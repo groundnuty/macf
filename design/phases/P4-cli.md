@@ -29,7 +29,7 @@ macf init --project macf --role science-agent
 1. Auto-detect: Tailscale IP, org from git remote
 2. Prompt for: project name, role, agent name (defaults to role), GitHub App ID, Installation ID
 3. Create `.macf/` directory structure
-4. Clone plugin to `.macf/plugin/` (from marketplace repo at latest tag)
+4. Clone plugin to `.macf/plugin/` from `groundnuty/macf-marketplace` (latest tag or `--version` flag)
 5. Generate agent cert (if CA key available locally or via `/sign` peer)
 6. Write `macf-agent.json` config
 7. Generate `claude.sh` (with passthrough args)

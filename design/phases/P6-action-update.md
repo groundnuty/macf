@@ -53,15 +53,38 @@ Action reads this to know where to find agent variables.
 ## Route-by-Label Job (key change)
 
 ```yaml
-- name: Setup mTLS certs
+- name: Read project config
+  id: config
   run: |
-    echo "${{ vars.MACF_CA_CERT }}" > /tmp/ca-cert.pem
+    PROJECT=$(jq -r '.project' .github/macf-config.json)
+    REGISTRY_TYPE=$(jq -r '.registry.type' .github/macf-config.json)
+    if [ "$REGISTRY_TYPE" = "org" ]; then
+      ORG=$(jq -r '.registry.org' .github/macf-config.json)
+      REGISTRY_PATH="orgs/$ORG"
+    elif [ "$REGISTRY_TYPE" = "profile" ]; then
+      USER=$(jq -r '.registry.user' .github/macf-config.json)
+      REGISTRY_PATH="repos/$USER/$USER"
+    else
+      OWNER=$(jq -r '.registry.owner' .github/macf-config.json)
+      REPO=$(jq -r '.registry.repo' .github/macf-config.json)
+      REGISTRY_PATH="repos/$OWNER/$REPO"
+    fi
+    echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+    echo "registry_path=$REGISTRY_PATH" >> "$GITHUB_OUTPUT"
+
+- name: Setup mTLS certs
+  env:
+    PROJECT: ${{ steps.config.outputs.project }}
+  run: |
+    echo "$(gh api ${{ steps.config.outputs.registry_path }}/actions/variables/${PROJECT}_CA_CERT --jq '.value')" > /tmp/ca-cert.pem
     echo "${{ secrets.MACF_ROUTER_CERT }}" > /tmp/router-cert.pem
     echo "${{ secrets.MACF_ROUTER_KEY }}" > /tmp/router-key.pem
 
 - name: Find agent
   env:
     LABEL: ${{ github.event.label.name }}
+    PROJECT: ${{ steps.config.outputs.project }}
+    REGISTRY_PATH: ${{ steps.config.outputs.registry_path }}
   run: |
     VAR_NAME="${PROJECT}_AGENT_${LABEL//-/_}"
     AGENT_INFO=$(gh api "$REGISTRY_PATH/actions/variables/$VAR_NAME" --jq '.value')

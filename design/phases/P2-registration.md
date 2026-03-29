@@ -41,12 +41,19 @@ Three implementations: `OrgRegistry` (orgs API), `ProfileRegistry` (user/user re
   "agent_name": "code-agent",
   "agent_role": "code-agent",
   "agent_type": "permanent",
+  "github_app": {
+    "app_id": "3102516",
+    "install_id": "116694960",
+    "key_path": ".github-app-key.pem"
+  },
   "registry": {
     "type": "org",
     "org": "macf-experiment"
   }
 }
 ```
+
+GH_TOKEN generation uses `github_app` fields: `gh token generate --app-id {app_id} --installation-id {install_id} --key {key_path} | jq -r '.token'`. These are also available as env vars from `.claude/settings.local.json` (`APP_ID`, `INSTALL_ID`, `KEY_PATH`).
 
 ## Variable Format
 

@@ -34,7 +34,7 @@ Response:
 { "csr": "...", "agent_name": "new-agent", "challenge_done": true }
 ```
 
-Signing agent reads `MACF_CHALLENGE_new_agent` from registry, verifies match, deletes challenge variable, signs CSR, returns cert:
+Signing agent reads `MACF_CHALLENGE_new_agent` from its own project's registry (same scope — per DR-006, all agents in one project share a registry scope). It verifies the match, deletes challenge variable, signs CSR, returns cert:
 
 ```json
 { "cert": "-----BEGIN CERTIFICATE-----..." }
