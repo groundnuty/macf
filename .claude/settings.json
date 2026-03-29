@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "alwaysThinkingEnabled": true,
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "Bash(*)",
+      "Agent",
+      "mcp__*"
+    ],
+    "deny": [
+      "Read(~/.ssh/id_*)",
+      "Read(~/.ssh/*.pem)",
+      "Read(~/.aws/**)",
+      "Read(~/.gnupg/**)",
+      "Bash(sudo *)",
+      "Bash(rm -rf /)",
+      "Bash(git commit --no-verify *)",
+      "Bash(git commit -n *)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": true,
+    "network": {
+      "allowedDomains": ["*"]
+    },
+    "filesystem": {
+      "denyWrite": [
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "~/.ssh",
+        "~/.aws",
+        "~/.bashrc",
+        "~/.zshrc"
+      ],
+      "denyRead": [
+        "~/.aws",
+        "~/.kube",
+        "~/.config/gcloud"
+      ]
+    }
+  },
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true,
+    "commit-commands@claude-plugins-official": true,
+    "feature-dev@claude-plugins-official": true,
+    "context7@claude-plugins-official": true,
+    "code-review@claude-plugins-official": true
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"Branch: $(git branch --show-current 2>/dev/null || echo 'detached'). Recent: $(git log --oneline -3 2>/dev/null || echo 'no commits')\"",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'command -v jq >/dev/null 2>&1 || exit 0; FILE=$(cat | jq -r \".tool_input.file_path // empty\"); case \"$FILE\" in *.ts|*.tsx) npx eslint --no-warn-ignored \"$FILE\" 2>&1 | head -20 || true ;; esac'",
+            "timeout": 15000
+          },
+          {
+            "type": "command",
+            "command": "sh -c 'command -v jq >/dev/null 2>&1 || exit 0; FILE=$(cat | jq -r \".tool_input.file_path // empty\"); case \"$FILE\" in *.ts|*.tsx) npx tsc --noEmit 2>&1 | head -20 ;; esac; exit 0'",
+            "timeout": 30000
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'echo \"State before compaction:\"; echo \"Branch: $(git branch --show-current 2>/dev/null)\"; echo \"Modified files: $(git diff --name-only 2>/dev/null | tr \"\\n\" \", \")\"; echo \"Staged files: $(git diff --cached --name-only 2>/dev/null | tr \"\\n\" \", \")\"'",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}
