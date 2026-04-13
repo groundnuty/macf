@@ -1,6 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "alwaysThinkingEnabled": true,
+  "enableAllProjectMcpServers": false,
   "permissions": {
     "allow": [
       "Read",
@@ -19,6 +20,7 @@
       "Read(~/.gnupg/**)",
       "Bash(sudo *)",
       "Bash(rm -rf /)",
+      "Bash(docker push *)",
       "Bash(git commit --no-verify *)",
       "Bash(git commit -n *)"
     ]
@@ -27,10 +29,17 @@
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
+    "excludedCommands": ["ssh:*", "scp:*", "rsync:*", "devbox:*", "nix:*", "git:*", "gpg:*", "gpg-agent:*"],
     "network": {
       "allowedDomains": ["*"]
     },
     "filesystem": {
+      "allowWrite": [
+        "~/.cache/devbox",
+        "~/.local/share/devbox",
+        "~/.nix-profile",
+        "/nix"
+      ],
       "denyWrite": [
         "/etc",
         "/usr",
@@ -53,7 +62,10 @@
     "commit-commands@claude-plugins-official": true,
     "feature-dev@claude-plugins-official": true,
     "context7@claude-plugins-official": true,
-    "code-review@claude-plugins-official": true
+    "code-review@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true,
+    "everything-claude-code@everything-claude-code": false,
+    "holistic-linting@jamie-bitflight-skills": false
   },
   "hooks": {
     "SessionStart": [
@@ -62,6 +74,16 @@
           {
             "type": "command",
             "command": "echo \"Branch: $(git branch --show-current 2>/dev/null || echo 'detached'). Recent: $(git log --oneline -3 2>/dev/null || echo 'no commits')\"",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Post-compaction reminder: ESM-only TypeScript project (.js import extensions). Use devbox — do not install on host. Makefile (dev.mk) is primary dev interface. Run make -f dev.mk check before finishing.'",
             "timeout": 5000
           }
         ]
@@ -91,6 +113,17 @@
             "type": "command",
             "command": "sh -c 'echo \"State before compaction:\"; echo \"Branch: $(git branch --show-current 2>/dev/null)\"; echo \"Modified files: $(git diff --name-only 2>/dev/null | tr \"\\n\" \", \")\"; echo \"Staged files: $(git diff --cached --name-only 2>/dev/null | tr \"\\n\" \", \")\"'",
             "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'INPUT=$(cat); if echo \"$INPUT\" | jq -e .stop_hook_active >/dev/null 2>&1 && [ \"$(echo \"$INPUT\" | jq -r .stop_hook_active)\" = \"true\" ]; then exit 0; fi; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; [ -f package.json ] || exit 0; command -v devbox >/dev/null 2>&1 || exit 0; OUTPUT=$(make -f dev.mk check 2>&1); rc=$?; printf \"%s\\n\" \"$OUTPUT\" | tail -30; if [ $rc -ne 0 ]; then exit 2; fi'",
+            "timeout": 120000
           }
         ]
       }

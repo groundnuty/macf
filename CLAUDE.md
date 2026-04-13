@@ -27,11 +27,28 @@ Read these before implementing:
 
 ## Tech Stack
 
-- TypeScript, ESM-only
+- TypeScript, ESM-only (`.js` import extensions, `"type": "module"`)
 - Node.js (v25+)
 - `@modelcontextprotocol/sdk` — MCP channel protocol
 - `node:https` — HTTPS/mTLS server
 - `node:crypto` — certificate operations
+- Zod v4 — runtime validation, `z.infer<>` for types
+- Vitest — testing (unit, e2e, coverage)
+
+## Development Environment
+
+- **Devbox** is mandatory — do NOT install tools on host
+- **Makefile (`dev.mk`) is the primary interface** — always use `make -f dev.mk <target>`
+- Never run `devbox run -- npx ...` or `npm` directly
+
+Key targets:
+- `make -f dev.mk check` — full CI: install + build + lint + test
+- `make -f dev.mk build` — type check (`tsc --noEmit`)
+- `make -f dev.mk lint` — ESLint
+- `make -f dev.mk test` — unit tests (no API calls)
+- `make -f dev.mk test-e2e` — E2E tests (require real mTLS certs)
+
+One-off test: `devbox run -- npx vitest run test/path/to/file.test.ts`
 
 ## Conventions
 
@@ -39,4 +56,7 @@ Read these before implementing:
 - Small files (200-400 lines, 800 max)
 - Functions under 50 lines
 - Explicit error handling at boundaries
-- `import type` for type-only imports
+- `import type` for type-only imports (enforced by `verbatimModuleSyntax`)
+- Zod schemas for runtime validation, TypeScript types via `z.infer<>`
+- Error classes extend `MacfError` with a unique `code` string
+- ESM-only: `.js` import extensions in all imports
