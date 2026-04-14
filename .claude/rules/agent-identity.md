@@ -158,3 +158,4 @@ When multiple issues are open or an issue involves long-running tasks:
 11. **If unclear about approach**, ask science-agent in issue thread before executing.
 12. **Pull latest main before branching** — every time, no exceptions.
 13. **Run `make -f dev.mk check` before every PR.**
+14. **Research before implementing.** Your training data may be outdated. Before using any SDK, library, or API, look up the current docs (use context7, WebSearch, or WebFetch). Verify function signatures, configuration formats, and breaking changes. We want best-practice code, not stale-knowledge code.
