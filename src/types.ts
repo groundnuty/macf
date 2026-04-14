@@ -53,6 +53,28 @@ export interface AgentConfig {
   readonly registry: import('./registry/types.js').RegistryConfig;
 }
 
+// --- Sign request (POST /sign body) ---
+
+export const SignRequestSchema = z.object({
+  csr: z.string(),
+  agent_name: z.string(),
+  project: z.string().optional(),
+  challenge_done: z.boolean().optional(),
+});
+
+export type SignRequest = z.infer<typeof SignRequestSchema>;
+
+// --- Sign responses ---
+
+export const SignChallengeResponseSchema = z.object({
+  challenge_id: z.string(),
+  instruction: z.string(),
+});
+
+export const SignCertResponseSchema = z.object({
+  cert: z.string(),
+});
+
 // --- Notify endpoint response ---
 
 export const NotifyResponseSchema = z.object({
