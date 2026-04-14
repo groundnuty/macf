@@ -2,7 +2,7 @@
   "agents": {
     "code-agent": {
       "app_name": "macf-code-agent",
-      "host": "orzech-dev-agents",
+      "host": "100.124.163.105",
       "tmux_session": "code-agent",
       "tmux_bin": "tmux",
       "ssh_user": "ubuntu",
@@ -10,7 +10,7 @@
     },
     "science-agent": {
       "app_name": "macf-science-agent",
-      "host": "orzech-dev-agents",
+      "host": "100.124.163.105",
       "tmux_session": "science-agent",
       "tmux_bin": "tmux",
       "ssh_user": "ubuntu",
