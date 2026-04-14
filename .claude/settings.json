@@ -29,7 +29,7 @@
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
-    "excludedCommands": ["ssh:*", "scp:*", "rsync:*", "devbox:*", "nix:*", "git:*", "gpg:*", "gpg-agent:*"],
+    "excludedCommands": ["ssh:*", "scp:*", "rsync:*", "devbox:*", "nix:*", "git:*", "gpg:*", "gpg-agent:*", "gh:*", "npx:*", "npm:*", "node:*", "make:*", "tmux:*", "jq:*", "openssl:*"],
     "network": {
       "allowedDomains": ["*"]
     },
