@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { ConfigError } from './errors.js';
 import type { AgentConfig } from './types.js';
+import type { RegistryConfig } from './registry/types.js';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -42,9 +44,18 @@ export function loadConfig(): AgentConfig {
 
   const logPath = process.env['MACF_LOG_PATH'] || undefined;
 
+  // P2: Registry config
+  const project = process.env['MACF_PROJECT'] ?? 'MACF';
+  const agentRole = process.env['MACF_AGENT_ROLE'] ?? agentName;
+  const instanceId = randomBytes(3).toString('hex');
+
+  const registryType = process.env['MACF_REGISTRY_TYPE'] ?? 'repo';
+  const registryConfig = parseRegistryConfig(registryType);
+
   return {
     agentName,
     agentType,
+    agentRole,
     host,
     port,
     caCertPath,
@@ -52,5 +63,35 @@ export function loadConfig(): AgentConfig {
     agentKeyPath,
     debug,
     logPath,
+    project,
+    instanceId,
+    registry: registryConfig,
   };
+}
+
+function parseRegistryConfig(registryType: string): RegistryConfig {
+  switch (registryType) {
+    case 'org': {
+      const org = process.env['MACF_REGISTRY_ORG'];
+      if (!org) throw new ConfigError('MACF_REGISTRY_ORG is required when MACF_REGISTRY_TYPE=org');
+      return { type: 'org', org };
+    }
+    case 'profile': {
+      const user = process.env['MACF_REGISTRY_USER'];
+      if (!user) throw new ConfigError('MACF_REGISTRY_USER is required when MACF_REGISTRY_TYPE=profile');
+      return { type: 'profile', user };
+    }
+    case 'repo': {
+      const scope = process.env['MACF_REGISTRY_REPO'] ?? 'groundnuty/macf';
+      const parts = scope.split('/');
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        throw new ConfigError(`MACF_REGISTRY_REPO must be "owner/repo", got "${scope}"`);
+      }
+      return { type: 'repo', owner: parts[0], repo: parts[1] };
+    }
+    default:
+      throw new ConfigError(
+        `MACF_REGISTRY_TYPE must be "org", "profile", or "repo", got "${registryType}"`,
+      );
+  }
 }

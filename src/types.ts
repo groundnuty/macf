@@ -39,6 +39,7 @@ export type HealthResponse = z.infer<typeof HealthResponseSchema>;
 export interface AgentConfig {
   readonly agentName: string;
   readonly agentType: string;
+  readonly agentRole: string;
   readonly host: string;
   readonly port: number;
   readonly caCertPath: string;
@@ -46,6 +47,9 @@ export interface AgentConfig {
   readonly agentKeyPath: string;
   readonly debug: boolean;
   readonly logPath: string | undefined;
+  readonly project: string;
+  readonly instanceId: string;
+  readonly registry: import('./registry/types.js').RegistryConfig;
 }
 
 // --- Notify endpoint response ---

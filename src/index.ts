@@ -13,3 +13,11 @@ export { createLogger } from './logger.js';
 export { loadConfig } from './config.js';
 export { NotifyPayloadSchema, NotifyTypeSchema, HealthResponseSchema } from './types.js';
 export type { NotifyPayload, NotifyType, HealthResponse, AgentConfig, Logger, McpChannel, HttpsServer, HealthState } from './types.js';
+
+// P2: Registry & Discovery
+export { createRegistryFromConfig, createRegistry, createGitHubClient, GitHubApiError, AgentInfoSchema, RegistryConfigSchema } from './registry/index.js';
+export type { AgentInfo, Registry, RegistryConfig, GitHubVariablesClient } from './registry/index.js';
+export { checkCollision, CollisionError } from './collision.js';
+export type { CollisionResult } from './collision.js';
+export { registerShutdownHandler } from './shutdown.js';
+export { generateToken } from './token.js';

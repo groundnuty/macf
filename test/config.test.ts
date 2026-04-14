@@ -112,4 +112,105 @@ describe('loadConfig', () => {
     const config = loadConfig();
     expect(config.logPath).toBeUndefined();
   });
+
+  // P2: Registry config tests
+  it('defaults to repo registry with groundnuty/macf', () => {
+    setMinimalEnv();
+    const config = loadConfig();
+    expect(config.registry).toEqual({ type: 'repo', owner: 'groundnuty', repo: 'macf' });
+  });
+
+  it('defaults project to MACF', () => {
+    setMinimalEnv();
+    const config = loadConfig();
+    expect(config.project).toBe('MACF');
+  });
+
+  it('defaults agentRole to agentName', () => {
+    setMinimalEnv();
+    const config = loadConfig();
+    expect(config.agentRole).toBe('test-agent');
+  });
+
+  it('generates a 6-char hex instanceId', () => {
+    setMinimalEnv();
+    const config = loadConfig();
+    expect(config.instanceId).toMatch(/^[0-9a-f]{6}$/);
+  });
+
+  it('parses org registry config', () => {
+    setMinimalEnv();
+    process.env['MACF_REGISTRY_TYPE'] = 'org';
+    process.env['MACF_REGISTRY_ORG'] = 'my-org';
+
+    const config = loadConfig();
+    expect(config.registry).toEqual({ type: 'org', org: 'my-org' });
+  });
+
+  it('throws when org registry missing MACF_REGISTRY_ORG', () => {
+    setMinimalEnv();
+    process.env['MACF_REGISTRY_TYPE'] = 'org';
+
+    expect(() => loadConfig()).toThrow(ConfigError);
+    expect(() => loadConfig()).toThrow('MACF_REGISTRY_ORG');
+  });
+
+  it('parses profile registry config', () => {
+    setMinimalEnv();
+    process.env['MACF_REGISTRY_TYPE'] = 'profile';
+    process.env['MACF_REGISTRY_USER'] = 'groundnuty';
+
+    const config = loadConfig();
+    expect(config.registry).toEqual({ type: 'profile', user: 'groundnuty' });
+  });
+
+  it('throws when profile registry missing MACF_REGISTRY_USER', () => {
+    setMinimalEnv();
+    process.env['MACF_REGISTRY_TYPE'] = 'profile';
+
+    expect(() => loadConfig()).toThrow(ConfigError);
+    expect(() => loadConfig()).toThrow('MACF_REGISTRY_USER');
+  });
+
+  it('parses repo registry config from env', () => {
+    setMinimalEnv();
+    process.env['MACF_REGISTRY_TYPE'] = 'repo';
+    process.env['MACF_REGISTRY_REPO'] = 'other-owner/other-repo';
+
+    const config = loadConfig();
+    expect(config.registry).toEqual({ type: 'repo', owner: 'other-owner', repo: 'other-repo' });
+  });
+
+  it('throws on invalid repo format', () => {
+    setMinimalEnv();
+    process.env['MACF_REGISTRY_TYPE'] = 'repo';
+    process.env['MACF_REGISTRY_REPO'] = 'no-slash';
+
+    expect(() => loadConfig()).toThrow(ConfigError);
+    expect(() => loadConfig()).toThrow('owner/repo');
+  });
+
+  it('throws on unknown registry type', () => {
+    setMinimalEnv();
+    process.env['MACF_REGISTRY_TYPE'] = 'invalid';
+
+    expect(() => loadConfig()).toThrow(ConfigError);
+    expect(() => loadConfig()).toThrow('"org", "profile", or "repo"');
+  });
+
+  it('reads custom project prefix', () => {
+    setMinimalEnv();
+    process.env['MACF_PROJECT'] = 'CPC';
+
+    const config = loadConfig();
+    expect(config.project).toBe('CPC');
+  });
+
+  it('reads custom agent role', () => {
+    setMinimalEnv();
+    process.env['MACF_AGENT_ROLE'] = 'code-agent';
+
+    const config = loadConfig();
+    expect(config.agentRole).toBe('code-agent');
+  });
 });
