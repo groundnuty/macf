@@ -26,7 +26,14 @@ export function createRegistry(
       const value = await client.readVariable(variableName(name));
       if (value === null) return null;
 
-      const result = AgentInfoSchema.safeParse(JSON.parse(value));
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(value);
+      } catch {
+        return null;
+      }
+
+      const result = AgentInfoSchema.safeParse(parsed);
       if (!result.success) return null;
       return result.data;
     },

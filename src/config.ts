@@ -38,6 +38,7 @@ export function loadConfig(): AgentConfig {
   }
 
   const host = process.env['MACF_HOST'] ?? '0.0.0.0';
+  const advertiseHost = process.env['MACF_ADVERTISE_HOST'] ?? (host === '0.0.0.0' ? '127.0.0.1' : host);
 
   const debugStr = process.env['MACF_DEBUG'] ?? 'false';
   const debug = debugStr === 'true' || debugStr === '1';
@@ -57,6 +58,7 @@ export function loadConfig(): AgentConfig {
     agentType,
     agentRole,
     host,
+    advertiseHost,
     port,
     caCertPath,
     agentCertPath,

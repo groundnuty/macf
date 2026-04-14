@@ -79,8 +79,8 @@ describe('createRegistry', () => {
       vi.mocked(client.readVariable).mockResolvedValueOnce('not-json');
 
       const registry = createRegistry(client, 'MACF');
-      // JSON.parse will throw, caught by the caller
-      await expect(registry.get('bad')).rejects.toThrow();
+      const result = await registry.get('bad');
+      expect(result).toBeNull();
     });
 
     it('returns null for valid JSON that fails schema validation', async () => {

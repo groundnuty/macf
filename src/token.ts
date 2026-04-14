@@ -1,10 +1,13 @@
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 /**
- * Generate a GitHub App installation token using gh CLI.
- * Falls back to GH_TOKEN env var if gh token generate is unavailable.
+ * Generate a GitHub App installation token.
+ * Falls back to GH_TOKEN env var if available.
  */
-export function generateToken(): string {
+export async function generateToken(): Promise<string> {
   // Prefer existing GH_TOKEN from environment
   const envToken = process.env['GH_TOKEN'];
   if (envToken) return envToken;
@@ -19,13 +22,13 @@ export function generateToken(): string {
     );
   }
 
-  const output = execFileSync('gh', [
+  const { stdout } = await execFileAsync('gh', [
     'token', 'generate',
     '--app-id', appId,
     '--installation-id', installId,
     '--key', keyPath,
-  ], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+  ], { encoding: 'utf-8' });
 
-  const parsed: { token: string } = JSON.parse(output);
+  const parsed: { token: string } = JSON.parse(stdout);
   return parsed.token;
 }

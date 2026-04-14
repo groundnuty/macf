@@ -21,3 +21,4 @@ export { checkCollision, CollisionError } from './collision.js';
 export type { CollisionResult } from './collision.js';
 export { registerShutdownHandler } from './shutdown.js';
 export { generateToken } from './token.js';
+export { checkPendingIssues } from './startup-issues.js';

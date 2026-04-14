@@ -5,7 +5,6 @@ describe('generateToken', () => {
 
   beforeEach(() => {
     vi.resetModules();
-    // Clear token-related env vars
     delete process.env['GH_TOKEN'];
     delete process.env['APP_ID'];
     delete process.env['INSTALL_ID'];
@@ -20,11 +19,12 @@ describe('generateToken', () => {
     process.env['GH_TOKEN'] = 'env-token-123';
 
     const { generateToken } = await import('../src/token.js');
-    expect(generateToken()).toBe('env-token-123');
+    const token = await generateToken();
+    expect(token).toBe('env-token-123');
   });
 
   it('throws when no GH_TOKEN and no App credentials', async () => {
     const { generateToken } = await import('../src/token.js');
-    expect(() => generateToken()).toThrow('No GH_TOKEN');
+    await expect(generateToken()).rejects.toThrow('No GH_TOKEN');
   });
 });

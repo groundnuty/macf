@@ -213,4 +213,25 @@ describe('loadConfig', () => {
     const config = loadConfig();
     expect(config.agentRole).toBe('code-agent');
   });
+
+  it('defaults advertiseHost to 127.0.0.1 when host is 0.0.0.0', () => {
+    setMinimalEnv();
+    const config = loadConfig();
+    expect(config.host).toBe('0.0.0.0');
+    expect(config.advertiseHost).toBe('127.0.0.1');
+  });
+
+  it('uses host as advertiseHost when host is specific', () => {
+    setMinimalEnv();
+    process.env['MACF_HOST'] = '100.86.5.117';
+    const config = loadConfig();
+    expect(config.advertiseHost).toBe('100.86.5.117');
+  });
+
+  it('reads explicit MACF_ADVERTISE_HOST', () => {
+    setMinimalEnv();
+    process.env['MACF_ADVERTISE_HOST'] = '10.0.0.1';
+    const config = loadConfig();
+    expect(config.advertiseHost).toBe('10.0.0.1');
+  });
 });

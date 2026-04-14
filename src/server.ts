@@ -7,6 +7,7 @@ import { createRegistryFromConfig } from './registry/factory.js';
 import { checkCollision, CollisionError } from './collision.js';
 import { registerShutdownHandler } from './shutdown.js';
 import { generateToken } from './token.js';
+import { checkPendingIssues } from './startup-issues.js';
 import type { NotifyPayload } from './types.js';
 import type { AgentInfo } from './registry/types.js';
 
@@ -77,7 +78,7 @@ async function main(): Promise<void> {
   const { actualPort } = await httpsServer.start(config.port, config.host);
 
   // P2: Generate token and create registry
-  const token = generateToken();
+  const token = await generateToken();
   const registry = createRegistryFromConfig(config.registry, config.project, token);
 
   // P2: Collision detection
@@ -101,9 +102,9 @@ async function main(): Promise<void> {
     );
   }
 
-  // P2: Register in GitHub variable
+  // P2: Register in GitHub variable (use advertiseHost, not bind address)
   const agentInfo: AgentInfo = {
-    host: config.host,
+    host: config.advertiseHost,
     port: actualPort,
     type: config.agentType as 'permanent' | 'worker',
     instance_id: config.instanceId,
@@ -113,7 +114,7 @@ async function main(): Promise<void> {
   await registry.register(config.agentName, agentInfo);
   logger.info('registered', {
     agent: config.agentName,
-    host: config.host,
+    host: config.advertiseHost,
     port: actualPort,
     instance_id: config.instanceId,
   });
@@ -126,9 +127,18 @@ async function main(): Promise<void> {
     logger,
   });
 
+  // P2: Check for pending issues and push startup_check notification
+  await checkPendingIssues({
+    repo: 'groundnuty/macf',
+    agentLabel: 'code-agent',
+    token,
+    onNotify,
+    logger,
+  });
+
   logger.info('server_started', {
     port: actualPort,
-    host: config.host,
+    host: config.advertiseHost,
     agent: config.agentName,
     type: config.agentType,
     instance_id: config.instanceId,
