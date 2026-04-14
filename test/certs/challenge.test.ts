@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createChallenge, verifyChallenge, ChallengeError } from '../../src/certs/challenge.js';
+import { createChallenge, verifyAndConsumeChallenge, ChallengeError } from '../../src/certs/challenge.js';
 import type { GitHubVariablesClient } from '../../src/registry/types.js';
 
 function mockClient(): GitHubVariablesClient {
@@ -44,11 +44,11 @@ describe('challenge', () => {
     });
   });
 
-  describe('verifyChallenge', () => {
+  describe('verifyAndConsumeChallenge', () => {
     it('returns stored value and deletes the variable', async () => {
       vi.mocked(client.readVariable).mockResolvedValueOnce('abc123');
 
-      const storedValue = await verifyChallenge({
+      const storedValue = await verifyAndConsumeChallenge({
         project: 'MACF',
         agentName: 'new_agent',
         client,
@@ -60,7 +60,7 @@ describe('challenge', () => {
     });
 
     it('throws when no challenge variable exists', async () => {
-      await expect(verifyChallenge({
+      await expect(verifyAndConsumeChallenge({
         project: 'MACF',
         agentName: 'missing',
         client,

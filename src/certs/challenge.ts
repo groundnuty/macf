@@ -34,10 +34,10 @@ export async function createChallenge(config: {
 }
 
 /**
- * Verify a challenge: read the variable, compare, delete (one-time use).
- * Returns true if the challenge matches.
+ * Verify and consume a challenge: read the variable, compare with submitted ID,
+ * delete on match (one-time use). Throws on mismatch or missing challenge.
  */
-export async function verifyChallenge(config: {
+export async function verifyAndConsumeChallenge(config: {
   readonly project: string;
   readonly agentName: string;
   readonly client: GitHubVariablesClient;
@@ -49,7 +49,8 @@ export async function verifyChallenge(config: {
     throw new ChallengeError(`No challenge found for agent "${config.agentName}"`);
   }
 
-  // Delete the challenge variable (one-time use)
+  // Delete the challenge variable (one-time use) — consume regardless of match
+  // to prevent brute-force attempts
   await config.client.deleteVariable(varName);
 
   return storedValue;

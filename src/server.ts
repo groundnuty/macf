@@ -8,7 +8,10 @@ import { checkCollision, CollisionError } from './collision.js';
 import { registerShutdownHandler } from './shutdown.js';
 import { generateToken } from './token.js';
 import { checkPendingIssues } from './startup-issues.js';
-import type { NotifyPayload } from './types.js';
+import { createChallenge, verifyAndConsumeChallenge } from './certs/challenge.js';
+import { signCSR } from './certs/agent-cert.js';
+import { loadCA } from './certs/ca.js';
+import type { NotifyPayload, SignRequest } from './types.js';
 import type { AgentInfo } from './registry/types.js';
 
 async function main(): Promise<void> {
@@ -62,12 +65,75 @@ async function main(): Promise<void> {
     });
   };
 
+  // P2: Generate token early — needed for /sign endpoint and registry
+  const token = await generateToken();
+  const registry = createRegistryFromConfig(config.registry, config.project, token);
+  const { createGitHubClient } = await import('./registry/github-client.js');
+
+  // Build the variables client for the /sign challenge flow
+  let signPathPrefix: string;
+  switch (config.registry.type) {
+    case 'org': signPathPrefix = `/orgs/${config.registry.org}`; break;
+    case 'profile': signPathPrefix = `/repos/${config.registry.user}/${config.registry.user}`; break;
+    case 'repo': signPathPrefix = `/repos/${config.registry.owner}/${config.registry.repo}`; break;
+  }
+  const varsClient = createGitHubClient(signPathPrefix, token);
+
+  // P3: /sign endpoint handler (two-step challenge-response)
+  const onSign = async (request: SignRequest): Promise<Record<string, unknown>> => {
+    // Try to load CA key — if not available, this agent can't sign
+    let ca: { certPem: string; keyPem: string };
+    try {
+      ca = loadCA(config.caCertPath, config.caCertPath.replace('-cert.pem', '-key.pem'));
+    } catch {
+      const err = new Error('CA key not available on this agent');
+      (err as any).status = 503;
+      throw err;
+    }
+
+    if (!request.challenge_done) {
+      // Step 1: Create challenge
+      const challenge = await createChallenge({
+        project: config.project,
+        agentName: request.agent_name,
+        client: varsClient,
+      });
+      logger.info('sign_challenge_created', {
+        agent_name: request.agent_name,
+        challenge_id: challenge.challengeId,
+      });
+      return {
+        challenge_id: challenge.challengeId,
+        instruction: challenge.instruction,
+      };
+    }
+
+    // Step 2: Verify challenge + sign CSR
+    await verifyAndConsumeChallenge({
+      project: config.project,
+      agentName: request.agent_name,
+      client: varsClient,
+    });
+    logger.info('sign_challenge_verified', { agent_name: request.agent_name });
+
+    const certPem = await signCSR({
+      csrPem: request.csr,
+      agentName: request.agent_name,
+      caCertPem: ca.certPem,
+      caKeyPem: ca.keyPem,
+    });
+
+    logger.info('sign_cert_issued', { agent_name: request.agent_name });
+    return { cert: certPem };
+  };
+
   const httpsServer = createHttpsServer({
     caCertPath: config.caCertPath,
     agentCertPath: config.agentCertPath,
     agentKeyPath: config.agentKeyPath,
     onNotify,
     onHealth: () => health.getHealth(),
+    onSign,
     logger,
   });
 
@@ -76,10 +142,6 @@ async function main(): Promise<void> {
 
   // P1: Bind port
   const { actualPort } = await httpsServer.start(config.port, config.host);
-
-  // P2: Generate token and create registry
-  const token = await generateToken();
-  const registry = createRegistryFromConfig(config.registry, config.project, token);
 
   // P2: Collision detection
   const collisionResult = await checkCollision(

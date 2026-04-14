@@ -28,6 +28,6 @@ export { createCA, backupCAKey, recoverCAKey, encryptCAKey, decryptCAKey, loadCA
 export type { CaKeyPair } from './certs/index.js';
 export { generateAgentCert, generateCSR, signCSR, AgentCertError } from './certs/index.js';
 export type { AgentCertResult } from './certs/index.js';
-export { createChallenge, verifyChallenge, ChallengeError } from './certs/index.js';
+export { createChallenge, verifyAndConsumeChallenge, ChallengeError } from './certs/index.js';
 export { SignRequestSchema, SignChallengeResponseSchema, SignCertResponseSchema } from './types.js';
 export type { SignRequest } from './types.js';

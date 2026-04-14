@@ -137,7 +137,7 @@ function extractCN(subject: string): string | undefined {
 }
 
 /**
- * Sign a CSR using the CA key. Validates that the CSR's CN matches the agent name.
+ * Sign a CSR using the CA key. Validates CN match and CSR signature (proof-of-possession).
  */
 export async function signCSR(config: {
   readonly csrPem: string;
@@ -150,6 +150,12 @@ export async function signCSR(config: {
   const csr = new x509.Pkcs10CertificateRequest(csrPem);
   const caCert = new x509.X509Certificate(caCertPem);
   const caKey = await importPrivateKey(caKeyPem);
+
+  // Verify CSR signature (proof-of-possession — requester controls the private key)
+  const csrValid = await csr.verify();
+  if (!csrValid) {
+    throw new AgentCertError('CSR signature verification failed');
+  }
 
   // Verify CN matches agent name
   const cn = extractCN(csr.subject);

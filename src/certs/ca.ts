@@ -131,6 +131,9 @@ export async function recoverCAKey(config: {
 /**
  * Encrypt CA key using AES-256-CBC + PBKDF2, interoperable with openssl enc.
  * Format: "Salted__" + 8-byte salt + ciphertext, then base64.
+ *
+ * Manual recovery with openssl CLI:
+ *   base64 -d < encrypted.txt | openssl enc -aes-256-cbc -pbkdf2 -md sha256 -iter 10000 -d -out ca-key.pem
  */
 export function encryptCAKey(keyPem: string, passphrase: string): string {
   const salt = randomBytes(8);
@@ -156,7 +159,7 @@ export function encryptCAKey(keyPem: string, passphrase: string): string {
 
 /**
  * Decrypt CA key encrypted with encryptCAKey.
- * Interoperable with: openssl enc -aes-256-cbc -pbkdf2 -d
+ * Interoperable with: openssl enc -aes-256-cbc -pbkdf2 -md sha256 -iter 10000 -d
  */
 export function decryptCAKey(encryptedBase64: string, passphrase: string): string {
   const data = Buffer.from(encryptedBase64, 'base64');
