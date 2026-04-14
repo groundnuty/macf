@@ -1,7 +1,7 @@
 ---
 name: code-agent
 description: Implements features, fixes bugs, writes tests, and maintains CI/CD. The primary engineering agent in a multi-agent MACF project.
-model: sonnet
+
 color: blue
 ---
 

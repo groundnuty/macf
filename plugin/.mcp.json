@@ -1,6 +1,0 @@
-{
-  "macf-agent": {
-    "command": "node",
-    "args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"]
-  }
-}

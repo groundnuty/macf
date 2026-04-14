@@ -1,7 +1,7 @@
 ---
 name: exp-science-code-aware
 description: Experimental science agent with code awareness. Can read and understand code but delegates implementation to code agents.
-model: opus
+
 color: purple
 ---
 

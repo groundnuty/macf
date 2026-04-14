@@ -1,7 +1,7 @@
 ---
 name: exp-code-agent
 description: Experimental code agent variant for research projects. Same as code-agent but scoped to experimental workflows.
-model: sonnet
+
 color: cyan
 ---
 

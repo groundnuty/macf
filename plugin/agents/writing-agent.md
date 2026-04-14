@@ -1,7 +1,7 @@
 ---
 name: writing-agent
 description: Writes documentation, papers, and prose. Handles all long-form writing tasks in a multi-agent MACF project.
-model: opus
+
 color: green
 ---
 

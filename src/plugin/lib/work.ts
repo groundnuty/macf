@@ -31,7 +31,10 @@ export async function checkIssues(config: {
     });
 
     return JSON.parse(stdout) as readonly PendingIssue[];
-  } catch {
+  } catch (err) {
+    process.stderr.write(
+      `Warning: failed to check issues: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
     return [];
   }
 }

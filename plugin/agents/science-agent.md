@@ -1,7 +1,7 @@
 ---
 name: science-agent
 description: Designs architecture, writes research documents, reviews PRs, and makes design decisions. The research and design agent in a multi-agent MACF project.
-model: opus
+
 color: purple
 ---
 

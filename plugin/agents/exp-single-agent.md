@@ -1,7 +1,7 @@
 ---
 name: exp-single-agent
 description: Single-agent mode — one agent handles both code and research. For small projects or solo work.
-model: opus
+
 color: orange
 ---
 

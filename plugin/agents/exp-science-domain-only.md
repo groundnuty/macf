@@ -1,7 +1,7 @@
 ---
 name: exp-science-domain-only
 description: Experimental science agent focused on domain expertise. No code access — pure research and design.
-model: opus
+
 color: purple
 ---
 
