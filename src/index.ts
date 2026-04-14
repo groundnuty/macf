@@ -22,3 +22,12 @@ export type { CollisionResult } from './collision.js';
 export { registerShutdownHandler } from './shutdown.js';
 export { generateToken } from './token.js';
 export { checkPendingIssues } from './startup-issues.js';
+
+// P3: Certificate Management
+export { createCA, backupCAKey, recoverCAKey, encryptCAKey, decryptCAKey, loadCA, CaError } from './certs/index.js';
+export type { CaKeyPair } from './certs/index.js';
+export { generateAgentCert, generateCSR, signCSR, AgentCertError } from './certs/index.js';
+export type { AgentCertResult } from './certs/index.js';
+export { createChallenge, verifyChallenge, ChallengeError } from './certs/index.js';
+export { SignRequestSchema, SignChallengeResponseSchema, SignCertResponseSchema } from './types.js';
+export type { SignRequest } from './types.js';

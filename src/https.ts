@@ -1,8 +1,8 @@
 import { createServer, type Server as NodeHttpsServer } from 'node:https';
 import type { TLSSocket } from 'node:tls';
 import { readFileSync } from 'node:fs';
-import { NotifyPayloadSchema } from './types.js';
-import type { NotifyPayload, HealthResponse, HttpsServer, Logger } from './types.js';
+import { NotifyPayloadSchema, SignRequestSchema } from './types.js';
+import type { NotifyPayload, SignRequest, HealthResponse, HttpsServer, Logger } from './types.js';
 import { PortExhaustedError, PortUnavailableError, HttpsServerError } from './errors.js';
 
 const MAX_BODY_BYTES = 64 * 1024; // 64KB
@@ -74,9 +74,10 @@ export function createHttpsServer(config: {
   readonly agentKeyPath: string;
   readonly onNotify: (payload: NotifyPayload) => Promise<void>;
   readonly onHealth: () => HealthResponse;
+  readonly onSign?: (request: SignRequest) => Promise<Record<string, unknown>>;
   readonly logger: Logger;
 }): HttpsServer {
-  const { onNotify, onHealth, logger } = config;
+  const { onNotify, onHealth, onSign, logger } = config;
 
   const tlsOptions = {
     key: readFileSync(config.agentKeyPath),
@@ -148,6 +149,52 @@ export function createHttpsServer(config: {
           error: err instanceof Error ? err.message : String(err),
         });
         sendJson(res, 500, { error: 'Failed to push notification' });
+      }
+      return;
+    }
+
+    if (method === 'POST' && url === '/sign') {
+      if (!onSign) {
+        sendJson(res, 503, { error: 'Signing not available on this agent' });
+        return;
+      }
+
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        sendJson(res, 415, { error: 'Content-Type must be application/json' });
+        return;
+      }
+
+      let body: string;
+      try {
+        body = await readBody(req);
+      } catch {
+        sendJson(res, 413, { error: 'Body too large (max 64KB)' });
+        return;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        sendJson(res, 400, { error: 'Invalid JSON' });
+        return;
+      }
+
+      const result = SignRequestSchema.safeParse(parsed);
+      if (!result.success) {
+        sendJson(res, 400, { error: `Validation failed: ${result.error.message}` });
+        return;
+      }
+
+      try {
+        const response = await onSign(result.data);
+        sendJson(res, 200, response);
+      } catch (err) {
+        const status = err instanceof Error && 'status' in err ? (err as { status: number }).status : 500;
+        sendJson(res, status, {
+          error: err instanceof Error ? err.message : 'Signing failed',
+        });
       }
       return;
     }

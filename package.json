@@ -18,6 +18,9 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "@peculiar/webcrypto": "^1.5.0",
+    "@peculiar/x509": "^2.0.0",
+    "reflect-metadata": "^0.2.2",
     "zod": "^4.0.0"
   },
   "devDependencies": {
