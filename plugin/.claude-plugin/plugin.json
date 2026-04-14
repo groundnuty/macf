@@ -1,0 +1,8 @@
+{
+  "name": "macf-agent",
+  "description": "Multi-Agent Coordination Framework — channel server, runtime skills, agent definitions, and hooks for coordinating Claude Code agents via mTLS and GitHub",
+  "author": {
+    "name": "groundnuty",
+    "email": "groundnuty@users.noreply.github.com"
+  }
+}
