@@ -1,0 +1,25 @@
+{
+  "description": "MACF agent startup hooks: dependency installer and work check",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "diff -q \"${CLAUDE_PLUGIN_ROOT}/package.json\" \"${CLAUDE_PLUGIN_DATA}/package.json\" >/dev/null 2>&1 || (cd \"${CLAUDE_PLUGIN_DATA}\" && cp \"${CLAUDE_PLUGIN_ROOT}/package.json\" . && npm install) || rm -f \"${CLAUDE_PLUGIN_DATA}/package.json\"",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Run /macf-status to see your identity and peers, then /macf-issues to check pending work.",
+            "once": true
+          }
+        ]
+      }
+    ]
+  }
+}

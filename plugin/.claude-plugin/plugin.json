@@ -1,0 +1,19 @@
+{
+  "name": "macf-agent",
+  "description": "Multi-Agent Coordination Framework — channel server, runtime skills, agent definitions, and hooks for coordinating Claude Code agents via mTLS and GitHub",
+  "author": {
+    "name": "groundnuty",
+    "email": "groundnuty@users.noreply.github.com"
+  },
+  "repository": "https://github.com/groundnuty/macf",
+  "license": "MIT",
+  "skills": "./skills/",
+  "agents": "./agents/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": {
+    "macf-agent": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"]
+    }
+  }
+}
