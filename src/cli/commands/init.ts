@@ -3,7 +3,8 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync } fr
 import { join, resolve } from 'node:path';
 import {
   projectMacfDir, writeAgentConfig, addToAgentsIndex,
-  agentCertPath, agentKeyPath, MACF_GLOBAL_DIR, CA_KEY_PATH,
+  agentCertPath, agentKeyPath,
+  caCertPath as caCertPathFor, caKeyPath as caKeyPathFor,
 } from '../config.js';
 import { loadCA } from '../../certs/ca.js';
 import { generateAgentCert } from '../../certs/agent-cert.js';
@@ -151,11 +152,12 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // Register in global index
   addToAgentsIndex(absDir);
 
-  // Generate agent cert if CA key is available locally
-  const caCertFile = join(MACF_GLOBAL_DIR, 'ca-cert.pem');
-  if (existsSync(caCertFile) && existsSync(CA_KEY_PATH)) {
+  // Generate agent cert if CA key is available locally (per-project)
+  const caCertFile = caCertPathFor(opts.project);
+  const caKeyFile = caKeyPathFor(opts.project);
+  if (existsSync(caCertFile) && existsSync(caKeyFile)) {
     try {
-      const ca = loadCA(caCertFile, CA_KEY_PATH);
+      const ca = loadCA(caCertFile, caKeyFile);
       await generateAgentCert({
         agentName,
         caCertPem: ca.certPem,
@@ -199,7 +201,7 @@ function generateClaudeSh(config: MacfAgentConfig): string {
     `export APP_ID="${config.github_app.app_id}"`,
     `export INSTALL_ID="${config.github_app.install_id}"`,
     `export KEY_PATH="${config.github_app.key_path}"`,
-    'export MACF_CA_CERT="$SCRIPT_DIR/.macf/certs/ca-cert.pem"',
+    `export MACF_CA_CERT="$HOME/.macf/certs/${config.project}/ca-cert.pem"`,
     'export MACF_AGENT_CERT="$SCRIPT_DIR/.macf/certs/agent-cert.pem"',
     'export MACF_AGENT_KEY="$SCRIPT_DIR/.macf/certs/agent-key.pem"',
     'export MACF_LOG_PATH="$SCRIPT_DIR/.macf/logs/channel.log"',
