@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import 'reflect-metadata';
-import { resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { Command } from 'commander';
 import { listAgents } from './commands/list.js';
 import { cdAgent } from './commands/cd.js';
@@ -28,6 +29,27 @@ function requireProjectRoot(): string {
     process.exit(1);
   }
   return dir;
+}
+
+/**
+ * Validate an explicit --dir value: resolve and confirm it contains
+ * .macf/macf-agent.json. No walk-up — the user gave an exact path.
+ */
+function validateProjectDir(path: string): string {
+  const abs = resolve(path);
+  if (!existsSync(join(abs, '.macf', 'macf-agent.json'))) {
+    console.error(`Not a MACF project: ${abs} has no .macf/macf-agent.json`);
+    process.exit(1);
+  }
+  return abs;
+}
+
+/**
+ * Resolve the project directory from either --dir (explicit) or auto-discovery.
+ * Explicit --dir wins. Both paths exit with a clear error if no project is found.
+ */
+function resolveProjectDir(optsDir: string | undefined): string {
+  return optsDir ? validateProjectDir(optsDir) : requireProjectRoot();
 }
 
 const program = new Command();
@@ -87,8 +109,9 @@ program
   .option('--actions', 'Bump only the actions pin', false)
   .option('--yes', 'Skip confirmation prompts', false)
   .option('--dry-run', 'Show the diff but do not write the config', false)
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .action(async (opts) => {
-    const code = await update(requireProjectRoot(), {
+    const code = await update(resolveProjectDir(opts.dir), {
       all: opts.all,
       cli: opts.cli,
       plugin: opts.plugin,
@@ -102,15 +125,19 @@ program
 program
   .command('status')
   .description('Ping all agents and show status')
-  .action(async () => {
-    await showStatus();
+  .option('--dir <path>', 'Scope to a specific project (defaults to all agents in global index)')
+  .action(async (opts) => {
+    const dir = opts.dir ? validateProjectDir(opts.dir) : undefined;
+    await showStatus(dir);
   });
 
 program
   .command('peers')
   .description('List peers from the registry')
-  .action(async () => {
-    await listPeers();
+  .option('--dir <path>', 'Scope to a specific project (defaults to all agents in global index)')
+  .action(async (opts) => {
+    const dir = opts.dir ? validateProjectDir(opts.dir) : undefined;
+    await listPeers(dir);
   });
 
 const certs = program
@@ -120,22 +147,25 @@ const certs = program
 certs
   .command('init')
   .description('Create CA certificate and upload to registry')
-  .action(async () => {
-    await certsInit(requireProjectRoot());
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    await certsInit(resolveProjectDir(opts.dir));
   });
 
 certs
   .command('recover')
   .description('Recover CA key from encrypted backup in registry')
-  .action(async () => {
-    await certsRecover(requireProjectRoot());
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    await certsRecover(resolveProjectDir(opts.dir));
   });
 
 certs
   .command('rotate')
   .description('Regenerate agent certificate with existing CA')
-  .action(async () => {
-    await certsRotate(requireProjectRoot());
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    await certsRotate(resolveProjectDir(opts.dir));
   });
 
 program

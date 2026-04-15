@@ -1,22 +1,34 @@
-import { loadAllAgents } from '../config.js';
+import { loadAllAgents, readAgentConfig } from '../config.js';
 import { createRegistryFromConfig } from '../../registry/factory.js';
 import { generateToken } from '../../token.js';
 
 /**
- * List peers from the registry for all configured projects.
+ * List peers from the registry.
+ *
+ * If projectDir is given, uses that project's config for registry access.
+ * Otherwise uses the first agent from the global index.
  */
-export async function listPeers(): Promise<void> {
-  const agents = loadAllAgents();
+export async function listPeers(projectDir?: string): Promise<void> {
+  const token = await generateToken();
 
-  if (agents.length === 0) {
-    console.log('No agents configured. Run `macf init` first.');
-    return;
+  let driverConfig;
+  if (projectDir) {
+    const c = readAgentConfig(projectDir);
+    if (!c) {
+      console.error(`Could not read agent config at ${projectDir}/.macf/macf-agent.json`);
+      return;
+    }
+    driverConfig = c;
+  } else {
+    const agents = loadAllAgents();
+    if (agents.length === 0) {
+      console.log('No agents configured. Run `macf init` first.');
+      return;
+    }
+    driverConfig = agents[0]!.config;
   }
 
-  // Use the first agent's config for registry access
-  const first = agents[0]!;
-  const token = await generateToken();
-  const registry = createRegistryFromConfig(first.config.registry, first.config.project, token);
+  const registry = createRegistryFromConfig(driverConfig.registry, driverConfig.project, token);
 
   const peers = await registry.list('');
 
