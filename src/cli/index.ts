@@ -4,7 +4,7 @@ import { Command } from 'commander';
 import { listAgents } from './commands/list.js';
 import { cdAgent } from './commands/cd.js';
 import { initAgent } from './commands/init.js';
-import { updatePlugin } from './commands/update.js';
+import { update } from './commands/update.js';
 import { showStatus } from './commands/status.js';
 import { listPeers } from './commands/peers.js';
 import { certsInit, certsRecover, certsRotate } from './commands/certs.js';
@@ -58,9 +58,23 @@ program
 
 program
   .command('update')
-  .description('Update plugin in current project')
-  .action(() => {
-    updatePlugin(process.cwd());
+  .description('Bump pinned versions in macf-agent.json (cli, plugin, actions)')
+  .option('--all', 'Bump all components non-interactively', false)
+  .option('--cli', 'Bump only the CLI pin', false)
+  .option('--plugin', 'Bump only the plugin pin', false)
+  .option('--actions', 'Bump only the actions pin', false)
+  .option('--yes', 'Skip confirmation prompts', false)
+  .option('--dry-run', 'Show the diff but do not write the config', false)
+  .action(async (opts) => {
+    const code = await update(process.cwd(), {
+      all: opts.all,
+      cli: opts.cli,
+      plugin: opts.plugin,
+      actions: opts.actions,
+      yes: opts.yes,
+      dryRun: opts.dryRun,
+    });
+    process.exitCode = code;
   });
 
 program
