@@ -85,6 +85,8 @@ describe('macf init', () => {
     const content = readFileSync(claudeSh, 'utf-8');
     expect(content).toContain('MACF_AGENT_NAME="agent"');
     expect(content).toContain('exec claude');
+    // Per-project CA path (PR #36)
+    expect(content).toContain('MACF_CA_CERT="$HOME/.macf/certs/TEST/ca-cert.pem"');
   });
 
   it('adds .macf/ to .gitignore', async () => {

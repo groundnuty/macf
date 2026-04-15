@@ -1,9 +1,8 @@
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import {
   readAgentConfig, agentCertPath, agentKeyPath,
-  MACF_GLOBAL_DIR, CA_KEY_PATH,
+  caCertPath as caCertPathFor, caKeyPath as caKeyPathFor, caDir,
 } from '../config.js';
 import { createCA, backupCAKey, recoverCAKey, loadCA } from '../../certs/ca.js';
 import { generateAgentCert } from '../../certs/agent-cert.js';
@@ -39,19 +38,23 @@ export async function certsInit(projectDir: string): Promise<void> {
   const token = await generateToken();
   const client = getVariablesClient(config, token);
 
-  const caCertPath = join(MACF_GLOBAL_DIR, 'ca-cert.pem');
+  // Per-project CA paths. mkdir with 0o700 — CA key is the most sensitive secret.
+  const projectCaDir = caDir(config.project);
+  mkdirSync(projectCaDir, { recursive: true, mode: 0o700 });
+  const caCertP = caCertPathFor(config.project);
+  const caKeyP = caKeyPathFor(config.project);
 
   console.log(`Creating CA for project "${config.project}"...`);
 
   const ca = await createCA({
     project: config.project,
-    certPath: caCertPath,
-    keyPath: CA_KEY_PATH,
+    certPath: caCertP,
+    keyPath: caKeyP,
     client,
   });
 
-  console.log(`  CA cert: ${caCertPath}`);
-  console.log(`  CA key:  ${CA_KEY_PATH}`);
+  console.log(`  CA cert: ${caCertP}`);
+  console.log(`  CA key:  ${caKeyP}`);
   console.log(`  CA cert uploaded to registry as ${config.project.toUpperCase()}_CA_CERT`);
 
   // Encrypted backup
@@ -93,16 +96,20 @@ export async function certsRecover(projectDir: string): Promise<void> {
     return;
   }
 
+  // Per-project CA paths. mkdir with 0o700.
+  mkdirSync(caDir(config.project), { recursive: true, mode: 0o700 });
+  const caKeyP = caKeyPathFor(config.project);
+
   console.log('Recovering CA key from registry...');
 
   await recoverCAKey({
     project: config.project,
     passphrase,
-    keyPath: CA_KEY_PATH,
+    keyPath: caKeyP,
     client,
   });
 
-  console.log(`  CA key recovered to: ${CA_KEY_PATH}`);
+  console.log(`  CA key recovered to: ${caKeyP}`);
   console.log('Recovery complete.');
 }
 
@@ -117,14 +124,15 @@ export async function certsRotate(projectDir: string): Promise<void> {
     return;
   }
 
-  const caCertPath = join(MACF_GLOBAL_DIR, 'ca-cert.pem');
-  if (!existsSync(caCertPath) || !existsSync(CA_KEY_PATH)) {
+  const caCertP = caCertPathFor(config.project);
+  const caKeyP = caKeyPathFor(config.project);
+  if (!existsSync(caCertP) || !existsSync(caKeyP)) {
     console.error('CA cert or key not found. Run `macf certs init` or `macf certs recover` first.');
     process.exitCode = 1;
     return;
   }
 
-  const ca = loadCA(caCertPath, CA_KEY_PATH);
+  const ca = loadCA(caCertP, caKeyP);
 
   const certP = agentCertPath(projectDir);
   const keyP = agentKeyPath(projectDir);

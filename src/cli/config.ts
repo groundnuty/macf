@@ -8,7 +8,39 @@ import { homedir } from 'node:os';
 export const MACF_GLOBAL_DIR = join(homedir(), '.macf');
 export const AGENTS_INDEX_PATH = join(MACF_GLOBAL_DIR, 'agents.json');
 export const GLOBAL_CONFIG_PATH = join(MACF_GLOBAL_DIR, 'config.json');
-export const CA_KEY_PATH = join(MACF_GLOBAL_DIR, 'ca-key.pem');
+
+/**
+ * Validate that a project name is safe for use as a filesystem directory.
+ * Allows alphanumeric, hyphen, underscore. Rejects slashes, dots, etc.
+ */
+export function isValidProjectName(name: string): boolean {
+  return /^[a-zA-Z0-9_-]+$/.test(name) && name.length > 0;
+}
+
+function assertValidProject(project: string): void {
+  if (!isValidProjectName(project)) {
+    throw new Error(
+      `Invalid project name "${project}": must match [a-zA-Z0-9_-]+`,
+    );
+  }
+}
+
+/**
+ * Per-project CA directory. One subdirectory per project prevents
+ * collisions when multiple MACF projects share a machine.
+ */
+export function caDir(project: string): string {
+  assertValidProject(project);
+  return join(MACF_GLOBAL_DIR, 'certs', project);
+}
+
+export function caCertPath(project: string): string {
+  return join(caDir(project), 'ca-cert.pem');
+}
+
+export function caKeyPath(project: string): string {
+  return join(caDir(project), 'ca-key.pem');
+}
 
 export function projectMacfDir(projectDir: string): string {
   return join(projectDir, '.macf');
