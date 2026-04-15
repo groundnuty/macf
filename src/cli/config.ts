@@ -42,6 +42,25 @@ export function caKeyPath(project: string): string {
   return join(caDir(project), 'ca-key.pem');
 }
 
+/**
+ * Walk up from startDir looking for .macf/macf-agent.json.
+ * Returns the project root (the dir CONTAINING .macf/), or null if not found.
+ *
+ * Same pattern as git's discovery of .git/. Stops at the filesystem root.
+ */
+export function findProjectRoot(startDir: string): string | null {
+  let dir = resolve(startDir);
+  // Loop bounded by filesystem depth — terminates when dirname(dir) === dir (root).
+  for (;;) {
+    if (existsSync(join(dir, '.macf', 'macf-agent.json'))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
 export function projectMacfDir(projectDir: string): string {
   return join(projectDir, '.macf');
 }

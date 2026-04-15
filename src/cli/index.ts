@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import 'reflect-metadata';
+import { resolve } from 'node:path';
 import { Command } from 'commander';
 import { listAgents } from './commands/list.js';
 import { cdAgent } from './commands/cd.js';
@@ -9,6 +10,25 @@ import { showStatus } from './commands/status.js';
 import { listPeers } from './commands/peers.js';
 import { certsInit, certsRecover, certsRotate } from './commands/certs.js';
 import { repoInit } from './commands/repo-init.js';
+import { findProjectRoot } from './config.js';
+
+/**
+ * Resolve the project directory for project-scoped commands.
+ * Walks up from cwd looking for .macf/macf-agent.json. Exits with a clear
+ * error if not found. Commands that bootstrap new projects (init, repo-init)
+ * use `--dir` or cwd directly instead of this.
+ */
+function requireProjectRoot(): string {
+  const dir = findProjectRoot(process.cwd());
+  if (!dir) {
+    console.error(
+      'Not in a MACF project (no .macf/macf-agent.json found walking up from cwd).\n' +
+      'Either cd into a project or run `macf init` first.',
+    );
+    process.exit(1);
+  }
+  return dir;
+}
 
 const program = new Command();
 
@@ -37,8 +57,10 @@ program
   .option('--cli-version <semver>', 'Pin @macf/cli version (e.g., 0.1.0)')
   .option('--plugin-version <semver>', 'Pin macf-agent plugin version (e.g., 0.1.0)')
   .option('--actions-version <tag>', 'Pin macf-actions version (e.g., v1, v1.0.0)')
+  .option('--dir <path>', 'Project directory (defaults to current working directory)')
   .action(async (opts) => {
-    await initAgent(process.cwd(), {
+    const projectDir = opts.dir ? resolve(opts.dir) : process.cwd();
+    await initAgent(projectDir, {
       project: opts.project,
       role: opts.role,
       name: opts.name,
@@ -66,7 +88,7 @@ program
   .option('--yes', 'Skip confirmation prompts', false)
   .option('--dry-run', 'Show the diff but do not write the config', false)
   .action(async (opts) => {
-    const code = await update(process.cwd(), {
+    const code = await update(requireProjectRoot(), {
       all: opts.all,
       cli: opts.cli,
       plugin: opts.plugin,
@@ -99,21 +121,21 @@ certs
   .command('init')
   .description('Create CA certificate and upload to registry')
   .action(async () => {
-    await certsInit(process.cwd());
+    await certsInit(requireProjectRoot());
   });
 
 certs
   .command('recover')
   .description('Recover CA key from encrypted backup in registry')
   .action(async () => {
-    await certsRecover(process.cwd());
+    await certsRecover(requireProjectRoot());
   });
 
 certs
   .command('rotate')
   .description('Regenerate agent certificate with existing CA')
   .action(async () => {
-    await certsRotate(process.cwd());
+    await certsRotate(requireProjectRoot());
   });
 
 program
@@ -130,8 +152,10 @@ program
   .option('--actions-version <version>', 'macf-actions tag to pin to', 'v1')
   .option('--agents <list>', 'Comma-separated agent names to scaffold (e.g., code-agent,science-agent)')
   .option('--force', 'Overwrite existing files', false)
+  .option('--dir <path>', 'Target directory (defaults to current working directory)')
   .action(async (opts) => {
-    await repoInit(process.cwd(), {
+    const projectDir = opts.dir ? resolve(opts.dir) : process.cwd();
+    await repoInit(projectDir, {
       repo: opts.repo,
       actionsVersion: opts.actionsVersion,
       agents: opts.agents,
