@@ -143,6 +143,16 @@ describe('canonicalScriptsDir', () => {
     const dir = canonicalScriptsDir();
     expect(existsSync(join(dir, 'tmux-send-to-claude.sh'))).toBe(true);
   });
+
+  it('macf-gh-token.sh exists in the canonical dir', () => {
+    const dir = canonicalScriptsDir();
+    expect(existsSync(join(dir, 'macf-gh-token.sh'))).toBe(true);
+  });
+
+  it('macf-whoami.sh exists in the canonical dir', () => {
+    const dir = canonicalScriptsDir();
+    expect(existsSync(join(dir, 'macf-whoami.sh'))).toBe(true);
+  });
 });
 
 describe('copyCanonicalScripts', () => {

@@ -25,7 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -n \"$TMUX\" ]; then TOKEN=$(gh token generate --app-id $APP_ID --installation-id $INSTALL_ID --key $KEY_PATH 2>/dev/null | jq -r '.token'); ISSUES=$(GH_TOKEN=$TOKEN gh issue list --repo groundnuty/macf --label code-agent --state open --json number,title --jq '[.[0:5] | .[] | \"#\\(.number): \\(.title)\"] | join(\"; \")' 2>/dev/null); if [ -n \"$ISSUES\" ]; then sleep 3 && \"$CLAUDE_PROJECT_DIR/.claude/scripts/tmux-send-to-claude.sh\" \"\" \"Pick up pending issues: $ISSUES\" & fi; fi",
+            "command": "if [ -n \"$TMUX\" ]; then TOKEN=$(\"$CLAUDE_PROJECT_DIR/.claude/scripts/macf-gh-token.sh\" --app-id \"$APP_ID\" --install-id \"$INSTALL_ID\" --key \"$KEY_PATH\" 2>/dev/null) || exit 0; ISSUES=$(GH_TOKEN=$TOKEN gh issue list --repo groundnuty/macf --label code-agent --state open --json number,title --jq '[.[0:5] | .[] | \"#\\(.number): \\(.title)\"] | join(\"; \")' 2>/dev/null); if [ -n \"$ISSUES\" ]; then sleep 3 && \"$CLAUDE_PROJECT_DIR/.claude/scripts/tmux-send-to-claude.sh\" \"\" \"Pick up pending issues: $ISSUES\" & fi; fi",
             "async": true
           }
         ]

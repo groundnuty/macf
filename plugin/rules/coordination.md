@@ -85,15 +85,37 @@ The helper is distributed to every agent workspace by `macf init` and refreshed 
 
 ## Token & Git Hygiene
 
-1. **Refresh GH_TOKEN before every `gh` or `git push`** — tokens are 1-hour installation tokens. Refresh pattern:
+1. **Refresh GH_TOKEN before every `gh` or `git push`** — tokens are 1-hour installation tokens. Use the canonical helper, and **fail loud** if it doesn't work:
 
-        export GH_TOKEN=$(gh token generate --app-id $APP_ID --installation-id $INSTALL_ID --key $KEY_PATH | jq -r '.token')
+        GH_TOKEN=$(./.claude/scripts/macf-gh-token.sh \
+          --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") || exit 1
+        export GH_TOKEN
 
-2. **Never bake tokens into `git remote set-url`** — use `-c url.insteadOf` for each push so tokens don't persist in remote URLs.
+   **Never** use the naive `export GH_TOKEN=$(gh token generate ... | jq -r '.token')` pattern — if `gh token generate` fails, jq's success masks the error (no `pipefail`), `GH_TOKEN` becomes the string `"null"`, and every subsequent `gh` operation silently falls back to the stored `gh auth login` as the user. This is the attribution trap: your PRs and comments get written as the user, not the bot, and nothing surfaces the mismatch until cross-agent routing breaks.
 
-3. **Never leave uncommitted changes** in the working tree at the end of a turn.
+   The helper uses `--token-only`, `set -euo pipefail`, validates the `ghs_` prefix, and emits actionable diagnostics (clock drift, missing key, bad PEM, wrong App/installation ID) on failure.
 
-4. **Never commit** `.github-app-key.pem`, tokens, or secrets. `.gitignore` should exclude them, but also verify untracked files before staging.
+2. **Sanity-check your identity** at session start or when something feels off:
+
+        GH_TOKEN=$GH_TOKEN ./.claude/scripts/macf-whoami.sh
+
+   Bot tokens (`ghs_*`) print `bot installation token`. A user token (`ghp_*`, `gho_*`, `ghu_*`) prints the user login and exits non-zero with a warning — that's the attribution trap firing.
+
+3. **When token generation fails, diagnose — don't work around it.** Common causes observed in practice:
+
+   - **Clock drift** — "JWT could not be decoded" usually means this machine's clock is skewed beyond GitHub's JWT tolerance. Check `timedatectl status` (expect `System clock synchronized: yes`).
+   - **Key mismatch** — `.github-app-key.pem` on disk doesn't match the App's registered public key (typically after a key rotation on GitHub without syncing locally). Compare fingerprints:
+
+            openssl rsa -in "$KEY_PATH" -pubout -outform DER 2>/dev/null | openssl dgst -sha256
+
+     against the SHA256 shown on GitHub → App settings → Private keys.
+   - **Wrong App/installation ID** — double-check `$APP_ID` and `$INSTALL_ID` in `.claude/settings.local.json`.
+
+4. **Never bake tokens into `git remote set-url`** — use `-c url.insteadOf` for each push so tokens don't persist in remote URLs.
+
+5. **Never leave uncommitted changes** in the working tree at the end of a turn.
+
+6. **Never commit** `.github-app-key.pem`, tokens, or secrets. `.gitignore` should exclude them, but also verify untracked files before staging.
 
 ---
 
