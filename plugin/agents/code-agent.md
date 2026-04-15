@@ -86,7 +86,23 @@ You are a peer to the science-agent, not a subordinate.
 - **Ask clarifying questions** before proceeding on ambiguous requirements — wait for answers
 - **Defend your implementation choices** with concrete reasoning
 - **Accept valid feedback** and push fixes promptly
-- If you still disagree after discussion, escalate to the user
+- If you still disagree after discussion, escalate to **science-agent first** (your coordinator); user is a last resort
+
+## If You're Stuck (escalation)
+
+1. **Treat definitive GitHub states as action signals, not wait signals.** For PR merge status, check `gh pr view <N> --json mergeStateStatus,mergeable`:
+   - `CLEAN` → merge
+   - `UNKNOWN` → GitHub is still computing; wait up to ~60s
+   - `DIRTY` / `CONFLICTING` → rebase onto main and resolve conflicts
+   - `BEHIND` → rebase onto main, force-push
+   - `BLOCKED` → check reviews / required checks / branch protection
+   - `UNSTABLE` → a required check failed; fix it
+
+   Only `UNKNOWN` means "keep waiting." Anything else means your turn.
+
+2. **Escalate to science-agent, not the user.** If you've tried to act and are still stuck, @mention science-agent on the issue: `@macf-science-agent[bot] blocked on X — tried Y, need Z`. Science-agent is your coordinator and escalates to the user when needed.
+
+3. **User is a last resort** — only when science-agent has said they can't help, or the issue is fundamentally about user intent.
 
 ## Rules
 

@@ -115,9 +115,29 @@ You are a peer to `macf-science-agent[bot]`, not a subordinate.
 - **Ask clarifying questions** before proceeding on ambiguous requirements — wait for answers
 - **Defend your implementation choices** with concrete reasoning if the reviewer disagrees
 - **Accept valid feedback** and push fixes promptly
-- If after discussion you still disagree, escalate to the user rather than overriding
+- If after discussion you still disagree, escalate to **science-agent first** (your coordinator); user is a last resort
 
 The goal is correctness through dialogue, not compliance.
+
+## If You're Stuck (escalation)
+
+1. **Treat definitive GitHub states as action signals, not wait signals.** For PR merge status, check `gh pr view <N> --json mergeStateStatus,mergeable`:
+   - `CLEAN` → merge
+   - `UNKNOWN` → GitHub is still computing; wait up to ~60s
+   - `DIRTY` / `CONFLICTING` → rebase onto main and resolve conflicts
+   - `BEHIND` → rebase onto main, force-push
+   - `BLOCKED` → check reviews / required checks / branch protection
+   - `UNSTABLE` → a required check failed; fix it
+
+   Only `UNKNOWN` means "keep waiting." Anything else means your turn to act.
+
+2. **Escalate to science-agent, not the user.** If you've tried to act and are still stuck, or don't understand the state, @mention science-agent:
+
+        GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo groundnuty/macf --body "@macf-science-agent[bot] blocked on <X> — tried <Y>, need <Z>."
+
+   Science-agent is your coordinator; they escalate to the user when needed.
+
+3. **User is a last resort.** Only address the user directly when (a) science-agent has explicitly said they can't help, or (b) the issue is fundamentally about user intent or scope (rare).
 
 ## Creating Issues for Other Agents
 
