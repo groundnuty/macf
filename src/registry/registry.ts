@@ -1,4 +1,5 @@
 import { AgentInfoSchema } from './types.js';
+import { toVariableSegment } from './variable-name.js';
 import type { AgentInfo, Registry, GitHubVariablesClient } from './types.js';
 
 /**
@@ -10,10 +11,12 @@ export function createRegistry(
   client: GitHubVariablesClient,
   project: string,
 ): Registry {
-  const prefix = `${project.toUpperCase()}_AGENT_`;
+  // GitHub Actions variable names only accept [A-Z0-9_]. Hyphens in the
+  // project or agent name become underscores; names are uppercased.
+  const prefix = `${toVariableSegment(project)}_AGENT_`;
 
   function variableName(agentName: string): string {
-    return `${prefix}${agentName}`;
+    return `${prefix}${toVariableSegment(agentName)}`;
   }
 
   return {
@@ -42,7 +45,9 @@ export function createRegistry(
       filterPrefix: string,
     ): Promise<ReadonlyArray<{ readonly name: string; readonly info: AgentInfo }>> {
       const allVars = await client.listVariables();
-      const fullPrefix = `${prefix}${filterPrefix}`;
+      // Sanitize filter side with the same transform used at write time so
+      // a filterPrefix like 'cv-' matches stored 'CV_ARCHITECT'.
+      const fullPrefix = `${prefix}${filterPrefix ? toVariableSegment(filterPrefix) : ''}`;
       const results: Array<{ name: string; info: AgentInfo }> = [];
 
       for (const v of allVars) {

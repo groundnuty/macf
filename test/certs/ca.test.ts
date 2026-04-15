@@ -63,6 +63,22 @@ describe('CA management', () => {
       );
     });
 
+    it('sanitizes hyphens in project name (issue #46)', async () => {
+      const client = mockClient();
+      await createCA({
+        project: 'academic-resume',
+        certPath: join(dir, 'ca-cert.pem'),
+        keyPath: join(dir, 'ca-key.pem'),
+        client,
+      });
+
+      // Before the fix this was ACADEMIC-RESUME_CA_CERT which GitHub rejects.
+      expect(client.writeVariable).toHaveBeenCalledWith(
+        'ACADEMIC_RESUME_CA_CERT',
+        expect.stringContaining('-----BEGIN CERTIFICATE-----'),
+      );
+    });
+
     it('creates nested directories for cert paths', async () => {
       const certPath = join(dir, 'nested', 'deep', 'ca-cert.pem');
       const keyPath = join(dir, 'nested', 'deep', 'ca-key.pem');

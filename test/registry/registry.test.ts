@@ -30,7 +30,7 @@ describe('createRegistry', () => {
       });
 
       expect(client.writeVariable).toHaveBeenCalledWith(
-        'MACF_AGENT_code_agent',
+        'MACF_AGENT_CODE_AGENT',
         expect.stringContaining('"host":"100.86.5.117"'),
       );
     });
@@ -45,7 +45,7 @@ describe('createRegistry', () => {
         started: '2026-01-01T00:00:00Z',
       });
 
-      expect(vi.mocked(client.writeVariable).mock.calls[0]![0]).toBe('MACF_AGENT_test');
+      expect(vi.mocked(client.writeVariable).mock.calls[0]![0]).toBe('MACF_AGENT_TEST');
     });
   });
 
@@ -65,7 +65,7 @@ describe('createRegistry', () => {
       expect(result).not.toBeNull();
       expect(result!.host).toBe('localhost');
       expect(result!.port).toBe(9000);
-      expect(client.readVariable).toHaveBeenCalledWith('MACF_AGENT_code_agent');
+      expect(client.readVariable).toHaveBeenCalledWith('MACF_AGENT_CODE_AGENT');
     });
 
     it('returns null when variable does not exist', async () => {
@@ -99,14 +99,14 @@ describe('createRegistry', () => {
     it('returns agents matching prefix', async () => {
       vi.mocked(client.listVariables).mockResolvedValueOnce([
         {
-          name: 'MACF_AGENT_code_agent',
+          name: 'MACF_AGENT_CODE_AGENT',
           value: JSON.stringify({
             host: 'host1', port: 8800, type: 'permanent',
             instance_id: 'a1', started: '2026-01-01T00:00:00Z',
           }),
         },
         {
-          name: 'MACF_AGENT_science_agent',
+          name: 'MACF_AGENT_SCIENCE_AGENT',
           value: JSON.stringify({
             host: 'host2', port: 8801, type: 'permanent',
             instance_id: 'a2', started: '2026-01-01T00:00:00Z',
@@ -119,28 +119,28 @@ describe('createRegistry', () => {
       const result = await registry.list('');
 
       expect(result).toHaveLength(2);
-      expect(result[0]!.name).toBe('code_agent');
-      expect(result[1]!.name).toBe('science_agent');
+      expect(result[0]!.name).toBe('CODE_AGENT');
+      expect(result[1]!.name).toBe('SCIENCE_AGENT');
     });
 
     it('filters by sub-prefix', async () => {
       vi.mocked(client.listVariables).mockResolvedValueOnce([
         {
-          name: 'MACF_AGENT_code_agent',
+          name: 'MACF_AGENT_CODE_AGENT',
           value: JSON.stringify({
             host: 'h', port: 1, type: 'permanent',
             instance_id: 'x', started: '2026-01-01T00:00:00Z',
           }),
         },
         {
-          name: 'MACF_AGENT_code_agent_2',
+          name: 'MACF_AGENT_CODE_AGENT_2',
           value: JSON.stringify({
             host: 'h', port: 2, type: 'worker',
             instance_id: 'y', started: '2026-01-01T00:00:00Z',
           }),
         },
         {
-          name: 'MACF_AGENT_science_agent',
+          name: 'MACF_AGENT_SCIENCE_AGENT',
           value: JSON.stringify({
             host: 'h', port: 3, type: 'permanent',
             instance_id: 'z', started: '2026-01-01T00:00:00Z',
@@ -152,27 +152,27 @@ describe('createRegistry', () => {
       const result = await registry.list('code');
 
       expect(result).toHaveLength(2);
-      expect(result.map(r => r.name)).toEqual(['code_agent', 'code_agent_2']);
+      expect(result.map(r => r.name)).toEqual(['CODE_AGENT', 'CODE_AGENT_2']);
     });
 
     it('skips variables with invalid JSON', async () => {
       vi.mocked(client.listVariables).mockResolvedValueOnce([
-        { name: 'MACF_AGENT_good', value: JSON.stringify({
+        { name: 'MACF_AGENT_GOOD', value: JSON.stringify({
           host: 'h', port: 1, type: 'permanent', instance_id: 'x', started: '2026-01-01T00:00:00Z',
         }) },
-        { name: 'MACF_AGENT_bad', value: 'not-json' },
+        { name: 'MACF_AGENT_BAD', value: 'not-json' },
       ]);
 
       const registry = createRegistry(client, 'MACF');
       const result = await registry.list('');
 
       expect(result).toHaveLength(1);
-      expect(result[0]!.name).toBe('good');
+      expect(result[0]!.name).toBe('GOOD');
     });
 
     it('skips variables that fail schema validation', async () => {
       vi.mocked(client.listVariables).mockResolvedValueOnce([
-        { name: 'MACF_AGENT_incomplete', value: JSON.stringify({ host: 'h' }) },
+        { name: 'MACF_AGENT_INCOMPLETE', value: JSON.stringify({ host: 'h' }) },
       ]);
 
       const registry = createRegistry(client, 'MACF');
@@ -187,7 +187,7 @@ describe('createRegistry', () => {
       const registry = createRegistry(client, 'MACF');
       await registry.remove('code_agent');
 
-      expect(client.deleteVariable).toHaveBeenCalledWith('MACF_AGENT_code_agent');
+      expect(client.deleteVariable).toHaveBeenCalledWith('MACF_AGENT_CODE_AGENT');
     });
   });
 });

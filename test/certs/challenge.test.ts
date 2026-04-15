@@ -27,11 +27,11 @@ describe('challenge', () => {
       });
 
       expect(result.challengeId).toMatch(/^[0-9a-f]{32}$/);
-      expect(result.instruction).toContain('MACF_CHALLENGE_new_agent');
+      expect(result.instruction).toContain('MACF_CHALLENGE_NEW_AGENT');
       expect(result.instruction).toContain(result.challengeId);
 
       expect(client.writeVariable).toHaveBeenCalledWith(
-        'MACF_CHALLENGE_new_agent',
+        'MACF_CHALLENGE_NEW_AGENT',
         result.challengeId,
       );
     });
@@ -55,8 +55,8 @@ describe('challenge', () => {
       });
 
       expect(storedValue).toBe('abc123');
-      expect(client.readVariable).toHaveBeenCalledWith('MACF_CHALLENGE_new_agent');
-      expect(client.deleteVariable).toHaveBeenCalledWith('MACF_CHALLENGE_new_agent');
+      expect(client.readVariable).toHaveBeenCalledWith('MACF_CHALLENGE_NEW_AGENT');
+      expect(client.deleteVariable).toHaveBeenCalledWith('MACF_CHALLENGE_NEW_AGENT');
     });
 
     it('throws when no challenge variable exists', async () => {
@@ -65,6 +65,21 @@ describe('challenge', () => {
         agentName: 'missing',
         client,
       })).rejects.toThrow(ChallengeError);
+    });
+
+    it('sanitizes hyphens in project and agent name (issue #46)', async () => {
+      // academic-resume / cv-architect are realistic inputs that previously
+      // produced invalid variable names with hyphens.
+      const result = await createChallenge({
+        project: 'academic-resume',
+        agentName: 'cv-architect',
+        client,
+      });
+
+      expect(client.writeVariable).toHaveBeenCalledWith(
+        'ACADEMIC_RESUME_CHALLENGE_CV_ARCHITECT',
+        result.challengeId,
+      );
     });
   });
 });

@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import type { GitHubVariablesClient } from '../registry/types.js';
+import { toVariableSegment } from '../registry/variable-name.js';
 import { MacfError } from '../errors.js';
 
 export class ChallengeError extends MacfError {
@@ -10,7 +11,7 @@ export class ChallengeError extends MacfError {
 }
 
 function challengeVarName(project: string, agentName: string): string {
-  return `${project.toUpperCase()}_CHALLENGE_${agentName}`;
+  return `${toVariableSegment(project)}_CHALLENGE_${toVariableSegment(agentName)}`;
 }
 
 /**

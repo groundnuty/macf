@@ -7,6 +7,7 @@ import {
   x509, webcrypto, RSA_ALGORITHM, CA_CERT_VALIDITY_YEARS,
 } from './crypto-provider.js';
 import type { GitHubVariablesClient } from '../registry/types.js';
+import { toVariableSegment } from '../registry/variable-name.js';
 import { MacfError } from '../errors.js';
 
 export class CaError extends MacfError {
@@ -84,7 +85,7 @@ export async function createCA(config: {
 
   // Upload CA cert to registry (plaintext PEM)
   if (client) {
-    await client.writeVariable(`${project.toUpperCase()}_CA_CERT`, certPem);
+    await client.writeVariable(`${toVariableSegment(project)}_CA_CERT`, certPem);
   }
 
   return { certPem, keyPem };
@@ -101,7 +102,7 @@ export async function backupCAKey(config: {
   readonly client: GitHubVariablesClient;
 }): Promise<void> {
   const encrypted = encryptCAKey(config.keyPem, config.passphrase);
-  const varName = `${config.project.toUpperCase()}_CA_KEY_ENCRYPTED`;
+  const varName = `${toVariableSegment(config.project)}_CA_KEY_ENCRYPTED`;
   await config.client.writeVariable(varName, encrypted);
 }
 
@@ -114,7 +115,7 @@ export async function recoverCAKey(config: {
   readonly keyPath: string;
   readonly client: GitHubVariablesClient;
 }): Promise<string> {
-  const varName = `${config.project.toUpperCase()}_CA_KEY_ENCRYPTED`;
+  const varName = `${toVariableSegment(config.project)}_CA_KEY_ENCRYPTED`;
   const encrypted = await config.client.readVariable(varName);
   if (encrypted === null) {
     throw new CaError('No encrypted CA key found in registry');
