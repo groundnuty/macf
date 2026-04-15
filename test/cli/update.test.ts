@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
-import { mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { update, buildDiff, renderDiff } from '../../src/cli/commands/update.js';
 import { agentConfigPath } from '../../src/cli/config.js';
@@ -198,6 +198,37 @@ describe('update command', () => {
     expect(cfg.versions.cli).toBe('0.3.0');
     expect(cfg.versions.plugin).toBe('0.2.0');
     expect(cfg.versions.actions).toBe('v1'); // not selected
+  });
+
+  it('refreshes canonical rules even when everything is up to date (#52 follow-up)', async () => {
+    // This is the bug: previously copyCanonicalRules only ran after a
+    // successful writeAgentConfig, so workspaces with matching pins never
+    // got new rules even though the installed CLI shipped updated ones.
+    // After the fix, the copy runs right after readAgentConfig succeeds.
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+
+    const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+    expect(code).toBe(0);
+
+    // Should have coordination.md even though no version bump happened.
+    expect(existsSync(join(dir, '.claude', 'rules', 'coordination.md'))).toBe(true);
+    // And the tmux helper script.
+    expect(existsSync(join(dir, '.claude', 'scripts', 'tmux-send-to-claude.sh'))).toBe(true);
+  });
+
+  it('refreshes canonical rules even with legacy config (no versions section)', async () => {
+    // Stale workspaces without a versions section should still get current
+    // rules — users shouldn't have to run `macf init --force` just to pick
+    // up updated coordination rules.
+    writeConfig(dir); // legacy: no versions
+
+    const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+    // Still returns 1 because versions are required for the pin-bump flow,
+    // but the asset refresh should have happened first.
+    expect(code).toBe(1);
+    expect(existsSync(join(dir, '.claude', 'rules', 'coordination.md'))).toBe(true);
+    expect(existsSync(join(dir, '.claude', 'scripts', 'tmux-send-to-claude.sh'))).toBe(true);
   });
 
   it('preserves unrelated config fields when writing', async () => {

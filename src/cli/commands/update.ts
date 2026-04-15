@@ -8,7 +8,7 @@
 import { createInterface } from 'node:readline';
 import { readAgentConfig, writeAgentConfig } from '../config.js';
 import { resolveLatestVersions } from '../version-resolver.js';
-import { copyCanonicalRules } from '../rules.js';
+import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import type { VersionPins } from '../config.js';
 import type { ResolvedVersions } from '../version-resolver.js';
 
@@ -112,6 +112,22 @@ export async function update(
     return 1;
   }
 
+  // Refresh canonical assets (coordination rules + helper scripts) on
+  // every `macf update`, regardless of version-pin state. These are tied
+  // to the installed CLI binary, not to `versions.cli` in the config —
+  // so a newer CLI version always wins, even when pins are unchanged.
+  // Running before any short-circuit also repairs workspaces created
+  // before these assets existed (otherwise they'd never get coordination.md
+  // unless the user happened to bump a pin). See #52 follow-up.
+  const refreshedRules = copyCanonicalRules(projectDir);
+  if (refreshedRules.length > 0) {
+    console.log(`Refreshed ${refreshedRules.length} canonical rule file(s) in .claude/rules/`);
+  }
+  const refreshedScripts = copyCanonicalScripts(projectDir);
+  if (refreshedScripts.length > 0) {
+    console.log(`Refreshed ${refreshedScripts.length} helper script(s) in .claude/scripts/`);
+  }
+
   if (!config.versions) {
     console.error(
       'No "versions" section in macf-agent.json (legacy config).\n' +
@@ -181,13 +197,6 @@ export async function update(
   }
 
   writeAgentConfig(projectDir, { ...config, versions: newVersions });
-
-  // Refresh canonical coordination rules — they ship with the CLI and
-  // should match the running CLI version, so re-copy on every update.
-  const refreshedRules = copyCanonicalRules(projectDir);
-  if (refreshedRules.length > 0) {
-    console.log(`Refreshed ${refreshedRules.length} canonical rule file(s) in .claude/rules/`);
-  }
 
   console.log('\nUpdated:');
   for (const row of toBump) {
