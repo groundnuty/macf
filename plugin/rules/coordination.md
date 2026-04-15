@@ -2,6 +2,8 @@
 
 **This file is the single source of truth for cross-cutting coordination rules that apply to every MACF agent.** It is copied into each agent workspace's `.claude/rules/` by `macf init` and refreshed by `macf update`. Do not edit workspace copies directly — edit this file and re-run `macf update`.
 
+> **Workspaces without full `macf init`** (e.g. `groundnuty/macf` itself, or any Claude Code workspace operated by a bot that isn't a MACF-registered agent) can still get these canonical rules via `macf rules refresh --dir <workspace>`. Same copy, no App credentials or registry required.
+
 The rules here are topology-agnostic: they work whether the project uses a science-agent coordinator (like macf) or peer-to-peer agents with direct user oversight (like CV).
 
 ---
