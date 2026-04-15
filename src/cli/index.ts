@@ -11,6 +11,7 @@ import { showStatus } from './commands/status.js';
 import { listPeers } from './commands/peers.js';
 import { certsInit, certsRecover, certsRotate } from './commands/certs.js';
 import { repoInit } from './commands/repo-init.js';
+import { rulesRefresh } from './commands/rules-refresh.js';
 import { findProjectRoot } from './config.js';
 
 /**
@@ -166,6 +167,24 @@ certs
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .action(async (opts) => {
     await certsRotate(resolveProjectDir(opts.dir));
+  });
+
+const rules = program
+  .command('rules')
+  .description('Canonical coordination rules distribution');
+
+rules
+  .command('refresh')
+  .description('Copy canonical rules + helper scripts into a workspace\'s .claude/ (does NOT require macf init)')
+  .option('--dir <path>', 'Target workspace directory (defaults to current working directory)')
+  .action((opts) => {
+    const target = opts.dir ? resolve(opts.dir) : process.cwd();
+    try {
+      rulesRefresh(target);
+    } catch (err) {
+      console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
   });
 
 program
