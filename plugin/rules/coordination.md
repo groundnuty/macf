@@ -67,6 +67,20 @@ The goal is correctness through dialogue, not compliance.
 
 ---
 
+## Submitting a Prompt to a Claude Code TUI (tmux)
+
+When a hook or script needs to programmatically submit a prompt to a Claude Code TUI running in tmux, **always use the canonical helper**:
+
+        .claude/scripts/tmux-send-to-claude.sh <session-or-empty> "<prompt text>"
+
+Pass `""` for the session to target the current pane.
+
+**Never** call `tmux send-keys "<prompt>" Enter` inline. Claude Code's TUI is in multi-line input mode by default, so a single Enter inserts a newline instead of submitting — the prompt sits in the buffer unsubmitted. The helper handles the submit-quirk correctly: clear existing input with `C-u`, send the text with a first Enter, sleep 1 second (load-bearing — without it tmux batches both Enters and Claude processes them atomically as "newline + newline"), then send a second Enter that actually submits.
+
+The helper is distributed to every agent workspace by `macf init` and refreshed by `macf update` (same mechanism as this rules file). If you're writing a new hook or automation that needs to prompt Claude, use the helper — do not re-implement the pattern.
+
+---
+
 ## Token & Git Hygiene
 
 1. **Refresh GH_TOKEN before every `gh` or `git push`** — tokens are 1-hour installation tokens. Refresh pattern:

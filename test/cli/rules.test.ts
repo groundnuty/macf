@@ -1,8 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { copyCanonicalRules, canonicalRulesDir, findCliPackageRoot } from '../../src/cli/rules.js';
+import {
+  copyCanonicalRules,
+  canonicalRulesDir,
+  copyCanonicalScripts,
+  canonicalScriptsDir,
+  findCliPackageRoot,
+} from '../../src/cli/rules.js';
 
 describe('findCliPackageRoot', () => {
   it('locates the CLI package root by walking up for package.json', () => {
@@ -118,6 +124,103 @@ describe('copyCanonicalRules', () => {
     mkdirSync(workspace);
 
     const copied = copyCanonicalRules(workspace, {
+      canonicalDir: join(tmpRoot, 'does-not-exist'),
+    });
+
+    expect(copied).toEqual([]);
+    expect(existsSync(join(workspace, '.claude'))).toBe(false);
+  });
+});
+
+describe('canonicalScriptsDir', () => {
+  it('points to <repo>/scripts/ in dev layout', () => {
+    const dir = canonicalScriptsDir();
+    expect(dir.endsWith('scripts')).toBe(true);
+    expect(existsSync(dir)).toBe(true);
+  });
+
+  it('tmux-send-to-claude.sh exists in the canonical dir', () => {
+    const dir = canonicalScriptsDir();
+    expect(existsSync(join(dir, 'tmux-send-to-claude.sh'))).toBe(true);
+  });
+});
+
+describe('copyCanonicalScripts', () => {
+  let tmpRoot: string;
+  let fakeCanonical: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'macf-scripts-test-'));
+    fakeCanonical = join(tmpRoot, 'canonical');
+    mkdirSync(fakeCanonical, { recursive: true });
+    writeFileSync(join(fakeCanonical, 'helper.sh'), '#!/usr/bin/env bash\necho hi\n');
+    writeFileSync(join(fakeCanonical, 'other.sh'), '#!/usr/bin/env bash\necho bye\n');
+    // Non-.sh files should be ignored.
+    writeFileSync(join(fakeCanonical, 'README.md'), '# not a script');
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('copies every .sh file to <workspace>/.claude/scripts/', () => {
+    const workspace = join(tmpRoot, 'workspace');
+    mkdirSync(workspace);
+
+    const copied = copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical });
+
+    expect(copied).toContain('helper.sh');
+    expect(copied).toContain('other.sh');
+    expect(copied).not.toContain('README.md');
+
+    const scriptsDir = join(workspace, '.claude', 'scripts');
+    expect(existsSync(scriptsDir)).toBe(true);
+    const files = readdirSync(scriptsDir).sort();
+    expect(files).toEqual(['helper.sh', 'other.sh']);
+  });
+
+  it('copies scripts verbatim without a managed header', () => {
+    const workspace = join(tmpRoot, 'workspace');
+    mkdirSync(workspace);
+
+    copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical });
+
+    const out = readFileSync(join(workspace, '.claude', 'scripts', 'helper.sh'), 'utf-8');
+    expect(out).toBe('#!/usr/bin/env bash\necho hi\n');
+    expect(out.startsWith('<!--')).toBe(false);
+  });
+
+  it('sets executable mode (0o755) on copied scripts', () => {
+    const workspace = join(tmpRoot, 'workspace');
+    mkdirSync(workspace);
+
+    copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical });
+
+    const stats = statSync(join(workspace, '.claude', 'scripts', 'helper.sh'));
+    // Check the owner-execute bit is set. mode & 0o111 == any-execute.
+    expect(stats.mode & 0o111).toBeGreaterThan(0);
+    // Tighter: owner rwx + group rx + other rx.
+    expect(stats.mode & 0o777).toBe(0o755);
+  });
+
+  it('overwrites existing workspace scripts on re-run', () => {
+    const workspace = join(tmpRoot, 'workspace');
+    const scriptsDir = join(workspace, '.claude', 'scripts');
+    mkdirSync(scriptsDir, { recursive: true });
+    writeFileSync(join(scriptsDir, 'helper.sh'), '#!/usr/bin/env bash\necho STALE\n');
+
+    copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical });
+
+    const out = readFileSync(join(scriptsDir, 'helper.sh'), 'utf-8');
+    expect(out).not.toContain('STALE');
+    expect(out).toContain('echo hi');
+  });
+
+  it('returns empty array when canonical dir does not exist (no crash)', () => {
+    const workspace = join(tmpRoot, 'workspace');
+    mkdirSync(workspace);
+
+    const copied = copyCanonicalScripts(workspace, {
       canonicalDir: join(tmpRoot, 'does-not-exist'),
     });
 

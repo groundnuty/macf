@@ -10,7 +10,8 @@
   },
   "files": [
     "dist/",
-    "plugin/rules/"
+    "plugin/rules/",
+    "scripts/"
   ],
   "engines": {
     "node": ">=22"

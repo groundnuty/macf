@@ -8,7 +8,7 @@ import {
 } from '../config.js';
 import { loadCA } from '../../certs/ca.js';
 import { generateAgentCert } from '../../certs/agent-cert.js';
-import { copyCanonicalRules } from '../rules.js';
+import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import {
   resolveLatestVersions, isValidSemver, isValidActionsRef,
   FALLBACK_VERSIONS, statusMessage,
@@ -168,6 +168,14 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   const copiedRules = copyCanonicalRules(absDir);
   if (copiedRules.length > 0) {
     console.log(`  Rules: copied ${copiedRules.length} canonical rule file(s) to .claude/rules/`);
+  }
+
+  // Copy canonical helper scripts (e.g., tmux-send-to-claude.sh) into
+  // <workspace>/.claude/scripts/. Hooks in settings.local.json.example
+  // call these by relative path.
+  const copiedScripts = copyCanonicalScripts(absDir);
+  if (copiedScripts.length > 0) {
+    console.log(`  Scripts: copied ${copiedScripts.length} helper script(s) to .claude/scripts/`);
   }
 
   // Generate agent cert if CA key is available locally (per-project)

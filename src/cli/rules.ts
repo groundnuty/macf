@@ -1,18 +1,20 @@
 /**
- * Distribute canonical coordination rules from the CLI package to each
- * agent workspace's .claude/rules/ directory.
+ * Distribute canonical assets (coordination rules, helper scripts) from
+ * the CLI package to each agent workspace's .claude/ subdirectory.
  *
- * The canonical files live at <package-root>/plugin/rules/*.md and ship
- * with the CLI (their version is tied to the CLI version). On `macf init`
- * we copy them once; on `macf update` we re-copy (overwriting) so a CLI
- * version bump propagates updated rules to existing workspaces.
+ * The canonical files live at <package-root>/plugin/rules/*.md and
+ * <package-root>/scripts/*.sh, shipped with the CLI (their version is
+ * tied to the CLI version). On `macf init` we copy them once; on
+ * `macf update` we re-copy (overwriting) so a CLI version bump
+ * propagates updates to existing workspaces.
  *
- * Workspace copies get a header warning telling the user not to edit
- * them — edits will be silently overwritten on the next `macf update`.
+ * Workspace rule copies get a header warning against direct edits.
+ * Workspace script copies preserve 0755 mode so the hooks that call
+ * them can execute.
  */
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 
 const MANAGED_HEADER = [
   '<!--',
@@ -74,6 +76,44 @@ export function copyCanonicalRules(workspaceDir: string, options: {
     // Avoid double-prepending the header on re-copy.
     const out = content.startsWith('<!--') ? content : MANAGED_HEADER + content;
     writeFileSync(dst, out);
+    copied.push(entry.name);
+  }
+  return copied;
+}
+
+/**
+ * Path to the canonical scripts directory shipped with the CLI.
+ */
+export function canonicalScriptsDir(packageRoot: string = findCliPackageRoot()): string {
+  return join(packageRoot, 'scripts');
+}
+
+/**
+ * Copy every .sh file from the canonical scripts dir to
+ * <workspace>/.claude/scripts/. Preserves executable mode (0o755).
+ *
+ * Unlike copyCanonicalRules, no header is injected — shell scripts
+ * can't take HTML comments, and the shebang + usage comment in the
+ * source already documents managed status.
+ *
+ * Returns copied basenames. Empty array if the canonical dir is missing.
+ */
+export function copyCanonicalScripts(workspaceDir: string, options: {
+  readonly canonicalDir?: string;
+} = {}): readonly string[] {
+  const sourceDir = options.canonicalDir ?? canonicalScriptsDir();
+  if (!existsSync(sourceDir)) return [];
+
+  const targetDir = join(resolve(workspaceDir), '.claude', 'scripts');
+  mkdirSync(targetDir, { recursive: true });
+
+  const copied: string[] = [];
+  for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith('.sh')) continue;
+    const src = join(sourceDir, entry.name);
+    const dst = join(targetDir, entry.name);
+    copyFileSync(src, dst);
+    chmodSync(dst, 0o755);
     copied.push(entry.name);
   }
   return copied;
