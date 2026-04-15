@@ -5,8 +5,19 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+
+// Stub the plugin fetcher for the whole file — otherwise any test that
+// bumps a pin would trigger a real `git clone` of groundnuty/macf-marketplace,
+// making tests network-dependent and slow. workspacePluginDir still returns
+// a real path so the repair-case predicate can inspect it.
+vi.mock('../../src/cli/plugin-fetcher.js', () => ({
+  fetchPluginToWorkspace: vi.fn(),
+  workspacePluginDir: (dir: string) => join(dir, '.macf', 'plugin'),
+}));
+
 import { update, buildDiff, renderDiff } from '../../src/cli/commands/update.js';
 import { agentConfigPath } from '../../src/cli/config.js';
+import { fetchPluginToWorkspace } from '../../src/cli/plugin-fetcher.js';
 import type { ResolvedVersions } from '../../src/cli/version-resolver.js';
 import type { MacfAgentConfig } from '../../src/cli/config.js';
 
@@ -229,6 +240,39 @@ describe('update command', () => {
     expect(code).toBe(1);
     expect(existsSync(join(dir, '.claude', 'rules', 'coordination.md'))).toBe(true);
     expect(existsSync(join(dir, '.claude', 'scripts', 'tmux-send-to-claude.sh'))).toBe(true);
+  });
+
+  it('re-fetches plugin when .macf/plugin/ is present but empty (#62 repair)', async () => {
+    // Workspace init'd before PR #60 merged: .macf/plugin/ exists as an
+    // empty directory. existsSync is true, but pluginDirNeedsRepair must
+    // still treat it as broken.
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
+    // Nothing bumped — same versions returned by the "latest" fetch.
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+
+    vi.mocked(fetchPluginToWorkspace).mockClear();
+    const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+    expect(code).toBe(0);
+
+    // Repair case: fetch should have been invoked exactly once with the
+    // pinned version even though nothing was bumped.
+    expect(fetchPluginToWorkspace).toHaveBeenCalledTimes(1);
+    expect(fetchPluginToWorkspace).toHaveBeenCalledWith(dir, '0.1.0');
+  });
+
+  it('does not re-fetch plugin when .macf/plugin/ is populated and no bump happens', async () => {
+    // Healthy workspace: .macf/plugin/ has content, pins match latest.
+    // Should short-circuit without any plugin refresh.
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
+    writeFileSync(join(dir, '.macf', 'plugin', 'manifest.txt'), 'v0.1.0\n');
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+
+    vi.mocked(fetchPluginToWorkspace).mockClear();
+    await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+
+    expect(fetchPluginToWorkspace).not.toHaveBeenCalled();
   });
 
   it('preserves unrelated config fields when writing', async () => {

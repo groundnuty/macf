@@ -6,7 +6,7 @@
  * version pins, this command is the canonical bumper.
  */
 import { createInterface } from 'node:readline';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { readAgentConfig, writeAgentConfig } from '../config.js';
 import { resolveLatestVersions } from '../version-resolver.js';
 import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
@@ -61,6 +61,17 @@ export function buildDiff(
       status: cur === lat ? ('same' as const) : ('update' as const),
     };
   });
+}
+
+/**
+ * Does the .macf/plugin/ dir need a re-fetch? True if the dir doesn't
+ * exist OR exists but is empty. `existsSync` alone returns true for an
+ * empty dir, which misses the repair case (e.g. workspaces init'd before
+ * #60 merged where the directory was created but never populated).
+ */
+function pluginDirNeedsRepair(dir: string): boolean {
+  if (!existsSync(dir)) return true;
+  return readdirSync(dir).length === 0;
 }
 
 function formatRow(row: DiffRow): string {
@@ -128,6 +139,22 @@ export async function update(
   const refreshedScripts = copyCanonicalScripts(projectDir);
   if (refreshedScripts.length > 0) {
     console.log(`Refreshed ${refreshedScripts.length} helper script(s) in .claude/scripts/`);
+  }
+
+  // Repair-case plugin fetch: if .macf/plugin/ is absent or empty, fetch
+  // the currently-pinned version regardless of whether anything is being
+  // bumped. Runs before every short-circuit so workspaces init'd before
+  // #60 merged (empty .macf/plugin/) don't require `rm -rf + macf update`
+  // to self-heal. See #62. We skip this if config.versions is missing —
+  // legacy configs are handled by the error path below.
+  if (config.versions && pluginDirNeedsRepair(workspacePluginDir(projectDir))) {
+    try {
+      fetchPluginToWorkspace(projectDir, config.versions.plugin);
+      console.log(`Repaired .macf/plugin/ with macf-agent@v${config.versions.plugin}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`Warning: plugin repair fetch failed: ${msg}`);
+    }
   }
 
   if (!config.versions) {
@@ -200,15 +227,11 @@ export async function update(
 
   writeAgentConfig(projectDir, { ...config, versions: newVersions });
 
-  // Re-fetch the plugin if versions.plugin was bumped OR the plugin dir
-  // is missing (repair case: user bumped pin earlier but fetch failed,
-  // or workspace was cloned without .macf/plugin/). Unlike rules/scripts,
-  // plugin fetch is a network clone — we don't want to do it on every
-  // `macf update` unconditionally, only when the pin actually changed
-  // (or needs to).
+  // Re-fetch the plugin when versions.plugin was bumped. The separate
+  // repair-case fetch runs earlier (before short-circuits) for empty/
+  // missing dirs; this block handles the pin-bump case specifically.
   const pluginBumped = toBump.some(r => r.component === 'plugin');
-  const pluginMissing = !existsSync(workspacePluginDir(projectDir));
-  if (pluginBumped || pluginMissing) {
+  if (pluginBumped) {
     try {
       fetchPluginToWorkspace(projectDir, newVersions.plugin);
       console.log(`Refreshed .macf/plugin/ to macf-agent@v${newVersions.plugin}`);
