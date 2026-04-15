@@ -36,6 +36,15 @@ export function agentLogPath(projectDir: string): string {
 
 // --- Agent config (macf-agent.json) ---
 
+// Version pin schema — strings (not enums) so odd pins are allowed if user insists.
+export const VersionPinsSchema = z.object({
+  cli: z.string(),
+  plugin: z.string(),
+  actions: z.string(),
+});
+
+export type VersionPins = z.infer<typeof VersionPinsSchema>;
+
 export const MacfAgentConfigSchema = z.object({
   project: z.string(),
   agent_name: z.string(),
@@ -51,6 +60,9 @@ export const MacfAgentConfigSchema = z.object({
     install_id: z.string(),
     key_path: z.string(),
   }),
+  // Optional for backward compat: legacy configs (pre-P6) lack this field.
+  // `macf init --force` rewrites with resolved versions; `macf update` (PR #5) bumps.
+  versions: VersionPinsSchema.optional(),
 });
 
 export type MacfAgentConfig = z.infer<typeof MacfAgentConfigSchema>;
@@ -84,7 +96,13 @@ export function readAgentConfig(projectDir: string): MacfAgentConfig | null {
   if (!existsSync(path)) return null;
   const raw = JSON.parse(readFileSync(path, 'utf-8'));
   const result = MacfAgentConfigSchema.safeParse(raw);
-  return result.success ? result.data : null;
+  if (!result.success) return null;
+  if (!result.data.versions) {
+    process.stderr.write(
+      `Warning: ${path} has no "versions" section (legacy config). Run \`macf init --force\` to resolve pins.\n`,
+    );
+  }
+  return result.data;
 }
 
 export function writeAgentConfig(projectDir: string, config: MacfAgentConfig): void {

@@ -7,7 +7,11 @@ import {
 } from '../config.js';
 import { loadCA } from '../../certs/ca.js';
 import { generateAgentCert } from '../../certs/agent-cert.js';
-import type { MacfAgentConfig } from '../config.js';
+import {
+  resolveLatestVersions, isValidSemver, isValidActionsRef,
+  FALLBACK_VERSIONS,
+} from '../version-resolver.js';
+import type { MacfAgentConfig, VersionPins } from '../config.js';
 
 export interface InitOptions {
   readonly project: string;
@@ -21,6 +25,59 @@ export interface InitOptions {
   readonly registryOrg?: string;
   readonly registryUser?: string;
   readonly registryRepo?: string;
+  readonly cliVersion?: string;
+  readonly pluginVersion?: string;
+  readonly actionsVersion?: string;
+}
+
+/**
+ * Resolve version pins: explicit flags > network-fetched latest > hardcoded fallback.
+ * Validates any explicit flag against format pattern.
+ */
+async function resolveVersions(opts: InitOptions): Promise<VersionPins> {
+  if (opts.cliVersion && !isValidSemver(opts.cliVersion)) {
+    throw new Error(`--cli-version must be semver (e.g., 0.1.0), got "${opts.cliVersion}"`);
+  }
+  if (opts.pluginVersion && !isValidSemver(opts.pluginVersion)) {
+    throw new Error(`--plugin-version must be semver (e.g., 0.1.0), got "${opts.pluginVersion}"`);
+  }
+  if (opts.actionsVersion && !isValidActionsRef(opts.actionsVersion)) {
+    throw new Error(`--actions-version must be a tag ref (v1, v1.0, v1.0.0), got "${opts.actionsVersion}"`);
+  }
+
+  // Skip the network fetch if all three flags are explicitly set
+  const allSet = opts.cliVersion && opts.pluginVersion && opts.actionsVersion;
+  if (allSet) {
+    return {
+      cli: opts.cliVersion!,
+      plugin: opts.pluginVersion!,
+      actions: opts.actionsVersion!,
+    };
+  }
+
+  let resolved;
+  try {
+    resolved = await resolveLatestVersions();
+    const fallbacks = Object.entries(resolved.sources)
+      .filter(([, src]) => src === 'fallback')
+      .map(([k]) => k);
+    if (fallbacks.length > 0) {
+      process.stderr.write(
+        `Warning: used fallback versions for ${fallbacks.join(', ')} (network fetch failed)\n`,
+      );
+    }
+  } catch {
+    process.stderr.write(
+      'Warning: version resolution failed entirely, using hardcoded fallbacks\n',
+    );
+    resolved = { versions: FALLBACK_VERSIONS, sources: { cli: 'fallback' as const, plugin: 'fallback' as const, actions: 'fallback' as const } };
+  }
+
+  return {
+    cli: opts.cliVersion ?? resolved.versions.cli,
+    plugin: opts.pluginVersion ?? resolved.versions.plugin,
+    actions: opts.actionsVersion ?? resolved.versions.actions,
+  };
 }
 
 /**
@@ -63,6 +120,9 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
       throw new Error(`Unknown registry type: "${regType}"`);
   }
 
+  // Resolve version pins (explicit flags > network-fetched latest > fallback)
+  const versions = await resolveVersions(opts);
+
   // Write agent config
   const config: MacfAgentConfig = {
     project: opts.project,
@@ -75,6 +135,7 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
       install_id: opts.installId,
       key_path: opts.keyPath,
     },
+    versions,
   };
 
   writeAgentConfig(absDir, config);
