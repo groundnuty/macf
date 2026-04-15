@@ -1,5 +1,4 @@
 import { existsSync, mkdirSync } from 'node:fs';
-import { createInterface } from 'node:readline';
 import {
   readAgentConfig, agentCertPath, agentKeyPath,
   caCertPath as caCertPathFor, caKeyPath as caKeyPathFor, caDir,
@@ -9,15 +8,18 @@ import { createCA, backupCAKey, recoverCAKey, loadCA } from '../../certs/ca.js';
 import { generateAgentCert } from '../../certs/agent-cert.js';
 import { createClientFromConfig } from '../registry-helper.js';
 import { generateToken } from '../../token.js';
+import { promptPassword, PromptCancelled } from '../prompt.js';
 
-function promptPassphrase(message: string): Promise<string> {
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  return new Promise((resolve) => {
-    rl.question(message, (answer) => {
-      rl.close();
-      resolve(answer);
-    });
-  });
+async function promptPassphrase(message: string): Promise<string> {
+  try {
+    return await promptPassword({ message });
+  } catch (err) {
+    if (err instanceof PromptCancelled) {
+      console.error('\nCancelled.');
+      process.exit(130); // 128 + SIGINT
+    }
+    throw err;
+  }
 }
 
 function getVariablesClient(config: ReturnType<typeof readAgentConfig>, token: string) {
