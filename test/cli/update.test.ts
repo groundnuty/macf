@@ -34,7 +34,7 @@ describe('buildDiff', () => {
   it('marks out-of-date components as update', () => {
     const resolved: ResolvedVersions = {
       versions: { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' },
-      sources: { cli: 'network', plugin: 'network', actions: 'network' },
+      sources: { cli: 'ok', plugin: 'ok', actions: 'ok' },
     };
     const diff = buildDiff({ cli: '0.1.0', plugin: '0.1.0', actions: 'v1' }, resolved);
     expect(diff[0]).toEqual({ component: 'cli', current: '0.1.0', latest: '0.2.0', status: 'update' });
@@ -45,7 +45,7 @@ describe('buildDiff', () => {
   it('marks fetch failures as fetch_failed', () => {
     const resolved: ResolvedVersions = {
       versions: { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' },
-      sources: { cli: 'fallback', plugin: 'network', actions: 'fallback' },
+      sources: { cli: 'not_published', plugin: 'ok', actions: 'network_error' },
     };
     const diff = buildDiff({ cli: '0.1.0', plugin: '0.1.0', actions: 'v1' }, resolved);
     expect(diff[0]!.status).toBe('fetch_failed');

@@ -10,7 +10,7 @@ import { loadCA } from '../../certs/ca.js';
 import { generateAgentCert } from '../../certs/agent-cert.js';
 import {
   resolveLatestVersions, isValidSemver, isValidActionsRef,
-  FALLBACK_VERSIONS,
+  FALLBACK_VERSIONS, statusMessage,
 } from '../version-resolver.js';
 import type { MacfAgentConfig, VersionPins } from '../config.js';
 
@@ -59,19 +59,29 @@ async function resolveVersions(opts: InitOptions): Promise<VersionPins> {
   let resolved;
   try {
     resolved = await resolveLatestVersions();
-    const fallbacks = Object.entries(resolved.sources)
-      .filter(([, src]) => src === 'fallback')
-      .map(([k]) => k);
-    if (fallbacks.length > 0) {
-      process.stderr.write(
-        `Warning: used fallback versions for ${fallbacks.join(', ')} (network fetch failed)\n`,
-      );
+    // Print one targeted message per non-ok component so the user sees the
+    // actual reason (no release, network down, malformed response) instead
+    // of a single vague "network fetch failed".
+    const notOk = Object.entries(resolved.sources)
+      .filter(([, status]) => status !== 'ok');
+    if (notOk.length > 0) {
+      process.stderr.write('Warning: using default versions for some components:\n');
+      for (const [component, status] of notOk) {
+        process.stderr.write(`  - ${statusMessage(component, status)}\n`);
+      }
     }
   } catch {
     process.stderr.write(
       'Warning: version resolution failed entirely, using hardcoded fallbacks\n',
     );
-    resolved = { versions: FALLBACK_VERSIONS, sources: { cli: 'fallback' as const, plugin: 'fallback' as const, actions: 'fallback' as const } };
+    resolved = {
+      versions: FALLBACK_VERSIONS,
+      sources: {
+        cli: 'network_error' as const,
+        plugin: 'network_error' as const,
+        actions: 'network_error' as const,
+      },
+    };
   }
 
   return {

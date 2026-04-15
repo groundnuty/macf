@@ -47,7 +47,7 @@ export function buildDiff(
   return ALL_COMPONENTS.map(component => {
     const cur = current[component];
     const lat = resolved.versions[component];
-    const fetched = resolved.sources[component] === 'network';
+    const fetched = resolved.sources[component] === 'ok';
     if (!fetched) {
       return { component, current: cur, latest: lat, status: 'fetch_failed' as const };
     }
