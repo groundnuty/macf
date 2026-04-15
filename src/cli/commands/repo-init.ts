@@ -1,0 +1,256 @@
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { generateToken } from '../../token.js';
+
+export interface RepoInitOptions {
+  readonly repo?: string;
+  readonly actionsVersion: string;
+  readonly agents?: string;
+  readonly force: boolean;
+}
+
+interface LabelSpec {
+  readonly name: string;
+  readonly color: string;
+  readonly description: string;
+}
+
+const STATUS_LABELS: readonly LabelSpec[] = [
+  { name: 'in-progress', color: 'fbca04', description: 'Actively being worked on' },
+  { name: 'in-review', color: '0e8a16', description: 'PR created, awaiting review' },
+  { name: 'blocked', color: 'e11d48', description: 'Needs help or input' },
+  { name: 'agent-offline', color: 'b60205', description: 'Agent VM unreachable' },
+];
+
+const AGENT_LABEL_COLOR = '1d76db';
+
+function ensureDir(filePath: string): void {
+  const dir = dirname(filePath);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+}
+
+/**
+ * Detect owner/repo from git remote. Uses execFileSync (no shell injection).
+ */
+function detectRepoFromGit(cwd: string): string | null {
+  try {
+    const remote = execFileSync('git', ['remote', 'get-url', 'origin'], {
+      cwd,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    const match = /github\.com[/:]([\w.-]+)\/([\w.-]+?)(?:\.git)?$/.exec(remote);
+    if (match) return `${match[1]}/${match[2]}`;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function validateVersion(version: string): void {
+  const validPatterns = [/^v\d+$/, /^v\d+\.\d+$/, /^v\d+\.\d+\.\d+$/];
+  const isTag = validPatterns.some(p => p.test(version));
+  if (!isTag && version !== 'main') {
+    process.stderr.write(
+      `Warning: "${version}" is not a tag ref. Production repos should pin to a tag (v1, v1.0, or v1.0.0).\n`,
+    );
+  }
+}
+
+export function generateWorkflow(actionsVersion: string): string {
+  return [
+    'name: Agent Router',
+    'on:',
+    '  issues:',
+    '    types: [labeled, closed]',
+    '  issue_comment:',
+    '    types: [created]',
+    '  pull_request:',
+    '    types: [opened]',
+    '  pull_request_review:',
+    '    types: [submitted]',
+    'jobs:',
+    '  route:',
+    `    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@${actionsVersion}`,
+    '    secrets: inherit',
+    '',
+  ].join('\n');
+}
+
+export function generateAgentConfig(agents: readonly string[]): string {
+  if (agents.length === 0) {
+    return JSON.stringify({
+      agents: {
+        '<agent-name>': {
+          app_name: '<github-app-name>',
+          host: '<agent-host-ip>',
+          tmux_session: '<tmux-session-name>',
+          ssh_user: 'ubuntu',
+          tmux_bin: 'tmux',
+        },
+      },
+    }, null, 2) + '\n';
+  }
+
+  const agentEntries: Record<string, {
+    app_name: string;
+    host: string;
+    tmux_session: string;
+    ssh_user: string;
+    tmux_bin: string;
+  }> = {};
+  for (const agent of agents) {
+    agentEntries[agent] = {
+      app_name: `macf-${agent}`,
+      host: '<agent-host-ip>',
+      tmux_session: agent,
+      ssh_user: 'ubuntu',
+      tmux_bin: 'tmux',
+    };
+  }
+  return JSON.stringify({ agents: agentEntries }, null, 2) + '\n';
+}
+
+export async function createLabel(
+  owner: string,
+  repo: string,
+  token: string,
+  spec: LabelSpec,
+): Promise<'created' | 'exists' | 'failed'> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/labels`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/vnd.github+json',
+      'Authorization': `Bearer ${token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      name: spec.name,
+      color: spec.color,
+      description: spec.description,
+    }),
+  });
+
+  if (res.status === 201) return 'created';
+  if (res.status === 422) return 'exists';
+  return 'failed';
+}
+
+function writeFileSafe(path: string, content: string, force: boolean): 'created' | 'skipped' {
+  if (existsSync(path) && !force) {
+    process.stderr.write(`Skipping existing file (use --force to overwrite): ${path}\n`);
+    return 'skipped';
+  }
+  ensureDir(path);
+  writeFileSync(path, content);
+  return 'created';
+}
+
+/**
+ * Bootstrap a repo for MACF routing.
+ */
+export async function repoInit(
+  projectDir: string,
+  opts: RepoInitOptions,
+): Promise<void> {
+  const absDir = resolve(projectDir);
+
+  validateVersion(opts.actionsVersion);
+
+  const repo = opts.repo ?? detectRepoFromGit(absDir);
+  if (!repo) {
+    throw new Error(
+      '--repo required (or run from a git repo with a GitHub origin remote)',
+    );
+  }
+  const parts = repo.split('/');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    throw new Error(`Invalid repo format: "${repo}". Expected "owner/repo".`);
+  }
+  const [owner, repoName] = parts;
+
+  const agentList = opts.agents ? opts.agents.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+  const workflowPath = join(absDir, '.github', 'workflows', 'agent-router.yml');
+  const configPath = join(absDir, '.github', 'agent-config.json');
+
+  const workflowResult = writeFileSafe(
+    workflowPath,
+    generateWorkflow(opts.actionsVersion),
+    opts.force,
+  );
+  const configResult = writeFileSafe(
+    configPath,
+    generateAgentConfig(agentList),
+    opts.force,
+  );
+
+  const allLabels: LabelSpec[] = [...STATUS_LABELS];
+  for (const agent of agentList) {
+    allLabels.push({
+      name: agent,
+      color: AGENT_LABEL_COLOR,
+      description: `Assigned to ${agent}[bot]`,
+    });
+  }
+
+  let token: string;
+  try {
+    token = await generateToken();
+  } catch (err) {
+    process.stderr.write(
+      `Warning: could not generate token (${err instanceof Error ? err.message : 'unknown'}). Skipping label creation.\n`,
+    );
+    printResults(workflowResult, configResult, [], [], []);
+    printNextSteps(configResult, agentList);
+    return;
+  }
+
+  const created: string[] = [];
+  const existed: string[] = [];
+  const failed: string[] = [];
+
+  for (const spec of allLabels) {
+    const result = await createLabel(owner, repoName, token, spec);
+    if (result === 'created') created.push(spec.name);
+    else if (result === 'exists') existed.push(spec.name);
+    else failed.push(spec.name);
+  }
+
+  printResults(workflowResult, configResult, created, existed, failed);
+  printNextSteps(configResult, agentList);
+}
+
+function printResults(
+  workflowResult: 'created' | 'skipped',
+  configResult: 'created' | 'skipped',
+  created: readonly string[],
+  existed: readonly string[],
+  failed: readonly string[],
+): void {
+  if (workflowResult === 'created') console.log('✓ Created .github/workflows/agent-router.yml');
+  if (configResult === 'created') console.log('✓ Created .github/agent-config.json');
+  if (created.length > 0) console.log(`✓ Created labels: ${created.join(', ')}`);
+  if (existed.length > 0) console.log(`  Labels already exist: ${existed.join(', ')}`);
+  if (failed.length > 0) console.error(`✗ Failed to create labels: ${failed.join(', ')}`);
+}
+
+function printNextSteps(
+  configResult: 'created' | 'skipped',
+  agentList: readonly string[],
+): void {
+  console.log('\nNext steps:\n');
+  if (configResult === 'created' && agentList.length === 0) {
+    console.log('  1. Edit .github/agent-config.json to set your agents\' hosts and tmux sessions');
+  } else if (configResult === 'created') {
+    console.log('  1. Edit .github/agent-config.json and replace <agent-host-ip> placeholders');
+  }
+  console.log('  2. Set repo secrets (Settings → Secrets and variables → Actions):');
+  console.log('       - AGENT_SSH_KEY: SSH private key for connecting to agent hosts');
+  console.log('       - TS_OAUTH_CLIENT_ID: Tailscale OAuth client ID');
+  console.log('       - TS_OAUTH_SECRET: Tailscale OAuth secret');
+  console.log('  3. Install your agent GitHub Apps on this repo');
+  console.log('  4. Commit and push: git add .github/ && git commit -m "chore: bootstrap MACF routing"');
+}

@@ -8,6 +8,7 @@ import { updatePlugin } from './commands/update.js';
 import { showStatus } from './commands/status.js';
 import { listPeers } from './commands/peers.js';
 import { certsInit, certsRecover, certsRotate } from './commands/certs.js';
+import { repoInit } from './commands/repo-init.js';
 
 const program = new Command();
 
@@ -100,6 +101,22 @@ program
   .description('Print agent project path (for shell: cd $(macf cd code-agent))')
   .action((agentName: string) => {
     cdAgent(agentName);
+  });
+
+program
+  .command('repo-init')
+  .description('Bootstrap a repo for MACF routing (generates workflow + config, creates labels)')
+  .option('--repo <owner/repo>', 'Target GitHub repo (defaults to current dir\'s origin remote)')
+  .option('--actions-version <version>', 'macf-actions tag to pin to', 'v1')
+  .option('--agents <list>', 'Comma-separated agent names to scaffold (e.g., code-agent,science-agent)')
+  .option('--force', 'Overwrite existing files', false)
+  .action(async (opts) => {
+    await repoInit(process.cwd(), {
+      repo: opts.repo,
+      actionsVersion: opts.actionsVersion,
+      agents: opts.agents,
+      force: opts.force,
+    });
   });
 
 program.parseAsync(process.argv).catch((err: Error) => {
