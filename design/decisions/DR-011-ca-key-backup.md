@@ -95,9 +95,14 @@ No `jq` unwrap step for v1 because the value is not JSON-wrapped.
 3. If v1, emit:
    ```
    Migrating CA key encryption: v1/iter=10000 → v2/iter=600000 for project {PROJECT}.
-   This is a one-time passphrase prompt; you won't see it again on this workspace.
+   This is a one-time passphrase prompt for this project; subsequent `macf update`
+   runs in this or any other workspace for the same project won't re-prompt.
    Enter CA key passphrase:
    ```
+
+   The migration is per-project (per-registry-variable), not per-workspace —
+   multi-workspace projects (e.g. multiple agents sharing one project registry)
+   see a single prompt on whichever workspace runs `macf update` first.
 4. Prompt for passphrase, decrypt at v1/10k, re-encrypt at v2/600k
 5. Write the new JSON envelope back to the registry
 
