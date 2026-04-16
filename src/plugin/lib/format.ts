@@ -105,6 +105,42 @@ export function formatPeerTable(
 }
 
 /**
+ * Format a detailed view of a single agent's health (for `/macf-ping`).
+ * Covers the live-health case (cert present, ping succeeded) and the
+ * offline case (registration known, ping failed). See #85.
+ */
+export function formatHealthDetail(
+  name: string,
+  info: PeerEntry['info'],
+  health: HealthResponse | null,
+): string {
+  const lines: string[] = [];
+  lines.push(`=== ${name} ===`);
+  lines.push('');
+  lines.push(`Endpoint:  ${info.host}:${info.port}`);
+  lines.push(`Type:      ${info.type}`);
+  lines.push(`Instance:  ${info.instance_id}`);
+  lines.push(`Started:   ${info.started}`);
+  lines.push('');
+  if (health) {
+    lines.push(`Status:    ${health.status}`);
+    lines.push(`Uptime:    ${formatUptime(health.uptime_seconds)}`);
+    lines.push(`Version:   ${health.version}`);
+    if (health.current_issue) {
+      lines.push(`Working:   issue #${health.current_issue}`);
+    } else {
+      lines.push(`Working:   idle`);
+    }
+    if (health.last_notification) {
+      lines.push(`Last ping: ${health.last_notification}`);
+    }
+  } else {
+    lines.push('Status:    offline (no response to /health ping)');
+  }
+  return lines.join('\n');
+}
+
+/**
  * Format pending issues for display.
  */
 export function formatIssues(

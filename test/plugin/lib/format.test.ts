@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { formatDashboard, formatPeerTable, formatIssues } from '../../../src/plugin/lib/format.js';
+import { formatDashboard, formatPeerTable, formatHealthDetail, formatIssues } from '../../../src/plugin/lib/format.js';
 import type { HealthResponse } from '../../../src/types.js';
 import type { OwnRegistration } from '../../../src/plugin/lib/registry.js';
+import type { AgentInfo } from '../../../src/registry/types.js';
 
 const sampleHealth: HealthResponse = {
   agent: 'code-agent',
@@ -100,6 +101,54 @@ describe('formatPeerTable', () => {
     expect(output).toContain('online');
     expect(output).toContain('science-agent');
     expect(output).toContain('offline');
+  });
+});
+
+describe('formatHealthDetail (#85)', () => {
+  const sampleInfo: AgentInfo = {
+    host: '100.86.5.117',
+    port: 8847,
+    type: 'permanent',
+    instance_id: 'abc123',
+    started: '2026-04-16T10:00:00Z',
+  };
+
+  it('shows full health when ping succeeded', () => {
+    const output = formatHealthDetail('code-agent', sampleInfo, sampleHealth);
+    expect(output).toContain('code-agent');
+    expect(output).toContain('100.86.5.117:8847');
+    expect(output).toContain('abc123');
+    expect(output).toContain('permanent');
+    expect(output).toContain('2026-04-16T10:00:00Z');
+    expect(output).toContain('online');
+    expect(output).toContain('1h');
+    expect(output).toContain('#42');
+  });
+
+  it('shows offline when ping returned null', () => {
+    const output = formatHealthDetail('code-agent', sampleInfo, null);
+    expect(output).toContain('code-agent');
+    // Registration details still shown even when offline
+    expect(output).toContain('100.86.5.117:8847');
+    expect(output).toContain('abc123');
+    // Clear offline message
+    expect(output).toContain('offline');
+    expect(output).toContain('no response');
+    // No stale health fields in the output
+    expect(output).not.toContain('online');
+    expect(output).not.toContain('Uptime:');
+  });
+
+  it('shows idle when agent is online with no current issue', () => {
+    const idle: HealthResponse = { ...sampleHealth, current_issue: null };
+    const output = formatHealthDetail('code-agent', sampleInfo, idle);
+    expect(output).toContain('idle');
+  });
+
+  it('omits last_notification line when null', () => {
+    const noPing: HealthResponse = { ...sampleHealth, last_notification: null };
+    const output = formatHealthDetail('code-agent', sampleInfo, noPing);
+    expect(output).not.toContain('Last ping:');
   });
 });
 

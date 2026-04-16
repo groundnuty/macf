@@ -10,11 +10,14 @@
  *   node macf-plugin-cli.js issues
  */
 import 'reflect-metadata';
-import { formatDashboard, formatPeerTable, formatIssues } from '../lib/format.js';
+import { readFileSync } from 'node:fs';
+import { formatDashboard, formatPeerTable, formatHealthDetail, formatIssues } from '../lib/format.js';
 import { getOwnRegistration, listPeers } from '../lib/registry.js';
+import { pingAgent } from '../lib/health.js';
 import { checkIssues } from '../lib/work.js';
 import { createRegistryFromConfig } from '../../registry/factory.js';
 import { generateToken } from '../../token.js';
+import { toVariableSegment } from '../../registry/variable-name.js';
 import type { RegistryConfig } from '../../registry/types.js';
 
 const command = process.argv[2];
@@ -71,13 +74,50 @@ async function main(): Promise<void> {
     }
 
     case 'ping': {
+      // #85: invoke the canonical pingAgent over mTLS and format detailed
+      // health. Previously this was a placeholder that just printed a TODO.
       const targetName = process.argv[3];
       if (!targetName) {
         console.error('Usage: macf-plugin-cli ping <agent-name>');
         process.exitCode = 1;
         return;
       }
-      console.log(`Pinging ${targetName}... (requires mTLS certs — use /macf-status for full health check)`);
+      const caCertPath = process.env['MACF_CA_CERT'];
+      const agentCertPath = process.env['MACF_AGENT_CERT'];
+      const agentKeyPath = process.env['MACF_AGENT_KEY'];
+      if (!caCertPath || !agentCertPath || !agentKeyPath) {
+        console.error(
+          'Error: MACF_CA_CERT / MACF_AGENT_CERT / MACF_AGENT_KEY must be set.\n' +
+          '       These are set by claude.sh after `macf init`. Run /macf-ping from a macf workspace.',
+        );
+        process.exitCode = 1;
+        return;
+      }
+
+      const token = await generateToken();
+      const registry = createRegistryFromConfig(registryConfig, project, token);
+      // Look up the target in the registry. Names in the registry are
+      // sanitized (uppercase, underscores), so match in that space.
+      const peers = await listPeers(registry);
+      const targetSanitized = toVariableSegment(targetName);
+      const target = peers.find(p => p.name === targetSanitized);
+      if (!target) {
+        console.error(`Error: agent '${targetName}' not found in registry`);
+        process.exitCode = 1;
+        return;
+      }
+
+      const caCertPem = readFileSync(caCertPath, 'utf-8');
+      const health = await pingAgent({
+        host: target.info.host,
+        port: target.info.port,
+        caCertPem,
+        certPath: agentCertPath,
+        keyPath: agentKeyPath,
+      });
+
+      console.log(formatHealthDetail(targetName, target.info, health));
+      if (!health) process.exitCode = 1;
       break;
     }
 
