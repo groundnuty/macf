@@ -45,10 +45,17 @@ export function createGitHubClient(
 ): GitHubVariablesClient {
   const baseUrl = `${API_BASE}${pathPrefix}/actions/variables`;
 
+  // Belt-and-suspenders: every caller currently runs names through
+  // toVariableSegment (uppercase + underscores + digits, URL-safe),
+  // but encoding here defends against a future caller forgetting the
+  // sanitizer — raw interpolation would silently produce a malformed
+  // URL or hit an adjacent variable. (#109 H2)
+  const encodeName = (name: string): string => encodeURIComponent(name);
+
   return {
     async writeVariable(name: string, value: string): Promise<void> {
       // Try PATCH (update) first
-      const patchRes = await fetch(`${baseUrl}/${name}`, {
+      const patchRes = await fetch(`${baseUrl}/${encodeName(name)}`, {
         method: 'PATCH',
         headers: { ...headers(token), 'Content-Type': 'application/json' },
         body: JSON.stringify({ value }),
@@ -79,7 +86,7 @@ export function createGitHubClient(
     },
 
     async readVariable(name: string): Promise<string | null> {
-      const res = await fetch(`${baseUrl}/${name}`, {
+      const res = await fetch(`${baseUrl}/${encodeName(name)}`, {
         method: 'GET',
         headers: headers(token),
       });
@@ -131,7 +138,7 @@ export function createGitHubClient(
     },
 
     async deleteVariable(name: string): Promise<void> {
-      const res = await fetch(`${baseUrl}/${name}`, {
+      const res = await fetch(`${baseUrl}/${encodeName(name)}`, {
         method: 'DELETE',
         headers: headers(token),
       });

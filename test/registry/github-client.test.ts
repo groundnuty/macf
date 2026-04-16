@@ -31,6 +31,22 @@ describe('createGitHubClient', () => {
       expect(mockFetch.mock.calls[0]![1]!.method).toBe('PATCH');
     });
 
+    it('URL-encodes variable names in fetch URLs (#109 H2)', async () => {
+      // Belt-and-suspenders: current callers pass names through
+      // toVariableSegment (URL-safe already), but a future caller that
+      // forgets should not produce a malformed URL or silently hit an
+      // adjacent variable. Use a name with chars that change under
+      // encodeURIComponent to verify encoding is applied.
+      mockFetch.mockResolvedValueOnce(jsonResponse(204, null));
+
+      await client.writeVariable('WEIRD NAME/Foo', 'v');
+
+      const url = mockFetch.mock.calls[0]![0] as string;
+      // Space becomes %20, slash becomes %2F.
+      expect(url).toContain('WEIRD%20NAME%2FFoo');
+      expect(url).not.toContain('WEIRD NAME/Foo');
+    });
+
     it('creates new variable with POST when PATCH returns 404', async () => {
       mockFetch
         .mockResolvedValueOnce(jsonResponse(404, { message: 'Not Found' }))

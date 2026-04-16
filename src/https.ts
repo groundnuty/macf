@@ -1,21 +1,26 @@
 import { createServer, type Server as NodeHttpsServer } from 'node:https';
 import type { TLSSocket } from 'node:tls';
 import { readFileSync } from 'node:fs';
+import { randomInt } from 'node:crypto';
 import { NotifyPayloadSchema, SignRequestSchema } from './types.js';
 import type { NotifyPayload, SignRequest, HealthResponse, HttpsServer, Logger } from './types.js';
 import { PortExhaustedError, PortUnavailableError, HttpsServerError } from './errors.js';
 
 const MAX_BODY_BYTES = 64 * 1024; // 64KB
-const PORT_RANGE_START = 8800;
-const PORT_RANGE_SIZE = 1000;
+export const PORT_RANGE_START = 8800;
+export const PORT_RANGE_SIZE = 1000;
 const MAX_PORT_ATTEMPTS = 10;
 
 interface NodeError extends Error {
   readonly code?: string;
 }
 
-function randomPort(): number {
-  return PORT_RANGE_START + Math.floor(Math.random() * PORT_RANGE_SIZE);
+// Exported for tests (#109 H1). Uses crypto.randomInt (CSPRNG)
+// rather than a weak PRNG — port numbers aren't secrets, but the
+// canonical defensive pattern for random in security-adjacent code
+// paths is the CSPRNG.
+export function randomPort(): number {
+  return PORT_RANGE_START + randomInt(PORT_RANGE_SIZE);
 }
 
 function sendJson(
