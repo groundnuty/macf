@@ -68,6 +68,32 @@ describe('generateAgentConfig', () => {
     expect(() => JSON.parse(generateAgentConfig([]))).not.toThrow();
     expect(() => JSON.parse(generateAgentConfig(['a', 'b']))).not.toThrow();
   });
+
+  it('groups multiple agents into a shared session with per-agent windows when --session-name is given (#69)', () => {
+    const json = generateAgentConfig(['code-agent', 'science-agent'], 'macf');
+    const parsed = JSON.parse(json);
+    expect(parsed.agents['code-agent'].tmux_session).toBe('macf');
+    expect(parsed.agents['code-agent'].tmux_window).toBe('code-agent');
+    expect(parsed.agents['science-agent'].tmux_session).toBe('macf');
+    expect(parsed.agents['science-agent'].tmux_window).toBe('science-agent');
+  });
+
+  it('omits tmux_window for a single agent even when --session-name is given', () => {
+    // One agent means windowing is pure overhead — keep the simple layout.
+    const json = generateAgentConfig(['code-agent'], 'macf');
+    const parsed = JSON.parse(json);
+    expect(parsed.agents['code-agent'].tmux_session).toBe('code-agent');
+    expect(parsed.agents['code-agent']).not.toHaveProperty('tmux_window');
+  });
+
+  it('omits tmux_window when --session-name is not provided (backward compat)', () => {
+    const json = generateAgentConfig(['code-agent', 'science-agent']);
+    const parsed = JSON.parse(json);
+    expect(parsed.agents['code-agent'].tmux_session).toBe('code-agent');
+    expect(parsed.agents['code-agent']).not.toHaveProperty('tmux_window');
+    expect(parsed.agents['science-agent'].tmux_session).toBe('science-agent');
+    expect(parsed.agents['science-agent']).not.toHaveProperty('tmux_window');
+  });
 });
 
 describe('createLabel', () => {
