@@ -129,11 +129,21 @@ export async function generateCSR(agentName: string): Promise<{
 }
 
 /**
- * Extract the CN from a subject string like "CN=code-agent".
+ * Extract the CN from a subject string like "CN=code-agent" or
+ * "O=foo,CN=code-agent,OU=bar".
+ *
+ * Returns undefined if the subject contains ZERO or MULTIPLE CN fields.
+ * A multi-CN subject ("CN=attacker,CN=victim") is explicitly rejected
+ * — signCSR surfaces a specific error so the confused-deputy attack
+ * can't slip through the agent-name equality check. See #89.
+ *
+ * Exported for unit tests.
  */
-function extractCN(subject: string): string | undefined {
-  const match = /CN=([^,]+)/i.exec(subject);
-  return match?.[1]?.trim();
+export function extractCN(subject: string): string | undefined {
+  const matches = subject.match(/(?:^|,\s*)CN=([^,]+)/gi);
+  if (!matches || matches.length !== 1) return undefined;
+  const inner = /CN=([^,]+)/i.exec(matches[0]);
+  return inner?.[1]?.trim();
 }
 
 /**
@@ -157,8 +167,16 @@ export async function signCSR(config: {
     throw new AgentCertError('CSR signature verification failed');
   }
 
-  // Verify CN matches agent name
+  // Verify CN matches agent name. extractCN returns undefined when the
+  // subject has zero OR multiple CN fields — surface that specifically
+  // so operators see "subject malformed" rather than "CN undefined does
+  // not match ..." (see #89).
   const cn = extractCN(csr.subject);
+  if (cn === undefined) {
+    throw new AgentCertError(
+      `CSR subject must contain exactly one CN field (got: "${csr.subject}")`,
+    );
+  }
   if (cn !== agentName) {
     throw new AgentCertError(
       `CSR CN "${cn}" does not match agent name "${agentName}"`,
