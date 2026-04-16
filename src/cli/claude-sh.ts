@@ -44,6 +44,7 @@ export function generateClaudeSh(config: MacfAgentConfig): string {
     `export INSTALL_ID="${config.github_app.install_id}"`,
     `export KEY_PATH="${config.github_app.key_path}"`,
     `export MACF_CA_CERT="$HOME/.macf/certs/${config.project}/ca-cert.pem"`,
+    `export MACF_CA_KEY="$HOME/.macf/certs/${config.project}/ca-key.pem"`,
     'export MACF_AGENT_CERT="$SCRIPT_DIR/.macf/certs/agent-cert.pem"',
     'export MACF_AGENT_KEY="$SCRIPT_DIR/.macf/certs/agent-key.pem"',
     'export MACF_LOG_PATH="$SCRIPT_DIR/.macf/logs/channel.log"',

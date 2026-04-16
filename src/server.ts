@@ -91,7 +91,7 @@ async function main(): Promise<void> {
     // Try to load CA key — if not available, this agent can't sign.
     let ca: { certPem: string; keyPem: string };
     try {
-      ca = loadCA(config.caCertPath, config.caCertPath.replace('-cert.pem', '-key.pem'));
+      ca = loadCA(config.caCertPath, config.caKeyPath);
     } catch {
       const err = new Error('CA key not available on this agent');
       (err as { status?: number }).status = 503;

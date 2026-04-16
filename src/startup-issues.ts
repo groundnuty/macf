@@ -56,14 +56,18 @@ export async function checkPendingIssues(config: {
 
   logger.info('startup_issues_found', { count: issues.length });
 
-  const summaries = issues.map(i => `#${i.number}: ${i.title}`);
-  const message = `Pending issues found at startup:\n${summaries.join('\n')}`;
-
-  await onNotify({
-    type: 'startup_check',
-    message,
-    issue_number: issues[0]!.number,
-    title: issues[0]!.title,
-    source: 'startup',
-  });
+  // One routing event per queued issue (#103 R1). Pre-fix, only the
+  // first issue's metadata was delivered to the router — extras were
+  // silently dropped. Sequential delivery matches the natural 1-issue-
+  // 1-routing-event model and keeps the router's per-issue context
+  // separate.
+  for (const issue of issues) {
+    await onNotify({
+      type: 'startup_check',
+      message: `Pending issue #${issue.number}: ${issue.title}`,
+      issue_number: issue.number,
+      title: issue.title,
+      source: 'startup',
+    });
+  }
 }

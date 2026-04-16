@@ -234,4 +234,39 @@ describe('loadConfig', () => {
     const config = loadConfig();
     expect(config.advertiseHost).toBe('10.0.0.1');
   });
+
+  describe('caKeyPath (#103 R3)', () => {
+    // Pre-#103: server.ts derived CA key path via
+    //   config.caCertPath.replace('-cert.pem', '-key.pem')
+    // on every /sign call. Fragile: a path like /etc/ca-cert.pem.bak
+    // becomes /etc/ca-key.pem.bak (wrong dir/suffix) silently.
+    //
+    // Fix: explicit MACF_CA_KEY env + config field. Derivation moves
+    // into config.ts as a one-time fallback with a deprecation warning.
+
+    it('reads MACF_CA_KEY when set', () => {
+      setMinimalEnv();
+      process.env['MACF_CA_KEY'] = EXISTING_FILE;
+      const config = loadConfig();
+      expect(config.caKeyPath).toBe(EXISTING_FILE);
+    });
+
+    it('falls back to derived path from MACF_CA_CERT when MACF_CA_KEY unset', () => {
+      // Existing behavior preserved for workspaces that haven't re-run
+      // `macf update` yet. Derivation is the well-known -cert.pem →
+      // -key.pem swap applied to the literal caCertPath string.
+      setMinimalEnv();
+      // package.json doesn't contain "-cert.pem", so the fallback
+      // returns the cert path unchanged (derivation is best-effort).
+      const config = loadConfig();
+      expect(config.caKeyPath).toBe(EXISTING_FILE);
+    });
+
+    it('throws when MACF_CA_KEY points to a nonexistent file', () => {
+      setMinimalEnv();
+      process.env['MACF_CA_KEY'] = '/nonexistent/ca-key.pem';
+      expect(() => loadConfig()).toThrow(ConfigError);
+      expect(() => loadConfig()).toThrow('File not found');
+    });
+  });
 });

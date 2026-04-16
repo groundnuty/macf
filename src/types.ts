@@ -44,6 +44,7 @@ export interface AgentConfig {
   readonly advertiseHost: string;
   readonly port: number;
   readonly caCertPath: string;
+  readonly caKeyPath: string;
   readonly agentCertPath: string;
   readonly agentKeyPath: string;
   readonly debug: boolean;

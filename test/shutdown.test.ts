@@ -127,4 +127,106 @@ describe('registerShutdownHandler', () => {
       expect.objectContaining({ error: 'stop failed' }),
     );
   });
+
+  describe('exit code on cleanup failure (#103 R2)', () => {
+    // Pre-#103: SIGTERM handler unconditionally called process.exit(0)
+    // even when registry.remove or httpsServer.stop threw. External
+    // monitors (systemd, macf-actions heartbeat) saw clean exit and
+    // never surfaced the degraded state (stale registry variable
+    // claiming the agent was still up).
+    let exitSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      exitSpy = vi.spyOn(process, 'exit').mockImplementation(
+        (() => { /* noop */ }) as never,
+      );
+    });
+
+    afterEach(() => {
+      exitSpy.mockRestore();
+    });
+
+    it('cleanup() returns true on clean shutdown', async () => {
+      const cleanup = registerShutdownHandler({
+        agentName: 'agent',
+        registry: mockRegistry(),
+        httpsServer: mockServer(),
+        logger: mockLogger(),
+      });
+
+      const result = await cleanup();
+      expect(result).toBe(true);
+    });
+
+    it('cleanup() returns false when registry.remove throws', async () => {
+      const registry = mockRegistry();
+      vi.mocked(registry.remove).mockRejectedValueOnce(new Error('api error'));
+
+      const cleanup = registerShutdownHandler({
+        agentName: 'agent',
+        registry,
+        httpsServer: mockServer(),
+        logger: mockLogger(),
+      });
+
+      const result = await cleanup();
+      expect(result).toBe(false);
+    });
+
+    it('cleanup() returns false when server.stop throws', async () => {
+      const server = mockServer();
+      vi.mocked(server.stop).mockRejectedValueOnce(new Error('stop error'));
+
+      const cleanup = registerShutdownHandler({
+        agentName: 'agent',
+        registry: mockRegistry(),
+        httpsServer: server,
+        logger: mockLogger(),
+      });
+
+      const result = await cleanup();
+      expect(result).toBe(false);
+    });
+
+    it('SIGTERM handler exits non-zero when cleanup fails', async () => {
+      const registry = mockRegistry();
+      vi.mocked(registry.remove).mockRejectedValueOnce(new Error('api error'));
+
+      registerShutdownHandler({
+        agentName: 'agent',
+        registry,
+        httpsServer: mockServer(),
+        logger: mockLogger(),
+      });
+
+      // Extract the handler wired by process.on('SIGTERM', ...)
+      const sigtermCall = processOnSpy.mock.calls.find(c => c[0] === 'SIGTERM')!;
+      const handler = sigtermCall[1] as () => void;
+      handler();
+
+      // Wait for the async cleanup chain to flush.
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    it('SIGTERM handler exits 0 on clean shutdown', async () => {
+      registerShutdownHandler({
+        agentName: 'agent',
+        registry: mockRegistry(),
+        httpsServer: mockServer(),
+        logger: mockLogger(),
+      });
+
+      const sigtermCall = processOnSpy.mock.calls.find(c => c[0] === 'SIGTERM')!;
+      const handler = sigtermCall[1] as () => void;
+      handler();
+
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    });
+  });
 });
