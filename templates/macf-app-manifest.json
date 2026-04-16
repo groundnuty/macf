@@ -1,0 +1,28 @@
+{
+  "_comment_permissions": "MACF App minimum permission set per DR-019. `actions: read` is included for coordinator/review agents to debug team workflow runs via `gh run list` — leaving it off triggers a 401 that silently falls through to stored user auth (see issue #72 for the attribution trap).",
+  "_comment_events": "MACF agents react to issues (labels + comments) and PRs (created + reviewed). Adjust if your agent participates in different coordination surfaces.",
+
+  "name": "macf-<agent-role>",
+  "url": "https://github.com/groundnuty/macf",
+  "hook_attributes": {
+    "url": "https://example.com/webhook",
+    "active": false
+  },
+  "redirect_url": "https://example.com/redirect",
+  "public": false,
+  "default_permissions": {
+    "metadata": "read",
+    "contents": "write",
+    "issues": "write",
+    "pull_requests": "write",
+    "variables": "write",
+    "workflows": "write",
+    "actions": "read"
+  },
+  "default_events": [
+    "issues",
+    "issue_comment",
+    "pull_request",
+    "pull_request_review"
+  ]
+}

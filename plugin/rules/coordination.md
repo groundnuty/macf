@@ -110,6 +110,7 @@ The helper is distributed to every agent workspace by `macf init` and refreshed 
 
      against the SHA256 shown on GitHub → App settings → Private keys.
    - **Wrong App/installation ID** — double-check `$APP_ID` and `$INSTALL_ID` in `.claude/settings.local.json`.
+   - **Missing App permission** — a 401 on a specific endpoint (e.g. `gh run list` returns 401 while `gh issue list` works) typically means the App lacks the permission for that resource. Coordinator/review agents especially need `actions: read` to debug team workflow runs — see DR-019 for the full required permission set. A missing permission is another flavor of the attribution trap: the bot call 401s, `gh` falls through to stored user auth, operations run as the user without surfacing the issue.
 
 4. **Never bake tokens into `git remote set-url`** — use `-c url.insteadOf` for each push so tokens don't persist in remote URLs.
 
