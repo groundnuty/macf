@@ -7,11 +7,15 @@
  */
 import { createInterface } from 'node:readline';
 import { existsSync, readdirSync } from 'node:fs';
-import { readAgentConfig, writeAgentConfig } from '../config.js';
+import { readAgentConfig, writeAgentConfig, tokenSourceFromConfig } from '../config.js';
 import { resolveLatestVersions } from '../version-resolver.js';
 import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import { fetchPluginToWorkspace, workspacePluginDir } from '../plugin-fetcher.js';
 import { writeClaudeSh } from '../claude-sh.js';
+import { createClientFromConfig } from '../registry-helper.js';
+import { generateToken } from '../../token.js';
+import { promptPassword, PromptCancelled } from '../prompt.js';
+import { migrateCaKeyToV2, formatMigrationResult } from './migrate-ca-key.js';
 import type { VersionPins } from '../config.js';
 import type { ResolvedVersions } from '../version-resolver.js';
 
@@ -159,6 +163,37 @@ export async function update(
   // for legacy configs (before the error-exit for missing versions).
   writeClaudeSh(projectDir, config);
   console.log(`Refreshed claude.sh from current launcher template`);
+
+  // DR-011 rev2 auto-migrate: check for legacy v1 CA key backup and
+  // upgrade it to v2 (JSON envelope at 600k iters) if found. One-time
+  // per project, silent no-op if already v2 or no backup exists.
+  // Failures here do NOT block `macf update` — the migration is
+  // independent of version bumps and the v1 blob stays decryptable
+  // via the read-compat path. See #115.
+  try {
+    const token = await generateToken(tokenSourceFromConfig(projectDir, config));
+    const client = createClientFromConfig(config.registry, token);
+    const result = await migrateCaKeyToV2({
+      project: config.project,
+      client,
+      prompt: async (message) => {
+        try {
+          return await promptPassword({ message });
+        } catch (err) {
+          if (err instanceof PromptCancelled) {
+            return '';
+          }
+          throw err;
+        }
+      },
+    });
+    const summary = formatMigrationResult(result, config.project);
+    if (summary) console.log(summary);
+  } catch (err) {
+    // Don't block update on migration failure (token/network/etc.).
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`Warning: CA key migration check failed: ${msg}`);
+  }
 
   // Repair-case plugin fetch: if .macf/plugin/ is absent or empty, fetch
   // the currently-pinned version regardless of whether anything is being

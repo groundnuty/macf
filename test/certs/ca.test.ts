@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 import { mkdirSync, rmSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { createCA, encryptCAKey, decryptCAKey, loadCA, backupCAKey, recoverCAKey, isLikelyPemPrivateKey, CaError } from '../../src/certs/ca.js';
+import {
+  createCA, encryptCAKey, decryptCAKey, loadCA, backupCAKey, recoverCAKey,
+  isLikelyPemPrivateKey, encryptCAKeyV1Legacy,
+  WIRE_FORMAT_VERSION, V2_PBKDF2_ITERS, V1_PBKDF2_ITERS,
+  CaError,
+} from '../../src/certs/ca.js';
 import type { GitHubVariablesClient } from '../../src/registry/types.js';
 
 function tempDir(): string {
@@ -115,28 +120,73 @@ describe('CA management', () => {
       expect(decrypted).toBe(original);
     });
 
-    it('produces base64 output with Salted__ header', () => {
+    it('writes v2 JSON envelope with iter=600000 and base64 Salted__ payload (#115)', () => {
       const encrypted = encryptCAKey('test-key', 'pass');
-      const decoded = Buffer.from(encrypted, 'base64');
+      // v2 output is JSON, not raw base64 (DR-011 rev2).
+      const envelope = JSON.parse(encrypted) as { v: number; iter: number; payload: string };
+      expect(envelope.v).toBe(WIRE_FORMAT_VERSION);
+      expect(envelope.v).toBe(2);
+      expect(envelope.iter).toBe(V2_PBKDF2_ITERS);
+      expect(envelope.iter).toBe(600000);
+      // Payload is the OpenSSL-compatible base64 Salted__ blob.
+      const decoded = Buffer.from(envelope.payload, 'base64');
       expect(decoded.subarray(0, 8).toString('utf-8')).toBe('Salted__');
     });
 
-    it('fails with wrong passphrase (#94 — 100 iterations must all throw)', () => {
-      // Previously flaky at ~6% per attempt because AES-CBC + PKCS7
-      // sometimes produces valid-padding garbage without throwing. The
-      // decryptCAKey semantic check (isLikelyPemPrivateKey) closes the
-      // gap: wrong-passphrase output never has both PEM markers, so the
-      // throw rate is now 100%. 100 iterations provides >99.999% confidence
-      // (prior flake probability 0.06^100 ≈ 10^-122).
+    it('fails with wrong passphrase — PEM-shape check catches 100% of attempts (#94 / #115)', () => {
+      // Pre-#99: AES-CBC + PKCS7 produced valid-padding garbage on ~6% of
+      // wrong passphrases, leading to confusing downstream failures.
+      // #99 added a PEM-shape check that closes the gap: wrong-passphrase
+      // output never has both BEGIN+END markers, so throw rate is 100%.
+      //
+      // At the post-#115 600k iter count, each PBKDF2 run is ~100× slower
+      // than the old 10k pre-#115 baseline; we use N=10 here (was 100 in
+      // the #99 test). The point is "all N throw", not "100 specifically."
+      // 10 iterations gives ~10^-12 confidence the gap hasn't reopened.
       const pem =
         '-----BEGIN PRIVATE KEY-----\n' +
         'MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQ' +
         'C7VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dV\n' +
         '-----END PRIVATE KEY-----\n';
       const encrypted = encryptCAKey(pem, 'correct-password');
-      for (let i = 0; i < 100; i++) {
+      for (let i = 0; i < 10; i++) {
         expect(() => decryptCAKey(encrypted, `wrong-${i}`)).toThrow(CaError);
       }
+    }, 30000);
+
+    it('fails with wrong passphrase on v1-shaped legacy input (#115 — dual-read)', () => {
+      // Same property on the v1 code path (fast: 10k iter) so we can
+      // run more iterations cheaply without the PBKDF2 cost of v2.
+      const pem =
+        '-----BEGIN PRIVATE KEY-----\n' +
+        'MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQ' +
+        'C7VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dV\n' +
+        '-----END PRIVATE KEY-----\n';
+      const v1Blob = encryptCAKeyV1Legacy(pem, 'correct-password');
+      for (let i = 0; i < 100; i++) {
+        expect(() => decryptCAKey(v1Blob, `wrong-${i}`)).toThrow(CaError);
+      }
+    });
+
+    it('decrypts a v1-shaped (legacy, iter=10000) blob — dual-read (#115)', () => {
+      // Read-compat for workspaces that haven't yet run `macf update`
+      // after DR-011 rev2.
+      const pem =
+        '-----BEGIN PRIVATE KEY-----\n' +
+        'MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQ' +
+        'C7VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dV\n' +
+        '-----END PRIVATE KEY-----\n';
+      const v1Blob = encryptCAKeyV1Legacy(pem, 'legacy-pass');
+      // v1 blob is raw base64 — never parses as JSON (base64 alphabet
+      // excludes `{`), so decryptCAKey dispatches to v1 path.
+      expect(v1Blob.startsWith('{')).toBe(false);
+      const decrypted = decryptCAKey(v1Blob, 'legacy-pass');
+      expect(decrypted).toBe(pem);
+    });
+
+    it('V1_PBKDF2_ITERS and V2_PBKDF2_ITERS constants match DR-011 rev2', () => {
+      expect(V1_PBKDF2_ITERS).toBe(10000);
+      expect(V2_PBKDF2_ITERS).toBe(600000);
     });
 
     it('fails with invalid format', () => {
@@ -145,18 +195,34 @@ describe('CA management', () => {
       expect(() => decryptCAKey(badData, 'pass')).toThrow('Salted__');
     });
 
-    it('fails with corrupted ciphertext (bit-flip) — #94 complement', () => {
+    it('fails with corrupted ciphertext (bit-flip) — #94 complement, v2 envelope (#115)', () => {
       const pem =
         '-----BEGIN PRIVATE KEY-----\n' +
         'MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQ' +
         'C7VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dV\n' +
         '-----END PRIVATE KEY-----\n';
       const encrypted = encryptCAKey(pem, 'pass');
-      const bytes = Buffer.from(encrypted, 'base64');
-      // Flip one bit in the ciphertext portion (after Salted__ + 8-byte salt)
-      bytes[20] ^= 0x01;
-      const corrupted = bytes.toString('base64');
+      // Post-#115: output is JSON envelope. Flip a bit inside the
+      // base64 payload, re-wrap, and expect decrypt to fail.
+      const envelope = JSON.parse(encrypted) as { v: number; iter: number; payload: string };
+      const bytes = Buffer.from(envelope.payload, 'base64');
+      bytes[20] ^= 0x01; // After Salted__ + 8-byte salt → inside ciphertext.
+      const corrupted = JSON.stringify({
+        v: envelope.v,
+        iter: envelope.iter,
+        payload: bytes.toString('base64'),
+      });
       expect(() => decryptCAKey(corrupted, 'pass')).toThrow(CaError);
+    }, 15000);
+
+    it('rejects malformed v2 envelope (#115)', () => {
+      // v2 JSON shape but missing required fields — must throw, not
+      // silently fall through to v1 path.
+      expect(() => decryptCAKey('{"v":2}', 'pass')).toThrow(CaError);
+      expect(() => decryptCAKey('{"v":2,"iter":600000}', 'pass')).toThrow(CaError);
+      expect(() => decryptCAKey('{"v":2,"payload":"abc"}', 'pass')).toThrow(CaError);
+      expect(() => decryptCAKey('{"v":3,"iter":1,"payload":"abc"}', 'pass')).toThrow(CaError);
+      expect(() => decryptCAKey('{"v":2,"iter":-1,"payload":"abc"}', 'pass')).toThrow(CaError);
     });
 
     it('round-trips a realistic PEM body through encrypt/decrypt', () => {

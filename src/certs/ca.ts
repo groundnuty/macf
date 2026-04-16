@@ -136,55 +136,51 @@ export async function recoverCAKey(config: {
   return keyPem;
 }
 
-/**
- * Encrypt CA key using AES-256-CBC + PBKDF2, interoperable with openssl enc.
- * Format: "Salted__" + 8-byte salt + ciphertext, then base64.
- *
- * Manual recovery with openssl CLI:
- *   base64 -d < encrypted.txt | openssl enc -aes-256-cbc -pbkdf2 -md sha256 -iter 10000 -d -out ca-key.pem
- */
-export function encryptCAKey(keyPem: string, passphrase: string): string {
-  const salt = randomBytes(8);
-  const keyIv = pbkdf2Sync(passphrase, salt, 10000, 48, 'sha256');
-  const key = keyIv.subarray(0, 32);
-  const iv = keyIv.subarray(32, 48);
+// DR-011 rev2 constants. `iter` lives in the v2 envelope so future
+// bumps (e.g. 600k → 1.2M) are iter-only changes without a v-bump.
+// v-bumps are reserved for actual wire-format changes (envelope shape,
+// algorithm swap). See design/decisions/DR-011-ca-key-backup.md.
+export const WIRE_FORMAT_VERSION = 2;
+export const V2_PBKDF2_ITERS = 600000;
+export const V1_PBKDF2_ITERS = 10000;
 
-  const cipher = createCipheriv('aes-256-cbc', key, iv);
-  const encrypted = Buffer.concat([
-    cipher.update(keyPem, 'utf-8'),
-    cipher.final(),
-  ]);
-
-  // OpenSSL format: "Salted__" + 8-byte salt + ciphertext
-  const result = Buffer.concat([
-    Buffer.from('Salted__'),
-    salt,
-    encrypted,
-  ]);
-
-  return result.toString('base64');
+interface V2Envelope {
+  readonly v: 2;
+  readonly iter: number;
+  readonly payload: string;
 }
 
 /**
- * Decrypt CA key encrypted with encryptCAKey.
- * Interoperable with: openssl enc -aes-256-cbc -pbkdf2 -md sha256 -iter 10000 -d
- *
- * Throws on:
- *   - missing `Salted__` header (ciphertext not in our expected format)
- *   - PKCS7 padding failure (wrong passphrase, ~94% of the time)
- *   - decrypted content doesn't look like a PEM private key (wrong
- *     passphrase that happened to produce valid PKCS7 padding by
- *     chance — ~6% of the time; see #94). Without the shape check,
- *     `recoverCAKey` would write garbage to disk as the CA key,
- *     producing confusing failures further down the TLS path.
- *
- * The PEM-shape check is a semantic verification, not cryptographic
- * authentication — AES-CBC has no built-in integrity. Adding HMAC would
- * break OpenSSL CLI interop (DR-011). The shape check catches the
- * observable failure mode without changing the on-wire format.
+ * Parse an on-wire value as a v2 JSON envelope, or return null for
+ * anything else. Disambiguation is safe by construction: a raw base64
+ * `Salted__` blob never starts with `{` (base64 alphabet excludes it),
+ * so only v2 envelopes parse as JSON objects with the `v` field.
  */
-export function decryptCAKey(encryptedBase64: string, passphrase: string): string {
-  const data = Buffer.from(encryptedBase64, 'base64');
+function parseV2Envelope(value: string): V2Envelope | null {
+  // Fast-path: base64 output never starts with `{`, so a non-`{` first
+  // char is immediately v1. Skip JSON.parse for the common case.
+  if (!value.trimStart().startsWith('{')) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const rec = parsed as Record<string, unknown>;
+  if (rec['v'] !== 2) return null;
+  if (typeof rec['iter'] !== 'number' || rec['iter'] < 1) return null;
+  if (typeof rec['payload'] !== 'string' || rec['payload'].length === 0) return null;
+  return { v: 2, iter: rec['iter'], payload: rec['payload'] };
+}
+
+/**
+ * Decrypt a raw `Salted__` OpenSSL-compatible blob at a given iter
+ * count. Shared by v1 and v2 paths after envelope is unwrapped.
+ * Throws CaError on bad shape, padding failure, or non-PEM output.
+ */
+function decryptSaltedBlob(payloadBase64: string, passphrase: string, iters: number): string {
+  const data = Buffer.from(payloadBase64, 'base64');
 
   const magic = data.subarray(0, 8).toString('utf-8');
   if (magic !== 'Salted__') {
@@ -194,7 +190,7 @@ export function decryptCAKey(encryptedBase64: string, passphrase: string): strin
   const salt = data.subarray(8, 16);
   const ciphertext = data.subarray(16);
 
-  const keyIv = pbkdf2Sync(passphrase, salt, 10000, 48, 'sha256');
+  const keyIv = pbkdf2Sync(passphrase, salt, iters, 48, 'sha256');
   const key = keyIv.subarray(0, 32);
   const iv = keyIv.subarray(32, 48);
 
@@ -219,6 +215,114 @@ export function decryptCAKey(encryptedBase64: string, passphrase: string): strin
   }
 
   return decrypted;
+}
+
+/**
+ * Encrypt CA key using AES-256-CBC + PBKDF2-SHA256 at 600k iters
+ * (DR-011 rev2, OWASP 2023 alignment). Output is a versioned JSON
+ * envelope wrapping the OpenSSL-compatible `Salted__` blob:
+ *
+ *   {"v": 2, "iter": 600000, "payload": "<base64 Salted__ ...>"}
+ *
+ * Manual recovery with openssl CLI (see DR-011-rev2 for full doc):
+ *   gh api ... --jq '.value' | jq -r .payload | base64 -d | \
+ *     openssl enc -aes-256-cbc -pbkdf2 -md sha256 -iter 600000 -d -out ca-key.pem
+ */
+export function encryptCAKey(keyPem: string, passphrase: string): string {
+  const salt = randomBytes(8);
+  const keyIv = pbkdf2Sync(passphrase, salt, V2_PBKDF2_ITERS, 48, 'sha256');
+  const key = keyIv.subarray(0, 32);
+  const iv = keyIv.subarray(32, 48);
+
+  const cipher = createCipheriv('aes-256-cbc', key, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(keyPem, 'utf-8'),
+    cipher.final(),
+  ]);
+
+  // OpenSSL format: "Salted__" + 8-byte salt + ciphertext
+  const payload = Buffer.concat([
+    Buffer.from('Salted__'),
+    salt,
+    encrypted,
+  ]).toString('base64');
+
+  const envelope: V2Envelope = {
+    v: WIRE_FORMAT_VERSION as 2,
+    iter: V2_PBKDF2_ITERS,
+    payload,
+  };
+  return JSON.stringify(envelope);
+}
+
+/**
+ * Decrypt a CA key from the on-wire registry value. Dispatches by
+ * wire format:
+ *
+ * - **v2 (JSON envelope, DR-011 rev2+):** parses `{v, iter, payload}`,
+ *   decrypts `payload` at the envelope's iter count.
+ * - **v1 (raw base64 `Salted__` blob, legacy pre-2026-04-16):** treats
+ *   the value as a raw base64 blob and decrypts at iter=10000 (the
+ *   OpenSSL 3.0/3.1 default at the time the blob was written).
+ *
+ * Both paths share the same PEM-shape check (#94) after AES decryption
+ * to catch wrong-passphrase attempts that produce valid PKCS7 padding
+ * by chance (~6% of wrong passphrases).
+ *
+ * Disambiguation is safe by construction — base64 output never starts
+ * with `{`, so only v2 JSON envelopes hit the JSON path. See DR-011
+ * rev2 \"Wire Format\" section for the full spec.
+ *
+ * Throws CaError on:
+ *   - malformed v2 envelope (missing/invalid v/iter/payload fields)
+ *   - missing `Salted__` header inside the payload
+ *   - PKCS7 padding failure (wrong passphrase, ~94% of the time)
+ *   - decrypted content doesn't look like a PEM private key (wrong
+ *     passphrase that happened to produce valid PKCS7 padding)
+ */
+export function decryptCAKey(encryptedValue: string, passphrase: string): string {
+  // If the value looks like JSON (starts with `{`), the caller intends
+  // v2. Validate strictly and throw on malformed envelope rather than
+  // fall through to v1 — otherwise a typoed envelope would produce a
+  // confusing "missing Salted__" error that doesn't point at the real
+  // problem.
+  if (encryptedValue.trimStart().startsWith('{')) {
+    const envelope = parseV2Envelope(encryptedValue);
+    if (!envelope) {
+      throw new CaError(
+        'Invalid v2 CA key envelope (expected {"v":2, "iter":<number>, "payload":"<base64>"})',
+      );
+    }
+    return decryptSaltedBlob(envelope.payload, passphrase, envelope.iter);
+  }
+  // v1 legacy path — raw base64 Salted__ blob, implicit iter=10000.
+  return decryptSaltedBlob(encryptedValue, passphrase, V1_PBKDF2_ITERS);
+}
+
+/**
+ * Hand-construct a v1-shaped CA key backup (legacy wire format) at
+ * 10000 iters. Exported for `test/certs/wire-format-compat.test.ts`
+ * regression guard and for any future tooling that needs to produce
+ * legacy-shaped backups (none expected). NOT used by `encryptCAKey`
+ * itself — `encryptCAKey` always writes v2. (#115)
+ */
+export function encryptCAKeyV1Legacy(keyPem: string, passphrase: string): string {
+  const salt = randomBytes(8);
+  const keyIv = pbkdf2Sync(passphrase, salt, V1_PBKDF2_ITERS, 48, 'sha256');
+  const key = keyIv.subarray(0, 32);
+  const iv = keyIv.subarray(32, 48);
+
+  const cipher = createCipheriv('aes-256-cbc', key, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(keyPem, 'utf-8'),
+    cipher.final(),
+  ]);
+
+  return Buffer.concat([
+    Buffer.from('Salted__'),
+    salt,
+    encrypted,
+  ]).toString('base64');
 }
 
 /**
