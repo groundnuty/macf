@@ -5,6 +5,7 @@ import {
   projectMacfDir, writeAgentConfig, addToAgentsIndex,
   agentCertPath, agentKeyPath,
   caCertPath as caCertPathFor, caKeyPath as caKeyPathFor,
+  isValidProjectName,
 } from '../config.js';
 import { loadCA } from '../../certs/ca.js';
 import { generateAgentCert } from '../../certs/agent-cert.js';
@@ -95,9 +96,43 @@ async function resolveVersions(opts: InitOptions): Promise<VersionPins> {
 }
 
 /**
+ * Validate fields that end up embedded verbatim in `claude.sh` via a
+ * shell double-quoted template literal (`export APP_ID="${appId}"`,
+ * etc.). Reject inputs containing characters that would break quoting
+ * or trigger shell expansion. Runs before any workspace state is
+ * written so bad inputs fail early, not after partial init. (#105)
+ */
+function validateInitOpts(opts: InitOptions): void {
+  if (!isValidProjectName(opts.project)) {
+    throw new Error(
+      `project "${opts.project}" must match [a-zA-Z0-9_-]+`,
+    );
+  }
+  if (!/^\d+$/.test(opts.appId)) {
+    throw new Error(
+      `appId "${opts.appId}" must be numeric (GitHub App IDs are digits only)`,
+    );
+  }
+  if (!/^\d+$/.test(opts.installId)) {
+    throw new Error(
+      `installId "${opts.installId}" must be numeric (GitHub installation IDs are digits only)`,
+    );
+  }
+  // Shell-dangerous chars inside double-quoted context. `\` escapes in
+  // double quotes; include it to avoid any sub-expansion surprise.
+  if (/["$`\\\n\r]/.test(opts.keyPath)) {
+    throw new Error(
+      `keyPath "${opts.keyPath}" contains a shell-unsafe character (", $, backtick, backslash, or newline)`,
+    );
+  }
+}
+
+/**
  * Set up a project directory for an agent.
  */
 export async function initAgent(projectDir: string, opts: InitOptions): Promise<void> {
+  validateInitOpts(opts);
+
   const absDir = resolve(projectDir);
   const macfDir = projectMacfDir(absDir);
   const agentName = opts.name ?? opts.role;

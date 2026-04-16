@@ -149,4 +149,101 @@ describe('macf init', () => {
     const config = readAgentConfig(dir);
     expect(config!.registry).toEqual({ type: 'profile', user: 'groundnuty' });
   });
+
+  describe('input validation (#105)', () => {
+    // claude.sh embeds appId / installId / keyPath / project into a
+    // shell double-quoted string via template literal. Validate at
+    // init so bad inputs are rejected before any workspace state is
+    // written, not caught later when claude.sh is run and fails
+    // opaquely.
+
+    const validBase = {
+      project: 'T',
+      role: 'a',
+      appId: '12345',
+      installId: '67890',
+      keyPath: 'app.key.pem',
+      registryType: 'repo',
+      registryRepo: 'o/r',
+    } as const;
+
+    it('rejects non-numeric appId', async () => {
+      await expect(initAgent(dir, { ...validBase, appId: '123abc' }))
+        .rejects.toThrow(/appId.*numeric|numeric.*appId/i);
+    });
+
+    it('rejects appId with shell-special chars', async () => {
+      await expect(initAgent(dir, { ...validBase, appId: '123"$x' }))
+        .rejects.toThrow(/appId/);
+    });
+
+    it('rejects empty appId', async () => {
+      await expect(initAgent(dir, { ...validBase, appId: '' }))
+        .rejects.toThrow(/appId/);
+    });
+
+    it('rejects non-numeric installId', async () => {
+      await expect(initAgent(dir, { ...validBase, installId: 'abc' }))
+        .rejects.toThrow(/installId.*numeric|numeric.*installId/i);
+    });
+
+    it('rejects keyPath with double-quote', async () => {
+      await expect(initAgent(dir, { ...validBase, keyPath: 'path"injection' }))
+        .rejects.toThrow(/keyPath/);
+    });
+
+    it('rejects keyPath with $', async () => {
+      await expect(initAgent(dir, { ...validBase, keyPath: 'path$HOME/evil' }))
+        .rejects.toThrow(/keyPath/);
+    });
+
+    it('rejects keyPath with backtick', async () => {
+      await expect(initAgent(dir, { ...validBase, keyPath: 'path`cmd`' }))
+        .rejects.toThrow(/keyPath/);
+    });
+
+    it('rejects keyPath with newline', async () => {
+      await expect(initAgent(dir, { ...validBase, keyPath: 'path\nextra' }))
+        .rejects.toThrow(/keyPath/);
+    });
+
+    it('rejects project with slash', async () => {
+      await expect(initAgent(dir, { ...validBase, project: 'bad/name' }))
+        .rejects.toThrow(/project/);
+    });
+
+    it('rejects project with shell-special char', async () => {
+      await expect(initAgent(dir, { ...validBase, project: 'bad$name' }))
+        .rejects.toThrow(/project/);
+    });
+
+    it('accepts realistic valid inputs', async () => {
+      // Normal GitHub App IDs, a relative key path, a typical project name.
+      await initAgent(dir, { ...validBase });
+      const config = readAgentConfig(dir);
+      expect(config).not.toBeNull();
+      expect(config!.github_app.app_id).toBe('12345');
+      expect(config!.github_app.install_id).toBe('67890');
+      expect(config!.github_app.key_path).toBe('app.key.pem');
+    });
+
+    it('accepts keyPath with dots, hyphens, underscores, slashes', async () => {
+      // Normal absolute / nested paths must not be rejected.
+      await initAgent(dir, {
+        ...validBase,
+        keyPath: '/absolute/path/to/my-app.key_2.pem',
+      });
+      const config = readAgentConfig(dir);
+      expect(config!.github_app.key_path).toBe('/absolute/path/to/my-app.key_2.pem');
+    });
+
+    it('rejects before writing any workspace state', async () => {
+      await expect(initAgent(dir, { ...validBase, appId: 'bad' }))
+        .rejects.toThrow();
+      // No .macf/ or claude.sh should exist — validation must run
+      // before any mkdir/writeFile.
+      expect(existsSync(join(dir, '.macf'))).toBe(false);
+      expect(existsSync(join(dir, 'claude.sh'))).toBe(false);
+    });
+  });
 });
