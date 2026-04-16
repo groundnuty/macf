@@ -48,6 +48,7 @@ describe('generateAgentConfig', () => {
       ssh_user: 'ubuntu',
       tmux_bin: 'tmux',
       ssh_key_secret: 'AGENT_SSH_KEY',
+      workspace_dir: '/home/ubuntu/repos/<owner>/<repo>',
     });
   });
 
@@ -75,6 +76,28 @@ describe('generateAgentConfig', () => {
       'in-review': 'In Review',
       'blocked': 'Blocked',
     });
+  });
+
+  it('populates workspace_dir default from owner/repo when defaults given (#71)', () => {
+    const json = generateAgentConfig(
+      ['code-agent'],
+      undefined,
+      { owner: 'groundnuty', repo: 'macf' },
+    );
+    const parsed = JSON.parse(json);
+    expect(parsed.agents['code-agent'].workspace_dir).toBe('/home/ubuntu/repos/groundnuty/macf');
+  });
+
+  it('omits workspace_dir when defaults are not provided (backward-compat callers)', () => {
+    const json = generateAgentConfig(['code-agent']);
+    const parsed = JSON.parse(json);
+    expect(parsed.agents['code-agent']).not.toHaveProperty('workspace_dir');
+  });
+
+  it('template (no --agents) includes a sample workspace_dir placeholder', () => {
+    const json = generateAgentConfig([]);
+    const parsed = JSON.parse(json);
+    expect(parsed.agents['<agent-name>'].workspace_dir).toMatch(/^\/home\/.*\/repos\/.*\/.*/);
   });
 
   it('produces valid JSON', () => {
@@ -233,6 +256,74 @@ describe('patchAgentConfig (merge-preserving regenerate, #76)', () => {
     expect(() =>
       patchAgentConfig(JSON.stringify({ other: 'thing' }), ['a']),
     ).toThrow(/no `agents` object/);
+  });
+
+  it('injects workspace_dir default when an old entry lacks it (#71)', () => {
+    // Config predates #71 — no workspace_dir field. Patch should upgrade
+    // it so the routing workflow can invoke the helper.
+    const existing = JSON.stringify({
+      agents: {
+        'code-agent': {
+          app_name: 'code-agent',
+          host: '100.0.0.1',
+          tmux_session: 'code-agent',
+          tmux_bin: 'tmux',
+          ssh_user: 'ubuntu',
+          ssh_key_secret: 'AGENT_SSH_KEY',
+        },
+      },
+    }, null, 2);
+    const patched = patchAgentConfig(
+      existing, ['code-agent'], undefined,
+      { owner: 'groundnuty', repo: 'macf' },
+    );
+    const parsed = JSON.parse(patched);
+    expect(parsed.agents['code-agent'].workspace_dir)
+      .toBe('/home/ubuntu/repos/groundnuty/macf');
+  });
+
+  it('preserves user-customized workspace_dir on patch', () => {
+    const existing = JSON.stringify({
+      agents: {
+        'code-agent': {
+          app_name: 'code-agent',
+          host: '100.0.0.1',
+          tmux_session: 'code-agent',
+          tmux_bin: 'tmux',
+          ssh_user: 'ubuntu',
+          ssh_key_secret: 'AGENT_SSH_KEY',
+          workspace_dir: '/custom/path/to/workspace',
+        },
+      },
+    }, null, 2);
+    const patched = patchAgentConfig(
+      existing, ['code-agent'], undefined,
+      { owner: 'groundnuty', repo: 'macf' },
+    );
+    const parsed = JSON.parse(patched);
+    expect(parsed.agents['code-agent'].workspace_dir).toBe('/custom/path/to/workspace');
+  });
+
+  it('respects ssh_user when computing default workspace_dir (not hardcoded ubuntu)', () => {
+    const existing = JSON.stringify({
+      agents: {
+        'code-agent': {
+          app_name: 'code-agent',
+          host: '100.0.0.1',
+          tmux_session: 'code-agent',
+          tmux_bin: 'tmux',
+          ssh_user: 'deploy',  // non-default
+          ssh_key_secret: 'AGENT_SSH_KEY',
+        },
+      },
+    }, null, 2);
+    const patched = patchAgentConfig(
+      existing, ['code-agent'], undefined,
+      { owner: 'groundnuty', repo: 'macf' },
+    );
+    const parsed = JSON.parse(patched);
+    expect(parsed.agents['code-agent'].workspace_dir)
+      .toBe('/home/deploy/repos/groundnuty/macf');
   });
 });
 

@@ -102,6 +102,25 @@ interface AgentConfigEntry {
   ssh_user: string;
   tmux_bin: string;
   ssh_key_secret: string;
+  /**
+   * Absolute path to the agent's workspace on the remote host. When set,
+   * the routing workflow invokes `$workspace_dir/.claude/scripts/tmux-send-to-claude.sh`
+   * (the canonical helper shipped by #56/#61) instead of inlining the
+   * tmux-submit pattern. See groundnuty/macf#71 + macf-actions v1.2.
+   * Optional: absent → routing falls back to the inline pattern
+   * (backward compatible with pre-v1.2 agent-router.yml).
+   */
+  workspace_dir?: string;
+}
+
+/**
+ * Options passed to generate/patch helpers so they can compute sensible
+ * default values for new entries. Owner/repo come from `--repo`; ssh_user
+ * defaults to 'ubuntu' matching the other template defaults.
+ */
+export interface AgentEntryDefaults {
+  readonly owner: string;
+  readonly repo: string;
 }
 
 const DEFAULT_LABEL_TO_STATUS: Readonly<Record<string, string>> = {
@@ -120,22 +139,31 @@ function makeAgentEntry(
   agent: string,
   useWindows: boolean,
   sessionName: string | undefined,
+  defaults?: AgentEntryDefaults,
 ): AgentConfigEntry {
+  const sshUser = 'ubuntu';
   const entry: AgentConfigEntry = {
     app_name: agent,
     host: '<agent-host-ip>',
     tmux_session: useWindows ? sessionName! : agent,
-    ssh_user: 'ubuntu',
+    ssh_user: sshUser,
     tmux_bin: 'tmux',
     ssh_key_secret: 'AGENT_SSH_KEY',
   };
   if (useWindows) entry.tmux_window = agent;
+  // Default workspace_dir = /home/<ssh_user>/repos/<owner>/<repo>. Covers
+  // the common case where agents are cloned into ~/repos/<owner>/<repo>
+  // on the host. Users override per-agent if their layout differs.
+  if (defaults) {
+    entry.workspace_dir = `/home/${sshUser}/repos/${defaults.owner}/${defaults.repo}`;
+  }
   return entry;
 }
 
 export function generateAgentConfig(
   agents: readonly string[],
   sessionName?: string,
+  defaults?: AgentEntryDefaults,
 ): string {
   if (agents.length === 0) {
     return JSON.stringify({
@@ -147,6 +175,7 @@ export function generateAgentConfig(
           ssh_user: 'ubuntu',
           tmux_bin: 'tmux',
           ssh_key_secret: 'AGENT_SSH_KEY',
+          workspace_dir: '/home/ubuntu/repos/<owner>/<repo>',
         },
       },
       label_to_status: { ...DEFAULT_LABEL_TO_STATUS },
@@ -157,7 +186,7 @@ export function generateAgentConfig(
 
   const agentEntries: Record<string, AgentConfigEntry> = {};
   for (const agent of agents) {
-    agentEntries[agent] = makeAgentEntry(agent, useWindows, sessionName);
+    agentEntries[agent] = makeAgentEntry(agent, useWindows, sessionName, defaults);
   }
   return JSON.stringify({
     agents: agentEntries,
@@ -175,6 +204,7 @@ export function patchAgentConfig(
   existingJson: string,
   agents: readonly string[],
   sessionName?: string,
+  defaults?: AgentEntryDefaults,
 ): string {
   let parsed: AgentConfigFile;
   try {
@@ -192,7 +222,7 @@ export function patchAgentConfig(
   for (const agent of agents) {
     const existing = parsed.agents[agent];
     if (!existing) {
-      agentEntries[agent] = makeAgentEntry(agent, useWindows, sessionName);
+      agentEntries[agent] = makeAgentEntry(agent, useWindows, sessionName, defaults);
       continue;
     }
     const patched: AgentConfigEntry = { ...existing };
@@ -203,6 +233,12 @@ export function patchAgentConfig(
       delete patched.tmux_window;
     }
     if (!patched.ssh_key_secret) patched.ssh_key_secret = 'AGENT_SSH_KEY';
+    // Inject workspace_dir default for old entries that lack it, so
+    // existing configs self-upgrade to enable helper invocation without
+    // requiring a hand-edit. Users can customize afterwards.
+    if (!patched.workspace_dir && defaults) {
+      patched.workspace_dir = `/home/${patched.ssh_user || 'ubuntu'}/repos/${defaults.owner}/${defaults.repo}`;
+    }
     agentEntries[agent] = patched;
   }
 
@@ -285,9 +321,12 @@ export async function repoInit(
   // Merge-preserving (#76): if the config already exists and --force is
   // passed, patch tmux fields + inject missing defaults rather than
   // clobbering user-customized app_name/host/ssh_key_secret/etc.
+  // Pass owner/repo so new entries AND old entries missing workspace_dir
+  // get a sensible default (see #71).
+  const entryDefaults: AgentEntryDefaults = { owner: owner!, repo: repoName! };
   const configContent = existsSync(configPath) && opts.force
-    ? patchAgentConfig(readFileSync(configPath, 'utf-8'), agentList, opts.sessionName)
-    : generateAgentConfig(agentList, opts.sessionName);
+    ? patchAgentConfig(readFileSync(configPath, 'utf-8'), agentList, opts.sessionName, entryDefaults)
+    : generateAgentConfig(agentList, opts.sessionName, entryDefaults);
   const configResult = writeFileSafe(configPath, configContent, opts.force);
 
   const allLabels: LabelSpec[] = [...STATUS_LABELS];
