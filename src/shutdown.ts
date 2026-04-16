@@ -12,15 +12,17 @@ export function registerShutdownHandler(config: {
   readonly registry: Registry;
   readonly httpsServer: HttpsServer;
   readonly logger: Logger;
-}): () => Promise<void> {
+}): () => Promise<boolean> {
   const { agentName, registry, httpsServer, logger } = config;
   let shuttingDown = false;
+  let lastResult = true;
 
-  async function cleanup(): Promise<void> {
-    if (shuttingDown) return;
+  async function cleanup(): Promise<boolean> {
+    if (shuttingDown) return lastResult;
     shuttingDown = true;
 
     logger.info('shutdown_start', { agent: agentName });
+    let ok = true;
 
     try {
       await registry.remove(agentName);
@@ -30,6 +32,7 @@ export function registerShutdownHandler(config: {
         agent: agentName,
         error: err instanceof Error ? err.message : String(err),
       });
+      ok = false;
     }
 
     try {
@@ -40,14 +43,20 @@ export function registerShutdownHandler(config: {
         agent: agentName,
         error: err instanceof Error ? err.message : String(err),
       });
+      ok = false;
     }
 
-    logger.info('shutdown_complete', { agent: agentName });
+    logger.info('shutdown_complete', { agent: agentName, ok });
+    lastResult = ok;
+    return ok;
   }
 
+  // Exit 1 when any cleanup step failed so external monitors (systemd,
+  // macf-actions heartbeat) surface the degraded state instead of
+  // silently absorbing it into a clean exit (#103 R2).
   const handler = (): void => {
     cleanup().then(
-      () => process.exit(0),
+      ok => process.exit(ok ? 0 : 1),
       () => process.exit(1),
     );
   };

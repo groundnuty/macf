@@ -58,6 +58,14 @@ describe('generateClaudeSh', () => {
     expect(output).toContain('export MACF_CA_CERT="$HOME/.macf/certs/TEST/ca-cert.pem"');
   });
 
+  it('exports MACF_CA_KEY alongside MACF_CA_CERT (#103 R3)', () => {
+    // Pre-#103 only MACF_CA_CERT was exported; server.ts derived the
+    // key path via string-replace. Now the launcher emits both so
+    // server config can consume the explicit field.
+    const output = generateClaudeSh(sampleConfig);
+    expect(output).toContain('export MACF_CA_KEY="$HOME/.macf/certs/TEST/ca-key.pem"');
+  });
+
   it('uses the fail-loud token helper (no naive gh token generate | jq)', () => {
     // #67: the launcher must not embed the silent-fallback anti-pattern.
     const output = generateClaudeSh(sampleConfig);
