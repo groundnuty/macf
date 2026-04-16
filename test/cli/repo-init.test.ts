@@ -460,6 +460,80 @@ describe('repoInit integration', () => {
     expect(Object.keys(config.agents)).toEqual(['code-agent', 'science-agent']);
   });
 
+  it('adds new agents to existing config WITHOUT --force (#82)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    // First run: create config with one agent.
+    await repoInit(dir, {
+      repo: 'owner/r',
+      actionsVersion: 'v1',
+      agents: 'code-agent',
+      force: false,
+    });
+
+    // Customize the entry to simulate user-edited fields.
+    const configPath = join(dir, '.github', 'agent-config.json');
+    const config1 = JSON.parse(readFileSync(configPath, 'utf-8'));
+    config1.agents['code-agent'].host = '100.0.0.5';
+    config1.agents['code-agent'].app_name = 'custom-app-name';
+    writeFileSync(configPath, JSON.stringify(config1, null, 2) + '\n');
+
+    // Second run: add a second agent, no --force.
+    await repoInit(dir, {
+      repo: 'owner/r',
+      actionsVersion: 'v1',
+      agents: 'code-agent,science-agent',
+      force: false,
+    });
+
+    const config2 = JSON.parse(readFileSync(configPath, 'utf-8'));
+    // Both agents present.
+    expect(Object.keys(config2.agents).sort()).toEqual(['code-agent', 'science-agent']);
+    // User-customized fields preserved on code-agent.
+    expect(config2.agents['code-agent'].host).toBe('100.0.0.5');
+    expect(config2.agents['code-agent'].app_name).toBe('custom-app-name');
+    // New agent has defaults.
+    expect(config2.agents['science-agent'].host).toBe('<agent-host-ip>');
+  });
+
+  it('--session-name applied on existing config WITHOUT --force (#82)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    // Create config with two un-grouped agents.
+    await repoInit(dir, {
+      repo: 'owner/r',
+      actionsVersion: 'v1',
+      agents: 'a,b',
+      force: false,
+    });
+
+    // Re-run with --session-name, no --force.
+    await repoInit(dir, {
+      repo: 'owner/r',
+      actionsVersion: 'v1',
+      agents: 'a,b',
+      sessionName: 'proj',
+      force: false,
+    });
+
+    const config = JSON.parse(readFileSync(join(dir, '.github', 'agent-config.json'), 'utf-8'));
+    expect(config.agents['a'].tmux_session).toBe('proj');
+    expect(config.agents['a'].tmux_window).toBe('a');
+    expect(config.agents['b'].tmux_session).toBe('proj');
+    expect(config.agents['b'].tmux_window).toBe('b');
+  });
+
+  it('workflow file still respects --force semantic even after #82', async () => {
+    // #82 only loosens the CONFIG file's --force gate; workflow stays gated.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    await repoInit(dir, { repo: 'owner/r', actionsVersion: 'v1', force: false });
+
+    // Second run: change actionsVersion, no --force.
+    await repoInit(dir, { repo: 'owner/r', actionsVersion: 'v2', force: false });
+    const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    expect(wf).toContain('@v1'); // unchanged because of --force gate
+  });
+
   it('throws on invalid repo format', async () => {
     await expect(repoInit(dir, {
       repo: 'no-slash',

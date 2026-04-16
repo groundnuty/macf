@@ -318,16 +318,38 @@ export async function repoInit(
     generateWorkflow(opts.actionsVersion),
     opts.force,
   );
-  // Merge-preserving (#76): if the config already exists and --force is
-  // passed, patch tmux fields + inject missing defaults rather than
-  // clobbering user-customized app_name/host/ssh_key_secret/etc.
-  // Pass owner/repo so new entries AND old entries missing workspace_dir
-  // get a sensible default (see #71).
+
+  // Agent-config handling: always merge-preserve when the file exists,
+  // regardless of --force (#82). Previously --force was required even to
+  // add new agents to an existing config; the "fresh template wins"
+  // semantic was a UX trap — users running `macf repo-init --agents foo`
+  // on an existing repo saw "Skipping existing file" and thought agents
+  // were scaffolded when nothing changed.
+  //
+  // --force now only controls the workflow file (agent-router.yml) — the
+  // workflow is regenerated from scratch (no fields to preserve), so the
+  // old "don't overwrite" guard still makes sense there.
+  //
+  // Patch is safe to call repeatedly: unchanged inputs produce the same
+  // output (idempotent), new agents are added, existing agent entries
+  // preserve app_name/host/ssh_key_secret/ssh_user/tmux_bin/workspace_dir,
+  // and top-level label_to_status + unknown keys pass through.
   const entryDefaults: AgentEntryDefaults = { owner: owner!, repo: repoName! };
-  const configContent = existsSync(configPath) && opts.force
-    ? patchAgentConfig(readFileSync(configPath, 'utf-8'), agentList, opts.sessionName, entryDefaults)
-    : generateAgentConfig(agentList, opts.sessionName, entryDefaults);
-  const configResult = writeFileSafe(configPath, configContent, opts.force);
+  let configResult: 'created' | 'updated' | 'skipped';
+  if (existsSync(configPath)) {
+    const patched = patchAgentConfig(
+      readFileSync(configPath, 'utf-8'),
+      agentList,
+      opts.sessionName,
+      entryDefaults,
+    );
+    writeFileSync(configPath, patched);
+    configResult = 'updated';
+  } else {
+    const fresh = generateAgentConfig(agentList, opts.sessionName, entryDefaults);
+    const writeRes = writeFileSafe(configPath, fresh, false);
+    configResult = writeRes;  // 'created' (file didn't exist) is the expected path
+  }
 
   const allLabels: LabelSpec[] = [...STATUS_LABELS];
   for (const agent of agentList) {
@@ -367,20 +389,21 @@ export async function repoInit(
 
 function printResults(
   workflowResult: 'created' | 'skipped',
-  configResult: 'created' | 'skipped',
+  configResult: 'created' | 'updated' | 'skipped',
   created: readonly string[],
   existed: readonly string[],
   failed: readonly string[],
 ): void {
   if (workflowResult === 'created') console.log('✓ Created .github/workflows/agent-router.yml');
   if (configResult === 'created') console.log('✓ Created .github/agent-config.json');
+  if (configResult === 'updated') console.log('✓ Patched .github/agent-config.json (preserving existing entries)');
   if (created.length > 0) console.log(`✓ Created labels: ${created.join(', ')}`);
   if (existed.length > 0) console.log(`  Labels already exist: ${existed.join(', ')}`);
   if (failed.length > 0) console.error(`✗ Failed to create labels: ${failed.join(', ')}`);
 }
 
 function printNextSteps(
-  configResult: 'created' | 'skipped',
+  configResult: 'created' | 'updated' | 'skipped',
   agentList: readonly string[],
 ): void {
   console.log('\nNext steps:\n');
@@ -388,6 +411,8 @@ function printNextSteps(
     console.log('  1. Edit .github/agent-config.json to set your agents\' hosts and tmux sessions');
   } else if (configResult === 'created') {
     console.log('  1. Edit .github/agent-config.json and replace <agent-host-ip> placeholders');
+  } else if (configResult === 'updated') {
+    console.log('  1. Review .github/agent-config.json — existing entries preserved, only tmux fields updated');
   }
   console.log('  2. Set repo secrets (Settings → Secrets and variables → Actions):');
   console.log('       - AGENT_SSH_KEY: SSH private key for connecting to agent hosts');
