@@ -275,6 +275,36 @@ describe('update command', () => {
     expect(fetchPluginToWorkspace).not.toHaveBeenCalled();
   });
 
+  it('regenerates claude.sh on every update, even when nothing is bumped (#63)', async () => {
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    // Seed a stale claude.sh that doesn't match the current template.
+    const shPath = join(dir, 'claude.sh');
+    writeFileSync(shPath, '#!/usr/bin/env bash\n# stale launcher\nexec claude "$@"\n', { mode: 0o755 });
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+
+    await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+
+    const regenerated = readFileSync(shPath, 'utf-8');
+    expect(regenerated).not.toContain('stale launcher');
+    expect(regenerated).toContain('--plugin-dir "$SCRIPT_DIR/.macf/plugin"');
+    expect(regenerated).toContain('managed by `macf`');
+  });
+
+  it('regenerates claude.sh even for legacy config without versions section', async () => {
+    // Regenerate shouldn't depend on versions — legacy workspaces still
+    // benefit from getting the current launcher template.
+    writeConfig(dir); // legacy, no versions
+    const shPath = join(dir, 'claude.sh');
+    writeFileSync(shPath, '# legacy launcher\n', { mode: 0o755 });
+
+    const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+    expect(code).toBe(1); // still errors on missing versions
+
+    const regenerated = readFileSync(shPath, 'utf-8');
+    expect(regenerated).not.toContain('legacy launcher');
+    expect(regenerated).toContain('--plugin-dir');
+  });
+
   it('preserves unrelated config fields when writing', async () => {
     writeConfig(dir, { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' });
     mockFetchReturning({ cli: '0.3.0', plugin: '0.1.0', actions: 'v1' });

@@ -11,6 +11,7 @@ import { readAgentConfig, writeAgentConfig } from '../config.js';
 import { resolveLatestVersions } from '../version-resolver.js';
 import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import { fetchPluginToWorkspace, workspacePluginDir } from '../plugin-fetcher.js';
+import { writeClaudeSh } from '../claude-sh.js';
 import type { VersionPins } from '../config.js';
 import type { ResolvedVersions } from '../version-resolver.js';
 
@@ -140,6 +141,15 @@ export async function update(
   if (refreshedScripts.length > 0) {
     console.log(`Refreshed ${refreshedScripts.length} helper script(s) in .claude/scripts/`);
   }
+
+  // Regenerate claude.sh unconditionally — the launcher template changes
+  // over time (e.g., #60 added --plugin-dir) and workspaces need those
+  // changes without having to re-run `macf init` from scratch. The
+  // generated file carries a managed-file header warning users not to
+  // edit it. See #63. Doesn't depend on config.versions, so it runs even
+  // for legacy configs (before the error-exit for missing versions).
+  writeClaudeSh(projectDir, config);
+  console.log(`Refreshed claude.sh from current launcher template`);
 
   // Repair-case plugin fetch: if .macf/plugin/ is absent or empty, fetch
   // the currently-pinned version regardless of whether anything is being
