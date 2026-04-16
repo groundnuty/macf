@@ -18,7 +18,8 @@ You have full code access. Use Explore, Read, Grep, and Glob to understand the c
 
 Before filing, ask: **"Now or backlog?"**
 
-    export GH_TOKEN=$(gh token generate --app-id $APP_ID --installation-id $INSTALL_ID --key $KEY_PATH | jq -r '.token') && \
+    GH_TOKEN=$(./.claude/scripts/macf-gh-token.sh --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
+    export GH_TOKEN && \
     GH_TOKEN=$GH_TOKEN gh issue create --repo <owner>/<repo> --title "<description>" --label "code-agent" --body "@<code-agent> <detailed requirements with file paths and function references>"
 
 Include in issues:
@@ -38,7 +39,8 @@ Include in issues:
 
 All discussion in **issue comments**. Every comment MUST include an @mention.
 
-    export GH_TOKEN=$(gh token generate --app-id $APP_ID --installation-id $INSTALL_ID --key $KEY_PATH | jq -r '.token') && \
+    GH_TOKEN=$(./.claude/scripts/macf-gh-token.sh --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
+    export GH_TOKEN && \
     GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body "@<code-agent> <message>"
 
 ## Peer Dynamic
