@@ -9,6 +9,7 @@ import { registerShutdownHandler } from './shutdown.js';
 import { generateToken } from './token.js';
 import { checkPendingIssues } from './startup-issues.js';
 import { createChallenge, verifyAndConsumeChallenge } from './certs/challenge.js';
+import { createChallengeStore } from './certs/challenge-store.js';
 import { signCSR } from './certs/agent-cert.js';
 import { loadCA } from './certs/ca.js';
 import type { NotifyPayload, SignRequest } from './types.js';
@@ -79,24 +80,30 @@ async function main(): Promise<void> {
   }
   const varsClient = createGitHubClient(signPathPrefix, token);
 
-  // P3: /sign endpoint handler (two-step challenge-response)
+  // In-memory challenge store (DR-010, #80). Process-local; server restart
+  // between step 1 and step 2 of a flow invalidates outstanding challenges.
+  const challengeStore = createChallengeStore();
+
+  // /sign endpoint handler — two-step challenge-response (DR-010).
+  // Step 1: allocate challenge, return id + instruction (no registry write).
+  // Step 2: verify challenge_id + registry-observed value, sign CSR.
   const onSign = async (request: SignRequest): Promise<Record<string, unknown>> => {
-    // Try to load CA key — if not available, this agent can't sign
+    // Try to load CA key — if not available, this agent can't sign.
     let ca: { certPem: string; keyPem: string };
     try {
       ca = loadCA(config.caCertPath, config.caCertPath.replace('-cert.pem', '-key.pem'));
     } catch {
       const err = new Error('CA key not available on this agent');
-      (err as any).status = 503;
+      (err as { status?: number }).status = 503;
       throw err;
     }
 
     if (!request.challenge_done) {
-      // Step 1: Create challenge
-      const challenge = await createChallenge({
+      // Step 1: allocate in-memory challenge, return id + instruction.
+      const challenge = createChallenge({
         project: config.project,
         agentName: request.agent_name,
-        client: varsClient,
+        store: challengeStore,
       });
       logger.info('sign_challenge_created', {
         agent_name: request.agent_name,
@@ -108,12 +115,25 @@ async function main(): Promise<void> {
       };
     }
 
-    // Step 2: Verify challenge + sign CSR
-    await verifyAndConsumeChallenge({
+    // Step 2: verify challenge + sign CSR. The refine() on SignRequestSchema
+    // already guarantees challenge_id is present when challenge_done is true.
+    const result = await verifyAndConsumeChallenge({
       project: config.project,
       agentName: request.agent_name,
+      challengeId: request.challenge_id!,
+      store: challengeStore,
       client: varsClient,
     });
+
+    if (result === 'mismatch') {
+      // Generic error — do not leak which check failed (no oracle for
+      // attackers probing expired/mismatched-agent/wrong-value, etc).
+      logger.warn('sign_challenge_failed', { agent_name: request.agent_name });
+      const err = new Error('challenge verification failed');
+      (err as { status?: number }).status = 401;
+      throw err;
+    }
+
     logger.info('sign_challenge_verified', { agent_name: request.agent_name });
 
     const certPem = await signCSR({

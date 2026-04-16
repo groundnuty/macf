@@ -54,13 +54,25 @@ export interface AgentConfig {
 }
 
 // --- Sign request (POST /sign body) ---
+//
+// Two-step challenge-response (DR-010, security fix per #80).
+// Step 1: `{csr, agent_name, project?}` (no challenge_done, no challenge_id).
+// Step 2: `{csr, agent_name, project?, challenge_done: true, challenge_id}`.
+//
+// Step 2 MUST include the `challenge_id` the server returned in step 1,
+// and the client MUST have written the expected value to the registry
+// using its own token. See src/certs/challenge.ts for the full protocol.
 
 export const SignRequestSchema = z.object({
-  csr: z.string(),
-  agent_name: z.string(),
+  csr: z.string().min(1),
+  agent_name: z.string().min(1),
   project: z.string().optional(),
   challenge_done: z.boolean().optional(),
-});
+  challenge_id: z.string().uuid().optional(),
+}).refine(
+  (req) => !req.challenge_done || !!req.challenge_id,
+  { message: 'challenge_id is required when challenge_done is true' },
+);
 
 export type SignRequest = z.infer<typeof SignRequestSchema>;
 
