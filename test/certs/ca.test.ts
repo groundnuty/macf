@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
-import { mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createCA, encryptCAKey, decryptCAKey, loadCA, backupCAKey, recoverCAKey, isLikelyPemPrivateKey, CaError } from '../../src/certs/ca.js';
 import type { GitHubVariablesClient } from '../../src/registry/types.js';
@@ -87,6 +87,19 @@ describe('CA management', () => {
 
       expect(existsSync(certPath)).toBe(true);
       expect(existsSync(keyPath)).toBe(true);
+    });
+
+    it('creates CA parent dir with 0o700 mode (#107)', async () => {
+      // Defense-in-depth: ensureDir should use 0o700 on the leaf so
+      // the CA private key's parent dir isn't world-traversable even
+      // when the caller didn't pre-create it with tight mode.
+      const certPath = join(dir, 'ca-subdir', 'ca-cert.pem');
+      const keyPath = join(dir, 'ca-subdir', 'ca-key.pem');
+
+      await createCA({ project: 'TEST', certPath, keyPath });
+
+      const mode = statSync(join(dir, 'ca-subdir')).mode & 0o777;
+      expect(mode).toBe(0o700);
     });
   });
 
@@ -236,6 +249,22 @@ describe('CA management', () => {
 
       expect(recovered).toBe(keyPem);
       expect(existsSync(keyPath)).toBe(true);
+    });
+
+    it('recoverCAKey creates key parent dir with 0o700 mode (#107)', async () => {
+      const client = mockClient();
+      const keyPem = '-----BEGIN PRIVATE KEY-----\ntest-key-data\n-----END PRIVATE KEY-----\n';
+      const passphrase = 'backup-pass';
+
+      await backupCAKey({ project: 'MACF', keyPem, passphrase, client });
+      const encryptedValue = vi.mocked(client.writeVariable).mock.calls[0]![1];
+      vi.mocked(client.readVariable).mockResolvedValueOnce(encryptedValue);
+
+      const keyPath = join(dir, 'recover-subdir', 'ca-key.pem');
+      await recoverCAKey({ project: 'MACF', passphrase, keyPath, client });
+
+      const mode = statSync(join(dir, 'recover-subdir')).mode & 0o777;
+      expect(mode).toBe(0o700);
     });
 
     it('throws when no encrypted key in registry', async () => {

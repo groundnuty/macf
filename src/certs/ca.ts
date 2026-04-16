@@ -1,7 +1,7 @@
 import {
   createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync,
 } from 'node:crypto';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   x509, webcrypto, RSA_ALGORITHM, CA_CERT_VALIDITY_YEARS,
@@ -22,11 +22,18 @@ export interface CaKeyPair {
   readonly keyPem: string;
 }
 
+// Tight perms on the leaf so the CA private key's parent dir isn't
+// world-traversable even when this path is hit outside `certs init`
+// (e.g. recoverCAKey in a fresh env). mkdirSync's `mode` is ANDed
+// with the process umask, so follow up with chmodSync to guarantee
+// 0o700 regardless of umask. Intermediate dirs keep umask defaults —
+// they're usually ~/.macf/ or similar and not key-adjacent. (#107)
 function ensureDir(filePath: string): void {
   const dir = dirname(filePath);
   if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
+  chmodSync(dir, 0o700);
 }
 
 function exportKeyToPem(exported: ArrayBuffer): string {
