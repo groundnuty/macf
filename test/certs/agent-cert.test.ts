@@ -4,7 +4,7 @@ import { mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as x509Lib from '@peculiar/x509';
 import { createCA } from '../../src/certs/ca.js';
-import { generateAgentCert, generateCSR, signCSR, AgentCertError } from '../../src/certs/agent-cert.js';
+import { generateAgentCert, generateCSR, signCSR, extractCN, AgentCertError } from '../../src/certs/agent-cert.js';
 // Ensure crypto provider is initialized
 import '../../src/certs/crypto-provider.js';
 
@@ -112,6 +112,44 @@ describe('agent-cert', () => {
         caCertPem,
         caKeyPem,
       })).rejects.toThrow();
+    });
+  });
+
+  describe('extractCN (#89 — strict single-CN parser)', () => {
+    it('extracts a single CN from a bare subject', () => {
+      expect(extractCN('CN=code-agent')).toBe('code-agent');
+    });
+
+    it('extracts the CN from a subject with other RDNs before it', () => {
+      expect(extractCN('O=foo,CN=code-agent,OU=bar')).toBe('code-agent');
+    });
+
+    it('trims surrounding whitespace on the CN value', () => {
+      expect(extractCN('CN= code-agent ')).toBe('code-agent');
+    });
+
+    it('is case-insensitive on the CN= prefix', () => {
+      expect(extractCN('cn=code-agent')).toBe('code-agent');
+    });
+
+    it('returns undefined on a subject with ZERO CN fields', () => {
+      expect(extractCN('O=foo,OU=bar')).toBeUndefined();
+      expect(extractCN('')).toBeUndefined();
+    });
+
+    it('returns undefined on a subject with MULTIPLE CN fields (#89)', () => {
+      // Core fix: multi-CN subjects are rejected so an attacker can't
+      // craft `CN=attacker,CN=victim` and slip past the equality check.
+      expect(extractCN('CN=attacker,CN=victim')).toBeUndefined();
+      expect(extractCN('O=foo,CN=attacker,CN=victim')).toBeUndefined();
+      expect(extractCN('CN=attacker,OU=baz,CN=victim')).toBeUndefined();
+    });
+
+    it('does not match CN as substring of another RDN', () => {
+      // "OCN=foo" should NOT be interpreted as a CN.
+      expect(extractCN('OCN=foo')).toBeUndefined();
+      // "DCN=foo" similarly.
+      expect(extractCN('DCN=bar')).toBeUndefined();
     });
   });
 });
