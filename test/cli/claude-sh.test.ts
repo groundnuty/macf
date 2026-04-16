@@ -57,6 +57,21 @@ describe('generateClaudeSh', () => {
     const output = generateClaudeSh(sampleConfig);
     expect(output).toContain('export MACF_CA_CERT="$HOME/.macf/certs/TEST/ca-cert.pem"');
   });
+
+  it('uses the fail-loud token helper (no naive gh token generate | jq)', () => {
+    // #67: the launcher must not embed the silent-fallback anti-pattern.
+    const output = generateClaudeSh(sampleConfig);
+
+    // Invokes the helper, not the bare CLI.
+    expect(output).toContain('macf-gh-token.sh');
+    expect(output).toContain('$SCRIPT_DIR/.claude/scripts/macf-gh-token.sh');
+
+    // Fails loud — explicit `exit 1` on helper failure.
+    expect(output).toMatch(/macf-gh-token\.sh[\s\S]*?exit 1/);
+
+    // And specifically does NOT reinstate the naive pattern.
+    expect(output).not.toMatch(/gh token generate[^\n]*\|\s*jq/);
+  });
 });
 
 describe('writeClaudeSh', () => {
