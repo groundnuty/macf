@@ -41,7 +41,11 @@ interface DiffRow {
   readonly component: Component;
   readonly current: string;
   readonly latest: string;
-  readonly status: 'update' | 'same' | 'fetch_failed';
+  // Mirror the FetchStatus variants for non-ok paths so operators
+  // see the actual reason (not yet published vs network down vs
+  // malformed response) — not_published was noise for normal
+  // pre-release state when conflated with fetch_failed (#111 C2).
+  readonly status: 'update' | 'same' | 'not_published' | 'network_error' | 'invalid_response';
 }
 
 export function buildDiff(
@@ -51,9 +55,9 @@ export function buildDiff(
   return ALL_COMPONENTS.map(component => {
     const cur = current[component];
     const lat = resolved.versions[component];
-    const fetched = resolved.sources[component] === 'ok';
-    if (!fetched) {
-      return { component, current: cur, latest: lat, status: 'fetch_failed' as const };
+    const source = resolved.sources[component];
+    if (source !== 'ok') {
+      return { component, current: cur, latest: lat, status: source };
     }
     return {
       component,
@@ -83,7 +87,12 @@ function formatRow(row: DiffRow): string {
   switch (row.status) {
     case 'update': statusText = '⬆ update available'; break;
     case 'same': statusText = '✓ up to date'; break;
-    case 'fetch_failed': statusText = '? fetch failed (using cached)'; break;
+    // Distinct messages for each failure mode so operators don't
+    // chase phantom network issues when the component simply hasn't
+    // been published yet (#111 C2).
+    case 'not_published': statusText = '· not yet published (using cached)'; break;
+    case 'network_error': statusText = '? fetch failed (network) — using cached'; break;
+    case 'invalid_response': statusText = '? unexpected response — using cached'; break;
   }
   return `${name}  ${cur}  ${lat}  ${statusText}`;
 }
@@ -184,7 +193,9 @@ export async function update(
   console.log('');
 
   // Exit 1 if every fetch failed (no current info to compare against).
-  const allFailed = diff.every(r => r.status === 'fetch_failed');
+  // Any non-'update' / non-'same' status counts as failed-to-fetch here.
+  const FAIL_STATES: readonly DiffRow['status'][] = ['not_published', 'network_error', 'invalid_response'];
+  const allFailed = diff.every(r => FAIL_STATES.includes(r.status));
   if (allFailed) {
     console.error('Error: could not fetch latest versions for any component. Network down?');
     return 1;

@@ -53,15 +53,54 @@ describe('buildDiff', () => {
     expect(diff[2]).toEqual({ component: 'actions', current: 'v1', latest: 'v1', status: 'same' });
   });
 
-  it('marks fetch failures as fetch_failed', () => {
+  it('preserves fetch-status distinction, not collapsed to fetch_failed (#111 C2)', () => {
+    // Pre-#111: not_published and network_error both became
+    // 'fetch_failed'. Post-fix: each non-ok source preserves its
+    // specific state so operators don't investigate non-issues
+    // (\"not yet published\" ≠ \"network down\").
     const resolved: ResolvedVersions = {
       versions: { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' },
       sources: { cli: 'not_published', plugin: 'ok', actions: 'network_error' },
     };
     const diff = buildDiff({ cli: '0.1.0', plugin: '0.1.0', actions: 'v1' }, resolved);
-    expect(diff[0]!.status).toBe('fetch_failed');
+    expect(diff[0]!.status).toBe('not_published');
     expect(diff[1]!.status).toBe('same');
-    expect(diff[2]!.status).toBe('fetch_failed');
+    expect(diff[2]!.status).toBe('network_error');
+  });
+
+  it('propagates invalid_response as its own status', () => {
+    const resolved: ResolvedVersions = {
+      versions: { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' },
+      sources: { cli: 'invalid_response', plugin: 'ok', actions: 'ok' },
+    };
+    const diff = buildDiff({ cli: '0.1.0', plugin: '0.1.0', actions: 'v1' }, resolved);
+    expect(diff[0]!.status).toBe('invalid_response');
+  });
+});
+
+describe('renderDiff status messages (#111 C2)', () => {
+  it('renders not_published with a distinct not-yet-published message', () => {
+    const output = renderDiff([
+      { component: 'cli', current: '0.1.0', latest: '0.1.0', status: 'not_published' },
+    ]);
+    expect(output).toMatch(/not yet published|not published/i);
+    // Must not look like a network failure.
+    expect(output).not.toMatch(/fetch failed|network/i);
+  });
+
+  it('renders network_error with a fetch-failed / network message', () => {
+    const output = renderDiff([
+      { component: 'cli', current: '0.1.0', latest: '0.1.0', status: 'network_error' },
+    ]);
+    expect(output).toMatch(/fetch failed|network/i);
+    expect(output).not.toMatch(/not yet published/i);
+  });
+
+  it('renders invalid_response distinctly', () => {
+    const output = renderDiff([
+      { component: 'cli', current: '0.1.0', latest: '0.1.0', status: 'invalid_response' },
+    ]);
+    expect(output).toMatch(/unexpected response|invalid response/i);
   });
 });
 
