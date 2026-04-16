@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
-import { mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { generateWorkflow, generateAgentConfig, createLabel, repoInit } from '../../src/cli/commands/repo-init.js';
+import { generateWorkflow, generateAgentConfig, patchAgentConfig, createLabel, repoInit } from '../../src/cli/commands/repo-init.js';
 
 function tempDir(): string {
   const dir = join(tmpdir(), `macf-repo-init-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -47,21 +47,34 @@ describe('generateAgentConfig', () => {
       tmux_session: '<tmux-session-name>',
       ssh_user: 'ubuntu',
       tmux_bin: 'tmux',
+      ssh_key_secret: 'AGENT_SSH_KEY',
     });
   });
 
-  it('expands --agents list into entries with defaults', () => {
+  it('expands --agents list into entries with defaults (app_name unprefixed per #76)', () => {
     const json = generateAgentConfig(['code-agent', 'science-agent']);
     const parsed = JSON.parse(json);
     expect(Object.keys(parsed.agents)).toEqual(['code-agent', 'science-agent']);
-    expect(parsed.agents['code-agent'].app_name).toBe('macf-code-agent');
+    // #76: app_name default is the agent name itself, not macf-<agent>.
+    expect(parsed.agents['code-agent'].app_name).toBe('code-agent');
     expect(parsed.agents['code-agent'].tmux_session).toBe('code-agent');
-    expect(parsed.agents['science-agent'].app_name).toBe('macf-science-agent');
+    expect(parsed.agents['science-agent'].app_name).toBe('science-agent');
   });
 
-  it('does NOT include dead ssh_key_secret field', () => {
+  it('includes ssh_key_secret in generated entries (required by routing workflow, #76)', () => {
     const json = generateAgentConfig(['code-agent']);
-    expect(json).not.toContain('ssh_key_secret');
+    const parsed = JSON.parse(json);
+    expect(parsed.agents['code-agent'].ssh_key_secret).toBe('AGENT_SSH_KEY');
+  });
+
+  it('includes default label_to_status block (#76)', () => {
+    const json = generateAgentConfig(['code-agent']);
+    const parsed = JSON.parse(json);
+    expect(parsed.label_to_status).toEqual({
+      'in-progress': 'In Progress',
+      'in-review': 'In Review',
+      'blocked': 'Blocked',
+    });
   });
 
   it('produces valid JSON', () => {
@@ -93,6 +106,133 @@ describe('generateAgentConfig', () => {
     expect(parsed.agents['code-agent']).not.toHaveProperty('tmux_window');
     expect(parsed.agents['science-agent'].tmux_session).toBe('science-agent');
     expect(parsed.agents['science-agent']).not.toHaveProperty('tmux_window');
+  });
+});
+
+describe('patchAgentConfig (merge-preserving regenerate, #76)', () => {
+  const existingConfig = () => ({
+    agents: {
+      'cv-architect': {
+        app_name: 'cv-architect',
+        host: '100.124.163.105',
+        tmux_session: 'cv-architect',
+        tmux_bin: 'tmux',
+        ssh_user: 'ubuntu',
+        ssh_key_secret: 'AGENT_SSH_KEY',
+      },
+      'cv-project-archaeologist': {
+        app_name: 'cv-project-archaeologist',
+        host: '100.124.163.105',
+        tmux_session: 'cv-project-archaeologist',
+        tmux_bin: 'tmux',
+        ssh_user: 'ubuntu',
+        ssh_key_secret: 'AGENT_SSH_KEY',
+      },
+    },
+    label_to_status: {
+      'in-progress': 'In Progress',
+      'in-review': 'In Review',
+      'blocked': 'Blocked',
+    },
+  });
+
+  it('preserves app_name, host, ssh_key_secret, ssh_user on regenerate', () => {
+    const existing = JSON.stringify(existingConfig(), null, 2);
+    const patched = patchAgentConfig(existing,
+      ['cv-architect', 'cv-project-archaeologist'], 'cv-project');
+    const parsed = JSON.parse(patched);
+    expect(parsed.agents['cv-architect'].app_name).toBe('cv-architect');
+    expect(parsed.agents['cv-architect'].host).toBe('100.124.163.105');
+    expect(parsed.agents['cv-architect'].ssh_key_secret).toBe('AGENT_SSH_KEY');
+    expect(parsed.agents['cv-architect'].ssh_user).toBe('ubuntu');
+  });
+
+  it('updates tmux_session + adds tmux_window when --session-name with multiple agents', () => {
+    const existing = JSON.stringify(existingConfig(), null, 2);
+    const patched = patchAgentConfig(existing,
+      ['cv-architect', 'cv-project-archaeologist'], 'cv-project');
+    const parsed = JSON.parse(patched);
+    expect(parsed.agents['cv-architect'].tmux_session).toBe('cv-project');
+    expect(parsed.agents['cv-architect'].tmux_window).toBe('cv-architect');
+    expect(parsed.agents['cv-project-archaeologist'].tmux_window).toBe('cv-project-archaeologist');
+  });
+
+  it('removes tmux_window when re-patching without --session-name (ungrouping)', () => {
+    const existing = JSON.stringify({
+      agents: {
+        'cv-architect': {
+          app_name: 'cv-architect', host: '100.0.0.1',
+          tmux_session: 'cv-project', tmux_window: 'cv-architect',
+          tmux_bin: 'tmux', ssh_user: 'ubuntu', ssh_key_secret: 'AGENT_SSH_KEY',
+        },
+      },
+    }, null, 2);
+    const patched = patchAgentConfig(existing, ['cv-architect']);
+    const parsed = JSON.parse(patched);
+    expect(parsed.agents['cv-architect'].tmux_session).toBe('cv-architect');
+    expect(parsed.agents['cv-architect']).not.toHaveProperty('tmux_window');
+  });
+
+  it('preserves top-level label_to_status and unknown top-level fields', () => {
+    const withExtras = {
+      ...existingConfig(),
+      custom_field: 'user added',
+      routing_policy: { debounce_ms: 500 },
+    };
+    const patched = patchAgentConfig(
+      JSON.stringify(withExtras, null, 2),
+      ['cv-architect'], 'cv-project',
+    );
+    const parsed = JSON.parse(patched);
+    expect(parsed.label_to_status).toEqual(withExtras.label_to_status);
+    expect(parsed.custom_field).toBe('user added');
+    expect(parsed.routing_policy).toEqual({ debounce_ms: 500 });
+  });
+
+  it('leaves agents NOT in --agents list unchanged', () => {
+    const patched = patchAgentConfig(
+      JSON.stringify(existingConfig(), null, 2),
+      ['cv-architect'], 'cv-project',
+    );
+    const parsed = JSON.parse(patched);
+    expect(parsed.agents).toHaveProperty('cv-project-archaeologist');
+    expect(parsed.agents['cv-project-archaeologist'].host).toBe('100.124.163.105');
+  });
+
+  it('adds fresh entries for new agents while preserving old ones', () => {
+    const patched = patchAgentConfig(
+      JSON.stringify(existingConfig(), null, 2),
+      ['cv-architect', 'writing-agent'], 'cv-project',
+    );
+    const parsed = JSON.parse(patched);
+    expect(parsed.agents['writing-agent']).toBeDefined();
+    expect(parsed.agents['writing-agent'].host).toBe('<agent-host-ip>');
+    expect(parsed.agents['cv-architect'].host).toBe('100.124.163.105');
+    expect(parsed.agents['writing-agent'].tmux_window).toBe('writing-agent');
+  });
+
+  it('injects ssh_key_secret default when old config lacks it', () => {
+    const oldConfig = {
+      agents: {
+        'code-agent': {
+          app_name: 'code-agent', host: '100.0.0.1',
+          tmux_session: 'code-agent', tmux_bin: 'tmux', ssh_user: 'ubuntu',
+        },
+      },
+    };
+    const patched = patchAgentConfig(JSON.stringify(oldConfig, null, 2), ['code-agent']);
+    const parsed = JSON.parse(patched);
+    expect(parsed.agents['code-agent'].ssh_key_secret).toBe('AGENT_SSH_KEY');
+  });
+
+  it('throws on malformed JSON rather than overwriting', () => {
+    expect(() => patchAgentConfig('{ not valid', ['a'])).toThrow(/not valid JSON/);
+  });
+
+  it('throws when the existing file has no agents key', () => {
+    expect(() =>
+      patchAgentConfig(JSON.stringify({ other: 'thing' }), ['a']),
+    ).toThrow(/no `agents` object/);
   });
 });
 

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { generateToken } from '../../token.js';
 
@@ -101,6 +101,36 @@ interface AgentConfigEntry {
   tmux_window?: string;
   ssh_user: string;
   tmux_bin: string;
+  ssh_key_secret: string;
+}
+
+const DEFAULT_LABEL_TO_STATUS: Readonly<Record<string, string>> = {
+  'in-progress': 'In Progress',
+  'in-review': 'In Review',
+  'blocked': 'Blocked',
+};
+
+interface AgentConfigFile {
+  agents: Record<string, AgentConfigEntry>;
+  label_to_status?: Record<string, string>;
+  [key: string]: unknown;
+}
+
+function makeAgentEntry(
+  agent: string,
+  useWindows: boolean,
+  sessionName: string | undefined,
+): AgentConfigEntry {
+  const entry: AgentConfigEntry = {
+    app_name: agent,
+    host: '<agent-host-ip>',
+    tmux_session: useWindows ? sessionName! : agent,
+    ssh_user: 'ubuntu',
+    tmux_bin: 'tmux',
+    ssh_key_secret: 'AGENT_SSH_KEY',
+  };
+  if (useWindows) entry.tmux_window = agent;
+  return entry;
 }
 
 export function generateAgentConfig(
@@ -116,30 +146,71 @@ export function generateAgentConfig(
           tmux_session: '<tmux-session-name>',
           ssh_user: 'ubuntu',
           tmux_bin: 'tmux',
+          ssh_key_secret: 'AGENT_SSH_KEY',
         },
       },
+      label_to_status: { ...DEFAULT_LABEL_TO_STATUS },
     }, null, 2) + '\n';
   }
 
-  // Group agents into a shared session with per-agent windows only when
-  // the operator asked for it explicitly (--session-name given) AND there
-  // are multiple agents. For a single agent, windowing adds tmux overhead
-  // with no benefit — stick with the simple one-session layout.
   const useWindows = !!sessionName && agents.length > 1;
 
   const agentEntries: Record<string, AgentConfigEntry> = {};
   for (const agent of agents) {
-    const entry: AgentConfigEntry = {
-      app_name: `macf-${agent}`,
-      host: '<agent-host-ip>',
-      tmux_session: useWindows ? sessionName! : agent,
-      ssh_user: 'ubuntu',
-      tmux_bin: 'tmux',
-    };
-    if (useWindows) entry.tmux_window = agent;
-    agentEntries[agent] = entry;
+    agentEntries[agent] = makeAgentEntry(agent, useWindows, sessionName);
   }
-  return JSON.stringify({ agents: agentEntries }, null, 2) + '\n';
+  return JSON.stringify({
+    agents: agentEntries,
+    label_to_status: { ...DEFAULT_LABEL_TO_STATUS },
+  }, null, 2) + '\n';
+}
+
+/**
+ * Merge-preserving regenerate for #76: update only tmux_session/tmux_window
+ * fields from user input, preserve app_name/host/ssh_key_secret/ssh_user
+ * /tmux_bin/unknown-fields, preserve top-level label_to_status and extras.
+ * Agents not in the --agents list are left alone.
+ */
+export function patchAgentConfig(
+  existingJson: string,
+  agents: readonly string[],
+  sessionName?: string,
+): string {
+  let parsed: AgentConfigFile;
+  try {
+    parsed = JSON.parse(existingJson) as AgentConfigFile;
+  } catch {
+    throw new Error('Existing agent-config.json is not valid JSON; aborting rather than overwrite.');
+  }
+  if (!parsed.agents || typeof parsed.agents !== 'object') {
+    throw new Error('Existing agent-config.json has no `agents` object; aborting.');
+  }
+
+  const useWindows = !!sessionName && agents.length > 1;
+  const agentEntries: Record<string, AgentConfigEntry> = { ...parsed.agents };
+
+  for (const agent of agents) {
+    const existing = parsed.agents[agent];
+    if (!existing) {
+      agentEntries[agent] = makeAgentEntry(agent, useWindows, sessionName);
+      continue;
+    }
+    const patched: AgentConfigEntry = { ...existing };
+    patched.tmux_session = useWindows ? sessionName! : agent;
+    if (useWindows) {
+      patched.tmux_window = agent;
+    } else {
+      delete patched.tmux_window;
+    }
+    if (!patched.ssh_key_secret) patched.ssh_key_secret = 'AGENT_SSH_KEY';
+    agentEntries[agent] = patched;
+  }
+
+  const out: AgentConfigFile = { ...parsed, agents: agentEntries };
+  if (!out.label_to_status) {
+    out.label_to_status = { ...DEFAULT_LABEL_TO_STATUS };
+  }
+  return JSON.stringify(out, null, 2) + '\n';
 }
 
 export async function createLabel(
@@ -211,11 +282,13 @@ export async function repoInit(
     generateWorkflow(opts.actionsVersion),
     opts.force,
   );
-  const configResult = writeFileSafe(
-    configPath,
-    generateAgentConfig(agentList, opts.sessionName),
-    opts.force,
-  );
+  // Merge-preserving (#76): if the config already exists and --force is
+  // passed, patch tmux fields + inject missing defaults rather than
+  // clobbering user-customized app_name/host/ssh_key_secret/etc.
+  const configContent = existsSync(configPath) && opts.force
+    ? patchAgentConfig(readFileSync(configPath, 'utf-8'), agentList, opts.sessionName)
+    : generateAgentConfig(agentList, opts.sessionName);
+  const configResult = writeFileSafe(configPath, configContent, opts.force);
 
   const allLabels: LabelSpec[] = [...STATUS_LABELS];
   for (const agent of agentList) {
