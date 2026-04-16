@@ -161,6 +161,20 @@ export function encryptCAKey(keyPem: string, passphrase: string): string {
 /**
  * Decrypt CA key encrypted with encryptCAKey.
  * Interoperable with: openssl enc -aes-256-cbc -pbkdf2 -md sha256 -iter 10000 -d
+ *
+ * Throws on:
+ *   - missing `Salted__` header (ciphertext not in our expected format)
+ *   - PKCS7 padding failure (wrong passphrase, ~94% of the time)
+ *   - decrypted content doesn't look like a PEM private key (wrong
+ *     passphrase that happened to produce valid PKCS7 padding by
+ *     chance — ~6% of the time; see #94). Without the shape check,
+ *     `recoverCAKey` would write garbage to disk as the CA key,
+ *     producing confusing failures further down the TLS path.
+ *
+ * The PEM-shape check is a semantic verification, not cryptographic
+ * authentication — AES-CBC has no built-in integrity. Adding HMAC would
+ * break OpenSSL CLI interop (DR-011). The shape check catches the
+ * observable failure mode without changing the on-wire format.
  */
 export function decryptCAKey(encryptedBase64: string, passphrase: string): string {
   const data = Buffer.from(encryptedBase64, 'base64');
@@ -178,12 +192,45 @@ export function decryptCAKey(encryptedBase64: string, passphrase: string): strin
   const iv = keyIv.subarray(32, 48);
 
   const decipher = createDecipheriv('aes-256-cbc', key, iv);
-  const decrypted = Buffer.concat([
-    decipher.update(ciphertext),
-    decipher.final(),
-  ]);
+  let decryptedBuf: Buffer;
+  try {
+    decryptedBuf = Buffer.concat([
+      decipher.update(ciphertext),
+      decipher.final(),
+    ]);
+  } catch {
+    // AES-CBC padding failure — most wrong-passphrase attempts hit
+    // this path. Generic error so callers can re-prompt.
+    throw new CaError('Decryption failed (wrong passphrase or corrupted ciphertext)');
+  }
 
-  return decrypted.toString('utf-8');
+  const decrypted = decryptedBuf.toString('utf-8');
+  if (!isLikelyPemPrivateKey(decrypted)) {
+    // Passphrase happened to produce valid PKCS7 padding by chance but
+    // the plaintext is random garbage. See #94.
+    throw new CaError('Decryption failed (wrong passphrase or corrupted ciphertext)');
+  }
+
+  return decrypted;
+}
+
+/**
+ * Cheap semantic check: does this look like a PEM-encoded private key?
+ * Exported for unit tests. Doesn't validate DER content — only the
+ * PEM envelope.
+ *
+ * Random bytes faking BOTH the 28-char BEGIN and 26-char END markers
+ * simultaneously is ~2^-432 per decrypted buffer — effectively
+ * impossible. No minimum body length is needed; the markers alone are
+ * the distinguisher.
+ */
+export function isLikelyPemPrivateKey(text: string): boolean {
+  // PKCS#8 ("-----BEGIN PRIVATE KEY-----") or legacy RSA/EC variants.
+  const beginIdx = text.search(/-----BEGIN [A-Z ]*PRIVATE KEY-----/);
+  if (beginIdx < 0) return false;
+  const endIdx = text.search(/-----END [A-Z ]*PRIVATE KEY-----/);
+  if (endIdx <= beginIdx) return false;
+  return true;
 }
 
 /**
