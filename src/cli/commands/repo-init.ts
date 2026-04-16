@@ -8,6 +8,13 @@ export interface RepoInitOptions {
   readonly actionsVersion: string;
   readonly agents?: string;
   readonly force: boolean;
+  /**
+   * Optional shared tmux session name. When provided alongside 2+ agents,
+   * all agents share this session and each is given a `tmux_window` equal
+   * to the agent name. Omit or combine with a single agent to get the
+   * legacy "session per agent, no window" layout.
+   */
+  readonly sessionName?: string;
 }
 
 interface LabelSpec {
@@ -78,7 +85,28 @@ export function generateWorkflow(actionsVersion: string): string {
   ].join('\n');
 }
 
-export function generateAgentConfig(agents: readonly string[]): string {
+/**
+ * Agent-config entry schema.
+ *
+ * `tmux_window` is optional: when present the routing workflow sends to
+ * `${tmux_session}:${tmux_window}` (per-agent window inside a shared
+ * session); when absent it sends to just `${tmux_session}` (legacy layout,
+ * one session per agent). See groundnuty/macf#69 and the matching workflow
+ * support in `groundnuty/macf-actions` v1.1.
+ */
+interface AgentConfigEntry {
+  app_name: string;
+  host: string;
+  tmux_session: string;
+  tmux_window?: string;
+  ssh_user: string;
+  tmux_bin: string;
+}
+
+export function generateAgentConfig(
+  agents: readonly string[],
+  sessionName?: string,
+): string {
   if (agents.length === 0) {
     return JSON.stringify({
       agents: {
@@ -93,21 +121,23 @@ export function generateAgentConfig(agents: readonly string[]): string {
     }, null, 2) + '\n';
   }
 
-  const agentEntries: Record<string, {
-    app_name: string;
-    host: string;
-    tmux_session: string;
-    ssh_user: string;
-    tmux_bin: string;
-  }> = {};
+  // Group agents into a shared session with per-agent windows only when
+  // the operator asked for it explicitly (--session-name given) AND there
+  // are multiple agents. For a single agent, windowing adds tmux overhead
+  // with no benefit — stick with the simple one-session layout.
+  const useWindows = !!sessionName && agents.length > 1;
+
+  const agentEntries: Record<string, AgentConfigEntry> = {};
   for (const agent of agents) {
-    agentEntries[agent] = {
+    const entry: AgentConfigEntry = {
       app_name: `macf-${agent}`,
       host: '<agent-host-ip>',
-      tmux_session: agent,
+      tmux_session: useWindows ? sessionName! : agent,
       ssh_user: 'ubuntu',
       tmux_bin: 'tmux',
     };
+    if (useWindows) entry.tmux_window = agent;
+    agentEntries[agent] = entry;
   }
   return JSON.stringify({ agents: agentEntries }, null, 2) + '\n';
 }
@@ -183,7 +213,7 @@ export async function repoInit(
   );
   const configResult = writeFileSafe(
     configPath,
-    generateAgentConfig(agentList),
+    generateAgentConfig(agentList, opts.sessionName),
     opts.force,
   );
 

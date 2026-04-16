@@ -200,6 +200,7 @@ program
   .option('--repo <owner/repo>', 'Target GitHub repo (defaults to current dir\'s origin remote)')
   .option('--actions-version <version>', 'macf-actions tag to pin to', 'v1')
   .option('--agents <list>', 'Comma-separated agent names to scaffold (e.g., code-agent,science-agent)')
+  .option('--session-name <name>', 'Shared tmux session name; when set with multiple --agents, each agent gets a window inside this session')
   .option('--force', 'Overwrite existing files', false)
   .option('--dir <path>', 'Target directory (defaults to current working directory)')
   .action(async (opts) => {
@@ -208,6 +209,7 @@ program
       repo: opts.repo,
       actionsVersion: opts.actionsVersion,
       agents: opts.agents,
+      sessionName: opts.sessionName,
       force: opts.force,
     });
   });
