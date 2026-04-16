@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { formatDashboard, formatPeerTable, formatIssues } from '../../../src/plugin/lib/format.js';
 import type { HealthResponse } from '../../../src/types.js';
+import type { OwnRegistration } from '../../../src/plugin/lib/registry.js';
 
 const sampleHealth: HealthResponse = {
   agent: 'code-agent',
@@ -12,23 +13,34 @@ const sampleHealth: HealthResponse = {
   last_notification: '2026-03-28T18:01:00Z',
 };
 
+const sampleRegistration: OwnRegistration = {
+  name: 'code-agent',
+  info: {
+    host: '100.86.5.117',
+    port: 8847,
+    type: 'permanent',
+    instance_id: 'abc123',
+    started: '2026-04-16T10:00:00Z',
+  },
+};
+
 describe('formatDashboard', () => {
-  it('formats agent status with health data', () => {
-    const output = formatDashboard('code-agent', sampleHealth, []);
+  it('formats agent status with health data (full live details)', () => {
+    const output = formatDashboard('code-agent', sampleRegistration, sampleHealth, []);
     expect(output).toContain('code-agent');
     expect(output).toContain('online');
     expect(output).toContain('1h');
     expect(output).toContain('#42');
   });
 
-  it('shows not registered when no health', () => {
-    const output = formatDashboard('unknown', null, []);
+  it('shows not registered when both registration and health are null', () => {
+    const output = formatDashboard('unknown', null, null, []);
     expect(output).toContain('not registered');
   });
 
   it('shows idle when no current issue', () => {
     const health: HealthResponse = { ...sampleHealth, current_issue: null };
-    const output = formatDashboard('code-agent', health, []);
+    const output = formatDashboard('code-agent', sampleRegistration, health, []);
     expect(output).toContain('idle');
   });
 
@@ -37,10 +49,34 @@ describe('formatDashboard', () => {
       { name: 'code-agent', health: sampleHealth },
       { name: 'science-agent', health: null },
     ];
-    const output = formatDashboard('code-agent', sampleHealth, peers);
+    const output = formatDashboard('code-agent', sampleRegistration, sampleHealth, peers);
     expect(output).toContain('Peers:');
     expect(output).toContain('science-agent');
     expect(output).toContain('offline');
+  });
+
+  it('shows registration info when agent is registered but no live health (#84)', () => {
+    // This is the #84 fix: without a live health ping, previously the
+    // header always said "not registered" even for agents that were
+    // registered. Now it shows what we know from the registry entry.
+    const output = formatDashboard('code-agent', sampleRegistration, null, []);
+    expect(output).toContain('registered');
+    expect(output).not.toContain('not registered');
+    expect(output).toContain('100.86.5.117:8847');
+    expect(output).toContain('abc123');
+  });
+
+  it('does NOT include self in peers table (self goes in header)', () => {
+    const peers = [
+      { name: 'code-agent', health: sampleHealth },   // self
+      { name: 'science-agent', health: null },        // peer
+    ];
+    const output = formatDashboard('code-agent', sampleRegistration, sampleHealth, peers);
+    // Self appears in header once ("=== code-agent ===") but not in the
+    // peers table. Count explicit table-formatted occurrences.
+    const peerSection = output.split('Peers:')[1] ?? '';
+    expect(peerSection).not.toContain('code-agent');
+    expect(peerSection).toContain('science-agent');
   });
 });
 

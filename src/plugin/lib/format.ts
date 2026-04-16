@@ -1,5 +1,5 @@
 import type { HealthResponse } from '../../types.js';
-import type { PeerEntry } from './registry.js';
+import type { OwnRegistration, PeerEntry } from './registry.js';
 
 function formatUptime(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -11,9 +11,19 @@ function formatUptime(seconds: number): string {
 
 /**
  * Format a status dashboard for a single agent.
+ *
+ * Three header states, based on what we know about the caller's own
+ * agent (see #84 — previously this was always "Status: not registered"):
+ *
+ *   - `ownHealth` set (via self-ping): full live details
+ *   - `ownRegistration` set but no health: registration info from the
+ *     registry (host:port, type, instance_id, started_at) — enough
+ *     to confirm the agent IS registered even without mTLS self-ping
+ *   - Neither: "not registered"
  */
 export function formatDashboard(
   agentName: string,
+  ownRegistration: OwnRegistration | null,
   ownHealth: HealthResponse | null,
   peers: ReadonlyArray<{ readonly name: string; readonly health: HealthResponse | null }>,
 ): string {
@@ -23,6 +33,7 @@ export function formatDashboard(
   lines.push('');
 
   if (ownHealth) {
+    // Live self-ping succeeded — show full health details.
     lines.push(`Status:    ${ownHealth.status}`);
     lines.push(`Type:      ${ownHealth.type}`);
     lines.push(`Uptime:    ${formatUptime(ownHealth.uptime_seconds)}`);
@@ -35,8 +46,17 @@ export function formatDashboard(
     if (ownHealth.last_notification) {
       lines.push(`Last ping: ${ownHealth.last_notification}`);
     }
+  } else if (ownRegistration) {
+    // Registry entry present but no live health (either couldn't ping
+    // or pinging wasn't attempted). Show registration info as minimum
+    // useful signal.
+    lines.push(`Status:    registered (no live health)`);
+    lines.push(`Type:      ${ownRegistration.info.type}`);
+    lines.push(`Endpoint:  ${ownRegistration.info.host}:${ownRegistration.info.port}`);
+    lines.push(`Instance:  ${ownRegistration.info.instance_id}`);
+    lines.push(`Started:   ${ownRegistration.info.started}`);
   } else {
-    lines.push('Status: not registered or unreachable');
+    lines.push('Status:    not registered');
   }
 
   if (peers.length > 0) {

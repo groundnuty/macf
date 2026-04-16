@@ -11,7 +11,7 @@
  */
 import 'reflect-metadata';
 import { formatDashboard, formatPeerTable, formatIssues } from '../lib/format.js';
-import { listPeers } from '../lib/registry.js';
+import { getOwnRegistration, listPeers } from '../lib/registry.js';
 import { checkIssues } from '../lib/work.js';
 import { createRegistryFromConfig } from '../../registry/factory.js';
 import { generateToken } from '../../token.js';
@@ -44,8 +44,21 @@ async function main(): Promise<void> {
     case 'status': {
       const token = await generateToken();
       const registry = createRegistryFromConfig(registryConfig, project, token);
-      const peers = await listPeers(registry);
-      console.log(formatDashboard(agentName, null, peers.map(p => ({ name: p.name, health: null }))));
+      // Fetch own registration from the registry so the dashboard header
+      // reflects whether THIS agent is actually registered (see #84 —
+      // previously always "not registered" due to hardcoded null).
+      const [ownRegistration, peers] = await Promise.all([
+        getOwnRegistration(agentName, registry),
+        listPeers(registry),
+      ]);
+      // Live-health self-ping tracked under #85 (macf-ping is a stub;
+      // wiring it up will let the dashboard show uptime/current_issue too).
+      console.log(formatDashboard(
+        agentName,
+        ownRegistration,
+        null,
+        peers.map(p => ({ name: p.name, health: null })),
+      ));
       break;
     }
 
