@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 import { mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { createCA, encryptCAKey, decryptCAKey, loadCA, backupCAKey, recoverCAKey, CaError } from '../../src/certs/ca.js';
+import { createCA, encryptCAKey, decryptCAKey, loadCA, backupCAKey, recoverCAKey, isLikelyPemPrivateKey, CaError } from '../../src/certs/ca.js';
 import type { GitHubVariablesClient } from '../../src/registry/types.js';
 
 function tempDir(): string {
@@ -108,15 +108,99 @@ describe('CA management', () => {
       expect(decoded.subarray(0, 8).toString('utf-8')).toBe('Salted__');
     });
 
-    it('fails with wrong passphrase', () => {
-      const encrypted = encryptCAKey('secret-key', 'correct-password');
-      expect(() => decryptCAKey(encrypted, 'wrong-password')).toThrow();
+    it('fails with wrong passphrase (#94 — 100 iterations must all throw)', () => {
+      // Previously flaky at ~6% per attempt because AES-CBC + PKCS7
+      // sometimes produces valid-padding garbage without throwing. The
+      // decryptCAKey semantic check (isLikelyPemPrivateKey) closes the
+      // gap: wrong-passphrase output never has both PEM markers, so the
+      // throw rate is now 100%. 100 iterations provides >99.999% confidence
+      // (prior flake probability 0.06^100 ≈ 10^-122).
+      const pem =
+        '-----BEGIN PRIVATE KEY-----\n' +
+        'MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQ' +
+        'C7VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dV\n' +
+        '-----END PRIVATE KEY-----\n';
+      const encrypted = encryptCAKey(pem, 'correct-password');
+      for (let i = 0; i < 100; i++) {
+        expect(() => decryptCAKey(encrypted, `wrong-${i}`)).toThrow(CaError);
+      }
     });
 
     it('fails with invalid format', () => {
       const badData = Buffer.from('not-salted-data').toString('base64');
       expect(() => decryptCAKey(badData, 'pass')).toThrow(CaError);
       expect(() => decryptCAKey(badData, 'pass')).toThrow('Salted__');
+    });
+
+    it('fails with corrupted ciphertext (bit-flip) — #94 complement', () => {
+      const pem =
+        '-----BEGIN PRIVATE KEY-----\n' +
+        'MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQ' +
+        'C7VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dV\n' +
+        '-----END PRIVATE KEY-----\n';
+      const encrypted = encryptCAKey(pem, 'pass');
+      const bytes = Buffer.from(encrypted, 'base64');
+      // Flip one bit in the ciphertext portion (after Salted__ + 8-byte salt)
+      bytes[20] ^= 0x01;
+      const corrupted = bytes.toString('base64');
+      expect(() => decryptCAKey(corrupted, 'pass')).toThrow(CaError);
+    });
+
+    it('round-trips a realistic PEM body through encrypt/decrypt', () => {
+      const pem =
+        '-----BEGIN PRIVATE KEY-----\n' +
+        'MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQ' +
+        'C7VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dV\n' +
+        '-----END PRIVATE KEY-----\n';
+      const encrypted = encryptCAKey(pem, 'my-passphrase');
+      const decrypted = decryptCAKey(encrypted, 'my-passphrase');
+      expect(decrypted).toBe(pem);
+    });
+  });
+
+  describe('isLikelyPemPrivateKey (#94 semantic check)', () => {
+    it('accepts PKCS#8 PEM', () => {
+      expect(isLikelyPemPrivateKey(
+        '-----BEGIN PRIVATE KEY-----\nbody\n-----END PRIVATE KEY-----\n',
+      )).toBe(true);
+    });
+
+    it('accepts legacy RSA PEM', () => {
+      expect(isLikelyPemPrivateKey(
+        '-----BEGIN RSA PRIVATE KEY-----\nbody\n-----END RSA PRIVATE KEY-----\n',
+      )).toBe(true);
+    });
+
+    it('accepts EC PEM', () => {
+      expect(isLikelyPemPrivateKey(
+        '-----BEGIN EC PRIVATE KEY-----\nbody\n-----END EC PRIVATE KEY-----\n',
+      )).toBe(true);
+    });
+
+    it('rejects plain garbage', () => {
+      expect(isLikelyPemPrivateKey('random garbage bytes')).toBe(false);
+      expect(isLikelyPemPrivateKey('')).toBe(false);
+      expect(isLikelyPemPrivateKey('\x00\x01\x02\x03')).toBe(false);
+    });
+
+    it('rejects PEM with only BEGIN marker', () => {
+      expect(isLikelyPemPrivateKey('-----BEGIN PRIVATE KEY-----\nbody')).toBe(false);
+    });
+
+    it('rejects PEM with only END marker', () => {
+      expect(isLikelyPemPrivateKey('body\n-----END PRIVATE KEY-----')).toBe(false);
+    });
+
+    it('rejects END-before-BEGIN ordering', () => {
+      expect(isLikelyPemPrivateKey(
+        '-----END PRIVATE KEY-----\nfoo\n-----BEGIN PRIVATE KEY-----',
+      )).toBe(false);
+    });
+
+    it('rejects non-private-key PEM (certificate)', () => {
+      expect(isLikelyPemPrivateKey(
+        '-----BEGIN CERTIFICATE-----\nbody\n-----END CERTIFICATE-----\n',
+      )).toBe(false);
     });
   });
 
