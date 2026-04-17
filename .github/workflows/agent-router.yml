@@ -1,5 +1,14 @@
 name: Agent Router
 
+# Delegates to the reusable workflow in groundnuty/macf-actions@v1.3.0
+# (see https://github.com/groundnuty/macf-actions for source).
+#
+# Pinned to immutable v1.3.0 rather than the floating @v1 tag so the
+# routing infrastructure macf itself depends on doesn't move without
+# an explicit PR here. When macf-actions cuts a new release, upgrade
+# the `uses:` ref by a dedicated PR on this repo — that gives the
+# upgrade its own review+verify window.
+
 on:
   issues:
     types: [labeled, closed]
@@ -9,205 +18,23 @@ on:
     types: [opened]
   pull_request_review:
     types: [submitted]
+  # CI-completion routing (macf-actions#6, v1.3+). Fires the
+  # route-by-ci-completion job so agent-authored PRs get notified
+  # when CI finishes, eliminating the "post handoff + poll" pattern.
+  check_suite:
+    types: [completed]
 
+# Caller must grant at least what the reusable workflow expects.
+# `checks: read` is required for the CI-completion job to enumerate
+# check_runs (for the first-failing-check name) — without it the job
+# would 403 inside the reusable workflow.
 permissions:
   contents: read
   issues: write
   pull-requests: read
+  checks: read
 
 jobs:
-
-  # ─── LOAD CONFIG ───
-  config:
-    runs-on: ubuntu-latest
-    outputs:
-      agents: ${{ steps.load.outputs.agents }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          sparse-checkout: .github/agent-config.json
-          sparse-checkout-cone-mode: false
-
-      - name: Load config
-        id: load
-        run: |
-          echo "agents=$(jq -c '.agents' .github/agent-config.json)" >> "$GITHUB_OUTPUT"
-
-  # ─── LABEL ROUTING ───
-  route-by-label:
-    needs: config
-    if: >
-      (github.event_name == 'issues') &&
-      (github.event.action == 'labeled') &&
-      (github.actor != 'github-actions[bot]')
-    runs-on: ubuntu-latest
-    env:
-      AGENT_SSH_KEY: ${{ secrets.AGENT_SSH_KEY }}
-      AGENTS: ${{ needs.config.outputs.agents }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v3
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci-runner
-
-      - name: Wait for Tailscale network
-        run: sleep 10
-
-      - name: Route to agent by label
-        env:
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          EVENT_LABEL: ${{ github.event.label.name }}
-          ACTOR: ${{ github.event.sender.login }}
-        run: |
-          set -euo pipefail
-
-          LABEL="$EVENT_LABEL"
-          HOST=$(echo "$AGENTS" | jq -r --arg l "$LABEL" '.[$l].host // empty')
-          if [ -z "$HOST" ]; then
-            echo "Label '$LABEL' is not an agent label, skipping"
-            exit 0
-          fi
-
-          APP_NAME=$(echo "$AGENTS" | jq -r --arg l "$LABEL" '.[$l].app_name // empty')
-          if [ "$ACTOR" = "${APP_NAME}[bot]" ]; then
-            echo "Actor is the same agent, skipping self-routing"
-            exit 0
-          fi
-
-          SESSION=$(echo "$AGENTS" | jq -r --arg l "$LABEL" '.[$l].tmux_session')
-          SSH_USER=$(echo "$AGENTS" | jq -r --arg l "$LABEL" '.[$l].ssh_user')
-          TMUX_BIN=$(echo "$AGENTS" | jq -r --arg l "$LABEL" '.[$l].tmux_bin // "tmux"')
-
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          echo "$AGENT_SSH_KEY" > ~/.ssh/id_agent
-          chmod 600 ~/.ssh/id_agent
-
-          if ssh -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new \
-            -i ~/.ssh/id_agent "${SSH_USER}@${HOST}" \
-            "${TMUX_BIN} has-session -t ${SESSION} 2>/dev/null \
-              && ${TMUX_BIN} send-keys -t ${SESSION} C-u \
-              && ${TMUX_BIN} send-keys -t ${SESSION} 'Please work on issue #${ISSUE_NUMBER}. Run: gh issue view ${ISSUE_NUMBER} --json title,body,labels,comments' Enter \
-              && sleep 1 \
-              && ${TMUX_BIN} send-keys -t ${SESSION} Enter"; then
-            echo "Routed issue #${ISSUE_NUMBER} to ${LABEL}"
-          else
-            echo "Agent ${LABEL} is offline or unreachable"
-            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "agent-offline"
-            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-              --body "Agent \`${APP_NAME}[bot]\` is offline. Issue will be picked up when the agent starts."
-          fi
-
-  # ─── @MENTION ROUTING ───
-  route-by-mention:
-    needs: config
-    if: >
-      (github.event_name == 'issue_comment') ||
-      (github.event_name == 'pull_request') ||
-      (github.event_name == 'pull_request_review')
-    runs-on: ubuntu-latest
-    env:
-      AGENT_SSH_KEY: ${{ secrets.AGENT_SSH_KEY }}
-      AGENTS: ${{ needs.config.outputs.agents }}
-    steps:
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v3
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci-runner
-
-      - name: Wait for Tailscale network
-        run: sleep 10
-
-      - name: Route to mentioned agents
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          REVIEW_BODY: ${{ github.event.review.body }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          COMMENT_USER: ${{ github.event.comment.user.login }}
-          REVIEW_USER: ${{ github.event.review.user.login }}
-          PR_USER: ${{ github.event.pull_request.user.login }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-
-          if [ "$EVENT_NAME" = "issue_comment" ]; then
-            BODY="$COMMENT_BODY"
-            ACTOR="$COMMENT_USER"
-            REF="issue #${ISSUE_NUMBER}"
-            VIEW_NUM="$ISSUE_NUMBER"
-          elif [ "$EVENT_NAME" = "pull_request" ]; then
-            BODY="$PR_BODY"
-            ACTOR="$PR_USER"
-            REF="PR #${PR_NUMBER}"
-            VIEW_NUM="$PR_NUMBER"
-          elif [ "$EVENT_NAME" = "pull_request_review" ]; then
-            BODY="$REVIEW_BODY"
-            ACTOR="$REVIEW_USER"
-            REF="PR #${PR_NUMBER}"
-            VIEW_NUM="$PR_NUMBER"
-          else
-            BODY="$COMMENT_BODY"
-            ACTOR="$COMMENT_USER"
-            REF="PR #${PR_NUMBER}"
-            VIEW_NUM="$PR_NUMBER"
-          fi
-
-          if [ "$ACTOR" = "github-actions[bot]" ]; then
-            echo "Comment from github-actions[bot], skipping"
-            exit 0
-          fi
-
-          for AGENT_NAME in $(echo "$AGENTS" | jq -r 'keys[]'); do
-            APP_NAME=$(echo "$AGENTS" | jq -r --arg a "$AGENT_NAME" '.[$a].app_name // empty')
-
-            if [ "$ACTOR" = "${APP_NAME}[bot]" ]; then
-              continue
-            fi
-
-            if echo "$BODY" | grep -qE "@(${AGENT_NAME}|${APP_NAME})\[bot\]"; then
-              HOST=$(echo "$AGENTS" | jq -r --arg a "$AGENT_NAME" '.[$a].host')
-              SESSION=$(echo "$AGENTS" | jq -r --arg a "$AGENT_NAME" '.[$a].tmux_session')
-              SSH_USER=$(echo "$AGENTS" | jq -r --arg a "$AGENT_NAME" '.[$a].ssh_user')
-              TMUX_BIN=$(echo "$AGENTS" | jq -r --arg a "$AGENT_NAME" '.[$a].tmux_bin // "tmux"')
-
-              mkdir -p ~/.ssh && chmod 700 ~/.ssh
-              echo "$AGENT_SSH_KEY" > ~/.ssh/id_agent
-              chmod 600 ~/.ssh/id_agent
-
-              if ssh -o ConnectTimeout=30 -o StrictHostKeyChecking=accept-new \
-                -i ~/.ssh/id_agent "${SSH_USER}@${HOST}" \
-                "${TMUX_BIN} has-session -t ${SESSION} 2>/dev/null \
-                  && ${TMUX_BIN} send-keys -t ${SESSION} C-u \
-                  && ${TMUX_BIN} send-keys -t ${SESSION} 'You were mentioned in ${REF}. Please check and respond: gh issue view ${VIEW_NUM} --repo groundnuty/macf --json title,body,comments' Enter \
-                  && sleep 1 \
-                  && ${TMUX_BIN} send-keys -t ${SESSION} Enter"; then
-                echo "Routed mention to ${AGENT_NAME}"
-              else
-                echo "Agent ${AGENT_NAME} is offline, skipping"
-              fi
-            fi
-          done
-
-  # ─── LABEL CLEANUP ON CLOSE ───
-  cleanup-labels:
-    if: >
-      (github.event_name == 'issues') &&
-      (github.event.action == 'closed')
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - name: Remove status labels
-        env:
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-        run: |
-          for LABEL in in-progress in-review blocked; do
-            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label "$LABEL" 2>/dev/null || true
-          done
-          echo "Cleaned status labels from issue #${ISSUE_NUMBER}"
+  route:
+    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v1.3.0
+    secrets: inherit

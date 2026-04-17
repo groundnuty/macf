@@ -64,6 +64,8 @@ The rules here are topology-agnostic: they work whether the project uses a scien
 
    Only `UNKNOWN` means "keep waiting." Anything else means your turn to act.
 
+   **Exception — CI-completion routing (macf-actions v1.3+).** When you receive a CI-completion routing notification (`PR #N: CI SUCCESS/FAILED ...`) and `gh pr view` returns `UNKNOWN` or `UNSTABLE` immediately after, the notification was fired by one workflow's `check_suite.completed` while another workflow on the same commit is still in-flight. The rollup hasn't resolved yet. Wait ~30s and re-query; don't force-merge until the full rollup goes `CLEAN`. See `groundnuty/macf-actions#6` for background.
+
 2. **Escalate to the issue reporter.** When you've tried to resolve and are still stuck, @mention the reporter of the issue you're working on:
 
         GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body "@<reporter> blocked on <X> — tried <Y>, need <Z>."
