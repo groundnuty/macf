@@ -217,6 +217,40 @@ describe('macf init', () => {
         .rejects.toThrow(/project/);
     });
 
+    it('rejects role with shell-special char (ultrareview C2)', async () => {
+      // role is interpolated into claude.sh exports the same way
+      // project is — without this check, --role 'foo"$(evil)' would
+      // produce a shell-injection-vulnerable launcher on `claude.sh`
+      // source.
+      await expect(initAgent(dir, { ...validBase, role: 'bad"injection' }))
+        .rejects.toThrow(/role/);
+    });
+
+    it('rejects role with backtick', async () => {
+      await expect(initAgent(dir, { ...validBase, role: 'bad`cmd`' }))
+        .rejects.toThrow(/role/);
+    });
+
+    it('rejects name with shell-special char (ultrareview C2)', async () => {
+      await expect(initAgent(dir, { ...validBase, name: 'bad$name' }))
+        .rejects.toThrow(/name/);
+    });
+
+    it('rejects name with double-quote', async () => {
+      await expect(initAgent(dir, { ...validBase, name: 'bad"injection' }))
+        .rejects.toThrow(/name/);
+    });
+
+    it('accepts undefined name (optional, defaults to role)', async () => {
+      // Existing behavior: if --name is omitted, agentName defaults
+      // to role. Validator must only reject malformed STRINGS, not
+      // undefined. validBase has no name, so this case also verifies
+      // the validator's undefined-safety for opts.name.
+      await initAgent(dir, { ...validBase });
+      const config = readAgentConfig(dir);
+      expect(config!.agent_name).toBe(validBase.role);
+    });
+
     it('accepts realistic valid inputs', async () => {
       // Normal GitHub App IDs, a relative key path, a typical project name.
       await initAgent(dir, { ...validBase });

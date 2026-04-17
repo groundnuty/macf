@@ -225,6 +225,25 @@ describe('CA management', () => {
       expect(() => decryptCAKey('{"v":2,"iter":-1,"payload":"abc"}', 'pass')).toThrow(CaError);
     });
 
+    it('rejects envelope with iter above MAX_ENVELOPE_ITER (ultrareview C1 — CPU-DoS guard)', () => {
+      // Attacker with registry-write access could store an envelope
+      // with `iter: 2^31 - 1` and block the Node main thread on
+      // pbkdf2Sync for effectively unbounded time. The parseV2Envelope
+      // validator now rejects iter above 10_000_000 — already ~16× the
+      // current 600k policy, well above any plausible future bump.
+      //
+      // The rejection path doesn't run PBKDF2 at all (parse returns
+      // null → decryptCAKey throws 'Invalid v2 envelope' before
+      // reaching the KDF), so tests run fast regardless of iter value.
+      const attackerIter = '{"v":2,"iter":2147483647,"payload":"UwBBQUFBQUFBQQ=="}';
+      expect(() => decryptCAKey(attackerIter, 'pass')).toThrow(CaError);
+      expect(() => decryptCAKey(attackerIter, 'pass')).toThrow(/Invalid v2/);
+
+      // Just-over the cap: same rejection path, doesn't run PBKDF2.
+      const justOver = '{"v":2,"iter":10000001,"payload":"UwBBQUFBQUFBQQ=="}';
+      expect(() => decryptCAKey(justOver, 'pass')).toThrow(CaError);
+    });
+
     it('round-trips a realistic PEM body through encrypt/decrypt', () => {
       const pem =
         '-----BEGIN PRIVATE KEY-----\n' +

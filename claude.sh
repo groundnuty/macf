@@ -38,7 +38,17 @@ if [ ! -f "$ABS_KEY" ]; then
   exit 1
 fi
 
-GH_TOKEN=$(gh token generate --app-id "$APP_ID" --installation-id "$INSTALL_ID" --key "$ABS_KEY" | jq -r '.token')
+# Fail-loud token generation — the naive `export GH_TOKEN=$(gh token
+# generate ... | jq)` silently swallows errors (no pipefail), making
+# `GH_TOKEN` the string "null" and letting `gh` fall back to stored
+# user auth. This is the attribution trap (see coordination.md Token
+# & Git Hygiene + feedback_attribution_trap_recurring.md). Use the
+# canonical helper so failures surface.
+GH_TOKEN=$("$DIR/.claude/scripts/macf-gh-token.sh" \
+  --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$ABS_KEY") || {
+  echo "FATAL: bot token generation failed — see stderr above." >&2
+  exit 1
+}
 
 SESSION="code-agent"
 
