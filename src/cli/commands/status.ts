@@ -1,54 +1,10 @@
-import { request } from 'node:https';
-import { readFileSync, existsSync } from 'node:fs';
 import { loadAllAgents, readAgentConfig, agentCertPath, agentKeyPath, tokenSourceFromConfig } from '../config.js';
 import { toVariableSegment } from '../../registry/variable-name.js';
 import { createClientFromConfig } from '../registry-helper.js';
 import { createRegistryFromConfig } from '../../registry/factory.js';
 import { generateToken } from '../../token.js';
-import type { HealthResponse } from '../../types.js';
-
-const HEALTH_TIMEOUT_MS = 5000;
-
-async function pingHealth(
-  host: string,
-  port: number,
-  caCertPem: string,
-  certPath: string,
-  keyPath: string,
-): Promise<HealthResponse | null> {
-  if (!existsSync(certPath) || !existsSync(keyPath)) return null;
-
-  return new Promise((resolve) => {
-    const req = request(
-      {
-        hostname: host,
-        port,
-        method: 'GET',
-        path: '/health',
-        ca: Buffer.from(caCertPem),
-        cert: readFileSync(certPath),
-        key: readFileSync(keyPath),
-        rejectUnauthorized: true,
-        timeout: HEALTH_TIMEOUT_MS,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (chunk: Buffer) => chunks.push(chunk));
-        res.on('end', () => {
-          try {
-            const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-            resolve(body as HealthResponse);
-          } catch {
-            resolve(null);
-          }
-        });
-      },
-    );
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.end();
-  });
-}
+// Shared with `src/plugin/lib/health.ts` — see ultrareview finding A3.
+import { pingAgentHealth } from '../../mtls-health-ping.js';
 
 function formatUptime(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -114,7 +70,13 @@ export async function showStatus(projectDir?: string): Promise<void> {
     const certP = localAgent ? agentCertPath(localAgent.path) : '';
     const keyP = localAgent ? agentKeyPath(localAgent.path) : '';
 
-    const health = await pingHealth(peer.info.host, peer.info.port, caCertPem, certP, keyP);
+    const health = await pingAgentHealth({
+      host: peer.info.host,
+      port: peer.info.port,
+      caCertPem,
+      certPath: certP,
+      keyPath: keyP,
+    });
 
     if (health) {
       const uptime = formatUptime(health.uptime_seconds);
