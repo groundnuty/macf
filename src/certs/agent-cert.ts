@@ -28,11 +28,31 @@ function exportKeyToPem(exported: ArrayBuffer): string {
  *
  * Return type was `Promise<unknown>` historically — DOM CryptoKey types
  * weren't exposed via @types/node < v25. Since @types/node v25 (#17 /
- * this PR) CryptoKey is resolvable from `globalThis`, so we can return
+ * PR #130) CryptoKey is resolvable from `globalThis`, so we return
  * the precise type instead of laundering through `unknown` at each
  * call site.
+ *
+ * Rejects input that contains zero or multiple BEGIN/END marker pairs
+ * (e.g. two keys accidentally concatenated) — ultrareview finding H4.
+ * Without this shape check, `webcrypto.subtle.importKey` would be
+ * handed a concatenated base64 blob and throw a generic DataError,
+ * which propagates upstream with no hint that the input file itself
+ * was malformed.
  */
 export async function importPrivateKey(keyPem: string): Promise<CryptoKey> {
+  const beginMatches = keyPem.match(/-----BEGIN PRIVATE KEY-----/g);
+  const endMatches = keyPem.match(/-----END PRIVATE KEY-----/g);
+  if (!beginMatches || beginMatches.length !== 1) {
+    throw new AgentCertError(
+      `Malformed private key PEM: expected exactly one BEGIN marker, got ${beginMatches?.length ?? 0}`,
+    );
+  }
+  if (!endMatches || endMatches.length !== 1) {
+    throw new AgentCertError(
+      `Malformed private key PEM: expected exactly one END marker, got ${endMatches?.length ?? 0}`,
+    );
+  }
+
   const stripped = keyPem
     .replace(/-----BEGIN PRIVATE KEY-----/g, '')
     .replace(/-----END PRIVATE KEY-----/g, '')

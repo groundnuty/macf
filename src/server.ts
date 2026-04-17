@@ -23,6 +23,23 @@ async function main(): Promise<void> {
     debug: config.debug,
   });
 
+  // Partial-startup failures (MCP connected, port bound, then registry
+  // or collision fails) would otherwise crash with only the stderr
+  // message from the outer catch — channel.log would show the agent
+  // starting and then go silent, leaving operators with no signal.
+  // Wrap the startup body so post-logger failures land in the log.
+  // Ultrareview finding H5.
+  try {
+    await runStartup();
+  } catch (err) {
+    logger.error('startup_failed', {
+      error: err instanceof Error ? err.message : String(err),
+      code: (err as { code?: string }).code ?? 'unknown',
+    });
+    throw err;
+  }
+
+  async function runStartup(): Promise<void> {
   const mcp = createMcpChannel({ agentName: config.agentName });
   const health = createHealthState(config.agentName, config.agentType);
 
@@ -244,6 +261,7 @@ async function main(): Promise<void> {
     type: config.agentType,
     instance_id: config.instanceId,
   });
+  }  // end runStartup
 }
 
 main().catch((err) => {

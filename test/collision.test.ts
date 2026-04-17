@@ -117,6 +117,31 @@ describe('checkCollision', () => {
     }
   });
 
+  it('returns takeover when readFileSync throws (cert-rotation race, ultrareview H3)', async () => {
+    // During a cert-rotation race at startup, the agent cert/key
+    // files may be momentarily absent. Without the ENOENT guard,
+    // pingHealth's top-of-function readFileSync would throw and
+    // crash the entire server startup via unhandled rejection.
+    // The guard treats read errors like network errors — peer is
+    // effectively unreachable → takeover path.
+    const registry = mockRegistry(existingAgent);
+    const logger = mockLogger();
+
+    // Make readFileSync throw on ANY file read (simulates the race).
+    const fs = await import('node:fs');
+    vi.mocked(fs.readFileSync).mockImplementationOnce(() => {
+      throw Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' });
+    });
+
+    const result = await checkCollision('code-agent', registry, certPaths, logger);
+
+    // Without the guard, this test would throw. With the guard,
+    // pingHealth returns false → takeover.
+    expect(result.action).toBe('takeover');
+    // request was never made — we bailed before the https.request call.
+    expect(mockRequest).not.toHaveBeenCalled();
+  });
+
   it('returns takeover when health ping times out', async () => {
     const registry = mockRegistry(existingAgent);
     const logger = mockLogger();

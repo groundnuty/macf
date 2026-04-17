@@ -29,6 +29,25 @@ function pingHealth(
   agentKeyPath: string,
   timeoutMs: number = HEALTH_PING_TIMEOUT_MS,
 ): Promise<boolean> {
+  // readFileSync on missing/unreadable cert files throws ENOENT/EACCES
+  // as raw Node errors with no descriptive context. During a cert-
+  // rotation race at startup, the agent cert/key files may be
+  // momentarily absent — without this guard the error propagates as
+  // an unhandled rejection up through main() and crashes startup.
+  // Treat any read error the same way we treat network errors: the
+  // peer is effectively unreachable for the purpose of the collision
+  // check. Ultrareview finding H3.
+  let ca: Buffer;
+  let cert: Buffer;
+  let key: Buffer;
+  try {
+    ca = readFileSync(caCertPath);
+    cert = readFileSync(agentCertPath);
+    key = readFileSync(agentKeyPath);
+  } catch {
+    return Promise.resolve(false);
+  }
+
   return new Promise((resolve) => {
     const req = request(
       {
@@ -36,9 +55,9 @@ function pingHealth(
         port,
         method: 'GET',
         path: '/health',
-        ca: readFileSync(caCertPath),
-        cert: readFileSync(agentCertPath),
-        key: readFileSync(agentKeyPath),
+        ca,
+        cert,
+        key,
         rejectUnauthorized: true,
         timeout: timeoutMs,
       },

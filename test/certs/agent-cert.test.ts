@@ -4,7 +4,7 @@ import { mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as x509Lib from '@peculiar/x509';
 import { createCA } from '../../src/certs/ca.js';
-import { generateAgentCert, generateClientCert, generateCSR, signCSR, extractCN, AgentCertError } from '../../src/certs/agent-cert.js';
+import { generateAgentCert, generateClientCert, generateCSR, signCSR, extractCN, importPrivateKey, AgentCertError } from '../../src/certs/agent-cert.js';
 // Ensure crypto provider is initialized
 import '../../src/certs/crypto-provider.js';
 
@@ -91,6 +91,39 @@ describe('agent-cert', () => {
 
       const csr = new x509Lib.Pkcs10CertificateRequest(result.csrPem);
       expect(csr.subject).toContain('CN=new-agent');
+    });
+  });
+
+  describe('importPrivateKey (#H4 ultrareview)', () => {
+    it('rejects input with zero BEGIN markers (empty string)', async () => {
+      await expect(importPrivateKey('')).rejects.toThrow(AgentCertError);
+      await expect(importPrivateKey('')).rejects.toThrow(/expected exactly one BEGIN marker/);
+    });
+
+    it('rejects input with multiple BEGIN markers (two concatenated PEMs)', async () => {
+      const double =
+        '-----BEGIN PRIVATE KEY-----\naaaa\n-----END PRIVATE KEY-----\n' +
+        '-----BEGIN PRIVATE KEY-----\nbbbb\n-----END PRIVATE KEY-----\n';
+      await expect(importPrivateKey(double)).rejects.toThrow(AgentCertError);
+      await expect(importPrivateKey(double)).rejects.toThrow(/got 2/);
+    });
+
+    it('rejects input with END marker but no BEGIN', async () => {
+      const noBegin = 'aaaa\n-----END PRIVATE KEY-----\n';
+      await expect(importPrivateKey(noBegin)).rejects.toThrow(AgentCertError);
+    });
+
+    it('rejects input with BEGIN marker but no END', async () => {
+      const noEnd = '-----BEGIN PRIVATE KEY-----\naaaa\n';
+      await expect(importPrivateKey(noEnd)).rejects.toThrow(AgentCertError);
+      await expect(importPrivateKey(noEnd)).rejects.toThrow(/END marker/);
+    });
+
+    it('accepts a well-formed single-PEM input (regression)', async () => {
+      // Validated via generateAgentCert roundtrip — a real PEM from
+      // createCA must still import cleanly after the shape check.
+      // Just confirm by using caKeyPem (which is valid single-PEM).
+      await expect(importPrivateKey(caKeyPem)).resolves.toBeDefined();
     });
   });
 

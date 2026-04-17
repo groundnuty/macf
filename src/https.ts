@@ -69,7 +69,12 @@ function readBody(
       size += chunk.length;
       if (size > MAX_BODY_BYTES && !settled) {
         settled = true;
-        req.destroy();
+        // Destroy the underlying socket (not just req) so the half-open
+        // write-side (res) is also torn down. `req.destroy()` alone
+        // leaves res attached to a destroyed request, which can retain
+        // GC references under high-throughput abuse — see ultrareview
+        // finding H2.
+        req.socket.destroy();
         reject(new HttpsServerError('Body too large'));
         return;
       }
@@ -289,6 +294,22 @@ export function createHttpsServer(config: {
   return {
     async start(port: number, host: string): Promise<{ readonly actualPort: number }> {
       server = createServer(tlsOptions, requestHandler);
+
+      // TLS-layer handshake failures (no cert, expired cert, wrong CA,
+      // missing clientAuth EKU per #121) never reach requestHandler.
+      // Without this listener, operators see a dead connection with
+      // no log entry explaining why. Log enough to triage — ultrareview
+      // finding H1.
+      server.on('tlsClientError', (err, tlsSocket) => {
+        const peerCn = (tlsSocket.getPeerCertificate?.() as { subject?: { CN?: string } } | undefined)
+          ?.subject?.CN ?? 'unknown';
+        logger.warn('tls_client_error', {
+          error: err.message,
+          code: (err as NodeError).code ?? 'unknown',
+          from_cn: peerCn,
+          remote_addr: tlsSocket.remoteAddress ?? 'unknown',
+        });
+      });
 
       // Explicit port: fail immediately if busy
       if (port !== 0) {
