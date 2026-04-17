@@ -12,6 +12,8 @@ import { createChallenge, verifyAndConsumeChallenge } from './certs/challenge.js
 import { createChallengeStore } from './certs/challenge-store.js';
 import { signCSR } from './certs/agent-cert.js';
 import { loadCA } from './certs/ca.js';
+import { HttpError } from './errors.js';
+import { formatNotifyContent } from './notify-formatter.js';
 import type { NotifyPayload, SignRequest } from './types.js';
 import type { AgentInfo } from './registry/types.js';
 
@@ -52,40 +54,9 @@ async function main(): Promise<void> {
       meta['source'] = payload.source;
     }
 
-    let content: string;
-    if (payload.type === 'issue_routed') {
-      if (payload.issue_number !== undefined) {
-        const suffix = payload.title ? `: ${payload.title}` : '';
-        content = `Issue #${payload.issue_number} was routed to you${suffix}`;
-        health.setCurrentIssue(payload.issue_number);
-      } else {
-        content = payload.title
-          ? `An issue was routed to you: ${payload.title}`
-          : 'An issue was routed to you';
-      }
-    } else if (payload.type === 'mention') {
-      content = payload.message ?? 'You were mentioned';
-    } else if (payload.type === 'ci_completion') {
-      // Prefer the prebuilt `message` (producer has all context) but
-      // fall back to a shape-derived rendering if absent. Producers
-      // that use CiCompletionPayloadSchema always provide `message`.
-      if (payload.message) {
-        content = payload.message;
-      } else if (payload.pr_number !== undefined && payload.conclusion !== undefined) {
-        const prRef = `PR #${payload.pr_number}`;
-        if (payload.conclusion === 'success') {
-          content = `${prRef}: CI SUCCESS`;
-        } else {
-          const failing = payload.failing_check_name
-            ? ` (first failing check: '${payload.failing_check_name}')`
-            : '';
-          content = `${prRef}: CI ${payload.conclusion.toUpperCase()}${failing}`;
-        }
-      } else {
-        content = 'CI completed';
-      }
-    } else {
-      content = payload.message ?? 'Pending issues found at startup';
+    const { content, issueNumber } = formatNotifyContent(payload);
+    if (issueNumber !== undefined) {
+      health.setCurrentIssue(issueNumber);
     }
 
     logger.info('notify_received', {
@@ -129,9 +100,7 @@ async function main(): Promise<void> {
     try {
       ca = loadCA(config.caCertPath, config.caKeyPath);
     } catch {
-      const err = new Error('CA key not available on this agent');
-      (err as { status?: number }).status = 503;
-      throw err;
+      throw new HttpError(503, 'CA key not available on this agent');
     }
 
     if (!request.challenge_done) {
@@ -165,9 +134,7 @@ async function main(): Promise<void> {
       // Generic error — do not leak which check failed (no oracle for
       // attackers probing expired/mismatched-agent/wrong-value, etc).
       logger.warn('sign_challenge_failed', { agent_name: request.agent_name });
-      const err = new Error('challenge verification failed');
-      (err as { status?: number }).status = 401;
-      throw err;
+      throw new HttpError(401, 'challenge verification failed');
     }
 
     logger.info('sign_challenge_verified', { agent_name: request.agent_name });

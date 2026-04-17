@@ -69,6 +69,66 @@ export async function importPrivateKey(keyPem: string): Promise<CryptoKey> {
 }
 
 /**
+ * Shared peer-cert builder used by both generateAgentCert (new peer
+ * certs via `macf certs init`) and signCSR (CSR-signed peer certs
+ * via `/sign`). Produces the DR-004-compliant extension set:
+ *
+ *   - KeyUsage: digitalSignature | keyEncipherment (mTLS client+server use)
+ *   - SubjectAlternativeName: 127.0.0.1 / localhost (per DR-004; SAN
+ *       across Tailscale hosts is a known follow-up per `phase2 backlog`)
+ *   - ExtendedKeyUsage: clientAuth (#125, DR-004 v2 EKU rollout)
+ *
+ * Extracted per ultrareview finding A10 — both callers previously
+ * duplicated this ~25-line extension list. When DR-004 extensions
+ * evolve (e.g. serverAuth EKU, per-host SAN), a single edit here
+ * affects both paths instead of two in lockstep.
+ */
+async function buildPeerCert(opts: {
+  readonly subject: string;
+  readonly caCertPem: string;
+  readonly caKeyPem: string;
+  // Accept either a plain WebCrypto CryptoKey (from generateAgentCert)
+  // or x509.PublicKey (from a parsed CSR's .publicKey) — the peculiar
+  // x509 generator internally accepts both via its overloaded type.
+  readonly publicKey: CryptoKey | x509.PublicKey;
+}): Promise<string> {
+  const caCert = new x509.X509Certificate(opts.caCertPem);
+  const caKey = await importPrivateKey(opts.caKeyPem);
+
+  const notBefore = new Date();
+  const notAfter = new Date();
+  notAfter.setFullYear(notAfter.getFullYear() + AGENT_CERT_VALIDITY_YEARS);
+
+  const cert = await x509.X509CertificateGenerator.create({
+    serialNumber: randomBytes(8).toString('hex'),
+    subject: opts.subject,
+    issuer: caCert.subject,
+    notBefore,
+    notAfter,
+    signingAlgorithm: RSA_ALGORITHM,
+    publicKey: opts.publicKey,
+    signingKey: caKey,
+    extensions: [
+      new x509.KeyUsagesExtension(
+        x509.KeyUsageFlags.digitalSignature | x509.KeyUsageFlags.keyEncipherment,
+        true,
+      ),
+      new x509.SubjectAlternativeNameExtension([
+        { type: 'ip', value: '127.0.0.1' },
+        { type: 'dns', value: 'localhost' },
+      ]),
+      new x509.ExtendedKeyUsageExtension([
+        // clientAuth OID (#125) — per DR-004 v2 EKU rollout. Enforced
+        // server-side at /health + /notify + /sign per #121.
+        '1.3.6.1.5.5.7.3.2',
+      ]),
+    ],
+  });
+
+  return cert.toString('pem');
+}
+
+/**
  * Generate agent certificate signed by the CA.
  * Used when the CA key is available locally.
  */
@@ -81,49 +141,18 @@ export async function generateAgentCert(config: {
 }): Promise<AgentCertResult> {
   const { agentName, caCertPem, caKeyPem, certPath, keyPath } = config;
 
-  const caCert = new x509.X509Certificate(caCertPem);
-  const caKey = await importPrivateKey(caKeyPem);
-
   const agentKeys = await webcrypto.subtle.generateKey(
     RSA_ALGORITHM,
     true,
     ['sign', 'verify'],
   );
 
-  const notBefore = new Date();
-  const notAfter = new Date();
-  notAfter.setFullYear(notAfter.getFullYear() + AGENT_CERT_VALIDITY_YEARS);
-
-  const cert = await x509.X509CertificateGenerator.create({
-    serialNumber: randomBytes(8).toString('hex'),
+  const certPem = await buildPeerCert({
     subject: `CN=${agentName}`,
-    issuer: caCert.subject,
-    notBefore,
-    notAfter,
-    signingAlgorithm: RSA_ALGORITHM,
+    caCertPem,
+    caKeyPem,
     publicKey: agentKeys.publicKey,
-    signingKey: caKey,
-    extensions: [
-      new x509.KeyUsagesExtension(
-        x509.KeyUsageFlags.digitalSignature | x509.KeyUsageFlags.keyEncipherment,
-        true,
-      ),
-      new x509.SubjectAlternativeNameExtension([
-        { type: 'ip', value: '127.0.0.1' },
-        { type: 'dns', value: 'localhost' },
-      ]),
-      // clientAuth EKU (#125, step 1 of DR-004 v2 EKU rollout). Peer
-      // certs are the mTLS client when calling peer /health, /notify,
-      // /sign — pair them with the server-side /notify EKU check
-      // landing in #121 after rotation. New peer certs carry the EKU
-      // immediately; existing peers adopt it on `macf certs rotate`.
-      new x509.ExtendedKeyUsageExtension([
-        '1.3.6.1.5.5.7.3.2',
-      ]),
-    ],
   });
-
-  const certPem = cert.toString('pem');
   const exported = await webcrypto.subtle.exportKey('pkcs8', agentKeys.privateKey);
   const agentKeyPem = exportKeyToPem(exported);
 
@@ -257,8 +286,6 @@ export async function signCSR(config: {
   const { csrPem, agentName, caCertPem, caKeyPem } = config;
 
   const csr = new x509.Pkcs10CertificateRequest(csrPem);
-  const caCert = new x509.X509Certificate(caCertPem);
-  const caKey = await importPrivateKey(caKeyPem);
 
   // Verify CSR signature (proof-of-possession — requester controls the private key)
   const csrValid = await csr.verify();
@@ -282,37 +309,10 @@ export async function signCSR(config: {
     );
   }
 
-  const notBefore = new Date();
-  const notAfter = new Date();
-  notAfter.setFullYear(notAfter.getFullYear() + AGENT_CERT_VALIDITY_YEARS);
-
-  const cert = await x509.X509CertificateGenerator.create({
-    serialNumber: randomBytes(8).toString('hex'),
+  return buildPeerCert({
     subject: csr.subject,
-    issuer: caCert.subject,
-    notBefore,
-    notAfter,
-    signingAlgorithm: RSA_ALGORITHM,
+    caCertPem,
+    caKeyPem,
     publicKey: csr.publicKey,
-    signingKey: caKey,
-    extensions: [
-      new x509.KeyUsagesExtension(
-        x509.KeyUsageFlags.digitalSignature | x509.KeyUsageFlags.keyEncipherment,
-        true,
-      ),
-      new x509.SubjectAlternativeNameExtension([
-        { type: 'ip', value: '127.0.0.1' },
-        { type: 'dns', value: 'localhost' },
-      ]),
-      // clientAuth EKU — same rationale as generateAgentCert above.
-      // CSR-signed peer certs (via /sign endpoint) must also carry
-      // the EKU so they work once #121 tightens server-side
-      // verification. (#125, step 1 of DR-004 v2 EKU rollout)
-      new x509.ExtendedKeyUsageExtension([
-        '1.3.6.1.5.5.7.3.2',
-      ]),
-    ],
   });
-
-  return cert.toString('pem');
 }

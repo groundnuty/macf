@@ -56,3 +56,32 @@ export class ValidationError extends MacfError {
     this.name = 'ValidationError';
   }
 }
+
+/**
+ * Thrown by server-side handlers to request a specific HTTP status
+ * code on the response. The HTTPS request-handler catches instances
+ * of this error and maps `httpStatus` to the response code. Replaces
+ * the pre-ultrareview pattern:
+ *
+ *   const err = new Error('message');
+ *   (err as { status?: number }).status = 503;
+ *   throw err;
+ *
+ * which relied on ad-hoc `as { status?: number }` casts at both throw
+ * and catch sites. With `HttpError`, the contract is type-level: the
+ * catch site narrows via `instanceof HttpError` and reads the typed
+ * `httpStatus` field.
+ *
+ * Use for intentional, operator-visible failures (e.g. "signing not
+ * available on this agent" → 503). Don't use for unexpected errors —
+ * those should bubble up to the generic 500 path.
+ */
+export class HttpError extends MacfError {
+  readonly httpStatus: number;
+
+  constructor(httpStatus: number, message: string) {
+    super('HTTP_ERROR', message);
+    this.name = 'HttpError';
+    this.httpStatus = httpStatus;
+  }
+}

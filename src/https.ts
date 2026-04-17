@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { randomInt } from 'node:crypto';
 import { NotifyPayloadSchema, SignRequestSchema } from './types.js';
 import type { NotifyPayload, SignRequest, HealthResponse, HttpsServer, Logger } from './types.js';
-import { PortExhaustedError, PortUnavailableError, HttpsServerError } from './errors.js';
+import { PortExhaustedError, PortUnavailableError, HttpsServerError, HttpError } from './errors.js';
 
 const MAX_BODY_BYTES = 64 * 1024; // 64KB
 export const PORT_RANGE_START = 8800;
@@ -246,7 +246,9 @@ export function createHttpsServer(config: {
         const response = await onSign(result.data);
         sendJson(res, 200, response);
       } catch (err) {
-        const status = err instanceof Error && 'status' in err ? (err as { status: number }).status : 500;
+        // Typed HttpError carries a specific intended status; anything
+        // else is an unexpected server-side failure → 500.
+        const status = err instanceof HttpError ? err.httpStatus : 500;
         sendJson(res, status, {
           error: err instanceof Error ? err.message : 'Signing failed',
         });
