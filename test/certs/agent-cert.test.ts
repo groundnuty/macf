@@ -75,7 +75,10 @@ describe('agent-cert', () => {
       const ekuExt = cert.getExtension('2.5.29.37'); // extKeyUsage OID
       expect(ekuExt).toBeDefined();
       const usages = (ekuExt as unknown as { usages: readonly string[] }).usages;
-      expect(usages).toContain('1.3.6.1.5.5.7.3.2');
+      // Belt-and-suspenders: pin exactly clientAuth, nothing else.
+      // Catches future regressions that accidentally add e.g.
+      // serverAuth to peer certs.
+      expect([...usages]).toEqual(['1.3.6.1.5.5.7.3.2']);
     });
   });
 
@@ -126,7 +129,9 @@ describe('agent-cert', () => {
       const ekuExt = cert.getExtension('2.5.29.37');
       expect(ekuExt).toBeDefined();
       const usages = (ekuExt as unknown as { usages: readonly string[] }).usages;
-      expect(usages).toContain('1.3.6.1.5.5.7.3.2');
+      // Exactly clientAuth — no serverAuth or others. See the
+      // matching generateAgentCert test for rationale.
+      expect([...usages]).toEqual(['1.3.6.1.5.5.7.3.2']);
     });
 
     it('rejects CSR with CN mismatch', async () => {
