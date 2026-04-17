@@ -108,6 +108,20 @@ function validateInitOpts(opts: InitOptions): void {
       `project "${opts.project}" must match [a-zA-Z0-9_-]+`,
     );
   }
+  // role + name are interpolated into claude.sh shell exports the same
+  // way project is. Without this check, `--name 'foo"$(evil)'` would
+  // produce an injection-vulnerable launcher. Apply the same allowlist
+  // as project — per ultrareview finding C2.
+  if (!isValidProjectName(opts.role)) {
+    throw new Error(
+      `role "${opts.role}" must match [a-zA-Z0-9_-]+`,
+    );
+  }
+  if (opts.name !== undefined && !isValidProjectName(opts.name)) {
+    throw new Error(
+      `name "${opts.name}" must match [a-zA-Z0-9_-]+`,
+    );
+  }
   if (!/^\d+$/.test(opts.appId)) {
     throw new Error(
       `appId "${opts.appId}" must be numeric (GitHub App IDs are digits only)`,

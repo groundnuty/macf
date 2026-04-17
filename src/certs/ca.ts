@@ -143,6 +143,14 @@ export async function recoverCAKey(config: {
 export const WIRE_FORMAT_VERSION = 2;
 export const V2_PBKDF2_ITERS = 600000;
 export const V1_PBKDF2_ITERS = 10000;
+// Upper bound on the envelope `iter` field. Without a cap, an
+// attacker with registry-write access could store `{"v":2,"iter":
+// 2147483647, ...}` and block the Node.js main thread on the next
+// decryptCAKey (CPU-DoS via pbkdf2Sync). 10M is already ~16× the
+// current 600k policy and well above any plausible future bump —
+// any registry-stored value above this is treated as malformed.
+// See ultrareview finding C1.
+const MAX_ENVELOPE_ITER = 10_000_000;
 
 interface V2Envelope {
   readonly v: 2;
@@ -170,6 +178,7 @@ function parseV2Envelope(value: string): V2Envelope | null {
   const rec = parsed as Record<string, unknown>;
   if (rec['v'] !== 2) return null;
   if (typeof rec['iter'] !== 'number' || rec['iter'] < 1) return null;
+  if (rec['iter'] > MAX_ENVELOPE_ITER) return null;
   if (typeof rec['payload'] !== 'string' || rec['payload'].length === 0) return null;
   return { v: 2, iter: rec['iter'], payload: rec['payload'] };
 }

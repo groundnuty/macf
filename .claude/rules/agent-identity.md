@@ -16,7 +16,7 @@ You work in `groundnuty/macf` — the framework source repo. This is your only r
 
 When asked to check for work, when idle, or when SessionStart hook output shows pending issues:
 
-    export GH_TOKEN=$(gh token generate --app-id $APP_ID --installation-id $INSTALL_ID --key $KEY_PATH | jq -r '.token') && \
+    GH_TOKEN=$(./.claude/scripts/macf-gh-token.sh --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && export GH_TOKEN && \
     GH_TOKEN=$GH_TOKEN gh issue list --repo groundnuty/macf --label "code-agent" --state open --json number,title,labels,body
 
 If any issues have the `agent-offline` label, pick them up immediately:
@@ -30,7 +30,7 @@ If any issues have the `agent-offline` label, pick them up immediately:
 2. If unclear, ask clarifying questions via @mention. **Wait for answers before proceeding.**
 3. Add status label (keep the `code-agent` label — never remove it):
 
-       export GH_TOKEN=$(gh token generate --app-id $APP_ID --installation-id $INSTALL_ID --key $KEY_PATH | jq -r '.token') && \
+       GH_TOKEN=$(./.claude/scripts/macf-gh-token.sh --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && export GH_TOKEN && \
        GH_TOKEN=$GH_TOKEN gh issue edit <N> --repo groundnuty/macf --add-label "in-progress"
 
 4. Always start from latest main:
@@ -48,7 +48,7 @@ If any issues have the `agent-offline` label, pick them up immediately:
 
 Refresh token and run all commands in a single chained block. **Your turn ends after this.**
 
-    export GH_TOKEN=$(gh token generate --app-id $APP_ID --installation-id $INSTALL_ID --key $KEY_PATH | jq -r '.token') && \
+    GH_TOKEN=$(./.claude/scripts/macf-gh-token.sh --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && export GH_TOKEN && \
     git -c url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf="https://github.com/" push -u origin HEAD && \
     GH_TOKEN=$GH_TOKEN gh pr create --repo groundnuty/macf --title "<type>: <description>" --body "Refs #<N>" && \
     GH_TOKEN=$GH_TOKEN gh issue edit <N> --repo groundnuty/macf --add-label "in-review" --remove-label "in-progress" && \
@@ -64,7 +64,7 @@ When the reviewer requests changes (delivered as a routed prompt):
 2. Push fixes to the same branch
 3. Post in the **issue** thread (not the PR):
 
-       export GH_TOKEN=$(gh token generate --app-id $APP_ID --installation-id $INSTALL_ID --key $KEY_PATH | jq -r '.token') && \
+       GH_TOKEN=$(./.claude/scripts/macf-gh-token.sh --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && export GH_TOKEN && \
        GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo groundnuty/macf --body "@macf-science-agent[bot] Pushed fixes. Please re-review."
 
 **Your turn ends again.** Wait for the next review.
@@ -73,7 +73,7 @@ When the reviewer requests changes (delivered as a routed prompt):
 
 Only merge when you receive a comment from the reviewer saying LGTM:
 
-    export GH_TOKEN=$(gh token generate --app-id $APP_ID --installation-id $INSTALL_ID --key $KEY_PATH | jq -r '.token') && \
+    GH_TOKEN=$(./.claude/scripts/macf-gh-token.sh --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && export GH_TOKEN && \
     GH_TOKEN=$GH_TOKEN gh pr merge <PR_NUMBER> --repo groundnuty/macf --squash --delete-branch && \
     git checkout main && git pull origin main
 
@@ -83,7 +83,7 @@ After merging, post the @mention handoff comment per `coordination.md` (Issue Li
 
 If you find work that belongs to science-agent (design decisions, research, paper edits):
 
-    export GH_TOKEN=$(gh token generate --app-id $APP_ID --installation-id $INSTALL_ID --key $KEY_PATH | jq -r '.token') && \
+    GH_TOKEN=$(./.claude/scripts/macf-gh-token.sh --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && export GH_TOKEN && \
     GH_TOKEN=$GH_TOKEN gh issue create --repo groundnuty/macf --title "<description>" --label "science-agent" --body "@macf-science-agent[bot] <details>"
 
 ## Label Convention
