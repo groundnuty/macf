@@ -101,6 +101,72 @@ export async function generateAgentCert(config: {
 }
 
 /**
+ * Generate a CA-signed client cert with a given CN and validity window.
+ * Used for non-peer clients (e.g. the routing Action's mTLS cert, per
+ * macf-actions#8 / #119). Unlike generateAgentCert, validity is
+ * parameterized in days so operator can pick the policy.
+ *
+ * Does NOT add SubjectAlternativeName — the routing Action is an
+ * mTLS CLIENT, so the server-hostname SAN pattern doesn't apply. Key
+ * usage is digital signature only (no key encipherment — we're not
+ * doing static-key TLS variants).
+ */
+export async function generateClientCert(config: {
+  readonly commonName: string;
+  readonly validityDays: number;
+  readonly caCertPem: string;
+  readonly caKeyPem: string;
+}): Promise<AgentCertResult> {
+  const { commonName, validityDays, caCertPem, caKeyPem } = config;
+
+  if (!Number.isInteger(validityDays) || validityDays < 1) {
+    throw new AgentCertError(
+      `validityDays must be a positive integer (got ${validityDays})`,
+    );
+  }
+
+  const caCert = new x509.X509Certificate(caCertPem);
+  const caKey = await importPrivateKey(caKeyPem);
+
+  const clientKeys = await webcrypto.subtle.generateKey(
+    RSA_ALGORITHM,
+    true,
+    ['sign', 'verify'],
+  );
+
+  const notBefore = new Date();
+  const notAfter = new Date();
+  notAfter.setDate(notAfter.getDate() + validityDays);
+
+  const cert = await x509.X509CertificateGenerator.create({
+    serialNumber: randomBytes(8).toString('hex'),
+    subject: `CN=${commonName}`,
+    issuer: caCert.subject,
+    notBefore,
+    notAfter,
+    signingAlgorithm: RSA_ALGORITHM,
+    publicKey: clientKeys.publicKey,
+    signingKey: caKey,
+    extensions: [
+      new x509.KeyUsagesExtension(
+        x509.KeyUsageFlags.digitalSignature,
+        true,
+      ),
+      new x509.ExtendedKeyUsageExtension([
+        // clientAuth OID — explicit "this cert is for TLS client auth"
+        '1.3.6.1.5.5.7.3.2',
+      ]),
+    ],
+  });
+
+  const certPem = cert.toString('pem');
+  const exported = await webcrypto.subtle.exportKey('pkcs8', clientKeys.privateKey);
+  const keyPem = exportKeyToPem(exported);
+
+  return { certPem, keyPem };
+}
+
+/**
  * Generate a CSR (Certificate Signing Request) for an agent.
  * Used when requesting remote signing via /sign endpoint.
  */
