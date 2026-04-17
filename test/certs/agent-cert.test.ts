@@ -4,7 +4,7 @@ import { mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as x509Lib from '@peculiar/x509';
 import { createCA } from '../../src/certs/ca.js';
-import { generateAgentCert, generateCSR, signCSR, extractCN, AgentCertError } from '../../src/certs/agent-cert.js';
+import { generateAgentCert, generateClientCert, generateCSR, signCSR, extractCN, AgentCertError } from '../../src/certs/agent-cert.js';
 // Ensure crypto provider is initialized
 import '../../src/certs/crypto-provider.js';
 
@@ -150,6 +150,114 @@ describe('agent-cert', () => {
       expect(extractCN('OCN=foo')).toBeUndefined();
       // "DCN=foo" similarly.
       expect(extractCN('DCN=bar')).toBeUndefined();
+    });
+  });
+
+  describe('generateClientCert (#119)', () => {
+    // Primitive used by the `macf certs issue-routing-client` CLI to
+    // mint the routing Action's mTLS client cert.
+
+    it('generates cert with correct CN and validity window', async () => {
+      const before = Date.now();
+      const result = await generateClientCert({
+        commonName: 'routing-action',
+        validityDays: 365,
+        caCertPem,
+        caKeyPem,
+      });
+      const after = Date.now();
+
+      expect(result.certPem).toContain('-----BEGIN CERTIFICATE-----');
+      expect(result.keyPem).toContain('-----BEGIN PRIVATE KEY-----');
+
+      const cert = new x509Lib.X509Certificate(result.certPem);
+      expect(cert.subject).toContain('CN=routing-action');
+
+      // Validity window: notAfter ~ now + 365 days, within tolerance.
+      const notBefore = cert.notBefore.getTime();
+      const notAfter = cert.notAfter.getTime();
+      const spanDays = (notAfter - notBefore) / (1000 * 60 * 60 * 24);
+      expect(spanDays).toBeGreaterThan(364.5);
+      expect(spanDays).toBeLessThan(365.5);
+      expect(notBefore).toBeGreaterThanOrEqual(before - 1000);
+      expect(notBefore).toBeLessThanOrEqual(after + 1000);
+    });
+
+    it('accepts short validity (e.g. 7 days for short-lived rotations)', async () => {
+      const result = await generateClientCert({
+        commonName: 'short',
+        validityDays: 7,
+        caCertPem,
+        caKeyPem,
+      });
+      const cert = new x509Lib.X509Certificate(result.certPem);
+      const spanDays = (cert.notAfter.getTime() - cert.notBefore.getTime()) / (1000 * 60 * 60 * 24);
+      expect(spanDays).toBeGreaterThan(6.5);
+      expect(spanDays).toBeLessThan(7.5);
+    });
+
+    it('rejects non-integer validityDays', async () => {
+      await expect(generateClientCert({
+        commonName: 'x',
+        validityDays: 1.5,
+        caCertPem,
+        caKeyPem,
+      })).rejects.toThrow(AgentCertError);
+    });
+
+    it('rejects zero or negative validityDays', async () => {
+      await expect(generateClientCert({
+        commonName: 'x',
+        validityDays: 0,
+        caCertPem,
+        caKeyPem,
+      })).rejects.toThrow(/positive/);
+      await expect(generateClientCert({
+        commonName: 'x',
+        validityDays: -5,
+        caCertPem,
+        caKeyPem,
+      })).rejects.toThrow(/positive/);
+    });
+
+    it('cert is signed by the CA (issuer matches CA subject)', async () => {
+      const result = await generateClientCert({
+        commonName: 'routing-action',
+        validityDays: 365,
+        caCertPem,
+        caKeyPem,
+      });
+      const caCert = new x509Lib.X509Certificate(caCertPem);
+      const cert = new x509Lib.X509Certificate(result.certPem);
+      expect(cert.issuer).toBe(caCert.subject);
+    });
+
+    it('cert has clientAuth ExtendedKeyUsage (TLS-client-auth only)', async () => {
+      const result = await generateClientCert({
+        commonName: 'routing-action',
+        validityDays: 365,
+        caCertPem,
+        caKeyPem,
+      });
+      const cert = new x509Lib.X509Certificate(result.certPem);
+      const ekuExt = cert.getExtension('2.5.29.37'); // extKeyUsage OID
+      expect(ekuExt).toBeDefined();
+      // The extension value should include the clientAuth OID.
+      // Peculiar's ExtendedKeyUsageExtension exposes .usages as string[]
+      const usages = (ekuExt as unknown as { usages: readonly string[] }).usages;
+      expect(usages).toContain('1.3.6.1.5.5.7.3.2');
+    });
+
+    it('does NOT add Subject Alternative Name (client cert, no hostname)', async () => {
+      const result = await generateClientCert({
+        commonName: 'routing-action',
+        validityDays: 365,
+        caCertPem,
+        caKeyPem,
+      });
+      const cert = new x509Lib.X509Certificate(result.certPem);
+      const san = cert.getExtension('2.5.29.17'); // subjectAltName OID
+      expect(san).toBeFalsy();
     });
   });
 });

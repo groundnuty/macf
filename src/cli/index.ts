@@ -9,7 +9,7 @@ import { initAgent } from './commands/init.js';
 import { update } from './commands/update.js';
 import { showStatus } from './commands/status.js';
 import { listPeers } from './commands/peers.js';
-import { certsInit, certsRecover, certsRotate } from './commands/certs.js';
+import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './commands/certs.js';
 import { repoInit } from './commands/repo-init.js';
 import { rulesRefresh } from './commands/rules-refresh.js';
 import { runDoctor } from './commands/doctor.js';
@@ -168,6 +168,20 @@ certs
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .action(async (opts) => {
     await certsRotate(resolveProjectDir(opts.dir));
+  });
+
+certs
+  .command('issue-routing-client')
+  .description('Mint a CA-signed client cert (CN=routing-action) for the routing Action (macf-actions#8)')
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .option('--out-dir <path>', 'Write cert/key files here instead of printing to stdout')
+  .option('--validity-days <n>', 'Cert validity in days (default 365; warns above 730)')
+  .action(async (opts) => {
+    const validityDays = opts.validityDays ? Number(opts.validityDays) : undefined;
+    await issueRoutingClient(resolveProjectDir(opts.dir), {
+      outDir: opts.outDir,
+      validityDays,
+    });
   });
 
 program
