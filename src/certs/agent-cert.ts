@@ -25,9 +25,14 @@ function exportKeyToPem(exported: ArrayBuffer): string {
 
 /**
  * Import a PEM private key into a WebCrypto CryptoKey for signing.
+ *
+ * Return type was `Promise<unknown>` historically — DOM CryptoKey types
+ * weren't exposed via @types/node < v25. Since @types/node v25 (#17 /
+ * this PR) CryptoKey is resolvable from `globalThis`, so we can return
+ * the precise type instead of laundering through `unknown` at each
+ * call site.
  */
-// Returns a WebCrypto CryptoKey; typed as unknown since DOM types aren't in tsconfig
-export async function importPrivateKey(keyPem: string): Promise<unknown> {
+export async function importPrivateKey(keyPem: string): Promise<CryptoKey> {
   const stripped = keyPem
     .replace(/-----BEGIN PRIVATE KEY-----/g, '')
     .replace(/-----END PRIVATE KEY-----/g, '')
