@@ -65,7 +65,7 @@ This section codifies the principal-type taxonomy so future principals have a do
 - **CN**: the distinguished literal `routing-action`
 - **Registered in the peer registry?**: **no** — explicit collision guard in `macf certs issue-routing-client` (see #119) refuses to issue if an agent with that name exists
 - **Issued by**: `macf certs issue-routing-client` CLI; operator pastes the resulting PEM into each consumer repo's GHA secrets (`ROUTING_CLIENT_CERT` / `ROUTING_CLIENT_KEY`)
-- **Server-side authorization**: POST `/notify` only (delivers routing notifications into the agent's session). Should NOT be allowed to POST `/sign` or access any peer-only endpoint. Current implementation's `tlsSocket.authorized` check accepts any CA-signed cert — sufficient for the single-endpoint case today but becomes ambiguous if additional non-peer principals are added. See #121 for the hardening path.
+- **Server-side authorization** (intended scope): POST `/notify` for routing notifications. `/sign` and peer-only endpoints are NOT intended use cases. Current enforcement is defense-in-depth via protocol gates (see "Authorization surface" below), not CN-based authz at the transport layer — the routing-action principal is admitted at `/health`/`/notify`/`/sign` uniformly by the EKU check, but `/sign`'s challenge-response protocol requires a registered-agent slot that routing-action doesn't have. CN-based tightening is captured as a potential future DR revision if a need surfaces.
 - **Client-side authorization**: presents cert when calling agents' `/notify`; never calls `/sign` or peer-only endpoints
 
 ### Extending the taxonomy
@@ -83,23 +83,33 @@ The goal is that the set of allowed `(CN-pattern × endpoint)` pairs is enumerab
 
 The `clientAuth` EKU (OID `1.3.6.1.5.5.7.3.2`) is the X.509 standard attestation that a cert is intended for TLS **client** authentication — not server, not code-signing, not any other use. A server that verifies the `clientAuth` EKU on presented certs rejects misuse (e.g. a server cert being presented for client auth).
 
-### Current state (2026-04-17)
+### State as shipped (2026-04-17)
 
-- **Peer-agent certs**: do **not** emit `clientAuth` EKU. Signed by `generateAgentCert` in `src/certs/agent-cert.ts`; the extension is absent.
-- **Routing-client certs**: **do** emit `clientAuth` EKU. Signed by `generateClientCert` in the same module (new in #119).
-- **Server-side `/notify` auth**: checks `tlsSocket.authorized` only (CA-chain verification) — does **not** inspect EKU.
+- **Peer-agent certs**: emit `clientAuth` EKU. `generateAgentCert` and `signCSR` both apply `ExtendedKeyUsageExtension(['1.3.6.1.5.5.7.3.2'])` — per #125 / #126.
+- **Routing-client certs**: emit `clientAuth` EKU. Signed by `generateClientCert` — per #119.
+- **Server-side auth** at `/health`, `/notify`, `/sign`: verifies `tlsSocket.authorized` (CA-chain) **and** `clientAuth` EKU via `peerCertHasClientAuthEKU` in `src/https.ts`. Non-EKU certs are rejected uniformly with a 403 pointing at `macf certs rotate`. Enforced per #121 / #129.
 
-### Target state (tracked in #121)
+### Rollout as executed (2026-04-17)
 
-All CA-signed cert presentations to the server should carry `clientAuth` EKU, and the server should verify it. Transition is ordered:
+Getting to the state above required a 3-step ordering to prevent a common failure mode (tightening server check before peers emit EKU → instant auth break across the whole fleet):
 
-1. **Emit**: `generateAgentCert` adds the `clientAuth` EKU on new peer certs. Does not break existing peers — they just don't have the extension yet.
-2. **Rotate**: each peer agent runs `macf certs rotate` to pick up an EKU-carrying cert. Per-workspace, one-shot.
-3. **Tighten**: server-side `/notify` handler adds EKU verification. Safe to tighten only AFTER all active peers carry the EKU.
+1. **Emit** (#125 / #126): `generateAgentCert` + `signCSR` add the `clientAuth` EKU on new peer certs. Does not break existing peers — their older certs simply don't have the extension yet, and the server isn't verifying it at this point.
+2. **Rotate** (step 2, operator-driven): each peer agent runs `macf certs rotate` to pick up an EKU-carrying cert. Per-workspace, one-shot. Completed for CV peers (cv-architect, cv-project-archaeologist) on 2026-04-17.
+3. **Tighten** (#121 / #129): server-side `/notify` handler adds EKU verification. Safe to tighten only AFTER all active peers carry the EKU.
 
-Each step is independent and reversible. The 3-step ordering prevents a common failure mode (tightening server check before peers emit EKU → instant auth break across the whole fleet).
+Each step was independent and reversible. Future EKU-adjacent changes (e.g. requiring additional EKUs) should follow the same ordering.
+
+### Authorization surface — defense-in-depth, not CN-based
+
+Server-side EKU verification is uniform across `/health`, `/notify`, `/sign` — any CA-signed cert with `clientAuth` EKU is admitted at the transport layer. Per-endpoint access scoping is enforced by protocol gates above the transport layer, not by CN inspection:
+
+- **`/sign`** requires the challenge-response protocol (per DR-010). The client must prove GitHub write access by writing to a registry variable keyed on their CN. The routing-action principal has no registered-agent slot in the registry, so the challenge can't be satisfied regardless of cert validity.
+- **`/notify`** accepts any CA+EKU cert as a routing-target — the routing-action principal's intended use case.
+- **`/health`** is read-only; admitting any CA+EKU cert matches its inspection-friendly intent.
+
+If future principals need tighter CN-based scoping (e.g. "this principal class may POST `/notify` but not read `/health`"), that's a defense-in-depth improvement over the current state rather than a replacement for the protocol gates. File as a separate DR revision if the need arises.
 
 ## Revision History
 
 - **2026-03-28 (v1)** — Initial decision: mTLS with per-project CA; peer agents as the single principal type.
-- **2026-04-17 (v2)** — Principal-type taxonomy added (peer-agent + routing-client); EKU doctrine established with 3-step rollout path (tracked in #121). Surfaced by macf-actions#8 migration from SSH+tmux to mTLS HTTPS POST transport.
+- **2026-04-17 (v2)** — Principal-type taxonomy added (peer-agent + routing-client); EKU doctrine established and executed via 3-step rollout (#125 emit → step 2 rotate → #129 tighten, all landed same day). Surfaced by macf-actions#8 migration from SSH+tmux to mTLS HTTPS POST transport.
