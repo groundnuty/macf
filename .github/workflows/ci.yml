@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: jetify-com/devbox-install-action@v0.14.0
+      - uses: jetify-com/devbox-install-action@v0.15.0
 
       - name: Build, lint, and test
         run: make -f dev.mk check
