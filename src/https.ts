@@ -11,6 +11,27 @@ export const PORT_RANGE_START = 8800;
 export const PORT_RANGE_SIZE = 1000;
 const MAX_PORT_ATTEMPTS = 10;
 
+// clientAuth EKU OID — RFC 5280 §4.2.1.12. Peer certs emit this via
+// generateAgentCert + signCSR (#125); the routing-action client cert
+// emits it too (#119). Enforced at the server as the final step of
+// DR-004 v2 EKU rollout (#121). Non-EKU certs are rejected at
+// /notify + /health + /sign uniformly.
+export const CLIENT_AUTH_EKU_OID = '1.3.6.1.5.5.7.3.2';
+
+/**
+ * Check whether the presented peer cert carries the clientAuth EKU.
+ * Node's `tls.TLSSocket.getPeerCertificate()` exposes EKU as
+ * `ext_key_usage` — an array of OID strings. If the field is absent
+ * or empty, the cert carries no EKU; if present, we require the
+ * clientAuth OID specifically. Exported for tests.
+ */
+export function peerCertHasClientAuthEKU(peerCert: {
+  readonly ext_key_usage?: readonly string[];
+}): boolean {
+  return Array.isArray(peerCert.ext_key_usage)
+    && peerCert.ext_key_usage.includes(CLIENT_AUTH_EKU_OID);
+}
+
 interface NodeError extends Error {
   readonly code?: string;
 }
@@ -103,6 +124,30 @@ export function createHttpsServer(config: {
     const tlsSocket = req.socket as TLSSocket;
     if (!tlsSocket.authorized) {
       sendJson(res, 401, { error: 'Unauthorized' });
+      return;
+    }
+
+    // Step 3 of the DR-004 v2 EKU rollout (#121): require the peer
+    // cert to carry the clientAuth EKU. Peer certs emit it via
+    // generateAgentCert + signCSR (#125); routing-action client cert
+    // emits it via generateClientCert (#119). A CA-signed cert
+    // WITHOUT the EKU — e.g. an old peer cert pre-#125 that hasn't
+    // been rotated — is rejected uniformly at /health, /notify,
+    // /sign. Operators who miss a rotation see 403 with a clear
+    // message pointing at `macf certs rotate`.
+    const peerCert = tlsSocket.getPeerCertificate() as {
+      readonly ext_key_usage?: readonly string[];
+      readonly subject?: { readonly CN?: string };
+    };
+    if (!peerCertHasClientAuthEKU(peerCert)) {
+      const cn = peerCert.subject?.CN ?? 'unknown';
+      logger.warn('client_cert_missing_eku', {
+        from_cn: cn,
+        url: req.url ?? '',
+      });
+      sendJson(res, 403, {
+        error: 'Forbidden: client certificate missing clientAuth Extended Key Usage. Run `macf certs rotate` to pick up an EKU-enabled cert.',
+      });
       return;
     }
 
