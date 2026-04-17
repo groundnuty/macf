@@ -109,9 +109,11 @@ One-off test: `devbox run -- npx vitest run test/path/to/file.test.ts`
 - Error classes extend `MacfError` with a unique `code` string
 - ESM-only: `.js` import extensions in all imports
 - Commit types per `commitlint.config.mjs`: feat / fix / **security** /
-  refactor / perf / docs / test / chore / ci / revert / build / style.
-  Use `security:` for vulnerability fixes + hardening (not `fix:`) so release
-  notes and `git log --grep=^security` surface them distinctly.
+  **reliability** / refactor / perf / docs / test / chore / ci / revert /
+  build / style. Use `security:` for vulnerability fixes + hardening
+  (not `fix:`); use `reliability:` for observability / robustness fixes
+  from audit / ultrareview findings (not `fix:`) so release notes and
+  `git log --grep='^security\|^reliability'` surface them distinctly.
 
 ## CLI Surface
 

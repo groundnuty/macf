@@ -1,9 +1,11 @@
 /**
- * Tests for commitlint.config.mjs — specifically that `security` is in
- * the type-enum (#88). Without this, a `security:` commit would be
- * rejected by CI and we'd end up using `fix:` for vulnerability
- * fixes, conflating them with non-security bug fixes in changelogs
- * and `git log` queries.
+ * Tests for commitlint.config.mjs — specifically that:
+ * - `security` is in the type-enum (#88).
+ * - `reliability` is in the type-enum (#133) — precedent-matched from
+ *   `security`, distinguishes observability/robustness hardening from
+ *   plain bug fixes in release notes and `git log --grep='^reliability'`.
+ * Without these, such commits would be rejected by CI and we'd conflate
+ * them with generic `fix:` in changelogs.
  */
 import { describe, it, expect } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
@@ -24,6 +26,10 @@ describe('commitlint type-enum', () => {
     expect(typeEnum[2]).toContain('security');
   });
 
+  it('includes reliability (#133)', () => {
+    expect(typeEnum[2]).toContain('reliability');
+  });
+
   it('retains the pre-#88 types (no regression)', () => {
     for (const t of ['feat', 'fix', 'refactor', 'docs', 'test', 'chore',
                      'perf', 'ci', 'revert', 'build', 'style']) {
@@ -33,7 +39,7 @@ describe('commitlint type-enum', () => {
 
   it('has no unexpected entries (drift guard)', () => {
     const expected = new Set([
-      'feat', 'fix', 'security',
+      'feat', 'fix', 'security', 'reliability',
       'refactor', 'perf', 'docs', 'test',
       'chore', 'ci', 'revert', 'build', 'style',
     ]);
