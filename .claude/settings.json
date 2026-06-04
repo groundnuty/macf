@@ -130,7 +130,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'INPUT=$(cat); if echo \"$INPUT\" | jq -e .stop_hook_active >/dev/null 2>&1 && [ \"$(echo \"$INPUT\" | jq -r .stop_hook_active)\" = \"true\" ]; then exit 0; fi; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; [ -f package.json ] || exit 0; command -v devbox >/dev/null 2>&1 || exit 0; OUTPUT=$(make -f dev.mk check 2>&1); rc=$?; printf \"%s\\n\" \"$OUTPUT\" | tail -30; if [ $rc -ne 0 ]; then exit 2; fi'",
+            "command": "sh -c 'INPUT=$(cat); if echo \"$INPUT\" | jq -e .stop_hook_active >/dev/null 2>&1 && [ \"$(echo \"$INPUT\" | jq -r .stop_hook_active)\" = \"true\" ]; then exit 0; fi; [ -z \"$CLAUDE_PROJECT_DIR\" ] && exit 0; cd \"$CLAUDE_PROJECT_DIR\" || exit 0; [ -f package.json ] || exit 0; command -v devbox >/dev/null 2>&1 || exit 0; CHANGED=$(git status --porcelain 2>/dev/null | grep -iE \"\\.(ts|tsx|mts|cts|js|mjs|cjs)$|package(-lock)?\\.json$|tsconfig[^/]*\\.json$|vitest\\.config\\.|eslint\\.config\\.|\\.eslintrc|dev\\.mk$\"); if [ -z \"$CHANGED\" ]; then echo \"Stop hook: no build-affecting working-tree changes; skipping make check.\"; exit 0; fi; OUTPUT=$(make -f dev.mk check 2>&1); rc=$?; printf \"%s\\n\" \"$OUTPUT\" | tail -30; if [ $rc -ne 0 ]; then exit 2; fi'",
             "timeout": 120000
           }
         ]
