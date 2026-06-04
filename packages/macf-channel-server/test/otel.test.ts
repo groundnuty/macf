@@ -44,18 +44,22 @@ describe('bootstrapOtel', () => {
     vi.resetModules();
   });
 
-  describe('AC1: env unset → silent no-op', () => {
-    it('returns undefined without writing to stderr when env is unset', async () => {
+  describe('AC1: env unset → telemetry-off announced (macf#422: was a silent no-op)', () => {
+    it('logs otel_init_skipped + returns undefined when env is unset', async () => {
       delete process.env['OTEL_EXPORTER_OTLP_ENDPOINT'];
       await expect(bootstrapOtel()).resolves.toBeUndefined();
-      expect(stderrSpy).not.toHaveBeenCalled();
+      // macf#422 AC-5: the unset path now ANNOUNCES the telemetry-off state
+      // (closes the silent no-op) rather than returning silently — so a
+      // channel-server exporting nothing is distinguishable from one whose
+      // OTLP export is failing downstream.
+      expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('otel_init_skipped'));
       expect(exitSpy).not.toHaveBeenCalled();
     });
 
-    it('treats empty-string env as unset (no-op)', async () => {
+    it('treats empty-string env as unset → also logs otel_init_skipped', async () => {
       process.env['OTEL_EXPORTER_OTLP_ENDPOINT'] = '';
       await expect(bootstrapOtel()).resolves.toBeUndefined();
-      expect(stderrSpy).not.toHaveBeenCalled();
+      expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('otel_init_skipped'));
       expect(exitSpy).not.toHaveBeenCalled();
     });
   });
@@ -67,7 +71,10 @@ describe('bootstrapOtel', () => {
       // span-emission verification is integration-level.
       process.env['OTEL_EXPORTER_OTLP_ENDPOINT'] = 'http://localhost:4318';
       await expect(bootstrapOtel()).resolves.toBeUndefined();
-      expect(stderrSpy).not.toHaveBeenCalled();
+      // macf#422 AC-5: success path announces init + the resolved endpoint,
+      // so channel.log can distinguish "telemetry on (export may be failing
+      // downstream)" from "telemetry off / env not propagated".
+      expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('otel_init endpoint='));
       expect(exitSpy).not.toHaveBeenCalled();
     });
   });
