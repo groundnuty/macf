@@ -58,7 +58,16 @@
  */
 export async function bootstrapOtel(): Promise<void> {
   const endpoint = process.env['OTEL_EXPORTER_OTLP_ENDPOINT'];
-  if (endpoint === undefined || endpoint === '') return;
+  if (endpoint === undefined || endpoint === '') {
+    // macf#422 AC-5: announce the telemetry-off state instead of returning
+    // silently. A channel-server that exports nothing is otherwise
+    // indistinguishable from one whose OTLP export is failing downstream —
+    // this line (MCP child's stderr → channel.log) confirms the cause is
+    // env-propagation: OTEL_EXPORTER_OTLP_ENDPOINT never reached this
+    // process. Sister to the Bug-2 silent-fallback fix.
+    process.stderr.write('[macf-otel] otel_init_skipped reason=OTEL_EXPORTER_OTLP_ENDPOINT_unset\n');
+    return;
+  }
 
   const serviceVersion = process.env['MACF_VERSION'] ?? '0.0.0';
   const serviceName = process.env['OTEL_SERVICE_NAME'] ?? 'macf';
@@ -183,4 +192,11 @@ export async function bootstrapOtel(): Promise<void> {
   };
   process.once('SIGTERM', shutdown);
   process.once('SIGINT', shutdown);
+
+  // macf#422 AC-5: announce successful telemetry init + the resolved
+  // endpoint. If spans STILL don't reach the collector after this logs,
+  // the gap is export-side (e.g. localhost→::1 resolution per macf#419),
+  // NOT env-propagation — distinguishing the two AC-5 candidates from
+  // channel.log alone (no root-only /proc/<pid>/environ needed).
+  process.stderr.write(`[macf-otel] otel_init endpoint="${endpoint}" service="${serviceName}"\n`);
 }
