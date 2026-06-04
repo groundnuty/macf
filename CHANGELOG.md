@@ -9,6 +9,52 @@ Plugin + routing-workflow changes ship from separate repos
 [`groundnuty/macf-actions`](https://github.com/groundnuty/macf-actions))
 and are not included here — pin them explicitly in each workspace.
 
+## [0.2.33] — 2026-06-04
+
+Reliability + observability release surfaced by the Phase 5 A2A live-fleet
+verification (`#406` / `#368`). First release since the v0.2.32 recovery
+arc; cut via OIDC Trusted Publishers (no npm-token step).
+
+### Reliability — A2A outbound observability (#422)
+
+The Phase 5 live-fleet test surfaced a real integration gap: an A2A
+`notify_peer` was silently falling back to the legacy `/notify` path,
+invisibly. Two silent-no-op hazards closed:
+
+- **`#423`** — `selectOutboundProtocol`'s AgentCard-discovery step (`notify-peer.ts`)
+  silently fell back to legacy on `getAgentCard` returning `null`
+  (peer 404/401/403 — a clean null-return, not an exception) or a card
+  without a JSONRPC binding. Only the catch path (transport/5xx/schema-fail)
+  warned. Now both quiet branches warn — `notify_peer_a2a_no_agent_card`
+  `{ peer, url }` + `notify_peer_a2a_no_jsonrpc_binding` `{ peer, url, bindings }`
+  (the bindings seen, so a version-skewed peer is diagnosable from one line).
+- **`#425`** — `bootstrapOtel` (`otel.ts`) returned silently when
+  `OTEL_EXPORTER_OTLP_ENDPOINT` was unset, making a channel-server that
+  exports nothing indistinguishable from one whose OTLP export fails
+  downstream. Now announces on startup (→ MCP child's channel.log):
+  `otel_init endpoint="..."` when set+registered, `otel_init_skipped
+  reason=...` when unset. Diagnoses the AC-5 sender-export gap.
+
+### Fix — OTLP endpoint hygiene (#419)
+
+- Default OTLP endpoint `localhost:14318` → **`127.0.0.1:14318`** (IPv4
+  literal) in both the canonical reference (`claude-sh.ts`) and the live
+  consumer-output path (`env-files.ts` `generateEnvTelemetry`). Removes
+  the latent `localhost`→`::1` resolution ambiguity; aligns with the
+  sibling `MACF_ADVERTISE_HOST ?? '127.0.0.1'` default.
+
+### Docs — A2A Phase 4/5 + DR-022 amendments
+
+- Phase 4 (`#405`/#409) external-publication topology + `notify_peer`
+  sunset options; Phase 5 (`#406`/#410/#411) CV consumer-fleet migration
+  procedure + operator checklist (AC-4 observability query corrected to
+  Tempo `service.version`).
+- DR-022 Amendment N (#408 — OIDC Trusted Publishers as canonical CI auth)
+  + Amendment O (#412 — legacy `notify_peer` sunset criterion Option A,
+  counter-based 60-day).
+- `silent-fallback-hazards.md` Instance 2 (#417) — closure-protocol-table-cell
+  auto-close sub-shape.
+
 ## [0.2.32] — 2026-05-20
 
 Recovery release per DR-022 Amendment L (fourth bump in the v0.2.29 →
