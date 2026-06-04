@@ -55,14 +55,28 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 ## Implementation Status
 
 P1–P7 all implemented. Post-P7 work is bug-fix + security + hardening driven
-by issue queue and periodic audits. **Current state**: `main` is at v0.2.32
-(`aad5a15` bump-commit; `acfdede` post-publish verify-script fix). **LIVE
-on npm: v0.2.32 across all 3 packages with provenance attestations** —
-recovery arc from v0.2.29-failure to v0.2.32-success completed 2026-05-20
-via pivot to OIDC Trusted Publishers (operator-configured on npmjs.com;
-GitHub `NPM_TOKEN` secret deleted; workflow falls through to OIDC via
-`id-token: write` permission). See `CHANGELOG.md` [0.2.32] for the full
-recovery narrative. 24 DRs (DR-019 Amendment A SHIPPED v0.2.27; DR-022
+by issue queue and periodic audits. **Current state**: `main` is at v0.2.33
+(`927afae` bump-commit). **LIVE on npm: v0.2.33 across all 3 packages with
+provenance attestations** — cut 2026-06-04 via OIDC Trusted Publishers (the
+canonical post-recovery path: bump+tag → auto-publish, no npm-token step;
+v0.2.32 recovery arc from v0.2.29-failure documented in `CHANGELOG.md`
+[0.2.32]). **v0.2.33 = reliability + observability release surfaced by the
+Phase 5 A2A live-fleet verification** (#406/#368): #423 (silent A2A→legacy
+fallback warns) + #425 (otel_init/otel_init_skipped startup announce, AC-5
+diagnostic) + #419 (OTLP default localhost→127.0.0.1) + Phase 4/5 docs +
+DR-022 Amendments N+O. See `CHANGELOG.md` [0.2.33].
+
+**Phase 5 A2A status (post-v0.2.33)**: A2A routing WORKS on the live CV
+fleet (Bug-1 — stale registry-squatter instance — resolved operationally
+2026-06-04). Remaining: AC-5 channel-server-export gap (freshly-launched CV
+channel-servers emit no OTEL spans; A2A routes but spans invisible).
+Candidate B (localhost→::1) refuted; Candidate A (OTEL env not reaching the
+MCP child) standing. v0.2.33's #425 diagnostic confirms A on next CV
+relaunch via channel.log `otel_init_skipped`. If A: fix = plugin `mcpServers`
+env propagation to the channel-server child (mind the known Claude Code
+`env`-block bug anthropics/claude-code#28332 — verify-then-trust).
+Tracked: #422 (AC-5), #424 (collision version-aware takeover enhancement),
+#421 (npx version-pin hardening, de-linked). 24 DRs (DR-019 Amendment A SHIPPED v0.2.27; DR-022
 Amendment M SHIPPED v0.2.30 bump-commit; both LIVE via v0.2.32), 9 phase
 specs (added `P-A2A-phase-2.md`, `P-A2A-phase-2d.md`, `P-A2A-phase-3.md`),
 13 canonical rules (silent-fallback Instance 9 added via #403), 16
