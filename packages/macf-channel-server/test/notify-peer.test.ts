@@ -402,6 +402,76 @@ describe('notify_peer tool', () => {
       expect(result.channel_state).toBe('offline');
     });
   });
+
+  describe('A2A discovery silent-fallback warns (macf#422 Bug-2)', () => {
+    // selectOutboundProtocol's getAgentCard step had two SILENT legacy
+    // fallbacks: card===null (peer 404/401/403) + AgentCard-without-JSONRPC-
+    // binding. Only the catch (transport/5xx/schema-fail) warned. A 404 is a
+    // clean null-return, not an exception — so a stale pre-v0.2.24 peer
+    // routed legacy invisibly while notify_peer returned delivered:true.
+    // These pin the warn on both quiet branches (symmetric with the catch).
+    function depsWithA2a(
+      reg: FakeRegistry,
+      getAgentCard: ReturnType<typeof vi.fn>,
+      sendMessage: ReturnType<typeof vi.fn> = vi.fn(),
+    ) {
+      const a2aClient = { getAgentCard, sendMessage };
+      return {
+        ...makeDeps(reg),
+        a2aClient: a2aClient as unknown as Parameters<typeof notifyPeer>[0]['a2aClient'],
+      };
+    }
+
+    it('warns notify_peer_a2a_no_agent_card when getAgentCard returns null, then legacy-falls-back', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const getAgentCard = vi.fn().mockResolvedValue(null);
+      nextHttpsRespondsWith(200); // legacy /notify fallback succeeds
+      fakeLogger.warn.mockClear();
+      const result = await notifyPeer(depsWithA2a(reg, getAgentCard), { to: 'peer-a', event: 'turn-complete' });
+      expect(getAgentCard).toHaveBeenCalledTimes(1);
+      expect(fakeLogger.warn).toHaveBeenCalledWith(
+        'notify_peer_a2a_no_agent_card',
+        expect.objectContaining({ peer: 'peer-a' }),
+      );
+      expect(result.peers_delivered).toBe(1); // legacy path still delivered
+    });
+
+    it('warns notify_peer_a2a_no_jsonrpc_binding when AgentCard lacks a JSONRPC binding, then legacy-falls-back', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const card = {
+        supportedInterfaces: [{ protocolBinding: 'GRPC', protocolVersion: '1.0', url: 'https://127.0.0.1:9000' }],
+      };
+      const getAgentCard = vi.fn().mockResolvedValue(card);
+      nextHttpsRespondsWith(200);
+      fakeLogger.warn.mockClear();
+      await notifyPeer(depsWithA2a(reg, getAgentCard), { to: 'peer-a', event: 'turn-complete' });
+      expect(fakeLogger.warn).toHaveBeenCalledWith(
+        'notify_peer_a2a_no_jsonrpc_binding',
+        expect.objectContaining({ peer: 'peer-a', bindings: ['GRPC'] }),
+      );
+    });
+
+    it('routes a2a (no silent-fallback warn) when AgentCard carries a JSONRPC binding', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const card = {
+        supportedInterfaces: [{ protocolBinding: 'JSONRPC', protocolVersion: '1.0', url: 'https://127.0.0.1:9000' }],
+      };
+      const getAgentCard = vi.fn().mockResolvedValue(card);
+      const sendMessage = vi.fn().mockResolvedValue({ id: 'task-1', status: { state: 'TASK_STATE_COMPLETED' } });
+      fakeLogger.warn.mockClear();
+      const result = await notifyPeer(depsWithA2a(reg, getAgentCard, sendMessage), { to: 'peer-a', event: 'turn-complete' });
+      expect(sendMessage).toHaveBeenCalledTimes(1); // A2A path taken, not legacy
+      expect(result.peers_delivered).toBe(1);
+      expect(fakeLogger.warn).not.toHaveBeenCalledWith('notify_peer_a2a_no_agent_card', expect.anything());
+      expect(fakeLogger.warn).not.toHaveBeenCalledWith('notify_peer_a2a_no_jsonrpc_binding', expect.anything());
+    });
+  });
 });
 
 // vitest's `beforeEach` is per-describe by default; declare top-level here too.

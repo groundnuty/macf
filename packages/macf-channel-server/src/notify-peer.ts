@@ -290,12 +290,35 @@ async function selectOutboundProtocol(
   try {
     const card = await deps.a2aClient.getAgentCard(peerBaseUrl(peer));
     if (card === null) {
+      // macf#422 Bug-2: a peer that returns 404/401/403 on AgentCard
+      // discovery yields a clean `null` (NOT an exception) — so this
+      // branch previously fell back to legacy SILENTLY, while the catch
+      // block (transport/5xx/schema-fail) warned. A stale pre-v0.2.24
+      // instance (no /.well-known/agent-card.json) hits exactly this path:
+      // legacy routing + delivered:true, with no signal that A2A never ran.
+      // Warn for symmetry with the catch so the operator can see WHY.
+      deps.logger.warn('notify_peer_a2a_no_agent_card', {
+        peer: peer.name,
+        url: peerBaseUrl(peer),
+      });
       return 'legacy';
     }
     const hasJsonRpcBinding = card.supportedInterfaces.some(
       (iface) => iface.protocolBinding === 'JSONRPC',
     );
-    return hasJsonRpcBinding ? 'a2a' : 'legacy';
+    if (!hasJsonRpcBinding) {
+      // macf#422 Bug-2: AgentCard present but no JSONRPC binding (e.g. a
+      // pre-Phase-2c instance whose supportedInterfaces predate the
+      // proto-aligned binding) → legacy. Previously silent; include the
+      // bindings actually seen so a version-skewed peer is diagnosable.
+      deps.logger.warn('notify_peer_a2a_no_jsonrpc_binding', {
+        peer: peer.name,
+        url: peerBaseUrl(peer),
+        bindings: card.supportedInterfaces.map((iface) => iface.protocolBinding),
+      });
+      return 'legacy';
+    }
+    return 'a2a';
   } catch (err) {
     deps.logger.warn('notify_peer_agent_card_fetch_failed', {
       peer: peer.name,
