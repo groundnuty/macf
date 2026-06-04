@@ -340,7 +340,7 @@ describe('otelTelemetryLines (kept exported as canonical pre-migration reference
     expect(joined).toContain('export OTEL_METRICS_EXPORTER=otlp');
     expect(joined).toContain('export OTEL_LOGS_EXPORTER=otlp');
     expect(joined).toContain('MACF_OTEL_ENDPOINT="${MACF_OTEL_ENDPOINT:-$(macf_settings_get MACF_OTEL_ENDPOINT)}"');
-    expect(joined).toContain('MACF_OTEL_ENDPOINT="${MACF_OTEL_ENDPOINT:-http://localhost:14318}"');
+    expect(joined).toContain('MACF_OTEL_ENDPOINT="${MACF_OTEL_ENDPOINT:-http://127.0.0.1:14318}"');
     expect(joined).toContain('export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-$MACF_OTEL_ENDPOINT}"');
     expect(joined).toContain('export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf');
     expect(joined).toContain('export OTEL_SERVICE_NAME="macf-agent-code-agent"');
@@ -357,14 +357,16 @@ describe('otelTelemetryLines (kept exported as canonical pre-migration reference
     expect(joined).toContain('MACF_OTEL_ENDPOINT="${MACF_OTEL_ENDPOINT:-http://obs.tailnet.ts.net:14318}"');
     expect(joined).toContain('export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-$MACF_OTEL_ENDPOINT}"');
     expect(joined).not.toContain('localhost:14318');
+    expect(joined).not.toContain('127.0.0.1:14318');
     expect(joined).not.toContain(':4318');
   });
 
-  it('default endpoint is :14318 (current cluster), NOT :4318 (retired)', () => {
+  it('default endpoint is the 127.0.0.1 IPv4 literal :14318 (macf#418 — no localhost→::1 ambiguity), NOT :4318 (retired)', () => {
     const lines = otelTelemetryLines(sampleConfig, {});
     const joined = lines.join('\n');
-    expect(joined).toContain('localhost:14318');
-    expect(joined).not.toContain('localhost:4318');
+    expect(joined).toContain('127.0.0.1:14318');
+    expect(joined).not.toContain('localhost');
+    expect(joined).not.toContain(':4318');
   });
 
   it('emits env-overridable form for run-time OTEL_EXPORTER_OTLP_ENDPOINT override', () => {

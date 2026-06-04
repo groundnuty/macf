@@ -212,8 +212,12 @@ function tmuxSelfWrapLines(): string[] {
  *                                reachable over Tailscale / other
  *                                network paths.
  *
- * Default endpoint is `http://localhost:14318` per the canonical k3d
+ * Default endpoint is `http://127.0.0.1:14318` per the canonical k3d
  * cluster topology (`groundnuty/macf-devops-toolkit:CLAUDE.md` —
+ * the IPv4 literal, NOT `localhost`, avoids the `localhost`→`::1`
+ * resolution ambiguity on hosts where getaddrinfo returns the IPv6
+ * loopback first; aligns with the `MACF_ADVERTISE_HOST ?? '127.0.0.1'`
+ * sibling default in this file. See macf#418 —
  * `:14318` is the host-port-mapped serverlb endpoint; the
  * pre-2026-04-25 compose-stack `:4318` is retired). Surfaced in
  * groundnuty/macf#282 — CV-agents had zero telemetry for 34min because
@@ -240,7 +244,7 @@ export function otelTelemetryLines(
     return [];
   }
 
-  const endpoint = env['MACF_OTEL_ENDPOINT'] ?? 'http://localhost:14318';
+  const endpoint = env['MACF_OTEL_ENDPOINT'] ?? 'http://127.0.0.1:14318';
 
   // The endpoint value gets embedded verbatim in a shell double-
   // quoted export. Reject chars that would break quoting or trigger

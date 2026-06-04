@@ -460,7 +460,8 @@ export function generateEnvRegistry(config: MacfAgentConfig): string {
  * + identity-bearing OTel resource attributes (macf#357). Mirrors
  * `claude-sh.ts`'s `otelTelemetryLines` (including the same shell-unsafe-
  * char rejection on MACF_OTEL_ENDPOINT and the same default endpoint
- * `http://localhost:14318` per macf-devops-toolkit canonical k3d topology).
+ * `http://127.0.0.1:14318` per macf-devops-toolkit canonical k3d topology —
+ * the IPv4 literal avoids the `localhost`→`::1` resolution ambiguity, macf#418).
  *
  * **Minimal placeholder when `MACF_OTEL_DISABLED=1`** (operator opt-out at
  * template-time per macf#197). Body shrinks to header + schema_version +
@@ -502,7 +503,7 @@ export function generateEnvTelemetry(
     return assemble(operatorHeaderLines('generateEnvTelemetry'), body);
   }
 
-  const endpoint = env['MACF_OTEL_ENDPOINT'] ?? 'http://localhost:14318';
+  const endpoint = env['MACF_OTEL_ENDPOINT'] ?? 'http://127.0.0.1:14318';
 
   // Same allowlist pattern as otelTelemetryLines in claude-sh.ts. The
   // endpoint value gets embedded verbatim in a shell double-quoted export.
