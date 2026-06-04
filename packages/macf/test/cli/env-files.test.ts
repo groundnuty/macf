@@ -368,10 +368,12 @@ describe('generateEnvTelemetry', () => {
     expect(out).toContain('export OTEL_LOGS_EXPORTER=otlp');
   });
 
-  it('bakes the canonical k3d default endpoint when MACF_OTEL_ENDPOINT unset', () => {
-    expect(generateEnvTelemetry(baseConfig, cleanEnv)).toContain(
-      'http://localhost:14318',
-    );
+  it('bakes the canonical k3d default endpoint (127.0.0.1 IPv4 literal, macf#418) when MACF_OTEL_ENDPOINT unset', () => {
+    const out = generateEnvTelemetry(baseConfig, cleanEnv);
+    expect(out).toContain('http://127.0.0.1:14318');
+    // macf#418: IPv4 literal avoids the localhost→::1 ambiguity on hosts
+    // where getaddrinfo returns the IPv6 loopback first.
+    expect(out).not.toContain('localhost');
   });
 
   it('honors MACF_OTEL_ENDPOINT template-time override', () => {
