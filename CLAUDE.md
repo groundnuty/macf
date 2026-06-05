@@ -87,16 +87,25 @@ v0.2.33 `mcpServers.env` block + #427 resource attrs); receiver-side delivery
 verified (#428/#429 — science co-verified Tempo trace + channel.log + TUI). The
 `gen_ai.agent.name` resource-attr (#427) is the last observability nicety,
 pending its operator-timed Tempo verify on the next CV relaunch to cs 0.2.35.
-**Routing**: macf-actions **v1.3.2** cut (#432) — `route-by-pr-review-state`
-reimplemented on the v1.x SSH/tmux primitive so `gh pr review --approve` notifies
-the PR author; fleet pins (macf/testbed/devops-toolkit) bumped; AC-6 proven live.
-The post-Phase-5 hardening **queue** is now CLEARED; remaining open issues:
-#427 (gen_ai.agent.name Tempo verify), **#437 (routing-reliability — substrate
-agents silently miss routed @mentions; the structural fix for the missed-ping
-failure surfaced this session)**, #439 (register CAS/If-Match — TOCTOU follow-up,
-backlog), #418 (claude-sh telemetry, devops), #224 (NPM_TOKEN rotation), #368
-(A2A master-tracking umbrella). 24 DRs, 9 phase specs, 13 canonical rules, 16
-research notes.
+**Routing**: macf-actions **v1.3.2** (#432, `route-by-pr-review-state` on the v1.x
+SSH/tmux primitive — `gh pr review --approve` notifies the PR author; AC-6 proven)
+then **v1.3.3** (#437 causes 2/3 — liveness-probe hardening across all four
+route-by-* blocks: split has-session/helper probes, retry, classify
+alive/absent/unknown, attempt-on-ambiguity, + the `set -e`/`|| true` blocker fix).
+**All 3 callers (macf/testbed/devops-toolkit) pin @v1.3.3** + carry `workspace_dir`
+in agent-config.json. **#437 routing-reliability CLOSED** (the missed-ping bug):
+cause-1 `workspace_dir`→helper (#443/#268/#81) + cause-2/3 v1.3.3 probe-hardening;
+busy-session co-verify PASS (`via helper … session=alive` on a live mid-turn ping);
+cause-3 structural receipt-close → #444. **#368 A2A master umbrella CLOSED** (A2A
+v1.0 complete + live-verified). silent-fallback Instance 10 documents the
+send≠receipt last-mile gap.
+
+The post-Phase-5 hardening queue is CLEARED. **Open issues:** #427
+(gen_ai.agent.name — code shipped in v0.2.35; AC-3 live Tempo verify OPERATOR-TIMED:
+CV `macf update` → cs 0.2.35 → science verifies → code-agent closes), #444
+(receipt-observable substrate routing — structural, backlog), #439 (register
+CAS/If-Match TOCTOU — backlog), #418 (claude-sh telemetry — devops), #224
+(NPM_TOKEN rotation). 24 DRs, 9 phase specs, 13 canonical rules, 16 research notes.
 
 **A2A integration arc** (master tracking #368): **full bidirectional v1.0
 surface LIVE on npm via v0.2.32**:
