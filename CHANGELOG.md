@@ -9,6 +9,40 @@ Plugin + routing-workflow changes ship from separate repos
 [`groundnuty/macf-actions`](https://github.com/groundnuty/macf-actions))
 and are not included here — pin them explicitly in each workspace.
 
+## [0.2.34] — 2026-06-05
+
+A2A receiver-side delivery — closes the "A2A routes but agents don't
+receive the message" gap (the Phase 5 follow-on surfaced on #422/#368).
+
+### feat — A2A `/a2a/v1` delivers to the agent (#429, Phase 3.5)
+
+Before this, the inbound `message/send` handler created an A2A Task and
+returned, but never delivered the message to the receiving agent (no
+MCP-channel deposit, no wake) — so A2A was protocol-proven but agents
+didn't actually receive over it. Now the handler, after creating the
+Task (happy-path + resume), calls the same `onNotify` primitive legacy
+`/notify` uses (`mcp.pushNotification` → `decideWake` → `wakeViaTmux`):
+
+- `a2a-delivery.ts` maps the inbound A2A `Message` → a `peer_notification`
+  `NotifyPayload`: body = joined text parts; `event`/`source` from
+  `Message.metadata` (spec-free-form). Missing/unrecognized event → omit
+  → `decideWake` skips → push-only (no accidental wake from a non-MACF
+  client; mTLS is the wake trust-gate).
+- Pattern E preserved at the receiver (`decideWake`, unchanged): `custom`
+  → wake; autonomous (`turn-complete`/`session-end`/`error`) → push-only.
+- Sender: the `selectOutboundProtocol` `event === 'custom' → legacy`
+  carve-out is lifted (its own comment deferred it to "Phase 3.5") —
+  custom now travels A2A + wakes via the receiver. Protocol selection is
+  event-independent; loop-prevention is transport-independent.
+
+### fix — code-agent launcher telemetry (#430, #418 item A)
+
+`macf/claude.sh` (code-agent's hand-maintained launcher) had zero OTEL
+lines. Wires the telemetry vars inlined into the tmux command (the
+`LAUNCH_ENV` pattern) so they cross the `tmux new-session` env-stripping
+boundary — code-agent now emits OTEL like the other agents. (Launcher-only
+change; not part of the npm packages, but bundled in this release.)
+
 ## [0.2.33] — 2026-06-04
 
 Reliability + observability release surfaced by the Phase 5 A2A live-fleet
