@@ -175,6 +175,14 @@ describe('checkCollision', () => {
       expect(decisionBasis(logger)).toBe('takeover_unversioned_existing');
     });
 
+    it('TAKES OVER an alive peer whose version is non-null but unparseable (logged distinctly)', async () => {
+      mockAliveWithVersion('garbage'); // non-null, but not x.y.z
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('takeover');
+      expect(decisionBasis(logger)).toBe('takeover_unparseable_existing');
+    });
+
     it('aborts when the INCOMING is unversioned (never displaces a live peer)', async () => {
       mockAliveWithVersion('0.2.20'); // existing older, but incoming is unversioned
       const logger = mockLogger();

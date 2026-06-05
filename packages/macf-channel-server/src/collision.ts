@@ -199,6 +199,13 @@ export async function checkCollision(
       // Existing answered but advertised no version → pre-#424 ⟹ oldest.
       takeover = true;
       basis = 'takeover_unversioned_existing';
+    } else if (!VERSION_PATTERN.test(existingVersion)) {
+      // Non-null but unparseable (malformed /health body, or a pre-release tag
+      // the x.y.z parser can't read) → treated as oldest → takeover, but logged
+      // with a distinct basis so the line doesn't falsely claim a real version
+      // comparison happened (#438 review note 3).
+      takeover = true;
+      basis = 'takeover_unparseable_existing';
     } else if (compareSemver(incomingVersion, existingVersion) > 0) {
       takeover = true;
       basis = 'takeover_newer_version';

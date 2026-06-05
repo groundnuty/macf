@@ -1,5 +1,5 @@
 /**
- * Source-shape regression test for the takeover-after-serve invariant
+ * Source-shape TRIPWIRE for the takeover-after-serve ordering
  * (groundnuty/macf#424, science-agent design assumption 2).
  *
  * Version-aware takeover lets a newer instance displace an alive older one —
@@ -13,10 +13,15 @@
  *     P2  registry.register(...)   ← take the slot
  *
  * A crash-on-boot never reaches checkCollision/register, so it never strands
- * the slot. There is no full server-startup test harness, so this pins the
- * ordering statically (same source-shape approach as a2a-response-headers.test
- * + the macf#347 regression test) — if a refactor moved `registry.register`
- * before `httpsServer.start`, this fails.
+ * the slot. **Scope caveat (per #438 review):** this asserts only the TEXTUAL
+ * source ORDER of the three calls (`indexOf`), not the runtime invariant — it
+ * would NOT catch a dropped `await` on `httpsServer.start` (fire-and-forget
+ * bind) or an early `register` path on a different branch. It's a cheap
+ * regression tripwire (same source-shape approach as a2a-response-headers.test
+ * + the macf#347 regression test) for the common refactor that physically
+ * reorders the calls; the runtime guarantee rests on the awaited
+ * `httpsServer.start` at the call site, not on this test. A full runtime
+ * assertion would need a server-startup harness (none exists yet).
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
