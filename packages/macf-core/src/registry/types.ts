@@ -33,7 +33,12 @@ export function agentInfoEquals(a: AgentInfo | null, b: AgentInfo | null): boole
  * Outcome of a conditional (compare-and-set) register (groundnuty/macf#439).
  *
  * `ok: true`  — this instance now owns the slot; `current` is the value just
- *               written (=== the `info` passed in).
+ *               written (=== the `info` passed in). Ownership strength is
+ *               backend-dependent: the local backend is **exclusive-at-return**
+ *               (the compare+write is lock-atomic), whereas the GitHub-Variables
+ *               backend is **best-effort / eventually-reconciled** — a racer
+ *               writing in the same instant can still win (no native CAS on that
+ *               API; see registry.ts `registerConditional`).
  * `ok: false` — a concurrent writer changed the slot between the collision
  *               check and this write; `current` is the conflicting value
  *               observed (null if the slot was emptied). The caller must NOT

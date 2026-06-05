@@ -46,16 +46,31 @@ export function createRegistry(
 
     // CAS register (groundnuty/macf#439). The GitHub Actions Variables API has
     // no native conditional write (no If-Match / ETag on PATCH/POST), so this
-    // is a best-effort narrowing, not a hard CAS:
+    // is a best-effort narrowing, NOT a hard CAS:
     //   1. pre-write compare — re-read the slot; if it no longer matches
     //      `expected`, a concurrent writer already changed it → abort the
     //      write (ok:false). This collapses the wide TOCTOU window (which
     //      spans the ~5s collision health-ping) down to the read→write gap.
     //   2. post-write read-back verify — after writing, re-read; if the slot
-    //      isn't ours, a racer wrote inside that residual gap → ok:false.
-    // The residual window between (1) and the write can't be closed without a
-    // real CAS primitive; (2) makes the loser of that rare race detect it
-    // rather than both instances believing they own the slot.
+    //      isn't ours, a racer wrote BEFORE our read-back → ok:false.
+    //
+    // What (2) does and does NOT cover (#447 review, science-agent): it catches
+    // only the interleaving where the racer's write lands before our read-back.
+    // The symmetric order — A-write → A-readback(ok) → B-write → B-readback(ok)
+    // — leaves BOTH returning ok:true (the slot ends up holding B; A's ok:true
+    // is stale). So on THIS backend `ok:true` means "we own the slot for now,"
+    // not "exclusively, at return" — eventually-reconciled, not a hard CAS.
+    // (The local backend IS exclusive-at-return: lock-atomic, no read-back
+    // needed.) The residual is bounded in practice by the ~5s health-ping
+    // window + the #424 version-takeover predicate (an equal/older racer aborts
+    // at the collision check, before reaching here); closing it hard needs a
+    // real CAS primitive the API doesn't offer.
+    //
+    // Corrupt-slot caveat: `readAgent` returns null for a malformed / schema-
+    // invalid value. On the read-back that's fail-safe (→ harmless ok:false).
+    // On the pre-write compare with `expected===null`, a corrupt-but-present
+    // slot also reads null → compare passes → we overwrite it — acceptable (a
+    // corrupt slot is already unusable) and bounded by schema-validity.
     async registerConditional(
       name: string,
       info: AgentInfo,
