@@ -55,28 +55,49 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 ## Implementation Status
 
 P1–P7 all implemented. Post-P7 work is bug-fix + security + hardening driven
-by issue queue and periodic audits. **Current state**: `main` is at v0.2.33
-(`927afae` bump-commit). **LIVE on npm: v0.2.33 across all 3 packages with
-provenance attestations** — cut 2026-06-04 via OIDC Trusted Publishers (the
-canonical post-recovery path: bump+tag → auto-publish, no npm-token step;
-v0.2.32 recovery arc from v0.2.29-failure documented in `CHANGELOG.md`
-[0.2.32]). **v0.2.33 = reliability + observability release surfaced by the
-Phase 5 A2A live-fleet verification** (#406/#368): #423 (silent A2A→legacy
-fallback warns) + #425 (otel_init/otel_init_skipped startup announce, AC-5
-diagnostic) + #419 (OTLP default localhost→127.0.0.1) + Phase 4/5 docs +
-DR-022 Amendments N+O. See `CHANGELOG.md` [0.2.33].
+by issue queue and periodic audits. **Current state**: `main` is at v0.2.34
+(`6a163b5` bump-commit). **LIVE on npm: v0.2.34 across all 3 packages with
+provenance attestations** — cut 2026-06-05 via OIDC Trusted Publishers
+(bump+tag → auto-publish, no npm-token step). Two releases shipped
+2026-06-04→05:
+- **v0.2.33** = reliability/observability from the Phase 5 A2A verification:
+  #423 (silent A2A→legacy fallback warns) + #425 (otel_init/otel_init_skipped
+  channel-server startup diagnostic) + #419 (OTLP default localhost→127.0.0.1)
+  + Phase 4/5 docs + DR-022 Amendments N (OIDC) + O (notify_peer sunset
+  Option A). **Also**: marketplace plugin v0.2.33 added the `mcpServers.env`
+  OTEL-forwarding block (the AC-5 fix).
+- **v0.2.34** = A2A Phase 3.5 receiver-side delivery (#428/#429) + #418 item A
+  (claude.sh OTEL across the tmux boundary, #430). See `CHANGELOG.md`.
 
-**Phase 5 A2A status (post-v0.2.33)**: A2A routing WORKS on the live CV
-fleet (Bug-1 — stale registry-squatter instance — resolved operationally
-2026-06-04). Remaining: AC-5 channel-server-export gap (freshly-launched CV
-channel-servers emit no OTEL spans; A2A routes but spans invisible).
-Candidate B (localhost→::1) refuted; Candidate A (OTEL env not reaching the
-MCP child) standing. v0.2.33's #425 diagnostic confirms A on next CV
-relaunch via channel.log `otel_init_skipped`. If A: fix = plugin `mcpServers`
-env propagation to the channel-server child (mind the known Claude Code
-`env`-block bug anthropics/claude-code#28332 — verify-then-trust).
-Tracked: #422 (AC-5), #424 (collision version-aware takeover enhancement),
-#421 (npx version-pin hardening, de-linked). 24 DRs (DR-019 Amendment A SHIPPED v0.2.27; DR-022
+**Phase 5 A2A arc — CLOSED (#422 done, #406 master)**: full bidirectional
+A2A v1.0 live + observable on the real CV fleet. Bug-1 (stale-instance
+registry squat → operator restart) + Bug-2 (#423) + AC-5 (marketplace
+v0.2.33 `mcpServers.env` forwards OTEL to the cs child — Candidate A
+confirmed/fixed; Candidate B localhost→::1 refuted; #28332 didn't bite;
+items 4/5 GREEN in Tempo, co-verified by devops + science).
+
+**Phase 3.5 (#428) — receiver-side A2A delivery SHIPPED (v0.2.34)**: the
+`/a2a/v1` handler now `onNotify`s (mcp_push + decideWake) after Task
+creation; sender `custom→legacy` carve-out lifted; Pattern E preserved at
+the receiver. #428 OPEN pending the live cv-architect→cv-project-archaeologist
+receipt demo (CV relaunch on v0.2.34 → science co-verifies → reporter closes).
+
+**#418 (substrate telemetry) — both items merged** (B #419/v0.2.33, A #430).
+OPEN pending code-agent relaunch on `7a9fd02` → devops verifies
+`service.name=macf-agent-code-agent` spans in Tempo → reporter closes.
+
+**IN FLIGHT — #432 routing backport** (cut macf-actions v1.3.2 so
+`gh pr review --approve` routes to the implementer): AC-1 done — v3.3.0's
+`route-by-pr-review-state` is mTLS-native (can't lift); reimplement on the
+v1.x SSH/tmux primitive (modeled on `route-by-ci-completion`), no contract
+widening. HOLDING for science-agent confirm before cutting the tag, then:
+v1.3.2 → bump 3 pins (macf/testbed/devops-toolkit) → close dependabot #359 →
+external-caller smoke. **Build queue** (filed): #431 (PreToolUse close-keyword
+guard — Path-2 fix for the recurring auto-close hazard, 4th instance this
+session), #424 (collision version-aware takeover, design-locked), #427
+(gen_ai.agent.name resource attr), #426 (plugin.json single-source), #421
+(npx version-pin hardening), #416 (Stop-hook latency — gate make-check on
+build-affecting changes; needs review + restart). 24 DRs (DR-019 Amendment A SHIPPED v0.2.27; DR-022
 Amendment M SHIPPED v0.2.30 bump-commit; both LIVE via v0.2.32), 9 phase
 specs (added `P-A2A-phase-2.md`, `P-A2A-phase-2d.md`, `P-A2A-phase-3.md`),
 13 canonical rules (silent-fallback Instance 9 added via #403), 16
