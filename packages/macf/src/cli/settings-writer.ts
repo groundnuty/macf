@@ -192,11 +192,12 @@ export const PLUGIN_SKILL_PERMISSIONS: readonly string[] = [
  * the original install-time pre-approval missed.
  *
  * Pattern format: `mcp__plugin_<plugin-name>_<server-key>__<tool-name>`.
- * Plugin name = `macf-agent` (per `packages/macf/plugin/.claude-plugin/
- * plugin.json` `name` field). Server key = `macf-agent` (per same file's
- * `mcpServers.macf-agent` map key). Tool names match the channel-server's
- * `mcp.mcp.registerTool(...)` first-arg in
- * `packages/macf-channel-server/src/server.ts`.
+ * Plugin name = `macf-agent` (per the canonical manifest in
+ * `groundnuty/macf-marketplace:macf-agent/.claude-plugin/plugin.json` `name`
+ * field — the repo copy was removed as vestigial per macf#426; marketplace is
+ * source). Server key = `macf-agent` (per that manifest's `mcpServers.macf-agent`
+ * map key). Tool names match the channel-server's `mcp.mcp.registerTool(...)`
+ * first-arg in `packages/macf-channel-server/src/server.ts`.
  *
  * Keep in lockstep with the channel-server's tool registration list.
  * When a new tool is added to the channel-server, add its pattern here

@@ -113,6 +113,33 @@ jobs:
           done
           echo "All three packages at v${EXPECTED}, matches tag."
 
+      - name: Check marketplace plugin.json version matches the tag (macf#426)
+        if: steps.version.outputs.tag_driven == 'true'
+        env:
+          EXPECTED: ${{ steps.version.outputs.version }}
+        run: |
+          # macf#426 version-lockstep: the marketplace repo is the canonical
+          # source for the mountable plugin (manifest + skills/agents/hooks);
+          # `macf init`/`update` fetch it at `v<version>`. If it lags npm (as it
+          # did — stuck at 0.2.26 / 0.2.33 behind shipping versions), consumers
+          # `macf update` to a plugin tag older than the npm packages. Fail the
+          # release loud BEFORE publishing if the marketplace plugin.json at the
+          # release tag is missing or version-mismatched — forcing the
+          # marketplace bump + tag to land first.
+          set -euo pipefail
+          URL="https://raw.githubusercontent.com/groundnuty/macf-marketplace/v${EXPECTED}/macf-agent/.claude-plugin/plugin.json"
+          HTTP=$(curl -sS -w '%{http_code}' -o /tmp/mp-plugin.json "$URL")
+          if [[ "$HTTP" != "200" ]]; then
+            echo "::error::marketplace macf-agent/.claude-plugin/plugin.json not found at tag v${EXPECTED} (HTTP ${HTTP}). Bump + tag groundnuty/macf-marketplace to v${EXPECTED} before releasing."
+            exit 1
+          fi
+          MP_VERSION=$(node -p "require('/tmp/mp-plugin.json').version")
+          if [[ "$MP_VERSION" != "$EXPECTED" ]]; then
+            echo "::error::marketplace plugin.json version=${MP_VERSION} doesn't match release tag v${EXPECTED}. Bump groundnuty/macf-marketplace to v${EXPECTED}."
+            exit 1
+          fi
+          echo "marketplace plugin.json at v${EXPECTED} matches — lockstep OK."
+
       # Sigstore's transparency log is append-only; once an entry is
       # submitted, retrying the same tarball content gets 409
       # TLOG_CREATE_ENTRY_ERROR. A prior partially-failed publish run
