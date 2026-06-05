@@ -9,6 +9,55 @@ Plugin + routing-workflow changes ship from separate repos
 [`groundnuty/macf-actions`](https://github.com/groundnuty/macf-actions))
 and are not included here — pin them explicitly in each workspace.
 
+## [0.2.35] — 2026-06-05
+
+Hardening + structural-defense release from the post-Phase-5 build queue —
+closes the stale-instance / version-skew / auto-close hazard classes that
+surfaced during the A2A fleet work.
+
+### feat
+
+- **Version-aware collision takeover (#424).** A fresh channel-server running a
+  newer version now takes over from an alive instance running an *older* version
+  instead of deferring to it forever — closing the "alive-but-obsolete instance
+  squats the registry slot" class (the Phase 5 stale archaeologist that needed a
+  hand-kill). `/health` carries `version`; missing version = oldest;
+  `MACF_NO_VERSION_TAKEOVER=1` escape hatch. `compareSemver` moved to macf-core.
+- **PreToolUse close-keyword guard hook (#431).** `check-close-keyword.sh` blocks
+  `gh pr create`/`edit` whose body or title would auto-close another agent's
+  issue (close-keyword adjacent to a `#N` / `owner/repo#N` they filed). Path-2
+  structural backstop for the recurring auto-close hazard; authorship is the
+  discriminator (self-filed passes); `MACF_SKIP_CLOSE_CHECK=1` escape. Wired by
+  `macf init`/`update`/`rules refresh`.
+
+### reliability
+
+- **OTEL `gen_ai.agent.name` resource attr (#427).** `buildResource` now merges
+  `OTEL_RESOURCE_ATTRIBUTES` (via the env detector) into the channel-server
+  resource, so exported spans carry `gen_ai.agent.name` / `gen_ai.agent.role` /
+  `service.namespace` (not just `service.name`). `defaultResource()` doesn't run
+  the env detector on its own (@opentelemetry/resources 2.7.0).
+
+### fix
+
+- **Pin the channel-server version in plugin `mcpServers` (#421).**
+  `macf init`/`update` rewrite the mounted `npx` args to
+  `@groundnuty/macf-channel-server@<cli-version>`, so a bare-npx cache hit can't
+  silently serve a stale channel-server after a version bump.
+
+### chore / ci
+
+- **Marketplace is the single source of truth for the plugin manifest (#426).**
+  Removed the vestigial repo `plugin.json` (→ README pointer); added a
+  release-time version-lockstep check in `publish.yml` that fails the publish if
+  the marketplace plugin.json at the tag lags the release version. (This release
+  is the first to pass under that gate.)
+- **Stop-hook latency (#416).** Skip the turn-end `make check` when no
+  build-affecting working-tree changes exist.
+- **Routing pin → macf-actions v1.3.2 (#432).** `route-by-pr-review-state`
+  backported to the v1.x SSH/tmux line so `gh pr review --approve` notifies the
+  PR author; fleet pins bumped.
+
 ## [0.2.34] — 2026-06-05
 
 A2A receiver-side delivery — closes the "A2A routes but agents don't
