@@ -163,6 +163,25 @@ Both classes share "multi-step pipeline where consumer assumes atomicity" but th
 
 **Codification rationale:** 3 instances across 2 trigger mechanisms + defense pattern stable + operator-witnessed across 2 calendar days (2026-05-18 + 2026-05-19) + cross-agent (instance 1 via science-agent's authoring; instances 2/3 via code-agent's release-cut workflow) — meets all four "When to add a new instance" criteria. The sister-class question (separate `partial-side-effect-hazards.md` canonical rule) is acknowledged inline + deferred to the 5-instance threshold per rule-promotion convention.
 
+### Instance 10 — Routing send-logged / receipt-unlogged at the Stage-2 tmux last-mile
+
+**Surface:** the GHA→tmux routing last-mile in macf-actions `route-by-*` jobs — the `ssh … tmux send-keys` (or `tmux-send-to-claude.sh` helper) delivery of a routed prompt to a substrate agent's session.
+
+**Failure shape:** the router logs what it *attempted* (`Routed … via helper` / `via inline` / `… offline, skipping`) but **never whether the agent received + processed the prompt as a turn**. send-logged ≠ received. Two sub-cases, both 2026-06-05 (groundnuty/macf#437):
+
+- **#416-class (offline-misdetect):** a transient SSH / `tmux has-session` failure false-negatived a live-but-busy agent → `offline, skipping` → the routed prompt dropped entirely. (A `set -euo pipefail` interaction made it worse — a bare probe command-substitution aborted the whole step on ssh-255 before any retry could run.)
+- **#436-class (delivered-not-processed):** delivered via the inline `send-keys` path (because `workspace_dir` was unset → not the helper) but landed mid-turn and was clobbered by the next ping's `C-u` → never became a processed turn.
+
+Both were invisible until "PR sat unmerged" was cross-referenced against the router run logs — the run logs are auditable, but the tmux last mile has **no receipt signal**.
+
+**Recurrence:** 2 (#416 07:10Z; #436 09:17Z) on 2026-06-05, two distinct causes (offline-misdetect; inline-clobber).
+
+**Canonical defense:** three-part — two shipped, one structural-tracked:
+
+- **Config (`workspace_dir`, #443 / #268 / #81):** lands the reliable helper (handles the multi-line submit-quirk) instead of raw inline → closes the #436-class.
+- **Probe-hardening (macf-actions v1.3.3, #437 causes 2/3):** split the liveness probe from delivery, retry, classify alive/absent/unknown, **attempt-on-ambiguity** (only a genuine `absent` skips) + `|| true` so `set -e` can't abort on a transient ssh-255 → closes the #416-class + makes the send-path greppable (distinct `via helper` / `via inline` / `delivery FAILED` / `session not found` logging).
+- **Receipt close (structural, NOT yet shipped — #444):** v1.3.3 makes the gap *greppable*, not *closed* — the tmux last mile still emits no receipt signal. The structural close is migrating substrate routing to the channel-server/A2A path, where `notify_received` / `mcp_pushed` / `tmux_wake_delivered` (channel.log) + the OTel spans (`macf.mcp.push`, `macf.tmux_wake.deliver`) already capture receipt — as the Phase 5 #428/#429 work demonstrated for the CV fleet.
+
 ---
 
 ## How to recognize the class on first encounter
@@ -306,7 +325,7 @@ Silent-fallback hazards are **architectural**, not implementation bugs. They eme
 
 For coordination-system safety analysis: this is a class of hazards multi-agent systems must explicitly defend against. Each new instance teaches the same lesson; the class-name is what makes the lesson transferable across agents.
 
-### Defense-pattern emergence (7-of-9 known instances have structural defense applied or shipped)
+### Defense-pattern emergence (8-of-10 known instances have structural defense applied or shipped)
 
 | Instance | Surface | Structural defense | Pattern |
 |---|---|---|---|
@@ -319,6 +338,7 @@ For coordination-system safety analysis: this is a class of hazards multi-agent 
 | 7 — OTel-counter cumulative-state vs short-lived-process lifecycle | Metric-instrumentation lifecycle | Two-phase: doc workaround `sum(increase(...))` + OTel SDK delta temporality | Pattern A |
 | 8 — OTLP endpoint silent-drop | Observability-endpoint routing | Five-surface defense: CLI release-discipline + substrate testers env-override + canonical template `:14318` default + cluster-side compat port-map + agent-process `doctor-otel.sh` Pattern A | Pattern A (composite — first multi-architectural-layer case in this rule; instances 1-7 have single-pattern defenses) |
 | 9 — Sigstore TLOG orphans on failed npm publish (sister-class) | npm publish + sigstore attestation pipeline | Three-defense composite: bump-version recovery (DR-022 Amendment L) + pre-flight registry-collision check (Pattern D analog, macf#380) + TLOG-state observability (devops-toolkit#74+#77 Grafana dashboard live) | Pattern D analog (pre-flight precheck) + recovery-procedure-codification |
+| 10 — Routing send-logged / receipt-unlogged (Stage-2 tmux last-mile) | GHA→tmux substrate routing | Config (`workspace_dir` #443/#268/#81 → reliable helper) + probe-hardening (macf-actions v1.3.3, attempt-on-ambiguity + `\|\| true` so `set -e` can't abort on ssh-255) make the gap greppable + close the #416/#436 sub-cases; structural receipt-signal close tracked #444 | Pattern B/C (probe + helper) — receipt-signal close pending (#444) |
 
 Seven of nine instances have structural defense applied or shipped. Defense patterns (A, B, C, D, E) generalize across instances — they're reusable defense templates, not case-specific fixes. **Pattern A (result-invariant assertion at the boundary) bears the most weight** — it's the structural defense for instances 4, 7, AND 8 (3 of 9), each at a different architectural boundary (logs pipeline, metric counter, observability endpoint). Instance 8's five-surface defense topology (consumer canonical + cluster-side compat port-map + concrete Pattern A impl) demonstrates that structural defense at the observability-pipeline-class can compose across architectural layers — the canonical-distribution layer + the cluster-infrastructure layer + the assertion-script layer all reinforce each other rather than substituting for each other. Instance 9 demonstrates that the Pattern D template generalizes from workflow-secrets-prechecks to release-pipeline-prechecks AND that recovery-procedure-codification (DR-022 Amendment L's bump-version-not-tag-retry) is its own defense category — distinct from detection-pre-merge defenses (Patterns A/B/D) and discrimination-at-receiver defenses (Pattern E).
 
