@@ -42,13 +42,13 @@ COMMAND="$(jq -r '.tool_input.command // ""' <<<"$INPUT_JSON" 2>/dev/null || ech
 
 # Wrapper-aware match for `gh pr create` / `gh pr edit`. Mirrors check-gh-
 # token.sh / check-mention-routing.sh — covers sudo, env VAR=, watch, ionice,
-# setsid, nice, time prefix wrappers + chained-form leadins `;` `|` `&` + bare
-# `VAR=val gh ...`. These are the two subcommands whose body/title lands in the
-# merge commit (and thus can auto-close on merge).
-GH_PR_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|watch[[:space:]]+|ionice[[:space:]]+|setsid[[:space:]]+|nice[[:space:]]+|time[[:space:]]+|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+pr[[:space:]]+(create|edit)([[:space:]]|$)'
+# setsid, nice, time prefix wrappers + chained-form leadins `;` `|` `&` `(`
+# (subshell) + bare `VAR=val gh ...`. These are the two subcommands whose
+# body/title lands in the merge commit (and thus can auto-close on merge).
+GH_PR_PATTERN='(^|[[:space:];|&(])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|watch[[:space:]]+|ionice[[:space:]]+|setsid[[:space:]]+|nice[[:space:]]+|time[[:space:]]+|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+pr[[:space:]]+(create|edit)([[:space:]]|$)'
 
 # Shell-wrapper bypass: `bash -c "gh pr create ..."` and variants.
-SHELL_C_GH_PR_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+[^[:space:]].*gh[[:space:]]+pr[[:space:]]+(create|edit)([[:space:]]|$)'
+SHELL_C_GH_PR_PATTERN='(^|[[:space:];|&(])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+[^[:space:]].*gh[[:space:]]+pr[[:space:]]+(create|edit)([[:space:]]|$)'
 
 if [[ ! "$COMMAND" =~ $GH_PR_PATTERN ]] && [[ ! "$COMMAND" =~ $SHELL_C_GH_PR_PATTERN ]]; then
   exit 0
@@ -61,7 +61,10 @@ fi
 # in a workspace with no identity env — handled conservatively below.
 ACTING_BOT=""
 if [[ -n "${MACF_AGENT_NAME:-}" ]]; then
-  ACTING_BOT="${MACF_AGENT_NAME}[bot]"
+  # Strip a trailing `[bot]` first so a misconfigured MACF_AGENT_NAME that
+  # already carries it doesn't become `<name>[bot][bot]` (which would
+  # mis-block self-filed closes). Append exactly once.
+  ACTING_BOT="${MACF_AGENT_NAME%"[bot]"}[bot]"
 elif [[ -n "${GIT_AUTHOR_NAME:-}" && "${GIT_AUTHOR_NAME}" == *"[bot]" ]]; then
   ACTING_BOT="${GIT_AUTHOR_NAME}"
 fi
@@ -77,6 +80,17 @@ fi
 # ── Build the scan text: the raw command (covers inline --body, --title, and
 #    heredoc text) plus the contents of any --body-file (a file path, NOT an
 #    inline arg — the bypass most likely to slip a body-only scan). ─────────
+# `-F` is gh's documented short alias for `--body-file` (`gh pr create --help`:
+# `-F, --body-file file`), so normalize the space/`=` forms `-F path` / `-F=path`
+# → `--body-file …` before extraction, else a peer close-keyword in a `-F`-passed
+# file slips the scan (groundnuty/macf#431 review must-fix 1).
+#
+# Known inherent non-guards (backstop, not airtight): `--body-file -` / `-F -`
+# (stdin — unreadable at hook-fire time); the glued short form `-Fpath`; and a
+# path-prefixed binary (`/usr/bin/gh pr create …`, where the leading boundary
+# class doesn't see a bare `gh`). The authorship+merge-time reality still
+# catches the common forms; these are documented so they're known, not silent.
+NORM_CMD="$(sed -E 's/(^|[[:space:]])-F([ =])/\1--body-file\2/g' <<<"$COMMAND")"
 SCAN_TEXT="$COMMAND"
 while IFS= read -r bf; do
   [[ -z "$bf" ]] && continue
@@ -84,7 +98,7 @@ while IFS= read -r bf; do
   if [[ -f "$bf" ]]; then
     SCAN_TEXT+=$'\n'"$(cat "$bf" 2>/dev/null || true)"
   fi
-done < <(grep -oE -- '--body-file[ =][^[:space:]]+' <<<"$COMMAND" | sed -E 's/^--body-file[ =]//' || true)
+done < <(grep -oE -- '--body-file[ =][^[:space:]]+' <<<"$NORM_CMD" | sed -E 's/^--body-file[ =]//' || true)
 
 # ── Find close-keyword → issue-ref adjacencies ───────────────────────────
 # Mirrors GitHub's actual parser: the keyword must be a whole word
@@ -94,10 +108,11 @@ done < <(grep -oE -- '--body-file[ =][^[:space:]]+' <<<"$COMMAND" | sed -E 's/^-
 # `closes groundnuty/macf#418` in a devops-toolkit PR — lands in the squash
 # commit + closes the referenced repo's issue).
 KW_ALT='close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved'
-# Optional `:` (GitHub also auto-closes `Closes: #5`), then whitespace, then
-# the ref with an optional `owner/repo` prefix. The leading boundary `[^A-Za-z]`
-# (or line start) keeps `unfixes #1` / `prefixes #1` from matching.
-ADJ_RE="(^|[^A-Za-z])(${KW_ALT}):?[[:space:]]+([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+"
+# After the keyword, either a `:` + optional space (`Closes: #5` AND `Closes:#5`)
+# OR required whitespace (`Closes #5`) — but NOT `closes#5` (no separator, which
+# GitHub does not auto-close). The leading boundary `[^A-Za-z]` (or line start)
+# keeps `unfixes #1` / `prefixes #1` from matching.
+ADJ_RE="(^|[^A-Za-z])(${KW_ALT})(:[[:space:]]*|[[:space:]]+)([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+"
 
 # grep -o yields each match including the optional leading boundary char;
 # strip it so each token is `<kw>[ ](<owner/repo>)?#N`.
@@ -108,10 +123,13 @@ MATCHES="$(grep -oiE "$ADJ_RE" <<<"$SCAN_TEXT" | sed -E 's/^[^A-Za-z]+//' || tru
 # Returns one of: NOTFOUND (no such issue → safe, no auto-close target),
 # OK:<PR|ISSUE>:<login>, or APIERROR:<msg>.
 resolve_issue() {
-  local repo="$1" num="$2" out rc err
-  out="$(GH_PAGER= gh api "repos/${repo}/issues/${num}" 2>/dev/null)"; rc=$?
+  local repo="$1" num="$2" out rc err errfile
+  # Single gh call: capture stdout + stderr + rc atomically so the
+  # success/404/error classification can't split across two flaky calls.
+  errfile="$(mktemp)"
+  out="$(GH_PAGER= gh api "repos/${repo}/issues/${num}" 2>"$errfile")"; rc=$?
+  err="$(cat "$errfile" 2>/dev/null || true)"; rm -f "$errfile"
   if [[ $rc -ne 0 ]]; then
-    err="$(GH_PAGER= gh api "repos/${repo}/issues/${num}" 2>&1 >/dev/null || true)"
     if grep -qiE '404|not found' <<<"$err"; then
       echo "NOTFOUND"
     else

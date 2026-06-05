@@ -208,14 +208,16 @@ describe('check-close-keyword.sh (hook)', () => {
     });
   });
 
-  describe('--body-file (the file-content bypass) → BLOCK', () => {
-    it('reads the --body-file contents and blocks a peer close-keyword', () => {
+  describe('--body-file / -F (the file-content bypass) → BLOCK', () => {
+    // Helper: write a body file with a peer close-keyword, run the hook with
+    // the given flag form, assert it blocks.
+    function expectBlockViaBodyFile(flag: (path: string) => string): void {
       const dir = mkdtempSync(join(tmpdir(), 'macf-close-bodyfile-'));
       const bf = join(dir, 'body.md');
       writeFileSync(bf, 'Implements the fix.\n\nresolves #5\n');
       try {
         const r = runHook({
-          command: `gh pr create --repo groundnuty/macf --title x --body-file ${bf}`,
+          command: `gh pr create --repo groundnuty/macf --title x ${flag(bf)}`,
           stubGh: { 'groundnuty/macf#5': { author: PEER } },
         });
         expect(r.status).toBe(2);
@@ -223,6 +225,57 @@ describe('check-close-keyword.sh (hook)', () => {
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
+    }
+
+    it('reads the --body-file contents and blocks a peer close-keyword', () => {
+      expectBlockViaBodyFile((p) => `--body-file ${p}`);
+    });
+
+    // Review must-fix 1: `-F file` is gh's documented short alias for
+    // `--body-file`; a peer close-keyword in a -F-passed file must NOT slip.
+    it('reads the `-F file` short-alias contents and blocks (review must-fix 1)', () => {
+      expectBlockViaBodyFile((p) => `-F ${p}`);
+    });
+
+    it('reads the `-F=file` short-alias contents and blocks', () => {
+      expectBlockViaBodyFile((p) => `-F=${p}`);
+    });
+  });
+
+  // Review must-fix 2: the wrapper-bypass guards (SHELL_C_GH_PR_PATTERN +
+  // sudo/env/subshell prefixes) are real but were previously untested — a
+  // regression breaking them would have passed CI.
+  describe('wrapper / subshell bypass coverage (review must-fix 2)', () => {
+    it('blocks `sudo gh pr create … closes #peer`', () => {
+      const r = runHook({
+        command: 'sudo gh pr create --repo groundnuty/macf --title x --body "closes #5"',
+        stubGh: { 'groundnuty/macf#5': { author: PEER } },
+      });
+      expect(r.status).toBe(2);
+    });
+
+    it('blocks `bash -c "gh pr create … closes #peer"` (SHELL_C path)', () => {
+      const r = runHook({
+        command: `bash -c 'gh pr create --repo groundnuty/macf --title x --body "closes #5"'`,
+        stubGh: { 'groundnuty/macf#5': { author: PEER } },
+      });
+      expect(r.status).toBe(2);
+    });
+
+    it('blocks a subshell `(gh pr create … closes #peer)` (leading `(` boundary)', () => {
+      const r = runHook({
+        command: '(gh pr create --repo groundnuty/macf --title x --body "closes #5")',
+        stubGh: { 'groundnuty/macf#5': { author: PEER } },
+      });
+      expect(r.status).toBe(2);
+    });
+
+    it('blocks the colon-no-space form `Closes:#peer`', () => {
+      const r = runHook({
+        command: 'gh pr create --repo groundnuty/macf --title x --body "Closes:#5"',
+        stubGh: { 'groundnuty/macf#5': { author: PEER } },
+      });
+      expect(r.status).toBe(2);
     });
   });
 
@@ -288,6 +341,17 @@ describe('check-close-keyword.sh (hook)', () => {
         command: 'gh pr create --repo groundnuty/macf --title x --body "closes #9"',
         stubGh: { 'groundnuty/macf#9': { author: SELF } },
         env: { MACF_AGENT_NAME: undefined, GIT_AUTHOR_NAME: SELF },
+      });
+      expect(r.status).toBe(0);
+    });
+
+    // Misconfig edge: MACF_AGENT_NAME already carrying `[bot]` must not become
+    // `<name>[bot][bot]` (which would mis-block a self-filed close).
+    it('handles a MACF_AGENT_NAME that already includes [bot] (no double-suffix mis-block)', () => {
+      const r = runHook({
+        command: 'gh pr create --repo groundnuty/macf --title x --body "closes #9"',
+        stubGh: { 'groundnuty/macf#9': { author: SELF } },
+        env: { MACF_AGENT_NAME: SELF }, // SELF = 'macf-code-agent[bot]'
       });
       expect(r.status).toBe(0);
     });
