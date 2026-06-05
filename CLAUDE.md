@@ -55,32 +55,44 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 ## Implementation Status
 
 P1–P7 all implemented. Post-P7 work is bug-fix + security + hardening driven
-by issue queue and periodic audits. **Current state**: `main` is at v0.2.33
-(`927afae` bump-commit). **LIVE on npm: v0.2.33 across all 3 packages with
-provenance attestations** — cut 2026-06-04 via OIDC Trusted Publishers (the
-canonical post-recovery path: bump+tag → auto-publish, no npm-token step;
-v0.2.32 recovery arc from v0.2.29-failure documented in `CHANGELOG.md`
-[0.2.32]). **v0.2.33 = reliability + observability release surfaced by the
-Phase 5 A2A live-fleet verification** (#406/#368): #423 (silent A2A→legacy
-fallback warns) + #425 (otel_init/otel_init_skipped startup announce, AC-5
-diagnostic) + #419 (OTLP default localhost→127.0.0.1) + Phase 4/5 docs +
-DR-022 Amendments N+O. See `CHANGELOG.md` [0.2.33].
+by issue queue and periodic audits. **Current state**: `main` is at v0.2.35
+(`3a7b7c6` bump-commit). **LIVE on npm: v0.2.35 across all 3 packages with
+provenance attestations** — cut 2026-06-05 via OIDC Trusted Publishers (bump+tag
+→ auto-publish, no npm-token step). **v0.2.35 = the post-Phase-5 hardening queue
+shipped in one release** — closing the stale-instance / version-skew /
+auto-close hazard classes that surfaced during the A2A fleet work:
+- **#424** — version-aware collision takeover (a fresh newer instance displaces
+  an alive *older* one; missing-version=oldest; `MACF_NO_VERSION_TAKEOVER=1`
+  escape; `compareSemver` moved to macf-core). Closes the #422 stale-squat class.
+- **#431** — `check-close-keyword.sh` PreToolUse hook (blocks `gh pr create/edit`
+  auto-closing another agent's issue; authorship discriminator; `-F`/wrapper
+  coverage; `MACF_SKIP_CLOSE_CHECK=1`). Path-2 fix for the 4×-recurring auto-close.
+- **#427** — OTEL `gen_ai.agent.name` resource attr (`buildResource` merges
+  `OTEL_RESOURCE_ATTRIBUTES` via envDetector). Code shipped; issue OPEN pending
+  the live Tempo verify on next CV relaunch (science verifies, code-agent closes).
+- **#421** — pin the channel-server version in plugin `mcpServers` args at
+  `macf init/update` (bare-npx cache can't serve a stale cs; cs = cli version).
+- **#426** — marketplace-is-source for the plugin manifest (vestigial repo
+  `plugin.json` → README pointer) + a release-time version-lockstep check in
+  `publish.yml` (it PASSED its first run gating the v0.2.35 publish).
+- **#416** — Stop-hook latency (skip turn-end `make check` when no
+  build-affecting changes).
+See `CHANGELOG.md` [0.2.35]. Earlier: v0.2.33 (reliability #419/#423/#425) +
+v0.2.34 (A2A Phase 3.5 receiver-delivery #428/#429 + #418 OTEL).
 
-**Phase 5 A2A status (post-v0.2.33)**: A2A routing WORKS on the live CV
-fleet (Bug-1 — stale registry-squatter instance — resolved operationally
-2026-06-04). Remaining: AC-5 channel-server-export gap (freshly-launched CV
-channel-servers emit no OTEL spans; A2A routes but spans invisible).
-Candidate B (localhost→::1) refuted; Candidate A (OTEL env not reaching the
-MCP child) standing. v0.2.33's #425 diagnostic confirms A on next CV
-relaunch via channel.log `otel_init_skipped`. If A: fix = plugin `mcpServers`
-env propagation to the channel-server child (mind the known Claude Code
-`env`-block bug anthropics/claude-code#28332 — verify-then-trust).
-Tracked: #422 (AC-5), #424 (collision version-aware takeover enhancement),
-#421 (npx version-pin hardening, de-linked). 24 DRs (DR-019 Amendment A SHIPPED v0.2.27; DR-022
-Amendment M SHIPPED v0.2.30 bump-commit; both LIVE via v0.2.32), 9 phase
-specs (added `P-A2A-phase-2.md`, `P-A2A-phase-2d.md`, `P-A2A-phase-3.md`),
-13 canonical rules (silent-fallback Instance 9 added via #403), 16
-research notes.
+**Phase 5 A2A status: CLOSED.** Full bidirectional A2A v1.0 live + observable on
+the real CV fleet. Bug-1 (stale registry-squatter) resolved operationally + now
+structurally (#424); Bug-2 (#423 warns); AC-5 export gap fixed (marketplace
+v0.2.33 `mcpServers.env` block + #427 resource attrs); receiver-side delivery
+verified (#428/#429 — science co-verified Tempo trace + channel.log + TUI). The
+`gen_ai.agent.name` resource-attr (#427) is the last observability nicety,
+pending its operator-timed Tempo verify on the next CV relaunch to cs 0.2.35.
+**Routing**: macf-actions **v1.3.2** cut (#432) — `route-by-pr-review-state`
+reimplemented on the v1.x SSH/tmux primitive so `gh pr review --approve` notifies
+the PR author; fleet pins (macf/testbed/devops-toolkit) bumped; AC-6 proven live.
+The post-Phase-5 build queue is now CLEARED; **#427 is the only open issue** (its
+Tempo verify) + #439 filed (register-TOCTOU CAS, backlog). 24 DRs, 9 phase specs,
+13 canonical rules, 16 research notes.
 
 **A2A integration arc** (master tracking #368): **full bidirectional v1.0
 surface LIVE on npm via v0.2.32**:
@@ -109,9 +121,10 @@ surface LIVE on npm via v0.2.32**:
   MACF_OUTBOUND_LEGACY=1 + 'custom' event → legacy preserved;
   `macf.outbound.protocol` + `OutboundTargetUrl` + `A2aTaskId` +
   `A2aTaskState` tracing attrs)** ✓ RELEASED
-- Phase 3.5 — receiver-side wake-decision on `/a2a/v1` for `custom`
-  events; reactive-deferral (no time pressure); trigger = first
-  operator-driven `custom` event on A2A path
+- **Phase 3.5 (#428/#429, v0.2.34 — receiver-side delivery on `/a2a/v1`:
+  `onNotify`(mcp_push + decideWake) after Task creation; sender
+  `custom→legacy` carve-out lifted; Pattern E preserved at the receiver)**
+  ✓ RELEASED + live-verified on the CV fleet (science co-verified)
 - Phase 3.6 — wire-form convergence with Python a2a-sdk JSON-RPC
   dispatcher; reactive-deferral; trigger = SDK stabilization OR external
   client surfacing the form-mismatch (3 forms documented in design doc:
