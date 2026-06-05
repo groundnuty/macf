@@ -19,7 +19,7 @@
  * those are integration concerns (`test/e2e/` scope, follow-up PR).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { bootstrapOtel } from '../src/otel.js';
+import { bootstrapOtel, buildResource } from '../src/otel.js';
 
 describe('bootstrapOtel', () => {
   let originalEnv: string | undefined;
@@ -163,5 +163,58 @@ describe('bootstrapOtel', () => {
 
       vi.doUnmock('@opentelemetry/sdk-trace-node');
     });
+  });
+});
+
+describe('buildResource (macf#427 — gen_ai.agent.name resource attrs)', () => {
+  let originalRA: string | undefined;
+
+  beforeEach(() => {
+    originalRA = process.env['OTEL_RESOURCE_ATTRIBUTES'];
+  });
+  afterEach(() => {
+    if (originalRA === undefined) delete process.env['OTEL_RESOURCE_ATTRIBUTES'];
+    else process.env['OTEL_RESOURCE_ATTRIBUTES'] = originalRA;
+  });
+
+  it('lands gen_ai.agent.name / gen_ai.agent.role / service.namespace from OTEL_RESOURCE_ATTRIBUTES', async () => {
+    process.env['OTEL_RESOURCE_ATTRIBUTES'] =
+      'gen_ai.agent.name=cv-architect,gen_ai.agent.role=architect,service.namespace=macf';
+    const resources = await import('@opentelemetry/resources');
+    const semconv = await import('@opentelemetry/semantic-conventions');
+
+    const r = buildResource(resources, semconv, 'macf-agent-cv-architect', '0.2.34');
+
+    // The bug (groundnuty/macf#427): defaultResource() alone leaves these <UNSET>.
+    expect(r.attributes['gen_ai.agent.name']).toBe('cv-architect');
+    expect(r.attributes['gen_ai.agent.role']).toBe('architect');
+    expect(r.attributes['service.namespace']).toBe('macf');
+    // Explicit service.* still applied.
+    expect(r.attributes['service.name']).toBe('macf-agent-cv-architect');
+    expect(r.attributes['service.version']).toBe('0.2.34');
+  });
+
+  it('still sets service.name/version when OTEL_RESOURCE_ATTRIBUTES is unset', async () => {
+    delete process.env['OTEL_RESOURCE_ATTRIBUTES'];
+    const resources = await import('@opentelemetry/resources');
+    const semconv = await import('@opentelemetry/semantic-conventions');
+
+    const r = buildResource(resources, semconv, 'macf-agent-code-agent', '1.2.3');
+
+    expect(r.attributes['service.name']).toBe('macf-agent-code-agent');
+    expect(r.attributes['service.version']).toBe('1.2.3');
+    expect(r.attributes['gen_ai.agent.name']).toBeUndefined();
+  });
+
+  it('explicit service.name wins over a service.name carried in OTEL_RESOURCE_ATTRIBUTES', async () => {
+    process.env['OTEL_RESOURCE_ATTRIBUTES'] = 'service.name=from-env,gen_ai.agent.name=cv-x';
+    const resources = await import('@opentelemetry/resources');
+    const semconv = await import('@opentelemetry/semantic-conventions');
+
+    const r = buildResource(resources, semconv, 'macf-agent-cv-x', '0.2.34');
+
+    // Explicit merge is applied last → wins; env-only attrs still survive.
+    expect(r.attributes['service.name']).toBe('macf-agent-cv-x');
+    expect(r.attributes['gen_ai.agent.name']).toBe('cv-x');
   });
 });
