@@ -20,6 +20,12 @@
  */
 
 import { PACKAGE_VERSION } from '../package-version.js';
+import { compareSemver } from '@groundnuty/macf-core';
+
+// Re-exported for backward compatibility: `compareSemver` originated here, but
+// now lives in macf-core so the channel-server's collision check (groundnuty/
+// macf#424) shares one implementation. Existing importers keep working.
+export { compareSemver };
 
 export interface VersionSet {
   readonly cli: string;
@@ -99,23 +105,6 @@ export function isValidSemver(v: string): boolean {
 
 export function isValidActionsRef(v: string): boolean {
   return ACTIONS_TAG_PATTERN.test(v) || v === 'main';
-}
-
-/**
- * Compare two semver strings (x.y.z) numerically. Returns negative if a < b,
- * zero if equal, positive if a > b. Used to pick the highest tag from a list.
- */
-export function compareSemver(a: string, b: string): number {
-  const parse = (v: string): [number, number, number] => {
-    const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(v);
-    if (!m) return [0, 0, 0];
-    return [Number.parseInt(m[1]!, 10), Number.parseInt(m[2]!, 10), Number.parseInt(m[3]!, 10)];
-  };
-  const [aMaj, aMin, aPat] = parse(a);
-  const [bMaj, bMin, bPat] = parse(b);
-  if (aMaj !== bMaj) return aMaj - bMaj;
-  if (aMin !== bMin) return aMin - bMin;
-  return aPat - bPat;
 }
 
 /**

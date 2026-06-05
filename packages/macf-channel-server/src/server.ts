@@ -490,7 +490,10 @@ async function main(): Promise<void> {
   // P1: Bind port
   const { actualPort } = await httpsServer.start(config.port, config.host);
 
-  // P2: Collision detection
+  // P2: Collision detection. The HTTPS server is already bound + serving
+  // (P1 above), so a version-aware takeover (groundnuty/macf#424) only fires
+  // for an instance that can actually serve — a crash-on-boot newer instance
+  // never reaches here to strand the slot.
   const collisionResult = await checkCollision(
     config.agentName,
     registry,
@@ -499,6 +502,7 @@ async function main(): Promise<void> {
       agentCertPath: config.agentCertPath,
       agentKeyPath: config.agentKeyPath,
     },
+    PACKAGE_VERSION,
     logger,
   );
 
