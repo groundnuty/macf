@@ -574,8 +574,19 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
+  // Force a clean exit on any fatal bootstrap abort (groundnuty/macf#449).
+  // Both bootstrap-abort idioms — CollisionError and RegisterRaceError (#447)
+  // — throw out of main() to here. Setting `process.exitCode = 1` alone is
+  // NOT enough to terminate: the MCP stdio transport keeps stdin's readable
+  // stream open, so the event loop stays alive and the process *hangs*
+  // instead of exiting 1 (reproducible with a held-open stdin, e.g.
+  // `sleep 10 | node …`). `process.exit(1)` tears down regardless. We set
+  // exitCode first (so the code is correct even if the write callback never
+  // fires) and exit from the stderr-flush callback so the diagnostic isn't
+  // truncated on a pipe.
+  process.exitCode = 1;
   process.stderr.write(
     `Fatal: ${err instanceof Error ? err.message : String(err)}\n`,
+    () => process.exit(1),
   );
-  process.exitCode = 1;
 });
