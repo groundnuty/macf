@@ -80,6 +80,42 @@ auto-close hazard classes that surfaced during the A2A fleet work:
 See `CHANGELOG.md` [0.2.35]. Earlier: v0.2.33 (reliability #419/#423/#425) +
 v0.2.34 (A2A Phase 3.5 receiver-delivery #428/#429 + #418 OTEL).
 
+**Post-v0.2.35 (2026-06-05 marathon — merged to `main`, NOT yet npm-released;
+the next cut bundles these):**
+- **#447** (`reliability(registry)`) — `registerConditional` CAS closes the
+  collision-takeover TOCTOU (#439): local backend atomic under `withLock`;
+  GitHub backend pre-write-compare + post-write read-back (no native If-Match);
+  `server.ts` throws `RegisterRaceError` on CAS-loss; `agentInfoEquals` +
+  `RegisterResult` in macf-core. Science 800-concurrent-CAS stress = 0 double-wins.
+  + **#448** (doc-honesty: GH `ok:true` is eventually-reconciled, not exclusive;
+  local IS exclusive-at-return).
+- **#450** (`reliability(channel-server)`) — fatal bootstrap abort now
+  `process.exit(1)` in `main().catch` (#449): was exitCode-only → held-open MCP
+  stdin hung the loop. Covers CollisionError + RegisterRaceError paths.
+- **#452** (`fix(claude-sh)`) — substrate `claude.sh` had dropped
+  `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA` (the traces gate, required *beyond*
+  `CLAUDE_CODE_ENABLE_TELEMETRY=1`) → on-VM native OTEL emitted ZERO traces. Fix
+  adds it (defaults + LAUNCH_ENV inline) + a tripwire test pinning all 9 gates.
+  **Closed #418** — science Tempo-verified native `claude_code.interaction` spans
+  now emit post-relaunch. Canonical `claude-sh.ts`/`env-files.ts` already carried
+  the gate; the substrate hand-port dropped it (the #197 hand-port-drift class).
+  *(Debug lesson: the Bash-subprocess env is NOT a valid telemetry-config proxy —
+  Claude Code strips `OTEL_*` from subprocesses; go to the authoritative observable
+  (Tempo) early. ~10 turns lost cycling on the proxy before science went to Tempo.)*
+- **#444 Option-D arc** (receipt-observable substrate routing, structural close
+  of #437 cause-3 / send≠receipt): operator chose Option D (turn-ack hook over the
+  existing SSH+tmux substrate; substrate runs no channel-server, so A/B were out).
+  Design spec = `macf-science-agent` `research/2026-06-05-…-option-d-design.md`
+  (#29). **piece 1** = macf-actions#45 route-correlation marker
+  `[macf-route:${RUN_ID}:${AGENT}]` (merged to `release/v1.3.1`, UNRELEASED).
+  **piece 2** = `emit-turn-receipt.sh` `UserPromptSubmit` hook (#451, merged).
+  **GATE 0 PASSED** (science helper-injected a marked prompt → hook fired). **piece 4**
+  = reconciler core PR **#453** (drop-detection + router-log parser, 16 tests) IN-REVIEW;
+  part-2 (Tempo fetch/parse + entrypoint + scheduled workflow) + the rollout (macf-actions
+  release + 3 per-workspace substrate hook-sync PRs — substrate does NOT run `macf update`)
+  are next. Join key = MARKER-parsed `(runId, agent)` (not `MACF_AGENT_NAME`, unset on
+  substrate). **CLOSED 2026-06-05: #427** (AC-3 Tempo-verified), **#439**, **#449**, **#418**.
+
 **Phase 5 A2A status: CLOSED.** Full bidirectional A2A v1.0 live + observable on
 the real CV fleet. Bug-1 (stale registry-squatter) resolved operationally + now
 structurally (#424); Bug-2 (#423 warns); AC-5 export gap fixed (marketplace
@@ -100,12 +136,13 @@ cause-3 structural receipt-close → #444. **#368 A2A master umbrella CLOSED** (
 v1.0 complete + live-verified). silent-fallback Instance 10 documents the
 send≠receipt last-mile gap.
 
-The post-Phase-5 hardening queue is CLEARED. **Open issues:** #427
-(gen_ai.agent.name — code shipped in v0.2.35; AC-3 live Tempo verify OPERATOR-TIMED:
-CV `macf update` → cs 0.2.35 → science verifies → code-agent closes), #444
-(receipt-observable substrate routing — structural, backlog), #439 (register
-CAS/If-Match TOCTOU — backlog), #418 (claude-sh telemetry — devops), #224
-(NPM_TOKEN rotation). 24 DRs, 9 phase specs, 13 canonical rules, 16 research notes.
+The post-Phase-5 hardening queue is CLEARED, and the 2026-06-05 marathon (above)
+closed #427/#439/#449/#418. **Open issues:** **#444** (Option-D receipt-observable
+substrate routing — pieces 1+2 merged + GATE 0 passed; piece-4 reconciler core
+PR #453 in review; part-2 [Tempo fetch/parse + entrypoint + scheduled workflow] +
+the rollout [macf-actions release + 3 substrate hook-sync PRs] are next), #439's
+follow-ups #449 CLOSED, #224 (NPM_TOKEN rotation). 24 DRs, 9 phase specs, 13
+canonical rules, 16 research notes.
 
 **A2A integration arc** (master tracking #368): **full bidirectional v1.0
 surface LIVE on npm via v0.2.32**:
