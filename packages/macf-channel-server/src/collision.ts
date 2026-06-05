@@ -18,6 +18,29 @@ export class CollisionError extends MacfError {
   }
 }
 
+/**
+ * Thrown when the conditional registration loses a race (groundnuty/macf#439):
+ * the collision check decided to register/takeover, but between that read and
+ * the write a concurrent instance of the same identity claimed the slot. This
+ * instance aborts cleanly (the winner holds the slot) rather than silently
+ * clobbering it. `current` is the conflicting registration observed at write
+ * time (null if the slot was emptied in the window).
+ */
+export class RegisterRaceError extends MacfError {
+  constructor(name: string, current: AgentInfo | null) {
+    super(
+      'AGENT_REGISTER_RACE',
+      current === null
+        ? `Agent '${name}' lost a registration race: the slot changed between ` +
+          'the collision check and the write (now empty). Aborting; relaunch to retry.'
+        : `Agent '${name}' lost a registration race: another instance registered ` +
+          `concurrently (now ${current.host}:${current.port}, instance ${current.instance_id}). ` +
+          'Aborting; the winner holds the slot.',
+    );
+    this.name = 'RegisterRaceError';
+  }
+}
+
 const HEALTH_PING_TIMEOUT_MS = 5000;
 
 /** Result of a collision /health ping: liveness + the advertised version

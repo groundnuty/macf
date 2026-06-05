@@ -10,6 +10,7 @@ function mockLogger(): Logger {
 function mockRegistry(): Registry {
   return {
     register: vi.fn(),
+    registerConditional: vi.fn(),
     get: vi.fn(),
     list: vi.fn(),
     remove: vi.fn().mockResolvedValue(undefined),

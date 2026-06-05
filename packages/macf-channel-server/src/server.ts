@@ -18,7 +18,7 @@ import { buildAgentCard } from './agent-card.js';
 import { TaskStore } from './a2a-task.js';
 import { PACKAGE_VERSION } from './package-version.js';
 import { createRegistry, createRegistryFromConfig } from '@groundnuty/macf-core';
-import { checkCollision, CollisionError } from './collision.js';
+import { checkCollision, CollisionError, RegisterRaceError } from './collision.js';
 import { registerShutdownHandler } from './shutdown.js';
 import { createTokenRefresher } from './token-refresh.js';
 import { createRefreshAwareClient } from './refresh-aware-client.js';
@@ -524,7 +524,30 @@ async function main(): Promise<void> {
     started: new Date().toISOString(),
   };
 
-  await registry.register(config.agentName, agentInfo);
+  // P2: Conditional (CAS) write to close the read→write TOCTOU window
+  // (groundnuty/macf#439). The collision check above observed the slot as
+  // either absent (action 'register') or held by the takeover target (action
+  // 'takeover'). Write only if the slot still matches that observation — a
+  // concurrent same-identity instance that registered in the window makes this
+  // write a no-op and aborts us cleanly, rather than silently clobbering it.
+  const expectedSlot =
+    collisionResult.action === 'takeover' ? collisionResult.previous : null;
+  const registerResult = await registry.registerConditional(
+    config.agentName,
+    agentInfo,
+    expectedSlot,
+  );
+  if (!registerResult.ok) {
+    logger.warn('register_race_lost', {
+      agent: config.agentName,
+      expected_instance: expectedSlot?.instance_id ?? null,
+      current_instance: registerResult.current?.instance_id ?? null,
+      current_host: registerResult.current?.host ?? null,
+      current_port: registerResult.current?.port ?? null,
+    });
+    await httpsServer.stop();
+    throw new RegisterRaceError(config.agentName, registerResult.current);
+  }
   logger.info('registered', {
     agent: config.agentName,
     host: config.advertiseHost,

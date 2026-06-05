@@ -35,6 +35,7 @@ vi.mock('@groundnuty/macf-core', async (importOriginal) => {
     generateToken: vi.fn().mockResolvedValue('fake-token-for-tests'),
     createRegistryFromConfig: () => ({
       register: vi.fn(),
+      registerConditional: vi.fn(),
       get: mockRegistryGet,
       list: vi.fn().mockResolvedValue([]),
       remove: vi.fn(),
