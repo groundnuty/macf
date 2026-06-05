@@ -13,6 +13,7 @@ const sampleInfo: AgentInfo = {
 function mockRegistry(getResult: AgentInfo | null = null, listResult: Array<{ name: string; info: AgentInfo }> = []): Registry {
   return {
     register: vi.fn(),
+    registerConditional: vi.fn(),
     get: vi.fn().mockResolvedValue(getResult),
     list: vi.fn().mockResolvedValue(listResult),
     remove: vi.fn(),

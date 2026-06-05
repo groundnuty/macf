@@ -26,6 +26,7 @@ function mockLogger(): Logger {
 function mockRegistry(getResult: AgentInfo | null = null): Registry {
   return {
     register: vi.fn(),
+    registerConditional: vi.fn(),
     get: vi.fn().mockResolvedValue(getResult),
     list: vi.fn().mockResolvedValue([]),
     remove: vi.fn(),

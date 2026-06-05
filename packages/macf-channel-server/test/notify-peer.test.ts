@@ -21,6 +21,7 @@ interface FakeRegistry {
   get: ReturnType<typeof vi.fn>;
   list: ReturnType<typeof vi.fn>;
   register: ReturnType<typeof vi.fn>;
+  registerConditional: ReturnType<typeof vi.fn>;
   remove: ReturnType<typeof vi.fn>;
 }
 
@@ -47,6 +48,7 @@ function makeRegistry(opts: {
     get: vi.fn().mockResolvedValue(opts.get ?? null),
     list: vi.fn().mockResolvedValue(opts.list ?? []),
     register: vi.fn(),
+    registerConditional: vi.fn(),
     remove: vi.fn(),
   };
 }

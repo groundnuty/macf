@@ -22,9 +22,9 @@ export type {
 } from '@groundnuty/macf-core';
 
 // P2: Registry & Discovery
-export { createRegistryFromConfig, createRegistry, createGitHubClient, GitHubApiError, AgentInfoSchema, RegistryConfigSchema } from '@groundnuty/macf-core';
-export type { AgentInfo, Registry, RegistryConfig, GitHubVariablesClient } from '@groundnuty/macf-core';
-export { checkCollision, CollisionError } from './collision.js';
+export { createRegistryFromConfig, createRegistry, createGitHubClient, GitHubApiError, AgentInfoSchema, agentInfoEquals, RegistryConfigSchema } from '@groundnuty/macf-core';
+export type { AgentInfo, Registry, RegisterResult, RegistryConfig, GitHubVariablesClient } from '@groundnuty/macf-core';
+export { checkCollision, CollisionError, RegisterRaceError } from './collision.js';
 export type { CollisionResult } from './collision.js';
 export { registerShutdownHandler } from './shutdown.js';
 export { generateToken } from '@groundnuty/macf-core';

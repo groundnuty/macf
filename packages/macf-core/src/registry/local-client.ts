@@ -4,8 +4,8 @@ import { randomBytes } from 'node:crypto';
 import lockfile from 'proper-lockfile';
 import { z } from 'zod';
 import { MacfError } from '../errors.js';
-import { AgentInfoSchema } from './types.js';
-import type { AgentInfo, Registry } from './types.js';
+import { AgentInfoSchema, agentInfoEquals } from './types.js';
+import type { AgentInfo, Registry, RegisterResult } from './types.js';
 
 /**
  * Local registry implementation per DR-024.
@@ -319,6 +319,38 @@ export function createLocalRegistry(
           agents: { ...file.agents, [name]: validated },
         };
         await writeRegistryFileAtomic(options.path, next);
+      });
+    },
+
+    // CAS register (groundnuty/macf#439). Fully atomic for the local backend:
+    // the read (current slot), the compare against `expected`, and the write
+    // all happen inside the same `withLock` critical section, so a racing
+    // second writer is serialized behind the lock and observes the first
+    // writer's value — failing the compare and backing off (ok:false). No
+    // read-back verify is needed (unlike the GitHub backend), because the lock
+    // makes the compare-then-write indivisible.
+    async registerConditional(
+      name: string,
+      info: AgentInfo,
+      expected: AgentInfo | null,
+    ): Promise<RegisterResult> {
+      const validated = AgentInfoSchema.parse(info);
+
+      return withLock(options.path, async (): Promise<RegisterResult> => {
+        const existing = await readRegistryFile(options.path);
+        const current = existing?.agents[name] ?? null;
+        if (!agentInfoEquals(current, expected)) {
+          return { ok: false, current };
+        }
+
+        const file: RegistryFile = existing ?? emptyRegistry(options.project);
+        const next: RegistryFile = {
+          schema_version: REGISTRY_SCHEMA_VERSION,
+          project: options.project,
+          agents: { ...file.agents, [name]: validated },
+        };
+        await writeRegistryFileAtomic(options.path, next);
+        return { ok: true, current: validated };
       });
     },
 

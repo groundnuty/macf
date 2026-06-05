@@ -12,10 +12,58 @@ export const AgentInfoSchema = z.object({
 
 export type AgentInfo = z.infer<typeof AgentInfoSchema>;
 
+/**
+ * Value equality for two `AgentInfo`s (or absence). `null` represents an
+ * empty registry slot; two nulls are equal, a null and a value are not.
+ * Used by the conditional-register CAS to compare the slot's observed
+ * state against its current state.
+ */
+export function agentInfoEquals(a: AgentInfo | null, b: AgentInfo | null): boolean {
+  if (a === null || b === null) return a === b;
+  return (
+    a.host === b.host &&
+    a.port === b.port &&
+    a.type === b.type &&
+    a.instance_id === b.instance_id &&
+    a.started === b.started
+  );
+}
+
+/**
+ * Outcome of a conditional (compare-and-set) register (groundnuty/macf#439).
+ *
+ * `ok: true`  — this instance now owns the slot; `current` is the value just
+ *               written (=== the `info` passed in).
+ * `ok: false` — a concurrent writer changed the slot between the collision
+ *               check and this write; `current` is the conflicting value
+ *               observed (null if the slot was emptied). The caller must NOT
+ *               treat itself as the registered owner — abort or re-check.
+ */
+export interface RegisterResult {
+  readonly ok: boolean;
+  readonly current: AgentInfo | null;
+}
+
 // --- Registry interface ---
 
 export interface Registry {
   readonly register: (name: string, info: AgentInfo) => Promise<void>;
+  /**
+   * Compare-and-set register (groundnuty/macf#439): write `info` only if the
+   * slot still matches `expected` (the value observed during the collision
+   * check; `null` = expected-absent). Closes the TOCTOU window between the
+   * collision check's read and the registration write — a racing second
+   * writer can't silently clobber the first. Returns whether this instance
+   * won the slot. Backends differ in atomicity: the local registry is fully
+   * atomic under its file lock; the GitHub-Variables backend narrows the
+   * window with a pre-write compare + post-write read-back verify (no native
+   * CAS primitive exists on that API — see registry.ts).
+   */
+  readonly registerConditional: (
+    name: string,
+    info: AgentInfo,
+    expected: AgentInfo | null,
+  ) => Promise<RegisterResult>;
   readonly get: (name: string) => Promise<AgentInfo | null>;
   readonly list: (prefix: string) => Promise<ReadonlyArray<{ readonly name: string; readonly info: AgentInfo }>>;
   readonly remove: (name: string) => Promise<void>;

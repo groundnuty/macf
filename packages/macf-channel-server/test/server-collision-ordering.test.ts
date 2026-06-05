@@ -38,9 +38,11 @@ describe('server.ts collision/serve/register ordering (macf#424 assumption 2)', 
     expect(startIdx).toBeLessThan(checkIdx);
   });
 
-  it('writes the registry slot (registry.register) only AFTER the collision check', () => {
+  it('writes the registry slot (registry.registerConditional) only AFTER the collision check', () => {
+    // The slot write is the CAS variant post-#439 — conditional on the state
+    // the collision check observed, so a racing second writer can't clobber.
     const checkIdx = SERVER_SOURCE.indexOf('checkCollision(');
-    const registerIdx = SERVER_SOURCE.indexOf('registry.register(');
+    const registerIdx = SERVER_SOURCE.indexOf('registry.registerConditional(');
     expect(registerIdx).toBeGreaterThan(-1);
     expect(checkIdx).toBeLessThan(registerIdx);
   });
