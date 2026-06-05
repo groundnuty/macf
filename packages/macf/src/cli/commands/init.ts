@@ -12,7 +12,7 @@ import { createCA, loadCA } from '@groundnuty/macf-core';
 import { generateAgentCert } from '@groundnuty/macf-core';
 import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
-import { fetchPluginToWorkspace } from '../plugin-fetcher.js';
+import { fetchPluginToWorkspace, pinChannelServerVersion } from '../plugin-fetcher.js';
 import { writeClaudeSh } from '../claude-sh.js';
 import { writeEnvFiles } from '../env-files.js';
 import {
@@ -427,7 +427,11 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // re-try with `macf update` once connectivity is back.
   try {
     fetchPluginToWorkspace(absDir, versions.plugin);
-    console.log(`  Plugin: fetched macf-agent@v${versions.plugin} to .macf/plugin/`);
+    // Pin the channel-server version in the mounted mcpServers args so a bare
+    // `npx` can't serve a stale cached cs (groundnuty/macf#421). cs ships with
+    // the CLI in the monorepo, so the cs version = versions.cli.
+    pinChannelServerVersion(absDir, versions.cli);
+    console.log(`  Plugin: fetched macf-agent@v${versions.plugin} to .macf/plugin/ (channel-server pinned @${versions.cli})`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`  Warning: plugin fetch failed: ${msg}`);

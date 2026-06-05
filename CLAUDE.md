@@ -322,7 +322,11 @@ One-off test: `devbox run -- npx vitest run test/path/to/file.test.ts`
 - Plugin ships via `groundnuty/macf-marketplace@v<version>` (separate repo)
   — `macf init` and `macf update` clone `macf-marketplace:macf-agent/` at
   the pinned tag into `<workspace>/.macf/plugin/`; `claude.sh` uses
-  `--plugin-dir` per DR-013
+  `--plugin-dir` per DR-013. The marketplace `mcpServers` args ship a BARE
+  `npx -y @groundnuty/macf-channel-server` spec; `macf init`/`update` rewrite
+  the mounted copy to pin `@<cli-version>` via `pinChannelServerVersion`
+  (macf#421) so a bare-npx cache hit can't silently serve a stale channel-server
+  (the cs version tracks the CLI in the monorepo, not the marketplace plugin tag)
 - Routing workflow ships via `groundnuty/macf-actions@v<version>` — consumers
   reference it from their `.github/workflows/agent-router.yml` via
   `uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3`

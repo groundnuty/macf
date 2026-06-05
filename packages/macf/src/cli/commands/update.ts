@@ -44,7 +44,7 @@ import { resolveLatestVersions } from '../version-resolver.js';
 import { copyCanonicalRules, copyCanonicalScripts, findCliPackageRoot } from '../rules.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
-import { fetchPluginToWorkspace, workspacePluginDir } from '../plugin-fetcher.js';
+import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion } from '../plugin-fetcher.js';
 import { writeClaudeSh } from '../claude-sh.js';
 import {
   refreshEnvFiles,
@@ -399,7 +399,8 @@ export async function update(
   if (config.versions && pluginDirNeedsRepair(workspacePluginDir(projectDir))) {
     try {
       fetchPluginToWorkspace(projectDir, config.versions.plugin);
-      console.log(`Repaired .macf/plugin/ with macf-agent@v${config.versions.plugin}`);
+      pinChannelServerVersion(projectDir, config.versions.cli); // groundnuty/macf#421
+      console.log(`Repaired .macf/plugin/ with macf-agent@v${config.versions.plugin} (channel-server pinned @${config.versions.cli})`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`Warning: plugin repair fetch failed: ${msg}`);
@@ -509,6 +510,19 @@ export async function update(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`Warning: plugin re-fetch failed: ${msg}`);
+    }
+  }
+
+  // Re-pin the channel-server version in the mounted mcpServers args
+  // (groundnuty/macf#421), regardless of WHICH component bumped: the cs version
+  // tracks the CLI (monorepo lockstep), so a CLI bump WITHOUT a plugin bump
+  // would otherwise leave the mounted plugin.json carrying a stale cs pin (the
+  // plugin re-fetch above only fires on a plugin bump). A fresh re-fetch resets
+  // the arg to the bare marketplace form, so this must run after it. Idempotent
+  // when the pin is already current.
+  if (existsSync(workspacePluginDir(projectDir))) {
+    if (pinChannelServerVersion(projectDir, newVersions.cli)) {
+      console.log(`Pinned channel-server @${newVersions.cli} in .macf/plugin/ mcpServers`);
     }
   }
 
