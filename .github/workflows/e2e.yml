@@ -324,7 +324,7 @@ jobs:
       # next run benefits.
       - name: Cache Python venv
         if: steps.gate.outputs.should_run == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: packages/macf-channel-server/node_modules/.cache/a2a-python-venv
           key: python-venv-${{ steps.sdk_version.outputs.version }}-${{ steps.sdk_version.outputs.depset }}-${{ runner.os }}
