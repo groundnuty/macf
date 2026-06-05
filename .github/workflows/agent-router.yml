@@ -1,9 +1,9 @@
 name: Agent Router
 
-# Delegates to the reusable workflow in groundnuty/macf-actions@v1.3.1
+# Delegates to the reusable workflow in groundnuty/macf-actions@v1.3.2
 # (see https://github.com/groundnuty/macf-actions for source).
 #
-# Pinned to immutable v1.3.1 rather than the floating @v1 tag so the
+# Pinned to immutable v1.3.2 rather than the floating @v1 tag so the
 # routing infrastructure macf itself depends on doesn't move without
 # an explicit PR here. When macf-actions cuts a new release, upgrade
 # the `uses:` ref by a dedicated PR on this repo — that gives the
@@ -18,6 +18,10 @@ on:
     types: [opened]
   pull_request_review:
     types: [submitted]
+  # Also feeds route-by-pr-review-state (macf-actions#432, v1.3.2+): an
+  # approved / changes_requested review notifies the PR author in their
+  # tmux session, so a `gh pr review` reaches the implementer without a
+  # manual @mention. No `on:`/permissions change — already declared above.
   # CI-completion routing (macf-actions#6, v1.3+). Fires the
   # route-by-ci-completion job so agent-authored PRs get notified
   # when CI finishes, eliminating the "post handoff + poll" pattern.
@@ -36,5 +40,5 @@ permissions:
 
 jobs:
   route:
-    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v1.3.1
+    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v1.3.2
     secrets: inherit
