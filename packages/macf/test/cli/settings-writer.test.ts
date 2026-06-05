@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
 
 describe('installGhTokenHook', () => {
   let tmpRoot: string;
@@ -158,6 +158,58 @@ describe('installGhTokenHook', () => {
     expect(macfEntries[0].hooks[0].command).toBe(MACF_HOOK_COMMAND);
     // --old-flag should be gone.
     expect(macfEntries[0].hooks[0].command).not.toContain('--old-flag');
+  });
+
+  // ── UserPromptSubmit turn-ack receipt hook (groundnuty/macf#444) ──
+
+  it('installs the UserPromptSubmit turn-receipt hook (async, no matcher)', () => {
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(s.hooks.UserPromptSubmit).toHaveLength(1);
+    const entry = s.hooks.UserPromptSubmit[0];
+    // UserPromptSubmit isn't tool-gated → no matcher (unlike the Bash PreToolUse hooks).
+    expect(entry.matcher).toBeUndefined();
+    expect(entry.hooks[0].type).toBe('command');
+    expect(entry.hooks[0].command).toBe(MACF_TURN_RECEIPT_HOOK_COMMAND);
+    // async so it never adds turn latency / can't block on a slow OTLP endpoint.
+    expect(entry.hooks[0].async).toBe(true);
+  });
+
+  it('MACF_TURN_RECEIPT_HOOK_COMMAND uses $CLAUDE_PROJECT_DIR (cwd-independent)', () => {
+    expect(MACF_TURN_RECEIPT_HOOK_COMMAND).toBe(
+      '$CLAUDE_PROJECT_DIR/.claude/scripts/emit-turn-receipt.sh',
+    );
+  });
+
+  it('preserves operator-authored UserPromptSubmit hooks when adding ours', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: './my-ups-hook.sh' }] }],
+      },
+    }, null, 2));
+
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(s.hooks.UserPromptSubmit).toHaveLength(2);
+    const cmds = s.hooks.UserPromptSubmit.flatMap((e: { hooks: { command: string }[] }) =>
+      e.hooks.map((h) => h.command),
+    );
+    expect(cmds).toContain('./my-ups-hook.sh');
+    expect(cmds).toContain(MACF_TURN_RECEIPT_HOOK_COMMAND);
+  });
+
+  it('UserPromptSubmit install is idempotent (no duplicate macf entry)', () => {
+    installGhTokenHook(tmpRoot);
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const macfUps = s.hooks.UserPromptSubmit.filter((e: { hooks: { command: string }[] }) =>
+      e.hooks.some((h) => h.command.includes('emit-turn-receipt.sh')),
+    );
+    expect(macfUps).toHaveLength(1);
   });
 
   // Per macf#232: workspaces created before the cwd-independent path

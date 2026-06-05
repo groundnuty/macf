@@ -86,6 +86,18 @@ export const MACF_LGTM_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check
 export const MACF_CLOSE_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh';
 
 /**
+ * The UserPromptSubmit turn-ack receipt hook (groundnuty/macf#444 Option D,
+ * piece 2). When the router injects a prompt carrying the correlation marker
+ * `[macf-route:<run_id>:<agent>]` (macf-actions piece 1), this hook fires on
+ * submit and emits a `turn_processed` OTel span — making a routed ping that
+ * BECAME A TURN observable, so a dropped one surfaces as a missing span
+ * (closes the #437 send≠receipt gap). Unlike the PreToolUse `check-*` hooks
+ * this is NOT a blocker (it observes, never `exit 2`s) and is registered
+ * `async: true` so it adds no turn latency. No-op on non-routed prompts.
+ */
+export const MACF_TURN_RECEIPT_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/emit-turn-receipt.sh';
+
+/**
  * The hook filenames used to identify MACF-managed entries on refresh.
  * Matched by path-end equality (see isMacfManagedCommand) so operator
  * files with a similar-but-distinct basename are not misclassified.
@@ -95,6 +107,7 @@ const MACF_HOOK_FILENAMES: readonly string[] = [
   'check-mention-routing.sh',
   'check-lgtm-gate.sh',
   'check-close-keyword.sh',
+  'emit-turn-receipt.sh',
 ];
 
 /**
@@ -117,6 +130,9 @@ interface HookCommand {
   readonly type: 'command';
   readonly command: string;
   readonly timeout?: number;
+  // groundnuty/macf#444: the turn-ack receipt hook runs async so it never
+  // adds turn latency (and a slow/absent OTLP endpoint can't block the turn).
+  readonly async?: boolean;
 }
 
 interface HookEntry {
@@ -681,6 +697,7 @@ export function installGhTokenHook(workspaceDir: string): void {
   const settings = readSettings(path);
   const hooks = settings.hooks ?? {};
   const preToolUse = hooks.PreToolUse ?? [];
+  const userPromptSubmit = hooks.UserPromptSubmit ?? [];
 
   // Drop any prior MACF-managed entries (any hook file in
   // MACF_HOOK_FILENAMES) so we can replace them cleanly — guards against
@@ -712,11 +729,27 @@ export function installGhTokenHook(workspaceDir: string): void {
     },
   ];
 
+  // UserPromptSubmit: the turn-ack receipt hook (groundnuty/macf#444). Same
+  // preserve-then-replace discipline as PreToolUse above — drop any prior
+  // MACF-managed UserPromptSubmit entry (by MACF_HOOK_FILENAMES basename) and
+  // re-add ours, leaving operator-authored UserPromptSubmit hooks intact. No
+  // `matcher` (UserPromptSubmit isn't tool-gated); `async: true` so it never
+  // adds turn latency.
+  const preservedUps = userPromptSubmit.filter(
+    (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
+  );
+  const macfUpsEntries: readonly HookEntry[] = [
+    {
+      hooks: [{ type: 'command', command: MACF_TURN_RECEIPT_HOOK_COMMAND, async: true }],
+    },
+  ];
+
   const updated: Settings = {
     ...settings,
     hooks: {
       ...hooks,
       PreToolUse: [...preserved, ...macfEntries],
+      UserPromptSubmit: [...preservedUps, ...macfUpsEntries],
     },
   };
 
