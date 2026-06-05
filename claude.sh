@@ -7,11 +7,29 @@
 #   - .github-app-key.pem (or whatever KEY_PATH points to)
 #   - gh CLI with personal login (for token generation)
 #   - jq, tmux, claude
+#
+# Env vars:
+#   CLAUDE_BIN  — path to the claude binary to use (default: "claude" in PATH).
+#                 Useful when pinning to a specific version, e.g.
+#                 CLAUDE_BIN=/tmp/claude-versions/claude-3 ./claude.sh -r
 
 set -euo pipefail
 
 if [ -d /home/linuxbrew/.linuxbrew ]; then
   eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv bash)"
+fi
+
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+
+RESUME=0
+RESUME_ID=""
+if [ "${1:-}" = "-r" ]; then
+  RESUME=1
+  shift
+  if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
+    RESUME_ID="$1"
+    shift
+  fi
 fi
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -57,5 +75,44 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   exit 0
 fi
 
-tmux new-session -s "$SESSION" -c "$DIR" \
-  "GH_TOKEN=$GH_TOKEN claude --permission-mode acceptEdits -c || GH_TOKEN=$GH_TOKEN claude --permission-mode acceptEdits"
+# macf#418 item A: Claude Code native OTEL telemetry for code-agent.
+# `tmux new-session` does NOT propagate this launcher's exported env to the
+# `claude` process (the env-stripping boundary #418 root-caused — OTEL_* /
+# CLAUDE_CODE_* exported here would never reach claude, so telemetry stays
+# dark, as it has been on the substrate agents). Fix: inline the telemetry
+# vars into the launched command the SAME way GH_TOKEN already is, via
+# LAUNCH_ENV below. Mirrors the canonical claude-sh.ts otelTelemetryLines set
+# + the devops#78 reference impl. Opt out with MACF_OTEL_DISABLED=1 (e.g. a
+# host with no observability stack running). Existing env values win (the
+# `: "${VAR=default}"` form only assigns when unset).
+LAUNCH_ENV="GH_TOKEN=$GH_TOKEN"
+if [ "${MACF_OTEL_DISABLED:-}" != "1" ]; then
+  : "${CLAUDE_CODE_ENABLE_TELEMETRY=1}"
+  : "${OTEL_TRACES_EXPORTER=otlp}"
+  : "${OTEL_METRICS_EXPORTER=otlp}"
+  : "${OTEL_LOGS_EXPORTER=otlp}"
+  : "${OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf}"
+  # IPv4 literal per macf#419 (avoids the localhost→::1 ambiguity); override
+  # via MACF_OTEL_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT in the environment.
+  : "${MACF_OTEL_ENDPOINT=http://127.0.0.1:14318}"
+  : "${OTEL_EXPORTER_OTLP_ENDPOINT=$MACF_OTEL_ENDPOINT}"
+  : "${OTEL_SERVICE_NAME=macf-agent-code-agent}"
+  : "${OTEL_RESOURCE_ATTRIBUTES=gen_ai.agent.name=code-agent,gen_ai.agent.role=code-agent,service.namespace=macf}"
+  for _v in CLAUDE_CODE_ENABLE_TELEMETRY OTEL_TRACES_EXPORTER OTEL_METRICS_EXPORTER \
+            OTEL_LOGS_EXPORTER OTEL_EXPORTER_OTLP_PROTOCOL OTEL_EXPORTER_OTLP_ENDPOINT \
+            OTEL_SERVICE_NAME OTEL_RESOURCE_ATTRIBUTES; do
+    LAUNCH_ENV="$LAUNCH_ENV $_v=${!_v:-}"
+  done
+fi
+
+if [ "$RESUME" = "1" ]; then
+  if [ -n "$RESUME_ID" ]; then
+    CMD="$LAUNCH_ENV '$CLAUDE_BIN' --permission-mode acceptEdits --resume $RESUME_ID"
+  else
+    CMD="$LAUNCH_ENV '$CLAUDE_BIN' --permission-mode acceptEdits --resume"
+  fi
+else
+  CMD="$LAUNCH_ENV '$CLAUDE_BIN' --permission-mode acceptEdits -c || $LAUNCH_ENV '$CLAUDE_BIN' --permission-mode acceptEdits"
+fi
+
+tmux new-session -s "$SESSION" -c "$DIR" "$CMD"
