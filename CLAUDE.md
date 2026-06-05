@@ -90,9 +90,13 @@ pending its operator-timed Tempo verify on the next CV relaunch to cs 0.2.35.
 **Routing**: macf-actions **v1.3.2** cut (#432) — `route-by-pr-review-state`
 reimplemented on the v1.x SSH/tmux primitive so `gh pr review --approve` notifies
 the PR author; fleet pins (macf/testbed/devops-toolkit) bumped; AC-6 proven live.
-The post-Phase-5 build queue is now CLEARED; **#427 is the only open issue** (its
-Tempo verify) + #439 filed (register-TOCTOU CAS, backlog). 24 DRs, 9 phase specs,
-13 canonical rules, 16 research notes.
+The post-Phase-5 hardening **queue** is now CLEARED; remaining open issues:
+#427 (gen_ai.agent.name Tempo verify), **#437 (routing-reliability — substrate
+agents silently miss routed @mentions; the structural fix for the missed-ping
+failure surfaced this session)**, #439 (register CAS/If-Match — TOCTOU follow-up,
+backlog), #418 (claude-sh telemetry, devops), #224 (NPM_TOKEN rotation), #368
+(A2A master-tracking umbrella). 24 DRs, 9 phase specs, 13 canonical rules, 16
+research notes.
 
 **A2A integration arc** (master tracking #368): **full bidirectional v1.0
 surface LIVE on npm via v0.2.32**:
