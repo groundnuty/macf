@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Registry, AgentInfo } from '@groundnuty/macf-core';
 import type { Logger } from '@groundnuty/macf-core';
 
@@ -38,6 +38,8 @@ const certPaths = {
   agentKeyPath: '/fake/agent-key.pem',
 };
 
+const INCOMING = '0.2.34'; // this instance's version in most tests
+
 const existingAgent: AgentInfo = {
   host: '100.86.5.117',
   port: 8847,
@@ -46,124 +48,164 @@ const existingAgent: AgentInfo = {
   started: '2026-03-28T18:00:00Z',
 };
 
+/**
+ * Mock a LIVE /health response (200) whose JSON body advertises `version`
+ * (omitted entirely when `version === null`, simulating a pre-#424 instance).
+ * Wires res.on('data')/on('end') so collision's pingHealth reads the body.
+ */
+function mockAliveWithVersion(version: string | null): void {
+  vi.mocked(mockRequest).mockImplementation((_opts, cb) => {
+    const bodyObj = version === null ? { status: 'online' } : { status: 'online', version };
+    const bodyStr = JSON.stringify(bodyObj);
+    const mockRes = {
+      statusCode: 200,
+      resume: vi.fn(),
+      on: vi.fn((event: string, handler: (...args: any[]) => void) => {
+        if (event === 'data') handler(Buffer.from(bodyStr));
+        if (event === 'end') handler();
+        return mockRes;
+      }),
+    };
+    if (cb) (cb as (res: typeof mockRes) => void)(mockRes);
+    return { on: vi.fn(), end: vi.fn(), destroy: vi.fn() } as any;
+  });
+}
+
+/** Mock a dead peer (connection error on end()). */
+function mockDead(): void {
+  vi.mocked(mockRequest).mockImplementation((_opts, _cb) => {
+    const handlers: Record<string, (...args: any[]) => void> = {};
+    const req = {
+      on: vi.fn((event: string, handler: (...args: any[]) => void) => {
+        handlers[event] = handler;
+        return req;
+      }),
+      end: vi.fn(() => {
+        if (handlers['error']) handlers['error'](new Error('ECONNREFUSED'));
+      }),
+      destroy: vi.fn(),
+    };
+    return req as any;
+  });
+}
+
+/** Find the warn-level collision_check log basis (the #424 decision). */
+function decisionBasis(logger: Logger): string | undefined {
+  const warn = vi.mocked(logger.warn);
+  const call = warn.mock.calls.find((c) => c[0] === 'collision_check');
+  return call ? (call[1] as { result?: string }).result : undefined;
+}
+
 describe('checkCollision', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env['MACF_NO_VERSION_TAKEOVER'];
   });
 
   it('returns register for fresh start (no variable)', async () => {
     const registry = mockRegistry(null);
-    const logger = mockLogger();
-
-    const result = await checkCollision('code-agent', registry, certPaths, logger);
-
+    const result = await checkCollision('code-agent', registry, certPaths, INCOMING, mockLogger());
     expect(result.action).toBe('register');
     expect(registry.get).toHaveBeenCalledWith('code-agent');
   });
 
-  it('returns abort when existing agent responds to health ping', async () => {
-    const registry = mockRegistry(existingAgent);
-    const logger = mockLogger();
-
-    // Simulate successful health response
-    vi.mocked(mockRequest).mockImplementation((_opts, cb) => {
-      const mockRes = {
-        statusCode: 200,
-        resume: vi.fn(),
-      };
-      if (cb) (cb as (res: typeof mockRes) => void)(mockRes);
-      return {
-        on: vi.fn(),
-        end: vi.fn(),
-        destroy: vi.fn(),
-      } as any;
+  describe('dead / unreachable existing → takeover (unchanged)', () => {
+    it('takeover when existing agent does not respond', async () => {
+      mockDead();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, INCOMING, mockLogger());
+      expect(result.action).toBe('takeover');
+      if (result.action === 'takeover') expect(result.previous.instance_id).toBe('a8f3c2');
     });
 
-    const result = await checkCollision('code-agent', registry, certPaths, logger);
+    it('takeover when readFileSync throws (cert-rotation race, ultrareview H3)', async () => {
+      const fs = await import('node:fs');
+      vi.mocked(fs.readFileSync).mockImplementationOnce(() => {
+        throw Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' });
+      });
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, INCOMING, mockLogger());
+      expect(result.action).toBe('takeover');
+      expect(mockRequest).not.toHaveBeenCalled();
+    });
 
-    expect(result.action).toBe('abort');
-    if (result.action === 'abort') {
-      expect(result.existing.host).toBe('100.86.5.117');
-      expect(result.existing.port).toBe(8847);
-    }
+    it('takeover when health ping times out', async () => {
+      vi.mocked(mockRequest).mockImplementation((_opts, _cb) => {
+        const handlers: Record<string, (...args: any[]) => void> = {};
+        const req = {
+          on: vi.fn((event: string, handler: (...args: any[]) => void) => { handlers[event] = handler; return req; }),
+          end: vi.fn(() => { if (handlers['timeout']) handlers['timeout'](); }),
+          destroy: vi.fn(),
+        };
+        return req as any;
+      });
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, INCOMING, mockLogger());
+      expect(result.action).toBe('takeover');
+    });
   });
 
-  it('returns takeover when existing agent does not respond', async () => {
-    const registry = mockRegistry(existingAgent);
-    const logger = mockLogger();
-
-    // Simulate connection error (agent is dead)
-    vi.mocked(mockRequest).mockImplementation((_opts, _cb) => {
-      const handlers: Record<string, (...args: any[]) => void> = {};
-      const req = {
-        on: vi.fn((event: string, handler: (...args: any[]) => void) => {
-          handlers[event] = handler;
-          return req;
-        }),
-        end: vi.fn(() => {
-          // Trigger error after end() is called
-          if (handlers['error']) handlers['error'](new Error('ECONNREFUSED'));
-        }),
-        destroy: vi.fn(),
-      };
-      return req as any;
+  describe('alive existing → version-aware decision (groundnuty/macf#424)', () => {
+    it('aborts when the alive peer runs the SAME version', async () => {
+      mockAliveWithVersion('0.2.34');
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('abort');
+      expect(decisionBasis(logger)).toBe('abort_same_or_newer');
     });
 
-    const result = await checkCollision('code-agent', registry, certPaths, logger);
-
-    expect(result.action).toBe('takeover');
-    if (result.action === 'takeover') {
-      expect(result.previous.instance_id).toBe('a8f3c2');
-    }
-  });
-
-  it('returns takeover when readFileSync throws (cert-rotation race, ultrareview H3)', async () => {
-    // During a cert-rotation race at startup, the agent cert/key
-    // files may be momentarily absent. Without the ENOENT guard,
-    // pingHealth's top-of-function readFileSync would throw and
-    // crash the entire server startup via unhandled rejection.
-    // The guard treats read errors like network errors — peer is
-    // effectively unreachable → takeover path.
-    const registry = mockRegistry(existingAgent);
-    const logger = mockLogger();
-
-    // Make readFileSync throw on ANY file read (simulates the race).
-    const fs = await import('node:fs');
-    vi.mocked(fs.readFileSync).mockImplementationOnce(() => {
-      throw Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' });
+    it('aborts when the alive peer runs a NEWER version', async () => {
+      mockAliveWithVersion('0.2.40');
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('abort');
+      expect(decisionBasis(logger)).toBe('abort_same_or_newer');
     });
 
-    const result = await checkCollision('code-agent', registry, certPaths, logger);
-
-    // Without the guard, this test would throw. With the guard,
-    // pingHealth returns false → takeover.
-    expect(result.action).toBe('takeover');
-    // request was never made — we bailed before the https.request call.
-    expect(mockRequest).not.toHaveBeenCalled();
-  });
-
-  it('returns takeover when health ping times out', async () => {
-    const registry = mockRegistry(existingAgent);
-    const logger = mockLogger();
-
-    // Simulate timeout
-    vi.mocked(mockRequest).mockImplementation((_opts, _cb) => {
-      const handlers: Record<string, (...args: any[]) => void> = {};
-      const req = {
-        on: vi.fn((event: string, handler: (...args: any[]) => void) => {
-          handlers[event] = handler;
-          return req;
-        }),
-        end: vi.fn(() => {
-          if (handlers['timeout']) handlers['timeout']();
-        }),
-        destroy: vi.fn(),
-      };
-      return req as any;
+    it('TAKES OVER an alive peer running an OLDER version', async () => {
+      mockAliveWithVersion('0.2.20');
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('takeover');
+      expect(decisionBasis(logger)).toBe('takeover_newer_version');
     });
 
-    const result = await checkCollision('code-agent', registry, certPaths, logger);
+    it('TAKES OVER an alive peer that advertises NO version (pre-#424 ⟹ oldest) — the motivating incident', async () => {
+      mockAliveWithVersion(null);
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('takeover');
+      expect(decisionBasis(logger)).toBe('takeover_unversioned_existing');
+    });
 
-    expect(result.action).toBe('takeover');
+    it('TAKES OVER an alive peer whose version is non-null but unparseable (logged distinctly)', async () => {
+      mockAliveWithVersion('garbage'); // non-null, but not x.y.z
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('takeover');
+      expect(decisionBasis(logger)).toBe('takeover_unparseable_existing');
+    });
+
+    it('aborts when the INCOMING is unversioned (never displaces a live peer)', async () => {
+      mockAliveWithVersion('0.2.20'); // existing older, but incoming is unversioned
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '', logger);
+      expect(result.action).toBe('abort');
+      expect(decisionBasis(logger)).toBe('abort_incoming_unversioned');
+    });
+
+    it('MACF_NO_VERSION_TAKEOVER=1 disables takeover even of an older alive peer (escape hatch)', async () => {
+      process.env['MACF_NO_VERSION_TAKEOVER'] = '1';
+      mockAliveWithVersion('0.2.20'); // older — would normally be taken over
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('abort');
+      expect(decisionBasis(logger)).toBe('abort_version_takeover_disabled');
+    });
+
+    it('reports both versions in the decision log line', async () => {
+      mockAliveWithVersion('0.2.20');
+      const logger = mockLogger();
+      await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      const call = vi.mocked(logger.warn).mock.calls.find((c) => c[0] === 'collision_check');
+      expect(call?.[1]).toMatchObject({ incoming_version: '0.2.34', existing_version: '0.2.20' });
+    });
   });
 });
