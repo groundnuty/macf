@@ -88,6 +88,11 @@ fi
 LAUNCH_ENV="GH_TOKEN=$GH_TOKEN"
 if [ "${MACF_OTEL_DISABLED:-}" != "1" ]; then
   : "${CLAUDE_CODE_ENABLE_TELEMETRY=1}"
+  # macf#418/#197: traces require this beta gate IN ADDITION to the master gate.
+  # CLAUDE_CODE_ENABLE_TELEMETRY=1 alone emits metrics+logs but NOT traces — the
+  # hand-port of this block dropped it, so substrate emitted zero native spans
+  # (science A/B vs CV). Canonical claude-sh.ts otelTelemetryLines has it.
+  : "${CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1}"
   : "${OTEL_TRACES_EXPORTER=otlp}"
   : "${OTEL_METRICS_EXPORTER=otlp}"
   : "${OTEL_LOGS_EXPORTER=otlp}"
@@ -98,7 +103,8 @@ if [ "${MACF_OTEL_DISABLED:-}" != "1" ]; then
   : "${OTEL_EXPORTER_OTLP_ENDPOINT=$MACF_OTEL_ENDPOINT}"
   : "${OTEL_SERVICE_NAME=macf-agent-code-agent}"
   : "${OTEL_RESOURCE_ATTRIBUTES=gen_ai.agent.name=code-agent,gen_ai.agent.role=code-agent,service.namespace=macf}"
-  for _v in CLAUDE_CODE_ENABLE_TELEMETRY OTEL_TRACES_EXPORTER OTEL_METRICS_EXPORTER \
+  for _v in CLAUDE_CODE_ENABLE_TELEMETRY CLAUDE_CODE_ENHANCED_TELEMETRY_BETA \
+            OTEL_TRACES_EXPORTER OTEL_METRICS_EXPORTER \
             OTEL_LOGS_EXPORTER OTEL_EXPORTER_OTLP_PROTOCOL OTEL_EXPORTER_OTLP_ENDPOINT \
             OTEL_SERVICE_NAME OTEL_RESOURCE_ATTRIBUTES; do
     LAUNCH_ENV="$LAUNCH_ENV $_v=${!_v:-}"
