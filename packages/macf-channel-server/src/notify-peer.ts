@@ -253,17 +253,22 @@ function buildA2aMessageFromPayload(
 
 /**
  * Decide which outbound protocol to use for a given peer (macf#396 Phase 3
- * design Q6 decision tree):
+ * design Q6 decision tree; the `event === 'custom' → legacy` carve-out was
+ * LIFTED in macf#428 Phase 3.5 once receiver-side decideWake was wired on
+ * the A2A path — so `custom` now travels A2A + wakes via the receiver):
  *
  *   1. `MACF_OUTBOUND_LEGACY=1` env var → legacy `/notify`
- *   2. `event === 'custom'` (operator-driven; wakes receiver via Pattern E
- *      'custom' branch in decideWake) → legacy `/notify` (preserves
- *      wake-on-receipt until Phase 3.5 wires receiver-side wake decision
- *      on A2A path)
- *   3. No A2aClient configured → legacy `/notify`
- *   4. Peer publishes valid AgentCard with `protocolBinding === 'JSONRPC'`
+ *   2. No A2aClient configured → legacy `/notify`
+ *   3. Peer publishes valid AgentCard with `protocolBinding === 'JSONRPC'`
  *      in any `supportedInterfaces[]` entry → A2A path
- *   5. Otherwise → legacy `/notify` (with warning span attribute)
+ *   4. Otherwise → legacy `/notify` (with warning span attribute)
+ *
+ * Protocol selection is **event-independent**: every event (including the
+ * operator-driven `custom`) prefers A2A when the peer supports it. The
+ * receiver applies Pattern E per-event via `decideWake` (custom → wake;
+ * autonomous turn-complete/session-end/error → push-only) — so cross-agent
+ * Stop-hook loop-prevention is preserved at the receiver regardless of
+ * transport (macf#428; the sender no longer needs to special-case it).
  *
  * Returns `'a2a'` or `'legacy'`. Caller dispatches accordingly. AgentCard
  * fetch failures + schema-validation failures fall through to legacy with
@@ -272,16 +277,8 @@ function buildA2aMessageFromPayload(
 async function selectOutboundProtocol(
   deps: NotifyPeerDeps,
   peer: { readonly name: string; readonly info: AgentInfo },
-  event: NotifyPeerInput['event'],
 ): Promise<'a2a' | 'legacy'> {
   if (process.env['MACF_OUTBOUND_LEGACY'] === '1') {
-    return 'legacy';
-  }
-  if (event === 'custom') {
-    // Operator-driven event — receiver-side wake-on-receipt fires via
-    // legacy /notify's decideWake() call. Phase 3.5 follow-up issue will
-    // wire receiver-side decideWake on /a2a/v1 too; until then, custom
-    // events stay on legacy to preserve the wake contract.
     return 'legacy';
   }
   if (deps.a2aClient === undefined) {
@@ -349,7 +346,7 @@ async function dispatchToPeer(
   legacyPayload: object,
   timeoutMs: number,
 ): Promise<{ readonly httpOk: boolean; readonly transportOk: boolean }> {
-  const protocol = await selectOutboundProtocol(deps, peer, input.event);
+  const protocol = await selectOutboundProtocol(deps, peer);
   const span = trace.getActiveSpan();
   if (span !== undefined) {
     span.setAttribute(Attr.OutboundProtocol, protocol);
