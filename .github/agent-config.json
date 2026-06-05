@@ -5,6 +5,7 @@
       "host": "100.124.163.105",
       "tmux_session": "code-agent",
       "tmux_bin": "tmux",
+      "workspace_dir": "/home/ubuntu/repos/groundnuty/macf",
       "ssh_user": "ubuntu",
       "ssh_key_secret": "AGENT_SSH_KEY"
     },
@@ -13,6 +14,7 @@
       "host": "100.124.163.105",
       "tmux_session": "science-agent",
       "tmux_bin": "tmux",
+      "workspace_dir": "/home/ubuntu/repos/groundnuty/macf-science-agent",
       "ssh_user": "ubuntu",
       "ssh_key_secret": "AGENT_SSH_KEY"
     },
@@ -21,6 +23,7 @@
       "host": "100.124.163.105",
       "tmux_session": "devops-agent",
       "tmux_bin": "tmux",
+      "workspace_dir": "/home/ubuntu/repos/groundnuty/macf-devops-toolkit",
       "ssh_user": "ubuntu",
       "ssh_key_secret": "AGENT_SSH_KEY"
     }
