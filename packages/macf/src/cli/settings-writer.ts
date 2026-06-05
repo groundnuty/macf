@@ -71,6 +71,21 @@ export const MACF_MENTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/ch
 export const MACF_LGTM_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-lgtm-gate.sh';
 
 /**
+ * Close-keyword-guard hook command (groundnuty/macf#431). Blocks
+ * `gh pr create` / `gh pr edit` invocations whose body / title contains a
+ * GitHub auto-close keyword (`close`/`closes`/`closed`/`fix`/`fixes`/`fixed`/
+ * `resolve`/`resolves`/`resolved`) adjacent to an issue ref (`#N` or
+ * `owner/repo#N`) filed by ANOTHER agent — which would auto-close that
+ * issue on merge, bypassing reporter-owns-closure (coordination.md
+ * §Issue Lifecycle 1). The parser is negation-/context-blind, so cognitive
+ * discipline proved insufficient (4 self-inflicted recurrences:
+ * macf#316/#410/#430). Path-2 structural backstop; sister to the #140 /
+ * #244+#272 / #270 hooks. Discriminator is issue authorship (self-filed
+ * `Closes #own` passes); override via MACF_SKIP_CLOSE_CHECK=1.
+ */
+export const MACF_CLOSE_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh';
+
+/**
  * The hook filenames used to identify MACF-managed entries on refresh.
  * Matched by path-end equality (see isMacfManagedCommand) so operator
  * files with a similar-but-distinct basename are not misclassified.
@@ -79,6 +94,7 @@ const MACF_HOOK_FILENAMES: readonly string[] = [
   'check-gh-token.sh',
   'check-mention-routing.sh',
   'check-lgtm-gate.sh',
+  'check-close-keyword.sh',
 ];
 
 /**
@@ -640,6 +656,9 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
  *     leak detector for raw `@<bot>[bot]` in describing-context)
  *   - `check-lgtm-gate.sh` (groundnuty/macf#270 — DR-023 UC-2; blocks
  *     `gh pr merge` when no non-author APPROVED review exists)
+ *   - `check-close-keyword.sh` (groundnuty/macf#431 — blocks `gh pr
+ *     create`/`edit` that would auto-close another agent's issue via a
+ *     close-keyword adjacent to its ref)
  *
  * Creates the `.claude/` directory and the file if either is missing.
  * Idempotent: repeated calls don't duplicate entries.
@@ -685,6 +704,10 @@ export function installGhTokenHook(workspaceDir: string): void {
     {
       matcher: 'Bash',
       hooks: [{ type: 'command', command: MACF_LGTM_HOOK_COMMAND }],
+    },
+    {
+      matcher: 'Bash',
+      hooks: [{ type: 'command', command: MACF_CLOSE_HOOK_COMMAND }],
     },
   ];
 
