@@ -254,7 +254,7 @@ jobs:
       # drift. On `push` / `schedule` / `workflow_dispatch` we always
       # run (path filter is intentionally PR-only — post-merge is
       # the backstop for transitive drift).
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: changes
         if: github.event_name == 'pull_request'
         with:
