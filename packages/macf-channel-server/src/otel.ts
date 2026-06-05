@@ -39,6 +39,43 @@
  */
 
 /**
+ * Build the OTel Resource for the channel server.
+ *
+ * Merge order (later wins on key collision):
+ *   1. `defaultResource()` — SDK defaults (telemetry.sdk.*, default service.name).
+ *   2. `detectResources({ detectors: [envDetector] })` — parses
+ *      `OTEL_RESOURCE_ATTRIBUTES` (gen_ai.agent.name, gen_ai.agent.role,
+ *      service.namespace, …). `defaultResource()` does NOT run the env
+ *      detector itself (verified on @opentelemetry/resources 2.7.0), so
+ *      without this explicit merge those attrs never land — exported spans
+ *      carried `service.name` but `gen_ai.agent.name` was <UNSET>
+ *      (groundnuty/macf#427, surfaced verifying #422 AC-5).
+ *   3. explicit `service.name` / `service.version` — applied last so the
+ *      channel server's computed service.name wins over any env/default value.
+ *
+ * Extracted from bootstrapOtel() as a pure function of the dynamically-imported
+ * SDK modules so the merge is unit-testable without standing up the provider.
+ * Takes `resources`/`semconv` as params (rather than importing) to preserve
+ * the zero-cost dynamic-import doctrine — see the module header.
+ */
+export function buildResource(
+  resources: typeof import('@opentelemetry/resources'),
+  semconv: typeof import('@opentelemetry/semantic-conventions'),
+  serviceName: string,
+  serviceVersion: string,
+): ReturnType<(typeof import('@opentelemetry/resources'))['defaultResource']> {
+  return resources
+    .defaultResource()
+    .merge(resources.detectResources({ detectors: [resources.envDetector] }))
+    .merge(
+      resources.resourceFromAttributes({
+        [semconv.ATTR_SERVICE_NAME]: serviceName,
+        [semconv.ATTR_SERVICE_VERSION]: serviceVersion,
+      }),
+    );
+}
+
+/**
  * Opt-in OTEL bootstrap. No-op (and zero module-resolution cost) when
  * `OTEL_EXPORTER_OTLP_ENDPOINT` is unset. When set, dynamic-imports
  * the SDK packages, configures an OTLP-proto exporter, registers the
@@ -107,15 +144,11 @@ export async function bootstrapOtel(): Promise<void> {
     process.exit(1);
   }
 
-  // Resource attributes inherit from the SDK's default detectors
-  // (process.*, host.*, telemetry.sdk.*) via `defaultResource()`,
-  // merged with our explicit service.* attributes on top.
-  const resource = resources.defaultResource().merge(
-    resources.resourceFromAttributes({
-      [semconv.ATTR_SERVICE_NAME]: serviceName,
-      [semconv.ATTR_SERVICE_VERSION]: serviceVersion,
-    }),
-  );
+  // Resource = SDK defaults + OTEL_RESOURCE_ATTRIBUTES (gen_ai.agent.name,
+  // gen_ai.agent.role, service.namespace) + explicit service.* on top.
+  // See buildResource() for the merge order + why the env detector is
+  // explicit (groundnuty/macf#427).
+  const resource = buildResource(resources, semconv, serviceName, serviceVersion);
 
   const tracerProvider = new sdkNode.NodeTracerProvider({
     resource,
