@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
 
 describe('installGhTokenHook', () => {
   let tmpRoot: string;
@@ -40,9 +40,10 @@ describe('installGhTokenHook', () => {
 
     expect(existsSync(settingsPath)).toBe(true);
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    // Three MACF hook entries land per call: check-gh-token.sh +
-    // check-mention-routing.sh + check-lgtm-gate.sh (groundnuty/macf#270).
-    expect(s.hooks.PreToolUse).toHaveLength(3);
+    // Four MACF hook entries land per call: check-gh-token.sh +
+    // check-mention-routing.sh + check-lgtm-gate.sh (groundnuty/macf#270) +
+    // check-close-keyword.sh (groundnuty/macf#431).
+    expect(s.hooks.PreToolUse).toHaveLength(4);
     expect(s.hooks.PreToolUse[0].matcher).toBe('Bash');
     expect(s.hooks.PreToolUse[0].hooks[0].command).toBe(MACF_HOOK_COMMAND);
     expect(s.hooks.PreToolUse[0].hooks[0].type).toBe('command');
@@ -52,6 +53,9 @@ describe('installGhTokenHook', () => {
     expect(s.hooks.PreToolUse[2].matcher).toBe('Bash');
     expect(s.hooks.PreToolUse[2].hooks[0].command).toBe(MACF_LGTM_HOOK_COMMAND);
     expect(s.hooks.PreToolUse[2].hooks[0].type).toBe('command');
+    expect(s.hooks.PreToolUse[3].matcher).toBe('Bash');
+    expect(s.hooks.PreToolUse[3].hooks[0].command).toBe(MACF_CLOSE_HOOK_COMMAND);
+    expect(s.hooks.PreToolUse[3].hooks[0].type).toBe('command');
   });
 
   it('preserves existing unrelated settings keys', () => {
@@ -82,23 +86,25 @@ describe('installGhTokenHook', () => {
     installGhTokenHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    // 1 user Edit hook + 3 MACF Bash hooks (gh-token + mention-routing + lgtm-gate).
-    expect(s.hooks.PreToolUse).toHaveLength(4);
+    // 1 user Edit hook + 4 MACF Bash hooks (gh-token + mention-routing +
+    // lgtm-gate + close-keyword).
+    expect(s.hooks.PreToolUse).toHaveLength(5);
     const userHook = s.hooks.PreToolUse.find((e: { matcher: string }) => e.matcher === 'Edit');
     const macfHooks = s.hooks.PreToolUse.filter(
       (e: { matcher: string; hooks: { command: string }[] }) =>
         e.matcher === 'Bash' &&
         e.hooks.some((h) =>
-          [MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND].includes(h.command),
+          [MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND].includes(h.command),
         ),
     );
     expect(userHook).toBeDefined();
     expect(userHook.hooks[0].command).toBe('./user-edit-hook.sh');
-    expect(macfHooks).toHaveLength(3);
+    expect(macfHooks).toHaveLength(4);
     const cmds = macfHooks.map((e: { hooks: { command: string }[] }) => e.hooks[0].command);
     expect(cmds).toContain(MACF_HOOK_COMMAND);
     expect(cmds).toContain(MACF_MENTION_HOOK_COMMAND);
     expect(cmds).toContain(MACF_LGTM_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_CLOSE_HOOK_COMMAND);
   });
 
   it('preserves other hook event types (SessionStart, Stop, etc.)', () => {
@@ -262,8 +268,8 @@ describe('installGhTokenHook', () => {
       e.hooks.some((h) => h.command === MACF_LGTM_HOOK_COMMAND),
     );
     expect(macfLgtmEntry).toBeDefined();
-    // 1 operator + 3 MACF entries.
-    expect(s.hooks.PreToolUse).toHaveLength(4);
+    // 1 operator + 4 MACF entries.
+    expect(s.hooks.PreToolUse).toHaveLength(5);
   });
 
   it('refreshes a stale MACF mention-routing entry alongside gh-token', () => {
@@ -369,8 +375,8 @@ describe('installGhTokenHook', () => {
       e.hooks.some((h) => h.command === './my-check-lgtm-gate.sh-wrapper --flag'),
     );
     expect(operatorEntry).toBeDefined();
-    // 1 operator + 3 MACF entries.
-    expect(s.hooks.PreToolUse).toHaveLength(4);
+    // 1 operator + 4 MACF entries.
+    expect(s.hooks.PreToolUse).toHaveLength(5);
   });
 });
 
