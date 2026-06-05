@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fetchPluginToWorkspace, workspacePluginDir } from '../../src/cli/plugin-fetcher.js';
+import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion } from '../../src/cli/plugin-fetcher.js';
 
 /**
  * Build a local bare git repo with the layout of macf-marketplace:
@@ -158,5 +158,72 @@ describe('workspacePluginDir', () => {
     const result = workspacePluginDir('./relative');
     expect(result.endsWith('/.macf/plugin')).toBe(true);
     expect(result.startsWith('/')).toBe(true);
+  });
+});
+
+describe('pinChannelServerVersion (groundnuty/macf#421)', () => {
+  let ws: string;
+
+  beforeEach(() => {
+    ws = mkdtempSync(join(tmpdir(), 'macf-pin-cs-'));
+  });
+  afterEach(() => {
+    rmSync(ws, { recursive: true, force: true });
+  });
+
+  function writeManifest(mcpServers: unknown): string {
+    const dir = join(workspacePluginDir(ws), '.claude-plugin');
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, 'plugin.json');
+    writeFileSync(path, JSON.stringify({ name: 'macf-agent', mcpServers }, null, 2));
+    return path;
+  }
+  function readArgs(path: string): string[] {
+    const m = JSON.parse(readFileSync(path, 'utf-8'));
+    return m.mcpServers['macf-agent'].args;
+  }
+
+  it('pins a bare npx channel-server spec to @<version>', () => {
+    const path = writeManifest({
+      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server'], env: { MACF_VERSION: '${MACF_VERSION:-}' } },
+    });
+    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(true);
+    expect(readArgs(path)).toEqual(['-y', '@groundnuty/macf-channel-server@0.2.34']);
+    // env block preserved.
+    expect(JSON.parse(readFileSync(path, 'utf-8')).mcpServers['macf-agent'].env).toEqual({ MACF_VERSION: '${MACF_VERSION:-}' });
+  });
+
+  it('re-pins an already-pinned spec to the new version', () => {
+    const path = writeManifest({
+      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.20'] },
+    });
+    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(true);
+    expect(readArgs(path)).toEqual(['-y', '@groundnuty/macf-channel-server@0.2.34']);
+  });
+
+  it('is idempotent (no rewrite, returns false) when already at the target version', () => {
+    writeManifest({
+      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.34'] },
+    });
+    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(false);
+  });
+
+  it('no-ops on the legacy node dist/server.js form (no npm spec to pin)', () => {
+    const path = writeManifest({
+      'macf-agent': { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/dist/server.js'] },
+    });
+    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(false);
+    expect(readArgs(path)).toEqual(['${CLAUDE_PLUGIN_ROOT}/dist/server.js']);
+  });
+
+  it('no-ops (returns false) when the plugin.json is absent', () => {
+    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(false);
+  });
+
+  it('no-ops when there is no mcpServers block', () => {
+    const dir = join(workspacePluginDir(ws), '.claude-plugin');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ name: 'macf-agent' }, null, 2));
+    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(false);
   });
 });
