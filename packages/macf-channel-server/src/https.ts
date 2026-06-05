@@ -36,6 +36,7 @@ import {
   InvalidTaskTransitionError,
 } from './a2a-task.js';
 import type { TaskStore } from './a2a-task.js';
+import { a2aMessageToNotifyPayload } from './a2a-delivery.js';
 
 const MAX_BODY_BYTES = 64 * 1024; // 64KB
 export const PORT_RANGE_START = 8800;
@@ -721,6 +722,10 @@ export function createHttpsServer(config: {
               span.setAttribute('macf.a2a.task_state', task.status.state);
               span.setAttribute('macf.a2a.dispatch', 'resume');
               span.setStatus({ code: SpanStatusCode.OK });
+              // macf#428 (Phase 3.5): deliver to the agent (resume branch too,
+              // not just happy-path — avoids a deliver/silently-drop asymmetry).
+              // See the happy-path call below for the ordering + wake rationale.
+              await onNotify(a2aMessageToNotifyPayload(incomingMessage));
               sendA2aJson(res, 200, {
                 jsonrpc: '2.0',
                 id: envelope.data.id,
@@ -779,6 +784,28 @@ export function createHttpsServer(config: {
             span.setAttribute('macf.a2a.task_state', task.status.state);
             span.setAttribute('macf.a2a.dispatch', 'fresh');
             span.setStatus({ code: SpanStatusCode.OK });
+            // macf#428 (Phase 3.5): deliver to the receiving agent via the
+            // SAME primitive as legacy /notify. `onNotify` does mcp_push +
+            // decideWake (+ fire-and-forget wakeViaTmux). Without this the A2A
+            // path created a Task but the agent never saw the message.
+            //
+            // Ordering: await onNotify (the mcp_push) BEFORE the response so a
+            // push failure surfaces (propagates to the catch → JSON-RPC error)
+            // rather than being masked behind a 200. The 1s tmux-submit sleep
+            // does NOT block this: onNotify calls wakeViaTmux fire-and-forget
+            // (server.ts, not awaited), so awaiting onNotify only waits on the
+            // fast mcp_push.
+            //
+            // Wake policy is decideWake's (Pattern E, macf#267 Option d),
+            // keyed on the metadata-carried event: custom → wake; autonomous
+            // (turn-complete/session-end/error) → push-only (loop prevention);
+            // missing/unrecognized → push-only (a2a-delivery.ts safety default).
+            // The mTLS boundary is the trust gate — a trusted client that
+            // stamps event=custom wakes, same as legacy /notify.
+            //
+            // NB: the REJECTED test-fixture branch above intentionally does
+            // NOT deliver — a rejected message was declined, not received.
+            await onNotify(a2aMessageToNotifyPayload(incomingMessage));
             sendA2aJson(res, 200, {
               jsonrpc: '2.0',
               id: envelope.data.id,

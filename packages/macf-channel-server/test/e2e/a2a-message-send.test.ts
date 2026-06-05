@@ -84,17 +84,19 @@ function httpsPost(
 }
 
 async function startServer(opts: { readonly taskStore?: TaskStore } = {}) {
+  const onNotify = vi.fn().mockResolvedValue(undefined);
   const server = createHttpsServer({
     caCertPath: certs.caCert,
     agentCertPath: certs.agentCert,
     agentKeyPath: certs.agentKey,
-    onNotify: vi.fn().mockResolvedValue(undefined),
+    onNotify,
     onHealth: () => ({}) as HealthResponse,
     taskStore: opts.taskStore,
     logger: makeLogger(),
   });
   const { actualPort } = await server.start(0, '127.0.0.1');
-  return { port: actualPort, stop: () => server.stop() };
+  // onNotify returned so macf#428 delivery tests can assert it was invoked.
+  return { port: actualPort, onNotify, stop: () => server.stop() };
 }
 
 beforeAll(() => {
@@ -131,6 +133,55 @@ describe('A2A /a2a/v1 endpoint E2E (macf#398 Phase 2d)', () => {
         expect(parsed.result.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-/);
         // Task store has the entry persisted for subsequent tasks/get.
         expect(store.size()).toBe(1);
+      } finally {
+        await stop();
+      }
+    });
+
+    it('delivers the message to the agent via onNotify, carrying event=custom → wake (macf#428 Phase 3.5)', async () => {
+      const { port, onNotify, stop } = await startServer({ taskStore: new TaskStore() });
+      try {
+        const res = await httpsPost(certs.agentCert, certs.agentKey, port, '/a2a/v1', {
+          jsonrpc: '2.0',
+          id: 'req-deliver',
+          method: 'message/send',
+          params: {
+            message: {
+              messageId: 'msg-deliver',
+              role: 'ROLE_USER',
+              parts: [{ text: 'phase 3.5 delivery' }],
+              metadata: { event: 'custom', source: 'cv-architect' },
+            },
+          },
+        });
+        expect(res.status).toBe(200); // protocol exchange still succeeds
+        // The message reached the agent's delivery primitive (mcp_push + decideWake).
+        expect(onNotify).toHaveBeenCalledTimes(1);
+        const payload = onNotify.mock.calls[0]![0] as Record<string, unknown>;
+        expect(payload['type']).toBe('peer_notification');
+        expect(payload['message']).toBe('phase 3.5 delivery'); // body surfaced
+        expect(payload['event']).toBe('custom'); // → decideWake WAKES
+        expect(payload['source']).toBe('cv-architect');
+      } finally {
+        await stop();
+      }
+    });
+
+    it('omits event (push-only) when the A2A message lacks our metadata keys — macf#428 no-accidental-wake default', async () => {
+      const { port, onNotify, stop } = await startServer({ taskStore: new TaskStore() });
+      try {
+        await httpsPost(certs.agentCert, certs.agentKey, port, '/a2a/v1', {
+          jsonrpc: '2.0',
+          id: 'req-anon',
+          method: 'message/send',
+          params: {
+            message: { messageId: 'msg-anon', role: 'ROLE_USER', parts: [{ text: 'no metadata' }] },
+          },
+        });
+        expect(onNotify).toHaveBeenCalledTimes(1);
+        const payload = onNotify.mock.calls[0]![0] as Record<string, unknown>;
+        expect('event' in payload).toBe(false); // push-only → no accidental wake from a non-MACF client
+        expect(payload['message']).toBe('no metadata');
       } finally {
         await stop();
       }

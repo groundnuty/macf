@@ -471,6 +471,27 @@ describe('notify_peer tool', () => {
       expect(fakeLogger.warn).not.toHaveBeenCalledWith('notify_peer_a2a_no_agent_card', expect.anything());
       expect(fakeLogger.warn).not.toHaveBeenCalledWith('notify_peer_a2a_no_jsonrpc_binding', expect.anything());
     });
+
+    it('routes event:custom over A2A too — the custom→legacy carve-out is lifted (macf#428)', async () => {
+      // Pre-#428, selectOutboundProtocol forced event:custom → legacy
+      // (receiver-wake was only wired on /notify). #428 wired receiver-side
+      // decideWake on /a2a/v1, so custom now prefers A2A when the peer
+      // supports it; the receiver applies Pattern E (custom → wake).
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const card = {
+        supportedInterfaces: [{ protocolBinding: 'JSONRPC', protocolVersion: '1.0', url: 'https://127.0.0.1:9000' }],
+      };
+      const getAgentCard = vi.fn().mockResolvedValue(card);
+      const sendMessage = vi.fn().mockResolvedValue({ id: 'task-1', status: { state: 'TASK_STATE_COMPLETED' } });
+      const result = await notifyPeer(
+        depsWithA2a(reg, getAgentCard, sendMessage),
+        { to: 'peer-a', event: 'custom', message: 'operator-driven' },
+      );
+      expect(sendMessage).toHaveBeenCalledTimes(1); // custom travels A2A now (was legacy pre-#428)
+      expect(result.peers_delivered).toBe(1);
+    });
   });
 });
 
