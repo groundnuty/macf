@@ -135,6 +135,17 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/emit-turn-receipt.sh",
+            "async": true
+          }
+        ]
+      }
     ]
   }
 }
