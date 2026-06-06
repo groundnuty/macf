@@ -16,7 +16,18 @@ name: Route Receipt Reconciler
 # by setting the repo variables:
 #   RECONCILER_ENABLED   = true
 #   TEMPO_QUERY_ENDPOINT = http://<tailnet-reachable-tempo-host>:13200
+#   RECONCILER_SINCE     = <hook-go-live ISO-8601, e.g. 2026-06-06T08:00:00Z>
 # (and optionally OPEN_THRESHOLD_MIN / LOOKBACK_MIN / TEMPO_LIMIT).
+#
+# ── DEPLOYMENT-BOUNDARY CUTOFF (RECONCILER_SINCE) ────────────────────────────
+# Set RECONCILER_SINCE to the moment the receipt mechanism went live (the fleet
+# relaunch onto the v1.3.4 router + the UserPromptSubmit hook). Routes delivered
+# BEFORE that had no marker and hit hookless sessions → no `turn_processed`
+# receipt by construction → a missing receipt there is EXPECTED, not a drop. The
+# reconciler ignores pre-cutoff routes, so the FIRST run after enabling doesn't
+# false-alarm on every pre-deployment route still inside the lookback window
+# (macf#444). Self-obsoletes once LOOKBACK_MIN slides fully past the cutoff
+# (~LOOKBACK_MIN after relaunch); leaving it set is harmless. Unset ⇒ no cutoff.
 #
 # ── ALERT-ONLY, NO AUTO-REDELIVER (Instance-6 guard) ─────────────────────────
 # On a drop the workflow opens/append a `blocked` incident and @mentions the
@@ -87,6 +98,10 @@ jobs:
           OPEN_THRESHOLD_MIN: ${{ vars.OPEN_THRESHOLD_MIN || '15' }}
           LOOKBACK_MIN: ${{ vars.LOOKBACK_MIN || '360' }}
           TEMPO_LIMIT: ${{ vars.TEMPO_LIMIT || '1000' }}
+          # Deployment-boundary cutoff — ignore routes that predate the receipt
+          # mechanism's go-live (no marker / no hook → no receipt by construction,
+          # not a drop). Set to the relaunch time at the first flip (see header).
+          RECONCILER_SINCE: ${{ vars.RECONCILER_SINCE }}
         run: node packages/macf/dist/reconciler/run.js
 
       # Open-on-absence. Alert-only: @mention the COORDINATOR (science-agent),

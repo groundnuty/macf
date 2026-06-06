@@ -58,6 +58,23 @@ const TEMPO = envStr('TEMPO_QUERY_ENDPOINT', 'http://127.0.0.1:13200').replace(/
 const OPEN_THRESHOLD_MS = Number(envStr('OPEN_THRESHOLD_MIN', '15')) * MIN;
 const LOOKBACK_MS = Number(envStr('LOOKBACK_MIN', '360')) * MIN;
 const TEMPO_LIMIT = Number(envStr('TEMPO_LIMIT', '1000'));
+/** Deployment-boundary cutoff (groundnuty/macf#444): ignore routes delivered
+ *  before the receipt mechanism went live. Set `RECONCILER_SINCE` to the
+ *  hook-go-live time (ISO-8601 e.g. `2026-06-06T08:00:00Z`, or epoch ms) at the
+ *  first `RECONCILER_ENABLED` flip — pre-deployment routes had no marker + hit
+ *  hookless sessions, so their missing receipt is EXPECTED, not a drop. Without
+ *  it, run 1 would false-alarm on every pre-deployment route in the lookback.
+ *  Self-obsoletes once LOOKBACK_MIN slides fully past the cutoff; unset ⇒ no cutoff. */
+const SINCE_MS = ((): number | undefined => {
+  const raw = process.env['RECONCILER_SINCE'];
+  if (!raw) return undefined;
+  const ms = /^\d+$/.test(raw) ? Number(raw) : Date.parse(raw);
+  if (!Number.isFinite(ms)) {
+    console.error(`WARN: RECONCILER_SINCE="${raw}" not parseable (want ISO-8601 or epoch ms) — ignoring cutoff.`);
+    return undefined;
+  }
+  return ms;
+})();
 
 /** DELIVERED set: parse the router runs' `Routed … to <AGENT>` success lines. */
 function fetchDelivered(nowMs: number): DeliveredRoute[] {
@@ -130,11 +147,12 @@ async function main(): Promise<void> {
     return;
   }
   const delivered = fetchDelivered(nowMs);
-  const result = reconcile(delivered, processed, { nowMs, openThresholdMs: OPEN_THRESHOLD_MS });
+  const result = reconcile(delivered, processed, { nowMs, openThresholdMs: OPEN_THRESHOLD_MS, sinceMs: SINCE_MS });
   const dropsJson = JSON.stringify(result.drops);
   console.error(
     `reconcile: delivered=${result.deliveredCount} processed=${result.processedCount} ` +
-    `drops=${result.drops.length} in_flight=${result.inFlight.length}`,
+    `drops=${result.drops.length} in_flight=${result.inFlight.length}` +
+    (SINCE_MS ? ` (since=${new Date(SINCE_MS).toISOString()} — pre-deployment routes excluded)` : ''),
   );
   if (result.drops.length > 0) console.error(`DROPS: ${dropsJson}`);
   emit({ tempoOk: true, dropsCount: result.drops.length, inFlightCount: result.inFlight.length, dropsJson });
