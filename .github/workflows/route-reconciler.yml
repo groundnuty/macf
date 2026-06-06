@@ -1,0 +1,141 @@
+name: Route Receipt Reconciler
+
+# Piece 4 of Option D (groundnuty/macf#444): the consumer that turns a MISSING
+# `turn_processed` span into a structural alert (emission ≠ surfacing). It joins
+# the macf-actions router's delivered routes (run logs) against the substrate
+# UserPromptSubmit hook's `turn_processed` spans (Tempo) on `(run_id, agent)`;
+# a delivered route with no matching span past the open-threshold is a DROP
+# (#437's send≠receipt gap, now observable).
+#
+# ── DORMANT UNTIL ROLLOUT (false-alarm guard) ────────────────────────────────
+# The job is gated on `vars.RECONCILER_ENABLED == 'true'`. Until the rollout
+# lands (piece-1 marker released in macf-actions + piece-2 hook synced to the
+# substrate workspaces + a relaunch), the router IS delivering but NO
+# `turn_processed` spans exist yet → the reconciler would flag EVERY delivery as
+# a drop (false-alarm spam). So it ships OFF. The operator enables it at rollout
+# by setting the repo variables:
+#   RECONCILER_ENABLED   = true
+#   TEMPO_QUERY_ENDPOINT = http://<tailnet-reachable-tempo-host>:13200
+# (and optionally OPEN_THRESHOLD_MIN / LOOKBACK_MIN / TEMPO_LIMIT).
+#
+# ── ALERT-ONLY, NO AUTO-REDELIVER (Instance-6 guard) ─────────────────────────
+# On a drop the workflow opens/append a `blocked` incident and @mentions the
+# COORDINATOR (science-agent) to investigate — it must NEVER @mention the
+# dropped *recipient* agent, because that would fire route-by-mention and
+# auto-redeliver the ping (silent-fallback Instance 6 cross-agent loop). Re-
+# delivery, if ever wanted, is a deliberate human step off the incident.
+#
+# Open-on-absence / self-close-on-appearance (e2e.yml #166/#163 shape): while
+# drops exist the incident stays open; once a late span lands (busy agent) or
+# none remain, the next run reports drops=0 and self-closes.
+#
+# Security: github.* context goes through `env:`, never inline `${{ }}` in run:.
+
+on:
+  schedule:
+    # Every 15 min — aligned with the ~15 min open-threshold (a busy agent's
+    # late turn is still "in flight" within the threshold, not yet a drop).
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  reconcile:
+    # Dormant until the operator enables it post-rollout (see header).
+    if: vars.RECONCILER_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # Shared by the reconcile, open, and self-close steps so the dedup
+      # title-prefix stays in lockstep (same discipline as e2e.yml).
+      INCIDENT_TITLE_PREFIX: "routing: dropped ping (no turn_processed receipt)"
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - uses: actions/checkout@v6
+
+      - uses: jetify-com/devbox-install-action@v0.15.0
+
+      - name: Install + build (compiles dist/reconciler/run.js)
+        run: |
+          make -f dev.mk install
+          make -f dev.mk build
+
+      - name: Reconcile delivered routes vs turn_processed receipts
+        id: reconcile
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RECONCILER_REPO: ${{ github.repository }}
+          ROUTER_WORKFLOW: agent-router.yml
+          TEMPO_QUERY_ENDPOINT: ${{ vars.TEMPO_QUERY_ENDPOINT }}
+          OPEN_THRESHOLD_MIN: ${{ vars.OPEN_THRESHOLD_MIN || '15' }}
+          LOOKBACK_MIN: ${{ vars.LOOKBACK_MIN || '360' }}
+          TEMPO_LIMIT: ${{ vars.TEMPO_LIMIT || '1000' }}
+        run: node packages/macf/dist/reconciler/run.js
+
+      # Open-on-absence. Alert-only: @mention the COORDINATOR (science-agent),
+      # NEVER the dropped recipient agent (route-by-mention would auto-redeliver
+      # — Instance-6 hazard).
+      - name: Open / update incident on dropped pings
+        if: steps.reconcile.outputs.drops_count != '0' && steps.reconcile.outputs.drops_count != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DROPS_COUNT: ${{ steps.reconcile.outputs.drops_count }}
+          DROPS_JSON: ${{ steps.reconcile.outputs.drops_json }}
+        run: |
+          set -euo pipefail
+          EXISTING=$(gh issue list --repo "$REPO" --state open \
+            --search "\"$INCIDENT_TITLE_PREFIX\" in:title" --json number --jq '.[0].number // ""')
+
+          # Render the dropped (run_id, agent) pairs as a list with run links.
+          DROP_LINES=$(printf '%s' "$DROPS_JSON" | jq -r \
+            --arg base "${{ github.server_url }}/${{ github.repository }}/actions/runs" \
+            '.[] | "- agent `\(.agent)` — route run [\(.runId)](\($base)/\(.runId))"')
+
+          BODY=$(cat <<EOF
+          The route-receipt reconciler found **$DROPS_COUNT** delivered route(s) with no \`turn_processed\` receipt past the open-threshold — a ping the router logged as delivered that never became a turn (#437 send≠receipt gap / #444-D).
+
+          $DROP_LINES
+
+          Reconcile run: $RUN_URL
+
+          @macf-science-agent[bot] — routing drop detected; please investigate (the recipient agent may be offline, RC-bound, or its receipt hook not emitting). **Not auto-redelivered** (Instance-6 guard); re-route deliberately if needed. This incident **auto-closes** when a later reconcile finds the receipt (busy-agent late turn) or no remaining drops.
+          EOF
+          )
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
+            echo "Updated incident #$EXISTING"
+          else
+            gh issue create --repo "$REPO" \
+              --title "$INCIDENT_TITLE_PREFIX" \
+              --label "science-agent,blocked" \
+              --body "$BODY"
+          fi
+
+      # Self-close-on-appearance: no drops this run ⇒ the receipt landed (or none
+      # outstanding) ⇒ close any open incident. Schedule/dispatch only (a genuine
+      # reconcile pass).
+      - name: Self-close incident when no drops remain
+        if: steps.reconcile.outputs.drops_count == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          EXISTING=$(gh issue list --repo "$REPO" --state open \
+            --search "\"$INCIDENT_TITLE_PREFIX\" in:title" --json number --jq '.[0].number // ""')
+          if [ -z "$EXISTING" ]; then echo "No open routing-drop incident — no-op."; exit 0; fi
+          gh issue close "$EXISTING" --repo "$REPO" --reason completed \
+            --comment "Reconcile found no outstanding dropped pings (all delivered routes have \`turn_processed\` receipts). Auto-closed; re-opens via title-prefix dedup if a drop recurs. Run: $RUN_URL"
+          echo "Closed incident #$EXISTING"
