@@ -84,3 +84,21 @@ export function parseProcessedFromTempo(body: unknown): ParseProcessedResult {
 
   return { receipts, traceCount: traces.length };
 }
+
+/**
+ * Interpret a parsed result against the Tempo query `limit`. A result that HIT
+ * the limit is (possibly) TRUNCATED — and a truncated PROCESSED set is missing
+ * real receipts, which `reconcile()` would read as drops → a FALSE incident on
+ * exactly the busy windows the reconciler exists to handle (Pattern A). So
+ * truncation is NOT "these are the receipts"; it makes the PROCESSED set
+ * **unknowable**, the same as a Tempo outage. Returns the receipts only when
+ * the set is known-complete (`traceCount < limit`), else `null` — the caller
+ * treats `null` as "Tempo problem → true no-op this run" (never open, never
+ * close), distinguishing "Tempo unknown" from "0 verified drops".
+ */
+export function receiptsIfComplete(
+  parsed: ParseProcessedResult,
+  limit: number,
+): readonly ProcessedReceipt[] | null {
+  return parsed.traceCount >= limit ? null : parsed.receipts;
+}

@@ -10,14 +10,19 @@
  *   2. PROCESSED — Tempo `/api/search` for `turn_processed` spans → parse the
  *      `(routed_run_id, agent)` attrs.
  *   3. reconcile() → drops (delivered, no receipt, older than the open-threshold).
- *   4. Emit `drops_count` / `drops_json` to `$GITHUB_OUTPUT` for the workflow's
- *      open-on-absence / self-close-on-appearance incident steps.
+ *   4. Emit `tempo_ok` + `drops_count` / `drops_json` to `$GITHUB_OUTPUT` for
+ *      the workflow's open-on-absence / self-close-on-appearance incident steps.
  *
- * Pattern-A safety (false-drop avoidance): a Tempo query FAILURE makes the
- * PROCESSED set unknowable — treating it as empty would flag every delivery as
- * a drop. So on Tempo failure we abort WITHOUT emitting drops (exit 0, loud
- * WARN); and on a result count hitting the limit we WARN (silent truncation =
- * false drops). Never alert on a Tempo problem; only on real missing receipts.
+ * Pattern-A safety (false-drop avoidance): any Tempo problem — unreachable,
+ * HTTP error, OR a result hitting the `limit` (truncation) — makes the
+ * PROCESSED set UNKNOWABLE, which is NOT the same as "zero drops". Treating it
+ * as empty would false-OPEN incidents (a truncated set reads as missing
+ * receipts) and treating it as `drops_count=0` would false-CLOSE a real
+ * incident on a transient outage. So all three paths emit `tempo_ok=false`;
+ * the workflow gates BOTH the open AND the self-close steps on
+ * `tempo_ok == 'true'`, making a Tempo problem a TRUE no-op (incidents left
+ * exactly as they are). Only a verified-complete query opens (real drops) or
+ * closes (verified zero).
  *
  * Config (env, set by the workflow):
  *   RECONCILER_REPO        owner/repo (default $GITHUB_REPOSITORY)
@@ -31,9 +36,17 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 import { reconcile, type DeliveredRoute, type ProcessedReceipt } from './reconcile.js';
 import { parseDeliveredFromLog } from './parse-delivered.js';
-import { parseProcessedFromTempo } from './parse-processed.js';
+import { parseProcessedFromTempo, receiptsIfComplete } from './parse-processed.js';
 
 const MIN = 60_000;
+/** `gh run list` page cap. If the router bursts past this in the lookback
+ *  window the DELIVERED set truncates silently (Pattern A on the delivered
+ *  side: a missed delivery → its receipt is never looked for → a real drop is
+ *  silently NOT flagged). We WARN when the cap is hit so the symmetry is
+ *  observable, but don't abort: delivered-side truncation under-reports drops
+ *  (false negative), which is far less harmful than the processed-side
+ *  truncation that would over-report them (false incident). */
+const RUN_LIST_LIMIT = 100;
 const envStr = (name: string, def: string): string => {
   const v = process.env[name];
   return v !== undefined && v.length > 0 ? v : def;
@@ -51,10 +64,13 @@ function fetchDelivered(nowMs: number): DeliveredRoute[] {
   const listJson = execFileSync(
     'gh',
     ['run', 'list', '--repo', REPO, '--workflow', ROUTER_WORKFLOW,
-     '--status', 'success', '--limit', '100', '--json', 'databaseId,createdAt'],
+     '--status', 'success', '--limit', String(RUN_LIST_LIMIT), '--json', 'databaseId,createdAt'],
     { encoding: 'utf-8' },
   );
   const runs = JSON.parse(listJson) as ReadonlyArray<{ databaseId: number; createdAt: string }>;
+  if (runs.length >= RUN_LIST_LIMIT) {
+    console.error(`WARN: gh run list hit the ${RUN_LIST_LIMIT}-run cap — the DELIVERED set may be truncated (Pattern A on the delivered side): older routes in the ${LOOKBACK_MS / MIN}-min window fall off the page, so their receipts are never looked for and a real drop could go unflagged. Narrow LOOKBACK_MIN or raise the run-list cap.`);
+  }
   const out: DeliveredRoute[] = [];
   for (const run of runs) {
     const createdMs = Date.parse(run.createdAt);
@@ -86,12 +102,16 @@ async function fetchProcessed(nowMs: number): Promise<readonly ProcessedReceipt[
     return null;
   }
   if (!res.ok) {
-    console.error(`WARN: Tempo query HTTP ${res.status} — NOT flagging drops this run (avoids false alarms).`);
+    console.error(`WARN: Tempo query HTTP ${res.status} — PROCESSED set unknowable; treating as Tempo-unknown (true no-op this run).`);
     return null;
   }
-  const { receipts, traceCount } = parseProcessedFromTempo(await res.json());
-  if (traceCount >= TEMPO_LIMIT) {
-    console.error(`WARN: Tempo returned ${traceCount} >= limit ${TEMPO_LIMIT} — possible silent truncation → false drops (Pattern A). Narrow LOOKBACK_MIN or raise TEMPO_LIMIT.`);
+  const parsed = parseProcessedFromTempo(await res.json());
+  // Truncation is a Tempo problem too: an incomplete PROCESSED set reads as
+  // missing receipts → false drops. receiptsIfComplete() returns null when the
+  // result hit the limit, so it's handled identically to unreachable/HTTP-error.
+  const receipts = receiptsIfComplete(parsed, TEMPO_LIMIT);
+  if (receipts === null) {
+    console.error(`WARN: Tempo returned ${parsed.traceCount} >= limit ${TEMPO_LIMIT} — PROCESSED set may be truncated (Pattern A: a truncated set reads as missing receipts → false drops). Treating as Tempo-unknown (true no-op this run); narrow LOOKBACK_MIN or raise TEMPO_LIMIT.`);
   }
   return receipts;
 }
@@ -100,8 +120,13 @@ async function main(): Promise<void> {
   const nowMs = Date.now();
   const processed = await fetchProcessed(nowMs);
   if (processed === null) {
-    // Tempo problem — emit zero drops so the workflow self-closes/no-ops; never false-alarm.
-    emit({ dropsCount: 0, inFlightCount: 0, dropsJson: '[]' });
+    // Tempo problem (unreachable / HTTP error / truncated) — the PROCESSED set
+    // is UNKNOWABLE, NOT "zero drops". Emit tempo_ok=false; the workflow gates
+    // BOTH its open AND its self-close steps on tempo_ok==true, so this is a
+    // TRUE no-op: incidents are left exactly as they are (never false-OPEN on a
+    // truncated set, never false-CLOSE a real incident on a transient outage).
+    console.error('WARN: PROCESSED set unknowable this run — emitting tempo_ok=false (no open, no close).');
+    emit({ tempoOk: false, dropsCount: 0, inFlightCount: 0, dropsJson: '[]' });
     return;
   }
   const delivered = fetchDelivered(nowMs);
@@ -112,13 +137,13 @@ async function main(): Promise<void> {
     `drops=${result.drops.length} in_flight=${result.inFlight.length}`,
   );
   if (result.drops.length > 0) console.error(`DROPS: ${dropsJson}`);
-  emit({ dropsCount: result.drops.length, inFlightCount: result.inFlight.length, dropsJson });
+  emit({ tempoOk: true, dropsCount: result.drops.length, inFlightCount: result.inFlight.length, dropsJson });
 }
 
-function emit(o: { dropsCount: number; inFlightCount: number; dropsJson: string }): void {
+function emit(o: { tempoOk: boolean; dropsCount: number; inFlightCount: number; dropsJson: string }): void {
   const out = process.env['GITHUB_OUTPUT'];
   if (!out) return;
-  appendFileSync(out, `drops_count=${o.dropsCount}\nin_flight_count=${o.inFlightCount}\ndrops_json=${o.dropsJson}\n`);
+  appendFileSync(out, `tempo_ok=${o.tempoOk}\ndrops_count=${o.dropsCount}\nin_flight_count=${o.inFlightCount}\ndrops_json=${o.dropsJson}\n`);
 }
 
 main().catch((err) => {

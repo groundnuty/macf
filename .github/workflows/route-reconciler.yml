@@ -29,6 +29,15 @@ name: Route Receipt Reconciler
 # drops exist the incident stays open; once a late span lands (busy agent) or
 # none remain, the next run reports drops=0 and self-closes.
 #
+# ── TEMPO PROBLEM = TRUE NO-OP (Pattern A) ───────────────────────────────────
+# A Tempo problem (unreachable / HTTP error / result hitting the query limit =
+# truncation) makes the PROCESSED set UNKNOWABLE, NOT "zero drops". The
+# reconciler emits `tempo_ok=false` in that case, and BOTH the open and the
+# self-close steps are gated on `tempo_ok == 'true'`. So a Tempo problem leaves
+# incidents exactly as they are: it never false-OPENS on a truncated set (which
+# reads as missing receipts) and never false-CLOSES a real incident on a
+# transient outage. Only a verified-complete query opens (real drops) or closes.
+#
 # Security: github.* context goes through `env:`, never inline `${{ }}` in run:.
 
 on:
@@ -84,7 +93,11 @@ jobs:
       # NEVER the dropped recipient agent (route-by-mention would auto-redeliver
       # — Instance-6 hazard).
       - name: Open / update incident on dropped pings
-        if: steps.reconcile.outputs.drops_count != '0' && steps.reconcile.outputs.drops_count != ''
+        # tempo_ok gate: a Tempo problem (unreachable / HTTP error / truncated)
+        # emits tempo_ok=false → neither open NOR close runs (true no-op). Only a
+        # verified-complete query with real drops opens. Avoids false-OPEN on a
+        # truncated PROCESSED set (Pattern A).
+        if: steps.reconcile.outputs.tempo_ok == 'true' && steps.reconcile.outputs.drops_count != '0' && steps.reconcile.outputs.drops_count != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -126,7 +139,10 @@ jobs:
       # outstanding) ⇒ close any open incident. Schedule/dispatch only (a genuine
       # reconcile pass).
       - name: Self-close incident when no drops remain
-        if: steps.reconcile.outputs.drops_count == '0'
+        # tempo_ok gate: only self-close on a VERIFIED-complete zero — never
+        # close a real incident just because Tempo was briefly unreachable /
+        # errored / truncated this run (that would false-CLOSE; Pattern A).
+        if: steps.reconcile.outputs.tempo_ok == 'true' && steps.reconcile.outputs.drops_count == '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}

@@ -4,7 +4,7 @@
  * science recorded (`traces[].spanSets[].spans[].attributes[]`, typed values).
  */
 import { describe, it, expect } from 'vitest';
-import { parseProcessedFromTempo } from '../../src/reconciler/parse-processed.js';
+import { parseProcessedFromTempo, receiptsIfComplete } from '../../src/reconciler/parse-processed.js';
 
 function trace(runId: string, agent: string) {
   return {
@@ -67,5 +67,27 @@ describe('parseProcessedFromTempo', () => {
     const r = parseProcessedFromTempo({ traces });
     expect(r.traceCount).toBe(20);
     expect(r.receipts).toHaveLength(20);
+  });
+});
+
+describe('receiptsIfComplete (truncation = Tempo-unknown, not "these receipts")', () => {
+  const parsed = (traceCount: number) => ({
+    receipts: [{ runId: '1', agent: 'code-agent' }] as const,
+    traceCount,
+  });
+
+  it('returns the receipts when the result is known-complete (traceCount < limit)', () => {
+    expect(receiptsIfComplete(parsed(5), 1000)).toEqual([{ runId: '1', agent: 'code-agent' }]);
+  });
+
+  it('returns null at the truncation boundary (traceCount === limit) — set unknowable, not "0 drops"', () => {
+    // Hitting the limit means MORE results may exist past the page → the
+    // PROCESSED set is incomplete → false drops if we trusted it. Same class as
+    // a Tempo outage: the caller treats null as a true no-op (no open/close).
+    expect(receiptsIfComplete(parsed(1000), 1000)).toBeNull();
+  });
+
+  it('returns null when over the limit (traceCount > limit)', () => {
+    expect(receiptsIfComplete(parsed(1001), 1000)).toBeNull();
   });
 });
