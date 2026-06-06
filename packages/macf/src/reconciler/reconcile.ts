@@ -60,6 +60,16 @@ export interface ReconcileOptions {
    * busy-turn latency (#437: ~4 min) — default ≈15 min, env-tunable.
    */
   readonly openThresholdMs: number;
+  /**
+   * Deployment-boundary cutoff (epoch ms): ignore delivered routes older than
+   * this. Routes that predate the receipt mechanism's go-live (a pre-v1.3.4
+   * router prompt with no marker, hitting a session with no hook) have no
+   * `turn_processed` receipt by construction — a missing receipt there is
+   * EXPECTED, not a drop. Without this the first reconcile after enabling
+   * would flag every pre-deployment route in the lookback window as a false
+   * drop (groundnuty/macf#444). Undefined / 0 ⇒ no cutoff (judge all routes).
+   */
+  readonly sinceMs?: number;
 }
 
 export interface ReconcileResult {
@@ -97,10 +107,18 @@ export function reconcile(
 ): ReconcileResult {
   const processedKeys = new Set(processed.map(receiptKey));
 
+  // Deployment-boundary guard (groundnuty/macf#444): drop routes delivered
+  // before the receipt mechanism went live from scope entirely — those prompts
+  // had no marker and hit hookless sessions, so a missing receipt is EXPECTED,
+  // not a drop. Else the first reconcile after enabling would false-alarm on
+  // every pre-deployment route in the lookback window.
+  const sinceMs = opts.sinceMs;
+  const inScope = sinceMs ? delivered.filter((r) => r.deliveredAtMs >= sinceMs) : delivered;
+
   const drops: DeliveredRoute[] = [];
   const inFlight: DeliveredRoute[] = [];
 
-  for (const route of delivered) {
+  for (const route of inScope) {
     if (processedKeys.has(receiptKey(route))) continue; // receipt landed — fine
     const ageMs = opts.nowMs - route.deliveredAtMs;
     if (ageMs > opts.openThresholdMs) {
@@ -113,7 +131,7 @@ export function reconcile(
   return {
     drops,
     inFlight,
-    deliveredCount: delivered.length,
+    deliveredCount: inScope.length,
     processedCount: processedKeys.size,
   };
 }

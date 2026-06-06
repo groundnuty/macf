@@ -90,3 +90,38 @@ describe('reconcile', () => {
     expect(r.inFlight.map((d) => d.runId)).toEqual(['2']);
   });
 });
+
+describe('reconcile — RECONCILER_SINCE deployment-boundary cutoff (macf#444)', () => {
+  const CUTOFF = NOW - 20 * MIN; // receipt mechanism went live 20 min ago
+
+  it('a pre-cutoff route with no receipt is NOT a drop (predates the receipt mechanism)', () => {
+    // delivered 30 min ago = before the 20-min cutoff → out of scope entirely
+    const r = reconcile([delivered('1', 'code-agent', 30)], [], { ...opts, sinceMs: CUTOFF });
+    expect(r.drops).toHaveLength(0);
+    expect(r.inFlight).toHaveLength(0);
+    expect(r.deliveredCount).toBe(0); // excluded from scope, not just un-dropped
+  });
+
+  it('a post-cutoff route with no receipt, older than threshold, IS still a drop', () => {
+    // delivered 18 min ago = after the cutoff AND past the 15-min threshold
+    const r = reconcile([delivered('2', 'code-agent', 18)], [], { ...opts, sinceMs: CUTOFF });
+    expect(r.drops.map((d) => d.runId)).toEqual(['2']);
+    expect(r.deliveredCount).toBe(1);
+  });
+
+  it('mixed: pre-cutoff routes are silently out of scope; only post-cutoff unmatched are judged', () => {
+    const r = reconcile(
+      [delivered('old', 'code-agent', 40), delivered('new', 'code-agent', 18)],
+      [],
+      { ...opts, sinceMs: CUTOFF },
+    );
+    expect(r.drops.map((d) => d.runId)).toEqual(['new']);
+    expect(r.deliveredCount).toBe(1); // 'old' excluded
+  });
+
+  it('without sinceMs, ALL routes are judged (backward-compat — no cutoff)', () => {
+    const r = reconcile([delivered('old', 'code-agent', 40)], [], opts);
+    expect(r.drops.map((d) => d.runId)).toEqual(['old']);
+    expect(r.deliveredCount).toBe(1);
+  });
+});
