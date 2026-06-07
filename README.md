@@ -97,6 +97,8 @@ MACF generalizes that PoC into an N-agent framework with typed roles, cross-repo
 
 **Routing transport:** the routing-Action workflow (running on a GitHub Actions runner) makes a `curl --cert ... --key ... --cacert ...` POST against the recipient agent's channel server `/notify` endpoint. **mTLS-only — no SSH for routing in canonical MACF** (`macf-actions@v3+`). The channel server rejects any client cert not signed by the project CA.
 
+> **Routing-stage carve-out.** Stage 3 (`macf-actions@v3`, mTLS) is canonical for **new** consumer projects. The established **substrate / CV fleet** (`groundnuty/macf`, `macf-science-agent`, `macf-devops-toolkit`, …) deliberately stays on the **v1.x SSH/tmux routing primitive** (`macf-actions@v1.3.x`, latest **`v1.3.4`**) per the 2026-04-27 operator directive. The two stages don't interoperate — an agent joining the CV fleet must pin `@v1.3.x` to match, **not** `@v3`. See [`design/macf-consumer-onboarding.md`](design/macf-consumer-onboarding.md) §"Routing-stage carve-out".
+
 **On SSH:** Tailscale SSH is for the operator's standard VM admin (attach to a tmux pane, inspect a log, intervene mid-prompt) — NOT MACF coordination infrastructure. Routing fires structurally via the workflow + mTLS regardless of whether any operator is SSH'd in.
 
 Key primitives:
@@ -242,11 +244,11 @@ MACF spans three repos, each with a distinct lifecycle:
 - **[`groundnuty/macf-actions`](https://github.com/groundnuty/macf-actions)** — reusable GitHub Actions workflow that routes issue / comment / PR / check-suite / pull_request_review events to agents' tmux sessions (Stage 2) or to their channel endpoints (Stage 3, mTLS). Consumed via `uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3` in coordination repos. Latest tag `v3.3.0` ships `route-by-pr-review-state` (LGTM-routing structural defense).
 - **[`groundnuty/macf-marketplace`](https://github.com/groundnuty/macf-marketplace)** — Claude Code plugin marketplace hosting the `macf-agent` plugin (skills: `/macf-status`, `/macf-peers`, `/macf-ping`, `/macf-issues`; agent identity templates; hooks). `macf init` / `macf update` fetch the plugin at a pinned tag into `<workspace>/.macf/plugin/`; `claude.sh` loads it via `--plugin-dir`.
 
-Releases are tag-versioned per repo; consumers pin to major tags (`@v3` for routing, currently at `v3.3.0`) and to exact versions for the plugin (currently `0.2.10`). Design rationale in [DR-013](design/decisions/DR-013-plugin-versioning.md).
+Releases are tag-versioned per repo; consumers pin to major tags (`@v3` for Stage-3 routing, currently at `v3.3.0`; the substrate/CV fleet pins the v1.x primitive at `v1.3.4`) and to exact versions for the plugin (currently `0.2.35`). Design rationale in [DR-013](design/decisions/DR-013-plugin-versioning.md).
 
 ## Status
 
-- **Latest CLI release**: [`v0.2.10`](CHANGELOG.md#0210--2026-05-01) (2026-05-01)
+- **Latest CLI release**: [`v0.2.35`](CHANGELOG.md) (2026-06-05) — see `CHANGELOG.md` for the v0.2.10→v0.2.35 arc (A2A, hardening queue, receipt-observable routing)
 - **Phases P1–P7**: shipped and on main
 - **Routing transport**: mTLS HTTPS POST `/notify` via `macf-actions@v3.3.0`. Includes `route-by-pr-review-state` Path-2 LGTM-handoff defense. SSH-based routing was an earlier generation (Stage 2; gone from active code in `macf-actions@v3+`)
 - **Security hardening**: PBKDF2 at OWASP 2023 levels, clientAuth EKU enforcement, attribution-trap PreToolUse hook (structural, not behavioral), `/sign` challenge verification, schema-validated payloads. Plus `check-mention-routing.sh` Check A (must-have-mention) + Check B (must-not-leak) hooks structurally enforcing `coordination.md §Communication 2` + `mention-routing-hygiene.md §5`

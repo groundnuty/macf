@@ -64,7 +64,7 @@ On your VM:
 ```bash
 npm install -g @groundnuty/macf
 macf --version
-# Expected: 0.2.9 (or later)
+# Expected: 0.2.35 (or later)
 ```
 
 That's it; the CLI is now on `PATH`.
@@ -99,7 +99,7 @@ macf repo-init \
 This creates:
 
 - `.github/agent-config.json` — registry pointer + per-agent metadata (App slug, tmux session, workspace path)
-- `.github/workflows/agent-router.yml` — references `groundnuty/macf-actions/.github/workflows/agent-router.yml@v3`
+- `.github/workflows/agent-router.yml` — references `groundnuty/macf-actions/.github/workflows/agent-router.yml@v3` (Stage-3 mTLS, the default for a new project). **If this agent must coordinate with the existing substrate/CV fleet, pin `@v1.3.4` instead** — that fleet runs the v1.x SSH/tmux routing primitive (per the 2026-04-27 operator directive) and the two stages don't interoperate. See [`design/macf-consumer-onboarding.md`](../design/macf-consumer-onboarding.md) §"Routing-stage carve-out"
 - Labels: `code-agent`, `in-progress`, `in-review`, `blocked`, `agent-offline` (and similar for any other agents listed)
 - Required secrets/variables (you may need to provision these manually; the script tells you which)
 

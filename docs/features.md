@@ -1,6 +1,6 @@
-# Features (v0.2.9)
+# Features (v0.2.35)
 
-Per-component reference: what each piece is, what it does, when you'd use it. Version pinned to v0.2.9 (latest npm release as of 2026-04-30). Later versions inherit; check `CHANGELOG.md` for additions.
+Per-component reference: what each piece is, what it does, when you'd use it. Current as of **v0.2.35** (latest npm release, 2026-06-05). Some sub-sections still cite the version a feature *landed* in ("added in v0.2.9") — those are accurate history; the inventory reflects current behavior. For the full delta since v0.2.9 (A2A surface, version-aware collision takeover, close-keyword + turn-receipt routing hooks, channel-server version-pinning at `init`, routing-reliability hardening), see `CHANGELOG.md`.
 
 ## CLI surface
 

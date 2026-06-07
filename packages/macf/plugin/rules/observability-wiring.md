@@ -13,7 +13,7 @@ Every MACF agent's `claude.sh` launcher exports the Claude Code native OpenTelem
 | `OTEL_TRACES_EXPORTER` | `otlp` | Emit traces. Without it, no spans even if master gate is on |
 | `OTEL_METRICS_EXPORTER` | `otlp` | Emit metrics. **Per-signal** — separate from traces |
 | `OTEL_LOGS_EXPORTER` | `otlp` | Emit logs. **Per-signal** — separate from traces |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` (default) | OTLP HTTP receiver. Override via `MACF_OTEL_ENDPOINT` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:14318` (macf canonical — the bare OTLP default `:4318` is overridden by `macf init`/`update`) | OTLP HTTP receiver. Override via `MACF_OTEL_ENDPOINT` |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | Wire protocol |
 | `OTEL_SERVICE_NAME` | `macf-agent-<name>` | All MACF agents grouped under one service.name family |
 | `OTEL_RESOURCE_ATTRIBUTES` | `gen_ai.agent.name=<name>,gen_ai.agent.role=<role>,service.namespace=macf` | Semconv-compliant resource attrs |
@@ -32,10 +32,10 @@ Per-workspace, two env knobs read at `macf init` / `macf update` time:
   - Deployment has no OTLP receiver running (no observability stack)
   - You want zero retry-spam from the exporter
   - Agent runs offline / on a host that can't reach the collector
-- `MACF_OTEL_ENDPOINT=http://central-host:4318` — overrides the default `http://localhost:4318`. Use when:
+- `MACF_OTEL_ENDPOINT=http://central-host:14318` — overrides the default `http://localhost:14318`. Use when:
   - The observability stack is on a different host (Tailscale tailnet, reverse proxy, central collector)
   - You're running multiple MACF deployments and want them all reporting to one collector
-  - The default port `4318` collides with another service on the agent's host (e.g., devops-toolkit's compose stack uses `:14318` for this reason)
+  - **Note:** the canonical macf-devops-toolkit k3d stack serves OTLP HTTP on `:14318` (the bare-SDK default `:4318` was retired 2026-04-25 after it collided with the prior compose stack and caused 34 min of zero-telemetry on CV agents — macf#282/#283). Use `:14318`, not `:4318`.
 
 To apply a knob: set the env var BEFORE running `macf update`. The launcher re-renders with the new state.
 
