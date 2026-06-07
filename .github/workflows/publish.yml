@@ -77,6 +77,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: jetify-com/devbox-install-action@v0.15.0
+        with:
+          devbox-version: '0.16.0'  # pin: 0.17.x ships a require()-in-ESM helper that crashes in our "type":"module" repo (no-floating-tags directive)
 
       - name: Derive version from tag or package.json
         id: version
