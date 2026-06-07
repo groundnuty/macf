@@ -99,7 +99,7 @@ macf repo-init \
 This creates:
 
 - `.github/agent-config.json` — registry pointer + per-agent metadata (App slug, tmux session, workspace path)
-- `.github/workflows/agent-router.yml` — references `groundnuty/macf-actions/.github/workflows/agent-router.yml@v3` (Stage-3 mTLS, the default for a new project). **If this agent must coordinate with the existing substrate/CV fleet, pin `@v1.3.4` instead** — that fleet runs the v1.x SSH/tmux routing primitive (per the 2026-04-27 operator directive) and the two stages don't interoperate. See [`design/macf-consumer-onboarding.md`](../design/macf-consumer-onboarding.md) §"Routing-stage carve-out"
+- `.github/workflows/agent-router.yml` — references `groundnuty/macf-actions/.github/workflows/agent-router.yml@v3` (Stage-3 mTLS, the default for a new project). **Transitional caveat:** the substrate/CV fleet currently runs a legacy v1.x SSH/tmux primitive (`@v1.3.x`) but is migrating to Stage 3 (#467); the two stages don't interoperate, so if you must coordinate with that fleet *while its migration is in progress*, match its current `agent-router.yml` stage rather than assuming `@v3`. See [`design/macf-consumer-onboarding.md`](../design/macf-consumer-onboarding.md) §"Routing-stage"
 - Labels: `code-agent`, `in-progress`, `in-review`, `blocked`, `agent-offline` (and similar for any other agents listed)
 - Required secrets/variables (you may need to provision these manually; the script tells you which)
 
