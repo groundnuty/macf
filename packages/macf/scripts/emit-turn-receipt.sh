@@ -30,13 +30,14 @@ if command -v jq >/dev/null 2>&1; then
 fi
 [ -z "$PROMPT" ] && PROMPT="$INPUT"
 
-# Route-correlation marker: [macf-route:<digits>:<kebab-agent>]. No match → not
-# a routed prompt → no-op.
-MARKER="$(printf '%s' "$PROMPT" | grep -oE '\[macf-route:[0-9]+:[a-z0-9-]+\]' | head -1 || true)"
-[ -z "$MARKER" ] && exit 0
-
-RUN_ID="$(printf '%s' "$MARKER" | sed -E 's/.*\[macf-route:([0-9]+):([a-z0-9-]+)\].*/\1/')"
-AGENT="$(printf '%s' "$MARKER" | sed -E 's/.*\[macf-route:([0-9]+):([a-z0-9-]+)\].*/\2/')"
+# Route-correlation markers: [macf-route:<digits>:<kebab-agent>]. No match → not
+# a routed prompt → no-op. A COALESCED turn (a busy agent processing several
+# queued routed pings in one turn) carries MULTIPLE markers — emit a receipt for
+# EACH distinct one. A receipt then means "the marked prompt reached the agent",
+# not "a distinct turn happened". (Was `head -1`, which under-emitted → the
+# macf#444 reconciler false-flagged the un-receipted markers as drops — #462.)
+MARKERS="$(printf '%s' "$PROMPT" | grep -oE '\[macf-route:[0-9]+:[a-z0-9-]+\]' | sort -u || true)"
+[ -z "$MARKERS" ] && exit 0
 
 # Need curl + openssl to emit; absent → degrade silently (no span, no noise).
 command -v curl >/dev/null 2>&1 || exit 0
@@ -44,21 +45,27 @@ command -v openssl >/dev/null 2>&1 || exit 0
 
 BASE="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://127.0.0.1:14318}"
 BASE="${BASE%/v1/traces}"
-TID="$(openssl rand -hex 16)"
-SID="$(openssl rand -hex 8)"
 
-# Nanosecond epoch. `date +%s%N` is GNU-only (substrate is Linux); on a BSD/mac
-# date that prints a literal `N`, fall back to seconds×1e9.
-NOW="$(date +%s%N 2>/dev/null || true)"
-case "$NOW" in
-  *N|'' ) NOW="$(( $(date +%s) * 1000000000 ))" ;;
-esac
+# One independent span per distinct marker (own trace/span id + timestamp).
+printf '%s\n' "$MARKERS" | while IFS= read -r MARKER; do
+  [ -z "$MARKER" ] && continue
+  RUN_ID="$(printf '%s' "$MARKER" | sed -E 's/.*\[macf-route:([0-9]+):([a-z0-9-]+)\].*/\1/')"
+  AGENT="$(printf '%s' "$MARKER" | sed -E 's/.*\[macf-route:([0-9]+):([a-z0-9-]+)\].*/\2/')"
 
-# Identity on resource attrs (matches the collector's resource/paper-dims +
-# the `{resource."gen_ai.agent.name"=…}` TraceQL); correlation on span attrs.
-curl -sf -m 3 -X POST "${BASE}/v1/traces" \
-  -H 'Content-Type: application/json' --data-binary @- <<JSON >/dev/null \
-  || echo "WARN: turn_processed span emit failed (endpoint=${BASE}/v1/traces run=${RUN_ID} agent=${AGENT})" >&2
+  # Nanosecond epoch. `date +%s%N` is GNU-only (substrate is Linux); on a BSD/mac
+  # date that prints a literal `N`, fall back to seconds×1e9.
+  NOW="$(date +%s%N 2>/dev/null || true)"
+  case "$NOW" in
+    *N|'' ) NOW="$(( $(date +%s) * 1000000000 ))" ;;
+  esac
+  TID="$(openssl rand -hex 16)"
+  SID="$(openssl rand -hex 8)"
+
+  # Identity on resource attrs (matches the collector's resource/paper-dims +
+  # the `{resource."gen_ai.agent.name"=…}` TraceQL); correlation on span attrs.
+  curl -sf -m 3 -X POST "${BASE}/v1/traces" \
+    -H 'Content-Type: application/json' --data-binary @- <<JSON >/dev/null \
+    || echo "WARN: turn_processed span emit failed (endpoint=${BASE}/v1/traces run=${RUN_ID} agent=${AGENT})" >&2
 {"resourceSpans":[{"resource":{"attributes":[
   {"key":"service.name","value":{"stringValue":"${OTEL_SERVICE_NAME:-macf-agent}"}},
   {"key":"gen_ai.agent.name","value":{"stringValue":"${AGENT}"}},
@@ -69,5 +76,6 @@ curl -sf -m 3 -X POST "${BASE}/v1/traces" \
   "attributes":[{"key":"routed_run_id","value":{"stringValue":"${RUN_ID}"}},
     {"key":"agent","value":{"stringValue":"${AGENT}"}}],"status":{"code":1}}]}]}]}
 JSON
+done
 
 exit 0

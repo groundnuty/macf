@@ -49,6 +49,14 @@ name: Route Receipt Reconciler
 # reads as missing receipts) and never false-CLOSES a real incident on a
 # transient outage. Only a verified-complete query opens (real drops) or closes.
 #
+# ── DELIVERED TRUNCATION = TRUE NO-OP (Pattern A, delivered side; macf#462) ───
+# Symmetric guard on the OTHER set: if `gh run list` hits its run cap the
+# DELIVERED set is truncated (older routes fell off the page) → also UNKNOWABLE.
+# The reconciler emits `delivered_ok=false`, and both steps additionally gate on
+# `delivered_ok == 'true'`, so a truncated delivered set is a true no-op too
+# (silently bounding coverage would let a real drop hide). LOOKBACK_MIN defaults
+# to 120 to keep the window below the router's cap-exceeding volume.
+#
 # Security: github.* context goes through `env:`, never inline `${{ }}` in run:.
 
 on:
@@ -120,7 +128,7 @@ jobs:
           ROUTER_WORKFLOW: agent-router.yml
           TEMPO_QUERY_ENDPOINT: ${{ vars.TEMPO_QUERY_ENDPOINT }}
           OPEN_THRESHOLD_MIN: ${{ vars.OPEN_THRESHOLD_MIN || '15' }}
-          LOOKBACK_MIN: ${{ vars.LOOKBACK_MIN || '360' }}
+          LOOKBACK_MIN: ${{ vars.LOOKBACK_MIN || '120' }}
           TEMPO_LIMIT: ${{ vars.TEMPO_LIMIT || '1000' }}
           # Deployment-boundary cutoff — ignore routes that predate the receipt
           # mechanism's go-live (no marker / no hook → no receipt by construction,
@@ -136,7 +144,7 @@ jobs:
         # emits tempo_ok=false → neither open NOR close runs (true no-op). Only a
         # verified-complete query with real drops opens. Avoids false-OPEN on a
         # truncated PROCESSED set (Pattern A).
-        if: steps.reconcile.outputs.tempo_ok == 'true' && steps.reconcile.outputs.drops_count != '0' && steps.reconcile.outputs.drops_count != ''
+        if: steps.reconcile.outputs.tempo_ok == 'true' && steps.reconcile.outputs.delivered_ok == 'true' && steps.reconcile.outputs.drops_count != '0' && steps.reconcile.outputs.drops_count != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -181,7 +189,7 @@ jobs:
         # tempo_ok gate: only self-close on a VERIFIED-complete zero — never
         # close a real incident just because Tempo was briefly unreachable /
         # errored / truncated this run (that would false-CLOSE; Pattern A).
-        if: steps.reconcile.outputs.tempo_ok == 'true' && steps.reconcile.outputs.drops_count == '0'
+        if: steps.reconcile.outputs.tempo_ok == 'true' && steps.reconcile.outputs.delivered_ok == 'true' && steps.reconcile.outputs.drops_count == '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}

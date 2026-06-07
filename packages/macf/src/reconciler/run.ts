@@ -29,7 +29,9 @@
  *   ROUTER_WORKFLOW        router workflow file (default agent-router.yml)
  *   TEMPO_QUERY_ENDPOINT   Tempo query base, e.g. http://<tailnet-host>:13200
  *   OPEN_THRESHOLD_MIN     drop threshold, must exceed busy-turn latency (default 15)
- *   LOOKBACK_MIN           how far back to scan runs + Tempo (default 360)
+ *   LOOKBACK_MIN           how far back to scan runs + Tempo (default 120; keep
+ *                          below the window where the router exceeds the run-list
+ *                          cap, else the DELIVERED set truncates → delivered_ok=false)
  *   TEMPO_LIMIT            Tempo search result cap (default 1000)
  */
 import { execFileSync } from 'node:child_process';
@@ -56,7 +58,7 @@ const REPO = envStr('RECONCILER_REPO', process.env['GITHUB_REPOSITORY'] ?? '');
 const ROUTER_WORKFLOW = envStr('ROUTER_WORKFLOW', 'agent-router.yml');
 const TEMPO = envStr('TEMPO_QUERY_ENDPOINT', 'http://127.0.0.1:13200').replace(/\/+$/, '');
 const OPEN_THRESHOLD_MS = Number(envStr('OPEN_THRESHOLD_MIN', '15')) * MIN;
-const LOOKBACK_MS = Number(envStr('LOOKBACK_MIN', '360')) * MIN;
+const LOOKBACK_MS = Number(envStr('LOOKBACK_MIN', '120')) * MIN;
 const TEMPO_LIMIT = Number(envStr('TEMPO_LIMIT', '1000'));
 /** Deployment-boundary cutoff (groundnuty/macf#444): ignore routes delivered
  *  before the receipt mechanism went live. Set `RECONCILER_SINCE` to the
@@ -76,8 +78,12 @@ const SINCE_MS = ((): number | undefined => {
   return ms;
 })();
 
-/** DELIVERED set: parse the router runs' `Routed … to <AGENT>` success lines. */
-function fetchDelivered(nowMs: number): DeliveredRoute[] {
+/** DELIVERED set: parse the router runs' `Routed … to <AGENT>` success lines.
+ *  `truncated` is true when `gh run list` hit its page cap — the set is then
+ *  UNKNOWABLE (older routes fell off the page), so the caller must NOT flag
+ *  drops this run. Symmetric to the Tempo `tempo_ok` guard, on the delivered
+ *  side (Pattern A): silently bounding coverage would let a real drop hide. */
+function fetchDelivered(nowMs: number): { routes: DeliveredRoute[]; truncated: boolean } {
   const listJson = execFileSync(
     'gh',
     ['run', 'list', '--repo', REPO, '--workflow', ROUTER_WORKFLOW,
@@ -85,8 +91,9 @@ function fetchDelivered(nowMs: number): DeliveredRoute[] {
     { encoding: 'utf-8' },
   );
   const runs = JSON.parse(listJson) as ReadonlyArray<{ databaseId: number; createdAt: string }>;
-  if (runs.length >= RUN_LIST_LIMIT) {
-    console.error(`WARN: gh run list hit the ${RUN_LIST_LIMIT}-run cap — the DELIVERED set may be truncated (Pattern A on the delivered side): older routes in the ${LOOKBACK_MS / MIN}-min window fall off the page, so their receipts are never looked for and a real drop could go unflagged. Narrow LOOKBACK_MIN or raise the run-list cap.`);
+  const truncated = runs.length >= RUN_LIST_LIMIT;
+  if (truncated) {
+    console.error(`WARN: gh run list hit the ${RUN_LIST_LIMIT}-run cap — DELIVERED set UNKNOWABLE (truncated; older routes in the ${LOOKBACK_MS / MIN}-min window fell off the page). Emitting delivered_ok=false (no drops this run); narrow LOOKBACK_MIN or raise the cap.`);
   }
   const out: DeliveredRoute[] = [];
   for (const run of runs) {
@@ -101,7 +108,7 @@ function fetchDelivered(nowMs: number): DeliveredRoute[] {
     }
     out.push(...parseDeliveredFromLog(log, String(run.databaseId), createdMs));
   }
-  return out;
+  return { routes: out, truncated };
 }
 
 /** PROCESSED set: Tempo `turn_processed` spans → receipts. Aborts (no drops)
@@ -150,10 +157,17 @@ async function main(): Promise<void> {
     // TRUE no-op: incidents are left exactly as they are (never false-OPEN on a
     // truncated set, never false-CLOSE a real incident on a transient outage).
     console.error('WARN: PROCESSED set unknowable this run — emitting tempo_ok=false (no open, no close).');
-    emit({ tempoOk: false, dropsCount: 0, inFlightCount: 0, dropsJson: '[]' });
+    emit({ tempoOk: false, deliveredOk: true, dropsCount: 0, inFlightCount: 0, dropsJson: '[]' });
     return;
   }
-  const delivered = fetchDelivered(nowMs);
+  const { routes: delivered, truncated } = fetchDelivered(nowMs);
+  if (truncated) {
+    // DELIVERED set unknowable (truncated) — like a Tempo problem, NOT "zero
+    // drops". Emit delivered_ok=false so the workflow's open AND self-close
+    // steps both no-op this run (each gated on tempo_ok && delivered_ok).
+    emit({ tempoOk: true, deliveredOk: false, dropsCount: 0, inFlightCount: 0, dropsJson: '[]' });
+    return;
+  }
   const result = reconcile(delivered, processed, { nowMs, openThresholdMs: OPEN_THRESHOLD_MS, sinceMs: SINCE_MS });
   const dropsJson = JSON.stringify(result.drops);
   console.error(
@@ -162,13 +176,13 @@ async function main(): Promise<void> {
     (SINCE_MS ? ` (since=${new Date(SINCE_MS).toISOString()} — pre-deployment routes excluded)` : ''),
   );
   if (result.drops.length > 0) console.error(`DROPS: ${dropsJson}`);
-  emit({ tempoOk: true, dropsCount: result.drops.length, inFlightCount: result.inFlight.length, dropsJson });
+  emit({ tempoOk: true, deliveredOk: true, dropsCount: result.drops.length, inFlightCount: result.inFlight.length, dropsJson });
 }
 
-function emit(o: { tempoOk: boolean; dropsCount: number; inFlightCount: number; dropsJson: string }): void {
+function emit(o: { tempoOk: boolean; deliveredOk: boolean; dropsCount: number; inFlightCount: number; dropsJson: string }): void {
   const out = process.env['GITHUB_OUTPUT'];
   if (!out) return;
-  appendFileSync(out, `tempo_ok=${o.tempoOk}\ndrops_count=${o.dropsCount}\nin_flight_count=${o.inFlightCount}\ndrops_json=${o.dropsJson}\n`);
+  appendFileSync(out, `tempo_ok=${o.tempoOk}\ndelivered_ok=${o.deliveredOk}\ndrops_count=${o.dropsCount}\nin_flight_count=${o.inFlightCount}\ndrops_json=${o.dropsJson}\n`);
 }
 
 main().catch((err) => {
