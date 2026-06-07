@@ -556,10 +556,21 @@ export function generateClaudeSh(config: MacfAgentConfig): string {
     // prior session state is missing/partial. Normal production runs
     // (MACF_TEST unset) get the resume-by-default behavior. See
     // macf#189 sub-item 4.
+    //
+    // Permanent agents resume with `-c`, but fall back to a FRESH session
+    // when no conversation is resumable for this workspace (first launch, or
+    // history keyed under a different/physical path) — otherwise `claude -c`
+    // exits non-zero immediately and the launch dies with no agent. The
+    // resume attempt isn't `exec`'d so the `||` fallback can fire; the
+    // fallback IS `exec`'d (terminal). CV-migration dogfooding finding #6.
     'if [ -n "${MACF_TEST:-}" ]; then',
-    `  exec claude ${['--plugin-dir', '"$SCRIPT_DIR/.macf/plugin"'].join(' ')} "$@"`,
+    '  exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"',
     'else',
-    `  exec claude ${[...resumeFlags(config), '--plugin-dir', '"$SCRIPT_DIR/.macf/plugin"'].join(' ')} "$@"`,
+    ...(resumeFlags(config).length > 0
+      ? [
+          `  claude ${resumeFlags(config).join(' ')} --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@" || exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"`,
+        ]
+      : ['  exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"']),
     'fi',
     '',
   ].join('\n');

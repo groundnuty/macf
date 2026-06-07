@@ -274,8 +274,8 @@ export async function issueRoutingClient(
   }
 
   console.log('');
-  console.log('Next steps (see macf-actions#8):');
+  console.log('Next steps (consumer Stage-3 wiring — see groundnuty/macf-actions CHANGELOG, "Migration for consumers"):');
   console.log('  1. Paste ROUTING_CLIENT_CERT and ROUTING_CLIENT_KEY into your consumer repo\'s GHA secrets');
-  console.log('  2. Upgrade the caller workflow to macf-actions @v2.x when available');
-  console.log('  3. Remove the AGENT_SSH_KEY secret once mTLS transport is proven');
+  console.log('  2. Set the other v3 router secrets: TS_OAUTH_CLIENT_ID/SECRET + MACF_ROUTING_APP_ID/KEY (a dedicated variables:read-only App)');
+  console.log('  3. Point the caller workflow at macf-actions/.github/workflows/agent-router.yml@v3 (with: { project }, secrets: inherit)');
 }
