@@ -72,13 +72,6 @@ jobs:
       # title-prefix stays in lockstep (same discipline as e2e.yml).
       INCIDENT_TITLE_PREFIX: "routing: dropped ping (no turn_processed receipt)"
     steps:
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v3
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
-
       - uses: actions/checkout@v6
 
       - uses: jetify-com/devbox-install-action@v0.15.0
@@ -87,6 +80,18 @@ jobs:
         run: |
           make -f dev.mk install
           make -f dev.mk build
+
+      # Tailscale is brought up LAST — only the reconcile step needs the tailnet
+      # (to reach Tempo's query API). Connecting earlier broke the Nix installer
+      # download in devbox-install-action (`tailscale up` rewrites DNS/routing →
+      # the installer's CDN fetch 502'd, deterministically). Keeping it here also
+      # minimizes the tailnet-open window to just the query.
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
 
       - name: Reconcile delivered routes vs turn_processed receipts
         id: reconcile
