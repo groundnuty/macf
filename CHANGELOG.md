@@ -9,6 +9,63 @@ Plugin + routing-workflow changes ship from separate repos
 [`groundnuty/macf-actions`](https://github.com/groundnuty/macf-actions))
 and are not included here — pin them explicitly in each workspace.
 
+## [0.2.36] — 2026-06-07
+
+Receipt-observable routing (the #444 arc) + registry CAS hardening (#439) +
+the CV-fleet Stage-3 revival dogfooding fixes, on top of the merged-but-
+unreleased post-0.2.35 queue. Coordinated with marketplace plugin **v0.2.36**
+— which drops the redundant `manifest.hooks` key that broke plugin-hook
+loading on Claude Code ≥2.1.x (`/doctor`: "Duplicate hooks file detected").
+Run `macf update --all` to pick up both.
+
+### feat
+
+- **Route-receipt drop-detection (#444).** `route-reconciler` joins delivered
+  routes (gh-run logs) against processed receipts (Tempo `turn_processed`
+  spans) on `(runId, agent)`, surfacing send-without-receipt last-mile gaps:
+  drop-detection core + delivered-log parser (#453), Tempo-receipt parser +
+  entrypoint + scheduled workflow (#455), per-marker receipts +
+  delivered-truncation guard (#463), deployment-boundary cutoff (#459).
+  Turn-ack receipt `UserPromptSubmit` hook (#451) + substrate rollout on
+  macf-actions v1.3.4 (#458).
+
+### reliability
+
+- **Registry conditional-CAS register (#447, closes #439)** — compare-and-swap
+  / If-Match on the GitHub-Variables backend closes the collision-takeover
+  TOCTOU; `RegisterRaceError` on a lost race.
+- **Channel-server clean exit on fatal bootstrap abort (#450)** — no hung
+  process on unrecoverable startup failure.
+- **`claude-sh` graceful `claude -c` resume fallback (#468)** — permanent
+  agents fall back to a fresh session instead of hard-exiting when nothing is
+  resumable (first launch / history keyed under a different path).
+- **`claude-sh` trace gate (#452, #418)** — restores
+  `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA` so native traces emit.
+
+### fix
+
+- **Reconciler CI** — correct Tailscale tag + fail-loud connectivity + Tempo
+  errno (#461); Tailscale-after-build to fix the Nix-install 502 (#460).
+- **Routing** — `workspace_dir` in macf `agent-config.json` (#443).
+- **`certs issue-routing-client` next-steps (#468)** — replaced stale
+  "@v2.x when available" / "remove AGENT_SSH_KEY" with the actual v3 wiring
+  (the six router secrets incl. the dedicated `macf-routing` read-only App).
+
+### docs
+
+- **Consumer-onboarding revival runbook (#468)** — "Reviving an existing
+  consumer" section + the full v3 router secret set + corrected CV worked
+  example (cv-architect's Overleaf working dir vs the coordination hub).
+- Canonical-rule graduation of 3 #444-D arc patterns (#466); legacy
+  tmux-send-keys routing retired from canonical (#467); registry CAS
+  read-back guarantee scoped honestly (#448); state refreshes (#442/#446).
+
+### chore
+
+- Dependabot: typescript-eslint 8.60.1 (#457), vitest 4.1.6 (#288),
+  @commitlint/cli 20.5.3 (#289); CI actions setup-node 6 (#285),
+  dependency-review 5 (#367), cache 5 (#413), paths-filter 4 (#414).
+
 ## [0.2.35] — 2026-06-05
 
 Hardening + structural-defense release from the post-Phase-5 build queue —
