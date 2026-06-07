@@ -26,9 +26,10 @@ const HOOK_SCRIPT = join(findCliPackageRoot(), 'scripts', 'emit-turn-receipt.sh'
 function makeStubCurlDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'macf-turn-receipt-curl-'));
   const shim = `#!/usr/bin/env bash
-# Ignore all curl args; capture the --data-binary @- payload (stdin) and exit
-# with the test-controlled code.
-cat > "\${CURL_CAPTURE:-/dev/null}"
+# Ignore all curl args; APPEND the --data-binary @- payload (stdin) — one curl
+# invocation per marker (macf#462 per-marker emission), so all payloads are
+# captured (newline-separated). Exit with the test-controlled code.
+{ cat; echo; } >> "\${CURL_CAPTURE:-/dev/null}"
 exit "\${CURL_EXIT:-0}"
 `;
   writeFileSync(join(dir, 'curl'), shim);
@@ -106,5 +107,27 @@ describe('emit-turn-receipt.sh', () => {
     expect(r.capture).not.toBeNull();
     expect(r.capture!).toContain('42');
     expect(r.capture!).toContain('devops-agent');
+  });
+
+  it('coalesced turn with MULTIPLE markers → a receipt for EACH (macf#462 per-marker)', () => {
+    // The bug: `head -1` receipted only the first marker, so the reconciler
+    // false-flagged the rest as drops. Per-marker emission gives each its span.
+    const r = runHook('mentioned in #444 [macf-route:111:code-agent] and PR #88 [macf-route:222:science-agent]');
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toMatch(/WARN/);
+    expect(r.capture).not.toBeNull();
+    const payload = r.capture!;
+    expect(payload).toContain('111');
+    expect(payload).toContain('code-agent');
+    expect(payload).toContain('222');
+    expect(payload).toContain('science-agent');
+    // two distinct turn_processed spans (head -1 would have emitted only one)
+    expect(payload.match(/"name":"turn_processed"/g) ?? []).toHaveLength(2);
+  });
+
+  it('duplicate marker in one prompt → deduped to a single receipt', () => {
+    const r = runHook('[macf-route:55:code-agent] … then again [macf-route:55:code-agent]');
+    expect(r.status).toBe(0);
+    expect((r.capture ?? '').match(/"name":"turn_processed"/g) ?? []).toHaveLength(1);
   });
 });
