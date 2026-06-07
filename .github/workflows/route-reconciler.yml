@@ -91,7 +91,26 @@ jobs:
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
+          # Must match a tag the OAuth client owns + the tailnet ACL's tagOwners
+          # (`tag:ci-runner`). An unowned tag (was `tag:ci`) → `tailscale up`
+          # 400s "requested tags … invalid or not permitted" on every retry.
+          tags: tag:ci-runner
+
+      # Fail LOUD if the tailnet isn't actually up. tailscale/github-action exits
+      # 0 even after exhausting all retries (e.g. an invalid `tags:` 400s 5×),
+      # so without this the reconcile step would run off-tailnet and report a
+      # misleading `tempo_ok=false` forever — a silent degradation. Assert the
+      # backend is Running so a tag/auth regression surfaces as a red job, not a
+      # quietly-never-reconciling green one.
+      - name: Verify tailnet is up
+        run: |
+          set -euo pipefail
+          state=$(tailscale status --json 2>/dev/null | jq -r '.BackendState // "Unknown"')
+          echo "Tailscale BackendState: ${state}"
+          if [ "${state}" != "Running" ]; then
+            echo "::error::Tailscale not connected (BackendState=${state}). The reconciler can't reach Tempo. Check the workflow's tags: input matches the OAuth client + ACL tagOwners (tag:ci-runner)."
+            exit 1
+          fi
 
       - name: Reconcile delivered routes vs turn_processed receipts
         id: reconcile

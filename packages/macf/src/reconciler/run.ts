@@ -115,7 +115,14 @@ async function fetchProcessed(nowMs: number): Promise<readonly ProcessedReceipt[
   try {
     res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
   } catch (err) {
-    console.error(`WARN: Tempo query unreachable (${(err as Error).message}) — PROCESSED set unknowable; NOT flagging drops this run (avoids false alarms).`);
+    // `fetch failed` is opaque — the real cause is in err.cause (undici wraps
+    // the network error). Surface its code + message so an unreachable Tempo
+    // tells us WHICH failure: ENOTFOUND (MagicDNS not resolving the host),
+    // ECONNREFUSED (nothing listening / not `tailscale serve`d), ETIMEDOUT
+    // (ACL/firewall dropping the connection), or AbortError (15s timeout).
+    const e = err as Error & { cause?: { code?: string; message?: string } };
+    const detail = e.cause?.code ?? e.cause?.message ?? e.name;
+    console.error(`WARN: Tempo query unreachable [${url}] — ${e.message}: ${detail} — PROCESSED set unknowable; NOT flagging drops this run (avoids false alarms).`);
     return null;
   }
   if (!res.ok) {
