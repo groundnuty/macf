@@ -117,6 +117,8 @@ Per `groundnuty/macf#244` + `#272`, this rule is enforced by a Claude Code PreTo
 
 The hook is the same shape as `check-gh-token.sh` (#140 attribution-trap defense) — bash command-type hook distributed via `macf init` / `macf update` / `macf rules refresh` to every workspace's `.claude/scripts/check-mention-routing.sh` with the entry registered in `.claude/settings.json` `hooks.PreToolUse`. Substrate workspaces, tester agents, CV consumers, and future MACF-consumer projects all get the protection uniformly.
 
+Because the hook is registered as a path-invocation (`"command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-mention-routing.sh"`), Claude Code execs the script fresh on every event, so a change to the **script body** goes live on the very next event as soon as the file is synced on disk — a `macf update` that updates the script is immediately in force for consumers with no session relaunch and no relaunch-coordination needed. Only a change to the hook **registration** in `.claude/settings.json` (or to the launch environment) requires a relaunch to take effect.
+
 **Heuristic** (subject to refinement; documented for transparency):
 
 - Already wrapped in backticks (`` `@<bot>[bot]` ``) → routing-suppressed; allowed (canonical describing form §5); does NOT count toward Check A

@@ -4,7 +4,7 @@
 
 > **Workspaces without full `macf init`** (e.g. `groundnuty/macf` itself, or any Claude Code workspace operated by a bot that isn't a MACF-registered agent) can still get this canonical rule via `macf rules refresh --dir <workspace>`. Same copy, no App credentials or registry required.
 
-This rule names the CLASS so agents recognize the shape on first encounter rather than re-discovering each instance from scratch. Nine specific instances are documented below as worked examples spanning different architectural layers (identity, parsing, TUI binding, observability routing, config substitution, multi-agent coordination protocol, metric-instrumentation lifecycle, observability-endpoint routing, release-pipeline-partial-publish). Seven of nine have structural defenses applied or in flight — the pattern of defense generalizes alongside the pattern of hazard.
+This rule names the CLASS so agents recognize the shape on first encounter rather than re-discovering each instance from scratch. Eleven specific instances are documented below as worked examples spanning different architectural layers (identity, parsing, TUI binding, observability routing, config substitution, multi-agent coordination protocol, metric-instrumentation lifecycle, observability-endpoint routing, release-pipeline-partial-publish, substrate-routing receipt-gap, third-party-action retry-exhaustion). Nine of eleven have structural defenses applied or in flight — the pattern of defense generalizes alongside the pattern of hazard.
 
 Instance 9 is annotated as **sister-shape** (failure correctly surfaced + partial side-effect breaks retry idempotency) — listed here for cross-reference convenience but warrants a sibling canonical rule (`partial-side-effect-hazards.md`) if more instances surface. The two classes share "multi-step pipeline where consumer assumes atomicity" but the failure surface differs: silent-fallback hides at the API boundary; partial-side-effect surfaces loudly but persists semi-state.
 
@@ -23,7 +23,7 @@ The trap is that defensive programming targets exit codes, but exit-code success
 
 ---
 
-## Nine known instances
+## Eleven known instances
 
 ### Instance 1 — gh-token attribution traps
 
@@ -184,6 +184,40 @@ Both were invisible until "PR sat unmerged" was cross-referenced against the rou
 
 ---
 
+### Instance 11 — Third-party retry-wrapping action exits 0 on internal retry-exhaustion (connect-failure masked as step-success)
+
+**Surface:** any consumer-CI step that delegates a connect/auth handshake to a third-party GitHub Action (or wrapper tool) that owns its own internal retry loop — tailnet join (`tailscale/github-action`), OTLP collector connect, cloud-provider auth (`aws-actions/configure-aws-credentials`, `google-github-actions/auth`), registry login, etc. The action retries internally and reports a single aggregate exit code for the step.
+
+**Failure shape:** the wrapped tool fails on EVERY internal retry (a hard error, not a transient one — e.g. an invalid-auth `400` that no amount of retrying can fix), the action **exhausts its retry budget and still exits `0`**, and the workflow continues into a broken state. The connect never happened, but the step is green. The real failure then surfaces far downstream as a *different* problem — every later fetch/query against the resource the step was supposed to make reachable fails, and the symptom (timeout, connection-refused, "endpoint unreachable") points the investigator at the downstream consumer, not at the masked upstream connect. The exit-0 step is the last place anyone looks because it's the one place that reported success.
+
+**Recurrence:** First confirmed instance — groundnuty/macf#461 (2026-06-07). The e2e workflow's `tailscale/github-action` step was configured with `tags: tag:ci`, but the OAuth client + ACL only permit `tag:ci-runner`. `tailscale up` returned `Status 400 "requested tags [tag:ci] are invalid or not permitted"` on all 5 internal retries; the action exited `0`; the runner never joined the tailnet; every subsequent tailnet fetch failed. The masked connect-failure projected onto two plausible downstream red herrings before the real cause was found — it presented as a **"Tempo query unreachable"** problem, costing a **3-hop misdiagnosis** (a step-ordering fix and a serve-port fix were both pursued and discarded as the masked failure masqueraded as each in turn) before the tag mismatch was identified and corrected.
+
+**Distinct from the sister GHA-surface instances** — do NOT fold this into Instance 5 or Instance 8:
+
+| Aspect | Instance 5 (secrets-misnamed) | Instance 8 (OTLP endpoint silent-drop) | Instance 11 (this) |
+|---|---|---|---|
+| Where the lie originates | empty-string substitution at `${{ }}` expansion, BEFORE the tool runs | exporter silently retries-then-drops, no exit code surfaced at all | third-party action runs, fails every retry, then **exits `0` reporting success** |
+| What's wrong | a required input is missing/renamed | a long-lived process points at a dead endpoint | a connect handshake hard-fails but its wrapper claims success |
+| Downstream disguise | misleading auth error at the *consuming* step | empty observability surface, no failure signal anywhere | masquerades as a *different* downstream problem (here: "Tempo unreachable") |
+
+Instance 5 is "the input was never there"; Instance 8 is "the data went into a void with no signal"; Instance 11 is "the connection step actively *reported success* while having hard-failed." All three live on the GitHub-Actions / CI-plumbing surface but the trust boundary that breaks differs — Instance 11's is specifically *a third party's exit code about its own retry exhaustion*. The tailscale case above is just the worked example: any consumer CI that wraps a connect/auth in a retrying action (tailnet, OTLP, cloud-auth, registry-login) is exposed to the same shape.
+
+**Defense status:** SHIPPED (Pattern A result-invariant assert, with a Pattern D precheck flavor) — a **"Verify <resource> is up" step placed immediately after the connect step**, asserting the connection's result-invariant and failing LOUD (red job) when it doesn't hold. Never trust a third-party action's exit code as evidence that its own internal retries succeeded — assert the post-connect state directly.
+
+```bash
+# After the tailscale connect step (NOT trusting its exit 0):
+tailscale status --json | jq -e '.BackendState == "Running"' >/dev/null \
+  || { echo "::error::tailnet did not come up — tailscale BackendState != Running."; \
+       echo "::error::The connect action may have exhausted retries and exited 0 anyway"; \
+       echo "::error::(e.g. tag/ACL mismatch returns Status 400 on every retry)."; \
+       tailscale status || true; exit 1; }
+echo "✓ tailnet up (BackendState=Running)"
+```
+
+Generalizes to any retry-wrapping action: assert the result-invariant the connect was *supposed to establish* — `BackendState == "Running"` for a tailnet, a successful authenticated probe for cloud-auth, a `200` from the collector's health endpoint for OTLP — in a dedicated step right after the connect, before any downstream consumer runs. This converts a far-downstream misdiagnosis (the 3-hop red-herring chase in #461) into a fail-at-the-boundary red job pointing directly at the broken connect.
+
+---
+
 ## How to recognize the class on first encounter
 
 When investigating a "the operation completed but the outcome is wrong" incident, suspect silent-fallback if ANY of:
@@ -325,7 +359,7 @@ Silent-fallback hazards are **architectural**, not implementation bugs. They eme
 
 For coordination-system safety analysis: this is a class of hazards multi-agent systems must explicitly defend against. Each new instance teaches the same lesson; the class-name is what makes the lesson transferable across agents.
 
-### Defense-pattern emergence (8-of-10 known instances have structural defense applied or shipped)
+### Defense-pattern emergence (9-of-11 known instances have structural defense applied or shipped)
 
 | Instance | Surface | Structural defense | Pattern |
 |---|---|---|---|
@@ -339,10 +373,11 @@ For coordination-system safety analysis: this is a class of hazards multi-agent 
 | 8 — OTLP endpoint silent-drop | Observability-endpoint routing | Five-surface defense: CLI release-discipline + substrate testers env-override + canonical template `:14318` default + cluster-side compat port-map + agent-process `doctor-otel.sh` Pattern A | Pattern A (composite — first multi-architectural-layer case in this rule; instances 1-7 have single-pattern defenses) |
 | 9 — Sigstore TLOG orphans on failed npm publish (sister-class) | npm publish + sigstore attestation pipeline | Three-defense composite: bump-version recovery (DR-022 Amendment L) + pre-flight registry-collision check (Pattern D analog, macf#380) + TLOG-state observability (devops-toolkit#74+#77 Grafana dashboard live) | Pattern D analog (pre-flight precheck) + recovery-procedure-codification |
 | 10 — Routing send-logged / receipt-unlogged (Stage-2 tmux last-mile) | GHA→tmux substrate routing | Config (`workspace_dir` #443/#268/#81 → reliable helper) + probe-hardening (macf-actions v1.3.3, attempt-on-ambiguity + `\|\| true` so `set -e` can't abort on ssh-255) make the gap greppable + close the #416/#436 sub-cases; structural receipt-signal close tracked #444 | Pattern B/C (probe + helper) — receipt-signal close pending (#444) |
+| 11 — Third-party retry-wrapping action exits 0 on retry-exhaustion | Consumer-CI connect/auth via third-party action (tailnet, OTLP, cloud-auth, registry-login) | SHIPPED — "Verify <resource> is up" step immediately after the connect asserts the connection's result-invariant (e.g. `tailscale status` `BackendState == "Running"`) + fails LOUD; never trusts the action's exit code about its own retry exhaustion (macf#461) | Pattern A (post-connect result-invariant assert) + Pattern D flavor (precheck-before-downstream) |
 
-Seven of nine instances have structural defense applied or shipped. Defense patterns (A, B, C, D, E) generalize across instances — they're reusable defense templates, not case-specific fixes. **Pattern A (result-invariant assertion at the boundary) bears the most weight** — it's the structural defense for instances 4, 7, AND 8 (3 of 9), each at a different architectural boundary (logs pipeline, metric counter, observability endpoint). Instance 8's five-surface defense topology (consumer canonical + cluster-side compat port-map + concrete Pattern A impl) demonstrates that structural defense at the observability-pipeline-class can compose across architectural layers — the canonical-distribution layer + the cluster-infrastructure layer + the assertion-script layer all reinforce each other rather than substituting for each other. Instance 9 demonstrates that the Pattern D template generalizes from workflow-secrets-prechecks to release-pipeline-prechecks AND that recovery-procedure-codification (DR-022 Amendment L's bump-version-not-tag-retry) is its own defense category — distinct from detection-pre-merge defenses (Patterns A/B/D) and discrimination-at-receiver defenses (Pattern E).
+Nine of eleven instances have structural defense applied or shipped. Defense patterns (A, B, C, D, E) generalize across instances — they're reusable defense templates, not case-specific fixes. **Pattern A (result-invariant assertion at the boundary) bears the most weight** — it's the structural defense for instances 4, 7, 8, AND 11 (4 of 11), each at a different architectural boundary (logs pipeline, metric counter, observability endpoint, third-party-action connect-verify). Instance 8's five-surface defense topology (consumer canonical + cluster-side compat port-map + concrete Pattern A impl) demonstrates that structural defense at the observability-pipeline-class can compose across architectural layers — the canonical-distribution layer + the cluster-infrastructure layer + the assertion-script layer all reinforce each other rather than substituting for each other. Instance 9 demonstrates that the Pattern D template generalizes from workflow-secrets-prechecks to release-pipeline-prechecks AND that recovery-procedure-codification (DR-022 Amendment L's bump-version-not-tag-retry) is its own defense category — distinct from detection-pre-merge defenses (Patterns A/B/D) and discrimination-at-receiver defenses (Pattern E).
 
-The breadth of layers spanned by 5 different defense patterns (identity, parsing, TUI binding, observability routing, config substitution, multi-agent coordination protocol, metric-instrumentation lifecycle, observability-endpoint routing, release-pipeline-partial-publish) is independent evidence that the hazard CLASS is real. If silent-fallback was a single-instance accident, no defense pattern would emerge. **Pattern A's recurrence across 3 different observability boundaries (logs / metrics / endpoint) is the strongest signal that result-invariant assertion is the load-bearing structural-defense template for the entire observability-pipeline-class** of silent fallback.
+The breadth of layers spanned by 5 different defense patterns (identity, parsing, TUI binding, observability routing, config substitution, multi-agent coordination protocol, metric-instrumentation lifecycle, observability-endpoint routing, release-pipeline-partial-publish, substrate-routing receipt-gap, third-party-action retry-exhaustion) is independent evidence that the hazard CLASS is real. If silent-fallback was a single-instance accident, no defense pattern would emerge. **Pattern A's recurrence across 3 different observability boundaries (logs / metrics / endpoint) is the strongest signal that result-invariant assertion is the load-bearing structural-defense template for the entire observability-pipeline-class** of silent fallback.
 
 ---
 
@@ -356,7 +391,7 @@ Add when ALL of the following hold:
 
 The class-name is what makes the lesson transferable, not multi-agent witness. A single-agent-confirmed instance with a concrete trace + identified defense pattern is sufficient for canonicalization (instances 4, 5, 7, 8 are all single-agent-confirmed). Cross-agent triangulation strengthens the framing but isn't a precondition.
 
-Add as a new numbered section under "Nine known instances" (will become "Ten known instances" etc.) with the same fields: Surface / Failure shape / Recurrence / Defense status. Increment the intro paragraph's instance count + the Defense-pattern emergence header's `N-of-M known instances` count too.
+Add as a new numbered section under "Eleven known instances" (will become "Twelve known instances" etc.) with the same fields: Surface / Failure shape / Recurrence / Defense status. Increment the intro paragraph's instance count + the Defense-pattern emergence header's `N-of-M known instances` count too.
 
 ---
 

@@ -115,6 +115,25 @@ The rules here are topology-agnostic: they work whether the project uses a scien
 
 4. **Concise comments** — 1-3 sentences unless detail is needed.
 
+5. **Inbound review requests are action asks that block the requester — not status FYIs.** Issue Lifecycle rule 2 covers the implementer's OUTBOUND queue ("work through your assigned-label queue without prompting"). This rule covers the symmetric REVIEWER-side INBOUND obligation, which is just as load-bearing and far easier to strand.
+
+   **(a) Treat "PR ready: #N" / "ready for review" as a request that blocks the peer's next move.** When a peer posts a review-request comment on a thread, that is not an informational status update you can note-and-defer — it is an action ask directed at you. The LGTM/merge-gate makes this structural: per `pr-discipline.md`, a peer's PR cannot merge without a reviewer's **formal approval** (`gh pr review --approve`), so until you review, the peer is blocked. Not slowed — blocked, and silently, because nothing on their side surfaces "my reviewer never saw this." A stranded review request stalls the peer indefinitely. Pick it up, review honestly, and submit a formal approve / request-changes (not a plain comment — see `pr-discipline.md §"How to submit LGTM"`; only the formal state-change fires the reviewer-notification routing).
+
+   **(b) Run an INBOUND review-sweep before declaring idle — especially after surfacing from a long single-threaded task.** Before you say "caught up" / "nothing pending" / "your call" / go idle, sweep your repos for review requests addressed to you. This matters most right after you surface from a deep, single-threaded arc (a long workflow, a multi-step investigation): while you were heads-down on one thread, a review request can have arrived on another and been easy to miss.
+
+        # Peer-authored PRs awaiting YOUR review (review not yet given):
+        for r in <your-repos>; do
+          gh pr list --repo "$r" --state open \
+            --json number,author,reviewDecision,title \
+            --jq '.[] | select(.reviewDecision == "REVIEW_REQUIRED" or .reviewDecision == null)
+                       | select(.author.login != "<your-login>")'
+        done
+        # Plus: open threads where you were @mentioned and haven't replied.
+
+   **Why the sweep is necessary — and why it's mechanism-agnostic.** Routing delivers each notification as a **discrete event at the moment it occurs** — a push to your channel-server, an A2A message — not as a standing inbox you can re-open and re-read later. Once that event has been delivered (or has arrived while you were mid-turn on a different thread), it is not re-presented to you on its own. So a review-request ping that landed while you were deep in another task is gone from the live stream and only recoverable by querying GitHub state directly. This is the **general silent-fallback shape** (see `silent-fallback-hazards.md`): the routing layer reports the ping delivered, but "delivered" does not guarantee "processed by the recipient," and nothing surfaces the gap until the blocked peer escalates. The sweep is the result-invariant check at the reviewer boundary — assert against GitHub state ("are there peer PRs awaiting my review?") rather than trusting that you'd remember every ping that flowed past.
+
+   **Verified motivation:** three operator-surfaced stalls where a peer's review request sat idle (42 min in one case; ~2.5 h in another) because the reviewer went idle without sweeping — the ping had arrived during a long single-threaded task and was never picked back up. In each case the peer's PR was blocked the entire time on a formal approval that never came.
+
 ---
 
 ## When You're Stuck — Escalation
