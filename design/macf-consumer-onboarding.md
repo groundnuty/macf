@@ -28,6 +28,12 @@ Operator must verify before any consumer agent begins bootstrap:
 - [ ] **`@groundnuty/macf` CLI** is installable globally — `npm install -g @groundnuty/macf` resolves to current published version. Latest published version reachable via `npm view @groundnuty/macf version`. v0.2.9 ships the doctor + Path-2 hooks set; later versions inherit.
 - [ ] **Per-project CA exists** at `~/.macf/certs/<project>/{ca-cert.pem,ca-key.pem}` (create one-time via `macf certs init` from any workspace in the project, with passphrase prompt; uploads CA cert to the project's GitHub Variables for the routing-Action to trust).
 - [ ] **Each agent's GitHub App has `actions_variables: write`** on the project's registry repo/org/profile (per DR-019); without it the channel server can't self-register and the routing-Action can't resolve the agent's address. Verify via `macf doctor` post-bootstrap (it surfaces all DR-019 permission gaps + a few hardening checks for `permissions.allow` and `sandbox.filesystem.allowRead`).
+- [ ] **The v3 router's six secrets are set on each consumer repo.** The `agent-router.yml@v3` reusable workflow (`groundnuty/macf-actions`) requires these — the channel server self-registering is necessary but **not sufficient**; without the secrets the router can't mint a registry-read token, join the tailnet, or present a client cert, and routing silently degrades to `agent-offline` (label routes) or a log-only skip (mention / CI-completion routes). The canonical provisioning steps live in **[`groundnuty/macf-actions` CHANGELOG §3.0.0 "Migration for consumers"](https://github.com/groundnuty/macf-actions/blob/main/CHANGELOG.md)**; summarized:
+  - `ROUTING_CLIENT_CERT` + `ROUTING_CLIENT_KEY` — base64 PEMs minted via **`macf certs issue-routing-client`** (the routing Action presents this client cert on the mTLS POST to `/notify`).
+  - `TS_OAUTH_CLIENT_ID` + `TS_OAUTH_SECRET` — Tailscale OAuth client so the GHA runner can join the tailnet and reach the agent's advertised host.
+  - `MACF_ROUTING_APP_ID` + `MACF_ROUTING_APP_KEY` — a **dedicated `macf-routing` GitHub App, scoped to `Organization variables: Read` ONLY** (minimum blast radius), installed on the registry org. This is a *separate* App from each agent's identity App — the runner uses it to resolve agent addresses from the registry. Create it once per org.
+- [ ] **The `<PROJECT_SEG>_CA_CERT` variable is set** (e.g. `academic-resume` → `ACADEMIC_RESUME_CA_CERT`) — written by `macf certs init`; the router trusts the project CA when verifying each agent's server cert. `<PROJECT_SEG>` = project name uppercased, hyphens→underscores.
+- [ ] **Each agent advertises a runner-reachable host.** Set `--advertise-host <tailnet-ip-or-host>` at `macf init` (or `MACF_ADVERTISE_HOST`) so the address the channel server registers is reachable by the GHA runner over the tailnet — **not** `127.0.0.1` unless the runner shares the host. The dynamically-assigned port is registered automatically; only the host needs pinning.
 
 ## Bootstrap steps
 
@@ -126,6 +132,21 @@ Bootstrap considered complete for a consumer when:
 - [ ] `.macf/logs/channel.log` shows `server_started` event for current session
 - [ ] One end-to-end routing test from a peer agent confirmed (issue → routing-Action HTTP-POST → channel server `/notify` → recipient TUI wake)
 - [ ] `macf doctor` returns exit 0 (no missing DR-019 perms; sandbox FD allowRead present; workspace `permissions.allow` either grants Write/Edit or has explicit operator deny rules)
+
+## Reviving an existing consumer (bring-current + re-register)
+
+A consumer that was bootstrapped earlier but has **drifted** — agents stopped running, version pins stale, plugin behind — doesn't need a from-scratch bootstrap. It's already Stage-3 (CA, registry config, router); the job is to bring it current and back online. (Empirically: the CV fleet bootstrapped in 2026-04 had decayed by 2026-06 — agents offline, `cv-architect` on cli `0.1.0`, plugin pre-#342 — and was revived via the steps below.)
+
+1. **Upgrade the global `macf` CLI first** — `npm install -g @groundnuty/macf@<latest>` (pin a specific version, not `@latest`, in any committed tooling). **A stale global CLI silently pins workspaces stale**, because `macf update` resolves "latest" relative to the *installed* CLI's version logic. After installing, confirm `which macf` resolves to the just-installed copy — a leftover install earlier in `PATH` (e.g. a prior global prefix) will shadow it and you'll keep running the old version.
+2. **`macf update --all` in each workspace.** **`--all` is required to bump the version pins** (cli / plugin / actions) in `.macf/macf-agent.json` and re-fetch the plugin + re-pin the channel-server (macf#421). A *bare* `macf update` only refreshes templates/assets (claude.sh, rules, scripts, settings hooks) and **leaves the pins — and thus the channel-server version — stale.** A pre-#342 monolithic `claude.sh` is auto-migrated to the multi-file `.claude/.macf/env.*` layout (operator-managed `env.telemetry`/`env.tmux` preserved).
+3. **Relaunch each agent** (`./claude.sh`) so the channel server re-registers its *current* host:port (a stale registry entry from a previous run points at a dead port → routing POSTs to nothing → `agent-offline`). If the launcher prints `Starting <agent>...` and **exits immediately**, that's `claude -c` (auto-resume) finding no resumable conversation for this workspace's path — relaunch once with `MACF_TEST=1 ./claude.sh` (bypasses `-c`, starts fresh, and *creates* the history so every subsequent plain `./claude.sh` resumes normally).
+4. **Verify** against the Verification gate above (registry var freshly updated, `server_started` in channel.log, one end-to-end routing test, `macf doctor` clean).
+
+**Gotchas that bite on revival:**
+
+- **Exactly one running instance per agent identity.** Two checkouts sharing the same `agent_name` + `project` (e.g. a GitHub coordination repo *and* an Overleaf working copy both configured as `cv-architect`/`academic-resume`) both register the *same* `MACF_<PROJECT_SEG>_AGENT_<NAME_SEG>` variable and take each other over (version-aware per macf#424 — the *newer*-versioned instance wins). Routing then reaches whichever registered last. Run one; retire or `MACF_NO_TMUX_WRAP`-park the other.
+- **Conversation history is keyed by resolved CWD.** A workspace reached via a symlink, or renamed/moved, keys its transcripts under the *physical* path; `claude -c` resumes by that key. If a session seems "lost", it's usually under the old/physical path key in `~/.claude/projects/`, not deleted — find it there and resume from the matching directory.
+- **Plugin hooks on Claude Code ≥2.1.x.** Plugin tags ≤0.2.35 ship a `manifest.hooks` key that fails to load on CC 2.1.x (`/doctor`: "Duplicate hooks file detected"); the plugin's `SessionStart` auto-pickup + `Stop` `notify_peer` hooks go dark (routing is unaffected — it's channel-server-based). Fixed in plugin **v0.2.36**; `macf update --all` picks it up.
 
 ## Rollback (if bootstrap fails partway)
 
@@ -320,13 +341,15 @@ The decommission is reversible — re-running `macf init --local` regenerates ev
 - [`docs/use-cases.md` §"When MACF without GitHub makes sense"](../docs/use-cases.md#when-macf-without-github-makes-sense-local-registry-mode) — when to use local mode vs GitHub mode
 - macf#322 — issue tracking the design + implementation work
 
-## Worked example — CV-fleet onboarding (2026-04 timeline)
+## Worked example — CV-fleet onboarding (2026-04) + revival (2026-06)
 
-Empirical reference for the bootstrap path:
+Empirical reference for both the bootstrap path and the revival path:
 
-1. **`groundnuty/academic-resume`** (`cv-architect` agent) — bootstrap via `macf init`. Channel server registered; cross-routing tested via cv-e2e-test rehearsals #11b, #12b, #13b (10/11 PASS empirically validating route-by-pr-review-state per macf-actions#39). Notable workspace customization: operator-authored `Write` + `Edit` in `.claude/settings.local.json` (per `macf#305` merge-view fix in `macf doctor`).
-2. **`groundnuty/cv-project-archaeologist`** — same bootstrap path; sister consumer; cross-routing exercised in research-handoff PR cycles.
+1. **`cv-architect`** (project `academic-resume`) — the agent's *working directory* is the Overleaf CV repo (the `academic-cv` checkout, holding the LaTeX CV); the GitHub `groundnuty/academic-resume` repo is the **coordination hub** — it holds the repo-scoped registry, the `agent-router.yml@v3` workflow, and the issue labels. Both CV agents register into the `academic-resume` registry. Bootstrapped via `macf init` in 2026-04 (channel server registered; cross-routing validated via cv-e2e-test rehearsals #11b/#12b/#13b — 10/11 PASS, validating route-by-pr-review-state per macf-actions#39). Notable workspace customization: operator-authored `Write` + `Edit` in `.claude/settings.local.json` (per `macf#305` merge-view fix in `macf doctor`).
+2. **`cv-project-archaeologist`** (same `academic-resume` project, own repo) — sister consumer; registers into the shared `academic-resume` registry; cross-routing exercised in research-handoff PR cycles.
 3. **Future CV-fleet additions** — same path; differential is project-name + agent-role at `macf init` time.
+
+**Revival (2026-06-07).** After months idle the fleet had decayed — both agents offline, `cv-architect` on cli `0.1.0` with a pre-#342 monolithic `claude.sh`, plugin behind. It was brought back via the "Reviving an existing consumer" steps above: global-CLI bump (the installed `macf` was itself stale at `0.2.4`, shadowed in `PATH`), `macf update --all` per workspace (0.1.0/0.2.33 → 0.2.35; monolithic→multi-file migration), fresh relaunch (`MACF_TEST=1` to bypass the empty-`-c` immediate exit), re-registration at the tailnet advertise-host, and an end-to-end `cv-architect → issue #60 → cv-project-archaeologist` mTLS round-trip verified via `tmux_wake_delivered` in *both* channel.logs. Two latent defects surfaced and were fixed in the process: the plugin hooks-dup on Claude Code ≥2.1.x (plugin **v0.2.36**), and a duplicate-`cv-architect`-identity collision between the `academic-cv` working checkout and a stray `academic-resume` checkout (one identity per running instance — see "Gotchas that bite on revival").
 
 Reference test bootstrap shape: `groundnuty/macf-testbed:scripts/bootstrap-tester.sh` shows the canonical save/restore-claude.sh pattern for workspaces with custom launchers (testbed agents have a custom `claude.sh` with extra OTel attrs + tmux/sg-docker wrappers; `bootstrap-tester.sh` saves it before `macf init` and re-merges after). Most consumer projects don't need this customization — the canonical `claude.sh` is sufficient.
 

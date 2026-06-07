@@ -193,9 +193,12 @@ describe('generateClaudeSh', () => {
   });
 
   describe('exec claude conditional (macf#178 Gap 5 + macf#189 sub-item 4)', () => {
-    it('includes the --plugin-dir flag + -c for permanent agents (default branch)', () => {
+    it('permanent agents resume with -c but fall back to a fresh session (no hard exec of -c)', () => {
       const output = generateClaudeSh(sampleConfig);
-      expect(output).toContain('exec claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"');
+      // The resume attempt is NOT exec'd, so the `|| exec claude` fallback fires
+      // when there's no resumable conversation (first launch / different path key).
+      expect(output).toContain('claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@" || exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"');
+      expect(output).not.toContain('exec claude -c');
     });
 
     it('omits -c for worker agents (each invocation is fresh by design)', () => {
@@ -205,11 +208,13 @@ describe('generateClaudeSh', () => {
       expect(output).not.toContain('exec claude -c');
     });
 
-    it('generates a conditional exec: MACF_TEST set → no -c, else → -c (permanent)', () => {
+    it('generates a conditional exec: MACF_TEST set → fresh exec, else → resume-with-fallback (permanent)', () => {
       const output = generateClaudeSh(sampleConfig);
       expect(output).toContain('if [ -n "${MACF_TEST:-}" ]; then');
+      // MACF_TEST branch: fresh session, no -c
       expect(output).toContain('exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"');
-      expect(output).toContain('exec claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"');
+      // else branch: resume, falling back to a fresh session if nothing is resumable
+      expect(output).toContain('claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@" || exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"');
       expect(output).toMatch(/fi[\s\n]*$/);
     });
 
@@ -313,7 +318,7 @@ describe('writeClaudeSh', () => {
 
     const after = readFileSync(path, 'utf-8');
     expect(after).not.toContain('stale user edits');
-    expect(after).toContain('exec claude -c --plugin-dir');
+    expect(after).toContain('claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@" || exec claude');
     expect(statSync(path).mode & 0o777).toBe(0o755);
   });
 
