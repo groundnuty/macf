@@ -26,6 +26,7 @@ import {
   getNotifyReceivedCounter,
   getNotifyPeerCounter,
   getSignCallsCounter,
+  getCommsLedgerWriteFailedCounter,
   resetMetricsCacheForTesting,
   MetricNames,
   MetricAttr,
@@ -105,6 +106,13 @@ describe('metrics module', () => {
       // macf#371: empirical-basis counter for DR-010 Path-2 removal trigger.
       const a = getSignCallsCounter();
       const b = getSignCallsCounter();
+      expect(a).toBe(b);
+    });
+
+    it('getCommsLedgerWriteFailedCounter returns the same instance on repeated calls', () => {
+      // macf#473 piece 2: loud-but-proceeds write-failed metric.
+      const a = getCommsLedgerWriteFailedCounter();
+      const b = getCommsLedgerWriteFailedCounter();
       expect(a).toBe(b);
     });
 
@@ -243,11 +251,50 @@ describe('metrics module', () => {
     });
   });
 
+  describe('macf#473 comms_ledger_write_failed_total counter', () => {
+    it('records comms_ledger_write_failed_total increments with agent/channel/direction labels', async () => {
+      const exporter = new InMemoryMetricExporter();
+      const sdkMetrics = await import('@opentelemetry/sdk-metrics');
+      const reader = new sdkMetrics.PeriodicExportingMetricReader({
+        exporter,
+        exportIntervalMillis: 60_000,
+      });
+      const provider = new MeterProvider({ readers: [reader] });
+      metrics.setGlobalMeterProvider(provider);
+
+      const counter = getCommsLedgerWriteFailedCounter();
+      counter.add(1, {
+        [MetricAttr.Agent]: 'tester-1',
+        [MetricAttr.Channel]: 'a2a',
+        [MetricAttr.Direction]: 'send',
+      });
+      counter.add(1, {
+        [MetricAttr.Agent]: 'tester-1',
+        [MetricAttr.Channel]: 'github-route',
+        [MetricAttr.Direction]: 'recv',
+      });
+
+      await reader.forceFlush();
+
+      const lastBatch = exporter.batches.at(-1);
+      expect(lastBatch).toBeDefined();
+      const metric = lastBatch?.scopeMetrics
+        .flatMap((sm) => sm.metrics)
+        .find((m) => m.descriptor.name === MetricNames.CommsLedgerWriteFailedTotal);
+      expect(metric).toBeDefined();
+      // 2 distinct (channel, direction) combos → 2 data points.
+      expect(metric?.dataPoints.length).toBe(2);
+
+      await provider.shutdown();
+    });
+  });
+
   describe('instrument names + attributes', () => {
     it('exposes canonical metric names matching documented conventions', () => {
       expect(MetricNames.NotifyReceivedTotal).toBe('macf.notify_received_total');
       expect(MetricNames.NotifyPeerTotal).toBe('macf.notify_peer_total');
       expect(MetricNames.SignCallsTotal).toBe('macf.sign_calls_total');
+      expect(MetricNames.CommsLedgerWriteFailedTotal).toBe('macf.comms_ledger_write_failed_total');
     });
 
     it('exposes canonical attribute keys', () => {
@@ -255,6 +302,8 @@ describe('metrics module', () => {
       expect(MetricAttr.Agent).toBe('macf.agent');
       expect(MetricAttr.Delivered).toBe('macf.notify.delivered');
       expect(MetricAttr.Event).toBe('macf.notify.event');
+      expect(MetricAttr.Channel).toBe('macf.comms.channel');
+      expect(MetricAttr.Direction).toBe('macf.comms.direction');
     });
   });
 });

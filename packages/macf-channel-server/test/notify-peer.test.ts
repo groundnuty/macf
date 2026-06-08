@@ -495,6 +495,144 @@ describe('notify_peer tool', () => {
       expect(result.peers_delivered).toBe(1);
     });
   });
+
+  // macf#473 piece 2: the outbound SEND edge site. Unlike the recv sites,
+  // recordEdge runs AFTER the dispatch (so `delivered` reflects the actual
+  // send result), inside the `invoke_agent` span.
+  describe('comms-ledger outbound send edge (macf#473)', () => {
+    function depsWithLedger(
+      reg: FakeRegistry,
+      recordLedgerEdge: ReturnType<typeof vi.fn>,
+      extra: Record<string, unknown> = {},
+    ) {
+      return {
+        ...makeDeps(reg),
+        recordLedgerEdge: recordLedgerEdge as unknown as Parameters<typeof notifyPeer>[0]['recordLedgerEdge'],
+        ...extra,
+      };
+    }
+
+    it('records one send edge per peer over the legacy path with delivered=true on HTTP 200', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const recordLedgerEdge = vi.fn();
+      nextHttpsRespondsWith(200);
+      await notifyPeer(depsWithLedger(reg, recordLedgerEdge), {
+        to: 'peer-a',
+        event: 'turn-complete',
+        message: 'wrapped up #34',
+        github_anchor: 'groundnuty/macf#34',
+      });
+      expect(recordLedgerEdge).toHaveBeenCalledTimes(1);
+      const edge = recordLedgerEdge.mock.calls[0]![0];
+      expect(edge).toMatchObject({
+        from: 'self-agent',
+        to: 'peer-a',
+        // direct-vs-router: a notify_peer send is always DIRECT peer-to-peer
+        // (legacy /notify POST or a2a-client) — never the router — so `a2a`.
+        channel: 'a2a',
+        direction: 'send',
+        event: 'turn-complete',
+        intent_summary: 'wrapped up #34',
+        github_anchor: 'groundnuty/macf#34',
+        delivered: true,
+        processed: null,
+      });
+      // a generated msg_id for the legacy path (no natural A2A id)
+      expect(typeof edge.msg_id).toBe('string');
+      expect(edge.msg_id.length).toBeGreaterThan(0);
+    });
+
+    it('records delivered=false when the legacy peer returns non-200', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const recordLedgerEdge = vi.fn();
+      nextHttpsRespondsWith(500); // peer alive but rejected
+      await notifyPeer(depsWithLedger(reg, recordLedgerEdge), { to: 'peer-a', event: 'error' });
+      expect(recordLedgerEdge).toHaveBeenCalledTimes(1);
+      expect(recordLedgerEdge.mock.calls[0]![0]).toMatchObject({
+        delivered: false,
+        event: 'error',
+        github_anchor: null, // omitted → null
+      });
+    });
+
+    it('records delivered=false on transport error (peer unreachable)', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const recordLedgerEdge = vi.fn();
+      nextHttpsErrorsWith(new Error('ECONNREFUSED'));
+      await notifyPeer(depsWithLedger(reg, recordLedgerEdge), { to: 'peer-a', event: 'session-end' });
+      expect(recordLedgerEdge).toHaveBeenCalledTimes(1);
+      expect(recordLedgerEdge.mock.calls[0]![0]).toMatchObject({ delivered: false });
+    });
+
+    it('records the A2A message id as msg_id + channel=a2a on the A2A path', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const card = {
+        supportedInterfaces: [{ protocolBinding: 'JSONRPC', protocolVersion: '1.0', url: 'https://127.0.0.1:9000' }],
+      };
+      const getAgentCard = vi.fn().mockResolvedValue(card);
+      const sendMessage = vi.fn().mockResolvedValue({ id: 'task-1', status: { state: 'TASK_STATE_COMPLETED' } });
+      const recordLedgerEdge = vi.fn();
+      const a2aClient = { getAgentCard, sendMessage };
+      await notifyPeer(
+        depsWithLedger(reg, recordLedgerEdge, {
+          a2aClient: a2aClient as unknown as Parameters<typeof notifyPeer>[0]['a2aClient'],
+        }),
+        { to: 'peer-a', event: 'turn-complete', github_anchor: 'g/m#7' },
+      );
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      // The Message constructed for the A2A send carries the messageId we record.
+      const sentMessage = sendMessage.mock.calls[0]![1] as { messageId: string; metadata: Record<string, unknown> };
+      expect(recordLedgerEdge).toHaveBeenCalledTimes(1);
+      const edge = recordLedgerEdge.mock.calls[0]![0];
+      expect(edge).toMatchObject({
+        channel: 'a2a',
+        direction: 'send',
+        msg_id: sentMessage.messageId,
+        delivered: true,
+        github_anchor: 'g/m#7',
+      });
+      // github_anchor also rides the outbound A2A Message metadata for the receiver.
+      expect(sentMessage.metadata['github_anchor']).toBe('g/m#7');
+    });
+
+    it('records delivered=false when the A2A peer REJECTED the message', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const card = {
+        supportedInterfaces: [{ protocolBinding: 'JSONRPC', protocolVersion: '1.0', url: 'https://127.0.0.1:9000' }],
+      };
+      const getAgentCard = vi.fn().mockResolvedValue(card);
+      const sendMessage = vi.fn().mockResolvedValue({ id: 'task-1', status: { state: 'TASK_STATE_REJECTED' } });
+      const recordLedgerEdge = vi.fn();
+      const a2aClient = { getAgentCard, sendMessage };
+      await notifyPeer(
+        depsWithLedger(reg, recordLedgerEdge, {
+          a2aClient: a2aClient as unknown as Parameters<typeof notifyPeer>[0]['a2aClient'],
+        }),
+        { to: 'peer-a', event: 'turn-complete' },
+      );
+      expect(recordLedgerEdge.mock.calls[0]![0]).toMatchObject({ channel: 'a2a', delivered: false });
+    });
+
+    it('is a clean no-op when recordLedgerEdge is omitted (back-compat)', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      nextHttpsRespondsWith(200);
+      // makeDeps() has no recordLedgerEdge — must still deliver fine.
+      const result = await notifyPeer(makeDeps(reg), { to: 'peer-a', event: 'turn-complete' });
+      expect(result.peers_delivered).toBe(1);
+    });
+  });
 });
 
 // vitest's `beforeEach` is per-describe by default; declare top-level here too.

@@ -30,6 +30,10 @@ import { HttpError } from '@groundnuty/macf-core';
 import { formatNotifyContent } from './notify-formatter.js';
 import { wakeViaTmux } from './tmux-wake.js';
 import { decideWake } from './wake-decision.js';
+import { createCommsLedger } from './comms-ledger.js';
+import { recordEdge } from './comms-ledger-record.js';
+import type { CommsLedgerEdge } from './comms-ledger.js';
+import { getCommsLedgerWriteFailedCounter, MetricAttr } from './metrics.js';
 import type { NotifyPayload, SignRequest } from '@groundnuty/macf-core';
 
 // NOTE: `checkPendingIssues` from './startup-issues.js' used to be
@@ -59,6 +63,30 @@ async function main(): Promise<void> {
     logPath: config.logPath,
     debug: config.debug,
   });
+
+  // macf#473 piece 2 (DR-025): the authoritative write-ahead comms-ledger,
+  // a SIBLING of channel.log derived from MACF_LOG_PATH. A no-op when
+  // logPath is unset (mirrors `logger`). The `appendEdge` writer is
+  // fail-loud; `recordEdge` wraps it in the loud-but-proceeds policy so a
+  // ledger-write failure at a coordination edge site never aborts delivery
+  // (operator decision 2026-06-08). Bound here once so the three edge sites
+  // (inbound /notify, inbound A2A message/send, outbound notify_peer) call a
+  // single closure — they build the edge, this records it.
+  const commsLedger = createCommsLedger({ logPath: config.logPath });
+  const recordLedgerEdge = (edge: CommsLedgerEdge): void =>
+    recordEdge(
+      {
+        ledger: commsLedger,
+        logger,
+        recordWriteFailed: (failedEdge) =>
+          getCommsLedgerWriteFailedCounter().add(1, {
+            [MetricAttr.Agent]: config.agentName,
+            [MetricAttr.Channel]: failedEdge.channel,
+            [MetricAttr.Direction]: failedEdge.direction,
+          }),
+      },
+      edge,
+    );
 
   // Partial-startup failures (MCP connected, port bound, then registry
   // or collision fails) would otherwise crash with only the stderr
@@ -380,6 +408,11 @@ async function main(): Promise<void> {
     agentCard,
     taskStore,
     logger,
+    // macf#473 piece 2: the inbound recv edge sites (/notify + A2A
+    // message/send) record an authoritative ledger edge BEFORE delivering
+    // to onNotify, capturing trace_id from the active SERVER span.
+    recordLedgerEdge,
+    selfAgentName: config.agentName,
   });
 
   // macf#256 / DR-023 UC-1: register notify_peer MCP tool on the MCP
@@ -412,6 +445,9 @@ async function main(): Promise<void> {
     caCertPem,
     logger,
     a2aClient,
+    // macf#473 piece 2: the outbound send edge site records a ledger edge
+    // per peer once the dispatch outcome (delivered) is known.
+    recordLedgerEdge,
   };
   mcp.mcp.registerTool(
     'notify_peer',

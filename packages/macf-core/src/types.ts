@@ -82,6 +82,8 @@ export const NotifyPayloadSchema = z.object({
   // design discriminates at the receiver from a property already there
   // for other reasons.
   event: z.enum(['session-end', 'turn-complete', 'error', 'custom']).optional(),
+  // macf#473: optional owner/repo#N anchor a peer_notification nudge is tied to, for the comms-ledger graph join.
+  github_anchor: z.string().optional(),
   // pr_review_state variant fields (macf-actions#39, v3.3.0). Optional
   // at the top level to preserve backward-compat. Producers (the
   // route-by-pr-review-state job) construct + validate against the
