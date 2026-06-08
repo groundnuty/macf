@@ -41,6 +41,8 @@ import { buildInvokeAgentSpanName, Attr, GenAiAttr } from './tracing.js';
 import { getNotifyPeerCounter, MetricAttr } from './metrics.js';
 import { A2aClient, A2aClientError } from './a2a-client.js';
 import type { Message } from './a2a-types.js';
+import { intentSummary } from './comms-ledger.js';
+import type { CommsLedgerEdge } from './comms-ledger.js';
 
 export const NotifyPeerInputSchema = {
   to: z.string().optional()
@@ -51,6 +53,13 @@ export const NotifyPeerInputSchema = {
     .describe('Optional human-readable message body.'),
   context: z.record(z.string(), z.unknown()).optional()
     .describe('Optional structured context payload (string-keyed object).'),
+  // macf#473 piece 2 (DR-025): an optional GitHub object this nudge is tied
+  // to (`owner/repo#N`), so an off-GitHub A2A edge stitches back to its
+  // on-GitHub object in the comms-ledger graph. Defaults to null (a pure
+  // nudge). Carried in the outbound A2A Message's `metadata.github_anchor`
+  // so the receiver can record the same anchor on its recv edge.
+  github_anchor: z.string().nullable().optional()
+    .describe('Optional GitHub anchor (owner/repo#N) this notification is tied to, for the comms-ledger graph join. Null/omitted for a pure nudge.'),
 } as const;
 
 export const NotifyPeerOutputSchema = {
@@ -78,6 +87,14 @@ export interface NotifyPeerDeps {
    * stub or omit entirely to exercise legacy-only paths.
    */
   readonly a2aClient?: A2aClient;
+  /**
+   * macf#473 piece 2 (DR-025): record an authoritative outbound comms-ledger
+   * edge per peer once the dispatch outcome is known. Optional — pre-#473
+   * deps (and most tests) omit it and the send site skips the ledger record.
+   * Loud-but-proceeds: this closure never throws (server.ts binds it through
+   * `recordEdge`).
+   */
+  readonly recordLedgerEdge?: (edge: CommsLedgerEdge) => void;
 }
 
 export interface NotifyPeerInput {
@@ -85,6 +102,8 @@ export interface NotifyPeerInput {
   readonly event: 'session-end' | 'turn-complete' | 'error' | 'custom';
   readonly message?: string;
   readonly context?: Record<string, unknown>;
+  /** macf#473 piece 2: optional GitHub anchor (owner/repo#N) for the ledger graph join. */
+  readonly github_anchor?: string | null;
 }
 
 export interface NotifyPeerResult {
@@ -247,6 +266,9 @@ function buildA2aMessageFromPayload(
       event: input.event,
       source: selfAgentName,
       ...(input.context !== undefined ? { context: input.context } : {}),
+      // macf#473 piece 2: carry the github_anchor on the wire so the
+      // receiver records the same anchor on its recv edge (graph join).
+      ...(input.github_anchor != null ? { github_anchor: input.github_anchor } : {}),
     },
   };
 }
@@ -351,36 +373,70 @@ async function dispatchToPeer(
   if (span !== undefined) {
     span.setAttribute(Attr.OutboundProtocol, protocol);
   }
+
+  // The A2A message id (when the A2A path is taken) doubles as the ledger
+  // msg_id; for the legacy path there is no natural id so we generate one.
+  let msgId: string | undefined;
+  let result: { readonly httpOk: boolean; readonly transportOk: boolean };
+
   if (protocol === 'legacy') {
-    return postToPeer(deps, peer, legacyPayload, timeoutMs);
+    result = await postToPeer(deps, peer, legacyPayload, timeoutMs);
+  } else {
+    // A2A path: construct message + send + map outcome.
+    const message = buildA2aMessageFromPayload(input, deps.selfAgentName);
+    msgId = message.messageId;
+    try {
+      const task = await deps.a2aClient!.sendMessage(
+        `${peerBaseUrl(peer)}`,
+        message,
+        { target: peer.name },
+      );
+      const state = task.status.state;
+      // Treat non-error terminal states as "delivered". REJECTED is the
+      // canonical "agent declined" state — treat as not-delivered.
+      const accepted =
+        state === 'TASK_STATE_COMPLETED'
+        || state === 'TASK_STATE_WORKING'
+        || state === 'TASK_STATE_SUBMITTED'
+        || state === 'TASK_STATE_INPUT_REQUIRED'
+        || state === 'TASK_STATE_AUTH_REQUIRED';
+      result = { httpOk: accepted, transportOk: true };
+    } catch (err) {
+      deps.logger.warn('notify_peer_a2a_error', {
+        peer: peer.name,
+        code: err instanceof A2aClientError ? err.code : 'UNKNOWN',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      const transportOk = !(err instanceof A2aClientError) || err.code !== 'TRANSPORT_ERROR';
+      result = { httpOk: false, transportOk };
+    }
   }
-  // A2A path: construct message + send + map outcome.
-  const message = buildA2aMessageFromPayload(input, deps.selfAgentName);
-  try {
-    const task = await deps.a2aClient!.sendMessage(
-      `${peerBaseUrl(peer)}`,
-      message,
-      { target: peer.name },
-    );
-    const state = task.status.state;
-    // Treat non-error terminal states as "delivered". REJECTED is the
-    // canonical "agent declined" state — treat as not-delivered.
-    const accepted =
-      state === 'TASK_STATE_COMPLETED'
-      || state === 'TASK_STATE_WORKING'
-      || state === 'TASK_STATE_SUBMITTED'
-      || state === 'TASK_STATE_INPUT_REQUIRED'
-      || state === 'TASK_STATE_AUTH_REQUIRED';
-    return { httpOk: accepted, transportOk: true };
-  } catch (err) {
-    deps.logger.warn('notify_peer_a2a_error', {
-      peer: peer.name,
-      code: err instanceof A2aClientError ? err.code : 'UNKNOWN',
-      error: err instanceof Error ? err.message : String(err),
+
+  // macf#473 piece 2: record the authoritative outbound SEND edge once the
+  // dispatch OUTCOME is known. Unlike the recv sites, "append-before-deliver"
+  // does not apply here — `delivered` must reflect the actual send result,
+  // which is only known after the dispatch. `delivered` is set from `httpOk`
+  // (the peer ACCEPTED the notification). trace_id comes from the active
+  // CLIENT span (`invoke_agent`) set by notifyPeer. Loud-but-proceeds:
+  // recordLedgerEdge never throws.
+  if (deps.recordLedgerEdge !== undefined) {
+    deps.recordLedgerEdge({
+      ts: new Date().toISOString(),
+      from: deps.selfAgentName,
+      to: peer.name,
+      channel: protocol === 'a2a' ? 'a2a' : 'github-route',
+      direction: 'send',
+      event: input.event,
+      msg_id: msgId ?? randomUUID(),
+      intent_summary: intentSummary(input.message),
+      github_anchor: input.github_anchor ?? null,
+      delivered: result.httpOk,
+      processed: null,
+      trace_id: span?.spanContext().traceId ?? '',
     });
-    const transportOk = !(err instanceof A2aClientError) || err.code !== 'TRANSPORT_ERROR';
-    return { httpOk: false, transportOk };
   }
+
+  return result;
 }
 
 /**

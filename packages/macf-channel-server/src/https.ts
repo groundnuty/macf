@@ -37,6 +37,10 @@ import {
 } from './a2a-task.js';
 import type { TaskStore } from './a2a-task.js';
 import { a2aMessageToNotifyPayload } from './a2a-delivery.js';
+import { intentSummary } from './comms-ledger.js';
+import type { CommsEvent, CommsLedgerEdge } from './comms-ledger.js';
+import { formatNotifyContent } from './notify-formatter.js';
+import type { Message } from './a2a-types.js';
 
 const MAX_BODY_BYTES = 64 * 1024; // 64KB
 export const PORT_RANGE_START = 8800;
@@ -153,6 +157,75 @@ function readBody(
   });
 }
 
+/**
+ * Map an inbound NotifyPayload type → the DR-025 unified comms-event
+ * taxonomy (macf#473 piece 2). The GitHub router events map to their
+ * taxonomy names; anything without a clean correspondence (ci_completion,
+ * startup_check, peer_notification) falls back to `custom`. Exported for
+ * the edge-site ordering tests.
+ */
+export function notifyTypeToCommsEvent(payload: NotifyPayload): CommsEvent {
+  switch (payload.type) {
+    case 'mention':
+      return 'mention';
+    case 'issue_routed':
+      return 'issue-routed';
+    case 'pr_review_state':
+      return 'pr-review-state';
+    default:
+      // ci_completion / startup_check / peer_notification (+ peer_notification
+      // carries its own finer `event`, but that field lives in the A2A path;
+      // the legacy /notify peer_notification still maps to custom here).
+      return 'custom';
+  }
+}
+
+/**
+ * Derive an `owner/repo#N`-style github_anchor from a NotifyPayload, or null
+ * for a payload with no GitHub object to stitch to (macf#473 piece 2).
+ * Prefers the producer-supplied `repo` (macf-actions v3.2.0+, #30); falls
+ * back to a bare `#N` when only the issue number is known. Exported for tests.
+ */
+export function githubAnchorFromNotify(payload: NotifyPayload): string | null {
+  if (payload.issue_number === undefined && payload.pr_number === undefined) {
+    return null;
+  }
+  const num = payload.issue_number ?? payload.pr_number;
+  if (num === undefined) return null;
+  return payload.repo ? `${payload.repo}#${num}` : `#${num}`;
+}
+
+/**
+ * Read a github_anchor out of an A2A Message's metadata, if the sender
+ * stamped one (macf#473 piece 2 — the outbound `notify_peer github_anchor`
+ * field travels in `metadata.github_anchor`). Returns null when absent or
+ * non-string. Exported for tests.
+ */
+export function githubAnchorFromMessage(message: Message): string | null {
+  const anchor = (message.metadata ?? {})['github_anchor'];
+  return typeof anchor === 'string' && anchor.length > 0 ? anchor : null;
+}
+
+/**
+ * Map an inbound A2A Message's `metadata.event` → the comms-event taxonomy.
+ * The sender stamps one of the four peer_notification events; anything
+ * missing/unrecognized falls back to `custom` (same shape as the
+ * a2a-delivery wake default). Exported for tests.
+ */
+export function a2aMetadataToCommsEvent(message: Message): CommsEvent {
+  const ev = (message.metadata ?? {})['event'];
+  switch (ev) {
+    case 'session-end':
+      return 'session-end';
+    case 'turn-complete':
+      return 'turn-complete';
+    case 'error':
+      return 'error';
+    default:
+      return 'custom';
+  }
+}
+
 export function createHttpsServer(config: {
   readonly caCertPath: string;
   readonly agentCertPath: string;
@@ -180,8 +253,22 @@ export function createHttpsServer(config: {
    */
   readonly taskStore?: TaskStore;
   readonly logger: Logger;
+  /**
+   * macf#473 piece 2 (DR-025): record an authoritative comms-ledger edge for
+   * an inbound coordination recv. Invoked BEFORE `onNotify` at both recv edge
+   * sites (`/notify` + A2A `message/send`). Loud-but-proceeds: a write
+   * failure is logged + counted but never throws, so delivery is never
+   * blocked. Optional — pre-#473 channel-servers (and most tests) omit it and
+   * the recv sites simply skip the ledger record.
+   */
+  readonly recordLedgerEdge?: (edge: CommsLedgerEdge) => void;
+  /**
+   * This server's own agent name — the `to` of an inbound recv edge. Required
+   * alongside `recordLedgerEdge`; when the latter is omitted this is unused.
+   */
+  readonly selfAgentName?: string;
 }): HttpsServer {
-  const { onNotify, onHealth, onSign, agentCard, taskStore, logger } = config;
+  const { onNotify, onHealth, onSign, agentCard, taskStore, logger, recordLedgerEdge, selfAgentName } = config;
 
   const tlsOptions = {
     key: readFileSync(config.agentKeyPath),
@@ -335,6 +422,34 @@ export function createHttpsServer(config: {
         parentCtx,
         async (span) => {
           try {
+            // macf#473 piece 2: APPEND-BEFORE-DELIVER. Record the
+            // authoritative inbound github-route recv edge BEFORE handing
+            // off to onNotify, capturing trace_id synchronously from the
+            // active SERVER span (OTel api 1.9.1 — synchronous, pre-export).
+            // Loud-but-proceeds: recordLedgerEdge never throws.
+            if (recordLedgerEdge !== undefined) {
+              const payload = result.data;
+              const num = payload.issue_number ?? payload.pr_number;
+              recordLedgerEdge({
+                ts: new Date().toISOString(),
+                // `subject.CN` is typed `string | string[]`; coerce to a
+                // single string for the edge `from` (multi-CN certs are
+                // rejected upstream by extractCN, so this is defensive).
+                from: String(clientCn),
+                to: selfAgentName ?? 'unknown',
+                channel: 'github-route',
+                direction: 'recv',
+                event: notifyTypeToCommsEvent(payload),
+                // Stable id: issue/pr number + type + ts; the type+number
+                // pair disambiguates concurrent recvs, the ts breaks ties.
+                msg_id: `${payload.type}:${num ?? 'na'}:${Date.now()}`,
+                intent_summary: intentSummary(formatNotifyContent(payload).content),
+                github_anchor: githubAnchorFromNotify(payload),
+                delivered: true, // it was received over the wire
+                processed: null, // backfilled later via the receipt join (#444)
+                trace_id: span.spanContext().traceId,
+              });
+            }
             await onNotify(result.data);
             sendJson(res, 200, { status: 'received' });
             span.setStatus({ code: SpanStatusCode.OK });
@@ -709,6 +824,35 @@ export function createHttpsServer(config: {
             const now = new Date().toISOString();
             const incomingMessage = params.data.message;
 
+            // macf#473 piece 2: APPEND-BEFORE-DELIVER for the inbound A2A
+            // recv edge. Records the authoritative edge BEFORE the
+            // `onNotify(a2aMessageToNotifyPayload(...))` delivery, capturing
+            // trace_id synchronously from the active SERVER span. Called from
+            // both delivering branches (resume + happy-path); the REJECTED
+            // test-fixture branch intentionally does NOT call it (a rejected
+            // message was declined, not received — mirrors its no-deliver
+            // semantics). Loud-but-proceeds: never throws.
+            const recordA2aRecvEdge = (): void => {
+              if (recordLedgerEdge === undefined) return;
+              const text = a2aMessageToNotifyPayload(incomingMessage).message ?? '';
+              recordLedgerEdge({
+                ts: new Date().toISOString(),
+                // `subject.CN` is typed `string | string[]`; coerce to a
+                // single string for the edge `from`.
+                from: String(clientCn),
+                to: selfAgentName ?? 'unknown',
+                channel: 'a2a',
+                direction: 'recv',
+                event: a2aMetadataToCommsEvent(incomingMessage),
+                msg_id: incomingMessage.messageId,
+                intent_summary: intentSummary(text),
+                github_anchor: githubAnchorFromMessage(incomingMessage),
+                delivered: true, // accepted over the wire
+                processed: null, // backfilled later via the receipt join (#444)
+                trace_id: span.spanContext().traceId,
+              });
+            };
+
             // macf#392 Phase 2b: resume branch. If incoming Message.taskId
             // is set, the client is resuming a paused task (INPUT_REQUIRED
             // or AUTH_REQUIRED state); dispatch to TaskStore.resume() instead
@@ -725,6 +869,7 @@ export function createHttpsServer(config: {
               // macf#428 (Phase 3.5): deliver to the agent (resume branch too,
               // not just happy-path — avoids a deliver/silently-drop asymmetry).
               // See the happy-path call below for the ordering + wake rationale.
+              recordA2aRecvEdge(); // macf#473: append-before-deliver
               await onNotify(a2aMessageToNotifyPayload(incomingMessage));
               sendA2aJson(res, 200, {
                 jsonrpc: '2.0',
@@ -805,6 +950,7 @@ export function createHttpsServer(config: {
             //
             // NB: the REJECTED test-fixture branch above intentionally does
             // NOT deliver — a rejected message was declined, not received.
+            recordA2aRecvEdge(); // macf#473: append-before-deliver
             await onNotify(a2aMessageToNotifyPayload(incomingMessage));
             sendA2aJson(res, 200, {
               jsonrpc: '2.0',

@@ -63,6 +63,20 @@ export const MetricNames = {
    * server's agent name).
    */
   SignCallsTotal: 'macf.sign_calls_total',
+  /**
+   * Counter incremented every time a comms-ledger edge write fails
+   * (macf#473 piece 2). The ledger writer (`appendEdge`) is fail-loud
+   * (throws); the `recordEdge` policy helper catches that throw, emits a
+   * LOUD signal, then proceeds with delivery — so an observability-layer
+   * failure can never cause a coordination outage. This counter is the
+   * machine-readable half of that loud signal (the `logger.error
+   * comms_ledger_write_failed` log line is the human-readable half). A
+   * non-zero value means at least one authoritative coordination edge was
+   * lost: the DR-025 ledger is the durable floor, so any miss is
+   * alert-worthy. Labels: `agent` (this server's agent name), `channel`
+   * (a2a | github-route), `direction` (send | recv).
+   */
+  CommsLedgerWriteFailedTotal: 'macf.comms_ledger_write_failed_total',
 } as const;
 
 /** Metric attribute keys — separate from span attributes (`Attr` in tracing.ts). */
@@ -75,6 +89,10 @@ export const MetricAttr = {
   Delivered: 'macf.notify.delivered',
   /** peer_notification event name (session-end, turn-complete, error, custom). */
   Event: 'macf.notify.event',
+  /** Comms-ledger edge channel (a2a | github-route) — on the write-failed counter (macf#473). */
+  Channel: 'macf.comms.channel',
+  /** Comms-ledger edge direction (send | recv) — on the write-failed counter (macf#473). */
+  Direction: 'macf.comms.direction',
 } as const;
 
 /**
@@ -87,6 +105,7 @@ export const MetricAttr = {
 let cachedNotifyReceivedCounter: Counter | undefined;
 let cachedNotifyPeerCounter: Counter | undefined;
 let cachedSignCallsCounter: Counter | undefined;
+let cachedCommsLedgerWriteFailedCounter: Counter | undefined;
 
 /**
  * Get the cached `macf.notify_received_total` counter, creating it
@@ -130,6 +149,21 @@ export function getSignCallsCounter(): Counter {
 }
 
 /**
+ * Get the cached `macf.comms_ledger_write_failed_total` counter, creating
+ * it on first access. Same lazy-create pattern as the others — safe before
+ * `bootstrapOtel()` (no-op meter → no-op instrument when OTEL is disabled).
+ * Incremented by the `recordEdge` policy helper's catch block (macf#473
+ * piece 2) when an authoritative comms-ledger write fails.
+ */
+export function getCommsLedgerWriteFailedCounter(): Counter {
+  cachedCommsLedgerWriteFailedCounter ??= getMeter().createCounter(MetricNames.CommsLedgerWriteFailedTotal, {
+    description: 'Comms-ledger edge writes that failed (loud-but-proceeds policy; non-zero = a lost authoritative coordination edge, macf#473)',
+    unit: '1',
+  });
+  return cachedCommsLedgerWriteFailedCounter;
+}
+
+/**
  * Reset cached instruments. ONLY for use in tests that need to swap in
  * a fresh MeterProvider between cases. Do not call from production
  * code — the cache is correct under any normal lifecycle.
@@ -138,4 +172,5 @@ export function resetMetricsCacheForTesting(): void {
   cachedNotifyReceivedCounter = undefined;
   cachedNotifyPeerCounter = undefined;
   cachedSignCallsCounter = undefined;
+  cachedCommsLedgerWriteFailedCounter = undefined;
 }
