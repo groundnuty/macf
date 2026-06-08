@@ -99,7 +99,7 @@ macf repo-init \
 This creates:
 
 - `.github/agent-config.json` — registry pointer + per-agent metadata (App slug, tmux session, workspace path)
-- `.github/workflows/agent-router.yml` — references `groundnuty/macf-actions/.github/workflows/agent-router.yml@v3` (Stage-3 mTLS, the default for a new project). **Transitional caveat:** the substrate/CV fleet currently runs a legacy v1.x SSH/tmux primitive (`@v1.3.x`) but is migrating to Stage 3 (#467); the two stages don't interoperate, so if you must coordinate with that fleet *while its migration is in progress*, match its current `agent-router.yml` stage rather than assuming `@v3`. See [`design/macf-consumer-onboarding.md`](../design/macf-consumer-onboarding.md) §"Routing-stage"
+- `.github/workflows/agent-router.yml` — references `groundnuty/macf-actions/.github/workflows/agent-router.yml@v3` (Stage-3 mTLS, the default for a new project). **Routing-stage caveat:** new projects + the CV fleet use Stage-3 (`@v3`), but the **substrate** (`groundnuty/macf`, `macf-science-agent`, `macf-devops-toolkit`) stays on the v1.x SSH/tmux primitive (`@v1.3.x`, currently `v1.3.5`) — permanent for now (substrate-permanent-Stage-2, `macf#273`). The two stages don't interoperate, so if you must coordinate with a fleet, match its **current** `agent-router.yml` stage rather than assuming `@v3`. See [`design/macf-consumer-onboarding.md`](../design/macf-consumer-onboarding.md) §"Routing-stage"
 - Labels: `code-agent`, `in-progress`, `in-review`, `blocked`, `agent-offline` (and similar for any other agents listed)
 - Required secrets/variables (you may need to provision these manually; the script tells you which)
 
