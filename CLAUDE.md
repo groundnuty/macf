@@ -54,8 +54,31 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 
 ## Implementation Status
 
+> **Current state (updated 2026-06-08).** `main` is **post-v0.2.36**. v0.2.36 is
+> LIVE on npm (all 3 packages, provenance) — it dropped the breaking plugin
+> `manifest.hooks` key (Claude Code ≥2.1.x "/doctor Duplicate hooks" fix) + shipped
+> the marketplace plugin v0.2.36. **Merged-but-unreleased on `main` (→ v0.2.37
+> candidate):** the **DR-025 comms-ledger** (#472/#474/#475/#473/#476 — per-agent
+> write-ahead `comms-ledger.jsonl` authoritative + Tempo derived index;
+> loud-but-proceeds) and the **#444 route-receipt reconciler** (#477/#478
+> window-aware truncation; #479/#480 coalesced-turn precision-floor gate via
+> sibling-delivery-receipted). **#462** (routing-drop incident) self-closes after
+> #479 deploys + a clean reconcile; **#481** (C-u-clobber hypothesis) was settled
+> **not-a-bug** by a GATE-0 experiment — mid-turn pings *queue* and survive `C-u`,
+> so it's the benign `receipt≠distinct-turn` gap already suppressed by #480.
+>
+> **Routing transport is two-track** (substrate-permanent-Stage-2 directive, #273):
+> new consumer projects + the **CV fleet** → Stage-3 (`macf-actions@v3`, mTLS); the
+> **substrate** (macf / science / devops) stays permanent **Stage-2** v1.x SSH/tmux
+> (`@v1.3.x`), actively maintained — **not** retiring. macf-actions **v1.3.5**
+> (2026-06-08) bundles #47 (router prompt-injection → base64 data-passing, dropping
+> the `tr -d "'"` strip) + #42 (Tailscale `sleep`→readiness-poll + action v4.1.2
+> SHA-pin) + #49 (self-hosted-runner enablement, inert by default); `@v1.3` / `@v1`
+> moved to it. (v1.3.4 was the #45 route-correlation marker, 2026-06-06.) The
+> detailed v0.2.35 record below stands as prior-release history.
+
 P1–P7 all implemented. Post-P7 work is bug-fix + security + hardening driven
-by issue queue and periodic audits. **Current state**: `main` is at v0.2.35
+by issue queue and periodic audits. **v0.2.35 (2026-06-05 release)**: `main` was at v0.2.35
 (`3a7b7c6` bump-commit). **LIVE on npm: v0.2.35 across all 3 packages with
 provenance attestations** — cut 2026-06-05 via OIDC Trusted Publishers (bump+tag
 → auto-publish, no npm-token step). **v0.2.35 = the post-Phase-5 hardening queue
