@@ -424,7 +424,12 @@ async function dispatchToPeer(
       ts: new Date().toISOString(),
       from: deps.selfAgentName,
       to: peer.name,
-      channel: protocol === 'a2a' ? 'a2a' : 'github-route',
+      // A notify_peer send is ALWAYS a DIRECT peer-to-peer exchange — both the
+      // a2a-client path AND the legacy /notify POST go straight to the peer's
+      // channel-server; neither traverses the macf-actions router. The
+      // `github-route` channel is reserved for edges that actually went
+      // THROUGH the router (recv side of mention/issue_routed/pr_review_state).
+      channel: 'a2a',
       direction: 'send',
       event: input.event,
       msg_id: msgId ?? randomUUID(),
@@ -516,6 +521,11 @@ export async function notifyPeer(
           event: input.event,
           ...(input.message !== undefined ? { message: input.message } : {}),
           ...(input.context !== undefined ? { context: input.context } : {}),
+          // macf#473: carry the anchor on the LEGACY wire too (the A2A path
+          // stamps it in Message.metadata.github_anchor). Without this the
+          // legacy recv edge can't derive the anchor → silent drop + send/recv
+          // graph-join asymmetry.
+          ...(input.github_anchor != null ? { github_anchor: input.github_anchor } : {}),
         };
 
         // macf#396 Phase 3: dispatchToPeer does protocol-selection

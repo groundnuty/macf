@@ -529,7 +529,9 @@ describe('notify_peer tool', () => {
       expect(edge).toMatchObject({
         from: 'self-agent',
         to: 'peer-a',
-        channel: 'github-route', // legacy path
+        // direct-vs-router: a notify_peer send is always DIRECT peer-to-peer
+        // (legacy /notify POST or a2a-client) — never the router — so `a2a`.
+        channel: 'a2a',
         direction: 'send',
         event: 'turn-complete',
         intent_summary: 'wrapped up #34',

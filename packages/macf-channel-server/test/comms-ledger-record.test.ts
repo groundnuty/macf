@@ -181,6 +181,32 @@ describe('recordEdge — loud-but-proceeds on write failure', () => {
     );
   });
 
+  it('does NOT throw when logger.error ALSO throws on a failing ledger (disk-full sibling path)', () => {
+    // The ledger is a sibling of channel.log: a disk-full / read-only volume
+    // makes BOTH appendEdge AND logger.error throw the same errno. Without the
+    // outermost guard that second throw escapes recordEdge → 500s the sender.
+    const throwingLedger: CommsLedger = {
+      path: '/does/not/matter',
+      appendEdge: () => {
+        throw new Error('ENOSPC: no space left on device');
+      },
+    };
+    const throwingLogger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(() => {
+        throw new Error('ENOSPC: no space left on device');
+      }),
+    };
+    const recordWriteFailed = vi.fn();
+    expect(() =>
+      recordEdge(
+        { ledger: throwingLedger, logger: throwingLogger as never, recordWriteFailed },
+        edge(),
+      ),
+    ).not.toThrow();
+  });
+
   it('uses a stub ledger whose appendEdge throws (policy seam, fs-independent)', () => {
     const throwingLedger: CommsLedger = {
       path: '/does/not/matter',

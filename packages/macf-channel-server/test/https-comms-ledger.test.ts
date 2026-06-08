@@ -30,9 +30,25 @@ describe('notifyTypeToCommsEvent — NotifyType → DR-025 taxonomy', () => {
   it('maps pr_review_state → pr-review-state', () => {
     expect(notifyTypeToCommsEvent({ type: 'pr_review_state' } as NotifyPayload)).toBe('pr-review-state');
   });
-  it('falls back to custom for ci_completion / startup_check / peer_notification', () => {
+  it('falls back to custom for ci_completion / startup_check', () => {
     expect(notifyTypeToCommsEvent({ type: 'ci_completion' } as NotifyPayload)).toBe('custom');
     expect(notifyTypeToCommsEvent({ type: 'startup_check' } as NotifyPayload)).toBe('custom');
+  });
+  it('passes a legacy peer_notification finer `event` through verbatim', () => {
+    expect(
+      notifyTypeToCommsEvent({ type: 'peer_notification', event: 'turn-complete' } as NotifyPayload),
+    ).toBe('turn-complete');
+    expect(
+      notifyTypeToCommsEvent({ type: 'peer_notification', event: 'session-end' } as NotifyPayload),
+    ).toBe('session-end');
+    expect(
+      notifyTypeToCommsEvent({ type: 'peer_notification', event: 'error' } as NotifyPayload),
+    ).toBe('error');
+    expect(
+      notifyTypeToCommsEvent({ type: 'peer_notification', event: 'custom' } as NotifyPayload),
+    ).toBe('custom');
+  });
+  it('falls back to custom for a peer_notification with no event', () => {
     expect(notifyTypeToCommsEvent({ type: 'peer_notification' } as NotifyPayload)).toBe('custom');
   });
 });
@@ -55,6 +71,20 @@ describe('githubAnchorFromNotify — owner/repo#N derivation', () => {
   });
   it('returns null for a payload with no GitHub object (pure nudge)', () => {
     expect(githubAnchorFromNotify({ type: 'peer_notification' } as NotifyPayload)).toBeNull();
+  });
+  it('prefers a peer-stamped github_anchor on the wire (macf#473 legacy path)', () => {
+    expect(
+      githubAnchorFromNotify({ type: 'peer_notification', github_anchor: 'g/m#7' } as NotifyPayload),
+    ).toBe('g/m#7');
+    // a peer-stamped anchor wins even when issue/pr derivation would also fire
+    expect(
+      githubAnchorFromNotify({
+        type: 'issue_routed',
+        github_anchor: 'stamped/repo#1',
+        issue_number: 99,
+        repo: 'derived/repo',
+      } as NotifyPayload),
+    ).toBe('stamped/repo#1');
   });
 });
 

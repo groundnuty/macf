@@ -180,4 +180,151 @@ describe('inbound recv edge sites — append-before-deliver (macf#473)', () => {
 
     await server.stop();
   });
+
+  it('A2A resume branch also records the recv edge BEFORE onNotify', async () => {
+    // The resume branch (incoming Message.taskId set) has its own
+    // recordA2aRecvEdge() call; pin that it too records STRICTLY before the
+    // onNotify deliver (same append-before-deliver contract as the happy path).
+    const order: string[] = [];
+    const recordLedgerEdge = vi.fn((_e: CommsLedgerEdge) => {
+      order.push('record');
+    });
+    const onNotify = vi.fn(async (_p: NotifyPayload) => {
+      order.push('deliver');
+    });
+
+    // Seed a resumable task (INPUT_REQUIRED) directly on the store, then drive
+    // a resume message/send (Message.taskId set) at it through the real path.
+    const taskStore = new TaskStore();
+    const seed = {
+      messageId: 'seed-msg',
+      role: 'ROLE_USER' as const,
+      parts: [{ text: 'initial' }],
+    };
+    const nowIso = new Date().toISOString();
+    const created = taskStore.create(seed, { nowIso });
+    taskStore.transition(created.id, 'TASK_STATE_WORKING', { nowIso });
+    taskStore.transition(created.id, 'TASK_STATE_INPUT_REQUIRED', { nowIso });
+
+    const server = createHttpsServer({
+      caCertPath: certs.caCert,
+      agentCertPath: certs.agentCert,
+      agentKeyPath: certs.agentKey,
+      onNotify,
+      onHealth: () => ({} as HealthResponse),
+      logger: makeLogger(),
+      taskStore,
+      recordLedgerEdge,
+      selfAgentName: 'recv-agent',
+    });
+
+    const { actualPort } = await server.start(0, '127.0.0.1');
+    const envelope = {
+      jsonrpc: '2.0',
+      id: 'rpc-resume',
+      method: 'message/send',
+      params: {
+        message: {
+          messageId: 'a2a-resume-1',
+          role: 'ROLE_USER',
+          taskId: created.id,
+          parts: [{ text: 'resume body' }],
+          metadata: { event: 'custom', source: 'cv-architect' },
+        },
+      },
+    };
+    const res = await httpsRequest(actualPort, {
+      method: 'POST',
+      path: '/a2a/v1',
+      body: JSON.stringify(envelope),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(recordLedgerEdge).toHaveBeenCalledTimes(1);
+    expect(onNotify).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(['record', 'deliver']);
+
+    await server.stop();
+  });
+
+  it('A2A REJECTED message does NOT record a recv edge (declined ≠ received)', async () => {
+    // The REJECTED branch intentionally does NOT call recordA2aRecvEdge — a
+    // rejected message was declined, not received. Enforced only by code
+    // placement (the reject branch returns before the deliver+record), so pin
+    // it: reject → spy NOT called; (contrast) accept → spy called once.
+    const recordLedgerEdge = vi.fn((_e: CommsLedgerEdge) => {});
+    const onNotify = vi.fn(async (_p: NotifyPayload) => {});
+
+    const server = createHttpsServer({
+      caCertPath: certs.caCert,
+      agentCertPath: certs.agentCert,
+      agentKeyPath: certs.agentKey,
+      onNotify,
+      onHealth: () => ({} as HealthResponse),
+      logger: makeLogger(),
+      taskStore: new TaskStore(),
+      recordLedgerEdge,
+      selfAgentName: 'recv-agent',
+    });
+
+    const { actualPort } = await server.start(0, '127.0.0.1');
+
+    const prev = process.env['MACF_A2A_TEST_REJECT_TRIGGER'];
+    process.env['MACF_A2A_TEST_REJECT_TRIGGER'] = '1';
+    try {
+      // (a) REJECTED path — synthetic trigger text → SUBMITTED → REJECTED.
+      const rejectEnvelope = {
+        jsonrpc: '2.0',
+        id: 'rpc-reject',
+        method: 'message/send',
+        params: {
+          message: {
+            messageId: 'a2a-reject-1',
+            role: 'ROLE_USER',
+            parts: [{ text: 'TEST_TRIGGER_REJECTED' }],
+            metadata: { event: 'custom', source: 'cv-architect' },
+          },
+        },
+      };
+      const rejRes = await httpsRequest(actualPort, {
+        method: 'POST',
+        path: '/a2a/v1',
+        body: JSON.stringify(rejectEnvelope),
+        headers: { 'Content-Type': 'application/json' },
+      });
+      expect(rejRes.status).toBe(200);
+      // declined ≠ received: NO recv edge, NO delivery.
+      expect(recordLedgerEdge).not.toHaveBeenCalled();
+      expect(onNotify).not.toHaveBeenCalled();
+
+      // (b) CONTRAST — an accepted (happy-path) message DOES record exactly once.
+      const acceptEnvelope = {
+        jsonrpc: '2.0',
+        id: 'rpc-accept',
+        method: 'message/send',
+        params: {
+          message: {
+            messageId: 'a2a-accept-1',
+            role: 'ROLE_USER',
+            parts: [{ text: 'real nudge' }],
+            metadata: { event: 'custom', source: 'cv-architect' },
+          },
+        },
+      };
+      const accRes = await httpsRequest(actualPort, {
+        method: 'POST',
+        path: '/a2a/v1',
+        body: JSON.stringify(acceptEnvelope),
+        headers: { 'Content-Type': 'application/json' },
+      });
+      expect(accRes.status).toBe(200);
+      expect(recordLedgerEdge).toHaveBeenCalledTimes(1);
+      expect(onNotify).toHaveBeenCalledTimes(1);
+    } finally {
+      if (prev === undefined) delete process.env['MACF_A2A_TEST_REJECT_TRIGGER'];
+      else process.env['MACF_A2A_TEST_REJECT_TRIGGER'] = prev;
+      await server.stop();
+    }
+  });
 });

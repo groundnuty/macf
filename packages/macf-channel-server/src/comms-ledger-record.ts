@@ -19,6 +19,19 @@
  * It never re-throws and never silently swallows. The caller then proceeds
  * with delivery regardless.
  *
+ * The WHOLE loud-signal path is guarded so it can never make delivery fatal.
+ * The dominant cause of `appendEdge` throwing is a disk-full / read-only
+ * volume — but the ledger is a SIBLING of `channel.log`, and `logger.error`
+ * lands in `channel.log` via the same `appendFileSync`. A disk-full failure
+ * therefore makes the loud-signal emitter (`logger.error`) throw the SAME
+ * errno, which — without the outermost guard — would escape `recordEdge` and,
+ * at the recv sites (`try { record; await onNotify; 200 } catch { 500 }`),
+ * skip the delivery and 500 the sender. So the entire catch-block body is
+ * wrapped in an OUTERMOST try/catch. If even that fails, a best-effort
+ * `process.stderr.write` is the last channel left; once that path is
+ * exhausted the only correct action is to swallow — there is no louder
+ * channel remaining and delivery MUST proceed.
+ *
  * This is the structural inverse of `appendEdge`: the WRITE is fail-loud
  * (it must surface the failure to *someone*); the POLICY around it at the
  * hot-path sites is loud-but-proceeds (it must surface AND keep going). The
@@ -78,23 +91,42 @@ export function recordEdge(deps: RecordEdgeDeps, edge: CommsLedgerEdge): void {
   try {
     deps.ledger.appendEdge(edge);
   } catch (err) {
-    // LOUD signal — human-readable half (always on). The edge is carried
-    // inline so the lost authoritative record can be reconstructed from the
-    // log without the ledger file.
-    deps.logger.error('comms_ledger_write_failed', {
-      edge,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    // LOUD signal — machine-readable half (when metrics are wired).
-    // Guard the recorder ITSELF so a misbehaving metric sink can't turn the
-    // loud-but-proceeds policy back into a fatal path. Last-ditch only.
-    if (deps.recordWriteFailed !== undefined) {
+    // OUTERMOST guard around the ENTIRE loud-signal path. The ledger is a
+    // sibling of channel.log, so the dominant failure cause (disk-full /
+    // read-only volume) makes `logger.error` throw the SAME errno. Without
+    // this guard that throw escapes recordEdge and 500s the sender at the
+    // recv sites. Nothing in here may escape — delivery must proceed.
+    try {
+      // LOUD signal — human-readable half (always on). The edge is carried
+      // inline so the lost authoritative record can be reconstructed from the
+      // log without the ledger file.
+      deps.logger.error('comms_ledger_write_failed', {
+        edge,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // LOUD signal — machine-readable half (when metrics are wired).
+      // Guard the recorder ITSELF so a misbehaving metric sink can't turn the
+      // loud-but-proceeds policy back into a fatal path. Last-ditch only.
+      if (deps.recordWriteFailed !== undefined) {
+        try {
+          deps.recordWriteFailed(edge);
+        } catch (metricErr) {
+          deps.logger.error('comms_ledger_write_failed_metric_error', {
+            error: metricErr instanceof Error ? metricErr.message : String(metricErr),
+          });
+        }
+      }
+    } catch {
+      // The loud-signal path itself failed (e.g. logger.error threw the same
+      // disk-full errno that broke appendEdge — they share the log volume).
+      // process.stderr is the last channel that doesn't touch that volume;
+      // best-effort, guarded, then SWALLOW. This is the one place a true
+      // swallow is correct: no louder channel remains and delivery must
+      // proceed. recordEdge NEVER escapes.
       try {
-        deps.recordWriteFailed(edge);
-      } catch (metricErr) {
-        deps.logger.error('comms_ledger_write_failed_metric_error', {
-          error: metricErr instanceof Error ? metricErr.message : String(metricErr),
-        });
+        process.stderr.write('comms_ledger_write_failed (loud-signal emit also failed)\n');
+      } catch {
+        /* nothing left to do */
       }
     }
     // RETURN normally — the caller proceeds with delivery.

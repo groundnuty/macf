@@ -172,10 +172,16 @@ export function notifyTypeToCommsEvent(payload: NotifyPayload): CommsEvent {
       return 'issue-routed';
     case 'pr_review_state':
       return 'pr-review-state';
+    case 'peer_notification':
+      // A legacy peer_notification carries its OWN finer `event`
+      // (session-end | turn-complete | error | custom) — these values are
+      // already exactly the comms-event taxonomy names, so pass them through
+      // directly. Collapsing to `custom` here would lose the event and create
+      // a send/recv asymmetry (the sender records the real event). `event` is
+      // optional on NotifyPayload → fall back to `custom` when absent.
+      return payload.event ?? 'custom';
     default:
-      // ci_completion / startup_check / peer_notification (+ peer_notification
-      // carries its own finer `event`, but that field lives in the A2A path;
-      // the legacy /notify peer_notification still maps to custom here).
+      // ci_completion / startup_check (no finer event to preserve).
       return 'custom';
   }
 }
@@ -183,10 +189,17 @@ export function notifyTypeToCommsEvent(payload: NotifyPayload): CommsEvent {
 /**
  * Derive an `owner/repo#N`-style github_anchor from a NotifyPayload, or null
  * for a payload with no GitHub object to stitch to (macf#473 piece 2).
- * Prefers the producer-supplied `repo` (macf-actions v3.2.0+, #30); falls
- * back to a bare `#N` when only the issue number is known. Exported for tests.
+ * A peer-STAMPED anchor (legacy `peer_notification` carrying `github_anchor`
+ * on the wire — macf#473) wins outright; otherwise prefer the producer-supplied
+ * `repo` (macf-actions v3.2.0+, #30) and fall back to a bare `#N` when only the
+ * issue number is known. Exported for tests.
  */
 export function githubAnchorFromNotify(payload: NotifyPayload): string | null {
+  // A peer-stamped anchor (off-GitHub nudge tied to a GitHub object) wins; the
+  // sender knows the anchor the recv-side derivation can't reconstruct.
+  if (typeof payload.github_anchor === 'string' && payload.github_anchor.length > 0) {
+    return payload.github_anchor;
+  }
   if (payload.issue_number === undefined && payload.pr_number === undefined) {
     return null;
   }
@@ -437,7 +450,12 @@ export function createHttpsServer(config: {
                 // rejected upstream by extractCN, so this is defensive).
                 from: String(clientCn),
                 to: selfAgentName ?? 'unknown',
-                channel: 'github-route',
+                // direct-vs-router taxonomy: a legacy `peer_notification` POST
+                // arrives DIRECTLY at /notify (peer-to-peer, no router hop), so
+                // it's `a2a`. Everything else at /notify is a router event
+                // (mention / issue_routed / pr_review_state / ci_completion /
+                // startup_check) → `github-route`.
+                channel: payload.type === 'peer_notification' ? 'a2a' : 'github-route',
                 direction: 'recv',
                 event: notifyTypeToCommsEvent(payload),
                 // Stable id: issue/pr number + type + ts; the type+number

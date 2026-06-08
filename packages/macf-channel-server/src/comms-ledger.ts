@@ -187,10 +187,21 @@ export function createCommsLedger(opts: {
  * NOT mutate the append-only ledger, it produces a derived view (the same shape
  * as `reconciler/reconcile.ts`, which joins delivered routes ⋈ turn receipts).
  *
- * `keyOf` maps an edge to its receipt-join key — channel-specific: github-route
- * edges join on the macf#444 `(run_id, agent)` key (reuse `reconciler`'s
- * `receiptKey`); a2a edges join on `msg_id`. Edges whose `processed` is already
- * non-null are left untouched (idempotent).
+ * Channel split for the `processed` (delivery ≠ turn) join:
+ *   - **a2a edges** join on `msg_id` via THIS function — `keyOf` maps the edge
+ *     to its `msg_id` and `receiptKeys` carries the observed receipts.
+ *   - **github-route edges** are tracked SEPARATELY by the macf#444 reconciler,
+ *     which is run_id-keyed off the prompt `[macf-route:RUN:AGENT]` marker. The
+ *     github-route recv edge intentionally does NOT carry that run_id (it is
+ *     absent from CommsLedgerEdge, NotifyPayload, and the `type:num:ts` msg_id),
+ *     so the `(run_id, agent)` join is structurally impossible HERE. A
+ *     github-route edge's `processed` therefore stays `null` in the ledger BY
+ *     DESIGN; its delivery≠turn distinction lives in the reconciler's view, not
+ *     this one. `backfillProcessed` is the a2a-side join.
+ *
+ * `keyOf` is left channel-agnostic on purpose (it just reads `msg_id` for the
+ * a2a join); edges whose `processed` is already non-null are left untouched
+ * (idempotent).
  */
 export function backfillProcessed(
   edges: readonly CommsLedgerEdge[],
