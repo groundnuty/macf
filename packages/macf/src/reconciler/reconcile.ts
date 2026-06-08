@@ -70,6 +70,32 @@ export interface ReconcileOptions {
    * drop (groundnuty/macf#444). Undefined / 0 ⇒ no cutoff (judge all routes).
    */
   readonly sinceMs?: number;
+  /**
+   * Coalesced-turn proximity window (epoch ms) for the macf#479 precision-floor
+   * gate. A would-be drop is SUPPRESSED (benign coalesce) when a *different*
+   * delivery to the same agent within ±this is receipted — proof the agent was
+   * alive and processing routed turns then, so this one coalesced/clobbered into
+   * a sibling's turn. Must be > the turn-batching window (~couple min) and <
+   * `openThresholdMs` (so a real lone/offline/RC-bound drop, which has no
+   * receipted sibling, still flags). Undefined / 0 ⇒ no suppression (pre-#479).
+   */
+  readonly proximityMs?: number;
+}
+
+/**
+ * A would-be drop suppressed by the macf#479 coalesced-turn gate: a sibling
+ * delivery to the same agent was receipted within the proximity window, so the
+ * agent demonstrably processed routed turns around this delivery. Reported
+ * separately (not in `drops`) so the caller can emit a LOUD, counted signal —
+ * the suppression is observable (never a silent mask), keeping the clobber rate
+ * visible for the source-side `C-u`-clobber follow-up.
+ */
+export interface SuppressedCoalesce {
+  readonly route: DeliveredRoute;
+  /** The receipted sibling delivery's run id that proves the agent was active. */
+  readonly siblingRunId: string;
+  /** `sibling.deliveredAtMs − route.deliveredAtMs` (signed), for the log. */
+  readonly deltaMs: number;
 }
 
 export interface ReconcileResult {
@@ -88,11 +114,49 @@ export interface ReconcileResult {
    * "in flight", reported for visibility but NOT alerted on.
    */
   readonly inFlight: readonly DeliveredRoute[];
+  /**
+   * Would-be drops suppressed by the macf#479 coalesced-turn gate (a receipted
+   * sibling delivery to the same agent within the proximity window). NOT alerted
+   * on, but the caller logs + counts each so the suppression stays observable.
+   */
+  readonly suppressed: readonly SuppressedCoalesce[];
 }
 
 /** Canonical join key for a `(runId, agent)` pair. */
 export function receiptKey(p: { runId: string; agent: string }): string {
   return `${p.runId}:${p.agent}`;
+}
+
+/**
+ * macf#479 coalesced-turn gate. For a would-be drop, find a *different*
+ * delivery to the same agent within ±proximityMs that WAS receipted. Its
+ * existence means the agent was alive + processing routed turns around the
+ * delivery, so this one benignly coalesced/clobbered into a sibling's turn.
+ *
+ * Crucially it counts only ROUTED receipts (the `processed` set), so an
+ * RC-bound agent — alive on the RC-SDK but silently dropping ALL its tmux
+ * pings, none of which receipt — has NO receipted sibling near a real drop and
+ * is correctly NOT suppressed. (Returns null ⇒ no benign sibling ⇒ real drop.)
+ */
+function findReceiptedSibling(
+  route: DeliveredRoute,
+  inScope: readonly DeliveredRoute[],
+  processedKeys: ReadonlySet<string>,
+  proximityMs: number,
+): SuppressedCoalesce | null {
+  let best: SuppressedCoalesce | null = null;
+  for (const sib of inScope) {
+    if (sib.runId === route.runId) continue; // not itself
+    if (sib.agent !== route.agent) continue; // same agent only
+    const deltaMs = sib.deliveredAtMs - route.deliveredAtMs;
+    if (Math.abs(deltaMs) > proximityMs) continue; // outside the window
+    if (!processedKeys.has(receiptKey(sib))) continue; // sibling must be receipted
+    // Prefer the temporally-nearest receipted sibling for the log.
+    if (best === null || Math.abs(deltaMs) < Math.abs(best.deltaMs)) {
+      best = { route, siblingRunId: sib.runId, deltaMs };
+    }
+  }
+  return best;
 }
 
 /**
@@ -114,23 +178,37 @@ export function reconcile(
   // every pre-deployment route in the lookback window.
   const sinceMs = opts.sinceMs;
   const inScope = sinceMs ? delivered.filter((r) => r.deliveredAtMs >= sinceMs) : delivered;
+  const proximityMs = opts.proximityMs ?? 0;
 
   const drops: DeliveredRoute[] = [];
   const inFlight: DeliveredRoute[] = [];
+  const suppressed: SuppressedCoalesce[] = [];
 
   for (const route of inScope) {
     if (processedKeys.has(receiptKey(route))) continue; // receipt landed — fine
     const ageMs = opts.nowMs - route.deliveredAtMs;
-    if (ageMs > opts.openThresholdMs) {
-      drops.push(route); // unmatched + past the threshold → structural drop
-    } else {
+    if (ageMs <= opts.openThresholdMs) {
       inFlight.push(route); // unmatched but young → busy agent may process late
+      continue;
+    }
+    // Unmatched + past the threshold → a would-be drop. macf#479: suppress it
+    // (benign coalesce) iff a receipted sibling delivery to the same agent sits
+    // within the proximity window — the agent was demonstrably processing routed
+    // turns then. No receipted sibling (lone / offline / RC-bound) ⇒ real drop.
+    const sibling = proximityMs > 0
+      ? findReceiptedSibling(route, inScope, processedKeys, proximityMs)
+      : null;
+    if (sibling !== null) {
+      suppressed.push(sibling);
+    } else {
+      drops.push(route);
     }
   }
 
   return {
     drops,
     inFlight,
+    suppressed,
     deliveredCount: inScope.length,
     processedCount: processedKeys.size,
   };
