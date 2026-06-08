@@ -54,18 +54,21 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 
 ## Implementation Status
 
-> **Current state (updated 2026-06-08).** `main` is **post-v0.2.36**. v0.2.36 is
-> LIVE on npm (all 3 packages, provenance) — it dropped the breaking plugin
-> `manifest.hooks` key (Claude Code ≥2.1.x "/doctor Duplicate hooks" fix) + shipped
-> the marketplace plugin v0.2.36. **Merged-but-unreleased on `main` (→ v0.2.37
+> **Current state (updated 2026-06-08).** `main` is **post-v0.2.36**. The CLI
+> v0.2.36 is LIVE on npm (all 3 packages, provenance); it dropped the breaking
+> plugin `manifest.hooks` key (the Claude Code ≥2.1.x "/doctor Duplicate hooks"
+> fix), and the marketplace plugin was bumped to v0.2.36 in lockstep.
+> **Merged-but-unreleased on `main` (→ v0.2.37
 > candidate):** the **DR-025 comms-ledger** (#472/#474/#475/#473/#476 — per-agent
 > write-ahead `comms-ledger.jsonl` authoritative + Tempo derived index;
 > loud-but-proceeds) and the **#444 route-receipt reconciler** (#477/#478
 > window-aware truncation; #479/#480 coalesced-turn precision-floor gate via
-> sibling-delivery-receipted). **#462** (routing-drop incident) self-closes after
-> #479 deploys + a clean reconcile; **#481** (C-u-clobber hypothesis) was settled
-> **not-a-bug** by a GATE-0 experiment — mid-turn pings *queue* and survive `C-u`,
-> so it's the benign `receipt≠distinct-turn` gap already suppressed by #480.
+> sibling-delivery-receipted). **#462** (routing-drop incident) self-closed
+> 2026-06-08 — its original benign drop aged out to `drops=0`; #480's
+> sibling-delivery-receipted gate now prevents new coalesced false-positives.
+> **#481** (C-u-clobber hypothesis) was settled **not-a-bug** by a controlled
+> tmux experiment — mid-turn pings *queue* and survive `C-u`, so it's the benign
+> `receipt≠distinct-turn` gap (#480 suppresses the symptom).
 >
 > **Routing transport is two-track** (substrate-permanent-Stage-2 directive, #273):
 > new consumer projects + the **CV fleet** → Stage-3 (`macf-actions@v3`, mTLS); the
