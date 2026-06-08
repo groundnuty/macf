@@ -29,9 +29,11 @@
  *   ROUTER_WORKFLOW        router workflow file (default agent-router.yml)
  *   TEMPO_QUERY_ENDPOINT   Tempo query base, e.g. http://<tailnet-host>:13200
  *   OPEN_THRESHOLD_MIN     drop threshold, must exceed busy-turn latency (default 15)
- *   LOOKBACK_MIN           how far back to scan runs + Tempo (default 120; keep
- *                          below the window where the router exceeds the run-list
- *                          cap, else the DELIVERED set truncates → delivered_ok=false)
+ *   LOOKBACK_MIN           how far back to scan runs + Tempo (default 120). The
+ *                          DELIVERED query is scoped to this window via
+ *                          `gh run list --created`, so truncation means
+ *                          ">RUN_LIST_LIMIT router runs INSIDE the window"
+ *                          (genuine high volume), not lifetime page-fullness (macf#477)
  *   TEMPO_LIMIT            Tempo search result cap (default 1000)
  */
 import { execFileSync } from 'node:child_process';
@@ -83,17 +85,50 @@ const SINCE_MS = ((): number | undefined => {
  *  UNKNOWABLE (older routes fell off the page), so the caller must NOT flag
  *  drops this run. Symmetric to the Tempo `tempo_ok` guard, on the delivered
  *  side (Pattern A): silently bounding coverage would let a real drop hide. */
+/**
+ * Window-aware DELIVERED truncation (macf#477). The set is UNKNOWABLE only when
+ * the run-list page is full AND its OLDEST run is still inside the lookback
+ * window — i.e. older in-window runs were pushed off the page. When the oldest
+ * run on the page predates the window start, the window is fully covered and
+ * the page is NOT truncated (the older entries are simply out-of-window).
+ *
+ * The previous check (`runs.length >= LIMIT`) measured LIFETIME page-fullness,
+ * so it went dark — `delivered_ok=false` every run — in any repo with >LIMIT
+ * lifetime router runs regardless of in-window count, making the reconciler a
+ * permanent no-op (and blocking #462 self-close). `gh run list` returns
+ * newest-first, so `runs.at(-1)` is the oldest on the page.
+ */
+export function isDeliveredTruncated(
+  runs: ReadonlyArray<{ createdAt: string }>,
+  nowMs: number,
+  lookbackMs: number,
+  limit: number,
+): boolean {
+  if (runs.length < limit) return false; // page not full → window fully covered
+  const oldest = runs[runs.length - 1];
+  if (oldest === undefined) return false;
+  const oldestMs = Date.parse(oldest.createdAt);
+  if (!Number.isFinite(oldestMs)) return true; // unparseable oldest → conservative: unknowable
+  return oldestMs > nowMs - lookbackMs; // oldest still in-window ⇒ older runs fell off ⇒ truncated
+}
+
 function fetchDelivered(nowMs: number): { routes: DeliveredRoute[]; truncated: boolean } {
+  // Scope the query to the lookback window SERVER-SIDE (macf#477): the page then
+  // holds only in-window runs, so a full page genuinely means ">LIMIT deliveries
+  // INSIDE the window" — and we fetch logs only for in-window runs instead of all
+  // RUN_LIST_LIMIT (incl. out-of-window ones the old code fetched then discarded).
+  const windowStartIso = new Date(nowMs - LOOKBACK_MS).toISOString();
   const listJson = execFileSync(
     'gh',
     ['run', 'list', '--repo', REPO, '--workflow', ROUTER_WORKFLOW,
-     '--status', 'success', '--limit', String(RUN_LIST_LIMIT), '--json', 'databaseId,createdAt'],
+     '--status', 'success', '--created', `>=${windowStartIso}`,
+     '--limit', String(RUN_LIST_LIMIT), '--json', 'databaseId,createdAt'],
     { encoding: 'utf-8' },
   );
   const runs = JSON.parse(listJson) as ReadonlyArray<{ databaseId: number; createdAt: string }>;
-  const truncated = runs.length >= RUN_LIST_LIMIT;
+  const truncated = isDeliveredTruncated(runs, nowMs, LOOKBACK_MS, RUN_LIST_LIMIT);
   if (truncated) {
-    console.error(`WARN: gh run list hit the ${RUN_LIST_LIMIT}-run cap — DELIVERED set UNKNOWABLE (truncated; older routes in the ${LOOKBACK_MS / MIN}-min window fell off the page). Emitting delivered_ok=false (no drops this run); narrow LOOKBACK_MIN or raise the cap.`);
+    console.error(`WARN: >${RUN_LIST_LIMIT} router runs INSIDE the ${LOOKBACK_MS / MIN}-min window — DELIVERED set UNKNOWABLE (older in-window routes fell off the ${RUN_LIST_LIMIT}-run page). Emitting delivered_ok=false (no drops this run); narrow LOOKBACK_MIN or raise the cap.`);
   }
   const out: DeliveredRoute[] = [];
   for (const run of runs) {
