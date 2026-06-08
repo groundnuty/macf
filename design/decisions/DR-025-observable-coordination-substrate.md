@@ -71,6 +71,8 @@ The durable write happens *before* the lossy network hop, on local disk, indepen
 
 The ledger is not A2A-only. The channel-server logs **both** A2A exchanges **and** its handling of GitHub-routed deliveries it receives, so the JSONL becomes the single record of the *off-GitHub* coordination graph. Combined: **GitHub (on-GitHub graph) + the comms-ledger (off-GitHub graph) + Tempo (central index over both) = the complete, resilient coordination graph.** The unified `event` taxonomy (one enum spanning A2A's `turn-complete`/`session-end`/`error`/`custom` and the router's `issue-routed`/`mention`/`pr-review-state`) is what makes a coordination event analyzable identically regardless of which channel carried it.
 
+The `channel` value follows a **direct-vs-router** distinction: `a2a` = any *direct* peer channel — the A2A protocol AND its legacy direct-`/notify` predecessor, both of which bypass the router — and `github-route` = the exchange *traversed the macf-actions router*. This direct-vs-router split is the on/off-GitHub boundary the instrument depends on, so a legacy direct nudge is tagged `a2a`, never `github-route`. (Operator decision 2026-06-08; implemented at both edge sites in macf#473 piece 2.)
+
 ## Consequences
 
 **Defense-in-depth, by role:**
