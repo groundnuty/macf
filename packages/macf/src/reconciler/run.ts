@@ -29,6 +29,9 @@
  *   ROUTER_WORKFLOW        router workflow file (default agent-router.yml)
  *   TEMPO_QUERY_ENDPOINT   Tempo query base, e.g. http://<tailnet-host>:13200
  *   OPEN_THRESHOLD_MIN     drop threshold, must exceed busy-turn latency (default 15)
+ *   PROXIMITY_MIN          macf#479 coalesced-turn gate: suppress a would-be drop
+ *                          when a receipted sibling delivery to the same agent is
+ *                          within ±this (default 5; must be < OPEN_THRESHOLD_MIN)
  *   LOOKBACK_MIN           how far back to scan runs + Tempo (default 120). The
  *                          DELIVERED query is scoped to this window via
  *                          `gh run list --created`, so truncation means
@@ -37,7 +40,8 @@
  *   TEMPO_LIMIT            Tempo search result cap (default 1000)
  */
 import { execFileSync } from 'node:child_process';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { reconcile, type DeliveredRoute, type ProcessedReceipt } from './reconcile.js';
 import { parseDeliveredFromLog } from './parse-delivered.js';
 import { parseProcessedFromTempo, receiptsIfComplete } from './parse-processed.js';
@@ -61,6 +65,11 @@ const ROUTER_WORKFLOW = envStr('ROUTER_WORKFLOW', 'agent-router.yml');
 const TEMPO = envStr('TEMPO_QUERY_ENDPOINT', 'http://127.0.0.1:13200').replace(/\/+$/, '');
 const OPEN_THRESHOLD_MS = Number(envStr('OPEN_THRESHOLD_MIN', '15')) * MIN;
 const LOOKBACK_MS = Number(envStr('LOOKBACK_MIN', '120')) * MIN;
+// macf#479 coalesced-turn gate: suppress a would-be drop when a receipted
+// sibling delivery to the same agent is within ±this. Must be > the turn-batching
+// window (~couple min) and < OPEN_THRESHOLD_MIN (so real lone/offline/RC-bound
+// drops still flag). 0 ⇒ disabled.
+const PROXIMITY_MS = Number(envStr('PROXIMITY_MIN', '5')) * MIN;
 const TEMPO_LIMIT = Number(envStr('TEMPO_LIMIT', '1000'));
 /** Deployment-boundary cutoff (groundnuty/macf#444): ignore routes delivered
  *  before the receipt mechanism went live. Set `RECONCILER_SINCE` to the
@@ -203,24 +212,75 @@ async function main(): Promise<void> {
     emit({ tempoOk: true, deliveredOk: false, dropsCount: 0, inFlightCount: 0, dropsJson: '[]' });
     return;
   }
-  const result = reconcile(delivered, processed, { nowMs, openThresholdMs: OPEN_THRESHOLD_MS, sinceMs: SINCE_MS });
+  const result = reconcile(delivered, processed, {
+    nowMs, openThresholdMs: OPEN_THRESHOLD_MS, sinceMs: SINCE_MS, proximityMs: PROXIMITY_MS,
+  });
   const dropsJson = JSON.stringify(result.drops);
   console.error(
     `reconcile: delivered=${result.deliveredCount} processed=${result.processedCount} ` +
-    `drops=${result.drops.length} in_flight=${result.inFlight.length}` +
+    `drops=${result.drops.length} in_flight=${result.inFlight.length} suppressed=${result.suppressed.length}` +
     (SINCE_MS ? ` (since=${new Date(SINCE_MS).toISOString()} — pre-deployment routes excluded)` : ''),
   );
+  // macf#479: coalesced-turn suppressions are LOUD + counted, NEVER silent. Each
+  // is a delivery whose marker never receipted but whose agent demonstrably
+  // processed a sibling ROUTED turn within PROXIMITY_MS (benign coalesce/clobber,
+  // not a real send≠receipt drop). Logging the rate keeps the underlying
+  // C-u-clobber visible (its source-side fix is tracked separately); a spike here
+  // is itself a signal. RC-bound real-drops are NOT suppressed (no receipted
+  // sibling — their tmux pings all drop), so the detector keeps its #437 cause-3
+  // teeth. Known residual (rare, same loud-log captures the rate): a content-loss
+  // clobber (the clobbering sibling DID receipt) is suppressed — and likewise a
+  // genuinely-independent transport loss of A that happens to fall within ±T of an
+  // UNRELATED receipted sibling. Both are closed at the root by the source-side
+  // C-u-clobber fix; until then the suppressed-rate signal keeps them visible.
+  for (const s of result.suppressed) {
+    console.error(
+      `suppressed_coalesced_drop: run=${s.route.runId} agent=${s.route.agent} ` +
+      `sibling=${s.siblingRunId} delta_ms=${s.deltaMs} ` +
+      `(benign: receipted sibling within ${PROXIMITY_MS / MIN}min — macf#479)`,
+    );
+  }
   if (result.drops.length > 0) console.error(`DROPS: ${dropsJson}`);
-  emit({ tempoOk: true, deliveredOk: true, dropsCount: result.drops.length, inFlightCount: result.inFlight.length, dropsJson });
+  emit({
+    tempoOk: true, deliveredOk: true, dropsCount: result.drops.length,
+    inFlightCount: result.inFlight.length, dropsJson, suppressedCount: result.suppressed.length,
+  });
 }
 
-function emit(o: { tempoOk: boolean; deliveredOk: boolean; dropsCount: number; inFlightCount: number; dropsJson: string }): void {
+function emit(o: {
+  tempoOk: boolean; deliveredOk: boolean; dropsCount: number;
+  inFlightCount: number; dropsJson: string; suppressedCount?: number;
+}): void {
   const out = process.env['GITHUB_OUTPUT'];
   if (!out) return;
-  appendFileSync(out, `tempo_ok=${o.tempoOk}\ndelivered_ok=${o.deliveredOk}\ndrops_count=${o.dropsCount}\nin_flight_count=${o.inFlightCount}\ndrops_json=${o.dropsJson}\n`);
+  appendFileSync(
+    out,
+    `tempo_ok=${o.tempoOk}\ndelivered_ok=${o.deliveredOk}\ndrops_count=${o.dropsCount}\n` +
+    `in_flight_count=${o.inFlightCount}\nsuppressed_count=${o.suppressedCount ?? 0}\ndrops_json=${o.dropsJson}\n`,
+  );
 }
 
-main().catch((err) => {
-  console.error(`Fatal: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-});
+/**
+ * Run main() ONLY when invoked as the CLI entrypoint (the route-reconciler.yml
+ * workflow runs `node dist/reconciler/run.js`). Guarded so the unit test can
+ * `import { isDeliveredTruncated }` from this module WITHOUT triggering main():
+ * an unguarded top-level main() rejects under the test's no-network env and
+ * calls process.exit(1), which vitest surfaces as an unhandled error + leaves a
+ * pending fetch keeping the worker alive (macf#477 test imported it; macf#479).
+ */
+function isCliEntrypoint(): boolean {
+  const argv1 = process.argv[1];
+  if (argv1 === undefined) return false;
+  try {
+    return realpathSync(argv1) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false; // argv1 unresolvable (e.g. under a test runner) — not the entrypoint
+  }
+}
+
+if (isCliEntrypoint()) {
+  main().catch((err) => {
+    console.error(`Fatal: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  });
+}

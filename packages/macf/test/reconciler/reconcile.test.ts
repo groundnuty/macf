@@ -125,3 +125,82 @@ describe('reconcile — RECONCILER_SINCE deployment-boundary cutoff (macf#444)',
     expect(r.deliveredCount).toBe(1);
   });
 });
+
+describe('reconcile — macf#479 coalesced-turn suppression (sibling-delivery-receipted)', () => {
+  // openThreshold 15min, proximity 5min. A "drop" is age > 15min + unmatched.
+  const opts479 = { nowMs: NOW, openThresholdMs: 15 * MIN, proximityMs: 5 * MIN };
+  const sibling = (runId: string, agent: string, afterMs: number, baseAgeMin: number): DeliveredRoute =>
+    ({ runId, agent, deliveredAtMs: NOW - baseAgeMin * MIN + afterMs });
+  const receipt = (runId: string, agent: string): ProcessedReceipt => ({ runId, agent });
+
+  it('SUPPRESSES a would-be drop when a receipted sibling (same agent, within ±proximity) exists', () => {
+    const A = delivered('A', 'code-agent', 40); // past threshold, unreceipted
+    const B = sibling('B', 'code-agent', 2 * MIN, 40); // +2min, receipted
+    const r = reconcile([A, B], [receipt('B', 'code-agent')], opts479);
+    expect(r.drops).toEqual([]); // A suppressed; B receipted
+    expect(r.suppressed.map((s) => s.route.runId)).toEqual(['A']);
+    expect(r.suppressed[0]!.siblingRunId).toBe('B');
+    expect(r.suppressed[0]!.deltaMs).toBe(2 * MIN);
+  });
+
+  it('FLAGS a lone unreceipted drop (no sibling at all)', () => {
+    const r = reconcile([delivered('A', 'code-agent', 40)], [], opts479);
+    expect(r.drops.map((d) => d.runId)).toEqual(['A']);
+    expect(r.suppressed).toEqual([]);
+  });
+
+  it('FLAGS the RC-bound case — a sibling exists but is itself UNreceipted (all tmux pings drop)', () => {
+    // RC-bound: agent alive on the RC-SDK, but its routed/tmux deliveries all
+    // drop → no routed receipt for ANY sibling → no benign sibling → real drop.
+    const A = delivered('A', 'code-agent', 40);
+    const B = sibling('B', 'code-agent', 2 * MIN, 40);
+    const r = reconcile([A, B], [], opts479); // neither receipted
+    expect(r.drops.map((d) => d.runId).sort()).toEqual(['A', 'B']);
+    expect(r.suppressed).toEqual([]);
+  });
+
+  it('does NOT suppress when the receipted sibling is OUTSIDE the proximity window', () => {
+    const A = delivered('A', 'code-agent', 40);
+    const B = sibling('B', 'code-agent', 10 * MIN, 40); // +10min > 5min proximity
+    const r = reconcile([A, B], [receipt('B', 'code-agent')], opts479);
+    expect(r.drops.map((d) => d.runId)).toEqual(['A']);
+    expect(r.suppressed).toEqual([]);
+  });
+
+  it('does NOT suppress when the receipted sibling is a DIFFERENT agent', () => {
+    const A = delivered('A', 'code-agent', 40);
+    const B = sibling('B', 'science-agent', 2 * MIN, 40);
+    const r = reconcile([A, B], [receipt('B', 'science-agent')], opts479);
+    expect(r.drops.map((d) => d.runId)).toEqual(['A']);
+    expect(r.suppressed).toEqual([]);
+  });
+
+  it('proximityMs unset/0 disables suppression (backward-compat)', () => {
+    const A = delivered('A', 'code-agent', 40);
+    const B = sibling('B', 'code-agent', 2 * MIN, 40);
+    const r = reconcile([A, B], [receipt('B', 'code-agent')], { nowMs: NOW, openThresholdMs: 15 * MIN });
+    expect(r.drops.map((d) => d.runId)).toEqual(['A']); // not suppressed — gate off
+    expect(r.suppressed).toEqual([]);
+  });
+
+  it('a young unmatched delivery is in-flight, never suppressed (suppression only applies past threshold)', () => {
+    const A = delivered('A', 'code-agent', 5); // 5min < 15min → in-flight
+    const B = sibling('B', 'code-agent', 1 * MIN, 5);
+    const r = reconcile([A, B], [receipt('B', 'code-agent')], opts479);
+    expect(r.inFlight.map((d) => d.runId)).toEqual(['A']);
+    expect(r.drops).toEqual([]);
+    expect(r.suppressed).toEqual([]);
+  });
+
+  it('live run-27131994218 fixture: the coalesced FYI drop is suppressed by its receipted sibling', () => {
+    // 27131251619 (code-agent, 10:22:07Z) dropped; sibling 27131237992
+    // (code-agent, ~22s later) was receipted → suppressed, not a drop.
+    const base = NOW - 40 * MIN;
+    const A: DeliveredRoute = { runId: '27131251619', agent: 'code-agent', deliveredAtMs: base };
+    const B: DeliveredRoute = { runId: '27131237992', agent: 'code-agent', deliveredAtMs: base + 22_000 };
+    const r = reconcile([A, B], [receipt('27131237992', 'code-agent')], opts479);
+    expect(r.drops).toEqual([]);
+    expect(r.suppressed.map((s) => s.route.runId)).toEqual(['27131251619']);
+    expect(r.suppressed[0]!.siblingRunId).toBe('27131237992');
+  });
+});

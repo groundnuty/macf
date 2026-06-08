@@ -57,6 +57,22 @@ name: Route Receipt Reconciler
 # (silently bounding coverage would let a real drop hide). LOOKBACK_MIN defaults
 # to 120 to keep the window below the router's cap-exceeding volume.
 #
+# ── COALESCED-TURN SUPPRESSION = LOUD, NEVER SILENT (macf#479 precision floor) ─
+# A receipt is per-RUN, not per-turn: two routed pings that arrive ~seconds apart
+# can coalesce/clobber into ONE turn, which emits ONE `turn_processed` span for
+# ONE of the run_ids — the sibling looks like a drop though the agent was alive
+# and processed the turn (#34 receipt≠distinct-turn Gap-2; #462's lone drops=1).
+# The reconciler SUPPRESSES such a would-be drop only when a *receipted* sibling
+# delivery to the SAME agent sits within ±PROXIMITY_MIN (proof the agent was
+# processing routed turns then). A real lone/offline/RC-bound drop has NO
+# receipted sibling, so it still flags (the #437 cause-3 teeth are preserved).
+# Suppressions are emitted LOUD + counted (`suppressed_coalesced_drop` run-log
+# lines + `suppressed_count` output) and surfaced in the self-close comment, so a
+# self-close is always clean-for-the-RIGHT-reason — never a silent mask. The
+# residual content-loss clobber is closed at the root by the source-side
+# C-u-clobber fix (tracked separately); the suppressed-rate signal keeps it
+# visible until then.
+#
 # Security: github.* context goes through `env:`, never inline `${{ }}` in run:.
 
 on:
@@ -132,6 +148,10 @@ jobs:
           OPEN_THRESHOLD_MIN: ${{ vars.OPEN_THRESHOLD_MIN || '15' }}
           LOOKBACK_MIN: ${{ vars.LOOKBACK_MIN || '120' }}
           TEMPO_LIMIT: ${{ vars.TEMPO_LIMIT || '1000' }}
+          # macf#479 coalesced-turn gate: suppress a would-be drop when a receipted
+          # sibling delivery to the same agent is within ±this. Must be < the
+          # open-threshold so real lone/offline/RC-bound drops still flag. 0 = off.
+          PROXIMITY_MIN: ${{ vars.PROXIMITY_MIN || '5' }}
           # Deployment-boundary cutoff — ignore routes that predate the receipt
           # mechanism's go-live (no marker / no hook → no receipt by construction,
           # not a drop). Set to the relaunch time at the first flip (see header).
@@ -196,11 +216,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SUPPRESSED_COUNT: ${{ steps.reconcile.outputs.suppressed_count }}
         run: |
           set -euo pipefail
           EXISTING=$(gh issue list --repo "$REPO" --state open \
             --search "\"$INCIDENT_TITLE_PREFIX\" in:title" --json number --jq '.[0].number // ""')
           if [ -z "$EXISTING" ]; then echo "No open routing-drop incident — no-op."; exit 0; fi
+          # macf#479: a "clean" run that silently masked a suppressed would-be-drop
+          # is clean-for-the-WRONG-reason. If this run suppressed benign coalesced
+          # turns, SAY SO in the close comment so the operator-facing surface
+          # matches the run log's `suppressed_coalesced_drop` lines (loud + counted,
+          # never a silent mask). Default note covers the all-receipts-landed case.
+          REASON_NOTE=" (all delivered routes have \`turn_processed\` receipts)"
+          if [ -n "${SUPPRESSED_COUNT:-}" ] && [ "${SUPPRESSED_COUNT}" != "0" ]; then
+            REASON_NOTE=" (${SUPPRESSED_COUNT} would-be drop(s) suppressed as benign coalesced turns — a receipted sibling delivery to the same agent within the proximity window proves the agent was processing routed turns then, macf#479; per-route detail in the run log's \`suppressed_coalesced_drop\` lines)"
+          fi
           gh issue close "$EXISTING" --repo "$REPO" --reason completed \
-            --comment "Reconcile found no outstanding dropped pings (all delivered routes have \`turn_processed\` receipts). Auto-closed; re-opens via title-prefix dedup if a drop recurs. Run: $RUN_URL"
+            --comment "Reconcile found no outstanding dropped pings${REASON_NOTE}. Auto-closed; re-opens via title-prefix dedup if a drop recurs. Run: $RUN_URL"
           echo "Closed incident #$EXISTING"
