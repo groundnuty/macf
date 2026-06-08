@@ -11,7 +11,7 @@ Eight docs covering the first-user journey, organized by [Diátaxis](https://dia
 | [quickstart.md](quickstart.md) | **Tutorial** (learning) | You want to bootstrap your first agent now (~30 min hands-on). Includes a separate **local-registry-mode quickstart** (no-GitHub-Apps single-host bootstrap per [DR-024](../design/decisions/DR-024-local-registry-mode.md)) for solo / education / demo / framework-dev / air-gapped / CI-fixture cases |
 | [concepts.md](concepts.md) | **Explanation** (understanding) | You want to understand WHY MACF is shaped the way it is, with DR citations |
 | [configuration.md](configuration.md) | **Reference** (information) | You want to customize the per-concern env-file layout (`.claude/.macf/env.*`) introduced in macf#342 / v0.2.18 — macf-managed vs operator-managed boundary, operator workflows, rollback |
-| [features.md](features.md) | **Reference** (information) | You need to look up what's in v0.2.9 — CLI subcommands, hooks, routing jobs, channel-server endpoints |
+| [features.md](features.md) | **Reference** (information) | You need to look up what's in v0.2.35 — CLI subcommands, hooks, routing jobs, channel-server endpoints |
 | [use-cases.md](use-cases.md) | **Explanation** (understanding) | You want to decide whether MACF is the right tool — when to use, when not to, comparison to academic + open-source peers. Includes **"When MACF without GitHub makes sense"** subsection covering local-registry mode trade-offs |
 | [troubleshooting.md](troubleshooting.md) | **How-to** (problem-solving) | Something broke; you need the canonical fix for a known failure mode |
 | [faq.md](faq.md) | **How-to + Explanation** | You have a question that doesn't fit the other docs (cost, security, customization, comparisons) |
