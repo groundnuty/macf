@@ -98,6 +98,23 @@ export const MACF_CLOSE_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/chec
 export const MACF_TURN_RECEIPT_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/emit-turn-receipt.sh';
 
 /**
+ * Attribution-result PostToolUse hook command (groundnuty/macf#489). After a
+ * `gh`-write Bash op (`gh issue/pr comment`, `gh issue/pr create`,
+ * `gh issue/pr close --comment`), this hook reads the just-written resource
+ * back from GitHub and warns LOUDLY (PostToolUse `exit 2`) if it was authored
+ * by the operator's USER account rather than the bot — the silent-fallback
+ * Instance-12 attribution trap. It is the result-invariant backstop to the
+ * #140 PreToolUse `check-gh-token.sh`: that one catches the missing-bot-token
+ * shape BEFORE the call; this one catches a slipped write AFTER the fact.
+ *
+ * PostToolUse CANNOT block (the tool already ran), so this is registered on
+ * the `PostToolUse` event (matcher `Bash`), NOT `PreToolUse`. Fail-open:
+ * every uncertain branch in the script exits 0; only a CONFIRMED
+ * user-authored write fires `exit 2`. Override: MACF_SKIP_ATTRIBUTION_CHECK=1.
+ */
+export const MACF_ATTRIBUTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-attribution.sh';
+
+/**
  * The hook filenames used to identify MACF-managed entries on refresh.
  * Matched by path-end equality (see isMacfManagedCommand) so operator
  * files with a similar-but-distinct basename are not misclassified.
@@ -108,6 +125,7 @@ const MACF_HOOK_FILENAMES: readonly string[] = [
   'check-lgtm-gate.sh',
   'check-close-keyword.sh',
   'emit-turn-receipt.sh',
+  'check-gh-attribution.sh',
 ];
 
 /**
@@ -143,6 +161,7 @@ interface HookEntry {
 interface Settings {
   hooks?: {
     PreToolUse?: HookEntry[];
+    PostToolUse?: HookEntry[];
     [key: string]: HookEntry[] | undefined;
   };
   [key: string]: unknown;
@@ -677,15 +696,24 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
  *     create`/`edit` that would auto-close another agent's issue via a
  *     close-keyword adjacent to its ref)
  *
+ * Plus, on the PostToolUse event:
+ *   - `check-gh-attribution.sh` (groundnuty/macf#489 — after a `gh`-write
+ *     op, reads the resource back from GitHub and warns (`exit 2`) if it
+ *     was authored by the operator's user account instead of the bot;
+ *     the result-invariant backstop to the #140 PreToolUse token check)
+ *
+ * And, on the UserPromptSubmit event:
+ *   - `emit-turn-receipt.sh` (groundnuty/macf#444 — async turn-ack span)
+ *
  * Creates the `.claude/` directory and the file if either is missing.
  * Idempotent: repeated calls don't duplicate entries.
  *
- * All hooks share `matcher: "Bash"` because Claude Code's matcher field
- * gates which tool fires the hook; the wrapped-command detection (gh vs
- * git-push for token, gh issue/pr comment for routing, gh pr merge for
- * LGTM) happens INSIDE each script. Distinct entries per script keep
- * them independently upgradeable + diagnosable in `gh issue list` style
- * settings audits.
+ * The PreToolUse + PostToolUse hooks share `matcher: "Bash"` because Claude
+ * Code's matcher field gates which tool fires the hook; the wrapped-command
+ * detection (gh vs git-push for token, gh issue/pr comment for routing,
+ * gh pr merge for LGTM, gh-write for attribution) happens INSIDE each script.
+ * Distinct entries per script keep them independently upgradeable +
+ * diagnosable in `gh issue list` style settings audits.
  */
 export function installGhTokenHook(workspaceDir: string): void {
   const absDir = resolve(workspaceDir);
@@ -697,6 +725,7 @@ export function installGhTokenHook(workspaceDir: string): void {
   const settings = readSettings(path);
   const hooks = settings.hooks ?? {};
   const preToolUse = hooks.PreToolUse ?? [];
+  const postToolUse = hooks.PostToolUse ?? [];
   const userPromptSubmit = hooks.UserPromptSubmit ?? [];
 
   // Drop any prior MACF-managed entries (any hook file in
@@ -729,6 +758,23 @@ export function installGhTokenHook(workspaceDir: string): void {
     },
   ];
 
+  // PostToolUse: the attribution-result hook (groundnuty/macf#489). Same
+  // preserve-then-replace discipline as PreToolUse above — drop any prior
+  // MACF-managed PostToolUse entry (by MACF_HOOK_FILENAMES basename) and
+  // re-add ours, leaving operator-authored PostToolUse hooks intact. It runs
+  // on the `PostToolUse` event (NOT PreToolUse) because it inspects the tool's
+  // OUTPUT — the resource is already written; the hook reads it back from
+  // GitHub and warns (`exit 2`) on a user-attributed write.
+  const preservedPost = postToolUse.filter(
+    (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
+  );
+  const macfPostEntries: readonly HookEntry[] = [
+    {
+      matcher: 'Bash',
+      hooks: [{ type: 'command', command: MACF_ATTRIBUTION_HOOK_COMMAND }],
+    },
+  ];
+
   // UserPromptSubmit: the turn-ack receipt hook (groundnuty/macf#444). Same
   // preserve-then-replace discipline as PreToolUse above — drop any prior
   // MACF-managed UserPromptSubmit entry (by MACF_HOOK_FILENAMES basename) and
@@ -749,6 +795,7 @@ export function installGhTokenHook(workspaceDir: string): void {
     hooks: {
       ...hooks,
       PreToolUse: [...preserved, ...macfEntries],
+      PostToolUse: [...preservedPost, ...macfPostEntries],
       UserPromptSubmit: [...preservedUps, ...macfUpsEntries],
     },
   };
