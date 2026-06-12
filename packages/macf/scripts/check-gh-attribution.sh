@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+#
+# check-gh-attribution.sh — Claude Code PostToolUse hook that, AFTER a
+# `gh`-write Bash op, verifies the just-written GitHub resource (issue /
+# PR / comment) was authored by the BOT, not the operator's user account.
+# A user-attributed write is the silent-fallback Instance-12 attribution
+# trap: the `gh` call fell back to stored `gh auth login` (user) because
+# GH_TOKEN was empty / a `ghp_`/`gho_`/`ghu_` user token / the literal
+# string "null", and nothing surfaced the mismatch at the time. The
+# #140 PreToolUse `check-gh-token.sh` catches the *missing-bot-token*
+# shape BEFORE the call; this hook is the result-invariant backstop that
+# catches a slipped write AFTER the fact by reading who actually authored
+# the resource on GitHub.
+#
+# Hook contract (PostToolUse): JSON on stdin, exit 0 = ok. PostToolUse
+# CANNOT block (the tool already ran) — the loud signal is `exit 2` with a
+# multi-line stderr message, which Claude Code surfaces back to Claude.
+# Read both the newer (`.tool_output.stdout`) and older
+# (`.tool_response.stdout` / `.tool_response`) output shapes defensively.
+#
+# Posture: FAIL-OPEN. `set -uo pipefail` (NOT `-e`) — every uncertain
+# branch (no URL, gh failure, can't parse, can't resolve expected login)
+# exits 0. A false WARN is more costly than a missed one here: the call
+# already happened, and the operator may be running a knowingly
+# user-attributed op. Only a CONFIRMED user-authored write fires `exit 2`.
+#
+# Override: MACF_SKIP_ATTRIBUTION_CHECK=1 bypasses (intentional
+# user-attributed ops, e.g. an onboarding `gh` call before the bot token
+# is wired). Consistent with MACF_SKIP_TOKEN_CHECK / MACF_SKIP_CLOSE_CHECK
+# in the sister hooks.
+#
+# Refs: groundnuty/macf#489 (this hook); silent-fallback-hazards.md
+#       Instance 12; coordination.md §Token & Git Hygiene (the attribution
+#       trap); #140 / #244+#272 / #270 / #431 (sister Path-2 hooks).
+set -uo pipefail
+
+# Cheap exit on operator override — no stdin read, no parsing.
+if [[ "${MACF_SKIP_ATTRIBUTION_CHECK:-}" == "1" ]]; then
+  exit 0
+fi
+
+# Defense-in-depth: any unexpected error past this point must NOT brick the
+# harness. We already use `set -uo pipefail` (no `-e`) so commands that fail
+# are handled explicitly; this trap is a final safety net for a genuinely
+# unexpected fault (e.g. a bash internal error) — fail open.
+trap 'exit 0' ERR
+
+# Read the PostToolUse payload. Fall through to allow on parse error.
+INPUT_JSON="$(cat)"
+COMMAND="$(jq -r '.tool_input.command // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
+[[ -z "$COMMAND" ]] && exit 0
+
+# ── Is this a gh-write op that produces an attributable resource? ─────────
+# Match the write subcommands whose output carries a resource/comment URL:
+#   gh issue comment / gh pr comment   → posts a comment
+#   gh issue create  / gh pr create    → creates the resource
+#   gh issue close … --comment         → posts a closing comment
+#   gh pr close    … --comment         → posts a closing comment
+# A bare `gh issue close` (no --comment) writes nothing attributable → skip.
+# This is a RESULT check (not a blocker), so a simple wrapper-tolerant
+# `grep -qE` over the raw command suffices — we don't need the airtight
+# bypass-resistant regex the PreToolUse blockers carry.
+is_gh_write() {
+  local cmd="$1"
+  if grep -qiE 'gh[[:space:]]+(issue|pr)[[:space:]]+comment([[:space:]]|$)' <<<"$cmd"; then
+    return 0
+  fi
+  if grep -qiE 'gh[[:space:]]+(issue|pr)[[:space:]]+create([[:space:]]|$)' <<<"$cmd"; then
+    return 0
+  fi
+  # close … --comment (the --comment may appear anywhere after the verb)
+  if grep -qiE 'gh[[:space:]]+(issue|pr)[[:space:]]+close([[:space:]]|$)' <<<"$cmd" \
+     && grep -qiE '(^|[[:space:]])--comment([[:space:]]|=|$)' <<<"$cmd"; then
+    return 0
+  fi
+  return 1
+}
+is_gh_write "$COMMAND" || exit 0
+
+# ── Extract the resource URL from the tool output ─────────────────────────
+# `gh issue create` / `gh pr create` print the new URL on stdout; `gh issue
+# comment` / `gh pr comment` print the comment URL (…#issuecomment-<id>).
+# Read both PostToolUse output shapes (newer `.tool_output.stdout`, older
+# `.tool_response.stdout`, oldest `.tool_response` as a raw string).
+OUTPUT="$(jq -r '.tool_output.stdout // .tool_response.stdout // .tool_response // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
+[[ -z "$OUTPUT" ]] && exit 0
+
+URL="$(grep -oE 'https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(issues|pull)/[0-9]+(#issuecomment-[0-9]+)?' <<<"$OUTPUT" | head -1 || true)"
+# No URL in output (e.g. `--json` suppressed it, or output was discarded) →
+# fail open. We can't verify what we can't see.
+[[ -z "$URL" ]] && exit 0
+
+# ── Parse the URL → owner / repo / kind / number / optional comment-id ────
+# Form: https://github.com/<owner>/<repo>/(issues|pull)/<N>[#issuecomment-<id>]
+URL_PATH="${URL#https://github.com/}"
+OWNER="$(cut -d/ -f1 <<<"$URL_PATH")"
+REPO="$(cut -d/ -f2 <<<"$URL_PATH")"
+KIND="$(cut -d/ -f3 <<<"$URL_PATH")"          # issues | pull
+NUM_AND_FRAG="$(cut -d/ -f4 <<<"$URL_PATH")"  # <N> | <N>#issuecomment-<id>
+NUM="${NUM_AND_FRAG%%#*}"
+COMMENT_ID=""
+if [[ "$NUM_AND_FRAG" == *"#issuecomment-"* ]]; then
+  COMMENT_ID="${NUM_AND_FRAG##*#issuecomment-}"
+fi
+# Sanity — if any required piece is missing/odd, fail open.
+[[ -z "$OWNER" || -z "$REPO" || -z "$KIND" || -z "$NUM" ]] && exit 0
+
+# ── Build the ACTUAL-resource API path ────────────────────────────────────
+# Comment-id present → both issue AND pr comments live under the issues
+# comments namespace; else a PR → pulls/<N>; else an issue → issues/<N>.
+if [[ -n "$COMMENT_ID" ]]; then
+  API_PATH="/repos/${OWNER}/${REPO}/issues/comments/${COMMENT_ID}"
+elif [[ "$KIND" == "pull" ]]; then
+  API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}"
+else
+  API_PATH="/repos/${OWNER}/${REPO}/issues/${NUM}"
+fi
+
+# ── Query the author (short timeout; one brief retry for API consistency) ─
+# The resource was JUST created, so a first read can occasionally race the
+# write through GitHub's read replicas. One `sleep 1` retry handles that
+# without materially delaying the turn. gh failure / empty → fail open.
+query_author() {
+  GH_PAGER= gh api "$API_PATH" --jq '{login: .user.login, type: .user.type}' 2>/dev/null
+}
+RESP="$(query_author || true)"
+if [[ -z "$RESP" ]]; then
+  sleep 1
+  RESP="$(query_author || true)"
+fi
+[[ -z "$RESP" ]] && exit 0
+
+ACTUAL_LOGIN="$(jq -r '.login // ""' <<<"$RESP" 2>/dev/null || echo "")"
+ACTUAL_TYPE="$(jq -r '.type // ""' <<<"$RESP" 2>/dev/null || echo "")"
+# Couldn't extract an author at all → fail open.
+[[ -z "$ACTUAL_LOGIN" ]] && exit 0
+
+# ── Resolve the EXPECTED bot login (first hit wins; may be empty) ─────────
+# 1. $MACF_EXPECTED_BOT_LOGIN — explicit operator/test override.
+# 2. .macf/macf-agent.json — derive `<name>[bot]` from the workspace config.
+#    The canonical workspace field is `agent_name`; the repo-side
+#    agent-config.json carries `app_name`. Accept either (agent_name first).
+# 3. empty — fall back to the type-based check below.
+EXPECTED_LOGIN="${MACF_EXPECTED_BOT_LOGIN:-}"
+if [[ -z "$EXPECTED_LOGIN" ]]; then
+  AGENT_JSON="${CLAUDE_PROJECT_DIR:-.}/.macf/macf-agent.json"
+  if [[ -f "$AGENT_JSON" ]]; then
+    AGENT_NAME="$(jq -r '.agent_name // .app_name // ""' "$AGENT_JSON" 2>/dev/null || echo "")"
+    if [[ -n "$AGENT_NAME" ]]; then
+      # Append `[bot]` exactly once (tolerate a config that already carries it).
+      EXPECTED_LOGIN="${AGENT_NAME%"[bot]"}[bot]"
+    fi
+  fi
+fi
+
+# Normalize a login for comparison: strip a leading `app/` prefix (gh's
+# GraphQL author.login carries `app/<name>`; the REST `.user.login` does
+# not) and lowercase. Echoes the normalized form.
+normalize_login() {
+  local l="$1"
+  l="${l#app/}"
+  echo "${l,,}"
+}
+
+NORM_ACTUAL="$(normalize_login "$ACTUAL_LOGIN")"
+
+# ── Decide: OK vs MISMATCH ────────────────────────────────────────────────
+MISMATCH=0
+if [[ -n "$EXPECTED_LOGIN" ]]; then
+  NORM_EXPECTED="$(normalize_login "$EXPECTED_LOGIN")"
+  if [[ "$NORM_ACTUAL" == "$NORM_EXPECTED" ]]; then
+    exit 0
+  fi
+  MISMATCH=1
+else
+  # No expected login known — best verifiable signal is the author TYPE.
+  # A Bot authored it → trust it (some bot posted; correct by design).
+  # A User authored it → the Instance-12 trap (a human account wrote it).
+  if [[ "$ACTUAL_TYPE" == "Bot" ]]; then
+    exit 0
+  fi
+  MISMATCH=1
+fi
+
+[[ "$MISMATCH" -ne 1 ]] && exit 0
+
+# ── MISMATCH → loud warning to stderr, then exit 2 ────────────────────────
+EXPECTED_LINE="(unknown — set \$MACF_EXPECTED_BOT_LOGIN or .macf/macf-agent.json)"
+if [[ -n "$EXPECTED_LOGIN" ]]; then
+  EXPECTED_LINE="$EXPECTED_LOGIN"
+fi
+
+cat >&2 <<ERR
+WARNING (MACF attribution-result check): the GitHub resource you just wrote
+appears to be authored by the WRONG account — the silent-fallback Instance-12
+attribution trap (a \`gh\` write fell back to the operator's USER auth instead
+of the bot installation token).
+
+Resource:        ${URL}
+Authored by:     ${ACTUAL_LOGIN} (type: ${ACTUAL_TYPE:-unknown})
+Expected (bot):  ${EXPECTED_LINE}
+
+The tool already ran — this is a PostToolUse check, so the resource is live on
+GitHub under the wrong attribution. Cross-agent routing keys off the bot login;
+a user-attributed comment/issue/PR is invisible to peers and breaks the
+reporter-owns-closure + @mention-routing contracts.
+
+Repair:
+  1. Refresh the bot token (fail-loud helper), THEN re-do the op as the bot:
+
+       GH_TOKEN=\$("\$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" \\
+         --app-id "\$APP_ID" --install-id "\$INSTALL_ID" --key "\$KEY_PATH") || exit 1
+       export GH_TOKEN
+
+  2. If the resource has NOT been replied-to yet, delete the mis-attributed
+     write and re-post it as the bot (clean correction).
+  3. If it HAS already been replied-to / acted-on, do NOT delete — post a
+     short clarify-forward correction comment AS THE BOT noting the prior
+     write was mis-attributed, so the thread stays coherent.
+
+Verify your identity any time:
+  GH_TOKEN=\$GH_TOKEN "\$MACF_WORKSPACE_DIR/.claude/scripts/macf-whoami.sh"
+
+Override (ONLY for intentional user-attributed ops, e.g. onboarding):
+  export MACF_SKIP_ATTRIBUTION_CHECK=1
+
+Refs: groundnuty/macf#489 (this hook); silent-fallback-hazards.md Instance 12;
+coordination.md §Token & Git Hygiene.
+ERR
+exit 2
