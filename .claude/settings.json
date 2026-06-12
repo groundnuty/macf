@@ -135,6 +135,15 @@
             "timeout": 30000
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-attribution.sh"
+          }
+        ]
       }
     ],
     "PreCompact": [
