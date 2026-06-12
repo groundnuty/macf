@@ -50,6 +50,10 @@ case "$TOKEN" in ghs_*) ;; *) echo "FATAL: bad token prefix" >&2; exit 1 ;; esac
 export GH_TOKEN="$TOKEN"
 ```
 
+**Why the bare `TOKEN=$(...)` + separate `export`, never `export GH_TOKEN=$(...)`:** `export` is a builtin whose own exit status (`0`) *replaces* the command-substitution's, so `export GH_TOKEN=$(helper) || exit 1` and `export GH_TOKEN=$(helper) && gh ...` both proceed even when the helper failed (ShellCheck SC2155). The failure only propagates from a **bare** assignment (`TOKEN=$(helper) || …`). This is load-bearing under GitHub's intermittent token-endpoint 401s: a refresh that can yield an empty token *without aborting* the dependent `gh` ops re-creates mode #3 (witnessed 2026-06-12 — `cv-architect` posted 4 comments as the operator under a transient 401).
+
+**The PreToolUse hook does NOT cover this.** `check-gh-token.sh` validates the *ambient* `GH_TOKEN` before the command runs, so an inline `export GH_TOKEN=$(...) && gh ...` (refresh-chain *or* file-cache read) reassigns the token *after* the hook has already passed — the hook is structurally blind to it (silent-fallback **Instance 12**, `silent-fallback-hazards.md`). Refresh in a **separate step** (to a pre-validated file, or a bare-assigned var with the checks above), never inline in the `gh` command. The durable structural cover is a result-invariant **PostToolUse** `author`-check (macf#489), not the PreToolUse precondition.
+
 ### 4. Wrong `gh auth` on the VM providing fallback
 
 Having `gh auth login` configured as a user account creates the fallback surface in #3. Even a "good" setup where the script is correct can hide a broken bot token because `gh` quietly uses the user auth.
