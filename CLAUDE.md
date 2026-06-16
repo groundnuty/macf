@@ -54,7 +54,27 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 
 ## Implementation Status
 
-> **Current state (updated 2026-06-08).** `main` is **post-v0.2.36**. The CLI
+> **Current state (updated 2026-06-16).** `main` HEAD `79d4f50`.
+> **Structural-hook workstream COMPLETE** this stretch (all merged): the 4
+> PreToolUse hooks were hand-wired into the substrate workbenches (**#488** —
+> code-agent was **0/4**; the substrate is rule-based/hand-wired, not a
+> `macf init` consumer), and a NEW result-invariant **PostToolUse
+> `check-gh-attribution.sh`** hook shipped (**#489/#491**) as the structural
+> backstop for **silent-fallback Instance 12**: the #140 PreToolUse hook reads
+> the *ambient* `GH_TOKEN` *before* the command, so it's blind to an inline
+> `export GH_TOKEN=$(...) && gh` that empties mid-command (a transient 401 +
+> no `pipefail` posted as the operator on 2026-06-12); the new hook checks the
+> **result** — `gh api`s who actually authored the just-written resource and
+> warns LOUD (`exit 2`, fail-open, `MACF_SKIP_ATTRIBUTION_CHECK=1`). **#490**
+> codified Instance 12 in `silent-fallback-hazards.md`; **#493** hand-wired the
+> new hook to the substrate. **DR-026 (the auditor — self-evolving coordination
+> governance) is PROPOSED** (**#495**, awaiting operator sign-off; once Accepted,
+> code-agent files the implementation issues). **macf-actions #53 gate-5**
+> (self-hosted no-SSH-direct inject, honors #91's low-priv bound) merged →
+> **v1.3.6 candidate, HELD for operator go-ahead**; **#42** (Tailscale wall-time
+> number) is the only open issue on that line.
+>
+> **Prior (2026-06-08) record stands below.** `main` is **post-v0.2.36**. The CLI
 > v0.2.36 is LIVE on npm (all 3 packages, provenance); it dropped the breaking
 > plugin `manifest.hooks` key (the Claude Code ≥2.1.x "/doctor Duplicate hooks"
 > fix), and the marketplace plugin was bumped to v0.2.36 in lockstep.
