@@ -66,8 +66,11 @@ export interface AggregatedSignal {
   readonly handle: string;
   readonly proposedTier: string;
   readonly signal: string;
-  /** How many records contributed this signal (cross-agent dedup count). */
+  /** Distinct AGENTS that raised this signal — the cross-agent corroboration
+   *  count (NOT raw occurrences: five hits from ONE agent count as one). */
   readonly count: number;
+  /** Raw record count carrying this signal (informational; ≥ count). */
+  readonly occurrences: number;
   /** Whether the grouping used an explicit `key` (vs. falling back to text). */
   readonly hasKey: boolean;
 }
@@ -127,15 +130,30 @@ export function computePrBuckets(prs: readonly MonitorPR[]): PrBuckets {
  * Aggregate rule-evolution signals across every reflection record, grouped by
  * (proposed_tier, dedup-handle). The dedup handle is the signal's `key` when
  * present (the cross-agent dedup handle per the F2 schema) and the signal text
- * otherwise. `count` is how many records carried that signal — a high count is
- * a stronger candidate for the governance layer to weigh.
+ * otherwise. `count` is the number of DISTINCT AGENTS that raised the signal —
+ * the cross-agent corroboration count, NOT raw occurrences (five hits from one
+ * agent count as one). This is the occurrence-vs-distinct-agent distinction the
+ * auditor's N>1 promotion gate hinges on (macf#503/#514); the digest's "×N
+ * agents" label must reflect distinct agents, not it would imply a corroboration
+ * it never measured. `occurrences` keeps the raw record count for context.
  */
 export function aggregateSignals(
   records: readonly ReflectionRecord[],
 ): readonly AggregatedSignal[] {
-  const byHandle = new Map<string, AggregatedSignal & { count: number }>();
+  interface Group {
+    handle: string;
+    proposedTier: string;
+    signal: string;
+    /** Distinct agent names (the corroboration unit). */
+    readonly agents: Set<string>;
+    /** Raw record count. */
+    occurrences: number;
+    hasKey: boolean;
+  }
+  const byHandle = new Map<string, Group>();
 
   for (const rec of records) {
+    const agentName = rec.agent.name;
     for (const sig of rec.rule_evolution_signals as readonly RuleEvolutionSignal[]) {
       const hasKey = typeof sig.key === 'string' && sig.key.length > 0;
       const handle = hasKey ? sig.key! : sig.signal;
@@ -144,23 +162,32 @@ export function aggregateSignals(
       const mapKey = JSON.stringify([sig.proposed_tier, handle]);
       const existing = byHandle.get(mapKey);
       if (existing) {
-        byHandle.set(mapKey, { ...existing, count: existing.count + 1 });
+        existing.agents.add(agentName);
+        existing.occurrences += 1;
       } else {
         byHandle.set(mapKey, {
           handle,
           proposedTier: sig.proposed_tier,
           signal: sig.signal,
-          count: 1,
+          agents: new Set([agentName]),
+          occurrences: 1,
           hasKey,
         });
       }
     }
   }
 
-  // Highest-count first (strongest cross-agent corroboration), then by tier.
-  return [...byHandle.values()].sort(
-    (a, b) => b.count - a.count || a.proposedTier.localeCompare(b.proposedTier),
-  );
+  // Strongest cross-agent corroboration (distinct agents) first, then by tier.
+  return [...byHandle.values()]
+    .map((g) => ({
+      handle: g.handle,
+      proposedTier: g.proposedTier,
+      signal: g.signal,
+      count: g.agents.size,
+      occurrences: g.occurrences,
+      hasKey: g.hasKey,
+    }))
+    .sort((a, b) => b.count - a.count || a.proposedTier.localeCompare(b.proposedTier));
 }
 
 function countBreaches(records: readonly ReflectionRecord[]): number {
