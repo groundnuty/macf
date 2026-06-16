@@ -1,7 +1,8 @@
 # DR-026: Self-evolving coordination governance (the auditor)
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-16
+**Ratified:** 2026-06-16 by the operator (the constitutional gate, DR-026 §1). Ratification (a) accepts the decision, (b) establishes the protected-invariant set in `design/protected-invariants.md` as the SECP guardrail core (§4), and (c) releases the gated policy slice (G1–G4, `macf#503`–`#506`) for implementation. The foundational invariant-safe slice (F1–F4) was already built pre-ratification (`macf#499`–`#502`).
 **Trigger:** 2026-06-15 operator ↔ `macf-science-agent` design arc + a multi-modal, multi-decade SOTA survey (session `ww0mgbtma`). The operator currently performs protocol-evolution **ad hoc** — "from time to time when I see something, I intervene." This DR formalizes delegating the *noticing → aggregating → proposing* of rule evolution to a dedicated agent, the **auditor**, grounded in prior art rather than reinvented. Full design synthesis + the survey's per-claim verdicts and citations: `groundnuty/macf-science-agent:research/2026-06-15-auditor-design-sota-and-provenance.md`.
 
 ## Context
