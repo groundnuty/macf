@@ -13,6 +13,7 @@ import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './comm
 import { repoInit } from './commands/repo-init.js';
 import { rulesRefresh } from './commands/rules-refresh.js';
 import { runDoctor } from './commands/doctor.js';
+import { runMonitorCommand } from './commands/monitor.js';
 import { selfUpdate } from './commands/self-update.js';
 import { findProjectRoot } from './config.js';
 import { findCliPackageRoot } from './rules.js';
@@ -288,6 +289,56 @@ program
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .action(async (opts) => {
     const code = await runDoctor(resolveProjectDir(opts.dir));
+    process.exitCode = code;
+  });
+
+program
+  .command('monitor')
+  .description(
+    'Read-only auditor: emit a protocol-health digest for the operator ' +
+    '(DR-026 F4). Aggregates open issues/PRs + F2 reflection signals; ' +
+    'surfaces drift WITHOUT acting on it. Never mutates GitHub — ' +
+    'proposing/actuation is a separate, ratification-gated step (DR-026 G1).',
+  )
+  .addHelpText('after', `
+This command is STRICTLY READ-ONLY. It issues only GitHub reads (gh issue/pr
+list) + local-file reads, and writes only the digest artifact (stdout or
+--output). It never creates, comments on, closes, edits, or merges anything.
+
+Sample digest shape:
+
+  # Protocol-Health Digest — macf
+  - Repo: \`groundnuty/macf\`
+  - Generated at: 2026-06-16T12:00:00Z
+  - Stale threshold: 14 days
+  ## Stale issues
+  ### code-agent
+  - #439 — register CAS/If-Match TOCTOU (40d open)
+  ## PRs awaiting action
+  ### Approved, unmerged
+  - #511 — feat: route-receipt reconciler
+  ## Aggregated reflection signals
+  ### proposed_tier: canonical
+  - silent-fallback last-mile gap [key: \`send-neq-receipt\`] (×2 agents)
+  ## Summary
+  - Open issues: 6 (stale: 1)
+  ...
+  > read-only report. No issues created/commented/closed/merged. (DR-026 G1)
+`)
+  .option('--repo <owner/repo>', 'Target GitHub repo (defaults to the project\'s repo registry config)')
+  .option('--since <days>', 'Stale threshold in days (open issues older than this are flagged)', '14')
+  .option('--output <file>', 'Write the digest to this file instead of stdout')
+  .option('--reflections-dir <path>', 'Directory of F2 reflection JSONL ledgers (default <project>/.claude/.macf/reflections)')
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    const sinceRaw = Number(opts.since);
+    const since = Number.isFinite(sinceRaw) && sinceRaw >= 0 ? sinceRaw : 14;
+    const code = await runMonitorCommand(resolveProjectDir(opts.dir), {
+      repo: opts.repo,
+      since,
+      output: opts.output,
+      reflectionsDir: opts.reflectionsDir,
+    });
     process.exitCode = code;
   });
 
