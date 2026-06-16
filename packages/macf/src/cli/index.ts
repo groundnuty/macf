@@ -14,6 +14,7 @@ import { repoInit } from './commands/repo-init.js';
 import { rulesRefresh } from './commands/rules-refresh.js';
 import { runDoctor } from './commands/doctor.js';
 import { runMonitorCommand } from './commands/monitor.js';
+import { runProposeCommand } from './commands/propose.js';
 import { selfUpdate } from './commands/self-update.js';
 import { findProjectRoot } from './config.js';
 import { findCliPackageRoot } from './rules.js';
@@ -338,6 +339,68 @@ Sample digest shape:
       since,
       output: opts.output,
       reflectionsDir: opts.reflectionsDir,
+    });
+    process.exitCode = code;
+  });
+
+program
+  .command('propose')
+  .description(
+    'Auditor Plan membrane (DR-026 G1): turn F2 reflection signals into ' +
+    'RATIFIABLE rule-evolution proposals. DRY-RUN BY DEFAULT — emits a report ' +
+    'and opens NOTHING. Only --file opens ratifiable auditor-proposal issues ' +
+    '(create-only). The operator ratifies; the auditor never merges/applies.',
+  )
+  .addHelpText('after', `
+TWO MODES — the distinction is load-bearing:
+
+  (default) DRY-RUN
+      Prints a Markdown report of candidate proposals + a HELD (N<threshold)
+      section to stdout (or --output). Performs ZERO GitHub writes. Opens
+      NOTHING. This is the safe default — run it to preview before --file.
+
+  --file    OPEN RATIFIABLE ARTIFACTS
+      Opens ONE 'auditor-proposal' issue per promoted candidate via a
+      create-only seam (no merge/close/edit method exists). Needs a bot token
+      (configured MACF project or GH_TOKEN). The operator ratifies each issue;
+      nothing is ever auto-merged or auto-applied (invariants #8 + #9).
+
+THREE SAFETY GATES (the whole safety model):
+  1. N>1 = distinct AGENTS, not occurrences. A candidate promotes only when it
+     recurs across >= --min-agents DISTINCT agents (default 2 / $MACF_PROPOSE_MIN_AGENTS).
+     5 hits from ONE agent = N=1 -> HELD (reflection != verification).
+  2. Dry-run by default (see above).
+  3. No-auto-drop on invariant-touch. Candidates touching/relaxing a protected
+     invariant are SURFACED + HIGH-RISK-flagged, NEVER code-dropped — the
+     amendment clause lets the auditor PROPOSE an operator-ratified amendment.
+     The operator (v1-manual) judges weaken-vs-amend.
+`)
+  .option('--repo <owner/repo>', 'Target GitHub repo (required for --file; defaults to project repo registry config when present)')
+  .option('--min-agents <n>', 'Distinct-agent promotion threshold (GATE 1). Default $MACF_PROPOSE_MIN_AGENTS or 2')
+  .option('--reflections-dir <path>', 'Directory of F2 reflection JSONL ledgers (default <dir>/.claude/.macf/reflections)')
+  .option('--repo-root <path>', 'Framework-source repo root holding design/protected-invariants.md (default: discovered by walking up)')
+  .option('--output <file>', 'Write the report to this file instead of stdout')
+  .option('--file', 'Open ratifiable auditor-proposal issues (create-only). DEFAULT OFF — without this, opens NOTHING.', false)
+  .option('--dir <path>', 'Project / workspace directory (defaults to current working directory)')
+  .action(async (opts) => {
+    const projectDir = opts.dir ? resolve(opts.dir) : process.cwd();
+    const envMin = process.env['MACF_PROPOSE_MIN_AGENTS'];
+    let minAgents: number | undefined;
+    if (opts.minAgents !== undefined) {
+      const n = Number(opts.minAgents);
+      minAgents = Number.isFinite(n) && n >= 1 ? Math.floor(n) : undefined;
+    } else if (envMin !== undefined) {
+      const n = Number(envMin);
+      minAgents = Number.isFinite(n) && n >= 1 ? Math.floor(n) : undefined;
+    }
+    const code = await runProposeCommand({
+      repo: opts.repo,
+      minAgents,
+      reflectionsDir: opts.reflectionsDir,
+      repoRoot: opts.repoRoot,
+      output: opts.output,
+      file: opts.file === true,
+      projectDir,
     });
     process.exitCode = code;
   });
