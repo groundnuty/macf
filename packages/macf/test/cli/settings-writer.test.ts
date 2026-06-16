@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
 
 describe('installGhTokenHook', () => {
   let tmpRoot: string;
@@ -559,6 +559,86 @@ describe('installGhTokenHook', () => {
       e.hooks.some((h) => h.command === MACF_AUDITOR_HOOK_COMMAND),
     );
     expect(auditorEntries).toHaveLength(1);
+  });
+
+  // ── PreCompact reflection-harvest hook (groundnuty/macf#500, DR-026 F2) ──
+
+  it('MACF_REFLECTION_HOOK_COMMAND uses $CLAUDE_PROJECT_DIR (cwd-independent)', () => {
+    expect(MACF_REFLECTION_HOOK_COMMAND).toBe(
+      '$CLAUDE_PROJECT_DIR/.claude/scripts/harvest-reflection.sh',
+    );
+    expect(MACF_REFLECTION_HOOK_COMMAND).toMatch(/^\$CLAUDE_PROJECT_DIR\//);
+    expect(MACF_REFLECTION_HOOK_COMMAND).toContain('harvest-reflection.sh');
+  });
+
+  it('installs the PreCompact reflection-harvest hook (matcher-less, command type)', () => {
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(s.hooks.PreCompact).toHaveLength(1);
+    const entry = s.hooks.PreCompact[0];
+    // PreCompact isn't tool-gated → no matcher (like UserPromptSubmit).
+    expect(entry.matcher).toBeUndefined();
+    expect(entry.hooks[0].type).toBe('command');
+    expect(entry.hooks[0].command).toBe(MACF_REFLECTION_HOOK_COMMAND);
+    // NON-BLOCKING by script contract (always exit 0) → no async flag needed.
+    expect(entry.hooks[0].async).toBeUndefined();
+  });
+
+  it('preserves operator-authored PreCompact hooks when adding ours', () => {
+    // e.g. an operator's own settings.json PreCompact bash hook must survive
+    // (the plugin's checkpoint_to_memory mcp_tool lives in plugin hooks.json,
+    // a separate distribution path — both can coexist on the PreCompact event).
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        PreCompact: [{ hooks: [{ type: 'command', command: './my-precompact-hook.sh' }] }],
+      },
+    }, null, 2));
+
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(s.hooks.PreCompact).toHaveLength(2);
+    const cmds = s.hooks.PreCompact.flatMap((e: { hooks: { command: string }[] }) =>
+      e.hooks.map((h) => h.command),
+    );
+    expect(cmds).toContain('./my-precompact-hook.sh');
+    expect(cmds).toContain(MACF_REFLECTION_HOOK_COMMAND);
+  });
+
+  it('PreCompact install is idempotent (no duplicate macf entry)', () => {
+    installGhTokenHook(tmpRoot);
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const macfCompact = s.hooks.PreCompact.filter((e: { hooks: { command: string }[] }) =>
+      e.hooks.some((h) => h.command.includes('harvest-reflection.sh')),
+    );
+    expect(macfCompact).toHaveLength(1);
+  });
+
+  it('refreshes a stale MACF reflection entry (replaces by command-path match)', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        PreCompact: [
+          {
+            hooks: [{ type: 'command', command: '.claude/scripts/harvest-reflection.sh --old-flag' }],
+          },
+        ],
+      },
+    }, null, 2));
+
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const macfEntries = s.hooks.PreCompact.filter((e: { hooks: { command: string }[] }) =>
+      e.hooks.some((h) => h.command.includes('harvest-reflection.sh')),
+    );
+    expect(macfEntries).toHaveLength(1);
+    expect(macfEntries[0].hooks[0].command).toBe(MACF_REFLECTION_HOOK_COMMAND);
+    expect(macfEntries[0].hooks[0].command).not.toContain('--old-flag');
   });
 });
 
