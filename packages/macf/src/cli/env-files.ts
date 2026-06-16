@@ -647,6 +647,63 @@ export function generateEnvTmux(config: MacfAgentConfig): string {
 }
 
 // ---------------------------------------------------------------------------
+// env.project-rules — operator-managed; project-tier rule source (macf#501)
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate `.claude/.macf/env.project-rules` content.
+ *
+ * Declares `MACF_PROJECT_RULES_SOURCE` — the explicit source for the project
+ * tier of the three-tier rule model (DR-026 §3 / F3, macf#501). `macf update`
+ * and `macf rules refresh` read this var (via the sourced env, exported to the
+ * CLI's process env) to fetch per-deployment project rules into
+ * `.claude/rules/project/`.
+ *
+ * **Operator-managed** — this is a per-deployment config the operator sets, NOT
+ * a baked macf value. The file is bootstrap-written ONCE (commented-out
+ * default) and then preserved on every `macf update`, so an operator who sets
+ * the source keeps it across CLI upgrades (same contract as env.telemetry /
+ * env.tmux). The value is commented out by default so an un-configured
+ * deployment leaves the tier empty (no-op) rather than pointing somewhere
+ * wrong.
+ *
+ * Two accepted forms (documented inline):
+ *   - `<owner>/<repo>//<path>` — a GitHub repo + subdir, fetched via git clone
+ *   - a local directory path    — copied directly (single-host deployments)
+ */
+export function generateEnvProjectRules(_config: MacfAgentConfig): string {
+  const body = [
+    '# Generator: generateEnvProjectRules (env-files.ts)',
+    '#',
+    '# Project-tier rule source (DR-026 §3 / F3, macf#501). The three-tier',
+    '# rule model: universal rules ship in the CLI → .claude/rules/*.md;',
+    '# PROJECT rules are per-deployment, fetched from the source below into',
+    '# .claude/rules/project/*.md by `macf update` / `macf rules refresh`;',
+    '# agent-private rules live in each agent\'s own memory.',
+    '#',
+    '# This file is OPERATOR-MANAGED: set MACF_PROJECT_RULES_SOURCE to your',
+    '# deployment\'s project-rules source. `macf update` preserves your value',
+    '# (it is not overwritten once you edit this file). Two forms:',
+    '#',
+    '#   1. GitHub repo + subdir — "<owner>/<repo>//<path>", e.g.',
+    '#        export MACF_PROJECT_RULES_SOURCE="your-org/your-repo//project-rules"',
+    '#      (shallow git clone of the default branch; the `//` separates repo',
+    '#       from the in-repo path)',
+    '#',
+    '#   2. Local directory path — for single-host deployments, e.g.',
+    '#        export MACF_PROJECT_RULES_SOURCE="/abs/path/to/project-rules"',
+    '#',
+    '# UNSET (the default) → the project tier is empty (optional, never errors).',
+    '# Do NOT assume "the coordination repo" implicitly — multi-repo deployments',
+    '# have no single repo, so the source must be configured explicitly.',
+    '#',
+    '# Uncomment + edit ONE of the forms above to enable the tier:',
+    '# export MACF_PROJECT_RULES_SOURCE="your-org/your-repo//project-rules"',
+  ];
+  return assemble(operatorHeaderLines('generateEnvProjectRules'), body);
+}
+
+// ---------------------------------------------------------------------------
 // writeEnvFiles — orchestrator (PR-B / macf#342)
 // ---------------------------------------------------------------------------
 
@@ -665,17 +722,18 @@ export interface WriteEnvFilesResult {
 }
 
 /**
- * Write all 7 per-concern env files into `<projectDir>/.claude/.macf/`.
+ * Write all 8 per-concern env files into `<projectDir>/.claude/.macf/`.
  *
- *   env._helpers   — library file (sourced first per alphabetical order)
- *   env.certs      — cert + log paths
- *   env.github     — App creds + GH_TOKEN mint (empty-comment in local-mode)
- *   env.identity   — MACF_PROJECT / MACF_AGENT_NAME / ROLE / TYPE / WORKSPACE_DIR
- *   env.registry   — MACF_REGISTRY_TYPE + per-type vars
- *   env.telemetry  — OTel gates + endpoint (operator-managed)
- *   env.tmux       — MACF_TMUX_SESSION / MACF_TMUX_WINDOW (operator-managed)
+ *   env._helpers       — library file (sourced first per alphabetical order)
+ *   env.certs          — cert + log paths
+ *   env.github         — App creds + GH_TOKEN mint (empty-comment in local-mode)
+ *   env.identity       — MACF_PROJECT / MACF_AGENT_NAME / ROLE / TYPE / WORKSPACE_DIR
+ *   env.project-rules  — MACF_PROJECT_RULES_SOURCE (operator-managed; macf#501)
+ *   env.registry       — MACF_REGISTRY_TYPE + per-type vars
+ *   env.telemetry      — OTel gates + endpoint (operator-managed)
+ *   env.tmux           — MACF_TMUX_SESSION / MACF_TMUX_WINDOW (operator-managed)
  *
- * **Always emits all 7 files** — even when the concern is empty (e.g.,
+ * **Always emits all 8 files** — even when the concern is empty (e.g.,
  * env.tmux with no tmux_session set, env.github in local-mode). The
  * generators emit a header + comment explaining the empty case. This
  * keeps the on-disk layout uniform across configs, so claude.sh's
@@ -719,6 +777,7 @@ export function writeEnvFiles(
     { name: 'env.registry', content: generateEnvRegistry(config) },
     { name: 'env.telemetry', content: generateEnvTelemetry(config) },
     { name: 'env.tmux', content: generateEnvTmux(config) },
+    { name: 'env.project-rules', content: generateEnvProjectRules(config) },
   ];
 
   const written: string[] = [];

@@ -159,6 +159,38 @@ describe('refreshEnvFiles', () => {
     expect(after).toBe(customTmux);
   });
 
+  it('preserves operator-set env.project-rules (MACF_PROJECT_RULES_SOURCE) across update (macf#501)', () => {
+    mkdirSync(join(tmpRoot, '.claude', '.macf'), { recursive: true });
+    // Operator has configured a project-rules source — must survive update.
+    const customSource =
+      '# Operator-edited\nexport MACF_PROJECT_RULES_SOURCE="my-org/coord//project-rules"\n';
+    const path = join(tmpRoot, '.claude', '.macf', 'env.project-rules');
+    writeFileSync(path, customSource);
+
+    const result = refreshEnvFiles(tmpRoot, baseConfig);
+
+    expect(result.preserved).toContain('env.project-rules');
+    expect(result.bootstrapped).not.toContain('env.project-rules');
+    expect(readFileSync(path, 'utf-8')).toBe(customSource);
+  });
+
+  it('bootstrap-writes env.project-rules when absent (default source UNSET)', () => {
+    const result = refreshEnvFiles(tmpRoot, baseConfig);
+    expect(result.bootstrapped).toContain('env.project-rules');
+    const content = readFileSync(
+      join(tmpRoot, '.claude', '.macf', 'env.project-rules'),
+      'utf-8',
+    );
+    expect(content).toContain('MACF_PROJECT_RULES_SOURCE');
+    // Default must NOT set an active export — the tier stays empty until the
+    // operator opts in.
+    for (const line of content.split('\n')) {
+      if (line.includes('export MACF_PROJECT_RULES_SOURCE')) {
+        expect(line.trimStart().startsWith('#')).toBe(true);
+      }
+    }
+  });
+
   it('no-ops on macf-managed file when content matches fresh generator output', () => {
     mkdirSync(join(tmpRoot, '.claude', '.macf'), { recursive: true });
     const path = join(tmpRoot, '.claude', '.macf', 'env.identity');
@@ -301,7 +333,7 @@ describe('migrateMonolithicClaudeSh', () => {
     expect(after).toContain('for f in "$SCRIPT_DIR/.claude/.macf"/env.*');
     expect(after).not.toContain('export MACF_AGENT_NAME='); // moved to env.identity
 
-    // All 7 env files exist
+    // All 8 env files exist
     for (const name of [
       'env._helpers',
       'env.identity',
@@ -310,6 +342,7 @@ describe('migrateMonolithicClaudeSh', () => {
       'env.registry',
       'env.telemetry',
       'env.tmux',
+      'env.project-rules',
     ]) {
       expect(
         existsSync(join(tmpRoot, '.claude', '.macf', name)),

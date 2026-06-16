@@ -19,11 +19,13 @@
  */
 import { existsSync, statSync } from 'node:fs';
 import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
+import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 
 export interface RulesRefreshResult {
   readonly rules: readonly string[];
   readonly scripts: readonly string[];
+  readonly projectRules: readonly string[];
   readonly hookInstalled: boolean;
 }
 
@@ -44,6 +46,21 @@ export function rulesRefresh(targetDir: string): RulesRefreshResult {
 
   const rules = copyCanonicalRules(targetDir);
   const scripts = copyCanonicalScripts(targetDir);
+
+  // Project-tier rules (DR-026 §3 / F3, macf#501) from
+  // MACF_PROJECT_RULES_SOURCE into .claude/rules/project/. Unset → no-op (the
+  // tier is optional). Lands in a SUBDIR so it can't shadow the universal
+  // rules copied above. A fetch failure warns but doesn't abort the refresh
+  // (rules + scripts already landed).
+  let projectRules: readonly string[] = [];
+  if ((process.env[PROJECT_RULES_SOURCE_ENV] ?? '').trim() !== '') {
+    try {
+      projectRules = fetchProjectRules(targetDir);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`Warning: project-rule refresh failed: ${msg}`);
+    }
+  }
 
   // Refresh the attribution-trap PreToolUse hook entry (merge-preserving,
   // per #140). Keeps non-init'd workspaces (the macf repo itself, CV,
@@ -79,5 +96,10 @@ export function rulesRefresh(targetDir: string): RulesRefreshResult {
 
   console.log('Refreshed gh-token guard hook in .claude/settings.json');
 
-  return { rules, scripts, hookInstalled: true };
+  if (projectRules.length > 0) {
+    console.log(`Refreshed ${projectRules.length} project-tier rule file(s) in .claude/rules/project/:`);
+    for (const name of projectRules) console.log(`  ${name}`);
+  }
+
+  return { rules, scripts, projectRules, hookInstalled: true };
 }

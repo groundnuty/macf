@@ -42,6 +42,7 @@ import { existsSync, readdirSync } from 'node:fs';
 import { readAgentConfig, writeAgentConfig, tokenSourceFromConfig } from '../config.js';
 import { resolveLatestVersions } from '../version-resolver.js';
 import { copyCanonicalRules, copyCanonicalScripts, findCliPackageRoot } from '../rules.js';
+import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
 import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion } from '../plugin-fetcher.js';
@@ -256,6 +257,26 @@ export async function update(
   const refreshedScripts = copyCanonicalScripts(projectDir);
   if (refreshedScripts.length > 0) {
     console.log(`Refreshed ${refreshedScripts.length} helper script(s) in .claude/scripts/`);
+  }
+
+  // Refresh project-tier rules (DR-026 §3 / F3, macf#501) from
+  // MACF_PROJECT_RULES_SOURCE into .claude/rules/project/. Unset → no-op (the
+  // tier is optional, like absent universal rules; never an error). This lands
+  // in a SUBDIR, so it can't overwrite or shadow the universal
+  // .claude/rules/*.md refreshed above. A fetch failure (bad source / network)
+  // warns but never aborts the update run.
+  if ((process.env[PROJECT_RULES_SOURCE_ENV] ?? '').trim() !== '') {
+    try {
+      const projectRules = fetchProjectRules(projectDir);
+      if (projectRules.length > 0) {
+        console.log(
+          `Refreshed ${projectRules.length} project-tier rule file(s) in .claude/rules/project/`,
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`Warning: project-rule refresh failed: ${msg}`);
+    }
   }
 
   // Refresh the attribution-trap PreToolUse hook entry (merge-preserving,
