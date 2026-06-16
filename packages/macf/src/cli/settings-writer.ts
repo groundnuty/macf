@@ -86,6 +86,23 @@ export const MACF_LGTM_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check
 export const MACF_CLOSE_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh';
 
 /**
+ * Auditor-never-acts hook command (groundnuty/macf#499 — DR-026 F1). Blocks
+ * state-mutating `gh` ops (`gh pr merge` / `gh issue close` / `gh pr close`)
+ * when the active identity is the auditor (`MACF_AGENT_ROLE=auditor`), while
+ * leaving the propose verbs (`gh issue/pr create|comment`) untouched. For every
+ * NON-auditor identity the hook is inert (`exit 0` before any parsing), so
+ * fleet-wide distribution via `macf init` / `macf update` is a no-op everywhere
+ * except the auditor.
+ *
+ * Why structural and not permission-based: a GitHub App's `pull_requests:write`
+ * grants merge+close TOGETHER with open-PR — there is no "open-a-PR-but-not-
+ * merge" scope to express the auditor's write-proposals-only boundary, so it
+ * must be enforced at tool-call time. Sister to the #140 / #244+#272 / #270 /
+ * #431 PreToolUse hooks; override via MACF_SKIP_AUDITOR_ACT_CHECK=1.
+ */
+export const MACF_AUDITOR_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-auditor-never-acts.sh';
+
+/**
  * The UserPromptSubmit turn-ack receipt hook (groundnuty/macf#444 Option D,
  * piece 2). When the router injects a prompt carrying the correlation marker
  * `[macf-route:<run_id>:<agent>]` (macf-actions piece 1), this hook fires on
@@ -124,6 +141,7 @@ const MACF_HOOK_FILENAMES: readonly string[] = [
   'check-mention-routing.sh',
   'check-lgtm-gate.sh',
   'check-close-keyword.sh',
+  'check-auditor-never-acts.sh',
   'emit-turn-receipt.sh',
   'check-gh-attribution.sh',
 ];
@@ -695,6 +713,9 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
  *   - `check-close-keyword.sh` (groundnuty/macf#431 — blocks `gh pr
  *     create`/`edit` that would auto-close another agent's issue via a
  *     close-keyword adjacent to its ref)
+ *   - `check-auditor-never-acts.sh` (groundnuty/macf#499 — DR-026 F1; when
+ *     `MACF_AGENT_ROLE=auditor`, blocks state-mutating `gh pr merge` /
+ *     `gh issue close` / `gh pr close`; inert for every non-auditor identity)
  *
  * Plus, on the PostToolUse event:
  *   - `check-gh-attribution.sh` (groundnuty/macf#489 — after a `gh`-write
@@ -711,7 +732,8 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
  * The PreToolUse + PostToolUse hooks share `matcher: "Bash"` because Claude
  * Code's matcher field gates which tool fires the hook; the wrapped-command
  * detection (gh vs git-push for token, gh issue/pr comment for routing,
- * gh pr merge for LGTM, gh-write for attribution) happens INSIDE each script.
+ * gh pr merge for LGTM, close-keyword for auto-close, the auditor-role
+ * acting-verb gate, gh-write for attribution) happens INSIDE each script.
  * Distinct entries per script keep them independently upgradeable +
  * diagnosable in `gh issue list` style settings audits.
  */
@@ -755,6 +777,10 @@ export function installGhTokenHook(workspaceDir: string): void {
     {
       matcher: 'Bash',
       hooks: [{ type: 'command', command: MACF_CLOSE_HOOK_COMMAND }],
+    },
+    {
+      matcher: 'Bash',
+      hooks: [{ type: 'command', command: MACF_AUDITOR_HOOK_COMMAND }],
     },
   ];
 

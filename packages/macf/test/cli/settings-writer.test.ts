@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
 
 describe('installGhTokenHook', () => {
   let tmpRoot: string;
@@ -40,10 +40,11 @@ describe('installGhTokenHook', () => {
 
     expect(existsSync(settingsPath)).toBe(true);
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    // Four MACF hook entries land per call: check-gh-token.sh +
+    // Five MACF hook entries land per call: check-gh-token.sh +
     // check-mention-routing.sh + check-lgtm-gate.sh (groundnuty/macf#270) +
-    // check-close-keyword.sh (groundnuty/macf#431).
-    expect(s.hooks.PreToolUse).toHaveLength(4);
+    // check-close-keyword.sh (groundnuty/macf#431) +
+    // check-auditor-never-acts.sh (groundnuty/macf#499).
+    expect(s.hooks.PreToolUse).toHaveLength(5);
     expect(s.hooks.PreToolUse[0].matcher).toBe('Bash');
     expect(s.hooks.PreToolUse[0].hooks[0].command).toBe(MACF_HOOK_COMMAND);
     expect(s.hooks.PreToolUse[0].hooks[0].type).toBe('command');
@@ -56,6 +57,9 @@ describe('installGhTokenHook', () => {
     expect(s.hooks.PreToolUse[3].matcher).toBe('Bash');
     expect(s.hooks.PreToolUse[3].hooks[0].command).toBe(MACF_CLOSE_HOOK_COMMAND);
     expect(s.hooks.PreToolUse[3].hooks[0].type).toBe('command');
+    expect(s.hooks.PreToolUse[4].matcher).toBe('Bash');
+    expect(s.hooks.PreToolUse[4].hooks[0].command).toBe(MACF_AUDITOR_HOOK_COMMAND);
+    expect(s.hooks.PreToolUse[4].hooks[0].type).toBe('command');
   });
 
   it('preserves existing unrelated settings keys', () => {
@@ -86,25 +90,26 @@ describe('installGhTokenHook', () => {
     installGhTokenHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    // 1 user Edit hook + 4 MACF Bash hooks (gh-token + mention-routing +
-    // lgtm-gate + close-keyword).
-    expect(s.hooks.PreToolUse).toHaveLength(5);
+    // 1 user Edit hook + 5 MACF Bash hooks (gh-token + mention-routing +
+    // lgtm-gate + close-keyword + auditor-never-acts).
+    expect(s.hooks.PreToolUse).toHaveLength(6);
     const userHook = s.hooks.PreToolUse.find((e: { matcher: string }) => e.matcher === 'Edit');
     const macfHooks = s.hooks.PreToolUse.filter(
       (e: { matcher: string; hooks: { command: string }[] }) =>
         e.matcher === 'Bash' &&
         e.hooks.some((h) =>
-          [MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND].includes(h.command),
+          [MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND].includes(h.command),
         ),
     );
     expect(userHook).toBeDefined();
     expect(userHook.hooks[0].command).toBe('./user-edit-hook.sh');
-    expect(macfHooks).toHaveLength(4);
+    expect(macfHooks).toHaveLength(5);
     const cmds = macfHooks.map((e: { hooks: { command: string }[] }) => e.hooks[0].command);
     expect(cmds).toContain(MACF_HOOK_COMMAND);
     expect(cmds).toContain(MACF_MENTION_HOOK_COMMAND);
     expect(cmds).toContain(MACF_LGTM_HOOK_COMMAND);
     expect(cmds).toContain(MACF_CLOSE_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_AUDITOR_HOOK_COMMAND);
   });
 
   it('preserves other hook event types (SessionStart, Stop, etc.)', () => {
@@ -395,8 +400,12 @@ describe('installGhTokenHook', () => {
       e.hooks.some((h) => h.command === MACF_LGTM_HOOK_COMMAND),
     );
     expect(macfLgtmEntry).toBeDefined();
-    // 1 operator + 4 MACF entries.
-    expect(s.hooks.PreToolUse).toHaveLength(5);
+    const macfAuditorEntry = s.hooks.PreToolUse.find((e: { hooks: { command: string }[] }) =>
+      e.hooks.some((h) => h.command === MACF_AUDITOR_HOOK_COMMAND),
+    );
+    expect(macfAuditorEntry).toBeDefined();
+    // 1 operator + 5 MACF entries.
+    expect(s.hooks.PreToolUse).toHaveLength(6);
   });
 
   it('refreshes a stale MACF mention-routing entry alongside gh-token', () => {
@@ -502,8 +511,54 @@ describe('installGhTokenHook', () => {
       e.hooks.some((h) => h.command === './my-check-lgtm-gate.sh-wrapper --flag'),
     );
     expect(operatorEntry).toBeDefined();
-    // 1 operator + 4 MACF entries.
-    expect(s.hooks.PreToolUse).toHaveLength(5);
+    // 1 operator + 5 MACF entries.
+    expect(s.hooks.PreToolUse).toHaveLength(6);
+  });
+
+  // groundnuty/macf#499 — DR-026 F1 auditor-never-acts hook entry. Same
+  // path-end matching + idempotency posture as the sister hook entries.
+  it('MACF_AUDITOR_HOOK_COMMAND uses $CLAUDE_PROJECT_DIR (cwd-independent)', () => {
+    expect(MACF_AUDITOR_HOOK_COMMAND).toBe(
+      '$CLAUDE_PROJECT_DIR/.claude/scripts/check-auditor-never-acts.sh',
+    );
+    expect(MACF_AUDITOR_HOOK_COMMAND).toMatch(/^\$CLAUDE_PROJECT_DIR\//);
+    expect(MACF_AUDITOR_HOOK_COMMAND).toContain('check-auditor-never-acts.sh');
+  });
+
+  it('refreshes a stale MACF auditor-never-acts entry alongside other hooks', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [{ type: 'command', command: '.claude/scripts/check-auditor-never-acts.sh --legacy-flag' }],
+          },
+        ],
+      },
+    }, null, 2));
+
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const auditorEntries = s.hooks.PreToolUse.filter((e: { hooks: { command: string }[] }) =>
+      e.hooks.some((h) => h.command.includes('check-auditor-never-acts.sh')),
+    );
+    expect(auditorEntries).toHaveLength(1);
+    expect(auditorEntries[0].hooks[0].command).toBe(MACF_AUDITOR_HOOK_COMMAND);
+    // Stale --legacy-flag dropped via path-end matching in MACF_HOOK_FILENAMES.
+    expect(auditorEntries[0].hooks[0].command).not.toContain('--legacy-flag');
+  });
+
+  it('idempotent: second call does not duplicate auditor-never-acts entry', () => {
+    installGhTokenHook(tmpRoot);
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const auditorEntries = s.hooks.PreToolUse.filter((e: { hooks: { command: string }[] }) =>
+      e.hooks.some((h) => h.command === MACF_AUDITOR_HOOK_COMMAND),
+    );
+    expect(auditorEntries).toHaveLength(1);
   });
 });
 
