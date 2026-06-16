@@ -36,6 +36,7 @@ The auditor is a **fourth agent-home** (alongside science / code / devops), with
 - **A sensor + steward, not an actuator** — it never authors rule *content* and never acts on the work. The division of powers is fixed:
   > **agents propose** (context-locality — the agent in the situation has the richest context) → **the auditor aggregates** (the only place a cross-agent view exists) → **the operator ratifies** (the constitutional gate). No single role holds both content-authority and coherence-authority; that separation is what keeps self-evolution safe.
 - **Least-privilege** in a specific shape: **read-broad** (all issues/PRs/OTEL across its project, to aggregate), **write-proposals-only** (it may open issues/PRs), **never-acts** (it cannot merge, close others' work, or implement). It judges **coherence, not content** — it can flag that two memories contradict or a rule is stale; it cannot rule on whether a domain decision is correct.
+  > **`never-acts` is a *structural* guarantee, not a GitHub-App-scope one.** The App permission needed to *open* a PR (`pull_requests: write`) also grants **merge** and **close**; `issues: write` also grants close/edit. GitHub cannot express "may open a PR but not merge it." So `write-proposals-only` / `never-acts` are enforced at the **structural / result level** — branch protection requiring a non-author review, the #270 LGTM-gate, and a `check-*.sh` that blocks the auditor identity from `gh pr merge` / `gh issue close` — **not** by App scope. This is the silent-fallback Instance 12 (#489) lesson restated: the guarantee lives at the result level, not at the precondition/permission level.
 
 ### 2. The loop — MAPE-K
 
@@ -66,6 +67,7 @@ Self-evolution must never erode the guarantees the protocol depends on (the SECP
 - A deployed instance **cannot modify the universal/product rules locally** — it may only PR them upstream.
 - It **may** propose project-scoped rules locally.
 - **Subordination check (or the separation is too soft):** project rules may *add to / specialize* the universal protocol but may **not contradict or weaken its invariants**. A **protected invariant set** is defined (reporter-owns-closure accountability; the identity↔attribution guarantee; the no-self-merge / LGTM gate; …), and **every proposal is validated against it before the operator ratifies.**
+  > **v1 validation is operator-manual.** The realistic first increment is a committed `protected-invariants.md` that the operator eyeballs each proposal against — *not* an automated checker. An **automated** SECP-style invariant-validator depends on the structured-norm representation (§5, deferred), so until that lands the "validated against the invariant set" guarantee is human-in-the-loop. The DR commits to the *guardrail*; the *automation* of it is a later track (see Scope).
 
 ### 5. Norm representation (machine-checkable)
 
