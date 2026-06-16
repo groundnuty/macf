@@ -17,6 +17,7 @@ export * from './config.js';
 export * from './token.js';
 export * from './types.js';
 export * from './semver.js';
+export * from './reflection.js';
 export * from './mtls-health-ping.js';
 export * from './certs/index.js';
 export * from './registry/index.js';

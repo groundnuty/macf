@@ -132,6 +132,27 @@ export const MACF_TURN_RECEIPT_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scrip
 export const MACF_ATTRIBUTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-attribution.sh';
 
 /**
+ * Reflection-harvest PreCompact hook command (groundnuty/macf#500 — DR-026 F2).
+ * At compaction (auto OR manual `/compact`), this hook harvests the agent's
+ * *staged* reflection (`.claude/.macf/reflections/pending.json`, maintained
+ * incrementally per `reflection-staging.md`), wraps it in the versioned
+ * reflection-schema envelope (`@groundnuty/macf-core` `ReflectionRecordSchema`),
+ * appends it as one line to a local per-session JSONL ledger, and clears the
+ * stage. F4's Monitor reads the ledger back.
+ *
+ * It runs on the `PreCompact` event (matcher-less, like SessionStart / Stop /
+ * UserPromptSubmit). Per DR-023 §UC-3 it is observational + NON-BLOCKING: the
+ * script ALWAYS `exit 0` (even on internal error) so it can never delay/block
+ * compaction. Fast + local; no network. Override: MACF_SKIP_REFLECTION_HARVEST=1.
+ *
+ * Distinct from the plugin's existing PreCompact `checkpoint_to_memory`
+ * mcp_tool entry (DR-023 §UC-3 session-checkpoint): that ships via the plugin
+ * `hooks.json` mcp_tool path; THIS is a bash command-type hook installed into
+ * settings.json — both can coexist on the PreCompact event.
+ */
+export const MACF_REFLECTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/harvest-reflection.sh';
+
+/**
  * The hook filenames used to identify MACF-managed entries on refresh.
  * Matched by path-end equality (see isMacfManagedCommand) so operator
  * files with a similar-but-distinct basename are not misclassified.
@@ -144,6 +165,7 @@ const MACF_HOOK_FILENAMES: readonly string[] = [
   'check-auditor-never-acts.sh',
   'emit-turn-receipt.sh',
   'check-gh-attribution.sh',
+  'harvest-reflection.sh',
 ];
 
 /**
@@ -180,6 +202,7 @@ interface Settings {
   hooks?: {
     PreToolUse?: HookEntry[];
     PostToolUse?: HookEntry[];
+    PreCompact?: HookEntry[];
     [key: string]: HookEntry[] | undefined;
   };
   [key: string]: unknown;
@@ -726,6 +749,11 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
  * And, on the UserPromptSubmit event:
  *   - `emit-turn-receipt.sh` (groundnuty/macf#444 — async turn-ack span)
  *
+ * And, on the PreCompact event:
+ *   - `harvest-reflection.sh` (groundnuty/macf#500 — DR-026 F2; at compaction,
+ *     harvests the agent's staged reflection into a local JSONL ledger. Matcher-
+ *     less + NON-BLOCKING; operator-authored PreCompact hooks are preserved)
+ *
  * Creates the `.claude/` directory and the file if either is missing.
  * Idempotent: repeated calls don't duplicate entries.
  *
@@ -749,6 +777,7 @@ export function installGhTokenHook(workspaceDir: string): void {
   const preToolUse = hooks.PreToolUse ?? [];
   const postToolUse = hooks.PostToolUse ?? [];
   const userPromptSubmit = hooks.UserPromptSubmit ?? [];
+  const preCompact = hooks.PreCompact ?? [];
 
   // Drop any prior MACF-managed entries (any hook file in
   // MACF_HOOK_FILENAMES) so we can replace them cleanly — guards against
@@ -816,6 +845,23 @@ export function installGhTokenHook(workspaceDir: string): void {
     },
   ];
 
+  // PreCompact: the reflection-harvest hook (groundnuty/macf#500, DR-026 F2).
+  // Same preserve-then-replace discipline — drop any prior MACF-managed
+  // PreCompact entry (by MACF_HOOK_FILENAMES basename) and re-add ours, leaving
+  // operator-authored PreCompact hooks intact (e.g. the plugin's
+  // checkpoint_to_memory mcp_tool entry lives in the plugin hooks.json, not
+  // here; an operator's own settings.json PreCompact bash hook is preserved).
+  // Matcher-less (PreCompact isn't tool-gated). NON-BLOCKING by script contract
+  // (always exit 0) — so no `async` flag is needed; it can't delay compaction.
+  const preservedCompact = preCompact.filter(
+    (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
+  );
+  const macfCompactEntries: readonly HookEntry[] = [
+    {
+      hooks: [{ type: 'command', command: MACF_REFLECTION_HOOK_COMMAND }],
+    },
+  ];
+
   const updated: Settings = {
     ...settings,
     hooks: {
@@ -823,6 +869,7 @@ export function installGhTokenHook(workspaceDir: string): void {
       PreToolUse: [...preserved, ...macfEntries],
       PostToolUse: [...preservedPost, ...macfPostEntries],
       UserPromptSubmit: [...preservedUps, ...macfUpsEntries],
+      PreCompact: [...preservedCompact, ...macfCompactEntries],
     },
   };
 
