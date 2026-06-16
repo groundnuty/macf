@@ -43,6 +43,7 @@ import {
   generateEnvGitHub,
   generateEnvHelpers,
   generateEnvIdentity,
+  generateEnvProjectRules,
   generateEnvRegistry,
   generateEnvTelemetry,
   generateEnvTmux,
@@ -87,6 +88,10 @@ const MANAGED_ENV_FILES: readonly ManagedEnvFile[] = [
 const OPERATOR_ENV_FILES: readonly ManagedEnvFile[] = [
   { name: 'env.telemetry', generate: generateEnvTelemetry },
   { name: 'env.tmux', generate: generateEnvTmux },
+  // env.project-rules carries MACF_PROJECT_RULES_SOURCE (macf#501) — an
+  // operator-set per-deployment config. Bootstrap-write once, then preserve:
+  // `macf update` must NOT clobber an operator's source value.
+  { name: 'env.project-rules', generate: generateEnvProjectRules },
 ];
 
 // ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ import {
   generateEnvRegistry,
   generateEnvTelemetry,
   generateEnvTmux,
+  generateEnvProjectRules,
   writeEnvFiles,
 } from '../../src/cli/env-files.js';
 import type { MacfAgentConfig } from '../../src/cli/config.js';
@@ -582,6 +583,35 @@ describe('generateEnvTmux', () => {
 });
 
 // ---------------------------------------------------------------------------
+// generateEnvProjectRules (macf#501 / DR-026 F3)
+// ---------------------------------------------------------------------------
+
+describe('generateEnvProjectRules', () => {
+  it('declares MACF_PROJECT_RULES_SOURCE + documents both source forms', () => {
+    const out = generateEnvProjectRules(baseConfig);
+    expect(out).toContain('MACF_PROJECT_RULES_SOURCE');
+    expect(out).toContain('<owner>/<repo>//<path>');
+    expect(out).toContain('Local directory path');
+  });
+
+  it('leaves the source UNSET by default (export line is commented out)', () => {
+    const out = generateEnvProjectRules(baseConfig);
+    // No active export — the only occurrences are inside comment lines.
+    for (const line of out.split('\n')) {
+      if (line.includes('export MACF_PROJECT_RULES_SOURCE')) {
+        expect(line.trimStart().startsWith('#')).toBe(true);
+      }
+    }
+  });
+
+  it('is operator-managed (soft header, preserved by macf update)', () => {
+    const out = generateEnvProjectRules(baseConfig);
+    expect(out).toContain('operator-editable');
+    expect(out).not.toContain('managed by `macf`');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Cross-concern invariants
 // ---------------------------------------------------------------------------
 
@@ -604,7 +634,7 @@ describe('cross-concern invariants', () => {
 
   for (const { name, cfg } of matrix) {
     describe(`config: ${name}`, () => {
-      it('all 6 generators run without throwing', () => {
+      it('all 7 generators run without throwing', () => {
         // generateEnvTelemetry takes an env arg; pass clean env so the
         // shell-unsafe-char check + MACF_OTEL_DISABLED branch don't fire.
         expect(() => generateEnvIdentity(cfg)).not.toThrow();
@@ -613,6 +643,7 @@ describe('cross-concern invariants', () => {
         expect(() => generateEnvRegistry(cfg)).not.toThrow();
         expect(() => generateEnvTelemetry(cfg, {})).not.toThrow();
         expect(() => generateEnvTmux(cfg)).not.toThrow();
+        expect(() => generateEnvProjectRules(cfg)).not.toThrow();
       });
 
       it('every generator output ends with a trailing newline', () => {
@@ -622,6 +653,7 @@ describe('cross-concern invariants', () => {
         expect(generateEnvRegistry(cfg).endsWith('\n')).toBe(true);
         expect(generateEnvTelemetry(cfg, {}).endsWith('\n')).toBe(true);
         expect(generateEnvTmux(cfg).endsWith('\n')).toBe(true);
+        expect(generateEnvProjectRules(cfg).endsWith('\n')).toBe(true);
       });
 
       it('every generator output carries the schema_version line', () => {
@@ -631,6 +663,7 @@ describe('cross-concern invariants', () => {
         expect(generateEnvRegistry(cfg)).toContain('# schema_version: 1');
         expect(generateEnvTelemetry(cfg, {})).toContain('# schema_version: 1');
         expect(generateEnvTmux(cfg)).toContain('# schema_version: 1');
+        expect(generateEnvProjectRules(cfg)).toContain('# schema_version: 1');
       });
     });
   }
@@ -769,9 +802,9 @@ describe('writeEnvFiles', () => {
     rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  it('writes all 7 env files into .claude/.macf/', () => {
+  it('writes all 8 env files into .claude/.macf/', () => {
     const result = writeEnvFiles(tmpRoot, baseConfig);
-    expect(result.written.length).toBe(7);
+    expect(result.written.length).toBe(8);
     const envDir = join(tmpRoot, '.claude', '.macf');
     expect(existsSync(envDir)).toBe(true);
     const onDisk = readdirSync(envDir).sort();
@@ -780,6 +813,7 @@ describe('writeEnvFiles', () => {
       'env.certs',
       'env.github',
       'env.identity',
+      'env.project-rules',
       'env.registry',
       'env.telemetry',
       'env.tmux',

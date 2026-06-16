@@ -47,6 +47,10 @@ design/
   phases/         ← 8 implementation phase specs
                     (P1–P7 + P-A2A-phase-2 added 2026-05-19 for the
                     A2A v1.0 inbound JSON-RPC arc per macf#390)
+  project-tier-rules.md ← DR-026 F3 (macf#501): the three-tier rule model's
+                    PROJECT tier — `.claude/rules/project/*.md`,
+                    `MACF_PROJECT_RULES_SOURCE` config, distribution +
+                    precedence
 research/         ← literature reviews, empirical analysis
 
 test/             ← unit tests (default vitest run) + test/e2e/ (excluded)

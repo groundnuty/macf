@@ -11,6 +11,7 @@ import {
 import { createCA, loadCA } from '@groundnuty/macf-core';
 import { generateAgentCert } from '@groundnuty/macf-core';
 import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
+import { seedProjectRulesDir } from '../project-rules.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { fetchPluginToWorkspace, pinChannelServerVersion } from '../plugin-fetcher.js';
 import { writeClaudeSh } from '../claude-sh.js';
@@ -379,6 +380,16 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   if (copiedRules.length > 0) {
     console.log(`  Rules: copied ${copiedRules.length} canonical rule file(s) to .claude/rules/`);
   }
+
+  // Seed the project-tier rule subdir (.claude/rules/project/) with a generic,
+  // format-demonstrating `.example` template (DR-026 §3 / F3, macf#501). Init
+  // ships to EVERY deployment, so the seed is deployment-agnostic — it never
+  // contains a macf-specific rule. The actual project rules arrive on
+  // `macf update` / `macf rules refresh` from MACF_PROJECT_RULES_SOURCE
+  // (env.project-rules), which init does NOT fetch (keeps init offline-safe +
+  // generic).
+  const seeded = seedProjectRulesDir(absDir);
+  console.log(`  Rules: seeded project-tier example to .claude/rules/project/${seeded}`);
 
   // Copy canonical helper scripts (e.g., tmux-send-to-claude.sh) into
   // <workspace>/.claude/scripts/. Hooks in settings.local.json.example

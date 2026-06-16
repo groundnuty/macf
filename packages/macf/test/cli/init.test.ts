@@ -99,6 +99,55 @@ describe('macf init', () => {
     expect(identityContent).toContain('export MACF_AGENT_NAME');
   });
 
+  it('seeds the project-tier rules subdir with a generic .example (macf#501)', async () => {
+    await initAgent(dir, {
+      project: 'TEST',
+      role: 'code-agent',
+      appId: '1',
+      installId: '2',
+      keyPath: 'k.pem',
+      registryType: 'repo',
+      registryRepo: 'o/r',
+    });
+
+    const seed = join(dir, '.claude', 'rules', 'project', 'EXAMPLE.project-rule.md.example');
+    expect(existsSync(seed)).toBe(true);
+    const content = readFileSync(seed, 'utf-8');
+    // Generic — must self-document the tier but NOT carry a macf-specific rule
+    // (init ships to every deployment).
+    expect(content).toContain('project-tier');
+    expect(content).toContain('MACF_PROJECT_RULES_SOURCE');
+    expect(content).not.toContain('dev.mk');
+
+    // The seed must NOT shadow the flat universal-rule dir — universal rules
+    // (coordination.md) stay at .claude/rules/, project rules go in the subdir.
+    expect(existsSync(join(dir, '.claude', 'rules', 'coordination.md'))).toBe(true);
+    expect(existsSync(join(dir, '.claude', 'rules', 'project', 'coordination.md'))).toBe(false);
+  });
+
+  it('writes env.project-rules with MACF_PROJECT_RULES_SOURCE unset by default (macf#501)', async () => {
+    await initAgent(dir, {
+      project: 'TEST',
+      role: 'code-agent',
+      appId: '1',
+      installId: '2',
+      keyPath: 'k.pem',
+      registryType: 'repo',
+      registryRepo: 'o/r',
+    });
+
+    const envFile = join(dir, '.claude', '.macf', 'env.project-rules');
+    expect(existsSync(envFile)).toBe(true);
+    const content = readFileSync(envFile, 'utf-8');
+    expect(content).toContain('MACF_PROJECT_RULES_SOURCE');
+    // No active export by default.
+    for (const line of content.split('\n')) {
+      if (line.includes('export MACF_PROJECT_RULES_SOURCE')) {
+        expect(line.trimStart().startsWith('#')).toBe(true);
+      }
+    }
+  });
+
   it('adds .macf/ to .gitignore', async () => {
     await initAgent(dir, {
       project: 'T',
