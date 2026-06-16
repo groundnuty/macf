@@ -58,7 +58,7 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 
 ## Implementation Status
 
-> **Current state (updated 2026-06-16).** `main` HEAD `79d4f50`.
+> **Current state (updated 2026-06-16).** `main` HEAD `963240c`.
 > **Structural-hook workstream COMPLETE** this stretch (all merged): the 4
 > PreToolUse hooks were hand-wired into the substrate workbenches (**#488** —
 > code-agent was **0/4**; the substrate is rule-based/hand-wired, not a
@@ -72,8 +72,22 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 > warns LOUD (`exit 2`, fail-open, `MACF_SKIP_ATTRIBUTION_CHECK=1`). **#490**
 > codified Instance 12 in `silent-fallback-hazards.md`; **#493** hand-wired the
 > new hook to the substrate. **DR-026 (the auditor — self-evolving coordination
-> governance) is PROPOSED** (**#495**, awaiting operator sign-off; once Accepted,
-> code-agent files the implementation issues). **macf-actions #53 gate-5**
+> governance) is **PROPOSED** (**#495** → `efdc821` landed the DR on `main` as
+> `Status: Proposed`; merging the PR did **not** ratify it — Proposed→Accepted is
+> the operator's pending call). The operator split the build (epic **#498**) and
+> code-agent shipped its **foundational, invariant-safe slice F1–F4** (all
+> merged): **#507** (`check-auditor-never-acts.sh` — structural
+> never-acts hook gated on `MACF_AGENT_ROLE=auditor`) / **#508** (`PreCompact`
+> reflection-harvest hook + `macf-core` reflection schema — the structural home
+> for synthesize-before-compaction) / **#509** (project-tier rules:
+> `.claude/rules/project/` + `MACF_PROJECT_RULES_SOURCE` + generic seed) /
+> **#510** (read-only `macf monitor` + `digest-to-operator`, type-level
+> read-only seam). The **policy/constitutional slice G1–G4** (#503–506:
+> Analyze→Plan membrane / Moise structured-norms + conflict-checker / SECP
+> invariant-validator / meta-auditor) is **GATED** on full DR-026 ratification +
+> the protected-invariant set + the auditor App's creation (operator passkey);
+> F1–F4 run against the placeholder `MACF_AGENT_ROLE=auditor` until then.
+> **macf-actions #53 gate-5**
 > (self-hosted no-SSH-direct inject, honors #91's low-priv bound) merged →
 > **v1.3.6 candidate, HELD for operator go-ahead**; **#42** (Tailscale wall-time
 > number) is the only open issue on that line.
