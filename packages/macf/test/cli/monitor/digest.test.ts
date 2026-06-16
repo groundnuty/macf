@@ -137,6 +137,25 @@ describe('aggregateSignals', () => {
     expect(worktree!.hasKey).toBe(false);
   });
 
+  it('counts DISTINCT AGENTS not occurrences — 5 hits from ONE agent is ×1 (macf#514)', () => {
+    const sameAgent = Array.from({ length: 5 }, () =>
+      record({
+        agent: { name: 'code-agent', role: 'code-agent', login: 'a' },
+        rule_evolution_signals: [
+          { signal: 'solo signal', proposed_tier: 'project', rationale: 'r', key: 'solo' },
+        ],
+      }),
+    );
+    const agg = aggregateSignals(sameAgent);
+    const solo = agg.find((a) => a.handle === 'solo');
+    expect(solo).toBeDefined();
+    expect(solo!.count).toBe(1); // ONE distinct agent — NOT 5 (the mislabel bug)
+    expect(solo!.occurrences).toBe(5); // raw record count, informational only
+    // And the digest must not imply corroboration it never measured:
+    const md = buildDigest(input({ reflections: sameAgent }));
+    expect(md).not.toMatch(/×\d+ agents/);
+  });
+
   it('keeps same key at different tiers as distinct candidates', () => {
     const recs: ReflectionRecord[] = [
       record({ rule_evolution_signals: [{ signal: 's', proposed_tier: 'canonical', rationale: 'r', key: 'k' }] }),
