@@ -27,7 +27,11 @@
  * Config (env, set by the workflow):
  *   RECONCILER_REPO        owner/repo (default $GITHUB_REPOSITORY)
  *   ROUTER_WORKFLOW        router workflow file (default agent-router.yml)
- *   TEMPO_QUERY_ENDPOINT   Tempo query base, e.g. http://<tailnet-host>:13200
+ *   TEMPO_QUERY_ENDPOINT   Tempo query base; default is the dedicated
+ *                          monitoring VM over Tailscale on the OTel-native
+ *                          port (no +10000 offset):
+ *                          http://orzech-dev-agents-monitoring.tail491af.ts.net:3200
+ *                          (macf#516 — the old k3d loopback default is DEAD)
  *   OPEN_THRESHOLD_MIN     drop threshold, must exceed busy-turn latency (default 15)
  *   PROXIMITY_MIN          macf#479 coalesced-turn gate: suppress a would-be drop
  *                          when a receipted sibling delivery to the same agent is
@@ -62,7 +66,10 @@ const envStr = (name: string, def: string): string => {
 
 const REPO = envStr('RECONCILER_REPO', process.env['GITHUB_REPOSITORY'] ?? '');
 const ROUTER_WORKFLOW = envStr('ROUTER_WORKFLOW', 'agent-router.yml');
-const TEMPO = envStr('TEMPO_QUERY_ENDPOINT', 'http://127.0.0.1:13200').replace(/\/+$/, '');
+const TEMPO = envStr(
+  'TEMPO_QUERY_ENDPOINT',
+  'http://orzech-dev-agents-monitoring.tail491af.ts.net:3200',
+).replace(/\/+$/, '');
 const OPEN_THRESHOLD_MS = Number(envStr('OPEN_THRESHOLD_MIN', '15')) * MIN;
 const LOOKBACK_MS = Number(envStr('LOOKBACK_MIN', '120')) * MIN;
 // macf#479 coalesced-turn gate: suppress a would-be drop when a receipted

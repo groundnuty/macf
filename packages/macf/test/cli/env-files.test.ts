@@ -369,12 +369,13 @@ describe('generateEnvTelemetry', () => {
     expect(out).toContain('export OTEL_LOGS_EXPORTER=otlp');
   });
 
-  it('bakes the canonical k3d default endpoint (127.0.0.1 IPv4 literal, macf#418) when MACF_OTEL_ENDPOINT unset', () => {
+  it('bakes the dedicated monitoring-VM default endpoint over Tailscale (macf#516) when MACF_OTEL_ENDPOINT unset', () => {
     const out = generateEnvTelemetry(baseConfig, cleanEnv);
-    expect(out).toContain('http://127.0.0.1:14318');
-    // macf#418: IPv4 literal avoids the localhost→::1 ambiguity on hosts
-    // where getaddrinfo returns the IPv6 loopback first.
+    expect(out).toContain('http://orzech-dev-agents-monitoring.tail491af.ts.net:4318');
+    // macf#516: the monitoring stack moved to a dedicated VM over Tailscale on
+    // OTel-native ports (no +10000 offset); the old k3d 127.0.0.1:14318 is DEAD.
     expect(out).not.toContain('localhost');
+    expect(out).not.toContain('127.0.0.1');
   });
 
   it('honors MACF_OTEL_ENDPOINT template-time override', () => {

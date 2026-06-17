@@ -97,9 +97,11 @@ if [ "${MACF_OTEL_DISABLED:-}" != "1" ]; then
   : "${OTEL_METRICS_EXPORTER=otlp}"
   : "${OTEL_LOGS_EXPORTER=otlp}"
   : "${OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf}"
-  # IPv4 literal per macf#419 (avoids the localhost→::1 ambiguity); override
-  # via MACF_OTEL_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT in the environment.
-  : "${MACF_OTEL_ENDPOINT=http://127.0.0.1:14318}"
+  # macf#516 (2026-06-17): the monitoring stack moved to a dedicated VM
+  # reached over Tailscale (OTel-native ports, no +10000 k3d offset), so the
+  # old k3d loopback default is DEAD. Override via MACF_OTEL_ENDPOINT or
+  # OTEL_EXPORTER_OTLP_ENDPOINT in the environment.
+  : "${MACF_OTEL_ENDPOINT=http://orzech-dev-agents-monitoring.tail491af.ts.net:4318}"
   : "${OTEL_EXPORTER_OTLP_ENDPOINT=$MACF_OTEL_ENDPOINT}"
   : "${OTEL_SERVICE_NAME=macf-agent-code-agent}"
   : "${OTEL_RESOURCE_ATTRIBUTES=gen_ai.agent.name=code-agent,gen_ai.agent.role=code-agent,service.namespace=macf}"

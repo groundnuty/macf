@@ -616,7 +616,7 @@ describe('update command', () => {
         writeFileSync(
           join(dir, '.claude', 'settings.local.json'),
           JSON.stringify(
-            { env: { MACF_OTEL_ENDPOINT: 'http://localhost:14318' } },
+            { env: { MACF_OTEL_ENDPOINT: 'http://orzech-dev-agents-monitoring.tail491af.ts.net:4318' } },
             null,
             2,
           ),
