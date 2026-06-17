@@ -15,8 +15,10 @@
  *    - `claude.sh`                (regenerated from current launcher
  *                                   template; #63 — landing template-
  *                                   evolution changes like #60's
- *                                   `--plugin-dir` or #283's `:14318`
- *                                   OTLP endpoint without re-running init)
+ *                                   `--plugin-dir` or #516's monitoring-VM
+ *                                   OTLP endpoint (the dedicated VM over
+ *                                   Tailscale, OTel-native ports, no +10000
+ *                                   offset) without re-running init)
  *    - `.macf/plugin/`            (repair-fetch only, if dir is empty;
  *                                   pin-bump fetch handled separately)
  *

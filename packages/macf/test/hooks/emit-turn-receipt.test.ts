@@ -55,7 +55,7 @@ function runHook(prompt: string, opts: { curlExit?: number } = {}): RunResult {
         PATH: `${stubDir}:${process.env['PATH'] ?? ''}`,
         CURL_CAPTURE: captureFile,
         CURL_EXIT: String(opts.curlExit ?? 0),
-        OTEL_EXPORTER_OTLP_ENDPOINT: 'http://127.0.0.1:14318',
+        OTEL_EXPORTER_OTLP_ENDPOINT: 'http://orzech-dev-agents-monitoring.tail491af.ts.net:4318',
         OTEL_SERVICE_NAME: 'macf-agent-code-agent',
       },
     });

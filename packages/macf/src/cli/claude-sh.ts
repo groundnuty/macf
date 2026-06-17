@@ -212,16 +212,18 @@ function tmuxSelfWrapLines(): string[] {
  *                                reachable over Tailscale / other
  *                                network paths.
  *
- * Default endpoint is `http://127.0.0.1:14318` per the canonical k3d
- * cluster topology (`groundnuty/macf-devops-toolkit:CLAUDE.md` —
- * the IPv4 literal, NOT `localhost`, avoids the `localhost`→`::1`
- * resolution ambiguity on hosts where getaddrinfo returns the IPv6
- * loopback first; aligns with the `MACF_ADVERTISE_HOST ?? '127.0.0.1'`
- * sibling default in this file. See macf#418 —
- * `:14318` is the host-port-mapped serverlb endpoint; the
- * pre-2026-04-25 compose-stack `:4318` is retired). Surfaced in
- * groundnuty/macf#282 — CV-agents had zero telemetry for 34min because
- * the previous default landed on the retired port.
+ * Default endpoint is
+ * `http://orzech-dev-agents-monitoring.tail491af.ts.net:4318` — the
+ * dedicated monitoring VM reached over Tailscale (macf#516, 2026-06-17).
+ * The stack moved off the per-host k3d cluster to its own VM, so agents
+ * are now cross-VM over the tailnet — `127.0.0.1` no longer reaches the
+ * collector. The VM uses OTel-native ports (no `+10000` k3d serverlb
+ * offset): OTLP HTTP `:4318`, OTLP gRPC `:4317`, Tempo query `:3200`.
+ * The old k3d loopback defaults (the +10000 serverlb ports per
+ * macf#418/#282) are DEAD. Aligns with the
+ * `MACF_ADVERTISE_HOST ?? '127.0.0.1'` sibling
+ * default in this file (advertise-host stays loopback — only the OTLP
+ * collector moved off-host).
  *
  * Run-time override: the GENERATED claude.sh emits
  * `${OTEL_EXPORTER_OTLP_ENDPOINT:-<default>}` so a per-launch
@@ -244,7 +246,8 @@ export function otelTelemetryLines(
     return [];
   }
 
-  const endpoint = env['MACF_OTEL_ENDPOINT'] ?? 'http://127.0.0.1:14318';
+  const endpoint =
+    env['MACF_OTEL_ENDPOINT'] ?? 'http://orzech-dev-agents-monitoring.tail491af.ts.net:4318';
 
   // The endpoint value gets embedded verbatim in a shell double-
   // quoted export. Reject chars that would break quoting or trigger

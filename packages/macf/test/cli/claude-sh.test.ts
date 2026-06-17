@@ -345,7 +345,9 @@ describe('otelTelemetryLines (kept exported as canonical pre-migration reference
     expect(joined).toContain('export OTEL_METRICS_EXPORTER=otlp');
     expect(joined).toContain('export OTEL_LOGS_EXPORTER=otlp');
     expect(joined).toContain('MACF_OTEL_ENDPOINT="${MACF_OTEL_ENDPOINT:-$(macf_settings_get MACF_OTEL_ENDPOINT)}"');
-    expect(joined).toContain('MACF_OTEL_ENDPOINT="${MACF_OTEL_ENDPOINT:-http://127.0.0.1:14318}"');
+    expect(joined).toContain(
+      'MACF_OTEL_ENDPOINT="${MACF_OTEL_ENDPOINT:-http://orzech-dev-agents-monitoring.tail491af.ts.net:4318}"',
+    );
     expect(joined).toContain('export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-$MACF_OTEL_ENDPOINT}"');
     expect(joined).toContain('export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf');
     expect(joined).toContain('export OTEL_SERVICE_NAME="macf-agent-code-agent"');
@@ -356,22 +358,23 @@ describe('otelTelemetryLines (kept exported as canonical pre-migration reference
 
   it('honors MACF_OTEL_ENDPOINT template-time override (bakes custom default)', () => {
     const lines = otelTelemetryLines(sampleConfig, {
-      MACF_OTEL_ENDPOINT: 'http://obs.tailnet.ts.net:14318',
+      MACF_OTEL_ENDPOINT: 'http://obs.tailnet.ts.net:9999',
     });
     const joined = lines.join('\n');
-    expect(joined).toContain('MACF_OTEL_ENDPOINT="${MACF_OTEL_ENDPOINT:-http://obs.tailnet.ts.net:14318}"');
+    expect(joined).toContain('MACF_OTEL_ENDPOINT="${MACF_OTEL_ENDPOINT:-http://obs.tailnet.ts.net:9999}"');
     expect(joined).toContain('export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-$MACF_OTEL_ENDPOINT}"');
-    expect(joined).not.toContain('localhost:14318');
-    expect(joined).not.toContain('127.0.0.1:14318');
-    expect(joined).not.toContain(':4318');
+    // The override fully replaces the monitoring-VM default (macf#516).
+    expect(joined).not.toContain('orzech-dev-agents-monitoring');
+    expect(joined).not.toContain('localhost');
   });
 
-  it('default endpoint is the 127.0.0.1 IPv4 literal :14318 (macf#418 — no localhost→::1 ambiguity), NOT :4318 (retired)', () => {
+  it('default endpoint is the dedicated monitoring VM over Tailscale on OTel-native :4318 (macf#516 — old k3d 127.0.0.1:14318 is DEAD)', () => {
     const lines = otelTelemetryLines(sampleConfig, {});
     const joined = lines.join('\n');
-    expect(joined).toContain('127.0.0.1:14318');
+    expect(joined).toContain('http://orzech-dev-agents-monitoring.tail491af.ts.net:4318');
     expect(joined).not.toContain('localhost');
-    expect(joined).not.toContain(':4318');
+    expect(joined).not.toContain('127.0.0.1');
+    expect(joined).not.toContain(':14318');
   });
 
   it('emits env-overridable form for run-time OTEL_EXPORTER_OTLP_ENDPOINT override', () => {
