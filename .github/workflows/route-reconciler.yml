@@ -96,7 +96,7 @@ jobs:
       # title-prefix stays in lockstep (same discipline as e2e.yml).
       INCIDENT_TITLE_PREFIX: "routing: dropped ping (no turn_processed receipt)"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: jetify-com/devbox-install-action@v0.15.0
         with:
