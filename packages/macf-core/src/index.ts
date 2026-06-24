@@ -18,6 +18,8 @@ export * from './token.js';
 export * from './types.js';
 export * from './semver.js';
 export * from './reflection.js';
+export * from './norm.js';
+export * from './protected-invariant-norms.js';
 export * from './mtls-health-ping.js';
 export * from './certs/index.js';
 export * from './registry/index.js';
