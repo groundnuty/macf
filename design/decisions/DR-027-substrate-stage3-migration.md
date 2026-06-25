@@ -2,7 +2,9 @@
 
 **Status:** Proposed
 **Date:** 2026-06-25
-**Trigger:** The "are we mature enough to use our own tool?" review (operator ↔ `macf-science-agent`, 2026-06-25) + `macf-devops-toolkit#90`'s finding that the MACF-project fleet (science/code/devops) runs `macf-actions@v1.3.4` — **Stage-2, SSH+tmux routing** — while the tool itself has shipped through `v3.3.0`: **Stage-3, mTLS channel routing** (a breaking transport change). The substrate is the last Stage-2 holdout: ~5 minor + 2 major versions behind its own product. The operator's *own* documented condition for substrate Stage-3 migration — *"substrate stays Stage-2 until substantial CV-on-Stage-3 work lands first"* — **is now met**: the CV consumer deployment has run Stage-3 for months (issue routing, PR routing, and A2A peer-to-peer; A2A e2e verified, trace `819c1586` / `macf#368`). So this DR is not a reversal — it is that pre-set trigger firing.
+**Trigger:** The "are we mature enough to use our own tool?" review (operator ↔ `macf-science-agent`, 2026-06-25) + `macf-devops-toolkit#90`'s finding that the MACF-project fleet (science/code/devops) runs `macf-actions@v1.3.4` — **Stage-2, SSH+tmux routing** — while the tool itself has shipped through `v3.3.0`: **Stage-3, mTLS channel routing** (a breaking transport change). The substrate is the last Stage-2 holdout: ~5 minor + 2 major versions behind its own product. The operator's *own* documented condition for substrate Stage-3 migration — *"substrate stays Stage-2 until substantial CV-on-Stage-3 work lands first"* (2026-06-08) — **is now met**: the CV consumer deployment has run Stage-3 for months (issue routing, PR routing, and A2A peer-to-peer; A2A e2e verified, trace `819c1586` / `macf#368`).
+
+> **Supersession (explicit, dated).** This DR **supersedes the permanent-Stage-2-*transport* stance** for the MACF-project substrate — recorded as "substrate runs permanent Stage-2 v1.x, actively maintained, not retiring" and rooted in the **2026-04-27 operator directive (`macf#273`)** that substrate workspaces *never run `macf init`* — "**permanent operating state, not deferred**." DR-027 does **not** soft-pedal this as "not really a reversal" (an earlier draft did; corrected per code-agent's #524 review — shipping a soft contradiction in the very DR that enables the doc-vs-directive auditor would be self-undermining). It is a clean supersession, **justified** by the 2026-06-08 precondition now being met, using the same dated-supersession pattern as DR-026 §8 (`macf#523`). **Crucially, `macf#273`'s literal directive survives intact** — see Decision #1: the substrate migrates *transport* via devops hand-wiring, it does **not** become a `macf init` consumer. What is superseded is the *transport permanence*, not the *init-consumership boundary*.
 
 ## Context
 
@@ -20,7 +22,7 @@ Stage-2 also carries a known fragility this migration retires: the Remote-Contro
 
 ## Decision
 
-1. **Migrate the MACF-project agent homes' routing transport from Stage-2 (SSH+tmux) to Stage-3 (mTLS channels), and drop SSH+tmux once migrated.**
+1. **Migrate the MACF-project agent homes' routing transport from Stage-2 (SSH+tmux) to Stage-3 (mTLS channels), and drop SSH+tmux once migrated.** **Transport-stage and `macf init`-consumership are separable, and this DR changes only the former.** The *existing* substrate agents (science/code/devops) migrate transport by **devops hand-wiring** (channel-server + certs + registry-Variables) — they do **NOT** become `macf init` consumers, so the `macf#273` boundary holds literally. Only the *greenfield* `macf-auditor-agent` is `macf init`'d (`--role auditor`) — it has no substrate-workbench history to preserve. (Avoids the reading "Stage-3 ⇒ `macf init`," which would contradict #273.)
 
 2. **Channels-for-routing only; the A2A peer-to-peer protocol is NOT enabled yet.** Per the operator's call (mirroring the CV discipline): agents coordinate via **issues**; A2A is used only in **specifically-designed** situations, and none are designed for the substrate yet. A2A enablement is **deferred until a validated use case**. *(Observability is not the blocker — DR-025's comms-ledger already makes A2A observable when it is enabled.)*
 
@@ -30,7 +32,13 @@ Stage-2 also carries a known fragility this migration retires: the Remote-Contro
 
 5. **The registry moves from the `.github/agent-config.json` file to org-scoped GitHub Variables** (DR-005/006/007), `registry-api-path = /orgs/groundnuty` — one registry for the fleet. Each agent's channel-server `host:port` becomes a registry Variable. (The file may remain but is unread under v3.)
 
-6. **Per-agent Stage-3 infra (devops-owned):** a channel-server on the agent host + its lifecycle; mTLS `ROUTING_CLIENT_CERT/KEY` issuance + rotation (DR-004); the v3 caller inputs (`project`, `registry-api-path`).
+6. **Per-agent Stage-3 infra (devops-owned; resolved with devops on #524):**
+   - **Topology:** **per-agent channel-server process, distinct ports, one shared CA** — matches the registry-per-agent-`host:port` model + the one-at-a-time canary (a crash isolates to one agent; no shared-demux single-point-of-failure). All five MACF-project homes (auditor + science/code/devops/writing) co-tenant on `orzech-dev-agents`, so N processes / N ports / 1 CA. *(Canary-zero validates this co-tenant layout directly — the auditor home is confirmed a 5th tenant on `orzech-dev-agents`, not a separate host.)*
+   - **Registry host value:** register each channel-server as its **MagicDNS FQDN** `orzech-dev-agents.tail491af.ts.net:<port>` — **not** the `192.168.102.x` LAN IP (unreachable from the GitHub-hosted runner) nor the raw tailnet IP (not the contract). Same FQDN-over-IP lesson DR-004 applied to the obs cluster. (Exact hostname confirmed via `tailscale status` on the agent host at stand-up.)
+   - **Certs:** per-agent **server** cert+key on the VM (root-owned, `0600`) under a long-lived shared CA trusted both ends; the **client** `ROUTING_CLIENT_CERT/KEY` (DR-004) as a secret.
+   - **Secret placement + rotation:** store `ROUTING_CLIENT_CERT/KEY` + `MACF_ROUTING_APP_KEY` as **org-level secrets** (scoped to the caller repos, consumed via `secrets: inherit`) — one rotation point, mirroring the org-Variables registry. **Asymmetric cadence:** server leaf certs auto-rotate on the VM under the long-lived CA (no GH touch); the client cert rotates on the DR-004 default (now a single org-secret update); the CA rotates only on compromise.
+   - v3 caller inputs: `project` (required) + `registry-api-path` (`/orgs/groundnuty`).
+   - **devops will draft the full Decision-6 infra expansion** (channel-server unit + CA/cert lifecycle + the per-agent port map + the org-secret/Variable layout) as the post-ratification deliverable feeding phase-0 auditor stand-up.
 
 7. **The dedicated `MACF_ROUTING` App (operator prerequisite).** The v3 router resolves the registry via `gh api .../actions/variables/...`, which the workflow's `GITHUB_TOKEN` cannot read; it mints a short-lived token from a **dedicated, minimal-scope App** (`metadata:read` + `actions_variables:read` only — far less than any agent App). This is structurally required by `agent-router.yml@v3.3.0` (the registry-read step is unconditional); it is the one hard operator passkey action. Least-privilege: a leaked router token reads the registry, nothing more.
 
@@ -58,8 +66,9 @@ Stage-2 also carries a known fragility this migration retires: the Remote-Contro
 
 ## Open questions
 
-- **Channel-server topology on the agent host** — per-agent process vs shared; cert store layout. devops to pin in the infra section (and confirm the agent-VM address — `100.124.163.105` tailnet vs the `192.168.102.x` LAN noted on #90).
-- **`ROUTING_CLIENT_*` rotation cadence** (DR-004 default vs tighter).
+*(The topology / agent-VM-address / rotation-cadence questions were resolved with devops on #524 and folded into Decision #6.)*
+
+- **Exact channel-server hostname + port map** — confirmed via `tailscale status` on `orzech-dev-agents` at stand-up; carried in devops's Decision-6 infra expansion, not blocking the DR as Proposed.
 - **The auditor's first real task post-stand-up** — likely the DR-026 §8 highest-value-early function (promote hard-won infra knowledge from agent memory → project rules) before it siloes.
 
 ## References
