@@ -244,6 +244,96 @@ function readSettings(path: string): Settings {
  * a skill, add its pattern here + bump CLI version. macf#350 added
  * `macf-notify-peer` (operator-driven cross-agent messaging slash-command).
  */
+/**
+ * DR-028 universal floor `allow` tools (every role). Broad `Bash(*)` — narrow
+ * patterns are defeated by `$GH_TOKEN`/`$MACF_WORKSPACE_DIR` "simple_expansion";
+ * the real defense is the `deny` floor + the PreToolUse hooks, NOT
+ * allow-narrowing. `Write`/`Edit` close the memory-edit prompt. Defined here
+ * (zero deps) so `role-settings-model.ts` re-exports it without an import cycle
+ * (that module imports the hook constants FROM here). See
+ * `design/decisions/DR-028-expected-settings-per-role.md`.
+ */
+export const ROLE_FLOOR_ALLOW: readonly string[] = [
+  'Bash(*)',
+  'Read',
+  'Write',
+  'Edit',
+  'Glob',
+  'Grep',
+  'WebFetch',
+  'WebSearch',
+  'Agent',
+];
+
+/**
+ * DR-028 universal floor `deny` — the real guardrail (seeded from devops's set,
+ * the most complete of the three working agents): credential/secret reads +
+ * config/dotfile writes + dangerous commands.
+ */
+export const ROLE_FLOOR_DENY: readonly string[] = [
+  // credential / secret reads
+  'Read(~/.ssh/id_*)',
+  'Read(~/.ssh/*.pem)',
+  'Read(~/.aws/**)',
+  'Read(~/.gnupg/**)',
+  'Read(~/.kube/**)',
+  'Read(~/.config/gcloud/**)',
+  'Read(~/.netrc)',
+  'Read(~/.config/gh/**)',
+  'Read(~/.bash_history)',
+  'Read(~/.zsh_history)',
+  // config / dotfile writes
+  'Write(~/.claude/settings.json)',
+  'Edit(~/.claude/settings.json)',
+  'Write(~/.claude.json)',
+  'Edit(~/.claude.json)',
+  'Write(~/.ssh/**)',
+  'Edit(~/.ssh/**)',
+  'Write(~/.aws/**)',
+  'Edit(~/.aws/**)',
+  'Write(~/.gnupg/**)',
+  'Edit(~/.gnupg/**)',
+  'Write(~/.kube/**)',
+  'Edit(~/.kube/**)',
+  'Write(~/.config/gcloud/**)',
+  'Edit(~/.config/gcloud/**)',
+  'Write(~/.gitconfig)',
+  'Edit(~/.gitconfig)',
+  'Write(~/.npmrc)',
+  'Edit(~/.npmrc)',
+  'Write(~/.pypirc)',
+  'Edit(~/.pypirc)',
+  'Write(~/.docker/config.json)',
+  'Edit(~/.docker/config.json)',
+  'Write(~/.netrc)',
+  'Edit(~/.netrc)',
+  'Write(~/.config/gh/**)',
+  'Edit(~/.config/gh/**)',
+  'Write(~/.bashrc)',
+  'Edit(~/.bashrc)',
+  'Write(~/.zshrc)',
+  'Edit(~/.zshrc)',
+  'Write(~/.profile)',
+  'Edit(~/.profile)',
+  'Write(~/.bash_profile)',
+  'Edit(~/.bash_profile)',
+  'Write(~/.zprofile)',
+  'Edit(~/.zprofile)',
+  'Write(~/.zshenv)',
+  'Edit(~/.zshenv)',
+  // dangerous commands
+  'Bash(sudo *)',
+  'Bash(rm -rf /)',
+  'Bash(git push --force*)',
+  'Bash(git push * --force*)',
+  'Bash(git push -f)',
+  'Bash(git push -f *)',
+  'Bash(git push * -f)',
+  'Bash(git push * -f *)',
+  'Bash(git commit --no-verify *)',
+  'Bash(git commit -n *)',
+];
+
 export const PLUGIN_SKILL_PERMISSIONS: readonly string[] = [
   'Skill(macf-agent:macf-status)',
   'Skill(macf-agent:macf-issues)',
@@ -707,10 +797,35 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
     return true;
   });
 
-  const allow: string[] = [
-    ...preserved,
+  // DR-028 (macf#534): emit the role-aware floor — not just skill/mcp perms.
+  // `Bash(*)` + Read/Write/Edit/etc close the "pure-init agent prompts on every
+  // command" + the memory-edit gaps; `deny` is the real guardrail. Dedup so a
+  // workspace whose hand-wired settings already carry the floor (the substrate)
+  // doesn't double entries. Floor + plugin perms FIRST, then preserved operator
+  // extras (minus the stale macf-managed skill/mcp entries dropped above + any
+  // floor entry already present, to avoid duplicates).
+  const floorAndPlugin = [
+    ...ROLE_FLOOR_ALLOW,
     ...PLUGIN_SKILL_PERMISSIONS,
     ...PLUGIN_MCP_TOOL_PERMISSIONS,
+  ];
+  const floorSet = new Set<string>(floorAndPlugin);
+  const allow: string[] = [
+    ...floorAndPlugin,
+    ...preserved.filter((e) => !(typeof e === 'string' && floorSet.has(e))),
+  ];
+
+  // DR-028 deny floor — union with operator-authored deny entries (preserve
+  // extras, dedup, idempotent on re-run).
+  const existingDeny = Array.isArray(
+    settings['permissions'] && (settings['permissions'] as { deny?: unknown })['deny'],
+  )
+    ? (settings['permissions'] as { deny: readonly string[] }).deny
+    : [];
+  const denySet = new Set<string>(ROLE_FLOOR_DENY);
+  const deny: string[] = [
+    ...ROLE_FLOOR_DENY,
+    ...existingDeny.filter((e) => !(typeof e === 'string' && denySet.has(e))),
   ];
 
   const existingPermissions = (settings['permissions'] as Record<string, unknown> | undefined) ?? {};
@@ -719,6 +834,7 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
     permissions: {
       ...existingPermissions,
       allow,
+      deny,
     },
   };
 

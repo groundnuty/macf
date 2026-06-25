@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
 
 describe('installGhTokenHook', () => {
   let tmpRoot: string;
@@ -655,18 +655,27 @@ describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {
     rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  it('creates .claude/settings.json with all skill + MCP tool patterns when missing', () => {
+  it('creates .claude/settings.json with the DR-028 floor + skill + MCP tool patterns when missing', () => {
     installPluginSkillPermissions(tmpRoot);
 
     expect(existsSync(settingsPath)).toBe(true);
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    // Post-#349: skill patterns + MCP tool patterns installed in lockstep.
-    expect(s.permissions.allow).toEqual([...PLUGIN_SKILL_PERMISSIONS, ...PLUGIN_MCP_TOOL_PERMISSIONS]);
+    // DR-028 (macf#534): emits the role-aware floor + plugin perms, in that order.
+    expect(s.permissions.allow).toEqual([
+      ...ROLE_FLOOR_ALLOW,
+      ...PLUGIN_SKILL_PERMISSIONS,
+      ...PLUGIN_MCP_TOOL_PERMISSIONS,
+    ]);
+    // Floor: broad Bash(*) + the read/write/edit tools (the no-usable-perms +
+    // memory-edit fix).
+    expect(s.permissions.allow).toContain('Bash(*)');
+    expect(s.permissions.allow).toContain('Write');
+    expect(s.permissions.allow).toContain('Edit');
+    // The deny safety floor is emitted too.
+    expect(s.permissions.deny).toContain('Bash(sudo *)');
+    expect(s.permissions.deny).toContain('Read(~/.ssh/id_*)');
     // Spot-check the 5 skills (macf#350 added macf-notify-peer).
     expect(s.permissions.allow).toContain('Skill(macf-agent:macf-status)');
-    expect(s.permissions.allow).toContain('Skill(macf-agent:macf-issues)');
-    expect(s.permissions.allow).toContain('Skill(macf-agent:macf-peers)');
-    expect(s.permissions.allow).toContain('Skill(macf-agent:macf-ping)');
     expect(s.permissions.allow).toContain('Skill(macf-agent:macf-notify-peer)');
     // Spot-check the 2 MCP tools (macf#349).
     expect(s.permissions.allow).toContain('mcp__plugin_macf-agent_macf-agent__notify_peer');
@@ -1434,6 +1443,12 @@ describe('end-to-end: macf update preserves operator-authored allow entries (mac
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
     expect(s.permissions.allow).toContain('Write');
     expect(s.permissions.allow).toContain('Edit');
-    expect(s.permissions.deny).toEqual(['Bash(rm -rf /)', 'Write(/etc/*)']);
+    // DR-028: the deny floor is now unioned in — operator entries preserved,
+    // floor added (not an exact-equals anymore).
+    expect(s.permissions.deny).toContain('Bash(rm -rf /)'); // operator's (also in floor)
+    expect(s.permissions.deny).toContain('Write(/etc/*)'); // operator-only — preserved
+    expect(s.permissions.deny).toContain('Bash(sudo *)'); // floor
+    // No duplicate of the shared 'Bash(rm -rf /)' entry.
+    expect(s.permissions.deny.filter((d: string) => d === 'Bash(rm -rf /)')).toHaveLength(1);
   });
 });

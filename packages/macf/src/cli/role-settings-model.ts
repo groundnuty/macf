@@ -26,6 +26,8 @@ import {
   MACF_TURN_RECEIPT_HOOK_COMMAND,
   MACF_ATTRIBUTION_HOOK_COMMAND,
   MACF_REFLECTION_HOOK_COMMAND,
+  ROLE_FLOOR_ALLOW,
+  ROLE_FLOOR_DENY,
 } from './settings-writer.js';
 
 /** A hook the model expects in `.claude/settings.json`. */
@@ -42,92 +44,11 @@ export interface ExpectedHook {
   readonly required: boolean;
 }
 
-/**
- * Universal floor `allow` tools (every role) — DR-028 §Decision 1. The macf
- * `Skill(...)` + `mcp__plugin…` entries (`PLUGIN_SKILL_PERMISSIONS` /
- * `PLUGIN_MCP_TOOL_PERMISSIONS`) are composed onto this by the emitter; they
- * are already emitted today and live in `settings-writer`.
- */
-export const ROLE_FLOOR_ALLOW: readonly string[] = [
-  'Bash(*)',
-  'Read',
-  'Write',
-  'Edit',
-  'Glob',
-  'Grep',
-  'WebFetch',
-  'WebSearch',
-  'Agent',
-];
-
-/**
- * Universal floor `deny` — the real guardrail (DR-028 §Decision 1; seeded from
- * devops's set, the most complete of the three working agents). Credential
- * reads + config/dotfile writes + dangerous commands.
- */
-export const ROLE_FLOOR_DENY: readonly string[] = [
-  // credential / secret reads
-  'Read(~/.ssh/id_*)',
-  'Read(~/.ssh/*.pem)',
-  'Read(~/.aws/**)',
-  'Read(~/.gnupg/**)',
-  'Read(~/.kube/**)',
-  'Read(~/.config/gcloud/**)',
-  'Read(~/.netrc)',
-  'Read(~/.config/gh/**)',
-  'Read(~/.bash_history)',
-  'Read(~/.zsh_history)',
-  // config / dotfile writes
-  'Write(~/.claude/settings.json)',
-  'Edit(~/.claude/settings.json)',
-  'Write(~/.claude.json)',
-  'Edit(~/.claude.json)',
-  'Write(~/.ssh/**)',
-  'Edit(~/.ssh/**)',
-  'Write(~/.aws/**)',
-  'Edit(~/.aws/**)',
-  'Write(~/.gnupg/**)',
-  'Edit(~/.gnupg/**)',
-  'Write(~/.kube/**)',
-  'Edit(~/.kube/**)',
-  'Write(~/.config/gcloud/**)',
-  'Edit(~/.config/gcloud/**)',
-  'Write(~/.gitconfig)',
-  'Edit(~/.gitconfig)',
-  'Write(~/.npmrc)',
-  'Edit(~/.npmrc)',
-  'Write(~/.pypirc)',
-  'Edit(~/.pypirc)',
-  'Write(~/.docker/config.json)',
-  'Edit(~/.docker/config.json)',
-  'Write(~/.netrc)',
-  'Edit(~/.netrc)',
-  'Write(~/.config/gh/**)',
-  'Edit(~/.config/gh/**)',
-  'Write(~/.bashrc)',
-  'Edit(~/.bashrc)',
-  'Write(~/.zshrc)',
-  'Edit(~/.zshrc)',
-  'Write(~/.profile)',
-  'Edit(~/.profile)',
-  'Write(~/.bash_profile)',
-  'Edit(~/.bash_profile)',
-  'Write(~/.zprofile)',
-  'Edit(~/.zprofile)',
-  'Write(~/.zshenv)',
-  'Edit(~/.zshenv)',
-  // dangerous commands
-  'Bash(sudo *)',
-  'Bash(rm -rf /)',
-  'Bash(git push --force*)',
-  'Bash(git push * --force*)',
-  'Bash(git push -f)',
-  'Bash(git push -f *)',
-  'Bash(git push * -f)',
-  'Bash(git push * -f *)',
-  'Bash(git commit --no-verify *)',
-  'Bash(git commit -n *)',
-];
+// DR-028 universal floor allow/deny live in settings-writer.ts (zero deps) to
+// avoid an import cycle — this module imports the hook constants FROM there, so
+// the floor data must not flow the other way. Re-exported below so the model's
+// public surface (what `macf doctor` validates against) stays in one place.
+export { ROLE_FLOOR_ALLOW, ROLE_FLOOR_DENY };
 
 /** Universal floor hooks (every role) — DR-028 §Decision 1. */
 export const ROLE_FLOOR_HOOKS: readonly ExpectedHook[] = [
