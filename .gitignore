@@ -18,3 +18,9 @@ coverage/
 
 # Local subagent worktrees (never committed)
 .claude/worktrees/
+
+# MACF hand-wire local state (substrate channel-server config — devops-toolkit DR-005 Decision 6).
+# Per-machine runtime config: env.*, plugin-cs, cert-mgmt marker, channel logs. Leaf key is
+# already *.pem-protected above; this keeps the rest out of the framework repo's tree.
+.macf/
+.claude/.macf/
