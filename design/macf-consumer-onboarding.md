@@ -54,6 +54,8 @@ ls ~/.macf/certs/<project>/{ca-cert.pem,ca-key.pem} 2>/dev/null \
 
 ### 2. Run `macf init`
 
+First download the App's private key (`.pem`) from the GitHub App settings page ("Generate a private key"). Pass it via **`--app-key`** — `macf init` ingests it to the conventional `~/.macf/keys/<agent>.pem` (`chmod 600`) and **fails loud at init** if it's missing, rather than deferring to a cryptic `gh` 401 later (`macf#530`).
+
 ```bash
 macf init \
   --project <project-name> \
@@ -62,7 +64,7 @@ macf init \
   --type permanent \
   --app-id $APP_ID \
   --install-id $INSTALL_ID \
-  --key-path .github-app-key.pem \
+  --app-key ~/Downloads/<app>.private-key.pem \   # ingested -> ~/.macf/keys/<agent>.pem (0600)
   --registry-type <repo|org|profile> \
   --registry-repo <owner>/<repo>     # if --registry-type repo
   --advertise-host <127.0.0.1|<tailscale-ip>>  # 127.0.0.1 if all agents on same VM
@@ -70,7 +72,7 @@ macf init \
   --dir .
 ```
 
-Required flags (per `packages/macf/src/cli/index.ts`): `--project`, `--role`, `--app-id`, `--install-id`, `--key-path`. Optional flags supply defaults; `--registry-type` defaults to `repo`, `--type` defaults to `permanent`. Cross-reference the live `--help` output for the canonical flag set when the CLI is updated.
+Required flags (per `packages/macf/src/cli/index.ts`): `--project`, `--role`, `--app-id`, `--install-id`. The App key is supplied via **`--app-key <downloaded .pem>`** (ingested to `--key-path`, which now defaults to `~/.macf/keys/<agent>.pem`); pass an explicit `--key-path` only to override the destination. Other optional flags supply defaults; `--registry-type` defaults to `repo`, `--type` defaults to `permanent`. Cross-reference the live `--help` output for the canonical flag set when the CLI is updated.
 
 Effects of `macf init`:
 
