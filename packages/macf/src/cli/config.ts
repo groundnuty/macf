@@ -144,6 +144,13 @@ export const MacfAgentConfigSchema = z.object({
     app_id: z.string(),
     install_id: z.string(),
     key_path: z.string(),
+    // The App's real bot login (App slug + `[bot]`, e.g. `macf-auditor-agent[bot]`).
+    // AUTHORITATIVE identity for the attribution hook (macf#535): `agent_name`
+    // is NOT always the App slug (the auditor's agent_name is "auditor" but its
+    // slug is macf-auditor-agent), so the hook must not derive the bot login
+    // from agent_name. Populated by macf init/doctor (DR-028); optional so
+    // pre-existing configs + local-mode stay valid.
+    bot_login: z.string().optional(),
   }).optional(),
   // Host the agent advertises in its registry entry (written by the
   // channel server on bind). When unset, claude.sh falls back to

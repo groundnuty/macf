@@ -135,20 +135,36 @@ ACTUAL_TYPE="$(jq -r '.type // ""' <<<"$RESP" 2>/dev/null || echo "")"
 # Couldn't extract an author at all → fail open.
 [[ -z "$ACTUAL_LOGIN" ]] && exit 0
 
-# ── Resolve the EXPECTED bot login (first hit wins; may be empty) ─────────
-# 1. $MACF_EXPECTED_BOT_LOGIN — explicit operator/test override.
-# 2. .macf/macf-agent.json — derive `<name>[bot]` from the workspace config.
-#    The canonical workspace field is `agent_name`; the repo-side
-#    agent-config.json carries `app_name`. Accept either (agent_name first).
-# 3. empty — fall back to the type-based check below.
+# ── Resolve the EXPECTED bot login + whether it is AUTHORITATIVE ──────────
+# AUTHORITATIVE sources (a mismatch is a real trap, even vs a different Bot):
+#   1. $MACF_EXPECTED_BOT_LOGIN — explicit operator/test override.
+#   2. .macf/macf-agent.json `.github_app.bot_login` — the App's real bot login
+#      (App slug + `[bot]`), written by macf init/doctor (DR-028). Authoritative.
+# NON-authoritative HINT:
+#   3. .macf/macf-agent.json `.agent_name` / `.app_name` — a derived guess that
+#      assumes agent_name == App slug, which is NOT always true (macf#535: the
+#      auditor's agent_name is "auditor" but its App slug is macf-auditor-agent).
+#      A mismatch on this guess is trapped ONLY when a User authored it (the
+#      Instance-12 trap); a Bot author that just doesn't match the guess is the
+#      name!=slug case and is allowed (no false positive).
+#   4. empty — fall back to the type-based check below.
 EXPECTED_LOGIN="${MACF_EXPECTED_BOT_LOGIN:-}"
+EXPECTED_AUTHORITATIVE=0
+[[ -n "$EXPECTED_LOGIN" ]] && EXPECTED_AUTHORITATIVE=1
 if [[ -z "$EXPECTED_LOGIN" ]]; then
   AGENT_JSON="${CLAUDE_PROJECT_DIR:-.}/.macf/macf-agent.json"
   if [[ -f "$AGENT_JSON" ]]; then
-    AGENT_NAME="$(jq -r '.agent_name // .app_name // ""' "$AGENT_JSON" 2>/dev/null || echo "")"
-    if [[ -n "$AGENT_NAME" ]]; then
+    BOT_LOGIN="$(jq -r '.github_app.bot_login // .bot_login // ""' "$AGENT_JSON" 2>/dev/null || echo "")"
+    if [[ -n "$BOT_LOGIN" ]]; then
       # Append `[bot]` exactly once (tolerate a config that already carries it).
-      EXPECTED_LOGIN="${AGENT_NAME%"[bot]"}[bot]"
+      EXPECTED_LOGIN="${BOT_LOGIN%"[bot]"}[bot]"
+      EXPECTED_AUTHORITATIVE=1
+    else
+      AGENT_NAME="$(jq -r '.agent_name // .app_name // ""' "$AGENT_JSON" 2>/dev/null || echo "")"
+      if [[ -n "$AGENT_NAME" ]]; then
+        # Non-authoritative guess (see note above) — leave AUTHORITATIVE=0.
+        EXPECTED_LOGIN="${AGENT_NAME%"[bot]"}[bot]"
+      fi
     fi
   fi
 fi
@@ -171,7 +187,15 @@ if [[ -n "$EXPECTED_LOGIN" ]]; then
   if [[ "$NORM_ACTUAL" == "$NORM_EXPECTED" ]]; then
     exit 0
   fi
-  MISMATCH=1
+  # Mismatch. Trap if the expectation is AUTHORITATIVE (env / bot_login — a
+  # different author, even a Bot, is wrong), OR a User authored it (the
+  # Instance-12 trap, regardless of source). A Bot author that only mismatches
+  # a NON-authoritative agent_name guess is the name!=slug case (macf#535) → ok.
+  if [[ "$EXPECTED_AUTHORITATIVE" == "1" || "$ACTUAL_TYPE" != "Bot" ]]; then
+    MISMATCH=1
+  else
+    exit 0
+  fi
 else
   # No expected login known — best verifiable signal is the author TYPE.
   # A Bot authored it → trust it (some bot posted; correct by design).
