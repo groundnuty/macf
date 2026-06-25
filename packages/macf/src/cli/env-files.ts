@@ -263,12 +263,15 @@ export function generateEnvIdentity(config: MacfAgentConfig): string {
     `MACF_AGENT_ROLE="\${MACF_AGENT_ROLE:-${config.agent_role}}"`,
     'export MACF_AGENT_ROLE',
     '',
-    '# macf#538: the ROUTING identity (registry key + cert CN) — distinct from',
-    '# MACF_AGENT_NAME (the OTEL bot-name). Defaults to the agent name, so it is',
-    '# inert unless the operator overrides it (the substrate sets a label that',
-    '# differs from its bot-name, e.g. devops-agent vs macf-devops-agent).',
+    '# macf#538/#545: the ROUTING identity (registry key + cert CN) — distinct',
+    '# from MACF_AGENT_NAME (the OTEL bot-name). The baked default is the config',
+    '# routing_label when set (the substrate: devops-agent), else the agent name',
+    '# (inert). MUST match the cert CN (macf init sources both from routing_label)',
+    '# so mTLS validates the CN against the resolved registry slot.',
     `MACF_ROUTING_LABEL="\${MACF_ROUTING_LABEL:-$(macf_settings_get MACF_ROUTING_LABEL)}"`,
-    `MACF_ROUTING_LABEL="\${MACF_ROUTING_LABEL:-\${MACF_AGENT_NAME}}"`,
+    config.routing_label !== undefined
+      ? `MACF_ROUTING_LABEL="\${MACF_ROUTING_LABEL:-${config.routing_label}}"`
+      : `MACF_ROUTING_LABEL="\${MACF_ROUTING_LABEL:-\${MACF_AGENT_NAME}}"`,
     'export MACF_ROUTING_LABEL',
   ];
   return assemble(managedHeaderLines('generateEnvIdentity'), body);

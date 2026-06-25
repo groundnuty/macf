@@ -124,7 +124,7 @@ describe('generateEnvIdentity', () => {
     expect(out).toContain('export MACF_AGENT_ROLE');
   });
 
-  it('emits MACF_ROUTING_LABEL defaulting to MACF_AGENT_NAME (macf#538)', () => {
+  it('emits MACF_ROUTING_LABEL defaulting to MACF_AGENT_NAME when routing_label unset (macf#538)', () => {
     const out = generateEnvIdentity(baseConfig);
     expect(out).toContain(
       'MACF_ROUTING_LABEL="${MACF_ROUTING_LABEL:-$(macf_settings_get MACF_ROUTING_LABEL)}"',
@@ -132,6 +132,16 @@ describe('generateEnvIdentity', () => {
     // Inert default: the routing label falls back to the bot-name.
     expect(out).toContain('MACF_ROUTING_LABEL="${MACF_ROUTING_LABEL:-${MACF_AGENT_NAME}}"');
     expect(out).toContain('export MACF_ROUTING_LABEL');
+  });
+
+  it('bakes MACF_ROUTING_LABEL to the config routing_label literal when set (macf#545)', () => {
+    // The substrate case: routing_label (devops-agent) != agent_name (the
+    // bot-name). The baked default MUST be the literal label so the registry
+    // key matches the cert CN (also sourced from routing_label).
+    const out = generateEnvIdentity({ ...baseConfig, routing_label: 'devops-agent' });
+    expect(out).toContain('MACF_ROUTING_LABEL="${MACF_ROUTING_LABEL:-devops-agent}"');
+    // Must NOT fall back to ${MACF_AGENT_NAME} when an explicit label is set.
+    expect(out).not.toContain('MACF_ROUTING_LABEL="${MACF_ROUTING_LABEL:-${MACF_AGENT_NAME}}"');
   });
 
   it('does NOT define macf_settings_get inline (delegated to env._helpers per #342 PR-B)', () => {

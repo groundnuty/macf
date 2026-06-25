@@ -27,6 +27,15 @@ export interface InitOptions {
   readonly project: string;
   readonly role: string;
   readonly name?: string;
+  /**
+   * The routing identity — registry key + cert CN (macf#545). Defaults to the
+   * agent name; set it only when the routing label must differ from the OTEL
+   * bot-name (the substrate: devops-agent vs macf-devops-agent). Written to
+   * `macf-agent.json` `routing_label`, baked as the `MACF_ROUTING_LABEL`
+   * default, and used as the cert CN — so the registry key and the cert CN
+   * stay consistent (mTLS validates CN against the resolved slot).
+   */
+  readonly routingLabel?: string;
   readonly type?: string;
   /**
    * GitHub App credentials. Required for `repo` / `org` / `profile`
@@ -416,6 +425,7 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     project: opts.project,
     agent_name: agentName,
     agent_role: opts.role,
+    ...(opts.routingLabel !== undefined ? { routing_label: opts.routingLabel } : {}),
     agent_type: (opts.type ?? 'permanent') as 'permanent' | 'worker',
     registry,
     ...(regType === 'local'
@@ -548,7 +558,9 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     try {
       const ca = loadCA(caCertFile, caKeyFile);
       await generateAgentCert({
-        agentName,
+        // macf#545: cert CN = the routing identity (defaults to agentName), so
+        // mTLS validates the CN against the registry slot the router resolved.
+        agentName: opts.routingLabel ?? agentName,
         caCertPem: ca.certPem,
         caKeyPem: ca.keyPem,
         ...(opts.advertiseHost !== undefined ? { advertiseHost: opts.advertiseHost } : {}),
@@ -649,7 +661,8 @@ async function initLocalModeCertsAndRegistry(
 
   // Generate this agent's cert against the (new or existing) CA.
   await generateAgentCert({
-    agentName,
+    // macf#545: cert CN = the routing identity (defaults to agentName).
+    agentName: opts.routingLabel ?? agentName,
     caCertPem,
     caKeyPem,
     ...(opts.advertiseHost !== undefined ? { advertiseHost: opts.advertiseHost } : {}),

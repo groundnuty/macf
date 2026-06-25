@@ -147,10 +147,14 @@ export async function certsRotate(projectDir: string): Promise<void> {
   const certP = agentCertPath(projectDir);
   const keyP = agentKeyPath(projectDir);
 
-  console.log(`Rotating certificate for "${config.agent_name}"...`);
+  // macf#545: the cert CN is the ROUTING identity (registry key), not the OTEL
+  // bot-name — mTLS validates the CN against the slot the router resolved.
+  // Defaults to agent_name (back-compat; inert when routing_label is unset).
+  const certCn = config.routing_label ?? config.agent_name;
+  console.log(`Rotating certificate for "${certCn}"...`);
 
   await generateAgentCert({
-    agentName: config.agent_name,
+    agentName: certCn,
     caCertPem: ca.certPem,
     caKeyPem: ca.keyPem,
     // Flow the advertised host into the cert SAN so TLS hostname

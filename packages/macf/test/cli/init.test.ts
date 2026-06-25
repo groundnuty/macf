@@ -34,6 +34,24 @@ describe('macf init', () => {
     expect(existsSync(join(dir, '.macf', 'plugin'))).toBe(true);
   });
 
+  it('writes routing_label to config when --routing-label is provided (macf#545)', async () => {
+    // Single init (these tests hit the network for the plugin fetch — keep it
+    // to one). The omitted→undefined case is covered by the next test, which
+    // inits without routingLabel.
+    await initAgent(dir, {
+      project: 'MACF',
+      role: 'devops-agent',
+      name: 'macf-devops-agent',
+      routingLabel: 'devops-agent',
+      appId: '1',
+      installId: '2',
+      keyPath: 'k.pem',
+      registryType: 'repo',
+      registryRepo: 'owner/repo',
+    });
+    expect(readAgentConfig(dir)!.routing_label).toBe('devops-agent');
+  });
+
   it('writes macf-agent.json with correct content', async () => {
     await initAgent(dir, {
       project: 'MACF',
@@ -52,6 +70,9 @@ describe('macf init', () => {
     expect(config!.agent_role).toBe('science-agent');
     expect(config!.project).toBe('MACF');
     expect(config!.registry).toEqual({ type: 'org', org: 'my-org' });
+    // macf#545: routing_label omitted when --routing-label not given → undefined
+    // (consumers default to agent_name; inert).
+    expect(config!.routing_label).toBeUndefined();
   });
 
   it('defaults agent name to role', async () => {

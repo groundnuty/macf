@@ -106,7 +106,9 @@ async function main(): Promise<void> {
 
   async function runStartup(): Promise<void> {
   const mcp = createMcpChannel({ agentName: config.agentName });
-  const health = createHealthState(config.agentName, config.agentType);
+  // macf#545: /health echoes the ROUTING identity (the router cross-checks the
+  // liveness response against the registry slot it resolved), not the bot-name.
+  const health = createHealthState(config.routingLabel, config.agentType);
 
   const onNotify = async (payload: NotifyPayload): Promise<void> => {
     const meta: Record<string, string> = { type: payload.type };
@@ -385,7 +387,9 @@ async function main(): Promise<void> {
   // process lifetime per spec § 4.4.1 (AgentCard version-pinned).
   // groundnuty/macf#370 — A2A Phase 1.
   const agentCard = buildAgentCard({
-    agentName: config.agentName,
+    // macf#545: the A2A card `name` is the peer-ADDRESSING identity (how a peer
+    // resolves us) → the routing label, not the OTEL bot-name.
+    agentName: config.routingLabel,
     agentRole: config.agentRole,
     project: config.project,
     url: `https://${config.advertiseHost}:${config.port}`,
