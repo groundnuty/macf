@@ -262,6 +262,14 @@ export function generateEnvIdentity(config: MacfAgentConfig): string {
     `MACF_AGENT_ROLE="\${MACF_AGENT_ROLE:-$(macf_settings_get MACF_AGENT_ROLE)}"`,
     `MACF_AGENT_ROLE="\${MACF_AGENT_ROLE:-${config.agent_role}}"`,
     'export MACF_AGENT_ROLE',
+    '',
+    '# macf#538: the ROUTING identity (registry key + cert CN) — distinct from',
+    '# MACF_AGENT_NAME (the OTEL bot-name). Defaults to the agent name, so it is',
+    '# inert unless the operator overrides it (the substrate sets a label that',
+    '# differs from its bot-name, e.g. devops-agent vs macf-devops-agent).',
+    `MACF_ROUTING_LABEL="\${MACF_ROUTING_LABEL:-$(macf_settings_get MACF_ROUTING_LABEL)}"`,
+    `MACF_ROUTING_LABEL="\${MACF_ROUTING_LABEL:-\${MACF_AGENT_NAME}}"`,
+    'export MACF_ROUTING_LABEL',
   ];
   return assemble(managedHeaderLines('generateEnvIdentity'), body);
 }

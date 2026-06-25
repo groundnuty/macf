@@ -124,6 +124,16 @@ describe('generateEnvIdentity', () => {
     expect(out).toContain('export MACF_AGENT_ROLE');
   });
 
+  it('emits MACF_ROUTING_LABEL defaulting to MACF_AGENT_NAME (macf#538)', () => {
+    const out = generateEnvIdentity(baseConfig);
+    expect(out).toContain(
+      'MACF_ROUTING_LABEL="${MACF_ROUTING_LABEL:-$(macf_settings_get MACF_ROUTING_LABEL)}"',
+    );
+    // Inert default: the routing label falls back to the bot-name.
+    expect(out).toContain('MACF_ROUTING_LABEL="${MACF_ROUTING_LABEL:-${MACF_AGENT_NAME}}"');
+    expect(out).toContain('export MACF_ROUTING_LABEL');
+  });
+
   it('does NOT define macf_settings_get inline (delegated to env._helpers per #342 PR-B)', () => {
     // PR-B moved the helper definition into env._helpers (sourced first
     // per alphabetical order). env.identity now CALLS the helper but

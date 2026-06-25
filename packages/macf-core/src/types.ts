@@ -200,6 +200,15 @@ export type HealthResponse = z.infer<typeof HealthResponseSchema>;
 
 export interface AgentConfig {
   readonly agentName: string;
+  /**
+   * The routing identity — registry key + cert CN (macf#538). Distinct from
+   * `agentName` (the OTEL bot-name): on the substrate `agentName` is
+   * `macf-devops-agent` while `routingLabel` is `devops-agent`; on greenfield
+   * agents they coincide. Sourced from `MACF_ROUTING_LABEL`, defaulting to
+   * `agentName` (back-compat). Use this — not `agentName` — for registry
+   * register/remove/collision lookups.
+   */
+  readonly routingLabel: string;
   readonly agentType: string;
   readonly agentRole: string;
   readonly host: string;
