@@ -41,7 +41,7 @@ They are **complementary**: the role layer says *how this agent thinks about its
 ## 2. Prerequisites (operator, one-time)
 
 - [ ] **`macf` CLI ≥ 0.2.37** — `npm i -g @groundnuty/macf@latest`; verify `macf --version` shows `0.2.37` (this is the release that ships `--app-key` ingestion + the auditor commands; older versions hand-`cp` keys and lack profile-registry fixes).
-- [ ] **Three GitHub Apps**, one per agent (attribution-distinct — each agent posts as itself). Create each from the manifest at `packages/macf/templates/macf-app-manifest.json` (DR-019 permission set) → `https://github.com/settings/apps/new?...`. For each App: note the **App ID**, **install it** on that agent's repo(s), and **download its private key** (`.pem`).
+- [ ] **Three GitHub Apps**, one per agent (attribution-distinct — each agent posts as itself). **This is the one step with no `gh` CLI — App create + install is web/passkey only** (there is no `gh app create`). Create each from the manifest at `packages/macf/templates/macf-app-manifest.json` (DR-019 permission set) → `https://github.com/settings/apps/new`. For each App: note the **App ID**, **install it** on that agent's repo(s) + on `groundnuty/groundnuty` (the registry), and **download its private key** (`.pem`).
   - `[WATCH]` Naming: name the Apps `icsoc-2026-science-agent` / `icsoc-2026-code-agent` / `icsoc-2026-writer-agent` so attribution in issues/PRs reads clearly.
 - [ ] **The `groundnuty/groundnuty` profile repo exists** (it does) and each agent's App is **installed on it** with `actions_variables:write`, so the channel server can self-register into the fleet registry.
 - [ ] **`agentic-repo-template` access** — you own it; you'll "Use this template" three times.
@@ -56,13 +56,15 @@ The three steps are identical in shape; only the **profile**, **role**, **home p
 ### 3a. Create the home repo from the role template
 
 ```bash
-# On GitHub: agentic-repo-template → "Use this template" → create
-#   groundnuty/icsoc-2026-science-agent
-git clone https://github.com/groundnuty/icsoc-2026-science-agent.git \
+# Create the repo FROM the template — gh CLI, no web UI:
+gh repo create groundnuty/icsoc-2026-science-agent \
+  --template groundnuty/agentic-repo-template --private
+# Clone it to the agent's home path:
+gh repo clone groundnuty/icsoc-2026-science-agent \
   /home/ubuntu/repos/agh/icsoc-2026-science-agent
 cd /home/ubuntu/repos/agh/icsoc-2026-science-agent
 
-# Apply the role profile (science → research; code → code; writer → paper-latex)
+# Apply the role profile (science → research; code → code; writer → paper-latex):
 ./.claude/init.sh research
 ```
 
@@ -113,6 +115,60 @@ ls .macf/macf-agent.json .macf/plugin claude.sh   # workspace wired
 
 *(All three: `--project icsoc-2026 --registry-type profile --registry-user groundnuty --advertise-host orzech-dev-agents.tail491af.ts.net`, plus each agent's own `--app-id/--install-id/--app-key`.)*
 
+### 3e. Every command in order — one agent (science-agent), copy-paste
+
+```bash
+# 1. Repo from template (gh CLI)
+gh repo create groundnuty/icsoc-2026-science-agent \
+  --template groundnuty/agentic-repo-template --private
+gh repo clone groundnuty/icsoc-2026-science-agent \
+  /home/ubuntu/repos/agh/icsoc-2026-science-agent
+cd /home/ubuntu/repos/agh/icsoc-2026-science-agent
+
+# 2. Role profile (template script)
+./.claude/init.sh research
+
+# 3. App create + install  —  WEB / passkey, NO gh CLI
+#    github.com/settings/apps/new  (perms from packages/macf/templates/macf-app-manifest.json)
+#    → install on groundnuty/icsoc-2026-science-agent AND groundnuty/groundnuty
+#    → download the .pem → note APP_ID, INSTALL_ID
+
+# 4. MACF coordination layer
+macf init \
+  --project icsoc-2026 --role science-agent --name icsoc-2026-science-agent \
+  --app-id <APP_ID> --install-id <INSTALL_ID> \
+  --app-key ~/Downloads/icsoc-2026-science-agent.private-key.pem \
+  --registry-type profile --registry-user groundnuty \
+  --advertise-host orzech-dev-agents.tail491af.ts.net \
+  --dir /home/ubuntu/repos/agh/icsoc-2026-science-agent
+
+# 5. Routing scaffolding on the repo (labels + agent-router workflow + agent-config).
+#    --actions-version v3 = Stage-3 (see §5). Needs a bot token with repo write.
+#    Creates the assignment labels (science-agent/code-agent/writer-agent) + status
+#    labels + .github/agent-router.yml@v3 + .github/agent-config.json.
+GH_TOKEN=<bot-token> macf repo-init \
+  --repo groundnuty/icsoc-2026-science-agent \
+  --actions-version v3 \
+  --agents science-agent,code-agent,writer-agent \
+  --dir /home/ubuntu/repos/agh/icsoc-2026-science-agent
+
+# 6. Verify
+macf doctor && ./.claude/scripts/macf-whoami.sh && ./claude.sh
+```
+
+Repeat steps 1–6 for **code-agent** (`code` profile · repo `groundnuty/icsoc-2026-experiment` · dir `/home/ubuntu/repos/agh/icsoc-2026-experiment`) and **writer-agent** (`paper-latex` · repo `groundnuty/icsoc-2026` · dir `/home/ubuntu/repos/papers/icsoc-2026`).
+
+> **Labels-only alternative (incremental start, no routing yet):** if you skip routing on day one (§5), you don't need `macf repo-init`'s workflow — but you still need the **assignment labels** so science can label delegation issues. Create them per repo with:
+> ```bash
+> for L in science-agent code-agent writer-agent; do
+>   gh label create "$L" --repo groundnuty/icsoc-2026-experiment --color 0e8a16 --force
+> done
+> gh label create in-progress --repo groundnuty/icsoc-2026-experiment --color fbca04 --force
+> gh label create in-review   --repo groundnuty/icsoc-2026-experiment --color 1d76db --force
+> gh label create blocked      --repo groundnuty/icsoc-2026-experiment --color b60205 --force
+> ```
+> `[WATCH]` Confirm whether `macf repo-init --agents …` already creates the assignment labels (it creates the status labels for sure) — if so this block is redundant when you run repo-init.
+
 ---
 
 ## 4. How the fleet coordinates (the loop)
@@ -133,7 +189,14 @@ The roles and the delegation discipline come from `coordination.md` + `delegatio
 
 Coordination (issues/PRs) works the moment the Apps + repos exist. **Routing** is the layer that *wakes* the target agent when it's `@mention`ed, instead of it only seeing the work on its next manual launch. Two paths:
 
-- **Stage-3 mTLS channels — canonical for new projects.** Each agent runs a channel server (an MCP stdio child of its `claude.sh`, per DR-002); the per-repo `agent-router.yml@v3` resolves the agent's `host:port` from the registry and delivers over mTLS. Prerequisites (the heavier part — and the same ones the `icsoc` fleet's sibling, the `macf-auditor`, is finishing): a shared **CA + per-agent server cert**, a minimal-scope **`MACF_ROUTING` App** installed on `groundnuty/groundnuty` (to read the registry), and `macf repo-init` on each repo to scaffold the `@v3` router. Follow `design/macf-consumer-onboarding.md` §routing for the canonical steps.
+- **Stage-3 mTLS channels — canonical for new projects.** Each agent runs a channel server (an MCP stdio child of its `claude.sh`, per DR-002); the per-repo `agent-router.yml@v3` resolves the agent's `host:port` from the registry and delivers over mTLS. Prerequisites (the heavier part — and the same ones the `icsoc` fleet's sibling, the `macf-auditor`, is finishing): a shared **CA + per-agent server cert**, a minimal-scope **`MACF_ROUTING` App** installed on `groundnuty/groundnuty` (to read the registry), and `macf repo-init` on each repo to scaffold the `@v3` router. Follow `design/macf-consumer-onboarding.md` §routing for the canonical steps. The per-repo routing **secrets** (per `macf#529` — Profile registry, secrets stay per-repo) go in via gh CLI on each agent repo:
+  ```bash
+  gh secret set MACF_ROUTING_APP_ID  --repo groundnuty/icsoc-2026-experiment --body "<routing-app-id>"
+  gh secret set MACF_ROUTING_APP_KEY --repo groundnuty/icsoc-2026-experiment < macf-routing.private-key.pem
+  gh secret set ROUTING_CLIENT_CERT  --repo groundnuty/icsoc-2026-experiment < routing-client.crt
+  gh secret set ROUTING_CLIENT_KEY   --repo groundnuty/icsoc-2026-experiment < routing-client.key
+  ```
+  (Repeat per repo; the client cert/key come from the shared CA devops provisions.)
 - **Incremental start (recommended for day one):** stand the fleet up *without* automated routing first — Apps + repos + role config + `macf init` (§3), coordinate via issues, and let each agent pick up its queue on launch / `SessionStart`. Add Stage-3 routing once the cert/CA + `MACF_ROUTING` App are in place. This de-risks the first run and isolates the (currently-being-polished) Stage-3 setup from the rest.
 
 **`[DECIDE]` Tell me which you want the recipe to lead with** — the full Stage-3 path inline, or the incremental start with Stage-3 as a follow-on section. (Given Stage-3 onboarding is exactly what we're polishing this week, I've written §3 to be stage-agnostic so either works.)
