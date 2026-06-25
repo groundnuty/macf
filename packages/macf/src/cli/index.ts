@@ -84,7 +84,8 @@ program
   // rather than commander's generic missing-required message.
   .option('--app-id <id>', 'GitHub App ID (required for repo/org/profile registries)')
   .option('--install-id <id>', 'GitHub App Installation ID (required for repo/org/profile registries)')
-  .option('--key-path <path>', 'Path to GitHub App private key (required for repo/org/profile registries)')
+  .option('--key-path <path>', 'Destination the App private key lives at + what env.github points to (repo/org/profile registries). Defaults to ~/.macf/keys/<agent>.pem; pass --app-key to ingest the key here at init.')
+  .option('--app-key <path>', 'Source path of the downloaded App private key (.pem) to INGEST into --key-path (default ~/.macf/keys/<agent>.pem) at 0600. Onboarding: create the App -> download the .pem -> macf init --app-key <path> ... (macf#530).')
   .option('--registry-type <type>', 'Registry: repo, org, profile, or local (DR-024)', 'repo')
   .option('--registry-org <org>', 'Org name (for org registry)')
   .option('--registry-user <user>', 'User name (for profile registry)')
@@ -114,6 +115,7 @@ program
       appId: opts.appId,
       installId: opts.installId,
       keyPath: opts.keyPath,
+      appKey: opts.appKey,
       registryType,
       registryOrg: opts.registryOrg,
       registryUser: opts.registryUser,

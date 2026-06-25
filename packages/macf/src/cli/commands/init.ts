@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync, chmodSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync, chmodSync, copyFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import {
@@ -37,6 +37,15 @@ export interface InitOptions {
   readonly appId?: string;
   readonly installId?: string;
   readonly keyPath?: string;
+  /**
+   * Source path of the downloaded App private key (.pem) to INGEST into the
+   * conventional destination (`--key-path`, default `~/.macf/keys/<agent>.pem`)
+   * with `0600` perms at init time. Closes the macf#530 "pointer set without
+   * the thing it points to" papercut — without ingestion the operator must
+   * hand-`cp` the key and a wrong path/perm surfaces later as a cryptic
+   * `gh` 401, not at init.
+   */
+  readonly appKey?: string;
   readonly registryType?: string;
   readonly registryOrg?: string;
   readonly registryUser?: string;
@@ -202,9 +211,10 @@ function validateInitOpts(opts: InitOptions): void {
   if (opts.installId === undefined || opts.installId === '') {
     throw new Error('installId is required (--install-id; omit only when using --local)');
   }
-  if (opts.keyPath === undefined || opts.keyPath === '') {
-    throw new Error('keyPath is required (--key-path; omit only when using --local)');
-  }
+  // keyPath is OPTIONAL (macf#530): when omitted it defaults to the
+  // conventional ~/.macf/keys/<agent>.pem in initAgent. Only its *shape* is
+  // validated here (when provided), since it embeds in the double-quoted
+  // claude.sh KEY_PATH export.
   if (!/^\d+$/.test(opts.appId)) {
     throw new Error(
       `appId "${opts.appId}" must be numeric (GitHub App IDs are digits only)`,
@@ -217,7 +227,7 @@ function validateInitOpts(opts: InitOptions): void {
   }
   // Shell-dangerous chars inside double-quoted context. `\` escapes in
   // double quotes; include it to avoid any sub-expansion surprise.
-  if (/["$`\\\n\r]/.test(opts.keyPath)) {
+  if (opts.keyPath !== undefined && /["$`\\\n\r]/.test(opts.keyPath)) {
     throw new Error(
       `keyPath "${opts.keyPath}" contains a shell-unsafe character (", $, backtick, backslash, or newline)`,
     );
@@ -235,6 +245,68 @@ function validateInitOpts(opts: InitOptions): void {
  */
 export function defaultLocalRegistryPath(project: string): string {
   return join(homedir(), '.macf', 'registry', `${project}.json`);
+}
+
+/**
+ * Conventional per-agent App-key destination: `~/.macf/keys/<agent>.pem`
+ * (macf#530). Absolute (homedir-rooted) so the token helper resolves it from
+ * any cwd — same cross-repo-cwd discipline as the registry path.
+ */
+export function defaultAgentKeyPath(agentName: string): string {
+  return join(homedir(), '.macf', 'keys', `${agentName}.pem`);
+}
+
+/**
+ * Resolve the destination App-key path and — when `--app-key <src>` is given —
+ * INGEST the downloaded private key to it at `0600`. Fails loud at init time:
+ *
+ *  - `--app-key` pointing at a missing file → throw (operator error, named).
+ *  - key absent at the destination after ingestion (no `--app-key`, none
+ *    pre-placed) → loud, actionable WARNING — not a throw, because the key may
+ *    legitimately be placed out-of-band, but the missing-key state must surface
+ *    HERE rather than as a cryptic `gh` 401 later (the macf#530 silent-fallback:
+ *    a pointer set without the thing it points to).
+ *
+ * Idempotent: an existing key at the destination is preserved, never clobbered
+ * (key rotation is a deliberate op, not an init side effect).
+ *
+ * Returns the path to record in `agent_config.github_app.key_path` (the
+ * conventional `~/.macf/keys/<agent>.pem` unless `--key-path` overrides).
+ */
+function ingestAndResolveKeyPath(opts: InitOptions, agentName: string, absDir: string): string {
+  const keyPathForConfig = opts.keyPath ?? defaultAgentKeyPath(agentName);
+  const destAbs = isAbsolute(keyPathForConfig)
+    ? keyPathForConfig
+    : resolve(absDir, keyPathForConfig);
+
+  if (opts.appKey !== undefined && opts.appKey !== '') {
+    const srcAbs = resolve(opts.appKey);
+    if (!existsSync(srcAbs)) {
+      throw new Error(
+        `--app-key "${opts.appKey}" not found. Download the App private key (.pem) ` +
+          `from the GitHub App settings page and pass its path.`,
+      );
+    }
+    if (existsSync(destAbs)) {
+      console.log(`  Key: ${destAbs} already exists — preserving (not clobbered by --app-key)`);
+    } else {
+      mkdirSync(dirname(destAbs), { recursive: true, mode: 0o700 });
+      copyFileSync(srcAbs, destAbs);
+      chmodSync(destAbs, 0o600);
+      console.log(`  Key: ingested App private key → ${destAbs} (chmod 600)`);
+    }
+  }
+
+  if (!existsSync(destAbs)) {
+    console.warn(
+      `\n  ⚠ App private key not found at ${destAbs}.\n` +
+        `    Pass --app-key <downloaded .pem> to ingest it now, or place the key\n` +
+        `    there yourself: cp <downloaded .pem> ${destAbs} && chmod 600 ${destAbs}\n` +
+        `    Until then GH_TOKEN minting fails — gh / git push will 401.\n`,
+    );
+  }
+
+  return keyPathForConfig;
 }
 
 /**
@@ -331,6 +403,12 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // Resolve version pins (explicit flags > network-fetched latest > fallback)
   const versions = await resolveVersions(opts);
 
+  // Resolve the App-key destination and (when --app-key is given) ingest the
+  // downloaded key there at 0600, failing loud on a missing key (macf#530).
+  // Local-registry mode mints no token, so it has no key.
+  const githubKeyPath =
+    regType === 'local' ? undefined : ingestAndResolveKeyPath(opts, agentName, absDir);
+
   // Write agent config. `github_app` is omitted in local-registry mode
   // (DR-024) — the launcher does not mint a token, and the schema marks
   // the field optional to encode that conditional shape.
@@ -346,7 +424,7 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
           github_app: {
             app_id: opts.appId!,
             install_id: opts.installId!,
-            key_path: opts.keyPath!,
+            key_path: githubKeyPath!,
           },
         }),
     ...(opts.advertiseHost !== undefined ? { advertise_host: opts.advertiseHost } : {}),
