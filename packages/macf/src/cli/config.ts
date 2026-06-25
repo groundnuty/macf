@@ -129,6 +129,15 @@ export const MacfAgentConfigSchema = z.object({
   project: z.string(),
   agent_name: z.string(),
   agent_role: z.string(),
+  // macf#545: the ROUTING identity — registry key + cert CN. Distinct from
+  // `agent_name` (the OTEL bot-name / GitHub-attribution identity). An identity
+  // is ROUTING iff a peer or the router uses it to ADDRESS or AUTHENTICATE the
+  // agent against the registry slot (registry key, cert CN, /health, A2A card
+  // name); it is TELEMETRY/ATTRIBUTION iff it merely describes who acted (OTEL,
+  // metrics, display) → those stay `agent_name`. Optional; consumers default to
+  // `agent_name` (back-compat: inert unless the substrate sets a label that
+  // differs from its bot-name, e.g. devops-agent vs macf-devops-agent).
+  routing_label: z.string().optional(),
   agent_type: z.enum(['permanent', 'worker']),
   // Registry union comes from registry/types.ts as the single source
   // of truth — previously inlined here with looser constraints (no
