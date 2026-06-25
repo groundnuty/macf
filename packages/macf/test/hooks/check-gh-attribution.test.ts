@@ -19,7 +19,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
@@ -64,6 +64,18 @@ exit 1
   const ghPath = join(dir, 'gh');
   writeFileSync(ghPath, stubScript);
   chmodSync(ghPath, 0o755);
+  return dir;
+}
+
+/**
+ * Build a temp workspace with `.macf/macf-agent.json` carrying the given
+ * fields, for the hook's `${CLAUDE_PROJECT_DIR}/.macf/macf-agent.json` read.
+ * Returns the dir (pass as CLAUDE_PROJECT_DIR). macf#535.
+ */
+function makeAgentWorkspace(agentJson: Record<string, unknown>): string {
+  const dir = mkdtempSync(join(tmpdir(), 'macf-attr-ws-'));
+  mkdirSync(join(dir, '.macf'), { recursive: true });
+  writeFileSync(join(dir, '.macf', 'macf-agent.json'), JSON.stringify(agentJson));
   return dir;
 }
 
@@ -268,6 +280,85 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
         stubGh: 'fail',
       });
       expect(r.status).toBe(0);
+    });
+  });
+
+  // macf#535: agent_name is NOT always the App slug. The hook must not hard-trap
+  // a Bot author merely because it differs from the agent_name-derived guess.
+  describe('(i) agent_name guess != actual Bot → exit 0 (macf#535)', () => {
+    it('allows the auditor (agent_name "auditor", App slug macf-auditor-agent)', () => {
+      const ws = makeAgentWorkspace({ agent_name: 'auditor', agent_role: 'auditor' });
+      try {
+        const r = runHook({
+          command: 'gh issue comment 1 --repo groundnuty/macf-auditor-agent --body "x"',
+          output: `${COMMENT_URL}\n`,
+          stubGh: { login: 'macf-auditor-agent[bot]', type: 'Bot' },
+          env: { CLAUDE_PROJECT_DIR: ws },
+        });
+        expect(r.status).toBe(0);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('(j) github_app.bot_login (authoritative) matches → exit 0', () => {
+    it('allows when the actual login matches the config bot_login', () => {
+      const ws = makeAgentWorkspace({
+        agent_name: 'auditor',
+        github_app: { app_id: '1', install_id: '2', key_path: 'k.pem', bot_login: 'macf-auditor-agent[bot]' },
+      });
+      try {
+        const r = runHook({
+          command: 'gh issue create --repo groundnuty/macf-auditor-agent --title x --body y',
+          output: `${ISSUE_URL}\n`,
+          stubGh: { login: 'macf-auditor-agent[bot]', type: 'Bot' },
+          env: { CLAUDE_PROJECT_DIR: ws },
+        });
+        expect(r.status).toBe(0);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('(k) github_app.bot_login (authoritative) + different Bot → exit 2', () => {
+    it('warns when a different bot wrote it despite a config bot_login', () => {
+      const ws = makeAgentWorkspace({
+        agent_name: 'auditor',
+        github_app: { app_id: '1', install_id: '2', key_path: 'k.pem', bot_login: 'macf-auditor-agent[bot]' },
+      });
+      try {
+        const r = runHook({
+          command: 'gh issue create --repo groundnuty/macf-auditor-agent --title x --body y',
+          output: `${ISSUE_URL}\n`,
+          stubGh: { login: 'some-other-agent[bot]', type: 'Bot' },
+          env: { CLAUDE_PROJECT_DIR: ws },
+        });
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('some-other-agent[bot]');
+        expect(r.stderr).toContain('macf-auditor-agent[bot]');
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('(l) agent_name guess != actual User → exit 2 (Instance-12 still caught)', () => {
+    it('traps a user-authored write even when only an agent_name guess exists', () => {
+      const ws = makeAgentWorkspace({ agent_name: 'auditor', agent_role: 'auditor' });
+      try {
+        const r = runHook({
+          command: 'gh issue create --repo groundnuty/macf-auditor-agent --title x --body y',
+          output: `${ISSUE_URL}\n`,
+          stubGh: { login: 'orzech', type: 'User' },
+          env: { CLAUDE_PROJECT_DIR: ws },
+        });
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('orzech');
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
     });
   });
 });
