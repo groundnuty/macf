@@ -61,7 +61,7 @@ Stage-2 also carries a known fragility this migration retires: the Remote-Contro
 
 ## Scope
 
-**IN:** the routing transport of the 4 MACF-project agent homes (auditor + science/code/devops), canary-sequenced; registry-as-org-Variables; the channel-server / mTLS-cert / `MACF_ROUTING` infra.
+**IN:** the routing transport of the 4 MACF-project agent homes (auditor + science/code/devops), canary-sequenced; registry-as-repo-Variables; the channel-server / mTLS-cert / `MACF_ROUTING` infra.
 
 **OUT / deferred:** A2A peer-protocol enablement (until a validated use case); removing Stage-2 (until the 2-month bake passes); the self-hosted runner (`macf-devops-toolkit#90` — separate low-priority workstream; becomes v3-relevant once an agent is on channels); consumer fleets (CV already on v3).
 
