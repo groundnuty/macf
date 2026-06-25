@@ -530,8 +530,13 @@ async function main(): Promise<void> {
   // (P1 above), so a version-aware takeover (groundnuty/macf#424) only fires
   // for an instance that can actually serve — a crash-on-boot newer instance
   // never reaches here to strand the slot.
+  // macf#538: the registry KEY (collision lookup + register + remove) uses the
+  // routing-label (defaults to agentName, so inert for existing agents), NOT
+  // the OTEL bot-name. Telemetry/metrics/display below stay on agentName — only
+  // the registry IDENTITY moves. (Peer-facing identities — health, A2A card,
+  // cert CN — must agree with the key; tracked as the macf#538 follow-up.)
   const collisionResult = await checkCollision(
-    config.agentName,
+    config.routingLabel,
     registry,
     {
       caCertPath: config.caCertPath,
@@ -545,7 +550,7 @@ async function main(): Promise<void> {
   if (collisionResult.action === 'abort') {
     await httpsServer.stop();
     throw new CollisionError(
-      config.agentName,
+      config.routingLabel,
       collisionResult.existing.host,
       collisionResult.existing.port,
     );
@@ -569,31 +574,31 @@ async function main(): Promise<void> {
   const expectedSlot =
     collisionResult.action === 'takeover' ? collisionResult.previous : null;
   const registerResult = await registry.registerConditional(
-    config.agentName,
+    config.routingLabel,
     agentInfo,
     expectedSlot,
   );
   if (!registerResult.ok) {
     logger.warn('register_race_lost', {
-      agent: config.agentName,
+      agent: config.routingLabel,
       expected_instance: expectedSlot?.instance_id ?? null,
       current_instance: registerResult.current?.instance_id ?? null,
       current_host: registerResult.current?.host ?? null,
       current_port: registerResult.current?.port ?? null,
     });
     await httpsServer.stop();
-    throw new RegisterRaceError(config.agentName, registerResult.current);
+    throw new RegisterRaceError(config.routingLabel, registerResult.current);
   }
   logger.info('registered', {
-    agent: config.agentName,
+    agent: config.routingLabel,
     host: config.advertiseHost,
     port: actualPort,
     instance_id: config.instanceId,
   });
 
-  // P2: Register shutdown handler
+  // P2: Register shutdown handler (deregisters the registry slot → routingLabel)
   registerShutdownHandler({
-    agentName: config.agentName,
+    agentName: config.routingLabel,
     registry,
     httpsServer,
     logger,

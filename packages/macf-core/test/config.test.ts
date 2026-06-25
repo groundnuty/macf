@@ -41,6 +41,23 @@ describe('loadConfig', () => {
     expect(config.logPath).toBeUndefined();
   });
 
+  // macf#538: routing identity (registry key + CN) split from the OTEL bot-name.
+  it('defaults routingLabel to agentName when MACF_ROUTING_LABEL is unset (back-compat)', () => {
+    setMinimalEnv();
+    const config = loadConfig();
+    expect(config.routingLabel).toBe('test-agent');
+    expect(config.routingLabel).toBe(config.agentName);
+  });
+
+  it('reads MACF_ROUTING_LABEL as the routing identity, distinct from agentName', () => {
+    setMinimalEnv();
+    process.env['MACF_AGENT_NAME'] = 'macf-devops-agent'; // OTEL bot-name
+    process.env['MACF_ROUTING_LABEL'] = 'devops-agent'; // registry key / CN
+    const config = loadConfig();
+    expect(config.agentName).toBe('macf-devops-agent');
+    expect(config.routingLabel).toBe('devops-agent');
+  });
+
   it('loads full config from env', () => {
     setMinimalEnv();
     process.env['MACF_PORT'] = '8847';

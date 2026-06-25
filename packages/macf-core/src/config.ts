@@ -22,6 +22,13 @@ function requireFilePath(name: string): string {
 
 export function loadConfig(): AgentConfig {
   const agentName = requireEnv('MACF_AGENT_NAME');
+  // macf#538: the routing IDENTITY (registry key + cert CN) is distinct from the
+  // OTEL bot-name. `MACF_AGENT_NAME` is the bot-name (e.g. `macf-devops-agent`,
+  // used for OTEL `gen_ai.agent.name`); `MACF_ROUTING_LABEL` is the registry-key
+  // / CN (e.g. `devops-agent`). They differ on the substrate; they coincide on
+  // greenfield agents (auditor) where name == label. Defaults to agentName so
+  // every existing agent is unchanged (back-compat: inert until set).
+  const routingLabel = process.env['MACF_ROUTING_LABEL'] || agentName;
   const caCertPath = requireFilePath('MACF_CA_CERT');
   const caKeyPath = resolveCaKeyPath(caCertPath);
   const agentCertPath = requireFilePath('MACF_AGENT_CERT');
@@ -65,6 +72,7 @@ export function loadConfig(): AgentConfig {
 
   return {
     agentName,
+    routingLabel,
     agentType,
     agentRole,
     host,
