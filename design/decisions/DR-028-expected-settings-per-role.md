@@ -1,7 +1,8 @@
 # DR-028: Canonical expected-`settings.json`-per-role + the settings validator/scaffolder
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-25
+**Ratified:** 2026-06-25 by the operator (the constitutional gate — directed in-session). Ratification (a) accepts the decision; (b) **releases the code-agent build** — one `ROLE_SETTINGS_MODEL` (universal floor + per-role deltas + the channel-server-loader-per-role addendum, Decision 4) consumed by **both** `macf init` (emit) and `macf doctor --fix` (validate/repair on operator consent, never silent) — fixing the originating no-usable-perms bug + closing the memory-edit prompt fleet-wide. Follow-ons stay tracked: DR-029 (graduate-up) + the launcher drift-check are science's; the auditor's `bot_login` (`macf#535`) auto-population lands as part of this build.
 **Trigger:** `groundnuty/macf#533` (the 2026-06-25 onboarding-UX pass, after `macf#530`). Standing up `macf-auditor-agent` as a **pure-`macf init`** agent (no `agentic-repo-template`) exposed that **`macf init` ships no usable Bash/edit permission set**: its `permissions.allow` is built as `[...preserved, ...PLUGIN_SKILL_PERMISSIONS, ...PLUGIN_MCP_TOOL_PERMISSIONS]` (`settings-writer.ts:710`) — only `Skill(...)` + `mcp__plugin…` entries, **no `Bash(*)`/`Read`/`Write`/`Edit`/`Glob`/`Grep`/`Agent`, no `deny` floor, no role-aware hooks**. So a freshly-init'd agent prompts on *every* command. The three substrate agents (code/science/devops) don't hit this only because their `settings.json` was **hand-wired** — and even they prompt on memory edits (code/science have no `Write`/`Edit` in `allow`).
 
 ## Context
