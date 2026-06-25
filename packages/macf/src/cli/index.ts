@@ -290,10 +290,12 @@ program
 
 program
   .command('doctor')
-  .description('Verify the workspace\'s bot token satisfies the MACF App permission doctrine (DR-019)')
+  .description('Verify the workspace\'s bot token (DR-019) + settings match the role-aware floor (DR-028)')
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .option('--fix', 'Write the DR-028 role-settings floor (allow/deny/hooks) + sandbox entries into .claude/settings.json after confirmation', false)
+  .option('--yes', 'Skip the --fix confirmation prompt (non-interactive)', false)
   .action(async (opts) => {
-    const code = await runDoctor(resolveProjectDir(opts.dir));
+    const code = await runDoctor(resolveProjectDir(opts.dir), { fix: opts.fix, yes: opts.yes });
     process.exitCode = code;
   });
 

@@ -484,6 +484,36 @@ export function getPermissionsDeny(workspaceDir: string): readonly string[] {
 }
 
 /**
+ * Read the workspace-effective set of hook command strings — the union of
+ * `.claude/settings.json` + `.claude/settings.local.json` across EVERY hook
+ * event (PreToolUse / PostToolUse / UserPromptSubmit / PreCompact / …). The
+ * order-/event-agnostic command list is what `macf doctor` (DR-028) validates
+ * against the role model: the model identifies a wired hook by its command
+ * string (the same identity `installGhTokenHook` writes), not by which event
+ * array it lives in, so a flat deduped command set is the right comparison
+ * surface. Throws on malformed JSON in either file (via `readSettings`).
+ */
+export function getHookCommands(workspaceDir: string): readonly string[] {
+  const absDir = resolve(workspaceDir);
+  const claudeDir = join(absDir, '.claude');
+  const commands: string[] = [];
+  for (const file of ['settings.json', 'settings.local.json'] as const) {
+    const settings = readSettings(join(claudeDir, file));
+    const hooks = settings.hooks ?? {};
+    for (const event of Object.keys(hooks)) {
+      const entries = hooks[event];
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        for (const h of entry.hooks ?? []) {
+          if (typeof h.command === 'string') commands.push(h.command);
+        }
+      }
+    }
+  }
+  return Array.from(new Set(commands));
+}
+
+/**
  * Legacy MACF-managed patterns that earlier CLI versions wrote to
  * `allowRead`. Dropped from the array before installing the current
  * `SANDBOX_FD_READ_PATTERN` — the `/**` glob suffix was treated

@@ -15,13 +15,24 @@
  * for the attribution-trap class this prevents).
  */
 import { execFileSync } from 'node:child_process';
+import { createInterface } from 'node:readline';
 import { readAgentConfig, tokenSourceFromConfig } from '../config.js';
 import {
+  getHookCommands,
   getPermissionsAllow,
   getPermissionsDeny,
   getSandboxAllowRead,
+  installGhTokenHook,
+  installPluginSkillPermissions,
+  installSandboxExcludedCommands,
+  installSandboxFdAllowRead,
   SANDBOX_FD_READ_PATTERN,
 } from '../settings-writer.js';
+import {
+  expectedAllowForRole,
+  expectedHooksForRole,
+  ROLE_FLOOR_DENY,
+} from '../role-settings-model.js';
 
 /**
  * One required permission entry from DR-019.
@@ -388,97 +399,373 @@ export async function fetchInstallationPermissions(
 }
 
 /**
- * Main entry for `macf doctor`. Returns the shell exit code: 0 if all
- * required permissions are present, 1 if any are missing or insufficient.
+ * One finding from the DR-028 role-settings check.
+ *
+ * `severity`:
+ *   - `ERROR` — a model-`required` item is absent. Today this is exactly the
+ *     auditor's `check-auditor-never-acts.sh` hook (DR-026 F1): its absence is
+ *     a missing structural safety invariant, not cosmetic drift, so it
+ *     influences the doctor exit code (see `runDoctor`).
+ *   - `WARN` — a recommended floor item (allow/deny/hook) is absent. Drift the
+ *     operator can `--fix` or `macf update`; does NOT affect the exit code,
+ *     matching the macf#296 permissions-allow check's warn-only discipline.
  */
-export async function runDoctor(projectDir: string): Promise<number> {
+export interface RoleSettingFinding {
+  readonly category: 'allow' | 'deny' | 'hook';
+  /** The expected entry — an allow/deny pattern or a hook command string. */
+  readonly item: string;
+  readonly severity: 'ERROR' | 'WARN';
+  readonly message: string;
+}
+
+/**
+ * Result of the DR-028 role-settings check (`checkRoleSettings`). `findings`
+ * lists one entry per absent floor/role item; `status` summarises across them —
+ * `ERROR` if any required item is missing, `WARN` if any recommended item is,
+ * `PASS` otherwise. `readError` is set when settings JSON was malformed (then
+ * `findings` is empty and `status` is `WARN`, mirroring `checkPermissionsAllow`).
+ */
+export interface RoleSettingsCheckResult {
+  readonly status: 'PASS' | 'WARN' | 'ERROR';
+  readonly role: string;
+  readonly findings: readonly RoleSettingFinding[];
+  readonly readError?: string;
+}
+
+/**
+ * Does `allow` grant the expected floor entry? `Bash(*)` (or any `Bash(...)`
+ * form) is satisfied by ANY broad Bash grant — DR-028 doctrine is that narrow
+ * `Bash(...)` patterns are defeated by `$GH_TOKEN`/`$MACF_WORKSPACE_DIR`
+ * expansion, so a workspace carrying bare `Bash` or `Bash(*)` satisfies the
+ * floor's Bash need. Bare tool names (`Read`, `Write`, …) accept the bare or
+ * `(*)` glob form via `isToolFullyAllowed`. Other patterned entries (e.g. a
+ * role-delta MCP allow string) require an exact match.
+ */
+function allowSatisfies(allow: readonly string[], expected: string): boolean {
+  if (expected === 'Bash' || expected.startsWith('Bash(')) {
+    return isToolFullyAllowed(allow, 'Bash');
+  }
+  if (!expected.includes('(')) {
+    return isToolFullyAllowed(allow, expected);
+  }
+  return allow.includes(expected);
+}
+
+function allowFindings(allow: readonly string[], role: string): RoleSettingFinding[] {
+  const findings: RoleSettingFinding[] = [];
+  for (const expected of expectedAllowForRole(role)) {
+    if (!allowSatisfies(allow, expected)) {
+      findings.push({
+        category: 'allow',
+        item: expected,
+        severity: 'WARN',
+        message: `floor allow entry "${expected}" absent from permissions.allow`,
+      });
+    }
+  }
+  return findings;
+}
+
+function denyFindings(deny: readonly string[]): RoleSettingFinding[] {
+  const findings: RoleSettingFinding[] = [];
+  for (const entry of ROLE_FLOOR_DENY) {
+    if (!deny.includes(entry)) {
+      findings.push({
+        category: 'deny',
+        item: entry,
+        severity: 'WARN',
+        message: `floor deny entry "${entry}" absent from permissions.deny`,
+      });
+    }
+  }
+  return findings;
+}
+
+function hookFindings(commands: readonly string[], role: string): RoleSettingFinding[] {
+  const findings: RoleSettingFinding[] = [];
+  for (const hook of expectedHooksForRole(role)) {
+    if (commands.includes(hook.command)) continue;
+    const where = `${hook.event}${hook.matcher ? ` / ${hook.matcher}` : ''}`;
+    findings.push({
+      category: 'hook',
+      item: hook.command,
+      severity: hook.required ? 'ERROR' : 'WARN',
+      message: `${hook.required ? 'REQUIRED hook' : 'hook'} (${where}) not wired in settings`,
+    });
+  }
+  return findings;
+}
+
+/**
+ * DR-028 increment 2: validate `.claude/settings.json` (merged with
+ * settings.local.json) against the role-aware expected-settings model for
+ * `role`. Compares the effective allow/deny/hooks to `expectedAllowForRole` +
+ * `ROLE_FLOOR_DENY` + `expectedHooksForRole`. A missing model-`required` hook
+ * (the auditor's never-acts hook) is an `ERROR`; everything else is `WARN`
+ * drift. Robust to malformed settings (try/catch → `readError`), like
+ * `checkPermissionsAllow`.
+ */
+export function checkRoleSettings(workspaceDir: string, role: string): RoleSettingsCheckResult {
+  let allow: readonly string[];
+  let deny: readonly string[];
+  let commands: readonly string[];
+  try {
+    allow = getPermissionsAllow(workspaceDir);
+    deny = getPermissionsDeny(workspaceDir);
+    commands = getHookCommands(workspaceDir);
+  } catch (err) {
+    return {
+      status: 'WARN',
+      role,
+      findings: [],
+      readError: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  const findings: RoleSettingFinding[] = [
+    ...allowFindings(allow, role),
+    ...denyFindings(deny),
+    ...hookFindings(commands, role),
+  ];
+
+  const status: RoleSettingsCheckResult['status'] =
+    findings.some((f) => f.severity === 'ERROR') ? 'ERROR'
+    : findings.length > 0 ? 'WARN'
+    : 'PASS';
+  return { status, role, findings };
+}
+
+/**
+ * Infer the workspace's role from `macf-agent.json` (`agent_role`). Returns
+ * `null` when indeterminable (no config / no role) — the doctor then WARNs and
+ * skips role-settings validation rather than guessing a role.
+ */
+export function inferRole(workspaceDir: string): string | null {
+  return readAgentConfig(workspaceDir)?.agent_role ?? null;
+}
+
+/** Prompt the operator for a y/N confirmation on stdin. Default = No. */
+function promptYesNo(question: string): Promise<boolean> {
+  return new Promise((resolveAnswer) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(`${question} [y/N] `, (answer) => {
+      rl.close();
+      resolveAnswer(/^y(es)?$/i.test(answer.trim()));
+    });
+  });
+}
+
+/** Print the DR-028 "Role settings" report section for the given check. */
+function printRoleSettingsSection(role: string | null, check: RoleSettingsCheckResult | null): void {
+  console.log('');
+  console.log('Role settings (DR-028)');
+  console.log('──────────────────────────────────────────────────────────────');
+  if (!role || !check) {
+    console.log('  ⚠ role indeterminable — skipping role-settings validation');
+    console.log('    (no macf-agent.json / no agent_role; run `macf init` first)');
+    return;
+  }
+  if (check.readError) {
+    console.log(`  ⚠ could not parse .claude/settings.json: ${check.readError}`);
+    return;
+  }
+  if (check.status === 'PASS') {
+    console.log(`  ✓ role "${role}" settings match the DR-028 floor + role deltas  [PASS]`);
+    return;
+  }
+  const errors = check.findings.filter((f) => f.severity === 'ERROR');
+  const warns = check.findings.filter((f) => f.severity === 'WARN');
+  const symbol = check.status === 'ERROR' ? '✗' : '⚠';
+  console.log(
+    `  ${symbol} role "${role}": ${errors.length} error(s), ${warns.length} drift item(s)  [${check.status}]`,
+  );
+  for (const f of check.findings) {
+    const fs = f.severity === 'ERROR' ? '✗' : '⚠';
+    console.log(`    ${fs} [${f.category}] ${f.message}`);
+  }
+  console.log('    Fix: run `macf doctor --fix` (writes the floor after confirmation) or `macf update`.');
+}
+
+/** Options for `runDoctor`. */
+export interface RunDoctorOptions {
+  /** Write the DR-028 floor (allow/deny/hooks) + sandbox entries after consent. */
+  readonly fix?: boolean;
+  /** Skip the `--fix` confirmation prompt (non-interactive). */
+  readonly yes?: boolean;
+}
+
+/**
+ * Main entry for `macf doctor`. Prints the DR-019 token report, the sandbox-fd
+ * + macf#296 permissions checks, and the DR-028 role-settings report; returns
+ * the shell exit code.
+ *
+ * Exit-code discipline:
+ *   - DR-019 missing/insufficient permission → 1 (unchanged).
+ *   - Sandbox fd FAIL → 1 (unchanged).
+ *   - DR-028 role-settings ERROR (auditor never-acts hook absent) → 1. This is
+ *     a missing structural safety invariant, treated like a missing required
+ *     permission. Plain WARN drift (allow/deny/hook gaps) does NOT affect the
+ *     exit code — same warn-only posture as the macf#296 permissions check.
+ *   - A failed/unreachable DR-019 token check is non-fatal to the rest of the
+ *     report (so `--fix` of the local settings floor still runs offline) but
+ *     still contributes 1 to the exit code.
+ */
+export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Promise<number> {
   const config = readAgentConfig(projectDir);
   if (!config) {
     console.error('No macf-agent.json found. Run `macf init` first.');
     return 1;
   }
 
-  const source = tokenSourceFromConfig(projectDir, config);
-  let permissions: Record<string, string>;
-  try {
-    permissions = await fetchInstallationPermissions(
-      source.appId, source.installId, source.keyPath,
-    );
-  } catch (err) {
-    console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
-    return 1;
+  // DR-019 token/permission check. Local-registry mode (DR-024) has no App, so
+  // there's nothing to mint — skip it. A network/token failure is recorded but
+  // non-fatal so the local-settings sections (+ `--fix`) still run offline.
+  let permissions: Record<string, string> | null = null;
+  let tokenError: string | null = null;
+  let tokenSkipped = false;
+  if (config.registry.type === 'local') {
+    tokenSkipped = true;
+  } else {
+    try {
+      const source = tokenSourceFromConfig(projectDir, config);
+      permissions = await fetchInstallationPermissions(
+        source.appId, source.installId, source.keyPath,
+      );
+    } catch (err) {
+      tokenError = err instanceof Error ? err.message : String(err);
+    }
   }
-
-  const finding = diffPermissions(permissions);
 
   console.log('MACF doctor report');
   console.log('──────────────────────────────────────────────────────────────');
-  for (const req of MACF_REQUIRED_PERMISSIONS) {
-    console.log(`  ${formatPermissionRow(req, permissions[req.name])}`);
-  }
-  console.log('');
-
-  const totalRequired = MACF_REQUIRED_PERMISSIONS.length;
-  const satisfied = totalRequired - finding.missing.length - finding.insufficient.length;
-  const status = finding.missing.length === 0 && finding.insufficient.length === 0
-    ? '✓ all required permissions present'
-    : `✗ ${finding.missing.length + finding.insufficient.length} of ${totalRequired} required permissions missing or insufficient`;
-  console.log(`  ${status} (${satisfied}/${totalRequired} satisfied)`);
-
-  if (finding.missing.length > 0) {
-    console.log('');
-    console.log('Missing:');
-    for (const req of finding.missing) {
-      console.log(`  - ${req.name}: ${req.level} — ${req.why}`);
+  let permissionsFailed = false;
+  if (tokenSkipped) {
+    console.log('  ℹ local-registry mode (DR-024) — no GitHub App; DR-019 token check skipped.');
+  } else if (tokenError || !permissions) {
+    permissionsFailed = true;
+    console.error(`  ✗ DR-019 token check failed: ${tokenError ?? 'unknown error'}`);
+    console.error('    See coordination.md Token & Git Hygiene for diagnostics.');
+  } else {
+    const finding = diffPermissions(permissions);
+    for (const req of MACF_REQUIRED_PERMISSIONS) {
+      console.log(`  ${formatPermissionRow(req, permissions[req.name])}`);
     }
-  }
-  if (finding.insufficient.length > 0) {
     console.log('');
-    console.log('Insufficient:');
-    for (const { required, actual } of finding.insufficient) {
-      console.log(`  - ${required.name}: have ${actual}, need ${required.level} — ${required.why}`);
-    }
-  }
 
-  if (finding.missing.length > 0 || finding.insufficient.length > 0) {
-    console.log('');
-    console.log('See design/decisions/DR-019-app-permissions.md for the full doctrine,');
-    console.log('and GitHub → Settings → Developer settings → GitHub Apps → <your App> → Permissions');
-    console.log('to update the App. Users with the App installed must accept the new permissions.');
+    const totalRequired = MACF_REQUIRED_PERMISSIONS.length;
+    const satisfied = totalRequired - finding.missing.length - finding.insufficient.length;
+    const status = finding.missing.length === 0 && finding.insufficient.length === 0
+      ? '✓ all required permissions present'
+      : `✗ ${finding.missing.length + finding.insufficient.length} of ${totalRequired} required permissions missing or insufficient`;
+    console.log(`  ${status} (${satisfied}/${totalRequired} satisfied)`);
+
+    if (finding.missing.length > 0) {
+      console.log('');
+      console.log('Missing:');
+      for (const req of finding.missing) {
+        console.log(`  - ${req.name}: ${req.level} — ${req.why}`);
+      }
+    }
+    if (finding.insufficient.length > 0) {
+      console.log('');
+      console.log('Insufficient:');
+      for (const { required, actual } of finding.insufficient) {
+        console.log(`  - ${required.name}: have ${actual}, need ${required.level} — ${required.why}`);
+      }
+    }
+    if (finding.missing.length > 0 || finding.insufficient.length > 0) {
+      console.log('');
+      console.log('See design/decisions/DR-019-app-permissions.md for the full doctrine,');
+      console.log('and GitHub → Settings → Developer settings → GitHub Apps → <your App> → Permissions');
+      console.log('to update the App. Users with the App installed must accept the new permissions.');
+      permissionsFailed = true;
+    }
   }
 
   console.log('');
   console.log('Sandbox filesystem (macf#200)');
   console.log('──────────────────────────────────────────────────────────────');
-  const sandboxCheck = checkSandboxFdAllowRead(projectDir);
-  if (sandboxCheck.status === 'PASS') {
-    console.log(`  ✓ sandbox.filesystem.allowRead contains ${SANDBOX_FD_READ_PATTERN}  [PASS]`);
-  } else {
-    console.log(`  ✗ sandbox.filesystem.allowRead missing ${SANDBOX_FD_READ_PATTERN}   [FAIL — run \`macf update\` to fix]`);
-    if (sandboxCheck.detail) console.log(`    ${sandboxCheck.detail}`);
-  }
+  let sandboxCheck = checkSandboxFdAllowRead(projectDir);
+  printSandboxSection(sandboxCheck);
 
   console.log('');
   console.log('Workspace permissions (macf#296)');
   console.log('──────────────────────────────────────────────────────────────');
-  const permsCheck = checkPermissionsAllow(projectDir);
-  if (permsCheck.readError) {
-    console.log(`  ⚠ could not parse .claude/settings.json: ${permsCheck.readError}`);
-  } else if (permsCheck.status === 'PASS') {
+  let permsCheck = checkPermissionsAllow(projectDir);
+  printPermissionsAllowSection(permsCheck);
+
+  const role = inferRole(projectDir);
+  let roleCheck = role ? checkRoleSettings(projectDir, role) : null;
+  printRoleSettingsSection(role, roleCheck);
+
+  // --fix: the existing install emitters ARE the fix (DR-028) — they write the
+  // floor merge-preservingly. Detect drift read-only above, then (on consent)
+  // call them + re-run the checks. NEVER write without consent.
+  if (opts?.fix) {
+    const needsFix =
+      (roleCheck !== null && roleCheck.status !== 'PASS') ||
+      sandboxCheck.status === 'FAIL' ||
+      permsCheck.status === 'WARN';
+    if (!needsFix) {
+      console.log('');
+      console.log('--fix: nothing to fix — settings already satisfy the floor.');
+    } else {
+      console.log('');
+      console.log('--fix will write the DR-028 floor into .claude/settings.json:');
+      console.log('  - permissions.allow/deny floor (installPluginSkillPermissions)');
+      console.log('  - PreToolUse/PostToolUse/UserPromptSubmit/PreCompact hooks (installGhTokenHook)');
+      console.log('  - sandbox.filesystem.allowRead + sandbox.excludedCommands');
+      console.log('  Existing operator-authored entries are preserved (merge, dedup).');
+      const consent = opts.yes ? true : await promptYesNo('Proceed?');
+      if (!consent) {
+        console.log('Aborted — no changes written.');
+      } else {
+        installPluginSkillPermissions(projectDir);
+        installGhTokenHook(projectDir);
+        installSandboxFdAllowRead(projectDir);
+        installSandboxExcludedCommands(projectDir);
+        sandboxCheck = checkSandboxFdAllowRead(projectDir);
+        permsCheck = checkPermissionsAllow(projectDir);
+        roleCheck = role ? checkRoleSettings(projectDir, role) : null;
+        console.log('');
+        console.log('--fix applied. Re-check:');
+        printSandboxSection(sandboxCheck);
+        printPermissionsAllowSection(permsCheck);
+        printRoleSettingsSection(role, roleCheck);
+      }
+    }
+  }
+
+  const sandboxFailed = sandboxCheck.status === 'FAIL';
+  const roleErrored = roleCheck?.status === 'ERROR';
+  return permissionsFailed || sandboxFailed || roleErrored ? 1 : 0;
+}
+
+/** Print the macf#200 sandbox-fd report line(s) for `check`. */
+function printSandboxSection(check: SandboxFdCheck): void {
+  if (check.status === 'PASS') {
+    console.log(`  ✓ sandbox.filesystem.allowRead contains ${SANDBOX_FD_READ_PATTERN}  [PASS]`);
+  } else {
+    console.log(`  ✗ sandbox.filesystem.allowRead missing ${SANDBOX_FD_READ_PATTERN}   [FAIL — run \`macf update\` to fix]`);
+    if (check.detail) console.log(`    ${check.detail}`);
+  }
+}
+
+/** Print the macf#296 permissions-allow report line(s) for `check`. */
+function printPermissionsAllowSection(check: PermissionsAllowCheckResult): void {
+  if (check.readError) {
+    console.log(`  ⚠ could not parse .claude/settings.json: ${check.readError}`);
+  } else if (check.status === 'PASS') {
     console.log(`  ✓ permissions.allow grants Write + Edit (autonomous coordination unblocked)  [PASS]`);
   } else {
-    const summary = permsCheck.status === 'INFO'
-      ? `ℹ ${permsCheck.findings.length} autonomy-required tool(s) absent (deny rules present — likely deliberate)  [INFO]`
-      : `⚠ ${permsCheck.findings.length} autonomy-required tool(s) absent or scoped  [WARN]`;
+    const summary = check.status === 'INFO'
+      ? `ℹ ${check.findings.length} autonomy-required tool(s) absent (deny rules present — likely deliberate)  [INFO]`
+      : `⚠ ${check.findings.length} autonomy-required tool(s) absent or scoped  [WARN]`;
     console.log(`  ${summary}`);
-    for (const f of permsCheck.findings) {
+    for (const f of check.findings) {
       const symbol = f.severity === 'BLOCK' ? '✗' : (f.severity === 'WARN' ? '⚠' : 'ℹ');
       console.log(`    ${symbol} ${f.tool}: ${f.message}`);
       console.log(`      Fix: ${f.remediation}`);
     }
   }
-
-  const permissionsFailed = finding.missing.length > 0 || finding.insufficient.length > 0;
-  const sandboxFailed = sandboxCheck.status === 'FAIL';
-  return permissionsFailed || sandboxFailed ? 1 : 0;
 }
