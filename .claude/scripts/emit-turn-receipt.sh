@@ -43,7 +43,7 @@ MARKERS="$(printf '%s' "$PROMPT" | grep -oE '\[macf-route:[0-9]+:[a-z0-9-]+\]' |
 command -v curl >/dev/null 2>&1 || exit 0
 command -v openssl >/dev/null 2>&1 || exit 0
 
-BASE="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://127.0.0.1:14318}"
+BASE="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://orzech-dev-agents-monitoring.tail491af.ts.net:4318}"
 BASE="${BASE%/v1/traces}"
 
 # One independent span per distinct marker (own trace/span id + timestamp).
