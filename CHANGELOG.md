@@ -9,6 +9,51 @@ Plugin + routing-workflow changes ship from separate repos
 [`groundnuty/macf-actions`](https://github.com/groundnuty/macf-actions))
 and are not included here — pin them explicitly in each workspace.
 
+## [0.2.37] — 2026-06-25
+
+The **DR-026 auditor** foundational + policy slices land, plus the
+structural-enforcement hook set, the DR-025 comms-ledger, and the
+observability-endpoint migration to the monitoring VM. Coordinated with
+marketplace plugin **v0.2.37** — which ships the new `auditor` agent template
+and the `check-auditor-never-acts.sh` hook. Run `macf update --all` to pick up
+both.
+
+### feat
+
+- **Auditor (DR-026), foundational slice F1–F4.** `check-auditor-never-acts.sh`
+  PreToolUse hook structurally blocks merge/close/push when
+  `MACF_AGENT_ROLE=auditor` (#507); PreCompact reflection-harvest hook +
+  `macf-core` reflection schema (#508); project-tier rule distribution
+  (`.claude/rules/project/` + `MACF_PROJECT_RULES_SOURCE`) wired into
+  `init`/`update` (#509); read-only **`macf monitor`** protocol-health digest +
+  `digest-to-operator` (#510).
+- **Auditor (DR-026), policy slice G1–G2.** **`macf propose`** — the
+  Analyze→Plan membrane with the N>1-distinct-agent generalization gate,
+  dry-run-by-default, and protected-invariant surfacing (#513); structured-norm
+  (Moisé) representation + deontic conflict-checker + the 10 protected-invariants
+  in `macf-core` (#521).
+- **Structural-enforcement hooks.** The full PreToolUse hook set wired into the
+  substrate (#488); a result-invariant PostToolUse `check-gh-attribution.sh`
+  catching silent-fallback Instance 12 (#491), codified (#490) + wired (#493).
+- **DR-025 comms-ledger.** Per-agent write-ahead `comms-ledger.jsonl` library +
+  schema (#474), wired into the channel-server edge sites, loud-but-proceeds
+  (#475).
+
+### fix
+
+- **reconciler:** window-aware DELIVERED truncation (#478) + suppress benign
+  coalesced-turn false-drops via a precision floor (#480).
+- **monitor:** digest counts distinct agents, not occurrences (#515).
+- **observability:** OTLP/Tempo defaults migrated to the monitoring-VM FQDN
+  (#517); the `MACF_OTEL_ENDPOINT` override knob preserved.
+
+### docs
+
+- DR-026 (self-evolving coordination governance — the auditor) **ratified** +
+  §8 amended to the dedicated meta-auditor home; DR-027 (substrate Stage-3
+  migration) **ratified**; DR-025 channel-semantics synced to the shipped
+  taxonomy.
+
 ## [0.2.36] — 2026-06-07
 
 Receipt-observable routing (the #444 arc) + registry CAS hardening (#439) +
