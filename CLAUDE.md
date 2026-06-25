@@ -33,7 +33,8 @@ templates/
 
 plugin/
   .claude-plugin/plugin.json  ← manifest
-  agents/         ← 7 agent identity templates (3 permanent + 4 exp-*)
+  agents/         ← 8 agent identity templates (code/science/writing/auditor
+                    + 4 exp-*; auditor.md = DR-026 sensor/steward, propose-only)
   skills/         ← 4 skills (macf-status, macf-peers, macf-ping, macf-issues)
   hooks/hooks.json
   rules/
