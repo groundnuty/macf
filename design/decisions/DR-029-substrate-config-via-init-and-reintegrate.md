@@ -1,7 +1,8 @@
 # DR-029: Substrate config maintenance via backup → `macf init` → reintegrate → reflect
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-25
+**Ratified:** 2026-06-25 by the operator ("DR-028 + DR-029 are ok"). Establishes the substrate-config-maintenance doctrine (backup → plain `macf init` → reintegrate-from-backup → reflect; reintegration friction = the graduate-up signal) and supersedes the "substrate ≠ `macf init` consumer" stance (`macf#273`). Rollout is per-agent, backup-first, after the DR-027 channel migrations (devops→code→science); `--mode substrate` stays rejected (true dogfooding — no special path).
 **Trigger:** `macf#533` (the onboarding-UX pass) + the DR-027 phase-1 evidence: the devops substrate launcher was **hand-maintained**, drifted to an older generation, and shipped a real bug (dropped `MACF_HOST`/`MACF_ADVERTISE_HOST` → the channel server registered `127.0.0.1` instead of the FQDN; `macf-devops-toolkit#111`). Operator direction, 2026-06-25.
 
 ## Context
