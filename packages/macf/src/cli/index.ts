@@ -268,17 +268,26 @@ fleet
 fleet
   .command('doctor')
   .description(
-    'NON-invasive mesh-interconnect test per registered agent: REACHABLE ' +
-    '(mTLS /health answers) + ACCEPTED (diagnostic mTLS /notify ACK — 200 + ' +
-    'ack + correlation-token echo). Renders ✓/✗/— + a verdict line. Proves ' +
-    'protocol-reaches-server ONLY (NOT delivery to the agent) — see the output ' +
-    'legend; mesh delivery needs --inject (a later DR-030 increment). Exits ' +
-    'non-zero when DEGRADED.',
+    'Mesh-interconnect test per registered agent. DEFAULT (non-invasive): ' +
+    'REACHABLE (mTLS /health answers) + ACCEPTED (diagnostic mTLS /notify ACK — ' +
+    '200 + ack + correlation-token echo) — proves protocol-reaches-server ONLY. ' +
+    'With --inject (INVASIVE): also PROCESSED — routes a REAL marker-bearing /notify ' +
+    'to each reachable agent, WAKING it, then matches the echoed run_id off ' +
+    '/health.last_processed to prove the full deliver→process chain. --inject is the ' +
+    'IDLE-agent fallback (prefer passive last_processed for a busy agent); a timeout ' +
+    'is UNCONFIRMED (possibly busy), NOT a gap. Exits non-zero when DEGRADED ' +
+    '(Reachable+Accepted; PROCESSED does not affect the verdict).',
   )
   .option('--json', 'Emit the structured per-agent result as JSON (DR-031 watchdog contract)', false)
+  .option('--inject', 'INVASIVE Processed-now delivery-proof: routes a real probe + wakes each reachable agent', false)
+  .option('--inject-timeout <sec>', 'Per-agent poll budget for --inject, in seconds (default 24)', (v) => parseInt(v, 10))
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .action(async (opts) => {
-    const code = await runFleetDoctor(resolveProjectDir(opts.dir), { json: opts.json });
+    const code = await runFleetDoctor(resolveProjectDir(opts.dir), {
+      json: opts.json,
+      inject: opts.inject,
+      injectTimeoutSec: opts.injectTimeout,
+    });
     process.exitCode = code;
   });
 

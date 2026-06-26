@@ -15,19 +15,26 @@ import {
   acceptFailureReason,
   acceptedGlyph,
   buildDoctorRows,
+  defaultRunId,
   fleetDoctorToJson,
   FLEET_DOCTOR_JSON_SCHEMA_VERSION,
   formatDoctorTable,
   gatherFleetDoctor,
+  injectableCount,
+  injectSummaryLine,
   isAccepted,
   meshVerdict,
+  processedGlyph,
   reachableGlyph,
   runFleetDoctor,
+  runProcessedInject,
+  sanitizeMarkerAgent,
   summaryLine,
   type DiagnosticAck,
   type FleetDiagnosticFn,
   type FleetDoctorDeps,
   type FleetDoctorResult,
+  type FleetInjectConfig,
   type FleetProbeFn,
 } from '../../src/cli/commands/fleet-doctor.js';
 
@@ -305,5 +312,249 @@ describe('runFleetDoctor (injected deps)', () => {
     const code = await runFleetDoctor('/unused', {}, deps([], async () => null, echoingDiagnostic));
     expect(code).toBe(0);
     expect(logSpy.mock.calls.flat().join('\n')).toMatch(/No agents registered/);
+  });
+});
+
+// --- DR-030 §3 Processed-now `--inject` tier (macf#568 final increment) ---
+
+describe('sanitizeMarkerAgent / defaultRunId — marker-regex legality', () => {
+  it('lowercases + maps out-of-class chars to `-` (emit-turn-receipt grep is [a-z0-9-])', () => {
+    // An UNsanitized `MACF_Science_Agent` would break the whole-marker grep
+    // → no receipt → false UNCONFIRMED. Sanitize keeps the marker matchable.
+    expect(sanitizeMarkerAgent('MACF_Science_Agent')).toBe('macf-science-agent');
+    expect(sanitizeMarkerAgent('code-agent')).toBe('code-agent');
+    expect(sanitizeMarkerAgent('___')).toBe('agent'); // empty after strip → fallback
+  });
+  it('defaultRunId is DIGITS-ONLY (marker run_id is [0-9]+)', () => {
+    expect(defaultRunId()).toMatch(/^[0-9]+$/);
+  });
+});
+
+describe('processedGlyph — ✓ / ? / —', () => {
+  it('✓ processed, ? unconfirmed (NOT ✗), — not-attempted', () => {
+    expect(processedGlyph(true)).toBe('✓');
+    expect(processedGlyph(false)).toBe('?');
+    expect(processedGlyph(null)).toBe('—');
+    expect(processedGlyph(undefined)).toBe('—');
+  });
+});
+
+describe('runProcessedInject — POST a marker probe, poll /health for the run_id', () => {
+  const peer = { name: 'code-agent', info: info('127.0.0.1', 4100) };
+
+  it('GREEN: run_id echoes back via /health.last_processed within the window', async () => {
+    let polls = 0;
+    const inject: FleetInjectConfig = {
+      post: async () => ({ delivered: true }),
+      poll: async () => { polls++; return polls >= 2 ? '777' : null; }, // appears on 2nd poll
+      genRunId: () => '777',
+      maxPolls: 4,
+      pollIntervalMs: 1,
+      sleep: async () => {}, // no real waits
+    };
+    const r = await runProcessedInject(peer, 'code-agent', inject);
+    expect(r).toMatchObject({ processedInject: true, injectRunId: '777' });
+    expect(r.injectError).toBeUndefined();
+  });
+
+  it('UNCONFIRMED: delivered but never echoes within the poll window', async () => {
+    const inject: FleetInjectConfig = {
+      post: async () => ({ delivered: true }),
+      poll: async () => null,
+      genRunId: () => '777',
+      maxPolls: 3,
+      pollIntervalMs: 1,
+      sleep: async () => {},
+    };
+    const r = await runProcessedInject(peer, 'code-agent', inject);
+    expect(r.processedInject).toBe(false);
+    expect(r.injectError).toMatch(/unconfirmed/);
+  });
+
+  it('POST not delivered → false, and NEVER polls', async () => {
+    const pollSpy = vi.fn(async () => '777');
+    const inject: FleetInjectConfig = {
+      post: async () => ({ delivered: false, error: 'http 502' }),
+      poll: pollSpy,
+      genRunId: () => '777',
+      sleep: async () => {},
+    };
+    const r = await runProcessedInject(peer, 'code-agent', inject);
+    expect(r).toMatchObject({ processedInject: false, injectError: 'http 502' });
+    expect(pollSpy).not.toHaveBeenCalled();
+  });
+
+  it('routes the SANITIZED marker agent + the generated run_id', async () => {
+    const postSpy = vi.fn(async () => ({ delivered: true }));
+    const inject: FleetInjectConfig = {
+      post: postSpy,
+      poll: async () => '777',
+      genRunId: () => '777',
+      maxPolls: 1,
+      sleep: async () => {},
+    };
+    await runProcessedInject(peer, 'MACF_Science_Agent', inject);
+    expect(postSpy).toHaveBeenCalledWith('127.0.0.1', 4100, '777', 'macf-science-agent');
+  });
+});
+
+describe('gatherFleetDoctor — Processed inject tier', () => {
+  const peers = [
+    { name: 'code-agent', info: info('127.0.0.1', 4100) }, // reachable + processed
+    { name: 'science-agent', info: info('100.64.0.2', 4200) }, // reachable, unconfirmed
+    { name: 'devops-agent', info: info('100.64.0.3', 4300) }, // offline
+  ];
+  const probe: FleetProbeFn = async (_h, port) => (port === 4300 ? null : ONLINE);
+  const inject = (): FleetInjectConfig => ({
+    post: async () => ({ delivered: true }),
+    poll: async (_h, port) => (port === 4100 ? '777' : null), // only code-agent echoes
+    genRunId: () => '777',
+    maxPolls: 2,
+    pollIntervalMs: 1,
+    sleep: async () => {},
+  });
+
+  it('marks processed ✓ / unconfirmed / not-attempted(null)', async () => {
+    const results = await gatherFleetDoctor(peers, probe, echoingDiagnostic, undefined, inject());
+    expect(results[0]).toMatchObject({ reachable: true, processedInject: true, injectRunId: '777' });
+    expect(results[1]).toMatchObject({ reachable: true, processedInject: false });
+    expect(results[1]!.injectError).toMatch(/unconfirmed/);
+    expect(results[2]).toMatchObject({ reachable: false, processedInject: null });
+  });
+
+  it('back-compat: no inject config → processedInject undefined (existing two-tier behavior)', async () => {
+    const results = await gatherFleetDoctor(peers, probe, echoingDiagnostic);
+    expect(results[0]!.processedInject).toBeUndefined();
+    expect(results[2]).toMatchObject({ reachable: false, accepted: null });
+  });
+
+  it('NEVER injects to an unreachable agent (ladder stops at tier 1)', async () => {
+    const postSpy = vi.fn(async () => ({ delivered: true }));
+    await gatherFleetDoctor(
+      [{ name: 'devops-agent', info: info('100.64.0.3', 4300) }],
+      probe,
+      echoingDiagnostic,
+      undefined,
+      { ...inject(), post: postSpy },
+    );
+    expect(postSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('inject rendering — table column + JSON + summaries', () => {
+  const results: readonly FleetDoctorResult[] = [
+    { name: 'code-agent', host: 'h', port: 1, reachable: true, accepted: true, processedInject: true, injectRunId: '777' },
+    { name: 'science-agent', host: 'h', port: 2, reachable: true, accepted: true, processedInject: false, injectError: 'processing unconfirmed within ~4s' },
+    { name: 'devops-agent', host: 'h', port: 3, reachable: false, accepted: null, processedInject: null },
+  ];
+
+  it('buildDoctorRows appends the PROCESSED glyph column only under inject', () => {
+    expect(buildDoctorRows(results, true)).toEqual([
+      ['code-agent', 'h:1', '✓', '✓', '✓'],
+      ['science-agent', 'h:2', '✓', '✓', '?'],
+      ['devops-agent', 'h:3', '✗', '—', '—'],
+    ]);
+    // default (no inject) → 4 columns, no PROCESSED
+    expect(buildDoctorRows(results)[0]).toHaveLength(4);
+  });
+
+  it('formatDoctorTable shows the PROCESSED header only under inject', () => {
+    expect(formatDoctorTable(results, true).split('\n')[0]).toContain('PROCESSED');
+    expect(formatDoctorTable(results).split('\n')[0]).not.toContain('PROCESSED');
+  });
+
+  it('injectSummaryLine + injectableCount count reachable attempts honestly', () => {
+    expect(injectableCount(results)).toBe(2); // 2 reachable agents woken
+    expect(injectSummaryLine(results)).toBe(
+      '1/2 reachable agents processed an injected probe (1 unconfirmed — possibly busy, NOT necessarily a gap)',
+    );
+  });
+
+  it('fleetDoctorToJson under inject: additive processed_inject + inject block, schema_version STAYS 1', () => {
+    const json = fleetDoctorToJson(results, 'macf', { inject: true }) as {
+      schema_version: number;
+      inject: { invasive: boolean; woke: number; processed: number };
+      agents: ReadonlyArray<Record<string, unknown>>;
+    };
+    expect(json.schema_version).toBe(FLEET_DOCTOR_JSON_SCHEMA_VERSION); // additive-optional → no bump
+    expect(json.schema_version).toBe(1);
+    expect(json.inject).toMatchObject({ invasive: true, woke: 2, processed: 1 });
+    expect(json.agents[0]).toMatchObject({ processed_inject: true, inject_run_id: '777' });
+    expect(json.agents[1]).toMatchObject({ processed_inject: false });
+    expect(json.agents[2]).toMatchObject({ processed_inject: null });
+  });
+
+  it('fleetDoctorToJson WITHOUT inject omits processed_inject entirely (mode-off ≠ 0-processed)', () => {
+    const json = fleetDoctorToJson(results, 'macf') as {
+      schema_version: number;
+      agents: ReadonlyArray<Record<string, unknown>>;
+    };
+    expect(json.schema_version).toBe(1);
+    expect(json).not.toHaveProperty('inject');
+    expect(json.agents[0]).not.toHaveProperty('processed_inject');
+  });
+});
+
+describe('runFleetDoctor --inject (injected deps)', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  afterEach(() => {
+    logSpy?.mockRestore();
+    errSpy?.mockRestore();
+  });
+
+  const injectDeps = (
+    peers: readonly { name: string; info: AgentInfo }[],
+    probe: FleetProbeFn,
+    processedPort: number,
+  ): FleetDoctorDeps => ({
+    project: 'macf',
+    listPeers: async () => peers,
+    probe,
+    diagnose: echoingDiagnostic,
+    injectPost: async () => ({ delivered: true }),
+    injectPoll: async (_h, port) => (port === processedPort ? '777' : null),
+    injectGenRunId: () => '777',
+    injectSleep: async () => {}, // no real waits
+  });
+
+  it('prints PROCESSED column + LOUD invasive warning (stderr) + processed summary + inject legend', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const peers = [
+      { name: 'code-agent', info: info('127.0.0.1', 4100) }, // processed ✓
+      { name: 'science-agent', info: info('100.64.0.2', 4200) }, // unconfirmed ?
+    ];
+    await runFleetDoctor('/unused', { inject: true, injectTimeoutSec: 1 }, injectDeps(peers, async () => ONLINE, 4100));
+
+    const out = logSpy.mock.calls.flat().join('\n');
+    const err = errSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('PROCESSED');
+    expect(err).toMatch(/INVASIVE/); // loud up-front warning to stderr
+    expect(err).toMatch(/WAKING/);
+    expect(out).toMatch(/routed a REAL probe to 2 reachable agent\(s\), waking each/);
+    expect(out).toMatch(/processed an injected probe/);
+    expect(out).toContain('IDLE-agent fallback'); // INJECT_LEGEND rendered
+  });
+
+  it('--json includes processed_inject + the inject block; schema_version stays 1', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const peers = [{ name: 'code-agent', info: info('127.0.0.1', 4100) }];
+    await runFleetDoctor('/unused', { json: true, inject: true }, injectDeps(peers, async () => ONLINE, 4100));
+
+    const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
+    expect(parsed.schema_version).toBe(1);
+    expect(parsed.inject).toMatchObject({ invasive: true, woke: 1, processed: 1 });
+    expect(parsed.agents[0]).toMatchObject({ name: 'code-agent', processed_inject: true });
+  });
+
+  it('does NOT print the invasive warning when --inject is off', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const peers = [{ name: 'code-agent', info: info('127.0.0.1', 4100) }];
+    await runFleetDoctor('/unused', {}, injectDeps(peers, async () => ONLINE, 4100));
+    expect(errSpy.mock.calls.flat().join('\n')).not.toMatch(/INVASIVE/);
+    expect(logSpy.mock.calls.flat().join('\n')).not.toContain('PROCESSED');
   });
 });
