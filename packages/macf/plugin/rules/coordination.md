@@ -136,6 +136,16 @@ The rules here are topology-agnostic: they work whether the project uses a scien
 
    **Verified motivation:** three operator-surfaced stalls where a peer's review request sat idle (42 min in one case; ~2.5 h in another) because the reviewer went idle without sweeping — the ping had arrived during a long single-threaded task and was never picked back up. In each case the peer's PR was blocked the entire time on a formal approval that never came.
 
+   **(c) Sweep your GATES against GitHub state — don't wait for a ping that may never come.** §5(a)/(b) cover the REVIEWER's inbound obligation (review requests addressed to you). The symmetric gap they don't cover: when YOUR next action is gated on a review/approval landing on **someone else's PR** — you are the *gate-owner*, not the PR author and not the requested reviewer — `route-by-pr-review-state` notifies only the **PR author**, NOT you. A review that clears your gate fires **no signal to you**, and your gate silently reads "pending" (this is `silent-fallback-hazards.md` Instance 13: reviewer ≠ next-actor, which is the *common* case once a fleet collaborates freely). Before recording a gate as satisfied OR as still-blocked, assert its artifact directly:
+
+        # Does the approval my next step is gated on actually exist?
+        gh pr view <N> --repo <owner>/<repo> --json reviews \
+          --jq '[.reviews[] | select(.author.login=="<gate-reviewer>" and .state=="APPROVED")] | length'
+
+   This is the result-invariant (Pattern A) at the **gate boundary** — clear the gate from GitHub state, never from "did I get pinged." It generalizes §5(b)'s reviewer-sweep from the *requested-reviewer* side to the *gate-owner* side. A reviewer **SHOULD** also @mention a known gate-owner in the review body (`route-by-mention` carries it) as a courtesy — but that depends on the reviewer remembering, so the gate-owner's own sweep is the load-bearing defense, not the courtesy.
+
+   **Verified motivation:** `groundnuty/macf` PR #574 (2026-06-26) — code-agent's approval was the framework-feasibility gate devops's impl work depended on; `route-by-pr-review-state` notified the PR author (science) only, devops received no signal, and its gate read "code's review still pending" though the APPROVED review existed. Resolved only by a manual relay + an operator-prompted direct channel push. A one-line gate-sweep would have cleared it immediately.
+
 ---
 
 ## When You're Stuck — Escalation
