@@ -4,6 +4,49 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.38] — 2026-06-26
+
+The **DR-028 settings validator/scaffolder** + the **identity model** (DR-028 /
+DR-029 ratified), the onboarding-UX cluster, and the 2026-06-26 Stage-3 incident
+fixes. No plugin-content change (marketplace v0.2.38 is a version bump).
+
+### feat
+
+- **DR-028 settings floor + validator.** `macf init`/`update` emit the role-aware
+  `permissions.allow`/`deny` floor (`Bash(*)` + Read/Write/Edit/… + the deny
+  safety floor), merge-preserving (#548). `macf doctor` validates settings vs the
+  per-role `ROLE_SETTINGS_MODEL` + `macf doctor --fix` repairs on operator
+  consent (#550); the auditor never-acts hook is a validator ERROR.
+- **Identity-scoped diagnostics (#558).** `macf ps` (every MACF process keyed by
+  its own `/proc/<pid>/cwd` + identity + port + OTEL endpoint — never `head -1`),
+  a `macf doctor` OTEL launch-boundary probe (cwd-disambiguated), and
+  `macf registry prune` (confirm-before-destroy: removes only entries dead across
+  a retry, consent-gated).
+- **`macf init --app-key`** ingests the App private key to `~/.macf/keys/<agent>.pem`
+  (`0600`) and fails loud if absent (#531).
+- **Routing-identity split.** `MACF_ROUTING_LABEL` / `routing_label` — the registry
+  key + cert CN, distinct from the OTEL bot-name `MACF_AGENT_NAME`; cert CN /
+  `/health` / A2A card now source it (#542, #547). Defaults to the agent name
+  (inert/back-compat).
+
+### reliability / security
+
+- **collision-takeover race (#557).** Channel-server liveness now re-confirms
+  (bounded retry) before trusting a peer alive, so a just-killed-port flicker no
+  longer aborts a restart; #424 live-peer protection preserved.
+- **attribution hook (#537).** `check-gh-attribution.sh` treats `agent_name` as a
+  non-authoritative guess + honors `github_app.bot_login` — fixes the auditor
+  false-positive.
+- **role hardening (#552).** `macf doctor` surfaces a non-canonical
+  safety-critical role (e.g. `auditor-agent` vs `auditor`) instead of silently
+  skipping its never-acts hook.
+
+### docs
+
+- DR-028 (expected-settings-per-role) + DR-029 (substrate config via
+  `macf init` + reintegrate) ratified; DR-027 registry scope → Profile mode.
+
+
 Plugin + routing-workflow changes ship from separate repos
 ([`groundnuty/macf-marketplace`](https://github.com/groundnuty/macf-marketplace),
 [`groundnuty/macf-actions`](https://github.com/groundnuty/macf-actions))
