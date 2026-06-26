@@ -16,5 +16,8 @@ coverage/
 .worktrees/
 *.pem
 
+# Local CLI/gh state dirs (e.g. packages/*/.local/state/gh/) — never source
+.local/
+
 # Local subagent worktrees (never committed)
 .claude/worktrees/
