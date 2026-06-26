@@ -16,6 +16,7 @@ import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllo
 import { fetchPluginToWorkspace, pinChannelServerVersion } from '../plugin-fetcher.js';
 import { writeClaudeSh } from '../claude-sh.js';
 import { writeEnvFiles } from '../env-files.js';
+import { writeHostPrelude } from '../host-prelude.js';
 import {
   resolveLatestVersions, isValidSemver, isValidActionsRef,
   FALLBACK_VERSIONS, statusMessage,
@@ -452,6 +453,14 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // telemetry / tmux env exports are all silently absent.
   const envFilesResult = writeEnvFiles(absDir, config);
   console.log(`  Env: wrote ${envFilesResult.written.length} env file(s) to .claude/.macf/`);
+
+  // Host-toolchain bootstrap (DR-031 piece 4). Detect the toolchain backend
+  // (devbox / brew / none) on the host and write .claude/.macf/host-prelude.sh,
+  // which claude.sh sources FIRST so a minimal-env launch (cron, restart-self
+  // relauncher, container entrypoint) re-establishes the toolchain rather than
+  // inheriting the operator login-shell PATH.
+  writeHostPrelude(absDir);
+  console.log(`  Host prelude: wrote .claude/.macf/host-prelude.sh (toolchain bootstrap)`);
 
   // Generate claude.sh launcher.
   const claudeShPath = writeClaudeSh(absDir, config);

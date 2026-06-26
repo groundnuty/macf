@@ -159,6 +159,37 @@ describe('generateClaudeSh', () => {
     });
   });
 
+  describe('host-prelude source (DR-031 piece 4)', () => {
+    it('emits a guarded source of .claude/.macf/host-prelude.sh', () => {
+      const output = generateClaudeSh(sampleConfig);
+      expect(output).toContain(
+        '[ -f "$SCRIPT_DIR/.claude/.macf/host-prelude.sh" ] && source "$SCRIPT_DIR/.claude/.macf/host-prelude.sh"',
+      );
+    });
+
+    it('sources host-prelude.sh BEFORE the env.* loop (toolchain on PATH for the env files)', () => {
+      const output = generateClaudeSh(sampleConfig);
+      const preludePos = output.indexOf(
+        '[ -f "$SCRIPT_DIR/.claude/.macf/host-prelude.sh" ] && source',
+      );
+      const envLoopPos = output.indexOf('for f in "$SCRIPT_DIR/.claude/.macf"/env.*');
+      expect(preludePos).toBeGreaterThan(0);
+      expect(envLoopPos).toBeGreaterThan(0);
+      expect(preludePos).toBeLessThan(envLoopPos);
+    });
+
+    it('sources host-prelude.sh AFTER cd $SCRIPT_DIR (path resolution) and BEFORE the tmux self-wrap', () => {
+      const output = generateClaudeSh(sampleConfig);
+      const cdPos = output.indexOf('cd "$SCRIPT_DIR"');
+      const preludePos = output.indexOf(
+        '[ -f "$SCRIPT_DIR/.claude/.macf/host-prelude.sh" ] && source',
+      );
+      const tmuxWrapPos = output.indexOf('if [ -z "${TMUX:-}" ]');
+      expect(cdPos).toBeLessThan(preludePos);
+      expect(preludePos).toBeLessThan(tmuxWrapPos);
+    });
+  });
+
   describe('channel-server runtime knobs (kept in claude.sh as orchestration)', () => {
     // MACF_HOST / MACF_ADVERTISE_HOST / MACF_DEBUG don't bucket cleanly
     // into a single env.* concern (network-transport-but-not-cert,
