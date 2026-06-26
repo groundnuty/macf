@@ -239,6 +239,34 @@ export function a2aMetadataToCommsEvent(message: Message): CommsEvent {
   }
 }
 
+/**
+ * Build the DR-030 §6 diagnostic ACK body (groundnuty/macf#568). Called only
+ * on the `/notify` short-circuit when `payload.diagnostic === true`. Shape:
+ *
+ *   { ack: true, agent: <routingLabel>, instance_id: <instanceId>,
+ *     correlation_token?: <echoed if the probe sent one> }
+ *
+ * `correlation_token` is included ONLY when the probe sent one (echoed
+ * verbatim for request/response correlation); omitted otherwise. Extracted as
+ * a pure function so the ACK contract is unit-testable without the mTLS
+ * request path (`src/https.ts` is coverage-excluded — the full handler path is
+ * e2e-tested). Exported for tests.
+ */
+export function diagnosticAckBody(
+  payload: NotifyPayload,
+  ids: { readonly agent: string; readonly instanceId: string },
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    ack: true,
+    agent: ids.agent,
+    instance_id: ids.instanceId,
+  };
+  if (payload.correlation_token !== undefined) {
+    body['correlation_token'] = payload.correlation_token;
+  }
+  return body;
+}
+
 export function createHttpsServer(config: {
   readonly caCertPath: string;
   readonly agentCertPath: string;
@@ -280,8 +308,22 @@ export function createHttpsServer(config: {
    * alongside `recordLedgerEdge`; when the latter is omitted this is unused.
    */
   readonly selfAgentName?: string;
+  /**
+   * DR-030 §6 (groundnuty/macf#568): the routing-label this server registers
+   * under (registry key + cert CN; `config.routingLabel`). Echoed as `agent`
+   * in the diagnostic ACK — same identity `/health` reports — so the
+   * fleet-doctor "Accepted" check can confirm it reached the slot it resolved.
+   * Optional; falls back to `selfAgentName` then `'unknown'` when omitted.
+   */
+  readonly routingLabel?: string;
+  /**
+   * DR-030 §6: this instance's `instance_id` (`config.instanceId`). Echoed in
+   * the diagnostic ACK as the registry/health staleness disambiguator.
+   * Optional; falls back to `'unknown'` when omitted.
+   */
+  readonly instanceId?: string;
 }): HttpsServer {
-  const { onNotify, onHealth, onSign, agentCard, taskStore, logger, recordLedgerEdge, selfAgentName } = config;
+  const { onNotify, onHealth, onSign, agentCard, taskStore, logger, recordLedgerEdge, selfAgentName, routingLabel, instanceId } = config;
 
   const tlsOptions = {
     key: readFileSync(config.agentKeyPath),
@@ -393,6 +435,40 @@ export function createHttpsServer(config: {
       const result = NotifyPayloadSchema.safeParse(parsed);
       if (!result.success) {
         sendJson(res, 400, { error: `Validation failed: ${result.error.message}` });
+        return;
+      }
+
+      // DR-030 §6 (groundnuty/macf#568): the `diagnostic` discriminator — the
+      // fleet-doctor mesh "Accepted" check. By the time we reach here the probe
+      // has cleared the SAME path real routing uses: mTLS + clientAuth-EKU auth
+      // (top of handleRequest) and the NotifyPayloadSchema parse (just above) —
+      // so a green ACK proves auth+parse+receiver-ready. The check then
+      // SHORT-CIRCUITS: respond synchronously with an ACK and return, BEFORE any
+      // side-effect — no notify_received counter bump, no SERVER span, no
+      // recordLedgerEdge, no onNotify (→ no mcp.pushNotification, no
+      // health.recordNotification, no decideWake, no wakeViaTmux). Zero queue
+      // pollution; a synthetic probe must not look like real received traffic.
+      //
+      // This composes with — but is strictly EARLIER than — Pattern E
+      // (`decideWake`, macf#355): decideWake only gates the *wake*, and an
+      // unrecognized event still pushes to MCP. The Accepted check needs no
+      // push at all, so it is NOT a decideWake event value — it is this
+      // pre-push short-circuit.
+      if (result.data.diagnostic === true) {
+        const probeCn = (req.socket as TLSSocket)
+          .getPeerCertificate()?.subject?.CN ?? 'unknown';
+        logger.info('diagnostic_ack', {
+          from_cn: String(probeCn),
+          correlation_token: result.data.correlation_token ?? null,
+        });
+        sendJson(
+          res,
+          200,
+          diagnosticAckBody(result.data, {
+            agent: routingLabel ?? selfAgentName ?? 'unknown',
+            instanceId: instanceId ?? 'unknown',
+          }),
+        );
         return;
       }
 
