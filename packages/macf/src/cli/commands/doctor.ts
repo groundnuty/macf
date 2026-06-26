@@ -16,7 +16,10 @@
  */
 import { execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { resolve } from 'node:path';
 import { readAgentConfig, tokenSourceFromConfig } from '../config.js';
+import { defaultProcReader, scanMacfProcesses } from '../proc-scan.js';
+import type { ProcReader } from '../proc-scan.js';
 import {
   getHookCommands,
   getPermissionsAllow,
@@ -544,6 +547,70 @@ export function inferRole(workspaceDir: string): string | null {
   return readAgentConfig(workspaceDir)?.agent_role ?? null;
 }
 
+/**
+ * Result of the OTEL launch-boundary probe (macf#554/#556).
+ *
+ *   - `PASS` — the claude process whose cwd IS this workspace exports
+ *     `OTEL_EXPORTER_OTLP_ENDPOINT` (telemetry will flow).
+ *   - `WARN` — that process exists but lacks the endpoint (a REAL stale/missing
+ *     launch-env: traces silently won't export). Warn-only — does not affect the
+ *     exit code, matching the macf#296 permissions check's discipline.
+ *   - `INFO` — no claude process for this workspace is running, or `/proc` is
+ *     unavailable (non-Linux). Nothing to assert; skip.
+ */
+export interface OtelLaunchCheck {
+  readonly status: 'PASS' | 'WARN' | 'INFO';
+  readonly detail: string;
+}
+
+/** Normalise a path for cwd comparison (absolute, no trailing slash). */
+function normalizeDir(p: string): string {
+  const abs = resolve(p);
+  return abs.length > 1 && abs.endsWith('/') ? abs.slice(0, -1) : abs;
+}
+
+/**
+ * Pattern-A launch-boundary probe: find the running `claude` process whose
+ * `/proc/<pid>/cwd` EQUALS this workspace dir — the cwd disambiguation is the
+ * whole point; a multi-tenant host runs many `claude`s and a `head -1` grab
+ * would assert against the wrong one — then assert its environ carries
+ * `OTEL_EXPORTER_OTLP_ENDPOINT`. The `ProcReader` is injectable for tests; the
+ * default reads real `/proc`. See macf#556 for the misdiagnosis this prevents.
+ */
+export function checkOtelLaunchBoundary(
+  workspaceDir: string,
+  reader: ProcReader = defaultProcReader,
+): OtelLaunchCheck {
+  if (!reader.available()) {
+    return {
+      status: 'INFO',
+      detail: '/proc unavailable (non-Linux host) — cannot probe the launch boundary',
+    };
+  }
+  const target = normalizeDir(workspaceDir);
+  const match = scanMacfProcesses(reader).find(
+    (p) => p.kind === 'claude' && p.cwd !== null && normalizeDir(p.cwd) === target,
+  );
+  if (!match) {
+    return {
+      status: 'INFO',
+      detail: `no running claude process has cwd == ${target} — skipping launch-boundary probe`,
+    };
+  }
+  if (match.otelEndpoint && match.otelEndpoint.length > 0) {
+    return {
+      status: 'PASS',
+      detail: `claude pid ${match.pid} exports OTEL_EXPORTER_OTLP_ENDPOINT=${match.otelEndpoint}`,
+    };
+  }
+  return {
+    status: 'WARN',
+    detail:
+      `claude pid ${match.pid} (cwd ${target}) has NO OTEL_EXPORTER_OTLP_ENDPOINT in its ` +
+      `environ — telemetry will NOT be exported. Relaunch via claude.sh with the endpoint set.`,
+  };
+}
+
 /** Prompt the operator for a y/N confirmation on stdin. Default = No. */
 function promptYesNo(question: string): Promise<boolean> {
   return new Promise((resolveAnswer) => {
@@ -698,6 +765,11 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   let roleCheck = role ? checkRoleSettings(projectDir, role) : null;
   printRoleSettingsSection(role, roleCheck);
 
+  console.log('');
+  console.log('OTEL launch boundary (macf#554/#556)');
+  console.log('──────────────────────────────────────────────────────────────');
+  printOtelLaunchSection(checkOtelLaunchBoundary(projectDir));
+
   // --fix: the existing install emitters ARE the fix (DR-028) — they write the
   // floor merge-preservingly. Detect drift read-only above, then (on consent)
   // call them + re-run the checks. NEVER write without consent.
@@ -739,6 +811,17 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   const sandboxFailed = sandboxCheck.status === 'FAIL';
   const roleErrored = roleCheck?.status === 'ERROR';
   return permissionsFailed || sandboxFailed || roleErrored ? 1 : 0;
+}
+
+/** Print the macf#554/#556 OTEL launch-boundary report line for `check`. */
+function printOtelLaunchSection(check: OtelLaunchCheck): void {
+  if (check.status === 'PASS') {
+    console.log(`  ✓ ${check.detail}  [PASS]`);
+  } else if (check.status === 'WARN') {
+    console.log(`  ⚠ ${check.detail}  [WARN]`);
+  } else {
+    console.log(`  ℹ ${check.detail}  [INFO]`);
+  }
 }
 
 /** Print the macf#200 sandbox-fd report line(s) for `check`. */
