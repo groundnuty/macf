@@ -113,6 +113,8 @@ async function main(): Promise<void> {
   const health = createHealthState(config.routingLabel, config.agentType, {
     instanceId: config.instanceId,
     certPath: config.agentCertPath,
+    // DR-030 E1: read the comms-ledger (sibling of logPath) for last_processed.
+    logPath: config.logPath,
   });
 
   const onNotify = async (payload: NotifyPayload): Promise<void> => {

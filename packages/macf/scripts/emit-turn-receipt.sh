@@ -11,6 +11,16 @@
 # structurally (closes the #437 send≠receipt gap). A prompt with NO marker
 # (a typed prompt, a non-routed turn) is a no-op — exit 0, emit nothing.
 #
+# DR-030 keystone (groundnuty/macf#568): IN ADDITION to the span, this hook
+# appends one LOCAL turn-receipt line per marker to
+# `$(dirname MACF_LOG_PATH)/processed-receipts.jsonl`
+# (`{"ts":<epoch-ms>,"run_id":"<run_id>","agent":"<agent>"}`). The channel-server
+# reads the most-recent receipt for `/health.last_processed`, making the
+# passive-Processed tier a real LOCAL self-report (no Tempo round-trip). The
+# receipt is ADDITIVE and does NOT depend on curl/openssl or a live OTLP endpoint;
+# it is fail-open + non-blocking like the rest of this async hook (MACF_LOG_PATH
+# unset → receipt skipped, a graceful no-op).
+#
 # Registered `async: true` (settings.json) so it never adds turn latency. It
 # NEVER blocks the turn: any failure path exits 0 (with a stderr WARN on a
 # genuine emit error — fail-loud per silent-fallback-hazards.md Instance 8).
@@ -39,18 +49,48 @@ fi
 MARKERS="$(printf '%s' "$PROMPT" | grep -oE '\[macf-route:[0-9]+:[a-z0-9-]+\]' | sort -u || true)"
 [ -z "$MARKERS" ] && exit 0
 
-# Need curl + openssl to emit; absent → degrade silently (no span, no noise).
-command -v curl >/dev/null 2>&1 || exit 0
-command -v openssl >/dev/null 2>&1 || exit 0
+# The OTLP span needs curl + openssl. The LOCAL receipt below does NOT — it must
+# land regardless (DR-030 passive-Processed is a real LOCAL self-report, working
+# even on a host without curl/openssl or without a live OTLP endpoint). So gate
+# ONLY the span on a flag; never exit before writing the receipt.
+CAN_EMIT_SPAN=1
+command -v curl >/dev/null 2>&1 || CAN_EMIT_SPAN=0
+command -v openssl >/dev/null 2>&1 || CAN_EMIT_SPAN=0
 
 BASE="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://orzech-dev-agents-monitoring.tail491af.ts.net:4318}"
 BASE="${BASE%/v1/traces}"
 
-# One independent span per distinct marker (own trace/span id + timestamp).
+# DR-030 local turn-receipt sink (groundnuty/macf#568): a sibling of MACF_LOG_PATH.
+# Empty when MACF_LOG_PATH is unset → the receipt write is skipped (graceful no-op).
+RECEIPT_SINK=""
+[ -n "${MACF_LOG_PATH:-}" ] && RECEIPT_SINK="$(dirname "$MACF_LOG_PATH")/processed-receipts.jsonl"
+
+# One independent span per distinct marker (own trace/span id + timestamp), plus
+# one local receipt per marker (the receipt lands even when the span can't).
 printf '%s\n' "$MARKERS" | while IFS= read -r MARKER; do
   [ -z "$MARKER" ] && continue
   RUN_ID="$(printf '%s' "$MARKER" | sed -E 's/.*\[macf-route:([0-9]+):([a-z0-9-]+)\].*/\1/')"
   AGENT="$(printf '%s' "$MARKER" | sed -E 's/.*\[macf-route:([0-9]+):([a-z0-9-]+)\].*/\2/')"
+
+  # DR-030 keystone: append the LOCAL turn-receipt — ADDITIVE to the span — so the
+  # agent's own /health.last_processed self-reports "I processed routed traffic at
+  # T" without Tempo. Fail-open + non-blocking (any error swallowed; this async
+  # hook must NEVER fail a turn). epoch-ms: `date +%s%3N` is GNU; a BSD/mac date
+  # leaves a literal `N` → fall back to seconds×1000 (the `*N` glob catches it).
+  if [ -n "$RECEIPT_SINK" ]; then
+    TS_MS="$(date +%s%3N 2>/dev/null || true)"
+    case "$TS_MS" in
+      *N|'' ) TS_MS="$(( $(date +%s) * 1000 ))" ;;
+    esac
+    {
+      mkdir -p "$(dirname "$RECEIPT_SINK")" 2>/dev/null &&
+        printf '{"ts":%s,"run_id":"%s","agent":"%s"}\n' "$TS_MS" "$RUN_ID" "$AGENT" >> "$RECEIPT_SINK"
+    } 2>/dev/null || true
+  fi
+
+  # Span requires curl + openssl; the local receipt above already landed, so just
+  # skip the span for this marker when we can't emit it.
+  [ "$CAN_EMIT_SPAN" = 1 ] || continue
 
   # Nanosecond epoch. `date +%s%N` is GNU-only (substrate is Linux); on a BSD/mac
   # date that prints a literal `N`, fall back to seconds×1e9.

@@ -3,6 +3,7 @@ import { resolve, join } from 'node:path';
 import { X509Certificate } from 'node:crypto';
 import { connect } from 'node:net';
 import type { HealthResponse, HealthState } from '@groundnuty/macf-core';
+import { readLastProcessed, type ProcessedReceipt } from './comms-ledger.js';
 
 /** The DR-030 `/health` `state` object shape (non-null), derived from the schema. */
 type TurnStateReport = NonNullable<HealthResponse['state']>;
@@ -250,6 +251,20 @@ export interface HealthStateOpts {
   readonly otelProbe?: (host: string, port: number, timeoutMs: number) => Promise<boolean>;
   /** Override the OTLP-reachability probe interval (testing); default 30s. */
   readonly otelProbeIntervalMs?: number;
+  /**
+   * Channel-server log path (`MACF_LOG_PATH`); the turn-receipt sink lives at a
+   * sibling `processed-receipts.jsonl` in the same directory. Source for the
+   * DR-030 `last_processed` passive-receipt self-report (the server passes
+   * `config.logPath`). When unset (and no `processedReader`), `last_processed`
+   * is null — no sink to read.
+   */
+  readonly logPath?: string;
+  /**
+   * Injectable turn-receipt reader for `last_processed` (testing — avoids a real
+   * on-disk receipt sink). Takes precedence over `logPath`-derived file reads
+   * when set.
+   */
+  readonly processedReader?: () => readonly ProcessedReceipt[];
 }
 
 export function createHealthState(
@@ -277,6 +292,12 @@ export function createHealthState(
   });
   otelProbe.start();
 
+  // DR-030 last_processed: resolve the receipt-sink source once; READ it FRESH on
+  // every getHealth() so `age_ms` is current and a newly-processed turn-receipt
+  // surfaces without a server restart.
+  const logPath = opts.logPath;
+  const processedReader = opts.processedReader;
+
   let currentIssue: number | null = null;
   let lastNotification: string | null = null;
 
@@ -299,6 +320,11 @@ export function createHealthState(
         cert_expiry: certExpiry,
         state: mapTurnStateMarker(readTurnState(turnStatePath), Date.now()),
         otel,
+        last_processed: readLastProcessed({
+          logPath,
+          now: Date.now(),
+          readReceipts: processedReader,
+        }),
       };
     },
 

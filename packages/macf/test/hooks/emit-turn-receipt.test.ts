@@ -41,28 +41,39 @@ interface RunResult {
   readonly status: number | null;
   readonly stderr: string;
   readonly capture: string | null;
+  /** Contents of the DR-030 receipt sink (sibling of MACF_LOG_PATH), or null. */
+  readonly receipts: string | null;
 }
 
-function runHook(prompt: string, opts: { curlExit?: number } = {}): RunResult {
+function runHook(prompt: string, opts: { curlExit?: number; noLogPath?: boolean } = {}): RunResult {
   const stubDir = makeStubCurlDir();
   const captureFile = join(stubDir, 'capture.json');
+  // DR-030: point MACF_LOG_PATH at a temp file so the receipt sink lands in
+  // stubDir (and overrides any ambient MACF_LOG_PATH so we never touch a real
+  // substrate sink). `noLogPath` exercises the graceful unset path.
+  const logPath = join(stubDir, 'logs', 'channel.log');
+  const receiptSink = join(stubDir, 'logs', 'processed-receipts.jsonl');
   try {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: `${stubDir}:${process.env['PATH'] ?? ''}`,
+      CURL_CAPTURE: captureFile,
+      CURL_EXIT: String(opts.curlExit ?? 0),
+      OTEL_EXPORTER_OTLP_ENDPOINT: 'http://orzech-dev-agents-monitoring.tail491af.ts.net:4318',
+      OTEL_SERVICE_NAME: 'macf-agent-code-agent',
+    };
+    if (opts.noLogPath) delete env['MACF_LOG_PATH'];
+    else env['MACF_LOG_PATH'] = logPath;
     const res = spawnSync('bash', [HOOK_SCRIPT], {
       input: JSON.stringify({ prompt }),
       encoding: 'utf-8',
-      env: {
-        ...process.env,
-        PATH: `${stubDir}:${process.env['PATH'] ?? ''}`,
-        CURL_CAPTURE: captureFile,
-        CURL_EXIT: String(opts.curlExit ?? 0),
-        OTEL_EXPORTER_OTLP_ENDPOINT: 'http://orzech-dev-agents-monitoring.tail491af.ts.net:4318',
-        OTEL_SERVICE_NAME: 'macf-agent-code-agent',
-      },
+      env,
     });
     return {
       status: res.status,
       stderr: res.stderr ?? '',
       capture: existsSync(captureFile) ? readFileSync(captureFile, 'utf-8') : null,
+      receipts: existsSync(receiptSink) ? readFileSync(receiptSink, 'utf-8') : null,
     };
   } finally {
     rmSync(stubDir, { recursive: true, force: true });
@@ -129,5 +140,56 @@ describe('emit-turn-receipt.sh', () => {
     const r = runHook('[macf-route:55:code-agent] … then again [macf-route:55:code-agent]');
     expect(r.status).toBe(0);
     expect((r.capture ?? '').match(/"name":"turn_processed"/g) ?? []).toHaveLength(1);
+  });
+});
+
+// --- DR-030 keystone (groundnuty/macf#568): local turn-receipt sink ----------
+//
+// In ADDITION to the OTLP span, the hook appends one line per marker to
+// `$(dirname MACF_LOG_PATH)/processed-receipts.jsonl` so the channel-server's
+// /health.last_processed is a real LOCAL self-report (no Tempo round-trip).
+describe('emit-turn-receipt.sh — local receipt sink', () => {
+  it('marker + MACF_LOG_PATH set → appends one {ts,run_id,agent} line', () => {
+    const r = runHook('You were mentioned in #444 [macf-route:123:code-agent]');
+    expect(r.status).toBe(0);
+    expect(r.receipts).not.toBeNull();
+    const lines = r.receipts!.trim().split('\n');
+    expect(lines).toHaveLength(1);
+    const rec = JSON.parse(lines[0]!) as { ts: number; run_id: string; agent: string };
+    expect(rec.run_id).toBe('123');
+    expect(rec.agent).toBe('code-agent');
+    expect(typeof rec.ts).toBe('number');
+    expect(Number.isFinite(rec.ts)).toBe(true);
+    expect(rec.ts).toBeGreaterThan(0);
+  });
+
+  it('no marker → no receipt written', () => {
+    const r = runHook('Just a normal typed prompt, no routing marker');
+    expect(r.status).toBe(0);
+    expect(r.receipts).toBeNull();
+  });
+
+  it('missing MACF_LOG_PATH → no crash, no receipt (graceful no-op)', () => {
+    const r = runHook('mention [macf-route:7:code-agent]', { noLogPath: true });
+    expect(r.status).toBe(0);
+    expect(r.receipts).toBeNull();
+  });
+
+  it('coalesced turn → one receipt line per distinct marker', () => {
+    const r = runHook('[macf-route:111:code-agent] and [macf-route:222:science-agent]');
+    expect(r.status).toBe(0);
+    const lines = (r.receipts ?? '').trim().split('\n').filter(Boolean);
+    expect(lines).toHaveLength(2);
+    const runIds = lines.map((l) => (JSON.parse(l) as { run_id: string }).run_id).sort();
+    expect(runIds).toEqual(['111', '222']);
+  });
+
+  it('receipt still lands when the span emit FAILS (additive, not span-gated)', () => {
+    const r = runHook('mention [macf-route:88:code-agent]', { curlExit: 22 });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toMatch(/WARN/); // span emit failed
+    expect(r.receipts).not.toBeNull(); // but the local receipt still landed
+    const rec = JSON.parse(r.receipts!.trim()) as { run_id: string };
+    expect(rec.run_id).toBe('88');
   });
 });

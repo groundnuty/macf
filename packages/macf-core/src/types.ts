@@ -240,6 +240,27 @@ export const HealthResponseSchema = z.object({
     endpoint_is_canonical: z.boolean(),
     endpoint_reachable: z.boolean(),
   }).nullable().optional(),
+  // DR-030 phase-1 increment E1 (groundnuty/macf#568): the passive-Processed
+  // self-report. Surfaces the agent's MOST-RECENT *processed* received
+  // coordination edge straight from its LOCAL comms-ledger (DR-025). A recv edge
+  // with `processed: true` is the macf#444 distinction — a routed message that
+  // wasn't merely delivered but actually consumed in a turn — so a fleet-doctor
+  // (or watchdog) can prove "this agent processed real routed traffic at time T"
+  // at ZERO cost (no synthetic injection). `at` is the edge's ISO-8601 ts (null
+  // if none found); `anchor` its github_anchor (owner/repo#N) or null; `age_ms`
+  // is computed live (now − at) on each /health call; `correlation_token` is the
+  // edge's trace_id (the per-edge correlation id the future `--inject` tier echoes
+  // + matches against — see channel-server `mapLastProcessed`). Same back-compat
+  // `.nullable().optional()` posture as `state`/`otel`: a newer parser still
+  // validates an older agent's body that predates this field, and the whole
+  // object is null when no processed recv-edge exists. The #553 collision parser
+  // reads only `version`, so this never affects it.
+  last_processed: z.object({
+    at: z.string().nullable(),
+    anchor: z.string().nullable(),
+    age_ms: z.number().int().nonnegative().nullable(),
+    correlation_token: z.string().nullable(),
+  }).nullable().optional(),
 });
 
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
