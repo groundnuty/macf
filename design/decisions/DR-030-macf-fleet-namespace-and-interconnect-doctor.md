@@ -61,9 +61,9 @@ Resolves the `--inject` invasiveness concern: proof escalates *with the layer*, 
 | **e2e** | the **routing plane** delivers end-to-end | full round-trip | routing-infra |
 
 - **Reachable** = `GET /health`; **Accepted** = a `diagnostic`-flagged request the server ACKs synchronously **without push/wake** (§6).
-- **Passive-Processed (the better-than-inject default):** observe a *real* recent route-receipt (DR-025 comms-ledger + #444 reconciler + #45 marker + the turn-receipt hook). A receipt for a real routed message proves the full chain at **zero cost**. **Phase-1 precondition to verify:** the comms-ledger captures *processed*-receipts at the per-agent/per-message granularity this needs — if not, passive degrades to "delivery happened" (not "processed") and `--inject` carries more weight.
+- **Passive-Processed (the better-than-inject default):** the agent self-reports *its own* last-processed-real-receipt from **local** state (a `/health` field), sourced from DR-025 comms-ledger / #444 / #45 / the turn-receipt hook. A receipt for a real routed message proves the full chain at **zero cost**. **Phase-1 precondition — locality *and* granularity (devops):** passive stays topology-agnostic in the mesh layer **only if** each agent can self-report a per-agent/per-message *local* processed-receipt. If processed-receipts live **only centrally** (Tempo/#444), passive can't be a self-report → it degrades to the routing-infra layer (deployment-specific) and `--inject` carries more mesh weight. The local self-report is the cleaner design — keep passive in mesh, gated on this.
 - **`--inject`** is the fallback for *idle* agents with no real traffic to observe (one turn; correlation-token echo, reusing #45).
-- **e2e is the routing-infra layer's NATIVE proof:** an `--inject` rides the channel directly and **structurally cannot** exercise the GitHub plane (router → registry-resolve → mTLS → channel → agent-acts → PR). Only a real issue/PR does — so **`e2e.yml` is formalized as layer-3's delivery proof** (not a new test), on-demand-triggerable by `macf routing doctor --e2e`.
+- **e2e is the routing-infra layer's NATIVE proof:** an `--inject` rides the channel directly and **structurally cannot** exercise the GitHub plane (router → registry-resolve → mTLS → channel → agent-acts → PR). Only a real issue/PR does — so **`e2e.yml` is formalized as layer-3's delivery proof**: `macf routing doctor --e2e` **triggers `e2e.yml`'s `workflow_dispatch` and reads its result** (reuse the existing suite — it already runs scheduled + on-demand and auto-files an issue on post-merge failure — *not* a parallel test).
 
 **Honesty requirement (loud in output):** non-invasive mesh checks prove the protocol **to the server's receive path**, NOT delivery-to-agent (the MCP-push blind spot that bit us this session) — only Passive/inject prove mesh delivery, and only e2e proves the routing plane.
 
@@ -86,6 +86,8 @@ Resolves the `--inject` invasiveness concern: proof escalates *with the layer*, 
 - **Stage-2 fallback consistency** — `agent-config.json` `tmux_session` matches the actual session name (the silent Stage-2 drop; revert-safety).
 - **e2e delivery proof** (§3).
 - **Repo-set source (resolves #560 Q3):** reuse an existing GitHub surface — the **App install-set** (or equivalent) — **not** a new `fleet.repos` config (no parallel, drift-prone surface).
+
+**Detection ≠ fix (devops):** `macf routing doctor` *detects* (e.g. wrong-key registration) but several remedies are **framework-owned** (`MACF_ROUTING_LABEL`, #542) — devops owns the diagnostic, not the registration logic it inspects.
 
 **The routing-client cert** (the single fleet-wide point) is a *write-only secret* → uncheckable statically; exercised **at use** by `macf routing doctor`'s own mTLS (a malformed cert fails its own POST = the signal) + on-disk where devops holds the source (`~/.macf/routing-client/`).
 
@@ -137,7 +139,7 @@ Both new commands need gh-auth (the GitHub reads) + a client cert + tailnet (the
 
 ## Open questions
 
-1. **Compose entrypoint** — a single "is the whole interconnect green?" command (self+mesh+routing) vs running the three separately. Lean: keep separate (clean layers) + document the "run all three" recipe; a `--all` aggregator can come later.
+1. **Compose entrypoint** — a single "is the whole interconnect green?" command (self+mesh+routing) vs running the three separately. Lean: keep separate (clean layers) + document the "run all three" recipe. An eventual `--all` aggregator must **degrade per-layer** (the layers have different access needs — self=local, mesh=tailnet+cert, routing=gh-auth+install-set), reporting e.g. "routing-infra: skipped — no gh-auth here" rather than failing the whole run; execution context determines which layers are runnable.
 2. Output format — human table vs `--json` (lean: both; `--json` for the CI variant).
 3. Does `fleet status` fully supersede the `macf-peers` skill, or coexist during transition?
 
