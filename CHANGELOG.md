@@ -4,6 +4,58 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.39] — 2026-06-27
+
+The **fleet-health release**: **DR-030 interconnect-doctor** (`macf fleet` /
+`macf routing`) and the **DR-031 agent-supervision framework** — both COMPLETE —
+plus the Stage-3 routing cutover and the `invoke_agent` telemetry fix. Additive /
+back-compat throughout (hard-version contracts: `health_schema_version`,
+fleet/routing-doctor `--json schema_version`). Marketplace v0.2.39 is a lockstep
+bump (plugin-content change: the turn-state hook + the Instance-13 / §5(c) rules).
+
+### feat
+
+- **DR-030 fleet/routing interconnect-doctor (complete).** `macf fleet status`
+  (roster + live health, #573); `macf fleet doctor` (non-invasive mesh
+  Reachable+Accepted, #578) + `--json schema_version` hard contract (#579) +
+  `--inject` invasive Processed-now delivery-proof (#585); `macf routing doctor`
+  (routing-infra: caller-pin, routability, freshness, CA, session-drift — phase-2,
+  #591). `/health` extended for liveness: `instance_id` + `cert_expiry` +
+  `health_schema_version` (#569), `state` turn-marker + `otel` reachability (#572)
+  fed by a plugin turn-state hook (#571), `last_processed` via the
+  local-turn-receipt keystone (#583); `/notify` `diagnostic` discriminator
+  (ACK-only short-circuit, #577).
+- **DR-031 agent-supervision framework (complete).** Instance-id-guarded
+  graceful-shutdown **deregister** (#553 root-cause, #586); registry
+  **heartbeat/TTL** + `isStaleEntry` (ungraceful-death backstop, #589) wired into
+  the **prune + collision** consumers (#592) — the stale-registration class is
+  closed; **`macf restart-self`** the be-replaceable verb (dry-run-default,
+  marked-stash, detached relauncher that outlives the session kill, #597); the
+  **`host-prelude` generator** (portable toolchain bootstrap — devbox/brew
+  dynamic re-source for cron / the restart-self relauncher / container
+  entrypoints, #599).
+
+### fix
+
+- **`invoke_agent` telemetry name (#590 / #593).** The span's `gen_ai.agent.name`
+  now emits the kebab routing-label, not the SCREAMING_SNAKE registry-key form
+  (via the new `fromVariableSegment`).
+
+### ci
+
+- **Stage-3 routing cutover (#563).** Repin the `agent-router` caller
+  `v1.3.4 → v3.3.0` — the substrate is now fully on Stage-3 mTLS.
+
+### docs
+
+- **DR-030 + DR-031 ratified** (Status → Accepted); DR-031 desired-state
+  reconciliation model. **DR-032** canonical agent naming convention (Proposed) +
+  two amendments — session keys on `name` across all surfaces (#601) and the
+  DR-029 managed-vs-operator taxonomy (host-prelude is managed-detected, #602).
+  **silent-fallback Instance 13** + `coordination.md` §Communication 5(c)
+  gate-sweep (the auditor's first canonical proposal, #576). Agent
+  state-detection research (#570).
+
 ## [0.2.38] — 2026-06-26
 
 The **DR-028 settings validator/scaffolder** + the **identity model** (DR-028 /
