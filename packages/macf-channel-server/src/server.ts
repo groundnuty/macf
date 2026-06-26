@@ -610,6 +610,7 @@ async function main(): Promise<void> {
     agentName: config.routingLabel,
     registry,
     httpsServer,
+    healthState: health,
     logger,
   });
 

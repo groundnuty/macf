@@ -199,6 +199,34 @@ export const HealthResponseSchema = z.object({
   // `version` + liveness, so these don't affect it.
   instance_id: z.string().nullable().optional(),
   cert_expiry: z.string().nullable().optional(),
+  // DR-030 phase-1 increment B (mesh self-report — live agent turn-state).
+  // Read from the `${MACF_WORKSPACE_DIR}/.macf/turn-state.json` marker that
+  // plugin hooks write. `.nullable()` for the absent/garbage-marker case
+  // (server idle, marker missing, or unparseable → null) and `.optional()`
+  // so a newer parser still validates an older agent's /health body that
+  // predates this field. `elapsed_ms` is computed live (now − started_at)
+  // on each /health call so it grows through a long tool wait.
+  state: z.object({
+    status: z.enum(['busy', 'idle']),
+    turn_number: z.number().int().nonnegative(),
+    elapsed_ms: z.number().int().nonnegative(),
+    phase: z.enum(['thinking', 'tool']).nullable(),
+    current_tool: z.string().nullable(),
+    current_command: z.string().nullable(),
+    last_turn_duration_ms: z.number().int().nonnegative().nullable(),
+    tool_use_count: z.number().int().nonnegative().nullable(),
+    output_tokens: z.number().int().nonnegative().nullable(),
+  }).nullable().optional(),
+  // DR-030 phase-1 increment B (the server's own OTLP exporter self-report).
+  // `endpoint` is the live `OTEL_EXPORTER_OTLP_ENDPOINT`; `endpoint_is_canonical`
+  // is an env-driven comparison (see health.ts `computeOtelEndpointInfo`);
+  // `endpoint_reachable` is a cached best-effort background TCP probe result.
+  // Same `.nullable().optional()` back-compat posture as `state`.
+  otel: z.object({
+    endpoint: z.string().nullable(),
+    endpoint_is_canonical: z.boolean(),
+    endpoint_reachable: z.boolean(),
+  }).nullable().optional(),
 });
 
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
@@ -321,4 +349,10 @@ export interface HealthState {
   readonly getHealth: () => HealthResponse;
   readonly setCurrentIssue: (issueNumber: number | null) => void;
   readonly recordNotification: () => void;
+  /**
+   * Release any background resources (e.g. the DR-030 OTLP-reachability probe
+   * interval). Optional + idempotent so existing constructors/mocks that don't
+   * hold resources stay valid; the shutdown handler calls it best-effort.
+   */
+  readonly dispose?: () => void;
 }
