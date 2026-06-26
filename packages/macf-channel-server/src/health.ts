@@ -5,6 +5,17 @@ import { connect } from 'node:net';
 import type { HealthResponse, HealthState } from '@groundnuty/macf-core';
 import { readLastProcessed, type ProcessedReceipt } from './comms-ledger.js';
 
+/**
+ * Hard version contract for the `/health` body SHAPE (DR-006 watchdog request,
+ * macf-devops-toolkit#115). A consumer asserts `health_schema_version === <known>`
+ * and refuses an unknown, so it fails LOUD on ANY breaking change to the
+ * `/health` shape — including a same-name SEMANTIC change (e.g. `last_processed.age_ms`
+ * meaning, an `at` rename) that additive-optional + presence-checks silently miss.
+ * BUMP on any breaking change to the `/health` shape; additive-optional fields do NOT
+ * bump it. Distinct from the package `version` (which bumps on every cs release).
+ */
+export const HEALTH_SCHEMA_VERSION = 1;
+
 /** The DR-030 `/health` `state` object shape (non-null), derived from the schema. */
 type TurnStateReport = NonNullable<HealthResponse['state']>;
 /** The DR-030 `/health` `otel` object shape (non-null), derived from the schema. */
@@ -315,6 +326,7 @@ export function createHealthState(
         uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
         current_issue: currentIssue,
         version,
+        health_schema_version: HEALTH_SCHEMA_VERSION,
         last_notification: lastNotification,
         instance_id: instanceId,
         cert_expiry: certExpiry,

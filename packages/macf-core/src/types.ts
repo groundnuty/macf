@@ -204,6 +204,12 @@ export const HealthResponseSchema = z.object({
   uptime_seconds: z.number().int().nonnegative(),
   current_issue: z.number().int().positive().nullable(),
   version: z.string(),
+  // The channel-server PACKAGE version (bumps on EVERY cs release). Distinct
+  // from `health_schema_version` below — a consumer that wants to detect a
+  // breaking change to the /health SHAPE must assert the latter, since
+  // `version` is too noisy (it false-rejects on a non-schema release bump).
+  // DR-006 watchdog request, macf-devops-toolkit#115.
+  health_schema_version: z.number().int().optional(),
   last_notification: z.string().nullable(),
   // DR-030 phase-1 (mesh self-report). Additive + `.optional()` so a newer
   // parser still validates an older agent's /health body that lacks these

@@ -9,6 +9,7 @@ import {
   computeOtelEndpointInfo,
   parseEndpointHostPort,
   createOtelReachabilityProbe,
+  HEALTH_SCHEMA_VERSION,
 } from '../src/health.js';
 import { receiptSinkPathFromLog, type ProcessedReceipt } from '../src/comms-ledger.js';
 import { EXPECTED_VERSION } from './version-helper.js';
@@ -86,6 +87,9 @@ describe('createHealthState', () => {
     expect(health.uptime_seconds).toBe(0);
     expect(health.current_issue).toBeNull();
     expect(health.version).toBe(EXPECTED_VERSION);
+    // DR-006 watchdog hard-version contract (macf-devops-toolkit#115): always
+    // emitted so a consumer can assert it + refuse an unknown version.
+    expect(health.health_schema_version).toBe(HEALTH_SCHEMA_VERSION);
     expect(health.last_notification).toBeNull();
     // DR-030 self-report fields default to null when no opts are passed.
     expect(health.instance_id).toBeNull();
