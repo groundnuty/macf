@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { z } from 'zod';
 
@@ -249,6 +249,169 @@ function safeJson(line: string): string {
     return line;
   } catch {
     return '{}';
+  }
+}
+
+// --- DR-030 phase-1 (groundnuty/macf#568): last_processed via the RECEIPT SINK ---
+//
+// The `/health` `last_processed` field is the agent's passive-Processed
+// self-report: "I processed a routed coordination message at time T", proven
+// LOCALLY with no synthetic injection (DR-030 §3 "Passive-Processed tier").
+//
+// THE LOCAL "PROCESSED" SOURCE IS THE RECEIPT SINK, not the comms-ledger.
+// When the router injects a prompt it appends a `[macf-route:<run_id>:<agent>]`
+// marker (macf-actions#45); the `emit-turn-receipt.sh` UserPromptSubmit hook
+// fires when that prompt is submitted AS A TURN and — alongside the OTLP
+// `turn_processed` span (which feeds Tempo + the #444 reconciler) — appends one
+// receipt line per marker to `processed-receipts.jsonl` (a sibling of
+// `channel.log`, see `receiptSinkPathFromLog`). THAT local append is the proof a
+// turn happened, and it is what this reader surfaces — making the passive tier a
+// real LOCAL self-report rather than a Tempo-only one (the keystone of #568).
+//
+// Why NOT the comms-ledger's `processed` field: every edge site writes
+// `processed: null` — the delivery≠turn join is a DERIVED view (`backfillProcessed`
+// / the #444 reconciler), never written back to the append-only ledger (DR-025).
+// So a `recv` + `processed:true` edge never exists on disk and a ledger scan is
+// always null. The ledger stays the authoritative edge record; this sink is the
+// separate, purpose-built local "I took a turn" proof.
+
+/** Receipt-sink filename (sibling of `channel.log`); the local turn-receipt log. */
+export const RECEIPT_SINK_FILENAME = 'processed-receipts.jsonl';
+
+/**
+ * Derive the receipt-sink path from the channel-server's `logPath` (`MACF_LOG_PATH`),
+ * as a sibling file in the same `.macf/logs/` directory — parallel to
+ * `ledgerPathFromLog`. `undefined` when no log path is configured (then
+ * `last_processed` is null: there is no sink to read). This is the SAME path the
+ * `emit-turn-receipt.sh` hook writes to (`$(dirname MACF_LOG_PATH)/<filename>`).
+ */
+export function receiptSinkPathFromLog(logPath: string | undefined): string | undefined {
+  if (!logPath) return undefined;
+  return join(dirname(logPath), RECEIPT_SINK_FILENAME);
+}
+
+/**
+ * One local turn-receipt line, written by `emit-turn-receipt.sh` (one per routed
+ * marker the agent processed in a turn). The compact wire form is exactly
+ * `{"ts":<epoch-ms>,"run_id":"<run_id>","agent":"<agent>"}`.
+ */
+export const ProcessedReceiptSchema = z.object({
+  /** Epoch milliseconds at which the routed prompt was submitted as a turn. */
+  ts: z.number(),
+  /** The router run id from the `[macf-route:<run_id>:<agent>]` marker. */
+  run_id: z.string().min(1),
+  /** The kebab agent name from the marker. */
+  agent: z.string().min(1),
+});
+export type ProcessedReceipt = z.infer<typeof ProcessedReceiptSchema>;
+
+/** The `/health` `last_processed` self-report shape (DR-030 passive-Processed tier). */
+export interface LastProcessedReport {
+  /** ISO-8601 timestamp of the most-recent turn-receipt (null if none/unparseable). */
+  readonly at: string | null;
+  /**
+   * GitHub anchor (owner/repo#N). Always `null` for the receipt sink — a turn
+   * receipt carries no github_anchor. The field stays in the shape for back-compat
+   * with the schema (and a future ledger-join view that could populate it).
+   */
+  readonly anchor: string | null;
+  /** now − ts, clamped ≥ 0; null when `at` is absent or `ts` is non-finite. */
+  readonly age_ms: number | null;
+  /**
+   * The receipt's `run_id` — THE `--inject` CONTRACT. An injector routes a prompt
+   * carrying a known `run_id` in its `[macf-route:<run_id>:<agent>]` marker, lets
+   * the agent process it in a turn, then reads `/health` and matches this
+   * `correlation_token` to confirm ITS OWN message was processed.
+   */
+  readonly correlation_token: string | null;
+}
+
+/**
+ * Parse a receipt-sink file's text into receipts, tolerantly: blank + malformed
+ * lines (incl. a torn final line mid-append) are skipped, never fatal — a corrupt
+ * line must not blind the read. Same posture as `mergeLedgers`.
+ */
+export function parseReceipts(content: string): ProcessedReceipt[] {
+  const out: ProcessedReceipt[] = [];
+  for (const raw of content.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    let json: unknown;
+    try {
+      json = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const parsed = ProcessedReceiptSchema.safeParse(json);
+    if (parsed.success) out.push(parsed.data);
+  }
+  return out;
+}
+
+/**
+ * Select the most-recent receipt (max `ts`), or null when there are none.
+ * Single-pass max-`ts` (not a sort) — cheap on the infrequent `/health` path. On
+ * equal `ts`, the first-seen wins (a benign tie). Max-`ts` (rather than just the
+ * last line) is robust to out-of-order lines under clock skew.
+ */
+export function selectLastReceipt(
+  receipts: readonly ProcessedReceipt[],
+): ProcessedReceipt | null {
+  let best: ProcessedReceipt | null = null;
+  for (const r of receipts) {
+    if (best === null || r.ts > best.ts) best = r;
+  }
+  return best;
+}
+
+/**
+ * Map a selected receipt (or null) into the `last_processed` `/health` shape.
+ * `at` ← ISO-8601 of the receipt's epoch-ms `ts`; `correlation_token` ← `run_id`
+ * (the `--inject` contract); `anchor` ← null (the sink carries no github_anchor);
+ * `age_ms` ← now − ts, clamped ≥ 0. A non-finite `ts` yields `at: null` + `age_ms: null`.
+ */
+export function mapReceiptToLastProcessed(
+  receipt: ProcessedReceipt | null,
+  now: number,
+): LastProcessedReport | null {
+  if (receipt === null) return null;
+  const finite = Number.isFinite(receipt.ts);
+  return {
+    at: finite ? new Date(receipt.ts).toISOString() : null,
+    anchor: null,
+    age_ms: finite ? Math.max(0, Math.floor(now - receipt.ts)) : null,
+    correlation_token: receipt.run_id,
+  };
+}
+
+/**
+ * Read the agent's most-recent turn-receipt from the receipt sink and map it to
+ * the `/health` `last_processed` self-report. NEVER throws — an unset/missing/
+ * unreadable/garbage sink (or any read/parse error) degrades to `null`, so it can
+ * never break `/health`. Inject `readReceipts` in tests to skip the file entirely.
+ *
+ * Perf: reads the whole jsonl on each call. A `/health` ping is infrequent and the
+ * sink is operator-rotated like the ledger (see `ROTATION_POLICY`), so a bounded
+ * full read is fine; a tail-scan optimisation is possible if it ever grows unbounded.
+ */
+export function readLastProcessed(opts: {
+  readonly logPath?: string | undefined;
+  readonly receiptSinkPath?: string | undefined;
+  readonly now: number;
+  readonly readReceipts?: () => readonly ProcessedReceipt[];
+}): LastProcessedReport | null {
+  try {
+    let receipts: readonly ProcessedReceipt[];
+    if (opts.readReceipts) {
+      receipts = opts.readReceipts();
+    } else {
+      const path = opts.receiptSinkPath ?? receiptSinkPathFromLog(opts.logPath);
+      if (!path || !existsSync(path)) return null;
+      receipts = parseReceipts(readFileSync(path, 'utf8'));
+    }
+    return mapReceiptToLastProcessed(selectLastReceipt(receipts), opts.now);
+  } catch {
+    return null;
   }
 }
 

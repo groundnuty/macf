@@ -5,7 +5,7 @@ import {
   readFileSync,
   existsSync,
   mkdirSync,
-  chmodSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,7 +17,14 @@ import {
   ledgerPathFromLog,
   COMMS_LEDGER_FILENAME,
   CommsLedgerEdgeSchema,
+  readLastProcessed,
+  selectLastReceipt,
+  mapReceiptToLastProcessed,
+  parseReceipts,
+  receiptSinkPathFromLog,
+  RECEIPT_SINK_FILENAME,
   type CommsLedgerEdge,
+  type ProcessedReceipt,
 } from '../src/comms-ledger.js';
 
 function edge(overrides: Partial<CommsLedgerEdge> = {}): CommsLedgerEdge {
@@ -199,5 +206,143 @@ describe('mergeLedgers — multi-host gather', () => {
     ledger.appendEdge(edge({ msg_id: 'w2', ts: '2026-06-08T00:00:09.000Z' }));
     const merged = mergeLedgers([readFileSync(path, 'utf8')]);
     expect(merged.map((e) => e.msg_id)).toEqual(['w1', 'w2']);
+  });
+});
+
+// --- DR-030 phase-1 (groundnuty/macf#568): last_processed via the receipt sink ---
+
+/** Build a turn-receipt (the `emit-turn-receipt.sh` wire shape) for reader tests. */
+function receipt(over: Partial<ProcessedReceipt> = {}): ProcessedReceipt {
+  return {
+    ts: Date.parse('2026-06-08T00:00:00.000Z'),
+    run_id: '27123456',
+    agent: 'code-agent',
+    ...over,
+  };
+}
+
+describe('receiptSinkPathFromLog', () => {
+  it('derives a sibling of channel.log', () => {
+    expect(receiptSinkPathFromLog('/x/.macf/logs/channel.log')).toBe(`/x/.macf/logs/${RECEIPT_SINK_FILENAME}`);
+  });
+  it('is undefined when logPath is undefined', () => {
+    expect(receiptSinkPathFromLog(undefined)).toBeUndefined();
+  });
+});
+
+describe('parseReceipts — tolerant line parsing', () => {
+  it('parses valid receipt lines, skipping blank + malformed + schema-failing lines', () => {
+    const content = [
+      JSON.stringify(receipt({ run_id: '1' })),
+      '',
+      'not json at all {{{',
+      '{"ts":123}', // valid JSON but fails the schema (missing run_id/agent)
+      '{"ts":456,"run_id":"","agent":"x"}', // empty run_id rejected by .min(1)
+      JSON.stringify(receipt({ run_id: '2' })),
+    ].join('\n');
+    expect(parseReceipts(content).map((r) => r.run_id)).toEqual(['1', '2']);
+  });
+
+  it('returns [] for empty content', () => {
+    expect(parseReceipts('')).toEqual([]);
+  });
+});
+
+describe('selectLastReceipt', () => {
+  it('picks the most-recent (max ts) receipt, robust to out-of-order lines', () => {
+    expect(
+      selectLastReceipt([
+        receipt({ run_id: 'old', ts: 1000 }),
+        receipt({ run_id: 'new', ts: 5000 }),
+        receipt({ run_id: 'mid', ts: 3000 }),
+      ])?.run_id,
+    ).toBe('new');
+  });
+  it('returns null on an empty list', () => {
+    expect(selectLastReceipt([])).toBeNull();
+  });
+});
+
+describe('mapReceiptToLastProcessed', () => {
+  const NOW = Date.parse('2026-06-08T00:00:05.000Z');
+
+  it('maps ts→at(ISO), run_id→correlation_token, anchor:null, age_ms=now−ts', () => {
+    const ts = Date.parse('2026-06-08T00:00:00.000Z');
+    expect(mapReceiptToLastProcessed(receipt({ ts, run_id: 'tok-XYZ' }), NOW)).toEqual({
+      at: '2026-06-08T00:00:00.000Z',
+      anchor: null,
+      age_ms: 5000,
+      correlation_token: 'tok-XYZ',
+    });
+  });
+
+  it('null receipt maps to null', () => {
+    expect(mapReceiptToLastProcessed(null, NOW)).toBeNull();
+  });
+
+  it('clamps age_ms to 0 on backwards clock skew (receipt ts in the future)', () => {
+    expect(mapReceiptToLastProcessed(receipt({ ts: NOW + 9000 }), NOW)?.age_ms).toBe(0);
+  });
+
+  it('yields at:null + age_ms:null for a non-finite ts (never NaN)', () => {
+    const r = mapReceiptToLastProcessed(receipt({ ts: NaN }), NOW);
+    expect(r?.at).toBeNull();
+    expect(r?.age_ms).toBeNull();
+  });
+});
+
+describe('readLastProcessed — reads the receipt sink', () => {
+  const NOW = Date.parse('2026-06-08T00:00:05.000Z');
+
+  it('reads the most-recent receipt via an injected readReceipts fn', () => {
+    expect(
+      readLastProcessed({
+        now: NOW,
+        readReceipts: () => [
+          receipt({ run_id: 'old', ts: Date.parse('2026-06-08T00:00:01.000Z') }),
+          receipt({ run_id: 'newest', ts: Date.parse('2026-06-08T00:00:03.000Z') }),
+        ],
+      }),
+    ).toEqual({
+      at: '2026-06-08T00:00:03.000Z',
+      anchor: null,
+      age_ms: 2000,
+      correlation_token: 'newest',
+    });
+  });
+
+  it('reads from a real on-disk receipt sink (sibling of logPath)', () => {
+    const logPath = join(tmp, 'logs', 'channel.log');
+    const sink = receiptSinkPathFromLog(logPath)!;
+    mkdirSync(join(tmp, 'logs'), { recursive: true });
+    writeFileSync(
+      sink,
+      [
+        JSON.stringify(receipt({ run_id: 'r-1', ts: Date.parse('2026-06-08T00:00:01.000Z') })),
+        JSON.stringify(receipt({ run_id: 'r-3', ts: Date.parse('2026-06-08T00:00:03.000Z') })),
+      ].join('\n') + '\n',
+    );
+    expect(readLastProcessed({ logPath, now: NOW })).toEqual({
+      at: '2026-06-08T00:00:03.000Z',
+      anchor: null,
+      age_ms: 2000,
+      correlation_token: 'r-3',
+    });
+  });
+
+  it('returns null when no logPath/receiptSinkPath/readReceipts is given', () => {
+    expect(readLastProcessed({ now: NOW })).toBeNull();
+  });
+
+  it('returns null when the receipt sink file is missing', () => {
+    expect(
+      readLastProcessed({ receiptSinkPath: join(tmp, 'nope', RECEIPT_SINK_FILENAME), now: NOW }),
+    ).toBeNull();
+  });
+
+  it('returns null (never throws) on a garbage receipt sink file', () => {
+    const path = join(tmp, RECEIPT_SINK_FILENAME);
+    writeFileSync(path, 'not json at all {{{\n{"partial":true}\n');
+    expect(readLastProcessed({ receiptSinkPath: path, now: NOW })).toBeNull();
   });
 });

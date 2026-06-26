@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -9,8 +9,20 @@ import {
   computeOtelEndpointInfo,
   parseEndpointHostPort,
   createOtelReachabilityProbe,
+  HEALTH_SCHEMA_VERSION,
 } from '../src/health.js';
+import { receiptSinkPathFromLog, type ProcessedReceipt } from '../src/comms-ledger.js';
 import { EXPECTED_VERSION } from './version-helper.js';
+
+/** Minimal turn-receipt factory for the DR-030 last_processed wiring tests. */
+function receipt(ts: string, over: Partial<ProcessedReceipt> = {}): ProcessedReceipt {
+  return {
+    ts: Date.parse(ts),
+    run_id: '27123456',
+    agent: 'code-agent',
+    ...over,
+  };
+}
 
 // Env hygiene: clear the DR-030 self-report env so ambient OTEL_*/MACF_* in the
 // CI shell can't make createHealthState read a real marker file or fire a real
@@ -75,10 +87,14 @@ describe('createHealthState', () => {
     expect(health.uptime_seconds).toBe(0);
     expect(health.current_issue).toBeNull();
     expect(health.version).toBe(EXPECTED_VERSION);
+    // DR-006 watchdog hard-version contract (macf-devops-toolkit#115): always
+    // emitted so a consumer can assert it + refuse an unknown version.
+    expect(health.health_schema_version).toBe(HEALTH_SCHEMA_VERSION);
     expect(health.last_notification).toBeNull();
     // DR-030 self-report fields default to null when no opts are passed.
     expect(health.instance_id).toBeNull();
     expect(health.cert_expiry).toBeNull();
+    expect(health.last_processed).toBeNull();
   });
 
   it('tracks uptime in seconds', () => {
@@ -442,5 +458,81 @@ describe('createHealthState — DR-030 otel self-report', () => {
       endpoint_reachable: false,
     });
     state.dispose?.();
+  });
+});
+
+// --- DR-030 phase-1 (groundnuty/macf#568): last_processed (passive-receipt self-report) ---
+
+describe('createHealthState — DR-030 last_processed', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    // 5s after the newest test receipt below, so age_ms is a round 2000.
+    vi.setSystemTime(new Date('2026-06-08T00:00:05.000Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('reports the most-recent receipt (run_id→correlation_token), age_ms fresh per call', () => {
+    const receipts = [
+      receipt('2026-06-08T00:00:01.000Z', { run_id: '41' }),
+      receipt('2026-06-08T00:00:03.000Z', { run_id: '42' }),
+      receipt('2026-06-08T00:00:02.000Z', { run_id: '40' }),
+    ];
+    const state = createHealthState('code-agent', 'permanent', {
+      processedReader: () => receipts,
+      otelProbe: async () => false,
+    });
+    expect(state.getHealth().last_processed).toEqual({
+      at: '2026-06-08T00:00:03.000Z',
+      anchor: null,
+      age_ms: 2000,
+      correlation_token: '42',
+    });
+    // age_ms grows live through a (simulated) 60s wait — recomputed per call.
+    vi.advanceTimersByTime(60_000);
+    expect(state.getHealth().last_processed?.age_ms).toBe(62_000);
+    state.dispose?.();
+  });
+
+  it('last_processed is null with no receipt source (no logPath, no reader)', () => {
+    const state = createHealthState('code-agent', 'permanent', { otelProbe: async () => false });
+    expect(state.getHealth().last_processed).toBeNull();
+    state.dispose?.();
+  });
+
+  it('last_processed is null when the reader yields no receipts', () => {
+    const state = createHealthState('code-agent', 'permanent', {
+      processedReader: () => [],
+      otelProbe: async () => false,
+    });
+    expect(state.getHealth().last_processed).toBeNull();
+    state.dispose?.();
+  });
+
+  it('reads from a real receipt sink at logPath (sibling processed-receipts.jsonl)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-lp-'));
+    const logPath = join(dir, 'logs', 'channel.log');
+    const sink = receiptSinkPathFromLog(logPath)!;
+    mkdirSync(join(dir, 'logs'), { recursive: true });
+    writeFileSync(
+      sink,
+      [
+        JSON.stringify(receipt('2026-06-08T00:00:02.000Z', { run_id: '6' })),
+        JSON.stringify(receipt('2026-06-08T00:00:03.000Z', { run_id: '7' })),
+      ].join('\n') + '\n',
+    );
+    try {
+      const state = createHealthState('code-agent', 'permanent', { logPath, otelProbe: async () => false });
+      expect(state.getHealth().last_processed).toEqual({
+        at: '2026-06-08T00:00:03.000Z',
+        anchor: null,
+        age_ms: 2000,
+        correlation_token: '7',
+      });
+      state.dispose?.();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

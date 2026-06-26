@@ -204,6 +204,12 @@ export const HealthResponseSchema = z.object({
   uptime_seconds: z.number().int().nonnegative(),
   current_issue: z.number().int().positive().nullable(),
   version: z.string(),
+  // The channel-server PACKAGE version (bumps on EVERY cs release). Distinct
+  // from `health_schema_version` below — a consumer that wants to detect a
+  // breaking change to the /health SHAPE must assert the latter, since
+  // `version` is too noisy (it false-rejects on a non-schema release bump).
+  // DR-006 watchdog request, macf-devops-toolkit#115.
+  health_schema_version: z.number().int().optional(),
   last_notification: z.string().nullable(),
   // DR-030 phase-1 (mesh self-report). Additive + `.optional()` so a newer
   // parser still validates an older agent's /health body that lacks these
@@ -239,6 +245,27 @@ export const HealthResponseSchema = z.object({
     endpoint: z.string().nullable(),
     endpoint_is_canonical: z.boolean(),
     endpoint_reachable: z.boolean(),
+  }).nullable().optional(),
+  // DR-030 phase-1 increment E1 (groundnuty/macf#568): the passive-Processed
+  // self-report. Surfaces the agent's MOST-RECENT *processed* received
+  // coordination edge straight from its LOCAL comms-ledger (DR-025). A recv edge
+  // with `processed: true` is the macf#444 distinction — a routed message that
+  // wasn't merely delivered but actually consumed in a turn — so a fleet-doctor
+  // (or watchdog) can prove "this agent processed real routed traffic at time T"
+  // at ZERO cost (no synthetic injection). `at` is the edge's ISO-8601 ts (null
+  // if none found); `anchor` its github_anchor (owner/repo#N) or null; `age_ms`
+  // is computed live (now − at) on each /health call; `correlation_token` is the
+  // edge's trace_id (the per-edge correlation id the future `--inject` tier echoes
+  // + matches against — see channel-server `mapLastProcessed`). Same back-compat
+  // `.nullable().optional()` posture as `state`/`otel`: a newer parser still
+  // validates an older agent's body that predates this field, and the whole
+  // object is null when no processed recv-edge exists. The #553 collision parser
+  // reads only `version`, so this never affects it.
+  last_processed: z.object({
+    at: z.string().nullable(),
+    anchor: z.string().nullable(),
+    age_ms: z.number().int().nonnegative().nullable(),
+    correlation_token: z.string().nullable(),
   }).nullable().optional(),
 });
 
