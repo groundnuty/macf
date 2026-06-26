@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { toVariableSegment } from '../../src/registry/variable-name.js';
+import { toVariableSegment, fromVariableSegment } from '../../src/registry/variable-name.js';
 
 describe('toVariableSegment', () => {
   it('uppercases plain alphanumeric names', () => {
@@ -35,5 +35,30 @@ describe('toVariableSegment', () => {
   it('handles digits', () => {
     expect(toVariableSegment('worker-a8f3c2')).toBe('WORKER_A8F3C2');
     expect(toVariableSegment('v1-0-0')).toBe('V1_0_0');
+  });
+});
+
+describe('fromVariableSegment (macf#590)', () => {
+  it('lowercases + converts underscores back to hyphens', () => {
+    expect(fromVariableSegment('DEVOPS_AGENT')).toBe('devops-agent');
+    expect(fromVariableSegment('CODE_AGENT')).toBe('code-agent');
+    expect(fromVariableSegment('CV_ARCHITECT')).toBe('cv-architect');
+  });
+
+  it('is idempotent on already-kebab routing-labels', () => {
+    expect(fromVariableSegment('devops-agent')).toBe('devops-agent');
+    expect(fromVariableSegment('code-agent')).toBe('code-agent');
+  });
+
+  it('round-trips a canonical kebab agent name through toVariableSegment', () => {
+    for (const name of ['devops-agent', 'code-agent', 'science-agent', 'cv-architect']) {
+      expect(fromVariableSegment(toVariableSegment(name))).toBe(name);
+    }
+  });
+
+  it('never emits an uppercase letter or underscore for a registry-key suffix', () => {
+    const out = fromVariableSegment('MACF_DEVOPS_AGENT');
+    expect(out).toBe('macf-devops-agent');
+    expect(out).not.toMatch(/[A-Z_]/);
   });
 });
