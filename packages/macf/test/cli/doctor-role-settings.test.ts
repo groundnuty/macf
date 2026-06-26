@@ -83,6 +83,20 @@ describe('checkRoleSettings (DR-028)', () => {
     expect(result.status).toBe('PASS');
     expect(result.findings).toHaveLength(0);
     expect(result.role).toBe('code-agent');
+    expect(result.roleKnown).toBe(true);
+  });
+
+  it('flags a non-canonical role as not known (macf#551 — surfaces auditor near-misses)', () => {
+    installFullFloor(tmpRoot);
+    // `auditor-agent` is a near-miss on the safety-critical `auditor` role: it
+    // gets the floor (PASS) but NOT the never-acts delta, so the doctor must
+    // mark it roleKnown=false so the report INFO surfaces the typo.
+    const result = checkRoleSettings(tmpRoot, 'auditor-agent');
+    expect(result.roleKnown).toBe(false);
+    // No never-acts ERROR (the delta keys on exact "auditor"), so floor-only.
+    expect(result.findings.some((f) => f.severity === 'ERROR')).toBe(false);
+    // A canonical role is roleKnown=true.
+    expect(checkRoleSettings(tmpRoot, 'auditor').roleKnown).toBe(true);
   });
 
   it('PASS for the auditor role when the full floor (incl. never-acts hook) is installed', () => {

@@ -32,6 +32,7 @@ import {
   expectedAllowForRole,
   expectedHooksForRole,
   ROLE_FLOOR_DENY,
+  isKnownRole,
 } from '../role-settings-model.js';
 
 /**
@@ -429,6 +430,13 @@ export interface RoleSettingsCheckResult {
   readonly status: 'PASS' | 'WARN' | 'ERROR';
   readonly role: string;
   readonly findings: readonly RoleSettingFinding[];
+  /**
+   * False when `role` is not a framework-recognized role (`KNOWN_ROLES`,
+   * macf#551) — a custom role validated against the floor only. The report
+   * surfaces this (INFO) so a typo on a delta-bearing safety role (e.g.
+   * `auditor-agent` vs `auditor`) is visible rather than silently floor-only.
+   */
+  readonly roleKnown: boolean;
   readonly readError?: string;
 }
 
@@ -518,6 +526,7 @@ export function checkRoleSettings(workspaceDir: string, role: string): RoleSetti
       status: 'WARN',
       role,
       findings: [],
+      roleKnown: isKnownRole(role),
       readError: err instanceof Error ? err.message : String(err),
     };
   }
@@ -532,7 +541,7 @@ export function checkRoleSettings(workspaceDir: string, role: string): RoleSetti
     findings.some((f) => f.severity === 'ERROR') ? 'ERROR'
     : findings.length > 0 ? 'WARN'
     : 'PASS';
-  return { status, role, findings };
+  return { status, role, findings, roleKnown: isKnownRole(role) };
 }
 
 /**
@@ -568,6 +577,18 @@ function printRoleSettingsSection(role: string | null, check: RoleSettingsCheckR
   if (check.readError) {
     console.log(`  ⚠ could not parse .claude/settings.json: ${check.readError}`);
     return;
+  }
+  // macf#551: surface a non-canonical role so a typo on a delta-bearing safety
+  // role (e.g. `auditor-agent` vs the exact `auditor`, which would silently skip
+  // the never-acts hook + its ERROR) is visible rather than degrading to
+  // floor-only without a signal.
+  if (!check.roleKnown) {
+    console.log(
+      `  ℹ role "${role}" is not a canonical MACF role — validated against the floor only.`,
+    );
+    console.log(
+      '    If this should be a delta-bearing role (e.g. the auditor → exact "auditor", no -agent suffix), check for a typo.',
+    );
   }
   if (check.status === 'PASS') {
     console.log(`  ✓ role "${role}" settings match the DR-028 floor + role deltas  [PASS]`);
