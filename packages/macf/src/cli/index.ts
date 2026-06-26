@@ -12,6 +12,7 @@ import { listPeers } from './commands/peers.js';
 import { runPs } from './commands/ps.js';
 import { runFleetStatus } from './commands/fleet.js';
 import { runFleetDoctor } from './commands/fleet-doctor.js';
+import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './commands/certs.js';
 import { repoInit } from './commands/repo-init.js';
@@ -287,6 +288,33 @@ fleet
       json: opts.json,
       inject: opts.inject,
       injectTimeoutSec: opts.injectTimeout,
+    });
+    process.exitCode = code;
+  });
+
+const routing = program
+  .command('routing')
+  .description('Routing-infra (GitHub delivery plane) interconnect-health (DR-030)');
+
+routing
+  .command('doctor')
+  .description(
+    'Routing-infra interconnect check (DR-030 phase-2): STATIC GitHub-plane checks ' +
+    'that the delivery plane is wired right — (1) CALLER-PIN consistency across the ' +
+    'App install-set, (2) the #538 split: ROUTABLE (MACF_AGENT_<LABEL> registry key) ' +
+    '+ SELF-SKIP (agent-config app_name == bot-login, #566), (3) registration ' +
+    'FRESHNESS (registry instance_id == live /health), (4) MACF_CA_CERT present + ' +
+    'parses (#563), (5) tmux_session <project>@<agent> convention. These prove the ' +
+    'PLUMBING, NOT end-to-end delivery (that is --e2e, a later increment). Exits ' +
+    'non-zero when DEGRADED.',
+  )
+  .option('--json', 'Emit the structured per-check result as JSON (DR-031 watchdog contract)', false)
+  .option('--expected-pin <pin>', 'Expected macf-actions caller-pin (else the modal pin across the fleet)')
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    const code = await runRoutingDoctor(resolveProjectDir(opts.dir), {
+      json: opts.json,
+      expectedPin: opts.expectedPin,
     });
     process.exitCode = code;
   });

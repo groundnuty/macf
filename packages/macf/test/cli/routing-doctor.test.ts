@@ -1,0 +1,499 @@
+/**
+ * Tests for `macf routing doctor` — ROUTING-INFRA-layer interconnect checks
+ * (DR-030 phase-2, macf#568).
+ *
+ * Fully offline + deterministic: the App install-set, the caller-pin reads, the
+ * routing config, the registry list, the mTLS `/health` probe, and the CA-var
+ * read are ALL injected (no `gh`, no network). The load-bearing cases mirror the
+ * 2026-06-26 outage's root causes: (a) a DIVERGENT caller-pin is flagged, (b) a
+ * missing `MACF_AGENT_<LABEL>` key fails routability, (c) an `app_name` != the
+ * bot-login fails self-skip WHILE routability stays green (they're independent),
+ * (d) a malformed `MACF_CA_CERT` fails, plus session-drift + instance_id-stale.
+ */
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
+import {
+  buildAgentRows,
+  buildRepoRows,
+  classifyFreshness,
+  computeExpectedPin,
+  evaluateCaCert,
+  evaluateSelfSkip,
+  evaluateSession,
+  formatAgentTable,
+  formatRepoTable,
+  freshnessGlyph,
+  gatherRoutingDoctor,
+  isStrictBase64,
+  normalizeLogin,
+  pinGlyph,
+  ROUTING_DOCTOR_JSON_SCHEMA_VERSION,
+  routingDoctorToJson,
+  routingVerdict,
+  runRoutingDoctor,
+  summaryLine,
+  type CallerPinResult,
+  type RoutingConfig,
+  type RoutingDoctorDeps,
+  type RoutingProbeFn,
+} from '../../src/cli/commands/routing-doctor.js';
+
+function info(host: string, port: number, instanceId: string): AgentInfo {
+  return { host, port, type: 'permanent', instance_id: instanceId, started: '2026-06-26T00:00:00Z' };
+}
+
+/** A minimal `/health` body echoing a given instance_id (freshness join). */
+function health(instanceId: string | null): HealthResponse {
+  return {
+    agent: 'x',
+    status: 'online',
+    type: 'permanent',
+    uptime_seconds: 1,
+    current_issue: null,
+    version: '0.2.38',
+    last_notification: null,
+    instance_id: instanceId,
+  } as HealthResponse;
+}
+
+/** A valid PEM cert (the body is real base64 → strict-base64-legal). */
+const VALID_PEM = `-----BEGIN CERTIFICATE-----\n${Buffer.from('x'.repeat(120)).toString('base64')}\n-----END CERTIFICATE-----`;
+
+// --- Pure primitives ---
+
+describe('normalizeLogin', () => {
+  it('strips app/ prefix + [bot] suffix, lowercases', () => {
+    expect(normalizeLogin('app/macf-code-agent[bot]')).toBe('macf-code-agent');
+    expect(normalizeLogin('MACF-Code-Agent')).toBe('macf-code-agent');
+    expect(normalizeLogin('macf-code-agent[bot]')).toBe('macf-code-agent');
+  });
+});
+
+describe('computeExpectedPin — modal / override', () => {
+  it('picks the modal pin', () => {
+    expect(computeExpectedPin(['v3.3.0', 'v3.3.0', 'v1.3.4'])).toBe('v3.3.0');
+  });
+  it('honors an explicit override', () => {
+    expect(computeExpectedPin(['v1.3.4', 'v1.3.4'], 'v3.3.0')).toBe('v3.3.0');
+  });
+  it('null when nothing is pinned', () => {
+    expect(computeExpectedPin([])).toBeNull();
+  });
+});
+
+describe('evaluateSelfSkip — #538(b) / #566', () => {
+  it('exact bot-login match passes (normalized, [bot]-tolerant)', () => {
+    expect(evaluateSelfSkip('code-agent', 'macf-code-agent', 'macf-code-agent[bot]')).toEqual({ ok: true });
+  });
+  it('app_name != bot-login fails when the authoritative login is known', () => {
+    const r = evaluateSelfSkip('code-agent', 'something-wrong', 'macf-code-agent[bot]');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/!= bot-login/);
+  });
+  it('heuristic: bare routing label (the #566 bug) fails with no authoritative login', () => {
+    const r = evaluateSelfSkip('code-agent', 'code-agent');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/#566/);
+  });
+  it('heuristic: a bot-login-shaped app_name passes', () => {
+    expect(evaluateSelfSkip('code-agent', 'macf-code-agent')).toEqual({ ok: true });
+  });
+  it('missing app_name fails', () => {
+    expect(evaluateSelfSkip('code-agent', undefined).ok).toBe(false);
+  });
+});
+
+describe('evaluateSession — <project>@<agent> convention', () => {
+  it('passes the canonical form', () => {
+    expect(evaluateSession('code-agent', 'macf@code-agent', 'macf')).toEqual({
+      ok: true,
+      expected: 'macf@code-agent',
+    });
+  });
+  it('flags a bare-label session (the silent Stage-2 drift)', () => {
+    const r = evaluateSession('code-agent', 'code-agent', 'macf');
+    expect(r.ok).toBe(false);
+    expect(r.expected).toBe('macf@code-agent');
+    expect(r.reason).toMatch(/convention/);
+  });
+  it('flags a missing session', () => {
+    expect(evaluateSession('code-agent', undefined, 'macf').ok).toBe(false);
+  });
+});
+
+describe('isStrictBase64 / evaluateCaCert — #563 malformed catch', () => {
+  it('strict base64 only', () => {
+    expect(isStrictBase64(Buffer.from('hello').toString('base64'))).toBe(true);
+    expect(isStrictBase64('AAAA!BBB')).toBe(false); // illegal char
+    expect(isStrictBase64('AAA')).toBe(false); // not a multiple of 4
+  });
+  it('a valid PEM cert passes', () => {
+    expect(evaluateCaCert(VALID_PEM)).toMatchObject({ present: true, valid: true });
+  });
+  it('a base64-of-PEM blob passes (the #563 storage form)', () => {
+    const b64 = Buffer.from(VALID_PEM).toString('base64');
+    expect(evaluateCaCert(b64)).toMatchObject({ present: true, valid: true });
+  });
+  it('absent → present:false, valid:false', () => {
+    expect(evaluateCaCert(null)).toMatchObject({ present: false, valid: false });
+    expect(evaluateCaCert('  ')).toMatchObject({ present: false, valid: false });
+  });
+  it('present-but-malformed (garbled base64 body) → present:true, valid:false (#563)', () => {
+    const bad = '-----BEGIN CERTIFICATE-----\nAAAA!notbase64\n-----END CERTIFICATE-----';
+    const r = evaluateCaCert(bad);
+    expect(r).toMatchObject({ present: true, valid: false });
+    expect(r.reason).toMatch(/base64/);
+  });
+  it('present-but-not-a-cert (random non-base64 string) → invalid', () => {
+    expect(evaluateCaCert('this is not a cert!!!')).toMatchObject({ present: true, valid: false });
+  });
+});
+
+describe('classifyFreshness — registry vs live /health instance_id', () => {
+  const now = Date.parse('2026-06-26T12:00:00Z');
+  const ttl = 900_000;
+  it('fresh when instance_id matches', () => {
+    expect(classifyFreshness(info('h', 1, 'inst-a'), health('inst-a'), now, ttl)).toBe('fresh');
+  });
+  it('stale when instance_id mismatches (a newer instance answered)', () => {
+    expect(classifyFreshness(info('h', 1, 'inst-OLD'), health('inst-NEW'), now, ttl)).toBe('stale');
+  });
+  it('unknown when /health omits instance_id (older cs)', () => {
+    expect(classifyFreshness(info('h', 1, 'inst-a'), health(null), now, ttl)).toBe('unknown');
+  });
+  it('unreachable when /health is null + no aged heartbeat', () => {
+    expect(classifyFreshness(info('h', 1, 'inst-a'), null, now, ttl)).toBe('unreachable');
+  });
+  it('stale when /health is null AND heartbeat aged past TTL (DR-031)', () => {
+    const aged: AgentInfo = { ...info('h', 1, 'inst-a'), last_heartbeat: '2026-06-26T00:00:00Z' };
+    expect(classifyFreshness(aged, null, now, ttl)).toBe('stale');
+  });
+});
+
+// --- Deps factory for the orchestration / command tests ---
+
+const ALL_PINNED_V3: (repo: string) => Promise<CallerPinResult> = async (repo) => ({
+  repo,
+  pin: 'v3.3.0',
+  status: 'pinned',
+});
+
+const HEALTHY_CONFIG: RoutingConfig = {
+  agents: {
+    'code-agent': { app_name: 'macf-code-agent', tmux_session: 'macf@code-agent' },
+    'science-agent': { app_name: 'macf-science-agent', tmux_session: 'macf@science-agent' },
+  },
+};
+
+function deps(over: Partial<RoutingDoctorDeps> = {}): RoutingDoctorDeps {
+  return {
+    project: 'macf',
+    now: Date.parse('2026-06-26T12:00:00Z'),
+    listRepos: async () => ['groundnuty/macf', 'groundnuty/macf-science-agent'],
+    readCallerPin: ALL_PINNED_V3,
+    readRoutingConfig: async () => HEALTHY_CONFIG,
+    listRegistry: async () => [
+      { name: 'CODE_AGENT', info: info('100.64.0.1', 4100, 'inst-code') },
+      { name: 'SCIENCE_AGENT', info: info('100.64.0.2', 4200, 'inst-science') },
+    ],
+    probe: async (_h, port) => (port === 4100 ? health('inst-code') : health('inst-science')),
+    readCaCert: async () => VALID_PEM,
+    ...over,
+  };
+}
+
+describe('gatherRoutingDoctor — the all-green baseline', () => {
+  it('every check passes → HEALTHY', async () => {
+    const report = await gatherRoutingDoctor(deps());
+    expect(routingVerdict(report)).toBe('HEALTHY');
+    expect(report.expectedPin).toBe('v3.3.0');
+    expect(report.repoPins.every((r) => r.consistent === true)).toBe(true);
+    expect(report.agents).toHaveLength(2);
+    expect(report.agents.every((a) => a.routable && a.selfSkipOk && a.sessionOk && a.freshness === 'fresh')).toBe(
+      true,
+    );
+    expect(report.ca).toMatchObject({ present: true, valid: true });
+  });
+});
+
+describe('check 1 — divergent caller-pin is flagged', () => {
+  it('one repo on v1.3.4 while the rest are v3.3.0 → DEGRADED + that repo inconsistent', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        readCallerPin: async (repo) =>
+          repo === 'groundnuty/macf-science-agent'
+            ? { repo, pin: 'v1.3.4', status: 'pinned' }
+            : { repo, pin: 'v3.3.0', status: 'pinned' },
+      }),
+    );
+    expect(report.expectedPin).toBe('v3.3.0'); // modal
+    const diverged = report.repoPins.find((r) => r.repo === 'groundnuty/macf-science-agent');
+    expect(diverged).toMatchObject({ pin: 'v1.3.4', consistent: false });
+    expect(routingVerdict(report)).toBe('DEGRADED');
+  });
+
+  it('a non-caller repo (no agent-router.yml) does NOT count as divergence', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        listRepos: async () => ['groundnuty/macf', 'groundnuty/groundnuty'],
+        readCallerPin: async (repo) =>
+          repo === 'groundnuty/groundnuty'
+            ? { repo, pin: null, status: 'no-workflow' }
+            : { repo, pin: 'v3.3.0', status: 'pinned' },
+      }),
+    );
+    const owner = report.repoPins.find((r) => r.repo === 'groundnuty/groundnuty');
+    expect(owner).toMatchObject({ consistent: null }); // excluded from verdict
+    expect(routingVerdict(report)).toBe('HEALTHY');
+  });
+});
+
+describe('check 2a — routability (missing MACF_AGENT_<LABEL>)', () => {
+  it('a label with no registry key fails routability → DEGRADED', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        // SCIENCE_AGENT is missing from the registry entirely.
+        listRegistry: async () => [{ name: 'CODE_AGENT', info: info('100.64.0.1', 4100, 'inst-code') }],
+      }),
+    );
+    const science = report.agents.find((a) => a.label === 'science-agent')!;
+    expect(science.routable).toBe(false);
+    expect(science.freshness).toBe('unregistered'); // no probe attempted
+    expect(routingVerdict(report)).toBe('DEGRADED');
+  });
+});
+
+describe('check 2b — self-skip independent of routability', () => {
+  it('app_name != bot-login fails self-skip BUT routability stays green', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        // The authoritative bot-login for code-agent is macf-code-agent; the
+        // config has the WRONG value, but the registry key still exists.
+        botLogins: { 'code-agent': 'macf-code-agent[bot]' },
+        readRoutingConfig: async () => ({
+          agents: {
+            'code-agent': { app_name: 'code-agent', tmux_session: 'macf@code-agent' }, // bare label (#566)
+            'science-agent': { app_name: 'macf-science-agent', tmux_session: 'macf@science-agent' },
+          },
+        }),
+      }),
+    );
+    const code = report.agents.find((a) => a.label === 'code-agent')!;
+    expect(code.routable).toBe(true); // STILL routes — resolution never touches app_name
+    expect(code.selfSkipOk).toBe(false);
+    expect(code.selfSkipReason).toMatch(/!= bot-login/);
+    expect(routingVerdict(report)).toBe('DEGRADED');
+  });
+});
+
+describe('check 3 — registration freshness (instance_id stale)', () => {
+  it('registry instance_id != live /health instance_id → stale → DEGRADED', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        // /health for code-agent reports a DIFFERENT instance_id than the registry.
+        probe: async (_h, port) => (port === 4100 ? health('inst-NEWER') : health('inst-science')),
+      }),
+    );
+    const code = report.agents.find((a) => a.label === 'code-agent')!;
+    expect(code.freshness).toBe('stale');
+    expect(code.registryInstanceId).toBe('inst-code');
+    expect(code.healthInstanceId).toBe('inst-NEWER');
+    expect(routingVerdict(report)).toBe('DEGRADED');
+  });
+
+  it('unreachable freshness does NOT fail the verdict (liveness is fleet-doctor’s job)', async () => {
+    const report = await gatherRoutingDoctor(deps({ probe: async () => null }));
+    expect(report.agents.every((a) => a.freshness === 'unreachable')).toBe(true);
+    expect(routingVerdict(report)).toBe('HEALTHY');
+  });
+});
+
+describe('check 4 — CA material malformed', () => {
+  it('a malformed MACF_CA_CERT → DEGRADED', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({ readCaCert: async () => '-----BEGIN CERTIFICATE-----\nAAAA!bad\n-----END CERTIFICATE-----' }),
+    );
+    expect(report.ca).toMatchObject({ present: true, valid: false });
+    expect(routingVerdict(report)).toBe('DEGRADED');
+  });
+});
+
+describe('check 5 — session-name drift', () => {
+  it('a bare-label tmux_session fails the convention → DEGRADED', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        readRoutingConfig: async () => ({
+          agents: {
+            'code-agent': { app_name: 'macf-code-agent', tmux_session: 'code-agent' }, // drift
+            'science-agent': { app_name: 'macf-science-agent', tmux_session: 'macf@science-agent' },
+          },
+        }),
+      }),
+    );
+    const code = report.agents.find((a) => a.label === 'code-agent')!;
+    expect(code.sessionOk).toBe(false);
+    expect(code.sessionExpected).toBe('macf@code-agent');
+    expect(routingVerdict(report)).toBe('DEGRADED');
+  });
+});
+
+describe('routingVerdict — EMPTY', () => {
+  it('no repos + no agents → EMPTY', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({ listRepos: async () => [], readRoutingConfig: async () => null, listRegistry: async () => [] }),
+    );
+    expect(routingVerdict(report)).toBe('EMPTY');
+  });
+});
+
+// --- Rendering ---
+
+describe('rendering — tables + glyphs', () => {
+  it('pinGlyph ✓ / ✗ / — n/a', () => {
+    expect(pinGlyph(true)).toBe('✓');
+    expect(pinGlyph(false)).toBe('✗');
+    expect(pinGlyph(null)).toBe('— n/a');
+  });
+  it('freshnessGlyph maps each state', () => {
+    expect(freshnessGlyph('fresh')).toBe('✓');
+    expect(freshnessGlyph('stale')).toBe('✗ stale');
+    expect(freshnessGlyph('unreachable')).toBe('? unreach');
+    expect(freshnessGlyph('unknown')).toBe('? unkn');
+    expect(freshnessGlyph('unregistered')).toBe('—');
+  });
+  it('buildRepoRows + formatRepoTable render REPO / CALLER-PIN / CONSISTENT', () => {
+    const rows = [
+      { repo: 'groundnuty/macf', pin: 'v3.3.0', status: 'pinned' as const, consistent: true },
+      { repo: 'groundnuty/x', pin: 'v1.3.4', status: 'pinned' as const, consistent: false },
+    ];
+    expect(buildRepoRows(rows)).toEqual([
+      ['groundnuty/macf', 'v3.3.0', '✓'],
+      ['groundnuty/x', 'v1.3.4', '✗'],
+    ]);
+    expect(formatRepoTable(rows).split('\n')[0]).toContain('CALLER-PIN');
+  });
+  it('buildAgentRows + formatAgentTable render the five-check row', async () => {
+    const report = await gatherRoutingDoctor(deps());
+    const rows = buildAgentRows(report.agents);
+    expect(rows[0]).toEqual(['code-agent', '✓', '✓', '✓', '✓']);
+    expect(formatAgentTable(report.agents).split('\n')[0]).toContain('SELF-SKIP');
+  });
+});
+
+describe('summaryLine', () => {
+  it('reads HEALTHY for the baseline', async () => {
+    const report = await gatherRoutingDoctor(deps());
+    expect(summaryLine(report)).toMatch(/routing plane: HEALTHY/);
+    expect(summaryLine(report)).toMatch(/pins consistent/);
+  });
+});
+
+// --- JSON contract ---
+
+describe('routingDoctorToJson — DR-031 watchdog contract', () => {
+  it('carries schema_version + summary verdict + per-check detail + disclaimer', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        readCallerPin: async (repo) =>
+          repo === 'groundnuty/macf-science-agent'
+            ? { repo, pin: 'v1.3.4', status: 'pinned' }
+            : { repo, pin: 'v3.3.0', status: 'pinned' },
+      }),
+    );
+    const json = routingDoctorToJson(report) as {
+      schema_version: number;
+      project: string;
+      summary: { verdict: string; routing_repos: number; pins_consistent: boolean; ca_ok: boolean; agents_total: number };
+      caller_pins: ReadonlyArray<Record<string, unknown>>;
+      agents: ReadonlyArray<Record<string, unknown>>;
+      ca_cert: Record<string, unknown>;
+      disclaimer: string;
+    };
+    expect(json.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION);
+    expect(json.schema_version).toBe(1);
+    expect(json.project).toBe('macf');
+    expect(json.summary.verdict).toBe('DEGRADED');
+    expect(json.summary.pins_consistent).toBe(false);
+    expect(json.summary.ca_ok).toBe(true);
+    expect(json.summary.agents_total).toBe(2);
+    expect(json.caller_pins).toHaveLength(2);
+    expect(json.agents[0]).toMatchObject({ label: 'code-agent', routable: true, self_skip_ok: true });
+    expect(json.ca_cert).toMatchObject({ present: true, valid: true });
+    expect(json.disclaimer).toMatch(/Static GitHub-plane/);
+  });
+});
+
+// --- Command entry point ---
+
+describe('runRoutingDoctor (injected deps)', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  afterEach(() => logSpy?.mockRestore());
+
+  it('prints both tables + CA line + summary + honesty legend; exits non-zero on DEGRADED', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runRoutingDoctor(
+      '/unused',
+      {},
+      deps({
+        readCallerPin: async (repo) =>
+          repo === 'groundnuty/macf-science-agent'
+            ? { repo, pin: 'v1.3.4', status: 'pinned' }
+            : { repo, pin: 'v3.3.0', status: 'pinned' },
+      }),
+    );
+    expect(code).toBe(1);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('macf routing doctor — macf');
+    expect(out).toContain('CALLER-PIN');
+    expect(out).toContain('SELF-SKIP');
+    expect(out).toContain('MACF_CA_CERT:');
+    expect(out).toContain('routing plane: DEGRADED');
+    expect(out).toContain('STATIC GitHub-plane checks'); // honesty legend
+    expect(out).toContain('--e2e');
+  });
+
+  it('exits 0 when HEALTHY', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runRoutingDoctor('/unused', {}, deps());
+    expect(code).toBe(0);
+    expect(logSpy.mock.calls.flat().join('\n')).toContain('routing plane: HEALTHY');
+  });
+
+  it('emits the stable JSON contract under --json (exit code still reflects verdict)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runRoutingDoctor(
+      '/unused',
+      { json: true },
+      deps({ readCaCert: async () => 'not-a-cert!!!' }), // malformed CA → DEGRADED
+    );
+    expect(code).toBe(1);
+    const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
+    expect(parsed.schema_version).toBe(1);
+    expect(parsed.summary.verdict).toBe('DEGRADED');
+    expect(parsed.ca_cert).toMatchObject({ present: true, valid: false });
+  });
+
+  it('reports EMPTY cleanly (exit 0) when nothing is discovered', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runRoutingDoctor(
+      '/unused',
+      {},
+      deps({ listRepos: async () => [], readRoutingConfig: async () => null, listRegistry: async () => [], readCaCert: async () => VALID_PEM }),
+    );
+    expect(code).toBe(0);
+    expect(logSpy.mock.calls.flat().join('\n')).toMatch(/Nothing to check/);
+  });
+
+  it('honors --expected-pin (flags repos off the explicitly-expected pin)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runRoutingDoctor(
+      '/unused',
+      { json: true, expectedPin: 'v3.3.0' },
+      deps({ readCallerPin: async (repo) => ({ repo, pin: 'v1.3.4', status: 'pinned' }) }),
+    );
+    expect(code).toBe(1); // all repos diverge from the expected v3.3.0
+    const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
+    expect(parsed.summary.expected_pin).toBe('v3.3.0');
+    expect(parsed.summary.pins_consistent).toBe(false);
+  });
+});
