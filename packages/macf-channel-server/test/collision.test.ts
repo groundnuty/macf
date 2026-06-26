@@ -90,6 +90,42 @@ function mockDead(): void {
   });
 }
 
+/**
+ * Mock the just-killed-port race (groundnuty/macf#553): the peer answers 2xx on
+ * the first `aliveCount` ping(s) — simulating the dying instance's not-yet-released
+ * listening socket — then is dead (ECONNREFUSED on end()) on every subsequent ping.
+ * With aliveCount=1 (default) the slot flickers alive once, then the re-confirm
+ * fails → the peer must be treated as dead → takeover.
+ */
+function mockAliveThenDead(version: string | null = INCOMING, aliveCount = 1): void {
+  let call = 0;
+  vi.mocked(mockRequest).mockImplementation((_opts, cb) => {
+    call += 1;
+    if (call <= aliveCount) {
+      const bodyObj = version === null ? { status: 'online' } : { status: 'online', version };
+      const bodyStr = JSON.stringify(bodyObj);
+      const mockRes = {
+        statusCode: 200,
+        resume: vi.fn(),
+        on: vi.fn((event: string, handler: (...args: any[]) => void) => {
+          if (event === 'data') handler(Buffer.from(bodyStr));
+          if (event === 'end') handler();
+          return mockRes;
+        }),
+      };
+      if (cb) (cb as (res: typeof mockRes) => void)(mockRes);
+      return { on: vi.fn(), end: vi.fn(), destroy: vi.fn() } as any;
+    }
+    const handlers: Record<string, (...args: any[]) => void> = {};
+    const req = {
+      on: vi.fn((event: string, handler: (...args: any[]) => void) => { handlers[event] = handler; return req; }),
+      end: vi.fn(() => { if (handlers['error']) handlers['error'](new Error('ECONNREFUSED')); }),
+      destroy: vi.fn(),
+    };
+    return req as any;
+  });
+}
+
 /** Find the warn-level collision_check log basis (the #424 decision). */
 function decisionBasis(logger: Logger): string | undefined {
   const warn = vi.mocked(logger.warn);
@@ -207,6 +243,40 @@ describe('checkCollision', () => {
       await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
       const call = vi.mocked(logger.warn).mock.calls.find((c) => c[0] === 'collision_check');
       expect(call?.[1]).toMatchObject({ incoming_version: '0.2.34', existing_version: '0.2.20' });
+    });
+
+    it('re-confirms a genuinely-live same-version peer (two pings) before aborting — no #424 regression', async () => {
+      mockAliveWithVersion('0.2.34'); // answers EVERY ping → confirmed alive
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('abort');
+      expect(decisionBasis(logger)).toBe('abort_same_or_newer');
+      // The fix must not trust a single 2xx: the live peer is pinged twice.
+      expect(mockRequest).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('just-killed-port race → takeover (groundnuty/macf#553)', () => {
+    it('TAKES OVER a same-version peer that flickers alive once then dies (the motivating race)', async () => {
+      mockAliveThenDead('0.2.34'); // same version — a single trusting ping would WRONGLY abort
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', mockLogger());
+      expect(result.action).toBe('takeover');
+      if (result.action === 'takeover') expect(result.previous.instance_id).toBe('a8f3c2');
+      // Re-confirm actually happened: alive ping #1, then the dead re-check #2.
+      expect(mockRequest).toHaveBeenCalledTimes(2);
+    });
+
+    it('TAKES OVER a newer-version peer that flickers alive once then dies', async () => {
+      mockAliveThenDead('0.2.40'); // newer — would abort under a single trusting ping
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', mockLogger());
+      expect(result.action).toBe('takeover');
+    });
+
+    it('does NOT waste a re-check when the first ping is already dead (short-circuit)', async () => {
+      mockDead();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, INCOMING, mockLogger());
+      expect(result.action).toBe('takeover');
+      expect(mockRequest).toHaveBeenCalledTimes(1); // dead-first short-circuits; no second ping
     });
   });
 });

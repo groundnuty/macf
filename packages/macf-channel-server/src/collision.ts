@@ -43,6 +43,29 @@ export class RegisterRaceError extends MacfError {
 
 const HEALTH_PING_TIMEOUT_MS = 5000;
 
+/**
+ * Liveness re-confirmation against the just-killed-port race (groundnuty/macf#553).
+ *
+ * A killed channel server's listening socket can momentarily still accept a
+ * TCP/TLS connection and answer ONE `/health` 2xx during the narrow window
+ * before the OS finishes releasing the port. Trusting that single 2xx
+ * mis-classifies a just-killed prior instance as `alive`, and the #424 version
+ * quadrant then aborts the restart against a doomed peer — stranding the slot
+ * until a manual registry delete.
+ *
+ * To be robust we require HEALTH_CONFIRM_ATTEMPTS *consecutive* 2xx answers
+ * (HEALTH_CONFIRM_DELAY_MS apart). Any failed attempt short-circuits to dead →
+ * the caller takes over the slot. A genuinely-live peer answers every attempt →
+ * still alive → still aborts (no groundnuty/macf#424 regression). Bounded: at
+ * most HEALTH_CONFIRM_ATTEMPTS pings and (HEALTH_CONFIRM_ATTEMPTS - 1) delays of
+ * added startup latency, paid only when the first ping is alive.
+ */
+const HEALTH_CONFIRM_ATTEMPTS = 2;
+const HEALTH_CONFIRM_DELAY_MS = 300;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
 /** Result of a collision /health ping: liveness + the advertised version
  *  (null when the peer answered but carried no `version` field — a
  *  pre-groundnuty/macf#424 instance — or was unreachable/unparseable). */
@@ -131,6 +154,31 @@ function pingHealth(
   });
 }
 
+/**
+ * Classify the existing peer's liveness, robust to the just-killed-port race
+ * (groundnuty/macf#553). Pings `/health` up to HEALTH_CONFIRM_ATTEMPTS times,
+ * waiting HEALTH_CONFIRM_DELAY_MS between attempts. The FIRST non-alive answer
+ * short-circuits to dead (`{ alive:false, version:null }`), so a flickering
+ * just-killed peer is treated as dead → the caller takes over the slot. Only a
+ * peer that answers 2xx on EVERY attempt is classified alive; the returned
+ * version is that of the final (still-answering) ping, feeding the #424 quadrant.
+ */
+async function confirmLiveness(
+  host: string,
+  port: number,
+  caCertPath: string,
+  agentCertPath: string,
+  agentKeyPath: string,
+): Promise<HealthPingResult> {
+  let result: HealthPingResult = { alive: false, version: null };
+  for (let attempt = 0; attempt < HEALTH_CONFIRM_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) await sleep(HEALTH_CONFIRM_DELAY_MS);
+    result = await pingHealth(host, port, caCertPath, agentCertPath, agentKeyPath);
+    if (!result.alive) return { alive: false, version: null };
+  }
+  return result;
+}
+
 export type CollisionResult =
   | { readonly action: 'register' }
   | { readonly action: 'takeover'; readonly previous: AgentInfo }
@@ -150,7 +198,8 @@ export type CollisionResult =
  * squatter that motivated this), so a versioned incoming takes it over.
  *
  * Quadrant (incoming × existing-alive), assuming the existing peer answers
- * `/health` (dead → takeover regardless):
+ * `/health` on every re-confirm ping (dead, OR alive-then-dead flicker per the
+ * just-killed-port race groundnuty/macf#553 → takeover regardless):
  *
  *   incoming versioned, existing unversioned   → takeover (takeover_unversioned_existing)
  *   incoming versioned, existing older         → takeover (takeover_newer_version)
@@ -196,7 +245,11 @@ export async function checkCollision(
     instance_id: existing.instance_id,
   });
 
-  const { alive, version: existingVersion } = await pingHealth(
+  // Liveness is re-confirmed across HEALTH_CONFIRM_ATTEMPTS pings to defeat the
+  // just-killed-port race (groundnuty/macf#553): a single momentary 2xx from a
+  // dying prior instance must NOT count as alive. A confirmed-live peer then
+  // flows into the unchanged #424 version quadrant below.
+  const { alive, version: existingVersion } = await confirmLiveness(
     existing.host,
     existing.port,
     certPaths.caCertPath,
