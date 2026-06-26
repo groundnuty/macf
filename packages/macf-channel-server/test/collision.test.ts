@@ -51,6 +51,25 @@ const existingAgent: AgentInfo = {
   started: '2026-03-28T18:00:00Z',
 };
 
+// DR-031 (groundnuty/macf#568) staleness fixtures. checkCollision reads the
+// real `Date.now()`, so heartbeats are built relative to it at call time — a
+// 1h-old beat is robustly past the 15-min TTL (stale); a 1-min-old beat is
+// robustly within it (fresh). The few-ms gap between construction and check is
+// negligible against those margins.
+const staleHb = (): string => new Date(Date.now() - 60 * 60 * 1000).toISOString();
+const freshHb = (): string => new Date(Date.now() - 60 * 1000).toISOString();
+const existingWithHb = (lastHeartbeat: string): AgentInfo => ({ ...existingAgent, last_heartbeat: lastHeartbeat });
+
+/** Find the `takeover_stale_heartbeat` override warn, if it fired (DR-031). */
+function staleOverrideWarn(logger: Logger): { result?: string; prior_basis?: string } | undefined {
+  const call = vi
+    .mocked(logger.warn)
+    .mock.calls.find(
+      (c) => c[0] === 'collision_check' && (c[1] as { result?: string }).result === 'takeover_stale_heartbeat',
+    );
+  return call?.[1] as { result?: string; prior_basis?: string } | undefined;
+}
+
 /**
  * Mock a LIVE /health response (200) whose JSON body advertises `version`
  * (omitted entirely when `version === null`, simulating a pre-#424 instance).
@@ -279,6 +298,78 @@ describe('checkCollision', () => {
       const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, INCOMING, mockLogger());
       expect(result.action).toBe('takeover');
       expect(mockRequest).toHaveBeenCalledTimes(1); // dead-first short-circuits; no second ping
+    });
+  });
+
+  describe('DR-031 complementary staleness override (groundnuty/macf#568)', () => {
+    it('TAKES OVER a same-version alive peer whose heartbeat is STALE (resolves the #553 ambiguity)', async () => {
+      mockAliveWithVersion('0.2.34'); // answers EVERY confirm ping → quadrant would ABORT (same version)
+      const logger = mockLogger();
+      const result = await checkCollision(
+        'code-agent',
+        mockRegistry(existingWithHb(staleHb())),
+        certPaths,
+        '0.2.34',
+        logger,
+      );
+      expect(result.action).toBe('takeover');
+      if (result.action === 'takeover') expect(result.previous.instance_id).toBe('a8f3c2');
+      // Attributed to the stale signal, with the would-have-been quadrant basis preserved.
+      expect(staleOverrideWarn(logger)).toMatchObject({ prior_basis: 'abort_same_or_newer' });
+    });
+
+    it('leaves a same-version abort UNCHANGED when the heartbeat is FRESH (#424/#557 byte-for-byte)', async () => {
+      mockAliveWithVersion('0.2.34');
+      const logger = mockLogger();
+      const result = await checkCollision(
+        'code-agent',
+        mockRegistry(existingWithHb(freshHb())),
+        certPaths,
+        '0.2.34',
+        logger,
+      );
+      expect(result.action).toBe('abort');
+      expect(decisionBasis(logger)).toBe('abort_same_or_newer');
+      expect(staleOverrideWarn(logger)).toBeUndefined(); // no override fired
+    });
+
+    it('an ABSENT heartbeat is never stale → same-version abort unchanged (back-compat)', async () => {
+      mockAliveWithVersion('0.2.34');
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('abort');
+      expect(decisionBasis(logger)).toBe('abort_same_or_newer');
+      expect(staleOverrideWarn(logger)).toBeUndefined();
+    });
+
+    it('a FRESH heartbeat never BLOCKS a legitimate older-version takeover (one-directional)', async () => {
+      mockAliveWithVersion('0.2.20'); // older → quadrant TAKES OVER on its own
+      const logger = mockLogger();
+      const result = await checkCollision(
+        'code-agent',
+        mockRegistry(existingWithHb(freshHb())),
+        certPaths,
+        '0.2.34',
+        logger,
+      );
+      expect(result.action).toBe('takeover');
+      expect(decisionBasis(logger)).toBe('takeover_newer_version'); // via the version path, not stale
+      expect(staleOverrideWarn(logger)).toBeUndefined();
+    });
+
+    it('reclaims a STALE peer even under MACF_NO_VERSION_TAKEOVER=1 (a provably-dead pin must not strand the slot)', async () => {
+      process.env['MACF_NO_VERSION_TAKEOVER'] = '1';
+      mockAliveWithVersion('0.2.20'); // older — would abort under the flag
+      const logger = mockLogger();
+      const result = await checkCollision(
+        'code-agent',
+        mockRegistry(existingWithHb(staleHb())),
+        certPaths,
+        '0.2.34',
+        logger,
+      );
+      expect(result.action).toBe('takeover');
+      expect(staleOverrideWarn(logger)).toMatchObject({ prior_basis: 'abort_version_takeover_disabled' });
     });
   });
 });

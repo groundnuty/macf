@@ -2,7 +2,7 @@ import { request } from 'node:https';
 import { readFileSync } from 'node:fs';
 import type { AgentInfo, Registry } from '@groundnuty/macf-core';
 import type { Logger } from '@groundnuty/macf-core';
-import { MacfError, compareSemver } from '@groundnuty/macf-core';
+import { MacfError, compareSemver, isStaleEntry, DEFAULT_REGISTRY_TTL_MS } from '@groundnuty/macf-core';
 
 /** Matches a parseable `x.y.z` (optional leading `v`) version string. */
 const VERSION_PATTERN = /^v?\d+\.\d+\.\d+$/;
@@ -217,6 +217,14 @@ export type CollisionResult =
  * over the existing ping→decide→register sequence — two racing newer instances
  * degrade to the same race the current `variable_exists` check already has.
  *
+ * Complementary staleness signal (DR-031, groundnuty/macf#568): when the quadrant
+ * above would ABORT against a /health-answering peer but that peer's registry
+ * `last_heartbeat` has aged past the TTL, the entry is taken over anyway — the
+ * stale heartbeat is a SECOND, version-independent liveness signal that resolves
+ * the just-killed-port ambiguity (#553) toward "dead". It is purely additive: it
+ * only ever turns a would-abort into a takeover, never the reverse, and a fresh or
+ * absent heartbeat leaves the quadrant's decision exactly as-is.
+ *
  * @param incomingVersion this instance's channel-server version (PACKAGE_VERSION).
  */
 export async function checkCollision(
@@ -300,6 +308,41 @@ export async function checkCollision(
     });
 
     if (takeover) return { action: 'takeover', previous: existing };
+
+    // DR-031 (groundnuty/macf#568) — COMPLEMENTARY staleness override. PURELY
+    // ADDITIVE and ONE-DIRECTIONAL: it can only turn a would-ABORT into a
+    // takeover, never the reverse. The #424 version quadrant + #553 confirmLiveness
+    // above are byte-for-byte unchanged; we only reach here when that quadrant
+    // already decided to ABORT against a peer that answered /health on EVERY
+    // confirm ping. The registry heartbeat (#589) re-stamps `last_heartbeat` on a
+    // coarse cadence, so an entry whose heartbeat aged past the TTL is almost
+    // certainly a DEAD instance whose freed/recycled port merely still answers (the
+    // #553 just-killed-port race, or a zombie squatting the port) — the stale
+    // signal resolves that ambiguity toward "dead → take over", exactly as the
+    // dead-`/health` path below already does (which likewise ignores the version
+    // policy). Safety: this can ONLY add a takeover, never block one — a FRESH
+    // heartbeat leaves the abort exactly as the quadrant decided, and an ABSENT or
+    // unparseable `last_heartbeat` is NEVER stale (`isStaleEntry` returns false), so
+    // pre-DR-031 entries and heartbeat-disabled-but-live instances take the
+    // unchanged path. A genuinely-live instance keeps its heartbeat fresh (it beats
+    // every cadence) and registration itself writes no heartbeat — so the only way
+    // to be stale here is to have beaten once and then stopped (the ungraceful
+    // death this backstops). The TTL slack (3× the 5-min cadence) prevents a
+    // healthy-but-briefly-unlucky instance from being judged stale.
+    if (isStaleEntry(existing, DEFAULT_REGISTRY_TTL_MS, Date.now())) {
+      logger.warn('collision_check', {
+        result: 'takeover_stale_heartbeat',
+        agent: name,
+        prior_basis: basis,
+        incoming_version: incomingVersion,
+        existing_version: existingVersion,
+        last_heartbeat: existing.last_heartbeat ?? null,
+        host: existing.host,
+        port: existing.port,
+      });
+      return { action: 'takeover', previous: existing };
+    }
+
     return { action: 'abort', existing };
   }
 
