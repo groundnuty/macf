@@ -49,6 +49,7 @@ import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllo
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
 import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion } from '../plugin-fetcher.js';
 import { writeClaudeSh } from '../claude-sh.js';
+import { writeHostPrelude } from '../host-prelude.js';
 import {
   refreshEnvFiles,
   migrateMonolithicClaudeSh,
@@ -368,6 +369,15 @@ export async function update(
       `preserved ${refresh.preserved.length} operator-managed file(s); ` +
       `warned on ${refresh.warnedHandEdits.length} hand-edit(s)`;
     console.log(summary);
+
+    // Host-toolchain bootstrap (DR-031 piece 4). Re-detect the backend +
+    // regenerate .claude/.macf/host-prelude.sh in lockstep with claude.sh.
+    // This is macf-managed + RE-DETECTED (never preserve-existing) — the
+    // host's toolchain may have changed since the last update, and the
+    // dynamic re-source the file emits must reflect the current backend.
+    // The thin claude.sh sources it FIRST (before the env.* loop).
+    writeHostPrelude(projectDir);
+    console.log(`Refreshed host-prelude.sh from current toolchain detection`);
   }
 
   // macf#342 PR-C deprecation surface: settings.local.json env keys

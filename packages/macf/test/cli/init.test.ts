@@ -118,6 +118,16 @@ describe('macf init', () => {
     const identityContent = readFileSync(join(dir, '.claude', '.macf', 'env.identity'), 'utf-8');
     expect(identityContent).toContain('MACF_AGENT_NAME="${MACF_AGENT_NAME:-agent}"');
     expect(identityContent).toContain('export MACF_AGENT_NAME');
+
+    // host-prelude.sh (DR-031 piece 4) is written + sourced first by claude.sh.
+    // Backend depends on the host (devbox / brew / none); only assert presence
+    // + the managed header so the test is host-toolchain-agnostic.
+    const hostPreludePath = join(dir, '.claude', '.macf', 'host-prelude.sh');
+    expect(existsSync(hostPreludePath)).toBe(true);
+    expect(readFileSync(hostPreludePath, 'utf-8')).toContain('managed by `macf`');
+    expect(content).toContain(
+      '[ -f "$SCRIPT_DIR/.claude/.macf/host-prelude.sh" ] && source "$SCRIPT_DIR/.claude/.macf/host-prelude.sh"',
+    );
   });
 
   it('seeds the project-tier rules subdir with a generic .example (macf#501)', async () => {
