@@ -20,6 +20,7 @@ import { PACKAGE_VERSION } from './package-version.js';
 import { createRegistry, createRegistryFromConfig } from '@groundnuty/macf-core';
 import { checkCollision, CollisionError, RegisterRaceError } from './collision.js';
 import { registerShutdownHandler } from './shutdown.js';
+import { createRegistryHeartbeat, resolveHeartbeatIntervalMs } from './registry-heartbeat.js';
 import { createTokenRefresher } from './token-refresh.js';
 import { createRefreshAwareClient } from './refresh-aware-client.js';
 import { createChallenge, verifyAndConsumeChallenge } from '@groundnuty/macf-core';
@@ -612,19 +613,41 @@ async function main(): Promise<void> {
     instance_id: config.instanceId,
   });
 
+  // P2: Registry heartbeat (DR-031, groundnuty/macf#568). The live instance
+  // periodically re-stamps `last_heartbeat` on its OWN slot (instance-id-guarded:
+  // re-stamp only if the slot still carries OUR instance_id, never a #424
+  // takeover's). A reader TTL-judges an aged-out entry dead — the backstop for the
+  // UNGRACEFUL death (kill -9 / OOM / power loss) that the graceful-deregister
+  // (#586) shutdown handler below never runs for. COARSE by design (default 5 min,
+  // `MACF_REGISTRY_HEARTBEAT_INTERVAL_MS` overrides; `0` disables) to bound the
+  // App-token write budget + the #439 If-Match TOCTOU surface. Started AFTER the
+  // shutdown handler is wired so `stop()` is registered for cleanup first.
+  const registryHeartbeat = createRegistryHeartbeat({
+    registry,
+    agentName: config.routingLabel,
+    instanceId: config.instanceId,
+    logger,
+    intervalMs: resolveHeartbeatIntervalMs(process.env['MACF_REGISTRY_HEARTBEAT_INTERVAL_MS']),
+  });
+
   // P2: Register shutdown handler. On graceful shutdown it deregisters the
   // registry slot (key = routingLabel) — but instance-id-guarded (DR-031,
   // groundnuty/macf#553 root-cause): the slot is deleted ONLY if it still
   // carries OUR instance_id, so a newer instance that took over the slot
-  // (groundnuty/macf#424) while we ran is never clobbered on our exit.
+  // (groundnuty/macf#424) while we ran is never clobbered on our exit. Also
+  // clears the registry-heartbeat interval (DR-031) on the way out.
   registerShutdownHandler({
     agentName: config.routingLabel,
     registry,
     instanceId: config.instanceId,
     httpsServer,
     healthState: health,
+    registryHeartbeat,
     logger,
   });
+
+  // Start the periodic heartbeat now that its stop() is wired into shutdown.
+  registryHeartbeat.start();
 
   logger.info('server_started', {
     port: actualPort,

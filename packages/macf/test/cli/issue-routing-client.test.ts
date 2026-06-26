@@ -37,6 +37,7 @@ vi.mock('@groundnuty/macf-core', async (importOriginal) => {
       register: vi.fn(),
       registerConditional: vi.fn(),
       deregisterConditional: vi.fn(),
+      heartbeatConditional: vi.fn(),
       get: mockRegistryGet,
       list: vi.fn().mockResolvedValue([]),
       remove: vi.fn(),

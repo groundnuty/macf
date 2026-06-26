@@ -28,6 +28,7 @@ function mockRegistry(getResult: AgentInfo | null = null): Registry {
     register: vi.fn(),
     registerConditional: vi.fn(),
     deregisterConditional: vi.fn(),
+    heartbeatConditional: vi.fn(),
     get: vi.fn().mockResolvedValue(getResult),
     list: vi.fn().mockResolvedValue([]),
     remove: vi.fn(),

@@ -8,6 +8,17 @@ export const AgentInfoSchema = z.object({
   type: z.enum(['permanent', 'worker']),
   instance_id: z.string(),
   started: z.string(),
+  /**
+   * Liveness re-stamp written periodically by the live instance's registry
+   * heartbeat (DR-031, groundnuty/macf#568). ISO-8601. ADDITIVE-OPTIONAL: older
+   * entries (and pre-DR-031 channel-server versions that never heartbeat) parse
+   * fine without it, and an ABSENT `last_heartbeat` must NEVER be judged stale
+   * (`isStaleEntry` returns false for absence — unknown, not dead). Staleness is
+   * asserted only when a heartbeat IS present and has aged past the TTL — the
+   * backstop for the UNGRACEFUL-death case (kill -9 / OOM / power loss) that the
+   * graceful-deregister (#586) shutdown handler never runs for.
+   */
+  last_heartbeat: z.string().optional(),
 });
 
 export type AgentInfo = z.infer<typeof AgentInfoSchema>;
@@ -17,6 +28,12 @@ export type AgentInfo = z.infer<typeof AgentInfoSchema>;
  * empty registry slot; two nulls are equal, a null and a value are not.
  * Used by the conditional-register CAS to compare the slot's observed
  * state against its current state.
+ *
+ * `last_heartbeat` is INTENTIONALLY EXCLUDED from the comparison (DR-031): it is
+ * liveness-churn, not identity. Including it would spuriously fail the startup
+ * CAS if a heartbeat from the prior instance landed in the collision-check →
+ * register-write window (a re-stamp must not block a legitimate #424 version-
+ * takeover). The five identity fields below fully determine slot ownership.
  */
 export function agentInfoEquals(a: AgentInfo | null, b: AgentInfo | null): boolean {
   if (a === null || b === null) return a === b;
@@ -77,6 +94,32 @@ export interface DeregisterResult {
   readonly reason: 'deleted' | 'not-ours' | 'absent' | 'error';
 }
 
+/**
+ * Outcome of an instance-id-guarded registry heartbeat (DR-031,
+ * groundnuty/macf#568). The live instance periodically re-stamps `last_heartbeat`
+ * on its OWN slot so a reader can TTL-judge an entry whose heartbeat aged out as
+ * dead — the backstop for the UNGRACEFUL death (kill -9 / OOM / power loss) that
+ * never runs the graceful-deregister (#586) shutdown handler.
+ *
+ * The write is guarded EXACTLY like `deregisterConditional`: re-stamp ONLY if the
+ * slot still carries OUR `instance_id`. If a newer instance took over the slot
+ * (groundnuty/macf#424) we must NOT re-stamp it (that would clobber the live
+ * newer peer's registration / mask its own heartbeat) — we report `not-ours` and
+ * let it heartbeat its own entry.
+ *
+ *  - `'beat'`     — slot was ours; `last_heartbeat` re-stamped.
+ *  - `'not-ours'` — slot held by a different instance_id (a newer instance took
+ *                   over); left untouched (NOT a failure).
+ *  - `'absent'`   — slot already gone (or unreadable/corrupt); nothing to stamp.
+ *  - `'error'`    — a registry read/write failed. `heartbeatConditional` NEVER
+ *                   throws — a heartbeat hiccup must never crash the server or
+ *                   block anything; the caller logs + the next interval retries.
+ */
+export interface HeartbeatResult {
+  readonly beat: boolean;
+  readonly reason: 'beat' | 'not-ours' | 'absent' | 'error';
+}
+
 // --- Registry interface ---
 
 export interface Registry {
@@ -119,6 +162,31 @@ export interface Registry {
     name: string,
     expectedInstanceId: string,
   ) => Promise<DeregisterResult>;
+  /**
+   * Instance-id-guarded registry heartbeat (DR-031, groundnuty/macf#568). Read
+   * the slot named `name`; re-stamp its `last_heartbeat` to `now` (ISO-8601),
+   * PRESERVING all other fields, ONLY if its `instance_id` still equals
+   * `expectedInstanceId` (it is still OUR registration). If a newer instance took
+   * over the slot (groundnuty/macf#424) — different `instance_id` — or the slot
+   * is already gone / unreadable, this is a no-op. NEVER throws: a registry
+   * failure surfaces as `{ beat: false, reason: 'error' }` so the periodic caller
+   * logs + retries on the next interval rather than crashing the server.
+   *
+   * Atomicity is backend-dependent (same posture as `registerConditional` /
+   * `deregisterConditional`): the local backend is fully atomic (read-compare-
+   * write inside one file-lock critical section); the GitHub-Variables backend is
+   * best-effort read-then-write (the Actions Variables API exposes no If-Match /
+   * conditional-write primitive — groundnuty/macf#439 — so the read→write window
+   * can't be closed hard, but the dominant #424-takeover case is caught by the
+   * instance_id compare since the newer instance wrote its id at ITS startup).
+   * The cadence is deliberately COARSE (default 5 min) to bound the App-token
+   * write budget and the #439 TOCTOU surface.
+   */
+  readonly heartbeatConditional: (
+    name: string,
+    expectedInstanceId: string,
+    now: string,
+  ) => Promise<HeartbeatResult>;
   readonly get: (name: string) => Promise<AgentInfo | null>;
   readonly list: (prefix: string) => Promise<ReadonlyArray<{ readonly name: string; readonly info: AgentInfo }>>;
   readonly remove: (name: string) => Promise<void>;
