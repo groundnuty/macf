@@ -10,6 +10,7 @@ import { update } from './commands/update.js';
 import { showStatus } from './commands/status.js';
 import { listPeers } from './commands/peers.js';
 import { runPs } from './commands/ps.js';
+import { runFleetStatus } from './commands/fleet.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './commands/certs.js';
 import { repoInit } from './commands/repo-init.js';
@@ -241,6 +242,26 @@ program
   )
   .action(() => {
     process.exitCode = runPs();
+  });
+
+const fleet = program
+  .command('fleet')
+  .description('Fleet roster + interconnect-health (DR-030)');
+
+fleet
+  .command('status')
+  .description(
+    'Roster + LIVE health for every registered agent: NAME / HOST:PORT / ' +
+    'online-offline (mTLS /health) / uptime + the present self-report fields ' +
+    '(instance_id, cert_expiry warn<30d/crit<7d, and idle/busy state + otel ' +
+    'reachability when the agent reports them). Reachable + self-reports only — ' +
+    'no inject/delivery probes (those are later DR-030 increments).',
+  )
+  .option('--json', 'Emit the structured roster as JSON for automation', false)
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    const code = await runFleetStatus(resolveProjectDir(opts.dir), { json: opts.json });
+    process.exitCode = code;
   });
 
 const registry = program
