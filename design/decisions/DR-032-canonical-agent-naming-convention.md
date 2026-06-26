@@ -46,7 +46,7 @@ The convention sets `name = <role>-agent` (e.g. `science-agent`) but the real Gi
 
 ### The 6th surface — the tmux session name + `agent-config.json` alignment
 
-The identity also surfaces as the **tmux session name**, and it drifted: this session's silent Stage-2 routing drop was `agent-config.json:tmux_session = science-agent` (routing-label) vs the live session `macf@macf-science-agent` (`<project>@<handle-stem>`) — the v1.x router's `send-keys` targeted a non-existent session. The convention governs this surface too: the session name is **`<project>@<name>`** (`macf@science-agent`) [DECISION — see Open Questions; the alternative is `<project>@<handle-stem>`], and `agent-config.json:tmux_session` MUST equal it. The lint asserts the match.
+The identity also surfaces as the **tmux session name**, and it drifted: this session's silent Stage-2 routing drop was `agent-config.json:tmux_session = science-agent` (routing-label) vs the live session `macf@macf-science-agent` (`<project>@<handle-stem>`) — the v1.x router's `send-keys` targeted a non-existent session. The convention governs this surface too: the session name is **`<project>@<name>`** (`macf@<role>-agent`, e.g. `macf@science-agent`) — **decided** (devops, #588: it tracks the name/routing-label identifier family + is brief), and `agent-config.json:tmux_session` MUST equal it. The lint asserts the match. **Note:** this is a *session-rename migration* from the current `<project>@<handle-stem>` form (`macf@macf-science-agent`) — a **devops-side gated operational follow-up** (same class as the auditor routing-label cutover), NOT part of this DR's ratification; the lint flags the pending mismatch at WARN until the rename lands.
 
 ### Enforcement
 
@@ -82,11 +82,15 @@ The auditor's *telemetry name* (`auditor` → `auditor-agent`) is safety-free an
 - The two incidents this session (attribution false-positive; silent Stage-2 session-name drop) become **lint failures**, not multi-hour diagnoses.
 - One field migration carries operational cost (the auditor routing-label) — gated + deferred, not bundled.
 
-## Open questions
+## Resolved decisions (#588 review — code + devops)
 
-1. **tmux session name field:** `<project>@<name>` (`macf@science-agent`, brief) vs `<project>@<handle-stem>` (`macf@macf-science-agent`, current). Either works if consistent + lint-checked; leaning `<project>@<name>`. devops/operator's tmux+agent-config call.
-2. **Is the tmux/agent-config surface folded into this DR or split to its own issue?** It's an identity-derived surface that bit us, so it belongs to the convention; but the *agent-config reconciliation* is devops-side ops work — fold the *rule* here, track the *fix* as a devops task.
-3. **Lint severity for `name ≠ routing-label`** (the retained `#538` escape hatch): INFO ("non-default, intentional?") vs silent-allow. Lean INFO.
+1. **tmux session name field → `<project>@<name>`** (`macf@<role>-agent`). Decided by devops (the tmux/agent-config owner), accepting the session-rename migration from the current `<project>@<handle-stem>` form as a devops-side gated step. (Science had raised the zero-migration alternative `<project>@<handle-stem>`; devops weighed it and chose family-consistency, owning the rename cost.)
+2. **tmux/agent-config surface → rule here, fix devops-side.** This DR specifies *which field drives the session name* + the lint asserts `agent-config.tmux_session` matches; the actual session-rename + `agent-config.json` alignment is a **devops operational follow-up (its own issue)**, not this DR's ratification.
+3. **`name ≠ routing-label` escape-hatch lint severity → INFO** (not WARN) — it's a legitimate documented split (the `#538` substrate case + the auditor's interim routing-label pin), so it shouldn't warn.
+
+## Auditor interim state (confirmed safe, devops #588)
+
+The auditor is in the safe name-now / routing-deferred split, **fixed at source (no settings-override**, per the operator's "fix at the canonical record" directive): telemetry **name → `auditor-agent`** (baked in `macf-agent.json` + `env.identity`, effective next relaunch); **routing-label stays `auditor`** (pinned literal + cert `CN=auditor` + registry `MACF_AGENT_AUDITOR` untouched/live); **role stays exactly `auditor`** (Constraint 1, never touched). The `auditor`→`auditor-agent` routing-label cutover remains the devops-owned gated follow-up; lint-WARN-not-FAIL in the interim.
 
 ## References
 
