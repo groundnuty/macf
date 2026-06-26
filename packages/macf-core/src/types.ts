@@ -192,6 +192,13 @@ export const HealthResponseSchema = z.object({
   current_issue: z.number().int().positive().nullable(),
   version: z.string(),
   last_notification: z.string().nullable(),
+  // DR-030 phase-1 (mesh self-report). Additive + `.optional()` so a newer
+  // parser still validates an older agent's /health body that lacks these
+  // (mixed-version fleets during rollout); `.nullable()` for the absent-value
+  // case (e.g. cert unreadable). The #553 collision parser reads only
+  // `version` + liveness, so these don't affect it.
+  instance_id: z.string().nullable().optional(),
+  cert_expiry: z.string().nullable().optional(),
 });
 
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
