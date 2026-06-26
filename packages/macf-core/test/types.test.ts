@@ -54,6 +54,35 @@ describe('NotifyPayloadSchema', () => {
   });
 });
 
+describe('NotifyPayloadSchema — DR-030 §6 diagnostic discriminator (macf#568)', () => {
+  it('accepts diagnostic + correlation_token', () => {
+    const result = NotifyPayloadSchema.parse({
+      type: 'mention',
+      diagnostic: true,
+      correlation_token: 'probe-abc-123',
+    });
+    expect(result.diagnostic).toBe(true);
+    expect(result.correlation_token).toBe('probe-abc-123');
+  });
+
+  it('accepts diagnostic without correlation_token', () => {
+    const result = NotifyPayloadSchema.parse({ type: 'mention', diagnostic: true });
+    expect(result.diagnostic).toBe(true);
+    expect(result.correlation_token).toBeUndefined();
+  });
+
+  it('both fields are optional → back-compat (a payload without them is unchanged)', () => {
+    const result = NotifyPayloadSchema.parse({ type: 'mention' });
+    expect(result.diagnostic).toBeUndefined();
+    expect(result.correlation_token).toBeUndefined();
+  });
+
+  it('rejects a non-boolean diagnostic / non-string correlation_token', () => {
+    expect(() => NotifyPayloadSchema.parse({ type: 'mention', diagnostic: 'yes' })).toThrow();
+    expect(() => NotifyPayloadSchema.parse({ type: 'mention', correlation_token: 42 })).toThrow();
+  });
+});
+
 describe('PeerNotificationPayloadSchema (macf#256, DR-023 UC-1)', () => {
   it('accepts minimal valid payload', () => {
     const result = PeerNotificationPayloadSchema.parse({

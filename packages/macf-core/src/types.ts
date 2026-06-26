@@ -94,6 +94,19 @@ export const NotifyPayloadSchema = z.object({
   review_state: z.enum(['approved', 'changes_requested']).optional(),
   reviewer_login: z.string().optional(),
   review_url: z.string().url().optional(),
+  // DR-030 §6 (groundnuty/macf#568): the `diagnostic` discriminator — the
+  // fleet-doctor mesh "Accepted" check. A diagnostic probe exercises the same
+  // `/notify` auth+parse path real routing uses (so a green "Accepted" is
+  // meaningful), but the receiver short-circuits BEFORE the MCP push: it
+  // responds synchronously with an ACK and returns — no wake, no comms-ledger
+  // write, no queue pollution. Distinct from Pattern E (`decideWake`, which
+  // only gates the wake; an unrecognized event still pushes to MCP) — this is
+  // strictly earlier, with no push at all. `correlation_token` (optional) is
+  // echoed back in the ACK for request/response correlation (reusing the #45
+  // correlation-marker idea). Both fields optional → back-compat: a producer
+  // that never sets them validates unchanged.
+  diagnostic: z.boolean().optional(),
+  correlation_token: z.string().optional(),
 });
 
 export type NotifyPayload = z.infer<typeof NotifyPayloadSchema>;

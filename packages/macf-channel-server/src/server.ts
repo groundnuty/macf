@@ -422,6 +422,11 @@ async function main(): Promise<void> {
     // to onNotify, capturing trace_id from the active SERVER span.
     recordLedgerEdge,
     selfAgentName: config.agentName,
+    // DR-030 §6 (macf#568): identity echoed in the diagnostic ACK. routingLabel
+    // matches the /health `agent` (registry slot the router resolves);
+    // instanceId is the staleness disambiguator.
+    routingLabel: config.routingLabel,
+    instanceId: config.instanceId,
   });
 
   // macf#256 / DR-023 UC-1: register notify_peer MCP tool on the MCP
