@@ -11,6 +11,7 @@ import { showStatus } from './commands/status.js';
 import { listPeers } from './commands/peers.js';
 import { runPs } from './commands/ps.js';
 import { runFleetStatus } from './commands/fleet.js';
+import { runFleetDoctor } from './commands/fleet-doctor.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './commands/certs.js';
 import { repoInit } from './commands/repo-init.js';
@@ -261,6 +262,23 @@ fleet
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .action(async (opts) => {
     const code = await runFleetStatus(resolveProjectDir(opts.dir), { json: opts.json });
+    process.exitCode = code;
+  });
+
+fleet
+  .command('doctor')
+  .description(
+    'NON-invasive mesh-interconnect test per registered agent: REACHABLE ' +
+    '(mTLS /health answers) + ACCEPTED (diagnostic mTLS /notify ACK — 200 + ' +
+    'ack + correlation-token echo). Renders ✓/✗/— + a verdict line. Proves ' +
+    'protocol-reaches-server ONLY (NOT delivery to the agent) — see the output ' +
+    'legend; mesh delivery needs --inject (a later DR-030 increment). Exits ' +
+    'non-zero when DEGRADED.',
+  )
+  .option('--json', 'Emit the structured per-agent result as JSON (DR-031 watchdog contract)', false)
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    const code = await runFleetDoctor(resolveProjectDir(opts.dir), { json: opts.json });
     process.exitCode = code;
   });
 
