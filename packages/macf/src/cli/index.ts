@@ -14,6 +14,7 @@ import { runFleetStatus } from './commands/fleet.js';
 import { runFleetDoctor } from './commands/fleet-doctor.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
+import { runRestartSelfCommand } from './commands/restart-self.js';
 import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './commands/certs.js';
 import { repoInit } from './commands/repo-init.js';
 import { rulesRefresh } from './commands/rules-refresh.js';
@@ -333,6 +334,32 @@ registry
   .option('--yes', 'Skip the confirmation prompt (non-interactive)', false)
   .action(async (opts) => {
     const code = await runRegistryPrune(resolveProjectDir(opts.dir), { yes: opts.yes });
+    process.exitCode = code;
+  });
+
+program
+  .command('restart-self')
+  .description(
+    'DR-031 piece 3 (be-replaceable): prepare the workspace + spawn a DETACHED ' +
+    'relauncher that OUTLIVES this session, so a watchdog (or the agent) can ' +
+    'trigger a clean restart without losing work. DRY-RUN BY DEFAULT — emits the ' +
+    'plan (marked-stash, RESUME-note, relauncher cmd, session to kill) and does ' +
+    'NOTHING without --confirm. With --confirm: marked-stash any uncommitted ' +
+    'tracked changes -> RESUME-note -> spawn detached relauncher -> kill the ' +
+    'current tmux session (the restart trigger).',
+  )
+  .option('--reason <fault|upgrade|manual>', 'Restart driver (fault/upgrade/manual)', 'manual')
+  .option('--confirm', 'Actually act (otherwise dry-run)', false)
+  .option('--dry-run', 'Force dry-run even with --confirm (the safer wins)', false)
+  .option('--json', 'Emit the structured plan/result as JSON', false)
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    const code = await runRestartSelfCommand(resolveProjectDir(opts.dir), {
+      reason: opts.reason,
+      confirm: opts.confirm,
+      dryRun: opts.dryRun,
+      json: opts.json,
+    });
     process.exitCode = code;
   });
 
