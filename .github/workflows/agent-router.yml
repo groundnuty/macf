@@ -1,9 +1,18 @@
 name: Agent Router
 
-# Delegates to the reusable workflow in groundnuty/macf-actions@v1.3.4
+# Delegates to the reusable workflow in groundnuty/macf-actions@v3.3.0
 # (see https://github.com/groundnuty/macf-actions for source).
 #
-# Pinned to immutable v1.3.4 rather than the floating @v1 tag so the
+# Stage-3 (registry-driven mTLS channels) per DR-027 (ratified) — supersedes
+# the #273 permanent-Stage-2 directive. The router resolves each agent's
+# host+port from the MACF registry (profile scope: `groundnuty` is a user
+# account, so the registry lives at groundnuty/groundnuty per DR-006) and
+# POSTs `issue_routed` to the agent's channel server over mTLS, instead of
+# the v1.x SSH/tmux inject. Mirrors the devops-toolkit caller (flipped
+# 2026-06-25, devops-toolkit#112). Revert is a one-line pin flip
+# @v3.3.0 -> @v1.3.4 (the v1.x SSH path stays available). See macf#562.
+#
+# Pinned to immutable v3.3.0 rather than the floating @v3 tag so the
 # routing infrastructure macf itself depends on doesn't move without
 # an explicit PR here. When macf-actions cuts a new release, upgrade
 # the `uses:` ref by a dedicated PR on this repo — that gives the
@@ -40,5 +49,11 @@ permissions:
 
 jobs:
   route:
-    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v1.3.4
+    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.3.0
+    with:
+      project: macf
+      # Profile-scoped registry (DR-006): groundnuty is a user account, so the
+      # MACF registry variables live on groundnuty/groundnuty. Omit the trailing
+      # /actions/variables — the reusable workflow appends it.
+      registry-api-path: /repos/groundnuty/groundnuty
     secrets: inherit
