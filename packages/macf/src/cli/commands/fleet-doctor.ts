@@ -227,12 +227,25 @@ const HONESTY_DISCLAIMER =
  * Structured `--json` shape for automation. THIS IS THE INPUT CONTRACT the
  * DR-031 watchdog consumes — keep it clean + stable. `accepted` is tri-state
  * (`true`/`false`/`null`); `summary.verdict` is the machine-readable health.
+ *
+ * `schema_version` is the HARD version contract (DR-006 watchdog request,
+ * macf-devops-toolkit#115): a consumer asserts `schema_version === <known>`
+ * and refuses an unknown value, so it fails LOUD on ANY breaking change —
+ * not just a renamed key (which a presence-check catches) but a same-name
+ * SEMANTIC change (e.g. `accepted` going tri-state-bool → string-enum) that
+ * would otherwise parse clean and silently misread (the Instance-13-adjacent
+ * silent-fallback at the supervisor's own input). BUMP this on any breaking
+ * change (rename / removal / semantic shift); additive-optional fields do NOT
+ * bump it.
  */
+export const FLEET_DOCTOR_JSON_SCHEMA_VERSION = 1;
+
 export function fleetDoctorToJson(
   results: readonly FleetDoctorResult[],
   project?: string,
 ): unknown {
   return {
+    schema_version: FLEET_DOCTOR_JSON_SCHEMA_VERSION,
     project: project ?? null,
     summary: {
       total: results.length,
