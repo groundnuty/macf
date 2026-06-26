@@ -108,7 +108,12 @@ async function main(): Promise<void> {
   const mcp = createMcpChannel({ agentName: config.agentName });
   // macf#545: /health echoes the ROUTING identity (the router cross-checks the
   // liveness response against the registry slot it resolved), not the bot-name.
-  const health = createHealthState(config.routingLabel, config.agentType);
+  // DR-030 phase-1: also self-report instance_id (registry/health staleness
+  // disambiguator) + cert_expiry (leaf notAfter) from the live config.
+  const health = createHealthState(config.routingLabel, config.agentType, {
+    instanceId: config.instanceId,
+    certPath: config.agentCertPath,
+  });
 
   const onNotify = async (payload: NotifyPayload): Promise<void> => {
     const meta: Record<string, string> = { type: payload.type };
