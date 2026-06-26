@@ -8,11 +8,34 @@ import {
   ROLE_FLOOR_DENY,
   ROLE_FLOOR_HOOKS,
   ROLE_SETTINGS_DELTAS,
+  KNOWN_ROLES,
+  isKnownRole,
   expectedHooksForRole,
   expectedAllowForRole,
 } from '../../src/cli/role-settings-model.js';
 
 describe('DR-028 role-settings model', () => {
+  describe('KNOWN_ROLES / isKnownRole (macf#551)', () => {
+    it('recognizes the canonical roles incl. the exact "auditor" (no -agent suffix)', () => {
+      for (const r of ['auditor', 'code-agent', 'science-agent', 'devops-agent', 'writing-agent']) {
+        expect(isKnownRole(r)).toBe(true);
+        expect(KNOWN_ROLES).toContain(r);
+      }
+    });
+    it('does NOT recognize a near-miss on the safety-critical auditor role', () => {
+      // The hazard: `auditor-agent` would silently skip the never-acts hook +
+      // its doctor ERROR. isKnownRole(false) lets the doctor surface it.
+      expect(isKnownRole('auditor-agent')).toBe(false);
+      expect(isKnownRole('Auditor')).toBe(false);
+      expect(isKnownRole('custom-role')).toBe(false);
+    });
+    it('every role with a delta is a known role (no orphan delta)', () => {
+      for (const role of Object.keys(ROLE_SETTINGS_DELTAS)) {
+        expect(isKnownRole(role)).toBe(true);
+      }
+    });
+  });
+
   describe('universal floor — allow', () => {
     it('carries broad Bash(*) + the read/write/edit tools (the doctrine + the memory-edit fix)', () => {
       // Broad Bash(*) — narrow patterns are defeated by simple_expansion.

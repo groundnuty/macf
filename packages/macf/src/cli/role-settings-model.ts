@@ -85,6 +85,33 @@ export const ROLE_SETTINGS_DELTAS: Readonly<Record<string, RoleSettingsDelta>> =
   },
 };
 
+/**
+ * The roles the framework recognizes — ships an agent template / model handling
+ * for (macf#551). The floor applies to ALL roles; only some carry deltas
+ * (`ROLE_SETTINGS_DELTAS`). An `agent_role` OUTSIDE this set is a custom role
+ * (legitimate — floor-only), but `macf doctor` surfaces it (INFO) so a typo on
+ * a delta-bearing SAFETY-critical role — e.g. `auditor-agent` instead of the
+ * exact `auditor`, which would silently skip the never-acts hook AND its doctor
+ * ERROR — becomes visible instead of degrading silently. NOTE: `auditor` has no
+ * `-agent` suffix (unlike `code-agent`); use the exact strings here.
+ */
+export const KNOWN_ROLES: readonly string[] = [
+  'auditor',
+  'code-agent',
+  'science-agent',
+  'devops-agent',
+  'writing-agent',
+  'exp-code-agent',
+  'exp-science-code-aware',
+  'exp-science-domain-only',
+  'exp-single-agent',
+];
+
+/** True if `role` is a framework-recognized role (see `KNOWN_ROLES`). */
+export function isKnownRole(role: string): boolean {
+  return KNOWN_ROLES.includes(role);
+}
+
 /** Expected hooks for a role = the floor + the role's delta hooks. */
 export function expectedHooksForRole(role: string): readonly ExpectedHook[] {
   const delta = ROLE_SETTINGS_DELTAS[role];

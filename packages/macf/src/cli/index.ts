@@ -75,7 +75,7 @@ program
   .command('init')
   .description('Set up a project directory for an agent')
   .requiredOption('--project <name>', 'Project name (e.g., macf)')
-  .requiredOption('--role <role>', 'Agent role (e.g., code-agent)')
+  .requiredOption('--role <role>', 'Agent role — a canonical role (auditor, code-agent, science-agent, devops-agent, writing-agent) or a custom one. NOTE: the auditor role is the exact string "auditor" (no -agent suffix) — a near-miss silently skips its never-acts safety hook (macf#551).')
   .option('--name <name>', 'Agent name (defaults to role) — the OTEL bot-name / GitHub-attribution identity')
   .option('--routing-label <label>', 'Routing identity (registry key + cert CN), defaults to the agent name. Set only when it must differ from the bot-name, e.g. the substrate (devops-agent vs macf-devops-agent) (macf#545).')
   .option('--type <type>', 'Agent type: permanent or worker', 'permanent')
