@@ -16,6 +16,7 @@ Research conducted during the design of the Multi-Agent Coordination Framework, 
 | [channel-architecture-design](2026-03-28-channel-architecture-design.md) | Complete channel architecture with 7 design alternatives evaluated | Per-agent org variables, mTLS, challenge-response signing, no orchestrator. GitHub is the registry. |
 | [macf-workspace-design](2026-03-28-macf-workspace-design.md) | Repository structure, agent assignments, experiment workspace layout | 8 repos, 6 GitHub Apps, 6 agent roles, 3 experiment conditions, 45 runs. |
 | [chrome-automation-validation](2026-03-28-chrome-automation-validation.md) | Validation that Claude Code + Chrome can automate GitHub UI tasks | `claude --chrome -p` works for multi-page navigation, form filling, and data extraction. Enables automated GitHub App creation. |
+| [agent-state-detection-telemetry-vs-hooks](2026-06-26-agent-state-detection-telemetry-vs-hooks.md) | How fleet-doctor detects live agent turn-state; every surface (metrics/traces/events/status-line/transcript/hooks) live-tested on Claude Code 2.1.193. | Metrics + transcript freeze during a long tool wait; turn-state lives in traces (export at turn-end, not live); Prometheus is architecturally metrics-only. Decision: plugin-shipped hook marker (`UserPromptSubmit`/`Stop`/`PreToolUse`) — accurate *through* tool waits, no consumer `settings.json`, never in the telemetry path. |
 
 ## Literature Reviews
 
