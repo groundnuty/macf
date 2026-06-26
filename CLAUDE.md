@@ -59,7 +59,24 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 
 ## Implementation Status
 
-> **Current state (updated 2026-06-16).** `main` HEAD `963240c`.
+> **Current state (updated 2026-06-27).** Substrate fully on **Stage-3** (all 4 repos
+> `agent-router.yml@v3.3.0`; code-agent migrated). **DR-030 fleet/routing interconnect-doctor
+> COMPLETE** — `macf fleet status` + `macf fleet doctor` (Reachable/Accepted/passive-Processed
+> via `/health.last_processed`/`--inject`) + `macf routing doctor` (routing-infra checks); both
+> `--json` carry `schema_version`. **DR-031 agent-supervision (desired-state reconciliation,
+> Accepted) framework 2/5 merged** (instance-id-guarded graceful-shutdown deregister + registry
+> heartbeat/TTL `isStaleEntry`) **+ its consumers wired** (prune/collision) — the stale-registration
+> class is closed. TO-DO 3/5: `restart-self`, host-prelude generator, `/health` hardening. **Ratified
+> DRs added:** DR-027/028/029 (Stage-3 migration, settings-validator, substrate-config),
+> DR-030 (interconnect-doctor), DR-031 (supervision), DR-032 (agent naming convention — Proposed,
+> code owns the generator-enforce + `macf doctor` identity-lint). silent-fallback **Instance 13**
+> (PR-review-state routing strands third-party gate-owners) + coordination.md **§Communication
+> 5(c)** gate-sweep canonicalized. **All the above is merged-but-UNRELEASED** (post-v0.2.38);
+> a channel-server release + fleet relaunch is pending. Full live working-state is in the
+> agent's memory handoff `project_session_handoff_2026_06_27.md`. The detailed historical record
+> below (2026-06-16) is retained but stale.
+>
+> **Prior (2026-06-16).** `main` HEAD `963240c`.
 > **Structural-hook workstream COMPLETE** this stretch (all merged): the 4
 > PreToolUse hooks were hand-wired into the substrate workbenches (**#488** —
 > code-agent was **0/4**; the substrate is rule-based/hand-wired, not a
