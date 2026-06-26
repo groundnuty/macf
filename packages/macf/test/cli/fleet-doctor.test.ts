@@ -16,6 +16,7 @@ import {
   acceptedGlyph,
   buildDoctorRows,
   fleetDoctorToJson,
+  FLEET_DOCTOR_JSON_SCHEMA_VERSION,
   formatDoctorTable,
   gatherFleetDoctor,
   isAccepted,
@@ -213,12 +214,17 @@ describe('fleetDoctorToJson — DR-031 watchdog contract', () => {
       { name: 'DEVOPS_AGENT', host: '100.64.0.3', port: 4300, reachable: false, accepted: null },
     ];
     const json = fleetDoctorToJson(results, 'macf') as {
+      schema_version: number;
       project: string;
       summary: { total: number; reachable: number; accepting: number; verdict: string };
       agents: ReadonlyArray<Record<string, unknown>>;
       disclaimer: string;
     };
 
+    // DR-006 watchdog hard-version contract (macf-devops-toolkit#115): the
+    // consumer asserts schema_version === <known> and refuses an unknown, so a
+    // breaking change fails LOUD rather than silently misreading.
+    expect(json.schema_version).toBe(FLEET_DOCTOR_JSON_SCHEMA_VERSION);
     expect(json.project).toBe('macf');
     expect(json.summary).toEqual({ total: 3, reachable: 2, accepting: 1, verdict: 'DEGRADED' });
     expect(json.agents).toHaveLength(3);
