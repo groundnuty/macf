@@ -612,10 +612,15 @@ async function main(): Promise<void> {
     instance_id: config.instanceId,
   });
 
-  // P2: Register shutdown handler (deregisters the registry slot → routingLabel)
+  // P2: Register shutdown handler. On graceful shutdown it deregisters the
+  // registry slot (key = routingLabel) — but instance-id-guarded (DR-031,
+  // groundnuty/macf#553 root-cause): the slot is deleted ONLY if it still
+  // carries OUR instance_id, so a newer instance that took over the slot
+  // (groundnuty/macf#424) while we ran is never clobbered on our exit.
   registerShutdownHandler({
     agentName: config.routingLabel,
     registry,
+    instanceId: config.instanceId,
     httpsServer,
     healthState: health,
     logger,

@@ -1,6 +1,6 @@
 import { AgentInfoSchema, agentInfoEquals } from './types.js';
 import { toVariableSegment } from './variable-name.js';
-import type { AgentInfo, Registry, RegisterResult, GitHubVariablesClient } from './types.js';
+import type { AgentInfo, Registry, RegisterResult, DeregisterResult, GitHubVariablesClient } from './types.js';
 
 /**
  * Creates a Registry backed by a GitHubVariablesClient.
@@ -88,6 +88,51 @@ export function createRegistry(
         return { ok: false, current: readback };
       }
       return { ok: true, current: info };
+    },
+
+    // Instance-id-guarded deregister (DR-031, groundnuty/macf#553 root-cause).
+    // The graceful-shutdown handler calls this so the registry stays accurate-
+    // by-construction: the slot is deleted ONLY when it is still ours.
+    //
+    // The load-bearing guard (inverse-of-#553): read the slot's current
+    // instance_id and delete ONLY IF it equals `expectedInstanceId`. If a newer
+    // instance took over the slot (groundnuty/macf#424) while we ran, the slot
+    // now carries the newer instance_id → we return 'not-ours' and DO NOT delete
+    // — deleting would strand a live newer peer (the inverse of the #553 stale-
+    // entry bug). A corrupt/unparseable slot reads as null via `readAgent` →
+    // 'absent' → also left intact (we can't prove it's ours, so we don't delete).
+    //
+    // Atomicity (best-effort, same posture as registerConditional): the GitHub
+    // Actions Variables API has NO native If-Match / conditional-delete, so the
+    // read→delete pair is not a hard CAS. We narrow the window to a single API
+    // round-trip by reading immediately before the delete. The dominant
+    // #424-takeover case is fully covered regardless of the window, because the
+    // newer instance writes its instance_id at ITS startup — well before our
+    // SIGTERM — so our read already observes the changed instance_id and skips.
+    // The only residual is a truly-concurrent takeover landing inside that one
+    // round-trip; that is the identical best-effort residual #439 documents for
+    // the conditional write, and closing it hard needs a CAS primitive the API
+    // doesn't offer. (The local backend IS exclusive — see local-client.ts.)
+    //
+    // NEVER throws: any read/delete failure returns reason:'error' so a graceful
+    // shutdown can log + proceed rather than crash on a registry hiccup.
+    async deregisterConditional(
+      name: string,
+      expectedInstanceId: string,
+    ): Promise<DeregisterResult> {
+      try {
+        const current = await readAgent(name);
+        if (current === null) {
+          return { deregistered: false, reason: 'absent' };
+        }
+        if (current.instance_id !== expectedInstanceId) {
+          return { deregistered: false, reason: 'not-ours' };
+        }
+        await client.deleteVariable(variableName(name));
+        return { deregistered: true, reason: 'deleted' };
+      } catch {
+        return { deregistered: false, reason: 'error' };
+      }
     },
 
     async get(name: string): Promise<AgentInfo | null> {
