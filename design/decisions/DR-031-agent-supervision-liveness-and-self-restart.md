@@ -1,7 +1,8 @@
 # DR-031: Agent supervision — liveness contract + portable self-restart
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-26
+**Ratified:** 2026-06-26 by the operator ("DR-031 Accepted") — as the aligned pair with `macf-devops-toolkit` DR-006 (the VM realization). Establishes agent supervision as **desired-state reconciliation** (reconcile actual → operator-owned desired; the don't-fight-a-deliberate-stop property + cold-start fall out of the model), the minimal agent-owned surface (`/health` + be-replaceable), upgrade-as-substrate-capability (VM self-restart / K8s GitOps), graceful-deregister + registry TTL as the #553 root-cause fix, and the `host-prelude` toolchain re-establishment. Scoped to VM + K8s (cloud out-of-scope with rationale; Managed-Agents-self-hosted a future spike). Build is phased (framework root-cause first, then the devops VM reconciler), code + devops.
 **Trigger:** The 2026-06-26 incident — `macf-devops-agent` silently went off-channels after a relaunch (the `macf#553` collision-abort left a healthy-looking-but-deaf agent + a stale registry entry; the operator had to hand-relay a peer's review). "Idle because there's no work" and "idle because I've gone deaf" are indistinguishable from inside the agent, so the fleet blocks and nobody knows — a single-point-of-fleet-failure of the silent-fallback hazard class applied to liveness. Design drafted by devops + the operator (`macf-devops-toolkit#115`), reviewed by science, graduated here. Sibling to DR-030 (detection); this is the **action/supervision** tier.
 
 ## Context
