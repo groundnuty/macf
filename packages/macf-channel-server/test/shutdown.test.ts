@@ -19,6 +19,7 @@ function mockRegistry(
     register: vi.fn(),
     registerConditional: vi.fn(),
     deregisterConditional: vi.fn().mockResolvedValue(deregResult),
+    heartbeatConditional: vi.fn().mockResolvedValue({ beat: true, reason: 'beat' }),
     get: vi.fn(),
     list: vi.fn(),
     remove: vi.fn().mockResolvedValue(undefined),
@@ -84,6 +85,48 @@ describe('registerShutdownHandler', () => {
     expect(server.stop).toHaveBeenCalledOnce();
     expect(infoEvents(logger)).toContain('shutdown_deregistered');
     expect(infoEvents(logger)).toContain('shutdown_complete');
+  });
+
+  it('clears the registry-heartbeat interval on cleanup (DR-031, #568)', async () => {
+    const registryHeartbeat = { stop: vi.fn() };
+
+    const cleanup = registerShutdownHandler({
+      agentName: 'test-agent',
+      registry: mockRegistry(),
+      instanceId: INSTANCE_ID,
+      httpsServer: mockServer(),
+      logger: mockLogger(),
+      registryHeartbeat,
+    });
+
+    await cleanup();
+
+    expect(registryHeartbeat.stop).toHaveBeenCalledOnce();
+  });
+
+  it('does not let a throwing registry-heartbeat stop() crash shutdown (best-effort)', async () => {
+    // The interval is unref()'d, so a missed clear can't pin exit; a stop() hiccup
+    // must not mask a real deregister/stop failure or flip the clean-exit result.
+    const registryHeartbeat = {
+      stop: vi.fn(() => {
+        throw new Error('stop boom');
+      }),
+    };
+    const server = mockServer();
+
+    const cleanup = registerShutdownHandler({
+      agentName: 'test-agent',
+      registry: mockRegistry(),
+      instanceId: INSTANCE_ID,
+      httpsServer: server,
+      logger: mockLogger(),
+      registryHeartbeat,
+    });
+
+    const ok = await cleanup();
+
+    expect(ok).toBe(true); // a heartbeat-stop hiccup is not a degraded exit
+    expect(server.stop).toHaveBeenCalledOnce();
   });
 
   it('cleanup is idempotent', async () => {

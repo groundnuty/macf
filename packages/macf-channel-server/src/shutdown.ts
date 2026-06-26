@@ -26,8 +26,14 @@ export function registerShutdownHandler(config: {
    * (best-effort) to clear the DR-030 OTLP-reachability probe interval.
    */
   readonly healthState?: HealthState;
+  /**
+   * The registry-heartbeat holder, if any (DR-031, groundnuty/macf#568). On
+   * shutdown its `stop()` is called (best-effort) to clear the periodic
+   * `last_heartbeat` re-stamp interval — mirrors the otel-probe `dispose()`.
+   */
+  readonly registryHeartbeat?: { readonly stop: () => void };
 }): () => Promise<boolean> {
-  const { agentName, registry, instanceId, httpsServer, healthState, logger } = config;
+  const { agentName, registry, instanceId, httpsServer, healthState, registryHeartbeat, logger } = config;
   let shuttingDown = false;
   let lastResult = true;
 
@@ -45,6 +51,15 @@ export function registerShutdownHandler(config: {
       healthState?.dispose?.();
     } catch {
       // ignore — the interval is unref()'d, so a missed clear can't pin exit
+    }
+
+    // Clear the registry-heartbeat interval (DR-031, groundnuty/macf#568). Same
+    // best-effort posture as the otel probe above — the interval is unref()'d, so
+    // a missed clear can't pin exit, and a hiccup must not mask a real failure.
+    try {
+      registryHeartbeat?.stop?.();
+    } catch {
+      // ignore — unref()'d interval; a missed clear can't pin exit
     }
 
     // Instance-id-guarded deregister (DR-031, groundnuty/macf#553 root-cause):

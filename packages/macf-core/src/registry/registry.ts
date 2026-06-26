@@ -1,6 +1,6 @@
 import { AgentInfoSchema, agentInfoEquals } from './types.js';
 import { toVariableSegment } from './variable-name.js';
-import type { AgentInfo, Registry, RegisterResult, DeregisterResult, GitHubVariablesClient } from './types.js';
+import type { AgentInfo, Registry, RegisterResult, DeregisterResult, HeartbeatResult, GitHubVariablesClient } from './types.js';
 
 /**
  * Creates a Registry backed by a GitHubVariablesClient.
@@ -132,6 +132,54 @@ export function createRegistry(
         return { deregistered: true, reason: 'deleted' };
       } catch {
         return { deregistered: false, reason: 'error' };
+      }
+    },
+
+    // Instance-id-guarded heartbeat (DR-031, groundnuty/macf#568). The live
+    // instance periodically re-stamps `last_heartbeat` on its OWN slot so a
+    // reader can TTL-judge an aged-out entry dead — the backstop for the
+    // UNGRACEFUL death (kill -9 / OOM / power loss) the graceful-deregister (#586)
+    // shutdown handler never runs for.
+    //
+    // Guard (identical shape to deregisterConditional): read the slot's current
+    // instance_id and re-stamp ONLY IF it equals `expectedInstanceId`. If a newer
+    // instance took over (groundnuty/macf#424) the slot carries a different
+    // instance_id → 'not-ours', left untouched (re-stamping would clobber the live
+    // newer peer's registration / mask its own heartbeat). A corrupt/unparseable
+    // slot reads as null via `readAgent` → 'absent' → also left intact.
+    //
+    // Atomicity (best-effort, same posture as registerConditional/#439): the
+    // GitHub Actions Variables API has NO native If-Match / conditional-write, so
+    // the read→write pair is not a hard CAS — narrowed to one round-trip by
+    // reading immediately before the write. The dominant #424-takeover case is
+    // fully covered (the newer instance wrote its instance_id at ITS startup, well
+    // before any of our heartbeat ticks). The only residual is a truly-concurrent
+    // takeover landing inside that one round-trip — the identical residual #439
+    // documents for the conditional write. (The local backend IS exclusive.)
+    //
+    // NEVER throws: any read/write failure returns reason:'error' so the periodic
+    // caller logs + the next interval retries rather than the server crashing.
+    async heartbeatConditional(
+      name: string,
+      expectedInstanceId: string,
+      now: string,
+    ): Promise<HeartbeatResult> {
+      try {
+        const current = await readAgent(name);
+        if (current === null) {
+          return { beat: false, reason: 'absent' };
+        }
+        if (current.instance_id !== expectedInstanceId) {
+          return { beat: false, reason: 'not-ours' };
+        }
+        // Preserve every other field; only `last_heartbeat` advances.
+        await client.writeVariable(
+          variableName(name),
+          JSON.stringify({ ...current, last_heartbeat: now }),
+        );
+        return { beat: true, reason: 'beat' };
+      } catch {
+        return { beat: false, reason: 'error' };
       }
     },
 
