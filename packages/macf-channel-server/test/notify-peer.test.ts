@@ -633,6 +633,67 @@ describe('notify_peer tool', () => {
       expect(result.peers_delivered).toBe(1);
     });
   });
+
+  // macf#590: the outbound `invoke_agent` span's `gen_ai.agent.name` (sourced
+  // from the sendMessage `target` opt) must be the kebab routing-label, NOT
+  // the SCREAMING_SNAKE registry-key suffix that `Registry.list()` returns.
+  // The `target` opt is telemetry-only (it becomes the span name +
+  // gen_ai.agent.name); the actual A2A dispatch uses the peer base URL.
+  describe('invoke_agent gen_ai.agent.name is the kebab routing-label (macf#590)', () => {
+    function a2aCard() {
+      return {
+        supportedInterfaces: [
+          { protocolBinding: 'JSONRPC', protocolVersion: '1.0', url: 'https://127.0.0.1:9001' },
+        ],
+      };
+    }
+    function makeA2aDeps(reg: FakeRegistry, sendMessage: ReturnType<typeof vi.fn>) {
+      const a2aClient = { getAgentCard: vi.fn().mockResolvedValue(a2aCard()), sendMessage };
+      return {
+        ...makeDeps(reg),
+        a2aClient: a2aClient as unknown as Parameters<typeof notifyPeer>[0]['a2aClient'],
+      };
+    }
+
+    it('broadcast: passes the kebab routing-label, not the registry-key suffix', async () => {
+      // Registry.list() returns GitHub-Variables-canonical names (uppercased,
+      // hyphens-to-underscores) — e.g. 'DEVOPS_AGENT'. Pre-fix this leaked
+      // straight onto the span as gen_ai.agent.name='DEVOPS_AGENT'.
+      const reg = makeRegistry({
+        list: [
+          { name: 'DEVOPS_AGENT', info: { host: '127.0.0.1', port: 9001, type: 'permanent', instance_id: 'a', started: 't' } },
+        ],
+      });
+      const sendMessage = vi.fn().mockResolvedValue({ id: 'task-1', status: { state: 'TASK_STATE_COMPLETED' } });
+      await notifyPeer(makeA2aDeps(reg, sendMessage), { event: 'turn-complete' });
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      const opts = sendMessage.mock.calls[0]![2] as { target?: string };
+      expect(opts.target).toBe('devops-agent');
+      expect(opts.target).not.toBe('DEVOPS_AGENT');
+      expect(opts.target).not.toMatch(/[A-Z_]/); // no SCREAMING_SNAKE / underscore
+      expect(opts.target?.startsWith('MACF_')).toBe(false);
+    });
+
+    it('single-peer: normalizes an uppercase `to` to the kebab routing-label', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9001, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const sendMessage = vi.fn().mockResolvedValue({ id: 'task-1', status: { state: 'TASK_STATE_COMPLETED' } });
+      await notifyPeer(makeA2aDeps(reg, sendMessage), { to: 'CODE_AGENT', event: 'turn-complete' });
+      const opts = sendMessage.mock.calls[0]![2] as { target?: string };
+      expect(opts.target).toBe('code-agent');
+    });
+
+    it('single-peer: leaves an already-kebab `to` unchanged (idempotent)', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9001, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const sendMessage = vi.fn().mockResolvedValue({ id: 'task-1', status: { state: 'TASK_STATE_COMPLETED' } });
+      await notifyPeer(makeA2aDeps(reg, sendMessage), { to: 'science-agent', event: 'turn-complete' });
+      const opts = sendMessage.mock.calls[0]![2] as { target?: string };
+      expect(opts.target).toBe('science-agent');
+    });
+  });
 });
 
 // vitest's `beforeEach` is per-describe by default; declare top-level here too.

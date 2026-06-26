@@ -6,4 +6,4 @@ export { createRegistry } from './registry.js';
 export { createRegistryFromConfig } from './factory.js';
 export { createLocalRegistry, LocalRegistryError, RegistryFileSchema, REGISTRY_SCHEMA_VERSION } from './local-client.js';
 export type { LocalRegistryOptions, RegistryFile } from './local-client.js';
-export { toVariableSegment } from './variable-name.js';
+export { toVariableSegment, fromVariableSegment } from './variable-name.js';

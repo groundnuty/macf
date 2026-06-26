@@ -29,7 +29,7 @@ import { request as httpsRequest } from 'node:https';
 import { randomUUID } from 'node:crypto';
 import type { Registry, AgentInfo } from '@groundnuty/macf-core';
 import type { Logger } from '@groundnuty/macf-core';
-import { toVariableSegment } from '@groundnuty/macf-core';
+import { toVariableSegment, fromVariableSegment } from '@groundnuty/macf-core';
 import { z } from 'zod';
 // macf#267 Findings 3+4: OTel span on outbound notify_peer + W3C
 // traceparent propagation to receiver. `propagation.inject()` writes
@@ -389,7 +389,13 @@ async function dispatchToPeer(
       const task = await deps.a2aClient!.sendMessage(
         `${peerBaseUrl(peer)}`,
         message,
-        { target: peer.name },
+        // macf#590: the `target` becomes the span's `gen_ai.agent.name`
+        // (telemetry only — the actual dispatch uses peerBaseUrl). In
+        // broadcast mode `peer.name` is the GitHub-Variables-canonical
+        // registry-key suffix (`DEVOPS_AGENT`); emit the kebab routing-label
+        // (`devops-agent`) instead so the span matches the Claude-native
+        // OTEL resource attr. Idempotent on an already-kebab single-peer `to`.
+        { target: fromVariableSegment(peer.name) },
       );
       const state = task.status.state;
       // Treat non-error terminal states as "delivered". REJECTED is the
@@ -481,8 +487,17 @@ export async function notifyPeer(
   // independently in https.ts onNotify via operationNameForNotifyType()
   // — sender-side and receiver-side spans carry different GenAI
   // operation semantics and that's correct under the spec.
+  // macf#590: the span name + `gen_ai.agent.name` carry the kebab
+  // routing-label (`devops-agent`), never the SCREAMING_SNAKE registry-key
+  // form. `input.to` itself is left untouched — it remains the registry
+  // LOOKUP key (resolveTargetPeers) + the raw `macf.notify.target` attr.
+  // `fromVariableSegment` is idempotent on an already-kebab `to`.
+  const targetLabel =
+    input.to !== undefined && input.to.length > 0
+      ? fromVariableSegment(input.to)
+      : undefined;
   return tracer.startActiveSpan(
-    buildInvokeAgentSpanName(input.to),
+    buildInvokeAgentSpanName(targetLabel),
     {
       kind: SpanKind.CLIENT,
       attributes: {
@@ -492,8 +507,8 @@ export async function notifyPeer(
         // Omitted entirely on broadcast (no single target). See OTel
         // GenAI Agent Spans spec § "Span name" + § "Recommended
         // attributes" (conditionally required).
-        ...(input.to !== undefined && input.to.length > 0
-          ? { [GenAiAttr.AgentName]: input.to }
+        ...(targetLabel !== undefined
+          ? { [GenAiAttr.AgentName]: targetLabel }
           : {}),
         [Attr.NotifyType]: 'peer_notification',
         [Attr.NotifyEvent]: input.event,
