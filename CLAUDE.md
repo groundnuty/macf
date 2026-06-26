@@ -64,9 +64,9 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 > COMPLETE** — `macf fleet status` + `macf fleet doctor` (Reachable/Accepted/passive-Processed
 > via `/health.last_processed`/`--inject`) + `macf routing doctor` (routing-infra checks); both
 > `--json` carry `schema_version`. **DR-031 agent-supervision (desired-state reconciliation,
-> Accepted) framework 3/5 merged**: instance-id-guarded graceful-shutdown deregister + registry
-> heartbeat/TTL (`isStaleEntry`) + its consumers (prune/collision) — the stale-registration class
-> is closed. TO-DO: `restart-self`, host-prelude generator, `/health` hardening. **Ratified
+> Accepted) framework 2/5 merged** (instance-id-guarded graceful-shutdown deregister + registry
+> heartbeat/TTL `isStaleEntry`) **+ its consumers wired** (prune/collision) — the stale-registration
+> class is closed. TO-DO 3/5: `restart-self`, host-prelude generator, `/health` hardening. **Ratified
 > DRs added:** DR-027/028/029 (Stage-3 migration, settings-validator, substrate-config),
 > DR-030 (interconnect-doctor), DR-031 (supervision), DR-032 (agent naming convention — Proposed,
 > code owns the generator-enforce + `macf doctor` identity-lint). silent-fallback **Instance 13**
