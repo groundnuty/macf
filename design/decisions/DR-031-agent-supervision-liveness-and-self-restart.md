@@ -18,13 +18,18 @@ These compose, they don't overlap: **the auditor reasons assuming agents are rea
 
 ## Decision
 
-Make every agent supervisable through a **minimal, substrate-identical surface**, and let the substrate provide the supervision:
+The supervision **model is desired-state reconciliation** (the Kubernetes model): a stateless reconciler continuously drives *actual* fleet state toward an **operator-owned *desired* state** (which agents should run, at which versions). "Restart a deaf agent" is one reconciliation action among several — this single reframe subsumes the whole problem space:
 
-**The agent owns exactly two things** (identical on VM, container, any harness):
+- **cold-start / one-command launch-all** = reconcile from empty;
+- **VM-reboot recovery** = the same reconcile on the first post-boot run (automatic);
+- **per-agent heal** = the tiered ladder (below), for a *desired-up but deaf* agent;
+- **don't-fight-the-operator** = a deliberate stop **updates desired state** (or sets a per-agent `paused` flag); the reconciler skips desired-down agents and **never resurrects them**. This is load-bearing: a bare liveness watchdog cannot distinguish "operator stopped it" from "it crashed," so it *would* fight a deliberate exit — the desired-state model is the fix, and it is the same model that yields cold-start. On K8s this is native (`replicas`; `scale --replicas=0` = desired-down); on the VM it is a tiny reconciler (DR-006) reading an operator-owned desired set + per-agent intent.
+
+**The agent owns a minimal, substrate-identical surface** (identical on VM, container, any harness):
 1. **A `/health` liveness contract** — expose it.
-2. **A `restart-self` verb** — be restartable.
+2. **Be replaceable** — restartable/killable so the substrate can reconcile it (VM: a `restart-self` verb; K8s: exit / be-killed → kubelet respawns).
 
-*Who* probes and *what* restarts is the substrate's job (cron now, kubelet later). Swapping Claude Code → another harness, or VM → pod, leaves these two constants unchanged — that is what makes supervision portable.
+*Who* probes, *what* restarts, *who upgrades*, and *what the desired set is* are the substrate's/operator's job (cron now, kubelet later). Swapping Claude Code → another harness, or VM → pod, leaves the agent surface unchanged — that is what makes supervision portable.
 
 ### Two invariants (everything follows)
 
@@ -43,9 +48,9 @@ DR-031's `/health` is **the same `/health` DR-030 §5 extends — hardened for l
 
 Plus a **registry heartbeat/TTL** (the channel server stamps "alive at \<t\>"): staleness becomes self-evident (a passive check, no live probe) and dead entries self-expire — the TTL `macf#553` also calls for. **The probe primitive is shared, not duplicated:** it is `macf fleet doctor` (mesh-Reachable) + `macf routing doctor` (registration-freshness) + `macf#556`'s dead-vs-alive `/health` check. The supervision watchdog **consumes those** (next section), it does not re-implement them.
 
-### The supervision model — substrate-native triggers
+### The reconciler — stateless one-shot, substrate-native trigger
 
-The watchdog is a **stateless one-shot** (probe → act → exit); the *trigger* is substrate-native:
+The reconciler is a **stateless one-shot** (read desired-state → probe actual → reconcile the delta → exit); the *trigger* is substrate-native. (On the VM the "reconcile" step is the tiered ladder + launch-the-missing; on K8s the controller does it natively.)
 
 | concern | VM (today) | Kubernetes (future) |
 |---|---|---|
@@ -54,7 +59,8 @@ The watchdog is a **stateless one-shot** (probe → act → exit); the *trigger*
 | self-restart | detached `setsid`/`nohup` relauncher | exit PID 1 / liveness-fail (native) |
 | restart-loop → operator | watchdog threshold + alert issue | `CrashLoopBackOff` (native) |
 | env / toolchain | `host-prelude` (brew shellenv) | `host-prelude` no-op (image PATH) |
-| **agent-owned surface** | **`/health` + `restart-self`** | **`/health` + `restart-self`** |
+| desired set / intent | operator-owned desired set + `paused` flag | Deployment `replicas` (`scale --replicas=0` = down) |
+| **agent-owned surface** | **`/health` + be-replaceable** | **`/health` + be-replaceable** |
 
 `cron ⇿ kubelet-liveness` is the clean 1:1 — same role, both substrate-native, **zero bespoke daemon**. The VM cron is explicitly *scaffolding that K8s's native liveness replaces*. **Not systemd** (container-hostile: no systemd in standard containers, wants PID 1 + cgroup ownership, `systemctl --user` needs a D-Bus/logind session containers lack — choosing it *forces* a two-mechanism split). **Not the harness's own scheduler** (`/loop`/hooks): it dies with the session (covers alive-but-deaf, not total crash) and is vendor-lock; keep it at most as a thin optional inner layer.
 
@@ -68,15 +74,18 @@ The watchdog is a **stateless one-shot** (probe → act → exit); the *trigger*
 
 **Ladder doctrine (load-bearing): every rung must be delivery-confirmed or fall through — a ladder with a silent rung is no ladder.** Tier 1 specifically rides `tmux send-keys`, which **silently no-ops against an RC-bound TUI** (silent-fallback **Instance 3**) exactly when needed. So the watchdog gates Tier 1 with the **Pattern-C `session_activity`-advanced check**; an un-confirmed-delivered inject **falls through to Tier 2**. The same principle applies at every rung: never assume a response landed — verify the result-invariant, else escalate.
 
-### `restart-self` — detached relauncher + dual-use (fault-recovery AND rolling-upgrade, co-equal)
+### Be-replaceable (the restart verb) + upgrade-as-substrate-capability
 
-The naive self-kill is suicide (an agent that `tmux kill-session`s its own session dies mid-command with no respawn). The verb is a relauncher that **outlives the agent's death**: VM = a detached `setsid`/`nohup` relauncher (commit + RESUME-note, then kill + relaunch); K8s = exit PID 1 / fail liveness / self-delete (kubelet respawns).
+The naive self-kill is suicide (an agent that `tmux kill-session`s its own session dies mid-command with no respawn). The restart must **outlive the agent's death**: VM = a detached `setsid`/`nohup` relauncher (commit + RESUME-note, then kill + relaunch); K8s = exit PID 1 / fail liveness / self-delete (kubelet respawns).
 
-**`restart-self` is co-equally the *upgrade* primitive — not a bonus.** One primitive, two drivers:
-- **Fault driver:** the watchdog says "restart" (above).
-- **Upgrade driver:** a **version-check** — "am I on the pinned channel-server / plugin / claude?" (source: **DR-029 / the registry `versions` block**) — "if behind, request restart" — feeds the same path.
+**Upgrade is a substrate-provided capability — NOT a uniform agent-owned one.** On the **VM**, the restart verb *is* co-equally the upgrade primitive (one verb, two drivers): a **fault driver** (the reconciler says "restart") and an **upgrade driver** (a version-check — "am I on the pinned channel-server/plugin/claude?", source **DR-029 / the registry `versions` block** — "if behind, restart-self with new bits"). But that is the **VM** realization and does **not** generalize: on **K8s** images are immutable, so an upgrade is a **new Deployment revision driven externally by GitOps** — the agent doesn't self-check-version-and-restart, it is simply *replaced*. So **"desired version" is just another facet of the desired state** the substrate reconciles; *who upgrades* differs by substrate while the agent stays passive/replaceable:
 
-Upgrade adds over fault-recovery: **staging** (new bits in place before restart); **rolling sequencing** (never all-at-once — restart one, verify green via `macf fleet doctor`, then the next); **rollback** = the Tier-3 escalation (restart-loop → operator). We just paid the *manual* version of this — the Stage-3 migration required hand-relaunching every agent to adopt the new launcher/plugin/caller, with a mixed-routing window and total-fleet-loss risk. The automated rolling-restart is the durable fix. On K8s this is a new Deployment revision → native rolling restart; on the VM, `restart-self` + a small sequencer *is* that rolling restart. The agent only ever needs "am I current? / `restart-self`."
+| | restart | upgrade |
+|---|---|---|
+| **VM** | self-restart (detached relauncher) | **self** — version-check → `restart-self` with new bits |
+| **K8s** | kill pod → kubelet respawns | **GitOps** — bump image, controller reconciles; agent passive |
+
+Upgrade adds over fault-recovery: **staging** (new bits in place before restart); **rolling sequencing** (never all-at-once — reconcile one, verify green via `macf fleet doctor`, then the next); **rollback** = the Tier-3 escalation (restart-loop → operator). We just paid the *manual* version — the Stage-3 migration hand-relaunched every agent to adopt the new launcher/plugin/caller (a mixed-routing window + total-fleet-loss risk); the automated rolling reconcile is the durable fix.
 
 ### Graceful-shutdown deregistration + registry TTL — the #553 root-cause fix
 
@@ -91,11 +100,15 @@ cron and a container entrypoint have a minimal env; `claude.sh` today *inherits*
 - **DR-030 (detection):** DR-031's watchdog *consumes* DR-030's `--json` probes; one `/health` contract across both. DR-031 adds the trigger + ladder + `restart-self` + bootstrap + upgrade that DR-030 doesn't have.
 - **DR-026 auditor (reasoning):** the auditor reasons over coordination *assuming* the liveness floor; DR-031 *is* that floor. The auditor consumes the guarantee, doesn't re-implement it.
 - **`macf#556`:** the dead-vs-alive `/health` primitive (`registry prune`) is shared as the probe primitive.
-- **`macf-devops-toolkit` impl DR (devops):** the VM-cron-watchdog realization (the cron one-shot, the tiered ladder with the Tier-1 gating, idempotent cron registration on launch, the watchdog self-heartbeat, the K8s liveness/restartPolicy manifests) references this DR. The §10 cron-prelude empirics + the why-not-systemd analysis are settled there.
+- **`macf-devops-toolkit` impl DR (devops):** the VM-cron-watchdog realization (the cron one-shot reconciler, the tiered ladder with the Tier-1 gating, idempotent cron registration on launch, the watchdog self-heartbeat, the operator-owned desired-set + `paused` mechanism, the K8s liveness/restartPolicy manifests) references this DR. The §10 cron-prelude empirics + the why-not-systemd analysis are settled there.
+
+## Substrate scope (in / out, with rationale)
+
+Supervision + routing target **VM + Kubernetes** — the two substrates where an agent can be a push-routed peer (inbound mTLS + tailnet + persistence) and be reconciled to a desired set. **Anthropic-cloud substrates are out-of-scope *by rationale*, not by accident:** interactive cloud-hosted Claude Code cannot be a push-routed peer (no inbound reachability, no tailnet, no persistence across turns), so the `/health`-probe + mTLS-fan-out + reconcile model does not apply. **Managed Agents (self-hosted) is a noted *future spike*, not a fold-in:** it inverts delivery to a **poll-queue** (no inbound needed) with tool-execution on our infra, and natively provides `workers_polling` liveness + `work.stop` + agent-versioning — i.e. it could *replace* much of DR-031's machinery for that substrate. Strategic + separate; cite `macf-devops-toolkit:research/2026-06-26-claude-code-on-anthropic-cloud-for-macf-agents.md`.
 
 ## Ownership / build split
 
-- **Framework (code-agent, `groundnuty/macf`):** the `/health` liveness-contract hardening (one contract with DR-030 §5) + the `restart-self` verb + **graceful-shutdown deregistration** + the registry **heartbeat/TTL** + the toolchain-detected **`host-prelude` generator** in the launcher template (DR-029 slot). Shares DR-030's `/health` schema + `macf#556`'s probe.
+- **Framework (code-agent, `groundnuty/macf`):** the `/health` liveness-contract hardening (one contract with DR-030 §5) + the `restart-self` verb + **graceful-shutdown deregistration** + the registry **heartbeat/TTL** + the toolchain-detected **`host-prelude` generator** in the launcher template (DR-029 slot). Shares DR-030's `/health` schema + `macf#556`'s probe. **Note (the "be-replaceable" reframe re-labels, does not expand, this build):** "be-replaceable" is *satisfied by* graceful-deregister (a replacement instance doesn't `AGENT_COLLISION` with the dying one — #557's race writ large) + the registry TTL (the dead slot frees for the replacement) + (VM) `restart-self` as the VM *realization* of being replaced. So `restart-self` stays a framework deliverable, scoped as the VM realization in the capability matrix — not dropped, not a universal agent primitive. The desired-state reframe sits *above* this surface (the reconciler + the operator-owned desired set / `paused` intent flag are the watchdog's + registry's concern, devops-side) and doesn't change what the agent exposes.
 - **Devops (`macf-devops-toolkit`, its own DR):** the cron watchdog + K8s manifests.
 - **Design (science):** this DR + the DR-030 family coherence.
 
