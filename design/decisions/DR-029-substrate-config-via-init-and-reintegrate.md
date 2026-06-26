@@ -17,14 +17,30 @@ Substrate workspaces maintain their config by **periodically becoming real consu
 
 1. **Backup** the agent's current `.claude/` + `claude.sh` + `env.*` + hand-wired state, out-of-tree.
 2. **Run plain `macf init`** on the home — the exact path every consumer uses, no special-casing. The substrate now eats the real dogfood; any init gap is felt **here, first**.
-3. **Reintegrate** from the backup only what the agent genuinely needs that init didn't deliver — its identity/App creds, genuine host-specifics (the `host-prelude` slot), and the authoritative workbench rules init's bundled copies would supersede.
-4. **Reflect at each reintegration:** every *"I had to re-add X"* is a signal — **does X belong in the framework** (promote → canonical rule / launcher template / `ROLE_SETTINGS_MODEL`) **or is it a legitimate local-only** (host-prelude / identity)? **The reflection moment IS the graduate-up mechanism.**
+3. **Reintegrate** from the backup only what the agent genuinely needs that init didn't deliver — its identity/App creds, genuine operator host-specifics (`env.local.*` — **NOT** `host-prelude.sh`; see the Amendment below), and the authoritative workbench rules init's bundled copies would supersede.
+4. **Reflect at each reintegration:** every *"I had to re-add X"* is a signal — **does X belong in the framework** (promote → canonical rule / launcher template / `ROLE_SETTINGS_MODEL`) **or is it a legitimate local-only** (`env.local.*` / identity)? **The reflection moment IS the graduate-up mechanism.**
 
 Over cycles, reintegration shrinks toward zero as genuinely-canonical bits get promoted; plain `macf init` converges to "just works" for the substrate too.
 
 **This supersedes the "substrate ≠ `macf init` consumer" stance** (`macf#273` / `feedback_substrate_workspaces_dont_use_macf`). The original blockers are resolved by the **backup + reintegrate**, not by avoidance:
 - *circular rules-overwrite* → the backup preserves the authoritative workbench rules; reintegration restores them; reflection promotes genuine evolutions to canonical — i.e. the **workbench→canonical flow, now triggered by init friction** rather than left informal.
 - *full-plugin hook duplication* → reconciled at reintegration (de-dupe; and reflect: should a hand-wired hook be *in* the plugin?).
+
+## Amendment (2026-06-27, `macf#598`) — managed-vs-operator taxonomy: the discriminator is "is it auto-detectable?"
+
+The original Decision (steps 3–4) lumped *all* host-specifics under "the `host-prelude` slot (reintegration-preserved)." DR-031 piece 4 (`host-prelude.sh` generator, `macf#599`) surfaced that this conflates two distinct kinds of config, and the correct cut is by **auto-detectability**, not by "is it host-specific?". The taxonomy sharpens from 2 categories to **3**:
+
+| category | examples | on `macf update` / re-init | env/file |
+|---|---|---|---|
+| macf-managed — **mechanical** | the generated env layout, the settings floor | regenerated (overwritten) | `env.*` (macf-managed) |
+| macf-managed — **detected** | the host toolchain (devbox/brew/none) | **re-detected** (regenerated, never preserved) | **`host-prelude.sh`** |
+| **operator-preserved** | operator-authored host-specifics, identity/App creds, authoritative workbench rules | **preserved** (the reintegration-from-backup target) | **`env.local.*`** (+ creds, rules) |
+
+**Why `host-prelude.sh` is managed-detected, NOT a reintegration target:** its content is *derived from host detection* (which toolchain is present), not operator-authored. Preserving a backup of it would carry a **stale** toolchain if the host changed (brew→devbox) — exactly wrong; re-detection on every `macf update` is the only correct behavior. So **`host-prelude.sh` is regenerated, never reintegrated.** Genuine operator host-specifics — the things init *cannot* detect — go in **`env.local.*`** (verified to exist as the operator-custom extension slot, `claude-sh.ts:504/534/542`), which IS preserved across re-init.
+
+**Migration guard:** the original framing told operators "host-prelude is your host-specifics slot (preserved)" — so an operator who hand-edited `host-prelude.sh` would silently lose it on the next update (now regenerated). The guard is `host-prelude.sh`'s **macf-managed header** ("macf-managed + re-detected on every `macf update`"), which signals don't-hand-edit-this and steers host-specifics to `env.local.*`. So the reintegration step (3) is corrected: reintegrate `env.local.*` + creds + rules; **never** reintegrate `host-prelude.sh`.
+
+This is a clarifying refinement, not a reversal of the ratified decision — the backup→init→reintegrate→reflect doctrine stands; this only sharpens *which* config is preserved vs regenerated.
 
 ## Why this over `--mode substrate`
 
