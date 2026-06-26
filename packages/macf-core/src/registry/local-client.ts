@@ -5,7 +5,7 @@ import lockfile from 'proper-lockfile';
 import { z } from 'zod';
 import { MacfError } from '../errors.js';
 import { AgentInfoSchema, agentInfoEquals } from './types.js';
-import type { AgentInfo, Registry, RegisterResult } from './types.js';
+import type { AgentInfo, Registry, RegisterResult, DeregisterResult } from './types.js';
 
 /**
  * Local registry implementation per DR-024.
@@ -352,6 +352,50 @@ export function createLocalRegistry(
         await writeRegistryFileAtomic(options.path, next);
         return { ok: true, current: validated };
       });
+    },
+
+    // Instance-id-guarded deregister (DR-031, groundnuty/macf#553 root-cause).
+    // Fully atomic on this backend: the read (current slot), the instance_id
+    // compare, and the delete all happen inside ONE `withLock` critical section,
+    // so a concurrent takeover (groundnuty/macf#424) is serialized behind the
+    // lock and observed by our read → we return 'not-ours' and never clobber the
+    // live newer instance's registration. NEVER throws — any error (incl. a
+    // malformed registry file surfaced by `readRegistryFile`) is caught and
+    // returned as reason:'error' so a graceful shutdown logs + proceeds.
+    async deregisterConditional(
+      name: string,
+      expectedInstanceId: string,
+    ): Promise<DeregisterResult> {
+      try {
+        return await withLock(options.path, async (): Promise<DeregisterResult> => {
+          const existing = await readRegistryFile(options.path);
+          const current = existing?.agents[name] ?? null;
+          // `existing === null` is folded into the absent branch so TS narrows
+          // `existing` to non-null for the delete path below (a non-null
+          // `current` implies a non-null `existing`, but the `?? null` erases
+          // that link for the type checker).
+          if (existing === null || current === null) {
+            return { deregistered: false, reason: 'absent' };
+          }
+          if (current.instance_id !== expectedInstanceId) {
+            // A newer instance (groundnuty/macf#424) holds the slot — not ours.
+            return { deregistered: false, reason: 'not-ours' };
+          }
+          const nextAgents: Record<string, AgentInfo> = {};
+          for (const [k, v] of Object.entries(existing.agents)) {
+            if (k !== name) nextAgents[k] = v;
+          }
+          const next: RegistryFile = {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            project: options.project,
+            agents: nextAgents,
+          };
+          await writeRegistryFileAtomic(options.path, next);
+          return { deregistered: true, reason: 'deleted' };
+        });
+      } catch {
+        return { deregistered: false, reason: 'error' };
+      }
     },
 
     async get(name: string): Promise<AgentInfo | null> {

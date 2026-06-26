@@ -49,6 +49,34 @@ export interface RegisterResult {
   readonly current: AgentInfo | null;
 }
 
+/**
+ * Outcome of a conditional (instance-id-guarded) deregister — the graceful-
+ * shutdown root-cause fix for the stale-registry-entry class (DR-031,
+ * groundnuty/macf#553; #557 fixed only the takeover *symptom*).
+ *
+ * The slot is deleted ONLY when it is still ours — its `instance_id` matches
+ * the `expectedInstanceId` we registered. This is the load-bearing inverse-of-
+ * #553 guard: if a newer instance took over our slot (groundnuty/macf#424) while
+ * we were running, the slot now carries the newer instance's `instance_id`, so
+ * we must NOT delete it on our exit (that would re-introduce a missing/stale
+ * entry for a live peer).
+ *
+ * `reason` distinguishes the four terminal states so the caller can log a
+ * precise diagnostic:
+ *  - `'deleted'`   — slot was ours; deleted.
+ *  - `'not-ours'`  — slot is present but held by a different instance_id (a
+ *                    newer instance took over); left intact (NOT a failure).
+ *  - `'absent'`    — slot already gone (or unreadable/corrupt → treated as
+ *                    not-ours-to-delete); nothing to do.
+ *  - `'error'`     — a registry read/delete failed. `deregisterConditional`
+ *                    NEVER throws — a deregister failure must not crash
+ *                    shutdown; the caller logs + proceeds.
+ */
+export interface DeregisterResult {
+  readonly deregistered: boolean;
+  readonly reason: 'deleted' | 'not-ours' | 'absent' | 'error';
+}
+
 // --- Registry interface ---
 
 export interface Registry {
@@ -69,6 +97,28 @@ export interface Registry {
     info: AgentInfo,
     expected: AgentInfo | null,
   ) => Promise<RegisterResult>;
+  /**
+   * Instance-id-guarded deregister (DR-031, groundnuty/macf#553 root-cause). Read
+   * the slot named `name`; delete it ONLY if its `instance_id` still equals
+   * `expectedInstanceId` (i.e. it is still OUR registration). If a newer instance
+   * took over the slot (groundnuty/macf#424) — different `instance_id` — or the
+   * slot is already gone / unreadable, this is a no-op (we never clobber a live
+   * newer instance's registration on our own shutdown). NEVER throws: a registry
+   * failure surfaces as `{ deregistered: false, reason: 'error' }` so a graceful
+   * shutdown can log + proceed rather than crash.
+   *
+   * Atomicity is backend-dependent (same posture as `registerConditional`): the
+   * local backend is fully atomic (read-compare-delete inside one file-lock
+   * critical section); the GitHub-Variables backend is best-effort (the Actions
+   * Variables API exposes no If-Match / conditional-delete primitive, so the
+   * read→delete window can't be closed hard — but the dominant #424-takeover
+   * case, where the newer instance wrote its instance_id well before our SIGTERM,
+   * is fully caught by the instance_id compare).
+   */
+  readonly deregisterConditional: (
+    name: string,
+    expectedInstanceId: string,
+  ) => Promise<DeregisterResult>;
   readonly get: (name: string) => Promise<AgentInfo | null>;
   readonly list: (prefix: string) => Promise<ReadonlyArray<{ readonly name: string; readonly info: AgentInfo }>>;
   readonly remove: (name: string) => Promise<void>;

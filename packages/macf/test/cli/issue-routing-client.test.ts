@@ -36,6 +36,7 @@ vi.mock('@groundnuty/macf-core', async (importOriginal) => {
     createRegistryFromConfig: () => ({
       register: vi.fn(),
       registerConditional: vi.fn(),
+      deregisterConditional: vi.fn(),
       get: mockRegistryGet,
       list: vi.fn().mockResolvedValue([]),
       remove: vi.fn(),

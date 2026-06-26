@@ -10,6 +10,15 @@ import type { HttpsServer, HealthState, Logger } from '@groundnuty/macf-core';
 export function registerShutdownHandler(config: {
   readonly agentName: string;
   readonly registry: Registry;
+  /**
+   * This instance's `instance_id` (the value registered into the slot). The
+   * deregister is guarded on it: the registry slot is deleted ONLY when it still
+   * carries this id (DR-031, groundnuty/macf#553 root-cause). If a newer instance
+   * took over the slot (groundnuty/macf#424) while we ran, its id differs → we
+   * leave the slot intact rather than clobbering a live newer peer's
+   * registration on our own exit.
+   */
+  readonly instanceId: string;
   readonly httpsServer: HttpsServer;
   readonly logger: Logger;
   /**
@@ -18,7 +27,7 @@ export function registerShutdownHandler(config: {
    */
   readonly healthState?: HealthState;
 }): () => Promise<boolean> {
-  const { agentName, registry, httpsServer, healthState, logger } = config;
+  const { agentName, registry, instanceId, httpsServer, healthState, logger } = config;
   let shuttingDown = false;
   let lastResult = true;
 
@@ -38,12 +47,49 @@ export function registerShutdownHandler(config: {
       // ignore — the interval is unref()'d, so a missed clear can't pin exit
     }
 
+    // Instance-id-guarded deregister (DR-031, groundnuty/macf#553 root-cause):
+    // remove our registry slot ONLY if it is still ours. `deregisterConditional`
+    // is contracted never to throw — a registry hiccup surfaces as reason:'error'
+    // — but we still wrap it so a future contract slip can't crash shutdown.
     try {
-      await registry.remove(agentName);
-      logger.info('shutdown_deregistered', { agent: agentName });
+      const result = await registry.deregisterConditional(agentName, instanceId);
+      if (result.deregistered) {
+        logger.info('shutdown_deregistered', { agent: agentName, instance_id: instanceId });
+      } else if (result.reason === 'not-ours') {
+        // A newer instance took over our slot (groundnuty/macf#424) while we ran.
+        // Leaving its registration intact is CORRECT — deleting it would re-
+        // introduce the missing/stale-entry bug (#553) for a live peer. Not a
+        // failure: keep `ok` true.
+        logger.info('shutdown_deregister_skipped', {
+          agent: agentName,
+          instance_id: instanceId,
+          reason: result.reason,
+          detail: 'registry slot held by a different instance — not ours to delete (DR-031, #424)',
+        });
+      } else if (result.reason === 'absent') {
+        // Slot already gone (or unreadable) — nothing to deregister. Not a failure.
+        logger.info('shutdown_deregister_skipped', {
+          agent: agentName,
+          instance_id: instanceId,
+          reason: result.reason,
+          detail: 'registry slot already empty',
+        });
+      } else {
+        // reason === 'error': a registry read/delete failed. Surface it loud and
+        // flip `ok` so external monitors (systemd, macf-actions heartbeat) see
+        // the degraded exit rather than absorbing a possibly-stale slot into a
+        // clean exit (#103 R2). Shutdown still proceeds — fail-open, not crash.
+        logger.error('shutdown_deregister_failed', {
+          agent: agentName,
+          instance_id: instanceId,
+          reason: result.reason,
+        });
+        ok = false;
+      }
     } catch (err) {
       logger.error('shutdown_deregister_failed', {
         agent: agentName,
+        instance_id: instanceId,
         error: err instanceof Error ? err.message : String(err),
       });
       ok = false;
