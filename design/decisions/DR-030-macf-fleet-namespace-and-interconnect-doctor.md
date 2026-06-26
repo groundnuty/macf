@@ -1,7 +1,8 @@
 # DR-030: `macf fleet` + `macf routing` — the three-layer interconnect health model
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-26
+**Ratified:** 2026-06-26 by the operator ("DR-030 ok"). Establishes the `macf fleet` (mesh) + `macf routing` (plane) **three-layer interconnect health model** — Self (`macf doctor`) / Mesh (framework) / Routing-infra (routing-infra), with per-layer ownership, the delivery-proof ladder (passive-local → `--inject` → e2e), and the topology-agnostic GitHub-shared-plane constraint with named registry/CA scope boundaries. Folds the `#564` check catalog. Build is layer-phased (phase 1 mesh, phase 2 routing-infra), code-agent.
 **Trigger:** The 2026-06-26 Stage-3 routing outage — science-agent silently received zero routed issues for a full session because `groundnuty/macf`'s caller was stuck `@v1.3.4` while science was on Stage-3 channels, compounded by an `agent-config.json` session-name mismatch that silently killed the Stage-2 fallback. Every root cause was an invisible-until-broken interconnect-health gap that took manual cross-repo archaeology to find. Operator-directed (`macf#560`); concrete checks harvested as `macf#564`. This DR is the synthesis of code-agent's seed (`#560`), science-agent's review, devops-agent's ops review, and an operator design review (the three-layer sharpening).
 
 ## Context
