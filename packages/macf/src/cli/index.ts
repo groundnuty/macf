@@ -9,6 +9,8 @@ import { initAgent } from './commands/init.js';
 import { update } from './commands/update.js';
 import { showStatus } from './commands/status.js';
 import { listPeers } from './commands/peers.js';
+import { runPs } from './commands/ps.js';
+import { runRegistryPrune } from './commands/registry-prune.js';
 import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './commands/certs.js';
 import { repoInit } from './commands/repo-init.js';
 import { rulesRefresh } from './commands/rules-refresh.js';
@@ -229,6 +231,33 @@ program
   .action(async (opts) => {
     const dir = opts.dir ? validateProjectDir(opts.dir) : undefined;
     await listPeers(dir);
+  });
+
+program
+  .command('ps')
+  .description(
+    'List MACF claude / channel-server processes (Linux /proc), keyed by ' +
+    'cwd + agent identity — multi-tenant-correct (never `pgrep | head -1`)',
+  )
+  .action(() => {
+    process.exitCode = runPs();
+  });
+
+const registry = program
+  .command('registry')
+  .description('Registry maintenance');
+
+registry
+  .command('prune')
+  .description(
+    'mTLS-/health-check each registry entry and remove ONLY confirmed-dead ones ' +
+    '(refused/timeout after a retry). Consent required (default No); --yes bypasses.',
+  )
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .option('--yes', 'Skip the confirmation prompt (non-interactive)', false)
+  .action(async (opts) => {
+    const code = await runRegistryPrune(resolveProjectDir(opts.dir), { yes: opts.yes });
+    process.exitCode = code;
   });
 
 const certs = program
