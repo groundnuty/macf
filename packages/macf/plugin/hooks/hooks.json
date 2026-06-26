@@ -1,5 +1,5 @@
 {
-  "description": "MACF agent startup hooks: dependency installer, work check, Stop-hook peer-notification (UC-1 per DR-023), and PreCompact-hook session checkpoint (UC-3 per DR-023)",
+  "description": "MACF agent hooks: dependency installer, work check, Stop-hook peer-notification (UC-1 per DR-023), PreCompact-hook session checkpoint (UC-3 per DR-023), and the turn-state marker that lets the channel server report accurate live agent state through long tool waits (DR-030 phase-1, groundnuty/macf#568)",
   "hooks": {
     "SessionStart": [
       {
@@ -21,7 +21,61 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/mark-turn-state.sh\" user-prompt-submit",
+            "async": true,
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/mark-turn-state.sh\" pre-tool-use",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/mark-turn-state.sh\" post-tool-use",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/mark-turn-state.sh\" post-tool-use-failure",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/mark-turn-state.sh\" stop",
+            "timeout": 10
+          }
+        ]
+      },
       {
         "hooks": [
           {
@@ -33,6 +87,28 @@
             },
             "timeout": 30,
             "statusMessage": "Notifying peers of session end..."
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/mark-turn-state.sh\" stop-failure",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/mark-turn-state.sh\" session-end",
+            "timeout": 10
           }
         ]
       }
