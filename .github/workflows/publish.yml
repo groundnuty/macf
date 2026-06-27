@@ -142,47 +142,6 @@ jobs:
           fi
           echo "marketplace plugin.json at v${EXPECTED} matches — lockstep OK."
 
-      # macf#605: the marketplace `macf-agent/` tree is distributed verbatim to
-      # consumers by `macf init`/`update` (shallow-clone of the marketplace, see
-      # plugin-fetcher.ts) — NOT copied from this monorepo. So it must stay
-      # byte-identical to the canonical `packages/macf/plugin/` across the synced
-      # subdirs (agents/hooks/scripts/skills). It silently drifted once: a stale
-      # v0.2.0-era hooks.json (missing the #571 turn-state hooks) + a missing
-      # scripts/ dir left `/health.state` dark on consumers. The macf#426 check
-      # above only compares the plugin.json VERSION; this gate compares the
-      # FILE CONTENT. Fail the release loud BEFORE publishing if the marketplace
-      # at the release tag has drifted — forcing a re-sync + marketplace re-tag.
-      #
-      # This is the first pre-publish step that needs the compiled sync core
-      # (dist/cli/marketplace-sync.js), so it runs `npm ci` + builds the macf
-      # package here. The cheaper curl/version prechecks above intentionally run
-      # first (fail-fast without an install). NOTE: the later "Install + check +
-      # build" step re-runs `npm ci` — a reviewer wanting to dedupe could move
-      # this gate to immediately AFTER that step instead (still before any
-      # publish); kept here to preserve the pre-publish-precheck grouping.
-      - name: Sync gate — marketplace macf-agent/ must match canonical plugin/ (macf#605)
-        if: steps.version.outputs.tag_driven == 'true'
-        env:
-          EXPECTED: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          # Build the sync core (dist/cli/marketplace-sync.js) the .mjs imports.
-          devbox run -- npm ci
-          devbox run -- npm run build --workspace=@groundnuty/macf
-          # Shallow-clone the marketplace at the release tag (macf#426 above
-          # already verified the tag + plugin.json exist).
-          MP_DIR="$(mktemp -d)"
-          git clone --depth 1 --branch "v${EXPECTED}" \
-            https://github.com/groundnuty/macf-marketplace "$MP_DIR"
-          if ! node packages/macf/scripts/sync-marketplace-plugin.mjs \
-                 --check --target "$MP_DIR/macf-agent"; then
-            echo "::error::marketplace macf-agent/ has drifted from canonical packages/macf/plugin/ (mismatches above)."
-            echo "::error::Re-sync: node packages/macf/scripts/sync-marketplace-plugin.mjs --target <macf-marketplace-checkout>/macf-agent"
-            echo "::error::then commit + tag groundnuty/macf-marketplace at v${EXPECTED} before re-tagging this release. See macf#605."
-            exit 1
-          fi
-          echo "marketplace macf-agent/ in sync with canonical plugin/ — OK."
-
       # Sigstore's transparency log is append-only; once an entry is
       # submitted, retrying the same tarball content gets 409
       # TLOG_CREATE_ENTRY_ERROR. A prior partially-failed publish run
@@ -239,6 +198,43 @@ jobs:
           devbox run -- npm ci
           devbox run -- make -f dev.mk check
           devbox run -- make -f dev.mk build
+
+      # macf#605: the marketplace `macf-agent/` tree is distributed verbatim to
+      # consumers by `macf init`/`update` (shallow-clone of the marketplace, see
+      # plugin-fetcher.ts) — NOT copied from this monorepo. So it must stay
+      # byte-identical to the canonical `packages/macf/plugin/` across the synced
+      # subdirs (agents/hooks/scripts/skills). It silently drifted once: a stale
+      # v0.2.0-era hooks.json (missing the #571 turn-state hooks) + a missing
+      # scripts/ dir left `/health.state` dark on consumers. The macf#426 check
+      # above only compares the plugin.json VERSION; this gate compares the
+      # FILE CONTENT. Fail the release loud BEFORE publishing if the marketplace
+      # at the release tag has drifted — forcing a re-sync + marketplace re-tag.
+      #
+      # Runs right after "Install + check + build" so it reuses that step's
+      # compiled dist (dist/cli/marketplace-sync.js, which the .mjs imports) —
+      # no redundant `npm ci` — and stays before any publish step. (Drift is the
+      # rare path; failing ~here instead of in the pre-precheck cluster trades a
+      # slightly later failure for zero redundant install on every green release.)
+      - name: Sync gate — marketplace macf-agent/ must match canonical plugin/ (macf#605)
+        if: steps.version.outputs.tag_driven == 'true'
+        env:
+          EXPECTED: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Shallow-clone the marketplace at the release tag (macf#426 above
+          # already verified the tag + plugin.json exist; dist was built by the
+          # "Install + check + build" step above).
+          MP_DIR="$(mktemp -d)"
+          git clone --depth 1 --branch "v${EXPECTED}" \
+            https://github.com/groundnuty/macf-marketplace "$MP_DIR"
+          if ! node packages/macf/scripts/sync-marketplace-plugin.mjs \
+                 --check --target "$MP_DIR/macf-agent"; then
+            echo "::error::marketplace macf-agent/ has drifted from canonical packages/macf/plugin/ (mismatches above)."
+            echo "::error::Re-sync: node packages/macf/scripts/sync-marketplace-plugin.mjs --target <macf-marketplace-checkout>/macf-agent"
+            echo "::error::then commit + tag groundnuty/macf-marketplace at v${EXPECTED} before re-tagging this release. See macf#605."
+            exit 1
+          fi
+          echo "marketplace macf-agent/ in sync with canonical plugin/ — OK."
 
       # OIDC trusted publishers (npm 11.5.1+) require a newer npm than
       # devbox's nixpkgs pin currently provides (npm@10.8.3 at the
