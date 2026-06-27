@@ -246,7 +246,7 @@ describe('createHttpsServer', () => {
     await server.stop();
   });
 
-  it('rejects an anchorless type:mention with 400 and never calls onNotify (macf#616)', async () => {
+  it('rejects a message-less anchorless type:mention with 400 and never calls onNotify (macf#616/#629)', async () => {
     const onNotify = vi.fn(async () => {});
 
     const server = createHttpsServer({
@@ -263,9 +263,11 @@ describe('createHttpsServer', () => {
     const res = await httpsRequest(actualPort, {
       method: 'POST',
       path: '/notify',
-      // No issue_number / pr_number anchor → schema refine rejects at PARSE,
-      // BEFORE the notification is ever surfaced to the recipient.
-      body: JSON.stringify({ type: 'mention', message: 'please look' }),
+      // No message AND no issue_number/pr_number anchor → schema refine rejects
+      // at PARSE, BEFORE the notification is ever surfaced to the recipient.
+      // (macf#629: a message-bearing anchorless mention is now VALID — the
+      // message is actionable content — so the stranding case is message-less.)
+      body: JSON.stringify({ type: 'mention' }),
       headers: { 'Content-Type': 'application/json' },
     });
 

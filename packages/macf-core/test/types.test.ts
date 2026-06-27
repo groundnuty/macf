@@ -56,24 +56,39 @@ describe('NotifyPayloadSchema', () => {
 });
 
 describe('NotifyPayloadSchema — mention anchor invariant (macf#616)', () => {
-  it('rejects an anchorless type:mention with an actionable message', () => {
+  it('rejects a message-less, anchorless type:mention (the stranding hazard)', () => {
     const result = NotifyPayloadSchema.safeParse({ type: 'mention' });
     expect(result.success).toBe(false);
     if (!result.success) {
       const msg = result.error.issues.map((i) => i.message).join(' ');
-      expect(msg).toContain('issue_number or pr_number');
+      expect(msg).toContain('message or an issue_number/pr_number');
       expect(msg).toContain('macf#616');
     }
   });
 
-  it('rejects an anchorless type:mention even when a message is present', () => {
-    // A message alone is not an anchor — the recipient still cannot locate the
-    // GitHub object the mention refers to.
+  it('accepts a message-bearing anchorless type:mention (macf#629)', () => {
+    // A message IS actionable content — a message-bearing mention is not
+    // context-free, so it does not strand the recipient. (macf#616 over-rejected
+    // these by requiring an anchor; #629 corrects the invariant to message-or-anchor.)
     const result = NotifyPayloadSchema.safeParse({
       type: 'mention',
       message: 'please take a look',
     });
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts the fleet-doctor --inject payload shape (macf#629)', () => {
+    // `fleet-doctor-inject.ts` POSTs a message-bearing, anchorless, non-diagnostic
+    // type:mention as the invasive Processed-proof probe. Pre-#629 the macf#616
+    // refine 400-rejected it (anchor-only); it must now parse.
+    const result = NotifyPayloadSchema.safeParse({
+      type: 'mention',
+      source: 'fleet-doctor',
+      message:
+        'fleet-doctor --inject probe (run_id=abc) — no action needed; this verifies '
+        + 'delivery is processed end-to-end. [macf-route:abc:code-agent]',
+    });
+    expect(result.success).toBe(true);
   });
 
   it('accepts a type:mention anchored by issue_number', () => {

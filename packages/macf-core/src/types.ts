@@ -109,31 +109,41 @@ export const NotifyPayloadSchema = z.object({
   correlation_token: z.string().optional(),
 }).refine(
   // macf#616 (silent-fallback Instance 14): a `type:mention` payload MUST carry
-  // a GitHub anchor (`issue_number` OR `pr_number`) so the recipient can locate
-  // the ask. The anchor is `.optional()` at the field level because it IS
-  // optional for every other notify type — but an anchorless mention surfaces
-  // to the recipient as a bare, context-free "You were mentioned" (see
-  // notify-formatter.ts), so the routed work strands invisibly even though
-  // delivery succeeded at every layer (HTTP 200 → notify_received → mcp_pushed
-  // → wake). Making the invariant a schema refine rejects the bad shape at PARSE
-  // (a loud 400 at `/notify`) rather than relying on a bypassable downstream
-  // handler guard.
+  // actionable content — either a `message` OR a GitHub anchor (`issue_number`
+  // / `pr_number`) — so the recipient can locate the ask. These are `.optional()`
+  // at the field level because they ARE optional for other notify types, but a
+  // mention with NEITHER surfaces to the recipient as a bare, context-free
+  // "You were mentioned" (see notify-formatter.ts `payload.message ?? 'You were
+  // mentioned'`), so the routed work strands invisibly even though delivery
+  // succeeded at every layer (HTTP 200 → notify_received → mcp_pushed → wake).
+  // Making the invariant a schema refine rejects the bad shape at PARSE (a loud
+  // 400 at `/notify`) rather than relying on a bypassable downstream handler guard.
+  //
+  // `message` counts as actionable content (macf#629): a message-bearing mention
+  // is NOT context-free — the message IS the context. The original macf#616 refine
+  // required an *anchor* and ignored `message`, which (a) over-rejected legitimate
+  // self-explanatory mentions and (b) would 400 `macf fleet doctor --inject`
+  // (`fleet-doctor-inject.ts` POSTs `{type:'mention', message:"…probe, no action
+  // needed…"}` — message-bearing, anchorless, non-diagnostic) once a receiver
+  // carries this refine. The true hazard is the message-LESS AND anchorless ping.
   //
   // Diagnostic probes (DR-030 §6, macf#568) are EXEMPT: a `diagnostic: true`
   // payload short-circuits at `/notify` BEFORE the formatter / onNotify and is
   // never surfaced to a recipient as a real mention, so the strand-the-recipient
-  // hazard does not apply. Only `diagnostic === true` is exempt — an explicit
-  // `diagnostic: false` is a real payload and still requires an anchor.
+  // hazard does not apply. (The non-invasive `fleet doctor` probe is exactly this
+  // message-less, anchorless, `diagnostic:true` shape — the historical source of
+  // the bare "You were mentioned" against pre-#577 receivers.)
   (payload) =>
     payload.type !== 'mention'
     || payload.diagnostic === true
+    || payload.message !== undefined
     || payload.issue_number !== undefined
     || payload.pr_number !== undefined,
   {
     message:
-      'a type:mention payload requires an issue_number or pr_number anchor; '
-      + 'anchorless mentions strand the recipient — see macf#616',
-    path: ['issue_number'],
+      'a type:mention payload requires a message or an issue_number/pr_number anchor; '
+      + 'a message-less anchorless mention strands the recipient — see macf#616/#629',
+    path: ['message'],
   },
 );
 
