@@ -4,6 +4,15 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.41] — 2026-06-27
+
+**Re-cut of 0.2.40** — the 0.2.40 npm publish hit a transient sigstore
+`TLOG_CREATE_ENTRY_ERROR (409)` (the TLOG entry registered server-side but the
+npm client didn't see success + retried into the append-only log). **0.2.40
+never reached npm**; 0.2.41 is the published artifact, content **identical to
+0.2.40** (the section below) plus this version bump. (DR-022 Amendment L
+recovery: bump-version, never retry the same version.)
+
 ## [0.2.40] — 2026-06-27
 
 The **fleet-health follow-up release**: hardens DR-030 routing-doctor +
