@@ -76,25 +76,53 @@ function rawField(health: HealthResponse | null, key: string): unknown {
 }
 
 /**
+ * Probe one peer, treating a REJECTED probe the SAME as a `null` resolution.
+ * `pingAgentHealth` is documented to resolve `null` on any failure, but a
+ * TRANSIENT fault can still reject the promise (a network error surfacing as
+ * `fetch failed`, or a synchronous `readFileSync` throw inside the probe when
+ * the cert file blinks out between the `existsSync` check and the read). A
+ * rejection here must mark only THAT peer unreachable — never abort the whole
+ * roster (macf#609). Mirrors `macf fleet doctor`'s per-peer failure isolation.
+ */
+async function safeProbe(
+  probe: FleetProbeFn,
+  host: string,
+  port: number,
+): Promise<HealthResponse | null> {
+  try {
+    return await probe(host, port);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Probe every peer once and collect roster + reachability + raw body. PURE
- * w.r.t. `probe` — tests inject a fake so nothing hits the network.
+ * w.r.t. `probe` — tests inject a fake so nothing hits the network. Each peer's
+ * probe is isolated (`safeProbe`): a single rejected/timed-out `/health` probe
+ * degrades that one peer to offline and the join still resolves with the full
+ * roster — it does NOT reject and abort the command (macf#609).
  */
 export async function gatherFleetStatus(
   peers: readonly { readonly name: string; readonly info: AgentInfo }[],
   probe: FleetProbeFn,
 ): Promise<readonly FleetAgentStatus[]> {
-  const out: FleetAgentStatus[] = [];
-  for (const peer of peers) {
-    const health = await probe(peer.info.host, peer.info.port);
-    out.push({
+  const settled = await Promise.allSettled(
+    peers.map((peer) => safeProbe(probe, peer.info.host, peer.info.port)),
+  );
+  return peers.map((peer, i) => {
+    const r = settled[i]!;
+    // safeProbe never rejects, so `rejected` is a belt-and-braces guard: any
+    // future probe-path that throws still degrades to offline, never aborts.
+    const health = r.status === 'fulfilled' ? r.value : null;
+    return {
       name: peer.name,
       host: peer.info.host,
       port: peer.info.port,
       online: health !== null,
       health,
-    });
-  }
-  return out;
+    };
+  });
 }
 
 /** Human-readable elapsed from whole seconds: `45s` / `18m` / `2h5m`. */

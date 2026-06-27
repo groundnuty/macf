@@ -135,6 +135,28 @@ describe('gatherFleetStatus', () => {
     expect(statuses[0]).toMatchObject({ name: 'CODE_AGENT', online: true, health });
     expect(statuses[1]).toMatchObject({ name: 'SCIENCE_AGENT', online: false, health: null });
   });
+
+  it('degrades a peer whose probe REJECTS instead of aborting the join (#609)', async () => {
+    const peers = [
+      { name: 'CODE_AGENT', info: info('127.0.0.1', 4100) },
+      { name: 'SCIENCE_AGENT', info: info('100.64.0.2', 4200) },
+      { name: 'DEVOPS_AGENT', info: info('100.64.0.3', 4300) },
+    ];
+    const health = onlineHealth();
+    // The middle peer's probe REJECTS transiently (e.g. `fetch failed`); the
+    // others resolve normally. The join must still resolve with all three.
+    const probe: FleetProbeFn = async (_host, port) => {
+      if (port === 4200) throw new Error('fetch failed');
+      return port === 4100 ? health : null;
+    };
+
+    const statuses = await gatherFleetStatus(peers, probe);
+    expect(statuses).toHaveLength(3);
+    expect(statuses[0]).toMatchObject({ name: 'CODE_AGENT', online: true, health });
+    // Rejected probe → that peer is marked offline, not propagated as a throw.
+    expect(statuses[1]).toMatchObject({ name: 'SCIENCE_AGENT', online: false, health: null });
+    expect(statuses[2]).toMatchObject({ name: 'DEVOPS_AGENT', online: false, health: null });
+  });
 });
 
 describe('buildFleetRows / formatFleetTable', () => {
@@ -258,6 +280,27 @@ describe('runFleetStatus (injected deps)', () => {
     expect(parsed.agents).toHaveLength(1);
     expect(parsed.agents[0].status).toBe('online');
     expect(parsed.agents[0].health.otel).toEqual({ endpoint_reachable: true });
+  });
+
+  it('renders the full roster + exits 0 when one peer probe rejects (#609)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const peers = [
+      { name: 'CODE_AGENT', info: info('127.0.0.1', 4100) },
+      { name: 'SCIENCE_AGENT', info: info('100.64.0.2', 4200) },
+    ];
+    const health = onlineHealth();
+    const probe: FleetProbeFn = async (_h, port) => {
+      if (port === 4200) throw new Error('fetch failed'); // transient single-peer reject
+      return health;
+    };
+
+    const code = await runFleetStatus('/unused', { now: NOW }, deps(peers, probe));
+    expect(code).toBe(0); // command degrades, does not abort
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('CODE_AGENT');
+    expect(out).toContain('online');
+    expect(out).toContain('SCIENCE_AGENT');
+    expect(out).toContain('offline'); // the rejected peer renders as unreachable
   });
 
   it('reports an empty registry cleanly', async () => {
