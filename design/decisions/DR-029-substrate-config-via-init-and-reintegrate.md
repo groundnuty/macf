@@ -40,6 +40,8 @@ The original Decision (steps 3–4) lumped *all* host-specifics under "the `host
 
 **Migration guard:** the original framing told operators "host-prelude is your host-specifics slot (preserved)" — so an operator who hand-edited `host-prelude.sh` would silently lose it on the next update (now regenerated). The guard is `host-prelude.sh`'s **macf-managed header** ("macf-managed + re-detected on every `macf update`"), which signals don't-hand-edit-this and steers host-specifics to `env.local.*`. So the reintegration step (3) is corrected: reintegrate `env.local.*` + creds + rules; **never** reintegrate `host-prelude.sh`.
 
+**The managed-header is the GENERAL discriminator — `claude.sh` follows it too (`macf#623`/`#624`).** The taxonomy's "macf-managed — mechanical" row covers the *generated* `claude.sh`, but a **hand-authored** `claude.sh` (the framework repo's own `#!/bin/bash` launcher with its custom `-r` flag + brew shellenv, header-less) must NOT be clobbered by `macf update`. The rule is uniform across every generated file: **regenerate IFF the existing file carries the `macf`-managed header; a header-less file is operator-authored → preserve + (drift-aware) warn.** `macf update` now auto-detects this via the header sentinel (`#623`/`#624`) — same discriminator `env.*` / `host-prelude.sh` use. So `claude.sh` is **managed-mechanical when header-present, operator-preserved when header-absent** — the discriminator (is-it-auto-detectable-as-managed?), not the filename, decides.
+
 This is a clarifying refinement, not a reversal of the ratified decision — the backup→init→reintegrate→reflect doctrine stands; this only sharpens *which* config is preserved vs regenerated.
 
 ## Why this over `--mode substrate`
