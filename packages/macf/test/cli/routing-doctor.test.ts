@@ -440,12 +440,17 @@ describe('check 5 — session-name drift is WARN-not-FAIL (DR-032 #610)', () => 
     expect(collectWarnings(report)).toEqual([expect.stringMatching(/code-agent.*WARN-not-FAIL/)]);
   });
 
-  it('an absent agent-config.json (vestigial on v3) does NOT degrade', async () => {
+  it('an absent agent-config.json (vestigial on v3) does NOT degrade — registry agents still checked (#621)', async () => {
     const report = await gatherRoutingDoctor(deps({ readRoutingConfig: async () => null }));
     expect(report.hasRoutingConfig).toBe(false);
-    expect(report.agents).toHaveLength(0);
-    expect(routingVerdict(report)).toBe('HEALTHY');
-    expect(collectWarnings(report)).toEqual([]);
+    // #621: with no local config, the registry-registered fleet agents are STILL checked
+    // (fleet-scoped) — they are no longer silently skipped. Repo-scoped fields null out.
+    expect(report.agents).toHaveLength(2);
+    expect(report.agents.every((a) => a.inLocalConfig === false)).toBe(true);
+    expect(report.agents.every((a) => a.routable && a.freshness === 'fresh')).toBe(true);
+    expect(report.agents.every((a) => a.selfSkipOk === null && a.sessionStatus === null)).toBe(true);
+    expect(routingVerdict(report)).toBe('HEALTHY'); // all fresh → no fleet-scoped fault
+    expect(collectWarnings(report)).toEqual([]); // null session → no warn
   });
 
   it('an agent entry with NO tmux_session is assert-if-present PASS (absent), not warn/fail', async () => {
@@ -481,6 +486,128 @@ describe('check 5 — session-name drift is WARN-not-FAIL (DR-032 #610)', () => 
     );
     expect(routingVerdict(report)).toBe('DEGRADED'); // the genuine fault (unroutable) still bites
     expect(collectWarnings(report)).toEqual([expect.stringMatching(/code-agent/)]); // warn still surfaced
+  });
+});
+
+describe('#621 — per-agent set is registry ∪ config (registry-only agents fleet-scoped-checked)', () => {
+  // A registry that carries an AUDITOR not in HEALTHY_CONFIG — the literal #621 case:
+  // the auditor is registered fleet-wide but groundnuty/macf does not route to it, so the
+  // OLD config-only loop never checked it. fromVariableSegment('AUDITOR') → 'auditor'.
+  const WITH_AUDITOR = (over: Partial<RoutingDoctorDeps> = {}): RoutingDoctorDeps =>
+    deps({
+      listRegistry: async () => [
+        { name: 'CODE_AGENT', info: info('100.64.0.1', 4100, 'inst-code') },
+        { name: 'SCIENCE_AGENT', info: info('100.64.0.2', 4200, 'inst-science') },
+        { name: 'AUDITOR', info: info('100.64.0.9', 4900, 'inst-aud') },
+      ],
+      probe: async (_h, port) =>
+        port === 4100 ? health('inst-code') : port === 4200 ? health('inst-science') : health('inst-aud'),
+      ...over,
+    });
+
+  it('a registry agent NOT in local config (the auditor) is checked fleet-scoped, repo-scoped null', async () => {
+    const report = await gatherRoutingDoctor(WITH_AUDITOR());
+    const auditor = report.agents.find((a) => a.label === 'auditor')!;
+    expect(auditor).toBeDefined();
+    expect(auditor.inLocalConfig).toBe(false); // provenance: registry-only
+    // FLEET-scoped checks DID run:
+    expect(auditor.routable).toBe(true);
+    expect(auditor.freshness).toBe('fresh');
+    expect(auditor.registryInstanceId).toBe('inst-aud');
+    expect(auditor.healthInstanceId).toBe('inst-aud');
+    // REPO-scoped checks are NULL (no local config to assert — honest-not-asserted):
+    expect(auditor.selfSkipOk).toBeNull();
+    expect(auditor.sessionOk).toBeNull();
+    expect(auditor.sessionStatus).toBeNull();
+    expect(auditor.sessionExpected).toBeNull();
+    expect(auditor.appName).toBeNull();
+    expect(auditor.tmuxSession).toBeNull();
+    // Fresh auditor → no fleet-scoped fault → still HEALTHY.
+    expect(routingVerdict(report)).toBe('HEALTHY');
+  });
+
+  it('a config agent present in the registry is FULLY checked as today (in_local_config:true)', async () => {
+    const report = await gatherRoutingDoctor(WITH_AUDITOR());
+    const code = report.agents.find((a) => a.label === 'code-agent')!;
+    expect(code.inLocalConfig).toBe(true);
+    expect(code.routable).toBe(true);
+    expect(code.freshness).toBe('fresh');
+    expect(code.selfSkipOk).toBe(true); // repo-scoped check ran
+    expect(code.sessionStatus).toBe('ok');
+    expect(code.sessionExpected).toBe('macf@code-agent');
+  });
+
+  it('a config agent NOT in the registry → routable:false (as today), still repo-scoped-checked', async () => {
+    const report = await gatherRoutingDoctor(
+      WITH_AUDITOR({
+        // science-agent is in HEALTHY_CONFIG but dropped from the registry.
+        listRegistry: async () => [
+          { name: 'CODE_AGENT', info: info('100.64.0.1', 4100, 'inst-code') },
+          { name: 'AUDITOR', info: info('100.64.0.9', 4900, 'inst-aud') },
+        ],
+      }),
+    );
+    const science = report.agents.find((a) => a.label === 'science-agent')!;
+    expect(science.inLocalConfig).toBe(true); // it IS in local config
+    expect(science.routable).toBe(false); // but missing the registry key
+    expect(science.freshness).toBe('unregistered'); // no probe attempted
+    expect(science.selfSkipOk).toBe(true); // repo-scoped check still ran (config present)
+    expect(routingVerdict(report)).toBe('DEGRADED'); // unroutable config target degrades
+  });
+
+  it('a registry-only agent that is STALE drives DEGRADED (fleet-scoped verdict covers it)', async () => {
+    const report = await gatherRoutingDoctor(
+      WITH_AUDITOR({
+        // The auditor's live /health reports a NEWER instance_id than the registry → stale.
+        probe: async (_h, port) =>
+          port === 4100 ? health('inst-code') : port === 4200 ? health('inst-science') : health('inst-NEWER-aud'),
+      }),
+    );
+    const auditor = report.agents.find((a) => a.label === 'auditor')!;
+    expect(auditor.inLocalConfig).toBe(false);
+    expect(auditor.freshness).toBe('stale');
+    expect(auditor.selfSkipOk).toBeNull(); // repo-scoped null does NOT mask the fleet fault
+    expect(routingVerdict(report)).toBe('DEGRADED'); // a registry-only stale agent still degrades
+  });
+
+  it('union de-dupes by label + keeps registry order first; auditor renders — n/a repo-scoped columns', async () => {
+    const report = await gatherRoutingDoctor(WITH_AUDITOR());
+    expect(report.agents.map((a) => a.label)).toEqual(['code-agent', 'science-agent', 'auditor']);
+    const rows = buildAgentRows(report.agents);
+    // auditor row: AGENT, ROUTABLE ✓, SELF-SKIP — n/a, SESSION — n/a, FRESH ✓
+    expect(rows[2]).toEqual(['auditor', '✓', '— n/a', '— n/a', '✓']);
+  });
+
+  it('--json: registry-only agent carries in_local_config + null repo-scoped fields; schema_version stays 1', async () => {
+    const report = await gatherRoutingDoctor(WITH_AUDITOR());
+    const json = routingDoctorToJson(report) as {
+      schema_version: number;
+      summary: { agents_total: number; agents_routing_ok: number };
+      warnings: string[];
+      non_fleet_repos: string[];
+      caller_pins: ReadonlyArray<Record<string, unknown>>;
+      agents: ReadonlyArray<Record<string, unknown>>;
+    };
+    expect(json.schema_version).toBe(1); // additive → NO bump
+    expect(json.summary.agents_total).toBe(3); // registry-only auditor now counted
+    expect(json.summary.agents_routing_ok).toBe(3); // all fresh + routable
+    // existing additive channels preserved:
+    expect(Array.isArray(json.warnings)).toBe(true);
+    expect(Array.isArray(json.non_fleet_repos)).toBe(true);
+    expect(json.caller_pins[0]).toHaveProperty('fleet_member'); // #614 field preserved
+    const auditor = json.agents.find((a) => a.label === 'auditor')!;
+    expect(auditor.in_local_config).toBe(false); // new additive provenance flag
+    expect(auditor.routable).toBe(true);
+    expect(auditor.freshness).toBe('fresh');
+    expect(auditor.self_skip_ok).toBeNull();
+    expect(auditor.session_ok).toBeNull();
+    expect(auditor.session_status).toBeNull();
+    expect(auditor.session_expected).toBeNull();
+    // a config agent still carries its repo-scoped fields (regression guard):
+    const code = json.agents.find((a) => a.label === 'code-agent')!;
+    expect(code.in_local_config).toBe(true);
+    expect(code.self_skip_ok).toBe(true);
+    expect(code.session_status).toBe('ok');
   });
 });
 
