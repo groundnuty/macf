@@ -806,7 +806,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
       console.log('');
       console.log('--fix will write the DR-028 floor into .claude/settings.json:');
       console.log('  - permissions.allow/deny floor (installPluginSkillPermissions)');
-      console.log('  - PreToolUse/PostToolUse/UserPromptSubmit/PreCompact hooks (installGhTokenHook)');
+      console.log('  - PreToolUse/PostToolUse/UserPromptSubmit/PreCompact/SessionStart hooks (installGhTokenHook)');
       console.log('  - sandbox.filesystem.allowRead + sandbox.excludedCommands');
       console.log('  Existing operator-authored entries are preserved (merge, dedup).');
       const consent = opts.yes ? true : await promptYesNo('Proceed?');
