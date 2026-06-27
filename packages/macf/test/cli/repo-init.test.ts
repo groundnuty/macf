@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { generateWorkflow, generateAgentConfig, patchAgentConfig, createLabel, repoInit } from '../../src/cli/commands/repo-init.js';
+import { generateWorkflow, generateAgentConfig, patchAgentConfig, createLabel, repoInit, isV3PlusActionsVersion } from '../../src/cli/commands/repo-init.js';
 
 function tempDir(): string {
   const dir = join(tmpdir(), `macf-repo-init-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -33,6 +33,79 @@ describe('generateWorkflow', () => {
   it('uses secrets: inherit', () => {
     const yaml = generateWorkflow('v1');
     expect(yaml).toContain('secrets: inherit');
+  });
+
+  // macf#566 — v3+ pins must emit the `with: { project, registry-api-path }`
+  // block; v1.x pins must not (the v1 reusable workflow declares no inputs).
+  it('emits a v3 with: block (project + registry-api-path) for a v3.3.0 pin', () => {
+    const yaml = generateWorkflow('v3.3.0', {
+      project: 'macf',
+      registryApiPath: '/repos/groundnuty/groundnuty',
+    });
+    expect(yaml).toContain('uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.3.0');
+    expect(yaml).toContain('\n    with:\n');
+    expect(yaml).toContain('\n      project: macf\n');
+    expect(yaml).toContain('\n      registry-api-path: /repos/groundnuty/groundnuty\n');
+    expect(yaml).toContain('secrets: inherit');
+    // well-formed YAML: no tabs; with: nested under route: between uses: and secrets:
+    expect(yaml).not.toContain('\t');
+    expect(yaml.indexOf('with:')).toBeGreaterThan(yaml.indexOf('uses:'));
+    expect(yaml.indexOf('with:')).toBeLessThan(yaml.indexOf('secrets: inherit'));
+  });
+
+  it('treats the bare v3 tag as v3+ (with: block present)', () => {
+    const yaml = generateWorkflow('v3', { project: 'p', registryApiPath: '/orgs/acme' });
+    expect(yaml).toContain('    with:');
+    expect(yaml).toContain('      project: p');
+    expect(yaml).toContain('      registry-api-path: /orgs/acme');
+  });
+
+  it('treats main as v3+ (with: block present)', () => {
+    const yaml = generateWorkflow('main', { project: 'p', registryApiPath: '/orgs/acme' });
+    expect(yaml).toContain('    with:');
+    expect(yaml).toContain('      registry-api-path: /orgs/acme');
+  });
+
+  it('omits with: for a v1 pin even when v3 inputs are passed (back-compat)', () => {
+    const yaml = generateWorkflow('v1', { project: 'p', registryApiPath: '/repos/o/r' });
+    expect(yaml).not.toContain('with:');
+    expect(yaml).not.toContain('project:');
+    expect(yaml).not.toContain('registry-api-path:');
+    expect(yaml).toContain('secrets: inherit');
+  });
+
+  it('omits with: for v2.x pins (back-compat)', () => {
+    const yaml = generateWorkflow('v2.0.1', { project: 'p', registryApiPath: '/repos/o/r' });
+    expect(yaml).not.toContain('with:');
+  });
+
+  it('omits with: on a v3 pin when no v3 inputs are supplied', () => {
+    const yaml = generateWorkflow('v3.3.0');
+    expect(yaml).not.toContain('with:');
+    expect(yaml).toContain('@v3.3.0');
+    expect(yaml).toContain('secrets: inherit');
+  });
+});
+
+describe('isV3PlusActionsVersion (macf#566)', () => {
+  it.each([
+    ['v1', false],
+    ['v1.3', false],
+    ['v1.3.1', false],
+    ['v2', false],
+    ['v2.0.1', false],
+    ['v3', true],
+    ['v3.0', true],
+    ['v3.3.0', true],
+    ['v4', true],
+    ['main', true],
+  ] as const)('%s -> %s', (ver, expected) => {
+    expect(isV3PlusActionsVersion(ver)).toBe(expected);
+  });
+
+  it('returns false for non-tag refs other than main', () => {
+    expect(isV3PlusActionsVersion('some-branch')).toBe(false);
+    expect(isV3PlusActionsVersion('v3-rc1')).toBe(false);
   });
 });
 
@@ -586,5 +659,104 @@ describe('repoInit integration', () => {
 
     // Files should still be created
     expect(existsSync(join(dir, '.github', 'workflows', 'agent-router.yml'))).toBe(true);
+  });
+
+  // macf#566 — v3 caller generation (project + registry-api-path).
+  it('v3 pin defaults project to repo name + repo-scoped registry-api-path', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    await repoInit(dir, {
+      repo: 'owner/test-repo',
+      actionsVersion: 'v3.3.0',
+      force: false,
+    });
+
+    const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    expect(wf).toContain('@v3.3.0');
+    expect(wf).toContain('    with:');
+    expect(wf).toContain('      project: test-repo');
+    expect(wf).toContain('      registry-api-path: /repos/owner/test-repo');
+  });
+
+  it('v3 pin + profile scope emits /repos/<user>/<user>', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    await repoInit(dir, {
+      repo: 'groundnuty/macf',
+      actionsVersion: 'v3.3.0',
+      registryType: 'profile',
+      registryUser: 'groundnuty',
+      force: false,
+    });
+
+    const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    expect(wf).toContain('      project: macf');
+    expect(wf).toContain('      registry-api-path: /repos/groundnuty/groundnuty');
+  });
+
+  it('v3 pin + org scope emits /orgs/<org>', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    await repoInit(dir, {
+      repo: 'acme/widget',
+      actionsVersion: 'v3.3.0',
+      registryType: 'org',
+      registryOrg: 'acme',
+      force: false,
+    });
+
+    const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    expect(wf).toContain('      registry-api-path: /orgs/acme');
+  });
+
+  it('v3 pin honours an explicit --project override', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    await repoInit(dir, {
+      repo: 'owner/some-repo',
+      actionsVersion: 'v3.3.0',
+      project: 'academic-resume',
+      force: false,
+    });
+
+    const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    expect(wf).toContain('      project: academic-resume');
+  });
+
+  it('v1 pin emits no v3 with: block (back-compat preserved)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    await repoInit(dir, {
+      repo: 'owner/test-repo',
+      actionsVersion: 'v1',
+      force: false,
+    });
+
+    const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    expect(wf).toContain('@v1');
+    expect(wf).not.toContain('with:');
+    expect(wf).not.toContain('registry-api-path:');
+  });
+
+  it('v3 pin + org scope without --registry-org throws', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    await expect(repoInit(dir, {
+      repo: 'acme/widget',
+      actionsVersion: 'v3.3.0',
+      registryType: 'org',
+      force: false,
+    })).rejects.toThrow('--registry-org required');
+  });
+
+  it('v3 pin + local scope is rejected (no GitHub-Actions routing path)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    await expect(repoInit(dir, {
+      repo: 'owner/r',
+      actionsVersion: 'v3.3.0',
+      registryType: 'local',
+      force: false,
+    })).rejects.toThrow('local registry has no GitHub-Actions routing path');
   });
 });
