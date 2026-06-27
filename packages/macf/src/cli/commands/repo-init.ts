@@ -2,6 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { generateToken } from '@groundnuty/macf-core';
+import type { RegistryConfig } from '@groundnuty/macf-core';
+import { registryPathPrefix } from '../registry-helper.js';
+import { isValidProjectName } from '../config.js';
 
 export interface RepoInitOptions {
   readonly repo?: string;
@@ -15,6 +18,82 @@ export interface RepoInitOptions {
    * legacy "session per agent, no window" layout.
    */
   readonly sessionName?: string;
+  /**
+   * Project name passed to the v3 reusable workflow's required `project`
+   * input (macf#566). Defaults to the repo name. Must match the `project`
+   * field in the agents' `.macf/macf-agent.json` — it derives the
+   * `<PROJECT_SEG>_AGENT_<NAME>` registry-variable + `<PROJECT_SEG>_CA_CERT`
+   * lookups. Only consumed when the pinned actions version is v3+.
+   */
+  readonly project?: string;
+  /**
+   * Registry scope for the v3 reusable workflow's `registry-api-path` input
+   * (DR-006). One of `repo` (default), `org`, or `profile`. Mirrors
+   * `macf init`'s `--registry-type`. Only consumed when the pinned actions
+   * version is v3+; v1.x routing reads addressing from agent-config.json,
+   * not the registry.
+   */
+  readonly registryType?: string;
+  /** Org login for `--registry-type org`. */
+  readonly registryOrg?: string;
+  /** User login for `--registry-type profile`. */
+  readonly registryUser?: string;
+}
+
+/**
+ * Parse the major version from a macf-actions pin (`v3`, `v3.3.0`, `v1.2`).
+ * Returns null when the ref is not a `vN[.N[.N]]` tag (e.g. a branch name).
+ */
+function parseActionsMajor(version: string): number | null {
+  const match = /^v(\d+)(?:\.\d+){0,2}$/.exec(version);
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * The v3 reusable workflow (`agent-router.yml@v3+`) requires the `project`
+ * input and resolves addressing from the MACF registry via `registry-api-path`
+ * (macf#566). v1.x/v2.x callers must NOT pass those inputs — the v1 reusable
+ * workflow declares no `workflow_call.inputs`, so an unknown `with:` key is a
+ * hard error. Gate the `with:` block on a v3+ pin.
+ *
+ * `main` (the macf-actions default branch) currently tracks the v3 contract,
+ * so it is treated as v3+.
+ */
+export function isV3PlusActionsVersion(version: string): boolean {
+  if (version === 'main') return true;
+  const major = parseActionsMajor(version);
+  return major !== null && major >= 3;
+}
+
+/**
+ * Build the registry config that the v3 caller's `registry-api-path` is
+ * derived from. Mirrors `macf init`'s `--registry-type` switch + reuses the
+ * canonical `registryPathPrefix` mapping (DR-006). `local` registries have no
+ * GitHub-Actions routing path, so they are rejected here.
+ */
+function buildRoutingRegistry(
+  opts: RepoInitOptions,
+  owner: string,
+  repoName: string,
+): RegistryConfig {
+  const regType = opts.registryType ?? 'repo';
+  switch (regType) {
+    case 'org':
+      if (!opts.registryOrg) throw new Error('--registry-org required for org registry');
+      return { type: 'org', org: opts.registryOrg };
+    case 'profile':
+      if (!opts.registryUser) throw new Error('--registry-user required for profile registry');
+      return { type: 'profile', user: opts.registryUser };
+    case 'repo':
+      return { type: 'repo', owner, repo: repoName };
+    case 'local':
+      throw new Error(
+        'local registry has no GitHub-Actions routing path; macf-actions v3 routing ' +
+          'requires a GitHub-backed registry. Use --registry-type repo (default), org, or profile.',
+      );
+    default:
+      throw new Error(`Unknown registry type: "${regType}" (expected repo, org, or profile)`);
+  }
 }
 
 interface LabelSpec {
@@ -65,8 +144,21 @@ function validateVersion(version: string): void {
   }
 }
 
-export function generateWorkflow(actionsVersion: string): string {
-  return [
+/**
+ * Inputs threaded into the v3 reusable workflow's `with:` block (macf#566).
+ * `registryApiPath` is the DR-006 API-path prefix (no trailing
+ * `/actions/variables`), e.g. `/repos/<user>/<user>` for profile scope.
+ */
+export interface V3WorkflowInputs {
+  readonly project: string;
+  readonly registryApiPath: string;
+}
+
+export function generateWorkflow(
+  actionsVersion: string,
+  v3Inputs?: V3WorkflowInputs,
+): string {
+  const lines = [
     'name: Agent Router',
     'on:',
     '  issues:',
@@ -80,9 +172,19 @@ export function generateWorkflow(actionsVersion: string): string {
     'jobs:',
     '  route:',
     `    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@${actionsVersion}`,
-    '    secrets: inherit',
-    '',
-  ].join('\n');
+  ];
+  // The v3+ reusable workflow requires `project` and resolves addressing from
+  // the registry via `registry-api-path` (macf#566). v1.x/v2.x callers must
+  // omit `with:` entirely — those workflows declare no `workflow_call.inputs`,
+  // and an unknown input is a hard error. Gate strictly on a v3+ pin.
+  if (v3Inputs && isV3PlusActionsVersion(actionsVersion)) {
+    lines.push('    with:');
+    lines.push(`      project: ${v3Inputs.project}`);
+    lines.push(`      registry-api-path: ${v3Inputs.registryApiPath}`);
+  }
+  lines.push('    secrets: inherit');
+  lines.push('');
+  return lines.join('\n');
 }
 
 /**
@@ -313,9 +415,23 @@ export async function repoInit(
   const workflowPath = join(absDir, '.github', 'workflows', 'agent-router.yml');
   const configPath = join(absDir, '.github', 'agent-config.json');
 
+  // macf#566: a v3+ pin needs the `project` + `registry-api-path` inputs in the
+  // generated caller; a v1.x pin must omit them. Resolve the v3 inputs only
+  // when the pin is v3+ so `repo-init --actions-version v1.x` still emits a
+  // valid v1 caller.
+  let v3Inputs: V3WorkflowInputs | undefined;
+  if (isV3PlusActionsVersion(opts.actionsVersion)) {
+    const project = opts.project ?? repoName!;
+    if (!isValidProjectName(project)) {
+      throw new Error(`Invalid project name "${project}": must match [a-zA-Z0-9_-]+`);
+    }
+    const registry = buildRoutingRegistry(opts, owner!, repoName!);
+    v3Inputs = { project, registryApiPath: registryPathPrefix(registry) };
+  }
+
   const workflowResult = writeFileSafe(
     workflowPath,
-    generateWorkflow(opts.actionsVersion),
+    generateWorkflow(opts.actionsVersion, v3Inputs),
     opts.force,
   );
 
