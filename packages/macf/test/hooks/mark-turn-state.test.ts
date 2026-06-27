@@ -82,6 +82,8 @@ describe('mark-turn-state.sh (turn-state marker writer)', () => {
       expect(s.current_tool).toBeNull();
       expect(s.current_command).toBeNull();
       expect(s.tool_started_at).toBeNull();
+      expect(s.tool_use_count).toBe(0); // #612: reset to 0 at turn start
+      expect(s.output_tokens).toBeNull(); // #612: null-by-design
     });
 
     it('increments turn_number across the session (preserves prior value)', () => {
@@ -107,6 +109,7 @@ describe('mark-turn-state.sh (turn-state marker writer)', () => {
       expect(s.current_tool).toBe('Bash');
       expect(s.current_command).toBe('make build');
       expect(typeof s.tool_started_at).toBe('number');
+      expect(s.tool_use_count).toBe(1); // #612: +1 on the first tool of the turn
       // Turn metadata preserved.
       expect(s.turn_number).toBe(1);
       expect(s.status).toBe('busy');
@@ -146,6 +149,7 @@ describe('mark-turn-state.sh (turn-state marker writer)', () => {
       expect(s.current_command).toBeNull();
       expect(s.tool_started_at).toBeNull();
       expect(s.status).toBe('busy'); // still mid-turn
+      expect(s.tool_use_count).toBe(1); // #612: post-tool-use does NOT increment
     });
 
     it('post-tool-use-failure is an alias → same clearing behavior', () => {
@@ -161,18 +165,72 @@ describe('mark-turn-state.sh (turn-state marker writer)', () => {
     });
   });
 
-  describe('(d) Stop ends the turn + records last-turn stats', () => {
-    it('status=idle, ended_at, last_turn_duration_ms, tool_use_count, output_tokens', () => {
+  describe('(c2) tool_use_count is a live per-turn counter (#612)', () => {
+    it('resets to 0 at UserPromptSubmit, +1 per pre-tool-use, post does not increment', () => {
       const ws = new Workspace();
       ws.fire('user-prompt-submit');
-      expect(ws.fire('stop', { tool_use_count: 12, output_tokens: 2048 })).toBe(0);
+      expect(ws.read().tool_use_count).toBe(0);
+      ws.fire('pre-tool-use', { tool_name: 'Bash', tool_input: { command: 'a' } });
+      expect(ws.read().tool_use_count).toBe(1);
+      ws.fire('post-tool-use');
+      expect(ws.read().tool_use_count).toBe(1); // post-tool-use does not increment
+      ws.fire('pre-tool-use', { tool_name: 'Read', tool_input: { file_path: '/x' } });
+      expect(ws.read().tool_use_count).toBe(2);
+      ws.fire('post-tool-use');
+      expect(ws.read().tool_use_count).toBe(2);
+    });
+
+    it('counts a failed tool (post-tool-use-failure still pairs one pre-tool-use)', () => {
+      const ws = new Workspace();
+      ws.fire('user-prompt-submit');
+      ws.fire('pre-tool-use', { tool_name: 'Bash', tool_input: { command: 'false' } });
+      ws.fire('post-tool-use-failure');
+      expect(ws.read().tool_use_count).toBe(1);
+    });
+
+    it('resets to 0 at the next turn (the counter does not carry across turns)', () => {
+      const ws = new Workspace();
+      ws.fire('user-prompt-submit');
+      ws.fire('pre-tool-use', { tool_name: 'Bash', tool_input: { command: 'a' } });
+      ws.fire('post-tool-use');
+      ws.fire('stop');
+      expect(ws.read().tool_use_count).toBe(1); // turn total kept at idle
+      ws.fire('user-prompt-submit');
+      expect(ws.read().tool_use_count).toBe(0); // reset for the new turn
+    });
+
+    it('output_tokens is null-by-design across the whole lifecycle (#612)', () => {
+      const ws = new Workspace();
+      ws.fire('user-prompt-submit');
+      expect(ws.read().output_tokens).toBeNull();
+      ws.fire('pre-tool-use', { tool_name: 'Bash', tool_input: { command: 'a' } });
+      expect(ws.read().output_tokens).toBeNull();
+      ws.fire('post-tool-use');
+      // Even when a Stop payload carries output_tokens, it is ignored: no hook
+      // event exposes per-turn token usage as a stdin field (transcript-only).
+      ws.fire('stop', { output_tokens: 4096 });
+      expect(ws.read().output_tokens).toBeNull();
+    });
+  });
+
+  describe('(d) Stop ends the turn + records last-turn stats', () => {
+    it('status=idle, ended_at, last_turn_duration_ms; tool_use_count = turn total; output_tokens null', () => {
+      const ws = new Workspace();
+      ws.fire('user-prompt-submit');
+      ws.fire('pre-tool-use', { tool_name: 'Bash', tool_input: { command: 'a' } });
+      ws.fire('post-tool-use');
+      ws.fire('pre-tool-use', { tool_name: 'Read', tool_input: { file_path: '/x' } });
+      ws.fire('post-tool-use');
+      // #612: Stop no longer reads tool_use_count/output_tokens from the payload
+      // (the Stop hook never carries them); the accumulated turn total is kept.
+      expect(ws.fire('stop', { tool_use_count: 999, output_tokens: 2048 })).toBe(0);
       const s = ws.read();
       expect(s.status).toBe('idle');
       expect(typeof s.ended_at).toBe('number');
       expect(typeof s.last_turn_duration_ms).toBe('number');
       expect(s.last_turn_duration_ms!).toBeGreaterThanOrEqual(0);
-      expect(s.tool_use_count).toBe(12);
-      expect(s.output_tokens).toBe(2048);
+      expect(s.tool_use_count).toBe(2); // two tools ran this turn (payload ignored)
+      expect(s.output_tokens).toBeNull(); // null-by-design
       expect(s.phase).toBeNull();
       expect(s.current_tool).toBeNull();
     });
@@ -181,19 +239,19 @@ describe('mark-turn-state.sh (turn-state marker writer)', () => {
       const ws = new Workspace();
       ws.fire('user-prompt-submit');
       const started = ws.read().started_at!;
-      ws.fire('stop', { tool_use_count: 0, output_tokens: 1 });
+      ws.fire('stop');
       const s = ws.read();
       expect(s.last_turn_duration_ms).toBe(s.ended_at! - started);
     });
 
-    it('missing Stop payload fields → tool_use_count/output_tokens null (no crash)', () => {
+    it('Stop with no tools this turn → tool_use_count 0, output_tokens null', () => {
       const ws = new Workspace();
       ws.fire('user-prompt-submit');
       expect(ws.fire('stop')).toBe(0);
       const s = ws.read();
       expect(s.status).toBe('idle');
-      expect(s.tool_use_count).toBeNull();
-      expect(s.output_tokens).toBeNull();
+      expect(s.tool_use_count).toBe(0); // #612: reset at UPS, no tools ran
+      expect(s.output_tokens).toBeNull(); // null-by-design
     });
   });
 
@@ -235,19 +293,20 @@ describe('mark-turn-state.sh (turn-state marker writer)', () => {
       ws.fire('post-tool-use');
       expect(ws.read()).toMatchObject({ phase: 'thinking', current_tool: null });
 
-      ws.fire('stop', { tool_use_count: 3, output_tokens: 99 });
+      // One tool ran this turn; the Stop payload's count/tokens are ignored (#612).
+      ws.fire('stop', { tool_use_count: 999, output_tokens: 99 });
       const ended = ws.read();
-      expect(ended).toMatchObject({ status: 'idle', tool_use_count: 3, output_tokens: 99 });
+      expect(ended).toMatchObject({ status: 'idle', tool_use_count: 1, output_tokens: null });
 
-      // Next turn: turn_number increments; PREVIOUS turn's stats persist into the
-      // busy state (the contract's "of the PREVIOUS turn" semantics).
+      // Next turn: turn_number increments; last_turn_duration_ms persists, but
+      // tool_use_count RESETS to 0 (it is a live per-turn counter, #612).
       ws.fire('user-prompt-submit');
       const next = ws.read();
       expect(next.turn_number).toBe(2);
       expect(next.status).toBe('busy');
       expect(next.last_turn_duration_ms).toBe(ended.last_turn_duration_ms);
-      expect(next.tool_use_count).toBe(3);
-      expect(next.output_tokens).toBe(99);
+      expect(next.tool_use_count).toBe(0);
+      expect(next.output_tokens).toBeNull();
     });
   });
 

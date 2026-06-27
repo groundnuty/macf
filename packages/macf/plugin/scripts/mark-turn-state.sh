@@ -7,11 +7,14 @@
 # Invoked by the MACF plugin hooks (hooks/hooks.json) with ONE argument naming
 # the lifecycle event:
 #
-#   user-prompt-submit  → a new turn begins (turn_number++, status=busy)
-#   pre-tool-use        → entered a tool (phase=tool, current_tool/command)
+#   user-prompt-submit  → a new turn begins (turn_number++, status=busy,
+#                         tool_use_count reset to 0)
+#   pre-tool-use        → entered a tool (phase=tool, current_tool/command,
+#                         tool_use_count++)
 #   post-tool-use       → tool finished (phase=thinking, tool fields cleared)
 #   post-tool-use-failure (alias of post-tool-use)
-#   stop                → turn ended (status=idle, ended_at, last-turn stats)
+#   stop                → turn ended (status=idle, ended_at, last_turn_duration_ms;
+#                         tool_use_count keeps the turn's accumulated total)
 #   stop-failure        → turn errored (status=idle, clear busy, rest as-is)
 #   session-end         (alias of stop-failure)
 #
@@ -23,8 +26,21 @@
 # half-written file. `turn_number` persists + increments across the session.
 #
 # Each event reads the Claude Code hook stdin JSON for the fields it needs
-# (`.tool_name`, `.tool_input.command` on PreToolUse; `.tool_use_count`,
-# `.output_tokens` on Stop). All epoch times are milliseconds.
+# (`.tool_name`, `.tool_input.command` on PreToolUse). All epoch times are
+# milliseconds.
+#
+# `tool_use_count` (groundnuty/macf#612) is a LIVE per-turn counter the script
+# DERIVES itself — reset to 0 on user-prompt-submit, +1 on each pre-tool-use —
+# NOT read from the hook payload, because no Claude Code hook event carries a
+# tool-use count as a stdin field. This makes the count visible mid-turn (the
+# channel server's /health.state was reporting it null because the old writer
+# only set it on Stop, from a `.tool_use_count` field the Stop payload never has).
+#
+# `output_tokens` is NULL-BY-DESIGN: no Claude Code hook event exposes per-turn
+# token usage as a direct stdin field — it lives only inside the transcript JSONL,
+# which this never-block hook deliberately does NOT parse (cost + fragility). The
+# field is kept in the marker shape (the channel server reads it) but always
+# written null. The DR-006 watchdog keys on status/elapsed_ms/phase regardless.
 #
 # ROBUSTNESS CONTRACT: this hook NEVER blocks a turn. Every path exits 0 —
 # missing jq, missing workspace dir, malformed stdin, a broken prior marker, a
@@ -87,12 +103,9 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
   CURRENT_COMMAND="${CURRENT_COMMAND:0:120}"
 fi
 
-# tool_use_count / output_tokens come off the Stop payload; pass as JSON
-# literals (a number, or the bare `null` literal) for jq's --argjson.
-TOOL_USE_COUNT="$(jq -c '.tool_use_count // null' <<<"$INPUT" 2>/dev/null || echo null)"
-[[ -z "$TOOL_USE_COUNT" ]] && TOOL_USE_COUNT="null"
-OUTPUT_TOKENS="$(jq -c '.output_tokens // null' <<<"$INPUT" 2>/dev/null || echo null)"
-[[ -z "$OUTPUT_TOKENS" ]] && OUTPUT_TOKENS="null"
+# NOTE: tool_use_count is NOT read from stdin — it is derived (reset on
+# user-prompt-submit, +1 per pre-tool-use; see header). output_tokens is
+# null-by-design (no hook event exposes it as a stdin field).
 
 # ── Load the prior marker (or {} if absent/broken) ────────────────────────────
 EXISTING='{}'
@@ -110,8 +123,6 @@ NEW="$(
     --argjson now "$NOW" \
     --arg tool_name "$TOOL_NAME" \
     --arg current_command "$CURRENT_COMMAND" \
-    --argjson tool_use_count "$TOOL_USE_COUNT" \
-    --argjson output_tokens "$OUTPUT_TOKENS" \
     '
     def base:
       { turn_number: 0, status: "idle", started_at: null, ended_at: null,
@@ -122,12 +133,14 @@ NEW="$(
     | if $event == "user-prompt-submit" then
         $s + { turn_number: (($s.turn_number // 0) + 1), status: "busy",
                started_at: $now, ended_at: null, phase: "thinking",
-               current_tool: null, current_command: null, tool_started_at: null }
+               current_tool: null, current_command: null, tool_started_at: null,
+               tool_use_count: 0, output_tokens: null }
       elif $event == "pre-tool-use" then
         $s + { phase: "tool",
                current_tool: ($tool_name | if . == "" then null else . end),
                current_command: ($current_command | if . == "" then null else . end),
-               tool_started_at: $now }
+               tool_started_at: $now,
+               tool_use_count: (($s.tool_use_count // 0) + 1) }
       elif $event == "post-tool-use" then
         $s + { phase: "thinking", current_tool: null, current_command: null,
                tool_started_at: null }
@@ -135,7 +148,6 @@ NEW="$(
         $s + { status: "idle", ended_at: $now,
                last_turn_duration_ms:
                  (if $s.started_at != null then ($now - $s.started_at) else null end),
-               tool_use_count: $tool_use_count, output_tokens: $output_tokens,
                phase: null, current_tool: null }
       elif $event == "stop-failure" then
         $s + { status: "idle", ended_at: $now, phase: null, current_tool: null }
