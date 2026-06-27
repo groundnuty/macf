@@ -4,6 +4,55 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.40] — 2026-06-27
+
+The **fleet-health follow-up release**: hardens DR-030 routing-doctor +
+DR-031 supervision against the issues that surfaced on the first live v0.2.39
+fleet run, plus the telemetry/notify fixes the DR-006 watchdog + Tempo verifies
+depend on. Additive/back-compat throughout (routing-doctor `--json` stays
+`schema_version: 1`). Marketplace v0.2.40 is a lockstep bump.
+
+### reliability
+
+- **routing-doctor is now fleet-complete + false-positive-free** (live HEALTHY
+  verified): session-name drift is WARN-not-FAIL + assert-if-present (#610);
+  `pins_consistent` scopes to opt-out fleet membership via `.github/macf-fleet.json`,
+  not the raw install-set (#614); per-agent checks iterate `registry ∪ config.agents`
+  with a fleet-scoped (registry) vs repo-scoped (config) tier, so registry-only
+  agents (e.g. the auditor) are checked from any repo's run (#621). `macf fleet
+  status` degrades a failed peer instead of aborting the roster (#609).
+
+### fix
+
+- **notify `type:mention` invariant = message-OR-anchor** (#616 + #629): reject a
+  message-less *and* anchorless mention at the schema boundary (the bare
+  "You were mentioned" stranding class, silent-fallback Instance 14), while
+  accepting message-bearing mentions — which unbreaks `macf fleet doctor --inject`
+  (its probe is message-bearing + anchorless). Diagnostic probes stay exempt.
+- **`/sign` SignCsr span emits the kebab `gen_ai.agent.name`** (#611) — the 2nd
+  emit-site #593 missed (completes the macf#590 telemetry-name convention).
+- **turn-state hook populates `tool_use_count`** (derived in-script);
+  `output_tokens` is null-by-design (no hook event exposes it) (#612).
+- **graceful-deregister fires on MCP stdin-close (TUI-exit)**, not just
+  SIGTERM/SIGINT — a clean `/exit` now deregisters instead of waiting for the
+  TTL (#627).
+- **`macf update` preserves a hand-authored `claude.sh`** (no managed-header) +
+  drift-aware warn, instead of clobbering it (#623).
+- **`macf repo-init` generates a v3 agent-router caller** with `project` +
+  `registry-api-path` (was a broken v1-style caller under v3) (#566).
+
+### ci
+
+- Marketplace plugin **sync + sync-or-fail publish gate** — `macf init`/`update`
+  distribute the marketplace plugin, which had silently drifted from canonical
+  `plugin/`; a release-time gate now fails publish on drift (#605/#606/#607).
+
+### docs
+
+- silent-fallback **Instance 13** + `coordination.md` §5(c) reframed
+  structural-first (the routing fix is the guarantee; the gate-sweep is the
+  backstop), recipient signal broadened to formal+requested+@mentioned (#575).
+
 ## [0.2.39] — 2026-06-27
 
 The **fleet-health release**: **DR-030 interconnect-doctor** (`macf fleet` /
