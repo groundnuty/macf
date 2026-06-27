@@ -334,6 +334,37 @@ const MANAGED_HEADER_LINES = [
 ];
 
 /**
+ * Distinctive, stable substring of the managed-file header that EVERY
+ * macf-generated `claude.sh` carries (it is the leading, punctuation-free
+ * span of `MANAGED_HEADER_LINES[0]`). Used by `hasManagedHeader` to tell a
+ * macf-managed launcher apart from a hand-authored one.
+ *
+ * **Why this exact slice:** it is a literal prefix of `MANAGED_HEADER_LINES[0]`
+ * (the `claude-sh.test.ts` `hasManagedHeader` suite asserts that, AND that a
+ * freshly `generateClaudeSh`'d launcher contains it — so the sentinel can't
+ * silently drift from what's emitted), and it stops BEFORE the em-dash so a
+ * minor reword of the header tail won't break detection. Distinctive enough
+ * that a hand-authored launcher (e.g. the framework repo's own `claude.sh`,
+ * which opens `# Launcher for macf-code-agent`) won't accidentally match.
+ */
+const MANAGED_HEADER_SENTINEL = '# This file is managed by `macf`.';
+
+/**
+ * True when `content` is a macf-generated `claude.sh` — i.e. it carries the
+ * managed-file header sentinel. False for a hand-authored / operator-owned
+ * launcher that lacks the header.
+ *
+ * This is the discriminator `macf update` uses to decide regenerate-vs-preserve
+ * for `claude.sh` (DR-029, groundnuty/macf#623): a header-LESS launcher is
+ * operator-authored and must be preserved (warn, don't clobber), never
+ * overwritten by the generic template. It is the same managed-header
+ * discriminator the `.claude/.macf/env.*` + `host-prelude.sh` managed files use.
+ */
+export function hasManagedHeader(content: string): boolean {
+  return content.includes(MANAGED_HEADER_SENTINEL);
+}
+
+/**
  * Emit GitHub-App env exports (`APP_ID`, `INSTALL_ID`, `KEY_PATH` + the
  * relative-path resolver) when running in a GitHub-backed registry mode.
  *
