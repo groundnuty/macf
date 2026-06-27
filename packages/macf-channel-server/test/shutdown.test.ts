@@ -73,13 +73,22 @@ async function flushExitChain(): Promise<void> {
 
 describe('registerShutdownHandler', () => {
   let processOnSpy: ReturnType<typeof vi.spyOn>;
+  // macf#627: registerShutdownHandler now also wires process.stdin 'end'/'close'
+  // listeners. Spy on process.stdin.on (mirroring the process.on spy) so tests
+  // that don't inject a mock stdin don't leak real listeners onto the global
+  // process.stdin (which triggers a MaxListenersExceededWarning across the suite).
+  let processStdinOnSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     processOnSpy = vi.spyOn(process, 'on').mockImplementation(() => process);
+    processStdinOnSpy = vi
+      .spyOn(process.stdin, 'on')
+      .mockImplementation(() => process.stdin);
   });
 
   afterEach(() => {
     processOnSpy.mockRestore();
+    processStdinOnSpy.mockRestore();
   });
 
   it('registers SIGTERM and SIGINT handlers', () => {
@@ -565,27 +574,22 @@ describe('registerShutdownHandler', () => {
       );
     });
 
-    it('defaults to process.stdin when no stdin is injected (does not throw)', () => {
+    it('defaults to process.stdin when no stdin is injected', () => {
       // Guard against a regression where the default `config.stdin ?? process.stdin`
-      // path is dropped — registration must still wire stdin listeners on the real
-      // process.stdin without error. Spy so we don't leave real listeners behind.
-      const stdinOnSpy = vi.spyOn(process.stdin, 'on').mockReturnValue(process.stdin);
+      // path is dropped — registration must still wire stdin 'end'/'close' on the
+      // real process.stdin. processStdinOnSpy (outer beforeEach) captures the calls
+      // without leaving real listeners behind.
+      registerShutdownHandler({
+        agentName: 'test-agent',
+        registry: mockRegistry(),
+        instanceId: INSTANCE_ID,
+        httpsServer: mockServer(),
+        logger: mockLogger(),
+      });
 
-      expect(() =>
-        registerShutdownHandler({
-          agentName: 'test-agent',
-          registry: mockRegistry(),
-          instanceId: INSTANCE_ID,
-          httpsServer: mockServer(),
-          logger: mockLogger(),
-        }),
-      ).not.toThrow();
-
-      const events = stdinOnSpy.mock.calls.map(c => c[0]);
+      const events = processStdinOnSpy.mock.calls.map(c => c[0]);
       expect(events).toContain('end');
       expect(events).toContain('close');
-
-      stdinOnSpy.mockRestore();
     });
   });
 });
