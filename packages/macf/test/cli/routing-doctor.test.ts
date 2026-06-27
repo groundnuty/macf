@@ -16,6 +16,7 @@ import {
   buildAgentRows,
   buildRepoRows,
   classifyFreshness,
+  collectWarnings,
   computeExpectedPin,
   evaluateCaCert,
   evaluateSelfSkip,
@@ -27,6 +28,7 @@ import {
   isStrictBase64,
   normalizeLogin,
   pinGlyph,
+  sessionGlyph,
   ROUTING_DOCTOR_JSON_SCHEMA_VERSION,
   routingDoctorToJson,
   routingVerdict,
@@ -103,21 +105,25 @@ describe('evaluateSelfSkip — #538(b) / #566', () => {
   });
 });
 
-describe('evaluateSession — <project>@<agent> convention', () => {
-  it('passes the canonical form', () => {
+describe('evaluateSession — <project>@<name> convention, tri-state (DR-032 #610)', () => {
+  it('passes the canonical form → ok', () => {
     expect(evaluateSession('code-agent', 'macf@code-agent', 'macf')).toEqual({
-      ok: true,
+      status: 'ok',
       expected: 'macf@code-agent',
     });
   });
-  it('flags a bare-label session (the silent Stage-2 drift)', () => {
+  it('present-but-stale → warn (NOT fail), with expected + a WARN-not-FAIL reason', () => {
     const r = evaluateSession('code-agent', 'code-agent', 'macf');
-    expect(r.ok).toBe(false);
+    expect(r.status).toBe('warn');
     expect(r.expected).toBe('macf@code-agent');
     expect(r.reason).toMatch(/convention/);
+    expect(r.reason).toMatch(/WARN-not-FAIL/);
   });
-  it('flags a missing session', () => {
-    expect(evaluateSession('code-agent', undefined, 'macf').ok).toBe(false);
+  it('absent tmux_session → absent (assert-if-present PASS, vestigial on v3)', () => {
+    expect(evaluateSession('code-agent', undefined, 'macf')).toEqual({
+      status: 'absent',
+      expected: 'macf@code-agent',
+    });
   });
 });
 
@@ -318,22 +324,69 @@ describe('check 4 — CA material malformed', () => {
   });
 });
 
-describe('check 5 — session-name drift', () => {
-  it('a bare-label tmux_session fails the convention → DEGRADED', async () => {
+describe('check 5 — session-name drift is WARN-not-FAIL (DR-032 #610)', () => {
+  it('a stale bare-label tmux_session warns but does NOT drive DEGRADED', async () => {
     const report = await gatherRoutingDoctor(
       deps({
         readRoutingConfig: async () => ({
           agents: {
-            'code-agent': { app_name: 'macf-code-agent', tmux_session: 'code-agent' }, // drift
+            'code-agent': { app_name: 'macf-code-agent', tmux_session: 'code-agent' }, // stale drift
             'science-agent': { app_name: 'macf-science-agent', tmux_session: 'macf@science-agent' },
           },
         }),
       }),
     );
     const code = report.agents.find((a) => a.label === 'code-agent')!;
-    expect(code.sessionOk).toBe(false);
+    expect(code.sessionStatus).toBe('warn');
+    expect(code.sessionOk).toBe(false); // back-compat field preserved
     expect(code.sessionExpected).toBe('macf@code-agent');
-    expect(routingVerdict(report)).toBe('DEGRADED');
+    // The drift no longer flips the verdict — it's the known-pending rename.
+    expect(routingVerdict(report)).toBe('HEALTHY');
+    // ...but it stays VISIBLE in the warnings channel.
+    expect(collectWarnings(report)).toEqual([expect.stringMatching(/code-agent.*WARN-not-FAIL/)]);
+  });
+
+  it('an absent agent-config.json (vestigial on v3) does NOT degrade', async () => {
+    const report = await gatherRoutingDoctor(deps({ readRoutingConfig: async () => null }));
+    expect(report.hasRoutingConfig).toBe(false);
+    expect(report.agents).toHaveLength(0);
+    expect(routingVerdict(report)).toBe('HEALTHY');
+    expect(collectWarnings(report)).toEqual([]);
+  });
+
+  it('an agent entry with NO tmux_session is assert-if-present PASS (absent), not warn/fail', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        readRoutingConfig: async () => ({
+          agents: {
+            'code-agent': { app_name: 'macf-code-agent' }, // no tmux_session at all
+            'science-agent': { app_name: 'macf-science-agent', tmux_session: 'macf@science-agent' },
+          },
+        }),
+      }),
+    );
+    const code = report.agents.find((a) => a.label === 'code-agent')!;
+    expect(code.sessionStatus).toBe('absent');
+    expect(code.sessionOk).toBe(true); // assert-if-present PASS
+    expect(routingVerdict(report)).toBe('HEALTHY');
+    expect(collectWarnings(report)).toEqual([]);
+  });
+
+  it('a session warn does NOT mask a genuine routing fault (still DEGRADED)', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        // science-agent is unroutable (missing registry key) AND code-agent's session is stale.
+        listRegistry: async () => [{ name: 'CODE_AGENT', info: info('100.64.0.1', 4100, 'inst-code') }],
+        readRoutingConfig: async () => ({
+          agents: {
+            'code-agent': { app_name: 'macf-code-agent', tmux_session: 'code-agent' }, // session warn
+            'science-agent': { app_name: 'macf-science-agent', tmux_session: 'macf@science-agent' },
+          },
+        }),
+      }),
+    );
+    expect(routingVerdict(report)).toBe('DEGRADED'); // the genuine fault (unroutable) still bites
+    expect(collectWarnings(report)).toEqual([expect.stringMatching(/code-agent/)]); // warn still surfaced
   });
 });
 
@@ -360,6 +413,11 @@ describe('rendering — tables + glyphs', () => {
     expect(freshnessGlyph('unreachable')).toBe('? unreach');
     expect(freshnessGlyph('unknown')).toBe('? unkn');
     expect(freshnessGlyph('unregistered')).toBe('—');
+  });
+  it('sessionGlyph maps each state (DR-032 #610)', () => {
+    expect(sessionGlyph('ok')).toBe('✓');
+    expect(sessionGlyph('warn')).toBe('⚠ warn');
+    expect(sessionGlyph('absent')).toBe('—');
   });
   it('buildRepoRows + formatRepoTable render REPO / CALLER-PIN / CONSISTENT', () => {
     const rows = [
@@ -421,6 +479,42 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
     expect(json.ca_cert).toMatchObject({ present: true, valid: true });
     expect(json.disclaimer).toMatch(/Static GitHub-plane/);
   });
+
+  it('additive: keeps session_ok, adds session_status + warnings[]; drift does NOT degrade (#610)', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        readRoutingConfig: async () => ({
+          agents: {
+            'code-agent': { app_name: 'macf-code-agent', tmux_session: 'code-agent' }, // stale drift
+            'science-agent': { app_name: 'macf-science-agent', tmux_session: 'macf@science-agent' },
+          },
+        }),
+      }),
+    );
+    const json = routingDoctorToJson(report) as {
+      schema_version: number;
+      summary: { verdict: string; agents_routing_ok: number };
+      warnings: string[];
+      agents: ReadonlyArray<Record<string, unknown>>;
+    };
+    expect(json.schema_version).toBe(1); // additive change → NO bump
+    expect(json.summary.verdict).toBe('HEALTHY'); // session drift no longer degrades
+    expect(json.summary.agents_routing_ok).toBe(2); // both agents still routing-OK
+    const code = json.agents.find((a) => a.label === 'code-agent')!;
+    expect(code.session_ok).toBe(false); // back-compat field PRESERVED
+    expect(code.session_status).toBe('warn'); // additive tri-state
+    expect(code.session_expected).toBe('macf@code-agent'); // PRESERVED
+    expect(code.session_reason).toMatch(/WARN-not-FAIL/); // PRESERVED + informative
+    expect(json.warnings).toEqual([expect.stringMatching(/code-agent/)]); // visible, additive
+  });
+
+  it('additive: an all-green report carries an empty warnings[] (absent session = no warn)', async () => {
+    const json = routingDoctorToJson(
+      await gatherRoutingDoctor(deps({ readRoutingConfig: async () => null })),
+    ) as { warnings: string[]; summary: { verdict: string } };
+    expect(json.warnings).toEqual([]);
+    expect(json.summary.verdict).not.toBe('DEGRADED');
+  });
 });
 
 // --- Command entry point ---
@@ -457,6 +551,27 @@ describe('runRoutingDoctor (injected deps)', () => {
     const code = await runRoutingDoctor('/unused', {}, deps());
     expect(code).toBe(0);
     expect(logSpy.mock.calls.flat().join('\n')).toContain('routing plane: HEALTHY');
+  });
+
+  it('prints the warnings block + exits 0 (HEALTHY) on a stale session (DR-032 #610)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runRoutingDoctor(
+      '/unused',
+      {},
+      deps({
+        readRoutingConfig: async () => ({
+          agents: {
+            'code-agent': { app_name: 'macf-code-agent', tmux_session: 'code-agent' }, // stale drift
+            'science-agent': { app_name: 'macf-science-agent', tmux_session: 'macf@science-agent' },
+          },
+        }),
+      }),
+    );
+    expect(code).toBe(0); // WARN-not-FAIL → not DEGRADED
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('routing plane: HEALTHY');
+    expect(out).toContain('Warnings');
+    expect(out).toMatch(/code-agent/);
   });
 
   it('emits the stable JSON contract under --json (exit code still reflects verdict)', async () => {
