@@ -477,11 +477,20 @@ describe('update command', () => {
     expect(fetchPluginToWorkspace).not.toHaveBeenCalled();
   });
 
-  it('regenerates claude.sh on every update, even when nothing is bumped (#63)', async () => {
+  it('regenerates a macf-managed (header-carrying) stale claude.sh on every update, even when nothing is bumped (#63)', async () => {
     writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
-    // Seed a stale claude.sh that doesn't match the current template.
+    // Seed a stale BUT macf-managed claude.sh (carries the managed-header,
+    // as every macf-generated launcher does) that's otherwise out of date.
+    // DR-029 / macf#623: managed launchers are still refreshed.
     const shPath = join(dir, 'claude.sh');
-    writeFileSync(shPath, '#!/usr/bin/env bash\n# stale launcher\nexec claude "$@"\n', { mode: 0o755 });
+    writeFileSync(
+      shPath,
+      '#!/usr/bin/env bash\n' +
+        '# This file is managed by `macf`. Do not edit directly — edits are\n' +
+        '# overwritten on the next `macf update`.\n' +
+        '# stale launcher\nexec claude "$@"\n',
+      { mode: 0o755 },
+    );
     mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
 
     await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
@@ -492,12 +501,19 @@ describe('update command', () => {
     expect(regenerated).toContain('managed by `macf`');
   });
 
-  it('regenerates claude.sh even for legacy config without versions section', async () => {
+  it('regenerates a macf-managed claude.sh even for legacy config without versions section', async () => {
     // Regenerate shouldn't depend on versions — legacy workspaces still
-    // benefit from getting the current launcher template.
+    // benefit from getting the current launcher template. Seed a managed
+    // (header-carrying) stale launcher so the DR-029 regenerate path fires.
     writeConfig(dir); // legacy, no versions
     const shPath = join(dir, 'claude.sh');
-    writeFileSync(shPath, '# legacy launcher\n', { mode: 0o755 });
+    writeFileSync(
+      shPath,
+      '#!/usr/bin/env bash\n' +
+        '# This file is managed by `macf`. Do not edit directly — edits are\n' +
+        '# legacy launcher\n',
+      { mode: 0o755 },
+    );
 
     const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
     expect(code).toBe(1); // still errors on missing versions
@@ -505,6 +521,49 @@ describe('update command', () => {
     const regenerated = readFileSync(shPath, 'utf-8');
     expect(regenerated).not.toContain('legacy launcher');
     expect(regenerated).toContain('--plugin-dir');
+  });
+
+  it('preserves a hand-authored (header-LESS) claude.sh + warns, never clobbers (DR-029 / #623)', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      // Seed a hand-authored launcher with NO macf managed-header — shape
+      // mirrors the framework repo's own claude.sh.
+      const shPath = join(dir, 'claude.sh');
+      const handAuthored =
+        '#!/bin/bash\n' +
+        '# Launcher for macf-code-agent\n' +
+        'set -euo pipefail\n' +
+        'CLAUDE_BIN="${CLAUDE_BIN:-claude}"\n' +
+        'exec "$CLAUDE_BIN" "$@"\n';
+      writeFileSync(shPath, handAuthored, { mode: 0o755 });
+
+      await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+
+      // Content preserved byte-for-byte — NOT overwritten by the template.
+      expect(readFileSync(shPath, 'utf-8')).toBe(handAuthored);
+      // Drift-aware warning surfaced.
+      const warnOut = warnSpy.mock.calls.flat().join('\n');
+      expect(warnOut).toMatch(/Preserved hand-authored claude\.sh/);
+      expect(warnOut).toMatch(/managed-header/);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('generates claude.sh fresh when absent (no preserve when nothing to preserve) (#623)', async () => {
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    // No claude.sh on disk to start.
+    const shPath = join(dir, 'claude.sh');
+    expect(existsSync(shPath)).toBe(false);
+
+    await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+
+    const generated = readFileSync(shPath, 'utf-8');
+    expect(generated).toContain('managed by `macf`');
+    expect(generated).toContain('--plugin-dir "$SCRIPT_DIR/.macf/plugin"');
   });
 
   it('preserves unrelated config fields when writing', async () => {
@@ -588,11 +647,16 @@ describe('update command', () => {
     it('migrates a monolithic claude.sh on first update (env files appear)', async () => {
       writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
       mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
-      // Pre-seed a monolithic-shaped claude.sh
+      // Pre-seed a monolithic-shaped claude.sh. Real pre-#342 monolithic
+      // launchers carried the macf managed-header, so include it — without it
+      // the DR-029 (#623) preserve path would treat the stub as hand-authored
+      // and skip migration.
       const shPath = join(dir, 'claude.sh');
       writeFileSync(
         shPath,
-        '#!/usr/bin/env bash\nset -euo pipefail\nexport MACF_AGENT_NAME="test-agent"\nexec claude "$@"\n',
+        '#!/usr/bin/env bash\nset -euo pipefail\n' +
+          '# This file is managed by `macf`. Do not edit directly — edits are\n' +
+          'export MACF_AGENT_NAME="test-agent"\nexec claude "$@"\n',
         { mode: 0o755 },
       );
 
