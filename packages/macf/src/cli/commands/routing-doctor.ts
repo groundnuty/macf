@@ -52,6 +52,7 @@ import {
   generateToken,
   pingAgentHealth,
   toVariableSegment,
+  fromVariableSegment,
   isStaleEntry,
   DEFAULT_REGISTRY_TTL_MS,
 } from '@groundnuty/macf-core';
@@ -312,16 +313,34 @@ export interface AgentRow {
   readonly appName: string | null;
   readonly tmuxSession: string | null;
   readonly routable: boolean;
-  readonly selfSkipOk: boolean;
+  /**
+   * Provenance (#621): `true` when a local `.github/agent-config.json[label]` entry
+   * exists (REPO-scoped checks apply); `false` for a REGISTRY-ONLY fleet agent (the
+   * current repo does not route to it — e.g. the auditor seen from groundnuty/macf).
+   * A consumer reads this to know whether a null repo-scoped field is null-because-
+   * registry-only (no local expectation) vs null-because-the-check-was-not-run.
+   */
+  readonly inLocalConfig: boolean;
+  /**
+   * REPO-scoped self-skip (#538b / #566). `null` for a registry-only agent — no local
+   * `agent-config.json` entry, so there is no `app_name` to assert (honest-not-asserted,
+   * NOT a fault). A boolean only when `inLocalConfig` is true.
+   */
+  readonly selfSkipOk: boolean | null;
   readonly selfSkipReason?: string;
   /**
    * Back-compat boolean (schema_version:1): `true` for `ok` + `absent`, `false` for
    * the stale `warn`. No longer drives the verdict — see `sessionStatus` (DR-032 #610).
+   * `null` for a registry-only agent (REPO-scoped; no local config to check, #621).
    */
-  readonly sessionOk: boolean;
-  /** Tri-state session check (DR-032 #610): `ok` (match) / `warn` (stale drift, non-fatal) / `absent` (vestigial on v3). */
-  readonly sessionStatus: SessionStatus;
-  readonly sessionExpected: string;
+  readonly sessionOk: boolean | null;
+  /**
+   * Tri-state session check (DR-032 #610): `ok` (match) / `warn` (stale drift, non-fatal)
+   * / `absent` (vestigial on v3). `null` for a registry-only agent (REPO-scoped, #621).
+   */
+  readonly sessionStatus: SessionStatus | null;
+  /** Expected `<project>@<name>` session; `null` for a registry-only agent (#621). */
+  readonly sessionExpected: string | null;
   readonly sessionReason?: string;
   readonly freshness: FreshnessState;
   readonly registryInstanceId?: string | null;
@@ -406,6 +425,58 @@ async function resolveRepoPins(
 }
 
 /**
+ * Build one agent's row. FLEET-scoped checks (routability + freshness/instance_id) run
+ * for every registry entry — they need no local config, so they hold from ANY repo's run
+ * (#621). REPO-scoped checks (self-skip + session) run ONLY when a local agent-config
+ * `entry` exists; a registry-only agent (`entry === undefined`) NULLS them — there is no
+ * local `app_name`/`tmux_session` to assert (honest-not-asserted, same discipline as the
+ * #612 null output_tokens), NOT a fault.
+ */
+async function evaluateAgentRow(
+  label: string,
+  info: AgentInfo | null,
+  entry: RoutingConfigEntry | undefined,
+  deps: RoutingDoctorDeps,
+  now: number,
+): Promise<AgentRow> {
+  const inLocalConfig = entry !== undefined;
+
+  // FLEET-scoped: freshness from the registry entry + the live /health probe.
+  let freshness: FreshnessState = 'unregistered';
+  let healthInstanceId: string | null | undefined;
+  if (info) {
+    const health = await deps.probe(info.host, info.port);
+    freshness = classifyFreshness(info, health, now, DEFAULT_REGISTRY_TTL_MS);
+    healthInstanceId = health?.instance_id ?? null;
+  }
+
+  // REPO-scoped: only when a local agent-config entry exists. The agent-config key IS the
+  // `name` (= routing-label under the DR-032 convention, #601); they diverge only in the
+  // #538 escape-hatch, where the session follows name.
+  const selfSkip = entry ? evaluateSelfSkip(label, entry.app_name, deps.botLogins?.[label]) : null;
+  const session = entry ? evaluateSession(label, entry.tmux_session, deps.project) : null;
+
+  return {
+    label,
+    appName: entry?.app_name ?? null,
+    tmuxSession: entry?.tmux_session ?? null,
+    routable: info !== null,
+    inLocalConfig,
+    selfSkipOk: selfSkip ? selfSkip.ok : null,
+    selfSkipReason: selfSkip?.reason,
+    // `session` is tri-state (DR-032 #610). `sessionOk` stays for back-compat (true for
+    // `ok` + `absent`, false for the stale `warn`); null for a registry-only agent (#621).
+    sessionOk: session ? session.status !== 'warn' : null,
+    sessionStatus: session ? session.status : null,
+    sessionExpected: session ? session.expected : null,
+    sessionReason: session?.reason,
+    freshness,
+    registryInstanceId: info?.instance_id ?? null,
+    healthInstanceId,
+  };
+}
+
+/**
  * Run all five checks. PURE w.r.t. the injected deps — tests pass fakes so nothing
  * hits gh / the registry / the network.
  */
@@ -422,46 +493,36 @@ export async function gatherRoutingDoctor(deps: RoutingDoctorDeps): Promise<Rout
   const registry = await deps.listRegistry();
   const registryByName = new Map(registry.map((e) => [e.name, e.info] as const));
 
-  // 2 + 3 + 5. Per-agent checks from the routing config.
+  // 2 + 3 + 5. Per-agent checks across the UNION of (registry-registered fleet agents) and
+  // (locally-configured routing-targets) — de-duped by label, registry order first (#621).
+  // The OLD loop iterated `config.agents` (the current repo's routing-TARGETS) only, so a
+  // registered fleet agent the repo does not route to (e.g. the auditor, from groundnuty/
+  // macf) was registered-but-never-checked → silently skipped. The union closes that: every
+  // registry agent gets the FLEET-scoped checks (routability + freshness) from any repo's run.
   const config = await deps.readRoutingConfig();
   const hasRoutingConfig = config !== null;
+  const configAgents = config?.agents ?? {};
+
+  const regKeyByLabel = new Map<string, string>();
+  const seen = new Set<string>();
+  const orderedLabels: string[] = [];
+  const pushLabel = (label: string): void => {
+    if (seen.has(label)) return;
+    seen.add(label);
+    orderedLabels.push(label);
+  };
+  for (const e of registry) {
+    const label = fromVariableSegment(e.name);
+    regKeyByLabel.set(label, e.name);
+    pushLabel(label);
+  }
+  for (const label of Object.keys(configAgents)) pushLabel(label);
+
   const agents: AgentRow[] = [];
-  for (const [label, entry] of Object.entries(config?.agents ?? {})) {
-    const regKey = toVariableSegment(label);
+  for (const label of orderedLabels) {
+    const regKey = regKeyByLabel.get(label) ?? toVariableSegment(label);
     const info = registryByName.get(regKey) ?? null;
-    const routable = info !== null;
-
-    const selfSkip = evaluateSelfSkip(label, entry.app_name, deps.botLogins?.[label]);
-    // The agent-config key IS the `name` (= routing-label under the DR-032 convention,
-    // #601); they diverge only in the #538 escape-hatch, where the session follows name.
-    const session = evaluateSession(label, entry.tmux_session, deps.project);
-
-    let freshness: FreshnessState = 'unregistered';
-    let healthInstanceId: string | null | undefined;
-    if (info) {
-      const health = await deps.probe(info.host, info.port);
-      freshness = classifyFreshness(info, health, now, DEFAULT_REGISTRY_TTL_MS);
-      healthInstanceId = health?.instance_id ?? null;
-    }
-
-    agents.push({
-      label,
-      appName: entry.app_name ?? null,
-      tmuxSession: entry.tmux_session ?? null,
-      routable,
-      selfSkipOk: selfSkip.ok,
-      selfSkipReason: selfSkip.reason,
-      // `session` is tri-state (DR-032 #610). `sessionOk` stays for back-compat (true
-      // for `ok` + `absent`, false for the stale `warn`) but no longer drives the
-      // verdict — the drift surfaces via `sessionStatus` + the `warnings[]` channel.
-      sessionOk: session.status !== 'warn',
-      sessionStatus: session.status,
-      sessionExpected: session.expected,
-      sessionReason: session.reason,
-      freshness,
-      registryInstanceId: info?.instance_id ?? null,
-      healthInstanceId,
-    });
+    agents.push(await evaluateAgentRow(label, info, configAgents[label], deps, now));
   }
 
   // 4. CA material.
@@ -481,14 +542,18 @@ function freshnessFails(s: FreshnessState): boolean {
 
 /**
  * Whether an agent's ROUTING-PLANE checks pass — the single predicate the verdict,
- * the summary line, and the JSON `agents_routing_ok` all share. The SESSION-name
- * drift is deliberately EXCLUDED (DR-032 §6th-surface amendment, #610): a stale
- * `agent-config.json:tmux_session` is the known-pending session-rename migration —
- * WARN-not-FAIL, so it must NOT flip the verdict (it is surfaced via `sessionStatus`
- * + the `warnings[]` channel instead).
+ * the summary line, and the JSON `agents_routing_ok` all share. Keyed on the FLEET-scoped
+ * invariants (routability + freshness) so it covers REGISTRY-ONLY agents too (#621): a
+ * registered fleet agent that has gone definitively `stale` still DEGRADES the plane from
+ * ANY repo's run, even with no local config. The SELF-SKIP clause is REPO-scoped — it
+ * constrains a locally-configured agent (`selfSkipOk === false` is the #566 fault) but a
+ * registry-only agent's `null` self-skip is honest-not-asserted, NOT a failure
+ * (`!== false`). The SESSION-name drift is deliberately EXCLUDED (DR-032 §6th-surface
+ * amendment, #610): a stale `agent-config.json:tmux_session` is the known-pending
+ * session-rename migration — WARN-not-FAIL, surfaced via `sessionStatus` + `warnings[]`.
  */
 function agentRoutingOk(a: AgentRow): boolean {
-  return a.routable && a.selfSkipOk && !freshnessFails(a.freshness);
+  return a.routable && a.selfSkipOk !== false && !freshnessFails(a.freshness);
 }
 
 export function routingVerdict(report: RoutingDoctorReport): RoutingVerdict {
@@ -597,8 +662,10 @@ export function buildAgentRows(rows: readonly AgentRow[]): readonly (readonly st
   return rows.map((a) => [
     a.label,
     boolGlyph(a.routable),
-    boolGlyph(a.selfSkipOk),
-    sessionGlyph(a.sessionStatus),
+    // REPO-scoped self-skip + session render `— n/a` for a registry-only agent (#621):
+    // null = no local config to assert, distinct from a ✗ failure.
+    a.selfSkipOk === null ? '— n/a' : boolGlyph(a.selfSkipOk),
+    a.sessionStatus === null ? '— n/a' : sessionGlyph(a.sessionStatus),
     freshnessGlyph(a.freshness),
   ]);
 }
@@ -626,6 +693,9 @@ export const HONESTY_LEGEND = [
   '                  absent = PASS, vestigial on v3; ⚠ warn = stale drift, WARN-not-FAIL — visible',
   '                  but does NOT drive the verdict, the known-pending DR-032 session-rename).',
   '                  FRESH = registry instance_id == live /health instance_id (✗ stale / ? unreach).',
+  '        The agent set is the registry fleet ∪ this repo\'s routing config (#621): a registry-only',
+  '        agent (one this repo does not route to, e.g. the auditor) shows "— n/a" SELF-SKIP/SESSION',
+  '        (REPO-scoped, no local config) but is still ROUTABLE/FRESH-checked (FLEET-scoped).',
   'NOTE: these are STATIC GitHub-plane checks — they prove the routing PLUMBING is wired right,',
   '      NOT that a message was delivered end-to-end (that is `macf routing doctor --e2e`, a',
   '      later increment). Mesh delivery is `macf fleet doctor`.',
@@ -681,6 +751,11 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       app_name: a.appName,
       tmux_session: a.tmuxSession,
       routable: a.routable,
+      // Additive (schema_version:1, #621): false = a registry-only fleet agent (the
+      // current repo does not route to it); its repo-scoped fields below are null-because-
+      // registry-only, NOT null-because-failed. FLEET-scoped fields (routable, freshness)
+      // are still asserted for it.
+      in_local_config: a.inLocalConfig,
       self_skip_ok: a.selfSkipOk,
       self_skip_reason: a.selfSkipReason ?? null,
       session_ok: a.sessionOk,
@@ -837,12 +912,18 @@ export async function runRoutingDoctor(
     console.log('Caller-pin consistency: no fleet repos discovered (App install-set unavailable).\n');
   }
 
-  if (report.hasRoutingConfig) {
-    console.log('Per-agent routing checks (current project routing config):');
+  if (report.agents.length > 0) {
+    // The agent set is the UNION of registry-registered fleet agents + this repo's routing
+    // config (#621); a registry-only agent (`— n/a` repo-scoped columns) is one the current
+    // repo does not route to but is still FLEET-scoped-checked (routability + freshness).
+    const scope = report.hasRoutingConfig
+      ? 'registry fleet ∪ current project routing config'
+      : 'registry fleet (no .github/agent-config.json for this project — repo-scoped checks n/a)';
+    console.log(`Per-agent routing checks (${scope}):`);
     console.log(formatAgentTable(report.agents));
     console.log('');
   } else {
-    console.log('Per-agent routing checks: no .github/agent-config.json found for this project.\n');
+    console.log('Per-agent routing checks: no registered fleet agents and no .github/agent-config.json found.\n');
   }
 
   const warnings = collectWarnings(report);
