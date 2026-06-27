@@ -3,7 +3,7 @@ import type { TLSSocket } from 'node:tls';
 import { readFileSync } from 'node:fs';
 import { randomInt, randomUUID } from 'node:crypto';
 import { context, propagation, SpanKind, SpanStatusCode } from '@opentelemetry/api';
-import { NotifyPayloadSchema, SignRequestSchema } from '@groundnuty/macf-core';
+import { NotifyPayloadSchema, SignRequestSchema, fromVariableSegment } from '@groundnuty/macf-core';
 import type { NotifyPayload, SignRequest, HealthResponse, HttpsServer, Logger } from '@groundnuty/macf-core';
 import { PortExhaustedError, PortUnavailableError, HttpsServerError, HttpError } from '@groundnuty/macf-core';
 import { getTracer, SpanNames, Attr, GenAiAttr, operationNameForNotifyType } from './tracing.js';
@@ -651,7 +651,15 @@ export function createHttpsServer(config: {
           attributes: {
             [GenAiAttr.System]: 'macf',
             [Attr.RemoteCn]: signClientCn,
-            [GenAiAttr.AgentName]: result.data.agent_name,
+            // macf#611: `gen_ai.agent.name` must carry the kebab
+            // routing-label (`code-agent`), never the SCREAMING_SNAKE
+            // registry-key form. The CSR `agent_name` can arrive in either
+            // form (registry-key callers send `CODE_AGENT`); normalize it
+            // here. `fromVariableSegment` is idempotent on already-kebab
+            // input, so an already-kebab `agent_name` passes through
+            // unchanged. Same macf#590 convention as the `invoke_agent`
+            // spans in notify-peer.ts + a2a-client.ts.
+            [GenAiAttr.AgentName]: fromVariableSegment(result.data.agent_name),
           },
         },
         signParentCtx,
