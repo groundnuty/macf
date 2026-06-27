@@ -16,6 +16,7 @@ import {
   buildAgentRows,
   buildRepoRows,
   classifyFreshness,
+  collectNonFleetRepos,
   collectWarnings,
   computeExpectedPin,
   evaluateCaCert,
@@ -25,6 +26,7 @@ import {
   formatRepoTable,
   freshnessGlyph,
   gatherRoutingDoctor,
+  isFleetMember,
   isStrictBase64,
   normalizeLogin,
   pinGlyph,
@@ -80,6 +82,22 @@ describe('computeExpectedPin — modal / override', () => {
   });
   it('null when nothing is pinned', () => {
     expect(computeExpectedPin([])).toBeNull();
+  });
+});
+
+describe('isFleetMember — opt-out semantics (#614)', () => {
+  it('absent marker → member (the safe default)', () => {
+    expect(isFleetMember(null)).toBe(true);
+    expect(isFleetMember(undefined)).toBe(true);
+  });
+  it('routing_fleet:false → NOT a member (the deliberate opt-out)', () => {
+    expect(isFleetMember({ routing_fleet: false })).toBe(false);
+  });
+  it('routing_fleet:true → member', () => {
+    expect(isFleetMember({ routing_fleet: true })).toBe(true);
+  });
+  it('key absent in an existing marker → member (fail toward over-checking)', () => {
+    expect(isFleetMember({})).toBe(true);
   });
 });
 
@@ -197,6 +215,8 @@ function deps(over: Partial<RoutingDoctorDeps> = {}): RoutingDoctorDeps {
     now: Date.parse('2026-06-26T12:00:00Z'),
     listRepos: async () => ['groundnuty/macf', 'groundnuty/macf-science-agent'],
     readCallerPin: ALL_PINNED_V3,
+    // Default: no opt-out marker anywhere → every pinned repo is a fleet member (#614).
+    readFleetMarker: async () => null,
     readRoutingConfig: async () => HEALTHY_CONFIG,
     listRegistry: async () => [
       { name: 'CODE_AGENT', info: info('100.64.0.1', 4100, 'inst-code') },
@@ -251,6 +271,80 @@ describe('check 1 — divergent caller-pin is flagged', () => {
     const owner = report.repoPins.find((r) => r.repo === 'groundnuty/groundnuty');
     expect(owner).toMatchObject({ consistent: null }); // excluded from verdict
     expect(routingVerdict(report)).toBe('HEALTHY');
+  });
+});
+
+describe('check 1 (#614) — opt-out fleet membership scopes pins_consistent', () => {
+  // The literal #614 scenario: the substrate is on v3.3.0, but the testbed harness is
+  // an intentional-Stage-2 caller pinned @v1.3.3 and should NOT flip pins_consistent.
+  const SUBSTRATE_PLUS_TESTBED = (over: Partial<RoutingDoctorDeps> = {}): RoutingDoctorDeps =>
+    deps({
+      listRepos: async () => [
+        'groundnuty/macf',
+        'groundnuty/macf-science-agent',
+        'groundnuty/macf-testbed',
+      ],
+      readCallerPin: async (repo) =>
+        repo === 'groundnuty/macf-testbed'
+          ? { repo, pin: 'v1.3.3', status: 'pinned' }
+          : { repo, pin: 'v3.3.0', status: 'pinned' },
+      readFleetMarker: async (repo) =>
+        repo === 'groundnuty/macf-testbed' ? { routing_fleet: false } : null,
+      ...over,
+    });
+
+  it('an opted-out repo with a divergent pin does NOT flip pins_consistent (members all v3.3.0)', async () => {
+    const report = await gatherRoutingDoctor(SUBSTRATE_PLUS_TESTBED());
+    expect(report.expectedPin).toBe('v3.3.0'); // modal over MEMBERS only — testbed didn't pull it
+    const testbed = report.repoPins.find((r) => r.repo === 'groundnuty/macf-testbed')!;
+    expect(testbed.fleetMember).toBe(false);
+    expect(testbed.consistent).toBeNull(); // excluded from the verdict
+    const macf = report.repoPins.find((r) => r.repo === 'groundnuty/macf')!;
+    expect(macf.fleetMember).toBe(true);
+    expect(macf.consistent).toBe(true);
+    expect(routingVerdict(report)).toBe('HEALTHY'); // the whole point of #614
+    expect(collectNonFleetRepos(report)).toEqual(['groundnuty/macf-testbed']); // reported
+  });
+
+  it('a GENUINE member pin divergence STILL flips pins_consistent → DEGRADED (no over-suppression)', async () => {
+    const report = await gatherRoutingDoctor(
+      SUBSTRATE_PLUS_TESTBED({
+        // science is a fleet member (no opt-out) AND it diverges → must still degrade.
+        readCallerPin: async (repo) =>
+          repo === 'groundnuty/macf-testbed'
+            ? { repo, pin: 'v1.3.3', status: 'pinned' }
+            : repo === 'groundnuty/macf-science-agent'
+              ? { repo, pin: 'v1.3.4', status: 'pinned' }
+              : { repo, pin: 'v3.3.0', status: 'pinned' },
+      }),
+    );
+    const science = report.repoPins.find((r) => r.repo === 'groundnuty/macf-science-agent')!;
+    expect(science.fleetMember).toBe(true);
+    expect(science.consistent).toBe(false);
+    expect(routingVerdict(report)).toBe('DEGRADED');
+    // testbed still excluded even while a real member fault degrades the plane
+    expect(collectNonFleetRepos(report)).toEqual(['groundnuty/macf-testbed']);
+  });
+
+  it('marker absent → member (participates) — the safe opt-out default', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        // No readFleetMarker override → factory default returns null (absent) for all.
+        readCallerPin: async (repo) =>
+          repo === 'groundnuty/macf-science-agent'
+            ? { repo, pin: 'v1.3.4', status: 'pinned' }
+            : { repo, pin: 'v3.3.0', status: 'pinned' },
+      }),
+    );
+    expect(report.repoPins.every((r) => r.fleetMember)).toBe(true); // all members by default
+    expect(routingVerdict(report)).toBe('DEGRADED'); // a real divergence among members
+    expect(collectNonFleetRepos(report)).toEqual([]);
+  });
+
+  it('routing_fleet:true (explicit) keeps the repo a member', async () => {
+    const report = await gatherRoutingDoctor(deps({ readFleetMarker: async () => ({ routing_fleet: true }) }));
+    expect(report.repoPins.filter((r) => r.status === 'pinned').every((r) => r.fleetMember)).toBe(true);
+    expect(collectNonFleetRepos(report)).toEqual([]);
   });
 });
 
@@ -421,8 +515,8 @@ describe('rendering — tables + glyphs', () => {
   });
   it('buildRepoRows + formatRepoTable render REPO / CALLER-PIN / CONSISTENT', () => {
     const rows = [
-      { repo: 'groundnuty/macf', pin: 'v3.3.0', status: 'pinned' as const, consistent: true },
-      { repo: 'groundnuty/x', pin: 'v1.3.4', status: 'pinned' as const, consistent: false },
+      { repo: 'groundnuty/macf', pin: 'v3.3.0', status: 'pinned' as const, fleetMember: true, consistent: true },
+      { repo: 'groundnuty/x', pin: 'v1.3.4', status: 'pinned' as const, fleetMember: true, consistent: false },
     ];
     expect(buildRepoRows(rows)).toEqual([
       ['groundnuty/macf', 'v3.3.0', '✓'],
@@ -515,6 +609,36 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
     expect(json.warnings).toEqual([]);
     expect(json.summary.verdict).not.toBe('DEGRADED');
   });
+
+  it('additive (#614): caller_pins carry fleet_member; non_fleet_repos lists opt-outs; schema_version stays 1', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        listRepos: async () => ['groundnuty/macf', 'groundnuty/macf-testbed'],
+        readCallerPin: async (repo) =>
+          repo === 'groundnuty/macf-testbed'
+            ? { repo, pin: 'v1.3.3', status: 'pinned' }
+            : { repo, pin: 'v3.3.0', status: 'pinned' },
+        readFleetMarker: async (repo) =>
+          repo === 'groundnuty/macf-testbed' ? { routing_fleet: false } : null,
+      }),
+    );
+    const json = routingDoctorToJson(report) as {
+      schema_version: number;
+      summary: { verdict: string; pins_consistent: boolean; routing_repos: number };
+      non_fleet_repos: string[];
+      caller_pins: ReadonlyArray<Record<string, unknown>>;
+    };
+    expect(json.schema_version).toBe(1); // additive → NO bump
+    expect(json.summary.pins_consistent).toBe(true); // testbed excluded → the member is consistent
+    expect(json.summary.routing_repos).toBe(1); // only the member participates
+    expect(json.non_fleet_repos).toEqual(['groundnuty/macf-testbed']);
+    const testbed = json.caller_pins.find((p) => p.repo === 'groundnuty/macf-testbed')!;
+    expect(testbed.fleet_member).toBe(false);
+    expect(testbed.consistent).toBeNull();
+    const macf = json.caller_pins.find((p) => p.repo === 'groundnuty/macf')!;
+    expect(macf.fleet_member).toBe(true);
+    expect(macf.consistent).toBe(true);
+  });
 });
 
 // --- Command entry point ---
@@ -586,6 +710,28 @@ describe('runRoutingDoctor (injected deps)', () => {
     expect(parsed.schema_version).toBe(1);
     expect(parsed.summary.verdict).toBe('DEGRADED');
     expect(parsed.ca_cert).toMatchObject({ present: true, valid: false });
+  });
+
+  it('prints the non-fleet opt-out note + exits 0 (HEALTHY) when an outlier opted out (#614)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runRoutingDoctor(
+      '/unused',
+      {},
+      deps({
+        listRepos: async () => ['groundnuty/macf', 'groundnuty/macf-testbed'],
+        readCallerPin: async (repo) =>
+          repo === 'groundnuty/macf-testbed'
+            ? { repo, pin: 'v1.3.3', status: 'pinned' }
+            : { repo, pin: 'v3.3.0', status: 'pinned' },
+        readFleetMarker: async (repo) =>
+          repo === 'groundnuty/macf-testbed' ? { routing_fleet: false } : null,
+      }),
+    );
+    expect(code).toBe(0); // the opt-out clears the false pins_consistent:false
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('routing plane: HEALTHY');
+    expect(out).toContain('Non-fleet (opt-out via .github/macf-fleet.json');
+    expect(out).toContain('groundnuty/macf-testbed');
   });
 
   it('reports EMPTY cleanly (exit 0) when nothing is discovered', async () => {

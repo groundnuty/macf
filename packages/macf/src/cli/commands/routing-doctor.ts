@@ -61,6 +61,7 @@ import {
   createInstallRepoLister,
   createCallerPinReader,
   createRoutingConfigGhReader,
+  createFleetMarkerReader,
 } from './routing-doctor-gh.js';
 
 // --- Shared types (also consumed by routing-doctor-gh.ts) ---
@@ -84,6 +85,18 @@ export interface RoutingConfigEntry {
 /** A repo's `.github/agent-config.json` (the router's per-label config). */
 export interface RoutingConfig {
   readonly agents: Readonly<Record<string, RoutingConfigEntry>>;
+}
+
+/**
+ * A pinned repo's `.github/macf-fleet.json` opt-OUT marker (#614). A repo that is
+ * an agent-router caller still participates in the `pins_consistent` verdict UNLESS
+ * it declares itself non-fleet here (`{ "routing_fleet": false }`). Lives WITH the
+ * opted-out repo (self-documenting), so there is no central allowlist / agent-config
+ * coupling / hardcoded repo-set baked into the published package. Absent file, or the
+ * key absent/`true`, → member (the opt-out direction; see `isFleetMember`).
+ */
+export interface FleetMarker {
+  readonly routing_fleet?: boolean;
 }
 
 /** Probe a single endpoint's `/health`; null on any failure. Injectable for tests. */
@@ -118,6 +131,21 @@ export function computeExpectedPin(
     }
   }
   return best;
+}
+
+/**
+ * Fleet membership via the opt-OUT marker (#614). A pinned (agent-router-caller) repo
+ * participates in `pins_consistent` UNLESS it explicitly declares itself non-fleet via
+ * `.github/macf-fleet.json` `{ "routing_fleet": false }`.
+ *
+ * The opt-OUT direction is load-bearing: the DEFAULT is MEMBER, so a NEW fleet repo is
+ * checked from day one. Opt-IN is the dangerous direction — a new member would silently
+ * default to UNCHECKED and a real pin-drift would go uncaught. Opt-out fails toward
+ * OVER-checking (a stray repo flagged), never toward a silent gap. Hence: absent /
+ * unreadable marker, or `routing_fleet !== false`, → member.
+ */
+export function isFleetMember(marker: FleetMarker | null | undefined): boolean {
+  return !(marker !== null && marker !== undefined && marker.routing_fleet === false);
 }
 
 /**
@@ -265,7 +293,17 @@ export interface RepoPinRow {
   readonly repo: string;
   readonly pin: string | null;
   readonly status: CallerPinStatus;
-  /** `true`/`false` for routing callers; `null` for non-callers (excluded from verdict). */
+  /**
+   * Fleet membership (#614, opt-out): `true` for a routing-caller repo that
+   * participates in `pins_consistent`; `false` for a pinned repo that opted OUT
+   * (`.github/macf-fleet.json` `routing_fleet:false`) AND for non-callers (no
+   * caller → not a participating member). Distinguish the two via `status`.
+   */
+  readonly fleetMember: boolean;
+  /**
+   * `true`/`false` only for FLEET-MEMBER routing callers; `null` for non-callers AND
+   * opted-out callers — both excluded from the verdict.
+   */
   readonly consistent: boolean | null;
 }
 
@@ -314,6 +352,11 @@ export interface RoutingDoctorDeps {
   readonly listRepos: () => Promise<readonly string[]>;
   /** Read a repo's macf-actions caller-pin from agent-router.yml. */
   readonly readCallerPin: (repo: string) => Promise<CallerPinResult>;
+  /**
+   * Read a pinned repo's `.github/macf-fleet.json` opt-out marker (#614). One extra
+   * small content-read per PINNED repo; absent/unreadable → member (`isFleetMember`).
+   */
+  readonly readFleetMarker: (repo: string) => Promise<FleetMarker | null>;
   /** The CURRENT project's routing config (`.github/agent-config.json`). */
   readonly readRoutingConfig: () => Promise<RoutingConfig | null>;
   /** Registry agents (for routability + freshness). */
@@ -331,24 +374,49 @@ export interface RoutingDoctorDeps {
 }
 
 /**
+ * Resolve fleet membership (#614, opt-out) per pinned repo, then build the RepoPinRow
+ * list. The modal/expected pin AND each `consistent` flag are scoped to FLEET-MEMBER
+ * pinned repos only — a non-member's divergent pin neither pulls the modal nor flips
+ * the verdict. Non-callers AND opted-out callers both get `consistent: null` (excluded).
+ */
+async function resolveRepoPins(
+  pinResults: readonly CallerPinResult[],
+  readFleetMarker: (repo: string) => Promise<FleetMarker | null>,
+  expectedPinOverride?: string,
+): Promise<{ readonly repoPins: RepoPinRow[]; readonly expectedPin: string | null }> {
+  const memberByRepo = new Map<string, boolean>();
+  for (const r of pinResults) {
+    if (r.status === 'pinned') memberByRepo.set(r.repo, isFleetMember(await readFleetMarker(r.repo)));
+  }
+  const isMember = (r: CallerPinResult): boolean =>
+    r.status === 'pinned' && (memberByRepo.get(r.repo) ?? true);
+  const memberPinnedVals = pinResults.filter((r) => isMember(r) && r.pin).map((r) => r.pin!);
+  const expectedPin = computeExpectedPin(memberPinnedVals, expectedPinOverride);
+  const repoPins = pinResults.map((r): RepoPinRow => {
+    const member = isMember(r);
+    return {
+      repo: r.repo,
+      pin: r.pin,
+      status: r.status,
+      fleetMember: member,
+      consistent: member ? r.pin === expectedPin : null,
+    };
+  });
+  return { repoPins, expectedPin };
+}
+
+/**
  * Run all five checks. PURE w.r.t. the injected deps — tests pass fakes so nothing
  * hits gh / the registry / the network.
  */
 export async function gatherRoutingDoctor(deps: RoutingDoctorDeps): Promise<RoutingDoctorReport> {
   const now = deps.now ?? Date.now();
 
-  // 1. Caller-pin sweep across the install-set.
+  // 1. Caller-pin sweep across the install-set; fleet membership (#614) scopes the verdict.
   const repos = await deps.listRepos();
   const pinResults: CallerPinResult[] = [];
   for (const repo of repos) pinResults.push(await deps.readCallerPin(repo));
-  const pinnedVals = pinResults.filter((r) => r.status === 'pinned' && r.pin).map((r) => r.pin!);
-  const expectedPin = computeExpectedPin(pinnedVals, deps.expectedPin);
-  const repoPins: RepoPinRow[] = pinResults.map((r) => ({
-    repo: r.repo,
-    pin: r.pin,
-    status: r.status,
-    consistent: r.status === 'pinned' ? r.pin === expectedPin : null,
-  }));
+  const { repoPins, expectedPin } = await resolveRepoPins(pinResults, deps.readFleetMarker, deps.expectedPin);
 
   // Registry index (routability + freshness).
   const registry = await deps.listRegistry();
@@ -467,6 +535,17 @@ export function collectWarnings(report: RoutingDoctorReport): readonly string[] 
   return out;
 }
 
+/**
+ * The deliberately opted-OUT pinned repos (#614): agent-router callers that declared
+ * `.github/macf-fleet.json` `routing_fleet:false` and are therefore excluded from the
+ * `pins_consistent` verdict. Non-callers are NOT listed (they never had a pin). Surfaced
+ * additively in the JSON `non_fleet_repos[]` + the text render so the exclusion is
+ * VISIBLE rather than a silent scope-narrowing.
+ */
+export function collectNonFleetRepos(report: RoutingDoctorReport): readonly string[] {
+  return report.repoPins.filter((r) => r.status === 'pinned' && !r.fleetMember).map((r) => r.repo);
+}
+
 // --- Render ---
 
 function boolGlyph(ok: boolean): string {
@@ -539,6 +618,8 @@ export function formatAgentTable(rows: readonly AgentRow[]): string {
  */
 export const HONESTY_LEGEND = [
   'Legend: CALLER-PIN = the macf-actions @version each routing repo pins (must all match).',
+  '        A repo opts OUT of the pin check via .github/macf-fleet.json {"routing_fleet":false}',
+  '        (e.g. an intentional-Stage-2 test harness); absent marker = fleet member (#614).',
   '        ROUTABLE = a MACF_AGENT_<LABEL> registry key exists (router resolves by LABEL).',
   '        SELF-SKIP = agent-config.json app_name is the bot-LOGIN, not the bare label (#566).',
   '        SESSION = agent-config.json tmux_session follows <project>@<name> (assert-IF-PRESENT:',
@@ -584,10 +665,15 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
     // Additive (schema_version:1, DR-032 #610): non-verdict-driving observations the
     // watchdog should still SEE — currently the session-name drift (WARN-not-FAIL).
     warnings: collectWarnings(report),
+    // Additive (schema_version:1, #614): pinned repos that opted OUT of the fleet via
+    // `.github/macf-fleet.json` routing_fleet:false (excluded from pins_consistent).
+    non_fleet_repos: collectNonFleetRepos(report),
     caller_pins: report.repoPins.map((r) => ({
       repo: r.repo,
       pin: r.pin,
       status: r.status,
+      // Additive (schema_version:1, #614): true = participates in pins_consistent.
+      fleet_member: r.fleetMember,
       consistent: r.consistent,
     })),
     agents: report.agents.map((a) => ({
@@ -671,6 +757,7 @@ async function resolveDepsFromRegistry(
       botLogins,
       listRepos: createInstallRepoLister(token),
       readCallerPin: createCallerPinReader(token),
+      readFleetMarker: createFleetMarkerReader(token),
       readRoutingConfig: async () => localRouting ?? (await ghRoutingReader(detectCurrentRepo(projectDir) ?? '')),
       listRegistry: () => registry.list(''),
       probe: (host, port) => pingAgentHealth({ host, port, caCertPem: caCertPem ?? '', certPath, keyPath }),
@@ -739,6 +826,12 @@ export async function runRoutingDoctor(
     console.log('Caller-pin consistency (App install-set):');
     console.log(formatRepoTable(report.repoPins));
     if (report.expectedPin) console.log(`Expected pin (modal): ${report.expectedPin}`);
+    const nonFleet = collectNonFleetRepos(report);
+    if (nonFleet.length > 0) {
+      console.log(
+        `Non-fleet (opt-out via .github/macf-fleet.json routing_fleet:false; excluded from pin check): ${nonFleet.join(', ')}`,
+      );
+    }
     console.log('');
   } else {
     console.log('Caller-pin consistency: no fleet repos discovered (App install-set unavailable).\n');
