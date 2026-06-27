@@ -68,12 +68,19 @@ describe('DR-028 role-settings model', () => {
   });
 
   describe('universal floor — hooks', () => {
-    it('includes the gh-token + attribution + turn-receipt + reflection hooks, none REQUIRED', () => {
+    it('includes the gh-token + attribution + turn-receipt + reflection + channels hooks, none REQUIRED', () => {
       const cmds = ROLE_FLOOR_HOOKS.map((h) => h.command);
       expect(cmds.some((c) => c.includes('check-gh-token.sh'))).toBe(true);
       expect(cmds.some((c) => c.includes('check-gh-attribution.sh'))).toBe(true);
       expect(cmds.some((c) => c.includes('emit-turn-receipt.sh'))).toBe(true);
       expect(cmds.some((c) => c.includes('harvest-reflection.sh'))).toBe(true);
+      expect(cmds.some((c) => c.includes('check-channels-enabled.sh'))).toBe(true);
+      // The channels guard is a SessionStart hook (macf#633).
+      expect(
+        ROLE_FLOOR_HOOKS.some(
+          (h) => h.event === 'SessionStart' && h.command.includes('check-channels-enabled.sh'),
+        ),
+      ).toBe(true);
       // No floor hook is REQUIRED (only the auditor's never-acts is).
       expect(ROLE_FLOOR_HOOKS.every((h) => h.required === false)).toBe(true);
     });

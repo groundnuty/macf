@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
 
 describe('installGhTokenHook', () => {
   let tmpRoot: string;
@@ -112,7 +112,7 @@ describe('installGhTokenHook', () => {
     expect(cmds).toContain(MACF_AUDITOR_HOOK_COMMAND);
   });
 
-  it('preserves other hook event types (SessionStart, Stop, etc.)', () => {
+  it('preserves operator hooks on other events (SessionStart op-hook kept, Stop untouched)', () => {
     mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
     writeFileSync(settingsPath, JSON.stringify({
       hooks: {
@@ -124,7 +124,14 @@ describe('installGhTokenHook', () => {
     installGhTokenHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    expect(s.hooks.SessionStart).toHaveLength(1);
+    // SessionStart now carries the operator's hook PLUS the macf channels guard.
+    expect(s.hooks.SessionStart).toHaveLength(2);
+    const sessionCmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
+      e.hooks.map((h) => h.command),
+    );
+    expect(sessionCmds).toContain('./user-session-hook.sh');
+    expect(sessionCmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
+    // Stop is not a MACF event → untouched.
     expect(s.hooks.Stop).toHaveLength(1);
     expect(s.hooks.PreToolUse[0].hooks[0].command).toBe(MACF_HOOK_COMMAND);
   });
@@ -638,6 +645,83 @@ describe('installGhTokenHook', () => {
     );
     expect(macfEntries).toHaveLength(1);
     expect(macfEntries[0].hooks[0].command).toBe(MACF_REFLECTION_HOOK_COMMAND);
+    expect(macfEntries[0].hooks[0].command).not.toContain('--old-flag');
+  });
+
+  // ── SessionStart channels-enabled guard (groundnuty/macf#633) ──
+
+  it('MACF_CHANNELS_HOOK_COMMAND uses $CLAUDE_PROJECT_DIR (cwd-independent)', () => {
+    expect(MACF_CHANNELS_HOOK_COMMAND).toBe(
+      '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channels-enabled.sh',
+    );
+    expect(MACF_CHANNELS_HOOK_COMMAND).toMatch(/^\$CLAUDE_PROJECT_DIR\//);
+    expect(MACF_CHANNELS_HOOK_COMMAND).toContain('check-channels-enabled.sh');
+  });
+
+  it('installs the SessionStart channels-guard hook (matcher-less, command type, no async)', () => {
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(s.hooks.SessionStart).toHaveLength(1);
+    const entry = s.hooks.SessionStart[0];
+    // SessionStart isn't tool-gated → no matcher (like UserPromptSubmit/PreCompact).
+    expect(entry.matcher).toBeUndefined();
+    expect(entry.hooks[0].type).toBe('command');
+    expect(entry.hooks[0].command).toBe(MACF_CHANNELS_HOOK_COMMAND);
+    // NON-BLOCKING by script contract (always exit 0) → no async flag needed.
+    expect(entry.hooks[0].async).toBeUndefined();
+  });
+
+  it('preserves operator-authored SessionStart hooks when adding ours', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: 'command', command: './my-session-hook.sh' }] }],
+      },
+    }, null, 2));
+
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(s.hooks.SessionStart).toHaveLength(2);
+    const cmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
+      e.hooks.map((h) => h.command),
+    );
+    expect(cmds).toContain('./my-session-hook.sh');
+    expect(cmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
+  });
+
+  it('SessionStart install is idempotent (no duplicate macf entry)', () => {
+    installGhTokenHook(tmpRoot);
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const macfSession = s.hooks.SessionStart.filter((e: { hooks: { command: string }[] }) =>
+      e.hooks.some((h) => h.command.includes('check-channels-enabled.sh')),
+    );
+    expect(macfSession).toHaveLength(1);
+  });
+
+  it('refreshes a stale MACF channels-guard entry (replaces by command-path match)', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          {
+            hooks: [{ type: 'command', command: '.claude/scripts/check-channels-enabled.sh --old-flag' }],
+          },
+        ],
+      },
+    }, null, 2));
+
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const macfEntries = s.hooks.SessionStart.filter((e: { hooks: { command: string }[] }) =>
+      e.hooks.some((h) => h.command.includes('check-channels-enabled.sh')),
+    );
+    expect(macfEntries).toHaveLength(1);
+    expect(macfEntries[0].hooks[0].command).toBe(MACF_CHANNELS_HOOK_COMMAND);
     expect(macfEntries[0].hooks[0].command).not.toContain('--old-flag');
   });
 });

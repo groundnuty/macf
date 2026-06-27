@@ -153,6 +153,28 @@ export const MACF_ATTRIBUTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/script
 export const MACF_REFLECTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/harvest-reflection.sh';
 
 /**
+ * Channels-enabled-guard SessionStart hook command (groundnuty/macf#633). At
+ * session start, this hook reads the macf-agent MCP server's own startup log
+ * back and warns LOUDLY into the agent's context when channel notifications are
+ * OFF for the session — the result-invariant (Pattern A) backstop to macf#632
+ * (which ENABLES channels in claude.sh). When channels are silently off (wrong
+ * flag value, old claude, opt-out, or a bare `claude` launch that bypassed
+ * claude.sh) every routed issue/PR/mention is dropped with no signal; this
+ * guard surfaces that so the agent stops trusting "no pings = idle".
+ *
+ * It runs on the `SessionStart` event (matcher-less, like UserPromptSubmit /
+ * PreCompact). OBSERVATIONAL + NON-BLOCKING: the script ALWAYS exits 0 (fail
+ * open on a missing/unreadable log, a poll timeout, or any internal error) so
+ * it can never block a session. STDOUT is injected into the agent's context —
+ * that is how the warning reaches the agent. Override: MACF_SKIP_CHANNELS_CHECK=1.
+ *
+ * Distributed via `macf init` / `macf update` / `macf rules refresh` like the
+ * other check-*.sh hooks (CLI-shipped, NOT a plugin hook — so it needs no
+ * marketplace re-tag to land).
+ */
+export const MACF_CHANNELS_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channels-enabled.sh';
+
+/**
  * The hook filenames used to identify MACF-managed entries on refresh.
  * Matched by path-end equality (see isMacfManagedCommand) so operator
  * files with a similar-but-distinct basename are not misclassified.
@@ -166,6 +188,7 @@ const MACF_HOOK_FILENAMES: readonly string[] = [
   'emit-turn-receipt.sh',
   'check-gh-attribution.sh',
   'harvest-reflection.sh',
+  'check-channels-enabled.sh',
 ];
 
 /**
@@ -203,6 +226,7 @@ interface Settings {
     PreToolUse?: HookEntry[];
     PostToolUse?: HookEntry[];
     PreCompact?: HookEntry[];
+    SessionStart?: HookEntry[];
     [key: string]: HookEntry[] | undefined;
   };
   [key: string]: unknown;
@@ -900,6 +924,13 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
  *     harvests the agent's staged reflection into a local JSONL ledger. Matcher-
  *     less + NON-BLOCKING; operator-authored PreCompact hooks are preserved)
  *
+ * And, on the SessionStart event:
+ *   - `check-channels-enabled.sh` (groundnuty/macf#633 — reads the macf-agent
+ *     MCP server's startup log back and warns LOUDLY into the agent's context
+ *     when channel notifications are OFF, the result-invariant backstop to the
+ *     macf#632 claude.sh flag. Matcher-less + NON-BLOCKING; operator-authored
+ *     SessionStart hooks are preserved)
+ *
  * Creates the `.claude/` directory and the file if either is missing.
  * Idempotent: repeated calls don't duplicate entries.
  *
@@ -924,6 +955,7 @@ export function installGhTokenHook(workspaceDir: string): void {
   const postToolUse = hooks.PostToolUse ?? [];
   const userPromptSubmit = hooks.UserPromptSubmit ?? [];
   const preCompact = hooks.PreCompact ?? [];
+  const sessionStart = hooks.SessionStart ?? [];
 
   // Drop any prior MACF-managed entries (any hook file in
   // MACF_HOOK_FILENAMES) so we can replace them cleanly — guards against
@@ -1008,6 +1040,21 @@ export function installGhTokenHook(workspaceDir: string): void {
     },
   ];
 
+  // SessionStart: the channels-enabled guard (groundnuty/macf#633). Same
+  // preserve-then-replace discipline — drop any prior MACF-managed SessionStart
+  // entry (by MACF_HOOK_FILENAMES basename) and re-add ours, leaving
+  // operator-authored SessionStart hooks intact. Matcher-less (SessionStart
+  // isn't tool-gated). NON-BLOCKING by script contract (always exit 0) — so no
+  // `async` flag is needed; it can't delay session start.
+  const preservedSession = sessionStart.filter(
+    (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
+  );
+  const macfSessionEntries: readonly HookEntry[] = [
+    {
+      hooks: [{ type: 'command', command: MACF_CHANNELS_HOOK_COMMAND }],
+    },
+  ];
+
   const updated: Settings = {
     ...settings,
     hooks: {
@@ -1016,6 +1063,7 @@ export function installGhTokenHook(workspaceDir: string): void {
       PostToolUse: [...preservedPost, ...macfPostEntries],
       UserPromptSubmit: [...preservedUps, ...macfUpsEntries],
       PreCompact: [...preservedCompact, ...macfCompactEntries],
+      SessionStart: [...preservedSession, ...macfSessionEntries],
     },
   };
 

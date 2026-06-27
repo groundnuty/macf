@@ -26,13 +26,14 @@ import {
   MACF_TURN_RECEIPT_HOOK_COMMAND,
   MACF_ATTRIBUTION_HOOK_COMMAND,
   MACF_REFLECTION_HOOK_COMMAND,
+  MACF_CHANNELS_HOOK_COMMAND,
   ROLE_FLOOR_ALLOW,
   ROLE_FLOOR_DENY,
 } from './settings-writer.js';
 
 /** A hook the model expects in `.claude/settings.json`. */
 export interface ExpectedHook {
-  readonly event: 'PreToolUse' | 'PostToolUse' | 'UserPromptSubmit' | 'PreCompact';
+  readonly event: 'PreToolUse' | 'PostToolUse' | 'UserPromptSubmit' | 'PreCompact' | 'SessionStart';
   /** Tool matcher for tool-scoped events (e.g. `Bash`); omitted for prompt/compact hooks. */
   readonly matcher?: string;
   readonly command: string;
@@ -59,6 +60,7 @@ export const ROLE_FLOOR_HOOKS: readonly ExpectedHook[] = [
   { event: 'PostToolUse', matcher: 'Bash', command: MACF_ATTRIBUTION_HOOK_COMMAND, required: false },
   { event: 'UserPromptSubmit', command: MACF_TURN_RECEIPT_HOOK_COMMAND, required: false },
   { event: 'PreCompact', command: MACF_REFLECTION_HOOK_COMMAND, required: false },
+  { event: 'SessionStart', command: MACF_CHANNELS_HOOK_COMMAND, required: false },
 ];
 
 /** Per-role additions beyond the floor (DR-028 §Decision 1, Per-role deltas). */

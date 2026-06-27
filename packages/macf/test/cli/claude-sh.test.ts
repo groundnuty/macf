@@ -148,7 +148,11 @@ describe('generateClaudeSh', () => {
       expect(output).not.toContain('MACF_CA_CERT');
       expect(output).not.toContain('MACF_CA_KEY');
       expect(output).not.toContain('MACF_AGENT_CERT');
-      expect(output).not.toContain('MACF_LOG_PATH');
+      // NOTE: MACF_LOG_PATH is NOT in this not-inlined list anymore. env.certs
+      // still owns the canonical value, but claude.sh now ALSO emits a
+      // ${MACF_LOG_PATH:-default} fallback (macf#632) so a partial workspace
+      // missing env.certs still gets a forensic log path. The `:-` form keeps
+      // env.certs's value when present — see the dedicated MACF_LOG_PATH test.
       // env.registry owns these:
       expect(output).not.toContain('MACF_REGISTRY_TYPE');
       // env.telemetry owns these:
@@ -228,24 +232,25 @@ describe('generateClaudeSh', () => {
       const output = generateClaudeSh(sampleConfig);
       // The resume attempt is NOT exec'd, so the `|| exec claude` fallback fires
       // when there's no resumable conversation (first launch / different path key).
-      expect(output).toContain('claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@" || exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"');
+      // macf#632: $MACF_CHANNELS_ARGS is word-split (unquoted) into each invocation.
+      expect(output).toContain('claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@" || exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@"');
       expect(output).not.toContain('exec claude -c');
     });
 
     it('omits -c for worker agents (each invocation is fresh by design)', () => {
       const workerConfig: MacfAgentConfig = { ...sampleConfig, agent_type: 'worker' };
       const output = generateClaudeSh(workerConfig);
-      expect(output).toContain('exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"');
+      expect(output).toContain('exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@"');
       expect(output).not.toContain('exec claude -c');
     });
 
     it('generates a conditional exec: MACF_TEST set → fresh exec, else → resume-with-fallback (permanent)', () => {
       const output = generateClaudeSh(sampleConfig);
       expect(output).toContain('if [ -n "${MACF_TEST:-}" ]; then');
-      // MACF_TEST branch: fresh session, no -c
-      expect(output).toContain('exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"');
+      // MACF_TEST branch: fresh session, no -c (channels flag word-split in)
+      expect(output).toContain('exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@"');
       // else branch: resume, falling back to a fresh session if nothing is resumable
-      expect(output).toContain('claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@" || exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"');
+      expect(output).toContain('claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@" || exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@"');
       expect(output).toMatch(/fi[\s\n]*$/);
     });
 
@@ -319,6 +324,76 @@ describe('generateClaudeSh', () => {
       expect(tmuxWrapPos).toBeLessThan(claudeExecPos);
     });
   });
+
+  describe('channel-notifications enablement (macf#632)', () => {
+    it('defaults MACF_CHANNELS_ARGS to the dev-flag form for the macf-agent server', () => {
+      const output = generateClaudeSh(sampleConfig);
+      expect(output).toContain(
+        'MACF_CHANNELS_ARGS="--dangerously-load-development-channels server:macf-agent"',
+      );
+    });
+
+    it('honors the MACF_CHANNELS_DISABLED=1 opt-out (empties the args)', () => {
+      const output = generateClaudeSh(sampleConfig);
+      expect(output).toContain('if [ "${MACF_CHANNELS_DISABLED:-}" = "1" ]; then');
+      expect(output).toMatch(/MACF_CHANNELS_DISABLED:-.*\n\s*MACF_CHANNELS_ARGS=""/);
+    });
+
+    it('respects a preset MACF_CHANNELS_ARGS override verbatim', () => {
+      const output = generateClaudeSh(sampleConfig);
+      expect(output).toContain('elif [ -n "${MACF_CHANNELS_ARGS:-}" ]; then');
+    });
+
+    it('version-gates the flag on Claude Code >= 2.1.80 (parses claude --version)', () => {
+      const output = generateClaudeSh(sampleConfig);
+      expect(output).toContain("claude --version");
+      expect(output).toContain('macf_channels_supported=1');
+      // major.minor.patch numeric comparison against 2.1.80
+      expect(output).toContain('[ "${macf_cc_major:-0}" -eq 2 ] && [ "${macf_cc_minor:-0}" -eq 1 ] && [ "${macf_cc_patch:-0}" -ge 80 ]');
+    });
+
+    it('warns LOUDLY to stderr when the version is older than 2.1.80 / unparseable', () => {
+      const output = generateClaudeSh(sampleConfig);
+      expect(output).toContain('older than 2.1.80');
+      expect(output).toMatch(/echo "WARNING.*>&2/);
+      expect(output).toContain('UNAVAILABLE this session');
+    });
+
+    it('runs the channels block AFTER the tmux self-wrap, BEFORE the exec', () => {
+      const output = generateClaudeSh(sampleConfig);
+      const tmuxPos = output.indexOf('if [ -z "${TMUX:-}" ]');
+      const channelsPos = output.indexOf('macf_channels_supported=0');
+      const execPos = output.indexOf('if [ -n "${MACF_TEST:-}" ]');
+      expect(tmuxPos).toBeGreaterThan(0);
+      expect(channelsPos).toBeGreaterThan(tmuxPos);
+      expect(channelsPos).toBeLessThan(execPos);
+    });
+
+    it('expands $MACF_CHANNELS_ARGS UNQUOTED in every exec claude line (word-split)', () => {
+      const output = generateClaudeSh(sampleConfig);
+      // unquoted (no surrounding double-quotes) so the two-token flag splits
+      expect(output).toMatch(/--plugin-dir "\$SCRIPT_DIR\/\.macf\/plugin" \$MACF_CHANNELS_ARGS "\$@"/);
+      // shellcheck disable is documented for the intentional unquoting
+      expect(output).toContain('# shellcheck disable=SC2086');
+    });
+  });
+
+  describe('MACF_LOG_PATH forensic-log fallback (macf#632)', () => {
+    it('exports MACF_LOG_PATH with a ${VAR:-default} fallback (preserves env.certs value)', () => {
+      const output = generateClaudeSh(sampleConfig);
+      expect(output).toContain(
+        'export MACF_LOG_PATH="${MACF_LOG_PATH:-$SCRIPT_DIR/.claude/.macf/channel.log}"',
+      );
+    });
+
+    it('sets MACF_LOG_PATH AFTER the env.* source loop so env.certs wins when present', () => {
+      const output = generateClaudeSh(sampleConfig);
+      const sourceLoopPos = output.indexOf('for f in "$SCRIPT_DIR/.claude/.macf"/env.*');
+      const logPathPos = output.indexOf('export MACF_LOG_PATH=');
+      expect(sourceLoopPos).toBeGreaterThan(0);
+      expect(logPathPos).toBeGreaterThan(sourceLoopPos);
+    });
+  });
 });
 
 describe('writeClaudeSh', () => {
@@ -349,7 +424,7 @@ describe('writeClaudeSh', () => {
 
     const after = readFileSync(path, 'utf-8');
     expect(after).not.toContain('stale user edits');
-    expect(after).toContain('claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@" || exec claude');
+    expect(after).toContain('claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@" || exec claude');
     expect(statSync(path).mode & 0o777).toBe(0o755);
   });
 
