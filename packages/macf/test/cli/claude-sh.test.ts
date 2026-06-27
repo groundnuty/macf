@@ -26,7 +26,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { generateClaudeSh, writeClaudeSh, otelTelemetryLines } from '../../src/cli/claude-sh.js';
+import { generateClaudeSh, writeClaudeSh, otelTelemetryLines, hasManagedHeader } from '../../src/cli/claude-sh.js';
 import type { MacfAgentConfig } from '../../src/cli/config.js';
 
 const sampleConfig: MacfAgentConfig = {
@@ -436,5 +436,43 @@ describe('otelTelemetryLines (kept exported as canonical pre-migration reference
       expect(() => otelTelemetryLines(sampleConfig, { MACF_OTEL_ENDPOINT: val }))
         .toThrow(/shell-unsafe/);
     }
+  });
+});
+
+describe('hasManagedHeader (DR-029 / macf#623)', () => {
+  it('returns true for a freshly generated launcher', () => {
+    expect(hasManagedHeader(generateClaudeSh(sampleConfig))).toBe(true);
+  });
+
+  it('returns true for a worker-type generated launcher too', () => {
+    const workerCfg: MacfAgentConfig = { ...sampleConfig, agent_type: 'worker' };
+    expect(hasManagedHeader(generateClaudeSh(workerCfg))).toBe(true);
+  });
+
+  it('returns false for a hand-authored launcher (no managed-header)', () => {
+    // Shape mirrors the framework repo's own hand-authored claude.sh:
+    // bash shebang, "Launcher for ..." comment, custom -r flag, brew
+    // shellenv — and crucially NO macf managed-header.
+    const handAuthored = [
+      '#!/bin/bash',
+      '# Launcher for macf-code-agent',
+      '# Generates a GitHub App token, starts tmux session, boots Claude Code.',
+      'set -euo pipefail',
+      'CLAUDE_BIN="${CLAUDE_BIN:-claude}"',
+      'exec "$CLAUDE_BIN" "$@"',
+      '',
+    ].join('\n');
+    expect(hasManagedHeader(handAuthored)).toBe(false);
+  });
+
+  it('returns false for empty content', () => {
+    expect(hasManagedHeader('')).toBe(false);
+  });
+
+  it('detects the managed-header anywhere in the content (not only at the top)', () => {
+    // The check is substring-based, so a managed launcher with extra
+    // leading lines still detects as managed.
+    const content = `#!/usr/bin/env bash\nset -euo pipefail\n# This file is managed by \`macf\`. Do not edit directly\n`;
+    expect(hasManagedHeader(content)).toBe(true);
   });
 });

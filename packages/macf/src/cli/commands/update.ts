@@ -40,7 +40,8 @@
  * version pins, this command is the canonical bumper.
  */
 import { createInterface } from 'node:readline';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { readAgentConfig, writeAgentConfig, tokenSourceFromConfig } from '../config.js';
 import { resolveLatestVersions } from '../version-resolver.js';
 import { copyCanonicalRules, copyCanonicalScripts, findCliPackageRoot } from '../rules.js';
@@ -48,7 +49,7 @@ import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
 import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion } from '../plugin-fetcher.js';
-import { writeClaudeSh } from '../claude-sh.js';
+import { writeClaudeSh, hasManagedHeader } from '../claude-sh.js';
 import { writeHostPrelude } from '../host-prelude.js';
 import {
   refreshEnvFiles,
@@ -332,32 +333,58 @@ export async function update(
   // until refreshEnvFiles ran later — leaving a brief window where the
   // launcher would source nothing. Migration writes both atomically.
   if (!opts.noMigrateEnvFiles) {
-    const migration = migrateMonolithicClaudeSh(projectDir, config);
-    if (migration.migrated) {
-      console.log(
-        `Migrated monolithic claude.sh → thin source-loop template + ` +
-          `per-concern env files (macf#342)`,
-      );
-    } else if (migration.reason === 'unrecognized-template') {
-      // Operator-edited / third-party launcher. Don't auto-overwrite
-      // here, but `writeClaudeSh` below WILL overwrite per the existing
-      // #63 contract — surface the case so the operator can decide
-      // whether to re-run with `--no-migrate-env-files`.
-      console.warn(
-        `Note: claude.sh did not match the canonical macf template. ` +
-          `Will be overwritten with the current template (managed-file contract).`,
-      );
-    }
+    // DR-029 / macf#623: regenerate claude.sh ONLY when it is macf-managed
+    // (carries the managed-header) or absent (fresh workspace). A claude.sh
+    // that EXISTS but LACKS the managed-header is hand-authored (e.g. the
+    // framework repo's own launcher, or any operator-written one) — preserve
+    // it + warn (drift-aware), never clobber it with the generic template.
+    // This is the auto-detect path that complements the `--no-migrate-env-files`
+    // hard skip: the manual flag short-circuits this whole block above;
+    // the managed-header check protects hand-authored launchers even on a
+    // normal `macf update` run where the operator didn't pass the flag.
+    // Same managed-header discriminator the env.* + host-prelude files use.
+    const claudeShPath = join(projectDir, 'claude.sh');
+    const existingClaudeSh = existsSync(claudeShPath)
+      ? readFileSync(claudeShPath, 'utf-8')
+      : null;
+    const preserveHandAuthored =
+      existingClaudeSh !== null && !hasManagedHeader(existingClaudeSh);
 
-    // Regenerate claude.sh unconditionally — the launcher template
-    // changes over time (e.g., #60 added --plugin-dir, #283 fixed the
-    // retired :4318 OTLP endpoint) and workspaces need those changes
-    // without having to re-run `macf init` from scratch. The generated
-    // file carries a managed-file header warning users not to edit it.
-    // See #63. Doesn't depend on config.versions, so it runs even for
-    // legacy configs (before the error-exit for missing versions).
-    writeClaudeSh(projectDir, config);
-    console.log(`Refreshed claude.sh from current launcher template`);
+    if (preserveHandAuthored) {
+      console.warn(
+        `Preserved hand-authored claude.sh (no macf managed-header). ` +
+          `Note: it lacks template improvements (e.g. the 0.2.39 host-prelude). ` +
+          `Fold them in manually, or 'macf init --force' to adopt the managed template.`,
+      );
+    } else {
+      const migration = migrateMonolithicClaudeSh(projectDir, config);
+      if (migration.migrated) {
+        console.log(
+          `Migrated monolithic claude.sh → thin source-loop template + ` +
+            `per-concern env files (macf#342)`,
+        );
+      } else if (migration.reason === 'unrecognized-template') {
+        // A claude.sh that carries the managed-header but matches neither the
+        // monolithic nor the thin template (an odd intermediate / mid-rewrite
+        // managed launcher). `writeClaudeSh` below WILL overwrite per the
+        // managed-file contract — surface the case. (A header-LESS launcher
+        // never reaches here; it's preserved by the branch above.)
+        console.warn(
+          `Note: claude.sh did not match the canonical macf template. ` +
+            `Will be overwritten with the current template (managed-file contract).`,
+        );
+      }
+
+      // Regenerate claude.sh — the launcher template changes over time (e.g.,
+      // #60 added --plugin-dir, #283 fixed the retired :4318 OTLP endpoint,
+      // #599 added the host-prelude source line) and managed workspaces need
+      // those changes without re-running `macf init`. The generated file
+      // carries the managed-file header warning users not to edit it. See #63.
+      // Doesn't depend on config.versions, so it runs even for legacy configs
+      // (before the error-exit for missing versions).
+      writeClaudeSh(projectDir, config);
+      console.log(`Refreshed claude.sh from current launcher template`);
+    }
 
     // Env-file refresh: macf-managed files (env._helpers / env.identity
     // / env.github / env.certs / env.registry) overwrite + warn-on-
