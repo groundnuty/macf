@@ -575,6 +575,10 @@ program
   .option('--actions-version <version>', 'macf-actions tag to pin to', 'v1')
   .option('--agents <list>', 'Comma-separated agent names to scaffold (e.g., code-agent,science-agent)')
   .option('--session-name <name>', 'Shared tmux session name; when set with multiple --agents, each agent gets a window inside this session')
+  .option('--project <name>', 'Project name for the v3 router caller\'s required `project` input (defaults to the repo name). Must match the agents\' macf-agent.json project. v3+ only.')
+  .option('--registry-type <type>', 'Registry scope for the v3 router\'s registry-api-path: repo (default), org, or profile (DR-006). v3+ only.', 'repo')
+  .option('--registry-org <org>', 'Org login (for --registry-type org)')
+  .option('--registry-user <user>', 'User login (for --registry-type profile)')
   .option('--force', 'Overwrite existing files', false)
   .option('--dir <path>', 'Target directory (defaults to current working directory)')
   .action(async (opts) => {
@@ -584,6 +588,10 @@ program
       actionsVersion: opts.actionsVersion,
       agents: opts.agents,
       sessionName: opts.sessionName,
+      project: opts.project,
+      registryType: opts.registryType,
+      registryOrg: opts.registryOrg,
+      registryUser: opts.registryUser,
       force: opts.force,
     });
   });
