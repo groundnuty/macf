@@ -107,7 +107,35 @@ export const NotifyPayloadSchema = z.object({
   // that never sets them validates unchanged.
   diagnostic: z.boolean().optional(),
   correlation_token: z.string().optional(),
-});
+}).refine(
+  // macf#616 (silent-fallback Instance 14): a `type:mention` payload MUST carry
+  // a GitHub anchor (`issue_number` OR `pr_number`) so the recipient can locate
+  // the ask. The anchor is `.optional()` at the field level because it IS
+  // optional for every other notify type — but an anchorless mention surfaces
+  // to the recipient as a bare, context-free "You were mentioned" (see
+  // notify-formatter.ts), so the routed work strands invisibly even though
+  // delivery succeeded at every layer (HTTP 200 → notify_received → mcp_pushed
+  // → wake). Making the invariant a schema refine rejects the bad shape at PARSE
+  // (a loud 400 at `/notify`) rather than relying on a bypassable downstream
+  // handler guard.
+  //
+  // Diagnostic probes (DR-030 §6, macf#568) are EXEMPT: a `diagnostic: true`
+  // payload short-circuits at `/notify` BEFORE the formatter / onNotify and is
+  // never surfaced to a recipient as a real mention, so the strand-the-recipient
+  // hazard does not apply. Only `diagnostic === true` is exempt — an explicit
+  // `diagnostic: false` is a real payload and still requires an anchor.
+  (payload) =>
+    payload.type !== 'mention'
+    || payload.diagnostic === true
+    || payload.issue_number !== undefined
+    || payload.pr_number !== undefined,
+  {
+    message:
+      'a type:mention payload requires an issue_number or pr_number anchor; '
+      + 'anchorless mentions strand the recipient — see macf#616',
+    path: ['issue_number'],
+  },
+);
 
 export type NotifyPayload = z.infer<typeof NotifyPayloadSchema>;
 

@@ -44,7 +44,23 @@ export function formatNotifyContent(payload: NotifyPayload): FormattedNotify {
   }
 
   if (payload.type === 'mention') {
-    return { content: payload.message ?? 'You were mentioned' };
+    if (payload.message) {
+      return { content: payload.message };
+    }
+    // macf#616: a message-less mention still carries its anchor (issue_number
+    // or pr_number — enforced by NotifyPayloadSchema's refine), so the fallback
+    // surfaces that anchor rather than a bare context-free "You were mentioned"
+    // that would strand the recipient (silent-fallback Instance 14). The truly
+    // anchorless bare string remains only as a last-resort defense for the
+    // diagnostic-probe path (which never reaches here) and direct callers that
+    // bypass the schema.
+    if (payload.issue_number !== undefined) {
+      return { content: `You were mentioned in #${payload.issue_number}` };
+    }
+    if (payload.pr_number !== undefined) {
+      return { content: `You were mentioned in PR #${payload.pr_number}` };
+    }
+    return { content: 'You were mentioned' };
   }
 
   if (payload.type === 'ci_completion') {

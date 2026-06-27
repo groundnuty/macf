@@ -235,11 +235,44 @@ describe('createHttpsServer', () => {
     const res = await httpsRequest(actualPort, {
       method: 'POST',
       path: '/notify',
-      body: JSON.stringify({ type: 'mention' }),
+      // Anchored mention so the payload validates and reaches onNotify (which
+      // then rejects) — exercises the 500 path, not the macf#616 reject path.
+      body: JSON.stringify({ type: 'mention', issue_number: 1 }),
       headers: { 'Content-Type': 'application/json' },
     });
 
     expect(res.status).toBe(500);
+
+    await server.stop();
+  });
+
+  it('rejects an anchorless type:mention with 400 and never calls onNotify (macf#616)', async () => {
+    const onNotify = vi.fn(async () => {});
+
+    const server = createHttpsServer({
+      caCertPath: certs.caCert,
+      agentCertPath: certs.agentCert,
+      agentKeyPath: certs.agentKey,
+      onNotify,
+      onHealth: () => ({} as HealthResponse),
+      logger: makeLogger(),
+    });
+
+    const { actualPort } = await server.start(0, '127.0.0.1');
+
+    const res = await httpsRequest(actualPort, {
+      method: 'POST',
+      path: '/notify',
+      // No issue_number / pr_number anchor → schema refine rejects at PARSE,
+      // BEFORE the notification is ever surfaced to the recipient.
+      body: JSON.stringify({ type: 'mention', message: 'please look' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toContain('macf#616');
+    // The reject is at the schema boundary — the delivery path never runs.
+    expect(onNotify).not.toHaveBeenCalled();
 
     await server.stop();
   });

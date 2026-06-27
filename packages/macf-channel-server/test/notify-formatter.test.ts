@@ -87,9 +87,22 @@ describe('formatNotifyContent', () => {
       expect(result.issueNumber).toBeUndefined();
     });
 
-    it('falls back to generic string when message absent', () => {
+    it('falls back to generic string when message AND anchor absent', () => {
+      // Truly anchorless mentions can't reach the formatter post-macf#616
+      // (NotifyPayloadSchema rejects them), but the bare string remains as a
+      // last-resort defense for direct callers that bypass the schema.
       const result = formatNotifyContent({ type: 'mention' });
       expect(result.content).toBe('You were mentioned');
+    });
+
+    it('includes the issue anchor when message absent (macf#616)', () => {
+      const result = formatNotifyContent({ type: 'mention', issue_number: 7 });
+      expect(result.content).toBe('You were mentioned in #7');
+    });
+
+    it('includes the PR anchor when message absent (macf#616)', () => {
+      const result = formatNotifyContent({ type: 'mention', pr_number: 12 });
+      expect(result.content).toBe('You were mentioned in PR #12');
     });
   });
 

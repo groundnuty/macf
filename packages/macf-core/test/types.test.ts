@@ -23,8 +23,9 @@ describe('NotifyTypeSchema', () => {
 
 describe('NotifyPayloadSchema', () => {
   it('accepts minimal payload', () => {
-    const result = NotifyPayloadSchema.parse({ type: 'mention' });
-    expect(result.type).toBe('mention');
+    // `startup_check` carries no required anchor (unlike `mention` post-macf#616).
+    const result = NotifyPayloadSchema.parse({ type: 'startup_check' });
+    expect(result.type).toBe('startup_check');
     expect(result.issue_number).toBeUndefined();
   });
 
@@ -54,6 +55,64 @@ describe('NotifyPayloadSchema', () => {
   });
 });
 
+describe('NotifyPayloadSchema — mention anchor invariant (macf#616)', () => {
+  it('rejects an anchorless type:mention with an actionable message', () => {
+    const result = NotifyPayloadSchema.safeParse({ type: 'mention' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const msg = result.error.issues.map((i) => i.message).join(' ');
+      expect(msg).toContain('issue_number or pr_number');
+      expect(msg).toContain('macf#616');
+    }
+  });
+
+  it('rejects an anchorless type:mention even when a message is present', () => {
+    // A message alone is not an anchor — the recipient still cannot locate the
+    // GitHub object the mention refers to.
+    const result = NotifyPayloadSchema.safeParse({
+      type: 'mention',
+      message: 'please take a look',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts a type:mention anchored by issue_number', () => {
+    const result = NotifyPayloadSchema.safeParse({ type: 'mention', issue_number: 7 });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts a type:mention anchored by pr_number', () => {
+    const result = NotifyPayloadSchema.safeParse({ type: 'mention', pr_number: 12 });
+    expect(result.success).toBe(true);
+  });
+
+  it('exempts a diagnostic probe (diagnostic:true) from the anchor requirement', () => {
+    // DR-030 §6 probes deliberately POST an anchorless type:mention; they
+    // short-circuit before delivery and are never surfaced to a recipient.
+    const result = NotifyPayloadSchema.safeParse({ type: 'mention', diagnostic: true });
+    expect(result.success).toBe(true);
+  });
+
+  it('does NOT exempt an explicit diagnostic:false anchorless mention', () => {
+    const result = NotifyPayloadSchema.safeParse({ type: 'mention', diagnostic: false });
+    expect(result.success).toBe(false);
+  });
+
+  it('leaves the anchor optional for non-mention notify types', () => {
+    // The invariant is scoped to `mention` — other types still parse without
+    // an issue_number/pr_number anchor (back-compat).
+    expect(NotifyPayloadSchema.safeParse({ type: 'startup_check' }).success).toBe(true);
+    expect(NotifyPayloadSchema.safeParse({ type: 'issue_routed' }).success).toBe(true);
+    expect(
+      NotifyPayloadSchema.safeParse({
+        type: 'peer_notification',
+        source: 'macf-science-agent',
+        event: 'custom',
+      }).success,
+    ).toBe(true);
+  });
+});
+
 describe('NotifyPayloadSchema — DR-030 §6 diagnostic discriminator (macf#568)', () => {
   it('accepts diagnostic + correlation_token', () => {
     const result = NotifyPayloadSchema.parse({
@@ -72,7 +131,9 @@ describe('NotifyPayloadSchema — DR-030 §6 diagnostic discriminator (macf#568)
   });
 
   it('both fields are optional → back-compat (a payload without them is unchanged)', () => {
-    const result = NotifyPayloadSchema.parse({ type: 'mention' });
+    // `startup_check` needs no anchor (macf#616); this test is about the
+    // diagnostic/correlation_token defaults, not the mention invariant.
+    const result = NotifyPayloadSchema.parse({ type: 'startup_check' });
     expect(result.diagnostic).toBeUndefined();
     expect(result.correlation_token).toBeUndefined();
   });

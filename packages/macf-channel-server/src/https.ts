@@ -434,6 +434,21 @@ export function createHttpsServer(config: {
 
       const result = NotifyPayloadSchema.safeParse(parsed);
       if (!result.success) {
+        // macf#616 (silent-fallback Instance 14): loud-log the rejection so a
+        // malformed inbound payload — notably an anchorless `type:mention`, which
+        // would otherwise surface as a context-free "You were mentioned" and
+        // strand the recipient — is visible in operator logs rather than a silent
+        // 400. The refine's error message carries the macf#616 reference for the
+        // mention case; `attempted_type` aids triage when the body is otherwise
+        // unparseable as a NotifyPayload.
+        const attemptedType =
+          parsed !== null && typeof parsed === 'object' && 'type' in parsed
+            ? String((parsed as { type?: unknown }).type)
+            : 'unknown';
+        logger.warn('notify_validation_failed', {
+          attempted_type: attemptedType,
+          error: result.error.message,
+        });
         sendJson(res, 400, { error: `Validation failed: ${result.error.message}` });
         return;
       }
