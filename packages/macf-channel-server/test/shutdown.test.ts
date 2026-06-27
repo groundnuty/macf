@@ -37,6 +37,40 @@ function infoEvents(logger: Logger): string[] {
   return vi.mocked(logger.info).mock.calls.map(c => c[0] as string);
 }
 
+/**
+ * A minimal stand-in for the MCP stdio transport's input stream (process.stdin)
+ * that records 'end'/'close' listeners and lets a test fire them — simulating a
+ * parent-Claude-TUI exit without touching the real process.stdin (macf#627).
+ */
+function mockStdin(): {
+  readonly on: ReturnType<typeof vi.fn>;
+  emit(event: 'end' | 'close'): void;
+} {
+  const listeners: Record<string, Array<() => void>> = {};
+  const on = vi.fn((event: string, listener: () => void) => {
+    (listeners[event] ??= []).push(listener);
+    return undefined;
+  });
+  return {
+    on,
+    emit(event): void {
+      (listeners[event] ?? []).forEach(l => l());
+    },
+  };
+}
+
+// Cast a mockStdin() to the injectable param type (it only needs `.on`).
+function asStdin(stub: ReturnType<typeof mockStdin>): Pick<NodeJS.ReadStream, 'on'> {
+  return stub as unknown as Pick<NodeJS.ReadStream, 'on'>;
+}
+
+// Flush the async cleanup().then(process.exit) chain — two setImmediate ticks,
+// matching the existing exit-code tests below.
+async function flushExitChain(): Promise<void> {
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+}
+
 describe('registerShutdownHandler', () => {
   let processOnSpy: ReturnType<typeof vi.spyOn>;
 
@@ -386,6 +420,172 @@ describe('registerShutdownHandler', () => {
       await new Promise(resolve => setImmediate(resolve));
 
       expect(exitSpy).toHaveBeenCalledWith(0);
+    });
+  });
+
+  describe('MCP stdin-close graceful-deregister (macf#627)', () => {
+    // The channel-server is the Claude TUI's MCP stdio child: a normal TUI exit
+    // delivers NO SIGTERM/SIGINT to this process — only stdin EOF. These tests
+    // assert the stdin 'end'/'close' wiring deregisters, and that the once-guard
+    // keeps it at exactly one deregister across racing triggers. The handler
+    // calls process.exit, so it is mocked here (same as the exit-code block).
+    let exitSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      exitSpy = vi.spyOn(process, 'exit').mockImplementation(
+        (() => { /* noop */ }) as never,
+      );
+    });
+
+    afterEach(() => {
+      exitSpy.mockRestore();
+    });
+
+    it('wires both "end" and "close" listeners on the injected stdin', () => {
+      const stdin = mockStdin();
+
+      registerShutdownHandler({
+        agentName: 'test-agent',
+        registry: mockRegistry(),
+        instanceId: INSTANCE_ID,
+        httpsServer: mockServer(),
+        logger: mockLogger(),
+        stdin: asStdin(stdin),
+      });
+
+      const events = stdin.on.mock.calls.map(c => c[0]);
+      expect(events).toContain('end');
+      expect(events).toContain('close');
+    });
+
+    it('stdin "end" (parent TUI exit) deregisters the slot exactly once', async () => {
+      const registry = mockRegistry();
+      const server = mockServer();
+      const stdin = mockStdin();
+
+      registerShutdownHandler({
+        agentName: 'test-agent',
+        registry,
+        instanceId: INSTANCE_ID,
+        httpsServer: server,
+        logger: mockLogger(),
+        stdin: asStdin(stdin),
+      });
+
+      stdin.emit('end');
+      await flushExitChain();
+
+      expect(registry.deregisterConditional).toHaveBeenCalledTimes(1);
+      // Same instance-id-guarded deregister as the signal path.
+      expect(registry.deregisterConditional).toHaveBeenCalledWith('test-agent', INSTANCE_ID);
+      expect(server.stop).toHaveBeenCalledOnce();
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    });
+
+    it('stdin "close" also triggers the deregister', async () => {
+      const registry = mockRegistry();
+      const stdin = mockStdin();
+
+      registerShutdownHandler({
+        agentName: 'test-agent',
+        registry,
+        instanceId: INSTANCE_ID,
+        httpsServer: mockServer(),
+        logger: mockLogger(),
+        stdin: asStdin(stdin),
+      });
+
+      stdin.emit('close');
+      await flushExitChain();
+
+      expect(registry.deregisterConditional).toHaveBeenCalledTimes(1);
+    });
+
+    it('"end" then "close" runs the deregister once (once-guard across stdin events)', async () => {
+      const registry = mockRegistry();
+      const stdin = mockStdin();
+
+      registerShutdownHandler({
+        agentName: 'test-agent',
+        registry,
+        instanceId: INSTANCE_ID,
+        httpsServer: mockServer(),
+        logger: mockLogger(),
+        stdin: asStdin(stdin),
+      });
+
+      stdin.emit('end');
+      stdin.emit('close');
+      await flushExitChain();
+
+      expect(registry.deregisterConditional).toHaveBeenCalledTimes(1);
+    });
+
+    it('a stdin-close racing a SIGTERM runs the deregister exactly once', async () => {
+      const registry = mockRegistry();
+      const stdin = mockStdin();
+
+      registerShutdownHandler({
+        agentName: 'test-agent',
+        registry,
+        instanceId: INSTANCE_ID,
+        httpsServer: mockServer(),
+        logger: mockLogger(),
+        stdin: asStdin(stdin),
+      });
+
+      // stdin EOF arrives, then a SIGTERM races in before cleanup completes.
+      stdin.emit('end');
+      const sigtermCall = processOnSpy.mock.calls.find(c => c[0] === 'SIGTERM')!;
+      (sigtermCall[1] as () => void)();
+      await flushExitChain();
+
+      expect(registry.deregisterConditional).toHaveBeenCalledTimes(1);
+    });
+
+    it('records the mcp-stdin-close trigger in shutdown_start', async () => {
+      const logger = mockLogger();
+      const stdin = mockStdin();
+
+      registerShutdownHandler({
+        agentName: 'test-agent',
+        registry: mockRegistry(),
+        instanceId: INSTANCE_ID,
+        httpsServer: mockServer(),
+        logger,
+        stdin: asStdin(stdin),
+      });
+
+      stdin.emit('end');
+      await flushExitChain();
+
+      expect(logger.info).toHaveBeenCalledWith(
+        'shutdown_start',
+        expect.objectContaining({ trigger: 'mcp-stdin-close' }),
+      );
+    });
+
+    it('defaults to process.stdin when no stdin is injected (does not throw)', () => {
+      // Guard against a regression where the default `config.stdin ?? process.stdin`
+      // path is dropped — registration must still wire stdin listeners on the real
+      // process.stdin without error. Spy so we don't leave real listeners behind.
+      const stdinOnSpy = vi.spyOn(process.stdin, 'on').mockReturnValue(process.stdin);
+
+      expect(() =>
+        registerShutdownHandler({
+          agentName: 'test-agent',
+          registry: mockRegistry(),
+          instanceId: INSTANCE_ID,
+          httpsServer: mockServer(),
+          logger: mockLogger(),
+        }),
+      ).not.toThrow();
+
+      const events = stdinOnSpy.mock.calls.map(c => c[0]);
+      expect(events).toContain('end');
+      expect(events).toContain('close');
+
+      stdinOnSpy.mockRestore();
     });
   });
 });
