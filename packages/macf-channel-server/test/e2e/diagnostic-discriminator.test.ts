@@ -199,7 +199,9 @@ describe('POST /notify — DR-030 §6 diagnostic discriminator (macf#568)', () =
     const res = await httpsRequest(actualPort, {
       method: 'POST',
       path: '/notify',
-      body: JSON.stringify({ type: 'mention', diagnostic: false, message: 'real ping' }),
+      // issue_number anchor so the mention validates (macf#616); diagnostic:false
+      // must still take the real delivery path, not the probe short-circuit.
+      body: JSON.stringify({ type: 'mention', diagnostic: false, issue_number: 42, message: 'real ping' }),
       headers: { 'Content-Type': 'application/json' },
     });
 
