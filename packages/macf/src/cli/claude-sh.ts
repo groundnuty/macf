@@ -188,6 +188,90 @@ function tmuxSelfWrapLines(): string[] {
 }
 
 /**
+ * Emit the channel-notifications enablement block (macf#632).
+ *
+ * Claude Code v2.1.80+ gates the MCP "channel notifications" push — the async
+ * surface that delivers routed coordination notifications to the agent — behind
+ * a launch flag. Without it the macf-agent MCP server logs `"Channel
+ * notifications skipped: server plugin:macf-agent:macf-agent not in --channels
+ * list for this session"` and every routed ping is silently dropped (the
+ * fleet-wide failure mode this block fixes).
+ *
+ * The flag value is the DEV form `--dangerously-load-development-channels
+ * server:macf-agent`, NOT plain `--channels plugin:macf-agent:macf-agent`: the
+ * `--plugin-dir`-mounted macf-agent plugin (DR-013) is not on Anthropic's
+ * curated channel allowlist, so the curated `--channels` flag rejects it; the
+ * development-channels dev-flag is the only form that accepts a non-allowlisted
+ * plugin server. Verified empirically against claude 2.1.195.
+ *
+ * The generated block sets `MACF_CHANNELS_ARGS` (expanded UNQUOTED into the
+ * `exec claude` line so the two-token flag word-splits into two argv entries)
+ * with three escape hatches, in priority order:
+ *   - MACF_CHANNELS_DISABLED=1 → empty (no flag); sister to MACF_OTEL_DISABLED.
+ *   - a preset MACF_CHANNELS_ARGS in the env → respected verbatim (operator
+ *     override; also bypasses the version gate — the operator owns the value).
+ *   - else → the canonical dev-flag, GATED on Claude Code >= 2.1.80.
+ *
+ * Version gate: on a Claude Code older than 2.1.80 (or an unparseable version),
+ * the block leaves MACF_CHANNELS_ARGS empty and warns LOUDLY to stderr that
+ * channel notifications are unavailable + that an update is needed — rather than
+ * passing a flag the older binary would reject and fail the launch on. A parse
+ * failure never aborts the launch (warn + proceed).
+ *
+ * Placed AFTER the tmux self-wrap so only the in-tmux (inner) invocation runs
+ * `claude --version`; the outer pre-wrap invocation is replaced by `exec tmux`
+ * before reaching here.
+ */
+function channelNotificationsLines(): string[] {
+  return [
+    '',
+    '# Channel notifications enablement (macf#632). Claude Code v2.1.80+ gates',
+    '# the MCP channel-notification push (routed-coordination delivery) behind a',
+    '# launch flag; without it the macf-agent MCP server logs "Channel',
+    '# notifications skipped: ... not in --channels list" and routed pings are',
+    "# silently dropped. The dev-flag form is required because the --plugin-dir",
+    "# macf-agent plugin is not on Anthropic's curated channel allowlist.",
+    '#',
+    '# Escape hatches (priority order): MACF_CHANNELS_DISABLED=1 omits the flag;',
+    '# a preset MACF_CHANNELS_ARGS is respected verbatim (and bypasses the',
+    '# version gate); else the canonical dev-flag gated on Claude Code >= 2.1.80.',
+    '#',
+    '# $MACF_CHANNELS_ARGS is expanded UNQUOTED in the exec line below so the',
+    '# two-token flag word-splits into two argv entries.',
+    '',
+    '# Parse the running Claude Code version (X.Y.Z) for the >= 2.1.80 gate. An',
+    '# unparseable/absent version is treated as old (flag left off + loud warn).',
+    "macf_cc_ver=\"$(claude --version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -n1 || true)\"",
+    'macf_channels_supported=0',
+    'if [ -n "$macf_cc_ver" ]; then',
+    '  macf_cc_major="${macf_cc_ver%%.*}"',
+    '  macf_cc_rest="${macf_cc_ver#*.}"',
+    '  macf_cc_minor="${macf_cc_rest%%.*}"',
+    '  macf_cc_patch="${macf_cc_ver##*.}"',
+    '  if [ "${macf_cc_major:-0}" -gt 2 ] \\',
+    '     || { [ "${macf_cc_major:-0}" -eq 2 ] && [ "${macf_cc_minor:-0}" -gt 1 ]; } \\',
+    '     || { [ "${macf_cc_major:-0}" -eq 2 ] && [ "${macf_cc_minor:-0}" -eq 1 ] && [ "${macf_cc_patch:-0}" -ge 80 ]; }; then',
+    '    macf_channels_supported=1',
+    '  fi',
+    'fi',
+    '',
+    'if [ "${MACF_CHANNELS_DISABLED:-}" = "1" ]; then',
+    '  MACF_CHANNELS_ARGS=""',
+    'elif [ -n "${MACF_CHANNELS_ARGS:-}" ]; then',
+    '  : # operator-supplied override — respect it verbatim (version gate bypassed)',
+    'elif [ "$macf_channels_supported" = "1" ]; then',
+    '  MACF_CHANNELS_ARGS="--dangerously-load-development-channels server:macf-agent"',
+    'else',
+    '  MACF_CHANNELS_ARGS=""',
+    '  echo "WARNING (macf#632): Claude Code ${macf_cc_ver:-<unknown>} is older than 2.1.80" >&2',
+    '  echo "WARNING: (or its version was unparseable) — MACF channel notifications are" >&2',
+    '  echo "WARNING: UNAVAILABLE this session; routed issues/PRs/mentions will be SILENTLY" >&2',
+    '  echo "WARNING: dropped. Update Claude Code to >= 2.1.80 to enable them (macf#632/#633)." >&2',
+    'fi',
+  ];
+}
+
+/**
  * Emit the Claude Code native OTEL telemetry env block into the
  * generated `claude.sh`. Three mandatory gates per Claude Code docs
  * — missing any one of them → zero traces emit:
@@ -590,7 +674,16 @@ export function generateClaudeSh(config: MacfAgentConfig): string {
     'export MACF_HOST="0.0.0.0"',
     `export MACF_ADVERTISE_HOST="${config.advertise_host ?? '127.0.0.1'}"`,
     'export MACF_DEBUG="${MACF_DEBUG:-false}"',
+    '',
+    "# macf#632: the channel-server's native log path — its forensic trail. The",
+    '# comms-ledger + turn-receipt sink are siblings derived from it, and the',
+    '# channel-server reads MACF_LOG_PATH via @groundnuty/macf-core config. For a',
+    "# fully macf-init'd workspace env.certs already exports this (sourced above),",
+    '# so the ${VAR:-default} form preserves that value and only supplies a',
+    '# default for an older/partial workspace whose env.certs predates the var.',
+    'export MACF_LOG_PATH="${MACF_LOG_PATH:-$SCRIPT_DIR/.claude/.macf/channel.log}"',
     ...tmuxSelfWrapLines(),
+    ...channelNotificationsLines(),
     '',
     // --plugin-dir loads the pinned macf-agent plugin from this workspace
     // (per DR-013). Additive — user-scope plugins still load alongside.
@@ -610,14 +703,19 @@ export function generateClaudeSh(config: MacfAgentConfig): string {
     // exits non-zero immediately and the launch dies with no agent. The
     // resume attempt isn't `exec`'d so the `||` fallback can fire; the
     // fallback IS `exec`'d (terminal). CV-migration dogfooding finding #6.
+    // $MACF_CHANNELS_ARGS is expanded UNQUOTED (channelNotificationsLines above
+    // set it) so the two-token `--dangerously-load-development-channels
+    // server:macf-agent` flag word-splits into two argv entries; an empty value
+    // (opt-out / old claude) expands to nothing. SC2086 is intentional here.
+    '# shellcheck disable=SC2086',
     'if [ -n "${MACF_TEST:-}" ]; then',
-    '  exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"',
+    '  exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@"',
     'else',
     ...(resumeFlags(config).length > 0
       ? [
-          `  claude ${resumeFlags(config).join(' ')} --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@" || exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"`,
+          `  claude ${resumeFlags(config).join(' ')} --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@" || exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@"`,
         ]
-      : ['  exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"']),
+      : ['  exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@"']),
     'fi',
     '',
   ].join('\n');
