@@ -150,26 +150,43 @@ export function evaluateSelfSkip(
   return { ok: true };
 }
 
+/** Session-name check tri-state (DR-032 #610): present+match / present+stale / absent. */
+export type SessionStatus = 'ok' | 'warn' | 'absent';
+
 /**
- * Session-name drift (#? Stage-2 fallback). The CONVENTION check: `tmux_session`
- * must equal `<project>@<label>`. This is a STATIC convention check — it proves the
- * config follows the canonical naming, NOT that it matches the LIVE tmux session
- * (a runtime fact this command can't see). Stated in the legend.
+ * Session-name drift (DR-032 §6th-surface amendment, #601 / #610). The CONVENTION
+ * check: `agent-config.json:tmux_session` should equal `<project>@<name>` — keyed on
+ * `name` (= `MACF_AGENT_NAME`, what `claude.sh` actually self-wraps per
+ * `claude-sh.ts`), NOT the routing-label (equal under the convention; they diverge
+ * only in the #538 escape-hatch, where the session follows `name`). This is a STATIC
+ * convention check — it proves the config follows the canonical naming, NOT that it
+ * matches the LIVE tmux session (a runtime fact this command can't see).
+ *
+ * Tri-state, and deliberately NOT a verdict-failing check:
+ *  - `absent` — no `tmux_session` (or no `agent-config.json` at all). ASSERT-IF-PRESENT:
+ *               agent-config.json was the Stage-2 SSH-router's target list and is
+ *               vestigial on v3 channel agents, so its absence is a PASS, not a fault.
+ *  - `ok`     — present and matches `<project>@<name>`.
+ *  - `warn`   — present but stale. The known-pending DR-032 session-rename migration;
+ *               WARN-not-FAIL — it stays VISIBLE but does NOT drive DEGRADED/exit-1
+ *               (else the DR-006 watchdog false-restarts on a gated step).
  */
 export function evaluateSession(
-  label: string,
+  name: string,
   tmuxSession: string | undefined,
   project: string,
-): { readonly ok: boolean; readonly expected: string; readonly reason?: string } {
-  const expected = `${project}@${label}`;
+): { readonly status: SessionStatus; readonly expected: string; readonly reason?: string } {
+  const expected = `${project}@${name}`;
   if (!tmuxSession || tmuxSession.trim() === '') {
-    return { ok: false, expected, reason: 'tmux_session missing' };
+    return { status: 'absent', expected };
   }
-  if (tmuxSession === expected) return { ok: true, expected };
+  if (tmuxSession === expected) return { status: 'ok', expected };
   return {
-    ok: false,
+    status: 'warn',
     expected,
-    reason: `tmux_session "${tmuxSession}" != "${expected}" (<project>@<agent> convention)`,
+    reason:
+      `tmux_session "${tmuxSession}" != "${expected}" (<project>@<name> convention; ` +
+      `WARN-not-FAIL pending the DR-032 session-rename migration)`,
   };
 }
 
@@ -259,7 +276,13 @@ export interface AgentRow {
   readonly routable: boolean;
   readonly selfSkipOk: boolean;
   readonly selfSkipReason?: string;
+  /**
+   * Back-compat boolean (schema_version:1): `true` for `ok` + `absent`, `false` for
+   * the stale `warn`. No longer drives the verdict — see `sessionStatus` (DR-032 #610).
+   */
   readonly sessionOk: boolean;
+  /** Tri-state session check (DR-032 #610): `ok` (match) / `warn` (stale drift, non-fatal) / `absent` (vestigial on v3). */
+  readonly sessionStatus: SessionStatus;
   readonly sessionExpected: string;
   readonly sessionReason?: string;
   readonly freshness: FreshnessState;
@@ -341,6 +364,8 @@ export async function gatherRoutingDoctor(deps: RoutingDoctorDeps): Promise<Rout
     const routable = info !== null;
 
     const selfSkip = evaluateSelfSkip(label, entry.app_name, deps.botLogins?.[label]);
+    // The agent-config key IS the `name` (= routing-label under the DR-032 convention,
+    // #601); they diverge only in the #538 escape-hatch, where the session follows name.
     const session = evaluateSession(label, entry.tmux_session, deps.project);
 
     let freshness: FreshnessState = 'unregistered';
@@ -358,7 +383,11 @@ export async function gatherRoutingDoctor(deps: RoutingDoctorDeps): Promise<Rout
       routable,
       selfSkipOk: selfSkip.ok,
       selfSkipReason: selfSkip.reason,
-      sessionOk: session.ok,
+      // `session` is tri-state (DR-032 #610). `sessionOk` stays for back-compat (true
+      // for `ok` + `absent`, false for the stale `warn`) but no longer drives the
+      // verdict — the drift surfaces via `sessionStatus` + the `warnings[]` channel.
+      sessionOk: session.status !== 'warn',
+      sessionStatus: session.status,
       sessionExpected: session.expected,
       sessionReason: session.reason,
       freshness,
@@ -382,13 +411,23 @@ function freshnessFails(s: FreshnessState): boolean {
   return s === 'stale';
 }
 
+/**
+ * Whether an agent's ROUTING-PLANE checks pass — the single predicate the verdict,
+ * the summary line, and the JSON `agents_routing_ok` all share. The SESSION-name
+ * drift is deliberately EXCLUDED (DR-032 §6th-surface amendment, #610): a stale
+ * `agent-config.json:tmux_session` is the known-pending session-rename migration —
+ * WARN-not-FAIL, so it must NOT flip the verdict (it is surfaced via `sessionStatus`
+ * + the `warnings[]` channel instead).
+ */
+function agentRoutingOk(a: AgentRow): boolean {
+  return a.routable && a.selfSkipOk && !freshnessFails(a.freshness);
+}
+
 export function routingVerdict(report: RoutingDoctorReport): RoutingVerdict {
   if (report.repoPins.length === 0 && report.agents.length === 0) return 'EMPTY';
   const participating = report.repoPins.filter((r) => r.consistent !== null);
   const pinFail = participating.some((r) => !r.consistent);
-  const agentFail = report.agents.some(
-    (a) => !a.routable || !a.selfSkipOk || !a.sessionOk || (a.routable && freshnessFails(a.freshness)),
-  );
+  const agentFail = report.agents.some((a) => !agentRoutingOk(a));
   const caFail = !report.ca.present || !report.ca.valid;
   return pinFail || agentFail || caFail ? 'DEGRADED' : 'HEALTHY';
 }
@@ -397,9 +436,7 @@ export function routingVerdict(report: RoutingDoctorReport): RoutingVerdict {
 export function summaryLine(report: RoutingDoctorReport): string {
   const participating = report.repoPins.filter((r) => r.consistent !== null);
   const pinsOk = participating.length > 0 && participating.every((r) => r.consistent);
-  const agentOk = report.agents.filter(
-    (a) => a.routable && a.selfSkipOk && a.sessionOk && !freshnessFails(a.freshness),
-  ).length;
+  const agentOk = report.agents.filter(agentRoutingOk).length;
   const pinClause =
     participating.length > 0
       ? `${participating.length} routing repo(s) (${pinsOk ? 'pins consistent' : 'PIN DIVERGENCE'})`
@@ -408,6 +445,26 @@ export function summaryLine(report: RoutingDoctorReport): string {
     `${pinClause}; ${agentOk}/${report.agents.length} agents routing-OK; ` +
     `CA ${report.ca.valid ? '✓' : '✗'}; routing plane: ${routingVerdict(report)}`
   );
+}
+
+/**
+ * Non-verdict-driving observations the watchdog should still SEE (DR-032 #610).
+ * Currently: the session-name drift (`warn`) — visible, but it does NOT flip the
+ * verdict (the known-pending session-rename migration). Surfaced additively in the
+ * JSON `warnings[]` and the text-render warnings block.
+ */
+export function collectWarnings(report: RoutingDoctorReport): readonly string[] {
+  const out: string[] = [];
+  for (const a of report.agents) {
+    if (a.sessionStatus === 'warn') {
+      out.push(
+        a.sessionReason
+          ? `agent "${a.label}": ${a.sessionReason}`
+          : `agent "${a.label}": tmux_session drift (expected "${a.sessionExpected}")`,
+      );
+    }
+  }
+  return out;
 }
 
 // --- Render ---
@@ -420,6 +477,18 @@ function boolGlyph(ok: boolean): string {
 export function pinGlyph(consistent: boolean | null): string {
   if (consistent === null) return '— n/a';
   return consistent ? '✓' : '✗';
+}
+
+/** Session status → glyph: ok ✓, warn ⚠ (non-fatal drift), absent — (assert-if-present PASS). */
+export function sessionGlyph(s: SessionStatus): string {
+  switch (s) {
+    case 'ok':
+      return '✓';
+    case 'warn':
+      return '⚠ warn';
+    case 'absent':
+      return '—';
+  }
 }
 
 /** Freshness → short glyph: fresh ✓, stale ✗, unreachable/unknown ?, unregistered —. */
@@ -450,7 +519,7 @@ export function buildAgentRows(rows: readonly AgentRow[]): readonly (readonly st
     a.label,
     boolGlyph(a.routable),
     boolGlyph(a.selfSkipOk),
-    boolGlyph(a.sessionOk),
+    sessionGlyph(a.sessionStatus),
     freshnessGlyph(a.freshness),
   ]);
 }
@@ -472,9 +541,10 @@ export const HONESTY_LEGEND = [
   'Legend: CALLER-PIN = the macf-actions @version each routing repo pins (must all match).',
   '        ROUTABLE = a MACF_AGENT_<LABEL> registry key exists (router resolves by LABEL).',
   '        SELF-SKIP = agent-config.json app_name is the bot-LOGIN, not the bare label (#566).',
-  '        SESSION = tmux_session follows the <project>@<agent> convention (a STATIC convention',
-  '                  check, NOT a match against the live tmux session).  FRESH = registry',
-  '                  instance_id == live /health instance_id (✗ stale / ? unreachable-or-unknown).',
+  '        SESSION = agent-config.json tmux_session follows <project>@<name> (assert-IF-PRESENT:',
+  '                  absent = PASS, vestigial on v3; ⚠ warn = stale drift, WARN-not-FAIL — visible',
+  '                  but does NOT drive the verdict, the known-pending DR-032 session-rename).',
+  '                  FRESH = registry instance_id == live /health instance_id (✗ stale / ? unreach).',
   'NOTE: these are STATIC GitHub-plane checks — they prove the routing PLUMBING is wired right,',
   '      NOT that a message was delivered end-to-end (that is `macf routing doctor --e2e`, a',
   '      later increment). Mesh delivery is `macf fleet doctor`.',
@@ -508,11 +578,12 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       pins_consistent: participating.length > 0 && participating.every((r) => r.consistent),
       expected_pin: report.expectedPin,
       agents_total: report.agents.length,
-      agents_routing_ok: report.agents.filter(
-        (a) => a.routable && a.selfSkipOk && a.sessionOk && !freshnessFails(a.freshness),
-      ).length,
+      agents_routing_ok: report.agents.filter(agentRoutingOk).length,
       ca_ok: report.ca.present && report.ca.valid,
     },
+    // Additive (schema_version:1, DR-032 #610): non-verdict-driving observations the
+    // watchdog should still SEE — currently the session-name drift (WARN-not-FAIL).
+    warnings: collectWarnings(report),
     caller_pins: report.repoPins.map((r) => ({
       repo: r.repo,
       pin: r.pin,
@@ -527,6 +598,7 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       self_skip_ok: a.selfSkipOk,
       self_skip_reason: a.selfSkipReason ?? null,
       session_ok: a.sessionOk,
+      session_status: a.sessionStatus,
       session_expected: a.sessionExpected,
       session_reason: a.sessionReason ?? null,
       freshness: a.freshness,
@@ -678,6 +750,13 @@ export async function runRoutingDoctor(
     console.log('');
   } else {
     console.log('Per-agent routing checks: no .github/agent-config.json found for this project.\n');
+  }
+
+  const warnings = collectWarnings(report);
+  if (warnings.length > 0) {
+    console.log('Warnings (non-fatal — do NOT drive the verdict):');
+    for (const w of warnings) console.log(`  ⚠ ${w}`);
+    console.log('');
   }
 
   console.log(
