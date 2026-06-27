@@ -13,13 +13,17 @@
  *                              `uses: groundnuty/macf-actions/...@<pin>` line.
  *   - `readRoutingConfigGh`  — a repo's `.github/agent-config.json` (the router's
  *                              per-label config), via the GitHub contents API.
+ *   - `readFleetMarker`      — a repo's `.github/macf-fleet.json` opt-OUT marker
+ *                              (#614): a pinned repo declares itself non-fleet here so
+ *                              it is excluded from `pins_consistent`. Self-declaration
+ *                              that lives WITH the repo — no central allowlist.
  *
  * The token is forwarded as `GH_TOKEN` in the subprocess env (the house auth
  * posture); none of these has a write path.
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { CallerPinResult, RoutingConfig } from './routing-doctor.js';
+import type { CallerPinResult, FleetMarker, RoutingConfig } from './routing-doctor.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -111,6 +115,33 @@ export function createRoutingConfigGhReader(
       );
       const parsed = JSON.parse(decodeGhContent(stdout)) as RoutingConfig;
       if (!parsed || typeof parsed !== 'object' || typeof parsed.agents !== 'object') return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  };
+}
+
+/**
+ * Read one repo's `.github/macf-fleet.json` opt-OUT marker (#614) via the GitHub
+ * contents API. Returns the parsed marker, or `null` (absent / unreadable / malformed
+ * — all of which mean "no opt-out" → the repo stays a fleet member per `isFleetMember`,
+ * the safe over-checking direction). A 404 (no marker file) is the overwhelmingly common
+ * case. NEVER throws.
+ */
+export function createFleetMarkerReader(
+  token: string,
+): (repo: string) => Promise<FleetMarker | null> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo: string): Promise<FleetMarker | null> => {
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['api', `repos/${repo}/contents/.github/macf-fleet.json`, '--jq', '.content'],
+        { encoding: 'utf-8', env, maxBuffer: 1 * 1024 * 1024 },
+      );
+      const parsed = JSON.parse(decodeGhContent(stdout)) as FleetMarker;
+      if (!parsed || typeof parsed !== 'object') return null;
       return parsed;
     } catch {
       return null;
