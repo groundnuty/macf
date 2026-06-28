@@ -134,6 +134,16 @@ Supervision + routing target **VM + Kubernetes** — the two substrates where an
 3. Single per-host watchdog vs. mutual/redundant (lean: single per-host v1; the watchdog self-heartbeat + Tier-3 terminates the who-watches regress at the operator).
 4. Generate-at-init vs. detect-at-runtime for the prelude's toolchain backend.
 
+## Amendment (2026-06-28, `macf#642`/#643) — the stdio-coupling death mode: HEAL detects + relaunches; whether that's the full fix or a stopgap is the open question the `#642` reproduction decides
+
+A death mode this supervision model **detects + relaunches**: the channel-server is a **stdio MCP child of Claude Code**, so its survival is coupled to the main agent's activity — under heavy main-thread load CC stops servicing the stdio pipe, deems the connection dead, and kills the child, which is **never auto-respawned** (observed 2026-06-28: code-agent's server died silently at 7.4 h under ~880k-token load; science's *idle* server ran 9.5 h — the activity differential is the diagnosis).
+
+- **Detection is covered.** The liveness probe (mTLS `/health` reachability) catches "channel-server dead, main agent alive" → the reconciler HEALs (relaunch). No new detection needed — exactly the deaf-but-up case the floor exists for. This HEAL is a correct backstop **regardless** of the root cause.
+- **Whether HEAL is the full fix or a stopgap is OPEN, pending the `#642` reproduction** (verify-before-claim — do not assert mechanism-as-fact). If the death is the **child blocking its own event loop** (sync ops), the chosen **harden-the-stdio-child** path (`#642`/#643: forensic log + crash handlers + async-responsiveness) is a **full fix** and HEAL is belt-and-suspenders. If CC **starves the pipe regardless** of child responsiveness, hardening is mitigation and the transport revisit (Path B) leads.
+- **Chosen direction (operator, 2026-06-28): harden the stdio child, NOT re-architect the transport.** Verbatim: *"I prefer 'CC spawns + owns it as a child'… first let's harden it and not make it more complicated."* **Path B (HTTP/SSE standalone service) was considered + DROPPED on complexity**; it's the leading revisit IF the reproduction shows hardening insufficient. Tracked in **DR-022 Amendment P**.
+
+So the honest layering: **supervision (this DR) keeps the agent reachable by relaunching a dead server (always correct); the chosen harden-stdio work (`#642`/#643) aims to stop it dying — and the reproduction decides whether that suffices or a transport change is also needed.** The B-vs-harden final call is the operator's.
+
 ## References
 
 DR-030 (interconnect detection — the sibling) · DR-026 F4 (`macf monitor` — the reasoning layer above) · DR-029 (substrate config + the launcher-template `host-prelude` slot + the `versions` block) · DR-005/DR-006 (registration + registry scope) · silent-fallback-hazards Instance 3 (RC-bound tmux send-keys) + the liveness application of the class · `macf#553` (collision / graceful-deregister / TTL) · `macf#556` (dead-vs-alive `/health` / `registry prune`) · `macf#560`/DR-030 (`--json` = the watchdog's input contract) · `macf-devops-toolkit#115` (the design session + §10 cron-prelude empirics + §6 why-not-systemd) · the forthcoming devops-toolkit implementation DR.
