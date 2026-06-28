@@ -4,6 +4,25 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.42] — 2026-06-28
+
+**Channel-server crash diagnostics** — the reliability foundation for the
+stdio-lifecycle-coupling death mode surfaced on the live fleet (a channel-server
+that dies silently mid-session under heavy main-agent activity, with no trail).
+Makes the next death self-diagnosable so the root cause (harden-vs-decouple) can
+be settled with data, not speculation. Transport-independent; additive.
+
+### reliability
+
+- **#642 / #643** — guaranteed **file-based forensic log**: the channel-server
+  now defaults `MACF_LOG_PATH` itself when the launcher omits it (stderr is the
+  channel that starves under load, so a file trail is load-bearing) +
+  top-level `uncaughtException` / `unhandledRejection` handlers (log to file
+  **and** stderr → timeout-bounded graceful deregister → `exit(1)`;
+  re-entrancy-guarded; early-startup-crash-safe) + lifecycle/exit logging + a
+  60s `unref()`'d alive-tick (its last line pinpoints the death moment) + a
+  `/notify` boundary catch. The next channel-server death records its own cause.
+
 ## [0.2.41] — 2026-06-27
 
 **Re-cut of 0.2.40** — the 0.2.40 npm publish hit a transient sigstore

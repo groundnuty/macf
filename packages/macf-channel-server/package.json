@@ -1,6 +1,6 @@
 {
   "name": "@groundnuty/macf-channel-server",
-  "version": "0.2.41",
+  "version": "0.2.42",
   "description": "MCP channel server for the Multi-Agent Coordination Framework. HTTPS + mTLS endpoint agents connect to for inter-agent messaging (notify), CI-completion routing, and /sign certificate issuance. Invoked by Claude Code's plugin via `npx -y @groundnuty/macf-channel-server` per DR-022.",
   "type": "module",
   "main": "dist/index.js",
@@ -33,7 +33,7 @@
     "test:integration": "vitest run --config vitest.integration.config.ts"
   },
   "dependencies": {
-    "@groundnuty/macf-core": "0.2.41",
+    "@groundnuty/macf-core": "0.2.42",
     "@modelcontextprotocol/sdk": "~1.29.0",
     "@opentelemetry/api": "1.9.1",
     "@opentelemetry/core": "2.7.0",
