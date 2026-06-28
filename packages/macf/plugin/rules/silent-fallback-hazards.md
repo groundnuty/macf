@@ -52,7 +52,7 @@ This is a distinct sub-case from the missing-helper / mis-pipefail / wrong-prefi
 **Recurrence:** Cross-agent triangulated; 2+ confirmed firings on real routes hours apart, same shape.
 **Defense status:** Two-tier per fleet class:
 - **Consumer fleet** (CV agents, tester agents, future macf-init'd consumers): largely mitigated, not fully eliminated. The routed **message** arrives via the channel-server's HTTP/MCP path (not as a keystroke), so the prompt *content* reaches the agent regardless of RC state — that's the structural win over send-keys routing (DR-020 / macf-actions v3+). The **residual**: the channel-server's `wakeViaTmux` nudge still uses send-keys, so under RC-bound input the auto-wake keystroke may not land — the message sits in the MCP channel until the agent next reads it, rather than being lost. So the hazard is reduced to a wake-latency issue, not a content-drop.
-- **Substrate fleet** (workspaces operated as the design surface, not registered MACF consumers): permanent operational reality — substrate workspaces don't run `macf init`. Defensive posture: rule-discipline + Pattern C fragility detector (`tmux display -p '#{session_activity}'` doesn't advance under RC-bound input).
+- **Substrate fleet** (workspaces operated as the design surface, not registered MACF consumers): permanent operational reality — substrate workspaces don't run `macf init`. Defensive posture: rule-discipline + Pattern C fragility detector (capture-pane content-diff over a window — NOT `#{session_activity}`, which doesn't reliably advance on agent activity; see Pattern C's 2026-06-28 correction).
 
 The content-drop is retired for the consumer fleet (message arrives via HTTP/MCP); only the wake-nudge residual remains there. The substrate fleet expects full Instance 3 firings to recur on routes indefinitely; rule-discipline catches the failure at observation time, not pre-emptively.
 
@@ -315,16 +315,18 @@ gh ...
 
 ### Pattern C — Heartbeat / activity invariant
 
-For routing-style operations, check that recipient state advanced post-delivery:
+For routing-style operations, check that recipient pane state advanced post-delivery — by **content-diffing the captured pane**, NOT via `#{session_activity}`:
 
 ```bash
-# tmux send-keys + check session_activity advanced (Remote Control IPC detector)
-PRE=$(tmux display -p -t $SESSION '#{session_activity}')
+# tmux send-keys + check the pane CONTENT changed (Remote Control IPC detector)
+PRE=$(tmux capture-pane -t $SESSION -p | md5sum)
 tmux send-keys -t $SESSION "..." Enter
 sleep 2
-POST=$(tmux display -p -t $SESSION '#{session_activity}')
-[ "$POST" -gt "$PRE" ] || { echo "WARNING: tmux activity didn't advance — RC-bound?"; }
+POST=$(tmux capture-pane -t $SESSION -p | md5sum)
+[ "$PRE" != "$POST" ] || { echo "WARNING: pane content didn't change — RC-bound / not processing?"; }
 ```
+
+> **⚠️ `#{session_activity}` is NOT a reliable activity/liveness signal — verified-corrected 2026-06-28 (`macf#645`).** A controlled test (detached session, 5 s of pure streaming output, no input) found `session_activity` **stayed stable** — it does **not** advance on an output-busy agent (spinner / streaming / tool-renders), and in that test did not advance on a `send-keys` either (likely a detached-session quirk; the precise input/output trigger is murky). The firm, verified conclusion: **`session_activity` cannot tell "working" from "dead" for an agent producing output**, so any "did it land / is it busy / did the prompt clear" check built on it **silently misclassifies a working agent**. **`capture-pane -p | md5sum` over a short window** detects real pane change (output OR echoed input) and is the correct primitive. This corrected a shipped Tier-2 aliveness-gate (`macf-devops-toolkit#128` / DR-031) that, on the old primitive, would have SIGTERM'd a streaming-busy agent it read as "not busy." Every place this catalog or a DR reaches for `session_activity` as an activity check should use the capture-pane content-diff instead.
 
 ### Pattern D — Precheck step at workflow / process entrypoint
 
