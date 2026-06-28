@@ -134,6 +134,16 @@ Supervision + routing target **VM + Kubernetes** — the two substrates where an
 3. Single per-host watchdog vs. mutual/redundant (lean: single per-host v1; the watchdog self-heartbeat + Tier-3 terminates the who-watches regress at the operator).
 4. Generate-at-init vs. detect-at-runtime for the prelude's toolchain backend.
 
+## Amendment (2026-06-28, `macf#642`/#643) — the stdio-coupling death mode: HEAL detects + mitigates, but the durable fix is Path B (not supervision)
+
+A death mode this supervision model **detects but cannot durably fix**: the channel-server is a **stdio MCP child of Claude Code**, so its survival is coupled to the main agent's activity — under heavy main-thread load CC stops servicing the stdio pipe, deems the connection dead, and kills the child, which is **never auto-respawned** (observed 2026-06-28: code-agent's server died silently at 7.4 h under ~880k-token load; science's *idle* server ran 9.5 h — the activity differential is the diagnosis).
+
+- **Detection is already covered.** The liveness probe (mTLS `/health` reachability) catches "channel-server dead, main agent alive" → the reconciler HEALs (relaunch). No new detection needed — this is exactly the deaf-but-up case the floor exists for.
+- **But HEAL here is mitigation, not a fix.** A relaunched **stdio** server dies again under the same load — so HEAL gives *bounded downtime*, not durability. The root cause is the transport's lifecycle-coupling, not anything the supervision floor can resolve by relaunching.
+- **The durable fix is Path B** — migrate the channel-server to an **HTTP/SSE MCP transport** (a separate long-lived process whose lifecycle is not bound to CC's stdio servicing), tracked in **DR-022 Amendment P** + `macf#642`/#643. `macf#643` (guaranteed file-based forensic log + top-level crash handlers) lands first so the stdio deaths are diagnosable and Path B is verifiable.
+
+So the layering is honest: **supervision (this DR) keeps the agent reachable by relaunching a dead server; the transport DR (DR-022 Path B) is what stops it dying in the first place.** Until Path B lands, expect the watchdog to HEAL stdio-starvation deaths on heavily-loaded agents as a recurring (but now bounded + diagnosable) event.
+
 ## References
 
 DR-030 (interconnect detection — the sibling) · DR-026 F4 (`macf monitor` — the reasoning layer above) · DR-029 (substrate config + the launcher-template `host-prelude` slot + the `versions` block) · DR-005/DR-006 (registration + registry scope) · silent-fallback-hazards Instance 3 (RC-bound tmux send-keys) + the liveness application of the class · `macf#553` (collision / graceful-deregister / TTL) · `macf#556` (dead-vs-alive `/health` / `registry prune`) · `macf#560`/DR-030 (`--json` = the watchdog's input contract) · `macf-devops-toolkit#115` (the design session + §10 cron-prelude empirics + §6 why-not-systemd) · the forthcoming devops-toolkit implementation DR.
