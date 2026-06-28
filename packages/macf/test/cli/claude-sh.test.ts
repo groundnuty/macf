@@ -379,11 +379,13 @@ describe('generateClaudeSh', () => {
   });
 
   describe('MACF_LOG_PATH forensic-log fallback (macf#632)', () => {
-    it('exports MACF_LOG_PATH with a ${VAR:-default} fallback (preserves env.certs value)', () => {
+    it('exports MACF_LOG_PATH with a ${VAR:-default} fallback to the agent HOME / XDG state, not the repo (macf#642)', () => {
       const output = generateClaudeSh(sampleConfig);
       expect(output).toContain(
-        'export MACF_LOG_PATH="${MACF_LOG_PATH:-$SCRIPT_DIR/.claude/.macf/channel.log}"',
+        'export MACF_LOG_PATH="${MACF_LOG_PATH:-${XDG_STATE_HOME:-$HOME/.local/state}/macf/TEST@code-agent/channel.log}"',
       );
+      // The fallback must NOT land the log cluster inside the repo/workspace.
+      expect(output).not.toContain('$SCRIPT_DIR/.claude/.macf/channel.log');
     });
 
     it('sets MACF_LOG_PATH AFTER the env.* source loop so env.certs wins when present', () => {

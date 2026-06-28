@@ -292,10 +292,13 @@ describe('generateEnvCerts', () => {
     );
   });
 
-  it('exports MACF_LOG_PATH', () => {
-    expect(generateEnvCerts(baseConfig)).toContain(
-      'export MACF_LOG_PATH="$SCRIPT_DIR/.macf/logs/channel.log"',
+  it('exports MACF_LOG_PATH under the agent HOME (XDG state), not the repo (macf#642)', () => {
+    const out = generateEnvCerts(baseConfig);
+    expect(out).toContain(
+      'export MACF_LOG_PATH="${XDG_STATE_HOME:-$HOME/.local/state}/macf/TEST@code-agent/channel.log"',
     );
+    // The log cluster must NOT live inside the workspace/repo anymore.
+    expect(out).not.toContain('$SCRIPT_DIR/.macf/logs/channel.log');
   });
 
   it('emits schema_version + managed-file header', () => {
