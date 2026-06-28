@@ -144,6 +144,20 @@ A death mode this supervision model **detects + relaunches**: the channel-server
 
 So the honest layering: **supervision (this DR) keeps the agent reachable by relaunching a dead server (always correct); the chosen harden-stdio work (`#642`/#643) aims to stop it dying — and the reproduction decides whether that suffices or a transport change is also needed.** The B-vs-harden final call is the operator's.
 
+## Amendment (2026-06-28, `macf#128` / `macf-devops-toolkit#128`) — the probe-target ≠ action-target gap: an aliveness-gate MUST precede Tier-2 restart
+
+A model sharpening the §"Tiered response" ladder needs, found by a live near-miss: **the liveness probe measures the *channel-server* (`/health` reachability), but Tier-2 restart acts on the *whole agent* (the TUI / tmux session).** These are different targets. So `reachable=false` has **two causes**, only one of which warrants a restart:
+1. the agent is genuinely dead → restart is correct; or
+2. the **channel-server died but the agent TUI is alive and working** (the `#642` stdio-starvation mode: CC starved the channel-server's pipe while the agent itself was mid-task).
+
+In case 2, a naive "`reachable=false` → restart" **SIGTERMs a working peer mid-task.** (Real near-miss, 2026-06-28: code-agent read `reachable=false` while actively working; only a pane capture revealed it was alive — a restart would have killed it.)
+
+**The fix (shipped — `macf-devops-toolkit#128`): an execute-time aliveness-gate before Tier-2.** Sample the agent's tmux pane `session_activity` over a short window; **if it advanced (agent busy) → ABORT the restart** (never apply a destructive recovery to a working agent); no-session → genuinely gone → restart proceeds. Held behind `--allow-restart` AND the gate (defense-in-depth). Fail-safe: a false-"busy" merely delays a needed restart (recoverable next sweep); a dead agent has no session → not busy → restart proceeds. (This reuses the silent-fallback Instance-3 `session_activity` primitive as an *aliveness* signal — inverse of its tmux-wake use.)
+
+**The constitutional refinement to §"Tiered response":** **never apply a destructive recovery (Tier-2 SIGTERM) to a working agent** — disambiguate the probe-target/action-target mismatch with an aliveness-gate first. Detection (the `/health` probe) is correct as-is; it is the *action* that must gate on a second, agent-level signal.
+
+**Residual (follow-on, ties to the `#642` harden work):** the **idle-AND-channel-dead** agent (TUI alive but idle, channel-server dead) reads not-busy → Tier-2 restarts the *whole TUI* to recover a dead *child* server — heavier than necessary. If the `#642`/#643 harden work makes the channel-server child independently restartable, prefer a **server-only restart** when the TUI is alive (gentler than a full agent restart); at minimum log the two cases distinctly (restart-alive-but-idle-to-recover-channel vs restart-dead-agent) so the forensic trail distinguishes a recovery from a crash. Increment-N, not blocking.
+
 ## References
 
 DR-030 (interconnect detection — the sibling) · DR-026 F4 (`macf monitor` — the reasoning layer above) · DR-029 (substrate config + the launcher-template `host-prelude` slot + the `versions` block) · DR-005/DR-006 (registration + registry scope) · silent-fallback-hazards Instance 3 (RC-bound tmux send-keys) + the liveness application of the class · `macf#553` (collision / graceful-deregister / TTL) · `macf#556` (dead-vs-alive `/health` / `registry prune`) · `macf#560`/DR-030 (`--json` = the watchdog's input contract) · `macf-devops-toolkit#115` (the design session + §10 cron-prelude empirics + §6 why-not-systemd) · the forthcoming devops-toolkit implementation DR.
