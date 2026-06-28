@@ -1,6 +1,6 @@
 # DR-032: Canonical agent naming convention — project / role / name / routing-label / handle
 
-**Status:** Proposed
+**Status:** Accepted (ratified by operator 2026-06-28; see macf#651)
 **Date:** 2026-06-26
 **Trigger:** The fleet's agent-identity fields drifted into **three different patterns** with no generator-level enforcement (surfaced during devops's Stage-3 work + an operator review, `macf#587`). The OTEL `gen_ai.agent.name` now flowing per `/health`: `code-agent` / `science-agent` (role-agent), `macf-devops-agent` (stray project-prefix), `auditor` (bare role) — three shapes for one field. Two prior overload-splits set the stage but never landed a *canonical, enforced* convention: `macf#535` (`agent_name` vs the App slug — the `check-gh-attribution` false-positive) and `macf#538` (`MACF_AGENT_NAME` OTEL-name vs `MACF_ROUTING_LABEL` registry-key/cert-CN). This DR ratifies the convention; siblings: DR-008 (agent identity), `#535`/`#538`/`#542`/`#547` (the overload lineage).
 

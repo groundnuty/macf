@@ -1,6 +1,6 @@
 # DR-034: Graceful compaction-drain — the quiesce → finalize → compact → resume contract
 
-**Status:** Proposed
+**Status:** Accepted (ratified by operator 2026-06-28; see macf#651)
 **Date:** 2026-06-28
 **Trigger:** Operator-requested (`macf#651`): automate the graceful compaction-drain — when an agent's context nears full, stop it taking new work, consolidate durable memory + CLAUDE.md, compact, and resume the held queue, instead of letting Claude Code's auto-compact fire uncontrolled (which can truncate in-flight reasoning + lose the working set). Two research agents (CC compaction lifecycle + SOTA long-running-agent context management) confirm the approach fits cleanly; findings in `macf-devops-toolkit:research/2026-06-28-graceful-compaction-drain.md`. The 6th member of the unattended-operation family (`#641` channels, `#642`/#643 harden-stdio, `#645`/DR-033 auto-responder, `#131` resume, `#132` operator-blocked report, + this). Design seeded by devops; contract + consolidation-convention shaped by science.
 
