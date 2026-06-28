@@ -1,6 +1,6 @@
 # DR-033: Interactive-prompt auto-responder — the allowlist-only safety contract
 
-**Status:** Proposed
+**Status:** Accepted (ratified by operator 2026-06-28; see macf#651)
 **Date:** 2026-06-28
 **Trigger:** Claude Code introduces **interactive launch prompts with no documented headless/`-p` bypass** — the channels dev-flag (`"I am using this for local development"`), the resume-summary prompt (`"Resume full session as-is"`), and likely more over time (Anthropic differentiates `-p`-priced headless from the interactive TUI, so required-click moments are here to stay). MACF needs **unattended/cron relaunch** (DR-031 supervision + `macf-devops-toolkit#543`) and wants operator-launches to not stall on manual clicks. The mechanism: an **allowlist-driven interactive-prompt auto-responder wired into `claude.sh`** (`macf#645`). Because a wrong auto-answer can approve a permission grant or a destructive action, the **allowlist-only / never-answer-unknown / ceremony-not-authorization** invariants are constitutional — hence a DR, sibling to the auditor never-acts contract (DR-026). Design seeded by code-agent (`#645`), safety-contract shaped by science.
 
