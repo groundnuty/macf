@@ -402,7 +402,14 @@ export function generateEnvCerts(config: MacfAgentConfig): string {
   lines.push(
     'export MACF_AGENT_CERT="$SCRIPT_DIR/.macf/certs/agent-cert.pem"',
     'export MACF_AGENT_KEY="$SCRIPT_DIR/.macf/certs/agent-key.pem"',
-    'export MACF_LOG_PATH="$SCRIPT_DIR/.macf/logs/channel.log"',
+    // macf#642: the channel-server log cluster (channel.log + comms-ledger +
+    // turn-receipt sink + last_processed) lives in the agent's HOME under the
+    // XDG state dir, NOT in the repo/workspace — per-agent subdir keyed by
+    // <project>@<agent> (mirrors the canonical tmux session name + the
+    // forensic-log default's XDG base) so it never clutters or gets committed
+    // to the project. createLogger mkdir -p's the parent on first write. An
+    // explicit operator MACF_LOG_PATH still wins (the `:-` in claude.sh).
+    `export MACF_LOG_PATH="\${XDG_STATE_HOME:-$HOME/.local/state}/macf/${config.project}@${config.agent_name}/channel.log"`,
   );
 
   return assemble(managedHeaderLines('generateEnvCerts'), lines);
