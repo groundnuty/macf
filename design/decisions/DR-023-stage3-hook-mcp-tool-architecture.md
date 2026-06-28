@@ -484,6 +484,18 @@ The constraint is **broader than substrate-specific**: even on consumer workspac
 
 **Implications for future UC additions:** when proposing a new UC against this DR, the decision rule above is the first design question — "is this PreToolUse-blocking, or is this Stop / best-effort?" — before working out the MCP tool API. A blocking hook needs bash form; the rest of the design follows from that.
 
+## Amendment 2026-06-28 — MCP tool namespace flips to the manual-server form (`macf#641`); `#639` delivery-mode toggle
+
+The channel-server moves from the plugin's `mcpServers` to a project `.mcp.json` `server:macf-agent` (DR-022 Amendment P — the only channel-id form the dev-flag loads for a non-allowlisted channel). The MCP **tool namespace flips accordingly**, and this DR's hook wiring with it:
+
+- **Tool names:** `mcp__plugin_macf-agent_macf-agent__*` → **`mcp__macf-agent__*`** (the manual-server namespace; the `plugin_` infix is gone). The `notify_peer` / `checkpoint_to_memory` MCP tools (Amendment K / UC-1) keep their semantics; only the namespace prefix changes.
+- **Stop-hook `server` field:** `"plugin:macf-agent:macf-agent"` → **`"macf-agent"`** (this was the live `not connected` Stop-hook error the `#641` spike surfaced — the hook referenced a plugin-server id that no longer mounts as a plugin).
+- **Pre-approved permission patterns** update in lockstep (the `mcp__macf-agent__*` allow-patterns), and settings `enabledMcpjsonServers: ["macf-agent"]` pre-approves the manual server so launch doesn't stall on the server-approval prompt.
+
+**`#639` — delivery is a MODE toggle, not a hard XOR.** `MACF_CHANNELS_ACTIVE` (read by `onNotify`): `both` (default — push + tmux-wake), `channels` (push only), `tmux` (tmux-wake only). The two paths are **functionally different, not redundant**: native channel-push is stored as `type:queue-operation` + `isMeta:true` — **outside the rewindable conversation tree, so it vanishes on rewind** — while tmux-wake is a real `type:user` turn (**rewind-durable**). Default **`both`**: it preserves the only path that actually worked pre-`#641` (tmux-wake) while adding channels, and the rewind-durability difference argues *against* a `channels`-only default (a rewind would silently drop an `isMeta` push). Narrow to `channels`-only only once native push is proven robust fleet-wide.
+
+(Cross-ref: silent-fallback-hazards Instance 15 — native channel-push never registered pre-`#641` because the plugin channel-id was dev-flag-rejected; the `server:` mount is the fix. The channel-server's stdio-lifecycle-coupling + the Path-B HTTP/SSE decoupling are tracked in DR-022 Amendment P + `macf#642`/#643.)
+
 ## Cross-references
 
 - **PR #275** (`groundnuty/macf#272`) — shipped UC-4 as bash form; first implementation of the bash-vs-mcp_tool decision rule
