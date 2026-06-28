@@ -40,7 +40,9 @@ They are **complementary**: the role layer says *how this agent thinks about its
 
 ## 2. Prerequisites (operator, one-time)
 
-- [ ] **`macf` CLI ≥ 0.2.37** — `npm i -g @groundnuty/macf@latest`; verify `macf --version` shows `0.2.37` (this is the release that ships `--app-key` ingestion + the auditor commands; older versions hand-`cp` keys and lack profile-registry fixes).
+- [ ] **`macf` CLI ≥ 0.2.43** — `npm i -g @groundnuty/macf@latest`; verify `macf --version` shows `0.2.43` (or later). 0.2.37 first shipped `--app-key` ingestion + the auditor commands; **0.2.43 adds what makes a fresh fleet verifiable + robust:** the **DR-030 fleet health commands** `macf fleet status` / `macf fleet doctor` / `macf routing doctor` (the whole-fleet verification — see §3e), the **canonical `claude.sh`** (`--plugin-dir` + Claude-Code channels flag + tmux self-wrap, #632/#638), **channel-server crash diagnostics** (a guaranteed forensic log + crash handlers so a server death self-records, #642), the **forensic/runtime log defaulting to the agent HOME** out of the repo (#649), and the **SessionStart work-check as a command-hook** (CC 2.1.195 compat, #650). Older versions lack the fleet-doctor commands + the crash-forensics, so pin ≥0.2.43.
+
+  > **⚠ Channels-state note (so the launch warnings don't read as a broken setup).** As of 0.2.43 the **native Claude-Code channel-push last-hop is NOT yet live** — a `--plugin-dir`-mounted plugin's channel id isn't loadable by the dev-flag (the `.mcp.json` `server:` mount migration is `macf#641`). So each agent logs `Channel notifications skipped: ... not in --channels list` and the SessionStart guard prints **"⚠ ROUTED NOTIFICATIONS ARE DISABLED"** on launch. **This is expected — routing still works**, delivered over the channel-server's **tmux-wake** last-hop (send-keys into the agent's TUI), the path that has always carried delivery. The guard is doing its job (no silent failure); it is *not* a bootstrap error. Native channels are a future upgrade (`macf#641`/`#639`); until then you have single, reliable tmux-wake delivery.
 - [ ] **Three GitHub Apps**, one per agent (attribution-distinct — each agent posts as itself). **This is the one step with no `gh` CLI — App create + install is web/passkey only** (there is no `gh app create`). Create each from the manifest at `packages/macf/templates/macf-app-manifest.json` (DR-019 permission set) → `https://github.com/settings/apps/new`. For each App: note the **App ID**, **install it** on that agent's repo(s) + on `groundnuty/groundnuty` (the registry), and **download its private key** (`.pem`).
   - `[WATCH]` Naming: name the Apps `icsoc-2026-science-agent` / `icsoc-2026-code-agent` / `icsoc-2026-writer-agent` so attribution in issues/PRs reads clearly.
 - [ ] **The `groundnuty/groundnuty` profile repo exists** (it does) and each agent's App is **installed on it** with `actions_variables:write`, so the channel server can self-register into the fleet registry.
@@ -103,7 +105,15 @@ macf doctor                 # App-token permissions vs DR-019
 ./.claude/scripts/macf-whoami.sh   # should print "bot installation token" (ghs_), not your user
 ls .macf/macf-agent.json .macf/plugin claude.sh   # workspace wired
 ./claude.sh                 # launches the agent (Claude Code, role config + MACF plugin)
+#   ^ press 1 at the "development channels" prompt; pick your resume option if shown.
+#     The "ROUTED NOTIFICATIONS ARE DISABLED" warning is EXPECTED (see §2 channels-state note).
+
+# After launch, confirm the channel server registered + is alive (forensic log, #649):
+cat ~/.local/state/macf/icsoc-2026@icsoc-2026-science-agent/channel.log
+#   want: forensic_log_active, server_started, then `alive` ticks + registry_heartbeat
 ```
+
+> Once **all three** agents are launched, run the fleet health check in **§3e** — that's the "is the fleet working well" gate, far faster than per-agent log-greps.
 
 ### Per-agent quick reference
 
@@ -168,6 +178,39 @@ Repeat steps 1–6 for **code-agent** (`code` profile · repo `groundnuty/icsoc-
 > gh label create blocked      --repo groundnuty/icsoc-2026-experiment --color b60205 --force
 > ```
 > `[WATCH]` Confirm whether `macf repo-init --agents …` already creates the assignment labels (it creates the status labels for sure) — if so this block is redundant when you run repo-init.
+
+---
+
+## 3f. Fleet health check — confirm all three are working (DR-030)
+
+Once all three agents are launched, three commands (run from any of the three workspaces) confirm the fleet is healthy. They check **different layers** — run all three:
+
+```bash
+macf fleet status        # 1. ROSTER + LIVE HEALTH — every registered agent in one table
+macf routing doctor      # 2. ROUTING PLANE — the GitHub-side plumbing is wired right
+macf fleet doctor        # 3. MESH DELIVERY — each agent is actually reachable + accepts
+```
+
+**1. `macf fleet status`** — one table; want all three `online` + `reachable` with healthy `CERT-EXPIRY`:
+
+```
+NAME                       HOST:PORT       STATUS  UPTIME  STATE      OTEL       CERT-EXPIRY
+ICSOC_2026_SCIENCE_AGENT   <host>:<port>   online  ...     idle ...   reachable  36Xd
+ICSOC_2026_CODE_AGENT      <host>:<port>   online  ...     idle ...   reachable  36Xd
+ICSOC_2026_WRITER_AGENT    <host>:<port>   online  ...     idle ...   reachable  36Xd
+```
+
+**2. `macf routing doctor`** — static GitHub-plane checks (pins consistent, each agent ROUTABLE via its registry key, FRESH = registry instance_id matches live `/health`). Want it to end:
+
+```
+N routing repo(s) (pins consistent); 3/3 agents routing-OK; CA ✓; routing plane: HEALTHY
+```
+
+Non-fatal `⚠ WARN`s (e.g. a bare `<name>` tmux session vs canonical `<project>@<name>`, the pending DR-032 rename) are visible but do NOT drive the verdict.
+
+**3. `macf fleet doctor`** — proves the mesh can actually DELIVER (REACHABLE = mTLS `/health` answers; ACCEPTED = diagnostic `/notify` ACK). Add `--inject` for the idle-agent PROCESSED proof (routes a real marker + wakes each idle agent). Exits non-zero when DEGRADED.
+
+**The fleet is working well when all three are green:** `fleet status` all `online`, `routing doctor` → `routing plane: HEALTHY`, `fleet doctor` exit 0. (`routing doctor` proves the GitHub plumbing; `fleet doctor` proves the live mesh delivers — run both.) `[WATCH]` if `routing doctor` shows an agent not ROUTABLE, its channel server didn't register — re-check §3d's registry/forensic-log step for that agent. (Routing is via tmux-wake until native channels land — see §2's channels-state note — so a `tmux_wake_delivered` line in the recipient's forensic log confirms the last hop on a real ping.)
 
 ---
 
