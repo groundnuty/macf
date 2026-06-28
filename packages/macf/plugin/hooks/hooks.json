@@ -14,9 +14,9 @@
       {
         "hooks": [
           {
-            "type": "prompt",
-            "prompt": "Run /macf-status to see your identity and peers, then /macf-issues to check pending work.",
-            "once": true
+            "type": "command",
+            "command": "echo 'Run /macf-status to see your identity and peers, then /macf-issues to check pending work.'",
+            "timeout": 5
           }
         ]
       }
