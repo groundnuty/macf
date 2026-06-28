@@ -4,6 +4,28 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.43] — 2026-06-28
+
+**Launcher hygiene** — two operator-requested fixes on top of v0.2.42's crash
+diagnostics. Additive; marketplace v0.2.43 is a lockstep bump (ships the plugin
+hooks fix).
+
+### reliability
+
+- **#649** — the channel-server runtime log cluster (forensic log + comms-ledger
+  + turn-receipts + last_processed) now defaults **out of the repo into the agent
+  HOME** (`${XDG_STATE_HOME:-$HOME/.local/state}/macf/<project>@<agent>/channel.log`),
+  per-agent, and `.macf/` is git-ignored. An explicit `MACF_LOG_PATH` still wins.
+  Stops the runtime logs cluttering / risking accidental commit into the project
+  tree.
+
+### fix
+
+- **#650** — plugin `SessionStart` work-check hook converted from `type:prompt`
+  to `type:command` (Claude Code 2.1.195 rejects prompt-type SessionStart hooks
+  — *"Use a command-type hook instead"* — which errored on every launch). Ships
+  via marketplace v0.2.43.
+
 ## [0.2.42] — 2026-06-28
 
 **Channel-server crash diagnostics** — the reliability foundation for the
