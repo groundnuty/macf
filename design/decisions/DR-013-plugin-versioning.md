@@ -47,3 +47,7 @@ macf update                   # updates .macf/plugin/ to latest
 The disk cost is negligible — the plugin is mostly markdown files (skills, agents) plus a small Node.js server.
 
 Testing strategy: update code-agent first (least critical), then science-agent, then writing-agent.
+
+## Amendment (2026-06-28, `macf#641`) — the channel-server is no longer plugin-versioned
+
+Per DR-022 Amendment P, the **channel-server** moves out of the plugin's `mcpServers` and into a project `.mcp.json` MCP server (`npx -y @groundnuty/macf-channel-server@<pin>`), because only a `.mcp.json` `server:<name>` channel id is dev-flag-loadable for a non-allowlisted channel (the `plugin:<name>:<server>` form is rejected). **Consequence for this DR:** plugin-versioning (this DR) **no longer governs the channel-server** — its pin now lives in the `.mcp.json` `npx` args (DR-022 Amendment P). Plugin-versioning still governs the `--plugin-dir`-mounted plugin's **skills / agents / hooks / rules**. (Lock-step versioning across the three npm packages — DR-022 Amendment D — is unchanged.)
