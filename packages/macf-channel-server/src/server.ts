@@ -10,7 +10,6 @@ import { bootstrapOtel } from './otel.js';
 import { SpanKind, SpanStatusCode } from '@opentelemetry/api';
 import { getTracer, SpanNames } from './tracing.js';
 import { loadConfig } from '@groundnuty/macf-core';
-import { createLogger } from '@groundnuty/macf-core';
 import { createMcpChannel } from './mcp.js';
 import { createHealthState } from './health.js';
 import { createHttpsServer } from './https.js';
@@ -20,6 +19,10 @@ import { PACKAGE_VERSION } from './package-version.js';
 import { createRegistry, createRegistryFromConfig } from '@groundnuty/macf-core';
 import { checkCollision, CollisionError, RegisterRaceError } from './collision.js';
 import { registerShutdownHandler } from './shutdown.js';
+import { createForensicLogger } from './forensic-log.js';
+import { createLifecycleTracker } from './lifecycle.js';
+import { registerCrashHandlers } from './crash-handlers.js';
+import { createAliveTicker } from './alive-ticker.js';
 import { createRegistryHeartbeat, resolveHeartbeatIntervalMs } from './registry-heartbeat.js';
 import { createTokenRefresher } from './token-refresh.js';
 import { createRefreshAwareClient } from './refresh-aware-client.js';
@@ -60,9 +63,58 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
 
-  const logger = createLogger({
-    logPath: config.logPath,
+  // macf#642: a GUARANTEED forensic file log. The macf-core logger NO-OPS when
+  // MACF_LOG_PATH is unset, and stderr is unreliable (Claude Code stops draining
+  // the stdio pipe under load) — so the channel-server could die with no trail.
+  // createForensicLogger defaults the path to $XDG_STATE_HOME / $HOME/.local/state
+  // when the launcher didn't export MACF_LOG_PATH (defense-in-depth; an explicit
+  // MACF_LOG_PATH still wins), and degrades to stderr-only rather than crashing if
+  // the file sink can't be opened.
+  const { logger, logPath: forensicLogPath, fileActive } = createForensicLogger({
+    agentName: config.agentName,
     debug: config.debug,
+  });
+
+  // Loud startup forensic line — file AND stderr regardless of debug — so the
+  // resolved log path is discoverable + the first line bounds the process start.
+  logger.info('forensic_log_active', {
+    log_path: forensicLogPath,
+    file_active: fileActive,
+    pid: process.pid,
+    version: PACKAGE_VERSION,
+  });
+  process.stderr.write(
+    `macf-channel-server: forensic log → ${forensicLogPath}` +
+      (fileActive ? '' : ' (file sink UNAVAILABLE — stderr only)') +
+      ` [pid ${String(process.pid)}, v${PACKAGE_VERSION}]\n`,
+  );
+
+  // macf#642: lifecycle-phase tracker — the crash handlers + alive-tick read this
+  // so the forensic log pinpoints WHERE the process was when it died.
+  const lifecycle = createLifecycleTracker({ initial: 'boot' });
+
+  // macf#642: top-level crash handlers, registered EARLY (before the rest of
+  // startup) so an uncaughtException / unhandledRejection during boot still lands
+  // in the forensic log + attempts a bounded graceful deregister, then exits 1.
+  // The shutdown `cleanup` is wired later (it needs the registry + HTTPS server);
+  // the getter returns undefined until then, so an early crash logs + exits
+  // without a deregister it has nothing to perform.
+  let shutdownCleanup: (() => Promise<boolean>) | undefined;
+  registerCrashHandlers({
+    logger,
+    lifecycle,
+    getCleanup: () => shutdownCleanup,
+  });
+
+  // macf#642: record the process exit code in the forensic log. The 'exit' event
+  // allows only synchronous work — logger.info uses appendFileSync (sync), so the
+  // line is durably written before the process is gone.
+  process.on('exit', (code) => {
+    logger.info('process_exit', {
+      code,
+      pid: process.pid,
+      lifecycle_phase: lifecycle.snapshot().phase,
+    });
   });
 
   // macf#473 piece 2 (DR-025): the authoritative write-ahead comms-ledger,
@@ -118,7 +170,27 @@ async function main(): Promise<void> {
     logPath: config.logPath,
   });
 
+  // macf#642: a boundary try/catch around the /notify delivery path. https.ts
+  // already catches at the request boundary (→ 500), but a dedicated catch here
+  // attributes the failure to the notify handler (payload type + stack) AND guards
+  // the fire-and-forget sub-calls (e.g. wakeViaTmux) so nothing can escape as an
+  // unhandledRejection. Re-thrown so the request boundary still returns 500 — the
+  // delivery genuinely failed; this only adds a louder, attributed log.
   const onNotify = async (payload: NotifyPayload): Promise<void> => {
+    try {
+      await deliverNotification(payload);
+    } catch (err) {
+      logger.error('notify_handler_error', {
+        type: payload.type,
+        issue: payload.issue_number,
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? (err.stack ?? '') : '',
+      });
+      throw err;
+    }
+  };
+
+  async function deliverNotification(payload: NotifyPayload): Promise<void> {
     const meta: Record<string, string> = { type: payload.type };
     if (payload.issue_number !== undefined) {
       meta['issue_number'] = String(payload.issue_number);
@@ -230,7 +302,7 @@ async function main(): Promise<void> {
         detail: 'MACF_WORKSPACE_DIR unset',
       });
     }
-  };
+  }
 
   // P2: Build the project registry + (GitHub-mode only) /sign varsClient.
   //
@@ -539,9 +611,11 @@ async function main(): Promise<void> {
 
   // P1: Connect MCP channel
   await mcp.connect();
+  lifecycle.set('mcp-connected'); // macf#642 forensic phase marker
 
   // P1: Bind port
   const { actualPort } = await httpsServer.start(config.port, config.host);
+  lifecycle.set('port-bound'); // macf#642 forensic phase marker
 
   // P2: Collision detection. The HTTPS server is already bound + serving
   // (P1 above), so a version-aware takeover (groundnuty/macf#424) only fires
@@ -563,6 +637,7 @@ async function main(): Promise<void> {
     PACKAGE_VERSION,
     logger,
   );
+  lifecycle.set('collision-checked'); // macf#642 forensic phase marker
 
   if (collisionResult.action === 'abort') {
     await httpsServer.stop();
@@ -606,6 +681,7 @@ async function main(): Promise<void> {
     await httpsServer.stop();
     throw new RegisterRaceError(config.routingLabel, registerResult.current);
   }
+  lifecycle.set('registered'); // macf#642 forensic phase marker
   logger.info('registered', {
     agent: config.routingLabel,
     host: config.advertiseHost,
@@ -636,7 +712,10 @@ async function main(): Promise<void> {
   // carries OUR instance_id, so a newer instance that took over the slot
   // (groundnuty/macf#424) while we ran is never clobbered on our exit. Also
   // clears the registry-heartbeat interval (DR-031) on the way out.
-  registerShutdownHandler({
+  // macf#642: capture the returned cleanup so the top-level crash handlers can
+  // attempt the same instance-id-guarded graceful deregister (behind a hard
+  // timeout) on an uncaughtException / unhandledRejection.
+  shutdownCleanup = registerShutdownHandler({
     agentName: config.routingLabel,
     registry,
     instanceId: config.instanceId,
@@ -649,13 +728,24 @@ async function main(): Promise<void> {
   // Start the periodic heartbeat now that its stop() is wired into shutdown.
   registryHeartbeat.start();
 
+  lifecycle.set('serving'); // macf#642 forensic phase marker
   logger.info('server_started', {
     port: actualPort,
     host: config.advertiseHost,
     agent: config.agentName,
     type: config.agentType,
     instance_id: config.instanceId,
+    pid: process.pid,
+    version: PACKAGE_VERSION,
+    log_path: forensicLogPath,
   });
+
+  // macf#642: periodic "alive" tick to the forensic log (every 60s, unref()'d so
+  // it can't pin the event loop). Its purpose is its ABSENCE — when the server
+  // dies a SILENT death (OOM / SIGKILL / power loss) no crash handler runs and
+  // the log just stops; the last `alive` line then bounds the death to a ≤60s
+  // window. Started last so the log shows the server reached steady state.
+  createAliveTicker({ logger, lifecycle }).start();
   }  // end runStartup
 }
 
