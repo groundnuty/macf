@@ -17,6 +17,9 @@
 #   - `jq` missing (every helper parses JSON with it)
 #   - the two structural deny-rails missing from the workspace (the no-prompt
 #     autonomy is only safe behind them — DR-035 §2.2)
+#   - the installed `macf` CLI is absent OR does not satisfy plugin.json's
+#     declared `.compatibility.macf` range (DR-035 §7 — independent versioning +
+#     ENFORCED compatibility; refuse on version-skew, safe-by-refusal)
 #
 # Best-effort (warn only, never fatal):
 #   - the Chrome DevTools MCP debug endpoint is unreachable. Whether the MCP is
@@ -39,6 +42,50 @@ fail=0
 note_fail() { echo "✗ CRITICAL: $1" >&2; fail=1; }
 note_warn() { echo "⚠ WARN: $1" >&2; }
 note_ok()   { echo "✓ $1" >&2; }
+
+# ── semver helpers (bash port of @groundnuty/macf-core `compareSemver`) ──────
+# Scope: x.y.z (optional leading v) only — sufficient for the 0.2.x line; an
+# unparseable string is treated as 0.0.0 (oldest), matching macf-core.
+_semver_triplet() { # $1=version → "MAJ MIN PAT" (unparseable ⇒ "0 0 0")
+  local v="${1#v}"
+  if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    printf '%s %s %s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+  else
+    printf '0 0 0'
+  fi
+}
+_compare_semver() { # $1 vs $2 → echoes lt|eq|gt
+  local -a A B; local i
+  read -ra A <<<"$(_semver_triplet "$1")"
+  read -ra B <<<"$(_semver_triplet "$2")"
+  for i in 0 1 2; do
+    if (( A[i] < B[i] )); then printf lt; return 0; fi
+    if (( A[i] > B[i] )); then printf gt; return 0; fi
+  done
+  printf eq
+}
+# macf_satisfies VERSION RANGE → exit 0 iff VERSION satisfies RANGE.
+# Supports ">=X.Y.Z" (canonical), ">X.Y.Z", "=X.Y.Z", and a bare "X.Y.Z"
+# (treated as a minimum). An unparseable VERSION or RANGE never satisfies —
+# safe-by-refusal: refuse on version-skew OR on a version we cannot parse.
+macf_satisfies() {
+  local version="$1" range="$2" op min cmp
+  range="${range//[[:space:]]/}"
+  case "$range" in
+    ">="*) op=">="; min="${range#>=}" ;;
+    ">"*)  op=">";  min="${range#>}"  ;;
+    "="*)  op="=";  min="${range#=}"  ;;
+    *)     op=">="; min="$range"      ;;
+  esac
+  [[ "${version#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ "${min#v}"     =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  cmp="$(_compare_semver "$version" "$min")"
+  case "$op" in
+    ">=") [[ "$cmp" == gt || "$cmp" == eq ]] ;;
+    ">")  [[ "$cmp" == gt ]] ;;
+    "=")  [[ "$cmp" == eq ]] ;;
+  esac
+}
 
 # ── gh present + authenticated as the operator (USER, not bot) ──────────────
 if ! command -v gh >/dev/null 2>&1; then
@@ -93,6 +140,35 @@ if [[ ! -f "$URL_GUARD" ]]; then
 fi
 if [[ -f "$SETTINGS" && -f "$GH_GUARD" && -f "$URL_GUARD" ]]; then
   note_ok "both structural deny-rails present."
+fi
+
+# ── macf-bootstrap ↔ macf framework compatibility (version-skew refusal) ────
+# macf-bootstrap is versioned INDEPENDENTLY of the framework (DR-035 §7) and
+# DECLARES the macf range it needs in plugin.json (.compatibility.macf). The
+# workspace runs `macf` locally (CA generation + emitting the VM-side `macf init`
+# commands — DR-035 §3), so an incompatible/absent macf must STOP the run loud.
+# This makes the compat declaration *enforced*, not just documented — the
+# safe-by-refusal property of §2 extended to cover version-skew.
+PLUGIN_JSON="$WORKSPACE/.claude-plugin/plugin.json"
+if [[ ! -f "$PLUGIN_JSON" ]]; then
+  note_fail "plugin.json missing ($PLUGIN_JSON) — the independent macf-bootstrap version + the .compatibility.macf declaration live there (DR-035 §7)."
+elif ! command -v jq >/dev/null 2>&1; then
+  : # jq absence already reported above; cannot parse the compat range without it.
+else
+  bs_version="$(jq -r '.version // empty' "$PLUGIN_JSON" 2>/dev/null || true)"
+  macf_range="$(jq -r '.compatibility.macf // empty' "$PLUGIN_JSON" 2>/dev/null || true)"
+  if [[ -z "$macf_range" ]]; then
+    note_fail "plugin.json has no .compatibility.macf range — cannot verify macf-version compatibility (DR-035 §7)."
+  elif ! command -v macf >/dev/null 2>&1; then
+    note_fail "\`macf\` CLI not found on PATH — macf-bootstrap ${bs_version:-0.1.0} requires macf ${macf_range}. Run \`npm i -g @groundnuty/macf@latest\`."
+  else
+    macf_version="$(macf --version 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+    if macf_satisfies "$macf_version" "$macf_range"; then
+      note_ok "macf ${macf_version} satisfies macf-bootstrap ${bs_version:-0.1.0} compatibility (${macf_range})."
+    else
+      note_fail "macf-bootstrap ${bs_version:-0.1.0} requires macf ${macf_range}; found ${macf_version:-<unparseable>}. Run \`npm i -g @groundnuty/macf@latest\` (or install a macf that satisfies ${macf_range})."
+    fi
+  fi
 fi
 
 # ── Chrome DevTools MCP reachability (best-effort, warn only) ───────────────

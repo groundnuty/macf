@@ -51,6 +51,58 @@ operator, not a `ghs_` bot token. That omission is documented explicitly in
 > tools stay in `permissions.allow` and the URL policy lives entirely in the
 > hook. Do not move them to `deny` — that disables the URL guard.
 
+## Versioning + macf-framework compatibility (DR-035 §7)
+
+`macf-bootstrap` is versioned **independently of the macf framework** — it is a
+tool, not the framework, on its own cadence. Its version lives in
+`.claude-plugin/plugin.json` (the macf-bootstrap line starts at `0.1.0`); it is
+**not** lockstep with the `macf`/`@groundnuty/macf-channel-server` version.
+
+Because it is not lockstep, the plugin **declares the framework range it needs**
+and that declaration is **enforced** (not merely documented):
+
+```jsonc
+// .claude-plugin/plugin.json
+{
+  "name": "macf-bootstrap",
+  "version": "0.1.0",                 // independent; NOT the framework version
+  "compatibility": { "macf": ">=0.2.43" }   // the macf range this version needs
+}
+```
+
+The `>=0.2.43` baseline is the framework version that ships the DR-030 fleet
+commands + the 0.2.43 forensic-log / launcher this skill builds on.
+
+**Enforcement (safe-by-refusal extends to version-skew).** The workspace runs
+`macf` locally — it generates the per-project CA and emits the VM-side
+`macf init` commands (DR-035 §3) — so a too-old or absent `macf` would silently
+produce broken output. `bootstrap-validate-env.sh` therefore reads
+`.compatibility.macf` from `plugin.json`, reads the installed `macf --version`,
+and **fails loud** (critical, stops the run) when the installed macf does not
+satisfy the range — with an actionable message:
+
+> `macf-bootstrap 0.1.0 requires macf >=0.2.43; found 0.2.X; run npm i -g @groundnuty/macf@latest`
+
+An *unparseable* or *absent* `macf --version` is treated the same way (refuse —
+we never run against a framework we cannot verify). This is the same
+**safe-by-refusal** posture as the deny-rails: the skill won't run against an
+incompatible framework, just as it won't run in a workspace missing the safety
+env (`age` / user-`gh` / the two deny-rails — see the safety model above).
+
+## Installing / using a specific version
+
+The **distribution unit is this complete workspace** (versioned + compat-declared),
+surfaced in the marketplace at its **own** version. A marketplace plugin carries
+the skill + the Chrome `mcpServers` + the deny-hooks + the version + the compat
+range — but **not** `permissions` (those are workspace-owned in Claude Code), so
+the operator-privilege permissions travel with the workspace template, and the
+skill's env-validation **refuses to run without the deny-rails**. To pin a
+version, clone/check-out the workspace at its tag (or install the marketplace
+entry at that version). *The marketplace registration itself is handled
+separately* (the framework maintainer publishes the plugin into
+`groundnuty/macf-marketplace`); this directory is the source workspace it is cut
+from.
+
 ## How the operator runs this workspace
 
 1. Clone this `tools/macf-bootstrap/` directory to the Mac as the bootstrap
@@ -98,6 +150,8 @@ See the upstream chrome-devtools-mcp README
 
 ```
 tools/macf-bootstrap/
+├── .claude-plugin/
+│   └── plugin.json                            ← independent version + compatibility.macf range (DR-035 §7); enforced by bootstrap-validate-env.sh
 ├── .claude/
 │   ├── settings.json                          ← operator-privilege allow + dual-surface deny + the 2 PreToolUse rails
 │   ├── skills/

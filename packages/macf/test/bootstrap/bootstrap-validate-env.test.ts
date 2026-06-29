@@ -31,11 +31,16 @@ function write(dir: string, name: string, body: string): void {
  *  - gh: always present, `gh auth token` prints `ghToken`.
  *  - age: when true, stub `age` + `age-keygen`.
  *  - curl: 'ok' (exit 0) | 'fail' (exit 1) | undefined (absent).
+ *  - macf: when set, stub `macf --version` to print this string; when omitted,
+ *    `macf` is ABSENT (the compat check then reports it not-found, a critical).
+ *    The workspace's real plugin.json declares `compatibility.macf` `>=0.2.43`,
+ *    so a stub of `0.2.43`+ satisfies it and `0.2.42`/garbage do not.
  */
 function makeStubBin(opts: {
   readonly ghToken: string;
   readonly age?: boolean;
   readonly curl?: 'ok' | 'fail';
+  readonly macfVersion?: string;
 }): string {
   const dir = mkdtempSync(join(tmpdir(), 'macf-bs-validate-bin-'));
   write(dir, 'gh', `#!/usr/bin/env bash
@@ -50,6 +55,9 @@ exit 0
     write(dir, 'curl', `#!/usr/bin/env bash\necho '{"Browser":"x"}'\nexit 0\n`);
   } else if (opts.curl === 'fail') {
     write(dir, 'curl', `#!/usr/bin/env bash\nexit 7\n`);
+  }
+  if (opts.macfVersion !== undefined) {
+    write(dir, 'macf', `#!/usr/bin/env bash\necho "${opts.macfVersion}"\nexit 0\n`);
   }
   return dir;
 }
@@ -85,7 +93,7 @@ describe('bootstrap-validate-env.sh', () => {
   });
 
   it('best-effort WARN (non-fatal): Chrome remote-debugging endpoint unreachable', () => {
-    const dir = makeStubBin({ ghToken: 'gho_usertoken', age: true, curl: 'fail' });
+    const dir = makeStubBin({ ghToken: 'gho_usertoken', age: true, curl: 'fail', macfVersion: '0.2.43' });
     try {
       const r = run(dir);
       expect(r.status).toBe(0); // warn only — not a critical
@@ -95,12 +103,59 @@ describe('bootstrap-validate-env.sh', () => {
     }
   });
 
-  it('passes when gh is a user token + age + Chrome reachable', () => {
-    const dir = makeStubBin({ ghToken: 'gho_usertoken', age: true, curl: 'ok' });
+  it('passes when gh is a user token + age + Chrome reachable + compatible macf', () => {
+    const dir = makeStubBin({ ghToken: 'gho_usertoken', age: true, curl: 'ok', macfVersion: '0.2.43' });
     try {
       const r = run(dir);
       expect(r.status).toBe(0);
       expect(r.stderr).toContain('environment validation OK');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // ── macf-version compatibility enforcement (DR-035 §7) ────────────────────
+  it('passes when the installed macf is NEWER than the required minimum', () => {
+    const dir = makeStubBin({ ghToken: 'gho_usertoken', age: true, curl: 'ok', macfVersion: '0.3.0' });
+    try {
+      const r = run(dir);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toMatch(/satisfies macf-bootstrap/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('CRITICAL: macf BELOW the declared compatibility minimum (version-skew refusal)', () => {
+    const dir = makeStubBin({ ghToken: 'gho_usertoken', age: true, curl: 'ok', macfVersion: '0.2.42' });
+    try {
+      const r = run(dir);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/requires macf >=0\.2\.43/);
+      expect(r.stderr).toContain('0.2.42');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('CRITICAL: garbled macf --version (unparseable ⇒ refuse, safe-by-refusal)', () => {
+    const dir = makeStubBin({ ghToken: 'gho_usertoken', age: true, curl: 'ok', macfVersion: 'not-a-version' });
+    try {
+      const r = run(dir);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/requires macf >=0\.2\.43/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('CRITICAL: macf CLI absent (cannot verify compat ⇒ refuse)', () => {
+    // No macfVersion ⇒ no `macf` stub ⇒ not found on the curated PATH.
+    const dir = makeStubBin({ ghToken: 'gho_usertoken', age: true, curl: 'ok' });
+    try {
+      const r = run(dir);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/`macf` CLI not found|requires macf/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
