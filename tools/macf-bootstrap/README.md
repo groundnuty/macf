@@ -114,7 +114,14 @@ Then the **operator (user) clones the product repo** and works there: `git clone
 
 > **This `tools/macf-bootstrap/` directory is the DEV SOURCE, not a user path.** macf-bootstrap is a **separate product** delivered as the `groundnuty/macf-automated-github-setup` repo (the unit users clone) — exactly like the routing workflow ships as `groundnuty/macf-actions` and the plugin as `groundnuty/macf-marketplace`. The source is *developed* here in the macf monorepo (so it stays in `make check` CI + lockstep with the framework it calls) and *published* to the product repo at each version. Users never clone macf or `cd` into this subdir.
 
-To **refresh / publish a new version**, re-sync this directory's contents into the product repo and push (the create-block above is the first publish; subsequent publishes re-sync + bump — see versioning below). A `sync` helper automates this.
+To **refresh / publish a new version**, re-sync this directory's contents into the product repo and push (the create-block above is the first publish; subsequent publishes re-sync + bump — see versioning below). The `sync-bootstrap-product.mjs` helper automates this:
+
+```bash
+node packages/macf/scripts/sync-bootstrap-product.mjs --target <macf-automated-github-setup-checkout>
+# then in the product checkout: git add -A && git commit && git push
+```
+
+> **Caveat — it's a true mirror.** The sync prunes target-only files (except `.git/`). So any file that belongs in the product repo (a `LICENSE`, product-specific CI) must be added to **this source** `tools/macf-bootstrap/`, NOT directly to `macf-automated-github-setup`, or the next publish deletes it.
 
 ## Versioning / using a specific version
 
