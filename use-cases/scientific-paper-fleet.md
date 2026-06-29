@@ -40,6 +40,55 @@ They are **complementary**: the role layer says *how this agent thinks about its
 
 ## 2. Prerequisites (operator, one-time)
 
+> **🤖 Recommended: automate this whole section + most of §3 with `macf-bootstrap`.** Rather than hand-doing the App creation (§2), repo creation (§3a), `macf init` prep, secrets, and the CA, the **`macf-bootstrap`** skill (DR-035) drives **your own logged-in Chrome + `gh` (as YOU)** to do all of it: create the per-agent Apps via the GitHub **manifest flow**, create the repos from the role template, install the Apps, set the routing secrets, generate the per-project CA, and produce an **age-encrypted vault** (committed to your science repo) + the **exact VM-side `macf init` commands** to run. Your only interaction: answer its intake, **approve one plan**, and satisfy the GitHub auth prompts as they pop. **Follow §2-bootstrap below.** The manual checklist (this §2 + §3a–3c) stays as the fallback **and** as the reference for *what* macf-bootstrap automates — read it to understand the moving parts even if you use the skill.
+
+### 2-bootstrap. Automated provisioning with `macf-bootstrap` (recommended) `[OPERATOR DOGFOOD]`
+
+> This is new (DR-035, built 2026-06-29) and wants your real-world feedback — what's unclear, what breaks, what's missing. Note friction as you go (§6 has a feedback hook).
+
+**One-time — get the setup workspace** (a dedicated, operator-privileged Claude Code workspace; it acts AS your GitHub account, so it is NOT a fleet agent and runs only here):
+
+```bash
+# The canonical workspace lives at groundnuty/macf:tools/macf-bootstrap/.
+# Create the standalone clone repo as YOURSELF (gh authed as your user) — this is
+# a one-time convenience so you can `git clone` just the workspace.
+# (Separately, the SAME account-level privilege — bots can't createRepository /
+# create Apps — is the chicken-and-egg reason macf-bootstrap itself runs as the
+# operator rather than as a scoped agent. DR-035.)
+SRC=<your-macf-checkout>/tools/macf-bootstrap
+gh repo create groundnuty/macf-automated-github-setup --private \
+  --description "Operator-privileged MACF fleet GitHub-provisioning workspace (DR-035)."
+TMP=$(mktemp -d); cp -a "$SRC/." "$TMP/"; cd "$TMP"
+git init -b main && git add -A && git commit -m "chore: macf-bootstrap workspace v0.1.0"
+git remote add origin https://github.com/groundnuty/macf-automated-github-setup.git
+git push -u origin main
+# (Or skip the standalone repo and just use the tools/macf-bootstrap/ subdir of a macf clone.)
+```
+
+**Per fleet — run the skill (on your Mac, where Chrome + your GitHub login live):**
+
+1. Have on the Mac: `macf` CLI **≥ 0.2.43** (the skill enforces this via its `compatibility.macf` field), `gh` authed **as YOU** (`gh auth status` → your user, not a `ghs_` bot), `age`, `jq`, and the **Chrome DevTools MCP** (`chrome-devtools-mcp` — auto-fetched by `.mcp.json`).
+2. **Start Chrome logged into GitHub with remote debugging:** launch Chrome with `--remote-debugging-port=9222`. The workspace's `.mcp.json` is baked to attach to *that* session (`--browser-url=http://127.0.0.1:9222`), so the skill drives your real, already-authenticated browser — no credential handling.
+3. **Clone + launch:** `git clone …/macf-automated-github-setup && cd macf-automated-github-setup`, then open Claude Code here.
+4. **Run `/macf-bootstrap`.**
+5. **Answer the intake** — project name (`icsoc-2026`), per agent `{role, repo name, VM deploy path}`, registry scope (`profile` → `groundnuty`), advertise-host, the **science repo** (where the vault is committed), and an **age recipient** (an `age1…` public key) — or let it mint a keypair and hand you the private key.
+6. **Approve the ONE plan** — it prints the full plan with the **blast-radius items highlighted** (acts as your account; creates N Apps + N repos; sets N secrets; commits to your science repo). Approve once → it runs end-to-end.
+7. **Satisfy the GitHub auth gates** as they appear (OAuth consent / sudo-mode / 2FA) — these are the **only** clicks; recur every few hours; pause → you complete the gate → it resumes.
+8. **Outputs:** the **age-encrypted vault committed to your science repo**, a **filled-in `macf init` command list**, and the **verification commands**.
+
+**Finish on the VM (the only steps the skill leaves to you, by design):**
+
+9. **scp the age private key** to the VM (out-of-band — the encrypted vault rides in via git; the key does not).
+10. On the VM: `git clone` the science repo → run its `secrets/vault.sh` to decrypt the vault + materialize the per-agent keys to `~/.macf/keys/`.
+11. Run the emitted **`macf init`** commands (one per agent), then `./claude.sh` to launch each.
+12. Run the **§3f fleet health check** to confirm all agents are green.
+
+If anything in steps 1–12 is unclear or breaks, that's the feedback we want (§6).
+
+---
+
+### 2-manual. Prerequisites — the manual path (fallback + reference)
+
 - [ ] **`macf` CLI ≥ 0.2.43** — `npm i -g @groundnuty/macf@latest`; verify `macf --version` shows `0.2.43` (or later). 0.2.37 first shipped `--app-key` ingestion + the auditor commands; **0.2.43 adds what makes a fresh fleet verifiable + robust:** the **DR-030 fleet health commands** `macf fleet status` / `macf fleet doctor` / `macf routing doctor` (the whole-fleet verification — see §3e), the **canonical `claude.sh`** (`--plugin-dir` + Claude-Code channels flag + tmux self-wrap, #632/#638), **channel-server crash diagnostics** (a guaranteed forensic log + crash handlers so a server death self-records, #642), the **forensic/runtime log defaulting to the agent HOME** out of the repo (#649), and the **SessionStart work-check as a command-hook** (CC 2.1.195 compat, #650). Older versions lack the fleet-doctor commands + the crash-forensics, so pin ≥0.2.43.
 
   > **⚠ Channels-state note (so the launch warnings don't read as a broken setup).** As of 0.2.43 the **native Claude-Code channel-push last-hop is NOT yet live** — a `--plugin-dir`-mounted plugin's channel id isn't loadable by the dev-flag (the `.mcp.json` `server:` mount migration is `macf#641`). So each agent logs `Channel notifications skipped: ... not in --channels list` and the SessionStart guard prints **"⚠ ROUTED NOTIFICATIONS ARE DISABLED"** on launch. **This is expected — routing still works**, delivered over the channel-server's **tmux-wake** last-hop (send-keys into the agent's TUI), the path that has always carried delivery. The guard is doing its job (no silent failure); it is *not* a bootstrap error. Native channels are a future upgrade (`macf#641`/`#639`); until then you have single, reliable tmux-wake delivery.
@@ -258,10 +307,13 @@ These are the spots I most expect you to hit friction — please confirm or corr
 4. **`writer-agent` role label** — the macf plugin ships a `writing-agent` identity template, not `writer-agent`; here the identity comes from the `paper-latex` *template* profile instead, and `writer-agent` is just the routing label. Confirm that's what you want, or align the name.
 5. **Profile prerequisites** — Scholar Gateway connector (research/paper), LaTeX (`paper-latex`) — present on the host?
 6. **`--advertise-host`** — is `orzech-dev-agents.tail491af.ts.net` right for all three (same VM), and is `127.0.0.1` fine if you'll drive them locally without a cloud runner?
+7. **`macf-bootstrap` dogfood (§2-bootstrap) `[OPERATOR DOGFOOD]`** — the automated path is brand-new; please report what worked / didn't on a real run: (a) did the Chrome-debug attach work (step 2), or did the skill drive a fresh browser instead of your logged-in one? (b) did the manifest flow create + capture each App cleanly, or did a selector / redirect-`code` read fail? (c) how many auth-gate pauses, and were they handled gracefully? (d) did the vault land in the science repo + the age-key handoff make sense? (e) were the emitted `macf init` commands correct + complete? (f) anything that needed a click *other* than auth? Each friction point is an onboarding bug → we harden the skill (the recipe's own feedback loop, same as `macf#530`).
 
 ---
 
 ## 7. References
+
+- **DR-035** + `tools/macf-bootstrap/` — the `macf-bootstrap` automated-provisioning skill (§2-bootstrap).
 
 - `design/macf-consumer-onboarding.md` — the generic bootstrap this recipe specialises.
 - `.claude/rules/coordination.md`, `.claude/rules/delegation-template.md` — the coordination discipline.
