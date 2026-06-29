@@ -4,7 +4,7 @@
 **Date:** 2026-06-29
 **Trigger:** Operator-requested. Every MACF fleet onboarding (see `use-cases/scientific-paper-fleet.md`, `design/macf-consumer-onboarding.md`) requires **manual GitHub GUI work no CLI can do** — creating the per-agent GitHub Apps, downloading their keys, installing them on repos/org. Automate it as a **versioned, marketplace-distributed skill** that drives the *operator's own* logged-in Chrome + `gh` to provision a whole fleet's GitHub side, leaving the operator only the VM-side `git clone` / `macf init` and the unavoidable auth clicks. Design driven by the operator + code-agent (the 2026-06-29 design dialogue); routed to science for canonical-record review + operator ratification. Prior art: science's `macf-science-agent/context/vnc-browser-setup.md` (the VM-side attempt), `macf-science-agent/scripts/setup/SETUP.md` (manifest-flow steps), and the existing `macf-science-agent/secrets/vault.{age,sh,template.txt}` vault.
 
-> **`[DECIDE]` plugin name:** `macf-bootstrap` (recommended — it bootstraps a fleet's GitHub side *from nothing*, breaking the chicken-and-egg that scoped Apps can't create the Apps; distinct from per-agent `macf init`/`update`) vs `macf-setup`. Used as `macf-bootstrap` throughout; operator confirms.
+> **`[DECIDE]` plugin name:** `macf-bootstrap` (recommended — it bootstraps a fleet's GitHub side *from nothing*, breaking the chicken-and-egg that scoped Apps can't create the Apps; distinct from per-agent `macf init`/`update`) vs `macf-setup`. Used as `macf-bootstrap` throughout; code-agent + science both recommend it; operator confirms.
 
 ## Context — the GUI gap, and the chicken-and-egg
 
@@ -43,10 +43,15 @@ The dedicated repo the operator described **is** that workspace; it loads the ma
 
 ### 2. Safety contract (operator-privilege without recklessness)
 
-Acting **as the operator's account** has the operator's full blast radius (every repo, org settings, deletes). "No per-action prompts" (operator requirement) is preserved by moving the gate off per-action onto two structural rails + one upfront approval — **not** a hard project-namespace confinement (rejected: it conflicts with project-independence):
+Acting **as the operator's account** has the operator's full blast radius (every repo, org settings, deletes). "No per-action prompts" (operator requirement) is preserved by moving the gate off per-action onto structural rails + one upfront approval — **not** a hard project-namespace confinement (rejected: it conflicts with project-independence):
 
-1. **Plan-approve-once.** After the Q&A intake the skill computes the *full* provisioning plan (these N Apps, these repos, these secrets) and shows it **once**; the operator approves the plan; it then runs end-to-end with **no further prompts** except auth gates. One approval at the top, not N clicks.
-2. **Surgical destructive-deny (so it never breaks automation).** Provisioning is *all* create/install/configure, so denying only the irreversible-destructive verbs has **zero happy-path impact**: deny **delete-repo, transfer/rename-org, billing, remove member/collaborator, delete an *existing* secret, revoke an *existing* App.** Enforced in workspace `settings.json` deny-rules + a PreToolUse hook, not by asking. (Operator-confirmed: acceptable *because* it cannot block setup.)
+1. **Plan-approve-once — with blast-radius highlighted.** After the Q&A intake the skill computes the *full* provisioning plan (these N Apps, these repos, these secrets) and shows it **once**; the operator approves the plan; it then runs end-to-end with **no further prompts** except auth gates. One approval at the top, not N clicks. Because the single approval's whole safety weight rests on the operator actually scrutinizing it, the plan **highlights the blast-radius items** (touches org-wide settings; commits to your science repo; sets N secrets) so the one approval is a real gate, not a rubber stamp on a long list.
+2. **Surgical destructive-deny (so it never breaks automation) — across BOTH surfaces.** Provisioning is *all* create/install/configure, so denying only the irreversible-destructive verbs has **zero happy-path impact**: deny **delete-repo, transfer/rename-org, billing, remove member/collaborator, delete *or overwrite* an *existing* secret, revoke an *existing* App.** Critically, the tool acts as the operator through **two surfaces**, and the rail must fence **both** — a deny covering only one leaves the operator's full blast radius open on the other:
+   - **Bash/`gh` surface** — `settings.json` deny-rules + a PreToolUse(Bash) hook (the established `check-*.sh` pattern). Covers the `gh`/CLI destructive verbs.
+   - **Browser/MCP surface (the hole a Bash hook does NOT cover — caught in science's #655 review).** The Chrome DevTools MCP drives the operator's *real, logged-in* browser, so a destructive action done *in the browser* (navigate to a repo Danger Zone, `…/settings`, `…/billing`, an App's revoke page) is an **`mcp__chrome-devtools__*` tool call, not a Bash call** — the Bash rail is structurally blind to it. So the browser is fenced with a **URL/action allowlist on the Chrome MCP navigate/click calls**: *allow* the manifest-flow form + the OAuth/sudo gate pages + the specific install/settings pages provisioning needs; *deny* `/settings/…/danger`, `/billing`, delete/transfer/revoke URLs. Procedural fencing ("browser only for App-creation + auth") is **not** sufficient alone for an operator-blast-radius tool.
+   - **Overwrite ≠ delete.** `gh secret set <name>` on an existing name *silently clobbers* — so secret-set is **create-only (fail-if-exists)**; an intended overwrite needs explicit operator confirmation. A re-run or a name collision with a live fleet must not silently overwrite a secret.
+
+   (Operator-confirmed: the deny set is acceptable *because* it cannot block setup — every denied verb is one provisioning never performs.)
 3. **No credential handling.** The skill uses the operator's *already-authenticated* Chrome session + `gh` user auth — it never sees or stores the operator's password/2FA.
 
 **Auth gates remain the operator's only clicks.** GitHub forces OAuth consent + **sudo-mode re-auth** (password/2FA) for sensitive ops, recurring every few hours — so during a long run the skill hits the gate **repeatedly**. "Pause → operator satisfies auth → resume" is a **first-class, expected loop**, not an error. That is the entirety of the operator's manual interaction.
@@ -69,7 +74,7 @@ Not project-scoped: it sets up **any project, any number of agents**. The skill 
 3. installs the Apps on their repos/org;
 4. sets the routing secrets + CA var + org settings;
 5. generates the per-project CA (Mac-side; uploads the `<PROJECT>_CA_CERT` var; CA key → vault);
-6. builds the **age-encrypted vault** and **commits it to the project's science repo** (clone to `/tmp`, drop `secrets/vault.age` + `vault.sh` + template, commit, push).
+6. builds the **age-encrypted vault** and **commits it to the project's science repo** (clone to `/tmp`, drop `secrets/vault.age` + `vault.sh` + template, commit, push) — **non-destructively**: if `vault.age` already exists it **fails-or-versions** (never silently clobbers a prior vault), and the push is a **normal push, never `--force`** (a re-run must not damage the existing science repo — the same "never irreversibly mutate existing state" guard as the deny rail, applied to the repo write). **Secure-cleanup:** the keys exist *decrypted* in the `/tmp` clone during vault construction, so the skill **shreds the `/tmp` workspace + every plaintext intermediate** on completion (and on abort) — a secrets tool leaves no plaintext on disk.
 
 ### 5. The three outputs (a run's definition-of-done)
 
@@ -102,6 +107,7 @@ The skill does **the whole project except the final VM `git clone` / `macf init`
 - Does not handle the operator's login credentials (uses the already-authenticated session).
 - Is not a fleet member (no channel-server, registry, or identity App) — it is ephemeral bootstrap tooling.
 - Is not a general TUI-automation framework — strictly the GitHub-provisioning allowlist.
+- **The workspace DELIBERATELY omits the fleet attribution-guard hooks** (`check-gh-token.sh` et al.) — it acts *as the operator*, the intentional inverse of the fleet discipline (`gh-token-attribution-traps.md`). This omission MUST be an **explicit, documented** config (a header in the workspace settings), and the workspace marked **operator-privileged, never reusable as a fleet agent** — so it reads as deliberate design, not drift. (A fleet agent that lost its `check-gh-token` hook would be a bug; here the absence is the point — but only when stated.)
 
 ## Consequences
 
