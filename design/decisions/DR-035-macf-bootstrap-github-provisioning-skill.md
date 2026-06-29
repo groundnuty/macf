@@ -1,6 +1,6 @@
 # DR-035: macf-bootstrap — operator-privileged GitHub-provisioning skill (the un-CLI-able fleet setup)
 
-**Status:** Proposed
+**Status:** Accepted (ratified by operator 2026-06-29)
 **Date:** 2026-06-29
 **Trigger:** Operator-requested. Every MACF fleet onboarding (see `use-cases/scientific-paper-fleet.md`, `design/macf-consumer-onboarding.md`) requires **manual GitHub GUI work no CLI can do** — creating the per-agent GitHub Apps, downloading their keys, installing them on repos/org. Automate it as a **versioned, marketplace-distributed skill** that drives the *operator's own* logged-in Chrome + `gh` to provision a whole fleet's GitHub side, leaving the operator only the VM-side `git clone` / `macf init` and the unavoidable auth clicks. Design driven by the operator + code-agent (the 2026-06-29 design dialogue); routed to science for canonical-record review + operator ratification. Prior art: science's `macf-science-agent/context/vnc-browser-setup.md` (the VM-side attempt), `macf-science-agent/scripts/setup/SETUP.md` (manifest-flow steps), and the existing `macf-science-agent/secrets/vault.{age,sh,template.txt}` vault.
 
