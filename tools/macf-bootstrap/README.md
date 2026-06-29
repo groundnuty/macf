@@ -110,9 +110,11 @@ tools/macf-bootstrap/
 │       ├── check-bootstrap-gh-guard.sh         ← Bash/gh rail (destructive-deny + create-only secret set)
 │       ├── bootstrap-validate-env.sh           ← start-of-run env validation (gh-user / age / jq / rails / chrome)
 │       ├── bootstrap-exchange-manifest.sh      ← redeem the manifest `code` → app_id + private-key PEM + secrets
-│       ├── bootstrap-build-vault.sh            ← age-encrypt the assembled creds → vault.age (shreds plaintext)
+│       ├── bootstrap-build-vault.sh            ← age-encrypt the assembled creds (plaintext piped on STDIN) → vault.age
 │       ├── bootstrap-commit-vault.sh           ← commit vault.age to the science repo (fail-if-exists, never --force)
+│       ├── bootstrap-cleanup.sh                ← wipe the .bootstrap-work/ scratch dir (always; success + abort)
 │       └── bootstrap-emit-commands.sh          ← render the VM-side macf init + verification commands
+├── .gitignore                                  ← keep scratch secrets out of git (.bootstrap-work/, *.app.json, vault*.age, age key)
 ├── .mcp.json                                   ← Chrome DevTools MCP server, --browser-url to the operator's Chrome
 ├── templates/
 │   ├── macf-app-manifest.json                  ← the DR-019 App manifest the skill submits (manifest flow)
@@ -121,6 +123,14 @@ tools/macf-bootstrap/
 │   └── bootstrap-spec.example.json             ← example project spec for bootstrap-emit-commands.sh
 └── README.md                                   ← this file
 ```
+
+> **Secrets-on-disk hygiene (DR-035 §4).** The vault plaintext is never written
+> to a file — it is piped to `bootstrap-build-vault.sh` on STDIN and streamed into
+> `age`. The scratch dir `.bootstrap-work/` (per-agent `*.app.json` PEMs, the
+> `vault.age`, the age key, the spec) is `.gitignore`d and wiped by
+> `bootstrap-cleanup.sh` on both success and abort. `shred` is best-effort and a
+> no-op on macOS/APFS — the real at-rest protection is FileVault; the structural
+> wins are the STDIN-pipe + `.gitignore` + always-cleanup.
 
 ## References
 

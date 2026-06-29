@@ -208,17 +208,35 @@ cert variable upload is part of `macf certs init`; verify it landed.
 
 Assemble the plaintext per `templates/vault.template.txt` from every
 `./.bootstrap-work/<name>.app.json`, the `macf-routing` creds, the 6 routing
-secrets, and the CA key (base64-encode PEMs/certs/keys). Write it to
-`./.bootstrap-work/vault.plain`. Then:
+secrets, and the CA key (base64-encode PEMs/certs/keys), and **PIPE it straight
+into `bootstrap-build-vault.sh` on STDIN — do NOT write a `vault.plain` file.**
+The script streams STDIN into `age`, so the plaintext is never materialized on
+disk (secure-by-construction). The per-agent `*.app.json` files are the only
+plaintext that touches disk in this flow; they are `.gitignore`d and wiped by
+`bootstrap-cleanup.sh` (Step 7).
 
 ```bash
-# Encrypt (mint a keypair if no --recipient; shreds the plaintext on success):
-"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-build-vault.sh" \
-  --in ./.bootstrap-work/vault.plain \
-  --out ./.bootstrap-work/vault.age \
-  --key-out ./.bootstrap-work/vault-age-key.txt   # omit --recipient → fresh keypair
+# Assemble the vault plaintext and PIPE it to build-vault on STDIN (no vault.plain).
+# This brace-group is illustrative — fill in INSTALL_ID (from spec.json), the
+# macf-routing creds, the 6 routing secrets, and the base64 CA key/cert the same
+# way, matching templates/vault.template.txt.
+{
+  for f in ./.bootstrap-work/*.app.json; do
+    name="$(jq -r .name "$f" | tr 'a-z-' 'A-Z_')"
+    printf 'MACF_AGENT_%s_APP_ID="%s"\n'          "$name" "$(jq -r .app_id "$f")"
+    printf 'MACF_AGENT_%s_CLIENT_ID="%s"\n'       "$name" "$(jq -r .client_id "$f")"
+    printf 'MACF_AGENT_%s_CLIENT_SECRET="%s"\n'   "$name" "$(jq -r .client_secret "$f")"
+    printf 'MACF_AGENT_%s_WEBHOOK_SECRET="%s"\n'  "$name" "$(jq -r .webhook_secret "$f")"
+    printf 'MACF_AGENT_%s_PRIVATE_KEY_B64="%s"\n' "$name" "$(jq -r .pem "$f" | base64 | tr -d '\n')"
+  done
+  # + MACF_AGENT_<name>_INSTALL_ID per agent (from spec.json)
+  # + MACF_ROUTING_APP_ID / MACF_ROUTING_APP_KEY_B64
+  # + the 6 routing secrets + MACF_<PROJECT>_CA_KEY_B64 / _CA_CERT_B64
+} | "$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-build-vault.sh" \
+      --out ./.bootstrap-work/vault.age \
+      --key-out ./.bootstrap-work/vault-age-key.txt   # omit --recipient → fresh keypair
 
-# Commit into the science repo (fail-if-exists; never --force; shreds the /tmp clone):
+# Commit into the science repo (fail-if-exists; never --force; wipes the /tmp clone):
 "$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-commit-vault.sh" \
   --repo <science-repo> \
   --vault ./.bootstrap-work/vault.age \
@@ -226,10 +244,9 @@ secrets, and the CA key (base64-encode PEMs/certs/keys). Write it to
   --template "$CLAUDE_PROJECT_DIR/templates/vault.template.txt"
 ```
 
-Tell the operator the **age private key path** (`./.bootstrap-work/vault-age-key.txt`)
-— they scp it to the VM out-of-band (the vault.age rides in via git; the key does
-not). After commit, shred any remaining plaintext intermediates in
-`./.bootstrap-work/` (the build/commit scripts shred their own; remove the rest).
+The age private-key handoff + scratch-dir wipe are Steps 6 and 7 (after the
+outputs are emitted) — the key must survive until the operator confirms the scp,
+then it is shredded.
 
 ---
 
@@ -246,20 +263,77 @@ substituted) and **output #3** (the verification commands: `macf fleet status` /
 Apps exist + are installed and the secrets are present). Output #1 (the vault) was
 committed in Step 4f.
 
-Hand the operator: (a) the emitted command list, (b) the age key path to scp, and
-(c) a one-line summary (N Apps created, N repos, vault committed to <science repo>).
+Hand the operator: (a) the emitted command list, (b) the age key path to scp
+(handed off + shredded in Step 6), and (c) a one-line summary (N Apps created, N
+repos, vault committed to <science repo>).
+
+---
+
+## Step 6 — Hand off the age private key, then shred it
+
+The vault rides to the VM via `git` (encrypted — safe in a private repo); its
+**age decryption key goes out-of-band**. Do NOT leave the key in the scratch dir.
+
+1. Surface the key path to the operator and ask them to copy it to the VM:
+
+   ```
+   age decryption key:  ./.bootstrap-work/vault-age-key.txt
+   scp it to the VM out-of-band, e.g.:
+     scp ./.bootstrap-work/vault-age-key.txt <vm>:~/.macf/<project>-vault-age-key.txt
+   Tell me once the key is on the VM and I'll shred it from this workspace.
+   ```
+
+2. **Wait for the operator to confirm the handoff.** This is one of the few
+   expected interactive pauses (like the auth gates) — not a per-action approval.
+
+3. Once confirmed, the key is removed by the Step 7 scratch-dir wipe (it lives in
+   `./.bootstrap-work/`). Run Step 7 now — that shreds the key along with the rest.
+
+---
+
+## Step 7 — Always wipe the scratch dir (success AND abort)
+
+```bash
+"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-cleanup.sh"
+```
+
+This shred-removes the **entire** `./.bootstrap-work/` — every `*.app.json` PEM,
+any `vault.plain`, `vault.age`, the `vault-age-key.txt`, and `spec.json`. It is
+idempotent and safe to call repeatedly.
+
+**Run it ALWAYS** — on the success path (after the Step 6 key handoff is
+confirmed) AND on any abort/error. If you orchestrate the run inside a single
+long Bash block, register it as an EXIT trap up front so an interrupt still
+cleans up:
+
+```bash
+trap '"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-cleanup.sh"' EXIT
+```
+
+> **Accurate at-rest note (do not overclaim).** `shred` is best-effort and a
+> **no-op on macOS/APFS** (copy-on-write never overwrites in place). The real
+> at-rest protection on the operator's Mac is **FileVault**. What this tool
+> guarantees structurally is: the plaintext vault is never written to disk (Step
+> 4f pipes it on STDIN), nothing secret is ever committed (`.gitignore`), and the
+> scratch dir is wiped on both success and abort (this step). Those are the
+> load-bearing protections — not shred.
 
 ---
 
 ## Reminders
 
 - **No per-command approval.** `Bash(*)` is pre-approved; the only interactive
-  points are the single plan approval (Step 3) + GitHub auth gates (Step 4). The
-  deny-rails — not prompts — fence the destructive surface. Do not ask the operator
-  to approve individual `gh`/MCP calls.
+  points are the single plan approval (Step 3), the GitHub auth gates (Step 4),
+  and the age-key handoff confirmation (Step 6). The deny-rails — not prompts —
+  fence the destructive surface. Do not ask the operator to approve individual
+  `gh`/MCP calls.
 - **Never** run a destructive GitHub op (delete/transfer/rename repo, delete
   secret, `gh api … DELETE`, force-push) — the rails block them; don't try to
   route around them. An intended exception is the operator's call via the documented
   override env var.
-- **No plaintext left behind.** Keys flow manifest-exchange → vault. Shred
-  intermediates. The build/commit scripts already shred their own.
+- **No plaintext vault on disk by construction.** The assembled plaintext is
+  piped to `bootstrap-build-vault.sh` on STDIN — never written as `vault.plain`.
+  The per-agent `*.app.json` PEMs are the only plaintext on disk; they are
+  `.gitignore`d and wiped by `bootstrap-cleanup.sh` (Step 7), which runs on
+  success AND abort. `shred` is best-effort (no-op on macOS/APFS); FileVault is
+  the real at-rest protection.

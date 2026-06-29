@@ -17,8 +17,11 @@
 #     timestamped secrets/vault.<UTC>.age beside it (version, don't overwrite).
 #   - the push is a NORMAL push — never --force (force-push is also denied in
 #     settings.json + the gh guard).
-#   - the /tmp clone (which briefly holds the vault on disk) is SHREDDED + removed
-#     on completion AND on abort (trap), so no plaintext/secret residue is left.
+#   - the /tmp clone (which briefly holds the encrypted vault on disk) is removed
+#     on completion AND on abort (trap), with a best-effort `shred` pass first.
+#     NOTE: `shred` is a no-op on macOS/APFS (copy-on-write) — the real at-rest
+#     protection is FileVault; the durable win here is that the clone is always
+#     removed (success + abort), not the overwrite.
 #
 # Refs: DR-035 §4/§6; sister scripts bootstrap-{exchange-manifest,build-vault}.sh.
 set -euo pipefail
