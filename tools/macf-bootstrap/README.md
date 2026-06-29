@@ -89,7 +89,31 @@ we never run against a framework we cannot verify). This is the same
 incompatible framework, just as it won't run in a workspace missing the safety
 env (`age` / user-`gh` / the two deny-rails — see the safety model above).
 
-## Installing / using a specific version
+## Installing
+
+**One-time, for all use-cases** (not per project) — create the standalone workspace
+repo so you can `git clone` just the bootstrap workspace. This is an **operator
+action**: a scoped bot can't `gh repo create` (account-level) — the same
+chicken-and-egg privilege reason macf-bootstrap itself runs *as the operator* (DR-035).
+Run where `gh` is authed **as you**:
+
+```bash
+SRC=<your-macf-checkout>/tools/macf-bootstrap   # this directory
+gh repo create groundnuty/macf-automated-github-setup --private \
+  --description "Operator-privileged MACF fleet GitHub-provisioning workspace (DR-035)."
+TMP=$(mktemp -d); cp -a "$SRC/." "$TMP/"; cd "$TMP"
+git init -b main && git add -A && git commit -m "chore: macf-bootstrap workspace v0.1.0"
+git remote add origin https://github.com/groundnuty/macf-automated-github-setup.git
+git push -u origin main
+```
+
+Then on the Mac: `git clone https://github.com/groundnuty/macf-automated-github-setup ~/macf-automated-github-setup`.
+(Or skip the standalone repo and use this `tools/macf-bootstrap/` subdir of a macf checkout directly as the workspace.)
+
+To **refresh** when a new macf-bootstrap version ships, re-sync the contents from
+`groundnuty/macf:tools/macf-bootstrap/` (the canonical source) and push — see versioning below.
+
+## Versioning / using a specific version
 
 The **distribution unit is this complete workspace** (versioned + compat-declared),
 surfaced in the marketplace at its **own** version. A marketplace plugin carries
