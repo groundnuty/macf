@@ -44,46 +44,68 @@ They are **complementary**: the role layer says *how this agent thinks about its
 
 ### 2-bootstrap. Automated provisioning with `macf-bootstrap` (recommended) `[OPERATOR DOGFOOD]`
 
-> This is new (DR-035, built 2026-06-29) and wants your real-world feedback — what's unclear, what breaks, what's missing. Note friction as you go (§6 has a feedback hook).
+> New (DR-035, 2026-06-29) — wants your real-world feedback (§6 hook).
 
-**One-time — get the setup workspace** (a dedicated, operator-privileged Claude Code workspace; it acts AS your GitHub account, so it is NOT a fleet agent and runs only here):
+**`macf-bootstrap` is framework infrastructure — installed ONCE for all use-cases, not per project.** It's a dedicated operator-privileged workspace that drives your Chrome + `gh` to provision *any* fleet's GitHub side. If you haven't installed it yet, do the one-time setup per the bootstrap README → **[Installing](../tools/macf-bootstrap/README.md#installing)** (it covers creating the standalone `macf-automated-github-setup` workspace). Then reuse it for every fleet, including this one. The rest of this section assumes the workspace exists at `~/macf-automated-github-setup`.
+
+**Prerequisites on your Mac** (where Chrome + your GitHub login live): `macf` CLI ≥ 0.2.43 · `gh` authed **as you** (`gh auth status` → your user, not a `ghs_` bot) · `age` · `jq` · the Chrome DevTools MCP (auto-fetched by the workspace `.mcp.json`).
+
+**Provision the `icsoc-2026` fleet — copy-paste:**
 
 ```bash
-# The canonical workspace lives at groundnuty/macf:tools/macf-bootstrap/.
-# Create the standalone clone repo as YOURSELF (gh authed as your user) — this is
-# a one-time convenience so you can `git clone` just the workspace.
-# (Separately, the SAME account-level privilege — bots can't createRepository /
-# create Apps — is the chicken-and-egg reason macf-bootstrap itself runs as the
-# operator rather than as a scoped agent. DR-035.)
-SRC=<your-macf-checkout>/tools/macf-bootstrap
-gh repo create groundnuty/macf-automated-github-setup --private \
-  --description "Operator-privileged MACF fleet GitHub-provisioning workspace (DR-035)."
-TMP=$(mktemp -d); cp -a "$SRC/." "$TMP/"; cd "$TMP"
-git init -b main && git add -A && git commit -m "chore: macf-bootstrap workspace v0.1.0"
-git remote add origin https://github.com/groundnuty/macf-automated-github-setup.git
-git push -u origin main
-# (Or skip the standalone repo and just use the tools/macf-bootstrap/ subdir of a macf clone.)
+# 1. Start Chrome logged into GitHub, attached for the skill (macOS path; adjust for your OS):
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9222 >/dev/null 2>&1 &
 ```
 
-**Per fleet — run the skill (on your Mac, where Chrome + your GitHub login live):**
+```bash
+# 2. Launch the bootstrap workspace:
+cd ~/macf-automated-github-setup
+claude
+```
 
-1. Have on the Mac: `macf` CLI **≥ 0.2.43** (the skill enforces this via its `compatibility.macf` field), `gh` authed **as YOU** (`gh auth status` → your user, not a `ghs_` bot), `age`, `jq`, and the **Chrome DevTools MCP** (`chrome-devtools-mcp` — auto-fetched by `.mcp.json`).
-2. **Start Chrome logged into GitHub with remote debugging:** launch Chrome with `--remote-debugging-port=9222`. The workspace's `.mcp.json` is baked to attach to *that* session (`--browser-url=http://127.0.0.1:9222`), so the skill drives your real, already-authenticated browser — no credential handling.
-3. **Clone + launch:** `git clone …/macf-automated-github-setup && cd macf-automated-github-setup`, then open Claude Code here.
-4. **Run `/macf-bootstrap`.**
-5. **Answer the intake** — project name (`icsoc-2026`), per agent `{role, repo name, VM deploy path}`, registry scope (`profile` → `groundnuty`), advertise-host, the **science repo** (where the vault is committed), and an **age recipient** (an `age1…` public key) — or let it mint a keypair and hand you the private key.
-6. **Approve the ONE plan** — it prints the full plan with the **blast-radius items highlighted** (acts as your account; creates N Apps + N repos; sets N secrets; commits to your science repo). Approve once → it runs end-to-end.
-7. **Satisfy the GitHub auth gates** as they appear (OAuth consent / sudo-mode / 2FA) — these are the **only** clicks; recur every few hours; pause → you complete the gate → it resumes.
-8. **Outputs:** the **age-encrypted vault committed to your science repo**, a **filled-in `macf init` command list**, and the **verification commands**.
+```text
+# 3. In the Claude Code session, run the skill:
+/macf-bootstrap
+```
 
-**Finish on the VM (the only steps the skill leaves to you, by design):**
+The skill interviews you — give it **this fleet's spec** (the only project-specific input):
 
-9. **scp the age private key** to the VM (out-of-band — the encrypted vault rides in via git; the key does not).
-10. On the VM: `git clone` the science repo → run its `secrets/vault.sh` to decrypt the vault + materialize the per-agent keys to `~/.macf/keys/`.
-11. Run the emitted **`macf init`** commands (one per agent), then `./claude.sh` to launch each.
-12. Run the **§3f fleet health check** to confirm all agents are green.
+| Intake prompt | Value for `icsoc-2026` |
+|---|---|
+| project name | `icsoc-2026` |
+| science-agent | role `science-agent` · repo `groundnuty/icsoc-2026-science-agent` · VM path `/home/ubuntu/repos/agh/icsoc-2026-science-agent` |
+| code-agent | role `code-agent` · repo `groundnuty/icsoc-2026-experiment` · VM path `/home/ubuntu/repos/agh/icsoc-2026-experiment` |
+| writer-agent | role `writer-agent` · repo `groundnuty/icsoc-2026` · VM path `/home/ubuntu/repos/papers/icsoc-2026` |
+| registry scope | `profile` → `groundnuty` |
+| advertise-host | `orzech-dev-agents.tail491af.ts.net` |
+| science repo (vault target) | `groundnuty/icsoc-2026-science-agent` |
+| age recipient | your `age1…` public key — or let it mint a keypair + hand you the private key |
 
-If anything in steps 1–12 is unclear or breaks, that's the feedback we want (§6).
+Then **approve the one plan** (it highlights blast-radius), and **satisfy the GitHub auth gates** as they pop (OAuth / sudo / 2FA — the only clicks; pause → you complete it → it resumes). **Outputs:** the age-encrypted vault committed to the science repo + a filled-in `macf init` command list + the verify commands.
+
+**Finish on the VM — copy-paste** (using the skill's emitted output):
+
+```bash
+# 4. Hand the age key to the VM out-of-band (the encrypted vault itself rides in via git):
+scp <age-key-path> magent:~/.config/macf/bootstrap-age.key
+```
+
+```bash
+# 5. On the VM — per agent: clone, decrypt the vault, run the emitted `macf init`, launch:
+ssh magent
+#   git clone <agent-repo> <vm-path> && cd <vm-path>
+#   ../<science-repo>/secrets/vault.sh        # decrypt → materializes keys to ~/.macf/keys/
+#   <paste the agent's emitted `macf init …` line>
+#   ./claude.sh
+```
+
+```bash
+# 6. Verify the whole fleet is green (DR-030 — §3f):
+macf fleet status && macf routing doctor && macf fleet doctor
+```
+
+If anything in these steps is unclear or breaks, that's the feedback we want (§6).
 
 ---
 
