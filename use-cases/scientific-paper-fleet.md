@@ -46,7 +46,7 @@ They are **complementary**: the role layer says *how this agent thinks about its
 
 > New (DR-035, 2026-06-29) — wants your real-world feedback (§6 hook).
 
-**`macf-bootstrap` is framework infrastructure — installed ONCE for all use-cases, not per project.** It's a dedicated operator-privileged workspace that drives your Chrome + `gh` to provision *any* fleet's GitHub side. If you haven't installed it yet, do the one-time setup per the bootstrap README → **[Installing](../tools/macf-bootstrap/README.md#installing)** (it covers creating the standalone `macf-automated-github-setup` workspace). Then reuse it for every fleet, including this one. The rest of this section assumes the workspace exists at `~/macf-automated-github-setup`.
+**`macf-bootstrap` is framework infrastructure — it ships *in* the macf repo at `tools/macf-bootstrap/`, used for all use-cases, not created per project.** It's a dedicated operator-privileged workspace that drives your Chrome + `gh` to provision *any* fleet's GitHub side. The steps below clone it fresh — **nothing needs to exist on your Mac first.** (For repeat use you can optionally cut a standalone clone repo — see the bootstrap README → **[Installing](../tools/macf-bootstrap/README.md#installing)** — but it's not required.)
 
 **Prerequisites on your Mac** (where Chrome + your GitHub login live): `macf` CLI ≥ 0.2.43 · `gh` authed **as you** (`gh auth status` → your user, not a `ghs_` bot) · `age` · `jq` · the Chrome DevTools MCP (auto-fetched by the workspace `.mcp.json`).
 
@@ -59,8 +59,10 @@ They are **complementary**: the role layer says *how this agent thinks about its
 ```
 
 ```bash
-# 2. Launch the bootstrap workspace:
-cd ~/macf-automated-github-setup
+# 2. Get + launch the bootstrap workspace — from NOTHING: clone the macf repo, cd its
+#    tools/macf-bootstrap subdir (that IS the workspace), and open Claude Code there:
+git clone https://github.com/groundnuty/macf ~/macf
+cd ~/macf/tools/macf-bootstrap
 claude
 ```
 
@@ -86,18 +88,35 @@ Then **approve the one plan** (it highlights blast-radius), and **satisfy the Gi
 
 **Finish on the VM — copy-paste** (using the skill's emitted output):
 
+The skill has now created all the repos on GitHub (from the role template) + committed the vault into the science repo. **Nothing is on the VM yet** — the next steps clone everything from GitHub and set it up from scratch.
+
 ```bash
-# 4. Hand the age key to the VM out-of-band (the encrypted vault itself rides in via git):
-scp <age-key-path> magent:~/.config/macf/bootstrap-age.key
+# 4. Hand the age key to the VM out-of-band (the encrypted vault itself rides in via git).
+#    Target path = the default vault.sh reads (~/.config/macf/vault-age-key.txt):
+ssh magent 'mkdir -p ~/.config/macf'
+scp <age-key-path> magent:~/.config/macf/vault-age-key.txt
 ```
 
 ```bash
-# 5. On the VM — per agent: clone, decrypt the vault, run the emitted `macf init`, launch:
-ssh magent
-#   git clone <agent-repo> <vm-path> && cd <vm-path>
-#   ../<science-repo>/secrets/vault.sh        # decrypt → materializes keys to ~/.macf/keys/
-#   <paste the agent's emitted `macf init …` line>
-#   ./claude.sh
+# 5. On the VM — clone every repo from GitHub, decrypt the vault, init + launch each agent.
+ssh magent          # then run the rest ON the VM:
+
+# 5a. Clone the science repo (it carries the age-encrypted vault) and unlock the vault:
+gh repo clone groundnuty/icsoc-2026-science-agent /home/ubuntu/repos/agh/icsoc-2026-science-agent
+cd /home/ubuntu/repos/agh/icsoc-2026-science-agent
+source secrets/vault.sh      # decrypts vault.age → exports creds + writes ~/.macf/keys/*.pem
+
+# 5b. Clone the other two agent repos to their home paths:
+gh repo clone groundnuty/icsoc-2026-experiment /home/ubuntu/repos/agh/icsoc-2026-experiment
+gh repo clone groundnuty/icsoc-2026            /home/ubuntu/repos/papers/icsoc-2026
+```
+
+```bash
+# 5c. Paste the macf init block the skill EMITTED (IDs + key paths pre-filled), then launch.
+#     It is a ready-to-run command per agent — shape:
+( cd /home/ubuntu/repos/agh/icsoc-2026-science-agent && macf init --project icsoc-2026 … && ./claude.sh )
+( cd /home/ubuntu/repos/agh/icsoc-2026-experiment    && macf init --project icsoc-2026 … && ./claude.sh )
+( cd /home/ubuntu/repos/papers/icsoc-2026            && macf init --project icsoc-2026 … && ./claude.sh )
 ```
 
 ```bash
