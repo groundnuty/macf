@@ -50,9 +50,11 @@ They are **complementary**: the role layer says *how this agent thinks about its
 
 ```bash
 # The canonical workspace lives at groundnuty/macf:tools/macf-bootstrap/.
-# Create the standalone clone repo — THIS step is an OPERATOR action: a scoped
-# bot cannot create repos (createRepository is account-level), which is the exact
-# privilege gap macf-bootstrap exists to bridge. Run where gh is authed AS YOU:
+# Create the standalone clone repo as YOURSELF (gh authed as your user) — this is
+# a one-time convenience so you can `git clone` just the workspace.
+# (Separately, the SAME account-level privilege — bots can't createRepository /
+# create Apps — is the chicken-and-egg reason macf-bootstrap itself runs as the
+# operator rather than as a scoped agent. DR-035.)
 SRC=<your-macf-checkout>/tools/macf-bootstrap
 gh repo create groundnuty/macf-automated-github-setup --private \
   --description "Operator-privileged MACF fleet GitHub-provisioning workspace (DR-035)."
