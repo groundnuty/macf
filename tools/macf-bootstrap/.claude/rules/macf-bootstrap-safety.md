@@ -81,6 +81,17 @@ approval's whole safety weight rests on the operator scrutinizing it, so the
 plan **highlights the blast-radius items** (touches org-wide settings; commits
 to your science repo; sets N secrets) — a real gate, not a rubber stamp.
 
+**Invariant — no per-command approval.** `Bash(*)` is pre-approved in
+`settings.json`; the ONLY interactive points in a run are the **single plan
+approval** (above) and the recurring **GitHub auth-gates** (§5). There are no
+per-action `ask` prompts, and none must be added — the deny-rails (§2), **not**
+prompts, are what fence the destructive surface. Do **not** narrow `Bash(*)`,
+add an `ask` permission, or otherwise reintroduce per-command confirmation:
+that would defeat the operator's no-prompt-autonomy requirement while adding no
+safety the rails don't already provide (a prompt the operator clicks through is
+not a fence; the deny-rail is). The safety model is "act freely, but be
+structurally unable to do anything irreversible" — keep the gate structural.
+
 ## 5. Auth gates are the operator's only clicks
 
 GitHub forces OAuth consent + **sudo-mode re-auth** (password / 2FA) for

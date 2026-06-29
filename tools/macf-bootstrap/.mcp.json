@@ -1,8 +1,9 @@
 {
+  "_comment": "Chrome DevTools MCP, pointed at the OPERATOR'S already-logged-in Chrome via --browser-url (DR-035). Start Chrome with --remote-debugging-port=9222 FIRST (see README), then launch Claude Code here. Attaching to the operator's session (not a fresh browser) is what reuses existing GitHub cookies so OAuth/sudo/2FA need no credential handling. The browser surface is fenced by the check-bootstrap-url-allowlist.sh PreToolUse hook (settings.json).",
   "mcpServers": {
     "chrome-devtools": {
       "command": "npx",
-      "args": ["-y", "chrome-devtools-mcp@latest"]
+      "args": ["-y", "chrome-devtools-mcp@latest", "--browser-url=http://127.0.0.1:9222"]
     }
   }
 }

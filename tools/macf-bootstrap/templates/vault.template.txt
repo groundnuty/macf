@@ -1,0 +1,38 @@
+# macf-bootstrap vault — PLAINTEXT SHAPE (DR-035 output #1)
+#
+# This is the template the skill fills in to build the vault PLAINTEXT, which
+# bootstrap-build-vault.sh then age-encrypts to `vault.age`. The plaintext is a
+# shell-sourceable env file: vault.sh decrypts vault.age and `source`s the result,
+# then materializes the per-agent PEMs to ~/.macf/keys/<name>.pem (0600).
+#
+# It holds EVERY generated credential for the fleet:
+#   - per-agent App: app_id, install_id, client_id/secret, webhook_secret, PEM
+#   - the macf-routing App: app_id + PEM
+#   - the 6 routing secrets (client cert/key, Tailscale OAuth, routing App id/key)
+#   - the per-project CA key
+#
+# PEMs / certs / keys are base64-encoded (single-line, source-safe). <NAME> is the
+# agent name uppercased with hyphens→underscores. <PROJECT> likewise.
+#
+# ── per-agent (repeat the block per agent) ──────────────────────────────────
+MACF_AGENT_<NAME>_APP_ID="<app_id>"
+MACF_AGENT_<NAME>_INSTALL_ID="<install_id>"
+MACF_AGENT_<NAME>_CLIENT_ID="<client_id>"
+MACF_AGENT_<NAME>_CLIENT_SECRET="<client_secret>"
+MACF_AGENT_<NAME>_WEBHOOK_SECRET="<webhook_secret>"
+MACF_AGENT_<NAME>_PRIVATE_KEY_B64="<base64 of the .pem>"
+
+# ── macf-routing App (one per fleet) ────────────────────────────────────────
+MACF_ROUTING_APP_ID="<routing_app_id>"
+MACF_ROUTING_APP_KEY_B64="<base64 of the routing App .pem>"
+
+# ── the 6 routing secrets (per macf-consumer-onboarding.md) ──────────────────
+ROUTING_CLIENT_CERT_B64="<base64 PEM>"
+ROUTING_CLIENT_KEY_B64="<base64 PEM>"
+TS_OAUTH_CLIENT_ID="<tailscale oauth client id>"
+TS_OAUTH_SECRET="<tailscale oauth secret>"
+# (MACF_ROUTING_APP_ID + MACF_ROUTING_APP_KEY above complete the 6.)
+
+# ── per-project CA (generated Mac-side via `macf certs init`) ────────────────
+MACF_<PROJECT>_CA_KEY_B64="<base64 of the CA private key>"
+MACF_<PROJECT>_CA_CERT_B64="<base64 of the CA cert>"
