@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment_workspace": "OPERATOR-PRIVILEGED BOOTSTRAP WORKSPACE (DR-035). This workspace acts AS THE OPERATOR's GitHub account (the deliberate INVERSE of the fleet attribution discipline) so it can create the scoped Apps the chicken-and-egg forbids a scoped App from creating. It runs with NO per-action prompts, fenced ONLY by the two structural rails below. NEVER reuse this workspace as a fleet agent. See .claude/rules/macf-bootstrap-safety.md + README.md.",
+  "_comment_attribution_omission": "DELIBERATE OMISSION (DR-035 Boundaries): the fleet attribution-guard hooks (check-gh-token.sh / check-gh-attribution.sh / check-mention-routing.sh / check-lgtm-gate.sh / check-close-keyword.sh) are intentionally ABSENT here. A fleet agent missing check-gh-token would be a bug; here the absence is the point — this workspace is SUPPOSED to act as the operator, not a ghs_ bot token. The only hooks are the two destructive-deny rails (URL allowlist + gh guard).",
+  "_comment_rails": "Two structural rails fence the operator's blast radius without per-action prompts: (1) permissions.deny on the Bash/gh destructive surface + the check-bootstrap-gh-guard.sh PreToolUse(Bash) hook; (2) the check-bootstrap-url-allowlist.sh PreToolUse hook on the chrome-devtools MCP browser surface. CRITICAL: the chrome-devtools MCP tools are in allow (NOT deny) — a permissions.deny fires BEFORE PreToolUse hooks and skips them, so denying the tool would skip the URL guard entirely; and permissions.deny cannot arg-match mcp__* tools anyway.",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "Bash(*)",
+      "mcp__chrome-devtools__*"
+    ],
+    "deny": [
+      "Bash(gh repo delete*)",
+      "Bash(gh repo transfer*)",
+      "Bash(gh repo rename*)",
+      "Bash(gh secret delete*)",
+      "Bash(gh variable delete*)",
+      "Bash(gh api * -X DELETE*)",
+      "Bash(gh api * --method DELETE*)",
+      "Bash(gh api * -XDELETE*)",
+      "Bash(gh api * --method=DELETE*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(rm -rf /)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__chrome-devtools__*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-bootstrap-url-allowlist.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-bootstrap-gh-guard.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
