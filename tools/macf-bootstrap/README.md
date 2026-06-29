@@ -1,9 +1,12 @@
 # macf-bootstrap — operator-privileged GitHub-provisioning workspace
 
-This directory is the **safety-foundation workspace template** for
-`macf-bootstrap` (DR-035) — the operator-invoked tool that provisions a whole
-MACF fleet's GitHub side (the per-agent GitHub Apps, their keys, installs, repos,
-secrets, CA var, vault) that no CLI can create on its own.
+This directory is the **dev source** for `macf-bootstrap` (DR-035) — a **separate
+product**, delivered as the standalone `groundnuty/macf-automated-github-setup`
+repo (what users clone), developed here in the macf monorepo and published to that
+repo at each version (the `macf-actions` / `macf-marketplace` pattern). It is the
+operator-invoked tool that provisions a whole MACF fleet's GitHub side (the
+per-agent GitHub Apps, their keys, installs, repos, secrets, CA var, vault) that no
+CLI can create on its own.
 
 > **Scope.** This directory carries both the *workspace scaffold* + the two
 > structural safety rails (P1) **and** the provisioning **skill** itself (P2–P5):
@@ -107,11 +110,11 @@ git remote add origin https://github.com/groundnuty/macf-automated-github-setup.
 git push -u origin main
 ```
 
-Then on the Mac: `git clone https://github.com/groundnuty/macf-automated-github-setup ~/macf-automated-github-setup`.
-(Or skip the standalone repo and use this `tools/macf-bootstrap/` subdir of a macf checkout directly as the workspace.)
+Then the **operator (user) clones the product repo** and works there: `git clone https://github.com/groundnuty/macf-automated-github-setup ~/macf-automated-github-setup`.
 
-To **refresh** when a new macf-bootstrap version ships, re-sync the contents from
-`groundnuty/macf:tools/macf-bootstrap/` (the canonical source) and push — see versioning below.
+> **This `tools/macf-bootstrap/` directory is the DEV SOURCE, not a user path.** macf-bootstrap is a **separate product** delivered as the `groundnuty/macf-automated-github-setup` repo (the unit users clone) — exactly like the routing workflow ships as `groundnuty/macf-actions` and the plugin as `groundnuty/macf-marketplace`. The source is *developed* here in the macf monorepo (so it stays in `make check` CI + lockstep with the framework it calls) and *published* to the product repo at each version. Users never clone macf or `cd` into this subdir.
+
+To **refresh / publish a new version**, re-sync this directory's contents into the product repo and push (the create-block above is the first publish; subsequent publishes re-sync + bump — see versioning below). A `sync` helper automates this.
 
 ## Versioning / using a specific version
 
@@ -129,9 +132,9 @@ from.
 
 ## How the operator runs this workspace
 
-1. Clone this `tools/macf-bootstrap/` directory to the Mac as the bootstrap
-   workspace root (the eventual delivery is a standalone repo or a
-   `macf bootstrap-init` scaffold — DR-035 open question; either consumes the
+1. The operator clones the **product repo** to the Mac and works there:
+   `git clone https://github.com/groundnuty/macf-automated-github-setup`
+   (NOT this `tools/macf-bootstrap/` dev-source subdir — see the note above; either consumes the
    same skill).
 2. **Start Chrome with remote debugging** (this is what lets the MCP drive the
    operator's *already-logged-in* session — the whole point of "no credential

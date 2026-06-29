@@ -46,7 +46,7 @@ They are **complementary**: the role layer says *how this agent thinks about its
 
 > New (DR-035, 2026-06-29) — wants your real-world feedback (§6 hook).
 
-**`macf-bootstrap` is framework infrastructure — it ships *in* the macf repo at `tools/macf-bootstrap/`, used for all use-cases, not created per project.** It's a dedicated operator-privileged workspace that drives your Chrome + `gh` to provision *any* fleet's GitHub side. The steps below clone it fresh — **nothing needs to exist on your Mac first.** (For repeat use you can optionally cut a standalone clone repo — see the bootstrap README → **[Installing](../tools/macf-bootstrap/README.md#installing)** — but it's not required.)
+**`macf-bootstrap` is a separate product — its own repo, `groundnuty/macf-automated-github-setup`, which you clone directly.** It's a dedicated operator-privileged workspace that drives your Chrome + `gh` to provision *any* fleet's GitHub side (used for all use-cases, not created per project). The steps below clone that one repo — **nothing else needs to exist on your Mac first**, and you never touch the macf framework repo. (Maintainer note: the product repo is published from `groundnuty/macf:tools/macf-bootstrap/` — see the bootstrap README → **[Installing](../tools/macf-bootstrap/README.md#installing)** — but that's a one-time maintainer step, not something the operator following this recipe does.)
 
 **Prerequisites on your Mac** (where Chrome + your GitHub login live): `macf` CLI ≥ 0.2.43 · `gh` authed **as you** (`gh auth status` → your user, not a `ghs_` bot) · `age` · `jq` · the Chrome DevTools MCP (auto-fetched by the workspace `.mcp.json`).
 
@@ -59,10 +59,10 @@ They are **complementary**: the role layer says *how this agent thinks about its
 ```
 
 ```bash
-# 2. Get + launch the bootstrap workspace — from NOTHING: clone the macf repo, cd its
-#    tools/macf-bootstrap subdir (that IS the workspace), and open Claude Code there:
-git clone https://github.com/groundnuty/macf ~/macf
-cd ~/macf/tools/macf-bootstrap
+# 2. Clone the macf-bootstrap product repo + open Claude Code in it. That's the whole
+#    workspace — nothing else to set up, and you never touch the macf framework repo:
+git clone https://github.com/groundnuty/macf-automated-github-setup ~/macf-automated-github-setup
+cd ~/macf-automated-github-setup
 claude
 ```
 
