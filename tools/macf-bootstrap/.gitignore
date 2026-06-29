@@ -1,0 +1,9 @@
+# macf-bootstrap — secrets-on-disk hygiene (DR-035 §4, science's #659 review).
+# Belt-and-suspenders against a stray `git add` / commit in this no-prompt git
+# workspace. The real at-rest protection is FileVault; this just keeps the scratch
+# secrets out of version control. Never relax these without an explicit reason.
+/.bootstrap-work/
+*.app.json
+vault.plain
+vault*.age
+vault-age-key.txt

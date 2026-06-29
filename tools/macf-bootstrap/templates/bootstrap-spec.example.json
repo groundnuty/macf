@@ -1,0 +1,36 @@
+{
+  "_comment": "Example project spec for bootstrap-emit-commands.sh (DR-035). The skill assembles this from the Q&A intake + the captured App IDs, then renders the VM-side handoff. This worked example mirrors use-cases/scientific-paper-fleet.md (icsoc-2026).",
+  "project": "icsoc-2026",
+  "registry": { "type": "profile", "user": "groundnuty" },
+  "advertise_host": "orzech-dev-agents.tail491af.ts.net",
+  "science_repo": "groundnuty/icsoc-2026-science-agent",
+  "agents": [
+    {
+      "role": "science-agent",
+      "name": "icsoc-2026-science-agent",
+      "repo": "groundnuty/icsoc-2026-science-agent",
+      "deploy_path": "/home/ubuntu/repos/agh/icsoc-2026-science-agent",
+      "app_id": "111111",
+      "install_id": "22222222",
+      "key_path": "~/.macf/keys/icsoc-2026-science-agent.pem"
+    },
+    {
+      "role": "code-agent",
+      "name": "icsoc-2026-code-agent",
+      "repo": "groundnuty/icsoc-2026-experiment",
+      "deploy_path": "/home/ubuntu/repos/agh/icsoc-2026-experiment",
+      "app_id": "333333",
+      "install_id": "44444444",
+      "key_path": "~/.macf/keys/icsoc-2026-code-agent.pem"
+    },
+    {
+      "role": "writer-agent",
+      "name": "icsoc-2026-writer-agent",
+      "repo": "groundnuty/icsoc-2026",
+      "deploy_path": "/home/ubuntu/repos/papers/icsoc-2026",
+      "app_id": "555555",
+      "install_id": "66666666",
+      "key_path": "~/.macf/keys/icsoc-2026-writer-agent.pem"
+    }
+  ]
+}

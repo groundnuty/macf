@@ -81,6 +81,17 @@ approval's whole safety weight rests on the operator scrutinizing it, so the
 plan **highlights the blast-radius items** (touches org-wide settings; commits
 to your science repo; sets N secrets) — a real gate, not a rubber stamp.
 
+**Invariant — no per-command approval.** `Bash(*)` is pre-approved in
+`settings.json`; the ONLY interactive points in a run are the **single plan
+approval** (above) and the recurring **GitHub auth-gates** (§5). There are no
+per-action `ask` prompts, and none must be added — the deny-rails (§2), **not**
+prompts, are what fence the destructive surface. Do **not** narrow `Bash(*)`,
+add an `ask` permission, or otherwise reintroduce per-command confirmation:
+that would defeat the operator's no-prompt-autonomy requirement while adding no
+safety the rails don't already provide (a prompt the operator clicks through is
+not a fence; the deny-rail is). The safety model is "act freely, but be
+structurally unable to do anything irreversible" — keep the gate structural.
+
 ## 5. Auth gates are the operator's only clicks
 
 GitHub forces OAuth consent + **sudo-mode re-auth** (password / 2FA) for
@@ -89,13 +100,29 @@ gate repeatedly. "Pause → operator satisfies auth → resume" is a **first-cla
 expected loop**, not an error. That is the entirety of the operator's manual
 interaction.
 
-## 6. No credential handling
+## 6. No credential handling, and secrets-on-disk hygiene
 
 The skill uses the operator's *already-authenticated* Chrome session + `gh` user
 auth. It never sees, types, or stores the operator's password / 2FA. Private
 keys flow from the App manifest-exchange straight into the age-encrypted vault —
-never manually downloaded, never left as plaintext on disk (the `/tmp` clone +
-every plaintext intermediate is shredded on completion and on abort).
+never manually downloaded.
+
+The vault **plaintext is never written to disk by construction**: it is piped to
+`bootstrap-build-vault.sh` on STDIN and streamed into `age`, so there is no
+`vault.plain` file to leak. The per-agent `*.app.json` PEMs (written by the
+manifest exchange) and the encrypted `vault.age` + age key do touch disk in the
+scratch dir `./.bootstrap-work/`; they are kept out of git by `.gitignore` and
+wiped by `bootstrap-cleanup.sh`, which the skill runs on **both success and
+abort** (the age decryption key is shredded after the operator confirms the
+out-of-band scp). The `/tmp` clone in `bootstrap-commit-vault.sh` is likewise
+removed on exit (trap).
+
+**Be accurate about `shred`, don't overclaim.** `shred` is best-effort and a
+**no-op on macOS/APFS** — copy-on-write filesystems never overwrite a file in
+place, so the bytes may remain recoverable. The real at-rest protection on the
+operator's Mac is **FileVault**. The durable, load-bearing protections here are
+structural: STDIN-pipe (no plaintext file), `.gitignore` (nothing secret is ever
+committed), and always-run cleanup (no scratch secrets linger) — not `shred`.
 
 ## 7. The deliberate attribution-hook omission
 

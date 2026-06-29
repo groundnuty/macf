@@ -5,11 +5,13 @@ This directory is the **safety-foundation workspace template** for
 MACF fleet's GitHub side (the per-agent GitHub Apps, their keys, installs, repos,
 secrets, CA var, vault) that no CLI can create on its own.
 
-> **P1 scope (this directory).** This is the *workspace scaffold* + the two
-> structural safety rails. The provisioning **skill** itself (the brains:
-> Q&A intake → manifest flow → `gh` orchestration → vault → emitted commands)
-> lands in **P2** as a separate marketplace plugin. This scaffold is what makes
-> the skill safe to run with no per-action prompts.
+> **Scope.** This directory carries both the *workspace scaffold* + the two
+> structural safety rails (P1) **and** the provisioning **skill** itself (P2–P5):
+> the brains at `.claude/skills/macf-bootstrap/SKILL.md` (Q&A intake → manifest
+> flow → `gh` orchestration → vault → emitted commands) plus its deterministic
+> helper scripts (`.claude/scripts/bootstrap-*.sh`) and vault templates
+> (`templates/vault.{sh,template.txt}`). The scaffold is what makes the skill
+> safe to run with no per-action prompts.
 
 ## What this workspace is
 
@@ -49,34 +51,40 @@ operator, not a `ghs_` bot token. That omission is documented explicitly in
 > tools stay in `permissions.allow` and the URL policy lives entirely in the
 > hook. Do not move them to `deny` — that disables the URL guard.
 
-## How the operator tests this workspace
+## How the operator runs this workspace
 
 1. Clone this `tools/macf-bootstrap/` directory to the Mac as the bootstrap
    workspace root (the eventual delivery is a standalone repo or a
    `macf bootstrap-init` scaffold — DR-035 open question; either consumes the
-   same marketplace skill).
-2. Ensure the **Chrome DevTools MCP** server is available (`npx
-   chrome-devtools-mcp@latest` — wired in `.mcp.json`) and **`gh` is
-   authenticated as the operator's user** (`gh auth status`). This workspace
-   deliberately uses user auth, not a bot token.
+   same skill).
+2. **Start Chrome with remote debugging** (this is what lets the MCP drive the
+   operator's *already-logged-in* session — the whole point of "no credential
+   handling"):
+
+   ```bash
+   # macOS — quit Chrome first, then:
+   /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+     --remote-debugging-port=9222
+   # verify it's listening:
+   curl -s http://127.0.0.1:9222/json/version
+   ```
+
+   `.mcp.json` already points the MCP at this with
+   `--browser-url=http://127.0.0.1:9222`, so the MCP **attaches** to that Chrome
+   rather than launching a fresh, logged-out instance. Make sure `gh` is
+   authenticated as the operator's **user** (`gh auth status`) — this workspace
+   deliberately uses user auth, not a bot token. (Override the debug URL for the
+   env-validation probe with `MACF_BOOTSTRAP_CHROME_URL`.)
 3. Open Claude Code in this directory and approve the project MCP server when
    prompted.
-4. (P2) Run the `/macf-bootstrap` skill and follow the Q&A intake → plan
-   approval → run loop. **The skill is not in P1** — this scaffold only proves
-   the rails.
+4. Run the **`macf-bootstrap`** skill (`.claude/skills/macf-bootstrap/SKILL.md`)
+   and follow its Q&A intake → plan approval → run loop. It validates the
+   environment first (`bootstrap-validate-env.sh`), so a missing Chrome / non-user
+   `gh` / missing `age` stops loud before any provisioning.
 
-### Driving the operator's logged-in Chrome
-
-`.mcp.json` ships the canonical `npx -y chrome-devtools-mcp@latest` invocation,
-which by default launches its own Chrome instance. To drive the operator's
-**already-logged-in** browser (so OAuth/sudo reuse existing cookies — the whole
-point of "no credential handling"), the operator points the MCP at a Chrome
-started with remote debugging, e.g. add `"--browser-url=http://127.0.0.1:9222"`
-to the `args` (after starting Chrome with `--remote-debugging-port=9222`). See
-`npx chrome-devtools-mcp@latest --help` and the upstream README
+See the upstream chrome-devtools-mcp README
 (<https://github.com/ChromeDevTools/chrome-devtools-mcp>) for `--browser-url` /
-`--channel` / profile options. This connection detail is an operator-setup
-choice, intentionally left out of the committed `.mcp.json`.
+`--channel` / profile options if the operator's Chrome setup differs.
 
 ## Override env vars (deliberate exceptions only)
 
@@ -92,16 +100,37 @@ choice, intentionally left out of the committed `.mcp.json`.
 tools/macf-bootstrap/
 ├── .claude/
 │   ├── settings.json                          ← operator-privilege allow + dual-surface deny + the 2 PreToolUse rails
+│   ├── skills/
+│   │   └── macf-bootstrap/
+│   │       └── SKILL.md                        ← the orchestration skill (intake → manifest flow → gh → vault → emit)
 │   ├── rules/
 │   │   └── macf-bootstrap-safety.md            ← the DR-035 §2 safety contract, workspace-rule form
 │   └── scripts/
 │       ├── check-bootstrap-url-allowlist.sh    ← browser/MCP rail (default-deny URL allowlist)
-│       └── check-bootstrap-gh-guard.sh         ← Bash/gh rail (destructive-deny + create-only secret set)
-├── .mcp.json                                   ← Chrome DevTools MCP server (stdio)
+│       ├── check-bootstrap-gh-guard.sh         ← Bash/gh rail (destructive-deny + create-only secret set)
+│       ├── bootstrap-validate-env.sh           ← start-of-run env validation (gh-user / age / jq / rails / chrome)
+│       ├── bootstrap-exchange-manifest.sh      ← redeem the manifest `code` → app_id + private-key PEM + secrets
+│       ├── bootstrap-build-vault.sh            ← age-encrypt the assembled creds (plaintext piped on STDIN) → vault.age
+│       ├── bootstrap-commit-vault.sh           ← commit vault.age to the science repo (fail-if-exists, never --force)
+│       ├── bootstrap-cleanup.sh                ← wipe the .bootstrap-work/ scratch dir (always; success + abort)
+│       └── bootstrap-emit-commands.sh          ← render the VM-side macf init + verification commands
+├── .gitignore                                  ← keep scratch secrets out of git (.bootstrap-work/, *.app.json, vault*.age, age key)
+├── .mcp.json                                   ← Chrome DevTools MCP server, --browser-url to the operator's Chrome
 ├── templates/
-│   └── macf-app-manifest.json                  ← the DR-019 App manifest the skill submits (manifest flow)
+│   ├── macf-app-manifest.json                  ← the DR-019 App manifest the skill submits (manifest flow)
+│   ├── vault.template.txt                      ← the vault plaintext shape (output #1)
+│   ├── vault.sh                                ← vault accessor committed alongside vault.age (decrypt + materialize keys)
+│   └── bootstrap-spec.example.json             ← example project spec for bootstrap-emit-commands.sh
 └── README.md                                   ← this file
 ```
+
+> **Secrets-on-disk hygiene (DR-035 §4).** The vault plaintext is never written
+> to a file — it is piped to `bootstrap-build-vault.sh` on STDIN and streamed into
+> `age`. The scratch dir `.bootstrap-work/` (per-agent `*.app.json` PEMs, the
+> `vault.age`, the age key, the spec) is `.gitignore`d and wiped by
+> `bootstrap-cleanup.sh` on both success and abort. `shred` is best-effort and a
+> no-op on macOS/APFS — the real at-rest protection is FileVault; the structural
+> wins are the STDIN-pipe + `.gitignore` + always-cleanup.
 
 ## References
 
