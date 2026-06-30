@@ -41,7 +41,7 @@ This is **B1-flavored — no cross-fleet CA/mTLS trust is required.** Routing ri
 
 ### 3. Peer-ownership (load-bearing principle)
 
-Because the specialist **owns its product**, the dependent fleet's delegation is a **request it can prioritize, push back on, or decline** — the `peer-dynamic.md` stance, stretched across fleets. The dependent fleet does **not** dictate the specialist's product or roadmap; it states a need and negotiates. The specialist is a **guest peer, not a fleet member**: it does not take a `code-agent`/`science-agent` label in the dependent fleet's registry, does not appear in the dependent fleet's `macf fleet status`, and is not supervised by the dependent fleet's liveness/reconciliation machinery (DR-031). It is a peer in another fleet that the dependent fleet collaborates with.
+Because the specialist **owns its product**, the dependent fleet's delegation is a **request it can prioritize, push back on, or decline** — the `peer-dynamic.md` stance, stretched across fleets. The dependent fleet does **not** dictate the specialist's product or roadmap; it states a need and negotiates. The specialist is a **guest peer, not a fleet member**: it does not take a `code-agent`/`science-agent` label in the dependent fleet's registry, and is not supervised by the dependent fleet's liveness/reconciliation machinery (DR-031). It is a peer in another fleet that the dependent fleet collaborates with. **(Amendment A, 2026-06-30: the original text also said the guest "does not appear in the dependent fleet's `macf fleet status`"; that visibility prohibition is superseded — the consumer MAY now *show* the guest in its `macf fleet status`, clearly marked as an external, **unsupervised** guest. Visibility is split from supervision; only the no-supervision invariant stands. See Amendment A.)**
 
 **The specialist keeps its own identity.** It posts, reviews, and releases **as its own App/bot** — it never impersonates a dependent-fleet agent, and the dependent fleet's agents never post as the specialist. The per-agent attribution discipline (`gh-token-attribution-traps.md`) holds verbatim across the boundary: each party's `gh` operations carry its own `ghs_` installation token for its own App. Clean per-agent attribution is exactly what makes the cross-fleet paper-trail auditable.
 
@@ -91,7 +91,7 @@ A specialist may already be a working MACF agent that is **deliberately not GitH
 - **The specialist does not relocate** into the dependent fleet. It keeps its repo, roadmap, identity, and registry home.
 - **The dependent fleet does not fork or absorb** the product. It depends on a pinned release; it does not vendor a copy it then maintains.
 - **Clean per-agent attribution is preserved.** Each party keeps its own App/bot; nobody impersonates anybody across the boundary.
-- **The specialist is not a member** of the dependent fleet's registry / `fleet status` / supervision. It is a guest peer.
+- **The specialist is not a *supervised* member** of the dependent fleet — not an owned member of its registry, not under its DR-031 supervision/reconciliation. It is a guest peer. **(Amendment A: it MAY be *shown* in the consumer's `macf fleet status` as an unsupervised guest — visibility ≠ supervision.)**
 
 ## Consequences
 
@@ -120,3 +120,84 @@ Design-now (capture the pattern while the `icsoc-2026` ↔ `onedata-mcp` depende
 - `.claude/rules/gh-token-attribution-traps.md` — the keep-your-own-identity discipline §3 preserves across the boundary (each party posts as its own bot; nobody impersonates across fleets).
 - `pr-discipline.md` §"How to submit LGTM" — formal-review state-change routing the (optional) cross-review in §4 rides.
 - CLAUDE.md "Routing transport is two-track" + the substrate-serves-consumers framing — the proven instance this DR generalizes.
+
+---
+
+## Amendment A (2026-06-30): guest visibility in the consumer's `macf fleet status` — split visibility from supervision
+
+**Status:** Proposed (amends §3 + §Boundaries). Ratification = operator's call, same as the base DR.
+
+**Trigger:** operator, 2026-06-30 — *"in the ideal situation the external contractor would be shown to the paper-writing fleet on `macf fleet status` … a (maybe temporary) official member of 2 fleets."* Surfaced while wiring the first live cross-fleet collaborator: `ppam-2026/code-agent` ↔ `icsoc-2026` (the `onedata-mcp` data dependency).
+
+### What changes
+
+Base §3 said the specialist *"does not appear in the dependent fleet's `macf fleet status` … and is not supervised by it."* That conflated two separable properties. This amendment splits them:
+
+- **Supervision** (DR-031 liveness / reconciliation / restart / prune) — the consumer fleet **MUST NOT** do this to a guest. It does not own the guest's lifecycle; a consumer reconciler that SIGTERM'd, pruned, or restarted a "down" guest would be acting on an agent another fleet owns. **UNCHANGED: a guest is never supervised by the consumer.**
+- **Visibility** (the guest appears in `macf fleet status`) — base §3 forbade this too, but it is safe and valuable: the consumer operator / coordinator seeing the external collaborator it depends on models the real topology. **CHANGED: a guest MAY be shown, clearly marked as external + unsupervised.**
+
+So base §3's clause "does not appear in the dependent fleet's `macf fleet status`" is **superseded**; the "is not supervised" clause **stands**.
+
+### The guest-membership model — asymmetric, two-fleet
+
+A cross-fleet collaborator is:
+
+- a **full member** of its **home** fleet — owned, supervised, lifecycle-managed there (`ppam-2026/code-agent` in ppam);
+- a **guest member** of each **consumer** fleet that depends on it — visible, perspectival-role'd, **not** supervised (`onedata-specialist` in icsoc).
+
+This is the operator's "member of 2 fleets," with deliberately **asymmetric** membership (full-home + guest-consumer). Grounded in MOISE+ **group-scoped roles**: an agent adopts different roles in different organizational groups; the consumer fleet is a different group with its own role vocabulary.
+
+### The consumer-side guest binding (perspectival role)
+
+The consumer fleet carries a **local** binding naming the external agent + the role it plays from the consumer's viewpoint. The external agent neither sees nor agrees to it — **topology-autonomy preserved** (a consumer cannot impose membership on a peer; it only annotates its own view).
+
+```jsonc
+{
+  "guests": [
+    {
+      "agent": "ppam-2026/code-agent",     // home-fleet/agent; resolves in the shared registry scope
+      "local_role": "onedata-specialist",  // the perspectival role (consumer's vocabulary)
+      "purpose": "data-access dependency (onedata-mcp)",
+      "delegate_via": "route",             // "route" (App-scoped -> GitHub @mention) | "operator-relay" (local-mode/(c))
+      "until": null                         // optional expiry -> "temporary" membership; null = open-ended
+    }
+  ]
+}
+```
+
+### `macf fleet status` rendering
+
+The consumer's `fleet status` reads the guest binding and renders a distinct **GUEST / external collaborators** block, separate from the fleet's own members:
+
+- the guest's **registry-derived state** (instance_id, cert-expiry, registry-heartbeat freshness) IS shown — resolvable **for free** when the guest shares the consumer's registry scope (`ppam-2026/code-agent` is a `PPAM_2026_AGENT_*` entry in the same `groundnuty` Profile registry `icsoc` reads — *because it was promoted to App-scope via Path-Y*; a pure DR-024 local-mode agent would instead live in its own local-*file* registry, not the shared Profile — see enabler-path (c). So this line is consistent with §(c)/#669, not a contradiction: #669 describes the *pre-promotion* local-mode state, this describes the *post-promotion* path-(a) state);
+- the **reachability column is path-aware** (science review, #675): for a **routable (a/b)** guest a live `/health` probe works and is shown; for a **(c) private-mesh** guest a cross-fleet probe is NOT meaningful (it would hit the consumer's own localhost or fail), so reachability renders **"local-mode — home-fleet-observable only"** and **never "down"** — mirroring how `macf#621`'s routing-doctor treats a registry-only agent (resolvable + freshness shown; live-probe n/a). A false "DOWN" is exactly the misleading "is it down? should I restart it?" signal this amendment exists to prevent (even with supervision off);
+- the row is marked `guest` and carries its `local_role`;
+- the guest is **excluded from DR-031 supervision** — `macf fleet doctor` MAY report its reachability but MUST NOT propose restart / prune / reconcile actions against it (not the consumer's to manage).
+
+### "Temporary"
+
+The binding is a consumer-side annotation: add it when the collaboration is active, remove it (or set `until`) when done. Membership is scoped in time with no change on the guest's side.
+
+### Relationship to the design candidates
+
+This is **design-candidate #2 (perspectival cross-fleet roles)** made concrete — the dual of **candidate #1 (local-mode identity aliasing**, how an agent labels *itself*). #2 is how the *consumer* labels the *external* agent. The two are the who-I-am ⇄ who-you-are-to-me halves of cross-fleet identity.
+
+### Boundaries / non-goals
+
+- **No supervision** of the guest by the consumer (the load-bearing invariant kept from §3).
+- **No cross-fleet CA / mTLS** — still B1. Visibility rides the **shared-registry read**, not a live cross-fleet trust path. (A guest in a *non-shared* scope is shown from whatever the consumer can resolve via `macf#621` cross-scope iteration, or as a static binding with no live state if unreachable.)
+- **No change to the guest's home-fleet membership.**
+- The binding is **consumer-local**; the guest is unaware.
+
+### Build surface (code-agent, additive)
+
+1. A `guests` binding schema + a home for it in the consumer's coordination config / registry.
+2. `macf fleet status` reads it + renders the GUEST block (reusing the shared-scope registry resolution that already exists for DR-030).
+3. `macf fleet doctor` excludes guests from supervision/reconcile proposals (reachability-report-only).
+
+Small and additive — no protocol change, no new transport.
+
+### Open questions for the build PR
+
+- **Where does the `guests` binding live** — the consumer's coordination-config, or a registry annotation? Lean: **coordination-config** (a perspectival role is a consumer-local fact, not a shared registry fact; the registry is GitHub-Variables-shaped and owned per-agent). Left open for the build PR to settle.
+- **`delegate_via` taxonomy** — `route` (App-scoped → GitHub @mention) vs `operator-relay` (local-mode/(c) path). Confirm these two cover the cases, or whether a B2 live-push value is ever needed (out of scope today).
