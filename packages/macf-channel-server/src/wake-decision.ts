@@ -15,7 +15,7 @@
  *      (slash command in macf#350). The loop hazard does not apply
  *      when the trigger is a human, not a Stop hook.
  *   2. `peer_notification` with any autonomous-flow event
- *      (`session-end` / `turn-complete` / `error`) → SKIP tmux wake
+ *      (`session-end` / `session-compact` / `turn-complete` / `error`) → SKIP tmux wake
  *      (Pattern E; observational-only delivery; loop prevention).
  *   3. Any other NotifyType (issue_routed, mention, ci_completion,
  *      pr_review_state, startup_check) → WAKE via tmux (existing

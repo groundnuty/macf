@@ -1,5 +1,5 @@
 {
-  "description": "MACF agent hooks: dependency installer, work check, Stop-hook peer-notification (UC-1 per DR-023), PreCompact-hook session checkpoint (UC-3 per DR-023), and the turn-state marker that lets the channel server report accurate live agent state through long tool waits (DR-030 phase-1, groundnuty/macf#568)",
+  "description": "MACF agent hooks: dependency installer, work check, SessionEnd + PreCompact peer-notification (UC-1 per DR-023; moved off the per-turn Stop hook in macf#673 to stop blocking the TUI every turn — distinguishable session-end vs session-compact events), PreCompact-hook session checkpoint (UC-3 per DR-023), and the turn-state marker that lets the channel server report accurate live agent state through long tool waits (DR-030 phase-1, groundnuty/macf#568)",
   "hooks": {
     "SessionStart": [
       {
@@ -75,20 +75,6 @@
             "timeout": 10
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "mcp_tool",
-            "server": "plugin:macf-agent:macf-agent",
-            "tool": "notify_peer",
-            "input": {
-              "event": "session-end"
-            },
-            "timeout": 30,
-            "statusMessage": "Notifying peers of session end..."
-          }
-        ]
       }
     ],
     "StopFailure": [
@@ -111,6 +97,20 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:macf-agent:macf-agent",
+            "tool": "notify_peer",
+            "input": {
+              "event": "session-end"
+            },
+            "timeout": 30,
+            "statusMessage": "Notifying peers of session end..."
+          }
+        ]
       }
     ],
     "PreCompact": [
@@ -127,6 +127,20 @@
             },
             "timeout": 30,
             "statusMessage": "Writing session checkpoint to memory..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:macf-agent:macf-agent",
+            "tool": "notify_peer",
+            "input": {
+              "event": "session-compact"
+            },
+            "timeout": 30,
+            "statusMessage": "Notifying peers of session compaction..."
           }
         ]
       }
