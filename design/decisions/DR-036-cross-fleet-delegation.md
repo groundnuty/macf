@@ -19,7 +19,7 @@ The right shape is **delegation across the fleet boundary**: the specialist stay
 
 **Open / confirm-these (do not assume — track as open items):**
 
-- Is the `onedata-mcp` maintainer **already a registered MACF agent** (registry entry + channel-server + App), or a plain non-MACF repo/developer? *(Decides the (a)-vs-(b) enabler path below.)*
+- ~~Is the `onedata-mcp` maintainer **already a registered MACF agent**...?~~ **RESOLVED 2026-06-30:** it is the **(c) local-mode case** — worked by the `ppam-2026` code-agent (DR-024 local-registry, macf 0.2.21, no GitHub App, operator-identity, private `127.0.0.1` mTLS mesh, branch `ppam2026/14-tools`). NOT GitHub-routable; collaborate operator-mediated (or opt-in bootstrap to App-scoped). See enabler path (c).
 - What is its **routing label / bot handle**? *(Needed for the delegation issue's assignee label + the @mention.)*
 - What is its **registry scope** — the same `groundnuty` Profile scope `icsoc-2026` uses (`groundnuty/groundnuty`, per DR-006), or a different account/org?
 
@@ -74,6 +74,16 @@ Whether cross-fleet delegation is light or needs an on-ramp depends entirely on 
 ### (b) The specialist is NOT yet a MACF agent
 
 (A plain repo / a non-MACF developer.) The **first step is making it one — via `macf-bootstrap` (DR-035)** — after which it becomes a cross-fleet collaborator per path (a). This is the natural on-ramp: the bootstrap product (which provisions a fleet's GitHub side: per-agent App, channel-server wiring, registry entry) is exactly what turns a plain product repo into a routable specialist agent. **DR-035 enables DR-036** — bootstrap a single-agent "fleet" for the product owner, register it (sharing the consumer's scope makes path (a) free), and the cross-fleet delegation pattern then applies unchanged.
+
+### (c) The specialist is a MACF agent but NOT GitHub-routable (local-mode / operator-identity)
+
+A specialist may already be a working MACF agent that is **deliberately not GitHub-App-scoped** — e.g. a **local-mode (DR-024)** fleet: no GitHub App, a local-CA mTLS mesh on a private host, acting **as the operator** (operator-attributed commits, no `ghs_` bot footprint). This is the **`groundnuty/onedata-mcp` ↔ `ppam-2026` case** (verified 2026-06-30: worked by the local-mode `ppam-2026` code-agent, macf 0.2.21, on a private `127.0.0.1` mesh — the work is the operator-attributed `ppam2026/14-tools` branch, which is why a bot/App fingerprint scan finds nothing yet the repo was demonstrably worked by a fleet agent). Such an agent is **not GitHub-@mention-routable** from the consumer fleet — there is no App, no resolvable shared-scope registry entry, and the channel-server is on a host the consumer can't reach.
+
+**Load-bearing principle (operator, 2026-06-30): the dependent fleet adapts to the specialist's chosen topology; it does NOT require identities/features the specialist deliberately lacks.** Local-mode is a *legitimate, intentional* configuration, not a deficiency to be "fixed." Upgrading such a fleet to the newest macf, or bootstrapping it to App-scoped, is *possible* and the specialist's operator **may** choose it (if they want automated cross-fleet routing) — but **App-scoping is NEVER a precondition the dependent fleet can demand.** So for a (c)-path specialist:
+
+- **Operator-mediated collaboration is a FIRST-CLASS supported mode, not a fallback-because-routing-failed.** The delegation still follows the §1 shape (6-section issue on the specialist's repo → versioned release → consumer pins), but the *transport* is the **operator bridging the two fleets** (relaying the delegation / the result) rather than GitHub-@mention auto-routing. The peer-ownership (§3) and version-contract (§5) are unchanged; only the wake/notify hop differs.
+- **Bootstrapping to App-scoped (→ path (a)) is an OPT-IN the specialist's operator may take**, not a requirement — it buys automated routing in exchange for adopting the App identity that fleet deliberately didn't have.
+- This is the **peer-dynamic applied to topology**: you don't dictate a peer's identity model any more than you dictate their roadmap. The dependent fleet uses GitHub-routing **if** the specialist is App-scoped (paths a/b), operator-relay **if** it is local-mode (path c) — adapting to the specialist, never the reverse.
 
 ## Boundaries (what this does NOT do)
 
