@@ -7,8 +7,12 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion } from '../../src/cli/plugin-fetcher.js';
+import { dirname, join } from 'node:path';
+import { lstatSync, realpathSync } from 'node:fs';
+import {
+  fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion,
+  linkPluginCliDist, resolveCliDistDir,
+} from '../../src/cli/plugin-fetcher.js';
 
 /**
  * Build a local bare git repo with the layout of macf-marketplace:
@@ -225,5 +229,104 @@ describe('pinChannelServerVersion (groundnuty/macf#421)', () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ name: 'macf-agent' }, null, 2));
     expect(pinChannelServerVersion(ws, '0.2.34')).toBe(false);
+  });
+});
+
+describe('linkPluginCliDist (groundnuty/macf#676)', () => {
+  let ws: string;
+  let fakeCliDist: string;
+
+  /**
+   * Build a fake CLI `dist/` containing the plugin-CLI entry the /macf-*
+   * skills invoke, standing in for the installed @groundnuty/macf package's
+   * own dist/ (which isn't built in the source-checkout test runner).
+   */
+  function buildFakeCliDist(rootDir: string): string {
+    const dist = join(rootDir, 'cli-dist');
+    mkdirSync(join(dist, 'plugin', 'bin'), { recursive: true });
+    writeFileSync(join(dist, 'plugin', 'bin', 'macf-plugin-cli.js'), '#!/usr/bin/env node\n');
+    return dist;
+  }
+
+  /** A populated marketplace plugin dir (mimics fetchPluginToWorkspace output). */
+  function populatePluginDir(): void {
+    const pluginDir = workspacePluginDir(ws);
+    mkdirSync(join(pluginDir, 'agents'), { recursive: true });
+    writeFileSync(join(pluginDir, 'manifest.txt'), 'fixture\n');
+  }
+
+  beforeEach(() => {
+    ws = mkdtempSync(join(tmpdir(), 'macf-link-dist-ws-'));
+    fakeCliDist = buildFakeCliDist(mkdtempSync(join(tmpdir(), 'macf-link-dist-pkg-')));
+  });
+  afterEach(() => {
+    rmSync(ws, { recursive: true, force: true });
+    rmSync(dirname(fakeCliDist), { recursive: true, force: true });
+  });
+
+  it('makes .macf/plugin/dist/plugin/bin/macf-plugin-cli.js resolve after populate+deliver', () => {
+    populatePluginDir();
+    expect(linkPluginCliDist(ws, { cliDistDir: fakeCliDist })).toBe(true);
+
+    const skillEntry = join(workspacePluginDir(ws), 'dist', 'plugin', 'bin', 'macf-plugin-cli.js');
+    // The skills run `node "${CLAUDE_PLUGIN_ROOT}/dist/plugin/bin/macf-plugin-cli.js"`;
+    // CLAUDE_PLUGIN_ROOT == <ws>/.macf/plugin. This path must resolve (#676).
+    expect(existsSync(skillEntry)).toBe(true);
+  });
+
+  it('creates a symlink pointing at the CLI dist (primary path)', () => {
+    populatePluginDir();
+    linkPluginCliDist(ws, { cliDistDir: fakeCliDist });
+
+    const link = join(workspacePluginDir(ws), 'dist');
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(realpathSync(link)).toBe(realpathSync(fakeCliDist));
+  });
+
+  it('is idempotent — re-running replaces a stale link with a current one', () => {
+    populatePluginDir();
+    linkPluginCliDist(ws, { cliDistDir: fakeCliDist });
+
+    // Point at a DIFFERENT dist on the second run; the link must now resolve
+    // there (proves the stale link is replaced, not left in place).
+    const otherDist = buildFakeCliDist(mkdtempSync(join(tmpdir(), 'macf-link-dist-pkg2-')));
+    try {
+      expect(linkPluginCliDist(ws, { cliDistDir: otherDist })).toBe(true);
+      const link = join(workspacePluginDir(ws), 'dist');
+      expect(realpathSync(link)).toBe(realpathSync(otherDist));
+    } finally {
+      rmSync(dirname(otherDist), { recursive: true, force: true });
+    }
+  });
+
+  it('replaces a pre-existing real directory at the dist path', () => {
+    populatePluginDir();
+    // Simulate a prior copy-fallback (a real dir, not a symlink) at dist/.
+    const stale = join(workspacePluginDir(ws), 'dist');
+    mkdirSync(stale, { recursive: true });
+    writeFileSync(join(stale, 'STALE_MARKER'), 'old\n');
+
+    linkPluginCliDist(ws, { cliDistDir: fakeCliDist });
+
+    expect(existsSync(join(stale, 'STALE_MARKER'))).toBe(false);
+    expect(existsSync(join(stale, 'plugin', 'bin', 'macf-plugin-cli.js'))).toBe(true);
+  });
+
+  it('no-ops (returns false) when the workspace plugin dir does not exist', () => {
+    // No populatePluginDir() — .macf/plugin/ absent. Don't plant a dangling dir.
+    expect(linkPluginCliDist(ws, { cliDistDir: fakeCliDist })).toBe(false);
+    expect(existsSync(join(workspacePluginDir(ws), 'dist'))).toBe(false);
+  });
+
+  it('no-ops (returns false) when the override dist lacks the plugin-CLI — n/a; resolveCliDistDir guards real runs', () => {
+    // resolveCliDistDir() returns null when the running CLI has no built dist,
+    // so linkPluginCliDist no-ops on an un-built source checkout. We assert the
+    // resolver's contract directly: it returns null OR a dir whose
+    // dist/plugin/bin/macf-plugin-cli.js exists (never a dangling pointer).
+    const resolved = resolveCliDistDir();
+    if (resolved !== null) {
+      expect(existsSync(join(resolved, 'plugin', 'bin', 'macf-plugin-cli.js'))).toBe(true);
+      expect(resolved.endsWith('dist')).toBe(true);
+    }
   });
 });

@@ -13,6 +13,11 @@ import { tmpdir } from 'node:os';
 vi.mock('../../src/cli/plugin-fetcher.js', () => ({
   fetchPluginToWorkspace: vi.fn(),
   workspacePluginDir: (dir: string) => join(dir, '.macf', 'plugin'),
+  pinChannelServerVersion: vi.fn(() => false),
+  // Stub the #676 dist-link delivery — it resolves the running CLI's own dist
+  // via import.meta.url, which isn't built in the test runner; a no-op keeps
+  // the update flow under test without touching the filesystem.
+  linkPluginCliDist: vi.fn(() => false),
 }));
 
 // Stub `node:readline.createInterface` so tests can drive the unified

@@ -48,7 +48,7 @@ import { copyCanonicalRules, copyCanonicalScripts, findCliPackageRoot } from '..
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
-import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion } from '../plugin-fetcher.js';
+import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion, linkPluginCliDist } from '../plugin-fetcher.js';
 import { writeClaudeSh, hasManagedHeader } from '../claude-sh.js';
 import { writeHostPrelude } from '../host-prelude.js';
 import {
@@ -467,6 +467,17 @@ export async function update(
     }
   }
 
+  // Deliver the built plugin-CLI by linking .macf/plugin/dist → the running
+  // CLI's own dist/ (groundnuty/macf#676). The marketplace plugin ships no
+  // dist/, so without this the /macf-* skills fail MODULE_NOT_FOUND. Run
+  // unconditionally whenever the plugin dir exists — after the repair fetch
+  // above, AND before every short-circuit return below — so an already-init'd
+  // consumer hit by the missing-dist bug self-heals on a single `macf update`
+  // even when no versions change. Idempotent (replaces a stale link).
+  if (existsSync(workspacePluginDir(projectDir)) && linkPluginCliDist(projectDir)) {
+    console.log(`Linked plugin-CLI dist into .macf/plugin/dist`);
+  }
+
   if (!config.versions) {
     console.error(
       'No "versions" section in macf-agent.json (legacy config).\n' +
@@ -583,6 +594,12 @@ export async function update(
   if (existsSync(workspacePluginDir(projectDir))) {
     if (pinChannelServerVersion(projectDir, newVersions.cli)) {
       console.log(`Pinned channel-server @${newVersions.cli} in .macf/plugin/ mcpServers`);
+    }
+    // Re-deliver the plugin-CLI dist link (groundnuty/macf#676). Runs after the
+    // pin and the plugin re-fetch above (a re-fetch wipes .macf/plugin/, taking
+    // the link with it); idempotent so a no-bump update refreshes a stale link.
+    if (linkPluginCliDist(projectDir)) {
+      console.log(`Linked plugin-CLI dist into .macf/plugin/dist`);
     }
   }
 
