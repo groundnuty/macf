@@ -13,7 +13,7 @@ import { generateAgentCert } from '@groundnuty/macf-core';
 import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import { seedProjectRulesDir } from '../project-rules.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
-import { fetchPluginToWorkspace, pinChannelServerVersion } from '../plugin-fetcher.js';
+import { fetchPluginToWorkspace, pinChannelServerVersion, linkPluginCliDist } from '../plugin-fetcher.js';
 import { writeClaudeSh } from '../claude-sh.js';
 import { writeEnvFiles } from '../env-files.js';
 import { writeHostPrelude } from '../host-prelude.js';
@@ -539,7 +539,15 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     // `npx` can't serve a stale cached cs (groundnuty/macf#421). cs ships with
     // the CLI in the monorepo, so the cs version = versions.cli.
     pinChannelServerVersion(absDir, versions.cli);
-    console.log(`  Plugin: fetched macf-agent@v${versions.plugin} to .macf/plugin/ (channel-server pinned @${versions.cli})`);
+    // Deliver the built plugin-CLI by linking .macf/plugin/dist → the running
+    // CLI's own dist/ (groundnuty/macf#676). The marketplace plugin ships no
+    // dist/, so without this the /macf-* skills fail MODULE_NOT_FOUND. MUST run
+    // after the fetch (a re-clone wipes the dir).
+    const linkedDist = linkPluginCliDist(absDir);
+    console.log(
+      `  Plugin: fetched macf-agent@v${versions.plugin} to .macf/plugin/ ` +
+      `(channel-server pinned @${versions.cli}${linkedDist ? '; plugin-CLI dist linked' : ''})`,
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`  Warning: plugin fetch failed: ${msg}`);

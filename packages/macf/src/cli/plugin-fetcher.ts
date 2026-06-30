@@ -16,15 +16,26 @@
  * whether to abort setup or warn-and-continue.
  */
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { findCliPackageRoot } from './rules.js';
 
 const DEFAULT_MARKETPLACE_URL = 'https://github.com/groundnuty/macf-marketplace';
 const DEFAULT_PLUGIN_SUBDIR = 'macf-agent';
 
 /** The channel-server npm package the plugin's mcpServers launches via npx. */
 const CHANNEL_SERVER_PKG = '@groundnuty/macf-channel-server';
+
+/**
+ * Plugin-CLI path the `/macf-*` skills invoke, relative to CLAUDE_PLUGIN_ROOT
+ * (= the workspace's `.macf/plugin/`). The skills run
+ * `node "${CLAUDE_PLUGIN_ROOT}/dist/plugin/bin/macf-plugin-cli.js" …`, so the
+ * marketplace plugin (which ships no `dist/`) needs a `dist/` link delivered.
+ */
+const PLUGIN_CLI_REL = join('plugin', 'bin', 'macf-plugin-cli.js');
 
 export interface FetchPluginOptions {
   /** Override the marketplace git URL (for testing). */
@@ -163,4 +174,101 @@ export function fetchPluginToWorkspace(
   } finally {
     rmSync(tmpClone, { recursive: true, force: true });
   }
+}
+
+/**
+ * Resolve the running CLI's own `dist/` directory — the one containing the
+ * built `plugin/bin/macf-plugin-cli.js`. The CLI source compiles to
+ * `<pkg>/dist/cli/...`, so the dist root is `<pkg>/dist`; we derive the
+ * package root from `import.meta.url` (via `findCliPackageRoot`) rather than
+ * hardcoding the depth from this module, then verify the plugin-CLI entry
+ * exists under `dist/` before returning. Returns `null` when no built dist is
+ * present (e.g. running from an un-built source checkout) so callers can
+ * skip the link rather than create a dangling one.
+ */
+export function resolveCliDistDir(): string | null {
+  let packageRoot: string;
+  try {
+    packageRoot = findCliPackageRoot();
+  } catch {
+    return null;
+  }
+  const distDir = join(packageRoot, 'dist');
+  if (!existsSync(join(distDir, PLUGIN_CLI_REL))) return null;
+  return distDir;
+}
+
+/**
+ * True if a filesystem entry exists at `p` — INCLUDING a dangling symlink
+ * (which `existsSync` reports false for, since it follows the link). Used to
+ * decide whether a prior `.macf/plugin/dist` must be removed before relinking.
+ */
+function hasFsEntry(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface LinkPluginCliDistOptions {
+  /**
+   * Override the CLI `dist/` directory to link (for testing). When unset, the
+   * running CLI's own dist is resolved from `import.meta.url`.
+   */
+  readonly cliDistDir?: string;
+}
+
+/**
+ * Deliver the built plugin-CLI into the workspace plugin dir (issue #676).
+ *
+ * The marketplace plugin cloned into `<ws>/.macf/plugin/` ships only
+ * `agents/ hooks/ scripts/ skills/ .claude-plugin/` — there is NO `dist/`. The
+ * `/macf-*` skills, however, run
+ * `node "${CLAUDE_PLUGIN_ROOT}/dist/plugin/bin/macf-plugin-cli.js" …` with
+ * CLAUDE_PLUGIN_ROOT pointing at `<ws>/.macf/plugin/`, so without a `dist/`
+ * there every plugin-CLI skill fails MODULE_NOT_FOUND. The built CLI lives in
+ * the installed `@groundnuty/macf` package's own `dist/`.
+ *
+ * Bridge the two by linking `<ws>/.macf/plugin/dist` → the running CLI's
+ * `dist/`. A symlink is primary; a recursive copy is the fallback when symlink
+ * creation throws (EPERM / unsupported filesystem). Idempotent: any pre-existing
+ * `dist` entry (stale symlink or dir) is removed first, so re-running gives a
+ * current link. MUST run AFTER `fetchPluginToWorkspace` populates `.macf/plugin/`
+ * (a marketplace re-clone wipes the dir, taking the link with it).
+ *
+ * No-ops (returns false) when the running CLI has no built dist to point at —
+ * `resolveCliDistDir` returns null for an un-built source checkout — so a dev
+ * run never plants a dangling link.
+ */
+export function linkPluginCliDist(
+  workspaceDir: string,
+  options: LinkPluginCliDistOptions = {},
+): boolean {
+  const cliDistDir = options.cliDistDir ?? resolveCliDistDir();
+  if (cliDistDir === null) return false;
+
+  const pluginDir = workspacePluginDir(workspaceDir);
+  if (!existsSync(pluginDir)) return false;
+
+  const target = join(pluginDir, 'dist');
+
+  // Idempotent replace: drop any prior dist entry (stale symlink — even a
+  // dangling one — or a real dir) so the result is always a fresh, correct
+  // link. `existsSync` follows symlinks (false for a dangling one), so probe
+  // with `lstatSync` to catch the broken-link case too. `rmSync` with
+  // `force: true` no-ops on absent, so the lstat is purely to gate it.
+  if (hasFsEntry(target)) {
+    rmSync(target, { recursive: true, force: true });
+  }
+
+  try {
+    symlinkSync(cliDistDir, target, 'dir');
+  } catch {
+    // Symlink unsupported / not permitted (some Windows configs, certain FS) —
+    // fall back to a recursive copy of the built dist.
+    cpSync(cliDistDir, target, { recursive: true });
+  }
+  return true;
 }
