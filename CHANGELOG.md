@@ -4,6 +4,29 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.44] — 2026-06-30
+
+**Two consumer-facing fixes** on top of v0.2.43 — both surfaced on fresh
+consumer launches. Additive; marketplace v0.2.44 is a lockstep bump (ships the
+plugin `hooks.json` change from #674).
+
+### reliability
+
+- **#674** — the plugin `Stop` hook fired `notify_peer` on **every turn**,
+  synchronously blocking the TUI with *"Notifying peers of session end…"* after
+  each prompt. Moved the peer-notify off the per-turn `Stop` hook to `SessionEnd`
+  (`event: session-end`) + `PreCompact` (a new distinguishable
+  `event: session-compact`, observational). Ships via marketplace v0.2.44
+  (`hooks.json`).
+
+### fix
+
+- **#676** — `macf init` / `macf update` never delivered the plugin CLI into
+  `.macf/plugin/dist/`, so fresh consumers' `/macf-*` skills all failed with
+  `MODULE_NOT_FOUND`. The running CLI's `dist/` is now linked into the workspace
+  plugin dir; **existing consumers self-heal on a single `macf update`** (no
+  re-init required).
+
 ## [0.2.43] — 2026-06-28
 
 **Launcher hygiene** — two operator-requested fixes on top of v0.2.42's crash
