@@ -165,6 +165,62 @@ See the upstream chrome-devtools-mcp README
 (<https://github.com/ChromeDevTools/chrome-devtools-mcp>) for `--browser-url` /
 `--channel` / profile options if the operator's Chrome setup differs.
 
+### Getting a *logged-in* debug Chrome (first-run finding, `macf-automated-github-setup#1`)
+
+The naive `--remote-debugging-port=9222` launch above only works if **no Chrome is
+already running**. In practice it usually is, and the result is the single most
+confusing first-run trap:
+
+- A running Chrome is a **singleton** — a second launch with
+  `--remote-debugging-port` just focuses the existing window and **ignores the
+  flag** (no debug port opens).
+- You **cannot** enable the debug port on an already-running instance.
+- Launching with a fresh `--user-data-dir` *does* open the port, but that profile
+  is **logged out** — which defeats the entire premise ("drive the operator's
+  already-logged-in GitHub session, never handle credentials").
+
+**The working path: copy the operator's logged-in profile into an isolated
+`--user-data-dir`, and run the debug instance off the copy.** The real Chrome and
+session are never touched; the copy is logged-in because it carries the cookies.
+macOS recipe:
+
+```bash
+SRC="$HOME/Library/Application Support/Google/Chrome"      # the live profile root
+COPY="$HOME/.macf-bootstrap-chrome"                         # isolated debug profile
+
+# 1. Copy the logged-in 'Default' profile + 'Local State' (cookies/keys), excluding
+#    the big, regenerable caches + history so the copy is small and clean.
+mkdir -p "$COPY"
+rsync -a --delete \
+  --exclude 'Cache' --exclude 'Code Cache' --exclude 'GPUCache' \
+  --exclude 'Service Worker' --exclude 'History*' --exclude 'Top Sites*' \
+  "$SRC/Default" "$COPY/"
+cp -f "$SRC/Local State" "$COPY/Local State"
+
+# 2. A copied profile carries Singleton* lock files that make Chrome think another
+#    instance owns it — remove them so the debug instance can start.
+rm -f "$COPY/Default/Singleton"* "$COPY/Singleton"*
+
+# 3. Launch the debug Chrome OFF THE COPY (the operator's real Chrome can stay open).
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --user-data-dir="$COPY" --remote-debugging-port=9222 \
+  --no-first-run --no-default-browser-check >/dev/null 2>&1 &
+
+# 4. Verify the port is live AND the session is logged-in (identity check via MCP:
+#    navigate to https://github.com/settings/profile and confirm the operator's login).
+curl -s http://127.0.0.1:9222/json/version >/dev/null && echo "debug Chrome up on :9222"
+
+# 5. CLEAN UP at the end of the run: kill the debug instance + remove the copy.
+#    (Done as part of the run's teardown — the copy holds session cookies.)
+#    pkill -f -- "--user-data-dir=$COPY"   # or close the debug window
+#    rm -rf "$COPY"
+```
+
+`.mcp.json` already points the MCP at `--browser-url=http://127.0.0.1:9222`, so it
+**attaches** to this debug instance. **`claude-in-chrome` is NOT a substitute** —
+it drives Chrome outside the `check-bootstrap-url-allowlist.sh` rail, so the
+browser surface would be un-fenced.
+
 ## Override env vars (deliberate exceptions only)
 
 | Variable | Effect |
@@ -188,6 +244,7 @@ tools/macf-bootstrap/
 │   │   └── macf-bootstrap-safety.md            ← the DR-035 §2 safety contract, workspace-rule form
 │   └── scripts/
 │       ├── check-bootstrap-url-allowlist.sh    ← browser/MCP rail (default-deny URL allowlist)
+│       ├── bootstrap-rail-selftest.sh          ← on-request proof the URL rail BLOCKS destructive nav (exit 2) + ALLOWs provisioning
 │       ├── check-bootstrap-gh-guard.sh         ← Bash/gh rail (destructive-deny + create-only secret set)
 │       ├── bootstrap-validate-env.sh           ← start-of-run env validation (gh-user / age / jq / rails / chrome)
 │       ├── bootstrap-exchange-manifest.sh      ← redeem the manifest `code` → app_id + private-key PEM + secrets

@@ -53,6 +53,7 @@ PROJECT="$(jq -r '.project // empty' "$SPEC")"
 [[ -n "$PROJECT" ]] || { echo "FATAL: spec.project is required." >&2; exit 1; }
 ADVERTISE="$(jq -r '.advertise_host // empty' "$SPEC")"
 SCIENCE_REPO="$(jq -r '.science_repo // empty' "$SPEC")"
+PROJ_SEG="$(printf '%s' "$PROJECT" | tr '[:lower:]-' '[:upper:]_')"
 
 # Registry flags from spec.registry.type.
 REG_TYPE="$(jq -r '.registry.type // "repo"' "$SPEC")"
@@ -75,27 +76,44 @@ echo "#   <science-repo>/secrets/vault.sh\` to decrypt + materialize the per-age
 echo "# key files at the --app-key paths below (DR-035 §6)."
 echo "# ════════════════════════════════════════════════════════════════════"
 echo ""
-echo "# ── 1. Decrypt the vault (materializes per-agent .pem files) ──────────"
+echo "# ── 1. Decrypt the vault (materializes per-agent .pem files + the CA) ─"
 if [[ -n "$SCIENCE_REPO" ]]; then
   echo "#   git clone https://github.com/${SCIENCE_REPO}.git <science-home>"
 fi
 echo "#   scp <mac>:vault-age-key.txt ~/.config/macf/vault-age-key.txt"
-echo "#   source <science-home>/secrets/vault.sh   # exports creds + writes .pem files"
+echo "#   source <science-home>/secrets/vault.sh"
+echo "#     → exports creds; writes ~/.macf/keys/<agent>.pem AND ~/.macf/certs/${PROJECT}/ca-{cert,key}.pem"
+echo "#   (vault.sh is source-safe in any shell — bash or zsh.)"
+echo "#   ⚠ Do NOT run \`macf certs init\` on the VM — it would mint a NEW CA and"
+echo "#     overwrite ${PROJ_SEG}_CA_CERT in the registry. The CA from the vault plus"
+echo "#     \`macf certs rotate\` (below) is all each agent needs."
 echo ""
-echo "# ── 2. Per-agent: clone the home repo + macf init ────────────────────"
+echo "# ── 2. Per-agent: clone (or mirror) the home repo + macf init + certs rotate ─"
 
 # Iterate agents. Emit tab-separated fields then format in bash to keep quoting
 # predictable and the renderer easy to unit-test.
 jq -r '.agents[] | [
   (.role // ""), (.name // ""), (.repo // ""), (.deploy_path // ""),
   (.app_id // ""), (.install_id // ""),
-  (.key_path // ("~/.macf/keys/" + (.name // "agent") + ".pem"))
-] | @tsv' "$SPEC" | while IFS=$'\t' read -r role name repo deploy_path app_id install_id key_path; do
+  (.key_path // ("~/.macf/keys/" + (.name // "agent") + ".pem")),
+  (.repo_provenance // "template")
+] | @tsv' "$SPEC" | while IFS=$'\t' read -r role name repo deploy_path app_id install_id key_path provenance; do
   echo ""
   echo "# ${name} (${role})"
-  if [[ -n "$repo" && -n "$deploy_path" ]]; then
-    echo "git clone https://github.com/${repo}.git ${deploy_path}"
-  fi
+  case "$provenance" in
+    overleaf-mirror|mirror)
+      # Home dir ALREADY EXISTS (e.g. an Overleaf-backed paper repo) and the GitHub
+      # repo is an empty MIRROR target — do NOT clone. Add GitHub as a 2nd remote
+      # and push the existing content to it (keeps the existing 'origin').
+      echo "# existing dir (${provenance}) — do NOT clone; mirror to the empty GitHub repo:"
+      echo "cd ${deploy_path}"
+      [[ -n "$repo" ]] && echo "git remote add github https://github.com/${repo}.git"
+      echo "git push -u github HEAD   # mirror the current branch to GitHub"
+      ;;
+    *)
+      [[ -n "$repo" && -n "$deploy_path" ]] && echo "git clone https://github.com/${repo}.git ${deploy_path}"
+      ;;
+  esac
   printf 'macf init \\\n'
   printf '  --project %s --role %s --name %s \\\n' "$PROJECT" "$role" "$name"
   printf '  --app-id %s --install-id %s \\\n' "$app_id" "$install_id"
@@ -103,6 +121,7 @@ jq -r '.agents[] | [
   printf '  %s \\\n' "$REG_FLAGS"
   [[ -n "$ADVERTISE" ]] && printf '  --advertise-host %s \\\n' "$ADVERTISE"
   printf '  --dir %s\n' "$deploy_path"
+  printf 'macf certs rotate --dir %s   # agent mTLS cert (uses the CA materialized by vault.sh)\n' "$deploy_path"
 done
 
 echo ""
@@ -112,14 +131,13 @@ echo "macf routing doctor      # routing plane wired (want: routing plane: HEALT
 echo "macf fleet doctor --inject   # mesh actually delivers (exit 0 = healthy)"
 echo ""
 echo "# ── 4. Setup asserts (the Apps + secrets the bootstrap created) ──────"
-jq -r '.agents[] | [(.name // ""), (.repo // ""), (.install_id // "")] | @tsv' "$SPEC" \
-  | while IFS=$'\t' read -r name repo install_id; do
-  echo "gh api /app/installations/${install_id} --jq '.app_slug'   # ${name} App installed?"
+echo "# Per agent — verify the App token mints + has DR-019 perms, from its home:"
+jq -r '.agents[] | [(.name // ""), (.repo // "")] | @tsv' "$SPEC" \
+  | while IFS=$'\t' read -r name repo; do
   [[ -n "$repo" ]] && echo "macf doctor --dir <home-of-${name}>   # App-token perms vs DR-019 on ${repo}"
 done
+echo "# (Verifying an install with \`gh api /app/installations/<id>\` needs an APP JWT, not"
+echo "#  your user token — use \`macf doctor\` above, or each App's Install-App settings page.)"
 echo "# Routing secrets present on each repo:"
 echo "#   gh secret list --repo <repo>   # expect MACF_ROUTING_APP_ID/KEY, ROUTING_CLIENT_CERT/KEY, TS_OAUTH_CLIENT_ID/SECRET"
-if [[ -n "$ADVERTISE" || -n "$PROJECT" ]]; then
-  proj_seg="$(printf '%s' "$PROJECT" | tr '[:lower:]-' '[:upper:]_')"
-  echo "#   gh variable list --repo <registry-target>   # expect ${proj_seg}_CA_CERT + MACF_${proj_seg}_AGENT_<NAME> per agent"
-fi
+echo "#   gh variable list --repo <registry-target>   # expect ${PROJ_SEG}_CA_CERT + MACF_${PROJ_SEG}_AGENT_<NAME> per agent"
