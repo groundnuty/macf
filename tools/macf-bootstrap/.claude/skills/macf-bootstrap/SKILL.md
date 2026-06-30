@@ -19,6 +19,18 @@ gate are what make running with **no per-action prompts** safe.
 
 Follow this procedure **in order**.
 
+> **⚠ PREREQ — `$CLAUDE_PROJECT_DIR` must be set.** Every helper below is invoked
+> as `"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-*.sh"`. If `CLAUDE_PROJECT_DIR`
+> is **unset** the path collapses to `/.claude/scripts/...` and the very first
+> command dies with **exit 127** (first-run finding,
+> `macf-automated-github-setup#1`). Claude Code normally exports it, but if you
+> launched outside the harness (or `list_pages`/a hook reports it empty), export it
+> first:
+>
+> ```bash
+> export CLAUDE_PROJECT_DIR="$(pwd)"   # the macf-bootstrap workspace root
+> ```
+
 ---
 
 ## Step 1 — Validate the environment (best-effort; stop loud on a critical gap)
@@ -39,6 +51,18 @@ Also confirm the chrome-devtools MCP is connected by listing open pages:
 - `mcp__chrome-devtools__list_pages` — if it errors, the MCP isn't attached.
   Tell the operator to start Chrome with `--remote-debugging-port=9222` and that
   `.mcp.json` points the MCP at `--browser-url=http://127.0.0.1:9222` (see README).
+
+> **Getting a *logged-in* debug Chrome is non-obvious** (first-run finding,
+> `macf-automated-github-setup#1`): a running Chrome **ignores**
+> `--remote-debugging-port` (it's a singleton — a second launch just focuses the
+> existing window), you can't enable the port on a live instance, and launching a
+> fresh `--user-data-dir` gives a **logged-out** profile — defeating the whole
+> "act as the already-logged-in operator" premise. The working path is to **copy
+> the operator's logged-in Chrome profile** into an isolated `--user-data-dir` and
+> launch the debug instance off the copy (real session untouched, copy logged-in).
+> The exact rsync recipe is in **README.md → "Getting a logged-in debug Chrome"**.
+> (`claude-in-chrome` is *not* a substitute — it drives Chrome outside the
+> `check-bootstrap-url-allowlist.sh` rail.)
 
 ---
 
@@ -86,9 +110,11 @@ macf-bootstrap plan for project <PROJECT>:
 REPOS (create from groundnuty/agentic-repo-template, private):
   - <repo>  (role profile: <research|code|paper-latex>)   ×N
 
-GITHUB APPS (create via manifest flow + install):
+GITHUB APPS (per-agent: create via manifest flow + install):
   - <name>  → install on <repo> + <registry target>        ×N
-  - macf-routing  → install on <registry target> (Org variables: Read only)
+  - macf-routing  → SHARED (one per registry/account, NOT per project): REUSE the
+    existing one if present (it usually is, from a prior fleet); create only on the
+    first-ever fleet. (variables:read only; already installed on <registry target>)
 
 SECRETS / VARIABLES (create-only; never overwrite):
   - per repo: MACF_ROUTING_APP_ID/KEY, ROUTING_CLIENT_CERT/KEY,
@@ -133,9 +159,20 @@ repo name/slug with the operator if `agentic-repo-template` 404s.)
 ### 4b. Create each App via the manifest flow (browser — chrome-devtools MCP)
 
 This is the **one genuinely GUI-only step** (no `gh app create` exists). Repeat
-for every agent App **and** the `macf-routing` App. The manifest to submit is
-`$CLAUDE_PROJECT_DIR/templates/macf-app-manifest.json` (the DR-019 permission set;
-for `macf-routing`, narrow it to `Organization variables: Read` only).
+for every agent App. The manifest to submit is
+`$CLAUDE_PROJECT_DIR/templates/macf-app-manifest.json` (the DR-019 permission set).
+
+> **`macf-routing` is SHARED — reuse, don't create.** It's one routing App per
+> registry/account (the channel servers' registry reader), NOT per project, so the
+> operator almost always already has it from a prior fleet. App names are GLOBALLY
+> unique, so a duplicate `macf-routing` create silently *fails* — GitHub bounces to
+> `/settings/apps` with **no `?code=`** (looks like a successful click). Detect it
+> FIRST: it's a private App, so `gh api /apps/<slug>` is **useless** (404s for every
+> private App, not just nonexistent ones); instead read
+> `https://github.com/settings/apps` or mint a JWT against its known `app_id`. If it
+> exists, reuse its `app_id` + existing private key (the operator supplies the key)
+> and just confirm it's installed on the registry target. Only run the manifest flow
+> for `macf-routing` on a brand-new account that has never hosted a MACF fleet.
 
 The GitHub create-from-manifest flow + how to capture the redirect `code`:
 
@@ -178,31 +215,88 @@ The GitHub create-from-manifest flow + how to capture the redirect `code`:
 If an auth/sudo/2FA gate appears (`/login`, `/sessions/two-factor`, `/sudo`),
 **pause and ask the operator to complete it**, then continue.
 
-### 4c. Install each App on its repos / org (`gh` / REST)
+### 4c. Install each App on its repos + registry (browser — the install flow)
 
 After exchange, install each App on its agent repo(s) **and** on the registry
-target (so the channel server can self-register). App install is API-able; do it
-via `gh api` (NOT the browser). Resolve the installation id and record it into the
-spec (`install_id`). (If a step needs the App-install confirmation page, that URL
-is on the allowlist — but prefer the API.)
+target (so the agent can self-register its host:port into the registry variables).
+
+> **The INITIAL install is browser-only — there is NO REST API to create it.**
+> (`PUT /user/installations/{id}/repositories/{id}` only *adds repos to an existing
+> installation*; it cannot do the first install, and the user-token install
+> endpoints need a `read:user` scope the bootstrap token lacks → 403.) So drive the
+> install flow with the chrome-devtools MCP: navigate to
+> `https://github.com/settings/apps/<slug>/installations` (allowlisted) → **Install**
+> → on the permissions page choose **"Only select repositories"** → add the agent
+> repo **and** the registry target → **Install**. GitHub redirects to
+> `…/settings/installations/<install_id>` — read `install_id` from that URL into the
+> spec. (The repo picker filters async; set its value via a React-style `input`
+> event, then click the filtered item.) Verify each install with the App's own JWT:
+> mint an installation token and `GET /installation/repositories`.
 
 ### 4d. Set routing secrets + CA var + org settings (`gh secret/variable set`)
 
-Set the 6 routing secrets per repo and the `<PROJECT_SEG>_CA_CERT` variable on the
-registry target with `gh secret set` / `gh variable set`. The gh guard enforces
-**create-only** — a name that already exists is blocked (overwrite ≠ delete); if
-an overwrite is genuinely intended, the operator opts in with
-`MACF_BOOTSTRAP_ALLOW_OVERWRITE=1`.
+Set the 6 routing secrets **per agent repo**. Their VALUE FORMATS (per the
+`macf-actions/agent-router.yml` consumer) matter — wrong format fails routing
+*silently*:
 
-### 4e. Generate the per-project CA (Mac-side) + upload the CA cert var
+| secret | value |
+|---|---|
+| `MACF_ROUTING_APP_ID` | the `macf-routing` App id (raw) |
+| `MACF_ROUTING_APP_KEY` | **raw PEM** of the macf-routing key (fed to `actions/create-github-app-token`) |
+| `ROUTING_CLIENT_CERT` | **base64** of `routing-action-cert.pem` |
+| `ROUTING_CLIENT_KEY` | **base64** of `routing-action-key.pem` |
+| `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` | operator-supplied Tailscale OAuth (raw) |
 
-```bash
-# From any workspace already wired for the project, or per the certs flow:
-macf certs init        # creates the CA + uploads <PROJECT_SEG>_CA_CERT
+Watch the asymmetry: the **vault** stores the app key + client cert/key base64'd
+(the `*_B64` vars), but the **repo secret** `MACF_ROUTING_APP_KEY` is **raw PEM** —
+only the two `ROUTING_CLIENT_*` repo secrets are base64. The `<PROJECT_SEG>_CA_CERT`
+variable on the registry target is set by `macf certs init` (Step 4e). The gh guard
+enforces **create-only** — an existing name is blocked (overwrite ≠ delete); an
+intended overwrite is opt-in via `MACF_BOOTSTRAP_ALLOW_OVERWRITE=1`.
+
+### 4e. Generate the per-project CA + routing-client cert (Mac-side)
+
+`macf certs init` / `issue-routing-client` auto-discover the project from a wired
+`macf-agent.json` — which a fresh bootstrap does NOT have on the Mac. So first write
+a **minimal CA workspace** at `./.bootstrap-work/ca-workspace/.macf/macf-agent.json`
+pointing `macf` at one already-created agent App (for the registry-write token). The
+field names match the `MacfAgentConfigSchema` (`agent_name`/`agent_role`, NOT
+`name`/`role`); include a `versions` stub so the CLI doesn't warn "legacy config":
+
+```jsonc
+{
+  "project": "<project>",
+  "agent_name": "<any agent name>", "agent_role": "<its role>",
+  "agent_type": "permanent",
+  "registry": { "type": "profile", "user": "<user>" },   // must match the spec's registry
+  "github_app": { "app_id": "<an agent app_id>", "install_id": "<its install_id>",
+                  "key_path": "<that agent's .pem, beside this file>" },
+  "advertise_host": "<advertise_host>",
+  "versions": { "cli": "*", "plugin": "*", "actions": "*" }  // stub: silences the legacy-config warning
+}
 ```
 
-Put the **CA private key** (base64) into the vault plaintext (Step 4f). The CA
-cert variable upload is part of `macf certs init`; verify it landed.
+(For an `org` registry use `{ "type": "org", "org": "<org>" }`; for `repo`,
+`{ "type": "repo", "owner": "<owner>", "repo": "<repo>" }` — see the CLI's
+`RegistryConfigSchema`.) Then, with `--dir` at that workspace:
+
+```bash
+# CA: writes ~/.macf/certs/<project>/ca-{cert,key}.pem + uploads <PROJECT_SEG>_CA_CERT.
+# certs init prompts for a passphrase to back the key up to the registry (encrypted);
+# pipe empty to SKIP it — the vault is the durable CA-key store (DR-035). NOTE: skipping
+# the encrypted registry backup means `macf certs recover` won't work for this project.
+echo "" | macf certs init --dir ./.bootstrap-work/ca-workspace
+
+# Routing client cert -> ROUTING_CLIENT_CERT/KEY (Step 4d). --out-dir writes the PEMs;
+# stdout ALSO prints the key, so redirect stdout to /dev/null to keep it off-transcript.
+macf certs issue-routing-client --dir ./.bootstrap-work/ca-workspace \
+  --out-dir ./.bootstrap-work/routing-client >/dev/null
+```
+
+Put the **CA key + cert** (base64) into the vault (Step 4f); the CA cert variable
+upload is part of `macf certs init` — verify it landed (`gh variable list`). Do NOT
+run `macf certs init` on the VM later (it would mint a new CA + clobber the
+variable) — `vault.sh` materializes the CA there and agents `macf certs rotate`.
 
 ### 4f. Build + commit the vault
 
@@ -317,6 +411,59 @@ trap '"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-cleanup.sh"' EXIT
 > 4f pipes it on STDIN), nothing secret is ever committed (`.gitignore`), and the
 > scratch dir is wiped on both success and abort (this step). Those are the
 > load-bearing protections — not shred.
+
+---
+
+## Optional — rail self-test (prove the URL guard actually fires)
+
+When the operator asks for **live proof** that the browser rail blocks destructive
+navigation (or before a first run on a new machine), run the one-shot self-test. It
+feeds the `check-bootstrap-url-allowlist.sh` hook synthetic PreToolUse payloads and
+asserts it **BLOCKS (exit 2)** a denylisted URL and **ALLOWS (exit 0)** a
+provisioning URL — positive evidence the guard works, **without** weakening it and
+**without** driving the real browser:
+
+```bash
+"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-rail-selftest.sh"
+# → ✓ BLOCKED  /settings/apps/<slug>/advanced (revoke/delete/transfer)
+# → ✓ BLOCKED  …/billing
+# → ✓ ALLOWED  …/settings/apps/new (manifest create)
+# exit 0 = rail healthy; non-zero = a case behaved wrong (STOP — the rail is broken).
+```
+
+**Live variant** (the strongest proof, when a debug Chrome is attached): attempt to
+navigate the MCP to a denylisted page — the PreToolUse hook intercepts the
+`mcp__chrome-devtools__navigate_page` call and blocks it before Chrome moves:
+
+```text
+mcp__chrome-devtools__navigate_page url=https://github.com/<owner>/<repo>/settings#danger-zone
+→ BLOCKED by macf-bootstrap URL guard: destructive GitHub surface.
+```
+
+Either way you get a concrete BLOCKED line in the transcript. Do **not** set
+`MACF_BOOTSTRAP_SKIP_URL_GUARD=1` during the self-test — that would bypass the very
+rail you're proving.
+
+## Gotcha — `ssh -n` silently discards a heredoc
+
+If you (or the operator) hand-write a remote VM step that pipes a heredoc into ssh
+— e.g. running the emitted command list remotely — **do NOT use `ssh -n`**. The
+`-n` flag redirects stdin from `/dev/null`, so the heredoc body is **silently
+discarded**: the remote `bash -s` reads EOF immediately, runs nothing, and ssh
+exits **0** (a clean-looking no-op — a first-run-class silent failure). Canonical
+form omits `-n`:
+
+```bash
+# WRONG — -n discards the heredoc; remote runs nothing, exits 0 (looks fine):
+ssh -n <vm> 'bash -s' <<'REMOTE'
+  source ~/secrets/vault.sh
+REMOTE
+
+# RIGHT — no -n; the heredoc reaches the remote shell's stdin:
+ssh <vm> 'bash -s' <<'REMOTE'
+  source ~/secrets/vault.sh
+REMOTE
+```
 
 ---
 
