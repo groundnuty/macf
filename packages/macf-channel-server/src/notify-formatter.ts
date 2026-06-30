@@ -89,7 +89,7 @@ export function formatNotifyContent(payload: NotifyPayload): FormattedNotify {
     // macf#256 / DR-023 UC-1: rendered when the channel-server's
     // notify_peer MCP tool POSTs to a peer's /notify. Source is the
     // sending peer's agent name; event is the hook context that
-    // triggered the notification (session-end / turn-complete /
+    // triggered the notification (session-end / session-compact / turn-complete /
     // error / custom). Prefer producer's `message` if present;
     // otherwise synthesize a minimal "Peer X reports event Y" line.
     if (payload.message) {

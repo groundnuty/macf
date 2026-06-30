@@ -47,8 +47,8 @@ import type { CommsLedgerEdge } from './comms-ledger.js';
 export const NotifyPeerInputSchema = {
   to: z.string().optional()
     .describe('Peer agent name to notify. If omitted, broadcasts to all registered peers in the project.'),
-  event: z.enum(['session-end', 'turn-complete', 'error', 'custom'])
-    .describe('Event type triggering the notification. Receiver-side wake policy keys off this field (macf#355): `custom` (operator-driven) wakes the receiver TUI; `session-end` / `turn-complete` / `error` (Stop-hook autonomous) are observational-only — Pattern E preserves cross-agent Stop-hook loop prevention.'),
+  event: z.enum(['session-end', 'session-compact', 'turn-complete', 'error', 'custom'])
+    .describe('Event type triggering the notification. Receiver-side wake policy keys off this field (macf#355): `custom` (operator-driven) wakes the receiver TUI; `session-end` / `session-compact` / `turn-complete` / `error` (autonomous-flow) are observational-only — Pattern E preserves cross-agent Stop-hook loop prevention. `session-compact` (macf#673) is the PreCompact-hook event, distinct from the SessionEnd `session-end`.'),
   message: z.string().optional()
     .describe('Optional human-readable message body.'),
   context: z.record(z.string(), z.unknown()).optional()
@@ -99,7 +99,7 @@ export interface NotifyPeerDeps {
 
 export interface NotifyPeerInput {
   readonly to?: string;
-  readonly event: 'session-end' | 'turn-complete' | 'error' | 'custom';
+  readonly event: 'session-end' | 'session-compact' | 'turn-complete' | 'error' | 'custom';
   readonly message?: string;
   readonly context?: Record<string, unknown>;
   /** macf#473 piece 2: optional GitHub anchor (owner/repo#N) for the ledger graph join. */

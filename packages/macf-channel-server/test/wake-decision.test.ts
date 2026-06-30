@@ -64,6 +64,20 @@ describe('decideWake (macf#355)', () => {
       expect(decision.action).toBe('skip');
       expect(decision.reason).toBe('peer_notification_autonomous_event');
     });
+
+    it('skips wake for event: session-compact (PreCompact-hook autonomous flow, macf#673)', () => {
+      // Regression: hooks.json PreCompact entry posts peer_notification with
+      // event=session-compact. MUST be `skip` — observational-only like
+      // session-end; only `custom` wakes. (macf#673 moved the peer-notify off
+      // the per-turn Stop hook onto SessionEnd[session-end] + PreCompact[session-compact].)
+      const decision = decideWake({
+        type: 'peer_notification',
+        source: 'tester-1',
+        event: 'session-compact',
+      });
+      expect(decision.action).toBe('skip');
+      expect(decision.reason).toBe('peer_notification_autonomous_event');
+    });
   });
 
   describe('peer_notification — operator-driven wake', () => {

@@ -35,6 +35,9 @@ export const CommsEventSchema = z.enum([
   // A2A / peer_notification (notify_peer `event`, message/send)
   'turn-complete',
   'session-end',
+  // macf#673: PreCompact-hook peer-notify event, distinct from session-end
+  // so a compaction break is not conflated with a genuine exit in the ledger.
+  'session-compact',
   'error',
   'custom',
   // GitHub router (the macf-actions route-by-* blocks)

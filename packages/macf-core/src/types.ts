@@ -14,7 +14,11 @@ export const NotifyTypeSchema = z.enum([
   'ci_completion',
   // `peer_notification` landed with macf#256 — sent by the channel
   // server's `notify_peer` MCP tool (DR-023 UC-1) when a hook fires
-  // a peer-to-peer event (e.g., `Stop` hook → `event: "session-end"`).
+  // a peer-to-peer event. Per macf#673 the peer-notify fires on the
+  // `SessionEnd` hook (`event: "session-end"`) + the `PreCompact` hook
+  // (`event: "session-compact"`), NOT on the per-turn `Stop` hook (which
+  // blocked the TUI every turn). `session-compact` is distinct from
+  // `session-end` so a compaction break is not mistaken for an exit.
   // Distinct from `mention` so observability surfaces (Tempo span
   // attributes, Langfuse op-name dimension) keep peer-notification
   // traffic separate from GitHub @mention routing — important for
@@ -74,14 +78,14 @@ export const NotifyPayloadSchema = z.object({
   // PeerNotificationPayloadSchema below before POST.
   // macf#355: `event` field IS the wake-policy discriminator. Receiver-
   // side `decideWake()` reads `event === 'custom'` → wake; autonomous
-  // events (session-end / turn-complete / error) → skip wake (Pattern E,
+  // events (session-end / session-compact / turn-complete / error) → skip wake (Pattern E,
   // macf#267 Option d cross-agent Stop-hook loop prevention). The
   // previously-shipped `wake?: boolean` field was removed in v0.2.21
   // (one-release-cycle window post-v0.2.20) — it leaked Pattern E
   // implementation detail into the agent-facing API; the cleaner
   // design discriminates at the receiver from a property already there
   // for other reasons.
-  event: z.enum(['session-end', 'turn-complete', 'error', 'custom']).optional(),
+  event: z.enum(['session-end', 'session-compact', 'turn-complete', 'error', 'custom']).optional(),
   // macf#473: optional owner/repo#N anchor a peer_notification nudge is tied to, for the comms-ledger graph join.
   github_anchor: z.string().optional(),
   // pr_review_state variant fields (macf-actions#39, v3.3.0). Optional
@@ -189,7 +193,7 @@ export type CiCompletionPayload = z.infer<typeof CiCompletionPayloadSchema>;
 export const PeerNotificationPayloadSchema = z.object({
   type: z.literal('peer_notification'),
   source: z.string().min(1),
-  event: z.enum(['session-end', 'turn-complete', 'error', 'custom']),
+  event: z.enum(['session-end', 'session-compact', 'turn-complete', 'error', 'custom']),
   message: z.string().optional(),
   context: z.record(z.string(), z.unknown()).optional(),
   // macf#355: receiver-side wake policy reads `event === 'custom'` only.

@@ -183,8 +183,8 @@ describe('PeerNotificationPayloadSchema (macf#256, DR-023 UC-1)', () => {
     expect(result.context).toEqual({ issue_number: 42 });
   });
 
-  it('accepts all four event values', () => {
-    for (const event of ['session-end', 'turn-complete', 'error', 'custom'] as const) {
+  it('accepts all five event values', () => {
+    for (const event of ['session-end', 'session-compact', 'turn-complete', 'error', 'custom'] as const) {
       const result = PeerNotificationPayloadSchema.parse({
         type: 'peer_notification', source: 'a', event,
       });
