@@ -13,6 +13,7 @@ import { runPs } from './commands/ps.js';
 import { runFleetStatus } from './commands/fleet.js';
 import { runFleetDoctor } from './commands/fleet-doctor.js';
 import { runFleetInstallCronCommand, DEFAULT_SCHEDULE } from './commands/fleet-install-cron.js';
+import { runFleetResumeCommand } from './commands/fleet-resume.js';
 import { runFleetUpgrade } from './commands/fleet-upgrade.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
@@ -337,6 +338,30 @@ fleet
       prelude: opts.prelude,
       log: opts.log,
       yes: opts.yes,
+    });
+    process.exitCode = code;
+  });
+
+fleet
+  .command('resume')
+  .description(
+    'Nudge a STALLED idle agent to continue, or REPORT a BLOCKED one — DR-037 / ' +
+    'macf#686, porting devops-toolkit fleet/resume.sh + stall-signatures.json. An idle ' +
+    'agent is one of three things and only its pane tells them apart: idle-CLEAN (no ' +
+    'signature) → never touched; idle-STALLED (rate-limit/turn-abort) → NUDGE (resume ' +
+    'the SAME session, preserving work); idle-BLOCKED (permission/trust/skill/memory ' +
+    'prompt) → REPORT (a durable operator alert, NEVER auto-answered — an authorization ' +
+    'decision needs a human, DR-033). SAFETY: allowlist-only (never a blind nudge), ' +
+    'idle-gated (never interrupt a busy agent), verify-resumed (a nudge that does not ' +
+    'take → back off, don\'t re-spam), fire-capped per episode. The allowlist lives in ' +
+    '.claude/.macf/stall-signatures.json (operator-tunable). DRY-RUN BY DEFAULT — prints ' +
+    'the plan; --execute nudges / raises alerts.',
+  )
+  .option('--execute', 'ACTUALLY nudge / raise alerts (else dry-run: print the plan)', false)
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    const code = await runFleetResumeCommand(resolveProjectDir(opts.dir), {
+      execute: Boolean(opts.execute),
     });
     process.exitCode = code;
   });

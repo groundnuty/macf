@@ -47,6 +47,7 @@ import { resolveLatestVersions } from '../version-resolver.js';
 import { copyCanonicalRules, copyCanonicalScripts, findCliPackageRoot } from '../rules.js';
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
+import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
 import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion, linkPluginCliDist } from '../plugin-fetcher.js';
@@ -270,6 +271,13 @@ export async function update(
   // existing file is only validated (loud Inv-2 refuse/warn feedback), so
   // `macf update` never reverts an operator's careful allowlist.
   reportSeedPromptResponses(seedPromptResponsesConfig(projectDir));
+
+  // Seed (if absent) / validate (if present) the stall-signature allowlist
+  // (.claude/.macf/stall-signatures.json, DR-037 / macf#686) — the config
+  // `macf fleet resume` matches an idle agent's pane against. Operator-curated
+  // (signatures are best-effort across CC versions) → seed-if-absent, never
+  // clobber: an existing file is only validated, never rewritten by update.
+  reportSeedStallSignatures(seedStallSignaturesConfig(projectDir));
 
   // Refresh project-tier rules (DR-026 §3 / F3, macf#501) from
   // MACF_PROJECT_RULES_SOURCE into .claude/rules/project/. Unset → no-op (the
