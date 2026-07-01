@@ -28,7 +28,7 @@ import { runProposeCommand } from './commands/propose.js';
 import { selfUpdate } from './commands/self-update.js';
 import { findProjectRoot } from './config.js';
 import { findCliPackageRoot } from './rules.js';
-import { PACKAGE_VERSION } from '../package-version.js';
+import { packageVersionDisplay } from '../package-version.js';
 
 /**
  * Resolve the project directory for project-scoped commands.
@@ -74,7 +74,7 @@ const program = new Command();
 program
   .name('macf')
   .description('Multi-Agent Coordination Framework CLI')
-  .version(PACKAGE_VERSION)
+  .version(packageVersionDisplay())
   .action(() => {
     listAgents();
   });
