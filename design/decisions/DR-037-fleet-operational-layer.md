@@ -1,6 +1,6 @@
 # DR-037: The fleet operational-layer as canonical CLI — two planes, decision/driver contract, distribution, workspace discovery
 
-**Status:** Proposed
+**Status:** Accepted (ratified by operator 2026-07-01; see macf#689)
 **Date:** 2026-07-01
 **Trigger:** The 2026-07-01 operator session surfaced a *delivery* problem and a converging set of routed feature issues. Devops built a fleet operational layer (the DR-006 watchdog, resume/nudge-report, the cron installer, the DR-007 upgrade roll) as **reference implementations in `groundnuty/macf-devops-toolkit:fleet/`** — but the agent VMs only ever receive the **macf binary**, so none of it reaches them. Three routed issues (`macf#682` fleet-upgrade + version-visibility, `macf#686` watchdog/resume/install-cron promotion, and the `macf ps` dead-agent enumeration off DR-007 Amendment A / `#141`) all promote operational tooling into the CLI, and — surfaced in the code review of DR-007 (`#682`) and the code↔devops exchange on `#686` — **they all consume the same framework primitives no macf DR yet defines.** This DR defines them, so the subcommands promote onto one substrate.
 
