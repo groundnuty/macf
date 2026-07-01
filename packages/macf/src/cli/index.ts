@@ -13,6 +13,7 @@ import { runPs } from './commands/ps.js';
 import { runFleetStatus } from './commands/fleet.js';
 import { runFleetDoctor } from './commands/fleet-doctor.js';
 import { runFleetInstallCronCommand, DEFAULT_SCHEDULE } from './commands/fleet-install-cron.js';
+import { runFleetReconcileCommand } from './commands/fleet-reconcile.js';
 import { runFleetResumeCommand } from './commands/fleet-resume.js';
 import { runFleetUpgrade } from './commands/fleet-upgrade.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
@@ -340,6 +341,44 @@ fleet
       yes: opts.yes,
     });
     process.exitCode = code;
+  });
+
+fleet
+  .command('reconcile')
+  .description(
+    'The DR-006 desired-state reconciler (DR-037 / macf#686, porting devops-toolkit ' +
+    'fleet/reconcile.sh). Probes ACTUAL state (fleet /health) and drives it toward the ' +
+    'operator-owned DESIRED set (a desired-agents.yaml manifest if present, else the ' +
+    "host's discovered workspaces): desired-and-down → LAUNCH; desired-and-deaf → HEAL " +
+    'via the tiered ladder (Tier-1 gated inject → Tier-2 graceful-restart [--allow-restart] → ' +
+    'Tier-3 gh-issue alert); desired-down (paused sentinel OR last-exit==0 /exit) → SKIP. ' +
+    'Guards: aliveness-gate (NEVER restart a busy agent), EXPONENTIAL restart-backoff + ' +
+    'stuck-in-backoff escalation (never restart-storm), launch-stagger (space cold-starts), ' +
+    'and a self-heartbeat. DRY-RUN BY DEFAULT — logs decisions, acts on nothing; pass ' +
+    '--execute to act. The cron consumer is `macf fleet install-cron`.',
+  )
+  .option('--execute', 'ACTUALLY act (launch/inject/restart/alert/heartbeat). Default: dry-run.', false)
+  .option('--allow-restart', 'Enable Tier-2 graceful-restart (operator sign-off; default held)', false)
+  .option('--with-routing', 'Accepted for cron compatibility (routing-freshness probe RESERVED in this port)', false)
+  .option('--manifest <path>', 'desired-agents.yaml (default: $HOME/.macf/desired-agents.yaml, else discovery)')
+  .option('--state-dir <dir>', 'Cross-sweep escalation/backoff/alert state dir (default: $HOME/.macf/watchdog-state)')
+  .option('--last-exit-dir <dir>', 'Per-agent last-exit-code dir (default: $HOME/.macf/last-exit)')
+  .option('--paused-dir <dir>', 'Paused-sentinel dir (default: $HOME/.macf/paused)')
+  .option('--heartbeat-file <path>', 'Watchdog self-heartbeat file (default: $HOME/.macf/watchdog-heartbeat)')
+  .option('--json', 'Emit the structured sweep result as JSON (DR-031 watchdog contract)', false)
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    process.exitCode = await runFleetReconcileCommand(resolveProjectDir(opts.dir), {
+      execute: opts.execute,
+      allowRestart: opts.allowRestart,
+      withRouting: opts.withRouting,
+      manifest: opts.manifest,
+      stateDir: opts.stateDir,
+      lastExitDir: opts.lastExitDir,
+      pausedDir: opts.pausedDir,
+      heartbeatFile: opts.heartbeatFile,
+      json: opts.json,
+    });
   });
 
 fleet
