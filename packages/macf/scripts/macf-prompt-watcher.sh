@@ -117,8 +117,17 @@ _classify() {
 }
 
 # _looks_prompt_like <frame> → 0 if the frame looks like an interactive prompt
+#
+# ❯ is overloaded (groundnuty/macf#729): it is BOTH the menu-selection cursor
+# on a real numbered ceremony prompt (`❯ 1. Yes`) AND the Claude Code
+# free-form input-box cursor (`❯ <queued/typed text>`). A bare `❯` match
+# misclassified a queued message in the input box (e.g.
+# `❯ you merge pleasee, complete startup-reconcile`) as an unknown prompt,
+# firing repeated ALERT spam. Match only when `❯` sits directly on a
+# NUMBERED OPTION line — that excludes the free-form input box (whose text
+# after `❯` is not `[0-9]+[.)]`) while still catching real numbered menus.
 _looks_prompt_like() {
-  printf '%s' "$1" | grep -qF '❯' && return 0
+  printf '%s' "$1" | grep -qE '❯[[:space:]]*[0-9]+[.)]' && return 0
   printf '%s' "$1" | grep -qE '\((y/n|y/N|Y/n)\)|\[(y/N|Y/n|y/n)\]' && return 0
   return 1
 }

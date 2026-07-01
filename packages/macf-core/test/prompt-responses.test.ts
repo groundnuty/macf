@@ -154,6 +154,23 @@ describe('Inv 1 — looksPromptLike', () => {
   it('is false for ordinary agent output', () => {
     expect(looksPromptLike('Running tests...\nAll 47 passing.')).toBe(false);
   });
+
+  // groundnuty/macf#729 — ❯ is overloaded: it is also the Claude Code
+  // free-form input-box cursor, not just the menu-selection cursor. A queued
+  // message in the input box must NOT be misread as an unknown prompt.
+  it('is false for a queued message in the free-form input box (macf#729)', () => {
+    expect(
+      looksPromptLike('❯ you merge pleasee, complete startup-reconcile (DR-008)'),
+    ).toBe(false);
+  });
+  it('is false for an empty input box', () => {
+    expect(looksPromptLike('❯ ')).toBe(false);
+    expect(looksPromptLike('❯')).toBe(false);
+  });
+  it('is still true for a real numbered menu even without a matching allowlist entry', () => {
+    expect(looksPromptLike('❯ 1. Yes, proceed\n  2. No')).toBe(true);
+    expect(looksPromptLike('❯ 2) No')).toBe(true);
+  });
 });
 
 describe('Inv 3 — optionOnSendLine', () => {
