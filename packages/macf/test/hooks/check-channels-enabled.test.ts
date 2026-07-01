@@ -47,6 +47,11 @@ function runHook(opts: {
   readonly env?: Record<string, string | undefined>;
   /** Stdin payload (defaults to a SessionStart-shaped JSON object). */
   readonly stdin?: string;
+  /** When set, create a channel-server log at
+   *  `$HOME/.local/state/macf/<sess>/channel.log` with these JSONL lines — the
+   *  tmux-wake fallback evidence the guard reads (macf#633 false-deafness fix).
+   *  `undefined` → no channel.log (can't confirm tmux-wake). */
+  readonly channelLogLines?: readonly string[];
 }): RunResult {
   const fakeHome = mkdtempSync(join(tmpdir(), 'macf-chan-home-'));
   const workspace = mkdtempSync(join(tmpdir(), 'macf-chan-ws-'));
@@ -66,13 +71,23 @@ function runHook(opts: {
     writeFileSync(join(logDir, '2026-06-27T15-58-04-000Z.jsonl'), lines + '\n');
   }
 
+  let channelLogPath: string | undefined;
+  if (opts.channelLogLines !== undefined) {
+    const chanDir = join(fakeHome, '.local', 'state', 'macf', 'testproj@test-agent');
+    mkdirSync(chanDir, { recursive: true });
+    channelLogPath = join(chanDir, 'channel.log');
+    writeFileSync(channelLogPath, opts.channelLogLines.join('\n') + '\n');
+  }
+
   // Clean env: temp HOME + workspace, fast poll. Drop ambient MACF_* so the
-  // runner's identity doesn't leak in.
+  // runner's identity doesn't leak in. Point MACF_LOG_PATH at the fake
+  // channel.log when one was created (the guard's primary locator).
   const cleanEnv: Record<string, string> = {
     PATH: process.env['PATH'] ?? '',
     HOME: fakeHome,
     CLAUDE_PROJECT_DIR: workspace,
     MACF_CHANNELS_POLL_ITERS: '1',
+    ...(channelLogPath ? { MACF_LOG_PATH: channelLogPath } : {}),
   };
   if (opts.env) {
     for (const [k, v] of Object.entries(opts.env)) {
@@ -90,14 +105,47 @@ function runHook(opts: {
   return { status: res.status, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
 }
 
+const TMUX_WAKE_DELIVERED =
+  '{"ts":"2026-07-01T09:05:06.742Z","level":"info","event":"tmux_wake_delivered","target":"%221"}';
+const TMUX_WAKE_SKIPPED =
+  '{"ts":"2026-07-01T09:05:06.742Z","level":"info","event":"tmux_wake_skipped","reason":"observational"}';
+
 describe('check-channels-enabled.sh (SessionStart guard)', () => {
-  describe('(a) channels OFF (skip marker present) → loud warning', () => {
-    it('prints the DISABLED warning to stdout + exits 0', () => {
-      const r = runHook({ logDebugLines: [OK_DEBUG, SKIP_DEBUG] });
+  // macf#633 false-deafness fix: native-push OFF is NOT "deaf" when tmux-wake
+  // is delivering. The guard asserts the TRUE invariant (is SOME path
+  // delivering?) via the channel-server log's `tmux_wake_delivered` events.
+  describe('(a) native-push OFF + tmux-wake DELIVERING → info note, NOT a deafness alarm', () => {
+    it('prints the accurate ℹ️ note (not deaf) + does NOT cry deafness + exits 0', () => {
+      const r = runHook({
+        logDebugLines: [OK_DEBUG, SKIP_DEBUG],
+        channelLogLines: [TMUX_WAKE_DELIVERED],
+      });
       expect(r.status).toBe(0);
-      expect(r.stdout).toContain('ROUTED NOTIFICATIONS ARE DISABLED');
+      expect(r.stdout).toContain('you are NOT deaf to routing');
+      expect(r.stdout).toContain('tmux-wake');
+      expect(r.stdout).toContain('macf#641');
+      // The old false claims must be GONE.
+      expect(r.stdout).not.toContain('ROUTED NOTIFICATIONS ARE DISABLED');
+      expect(r.stdout).not.toContain('SILENTLY DROPPED');
+    });
+  });
+
+  describe('(a2) native-push OFF + NO tmux-wake evidence → the (reworded, honest) warning', () => {
+    it('warns delivery is UNCONFIRMED (not a false-absolute "you are deaf") + exits 0', () => {
+      const r = runHook({
+        logDebugLines: [OK_DEBUG, SKIP_DEBUG],
+        channelLogLines: [TMUX_WAKE_SKIPPED], // channel.log exists but no delivery
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('UNCONFIRMED');
       expect(r.stdout).toContain('macf#632/#633');
-      expect(r.stdout).toContain('Assert GitHub state directly');
+      expect(r.stdout).toContain('Assert GitHub state'); // wraps across a newline in the heredoc
+    });
+
+    it('no channel.log at all → also the UNCONFIRMED warning (can\'t verify tmux-wake)', () => {
+      const r = runHook({ logDebugLines: [OK_DEBUG, SKIP_DEBUG] }); // no channelLogLines
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('UNCONFIRMED');
     });
   });
 

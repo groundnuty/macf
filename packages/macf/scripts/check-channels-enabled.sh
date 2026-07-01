@@ -91,23 +91,80 @@ for ((i = 0; i < poll_iters; i++)); do
   sleep 1
 done
 
-# Only the CONFIRMED-off case warns. on / unknown / inconclusive stay silent.
+# on / unknown / inconclusive → stay silent (native channel-push is fine or
+# undeterminable). Only the CONFIRMED-off case says anything — and WHAT it says
+# depends on whether the tmux-wake FALLBACK is delivering, because
+# "native-push off" is NOT "deaf to routing": tmux-wake (send-keys) is the
+# load-bearing last-hop and is DELIVERING routed notifications on every current
+# agent (macf#641/DR-022-Amendment-P: native channels are a pending UPGRADE, not
+# yet applied — the .mcp.json mount the dev-flag needs isn't in place, so
+# native-push is off fleet-wide, while tmux-wake carries delivery).
+#
+# The original macf#633 warning asserted the WRONG invariant — "is native-push
+# on?" — and cried total deafness whenever it was off, a FALSE ALARM while
+# tmux-wake delivers. This asserts the TRUE result-invariant (Pattern A):
+# "is SOME delivery path working?" by reading the channel-server's own log for
+# recent `tmux_wake_delivered` events. Only genuine total deafness (native off
+# AND no tmux-wake delivery evidence) gets the loud warning.
 if [ "$state" = "off" ]; then
-  cat <<'WARN'
-⚠️  ROUTED NOTIFICATIONS ARE DISABLED this session (macf#632/#633).
+  # Locate this agent's channel-server log. MACF_LOG_PATH (set by claude.sh) is
+  # the full path to channel.log; else fall back to the newest channel.log under
+  # ~/.local/state/macf/*/ (this session's is freshest-by-mtime).
+  CHANNEL_LOG=""
+  if [ -n "${MACF_LOG_PATH:-}" ] && [ -r "${MACF_LOG_PATH}" ]; then
+    CHANNEL_LOG="${MACF_LOG_PATH}"
+  else
+    CHANNEL_LOG="$(ls -t "$HOME_DIR"/.local/state/macf/*/channel.log 2>/dev/null | head -n1 || true)"
+  fi
+
+  # Evidence the tmux-wake fallback is delivering to THIS agent: a
+  # `tmux_wake_delivered` event in its channel log. A functioning tmux-wake
+  # agent accrues these; its presence means routed notifications DO reach the
+  # TUI (the agent is NOT deaf), even with native-push off.
+  tmux_wake_alive="no"
+  if [ -n "$CHANNEL_LOG" ] && [ -r "$CHANNEL_LOG" ]; then
+    # Bound the scan to the tail (logs grow large); grep is quiet on no-match.
+    if tail -n 2000 "$CHANNEL_LOG" 2>/dev/null | grep -q 'tmux_wake_delivered'; then
+      tmux_wake_alive="yes"
+    fi
+  fi
+
+  if [ "$tmux_wake_alive" = "yes" ]; then
+    # The current, expected fleet state: native-push off, tmux-wake delivering.
+    # Accurate + non-alarming — NOT "you are deaf".
+    cat <<'INFO'
+ℹ️  Native Claude Code channel-push is OFF this session, but tmux-wake IS
+delivering routed notifications (recent `tmux_wake_delivered` in the
+channel-server log) — you are NOT deaf to routing. Routed issues, PRs, reviews,
+and @mentions still reach you via the tmux-wake last-hop.
+
+Native channel-push is the pending macf#641 / DR-022-Amendment-P upgrade (the
+channel-server must be mounted as a `.mcp.json server:macf-agent` for the
+`--dangerously-load-development-channels` flag to resolve; it is currently
+`--plugin-dir`-mounted, so the flag matches nothing). Expected until that
+migration lands — no action needed. Good hygiene regardless: assert GitHub
+state on hand-offs (coordination.md §Communication 5). Silence: MACF_SKIP_CHANNELS_CHECK=1.
+INFO
+  else
+    # Genuine concern: native-push off AND no evidence tmux-wake is delivering.
+    cat <<'WARN'
+⚠️  ROUTED-NOTIFICATION DELIVERY IS UNCONFIRMED this session (macf#632/#633).
 
 The macf-agent MCP server logged "Channel notifications skipped: ... not in
---channels list for this session". Routed issues, PRs, reviews, and @mentions
-will be SILENTLY DROPPED — you will NOT be woken for them.
+--channels list" (native channel-push is OFF — the pending macf#641 upgrade),
+AND no recent `tmux_wake_delivered` was found in the channel-server log — so the
+tmux-wake FALLBACK delivery could not be confirmed either. You may not be woken
+for routed issues, PRs, reviews, or @mentions.
 
-Do NOT trust "no pings = nothing to do" / "I'm idle". You are deaf to routing
-this session. Until relaunched with channels enabled:
-  - Assert GitHub state directly (gh issue/pr list, review-sweep, gate-sweep)
-    instead of waiting for a ping (coordination.md §Communication 5).
-To fix: relaunch via ./claude.sh on Claude Code >= 2.1.80 (it passes the
-channels flag). If it persists, check `claude --version` and that claude.sh
-emits MACF_CHANNELS_ARGS, or set MACF_SKIP_CHANNELS_CHECK=1 to silence this.
+Do NOT trust "no pings = nothing to do" / "I'm idle". Assert GitHub state
+directly (gh issue/pr list, review-sweep, gate-sweep) instead of waiting for a
+ping (coordination.md §Communication 5).
+To fix: relaunch via ./claude.sh on Claude Code >= 2.1.80. If it persists,
+check `claude --version`, that claude.sh emits MACF_CHANNELS_ARGS, and that the
+channel-server is running (its log should show `tmux_wake_delivered` on
+delivery). Silence: MACF_SKIP_CHANNELS_CHECK=1.
 WARN
+  fi
 fi
 
 exit 0
