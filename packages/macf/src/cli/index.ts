@@ -408,20 +408,27 @@ fleet
 fleet
   .command('upgrade')
   .description(
-    'Rolling framework-version upgrade (DR-037 / macf#682, hardened macf#722). For ' +
-    "each selected fleet (a fleet == one PROJECT, macf#710 — its own CA + registry " +
-    'namespace, NOT the coarser registry scope, since one profile/org registry can ' +
-    'host several distinct projects), roll every agent whose RUNNING /health.version ' +
-    'is behind TARGET, ONE AT A TIME: pre-flight gates (config-dirty — skip+report ' +
-    'unless --force; then busy — never interrupt a working agent, skip+report or ' +
-    '--wait for idle) → macf update → restart-self → verify /health.version == target ' +
-    '(re-resolving the fresh restart-self endpoint on EACH poll, over a ' +
-    'relaunch-aware grace budget) → next. A HALT stops the roll (and later fleets): ' +
-    '`bad-release` when the agent is confirmed back on its OLD version (a crash-loop), ' +
-    '`relaunch-unconfirmed` when it is never confirmed green within the grace (down / ' +
-    'unreachable / an unrecognized version) — neither is safe to leave behind while ' +
-    'moving on, so a bad release cannot brick the fleet. DRY-RUN by default (prints ' +
-    'the plan); --execute rolls. TARGET defaults to npm-latest of @groundnuty/macf.',
+    'Rolling framework-version upgrade (DR-037 / macf#682, hardened macf#722, ' +
+    'transactional + object-with-message macf#725). For each selected fleet (a ' +
+    "fleet == one PROJECT, macf#710 — its own CA + registry namespace, NOT the " +
+    'coarser registry scope, since one profile/org registry can host several ' +
+    'distinct projects), roll every agent whose RUNNING /health.version is ' +
+    'behind TARGET, ONE AT A TIME: pre-flight gates (config-dirty — OBJECTS ' +
+    'with the exact uncommitted-file list + an agent-directed message, doing ' +
+    'NOTHING to that agent, unless --force; then busy — never interrupt a ' +
+    'working agent, skip+report or --wait for idle) → macf update → ' +
+    'restart-self (relaunches WITHOUT stashing its own regeneration — left ' +
+    'uncommitted for the relaunched agent to see) → verify /health.version == ' +
+    'target (re-resolving the fresh restart-self endpoint on EACH poll, over a ' +
+    'relaunch-aware grace budget) → report the regenerated files + next. A HALT ' +
+    'stops the roll (and later fleets): `bad-release` when the agent is ' +
+    'confirmed back on its OLD version (a crash-loop), `relaunch-unconfirmed` ' +
+    'when it is never confirmed green within the grace (down / unreachable / an ' +
+    'unrecognized version) — neither is safe to leave behind while moving on, ' +
+    'so a bad release cannot brick the fleet. Reconcile after an OBJECT is ' +
+    'MANUAL this iteration: resolve the flagged files, then re-run. DRY-RUN by ' +
+    'default (prints the plan); --execute rolls. TARGET defaults to npm-latest ' +
+    'of @groundnuty/macf.',
   )
   .option('--target <version>', 'Target framework version (default: npm-latest of @groundnuty/macf)')
   .option('--fleet <names>', 'Comma-list of fleets (project identifiers) to roll — multi-select, rolled fleet-by-fleet')
@@ -432,8 +439,10 @@ fleet
   .option(
     '--force',
     'Roll an agent even if its config surface (.claude/**, CLAUDE.md, ' +
-      'claude.sh, env.local.*) is dirty (macf#722) — bypasses the pre-flight ' +
-      'config-dirty skip-gate AND restart-self\'s matching stash-refusal guard.',
+      'claude.sh, env.local.*) is dirty PRE-flight (macf#722/#725) — bypasses ' +
+      'the pre-flight config-dirty OBJECT gate. The bypassed agent\'s restart ' +
+      'still leaves the config surface uncommitted (same as the normal path), ' +
+      'it does not stash it.',
     false,
   )
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
@@ -511,9 +520,19 @@ program
   .option('--json', 'Emit the structured plan/result as JSON', false)
   .option(
     '--force',
-    'Bypass the config-surface stash-refusal guard (macf#722) — proceed ' +
-      '(and stash) even when .claude/**, CLAUDE.md, claude.sh, or env.local.* ' +
-      'are dirty. Same effect as MACF_RESTART_STASH_CONFIG=1.',
+    'Bypass the STANDALONE config-surface stash-refusal guard (macf#722) — ' +
+      'proceed (and STASH, same as any other dirt) even when .claude/**, ' +
+      'CLAUDE.md, claude.sh, or env.local.* are dirty. Same effect as ' +
+      'MACF_RESTART_STASH_CONFIG=1.',
+    false,
+  )
+  .option(
+    '--leave-config-uncommitted',
+    'Roll-path flag (macf#725, set by `macf fleet upgrade`\'s driver — not ' +
+      'intended for direct operator use): skip the config-surface guard ' +
+      'entirely and LEAVE the config surface uncommitted instead of ' +
+      'stashing it (any other tracked dirt still stashes normally). Same ' +
+      'effect as MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED=1.',
     false,
   )
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
@@ -524,6 +543,7 @@ program
       dryRun: opts.dryRun,
       json: opts.json,
       force: opts.force,
+      leaveConfigUncommitted: opts.leaveConfigUncommitted,
     });
     process.exitCode = code;
   });

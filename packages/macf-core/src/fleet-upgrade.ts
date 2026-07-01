@@ -7,25 +7,35 @@
  * logic lives in macf-core; the per-runtime driver bodies live in `packages/macf`
  * or a future K8s package). It NEVER touches `/proc`, tmux, `capture-pane`, or
  * kubectl — it drives entirely off the injected `FleetDriver` verbs
- * (`probe`/`discoverWorkspaces`/`isBusy`/`isConfigDirty`/`upgrade`/`restart`)
- * plus an injected `verifyGreen` runner, so the SAME sequencer rolls a VM tmux
- * fleet, a macOS host, and a far-future K8s deployment by swapping only the driver.
+ * (`probe`/`discoverWorkspaces`/`isBusy`/`listDirtyConfig`/`upgrade`/`restart`/
+ * `listModifiedFiles`) plus an injected `verifyGreen` runner, so the SAME
+ * sequencer rolls a VM tmux fleet, a macOS host, and a far-future K8s deployment
+ * by swapping only the driver.
  *
  * The state machine (per fleet, one agent at a time):
  *
  *   probe() + discoverWorkspaces()
  *     → for each member whose RUNNING version < target (compareSemver):
- *         PRE-FLIGHT gates (BEFORE any mutation — a gated agent is never
- *         upgraded/restarted, so skipping here is always safe to CONTINUE):
- *           config-dirty-gate (driver.isConfigDirty → dirty ⇒ SKIP+REPORT
- *             unless `--force`; macf#722 Fix B — never clobber/stash operator
- *             config underneath a rolling `macf update` + restart-self)
+ *         PRE-FLIGHT gate (BEFORE any mutation — never touches the agent):
+ *           config-dirty-gate (driver.listDirtyConfig → non-empty ⇒ OBJECT:
+ *             SKIP+REPORT the list of uncommitted files + an agent-directed
+ *             message to inspect-and-commit-or-delete-or-gitignore-then-retry,
+ *             unless `--force`; macf#725 — TRANSACTIONAL revision of macf#722
+ *             Fix B: rather than silently stashing operator dirt, the roll
+ *             OBJECTS and does NOTHING until the agent resolves it)
  *           busy-gate (driver.isBusy → busy ⇒ SKIP+REPORT, or `--wait` for idle)
- *         → driver.upgrade(agent)
- *         → driver.restart(agent)
+ *         → driver.upgrade(agent)        // dirties the managed config surface —
+ *                                        // this is EXPECTED, not a fault
+ *         → driver.restart(agent, { leaveConfigUncommitted: true })
+ *             // relaunches WITHOUT stashing macf update's own regeneration —
+ *             // the pre-flight gate already proved the ONLY dirt is the
+ *             // upgrade's, so leaving it uncommitted (visible via `git status`
+ *             // in the relaunched agent) is safe + intended (macf#725)
  *         → verifyGreen({agent, target})   // re-resolves the fresh endpoint
  *             each poll, over a relaunch-aware grace budget (`--verify-timeout`)
- *             → green on TARGET ⇒ next agent (`upgraded`)
+ *             → green on TARGET ⇒ driver.listModifiedFiles(agent) → emit an
+ *               agent-directed "review + commit what macf update regenerated"
+ *               message + list, THEN next agent (`upgraded`)
  *             → confirmed back on the OLD (pre-upgrade) version ⇒ HALT the
  *               roll, reason `bad-release` (a crash-loop / stuck-old-process
  *               release stalls at agent 1 and CANNOT brick the fleet)
@@ -44,6 +54,12 @@
  *
  * DRY-RUN is the default at the command boundary: `execute: false` computes +
  * reports the PLAN (probe + classify) and performs NO driver mutations.
+ *
+ * **Reconcile is MANUAL this iteration (macf#725).** The config-dirty OBJECT
+ * path surfaces the dirt via `onEvent` + a non-mutating skip; it does NOT
+ * auto-resolve (no auto-stash, no auto-commit, no auto-delete). A clean
+ * re-run, after the agent (or operator) resolves the flagged files, completes
+ * the roll for that agent.
  */
 import { compareSemver } from './semver.js';
 import type { FleetDriver, FleetState } from './fleet-driver.js';
@@ -85,8 +101,11 @@ export interface AgentUpgradePlan {
  * - `busy-skipped`          — busy-gated (or `--wait` timed out still busy),
  *                             BEFORE any mutation; NOT a failure, CONTINUES.
  * - `config-dirty-skipped`  — config-dirty-gated (uncommitted changes on the
- *                             DR-029 operator-preserved surface), BEFORE any
- *                             mutation; NOT a failure, CONTINUES (macf#722 Fix B).
+ *                             roll's touched-config surface), BEFORE any
+ *                             mutation; NOT a failure, CONTINUES. The roll
+ *                             OBJECTS with the specific file list + an
+ *                             agent-directed message (macf#725 — replaces
+ *                             macf#722 Fix B's silent skip).
  * - `halted`                — verify-green did NOT confirm the target version;
  *                             the roll STOPS here. `reason` distinguishes WHY
  *                             (see `HaltReason`).
@@ -126,31 +145,47 @@ export interface AgentRollResult {
 }
 
 /**
- * The DR-029 operator-preserved config surface (macf#722 Fix B) — the path
- * globs `rollFleet`'s pre-flight config-dirty gate checks for uncommitted
- * tracked changes before touching an agent. Sourced from DR-029's Amendment
- * (2026-06-27, macf#598) managed-vs-operator taxonomy: `.claude/**` (rules +
- * scripts + settings), `CLAUDE.md` (workbench doc), `claude.sh` (the launcher —
- * operator-preserved when hand-authored/header-less, and harmless to include
- * even when macf-managed since a macf-managed copy is never legitimately
- * "dirty" outside an in-flight `macf update`), and `env.local.*` (the
- * operator-custom env extension slot — see
+ * The roll's TOUCHED-CONFIG-SURFACE UNION (macf#722 Fix B, corrected naming
+ * macf#725) — the path globs `rollFleet`'s pre-flight config-dirty gate checks
+ * for uncommitted tracked changes before touching an agent.
+ *
+ * **This is a UNION, not an "operator-preserved" set** (the DR-037 Amendment B
+ * naming was a misnomer, corrected here macf#725): it spans BOTH (a) the files
+ * `macf update` OVERWRITES (the managed surface — canonical rules/scripts/hooks
+ * under `.claude/**`, `.macf/*`) and (b) the files `restart-self` would STASH
+ * (the operator surface — `settings.local.json`, `rules/project/**`,
+ * `env.local.*`, `CLAUDE.md`, a hand-authored `claude.sh`). Both halves answer
+ * the SAME pre-flight question the gate asks — "would this roll's `upgrade` +
+ * `restart` silently clobber or stash SOMETHING uncommitted on this surface?"
+ * — so both belong in the one union the gate checks, regardless of which half
+ * of DR-029's managed-vs-operator taxonomy a given path falls in.
+ *
+ * Sourced from DR-029's Amendment (2026-06-27, macf#598) managed-vs-operator
+ * taxonomy: `.claude/**` (rules + scripts + settings — managed AND
+ * project-tier), `CLAUDE.md` (operator workbench doc), `claude.sh` (the
+ * launcher — operator-preserved when hand-authored/header-less, and harmless
+ * to include even when macf-managed since a macf-managed copy is never
+ * legitimately "dirty" outside an in-flight `macf update`), and `env.local.*`
+ * (the operator-custom env extension slot — see
  * `design/decisions/DR-029-substrate-config-via-init-and-reintegrate.md`
  * Amendment table). Deliberately excludes macf-managed/regenerated files
- * (`env.*` canonical seven, `host-prelude.sh`) — those are SUPPOSED to change
- * under `macf update`; dirtiness there is not an operator-authored conflict.
+ * (`env.*` canonical seven, `host-prelude.sh`) that are ONLY ever touched by
+ * `macf update` itself and never by an operator — dirtiness there pre-flight
+ * would still be a genuine conflict (someone hand-edited a regenerated file),
+ * so those ARE covered by `.claude/**`/`.macf/*` where they live; the excluded
+ * class is narrower than "everything macf update touches."
  *
- * NOTE (macf#724 review): this stash-guard set is intentionally a slight
- * SUPERSET of DR-029's *regenerate*-boundary for `claude.sh`. The two answer
- * DIFFERENT questions — the stash-guard: "should `restart-self` STASH this
- * uncommitted change?"; DR-029's header-conditional rule: "should `macf update`
- * REGENERATE this file?". So do NOT "align" `claude.sh` here to DR-029's
- * header-conditional form: that would reintroduce the stash-a-dirty-managed-
- * `claude.sh` hole (a dirty managed launcher would then be silently stashed →
- * relaunched-wrong). Unconditional here is harmless when clean (nothing to
- * stash) and protective when dirty, regardless of header.
+ * NOTE (macf#724 review, still applicable post-rename): this gate's set is
+ * intentionally a slight SUPERSET of DR-029's *regenerate*-boundary for
+ * `claude.sh`. The two answer DIFFERENT questions — this gate: "does the roll
+ * need to OBJECT before touching this agent?"; DR-029's header-conditional
+ * rule: "should `macf update` REGENERATE this file?". So do NOT "align"
+ * `claude.sh` here to DR-029's header-conditional form: that would reintroduce
+ * the roll-past-a-dirty-managed-`claude.sh` hole. Unconditional here is
+ * harmless when clean (nothing flagged) and protective when dirty, regardless
+ * of header.
  */
-export const OPERATOR_PRESERVED_CONFIG_PATTERNS = [
+export const ROLL_TOUCHED_CONFIG_PATTERNS = [
   '.claude/**',
   'CLAUDE.md',
   'claude.sh',
@@ -175,9 +210,24 @@ export type UpgradeEvent =
   | { readonly kind: 'fleet-start'; readonly fleet: string; readonly behind: number; readonly total: number }
   | { readonly kind: 'fleet-skipped'; readonly fleet: string; readonly reason: string }
   | { readonly kind: 'roll-start'; readonly agent: string; readonly from: string | null; readonly to: string }
-  | { readonly kind: 'config-dirty-skip'; readonly agent: string }
+  /**
+   * The pre-flight OBJECT (macf#725) — the agent's touched-config surface has
+   * UNCOMMITTED changes. `files` is the exact uncommitted-path list;
+   * `message` is the ready-to-forward, agent-directed text (inspect + commit /
+   * delete / gitignore, then re-run). Fired INSTEAD of any mutation — nothing
+   * on this agent was touched.
+   */
+  | { readonly kind: 'config-dirty-skip'; readonly agent: string; readonly files: readonly string[]; readonly message: string }
   | { readonly kind: 'busy-skip'; readonly agent: string; readonly waited: boolean }
-  | { readonly kind: 'upgraded'; readonly agent: string; readonly version: string }
+  /**
+   * The post-upgrade modified-files report (macf#725) — fired once an agent is
+   * confirmed green, before advancing to the next agent. `files` lists what
+   * `macf update` regenerated (and `restart-self` deliberately left
+   * uncommitted) in the relaunched agent's workspace; `message` is the
+   * ready-to-forward, agent-directed text (review with `git diff` + commit /
+   * act as needed).
+   */
+  | { readonly kind: 'upgraded'; readonly agent: string; readonly version: string; readonly modifiedFiles: readonly string[]; readonly message: string }
   | { readonly kind: 'halt'; readonly agent: string; readonly reason: HaltReason; readonly lastVersion: string | null };
 
 /**
@@ -225,10 +275,13 @@ export interface RollFleetOptions {
   /** Re-poll interval while waiting for idle (ms). */
   readonly waitPollMs?: number;
   /**
-   * `--force` (macf#722 Fix B): roll an agent EVEN IF its config surface is
-   * dirty — bypasses the pre-flight config-dirty gate. Threaded through to
-   * `restart-self` as the matching stash-override so the two halves of the
-   * override stay in lockstep (see `packages/macf/src/cli/commands/fleet-upgrade.ts`).
+   * `--force` (macf#722 Fix B / macf#725): roll an agent EVEN IF its config
+   * surface is dirty PRE-flight — bypasses the pre-flight config-dirty OBJECT
+   * gate. Once bypassed for an agent, that agent's `restart` is ALSO told
+   * `leaveConfigUncommitted: true` (same as the normal clean-path transaction)
+   * — `--force` means "roll anyway," not "stash the pre-existing dirt," so the
+   * pre-existing uncommitted files are left in place exactly like `macf
+   * update`'s own regeneration would be.
    */
   readonly force?: boolean;
 }
@@ -294,6 +347,37 @@ function classifyHalt(green: VerifyGreenResult & { readonly ok: false }, oldVers
 }
 
 /**
+ * Build the agent-directed OBJECT message for a config-dirty pre-flight skip
+ * (macf#725). Pure — exported for CLI-rendering reuse / tests.
+ */
+export function buildConfigDirtyMessage(agent: string, files: readonly string[]): string {
+  return (
+    `Fleet upgrade skipped ${agent} — these files have uncommitted changes ` +
+    `\`macf update\` would overwrite: ${files.join(', ')}. Inspect each and ` +
+    `commit, delete, or .gitignore it, then re-run the upgrade.`
+  );
+}
+
+/**
+ * Build the agent-directed post-upgrade modified-files message (macf#725).
+ * Pure — exported for CLI-rendering reuse / tests.
+ *
+ * The message names the intended STEADY-STATE explicitly: a clean roll LEAVES
+ * this regeneration uncommitted (so the agent can review it), which means the
+ * NEXT roll's pre-flight WILL re-flag these same files as uncommitted unless
+ * they're committed. That re-flag is intended hygiene ("commit last update's
+ * regen before upgrading again"), not a surprise — so the message tells the
+ * agent to commit them, not merely review them.
+ */
+export function buildModifiedFilesMessage(agent: string, files: readonly string[]): string {
+  return (
+    `Fleet upgrade regenerated these files in ${agent}'s workspace: ` +
+    `${files.join(', ')}. Review with \`git diff\` and commit them (so the next ` +
+    `upgrade's pre-flight doesn't re-flag them as uncommitted) or act as needed.`
+  );
+}
+
+/**
  * Roll ONE fleet: for every `behind` plan (in order) run the PRE-FLIGHT gates
  * (config-dirty, then busy) → upgrade → restart → verify-green cycle, HALTING
  * the roll on the first agent whose post-restart state isn't confirmed-green.
@@ -303,6 +387,20 @@ function classifyHalt(green: VerifyGreenResult & { readonly ok: false }, oldVers
  * agent may still become idle later (`--wait`), whereas a dirty agent is
  * skip-only regardless. With `wait`, a busy agent is re-polled for idle first.
  * The verb order + HALT semantics mirror `fleet/upgrade.sh`'s `roll_one`.
+ *
+ * **Transactional + OBJECT-with-message revision (macf#725).** The pre-flight
+ * config-dirty gate is the ONLY decision point that inspects PRE-upgrade
+ * state: clean (or explicitly `--force`-bypassed) ⇒ the roll enters the
+ * transaction and MUST complete it — `upgrade` → `restart(agent,
+ * { leaveConfigUncommitted: true })` always runs together, never mutating
+ * `upgrade` without following through to `restart`. Dirty (and not forced) ⇒
+ * the roll does NOTHING to this agent (no `upgrade`, no `restart`) and OBJECTS
+ * via `onEvent` with the exact file list + an agent-directed message —
+ * reconcile is MANUAL: the agent (or operator) resolves the flagged files and
+ * a clean re-run completes it. This replaces the earlier (macf#722 Fix B)
+ * silent-skip + separately-force-stashed-restart shape, which could dirty the
+ * workspace via `upgrade` and then have `restart-self`'s OWN guard refuse —
+ * aborting mid-transaction with the workspace already mutated.
  */
 export async function rollFleet(
   plans: readonly AgentUpgradePlan[],
@@ -318,15 +416,31 @@ export async function rollFleet(
     if (plan.disposition !== 'behind') continue;
     const agent = plan.agent;
 
-    if (!opts.force && (await deps.driver.isConfigDirty(agent))) {
-      configDirtySkipped += 1;
-      results.push({
-        agent,
-        outcome: 'config-dirty-skipped',
-        detail: 'uncommitted config — commit or --force',
-      });
-      deps.onEvent?.({ kind: 'config-dirty-skip', agent });
-      continue;
+    // PRE-FLIGHT config-dirty gate. By-design inter-roll STEADY-STATE
+    // (macf#725): a clean roll LEAVES `macf update`'s regeneration uncommitted
+    // (so the relaunched agent reviews it — see `restart`'s
+    // `leaveConfigUncommitted` below + `buildModifiedFilesMessage`).
+    // Consequently, the NEXT roll's pre-flight WILL object on that
+    // still-uncommitted regen. This is INTENDED HYGIENE — "commit last update's
+    // regen before upgrading again" — NOT the mid-run abort bug this revision
+    // fixed: it is self-resolving via the object-with-message (the agent
+    // commits the flagged regen, then a clean re-run rolls). The alternative —
+    // auto-committing the deterministic canonical regen at end-of-transaction
+    // (zero inter-roll friction, but trades away the agent's review-visibility
+    // of what changed) — is a DEFERRED future option, the operator's call.
+    if (!opts.force) {
+      const dirtyFiles = await deps.driver.listDirtyConfig(agent);
+      if (dirtyFiles.length > 0) {
+        configDirtySkipped += 1;
+        const message = buildConfigDirtyMessage(agent, dirtyFiles);
+        results.push({
+          agent,
+          outcome: 'config-dirty-skipped',
+          detail: message,
+        });
+        deps.onEvent?.({ kind: 'config-dirty-skip', agent, files: dirtyFiles, message });
+        continue;
+      }
     }
 
     let busy = await deps.driver.isBusy(agent);
@@ -342,12 +456,16 @@ export async function rollFleet(
       continue;
     }
 
+    // --- ENTERING THE TRANSACTION: upgrade + restart run together, always. ---
     deps.onEvent?.({ kind: 'roll-start', agent, from: plan.runningVersion, to: opts.targetVersion });
     await deps.driver.upgrade(agent);
-    // `force` only ever reaches here for an agent whose OWN config-dirty gate
-    // (above) was bypassed by the override — thread it to restart-self's
-    // matching guard so it doesn't re-block the same explicit override.
-    await deps.driver.restart(agent, opts.force ? { forceStashConfig: true } : undefined);
+    // The pre-flight gate above (clean, or explicitly `--force`-bypassed) is
+    // the only thing that decided whether to enter this transaction. Once
+    // entered, `restart` must NOT stash or refuse on the config surface —
+    // `upgrade` (macf update) is EXPECTED to have just dirtied it, and that
+    // dirt (plus any pre-existing `--force`-bypassed dirt) is deliberately
+    // LEFT UNCOMMITTED for the relaunched agent to see via `git status`.
+    await deps.driver.restart(agent, { leaveConfigUncommitted: true });
     const green = await deps.verifyGreen({
       agent,
       targetVersion: opts.targetVersion,
@@ -356,8 +474,10 @@ export async function rollFleet(
 
     if (green.ok) {
       upgraded += 1;
-      results.push({ agent, outcome: 'upgraded', detail: green.version });
-      deps.onEvent?.({ kind: 'upgraded', agent, version: green.version });
+      const modifiedFiles = await deps.driver.listModifiedFiles(agent);
+      const message = buildModifiedFilesMessage(agent, modifiedFiles);
+      results.push({ agent, outcome: 'upgraded', detail: message });
+      deps.onEvent?.({ kind: 'upgraded', agent, version: green.version, modifiedFiles, message });
       continue;
     }
 

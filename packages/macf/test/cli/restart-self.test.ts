@@ -35,6 +35,7 @@ const FIXED_NOW = new Date('2026-06-27T12:00:00.000Z');
 interface Recorder {
   readonly order: string[];
   stashedLabel?: string;
+  stashedExcludeConfigSurface?: boolean;
   written: { path: string; content: string; mode?: number }[];
   spawned: { path: string; args: readonly string[] }[];
   killed: string[];
@@ -61,9 +62,10 @@ function fakeDeps(overrides: Partial<RestartSelfDeps> = {}): {
     hasUncommittedConfigChanges: () => false,
     currentBranch: () => 'feat/596-restart-self',
     headSha: () => 'abc1234def5678',
-    stash: (label: string): StashResult => {
+    stash: (label: string, stashOpts?: { readonly excludeConfigSurface?: boolean }): StashResult => {
       rec.order.push('stash');
       rec.stashedLabel = label;
+      rec.stashedExcludeConfigSurface = stashOpts?.excludeConfigSurface;
       return { stashed: true, ref: 'deadbeefcafe' };
     },
     mkdirp: (path: string) => {
@@ -101,6 +103,7 @@ function baseOpts(over: Partial<RunRestartSelfOptions> = {}): RunRestartSelfOpti
     dryRun: false,
     json: false,
     force: false,
+    leaveConfigUncommitted: false,
     ...over,
   };
 }
@@ -241,6 +244,55 @@ describe('runRestartSelf — confirm path', () => {
       expect(rec.order).toEqual([]);
       const out = logSpy.mock.calls.flat().join('\n');
       expect(out).toContain('DRY-RUN');
+    });
+  });
+
+  describe('leaveConfigUncommitted — the roll-path bypass (macf#725)', () => {
+    it('SKIPS the standalone guard entirely (no refusal) even though the config surface is dirty', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ hasUncommittedConfigChanges: () => true });
+      const code = await runRestartSelf(baseOpts({ confirm: true, leaveConfigUncommitted: true }), deps);
+      expect(code).toBe(0);
+      expect(rec.order).toEqual(['stash', 'backup', 'write', 'write', 'spawn', 'kill']);
+    });
+
+    it('stashes with excludeConfigSurface: true — leaves the config surface uncommitted, not stashed', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ hasUncommittedConfigChanges: () => true });
+      await runRestartSelf(baseOpts({ confirm: true, leaveConfigUncommitted: true }), deps);
+      expect(rec.stashedExcludeConfigSurface).toBe(true);
+    });
+
+    it('is distinct from --force: force STASHES the config surface (excludeConfigSurface undefined/false)', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ hasUncommittedConfigChanges: () => true });
+      await runRestartSelf(baseOpts({ confirm: true, force: true, leaveConfigUncommitted: false }), deps);
+      expect(rec.order).toEqual(['stash', 'backup', 'write', 'write', 'spawn', 'kill']);
+      expect(rec.stashedExcludeConfigSurface).toBeUndefined();
+    });
+
+    it('MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED=1 has the same effect as the option', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ hasUncommittedConfigChanges: () => true });
+      const prior = process.env['MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED'];
+      process.env['MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED'] = '1';
+      try {
+        const code = await runRestartSelf(baseOpts({ confirm: true }), deps);
+        expect(code).toBe(0);
+        expect(rec.stashedExcludeConfigSurface).toBe(true);
+      } finally {
+        if (prior === undefined) delete process.env['MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED'];
+        else process.env['MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED'] = prior;
+      }
+    });
+
+    it('when the config surface is CLEAN, leaveConfigUncommitted is a no-op on the stash call (still excludes, harmlessly)', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ hasUncommittedConfigChanges: () => false });
+      const code = await runRestartSelf(baseOpts({ confirm: true, leaveConfigUncommitted: true }), deps);
+      expect(code).toBe(0);
+      expect(rec.order).toEqual(['stash', 'backup', 'write', 'write', 'spawn', 'kill']);
+      expect(rec.stashedExcludeConfigSurface).toBe(true);
     });
   });
 

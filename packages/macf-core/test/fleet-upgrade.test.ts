@@ -15,6 +15,7 @@ import {
   type FleetState,
   type WorkspaceRecord,
   type HealthResponse,
+  type UpgradeEvent,
   type VerifyGreenOptions,
   type VerifyGreenResult,
 } from '../src/index.js';
@@ -61,28 +62,39 @@ interface DriverCalls {
   probe: number;
   discover: number;
   isBusy: string[];
-  isConfigDirty: string[];
+  listDirtyConfig: string[];
   upgrade: string[];
   restart: string[];
-  restartForce: string[];
+  restartLeaveUncommitted: string[];
+  listModifiedFiles: string[];
 }
 
-/** A recording fake driver. `busy(agent, callIdx)` decides isBusy per call. */
+/**
+ * A recording fake driver. `busy(agent, callIdx)` decides isBusy per call.
+ * `dirtyConfigFiles(agent)` returns the pre-flight `listDirtyConfig` result
+ * (empty = clean) — a STATIC predicate; use `makeTransactionalDriver` below
+ * when a test needs `upgrade()` to actually COUPLE into post-upgrade state
+ * (macf#725 — this static fake can't surface the #722/#725 mid-transaction
+ * bug class, since its dirty-check never reacts to `upgrade` having run).
+ */
 function makeDriver(opts: {
   state: FleetState;
   workspaces: readonly WorkspaceRecord[];
   busy?: (agent: string, callIdx: number) => boolean;
-  /** Agents whose config surface is dirty (macf#722 Fix B); defaults to none. */
-  configDirty?: (agent: string) => boolean;
+  /** Agents whose config surface is dirty pre-flight (macf#722/#725); defaults to none. */
+  dirtyConfigFiles?: (agent: string) => readonly string[];
+  /** Modified-files list `listModifiedFiles` reports post-upgrade; defaults to none. */
+  modifiedFiles?: (agent: string) => readonly string[];
 }): { driver: FleetDriver; calls: DriverCalls } {
   const calls: DriverCalls = {
     probe: 0,
     discover: 0,
     isBusy: [],
-    isConfigDirty: [],
+    listDirtyConfig: [],
     upgrade: [],
     restart: [],
-    restartForce: [],
+    restartLeaveUncommitted: [],
+    listModifiedFiles: [],
   };
   const perAgent = new Map<string, number>();
   const driver: FleetDriver = {
@@ -100,9 +112,10 @@ function makeDriver(opts: {
       calls.isBusy.push(agent);
       return opts.busy ? opts.busy(agent, idx) : false;
     },
-    isConfigDirty: async (agent) => {
-      calls.isConfigDirty.push(agent);
-      return opts.configDirty ? opts.configDirty(agent) : false;
+    isConfigDirty: async (agent) => (opts.dirtyConfigFiles?.(agent)?.length ?? 0) > 0,
+    listDirtyConfig: async (agent) => {
+      calls.listDirtyConfig.push(agent);
+      return opts.dirtyConfigFiles ? opts.dirtyConfigFiles(agent) : [];
     },
     capturePane: async () => null,
     upgrade: async (agent) => {
@@ -110,10 +123,97 @@ function makeDriver(opts: {
     },
     restart: async (agent, restartOpts) => {
       calls.restart.push(agent);
-      if (restartOpts?.forceStashConfig) calls.restartForce.push(agent);
+      if (restartOpts?.leaveConfigUncommitted) calls.restartLeaveUncommitted.push(agent);
     },
     inject: async () => {},
     launch: async () => {},
+    listModifiedFiles: async (agent) => {
+      calls.listModifiedFiles.push(agent);
+      return opts.modifiedFiles ? opts.modifiedFiles(agent) : [];
+    },
+  };
+  return { driver, calls };
+}
+
+/**
+ * A REAL coupled fake (macf#725) — `upgrade()` actually DIRTIES the
+ * workspace's config surface, and `restart()` THROWS unless told
+ * `leaveConfigUncommitted: true`. This is what proves the transactional fix:
+ * a static `dirtyConfigFiles` predicate (as in `makeDriver`) can report
+ * "clean" pre-flight and never react to `upgrade` having run, which is
+ * EXACTLY the shape that let the macf#722 bug (upgrade dirties → restart
+ * refuses, aborting mid-transaction) hide from the original test suite.
+ */
+function makeTransactionalDriver(opts: {
+  state: FleetState;
+  workspaces: readonly WorkspaceRecord[];
+  /** Agents whose config surface is dirty BEFORE any roll touches them. */
+  preDirty?: ReadonlySet<string>;
+  /** Files `upgrade()` regenerates (becomes the post-upgrade dirty/modified set). */
+  regeneratedFiles?: readonly string[];
+}): { driver: FleetDriver; calls: DriverCalls } {
+  const calls: DriverCalls = {
+    probe: 0,
+    discover: 0,
+    isBusy: [],
+    listDirtyConfig: [],
+    upgrade: [],
+    restart: [],
+    restartLeaveUncommitted: [],
+    listModifiedFiles: [],
+  };
+  const regenerated = opts.regeneratedFiles ?? ['.claude/rules/coordination.md'];
+  // COUPLED STATE: which agents currently have dirty config — starts as
+  // `preDirty`, and `upgrade()` ADDS the agent (real `macf update` always
+  // dirties the managed surface). `restart()` reads this SAME state to decide
+  // whether it would need to refuse/stash — proving the two verbs are talking
+  // to the same underlying workspace, not independent static predicates.
+  const dirty = new Set(opts.preDirty ?? []);
+  const driver: FleetDriver = {
+    probe: async () => {
+      calls.probe += 1;
+      return opts.state;
+    },
+    discoverWorkspaces: () => {
+      calls.discover += 1;
+      return opts.workspaces;
+    },
+    isBusy: async (agent) => {
+      calls.isBusy.push(agent);
+      return false;
+    },
+    isConfigDirty: async (agent) => dirty.has(agent),
+    listDirtyConfig: async (agent) => {
+      calls.listDirtyConfig.push(agent);
+      return dirty.has(agent) ? regenerated : [];
+    },
+    capturePane: async () => null,
+    upgrade: async (agent) => {
+      calls.upgrade.push(agent);
+      // REAL `macf update` semantics: upgrading ALWAYS dirties the managed
+      // config surface (it just regenerated `.claude/**` etc).
+      dirty.add(agent);
+    },
+    restart: async (agent, restartOpts) => {
+      calls.restart.push(agent);
+      if (restartOpts?.leaveConfigUncommitted) {
+        calls.restartLeaveUncommitted.push(agent);
+        // Leaves the config surface uncommitted — dirty state persists (this
+        // IS the intended post-roll state the relaunched agent should see).
+        return;
+      }
+      // STANDALONE semantics (macf#722 Fix B): refuses outright when the
+      // config surface is dirty and it was NOT told to leave it uncommitted.
+      if (dirty.has(agent)) {
+        throw new Error(`restart-self would refuse: uncommitted config surface for ${agent}`);
+      }
+    },
+    inject: async () => {},
+    launch: async () => {},
+    listModifiedFiles: async (agent) => {
+      calls.listModifiedFiles.push(agent);
+      return dirty.has(agent) ? regenerated : [];
+    },
   };
   return { driver, calls };
 }
@@ -210,7 +310,7 @@ describe('rollFleet', () => {
     '0.2.41',
   );
 
-  it('rolls behind agents in order: upgrade → restart → verify-green, all green', async () => {
+  it('rolls behind agents in order: upgrade → restart(leaveConfigUncommitted) → verify-green, all green', async () => {
     const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
     const { verifyGreen, seen } = makeVerify();
     const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
@@ -220,26 +320,32 @@ describe('rollFleet', () => {
     });
     expect(calls.upgrade).toEqual(['a1', 'a2']);
     expect(calls.restart).toEqual(['a1', 'a2']);
+    // EVERY roll-transaction restart leaves the config surface uncommitted —
+    // this is unconditional (not gated on --force), unlike the pre-flight gate.
+    expect(calls.restartLeaveUncommitted).toEqual(['a1', 'a2']);
     expect(seen).toEqual(['a1', 'a2']);
     expect(res.halted).toBe(false);
     expect(res.upgraded).toBe(2);
     expect(res.results.map((r) => r.outcome)).toEqual(['upgraded', 'upgraded']);
   });
 
-  it('config-dirty PRE-FLIGHT gate: skips + reports BEFORE any mutation, and continues (macf#722 Fix B)', async () => {
+  it('config-dirty PRE-FLIGHT gate: OBJECTS with the file list + message BEFORE any mutation, and continues (macf#725)', async () => {
+    const dirtyFiles = ['.claude/rules/coordination.md', 'CLAUDE.md'];
     const { driver, calls } = makeDriver({
       state: mkState([]),
       workspaces: [],
-      configDirty: (agent) => agent === 'a1',
+      dirtyConfigFiles: (agent) => (agent === 'a1' ? dirtyFiles : []),
     });
     const { verifyGreen } = makeVerify();
+    const events: UpgradeEvent[] = [];
     const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
       driver,
       verifyGreen,
       ...noWait,
+      onEvent: (ev) => events.push(ev),
     });
     // a1 never touched — no upgrade/restart/isBusy call at all for a1.
-    expect(calls.isConfigDirty).toEqual(['a1', 'a2']);
+    expect(calls.listDirtyConfig).toEqual(['a1', 'a2']);
     expect(calls.upgrade).toEqual(['a2']);
     expect(calls.restart).toEqual(['a2']);
     expect(calls.isBusy).toEqual(['a2']); // a1's busy-gate never even runs
@@ -250,14 +356,21 @@ describe('rollFleet', () => {
       ['a1', 'config-dirty-skipped'],
       ['a2', 'upgraded'],
     ]);
-    expect(res.results[0]!.detail).toContain('--force');
+    // The result's `detail` carries the full agent-directed message.
+    expect(res.results[0]!.detail).toContain('a1');
+    expect(res.results[0]!.detail).toContain(dirtyFiles[0]!);
+    expect(res.results[0]!.detail).toContain('commit');
+    // The onEvent carries the exact file list + message separately (macf#725).
+    const skipEvent = events.find((e) => e.kind === 'config-dirty-skip');
+    expect(skipEvent).toMatchObject({ kind: 'config-dirty-skip', agent: 'a1', files: dirtyFiles });
+    expect(skipEvent && 'message' in skipEvent ? skipEvent.message : '').toContain('a1');
   });
 
-  it('--force bypasses the config-dirty gate AND threads forceStashConfig into restart', async () => {
+  it('--force bypasses the config-dirty OBJECT gate AND leaves the (pre-existing dirty) config surface uncommitted, not stashed', async () => {
     const { driver, calls } = makeDriver({
       state: mkState([]),
       workspaces: [],
-      configDirty: () => true,
+      dirtyConfigFiles: () => ['CLAUDE.md'],
     });
     const { verifyGreen } = makeVerify();
     const res = await rollFleet(
@@ -268,8 +381,8 @@ describe('rollFleet', () => {
     expect(res.configDirtySkipped).toBe(0);
     expect(calls.upgrade).toEqual(['a1', 'a2']);
     expect(calls.restart).toEqual(['a1', 'a2']);
-    // both agents' restart was told to force-stash the (dirty) config surface.
-    expect(calls.restartForce).toEqual(['a1', 'a2']);
+    // both agents' restart was told to leave the (dirty) config surface uncommitted.
+    expect(calls.restartLeaveUncommitted).toEqual(['a1', 'a2']);
     expect(res.halted).toBe(false);
   });
 
@@ -406,6 +519,88 @@ describe('rollFleet', () => {
     expect(calls.upgrade).toEqual(['a1', 'a2']);
     expect(seen).toEqual(['a1', 'a2']);
     expect(res.results.map((r) => r.outcome)).toEqual(['upgraded', 'upgraded']);
+  });
+
+  it('post-upgrade: reports the modified-files list + message once green (macf#725)', async () => {
+    const modified = ['.claude/rules/coordination.md', '.claude/.macf/env.identity'];
+    const { driver } = makeDriver({
+      state: mkState([]),
+      workspaces: [],
+      modifiedFiles: (agent) => (agent === 'a1' ? modified : []),
+    });
+    const { verifyGreen } = makeVerify();
+    const events: UpgradeEvent[] = [];
+    const res = await rollFleet([twoBehind[0]!], { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+      onEvent: (ev) => events.push(ev),
+    });
+    expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'upgraded' });
+    expect(res.results[0]!.detail).toContain('a1');
+    expect(res.results[0]!.detail).toContain(modified[0]!);
+    // The steady-state clause (macf#725): the message must direct the agent to
+    // COMMIT the regen (not just review it), so the next roll's pre-flight
+    // doesn't re-flag it as uncommitted.
+    expect(res.results[0]!.detail).toContain('commit them');
+    expect(res.results[0]!.detail).toContain("next upgrade's pre-flight");
+    const upgradedEvent = events.find((e) => e.kind === 'upgraded');
+    expect(upgradedEvent).toMatchObject({ kind: 'upgraded', agent: 'a1', version: '0.2.41', modifiedFiles: modified });
+    expect(upgradedEvent && 'message' in upgradedEvent ? upgradedEvent.message : '').toContain('a1');
+    expect(upgradedEvent && 'message' in upgradedEvent ? upgradedEvent.message : '').toContain('commit them');
+  });
+
+  describe('transactional coupling (macf#725 — REAL coupled fake, not a static predicate)', () => {
+    it('clean pre-flight: upgrade dirties the workspace, restart is told to leave it uncommitted (NOT stash, NOT refuse)', async () => {
+      const { driver, calls } = makeTransactionalDriver({ state: mkState([]), workspaces: [] });
+      const { verifyGreen } = makeVerify();
+      const res = await rollFleet([twoBehind[0]!], { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      // Pre-flight saw CLEAN (preDirty is empty) — entered the transaction.
+      expect(calls.listDirtyConfig).toEqual(['a1']);
+      expect(calls.upgrade).toEqual(['a1']); // this is what DIRTIES the workspace
+      // restart() was called with leaveConfigUncommitted — did NOT throw despite
+      // the workspace now being dirty (proving the fake's restart() actually
+      // reacts to upgrade()'s side effect, not a static "always ok" stub).
+      expect(calls.restart).toEqual(['a1']);
+      expect(calls.restartLeaveUncommitted).toEqual(['a1']);
+      expect(res.halted).toBe(false);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'upgraded' });
+    });
+
+    it('a pre-flight-dirty agent is OBJECTED on and NEVER reaches upgrade/restart at all', async () => {
+      const { driver, calls } = makeTransactionalDriver({
+        state: mkState([]),
+        workspaces: [],
+        preDirty: new Set(['a1']),
+      });
+      const { verifyGreen } = makeVerify();
+      const res = await rollFleet([twoBehind[0]!], { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(calls.listDirtyConfig).toEqual(['a1']);
+      expect(calls.upgrade).toEqual([]); // NOTHING mutated
+      expect(calls.restart).toEqual([]);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'config-dirty-skipped' });
+      expect(res.configDirtySkipped).toBe(1);
+    });
+
+    it('reproduces + proves the macf#722 bug is CLOSED: without leaveConfigUncommitted, restart would have refused mid-transaction', async () => {
+      // Sanity-check the fake's own coupling: if rollFleet had (incorrectly,
+      // pre-macf#725) called restart WITHOUT leaveConfigUncommitted after an
+      // upgrade, the transactional fake throws — this is the exact mid-transaction
+      // abort shape macf#722/#725 fixed. Exercise the fake directly to pin it.
+      const { driver } = makeTransactionalDriver({ state: mkState([]), workspaces: [] });
+      await driver.upgrade('a1'); // dirties the workspace, as real `macf update` does
+      await expect(driver.restart('a1')).rejects.toThrow(/would refuse/);
+      // But WITH leaveConfigUncommitted (what rollFleet actually does), it's fine:
+      await expect(driver.restart('a1', { leaveConfigUncommitted: true })).resolves.toBeUndefined();
+    });
   });
 
   it('ignores non-behind plans (at-target / offline) — no driver mutations', async () => {

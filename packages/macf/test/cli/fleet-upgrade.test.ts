@@ -78,6 +78,7 @@ function makeDriver(
     discoverWorkspaces: () => workspaces,
     isBusy: async () => false,
     isConfigDirty: async () => false,
+    listDirtyConfig: async () => [],
     capturePane: async () => null,
     upgrade: async (a) => { calls.upgrade.push(a); },
     restart: async (a) => {
@@ -86,6 +87,7 @@ function makeDriver(
     },
     inject: async () => {},
     launch: async () => {},
+    listModifiedFiles: async () => [],
   };
   return { driver, calls, workspaces };
 }
@@ -228,6 +230,7 @@ describe('runFleetUpgrade', () => {
       discoverWorkspaces: () => [mkWs('a', 'fleet-1', '0.2.40')],
       isBusy: async () => false,
       isConfigDirty: async () => false,
+      listDirtyConfig: async () => [],
       capturePane: async () => null,
       upgrade: async () => {},
       restart: async () => {
@@ -235,6 +238,7 @@ describe('runFleetUpgrade', () => {
       },
       inject: async () => {},
       launch: async () => {},
+      listModifiedFiles: async () => [],
     };
     const { deps } = makeDeps({
       discover: () => [mkWs('a', 'fleet-1', '0.2.40')],
@@ -315,11 +319,13 @@ describe('runFleetUpgrade', () => {
         discoverWorkspaces: () => members, // full host scan — filtering is the CALLER's job (macf-core's upgradeFleets)
         isBusy: async () => false,
         isConfigDirty: async () => false,
+        listDirtyConfig: async () => [],
         capturePane: async () => null,
         upgrade: async (a) => { calls.upgrade.push(a); },
         restart: async (a) => { calls.restart.push(a); restarted.add(a); },
         inject: async () => {},
         launch: async () => {},
+        listModifiedFiles: async () => [],
       };
       return { driver, calls };
     }
