@@ -370,4 +370,58 @@ describe('macf init', () => {
       expect(existsSync(join(dir, 'claude.sh'))).toBe(false);
     });
   });
+
+  describe('github_app.bot_login resolution (macf#535 / macf#707)', () => {
+    // These use the same fake App credentials as the rest of the suite
+    // (appId '12345' has no real GitHub App behind it), so the App-slug
+    // JWT-mint genuinely fails — exercising the real best-effort/non-fatal
+    // code path rather than a mocked one.
+
+    it('does not abort init when App-slug resolution fails (best-effort, non-fatal)', async () => {
+      await expect(initAgent(dir, {
+        project: 'TEST',
+        role: 'code-agent',
+        appId: '12345',
+        installId: '67890',
+        keyPath: 'app.key.pem',
+        registryType: 'repo',
+        registryRepo: 'owner/repo',
+      })).resolves.not.toThrow();
+
+      // Init still completed and wrote a usable config, even though
+      // bot_login resolution against a fake App could not succeed.
+      const config = readAgentConfig(dir);
+      expect(config).not.toBeNull();
+      expect(config!.github_app.app_id).toBe('12345');
+    });
+
+    it('leaves bot_login unset when App-slug resolution fails, never derives it from agent_name (AC #3)', async () => {
+      await initAgent(dir, {
+        project: 'TEST',
+        role: 'code-agent',
+        name: 'totally-different-name',
+        appId: '12345',
+        installId: '67890',
+        keyPath: 'app.key.pem',
+        registryType: 'repo',
+        registryRepo: 'owner/repo',
+      });
+      const config = readAgentConfig(dir);
+      // bot_login stays unset (undefined) — NOT silently derived from
+      // agent_name as a fallback guess. That fallback belongs to the
+      // shipped check-gh-attribution.sh hook (non-authoritative), not init.
+      expect(config!.github_app.bot_login).toBeUndefined();
+      expect(config!.agent_name).toBe('totally-different-name');
+    });
+
+    it('does not write bot_login at all in local-registry mode (no App to resolve)', async () => {
+      await initAgent(dir, {
+        project: 'TEST',
+        role: 'code-agent',
+        registryType: 'local',
+      });
+      const config = readAgentConfig(dir);
+      expect(config!.github_app).toBeUndefined();
+    });
+  });
 });

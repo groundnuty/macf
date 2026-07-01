@@ -17,7 +17,8 @@
 import { execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { resolve } from 'node:path';
-import { readAgentConfig, tokenSourceFromConfig } from '../config.js';
+import { readAgentConfig, tokenSourceFromConfig, writeAgentConfig } from '../config.js';
+import type { MacfAgentConfig } from '../config.js';
 import { defaultProcReader, scanMacfProcesses } from '../proc-scan.js';
 import type { ProcReader } from '../proc-scan.js';
 import {
@@ -400,6 +401,167 @@ export async function fetchInstallationPermissions(
     throw new Error('/app/installations/:id response missing `permissions` field');
   }
   return parsed.permissions as Record<string, string>;
+}
+
+/**
+ * Derive the App's bot-LOGIN from its slug: `<slug>[bot]` (DR-028 / macf#535).
+ * Idempotent — tolerates a slug that already carries the `[bot]` suffix (some
+ * API responses / operator-pasted values do), matching the same tolerance the
+ * shipped `check-gh-attribution.sh` hook applies when reading this field back
+ * (`${BOT_LOGIN%"[bot]"}[bot]`).
+ */
+export function deriveBotLogin(slug: string): string {
+  if (!slug || slug.trim() === '') {
+    throw new Error('deriveBotLogin: slug must not be empty');
+  }
+  const bare = slug.endsWith('[bot]') ? slug.slice(0, -'[bot]'.length) : slug;
+  return `${bare}[bot]`;
+}
+
+/**
+ * Format a non-leaking error message when `GET /app` returns a body that
+ * doesn't look like the expected `{ slug: string, ... }` shape. Mirrors
+ * `describeNonJwtOutput` — shows only a short prefix + length, never the
+ * full unexpected body (which could carry a JWT-adjacent secret echoed back
+ * by a misbehaving proxy, or just be noisy).
+ */
+export function describeNonAppSlugOutput(body: string): string {
+  const safePrefix = body.length > 0 ? body.slice(0, 6) : '(empty)';
+  return (
+    `GET /app response did not contain a usable \`slug\` field ` +
+    `(prefix='${safePrefix}', length=${body.length})`
+  );
+}
+
+/**
+ * Resolve the GitHub App's slug via `GET /app` (Get the authenticated app),
+ * authenticated with an App JWT — the same JWT-mint step
+ * `fetchInstallationPermissions` already performs, reused here rather than
+ * re-implementing RS256 signing. `GET /app` needs only the JWT (no
+ * installation-scoped permission), so this resolves even for an App whose
+ * installation permissions are still being provisioned.
+ *
+ * The response's `slug` IS the App's bot-login stem — GitHub mints the bot
+ * user as `<slug>[bot]` for every App installation; see DR-028 / macf#535.
+ */
+export async function fetchAppSlug(appId: string, keyPath: string): Promise<string> {
+  let jwt: string;
+  try {
+    jwt = execFileSync('gh', [
+      'token', 'generate',
+      '--app-id', appId,
+      '--key', keyPath,
+      '--jwt',
+      '--token-only',
+    ], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `gh token generate --jwt failed: ${msg}. ` +
+      `See coordination.md Token & Git Hygiene for diagnostics.`,
+      { cause: err },
+    );
+  }
+  if (!jwt.startsWith('eyJ')) {
+    throw new Error(describeNonJwtOutput(jwt));
+  }
+
+  const response = await fetch('https://api.github.com/app', {
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => '<no body>');
+    throw new Error(`GET /app returned ${response.status}: ${body.slice(0, 200)}`);
+  }
+  const bodyText = await response.text();
+  let parsed: { slug?: unknown };
+  try {
+    parsed = JSON.parse(bodyText) as { slug?: unknown };
+  } catch {
+    throw new Error(describeNonAppSlugOutput(bodyText));
+  }
+  if (typeof parsed.slug !== 'string' || parsed.slug.trim() === '') {
+    throw new Error(describeNonAppSlugOutput(bodyText));
+  }
+  return parsed.slug;
+}
+
+/**
+ * Result of the `github_app.bot_login` presence check (DR-028 / macf#535 /
+ * macf#707). `bot_login` is the AUTHORITATIVE identity the shipped
+ * `check-gh-attribution.sh` PostToolUse hook compares against; when it's
+ * null the hook silently falls back to a non-authoritative `agent_name`
+ * guess (tolerated per macf#535, since `agent_name` isn't always the App
+ * slug) — meaning the attribution guard is effectively inert. See
+ * `packages/macf/scripts/check-gh-attribution.sh` lines ~151-170.
+ *
+ *   - `PASS` — `bot_login` is populated (non-empty string).
+ *   - `WARN` — `github_app` is present but `bot_login` is missing/empty.
+ *     Repairable via `macf doctor --fix` or re-running `macf init`.
+ *   - `INFO` — no `github_app` block at all (local-registry / DR-024 mode).
+ *     Nothing to populate; not a gap.
+ */
+export interface BotLoginCheckResult {
+  readonly status: 'PASS' | 'WARN' | 'INFO';
+  readonly detail: string;
+}
+
+/**
+ * Pure detection: does `config.github_app.bot_login` hold a usable value?
+ * Independent of `agent_name` by construction — this function never reads
+ * or derives from `agent_name` (AC #3: populating `bot_login` must not
+ * ripple into the OTEL `gen_ai.agent.name` / cert-CN identity surface).
+ */
+export function checkBotLogin(config: MacfAgentConfig): BotLoginCheckResult {
+  if (!config.github_app) {
+    return {
+      status: 'INFO',
+      detail: 'local-registry mode (DR-024) — no GitHub App; bot_login check skipped',
+    };
+  }
+  const botLogin = config.github_app.bot_login;
+  if (botLogin && botLogin.trim() !== '') {
+    return { status: 'PASS', detail: `github_app.bot_login = ${botLogin}` };
+  }
+  return {
+    status: 'WARN',
+    detail:
+      'github_app.bot_login is unset — attribution hook inert (check-gh-attribution.sh falls ' +
+      'back to a non-authoritative agent_name guess, per macf#535). Repair via `macf doctor --fix` ' +
+      'or by re-running `macf init`.',
+  };
+}
+
+/**
+ * Repair: resolve the App slug via `fetchAppSlug` and write
+ * `github_app.bot_login` back to `macf-agent.json`, leaving every other
+ * field (notably `agent_name`) untouched. Returns the resolved login on
+ * success. Throws on any network/gh failure — callers decide how to
+ * surface that (doctor's `--fix` path logs + continues; init's best-effort
+ * call catches + warns, per the plugin-fetch precedent in `init.ts`).
+ */
+export async function repairBotLogin(
+  projectDir: string,
+  config: MacfAgentConfig,
+): Promise<string> {
+  if (!config.github_app) {
+    throw new Error('repairBotLogin called on a config without a `github_app` block (local mode)');
+  }
+  const source = tokenSourceFromConfig(projectDir, config);
+  const slug = await fetchAppSlug(source.appId, source.keyPath);
+  const botLogin = deriveBotLogin(slug);
+  writeAgentConfig(projectDir, {
+    ...config,
+    github_app: { ...config.github_app, bot_login: botLogin },
+  });
+  return botLogin;
 }
 
 /**
@@ -791,6 +953,12 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('──────────────────────────────────────────────────────────────');
   printOtelLaunchSection(checkOtelLaunchBoundary(projectDir));
 
+  console.log('');
+  console.log('Attribution identity (DR-028 / macf#535 / macf#707)');
+  console.log('──────────────────────────────────────────────────────────────');
+  let botLoginCheck = checkBotLogin(config);
+  printBotLoginSection(botLoginCheck);
+
   // --fix: the existing install emitters ARE the fix (DR-028) — they write the
   // floor merge-preservingly. Detect drift read-only above, then (on consent)
   // call them + re-run the checks. NEVER write without consent.
@@ -798,7 +966,8 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     const needsFix =
       (roleCheck !== null && roleCheck.status !== 'PASS') ||
       sandboxCheck.status === 'FAIL' ||
-      permsCheck.status === 'WARN';
+      permsCheck.status === 'WARN' ||
+      botLoginCheck.status === 'WARN';
     if (!needsFix) {
       console.log('');
       console.log('--fix: nothing to fix — settings already satisfy the floor.');
@@ -808,6 +977,9 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
       console.log('  - permissions.allow/deny floor (installPluginSkillPermissions)');
       console.log('  - PreToolUse/PostToolUse/UserPromptSubmit/PreCompact/SessionStart hooks (installGhTokenHook)');
       console.log('  - sandbox.filesystem.allowRead + sandbox.excludedCommands');
+      if (botLoginCheck.status === 'WARN') {
+        console.log('  - github_app.bot_login in macf-agent.json (resolves the App slug via GET /app)');
+      }
       console.log('  Existing operator-authored entries are preserved (merge, dedup).');
       const consent = opts.yes ? true : await promptYesNo('Proceed?');
       if (!consent) {
@@ -817,14 +989,27 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
         installGhTokenHook(projectDir);
         installSandboxFdAllowRead(projectDir);
         installSandboxExcludedCommands(projectDir);
+        if (botLoginCheck.status === 'WARN') {
+          try {
+            const botLogin = await repairBotLogin(projectDir, config);
+            console.log(`  Attribution: resolved + wrote github_app.bot_login = ${botLogin}`);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn(`  Warning: bot_login repair failed: ${msg}`);
+            console.warn('    App-slug resolution needs a valid App JWT (gh token generate --jwt) and network');
+            console.warn('    access to api.github.com — check the App ID / key path if this persists.');
+          }
+        }
         sandboxCheck = checkSandboxFdAllowRead(projectDir);
         permsCheck = checkPermissionsAllow(projectDir);
         roleCheck = role ? checkRoleSettings(projectDir, role) : null;
+        botLoginCheck = checkBotLogin(readAgentConfig(projectDir) ?? config);
         console.log('');
         console.log('--fix applied. Re-check:');
         printSandboxSection(sandboxCheck);
         printPermissionsAllowSection(permsCheck);
         printRoleSettingsSection(role, roleCheck);
+        printBotLoginSection(botLoginCheck);
       }
     }
   }
@@ -840,6 +1025,18 @@ function printOtelLaunchSection(check: OtelLaunchCheck): void {
     console.log(`  ✓ ${check.detail}  [PASS]`);
   } else if (check.status === 'WARN') {
     console.log(`  ⚠ ${check.detail}  [WARN]`);
+  } else {
+    console.log(`  ℹ ${check.detail}  [INFO]`);
+  }
+}
+
+/** Print the DR-028 / macf#535 / macf#707 bot-login report line for `check`. */
+function printBotLoginSection(check: BotLoginCheckResult): void {
+  if (check.status === 'PASS') {
+    console.log(`  ✓ ${check.detail}  [PASS]`);
+  } else if (check.status === 'WARN') {
+    console.log(`  ⚠ ${check.detail}  [WARN]`);
+    console.log('    Fix: run `macf doctor --fix` (resolves the App slug via GET /app) or re-run `macf init`.');
   } else {
     console.log(`  ℹ ${check.detail}  [INFO]`);
   }
