@@ -7,21 +7,36 @@
  * logic lives in macf-core; the per-runtime driver bodies live in `packages/macf`
  * or a future K8s package). It NEVER touches `/proc`, tmux, `capture-pane`, or
  * kubectl — it drives entirely off the injected `FleetDriver` verbs
- * (`probe`/`discoverWorkspaces`/`isBusy`/`upgrade`/`restart`) plus an injected
- * `verifyGreen` runner, so the SAME sequencer rolls a VM tmux fleet, a macOS
- * host, and a far-future K8s deployment by swapping only the driver.
+ * (`probe`/`discoverWorkspaces`/`isBusy`/`isConfigDirty`/`upgrade`/`restart`)
+ * plus an injected `verifyGreen` runner, so the SAME sequencer rolls a VM tmux
+ * fleet, a macOS host, and a far-future K8s deployment by swapping only the driver.
  *
  * The state machine (per fleet, one agent at a time):
  *
  *   probe() + discoverWorkspaces()
  *     → for each member whose RUNNING version < target (compareSemver):
- *         busy-gate (driver.isBusy → busy ⇒ SKIP+REPORT, or `--wait` for idle)
- *           → driver.upgrade(agent)
- *           → driver.restart(agent)
- *           → verifyGreen({agent, target})   // re-resolves the fresh endpoint
- *               → green ⇒ next agent
- *               → NOT green within the budget ⇒ HALT the roll (a bad release
- *                 stalls at agent 1 and CANNOT brick the fleet)
+ *         PRE-FLIGHT gates (BEFORE any mutation — a gated agent is never
+ *         upgraded/restarted, so skipping here is always safe to CONTINUE):
+ *           config-dirty-gate (driver.isConfigDirty → dirty ⇒ SKIP+REPORT
+ *             unless `--force`; macf#722 Fix B — never clobber/stash operator
+ *             config underneath a rolling `macf update` + restart-self)
+ *           busy-gate (driver.isBusy → busy ⇒ SKIP+REPORT, or `--wait` for idle)
+ *         → driver.upgrade(agent)
+ *         → driver.restart(agent)
+ *         → verifyGreen({agent, target})   // re-resolves the fresh endpoint
+ *             each poll, over a relaunch-aware grace budget (`--verify-timeout`)
+ *             → green on TARGET ⇒ next agent (`upgraded`)
+ *             → confirmed back on the OLD (pre-upgrade) version ⇒ HALT the
+ *               roll, reason `bad-release` (a crash-loop / stuck-old-process
+ *               release stalls at agent 1 and CANNOT brick the fleet)
+ *             → past-grace still NOT confirmed green (down / unreachable /
+ *               some other unknown version) ⇒ HALT the roll, reason
+ *               `relaunch-unconfirmed` — this is NOT a continue: "not yet
+ *               green" cannot distinguish a slow-but-fine relaunch from a
+ *               release that crashes on startup (which never shows the old
+ *               version either), so continuing past an unconfirmed agent
+ *               would risk cascading a crash-on-start release across the
+ *               fleet (macf#722 Fix A)
  *
  * Multi-fleet (`--fleet a,b,c`) rolls fleet-by-fleet: each fleet's roll must
  * finish without a HALT before the next fleet starts (a bad release in fleet-1
@@ -66,19 +81,71 @@ export interface AgentUpgradePlan {
 
 /**
  * The EXECUTE-path outcome of a single agent in the roll:
- * - `upgraded`     — rolled + came up green on the target.
- * - `busy-skipped` — busy-gated (or `--wait` timed out still busy); NOT a
- *                    failure, so the roll CONTINUES to the next agent.
- * - `halted`       — did not verify-green within the budget; the roll STOPS here.
+ * - `upgraded`              — rolled + confirmed green on the target. CONTINUES.
+ * - `busy-skipped`          — busy-gated (or `--wait` timed out still busy),
+ *                             BEFORE any mutation; NOT a failure, CONTINUES.
+ * - `config-dirty-skipped`  — config-dirty-gated (uncommitted changes on the
+ *                             DR-029 operator-preserved surface), BEFORE any
+ *                             mutation; NOT a failure, CONTINUES (macf#722 Fix B).
+ * - `halted`                — verify-green did NOT confirm the target version;
+ *                             the roll STOPS here. `reason` distinguishes WHY
+ *                             (see `HaltReason`).
+ *
+ * The two pre-flight skip outcomes (`busy-skipped` / `config-dirty-skipped`)
+ * are safe to continue past because the agent was NEVER mutated. `halted` is
+ * always terminal because the agent WAS rolled and its post-restart state is
+ * either confirmed-bad or unconfirmed — neither is safe to leave behind while
+ * moving on to the next agent (macf#722 Fix A).
  */
-export type RollOutcome = 'upgraded' | 'busy-skipped' | 'halted';
+export type RollOutcome = 'upgraded' | 'busy-skipped' | 'config-dirty-skipped' | 'halted';
 
-/** The per-agent EXECUTE result. `detail` carries the green version or halt reason. */
+/**
+ * WHY a roll halted (only meaningful when `outcome === 'halted'`):
+ * - `bad-release`           — verify-green confirmed the agent came back up
+ *                             REACHABLE at its OLD (pre-upgrade) version — a
+ *                             crash-loop / stuck-old-process release. Terminal;
+ *                             stops this fleet's roll + later fleets.
+ * - `relaunch-unconfirmed`  — past the full verify-green grace budget, the
+ *                             agent was never confirmed at the target version:
+ *                             down the whole time, unreachable, or reachable at
+ *                             some OTHER (neither old-pin nor target) version.
+ *                             "Not yet green" cannot distinguish a slow-but-fine
+ *                             relaunch from a release that crashes on startup
+ *                             (which never shows the old version either), so
+ *                             this is deliberately NOT a continue.
+ */
+export type HaltReason = 'bad-release' | 'relaunch-unconfirmed';
+
+/** The per-agent EXECUTE result. `detail` carries a human-readable summary. */
 export interface AgentRollResult {
   readonly agent: string;
   readonly outcome: RollOutcome;
+  /** Set only when `outcome === 'halted'` — see `HaltReason`. */
+  readonly reason?: HaltReason;
   readonly detail?: string;
 }
+
+/**
+ * The DR-029 operator-preserved config surface (macf#722 Fix B) — the path
+ * globs `rollFleet`'s pre-flight config-dirty gate checks for uncommitted
+ * tracked changes before touching an agent. Sourced from DR-029's Amendment
+ * (2026-06-27, macf#598) managed-vs-operator taxonomy: `.claude/**` (rules +
+ * scripts + settings), `CLAUDE.md` (workbench doc), `claude.sh` (the launcher —
+ * operator-preserved when hand-authored/header-less, and harmless to include
+ * even when macf-managed since a macf-managed copy is never legitimately
+ * "dirty" outside an in-flight `macf update`), and `env.local.*` (the
+ * operator-custom env extension slot — see
+ * `design/decisions/DR-029-substrate-config-via-init-and-reintegrate.md`
+ * Amendment table). Deliberately excludes macf-managed/regenerated files
+ * (`env.*` canonical seven, `host-prelude.sh`) — those are SUPPOSED to change
+ * under `macf update`; dirtiness there is not an operator-authored conflict.
+ */
+export const OPERATOR_PRESERVED_CONFIG_PATTERNS = [
+  '.claude/**',
+  'CLAUDE.md',
+  'claude.sh',
+  'env.local.*',
+] as const;
 
 /** The result of rolling ONE fleet (the EXECUTE path). */
 export interface FleetRollResult {
@@ -89,6 +156,8 @@ export interface FleetRollResult {
   readonly upgraded: number;
   /** Count of agents skipped because they were busy. */
   readonly busySkipped: number;
+  /** Count of agents skipped because their config surface was dirty (macf#722 Fix B). */
+  readonly configDirtySkipped: number;
 }
 
 /** Progress events for CLI rendering (the RESULT objects are what tests assert on). */
@@ -96,9 +165,10 @@ export type UpgradeEvent =
   | { readonly kind: 'fleet-start'; readonly fleet: string; readonly behind: number; readonly total: number }
   | { readonly kind: 'fleet-skipped'; readonly fleet: string; readonly reason: string }
   | { readonly kind: 'roll-start'; readonly agent: string; readonly from: string | null; readonly to: string }
+  | { readonly kind: 'config-dirty-skip'; readonly agent: string }
   | { readonly kind: 'busy-skip'; readonly agent: string; readonly waited: boolean }
   | { readonly kind: 'upgraded'; readonly agent: string; readonly version: string }
-  | { readonly kind: 'halt'; readonly agent: string; readonly reason: string; readonly lastVersion: string | null };
+  | { readonly kind: 'halt'; readonly agent: string; readonly reason: HaltReason; readonly lastVersion: string | null };
 
 /**
  * Classify each discovered fleet member against the target version. PURE — no
@@ -144,6 +214,13 @@ export interface RollFleetOptions {
   readonly waitTimeoutMs?: number;
   /** Re-poll interval while waiting for idle (ms). */
   readonly waitPollMs?: number;
+  /**
+   * `--force` (macf#722 Fix B): roll an agent EVEN IF its config surface is
+   * dirty — bypasses the pre-flight config-dirty gate. Threaded through to
+   * `restart-self` as the matching stash-override so the two halves of the
+   * override stay in lockstep (see `packages/macf/src/cli/commands/fleet-upgrade.ts`).
+   */
+  readonly force?: boolean;
 }
 
 /** Injected side-effect seams for the roll (all fakeable in tests). */
@@ -187,11 +264,35 @@ async function waitForIdle(agent: string, opts: RollFleetOptions, deps: RollFlee
 }
 
 /**
- * Roll ONE fleet: for every `behind` plan (in order) run the busy-gate → upgrade
- * → restart → verify-green cycle, HALTING the roll on the first agent that fails
- * to come up green. Non-`behind` plans are ignored (planned skips). Busy agents
- * are skipped + reported (never a halt); with `wait`, they are re-polled for idle
- * first. The verb order + HALT semantics mirror `fleet/upgrade.sh`'s `roll_one`.
+ * Classify a failed verify-green against the agent's PRE-upgrade running
+ * version (macf#722 Fix A). `bad-release` requires POSITIVE confirmation that
+ * the agent came back reachable at the OLD pin — everything else (never
+ * reachable, or reachable at some other unrecognized version) is
+ * `relaunch-unconfirmed`. Never infer `bad-release` from absence of success;
+ * only from the last-seen version actually matching the old pin.
+ */
+function classifyHalt(green: VerifyGreenResult & { readonly ok: false }, oldVersion: string | null): HaltReason {
+  if (
+    green.reason === 'wrong-version' &&
+    green.lastVersion !== null &&
+    oldVersion !== null &&
+    compareSemver(green.lastVersion, oldVersion) === 0
+  ) {
+    return 'bad-release';
+  }
+  return 'relaunch-unconfirmed';
+}
+
+/**
+ * Roll ONE fleet: for every `behind` plan (in order) run the PRE-FLIGHT gates
+ * (config-dirty, then busy) → upgrade → restart → verify-green cycle, HALTING
+ * the roll on the first agent whose post-restart state isn't confirmed-green.
+ * Non-`behind` plans are ignored (planned skips). Pre-flight-gated agents are
+ * skipped + reported and NEVER a halt (they were never mutated, so continuing
+ * is always safe) — config-dirty is checked first because a busy-but-clean
+ * agent may still become idle later (`--wait`), whereas a dirty agent is
+ * skip-only regardless. With `wait`, a busy agent is re-polled for idle first.
+ * The verb order + HALT semantics mirror `fleet/upgrade.sh`'s `roll_one`.
  */
 export async function rollFleet(
   plans: readonly AgentUpgradePlan[],
@@ -201,10 +302,22 @@ export async function rollFleet(
   const results: AgentRollResult[] = [];
   let upgraded = 0;
   let busySkipped = 0;
+  let configDirtySkipped = 0;
 
   for (const plan of plans) {
     if (plan.disposition !== 'behind') continue;
     const agent = plan.agent;
+
+    if (!opts.force && (await deps.driver.isConfigDirty(agent))) {
+      configDirtySkipped += 1;
+      results.push({
+        agent,
+        outcome: 'config-dirty-skipped',
+        detail: 'uncommitted config — commit or --force',
+      });
+      deps.onEvent?.({ kind: 'config-dirty-skip', agent });
+      continue;
+    }
 
     let busy = await deps.driver.isBusy(agent);
     let waited = false;
@@ -221,7 +334,10 @@ export async function rollFleet(
 
     deps.onEvent?.({ kind: 'roll-start', agent, from: plan.runningVersion, to: opts.targetVersion });
     await deps.driver.upgrade(agent);
-    await deps.driver.restart(agent);
+    // `force` only ever reaches here for an agent whose OWN config-dirty gate
+    // (above) was bypassed by the override — thread it to restart-self's
+    // matching guard so it doesn't re-block the same explicit override.
+    await deps.driver.restart(agent, opts.force ? { forceStashConfig: true } : undefined);
     const green = await deps.verifyGreen({
       agent,
       targetVersion: opts.targetVersion,
@@ -235,17 +351,18 @@ export async function rollFleet(
       continue;
     }
 
-    const reason = green.reason;
+    const reason = classifyHalt(green, plan.runningVersion);
     results.push({
       agent,
       outcome: 'halted',
-      detail: `verify-green ${reason} (last=${green.lastVersion ?? 'down'})`,
+      reason,
+      detail: `${reason}: verify-green ${green.reason} (last=${green.lastVersion ?? 'down'})`,
     });
     deps.onEvent?.({ kind: 'halt', agent, reason, lastVersion: green.lastVersion });
-    return { results, halted: true, upgraded, busySkipped };
+    return { results, halted: true, upgraded, busySkipped, configDirtySkipped };
   }
 
-  return { results, halted: false, upgraded, busySkipped };
+  return { results, halted: false, upgraded, busySkipped, configDirtySkipped };
 }
 
 /** Options for the multi-fleet orchestrator. */

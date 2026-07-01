@@ -31,7 +31,17 @@ import { createVmDriverFromConfig } from '../fleet/vm-driver.js';
 import { fetchLatestCliVersion } from '../version-resolver.js';
 import { formatTable } from './ps.js';
 
-/** Default per-agent verify-green budget (ms) — mirrors `fleet/upgrade.sh`'s 120s. */
+/**
+ * Default per-agent verify-green budget (ms) — mirrors `fleet/upgrade.sh`'s
+ * 120s. Deliberately a RELAUNCH-AWARE grace, not a tight poll timeout
+ * (macf#722 Fix A): a real `restart-self` relaunch involves the old tmux
+ * session dying (~30s poll in the relauncher), the new process starting, AND
+ * the fresh channel-server port re-registering + propagating through the
+ * registry roster before `verifyGreen`'s re-resolving probe can see it. 120s
+ * comfortably covers that whole sequence with margin, so a genuinely-fine
+ * slow relaunch confirms green WITHIN the budget instead of spuriously
+ * halting. Configurable via `--verify-timeout <sec>`.
+ */
 export const DEFAULT_VERIFY_TIMEOUT_MS = 120_000;
 
 /** Parsed + validated command options. */
@@ -52,6 +62,14 @@ export interface RunFleetUpgradeOptions {
   readonly wait?: boolean;
   /** Per-agent verify-green budget in seconds (default 120). */
   readonly verifyTimeoutSec?: number;
+  /**
+   * `--force` (macf#722 Fix B): roll an agent even if its config surface
+   * (`.claude/**`, `CLAUDE.md`, `claude.sh`, `env.local.*` — DR-029
+   * operator-preserved) is dirty. Also threaded into the `restart-self` stash
+   * step via `MACF_RESTART_STASH_CONFIG=1` on the driver's `restart` exec, so
+   * both halves of the override move together.
+   */
+  readonly force?: boolean;
 }
 
 /** Injectable seams — production resolves them from config; tests supply fakes. */
@@ -165,7 +183,12 @@ export function formatFleetReport(report: FleetPlanReport, target: string, log: 
   const rolled = report.rolled;
   if (!rolled) return;
   for (const r of rolled.results) {
-    const mark = r.outcome === 'upgraded' ? '✓' : r.outcome === 'busy-skipped' ? '•' : '✗';
+    const mark =
+      r.outcome === 'upgraded'
+        ? '✓'
+        : r.outcome === 'busy-skipped' || r.outcome === 'config-dirty-skipped'
+          ? '•'
+          : '✗';
     log(`    ${mark} ${r.agent} — ${r.outcome}${r.detail ? ` (${r.detail})` : ''}`);
   }
   if (rolled.halted) {
@@ -250,8 +273,12 @@ export async function runFleetUpgrade(
     {
       execute,
       targetVersion: target,
-      verifyTimeoutMs: (opts.verifyTimeoutSec ?? 120) * 1000,
+      verifyTimeoutMs:
+        opts.verifyTimeoutSec !== undefined
+          ? opts.verifyTimeoutSec * 1000
+          : DEFAULT_VERIFY_TIMEOUT_MS,
       wait: Boolean(opts.wait),
+      force: Boolean(opts.force),
     },
     {
       resolveDriver,
@@ -273,6 +300,9 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
       break;
     case 'roll-start':
       log(`   rolling ${ev.agent} (${ev.from ?? 'down'}→${ev.to})`);
+      break;
+    case 'config-dirty-skip':
+      log(`   ${ev.agent}: CONFIG-DIRTY — skip + report (commit or --force)`);
       break;
     case 'busy-skip':
       log(`   ${ev.agent}: BUSY — skip + report${ev.waited ? ' (still busy after --wait)' : ''}`);

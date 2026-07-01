@@ -72,12 +72,14 @@ interface SeamOverrides {
   readonly paneReads?: readonly (string | null)[];
   readonly peers?: readonly { readonly name: string; readonly info: AgentInfo }[];
   readonly health?: (host: string, port: number) => Promise<HealthResponse | null>;
+  readonly configDirtyWorkspaces?: ReadonlySet<string>;
 }
 
 function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder } {
   const rec: Recorder = { execs: [], spawns: [], submits: [], sleeps: [], captured: [] };
   const paneQueue = [...(o.paneReads ?? [])];
   const live = o.liveSessions ?? new Set<string>();
+  const dirtyWorkspaces = o.configDirtyWorkspaces ?? new Set<string>();
   const seams: VmDriverSeams = {
     listPeers: async () => o.peers ?? [],
     probeHealth: o.health ?? (async () => null),
@@ -100,6 +102,7 @@ function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder
     exec: (bin, args, cwd) => void rec.execs.push({ bin, args, cwd }),
     spawnDetached: (bin, args, cwd) => void rec.spawns.push({ bin, args, cwd }),
     sleep: async (ms) => void rec.sleeps.push(ms),
+    isConfigDirty: (workspaceDir: string) => dirtyWorkspaces.has(workspaceDir),
   };
   return { seams, rec };
 }
@@ -295,6 +298,33 @@ describe('isBusy', () => {
       paneReads: [null, null],
     });
     expect(await createVmDriver(OPTS, seams).isBusy('code-agent')).toBe(true);
+  });
+});
+
+// --- isConfigDirty (macf#722 Fix B) ------------------------------------------
+
+describe('isConfigDirty', () => {
+  it('is dirty when the workspace seam reports uncommitted config-surface changes', async () => {
+    const { seams } = fakeSeams({ configDirtyWorkspaces: new Set(['/w/macf']) });
+    expect(await createVmDriver(OPTS, seams).isConfigDirty('code-agent')).toBe(true);
+  });
+
+  it('is clean when the workspace seam reports no config-surface changes', async () => {
+    const { seams } = fakeSeams();
+    expect(await createVmDriver(OPTS, seams).isConfigDirty('code-agent')).toBe(false);
+  });
+
+  it('is clean (false) when the agent is unknown — nothing to check', async () => {
+    const { seams } = fakeSeams({ configDirtyWorkspaces: new Set(['/w/macf']) });
+    expect(await createVmDriver(OPTS, seams).isConfigDirty('ghost')).toBe(false);
+  });
+
+  it('checks the RESOLVED agent workspace, not the driver`s own workspace', async () => {
+    const { seams } = fakeSeams({ configDirtyWorkspaces: new Set(['/w/science']) });
+    // driver bound to /w/macf (OPTS.workspaceDir), but the agent under test is
+    // science-agent, whose OWN workspace (/w/science) is the dirty one.
+    expect(await createVmDriver(OPTS, seams).isConfigDirty('code-agent')).toBe(false);
+    expect(await createVmDriver(OPTS, seams).isConfigDirty('science-agent')).toBe(true);
   });
 });
 

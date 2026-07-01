@@ -61,8 +61,10 @@ interface DriverCalls {
   probe: number;
   discover: number;
   isBusy: string[];
+  isConfigDirty: string[];
   upgrade: string[];
   restart: string[];
+  restartForce: string[];
 }
 
 /** A recording fake driver. `busy(agent, callIdx)` decides isBusy per call. */
@@ -70,8 +72,18 @@ function makeDriver(opts: {
   state: FleetState;
   workspaces: readonly WorkspaceRecord[];
   busy?: (agent: string, callIdx: number) => boolean;
+  /** Agents whose config surface is dirty (macf#722 Fix B); defaults to none. */
+  configDirty?: (agent: string) => boolean;
 }): { driver: FleetDriver; calls: DriverCalls } {
-  const calls: DriverCalls = { probe: 0, discover: 0, isBusy: [], upgrade: [], restart: [] };
+  const calls: DriverCalls = {
+    probe: 0,
+    discover: 0,
+    isBusy: [],
+    isConfigDirty: [],
+    upgrade: [],
+    restart: [],
+    restartForce: [],
+  };
   const perAgent = new Map<string, number>();
   const driver: FleetDriver = {
     probe: async () => {
@@ -88,11 +100,17 @@ function makeDriver(opts: {
       calls.isBusy.push(agent);
       return opts.busy ? opts.busy(agent, idx) : false;
     },
+    isConfigDirty: async (agent) => {
+      calls.isConfigDirty.push(agent);
+      return opts.configDirty ? opts.configDirty(agent) : false;
+    },
+    capturePane: async () => null,
     upgrade: async (agent) => {
       calls.upgrade.push(agent);
     },
-    restart: async (agent) => {
+    restart: async (agent, restartOpts) => {
       calls.restart.push(agent);
+      if (restartOpts?.forceStashConfig) calls.restartForce.push(agent);
     },
     inject: async () => {},
     launch: async () => {},
@@ -208,6 +226,53 @@ describe('rollFleet', () => {
     expect(res.results.map((r) => r.outcome)).toEqual(['upgraded', 'upgraded']);
   });
 
+  it('config-dirty PRE-FLIGHT gate: skips + reports BEFORE any mutation, and continues (macf#722 Fix B)', async () => {
+    const { driver, calls } = makeDriver({
+      state: mkState([]),
+      workspaces: [],
+      configDirty: (agent) => agent === 'a1',
+    });
+    const { verifyGreen } = makeVerify();
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+    });
+    // a1 never touched — no upgrade/restart/isBusy call at all for a1.
+    expect(calls.isConfigDirty).toEqual(['a1', 'a2']);
+    expect(calls.upgrade).toEqual(['a2']);
+    expect(calls.restart).toEqual(['a2']);
+    expect(calls.isBusy).toEqual(['a2']); // a1's busy-gate never even runs
+    expect(res.halted).toBe(false);
+    expect(res.configDirtySkipped).toBe(1);
+    expect(res.upgraded).toBe(1);
+    expect(res.results.map((r) => [r.agent, r.outcome])).toEqual([
+      ['a1', 'config-dirty-skipped'],
+      ['a2', 'upgraded'],
+    ]);
+    expect(res.results[0]!.detail).toContain('--force');
+  });
+
+  it('--force bypasses the config-dirty gate AND threads forceStashConfig into restart', async () => {
+    const { driver, calls } = makeDriver({
+      state: mkState([]),
+      workspaces: [],
+      configDirty: () => true,
+    });
+    const { verifyGreen } = makeVerify();
+    const res = await rollFleet(
+      twoBehind,
+      { targetVersion: '0.2.41', verifyTimeoutMs: 1000, force: true },
+      { driver, verifyGreen, ...noWait },
+    );
+    expect(res.configDirtySkipped).toBe(0);
+    expect(calls.upgrade).toEqual(['a1', 'a2']);
+    expect(calls.restart).toEqual(['a1', 'a2']);
+    // both agents' restart was told to force-stash the (dirty) config surface.
+    expect(calls.restartForce).toEqual(['a1', 'a2']);
+    expect(res.halted).toBe(false);
+  });
+
   it('skips + reports a BUSY agent (never interrupts) and continues to the next', async () => {
     const { driver, calls } = makeDriver({
       state: mkState([]),
@@ -262,7 +327,11 @@ describe('rollFleet', () => {
     expect(res.results[0]!.detail).toContain('still busy');
   });
 
-  it('HALTS the roll when an agent fails verify-green — later agents are NOT touched', async () => {
+  it('HALTS with reason bad-release when verify-green sees the agent back on the OLD (pre-upgrade) version — later agents are NOT touched', async () => {
+    // a1's plan.runningVersion is '0.2.40' (the pre-upgrade pin) — verify-green
+    // reporting lastVersion '0.2.40' means the restart came back on the SAME old
+    // release (crash-loop / stuck-old-process), which is the confirmed-bad-release
+    // signal, distinct from an unconfirmed/unknown state.
     const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
     const { verifyGreen, seen } = makeVerify({
       a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40' },
@@ -277,8 +346,66 @@ describe('rollFleet', () => {
     expect(calls.restart).toEqual(['a1']);
     expect(seen).toEqual(['a1']);
     expect(res.results).toHaveLength(1);
-    expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted' });
-    expect(res.results[0]!.detail).toContain('wrong-version');
+    expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted', reason: 'bad-release' });
+    expect(res.results[0]!.detail).toContain('bad-release');
+  });
+
+  it('HALTS with reason relaunch-unconfirmed when verify-green times out unreachable (down the whole grace) — later agents are NOT touched', async () => {
+    const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
+    const { verifyGreen, seen } = makeVerify({
+      a1: { ok: false, reason: 'unreachable', lastVersion: null },
+    });
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+    });
+    expect(res.halted).toBe(true);
+    expect(calls.upgrade).toEqual(['a1']);
+    expect(seen).toEqual(['a1']);
+    expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted', reason: 'relaunch-unconfirmed' });
+    expect(res.results[0]!.detail).toContain('relaunch-unconfirmed');
+  });
+
+  it('HALTS with reason relaunch-unconfirmed when verify-green sees an UNKNOWN (neither old nor target) version — NOT bad-release', async () => {
+    // a1 pre-upgrade pin/runningVersion is '0.2.40'; verify-green sees some OTHER
+    // in-between version ('0.2.40-rc1' normalizes to 0.2.40.0 under compareSemver's
+    // unparseable-suffix rule... use a genuinely distinct comparable version instead
+    // so the case is unambiguous: neither the old pin nor the target).
+    const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
+    const { verifyGreen, seen } = makeVerify({
+      a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.39' },
+    });
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+    });
+    expect(res.halted).toBe(true);
+    expect(calls.upgrade).toEqual(['a1']);
+    expect(seen).toEqual(['a1']);
+    expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted', reason: 'relaunch-unconfirmed' });
+  });
+
+  it('slow-but-fine relaunch: verify-green confirms green WITHIN the grace after early down/unknown polls — CONTINUES', async () => {
+    // Models the spurious-halt root cause: early polls during relaunch see the
+    // agent down/unreachable (old session dying, new one not up yet), but the
+    // REAL verifyGreen (macf-core) already polls-with-retry internally — this
+    // test asserts rollFleet just trusts whatever terminal result verifyGreen
+    // returns (ok:true) and continues, regardless of how many polls it took.
+    const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
+    const { verifyGreen, seen } = makeVerify({
+      a1: { ok: true, version: '0.2.41' },
+    });
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+    });
+    expect(res.halted).toBe(false);
+    expect(calls.upgrade).toEqual(['a1', 'a2']);
+    expect(seen).toEqual(['a1', 'a2']);
+    expect(res.results.map((r) => r.outcome)).toEqual(['upgraded', 'upgraded']);
   });
 
   it('ignores non-behind plans (at-target / offline) — no driver mutations', async () => {

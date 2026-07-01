@@ -77,6 +77,8 @@ function makeDriver(
       mkState(agents.map((a) => [a.name, flip && restarted.has(a.name) ? opts.target : opts.base])),
     discoverWorkspaces: () => workspaces,
     isBusy: async () => false,
+    isConfigDirty: async () => false,
+    capturePane: async () => null,
     upgrade: async (a) => { calls.upgrade.push(a); },
     restart: async (a) => {
       calls.restart.push(a);
@@ -200,6 +202,50 @@ describe('runFleetUpgrade', () => {
     expect(lines.join('\n')).toContain('EXECUTE');
   });
 
+  it('re-resolves the FRESH endpoint on each verify-green poll after a restart-self port churn (macf#722 Fix A)', async () => {
+    // Models the real restart-self behavior: the agent relaunches on a NEW
+    // port. The wiring under test is `runFleetUpgrade`'s `probe` closure,
+    // which must call `current.probe()` fresh EACH poll (not resolve the
+    // endpoint once up front) so it sees the roster's updated port and keeps
+    // seeing the (still-online) agent rather than treating the port-flip as
+    // an unreachable/offline agent.
+    const restarted = new Set<string>();
+    let pollsAfterRestart = 0;
+    const driver: FleetDriver = {
+      probe: async () => {
+        if (restarted.has('a')) pollsAfterRestart += 1;
+        // Pre-restart: port 4000, version 0.2.40 (old). Post-restart: port
+        // CHANGES to 5000 (the restart-self relaunch churn) AND the version
+        // flips to target — but only after a couple of polls (modeling
+        // registry-propagation lag), so a naive "resolve once" probe would
+        // keep querying the DEAD port 4000 and see nothing.
+        const port = restarted.has('a') ? 5000 : 4000;
+        const version = restarted.has('a') && pollsAfterRestart >= 2 ? '0.2.41' : '0.2.40';
+        return {
+          agents: [{ name: 'a', host: 'h', port, online: true, version, health: mkHealth(version) }],
+        };
+      },
+      discoverWorkspaces: () => [mkWs('a', 'fleet-1', '0.2.40')],
+      isBusy: async () => false,
+      isConfigDirty: async () => false,
+      capturePane: async () => null,
+      upgrade: async () => {},
+      restart: async () => {
+        restarted.add('a');
+      },
+      inject: async () => {},
+      launch: async () => {},
+    };
+    const { deps } = makeDeps({
+      discover: () => [mkWs('a', 'fleet-1', '0.2.40')],
+      defaultFleet: 'fleet-1',
+      resolveDriver: async () => driver,
+    });
+    const code = await runFleetUpgrade('/proj', { execute: true, verifyTimeoutSec: 5 }, deps);
+    expect(code).toBe(0);
+    expect(pollsAfterRestart).toBeGreaterThanOrEqual(2); // actually polled past the port churn
+  });
+
   it('multi-select rolls fleet-by-fleet and HALT in fleet-1 stops fleet-2 (exit 1)', async () => {
     // flipOnRestart:false → 'a' never comes up on the target → verify-green fails → HALT.
     const { driver, calls, workspaces } = makeDriver(AGENTS, {
@@ -268,6 +314,8 @@ describe('runFleetUpgrade', () => {
           mkState(own.map((m) => [m.agent, restarted.has(m.agent) ? opts.target : opts.base])),
         discoverWorkspaces: () => members, // full host scan — filtering is the CALLER's job (macf-core's upgradeFleets)
         isBusy: async () => false,
+        isConfigDirty: async () => false,
+        capturePane: async () => null,
         upgrade: async (a) => { calls.upgrade.push(a); },
         restart: async (a) => { calls.restart.push(a); restarted.add(a); },
         inject: async () => {},

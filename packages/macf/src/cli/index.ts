@@ -408,15 +408,20 @@ fleet
 fleet
   .command('upgrade')
   .description(
-    'Rolling framework-version upgrade (DR-037 / macf#682). For each selected ' +
-    "fleet (a fleet == one PROJECT, macf#710 — its own CA + registry namespace, " +
-    'NOT the coarser registry scope, since one profile/org registry can host ' +
-    'several distinct projects), roll every agent whose RUNNING /health.version ' +
-    'is behind TARGET, ONE AT A TIME: busy-gate (never interrupt a working agent — ' +
-    'skip+report, or --wait for idle) → macf update → restart-self → verify /health.version ' +
-    '== target (re-resolving the fresh restart-self endpoint) → next. A bad release HALTS ' +
-    'the roll (and stops later fleets) so it cannot brick the fleet. DRY-RUN by default ' +
-    '(prints the plan); --execute rolls. TARGET defaults to npm-latest of @groundnuty/macf.',
+    'Rolling framework-version upgrade (DR-037 / macf#682, hardened macf#722). For ' +
+    "each selected fleet (a fleet == one PROJECT, macf#710 — its own CA + registry " +
+    'namespace, NOT the coarser registry scope, since one profile/org registry can ' +
+    'host several distinct projects), roll every agent whose RUNNING /health.version ' +
+    'is behind TARGET, ONE AT A TIME: pre-flight gates (config-dirty — skip+report ' +
+    'unless --force; then busy — never interrupt a working agent, skip+report or ' +
+    '--wait for idle) → macf update → restart-self → verify /health.version == target ' +
+    '(re-resolving the fresh restart-self endpoint on EACH poll, over a ' +
+    'relaunch-aware grace budget) → next. A HALT stops the roll (and later fleets): ' +
+    '`bad-release` when the agent is confirmed back on its OLD version (a crash-loop), ' +
+    '`relaunch-unconfirmed` when it is never confirmed green within the grace (down / ' +
+    'unreachable / an unrecognized version) — neither is safe to leave behind while ' +
+    'moving on, so a bad release cannot brick the fleet. DRY-RUN by default (prints ' +
+    'the plan); --execute rolls. TARGET defaults to npm-latest of @groundnuty/macf.',
   )
   .option('--target <version>', 'Target framework version (default: npm-latest of @groundnuty/macf)')
   .option('--fleet <names>', 'Comma-list of fleets (project identifiers) to roll — multi-select, rolled fleet-by-fleet')
@@ -424,6 +429,13 @@ fleet
   .option('--execute', 'ACTUALLY roll the upgrade (default: dry-run — print the plan)', false)
   .option('--wait', 'On a busy agent, poll for idle up to a bound instead of skipping', false)
   .option('--verify-timeout <sec>', 'Per-agent verify-green budget, in seconds (default 120)', (v) => parseInt(v, 10))
+  .option(
+    '--force',
+    'Roll an agent even if its config surface (.claude/**, CLAUDE.md, ' +
+      'claude.sh, env.local.*) is dirty (macf#722) — bypasses the pre-flight ' +
+      'config-dirty skip-gate AND restart-self\'s matching stash-refusal guard.',
+    false,
+  )
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .action(async (opts) => {
     const code = await runFleetUpgrade(resolveProjectDir(opts.dir), {
@@ -433,6 +445,7 @@ fleet
       execute: opts.execute,
       wait: opts.wait,
       verifyTimeoutSec: opts.verifyTimeout,
+      force: opts.force,
     });
     process.exitCode = code;
   });
@@ -496,6 +509,13 @@ program
   .option('--confirm', 'Actually act (otherwise dry-run)', false)
   .option('--dry-run', 'Force dry-run even with --confirm (the safer wins)', false)
   .option('--json', 'Emit the structured plan/result as JSON', false)
+  .option(
+    '--force',
+    'Bypass the config-surface stash-refusal guard (macf#722) — proceed ' +
+      '(and stash) even when .claude/**, CLAUDE.md, claude.sh, or env.local.* ' +
+      'are dirty. Same effect as MACF_RESTART_STASH_CONFIG=1.',
+    false,
+  )
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .action(async (opts) => {
     const code = await runRestartSelfCommand(resolveProjectDir(opts.dir), {
@@ -503,6 +523,7 @@ program
       confirm: opts.confirm,
       dryRun: opts.dryRun,
       json: opts.json,
+      force: opts.force,
     });
     process.exitCode = code;
   });
