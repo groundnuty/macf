@@ -19,6 +19,7 @@ import {
   formatOtel,
   formatRunState,
   formatUptime,
+  formatVersion,
   gatherFleetStatus,
   runFleetStatus,
   type FleetAgentStatus,
@@ -121,6 +122,19 @@ describe('formatOtel — defensive over endpoint_reachable', () => {
   });
 });
 
+describe('formatVersion — /health.version, defensive (macf#682)', () => {
+  it('renders a present version string', () => {
+    expect(formatVersion('0.2.41')).toBe('0.2.41');
+  });
+
+  it('placeholders an absent / empty / non-string value with `?`', () => {
+    expect(formatVersion(undefined)).toBe('?');
+    expect(formatVersion(null)).toBe('?');
+    expect(formatVersion('')).toBe('?');
+    expect(formatVersion(42)).toBe('?');
+  });
+});
+
 describe('gatherFleetStatus', () => {
   it('marks each peer online/offline from the injected probe', async () => {
     const peers = [
@@ -187,6 +201,7 @@ describe('buildFleetRows / formatFleetTable', () => {
       'CODE_AGENT',
       '127.0.0.1:4100',
       'online',
+      '0.2.38', // /health.version (macf#682)
       '2h', // 7200s
       'busy 18m on turn 7',
       'reachable',
@@ -206,7 +221,27 @@ describe('buildFleetRows / formatFleetTable', () => {
       '—',
       '—',
       '—',
+      '—',
     ]);
+  });
+
+  it('degrades an online agent whose /health omits version to `?` (back-compat)', () => {
+    const noVersion: FleetAgentStatus[] = [
+      {
+        name: 'OLD_AGENT',
+        host: '127.0.0.1',
+        port: 4400,
+        online: true,
+        // Body predating /health.version — strip the field entirely.
+        health: (() => {
+          const h = onlineHealth() as unknown as Record<string, unknown>;
+          delete h['version'];
+          return h as unknown as HealthResponse;
+        })(),
+      },
+    ];
+    const rows = buildFleetRows(noVersion, NOW);
+    expect(rows[0]![3]).toBe('?'); // VERSION column
   });
 
   it('produces an aligned table with a header + separator', () => {
@@ -234,6 +269,17 @@ describe('fleetStatusToJson', () => {
       endpoint_reachable: false,
     });
     expect(json.agents[1]).toMatchObject({ name: 'SCIENCE_AGENT', status: 'offline', health: null });
+  });
+
+  it('surfaces version as a top-level per-agent field (macf#682)', () => {
+    const json = fleetStatusToJson([
+      { name: 'CODE_AGENT', host: '127.0.0.1', port: 4100, online: true, health: onlineHealth() },
+      { name: 'SCIENCE_AGENT', host: '100.64.0.2', port: 4200, online: false, health: null },
+    ]) as { agents: ReadonlyArray<Record<string, unknown>> };
+
+    // Online agent → its /health.version; offline → null (nothing to report).
+    expect(json.agents[0]!.version).toBe('0.2.38');
+    expect(json.agents[1]!.version).toBeNull();
   });
 });
 

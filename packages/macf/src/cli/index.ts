@@ -243,8 +243,9 @@ program
     'List MACF claude / channel-server processes (Linux /proc), keyed by ' +
     'cwd + agent identity — multi-tenant-correct (never `pgrep | head -1`)',
   )
-  .action(() => {
-    process.exitCode = runPs();
+  .option('--json', 'Emit the structured process list as JSON for automation', false)
+  .action((opts) => {
+    process.exitCode = runPs(undefined, { json: Boolean(opts.json) });
   });
 
 const fleet = program
