@@ -191,7 +191,13 @@ describe('macf-prompt-watcher.sh — self-alert feedback loop (macf#712)', () =>
     // "looks prompt-like". Directly assert the pane after a run contains
     // at most ONE watcher-emitted ALERT line despite the marker being
     // present in what the stub tmux "pane" accumulates.
-    const unknownFrame = '❯ mystery-menu\n';
+    //
+    // Uses a NUMBERED menu shape (post-macf#729 `_looks_prompt_like` only
+    // treats `❯` as prompt-like on a numbered option line — see the
+    // "input-box vs menu-cursor misclassification" describe block below).
+    // The alert text embeds this same "❯ 1. mystery-menu" excerpt verbatim,
+    // which is what reproduces the self-match hazard this test guards.
+    const unknownFrame = '❯ 1. mystery-menu\n';
     const result = runWatcher({ initialFrame: unknownFrame, windowSecs: 3, intervalSecs: 1 });
     const markerCount = (result.paneContents.match(/\[macf-prompt-watcher\] ALERT: UNKNOWN/g) ?? [])
       .length;
@@ -258,5 +264,42 @@ describe('macf-prompt-watcher.sh — self-alert feedback loop (macf#712)', () =>
       rmSync(workDir, { recursive: true, force: true });
       rmSync(tmuxDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('macf-prompt-watcher.sh — input-box vs menu-cursor misclassification (macf#729)', () => {
+  // `❯` is overloaded: it is BOTH the menu-selection cursor on a real
+  // numbered ceremony prompt AND the Claude Code free-form input-box
+  // cursor. `_looks_prompt_like` must distinguish a queued/typed message in
+  // the input box (not prompt-like — no ALERT) from a real numbered menu
+  // (still prompt-like — ALERT preserved, Inv 1).
+
+  function alertCount(paneContents: string): number {
+    return paneContents.split('\n').filter((l) => l.includes('ALERT: UNKNOWN prompt-like frame'))
+      .length;
+  }
+
+  it('a queued message in the free-form input box is NOT prompt-like (no ALERT spam)', () => {
+    const inputBoxFrame = '❯ you merge pleasee, complete startup-reconcile (DR-008)\n';
+    const result = runWatcher({ initialFrame: inputBoxFrame, windowSecs: 3, intervalSecs: 1 });
+    expect(alertCount(result.paneContents)).toBe(0);
+  });
+
+  it('an empty input box is NOT prompt-like (no ALERT)', () => {
+    const emptyInputBoxFrame = '❯ \n';
+    const result = runWatcher({ initialFrame: emptyInputBoxFrame, windowSecs: 3, intervalSecs: 1 });
+    expect(alertCount(result.paneContents)).toBe(0);
+  });
+
+  it('Inv 1 preserved: a real numbered menu NOT on the allowlist is still prompt-like (ALERT fires)', () => {
+    const menuFrame = '❯ 1. Yes, proceed\n  2. No\n';
+    const result = runWatcher({ initialFrame: menuFrame, windowSecs: 3, intervalSecs: 1 });
+    expect(alertCount(result.paneContents)).toBe(1);
+  });
+
+  it('Inv 1 preserved: a (y/n) prompt NOT on the allowlist is still prompt-like (ALERT fires)', () => {
+    const yesNoFrame = 'Continue? (y/n)\n';
+    const result = runWatcher({ initialFrame: yesNoFrame, windowSecs: 3, intervalSecs: 1 });
+    expect(alertCount(result.paneContents)).toBe(1);
   });
 });

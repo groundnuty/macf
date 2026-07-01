@@ -198,9 +198,18 @@ export function loadPromptResponses(raw: unknown): LoadedPromptResponses {
  * confirmation) is the dangerous case: an unknown prompt we must NOT answer.
  * Broad on purpose — false-positive (alert on a non-prompt) is cheap; a
  * false-negative (miss a real unknown prompt) is the hazard.
+ *
+ * `❯` is overloaded (groundnuty/macf#729): it is BOTH the menu-selection
+ * cursor on a real numbered ceremony prompt (`❯ 1. Yes`) AND the Claude Code
+ * free-form input-box cursor (`❯ <queued/typed text>`). A bare `frame.includes('❯')`
+ * misclassified a queued message in the input box as an unknown prompt,
+ * firing repeated ALERT spam. Match only when `❯` sits directly on a
+ * NUMBERED OPTION line — that excludes the free-form input box (whose text
+ * after `❯` is not `[0-9]+[.)]`) while still catching real numbered menus.
+ * Kept in lockstep with the watcher's bash `_looks_prompt_like`.
  */
 export function looksPromptLike(frame: string): boolean {
-  if (frame.includes('❯')) return true;
+  if (/❯[ \t]*[0-9]+[.)]/.test(frame)) return true;
   return /\((?:y\/n|y\/N|Y\/n)\)|\[(?:y\/N|Y\/n|y\/n)\]/.test(frame);
 }
 
