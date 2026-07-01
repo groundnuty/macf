@@ -175,6 +175,32 @@ export const MACF_REFLECTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts
 export const MACF_CHANNELS_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channels-enabled.sh';
 
 /**
+ * Channel-alive liveness-guard hook command (groundnuty/macf#734). Registered
+ * on BOTH the `SessionStart` and `UserPromptSubmit` events: it probes THIS
+ * agent's own channel-server `/health` endpoint over mTLS (endpoint learned
+ * from the newest `server_started` line in the agent's own channel.log; certs
+ * from MACF_CA_CERT/MACF_AGENT_CERT/MACF_AGENT_KEY) and warns LOUDLY into the
+ * agent's context when it does NOT respond — the missing detect-half
+ * check-channels-enabled.sh (#633) doesn't cover: that guard asserts native
+ * channel-push is ENABLED for the session (a one-time config/flag question);
+ * this guard asserts the channel-server PROCESS is still alive right now,
+ * re-checked periodically through the session. Motivated by a real incident:
+ * an agent's channel-server process died and went unnoticed for ~55 minutes
+ * because the Claude Code TUI (a separate process) kept working fine.
+ *
+ * Throttled via a local timestamp file (`.claude/.macf/.channel-alive-last-check`)
+ * so the mTLS probe doesn't fire on every single turn — SessionStart always
+ * probes (fresh session); UserPromptSubmit is bounded to roughly once per 5
+ * minutes. OBSERVATIONAL + NON-BLOCKING: the script ALWAYS exits 0 (fail open
+ * on a missing log, missing certs, missing curl, or any internal error) so it
+ * can never block a turn or a session. Override: MACF_SKIP_CHANNEL_ALIVE_CHECK=1.
+ *
+ * Distributed via `macf init` / `macf update` / `macf rules refresh` like the
+ * other check-*.sh hooks (CLI-shipped, NOT a plugin hook).
+ */
+export const MACF_CHANNEL_ALIVE_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh';
+
+/**
  * The hook filenames used to identify MACF-managed entries on refresh.
  * Matched by path-end equality (see isMacfManagedCommand) so operator
  * files with a similar-but-distinct basename are not misclassified.
@@ -189,6 +215,7 @@ const MACF_HOOK_FILENAMES: readonly string[] = [
   'check-gh-attribution.sh',
   'harvest-reflection.sh',
   'check-channels-enabled.sh',
+  'check-channel-alive.sh',
 ];
 
 /**
@@ -918,6 +945,11 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
  *
  * And, on the UserPromptSubmit event:
  *   - `emit-turn-receipt.sh` (groundnuty/macf#444 — async turn-ack span)
+ *   - `check-channel-alive.sh` (groundnuty/macf#734 — throttled mTLS liveness
+ *     probe against this agent's OWN channel-server `/health`; warns LOUDLY
+ *     when it doesn't respond. Shares the script with the SessionStart entry
+ *     below; the script self-throttles so this doesn't fire a real probe on
+ *     every turn)
  *
  * And, on the PreCompact event:
  *   - `harvest-reflection.sh` (groundnuty/macf#500 — DR-026 F2; at compaction,
@@ -930,6 +962,12 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
  *     when channel notifications are OFF, the result-invariant backstop to the
  *     macf#632 claude.sh flag. Matcher-less + NON-BLOCKING; operator-authored
  *     SessionStart hooks are preserved)
+ *   - `check-channel-alive.sh` (groundnuty/macf#734 — unthrottled on
+ *     SessionStart, since a fresh session has no reason to trust a stale
+ *     throttle stamp from a prior session; probes this agent's own
+ *     channel-server `/health` and warns LOUDLY if it's unreachable — the
+ *     detect-half check-channels-enabled.sh doesn't cover, see its own header
+ *     comment for the config-flag-vs-process-liveness distinction)
  *
  * Creates the `.claude/` directory and the file if either is missing.
  * Idempotent: repeated calls don't duplicate entries.
@@ -1014,12 +1052,25 @@ export function installGhTokenHook(workspaceDir: string): void {
   // re-add ours, leaving operator-authored UserPromptSubmit hooks intact. No
   // `matcher` (UserPromptSubmit isn't tool-gated); `async: true` so it never
   // adds turn latency.
+  //
+  // Plus the channel-alive liveness guard (groundnuty/macf#734) — deliberately
+  // NOT `async: true`, unlike the turn-receipt hook above. Its whole value is
+  // getting a LOUD warning INTO the agent's context on the turn where it
+  // fires; an async hook's stdout is fire-and-forget and isn't reliably
+  // injected in time to matter for the current turn. The script's own
+  // throttle (~once per 5 min; see check-channel-alive.sh) bounds how often a
+  // turn actually pays the synchronous mTLS-probe cost (curl `-m 5` worst
+  // case) — the same accepted trade-off as check-channels-enabled.sh's
+  // synchronous (non-async) SessionStart poll (up to ~12s worst case) below.
   const preservedUps = userPromptSubmit.filter(
     (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
   );
   const macfUpsEntries: readonly HookEntry[] = [
     {
       hooks: [{ type: 'command', command: MACF_TURN_RECEIPT_HOOK_COMMAND, async: true }],
+    },
+    {
+      hooks: [{ type: 'command', command: MACF_CHANNEL_ALIVE_HOOK_COMMAND }],
     },
   ];
 
@@ -1046,12 +1097,22 @@ export function installGhTokenHook(workspaceDir: string): void {
   // operator-authored SessionStart hooks intact. Matcher-less (SessionStart
   // isn't tool-gated). NON-BLOCKING by script contract (always exit 0) — so no
   // `async` flag is needed; it can't delay session start.
+  //
+  // Plus the channel-alive liveness guard (groundnuty/macf#734) — SAME script
+  // as the UserPromptSubmit entry above, registered a second time on
+  // SessionStart so a fresh session always probes immediately (bypassing the
+  // script's own throttle, which only applies to non-SessionStart events) and
+  // stamps the throttle file so the UserPromptSubmit calls that follow inherit
+  // the fresh window.
   const preservedSession = sessionStart.filter(
     (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
   );
   const macfSessionEntries: readonly HookEntry[] = [
     {
       hooks: [{ type: 'command', command: MACF_CHANNELS_HOOK_COMMAND }],
+    },
+    {
+      hooks: [{ type: 'command', command: MACF_CHANNEL_ALIVE_HOOK_COMMAND }],
     },
   ];
 
