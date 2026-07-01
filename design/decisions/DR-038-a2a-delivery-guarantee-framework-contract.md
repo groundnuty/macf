@@ -65,7 +65,7 @@ interface InboxStore {
 
 `persist(msg) -> wasNew` is the key design point: dedup-and-persist in **one atomic operation**, closing the check-then-act race a separate `seen(id)` + `append()` would open.
 
-**Drivers (devops-owned, DR-008):** the VM disk-spool driver extends `comms-ledger`'s `appendFileSync`-jsonl surface into a queue (`.outbox.jsonl` / `.inbox.jsonl` siblings); the K8s driver uses a PVC/broker. **Durability scope (explicit): `appendFileSync` is sufficient** — it survives the actual failure mode, a process **crash** (`process_exit code:1`, the observed channel-server death). Only power-loss would need `fsync`, which is **out of scope** for this DR (the failure mode is crash, not power-loss).
+**Drivers (devops-owned, DR-008):** the VM disk-spool driver extends `comms-ledger`'s `appendFileSync`-jsonl surface into a queue (e.g. `.outbox.jsonl` / `.inbox.jsonl` siblings — **illustrative, non-binding**: the concrete filenames + on-disk layout are a devops-driver detail settled when the driver design lands, and must NOT ossify as an implicit contract ahead of DR-008's deferred open-Q5 [the store-driver interface]; the binding contract is the `OutboxStore`/`InboxStore` *interface* above, not the filenames); the K8s driver uses a PVC/broker. **Durability scope (explicit): `appendFileSync` is sufficient** — it survives the actual failure mode, a process **crash** (`process_exit code:1`, the observed channel-server death). Only power-loss would need `fsync`, which is **out of scope** for this DR (the failure mode is crash, not power-loss).
 
 ## Decision 7 — Queue-source: App-install-set × label, complete-by-construction
 
@@ -79,7 +79,8 @@ Replace the hardcoded per-repo loop (`agent-identity.md §"Checking for Work"` /
 
 - **code + science:** the channel-server delivery contract (outbox/inbox, effectively-once, message-id, persist-then-ACK, TTL/dead-letter), the **store interface** (Decision 6), the drain-on-recovery logic, the effectively-once invariant.
 - **code:** the plugin startup-reconcile (extend `startup_check`: drain-inbox + §5 sweeps), the queue-source (`startup-issues.ts` → App-install×label). The plugin owns SessionStart.
-- **devops (DR-008):** the VM disk-spool store driver, the K8s PVC/broker driver, the §5→startup-step operational rule.
+- **devops (DR-008):** the VM disk-spool store driver, the K8s PVC/broker driver, the canonical `coordination.md §5` rule-text change.
+- **The §5-promotion is JOINT (code + devops) and its two halves MUST land together** (DR-008 §4 "two halves that must land together"): the **plugin wiring** (code — the injected `startup_check` step that runs the §5 sweeps) and the **canonical rule-text** (devops — `coordination.md §5` reworded from "a discipline the agent must remember" to "an injected startup step"). Neither row is *sole* ownership. If only the wiring lands, the canonical rule still tells the agent to remember (stale + contradictory); if only the rule-text lands, there is no injected step to back it. Ship them as one change.
 - **science (this DR):** the framework contract + resolving DR-008's open questions.
 
 ## Boundaries / non-goals
