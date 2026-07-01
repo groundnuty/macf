@@ -180,8 +180,26 @@ export function buildResumeNote(args: {
  * The detached relauncher script. Waits for the OLD session to die (up to ~30s),
  * then `cd`s to the workspace, spawns the assert-survived watcher (macf#685),
  * sources the host-prelude IF it exists (decoupled from DR-031 piece 4 — proceed
- * if absent), and `exec`s the launcher. Uses absolute paths so it does not depend
- * on the dying session's env beyond what it re-establishes.
+ * if absent), and relaunches into a FRESH detached tmux session. Uses absolute
+ * paths so it does not depend on the dying session's env beyond what it
+ * re-establishes.
+ *
+ * **macf#711 root cause + fix.** The relauncher process is detached from (but
+ * still ENV-inherits) the dying agent's tmux pane, so `$TMUX` / `$TMUX_PANE` are
+ * still SET in the relauncher's own environment even though it has no
+ * controlling terminal. A bare `exec ./claude.sh` therefore skips `claude.sh`'s
+ * own tmux self-wrap entirely (`[ -z "${TMUX:-}" ]` is false) and — even were
+ * `$TMUX` unset first — that self-wrap's `tmux new-session` (no `-d`) needs a
+ * controlling terminal to attach to and fails with "open terminal failed: not a
+ * terminal" from a detached/`stdio:ignore` spawn. Both failure paths leave the
+ * agent DOWN with no tmux session and no process — reproduced + root-caused via
+ * live `spawn(..., { detached: true, stdio: 'ignore' })` experiments (macf#711).
+ * The fix: the relauncher creates the fresh DETACHED session itself
+ * (`tmux new-session -d -s "$SESSION" ...`, the exact form proven to work for
+ * manual recovery) and passes `MACF_NO_TMUX_WRAP=1` to the inner `claude.sh` so
+ * it does not attempt (and fail) its own self-wrap — `claude.sh` is already
+ * running inside the fresh session by the time it starts, so `$TMUX` being set
+ * there is the CORRECT signal to skip re-wrapping, not a leftover artifact.
  *
  * Assert-survived is Pattern A (silent-fallback-hazards): "restart exited 0" ≠
  * "the transcript survived". It runs in a DETACHED background watcher spawned
@@ -189,7 +207,9 @@ export function buildResumeNote(args: {
  * watcher is a separate PID that outlives the exec and polls the relaunched
  * session). It WAITS for the relaunch to come live (transcript mtime advancing)
  * BEFORE comparing — comparing the instant the relaunch spawns races the
- * transcript re-open and false-trips gone/shrank.
+ * transcript re-open and false-trips gone/shrank. The SAME watcher now also
+ * asserts the tmux session itself came up (macf#711 AC#2) — a silent
+ * session-creation failure must not be indistinguishable from "still starting".
  */
 export function buildRelauncherScript(args: {
   readonly workspaceDir: string;
@@ -225,14 +245,20 @@ export function buildRelauncherScript(args: {
     '',
     'cd "$WORKSPACE" || exit 1',
     '',
-    '# Assert-survived (Pattern A, macf#685): spawn the guard as a DETACHED watcher',
-    '# BEFORE the exec below — exec replaces this process, so anything after it never',
-    '# runs; the watcher is a separate PID that survives the exec and polls the',
-    '# relaunched session. Fail-open: it never blocks or aborts the relaunch.',
-    'if [ -f "$PRESTATE" ]; then',
-    '  assert_transcript_survived >>"$GUARD_LOG" 2>&1 &',
-    '  disown 2>/dev/null || true',
-    'fi',
+    '# Assert-live + assert-survived (Pattern A, macf#685 + macf#711): spawn the',
+    '# guard as a DETACHED watcher BEFORE the exec below — exec replaces this',
+    '# process, so anything after it never runs; the watcher is a separate PID',
+    '# that survives the exec and polls the relaunched session. Fail-open: it',
+    '# never blocks or aborts the relaunch, but it DOES surface a loud, durable',
+    '# alert into $GUARD_LOG on failure (macf#711 AC#2) — a silent agent-down is',
+    '# what let the original incident hang `fleet upgrade` invisibly.',
+    '(',
+    '  assert_session_live "$SESSION" >>"$GUARD_LOG" 2>&1',
+    '  if [ -f "$PRESTATE" ]; then',
+    '    assert_transcript_survived >>"$GUARD_LOG" 2>&1',
+    '  fi',
+    ') &',
+    'disown 2>/dev/null || true',
     '',
     '# host-prelude re-establishes the toolchain (brew/devbox PATH) for a minimal',
     '# (cron/detached) env. Decoupled from DR-031 piece 4 — proceed if absent.',
@@ -240,7 +266,20 @@ export function buildRelauncherScript(args: {
     '  # shellcheck disable=SC1090',
     '  . "$PRELUDE"',
     'fi',
-    'exec ./claude.sh',
+    '',
+    '# Relaunch into a FRESH detached tmux session (macf#711) — the exact form',
+    '# proven to work for manual recovery. A bare `exec ./claude.sh` here would',
+    '# rely on claude.sh\'s OWN self-wrap, which (a) is defeated because $TMUX /',
+    '# $TMUX_PANE are still set in this relauncher\'s inherited env even though it',
+    '# has no controlling terminal, and (b) even with $TMUX unset, its',
+    '# `tmux new-session` (no -d) needs a controlling terminal and fails with',
+    '# "open terminal failed: not a terminal" when run detached. Creating the',
+    '# session ourselves with -d sidesteps both. MACF_NO_TMUX_WRAP=1 tells the',
+    '# inner claude.sh not to attempt (and fail) its own wrap — by the time it',
+    '# runs it is already inside the fresh session, so $TMUX being set there is',
+    '# the CORRECT signal, not a leftover artifact.',
+    'exec tmux new-session -d -s "$SESSION" -c "$WORKSPACE" \\',
+    '  "MACF_NO_TMUX_WRAP=1 exec \\"$WORKSPACE/claude.sh\\""',
     '',
   ].join('\n');
 }
@@ -289,6 +328,43 @@ export function relauncherGuardLines(): readonly string[] {
     '  fi',
     '  [ "$post_uuid" != "$pre_uuid" ] && echo "[state-guard] note: uuid changed $pre_uuid -> $post_uuid (grew — not a loss, but verify the right session resumed)."',
     '  return 0',
+    '}',
+    '',
+    '# assert_session_live <session> — WAIT (up to LIVE_TIMEOUT) for the tmux',
+    '# session to exist, then assert it. This is the macf#711 structural fix\'s',
+    '# OWN result-invariant check (Pattern A): "the relauncher ran to completion"',
+    '# must not be conflated with "a live session came back" — that conflation is',
+    '# exactly what let the original incident hang `fleet upgrade` invisibly with',
+    '# no signal that the agent never came back up. Fail-open (never aborts',
+    '# anything — the relaunch already happened by the time this runs) but LOUD',
+    '# (a durable alert banner in $GUARD_LOG, same convention as the transcript',
+    '# guard below) on failure.',
+    '# Test seam: MACF_TEST_TMUX_UP="0"|"1" DEFINED => authoritative (skips the',
+    '# real `tmux has-session` call so this is unit-testable without a live server).',
+    'assert_session_live() {',
+    '  local session="$1"',
+    '  local deadline=$(( $(date +%s) + LIVE_TIMEOUT )) up=0',
+    '  while [ "$(date +%s)" -lt "$deadline" ]; do',
+    '    if [ "${MACF_TEST_TMUX_UP+set}" = set ]; then',
+    '      [ "$MACF_TEST_TMUX_UP" = "1" ] && up=1',
+    '      break',
+    '    elif tmux has-session -t "$session" 2>/dev/null; then',
+    '      up=1',
+    '      break',
+    '    fi',
+    '    sleep "$LIVE_INTERVAL"',
+    '  done',
+    '  if [ "$up" -eq 1 ]; then',
+    '    echo "[session-guard] OK: tmux session \'$session\' is live after relaunch."',
+    '    return 0',
+    '  fi',
+    '  echo "==================== macf restart-self SESSION-GUARD ALERT =================="',
+    '  echo "  The relaunch did NOT bring up a live tmux session within ${LIVE_TIMEOUT}s."',
+    '  echo "  session: $session"',
+    '  echo "  The agent is DOWN — nothing will register/respond until manually"',
+    '  echo "  recovered, e.g.: tmux new-session -d -s \'$session\' \\"cd ${WORKSPACE:-<workspace>} && ./claude.sh\\""',
+    '  echo "==============================================================================="',
+    '  return 1',
     '}',
     '',
     '# assert_transcript_survived — WAIT for the relaunch to come live (the transcript',
