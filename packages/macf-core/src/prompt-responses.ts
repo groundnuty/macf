@@ -44,8 +44,11 @@ export const PROMPT_RESPONSES_SCHEMA_VERSION = '1' as const;
  * answer a destructive-confirmation or a folder/tool-trust prompt, even if an
  * operator tries to allowlist it (DR-033 OQ1 lean: hard-refuse the most
  * dangerous). Kept in lockstep with `PROMPT_REFUSE_SUBSTRINGS` in the watcher.
+ * `revoke`/`remove` are the security/destructive siblings of `delete`/`trust`
+ * ("revoke token?" / "remove collaborator?") — same never-even-if-allowlisted
+ * class (science review of macf#645).
  */
-export const PROMPT_REFUSE_SUBSTRINGS = ['delete', 'overwrite', 'trust'] as const;
+export const PROMPT_REFUSE_SUBSTRINGS = ['delete', 'overwrite', 'trust', 'revoke', 'remove'] as const;
 
 /**
  * Inv 2 — LOUD-WARN substrings. An entry whose signature material contains any

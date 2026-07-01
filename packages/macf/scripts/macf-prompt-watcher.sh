@@ -14,7 +14,7 @@
 #   Inv 1  allowlist-only. Only auto-answer a frame that matches a vetted entry.
 #          An unrecognized prompt-like frame (a `❯` menu / `(y/n)`) → ALERT loud
 #          (forensic log + stderr) and DO NOT answer. Silence beats a wrong key.
-#   Inv 2  ceremony-only. Entries whose signature contains delete/overwrite/trust
+#   Inv 2  ceremony-only. Entries whose signature contains delete/overwrite/trust/revoke/remove
 #          are HARD-REFUSED (dropped) here at load; (y/n)/allow/permission/grant
 #          are LOUD-WARNED (kept, operator-owned risk). Defense-in-depth: the CLI
 #          validates too at `macf update`, but the operator may edit the JSON and
@@ -98,7 +98,7 @@ INTERVAL="${MACF_PROMPT_WATCH_INTERVAL_SECS:-1}"
 
 # Inv-2 substring lists — kept in lockstep with PROMPT_{REFUSE,WARN}_SUBSTRINGS
 # in @groundnuty/macf-core prompt-responses.ts.
-REFUSE_SUBSTR=(delete overwrite trust)
+REFUSE_SUBSTR=(delete overwrite trust revoke remove)
 WARN_SUBSTR=("(y/n)" allow permission grant)
 
 # --- pure helpers (mirror the macf-core matcher) -----------------------------

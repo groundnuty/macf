@@ -3,7 +3,7 @@
  * groundnuty/macf#645). SAFETY-CRITICAL — these cover the three constitutional
  * invariants:
  *   Inv 1 — allowlist-only + unknown-prompt → alert (never answer)
- *   Inv 2 — ceremony-only config classifier (refuse delete/overwrite/trust;
+ *   Inv 2 — ceremony-only config classifier (refuse delete/overwrite/trust/revoke/remove;
  *           warn (y/n)/allow/permission/grant)
  *   Inv 3 — structured signature: option_text at the send ordinal → reorder
  *           breaks the match → falls through to Inv 1
