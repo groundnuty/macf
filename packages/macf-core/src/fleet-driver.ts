@@ -104,6 +104,17 @@ export interface FleetDriver {
    */
   readonly isBusy: (agent: string) => Promise<boolean>;
 
+  /**
+   * Read the agent's current pane content for stall-signature matching
+   * (`macf fleet resume`, DR-037 / macf#686). VM: a single `tmux capture-pane`
+   * of the live session; K8s: recent pod logs. Returns `null` when the agent has
+   * NO live session / is unreadable (DEAD / gone — resume can't help it, so the
+   * caller skips it and leaves it to `reconcile`'s launch). Runtime-specific (a
+   * pane read), so it belongs on the driver — the decision layer stays pure by
+   * matching the returned string against the allowlist.
+   */
+  readonly capturePane: (agent: string) => Promise<string | null>;
+
   /** Roll the agent's framework version. VM: `macf update` in its workspace. */
   readonly upgrade: (agent: string) => Promise<void>;
 

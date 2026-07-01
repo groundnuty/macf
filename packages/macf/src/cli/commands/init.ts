@@ -13,6 +13,7 @@ import { generateAgentCert } from '@groundnuty/macf-core';
 import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import { seedProjectRulesDir } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
+import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { fetchPluginToWorkspace, pinChannelServerVersion, linkPluginCliDist } from '../plugin-fetcher.js';
 import { writeClaudeSh } from '../claude-sh.js';
@@ -504,6 +505,13 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // existing file (loud Inv-2 feedback), never reverts operator edits. The
   // watcher (macf-prompt-watcher.sh, just copied above) reads it at launch.
   reportSeedPromptResponses(seedPromptResponsesConfig(absDir));
+
+  // Seed the stall-signature allowlist (.claude/.macf/stall-signatures.json,
+  // DR-037 / macf#686) — the config `macf fleet resume` matches an idle agent's
+  // pane against. Seed-if-absent + never clobber (same operator-curated posture
+  // as prompt-responses): signature strings are best-effort across Claude Code
+  // versions, so re-running init/update only validates an existing file.
+  reportSeedStallSignatures(seedStallSignaturesConfig(absDir));
 
   // Install the attribution-trap PreToolUse hook entry in
   // .claude/settings.json (merge-preserving). Per #140, structurally

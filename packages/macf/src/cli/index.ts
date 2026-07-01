@@ -14,6 +14,8 @@ import { runFleetStatus } from './commands/fleet.js';
 import { runFleetDoctor } from './commands/fleet-doctor.js';
 import { runFleetInstallCronCommand, DEFAULT_SCHEDULE } from './commands/fleet-install-cron.js';
 import { runFleetReconcileCommand } from './commands/fleet-reconcile.js';
+import { runFleetResumeCommand } from './commands/fleet-resume.js';
+import { runFleetUpgrade } from './commands/fleet-upgrade.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { runRestartSelfCommand } from './commands/restart-self.js';
@@ -377,6 +379,60 @@ fleet
       heartbeatFile: opts.heartbeatFile,
       json: opts.json,
     });
+  });
+
+fleet
+  .command('resume')
+  .description(
+    'Nudge a STALLED idle agent to continue, or REPORT a BLOCKED one — DR-037 / ' +
+    'macf#686, porting devops-toolkit fleet/resume.sh + stall-signatures.json. An idle ' +
+    'agent is one of three things and only its pane tells them apart: idle-CLEAN (no ' +
+    'signature) → never touched; idle-STALLED (rate-limit/turn-abort) → NUDGE (resume ' +
+    'the SAME session, preserving work); idle-BLOCKED (permission/trust/skill/memory ' +
+    'prompt) → REPORT (a durable operator alert, NEVER auto-answered — an authorization ' +
+    'decision needs a human, DR-033). SAFETY: allowlist-only (never a blind nudge), ' +
+    'idle-gated (never interrupt a busy agent), verify-resumed (a nudge that does not ' +
+    'take → back off, don\'t re-spam), fire-capped per episode. The allowlist lives in ' +
+    '.claude/.macf/stall-signatures.json (operator-tunable). DRY-RUN BY DEFAULT — prints ' +
+    'the plan; --execute nudges / raises alerts.',
+  )
+  .option('--execute', 'ACTUALLY nudge / raise alerts (else dry-run: print the plan)', false)
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    const code = await runFleetResumeCommand(resolveProjectDir(opts.dir), {
+      execute: Boolean(opts.execute),
+    });
+    process.exitCode = code;
+  });
+
+fleet
+  .command('upgrade')
+  .description(
+    'Rolling framework-version upgrade (DR-037 / macf#682). For each selected ' +
+    "fleet (a fleet == one registry), roll every agent whose RUNNING /health.version " +
+    'is behind TARGET, ONE AT A TIME: busy-gate (never interrupt a working agent — ' +
+    'skip+report, or --wait for idle) → macf update → restart-self → verify /health.version ' +
+    '== target (re-resolving the fresh restart-self endpoint) → next. A bad release HALTS ' +
+    'the roll (and stops later fleets) so it cannot brick the fleet. DRY-RUN by default ' +
+    '(prints the plan); --execute rolls. TARGET defaults to npm-latest of @groundnuty/macf.',
+  )
+  .option('--target <version>', 'Target framework version (default: npm-latest of @groundnuty/macf)')
+  .option('--fleet <names>', 'Comma-list of fleets (registries) to roll — multi-select, rolled fleet-by-fleet')
+  .option('--registry <ids>', 'Comma-list of registry identifiers to roll (same selector space as --fleet)')
+  .option('--execute', 'ACTUALLY roll the upgrade (default: dry-run — print the plan)', false)
+  .option('--wait', 'On a busy agent, poll for idle up to a bound instead of skipping', false)
+  .option('--verify-timeout <sec>', 'Per-agent verify-green budget, in seconds (default 120)', (v) => parseInt(v, 10))
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    const code = await runFleetUpgrade(resolveProjectDir(opts.dir), {
+      target: opts.target,
+      fleet: opts.fleet,
+      registry: opts.registry,
+      execute: opts.execute,
+      wait: opts.wait,
+      verifyTimeoutSec: opts.verifyTimeout,
+    });
+    process.exitCode = code;
   });
 
 const routing = program
