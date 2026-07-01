@@ -45,12 +45,14 @@ const WS_CODE: WorkspaceRecord = {
   agent: 'code-agent',
   workspace: '/w/macf',
   registry: 'groundnuty',
+  project: 'macf',
   versionPin: '0.2.41',
 };
 const WS_SCIENCE: WorkspaceRecord = {
   agent: 'science-agent',
   workspace: '/w/science',
   registry: 'groundnuty',
+  project: 'macf',
   versionPin: '0.2.41',
 };
 
@@ -213,10 +215,10 @@ describe('probe ↔ fleet status liveness parity', () => {
     // The `fleet upgrade` view: driver.probe() → planFleetUpgrade joined against
     // discovered members (routing labels). Members mirror the live substrate.
     const members: readonly WorkspaceRecord[] = [
-      { agent: 'auditor-agent', workspace: '/w/auditor', registry: 'groundnuty', versionPin: '0.2.44' },
-      { agent: 'code-agent', workspace: '/w/macf', registry: 'groundnuty', versionPin: '0.2.44' },
-      { agent: 'devops-agent', workspace: '/w/devops', registry: 'groundnuty', versionPin: '0.2.44' },
-      { agent: 'science-agent', workspace: '/w/science', registry: 'groundnuty', versionPin: '0.2.44' },
+      { agent: 'auditor-agent', workspace: '/w/auditor', registry: 'groundnuty', project: 'macf', versionPin: '0.2.44' },
+      { agent: 'code-agent', workspace: '/w/macf', registry: 'groundnuty', project: 'macf', versionPin: '0.2.44' },
+      { agent: 'devops-agent', workspace: '/w/devops', registry: 'groundnuty', project: 'macf', versionPin: '0.2.44' },
+      { agent: 'science-agent', workspace: '/w/science', registry: 'groundnuty', project: 'macf', versionPin: '0.2.44' },
     ];
     const { seams } = fakeSeams({ workspaces: members, peers, health });
     const state = await createVmDriver(OPTS, seams).probe();

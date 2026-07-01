@@ -67,8 +67,8 @@ describe('defaultHeartbeatPath', () => {
 // --- desired resolution -----------------------------------------------------
 
 const WS: WorkspaceRecord[] = [
-  { agent: 'devops-agent', workspace: '/w/devops', registry: 'groundnuty', versionPin: '0.2.41' },
-  { agent: 'code-agent', workspace: '/w/macf', registry: 'groundnuty', versionPin: '0.2.41' },
+  { agent: 'devops-agent', workspace: '/w/devops', registry: 'groundnuty', project: 'macf', versionPin: '0.2.41' },
+  { agent: 'code-agent', workspace: '/w/macf', registry: 'groundnuty', project: 'macf', versionPin: '0.2.41' },
 ];
 
 function stubDriver(workspaces: readonly WorkspaceRecord[]): FleetDriver {

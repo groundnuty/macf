@@ -47,8 +47,14 @@ function mkState(rows: readonly [string, string | null, boolean?][]): FleetState
   };
 }
 
-function mkWs(agent: string, registry: string, pin: string | null): WorkspaceRecord {
-  return { agent, workspace: `/w/${agent}`, registry, versionPin: pin };
+/**
+ * `project` is the fleet-grouping key (macf#710) — the fixture's `fleet` param
+ * feeds it directly (a distinct `registry` value is set alongside so the
+ * two-fields-can-diverge shape mirrors production and any test that DOES want
+ * to exercise a same-registry / different-project split can supply its own).
+ */
+function mkWs(agent: string, fleet: string, pin: string | null): WorkspaceRecord {
+  return { agent, workspace: `/w/${agent}`, registry: fleet, project: fleet, versionPin: pin };
 }
 
 interface DriverCalls {
@@ -140,9 +146,37 @@ describe('planFleetUpgrade', () => {
     expect(plans[0]!.disposition).toBe('offline');
   });
 
-  it('carries the fleet (registry) + on-disk pin through', () => {
+  it('carries the fleet (project, macf#710) + on-disk pin through', () => {
     const plans = planFleetUpgrade([mkWs('a', 'acme/repo', '0.2.40')], mkState([['a', '0.2.40']]), '0.2.41');
     expect(plans[0]).toMatchObject({ fleet: 'acme/repo', pinnedVersion: '0.2.40', runningVersion: '0.2.40' });
+  });
+
+  it('groups by PROJECT, not registry: two projects sharing one registry scope do NOT collide', () => {
+    // The macf#710 regression shape: two workspaces share the same `registry`
+    // (e.g. both `groundnuty` profile-scoped) but belong to DIFFERENT projects.
+    // `planFleetUpgrade`'s `fleet` output must key on `project`, so a caller
+    // filtering members by `r.project === fleet` (as `upgradeFleets` does)
+    // correctly separates them into two fleets.
+    const macfMember: WorkspaceRecord = {
+      agent: 'code-agent',
+      workspace: '/w/macf',
+      registry: 'groundnuty',
+      project: 'macf',
+      versionPin: '0.2.40',
+    };
+    const icsocMember: WorkspaceRecord = {
+      agent: 'icsoc-agent',
+      workspace: '/w/icsoc',
+      registry: 'groundnuty',
+      project: 'icsoc_2026',
+      versionPin: '0.2.40',
+    };
+    const state = mkState([
+      ['code-agent', '0.2.40'],
+      ['icsoc-agent', '0.2.40'],
+    ]);
+    const plans = planFleetUpgrade([macfMember, icsocMember], state, '0.2.41');
+    expect(plans.map((p) => p.fleet)).toEqual(['macf', 'icsoc_2026']);
   });
 });
 

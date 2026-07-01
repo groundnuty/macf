@@ -27,7 +27,7 @@ describe('FleetDriverError', () => {
 describe('FleetDriver structural contract', () => {
   it('a minimal object satisfies the interface + its verbs are callable', async () => {
     const records: readonly WorkspaceRecord[] = [
-      { agent: 'code-agent', workspace: '/w/macf', registry: 'groundnuty', versionPin: '0.2.41' },
+      { agent: 'code-agent', workspace: '/w/macf', registry: 'groundnuty', project: 'macf', versionPin: '0.2.41' },
     ];
     const state: FleetState = { agents: [] };
     const calls: string[] = [];

@@ -70,7 +70,7 @@ function build(
     counts: new Map(), cleared: [], isBusyCalls: new Map(),
   };
   const records: WorkspaceRecord[] = Object.keys(agents).map((name) => ({
-    agent: name, workspace: `/w/${name}`, registry: 'groundnuty', versionPin: null,
+    agent: name, workspace: `/w/${name}`, registry: 'groundnuty', project: 'macf', versionPin: null,
   }));
   const driver: FleetDriver = {
     probe: async (): Promise<FleetState> => ({ agents: [] }),
