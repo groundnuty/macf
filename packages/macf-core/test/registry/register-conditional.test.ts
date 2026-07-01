@@ -105,6 +105,7 @@ describe('createRegistry().registerConditional (GitHub backend)', () => {
     const result = await registry.registerConditional('code_agent', AGENT_A, null);
 
     expect(result.ok).toBe(true);
+    expect(result.reason).toBe('claimed');
     expect(result.current).toEqual(AGENT_A);
     expect(client.writeVariable).toHaveBeenCalledWith(
       'MACF_AGENT_CODE_AGENT',
@@ -121,6 +122,7 @@ describe('createRegistry().registerConditional (GitHub backend)', () => {
     const result = await registry.registerConditional('code_agent', AGENT_A, PREVIOUS);
 
     expect(result.ok).toBe(true);
+    expect(result.reason).toBe('claimed');
     expect(client.writeVariable).toHaveBeenCalledTimes(1);
   });
 
@@ -132,14 +134,16 @@ describe('createRegistry().registerConditional (GitHub backend)', () => {
     const result = await registry.registerConditional('code_agent', AGENT_A, null);
 
     expect(result.ok).toBe(false);
+    expect(result.reason).toBe('lost-to-newer');
     expect(result.current).toEqual(AGENT_B);
     expect(client.writeVariable).not.toHaveBeenCalled();
   });
 
-  it('detects a racer that wrote inside the residual window (post-write read-back fails)', async () => {
+  it('detects a racer that wrote inside the residual window (post-write read-back shows a DIFFERENT instance)', async () => {
     // pre-write read matches expected (PREVIOUS), so we write — but the
-    // read-back shows a DIFFERENT instance: a concurrent newer instance wrote
-    // between our compare and our write. We must report ok:false, not claim it.
+    // read-back shows a DIFFERENT instance that is neither ours NOR the
+    // expected pre-write value: a concurrent newer instance wrote between our
+    // compare and our write. That is a real lost race, not a read-lag artifact.
     vi.mocked(client.readVariable)
       .mockResolvedValueOnce(JSON.stringify(PREVIOUS)) // pre-write compare OK
       .mockResolvedValueOnce(JSON.stringify(AGENT_B)); // read-back: someone else's
@@ -148,7 +152,65 @@ describe('createRegistry().registerConditional (GitHub backend)', () => {
     const result = await registry.registerConditional('code_agent', AGENT_A, PREVIOUS);
 
     expect(result.ok).toBe(false);
+    expect(result.reason).toBe('lost-to-newer');
     expect(result.current).toEqual(AGENT_B);
+  });
+
+  // --- groundnuty/macf#702 over-register: read-after-write lag must NOT abort ---
+
+  it('DEVOPS REGRESSION: current==expected==<stale> claims even when the read-back LAGS (never lost-to-newer)', async () => {
+    // The exact devops 8h-outage shape: the collision check decided to take
+    // over the stale/dead PREVIOUS entry; the pre-write compare finds it
+    // unchanged (current==expected==PREVIOUS) → we write; but the GitHub
+    // Variables API's read-after-write lag serves the STALE PREVIOUS value on
+    // EVERY read-back retry (never catches up within the budget). Pre-#702
+    // this returned ok:false (mistaking the lag for a lost race) → the agent
+    // aborted with AGENT_REGISTER_RACE and stayed DOWN. Post-#702 it must
+    // trust the write it issued and claim.
+    vi.mocked(client.readVariable)
+      .mockResolvedValueOnce(JSON.stringify(PREVIOUS)) // pre-write compare OK
+      .mockResolvedValue(JSON.stringify(PREVIOUS)); // EVERY read-back lags (stale)
+
+    const registry = createRegistry(client, PROJECT);
+    const result = await registry.registerConditional('code_agent', AGENT_A, PREVIOUS);
+
+    expect(result.ok).toBe(true);
+    expect(result.reason).toBe('claimed');
+    expect(result.current).toEqual(AGENT_A);
+    // We DID issue the write — a lagging read-back must not un-write it.
+    expect(client.writeVariable).toHaveBeenCalledTimes(1);
+  });
+
+  it('claims when the read-back lags but EVENTUALLY confirms our write (lag resolves within the retry budget)', async () => {
+    // Write succeeds; first read-back still shows the stale PREVIOUS (lag),
+    // second read-back catches up and shows OURS. Claim, no error.
+    vi.mocked(client.readVariable)
+      .mockResolvedValueOnce(JSON.stringify(PREVIOUS)) // pre-write compare OK
+      .mockResolvedValueOnce(JSON.stringify(PREVIOUS)) // read-back #1: lagging
+      .mockResolvedValueOnce(JSON.stringify(AGENT_A)); // read-back #2: confirmed
+
+    const registry = createRegistry(client, PROJECT);
+    const result = await registry.registerConditional('code_agent', AGENT_A, PREVIOUS);
+
+    expect(result.ok).toBe(true);
+    expect(result.reason).toBe('claimed');
+    expect(result.current).toEqual(AGENT_A);
+  });
+
+  it('claims against an expected-absent slot even when the read-back reads null forever (propagation lag)', async () => {
+    // Fresh register (expected=null): pre-write null (matches), write, but the
+    // read-back never shows our write (stays null / propagation lag). The
+    // write itself did not error → trust it, claim.
+    vi.mocked(client.readVariable)
+      .mockResolvedValueOnce(null) // pre-write compare OK (absent as expected)
+      .mockResolvedValue(null); // read-back never propagates
+
+    const registry = createRegistry(client, PROJECT);
+    const result = await registry.registerConditional('code_agent', AGENT_A, null);
+
+    expect(result.ok).toBe(true);
+    expect(result.reason).toBe('claimed');
+    expect(result.current).toEqual(AGENT_A);
   });
 });
 
@@ -185,6 +247,7 @@ describe('createLocalRegistry().registerConditional (local backend)', () => {
       const result = await registry.registerConditional('code-agent', AGENT_A, null);
 
       expect(result.ok).toBe(true);
+      expect(result.reason).toBe('claimed');
       expect(await registry.get('code-agent')).toEqual(AGENT_A);
     } finally {
       await cleanup(sb);
@@ -199,6 +262,7 @@ describe('createLocalRegistry().registerConditional (local backend)', () => {
       const result = await registry.registerConditional('code-agent', AGENT_A, null);
 
       expect(result.ok).toBe(false);
+      expect(result.reason).toBe('lost-to-newer');
       expect(result.current).toEqual(AGENT_B);
       // The existing registration is untouched (no silent clobber).
       expect(await registry.get('code-agent')).toEqual(AGENT_B);
@@ -215,6 +279,26 @@ describe('createLocalRegistry().registerConditional (local backend)', () => {
       const result = await registry.registerConditional('code-agent', AGENT_A, PREVIOUS);
 
       expect(result.ok).toBe(true);
+      expect(result.reason).toBe('claimed');
+      expect(await registry.get('code-agent')).toEqual(AGENT_A);
+    } finally {
+      await cleanup(sb);
+    }
+  });
+
+  it('DEVOPS REGRESSION (local backend): current==expected==<stale> claims (atomic — no lag, always claims)', async () => {
+    // On the local backend the compare+write is lock-atomic so there is no
+    // read-after-write lag to distinguish, but the invariant is identical to
+    // the GitHub backend's #702 fix: current==expected==<stale> ALWAYS claims,
+    // never returns lost-to-newer. Seed the stale entry as the takeover target.
+    const sb = makeSandbox();
+    try {
+      seed(sb, { 'code-agent': PREVIOUS });
+      const registry = createLocalRegistry({ path: sb.filePath, project: PROJECT });
+      const result = await registry.registerConditional('code-agent', AGENT_A, PREVIOUS);
+
+      expect(result.ok).toBe(true);
+      expect(result.reason).toBe('claimed');
       expect(await registry.get('code-agent')).toEqual(AGENT_A);
     } finally {
       await cleanup(sb);
@@ -230,6 +314,7 @@ describe('createLocalRegistry().registerConditional (local backend)', () => {
       const result = await registry.registerConditional('code-agent', AGENT_A, PREVIOUS);
 
       expect(result.ok).toBe(false);
+      expect(result.reason).toBe('lost-to-newer');
       expect(result.current).toEqual(AGENT_B);
       expect(await registry.get('code-agent')).toEqual(AGENT_B);
     } finally {

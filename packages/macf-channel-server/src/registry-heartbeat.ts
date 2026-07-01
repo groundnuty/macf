@@ -2,13 +2,25 @@ import type { Registry, Logger } from '@groundnuty/macf-core';
 import { DEFAULT_REGISTRY_HEARTBEAT_INTERVAL_MS } from '@groundnuty/macf-core';
 
 /**
- * Periodic registry heartbeat (DR-031, groundnuty/macf#568).
+ * Periodic registry heartbeat (DR-031, groundnuty/macf#568) — also the
+ * split-brain guard's DETECTION half (groundnuty/macf#702 over-register).
  *
  * The live channel-server instance re-stamps `last_heartbeat` on its OWN registry
  * slot on a coarse interval so a reader can TTL-judge an aged-out entry dead. This
  * is the backstop for the UNGRACEFUL death (kill -9 / OOM / power loss) that never
  * runs the graceful-deregister (#586) shutdown handler — together they close the
  * stale-registration class.
+ *
+ * **Loser-yields (macf#702 split-brain guard):** the heartbeat is
+ * instance-id-guarded — when a NEWER instance over-registers the slot
+ * (last-writer-wins), the older/displaced instance's next beat reads a
+ * different `instance_id` and `heartbeatConditional` returns `'not-ours'`. On
+ * that signal this instance is no longer the slot's owner, so it must STAND
+ * DOWN — stop serving — leaving exactly one live instance registered. The
+ * caller wires `onDisplaced` to the graceful-shutdown cleanup. A brief
+ * two-serving window (bounded by one heartbeat cadence) is acceptable; a
+ * PERMANENT split-brain is not, and this closes it without depending on the
+ * displaced instance having been signalled/killed externally.
  *
  * Lifecycle MIRRORS `createOtelReachabilityProbe` (health.ts): an `unref()`'d
  * `setInterval` that never pins the event loop open, plus an explicit `stop()`
@@ -59,11 +71,24 @@ export function createRegistryHeartbeat(opts: {
   readonly intervalMs?: number;
   /** Injectable ISO-8601 clock (testing); default `() => new Date().toISOString()`. */
   readonly now?: () => string;
+  /**
+   * Split-brain guard (macf#702 loser-yields). Invoked ONCE when a beat
+   * observes `'not-ours'` — a NEWER instance has over-registered the slot, so
+   * THIS (older/displaced) instance must stand down. The caller wires this to
+   * the graceful-shutdown cleanup so the displaced instance stops serving,
+   * leaving exactly one live instance. Best-effort + fire-once: any throw from
+   * the callback is swallowed (a stand-down hiccup must not crash the tick),
+   * and the periodic interval is cleared so we don't re-fire it every cadence.
+   * Omitted → the heartbeat only logs the displacement (pre-#702 behaviour),
+   * which is what tests that don't exercise the guard use.
+   */
+  readonly onDisplaced?: (current: { readonly instanceId: string } | null) => void;
 }): RegistryHeartbeat {
   const { registry, agentName, instanceId, logger } = opts;
   const intervalMs = opts.intervalMs ?? DEFAULT_REGISTRY_HEARTBEAT_INTERVAL_MS;
   const now = opts.now ?? ((): string => new Date().toISOString());
   let timer: ReturnType<typeof setInterval> | null = null;
+  let displacedFired = false;
 
   async function runOnce(): Promise<void> {
     try {
@@ -71,14 +96,31 @@ export function createRegistryHeartbeat(opts: {
       if (result.beat) {
         logger.info('registry_heartbeat', { agent: agentName, instance_id: instanceId });
       } else if (result.reason === 'not-ours') {
-        // A newer instance (groundnuty/macf#424) took over our slot — leave it
-        // alone (it heartbeats its own entry). Not a failure.
-        logger.info('registry_heartbeat_skipped', {
+        // A NEWER instance over-registered our slot (macf#702 last-writer-wins,
+        // or the #424 version takeover). We are the DISPLACED instance and must
+        // stand down (loser-yields split-brain guard) — leaving it alone AND
+        // stopping our own serving so only one live instance remains.
+        logger.warn('registry_heartbeat_displaced', {
           agent: agentName,
           instance_id: instanceId,
           reason: result.reason,
-          detail: 'registry slot held by a different instance — not ours to re-stamp (DR-031, #424)',
+          detail: 'a newer instance holds the slot — standing down (macf#702 loser-yields)',
         });
+        if (opts.onDisplaced !== undefined && !displacedFired) {
+          displacedFired = true;
+          // Clear our own interval first so we don't re-fire the stand-down
+          // every cadence while shutdown is in flight.
+          stopTimer();
+          try {
+            opts.onDisplaced(null);
+          } catch (err) {
+            logger.warn('registry_heartbeat_displaced_callback_failed', {
+              agent: agentName,
+              instance_id: instanceId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
       } else if (result.reason === 'absent') {
         logger.info('registry_heartbeat_skipped', {
           agent: agentName,
@@ -106,6 +148,13 @@ export function createRegistryHeartbeat(opts: {
     }
   }
 
+  function stopTimer(): void {
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+
   return {
     runOnce,
     start(): void {
@@ -117,11 +166,6 @@ export function createRegistryHeartbeat(opts: {
       // Don't let the heartbeat interval pin the event loop open on shutdown.
       timer.unref();
     },
-    stop(): void {
-      if (timer !== null) {
-        clearInterval(timer);
-        timer = null;
-      }
-    },
+    stop: stopTimer,
   };
 }

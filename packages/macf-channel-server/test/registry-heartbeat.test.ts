@@ -97,7 +97,11 @@ describe('createRegistryHeartbeat', () => {
     );
   });
 
-  it('logs a skip (not a failure) when a newer instance owns the slot (not-ours)', async () => {
+  it('warns "displaced" (not a failure) when a newer instance owns the slot (not-ours), no onDisplaced', async () => {
+    // macf#702: not-ours now warns registry_heartbeat_displaced (the older
+    // instance recognizes it was over-registered). Without an onDisplaced
+    // callback it only logs — no stand-down (pre-#702 behaviour, used by
+    // callers/tests that don't wire the guard).
     const logger = mockLogger();
     const hb = createRegistryHeartbeat({
       registry: mockRegistry({ beat: false, reason: 'not-ours' }),
@@ -109,11 +113,82 @@ describe('createRegistryHeartbeat', () => {
 
     await hb.runOnce();
 
-    expect(logger.info).toHaveBeenCalledWith(
-      'registry_heartbeat_skipped',
+    expect(logger.warn).toHaveBeenCalledWith(
+      'registry_heartbeat_displaced',
       expect.objectContaining({ reason: 'not-ours' }),
     );
-    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  // --- macf#702 loser-yields split-brain guard ---
+
+  it('SPLIT-BRAIN GUARD: fires onDisplaced (stand-down) exactly once when over-registered (not-ours)', async () => {
+    const logger = mockLogger();
+    const onDisplaced = vi.fn();
+    const hb = createRegistryHeartbeat({
+      registry: mockRegistry({ beat: false, reason: 'not-ours' }),
+      agentName: AGENT,
+      instanceId: INSTANCE_ID,
+      logger,
+      now: () => NOW,
+      onDisplaced,
+    });
+
+    // Two beats both see not-ours; the guard must fire the stand-down ONCE.
+    await hb.runOnce();
+    await hb.runOnce();
+
+    expect(onDisplaced).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'registry_heartbeat_displaced',
+      expect.objectContaining({ reason: 'not-ours' }),
+    );
+  });
+
+  it('SPLIT-BRAIN GUARD: a THROWN onDisplaced is swallowed (a stand-down hiccup never crashes the tick)', async () => {
+    const logger = mockLogger();
+    const onDisplaced = vi.fn(() => {
+      throw new Error('stand-down boom');
+    });
+    const hb = createRegistryHeartbeat({
+      registry: mockRegistry({ beat: false, reason: 'not-ours' }),
+      agentName: AGENT,
+      instanceId: INSTANCE_ID,
+      logger,
+      now: () => NOW,
+      onDisplaced,
+    });
+
+    await expect(hb.runOnce()).resolves.toBeUndefined();
+    expect(onDisplaced).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'registry_heartbeat_displaced_callback_failed',
+      expect.objectContaining({ error: 'stand-down boom' }),
+    );
+  });
+
+  it('SPLIT-BRAIN GUARD: does NOT fire onDisplaced on a healthy beat (beat) or a benign absent slot', async () => {
+    const onDisplaced = vi.fn();
+    const beatHb = createRegistryHeartbeat({
+      registry: mockRegistry({ beat: true, reason: 'beat' }),
+      agentName: AGENT,
+      instanceId: INSTANCE_ID,
+      logger: mockLogger(),
+      now: () => NOW,
+      onDisplaced,
+    });
+    const absentHb = createRegistryHeartbeat({
+      registry: mockRegistry({ beat: false, reason: 'absent' }),
+      agentName: AGENT,
+      instanceId: INSTANCE_ID,
+      logger: mockLogger(),
+      now: () => NOW,
+      onDisplaced,
+    });
+
+    await beatHb.runOnce();
+    await absentHb.runOnce();
+
+    expect(onDisplaced).not.toHaveBeenCalled();
   });
 
   it('logs a skip when the slot is absent', async () => {

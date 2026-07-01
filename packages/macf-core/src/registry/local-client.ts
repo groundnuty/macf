@@ -322,13 +322,19 @@ export function createLocalRegistry(
       });
     },
 
-    // CAS register (groundnuty/macf#439). Fully atomic for the local backend:
-    // the read (current slot), the compare against `expected`, and the write
-    // all happen inside the same `withLock` critical section, so a racing
-    // second writer is serialized behind the lock and observes the first
-    // writer's value — failing the compare and backing off (ok:false). No
-    // read-back verify is needed (unlike the GitHub backend), because the lock
-    // makes the compare-then-write indivisible.
+    // CAS register (groundnuty/macf#439; over-register semantics per
+    // groundnuty/macf#702). Fully atomic for the local backend: the read
+    // (current slot), the compare against `expected`, and the write all
+    // happen inside the same `withLock` critical section, so a racing second
+    // writer is serialized behind the lock and observes the first writer's
+    // value — failing the compare and backing off (`ok:false,
+    // reason:'lost-to-newer'`). No read-back verify is needed (unlike the
+    // GitHub backend, whose read-after-write lag motivated #702's retry
+    // logic) — the lock makes the compare-then-write indivisible, so there is
+    // no confirmation-gap distinct from a real conflict on this backend:
+    // `current == expected` (including a stale/unchanged entry the caller is
+    // taking over) ALWAYS claims (`ok:true, reason:'claimed'`); any other
+    // `current` is a genuine concurrent writer (`reason:'lost-to-newer'`).
     async registerConditional(
       name: string,
       info: AgentInfo,
@@ -340,7 +346,7 @@ export function createLocalRegistry(
         const existing = await readRegistryFile(options.path);
         const current = existing?.agents[name] ?? null;
         if (!agentInfoEquals(current, expected)) {
-          return { ok: false, current };
+          return { ok: false, reason: 'lost-to-newer', current };
         }
 
         const file: RegistryFile = existing ?? emptyRegistry(options.project);
@@ -350,7 +356,7 @@ export function createLocalRegistry(
           agents: { ...file.agents, [name]: validated },
         };
         await writeRegistryFileAtomic(options.path, next);
-        return { ok: true, current: validated };
+        return { ok: true, reason: 'claimed', current: validated };
       });
     },
 
