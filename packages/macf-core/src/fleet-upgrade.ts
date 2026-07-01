@@ -139,6 +139,16 @@ export interface AgentRollResult {
  * Amendment table). Deliberately excludes macf-managed/regenerated files
  * (`env.*` canonical seven, `host-prelude.sh`) — those are SUPPOSED to change
  * under `macf update`; dirtiness there is not an operator-authored conflict.
+ *
+ * NOTE (macf#724 review): this stash-guard set is intentionally a slight
+ * SUPERSET of DR-029's *regenerate*-boundary for `claude.sh`. The two answer
+ * DIFFERENT questions — the stash-guard: "should `restart-self` STASH this
+ * uncommitted change?"; DR-029's header-conditional rule: "should `macf update`
+ * REGENERATE this file?". So do NOT "align" `claude.sh` here to DR-029's
+ * header-conditional form: that would reintroduce the stash-a-dirty-managed-
+ * `claude.sh` hole (a dirty managed launcher would then be silently stashed →
+ * relaunched-wrong). Unconditional here is harmless when clean (nothing to
+ * stash) and protective when dirty, regardless of header.
  */
 export const OPERATOR_PRESERVED_CONFIG_PATTERNS = [
   '.claude/**',
