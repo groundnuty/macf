@@ -206,6 +206,23 @@ export function scanMacfProcesses(reader: ProcReader): readonly MacfProcess[] {
   return [...out].sort(compareProcesses);
 }
 
+/**
+ * Read `<pkgRoot>/package.json`'s `version` from the real filesystem (macf#682).
+ * Shared by the Linux `/proc` reader and the macOS reader — the package-version
+ * source is filesystem-portable (only the process-liveness read is OS-specific).
+ * Returns `null` on any failure (missing file, bad JSON, absent/empty version).
+ */
+export function readPkgVersionFs(pkgRoot: string): string | null {
+  try {
+    const pkg = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf-8')) as {
+      version?: unknown;
+    };
+    return typeof pkg.version === 'string' && pkg.version.length > 0 ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Stable ordering: cwd (nulls last) → kind → numeric pid. */
 function compareProcesses(a: MacfProcess, b: MacfProcess): number {
   const ca = a.cwd ?? '￿';
@@ -249,14 +266,5 @@ export const defaultProcReader: ProcReader = {
       return null;
     }
   },
-  readPkgVersion: (pkgRoot) => {
-    try {
-      const pkg = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf-8')) as {
-        version?: unknown;
-      };
-      return typeof pkg.version === 'string' && pkg.version.length > 0 ? pkg.version : null;
-    } catch {
-      return null;
-    }
-  },
+  readPkgVersion: readPkgVersionFs,
 };
