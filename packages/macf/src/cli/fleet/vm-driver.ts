@@ -24,6 +24,7 @@ import { join } from 'node:path';
 import {
   FleetDriverError,
   createRegistryFromConfig,
+  fromVariableSegment,
   generateToken,
   pingAgentHealth,
   toVariableSegment,
@@ -103,12 +104,28 @@ export interface VmDriverOptions {
   readonly launcher?: string;
 }
 
-/** Map `gatherFleetStatus` rows into the portable `FleetState` (version pulled up). */
+/**
+ * Map `gatherFleetStatus` rows into the portable `FleetState` (version pulled up).
+ *
+ * CRITICAL name-form normalization (macf#708): `gatherFleetStatus` sources its
+ * `name` from `registry.list('')`, which returns the GitHub-Variables-canonical
+ * registry-key SEGMENT (`CODE_AGENT`, `SCIENCE_AGENT` — uppercased, hyphens→`_`).
+ * But the `FleetDriver` contract documents `FleetAgentState.name` as the **routing
+ * label** (`code-agent`, `science-agent`), and every decision-layer consumer joins
+ * on it that way: `planFleetUpgrade` keys `byName` on it, `fleet-reconcile` does
+ * `state.agents.find(a => a.name === agent)`, and the CLI verify-green probe does
+ * the same — all against a `WorkspaceRecord.agent` / `DesiredAgent.agent` which is
+ * the kebab routing label. Passing the SCREAMING_SNAKE form straight through made
+ * EVERY join miss, so `fleet upgrade`/`reconcile` false-negatived every alive agent
+ * as `offline` even though `fleet status` (which never cross-matches) showed them
+ * online. Normalize back to the routing-label form here (idempotent on already-kebab
+ * input) so the driver HONORS its interface contract and the joins can't drift.
+ */
 function toFleetState(
   statuses: readonly { readonly name: string; readonly host: string; readonly port: number; readonly online: boolean; readonly health: HealthResponse | null }[],
 ): FleetState {
   const agents: FleetAgentState[] = statuses.map((s) => ({
-    name: s.name,
+    name: fromVariableSegment(s.name),
     host: s.host,
     port: s.port,
     online: s.online,

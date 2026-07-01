@@ -13,7 +13,7 @@
  *   - resolveTarget: <project>@<routing-label> derivation + routing-label fallback.
  */
 import { describe, it, expect } from 'vitest';
-import { FleetDriverError } from '@groundnuty/macf-core';
+import { FleetDriverError, planFleetUpgrade } from '@groundnuty/macf-core';
 import type { AgentInfo, HealthResponse, WorkspaceRecord } from '@groundnuty/macf-core';
 import {
   createVmDriver,
@@ -21,6 +21,7 @@ import {
   type VmDriverSeams,
   type WorkspaceIdentity,
 } from '../../../src/cli/fleet/vm-driver.js';
+import { gatherFleetStatus } from '../../../src/cli/commands/fleet.js';
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -160,6 +161,89 @@ describe('probe', () => {
         health: mkHealth('0.2.41'),
       },
       { name: 'science-agent', host: 'h2', port: 4001, online: false, version: null, health: null },
+    ]);
+  });
+
+  it('normalizes the registry-listed SCREAMING_SNAKE name back to the routing label (macf#708)', async () => {
+    // The real GitHub-Variables registry lists agents by their variable SEGMENT
+    // (`CODE_AGENT`, `SCIENCE_AGENT`) — the form `registry.list('')` returns via
+    // `v.name.slice(prefix.length)`. The `FleetAgentState.name` contract is the
+    // kebab routing label, and every decision-layer join keys on it that way. The
+    // driver MUST normalize, or every join misses (the #708 false-negative).
+    const { seams } = fakeSeams({
+      peers: [
+        { name: 'CODE_AGENT', info: mkInfo('h1', 4000) },
+        { name: 'SCIENCE_AGENT', info: mkInfo('h2', 4001) },
+      ],
+      health: async () => mkHealth('0.2.44'),
+    });
+    const state = await createVmDriver(OPTS, seams).probe();
+    expect(state.agents.map((a) => a.name)).toEqual(['code-agent', 'science-agent']);
+    expect(state.agents.every((a) => a.online)).toBe(true);
+  });
+});
+
+// --- probe/fleet-status parity (macf#708 regression) ------------------------
+
+describe('probe ↔ fleet status liveness parity', () => {
+  // The #708 bug: `fleet upgrade`/`reconcile` cross-match `driver.probe()`'s
+  // agents (by name) against discovered `WorkspaceRecord`s (routing labels) to
+  // classify liveness, while `fleet status` renders `gatherFleetStatus` rows
+  // directly and never cross-matches. When the registry lists names as
+  // SCREAMING_SNAKE, the un-normalized join missed EVERY agent → alive agents
+  // classified `offline` and the whole roll skipped. This asserts the two views
+  // agree on the ONLINE set for the SAME registry roster — they cannot diverge.
+  it('classifies the same alive set as fleet status (the alive-→-offline guard)', async () => {
+    // Registry roster in the REAL screaming-snake form + a genuinely-down member.
+    const peers = [
+      { name: 'AUDITOR_AGENT', info: mkInfo('h1', 8920) },
+      { name: 'CODE_AGENT', info: mkInfo('h2', 8921) }, // genuinely down (#702)
+      { name: 'DEVOPS_AGENT', info: mkInfo('h3', 8922) },
+      { name: 'SCIENCE_AGENT', info: mkInfo('h4', 8923) },
+    ];
+    const health = async (host: string): Promise<HealthResponse | null> =>
+      host === 'h2' ? null : mkHealth('0.2.44');
+
+    // The `fleet status` view: gatherFleetStatus rows directly (its ONLINE set).
+    const statuses = await gatherFleetStatus(peers, health);
+    const statusOnline = new Set(
+      statuses.filter((s) => s.online).map((s) => s.name), // AUDITOR_AGENT, ...
+    );
+
+    // The `fleet upgrade` view: driver.probe() → planFleetUpgrade joined against
+    // discovered members (routing labels). Members mirror the live substrate.
+    const members: readonly WorkspaceRecord[] = [
+      { agent: 'auditor-agent', workspace: '/w/auditor', registry: 'groundnuty', versionPin: '0.2.44' },
+      { agent: 'code-agent', workspace: '/w/macf', registry: 'groundnuty', versionPin: '0.2.44' },
+      { agent: 'devops-agent', workspace: '/w/devops', registry: 'groundnuty', versionPin: '0.2.44' },
+      { agent: 'science-agent', workspace: '/w/science', registry: 'groundnuty', versionPin: '0.2.44' },
+    ];
+    const { seams } = fakeSeams({ workspaces: members, peers, health });
+    const state = await createVmDriver(OPTS, seams).probe();
+    // Target ABOVE the running version so a matched-online agent is `behind`
+    // (a real roll candidate) — never conflated with `offline`.
+    const plans = planFleetUpgrade(members, state, '0.2.99');
+    const planOnline = new Set(
+      plans.filter((p) => p.disposition !== 'offline').map((p) => p.agent),
+    );
+
+    // Parity: the two ONLINE sets are the SAME agents (modulo name form).
+    // Before the fix, planOnline was EMPTY (every join missed) while
+    // statusOnline had 3 — the exact alive-classified-offline divergence.
+    expect([...planOnline].sort()).toEqual(['auditor-agent', 'devops-agent', 'science-agent']);
+    expect([...statusOnline].map((n) => n.toLowerCase().replace(/_/g, '-')).sort()).toEqual([
+      'auditor-agent',
+      'devops-agent',
+      'science-agent',
+    ]);
+    // And the genuinely-down agent is offline in BOTH views.
+    expect(plans.find((p) => p.agent === 'code-agent')!.disposition).toBe('offline');
+    expect(statuses.find((s) => s.name === 'CODE_AGENT')!.online).toBe(false);
+    // Every alive member is a real roll candidate now (the roll is no longer a no-op).
+    expect(plans.filter((p) => p.disposition === 'behind').map((p) => p.agent).sort()).toEqual([
+      'auditor-agent',
+      'devops-agent',
+      'science-agent',
     ]);
   });
 });
