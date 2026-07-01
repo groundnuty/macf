@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, MACF_CHANNEL_ALIVE_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
 
 describe('installGhTokenHook', () => {
   let tmpRoot: string;
@@ -124,13 +124,15 @@ describe('installGhTokenHook', () => {
     installGhTokenHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    // SessionStart now carries the operator's hook PLUS the macf channels guard.
-    expect(s.hooks.SessionStart).toHaveLength(2);
+    // SessionStart now carries the operator's hook PLUS the macf channels
+    // guard PLUS the macf channel-alive guard (groundnuty/macf#734).
+    expect(s.hooks.SessionStart).toHaveLength(3);
     const sessionCmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
       e.hooks.map((h) => h.command),
     );
     expect(sessionCmds).toContain('./user-session-hook.sh');
     expect(sessionCmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
+    expect(sessionCmds).toContain(MACF_CHANNEL_ALIVE_HOOK_COMMAND);
     // Stop is not a MACF event → untouched.
     expect(s.hooks.Stop).toHaveLength(1);
     expect(s.hooks.PreToolUse[0].hooks[0].command).toBe(MACF_HOOK_COMMAND);
@@ -178,7 +180,9 @@ describe('installGhTokenHook', () => {
     installGhTokenHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    expect(s.hooks.UserPromptSubmit).toHaveLength(1);
+    // 2 MACF UserPromptSubmit entries: emit-turn-receipt.sh (async) +
+    // check-channel-alive.sh (groundnuty/macf#734, NOT async).
+    expect(s.hooks.UserPromptSubmit).toHaveLength(2);
     const entry = s.hooks.UserPromptSubmit[0];
     // UserPromptSubmit isn't tool-gated → no matcher (unlike the Bash PreToolUse hooks).
     expect(entry.matcher).toBeUndefined();
@@ -186,6 +190,21 @@ describe('installGhTokenHook', () => {
     expect(entry.hooks[0].command).toBe(MACF_TURN_RECEIPT_HOOK_COMMAND);
     // async so it never adds turn latency / can't block on a slow OTLP endpoint.
     expect(entry.hooks[0].async).toBe(true);
+  });
+
+  it('installs the UserPromptSubmit channel-alive guard (groundnuty/macf#734, NOT async)', () => {
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const entry = s.hooks.UserPromptSubmit.find(
+      (e: { hooks: { command: string }[] }) => e.hooks.some((h) => h.command === MACF_CHANNEL_ALIVE_HOOK_COMMAND),
+    );
+    expect(entry).toBeDefined();
+    expect(entry.matcher).toBeUndefined();
+    expect(entry.hooks[0].type).toBe('command');
+    // Deliberately NOT async — its value is injecting a LOUD warning into the
+    // CURRENT turn's context, which an async hook's stdout can't reliably do.
+    expect(entry.hooks[0].async).toBeUndefined();
   });
 
   it('MACF_TURN_RECEIPT_HOOK_COMMAND uses $CLAUDE_PROJECT_DIR (cwd-independent)', () => {
@@ -205,12 +224,14 @@ describe('installGhTokenHook', () => {
     installGhTokenHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    expect(s.hooks.UserPromptSubmit).toHaveLength(2);
+    // 1 operator hook + 2 MACF entries (turn-receipt + channel-alive).
+    expect(s.hooks.UserPromptSubmit).toHaveLength(3);
     const cmds = s.hooks.UserPromptSubmit.flatMap((e: { hooks: { command: string }[] }) =>
       e.hooks.map((h) => h.command),
     );
     expect(cmds).toContain('./my-ups-hook.sh');
     expect(cmds).toContain(MACF_TURN_RECEIPT_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_CHANNEL_ALIVE_HOOK_COMMAND);
   });
 
   it('UserPromptSubmit install is idempotent (no duplicate macf entry)', () => {
@@ -662,13 +683,30 @@ describe('installGhTokenHook', () => {
     installGhTokenHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    expect(s.hooks.SessionStart).toHaveLength(1);
-    const entry = s.hooks.SessionStart[0];
+    // 2 MACF SessionStart entries: check-channels-enabled.sh (#633) +
+    // check-channel-alive.sh (#734).
+    expect(s.hooks.SessionStart).toHaveLength(2);
+    const entry = s.hooks.SessionStart.find(
+      (e: { hooks: { command: string }[] }) => e.hooks.some((h) => h.command === MACF_CHANNELS_HOOK_COMMAND),
+    );
     // SessionStart isn't tool-gated → no matcher (like UserPromptSubmit/PreCompact).
     expect(entry.matcher).toBeUndefined();
     expect(entry.hooks[0].type).toBe('command');
     expect(entry.hooks[0].command).toBe(MACF_CHANNELS_HOOK_COMMAND);
     // NON-BLOCKING by script contract (always exit 0) → no async flag needed.
+    expect(entry.hooks[0].async).toBeUndefined();
+  });
+
+  it('installs the SessionStart channel-alive guard (groundnuty/macf#734, matcher-less, no async)', () => {
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const entry = s.hooks.SessionStart.find(
+      (e: { hooks: { command: string }[] }) => e.hooks.some((h) => h.command === MACF_CHANNEL_ALIVE_HOOK_COMMAND),
+    );
+    expect(entry).toBeDefined();
+    expect(entry.matcher).toBeUndefined();
+    expect(entry.hooks[0].type).toBe('command');
     expect(entry.hooks[0].async).toBeUndefined();
   });
 
@@ -683,12 +721,14 @@ describe('installGhTokenHook', () => {
     installGhTokenHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    expect(s.hooks.SessionStart).toHaveLength(2);
+    // 1 operator hook + 2 MACF entries (channels-guard + channel-alive).
+    expect(s.hooks.SessionStart).toHaveLength(3);
     const cmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
       e.hooks.map((h) => h.command),
     );
     expect(cmds).toContain('./my-session-hook.sh');
     expect(cmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_CHANNEL_ALIVE_HOOK_COMMAND);
   });
 
   it('SessionStart install is idempotent (no duplicate macf entry)', () => {
@@ -700,6 +740,10 @@ describe('installGhTokenHook', () => {
       e.hooks.some((h) => h.command.includes('check-channels-enabled.sh')),
     );
     expect(macfSession).toHaveLength(1);
+    const macfAlive = s.hooks.SessionStart.filter((e: { hooks: { command: string }[] }) =>
+      e.hooks.some((h) => h.command.includes('check-channel-alive.sh')),
+    );
+    expect(macfAlive).toHaveLength(1);
   });
 
   it('refreshes a stale MACF channels-guard entry (replaces by command-path match)', () => {
