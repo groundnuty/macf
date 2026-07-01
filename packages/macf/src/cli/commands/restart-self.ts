@@ -29,6 +29,7 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { OPERATOR_PRESERVED_CONFIG_PATTERNS } from '@groundnuty/macf-core';
 import { readAgentConfig } from '../config.js';
 import {
   backupSessionTranscript,
@@ -61,6 +62,16 @@ export interface StashResult {
 export interface RestartSelfDeps {
   readonly now: () => Date;
   readonly hasUncommittedTrackedChanges: () => boolean;
+  /**
+   * The matching half of `fleet-upgrade.ts`'s `isConfigDirty` pre-flight gate
+   * (macf#722 Fix B): `true` when there are uncommitted TRACKED changes on the
+   * DR-029 operator-preserved config surface specifically (a subset of
+   * `hasUncommittedTrackedChanges` — see `OPERATOR_PRESERVED_CONFIG_PATTERNS` in
+   * `@groundnuty/macf-core`'s `fleet-upgrade.ts`). Drives the stash-refusal
+   * guard: config-surface dirt refuses the whole restart (never stashes
+   * operator config) unless `--force` / `MACF_RESTART_STASH_CONFIG=1`.
+   */
+  readonly hasUncommittedConfigChanges: () => boolean;
   readonly currentBranch: () => string;
   readonly headSha: () => string;
   readonly stash: (label: string) => StashResult;
@@ -102,6 +113,14 @@ export interface RunRestartSelfOptions {
   /** Force dry-run even with `--confirm` (the safer of the two wins). */
   readonly dryRun: boolean;
   readonly json: boolean;
+  /**
+   * `--force` / `MACF_RESTART_STASH_CONFIG=1` (macf#722 Fix B): bypass the
+   * config-surface stash-refusal guard — proceed (and stash) even when the
+   * DR-029 operator-preserved config surface is dirty. Default false: the
+   * guard refuses the WHOLE restart (no stash/write/spawn/kill) rather than
+   * stash operator config underneath the caller.
+   */
+  readonly force: boolean;
 }
 
 /** The `--json` state-record (mirrors `fleet doctor`'s versioned shape). */
@@ -470,6 +489,23 @@ export async function runRestartSelf(
     return 0;
   }
 
+  // Config-surface stash-refusal guard (macf#722 Fix B) — CONFIRM-mode only;
+  // dry-run above already returned. Refuses the WHOLE restart (no
+  // stash/write/spawn/kill) when the DR-029 operator-preserved config surface
+  // is dirty, unless explicitly overridden. Never partially-proceeds (e.g.
+  // stashing only the non-config files) — that would still risk `macf update`
+  // clobbering config left dirty on disk mid-restart.
+  const forceStashConfig = opts.force || process.env['MACF_RESTART_STASH_CONFIG'] === '1';
+  if (!forceStashConfig && deps.hasUncommittedConfigChanges()) {
+    console.error(
+      'macf restart-self: refusing — uncommitted config-surface changes ' +
+        '(.claude/**, CLAUDE.md, claude.sh, env.local.*) would be stashed by a ' +
+        'restart. Commit them first, or pass --force / set ' +
+        'MACF_RESTART_STASH_CONFIG=1 to proceed anyway.',
+    );
+    return 1;
+  }
+
   // --- CONFIRM mode: prepare → backup → note → spawn → kill (each exactly once) ---
   deps.mkdirp(join(workspaceDir, MACF_DIR_REL));
 
@@ -560,6 +596,26 @@ export function createRealDeps(workspaceDir: string): RestartSelfDeps {
       const out = git(workspaceDir, ['status', '--porcelain', '--untracked-files=no']);
       return out.length > 0;
     },
+    hasUncommittedConfigChanges: () => {
+      // Same tracked-only predicate, scoped to the DR-029 operator-preserved
+      // config surface (macf#722 Fix B) — the matching guard to
+      // `fleet-upgrade.ts`'s `isConfigDirty` pre-flight gate.
+      try {
+        const out = git(workspaceDir, [
+          'status',
+          '--porcelain',
+          '--untracked-files=no',
+          '--',
+          ...OPERATOR_PRESERVED_CONFIG_PATTERNS,
+        ]);
+        return out.length > 0;
+      } catch {
+        // Not a git repo / git unavailable → fail-open (never block a restart
+        // on an inspection failure the surrounding tracked-changes check would
+        // have already surfaced via `hasUncommittedTrackedChanges` anyway).
+        return false;
+      }
+    },
     currentBranch: () => {
       try {
         return git(workspaceDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
@@ -624,6 +680,8 @@ export interface RestartSelfCliOptions {
   readonly confirm?: boolean;
   readonly dryRun?: boolean;
   readonly json?: boolean;
+  /** `--force` (macf#722 Fix B) — bypass the config-surface stash-refusal guard. */
+  readonly force?: boolean;
 }
 
 /**
@@ -668,6 +726,7 @@ export async function runRestartSelfCommand(
       confirm: cliOpts.confirm === true,
       dryRun: cliOpts.dryRun === true,
       json: cliOpts.json === true,
+      force: cliOpts.force === true,
     },
     deps,
   );

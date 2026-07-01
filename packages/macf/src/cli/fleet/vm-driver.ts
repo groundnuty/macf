@@ -23,6 +23,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import {
   FleetDriverError,
+  OPERATOR_PRESERVED_CONFIG_PATTERNS,
   createRegistryFromConfig,
   fromVariableSegment,
   generateToken,
@@ -86,6 +87,13 @@ export interface VmDriverSeams {
   readonly spawnDetached: (bin: string, args: readonly string[], cwd: string) => void;
   /** Sleep `ms` (injected so tests don't wait on the busy window). */
   readonly sleep: (ms: number) => Promise<void>;
+  /**
+   * The pre-flight config-dirty check (macf#722 Fix B) — `true` when
+   * `workspaceDir` has uncommitted TRACKED changes on the DR-029
+   * operator-preserved config surface (`OPERATOR_PRESERVED_CONFIG_PATTERNS`).
+   * Real impl: `git status --porcelain -- <patterns>` in `workspaceDir`.
+   */
+  readonly isConfigDirty: (workspaceDir: string) => boolean;
 }
 
 /** Construction options for `createVmDriver`. */
@@ -211,6 +219,13 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     return seams.capturePane(target.session);
   }
 
+  async function isConfigDirty(agent: string): Promise<boolean> {
+    const target = resolveTarget(seams, agent);
+    // Unknown agent → nothing to check (mirrors isBusy's dead/unknown → false).
+    if (!target) return false;
+    return seams.isConfigDirty(target.workspace);
+  }
+
   async function upgrade(agent: string): Promise<void> {
     const target = requireTarget(agent);
     seams.exec(macfBin, ['update', '--yes'], target.workspace);
@@ -222,12 +237,18 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     seams.spawnDetached(launcher, [], target.workspace);
   }
 
-  async function restart(agent: string): Promise<void> {
+  async function restart(agent: string, restartOpts?: { readonly forceStashConfig?: boolean }): Promise<void> {
     const target = requireTarget(agent);
     if (target.session && seams.hasSession(target.session)) {
       // ALIVE → graceful: `macf restart-self` in the target workspace (stash +
       // detached relaunch; it resolves the target's own identity from cwd config).
-      seams.exec(macfBin, ['restart-self', '--confirm', '--reason', 'fault'], target.workspace);
+      // `--force` (macf#722 Fix B) only reaches here when the CALLER (rollFleet)
+      // already bypassed its own config-dirty gate for this agent — thread it so
+      // restart-self's matching stash-refusal guard doesn't re-block the same
+      // explicit override.
+      const args = ['restart-self', '--confirm', '--reason', 'fault'];
+      if (restartOpts?.forceStashConfig) args.push('--force');
+      seams.exec(macfBin, args, target.workspace);
       return;
     }
     // DEAD → cold-start (DR-037 Decision 3: restart = alive→graceful, dead→launch).
@@ -243,6 +264,7 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     probe,
     discoverWorkspaces: () => seams.discover(),
     isBusy,
+    isConfigDirty,
     capturePane,
     upgrade,
     restart,
@@ -267,10 +289,44 @@ export function createVmExecSeams(
   workspaceDir: string,
 ): Pick<
   VmDriverSeams,
-  'discover' | 'readConfig' | 'hasSession' | 'capturePane' | 'submit' | 'exec' | 'spawnDetached' | 'sleep'
+  | 'discover'
+  | 'readConfig'
+  | 'hasSession'
+  | 'capturePane'
+  | 'submit'
+  | 'exec'
+  | 'spawnDetached'
+  | 'sleep'
+  | 'isConfigDirty'
 > {
   return {
     discover: () => discoverWorkspaces(),
+    isConfigDirty: (dir: string): boolean => {
+      try {
+        // Tracked-only (macf#722 Fix B): untracked config files are not yet an
+        // operator-vs-macf-update conflict — mirrors restart-self's own
+        // `--untracked-files=no` stash-trigger predicate. Pathspecs use git's
+        // default fnmatch (no `:(glob)` magic needed — `**`/`*` already match
+        // across path separators under the default pathspec semantics).
+        const out = execFileSync(
+          'git',
+          [
+            'status',
+            '--porcelain',
+            '--untracked-files=no',
+            '--',
+            ...OPERATOR_PRESERVED_CONFIG_PATTERNS,
+          ],
+          { cwd: dir, encoding: 'utf-8' },
+        );
+        return out.trim().length > 0;
+      } catch {
+        // Not a git repo / git unavailable / any other failure → fail-open
+        // (never block a roll on an inspection failure; mirrors capturePane's
+        // fail-to-null posture for infra-failure cases).
+        return false;
+      }
+    },
     readConfig: (dir: string): WorkspaceIdentity | null => {
       const cfg = readAgentConfig(dir);
       if (!cfg) return null;

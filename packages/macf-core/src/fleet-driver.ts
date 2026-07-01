@@ -105,6 +105,18 @@ export interface FleetDriver {
   readonly isBusy: (agent: string) => Promise<boolean>;
 
   /**
+   * The pre-flight config-dirty gate (macf#722 Fix B) — `true` when the agent's
+   * workspace has UNCOMMITTED changes on the DR-029 operator-preserved config
+   * surface (`.claude/**`, `CLAUDE.md`, `claude.sh`, `env.local.*` — see
+   * `OPERATOR_PRESERVED_CONFIG_PATTERNS` in `fleet-upgrade.ts`). VM: `git status`
+   * in the agent's workspace, filtered to that path set. A dirty agent is SKIPPED
+   * before any mutation (never upgraded/restarted) — `macf update` / restart-self
+   * would otherwise clobber or stash operator-authored config underneath it. A
+   * DEAD/absent agent reads `false` (nothing to check; reconcile will launch it).
+   */
+  readonly isConfigDirty: (agent: string) => Promise<boolean>;
+
+  /**
    * Read the agent's current pane content for stall-signature matching
    * (`macf fleet resume`, DR-037 / macf#686). VM: a single `tmux capture-pane`
    * of the live session; K8s: recent pod logs. Returns `null` when the agent has
@@ -121,8 +133,17 @@ export interface FleetDriver {
   /**
    * Restart the agent. VM: `macf restart-self` when ALIVE (graceful — stash +
    * detached relaunch), or `launch` when DEAD. K8s: cycle the pod.
+   *
+   * `opts.forceStashConfig` (macf#722 Fix B): when the CALLER already decided to
+   * roll a config-dirty agent (an explicit `--force` override past the
+   * pre-flight `isConfigDirty` gate), thread that decision through so
+   * `restart-self`'s OWN config-surface stash-refusal guard doesn't re-block the
+   * same override — it maps to `restart-self`'s `--force` flag /
+   * `MACF_RESTART_STASH_CONFIG=1`. Omitted (default false) for every OTHER
+   * caller (e.g. `fleet-reconcile`'s healing ladder), which never bypasses the
+   * config-dirty gate because it never checks it in the first place.
    */
-  readonly restart: (agent: string) => Promise<void>;
+  readonly restart: (agent: string, opts?: { readonly forceStashConfig?: boolean }) => Promise<void>;
 
   /**
    * The tier-1 gated nudge — deliver `text` into the agent's live turn loop.

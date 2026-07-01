@@ -58,6 +58,7 @@ function fakeDeps(overrides: Partial<RestartSelfDeps> = {}): {
   const deps: RestartSelfDeps = {
     now: () => FIXED_NOW,
     hasUncommittedTrackedChanges: () => true,
+    hasUncommittedConfigChanges: () => false,
     currentBranch: () => 'feat/596-restart-self',
     headSha: () => 'abc1234def5678',
     stash: (label: string): StashResult => {
@@ -99,6 +100,7 @@ function baseOpts(over: Partial<RunRestartSelfOptions> = {}): RunRestartSelfOpti
     confirm: false,
     dryRun: false,
     json: false,
+    force: false,
     ...over,
   };
 }
@@ -202,6 +204,44 @@ describe('runRestartSelf — confirm path', () => {
     await runRestartSelf(baseOpts({ confirm: true }), deps);
     expect(rec.order).toEqual(['backup', 'write', 'write', 'spawn', 'kill']); // no 'stash'
     expect(rec.stashedLabel).toBeUndefined();
+  });
+
+  describe('config-surface stash-refusal guard (macf#722 Fix B)', () => {
+    it('refuses (exit 1, NO stash/write/spawn/kill) when config-surface files are dirty and not forced', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ hasUncommittedConfigChanges: () => true });
+      const code = await runRestartSelf(baseOpts({ confirm: true }), deps);
+      expect(code).toBe(1);
+      expect(rec.order).toEqual([]); // nothing mutated — no stash, no spawn, no kill
+      expect(errSpy.mock.calls.flat().join('\n')).toContain('uncommitted config');
+      errSpy.mockRestore();
+    });
+
+    it('proceeds (stashes) despite config-dirty when `force: true` is passed', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ hasUncommittedConfigChanges: () => true });
+      const code = await runRestartSelf(baseOpts({ confirm: true, force: true }), deps);
+      expect(code).toBe(0);
+      expect(rec.order).toEqual(['stash', 'backup', 'write', 'write', 'spawn', 'kill']);
+    });
+
+    it('non-config uncommitted changes (config-surface clean) proceed + stash as before — unaffected by the guard', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ hasUncommittedConfigChanges: () => false });
+      const code = await runRestartSelf(baseOpts({ confirm: true }), deps);
+      expect(code).toBe(0);
+      expect(rec.order).toEqual(['stash', 'backup', 'write', 'write', 'spawn', 'kill']);
+    });
+
+    it('dry-run still reports the plan even when config-dirty (the guard only blocks --confirm mutation)', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ hasUncommittedConfigChanges: () => true });
+      const code = await runRestartSelf(baseOpts({ confirm: false }), deps);
+      expect(code).toBe(0);
+      expect(rec.order).toEqual([]);
+      const out = logSpy.mock.calls.flat().join('\n');
+      expect(out).toContain('DRY-RUN');
+    });
   });
 
   it('writes the RESUME-note with reason / branch / HEAD / stash-ref', async () => {
