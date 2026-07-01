@@ -135,6 +135,27 @@ The canonical subcommands are **native TypeScript** (decision layer unit-tested 
 - The `--registry` selector is a mild misnomer under this refinement (a fleet is a project); it is kept as a working, documented alias to avoid a breaking CLI change, with `--fleet` as the canonical spelling and `--registry` deprecated-in-favor-of-`--fleet` as a follow-up (macf#710 Q2).
 - Cross-references that cite "fleet == registry" (DR-008/`#704` durable-substrate framing; the add-agent runbook; DR-007 fleet-enumeration) read correctly under the coincidence case; where a profile registry hosts multiple projects, read "fleet == project" per this amendment.
 
+## Amendment B — verify-green is a THREE-outcome gate; continue only on confirmed green (macf#722, 2026-07-01)
+
+**The rollFleet HALT contract as originally shipped ("HALT the roll on the first agent that doesn't verify-green within budget") conflated two failure shapes under one "not-green," and a live `macf fleet upgrade --target 0.2.47 --execute` on the substrate fleet (2026-07-01) exposed the false-positive:** the first agent (code-agent) relaunched slowly — `restart-self` kills the session + relaunches detached (~30s before the new session even starts) on a **fresh channel-server port the registry roster had not yet re-advertised** — so `verifyGreen` polled the stale endpoint, exceeded the budget, and HALTed the whole roll (devops/science never rolled), **though code-agent came up green on the target moments later.** The halt was spurious: a slow-but-fine relaunch, not a bad release.
+
+**The root cause is a two-outcome model where there are three.** After `upgrade → restart`, `verifyGreen` can land in:
+1. **came up GREEN (target)** → continue.
+2. **came up on the OLD version** → confirmed bad release → HALT (reason `bad-release`).
+3. **did NOT come up within budget** → **ambiguous**: a slow-but-fine relaunch, **OR a release that crashes on startup** (a bad release that never shows the old version — it just dies).
+
+**The load-bearing correction — continue only on positive green confirmation, never on absence-of-failure.** A tempting fix ("not-yet-green → skip+continue") is **unsafe**: case 3 contains the crash-on-start bad release, and continuing there rolls the next agent → it also crashes → the bad release cascades across the fleet, defeating the whole point of no-cascade. "Absence of a failure signal" ≠ "confirmed fine" — the same Pattern-A / `silent-fallback-hazards` lesson (and the #700/#701 channels-guard lesson) applied to the roll. So:
+
+- **Fix the spurious halt at its root (a budget/endpoint bug, not a HALT-policy relaxation):** extend the verify-green grace to cover real relaunch latency (session-death + startup + **re-register + roster-propagation of the fresh port**) AND re-resolve the relaunched agent's fresh endpoint from the registry roster with retry. A *fine* slow relaunch then confirms green **within** the grace → continues. (This is the mechanical half of DR-037 Decision 5's "verify-green re-resolves the endpoint," strengthened: re-resolve **with retry against a roster that lags the restart**, on a relaunch-aware budget.)
+- **CONTINUE requires a confirmed green** (target version). Nothing else advances the roll.
+- **HALT (terminal) covers BOTH remaining outcomes, with distinct reasons:** came-up-old-version → `bad-release`; past-grace-still-unconfirmed → `relaunch-unconfirmed` (a different operator message — "agent X didn't come back within Ns — investigate" — but still terminal, because you cannot safely proceed past an agent you couldn't confirm: a crash-on-start would cascade).
+
+**Skip-BEFORE-roll continues; rolled-then-unconfirmed halts.** The safe skip-and-continue is for agents you did NOT mutate — **config-dirty** (Amendment-B Fix B, below) and **busy** are skipped *before* `upgrade`/`restart`, so the roll safely proceeds through them to the others. An agent that was *rolled* (upgrade+restart happened) and then can't be confirmed is the halt case. The clean line: skip-before-roll continues; rolled-then-unconfirmed halts.
+
+**Fix B — config-dirty pre-flight skip (the stash-relaunch-wrong defect).** The same live run surfaced a second defect: `restart-self` stashes uncommitted *tracked* changes to relaunch clean (#711), but on a substrate workspace the operator's uncommitted `.claude/` config gets stashed → `macf update` regenerates **canonical** config → the agent relaunches on the *wrong (canonical)* config. Fix: a **pre-flight config-dirty gate** — before rolling an agent, if its workspace has uncommitted changes to the **operator-preserved config surface**, skip+report it (the busy-skip shape: "uncommitted config — commit or `--force`") rather than silently stash→relaunch-wrong; and `restart-self` refuses to stash config-surface files unless `--force`. **The config-surface path set is DR-029's operator-preserved boundary** (`env.local.*`, `.claude/**`, `CLAUDE.md`, `claude.sh`) — the stash-guard boundary == the DR-029 managed-vs-operator boundary, not an ad-hoc list. `macf fleet upgrade --force` threads the override through.
+
+**Consequences:** a slow relaunch no longer strands the fleet; a crash-on-start bad release still cannot cascade (halt-on-unconfirmed preserves no-cascade); a config-dirty substrate agent is skipped-not-relaunched-wrong. Build: `macf#722`.
+
 ## Cross-references
 
 - **DR-006** (macf-devops-toolkit) — VM watchdog + reconcile ladder + exit-code intent + heartbeat; the reference impls this promotes.
