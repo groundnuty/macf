@@ -19,6 +19,7 @@ export * from './types.js';
 export * from './semver.js';
 export * from './discovery.js';
 export * from './fleet-driver.js';
+export * from './fleet-reconcile.js';
 export * from './verify-green.js';
 export * from './reflection.js';
 export * from './prompt-responses.js';
