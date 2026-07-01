@@ -282,6 +282,52 @@ function channelNotificationsLines(): string[] {
 }
 
 /**
+ * Emit the interactive-prompt auto-responder start block (DR-033, macf#645).
+ *
+ * Claude Code introduces interactive LAUNCH prompts with no `-p` bypass (the
+ * channels dev-flag ack, the resume-summary choice, more over time). For
+ * unattended/cron relaunch (DR-031) — and to spare operators the manual click —
+ * `claude.sh` starts `macf-prompt-watcher.sh` in the background right before
+ * `exec claude`. The watcher polls THIS tmux pane during the startup window,
+ * auto-answers KNOWN ceremony prompts from the allowlist, and — crucially —
+ * ALERTs (never answers) an unknown prompt-like frame (Inv 1). See DR-033 for
+ * the three constitutional invariants.
+ *
+ * Placed AFTER the tmux self-wrap so only the in-tmux (inner) invocation starts
+ * a watcher — the outer pre-wrap invocation is replaced by `exec tmux` before
+ * reaching here, and $TMUX / $TMUX_PANE are only set inside tmux. The watcher is
+ * a separate process; it survives the subsequent `exec claude` (exec replaces
+ * this shell's image but does not signal its children) and self-terminates when
+ * the startup window elapses.
+ *
+ * Gates:
+ *   - MACF_PROMPT_AUTORESPOND_DISABLED=1 → skip (sister to MACF_OTEL_DISABLED /
+ *     MACF_CHANNELS_DISABLED). The watcher itself honors the same flag as
+ *     defense-in-depth.
+ *   - only when $TMUX is set (in-tmux) AND $TMUX_PANE is known — otherwise there
+ *     is no deterministic pane to watch (e.g. MACF_NO_TMUX_WRAP launches).
+ *   - only when the watcher script exists (older/partial workspaces skip
+ *     cleanly).
+ */
+function promptWatcherLines(): string[] {
+  return [
+    '',
+    '# Interactive-prompt auto-responder (macf#645 / DR-033). Start the pane',
+    '# watcher in the background so it can auto-clear KNOWN launch ceremony',
+    '# prompts (allowlist-only; unknown prompt-like frames are ALERTed, never',
+    '# answered — Inv 1) during the startup window. Only runs in-tmux (a',
+    '# deterministic $TMUX_PANE to watch); survives the claude launch below as a',
+    '# separate process and self-exits when the window elapses. Opt-out:',
+    '# MACF_PROMPT_AUTORESPOND_DISABLED=1 (sister to MACF_OTEL_DISABLED).',
+    'if [ "${MACF_PROMPT_AUTORESPOND_DISABLED:-}" != "1" ] \\',
+    '   && [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] \\',
+    '   && [ -x "$SCRIPT_DIR/.claude/scripts/macf-prompt-watcher.sh" ]; then',
+    '  "$SCRIPT_DIR/.claude/scripts/macf-prompt-watcher.sh" "$TMUX_PANE" &',
+    'fi',
+  ];
+}
+
+/**
  * Emit the Claude Code native OTEL telemetry env block into the
  * generated `claude.sh`. Three mandatory gates per Claude Code docs
  * — missing any one of them → zero traces emit:
@@ -698,6 +744,7 @@ export function generateClaudeSh(config: MacfAgentConfig): string {
     `export MACF_LOG_PATH="\${MACF_LOG_PATH:-\${XDG_STATE_HOME:-$HOME/.local/state}/macf/${config.project}@${config.agent_name}/channel.log}"`,
     ...tmuxSelfWrapLines(),
     ...channelNotificationsLines(),
+    ...promptWatcherLines(),
     '',
     // --plugin-dir loads the pinned macf-agent plugin from this workspace
     // (per DR-013). Additive — user-scope plugins still load alongside.

@@ -46,6 +46,7 @@ import { readAgentConfig, writeAgentConfig, tokenSourceFromConfig } from '../con
 import { resolveLatestVersions } from '../version-resolver.js';
 import { copyCanonicalRules, copyCanonicalScripts, findCliPackageRoot } from '../rules.js';
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
+import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
 import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion, linkPluginCliDist } from '../plugin-fetcher.js';
@@ -262,6 +263,13 @@ export async function update(
   if (refreshedScripts.length > 0) {
     console.log(`Refreshed ${refreshedScripts.length} helper script(s) in .claude/scripts/`);
   }
+
+  // Seed (if absent) / validate (if present) the interactive-prompt
+  // auto-responder allowlist (.claude/.macf/prompt-responses.json, DR-033 /
+  // macf#645). Operator-curated state → seed-if-absent, never clobber: an
+  // existing file is only validated (loud Inv-2 refuse/warn feedback), so
+  // `macf update` never reverts an operator's careful allowlist.
+  reportSeedPromptResponses(seedPromptResponsesConfig(projectDir));
 
   // Refresh project-tier rules (DR-026 §3 / F3, macf#501) from
   // MACF_PROJECT_RULES_SOURCE into .claude/rules/project/. Unset → no-op (the

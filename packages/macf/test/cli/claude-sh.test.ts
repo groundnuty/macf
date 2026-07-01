@@ -405,6 +405,31 @@ describe('generateClaudeSh', () => {
     });
   });
 
+  describe('interactive-prompt auto-responder start block (macf#645 / DR-033)', () => {
+    it('starts macf-prompt-watcher.sh in the background targeting $TMUX_PANE', () => {
+      const output = generateClaudeSh(sampleConfig);
+      expect(output).toContain(
+        '"$SCRIPT_DIR/.claude/scripts/macf-prompt-watcher.sh" "$TMUX_PANE" &',
+      );
+    });
+
+    it('gates the watcher on MACF_PROMPT_AUTORESPOND_DISABLED, in-tmux, and script-exists', () => {
+      const output = generateClaudeSh(sampleConfig);
+      expect(output).toContain('[ "${MACF_PROMPT_AUTORESPOND_DISABLED:-}" != "1" ]');
+      expect(output).toContain('[ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]');
+      expect(output).toContain('[ -x "$SCRIPT_DIR/.claude/scripts/macf-prompt-watcher.sh" ]');
+    });
+
+    it('starts the watcher AFTER the tmux self-wrap and BEFORE exec claude', () => {
+      const output = generateClaudeSh(sampleConfig);
+      const tmuxPos = output.indexOf('SESSION_NAME="${MACF_PROJECT}@${MACF_ROUTING_LABEL}"');
+      const watcherPos = output.indexOf('macf-prompt-watcher.sh" "$TMUX_PANE" &');
+      const execPos = output.indexOf('exec claude --plugin-dir');
+      expect(watcherPos).toBeGreaterThan(tmuxPos);
+      expect(watcherPos).toBeLessThan(execPos);
+    });
+  });
+
   describe('MACF_LOG_PATH forensic-log fallback (macf#632)', () => {
     it('exports MACF_LOG_PATH with a ${VAR:-default} fallback to the agent HOME / XDG state, not the repo (macf#642)', () => {
       const output = generateClaudeSh(sampleConfig);

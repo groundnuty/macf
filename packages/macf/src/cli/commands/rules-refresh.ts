@@ -20,6 +20,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
+import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 
 export interface RulesRefreshResult {
@@ -46,6 +47,12 @@ export function rulesRefresh(targetDir: string): RulesRefreshResult {
 
   const rules = copyCanonicalRules(targetDir);
   const scripts = copyCanonicalScripts(targetDir);
+
+  // Seed (if absent) / validate (if present) the interactive-prompt
+  // auto-responder allowlist (.claude/.macf/prompt-responses.json, DR-033 /
+  // macf#645). Operator-curated state, so it is seed-if-absent + never
+  // clobbered — an existing file is only validated (loud Inv-2 feedback).
+  const promptResponses = seedPromptResponsesConfig(targetDir);
 
   // Project-tier rules (DR-026 §3 / F3, macf#501) from
   // MACF_PROJECT_RULES_SOURCE into .claude/rules/project/. Unset → no-op (the
@@ -95,6 +102,8 @@ export function rulesRefresh(targetDir: string): RulesRefreshResult {
   }
 
   console.log('Refreshed gh-token guard hook in .claude/settings.json');
+
+  reportSeedPromptResponses(promptResponses);
 
   if (projectRules.length > 0) {
     console.log(`Refreshed ${projectRules.length} project-tier rule file(s) in .claude/rules/project/:`);
