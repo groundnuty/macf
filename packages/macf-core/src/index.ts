@@ -18,6 +18,7 @@ export * from './token.js';
 export * from './types.js';
 export * from './semver.js';
 export * from './reflection.js';
+export * from './guest.js';
 export * from './norm.js';
 export * from './protected-invariant-norms.js';
 export * from './mtls-health-ping.js';

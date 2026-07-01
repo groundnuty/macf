@@ -125,7 +125,7 @@ Design-now (capture the pattern while the `icsoc-2026` ↔ `onedata-mcp` depende
 
 ## Amendment A (2026-06-30): guest visibility in the consumer's `macf fleet status` — split visibility from supervision
 
-**Status:** Proposed (amends §3 + §Boundaries). Ratification = operator's call, same as the base DR.
+**Status:** Accepted — ratified by operator 2026-06-30 (live). Amends §3 + §Boundaries. Implemented in groundnuty/macf#679 (the `guests` binding in `.github/macf-fleet.json` + the GUEST block in `macf fleet status` / `/macf-peers` + the path-aware, never-"down" reachability + the supervision-exclusion invariant).
 
 **Trigger:** operator, 2026-06-30 — *"in the ideal situation the external contractor would be shown to the paper-writing fleet on `macf fleet status` … a (maybe temporary) official member of 2 fleets."* Surfaced while wiring the first live cross-fleet collaborator: `ppam-2026/code-agent` ↔ `icsoc-2026` (the `onedata-mcp` data dependency).
 

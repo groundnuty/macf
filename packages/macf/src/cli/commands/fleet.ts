@@ -38,8 +38,17 @@ import {
   pingAgentHealth,
   toVariableSegment,
 } from '@groundnuty/macf-core';
-import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
+import type { AgentInfo, GuestBinding, HealthResponse } from '@groundnuty/macf-core';
 import { formatTable } from './ps.js';
+import {
+  loadGuestBindings,
+  gatherGuestStatuses,
+  formatGuestBlock,
+  guestStatusesToJson,
+  type GuestProbeFn,
+  type GuestResolveFn,
+  type GuestStatus,
+} from './fleet-guests.js';
 
 /**
  * DR-030 sibling-increment `/health.state` object self-report — read
@@ -225,9 +234,14 @@ export function formatFleetTable(statuses: readonly FleetAgentStatus[], now: num
 
 /**
  * Structured `--json` shape for automation. Carries the RAW `/health` body so
- * any present `state`/`otel`/future fields pass through untouched.
+ * any present `state`/`otel`/future fields pass through untouched. Guests
+ * (DR-036 Amendment A) are a SEPARATE array — external, unsupervised (each
+ * carries `supervised: false`) — never folded into `agents` (the members).
  */
-export function fleetStatusToJson(statuses: readonly FleetAgentStatus[]): unknown {
+export function fleetStatusToJson(
+  statuses: readonly FleetAgentStatus[],
+  guests: readonly GuestStatus[] = [],
+): unknown {
   return {
     agents: statuses.map((s) => ({
       name: s.name,
@@ -236,6 +250,7 @@ export function fleetStatusToJson(statuses: readonly FleetAgentStatus[]): unknow
       status: s.online ? 'online' : 'offline',
       health: s.health,
     })),
+    guests: guestStatusesToJson(guests),
   };
 }
 
@@ -252,6 +267,16 @@ export interface FleetStatusDeps {
   readonly listPeers: () => Promise<readonly { readonly name: string; readonly info: AgentInfo }[]>;
   readonly probe: FleetProbeFn;
   readonly project?: string;
+  /**
+   * Consumer-local cross-fleet guest bindings (DR-036 Amendment A). Optional —
+   * defaults to none, so a fleet with no `.github/macf-fleet.json` guests renders
+   * exactly as before.
+   */
+  readonly loadGuests?: () => readonly GuestBinding[];
+  /** Resolve a guest's registry slot from the shared scope (keyed on home project). */
+  readonly resolveGuest?: GuestResolveFn;
+  /** mTLS `/health` probe for a `route` guest (reuses the members probe by default). */
+  readonly guestProbe?: GuestProbeFn;
 }
 
 /** Wire the registry + mTLS probe from a project's config. */
@@ -275,12 +300,22 @@ async function resolveDepsFromRegistry(
 
   const certPath = agentCertPath(projectDir);
   const keyPath = agentKeyPath(projectDir);
+  const probe: FleetProbeFn = (host, port) =>
+    pingAgentHealth({ host, port, caCertPem, certPath, keyPath });
   return {
     ok: true,
     deps: {
       project: config.project,
       listPeers: () => registry.list(''),
-      probe: (host, port) => pingAgentHealth({ host, port, caCertPem, certPath, keyPath }),
+      probe,
+      loadGuests: () => loadGuestBindings(projectDir),
+      // Resolve a guest cross-project within the SAME registry scope (DR-006
+      // profile scope; macf#621 cross-scope) by keying a registry on the guest's
+      // HOME project and reading its slot. Local-registry mode has no shared
+      // cross-project scope, so a guest resolves only if it lives in this file.
+      resolveGuest: (homeProject, name) =>
+        createRegistryFromConfig(config.registry, homeProject, token).get(name),
+      guestProbe: probe,
     },
   };
 }
@@ -305,17 +340,38 @@ export async function runFleetStatus(
   const statuses = await gatherFleetStatus(peers, resolved.probe);
   const now = opts.now ?? Date.now();
 
+  // Guests (DR-036 Amendment A) — external, unsupervised collaborators the
+  // consumer DEPENDS on. Resolved from the shared registry scope; NEVER added to
+  // the members list nor to any supervision path.
+  const guestBindings = resolved.loadGuests ? resolved.loadGuests() : [];
+  const guests =
+    guestBindings.length > 0 && resolved.resolveGuest
+      ? await gatherGuestStatuses(
+          guestBindings,
+          resolved.resolveGuest,
+          resolved.guestProbe ?? resolved.probe,
+        )
+      : [];
+
   if (opts.json) {
-    console.log(JSON.stringify(fleetStatusToJson(statuses), null, 2));
+    console.log(JSON.stringify(fleetStatusToJson(statuses, guests), null, 2));
     return 0;
   }
 
   const header = `macf fleet${resolved.project ? ` — ${resolved.project}` : ''}`;
-  if (statuses.length === 0) {
+  if (statuses.length === 0 && guests.length === 0) {
     console.log(`${header}\n\nNo agents registered in the registry.`);
     return 0;
   }
   console.log(`${header}\n`);
-  console.log(formatFleetTable(statuses, now));
+  if (statuses.length > 0) {
+    console.log(formatFleetTable(statuses, now));
+  } else {
+    console.log('No agents registered in the registry.');
+  }
+  if (guests.length > 0) {
+    console.log('');
+    console.log(formatGuestBlock(guests, now));
+  }
   return 0;
 }
