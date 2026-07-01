@@ -12,6 +12,7 @@ import { listPeers } from './commands/peers.js';
 import { runPs } from './commands/ps.js';
 import { runFleetStatus } from './commands/fleet.js';
 import { runFleetDoctor } from './commands/fleet-doctor.js';
+import { runFleetInstallCronCommand, DEFAULT_SCHEDULE } from './commands/fleet-install-cron.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { runRestartSelfCommand } from './commands/restart-self.js';
@@ -290,6 +291,49 @@ fleet
       json: opts.json,
       inject: opts.inject,
       injectTimeoutSec: opts.injectTimeout,
+    });
+    process.exitCode = code;
+  });
+
+fleet
+  .command('install-cron')
+  .description(
+    'Install a HOST crontab entry that periodically runs the watchdog (`macf ' +
+    'fleet reconcile`) — DR-037 / macf#686, porting devops-toolkit fleet/install-cron.sh ' +
+    '(DR-006 §A.4). Host-installed so it survives a reboot (the first post-boot sweep ' +
+    'launches the desired fleet from a cold box). The generated line sources the ' +
+    'host-prelude (cron has a bare env), mints a FRESH GH_TOKEN fail-loud (cron has no ' +
+    'ambient token), then runs reconcile, appending to a log. SAFE DEFAULT: REPORT-ONLY ' +
+    '(the line omits --execute → reconcile logs decisions, acts on nothing); pass ' +
+    '--execute to act. IDEMPOTENT: marker-guarded — a re-run replaces the macf-watchdog ' +
+    'line, never duplicates. --uninstall removes only that line. Shows the planned change ' +
+    '+ confirms (--yes bypasses; --print previews without touching crontab).',
+  )
+  .option('--schedule <cron>', `Cron schedule expression (default '${DEFAULT_SCHEDULE}')`)
+  .option('--execute', 'Install an ACTING line (default: report-only/dry-run)', false)
+  .option('--allow-restart', 'Also forward --allow-restart to reconcile (Tier-2 graceful-restart)', false)
+  .option('--with-routing', 'Also forward --with-routing to reconcile (routing-doctor freshness probe)', false)
+  .option('--manifest <path>', 'Forward --manifest <path> to reconcile (desired-set manifest)')
+  .option('--no-token', 'Do NOT bake a GH_TOKEN mint into the cron (operator provides it)')
+  .option('--uninstall', 'Remove the macf-watchdog cron line', false)
+  .option('--print', 'Print the line that WOULD be installed and exit — never touches crontab', false)
+  .option('--prelude <path>', 'Override the host-prelude path sourced before reconcile')
+  .option('--log <path>', 'Override the watchdog log path')
+  .option('--yes', 'Skip the confirmation prompt (non-interactive)', false)
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    const code = await runFleetInstallCronCommand(resolveProjectDir(opts.dir), {
+      schedule: opts.schedule,
+      execute: opts.execute,
+      allowRestart: opts.allowRestart,
+      withRouting: opts.withRouting,
+      manifest: opts.manifest,
+      token: opts.token,
+      uninstall: opts.uninstall,
+      print: opts.print,
+      prelude: opts.prelude,
+      log: opts.log,
+      yes: opts.yes,
     });
     process.exitCode = code;
   });
