@@ -4,6 +4,50 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.45] — 2026-07-01
+
+The **DR-037 fleet operational-layer release**: the fleet-operations layer is
+promoted into the `macf` binary — rolling upgrades, desired-state
+reconciliation, stall-resume, and a host-cron watchdog, on top of a
+workspace-discovery + `FleetDriver` substrate. Additive/back-compat throughout
+(fleet/routing-doctor `--json` stays `schema_version: 1`). Marketplace v0.2.45
+is a lockstep bump (`hooks.json`).
+
+### feat
+
+- **`macf fleet upgrade`** (#695) — rolling, busy-gated,
+  verify-green-before-next version-upgrade orchestrator across the fleet;
+  HALT-on-bad-release; fleet/registry multi-select. (DR-037)
+- **`macf fleet reconcile`** (#697) — the DR-006 desired-state HEAL ladder:
+  exit-code intent → aliveness-gate → tier-1 inject / tier-2 restart / tier-3
+  alert, with exponential backoff, stuck-escalation, launch-stagger, and a
+  self-heartbeat. Dry-run by default.
+- **`macf fleet resume`** (#696) — allowlist-driven stall nudge/report; never a
+  blind nudge (report-mode never answers an authorization prompt). (DR-037)
+- **`macf fleet install-cron`** (#692) — host-cron watchdog installer
+  (report-only default, fail-loud token-mint, idempotent). (DR-037)
+- **Fleet substrate**: workspace-discovery primitive + `macf ps` alive∪dead
+  enumeration (#693); `FleetDriver` interface + VM driver + `verifyGreen`
+  (#694); `/health.version` + `VERSION` column + `--json` in `fleet status`
+  (#683, DR-007 Phase 1).
+- **Interactive-prompt auto-responder** (#684) — allowlist-only handling of
+  launch-time interactive prompts (DR-033).
+- **`restart-self` backs up the session transcript + asserts it survived**
+  before restart (Pattern A) (#690).
+- **Cross-fleet guest visibility** in `fleet status` + `peers` (#681, DR-036
+  Amendment A).
+
+### fix
+
+- **tmux session keyed on `MACF_ROUTING_LABEL`** — drops the vestigial
+  `agent-config` `tmux_session`; the watchdog now covers agents whose name ≠
+  routing label (#680, DR-032).
+
+### ci
+
+- Dependabot: **`actions/checkout` 6 → 7** (#519), **`actions/cache` 5 → 6**
+  (#665).
+
 ## [0.2.44] — 2026-06-30
 
 **Two consumer-facing fixes** on top of v0.2.43 — both surfaced on fresh
