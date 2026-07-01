@@ -14,6 +14,7 @@ import { runFleetStatus } from './commands/fleet.js';
 import { runFleetDoctor } from './commands/fleet-doctor.js';
 import { runFleetInstallCronCommand, DEFAULT_SCHEDULE } from './commands/fleet-install-cron.js';
 import { runFleetResumeCommand } from './commands/fleet-resume.js';
+import { runFleetUpgrade } from './commands/fleet-upgrade.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { runRestartSelfCommand } from './commands/restart-self.js';
@@ -361,6 +362,36 @@ fleet
   .action(async (opts) => {
     const code = await runFleetResumeCommand(resolveProjectDir(opts.dir), {
       execute: Boolean(opts.execute),
+    });
+    process.exitCode = code;
+  });
+
+fleet
+  .command('upgrade')
+  .description(
+    'Rolling framework-version upgrade (DR-037 / macf#682). For each selected ' +
+    "fleet (a fleet == one registry), roll every agent whose RUNNING /health.version " +
+    'is behind TARGET, ONE AT A TIME: busy-gate (never interrupt a working agent — ' +
+    'skip+report, or --wait for idle) → macf update → restart-self → verify /health.version ' +
+    '== target (re-resolving the fresh restart-self endpoint) → next. A bad release HALTS ' +
+    'the roll (and stops later fleets) so it cannot brick the fleet. DRY-RUN by default ' +
+    '(prints the plan); --execute rolls. TARGET defaults to npm-latest of @groundnuty/macf.',
+  )
+  .option('--target <version>', 'Target framework version (default: npm-latest of @groundnuty/macf)')
+  .option('--fleet <names>', 'Comma-list of fleets (registries) to roll — multi-select, rolled fleet-by-fleet')
+  .option('--registry <ids>', 'Comma-list of registry identifiers to roll (same selector space as --fleet)')
+  .option('--execute', 'ACTUALLY roll the upgrade (default: dry-run — print the plan)', false)
+  .option('--wait', 'On a busy agent, poll for idle up to a bound instead of skipping', false)
+  .option('--verify-timeout <sec>', 'Per-agent verify-green budget, in seconds (default 120)', (v) => parseInt(v, 10))
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .action(async (opts) => {
+    const code = await runFleetUpgrade(resolveProjectDir(opts.dir), {
+      target: opts.target,
+      fleet: opts.fleet,
+      registry: opts.registry,
+      execute: opts.execute,
+      wait: opts.wait,
+      verifyTimeoutSec: opts.verifyTimeout,
     });
     process.exitCode = code;
   });
