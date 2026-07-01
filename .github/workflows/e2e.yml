@@ -79,7 +79,7 @@ jobs:
     env:
       INCIDENT_TITLE_PREFIX: "ci(e2e): post-merge suite failing on main"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: jetify-com/devbox-install-action@v0.15.0
         with:
@@ -248,7 +248,7 @@ jobs:
     env:
       INCIDENT_TITLE_PREFIX: "ci(integration): python a2a-sdk suite failing on main"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Per-job path filter. Workflow-level `on.pull_request.paths`
       # is coarse (`packages/macf-channel-server/**`); this narrows
