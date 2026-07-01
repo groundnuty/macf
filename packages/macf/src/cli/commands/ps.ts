@@ -19,6 +19,7 @@ const HEADERS = [
   'KIND',
   'WORKSPACE',
   'AGENT',
+  'VERSION',
   'MACF_PORT',
   'OTEL_ENDPOINT',
   'CWD',
@@ -31,10 +32,38 @@ export function buildPsRows(procs: readonly MacfProcess[]): readonly (readonly s
     p.kind,
     p.cwdBasename ?? '—',
     p.agentIdentity ?? '—',
+    p.version ?? '—',
     p.port ?? '—',
     p.otelEndpoint ?? '(none)',
     p.cwd ?? '—',
   ]);
+}
+
+/**
+ * Structured `--json` shape for automation (macf#682). `available` distinguishes
+ * "not a `/proc` host" (macOS) from "no MACF processes found" — both yield an
+ * empty `processes` array, so a consumer needs the flag to tell them apart.
+ */
+export function psToJson(procs: readonly MacfProcess[], available: boolean): unknown {
+  return {
+    available,
+    processes: procs.map((p) => ({
+      pid: p.pid,
+      kind: p.kind,
+      workspace: p.cwdBasename,
+      agent: p.agentIdentity,
+      version: p.version,
+      port: p.port,
+      otel_endpoint: p.otelEndpoint,
+      cwd: p.cwd,
+    })),
+  };
+}
+
+/** Options for `runPs`. */
+export interface RunPsOptions {
+  /** Emit the structured process list as JSON instead of a table. */
+  readonly json?: boolean;
 }
 
 /**
@@ -64,8 +93,18 @@ export function formatPsTable(procs: readonly MacfProcess[]): string {
  * `macf ps` entry point. Returns the shell exit code. The reader is injectable
  * for tests; production uses the real `/proc` reader.
  */
-export function runPs(reader: ProcReader = defaultProcReader): number {
-  if (!reader.available()) {
+export function runPs(reader: ProcReader = defaultProcReader, opts: RunPsOptions = {}): number {
+  const available = reader.available();
+  const procs = available ? scanMacfProcesses(reader) : [];
+
+  // JSON always emits valid, machine-consumable output — even off-/proc or with
+  // zero matches — so the fleet-upgrade orchestrator never has to parse prose.
+  if (opts.json) {
+    console.log(JSON.stringify(psToJson(procs, available), null, 2));
+    return 0;
+  }
+
+  if (!available) {
     console.log('macf ps: process introspection is Linux-only (no /proc on this host).');
     console.log(
       '  It reads /proc/<pid>/{cwd,environ,cmdline}; on macOS/other platforms there is nothing to scan.',
@@ -73,7 +112,6 @@ export function runPs(reader: ProcReader = defaultProcReader): number {
     return 0;
   }
 
-  const procs = scanMacfProcesses(reader);
   if (procs.length === 0) {
     console.log('No MACF claude / channel-server processes found.');
     return 0;

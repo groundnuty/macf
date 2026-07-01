@@ -192,10 +192,21 @@ export function formatOtel(raw: unknown): string {
   return o.endpoint_reachable ? 'reachable' : 'unreachable ✗';
 }
 
+/**
+ * Render the framework-version self-report (`/health.version` — the
+ * channel-server's OWN package version, macf#682). Read DEFENSIVELY: `version`
+ * is a long-established REQUIRED field, but a body from an agent old enough to
+ * predate it degrades to `?` (unknown) rather than crashing the roster.
+ */
+export function formatVersion(raw: unknown): string {
+  return typeof raw === 'string' && raw.length > 0 ? raw : '?';
+}
+
 const HEADERS = [
   'NAME',
   'HOST:PORT',
   'STATUS',
+  'VERSION',
   'UPTIME',
   'STATE',
   'OTEL',
@@ -211,13 +222,14 @@ export function buildFleetRows(
   return statuses.map((s) => {
     const where = `${s.host}:${s.port}`;
     if (!s.online || !s.health) {
-      return [s.name, where, 'offline', '—', '—', '—', '—', '—'];
+      return [s.name, where, 'offline', '—', '—', '—', '—', '—', '—'];
     }
     const h = s.health;
     return [
       s.name,
       where,
       'online',
+      formatVersion(rawField(h, 'version')),
       formatUptime(h.uptime_seconds),
       formatRunState(rawField(h, 'state')),
       formatOtel(rawField(h, 'otel')),
@@ -237,19 +249,28 @@ export function formatFleetTable(statuses: readonly FleetAgentStatus[], now: num
  * any present `state`/`otel`/future fields pass through untouched. Guests
  * (DR-036 Amendment A) are a SEPARATE array — external, unsupervised (each
  * carries `supervised: false`) — never folded into `agents` (the members).
+ *
+ * `version` is surfaced as a TOP-LEVEL per-agent field (in addition to living
+ * inside `health`) so the fleet-upgrade orchestrator (DR-007, macf#682) can read
+ * `agents[].version` directly without reaching into the raw body. `null` when the
+ * agent is offline or its `/health` predates the field.
  */
 export function fleetStatusToJson(
   statuses: readonly FleetAgentStatus[],
   guests: readonly GuestStatus[] = [],
 ): unknown {
   return {
-    agents: statuses.map((s) => ({
-      name: s.name,
-      host: s.host,
-      port: s.port,
-      status: s.online ? 'online' : 'offline',
-      health: s.health,
-    })),
+    agents: statuses.map((s) => {
+      const version = rawField(s.health, 'version');
+      return {
+        name: s.name,
+        host: s.host,
+        port: s.port,
+        status: s.online ? 'online' : 'offline',
+        version: typeof version === 'string' && version.length > 0 ? version : null,
+        health: s.health,
+      };
+    }),
     guests: guestStatusesToJson(guests),
   };
 }

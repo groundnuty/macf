@@ -15,7 +15,7 @@
  * `null` on EACCES / ESRCH races; `available()` is false off-Linux).
  */
 import { readdirSync, readlinkSync, readFileSync, existsSync } from 'node:fs';
-import { basename } from 'node:path';
+import { basename, join } from 'node:path';
 
 /** The MACF process kinds this scanner recognises. */
 export type MacfProcessKind = 'claude' | 'channel-server';
@@ -40,6 +40,15 @@ export interface ProcReader {
   readonly readCmdline: (pid: string) => string | null;
   /** Raw NUL-separated `/proc/<pid>/environ`, or null. */
   readonly readEnviron: (pid: string) => string | null;
+  /**
+   * Read `<pkgRoot>/package.json`'s `version` (the channel-server's OWN package
+   * version — the SAME value it self-reports on `/health.version`, macf#682).
+   * Local + zero-network by design: `macf ps` is a pure `/proc` scanner, so it
+   * sources the version from the resolved-on-disk package rather than probing
+   * `/health`. Optional so existing readers (and tests) that don't provide it
+   * degrade the VERSION column to `—`. Returns `null` on any failure.
+   */
+  readonly readPkgVersion?: (pkgRoot: string) => string | null;
 }
 
 /** One discovered MACF process, keyed by its own cwd + identity. */
@@ -57,6 +66,14 @@ export interface MacfProcess {
   readonly port: string | null;
   /** `OTEL_EXPORTER_OTLP_ENDPOINT` from the process environment. */
   readonly otelEndpoint: string | null;
+  /**
+   * The channel-server's running framework version (macf#682) — the SAME value
+   * it self-reports on `/health.version`, resolved LOCALLY from the on-disk
+   * `package.json` next to the running `server.js` (no network). `null` for a
+   * `claude` process (the framework version is a channel-server property) and
+   * whenever the package root / version can't be resolved.
+   */
+  readonly version: string | null;
 }
 
 /** Split a NUL-separated `/proc` blob (cmdline / environ) into tokens. */
@@ -129,6 +146,23 @@ export function classifyCmdline(raw: string): MacfProcessKind | null {
 }
 
 /**
+ * Resolve the channel-server's on-disk PACKAGE ROOT from its cmdline (macf#682),
+ * so the caller can read `<root>/package.json` for the running version. The
+ * server runs as `node .../@groundnuty/macf-channel-server/dist/server.js`, so
+ * the package root is the token truncated at `macf-channel-server` inclusive
+ * (`.../@groundnuty/macf-channel-server`). Returns `null` when no token carries
+ * the marker (e.g. a `claude` process, or an unexpected launch form).
+ */
+export function channelServerPkgRootFromCmdline(cmdline: string): string | null {
+  const marker = 'macf-channel-server';
+  for (const token of splitNul(cmdline)) {
+    const i = token.indexOf(marker);
+    if (i >= 0) return token.slice(0, i + marker.length);
+  }
+  return null;
+}
+
+/**
  * Enumerate every MACF claude / channel-server process via the reader.
  * PURE w.r.t. the reader: no real-process dependency. Each process is keyed by
  * its OWN cwd + environment — never `head -1`. Returns a stable ordering
@@ -148,6 +182,15 @@ export function scanMacfProcesses(reader: ProcReader): readonly MacfProcess[] {
     const env = environRaw ? parseEnviron(environRaw) : {};
     const id = agentIdentityFromEnv(env);
 
+    // Version is a channel-server property (macf#682): resolve the on-disk
+    // package root from its cmdline and read package.json's version. `claude`
+    // rows have no framework version of their own → null.
+    let version: string | null = null;
+    if (kind === 'channel-server' && reader.readPkgVersion) {
+      const pkgRoot = channelServerPkgRootFromCmdline(cmdline);
+      version = pkgRoot ? reader.readPkgVersion(pkgRoot) : null;
+    }
+
     out.push({
       pid,
       kind,
@@ -157,6 +200,7 @@ export function scanMacfProcesses(reader: ProcReader): readonly MacfProcess[] {
       identitySource: id?.source ?? null,
       port: env['MACF_PORT'] ?? null,
       otelEndpoint: env['OTEL_EXPORTER_OTLP_ENDPOINT'] ?? null,
+      version,
     });
   }
   return [...out].sort(compareProcesses);
@@ -201,6 +245,16 @@ export const defaultProcReader: ProcReader = {
   readEnviron: (pid) => {
     try {
       return readFileSync(`/proc/${pid}/environ`, 'utf-8');
+    } catch {
+      return null;
+    }
+  },
+  readPkgVersion: (pkgRoot) => {
+    try {
+      const pkg = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf-8')) as {
+        version?: unknown;
+      };
+      return typeof pkg.version === 'string' && pkg.version.length > 0 ? pkg.version : null;
     } catch {
       return null;
     }
