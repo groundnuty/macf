@@ -195,6 +195,9 @@ export function parseWorkspace(fs: DiscoveryFs, wsDir: string): WorkspaceRecord 
     agent: cfg.routing_label ?? cfg.agent_name,
     workspace: fs.realpath(wsDir),
     registry: registryIdentifier(cfg.registry),
+    // The fleet-grouping key (macf#710) — see `WorkspaceRecord.project`. Always
+    // present: `MacfAgentConfigSchema.project` is a required field.
+    project: cfg.project,
     versionPin: cfg.versions?.cli ?? null,
   };
 }

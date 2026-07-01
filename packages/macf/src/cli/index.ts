@@ -409,7 +409,9 @@ fleet
   .command('upgrade')
   .description(
     'Rolling framework-version upgrade (DR-037 / macf#682). For each selected ' +
-    "fleet (a fleet == one registry), roll every agent whose RUNNING /health.version " +
+    "fleet (a fleet == one PROJECT, macf#710 — its own CA + registry namespace, " +
+    'NOT the coarser registry scope, since one profile/org registry can host ' +
+    'several distinct projects), roll every agent whose RUNNING /health.version ' +
     'is behind TARGET, ONE AT A TIME: busy-gate (never interrupt a working agent — ' +
     'skip+report, or --wait for idle) → macf update → restart-self → verify /health.version ' +
     '== target (re-resolving the fresh restart-self endpoint) → next. A bad release HALTS ' +
@@ -417,8 +419,8 @@ fleet
     '(prints the plan); --execute rolls. TARGET defaults to npm-latest of @groundnuty/macf.',
   )
   .option('--target <version>', 'Target framework version (default: npm-latest of @groundnuty/macf)')
-  .option('--fleet <names>', 'Comma-list of fleets (registries) to roll — multi-select, rolled fleet-by-fleet')
-  .option('--registry <ids>', 'Comma-list of registry identifiers to roll (same selector space as --fleet)')
+  .option('--fleet <names>', 'Comma-list of fleets (project identifiers) to roll — multi-select, rolled fleet-by-fleet')
+  .option('--registry <ids>', 'Comma-list of project identifiers to roll (same selector space as --fleet; historical flag name predates macf#710\'s project-based grouping)')
   .option('--execute', 'ACTUALLY roll the upgrade (default: dry-run — print the plan)', false)
   .option('--wait', 'On a busy agent, poll for idle up to a bound instead of skipping', false)
   .option('--verify-timeout <sec>', 'Per-agent verify-green budget, in seconds (default 120)', (v) => parseInt(v, 10))

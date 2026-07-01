@@ -347,7 +347,7 @@ describe('buildPsEntries — alive∪dead union (DR-037 / #141)', () => {
     workspace: string,
     versionPin: string | null,
     registry = 'groundnuty',
-  ): WorkspaceRecord => ({ agent, workspace, registry, versionPin });
+  ): WorkspaceRecord => ({ agent, workspace, registry, project: 'macf', versionPin });
 
   it('marks a workspace with a matching live process ALIVE and one without DEAD', () => {
     const procs = scanMacfProcesses(
@@ -434,7 +434,7 @@ describe('runPs', () => {
   it('still lists discovered workspaces (as dead) when introspection is unavailable', () => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const code = runPs(fakeReader({}, false), {}, () => [
-      { agent: 'science-agent', workspace: '/canon/science', registry: 'groundnuty', versionPin: '0.2.41' },
+      { agent: 'science-agent', workspace: '/canon/science', registry: 'groundnuty', project: 'macf', versionPin: '0.2.41' },
     ]);
     expect(code).toBe(0);
     const out = logSpy.mock.calls.flat().join('\n');

@@ -14,7 +14,6 @@
  * release HALTS the roll (and, across `--fleet a,b,c`, stops later fleets).
  */
 import {
-  registryIdentifier,
   verifyGreen,
   upgradeFleets,
   type FleetDriver,
@@ -39,9 +38,13 @@ export const DEFAULT_VERIFY_TIMEOUT_MS = 120_000;
 export interface RunFleetUpgradeOptions {
   /** Explicit target version pin (`--target`); default = npm-latest of `@groundnuty/macf`. */
   readonly target?: string;
-  /** Comma-list of fleet identifiers (`--fleet a,b,c`). */
+  /** Comma-list of fleet identifiers (`--fleet a,b,c`) — project identifiers (macf#710). */
   readonly fleet?: string;
-  /** Comma-list of registry identifiers (`--registry owner/repo,...`) — same selector space. */
+  /**
+   * Comma-list of project identifiers (`--registry <project>,...`) — same
+   * selector space as `--fleet`. The flag name predates macf#710's shift from
+   * registry-scope to project-scope grouping; kept for back-compat.
+   */
   readonly registry?: string;
   /** Actually roll (default: dry-run — plan only). */
   readonly execute?: boolean;
@@ -53,11 +56,15 @@ export interface RunFleetUpgradeOptions {
 
 /** Injectable seams — production resolves them from config; tests supply fakes. */
 export interface FleetUpgradeDeps {
-  /** The registry-free host workspace scan (grouped into fleets by `registry`). */
+  /** The registry-free host workspace scan (grouped into fleets by `project`, macf#710). */
   readonly discover: () => readonly WorkspaceRecord[];
-  /** Resolve a per-fleet driver (a representative workspace → `createVmDriverFromConfig`). */
+  /**
+   * Resolve a per-fleet driver (a representative workspace OF THAT PROJECT →
+   * `createVmDriverFromConfig`, which binds the driver to the project's own CA +
+   * registry namespace — macf#710).
+   */
   readonly resolveDriver: (fleet: string) => Promise<FleetDriver | null>;
-  /** The current project's fleet (registry identifier) — the DEFAULT selection. */
+  /** The current project's fleet (its project identifier) — the DEFAULT selection. */
   readonly defaultFleet: string | null;
   /** Resolve npm-latest of `@groundnuty/macf` (the default `--target`). */
   readonly fetchLatest: () => Promise<string | null>;
@@ -87,11 +94,11 @@ export async function resolveTargetVersion(
 }
 
 /**
- * Resolve the ordered set of fleets to roll. Selectors from `--fleet` +
- * `--registry` are unioned (order preserved, first-wins dedup) and filtered to
- * the fleets actually present on this host; unknown selectors are returned
- * separately for a warning. With NO selectors, defaults to the current project's
- * fleet. Pure.
+ * Resolve the ordered set of fleets (project identifiers, macf#710) to roll.
+ * Selectors from `--fleet` + `--registry` are unioned (order preserved,
+ * first-wins dedup) and filtered to the fleets actually present on this host;
+ * unknown selectors are returned separately for a warning. With NO selectors,
+ * defaults to the current project's fleet. Pure.
  */
 export function selectFleets(
   available: readonly string[],
@@ -204,7 +211,7 @@ export async function runFleetUpgrade(
   }
   const target = targetR.target;
 
-  const available = [...new Set(resolved.discover().map((r) => r.registry))];
+  const available = [...new Set(resolved.discover().map((r) => r.project))];
   const selectors = [...splitSelectors(opts.fleet), ...splitSelectors(opts.registry)];
   const { fleets, unknown } = selectFleets(available, selectors, resolved.defaultFleet);
   for (const u of unknown) {
@@ -284,9 +291,12 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
 
 /**
  * Wire the production deps from the project config: host discovery, npm-latest,
- * the default fleet (this project's registry), and a per-fleet driver resolver
- * that binds `createVmDriverFromConfig` at a REPRESENTATIVE workspace of the
- * fleet. Returns null (diagnostic on stderr) when the project isn't initialised.
+ * the default fleet (this workspace's OWN project — macf#710), and a per-fleet
+ * driver resolver that binds `createVmDriverFromConfig` at a REPRESENTATIVE
+ * workspace OF THAT PROJECT (so the driver carries the project's own CA +
+ * registry namespace, never a sibling project's sharing the same registry
+ * scope). Returns null (diagnostic on stderr) when the project isn't
+ * initialised.
  */
 async function resolveDepsFromConfig(projectDir: string): Promise<FleetUpgradeDeps | null> {
   const config = readAgentConfig(projectDir);
@@ -294,7 +304,7 @@ async function resolveDepsFromConfig(projectDir: string): Promise<FleetUpgradeDe
     console.error('No macf-agent.json found. Run `macf init` first.');
     return null;
   }
-  const defaultFleet = registryIdentifier(config.registry);
+  const defaultFleet = config.project;
   const discover = (): readonly WorkspaceRecord[] => discoverWorkspaces();
 
   return {
@@ -305,7 +315,7 @@ async function resolveDepsFromConfig(projectDir: string): Promise<FleetUpgradeDe
       return r.status === 'ok' ? r.value : null;
     },
     resolveDriver: async (fleet: string): Promise<FleetDriver | null> => {
-      const rep = discover().find((r) => r.registry === fleet);
+      const rep = discover().find((r) => r.project === fleet);
       if (!rep) {
         console.error(`macf fleet upgrade: no workspace for fleet '${fleet}' on this host.`);
         return null;

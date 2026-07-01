@@ -51,7 +51,10 @@ export type UpgradeDisposition = 'behind' | 'at-target' | 'offline';
 export interface AgentUpgradePlan {
   /** The agent's routing label (registry key). */
   readonly agent: string;
-  /** The fleet (registry identifier) this member belongs to. */
+  /**
+   * The fleet this member belongs to — the workspace's PROJECT (macf#710), NOT
+   * its (possibly-shared) registry scope. See `WorkspaceRecord.project`.
+   */
   readonly fleet: string;
   /** The agent's live self-reported `/health.version`, or `null` when offline/version-less. */
   readonly runningVersion: string | null;
@@ -121,7 +124,7 @@ export function planFleetUpgrade(
     }
     return {
       agent: m.agent,
-      fleet: m.registry,
+      fleet: m.project,
       runningVersion,
       pinnedVersion: m.versionPin,
       disposition,
@@ -254,9 +257,11 @@ export interface UpgradeFleetsOptions extends RollFleetOptions {
 /** Injected seams for the multi-fleet orchestrator. */
 export interface UpgradeFleetsDeps {
   /**
-   * Resolve the driver for a fleet (registry identifier). Production binds
-   * `createVmDriverFromConfig` at a representative workspace; tests return a fake.
-   * `null` ⇒ the fleet cannot be reached (skip + report, NOT a halt).
+   * Resolve the driver for a fleet (a PROJECT identifier — macf#710). Production
+   * binds `createVmDriverFromConfig` at a representative workspace OF THAT
+   * PROJECT (so the driver's mTLS CA + registry namespace are the project's own,
+   * never a sibling project's sharing the same registry scope); tests return a
+   * fake. `null` ⇒ the fleet cannot be reached (skip + report, NOT a halt).
    */
   readonly resolveDriver: (fleet: string) => Promise<FleetDriver | null>;
   readonly verifyGreen: (opts: VerifyGreenOptions) => Promise<VerifyGreenResult>;
@@ -284,11 +289,14 @@ export interface FleetUpgradeReport {
 }
 
 /**
- * Orchestrate a rolling upgrade across the ORDERED `fleets` (registry
- * identifiers), fleet-by-fleet. Each fleet is probed + planned; in EXECUTE mode
- * it is then rolled, and a HALT in one fleet STOPS the whole run — later fleets
- * are never started (a bad release cannot cascade across fleets). An unresolvable
- * fleet is skipped + reported and does NOT halt the run.
+ * Orchestrate a rolling upgrade across the ORDERED `fleets` (PROJECT
+ * identifiers — macf#710: a "fleet" == a project, which owns its own CA +
+ * registry namespace + version cadence; a profile/org registry scope hosting N
+ * projects yields N fleets here, never one), fleet-by-fleet. Each fleet is
+ * probed + planned; in EXECUTE mode it is then rolled, and a HALT in one fleet
+ * STOPS the whole run — later fleets are never started (a bad release cannot
+ * cascade across fleets). An unresolvable fleet is skipped + reported and does
+ * NOT halt the run.
  */
 export async function upgradeFleets(
   fleets: readonly string[],
@@ -306,7 +314,7 @@ export async function upgradeFleets(
       continue;
     }
 
-    const members = driver.discoverWorkspaces().filter((r) => r.registry === fleet);
+    const members = driver.discoverWorkspaces().filter((r) => r.project === fleet);
     const state = await driver.probe();
     const plans = planFleetUpgrade(members, state, opts.targetVersion);
     const behind = plans.filter((p) => p.disposition === 'behind').length;

@@ -79,6 +79,24 @@ describe('parseWorkspace', () => {
       agent: 'code-agent',
       workspace: '/root/macf',
       registry: 'groundnuty',
+      project: 'macf',
+      versionPin: '0.2.44',
+    });
+  });
+
+  it('carries a DIFFERENT project through even under the SAME profile registry (macf#710)', () => {
+    // Two projects (macf substrate + icsoc_2026) sharing one `groundnuty`
+    // profile registry must parse to DIFFERENT `project` values so `fleet
+    // upgrade` can group them into two separate fleets, each with its own CA.
+    const fs = fakeFs({
+      '/root/icsoc/.macf/macf-agent.json': config('icsoc-agent', { project: 'icsoc_2026' }),
+    });
+    const rec = parseWorkspace(fs, '/root/icsoc');
+    expect(rec).toEqual({
+      agent: 'icsoc-agent',
+      workspace: '/root/icsoc',
+      registry: 'groundnuty', // SAME registry scope as the macf fixture above
+      project: 'icsoc_2026', // DIFFERENT project/fleet
       versionPin: '0.2.44',
     });
   });

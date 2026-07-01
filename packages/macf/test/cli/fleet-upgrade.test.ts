@@ -6,7 +6,7 @@
  * fleets). The heavy state-machine coverage lives in macf-core's
  * `fleet-upgrade.test.ts`; here we verify the RESOLVE + RENDER + wiring seam.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type {
   FleetDriver,
   FleetState,
@@ -48,8 +48,9 @@ function mkState(rows: readonly [string, string | null, boolean?][]): FleetState
   };
 }
 
-function mkWs(agent: string, registry: string, pin: string | null): WorkspaceRecord {
-  return { agent, workspace: `/w/${agent}`, registry, versionPin: pin };
+/** `fleet` feeds BOTH `registry` and `project` (macf#710: `project` is the true grouping key). */
+function mkWs(agent: string, fleet: string, pin: string | null): WorkspaceRecord {
+  return { agent, workspace: `/w/${agent}`, registry: fleet, project: fleet, versionPin: pin };
 }
 
 interface Calls {
@@ -236,5 +237,117 @@ describe('runFleetUpgrade', () => {
     const { deps } = makeDeps({ discover: () => [], defaultFleet: null });
     const code = await runFleetUpgrade('/proj', {}, deps);
     expect(code).toBe(1);
+  });
+
+  // --- macf#710: a profile registry hosting multiple projects must split into
+  // multiple fleets, each probed with a driver bound to THAT project's own CA
+  // (not a sibling project's) --------------------------------------------------
+  describe('multi-project discovery under one profile registry (macf#710)', () => {
+    /**
+     * Two workspaces sharing the SAME `registry` scope (`groundnuty` — modeling
+     * a profile registry) but belonging to DIFFERENT projects (`macf` +
+     * `icsoc_2026`). Before #710 these collapsed into one fleet (grouped by
+     * `registry`); after #710 they must discover as TWO separate fleets.
+     */
+    const CROSS_PROJECT_WORKSPACES: readonly WorkspaceRecord[] = [
+      { agent: 'code-agent', workspace: '/w/code-agent', registry: 'groundnuty', project: 'macf', versionPin: '0.2.40' },
+      { agent: 'icsoc-agent', workspace: '/w/icsoc-agent', registry: 'groundnuty', project: 'icsoc_2026', versionPin: '0.2.40' },
+    ];
+
+    /** Build a per-project driver bound ONLY to that project's own member(s) — models `createVmDriverFromConfig`'s CA binding. */
+    function makeProjectDriver(
+      project: string,
+      members: readonly WorkspaceRecord[],
+      opts: { base: string; target: string },
+    ): { driver: FleetDriver; calls: Calls } {
+      const calls: Calls = { upgrade: [], restart: [] };
+      const restarted = new Set<string>();
+      const own = members.filter((m) => m.project === project);
+      const driver: FleetDriver = {
+        probe: async () =>
+          mkState(own.map((m) => [m.agent, restarted.has(m.agent) ? opts.target : opts.base])),
+        discoverWorkspaces: () => members, // full host scan — filtering is the CALLER's job (macf-core's upgradeFleets)
+        isBusy: async () => false,
+        upgrade: async (a) => { calls.upgrade.push(a); },
+        restart: async (a) => { calls.restart.push(a); restarted.add(a); },
+        inject: async () => {},
+        launch: async () => {},
+      };
+      return { driver, calls };
+    }
+
+    it('discovers TWO fleets (one per project) from a single profile-registry host scan', async () => {
+      const { deps, lines } = makeDeps({
+        discover: () => CROSS_PROJECT_WORKSPACES,
+        defaultFleet: 'macf',
+        resolveDriver: async () => null, // dry-run plan doesn't need a real driver resolution to enumerate fleets
+      });
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        // No selectors + defaultFleet='macf' would only plan macf; explicitly
+        // select both projects to exercise the multi-fleet discovery path.
+        const code = await runFleetUpgrade('/proj', { fleet: 'macf,icsoc_2026' }, deps);
+        // Both fleets are recognized as PRESENT on this host — neither is
+        // reported as an unknown selector (which WOULD happen if the available
+        // set were still keyed by the shared registry scope 'groundnuty').
+        expect(errSpy).not.toHaveBeenCalledWith(expect.stringContaining('no fleet'));
+        // Both fleets are reported SKIPPED (driver-unresolved) rather than
+        // halted, so the run exits 0 — the load-bearing assertion is that BOTH
+        // fleet identifiers were recognized + attempted, not the exit code.
+        expect(code).toBe(0);
+        expect(lines.join('\n')).toContain('fleet macf');
+        expect(lines.join('\n')).toContain('fleet icsoc_2026');
+      } finally {
+        errSpy.mockRestore();
+      }
+    });
+
+    it('rolls macf with a driver scoped to ONLY macf members, never touching icsoc_2026 agents', async () => {
+      const macfDriver = makeProjectDriver('macf', CROSS_PROJECT_WORKSPACES, { base: '0.2.40', target: '0.2.41' });
+      const icsocDriver = makeProjectDriver('icsoc_2026', CROSS_PROJECT_WORKSPACES, { base: '0.2.40', target: '0.2.41' });
+      const resolveDriver = async (fleet: string): Promise<FleetDriver | null> =>
+        fleet === 'macf' ? macfDriver.driver : fleet === 'icsoc_2026' ? icsocDriver.driver : null;
+
+      const { deps } = makeDeps({
+        discover: () => CROSS_PROJECT_WORKSPACES,
+        defaultFleet: 'macf',
+        resolveDriver,
+      });
+      const code = await runFleetUpgrade(
+        '/proj',
+        { execute: true, fleet: 'macf,icsoc_2026' },
+        deps,
+      );
+      expect(code).toBe(0);
+      // macf's driver only ever sees/rolls 'code-agent' — never 'icsoc-agent'.
+      expect(macfDriver.calls.upgrade).toEqual(['code-agent']);
+      expect(macfDriver.calls.restart).toEqual(['code-agent']);
+      // icsoc's driver only ever sees/rolls 'icsoc-agent' — never 'code-agent'.
+      expect(icsocDriver.calls.upgrade).toEqual(['icsoc-agent']);
+      expect(icsocDriver.calls.restart).toEqual(['icsoc-agent']);
+    });
+
+    it('the available-fleets list is keyed by project, not by the (shared) registry scope', async () => {
+      const { deps } = makeDeps({
+        discover: () => CROSS_PROJECT_WORKSPACES,
+        defaultFleet: null,
+        resolveDriver: async () => null,
+      });
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        // 'groundnuty' is the SHARED registry scope of both fixture workspaces —
+        // under the pre-#710 registry-grouping this would have been a valid
+        // fleet selector. Post-#710 it must be reported UNKNOWN (the available
+        // set is now ['macf', 'icsoc_2026'], never 'groundnuty').
+        const code = await runFleetUpgrade('/proj', { fleet: 'groundnuty' }, deps);
+        expect(code).toBe(1);
+        const errText = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
+        expect(errText).toContain("no fleet 'groundnuty' discovered on this host");
+        expect(errText).toContain('macf');
+        expect(errText).toContain('icsoc_2026');
+      } finally {
+        errSpy.mockRestore();
+      }
+    });
   });
 });

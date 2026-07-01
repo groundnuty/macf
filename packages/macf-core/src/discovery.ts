@@ -2,8 +2,10 @@
  * The workspace-discovery record + its pure helpers (DR-037 Decision 4).
  *
  * This is the shared substrate the fleet operational-layer subcommands consume:
- * `macf ps` (alive∪dead enumeration), `macf fleet upgrade` (group-by-registry →
- * fleets), and the watchdog (desired-set reconcile) all read the same primitive.
+ * `macf ps` (alive∪dead enumeration), `macf fleet upgrade` (group-by-PROJECT →
+ * fleets — macf#710; a project owns its own CA + registry namespace, so it is
+ * the correct grouping key, NOT the coarser `registry` scope), and the watchdog
+ * (desired-set reconcile) all read the same primitive.
  *
  * The record shape + the RUNTIME-and-CLI-independent helpers live HERE in
  * macf-core (DR-037 OQ2 — pure/portable logic in macf-core); the VM-filesystem
@@ -32,12 +34,32 @@ export const WorkspaceRecordSchema = z.object({
    */
   workspace: z.string(),
   /**
-   * The registry this workspace belongs to, as a stable GROUPING identifier —
-   * `owner/repo` (repo scope), the org / profile-user name (org / profile
-   * scope), or `local` (DR-024 local-registry mode). A "fleet" == a registry,
-   * so `fleet upgrade` groups by this field. Derive via `registryIdentifier`.
+   * The registry this workspace belongs to, as a stable identifier — `owner/repo`
+   * (repo scope), the org / profile-user name (org / profile scope), or `local`
+   * (DR-024 local-registry mode). Derive via `registryIdentifier`.
+   *
+   * NOT the fleet-grouping key (macf#710) — a profile/org registry scope is the
+   * NETWORK ENDPOINT (e.g. the `groundnuty/groundnuty` GitHub repo backing a
+   * profile registry), which multiple DISTINCT projects can share. Each project
+   * has its own registry NAMESPACE (`MACF_AGENT_*` vs `ICSOC_2026_AGENT_*`) and
+   * its own CA (`MACF_CA_CERT` vs `ICSOC_2026_CA_CERT` — see
+   * `createVmDriverFromConfig`'s `${toVariableSegment(config.project)}_CA_CERT`
+   * lookup). Grouping by `registry` collapsed distinct projects sharing one
+   * profile/org scope into a single fleet, so a driver built from one project's
+   * workspace (its CA) was used to probe the other project's agents — wrong CA,
+   * false-negative UNREACHABLE. See `project` below for the correct grouping key.
    */
   registry: z.string(),
+  /**
+   * The project this workspace belongs to (`.macf/macf-agent.json` `project`) —
+   * its own CA + registry namespace + version cadence. THE fleet-grouping key
+   * (macf#710, superseding the pre-#710 `registry`-based grouping): `fleet
+   * upgrade` groups discovered workspaces by this field, so a `groundnuty`
+   * profile-registry host running BOTH `macf` and `icsoc_2026` projects
+   * discovers as TWO fleets, each rolled with a driver bound to that project's
+   * own CA — no cross-project probe mismatch.
+   */
+  project: z.string(),
   /**
    * The workspace's pinned framework version (`.macf/macf-agent.json`
    * `versions.cli`), or `null` when the config carries no pin (legacy / pre-P6).
@@ -50,18 +72,26 @@ export const WorkspaceRecordSchema = z.object({
 export type WorkspaceRecord = z.infer<typeof WorkspaceRecordSchema>;
 
 /**
- * Render a `RegistryConfig` as its stable fleet-grouping identifier (a "fleet"
- * == a registry — DR-037 Decision 1). Pure.
+ * Render a `RegistryConfig` as its stable, human-legible identifier. Pure.
  *
  * - `repo`    → `owner/repo`
  * - `org`     → the org name
- * - `profile` → the profile user name (the substrate case: every `groundnuty`
- *               profile-registry workspace groups into one fleet)
+ * - `profile` → the profile user name (e.g. every `groundnuty` profile-registry
+ *               workspace, REGARDLESS of which project it belongs to, renders
+ *               the same identifier here — it names the shared NETWORK ENDPOINT,
+ *               not a fleet)
  * - `local`   → `local` (DR-024)
  *
+ * NOTE (macf#710): this identifier is NOT the fleet-grouping key — see
+ * `WorkspaceRecord.project` for that. Prior to #710, `fleet upgrade` grouped by
+ * this identifier (DR-037 Decision 1's original framing), which collapsed
+ * distinct projects sharing one profile/org registry scope into a single fleet.
+ * `registryIdentifier` remains useful for display + for resolving a genuinely
+ * registry-scoped target (e.g. `fleet-resume`'s repo-scoped alert-repo lookup).
+ *
  * Org and profile scopes collapse to a bare name; a theoretical `org foo` vs
- * `profile foo` collision is accepted for this grouping heuristic (they are not
- * both used by one host in practice) and keeps the identifier human-legible.
+ * `profile foo` collision is accepted for this heuristic (they are not both
+ * used by one host in practice) and keeps the identifier human-legible.
  */
 export function registryIdentifier(config: RegistryConfig): string {
   switch (config.type) {
