@@ -18,6 +18,8 @@ export * from './token.js';
 export * from './types.js';
 export * from './semver.js';
 export * from './discovery.js';
+export * from './fleet-driver.js';
+export * from './verify-green.js';
 export * from './reflection.js';
 export * from './prompt-responses.js';
 export * from './guest.js';
