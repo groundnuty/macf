@@ -199,7 +199,29 @@ _entry_matches() {
   return 0
 }
 
-_capture() { tmux capture-pane -t "$PANE" -p 2>/dev/null || true; }
+# Own-output marker — every line this watcher writes (via _log/_alert) is
+# prefixed with this. When the watcher's stderr shares the watched pane (the
+# canonical claude.sh wiring backgrounds it into the SAME tmux pane it
+# watches), its own ALERT lines land back in the very frame the next poll
+# captures. An ALERT line embeds an excerpt of the offending frame (which for
+# an unknown MENU prompt contains the `❯` glyph) — so the alert itself
+# "looks prompt-like" to `_looks_prompt_like` on the very next poll, causing
+# an infinite self-alert feedback loop (groundnuty/macf#712). Filtering the
+# marker out of every captured frame, BEFORE any matching/detection runs,
+# makes the watcher blind to its own emitted output structurally, regardless
+# of where its stderr happens to be wired.
+readonly OWN_MARKER='[macf-prompt-watcher]'
+
+# _strip_own_output <frame> → the frame with every line containing this
+# watcher's own log/alert marker removed.
+_strip_own_output() {
+  printf '%s' "$1" | grep -vF -- "$OWN_MARKER" || true
+}
+
+_capture() {
+  local raw; raw="$(tmux capture-pane -t "$PANE" -p 2>/dev/null || true)"
+  _strip_own_output "$raw"
+}
 
 # --- handle a matched entry: settle → send → verify --------------------------
 _handle_match() { # <frame> <idx>
