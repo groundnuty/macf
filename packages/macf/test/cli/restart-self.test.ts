@@ -13,11 +13,13 @@
  *   - refuses cleanly when the session name can't be resolved.
  *   - --json emits the versioned state-record.
  */
+import { spawnSync } from 'node:child_process';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   buildRelauncherScript,
   buildResumeNote,
   coerceReason,
+  relauncherGuardLines,
   resolveIdentity,
   resolveSession,
   runRestartSelf,
@@ -37,6 +39,7 @@ interface Recorder {
   spawned: { path: string; args: readonly string[] }[];
   killed: string[];
   mkdirs: string[];
+  backedUp: { session: string; prestatePath: string }[];
 }
 
 /** A fake deps set that records every side-effecting call + its order. */
@@ -44,7 +47,14 @@ function fakeDeps(overrides: Partial<RestartSelfDeps> = {}): {
   deps: RestartSelfDeps;
   rec: Recorder;
 } {
-  const rec: Recorder = { order: [], written: [], spawned: [], killed: [], mkdirs: [] };
+  const rec: Recorder = {
+    order: [],
+    written: [],
+    spawned: [],
+    killed: [],
+    mkdirs: [],
+    backedUp: [],
+  };
   const deps: RestartSelfDeps = {
     now: () => FIXED_NOW,
     hasUncommittedTrackedChanges: () => true,
@@ -69,6 +79,11 @@ function fakeDeps(overrides: Partial<RestartSelfDeps> = {}): {
     killSession: (session: string) => {
       rec.order.push('kill');
       rec.killed.push(session);
+    },
+    backupTranscript: (session: string, prestatePath: string) => {
+      rec.order.push('backup');
+      rec.backedUp.push({ session, prestatePath });
+      return null;
     },
     ...overrides,
   };
@@ -158,16 +173,20 @@ describe('runRestartSelf — confirm path', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
   afterEach(() => logSpy?.mockRestore());
 
-  it('calls deps in order prepare → note → spawn → kill, exactly once each', async () => {
+  it('calls deps in order prepare → backup → note → spawn → kill, exactly once each', async () => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const { deps, rec } = fakeDeps();
     const code = await runRestartSelf(baseOpts({ confirm: true, reason: 'fault' }), deps);
     expect(code).toBe(0);
-    // prepare(stash) → note(write) → spawn(write+spawn) → kill
-    expect(rec.order).toEqual(['stash', 'write', 'write', 'spawn', 'kill']);
+    // prepare(stash) → backup(transcript) → note(write) → spawn(write+spawn) → kill
+    expect(rec.order).toEqual(['stash', 'backup', 'write', 'write', 'spawn', 'kill']);
     expect(rec.killed).toEqual(['macf@code-agent']);
     expect(rec.spawned).toHaveLength(1);
     expect(rec.mkdirs).toHaveLength(1);
+    // transcript backup fires BEFORE the spawn/kill, keyed on the resolved session.
+    expect(rec.backedUp).toHaveLength(1);
+    expect(rec.backedUp[0].session).toBe('macf@code-agent');
+    expect(rec.backedUp[0].prestatePath).toContain('restart-self-session-prestate.env');
   });
 
   it('stashes only when dirty; label is macf-restart-self/<ts>/<reason>', async () => {
@@ -181,7 +200,7 @@ describe('runRestartSelf — confirm path', () => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const { deps, rec } = fakeDeps({ hasUncommittedTrackedChanges: () => false });
     await runRestartSelf(baseOpts({ confirm: true }), deps);
-    expect(rec.order).toEqual(['write', 'write', 'spawn', 'kill']); // no 'stash'
+    expect(rec.order).toEqual(['backup', 'write', 'write', 'spawn', 'kill']); // no 'stash'
     expect(rec.stashedLabel).toBeUndefined();
   });
 
@@ -261,17 +280,46 @@ describe('buildResumeNote', () => {
 });
 
 describe('buildRelauncherScript', () => {
-  it('uses absolute, shell-quoted paths + the ~30s session-death poll', () => {
-    const s = buildRelauncherScript({
+  const relauncher = (): string =>
+    buildRelauncherScript({
       workspaceDir: '/ws',
       session: 'macf@code-agent',
       iso: FIXED_NOW.toISOString(),
+      prestatePath: '/ws/.claude/.macf/restart-self-session-prestate.env',
+      guardLogPath: '/ws/.claude/.macf/restart-self-guard.log',
     });
+
+  it('uses absolute, shell-quoted paths + the ~30s session-death poll', () => {
+    const s = relauncher();
     expect(s).toContain("WORKSPACE='/ws'");
     expect(s).toContain("SESSION='macf@code-agent'");
     expect(s).toContain('/ws/.claude/.macf/host-prelude.sh');
     expect(s).toContain('seq 1 60');
     expect(s.startsWith('#!/usr/bin/env bash')).toBe(true);
+  });
+
+  it('embeds the pre-state + guard-log paths and the assert-survived watcher', () => {
+    const s = relauncher();
+    expect(s).toContain("PRESTATE='/ws/.claude/.macf/restart-self-session-prestate.env'");
+    expect(s).toContain("GUARD_LOG='/ws/.claude/.macf/restart-self-guard.log'");
+    // The watcher is spawned (detached) BEFORE the exec so it survives it.
+    expect(s).toContain('assert_transcript_survived >>"$GUARD_LOG" 2>&1 &');
+    expect(s).toContain('if [ -f "$PRESTATE" ]; then');
+    expect(s).toContain('session_survived()');
+    expect(s).toContain('session_post_state()');
+    // The guard watcher precedes the exec (must not run after exec replaces us).
+    expect(s.indexOf('assert_transcript_survived >>')).toBeLessThan(s.indexOf('exec ./claude.sh'));
+  });
+
+  it('waits for the relaunch to come live before comparing (avoids the re-open race)', () => {
+    const s = relauncher();
+    expect(s).toContain('MACF_RESTART_LIVE_TIMEOUT');
+    expect(s).toContain('-gt "${pre_mtime:-0}"'); // mtime-advancing liveness poll
+    // cross-platform stat for both mtime (%Y/%m) and size (%s/%z)
+    expect(s).toContain('stat -c%Y');
+    expect(s).toContain('stat -f%m');
+    expect(s).toContain('stat -c%s');
+    expect(s).toContain('stat -f%z');
   });
 });
 
@@ -303,5 +351,67 @@ describe('resolveIdentity', () => {
   it('falls back to projectDir for the workspace when env is unset', () => {
     const id = resolveIdentity('/proj', {} as NodeJS.ProcessEnv);
     expect(id.workspaceDir).toBe('/proj');
+  });
+});
+
+/**
+ * The assert-survived guard is generated SHELL (it runs in the detached
+ * relauncher, where TS can't). Lift the VM reference's 6 unit-tested guard cases
+ * (fleet/upgrade.sh) by executing the ACTUAL generated `session_survived` through
+ * bash with the `MACF_TEST_SESSION` seam — the shipped code is the code tested.
+ */
+describe('relauncher session_survived — 6 guard cases (macf#685)', () => {
+  // Drive session_survived("/x", "u1 100") with MACF_TEST_SESSION per case.
+  const PRE = 'u1 100';
+  function run(seam: string): { exit: number; out: string } {
+    const script = [
+      'set -uo pipefail',
+      ...relauncherGuardLines(),
+      'if session_survived "/x" "$1"; then echo "RESULT:survive"; else echo "RESULT:halt"; fi',
+    ].join('\n');
+    const r = spawnSync('bash', ['-c', script, 'bash', PRE], {
+      env: { ...process.env, MACF_TEST_SESSION: seam },
+      encoding: 'utf-8',
+    });
+    return { exit: r.status ?? -1, out: r.stdout + r.stderr };
+  }
+
+  it('1. same uuid, grew → survive', () => {
+    expect(run('u1,200').out).toContain('RESULT:survive');
+  });
+  it('2. same uuid, same size → survive', () => {
+    expect(run('u1,100').out).toContain('RESULT:survive');
+  });
+  it('3. same uuid, SHRANK → halt', () => {
+    const r = run('u1,50');
+    expect(r.out).toContain('RESULT:halt');
+    expect(r.out).toContain('SHRANK');
+  });
+  it('4. transcript GONE → halt', () => {
+    const r = run('');
+    expect(r.out).toContain('RESULT:halt');
+    expect(r.out).toContain('no active transcript');
+  });
+  it('5. uuid changed but grew → survive + note', () => {
+    const r = run('u2,300');
+    expect(r.out).toContain('RESULT:survive');
+    expect(r.out).toContain('uuid changed u1 -> u2');
+  });
+  it('6. uuid changed AND shrank → halt', () => {
+    expect(run('u2,40').out).toContain('RESULT:halt');
+  });
+
+  it('missing pre-state → guard skipped (survive)', () => {
+    const script = [
+      'set -uo pipefail',
+      ...relauncherGuardLines(),
+      'if session_survived "/x" ""; then echo "RESULT:survive"; else echo "RESULT:halt"; fi',
+    ].join('\n');
+    const r = spawnSync('bash', ['-c', script], {
+      env: { ...process.env, MACF_TEST_SESSION: 'u1,50' },
+      encoding: 'utf-8',
+    });
+    expect(r.stdout).toContain('RESULT:survive');
+    expect(r.stdout).toContain('no pre-state');
   });
 });

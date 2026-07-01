@@ -30,6 +30,11 @@ import { spawn, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { readAgentConfig } from '../config.js';
+import {
+  backupSessionTranscript,
+  createRealTranscriptDeps,
+  type TranscriptPreState,
+} from './transcript-backup.js';
 
 /** The three restart drivers (DR-031 §"Be-replaceable" — fault / upgrade / manual). */
 export const RESTART_REASONS = ['fault', 'upgrade', 'manual'] as const;
@@ -63,6 +68,16 @@ export interface RestartSelfDeps {
   readonly mkdirp: (path: string) => void;
   readonly spawnDetached: (scriptPath: string, args: readonly string[]) => void;
   readonly killSession: (session: string) => void;
+  /**
+   * Back up the active session transcript (rotating) + write the pre-state file
+   * the relauncher reads to assert-survived (macf#685). Returns the recorded
+   * pre-state, or `null` when there is no active transcript to protect.
+   */
+  readonly backupTranscript: (
+    session: string,
+    prestatePath: string,
+    now: Date,
+  ) => TranscriptPreState | null;
 }
 
 /** Options for `runRestartSelf` (already-resolved identity; pure orchestrator input). */
@@ -127,6 +142,10 @@ const RESUME_NOTE_REL = join('.claude', '.macf', 'RESUME-restart-self.md');
 const RELAUNCHER_REL = join('.claude', '.macf', 'restart-self-relauncher.sh');
 const HOST_PRELUDE_REL = join('.claude', '.macf', 'host-prelude.sh');
 const MACF_DIR_REL = join('.claude', '.macf');
+/** Pre-restart transcript state (macf#685) — written here, read by the relauncher. */
+const SESSION_PRESTATE_REL = join('.claude', '.macf', 'restart-self-session-prestate.env');
+/** Forensic log the detached relauncher's assert-survived writes into (macf#685). */
+const GUARD_LOG_REL = join('.claude', '.macf', 'restart-self-guard.log');
 
 /** The RESUME-note body — what a future session needs to pick the work back up. */
 export function buildResumeNote(args: {
@@ -159,17 +178,27 @@ export function buildResumeNote(args: {
 
 /**
  * The detached relauncher script. Waits for the OLD session to die (up to ~30s),
- * then `cd`s to the workspace, sources the host-prelude IF it exists (decoupled
- * from DR-031 piece 4 — proceed if absent), and `exec`s the launcher. Uses
- * absolute paths so it does not depend on the dying session's env beyond what it
- * re-establishes.
+ * then `cd`s to the workspace, spawns the assert-survived watcher (macf#685),
+ * sources the host-prelude IF it exists (decoupled from DR-031 piece 4 — proceed
+ * if absent), and `exec`s the launcher. Uses absolute paths so it does not depend
+ * on the dying session's env beyond what it re-establishes.
+ *
+ * Assert-survived is Pattern A (silent-fallback-hazards): "restart exited 0" ≠
+ * "the transcript survived". It runs in a DETACHED background watcher spawned
+ * BEFORE the `exec` (exec replaces this process, so nothing after it runs — the
+ * watcher is a separate PID that outlives the exec and polls the relaunched
+ * session). It WAITS for the relaunch to come live (transcript mtime advancing)
+ * BEFORE comparing — comparing the instant the relaunch spawns races the
+ * transcript re-open and false-trips gone/shrank.
  */
 export function buildRelauncherScript(args: {
   readonly workspaceDir: string;
   readonly session: string;
   readonly iso: string;
+  readonly prestatePath: string;
+  readonly guardLogPath: string;
 }): string {
-  const { workspaceDir, session, iso } = args;
+  const { workspaceDir, session, iso, prestatePath, guardLogPath } = args;
   const prelude = join(workspaceDir, HOST_PRELUDE_REL);
   return [
     '#!/usr/bin/env bash',
@@ -179,6 +208,13 @@ export function buildRelauncherScript(args: {
     `WORKSPACE=${shq(workspaceDir)}`,
     `SESSION=${shq(session)}`,
     `PRELUDE=${shq(prelude)}`,
+    `PRESTATE=${shq(prestatePath)}`,
+    `GUARD_LOG=${shq(guardLogPath)}`,
+    '# Wait-for-live poll bounds (assert-survived rides the relaunch coming up).',
+    'LIVE_TIMEOUT="${MACF_RESTART_LIVE_TIMEOUT:-120}"',
+    'LIVE_INTERVAL="${MACF_RESTART_LIVE_INTERVAL:-3}"',
+    '',
+    ...relauncherGuardLines(),
     '',
     '# Wait for the dying session to actually exit (up to ~30s) so the relaunch',
     "# self-wrap re-creates it cleanly instead of attaching to the corpse.",
@@ -188,6 +224,16 @@ export function buildRelauncherScript(args: {
     'done',
     '',
     'cd "$WORKSPACE" || exit 1',
+    '',
+    '# Assert-survived (Pattern A, macf#685): spawn the guard as a DETACHED watcher',
+    '# BEFORE the exec below — exec replaces this process, so anything after it never',
+    '# runs; the watcher is a separate PID that survives the exec and polls the',
+    '# relaunched session. Fail-open: it never blocks or aborts the relaunch.',
+    'if [ -f "$PRESTATE" ]; then',
+    '  assert_transcript_survived >>"$GUARD_LOG" 2>&1 &',
+    '  disown 2>/dev/null || true',
+    'fi',
+    '',
     '# host-prelude re-establishes the toolchain (brew/devbox PATH) for a minimal',
     '# (cron/detached) env. Decoupled from DR-031 piece 4 — proceed if absent.',
     'if [ -f "$PRELUDE" ]; then',
@@ -197,6 +243,92 @@ export function buildRelauncherScript(args: {
     'exec ./claude.sh',
     '',
   ].join('\n');
+}
+
+/**
+ * The assert-survived guard functions embedded in the relauncher (macf#685).
+ * Lifted from the VM reference `fleet/upgrade.sh` (`session_state` /
+ * `session_survived`), split so the pure compare (`session_survived`) is
+ * unit-testable via the `MACF_TEST_SESSION` seam WITHOUT real files.
+ *
+ * The invariant (append-only `.jsonl`): a healthy resume keeps the transcript at
+ * least as large as before. LOSS = the transcript is GONE, or it SHRANK (a size
+ * regression is impossible for an append-only log → truncation / fresh-start /
+ * mis-resume). A uuid change WITH growth is allowed but NOTED.
+ */
+export function relauncherGuardLines(): readonly string[] {
+  return [
+    '# --- assert-survived guard (Pattern A; macf#685) --------------------------',
+    '# session_post_state <projdir> -> "<uuid> <bytes>" of the newest .jsonl, "" if none.',
+    '# Test seam: MACF_TEST_SESSION="<uuid>,<bytes>" DEFINED => authoritative (skips disk).',
+    'session_post_state() {',
+    '  if [ "${MACF_TEST_SESSION+set}" = set ]; then',
+    '    [ -n "$MACF_TEST_SESSION" ] && printf \'%s\\n\' "$MACF_TEST_SESSION" | tr \',\' \' \'',
+    '    return 0',
+    '  fi',
+    '  local projdir="$1" sf',
+    '  sf="$(ls -t "$projdir"/*.jsonl 2>/dev/null | head -1)"',
+    '  [ -n "${sf:-}" ] && [ -f "$sf" ] || { echo ""; return 0; }',
+    '  echo "$(basename "$sf" .jsonl) $(stat -c%s "$sf" 2>/dev/null || stat -f%z "$sf" 2>/dev/null || echo 0)"',
+    '}',
+    '',
+    '# session_survived <projdir> "<pre_uuid> <pre_size>" -> 0 survived, 1 HALT (state loss).',
+    'session_survived() {',
+    '  local projdir="$1" pre="$2" post pre_uuid pre_size post_uuid post_size',
+    '  [ -n "$pre" ] || { echo "[state-guard] no pre-state — guard skipped"; return 0; }',
+    '  post="$(session_post_state "$projdir")"',
+    '  pre_uuid="${pre%% *}"; pre_size="${pre##* }"',
+    '  if [ -z "$post" ]; then',
+    '    echo "[STATE-GUARD] HALT: no active transcript after restart — possible state loss."',
+    '    return 1',
+    '  fi',
+    '  post_uuid="${post%% *}"; post_size="${post##* }"',
+    '  if [ "${post_size:-0}" -lt "${pre_size:-0}" ]; then',
+    '    echo "[STATE-GUARD] HALT: transcript SHRANK after restart (pre=[$pre] post=[$post]) — truncation / fresh-start / mis-resume."',
+    '    return 1',
+    '  fi',
+    '  [ "$post_uuid" != "$pre_uuid" ] && echo "[state-guard] note: uuid changed $pre_uuid -> $post_uuid (grew — not a loss, but verify the right session resumed)."',
+    '  return 0',
+    '}',
+    '',
+    '# assert_transcript_survived — WAIT for the relaunch to come live (the transcript',
+    "# mtime advancing past pre-restart), THEN compare. Comparing the instant the",
+    '# relaunch spawns races the transcript re-open + false-trips gone/shrank.',
+    'assert_transcript_survived() {',
+    '  # shellcheck disable=SC1090',
+    '  . "$PRESTATE" 2>/dev/null || { echo "[state-guard] pre-state unreadable — guard skipped"; return 0; }',
+    '  local projdir="${MACF_RESTART_PROJECT_DIR:-}" pre_uuid="${MACF_RESTART_PRE_UUID:-}"',
+    '  local pre_size="${MACF_RESTART_PRE_SIZE:-0}" pre_mtime="${MACF_RESTART_PRE_MTIME:-0}"',
+    '  local backup_dir="${MACF_RESTART_BACKUP_DIR:-}"',
+    '  [ -n "$projdir" ] || { echo "[state-guard] no project dir in pre-state — guard skipped"; return 0; }',
+    '',
+    '  # wait-for-live: poll the active transcript mtime advancing past pre-restart.',
+    '  local deadline=$(( $(date +%s) + LIVE_TIMEOUT )) live=0 sf cur',
+    '  while [ "$(date +%s)" -lt "$deadline" ]; do',
+    '    sf="$(ls -t "$projdir"/*.jsonl 2>/dev/null | head -1)"',
+    '    if [ -n "${sf:-}" ] && [ -f "$sf" ]; then',
+    '      cur="$(stat -c%Y "$sf" 2>/dev/null || stat -f%m "$sf" 2>/dev/null || echo 0)"',
+    '      [ "${cur:-0}" -gt "${pre_mtime:-0}" ] && { live=1; break; }',
+    '    fi',
+    '    sleep "$LIVE_INTERVAL"',
+    '  done',
+    '  [ "$live" -eq 1 ] || echo "[state-guard] warning: relaunched session did not write within ${LIVE_TIMEOUT}s — comparing anyway."',
+    '',
+    '  if session_survived "$projdir" "$pre_uuid $pre_size"; then',
+    '    echo "[state-guard] OK: transcript survived the restart (pre uuid=$pre_uuid size=$pre_size)."',
+    '    return 0',
+    '  fi',
+    '  # HALT path — the relaunch already happened, so this SURFACES the loss LOUDLY',
+    '  # and points at the retained backup for restore.',
+    '  echo "==================== macf restart-self STATE-GUARD ALERT ===================="',
+    '  echo "  A possible SESSION-STATE LOSS was detected after restart (Pattern A)."',
+    '  echo "  pre-state: uuid=$pre_uuid size=$pre_size mtime=$pre_mtime"',
+    '  echo "  RESTORE from the retained backup: $backup_dir"',
+    '  echo "  (the newest .jsonl.bak there is the pre-restart transcript.)"',
+    '  echo "============================================================================="',
+    '  return 1',
+    '}',
+  ];
 }
 
 /** Single-quote a value for safe shell embedding (closes + escapes any `'`). */
@@ -247,10 +379,13 @@ export async function runRestartSelf(
   const { workspaceDir, reason } = opts;
   const resumeNotePath = join(workspaceDir, RESUME_NOTE_REL);
   const relauncherPath = join(workspaceDir, RELAUNCHER_REL);
+  const prestatePath = join(workspaceDir, SESSION_PRESTATE_REL);
+  const guardLogPath = join(workspaceDir, GUARD_LOG_REL);
   const dryRun = opts.dryRun || !opts.confirm;
 
   const dirty = deps.hasUncommittedTrackedChanges();
-  const iso = deps.now().toISOString();
+  const nowDate = deps.now();
+  const iso = nowDate.toISOString();
 
   if (dryRun) {
     const plan = makePlan({ dryRun: true, reason, session, stashRef: null, resumeNotePath, relauncherPath, killed: false });
@@ -259,7 +394,7 @@ export async function runRestartSelf(
     return 0;
   }
 
-  // --- CONFIRM mode: prepare → note → spawn → kill (each exactly once) ---
+  // --- CONFIRM mode: prepare → backup → note → spawn → kill (each exactly once) ---
   deps.mkdirp(join(workspaceDir, MACF_DIR_REL));
 
   // 3. Prepare working tree — marked stash, ONLY when there are tracked changes.
@@ -268,6 +403,12 @@ export async function runRestartSelf(
     const result = deps.stash(stashLabel(iso, reason));
     stashRef = result.stashed ? (result.ref ?? 'stash@{0}') : null;
   }
+
+  // 3b. Back up the session transcript + record pre-state (macf#685) — the
+  // TRANSCRIPT half of "protect state before the destructive restart". No-op
+  // (returns null) when there's no active transcript; the relauncher's guard
+  // then finds no pre-state file and skips.
+  deps.backupTranscript(session, prestatePath, nowDate);
 
   // 4. RESUME-note.
   const note = buildResumeNote({
@@ -280,7 +421,13 @@ export async function runRestartSelf(
   deps.writeFile(resumeNotePath, note);
 
   // 5. Detached relauncher (script + spawn).
-  const script = buildRelauncherScript({ workspaceDir, session, iso });
+  const script = buildRelauncherScript({
+    workspaceDir,
+    session,
+    iso,
+    prestatePath,
+    guardLogPath,
+  });
   deps.writeFile(relauncherPath, script, 0o755);
   deps.spawnDetached(relauncherPath, []);
 
@@ -381,6 +528,14 @@ export function createRealDeps(workspaceDir: string): RestartSelfDeps {
       } catch {
         // The goal — the session's death — is satisfied whether or not the
         // command "succeeds" (e.g. already gone). Never throw on the final step.
+      }
+    },
+    backupTranscript: (session: string, prestatePath: string, now: Date) => {
+      // Best-effort insurance: a backup failure must NOT abort the restart.
+      try {
+        return backupSessionTranscript(createRealTranscriptDeps(), session, prestatePath, now);
+      } catch {
+        return null;
       }
     },
   };
