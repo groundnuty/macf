@@ -12,6 +12,7 @@ import { createCA, loadCA } from '@groundnuty/macf-core';
 import { generateAgentCert } from '@groundnuty/macf-core';
 import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import { seedProjectRulesDir } from '../project-rules.js';
+import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { fetchPluginToWorkspace, pinChannelServerVersion, linkPluginCliDist } from '../plugin-fetcher.js';
 import { writeClaudeSh } from '../claude-sh.js';
@@ -495,6 +496,14 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   if (copiedScripts.length > 0) {
     console.log(`  Scripts: copied ${copiedScripts.length} helper script(s) to .claude/scripts/`);
   }
+
+  // Seed the interactive-prompt auto-responder allowlist
+  // (.claude/.macf/prompt-responses.json, DR-033 / macf#645) with the two
+  // canonical ceremony-ack entries. Seed-if-absent + never clobber: the config
+  // is operator-curated state, so re-running init/update only validates an
+  // existing file (loud Inv-2 feedback), never reverts operator edits. The
+  // watcher (macf-prompt-watcher.sh, just copied above) reads it at launch.
+  reportSeedPromptResponses(seedPromptResponsesConfig(absDir));
 
   // Install the attribution-trap PreToolUse hook entry in
   // .claude/settings.json (merge-preserving). Per #140, structurally

@@ -18,6 +18,7 @@ export * from './token.js';
 export * from './types.js';
 export * from './semver.js';
 export * from './reflection.js';
+export * from './prompt-responses.js';
 export * from './guest.js';
 export * from './norm.js';
 export * from './protected-invariant-norms.js';
