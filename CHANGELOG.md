@@ -4,6 +4,31 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.47] — 2026-07-01
+
+**Fleet-probe routing-label fix**: `macf fleet upgrade`/`reconcile` now
+correctly see the live fleet. Marketplace v0.2.47 is a lockstep bump
+(`hooks.json`).
+
+### reliability
+
+- **Fleet probe returns the routing-label, not the registry-segment**
+  (#708, PR #709) — `driver.probe()` (`toFleetState`) sourced
+  `FleetAgentState.name` from `registry.list('')` as the GitHub-Variables
+  SCREAMING_SNAKE segment (`CODE_AGENT`), while the `FleetDriver` contract
+  and every consumer join on the kebab routing-label (`code-agent`)
+  (`planFleetUpgrade`'s `byName`, `fleet-reconcile`'s `state.agents.find`,
+  the CLI verify-green probe). The un-normalized form made every
+  cross-match miss, so `runningVersion` came back `null` and `macf fleet
+  upgrade`/`reconcile` classified the entire live fleet `offline` and
+  skipped it — while `macf fleet status` (which never cross-matches)
+  correctly showed the same agents online. Fix: normalize at the source —
+  `name: fromVariableSegment(s.name)` in `toFleetState` — so the driver
+  honors its own interface contract and the join can't drift. Adds a
+  probe↔fleet-status parity regression test. Live-verified: `macf fleet
+  upgrade --dry-run` now shows the real fleet as reachable + behind
+  instead of offline.
+
 ## [0.2.46] — 2026-07-01
 
 **Fleet-relaunch reliability release**: fixes the over-register abort that
