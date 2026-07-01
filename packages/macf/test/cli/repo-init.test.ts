@@ -203,6 +203,44 @@ describe('generateAgentConfig', () => {
     expect(parsed.agents['science-agent'].tmux_session).toBe('science-agent');
     expect(parsed.agents['science-agent']).not.toHaveProperty('tmux_window');
   });
+
+  describe('omitTmuxSession (v3+ registry-routed, macf#678)', () => {
+    it('omits the vestigial tmux_session from generated entries but keeps app_name/host/ssh fields', () => {
+      const json = generateAgentConfig(
+        ['code-agent', 'science-agent'],
+        undefined,
+        undefined,
+        true,
+      );
+      const parsed = JSON.parse(json);
+      expect(parsed.agents['code-agent']).not.toHaveProperty('tmux_session');
+      expect(parsed.agents['code-agent']).not.toHaveProperty('tmux_window');
+      // app_name is still asserted by routing-doctor's SELF-SKIP check on v3 —
+      // only tmux_session is vestigial, the entry itself is not.
+      expect(parsed.agents['code-agent'].app_name).toBe('code-agent');
+      expect(parsed.agents['code-agent'].ssh_key_secret).toBe('AGENT_SSH_KEY');
+      expect(parsed.agents['science-agent']).not.toHaveProperty('tmux_session');
+    });
+
+    it('omits tmux_session even with a --session-name (windowing is moot without a session)', () => {
+      const json = generateAgentConfig(['code-agent', 'science-agent'], 'macf', undefined, true);
+      const parsed = JSON.parse(json);
+      expect(parsed.agents['code-agent']).not.toHaveProperty('tmux_session');
+      expect(parsed.agents['code-agent']).not.toHaveProperty('tmux_window');
+    });
+
+    it('omits the tmux_session placeholder from the empty (no --agents) template', () => {
+      const json = generateAgentConfig([], undefined, undefined, true);
+      const parsed = JSON.parse(json);
+      expect(parsed.agents['<agent-name>']).not.toHaveProperty('tmux_session');
+      expect(parsed.agents['<agent-name>'].app_name).toBe('<github-app-name>');
+    });
+
+    it('default (omitTmuxSession=false) keeps the v1.x send-target (SSH routing reads it)', () => {
+      const parsed = JSON.parse(generateAgentConfig(['code-agent']));
+      expect(parsed.agents['code-agent'].tmux_session).toBe('code-agent');
+    });
+  });
 });
 
 describe('patchAgentConfig (merge-preserving regenerate, #76)', () => {
@@ -319,6 +357,37 @@ describe('patchAgentConfig (merge-preserving regenerate, #76)', () => {
     const patched = patchAgentConfig(JSON.stringify(oldConfig, null, 2), ['code-agent']);
     const parsed = JSON.parse(patched);
     expect(parsed.agents['code-agent'].ssh_key_secret).toBe('AGENT_SSH_KEY');
+  });
+
+  it('deletes the vestigial tmux_session/tmux_window on a v3+ re-patch (omitTmuxSession, macf#678)', () => {
+    // The substrate scenario: a leftover Stage-2 tmux_session ("cv-architect")
+    // that drives routing-doctor's false SESSION WARN. Re-running repo-init at
+    // v3 sheds it → doctor reads `absent` → PASS.
+    const existing = JSON.stringify({
+      agents: {
+        'cv-architect': {
+          app_name: 'cv-architect', host: '100.0.0.1',
+          tmux_session: 'cv-architect', tmux_window: 'cv-architect',
+          tmux_bin: 'tmux', ssh_user: 'ubuntu', ssh_key_secret: 'AGENT_SSH_KEY',
+        },
+      },
+    }, null, 2);
+    const patched = patchAgentConfig(existing, ['cv-architect'], undefined, undefined, true);
+    const parsed = JSON.parse(patched);
+    expect(parsed.agents['cv-architect']).not.toHaveProperty('tmux_session');
+    expect(parsed.agents['cv-architect']).not.toHaveProperty('tmux_window');
+    // Non-session fields survive the patch untouched.
+    expect(parsed.agents['cv-architect'].app_name).toBe('cv-architect');
+    expect(parsed.agents['cv-architect'].host).toBe('100.0.0.1');
+  });
+
+  it('creates fresh v3+ entries without a tmux_session (omitTmuxSession, macf#678)', () => {
+    const existing = JSON.stringify({ agents: {} }, null, 2);
+    const patched = patchAgentConfig(existing, ['writing-agent'], undefined,
+      { owner: 'groundnuty', repo: 'macf' }, true);
+    const parsed = JSON.parse(patched);
+    expect(parsed.agents['writing-agent']).not.toHaveProperty('tmux_session');
+    expect(parsed.agents['writing-agent'].app_name).toBe('writing-agent');
   });
 
   it('throws on malformed JSON rather than overwriting', () => {

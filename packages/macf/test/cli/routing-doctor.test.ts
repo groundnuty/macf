@@ -123,7 +123,7 @@ describe('evaluateSelfSkip — #538(b) / #566', () => {
   });
 });
 
-describe('evaluateSession — <project>@<name> convention, tri-state (DR-032 #610)', () => {
+describe('evaluateSession — <project>@<routing-label> convention, tri-state (DR-032 #610)', () => {
   it('passes the canonical form → ok', () => {
     expect(evaluateSession('code-agent', 'macf@code-agent', 'macf')).toEqual({
       status: 'ok',
@@ -142,6 +142,15 @@ describe('evaluateSession — <project>@<name> convention, tri-state (DR-032 #61
       status: 'absent',
       expected: 'macf@code-agent',
     });
+  });
+  it('keys the expected session on the ROUTING LABEL, not the OTEL agent-name (macf#678)', () => {
+    // science: routing_label=science-agent (the doctor's `label`), agent_name=
+    // macf-science-agent. The live session claude.sh self-wraps is macf@science-agent
+    // (routing-label), so that is `ok`; the old agent-name-keyed form is drift.
+    expect(evaluateSession('science-agent', 'macf@science-agent', 'macf').status).toBe('ok');
+    const drift = evaluateSession('science-agent', 'macf@macf-science-agent', 'macf');
+    expect(drift.status).toBe('warn');
+    expect(drift.expected).toBe('macf@science-agent');
   });
 });
 

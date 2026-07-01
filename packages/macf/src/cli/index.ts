@@ -305,7 +305,7 @@ routing
     'App install-set, (2) the #538 split: ROUTABLE (MACF_AGENT_<LABEL> registry key) ' +
     '+ SELF-SKIP (agent-config app_name == bot-login, #566), (3) registration ' +
     'FRESHNESS (registry instance_id == live /health), (4) MACF_CA_CERT present + ' +
-    'parses (#563), (5) tmux_session <project>@<agent> convention. These prove the ' +
+    'parses (#563), (5) tmux_session <project>@<routing-label> convention. These prove the ' +
     'PLUMBING, NOT end-to-end delivery (that is --e2e, a later increment). Exits ' +
     'non-zero when DEGRADED.',
   )

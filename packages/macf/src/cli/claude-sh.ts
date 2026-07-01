@@ -120,19 +120,29 @@ export function settingsGetHelperLines(): string[] {
  *
  * If `$TMUX` is unset (operator launched outside tmux) AND
  * `MACF_NO_TMUX_WRAP` isn't `1`, the script `exec`s itself inside a
- * tmux session named `<MACF_PROJECT>@<MACF_AGENT_NAME>`. Re-attach if
+ * tmux session named `<MACF_PROJECT>@<MACF_ROUTING_LABEL>`. Re-attach if
  * the session already exists; otherwise create a new session and exec
  * into it. Eliminates operator-discipline dependency for canonical
  * session naming (coordination.md §Canonical tmux launch pattern).
+ *
+ * The session keys on `MACF_ROUTING_LABEL` (the registry key / cert CN /
+ * DR-031 watchdog + reconcile/resume target), NOT `MACF_AGENT_NAME` (the
+ * OTEL display name). For an agent where name != routing_label (e.g.
+ * science: name=macf-science-agent, routing_label=science-agent) keying
+ * on the agent-name would produce `macf@macf-science-agent`, invisible to
+ * the watchdog that targets `macf@science-agent` (macf#678). Where
+ * name == routing_label (code/devops/auditor) this is a no-op.
  *
  * Path-2 promotion of the canonical-session-name rule: pre-#313, the
  * rule existed as text-only doc that operators had to manually wrap
  * `tmux new-session -d -s "<project>@<agent>" "./claude.sh"`. Post-#313,
  * bare `./claude.sh` produces the same canonical session structurally.
  *
- * Order requirement: `MACF_PROJECT` and `MACF_AGENT_NAME` must be
+ * Order requirement: `MACF_PROJECT` and `MACF_ROUTING_LABEL` must be
  * exported before this block (so `$SESSION_NAME` resolves correctly).
- * `generateClaudeSh` orders accordingly.
+ * `generateClaudeSh` orders accordingly — env.identity (which exports
+ * both, `MACF_ROUTING_LABEL` defaulting to `MACF_AGENT_NAME`) is sourced
+ * by the env.* loop above this block.
  *
  * Opt-out: `MACF_NO_TMUX_WRAP=1 ./claude.sh` for operator-driven manual
  * launches outside tmux (e.g., debug sessions, single-shot CLI use, CI).
@@ -144,7 +154,7 @@ function tmuxSelfWrapLines(): string[] {
     '# Tmux self-wrap (macf#313 Path-2 promotion of coordination.md',
     '# §Canonical tmux launch pattern). If launched outside tmux and the',
     '# operator hasn\'t opted out, re-exec inside a tmux session named',
-    '# <MACF_PROJECT>@<MACF_AGENT_NAME>. Attach if the session exists;',
+    '# <MACF_PROJECT>@<MACF_ROUTING_LABEL>. Attach if the session exists;',
     '# otherwise create a new one. The second invocation (inside tmux)',
     '# has $TMUX set and skips the wrap.',
     '#',
@@ -153,7 +163,7 @@ function tmuxSelfWrapLines(): string[] {
     '# initialized from the SERVER\'S GLOBAL env (set once at server',
     '# start), NOT the calling shell\'s env. So a second `./claude.sh`',
     '# from a different workspace would inherit the FIRST agent\'s',
-    '# MACF_AGENT_NAME from server-global — `${VAR:-default}` shortcut',
+    '# MACF_ROUTING_LABEL from server-global — `${VAR:-default}` shortcut',
     '# preserves the leaked value, causing AGENT_COLLISION on register.',
     '# The `-e VAR=VAL` flags built from MACF_TMUX_PASSTHROUGH below pin',
     '# session-level env that overrides server-global, ensuring this',
@@ -166,7 +176,7 @@ function tmuxSelfWrapLines(): string[] {
     '#   For operator-driven manual launches outside tmux, debug sessions,',
     '#   single-shot CLI use, CI environments.',
     'if [ -z "${TMUX:-}" ] && [ "${MACF_NO_TMUX_WRAP:-}" != "1" ]; then',
-    '  SESSION_NAME="${MACF_PROJECT}@${MACF_AGENT_NAME}"',
+    '  SESSION_NAME="${MACF_PROJECT}@${MACF_ROUTING_LABEL}"',
     '  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then',
     '    exec tmux attach -t "$SESSION_NAME"',
     '  else',

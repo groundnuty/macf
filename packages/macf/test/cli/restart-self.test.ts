@@ -89,15 +89,22 @@ function baseOpts(over: Partial<RunRestartSelfOptions> = {}): RunRestartSelfOpti
 }
 
 describe('resolveSession', () => {
-  it('derives <project>@<agent>', () => {
+  it('derives <project>@<agent> when routingLabel is unset (name == label)', () => {
     expect(resolveSession(baseOpts())).toBe('macf@code-agent');
+  });
+  it('keys on the routing-label for a name != routing_label agent (macf#678)', () => {
+    // science: agentName=macf-science-agent, routingLabel=science-agent →
+    // must target macf@science-agent (what claude.sh self-wraps + the watchdog hits).
+    expect(
+      resolveSession(baseOpts({ agentName: 'macf-science-agent', routingLabel: 'science-agent' })),
+    ).toBe('macf@science-agent');
   });
   it('prefers an explicit session override', () => {
     expect(resolveSession(baseOpts({ session: 'custom@sess' }))).toBe('custom@sess');
   });
-  it('returns null when project or agent is missing', () => {
+  it('returns null when project or both name+label are missing', () => {
     expect(resolveSession(baseOpts({ project: undefined }))).toBeNull();
-    expect(resolveSession(baseOpts({ agentName: '  ' }))).toBeNull();
+    expect(resolveSession(baseOpts({ agentName: '  ', routingLabel: '  ' }))).toBeNull();
   });
 });
 
@@ -269,13 +276,28 @@ describe('buildRelauncherScript', () => {
 });
 
 describe('resolveIdentity', () => {
-  it('prefers env over config', () => {
+  it('prefers env over config; routingLabel defaults to agentName when MACF_ROUTING_LABEL unset', () => {
     const id = resolveIdentity('/proj', {
       MACF_WORKSPACE_DIR: '/env-ws',
       MACF_PROJECT: 'envproj',
       MACF_AGENT_NAME: 'envagent',
     } as NodeJS.ProcessEnv);
-    expect(id).toEqual({ workspaceDir: '/env-ws', project: 'envproj', agentName: 'envagent' });
+    expect(id).toEqual({
+      workspaceDir: '/env-ws',
+      project: 'envproj',
+      agentName: 'envagent',
+      routingLabel: 'envagent',
+    });
+  });
+
+  it('resolves routingLabel from MACF_ROUTING_LABEL for a name != routing_label agent (macf#678)', () => {
+    const id = resolveIdentity('/proj', {
+      MACF_PROJECT: 'macf',
+      MACF_AGENT_NAME: 'macf-science-agent',
+      MACF_ROUTING_LABEL: 'science-agent',
+    } as NodeJS.ProcessEnv);
+    expect(id.agentName).toBe('macf-science-agent');
+    expect(id.routingLabel).toBe('science-agent');
   });
 
   it('falls back to projectDir for the workspace when env is unset', () => {

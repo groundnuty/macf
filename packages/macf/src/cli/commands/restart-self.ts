@@ -9,7 +9,7 @@
  * restart survive the kill.
  *
  * Orchestration (in this exact order, ALL under a confirm gate):
- *   1. Resolve config (workspace + the canonical `<project>@<agent>` tmux session).
+ *   1. Resolve config (workspace + the canonical `<project>@<routing-label>` tmux session).
  *   2. Safety gate — DRY-RUN BY DEFAULT. Without `--confirm` (or with `--dry-run`)
  *      it emits the full plan and exits 0 having done NOTHING (no stash/kill/spawn).
  *   3. Prepare the working tree — a MARKED STASH (not auto-commit): only if there
@@ -69,10 +69,16 @@ export interface RestartSelfDeps {
 export interface RunRestartSelfOptions {
   /** Absolute workspace dir (holds `claude.sh` + `.claude/.macf/`). */
   readonly workspaceDir: string;
-  /** Project name (for the `<project>@<agent>` session derivation). */
+  /** Project name (for the `<project>@<routing-label>` session derivation). */
   readonly project?: string;
-  /** Agent name (for the `<project>@<agent>` session derivation). */
+  /** OTEL agent name (display only; NOT the session key). */
   readonly agentName?: string;
+  /**
+   * Routing label — the canonical session key (`<project>@<routing-label>`,
+   * macf#678), matching what `claude.sh` self-wraps on. Falls back to
+   * `agentName` when unset (the name == routing_label case).
+   */
+  readonly routingLabel?: string;
   /** Explicit session override; when set it wins over the derived form. */
   readonly session?: string;
   readonly reason: RestartReason;
@@ -97,13 +103,19 @@ export interface RestartSelfPlan {
   readonly killed: boolean;
 }
 
-/** Derive `<project>@<agent>` (the canonical claude.sh self-wrap session), or null. */
+/**
+ * Derive `<project>@<routing-label>` (the canonical claude.sh self-wrap session,
+ * macf#678), or null. Keyed on the routing-label — NOT the OTEL agent-name — so a
+ * name != routing_label agent (science) targets the session `claude.sh` actually
+ * created + the watchdog/reconcile target. Falls back to `agentName` when no
+ * routing-label is set (name == routing_label agents: code/devops/auditor).
+ */
 export function resolveSession(opts: RunRestartSelfOptions): string | null {
   const explicit = opts.session?.trim();
   if (explicit) return explicit;
   const p = opts.project?.trim();
-  const a = opts.agentName?.trim();
-  return p && a ? `${p}@${a}` : null;
+  const label = opts.routingLabel?.trim() || opts.agentName?.trim();
+  return p && label ? `${p}@${label}` : null;
 }
 
 /** The marked-stash label: `macf-restart-self/<ISO-8601-ts>/<reason>`. */
@@ -384,19 +396,28 @@ export interface RestartSelfCliOptions {
 }
 
 /**
- * Resolve identity (workspace / project / agent) from env first (the running
- * agent's `claude.sh`-exported values), falling back to `.macf/macf-agent.json`.
- * The canonical session claude.sh self-wraps into is `${MACF_PROJECT}@${MACF_AGENT_NAME}`.
+ * Resolve identity (workspace / project / agent / routing-label) from env first
+ * (the running agent's `claude.sh`-exported values), falling back to
+ * `.macf/macf-agent.json`. The canonical session claude.sh self-wraps into is
+ * `${MACF_PROJECT}@${MACF_ROUTING_LABEL}` (macf#678); `routingLabel` defaults to
+ * `agentName` when neither the env var nor `config.routing_label` is set.
  */
 export function resolveIdentity(
   projectDir: string,
   env: NodeJS.ProcessEnv = process.env,
-): { readonly workspaceDir: string; readonly project?: string; readonly agentName?: string } {
+): {
+  readonly workspaceDir: string;
+  readonly project?: string;
+  readonly agentName?: string;
+  readonly routingLabel?: string;
+} {
   const config = readAgentConfig(projectDir);
   const workspaceDir = env['MACF_WORKSPACE_DIR']?.trim() || projectDir;
   const project = env['MACF_PROJECT']?.trim() || config?.project;
   const agentName = env['MACF_AGENT_NAME']?.trim() || config?.agent_name;
-  return { workspaceDir, project, agentName };
+  const routingLabel =
+    env['MACF_ROUTING_LABEL']?.trim() || config?.routing_label || agentName;
+  return { workspaceDir, project, agentName, routingLabel };
 }
 
 /** `macf restart-self` entry point — resolves config, wires real deps, runs. */
@@ -404,13 +425,14 @@ export async function runRestartSelfCommand(
   projectDir: string,
   cliOpts: RestartSelfCliOptions,
 ): Promise<number> {
-  const { workspaceDir, project, agentName } = resolveIdentity(projectDir);
+  const { workspaceDir, project, agentName, routingLabel } = resolveIdentity(projectDir);
   const deps = createRealDeps(workspaceDir);
   return runRestartSelf(
     {
       workspaceDir,
       project,
       agentName,
+      routingLabel,
       reason: coerceReason(cliOpts.reason),
       confirm: cliOpts.confirm === true,
       dryRun: cliOpts.dryRun === true,

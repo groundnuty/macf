@@ -211,7 +211,7 @@ The goal is correctness through dialogue, not compliance.
 
 **One session per agent** gives each server process a deterministic `$TMUX_PANE` + one-window-per-session context where `display-message` can't be ambiguous.
 
-**Session-name convention `<project>@<agent>`** is parseable (both human + script-friendly) and collision-free across projects — two `cv-architect` agents on the same VM (one for `academic-resume`, one for `macf-paper`) stay on separate sessions.
+**Session-name convention `<project>@<routing-label>`** is parseable (both human + script-friendly) and collision-free across projects — two `cv-architect` agents on the same VM (one for `academic-resume`, one for `macf-paper`) stay on separate sessions. **The session keys on the agent's `routing_label` (`MACF_ROUTING_LABEL`), not its OTEL display name (`MACF_AGENT_NAME`).** Why: the DR-031 watchdog + reconcile/resume, the registry key, and the mTLS cert CN all key on `routing_label`; `agent_name` is the OTEL `gen_ai.agent.name` display value only. For an agent where the two differ (science: `agent_name=macf-science-agent`, `routing_label=science-agent`) a session keyed on the display name (`macf@macf-science-agent`) would be invisible to the watchdog targeting `macf@science-agent` (macf#678). Where `agent_name == routing_label` (code/devops/auditor) they coincide, so this is a no-op.
 
 **Bonus**: separate sessions mean multiple terminals can attach to different agents independently — `tmux attach -t academic-resume@cv-architect` on one terminal, `...@cv-project-archaeologist` on another, without windows-switching interference.
 
