@@ -4,6 +4,45 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.46] — 2026-07-01
+
+**Fleet-relaunch reliability release**: fixes the over-register abort that
+bricked agents on relaunch, plus a channels-guard false-alarm fix and the
+add-an-agent-to-the-fleet onboarding runbook. Additive/back-compat
+throughout. Marketplace v0.2.46 is a lockstep bump (`hooks.json`).
+
+### reliability
+
+- **Registry over-register on relaunch — last-writer-wins + loser-yields**
+  (#705) — fixes the register-race abort that bricked agents on relaunch
+  (devops down 8h, 2026-07-01). Root cause: GitHub Variables API
+  read-after-write lag made `registerConditional`'s post-write read-back
+  serve the stale prior entry, which was mistaken for a lost race
+  (`RegisterRaceError`, exit 1 → agent DOWN) instead of a no-op reclaim.
+  Fix: bounded read-back retry + trust-our-issued-write (never un-write on
+  an unconfirmed read; a genuinely different writer is still detected as
+  `lost-to-newer`); a `register-with-takeover` classifier that yields to a
+  newer-live peer but force-claims over a stale/dead/older one; and a
+  fire-once `onDisplaced` split-brain stand-down. Deregister is demoted to
+  best-effort. `RegisterRaceError` now exits 0 (a clean yield, not a
+  crash). Folds #439.
+- **channels-guard must not cry deafness when tmux-wake delivers** (#700) —
+  `check-channels-enabled.sh` asserted the wrong invariant ("is native
+  channel-push on?") and fired a false "you are deaf to routing" alarm
+  whenever native push was off — even though tmux-wake was delivering every
+  notification. Now asserts the true result-invariant ("is *some* delivery
+  path working?"): native-off + tmux-wake-delivering → accurate ℹ️ info
+  note; native-off + no tmux-wake evidence → honest "delivery unconfirmed"
+  warning, not a false-absolute "you ARE deaf."
+
+### docs
+
+- **Add-an-agent-to-the-fleet onboarding runbook** (Refs #698) —
+  `design/add-agent-to-fleet.md` documents the per-repo (apply-in-ALL,
+  silent-miss) vs once-per-agent split, grounded in live drift found during
+  authoring (auditor missing from macf-actions; `MACF_TRUSTED_ACTORS` in no
+  repo).
+
 ## [0.2.45] — 2026-07-01
 
 The **DR-037 fleet operational-layer release**: the fleet-operations layer is
