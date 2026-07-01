@@ -17,6 +17,7 @@ export * from './config.js';
 export * from './token.js';
 export * from './types.js';
 export * from './semver.js';
+export * from './discovery.js';
 export * from './reflection.js';
 export * from './prompt-responses.js';
 export * from './guest.js';

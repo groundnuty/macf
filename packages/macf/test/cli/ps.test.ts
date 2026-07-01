@@ -18,7 +18,18 @@ import {
   splitNul,
   type ProcReader,
 } from '../../src/cli/proc-scan.js';
-import { buildPsRows, formatPsTable, formatTable, psToJson, runPs } from '../../src/cli/commands/ps.js';
+import {
+  buildPsEntries,
+  buildPsRows,
+  formatPsTable,
+  formatTable,
+  psToJson,
+  runPs,
+} from '../../src/cli/commands/ps.js';
+import type { WorkspaceRecord } from '@groundnuty/macf-core';
+
+/** No-op discovery for the process-only tests (keeps them deterministic). */
+const noWorkspaces = (): readonly WorkspaceRecord[] => [];
 
 interface FakeProc {
   readonly cwd?: string;
@@ -268,12 +279,14 @@ describe('buildPsRows / formatPsTable', () => {
     const reader = fakeReader({
       '7': { cwd: '/w/macf', cmdline: ['claude'], environ: {} },
     });
-    const procs = scanMacfProcesses(reader);
-    const rows = buildPsRows(procs);
+    const entries = buildPsEntries(scanMacfProcesses(reader), []);
+    const rows = buildPsRows(entries);
     expect(rows).toHaveLength(1);
-    // Columns: PID KIND WORKSPACE AGENT VERSION MACF_PORT OTEL_ENDPOINT CWD
-    expect(rows[0]).toEqual(['7', 'claude', 'macf', '—', '—', '—', '(none)', '/w/macf']);
-    expect(formatPsTable(procs)).toContain('(none)');
+    // Columns: STATUS PID KIND WORKSPACE AGENT VERSION PIN MACF_PORT OTEL_ENDPOINT CWD
+    expect(rows[0]).toEqual([
+      'alive', '7', 'claude', 'macf', '—', '—', '—', '—', '(none)', '/w/macf',
+    ]);
+    expect(formatPsTable(entries)).toContain('(none)');
   });
 
   it('surfaces a channel-server VERSION cell (macf#682)', () => {
@@ -288,13 +301,13 @@ describe('buildPsRows / formatPsTable', () => {
       true,
       { '/x/@groundnuty/macf-channel-server': '0.2.41' },
     );
-    const rows = buildPsRows(scanMacfProcesses(reader));
-    expect(rows[0]![4]).toBe('0.2.41'); // VERSION column
+    const rows = buildPsRows(buildPsEntries(scanMacfProcesses(reader), []));
+    expect(rows[0]![5]).toBe('0.2.41'); // VERSION column (running)
   });
 });
 
-describe('psToJson (macf#682)', () => {
-  it('emits the process list + available flag as structured data', () => {
+describe('psToJson (macf#682 + #141)', () => {
+  it('emits the entry list + available flag as structured data', () => {
     const reader = fakeReader(
       {
         '9': {
@@ -306,13 +319,14 @@ describe('psToJson (macf#682)', () => {
       true,
       { '/x/@groundnuty/macf-channel-server': '0.2.41' },
     );
-    const json = psToJson(scanMacfProcesses(reader), true) as {
+    const json = psToJson(buildPsEntries(scanMacfProcesses(reader), []), true) as {
       available: boolean;
       processes: ReadonlyArray<Record<string, unknown>>;
     };
     expect(json.available).toBe(true);
     expect(json.processes).toHaveLength(1);
     expect(json.processes[0]).toMatchObject({
+      alive: true,
       pid: '9',
       kind: 'channel-server',
       agent: 'code-agent',
@@ -327,22 +341,111 @@ describe('psToJson (macf#682)', () => {
   });
 });
 
+describe('buildPsEntries — alive∪dead union (DR-037 / #141)', () => {
+  const ws = (
+    agent: string,
+    workspace: string,
+    versionPin: string | null,
+    registry = 'groundnuty',
+  ): WorkspaceRecord => ({ agent, workspace, registry, versionPin });
+
+  it('marks a workspace with a matching live process ALIVE and one without DEAD', () => {
+    const procs = scanMacfProcesses(
+      fakeReader(
+        {
+          '9': {
+            cwd: '/canon/macf',
+            cmdline: ['node', '/x/@groundnuty/macf-channel-server/dist/server.js'],
+            environ: { MACF_AGENT_NAME: 'code-agent', MACF_PORT: '4300' },
+          },
+        },
+        true,
+        { '/x/@groundnuty/macf-channel-server': '0.2.44' },
+      ),
+    );
+    const workspaces = [
+      ws('code-agent', '/canon/macf', '0.2.44'),
+      ws('science-agent', '/canon/science', '0.2.41'),
+    ];
+    const entries = buildPsEntries(procs, workspaces);
+
+    const alive = entries.find((e) => e.workspacePath === '/canon/macf')!;
+    expect(alive.alive).toBe(true);
+    expect(alive.version).toBe('0.2.44'); // running
+    expect(alive.pinnedVersion).toBe('0.2.44'); // on-disk pin
+    expect(alive.registry).toBe('groundnuty');
+
+    const dead = entries.find((e) => e.workspacePath === '/canon/science')!;
+    expect(dead.alive).toBe(false);
+    expect(dead.pid).toBeNull();
+    expect(dead.version).toBeNull(); // no running version for a dead agent
+    expect(dead.pinnedVersion).toBe('0.2.41'); // resolves from the on-disk pin
+    expect(dead.agent).toBe('science-agent');
+  });
+
+  it('renders a dead workspace with a dead STATUS + the pin, cwd falls back to the path', () => {
+    const entries = buildPsEntries([], [ws('science-agent', '/canon/science', '0.2.41')]);
+    const rows = buildPsRows(entries);
+    expect(rows[0]).toEqual([
+      'dead', '—', '—', 'science', 'science-agent', '—', '0.2.41', '—', '(none)', '/canon/science',
+    ]);
+  });
+
+  it('keeps a live process that matches NO discovered workspace (never drops it)', () => {
+    const procs = scanMacfProcesses(
+      fakeReader({
+        '5': { cwd: '/outside/roots', cmdline: ['claude'], environ: { MACF_AGENT_NAME: 'x' } },
+      }),
+    );
+    const entries = buildPsEntries(procs, []);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.alive).toBe(true);
+    expect(entries[0]!.pinnedVersion).toBeNull(); // unknown — no workspace matched
+  });
+
+  it('emits dead entries under psToJson with alive=false + pinned_version', () => {
+    const json = psToJson(
+      buildPsEntries([], [ws('science-agent', '/canon/science', '0.2.41')]),
+      true,
+    ) as { processes: ReadonlyArray<Record<string, unknown>> };
+    expect(json.processes[0]).toMatchObject({
+      alive: false,
+      agent: 'science-agent',
+      version: null,
+      pinned_version: '0.2.41',
+      registry: 'groundnuty',
+    });
+  });
+});
+
 describe('runPs', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
   afterEach(() => {
     logSpy?.mockRestore();
   });
 
-  it('prints a clear degradation message when /proc is unavailable', () => {
+  it('prints a degradation message when introspection is unavailable + no workspaces', () => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const code = runPs(fakeReader({}, false));
+    const code = runPs(fakeReader({}, false), {}, noWorkspaces);
     expect(code).toBe(0);
-    expect(logSpy.mock.calls.flat().join('\n')).toMatch(/Linux-only/);
+    expect(logSpy.mock.calls.flat().join('\n')).toMatch(/no supported process source/);
+  });
+
+  it('still lists discovered workspaces (as dead) when introspection is unavailable', () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = runPs(fakeReader({}, false), {}, () => [
+      { agent: 'science-agent', workspace: '/canon/science', registry: 'groundnuty', versionPin: '0.2.41' },
+    ]);
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('dead');
+    expect(out).toContain('science-agent');
+    expect(out).toMatch(/liveness unconfirmed/);
   });
 
   it('prints a no-processes message when nothing matches', () => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const code = runPs(fakeReader({ '1': { cmdline: ['node', '/x.js'] } }));
+    const code = runPs(fakeReader({ '1': { cmdline: ['node', '/x.js'] } }), {}, noWorkspaces);
     expect(code).toBe(0);
     expect(logSpy.mock.calls.flat().join('\n')).toMatch(/No MACF claude/);
   });
@@ -357,6 +460,8 @@ describe('runPs', () => {
           environ: { MACF_AGENT_NAME: 'code-agent', MACF_PORT: '4001' },
         },
       }),
+      {},
+      noWorkspaces,
     );
     expect(code).toBe(0);
     const out = logSpy.mock.calls.flat().join('\n');
@@ -380,6 +485,7 @@ describe('runPs', () => {
         { '/x/@groundnuty/macf-channel-server': '0.2.41' },
       ),
       { json: true },
+      noWorkspaces,
     );
     expect(code).toBe(0);
     const parsed = JSON.parse(logSpy.mock.calls.flat().join('')) as {
@@ -389,11 +495,12 @@ describe('runPs', () => {
     expect(parsed.available).toBe(true);
     expect(parsed.processes[0]!.version).toBe('0.2.41');
     expect(parsed.processes[0]!.agent).toBe('code-agent');
+    expect(parsed.processes[0]!.alive).toBe(true);
   });
 
   it('emits valid JSON (available=false) off-/proc under --json', () => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const code = runPs(fakeReader({}, false), { json: true });
+    const code = runPs(fakeReader({}, false), { json: true }, noWorkspaces);
     expect(code).toBe(0);
     const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
     expect(parsed).toEqual({ available: false, processes: [] });

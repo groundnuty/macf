@@ -240,10 +240,12 @@ program
 program
   .command('ps')
   .description(
-    'List MACF claude / channel-server processes (Linux /proc), keyed by ' +
-    'cwd + agent identity — multi-tenant-correct (never `pgrep | head -1`)',
+    'List MACF agents on this host — ALIVE (running claude / channel-server, ' +
+    'keyed by cwd + identity) UNION DEAD (discovered .macf/ workspaces with no ' +
+    'process). Registry-free local scan; Linux + macOS. Set MACF_WORKSPACE_ROOT ' +
+    'to override the scan roots.',
   )
-  .option('--json', 'Emit the structured process list as JSON for automation', false)
+  .option('--json', 'Emit the structured alive∪dead entry list as JSON for automation', false)
   .action((opts) => {
     process.exitCode = runPs(undefined, { json: Boolean(opts.json) });
   });
