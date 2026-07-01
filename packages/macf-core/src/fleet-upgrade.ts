@@ -361,11 +361,19 @@ export function buildConfigDirtyMessage(agent: string, files: readonly string[])
 /**
  * Build the agent-directed post-upgrade modified-files message (macf#725).
  * Pure — exported for CLI-rendering reuse / tests.
+ *
+ * The message names the intended STEADY-STATE explicitly: a clean roll LEAVES
+ * this regeneration uncommitted (so the agent can review it), which means the
+ * NEXT roll's pre-flight WILL re-flag these same files as uncommitted unless
+ * they're committed. That re-flag is intended hygiene ("commit last update's
+ * regen before upgrading again"), not a surprise — so the message tells the
+ * agent to commit them, not merely review them.
  */
 export function buildModifiedFilesMessage(agent: string, files: readonly string[]): string {
   return (
     `Fleet upgrade regenerated these files in ${agent}'s workspace: ` +
-    `${files.join(', ')}. Review with \`git diff\` and commit / act as needed.`
+    `${files.join(', ')}. Review with \`git diff\` and commit them (so the next ` +
+    `upgrade's pre-flight doesn't re-flag them as uncommitted) or act as needed.`
   );
 }
 
@@ -408,6 +416,18 @@ export async function rollFleet(
     if (plan.disposition !== 'behind') continue;
     const agent = plan.agent;
 
+    // PRE-FLIGHT config-dirty gate. By-design inter-roll STEADY-STATE
+    // (macf#725): a clean roll LEAVES `macf update`'s regeneration uncommitted
+    // (so the relaunched agent reviews it — see `restart`'s
+    // `leaveConfigUncommitted` below + `buildModifiedFilesMessage`).
+    // Consequently, the NEXT roll's pre-flight WILL object on that
+    // still-uncommitted regen. This is INTENDED HYGIENE — "commit last update's
+    // regen before upgrading again" — NOT the mid-run abort bug this revision
+    // fixed: it is self-resolving via the object-with-message (the agent
+    // commits the flagged regen, then a clean re-run rolls). The alternative —
+    // auto-committing the deterministic canonical regen at end-of-transaction
+    // (zero inter-roll friction, but trades away the agent's review-visibility
+    // of what changed) — is a DEFERRED future option, the operator's call.
     if (!opts.force) {
       const dirtyFiles = await deps.driver.listDirtyConfig(agent);
       if (dirtyFiles.length > 0) {

@@ -539,9 +539,15 @@ describe('rollFleet', () => {
     expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'upgraded' });
     expect(res.results[0]!.detail).toContain('a1');
     expect(res.results[0]!.detail).toContain(modified[0]!);
+    // The steady-state clause (macf#725): the message must direct the agent to
+    // COMMIT the regen (not just review it), so the next roll's pre-flight
+    // doesn't re-flag it as uncommitted.
+    expect(res.results[0]!.detail).toContain('commit them');
+    expect(res.results[0]!.detail).toContain("next upgrade's pre-flight");
     const upgradedEvent = events.find((e) => e.kind === 'upgraded');
     expect(upgradedEvent).toMatchObject({ kind: 'upgraded', agent: 'a1', version: '0.2.41', modifiedFiles: modified });
     expect(upgradedEvent && 'message' in upgradedEvent ? upgradedEvent.message : '').toContain('a1');
+    expect(upgradedEvent && 'message' in upgradedEvent ? upgradedEvent.message : '').toContain('commit them');
   });
 
   describe('transactional coupling (macf#725 — REAL coupled fake, not a static predicate)', () => {
