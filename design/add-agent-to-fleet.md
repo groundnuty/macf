@@ -53,7 +53,7 @@ Plus **two once-per-agent steps that are NOT in the consumer doc** (add them the
 
 For **each** repo the new agent will work in or be routed on, apply **all** of the following. Missing one = a silent per-repo failure.
 
-**The fleet's routed repos (2026-07-01):** `groundnuty/macf`, `groundnuty/macf-actions`, `groundnuty/macf-devops-toolkit`, `groundnuty/macf-science-agent`. *(Enumerate current reality before onboarding — the set grows.)*
+**The fleet's routed repos (2026-07-01):** `groundnuty/macf`, `groundnuty/macf-actions`, `groundnuty/macf-devops-toolkit`, `groundnuty/macf-science-agent`. **Don't hardcode this list — derive it** from the fleet App's install set (`gh api /installation/repositories --jq '.repositories[].full_name'`), the GitHub source of truth for "which repos this fleet participates in" (code-agent #698). The set grows; the install set tracks it.
 
 ### P1. Assignment label `<name>-agent`
 
@@ -113,8 +113,9 @@ A `0` or `null` on any repo is a missed step. This gate is the doc-side backstop
 **Consultation for `@macf-code-agent[bot]`** (the CLI/framework owner — the automation half is framework territory): should the per-repo surface become a canonical subcommand? Candidate shape:
 
 - **`macf onboard-agent <name> --repos <auto|list>`** — for each repo: ensure the `<name>-agent` label exists + append the agent to `MACF_TRUSTED_ACTORS` + (optionally) verify the App install. Idempotent (re-run = no-op where already set). Reports per-repo what it changed vs what was already correct.
-- **Repo enumeration** should reuse the DR-037 discovery/registry substrate (a fleet == a registry; the routed-repo set is derivable), *not* a hand-maintained repo list — that's the same "don't build a 4th source of truth" rule (`check-before-propose §4`) DR-037 §4 applies to workspace discovery.
-- **`MACF_TRUSTED_ACTORS` specifically** is a natural `macf` cross-repo setter even standalone (it's the highest-drift item): `macf trusted-actors add <login>` iterating the runner repos.
+- **Repo enumeration** should be the fleet App's **install set** — `gh api /installation/repositories` returns exactly the repos the fleet's App is on (verified 2026-07-01, code-agent #698), which IS the GitHub source of truth for "which repos must carry the per-repo config." It self-maintains (install the App on a repo → it's in the set), so it is *not* a hand-maintained repo list — honoring the "don't build a 4th source of truth" rule (`check-before-propose §4`). *(Note: neither the agent-registry [lists agents, not repos] nor DR-037 §4 discovery [enumerates workspaces on a host] is the right source — the App-install set is. The install set is a slight superset of the runner repos, so setting `MACF_TRUSTED_ACTORS` on an install-but-no-runner repo is a harmless no-op.)*
+- **`MACF_TRUSTED_ACTORS` specifically** is a natural `macf` cross-repo setter even standalone (it's the highest-drift item): `macf trusted-actors add <login>` iterating the App-install set (harmless no-op on install-but-no-runner repos).
+- **Command family (code-agent #698):** this is a **provisioning** command (`macf onboard-agent`, a `repo-init` sibling — cross-repo iteration of `repo-init`'s per-repo config), **not** a `macf fleet <x>` subcommand. The DR-037 `fleet` family is *runtime-ops on live agents* (upgrade/reconcile/resume); onboarding is *provisioning an agent's presence* — a distinct family.
 
 This is a **consultation, not a spec** — code-agent's call on whether/how it folds into the CLI (and whether it belongs under DR-037's distribution/fleet-command family). The doc ships now as the human-guard; the command is the structural fix that makes the doc a fallback rather than the only defense (the same Path-2 pattern as the `check-*.sh` hooks).
 
