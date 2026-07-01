@@ -186,6 +186,14 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     return before !== after;
   }
 
+  async function capturePane(agent: string): Promise<string | null> {
+    const target = resolveTarget(seams, agent);
+    // No workspace, no derivable session, or no live session → gone/unreadable →
+    // null (the resume decision layer skips it — reconcile launches a dead agent).
+    if (!target?.session || !seams.hasSession(target.session)) return null;
+    return seams.capturePane(target.session);
+  }
+
   async function upgrade(agent: string): Promise<void> {
     const target = requireTarget(agent);
     seams.exec(macfBin, ['update', '--yes'], target.workspace);
@@ -218,6 +226,7 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     probe,
     discoverWorkspaces: () => seams.discover(),
     isBusy,
+    capturePane,
     upgrade,
     restart,
     inject,

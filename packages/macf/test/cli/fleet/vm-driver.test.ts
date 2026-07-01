@@ -212,6 +212,28 @@ describe('isBusy', () => {
   });
 });
 
+// --- capturePane ------------------------------------------------------------
+
+describe('capturePane', () => {
+  it('returns the live session pane content (for stall-signature matching)', async () => {
+    const { seams } = fakeSeams({
+      liveSessions: new Set(['macf@code-agent']),
+      paneReads: ['❯ Rate limited · idle'],
+    });
+    expect(await createVmDriver(OPTS, seams).capturePane('code-agent')).toBe('❯ Rate limited · idle');
+  });
+
+  it('returns null when the session is dead / gone (resume skips it)', async () => {
+    const { seams } = fakeSeams({ liveSessions: new Set() });
+    expect(await createVmDriver(OPTS, seams).capturePane('code-agent')).toBeNull();
+  });
+
+  it('returns null when the agent is unknown', async () => {
+    const { seams } = fakeSeams();
+    expect(await createVmDriver(OPTS, seams).capturePane('ghost')).toBeNull();
+  });
+});
+
 // --- upgrade ----------------------------------------------------------------
 
 describe('upgrade', () => {

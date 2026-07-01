@@ -21,6 +21,7 @@ import { existsSync, statSync } from 'node:fs';
 import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
+import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 
 export interface RulesRefreshResult {
@@ -53,6 +54,12 @@ export function rulesRefresh(targetDir: string): RulesRefreshResult {
   // macf#645). Operator-curated state, so it is seed-if-absent + never
   // clobbered — an existing file is only validated (loud Inv-2 feedback).
   const promptResponses = seedPromptResponsesConfig(targetDir);
+
+  // Seed (if absent) / validate (if present) the stall-signature allowlist
+  // (.claude/.macf/stall-signatures.json, DR-037 / macf#686) that `macf fleet
+  // resume` matches idle panes against. Operator-curated → seed-if-absent + never
+  // clobbered; an existing file is only validated.
+  const stallSignatures = seedStallSignaturesConfig(targetDir);
 
   // Project-tier rules (DR-026 §3 / F3, macf#501) from
   // MACF_PROJECT_RULES_SOURCE into .claude/rules/project/. Unset → no-op (the
@@ -104,6 +111,7 @@ export function rulesRefresh(targetDir: string): RulesRefreshResult {
   console.log('Refreshed gh-token guard hook in .claude/settings.json');
 
   reportSeedPromptResponses(promptResponses);
+  reportSeedStallSignatures(stallSignatures);
 
   if (projectRules.length > 0) {
     console.log(`Refreshed ${projectRules.length} project-tier rule file(s) in .claude/rules/project/:`);
