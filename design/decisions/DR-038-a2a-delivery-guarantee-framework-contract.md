@@ -1,6 +1,6 @@
 # DR-038: A2A delivery-guarantee — the framework contract (durable inbox/outbox, effectively-once, complete relaunch-reconcile)
 
-**Status:** Proposed
+**Status:** Accepted (ratified by operator 2026-07-01; see macf#704)
 **Date:** 2026-07-01
 **Trigger:** The framework-contract half of `macf-devops-toolkit` DR-008 (PR #147), filed as `macf#704` from the operator's 2026-07-01 reliability review. DR-008 is the substrate design + evidence + the store *drivers*; **DR-038 is the framework contract it triggers** — the channel-server delivery guarantee, the store *interface*, the plugin startup-reconcile, and the queue-source. Same split as DR-037↔DR-007 and DR-031↔DR-006 (framework primitives in `macf`; substrate drivers + cron in the devops toolkit). The 5 open questions DR-008 posed are resolved here, reconciled with code-agent's implementer positions (`#704` thread) — folded *before* authoring, not after.
 
