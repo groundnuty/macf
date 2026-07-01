@@ -15,8 +15,9 @@
  * for the attribution-trap class this prevents).
  */
 import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { readAgentConfig, tokenSourceFromConfig, writeAgentConfig } from '../config.js';
 import type { MacfAgentConfig } from '../config.js';
 import { defaultProcReader, scanMacfProcesses } from '../proc-scan.js';
@@ -782,6 +783,367 @@ export function checkOtelLaunchBoundary(
   };
 }
 
+/**
+ * DR-039 Decision 1 — the load-bearing hook-set `macf doctor` asserts is
+ * actually present in the agent's EFFECTIVE hook registration (the union of
+ * `.claude/settings.json` + the LOADED plugin's `hooks/hooks.json`). Pattern A:
+ * assert the result-invariant (the hook is registered), don't trust that the
+ * delivery channel (a full plugin load, an un-stashed settings.json) carried
+ * it. Catches a stripped launcher (the plugin-cs bug that triggered this DR —
+ * a `--plugin-dir` pointing at a hooks-less plugin variant silently drops
+ * every plugin-owned hook), a bad stash, or an agent-edit that dropped a
+ * hook — LOUDLY, at a deterministic checkpoint, instead of a distant silent
+ * symptom (a lost handoff, a mis-attribution). See
+ * `design/decisions/DR-039-hook-delivery-and-presence-guarantee.md`.
+ *
+ * This is READ-ONLY detection + report — no repair action is taken here (the
+ * DR's open question 1 leans "warn + offer repair", not silent auto-repair;
+ * see `printLoadBearingHooksSection`'s remediation text). The single-source
+ * migration (Decision 2: retire plugin-cs, stop hand-wiring settings.json
+ * duplicates) is a separate slice, NOT implemented by this check.
+ */
+export interface LoadBearingHookSpec {
+  readonly name: string;
+  /**
+   * `mcp_tool` hooks match by exact `tool` name; `command` hooks match by
+   * substring against the hook's `command` string — tolerates the
+   * `$CLAUDE_PROJECT_DIR` (settings.json) vs `${CLAUDE_PLUGIN_ROOT}` (plugin
+   * hooks.json) path-prefix variance between the two delivery channels.
+   */
+  readonly kind: 'command' | 'mcp_tool';
+  readonly match: string;
+  /**
+   * Event(s) this hook is expected on — informational (report text only).
+   * Presence is asserted regardless of which event it's actually wired to,
+   * per DR-039's "err toward not-false-alarming" posture (a hook registered
+   * under a slightly different event is still evidence the delivery channel
+   * carried it, and this check's job is presence, not event-correctness).
+   */
+  readonly events: readonly string[];
+  readonly citation: string;
+}
+
+/**
+ * The load-bearing hook-set from `design/decisions/DR-039-hook-delivery-and-presence-guarantee.md`
+ * §"The load-bearing hook-set the doctor asserts", plus `check-channel-alive`
+ * (macf#734, merged after the DR was ratified — the DR text explicitly notes
+ * it joins the asserted set).
+ */
+export const DR039_LOAD_BEARING_HOOKS: readonly LoadBearingHookSpec[] = [
+  {
+    name: 'checkpoint_to_memory',
+    kind: 'mcp_tool',
+    match: 'checkpoint_to_memory',
+    events: ['PreCompact'],
+    citation: 'DR-034 session-handoff memory write — its absence was the DR-039 trigger incident',
+  },
+  {
+    name: 'check-gh-attribution',
+    kind: 'command',
+    match: 'check-gh-attribution.sh',
+    events: ['PostToolUse'],
+    citation: 'macf#491 — attribution-trap result-invariant backstop',
+  },
+  {
+    name: 'harvest-reflection',
+    kind: 'command',
+    match: 'harvest-reflection.sh',
+    events: ['PreCompact'],
+    citation: 'macf#500 — reflection-staging harvest at compaction',
+  },
+  {
+    name: 'check-gh-token',
+    kind: 'command',
+    match: 'check-gh-token.sh',
+    events: ['PreToolUse'],
+    citation: 'macf#140 — gh-token attribution-trap guard',
+  },
+  {
+    name: 'check-mention-routing',
+    kind: 'command',
+    match: 'check-mention-routing.sh',
+    events: ['PreToolUse'],
+    citation: 'macf#244 / macf#272 — mention-routing-hygiene guard',
+  },
+  {
+    name: 'check-lgtm-gate',
+    kind: 'command',
+    match: 'check-lgtm-gate.sh',
+    events: ['PreToolUse'],
+    citation: 'macf#270 — no-LGTM-no-merge guard',
+  },
+  {
+    name: 'check-close-keyword',
+    kind: 'command',
+    match: 'check-close-keyword.sh',
+    events: ['PreToolUse'],
+    citation: 'macf#431 — auto-close-keyword guard',
+  },
+  {
+    name: 'check-channel-alive',
+    kind: 'command',
+    match: 'check-channel-alive.sh',
+    events: ['SessionStart', 'UserPromptSubmit'],
+    citation: 'macf#734 — channel-server liveness guard',
+  },
+];
+
+/**
+ * One hook registration found while scanning a settings.json / hooks.json
+ * file's `hooks` map — either a bash `command` string or an `mcp_tool` name.
+ */
+interface HookMatchEntry {
+  readonly kind: 'command' | 'mcp_tool';
+  readonly value: string;
+}
+
+/**
+ * Extract every command/mcp_tool hook entry out of a parsed `hooks` map,
+ * regardless of event name — matches BOTH Claude Code's settings.json shape
+ * and the plugin's `hooks.json` shape (`{ "<Event>": [{ "hooks": [{ type,
+ * command|tool }] }] }`).
+ */
+function extractHookMatchEntries(hooksMap: unknown): HookMatchEntry[] {
+  const result: HookMatchEntry[] = [];
+  if (!hooksMap || typeof hooksMap !== 'object') return result;
+  for (const entries of Object.values(hooksMap as Record<string, unknown>)) {
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object') continue;
+      const hooks = (entry as { hooks?: unknown }).hooks;
+      if (!Array.isArray(hooks)) continue;
+      for (const h of hooks) {
+        if (!h || typeof h !== 'object') continue;
+        const type = (h as { type?: unknown }).type;
+        if (type === 'mcp_tool') {
+          const tool = (h as { tool?: unknown }).tool;
+          if (typeof tool === 'string') result.push({ kind: 'mcp_tool', value: tool });
+        } else {
+          const command = (h as { command?: unknown }).command;
+          if (typeof command === 'string') result.push({ kind: 'command', value: command });
+        }
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Best-effort read of a JSON file's top-level `hooks` map. Returns `[]` on
+ * any absence/parse failure — this check's job is presence-ASSERTION, not
+ * JSON-validity reporting (`checkSandboxFdAllowRead` / `checkPermissionsAllow`
+ * already surface malformed settings.json elsewhere in the doctor report).
+ */
+function readHooksMapEntries(jsonPath: string): HookMatchEntry[] {
+  if (!existsSync(jsonPath)) return [];
+  let raw: string;
+  try {
+    raw = readFileSync(jsonPath, 'utf-8');
+  } catch {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw) as { hooks?: unknown };
+    return extractHookMatchEntries(parsed.hooks);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Every command/mcp_tool hook entry across `.claude/settings.json` +
+ * `.claude/settings.local.json` — both contribute to Claude Code's merged
+ * hook set, same two files `getHookCommands` already reads for the DR-028
+ * role-settings check.
+ */
+function readSettingsHookEntries(workspaceDir: string): HookMatchEntry[] {
+  const claudeDir = join(resolve(workspaceDir), '.claude');
+  const result: HookMatchEntry[] = [];
+  for (const file of ['settings.json', 'settings.local.json'] as const) {
+    result.push(...readHooksMapEntries(join(claudeDir, file)));
+  }
+  return result;
+}
+
+/** Result of trying to determine which plugin dir `claude.sh` actually mounts. */
+export interface PluginDirResolution {
+  /** Absolute resolved path, or `null` if not cleanly determinable. */
+  readonly dir: string | null;
+  readonly determinable: boolean;
+  readonly detail: string;
+}
+
+/**
+ * Parse the workspace's `claude.sh` for its `--plugin-dir "<path>"` argument
+ * and resolve it to an absolute path (substituting `$SCRIPT_DIR` /
+ * `${SCRIPT_DIR}` — the launcher's own name for the workspace root, see
+ * `claude-sh.ts`'s `SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"`
+ * — with `workspaceDir`).
+ *
+ * Returns `determinable: false` when `claude.sh` is absent, unreadable, has
+ * no `--plugin-dir` flag at all, or has MULTIPLE distinct `--plugin-dir`
+ * values (an ambiguous/hand-edited launcher) — callers fall back to the
+ * default `.macf/plugin` location in that case (DR-039's "err toward
+ * not-false-alarming" posture), rather than reporting every hook missing.
+ */
+export function resolvePluginDirFromClaudeSh(workspaceDir: string): PluginDirResolution {
+  const absDir = resolve(workspaceDir);
+  const claudeShPath = join(absDir, 'claude.sh');
+  if (!existsSync(claudeShPath)) {
+    return { dir: null, determinable: false, detail: 'no claude.sh found in workspace' };
+  }
+  let content: string;
+  try {
+    content = readFileSync(claudeShPath, 'utf-8');
+  } catch (err) {
+    return {
+      dir: null,
+      determinable: false,
+      detail: `could not read claude.sh: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  const found = new Set<string>();
+  const re = /--plugin-dir\s+"([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    const captured = m[1];
+    if (captured !== undefined) found.add(captured);
+  }
+  if (found.size === 0) {
+    return { dir: null, determinable: false, detail: 'claude.sh has no --plugin-dir flag' };
+  }
+  if (found.size > 1) {
+    return {
+      dir: null,
+      determinable: false,
+      detail: `claude.sh has multiple distinct --plugin-dir values: ${[...found].join(', ')}`,
+    };
+  }
+  const raw = [...found][0] as string;
+  const substituted = raw.replace(/\$\{SCRIPT_DIR\}|\$SCRIPT_DIR/g, absDir);
+  return {
+    dir: resolve(substituted),
+    determinable: true,
+    detail: `resolved from claude.sh --plugin-dir "${raw}"`,
+  };
+}
+
+/**
+ * The agent's effective hook registration — the union DR-039 asserts
+ * against: `.claude/settings.json` (+ `settings.local.json`) hooks, PLUS the
+ * `hooks.json` of whichever plugin dir `claude.sh` actually loads.
+ */
+export interface EffectiveHookConfig {
+  readonly entries: readonly HookMatchEntry[];
+  readonly pluginDirResolution: PluginDirResolution;
+  /**
+   * The `hooks.json` path actually consulted — the resolved dir's, or the
+   * default-fallback path when the plugin dir wasn't cleanly determinable.
+   */
+  readonly pluginHooksJsonPath: string;
+  /**
+   * True when the plugin dir could not be cleanly determined from
+   * `claude.sh`, so the default `.macf/plugin` location was checked instead
+   * (in ADDITION to settings.json — "err toward not-false-alarming").
+   */
+  readonly usedDefaultFallback: boolean;
+}
+
+export function getEffectiveHookConfig(workspaceDir: string): EffectiveHookConfig {
+  const settingsEntries = readSettingsHookEntries(workspaceDir);
+  const pluginDirResolution = resolvePluginDirFromClaudeSh(workspaceDir);
+
+  const usedDefaultFallback = !pluginDirResolution.determinable || !pluginDirResolution.dir;
+  const pluginDir = usedDefaultFallback
+    ? join(resolve(workspaceDir), '.macf', 'plugin')
+    : (pluginDirResolution.dir as string);
+  const pluginHooksJsonPath = join(pluginDir, 'hooks', 'hooks.json');
+  const pluginEntries = readHooksMapEntries(pluginHooksJsonPath);
+
+  return {
+    entries: [...settingsEntries, ...pluginEntries],
+    pluginDirResolution,
+    pluginHooksJsonPath,
+    usedDefaultFallback,
+  };
+}
+
+/** One load-bearing hook DR-039 found absent from the effective config. */
+export interface LoadBearingHookFinding {
+  readonly name: string;
+  readonly citation: string;
+}
+
+/**
+ * Result of the DR-039 load-bearing-hook-set assertion. `status` is `WARN`
+ * (not `ERROR`/exit-code-affecting) when any hook is missing — matching the
+ * doctor's existing warn-only posture for detect-only checks (OTEL launch
+ * boundary, bot_login, permissions-allow); `INFO` when the workspace isn't a
+ * `macf init`-managed one at all (nothing to assert).
+ */
+export interface LoadBearingHooksCheckResult {
+  readonly status: 'PASS' | 'WARN' | 'INFO';
+  readonly presentCount: number;
+  readonly totalCount: number;
+  /** The load-bearing hooks NOT found in the effective config. Empty on PASS/INFO. */
+  readonly missing: readonly LoadBearingHookFinding[];
+  readonly detail: string;
+}
+
+function hookIsPresent(spec: LoadBearingHookSpec, entries: readonly HookMatchEntry[]): boolean {
+  return entries.some((e) => {
+    if (spec.kind === 'mcp_tool') return e.kind === 'mcp_tool' && e.value === spec.match;
+    return e.kind === 'command' && e.value.includes(spec.match);
+  });
+}
+
+/**
+ * DR-039 Decision 1: assert the load-bearing hook-set (`DR039_LOAD_BEARING_HOOKS`)
+ * is present in the agent's EFFECTIVE hook registration (`getEffectiveHookConfig`).
+ * Skips gracefully (`INFO`) when the workspace has no `.macf/` dir at all — not a
+ * `macf init`-managed workspace (a local dev checkout, a non-agent workspace,
+ * etc.) — so a non-standard workspace doesn't get false-alarmed. DR-024
+ * (local-registry) workspaces DO still get the full assertion: they carry
+ * `.macf/plugin` + `.claude/settings.json` like any other macf-init'd
+ * workspace, and their load-bearing hooks matter just as much (DR-024 changes
+ * how the registry/App token is sourced, not how hooks are delivered).
+ */
+export function checkLoadBearingHooks(workspaceDir: string): LoadBearingHooksCheckResult {
+  const absDir = resolve(workspaceDir);
+  if (!existsSync(join(absDir, '.macf'))) {
+    return {
+      status: 'INFO',
+      presentCount: 0,
+      totalCount: DR039_LOAD_BEARING_HOOKS.length,
+      missing: [],
+      detail:
+        'no .macf/ directory — not a macf-init-managed workspace; skipping the DR-039 ' +
+        'hook-presence assertion',
+    };
+  }
+
+  const config = getEffectiveHookConfig(workspaceDir);
+  const missing: LoadBearingHookFinding[] = [];
+  for (const spec of DR039_LOAD_BEARING_HOOKS) {
+    if (!hookIsPresent(spec, config.entries)) {
+      missing.push({ name: spec.name, citation: spec.citation });
+    }
+  }
+  const presentCount = DR039_LOAD_BEARING_HOOKS.length - missing.length;
+  const detail = config.usedDefaultFallback
+    ? `plugin dir not cleanly determinable from claude.sh (${config.pluginDirResolution.detail}) — ` +
+      'checked default .macf/plugin/hooks/hooks.json + settings.json'
+    : `loaded plugin dir: ${config.pluginDirResolution.dir}`;
+
+  return {
+    status: missing.length === 0 ? 'PASS' : 'WARN',
+    presentCount,
+    totalCount: DR039_LOAD_BEARING_HOOKS.length,
+    missing,
+    detail,
+  };
+}
+
 /** Prompt the operator for a y/N confirmation on stdin. Default = No. */
 function promptYesNo(question: string): Promise<boolean> {
   return new Promise((resolveAnswer) => {
@@ -959,6 +1321,11 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   let botLoginCheck = checkBotLogin(config);
   printBotLoginSection(botLoginCheck);
 
+  console.log('');
+  console.log('Load-bearing hooks (DR-039)');
+  console.log('──────────────────────────────────────────────────────────────');
+  printLoadBearingHooksSection(checkLoadBearingHooks(projectDir));
+
   // --fix: the existing install emitters ARE the fix (DR-028) — they write the
   // floor merge-preservingly. Detect drift read-only above, then (on consent)
   // call them + re-run the checks. NEVER write without consent.
@@ -1040,6 +1407,31 @@ function printBotLoginSection(check: BotLoginCheckResult): void {
   } else {
     console.log(`  ℹ ${check.detail}  [INFO]`);
   }
+}
+
+/** Print the DR-039 load-bearing-hook-set report section for `check`. */
+function printLoadBearingHooksSection(check: LoadBearingHooksCheckResult): void {
+  if (check.status === 'INFO') {
+    console.log(`  ℹ ${check.detail}  [INFO]`);
+    return;
+  }
+  console.log(`  (${check.detail})`);
+  if (check.status === 'PASS') {
+    console.log(`  ✓ ${check.presentCount}/${check.totalCount} load-bearing hooks registered  [PASS]`);
+    return;
+  }
+  console.log(
+    `  ⚠ ${check.presentCount}/${check.totalCount} load-bearing hooks registered — ` +
+    `${check.missing.length} MISSING  [WARN]`,
+  );
+  for (const m of check.missing) {
+    console.log(`    ✗ ${m.name} — ${m.citation}`);
+  }
+  console.log(
+    '    Fix: re-run `macf update` (or `macf init --force`) to restore the full plugin + settings ' +
+    'floor. A stripped --plugin-dir (a hooks-less plugin variant), a bad stash, or a hand-edit can ' +
+    'drop these silently — see design/decisions/DR-039-hook-delivery-and-presence-guarantee.md.',
+  );
 }
 
 /** Print the macf#200 sandbox-fd report line(s) for `check`. */

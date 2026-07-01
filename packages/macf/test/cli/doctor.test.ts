@@ -11,8 +11,10 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 import {
   AUTONOMY_REQUIRED_TOOLS,
+  DR039_LOAD_BEARING_HOOKS,
   MACF_REQUIRED_PERMISSIONS,
   checkBotLogin,
+  checkLoadBearingHooks,
   checkPermissionsAllow,
   checkSandboxFdAllowRead,
   deriveBotLogin,
@@ -20,8 +22,10 @@ import {
   diffPermissions,
   formatPermissionRow,
   describeNonJwtOutput,
+  getEffectiveHookConfig,
   hasToolDeny,
   isToolFullyAllowed,
+  resolvePluginDirFromClaudeSh,
   type RequiredPermission,
 } from '../../src/cli/commands/doctor.js';
 import { SANDBOX_FD_READ_PATTERN } from '../../src/cli/settings-writer.js';
@@ -542,5 +546,316 @@ describe('checkBotLogin (macf#707/#535 — DR-028 attribution-hook detect+repair
     const result = checkBotLogin(rest as MacfAgentConfig);
     expect(result.status).toBe('INFO');
     expect(result.detail).toMatch(/local-registry|no github app/i);
+  });
+});
+
+describe('checkLoadBearingHooks (DR-039 Decision 1)', () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'doctor-hooks-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function writeSettingsJson(obj: unknown): void {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(join(tmpRoot, '.claude', 'settings.json'), JSON.stringify(obj, null, 2));
+  }
+
+  function writeClaudeSh(pluginDirExpr: string): void {
+    writeFileSync(
+      join(tmpRoot, 'claude.sh'),
+      [
+        '#!/bin/bash',
+        'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"',
+        `exec claude --plugin-dir "${pluginDirExpr}" "$@"`,
+        '',
+      ].join('\n'),
+    );
+  }
+
+  function writePluginHooksJson(pluginRelDir: string, obj: unknown): void {
+    const dir = join(tmpRoot, pluginRelDir, 'hooks');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'hooks.json'), JSON.stringify(obj, null, 2));
+  }
+
+  /** All 7 bash-command load-bearing hooks (everything except the
+   *  mcp_tool-only, plugin-bound `checkpoint_to_memory`), in settings.json shape. */
+  function allBashHooksSettings(): unknown {
+    return {
+      hooks: {
+        PreToolUse: [
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-token.sh' }] },
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-mention-routing.sh' }] },
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-lgtm-gate.sh' }] },
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh' }] },
+        ],
+        PostToolUse: [
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-attribution.sh' }] },
+        ],
+        PreCompact: [
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/harvest-reflection.sh' }] },
+        ],
+        SessionStart: [
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh' }] },
+        ],
+        UserPromptSubmit: [
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh' }] },
+        ],
+      },
+    };
+  }
+
+  function pluginHooksJsonWithCheckpoint(): unknown {
+    return {
+      hooks: {
+        PreCompact: [
+          {
+            hooks: [
+              {
+                type: 'mcp_tool',
+                server: 'plugin:macf-agent:macf-agent',
+                tool: 'checkpoint_to_memory',
+                input: { session_id: '${session_id}' },
+              },
+            ],
+          },
+        ],
+      },
+    };
+  }
+
+  it('has exactly the 8 DR-039 load-bearing hooks (7 bash + 1 mcp_tool)', () => {
+    const names = DR039_LOAD_BEARING_HOOKS.map((h) => h.name).sort();
+    expect(names).toEqual(
+      [
+        'check-channel-alive',
+        'check-close-keyword',
+        'check-gh-attribution',
+        'check-gh-token',
+        'check-lgtm-gate',
+        'check-mention-routing',
+        'checkpoint_to_memory',
+        'harvest-reflection',
+      ].sort(),
+    );
+    const mcpTools = DR039_LOAD_BEARING_HOOKS.filter((h) => h.kind === 'mcp_tool');
+    expect(mcpTools).toHaveLength(1);
+    expect(mcpTools[0]?.match).toBe('checkpoint_to_memory');
+  });
+
+  it('PASS: all hooks present — settings.json bash hooks + full plugin hooks.json (mounted via claude.sh)', () => {
+    writeSettingsJson(allBashHooksSettings());
+    writeClaudeSh('$SCRIPT_DIR/.macf/plugin');
+    writePluginHooksJson('.macf/plugin', pluginHooksJsonWithCheckpoint());
+    mkdirSync(join(tmpRoot, '.macf'), { recursive: true });
+
+    const result = checkLoadBearingHooks(tmpRoot);
+    expect(result.status).toBe('PASS');
+    expect(result.missing).toEqual([]);
+    expect(result.presentCount).toBe(result.totalCount);
+    expect(result.totalCount).toBe(DR039_LOAD_BEARING_HOOKS.length);
+  });
+
+  it('WARN: the plugin-cs case — claude.sh loads a hooks-less plugin variant, checkpoint_to_memory absent', () => {
+    writeSettingsJson(allBashHooksSettings());
+    // plugin-cs: mcpServers-only, no hooks/ dir at all (macf#533 / the DR-039 trigger shape).
+    writeClaudeSh('$SCRIPT_DIR/.macf/plugin-cs');
+    mkdirSync(join(tmpRoot, '.macf', 'plugin-cs'), { recursive: true });
+    // NOT writing hooks/hooks.json under plugin-cs — that's the whole point.
+
+    const result = checkLoadBearingHooks(tmpRoot);
+    expect(result.status).toBe('WARN');
+    expect(result.missing).toHaveLength(1);
+    expect(result.missing[0]?.name).toBe('checkpoint_to_memory');
+    expect(result.presentCount).toBe(result.totalCount - 1);
+    // The resolved (loaded) plugin dir shows up in the report detail, not a
+    // silently-substituted default — the whole point of the assertion.
+    expect(result.detail).toContain('plugin-cs');
+  });
+
+  it('WARN: names every missing hook when settings.json is entirely empty and the plugin has no hooks dir', () => {
+    writeSettingsJson({});
+    writeClaudeSh('$SCRIPT_DIR/.macf/plugin-cs');
+    mkdirSync(join(tmpRoot, '.macf', 'plugin-cs'), { recursive: true });
+
+    const result = checkLoadBearingHooks(tmpRoot);
+    expect(result.status).toBe('WARN');
+    expect(result.missing).toHaveLength(DR039_LOAD_BEARING_HOOKS.length);
+    const missingNames = result.missing.map((m) => m.name).sort();
+    expect(missingNames).toEqual(DR039_LOAD_BEARING_HOOKS.map((h) => h.name).sort());
+  });
+
+  it('PASS: mixed sources — some hooks in settings.json, some in the plugin hooks.json — union covers all', () => {
+    // Split: checkpoint_to_memory + check-gh-attribution live in the plugin's
+    // hooks.json; everything else lives in settings.json.
+    writeSettingsJson({
+      hooks: {
+        PreToolUse: [
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-token.sh' }] },
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-mention-routing.sh' }] },
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-lgtm-gate.sh' }] },
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh' }] },
+        ],
+        SessionStart: [
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh' }] },
+        ],
+        UserPromptSubmit: [
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh' }] },
+        ],
+      },
+    });
+    writeClaudeSh('$SCRIPT_DIR/.macf/plugin');
+    writePluginHooksJson('.macf/plugin', {
+      hooks: {
+        PreCompact: [
+          {
+            hooks: [
+              { type: 'mcp_tool', server: 'plugin:macf-agent:macf-agent', tool: 'checkpoint_to_memory' },
+            ],
+          },
+          {
+            hooks: [
+              { type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/harvest-reflection.sh' },
+            ],
+          },
+        ],
+        PostToolUse: [
+          { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-gh-attribution.sh' }] },
+        ],
+      },
+    });
+
+    const result = checkLoadBearingHooks(tmpRoot);
+    expect(result.status).toBe('PASS');
+    expect(result.missing).toEqual([]);
+  });
+
+  it('INFO: no .macf/ directory — not a macf-init-managed workspace, no false WARN', () => {
+    // Deliberately no .macf, no claude.sh, no settings.json — a bare/local dir.
+    const result = checkLoadBearingHooks(tmpRoot);
+    expect(result.status).toBe('INFO');
+    expect(result.missing).toEqual([]);
+    expect(result.detail).toMatch(/not a macf-init-managed workspace/i);
+  });
+
+  it('a missing hook produces WARN, not a hard-fail (this slice is detect+report, not exit-code-affecting)', () => {
+    writeSettingsJson({});
+    mkdirSync(join(tmpRoot, '.macf'), { recursive: true });
+    const result = checkLoadBearingHooks(tmpRoot);
+    expect(result.status).toBe('WARN');
+  });
+});
+
+describe('resolvePluginDirFromClaudeSh (DR-039)', () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'doctor-plugindir-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('not determinable when claude.sh is absent', () => {
+    const result = resolvePluginDirFromClaudeSh(tmpRoot);
+    expect(result.determinable).toBe(false);
+    expect(result.dir).toBeNull();
+    expect(result.detail).toMatch(/no claude\.sh/i);
+  });
+
+  it('resolves a single --plugin-dir "$SCRIPT_DIR/.macf/plugin" to the workspace-relative absolute path', () => {
+    writeFileSync(
+      join(tmpRoot, 'claude.sh'),
+      'exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"\n',
+    );
+    const result = resolvePluginDirFromClaudeSh(tmpRoot);
+    expect(result.determinable).toBe(true);
+    expect(result.dir).toBe(join(tmpRoot, '.macf', 'plugin'));
+  });
+
+  it('resolves a hand-edited launcher pointing at .macf/plugin-cs', () => {
+    writeFileSync(
+      join(tmpRoot, 'claude.sh'),
+      'exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin-cs" "$@"\n',
+    );
+    const result = resolvePluginDirFromClaudeSh(tmpRoot);
+    expect(result.determinable).toBe(true);
+    expect(result.dir).toBe(join(tmpRoot, '.macf', 'plugin-cs'));
+  });
+
+  it('not determinable when claude.sh has no --plugin-dir flag at all', () => {
+    writeFileSync(join(tmpRoot, 'claude.sh'), 'exec claude "$@"\n');
+    const result = resolvePluginDirFromClaudeSh(tmpRoot);
+    expect(result.determinable).toBe(false);
+    expect(result.dir).toBeNull();
+  });
+
+  it('not determinable when claude.sh has multiple distinct --plugin-dir values (ambiguous)', () => {
+    writeFileSync(
+      join(tmpRoot, 'claude.sh'),
+      [
+        'if [ -n "$FOO" ]; then',
+        '  claude --plugin-dir "$SCRIPT_DIR/.macf/plugin-a" "$@"',
+        'else',
+        '  exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin-b" "$@"',
+        'fi',
+        '',
+      ].join('\n'),
+    );
+    const result = resolvePluginDirFromClaudeSh(tmpRoot);
+    expect(result.determinable).toBe(false);
+    expect(result.dir).toBeNull();
+    expect(result.detail).toMatch(/multiple distinct/i);
+  });
+
+  it('is fine with the SAME --plugin-dir value repeated twice (the canonical resume-fallback claude.sh shape)', () => {
+    writeFileSync(
+      join(tmpRoot, 'claude.sh'),
+      [
+        'claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@" || ' +
+          'exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"',
+        '',
+      ].join('\n'),
+    );
+    const result = resolvePluginDirFromClaudeSh(tmpRoot);
+    expect(result.determinable).toBe(true);
+    expect(result.dir).toBe(join(tmpRoot, '.macf', 'plugin'));
+  });
+});
+
+describe('getEffectiveHookConfig fallback (DR-039 "err toward not-false-alarming")', () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'doctor-effective-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('falls back to the default .macf/plugin/hooks/hooks.json when claude.sh is absent/ambiguous', () => {
+    // No claude.sh at all — plugin dir is NOT cleanly determinable.
+    mkdirSync(join(tmpRoot, '.macf', 'plugin', 'hooks'), { recursive: true });
+    writeFileSync(
+      join(tmpRoot, '.macf', 'plugin', 'hooks', 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          PreCompact: [
+            { hooks: [{ type: 'mcp_tool', server: 'plugin:macf-agent:macf-agent', tool: 'checkpoint_to_memory' }] },
+          ],
+        },
+      }),
+    );
+
+    const config = getEffectiveHookConfig(tmpRoot);
+    expect(config.usedDefaultFallback).toBe(true);
+    expect(config.entries.some((e) => e.kind === 'mcp_tool' && e.value === 'checkpoint_to_memory')).toBe(true);
   });
 });
