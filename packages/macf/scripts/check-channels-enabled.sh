@@ -29,6 +29,17 @@
 # which case this guard fails open (no false alarms) and should be re-pointed.
 set -euo pipefail
 
+# macf#701: how far back a `tmux_wake_delivered` line's `ts` may be and still
+# count as evidence THIS session is receiving deliveries. Without a bound, a
+# single delivery from a PREVIOUS session (the log is append-only across
+# relaunches) satisfies the "not deaf" check forever — the exact stale-proxy
+# shape macf#700 already fixed one layer up (native-push state itself).
+# MACF_CHANNELS_RECENCY_WINDOW_SECS is an internal/test knob; default 30 min.
+CHANNELS_RECENCY_WINDOW_SECS="${MACF_CHANNELS_RECENCY_WINDOW_SECS:-1800}"
+case "$CHANNELS_RECENCY_WINDOW_SECS" in
+  '' | *[!0-9]*) CHANNELS_RECENCY_WINDOW_SECS=1800 ;;
+esac
+
 # Operator override first — cheapest exit, no stdin read needed.
 if [ "${MACF_SKIP_CHANNELS_CHECK:-}" = "1" ]; then
   exit 0
@@ -56,6 +67,28 @@ LOG_DIR="$HOME_DIR/.cache/claude-cli-nodejs/$ENCODED/mcp-logs-plugin-macf-agent-
 # No log dir (workspace never ran the macf-agent MCP server, encoding drifted,
 # or a fresh machine) -> nothing to assert. Fail open.
 [ -d "$LOG_DIR" ] || exit 0
+
+# iso_to_epoch ISO_TS — print ISO_TS (e.g. "2026-07-01T09:05:06.742Z") as Unix
+# epoch seconds on stdout, or nothing + non-zero exit if parsing fails on this
+# platform. GNU `date -d` parses the form directly (fractional seconds + `Z`
+# both fine); BSD/macOS `date -j -f` needs the fractional-seconds + trailing
+# `Z` stripped down to `%Y-%m-%dT%H:%M:%S` first. Never treated as fatal by
+# callers — a parse failure just means "can't confirm recency," which routes
+# to the pre-macf#701 presence-only behavior (never a NEW failure mode).
+iso_to_epoch() {
+  local iso="$1"
+  if date --version >/dev/null 2>&1; then
+    # GNU coreutils date.
+    date -d "$iso" +%s 2>/dev/null
+  else
+    # BSD/macOS date. Strip fractional seconds + the trailing Z so -f's
+    # format string lines up with a plain "%Y-%m-%dT%H:%M:%S" (UTC via -u).
+    local stripped
+    stripped="$(printf '%s' "$iso" | sed -E 's/\.[0-9]+Z?$/Z/; s/Z$//' 2>/dev/null)"
+    [ -n "$stripped" ] || return 1
+    date -j -u -f "%Y-%m-%dT%H:%M:%S" "$stripped" +%s 2>/dev/null
+  fi
+}
 
 # Markers emitted by the macf-agent MCP server at startup (verified vs 2.1.195):
 #   OFF: "Channel notifications skipped: server plugin:macf-agent:macf-agent
@@ -117,15 +150,60 @@ if [ "$state" = "off" ]; then
     CHANNEL_LOG="$(ls -t "$HOME_DIR"/.local/state/macf/*/channel.log 2>/dev/null | head -n1 || true)"
   fi
 
-  # Evidence the tmux-wake fallback is delivering to THIS agent: a
+  # Evidence the tmux-wake fallback is delivering to THIS agent: a RECENT
   # `tmux_wake_delivered` event in its channel log. A functioning tmux-wake
-  # agent accrues these; its presence means routed notifications DO reach the
+  # agent accrues these; a recent one means routed notifications DO reach the
   # TUI (the agent is NOT deaf), even with native-push off.
+  #
+  # macf#701: bound "recent" — the log is append-only across relaunches, so a
+  # bare presence check (any tmux_wake_delivered in the tail, ever) lets a hit
+  # from a PREVIOUS session satisfy THIS session's check forever, even if
+  # tmux-wake broke moments after this session started. Read each candidate
+  # line's `ts` and require it within CHANNELS_RECENCY_WINDOW_SECS of now.
+  #
+  # Fail-open contract: if `now` or EVERY candidate line's `ts` fails to
+  # parse on this platform, fall back to the pre-#701 presence-only check —
+  # recency is a best-effort NARROWING of "yes", never a new way to produce a
+  # false "no" (that would trade a stale-positive hazard for a false-alarm one).
   tmux_wake_alive="no"
   if [ -n "$CHANNEL_LOG" ] && [ -r "$CHANNEL_LOG" ]; then
     # Bound the scan to the tail (logs grow large); grep is quiet on no-match.
-    if tail -n 2000 "$CHANNEL_LOG" 2>/dev/null | grep -q 'tmux_wake_delivered'; then
-      tmux_wake_alive="yes"
+    candidates="$(tail -n 2000 "$CHANNEL_LOG" 2>/dev/null | grep 'tmux_wake_delivered' || true)"
+    if [ -n "$candidates" ]; then
+      now_epoch="$(date +%s 2>/dev/null || true)"
+      if [ -z "$now_epoch" ]; then
+        # Can't even get "now" — recency is unassertable on this platform;
+        # fall back to presence-only (never a new failure mode).
+        tmux_wake_alive="yes"
+      else
+        recency_confirmed="no"
+        parse_ok_any="no"
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          # Extract the `ts` field's value without a JSON parser dependency:
+          # match `"ts":"..."` and capture the quoted ISO string.
+          ts="$(printf '%s' "$line" | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
+          [ -n "$ts" ] || continue
+          epoch="$(iso_to_epoch "$ts" || true)"
+          [ -n "$epoch" ] || continue
+          parse_ok_any="yes"
+          age=$((now_epoch - epoch))
+          if [ "$age" -ge 0 ] && [ "$age" -le "$CHANNELS_RECENCY_WINDOW_SECS" ]; then
+            recency_confirmed="yes"
+            break
+          fi
+        done <<EOF
+$candidates
+EOF
+        if [ "$recency_confirmed" = "yes" ]; then
+          tmux_wake_alive="yes"
+        elif [ "$parse_ok_any" = "no" ]; then
+          # Every candidate's `ts` failed to parse (or had no `ts` at all) —
+          # can't assert recency on this platform/shape; fall back to the
+          # pre-#701 presence-only behavior rather than invent a new "no".
+          tmux_wake_alive="yes"
+        fi
+      fi
     fi
   fi
 

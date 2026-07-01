@@ -105,8 +105,14 @@ function runHook(opts: {
   return { status: res.status, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
 }
 
-const TMUX_WAKE_DELIVERED =
-  '{"ts":"2026-07-01T09:05:06.742Z","level":"info","event":"tmux_wake_delivered","target":"%221"}';
+/** Build a `tmux_wake_delivered` JSONL line with `ts` offset from now (minutes). */
+function tmuxWakeDeliveredAt(minutesAgo: number): string {
+  const ts = new Date(Date.now() - minutesAgo * 60_000).toISOString();
+  return JSON.stringify({ ts, level: 'info', event: 'tmux_wake_delivered', target: '%221' });
+}
+
+const TMUX_WAKE_DELIVERED = tmuxWakeDeliveredAt(1); // 1 min ago — comfortably "recent"
+const TMUX_WAKE_DELIVERED_STALE = tmuxWakeDeliveredAt(120); // 2h ago — outside the recency window
 const TMUX_WAKE_SKIPPED =
   '{"ts":"2026-07-01T09:05:06.742Z","level":"info","event":"tmux_wake_skipped","reason":"observational"}';
 
@@ -146,6 +152,29 @@ describe('check-channels-enabled.sh (SessionStart guard)', () => {
       const r = runHook({ logDebugLines: [OK_DEBUG, SKIP_DEBUG] }); // no channelLogLines
       expect(r.status).toBe(0);
       expect(r.stdout).toContain('UNCONFIRMED');
+    });
+
+    // macf#701: a `tmux_wake_delivered` line only counts as evidence if its
+    // `ts` is recent — a stale hit (e.g. carried over from a PREVIOUS session)
+    // must NOT satisfy the "not deaf" check for THIS session.
+    it('only a STALE tmux_wake_delivered (old ts) → UNCONFIRMED, not "not deaf"', () => {
+      const r = runHook({
+        logDebugLines: [OK_DEBUG, SKIP_DEBUG],
+        channelLogLines: [TMUX_WAKE_DELIVERED_STALE],
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('UNCONFIRMED');
+      expect(r.stdout).not.toContain('you are NOT deaf to routing');
+    });
+
+    it('a STALE delivery mixed with older noise (both outside window) → UNCONFIRMED', () => {
+      const r = runHook({
+        logDebugLines: [OK_DEBUG, SKIP_DEBUG],
+        channelLogLines: [TMUX_WAKE_SKIPPED, TMUX_WAKE_DELIVERED_STALE],
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('UNCONFIRMED');
+      expect(r.stdout).not.toContain('you are NOT deaf to routing');
     });
   });
 
