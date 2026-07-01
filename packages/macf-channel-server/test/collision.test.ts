@@ -72,12 +72,17 @@ function staleOverrideWarn(logger: Logger): { result?: string; prior_basis?: str
 
 /**
  * Mock a LIVE /health response (200) whose JSON body advertises `version`
- * (omitted entirely when `version === null`, simulating a pre-#424 instance).
- * Wires res.on('data')/on('end') so collision's pingHealth reads the body.
+ * (omitted entirely when `version === null`, simulating a pre-#424 instance)
+ * and, optionally, the responder's OWN `instance_id` (groundnuty/macf#733;
+ * omitted entirely when `instanceId` is undefined, simulating a pre-#733
+ * peer whose `/health` body predates the self-report). Wires
+ * res.on('data')/on('end') so collision's pingHealth reads the body.
  */
-function mockAliveWithVersion(version: string | null): void {
+function mockAliveWithVersion(version: string | null, instanceId?: string): void {
   vi.mocked(mockRequest).mockImplementation((_opts, cb) => {
-    const bodyObj = version === null ? { status: 'online' } : { status: 'online', version };
+    const bodyObj: Record<string, unknown> = { status: 'online' };
+    if (version !== null) bodyObj['version'] = version;
+    if (instanceId !== undefined) bodyObj['instance_id'] = instanceId;
     const bodyStr = JSON.stringify(bodyObj);
     const mockRes = {
       statusCode: 200,
@@ -274,6 +279,73 @@ describe('checkCollision', () => {
       expect(decisionBasis(logger)).toBe('abort_same_or_newer');
       // The fix must not trust a single 2xx: the live peer is pinged twice.
       expect(mockRequest).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('identity-aware liveness (groundnuty/macf#733 — the phantom-on-the-port bug)', () => {
+    it('TAKES OVER when the responder self-reports an instance_id that MISMATCHES the registered slot — the motivating bug', async () => {
+      // Something is answering 2xx (same version even) but it is NOT the
+      // registered owner ('a8f3c2') — a phantom/stray/orphan on the port.
+      mockAliveWithVersion('0.2.34', 'some-other-instance');
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('takeover');
+      expect(decisionBasis(logger)).toBe('takeover_stale_owner_gone');
+      if (result.action === 'takeover') expect(result.previous.instance_id).toBe('a8f3c2');
+    });
+
+    it('mismatch takeover bypasses MACF_NO_VERSION_TAKEOVER=1 (identity, not version, is the question)', async () => {
+      process.env['MACF_NO_VERSION_TAKEOVER'] = '1';
+      mockAliveWithVersion('0.2.34', 'some-other-instance');
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('takeover');
+      expect(decisionBasis(logger)).toBe('takeover_stale_owner_gone');
+    });
+
+    it('mismatch takeover bypasses the unversioned-incoming guard (identity, not version, is the question)', async () => {
+      mockAliveWithVersion('0.2.34', 'some-other-instance');
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '', logger);
+      expect(result.action).toBe('takeover');
+      expect(decisionBasis(logger)).toBe('takeover_stale_owner_gone');
+    });
+
+    it('ABORTS (unchanged #424) when the responder instance_id MATCHES the slot + SAME version — no regression', async () => {
+      mockAliveWithVersion('0.2.34', 'a8f3c2'); // matches existingAgent.instance_id
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('abort');
+      expect(decisionBasis(logger)).toBe('abort_same_or_newer');
+    });
+
+    it('TAKES OVER (unchanged #424) when the responder instance_id MATCHES the slot but version is OLDER', async () => {
+      mockAliveWithVersion('0.2.20', 'a8f3c2'); // matches; existing peer genuinely alive + older
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('takeover');
+      expect(decisionBasis(logger)).toBe('takeover_newer_version');
+    });
+
+    it('falls through to the #424 version quadrant (back-compat) when the responder is a pre-#733 peer (no instance_id in body)', async () => {
+      // No instance_id field at all in the /health body — can't compare, so the
+      // unchanged version quadrant decides (same version → abort).
+      mockAliveWithVersion('0.2.34'); // instanceId omitted
+      const logger = mockLogger();
+      const result = await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      expect(result.action).toBe('abort');
+      expect(decisionBasis(logger)).toBe('abort_same_or_newer');
+    });
+
+    it('logs both the slot + responder instance_id on the decision line', async () => {
+      mockAliveWithVersion('0.2.34', 'some-other-instance');
+      const logger = mockLogger();
+      await checkCollision('code-agent', mockRegistry(existingAgent), certPaths, '0.2.34', logger);
+      const call = vi.mocked(logger.warn).mock.calls.find((c) => c[0] === 'collision_check');
+      expect(call?.[1]).toMatchObject({
+        existing_instance_id: 'a8f3c2',
+        responder_instance_id: 'some-other-instance',
+      });
     });
   });
 

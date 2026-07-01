@@ -86,18 +86,25 @@ const HEALTH_CONFIRM_DELAY_MS = 300;
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Result of a collision /health ping: liveness + the advertised version
- *  (null when the peer answered but carried no `version` field — a
- *  pre-groundnuty/macf#424 instance — or was unreachable/unparseable). */
+/** Result of a collision /health ping: liveness + the advertised version +
+ *  the RESPONDER's OWN `instance_id` (groundnuty/macf#733). `version` is null
+ *  when the peer answered but carried no `version` field (a pre-#424
+ *  instance) or was unreachable/unparseable. `instanceId` is null under the
+ *  same conditions PLUS the pre-#733 case where a live peer's `/health` body
+ *  simply predates the `instance_id` self-report — the identity check
+ *  (`classifyPeer`) treats a null `instanceId` as "can't compare" and falls
+ *  through to the unchanged #424 version quadrant (back-compat). */
 export interface HealthPingResult {
   readonly alive: boolean;
   readonly version: string | null;
+  readonly instanceId: string | null;
 }
 
 /**
  * Ping an agent's /health endpoint via mTLS.
- * Returns `{ alive, version }`: alive iff the agent responds 2xx; version is
- * the `version` field parsed from the JSON body (null if absent/unparseable).
+ * Returns `{ alive, version, instanceId }`: alive iff the agent responds 2xx;
+ * version + instanceId are the `version` / `instance_id` fields parsed from
+ * the JSON body (null if absent/unparseable).
  */
 function pingHealth(
   host: string,
@@ -123,7 +130,7 @@ function pingHealth(
     cert = readFileSync(agentCertPath);
     key = readFileSync(agentKeyPath);
   } catch {
-    return Promise.resolve({ alive: false, version: null });
+    return Promise.resolve({ alive: false, version: null, instanceId: null });
   }
 
   return new Promise((resolve) => {
@@ -143,32 +150,39 @@ function pingHealth(
         const alive = res.statusCode !== undefined && res.statusCode >= 200 && res.statusCode < 300;
         if (!alive) {
           res.resume(); // drain
-          resolve({ alive: false, version: null });
+          resolve({ alive: false, version: null, instanceId: null });
           return;
         }
-        // Alive — read the body to extract the advertised version. A peer
-        // that answers 2xx but carries no `version` field (or an unparseable
-        // body) is treated as version=null (a pre-#424 instance).
+        // Alive — read the body to extract the advertised version + the
+        // responder's OWN instance_id (groundnuty/macf#733). A peer that
+        // answers 2xx but carries no `version` / `instance_id` field (or an
+        // unparseable body) is treated as version=null / instanceId=null (a
+        // pre-#424 / pre-#733 instance).
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
         res.on('end', () => {
           let version: string | null = null;
+          let instanceId: string | null = null;
           try {
-            const body = JSON.parse(Buffer.concat(chunks).toString('utf-8')) as { version?: unknown };
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf-8')) as {
+              version?: unknown;
+              instance_id?: unknown;
+            };
             if (typeof body.version === 'string') version = body.version;
+            if (typeof body.instance_id === 'string') instanceId = body.instance_id;
           } catch {
-            // alive but unparseable → version stays null
+            // alive but unparseable → version/instanceId stay null
           }
-          resolve({ alive: true, version });
+          resolve({ alive: true, version, instanceId });
         });
-        res.on('error', () => resolve({ alive: true, version: null }));
+        res.on('error', () => resolve({ alive: true, version: null, instanceId: null }));
       },
     );
 
-    req.on('error', () => resolve({ alive: false, version: null }));
+    req.on('error', () => resolve({ alive: false, version: null, instanceId: null }));
     req.on('timeout', () => {
       req.destroy();
-      resolve({ alive: false, version: null });
+      resolve({ alive: false, version: null, instanceId: null });
     });
     req.end();
   });
@@ -190,11 +204,11 @@ async function confirmLiveness(
   agentCertPath: string,
   agentKeyPath: string,
 ): Promise<HealthPingResult> {
-  let result: HealthPingResult = { alive: false, version: null };
+  let result: HealthPingResult = { alive: false, version: null, instanceId: null };
   for (let attempt = 0; attempt < HEALTH_CONFIRM_ATTEMPTS; attempt += 1) {
     if (attempt > 0) await sleep(HEALTH_CONFIRM_DELAY_MS);
     result = await pingHealth(host, port, caCertPath, agentCertPath, agentKeyPath);
-    if (!result.alive) return { alive: false, version: null };
+    if (!result.alive) return { alive: false, version: null, instanceId: null };
   }
   return result;
 }
@@ -209,6 +223,25 @@ export type CollisionResult =
  *
  * Returns the action to take: register (fresh), takeover (the slot is held by a
  * dead OR alive-but-older instance), or abort (a same/newer live peer holds it).
+ *
+ * Identity-aware liveness (groundnuty/macf#733): "something answers 2xx on the
+ * advertised port" is NOT the same claim as "the REGISTERED owner is alive" —
+ * a lingering socket from the just-exited owner, or an unrelated stray/orphan
+ * process, can answer 2xx on the port the registry recorded, and the #424
+ * quadrant below would then read that as a same-version live peer and ABORT,
+ * stranding the slot indefinitely (the bug that repeatedly bricked devops on
+ * 0.2.47). The `/health` responder now self-reports its OWN `instance_id`
+ * (`health.ts`), so `classifyPeer` can tell "the registered owner is
+ * confirmed alive" apart from "the registered owner is gone; something else
+ * answers." When the responder's `instance_id` is present AND differs from
+ * the registry slot's `instance_id`, the registered owner's liveness is
+ * UNCONFIRMED — takeover, bypassing the #424 quadrant entirely (this is an
+ * identity question, not a version question). When the responder's
+ * `instance_id` matches the slot (the common, correct case) OR the responder
+ * doesn't self-report one (a pre-#733 peer — back-compat), the unchanged
+ * #424 version quadrant below decides. See `classifyPeer`'s body for the
+ * concurrent-newer-instance-race analysis (why this is safe to do without
+ * its own displacement logic).
  *
  * Version-aware takeover (groundnuty/macf#424): a same-version alive peer is
  * still protected (alive → abort), but an alive instance running an *older*
@@ -301,8 +334,8 @@ export async function classifyPeer(
   // Liveness is re-confirmed across HEALTH_CONFIRM_ATTEMPTS pings to defeat the
   // just-killed-port race (groundnuty/macf#553): a single momentary 2xx from a
   // dying prior instance must NOT count as alive. A confirmed-live peer then
-  // flows into the unchanged #424 version quadrant below.
-  const { alive, version: existingVersion } = await confirmLiveness(
+  // flows into the identity check + the #424 version quadrant below.
+  const { alive, version: existingVersion, instanceId: responderInstanceId } = await confirmLiveness(
     existing.host,
     existing.port,
     certPaths.caCertPath,
@@ -314,10 +347,43 @@ export async function classifyPeer(
     const versionTakeoverDisabled = process.env['MACF_NO_VERSION_TAKEOVER'] === '1';
     const incomingVersioned = VERSION_PATTERN.test(incomingVersion);
 
-    // Decide takeover-vs-abort against a LIVE peer (the #424 quadrant).
+    // groundnuty/macf#733: the /health responder answered 2xx on every
+    // re-confirm ping (so `alive` is true), but that alone doesn't prove the
+    // REGISTERED owner (`existing.instance_id`) is who's answering. When the
+    // responder self-reports its OWN instance_id and it does NOT match the
+    // slot, the registered owner is confirmed GONE — something else (a
+    // lingering just-exited socket, an unrelated orphan) is squatting the
+    // port. `responderInstanceId === null` means the responder predates the
+    // #733 self-report (or the body was unparseable) — we can't compare, so
+    // fall through to the unchanged #424 version quadrant (back-compat).
+    //
+    // Concurrent-newer-instance-race safety: this identity check can, in a
+    // narrow TOCTOU window, mis-takeover against a genuinely newer live peer
+    // that raced us between our `registry.get()` read and this /health ping
+    // (e.g. the peer's own server is already up+serving at the recorded
+    // host:port under a fresh instance_id, but its registry write hasn't
+    // landed yet). This is bounded, not a permanent stranding: the caller's
+    // over-register loop (register-with-takeover.ts, macf#702) re-classifies
+    // against the FRESH registry value at CAS write time — if that peer is
+    // genuinely live + same-or-newer, our own registerConditional loses the
+    // race and we yield (RegisterRaceError); if the peer instead loses the
+    // slot to us first, its own registry heartbeat (DR-031 onDisplaced,
+    // macf#568) detects the takeover on its own next beat and stands down
+    // gracefully. Either direction self-corrects within one heartbeat
+    // interval — no additional displacement logic is added here.
+    const identityMismatch = responderInstanceId !== null && responderInstanceId !== existing.instance_id;
+
+    // Decide takeover-vs-abort against a LIVE peer (the identity check, then
+    // the #424 quadrant).
     let takeover: boolean;
     let basis: string;
-    if (versionTakeoverDisabled) {
+    if (identityMismatch) {
+      // The registered owner isn't the one answering — takeover regardless of
+      // version policy (this is an identity question, not a version one; it
+      // intentionally bypasses versionTakeoverDisabled + incomingVersioned).
+      takeover = true;
+      basis = 'takeover_stale_owner_gone';
+    } else if (versionTakeoverDisabled) {
       takeover = false;
       basis = 'abort_version_takeover_disabled';
     } else if (!incomingVersioned) {
@@ -348,6 +414,8 @@ export async function classifyPeer(
       agent: name,
       incoming_version: incomingVersion,
       existing_version: existingVersion,
+      existing_instance_id: existing.instance_id,
+      responder_instance_id: responderInstanceId,
       host: existing.host,
       port: existing.port,
     });
