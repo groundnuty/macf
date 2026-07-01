@@ -267,9 +267,36 @@ describe('generateClaudeSh', () => {
       expect(output).toContain('if [ -z "${TMUX:-}" ] && [ "${MACF_NO_TMUX_WRAP:-}" != "1" ]; then');
     });
 
-    it('emits canonical session name from MACF_PROJECT@MACF_AGENT_NAME', () => {
+    it('emits canonical session name from MACF_PROJECT@MACF_ROUTING_LABEL (macf#678)', () => {
+      // The session keys on the routing-label (registry key / cert CN /
+      // DR-031 watchdog target), NOT the OTEL agent-name — so a name!=label
+      // agent's session matches what the watchdog + reconcile/resume look for.
       const output = generateClaudeSh(sampleConfig);
-      expect(output).toContain('SESSION_NAME="${MACF_PROJECT}@${MACF_AGENT_NAME}"');
+      expect(output).toContain('SESSION_NAME="${MACF_PROJECT}@${MACF_ROUTING_LABEL}"');
+      expect(output).not.toContain('SESSION_NAME="${MACF_PROJECT}@${MACF_AGENT_NAME}"');
+    });
+
+    it('keys the session on the routing-label for a name != routing_label agent (macf#678)', () => {
+      // Shell-variable expansion: the launcher emits the same `${MACF_ROUTING_LABEL}`
+      // literal regardless of config, and env.identity resolves it to the
+      // baked routing_label at runtime (covered in env-files.test.ts). This
+      // pins that the session derivation is routing-label-driven, not
+      // agent-name-interpolated — so science (name=macf-science-agent,
+      // routing_label=science-agent) lands on `macf@science-agent`, not
+      // `macf@macf-science-agent`.
+      const nameNeLabel: MacfAgentConfig = {
+        ...sampleConfig,
+        agent_name: 'macf-science-agent',
+        routing_label: 'science-agent',
+      };
+      const output = generateClaudeSh(nameNeLabel);
+      const sessionLine = output
+        .split('\n')
+        .find((l) => l.includes('SESSION_NAME='));
+      expect(sessionLine?.trim()).toBe('SESSION_NAME="${MACF_PROJECT}@${MACF_ROUTING_LABEL}"');
+      // The session-name derivation must not bake either identity literal.
+      expect(sessionLine).not.toContain('macf-science-agent');
+      expect(sessionLine).not.toContain('science-agent"');
     });
 
     it('emits has-session re-attach path with stderr suppressed', () => {

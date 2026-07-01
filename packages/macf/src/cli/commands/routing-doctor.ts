@@ -32,7 +32,8 @@
  *  4. CA material — `MACF_CA_CERT` (a readable VARIABLE) is present AND
  *     base64/PEM-parses (the #563 malformed-base64 class — present ≠ valid).
  *  5. SESSION-name drift — `agent-config.json.tmux_session` follows the canonical
- *     `<project>@<agent>` convention (the silent Stage-2-routing-drop class).
+ *     `<project>@<routing-label>` convention (the silent Stage-2-routing-drop class).
+ *     Vestigial + omitted on v3+ (macf#678): absent = PASS.
  *
  * Every GitHub read (install-set, caller-pins, agent-config), the registry list,
  * the mTLS `/health` probe, and the CA-var read are INJECTABLE (`RoutingDoctorDeps`)
@@ -184,28 +185,32 @@ export type SessionStatus = 'ok' | 'warn' | 'absent';
 
 /**
  * Session-name drift (DR-032 §6th-surface amendment, #601 / #610). The CONVENTION
- * check: `agent-config.json:tmux_session` should equal `<project>@<name>` — keyed on
- * `name` (= `MACF_AGENT_NAME`, what `claude.sh` actually self-wraps per
- * `claude-sh.ts`), NOT the routing-label (equal under the convention; they diverge
- * only in the #538 escape-hatch, where the session follows `name`). This is a STATIC
- * convention check — it proves the config follows the canonical naming, NOT that it
- * matches the LIVE tmux session (a runtime fact this command can't see).
+ * check: `agent-config.json:tmux_session` should equal `<project>@<routing-label>` —
+ * keyed on the ROUTING LABEL (= `MACF_ROUTING_LABEL`, what `claude.sh` self-wraps on
+ * per `claude-sh.ts` since macf#678), NOT the OTEL agent-name. The registry key / cert
+ * CN / DR-031 watchdog all key on the routing-label too, so the session matches what
+ * they target even for a name != routing_label agent (science). `label` here IS the
+ * routing label (the caller iterates registry keys / agent-config.json keys). This is
+ * a STATIC convention check — it proves the config follows the canonical naming, NOT
+ * that it matches the LIVE tmux session (a runtime fact this command can't see).
  *
  * Tri-state, and deliberately NOT a verdict-failing check:
  *  - `absent` — no `tmux_session` (or no `agent-config.json` at all). ASSERT-IF-PRESENT:
  *               agent-config.json was the Stage-2 SSH-router's target list and is
- *               vestigial on v3 channel agents, so its absence is a PASS, not a fault.
- *  - `ok`     — present and matches `<project>@<name>`.
- *  - `warn`   — present but stale. The known-pending DR-032 session-rename migration;
- *               WARN-not-FAIL — it stays VISIBLE but does NOT drive DEGRADED/exit-1
- *               (else the DR-006 watchdog false-restarts on a gated step).
+ *               vestigial on v3 channel agents (the v3+ template omits it per macf#678),
+ *               so its absence is a PASS, not a fault.
+ *  - `ok`     — present and matches `<project>@<routing-label>`.
+ *  - `warn`   — present but stale (e.g. a leftover Stage-2 bare-label send-target). The
+ *               known-pending DR-032 session-rename migration; WARN-not-FAIL — it stays
+ *               VISIBLE but does NOT drive DEGRADED/exit-1 (else the DR-006 watchdog
+ *               false-restarts on a gated step).
  */
 export function evaluateSession(
-  name: string,
+  label: string,
   tmuxSession: string | undefined,
   project: string,
 ): { readonly status: SessionStatus; readonly expected: string; readonly reason?: string } {
-  const expected = `${project}@${name}`;
+  const expected = `${project}@${label}`;
   if (!tmuxSession || tmuxSession.trim() === '') {
     return { status: 'absent', expected };
   }
@@ -214,7 +219,7 @@ export function evaluateSession(
     status: 'warn',
     expected,
     reason:
-      `tmux_session "${tmuxSession}" != "${expected}" (<project>@<name> convention; ` +
+      `tmux_session "${tmuxSession}" != "${expected}" (<project>@<routing-label> convention; ` +
       `WARN-not-FAIL pending the DR-032 session-rename migration)`,
   };
 }
@@ -339,7 +344,7 @@ export interface AgentRow {
    * / `absent` (vestigial on v3). `null` for a registry-only agent (REPO-scoped, #621).
    */
   readonly sessionStatus: SessionStatus | null;
-  /** Expected `<project>@<name>` session; `null` for a registry-only agent (#621). */
+  /** Expected `<project>@<routing-label>` session; `null` for a registry-only agent (#621). */
   readonly sessionExpected: string | null;
   readonly sessionReason?: string;
   readonly freshness: FreshnessState;
@@ -451,8 +456,8 @@ async function evaluateAgentRow(
   }
 
   // REPO-scoped: only when a local agent-config entry exists. The agent-config key IS the
-  // `name` (= routing-label under the DR-032 convention, #601); they diverge only in the
-  // #538 escape-hatch, where the session follows name.
+  // routing label — the canonical session keys on the routing-label too (macf#678), so
+  // the SESSION check matches even for a name != routing_label agent (science).
   const selfSkip = entry ? evaluateSelfSkip(label, entry.app_name, deps.botLogins?.[label]) : null;
   const session = entry ? evaluateSession(label, entry.tmux_session, deps.project) : null;
 
@@ -689,9 +694,9 @@ export const HONESTY_LEGEND = [
   '        (e.g. an intentional-Stage-2 test harness); absent marker = fleet member (#614).',
   '        ROUTABLE = a MACF_AGENT_<LABEL> registry key exists (router resolves by LABEL).',
   '        SELF-SKIP = agent-config.json app_name is the bot-LOGIN, not the bare label (#566).',
-  '        SESSION = agent-config.json tmux_session follows <project>@<name> (assert-IF-PRESENT:',
-  '                  absent = PASS, vestigial on v3; ⚠ warn = stale drift, WARN-not-FAIL — visible',
-  '                  but does NOT drive the verdict, the known-pending DR-032 session-rename).',
+  '        SESSION = agent-config.json tmux_session follows <project>@<routing-label> (assert-IF-',
+  '                  PRESENT: absent = PASS, vestigial + omitted on v3 (#678); ⚠ warn = stale drift,',
+  '                  WARN-not-FAIL — visible but does NOT drive the verdict, DR-032 session-rename).',
   '                  FRESH = registry instance_id == live /health instance_id (✗ stale / ? unreach).',
   '        The agent set is the registry fleet ∪ this repo\'s routing config (#621): a registry-only',
   '        agent (one this repo does not route to, e.g. the auditor) shows "— n/a" SELF-SKIP/SESSION',

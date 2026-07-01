@@ -199,7 +199,17 @@ export function generateWorkflow(
 interface AgentConfigEntry {
   app_name: string;
   host: string;
-  tmux_session: string;
+  /**
+   * Stage-2 (v1.x SSH-router) send-target: the router SSHes in and sends to
+   * `${tmux_session}` (or `${tmux_session}:${tmux_window}`). Load-bearing for
+   * v1.x routing (which reads addressing from this file), but VESTIGIAL on v3+
+   * where routing resolves the channel endpoint from the MACF registry instead.
+   * Omitted from the generated template on a v3+ pin (macf#678) so `macf routing
+   * doctor`'s SESSION check reads `absent` (= PASS) rather than the false
+   * `tmux_session "<label>" != "<project>@<routing-label>"` WARN — the field held
+   * the bare label, never the canonical `<project>@<routing-label>` session name.
+   */
+  tmux_session?: string;
   tmux_window?: string;
   ssh_user: string;
   tmux_bin: string;
@@ -242,17 +252,19 @@ function makeAgentEntry(
   useWindows: boolean,
   sessionName: string | undefined,
   defaults?: AgentEntryDefaults,
+  omitTmuxSession = false,
 ): AgentConfigEntry {
   const sshUser = 'ubuntu';
   const entry: AgentConfigEntry = {
     app_name: agent,
     host: '<agent-host-ip>',
-    tmux_session: useWindows ? sessionName! : agent,
+    // v3+ (registry-routed): omit the vestigial Stage-2 send-target (macf#678).
+    ...(omitTmuxSession ? {} : { tmux_session: useWindows ? sessionName! : agent }),
     ssh_user: sshUser,
     tmux_bin: 'tmux',
     ssh_key_secret: 'AGENT_SSH_KEY',
   };
-  if (useWindows) entry.tmux_window = agent;
+  if (useWindows && !omitTmuxSession) entry.tmux_window = agent;
   // Default workspace_dir = /home/<ssh_user>/repos/<owner>/<repo>. Covers
   // the common case where agents are cloned into ~/repos/<owner>/<repo>
   // on the host. Users override per-agent if their layout differs.
@@ -266,6 +278,7 @@ export function generateAgentConfig(
   agents: readonly string[],
   sessionName?: string,
   defaults?: AgentEntryDefaults,
+  omitTmuxSession = false,
 ): string {
   if (agents.length === 0) {
     return JSON.stringify({
@@ -273,7 +286,8 @@ export function generateAgentConfig(
         '<agent-name>': {
           app_name: '<github-app-name>',
           host: '<agent-host-ip>',
-          tmux_session: '<tmux-session-name>',
+          // v3+ (registry-routed) omits the vestigial Stage-2 send-target (macf#678).
+          ...(omitTmuxSession ? {} : { tmux_session: '<tmux-session-name>' }),
           ssh_user: 'ubuntu',
           tmux_bin: 'tmux',
           ssh_key_secret: 'AGENT_SSH_KEY',
@@ -288,7 +302,7 @@ export function generateAgentConfig(
 
   const agentEntries: Record<string, AgentConfigEntry> = {};
   for (const agent of agents) {
-    agentEntries[agent] = makeAgentEntry(agent, useWindows, sessionName, defaults);
+    agentEntries[agent] = makeAgentEntry(agent, useWindows, sessionName, defaults, omitTmuxSession);
   }
   return JSON.stringify({
     agents: agentEntries,
@@ -301,12 +315,18 @@ export function generateAgentConfig(
  * fields from user input, preserve app_name/host/ssh_key_secret/ssh_user
  * /tmux_bin/unknown-fields, preserve top-level label_to_status and extras.
  * Agents not in the --agents list are left alone.
+ *
+ * When `omitTmuxSession` is set (a v3+ registry-routed pin, macf#678) the patch
+ * DELETES the vestigial `tmux_session`/`tmux_window` from re-patched entries so a
+ * substrate agent re-running `macf repo-init` at v3 sheds the leftover Stage-2
+ * send-target — clearing `macf routing doctor`'s false SESSION WARN.
  */
 export function patchAgentConfig(
   existingJson: string,
   agents: readonly string[],
   sessionName?: string,
   defaults?: AgentEntryDefaults,
+  omitTmuxSession = false,
 ): string {
   let parsed: AgentConfigFile;
   try {
@@ -324,15 +344,21 @@ export function patchAgentConfig(
   for (const agent of agents) {
     const existing = parsed.agents[agent];
     if (!existing) {
-      agentEntries[agent] = makeAgentEntry(agent, useWindows, sessionName, defaults);
+      agentEntries[agent] = makeAgentEntry(agent, useWindows, sessionName, defaults, omitTmuxSession);
       continue;
     }
     const patched: AgentConfigEntry = { ...existing };
-    patched.tmux_session = useWindows ? sessionName! : agent;
-    if (useWindows) {
-      patched.tmux_window = agent;
-    } else {
+    if (omitTmuxSession) {
+      // v3+ (registry-routed): shed the vestigial Stage-2 send-target (macf#678).
+      delete patched.tmux_session;
       delete patched.tmux_window;
+    } else {
+      patched.tmux_session = useWindows ? sessionName! : agent;
+      if (useWindows) {
+        patched.tmux_window = agent;
+      } else {
+        delete patched.tmux_window;
+      }
     }
     if (!patched.ssh_key_secret) patched.ssh_key_secret = 'AGENT_SSH_KEY';
     // Inject workspace_dir default for old entries that lack it, so
@@ -451,6 +477,11 @@ export async function repoInit(
   // preserve app_name/host/ssh_key_secret/ssh_user/tmux_bin/workspace_dir,
   // and top-level label_to_status + unknown keys pass through.
   const entryDefaults: AgentEntryDefaults = { owner: owner!, repo: repoName! };
+  // v3+ routing resolves the channel endpoint from the MACF registry, so the
+  // agent-config.json `tmux_session` send-target is vestigial and only drives a
+  // false `macf routing doctor` SESSION WARN — omit it on v3+ (macf#678). v1.x
+  // still reads addressing from this file, so keep it there.
+  const omitTmuxSession = isV3PlusActionsVersion(opts.actionsVersion);
   let configResult: 'created' | 'updated' | 'skipped';
   if (existsSync(configPath)) {
     const patched = patchAgentConfig(
@@ -458,11 +489,12 @@ export async function repoInit(
       agentList,
       opts.sessionName,
       entryDefaults,
+      omitTmuxSession,
     );
     writeFileSync(configPath, patched);
     configResult = 'updated';
   } else {
-    const fresh = generateAgentConfig(agentList, opts.sessionName, entryDefaults);
+    const fresh = generateAgentConfig(agentList, opts.sessionName, entryDefaults, omitTmuxSession);
     const writeRes = writeFileSafe(configPath, fresh, false);
     configResult = writeRes;  // 'created' (file didn't exist) is the expected path
   }
