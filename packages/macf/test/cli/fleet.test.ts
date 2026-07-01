@@ -9,7 +9,7 @@
  * cert_expiry warn/crit math deterministic.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
+import type { AgentInfo, GuestBinding, HealthResponse } from '@groundnuty/macf-core';
 import {
   buildFleetRows,
   daysUntil,
@@ -308,5 +308,107 @@ describe('runFleetStatus (injected deps)', () => {
     const code = await runFleetStatus('/unused', { now: NOW }, deps([], async () => null));
     expect(code).toBe(0);
     expect(logSpy.mock.calls.flat().join('\n')).toMatch(/No agents registered/);
+  });
+});
+
+describe('runFleetStatus — GUEST block (DR-036 Amendment A, #679)', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  afterEach(() => {
+    logSpy?.mockRestore();
+  });
+
+  const routeGuest: GuestBinding = {
+    agent: 'ppam-2026/code-agent',
+    local_role: 'onedata-specialist',
+    purpose: 'data-access dependency (onedata-mcp)',
+    delegate_via: 'route',
+    until: null,
+  };
+  const relayGuest: GuestBinding = { ...routeGuest, delegate_via: 'operator-relay' };
+
+  const guestDeps = (
+    peers: readonly { name: string; info: AgentInfo }[],
+    probe: FleetProbeFn,
+    guests: readonly GuestBinding[],
+    resolveGuest: (home: string, name: string) => Promise<AgentInfo | null>,
+  ): FleetStatusDeps => ({
+    project: 'icsoc-2026',
+    listPeers: async () => peers,
+    probe,
+    loadGuests: () => guests,
+    resolveGuest,
+    guestProbe: probe,
+  });
+
+  it('renders a members table AND a separate GUEST block for a route guest', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const peers = [{ name: 'SCIENCE_AGENT', info: info('127.0.0.1', 4200) }];
+    const guestInfo = info('100.64.0.9', 4900);
+    const health = onlineHealth();
+    // The guest resolves to a different host:port than the member; the probe
+    // answers for the guest's port so it renders online.
+    const probe: FleetProbeFn = async (_h, port) => (port === 4900 || port === 4200 ? health : null);
+    const resolveGuest = async (home: string, name: string) =>
+      home === 'ppam-2026' && name === 'code-agent' ? guestInfo : null;
+
+    const code = await runFleetStatus(
+      '/unused',
+      { now: NOW },
+      guestDeps(peers, probe, [routeGuest], resolveGuest),
+    );
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('SCIENCE_AGENT'); // members
+    expect(out).toContain('GUEST / external collaborators'); // guest block header
+    expect(out).toContain('ppam-2026/code-agent');
+    expect(out).toContain('onedata-specialist');
+    expect(out).toContain('online');
+  });
+
+  it('local-mode guest renders never-"down", with no probe issued', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const probe = vi.fn<FleetProbeFn>(async () => null);
+    const resolveGuest = async () => info('127.0.0.1', 5000);
+    const code = await runFleetStatus(
+      '/unused',
+      { now: NOW },
+      guestDeps([], probe, [relayGuest], resolveGuest),
+    );
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('local-mode — home-fleet-observable only');
+    expect(out).not.toContain('offline');
+    expect(probe).not.toHaveBeenCalled(); // no cross-fleet probe for path-c
+  });
+
+  it('--json carries a separate guests[] array with supervised:false', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const resolveGuest = async () => info('127.0.0.1', 5000);
+    const code = await runFleetStatus(
+      '/unused',
+      { json: true, now: NOW },
+      guestDeps([], async () => null, [relayGuest], resolveGuest),
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
+    expect(parsed.agents).toEqual([]);
+    expect(parsed.guests).toHaveLength(1);
+    expect(parsed.guests[0].supervised).toBe(false);
+    expect(parsed.guests[0].reachability).toBe('local-mode');
+    expect(parsed.guests[0].delegate_via).toBe('operator-relay');
+  });
+
+  it('renders the GUEST block even when there are no members', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const resolveGuest = async () => info('127.0.0.1', 5000);
+    const code = await runFleetStatus(
+      '/unused',
+      { now: NOW },
+      guestDeps([], async () => null, [relayGuest], resolveGuest),
+    );
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('No agents registered in the registry.'); // members empty
+    expect(out).toContain('GUEST / external collaborators'); // but guests still show
   });
 });

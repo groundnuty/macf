@@ -21,8 +21,27 @@ import { mintFreshGitHubToken } from '../lib/fresh-github-token.js';
 import { checkIssues } from '../lib/work.js';
 import { createRegistryFromConfig } from '@groundnuty/macf-core';
 import { toVariableSegment } from '@groundnuty/macf-core';
+import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
+import {
+  loadGuestBindings,
+  gatherGuestStatuses,
+  formatGuestBlock,
+  type GuestProbeFn,
+  type GuestResolveFn,
+} from '../../cli/commands/fleet-guests.js';
 
 const command = process.argv[2];
+
+/**
+ * Probe a `route` guest's `/health` by host:port, reusing the same cert-env
+ * mTLS path `probePeerHealth` uses for members (returns null when the cert env
+ * is missing or the probe fails → the guest renders offline, still visible via
+ * the registry). Only `host`/`port` of the synthetic `AgentInfo` are used.
+ */
+function probeGuestHealth(host: string, port: number): Promise<HealthResponse | null> {
+  const info: AgentInfo = { host, port, type: 'permanent', instance_id: '', started: '' };
+  return probePeerHealth({ name: 'guest', info });
+}
 
 async function main(): Promise<void> {
   const agentName = process.env['MACF_AGENT_NAME'] ?? 'unknown';
@@ -68,6 +87,22 @@ async function main(): Promise<void> {
         peers.map(async p => ({ ...p, health: await probePeerHealth(p) })),
       );
       console.log(formatPeerTable(peersWithHealth));
+
+      // GUEST / external collaborators block (DR-036 Amendment A, macf#679) —
+      // cross-fleet guests the consumer DEPENDS on but does NOT supervise. Same
+      // block `macf fleet status` renders. Additive + best-effort: any failure
+      // here must never break the members roster above.
+      const workspaceDir = process.env['MACF_WORKSPACE_DIR'] ?? process.cwd();
+      const guestBindings = loadGuestBindings(workspaceDir);
+      if (guestBindings.length > 0) {
+        const resolveGuest: GuestResolveFn = (homeProject, name) =>
+          createRegistryFromConfig(registryConfig, homeProject, token).get(name);
+        const guestProbe: GuestProbeFn = (host, port) =>
+          probeGuestHealth(host, port);
+        const guests = await gatherGuestStatuses(guestBindings, resolveGuest, guestProbe);
+        console.log('');
+        console.log(formatGuestBlock(guests, Date.now()));
+      }
       break;
     }
 
