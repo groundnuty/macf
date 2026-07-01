@@ -12,8 +12,11 @@ import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 import {
   AUTONOMY_REQUIRED_TOOLS,
   MACF_REQUIRED_PERMISSIONS,
+  checkBotLogin,
   checkPermissionsAllow,
   checkSandboxFdAllowRead,
+  deriveBotLogin,
+  describeNonAppSlugOutput,
   diffPermissions,
   formatPermissionRow,
   describeNonJwtOutput,
@@ -22,6 +25,7 @@ import {
   type RequiredPermission,
 } from '../../src/cli/commands/doctor.js';
 import { SANDBOX_FD_READ_PATTERN } from '../../src/cli/settings-writer.js';
+import type { MacfAgentConfig } from '../../src/cli/config.js';
 
 describe('MACF_REQUIRED_PERMISSIONS', () => {
   it('has exactly the seven DR-019 permissions (canonical API names)', () => {
@@ -470,5 +474,73 @@ describe('checkPermissionsAllow (macf#296)', () => {
     expect(writeFinding?.remediation).toContain('"Write"');
     expect(writeFinding?.remediation).toContain('"Write(*)"');
     expect(writeFinding?.remediation).toContain('permissions.allow');
+  });
+});
+
+describe('deriveBotLogin (macf#707/#535)', () => {
+  it('appends [bot] to a bare slug', () => {
+    expect(deriveBotLogin('macf-auditor-agent')).toBe('macf-auditor-agent[bot]');
+  });
+
+  it('is idempotent — does not double-append [bot] when already present', () => {
+    expect(deriveBotLogin('macf-auditor-agent[bot]')).toBe('macf-auditor-agent[bot]');
+  });
+
+  it('rejects an empty slug', () => {
+    expect(() => deriveBotLogin('')).toThrow(/empty/i);
+  });
+});
+
+describe('describeNonAppSlugOutput', () => {
+  it('does not leak full unexpected output — only a short prefix + length', () => {
+    const msg = describeNonAppSlugOutput('{"error":"some secret-bearing body"}');
+    expect(msg).toContain('length=');
+    expect(msg).not.toContain('secret-bearing');
+  });
+
+  it('reports (empty) for zero-length input', () => {
+    expect(describeNonAppSlugOutput('')).toContain('(empty)');
+  });
+});
+
+describe('checkBotLogin (macf#707/#535 — DR-028 attribution-hook detect+repair)', () => {
+  function baseConfig(overrides: Partial<MacfAgentConfig> = {}): MacfAgentConfig {
+    return {
+      project: 'TEST',
+      agent_name: 'test-agent',
+      agent_role: 'code-agent',
+      agent_type: 'permanent',
+      registry: { type: 'repo', owner: 'o', repo: 'r' },
+      github_app: { app_id: '1', install_id: '2', key_path: 'k.pem' },
+      ...overrides,
+    };
+  }
+
+  it('PASS when github_app.bot_login is already populated', () => {
+    const result = checkBotLogin(baseConfig({
+      github_app: { app_id: '1', install_id: '2', key_path: 'k.pem', bot_login: 'macf-code-agent[bot]' },
+    }));
+    expect(result.status).toBe('PASS');
+  });
+
+  it('WARN when github_app is present but bot_login is unset — attribution hook is inert', () => {
+    const result = checkBotLogin(baseConfig());
+    expect(result.status).toBe('WARN');
+    expect(result.detail).toMatch(/attribution hook inert/i);
+    expect(result.detail).toContain('bot_login');
+  });
+
+  it('WARN when bot_login is present but empty string', () => {
+    const result = checkBotLogin(baseConfig({
+      github_app: { app_id: '1', install_id: '2', key_path: 'k.pem', bot_login: '' },
+    }));
+    expect(result.status).toBe('WARN');
+  });
+
+  it('INFO (skip) when github_app is absent — local-registry mode (DR-024) has no App', () => {
+    const { github_app, ...rest } = baseConfig();
+    const result = checkBotLogin(rest as MacfAgentConfig);
+    expect(result.status).toBe('INFO');
+    expect(result.detail).toMatch(/local-registry|no github app/i);
   });
 });

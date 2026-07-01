@@ -6,7 +6,7 @@ import {
   projectMacfDir, writeAgentConfig, addToAgentsIndex,
   agentCertPath, agentKeyPath,
   caCertPath as caCertPathFor, caKeyPath as caKeyPathFor,
-  isValidProjectName,
+  isValidProjectName, tokenSourceFromConfig,
 } from '../config.js';
 import { createCA, loadCA } from '@groundnuty/macf-core';
 import { generateAgentCert } from '@groundnuty/macf-core';
@@ -15,6 +15,7 @@ import { seedProjectRulesDir } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
 import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
+import { deriveBotLogin, fetchAppSlug } from './doctor.js';
 import { fetchPluginToWorkspace, pinChannelServerVersion, linkPluginCliDist } from '../plugin-fetcher.js';
 import { writeClaudeSh } from '../claude-sh.js';
 import { writeEnvFiles } from '../env-files.js';
@@ -447,6 +448,38 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   };
 
   writeAgentConfig(absDir, config);
+
+  // Resolve + write `github_app.bot_login` (DR-028 / macf#535 / macf#707) —
+  // the App slug + `[bot]`, the AUTHORITATIVE identity the shipped
+  // `check-gh-attribution.sh` PostToolUse hook compares against. Independent
+  // of `agent_name` by construction (AC #3): this block never reads or
+  // derives from `agent_name`, so it cannot ripple into the OTEL
+  // `gen_ai.agent.name` / cert-CN identity surface.
+  //
+  // Best-effort + non-fatal, same posture as the plugin-fetch block below —
+  // a fresh App installation's JWT-mint can legitimately fail (key not yet
+  // ingested, App ID typo, no network at init time) and none of that should
+  // abort an otherwise-successful `macf init`. `macf doctor --fix` repairs
+  // this later once the App/key are reachable.
+  if (config.github_app) {
+    try {
+      const source = tokenSourceFromConfig(absDir, config);
+      const slug = await fetchAppSlug(source.appId, source.keyPath);
+      const botLogin = deriveBotLogin(slug);
+      const updatedConfig: MacfAgentConfig = {
+        ...config,
+        github_app: { ...config.github_app, bot_login: botLogin },
+      };
+      writeAgentConfig(absDir, updatedConfig);
+      console.log(`  Attribution: resolved github_app.bot_login = ${botLogin}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`  Warning: could not resolve App slug for bot_login: ${msg}`);
+      console.warn('    The attribution hook will fall back to a non-authoritative agent_name');
+      console.warn('    guess (macf#535) until this is repaired — run `macf doctor --fix` once');
+      console.warn('    the App/key are reachable.');
+    }
+  }
 
   // Generate per-concern env files BEFORE the launcher so claude.sh's
   // source-loop on `.claude/.macf/env.*` finds them on first invocation
