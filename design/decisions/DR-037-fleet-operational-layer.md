@@ -21,7 +21,7 @@ Fleet operations read two *different* views of "the fleet," and DR-007 §1–4 b
 
 | Plane | Source | Answers | Needs | Scope |
 |---|---|---|---|---|
-| **Routing / delivery** | the **registry** (per-fleet GitHub org-vars) | *reachability* — who is registered + alive-ish, at `host:port` | repo + network + auth | **per-fleet** (a fleet == a registry) |
+| **Routing / delivery** | the **registry** (per-fleet GitHub org-vars) | *reachability* — who is registered + alive-ish, at `host:port` | repo + network + auth | **per-fleet** (a fleet == a *project* — see Amendment A; == a registry only when one project owns the registry) |
 | **Host-operational** | a **local scan** (workspaces + processes + on-disk pin + tmux) | *"what macf agents live on THIS box — alive or dead, at what version, busy or idle"* | **nothing** (no repo, no network) | **per-host** (all fleets) |
 
 The registry is the routing plane (correct for delivery + upgrade *selection isolation* — `--fleet`/`--registry`, per-fleet version-target). The host-operational plane is registry-independent, **exactly like K8s**: `kubectl get pods -l app=macf` is the control plane; on a VM, **`macf ps` is that plane**. The upgrade/reconcile decision layer enumerates + reasons from the host-operational plane, touching the registry only for the routing it is actually for. **The two never conflate** — this is the *why* behind §4's registry-free discovery.
@@ -67,7 +67,7 @@ The decision layer branches on the reconcile tier: **gated-inject → `driver.in
 ## Decision 4 — The workspace-discovery primitive (the host-operational plane's source)
 
 One primitive, three consumers (`ps` dead-enum, upgrade fleet-enum, watchdog desired-set).
-- **Shape (per workspace):** `{ agent (routing-label), workspace, registry, versionPin }`. `ps` adds alive/dead (process↔cwd match); upgrade groups by `registry` (→ fleets, per-fleet target); the watchdog reconciles the desired-set.
+- **Shape (per workspace):** `{ agent (routing-label), workspace, project, registry, versionPin }`. `ps` adds alive/dead (process↔cwd match); upgrade groups by **`project`** (→ fleets, per-fleet target — see Amendment A; `registry` is a demoted non-grouping identifier); the watchdog reconciles the desired-set.
 - **Source — registry-free filesystem discovery, NOT a registry-of-registries.** Scan for the `.macf/` marker under configured root(s) (`MACF_WORKSPACE_ROOT`, env-override + sensible default) — *discovery* (a search path), not a 4th drift-prone source of truth (`check-before-propose §4`; the same reason DR-007 OQ1 rejected a hand-maintained `fleets.yaml`).
 - **Marker-scan is primary** (it reveals the **dead** agents — a stopped agent has a workspace, no process); running-process cwds are a cross-check (alive only). A dead agent's version reads from its on-disk pin.
 
@@ -119,6 +119,21 @@ The canonical subcommands are **native TypeScript** (decision layer unit-tested 
 5. **Numbering vs DR-007 Amendment B** — resolved: **keep both, cross-referenced** (macf DR-037 = the framework contract; devops DR-007 Amendment B = the trigger + reference), per the DR-030/031 precedent.
 
 **Still open:** whether `discoverWorkspaces` should cache per-invocation (a large host re-scans every `ps`/`reconcile`) or accept the scan cost — a perf question deferred to the `macf ps` build (`#682`/`#141`).
+
+## Amendment A — the fleet-grouping key is `project`, not `registry` (macf#710, 2026-07-01)
+
+**Decision 1 as originally written ("a fleet == a registry") conflated two boundaries that coincide only in the one-project-per-registry case.** Surfaced by the live `groundnuty`-profile registry hosting *two* projects (the `macf` substrate fleet + the `icsoc_2026` fleet, via the DR-036 cross-fleet / DR-035 bootstrap work): `fleet upgrade` grouped by the profile-scope registry identifier (`groundnuty`), collapsing both projects into one "fleet," so a driver built from one project's workspace probed the other project's agents with the **wrong CA** → false-negative `UNREACHABLE` (fix: PR #719, macf#710).
+
+**The two boundaries:**
+- **Routing / registry-namespace** — registry-scoped (where agents self-register + resolve each other). Decision 1's original routing-plane context; unchanged.
+- **Upgrade / probe** — the **CA** boundary. `fleet upgrade`/`reconcile` build a per-fleet driver that mTLS-probes `/health`, and the CA is **project**-scoped (`MACF_CA_CERT` ≠ `ICSOC_2026_CA_CERT`; the driver looks up `${toVariableSegment(project)}_CA_CERT`), as is the registry namespace (`MACF_AGENT_*` vs `ICSOC_2026_AGENT_*`).
+
+**The refinement:** the **fleet-grouping key for the operational plane is `project`** — the CA + registry-namespace boundary. It *coincides* with the registry scope only when a single project owns the registry (the common case, which is why "== a registry" held until now); under a **shared profile/org-scope registry hosting multiple projects, `project` is the correct finer key.** A driver bound to one project's CA cannot probe another project's agents by construction, so grouping must never cross a project boundary. `WorkspaceRecord` gains a `project` field as the grouping key; `registry` is demoted to a non-grouping identifier.
+
+**Consequences:**
+- `fleet upgrade`/`reconcile`/`ps` group by `project`; per-fleet version-target is per-project.
+- The `--registry` selector is a mild misnomer under this refinement (a fleet is a project); it is kept as a working, documented alias to avoid a breaking CLI change, with `--fleet` as the canonical spelling and `--registry` deprecated-in-favor-of-`--fleet` as a follow-up (macf#710 Q2).
+- Cross-references that cite "fleet == registry" (DR-008/`#704` durable-substrate framing; the add-agent runbook; DR-007 fleet-enumeration) read correctly under the coincidence case; where a profile registry hosts multiple projects, read "fleet == project" per this amendment.
 
 ## Cross-references
 
