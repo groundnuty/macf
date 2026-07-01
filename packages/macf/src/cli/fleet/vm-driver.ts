@@ -23,7 +23,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import {
   FleetDriverError,
-  OPERATOR_PRESERVED_CONFIG_PATTERNS,
+  ROLL_TOUCHED_CONFIG_PATTERNS,
   createRegistryFromConfig,
   fromVariableSegment,
   generateToken,
@@ -89,11 +89,26 @@ export interface VmDriverSeams {
   readonly sleep: (ms: number) => Promise<void>;
   /**
    * The pre-flight config-dirty check (macf#722 Fix B) — `true` when
-   * `workspaceDir` has uncommitted TRACKED changes on the DR-029
-   * operator-preserved config surface (`OPERATOR_PRESERVED_CONFIG_PATTERNS`).
+   * `workspaceDir` has uncommitted TRACKED changes on the roll's
+   * touched-config surface (`ROLL_TOUCHED_CONFIG_PATTERNS`).
    * Real impl: `git status --porcelain -- <patterns>` in `workspaceDir`.
    */
   readonly isConfigDirty: (workspaceDir: string) => boolean;
+  /**
+   * The pre-flight config-dirty check's LIST form (macf#725) — the exact
+   * uncommitted paths on the roll's touched-config surface, empty when clean.
+   * Real impl: `git status --porcelain -- <patterns>` in `workspaceDir`, one
+   * path per line (status-prefix stripped).
+   */
+  readonly listDirtyConfig: (workspaceDir: string) => readonly string[];
+  /**
+   * Post-upgrade: list ALL currently-modified tracked files in `workspaceDir`
+   * (macf#725) — used to report what `macf update` regenerated. NOT scoped to
+   * the touched-config patterns (macf update can touch other managed files
+   * too). Real impl: `git status --porcelain` (no pathspec), one path per
+   * line. Best-effort — callers treat an inspection failure as an empty list.
+   */
+  readonly listModifiedFiles: (workspaceDir: string) => readonly string[];
 }
 
 /** Construction options for `createVmDriver`. */
@@ -226,6 +241,19 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     return seams.isConfigDirty(target.workspace);
   }
 
+  async function listDirtyConfig(agent: string): Promise<readonly string[]> {
+    const target = resolveTarget(seams, agent);
+    // Unknown agent → nothing to check (mirrors isConfigDirty's unknown → false).
+    if (!target) return [];
+    return seams.listDirtyConfig(target.workspace);
+  }
+
+  async function listModifiedFiles(agent: string): Promise<readonly string[]> {
+    const target = resolveTarget(seams, agent);
+    if (!target) return [];
+    return seams.listModifiedFiles(target.workspace);
+  }
+
   async function upgrade(agent: string): Promise<void> {
     const target = requireTarget(agent);
     seams.exec(macfBin, ['update', '--yes'], target.workspace);
@@ -237,17 +265,17 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     seams.spawnDetached(launcher, [], target.workspace);
   }
 
-  async function restart(agent: string, restartOpts?: { readonly forceStashConfig?: boolean }): Promise<void> {
+  async function restart(agent: string, restartOpts?: { readonly leaveConfigUncommitted?: boolean }): Promise<void> {
     const target = requireTarget(agent);
     if (target.session && seams.hasSession(target.session)) {
       // ALIVE → graceful: `macf restart-self` in the target workspace (stash +
       // detached relaunch; it resolves the target's own identity from cwd config).
-      // `--force` (macf#722 Fix B) only reaches here when the CALLER (rollFleet)
-      // already bypassed its own config-dirty gate for this agent — thread it so
-      // restart-self's matching stash-refusal guard doesn't re-block the same
-      // explicit override.
+      // `leaveConfigUncommitted` (macf#725) only reaches here when the CALLER
+      // (rollFleet) is completing a transaction it already gated pre-flight —
+      // thread it so restart-self relaunches WITHOUT stashing (and without
+      // refusing on) macf update's own regeneration.
       const args = ['restart-self', '--confirm', '--reason', 'fault'];
-      if (restartOpts?.forceStashConfig) args.push('--force');
+      if (restartOpts?.leaveConfigUncommitted) args.push('--leave-config-uncommitted');
       seams.exec(macfBin, args, target.workspace);
       return;
     }
@@ -265,11 +293,13 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     discoverWorkspaces: () => seams.discover(),
     isBusy,
     isConfigDirty,
+    listDirtyConfig,
     capturePane,
     upgrade,
     restart,
     inject,
     launch,
+    listModifiedFiles,
   };
 }
 
@@ -278,6 +308,18 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
 /** Path to the canonical tmux-submit helper inside a driver workspace. */
 function tmuxSubmitScript(workspaceDir: string): string {
   return join(workspaceDir, '.claude', 'scripts', 'tmux-send-to-claude.sh');
+}
+
+/**
+ * Parse `git status --porcelain` lines into bare paths — strips the 2-char
+ * status code + following space (` M path`, `M  path`, `?? path`, …). Shared
+ * by `listDirtyConfig` + `listModifiedFiles` (macf#725).
+ */
+function parsePorcelainPaths(out: string): readonly string[] {
+  return out
+    .split('\n')
+    .map((line) => line.slice(3).trim())
+    .filter((p) => p.length > 0);
 }
 
 /**
@@ -298,6 +340,8 @@ export function createVmExecSeams(
   | 'spawnDetached'
   | 'sleep'
   | 'isConfigDirty'
+  | 'listDirtyConfig'
+  | 'listModifiedFiles'
 > {
   return {
     discover: () => discoverWorkspaces(),
@@ -315,7 +359,7 @@ export function createVmExecSeams(
             '--porcelain',
             '--untracked-files=no',
             '--',
-            ...OPERATOR_PRESERVED_CONFIG_PATTERNS,
+            ...ROLL_TOUCHED_CONFIG_PATTERNS,
           ],
           { cwd: dir, encoding: 'utf-8' },
         );
@@ -325,6 +369,42 @@ export function createVmExecSeams(
         // (never block a roll on an inspection failure; mirrors capturePane's
         // fail-to-null posture for infra-failure cases).
         return false;
+      }
+    },
+    listDirtyConfig: (dir: string): readonly string[] => {
+      try {
+        // Same predicate as isConfigDirty (tracked-only, touched-config-surface
+        // scoped) — returns the actual paths instead of a boolean (macf#725).
+        const out = execFileSync(
+          'git',
+          [
+            'status',
+            '--porcelain',
+            '--untracked-files=no',
+            '--',
+            ...ROLL_TOUCHED_CONFIG_PATTERNS,
+          ],
+          { cwd: dir, encoding: 'utf-8' },
+        );
+        return parsePorcelainPaths(out);
+      } catch {
+        // Fail-open (empty == clean), matching isConfigDirty's fail-open posture.
+        return [];
+      }
+    },
+    listModifiedFiles: (dir: string): readonly string[] => {
+      try {
+        // NOT scoped to the touched-config patterns — reports everything `macf
+        // update` may have regenerated in the workspace (macf#725).
+        const out = execFileSync(
+          'git',
+          ['status', '--porcelain', '--untracked-files=no'],
+          { cwd: dir, encoding: 'utf-8' },
+        );
+        return parsePorcelainPaths(out);
+      } catch {
+        // Best-effort diagnostic read — never throw on it.
+        return [];
       }
     },
     readConfig: (dir: string): WorkspaceIdentity | null => {

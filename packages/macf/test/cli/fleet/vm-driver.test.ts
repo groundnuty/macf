@@ -73,6 +73,10 @@ interface SeamOverrides {
   readonly peers?: readonly { readonly name: string; readonly info: AgentInfo }[];
   readonly health?: (host: string, port: number) => Promise<HealthResponse | null>;
   readonly configDirtyWorkspaces?: ReadonlySet<string>;
+  /** Per-workspace dirty-config file lists for `listDirtyConfig` (macf#725). */
+  readonly dirtyConfigFiles?: ReadonlyMap<string, readonly string[]>;
+  /** Per-workspace modified-file lists for `listModifiedFiles` (macf#725). */
+  readonly modifiedFiles?: ReadonlyMap<string, readonly string[]>;
 }
 
 function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder } {
@@ -103,6 +107,8 @@ function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder
     spawnDetached: (bin, args, cwd) => void rec.spawns.push({ bin, args, cwd }),
     sleep: async (ms) => void rec.sleeps.push(ms),
     isConfigDirty: (workspaceDir: string) => dirtyWorkspaces.has(workspaceDir),
+    listDirtyConfig: (workspaceDir: string) => o.dirtyConfigFiles?.get(workspaceDir) ?? [],
+    listModifiedFiles: (workspaceDir: string) => o.modifiedFiles?.get(workspaceDir) ?? [],
   };
   return { seams, rec };
 }
@@ -328,6 +334,52 @@ describe('isConfigDirty', () => {
   });
 });
 
+// --- listDirtyConfig (macf#725) ----------------------------------------------
+
+describe('listDirtyConfig', () => {
+  it('returns the dirty-file list reported by the workspace seam', async () => {
+    const files = ['.claude/rules/coordination.md', 'CLAUDE.md'];
+    const { seams } = fakeSeams({ dirtyConfigFiles: new Map([['/w/macf', files]]) });
+    expect(await createVmDriver(OPTS, seams).listDirtyConfig('code-agent')).toEqual(files);
+  });
+
+  it('returns an empty list when clean', async () => {
+    const { seams } = fakeSeams();
+    expect(await createVmDriver(OPTS, seams).listDirtyConfig('code-agent')).toEqual([]);
+  });
+
+  it('returns an empty list when the agent is unknown — nothing to check', async () => {
+    const { seams } = fakeSeams({ dirtyConfigFiles: new Map([['/w/macf', ['CLAUDE.md']]]) });
+    expect(await createVmDriver(OPTS, seams).listDirtyConfig('ghost')).toEqual([]);
+  });
+
+  it('checks the RESOLVED agent workspace, not the driver`s own workspace', async () => {
+    const { seams } = fakeSeams({ dirtyConfigFiles: new Map([['/w/science', ['CLAUDE.md']]]) });
+    expect(await createVmDriver(OPTS, seams).listDirtyConfig('code-agent')).toEqual([]);
+    expect(await createVmDriver(OPTS, seams).listDirtyConfig('science-agent')).toEqual(['CLAUDE.md']);
+  });
+});
+
+// --- listModifiedFiles (macf#725) --------------------------------------------
+
+describe('listModifiedFiles', () => {
+  it('returns the modified-file list reported by the workspace seam', async () => {
+    const files = ['.claude/.macf/env.identity', '.claude/rules/coordination.md'];
+    const { seams } = fakeSeams({ modifiedFiles: new Map([['/w/science', files]]) });
+    expect(await createVmDriver(OPTS, seams).listModifiedFiles('science-agent')).toEqual(files);
+  });
+
+  it('returns an empty list when nothing changed', async () => {
+    const { seams } = fakeSeams();
+    expect(await createVmDriver(OPTS, seams).listModifiedFiles('code-agent')).toEqual([]);
+  });
+
+  it('returns an empty list when the agent is unknown', async () => {
+    const { seams } = fakeSeams({ modifiedFiles: new Map([['/w/macf', ['CLAUDE.md']]]) });
+    expect(await createVmDriver(OPTS, seams).listModifiedFiles('ghost')).toEqual([]);
+  });
+});
+
 // --- capturePane ------------------------------------------------------------
 
 describe('capturePane', () => {
@@ -390,6 +442,26 @@ describe('restart', () => {
     await createVmDriver(OPTS, seams).restart('code-agent');
     expect(rec.execs).toEqual([]);
     expect(rec.spawns).toEqual([{ bin: '/w/macf/claude.sh', args: [], cwd: '/w/macf' }]);
+  });
+
+  it('threads leaveConfigUncommitted through as --leave-config-uncommitted (macf#725)', async () => {
+    const { seams, rec } = fakeSeams({ liveSessions: new Set(['macf@code-agent']) });
+    await createVmDriver(OPTS, seams).restart('code-agent', { leaveConfigUncommitted: true });
+    expect(rec.execs).toEqual([
+      {
+        bin: 'macf',
+        args: ['restart-self', '--confirm', '--reason', 'fault', '--leave-config-uncommitted'],
+        cwd: '/w/macf',
+      },
+    ]);
+  });
+
+  it('omits --leave-config-uncommitted when not requested', async () => {
+    const { seams, rec } = fakeSeams({ liveSessions: new Set(['macf@code-agent']) });
+    await createVmDriver(OPTS, seams).restart('code-agent', {});
+    expect(rec.execs).toEqual([
+      { bin: 'macf', args: ['restart-self', '--confirm', '--reason', 'fault'], cwd: '/w/macf' },
+    ]);
   });
 
   it('throws FleetDriverError for an unknown agent', async () => {

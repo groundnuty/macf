@@ -29,7 +29,7 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { OPERATOR_PRESERVED_CONFIG_PATTERNS } from '@groundnuty/macf-core';
+import { ROLL_TOUCHED_CONFIG_PATTERNS } from '@groundnuty/macf-core';
 import { readAgentConfig } from '../config.js';
 import {
   backupSessionTranscript,
@@ -63,18 +63,29 @@ export interface RestartSelfDeps {
   readonly now: () => Date;
   readonly hasUncommittedTrackedChanges: () => boolean;
   /**
-   * The matching half of `fleet-upgrade.ts`'s `isConfigDirty` pre-flight gate
-   * (macf#722 Fix B): `true` when there are uncommitted TRACKED changes on the
-   * DR-029 operator-preserved config surface specifically (a subset of
-   * `hasUncommittedTrackedChanges` — see `OPERATOR_PRESERVED_CONFIG_PATTERNS` in
-   * `@groundnuty/macf-core`'s `fleet-upgrade.ts`). Drives the stash-refusal
-   * guard: config-surface dirt refuses the whole restart (never stashes
-   * operator config) unless `--force` / `MACF_RESTART_STASH_CONFIG=1`.
+   * The matching half of `fleet-upgrade.ts`'s `listDirtyConfig` pre-flight gate
+   * (macf#722 Fix B / macf#725): `true` when there are uncommitted TRACKED
+   * changes on the roll's touched-config surface specifically (a subset of
+   * `hasUncommittedTrackedChanges` — see `ROLL_TOUCHED_CONFIG_PATTERNS` in
+   * `@groundnuty/macf-core`'s `fleet-upgrade.ts`). Drives the STANDALONE
+   * stash-refusal guard: config-surface dirt refuses the whole restart (never
+   * stashes operator config) unless `--force` / `MACF_RESTART_STASH_CONFIG=1`.
+   * This guard is BYPASSED (not consulted) when `leaveConfigUncommitted` is
+   * set (macf#725 roll path) — see `RunRestartSelfOptions.leaveConfigUncommitted`.
    */
   readonly hasUncommittedConfigChanges: () => boolean;
   readonly currentBranch: () => string;
   readonly headSha: () => string;
-  readonly stash: (label: string) => StashResult;
+  /**
+   * Stash uncommitted tracked changes under `label`. When `excludeConfigSurface`
+   * is true (macf#725 — the roll's `leaveConfigUncommitted` path), the stash
+   * EXCLUDES the touched-config-surface pathspec (`git stash push -- . ':!<pattern>'`
+   * per pattern) so config-surface dirt (typically `macf update`'s own
+   * regeneration) is deliberately LEFT UNCOMMITTED in the working tree for the
+   * relaunched agent to see via `git status`, while any OTHER tracked dirt
+   * (unrelated work-in-progress) is still stashed as usual.
+   */
+  readonly stash: (label: string, opts?: { readonly excludeConfigSurface?: boolean }) => StashResult;
   readonly writeFile: (path: string, content: string, mode?: number) => void;
   readonly mkdirp: (path: string) => void;
   readonly spawnDetached: (scriptPath: string, args: readonly string[]) => void;
@@ -115,12 +126,33 @@ export interface RunRestartSelfOptions {
   readonly json: boolean;
   /**
    * `--force` / `MACF_RESTART_STASH_CONFIG=1` (macf#722 Fix B): bypass the
-   * config-surface stash-refusal guard — proceed (and stash) even when the
-   * DR-029 operator-preserved config surface is dirty. Default false: the
-   * guard refuses the WHOLE restart (no stash/write/spawn/kill) rather than
-   * stash operator config underneath the caller.
+   * STANDALONE config-surface stash-refusal guard — proceed (and STASH, same
+   * as any other dirt) even when the touched-config surface is dirty. Default
+   * false: the guard refuses the WHOLE restart (no stash/write/spawn/kill)
+   * rather than stash operator config underneath the caller. Mutually
+   * distinct from `leaveConfigUncommitted` below — `force` still STASHES the
+   * config surface (for a direct operator invocation that just wants to
+   * proceed); it does not LEAVE it uncommitted.
    */
   readonly force: boolean;
+  /**
+   * `--leave-config-uncommitted` / `MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED=1`
+   * (macf#725 — the `macf fleet upgrade` roll path): set ONLY by the driver's
+   * `restart(agent, { leaveConfigUncommitted: true })` call that immediately
+   * follows an `upgrade` in the SAME roll transaction. Two effects, together:
+   * (1) the STANDALONE config-dirty stash-refusal guard above is BYPASSED
+   * entirely (never consulted — this is not "force past a refusal", the
+   * refusal doesn't apply here because the roll's OWN pre-flight already
+   * proved the config surface was clean before `upgrade` ran); (2) the stash
+   * step EXCLUDES the touched-config-surface pathspec, so whatever `macf
+   * update` just regenerated is left UNCOMMITTED in the working tree (visible
+   * to the relaunched agent via `git status`) rather than silently stashed
+   * away. Any OTHER tracked dirt (unrelated to the config surface) is still
+   * stashed normally — this flag narrows what's EXCLUDED from the stash, it
+   * does not disable stashing altogether. Default false: a direct/standalone
+   * `macf restart-self` invocation keeps the full guard + full-stash behavior.
+   */
+  readonly leaveConfigUncommitted: boolean;
 }
 
 /** The `--json` state-record (mirrors `fleet doctor`'s versioned shape). */
@@ -489,14 +521,26 @@ export async function runRestartSelf(
     return 0;
   }
 
-  // Config-surface stash-refusal guard (macf#722 Fix B) — CONFIRM-mode only;
-  // dry-run above already returned. Refuses the WHOLE restart (no
-  // stash/write/spawn/kill) when the DR-029 operator-preserved config surface
-  // is dirty, unless explicitly overridden. Never partially-proceeds (e.g.
-  // stashing only the non-config files) — that would still risk `macf update`
-  // clobbering config left dirty on disk mid-restart.
+  // The roll-path bypass (macf#725) — set ONLY by `macf fleet upgrade`'s
+  // `restart(agent, { leaveConfigUncommitted: true })` call. It SKIPS the
+  // standalone guard below entirely: the roll's OWN pre-flight already proved
+  // the config surface was clean before `upgrade` ran, so there is nothing to
+  // "refuse" — the only dirt now is `upgrade`'s own expected regeneration,
+  // which this restart must leave uncommitted (see the stash call further
+  // down), never stash away or refuse over.
+  const leaveConfigUncommitted =
+    opts.leaveConfigUncommitted || process.env['MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED'] === '1';
+
+  // Config-surface stash-refusal guard (macf#722 Fix B) — STANDALONE-invocation
+  // ONLY (bypassed entirely by `leaveConfigUncommitted` above). CONFIRM-mode
+  // only; dry-run above already returned. Refuses the WHOLE restart (no
+  // stash/write/spawn/kill) when the touched-config surface is dirty, unless
+  // explicitly overridden with `--force`. Never partially-proceeds on ITS OWN
+  // (e.g. stashing only the non-config files) — that would still risk `macf
+  // update` clobbering config left dirty on disk mid-restart for a direct
+  // operator invocation that never ran the roll's pre-flight gate.
   const forceStashConfig = opts.force || process.env['MACF_RESTART_STASH_CONFIG'] === '1';
-  if (!forceStashConfig && deps.hasUncommittedConfigChanges()) {
+  if (!leaveConfigUncommitted && !forceStashConfig && deps.hasUncommittedConfigChanges()) {
     console.error(
       'macf restart-self: refusing — uncommitted config-surface changes ' +
         '(.claude/**, CLAUDE.md, claude.sh, env.local.*) would be stashed by a ' +
@@ -510,9 +554,16 @@ export async function runRestartSelf(
   deps.mkdirp(join(workspaceDir, MACF_DIR_REL));
 
   // 3. Prepare working tree — marked stash, ONLY when there are tracked changes.
+  // `leaveConfigUncommitted` (macf#725) EXCLUDES the touched-config-surface
+  // pathspec from the stash — the config regen `upgrade` just produced stays
+  // uncommitted in the tree (visible via `git status` after relaunch), while
+  // any OTHER tracked dirt is still stashed as usual.
   let stashRef: string | null = null;
   if (dirty) {
-    const result = deps.stash(stashLabel(iso, reason));
+    const result = deps.stash(
+      stashLabel(iso, reason),
+      leaveConfigUncommitted ? { excludeConfigSurface: true } : undefined,
+    );
     stashRef = result.stashed ? (result.ref ?? 'stash@{0}') : null;
   }
 
@@ -597,16 +648,16 @@ export function createRealDeps(workspaceDir: string): RestartSelfDeps {
       return out.length > 0;
     },
     hasUncommittedConfigChanges: () => {
-      // Same tracked-only predicate, scoped to the DR-029 operator-preserved
-      // config surface (macf#722 Fix B) — the matching guard to
-      // `fleet-upgrade.ts`'s `isConfigDirty` pre-flight gate.
+      // Same tracked-only predicate, scoped to the roll's touched-config
+      // surface (macf#722 Fix B / macf#725) — the matching guard to
+      // `fleet-upgrade.ts`'s `listDirtyConfig` pre-flight gate.
       try {
         const out = git(workspaceDir, [
           'status',
           '--porcelain',
           '--untracked-files=no',
           '--',
-          ...OPERATOR_PRESERVED_CONFIG_PATTERNS,
+          ...ROLL_TOUCHED_CONFIG_PATTERNS,
         ]);
         return out.length > 0;
       } catch {
@@ -630,8 +681,23 @@ export function createRealDeps(workspaceDir: string): RestartSelfDeps {
         return '(unknown)';
       }
     },
-    stash: (label: string): StashResult => {
-      const out = git(workspaceDir, ['stash', 'push', '-m', label]);
+    stash: (label: string, stashOpts?: { readonly excludeConfigSurface?: boolean }): StashResult => {
+      // `excludeConfigSurface` (macf#725): stash everything EXCEPT the roll's
+      // touched-config surface — `git stash push -- . ':!<pattern>'` per
+      // pattern, which stashes all OTHER tracked dirt while leaving the
+      // config-surface paths uncommitted in the working tree.
+      const args = stashOpts?.excludeConfigSurface
+        ? [
+            'stash',
+            'push',
+            '-m',
+            label,
+            '--',
+            '.',
+            ...ROLL_TOUCHED_CONFIG_PATTERNS.map((p) => `:!${p}`),
+          ]
+        : ['stash', 'push', '-m', label];
+      const out = git(workspaceDir, args);
       if (/no local changes/i.test(out)) return { stashed: false };
       let ref = 'stash@{0}';
       try {
@@ -680,8 +746,16 @@ export interface RestartSelfCliOptions {
   readonly confirm?: boolean;
   readonly dryRun?: boolean;
   readonly json?: boolean;
-  /** `--force` (macf#722 Fix B) — bypass the config-surface stash-refusal guard. */
+  /** `--force` (macf#722 Fix B) — bypass the STANDALONE config-surface stash-refusal guard. */
   readonly force?: boolean;
+  /**
+   * `--leave-config-uncommitted` (macf#725) — the `macf fleet upgrade` roll
+   * path's flag: skip the standalone guard entirely + leave the config
+   * surface uncommitted instead of stashing it. Not intended for direct
+   * operator use (the roll's driver passes it); documented on the CLI surface
+   * for completeness / scripting.
+   */
+  readonly leaveConfigUncommitted?: boolean;
 }
 
 /**
@@ -727,6 +801,7 @@ export async function runRestartSelfCommand(
       dryRun: cliOpts.dryRun === true,
       json: cliOpts.json === true,
       force: cliOpts.force === true,
+      leaveConfigUncommitted: cliOpts.leaveConfigUncommitted === true,
     },
     deps,
   );

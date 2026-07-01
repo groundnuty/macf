@@ -63,11 +63,13 @@ export interface RunFleetUpgradeOptions {
   /** Per-agent verify-green budget in seconds (default 120). */
   readonly verifyTimeoutSec?: number;
   /**
-   * `--force` (macf#722 Fix B): roll an agent even if its config surface
-   * (`.claude/**`, `CLAUDE.md`, `claude.sh`, `env.local.*` — DR-029
-   * operator-preserved) is dirty. Also threaded into the `restart-self` stash
-   * step via `MACF_RESTART_STASH_CONFIG=1` on the driver's `restart` exec, so
-   * both halves of the override move together.
+   * `--force` (macf#722 Fix B / macf#725): roll an agent even if its config
+   * surface (`.claude/**`, `CLAUDE.md`, `claude.sh`, `env.local.*` — the roll's
+   * touched-config-surface union) is dirty PRE-flight — bypasses the pre-flight
+   * OBJECT gate. The bypassed agent's `restart` is then told
+   * `leaveConfigUncommitted: true` (same as every normal roll transaction) via
+   * the driver's `--leave-config-uncommitted` exec flag — `--force` means "roll
+   * anyway," so the pre-existing dirt is left in place, not stashed.
    */
   readonly force?: boolean;
 }
@@ -292,6 +294,18 @@ export async function runFleetUpgrade(
   return renderReport(report, execute, resolved.log);
 }
 
+/**
+ * Render a forwardable "block" for an agent-directed message + its file list
+ * (macf#725) — used for BOTH the pre-flight OBJECT (`config-dirty-skip`) and
+ * the post-upgrade report (`upgraded`). Same shape for both so an operator (or
+ * a script) relaying the block to the named agent sees a consistent format
+ * regardless of which path produced it.
+ */
+function renderMessageBlock(log: (s: string) => void, message: string, files: readonly string[]): void {
+  log(`     ${message}`);
+  for (const f of files) log(`       - ${f}`);
+}
+
 /** Live progress line for an upgrade event (execute mode). */
 function emit(ev: UpgradeEvent, log: (s: string) => void): void {
   switch (ev.kind) {
@@ -302,13 +316,19 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
       log(`   rolling ${ev.agent} (${ev.from ?? 'down'}→${ev.to})`);
       break;
     case 'config-dirty-skip':
-      log(`   ${ev.agent}: CONFIG-DIRTY — skip + report (commit or --force)`);
+      // The OBJECT path (macf#725): nothing was touched — forward the exact
+      // list + the inspect/commit/delete/gitignore-then-retry message.
+      log(`   ${ev.agent}: CONFIG-DIRTY — OBJECTING (no upgrade/restart run; commit or --force)`);
+      renderMessageBlock(log, ev.message, ev.files);
       break;
     case 'busy-skip':
       log(`   ${ev.agent}: BUSY — skip + report${ev.waited ? ' (still busy after --wait)' : ''}`);
       break;
     case 'upgraded':
+      // The clean-proceed path (macf#725): green on target — forward what
+      // `macf update` regenerated (deliberately left uncommitted) for review.
       log(`   ${ev.agent}: GREEN on ${ev.version}`);
+      if (ev.modifiedFiles.length > 0) renderMessageBlock(log, ev.message, ev.modifiedFiles);
       break;
     case 'halt':
       log(`   ${ev.agent}: HALT — verify-green ${ev.reason} (last=${ev.lastVersion ?? 'down'})`);

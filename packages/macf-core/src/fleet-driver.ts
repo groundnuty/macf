@@ -105,16 +105,33 @@ export interface FleetDriver {
   readonly isBusy: (agent: string) => Promise<boolean>;
 
   /**
-   * The pre-flight config-dirty gate (macf#722 Fix B) — `true` when the agent's
-   * workspace has UNCOMMITTED changes on the DR-029 operator-preserved config
+   * The pre-flight config-dirty predicate (macf#722 Fix B) — `true` when the
+   * agent's workspace has UNCOMMITTED changes on the roll's touched-config
    * surface (`.claude/**`, `CLAUDE.md`, `claude.sh`, `env.local.*` — see
-   * `OPERATOR_PRESERVED_CONFIG_PATTERNS` in `fleet-upgrade.ts`). VM: `git status`
-   * in the agent's workspace, filtered to that path set. A dirty agent is SKIPPED
-   * before any mutation (never upgraded/restarted) — `macf update` / restart-self
-   * would otherwise clobber or stash operator-authored config underneath it. A
-   * DEAD/absent agent reads `false` (nothing to check; reconcile will launch it).
+   * `ROLL_TOUCHED_CONFIG_PATTERNS` in `fleet-upgrade.ts`). VM: `git status`
+   * in the agent's workspace, filtered to that path set. A DEAD/absent agent
+   * reads `false` (nothing to check; reconcile will launch it). Kept as a
+   * boolean convenience alongside `listDirtyConfig` below — `rollFleet`'s
+   * pre-flight gate itself calls `listDirtyConfig` (it needs the file list to
+   * OBJECT with, macf#725), so this predicate form is for OTHER callers that
+   * only need the yes/no answer.
    */
   readonly isConfigDirty: (agent: string) => Promise<boolean>;
+
+  /**
+   * The pre-flight config-dirty gate's LIST form (macf#725 — transactional
+   * object-with-message revision; this is what `rollFleet` actually calls).
+   * Same predicate surface as `isConfigDirty` (`ROLL_TOUCHED_CONFIG_PATTERNS`,
+   * tracked-only), but returns the actual uncommitted paths rather than a
+   * boolean, so the roll can OBJECT with a specific, actionable list instead
+   * of a bare skip — a dirty agent is SKIPPED before any mutation (never
+   * upgraded/restarted); `macf update` / restart-self would otherwise clobber
+   * or stash operator-authored config underneath it. Empty array == clean
+   * (equivalent to `isConfigDirty` reading `false`). VM: `git status
+   * --porcelain` in the agent's workspace, filtered to that path set, one
+   * path per line.
+   */
+  readonly listDirtyConfig: (agent: string) => Promise<readonly string[]>;
 
   /**
    * Read the agent's current pane content for stall-signature matching
@@ -134,16 +151,23 @@ export interface FleetDriver {
    * Restart the agent. VM: `macf restart-self` when ALIVE (graceful — stash +
    * detached relaunch), or `launch` when DEAD. K8s: cycle the pod.
    *
-   * `opts.forceStashConfig` (macf#722 Fix B): when the CALLER already decided to
-   * roll a config-dirty agent (an explicit `--force` override past the
-   * pre-flight `isConfigDirty` gate), thread that decision through so
-   * `restart-self`'s OWN config-surface stash-refusal guard doesn't re-block the
-   * same override — it maps to `restart-self`'s `--force` flag /
-   * `MACF_RESTART_STASH_CONFIG=1`. Omitted (default false) for every OTHER
-   * caller (e.g. `fleet-reconcile`'s healing ladder), which never bypasses the
-   * config-dirty gate because it never checks it in the first place.
+   * `opts.leaveConfigUncommitted` (macf#725 — transactional revision, replaces
+   * the earlier unconditional-`forceStashConfig` shape): set ONLY by `rollFleet`
+   * on the restart that immediately follows an `upgrade` in the SAME roll. The
+   * roll's pre-flight `listDirtyConfig` gate already guaranteed the config
+   * surface was clean BEFORE `upgrade` ran; the ONLY dirt an upgrade can leave
+   * behind is `macf update`'s OWN regeneration of the managed surface — which is
+   * supposed to change and must never be silently stashed away (the relaunched
+   * agent needs to SEE it via `git status`). So this tells `restart-self` to
+   * relaunch WITHOUT stashing AND WITHOUT refusing on its own post-upgrade
+   * config-dirty guard — it maps to `restart-self`'s `--leave-config-uncommitted`
+   * flag / `MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED=1`. Omitted (default false,
+   * i.e. the STANDALONE guard stays fully active) for every OTHER caller (e.g. a
+   * direct operator `macf restart-self` invocation, or `fleet-reconcile`'s
+   * healing ladder), which never bypasses the config-dirty gate because it never
+   * checks it in the first place.
    */
-  readonly restart: (agent: string, opts?: { readonly forceStashConfig?: boolean }) => Promise<void>;
+  readonly restart: (agent: string, opts?: { readonly leaveConfigUncommitted?: boolean }) => Promise<void>;
 
   /**
    * The tier-1 gated nudge — deliver `text` into the agent's live turn loop.
@@ -153,6 +177,18 @@ export interface FleetDriver {
 
   /** Cold-start a desired-but-down agent. VM: spawn its `./claude.sh`. */
   readonly launch: (agent: string) => Promise<void>;
+
+  /**
+   * List the agent's currently-modified files (macf#725) — used AFTER a
+   * successful `upgrade` to report what `macf update` regenerated in the
+   * relaunched agent's workspace, so the roll's post-upgrade message can name
+   * them explicitly. VM: `git status --porcelain` (all tracked changes, not
+   * scoped to the config-surface patterns — `macf update` can also touch pins /
+   * other managed files outside that surface). Best-effort: an inspection
+   * failure returns an empty list rather than throwing (never blocks reporting
+   * on a diagnostic-only read).
+   */
+  readonly listModifiedFiles: (agent: string) => Promise<readonly string[]>;
 }
 
 /**
