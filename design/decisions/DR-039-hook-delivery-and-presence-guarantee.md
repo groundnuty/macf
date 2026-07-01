@@ -1,6 +1,6 @@
 # DR-039: Where load-bearing hooks live + how MACF guarantees their presence
 
-**Status:** Proposed
+**Status:** Accepted (ratified by operator 2026-07-01; see macf#731)
 **Date:** 2026-07-01
 **Trigger:** `macf-devops-agent` lost its post-compaction handoff. Root cause: devops's launcher loads `.macf/plugin-cs` (the DR-005 / `macf#533` mcpServers-only plugin — **no `hooks/` dir**), so it lacks the plugin's PreCompact `checkpoint_to_memory` hook that WRITES the session-handoff memory. code / science / auditor load the full `.macf/plugin` (`hooks.json` present) and get it; devops doesn't → nothing detailed survived its compaction. The **same** plugin-cs relic caused devops's version-tracking failure earlier the same day — one root cause, two symptoms. Operator-directed (2026-07-01); code-agent proposed the frame on `macf#731`; science authored + ratifies this DR.
 
