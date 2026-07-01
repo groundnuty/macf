@@ -1,0 +1,312 @@
+/**
+ * Tests for the VM `FleetDriver` (DR-037 Decision 3). Every side effect is a
+ * fake seam that RECORDS its call, so the orchestration is verified without real
+ * tmux / processes / network. The load-bearing cases:
+ *   - probe: registry roster → FleetState, version pulled up, offline handled.
+ *   - discoverWorkspaces: passes the scan through.
+ *   - isBusy: capture-pane content-DIFF gate (busy on change, idle on same, dead
+ *     → not busy, unreadable-live-pane → conservatively busy).
+ *   - upgrade: `macf update --yes` in the target workspace; unknown agent throws.
+ *   - restart: alive → `macf restart-self --confirm`; dead → launch.
+ *   - inject: canonical submit into the derived session; no-project → throws.
+ *   - launch: spawn ./claude.sh detached in the workspace.
+ *   - resolveTarget: <project>@<routing-label> derivation + routing-label fallback.
+ */
+import { describe, it, expect } from 'vitest';
+import { FleetDriverError } from '@groundnuty/macf-core';
+import type { AgentInfo, HealthResponse, WorkspaceRecord } from '@groundnuty/macf-core';
+import {
+  createVmDriver,
+  resolveTarget,
+  type VmDriverSeams,
+  type WorkspaceIdentity,
+} from '../../../src/cli/fleet/vm-driver.js';
+
+// --- fixtures ---------------------------------------------------------------
+
+function mkHealth(version: string): HealthResponse {
+  return {
+    agent: 'a',
+    status: 'online',
+    type: 'permanent',
+    uptime_seconds: 5,
+    current_issue: null,
+    version,
+    last_notification: null,
+  };
+}
+
+function mkInfo(host: string, port: number): AgentInfo {
+  return { host, port, type: 'permanent', instance_id: 'i', started: '2026-07-01T00:00:00Z' };
+}
+
+const WS_CODE: WorkspaceRecord = {
+  agent: 'code-agent',
+  workspace: '/w/macf',
+  registry: 'groundnuty',
+  versionPin: '0.2.41',
+};
+const WS_SCIENCE: WorkspaceRecord = {
+  agent: 'science-agent',
+  workspace: '/w/science',
+  registry: 'groundnuty',
+  versionPin: '0.2.41',
+};
+
+interface Recorder {
+  readonly execs: { bin: string; args: readonly string[]; cwd: string }[];
+  readonly spawns: { bin: string; args: readonly string[]; cwd: string }[];
+  readonly submits: { session: string; text: string }[];
+  readonly sleeps: number[];
+  readonly captured: string[];
+}
+
+/** Per-call capturePane return values (drained in order; repeats last). */
+interface SeamOverrides {
+  readonly workspaces?: readonly WorkspaceRecord[];
+  readonly config?: (dir: string) => WorkspaceIdentity | null;
+  readonly liveSessions?: ReadonlySet<string>;
+  readonly paneReads?: readonly (string | null)[];
+  readonly peers?: readonly { readonly name: string; readonly info: AgentInfo }[];
+  readonly health?: (host: string, port: number) => Promise<HealthResponse | null>;
+}
+
+function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder } {
+  const rec: Recorder = { execs: [], spawns: [], submits: [], sleeps: [], captured: [] };
+  const paneQueue = [...(o.paneReads ?? [])];
+  const live = o.liveSessions ?? new Set<string>();
+  const seams: VmDriverSeams = {
+    listPeers: async () => o.peers ?? [],
+    probeHealth: o.health ?? (async () => null),
+    discover: () => o.workspaces ?? [WS_CODE, WS_SCIENCE],
+    readConfig:
+      o.config ??
+      ((dir: string) =>
+        dir === '/w/macf'
+          ? { project: 'macf', routingLabel: 'code-agent' }
+          : dir === '/w/science'
+            ? { project: 'macf', routingLabel: 'science-agent' }
+            : null),
+    hasSession: (s: string) => live.has(s),
+    capturePane: (s: string) => {
+      const v = paneQueue.length > 0 ? paneQueue.shift()! : 'idle-frame';
+      rec.captured.push(`${s}:${v}`);
+      return v;
+    },
+    submit: (session, text) => void rec.submits.push({ session, text }),
+    exec: (bin, args, cwd) => void rec.execs.push({ bin, args, cwd }),
+    spawnDetached: (bin, args, cwd) => void rec.spawns.push({ bin, args, cwd }),
+    sleep: async (ms) => void rec.sleeps.push(ms),
+  };
+  return { seams, rec };
+}
+
+const OPTS = { workspaceDir: '/w/macf', busyWindowMs: 1500 };
+
+// --- resolveTarget ----------------------------------------------------------
+
+describe('resolveTarget', () => {
+  it('derives <project>@<routing-label> from discovery + config', () => {
+    const { seams } = fakeSeams();
+    expect(resolveTarget(seams, 'code-agent')).toEqual({
+      workspace: '/w/macf',
+      session: 'macf@code-agent',
+    });
+    expect(resolveTarget(seams, 'science-agent')).toEqual({
+      workspace: '/w/science',
+      session: 'macf@science-agent',
+    });
+  });
+
+  it('returns null when no discovered workspace matches the routing label', () => {
+    const { seams } = fakeSeams();
+    expect(resolveTarget(seams, 'ghost')).toBeNull();
+  });
+
+  it('falls back to the record agent when config has no routing label', () => {
+    const { seams } = fakeSeams({ config: () => ({ project: 'macf' }) });
+    expect(resolveTarget(seams, 'code-agent')).toEqual({
+      workspace: '/w/macf',
+      session: 'macf@code-agent',
+    });
+  });
+
+  it('yields a null session when the workspace config has no project', () => {
+    const { seams } = fakeSeams({ config: () => ({ routingLabel: 'code-agent' }) });
+    expect(resolveTarget(seams, 'code-agent')).toEqual({ workspace: '/w/macf', session: null });
+  });
+});
+
+// --- probe ------------------------------------------------------------------
+
+describe('probe', () => {
+  it('builds a FleetState with version pulled up + offline peers handled', async () => {
+    const { seams } = fakeSeams({
+      peers: [
+        { name: 'code-agent', info: mkInfo('h1', 4000) },
+        { name: 'science-agent', info: mkInfo('h2', 4001) },
+      ],
+      health: async (host) => (host === 'h1' ? mkHealth('0.2.41') : null),
+    });
+    const driver = createVmDriver(OPTS, seams);
+    const state = await driver.probe();
+    expect(state.agents).toEqual([
+      {
+        name: 'code-agent',
+        host: 'h1',
+        port: 4000,
+        online: true,
+        version: '0.2.41',
+        health: mkHealth('0.2.41'),
+      },
+      { name: 'science-agent', host: 'h2', port: 4001, online: false, version: null, health: null },
+    ]);
+  });
+});
+
+// --- discoverWorkspaces -----------------------------------------------------
+
+describe('discoverWorkspaces', () => {
+  it('passes the scan result through', () => {
+    const { seams } = fakeSeams({ workspaces: [WS_CODE] });
+    expect(createVmDriver(OPTS, seams).discoverWorkspaces()).toEqual([WS_CODE]);
+  });
+});
+
+// --- isBusy -----------------------------------------------------------------
+
+describe('isBusy', () => {
+  it('is busy when the pane content changes across the window', async () => {
+    const { seams, rec } = fakeSeams({
+      liveSessions: new Set(['macf@code-agent']),
+      paneReads: ['frame-A', 'frame-B'],
+    });
+    expect(await createVmDriver(OPTS, seams).isBusy('code-agent')).toBe(true);
+    expect(rec.sleeps).toEqual([1500]); // waited the busy window between captures
+  });
+
+  it('is idle when the pane content is unchanged', async () => {
+    const { seams } = fakeSeams({
+      liveSessions: new Set(['macf@code-agent']),
+      paneReads: ['same-frame', 'same-frame'],
+    });
+    expect(await createVmDriver(OPTS, seams).isBusy('code-agent')).toBe(false);
+  });
+
+  it('is not busy when the session is dead (safe to launch)', async () => {
+    const { seams } = fakeSeams({ liveSessions: new Set() });
+    expect(await createVmDriver(OPTS, seams).isBusy('code-agent')).toBe(false);
+  });
+
+  it('is not busy when the agent is unknown', async () => {
+    const { seams } = fakeSeams();
+    expect(await createVmDriver(OPTS, seams).isBusy('ghost')).toBe(false);
+  });
+
+  it('is conservatively busy when a LIVE pane is unreadable', async () => {
+    const { seams } = fakeSeams({
+      liveSessions: new Set(['macf@code-agent']),
+      paneReads: [null, null],
+    });
+    expect(await createVmDriver(OPTS, seams).isBusy('code-agent')).toBe(true);
+  });
+});
+
+// --- upgrade ----------------------------------------------------------------
+
+describe('upgrade', () => {
+  it('runs `macf update --yes` in the target workspace', async () => {
+    const { seams, rec } = fakeSeams();
+    await createVmDriver(OPTS, seams).upgrade('science-agent');
+    expect(rec.execs).toEqual([{ bin: 'macf', args: ['update', '--yes'], cwd: '/w/science' }]);
+  });
+
+  it('honours a custom macf binary', async () => {
+    const { seams, rec } = fakeSeams();
+    await createVmDriver({ ...OPTS, macfBin: '/opt/macf' }, seams).upgrade('code-agent');
+    expect(rec.execs[0]!.bin).toBe('/opt/macf');
+  });
+
+  it('throws FleetDriverError for an unknown agent', async () => {
+    const { seams } = fakeSeams();
+    await expect(createVmDriver(OPTS, seams).upgrade('ghost')).rejects.toBeInstanceOf(
+      FleetDriverError,
+    );
+  });
+});
+
+// --- restart ----------------------------------------------------------------
+
+describe('restart', () => {
+  it('runs graceful `macf restart-self --confirm` when the session is alive', async () => {
+    const { seams, rec } = fakeSeams({ liveSessions: new Set(['macf@code-agent']) });
+    await createVmDriver(OPTS, seams).restart('code-agent');
+    expect(rec.execs).toEqual([
+      { bin: 'macf', args: ['restart-self', '--confirm', '--reason', 'fault'], cwd: '/w/macf' },
+    ]);
+    expect(rec.spawns).toEqual([]);
+  });
+
+  it('cold-launches when the agent is dead (restart == launch)', async () => {
+    const { seams, rec } = fakeSeams({ liveSessions: new Set() });
+    await createVmDriver(OPTS, seams).restart('code-agent');
+    expect(rec.execs).toEqual([]);
+    expect(rec.spawns).toEqual([{ bin: '/w/macf/claude.sh', args: [], cwd: '/w/macf' }]);
+  });
+
+  it('throws FleetDriverError for an unknown agent', async () => {
+    const { seams } = fakeSeams();
+    await expect(createVmDriver(OPTS, seams).restart('ghost')).rejects.toBeInstanceOf(
+      FleetDriverError,
+    );
+  });
+});
+
+// --- inject -----------------------------------------------------------------
+
+describe('inject', () => {
+  it('submits the text into the derived session', async () => {
+    const { seams, rec } = fakeSeams();
+    await createVmDriver(OPTS, seams).inject('code-agent', 'fleet-doctor probe, no action needed');
+    expect(rec.submits).toEqual([
+      { session: 'macf@code-agent', text: 'fleet-doctor probe, no action needed' },
+    ]);
+  });
+
+  it('throws when the session cannot be derived (no project in config)', async () => {
+    const { seams } = fakeSeams({ config: () => ({ routingLabel: 'code-agent' }) });
+    await expect(createVmDriver(OPTS, seams).inject('code-agent', 'hi')).rejects.toBeInstanceOf(
+      FleetDriverError,
+    );
+  });
+
+  it('throws FleetDriverError for an unknown agent', async () => {
+    const { seams } = fakeSeams();
+    await expect(createVmDriver(OPTS, seams).inject('ghost', 'hi')).rejects.toBeInstanceOf(
+      FleetDriverError,
+    );
+  });
+});
+
+// --- launch -----------------------------------------------------------------
+
+describe('launch', () => {
+  it('spawns the workspace launcher detached', async () => {
+    const { seams, rec } = fakeSeams();
+    await createVmDriver(OPTS, seams).launch('science-agent');
+    expect(rec.spawns).toEqual([{ bin: '/w/science/claude.sh', args: [], cwd: '/w/science' }]);
+  });
+
+  it('honours a custom launcher basename', async () => {
+    const { seams, rec } = fakeSeams();
+    await createVmDriver({ ...OPTS, launcher: 'run.sh' }, seams).launch('code-agent');
+    expect(rec.spawns[0]!.bin).toBe('/w/macf/run.sh');
+  });
+
+  it('throws FleetDriverError for an unknown agent', async () => {
+    const { seams } = fakeSeams();
+    await expect(createVmDriver(OPTS, seams).launch('ghost')).rejects.toBeInstanceOf(
+      FleetDriverError,
+    );
+  });
+});
