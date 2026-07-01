@@ -38,11 +38,13 @@ describe('server.ts collision/serve/register ordering (macf#424 assumption 2)', 
     expect(startIdx).toBeLessThan(checkIdx);
   });
 
-  it('writes the registry slot (registry.registerConditional) only AFTER the collision check', () => {
-    // The slot write is the CAS variant post-#439 — conditional on the state
-    // the collision check observed, so a racing second writer can't clobber.
+  it('writes the registry slot (registerWithTakeover) only AFTER the collision check', () => {
+    // The slot write is the over-register loop post-#702 (which wraps the #439
+    // CAS `registry.registerConditional`) — conditional on the state the
+    // collision check observed, so a racing second writer can't clobber, and a
+    // stale/same/older entry is CLAIMED (over-register) rather than aborted.
     const checkIdx = SERVER_SOURCE.indexOf('checkCollision(');
-    const registerIdx = SERVER_SOURCE.indexOf('registry.registerConditional(');
+    const registerIdx = SERVER_SOURCE.indexOf('registerWithTakeover(');
     expect(registerIdx).toBeGreaterThan(-1);
     expect(checkIdx).toBeLessThan(registerIdx);
   });

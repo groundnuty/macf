@@ -47,7 +47,8 @@ export function agentInfoEquals(a: AgentInfo | null, b: AgentInfo | null): boole
 }
 
 /**
- * Outcome of a conditional (compare-and-set) register (groundnuty/macf#439).
+ * Outcome of a conditional (compare-and-set) register (groundnuty/macf#439,
+ * reshaped by groundnuty/macf#702 — over-register).
  *
  * `ok: true`  — this instance now owns the slot; `current` is the value just
  *               written (=== the `info` passed in). Ownership strength is
@@ -58,11 +59,38 @@ export function agentInfoEquals(a: AgentInfo | null, b: AgentInfo | null): boole
  *               API; see registry.ts `registerConditional`).
  * `ok: false` — a concurrent writer changed the slot between the collision
  *               check and this write; `current` is the conflicting value
- *               observed (null if the slot was emptied). The caller must NOT
- *               treat itself as the registered owner — abort or re-check.
+ *               observed (null if the slot was emptied). The caller decides
+ *               claim-vs-yield from `reason` (see below) — `ok:false` is NO
+ *               LONGER an unconditional abort signal (groundnuty/macf#702 fixed
+ *               the devops 8h-outage bug where it was).
+ *
+ * `reason` discriminates WHY the CAS resolved the way it did — this is the
+ * groundnuty/macf#702 fix. Before #702, `ok:false` was always treated as "lost
+ * a race, abort" (`RegisterRaceError`), which mis-fired when the write
+ * actually succeeded but the GitHub Variables API's read-after-write lag
+ * served a stale GET on the post-write read-back (the exact devops bug:
+ * `current == expected` — nothing changed — yet the read-back momentarily
+ * still showed the pre-write value, and the old code aborted anyway):
+ *
+ *  - `'claimed'`          — `ok:true`. The write landed and (when a read-back
+ *                           exists) is confirmed, OR the pre-write compare
+ *                           found the slot unchanged from `expected` and the
+ *                           write was issued — the CAS ALWAYS claims in this
+ *                           case, never aborts, even if a same-backend
+ *                           read-back lag means confirmation isn't
+ *                           immediately visible (groundnuty/macf#702 §1).
+ *  - `'lost-to-newer'`    — `ok:false`. The write-time re-read (or read-back)
+ *                           observed a DIFFERENT registration than `expected`
+ *                           — a genuine concurrent writer. The caller
+ *                           (server.ts) is responsible for classifying that
+ *                           `current` as newer-live (yield) vs stale/older
+ *                           (retry the takeover) — the registry layer only
+ *                           reports the conflicting value; it doesn't probe
+ *                           liveness (that's `collision.ts`'s job).
  */
 export interface RegisterResult {
   readonly ok: boolean;
+  readonly reason: 'claimed' | 'lost-to-newer';
   readonly current: AgentInfo | null;
 }
 
@@ -125,15 +153,32 @@ export interface HeartbeatResult {
 export interface Registry {
   readonly register: (name: string, info: AgentInfo) => Promise<void>;
   /**
-   * Compare-and-set register (groundnuty/macf#439): write `info` only if the
-   * slot still matches `expected` (the value observed during the collision
-   * check; `null` = expected-absent). Closes the TOCTOU window between the
-   * collision check's read and the registration write — a racing second
-   * writer can't silently clobber the first. Returns whether this instance
-   * won the slot. Backends differ in atomicity: the local registry is fully
-   * atomic under its file lock; the GitHub-Variables backend narrows the
-   * window with a pre-write compare + post-write read-back verify (no native
-   * CAS primitive exists on that API — see registry.ts).
+   * Compare-and-set register (groundnuty/macf#439; over-register semantics
+   * per groundnuty/macf#702): write `info` if the slot still matches
+   * `expected` (the value observed during the collision check; `null` =
+   * expected-absent). Closes the TOCTOU window between the collision check's
+   * read and the registration write — a racing second writer can't silently
+   * clobber the first. Backends differ in atomicity: the local registry is
+   * fully atomic under its file lock (no read-back needed); the
+   * GitHub-Variables backend narrows the window with a pre-write compare and
+   * best-effort-confirms via a post-write read-back (no native CAS primitive
+   * exists on that API — see registry.ts).
+   *
+   * **groundnuty/macf#702 (over-register):** `current == expected` — the slot
+   * is UNCHANGED, including the case where `expected` is itself a stale/dead
+   * entry the caller decided to take over — is ALWAYS a claim (`ok:true,
+   * reason:'claimed'`), never a failure. This holds even when a same-backend
+   * read-back can't yet observe the write (GitHub Variables API
+   * read-after-write lag) — a lagging read-back is a confirmation gap, not a
+   * lost race, and must not be reported as one (this was the devops 8h-outage
+   * bug: `current==expected==<stale>` incorrectly returned `ok:false`).
+   * `ok:false, reason:'lost-to-newer'` fires ONLY when the write-time re-read
+   * (or the read-back) observes a value that is a genuinely different
+   * registration than the caller's own `info` AND different from `expected`
+   * — a real concurrent writer. The registry layer reports the conflicting
+   * `current` but does not classify it as live/dead/newer/older — that
+   * liveness judgment is the caller's (server.ts + collision.ts), which
+   * decides claim-over-stale (retry) vs yield-to-newer-live.
    */
   readonly registerConditional: (
     name: string,

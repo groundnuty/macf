@@ -3,6 +3,22 @@ import { toVariableSegment } from './variable-name.js';
 import type { AgentInfo, Registry, RegisterResult, DeregisterResult, HeartbeatResult, GitHubVariablesClient } from './types.js';
 
 /**
+ * Post-write read-back retry budget for the GitHub-Variables backend
+ * (groundnuty/macf#702). The Variables API's PATCH/GET pair is NOT
+ * linearizable — a GET issued immediately after a successful PATCH can
+ * momentarily still serve the pre-write value (read-after-write lag). This
+ * bounds how long `registerConditional` waits for the read-back to catch up
+ * with a write it already knows succeeded (the PATCH/POST itself did not
+ * error) before falling back to trusting the write outright (see
+ * `registerConditional` below — the devops 8h-outage fix).
+ */
+const READBACK_RETRY_ATTEMPTS = 2;
+const READBACK_RETRY_DELAY_MS = 250;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
  * Creates a Registry backed by a GitHubVariablesClient.
  * All three backends (org, profile, repo) share this implementation —
  * the only difference is the URL path prefix baked into the client.
@@ -44,32 +60,57 @@ export function createRegistry(
       await client.writeVariable(variableName(name), value);
     },
 
-    // CAS register (groundnuty/macf#439). The GitHub Actions Variables API has
-    // no native conditional write (no If-Match / ETag on PATCH/POST), so this
-    // is a best-effort narrowing, NOT a hard CAS:
+    // CAS register (groundnuty/macf#439; over-register semantics per
+    // groundnuty/macf#702). The GitHub Actions Variables API has no native
+    // conditional write (no If-Match / ETag on PATCH/POST), so this is a
+    // best-effort narrowing, NOT a hard CAS:
     //   1. pre-write compare — re-read the slot; if it no longer matches
-    //      `expected`, a concurrent writer already changed it → abort the
-    //      write (ok:false). This collapses the wide TOCTOU window (which
-    //      spans the ~5s collision health-ping) down to the read→write gap.
-    //   2. post-write read-back verify — after writing, re-read; if the slot
-    //      isn't ours, a racer wrote BEFORE our read-back → ok:false.
+    //      `expected`, a concurrent writer already changed it BEFORE we ever
+    //      wrote → this is the one case a stale/unchanged `expected` can't
+    //      explain, so it's the real "current is a genuinely different
+    //      registration" signal → `ok:false, reason:'lost-to-newer'`. This
+    //      collapses the wide TOCTOU window (which spans the ~5s collision
+    //      health-ping) down to the read→write gap.
+    //   2. write — the compare passed (this INCLUDES the over-register case:
+    //      `expected` is itself a stale/dead entry the collision check
+    //      decided to take over, and the pre-write re-read still shows it
+    //      unchanged). Per groundnuty/macf#702, reaching this point already
+    //      means "claim" — the write is issued unconditionally.
+    //   3. post-write read-back — a best-effort CONFIRMATION, not a
+    //      precondition for success. If the first read-back doesn't yet show
+    //      our own `info.instance_id`, retry up to READBACK_RETRY_ATTEMPTS
+    //      times (READBACK_RETRY_DELAY_MS apart) to absorb the Variables
+    //      API's read-after-write lag. Two outcomes after retries:
+    //        - the read-back still reads as `expected` (unchanged) or as
+    //          `null`/corrupt → the write itself never errored, so we trust
+    //          it: `ok:true, reason:'claimed'`. This is the groundnuty/macf#702
+    //          fix — the devops bug was exactly this branch previously
+    //          returning `ok:false` (a lagging read-back of the stale entry
+    //          was mistaken for "someone else won").
+    //        - the read-back shows a DIFFERENT registration (neither `info`
+    //          nor `expected`) → a real concurrent writer landed inside the
+    //          residual window → `ok:false, reason:'lost-to-newer'`. The
+    //          caller (server.ts) classifies that `current` as newer-live
+    //          (yield) vs stale (retry the takeover) — this layer only
+    //          reports the conflict.
     //
-    // What (2) does and does NOT cover (#447 review, science-agent): it catches
-    // only the interleaving where the racer's write lands before our read-back.
-    // The symmetric order — A-write → A-readback(ok) → B-write → B-readback(ok)
-    // — leaves BOTH returning ok:true (the slot ends up holding B; A's ok:true
-    // is stale). So on THIS backend `ok:true` means "we own the slot for now,"
-    // not "exclusively, at return" — eventually-reconciled, not a hard CAS.
-    // (The local backend IS exclusive-at-return: lock-atomic, no read-back
-    // needed.) The residual is bounded in practice by the ~5s health-ping
-    // window + the #424 version-takeover predicate (an equal/older racer aborts
-    // at the collision check, before reaching here); closing it hard needs a
-    // real CAS primitive the API doesn't offer.
+    // What (3) does and does NOT cover (#447/#702 review lineage): retrying
+    // the read-back only helps when the LAG resolves within the retry
+    // budget. The residual — a genuinely concurrent second writer landing
+    // between our write and our final read-back — is symmetric to the
+    // pre-#702 analysis: on THIS backend `ok:true` means "we own the slot
+    // for now, best-effort," not "exclusively, at return." (The local
+    // backend IS exclusive-at-return: lock-atomic, no read-back needed.) The
+    // residual is bounded in practice by the ~5s health-ping window + the
+    // #424 version-takeover predicate (an equal/older racer aborts at the
+    // collision check, before reaching here); closing it hard needs a real
+    // CAS primitive the API doesn't offer.
     //
     // Corrupt-slot caveat: `readAgent` returns null for a malformed / schema-
-    // invalid value. On the read-back that's fail-safe (→ harmless ok:false).
-    // On the pre-write compare with `expected===null`, a corrupt-but-present
-    // slot also reads null → compare passes → we overwrite it — acceptable (a
+    // invalid value. On the read-back that's treated as an unconfirmed (not
+    // failed) read — retried, then trusted per the rule above. On the
+    // pre-write compare with `expected===null`, a corrupt-but-present slot
+    // also reads null → compare passes → we overwrite it — acceptable (a
     // corrupt slot is already unusable) and bounded by schema-validity.
     async registerConditional(
       name: string,
@@ -78,16 +119,46 @@ export function createRegistry(
     ): Promise<RegisterResult> {
       const current = await readAgent(name);
       if (!agentInfoEquals(current, expected)) {
-        return { ok: false, current };
+        // A concurrent writer already changed the slot BEFORE we wrote
+        // anything — this is unambiguously a real conflict, not a read-lag
+        // artifact (we haven't written yet, so there's nothing of ours for
+        // a lagging read to be behind).
+        return { ok: false, reason: 'lost-to-newer', current };
       }
 
       await client.writeVariable(variableName(name), JSON.stringify(info));
 
-      const readback = await readAgent(name);
-      if (readback === null || readback.instance_id !== info.instance_id) {
-        return { ok: false, current: readback };
+      for (let attempt = 0; ; attempt += 1) {
+        const readback = await readAgent(name);
+
+        if (readback !== null && readback.instance_id === info.instance_id) {
+          // Confirmed: the read-back sees our own write.
+          return { ok: true, reason: 'claimed', current: info };
+        }
+
+        if (readback !== null && !agentInfoEquals(readback, expected)) {
+          // The read-back shows a registration that is neither ours nor the
+          // pre-write `expected` value — a genuinely different writer landed
+          // in the residual window. Real conflict, not a lag artifact.
+          return { ok: false, reason: 'lost-to-newer', current: readback };
+        }
+
+        // readback is either null (still-propagating / corrupt-but-fail-safe)
+        // or still shows `expected` unchanged (the write we just issued
+        // hasn't propagated to this read yet) — read-after-write lag, not a
+        // lost race. Retry a bounded number of times to absorb the lag.
+        if (attempt >= READBACK_RETRY_ATTEMPTS) {
+          // Exhausted the retry budget without seeing OUR write, but we also
+          // never saw anyone else's write either — the PATCH/POST itself
+          // succeeded (no throw), so trust it (groundnuty/macf#702: a
+          // stale/unconfirmed read-back must never masquerade as a lost
+          // race). This is the devops-outage fix: `current == expected`
+          // (unchanged, including a stale entry) always claims.
+          return { ok: true, reason: 'claimed', current: info };
+        }
+
+        await sleep(READBACK_RETRY_DELAY_MS);
       }
-      return { ok: true, current: info };
     },
 
     // Instance-id-guarded deregister (DR-031, groundnuty/macf#553 root-cause).

@@ -52,7 +52,7 @@ export function registerShutdownHandler(config: {
    * surfaces stdin EOF.
    */
   readonly stdin?: Pick<NodeJS.ReadStream, 'on'>;
-}): () => Promise<boolean> {
+}): (trigger?: string) => Promise<boolean> {
   const { agentName, registry, instanceId, httpsServer, healthState, registryHeartbeat, logger } = config;
   let shuttingDown = false;
   let lastResult = true;

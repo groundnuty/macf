@@ -19,12 +19,18 @@ export class CollisionError extends MacfError {
 }
 
 /**
- * Thrown when the conditional registration loses a race (groundnuty/macf#439):
- * the collision check decided to register/takeover, but between that read and
- * the write a concurrent instance of the same identity claimed the slot. This
- * instance aborts cleanly (the winner holds the slot) rather than silently
- * clobbering it. `current` is the conflicting registration observed at write
- * time (null if the slot was emptied in the window).
+ * Thrown ONLY when a `registerConditional` write-time race is lost to a
+ * GENUINELY DIFFERENT + NEWER + LIVE instance (groundnuty/macf#702 reshaped
+ * this from groundnuty/macf#439's original "any `ok:false` aborts" — the bug
+ * that bricked devops for 8h: a stale/same/older `current` must FORCE the
+ * claim via retry, never throw this).
+ *
+ * This is a CLEAN YIELD, not a crash-loop failure — a legitimately newer live
+ * peer already holds the slot, so standing down is the correct outcome. The
+ * caller (server.ts) catches this distinctly and exits 0 ("a newer instance
+ * owns the slot, I yield"), NOT the fatal exit-1 path used for
+ * `CollisionError` and other bootstrap aborts. `current` is the conflicting
+ * (newer, live) registration observed at write time.
  */
 export class RegisterRaceError extends MacfError {
   constructor(name: string, current: AgentInfo | null) {
@@ -32,14 +38,28 @@ export class RegisterRaceError extends MacfError {
       'AGENT_REGISTER_RACE',
       current === null
         ? `Agent '${name}' lost a registration race: the slot changed between ` +
-          'the collision check and the write (now empty). Aborting; relaunch to retry.'
-        : `Agent '${name}' lost a registration race: another instance registered ` +
-          `concurrently (now ${current.host}:${current.port}, instance ${current.instance_id}). ` +
-          'Aborting; the winner holds the slot.',
+          'the collision check and the write (now empty). Yielding; relaunch to retry.'
+        : `Agent '${name}' lost a registration race to a newer live instance ` +
+          `(now ${current.host}:${current.port}, instance ${current.instance_id}). ` +
+          'Yielding; the newer instance holds the slot.',
     );
     this.name = 'RegisterRaceError';
   }
 }
+
+/**
+ * Bound on the over-register retry loop (groundnuty/macf#702): how many
+ * times server.ts re-attempts `registerConditional` after a `lost-to-newer`
+ * result classifies as claim-over-stale (not yield-to-newer-live). Each
+ * retry re-reads + re-classifies the conflicting `current` via
+ * `classifyPeer`, so this bounds the number of `/health` liveness probes a
+ * relaunch will issue against a pathologically flapping slot before giving
+ * up. In practice a single retry resolves the devops-class case (the
+ * conflicting `current` IS the stale entry we already decided to take over);
+ * the extra headroom absorbs a second legitimate racer without looping
+ * forever.
+ */
+export const MAX_REGISTER_RETRIES = 5;
 
 const HEALTH_PING_TIMEOUT_MS = 5000;
 
@@ -245,6 +265,31 @@ export async function checkCollision(
     return { action: 'register' };
   }
 
+  return classifyPeer(name, existing, certPaths, incomingVersion, logger);
+}
+
+/**
+ * Classify a KNOWN existing registration (`existing`) as register-target-
+ * absent-equivalent / takeover / abort — the liveness + #424 version quadrant
+ * + DR-031 staleness override, factored out of `checkCollision` so the
+ * groundnuty/macf#702 over-register retry loop in server.ts can re-classify
+ * the `current` value returned by a lost `registerConditional` race WITHOUT
+ * an extra `registry.get()` round-trip (which would reopen a fresh TOCTOU
+ * window against the very value we just observed at write-time). Byte-for-
+ * byte the same decision logic `checkCollision` has always run — this is a
+ * pure extraction, not a behavior change for the original call path.
+ */
+export async function classifyPeer(
+  name: string,
+  existing: AgentInfo,
+  certPaths: {
+    readonly caCertPath: string;
+    readonly agentCertPath: string;
+    readonly agentKeyPath: string;
+  },
+  incomingVersion: string,
+  logger: Logger,
+): Promise<CollisionResult> {
   logger.info('collision_check', {
     result: 'variable_exists',
     agent: name,

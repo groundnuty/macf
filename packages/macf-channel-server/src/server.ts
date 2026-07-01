@@ -18,6 +18,7 @@ import { TaskStore } from './a2a-task.js';
 import { PACKAGE_VERSION } from './package-version.js';
 import { createRegistry, createRegistryFromConfig } from '@groundnuty/macf-core';
 import { checkCollision, CollisionError, RegisterRaceError } from './collision.js';
+import { registerWithTakeover } from './register-with-takeover.js';
 import { registerShutdownHandler } from './shutdown.js';
 import { createForensicLogger } from './forensic-log.js';
 import { createLifecycleTracker } from './lifecycle.js';
@@ -99,7 +100,7 @@ async function main(): Promise<void> {
   // The shutdown `cleanup` is wired later (it needs the registry + HTTPS server);
   // the getter returns undefined until then, so an early crash logs + exits
   // without a deregister it has nothing to perform.
-  let shutdownCleanup: (() => Promise<boolean>) | undefined;
+  let shutdownCleanup: ((trigger?: string) => Promise<boolean>) | undefined;
   registerCrashHandlers({
     logger,
     lifecycle,
@@ -657,29 +658,35 @@ async function main(): Promise<void> {
     started: new Date().toISOString(),
   };
 
-  // P2: Conditional (CAS) write to close the read→write TOCTOU window
-  // (groundnuty/macf#439). The collision check above observed the slot as
-  // either absent (action 'register') or held by the takeover target (action
-  // 'takeover'). Write only if the slot still matches that observation — a
-  // concurrent same-identity instance that registered in the window makes this
-  // write a no-op and aborts us cleanly, rather than silently clobbering it.
-  const expectedSlot =
-    collisionResult.action === 'takeover' ? collisionResult.previous : null;
-  const registerResult = await registry.registerConditional(
-    config.routingLabel,
-    agentInfo,
-    expectedSlot,
-  );
-  if (!registerResult.ok) {
-    logger.warn('register_race_lost', {
-      agent: config.routingLabel,
-      expected_instance: expectedSlot?.instance_id ?? null,
-      current_instance: registerResult.current?.instance_id ?? null,
-      current_host: registerResult.current?.host ?? null,
-      current_port: registerResult.current?.port ?? null,
+  // P2: Over-register the slot (groundnuty/macf#702 — the devops 8h-outage
+  // fix, reshaping the #439 CAS write). The collision check above observed the
+  // slot as absent (action 'register') or held by a takeover target (action
+  // 'takeover'). `registerWithTakeover` CLAIMS the slot — including over a
+  // stale/same/older entry (never aborting-to-dead because the slot is
+  // occupied) — and YIELDS (throws RegisterRaceError, caught at main()'s
+  // top-level for a CLEAN exit 0) only to a genuinely newer + LIVE instance.
+  // See `register-with-takeover.ts` for the full claim-vs-yield contract; it
+  // re-classifies any lost-race `current` with the same liveness + #424
+  // version quadrant the collision check used, bounded by MAX_REGISTER_RETRIES.
+  try {
+    await registerWithTakeover({
+      registry,
+      routingLabel: config.routingLabel,
+      agentInfo,
+      collisionResult,
+      certPaths: {
+        caCertPath: config.caCertPath,
+        agentCertPath: config.agentCertPath,
+        agentKeyPath: config.agentKeyPath,
+      },
+      incomingVersion: PACKAGE_VERSION,
+      logger,
     });
+  } catch (err) {
+    // Stop the (already-serving) HTTPS server before propagating a yield/abort
+    // so we don't leave a bound port behind on our way out.
     await httpsServer.stop();
-    throw new RegisterRaceError(config.routingLabel, registerResult.current);
+    throw err;
   }
   lifecycle.set('registered'); // macf#642 forensic phase marker
   logger.info('registered', {
@@ -698,12 +705,33 @@ async function main(): Promise<void> {
   // `MACF_REGISTRY_HEARTBEAT_INTERVAL_MS` overrides; `0` disables) to bound the
   // App-token write budget + the #439 If-Match TOCTOU surface. Started AFTER the
   // shutdown handler is wired so `stop()` is registered for cleanup first.
+  // macf#702 loser-yields split-brain guard: if a heartbeat observes that a
+  // NEWER instance has over-registered our slot ('not-ours'), THIS displaced
+  // instance stands down via the graceful-shutdown cleanup so exactly one live
+  // instance remains. `shutdownCleanup` is assigned just below and always set
+  // before `start()` fires the first beat, so the lazy reference is safe.
   const registryHeartbeat = createRegistryHeartbeat({
     registry,
     agentName: config.routingLabel,
     instanceId: config.instanceId,
     logger,
     intervalMs: resolveHeartbeatIntervalMs(process.env['MACF_REGISTRY_HEARTBEAT_INTERVAL_MS']),
+    onDisplaced: () => {
+      logger.warn('standing_down_displaced', {
+        agent: config.routingLabel,
+        instance_id: config.instanceId,
+        detail: 'a newer instance over-registered the slot — graceful shutdown (macf#702)',
+      });
+      // Trigger the same instance-id-guarded graceful cleanup as a SIGTERM. It
+      // deregisters only if still ours (it is NOT — the newer instance holds
+      // it, so deregister will no-op 'not-ours') + stops the HTTPS server, then
+      // exits. Fire-and-forget; the cleanup's once-guard makes a racing signal
+      // benign.
+      void shutdownCleanup?.('displaced-by-newer-instance').then(
+        (ok) => process.exit(ok ? 0 : 1),
+        () => process.exit(1),
+      );
+    },
   });
 
   // P2: Register shutdown handler. On graceful shutdown it deregisters the
@@ -750,16 +778,31 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  // Force a clean exit on any fatal bootstrap abort (groundnuty/macf#449).
-  // Both bootstrap-abort idioms — CollisionError and RegisterRaceError (#447)
-  // — throw out of main() to here. Setting `process.exitCode = 1` alone is
-  // NOT enough to terminate: the MCP stdio transport keeps stdin's readable
-  // stream open, so the event loop stays alive and the process *hangs*
-  // instead of exiting 1 (reproducible with a held-open stdin, e.g.
-  // `sleep 10 | node …`). `process.exit(1)` tears down regardless. We set
-  // exitCode first (so the code is correct even if the write callback never
-  // fires) and exit from the stderr-flush callback so the diagnostic isn't
-  // truncated on a pipe.
+  // Force a clean exit on any bootstrap abort (groundnuty/macf#449). Setting
+  // `process.exitCode` alone is NOT enough to terminate: the MCP stdio
+  // transport keeps stdin's readable stream open, so the event loop stays
+  // alive and the process *hangs* instead of exiting (reproducible with a
+  // held-open stdin, e.g. `sleep 10 | node …`). `process.exit()` tears down
+  // regardless. We set exitCode first (so the code is correct even if the
+  // write callback never fires) and exit from the stderr-flush callback so
+  // the diagnostic isn't truncated on a pipe.
+  //
+  // groundnuty/macf#702: `RegisterRaceError` is now a CLEAN YIELD, not a
+  // fatal abort — it fires ONLY when a genuinely newer, live instance holds
+  // the slot (see the retry loop in `main()` above), which is the CORRECT
+  // outcome for this launch, not a failure. Exit 0 with an informational
+  // (not "Fatal:") message so external monitors don't flag a legitimate
+  // yield as a crash. `CollisionError` and any other thrown error remain the
+  // fatal exit-1 path (groundnuty/macf#447).
+  if (err instanceof RegisterRaceError) {
+    process.exitCode = 0;
+    process.stderr.write(
+      `${err.message}\n`,
+      () => process.exit(0),
+    );
+    return;
+  }
+
   process.exitCode = 1;
   process.stderr.write(
     `Fatal: ${err instanceof Error ? err.message : String(err)}\n`,
