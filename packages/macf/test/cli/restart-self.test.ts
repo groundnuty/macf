@@ -216,7 +216,7 @@ describe('runRestartSelf — confirm path', () => {
     expect(note!.content).toContain('Stash: deadbeefcafe');
   });
 
-  it('writes a 0755 relauncher that sources the host-prelude + execs claude.sh', async () => {
+  it('writes a 0755 relauncher that sources the host-prelude + relaunches into a fresh detached tmux session (macf#711)', async () => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const { deps, rec } = fakeDeps();
     await runRestartSelf(baseOpts({ confirm: true }), deps);
@@ -225,8 +225,13 @@ describe('runRestartSelf — confirm path', () => {
     expect(relaunch!.mode).toBe(0o755);
     expect(relaunch!.content).toContain('host-prelude.sh');
     expect(relaunch!.content).toContain('if [ -f "$PRELUDE" ]; then');
-    expect(relaunch!.content).toContain('exec ./claude.sh');
     expect(relaunch!.content).toContain('tmux has-session');
+    // macf#711 fix: relaunch via a FRESH detached tmux session, not a bare
+    // `exec ./claude.sh` (which relies on claude.sh's own self-wrap — defeated
+    // by inherited-but-stale $TMUX / no controlling terminal from a detached spawn).
+    expect(relaunch!.content).toContain('exec tmux new-session -d -s "$SESSION"');
+    expect(relaunch!.content).toContain('MACF_NO_TMUX_WRAP=1 exec');
+    expect(relaunch!.content).not.toMatch(/^exec \.\/claude\.sh$/m);
   });
 
   it('refuses cleanly (exit 1) when the session cannot be resolved', async () => {
@@ -302,13 +307,37 @@ describe('buildRelauncherScript', () => {
     const s = relauncher();
     expect(s).toContain("PRESTATE='/ws/.claude/.macf/restart-self-session-prestate.env'");
     expect(s).toContain("GUARD_LOG='/ws/.claude/.macf/restart-self-guard.log'");
-    // The watcher is spawned (detached) BEFORE the exec so it survives it.
-    expect(s).toContain('assert_transcript_survived >>"$GUARD_LOG" 2>&1 &');
+    // The watcher subshell is spawned (detached) BEFORE the exec so it survives it.
+    expect(s).toContain('assert_session_live "$SESSION" >>"$GUARD_LOG" 2>&1');
+    expect(s).toContain('assert_transcript_survived >>"$GUARD_LOG" 2>&1');
     expect(s).toContain('if [ -f "$PRESTATE" ]; then');
     expect(s).toContain('session_survived()');
     expect(s).toContain('session_post_state()');
     // The guard watcher precedes the exec (must not run after exec replaces us).
-    expect(s.indexOf('assert_transcript_survived >>')).toBeLessThan(s.indexOf('exec ./claude.sh'));
+    expect(s.indexOf('assert_session_live "$SESSION"')).toBeLessThan(
+      s.indexOf('exec tmux new-session -d -s "$SESSION"'),
+    );
+  });
+
+  it('the session-liveness guard fails LOUD (durable alert banner) when no session comes up (macf#711 AC#2)', () => {
+    const s = relauncher();
+    expect(s).toContain('assert_session_live() {');
+    expect(s).toContain('SESSION-GUARD ALERT');
+    expect(s).toContain('The relaunch did NOT bring up a live tmux session');
+    expect(s).toContain('The agent is DOWN');
+    // Fail-open: it reports, but never aborts / blocks the relaunch itself.
+    expect(s.indexOf('assert_session_live "$SESSION"')).toBeLessThan(
+      s.indexOf('exec tmux new-session -d -s "$SESSION"'),
+    );
+  });
+
+  it('relaunches via a fresh detached tmux session with MACF_NO_TMUX_WRAP=1 for the inner claude.sh (macf#711)', () => {
+    const s = relauncher();
+    expect(s).toContain('exec tmux new-session -d -s "$SESSION" -c "$WORKSPACE"');
+    expect(s).toContain('MACF_NO_TMUX_WRAP=1 exec');
+    expect(s).toContain('$WORKSPACE/claude.sh');
+    // The old bare-exec form must be fully gone — that was the bug.
+    expect(s).not.toMatch(/^exec \.\/claude\.sh$/m);
   });
 
   it('waits for the relaunch to come live before comparing (avoids the re-open race)', () => {
@@ -413,5 +442,61 @@ describe('relauncher session_survived — 6 guard cases (macf#685)', () => {
     });
     expect(r.stdout).toContain('RESULT:survive');
     expect(r.stdout).toContain('no pre-state');
+  });
+});
+
+/**
+ * assert_session_live (macf#711 AC#1/#2) — drive the ACTUAL generated guard
+ * through bash with the `MACF_TEST_TMUX_UP` seam, so no real tmux server is
+ * needed in CI (same seam-pattern as `MACF_TEST_SESSION` above). Bounds are
+ * tightened via MACF_RESTART_LIVE_TIMEOUT/INTERVAL so the "never comes up"
+ * case doesn't block the test suite for the production 120s default.
+ */
+describe('relauncher assert_session_live (macf#711)', () => {
+  function run(tmuxUp: '0' | '1'): { exit: number; out: string } {
+    const script = [
+      'set -uo pipefail',
+      'LIVE_TIMEOUT=1',
+      'LIVE_INTERVAL=0.2',
+      ...relauncherGuardLines(),
+      'if assert_session_live "macf@test-agent"; then echo "RESULT:live"; else echo "RESULT:down"; fi',
+    ].join('\n');
+    const r = spawnSync('bash', ['-c', script], {
+      env: { ...process.env, MACF_TEST_TMUX_UP: tmuxUp },
+      encoding: 'utf-8',
+    });
+    return { exit: r.status ?? -1, out: r.stdout + r.stderr };
+  }
+
+  it('session came up → live, no alert', () => {
+    const r = run('1');
+    expect(r.out).toContain('RESULT:live');
+    expect(r.out).toContain('[session-guard] OK');
+    expect(r.out).not.toContain('SESSION-GUARD ALERT');
+  });
+
+  it('session never came up → down, LOUD durable alert banner (AC#2)', () => {
+    const r = run('0');
+    expect(r.out).toContain('RESULT:down');
+    expect(r.out).toContain('SESSION-GUARD ALERT');
+    expect(r.out).toContain('did NOT bring up a live tmux session');
+    expect(r.out).toContain('The agent is DOWN');
+    expect(r.out).toContain('macf@test-agent');
+  });
+
+  it('is fail-open — a down result returns non-zero but the calling script keeps running (never aborts the relaunch)', () => {
+    const script = [
+      'set -uo pipefail',
+      'LIVE_TIMEOUT=1',
+      'LIVE_INTERVAL=0.2',
+      ...relauncherGuardLines(),
+      'assert_session_live "macf@test-agent" || true',
+      'echo "REACHED-AFTER-GUARD"',
+    ].join('\n');
+    const r = spawnSync('bash', ['-c', script], {
+      env: { ...process.env, MACF_TEST_TMUX_UP: '0' },
+      encoding: 'utf-8',
+    });
+    expect(r.stdout + r.stderr).toContain('REACHED-AFTER-GUARD');
   });
 });
