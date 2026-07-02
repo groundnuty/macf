@@ -5,6 +5,6 @@ export { probePeerHealth } from './probe-peer-health.js';
 export { buildDashboardHealth } from './build-dashboard-health.js';
 export { getRegistryConfig } from './registry-config.js';
 export { mintFreshGitHubToken } from './fresh-github-token.js';
-export { checkIssues } from './work.js';
+export { checkIssues, checkIssuesAcrossFleet } from './work.js';
 export type { PendingIssue } from './work.js';
 export { formatDashboard, formatPeerTable, formatIssues } from './format.js';

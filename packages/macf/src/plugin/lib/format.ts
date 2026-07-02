@@ -141,10 +141,13 @@ export function formatHealthDetail(
 }
 
 /**
- * Format pending issues for display.
+ * Format pending issues for display. `repo` is optional back-compat (single-
+ * repo callers); when present (DR-038 Decision 7's App-install-set x label
+ * queue spans multiple repos), it's prefixed so issue numbers — which are
+ * only unique WITHIN a repo, not across the fleet — aren't ambiguous.
  */
 export function formatIssues(
-  issues: ReadonlyArray<{ readonly number: number; readonly title: string }>,
+  issues: ReadonlyArray<{ readonly number: number; readonly title: string; readonly repo?: string }>,
 ): string {
   if (issues.length === 0) {
     return 'No pending issues.';
@@ -152,7 +155,8 @@ export function formatIssues(
 
   const lines: string[] = [`${issues.length} pending issue(s):\n`];
   for (const issue of issues) {
-    lines.push(`  #${issue.number}: ${issue.title}`);
+    const ref = issue.repo ? `${issue.repo}#${issue.number}` : `#${issue.number}`;
+    lines.push(`  ${ref}: ${issue.title}`);
   }
   return lines.join('\n');
 }

@@ -15,7 +15,9 @@ vi.mock('node:https', () => ({
   request: (...args: unknown[]) => requestMock(...args),
 }));
 
-const { notifyPeer } = await import('../src/notify-peer.js');
+const { notifyPeer, createNotifyOutboxSend } = await import('../src/notify-peer.js');
+const { createOutbox } = await import('../src/delivery/outbox.js');
+const { createInMemoryOutboxStore } = await import('../src/delivery/in-memory-store.js');
 
 interface FakeRegistry {
   get: ReturnType<typeof vi.fn>;
@@ -29,24 +31,60 @@ const fakeLogger = {
   debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(),
 };
 
-function makeDeps(reg: FakeRegistry) {
-  return {
+/**
+ * DR-038 Slice B: `notifyPeer()` now sends THROUGH a durable outbox
+ * (persist-then-send) instead of dispatching directly — `NotifyPeerDeps`
+ * requires `outbox` + `outboxAttempts`. Wiring a REAL in-memory-backed
+ * outbox here (via the actual production `createNotifyOutboxSend` adapter,
+ * not a re-mocked stand-in) means every existing test in this file
+ * exercises the real DR-038 wiring end-to-end while still only touching
+ * `node:https` at the mock boundary — the same boundary these tests
+ * already assumed.
+ *
+ * `extra` overrides (e.g. `a2aClient`, `recordLedgerEdge`) MUST be folded
+ * in BEFORE `createNotifyOutboxSend` is called, not spread onto the
+ * returned object afterward — the outbox's `send` adapter closes over the
+ * deps object passed to `createNotifyOutboxSend` at construction time, so
+ * a later `{ ...makeDeps(reg), a2aClient }`-style override would silently
+ * never reach the adapter (it patches a copy, not the closed-over original).
+ */
+function makeDeps(reg: FakeRegistry, extra: Record<string, unknown> = {}) {
+  const base = {
     registry: reg as unknown as Parameters<typeof notifyPeer>[0]['registry'],
     selfAgentName: 'self-agent',
     mTlsClientCertPem: 'test-cert',
     mTlsClientKeyPem: 'test-key',
     caCertPem: 'test-ca',
     logger: fakeLogger as unknown as Parameters<typeof notifyPeer>[0]['logger'],
+    ...extra,
   };
+  const { send, lastAttempts } = createNotifyOutboxSend(base);
+  const outbox = createOutbox({ store: createInMemoryOutboxStore(), send });
+  return { ...base, outbox, outboxAttempts: lastAttempts };
 }
 
 function makeRegistry(opts: {
   get?: Awaited<ReturnType<FakeRegistry['get']>>;
   list?: Awaited<ReturnType<FakeRegistry['list']>>;
 }): FakeRegistry {
+  const list = opts.list ?? [];
   return {
-    get: vi.fn().mockResolvedValue(opts.get ?? null),
-    list: vi.fn().mockResolvedValue(opts.list ?? []),
+    // DR-038 Slice B: the outbox's send adapter re-resolves EVERY attempt
+    // (including the immediate first one) via `registry.get(target)` — not
+    // just at the initial `resolveTargetPeers` call — so a real Registry's
+    // `get` must be able to find anything `list` can (both are views into
+    // the same underlying store; re-resolving at send time is deliberate,
+    // to pick up a peer's host/port changing across a retry gap). When the
+    // test wired an explicit `get` value, honor it verbatim (preserves
+    // every pre-DR-038 single-peer-mode test exactly); otherwise fall back
+    // to a list-member lookup by name — mirrors realistic registry
+    // semantics for the broadcast-mode tests, which only ever wired `list`.
+    get: vi.fn().mockImplementation(async (name: string) => {
+      if (opts.get !== undefined) return opts.get;
+      const found = list.find((p) => p.name === name);
+      return found?.info ?? null;
+    }),
+    list: vi.fn().mockResolvedValue(list),
     register: vi.fn(),
     registerConditional: vi.fn(),
     remove: vi.fn(),
@@ -418,10 +456,7 @@ describe('notify_peer tool', () => {
       sendMessage: ReturnType<typeof vi.fn> = vi.fn(),
     ) {
       const a2aClient = { getAgentCard, sendMessage };
-      return {
-        ...makeDeps(reg),
-        a2aClient: a2aClient as unknown as Parameters<typeof notifyPeer>[0]['a2aClient'],
-      };
+      return makeDeps(reg, { a2aClient });
     }
 
     it('warns notify_peer_a2a_no_agent_card when getAgentCard returns null, then legacy-falls-back', async () => {
@@ -505,11 +540,7 @@ describe('notify_peer tool', () => {
       recordLedgerEdge: ReturnType<typeof vi.fn>,
       extra: Record<string, unknown> = {},
     ) {
-      return {
-        ...makeDeps(reg),
-        recordLedgerEdge: recordLedgerEdge as unknown as Parameters<typeof notifyPeer>[0]['recordLedgerEdge'],
-        ...extra,
-      };
+      return makeDeps(reg, { recordLedgerEdge, ...extra });
     }
 
     it('records one send edge per peer over the legacy path with delivered=true on HTTP 200', async () => {
@@ -649,10 +680,7 @@ describe('notify_peer tool', () => {
     }
     function makeA2aDeps(reg: FakeRegistry, sendMessage: ReturnType<typeof vi.fn>) {
       const a2aClient = { getAgentCard: vi.fn().mockResolvedValue(a2aCard()), sendMessage };
-      return {
-        ...makeDeps(reg),
-        a2aClient: a2aClient as unknown as Parameters<typeof notifyPeer>[0]['a2aClient'],
-      };
+      return makeDeps(reg, { a2aClient });
     }
 
     it('broadcast: passes the kebab routing-label, not the registry-key suffix', async () => {
@@ -692,6 +720,137 @@ describe('notify_peer tool', () => {
       await notifyPeer(makeA2aDeps(reg, sendMessage), { to: 'science-agent', event: 'turn-complete' });
       const opts = sendMessage.mock.calls[0]![2] as { target?: string };
       expect(opts.target).toBe('science-agent');
+    });
+  });
+
+  describe('DR-038 Slice B — durable outbox wiring (groundnuty/macf#704)', () => {
+    /** Same as `makeDeps`, but also returns the underlying store + outbox so
+     * these tests can assert on outbox STATE across separate `driveOnce()`
+     * ticks — simulating the periodic `outbox-ticker.ts` retry-drive that
+     * runs independently of any single `notifyPeer()` call in production. */
+    function makeDepsWithStore(reg: FakeRegistry) {
+      const base = {
+        registry: reg as unknown as Parameters<typeof notifyPeer>[0]['registry'],
+        selfAgentName: 'self-agent',
+        mTlsClientCertPem: 'test-cert',
+        mTlsClientKeyPem: 'test-key',
+        caCertPem: 'test-ca',
+        logger: fakeLogger as unknown as Parameters<typeof notifyPeer>[0]['logger'],
+      };
+      const { send, lastAttempts } = createNotifyOutboxSend(base);
+      const store = createInMemoryOutboxStore();
+      const outbox = createOutbox({ store, send });
+      return { deps: { ...base, outbox, outboxAttempts: lastAttempts }, store };
+    }
+
+    it('persist-then-send (Decision 1): by the time the HTTP transport fires, the entry is already durable in the store', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const { deps, store } = makeDepsWithStore(reg);
+      let pendingAtSendTime: number | undefined;
+      requestMock.mockImplementationOnce((...args: unknown[]) => {
+        const cb = args[1] as ((res: EventEmitter & { statusCode: number; resume: () => void }) => void);
+        const req = new EventEmitter() as EventEmitter & { write: () => void; end: () => void; destroy: () => void };
+        req.write = () => undefined;
+        req.end = () => {
+          // Read store state at the moment the transport layer is invoked
+          // (synchronously, before the response even fires) — the outbox
+          // already `await`ed `store.enqueue()` before calling this `send`
+          // function, so the entry MUST already be durable here.
+          void store.listPending().then((p) => { pendingAtSendTime = p.length; });
+          const res = new EventEmitter() as EventEmitter & { statusCode: number; resume: () => void };
+          res.statusCode = 200;
+          res.resume = () => undefined;
+          cb(res);
+          Promise.resolve().then(() => res.emit('end'));
+        };
+        req.destroy = () => undefined;
+        return req;
+      });
+
+      await notifyPeer(deps, { to: 'peer-a', event: 'session-end' });
+      expect(pendingAtSendTime).toBe(1); // durably persisted BEFORE the send attempt
+    });
+
+    it('a failed first attempt leaves the entry pending in the outbox for a LATER retry (Decision 4 restart-survival)', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9999, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const { deps, store } = makeDepsWithStore(reg);
+      nextHttpsErrorsWith(new Error('ECONNREFUSED'));
+
+      const result = await notifyPeer(deps, { to: 'peer-a', event: 'session-end' });
+      expect(result.channel_state).toBe('offline');
+
+      // The message SURVIVES the failed attempt — it's still in the outbox,
+      // not dropped, ready for the next retry tick.
+      const pending = await store.listPending();
+      expect(pending).toHaveLength(1);
+      expect(pending[0]?.attemptCount).toBe(1);
+      expect(pending[0]?.target).toBe('peer-a');
+    });
+
+    it('a LATER driveOnce() tick (simulating the periodic ticker) retries + delivers the survived entry', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9999, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const { deps, store } = makeDepsWithStore(reg);
+      nextHttpsErrorsWith(new Error('ECONNREFUSED'));
+      await notifyPeer(deps, { to: 'peer-a', event: 'session-end' });
+      expect(await store.listPending()).toHaveLength(1);
+
+      // Simulate the periodic outbox-ticker's next tick, independent of any
+      // further notifyPeer() call — the peer is back up now.
+      nextHttpsRespondsWith(200);
+      const summary = await deps.outbox.driveOnce(Date.now() + 60_000);
+
+      expect(summary.acked).toBe(1);
+      expect(await store.listPending()).toHaveLength(0);
+    });
+
+    it('reuses the SAME message-id across the failed attempt and the later successful retry (Decision 2)', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9999, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const { deps, store } = makeDepsWithStore(reg);
+      nextHttpsErrorsWith(new Error('ECONNREFUSED'));
+      await notifyPeer(deps, { to: 'peer-a', event: 'session-end' });
+      const [entryAfterFailure] = await store.listPending();
+      const idAfterFailure = entryAfterFailure?.id;
+      expect(typeof idAfterFailure).toBe('string');
+
+      let postedId: string | undefined;
+      requestMock.mockImplementationOnce((...args: unknown[]) => {
+        const cb = args[1] as ((res: EventEmitter & { statusCode: number; resume: () => void }) => void);
+        const req = new EventEmitter() as EventEmitter & { write: (b: string) => void; end: () => void; destroy: () => void };
+        req.write = (body: string) => {
+          postedId = (JSON.parse(body) as { message_id?: string }).message_id;
+        };
+        req.end = () => {
+          const res = new EventEmitter() as EventEmitter & { statusCode: number; resume: () => void };
+          res.statusCode = 200;
+          res.resume = () => undefined;
+          cb(res);
+          Promise.resolve().then(() => res.emit('end'));
+        };
+        req.destroy = () => undefined;
+        return req;
+      });
+      await deps.outbox.driveOnce(Date.now() + 60_000);
+
+      expect(postedId).toBe(idAfterFailure);
+    });
+
+    it('the legacy wire payload carries the outbox message_id (dedup key)', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      nextHttpsRespondsWith(200);
+      await notifyPeer(makeDeps(reg), { to: 'peer-a', event: 'session-end' });
+      const body = JSON.parse(lastPostedBody!);
+      expect(typeof body.message_id).toBe('string');
+      expect(body.message_id.length).toBeGreaterThan(0);
     });
   });
 });

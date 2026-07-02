@@ -2,68 +2,25 @@
  * DR-038 Decision 5/6 — the plugin-side `InboxStore` contract the
  * on-startup drain (`inbox-drain.ts`) consumes.
  *
- * This is a STRUCTURALLY-COMPATIBLE mirror of the canonical `InboxStore` /
- * `InboxEntry` defined by Slice A at
- * `packages/macf-channel-server/src/delivery/store.ts`
- * (persist / has / get / listUndrained / markProcessed) — NOT a re-export.
- *
- * Why not import it directly: `packages/macf` (this package) does not
- * currently depend on `@groundnuty/macf-channel-server` — there is no
- * existing precedent for that edge anywhere in this package (the only
- * existing references to `@groundnuty/macf-channel-server` elsewhere in
- * `packages/macf/src` are STRING literals used to launch it via `npx`, not
- * TypeScript imports), and the channel-server's public `index.ts` doesn't
- * even export the `delivery/` module today. Slice B (the on-receipt wiring,
- * same package as Slice A) hasn't landed yet either, so there is no
- * established "injected-driver seam" this slice could plug into
- * cross-package. Introducing a new tsconfig project-reference + a new
- * package.json dependency + a lockfile regen is a bigger architectural
- * call than Slice C's scoped "plugin startup-reconcile" mandate —
- * especially since devops's disk-spool driver (DR-008) lives in a THIRD
- * repo (`macf-devops-toolkit`) that cannot depend on either monorepo
- * package directly. That makes it likely the real long-term home for this
- * contract is `@groundnuty/macf-core` (npm-published, already consumed by
- * all three: macf, macf-channel-server, and — once it exists — the devops
- * driver), not a direct macf → macf-channel-server edge. That hoist
- * decision is "code + science" territory per DR-038's build-split (the
- * channel-server delivery contract + store interface), not something this
- * single slice should decide unilaterally.
- *
- * Until that lands, this file is the swap-in seam: once a shared driver
- * type exists (macf-core hoist, or a deliberate cross-package dependency),
- * replace this file's `InboxStore` type + `createInMemoryInboxStore` with
- * the shared one — `inbox-drain.ts`'s call sites don't need to change
- * (field names/signatures kept identical to Slice A's `store.ts` at
- * authoring time).
+ * `InboxStore` / `InboxEntry` are now imported directly from
+ * `@groundnuty/macf-core` (macf#741/#745 hoisted the ONE shared definition
+ * there from `packages/macf-channel-server/src/delivery/store.ts`, since
+ * this package, `macf-channel-server`, AND devops's future disk-spool
+ * driver in a THIRD repo — `macf-devops-toolkit`, which cannot depend on
+ * either monorepo package directly — all need it). This file previously
+ * carried a structurally-compatible LOCAL MIRROR of those types (authored
+ * before the hoist landed, when `macf-core` didn't yet export them); that
+ * mirror is retired now that the shared definition exists. Only the
+ * IMPLEMENTATIONS live here — `createInMemoryInboxStore` (the reference
+ * driver) + `getInboxStore` (the decision/driver-split factory) — which
+ * now implement the `@groundnuty/macf-core` `InboxStore` contract instead
+ * of the local one. `inbox-drain.ts`'s call sites are unaffected (field
+ * names/signatures are identical; this file still re-exports the types
+ * under the same names).
  */
+import type { InboxStore, InboxEntry } from '@groundnuty/macf-core';
 
-export interface InboxEntry {
-  /** The sender's message-id — the dedup key (DR-038 Decisions 1, 2). */
-  readonly id: string;
-  /** Opaque message payload, as durably received. */
-  readonly payload: unknown;
-  /** Epoch-ms at receipt (persist time, i.e. before ACK — Decision 3). */
-  readonly receivedAt: number;
-  /** Has the drain processed this entry yet? (Decision 5). */
-  readonly processed: boolean;
-}
-
-export interface InboxStore {
-  /** Atomically dedup-and-persist. Returns `wasNew`. */
-  persist(entry: InboxEntry): Promise<boolean>;
-  /** Existence check by id. */
-  has(id: string): Promise<boolean>;
-  /** Fetch by id, or `undefined` if absent. */
-  get(id: string): Promise<InboxEntry | undefined>;
-  /**
-   * Persisted-but-not-yet-processed entries — drained on-receipt AND
-   * on-startup (DR-038 Decision 5). Dedup-by-id makes the two triggers
-   * safe to overlap.
-   */
-  listUndrained(): Promise<InboxEntry[]>;
-  /** Mark an entry processed — it won't be re-drained. */
-  markProcessed(id: string): Promise<void>;
-}
+export type { InboxStore, InboxEntry };
 
 /**
  * Reference in-memory `InboxStore` — mirrors

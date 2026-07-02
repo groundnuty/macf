@@ -4,8 +4,9 @@
  * backoff retry bounded by a wall-clock TTL, and dead-letter escalation on
  * TTL expiry.
  *
- * Runtime-agnostic over an injected `OutboxStore` (the pluggable driver,
- * `store.ts`), an injected `send` transport seam, and an injected clock — so
+ * Runtime-agnostic over an injected `OutboxStore` (the pluggable driver
+ * interface, hoisted to `@groundnuty/macf-core`'s `delivery/store.ts` —
+ * macf#741), an injected `send` transport seam, and an injected clock — so
  * the whole retry loop is deterministically testable without real time or
  * real network I/O, and so a driver swap (in-memory here, VM disk-spool /
  * K8s PVC-broker per DR-008) never touches this file.
@@ -20,8 +21,7 @@
  * immediate attempt on startup... then re-enter backoff") without any
  * startup-specific code path: an overdue entry is simply due right away.
  */
-import type { Logger } from '@groundnuty/macf-core';
-import type { OutboxStore, OutboxEntry } from './store.js';
+import type { Logger, OutboxStore, OutboxEntry } from '@groundnuty/macf-core';
 import { mintMessageId } from './message-id.js';
 
 /**

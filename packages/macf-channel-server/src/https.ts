@@ -41,6 +41,11 @@ import { intentSummary } from './comms-ledger.js';
 import type { CommsEvent, CommsLedgerEdge } from './comms-ledger.js';
 import { formatNotifyContent } from './notify-formatter.js';
 import type { Message } from './a2a-types.js';
+// DR-038 Slice B: the durable receiver-side inbox — persist-THEN-ack
+// (Decision 3) for the direct A2A path (legacy `peer_notification` /notify +
+// A2A message/send). Optional on the server config; absence preserves
+// exact pre-DR-038 behavior (straight to onNotify, no dedup).
+import type { Inbox } from './delivery/inbox.js';
 
 const MAX_BODY_BYTES = 64 * 1024; // 64KB
 export const PORT_RANGE_START = 8800;
@@ -293,6 +298,29 @@ export function createHttpsServer(config: {
    * via `Message.taskId`.
    */
   readonly taskStore?: TaskStore;
+  /**
+   * DR-038 Slice B (groundnuty/macf#704): the durable receiver-side inbox for
+   * the direct A2A path — legacy `/notify` `type:peer_notification` payloads
+   * that carry a `message_id`, and every A2A `message/send` (its `Message.
+   * messageId` is spec-required, always present). When present, both recv
+   * sites call `inbox.accept(id, payload)` — an atomic dedup-and-persist —
+   * and return their HTTP 200 / JSON-RPC result ONLY AFTER it resolves
+   * (Decision 3's load-bearing persist-then-ACK ordering: returning 200
+   * before the persist would make the ACK mean "received" instead of
+   * "durably yours" — the exact silent-fallback shape Decision 3 exists to
+   * avoid). A redelivered id dedups (`wasNew: false`) — the existing entry
+   * is left untouched and `onNotify` is NOT re-invoked (no duplicate MCP
+   * push / tmux wake), but the handler still returns 200 (Decision 3: "a
+   * lost-in-transit 200 is safe... idempotent by construction"). Optional —
+   * omitted entirely preserves the exact pre-DR-038 behavior (call onNotify
+   * directly, no persist, no dedup) for channel-servers that haven't wired
+   * a store driver yet, and for GitHub-anchored /notify types (mention /
+   * issue_routed / pr_review_state / ci_completion / startup_check), which
+   * are OUT of DR-038 scope (Decision 1: GitHub stays the durable substrate
+   * for those; the inbox/outbox is the DIRECT path only) and never carry a
+   * `message_id` regardless of whether `inbox` is configured.
+   */
+  readonly inbox?: Inbox;
   readonly logger: Logger;
   /**
    * macf#473 piece 2 (DR-025): record an authoritative comms-ledger edge for
@@ -323,7 +351,7 @@ export function createHttpsServer(config: {
    */
   readonly instanceId?: string;
 }): HttpsServer {
-  const { onNotify, onHealth, onSign, agentCard, taskStore, logger, recordLedgerEdge, selfAgentName, routingLabel, instanceId } = config;
+  const { onNotify, onHealth, onSign, agentCard, taskStore, inbox, logger, recordLedgerEdge, selfAgentName, routingLabel, instanceId } = config;
 
   const tlsOptions = {
     key: readFileSync(config.agentKeyPath),
@@ -559,7 +587,37 @@ export function createHttpsServer(config: {
                 trace_id: span.spanContext().traceId,
               });
             }
-            await onNotify(result.data);
+            // DR-038 Slice B: the direct A2A path (legacy `peer_notification`
+            // carrying a sender-stamped `message_id`) routes through the
+            // durable inbox when one is configured. `accept()` is the
+            // atomic dedup-and-persist primitive (Decision 6); the caller
+            // MUST await it fully before the HTTP 200 below is ever sent —
+            // Decision 3's load-bearing persist-then-ACK ordering. Every
+            // OTHER notify type (mention / issue_routed / pr_review_state /
+            // ci_completion / startup_check — GitHub-anchored, out of
+            // DR-038 scope per Decision 1) and any pre-DR-038 sender that
+            // omitted `message_id` fall through to the unchanged direct
+            // onNotify call.
+            const messageId =
+              result.data.type === 'peer_notification' ? result.data.message_id : undefined;
+            if (messageId !== undefined && inbox !== undefined) {
+              const accepted = await inbox.accept(messageId, result.data);
+              if (accepted.wasNew) {
+                await onNotify(result.data);
+                await inbox.markProcessed(messageId);
+              } else {
+                // Redelivery (sender retried after a lost-in-transit 200,
+                // DR-038 Decision 3): existing entry untouched, onNotify NOT
+                // re-invoked (no duplicate MCP push / tmux wake). Still
+                // returns 200 below — idempotent by construction.
+                logger.info('notify_inbox_dedup', {
+                  message_id: messageId,
+                  type: result.data.type,
+                });
+              }
+            } else {
+              await onNotify(result.data);
+            }
             sendJson(res, 200, { status: 'received' });
             span.setStatus({ code: SpanStatusCode.OK });
           } catch (err) {
@@ -970,6 +1028,27 @@ export function createHttpsServer(config: {
               });
             };
 
+            // DR-038 Slice B: the durable inbox wraps `onNotify` for the A2A
+            // path — `Message.messageId` is spec-required (always present,
+            // unlike the legacy path's optional `message_id`), so every A2A
+            // `message/send` gets inbox dedup whenever `inbox` is configured.
+            // Same persist-THEN-ack/process ordering as the legacy `/notify`
+            // handler; called from both delivering branches below (resume +
+            // fresh happy-path).
+            const deliverA2aMessage = async (msg: Message): Promise<void> => {
+              if (inbox !== undefined) {
+                const accepted = await inbox.accept(msg.messageId, msg);
+                if (accepted.wasNew) {
+                  await onNotify(a2aMessageToNotifyPayload(msg));
+                  await inbox.markProcessed(msg.messageId);
+                } else {
+                  logger.info('a2a_inbox_dedup', { message_id: msg.messageId });
+                }
+              } else {
+                await onNotify(a2aMessageToNotifyPayload(msg));
+              }
+            };
+
             // macf#392 Phase 2b: resume branch. If incoming Message.taskId
             // is set, the client is resuming a paused task (INPUT_REQUIRED
             // or AUTH_REQUIRED state); dispatch to TaskStore.resume() instead
@@ -987,7 +1066,7 @@ export function createHttpsServer(config: {
               // not just happy-path — avoids a deliver/silently-drop asymmetry).
               // See the happy-path call below for the ordering + wake rationale.
               recordA2aRecvEdge(); // macf#473: append-before-deliver
-              await onNotify(a2aMessageToNotifyPayload(incomingMessage));
+              await deliverA2aMessage(incomingMessage);
               sendA2aJson(res, 200, {
                 jsonrpc: '2.0',
                 id: envelope.data.id,
@@ -1068,7 +1147,7 @@ export function createHttpsServer(config: {
             // NB: the REJECTED test-fixture branch above intentionally does
             // NOT deliver — a rejected message was declined, not received.
             recordA2aRecvEdge(); // macf#473: append-before-deliver
-            await onNotify(a2aMessageToNotifyPayload(incomingMessage));
+            await deliverA2aMessage(incomingMessage);
             sendA2aJson(res, 200, {
               jsonrpc: '2.0',
               id: envelope.data.id,

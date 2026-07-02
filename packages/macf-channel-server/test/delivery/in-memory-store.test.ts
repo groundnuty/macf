@@ -3,7 +3,7 @@ import {
   createInMemoryOutboxStore,
   createInMemoryInboxStore,
 } from '../../src/delivery/in-memory-store.js';
-import type { OutboxEntry, InboxEntry } from '../../src/delivery/store.js';
+import type { OutboxEntry, InboxEntry } from '@groundnuty/macf-core';
 
 function outboxEntry(overrides: Partial<OutboxEntry> = {}): OutboxEntry {
   return {

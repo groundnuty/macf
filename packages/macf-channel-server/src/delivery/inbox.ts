@@ -3,8 +3,9 @@
  * persist-THEN-ack ordering (Decision 3), and the store-backed primitives
  * the inbox drain (Decision 5) needs.
  *
- * Runtime-agnostic over an injected `InboxStore` (the pluggable driver,
- * `store.ts`). The drain TRIGGER itself — hooking `accept` into the HTTP
+ * Runtime-agnostic over an injected `InboxStore` (the pluggable driver
+ * interface, hoisted to `@groundnuty/macf-core`'s `delivery/store.ts` —
+ * macf#741). The drain TRIGGER itself — hooking `accept` into the HTTP
  * `/notify` / `message/send` handler (on-receipt), and hooking `undrained`
  * + `markProcessed` into the plugin's SessionStart `startup_check`
  * (on-startup) — is a follow-on slice. This module provides the store-
@@ -12,7 +13,7 @@
  * that makes the two triggers safe to run overlapping (Decision 5: "no
  * periodic drain is needed if receipt + startup cover it").
  */
-import type { InboxStore, InboxEntry } from './store.js';
+import type { InboxStore, InboxEntry } from '@groundnuty/macf-core';
 
 export interface InboxAcceptResult {
   /**
