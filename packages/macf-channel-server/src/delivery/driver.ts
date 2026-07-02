@@ -1,8 +1,9 @@
 /**
  * DR-038 Decision 6 — the pluggable store-DRIVER seam. `outbox.ts` / `inbox.ts`
  * (the runtime-agnostic effectively-once logic) depend only on the
- * `OutboxStore` / `InboxStore` interfaces (`store.ts`); THIS module is the one
- * place `server.ts` decides which concrete driver backs those interfaces.
+ * `OutboxStore` / `InboxStore` interfaces (hoisted to `@groundnuty/macf-core`,
+ * `delivery/store.ts` — macf#741); THIS module is the one place `server.ts`
+ * decides which concrete driver backs those interfaces.
  *
  * Today there is exactly one driver: the in-memory reference (`in-memory-store.ts`).
  * That is a PLACEHOLDER, not the DR-038 durability guarantee — see the loud
@@ -14,8 +15,7 @@
  * `message/send` receiver wiring, all of which only ever see the `OutboxStore`
  * / `InboxStore` interface.
  */
-import type { Logger } from '@groundnuty/macf-core';
-import type { OutboxStore, InboxStore } from './store.js';
+import type { Logger, OutboxStore, InboxStore } from '@groundnuty/macf-core';
 import { createInMemoryOutboxStore, createInMemoryInboxStore } from './in-memory-store.js';
 
 export interface DeliveryStores {

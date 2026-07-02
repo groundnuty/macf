@@ -16,7 +16,7 @@
  * `markProcessed`) — consistent with this repo's "immutable interfaces"
  * convention (CLAUDE.md § Conventions).
  */
-import type { OutboxStore, OutboxEntry, InboxStore, InboxEntry } from './store.js';
+import type { OutboxStore, OutboxEntry, InboxStore, InboxEntry } from '@groundnuty/macf-core';
 
 /** Create a fresh in-memory `OutboxStore`. Each call is an independent store. */
 export function createInMemoryOutboxStore(): OutboxStore {

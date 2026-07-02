@@ -7,6 +7,19 @@
  * broker topic, etc.) is explicitly NOT part of this contract — DR-038
  * Decision 6 is emphatic that the interface, not the file shape, is binding.
  *
+ * HOISTED HERE (macf#741 follow-up to #738/#742) from
+ * `packages/macf-channel-server/src/delivery/store.ts` so ONE definition
+ * serves all three consumers that need it: `macf-channel-server` (the
+ * sender/receiver runtime, `outbox.ts` / `inbox.ts` / `in-memory-store.ts`),
+ * `macf` (the plugin's on-startup inbox drain, `plugin/lib/inbox-store.ts`),
+ * and devops's disk-spool driver (DR-008), which lives in a THIRD repo
+ * (`macf-devops-toolkit`) that cannot depend on either monorepo package
+ * directly — `@groundnuty/macf-core` (npm-published, already a dependency of
+ * both `macf` and `macf-channel-server`) is the one home reachable by all
+ * three. `macf-channel-server`'s local `delivery/store.ts` (the prior home
+ * of this contract) is removed; every consumer there now imports these
+ * types directly from `@groundnuty/macf-core`.
+ *
  * Both interfaces are `Promise`-returning uniformly, even though the
  * reference in-memory driver (`in-memory-store.ts`) and a likely disk-spool
  * driver could be synchronous under the hood (comms-ledger.ts's
@@ -154,6 +167,15 @@ export interface InboxStore {
    */
   listUndrained(): Promise<InboxEntry[]>;
 
-  /** Mark an entry processed — it won't be re-drained. */
+  /**
+   * Mark an entry processed — it won't be re-drained.
+   *
+   * Forward-note (DR-038 / macf#741): today's plugin drain calls this
+   * BEFORE surfacing the entry to the operator/agent (mark-then-surface),
+   * against an in-memory reference store where the distinction is moot. Once
+   * a durable driver lands, revisit the ordering to surface-then-mark
+   * instead, so a crash between the two steps can't silently drop a message
+   * that was marked processed but never actually surfaced.
+   */
   markProcessed(id: string): Promise<void>;
 }

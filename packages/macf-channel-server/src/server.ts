@@ -47,7 +47,7 @@ import { createDefaultDeliveryStores } from './delivery/driver.js';
 import { createOutbox } from './delivery/outbox.js';
 import { createInbox } from './delivery/inbox.js';
 import { createOutboxTicker } from './delivery/outbox-ticker.js';
-import type { OutboxEntry } from './delivery/store.js';
+import type { OutboxEntry } from '@groundnuty/macf-core';
 
 // NOTE: `checkPendingIssues` from './startup-issues.js' used to be
 // called here at boot — but the call had a hardcoded

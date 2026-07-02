@@ -31,6 +31,7 @@ export * from './protected-invariant-norms.js';
 export * from './mtls-health-ping.js';
 export * from './certs/index.js';
 export * from './registry/index.js';
+export * from './delivery/index.js';
 
 // Subpath modules NOT re-exported from the subdir index.ts files;
 // surface them here so consumers can use the flat barrel uniformly.

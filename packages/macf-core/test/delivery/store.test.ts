@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { OutboxEntrySchema, InboxEntrySchema } from '@groundnuty/macf-core';
+import { OutboxEntrySchema, InboxEntrySchema } from '../../src/delivery/store.js';
 
 describe('OutboxEntrySchema', () => {
   it('accepts a well-formed entry', () => {
