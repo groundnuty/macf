@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { createInMemoryOutboxStore } from '../../src/delivery/in-memory-store.js';
 import { createOutbox, computeBackoffMs } from '../../src/delivery/outbox.js';
 import type { OutboxSendFn } from '../../src/delivery/outbox.js';
-import type { OutboxEntry } from '../../src/delivery/store.js';
+import type { OutboxEntry } from '@groundnuty/macf-core';
 
 describe('computeBackoffMs', () => {
   it('doubles from the base on each successive attemptCount', () => {

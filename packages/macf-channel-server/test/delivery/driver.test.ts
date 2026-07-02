@@ -15,8 +15,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { createDefaultDeliveryStores } from '../../src/delivery/driver.js';
 import { createOutbox } from '../../src/delivery/outbox.js';
 import { createInbox } from '../../src/delivery/inbox.js';
-import type { OutboxStore, InboxStore, OutboxEntry, InboxEntry } from '../../src/delivery/store.js';
-import type { Logger } from '@groundnuty/macf-core';
+import type { OutboxStore, InboxStore, OutboxEntry, InboxEntry, Logger } from '@groundnuty/macf-core';
 
 function mockLogger(): Logger {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
