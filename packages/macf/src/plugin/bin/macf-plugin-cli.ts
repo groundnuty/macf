@@ -18,7 +18,7 @@ import { probePeerHealth } from '../lib/probe-peer-health.js';
 import { buildDashboardHealth } from '../lib/build-dashboard-health.js';
 import { getRegistryConfig } from '../lib/registry-config.js';
 import { mintFreshGitHubToken } from '../lib/fresh-github-token.js';
-import { checkIssues } from '../lib/work.js';
+import { checkIssuesAcrossFleet } from '../lib/work.js';
 import { createRegistryFromConfig } from '@groundnuty/macf-core';
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
@@ -164,9 +164,13 @@ async function main(): Promise<void> {
       // is GitHub-only by design (queries gh api repos/...), so the
       // stale-token-from-long-running-parent class hits here too.
       const token = await mintFreshGitHubToken();
-      const repo = process.env['MACF_REGISTRY_REPO'] ?? 'groundnuty/macf';
       const label = process.env['MACF_AGENT_LABEL'] ?? 'code-agent';
-      const issues = await checkIssues({ repo, label, token });
+      // DR-038 Decision 7: queue-source = App-install-set x label, complete
+      // by construction — NOT a single hardcoded/MACF_REGISTRY_REPO repo
+      // (that var is the registry's scope, not the issue-queue's scope; a
+      // repo can be install-set member + routing target without being the
+      // registry repo, and vice versa).
+      const issues = await checkIssuesAcrossFleet({ label, token });
       console.log(formatIssues(issues));
       break;
     }
