@@ -88,6 +88,16 @@ export const NotifyPayloadSchema = z.object({
   event: z.enum(['session-end', 'session-compact', 'turn-complete', 'error', 'custom']).optional(),
   // macf#473: optional owner/repo#N anchor a peer_notification nudge is tied to, for the comms-ledger graph join.
   github_anchor: z.string().optional(),
+  // DR-038 Decision 2: the sender's stable dedup key for the direct
+  // peer_notification path — a UUIDv4 minted ONCE at outbox-enqueue and
+  // reused verbatim on every retry (never regenerated). Optional at the
+  // schema level for back-compat with pre-DR-038 senders (who never set
+  // it) and with every OTHER NotifyType (which don't carry a message-id at
+  // all — those stay on the always-durable GitHub-anchored path, DR-038
+  // Decision 1). Receivers use this as the `InboxStore.persist()` dedup
+  // key when present; absence means "no inbox wiring for this payload"
+  // (processed directly, exactly as before DR-038).
+  message_id: z.string().min(1).optional(),
   // pr_review_state variant fields (macf-actions#39, v3.3.0). Optional
   // at the top level to preserve backward-compat. Producers (the
   // route-by-pr-review-state job) construct + validate against the
@@ -200,6 +210,9 @@ export const PeerNotificationPayloadSchema = z.object({
   // No flag-on-the-wire — Pattern E (cross-agent Stop-hook loop
   // prevention) is enforced by the receiver's `decideWake()` from
   // `event` alone, removing per-call sender-side wake leakage.
+  // DR-038 Decision 2: optional stable dedup id — see NotifyPayloadSchema's
+  // `message_id` doc comment for the full rationale.
+  message_id: z.string().min(1).optional(),
 });
 
 export type PeerNotificationPayload = z.infer<typeof PeerNotificationPayloadSchema>;
