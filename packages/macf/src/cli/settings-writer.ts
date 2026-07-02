@@ -41,6 +41,16 @@ import { join, resolve } from 'node:path';
  * `macf update` / `macf rules refresh` cycle. No legacy-pattern list
  * is needed (unlike `MACF_LEGACY_FD_PATTERNS` which compares strings
  * literally) because the basename matcher is path-agnostic.
+ *
+ * **DR-039 Decision 2 (groundnuty/macf#731/#739):** this hook's
+ * REGISTRATION single-sourced into the plugin's `hooks/hooks.json` —
+ * `installGhTokenHook` no longer writes it into settings.json. The
+ * constant is retained for (a) migration cleanup — `isMacfManagedCommand`
+ * still recognizes + strips a legacy settings.json copy on refresh — and
+ * (b) as the canonical command string the plugin's hooks.json entry must
+ * match verbatim (see the plugin-hooks single-source lockstep test). The
+ * SCRIPT itself stays path-invoked at `.claude/scripts/check-gh-token.sh`
+ * (workbench-maintainable); only the registration moved.
  */
 export const MACF_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-token.sh';
 
@@ -52,6 +62,10 @@ export const MACF_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-t
  * `mention-routing-hygiene.md` §5 enforcement structurally; codification
  * alone produced ~80% catch rate (see science-agent's research note
  * `2026-04-27-self-observed-canonical-rule-breach-pattern-analysis.md`).
+ *
+ * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
+ * plugin's `hooks/hooks.json` — retained here for migration-cleanup +
+ * the plugin-hooks lockstep test (see `MACF_HOOK_COMMAND`'s comment above).
  */
 export const MACF_MENTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-mention-routing.sh';
 
@@ -67,6 +81,10 @@ export const MACF_MENTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/ch
  * incompatible; bash form fires uniformly across substrate (no
  * macf-agent MCP server) AND consumer workspaces. UC-4 (PR #275)
  * demonstrated the bash-form path empirically; UC-2 mirrors it.
+ *
+ * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
+ * plugin's `hooks/hooks.json` — retained here for migration-cleanup +
+ * the plugin-hooks lockstep test (see `MACF_HOOK_COMMAND`'s comment above).
  */
 export const MACF_LGTM_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-lgtm-gate.sh';
 
@@ -82,6 +100,10 @@ export const MACF_LGTM_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check
  * macf#316/#410/#430). Path-2 structural backstop; sister to the #140 /
  * #244+#272 / #270 hooks. Discriminator is issue authorship (self-filed
  * `Closes #own` passes); override via MACF_SKIP_CLOSE_CHECK=1.
+ *
+ * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
+ * plugin's `hooks/hooks.json` — retained here for migration-cleanup +
+ * the plugin-hooks lockstep test (see `MACF_HOOK_COMMAND`'s comment above).
  */
 export const MACF_CLOSE_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh';
 
@@ -128,6 +150,10 @@ export const MACF_TURN_RECEIPT_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scrip
  * the `PostToolUse` event (matcher `Bash`), NOT `PreToolUse`. Fail-open:
  * every uncertain branch in the script exits 0; only a CONFIRMED
  * user-authored write fires `exit 2`. Override: MACF_SKIP_ATTRIBUTION_CHECK=1.
+ *
+ * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
+ * plugin's `hooks/hooks.json` — retained here for migration-cleanup +
+ * the plugin-hooks lockstep test (see `MACF_HOOK_COMMAND`'s comment above).
  */
 export const MACF_ATTRIBUTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-attribution.sh';
 
@@ -147,8 +173,14 @@ export const MACF_ATTRIBUTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/script
  *
  * Distinct from the plugin's existing PreCompact `checkpoint_to_memory`
  * mcp_tool entry (DR-023 §UC-3 session-checkpoint): that ships via the plugin
- * `hooks.json` mcp_tool path; THIS is a bash command-type hook installed into
- * settings.json — both can coexist on the PreCompact event.
+ * `hooks.json` mcp_tool path; THIS is a bash command-type hook that ALSO now
+ * ships via the plugin's `hooks.json` (see the DR-039 note below) — both
+ * coexist on the PreCompact event there.
+ *
+ * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
+ * plugin's `hooks/hooks.json` (no longer written into settings.json by
+ * `installGhTokenHook`) — retained here for migration-cleanup + the
+ * plugin-hooks lockstep test (see `MACF_HOOK_COMMAND`'s comment above).
  */
 export const MACF_REFLECTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/harvest-reflection.sh';
 
@@ -197,6 +229,12 @@ export const MACF_CHANNELS_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/c
  *
  * Distributed via `macf init` / `macf update` / `macf rules refresh` like the
  * other check-*.sh hooks (CLI-shipped, NOT a plugin hook).
+ *
+ * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
+ * plugin's `hooks/hooks.json` (registered on BOTH SessionStart AND
+ * UserPromptSubmit there, mirroring the dual registration this comment
+ * describes) — no longer written into settings.json by `installGhTokenHook`.
+ * Retained here for migration-cleanup + the plugin-hooks lockstep test.
  */
 export const MACF_CHANNEL_ALIVE_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh';
 
@@ -204,6 +242,17 @@ export const MACF_CHANNEL_ALIVE_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scri
  * The hook filenames used to identify MACF-managed entries on refresh.
  * Matched by path-end equality (see isMacfManagedCommand) so operator
  * files with a similar-but-distinct basename are not misclassified.
+ *
+ * Per DR-039 Decision 2 (groundnuty/macf#731/#739), 7 of these 10 filenames
+ * (check-gh-token / check-mention-routing / check-lgtm-gate /
+ * check-close-keyword / check-gh-attribution / harvest-reflection /
+ * check-channel-alive) are no longer RE-ADDED by `installGhTokenHook` — their
+ * registration single-sourced into the plugin's `hooks/hooks.json`. They stay
+ * in this list so the preserve-filter keeps recognizing + stripping a legacy
+ * settings.json copy left over from a pre-migration CLI version (migration
+ * cleanup is idempotent: nothing to strip on an already-migrated workspace).
+ * The remaining 3 (check-auditor-never-acts / emit-turn-receipt /
+ * check-channels-enabled) are still actively re-installed hand-wired hooks.
  */
 const MACF_HOOK_FILENAMES: readonly string[] = [
   'check-gh-token.sh',
@@ -923,62 +972,62 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
 }
 
 /**
- * Install (or refresh) the MACF PreToolUse hook entries in
- * `<workspaceDir>/.claude/settings.json`. Currently installs:
- *   - `check-gh-token.sh` (groundnuty/macf#140 — attribution-trap defense)
- *   - `check-mention-routing.sh` (groundnuty/macf#244 + #272 — routing
- *     leak detector for raw `@<bot>[bot]` in describing-context)
- *   - `check-lgtm-gate.sh` (groundnuty/macf#270 — DR-023 UC-2; blocks
- *     `gh pr merge` when no non-author APPROVED review exists)
- *   - `check-close-keyword.sh` (groundnuty/macf#431 — blocks `gh pr
- *     create`/`edit` that would auto-close another agent's issue via a
- *     close-keyword adjacent to its ref)
+ * Install (or refresh) the MACF hook entries that remain HAND-WIRED in
+ * `<workspaceDir>/.claude/settings.json` after the DR-039 Decision 2
+ * single-source migration (groundnuty/macf#731/#739). Currently installs:
  *   - `check-auditor-never-acts.sh` (groundnuty/macf#499 — DR-026 F1; when
  *     `MACF_AGENT_ROLE=auditor`, blocks state-mutating `gh pr merge` /
  *     `gh issue close` / `gh pr close`; inert for every non-auditor identity)
- *
- * Plus, on the PostToolUse event:
- *   - `check-gh-attribution.sh` (groundnuty/macf#489 — after a `gh`-write
- *     op, reads the resource back from GitHub and warns (`exit 2`) if it
- *     was authored by the operator's user account instead of the bot;
- *     the result-invariant backstop to the #140 PreToolUse token check)
- *
- * And, on the UserPromptSubmit event:
- *   - `emit-turn-receipt.sh` (groundnuty/macf#444 — async turn-ack span)
- *   - `check-channel-alive.sh` (groundnuty/macf#734 — throttled mTLS liveness
- *     probe against this agent's OWN channel-server `/health`; warns LOUDLY
- *     when it doesn't respond. Shares the script with the SessionStart entry
- *     below; the script self-throttles so this doesn't fire a real probe on
- *     every turn)
- *
- * And, on the PreCompact event:
- *   - `harvest-reflection.sh` (groundnuty/macf#500 — DR-026 F2; at compaction,
- *     harvests the agent's staged reflection into a local JSONL ledger. Matcher-
- *     less + NON-BLOCKING; operator-authored PreCompact hooks are preserved)
- *
- * And, on the SessionStart event:
+ *     — PreToolUse, matcher `Bash`.
+ *   - `emit-turn-receipt.sh` (groundnuty/macf#444 — async turn-ack span) —
+ *     UserPromptSubmit, matcher-less, `async: true`.
  *   - `check-channels-enabled.sh` (groundnuty/macf#633 — reads the macf-agent
  *     MCP server's startup log back and warns LOUDLY into the agent's context
  *     when channel notifications are OFF, the result-invariant backstop to the
- *     macf#632 claude.sh flag. Matcher-less + NON-BLOCKING; operator-authored
- *     SessionStart hooks are preserved)
- *   - `check-channel-alive.sh` (groundnuty/macf#734 — unthrottled on
- *     SessionStart, since a fresh session has no reason to trust a stale
- *     throttle stamp from a prior session; probes this agent's own
- *     channel-server `/health` and warns LOUDLY if it's unreachable — the
- *     detect-half check-channels-enabled.sh doesn't cover, see its own header
- *     comment for the config-flag-vs-process-liveness distinction)
+ *     macf#632 claude.sh flag) — SessionStart, matcher-less, NON-BLOCKING.
+ *
+ * **DR-039 Decision 2 single-sourced the REST of the load-bearing hook set
+ * INTO THE PLUGIN's `hooks/hooks.json`** — this function no longer writes:
+ *   - `check-gh-token.sh` / `check-mention-routing.sh` / `check-lgtm-gate.sh` /
+ *     `check-close-keyword.sh` (previously PreToolUse, matcher `Bash`)
+ *   - `check-gh-attribution.sh` (previously PostToolUse, matcher `Bash`)
+ *   - `harvest-reflection.sh` (previously PreCompact, matcher-less)
+ *   - `check-channel-alive.sh` (previously SessionStart + UserPromptSubmit,
+ *     matcher-less)
+ *
+ * Those 7 hooks are now REGISTERED by the plugin, delivered to every
+ * workspace via `macf init` / `macf update`'s always-load-the-full-plugin
+ * fetch (`fetchPluginToWorkspace`) — no `macf init`/`update` code change was
+ * needed there, since the CLI never produced a stripped/minimal plugin
+ * variant to begin with (that variant — "plugin-cs" — was always a
+ * hand-authored substrate relic, never CLI-generated). Their SCRIPTS stay
+ * path-invoked at `.claude/scripts/*.sh` per Decision 2's "scripts stay
+ * path-invoked; registration single-sources" split (workbench-maintainable:
+ * a substrate agent can still evolve a guard's behavior by editing the
+ * script, and the change goes live on the next event with no relaunch).
+ * `macf doctor`'s DR-039 assertion (`checkLoadBearingHooks`) verifies
+ * presence across the UNION of settings.json + the plugin's hooks.json, so
+ * this migration is invisible to that check — only the delivery channel
+ * moved, not the doctor's expectation.
+ *
+ * **Migration cleanup is idempotent and atomic with the switch:** the
+ * preserve-then-replace discipline below still recognizes any of the 7
+ * migrated filenames (via `MACF_HOOK_FILENAMES` / `isMacfManagedCommand`) and
+ * STRIPS a legacy settings.json copy left over from a pre-migration CLI
+ * version — it just does not re-add them. So a single `macf update` run both
+ * starts delivering the hook via the plugin (already true for any init'd
+ * workspace) AND removes the old settings.json duplicate in the same pass —
+ * there is no window where a workspace has both (doubling) or neither (gap).
+ * Re-running against an already-migrated workspace is a clean no-op for the
+ * migrated events (nothing to strip, nothing to add).
+ *
+ * Operator-authored (non-MACF) hook entries on every event are ALWAYS
+ * preserved verbatim — the discriminator is `isMacfManagedCommand`, which
+ * matches by exact basename against `MACF_HOOK_FILENAMES`, never by "clear
+ * everything in this event's array."
  *
  * Creates the `.claude/` directory and the file if either is missing.
  * Idempotent: repeated calls don't duplicate entries.
- *
- * The PreToolUse + PostToolUse hooks share `matcher: "Bash"` because Claude
- * Code's matcher field gates which tool fires the hook; the wrapped-command
- * detection (gh vs git-push for token, gh issue/pr comment for routing,
- * gh pr merge for LGTM, close-keyword for auto-close, the auditor-role
- * acting-verb gate, gh-write for attribution) happens INSIDE each script.
- * Distinct entries per script keep them independently upgradeable +
- * diagnosable in `gh issue list` style settings audits.
  */
 export function installGhTokenHook(workspaceDir: string): void {
   const absDir = resolve(workspaceDir);
@@ -995,73 +1044,35 @@ export function installGhTokenHook(workspaceDir: string): void {
   const preCompact = hooks.PreCompact ?? [];
   const sessionStart = hooks.SessionStart ?? [];
 
-  // Drop any prior MACF-managed entries (any hook file in
-  // MACF_HOOK_FILENAMES) so we can replace them cleanly — guards against
-  // stale flags from older CLI versions + handles renames/additions to
-  // the canonical hook set. Match by path-end equality so an
-  // operator-authored file with a similar-but-distinct name
-  // (e.g. `my-check-gh-token.sh-helper.sh`) doesn't get misclassified
-  // as ours and accidentally clobbered.
+  // PreToolUse: only check-auditor-never-acts.sh remains hand-wired. The
+  // preserve-filter (matching by MACF_HOOK_FILENAMES basename) still strips a
+  // legacy settings.json copy of check-gh-token / check-mention-routing /
+  // check-lgtm-gate / check-close-keyword (now plugin-owned, DR-039 Decision
+  // 2) on refresh; operator-authored PreToolUse hooks are untouched.
   const preserved = preToolUse.filter(
     (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
   );
-
   const macfEntries: readonly HookEntry[] = [
-    {
-      matcher: 'Bash',
-      hooks: [{ type: 'command', command: MACF_HOOK_COMMAND }],
-    },
-    {
-      matcher: 'Bash',
-      hooks: [{ type: 'command', command: MACF_MENTION_HOOK_COMMAND }],
-    },
-    {
-      matcher: 'Bash',
-      hooks: [{ type: 'command', command: MACF_LGTM_HOOK_COMMAND }],
-    },
-    {
-      matcher: 'Bash',
-      hooks: [{ type: 'command', command: MACF_CLOSE_HOOK_COMMAND }],
-    },
     {
       matcher: 'Bash',
       hooks: [{ type: 'command', command: MACF_AUDITOR_HOOK_COMMAND }],
     },
   ];
 
-  // PostToolUse: the attribution-result hook (groundnuty/macf#489). Same
-  // preserve-then-replace discipline as PreToolUse above — drop any prior
-  // MACF-managed PostToolUse entry (by MACF_HOOK_FILENAMES basename) and
-  // re-add ours, leaving operator-authored PostToolUse hooks intact. It runs
-  // on the `PostToolUse` event (NOT PreToolUse) because it inspects the tool's
-  // OUTPUT — the resource is already written; the hook reads it back from
-  // GitHub and warns (`exit 2`) on a user-attributed write.
+  // PostToolUse: check-gh-attribution.sh moved to the plugin (DR-039 Decision
+  // 2) — no MACF-managed PostToolUse hook remains hand-wired here. The
+  // preserve-filter still strips a legacy settings.json copy on refresh;
+  // operator-authored PostToolUse hooks are untouched.
   const preservedPost = postToolUse.filter(
     (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
   );
-  const macfPostEntries: readonly HookEntry[] = [
-    {
-      matcher: 'Bash',
-      hooks: [{ type: 'command', command: MACF_ATTRIBUTION_HOOK_COMMAND }],
-    },
-  ];
+  const macfPostEntries: readonly HookEntry[] = [];
 
-  // UserPromptSubmit: the turn-ack receipt hook (groundnuty/macf#444). Same
-  // preserve-then-replace discipline as PreToolUse above — drop any prior
-  // MACF-managed UserPromptSubmit entry (by MACF_HOOK_FILENAMES basename) and
-  // re-add ours, leaving operator-authored UserPromptSubmit hooks intact. No
-  // `matcher` (UserPromptSubmit isn't tool-gated); `async: true` so it never
-  // adds turn latency.
-  //
-  // Plus the channel-alive liveness guard (groundnuty/macf#734) — deliberately
-  // NOT `async: true`, unlike the turn-receipt hook above. Its whole value is
-  // getting a LOUD warning INTO the agent's context on the turn where it
-  // fires; an async hook's stdout is fire-and-forget and isn't reliably
-  // injected in time to matter for the current turn. The script's own
-  // throttle (~once per 5 min; see check-channel-alive.sh) bounds how often a
-  // turn actually pays the synchronous mTLS-probe cost (curl `-m 5` worst
-  // case) — the same accepted trade-off as check-channels-enabled.sh's
-  // synchronous (non-async) SessionStart poll (up to ~12s worst case) below.
+  // UserPromptSubmit: emit-turn-receipt.sh remains hand-wired (async, no
+  // matcher). check-channel-alive.sh moved to the plugin (DR-039 Decision 2),
+  // registered there on BOTH SessionStart (unthrottled) and UserPromptSubmit
+  // (throttled) — the same dual-registration shape this function used to
+  // install directly.
   const preservedUps = userPromptSubmit.filter(
     (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
   );
@@ -1069,50 +1080,27 @@ export function installGhTokenHook(workspaceDir: string): void {
     {
       hooks: [{ type: 'command', command: MACF_TURN_RECEIPT_HOOK_COMMAND, async: true }],
     },
-    {
-      hooks: [{ type: 'command', command: MACF_CHANNEL_ALIVE_HOOK_COMMAND }],
-    },
   ];
 
-  // PreCompact: the reflection-harvest hook (groundnuty/macf#500, DR-026 F2).
-  // Same preserve-then-replace discipline — drop any prior MACF-managed
-  // PreCompact entry (by MACF_HOOK_FILENAMES basename) and re-add ours, leaving
-  // operator-authored PreCompact hooks intact (e.g. the plugin's
-  // checkpoint_to_memory mcp_tool entry lives in the plugin hooks.json, not
-  // here; an operator's own settings.json PreCompact bash hook is preserved).
-  // Matcher-less (PreCompact isn't tool-gated). NON-BLOCKING by script contract
-  // (always exit 0) — so no `async` flag is needed; it can't delay compaction.
+  // PreCompact: harvest-reflection.sh moved to the plugin (DR-039 Decision 2)
+  // — no MACF-managed PreCompact hook remains hand-wired here (the plugin's
+  // checkpoint_to_memory + notify_peer mcp_tool entries AND harvest-reflection
+  // now all live together in the plugin's hooks.json). An operator's own
+  // settings.json PreCompact bash hook is preserved.
   const preservedCompact = preCompact.filter(
     (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
   );
-  const macfCompactEntries: readonly HookEntry[] = [
-    {
-      hooks: [{ type: 'command', command: MACF_REFLECTION_HOOK_COMMAND }],
-    },
-  ];
+  const macfCompactEntries: readonly HookEntry[] = [];
 
-  // SessionStart: the channels-enabled guard (groundnuty/macf#633). Same
-  // preserve-then-replace discipline — drop any prior MACF-managed SessionStart
-  // entry (by MACF_HOOK_FILENAMES basename) and re-add ours, leaving
-  // operator-authored SessionStart hooks intact. Matcher-less (SessionStart
-  // isn't tool-gated). NON-BLOCKING by script contract (always exit 0) — so no
-  // `async` flag is needed; it can't delay session start.
-  //
-  // Plus the channel-alive liveness guard (groundnuty/macf#734) — SAME script
-  // as the UserPromptSubmit entry above, registered a second time on
-  // SessionStart so a fresh session always probes immediately (bypassing the
-  // script's own throttle, which only applies to non-SessionStart events) and
-  // stamps the throttle file so the UserPromptSubmit calls that follow inherit
-  // the fresh window.
+  // SessionStart: check-channels-enabled.sh remains hand-wired (matcher-less,
+  // NON-BLOCKING). check-channel-alive.sh moved to the plugin (DR-039
+  // Decision 2) — see the UserPromptSubmit comment above for its new home.
   const preservedSession = sessionStart.filter(
     (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
   );
   const macfSessionEntries: readonly HookEntry[] = [
     {
       hooks: [{ type: 'command', command: MACF_CHANNELS_HOOK_COMMAND }],
-    },
-    {
-      hooks: [{ type: 'command', command: MACF_CHANNEL_ALIVE_HOOK_COMMAND }],
     },
   ];
 

@@ -1002,11 +1002,18 @@ export function resolvePluginDirFromClaudeSh(workspaceDir: string): PluginDirRes
       detail: `could not read claude.sh: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
+  // Match double-quoted, single-quoted, OR bare/unquoted forms — a
+  // hand-authored launcher (macf#739 follow-up hardening, science-agent
+  // review) may use `--plugin-dir "$X"` (canonical), `--plugin-dir '$X'`, or
+  // `--plugin-dir $X` (unquoted var / bare path, no embedded whitespace).
+  // Double-quote checked first so the canonical form's exact prior behavior
+  // is unchanged; the unquoted `(\S+)` alternative is a catch-all fallback
+  // that only matches when neither quote form applies at that position.
   const found = new Set<string>();
-  const re = /--plugin-dir\s+"([^"]+)"/g;
+  const re = /--plugin-dir\s+(?:"([^"]+)"|'([^']+)'|(\S+))/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(content)) !== null) {
-    const captured = m[1];
+    const captured = m[1] ?? m[2] ?? m[3];
     if (captured !== undefined) found.add(captured);
   }
   if (found.size === 0) {
