@@ -20,6 +20,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { readHooksMapEntries, resolvePluginDirFromClaudeSh } from './plugin-hook-resolver.js';
 
 /**
  * The command path written into settings.json. Uses
@@ -268,6 +269,41 @@ const MACF_HOOK_FILENAMES: readonly string[] = [
 ];
 
 /**
+ * The subset of `MACF_HOOK_FILENAMES` DR-039 Decision 2 single-sourced into
+ * the plugin's `hooks/hooks.json` — the 7 filenames `installGhTokenHook` no
+ * longer RE-ADDS. This is the exact set the self-guard below
+ * (`canPluginDeliverMigratedHooks`) checks for in the loaded plugin's own
+ * `hooks.json` before permitting a strip of a legacy settings.json copy.
+ * Kept as its own constant (rather than re-deriving from MACF_HOOK_FILENAMES)
+ * because the 3 hand-wired filenames (check-auditor-never-acts /
+ * emit-turn-receipt / check-channels-enabled) are unconditionally
+ * stripped-then-replaced regardless of plugin-delivery capability — only
+ * these 7 are gated.
+ */
+const MIGRATED_HOOK_FILENAMES: readonly string[] = [
+  'check-gh-token.sh',
+  'check-mention-routing.sh',
+  'check-lgtm-gate.sh',
+  'check-close-keyword.sh',
+  'check-gh-attribution.sh',
+  'harvest-reflection.sh',
+  'check-channel-alive.sh',
+];
+
+/**
+ * Extract the program's basename from a hook command string — the first
+ * whitespace-delimited token, path-stripped. `/a/b/check-gh-token.sh --v2`
+ * → `check-gh-token.sh`. Shared by `isMacfManagedCommand` (full 10-name set)
+ * and `isMigratedHookCommand` (the 7-name migrated subset) so both matchers
+ * apply the identical path-end-equality discriminator.
+ */
+function basenameOfCommand(command: string): string {
+  const program = command.trim().split(/\s+/)[0] ?? '';
+  const slash = program.lastIndexOf('/');
+  return slash >= 0 ? program.slice(slash + 1) : program;
+}
+
+/**
  * True iff the command string represents one of our managed hooks — i.e.
  * the command invokes a file whose basename equals any MACF_HOOK_FILENAMES
  * entry (ignoring any trailing flags/arguments). Defensive against
@@ -275,12 +311,91 @@ const MACF_HOOK_FILENAMES: readonly string[] = [
  * substring (e.g. `./my-check-gh-token.sh-wrapper --flag`).
  */
 function isMacfManagedCommand(command: string): boolean {
-  // Take the program path (first whitespace-delimited token), then
-  // extract its basename. `/a/b/check-gh-token.sh --v2` → `check-gh-token.sh`.
-  const program = command.trim().split(/\s+/)[0] ?? '';
-  const slash = program.lastIndexOf('/');
-  const basename = slash >= 0 ? program.slice(slash + 1) : program;
-  return MACF_HOOK_FILENAMES.includes(basename);
+  return MACF_HOOK_FILENAMES.includes(basenameOfCommand(command));
+}
+
+/**
+ * True iff the command string represents one of the 7 DR-039 Decision 2
+ * migrated hooks (the subset of MACF_HOOK_FILENAMES single-sourced into the
+ * plugin's hooks.json). Used by the self-guard to distinguish "strip only if
+ * the plugin can deliver" entries from the 3 hand-wired hooks that are
+ * always stripped-then-replaced unconditionally.
+ */
+function isMigratedHookCommand(command: string): boolean {
+  return MIGRATED_HOOK_FILENAMES.includes(basenameOfCommand(command));
+}
+
+/**
+ * Result of `canPluginDeliverMigratedHooks` — whether the EFFECTIVE loaded
+ * plugin (per `resolvePluginDirFromClaudeSh`) registers the full DR-039
+ * Decision 2 migrated hook set, plus a human-readable reason.
+ */
+export interface PluginDeliveryCheck {
+  readonly canDeliver: boolean;
+  readonly detail: string;
+}
+
+/**
+ * DR-039 Amendment B self-guard (groundnuty/macf#743 science-agent review):
+ * before `installGhTokenHook` strips a now-plugin-owned hook out of
+ * settings.json, verify the POSITIVE invariant that the effective loaded
+ * plugin can actually deliver the migrated hook set — don't strip on the
+ * assumption that "the migration says the plugin owns it now" is always
+ * true for THIS workspace's launcher. Mirrors the DR-037 Amendment B lesson
+ * (verify "can deliver" BEFORE removing a fallback) applied here to the
+ * DR-039 Decision 2 hook-strip instead of the fleet-reconcile path. Without
+ * this guard, a hooks-less-plugin launcher (e.g. devops's `plugin-cs` relic
+ * — a `--plugin-dir` pointing at a stripped/minimal plugin variant with no
+ * `hooks/hooks.json` entries) gets its hand-wired settings.json copies
+ * stripped on the next `macf update`, landing in a TOTAL hook-loss gap:
+ * neither settings.json nor the plugin delivers the guard.
+ *
+ * Reuses the SAME plugin-dir resolver `macf doctor`'s DR-039 Decision 1
+ * assertion uses (`resolvePluginDirFromClaudeSh`, extracted to
+ * `plugin-hook-resolver.ts` precisely so this module and `doctor.ts` share
+ * one resolver and can never silently disagree about which plugin is "the
+ * loaded one"). Deliberately inspects ONLY the plugin's own `hooks.json` —
+ * NOT the settings.json union `doctor.ts`'s `getEffectiveHookConfig`
+ * computes — because settings.json is exactly what we're about to strip;
+ * folding it into "can deliver" would be circular (a not-yet-stripped
+ * legacy copy would count as "the plugin can deliver" even when it can't).
+ *
+ * Fail-safe: any ambiguity (claude.sh absent/unreadable, no --plugin-dir,
+ * multiple distinct --plugin-dir values) is treated as "cannot confirm
+ * delivery" → `canDeliver: false` → the caller defers the strip. This is
+ * the OPPOSITE default from `doctor.ts`'s own "err toward not-false-alarming"
+ * fallback-to-default posture (`getEffectiveHookConfig` checks the default
+ * `.macf/plugin` location when the launcher is ambiguous, to avoid a false
+ * WARN) — here the cost of erring the other way is a total hook-loss gap
+ * (a hooks-less plugin PLUS a stripped settings.json), so ambiguity must
+ * resolve toward KEEPING the hand-wired copies, never toward assuming a
+ * default plugin dir is fine.
+ */
+export function canPluginDeliverMigratedHooks(workspaceDir: string): PluginDeliveryCheck {
+  const resolution = resolvePluginDirFromClaudeSh(workspaceDir);
+  if (!resolution.determinable || !resolution.dir) {
+    return {
+      canDeliver: false,
+      detail:
+        `plugin dir not cleanly determinable from claude.sh (${resolution.detail}) — ` +
+        'cannot confirm the effective plugin delivers the migrated hook set',
+    };
+  }
+  const hooksJsonPath = join(resolution.dir, 'hooks', 'hooks.json');
+  const entries = readHooksMapEntries(hooksJsonPath);
+  const missing = MIGRATED_HOOK_FILENAMES.filter(
+    (filename) => !entries.some((e) => e.kind === 'command' && e.value.includes(filename)),
+  );
+  if (missing.length > 0) {
+    return {
+      canDeliver: false,
+      detail: `loaded plugin (${resolution.dir}) does not register: ${missing.join(', ')}`,
+    };
+  }
+  return {
+    canDeliver: true,
+    detail: `loaded plugin (${resolution.dir}) registers the full migrated hook set`,
+  };
 }
 
 interface HookCommand {
@@ -1026,6 +1141,20 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
  * matches by exact basename against `MACF_HOOK_FILENAMES`, never by "clear
  * everything in this event's array."
  *
+ * **DR-039 Amendment B self-guard (groundnuty/macf#743 review):** the strip
+ * of the 7 migrated filenames above is itself GATED on
+ * `canPluginDeliverMigratedHooks` — see that function's doc comment. When the
+ * effective loaded plugin cannot deliver the migrated set (a hooks-less
+ * plugin variant, an ambiguous/unresolvable `--plugin-dir`), any EXISTING
+ * legacy settings.json copies of those 7 filenames are left in place instead
+ * of being stripped, and a `console.warn` surfaces the deferral. This does
+ * NOT install fresh copies of the 7 on a brand-new workspace that never had
+ * them (that would re-litigate DR-039 Decision 2 itself) — it only prevents
+ * stripping an EXISTING hand-wired fallback into a gap. The 3 still-hand-wired
+ * hooks (auditor / turn-receipt / channels-enabled) are unaffected by the
+ * guard — they are always stripped-then-replaced unconditionally, same as
+ * before this amendment.
+ *
  * Creates the `.claude/` directory and the file if either is missing.
  * Idempotent: repeated calls don't duplicate entries.
  */
@@ -1044,13 +1173,39 @@ export function installGhTokenHook(workspaceDir: string): void {
   const preCompact = hooks.PreCompact ?? [];
   const sessionStart = hooks.SessionStart ?? [];
 
-  // PreToolUse: only check-auditor-never-acts.sh remains hand-wired. The
-  // preserve-filter (matching by MACF_HOOK_FILENAMES basename) still strips a
-  // legacy settings.json copy of check-gh-token / check-mention-routing /
-  // check-lgtm-gate / check-close-keyword (now plugin-owned, DR-039 Decision
-  // 2) on refresh; operator-authored PreToolUse hooks are untouched.
+  // DR-039 Amendment B self-guard: only strip a migrated-hook entry (one of
+  // MIGRATED_HOOK_FILENAMES) when the effective loaded plugin can actually
+  // deliver the full set. The 3 hand-wired filenames are always eligible for
+  // strip-then-replace regardless of plugin-delivery capability.
+  const delivery = canPluginDeliverMigratedHooks(workspaceDir);
+  const shouldStrip = (command: string): boolean => {
+    if (!isMacfManagedCommand(command)) return false;
+    if (isMigratedHookCommand(command)) return delivery.canDeliver;
+    return true;
+  };
+  // Only warn when there was something ACTUALLY deferred (an existing
+  // migrated-hook entry kept in place) — a fresh/never-hand-wired workspace
+  // has nothing to defer, so staying silent there avoids spamming every
+  // `macf init`/`update` run on a workspace that will never carry these.
+  const hasDeferredEntry = [...preToolUse, ...postToolUse, ...userPromptSubmit, ...preCompact, ...sessionStart].some(
+    (entry) => entry.hooks.some((h) => isMigratedHookCommand(h.command)),
+  );
+  if (!delivery.canDeliver && hasDeferredEntry) {
+    console.warn(
+      "macf: deferring hook-strip: effective plugin can't deliver the load-bearing set — " +
+        'keeping hand-wired copies; fix the launcher to load the full .macf/plugin, see DR-039 ' +
+        `(${delivery.detail}).`,
+    );
+  }
+
+  // PreToolUse: check-auditor-never-acts.sh always remains hand-wired. The
+  // preserve-filter (matching by MACF_HOOK_FILENAMES basename, gated per
+  // shouldStrip above) strips a legacy settings.json copy of check-gh-token /
+  // check-mention-routing / check-lgtm-gate / check-close-keyword (now
+  // plugin-owned, DR-039 Decision 2) on refresh ONLY when the plugin can
+  // deliver them; operator-authored PreToolUse hooks are untouched either way.
   const preserved = preToolUse.filter(
-    (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
+    (entry) => !entry.hooks.some((h) => shouldStrip(h.command)),
   );
   const macfEntries: readonly HookEntry[] = [
     {
@@ -1061,10 +1216,11 @@ export function installGhTokenHook(workspaceDir: string): void {
 
   // PostToolUse: check-gh-attribution.sh moved to the plugin (DR-039 Decision
   // 2) — no MACF-managed PostToolUse hook remains hand-wired here. The
-  // preserve-filter still strips a legacy settings.json copy on refresh;
-  // operator-authored PostToolUse hooks are untouched.
+  // preserve-filter strips a legacy settings.json copy on refresh only when
+  // the plugin can deliver it (self-guard); operator-authored PostToolUse
+  // hooks are untouched either way.
   const preservedPost = postToolUse.filter(
-    (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
+    (entry) => !entry.hooks.some((h) => shouldStrip(h.command)),
   );
   const macfPostEntries: readonly HookEntry[] = [];
 
@@ -1072,9 +1228,9 @@ export function installGhTokenHook(workspaceDir: string): void {
   // matcher). check-channel-alive.sh moved to the plugin (DR-039 Decision 2),
   // registered there on BOTH SessionStart (unthrottled) and UserPromptSubmit
   // (throttled) — the same dual-registration shape this function used to
-  // install directly.
+  // install directly. Strip is gated per the self-guard.
   const preservedUps = userPromptSubmit.filter(
-    (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
+    (entry) => !entry.hooks.some((h) => shouldStrip(h.command)),
   );
   const macfUpsEntries: readonly HookEntry[] = [
     {
@@ -1086,17 +1242,26 @@ export function installGhTokenHook(workspaceDir: string): void {
   // — no MACF-managed PreCompact hook remains hand-wired here (the plugin's
   // checkpoint_to_memory + notify_peer mcp_tool entries AND harvest-reflection
   // now all live together in the plugin's hooks.json). An operator's own
-  // settings.json PreCompact bash hook is preserved.
+  // settings.json PreCompact bash hook is preserved. Strip is gated per the
+  // self-guard.
   const preservedCompact = preCompact.filter(
-    (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
+    (entry) => !entry.hooks.some((h) => shouldStrip(h.command)),
   );
   const macfCompactEntries: readonly HookEntry[] = [];
 
   // SessionStart: check-channels-enabled.sh remains hand-wired (matcher-less,
   // NON-BLOCKING). check-channel-alive.sh moved to the plugin (DR-039
-  // Decision 2) — see the UserPromptSubmit comment above for its new home.
+  // Decision 2) — see the UserPromptSubmit comment above for its new home;
+  // strip is gated per the self-guard. Intent-note (science-agent forward
+  // note, #743 review): check-channels-enabled.sh (#633) stays hand-wired as
+  // the REACTIVE detect-half (warns after a push was attempted-and-skipped),
+  // while check-channel-alive.sh (#734) is plugin-owned as the PROACTIVE
+  // liveness probe (checks the channel-server process is alive right now).
+  // The asymmetry — one hand-wired, one plugin-owned — is intentional for
+  // now; folding both onto the same delivery channel is a separate,
+  // not-yet-decided DR-039 follow-up, not something this amendment resolves.
   const preservedSession = sessionStart.filter(
-    (entry) => !entry.hooks.some((h) => isMacfManagedCommand(h.command)),
+    (entry) => !entry.hooks.some((h) => shouldStrip(h.command)),
   );
   const macfSessionEntries: readonly HookEntry[] = [
     {

@@ -4,11 +4,128 @@
  * entry for `check-gh-token.sh` without clobbering operator-authored
  * settings (per #140).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, MACF_CHANNEL_ALIVE_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, MACF_CHANNEL_ALIVE_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny, canPluginDeliverMigratedHooks } from '../../src/cli/settings-writer.js';
+
+// ── Shared fixtures for the DR-039 Amendment B self-guard (macf#743 review) ──
+//
+// `canPluginDeliverMigratedHooks` resolves the plugin dir from `claude.sh`'s
+// `--plugin-dir` flag, then reads that dir's `hooks/hooks.json`. These
+// helpers set up the two shapes the self-guard discriminates between.
+
+const MIGRATED_HOOK_BASENAMES = [
+  'check-gh-token.sh',
+  'check-mention-routing.sh',
+  'check-lgtm-gate.sh',
+  'check-close-keyword.sh',
+  'check-gh-attribution.sh',
+  'harvest-reflection.sh',
+  'check-channel-alive.sh',
+];
+
+/** Write a `claude.sh` whose `--plugin-dir` resolves (via $SCRIPT_DIR) to `<root>/.macf/plugin`. */
+function writeClaudeShPointingAtDotMacfPlugin(root: string): void {
+  writeFileSync(
+    join(root, 'claude.sh'),
+    [
+      '#!/bin/bash',
+      'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+      'exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"',
+      '',
+    ].join('\n'),
+  );
+}
+
+/**
+ * Full-plugin fixture — a `.macf/plugin/hooks/hooks.json` that registers all
+ * 7 DR-039 Decision 2 migrated hooks. Represents a canonical, up-to-date
+ * launcher: `canPluginDeliverMigratedHooks` should report `canDeliver: true`.
+ */
+function setupDeliveringPlugin(root: string): void {
+  writeClaudeShPointingAtDotMacfPlugin(root);
+  const hooksDir = join(root, '.macf', 'plugin', 'hooks');
+  mkdirSync(hooksDir, { recursive: true });
+  writeFileSync(
+    join(hooksDir, 'hooks.json'),
+    JSON.stringify(
+      {
+        hooks: {
+          PreToolUse: [
+            { matcher: 'Bash', hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-gh-token.sh' }] },
+            { matcher: 'Bash', hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-mention-routing.sh' }] },
+            { matcher: 'Bash', hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-lgtm-gate.sh' }] },
+            { matcher: 'Bash', hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-close-keyword.sh' }] },
+          ],
+          PostToolUse: [
+            { matcher: 'Bash', hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-gh-attribution.sh' }] },
+          ],
+          PreCompact: [
+            { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/harvest-reflection.sh' }] },
+          ],
+          SessionStart: [
+            { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-channel-alive.sh' }] },
+          ],
+          UserPromptSubmit: [
+            { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-channel-alive.sh' }] },
+          ],
+        },
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+/**
+ * Hooks-less-plugin fixture (the `plugin-cs` shape) — a `.macf/plugin/hooks/`
+ * dir whose `hooks.json` is EMPTY (mcpServers-only plugin variant, no hook
+ * registrations at all). `canPluginDeliverMigratedHooks` should report
+ * `canDeliver: false`.
+ */
+function setupHooksLessPlugin(root: string): void {
+  writeClaudeShPointingAtDotMacfPlugin(root);
+  const hooksDir = join(root, '.macf', 'plugin', 'hooks');
+  mkdirSync(hooksDir, { recursive: true });
+  writeFileSync(join(hooksDir, 'hooks.json'), JSON.stringify({ hooks: {} }, null, 2));
+}
+
+/** Write a legacy hand-wired copy of all 7 migrated hooks into settings.json. */
+function writeLegacyMigratedHooksSettings(settingsPath: string): void {
+  mkdirSync(join(settingsPath, '..'), { recursive: true });
+  writeFileSync(
+    settingsPath,
+    JSON.stringify(
+      {
+        hooks: {
+          PreToolUse: [
+            { matcher: 'Bash', hooks: [{ type: 'command', command: '.claude/scripts/check-gh-token.sh' }] },
+            { matcher: 'Bash', hooks: [{ type: 'command', command: '.claude/scripts/check-mention-routing.sh' }] },
+            { matcher: 'Bash', hooks: [{ type: 'command', command: '.claude/scripts/check-lgtm-gate.sh' }] },
+            { matcher: 'Bash', hooks: [{ type: 'command', command: '.claude/scripts/check-close-keyword.sh' }] },
+          ],
+          PostToolUse: [
+            { matcher: 'Bash', hooks: [{ type: 'command', command: '.claude/scripts/check-gh-attribution.sh' }] },
+          ],
+          PreCompact: [{ hooks: [{ type: 'command', command: '.claude/scripts/harvest-reflection.sh' }] }],
+          SessionStart: [{ hooks: [{ type: 'command', command: '.claude/scripts/check-channel-alive.sh' }] }],
+          UserPromptSubmit: [{ hooks: [{ type: 'command', command: '.claude/scripts/check-channel-alive.sh' }] }],
+        },
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+function allHookCommands(settingsJson: {
+  hooks?: Record<string, ReadonlyArray<{ hooks: ReadonlyArray<{ command: string }> }>>;
+}): string[] {
+  const hooks = settingsJson.hooks ?? {};
+  return Object.values(hooks).flatMap((entries) => entries.flatMap((e) => e.hooks.map((h) => h.command)));
+}
 
 describe('installGhTokenHook', () => {
   let tmpRoot: string;
@@ -337,6 +454,13 @@ describe('installGhTokenHook — DR-039 Decision 2 migration cleanup', () => {
   beforeEach(() => {
     tmpRoot = mkdtempSync(join(tmpdir(), 'macf-settings-migration-test-'));
     settingsPath = join(tmpRoot, '.claude', 'settings.json');
+    // DR-039 Amendment B self-guard (macf#743 review): the strip these tests
+    // assert on is now GATED on the effective plugin being able to deliver
+    // the migrated set. Set up a full-delivering plugin fixture so these
+    // pre-existing migration-cleanup assertions keep exercising the STRIP
+    // path unchanged; the self-guard's DEFER path gets its own describe
+    // block below ("DR-039 Amendment B self-guard").
+    setupDeliveringPlugin(tmpRoot);
   });
 
   afterEach(() => {
@@ -463,6 +587,195 @@ describe('installGhTokenHook — DR-039 Decision 2 migration cleanup', () => {
     const cmds = s.hooks.PreToolUse.flatMap((e: { hooks: { command: string }[] }) => e.hooks.map((h) => h.command));
     expect(cmds.some((c: string) => c.includes('check-gh-token.sh'))).toBe(false);
     expect(cmds).toContain('echo edited');
+  });
+});
+
+// ── DR-039 Amendment B self-guard (groundnuty/macf#743 science-agent review) ──
+//
+// `installGhTokenHook`'s strip of the 7 migrated hooks must DEFER (not
+// strip) when the effective loaded plugin CANNOT deliver the load-bearing
+// set — otherwise a hooks-less-plugin launcher (e.g. devops's `plugin-cs`
+// relic) has its hand-wired settings.json fallback stripped into a
+// total-hook-loss gap. See `canPluginDeliverMigratedHooks` in
+// `settings-writer.ts` for the mechanism + the DR-037-Amendment-B-lesson
+// framing (verify "can deliver" BEFORE removing a fallback).
+describe('installGhTokenHook — DR-039 Amendment B self-guard (macf#743 review)', () => {
+  let tmpRoot: string;
+  let settingsPath: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'macf-settings-selfguard-test-'));
+    settingsPath = join(tmpRoot, '.claude', 'settings.json');
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  describe('canPluginDeliverMigratedHooks', () => {
+    it('reports canDeliver: false when claude.sh is absent (unresolvable)', () => {
+      const result = canPluginDeliverMigratedHooks(tmpRoot);
+      expect(result.canDeliver).toBe(false);
+      expect(result.detail).toMatch(/not cleanly determinable/i);
+    });
+
+    it('reports canDeliver: false for a hooks-less plugin (plugin-cs shape)', () => {
+      setupHooksLessPlugin(tmpRoot);
+      const result = canPluginDeliverMigratedHooks(tmpRoot);
+      expect(result.canDeliver).toBe(false);
+      expect(result.detail).toContain('does not register');
+      for (const name of MIGRATED_HOOK_BASENAMES) {
+        expect(result.detail).toContain(name);
+      }
+    });
+
+    it('reports canDeliver: true for a full plugin that registers all 7 migrated hooks', () => {
+      setupDeliveringPlugin(tmpRoot);
+      const result = canPluginDeliverMigratedHooks(tmpRoot);
+      expect(result.canDeliver).toBe(true);
+      expect(result.detail).toContain('registers the full migrated hook set');
+    });
+
+    it('reports canDeliver: false when claude.sh has multiple distinct --plugin-dir values (ambiguous)', () => {
+      writeFileSync(
+        join(tmpRoot, 'claude.sh'),
+        '#!/bin/bash\nclaude --plugin-dir "/a/plugin" "$@"\nclaude --plugin-dir "/b/plugin" "$@"\n',
+      );
+      const result = canPluginDeliverMigratedHooks(tmpRoot);
+      expect(result.canDeliver).toBe(false);
+      expect(result.detail).toMatch(/not cleanly determinable/i);
+    });
+  });
+
+  it('DEFERS the strip when the plugin is hooks-less — the 7 hand-wired copies SURVIVE', () => {
+    writeLegacyMigratedHooksSettings(settingsPath);
+    setupHooksLessPlugin(tmpRoot);
+
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const cmds = allHookCommands(s);
+    for (const name of MIGRATED_HOOK_BASENAMES) {
+      expect(cmds.some((c) => c.includes(name)), `expected ${name} to survive (deferred, not stripped)`).toBe(true);
+    }
+    // The always-hand-wired 3 are still present too.
+    expect(cmds).toContain(MACF_AUDITOR_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_TURN_RECEIPT_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
+  });
+
+  it('DEFERS the strip when claude.sh is absent (ambiguous/unresolvable) — legacy copies SURVIVE', () => {
+    // No claude.sh at all — resolvePluginDirFromClaudeSh is undeterminable.
+    writeLegacyMigratedHooksSettings(settingsPath);
+
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const cmds = allHookCommands(s);
+    for (const name of MIGRATED_HOOK_BASENAMES) {
+      expect(cmds.some((c) => c.includes(name)), `expected ${name} to survive (deferred, not stripped)`).toBe(true);
+    }
+  });
+
+  it('STRIPS the legacy copies when the plugin CAN deliver the full migrated set', () => {
+    writeLegacyMigratedHooksSettings(settingsPath);
+    setupDeliveringPlugin(tmpRoot);
+
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const cmds = allHookCommands(s);
+    for (const name of MIGRATED_HOOK_BASENAMES) {
+      expect(cmds.some((c) => c.includes(name)), `expected ${name} to be stripped`).toBe(false);
+    }
+    // The always-hand-wired 3 are still (re-)installed.
+    expect(cmds).toContain(MACF_AUDITOR_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_TURN_RECEIPT_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
+  });
+
+  it('is idempotent — re-running against an already-delivering plugin twice produces the same stripped result', () => {
+    writeLegacyMigratedHooksSettings(settingsPath);
+    setupDeliveringPlugin(tmpRoot);
+
+    installGhTokenHook(tmpRoot);
+    const after1 = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    installGhTokenHook(tmpRoot);
+    const after2 = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+
+    expect(after2).toEqual(after1);
+    const cmds = allHookCommands(after2);
+    for (const name of MIGRATED_HOOK_BASENAMES) {
+      expect(cmds.some((c) => c.includes(name))).toBe(false);
+    }
+  });
+
+  it('is idempotent — re-running against a hooks-less plugin twice keeps deferring without duplicating entries', () => {
+    writeLegacyMigratedHooksSettings(settingsPath);
+    setupHooksLessPlugin(tmpRoot);
+
+    installGhTokenHook(tmpRoot);
+    const after1 = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    installGhTokenHook(tmpRoot);
+    const after2 = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+
+    expect(after2).toEqual(after1);
+    const preToolUseCmds = after2.hooks.PreToolUse.flatMap((e: { hooks: { command: string }[] }) =>
+      e.hooks.map((h) => h.command),
+    );
+    // check-gh-token.sh legacy entry present exactly once (not duplicated).
+    expect(preToolUseCmds.filter((c: string) => c.includes('check-gh-token.sh'))).toHaveLength(1);
+  });
+
+  it('does NOT strip a brand-new workspace differently — a fresh hooks-less-plugin install still ends up with only the 3 hand-wired hooks (nothing to defer)', () => {
+    // No pre-existing legacy entries at all — a first-ever `macf init` on a
+    // hooks-less-plugin launcher. The self-guard only prevents STRIPPING an
+    // EXISTING fallback; it does not synthesize fresh copies of the 7.
+    setupHooksLessPlugin(tmpRoot);
+
+    installGhTokenHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const cmds = allHookCommands(s);
+    for (const name of MIGRATED_HOOK_BASENAMES) {
+      expect(cmds.some((c) => c.includes(name))).toBe(false);
+    }
+    expect(cmds).toContain(MACF_AUDITOR_HOOK_COMMAND);
+  });
+
+  it('warns loudly when deferring an actual strip (hooks-less plugin + existing legacy copies)', () => {
+    writeLegacyMigratedHooksSettings(settingsPath);
+    setupHooksLessPlugin(tmpRoot);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    installGhTokenHook(tmpRoot);
+
+    expect(warnSpy).toHaveBeenCalled();
+    const messages = warnSpy.mock.calls.map((args) => String(args[0]));
+    expect(messages.some((m) => m.includes('deferring hook-strip'))).toBe(true);
+    expect(messages.some((m) => m.includes('DR-039'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it('does NOT warn on a fresh workspace with nothing to defer (hooks-less plugin, no legacy entries)', () => {
+    setupHooksLessPlugin(tmpRoot);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    installGhTokenHook(tmpRoot);
+
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('does NOT warn when the plugin can deliver (nothing deferred, strip proceeds normally)', () => {
+    writeLegacyMigratedHooksSettings(settingsPath);
+    setupDeliveringPlugin(tmpRoot);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    installGhTokenHook(tmpRoot);
+
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 });
 

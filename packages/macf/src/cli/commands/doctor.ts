@@ -15,7 +15,7 @@
  * for the attribution-trap class this prevents).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
 import { readAgentConfig, tokenSourceFromConfig, writeAgentConfig } from '../config.js';
@@ -39,6 +39,21 @@ import {
   ROLE_FLOOR_DENY,
   isKnownRole,
 } from '../role-settings-model.js';
+import {
+  readHooksMapEntries,
+  resolvePluginDirFromClaudeSh,
+} from '../plugin-hook-resolver.js';
+import type { HookMatchEntry, PluginDirResolution } from '../plugin-hook-resolver.js';
+
+// Re-exported for backward compatibility — `resolvePluginDirFromClaudeSh` +
+// `PluginDirResolution` moved to `plugin-hook-resolver.ts` (DR-039 Amendment B,
+// groundnuty/macf#743 review) so `settings-writer.ts` can reuse the SAME
+// resolver without a settings-writer.ts → doctor.ts → settings-writer.ts
+// import cycle (doctor.ts already imports `installGhTokenHook` FROM
+// settings-writer.ts, above). `doctor.test.ts` still imports both names from
+// `doctor.js` — this re-export keeps that surface unchanged.
+export { resolvePluginDirFromClaudeSh };
+export type { PluginDirResolution };
 
 /**
  * One required permission entry from DR-019.
@@ -889,66 +904,12 @@ export const DR039_LOAD_BEARING_HOOKS: readonly LoadBearingHookSpec[] = [
 ];
 
 /**
- * One hook registration found while scanning a settings.json / hooks.json
- * file's `hooks` map — either a bash `command` string or an `mcp_tool` name.
+ * `HookMatchEntry`, `extractHookMatchEntries`, and `readHooksMapEntries`
+ * moved to `../plugin-hook-resolver.js` (DR-039 Amendment B, groundnuty/macf#743
+ * review) so `settings-writer.ts` can reuse them without an import cycle —
+ * see the module-level comment there + the re-export note at the top of
+ * this file. `readHooksMapEntries` is imported above; used below.
  */
-interface HookMatchEntry {
-  readonly kind: 'command' | 'mcp_tool';
-  readonly value: string;
-}
-
-/**
- * Extract every command/mcp_tool hook entry out of a parsed `hooks` map,
- * regardless of event name — matches BOTH Claude Code's settings.json shape
- * and the plugin's `hooks.json` shape (`{ "<Event>": [{ "hooks": [{ type,
- * command|tool }] }] }`).
- */
-function extractHookMatchEntries(hooksMap: unknown): HookMatchEntry[] {
-  const result: HookMatchEntry[] = [];
-  if (!hooksMap || typeof hooksMap !== 'object') return result;
-  for (const entries of Object.values(hooksMap as Record<string, unknown>)) {
-    if (!Array.isArray(entries)) continue;
-    for (const entry of entries) {
-      if (!entry || typeof entry !== 'object') continue;
-      const hooks = (entry as { hooks?: unknown }).hooks;
-      if (!Array.isArray(hooks)) continue;
-      for (const h of hooks) {
-        if (!h || typeof h !== 'object') continue;
-        const type = (h as { type?: unknown }).type;
-        if (type === 'mcp_tool') {
-          const tool = (h as { tool?: unknown }).tool;
-          if (typeof tool === 'string') result.push({ kind: 'mcp_tool', value: tool });
-        } else {
-          const command = (h as { command?: unknown }).command;
-          if (typeof command === 'string') result.push({ kind: 'command', value: command });
-        }
-      }
-    }
-  }
-  return result;
-}
-
-/**
- * Best-effort read of a JSON file's top-level `hooks` map. Returns `[]` on
- * any absence/parse failure — this check's job is presence-ASSERTION, not
- * JSON-validity reporting (`checkSandboxFdAllowRead` / `checkPermissionsAllow`
- * already surface malformed settings.json elsewhere in the doctor report).
- */
-function readHooksMapEntries(jsonPath: string): HookMatchEntry[] {
-  if (!existsSync(jsonPath)) return [];
-  let raw: string;
-  try {
-    raw = readFileSync(jsonPath, 'utf-8');
-  } catch {
-    return [];
-  }
-  try {
-    const parsed = JSON.parse(raw) as { hooks?: unknown };
-    return extractHookMatchEntries(parsed.hooks);
-  } catch {
-    return [];
-  }
-}
 
 /**
  * Every command/mcp_tool hook entry across `.claude/settings.json` +
@@ -965,75 +926,11 @@ function readSettingsHookEntries(workspaceDir: string): HookMatchEntry[] {
   return result;
 }
 
-/** Result of trying to determine which plugin dir `claude.sh` actually mounts. */
-export interface PluginDirResolution {
-  /** Absolute resolved path, or `null` if not cleanly determinable. */
-  readonly dir: string | null;
-  readonly determinable: boolean;
-  readonly detail: string;
-}
-
 /**
- * Parse the workspace's `claude.sh` for its `--plugin-dir "<path>"` argument
- * and resolve it to an absolute path (substituting `$SCRIPT_DIR` /
- * `${SCRIPT_DIR}` — the launcher's own name for the workspace root, see
- * `claude-sh.ts`'s `SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"`
- * — with `workspaceDir`).
- *
- * Returns `determinable: false` when `claude.sh` is absent, unreadable, has
- * no `--plugin-dir` flag at all, or has MULTIPLE distinct `--plugin-dir`
- * values (an ambiguous/hand-edited launcher) — callers fall back to the
- * default `.macf/plugin` location in that case (DR-039's "err toward
- * not-false-alarming" posture), rather than reporting every hook missing.
+ * `PluginDirResolution` + `resolvePluginDirFromClaudeSh` moved to
+ * `../plugin-hook-resolver.js` (see the re-export note at the top of this
+ * file) — imported above, re-exported for `doctor.test.ts` compatibility.
  */
-export function resolvePluginDirFromClaudeSh(workspaceDir: string): PluginDirResolution {
-  const absDir = resolve(workspaceDir);
-  const claudeShPath = join(absDir, 'claude.sh');
-  if (!existsSync(claudeShPath)) {
-    return { dir: null, determinable: false, detail: 'no claude.sh found in workspace' };
-  }
-  let content: string;
-  try {
-    content = readFileSync(claudeShPath, 'utf-8');
-  } catch (err) {
-    return {
-      dir: null,
-      determinable: false,
-      detail: `could not read claude.sh: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
-  // Match double-quoted, single-quoted, OR bare/unquoted forms — a
-  // hand-authored launcher (macf#739 follow-up hardening, science-agent
-  // review) may use `--plugin-dir "$X"` (canonical), `--plugin-dir '$X'`, or
-  // `--plugin-dir $X` (unquoted var / bare path, no embedded whitespace).
-  // Double-quote checked first so the canonical form's exact prior behavior
-  // is unchanged; the unquoted `(\S+)` alternative is a catch-all fallback
-  // that only matches when neither quote form applies at that position.
-  const found = new Set<string>();
-  const re = /--plugin-dir\s+(?:"([^"]+)"|'([^']+)'|(\S+))/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null) {
-    const captured = m[1] ?? m[2] ?? m[3];
-    if (captured !== undefined) found.add(captured);
-  }
-  if (found.size === 0) {
-    return { dir: null, determinable: false, detail: 'claude.sh has no --plugin-dir flag' };
-  }
-  if (found.size > 1) {
-    return {
-      dir: null,
-      determinable: false,
-      detail: `claude.sh has multiple distinct --plugin-dir values: ${[...found].join(', ')}`,
-    };
-  }
-  const raw = [...found][0] as string;
-  const substituted = raw.replace(/\$\{SCRIPT_DIR\}|\$SCRIPT_DIR/g, absDir);
-  return {
-    dir: resolve(substituted),
-    determinable: true,
-    detail: `resolved from claude.sh --plugin-dir "${raw}"`,
-  };
-}
 
 /**
  * The agent's effective hook registration — the union DR-039 asserts
