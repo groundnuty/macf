@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import { ReflectionRecordSchema } from '@groundnuty/macf-core';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 
-const HOOK_SCRIPT = join(findCliPackageRoot(), 'scripts', 'harvest-reflection.sh');
+const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'harvest-reflection.sh');
 
 const REFLECTIONS_REL = join('.claude', '.macf', 'reflections');
 

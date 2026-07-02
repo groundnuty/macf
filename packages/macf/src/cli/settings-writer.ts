@@ -46,12 +46,19 @@ import { readHooksMapEntries, resolvePluginDirFromClaudeSh } from './plugin-hook
  * **DR-039 Decision 2 (groundnuty/macf#731/#739):** this hook's
  * REGISTRATION single-sourced into the plugin's `hooks/hooks.json` —
  * `installGhTokenHook` no longer writes it into settings.json. The
- * constant is retained for (a) migration cleanup — `isMacfManagedCommand`
- * still recognizes + strips a legacy settings.json copy on refresh — and
- * (b) as the canonical command string the plugin's hooks.json entry must
- * match verbatim (see the plugin-hooks single-source lockstep test). The
- * SCRIPT itself stays path-invoked at `.claude/scripts/check-gh-token.sh`
- * (workbench-maintainable); only the registration moved.
+ * constant is retained for migration cleanup — `isMacfManagedCommand`
+ * still recognizes + strips a legacy settings.json copy on refresh.
+ *
+ * **DR-039 phase 2 (groundnuty/macf#698):** the SCRIPT itself also moved —
+ * it now lives at `packages/macf/plugin/scripts/check-gh-token.sh` (tamper-
+ * resistant: the plugin invokes it via `${CLAUDE_PLUGIN_ROOT}/scripts/`, so
+ * this constant is NO LONGER the command string the plugin's hooks.json
+ * entry matches verbatim — see the plugin-hooks single-source lockstep
+ * test's dedicated `${CLAUDE_PLUGIN_ROOT}` assertions instead). This
+ * constant now scopes to ONLY the settings.json/`.claude/scripts/`
+ * hand-wired-compat path: migration cleanup (above) and any still-hand-wired
+ * substrate workspace that references the compat copy `copyCanonicalScripts`
+ * distributes.
  */
 export const MACF_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-token.sh';
 
@@ -65,8 +72,12 @@ export const MACF_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-t
  * `2026-04-27-self-observed-canonical-rule-breach-pattern-analysis.md`).
  *
  * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
- * plugin's `hooks/hooks.json` — retained here for migration-cleanup +
- * the plugin-hooks lockstep test (see `MACF_HOOK_COMMAND`'s comment above).
+ * plugin's `hooks/hooks.json`. Per DR-039 phase 2 (groundnuty/macf#698) the
+ * SCRIPT also moved into `packages/macf/plugin/scripts/` — the plugin's
+ * hooks.json entry no longer matches this constant verbatim (it now uses
+ * `${CLAUDE_PLUGIN_ROOT}/scripts/`). Retained here ONLY for migration-cleanup
+ * + the settings.json/`.claude/scripts/` hand-wired-compat path (see
+ * `MACF_HOOK_COMMAND`'s comment above).
  */
 export const MACF_MENTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-mention-routing.sh';
 
@@ -84,8 +95,12 @@ export const MACF_MENTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/ch
  * demonstrated the bash-form path empirically; UC-2 mirrors it.
  *
  * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
- * plugin's `hooks/hooks.json` — retained here for migration-cleanup +
- * the plugin-hooks lockstep test (see `MACF_HOOK_COMMAND`'s comment above).
+ * plugin's `hooks/hooks.json`. Per DR-039 phase 2 (groundnuty/macf#698) the
+ * SCRIPT also moved into `packages/macf/plugin/scripts/` — the plugin's
+ * hooks.json entry no longer matches this constant verbatim (it now uses
+ * `${CLAUDE_PLUGIN_ROOT}/scripts/`). Retained here ONLY for migration-cleanup
+ * + the settings.json/`.claude/scripts/` hand-wired-compat path (see
+ * `MACF_HOOK_COMMAND`'s comment above).
  */
 export const MACF_LGTM_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-lgtm-gate.sh';
 
@@ -103,8 +118,12 @@ export const MACF_LGTM_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check
  * `Closes #own` passes); override via MACF_SKIP_CLOSE_CHECK=1.
  *
  * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
- * plugin's `hooks/hooks.json` — retained here for migration-cleanup +
- * the plugin-hooks lockstep test (see `MACF_HOOK_COMMAND`'s comment above).
+ * plugin's `hooks/hooks.json`. Per DR-039 phase 2 (groundnuty/macf#698) the
+ * SCRIPT also moved into `packages/macf/plugin/scripts/` — the plugin's
+ * hooks.json entry no longer matches this constant verbatim (it now uses
+ * `${CLAUDE_PLUGIN_ROOT}/scripts/`). Retained here ONLY for migration-cleanup
+ * + the settings.json/`.claude/scripts/` hand-wired-compat path (see
+ * `MACF_HOOK_COMMAND`'s comment above).
  */
 export const MACF_CLOSE_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh';
 
@@ -153,8 +172,12 @@ export const MACF_TURN_RECEIPT_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scrip
  * user-authored write fires `exit 2`. Override: MACF_SKIP_ATTRIBUTION_CHECK=1.
  *
  * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
- * plugin's `hooks/hooks.json` — retained here for migration-cleanup +
- * the plugin-hooks lockstep test (see `MACF_HOOK_COMMAND`'s comment above).
+ * plugin's `hooks/hooks.json`. Per DR-039 phase 2 (groundnuty/macf#698) the
+ * SCRIPT also moved into `packages/macf/plugin/scripts/` — the plugin's
+ * hooks.json entry no longer matches this constant verbatim (it now uses
+ * `${CLAUDE_PLUGIN_ROOT}/scripts/`). Retained here ONLY for migration-cleanup
+ * + the settings.json/`.claude/scripts/` hand-wired-compat path (see
+ * `MACF_HOOK_COMMAND`'s comment above).
  */
 export const MACF_ATTRIBUTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-attribution.sh';
 
@@ -180,8 +203,12 @@ export const MACF_ATTRIBUTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/script
  *
  * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
  * plugin's `hooks/hooks.json` (no longer written into settings.json by
- * `installGhTokenHook`) — retained here for migration-cleanup + the
- * plugin-hooks lockstep test (see `MACF_HOOK_COMMAND`'s comment above).
+ * `installGhTokenHook`). Per DR-039 phase 2 (groundnuty/macf#698) the SCRIPT
+ * also moved into `packages/macf/plugin/scripts/` — the plugin's hooks.json
+ * entry no longer matches this constant verbatim (it now uses
+ * `${CLAUDE_PLUGIN_ROOT}/scripts/`). Retained here ONLY for migration-cleanup
+ * + the settings.json/`.claude/scripts/` hand-wired-compat path (see
+ * `MACF_HOOK_COMMAND`'s comment above).
  */
 export const MACF_REFLECTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/harvest-reflection.sh';
 
@@ -228,14 +255,20 @@ export const MACF_CHANNELS_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/c
  * on a missing log, missing certs, missing curl, or any internal error) so it
  * can never block a turn or a session. Override: MACF_SKIP_CHANNEL_ALIVE_CHECK=1.
  *
- * Distributed via `macf init` / `macf update` / `macf rules refresh` like the
- * other check-*.sh hooks (CLI-shipped, NOT a plugin hook).
+ * Distributed via `macf init` / `macf update` / `macf rules refresh` to
+ * `.claude/scripts/` for the hand-wired-compat path (see the DR-039 phase 2
+ * note below for the plugin-mounted copy that's actually load-bearing).
  *
  * **DR-039 Decision 2 (groundnuty/macf#731/#739):** single-sourced into the
  * plugin's `hooks/hooks.json` (registered on BOTH SessionStart AND
  * UserPromptSubmit there, mirroring the dual registration this comment
  * describes) — no longer written into settings.json by `installGhTokenHook`.
- * Retained here for migration-cleanup + the plugin-hooks lockstep test.
+ * Per DR-039 phase 2 (groundnuty/macf#698) the SCRIPT also moved into
+ * `packages/macf/plugin/scripts/` — the plugin's hooks.json entry no longer
+ * matches this constant verbatim (it now uses `${CLAUDE_PLUGIN_ROOT}/scripts/`
+ * on both events). Retained here ONLY for migration-cleanup + the
+ * settings.json/`.claude/scripts/` hand-wired-compat path (see
+ * `MACF_HOOK_COMMAND`'s comment above).
  */
 export const MACF_CHANNEL_ALIVE_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh';
 
@@ -1115,15 +1148,21 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
  * fetch (`fetchPluginToWorkspace`) — no `macf init`/`update` code change was
  * needed there, since the CLI never produced a stripped/minimal plugin
  * variant to begin with (that variant — "plugin-cs" — was always a
- * hand-authored substrate relic, never CLI-generated). Their SCRIPTS stay
- * path-invoked at `.claude/scripts/*.sh` per Decision 2's "scripts stay
- * path-invoked; registration single-sources" split (workbench-maintainable:
- * a substrate agent can still evolve a guard's behavior by editing the
- * script, and the change goes live on the next event with no relaunch).
- * `macf doctor`'s DR-039 assertion (`checkLoadBearingHooks`) verifies
- * presence across the UNION of settings.json + the plugin's hooks.json, so
- * this migration is invisible to that check — only the delivery channel
- * moved, not the doctor's expectation.
+ * hand-authored substrate relic, never CLI-generated).
+ *
+ * **DR-039 phase 2 (groundnuty/macf#698) went further: their SCRIPTS also
+ * moved INTO THE PLUGIN** (`packages/macf/plugin/scripts/*.sh`), invoked via
+ * `${CLAUDE_PLUGIN_ROOT}/scripts/` — tamper-resistant, since an agent editing
+ * its workspace `.claude/scripts/` copy no longer changes what the plugin
+ * actually runs (Decision 2's original "scripts stay path-invoked;
+ * registration single-sources" split is thus superseded for these 7 —
+ * `copyCanonicalScripts` still writes a `.claude/scripts/` compat copy for
+ * hand-wired substrate hooks + non-plugin-init'd workspaces, but that copy is
+ * no longer what the plugin-mounted hook executes). `macf doctor`'s DR-039
+ * assertion (`checkLoadBearingHooks`) verifies presence across the UNION of
+ * settings.json + the plugin's hooks.json by substring-matching the script's
+ * basename — path-prefix-agnostic, so this migration is invisible to that
+ * check either way.
  *
  * **Migration cleanup is idempotent and atomic with the switch:** the
  * preserve-then-replace discipline below still recognizes any of the 7
