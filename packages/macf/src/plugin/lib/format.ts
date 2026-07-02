@@ -156,3 +156,60 @@ export function formatIssues(
   }
   return lines.join('\n');
 }
+
+/**
+ * DR-038 Decision 5 — the injected `coordination.md §Communication 5`
+ * sweep instruction. Promotes the review/gate/mention pull-disciplines
+ * from "a discipline the agent must remember" to an injected startup
+ * step (paired with the JOINT devops canonical rule-text change — see
+ * DR-038 build-split "the §5-promotion is JOINT (code + devops) and its
+ * two halves MUST land together").
+ *
+ * Unconditional by design: `formatStartupReconcile` always appends this,
+ * regardless of whether any issues or drained inbox messages exist — the
+ * whole point of §5(c) is "don't wait for a ping that may never come",
+ * so the sweep instruction has to render even on an otherwise-quiet
+ * startup.
+ */
+export function formatSweepInstruction(): string {
+  return [
+    'Coordination sweep (coordination.md §Communication 5) — run before considering yourself idle:',
+    '  (a) reviewer-sweep: any peer PR awaiting your formal review (approve/request-changes)?',
+    '  (b) inbound-review-sweep + mention-sweep: any review request, or @mention on an open thread, addressed to you that you have not yet actioned?',
+    '  (c) gate-sweep: for anything you are waiting on, does the APPROVED review or artifact already exist on GitHub?',
+    'Assert against live GitHub state directly — do not wait for a ping that may have already arrived and been missed.',
+  ].join('\n');
+}
+
+/**
+ * DR-038 Decision 5 — the extended SessionStart startup_check. Composes
+ * three sections: the existing issue-queue (`formatIssues`, unchanged),
+ * any inbox messages drained on this startup (`inbox-drain.ts`'s
+ * `drainInbox`, the "completeness half" — messages that arrived while the
+ * agent was busy/relaunching or whose tmux-wake didn't land), and the
+ * injected §5 sweep instruction.
+ *
+ * The drained-messages section is OMITTED entirely when nothing was
+ * drained — an empty inbox must not add noise to an otherwise-normal
+ * startup. The sweep instruction always renders (see
+ * `formatSweepInstruction`).
+ */
+export function formatStartupReconcile(
+  issues: ReadonlyArray<{ readonly number: number; readonly title: string }>,
+  drained: ReadonlyArray<{ readonly id: string; readonly payload: unknown; readonly receivedAt: number }>,
+): string {
+  const sections: string[] = [formatIssues(issues)];
+
+  if (drained.length > 0) {
+    const lines: string[] = [`${drained.length} inbox message(s) drained on startup:`];
+    for (const entry of drained) {
+      const receivedIso = new Date(entry.receivedAt).toISOString();
+      lines.push(`  ${entry.id} (received ${receivedIso}): ${JSON.stringify(entry.payload)}`);
+    }
+    sections.push(lines.join('\n'));
+  }
+
+  sections.push(formatSweepInstruction());
+
+  return sections.join('\n\n');
+}

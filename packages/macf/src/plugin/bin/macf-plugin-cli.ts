@@ -11,7 +11,7 @@
  */
 import 'reflect-metadata';
 import { readFileSync } from 'node:fs';
-import { formatDashboard, formatPeerTable, formatHealthDetail, formatIssues } from '../lib/format.js';
+import { formatDashboard, formatPeerTable, formatHealthDetail, formatStartupReconcile } from '../lib/format.js';
 import { getOwnRegistration, listPeers } from '../lib/registry.js';
 import { pingAgent } from '../lib/health.js';
 import { probePeerHealth } from '../lib/probe-peer-health.js';
@@ -19,6 +19,8 @@ import { buildDashboardHealth } from '../lib/build-dashboard-health.js';
 import { getRegistryConfig } from '../lib/registry-config.js';
 import { mintFreshGitHubToken } from '../lib/fresh-github-token.js';
 import { checkIssues } from '../lib/work.js';
+import { getInboxStore } from '../lib/inbox-store.js';
+import { drainInbox } from '../lib/inbox-drain.js';
 import { createRegistryFromConfig } from '@groundnuty/macf-core';
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
@@ -167,7 +169,18 @@ async function main(): Promise<void> {
       const repo = process.env['MACF_REGISTRY_REPO'] ?? 'groundnuty/macf';
       const label = process.env['MACF_AGENT_LABEL'] ?? 'code-agent';
       const issues = await checkIssues({ repo, label, token });
-      console.log(formatIssues(issues));
+
+      // DR-038 Decision 5 — the on-startup completeness half: drain any
+      // inbox message that arrived while the agent was busy/relaunching
+      // or whose tmux-wake didn't land, and inject the coordination.md §5
+      // review/gate/mention sweep instruction alongside the issue queue.
+      // `getInboxStore()` is currently an in-memory placeholder (see
+      // `inbox-store.ts`) — real cross-process durability is pending
+      // devops's disk-backed driver (DR-008).
+      const inboxStore = getInboxStore();
+      const drained = await drainInbox(inboxStore);
+
+      console.log(formatStartupReconcile(issues, drained));
       break;
     }
 

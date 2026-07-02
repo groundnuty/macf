@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { formatDashboard, formatPeerTable, formatHealthDetail, formatIssues } from '../../../src/plugin/lib/format.js';
+import {
+  formatDashboard,
+  formatPeerTable,
+  formatHealthDetail,
+  formatIssues,
+  formatSweepInstruction,
+  formatStartupReconcile,
+} from '../../../src/plugin/lib/format.js';
 import type { HealthResponse } from '@groundnuty/macf-core';
 import type { OwnRegistration } from '../../../src/plugin/lib/registry.js';
 import type { AgentInfo } from '@groundnuty/macf-core';
@@ -166,5 +173,47 @@ describe('formatIssues', () => {
   it('shows no pending issues message', () => {
     const output = formatIssues([]);
     expect(output).toContain('No pending issues');
+  });
+});
+
+describe('formatSweepInstruction — DR-038 Decision 5 §Communication 5 injection', () => {
+  it('references coordination.md and all three sweeps (review/gate/mention)', () => {
+    const text = formatSweepInstruction();
+    expect(text).toContain('coordination.md');
+    expect(text).toContain('§Communication 5');
+    expect(text).toContain('reviewer-sweep');
+    expect(text).toContain('gate-sweep');
+    expect(text.toLowerCase()).toContain('mention-sweep');
+  });
+});
+
+describe('formatStartupReconcile — extended SessionStart startup_check (DR-038 Decision 5)', () => {
+  it('composes issues + drained inbox messages + the sweep instruction', () => {
+    const output = formatStartupReconcile(
+      [{ number: 11, title: 'P1 Channel Server' }],
+      [{ id: 'msg-1', payload: { hello: 'world' }, receivedAt: 0, processed: false }],
+    );
+    expect(output).toContain('#11');
+    expect(output).toContain('msg-1');
+    expect(output).toContain('hello');
+    expect(output).toContain('coordination.md');
+  });
+
+  it('omits the drained-messages section entirely when the inbox is empty (no drain noise)', () => {
+    const output = formatStartupReconcile([{ number: 11, title: 'x' }], []);
+    expect(output).not.toContain('inbox message');
+  });
+
+  it('still injects the sweep instruction on an otherwise-quiet startup', () => {
+    const output = formatStartupReconcile([], []);
+    expect(output).toContain('No pending issues');
+    expect(output).not.toContain('inbox message');
+    expect(output).toContain('coordination.md');
+  });
+
+  it('preserves the existing formatIssues text verbatim as the first section', () => {
+    const issues = [{ number: 42, title: 'test issue' }];
+    const output = formatStartupReconcile(issues, []);
+    expect(output.startsWith(formatIssues(issues))).toBe(true);
   });
 });
