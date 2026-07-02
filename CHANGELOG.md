@@ -4,6 +4,68 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.48] — 2026-07-02
+
+Stability + delivery-guarantee release. Closes the silent-channel-death /
+relaunch-bricking class, ships the DR-038 A2A delivery-guarantee framework
+(additive — in-memory placeholder, no regression) + the DR-039
+hook-presence guarantee, and hardens the fleet-upgrade tooling. Marketplace
+v0.2.48 is a lockstep bump.
+
+### Reliability — relaunch / channel stability
+- **#733** — identity-aware collision liveness check: the over-register
+  liveness ping now parses the responder's `instance_id` from `/health` and
+  aborts ONLY on positive confirmation the *registered* owner is alive
+  (instance-id match + version quadrant); an identity mismatch → takeover
+  (`takeover_stale_owner_gone`). Root fix for channel-servers dying on
+  relaunch — the ping was identity-blind and aborted against a phantom on
+  the port. Completes the register-reliability trilogy (#553/#705/#733).
+- **#734** — `check-channel-alive.sh`: in-agent SessionStart/UserPromptSubmit
+  self-liveness probe warns loudly into the agent's context when its own
+  channel-server is dead (so a silently-deaf agent notices).
+- **#713** — `restart-self` relaunches into a fresh detached tmux session.
+- **#714 / #729 / #730** — prompt-watcher: fix the self-alert feedback loop
+  on unknown prompts + stop misreading the input box as an unknown prompt.
+- **#716** — channels-guard recency-bounds the `tmux_wake_delivered` evidence.
+- **#717** — populate `github_app.bot_login` at init + repair via `doctor --fix`.
+
+### Reliability — fleet-upgrade tooling
+- **#722 / #724** — verify-green three-outcome gate + config-dirty pre-flight
+  skip (DR-037 Amendment B): roll continues only on *confirmed* green.
+- **#725 / #726** — transactional roll + object-with-message on config-dirty
+  (either a full transaction or none; a config-dirty agent is reported with a
+  forwardable message, never left half-upgraded).
+- **#719** — group `macf fleet upgrade` by project, not registry scope
+  (DR-037 Amendment A).
+- **#721** — drop the misleading per-line "busy-gated at execute" plan suffix;
+  explain the busy-gate once as a future-conditional footer.
+- **#715** — dev-version display suffix (`+dev.<sha>`) for npm-linked builds.
+
+### DR-039 — hook-delivery-and-presence guarantee
+- **#739** — `macf doctor` asserts the load-bearing hook-set is present.
+- **#743** — single-source hook registration into the plugin (retire
+  `plugin-cs`), with a self-guard that DEFERS the `settings.json` strip when
+  the effective plugin can't deliver — structurally gap-proof.
+
+### DR-038 — A2A delivery-guarantee framework (additive; no regression)
+Delivery is plumbed-but-not-durable (in-memory placeholder store) until
+devops's durable disk-spool driver (DR-008) lands — no regression vs the
+prior fire-and-forget path.
+- **#738** — Slice A effectively-once core (outbox/inbox, dedup-by-message-id).
+- **#742** — Slice B: wire effectively-once delivery into `notify_peer` +
+  `/notify` (persist-then-ACK).
+- **#740** — Slice D: queue-source = App-install-set × label.
+- **#745** — hoist the store interfaces to `@groundnuty/macf-core` (one
+  binding definition across macf, channel-server, and the future disk driver).
+- **#741** — Slice C: plugin startup-reconcile (inbox drain + coordination.md
+  §Communication 5 sweep injection).
+- **#747** — live inbox orphan-drain ticker (completes Decision 5's
+  receipt + startup + live-cadence coverage).
+
+### Design records
+- DR-037 Amendments A + B; **DR-038** (A2A delivery-guarantee, Accepted);
+  **DR-039** (hook-delivery-and-presence, Accepted).
+
 ## [0.2.47] — 2026-07-01
 
 **Fleet-probe routing-label fix**: `macf fleet upgrade`/`reconcile` now
