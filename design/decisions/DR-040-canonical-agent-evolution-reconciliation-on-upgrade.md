@@ -61,6 +61,14 @@ Once a supervision cron (DR-031) keeps agents alive, it will race the upgrade: a
 
 This one lock delivers **three** effects the reconcile needs: (a) watchdog suppression (upgrade ≠ outage), (b) **routing freeze** — no peer messages injected mid-reconcile (queue, do **not** drop, and release after), and (c) the upgrade flow **owns every restart in the window**, which is what makes resume-by-id (Decision 5) safe. It is a DR-031 supervision primitive useful independent of this DR — any planned restart must not look like an outage — so it should be built first, standalone.
 
+**Implementation pins (devops review, PR #748 — the DR-031/cron owner):**
+
+1. **Specify the lock's STORAGE, portable across substrates.** Both the upgrade-orchestrator and the watchdog must read it in **both** DR-031 substrates, or the VM cron and the K8s operator will implement it differently and drift. VM = a lock file (e.g. `.claude/.macf/maintenance.lock`) the cron reads; K8s = a pod annotation / ConfigMap the operator reconciles. This is the load-bearing detail on the cron side — name it in the standalone spec, don't leave it as "sets a lock."
+2. **Heartbeat-refresh, not a single fixed TTL.** One TTL forces a bad tradeoff: too short → the watchdog relaunches a *slow-but-live* upgrade (the fresh-session reconcile can take minutes); too long → a crashed upgrade locks keep-alive out for that whole bound. Have the upgrade **refresh** the lock periodically; the watchdog ignores a lock whose heartbeat went stale → short TTL (fast crash-detection) *and* no mid-upgrade relaunch.
+3. **Durable write before the stop.** fsync/commit the lock (not in-memory) so a watchdog tick *inside* the stop-window sees it; `#733` collision covers the residual race.
+
+devops is well-placed to own the standalone lock build on the VM/cron side.
+
 ## Decision 5 — Prerequisite primitive: resume by session-id, not `-c`
 
 The reconcile runs in a fresh session (self-contained; avoids taxing/overflowing a near-full operational session). But `claude.sh`'s `-c` (resume-latest) would then resume the **reconcile** session, not the agent's real operational session. Fix:
@@ -72,7 +80,12 @@ The maintenance lock (Decision 4) protects the window in which the reconcile ses
 
 ## Decision 6 — Config-dirty guard precision (narrow the pattern; stop false-positives)
 
-`ROLL_TOUCHED_CONFIG_PATTERNS` is `['.claude/**', 'CLAUDE.md', 'claude.sh', 'env.local.*']`. `.claude/**` over-matches: it flags runtime files `macf update` never writes (e.g. devops's `.claude/audit.log`, appended by a custom `ConfigChange` hook, hence perpetually git-dirty) as "macf update would overwrite" — a false CONFIG-DIRTY objection. Narrow it to the **exact distributed paths** (`.claude/rules/**`, `.claude/scripts/**` until Q1 drops it, `.claude/settings.json`, the managed `.claude/.macf/env.*`) — the same exact-file discipline as Decision 2 — and gitignore runtime artifacts like `audit.log`. This is the precise reconcile input; a wildcard both over-objects and mis-lists.
+`ROLL_TOUCHED_CONFIG_PATTERNS` is `['.claude/**', 'CLAUDE.md', 'claude.sh', 'env.local.*']`. `.claude/**` over-matches: it flags runtime files `macf update` never writes (e.g. devops's `.claude/audit.log`, appended by a custom `ConfigChange` hook, hence perpetually git-dirty) as "macf update would overwrite" — a false CONFIG-DIRTY objection. Narrow it to the **exact distributed paths** (`.claude/rules/**`, `.claude/scripts/**` until Q1 drops it, `.claude/settings.json`, the managed `.claude/.macf/env.*`) — the same exact-file discipline as Decision 2 — and gitignore runtime artifacts like `audit.log`. This is the precise reconcile input; a wildcard both over-objects and mis-lists. **Validated by a just-lived incident** (devops review, PR #748): the `.claude/**` wildcard flagged devops's `audit.log` and **blocked its v0.2.48 upgrade** 2026-07-02.
+
+**Implementation detail (devops, from hand-fixing it):**
+
+- **Untracking `audit.log` is TWO steps, not one.** It is currently *force-tracked*: `.gitignore` has `*.log` but a deliberate `!.claude/audit.log` line un-ignores it. So the fix is (a) **remove the `!.claude/audit.log` force-include** (lets it fall under `*.log`) **and** (b) **`git rm --cached .claude/audit.log`** in the distribution (an already-tracked file stays tracked despite a new ignore). Narrowing `ROLL_TOUCHED_CONFIG_PATTERNS` alone clears the CONFIG-DIRTY *objection*, but the log keeps churning as a tracked file (tripping git ops, subagents, every pre-flight) until it is actually untracked.
+- **Decide whether the trail is even wanted:** the `ConfigChange` hook writes `TIMESTAMP<TAB>USER<TAB>?` — the file field is **always `?`** (`CLAUDE_HOOK_FILE` never populates), so it records "a config changed at time T" with no detail. Either fix the hook to capture the file or drop it; as-is, gitignoring the low-value churning log is the right immediate call.
 
 ## Decision 7 — Governance: the agent as first-line auditor of its own evolution
 
