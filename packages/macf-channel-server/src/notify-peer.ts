@@ -26,7 +26,6 @@
  *   `to:` customization needed).
  */
 import { request as httpsRequest } from 'node:https';
-import { randomUUID } from 'node:crypto';
 import type { Registry, AgentInfo } from '@groundnuty/macf-core';
 import type { Logger } from '@groundnuty/macf-core';
 import { toVariableSegment, fromVariableSegment } from '@groundnuty/macf-core';
@@ -43,6 +42,9 @@ import { A2aClient, A2aClientError } from './a2a-client.js';
 import type { Message } from './a2a-types.js';
 import { intentSummary } from './comms-ledger.js';
 import type { CommsLedgerEdge } from './comms-ledger.js';
+// DR-038 Slice B: the durable outbox this module now sends THROUGH (persist-
+// then-send, Decision 1) instead of dispatching directly.
+import type { Outbox, OutboxSendFn } from './delivery/outbox.js';
 
 export const NotifyPeerInputSchema = {
   to: z.string().optional()
@@ -95,6 +97,33 @@ export interface NotifyPeerDeps {
    * `recordEdge`).
    */
   readonly recordLedgerEdge?: (edge: CommsLedgerEdge) => void;
+  /**
+   * DR-038 Slice B: the durable, process-lifetime outbox `notifyPeer()` now
+   * enqueues every dispatch through (persist-then-send, Decision 1), instead
+   * of dispatching directly. Constructed ONCE at server startup (`server.ts`)
+   * over a pluggable `OutboxStore` driver (`delivery/driver.ts`) with `send`
+   * wired to `createNotifyOutboxSend()`'s adapter (below) — so retry state
+   * survives across `notify_peer` calls (and, once a durable store driver
+   * lands per DR-008, across this sender's own restarts).
+   */
+  readonly outbox: Outbox;
+  /**
+   * DR-038 Slice B: the read-once side-channel populated by
+   * `createNotifyOutboxSend()`'s adapter on every send attempt, keyed by
+   * outbox message-id. `Outbox.driveOnce()`'s public contract only returns
+   * AGGREGATE counts (attempted/acked/failed/deadLettered), not per-entry
+   * outcomes — this map is what lets `notifyPeer()` recover the SAME
+   * per-peer {httpOk, transportOk} granularity the pre-DR-038 direct-dispatch
+   * path returned synchronously (needed to preserve the `channel_state`
+   * online-vs-offline distinction: "peer alive but rejected" vs "peer
+   * unreachable"). `notifyPeer()` reads-and-deletes its own ids after the
+   * immediate `driveOnce()` call; an id that needs a LATER retry (driven by
+   * the periodic `outbox-ticker.ts`, after the originating `notifyPeer()`
+   * call already returned) leaves one entry here that is simply overwritten
+   * on the next attempt for that id and never independently unbounded — see
+   * `createNotifyOutboxSend`'s doc comment for the full accepted-tradeoff note.
+   */
+  readonly outboxAttempts: Map<string, NotifyOutboxAttempt>;
 }
 
 export interface NotifyPeerInput {
@@ -159,7 +188,7 @@ async function resolveTargetPeers(
  * stats to surface aggregate health).
  */
 function postToPeer(
-  deps: NotifyPeerDeps,
+  deps: NotifyDispatchDeps,
   peer: { readonly name: string; readonly info: AgentInfo },
   payload: object,
   timeoutMs: number,
@@ -235,13 +264,42 @@ function peerBaseUrl(peer: { readonly info: AgentInfo }): string {
 }
 
 /**
+ * Build the legacy `/notify` envelope from a notify_peer input — pure,
+ * per-peer-invariant (no per-peer info, so callers used to build it ONCE and
+ * reuse across peers; DR-038 Slice B rebuilds it fresh per outbox send
+ * attempt instead, which is cheap and keeps `dispatchToPeer` self-contained).
+ * `message_id` is NOT included here — the caller (`dispatchToPeer`) stamps it
+ * from the outbox-supplied stable id at send time (DR-038 Decision 2: the id
+ * must be the SAME across every retry, and this function has no id of its
+ * own to offer).
+ */
+function buildLegacyPayload(input: NotifyPeerInput, selfAgentName: string): Record<string, unknown> {
+  return {
+    type: 'peer_notification',
+    source: selfAgentName,
+    event: input.event,
+    ...(input.message !== undefined ? { message: input.message } : {}),
+    ...(input.context !== undefined ? { context: input.context } : {}),
+    // macf#473: carry the anchor on the LEGACY wire too (the A2A path
+    // stamps it in Message.metadata.github_anchor). Without this the
+    // legacy recv edge can't derive the anchor → silent drop + send/recv
+    // graph-join asymmetry.
+    ...(input.github_anchor != null ? { github_anchor: input.github_anchor } : {}),
+  };
+}
+
+/**
  * Construct an A2A v1.0 Message from a notify_peer payload. The Message
  * shape encodes the legacy envelope's semantic fields (event, source,
  * message body, context) into A2A-canonical structure so the receiver
  * (after Phase 3.5 receiver-side wake-decision integration) can route
  * appropriately.
  *
- * - `messageId`: fresh UUID per call (spec § 4.1.4 — required)
+ * - `messageId`: the STABLE id supplied by the caller (DR-038 Decision 2 —
+ *   minted ONCE at outbox-enqueue, reused verbatim on every retry; this
+ *   function no longer mints its own, which would break receiver-side
+ *   dedup on a retried A2A send — a redelivery under a fresh id would look
+ *   like a brand-new message to `InboxStore.persist()`)
  * - `role`: ROLE_USER (sender's perspective; spec § 4.1.5 — client→server)
  * - `parts[0]`: text with a human-readable summary of the notification
  * - `metadata.event` + `metadata.source` + `metadata.context`: structured
@@ -256,10 +314,11 @@ function peerBaseUrl(peer: { readonly info: AgentInfo }): string {
 function buildA2aMessageFromPayload(
   input: NotifyPeerInput,
   selfAgentName: string,
+  id: string,
 ): Message {
   const summary = input.message ?? `Notification from ${selfAgentName} (event=${input.event})`;
   return {
-    messageId: randomUUID(),
+    messageId: id,
     role: 'ROLE_USER',
     parts: [{ text: summary }],
     metadata: {
@@ -297,7 +356,7 @@ function buildA2aMessageFromPayload(
  * the failure logged at warn level (not fatal — legacy path is safe).
  */
 async function selectOutboundProtocol(
-  deps: NotifyPeerDeps,
+  deps: NotifyDispatchDeps,
   peer: { readonly name: string; readonly info: AgentInfo },
 ): Promise<'a2a' | 'legacy'> {
   if (process.env['MACF_OUTBOUND_LEGACY'] === '1') {
@@ -360,12 +419,21 @@ async function selectOutboundProtocol(
  * The wrapping `invoke_agent {target}` span (set by `notifyPeer`'s
  * tracer scope) is shared across both protocols; this function sets
  * the `macf.outbound.protocol` attribute on the span to disambiguate.
+ *
+ * DR-038 Slice B: `id` is now a REQUIRED parameter — the stable outbox
+ * message-id (Decision 2), supplied by the caller (the outbox `send` seam,
+ * `createNotifyOutboxSend` below) and stamped onto the wire payload for
+ * BOTH protocols (legacy `message_id` field / A2A `Message.messageId`) —
+ * the SAME id on every retry, which is the whole receiver-side dedup key.
+ * `dispatchToPeer` no longer builds `legacyPayload` from a caller-supplied
+ * object; it derives it fresh from `input` via `buildLegacyPayload` (cheap,
+ * and keeps this function self-contained for the outbox's per-attempt calls).
  */
 async function dispatchToPeer(
-  deps: NotifyPeerDeps,
+  deps: NotifyDispatchDeps,
   peer: { readonly name: string; readonly info: AgentInfo },
   input: NotifyPeerInput,
-  legacyPayload: object,
+  id: string,
   timeoutMs: number,
 ): Promise<{ readonly httpOk: boolean; readonly transportOk: boolean }> {
   const protocol = await selectOutboundProtocol(deps, peer);
@@ -374,17 +442,14 @@ async function dispatchToPeer(
     span.setAttribute(Attr.OutboundProtocol, protocol);
   }
 
-  // The A2A message id (when the A2A path is taken) doubles as the ledger
-  // msg_id; for the legacy path there is no natural id so we generate one.
-  let msgId: string | undefined;
   let result: { readonly httpOk: boolean; readonly transportOk: boolean };
 
   if (protocol === 'legacy') {
+    const legacyPayload = { ...buildLegacyPayload(input, deps.selfAgentName), message_id: id };
     result = await postToPeer(deps, peer, legacyPayload, timeoutMs);
   } else {
-    // A2A path: construct message + send + map outcome.
-    const message = buildA2aMessageFromPayload(input, deps.selfAgentName);
-    msgId = message.messageId;
+    // A2A path: construct message (stable id stamped in) + send + map outcome.
+    const message = buildA2aMessageFromPayload(input, deps.selfAgentName, id);
     try {
       const task = await deps.a2aClient!.sendMessage(
         `${peerBaseUrl(peer)}`,
@@ -438,7 +503,7 @@ async function dispatchToPeer(
       channel: 'a2a',
       direction: 'send',
       event: input.event,
-      msg_id: msgId ?? randomUUID(),
+      msg_id: id,
       intent_summary: intentSummary(input.message),
       github_anchor: input.github_anchor ?? null,
       delivered: result.httpOk,
@@ -530,26 +595,41 @@ export async function notifyPeer(
           };
         }
 
-        const payload = {
-          type: 'peer_notification',
-          source: deps.selfAgentName,
-          event: input.event,
-          ...(input.message !== undefined ? { message: input.message } : {}),
-          ...(input.context !== undefined ? { context: input.context } : {}),
-          // macf#473: carry the anchor on the LEGACY wire too (the A2A path
-          // stamps it in Message.metadata.github_anchor). Without this the
-          // legacy recv edge can't derive the anchor → silent drop + send/recv
-          // graph-join asymmetry.
-          ...(input.github_anchor != null ? { github_anchor: input.github_anchor } : {}),
-        };
-
-        // macf#396 Phase 3: dispatchToPeer does protocol-selection
-        // per-peer (A2A vs legacy /notify) based on AgentCard discovery
-        // + the MACF_OUTBOUND_LEGACY env flag + event-class routing.
-        // See selectOutboundProtocol() for the decision tree.
-        const results = await Promise.all(
-          peers.map(p => dispatchToPeer(deps, p, input, payload, 5000)),
+        // DR-038 Slice B: persist-then-send (Decision 1). Enqueue EVERY
+        // peer's message into the durable outbox BEFORE any send is
+        // attempted — `outbox.enqueue` mints the stable message-id
+        // (Decision 2) and durably persists via the injected `OutboxStore`
+        // driver, returning the id. Only THEN do we attempt delivery, via
+        // one immediate `driveOnce()` call covering everything just
+        // enqueued (plus any already-due backlog from a prior call) — this
+        // gives the reachable-peer common case the same "delivered inline"
+        // UX as the pre-DR-038 fire-and-forget dispatch, while an
+        // unreachable peer's entry now durably SURVIVES in the outbox for
+        // the periodic ticker (`delivery/outbox-ticker.ts`, wired in
+        // `server.ts`) to keep retrying with backoff, bounded by the TTL,
+        // across this sender's own restarts (Decision 4) — once a durable
+        // store driver replaces the in-memory placeholder (DR-008).
+        const enqueued = await Promise.all(
+          peers.map(async (peer) => ({ peer, id: await deps.outbox.enqueue(peer.name, input) })),
         );
+        await deps.outbox.driveOnce();
+
+        // `Outbox.driveOnce()`'s public contract returns only AGGREGATE
+        // counts, not per-entry outcomes — `deps.outboxAttempts` is the
+        // read-once side-channel `createNotifyOutboxSend`'s adapter
+        // populates per attempt (see its doc comment + `NotifyPeerDeps`
+        // .outboxAttempts for the full rationale). Read-and-delete each id
+        // this call just enqueued so the map doesn't grow across calls for
+        // messages that succeed on the first attempt.
+        const results = enqueued.map(({ peer, id }) => {
+          const attempt = deps.outboxAttempts.get(id);
+          deps.outboxAttempts.delete(id);
+          return {
+            peer,
+            httpOk: attempt?.httpOk ?? false,
+            transportOk: attempt?.transportOk ?? false,
+          };
+        });
 
         const peers_delivered = results.filter(r => r.httpOk).length;
         const peers_reachable = results.filter(r => r.transportOk).length;
@@ -593,4 +673,95 @@ export async function notifyPeer(
       }
     },
   );
+}
+
+// ---------------------------------------------------------------------------
+// DR-038 Slice B — the outbox `send` seam wired to the ACTUAL peer dispatch.
+// ---------------------------------------------------------------------------
+
+/** Per-attempt outcome recorded in `NotifyPeerDeps.outboxAttempts`. */
+export interface NotifyOutboxAttempt {
+  readonly httpOk: boolean;
+  readonly transportOk: boolean;
+}
+
+/**
+ * Everything `createNotifyOutboxSend`'s adapter needs — exactly
+ * `NotifyPeerDeps` minus the two outbox-related fields (which don't exist
+ * yet at the point this factory is called: `server.ts` constructs the
+ * adapter FIRST, then wraps it in `createOutbox({ send, ... })`, and only
+ * THEN has a complete `NotifyPeerDeps` to hand to `notifyPeer()`).
+ */
+export type NotifyDispatchDeps = Omit<NotifyPeerDeps, 'outbox' | 'outboxAttempts'>;
+
+/** Bound on `lastAttempts` size — defense-in-depth against unbounded growth
+ * from ids that get retried after their originating `notifyPeer()` call has
+ * already returned and read-and-deleted its own entries (see doc comment
+ * below). FIFO-evicts the oldest tracked id once exceeded. */
+const MAX_TRACKED_ATTEMPTS = 500;
+
+/**
+ * Build the `OutboxSendFn` wired to the real peer dispatch (legacy `/notify`
+ * POST or A2A `message/send`, per `selectOutboundProtocol`) — this is the
+ * seam DR-038 Decision 1's "persist-then-send" plugs the ACTUAL send into.
+ * Constructed ONCE at server startup (`server.ts`) and passed to
+ * `createOutbox({ send, ... })`; `server.ts` then folds the resulting
+ * `outbox` + `lastAttempts` into the full `NotifyPeerDeps` handed to
+ * `notifyPeer()`.
+ *
+ * The returned `lastAttempts` map is the read-once side-channel documented
+ * on `NotifyPeerDeps.outboxAttempts`: `Outbox.driveOnce()`'s public contract
+ * only returns aggregate attempted/acked/failed/deadLettered counts, not
+ * per-entry outcomes, so this is what recovers the granular
+ * {httpOk, transportOk} pair `notifyPeer()` needs to preserve the pre-DR-038
+ * `channel_state` distinction (peer-alive-but-rejected vs peer-unreachable)
+ * in its immediate return value. A message that needs a LATER retry (driven
+ * by `delivery/outbox-ticker.ts`'s periodic tick, after the originating
+ * `notifyPeer()` call has already read-and-deleted its own id) leaves one
+ * stale entry here — bounded by `MAX_TRACKED_ATTEMPTS` (FIFO eviction), so
+ * this is capped, not unbounded, even though it is not eagerly cleaned up
+ * the moment a message finally acks or dead-letters. Accepted tradeoff for
+ * this wiring slice; a follow-up could decorate `store.markAcked` /
+ * `store.deadLetter` to evict eagerly if the cap ever proves too coarse in
+ * practice.
+ */
+export function createNotifyOutboxSend(
+  deps: NotifyDispatchDeps,
+  timeoutMs = 5000,
+): { readonly send: OutboxSendFn; readonly lastAttempts: Map<string, NotifyOutboxAttempt> } {
+  const lastAttempts = new Map<string, NotifyOutboxAttempt>();
+
+  function record(id: string, attempt: NotifyOutboxAttempt): void {
+    if (lastAttempts.size >= MAX_TRACKED_ATTEMPTS && !lastAttempts.has(id)) {
+      const oldestKey = lastAttempts.keys().next().value;
+      if (oldestKey !== undefined) lastAttempts.delete(oldestKey);
+    }
+    lastAttempts.set(id, attempt);
+  }
+
+  const send: OutboxSendFn = async (target, id, payload) => {
+    const input = payload as NotifyPeerInput;
+    // Re-resolve the peer via the registry at SEND time (not at enqueue
+    // time) — deliberate: across a retry gap the peer's host/port may have
+    // changed (relaunch, collision takeover), and a stale cached AgentInfo
+    // would keep retrying a dead address. `target` is the routing-label
+    // string `outbox.enqueue`'s caller passed as its first arg
+    // (`peer.name` in `notifyPeer()`).
+    const info = await deps.registry.get(target);
+    if (info === null) {
+      // Peer no longer registered — a transient (deregistered mid-restart)
+      // or permanent (removed) absence look identical here; either way,
+      // report a failed attempt so the outbox retries until the TTL either
+      // finds the peer registered again or dead-letters per Decision 4.
+      const attempt: NotifyOutboxAttempt = { httpOk: false, transportOk: false };
+      record(id, attempt);
+      return { ack: false };
+    }
+    const peer = { name: target, info };
+    const result = await dispatchToPeer(deps, peer, input, id, timeoutMs);
+    record(id, result);
+    return { ack: result.httpOk };
+  };
+
+  return { send, lastAttempts };
 }

@@ -40,6 +40,14 @@ import { recordEdge } from './comms-ledger-record.js';
 import type { CommsLedgerEdge } from './comms-ledger.js';
 import { getCommsLedgerWriteFailedCounter, MetricAttr } from './metrics.js';
 import type { NotifyPayload, SignRequest } from '@groundnuty/macf-core';
+// DR-038 Slice B (groundnuty/macf#704): the durable effectively-once delivery
+// wiring — pluggable store driver, outbox (sender) + inbox (receiver), and
+// the periodic ticker that drives outbox retries over the server's lifetime.
+import { createDefaultDeliveryStores } from './delivery/driver.js';
+import { createOutbox } from './delivery/outbox.js';
+import { createInbox } from './delivery/inbox.js';
+import { createOutboxTicker } from './delivery/outbox-ticker.js';
+import type { OutboxEntry } from './delivery/store.js';
 
 // NOTE: `checkPendingIssues` from './startup-issues.js' used to be
 // called here at boot — but the call had a hardcoded
@@ -483,6 +491,16 @@ async function main(): Promise<void> {
   // revisit if longer-lived persistence becomes a need.
   const taskStore = new TaskStore();
 
+  // DR-038 Slice B (groundnuty/macf#704): construct the delivery stores ONCE,
+  // process-lifetime. `createDefaultDeliveryStores` is the in-memory
+  // PLACEHOLDER driver (logs a loud warning) — the devops-owned DR-008
+  // disk-spool driver is a straight swap of this one call, per
+  // `delivery/driver.ts`'s doc comment; nothing downstream (inbox, outbox,
+  // the /notify + message/send receiver wiring, or the notify_peer sender
+  // wiring) changes shape when that swap happens.
+  const { outboxStore, inboxStore } = createDefaultDeliveryStores(logger);
+  const inbox = createInbox({ store: inboxStore });
+
   const httpsServer = createHttpsServer({
     caCertPath: config.caCertPath,
     agentCertPath: config.agentCertPath,
@@ -492,6 +510,10 @@ async function main(): Promise<void> {
     onSign,
     agentCard,
     taskStore,
+    // DR-038 Slice B: the durable receiver-side inbox — persist-then-ACK
+    // (Decision 3) for the direct A2A path (/notify peer_notification +
+    // A2A message/send).
+    inbox,
     logger,
     // macf#473 piece 2: the inbound recv edge sites (/notify + A2A
     // message/send) record an authoritative ledger edge BEFORE delivering
@@ -513,7 +535,8 @@ async function main(): Promise<void> {
   // macf#256): `to` field is OPTIONAL — when absent, broadcasts to all
   // peers in the project registry (excluding self).
   const { readFileSync } = await import('node:fs');
-  const { notifyPeer, NotifyPeerInputSchema, NotifyPeerOutputSchema } = await import('./notify-peer.js');
+  const { notifyPeer, NotifyPeerInputSchema, NotifyPeerOutputSchema, createNotifyOutboxSend } =
+    await import('./notify-peer.js');
   // macf#396 Phase 3: outbound A2A client for protocol-selection.
   // Shared across notify_peer invocations so the AgentCard cache is
   // process-lifetime (5-min TTL) rather than per-call. Closed in
@@ -527,7 +550,7 @@ async function main(): Promise<void> {
     mTlsClientKeyPem,
     caCertPem,
   });
-  const notifyPeerDeps = {
+  const notifyDispatchDeps = {
     registry,
     selfAgentName: config.agentName,
     mTlsClientCertPem,
@@ -539,6 +562,52 @@ async function main(): Promise<void> {
     // per peer once the dispatch outcome (delivered) is known.
     recordLedgerEdge,
   };
+
+  // DR-038 Slice B: wire the durable outbox — `send` is the ACTUAL peer
+  // dispatch (legacy /notify POST or A2A message/send), adapted to the
+  // `OutboxSendFn` contract by `createNotifyOutboxSend`. `onDeadLetter` is a
+  // LOUD log only in this slice — Decision 4 explicitly scopes the GitHub-
+  // issue escalation as a decision-layer action, not a channel-server-core
+  // concern; wiring the actual `gh issue create` call is a follow-on (TODO
+  // below), not this wiring slice.
+  const { send: outboxSend, lastAttempts: outboxAttempts } = createNotifyOutboxSend(notifyDispatchDeps);
+  const onOutboxDeadLetter = (entry: OutboxEntry): void => {
+    logger.error('outbox_dead_letter', {
+      id: entry.id,
+      target: entry.target,
+      enqueued_at: new Date(entry.enqueuedAt).toISOString(),
+      attempt_count: entry.attemptCount,
+      // TODO(DR-038 Decision 4 follow-on): escalate via `gh issue create` to
+      // the operator/reporter — the always-durable GitHub-anchored downgrade
+      // Decision 4 calls for. Deliberately NOT wired here: a GitHub call is a
+      // decision-layer action ("a decision-layer action... NOT a store-driver
+      // method" — Decision 4), out of scope for the channel-server core this
+      // slice wires. Until that lands, a TTL-expired direct-path message is
+      // LOUDLY logged but not automatically escalated to GitHub.
+      detail: 'TTL expired without a durable ACK (DR-038 Decision 4). GitHub-issue ' +
+        'escalation is NOT YET WIRED — see TODO at this call site.',
+    });
+  };
+  const outbox = createOutbox({
+    store: outboxStore,
+    send: outboxSend,
+    onDeadLetter: onOutboxDeadLetter,
+    logger,
+  });
+  const notifyPeerDeps = {
+    ...notifyDispatchDeps,
+    outbox,
+    outboxAttempts,
+  };
+
+  // DR-038 Decision 4 ("resumed on sender startup"): drive the outbox once
+  // immediately at boot, before the recurring ticker starts, so any entry
+  // already overdue when this process comes up gets its first attempt right
+  // away rather than waiting a full tick interval. A no-op today (the
+  // in-memory store starts empty every process launch); load-bearing once a
+  // durable store driver (DR-008) replaces the in-memory placeholder.
+  const outboxTicker = createOutboxTicker({ outbox, logger });
+  void outboxTicker.tickNow();
   mcp.mcp.registerTool(
     'notify_peer',
     {
@@ -750,11 +819,20 @@ async function main(): Promise<void> {
     httpsServer,
     healthState: health,
     registryHeartbeat,
+    // DR-038 Slice B: clear the outbox-retry-drive interval on shutdown —
+    // same best-effort posture as registryHeartbeat/otel-probe (unref()'d,
+    // so a missed clear can't pin exit; a hiccup must not mask a real
+    // deregister/stop failure).
+    outboxTicker,
     logger,
   });
 
   // Start the periodic heartbeat now that its stop() is wired into shutdown.
   registryHeartbeat.start();
+  // DR-038 Decision 4: start the periodic outbox-retry-drive tick now that
+  // its stop() is wired into shutdown too (same ordering rationale as the
+  // registry heartbeat above).
+  outboxTicker.start();
 
   lifecycle.set('serving'); // macf#642 forensic phase marker
   logger.info('server_started', {
