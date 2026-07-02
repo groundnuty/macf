@@ -45,6 +45,14 @@
  *      The FUTURE plugin startup-drain's surface-as-text path (Decision 5's
  *      other trigger) is the intended eventual consumer of a given-up
  *      entry, once it too can see this process's store (post-DR-008).
+ *      Forward-note (DR-008, science #747 review): the attempt `Map` is
+ *      process-local, so once a DURABLE store survives restarts a given-up
+ *      entry gets a FRESH `maxAttempts` budget on every process restart (the
+ *      Map resets while the entry persists) until the surface-as-text path
+ *      consumes it. The durable-driver integration should define how a
+ *      given-up entry is FINALLY resolved (dead-letter, or surfaced-once) so
+ *      it can't be re-attempted indefinitely across restart generations.
+ *      Moot today: the in-memory store loses the entry on restart too.
  *   4. Drainer ownership / no double-surface — this driver ONLY re-fires
  *      `onNotify` + marks-on-success, or gives up silently. It NEVER
  *      surfaces anything as text itself; that split keeps it composable
@@ -107,11 +115,17 @@ export interface InboxDriveDeps {
    * The SAME callback passed to `createHttpsServer` — re-invoked verbatim
    * for an orphaned entry. The cast from `InboxEntry.payload` (`unknown` at
    * the store layer by design — see `@groundnuty/macf-core`'s
-   * `delivery/store.ts`) to `NotifyPayload` is sound here because every
-   * entry this driver ever sees was itself persisted from an already-
-   * `NotifyPayloadSchema`-validated payload at the ORIGINAL `inbox.accept()`
-   * call site (`https.ts`'s `/notify` + `message/send` recv edges) — nothing
-   * else ever calls `accept()`.
+   * `delivery/store.ts`) to `NotifyPayload` is sound because BOTH
+   * `inbox.accept()` call sites in `https.ts` persist a NotifyPayload:
+   *   - the legacy `/notify` edge persists the `NotifyPayloadSchema`-
+   *     validated `result.data`;
+   *   - the A2A `message/send` edge persists `a2aMessageToNotifyPayload(msg)`
+   *     — the CONVERTED payload, NOT the raw `Message` (this uniform-persist
+   *     is the #744 correctness fix; persisting the raw `Message` would make
+   *     an A2A orphan re-fire a malformed NotifyPayload with every field
+   *     undefined).
+   * Nothing else ever calls `accept()`, so `entry.payload` is invariably a
+   * NotifyPayload by the time this driver re-fires it.
    */
   readonly onNotify: (payload: NotifyPayload) => Promise<void>;
   /**
