@@ -154,7 +154,7 @@ const PLAN_HEADERS = ['AGENT', 'FLEET', 'RUNNING', 'PIN', 'PLAN'] as const;
 function planCell(plan: AgentUpgradePlan, target: string): string {
   switch (plan.disposition) {
     case 'behind':
-      return `UPGRADE ${plan.runningVersion ?? '?'}→${target} (busy-gated at execute)`;
+      return `UPGRADE ${plan.runningVersion ?? '?'}→${target}`;
     case 'at-target':
       return 'OK (at target)';
     case 'offline':
@@ -208,7 +208,8 @@ function renderReport(report: FleetUpgradeReport, execute: boolean, log: (s: str
     const behind = report.fleets.flatMap((f) => f.plans).filter((p) => p.disposition === 'behind').length;
     log(
       behind > 0
-        ? `\n${behind} agent(s) behind target. Re-run with --execute to roll (ATTENDED: clear the launch-prompts as each agent returns).`
+        ? `\n${behind} agent(s) behind target. Re-run with --execute to roll (ATTENDED: clear the launch-prompts as each agent returns).\n` +
+          'At execute, each agent rolls only when idle — a busy one is skipped and reported (use --wait to poll for idle instead).'
         : '\nAll selected agents are at target — nothing to roll.',
     );
     return 0;
