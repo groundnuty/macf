@@ -47,6 +47,10 @@ import { createDefaultDeliveryStores } from './delivery/driver.js';
 import { createOutbox } from './delivery/outbox.js';
 import { createInbox } from './delivery/inbox.js';
 import { createOutboxTicker } from './delivery/outbox-ticker.js';
+// DR-038 Decision 5 follow-on (groundnuty/macf#744): the live inbox orphan-
+// drain ticker — same family as the outbox ticker above, re-firing onNotify
+// for the receiver's own in-process undrained entries.
+import { createInboxTicker } from './delivery/inbox-ticker.js';
 import type { OutboxEntry } from '@groundnuty/macf-core';
 
 // NOTE: `checkPendingIssues` from './startup-issues.js' used to be
@@ -608,6 +612,22 @@ async function main(): Promise<void> {
   // durable store driver (DR-008) replaces the in-memory placeholder.
   const outboxTicker = createOutboxTicker({ outbox, logger });
   void outboxTicker.tickNow();
+
+  // DR-038 Decision 5 follow-on (groundnuty/macf#744): the live inbox
+  // orphan-drain ticker — re-fires `onNotify` for any undrained inbox entry
+  // whose ORIGINAL `onNotify` call threw between `inbox.accept()` and
+  // `inbox.markProcessed()` (see the on-receipt wiring in https.ts). Same
+  // "tick once at boot, then start the recurring interval" ordering as the
+  // outbox ticker above, and for the same reason: any orphan already
+  // undrained when this process comes up gets an immediate first re-fire
+  // attempt rather than waiting a full tick interval. Today's in-memory
+  // inbox store starts empty every process launch, so this is a no-op on a
+  // fresh boot — it becomes load-bearing for cross-restart orphans once a
+  // durable store driver (DR-008) replaces the placeholder; even today it
+  // recovers a transient onNotify failure within THIS process's lifetime,
+  // which the fire-and-forget pre-DR-038 behavior never did.
+  const inboxTicker = createInboxTicker({ inbox, onNotify, logger });
+  void inboxTicker.tickNow();
   mcp.mcp.registerTool(
     'notify_peer',
     {
@@ -824,6 +844,9 @@ async function main(): Promise<void> {
     // so a missed clear can't pin exit; a hiccup must not mask a real
     // deregister/stop failure).
     outboxTicker,
+    // DR-038 Decision 5 follow-on (groundnuty/macf#744): clear the inbox
+    // orphan-drain interval on shutdown too — same best-effort posture.
+    inboxTicker,
     logger,
   });
 
@@ -833,6 +856,9 @@ async function main(): Promise<void> {
   // its stop() is wired into shutdown too (same ordering rationale as the
   // registry heartbeat above).
   outboxTicker.start();
+  // DR-038 Decision 5 follow-on (groundnuty/macf#744): start the periodic
+  // inbox orphan-drain tick now that its stop() is wired into shutdown too.
+  inboxTicker.start();
 
   lifecycle.set('serving'); // macf#642 forensic phase marker
   logger.info('server_started', {

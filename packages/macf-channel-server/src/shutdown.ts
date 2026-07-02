@@ -48,6 +48,13 @@ export function registerShutdownHandler(config: {
    */
   readonly outboxTicker?: { readonly stop: () => void };
   /**
+   * DR-038 Decision 5 follow-on (groundnuty/macf#744): the inbox orphan-
+   * drain ticker, if any. On shutdown its `stop()` is called (best-effort)
+   * to clear the periodic `driveInboxOnce()` interval — mirrors the
+   * `outboxTicker` cleanup above.
+   */
+  readonly inboxTicker?: { readonly stop: () => void };
+  /**
    * The MCP stdio transport's input stream — defaults to `process.stdin`,
    * injectable for tests. On a normal Claude-TUI exit this stream reaches EOF
    * (`'end'`) / is destroyed (`'close'`); those events are wired to the same
@@ -60,7 +67,7 @@ export function registerShutdownHandler(config: {
    */
   readonly stdin?: Pick<NodeJS.ReadStream, 'on'>;
 }): (trigger?: string) => Promise<boolean> {
-  const { agentName, registry, instanceId, httpsServer, healthState, registryHeartbeat, outboxTicker, logger } = config;
+  const { agentName, registry, instanceId, httpsServer, healthState, registryHeartbeat, outboxTicker, inboxTicker, logger } = config;
   let shuttingDown = false;
   let lastResult = true;
 
@@ -96,6 +103,15 @@ export function registerShutdownHandler(config: {
     // Same best-effort posture as the registry-heartbeat clear above.
     try {
       outboxTicker?.stop?.();
+    } catch {
+      // ignore — unref()'d interval; a missed clear can't pin exit
+    }
+
+    // DR-038 Decision 5 follow-on: clear the inbox orphan-drain interval
+    // (groundnuty/macf#744). Same best-effort posture as the outbox-ticker
+    // clear above.
+    try {
+      inboxTicker?.stop?.();
     } catch {
       // ignore — unref()'d interval; a missed clear can't pin exit
     }
