@@ -165,6 +165,9 @@ describe('formatPlanTable', () => {
     expect(table).toContain('UPGRADE 0.2.40→0.2.41');
     expect(table).toContain('OK (at target)');
     expect(table).toContain('UNREACHABLE');
+    // #721: the per-line PLAN cell must NOT carry the present-tense-reading
+    // "(busy-gated at execute)" parenthetical — it misreads as "agent is busy".
+    expect(table).not.toContain('busy-gated');
   });
 });
 
@@ -187,7 +190,13 @@ describe('runFleetUpgrade', () => {
     expect(code).toBe(0);
     expect(calls.upgrade).toEqual([]);
     expect(calls.restart).toEqual([]);
-    expect(lines.join('\n')).toContain('dry-run');
+    const out = lines.join('\n');
+    expect(out).toContain('dry-run');
+    // #721: the busy-gate is explained ONCE as a future-conditional footer
+    // (mechanism + --wait), not repeated per-line as present-tense state.
+    expect(out).toContain('rolls only when idle');
+    expect(out).toContain('--wait');
+    expect(out).not.toContain('busy-gated');
   });
 
   it('--execute rolls the default fleet and reports GREEN', async () => {
