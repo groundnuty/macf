@@ -268,4 +268,42 @@ describe('POST /a2a/v1 message/send — DR-038 inbox wiring (Message.messageId i
       await stop();
     }
   });
+
+  it('#744: accept persists the CONVERTED NotifyPayload (not the raw A2A Message) — so an inbox orphan re-fires a valid payload', async () => {
+    // The #744 inbox orphan-drain ticker re-fires `onNotify(entry.payload as
+    // NotifyPayload)` directly. If the A2A accept site persisted the raw
+    // `Message` (messageId/role/parts) instead of the converted NotifyPayload,
+    // an A2A orphan would re-fire a malformed payload with every NotifyPayload
+    // field (type/event/message/source) undefined. Guard: capture exactly what
+    // `inbox.accept()` is asked to persist and assert it's the converted shape.
+    const acceptedPayloads: unknown[] = [];
+    const real = createInbox({ store: createInMemoryInboxStore() });
+    const inbox: Inbox = {
+      accept: (id, payload) => { acceptedPayloads.push(payload); return real.accept(id, payload); },
+      undrained: real.undrained,
+      markProcessed: real.markProcessed,
+    };
+    const onNotify = vi.fn(async () => undefined);
+    const { port, stop } = await startServer({ onNotify, inbox, taskStore: new TaskStore() });
+    try {
+      const res = await httpsRequest(port, {
+        method: 'POST', path: '/a2a/v1', body: messageSendBody(1, 'a2a-msg-converted-1'),
+        headers: { 'Content-Type': 'application/json' },
+      });
+      expect(res.status).toBe(200);
+      expect(acceptedPayloads).toHaveLength(1);
+      const persisted = acceptedPayloads[0] as Record<string, unknown>;
+      // CONVERTED NotifyPayload shape present, raw A2A Message shape absent:
+      expect(persisted.type).toBe('peer_notification');
+      expect(persisted.message).toBe('hi'); // joined from parts[].text
+      expect(persisted).not.toHaveProperty('role');
+      expect(persisted).not.toHaveProperty('parts');
+      // ...and it's the SAME payload the live onNotify received — uniform at
+      // both the persist and the delivery sites (the #744 fix converts once).
+      expect(onNotify).toHaveBeenCalledTimes(1);
+      expect(onNotify.mock.calls[0]?.[0]).toEqual(persisted);
+    } finally {
+      await stop();
+    }
+  });
 });

@@ -1036,16 +1036,29 @@ export function createHttpsServer(config: {
             // handler; called from both delivering branches below (resume +
             // fresh happy-path).
             const deliverA2aMessage = async (msg: Message): Promise<void> => {
+              // DR-038 #744: persist the CONVERTED NotifyPayload (not the raw
+              // `Message`) so `entry.payload` is uniformly a NotifyPayload at
+              // BOTH `inbox.accept` sites (legacy `/notify` above + this A2A
+              // path). The inbox orphan-drain ticker (`inbox-drain-driver.ts`)
+              // re-fires `onNotify(entry.payload as NotifyPayload)` directly;
+              // persisting the raw `Message` here would make an A2A orphan
+              // re-fire `onNotify(Message)` → every NotifyPayload field
+              // (`type`/`event`/`message`/`source`) undefined → a malformed,
+              // context-free re-delivery. Convert ONCE + reuse for both the
+              // persist and the live `onNotify` (dedup keys on `id`, and both
+              // drainers consume the payload as a NotifyPayload — nothing
+              // downstream needs the raw `Message` post-accept).
+              const payload = a2aMessageToNotifyPayload(msg);
               if (inbox !== undefined) {
-                const accepted = await inbox.accept(msg.messageId, msg);
+                const accepted = await inbox.accept(msg.messageId, payload);
                 if (accepted.wasNew) {
-                  await onNotify(a2aMessageToNotifyPayload(msg));
+                  await onNotify(payload);
                   await inbox.markProcessed(msg.messageId);
                 } else {
                   logger.info('a2a_inbox_dedup', { message_id: msg.messageId });
                 }
               } else {
-                await onNotify(a2aMessageToNotifyPayload(msg));
+                await onNotify(payload);
               }
             };
 
