@@ -24,7 +24,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 
-const HOOK_SCRIPT = join(findCliPackageRoot(), 'scripts', 'check-close-keyword.sh');
+const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'check-close-keyword.sh');
 
 const ACTING = 'macf-code-agent'; // ACTING_BOT resolves to `macf-code-agent[bot]`
 const PEER = 'macf-science-agent[bot]';

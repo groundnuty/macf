@@ -11,6 +11,24 @@
  * Workspace rule copies get a header warning against direct edits.
  * Workspace script copies preserve 0755 mode so the hooks that call
  * them can execute.
+ *
+ * **DR-039 phase 2 (groundnuty/macf#698):** the 7 load-bearing hook
+ * scripts single-sourced into the plugin's `hooks/hooks.json` at DR-039
+ * Decision 2 (`check-gh-token.sh`, `check-mention-routing.sh`,
+ * `check-lgtm-gate.sh`, `check-close-keyword.sh`, `check-gh-attribution.sh`,
+ * `check-channel-alive.sh`, `harvest-reflection.sh`) moved a second time —
+ * their FILES now live at `<package-root>/plugin/scripts/*.sh` (tamper-
+ * resistant: the plugin invokes them via `${CLAUDE_PLUGIN_ROOT}/scripts/`, so
+ * an agent editing its workspace `.claude/scripts/` copy no longer changes
+ * what the hook actually runs). `copyCanonicalScripts` still distributes a
+ * compat copy of those 7 to `<workspace>/.claude/scripts/` — hand-wired
+ * substrate hooks (`settings.json`-registered, pre-DR-039 workspaces) and
+ * non-plugin-init'd workspaces still reference that path — so it now reads
+ * from TWO source directories: the legacy `<package-root>/scripts/` (helper
+ * scripts + the 3 hooks that remain hand-wired) and the new
+ * `<package-root>/plugin/scripts/` (the 7 migrated hooks, alongside the
+ * plugin-only `mark-turn-state.sh`, which is deliberately excluded from the
+ * `.claude/scripts/` compat copy — see `PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT`).
  */
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -82,39 +100,82 @@ export function copyCanonicalRules(workspaceDir: string, options: {
 }
 
 /**
- * Path to the canonical scripts directory shipped with the CLI.
+ * Path to the LEGACY canonical scripts directory shipped with the CLI —
+ * agent-invoked helpers (`macf-gh-token.sh`, `macf-whoami.sh`,
+ * `tmux-send-to-claude.sh`) plus the 3 hooks that remain hand-wired in
+ * `.claude/settings.json` post-DR-039 (`check-auditor-never-acts.sh`,
+ * `emit-turn-receipt.sh`, `check-channels-enabled.sh`).
  */
 export function canonicalScriptsDir(packageRoot: string = findCliPackageRoot()): string {
   return join(packageRoot, 'scripts');
 }
 
 /**
- * Copy every .sh file from the canonical scripts dir to
+ * Path to the canonical PLUGIN scripts directory shipped with the CLI
+ * (`<package-root>/plugin/scripts/`). Since DR-039 phase 2
+ * (groundnuty/macf#698) this is the canonical home of the 7 load-bearing
+ * hook scripts the plugin's `hooks/hooks.json` invokes via
+ * `${CLAUDE_PLUGIN_ROOT}/scripts/`, alongside the pre-existing
+ * plugin-only `mark-turn-state.sh`.
+ */
+export function canonicalPluginScriptsDir(packageRoot: string = findCliPackageRoot()): string {
+  return join(packageRoot, 'plugin', 'scripts');
+}
+
+/**
+ * Scripts that live under `canonicalPluginScriptsDir()` but are NEVER
+ * distributed to `<workspace>/.claude/scripts/` — they have no hand-wired
+ * `.claude/scripts/`-path consumer (they're invoked exclusively via
+ * `${CLAUDE_PLUGIN_ROOT}/scripts/` from the plugin's own `hooks.json`), so a
+ * compat copy would just be dead weight in the workspace.
+ */
+const PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT: ReadonlySet<string> = new Set(['mark-turn-state.sh']);
+
+/**
+ * Copy every .sh file from the canonical scripts dirs to
  * <workspace>/.claude/scripts/. Preserves executable mode (0o755).
+ *
+ * Reads from TWO source directories (DR-039 phase 2, groundnuty/macf#698):
+ * the legacy `canonicalScriptsDir()` (helper scripts + the 3 hand-wired
+ * hooks) and `canonicalPluginScriptsDir()` (the 7 hook scripts that moved
+ * into the plugin — one canonical source feeding two consumers: the
+ * plugin's own `hooks.json` mount AND this `.claude/scripts/` compat copy).
+ * `PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT` filters out plugin-only scripts
+ * (`mark-turn-state.sh`) that have no `.claude/scripts/`-path consumer.
  *
  * Unlike copyCanonicalRules, no header is injected — shell scripts
  * can't take HTML comments, and the shebang + usage comment in the
  * source already documents managed status.
  *
- * Returns copied basenames. Empty array if the canonical dir is missing.
+ * Returns copied basenames (deduplicated across both source dirs, though
+ * no overlap is expected in practice). Missing source dirs are skipped
+ * individually (not a hard failure) — the target dir is created only if at
+ * least one source dir exists and yields a script to copy.
  */
 export function copyCanonicalScripts(workspaceDir: string, options: {
   readonly canonicalDir?: string;
+  readonly pluginScriptsDir?: string;
 } = {}): readonly string[] {
-  const sourceDir = options.canonicalDir ?? canonicalScriptsDir();
-  if (!existsSync(sourceDir)) return [];
+  const sourceDirs: readonly { readonly dir: string; readonly excluded: ReadonlySet<string> }[] = [
+    { dir: options.canonicalDir ?? canonicalScriptsDir(), excluded: new Set() },
+    { dir: options.pluginScriptsDir ?? canonicalPluginScriptsDir(), excluded: PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT },
+  ];
 
   const targetDir = join(resolve(workspaceDir), '.claude', 'scripts');
-  mkdirSync(targetDir, { recursive: true });
-
   const copied: string[] = [];
-  for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
-    if (!entry.isFile() || !entry.name.endsWith('.sh')) continue;
-    const src = join(sourceDir, entry.name);
-    const dst = join(targetDir, entry.name);
-    copyFileSync(src, dst);
-    chmodSync(dst, 0o755);
-    copied.push(entry.name);
+
+  for (const { dir: sourceDir, excluded } of sourceDirs) {
+    if (!existsSync(sourceDir)) continue;
+    mkdirSync(targetDir, { recursive: true });
+    for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.sh')) continue;
+      if (excluded.has(entry.name)) continue;
+      const src = join(sourceDir, entry.name);
+      const dst = join(targetDir, entry.name);
+      copyFileSync(src, dst);
+      chmodSync(dst, 0o755);
+      copied.push(entry.name);
+    }
   }
   return copied;
 }

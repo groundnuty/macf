@@ -149,10 +149,37 @@ describe('installGhTokenHook', () => {
   // regardless of where Bash was invoked from. Per DR-039 Decision 2
   // (groundnuty/macf#731/#739) this hook's REGISTRATION now lives in the
   // plugin's hooks.json (see the "plugin single-source" describe block
-  // below); the constant itself is unchanged and still used there.
+  // below). Per DR-039 phase 2 (groundnuty/macf#698) the plugin's own
+  // hooks.json entry no longer matches this constant verbatim — it invokes
+  // the script via `${CLAUDE_PLUGIN_ROOT}/scripts/` instead (the script FILE
+  // moved into the plugin). This constant is retained ONLY for the
+  // settings.json/.claude/scripts/ migration-cleanup + hand-wired-compat
+  // path (`isMacfManagedCommand` basename matching).
   it('MACF_HOOK_COMMAND uses $CLAUDE_PROJECT_DIR (cwd-independent absolute path)', () => {
     expect(MACF_HOOK_COMMAND).toMatch(/^\$CLAUDE_PROJECT_DIR\//);
     expect(MACF_HOOK_COMMAND).toContain('check-gh-token.sh');
+  });
+
+  // Per DR-039 phase 2 (groundnuty/macf#698), the plugin's hooks.json no
+  // longer matches ANY of the 7 migrated-hook constants verbatim (see the
+  // dedicated assertions above) — but the constants themselves must still
+  // retain the settings.json-compat `$CLAUDE_PROJECT_DIR/.claude/scripts/`
+  // shape, since `isMacfManagedCommand` / the migration-cleanup strip logic
+  // (below) and any still-hand-wired substrate workspace depend on it.
+  it('the 7 migrated-hook constants all retain the $CLAUDE_PROJECT_DIR/.claude/scripts/ compat form', () => {
+    const constants: ReadonlyArray<readonly [string, string]> = [
+      [MACF_HOOK_COMMAND, 'check-gh-token.sh'],
+      [MACF_MENTION_HOOK_COMMAND, 'check-mention-routing.sh'],
+      [MACF_LGTM_HOOK_COMMAND, 'check-lgtm-gate.sh'],
+      [MACF_CLOSE_HOOK_COMMAND, 'check-close-keyword.sh'],
+      [MACF_ATTRIBUTION_HOOK_COMMAND, 'check-gh-attribution.sh'],
+      [MACF_REFLECTION_HOOK_COMMAND, 'harvest-reflection.sh'],
+      [MACF_CHANNEL_ALIVE_HOOK_COMMAND, 'check-channel-alive.sh'],
+    ];
+    for (const [constant, basename] of constants) {
+      expect(constant, `${basename} constant`).toMatch(/^\$CLAUDE_PROJECT_DIR\/\.claude\/scripts\//);
+      expect(constant, `${basename} constant`).toContain(basename);
+    }
   });
 
   it('creates .claude/settings.json when missing, with the auditor hook entry only', () => {
@@ -809,46 +836,61 @@ describe('plugin hooks.json single-source (DR-039 Decision 2)', () => {
     return entries.flatMap((e) => e.hooks.filter((h) => h.type === 'command').map((h) => h.command as string));
   }
 
+  // DR-039 phase 2 (groundnuty/macf#698): the 7 migrated hook scripts moved a
+  // second time — their FILES now live under the plugin's own scripts/ dir
+  // (`packages/macf/plugin/scripts/`), so the plugin's hooks.json invokes them
+  // via `${CLAUDE_PLUGIN_ROOT}/scripts/<name>.sh` (tamper-resistant), NOT the
+  // `$CLAUDE_PROJECT_DIR/.claude/scripts/` form the MACF_*_HOOK_COMMAND
+  // constants still carry (those constants are now scoped to the settings.json
+  // hand-wired-compat path only — see their doc comments in settings-writer.ts).
+  function pluginRootHookCommand(basename: string): string {
+    return `"\${CLAUDE_PLUGIN_ROOT}/scripts/${basename}"`;
+  }
+
   it('is valid JSON with a top-level hooks map', () => {
     const parsed = readPluginHooksJson();
     expect(typeof parsed.hooks).toBe('object');
   });
 
-  it('registers check-gh-token.sh / check-mention-routing.sh / check-lgtm-gate.sh / check-close-keyword.sh on PreToolUse with matcher Bash', () => {
+  it('registers check-gh-token.sh / check-mention-routing.sh / check-lgtm-gate.sh / check-close-keyword.sh on PreToolUse with matcher Bash, via ${CLAUDE_PLUGIN_ROOT}/scripts/', () => {
     const parsed = readPluginHooksJson();
     const preToolUse = parsed.hooks['PreToolUse'] ?? [];
-    for (const cmd of [MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND]) {
+    for (const name of ['check-gh-token.sh', 'check-mention-routing.sh', 'check-lgtm-gate.sh', 'check-close-keyword.sh']) {
+      const cmd = pluginRootHookCommand(name);
       const entry = preToolUse.find((e) => e.hooks.some((h) => h.command === cmd));
       expect(entry, `expected a PreToolUse entry for ${cmd}`).toBeDefined();
       expect(entry?.matcher).toBe('Bash');
+      // Not the settings.json/.claude/scripts/ compat form.
+      expect(preToolUse.some((e) => e.hooks.some((h) => h.command?.includes('.claude/scripts/' + name)))).toBe(false);
     }
   });
 
-  it('registers check-gh-attribution.sh on PostToolUse with matcher Bash', () => {
+  it('registers check-gh-attribution.sh on PostToolUse with matcher Bash, via ${CLAUDE_PLUGIN_ROOT}/scripts/', () => {
     const parsed = readPluginHooksJson();
     const postToolUse = parsed.hooks['PostToolUse'] ?? [];
-    const entry = postToolUse.find((e) => e.hooks.some((h) => h.command === MACF_ATTRIBUTION_HOOK_COMMAND));
+    const entry = postToolUse.find((e) => e.hooks.some((h) => h.command === pluginRootHookCommand('check-gh-attribution.sh')));
     expect(entry).toBeDefined();
     expect(entry?.matcher).toBe('Bash');
   });
 
-  it('registers harvest-reflection.sh on PreCompact, alongside the existing checkpoint_to_memory + notify_peer mcp_tool entries', () => {
+  it('registers harvest-reflection.sh on PreCompact, via ${CLAUDE_PLUGIN_ROOT}/scripts/, alongside the existing checkpoint_to_memory + notify_peer mcp_tool entries', () => {
     const parsed = readPluginHooksJson();
     const preCompact = parsed.hooks['PreCompact'] ?? [];
     const cmds = commandsFor(preCompact);
-    expect(cmds).toContain(MACF_REFLECTION_HOOK_COMMAND);
+    expect(cmds).toContain(pluginRootHookCommand('harvest-reflection.sh'));
     // The pre-existing mcp_tool entries must NOT have regressed.
     const mcpTools = preCompact.flatMap((e) => e.hooks.filter((h) => h.type === 'mcp_tool').map((h) => h.tool));
     expect(mcpTools).toContain('checkpoint_to_memory');
     expect(mcpTools).toContain('notify_peer');
   });
 
-  it('registers check-channel-alive.sh on BOTH SessionStart and UserPromptSubmit', () => {
+  it('registers check-channel-alive.sh on BOTH SessionStart and UserPromptSubmit, via ${CLAUDE_PLUGIN_ROOT}/scripts/', () => {
     const parsed = readPluginHooksJson();
     const sessionStart = commandsFor(parsed.hooks['SessionStart'] ?? []);
     const userPromptSubmit = commandsFor(parsed.hooks['UserPromptSubmit'] ?? []);
-    expect(sessionStart).toContain(MACF_CHANNEL_ALIVE_HOOK_COMMAND);
-    expect(userPromptSubmit).toContain(MACF_CHANNEL_ALIVE_HOOK_COMMAND);
+    const expected = pluginRootHookCommand('check-channel-alive.sh');
+    expect(sessionStart).toContain(expected);
+    expect(userPromptSubmit).toContain(expected);
   });
 
   it('does NOT register check-channels-enabled.sh, check-auditor-never-acts.sh, or emit-turn-receipt.sh (those stay hand-wired in settings.json)', () => {
@@ -866,6 +908,27 @@ describe('plugin hooks.json single-source (DR-039 Decision 2)', () => {
     expect(markTurnStateCommands.length).toBeGreaterThan(0);
     for (const c of markTurnStateCommands) {
       expect(c).toContain('${CLAUDE_PLUGIN_ROOT}');
+    }
+  });
+
+  it('none of the 7 migrated hooks reference the legacy $CLAUDE_PROJECT_DIR/.claude/scripts/ path anymore', () => {
+    const parsed = readPluginHooksJson();
+    const allCommands = Object.values(parsed.hooks).flatMap((entries) => commandsFor(entries));
+    for (const name of [
+      'check-gh-token.sh',
+      'check-mention-routing.sh',
+      'check-lgtm-gate.sh',
+      'check-close-keyword.sh',
+      'check-gh-attribution.sh',
+      'harvest-reflection.sh',
+      'check-channel-alive.sh',
+    ]) {
+      const matches = allCommands.filter((c) => c.includes(name));
+      expect(matches.length, `expected at least one entry for ${name}`).toBeGreaterThan(0);
+      for (const c of matches) {
+        expect(c, `${name} command should be plugin-root-relative: ${c}`).toContain('${CLAUDE_PLUGIN_ROOT}');
+        expect(c, `${name} command should not use the .claude/scripts/ compat path: ${c}`).not.toContain('.claude/scripts/');
+      }
     }
   });
 });

@@ -31,7 +31,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 
-const HOOK_SCRIPT = join(findCliPackageRoot(), 'scripts', 'check-lgtm-gate.sh');
+const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'check-lgtm-gate.sh');
 
 interface StubReview {
   readonly authorLogin: string;

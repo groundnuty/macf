@@ -1,5 +1,5 @@
 {
-  "description": "MACF agent hooks: dependency installer, work check, SessionEnd + PreCompact peer-notification (UC-1 per DR-023; moved off the per-turn Stop hook in macf#673 to stop blocking the TUI every turn — distinguishable session-end vs session-compact events), PreCompact-hook session checkpoint (UC-3 per DR-023), the turn-state marker that lets the channel server report accurate live agent state through long tool waits (DR-030 phase-1, groundnuty/macf#568), and the single-sourced load-bearing guard set (DR-039 Decision 2, groundnuty/macf#731/#739): gh-token attribution-trap (#140), mention-routing-hygiene (#244/#272), LGTM-gate (#270), close-keyword-guard (#431), attribution result-invariant backstop (#489), reflection-harvest (#500), and channel-server liveness guard (#734). Scripts stay path-invoked at $CLAUDE_PROJECT_DIR/.claude/scripts/ (workbench-maintainable); only the registration lives here now.",
+  "description": "MACF agent hooks: dependency installer, work check, SessionEnd + PreCompact peer-notification (UC-1 per DR-023; moved off the per-turn Stop hook in macf#673 to stop blocking the TUI every turn — distinguishable session-end vs session-compact events), PreCompact-hook session checkpoint (UC-3 per DR-023), the turn-state marker that lets the channel server report accurate live agent state through long tool waits (DR-030 phase-1, groundnuty/macf#568), and the single-sourced load-bearing guard set (DR-039 Decision 2, groundnuty/macf#731/#739): gh-token attribution-trap (#140), mention-routing-hygiene (#244/#272), LGTM-gate (#270), close-keyword-guard (#431), attribution result-invariant backstop (#489), reflection-harvest (#500), and channel-server liveness guard (#734). As of DR-039 phase 2 (groundnuty/macf#698), these 7 scripts themselves also moved into the plugin (`packages/macf/plugin/scripts/`, joining `mark-turn-state.sh`) and are invoked via ${CLAUDE_PLUGIN_ROOT}/scripts/<name>.sh — tamper-resistant, since an agent can no longer defeat an enforcement hook by editing its workspace `.claude/scripts/` copy. A compat copy is still distributed to `.claude/scripts/` by `macf init`/`update` for hand-wired substrate hooks + non-plugin-init'd workspaces, pending full DR-039 substrate rollout.",
   "hooks": {
     "SessionStart": [
       {
@@ -24,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/check-channel-alive.sh\""
           }
         ]
       }
@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/check-channel-alive.sh\""
           }
         ]
       }
@@ -64,7 +64,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-token.sh"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/check-gh-token.sh\""
           }
         ]
       },
@@ -73,7 +73,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-mention-routing.sh"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/check-mention-routing.sh\""
           }
         ]
       },
@@ -82,7 +82,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-lgtm-gate.sh"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/check-lgtm-gate.sh\""
           }
         ]
       },
@@ -91,7 +91,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/check-close-keyword.sh\""
           }
         ]
       }
@@ -111,7 +111,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-attribution.sh"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/check-gh-attribution.sh\""
           }
         ]
       }
@@ -209,7 +209,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/harvest-reflection.sh"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/harvest-reflection.sh\""
           }
         ]
       }

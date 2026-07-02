@@ -26,7 +26,7 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 
-const HOOK_SCRIPT = join(findCliPackageRoot(), 'scripts', 'check-mention-routing.sh');
+const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'check-mention-routing.sh');
 
 /**
  * Spawn the hook with a JSON stdin payload + env overrides. Mirrors the

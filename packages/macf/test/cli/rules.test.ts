@@ -7,6 +7,7 @@ import {
   canonicalRulesDir,
   copyCanonicalScripts,
   canonicalScriptsDir,
+  canonicalPluginScriptsDir,
   findCliPackageRoot,
 } from '../../src/cli/rules.js';
 
@@ -155,9 +156,53 @@ describe('canonicalScriptsDir', () => {
   });
 });
 
+describe('canonicalPluginScriptsDir', () => {
+  it('points to <repo>/plugin/scripts/ in dev layout', () => {
+    const dir = canonicalPluginScriptsDir();
+    expect(dir.endsWith(join('plugin', 'scripts'))).toBe(true);
+    expect(existsSync(dir)).toBe(true);
+  });
+
+  it('mark-turn-state.sh exists in the canonical plugin scripts dir', () => {
+    const dir = canonicalPluginScriptsDir();
+    expect(existsSync(join(dir, 'mark-turn-state.sh'))).toBe(true);
+  });
+
+  it('the 7 DR-039-phase-2-migrated hook scripts exist in the canonical plugin scripts dir', () => {
+    const dir = canonicalPluginScriptsDir();
+    for (const name of [
+      'check-gh-token.sh',
+      'check-mention-routing.sh',
+      'check-lgtm-gate.sh',
+      'check-close-keyword.sh',
+      'check-gh-attribution.sh',
+      'check-channel-alive.sh',
+      'harvest-reflection.sh',
+    ]) {
+      expect(existsSync(join(dir, name)), `expected ${name} in ${dir}`).toBe(true);
+    }
+  });
+
+  it('the 7 migrated hook scripts no longer exist in the LEGACY canonical scripts dir', () => {
+    const dir = canonicalScriptsDir();
+    for (const name of [
+      'check-gh-token.sh',
+      'check-mention-routing.sh',
+      'check-lgtm-gate.sh',
+      'check-close-keyword.sh',
+      'check-gh-attribution.sh',
+      'check-channel-alive.sh',
+      'harvest-reflection.sh',
+    ]) {
+      expect(existsSync(join(dir, name)), `expected ${name} NOT in ${dir}`).toBe(false);
+    }
+  });
+});
+
 describe('copyCanonicalScripts', () => {
   let tmpRoot: string;
   let fakeCanonical: string;
+  let fakePluginScripts: string;
 
   beforeEach(() => {
     tmpRoot = mkdtempSync(join(tmpdir(), 'macf-scripts-test-'));
@@ -167,6 +212,13 @@ describe('copyCanonicalScripts', () => {
     writeFileSync(join(fakeCanonical, 'other.sh'), '#!/usr/bin/env bash\necho bye\n');
     // Non-.sh files should be ignored.
     writeFileSync(join(fakeCanonical, 'README.md'), '# not a script');
+
+    // A second, empty fake plugin-scripts dir so the default real
+    // <repo>/plugin/scripts/ content doesn't leak into these single-source
+    // assertions. Dual-source behavior is covered by its own describe block
+    // below.
+    fakePluginScripts = join(tmpRoot, 'plugin-canonical');
+    mkdirSync(fakePluginScripts, { recursive: true });
   });
 
   afterEach(() => {
@@ -177,7 +229,7 @@ describe('copyCanonicalScripts', () => {
     const workspace = join(tmpRoot, 'workspace');
     mkdirSync(workspace);
 
-    const copied = copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical });
+    const copied = copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
 
     expect(copied).toContain('helper.sh');
     expect(copied).toContain('other.sh');
@@ -193,7 +245,7 @@ describe('copyCanonicalScripts', () => {
     const workspace = join(tmpRoot, 'workspace');
     mkdirSync(workspace);
 
-    copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical });
+    copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
 
     const out = readFileSync(join(workspace, '.claude', 'scripts', 'helper.sh'), 'utf-8');
     expect(out).toBe('#!/usr/bin/env bash\necho hi\n');
@@ -204,7 +256,7 @@ describe('copyCanonicalScripts', () => {
     const workspace = join(tmpRoot, 'workspace');
     mkdirSync(workspace);
 
-    copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical });
+    copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
 
     const stats = statSync(join(workspace, '.claude', 'scripts', 'helper.sh'));
     // Check the owner-execute bit is set. mode & 0o111 == any-execute.
@@ -219,22 +271,106 @@ describe('copyCanonicalScripts', () => {
     mkdirSync(scriptsDir, { recursive: true });
     writeFileSync(join(scriptsDir, 'helper.sh'), '#!/usr/bin/env bash\necho STALE\n');
 
-    copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical });
+    copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
 
     const out = readFileSync(join(scriptsDir, 'helper.sh'), 'utf-8');
     expect(out).not.toContain('STALE');
     expect(out).toContain('echo hi');
   });
 
-  it('returns empty array when canonical dir does not exist (no crash)', () => {
+  it('returns empty array when both canonical dirs do not exist (no crash)', () => {
     const workspace = join(tmpRoot, 'workspace');
     mkdirSync(workspace);
 
     const copied = copyCanonicalScripts(workspace, {
       canonicalDir: join(tmpRoot, 'does-not-exist'),
+      pluginScriptsDir: join(tmpRoot, 'also-does-not-exist'),
     });
 
     expect(copied).toEqual([]);
     expect(existsSync(join(workspace, '.claude'))).toBe(false);
+  });
+
+  describe('dual-source merge (DR-039 phase 2, groundnuty/macf#698)', () => {
+    it('copies .sh files from BOTH the legacy dir and the plugin scripts dir', () => {
+      writeFileSync(join(fakePluginScripts, 'check-fake-hook.sh'), '#!/usr/bin/env bash\necho hook\n');
+
+      const workspace = join(tmpRoot, 'workspace');
+      mkdirSync(workspace);
+
+      const copied = copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
+
+      expect(copied).toContain('helper.sh');
+      expect(copied).toContain('other.sh');
+      expect(copied).toContain('check-fake-hook.sh');
+
+      const scriptsDir = join(workspace, '.claude', 'scripts');
+      const files = readdirSync(scriptsDir).sort();
+      expect(files).toEqual(['check-fake-hook.sh', 'helper.sh', 'other.sh']);
+    });
+
+    it('excludes mark-turn-state.sh from the plugin-scripts-dir compat copy', () => {
+      writeFileSync(join(fakePluginScripts, 'mark-turn-state.sh'), '#!/usr/bin/env bash\necho turn\n');
+      writeFileSync(join(fakePluginScripts, 'check-fake-hook.sh'), '#!/usr/bin/env bash\necho hook\n');
+
+      const workspace = join(tmpRoot, 'workspace');
+      mkdirSync(workspace);
+
+      const copied = copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
+
+      expect(copied).toContain('check-fake-hook.sh');
+      expect(copied).not.toContain('mark-turn-state.sh');
+      expect(existsSync(join(workspace, '.claude', 'scripts', 'mark-turn-state.sh'))).toBe(false);
+    });
+  });
+
+  describe('real default sources (no override) — the actual CLI-shipped scripts', () => {
+    it('distributes all 7 DR-039-phase-2-migrated hook scripts to <workspace>/.claude/scripts/', () => {
+      const workspace = join(tmpRoot, 'workspace');
+      mkdirSync(workspace);
+
+      const copied = copyCanonicalScripts(workspace);
+
+      for (const name of [
+        'check-gh-token.sh',
+        'check-mention-routing.sh',
+        'check-lgtm-gate.sh',
+        'check-close-keyword.sh',
+        'check-gh-attribution.sh',
+        'check-channel-alive.sh',
+        'harvest-reflection.sh',
+      ]) {
+        expect(copied, `expected ${name} to be copied`).toContain(name);
+        expect(existsSync(join(workspace, '.claude', 'scripts', name)), `expected ${name} on disk`).toBe(true);
+      }
+    });
+
+    it('also still distributes the legacy helper + hand-wired-hook scripts', () => {
+      const workspace = join(tmpRoot, 'workspace');
+      mkdirSync(workspace);
+
+      const copied = copyCanonicalScripts(workspace);
+
+      for (const name of [
+        'macf-gh-token.sh',
+        'macf-whoami.sh',
+        'tmux-send-to-claude.sh',
+        'check-auditor-never-acts.sh',
+        'emit-turn-receipt.sh',
+        'check-channels-enabled.sh',
+      ]) {
+        expect(copied, `expected ${name} to be copied`).toContain(name);
+      }
+    });
+
+    it('does NOT distribute the plugin-only mark-turn-state.sh', () => {
+      const workspace = join(tmpRoot, 'workspace');
+      mkdirSync(workspace);
+
+      const copied = copyCanonicalScripts(workspace);
+
+      expect(copied).not.toContain('mark-turn-state.sh');
+      expect(existsSync(join(workspace, '.claude', 'scripts', 'mark-turn-state.sh'))).toBe(false);
+    });
   });
 });
