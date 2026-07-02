@@ -1,5 +1,5 @@
 {
-  "description": "MACF agent hooks: dependency installer, work check, SessionEnd + PreCompact peer-notification (UC-1 per DR-023; moved off the per-turn Stop hook in macf#673 to stop blocking the TUI every turn — distinguishable session-end vs session-compact events), PreCompact-hook session checkpoint (UC-3 per DR-023), and the turn-state marker that lets the channel server report accurate live agent state through long tool waits (DR-030 phase-1, groundnuty/macf#568)",
+  "description": "MACF agent hooks: dependency installer, work check, SessionEnd + PreCompact peer-notification (UC-1 per DR-023; moved off the per-turn Stop hook in macf#673 to stop blocking the TUI every turn — distinguishable session-end vs session-compact events), PreCompact-hook session checkpoint (UC-3 per DR-023), the turn-state marker that lets the channel server report accurate live agent state through long tool waits (DR-030 phase-1, groundnuty/macf#568), and the single-sourced load-bearing guard set (DR-039 Decision 2, groundnuty/macf#731/#739): gh-token attribution-trap (#140), mention-routing-hygiene (#244/#272), LGTM-gate (#270), close-keyword-guard (#431), attribution result-invariant backstop (#489), reflection-harvest (#500), and channel-server liveness guard (#734). Scripts stay path-invoked at $CLAUDE_PROJECT_DIR/.claude/scripts/ (workbench-maintainable); only the registration lives here now.",
   "hooks": {
     "SessionStart": [
       {
@@ -19,6 +19,14 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -29,6 +37,14 @@
             "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/mark-turn-state.sh\" user-prompt-submit",
             "async": true,
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh"
           }
         ]
       }
@@ -42,6 +58,42 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-token.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-mention-routing.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-lgtm-gate.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh"
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -51,6 +103,15 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/mark-turn-state.sh\" post-tool-use",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-attribution.sh"
           }
         ]
       }
@@ -141,6 +202,14 @@
             },
             "timeout": 30,
             "statusMessage": "Notifying peers of session compaction..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/harvest-reflection.sh"
           }
         ]
       }

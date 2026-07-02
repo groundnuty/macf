@@ -16,16 +16,25 @@
  * DR-028 ratification, macf#539). Importing the hook-command constants from
  * `settings-writer` is one-directional (settings-writer does not import this),
  * so there is no import cycle.
+ *
+ * **DR-039 Decision 2 (groundnuty/macf#731/#739):** `check-gh-token` /
+ * `check-mention-routing` / `check-lgtm-gate` / `check-close-keyword` /
+ * `check-gh-attribution` / `harvest-reflection` / `check-channel-alive`
+ * single-sourced into the plugin's `hooks/hooks.json` and are NO LONGER part
+ * of the settings.json floor this model validates — `installGhTokenHook`
+ * (the emitter `checkRoleSettings`/`--fix` stays in lockstep with) no longer
+ * writes them into settings.json, so keeping them in `ROLE_FLOOR_HOOKS` would
+ * make `--fix` report permanent false-drift for hooks that are, by design,
+ * now delivered a different way. Their PRESENCE is still asserted — by the
+ * broader DR-039 `checkLoadBearingHooks` union-check in `doctor.ts`, which
+ * looks at settings.json + the loaded plugin's hooks.json together (the
+ * correct surface for a hook that can live in either place). This module's
+ * `ROLE_FLOOR_HOOKS` stays scoped to what `.claude/settings.json` itself
+ * should contain.
  */
 import {
-  MACF_HOOK_COMMAND,
-  MACF_MENTION_HOOK_COMMAND,
-  MACF_LGTM_HOOK_COMMAND,
-  MACF_CLOSE_HOOK_COMMAND,
   MACF_AUDITOR_HOOK_COMMAND,
   MACF_TURN_RECEIPT_HOOK_COMMAND,
-  MACF_ATTRIBUTION_HOOK_COMMAND,
-  MACF_REFLECTION_HOOK_COMMAND,
   MACF_CHANNELS_HOOK_COMMAND,
   ROLE_FLOOR_ALLOW,
   ROLE_FLOOR_DENY,
@@ -51,15 +60,14 @@ export interface ExpectedHook {
 // public surface (what `macf doctor` validates against) stays in one place.
 export { ROLE_FLOOR_ALLOW, ROLE_FLOOR_DENY };
 
-/** Universal floor hooks (every role) — DR-028 §Decision 1. */
+/**
+ * Universal floor hooks (every role) — DR-028 §Decision 1, narrowed by DR-039
+ * Decision 2. Only the hooks `installGhTokenHook` still hand-wires into
+ * settings.json belong here (see this file's top comment for why the
+ * migrated hooks aren't listed).
+ */
 export const ROLE_FLOOR_HOOKS: readonly ExpectedHook[] = [
-  { event: 'PreToolUse', matcher: 'Bash', command: MACF_HOOK_COMMAND, required: false },
-  { event: 'PreToolUse', matcher: 'Bash', command: MACF_MENTION_HOOK_COMMAND, required: false },
-  { event: 'PreToolUse', matcher: 'Bash', command: MACF_LGTM_HOOK_COMMAND, required: false },
-  { event: 'PreToolUse', matcher: 'Bash', command: MACF_CLOSE_HOOK_COMMAND, required: false },
-  { event: 'PostToolUse', matcher: 'Bash', command: MACF_ATTRIBUTION_HOOK_COMMAND, required: false },
   { event: 'UserPromptSubmit', command: MACF_TURN_RECEIPT_HOOK_COMMAND, required: false },
-  { event: 'PreCompact', command: MACF_REFLECTION_HOOK_COMMAND, required: false },
   { event: 'SessionStart', command: MACF_CHANNELS_HOOK_COMMAND, required: false },
 ];
 

@@ -789,6 +789,31 @@ describe('resolvePluginDirFromClaudeSh (DR-039)', () => {
     expect(result.dir).toBe(join(tmpRoot, '.macf', 'plugin-cs'));
   });
 
+  // macf#739 follow-up hardening (science-agent review): the original regex
+  // was double-quote-only, so a hand-authored launcher using an unquoted var
+  // or single-quoted path was silently treated as "no --plugin-dir flag" —
+  // masked by the default-fallback posture (getEffectiveHookConfig falls back
+  // to `.macf/plugin`), hiding a hooks-less variant instead of surfacing it.
+  it('resolves an UNQUOTED --plugin-dir value (macf#739 follow-up hardening)', () => {
+    writeFileSync(
+      join(tmpRoot, 'claude.sh'),
+      'exec claude --plugin-dir $SCRIPT_DIR/.macf/plugin "$@"\n',
+    );
+    const result = resolvePluginDirFromClaudeSh(tmpRoot);
+    expect(result.determinable).toBe(true);
+    expect(result.dir).toBe(join(tmpRoot, '.macf', 'plugin'));
+  });
+
+  it('resolves a SINGLE-QUOTED --plugin-dir absolute path (macf#739 follow-up hardening)', () => {
+    writeFileSync(
+      join(tmpRoot, 'claude.sh'),
+      "exec claude --plugin-dir '$SCRIPT_DIR/.macf/plugin-cs' \"$@\"\n",
+    );
+    const result = resolvePluginDirFromClaudeSh(tmpRoot);
+    expect(result.determinable).toBe(true);
+    expect(result.dir).toBe(join(tmpRoot, '.macf', 'plugin-cs'));
+  });
+
   it('not determinable when claude.sh has no --plugin-dir flag at all', () => {
     writeFileSync(join(tmpRoot, 'claude.sh'), 'exec claude "$@"\n');
     const result = resolvePluginDirFromClaudeSh(tmpRoot);

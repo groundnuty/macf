@@ -68,13 +68,27 @@ describe('DR-028 role-settings model', () => {
   });
 
   describe('universal floor — hooks', () => {
-    it('includes the gh-token + attribution + turn-receipt + reflection + channels hooks, none REQUIRED', () => {
+    // Per DR-039 Decision 2 (groundnuty/macf#731/#739), check-gh-token /
+    // check-mention-routing / check-lgtm-gate / check-close-keyword /
+    // check-gh-attribution / harvest-reflection / check-channel-alive
+    // single-sourced into the plugin's hooks.json and are NO LONGER part of
+    // this settings.json floor model — `installGhTokenHook` no longer writes
+    // them, so the floor now only lists what stays hand-wired: the
+    // turn-receipt hook (UserPromptSubmit) + the channels-enabled guard
+    // (SessionStart). Their presence is still asserted overall by the
+    // broader DR-039 `checkLoadBearingHooks` union-check in `doctor.ts`.
+    it('includes ONLY the turn-receipt + channels-enabled hooks post-DR-039-Decision-2, none REQUIRED', () => {
       const cmds = ROLE_FLOOR_HOOKS.map((h) => h.command);
-      expect(cmds.some((c) => c.includes('check-gh-token.sh'))).toBe(true);
-      expect(cmds.some((c) => c.includes('check-gh-attribution.sh'))).toBe(true);
       expect(cmds.some((c) => c.includes('emit-turn-receipt.sh'))).toBe(true);
-      expect(cmds.some((c) => c.includes('harvest-reflection.sh'))).toBe(true);
       expect(cmds.some((c) => c.includes('check-channels-enabled.sh'))).toBe(true);
+      // The 7 hooks single-sourced into the plugin are NOT part of this floor.
+      expect(cmds.some((c) => c.includes('check-gh-token.sh'))).toBe(false);
+      expect(cmds.some((c) => c.includes('check-mention-routing.sh'))).toBe(false);
+      expect(cmds.some((c) => c.includes('check-lgtm-gate.sh'))).toBe(false);
+      expect(cmds.some((c) => c.includes('check-close-keyword.sh'))).toBe(false);
+      expect(cmds.some((c) => c.includes('check-gh-attribution.sh'))).toBe(false);
+      expect(cmds.some((c) => c.includes('harvest-reflection.sh'))).toBe(false);
+      expect(cmds.some((c) => c.includes('check-channel-alive.sh'))).toBe(false);
       // The channels guard is a SessionStart hook (macf#633).
       expect(
         ROLE_FLOOR_HOOKS.some(
