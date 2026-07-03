@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import {
   writeAgentConfig, readAgentConfig, writeAgentsIndex, readAgentsIndex,
   addToAgentsIndex, loadAllAgents, agentConfigPath,
+  resolveCanonicalBranch, DEFAULT_CANONICAL_BRANCH,
 } from '../../src/cli/config.js';
 import type { MacfAgentConfig } from '../../src/cli/config.js';
 
@@ -76,5 +77,39 @@ describe('CLI config', () => {
       const agents = loadAllAgents();
       expect(Array.isArray(agents)).toBe(true);
     });
+  });
+});
+
+describe('resolveCanonicalBranch (macf#755)', () => {
+  it('defaults to "main" when neither env nor config set it', () => {
+    expect(resolveCanonicalBranch(null, {} as NodeJS.ProcessEnv)).toBe('main');
+    expect(resolveCanonicalBranch(null, {} as NodeJS.ProcessEnv)).toBe(DEFAULT_CANONICAL_BRANCH);
+  });
+
+  it('prefers the macf-agent.json canonicalBranch field over the default', () => {
+    expect(resolveCanonicalBranch({ canonicalBranch: 'develop' }, {} as NodeJS.ProcessEnv)).toBe('develop');
+  });
+
+  it('MACF_CANONICAL_BRANCH env wins over the config field', () => {
+    const env = { MACF_CANONICAL_BRANCH: 'release' } as unknown as NodeJS.ProcessEnv;
+    expect(resolveCanonicalBranch({ canonicalBranch: 'develop' }, env)).toBe('release');
+  });
+
+  it('MACF_CANONICAL_BRANCH env wins even when config is null', () => {
+    const env = { MACF_CANONICAL_BRANCH: 'release' } as unknown as NodeJS.ProcessEnv;
+    expect(resolveCanonicalBranch(null, env)).toBe('release');
+  });
+
+  it('treats a blank/whitespace-only env override as unset — falls through to config', () => {
+    const env = { MACF_CANONICAL_BRANCH: '   ' } as unknown as NodeJS.ProcessEnv;
+    expect(resolveCanonicalBranch({ canonicalBranch: 'develop' }, env)).toBe('develop');
+  });
+
+  it('treats a blank/whitespace-only config field as unset — falls through to default', () => {
+    expect(resolveCanonicalBranch({ canonicalBranch: '   ' }, {} as NodeJS.ProcessEnv)).toBe('main');
+  });
+
+  it('defaults process.env when env is omitted (does not throw)', () => {
+    expect(() => resolveCanonicalBranch(null)).not.toThrow();
   });
 });

@@ -183,9 +183,46 @@ export const MacfAgentConfigSchema = z.object({
   // Optional for backward compat: legacy configs (pre-P6) lack this field.
   // `macf init --force` rewrites with resolved versions; `macf update` (PR #5) bumps.
   versions: VersionPinsSchema.optional(),
+  // The branch `macf fleet upgrade` / `macf restart-self` are allowed to
+  // mutate + relaunch onto (macf#755 canonical-branch guard). Per-workspace
+  // override for a legitimate consumer fork whose canonical branch isn't
+  // `main`. Optional; `resolveCanonicalBranch` defaults to `'main'` when
+  // absent (and this field is itself overridable by `MACF_CANONICAL_BRANCH`
+  // env — see that function's priority order).
+  canonicalBranch: z.string().min(1).optional(),
 });
 
 export type MacfAgentConfig = z.infer<typeof MacfAgentConfigSchema>;
+
+/** Default canonical branch (macf#755) when neither env nor config override it. */
+export const DEFAULT_CANONICAL_BRANCH = 'main';
+
+/**
+ * Resolve the branch a workspace's `macf fleet upgrade` / `macf restart-self`
+ * mutations + relaunches are allowed to land on (macf#755). Priority order:
+ *
+ *   1. `MACF_CANONICAL_BRANCH` env override — a deliberate, process-wide
+ *      override (e.g. a temporary fleet-wide migration, or a test harness).
+ *   2. The workspace's own `macf-agent.json` `canonicalBranch` field — a
+ *      per-workspace override for a legitimate consumer fork whose canonical
+ *      branch genuinely isn't `main`.
+ *   3. `DEFAULT_CANONICAL_BRANCH` (`'main'`).
+ *
+ * Never throws — `config` may be `null` (an unresolvable workspace) and `env`
+ * defaults to `process.env`. Pure w.r.t. its inputs so both `rollFleet`'s
+ * driver-level resolution (per-agent, macf-core) and `restart-self`'s
+ * standalone resolution (this workspace) share the exact same precedence.
+ */
+export function resolveCanonicalBranch(
+  config: Pick<MacfAgentConfig, 'canonicalBranch'> | null,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const fromEnv = env['MACF_CANONICAL_BRANCH']?.trim();
+  if (fromEnv) return fromEnv;
+  const fromConfig = config?.canonicalBranch?.trim();
+  if (fromConfig) return fromConfig;
+  return DEFAULT_CANONICAL_BRANCH;
+}
 
 // --- Agents index (agents.json) ---
 

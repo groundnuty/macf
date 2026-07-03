@@ -30,7 +30,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { ROLL_TOUCHED_CONFIG_PATTERNS } from '@groundnuty/macf-core';
-import { readAgentConfig } from '../config.js';
+import { readAgentConfig, resolveCanonicalBranch } from '../config.js';
 import {
   backupSessionTranscript,
   createRealTranscriptDeps,
@@ -153,6 +153,16 @@ export interface RunRestartSelfOptions {
    * `macf restart-self` invocation keeps the full guard + full-stash behavior.
    */
   readonly leaveConfigUncommitted: boolean;
+  /**
+   * The resolved canonical branch (macf#755 — `resolveCanonicalBranch`:
+   * `MACF_CANONICAL_BRANCH` env > `macf-agent.json` `canonicalBranch` > the
+   * `'main'` default). The STANDALONE canonical-branch guard refuses the
+   * whole restart (no stash/write/spawn/kill) when `deps.currentBranch()`
+   * doesn't match, unless `force` is set or `leaveConfigUncommitted` is set
+   * (the roll-path bypass — `macf fleet upgrade`'s OWN branch-gate, macf#755,
+   * already vetted this before calling `upgrade`+`restart`).
+   */
+  readonly canonicalBranch: string;
 }
 
 /** The `--json` state-record (mirrors `fleet doctor`'s versioned shape). */
@@ -531,6 +541,30 @@ export async function runRestartSelf(
   const leaveConfigUncommitted =
     opts.leaveConfigUncommitted || process.env['MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED'] === '1';
 
+  // Canonical-branch guard (macf#755) — the FIRST refusal, before the
+  // config-surface guard below: cheapest + most fundamental (branch-
+  // correctness precedes config-correctness). STANDALONE-invocation ONLY
+  // (bypassed entirely by `leaveConfigUncommitted` — the roll-path, whose
+  // OWN branch-gate in `rollFleet` already vetted this before calling
+  // `restart`). Refuses the WHOLE restart (no stash/write/spawn/kill) when
+  // the workspace is not on its canonical branch, unless `--force`. A
+  // relaunch on the wrong branch either corrupts a feature branch (macf
+  // update's regen + any auto-resolve commit land there) or comes back up
+  // stale on it — the same hazard `rollFleet`'s branch-gate exists to catch.
+  if (!leaveConfigUncommitted && !opts.force) {
+    const branch = deps.currentBranch();
+    if (branch !== opts.canonicalBranch) {
+      console.error(
+        `macf restart-self: refusing — on branch \`${branch}\`, expected ` +
+          `\`${opts.canonicalBranch}\`. A relaunch here would either corrupt a ` +
+          'non-canonical branch (config regen + any auto-resolve commit land on it) ' +
+          'or come back up stale on it. Switch to the canonical branch, or pass ' +
+          '--force to proceed anyway.',
+      );
+      return 1;
+    }
+  }
+
   // Config-surface stash-refusal guard (macf#722 Fix B) — STANDALONE-invocation
   // ONLY (bypassed entirely by `leaveConfigUncommitted` above). CONFIRM-mode
   // only; dry-run above already returned. Refuses the WHOLE restart (no
@@ -791,6 +825,10 @@ export async function runRestartSelfCommand(
   cliOpts: RestartSelfCliOptions,
 ): Promise<number> {
   const { workspaceDir, project, agentName, routingLabel } = resolveIdentity(projectDir);
+  // macf#755 — resolve the canonical-branch guard's expected branch from the
+  // SAME `projectDir` config `resolveIdentity` reads (env override still
+  // applies regardless of whether a config is found).
+  const canonicalBranch = resolveCanonicalBranch(readAgentConfig(projectDir));
   const deps = createRealDeps(workspaceDir);
   return runRestartSelf(
     {
@@ -798,6 +836,7 @@ export async function runRestartSelfCommand(
       project,
       agentName,
       routingLabel,
+      canonicalBranch,
       reason: coerceReason(cliOpts.reason),
       confirm: cliOpts.confirm === true,
       dryRun: cliOpts.dryRun === true,

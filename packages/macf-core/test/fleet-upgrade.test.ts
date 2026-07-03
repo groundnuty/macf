@@ -116,6 +116,9 @@ interface DriverCalls {
   releaseLock: string[];
   startHeartbeat: string[];
   stopHeartbeat: string[];
+  /** macf#755 branch-gate call logs — which agents had their branch checked. */
+  currentBranch: string[];
+  canonicalBranch: string[];
   /** A single ordered event log across ALL verbs (tagged `"<verb>:<agent>"`), for sequencing assertions. */
   order: string[];
 }
@@ -141,6 +144,10 @@ function makeDriver(opts: {
   alreadyCanonicalFiles?: (agent: string) => readonly string[];
   /** Modified-files list `listModifiedFiles` reports post-upgrade; defaults to none. */
   modifiedFiles?: (agent: string) => readonly string[];
+  /** Per-agent CURRENT branch (macf#755); defaults to `'main'` for every agent (on-canonical). */
+  branch?: (agent: string) => string | null;
+  /** Per-agent CANONICAL branch (macf#755); defaults to `'main'` for every agent. */
+  canonicalBranchOf?: (agent: string) => string;
 }): { driver: FleetDriver; calls: DriverCalls } {
   const calls: DriverCalls = {
     probe: 0,
@@ -156,6 +163,8 @@ function makeDriver(opts: {
     releaseLock: [],
     startHeartbeat: [],
     stopHeartbeat: [],
+    currentBranch: [],
+    canonicalBranch: [],
     order: [],
   };
   const perAgent = new Map<string, number>();
@@ -180,6 +189,14 @@ function makeDriver(opts: {
       ...(opts.alreadyCanonicalFiles?.(agent) ?? []),
       ...(opts.dirtyConfigFiles?.(agent) ?? []),
     ],
+    currentBranch: async (agent) => {
+      calls.currentBranch.push(agent);
+      return opts.branch ? opts.branch(agent) : 'main';
+    },
+    canonicalBranch: async (agent) => {
+      calls.canonicalBranch.push(agent);
+      return opts.canonicalBranchOf ? opts.canonicalBranchOf(agent) : 'main';
+    },
     classifyDirtyConfig: async (agent) => {
       calls.classifyDirtyConfig.push(agent);
       return {
@@ -260,6 +277,8 @@ function makeTransactionalDriver(opts: {
     releaseLock: [],
     startHeartbeat: [],
     stopHeartbeat: [],
+    currentBranch: [],
+    canonicalBranch: [],
     order: [],
   };
   const regenerated = opts.regeneratedFiles ?? ['.claude/rules/coordination.md'];
@@ -287,6 +306,14 @@ function makeTransactionalDriver(opts: {
     },
     isConfigDirty: async (agent) => dirty.has(agent),
     listDirtyConfig: async (agent) => (dirty.has(agent) ? regenerated : []),
+    currentBranch: async (agent) => {
+      calls.currentBranch.push(agent);
+      return 'main';
+    },
+    canonicalBranch: async (agent) => {
+      calls.canonicalBranch.push(agent);
+      return 'main';
+    },
     classifyDirtyConfig: async (agent) => {
       calls.classifyDirtyConfig.push(agent);
       return { alreadyCanonical: [], genuineDelta: dirty.has(agent) ? regenerated : [] };
@@ -525,6 +552,124 @@ describe('rollFleet', () => {
     // both agents' restart was told to leave the (dirty) config surface uncommitted.
     expect(calls.restartLeaveUncommitted).toEqual(['a1', 'a2']);
     expect(res.halted).toBe(false);
+  });
+
+  describe('branch-gate (macf#755) — the FIRST pre-flight gate', () => {
+    it('on-canonical: proceeds into the normal gate chain (config-dirty, then busy, then the transaction)', async () => {
+      const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
+      const { verifyGreen } = makeVerify();
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(calls.currentBranch).toEqual(['a1', 'a2']);
+      expect(calls.canonicalBranch).toEqual(['a1', 'a2']);
+      expect(calls.classifyDirtyConfig).toEqual(['a1', 'a2']);
+      expect(calls.upgrade).toEqual(['a1', 'a2']);
+      expect(res.branchSkipped).toBe(0);
+      expect(res.upgraded).toBe(2);
+    });
+
+    it('off-canonical: OBJECTS (branch-skipped) BEFORE any mutation — classifyDirtyConfig/isBusy/upgrade/restart NEVER called for that agent', async () => {
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        branch: (agent) => (agent === 'a1' ? 'feat/some-branch' : 'main'),
+      });
+      const { verifyGreen } = makeVerify();
+      const events: UpgradeEvent[] = [];
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+        onEvent: (ev) => events.push(ev),
+      });
+      // a1 never touched at all — no classifyDirtyConfig/isBusy/upgrade/restart/lock call.
+      expect(calls.classifyDirtyConfig).toEqual(['a2']);
+      expect(calls.isBusy).toEqual(['a2']);
+      expect(calls.upgrade).toEqual(['a2']);
+      expect(calls.restart).toEqual(['a2']);
+      expect(calls.acquireLock.map((c) => c.agent)).toEqual(['a2']);
+      expect(res.halted).toBe(false);
+      expect(res.branchSkipped).toBe(1);
+      expect(res.upgraded).toBe(1);
+      expect(res.results.map((r) => [r.agent, r.outcome])).toEqual([
+        ['a1', 'branch-skipped'],
+        ['a2', 'upgraded'],
+      ]);
+      expect(res.results[0]!.detail).toContain('a1');
+      expect(res.results[0]!.detail).toContain('feat/some-branch');
+      expect(res.results[0]!.detail).toContain('main');
+      const skipEvent = events.find((e) => e.kind === 'branch-skip');
+      expect(skipEvent).toMatchObject({
+        kind: 'branch-skip',
+        agent: 'a1',
+        current: 'feat/some-branch',
+        canonical: 'main',
+      });
+    });
+
+    it('detached HEAD / unresolvable branch (currentBranch → null) is treated as non-canonical → OBJECTS', async () => {
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        branch: (agent) => (agent === 'a1' ? null : 'main'),
+      });
+      const { verifyGreen } = makeVerify();
+      const events: UpgradeEvent[] = [];
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+        onEvent: (ev) => events.push(ev),
+      });
+      expect(calls.upgrade).toEqual(['a2']);
+      expect(res.branchSkipped).toBe(1);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'branch-skipped' });
+      expect(res.results[0]!.detail).toContain('detached HEAD');
+      const skipEvent = events.find((e) => e.kind === 'branch-skip');
+      expect(skipEvent).toMatchObject({ kind: 'branch-skip', agent: 'a1', current: null, canonical: 'main' });
+    });
+
+    it('--force bypasses the branch-gate ENTIRELY — currentBranch/canonicalBranch never even called', async () => {
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        branch: () => 'feat/some-branch',
+      });
+      const { verifyGreen } = makeVerify();
+      const res = await rollFleet(
+        twoBehind,
+        { targetVersion: '0.2.41', verifyTimeoutMs: 1000, force: true },
+        { driver, verifyGreen, ...noWait },
+      );
+      expect(calls.currentBranch).toEqual([]);
+      expect(calls.canonicalBranch).toEqual([]);
+      expect(res.branchSkipped).toBe(0);
+      expect(calls.upgrade).toEqual(['a1', 'a2']);
+      expect(res.halted).toBe(false);
+    });
+
+    it('precedes the config-dirty gate: a dirty-AND-off-branch agent reports branch-skip, NOT config-dirty-skip', async () => {
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        branch: (agent) => (agent === 'a1' ? 'feat/some-branch' : 'main'),
+        dirtyConfigFiles: (agent) => (agent === 'a1' ? ['CLAUDE.md'] : []),
+      });
+      const { verifyGreen } = makeVerify();
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      // classifyDirtyConfig is never called for a1 — the branch-gate short-circuits first.
+      expect(calls.classifyDirtyConfig).toEqual(['a2']);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'branch-skipped' });
+      expect(res.branchSkipped).toBe(1);
+      expect(res.configDirtySkipped).toBe(0);
+    });
   });
 
   describe('tier-first auto-resolve (DR-040 Decision 3, macf#698 R1)', () => {

@@ -7,8 +7,9 @@
  * logic lives in macf-core; the per-runtime driver bodies live in `packages/macf`
  * or a future K8s package). It NEVER touches `/proc`, tmux, `capture-pane`, or
  * kubectl — it drives entirely off the injected `FleetDriver` verbs
- * (`probe`/`discoverWorkspaces`/`isBusy`/`listDirtyConfig`/`upgrade`/`restart`/
- * `listModifiedFiles`/`acquireLock`/`startHeartbeat`/`releaseLock`) plus an
+ * (`probe`/`discoverWorkspaces`/`isBusy`/`listDirtyConfig`/`currentBranch`/
+ * `canonicalBranch`/`upgrade`/`restart`/`listModifiedFiles`/`acquireLock`/
+ * `startHeartbeat`/`releaseLock`) plus an
  * injected `verifyGreen` runner, so the SAME sequencer rolls a VM tmux fleet, a
  * macOS host, and a far-future K8s deployment by swapping only the driver.
  *
@@ -17,6 +18,11 @@
  *   probe() + discoverWorkspaces()
  *     → for each member whose RUNNING version < target (compareSemver):
  *         PRE-FLIGHT gate (BEFORE any mutation — never touches the agent):
+ *           branch-gate (macf#755, FIRST — cheapest + most fundamental:
+ *             driver.currentBranch != driver.canonicalBranch (or detached
+ *             HEAD / unresolvable, i.e. `null`) ⇒ OBJECT: SKIP+REPORT, unless
+ *             `--force` — a mutation or relaunch on the wrong branch either
+ *             corrupts a feature branch or relaunches the agent stale on it)
  *           config-dirty-gate (driver.listDirtyConfig → non-empty ⇒ OBJECT:
  *             SKIP+REPORT the list of uncommitted files + an agent-directed
  *             message to inspect-and-commit-or-delete-or-gitignore-then-retry,
@@ -123,17 +129,25 @@ export interface AgentUpgradePlan {
  *                             OBJECTS with the specific file list + an
  *                             agent-directed message (macf#725 — replaces
  *                             macf#722 Fix B's silent skip).
+ * - `branch-skipped`        — branch-gated (macf#755): the agent's workspace
+ *                             is not on its canonical branch (or is on a
+ *                             detached HEAD / unresolvable branch), BEFORE any
+ *                             mutation; NOT a failure, CONTINUES. The roll
+ *                             OBJECTS — a mutation (macf update / an
+ *                             auto-resolve commit) or a relaunch on the wrong
+ *                             branch either corrupts a feature branch or
+ *                             relaunches the agent stale on it.
  * - `halted`                — verify-green did NOT confirm the target version;
  *                             the roll STOPS here. `reason` distinguishes WHY
  *                             (see `HaltReason`).
  *
- * The two pre-flight skip outcomes (`busy-skipped` / `config-dirty-skipped`)
- * are safe to continue past because the agent was NEVER mutated. `halted` is
- * always terminal because the agent WAS rolled and its post-restart state is
- * either confirmed-bad or unconfirmed — neither is safe to leave behind while
- * moving on to the next agent (macf#722 Fix A).
+ * The three pre-flight skip outcomes (`busy-skipped` / `config-dirty-skipped`
+ * / `branch-skipped`) are safe to continue past because the agent was NEVER
+ * mutated. `halted` is always terminal because the agent WAS rolled and its
+ * post-restart state is either confirmed-bad or unconfirmed — neither is safe
+ * to leave behind while moving on to the next agent (macf#722 Fix A).
  */
-export type RollOutcome = 'upgraded' | 'busy-skipped' | 'config-dirty-skipped' | 'halted';
+export type RollOutcome = 'upgraded' | 'busy-skipped' | 'config-dirty-skipped' | 'branch-skipped' | 'halted';
 
 /**
  * WHY a roll halted (only meaningful when `outcome === 'halted'`):
@@ -310,6 +324,12 @@ export interface FleetRollResult {
    * `autoResolvedFiles` for the file-level detail.
    */
   readonly configAutoResolved: number;
+  /**
+   * Count of agents skipped because their workspace was NOT on its
+   * canonical branch (or was on a detached HEAD / unresolvable branch) —
+   * macf#755's pre-flight branch-gate, the FIRST gate in the transaction.
+   */
+  readonly branchSkipped: number;
 }
 
 /** Progress events for CLI rendering (the RESULT objects are what tests assert on). */
@@ -317,6 +337,14 @@ export type UpgradeEvent =
   | { readonly kind: 'fleet-start'; readonly fleet: string; readonly behind: number; readonly total: number }
   | { readonly kind: 'fleet-skipped'; readonly fleet: string; readonly reason: string }
   | { readonly kind: 'roll-start'; readonly agent: string; readonly from: string | null; readonly to: string }
+  /**
+   * The pre-flight BRANCH-GATE OBJECT (macf#755) — the FIRST gate, fired
+   * BEFORE the config-dirty tiering / auto-resolve / busy-gate even run for
+   * this agent. `current` is the agent's actual branch (`null` on detached
+   * HEAD / an unresolvable branch); `canonical` is the resolved expected
+   * branch. Fired INSTEAD of any mutation — nothing was touched.
+   */
+  | { readonly kind: 'branch-skip'; readonly agent: string; readonly current: string | null; readonly canonical: string }
   /**
    * The pre-flight AUTO-RESOLVE (DR-040 Decision 3 / macf#698 R1) — `files`
    * were dirty but their content already equalled canonical, so they were
@@ -498,16 +526,49 @@ export function buildModifiedFilesMessage(agent: string, files: readonly string[
 }
 
 /**
+ * Build the agent-directed OBJECT message for the branch-gate pre-flight skip
+ * (macf#755). Pure — exported for CLI-rendering reuse / tests.
+ */
+export function buildBranchSkipMessage(
+  agent: string,
+  current: string | null,
+  canonical: string,
+): string {
+  const branchDesc =
+    current === null ? 'a detached HEAD (or an unresolvable branch)' : `branch \`${current}\``;
+  return (
+    `Fleet upgrade skipped ${agent} — on ${branchDesc}, expected \`${canonical}\`. ` +
+    `A mutation (macf update / an auto-resolve commit) or a relaunch would land on the ` +
+    `wrong branch. Switch the workspace to \`${canonical}\` (or set canonicalBranch / ` +
+    `MACF_CANONICAL_BRANCH if this is a legitimate fork), then re-run the upgrade, or ` +
+    `pass --force to bypass.`
+  );
+}
+
+/**
  * Roll ONE fleet: for every `behind` plan (in order) run the PRE-FLIGHT gates
- * (config-dirty tier-first, then busy) → upgrade → restart → verify-green
- * cycle, HALTING the roll on the first agent whose post-restart state isn't
- * confirmed-green. Non-`behind` plans are ignored (planned skips).
- * Pre-flight-gated agents are skipped + reported and NEVER a halt (they were
- * never mutated, so continuing is always safe) — config-dirty is checked
- * first because a busy-but-clean agent may still become idle later
- * (`--wait`), whereas a dirty (genuine-delta) agent is skip-only regardless.
+ * (branch-gate FIRST, then config-dirty tier-first, then busy) → upgrade →
+ * restart → verify-green cycle, HALTING the roll on the first agent whose
+ * post-restart state isn't confirmed-green. Non-`behind` plans are ignored
+ * (planned skips). Pre-flight-gated agents are skipped + reported and NEVER a
+ * halt (they were never mutated, so continuing is always safe) — the
+ * branch-gate runs first (cheapest + most fundamental: branch-correctness
+ * precedes config-correctness — a mutation on the wrong branch is unsafe
+ * regardless of that branch's config-dirty state), then config-dirty (checked
+ * before busy because a busy-but-clean agent may still become idle later via
+ * `--wait`, whereas a dirty (genuine-delta) agent is skip-only regardless).
  * With `wait`, a busy agent is re-polled for idle first. The verb order +
  * HALT semantics mirror `fleet/upgrade.sh`'s `roll_one`.
+ *
+ * **Branch-gate (macf#755).** Before any other gate: resolve the agent's
+ * CURRENT branch (`deps.driver.currentBranch`) and its CANONICAL branch
+ * (`deps.driver.canonicalBranch`). Detached HEAD / an unresolvable branch
+ * (`currentBranch` returns `null`) is ALWAYS treated as non-canonical — never
+ * a safe mutate+relaunch target. A mismatch OBJECTS (`branch-skipped`) and
+ * skips the agent entirely — no `classifyDirtyConfig`, no `isBusy`, no
+ * `upgrade`/`restart`, no maintenance-lock activity. `--force` bypasses this
+ * gate exactly like it bypasses the config-dirty gate (same flag, same
+ * "I know what I'm doing" escape hatch).
  *
  * **Transactional + OBJECT-with-message revision (macf#725).** The pre-flight
  * config-dirty gate is the ONLY decision point that inspects PRE-upgrade
@@ -548,10 +609,26 @@ export async function rollFleet(
   let busySkipped = 0;
   let configDirtySkipped = 0;
   let configAutoResolved = 0;
+  let branchSkipped = 0;
 
   for (const plan of plans) {
     if (plan.disposition !== 'behind') continue;
     const agent = plan.agent;
+
+    // PRE-FLIGHT branch-gate (macf#755) — the FIRST gate, before config-dirty
+    // or busy. Detached HEAD / unresolvable (`current === null`) is ALWAYS
+    // non-canonical.
+    if (!opts.force) {
+      const canonical = await deps.driver.canonicalBranch(agent);
+      const current = await deps.driver.currentBranch(agent);
+      if (current === null || current !== canonical) {
+        branchSkipped += 1;
+        const message = buildBranchSkipMessage(agent, current, canonical);
+        results.push({ agent, outcome: 'branch-skipped', detail: message });
+        deps.onEvent?.({ kind: 'branch-skip', agent, current, canonical });
+        continue;
+      }
+    }
 
     // PRE-FLIGHT config-dirty gate — tier-first (DR-040 Decision 3 /
     // macf#698 R1). By-design inter-roll STEADY-STATE (macf#725): a clean
@@ -669,10 +746,10 @@ export async function rollFleet(
     // (MAINT_LOCK_TTL), giving the operator a bounded grace window to
     // inspect the halted roll before the watchdog resumes automatic action.
     stopHeartbeat();
-    return { results, halted: true, upgraded, busySkipped, configDirtySkipped, configAutoResolved };
+    return { results, halted: true, upgraded, busySkipped, configDirtySkipped, configAutoResolved, branchSkipped };
   }
 
-  return { results, halted: false, upgraded, busySkipped, configDirtySkipped, configAutoResolved };
+  return { results, halted: false, upgraded, busySkipped, configDirtySkipped, configAutoResolved, branchSkipped };
 }
 
 /** Options for the multi-fleet orchestrator. */

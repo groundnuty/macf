@@ -192,7 +192,7 @@ export function formatFleetReport(report: FleetPlanReport, target: string, log: 
     const mark =
       r.outcome === 'upgraded'
         ? '✓'
-        : r.outcome === 'busy-skipped' || r.outcome === 'config-dirty-skipped'
+        : r.outcome === 'busy-skipped' || r.outcome === 'config-dirty-skipped' || r.outcome === 'branch-skipped'
           ? '•'
           : '✗';
     log(`    ${mark} ${r.agent} — ${r.outcome}${r.detail ? ` (${r.detail})` : ''}`);
@@ -325,6 +325,14 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
       break;
     case 'roll-start':
       log(`   rolling ${ev.agent} (${ev.from ?? 'down'}→${ev.to})`);
+      break;
+    case 'branch-skip':
+      // The FIRST pre-flight gate (macf#755): nothing was touched — the
+      // workspace isn't on its canonical branch (or is detached/unresolvable).
+      log(
+        `   ${ev.agent}: BRANCH — OBJECTING (on ${ev.current ?? 'detached HEAD'}, expected ` +
+        `${ev.canonical}; no upgrade/restart run; switch branch or --force)`,
+      );
       break;
     case 'config-auto-resolved':
       // DR-040 Decision 3 / macf#698 R1: these dirty files were ALREADY the

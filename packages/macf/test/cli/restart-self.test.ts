@@ -60,7 +60,12 @@ function fakeDeps(overrides: Partial<RestartSelfDeps> = {}): {
     now: () => FIXED_NOW,
     hasUncommittedTrackedChanges: () => true,
     hasUncommittedConfigChanges: () => false,
-    currentBranch: () => 'feat/596-restart-self',
+    // macf#755: defaults to the SAME value as `baseOpts()`'s default
+    // `canonicalBranch` ('main') so the new canonical-branch guard doesn't
+    // trip on every pre-existing test that doesn't care about branch state.
+    // Tests exercising a specific branch value override BOTH this AND
+    // `canonicalBranch` (or pass `force`) explicitly.
+    currentBranch: () => 'main',
     headSha: () => 'abc1234def5678',
     stash: (label: string, stashOpts?: { readonly excludeConfigSurface?: boolean }): StashResult => {
       rec.order.push('stash');
@@ -104,6 +109,9 @@ function baseOpts(over: Partial<RunRestartSelfOptions> = {}): RunRestartSelfOpti
     json: false,
     force: false,
     leaveConfigUncommitted: false,
+    // macf#755 — matches fakeDeps()'s default `currentBranch` ('main') so
+    // the canonical-branch guard is a no-op for tests that don't care about it.
+    canonicalBranch: 'main',
     ...over,
   };
 }
@@ -247,6 +255,74 @@ describe('runRestartSelf — confirm path', () => {
     });
   });
 
+  describe('canonical-branch guard (macf#755)', () => {
+    it('refuses (exit 1, NO stash/write/spawn/kill) when off the canonical branch and not forced', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ currentBranch: () => 'feat/some-branch' });
+      const code = await runRestartSelf(baseOpts({ confirm: true, canonicalBranch: 'main' }), deps);
+      expect(code).toBe(1);
+      expect(rec.order).toEqual([]); // nothing mutated — no stash, no write, no spawn, no kill
+      const err = errSpy.mock.calls.flat().join('\n');
+      expect(err).toContain('feat/some-branch');
+      expect(err).toContain('main');
+      errSpy.mockRestore();
+    });
+
+    it('proceeds when on the canonical branch', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ currentBranch: () => 'main' });
+      const code = await runRestartSelf(baseOpts({ confirm: true, canonicalBranch: 'main' }), deps);
+      expect(code).toBe(0);
+      expect(rec.order).toEqual(['stash', 'backup', 'write', 'write', 'spawn', 'kill']);
+    });
+
+    it('a detached HEAD / unresolvable branch value is non-canonical too (refuses)', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      // `currentBranch()`'s real impl returns the literal string "HEAD" on a
+      // detached HEAD (git rev-parse --abbrev-ref HEAD semantics) or
+      // "(unknown)" on any git failure — neither ever equals a real branch
+      // name, so both are non-canonical without any special-casing.
+      const { deps, rec } = fakeDeps({ currentBranch: () => 'HEAD' });
+      const code = await runRestartSelf(baseOpts({ confirm: true, canonicalBranch: 'main' }), deps);
+      expect(code).toBe(1);
+      expect(rec.order).toEqual([]);
+      expect(errSpy.mock.calls.flat().join('\n')).toContain('HEAD');
+      errSpy.mockRestore();
+    });
+
+    it('--force bypasses the guard — proceeds despite being off-canonical', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ currentBranch: () => 'feat/some-branch' });
+      const code = await runRestartSelf(
+        baseOpts({ confirm: true, canonicalBranch: 'main', force: true }),
+        deps,
+      );
+      expect(code).toBe(0);
+      expect(rec.order).toEqual(['stash', 'backup', 'write', 'write', 'spawn', 'kill']);
+    });
+
+    it('leaveConfigUncommitted (the roll-path bypass) SKIPS the guard entirely — off-canonical proceeds', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ currentBranch: () => 'feat/some-branch' });
+      const code = await runRestartSelf(
+        baseOpts({ confirm: true, canonicalBranch: 'main', leaveConfigUncommitted: true }),
+        deps,
+      );
+      expect(code).toBe(0);
+      expect(rec.order).toEqual(['stash', 'backup', 'write', 'write', 'spawn', 'kill']);
+    });
+
+    it('dry-run still reports the plan even when off-canonical (the guard only blocks --confirm mutation)', async () => {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps({ currentBranch: () => 'feat/some-branch' });
+      const code = await runRestartSelf(baseOpts({ confirm: false, canonicalBranch: 'main' }), deps);
+      expect(code).toBe(0);
+      expect(rec.order).toEqual([]);
+      const out = logSpy.mock.calls.flat().join('\n');
+      expect(out).toContain('DRY-RUN');
+    });
+  });
+
   describe('leaveConfigUncommitted — the roll-path bypass (macf#725)', () => {
     it('SKIPS the standalone guard entirely (no refusal) even though the config surface is dirty', async () => {
       logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -298,8 +374,14 @@ describe('runRestartSelf — confirm path', () => {
 
   it('writes the RESUME-note with reason / branch / HEAD / stash-ref', async () => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const { deps, rec } = fakeDeps();
-    await runRestartSelf(baseOpts({ confirm: true, reason: 'fault' }), deps);
+    // On-canonical (currentBranch matches canonicalBranch) so the macf#755
+    // guard doesn't refuse — this test is about the resume-note CONTENT, not
+    // the branch-guard (see its own describe block below for that).
+    const { deps, rec } = fakeDeps({ currentBranch: () => 'feat/596-restart-self' });
+    await runRestartSelf(
+      baseOpts({ confirm: true, reason: 'fault', canonicalBranch: 'feat/596-restart-self' }),
+      deps,
+    );
     const note = rec.written.find((w) => w.path.endsWith('RESUME-restart-self.md'));
     expect(note).toBeDefined();
     expect(note!.content).toContain('Reason: fault');

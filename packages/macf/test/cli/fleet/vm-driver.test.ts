@@ -90,6 +90,8 @@ interface SeamOverrides {
   readonly modifiedFiles?: ReadonlyMap<string, readonly string[]>;
   /** Per-workspace FULL agent config for `readFullConfig` (DR-040 Decision 3 / macf#698 R1). */
   readonly fullConfigs?: ReadonlyMap<string, MacfAgentConfig | null>;
+  /** Per-workspace CURRENT branch for `currentBranch` (macf#755); default `'main'`. */
+  readonly branches?: ReadonlyMap<string, string | null>;
 }
 
 function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder } {
@@ -122,6 +124,7 @@ function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder
     isConfigDirty: (workspaceDir: string) => dirtyWorkspaces.has(workspaceDir),
     listDirtyConfig: (workspaceDir: string) => o.dirtyConfigFiles?.get(workspaceDir) ?? [],
     listModifiedFiles: (workspaceDir: string) => o.modifiedFiles?.get(workspaceDir) ?? [],
+    currentBranch: (workspaceDir: string) => (o.branches?.has(workspaceDir) ? (o.branches.get(workspaceDir) ?? null) : 'main'),
     readFullConfig: (workspaceDir: string) => o.fullConfigs?.get(workspaceDir) ?? null,
     commitCanonicalFiles: (workspaceDir: string, files: readonly string[]) => {
       rec.commits.push({ workspaceDir, files });
@@ -374,6 +377,81 @@ describe('listDirtyConfig', () => {
     const { seams } = fakeSeams({ dirtyConfigFiles: new Map([['/w/science', ['CLAUDE.md']]]) });
     expect(await createVmDriver(OPTS, seams).listDirtyConfig('code-agent')).toEqual([]);
     expect(await createVmDriver(OPTS, seams).listDirtyConfig('science-agent')).toEqual(['CLAUDE.md']);
+  });
+});
+
+// --- currentBranch / canonicalBranch (macf#755) ------------------------------
+
+describe('currentBranch', () => {
+  it('returns the branch reported by the workspace seam', async () => {
+    const { seams } = fakeSeams({ branches: new Map([['/w/macf', 'feat/some-branch']]) });
+    expect(await createVmDriver(OPTS, seams).currentBranch('code-agent')).toBe('feat/some-branch');
+  });
+
+  it('returns null when the agent is unknown — mirrors isConfigDirty/listDirtyConfig`s unknown handling', async () => {
+    const { seams } = fakeSeams({ branches: new Map([['/w/macf', 'main']]) });
+    expect(await createVmDriver(OPTS, seams).currentBranch('ghost')).toBeNull();
+  });
+
+  it('returns null when the seam itself reports null (detached HEAD)', async () => {
+    const { seams } = fakeSeams({ branches: new Map([['/w/macf', null]]) });
+    expect(await createVmDriver(OPTS, seams).currentBranch('code-agent')).toBeNull();
+  });
+
+  it('checks the RESOLVED agent workspace, not the driver`s own workspace', async () => {
+    const { seams } = fakeSeams({
+      branches: new Map([
+        ['/w/macf', 'main'],
+        ['/w/science', 'feat/science-branch'],
+      ]),
+    });
+    expect(await createVmDriver(OPTS, seams).currentBranch('code-agent')).toBe('main');
+    expect(await createVmDriver(OPTS, seams).currentBranch('science-agent')).toBe('feat/science-branch');
+  });
+});
+
+describe('canonicalBranch', () => {
+  it('defaults to "main" when the workspace has no macf-agent.json config', async () => {
+    const { seams } = fakeSeams();
+    expect(await createVmDriver(OPTS, seams).canonicalBranch('code-agent')).toBe('main');
+  });
+
+  it('resolves the per-workspace canonicalBranch field from the agent`s OWN config', async () => {
+    const config: MacfAgentConfig = {
+      project: 'macf',
+      agent_name: 'code-agent',
+      agent_role: 'code-agent',
+      agent_type: 'permanent',
+      registry: { type: 'repo', owner: 'o', repo: 'r' },
+      canonicalBranch: 'develop',
+    };
+    const { seams } = fakeSeams({ fullConfigs: new Map([['/w/macf', config]]) });
+    expect(await createVmDriver(OPTS, seams).canonicalBranch('code-agent')).toBe('develop');
+  });
+
+  it('still resolves (env override / default) for an unknown agent — never throws', async () => {
+    const { seams } = fakeSeams();
+    expect(await createVmDriver(OPTS, seams).canonicalBranch('ghost')).toBe('main');
+  });
+
+  it('MACF_CANONICAL_BRANCH env overrides even a per-workspace config field', async () => {
+    const config: MacfAgentConfig = {
+      project: 'macf',
+      agent_name: 'code-agent',
+      agent_role: 'code-agent',
+      agent_type: 'permanent',
+      registry: { type: 'repo', owner: 'o', repo: 'r' },
+      canonicalBranch: 'develop',
+    };
+    const { seams } = fakeSeams({ fullConfigs: new Map([['/w/macf', config]]) });
+    const prior = process.env['MACF_CANONICAL_BRANCH'];
+    process.env['MACF_CANONICAL_BRANCH'] = 'release';
+    try {
+      expect(await createVmDriver(OPTS, seams).canonicalBranch('code-agent')).toBe('release');
+    } finally {
+      if (prior === undefined) delete process.env['MACF_CANONICAL_BRANCH'];
+      else process.env['MACF_CANONICAL_BRANCH'] = prior;
+    }
   });
 });
 
@@ -793,6 +871,51 @@ describe('createVmExecSeams — real git (macf#698, DR-040 Decision 6)', () => {
     const seams = createVmExecSeams(repo);
     expect(seams.isConfigDirty(repo)).toBe(false);
     expect(seams.listDirtyConfig(repo)).toEqual([]);
+  });
+});
+
+// --- createVmExecSeams.currentBranch — real git (macf#755) ------------------
+
+describe('createVmExecSeams — currentBranch, real git (macf#755)', () => {
+  let repo: string;
+
+  afterEach(() => {
+    if (repo) rmSync(repo, { recursive: true, force: true });
+  });
+
+  function initRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-branch-'));
+    execFileSync('git', ['init', '--initial-branch=main'], { cwd: dir });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir });
+    execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: dir });
+    writeFileSync(join(dir, 'f.txt'), 'x');
+    execFileSync('git', ['add', '.'], { cwd: dir });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: dir });
+    return dir;
+  }
+
+  it('reports the current branch name', () => {
+    repo = initRepo();
+    expect(createVmExecSeams(repo).currentBranch(repo)).toBe('main');
+  });
+
+  it('reports a non-default branch after checkout -b', () => {
+    repo = initRepo();
+    execFileSync('git', ['checkout', '-b', 'feat/some-branch'], { cwd: repo, stdio: 'ignore' });
+    expect(createVmExecSeams(repo).currentBranch(repo)).toBe('feat/some-branch');
+  });
+
+  it('returns null on a detached HEAD (empty --show-current output)', () => {
+    repo = initRepo();
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim();
+    execFileSync('git', ['checkout', sha], { cwd: repo, stdio: 'ignore' });
+    expect(createVmExecSeams(repo).currentBranch(repo)).toBeNull();
+  });
+
+  it('returns null when the directory is not a git repo (fail-safe, same as detached HEAD)', () => {
+    repo = mkdtempSync(join(tmpdir(), 'macf-vmdriver-branch-notgit-'));
+    expect(createVmExecSeams(repo).currentBranch(repo)).toBeNull();
   });
 });
 
