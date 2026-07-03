@@ -56,6 +56,23 @@
 # internal error fails open (never delays or blocks a turn/session). Override:
 # MACF_SKIP_CHANNEL_ALIVE_CHECK=1.
 #
+# RETRY-BEFORE-DEAD (groundnuty/macf#765): a SINGLE `curl` probe treated a
+# transient timeout / momentary TLS blip / SessionStart-time resource
+# contention under fleet-launch load as a definitive, maximally-loud DEAD
+# verdict — no retry, no debounce. This produced a real false positive: the
+# channel-server had been up 2d19h, `macf fleet status` reported it reachable,
+# and live @mentions were arriving — yet this hook fired the DEAD banner off
+# one noisy sample. Same class as macf#645 (single-noisy-sample vs
+# sustained-signal — see silent-fallback-hazards.md's Pattern-C correction).
+# The fix: retry the probe up to MACF_CHANNEL_ALIVE_RETRIES times (default 3,
+# short spacing between attempts via MACF_CHANNEL_ALIVE_RETRY_DELAY_SECS,
+# default 1s) and only emit the LOUD banner once EVERY attempt has failed —
+# a single failure among successes stays completely silent, and the happy
+# path exits as soon as any attempt returns 2xx (no latency added when the
+# server is actually up). All attempts happen inside this ONE invocation, so
+# the existing throttle stamp (written once, below, before any attempt) still
+# bounds the frequency of the *next* invocation correctly.
+#
 # THROTTLE: a real mTLS probe on EVERY UserPromptSubmit would add needless
 # latency + noise to every turn. A local timestamp file
 # (.claude/.macf/.channel-alive-last-check, plain epoch-seconds) bounds the
@@ -156,48 +173,86 @@ if [ -n "$NOW_EPOCH" ]; then
   printf '%s' "$NOW_EPOCH" >"$THROTTLE_FILE" 2>/dev/null || true
 fi
 
-# ── The actual liveness probe ────────────────────────────────────────────────
-CURL_TIMEOUT_SECS="${MACF_CHANNEL_ALIVE_CURL_TIMEOUT_SECS:-5}"
+# ── The actual liveness probe — retry-before-DEAD (groundnuty/macf#765) ─────
+# A single transient failure must NOT produce the maximally-loud DEAD verdict
+# — only a SUSTAINED failure across every attempt does. The happy path (any
+# attempt returns 2xx) exits immediately with zero added latency; only a
+# fully-dead channel-server pays for the full retry budget.
+CURL_TIMEOUT_SECS="${MACF_CHANNEL_ALIVE_CURL_TIMEOUT_SECS:-8}"
 case "$CURL_TIMEOUT_SECS" in
-  '' | *[!0-9]*) CURL_TIMEOUT_SECS=5 ;;
+  '' | *[!0-9]*) CURL_TIMEOUT_SECS=8 ;;
+esac
+
+RETRIES="${MACF_CHANNEL_ALIVE_RETRIES:-3}"
+case "$RETRIES" in
+  '' | *[!0-9]*) RETRIES=3 ;;
+esac
+# A zero/blank-after-guard value would skip the loop body entirely and fall
+# through to the DEAD verdict WITHOUT ever probing — that's a false alarm,
+# not a fail-open. Floor it at 1.
+[ "$RETRIES" -ge 1 ] || RETRIES=3
+
+RETRY_DELAY_SECS="${MACF_CHANNEL_ALIVE_RETRY_DELAY_SECS:-1}"
+case "$RETRY_DELAY_SECS" in
+  '' | *[!0-9]*) RETRY_DELAY_SECS=1 ;;
 esac
 
 HEALTH_URL="https://${HOST}:${PORT}/health"
-TMP_BODY="$(mktemp 2>/dev/null || true)"
-[ -n "$TMP_BODY" ] || exit 0
 
-# curl's own `%{http_code}` prints "000" when no HTTP response was received
-# at all (connection refused / timeout / TLS failure) — it prints that AND
-# still exits non-zero, so `|| echo "000"` here would DOUBLE it into "000000"
-# (curl's own "000" plus the fallback's). `|| true` just neutralizes curl's
-# exit status for `set -e` purposes without adding a second stdout write; the
-# empty-string case below (curl killed by a signal before writing anything)
-# is the actual belt-and-suspenders backstop.
-HTTP_CODE="$(curl -sS -o "$TMP_BODY" -w '%{http_code}' -m "$CURL_TIMEOUT_SECS" \
-  --cacert "$CA_CERT" --cert "$AGENT_CERT" --key "$AGENT_KEY" \
-  "$HEALTH_URL" 2>/dev/null || true)"
-rm -f "$TMP_BODY" 2>/dev/null || true
-[ -z "$HTTP_CODE" ] && HTTP_CODE="000"
+ATTEMPT=1
+HTTP_CODE="000"
+while [ "$ATTEMPT" -le "$RETRIES" ]; do
+  TMP_BODY="$(mktemp 2>/dev/null || true)"
+  [ -n "$TMP_BODY" ] || exit 0
 
-case "$HTTP_CODE" in
-  2??)
-    # Alive. No output — no noise on the happy path.
-    exit 0
-    ;;
-  *)
-    DETAIL="unexpected HTTP ${HTTP_CODE} from ${HEALTH_URL}"
-    [ "$HTTP_CODE" = "000" ] && DETAIL="connection to ${HEALTH_URL} failed (refused/timeout/TLS error)"
-    cat <<WARN
+  # curl's own `%{http_code}` prints "000" when no HTTP response was received
+  # at all (connection refused / timeout / TLS failure) — it prints that AND
+  # still exits non-zero, so `|| echo "000"` here would DOUBLE it into "000000"
+  # (curl's own "000" plus the fallback's). `|| true` just neutralizes curl's
+  # exit status for `set -e` purposes without adding a second stdout write; the
+  # empty-string case below (curl killed by a signal before writing anything)
+  # is the actual belt-and-suspenders backstop.
+  HTTP_CODE="$(curl -sS -o "$TMP_BODY" -w '%{http_code}' -m "$CURL_TIMEOUT_SECS" \
+    --cacert "$CA_CERT" --cert "$AGENT_CERT" --key "$AGENT_KEY" \
+    "$HEALTH_URL" 2>/dev/null || true)"
+  rm -f "$TMP_BODY" 2>/dev/null || true
+  [ -z "$HTTP_CODE" ] && HTTP_CODE="000"
+
+  case "$HTTP_CODE" in
+    2??)
+      # Alive on this attempt. No output — no noise on the happy path. Stop
+      # immediately; a single success is sufficient, no need to burn the
+      # remaining retry budget.
+      exit 0
+      ;;
+  esac
+
+  # Not alive on this attempt. Unless this was the last one, wait a short
+  # beat and try again — only a failure sustained across EVERY attempt is
+  # reported below.
+  if [ "$ATTEMPT" -lt "$RETRIES" ] && [ "$RETRY_DELAY_SECS" -gt 0 ]; then
+    sleep "$RETRY_DELAY_SECS" 2>/dev/null || true
+  fi
+  ATTEMPT=$((ATTEMPT + 1))
+done
+
+# Every attempt failed — the CONFIRMED-sustained case. Report LOUD (wording
+# intentionally NOT softened here: this verdict now means "sustained across
+# $RETRIES consecutive probes", which is meaningfully stronger evidence than
+# the single-sample verdict this hook used to fire on).
+DETAIL="unexpected HTTP ${HTTP_CODE} from ${HEALTH_URL} (after ${RETRIES} attempts)"
+[ "$HTTP_CODE" = "000" ] && DETAIL="connection to ${HEALTH_URL} failed (refused/timeout/TLS error) after ${RETRIES} attempts"
+cat <<WARN
 ⚠️  YOUR CHANNEL-SERVER IS DEAD (groundnuty/macf#734) — you are DEAF to ALL
 routed issues, PRs, reviews, and @mentions.
 
-A liveness probe to this agent's own channel-server (${HEALTH_URL}) did NOT
-succeed: ${DETAIL}. The channel-server process is the delivery path for BOTH
-native channel-push AND the tmux-wake fallback (silent-fallback-hazards.md
-Instance 15) — when it is down, every routed notification is silently
-dropped, and the Claude Code TUI itself shows nothing wrong (it's a separate
-process; this is exactly how one agent's dead channel-server went unnoticed
-for ~55 minutes).
+${RETRIES} consecutive liveness probes to this agent's own channel-server
+(${HEALTH_URL}) did NOT succeed: ${DETAIL}. The channel-server process is the
+delivery path for BOTH native channel-push AND the tmux-wake fallback
+(silent-fallback-hazards.md Instance 15) — when it is down, every routed
+notification is silently dropped, and the Claude Code TUI itself shows
+nothing wrong (it's a separate process; this is exactly how one agent's dead
+channel-server went unnoticed for ~55 minutes).
 
 Do NOT assume "no pings = nothing to do" — that assumption is exactly what a
 dead channel-server breaks. Assert GitHub state directly (gh issue/pr list,
@@ -209,6 +264,4 @@ guard is observational-only (DR-023 §UC-3) and cannot restart it for you.
 
 Silence: MACF_SKIP_CHANNEL_ALIVE_CHECK=1.
 WARN
-    exit 0
-    ;;
-esac
+exit 0
