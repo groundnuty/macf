@@ -4,6 +4,24 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.50] — 2026-07-03
+
+Patch: fixes a crash that halted `macf fleet upgrade`. Marketplace v0.2.50 is a
+lockstep bump (plugin content unchanged from 0.2.49).
+
+### Reliability
+- **#757/#758** — `macf update` crashed (`Cannot read properties of undefined
+  (reading 'trim')`) rolling an agent whose `settings.json` has a
+  `type:"mcp_tool"` hook (no `command` field — e.g. a hand-wired PreCompact
+  `checkpoint_to_memory`). The DR-039 hook-strip migration called
+  `basenameOfCommand(hook.command)` → `undefined.trim()`, halting the whole
+  fleet roll. Guard the shared chokepoint (`basenameOfCommand` +
+  `isMacfManagedCommand`/`isMigratedHookCommand`/`shouldStrip` widened to
+  `string | undefined`): a non-command hook is ignored (never stripped),
+  never crashes. Pre-existing since 0.2.48 (DR-039 landing); first exposed
+  when an agent upgraded 0.2.47→0.2.49, hitting the DR-039 migration for the
+  first time.
+
 ## [0.2.49] — 2026-07-03
 
 DR-040 reconcile-foundation release. Ratifies + starts implementing the

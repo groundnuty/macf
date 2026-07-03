@@ -1,6 +1,6 @@
 {
   "name": "@groundnuty/macf-core",
-  "version": "0.2.49",
+  "version": "0.2.50",
   "description": "Shared internals consumed by the MACF CLI and channel-server packages. Not intended for direct external use — will be marked deprecated-internal on first npm publish per DR-022 Amendment A.",
   "type": "module",
   "main": "dist/index.js",
