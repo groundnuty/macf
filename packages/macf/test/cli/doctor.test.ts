@@ -5,6 +5,7 @@
  * module semantics — we cover the business logic (diff + format)
  * directly and trust the wrapper.
  */
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +15,7 @@ import {
   DR039_LOAD_BEARING_HOOKS,
   MACF_REQUIRED_PERMISSIONS,
   checkBotLogin,
+  checkCanonicalBranch,
   checkLoadBearingHooks,
   checkPermissionsAllow,
   checkSandboxFdAllowRead,
@@ -25,6 +27,7 @@ import {
   getEffectiveHookConfig,
   hasToolDeny,
   isToolFullyAllowed,
+  readCurrentBranch,
   resolvePluginDirFromClaudeSh,
   type RequiredPermission,
 } from '../../src/cli/commands/doctor.js';
@@ -546,6 +549,96 @@ describe('checkBotLogin (macf#707/#535 — DR-028 attribution-hook detect+repair
     const result = checkBotLogin(rest as MacfAgentConfig);
     expect(result.status).toBe('INFO');
     expect(result.detail).toMatch(/local-registry|no github app/i);
+  });
+});
+
+describe('checkCanonicalBranch (macf#755 — branch-guard DETECT half, Pattern A)', () => {
+  function baseConfig(overrides: Partial<MacfAgentConfig> = {}): MacfAgentConfig {
+    return {
+      project: 'TEST',
+      agent_name: 'test-agent',
+      agent_role: 'code-agent',
+      agent_type: 'permanent',
+      registry: { type: 'repo', owner: 'o', repo: 'r' },
+      ...overrides,
+    };
+  }
+
+  it('PASS when the current branch matches the default canonical branch (main)', () => {
+    const result = checkCanonicalBranch(baseConfig(), 'main');
+    expect(result.status).toBe('PASS');
+    expect(result.detail).toContain('main');
+  });
+
+  it('WARN when the current branch is a different branch than the default (main)', () => {
+    const result = checkCanonicalBranch(baseConfig(), 'feat/some-branch');
+    expect(result.status).toBe('WARN');
+    expect(result.detail).toContain('feat/some-branch');
+    expect(result.detail).toContain('main');
+    expect(result.detail).toMatch(/mutate the wrong branch/i);
+  });
+
+  it('WARN with a detached-HEAD-specific message when currentBranch is null', () => {
+    const result = checkCanonicalBranch(baseConfig(), null);
+    expect(result.status).toBe('WARN');
+    expect(result.detail).toMatch(/detached head/i);
+  });
+
+  it('respects a per-workspace canonicalBranch override — PASS when current matches the override', () => {
+    const result = checkCanonicalBranch(baseConfig({ canonicalBranch: 'develop' }), 'develop');
+    expect(result.status).toBe('PASS');
+    expect(result.detail).toContain('develop');
+  });
+
+  it('WARN against the override when current does not match it', () => {
+    const result = checkCanonicalBranch(baseConfig({ canonicalBranch: 'develop' }), 'main');
+    expect(result.status).toBe('WARN');
+    expect(result.detail).toContain('main');
+    expect(result.detail).toContain('develop');
+  });
+
+  it('resolves the default (main) when config is null (unresolvable workspace)', () => {
+    expect(checkCanonicalBranch(null, 'main').status).toBe('PASS');
+    expect(checkCanonicalBranch(null, 'other').status).toBe('WARN');
+  });
+});
+
+describe('readCurrentBranch (macf#755 — real git)', () => {
+  let repo: string;
+
+  afterEach(() => {
+    if (repo) rmSync(repo, { recursive: true, force: true });
+  });
+
+  it('returns the current branch name for a real git repo', () => {
+    repo = mkdtempSync(join(tmpdir(), 'doctor-branch-'));
+    execFileSync('git', ['init', '--initial-branch=main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: repo });
+    execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: repo });
+    writeFileSync(join(repo, 'f.txt'), 'x');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    expect(readCurrentBranch(repo)).toBe('main');
+  });
+
+  it('returns null on a detached HEAD', () => {
+    repo = mkdtempSync(join(tmpdir(), 'doctor-branch-'));
+    execFileSync('git', ['init', '--initial-branch=main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: repo });
+    execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: repo });
+    writeFileSync(join(repo, 'f.txt'), 'x');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim();
+    execFileSync('git', ['checkout', sha], { cwd: repo, stdio: 'ignore' });
+    expect(readCurrentBranch(repo)).toBeNull();
+  });
+
+  it('returns null when the directory is not a git repo', () => {
+    repo = mkdtempSync(join(tmpdir(), 'doctor-branch-notgit-'));
+    expect(readCurrentBranch(repo)).toBeNull();
   });
 });
 

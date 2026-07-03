@@ -38,6 +38,7 @@ import {
 } from '@groundnuty/macf-core';
 import {
   readAgentConfig,
+  resolveCanonicalBranch,
   tokenSourceFromConfig,
   agentCertPath,
   agentKeyPath,
@@ -110,6 +111,13 @@ export interface VmDriverSeams {
    * path per line (status-prefix stripped).
    */
   readonly listDirtyConfig: (workspaceDir: string) => readonly string[];
+  /**
+   * The canonical-branch guard's CURRENT-branch read (macf#755) — `git branch
+   * --show-current` semantics: the branch name, or `null` on detached HEAD
+   * (empty output) / any git failure. Real impl: `git branch --show-current`
+   * in `workspaceDir`.
+   */
+  readonly currentBranch: (workspaceDir: string) => string | null;
   /**
    * Post-upgrade: list ALL currently-modified tracked files in `workspaceDir`
    * (macf#725) — used to report what `macf update` regenerated. NOT scoped to
@@ -291,6 +299,29 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
   }
 
   /**
+   * The canonical-branch guard's CURRENT-branch read (macf#755). Unknown
+   * agent → `null` (unresolvable is treated identically to detached HEAD by
+   * the branch-gate — both are "never a safe mutate+relaunch target").
+   */
+  async function currentBranch(agent: string): Promise<string | null> {
+    const target = resolveTarget(seams, agent);
+    if (!target) return null;
+    return seams.currentBranch(target.workspace);
+  }
+
+  /**
+   * The canonical-branch guard's CANONICAL-branch resolution (macf#755) —
+   * `resolveCanonicalBranch` against the agent's own `macf-agent.json` (env
+   * override still applies even for an unresolvable agent / missing config;
+   * only the per-workspace `canonicalBranch` field needs a readable config).
+   */
+  async function canonicalBranch(agent: string): Promise<string> {
+    const target = resolveTarget(seams, agent);
+    const config = target ? seams.readFullConfig(target.workspace) : null;
+    return resolveCanonicalBranch(config, process.env);
+  }
+
+  /**
    * The tiered form (DR-040 Decision 3 / macf#698 R1): resolve the agent's
    * workspace + full config, reuse `listDirtyConfig`'s raw list, and classify
    * EACH path via the canonical-compute primitive (`classifyDirtyFile`).
@@ -398,6 +429,8 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     isBusy,
     isConfigDirty,
     listDirtyConfig,
+    currentBranch,
+    canonicalBranch,
     classifyDirtyConfig,
     autoResolveCanonical,
     capturePane,
@@ -450,6 +483,7 @@ export function createVmExecSeams(
   | 'sleep'
   | 'isConfigDirty'
   | 'listDirtyConfig'
+  | 'currentBranch'
   | 'listModifiedFiles'
   | 'readFullConfig'
   | 'commitCanonicalFiles'
@@ -516,6 +550,22 @@ export function createVmExecSeams(
       } catch {
         // Best-effort diagnostic read — never throw on it.
         return [];
+      }
+    },
+    currentBranch: (dir: string): string | null => {
+      try {
+        // `git branch --show-current` prints the branch name, or an EMPTY
+        // line on detached HEAD — normalize empty to `null` (macf#755: the
+        // branch-gate treats detached HEAD as non-canonical).
+        const out = execFileSync('git', ['branch', '--show-current'], {
+          cwd: dir,
+          encoding: 'utf-8',
+        }).trim();
+        return out.length > 0 ? out : null;
+      } catch {
+        // Not a git repo / git unavailable → null, same as detached HEAD —
+        // never a safe mutate+relaunch target either way.
+        return null;
       }
     },
     readConfig: (dir: string): WorkspaceIdentity | null => {

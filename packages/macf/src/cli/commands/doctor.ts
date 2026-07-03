@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
-import { readAgentConfig, tokenSourceFromConfig, writeAgentConfig } from '../config.js';
+import { readAgentConfig, resolveCanonicalBranch, tokenSourceFromConfig, writeAgentConfig } from '../config.js';
 import type { MacfAgentConfig } from '../config.js';
 import { defaultProcReader, scanMacfProcesses } from '../proc-scan.js';
 import type { ProcReader } from '../proc-scan.js';
@@ -799,6 +799,66 @@ export function checkOtelLaunchBoundary(
 }
 
 /**
+ * Result of the canonical-branch check (macf#755) — the branch-guard's
+ * DETECT half (Pattern A): surface non-canonical-branch drift as a doctor
+ * WARN *before* a `macf fleet upgrade` / `macf restart-self` hits it and
+ * refuses (or, pre-#755, would have silently mutated the wrong branch).
+ *
+ *   - `PASS` — the workspace's current branch matches its resolved canonical
+ *     branch (`resolveCanonicalBranch`).
+ *   - `WARN` — a different branch, a detached HEAD, or an unresolvable
+ *     branch (all non-canonical) — a fleet-upgrade/relaunch would mutate the
+ *     wrong branch. Warn-only — does not affect the exit code, matching the
+ *     macf#296 / OTEL-launch-boundary checks' detect-only discipline.
+ */
+export interface CanonicalBranchCheckResult {
+  readonly status: 'PASS' | 'WARN';
+  readonly detail: string;
+}
+
+/**
+ * Read `workspaceDir`'s current git branch (`git branch --show-current`
+ * semantics — macf#755, matching the VM `FleetDriver.currentBranch` seam).
+ * `null` on detached HEAD (empty output) or any git failure — both are
+ * non-canonical to the caller.
+ */
+export function readCurrentBranch(workspaceDir: string): string | null {
+  try {
+    const out = execFileSync('git', ['branch', '--show-current'], {
+      cwd: workspaceDir,
+      encoding: 'utf-8',
+    }).trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pure check: does `currentBranch` match `config`'s resolved canonical
+ * branch? `currentBranch` is injected (via `readCurrentBranch` in
+ * production) so tests don't need a real git repo — same seam-injection
+ * style as `checkOtelLaunchBoundary`'s `ProcReader`.
+ */
+export function checkCanonicalBranch(
+  config: MacfAgentConfig | null,
+  currentBranch: string | null,
+): CanonicalBranchCheckResult {
+  const canonical = resolveCanonicalBranch(config);
+  if (currentBranch !== null && currentBranch === canonical) {
+    return { status: 'PASS', detail: `workspace is on its canonical branch \`${canonical}\`` };
+  }
+  const branchDesc =
+    currentBranch === null ? 'a detached HEAD (or an unresolvable branch)' : `branch \`${currentBranch}\``;
+  return {
+    status: 'WARN',
+    detail:
+      `workspace on non-canonical ${branchDesc} (expected \`${canonical}\`) — a fleet-upgrade/relaunch ` +
+      `would mutate the wrong branch; switch to \`${canonical}\` or set canonicalBranch`,
+  };
+}
+
+/**
  * DR-039 Decision 1 — the load-bearing hook-set `macf doctor` asserts is
  * actually present in the agent's EFFECTIVE hook registration (the union of
  * `.claude/settings.json` + the LOADED plugin's `hooks/hooks.json`). Pattern A:
@@ -1220,6 +1280,11 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   printOtelLaunchSection(checkOtelLaunchBoundary(projectDir));
 
   console.log('');
+  console.log('Canonical branch (macf#755)');
+  console.log('──────────────────────────────────────────────────────────────');
+  printCanonicalBranchSection(checkCanonicalBranch(config, readCurrentBranch(projectDir)));
+
+  console.log('');
   console.log('Attribution identity (DR-028 / macf#535 / macf#707)');
   console.log('──────────────────────────────────────────────────────────────');
   let botLoginCheck = checkBotLogin(config);
@@ -1298,6 +1363,16 @@ function printOtelLaunchSection(check: OtelLaunchCheck): void {
     console.log(`  ⚠ ${check.detail}  [WARN]`);
   } else {
     console.log(`  ℹ ${check.detail}  [INFO]`);
+  }
+}
+
+/** Print the macf#755 canonical-branch report line for `check`. */
+function printCanonicalBranchSection(check: CanonicalBranchCheckResult): void {
+  if (check.status === 'PASS') {
+    console.log(`  ✓ ${check.detail}  [PASS]`);
+  } else {
+    console.log(`  ⚠ ${check.detail}  [WARN]`);
+    console.log('    Fix: switch the workspace to its canonical branch, or set canonicalBranch in macf-agent.json.');
   }
 }
 

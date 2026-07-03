@@ -181,6 +181,28 @@ export interface FleetDriver {
   readonly autoResolveCanonical: (agent: string, files: readonly string[]) => Promise<void>;
 
   /**
+   * The agent's CURRENT git branch (`git branch --show-current` semantics) —
+   * macf#755's canonical-branch guard. `null` on detached HEAD (empty
+   * `--show-current` output), no branch, or an unresolvable agent — ALL
+   * treated identically as non-canonical by `rollFleet`'s branch-gate (a
+   * detached HEAD is never a safe mutate+relaunch target). VM: `git branch
+   * --show-current` in the agent's resolved workspace.
+   */
+  readonly currentBranch: (agent: string) => Promise<string | null>;
+
+  /**
+   * The agent's configured CANONICAL branch (macf#755) — resolved via
+   * `resolveCanonicalBranch` (macf's `config.ts`): the `MACF_CANONICAL_BRANCH`
+   * env override, else the agent's own `macf-agent.json` `canonicalBranch`
+   * field, else the default `'main'`. Used alongside `currentBranch` by
+   * `rollFleet`'s pre-flight branch-gate — the FIRST gate (cheapest + most
+   * fundamental: branch-correctness precedes config-correctness). An
+   * unresolvable agent still resolves (env override or default) — never
+   * throws.
+   */
+  readonly canonicalBranch: (agent: string) => Promise<string>;
+
+  /**
    * Read the agent's current pane content for stall-signature matching
    * (`macf fleet resume`, DR-037 / macf#686). VM: a single `tmux capture-pane`
    * of the live session; K8s: recent pod logs. Returns `null` when the agent has
