@@ -15,6 +15,7 @@ import {
   detectToolchainBackend,
   generateHostPrelude,
   writeHostPrelude,
+  computeCanonicalHostPrelude,
 } from '../../src/cli/host-prelude.js';
 import type { ToolchainProbe, ToolchainDetection } from '../../src/cli/host-prelude.js';
 
@@ -222,5 +223,16 @@ describe('writeHostPrelude', () => {
     const isReSource = content.includes('shellenv');
     const isNoOp = /^:$/m.test(content);
     expect(isReSource || isNoOp).toBe(true);
+  });
+
+  it('computeCanonicalHostPrelude() (DR-040 Decision 3, macf#698 R1) matches what writeHostPrelude WOULD write right now', () => {
+    const computed = computeCanonicalHostPrelude();
+    const path = writeHostPrelude(tmpRoot);
+    const written = readFileSync(path, 'utf-8');
+    expect(computed).toBe(written);
+  });
+
+  it('computeCanonicalHostPrelude() is stable across repeated calls (re-detects the SAME current toolchain)', () => {
+    expect(computeCanonicalHostPrelude()).toBe(computeCanonicalHostPrelude());
   });
 });

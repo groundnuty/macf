@@ -41,10 +41,12 @@ import {
   tokenSourceFromConfig,
   agentCertPath,
   agentKeyPath,
+  type MacfAgentConfig,
 } from '../config.js';
 import { createClientFromConfig } from '../registry-helper.js';
 import { discoverWorkspaces } from '../discovery.js';
 import { gatherFleetStatus, type FleetProbeFn } from '../commands/fleet.js';
+import { classifyDirtyFile } from './canonical-compute.js';
 
 /** Default `capture-pane` content-diff window for the busy gate (ms). */
 export const DEFAULT_BUSY_WINDOW_MS = 2000;
@@ -109,6 +111,25 @@ export interface VmDriverSeams {
    * line. Best-effort — callers treat an inspection failure as an empty list.
    */
   readonly listModifiedFiles: (workspaceDir: string) => readonly string[];
+  /**
+   * Read a workspace's FULL agent config (DR-040 Decision 3 / macf#698 R1) —
+   * the canonical-compute primitive needs it to regenerate `claude.sh` /
+   * the managed env files / etc. Distinct from `readConfig` above (which only
+   * surfaces `project` + `routingLabel` for session-name derivation). `null`
+   * when the workspace has no `macf-agent.json` (or it's unreadable) —
+   * callers fail-safe to `genuine-delta` in that case.
+   */
+  readonly readFullConfig: (workspaceDir: string) => MacfAgentConfig | null;
+  /**
+   * Commit exactly `files` in `workspaceDir` (DR-040 Decision 3 / macf#698
+   * R1) — the auto-resolve half of the tier-first config-dirty gate. A no-op
+   * when `files` is empty OR when `git add` stages nothing (e.g. the file
+   * was already committed by the time this runs) — never throws on
+   * "nothing to commit". Real impl: `git add -- <files>` then `git commit`
+   * with a fixed, DR-040-referencing message, ONLY if `git diff --cached`
+   * shows staged changes.
+   */
+  readonly commitCanonicalFiles: (workspaceDir: string, files: readonly string[]) => void;
 }
 
 /** Construction options for `createVmDriver`. */
@@ -248,6 +269,50 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     return seams.listDirtyConfig(target.workspace);
   }
 
+  /**
+   * The tiered form (DR-040 Decision 3 / macf#698 R1): resolve the agent's
+   * workspace + full config, reuse `listDirtyConfig`'s raw list, and classify
+   * EACH path via the canonical-compute primitive (`classifyDirtyFile`).
+   * Unknown agent / unresolvable config → everything classifies as
+   * genuine-delta (fail-safe — never auto-resolve without a config to
+   * compute canonical content against).
+   */
+  async function classifyDirtyConfig(
+    agent: string,
+  ): Promise<{ readonly alreadyCanonical: readonly string[]; readonly genuineDelta: readonly string[] }> {
+    const target = resolveTarget(seams, agent);
+    if (!target) return { alreadyCanonical: [], genuineDelta: [] };
+
+    const dirty = seams.listDirtyConfig(target.workspace);
+    if (dirty.length === 0) return { alreadyCanonical: [], genuineDelta: [] };
+
+    const config = seams.readFullConfig(target.workspace);
+    if (!config) {
+      // No macf-agent.json (or unreadable) → can't compute canonical content
+      // for anything → every dirty file fails safe to genuine-delta.
+      return { alreadyCanonical: [], genuineDelta: dirty };
+    }
+
+    const alreadyCanonical: string[] = [];
+    const genuineDelta: string[] = [];
+    for (const file of dirty) {
+      const tier = classifyDirtyFile(file, target.workspace, config);
+      (tier === 'already-canonical' ? alreadyCanonical : genuineDelta).push(file);
+    }
+    return { alreadyCanonical, genuineDelta };
+  }
+
+  /**
+   * Commit exactly `files` in the agent's workspace (DR-040 Decision 3 /
+   * macf#698 R1). Unknown agent / empty `files` → no-op.
+   */
+  async function autoResolveCanonical(agent: string, files: readonly string[]): Promise<void> {
+    if (files.length === 0) return;
+    const target = resolveTarget(seams, agent);
+    if (!target) return;
+    seams.commitCanonicalFiles(target.workspace, files);
+  }
+
   async function listModifiedFiles(agent: string): Promise<readonly string[]> {
     const target = resolveTarget(seams, agent);
     if (!target) return [];
@@ -294,6 +359,8 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     isBusy,
     isConfigDirty,
     listDirtyConfig,
+    classifyDirtyConfig,
+    autoResolveCanonical,
     capturePane,
     upgrade,
     restart,
@@ -342,6 +409,8 @@ export function createVmExecSeams(
   | 'isConfigDirty'
   | 'listDirtyConfig'
   | 'listModifiedFiles'
+  | 'readFullConfig'
+  | 'commitCanonicalFiles'
 > {
   return {
     discover: () => discoverWorkspaces(),
@@ -411,6 +480,39 @@ export function createVmExecSeams(
       const cfg = readAgentConfig(dir);
       if (!cfg) return null;
       return { project: cfg.project, routingLabel: cfg.routing_label ?? cfg.agent_name };
+    },
+    readFullConfig: (dir: string): MacfAgentConfig | null => readAgentConfig(dir),
+    commitCanonicalFiles: (dir: string, files: readonly string[]): void => {
+      if (files.length === 0) return;
+      try {
+        execFileSync('git', ['add', '--', ...files], { cwd: dir, stdio: 'ignore' });
+        // Nothing staged (e.g. the file was already committed by the time
+        // this runs) → `git diff --cached --quiet` exits 0 → no-op, never
+        // attempt a commit with nothing to commit.
+        execFileSync('git', ['diff', '--cached', '--quiet'], { cwd: dir });
+        return;
+      } catch {
+        // `git diff --cached --quiet` exits 1 when there ARE staged changes
+        // (the normal, expected case) — fall through to commit. Any OTHER
+        // failure (git add itself failing, not a repo, etc.) also lands here;
+        // the commit attempt below will itself fail-safe (best-effort,
+        // never throws upward — see the outer try/catch).
+      }
+      try {
+        execFileSync(
+          'git',
+          [
+            'commit',
+            '-m',
+            'chore(config): commit already-canonical macf-update regen (auto-resolved, DR-040 Decision 3 tier-first)',
+          ],
+          { cwd: dir, stdio: 'ignore' },
+        );
+      } catch {
+        // Best-effort: never block the roll on a commit failure here — the
+        // files stay dirty and the NEXT roll's pre-flight re-classifies them
+        // (still already-canonical, tries again) rather than aborting this one.
+      }
     },
     hasSession: (session: string): boolean => {
       try {

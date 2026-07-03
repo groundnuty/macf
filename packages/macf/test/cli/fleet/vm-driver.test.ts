@@ -27,6 +27,8 @@ import {
   type WorkspaceIdentity,
 } from '../../../src/cli/fleet/vm-driver.js';
 import { gatherFleetStatus } from '../../../src/cli/commands/fleet.js';
+import { computeCanonicalRuleFile } from '../../../src/cli/rules.js';
+import type { MacfAgentConfig } from '../../../src/cli/config.js';
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -67,6 +69,8 @@ interface Recorder {
   readonly submits: { session: string; text: string }[];
   readonly sleeps: number[];
   readonly captured: string[];
+  /** `commitCanonicalFiles` calls (DR-040 Decision 3 / macf#698 R1). */
+  readonly commits: { workspaceDir: string; files: readonly string[] }[];
 }
 
 /** Per-call capturePane return values (drained in order; repeats last). */
@@ -82,10 +86,12 @@ interface SeamOverrides {
   readonly dirtyConfigFiles?: ReadonlyMap<string, readonly string[]>;
   /** Per-workspace modified-file lists for `listModifiedFiles` (macf#725). */
   readonly modifiedFiles?: ReadonlyMap<string, readonly string[]>;
+  /** Per-workspace FULL agent config for `readFullConfig` (DR-040 Decision 3 / macf#698 R1). */
+  readonly fullConfigs?: ReadonlyMap<string, MacfAgentConfig | null>;
 }
 
 function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder } {
-  const rec: Recorder = { execs: [], spawns: [], submits: [], sleeps: [], captured: [] };
+  const rec: Recorder = { execs: [], spawns: [], submits: [], sleeps: [], captured: [], commits: [] };
   const paneQueue = [...(o.paneReads ?? [])];
   const live = o.liveSessions ?? new Set<string>();
   const dirtyWorkspaces = o.configDirtyWorkspaces ?? new Set<string>();
@@ -114,6 +120,10 @@ function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder
     isConfigDirty: (workspaceDir: string) => dirtyWorkspaces.has(workspaceDir),
     listDirtyConfig: (workspaceDir: string) => o.dirtyConfigFiles?.get(workspaceDir) ?? [],
     listModifiedFiles: (workspaceDir: string) => o.modifiedFiles?.get(workspaceDir) ?? [],
+    readFullConfig: (workspaceDir: string) => o.fullConfigs?.get(workspaceDir) ?? null,
+    commitCanonicalFiles: (workspaceDir: string, files: readonly string[]) => {
+      rec.commits.push({ workspaceDir, files });
+    },
   };
   return { seams, rec };
 }
@@ -362,6 +372,77 @@ describe('listDirtyConfig', () => {
     const { seams } = fakeSeams({ dirtyConfigFiles: new Map([['/w/science', ['CLAUDE.md']]]) });
     expect(await createVmDriver(OPTS, seams).listDirtyConfig('code-agent')).toEqual([]);
     expect(await createVmDriver(OPTS, seams).listDirtyConfig('science-agent')).toEqual(['CLAUDE.md']);
+  });
+});
+
+// --- classifyDirtyConfig / autoResolveCanonical (DR-040 Decision 3, macf#698 R1) ---
+//
+// Dispatch-level coverage with FAKE seams (no real fs) — the TRUE positive
+// "content already equals canonical" path needs a real workspace on disk (the
+// canonical-compute primitive reads real files), so that's covered by the
+// "createVmExecSeams — real git" suite below instead. Here we pin: unknown
+// agent / no dirty files short-circuit before ever calling `readFullConfig`;
+// a missing config fails safe (every dirty file → genuineDelta); and
+// `autoResolveCanonical` correctly resolves the target + delegates to the
+// seam (or no-ops on an unknown agent / empty file list).
+
+describe('classifyDirtyConfig', () => {
+  it('returns both tiers empty when the agent is unknown — never calls readFullConfig', async () => {
+    const { seams } = fakeSeams({ dirtyConfigFiles: new Map([['/w/macf', ['CLAUDE.md']]]) });
+    const result = await createVmDriver(OPTS, seams).classifyDirtyConfig('ghost');
+    expect(result).toEqual({ alreadyCanonical: [], genuineDelta: [] });
+  });
+
+  it('returns both tiers empty when nothing is dirty', async () => {
+    const { seams } = fakeSeams();
+    const result = await createVmDriver(OPTS, seams).classifyDirtyConfig('code-agent');
+    expect(result).toEqual({ alreadyCanonical: [], genuineDelta: [] });
+  });
+
+  it('fails safe to ALL genuine-delta when the workspace has no readable macf-agent.json', async () => {
+    const files = ['.claude/rules/coordination.md', 'CLAUDE.md'];
+    const { seams } = fakeSeams({
+      dirtyConfigFiles: new Map([['/w/macf', files]]),
+      fullConfigs: new Map([['/w/macf', null]]),
+    });
+    const result = await createVmDriver(OPTS, seams).classifyDirtyConfig('code-agent');
+    expect(result).toEqual({ alreadyCanonical: [], genuineDelta: files });
+  });
+
+  it('CLAUDE.md is always genuine-delta even WITH a resolvable config (never-written file)', async () => {
+    const config: MacfAgentConfig = {
+      project: 'macf',
+      agent_name: 'code-agent',
+      agent_role: 'code-agent',
+      agent_type: 'permanent',
+      registry: { type: 'repo', owner: 'o', repo: 'r' },
+    };
+    const { seams } = fakeSeams({
+      dirtyConfigFiles: new Map([['/w/macf', ['CLAUDE.md']]]),
+      fullConfigs: new Map([['/w/macf', config]]),
+    });
+    const result = await createVmDriver(OPTS, seams).classifyDirtyConfig('code-agent');
+    expect(result).toEqual({ alreadyCanonical: [], genuineDelta: ['CLAUDE.md'] });
+  });
+});
+
+describe('autoResolveCanonical', () => {
+  it('delegates to the commitCanonicalFiles seam for the RESOLVED agent workspace', async () => {
+    const { seams, rec } = fakeSeams();
+    await createVmDriver(OPTS, seams).autoResolveCanonical('science-agent', ['.claude/rules/coordination.md']);
+    expect(rec.commits).toEqual([{ workspaceDir: '/w/science', files: ['.claude/rules/coordination.md'] }]);
+  });
+
+  it('is a no-op for an unknown agent', async () => {
+    const { seams, rec } = fakeSeams();
+    await createVmDriver(OPTS, seams).autoResolveCanonical('ghost', ['CLAUDE.md']);
+    expect(rec.commits).toEqual([]);
+  });
+
+  it('is a no-op when files is empty (never calls the seam)', async () => {
+    const { seams, rec } = fakeSeams();
+    await createVmDriver(OPTS, seams).autoResolveCanonical('code-agent', []);
+    expect(rec.commits).toEqual([]);
   });
 });
 
@@ -631,5 +712,129 @@ describe('createVmExecSeams — real git (macf#698, DR-040 Decision 6)', () => {
     const seams = createVmExecSeams(repo);
     expect(seams.isConfigDirty(repo)).toBe(false);
     expect(seams.listDirtyConfig(repo)).toEqual([]);
+  });
+});
+
+describe('createVmDriver — classifyDirtyConfig / autoResolveCanonical, real git+fs (DR-040 Decision 3, macf#698 R1)', () => {
+  let repo: string;
+
+  afterEach(() => {
+    if (repo) rmSync(repo, { recursive: true, force: true });
+  });
+
+  /** Init a real git repo with an initial commit of `files`, plus a valid `.macf/macf-agent.json`. */
+  function initRepo(files: Readonly<Record<string, string>>): string {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-tier-'));
+    execFileSync('git', ['init', '--initial-branch=main'], { cwd: dir });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir });
+    execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: dir });
+    mkdirSync(join(dir, '.macf'), { recursive: true });
+    writeFileSync(
+      join(dir, '.macf', 'macf-agent.json'),
+      JSON.stringify({
+        project: 'macf',
+        agent_name: 'code-agent',
+        agent_role: 'code-agent',
+        agent_type: 'permanent',
+        registry: { type: 'repo', owner: 'o', repo: 'r' },
+      }),
+    );
+    for (const [rel, content] of Object.entries(files)) {
+      const abs = join(dir, rel);
+      mkdirSync(join(abs, '..'), { recursive: true });
+      writeFileSync(abs, content);
+    }
+    execFileSync('git', ['add', '.'], { cwd: dir });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: dir });
+    return dir;
+  }
+
+  /** Build a full `createVmDriver` over the real `createVmExecSeams`, discover() overridden to point at `repo`. */
+  function driverFor(repoDir: string) {
+    const seams: VmDriverSeams = {
+      ...createVmExecSeams(repoDir),
+      listPeers: async () => [],
+      probeHealth: async () => null,
+      discover: () => [
+        { agent: 'code-agent', workspace: repoDir, registry: 'macf', project: 'macf', versionPin: null },
+      ],
+    };
+    return createVmDriver({ workspaceDir: repoDir }, seams);
+  }
+
+  it('a dirty rule file whose content EQUALS the real canonical coordination.md → classified already-canonical', async () => {
+    repo = initRepo({
+      '.claude/rules/coordination.md': '# stale coordination.md, will be overwritten\n',
+      'claude.sh': '#!/usr/bin/env bash\necho hi\n',
+    });
+    // Dirty it to EXACTLY what the real canonical coordination.md computes to.
+    const canonical = computeCanonicalRuleFile('coordination.md')!;
+    writeFileSync(join(repo, '.claude', 'rules', 'coordination.md'), canonical);
+
+    const driver = driverFor(repo);
+    const result = await driver.classifyDirtyConfig('code-agent');
+    expect(result.alreadyCanonical).toEqual(['.claude/rules/coordination.md']);
+    expect(result.genuineDelta).toEqual([]);
+  });
+
+  it('autoResolveCanonical actually COMMITS the already-canonical file — the tree is clean after', async () => {
+    repo = initRepo({
+      '.claude/rules/coordination.md': '# stale, will be overwritten\n',
+      'claude.sh': '#!/usr/bin/env bash\necho hi\n',
+    });
+    const canonical = computeCanonicalRuleFile('coordination.md')!;
+    writeFileSync(join(repo, '.claude', 'rules', 'coordination.md'), canonical);
+
+    const driver = driverFor(repo);
+    const { alreadyCanonical } = await driver.classifyDirtyConfig('code-agent');
+    expect(alreadyCanonical).toEqual(['.claude/rules/coordination.md']);
+
+    await driver.autoResolveCanonical('code-agent', alreadyCanonical);
+
+    const status = execFileSync('git', ['status', '--porcelain'], { cwd: repo, encoding: 'utf-8' });
+    expect(status.trim()).toBe('');
+    // The commit actually landed (HEAD advanced past the initial commit).
+    const log = execFileSync('git', ['log', '--oneline'], { cwd: repo, encoding: 'utf-8' });
+    expect(log.trim().split('\n')).toHaveLength(2);
+    const lastCommitMsg = execFileSync('git', ['log', '-1', '--pretty=%s'], { cwd: repo, encoding: 'utf-8' });
+    expect(lastCommitMsg).toContain('DR-040');
+  });
+
+  it('a dirty CLAUDE.md → genuine-delta (never auto-committed, even though it is a real dirty file)', async () => {
+    repo = initRepo({
+      'CLAUDE.md': '# original\n',
+      'claude.sh': '#!/usr/bin/env bash\necho hi\n',
+    });
+    writeFileSync(join(repo, 'CLAUDE.md'), '# a real agent edit\n');
+
+    const driver = driverFor(repo);
+    const result = await driver.classifyDirtyConfig('code-agent');
+    expect(result.alreadyCanonical).toEqual([]);
+    expect(result.genuineDelta).toEqual(['CLAUDE.md']);
+
+    // Sanity: autoResolveCanonical is never invoked by the caller for
+    // genuine-delta files in the real rollFleet gate — direct-invoking it
+    // here would commit ANY files handed to it (it trusts its caller), so we
+    // assert the CLASSIFY result correctly excludes CLAUDE.md instead of
+    // relying on autoResolveCanonical to refuse it.
+    const status = execFileSync('git', ['status', '--porcelain'], { cwd: repo, encoding: 'utf-8' });
+    expect(status.trim()).toContain('CLAUDE.md');
+  });
+
+  it('a MIXED dirty set: rule file already-canonical + CLAUDE.md genuine-delta, split correctly', async () => {
+    repo = initRepo({
+      '.claude/rules/coordination.md': '# stale\n',
+      'CLAUDE.md': '# original\n',
+      'claude.sh': '#!/usr/bin/env bash\necho hi\n',
+    });
+    const canonical = computeCanonicalRuleFile('coordination.md')!;
+    writeFileSync(join(repo, '.claude', 'rules', 'coordination.md'), canonical);
+    writeFileSync(join(repo, 'CLAUDE.md'), '# a real agent edit\n');
+
+    const driver = driverFor(repo);
+    const result = await driver.classifyDirtyConfig('code-agent');
+    expect(result.alreadyCanonical).toEqual(['.claude/rules/coordination.md']);
+    expect(result.genuineDelta).toEqual(['CLAUDE.md']);
   });
 });

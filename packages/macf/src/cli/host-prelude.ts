@@ -290,3 +290,15 @@ export function writeHostPrelude(
   writeFileSync(path, generateHostPrelude(resolved), { mode: 0o644 });
   return path;
 }
+
+/**
+ * Compute what `writeHostPrelude` WOULD write RIGHT NOW, WITHOUT writing
+ * anything — the canonical-compute tier-check's primitive for
+ * `.claude/.macf/host-prelude.sh` (DR-040 Decision 3 / macf#698 R1). Runs the
+ * SAME real-FS toolchain re-detection `writeHostPrelude` uses by default (so
+ * "already canonical" reflects THIS host's current toolchain, not a stale
+ * snapshot), then feeds it through the identical pure generator.
+ */
+export function computeCanonicalHostPrelude(): string {
+  return generateHostPrelude(detectToolchainBackend(realProbe()));
+}

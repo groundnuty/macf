@@ -445,7 +445,15 @@ interface HookEntry {
   readonly hooks: readonly HookCommand[];
 }
 
-interface Settings {
+/**
+ * Exported (DR-040 Decision 3 / macf#698 R1): the canonical-compute tier-check
+ * (`packages/macf/src/cli/fleet/canonical-compute.ts`) needs this shape to
+ * parse a workspace's on-disk `.claude/settings.json` and feed it through the
+ * SAME transform functions this module's `installXxx` writers use, so the
+ * dry-run "would `macf update` change this file" check is byte-for-byte the
+ * same logic as the real write path — never a re-implementation that can drift.
+ */
+export interface Settings {
   hooks?: {
     PreToolUse?: HookEntry[];
     PostToolUse?: HookEntry[];
@@ -456,7 +464,12 @@ interface Settings {
   [key: string]: unknown;
 }
 
-function readSettings(path: string): Settings {
+/**
+ * Exported (DR-040 Decision 3 / macf#698 R1) — the canonical-compute tier-check
+ * reads a workspace's settings.json with the exact same malformed-JSON-throws
+ * semantics as the real writers (never silently treats broken JSON as `{}`).
+ */
+export function readSettings(path: string): Settings {
   if (!existsSync(path)) return {};
   const raw = readFileSync(path, 'utf-8');
   try {
@@ -789,17 +802,15 @@ const MACF_LEGACY_FD_PATTERNS: readonly string[] = [
  *
  * See macf#200 (original fd-deny bug), macf#208 (pattern-literal fix).
  */
-export function installSandboxFdAllowRead(workspaceDir: string): void {
-  const skip = process.env['MACF_SANDBOX_FD_FIX_SKIP'];
-  if (skip === '1' || skip === 'true') return;
-
-  const absDir = resolve(workspaceDir);
-  const claudeDir = join(absDir, '.claude');
-  const path = join(claudeDir, 'settings.json');
-
-  mkdirSync(claudeDir, { recursive: true });
-
-  const settings = readSettings(path);
+/**
+ * Pure transform: apply the canonical `sandbox.filesystem.allowRead` entry to
+ * a parsed `settings` object. Exported (DR-040 Decision 3 / macf#698 R1) so
+ * the canonical-compute tier-check can apply this SAME logic in-memory
+ * (without writing) to classify a dirty settings.json as already-canonical
+ * vs genuine-delta. Operator-authored entries preserved; legacy MACF patterns
+ * (`MACF_LEGACY_FD_PATTERNS`) dropped before the current pattern is added.
+ */
+export function applySandboxFdAllowReadTransform(settings: Settings): Settings {
   // Narrow the deep-nested read; operator-authored alien shapes at
   // any level default to a fresh empty branch rather than throwing.
   const sandboxRaw = (settings['sandbox'] as Record<string, unknown> | undefined) ?? {};
@@ -814,17 +825,11 @@ export function installSandboxFdAllowRead(workspaceDir: string): void {
     (entry) => !MACF_LEGACY_FD_PATTERNS.includes(entry),
   );
 
-  // Idempotent short-circuit: only skip if the current pattern is
-  // already present AND there's no legacy pattern to clean up.
-  if (preserved.length === existingAllow.length && preserved.includes(SANDBOX_FD_READ_PATTERN)) {
-    return;
-  }
-
   const allowRead = preserved.includes(SANDBOX_FD_READ_PATTERN)
     ? preserved
     : [...preserved, SANDBOX_FD_READ_PATTERN];
 
-  const updated: Settings = {
+  return {
     ...settings,
     sandbox: {
       ...sandboxRaw,
@@ -834,7 +839,35 @@ export function installSandboxFdAllowRead(workspaceDir: string): void {
       },
     },
   };
+}
 
+export function installSandboxFdAllowRead(workspaceDir: string): void {
+  const skip = process.env['MACF_SANDBOX_FD_FIX_SKIP'];
+  if (skip === '1' || skip === 'true') return;
+
+  const absDir = resolve(workspaceDir);
+  const claudeDir = join(absDir, '.claude');
+  const path = join(claudeDir, 'settings.json');
+
+  mkdirSync(claudeDir, { recursive: true });
+
+  const settings = readSettings(path);
+  const sandboxRaw = (settings['sandbox'] as Record<string, unknown> | undefined) ?? {};
+  const filesystemRaw = (sandboxRaw['filesystem'] as Record<string, unknown> | undefined) ?? {};
+  const existingAllow = Array.isArray(filesystemRaw['allowRead'])
+    ? (filesystemRaw['allowRead'] as readonly unknown[]).filter((v): v is string => typeof v === 'string')
+    : [];
+  const preserved = existingAllow.filter(
+    (entry) => !MACF_LEGACY_FD_PATTERNS.includes(entry),
+  );
+
+  // Idempotent short-circuit: only skip if the current pattern is
+  // already present AND there's no legacy pattern to clean up.
+  if (preserved.length === existingAllow.length && preserved.includes(SANDBOX_FD_READ_PATTERN)) {
+    return;
+  }
+
+  const updated = applySandboxFdAllowReadTransform(settings);
   writeFileSync(path, JSON.stringify(updated, null, 2) + '\n');
 }
 
@@ -945,17 +978,15 @@ const MACF_LEGACY_EXCLUDED_COMMANDS: readonly string[] = [];
  * See macf#211 (this issue), claude-code#43454 (upstream
  * regression), macf#200 / #208 (precedent fd allowRead pattern).
  */
-export function installSandboxExcludedCommands(workspaceDir: string): void {
-  const skip = process.env['MACF_SANDBOX_EXCLUDED_COMMANDS_SKIP'];
-  if (skip === '1' || skip === 'true') return;
-
-  const absDir = resolve(workspaceDir);
-  const claudeDir = join(absDir, '.claude');
-  const path = join(claudeDir, 'settings.json');
-
-  mkdirSync(claudeDir, { recursive: true });
-
-  const settings = readSettings(path);
+/**
+ * Pure transform: apply the canonical `sandbox.excludedCommands` merge to a
+ * parsed `settings` object. Exported (DR-040 Decision 3 / macf#698 R1) so the
+ * canonical-compute tier-check can apply this SAME logic in-memory (without
+ * writing). Preserves operator-authored entries + already-present MACF
+ * entries in position; drops legacy MACF entries; appends missing canonical
+ * entries.
+ */
+export function applySandboxExcludedCommandsTransform(settings: Settings): Settings {
   // Mirror installSandboxFdAllowRead's deep-narrow shape — operator-
   // authored alien shapes default to fresh empty branches.
   const sandboxRaw = (settings['sandbox'] as Record<string, unknown> | undefined) ?? {};
@@ -977,19 +1008,44 @@ export function installSandboxExcludedCommands(workspaceDir: string): void {
     if (!merged.includes(entry)) merged.push(entry);
   }
 
-  // Idempotent short-circuit: nothing changed → skip the write.
-  const sameLength = merged.length === existing.length;
-  const sameContent = sameLength && merged.every((v, i) => v === existing[i]);
-  if (sameContent) return;
-
-  const updated: Settings = {
+  return {
     ...settings,
     sandbox: {
       ...sandboxRaw,
       excludedCommands: merged,
     },
   };
+}
 
+export function installSandboxExcludedCommands(workspaceDir: string): void {
+  const skip = process.env['MACF_SANDBOX_EXCLUDED_COMMANDS_SKIP'];
+  if (skip === '1' || skip === 'true') return;
+
+  const absDir = resolve(workspaceDir);
+  const claudeDir = join(absDir, '.claude');
+  const path = join(claudeDir, 'settings.json');
+
+  mkdirSync(claudeDir, { recursive: true });
+
+  const settings = readSettings(path);
+  const sandboxRaw = (settings['sandbox'] as Record<string, unknown> | undefined) ?? {};
+  const existing = Array.isArray(sandboxRaw['excludedCommands'])
+    ? (sandboxRaw['excludedCommands'] as readonly unknown[]).filter((v): v is string => typeof v === 'string')
+    : [];
+  const preserved = existing.filter(
+    (entry) => !MACF_LEGACY_EXCLUDED_COMMANDS.includes(entry),
+  );
+  const merged = [...preserved];
+  for (const entry of SANDBOX_EXCLUDED_COMMANDS) {
+    if (!merged.includes(entry)) merged.push(entry);
+  }
+
+  // Idempotent short-circuit: nothing changed → skip the write.
+  const sameLength = merged.length === existing.length;
+  const sameContent = sameLength && merged.every((v, i) => v === existing[i]);
+  if (sameContent) return;
+
+  const updated = applySandboxExcludedCommandsTransform(settings);
   writeFileSync(path, JSON.stringify(updated, null, 2) + '\n');
 }
 
@@ -1053,14 +1109,13 @@ const MACF_MCP_TOOL_PATTERN_PREFIX = 'mcp__plugin_macf-agent_macf-agent__';
  *
  * Creates the `.claude/` directory + settings.json if missing.
  */
-export function installPluginSkillPermissions(workspaceDir: string): void {
-  const absDir = resolve(workspaceDir);
-  const claudeDir = join(absDir, '.claude');
-  const path = join(claudeDir, 'settings.json');
-
-  mkdirSync(claudeDir, { recursive: true });
-
-  const settings = readSettings(path);
+/**
+ * Pure transform: apply the canonical plugin-skill + MCP-tool pre-approval
+ * merge (+ the DR-028 role floor) to a parsed `settings` object. Exported
+ * (DR-040 Decision 3 / macf#698 R1) so the canonical-compute tier-check can
+ * apply this SAME logic in-memory (without writing).
+ */
+export function applyPluginSkillPermissionsTransform(settings: Settings): Settings {
   const existingAllow = Array.isArray(settings['permissions'] && (settings['permissions'] as { allow?: unknown })['allow'])
     ? ((settings['permissions'] as { allow: readonly string[] }).allow)
     : [];
@@ -1107,7 +1162,7 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
   ];
 
   const existingPermissions = (settings['permissions'] as Record<string, unknown> | undefined) ?? {};
-  const updated: Settings = {
+  return {
     ...settings,
     permissions: {
       ...existingPermissions,
@@ -1115,7 +1170,17 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
       deny,
     },
   };
+}
 
+export function installPluginSkillPermissions(workspaceDir: string): void {
+  const absDir = resolve(workspaceDir);
+  const claudeDir = join(absDir, '.claude');
+  const path = join(claudeDir, 'settings.json');
+
+  mkdirSync(claudeDir, { recursive: true });
+
+  const settings = readSettings(path);
+  const updated = applyPluginSkillPermissionsTransform(settings);
   writeFileSync(path, JSON.stringify(updated, null, 2) + '\n');
 }
 
@@ -1197,14 +1262,35 @@ export function installPluginSkillPermissions(workspaceDir: string): void {
  * Creates the `.claude/` directory and the file if either is missing.
  * Idempotent: repeated calls don't duplicate entries.
  */
-export function installGhTokenHook(workspaceDir: string): void {
-  const absDir = resolve(workspaceDir);
-  const claudeDir = join(absDir, '.claude');
-  const path = join(claudeDir, 'settings.json');
+/**
+ * True iff `settings` carries a hand-wired entry (on ANY hook event) for one
+ * of the 7 DR-039 Decision 2 migrated filenames. Exported (DR-040 Decision 3
+ * / macf#698 R1) — shared by `installGhTokenHook`'s warn-decision and the
+ * canonical-compute tier-check (which needs the identical predicate to decide
+ * whether the pure transform below is even reachable-different).
+ */
+export function hasDeferredMigratedHookEntry(settings: Settings): boolean {
+  const hooks = settings.hooks ?? {};
+  const all = [
+    ...(hooks.PreToolUse ?? []),
+    ...(hooks.PostToolUse ?? []),
+    ...(hooks.UserPromptSubmit ?? []),
+    ...(hooks.PreCompact ?? []),
+    ...(hooks.SessionStart ?? []),
+  ];
+  return all.some((entry) => entry.hooks.some((h) => isMigratedHookCommand(h.command)));
+}
 
-  mkdirSync(claudeDir, { recursive: true });
-
-  const settings = readSettings(path);
+/**
+ * Pure transform: apply the canonical gh-token/auditor/turn-receipt/channels
+ * hook-registration merge to a parsed `settings` object, given an
+ * already-resolved `delivery` capability check (DR-039 Amendment B self-guard
+ * — see `canPluginDeliverMigratedHooks`). Exported (DR-040 Decision 3 /
+ * macf#698 R1) so the canonical-compute tier-check can apply this SAME logic
+ * in-memory (without writing, without re-triggering the console.warn — that
+ * side effect stays in `installGhTokenHook` below).
+ */
+export function applyGhTokenHookTransform(settings: Settings, delivery: PluginDeliveryCheck): Settings {
   const hooks = settings.hooks ?? {};
   const preToolUse = hooks.PreToolUse ?? [];
   const postToolUse = hooks.PostToolUse ?? [];
@@ -1216,26 +1302,11 @@ export function installGhTokenHook(workspaceDir: string): void {
   // MIGRATED_HOOK_FILENAMES) when the effective loaded plugin can actually
   // deliver the full set. The 3 hand-wired filenames are always eligible for
   // strip-then-replace regardless of plugin-delivery capability.
-  const delivery = canPluginDeliverMigratedHooks(workspaceDir);
   const shouldStrip = (command: string): boolean => {
     if (!isMacfManagedCommand(command)) return false;
     if (isMigratedHookCommand(command)) return delivery.canDeliver;
     return true;
   };
-  // Only warn when there was something ACTUALLY deferred (an existing
-  // migrated-hook entry kept in place) — a fresh/never-hand-wired workspace
-  // has nothing to defer, so staying silent there avoids spamming every
-  // `macf init`/`update` run on a workspace that will never carry these.
-  const hasDeferredEntry = [...preToolUse, ...postToolUse, ...userPromptSubmit, ...preCompact, ...sessionStart].some(
-    (entry) => entry.hooks.some((h) => isMigratedHookCommand(h.command)),
-  );
-  if (!delivery.canDeliver && hasDeferredEntry) {
-    console.warn(
-      "macf: deferring hook-strip: effective plugin can't deliver the load-bearing set — " +
-        'keeping hand-wired copies; fix the launcher to load the full .macf/plugin, see DR-039 ' +
-        `(${delivery.detail}).`,
-    );
-  }
 
   // PreToolUse: check-auditor-never-acts.sh always remains hand-wired. The
   // preserve-filter (matching by MACF_HOOK_FILENAMES basename, gated per
@@ -1308,7 +1379,7 @@ export function installGhTokenHook(workspaceDir: string): void {
     },
   ];
 
-  const updated: Settings = {
+  return {
     ...settings,
     hooks: {
       ...hooks,
@@ -1319,6 +1390,32 @@ export function installGhTokenHook(workspaceDir: string): void {
       SessionStart: [...preservedSession, ...macfSessionEntries],
     },
   };
+}
 
+export function installGhTokenHook(workspaceDir: string): void {
+  const absDir = resolve(workspaceDir);
+  const claudeDir = join(absDir, '.claude');
+  const path = join(claudeDir, 'settings.json');
+
+  mkdirSync(claudeDir, { recursive: true });
+
+  const settings = readSettings(path);
+
+  // DR-039 Amendment B self-guard: only strip a migrated-hook entry when the
+  // effective loaded plugin can actually deliver the full set.
+  const delivery = canPluginDeliverMigratedHooks(workspaceDir);
+  // Only warn when there was something ACTUALLY deferred (an existing
+  // migrated-hook entry kept in place) — a fresh/never-hand-wired workspace
+  // has nothing to defer, so staying silent there avoids spamming every
+  // `macf init`/`update` run on a workspace that will never carry these.
+  if (!delivery.canDeliver && hasDeferredMigratedHookEntry(settings)) {
+    console.warn(
+      "macf: deferring hook-strip: effective plugin can't deliver the load-bearing set — " +
+        'keeping hand-wired copies; fix the launcher to load the full .macf/plugin, see DR-039 ' +
+        `(${delivery.detail}).`,
+    );
+  }
+
+  const updated = applyGhTokenHookTransform(settings, delivery);
   writeFileSync(path, JSON.stringify(updated, null, 2) + '\n');
 }

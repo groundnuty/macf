@@ -196,6 +196,12 @@ export function formatFleetReport(report: FleetPlanReport, target: string, log: 
           ? '•'
           : '✗';
     log(`    ${mark} ${r.agent} — ${r.outcome}${r.detail ? ` (${r.detail})` : ''}`);
+    // DR-040 Decision 3 / macf#698 R1: surface auto-resolved (already-canonical,
+    // committed) files in the SAME per-agent summary line, distinct from any
+    // genuine-delta detail above — orthogonal to `outcome`.
+    if (r.autoResolvedFiles && r.autoResolvedFiles.length > 0) {
+      log(`      auto-resolved (already-canonical, committed): ${r.autoResolvedFiles.join(', ')}`);
+    }
   }
   if (rolled.halted) {
     log(`    ROLL HALTED in ${report.fleet} — later fleets NOT started (a bad release cannot cascade).`);
@@ -319,6 +325,12 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
       break;
     case 'roll-start':
       log(`   rolling ${ev.agent} (${ev.from ?? 'down'}→${ev.to})`);
+      break;
+    case 'config-auto-resolved':
+      // DR-040 Decision 3 / macf#698 R1: these dirty files were ALREADY the
+      // canonical `macf update` regen — committed automatically, no OBJECT,
+      // no agent/operator involvement.
+      log(`   ${ev.agent}: CONFIG auto-resolved (already-canonical, committed): ${ev.files.join(', ')}`);
       break;
     case 'config-dirty-skip':
       // The OBJECT path (macf#725): nothing was touched — forward the exact

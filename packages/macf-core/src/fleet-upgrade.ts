@@ -142,6 +142,17 @@ export interface AgentRollResult {
   /** Set only when `outcome === 'halted'` — see `HaltReason`. */
   readonly reason?: HaltReason;
   readonly detail?: string;
+  /**
+   * Files auto-resolved (committed as already-canonical) during this
+   * agent's pre-flight, if any (DR-040 Decision 3 / macf#698 R1). Orthogonal
+   * to `outcome` — auto-resolve happens BEFORE the outcome is decided, so it
+   * can co-occur with ANY outcome: e.g. all dirty files were already-canonical
+   * → committed, roll proceeds → `outcome: 'upgraded'` WITH this field set; or
+   * some were already-canonical (committed) and some were genuine-delta →
+   * `outcome: 'config-dirty-skipped'` (message scoped to the genuine-delta
+   * subset only) WITH this field set. Absent when nothing was auto-resolved.
+   */
+  readonly autoResolvedFiles?: readonly string[];
 }
 
 /**
@@ -267,8 +278,21 @@ export interface FleetRollResult {
   readonly upgraded: number;
   /** Count of agents skipped because they were busy. */
   readonly busySkipped: number;
-  /** Count of agents skipped because their config surface was dirty (macf#722 Fix B). */
+  /**
+   * Count of agents skipped because their config surface still had a
+   * GENUINE-DELTA file after tiering (macf#722 Fix B; scope narrowed to
+   * genuine-delta-only by DR-040 Decision 3 / macf#698 R1 — an agent whose
+   * ENTIRE dirty set was already-canonical is auto-resolved instead and does
+   * NOT count here).
+   */
   readonly configDirtySkipped: number;
+  /**
+   * Count of agents that had ≥1 dirty file auto-resolved (committed as
+   * already-canonical) this roll (DR-040 Decision 3 / macf#698 R1). Same
+   * per-agent-count style as the other counters; see each result's
+   * `autoResolvedFiles` for the file-level detail.
+   */
+  readonly configAutoResolved: number;
 }
 
 /** Progress events for CLI rendering (the RESULT objects are what tests assert on). */
@@ -277,11 +301,24 @@ export type UpgradeEvent =
   | { readonly kind: 'fleet-skipped'; readonly fleet: string; readonly reason: string }
   | { readonly kind: 'roll-start'; readonly agent: string; readonly from: string | null; readonly to: string }
   /**
-   * The pre-flight OBJECT (macf#725) — the agent's touched-config surface has
-   * UNCOMMITTED changes. `files` is the exact uncommitted-path list;
-   * `message` is the ready-to-forward, agent-directed text (inspect + commit /
-   * delete / gitignore, then re-run). Fired INSTEAD of any mutation — nothing
-   * on this agent was touched.
+   * The pre-flight AUTO-RESOLVE (DR-040 Decision 3 / macf#698 R1) — `files`
+   * were dirty but their content already equalled canonical, so they were
+   * committed automatically; no agent/operator involvement. Fired BEFORE the
+   * genuine-delta OBJECT check (if any) + before the busy-gate / transaction,
+   * for the SAME agent this iteration — an agent can see BOTH this event AND
+   * a subsequent `config-dirty-skip` (for the remaining genuine-delta files)
+   * in the same roll.
+   */
+  | { readonly kind: 'config-auto-resolved'; readonly agent: string; readonly files: readonly string[] }
+  /**
+   * The pre-flight OBJECT (macf#725; scope narrowed to GENUINE-DELTA files
+   * only by DR-040 Decision 3 / macf#698 R1 — already-canonical files were
+   * auto-resolved above and are never part of this list). `files` is the
+   * exact genuine-delta uncommitted-path list; `message` is the
+   * ready-to-forward, agent-directed text (inspect + commit / delete /
+   * gitignore, then re-run). Fired INSTEAD of any mutation — nothing on this
+   * agent's genuine-delta files was touched (though the already-canonical
+   * subset, if any, WAS committed by the preceding `config-auto-resolved`).
    */
   | { readonly kind: 'config-dirty-skip'; readonly agent: string; readonly files: readonly string[]; readonly message: string }
   | { readonly kind: 'busy-skip'; readonly agent: string; readonly waited: boolean }
@@ -445,14 +482,15 @@ export function buildModifiedFilesMessage(agent: string, files: readonly string[
 
 /**
  * Roll ONE fleet: for every `behind` plan (in order) run the PRE-FLIGHT gates
- * (config-dirty, then busy) → upgrade → restart → verify-green cycle, HALTING
- * the roll on the first agent whose post-restart state isn't confirmed-green.
- * Non-`behind` plans are ignored (planned skips). Pre-flight-gated agents are
- * skipped + reported and NEVER a halt (they were never mutated, so continuing
- * is always safe) — config-dirty is checked first because a busy-but-clean
- * agent may still become idle later (`--wait`), whereas a dirty agent is
- * skip-only regardless. With `wait`, a busy agent is re-polled for idle first.
- * The verb order + HALT semantics mirror `fleet/upgrade.sh`'s `roll_one`.
+ * (config-dirty tier-first, then busy) → upgrade → restart → verify-green
+ * cycle, HALTING the roll on the first agent whose post-restart state isn't
+ * confirmed-green. Non-`behind` plans are ignored (planned skips).
+ * Pre-flight-gated agents are skipped + reported and NEVER a halt (they were
+ * never mutated, so continuing is always safe) — config-dirty is checked
+ * first because a busy-but-clean agent may still become idle later
+ * (`--wait`), whereas a dirty (genuine-delta) agent is skip-only regardless.
+ * With `wait`, a busy agent is re-polled for idle first. The verb order +
+ * HALT semantics mirror `fleet/upgrade.sh`'s `roll_one`.
  *
  * **Transactional + OBJECT-with-message revision (macf#725).** The pre-flight
  * config-dirty gate is the ONLY decision point that inspects PRE-upgrade
@@ -467,6 +505,21 @@ export function buildModifiedFilesMessage(agent: string, files: readonly string[
  * silent-skip + separately-force-stashed-restart shape, which could dirty the
  * workspace via `upgrade` and then have `restart-self`'s OWN guard refuse —
  * aborting mid-transaction with the workspace already mutated.
+ *
+ * **Tier-first auto-resolve (DR-040 Decision 3 / macf#698 R1).** Before
+ * deciding OBJECT-or-proceed, `deps.driver.classifyDirtyConfig` splits the
+ * dirty set into `alreadyCanonical` (content already equals what `macf
+ * update` would write — the common case: a stale-branch workspace, both
+ * code-agent AND science hit ONLY this tier on the v0.2.48 roll) and
+ * `genuineDelta` (a real local difference). `alreadyCanonical` files are
+ * committed automatically via `autoResolveCanonical` — no agent/operator
+ * involvement, no OBJECT — clearing the false config-dirty signal. Only a
+ * non-empty `genuineDelta` still triggers the OBJECT-and-skip path, and its
+ * message + `onEvent` payload are scoped to the genuine-delta files ONLY
+ * (the auto-resolved noise is never re-surfaced as something to inspect).
+ * When `genuineDelta` is empty (either the whole dirty set was
+ * already-canonical, or there was nothing dirty at all), the roll falls
+ * through into the transaction exactly as the clean case always has.
  */
 export async function rollFleet(
   plans: readonly AgentUpgradePlan[],
@@ -477,36 +530,47 @@ export async function rollFleet(
   let upgraded = 0;
   let busySkipped = 0;
   let configDirtySkipped = 0;
+  let configAutoResolved = 0;
 
   for (const plan of plans) {
     if (plan.disposition !== 'behind') continue;
     const agent = plan.agent;
 
-    // PRE-FLIGHT config-dirty gate. By-design inter-roll STEADY-STATE
-    // (macf#725): a clean roll LEAVES `macf update`'s regeneration uncommitted
-    // (so the relaunched agent reviews it — see `restart`'s
-    // `leaveConfigUncommitted` below + `buildModifiedFilesMessage`).
-    // Consequently, the NEXT roll's pre-flight WILL object on that
-    // still-uncommitted regen. This is INTENDED HYGIENE — "commit last update's
-    // regen before upgrading again" — NOT the mid-run abort bug this revision
-    // fixed: it is self-resolving via the object-with-message (the agent
-    // commits the flagged regen, then a clean re-run rolls). The alternative —
-    // auto-committing the deterministic canonical regen at end-of-transaction
-    // (zero inter-roll friction, but trades away the agent's review-visibility
-    // of what changed) — is a DEFERRED future option, the operator's call.
+    // PRE-FLIGHT config-dirty gate — tier-first (DR-040 Decision 3 /
+    // macf#698 R1). By-design inter-roll STEADY-STATE (macf#725): a clean
+    // roll LEAVES `macf update`'s regeneration uncommitted (so the relaunched
+    // agent reviews it — see `restart`'s `leaveConfigUncommitted` below +
+    // `buildModifiedFilesMessage`). Consequently, the NEXT roll's pre-flight
+    // will re-classify that still-uncommitted regen — almost always as
+    // ALREADY-CANONICAL (it IS what `macf update` just wrote) and therefore
+    // auto-resolved here rather than objected on. This is the steady-state
+    // this tier exists to smooth over.
+    let autoResolvedFiles: readonly string[] | undefined;
     if (!opts.force) {
-      const dirtyFiles = await deps.driver.listDirtyConfig(agent);
-      if (dirtyFiles.length > 0) {
+      const { alreadyCanonical, genuineDelta } = await deps.driver.classifyDirtyConfig(agent);
+
+      if (alreadyCanonical.length > 0) {
+        await deps.driver.autoResolveCanonical(agent, alreadyCanonical);
+        configAutoResolved += 1;
+        autoResolvedFiles = alreadyCanonical;
+        deps.onEvent?.({ kind: 'config-auto-resolved', agent, files: alreadyCanonical });
+      }
+
+      if (genuineDelta.length > 0) {
         configDirtySkipped += 1;
-        const message = buildConfigDirtyMessage(agent, dirtyFiles);
+        const message = buildConfigDirtyMessage(agent, genuineDelta);
         results.push({
           agent,
           outcome: 'config-dirty-skipped',
           detail: message,
+          ...(autoResolvedFiles ? { autoResolvedFiles } : {}),
         });
-        deps.onEvent?.({ kind: 'config-dirty-skip', agent, files: dirtyFiles, message });
+        deps.onEvent?.({ kind: 'config-dirty-skip', agent, files: genuineDelta, message });
         continue;
       }
+      // genuineDelta is empty (nothing dirty at all, or everything dirty WAS
+      // already-canonical and is now committed) — fall through into the
+      // transaction below exactly as the always-clean case does.
     }
 
     let busy = await deps.driver.isBusy(agent);
@@ -517,7 +581,12 @@ export async function rollFleet(
     }
     if (busy) {
       busySkipped += 1;
-      results.push({ agent, outcome: 'busy-skipped', detail: waited ? 'still busy after --wait' : 'busy' });
+      results.push({
+        agent,
+        outcome: 'busy-skipped',
+        detail: waited ? 'still busy after --wait' : 'busy',
+        ...(autoResolvedFiles ? { autoResolvedFiles } : {}),
+      });
       deps.onEvent?.({ kind: 'busy-skip', agent, waited });
       continue;
     }
@@ -542,7 +611,12 @@ export async function rollFleet(
       upgraded += 1;
       const modifiedFiles = await deps.driver.listModifiedFiles(agent);
       const message = buildModifiedFilesMessage(agent, modifiedFiles);
-      results.push({ agent, outcome: 'upgraded', detail: message });
+      results.push({
+        agent,
+        outcome: 'upgraded',
+        detail: message,
+        ...(autoResolvedFiles ? { autoResolvedFiles } : {}),
+      });
       deps.onEvent?.({ kind: 'upgraded', agent, version: green.version, modifiedFiles, message });
       continue;
     }
@@ -553,12 +627,13 @@ export async function rollFleet(
       outcome: 'halted',
       reason,
       detail: `${reason}: verify-green ${green.reason} (last=${green.lastVersion ?? 'down'})`,
+      ...(autoResolvedFiles ? { autoResolvedFiles } : {}),
     });
     deps.onEvent?.({ kind: 'halt', agent, reason, lastVersion: green.lastVersion });
-    return { results, halted: true, upgraded, busySkipped, configDirtySkipped };
+    return { results, halted: true, upgraded, busySkipped, configDirtySkipped, configAutoResolved };
   }
 
-  return { results, halted: false, upgraded, busySkipped, configDirtySkipped };
+  return { results, halted: false, upgraded, busySkipped, configDirtySkipped, configAutoResolved };
 }
 
 /** Options for the multi-fleet orchestrator. */

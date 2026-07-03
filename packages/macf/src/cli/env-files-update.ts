@@ -80,6 +80,23 @@ const MANAGED_ENV_FILES: readonly ManagedEnvFile[] = [
 ];
 
 /**
+ * Compute what `refreshEnvFiles` WOULD write for one of the 5 macf-managed
+ * `.claude/.macf/env.*` files, WITHOUT writing anything — the canonical-
+ * compute tier-check's per-file-type primitive for the managed env-file set
+ * (DR-040 Decision 3 / macf#698 R1). `name` is the basename (e.g.
+ * `env.identity`). Returns `null` for a name that isn't one of the 5
+ * macf-managed files (e.g. the 3 operator-managed files `env.telemetry` /
+ * `env.tmux` / `env.project-rules`, which `macf update` bootstrap-writes only
+ * if absent and never overwrites thereafter — not part of the overwrite set
+ * `ROLL_TOUCHED_CONFIG_PATTERNS` covers, so the caller's fail-safe default is
+ * `genuine-delta`).
+ */
+export function computeCanonicalEnvFileContent(name: string, config: MacfAgentConfig): string | null {
+  const entry = MANAGED_ENV_FILES.find((f) => f.name === name);
+  return entry ? entry.generate(config) : null;
+}
+
+/**
  * The set of operator-managed env files. Bootstrap-write on first
  * `macf update` if absent, then preserved unconditionally on subsequent
  * runs — operator's edits are theirs to own. The `generate` function
