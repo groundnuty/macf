@@ -4,6 +4,33 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.52] — 2026-07-03
+
+Fleet-upgrade safety release — makes agent-driven fleet upgrades safe (an agent
+can now run `macf fleet upgrade` from its own session). Marketplace v0.2.52 is a
+lockstep bump (plugin content unchanged from 0.2.51).
+
+### Reliability — fleet-upgrade safety
+- **#763** (CRITICAL) — `macf fleet upgrade` run from inside an agent's own tmux
+  session self-killed the ORCHESTRATOR instead of rolling the target. The
+  `restart`/`upgrade`/`launch` seams exec'd `macf restart-self`/`macf update`
+  with `cwd=target.workspace` but inherited the orchestrator's full env;
+  `restart-self`'s `resolveIdentity` is env-over-config, so the orchestrator's
+  leaked `MACF_PROJECT`/`MACF_ROUTING_LABEL`/`MACF_WORKSPACE_DIR` overrode the
+  target's cwd-config and derived the orchestrator's session — killing it. Fix:
+  `childEnvForTarget()` scrubs the orchestrator identity vars
+  (`MACF_WORKSPACE_DIR`, `MACF_PROJECT`, `MACF_ROUTING_LABEL`, `MACF_AGENT_NAME`,
+  `CLAUDE_PROJECT_DIR`) from the target child, so `cwd=target.workspace` is the
+  sole identity source (the safe plain-terminal path). `restart-self`'s
+  standalone env-precedence is unchanged.
+- **#755** — canonical-branch guard: `macf fleet upgrade` / `restart-self` /
+  `macf doctor` now refuse to mutate or relaunch an agent whose workspace is on
+  a non-canonical git branch (a mutation would land on the wrong branch; a
+  relaunch would come up stale). Pre-flight branch-gate is the FIRST rollFleet
+  gate (before config-dirty/busy), refuses without mutating; `--force` bypass;
+  detached-HEAD treated as non-canonical; `canonicalBranch` config
+  (`MACF_CANONICAL_BRANCH` env → `macf-agent.json` → default `main`).
+
 ## [0.2.51] — 2026-07-03
 
 Patch: fixes two guard/parser false-positives surfaced by the fleet upgrade.
