@@ -91,10 +91,18 @@ export interface VmDriverSeams {
   readonly capturePane: (session: string) => string | null;
   /** Submit `text` into a session's Claude TUI via the canonical tmux-send-to-claude pattern. */
   readonly submit: (session: string, text: string) => void;
-  /** Run `bin args` in `cwd`, blocking (throws on non-zero). */
-  readonly exec: (bin: string, args: readonly string[], cwd: string) => void;
-  /** Spawn `bin args` in `cwd`, DETACHED (outlives this process). */
-  readonly spawnDetached: (bin: string, args: readonly string[], cwd: string) => void;
+  /**
+   * Run `bin args` in `cwd`, blocking (throws on non-zero). `env` defaults to
+   * `process.env` when omitted; the driver ALWAYS passes an explicit
+   * (identity-scrubbed) env for target-workspace macf subcommands — see
+   * `childEnvForTarget` (macf#763).
+   */
+  readonly exec: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv) => void;
+  /**
+   * Spawn `bin args` in `cwd`, DETACHED (outlives this process). `env`
+   * defaults to `process.env` when omitted — see `exec` above.
+   */
+  readonly spawnDetached: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv) => void;
   /** Sleep `ms` (injected so tests don't wait on the busy window). */
   readonly sleep: (ms: number) => Promise<void>;
   /**
@@ -218,6 +226,50 @@ export function resolveTarget(seams: VmDriverSeams, agent: string): ResolvedTarg
   const routingLabel = id?.routingLabel ?? record.agent;
   const session = project ? `${project}@${routingLabel}` : null;
   return { workspace: record.workspace, session };
+}
+
+/**
+ * The identity env vars a target-workspace `macf` subcommand (`macf update`,
+ * `macf restart-self`) must NOT inherit from the ORCHESTRATOR process running
+ * `macf fleet upgrade` (macf#763 — verified live, 2026-07-03).
+ *
+ * `restart-self`'s `resolveIdentity` (`commands/restart-self.ts`) is
+ * intentionally env-over-config: `MACF_WORKSPACE_DIR` / `MACF_PROJECT` /
+ * `MACF_ROUTING_LABEL` / `MACF_AGENT_NAME`, when SET, win over the
+ * cwd-resolved `.macf/macf-agent.json`. That's correct for the STANDALONE
+ * self-restart case (an agent restarting itself — its own `claude.sh`-exported
+ * env IS the authoritative identity, regardless of cwd). It is WRONG when the
+ * child is spawned by a DIFFERENT agent's `macf fleet upgrade` run: the
+ * orchestrator's own identity leaks via normal env inheritance, overrides the
+ * TARGET's cwd-resolved config, and `restart-self` derives the
+ * `${MACF_PROJECT}@${MACF_ROUTING_LABEL}` session for the ORCHESTRATOR —
+ * killing it instead of the target. `CLAUDE_PROJECT_DIR` is scrubbed too
+ * (defense-in-depth; not currently read by `resolveIdentity`, but it is the
+ * other ambient workspace-identity var `claude.sh` exports).
+ */
+export const ORCHESTRATOR_IDENTITY_ENV_KEYS = [
+  'MACF_WORKSPACE_DIR',
+  'MACF_PROJECT',
+  'MACF_ROUTING_LABEL',
+  'MACF_AGENT_NAME',
+  'CLAUDE_PROJECT_DIR',
+] as const;
+
+/**
+ * Build the child env for a target-workspace `macf` subcommand invoked via
+ * `exec`/`spawnDetached` (macf#763) — strips `ORCHESTRATOR_IDENTITY_ENV_KEYS`
+ * so `cwd=target.workspace` becomes the SOLE source of identity for the
+ * child. This is the safe-floor fix (delete, don't override): with the
+ * orchestrator's identity vars absent, `resolveIdentity` / `readAgentConfig`
+ * already fall through to reading `.macf/macf-agent.json` from `cwd` —
+ * exactly the code path that made a plain-terminal (no `MACF_*` env) fleet
+ * upgrade run safe before this fix. No new identity-resolution logic is
+ * introduced; the leak is simply removed.
+ */
+export function childEnvForTarget(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...baseEnv };
+  for (const key of ORCHESTRATOR_IDENTITY_ENV_KEYS) delete env[key];
+  return env;
 }
 
 /**
@@ -373,13 +425,20 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
 
   async function upgrade(agent: string): Promise<void> {
     const target = requireTarget(agent);
-    seams.exec(macfBin, ['update', '--yes'], target.workspace);
+    // macf#763: scrub the orchestrator's own identity so `macf update` (run
+    // in the target's workspace) can't resolve anything but the target — see
+    // `childEnvForTarget`.
+    seams.exec(macfBin, ['update', '--yes'], target.workspace, childEnvForTarget());
   }
 
   async function launch(agent: string): Promise<void> {
     const target = requireTarget(agent);
     const launcher = join(target.workspace, opts.launcher ?? 'claude.sh');
-    seams.spawnDetached(launcher, [], target.workspace);
+    // macf#763: same scrub as `upgrade`/`restart` — `claude.sh` itself
+    // re-sources the target's own env files, but scrub here too for
+    // uniformity/defense-in-depth (the detached child briefly runs with the
+    // orchestrator's env before claude.sh re-execs).
+    seams.spawnDetached(launcher, [], target.workspace, childEnvForTarget());
   }
 
   async function restart(agent: string, restartOpts?: { readonly leaveConfigUncommitted?: boolean }): Promise<void> {
@@ -393,7 +452,11 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
       // refusing on) macf update's own regeneration.
       const args = ['restart-self', '--confirm', '--reason', 'fault'];
       if (restartOpts?.leaveConfigUncommitted) args.push('--leave-config-uncommitted');
-      seams.exec(macfBin, args, target.workspace);
+      // macf#763 — CRITICAL: without this scrub, `restart-self`'s
+      // env-over-config `resolveIdentity` derives the ORCHESTRATOR's session
+      // (from the orchestrator's leaked MACF_* env) and kills IT instead of
+      // `agent`. See `childEnvForTarget`.
+      seams.exec(macfBin, args, target.workspace, childEnvForTarget());
       return;
     }
     // DEAD → cold-start (DR-037 Decision 3: restart = alive→graceful, dead→launch).
@@ -627,11 +690,16 @@ export function createVmExecSeams(
       // The ONLY sanctioned prompt-submit path (the C-u + double-Enter quirk).
       execFileSync(tmuxSubmitScript(workspaceDir), [session, text], { stdio: 'ignore' });
     },
-    exec: (bin: string, args: readonly string[], cwd: string): void => {
-      execFileSync(bin, args as string[], { cwd, stdio: 'inherit' });
+    exec: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv): void => {
+      execFileSync(bin, args as string[], { cwd, stdio: 'inherit', env: env ?? process.env });
     },
-    spawnDetached: (bin: string, args: readonly string[], cwd: string): void => {
-      const child = spawn(bin, args as string[], { cwd, detached: true, stdio: 'ignore' });
+    spawnDetached: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv): void => {
+      const child = spawn(bin, args as string[], {
+        cwd,
+        detached: true,
+        stdio: 'ignore',
+        env: env ?? process.env,
+      });
       child.unref();
     },
     sleep: (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms)),
