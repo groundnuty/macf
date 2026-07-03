@@ -12,7 +12,7 @@
  *   - launch: spawn ./claude.sh detached in the workspace.
  *   - resolveTarget: <project>@<routing-label> derivation + routing-label fallback.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -23,9 +23,11 @@ import {
   createVmDriver,
   createVmExecSeams,
   resolveTarget,
+  type VmDriverOptions,
   type VmDriverSeams,
   type WorkspaceIdentity,
 } from '../../../src/cli/fleet/vm-driver.js';
+import { readLockEntry, type MaintenanceLockConfig } from '../../../src/cli/fleet/maintenance-lock.js';
 import { gatherFleetStatus } from '../../../src/cli/commands/fleet.js';
 import { computeCanonicalRuleFile } from '../../../src/cli/rules.js';
 import type { MacfAgentConfig } from '../../../src/cli/config.js';
@@ -604,6 +606,85 @@ describe('launch', () => {
     await expect(createVmDriver(OPTS, seams).launch('ghost')).rejects.toBeInstanceOf(
       FleetDriverError,
     );
+  });
+});
+
+// --- maintenance lock (DR-040 Decision 4, macf#752) -------------------------
+//
+// `acquireLock`/`releaseLock`/`startHeartbeat` are the ONLY driver verbs with
+// NO workspace/session resolution — the lock keys directly on the agent's
+// routing label (matching the bash `$MAINT_LOCK_DIR/<agent>.lock` contract).
+// Real fs/atomic-write behavior is exhaustively covered in
+// `maintenance-lock.test.ts`; these tests only verify createVmDriver's GLUE —
+// that the driver wires the configured `maintenanceLock` dir through to the
+// real module, and defaults to env-resolution when no override is supplied.
+
+describe('acquireLock / releaseLock / startHeartbeat (maintenance lock, macf#752)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'macf-vm-driver-lock-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function lockOpts(overrides: Partial<MaintenanceLockConfig> = {}): VmDriverOptions {
+    return {
+      ...OPTS,
+      maintenanceLock: { dir, ttlSec: 900, heartbeatIntervalSec: 300, heartbeatMaxS: 3600, ...overrides },
+    };
+  }
+
+  it('acquireLock writes a lock keyed on the agent routing label directly — no workspace/session resolution needed', async () => {
+    const { seams } = fakeSeams();
+    const driver = createVmDriver(lockOpts(), seams);
+    // Deliberately an agent name with NO discovered workspace — proves this
+    // verb does not go through resolveTarget/requireTarget like upgrade/restart/inject do.
+    await driver.acquireLock('ghost-not-in-any-workspace', '0.2.48');
+    expect(readLockEntry(dir, 'ghost-not-in-any-workspace')).toMatchObject({
+      agent: 'ghost-not-in-any-workspace',
+      target_version: '0.2.48',
+    });
+  });
+
+  it('releaseLock removes the lock file written by acquireLock', async () => {
+    const { seams } = fakeSeams();
+    const driver = createVmDriver(lockOpts(), seams);
+    await driver.acquireLock('code-agent', '0.2.48');
+    await driver.releaseLock('code-agent');
+    expect(readLockEntry(dir, 'code-agent')).toBeNull();
+  });
+
+  it('startHeartbeat returns a working stop-handle that refreshes the SAME configured lock', () => {
+    vi.useFakeTimers();
+    try {
+      const { seams } = fakeSeams();
+      const driver = createVmDriver(lockOpts({ heartbeatIntervalSec: 5, heartbeatMaxS: 0 }), seams);
+      void driver.acquireLock('code-agent', '0.2.48');
+      const stop = driver.startHeartbeat('code-agent');
+      const before = readLockEntry(dir, 'code-agent')!.heartbeat_at;
+      vi.advanceTimersByTime(5000);
+      const after = readLockEntry(dir, 'code-agent')!.heartbeat_at;
+      expect(after).toBeGreaterThanOrEqual(before);
+      stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('defaults to resolveMaintenanceLockConfig() (env-resolved) when no `maintenanceLock` override is supplied', async () => {
+    const prior = process.env.MACF_MAINT_LOCK_DIR;
+    process.env.MACF_MAINT_LOCK_DIR = dir;
+    try {
+      const { seams } = fakeSeams();
+      const driver = createVmDriver(OPTS, seams); // NOTE: no `maintenanceLock` override
+      await driver.acquireLock('code-agent', '0.2.48');
+      expect(readLockEntry(dir, 'code-agent')).toMatchObject({ agent: 'code-agent' });
+    } finally {
+      if (prior === undefined) delete process.env.MACF_MAINT_LOCK_DIR;
+      else process.env.MACF_MAINT_LOCK_DIR = prior;
+    }
   });
 });
 
