@@ -91,12 +91,38 @@ export function copyCanonicalRules(workspaceDir: string, options: {
     const src = join(sourceDir, entry.name);
     const dst = join(targetDir, entry.name);
     const content = readFileSync(src, 'utf-8');
-    // Avoid double-prepending the header on re-copy.
-    const out = content.startsWith('<!--') ? content : MANAGED_HEADER + content;
+    const out = computeCanonicalRuleContent(content);
     writeFileSync(dst, out);
     copied.push(entry.name);
   }
   return copied;
+}
+
+/**
+ * Apply the same header-prepend logic `copyCanonicalRules` uses (avoid
+ * double-prepending on re-copy) to a canonical rule file's raw content. Pure
+ * — exported (DR-040 Decision 3 / macf#698 R1) so `computeCanonicalRuleFile`
+ * below AND `copyCanonicalRules` above share one implementation.
+ */
+function computeCanonicalRuleContent(rawContent: string): string {
+  return rawContent.startsWith('<!--') ? rawContent : MANAGED_HEADER + rawContent;
+}
+
+/**
+ * Compute what `copyCanonicalRules` WOULD write for a single rule file
+ * `name` (e.g. `coordination.md`), WITHOUT writing anything — the canonical-
+ * compute tier-check's per-file-type primitive for `.claude/rules/*.md`
+ * (DR-040 Decision 3 / macf#698 R1). Returns `null` when the canonical
+ * source directory doesn't carry that filename (nothing to compute against —
+ * the caller's fail-safe default is `genuine-delta`).
+ */
+export function computeCanonicalRuleFile(name: string, options: {
+  readonly canonicalDir?: string;
+} = {}): string | null {
+  const sourceDir = options.canonicalDir ?? canonicalRulesDir();
+  const src = join(sourceDir, name);
+  if (!existsSync(src)) return null;
+  return computeCanonicalRuleContent(readFileSync(src, 'utf-8'));
 }
 
 /**
@@ -178,4 +204,39 @@ export function copyCanonicalScripts(workspaceDir: string, options: {
     }
   }
   return copied;
+}
+
+/**
+ * Compute the bytes `copyCanonicalScripts` WOULD write for a single script
+ * `name` (e.g. `macf-gh-token.sh`), WITHOUT writing anything — the
+ * canonical-compute tier-check's per-file-type primitive for
+ * `.claude/scripts/*` (DR-040 Decision 3 / macf#698 R1).
+ *
+ * Mirrors `copyCanonicalScripts`'s two-source-dir winner semantics exactly:
+ * that function iterates the legacy dir FIRST then the plugin dir SECOND,
+ * copying to the SAME target path — so when a filename exists in both, the
+ * plugin dir's bytes are what actually lands on disk (the later copy wins).
+ * A name that is `PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT` (currently only
+ * `mark-turn-state.sh`) is never distributed to `.claude/scripts/` at all —
+ * returns `null` (not managed at this path) even if a stray same-named file
+ * happens to sit there.
+ *
+ * Returns `null` when neither source dir carries the filename — nothing to
+ * compute against (the caller's fail-safe default is `genuine-delta`).
+ */
+export function computeCanonicalScriptFile(name: string, options: {
+  readonly canonicalDir?: string;
+  readonly pluginScriptsDir?: string;
+} = {}): Buffer | null {
+  if (PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT.has(name)) return null;
+
+  const pluginDir = options.pluginScriptsDir ?? canonicalPluginScriptsDir();
+  const pluginPath = join(pluginDir, name);
+  if (existsSync(pluginPath)) return readFileSync(pluginPath);
+
+  const legacyDir = options.canonicalDir ?? canonicalScriptsDir();
+  const legacyPath = join(legacyDir, name);
+  if (existsSync(legacyPath)) return readFileSync(legacyPath);
+
+  return null;
 }

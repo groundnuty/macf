@@ -105,7 +105,8 @@ interface DriverCalls {
   probe: number;
   discover: number;
   isBusy: string[];
-  listDirtyConfig: string[];
+  classifyDirtyConfig: string[];
+  autoResolveCanonical: { agent: string; files: readonly string[] }[];
   upgrade: string[];
   restart: string[];
   restartLeaveUncommitted: string[];
@@ -114,18 +115,23 @@ interface DriverCalls {
 
 /**
  * A recording fake driver. `busy(agent, callIdx)` decides isBusy per call.
- * `dirtyConfigFiles(agent)` returns the pre-flight `listDirtyConfig` result
- * (empty = clean) — a STATIC predicate; use `makeTransactionalDriver` below
- * when a test needs `upgrade()` to actually COUPLE into post-upgrade state
- * (macf#725 — this static fake can't surface the #722/#725 mid-transaction
- * bug class, since its dirty-check never reacts to `upgrade` having run).
+ * `dirtyConfigFiles(agent)` returns the pre-flight GENUINE-DELTA files (still
+ * objects; defaults none) and `alreadyCanonicalFiles(agent)` returns the
+ * ALREADY-CANONICAL files (auto-resolved/committed; defaults none) — the two
+ * tiers `classifyDirtyConfig` splits into (DR-040 Decision 3 / macf#698 R1).
+ * A STATIC predicate; use `makeTransactionalDriver` below when a test needs
+ * `upgrade()` to actually COUPLE into post-upgrade state (macf#725 — this
+ * static fake can't surface the #722/#725 mid-transaction bug class, since
+ * its dirty-check never reacts to `upgrade` having run).
  */
 function makeDriver(opts: {
   state: FleetState;
   workspaces: readonly WorkspaceRecord[];
   busy?: (agent: string, callIdx: number) => boolean;
-  /** Agents whose config surface is dirty pre-flight (macf#722/#725); defaults to none. */
+  /** Agents' pre-flight GENUINE-DELTA files (still objects); defaults to none. */
   dirtyConfigFiles?: (agent: string) => readonly string[];
+  /** Agents' pre-flight ALREADY-CANONICAL files (auto-resolved); defaults to none. */
+  alreadyCanonicalFiles?: (agent: string) => readonly string[];
   /** Modified-files list `listModifiedFiles` reports post-upgrade; defaults to none. */
   modifiedFiles?: (agent: string) => readonly string[];
 }): { driver: FleetDriver; calls: DriverCalls } {
@@ -133,7 +139,8 @@ function makeDriver(opts: {
     probe: 0,
     discover: 0,
     isBusy: [],
-    listDirtyConfig: [],
+    classifyDirtyConfig: [],
+    autoResolveCanonical: [],
     upgrade: [],
     restart: [],
     restartLeaveUncommitted: [],
@@ -155,10 +162,21 @@ function makeDriver(opts: {
       calls.isBusy.push(agent);
       return opts.busy ? opts.busy(agent, idx) : false;
     },
-    isConfigDirty: async (agent) => (opts.dirtyConfigFiles?.(agent)?.length ?? 0) > 0,
-    listDirtyConfig: async (agent) => {
-      calls.listDirtyConfig.push(agent);
-      return opts.dirtyConfigFiles ? opts.dirtyConfigFiles(agent) : [];
+    isConfigDirty: async (agent) =>
+      ((opts.dirtyConfigFiles?.(agent)?.length ?? 0) + (opts.alreadyCanonicalFiles?.(agent)?.length ?? 0)) > 0,
+    listDirtyConfig: async (agent) => [
+      ...(opts.alreadyCanonicalFiles?.(agent) ?? []),
+      ...(opts.dirtyConfigFiles?.(agent) ?? []),
+    ],
+    classifyDirtyConfig: async (agent) => {
+      calls.classifyDirtyConfig.push(agent);
+      return {
+        alreadyCanonical: opts.alreadyCanonicalFiles ? opts.alreadyCanonicalFiles(agent) : [],
+        genuineDelta: opts.dirtyConfigFiles ? opts.dirtyConfigFiles(agent) : [],
+      };
+    },
+    autoResolveCanonical: async (agent, files) => {
+      calls.autoResolveCanonical.push({ agent, files });
     },
     capturePane: async () => null,
     upgrade: async (agent) => {
@@ -199,7 +217,8 @@ function makeTransactionalDriver(opts: {
     probe: 0,
     discover: 0,
     isBusy: [],
-    listDirtyConfig: [],
+    classifyDirtyConfig: [],
+    autoResolveCanonical: [],
     upgrade: [],
     restart: [],
     restartLeaveUncommitted: [],
@@ -211,6 +230,9 @@ function makeTransactionalDriver(opts: {
   // dirties the managed surface). `restart()` reads this SAME state to decide
   // whether it would need to refuse/stash — proving the two verbs are talking
   // to the same underlying workspace, not independent static predicates.
+  // Everything this fake reports dirty is treated as GENUINE-DELTA (never
+  // already-canonical) — these tests exercise the transactional coupling,
+  // not the DR-040 tiering (that's `makeDriver`'s job via `alreadyCanonicalFiles`).
   const dirty = new Set(opts.preDirty ?? []);
   const driver: FleetDriver = {
     probe: async () => {
@@ -226,9 +248,13 @@ function makeTransactionalDriver(opts: {
       return false;
     },
     isConfigDirty: async (agent) => dirty.has(agent),
-    listDirtyConfig: async (agent) => {
-      calls.listDirtyConfig.push(agent);
-      return dirty.has(agent) ? regenerated : [];
+    listDirtyConfig: async (agent) => (dirty.has(agent) ? regenerated : []),
+    classifyDirtyConfig: async (agent) => {
+      calls.classifyDirtyConfig.push(agent);
+      return { alreadyCanonical: [], genuineDelta: dirty.has(agent) ? regenerated : [] };
+    },
+    autoResolveCanonical: async (agent, files) => {
+      calls.autoResolveCanonical.push({ agent, files });
     },
     capturePane: async () => null,
     upgrade: async (agent) => {
@@ -388,7 +414,7 @@ describe('rollFleet', () => {
       onEvent: (ev) => events.push(ev),
     });
     // a1 never touched — no upgrade/restart/isBusy call at all for a1.
-    expect(calls.listDirtyConfig).toEqual(['a1', 'a2']);
+    expect(calls.classifyDirtyConfig).toEqual(['a1', 'a2']);
     expect(calls.upgrade).toEqual(['a2']);
     expect(calls.restart).toEqual(['a2']);
     expect(calls.isBusy).toEqual(['a2']); // a1's busy-gate never even runs
@@ -422,11 +448,107 @@ describe('rollFleet', () => {
       { driver, verifyGreen, ...noWait },
     );
     expect(res.configDirtySkipped).toBe(0);
+    expect(res.configAutoResolved).toBe(0);
+    // --force bypasses the gate ENTIRELY (DR-040 Decision 3 / macf#698 R1) —
+    // classifyDirtyConfig / autoResolveCanonical are never even called.
+    expect(calls.classifyDirtyConfig).toEqual([]);
+    expect(calls.autoResolveCanonical).toEqual([]);
     expect(calls.upgrade).toEqual(['a1', 'a2']);
     expect(calls.restart).toEqual(['a1', 'a2']);
     // both agents' restart was told to leave the (dirty) config surface uncommitted.
     expect(calls.restartLeaveUncommitted).toEqual(['a1', 'a2']);
     expect(res.halted).toBe(false);
+  });
+
+  describe('tier-first auto-resolve (DR-040 Decision 3, macf#698 R1)', () => {
+    it('an agent whose ENTIRE dirty set is already-canonical: auto-resolved (committed), NOT objected, roll PROCEEDS into the transaction', async () => {
+      const canonicalFiles = ['.claude/rules/coordination.md', '.claude/.macf/env.identity'];
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        alreadyCanonicalFiles: (agent) => (agent === 'a1' ? canonicalFiles : []),
+      });
+      const { verifyGreen } = makeVerify();
+      const events: UpgradeEvent[] = [];
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+        onEvent: (ev) => events.push(ev),
+      });
+      expect(calls.classifyDirtyConfig).toEqual(['a1', 'a2']);
+      expect(calls.autoResolveCanonical).toEqual([{ agent: 'a1', files: canonicalFiles }]);
+      // NOT objected — a1 proceeds through the FULL transaction like a clean agent.
+      expect(calls.upgrade).toEqual(['a1', 'a2']);
+      expect(calls.restart).toEqual(['a1', 'a2']);
+      expect(res.halted).toBe(false);
+      expect(res.configDirtySkipped).toBe(0);
+      expect(res.configAutoResolved).toBe(1);
+      expect(res.upgraded).toBe(2);
+      expect(res.results.map((r) => [r.agent, r.outcome])).toEqual([
+        ['a1', 'upgraded'],
+        ['a2', 'upgraded'],
+      ]);
+      // The auto-resolved files are annotated on a1's (upgraded) result.
+      expect(res.results[0]!.autoResolvedFiles).toEqual(canonicalFiles);
+      expect(res.results[1]!.autoResolvedFiles).toBeUndefined();
+      const autoResolvedEvent = events.find((e) => e.kind === 'config-auto-resolved');
+      expect(autoResolvedEvent).toMatchObject({ kind: 'config-auto-resolved', agent: 'a1', files: canonicalFiles });
+      // Fired BEFORE the transaction started for a1.
+      const a1RollStartIdx = events.findIndex((e) => e.kind === 'roll-start' && e.agent === 'a1');
+      const autoResolvedIdx = events.findIndex((e) => e.kind === 'config-auto-resolved');
+      expect(autoResolvedIdx).toBeGreaterThanOrEqual(0);
+      expect(autoResolvedIdx).toBeLessThan(a1RollStartIdx);
+    });
+
+    it('a MIXED dirty set: auto-resolves the already-canonical subset AND objects on the genuine-delta subset only — upgrade NOT called', async () => {
+      const canonical = ['.claude/scripts/macf-gh-token.sh'];
+      const genuine = ['CLAUDE.md'];
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        alreadyCanonicalFiles: (agent) => (agent === 'a1' ? canonical : []),
+        dirtyConfigFiles: (agent) => (agent === 'a1' ? genuine : []),
+      });
+      const { verifyGreen } = makeVerify();
+      const events: UpgradeEvent[] = [];
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+        onEvent: (ev) => events.push(ev),
+      });
+      // Auto-resolve STILL runs on the canonical subset...
+      expect(calls.autoResolveCanonical).toEqual([{ agent: 'a1', files: canonical }]);
+      // ...but a1 is objected on (never upgraded/restarted) because genuine-delta remains.
+      expect(calls.upgrade).toEqual(['a2']);
+      expect(calls.restart).toEqual(['a2']);
+      expect(res.configAutoResolved).toBe(1);
+      expect(res.configDirtySkipped).toBe(1);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'config-dirty-skipped' });
+      expect(res.results[0]!.autoResolvedFiles).toEqual(canonical);
+      // The OBJECT message + config-dirty-skip event carry ONLY the genuine-delta
+      // files — the auto-resolved noise is never re-surfaced as something to inspect.
+      expect(res.results[0]!.detail).toContain(genuine[0]!);
+      expect(res.results[0]!.detail).not.toContain(canonical[0]!);
+      const skipEvent = events.find((e) => e.kind === 'config-dirty-skip');
+      expect(skipEvent).toMatchObject({ kind: 'config-dirty-skip', agent: 'a1', files: genuine });
+    });
+
+    it('both tiers empty (nothing dirty): proceeds normally, no auto-resolve, no object', async () => {
+      const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
+      const { verifyGreen } = makeVerify();
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(calls.autoResolveCanonical).toEqual([]);
+      expect(res.configAutoResolved).toBe(0);
+      expect(res.configDirtySkipped).toBe(0);
+      expect(res.upgraded).toBe(2);
+      expect(calls.upgrade).toEqual(['a1', 'a2']);
+    });
   });
 
   it('skips + reports a BUSY agent (never interrupts) and continues to the next', async () => {
@@ -603,7 +725,7 @@ describe('rollFleet', () => {
         ...noWait,
       });
       // Pre-flight saw CLEAN (preDirty is empty) — entered the transaction.
-      expect(calls.listDirtyConfig).toEqual(['a1']);
+      expect(calls.classifyDirtyConfig).toEqual(['a1']);
       expect(calls.upgrade).toEqual(['a1']); // this is what DIRTIES the workspace
       // restart() was called with leaveConfigUncommitted — did NOT throw despite
       // the workspace now being dirty (proving the fake's restart() actually
@@ -626,7 +748,7 @@ describe('rollFleet', () => {
         verifyGreen,
         ...noWait,
       });
-      expect(calls.listDirtyConfig).toEqual(['a1']);
+      expect(calls.classifyDirtyConfig).toEqual(['a1']);
       expect(calls.upgrade).toEqual([]); // NOTHING mutated
       expect(calls.restart).toEqual([]);
       expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'config-dirty-skipped' });

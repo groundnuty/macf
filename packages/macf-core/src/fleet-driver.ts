@@ -124,18 +124,61 @@ export interface FleetDriver {
 
   /**
    * The pre-flight config-dirty gate's LIST form (macf#725 — transactional
-   * object-with-message revision; this is what `rollFleet` actually calls).
-   * Same predicate surface as `isConfigDirty` (`ROLL_TOUCHED_CONFIG_PATTERNS`,
-   * tracked-only), but returns the actual uncommitted paths rather than a
-   * boolean, so the roll can OBJECT with a specific, actionable list instead
-   * of a bare skip — a dirty agent is SKIPPED before any mutation (never
-   * upgraded/restarted); `macf update` / restart-self would otherwise clobber
-   * or stash operator-authored config underneath it. Empty array == clean
+   * object-with-message revision). Same predicate surface as `isConfigDirty`
+   * (`ROLL_TOUCHED_CONFIG_PATTERNS`, tracked-only), but returns the actual
+   * uncommitted paths rather than a boolean. Empty array == clean
    * (equivalent to `isConfigDirty` reading `false`). VM: `git status
    * --porcelain` in the agent's workspace, filtered to that path set, one
    * path per line.
+   *
+   * **Superseded as `rollFleet`'s pre-flight call site by `classifyDirtyConfig`
+   * below (DR-040 Decision 3 / macf#698 R1)** — the roll no longer treats
+   * every dirty file as an OBJECT-worthy delta; it tiers them first. This
+   * verb remains on the interface (still used internally by
+   * `classifyDirtyConfig`'s real implementation, and by other callers that
+   * only need the raw uncommitted-path list without tier classification).
    */
   readonly listDirtyConfig: (agent: string) => Promise<readonly string[]>;
+
+  /**
+   * The pre-flight config-dirty gate's TIERED form (DR-040 Decision 3 /
+   * macf#698 R1 — this is what `rollFleet` actually calls now). Splits
+   * `listDirtyConfig`'s raw uncommitted-path list into two tiers by
+   * comparing each file's CURRENT (dirty) content against what `macf
+   * update` would write for it right now (the canonical-compute primitive,
+   * `packages/macf/src/cli/fleet/canonical-compute.ts`):
+   *
+   * - `alreadyCanonical` — the file's content already IS the canonical
+   *   regen (the common case: a stale-branch workspace whose "dirty" files
+   *   are exactly what a fresh `macf update` would produce — both code-agent
+   *   AND science hit only this tier on the v0.2.48 roll). Safe to commit
+   *   as-is; NEVER a genuine conflict.
+   * - `genuineDelta` — a real local difference from canonical. Still
+   *   requires the OBJECT-and-halt treatment `listDirtyConfig`'s callers
+   *   used to apply to the WHOLE dirty list.
+   *
+   * Both arrays are empty when the agent has no dirty config surface at all
+   * (mirrors `listDirtyConfig`'s empty-array-== -clean contract). VM: reuses
+   * `listDirtyConfig` for the raw list, then classifies each path via
+   * `classifyDirtyFile`.
+   */
+  readonly classifyDirtyConfig: (agent: string) => Promise<{
+    readonly alreadyCanonical: readonly string[];
+    readonly genuineDelta: readonly string[];
+  }>;
+
+  /**
+   * Commit exactly `files` in the agent's workspace (DR-040 Decision 3 /
+   * macf#698 R1) — the auto-resolve half of the tier-first gate. Called ONLY
+   * with `classifyDirtyConfig`'s `alreadyCanonical` subset: those files are,
+   * by construction, deterministic canonical content (not an arbitrary
+   * commit), so committing them clears the false config-dirty signal
+   * without any agent/operator involvement. A no-op when `files` is empty.
+   * VM: `git add -- <files>` + `git commit` in the agent's workspace (a
+   * no-op commit, i.e. nothing actually staged after `add`, is tolerated —
+   * never throws on "nothing to commit").
+   */
+  readonly autoResolveCanonical: (agent: string, files: readonly string[]) => Promise<void>;
 
   /**
    * Read the agent's current pane content for stall-signature matching

@@ -28,6 +28,7 @@ import {
   migrateMonolithicClaudeSh,
   detectSettingsLocalEnvKeys,
   formatDeprecationWarning,
+  computeCanonicalEnvFileContent,
 } from '../../src/cli/env-files-update.js';
 import {
   generateEnvHelpers,
@@ -461,5 +462,56 @@ describe('formatDeprecationWarning', () => {
     expect(out).toContain('env.OTEL_RESOURCE_ATTRIBUTES');
     expect(out).toContain('macf#342');
     expect(out).toContain('settings.local.json');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeCanonicalEnvFileContent (DR-040 Decision 3, groundnuty/macf#698 R1)
+// — the canonical-compute tier-check's per-file-type primitive for the 5
+// macf-managed `.claude/.macf/env.*` files.
+// ---------------------------------------------------------------------------
+
+describe('computeCanonicalEnvFileContent', () => {
+  it('returns generateEnvIdentity output for env.identity', () => {
+    expect(computeCanonicalEnvFileContent('env.identity', baseConfig)).toBe(generateEnvIdentity(baseConfig));
+  });
+
+  it('returns generateEnvGitHub output for env.github', () => {
+    expect(computeCanonicalEnvFileContent('env.github', baseConfig)).toBe(generateEnvGitHub(baseConfig));
+  });
+
+  it('returns generateEnvCerts output for env.certs', () => {
+    expect(computeCanonicalEnvFileContent('env.certs', baseConfig)).toBe(generateEnvCerts(baseConfig));
+  });
+
+  it('returns generateEnvRegistry output for env.registry', () => {
+    expect(computeCanonicalEnvFileContent('env.registry', baseConfig)).toBe(generateEnvRegistry(baseConfig));
+  });
+
+  it('returns generateEnvHelpers output for env._helpers (config-independent)', () => {
+    expect(computeCanonicalEnvFileContent('env._helpers', baseConfig)).toBe(generateEnvHelpers());
+  });
+
+  it('exactly matches what refreshEnvFiles WOULD write for a fresh workspace', () => {
+    const workspace = join(tmpRoot, 'workspace');
+    mkdirSync(workspace, { recursive: true });
+    refreshEnvFiles(workspace, baseConfig);
+    for (const name of ['env._helpers', 'env.identity', 'env.github', 'env.certs', 'env.registry']) {
+      const computed = computeCanonicalEnvFileContent(name, baseConfig);
+      const written = readFileSync(join(workspace, '.claude', '.macf', name), 'utf-8');
+      expect(computed, `mismatch for ${name}`).toBe(written);
+    }
+  });
+
+  it('returns null for an OPERATOR-managed file (env.telemetry) — never overwritten, not part of the macf-managed set', () => {
+    expect(computeCanonicalEnvFileContent('env.telemetry', baseConfig)).toBeNull();
+  });
+
+  it('returns null for env.tmux (operator-managed)', () => {
+    expect(computeCanonicalEnvFileContent('env.tmux', baseConfig)).toBeNull();
+  });
+
+  it('returns null for an unrecognized name', () => {
+    expect(computeCanonicalEnvFileContent('env.local.custom', baseConfig)).toBeNull();
   });
 });

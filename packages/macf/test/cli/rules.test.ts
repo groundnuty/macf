@@ -9,6 +9,8 @@ import {
   canonicalScriptsDir,
   canonicalPluginScriptsDir,
   findCliPackageRoot,
+  computeCanonicalRuleFile,
+  computeCanonicalScriptFile,
 } from '../../src/cli/rules.js';
 
 describe('findCliPackageRoot', () => {
@@ -372,5 +374,131 @@ describe('copyCanonicalScripts', () => {
       expect(copied).not.toContain('mark-turn-state.sh');
       expect(existsSync(join(workspace, '.claude', 'scripts', 'mark-turn-state.sh'))).toBe(false);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeCanonicalRuleFile / computeCanonicalScriptFile (DR-040 Decision 3,
+// groundnuty/macf#698 R1) — the canonical-compute tier-check's per-file-type
+// primitives. These must produce EXACTLY what copyCanonicalRules /
+// copyCanonicalScripts would write, without writing anything.
+// ---------------------------------------------------------------------------
+
+describe('computeCanonicalRuleFile', () => {
+  let tmpRoot: string;
+  let fakeCanonical: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'macf-compute-rule-test-'));
+    fakeCanonical = join(tmpRoot, 'canonical');
+    mkdirSync(fakeCanonical, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('prepends the managed header to a header-less source file', () => {
+    writeFileSync(join(fakeCanonical, 'coordination.md'), '# Coordination\n\nBody.\n');
+    const content = computeCanonicalRuleFile('coordination.md', { canonicalDir: fakeCanonical });
+    expect(content).not.toBeNull();
+    expect(content).toMatch(/^<!--/);
+    expect(content).toContain('managed by `macf`');
+    expect(content).toContain('# Coordination\n\nBody.\n');
+  });
+
+  it('does NOT double-prepend the header when the source already starts with <!--', () => {
+    const already = '<!--\n  already headered\n-->\n\nBody.\n';
+    writeFileSync(join(fakeCanonical, 'already-headered.md'), already);
+    const content = computeCanonicalRuleFile('already-headered.md', { canonicalDir: fakeCanonical });
+    expect(content).toBe(already);
+  });
+
+  it('exactly matches what copyCanonicalRules WOULD write for the same source', () => {
+    writeFileSync(join(fakeCanonical, 'coordination.md'), '# Coordination\n\nBody.\n');
+    const computed = computeCanonicalRuleFile('coordination.md', { canonicalDir: fakeCanonical });
+    const workspace = join(tmpRoot, 'workspace');
+    mkdirSync(workspace);
+    copyCanonicalRules(workspace, { canonicalDir: fakeCanonical });
+    const written = readFileSync(join(workspace, '.claude', 'rules', 'coordination.md'), 'utf-8');
+    expect(computed).toBe(written);
+  });
+
+  it('returns null when the canonical dir has no such file — nothing to compute against', () => {
+    expect(computeCanonicalRuleFile('does-not-exist.md', { canonicalDir: fakeCanonical })).toBeNull();
+  });
+
+  it('resolves the REAL bundled coordination.md via the default canonical dir', () => {
+    const content = computeCanonicalRuleFile('coordination.md');
+    expect(content).not.toBeNull();
+    expect(content).toContain('managed by `macf`');
+  });
+});
+
+describe('computeCanonicalScriptFile', () => {
+  let tmpRoot: string;
+  let fakeCanonical: string;
+  let fakePluginScripts: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'macf-compute-script-test-'));
+    fakeCanonical = join(tmpRoot, 'legacy');
+    fakePluginScripts = join(tmpRoot, 'plugin-scripts');
+    mkdirSync(fakeCanonical, { recursive: true });
+    mkdirSync(fakePluginScripts, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('returns the exact bytes for a legacy-only script', () => {
+    writeFileSync(join(fakeCanonical, 'macf-gh-token.sh'), '#!/usr/bin/env bash\necho legacy\n');
+    const content = computeCanonicalScriptFile('macf-gh-token.sh', {
+      canonicalDir: fakeCanonical,
+      pluginScriptsDir: fakePluginScripts,
+    });
+    expect(content).not.toBeNull();
+    expect(content!.toString('utf-8')).toBe('#!/usr/bin/env bash\necho legacy\n');
+  });
+
+  it('the PLUGIN dir wins when a name exists in BOTH source dirs (mirrors copyCanonicalScripts iteration order)', () => {
+    writeFileSync(join(fakeCanonical, 'check-gh-token.sh'), '#!/usr/bin/env bash\necho legacy-version\n');
+    writeFileSync(join(fakePluginScripts, 'check-gh-token.sh'), '#!/usr/bin/env bash\necho plugin-version\n');
+    const content = computeCanonicalScriptFile('check-gh-token.sh', {
+      canonicalDir: fakeCanonical,
+      pluginScriptsDir: fakePluginScripts,
+    });
+    expect(content!.toString('utf-8')).toBe('#!/usr/bin/env bash\necho plugin-version\n');
+  });
+
+  it('returns null for a PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT name (mark-turn-state.sh) even if present', () => {
+    writeFileSync(join(fakePluginScripts, 'mark-turn-state.sh'), '#!/usr/bin/env bash\n');
+    const content = computeCanonicalScriptFile('mark-turn-state.sh', {
+      canonicalDir: fakeCanonical,
+      pluginScriptsDir: fakePluginScripts,
+    });
+    expect(content).toBeNull();
+  });
+
+  it('returns null when neither source dir carries the name', () => {
+    const content = computeCanonicalScriptFile('does-not-exist.sh', {
+      canonicalDir: fakeCanonical,
+      pluginScriptsDir: fakePluginScripts,
+    });
+    expect(content).toBeNull();
+  });
+
+  it('exactly matches the bytes copyCanonicalScripts WOULD write for the same source', () => {
+    writeFileSync(join(fakeCanonical, 'macf-gh-token.sh'), '#!/usr/bin/env bash\necho legacy\n');
+    const computed = computeCanonicalScriptFile('macf-gh-token.sh', {
+      canonicalDir: fakeCanonical,
+      pluginScriptsDir: fakePluginScripts,
+    });
+    const workspace = join(tmpRoot, 'workspace');
+    mkdirSync(workspace);
+    copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
+    const written = readFileSync(join(workspace, '.claude', 'scripts', 'macf-gh-token.sh'));
+    expect(computed!.equals(written)).toBe(true);
   });
 });
