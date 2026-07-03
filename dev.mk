@@ -1,4 +1,5 @@
-.PHONY: install check test lint typecheck build clean test-e2e test-integration install-hooks
+.PHONY: install check test lint typecheck build clean test-e2e test-integration install-hooks \
+	release-bump release-check release-marketplace release-cli release-verify release release-dry
 
 install:
 	devbox run -- npm ci
@@ -61,3 +62,57 @@ clean:
 install-hooks:
 	git config core.hooksPath .githooks
 	@echo "Installed commit-msg hook. Future commits will run commitlint locally before landing."
+
+# ---------------------------------------------------------------------------
+# Release orchestration (macf#766) — codifies the hand-orchestrated ~8-step
+# release sequence (bump 3 package.json + inter-dep + lockfile + CHANGELOG ->
+# check -> build -> marketplace sync/bump/tag -> push CLI bump + tag ->
+# poll publish.yml -> verify npm) run by hand for v0.2.48 through v0.2.52.
+# Thin wrappers around `packages/macf/scripts/release.sh` — see that script
+# for the guards (CHANGELOG-heading presence, version-greater-than-current,
+# idempotent tag-exists checks, fast-forward check on main, DR-022
+# Amendment L no-retry-same-version on publish failure).
+#
+# Component targets allow partial re-runs (e.g. re-run just
+# `release-marketplace` after a transient clone/push failure, without
+# redoing the bump). `release` is the full end-to-end aggregate; `release-dry`
+# runs the same aggregate under --dry-run, which is FULLY side-effect-free
+# (no file writes, no commits, no pushes, no tags, no publish) — a safe
+# preview before committing to a real cut.
+#
+# Usage:
+#   make -f dev.mk release VERSION=0.2.53          # full release, end to end
+#   make -f dev.mk release-dry VERSION=0.2.53       # safe preview, mutates nothing
+#   make -f dev.mk release-marketplace VERSION=0.2.53   # partial re-run
+#
+# VERSION is required on every release-* target (fails loud if empty).
+# ---------------------------------------------------------------------------
+RELEASE_SH := packages/macf/scripts/release.sh
+
+release-bump:
+	@test -n "$(VERSION)" || { echo "VERSION is required, e.g. make -f dev.mk release-bump VERSION=0.2.53"; exit 1; }
+	bash $(RELEASE_SH) bump $(VERSION)
+
+release-check:
+	@test -n "$(VERSION)" || { echo "VERSION is required, e.g. make -f dev.mk release-check VERSION=0.2.53"; exit 1; }
+	bash $(RELEASE_SH) check $(VERSION)
+
+release-marketplace:
+	@test -n "$(VERSION)" || { echo "VERSION is required, e.g. make -f dev.mk release-marketplace VERSION=0.2.53"; exit 1; }
+	bash $(RELEASE_SH) marketplace $(VERSION)
+
+release-cli:
+	@test -n "$(VERSION)" || { echo "VERSION is required, e.g. make -f dev.mk release-cli VERSION=0.2.53"; exit 1; }
+	bash $(RELEASE_SH) cli $(VERSION)
+
+release-verify:
+	@test -n "$(VERSION)" || { echo "VERSION is required, e.g. make -f dev.mk release-verify VERSION=0.2.53"; exit 1; }
+	bash $(RELEASE_SH) verify $(VERSION)
+
+release:
+	@test -n "$(VERSION)" || { echo "VERSION is required, e.g. make -f dev.mk release VERSION=0.2.53"; exit 1; }
+	bash $(RELEASE_SH) all $(VERSION)
+
+release-dry:
+	@test -n "$(VERSION)" || { echo "VERSION is required, e.g. make -f dev.mk release-dry VERSION=0.2.53"; exit 1; }
+	MACF_RELEASE_DRY_RUN=1 bash $(RELEASE_SH) all $(VERSION)
