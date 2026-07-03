@@ -19,18 +19,27 @@
 # re-asserted periodically through the session (throttled — see below).
 #
 # HOW it finds "its own" endpoint: the channel-server logs a `server_started`
-# JSONL event (host/port/instance_id — packages/macf-core/src/logger.ts +
+# JSONL event (host/port/pid/instance_id — packages/macf-core/src/logger.ts +
 # packages/macf-channel-server/src/server.ts) to its own channel.log — the
 # SAME log check-channels-enabled.sh already reads via MACF_LOG_PATH (or the
-# newest `~/.local/state/macf/*/channel.log` fallback). This hook reads the
-# NEWEST `server_started` line back to learn this process's {host, port},
-# then curls `https://<host>:<port>/health` over mTLS using the same
-# MACF_CA_CERT / MACF_AGENT_CERT / MACF_AGENT_KEY cert paths claude.sh's
-# multi-file env (env.certs) exports for peer-health pings (see
-# plugin/lib/probe-peer-health.ts — identical cert usage). No GitHub /
-# registry call is made — purely local files + one local-network probe, so
-# this hook stays fast, offline-safe, and matches the check-*.sh family's
-# no-external-dependency posture.
+# newest `~/.local/state/macf/*/channel.log` fallback). channel.log is
+# APPEND-ONLY across every relaunch generation, and the channel-server picks
+# a fresh random port every launch (PORT_RANGE 8800..9800) — so this hook
+# does NOT simply trust the newest `server_started` line (macf#760: that
+# heuristic false-alarmed "DEAD" on a live server, because the NEWEST logged
+# line can belong to a PRIOR generation whose process is long gone — e.g. at
+# SessionStart, when THIS session's channel-server, an MCP stdio child
+# Claude Code spawns ASYNCHRONOUSLY, hasn't logged its own line yet). Instead
+# it scans every `server_started` line and selects the {host, port} of the
+# most recent one whose `pid` is CONFIRMED ALIVE (`kill -0`, best-effort
+# tightened against pid-reuse via `/proc/<pid>/cmdline` where readable — see
+# the port-resolution block below for the full rationale), then curls
+# `https://<host>:<port>/health` over mTLS using the same MACF_CA_CERT /
+# MACF_AGENT_CERT / MACF_AGENT_KEY cert paths claude.sh's multi-file env
+# (env.certs) exports for peer-health pings (see plugin/lib/probe-peer-health.ts
+# — identical cert usage). No GitHub / registry call is made — purely local
+# files + one local-network probe, so this hook stays fast, offline-safe, and
+# matches the check-*.sh family's no-external-dependency posture.
 #
 # IDENTITY CHECK IS BEST-EFFORT AND NON-GATING: a fully robust liveness
 # assertion would confirm the `/health` responder's `instance_id` against the
@@ -122,15 +131,61 @@ else
 fi
 [ -n "$CHANNEL_LOG" ] && [ -r "$CHANNEL_LOG" ] || exit 0
 
-# ── Read back this agent's own {host, port} from its NEWEST `server_started`
-# log line. No such line at all → can't determine our own endpoint → fail
-# open (no false alarm; e.g. very early in a session before the server has
-# logged its first startup line).
-NEWEST_START="$(grep '"event":"server_started"' "$CHANNEL_LOG" 2>/dev/null | tail -n1 || true)"
-[ -n "$NEWEST_START" ] || exit 0
+# ── Read back this agent's own {host, port} — NOT simply from the NEWEST
+# `server_started` log line (macf#760). channel.log is append-only across
+# every relaunch generation, and the channel-server picks a FRESH random
+# port every launch (PORT_RANGE 8800..9800), so a blind "take the newest
+# line" read can name a port from a PRIOR generation whose process is long
+# gone — while the CURRENT server is alive on a different port. Concretely:
+# at SessionStart, this session's channel-server is an MCP stdio child
+# Claude Code spawns ASYNCHRONOUSLY — it may not have logged its own
+# `server_started` line yet, so the newest line on disk still belongs to the
+# previous generation. Probing that stale port then false-alarms "DEAD" on a
+# server that is, in fact, alive elsewhere (verified live 2026-07-03: the
+# guard probed a stale dead-pid port while the real v0.2.50 server served
+# peer health-pings on a different port the whole time).
+#
+# Fix: scan every `server_started` line, oldest → newest (the log's natural
+# append order), and remember the {host, port} of the LAST (i.e. most
+# recent) one whose `pid` is CONFIRMED ALIVE — `kill -0 $pid` — and, when
+# `/proc` is readable (Linux), whose `/proc/$pid/cmdline` actually looks like
+# a channel-server process (best-effort pid-reuse guard; when
+# `/proc/$pid/cmdline` can't be read at all — non-Linux, permission,
+# `/proc` absent — that extra check is skipped and `kill -0` alone decides,
+# rather than failing the whole liveness check over an unrelated missing
+# `/proc` capability).
+#
+# No candidate has a live pid at all → same posture as "no `server_started`
+# line at all": fail open, no false alarm. This is the expected TRANSIENT
+# shape right at SessionStart, before the async stdio child has logged its
+# first line — treating it as a hazard would just reintroduce the false
+# alarm this fix removes. The LOUD alarm below stays reserved for the
+# genuine hazard this hook exists to catch: a LIVE-pid server that still
+# won't answer `/health` (process up, endpoint deaf).
+ALL_STARTS="$(grep '"event":"server_started"' "$CHANNEL_LOG" 2>/dev/null || true)"
+[ -n "$ALL_STARTS" ] || exit 0
 
-PORT="$(printf '%s' "$NEWEST_START" | sed -n 's/.*"port":\([0-9]*\).*/\1/p')"
-HOST="$(printf '%s' "$NEWEST_START" | sed -n 's/.*"host":"\([^"]*\)".*/\1/p')"
+PORT=""
+HOST=""
+while IFS= read -r START_LINE; do
+  [ -n "$START_LINE" ] || continue
+  CAND_PID="$(printf '%s' "$START_LINE" | sed -n 's/.*"pid":\([0-9]*\).*/\1/p')"
+  [ -n "$CAND_PID" ] || continue
+  kill -0 "$CAND_PID" 2>/dev/null || continue
+  if [ -r "/proc/$CAND_PID/cmdline" ]; then
+    tr '\0' ' ' <"/proc/$CAND_PID/cmdline" 2>/dev/null | grep -q 'macf-channel-server' || continue
+  fi
+  CAND_PORT="$(printf '%s' "$START_LINE" | sed -n 's/.*"port":\([0-9]*\).*/\1/p')"
+  CAND_HOST="$(printf '%s' "$START_LINE" | sed -n 's/.*"host":"\([^"]*\)".*/\1/p')"
+  [ -n "$CAND_PORT" ] && [ -n "$CAND_HOST" ] || continue
+  PORT="$CAND_PORT"
+  HOST="$CAND_HOST"
+done <<STARTLINES
+$ALL_STARTS
+STARTLINES
+
+# No `server_started` line had a confirmable-live pid → fail open (see the
+# comment above — this is the expected transient shape, not a hazard).
 [ -n "$PORT" ] && [ -n "$HOST" ] || exit 0
 
 # ── mTLS cert paths (claude.sh's env.certs exports these; see
