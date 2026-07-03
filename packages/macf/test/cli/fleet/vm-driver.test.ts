@@ -12,11 +12,16 @@
  *   - launch: spawn ./claude.sh detached in the workspace.
  *   - resolveTarget: <project>@<routing-label> derivation + routing-label fallback.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { FleetDriverError, planFleetUpgrade } from '@groundnuty/macf-core';
 import type { AgentInfo, HealthResponse, WorkspaceRecord } from '@groundnuty/macf-core';
 import {
   createVmDriver,
+  createVmExecSeams,
   resolveTarget,
   type VmDriverSeams,
   type WorkspaceIdentity,
@@ -518,5 +523,113 @@ describe('launch', () => {
     await expect(createVmDriver(OPTS, seams).launch('ghost')).rejects.toBeInstanceOf(
       FleetDriverError,
     );
+  });
+});
+
+// --- createVmExecSeams — REAL git (macf#698, DR-040 Decision 6) ------------
+//
+// Unlike the fakeSeams-driven suites above (which verify createVmDriver's
+// orchestration against an INJECTED isConfigDirty/listDirtyConfig), these
+// tests exercise the REAL git-backed implementation createVmExecSeams wires
+// up — the actual `git status --porcelain -- <ROLL_TOUCHED_CONFIG_PATTERNS>`
+// invocation BOTH isConfigDirty AND listDirtyConfig share (same pattern
+// array, same git call). This is the load-bearing regression coverage for
+// the false-positive fix:
+//   - a dirty runtime file (e.g. `.claude/audit.log` — the exact shape that
+//     blocked devops's v0.2.48 fleet upgrade, PR #748) must NOT be flagged by
+//     either function (that's the operator's complaint + the fix), while
+//   - a dirty file on the MEANINGFUL union (the macf-update overwrite set ∪
+//     the operator-evolution files `CLAUDE.md` / `env.local.*` kept per
+//     macf#725) MUST be — proving the gate (isConfigDirty) and the displayed
+//     list (listDirtyConfig) are narrowed IDENTICALLY, since they already
+//     shared the same pathspec-filtered git status call before this fix.
+// CLAUDE.md is TRACKED operator-evolution: dropping it would make
+// restart-self's excludeConfigSurface stash it away on relaunch (silent
+// pre-reconcile loss), so it stays in the pattern AND legitimately warrants a
+// gate objection — the opposite of audit.log.
+
+describe('createVmExecSeams — real git (macf#698, DR-040 Decision 6)', () => {
+  let repo: string;
+
+  afterEach(() => {
+    if (repo) rmSync(repo, { recursive: true, force: true });
+  });
+
+  /** Init a real git repo at a temp dir with an initial commit of `files`. */
+  function initRepo(files: Readonly<Record<string, string>>): string {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-configdirty-'));
+    execFileSync('git', ['init', '--initial-branch=main'], { cwd: dir });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir });
+    execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: dir });
+    for (const [rel, content] of Object.entries(files)) {
+      const abs = join(dir, rel);
+      mkdirSync(join(abs, '..'), { recursive: true });
+      writeFileSync(abs, content);
+    }
+    execFileSync('git', ['add', '.'], { cwd: dir });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: dir });
+    return dir;
+  }
+
+  it('a dirty non-canonical .claude/ runtime file (audit.log) is NOT flagged — the macf#698 false-positive regression', () => {
+    repo = initRepo({
+      '.claude/audit.log': 'TIMESTAMP\tUSER\t?\n',
+      'claude.sh': '#!/usr/bin/env bash\necho hi\n',
+    });
+    // Dirty the runtime log — the exact shape of the devops incident: a
+    // custom ConfigChange hook keeps appending to a force-tracked audit.log.
+    writeFileSync(join(repo, '.claude/audit.log'), 'TIMESTAMP\tUSER\t?\nMORE\n');
+
+    const seams = createVmExecSeams(repo);
+    expect(seams.isConfigDirty(repo)).toBe(false);
+    expect(seams.listDirtyConfig(repo)).toEqual([]);
+  });
+
+  it.each([
+    // (a) the exact macf-update overwrite set:
+    ['claude.sh'],
+    ['.claude/settings.json'],
+    ['.claude/rules/coordination.md'],
+    ['.claude/scripts/macf-gh-token.sh'],
+    ['.claude/.macf/env.identity'],
+    ['.claude/.macf/host-prelude.sh'],
+    // (b) the operator-evolution union half (macf#725), meaningful ≠ audit.log:
+    ['CLAUDE.md'], // TRACKED — dirty CLAUDE.md IS flagged (must-not-silently-stash)
+    ['env.local.host'], // bare `env.local.*` pathspec matches top-level, when TRACKED
+  ])('a dirty file ON the meaningful union (%s) IS flagged, in BOTH the gate and the display', (rel) => {
+    repo = initRepo({
+      '.claude/audit.log': 'unrelated\n',
+      'claude.sh': '#!/usr/bin/env bash\necho hi\n',
+      '.claude/settings.json': '{}\n',
+      '.claude/rules/coordination.md': '# coordination\n',
+      '.claude/scripts/macf-gh-token.sh': '#!/usr/bin/env bash\n',
+      '.claude/.macf/env.identity': 'export MACF_AGENT_NAME=code-agent\n',
+      '.claude/.macf/host-prelude.sh': '# host prelude\n',
+      'CLAUDE.md': '# workbench doc\n',
+      'env.local.host': 'export FOO=bar\n',
+    });
+    writeFileSync(join(repo, rel), 'DIRTIED\n');
+
+    const seams = createVmExecSeams(repo);
+    expect(seams.isConfigDirty(repo)).toBe(true);
+    expect(seams.listDirtyConfig(repo)).toEqual([rel]);
+  });
+
+  it('a dirty non-canonical .claude/ scratch file (foo.log) is NOT flagged — the wildcard was the only bug', () => {
+    // A second non-audit.log runtime-file case: agent scratch / arbitrary log
+    // under .claude/. Confirms the fix generalizes beyond audit.log to the
+    // whole "runtime files macf update never writes" class.
+    repo = initRepo({
+      '.claude/foo.log': 'scratch\n',
+      '.claude/notes.txt': 'agent scratch\n',
+      'claude.sh': '#!/usr/bin/env bash\necho hi\n',
+    });
+    writeFileSync(join(repo, '.claude/foo.log'), 'scratch\nmore\n');
+    writeFileSync(join(repo, '.claude/notes.txt'), 'agent scratch\nedited\n');
+
+    const seams = createVmExecSeams(repo);
+    expect(seams.isConfigDirty(repo)).toBe(false);
+    expect(seams.listDirtyConfig(repo)).toEqual([]);
   });
 });
