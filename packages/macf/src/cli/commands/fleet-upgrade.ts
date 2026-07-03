@@ -63,10 +63,14 @@ export interface RunFleetUpgradeOptions {
   /** Per-agent verify-green budget in seconds (default 120). */
   readonly verifyTimeoutSec?: number;
   /**
-   * `--force` (macf#722 Fix B / macf#725): roll an agent even if its config
-   * surface (`.claude/**`, `CLAUDE.md`, `claude.sh`, `env.local.*` — the roll's
-   * touched-config-surface union) is dirty PRE-flight — bypasses the pre-flight
-   * OBJECT gate. The bypassed agent's `restart` is then told
+   * `--force` (macf#722 Fix B / macf#725; union narrowed off the `.claude/**`
+   * wildcard by DR-040 Decision 6, macf#698): roll an agent even if its config
+   * surface (`claude.sh`, `.claude/rules/**`, `.claude/scripts/**`,
+   * `.claude/settings.json`, the managed `.claude/.macf/env.*` +
+   * `host-prelude.sh`, `CLAUDE.md`, `env.local.*` — see
+   * `ROLL_TOUCHED_CONFIG_PATTERNS` in `@groundnuty/macf-core`'s
+   * `fleet-upgrade.ts`) is dirty PRE-flight — bypasses the pre-flight OBJECT
+   * gate. The bypassed agent's `restart` is then told
    * `leaveConfigUncommitted: true` (same as every normal roll transaction) via
    * the driver's `--leave-config-uncommitted` exec flag — `--force` means "roll
    * anyway," so the pre-existing dirt is left in place, not stashed.

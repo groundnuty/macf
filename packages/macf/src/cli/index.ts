@@ -438,11 +438,12 @@ fleet
   .option('--verify-timeout <sec>', 'Per-agent verify-green budget, in seconds (default 120)', (v) => parseInt(v, 10))
   .option(
     '--force',
-    'Roll an agent even if its config surface (.claude/**, CLAUDE.md, ' +
-      'claude.sh, env.local.*) is dirty PRE-flight (macf#722/#725) — bypasses ' +
-      'the pre-flight config-dirty OBJECT gate. The bypassed agent\'s restart ' +
-      'still leaves the config surface uncommitted (same as the normal path), ' +
-      'it does not stash it.',
+    'Roll an agent even if its config surface (claude.sh, .claude/rules/**, ' +
+      '.claude/scripts/**, .claude/settings.json, the managed .claude/.macf/env.* ' +
+      '+ host-prelude.sh, CLAUDE.md, env.local.* — the DR-040 Decision 6 union, ' +
+      'macf#698) is dirty PRE-flight (macf#722/#725) — bypasses the pre-flight ' +
+      'config-dirty OBJECT gate. The bypassed agent\'s restart still leaves the ' +
+      'config surface uncommitted (same as the normal path), it does not stash it.',
     false,
   )
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
@@ -521,8 +522,10 @@ program
   .option(
     '--force',
     'Bypass the STANDALONE config-surface stash-refusal guard (macf#722) — ' +
-      'proceed (and STASH, same as any other dirt) even when .claude/**, ' +
-      'CLAUDE.md, claude.sh, or env.local.* are dirty. Same effect as ' +
+      'proceed (and STASH, same as any other dirt) even when claude.sh, ' +
+      '.claude/rules/**, .claude/scripts/**, .claude/settings.json, the ' +
+      'managed .claude/.macf/env.* + host-prelude.sh, CLAUDE.md, or env.local.* ' +
+      '(the DR-040 Decision 6 union, macf#698) are dirty. Same effect as ' +
       'MACF_RESTART_STASH_CONFIG=1.',
     false,
   )

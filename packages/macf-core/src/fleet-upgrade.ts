@@ -145,50 +145,116 @@ export interface AgentRollResult {
 }
 
 /**
- * The roll's TOUCHED-CONFIG-SURFACE UNION (macf#722 Fix B, corrected naming
- * macf#725) — the path globs `rollFleet`'s pre-flight config-dirty gate checks
- * for uncommitted tracked changes before touching an agent.
+ * The roll's MEANINGFUL config surface (macf#722 Fix B / macf#725 UNION,
+ * narrowed by DR-040 Decision 6 / macf#698). The path globs that BOTH
+ * consumers of this constant key on:
  *
- * **This is a UNION, not an "operator-preserved" set** (the DR-037 Amendment B
- * naming was a misnomer, corrected here macf#725): it spans BOTH (a) the files
- * `macf update` OVERWRITES (the managed surface — canonical rules/scripts/hooks
- * under `.claude/**`, `.macf/*`) and (b) the files `restart-self` would STASH
- * (the operator surface — `settings.local.json`, `rules/project/**`,
- * `env.local.*`, `CLAUDE.md`, a hand-authored `claude.sh`). Both halves answer
- * the SAME pre-flight question the gate asks — "would this roll's `upgrade` +
- * `restart` silently clobber or stash SOMETHING uncommitted on this surface?"
- * — so both belong in the one union the gate checks, regardless of which half
- * of DR-029's managed-vs-operator taxonomy a given path falls in.
+ *   1. **The dirty-CHECK gate** — `rollFleet`'s pre-flight config-dirty
+ *      gate (`isConfigDirty` / `listDirtyConfig` in `vm-driver.ts`) +
+ *      `restart-self`'s standalone stash-refusal guard
+ *      (`hasUncommittedConfigChanges`). `git status --porcelain -- <pattern>`
+ *      → non-empty ⇒ OBJECT / refuse. Narrowing here narrows what OBJECTS.
+ *   2. **The `excludeConfigSurface` stash** — `restart-self`'s roll-path
+ *      relaunch (`git stash push -- . ':!<pattern>'` per entry) stashes
+ *      everything EXCEPT this pattern, so the roll's own `macf update`
+ *      regeneration stays uncommitted for the relaunched agent to see. A
+ *      path DROPPED from the pattern is therefore no longer excluded → it
+ *      gets STASHED on relaunch. For a TRACKED operator-evolution file
+ *      (`CLAUDE.md`), that means the agent comes back with it reverted to
+ *      HEAD and the edits buried in a stash = silent pre-reconcile loss.
  *
- * Sourced from DR-029's Amendment (2026-06-27, macf#598) managed-vs-operator
- * taxonomy: `.claude/**` (rules + scripts + settings — managed AND
- * project-tier), `CLAUDE.md` (operator workbench doc), `claude.sh` (the
- * launcher — operator-preserved when hand-authored/header-less, and harmless
- * to include even when macf-managed since a macf-managed copy is never
- * legitimately "dirty" outside an in-flight `macf update`), and `env.local.*`
- * (the operator-custom env extension slot — see
- * `design/decisions/DR-029-substrate-config-via-init-and-reintegrate.md`
- * Amendment table). Deliberately excludes macf-managed/regenerated files
- * (`env.*` canonical seven, `host-prelude.sh`) that are ONLY ever touched by
- * `macf update` itself and never by an operator — dirtiness there pre-flight
- * would still be a genuine conflict (someone hand-edited a regenerated file),
- * so those ARE covered by `.claude/**`/`.macf/*` where they live; the excluded
- * class is narrower than "everything macf update touches."
+ * Because of use #2, this is a **UNION, not the overwrite-set alone**
+ * (macf#725): (a) the files `macf update` OVERWRITES ∪ (b) the
+ * operator-evolution files that must NOT be silently stashed on relaunch.
+ * The `.claude/**` wildcard was the ONLY bug — it swept in runtime logs
+ * (`.claude/audit.log`) + agent scratch that `macf update` never writes,
+ * producing false CONFIG-DIRTY objections. This revision replaces ONLY that
+ * wildcard with the specific managed paths; the union's meaningful members
+ * are preserved.
  *
- * NOTE (macf#724 review, still applicable post-rename): this gate's set is
- * intentionally a slight SUPERSET of DR-029's *regenerate*-boundary for
- * `claude.sh`. The two answer DIFFERENT questions — this gate: "does the roll
- * need to OBJECT before touching this agent?"; DR-029's header-conditional
- * rule: "should `macf update` REGENERATE this file?". So do NOT "align"
- * `claude.sh` here to DR-029's header-conditional form: that would reintroduce
- * the roll-past-a-dirty-managed-`claude.sh` hole. Unconditional here is
- * harmless when clean (nothing flagged) and protective when dirty, regardless
- * of header.
+ * **(a) The exact set `macf update` OVERWRITES** — verified directly against
+ * the CLI source (`update.ts` + `env-files-update.ts` + `rules.ts` +
+ * `claude-sh.ts` + `host-prelude.ts` + `settings-writer.ts`):
+ *
+ * - `claude.sh` — `writeClaudeSh` (unconditional for a macf-managed workspace;
+ *   preserved only when hand-authored/header-less, in which case it's never
+ *   legitimately dirty from `macf update`'s perspective anyway — harmless to
+ *   include unconditionally, same reasoning as the prior revision).
+ * - `.claude/rules/**` — `copyCanonicalRules` (universal `.claude/rules/*.md`)
+ *   + `fetchProjectRules` (project-tier `.claude/rules/project/*.md`); both
+ *   land under this one glob.
+ * - `.claude/scripts/**` — `copyCanonicalScripts`. Still the exact overwrite
+ *   set as of DR-039 phase 2 (macf#749, hook SCRIPT FILES moved to
+ *   `plugin/scripts/`): `macf update` still writes a `.claude/scripts/`
+ *   compat copy for hand-wired substrate hooks + non-plugin-init'd
+ *   workspaces (see `rules.ts` `copyCanonicalScripts` doc comment). Drop this
+ *   entry once that compat copy is retired.
+ * - `.claude/settings.json` — `installGhTokenHook` / `installPluginSkillPermissions`
+ *   / `installSandboxFdAllowRead` / `installSandboxExcludedCommands` (all
+ *   merge-preserving writers targeting this one file). Deliberately EXCLUDES
+ *   `.claude/settings.local.json` — `macf update` only ever READS it (for the
+ *   getters' merged-view), never writes it (+ it's gitignored → never dirty
+ *   in the first place → no stash risk).
+ * - `.claude/.macf/env._helpers` / `env.identity` / `env.github` / `env.certs`
+ *   / `env.registry` — the 5 `MANAGED_ENV_FILES` (`env-files-update.ts`),
+ *   regenerated unconditionally + warn-on-hand-edit. Deliberately EXCLUDES the
+ *   2 `OPERATOR_ENV_FILES` (`env.telemetry`, `env.tmux` — bootstrap-write-if-
+ *   absent, else preserved unconditionally).
+ * - `.claude/.macf/host-prelude.sh` — `writeHostPrelude`, "macf-managed +
+ *   RE-DETECTED (never preserve-existing)" per its own doc comment
+ *   (`host-prelude.ts`). Genuinely overwritten every `macf update` run; ADDED
+ *   here (the prior `.claude/**` wildcard caught it incidentally — narrowing
+ *   the wildcard away would have silently dropped coverage for this file
+ *   without this explicit addition).
+ *
+ * **(b) The operator-evolution surface that must NOT be silently stashed**
+ * (macf#725 union half — kept, NOT dropped, per the use-#2 reasoning above):
+ *
+ * - `CLAUDE.md` — TRACKED operator/workbench doc. `macf update` never writes
+ *   it (no write path in any CLI command), so it's NOT an overwrite-set
+ *   member — but it IS a meaningful operator-evolution file: a dirty
+ *   `CLAUDE.md` legitimately warrants a gate objection (unlike `audit.log`,
+ *   it's real work, not runtime noise), and it MUST stay in the pattern so
+ *   `excludeConfigSurface` leaves it uncommitted rather than stashing the
+ *   operator's edits away on relaunch (verified TRACKED → live stash-loss
+ *   hazard if dropped).
+ * - `env.local.*` — the operator-custom env-extension slot (bare pathspec,
+ *   preserved verbatim from the prior union). Untracked in practice (so no
+ *   live stash risk today), but kept for union fidelity + zero-cost safety as
+ *   a genuine operator-surface member.
+ *
+ * **Motivating incident** (devops review, PR #748 / macf#698): the prior
+ * `.claude/**` wildcard matched `.claude/audit.log` — a runtime log a custom
+ * `ConfigChange` hook appends to (hence perpetually git-dirty on that
+ * workspace) that `macf update` never writes — and **blocked devops's
+ * v0.2.48 fleet upgrade** with a false CONFIG-DIRTY objection on 2026-07-02.
+ * Untracking `audit.log` itself (the `.gitignore` force-include +
+ * `git rm --cached`) is a separate, devops-owned LOCAL workspace cleanup —
+ * out of scope here; this pattern-narrowing is the FRAMEWORK-side fix so no
+ * future non-canonical `.claude/` file (runtime logs, agent scratch, custom-
+ * hook output) can trip the gate at all, regardless of gitignore state on any
+ * given workspace.
+ *
+ * Both gate consumers already pathspec-filter their `git status --porcelain`
+ * calls by this exact array (as does the stash), so this revision narrows
+ * ALL consumers' behavior identically; no separate no-pathspec fix was needed
+ * at any call site.
  */
 export const ROLL_TOUCHED_CONFIG_PATTERNS = [
-  '.claude/**',
-  'CLAUDE.md',
+  // (a) the exact set `macf update` OVERWRITES:
   'claude.sh',
+  '.claude/rules/**',
+  '.claude/scripts/**',
+  '.claude/settings.json',
+  '.claude/.macf/env._helpers',
+  '.claude/.macf/env.identity',
+  '.claude/.macf/env.github',
+  '.claude/.macf/env.certs',
+  '.claude/.macf/env.registry',
+  '.claude/.macf/host-prelude.sh',
+  // (b) operator-evolution files that must NOT be silently stashed on relaunch
+  //     (macf#725 union half — `excludeConfigSurface` leaves these uncommitted):
+  'CLAUDE.md',
   'env.local.*',
 ] as const;
 

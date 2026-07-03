@@ -107,8 +107,12 @@ export interface FleetDriver {
   /**
    * The pre-flight config-dirty predicate (macf#722 Fix B) — `true` when the
    * agent's workspace has UNCOMMITTED changes on the roll's touched-config
-   * surface (`.claude/**`, `CLAUDE.md`, `claude.sh`, `env.local.*` — see
-   * `ROLL_TOUCHED_CONFIG_PATTERNS` in `fleet-upgrade.ts`). VM: `git status`
+   * surface (the macf#725 UNION: the macf-update overwrite set ∪ the
+   * operator-evolution files — `claude.sh`, `.claude/rules/**`,
+   * `.claude/scripts/**`, `.claude/settings.json`, the managed
+   * `.claude/.macf/env.*` + `host-prelude.sh`, `CLAUDE.md`, `env.local.*` —
+   * see `ROLL_TOUCHED_CONFIG_PATTERNS` in `fleet-upgrade.ts`, narrowed off a
+   * `.claude/**` wildcard by DR-040 Decision 6 / macf#698). VM: `git status`
    * in the agent's workspace, filtered to that path set. A DEAD/absent agent
    * reads `false` (nothing to check; reconcile will launch it). Kept as a
    * boolean convenience alongside `listDirtyConfig` below — `rollFleet`'s

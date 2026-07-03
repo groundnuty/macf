@@ -11,6 +11,7 @@ import {
   planFleetUpgrade,
   rollFleet,
   upgradeFleets,
+  ROLL_TOUCHED_CONFIG_PATTERNS,
   type FleetDriver,
   type FleetState,
   type WorkspaceRecord,
@@ -19,6 +20,48 @@ import {
   type VerifyGreenOptions,
   type VerifyGreenResult,
 } from '../src/index.js';
+
+// --- ROLL_TOUCHED_CONFIG_PATTERNS (DR-040 Decision 6, macf#698) -------------
+//
+// Pins the meaningful config-surface UNION (macf#725: the macf-update
+// overwrite set ∪ the operator-evolution files) so a future edit to the
+// constant is a deliberate, reviewed change rather than a silent drift. The
+// `.claude/**` wildcard was the ONLY bug (it swept in runtime logs / scratch);
+// this pins that it's gone while the meaningful members — including the
+// operator-evolution `CLAUDE.md` / `env.local.*` half that must NOT be
+// silently stashed by restart-self's excludeConfigSurface — are preserved.
+// The real git-backed matching behavior (a dirty .claude/audit.log NOT
+// flagged; a dirty claude.sh / .claude/settings.json / .claude/rules/** /
+// .claude/scripts/** / managed .claude/.macf/env.* / CLAUDE.md IS flagged) is
+// exercised against a REAL git repo in packages/macf's
+// `test/cli/fleet/vm-driver.test.ts` ("createVmExecSeams — real git" suite) —
+// this test only pins the array CONTENT.
+
+describe('ROLL_TOUCHED_CONFIG_PATTERNS (DR-040 Decision 6, macf#698)', () => {
+  it('is the meaningful union — managed overwrite set ∪ operator-evolution files; no .claude/** wildcard', () => {
+    expect(ROLL_TOUCHED_CONFIG_PATTERNS).toEqual([
+      // (a) the exact macf-update overwrite set:
+      'claude.sh',
+      '.claude/rules/**',
+      '.claude/scripts/**',
+      '.claude/settings.json',
+      '.claude/.macf/env._helpers',
+      '.claude/.macf/env.identity',
+      '.claude/.macf/env.github',
+      '.claude/.macf/env.certs',
+      '.claude/.macf/env.registry',
+      '.claude/.macf/host-prelude.sh',
+      // (b) operator-evolution files kept per macf#725 (must-not-silently-stash):
+      'CLAUDE.md',
+      'env.local.*',
+    ]);
+    // The wildcard that swept in runtime logs / scratch is GONE (macf#698)...
+    expect(ROLL_TOUCHED_CONFIG_PATTERNS).not.toContain('.claude/**');
+    // ...but the operator-evolution union half is PRESERVED (macf#725).
+    expect(ROLL_TOUCHED_CONFIG_PATTERNS).toContain('CLAUDE.md');
+    expect(ROLL_TOUCHED_CONFIG_PATTERNS).toContain('env.local.*');
+  });
+});
 
 // --- fixtures ---------------------------------------------------------------
 

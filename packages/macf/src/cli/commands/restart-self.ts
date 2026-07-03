@@ -543,8 +543,10 @@ export async function runRestartSelf(
   if (!leaveConfigUncommitted && !forceStashConfig && deps.hasUncommittedConfigChanges()) {
     console.error(
       'macf restart-self: refusing — uncommitted config-surface changes ' +
-        '(.claude/**, CLAUDE.md, claude.sh, env.local.*) would be stashed by a ' +
-        'restart. Commit them first, or pass --force / set ' +
+        '(claude.sh, .claude/rules/**, .claude/scripts/**, .claude/settings.json, ' +
+        'the managed .claude/.macf/env.* + host-prelude.sh, CLAUDE.md, ' +
+        'env.local.* — the DR-040 Decision 6 union, macf#698) would be stashed ' +
+        'by a restart. Commit them first, or pass --force / set ' +
         'MACF_RESTART_STASH_CONFIG=1 to proceed anyway.',
     );
     return 1;
