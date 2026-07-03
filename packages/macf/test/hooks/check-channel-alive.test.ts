@@ -19,9 +19,9 @@
  * / check-lgtm-gate.test.ts's external-binary stubbing convention) so no
  * real network/TLS is involved.
  */
-import { describe, it, expect } from 'vitest';
-import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, symlinkSync } from 'node:fs';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
@@ -29,21 +29,137 @@ import { findCliPackageRoot } from '../../src/cli/rules.js';
 const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'check-channel-alive.sh');
 
 /**
+ * Spawn a long-lived, real OS process whose pid stays alive for the
+ * duration of a test AND whose `/proc/<pid>/cmdline` contains
+ * "macf-channel-server" — satisfying BOTH halves of the hook's live-pid
+ * predicate (macf#760: `kill -0` succeeds AND, where `/proc` is readable
+ * as it is on this Linux test host, the cmdline substring-matches).
+ *
+ * Spawns THIS test process's own `node` binary with an idle event-loop
+ * keeper (`setInterval`) plus a trailing marker argument — `/proc/<pid>/
+ * cmdline` reflects the raw execve argv regardless of whether node's own
+ * arg-parsing "uses" that trailing argument, so the marker shows up
+ * unconditionally. Deliberately NOT `bash -c 'exec -a NAME sleep infinity'`
+ * (the first approach tried): under this repo's devbox/Nix toolchain,
+ * `sleep` resolves to a multi-call coreutils binary that dispatches on
+ * `argv[0]` — `exec -a` spoofing argv[0] away from "sleep" makes it print
+ * `coreutils: unknown program 'NAME'` and exit immediately, so the
+ * "alive" process was actually already dead by the time any test ran.
+ * Spawning node directly sidesteps that class of problem entirely (node's
+ * own binary isn't a multi-call dispatcher).
+ */
+function spawnFakeChannelServerProcess(): { readonly pid: number; readonly stop: () => void } {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);', '--', 'macf-channel-server-marker'], {
+    stdio: 'ignore',
+  });
+  const pid = child.pid;
+  if (pid === undefined) {
+    throw new Error('failed to spawn fake channel-server stub process for test');
+  }
+  return {
+    pid,
+    stop: () => {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // already exited — fine, nothing to clean up
+      }
+    },
+  };
+}
+
+/**
+ * Spawn a real, alive OS process whose `/proc/<pid>/cmdline` does NOT
+ * look like a channel-server — used to prove the pid-reuse guard (macf#760)
+ * rejects an alive-but-wrong-shaped pid rather than trusting `kill -0` alone.
+ */
+function spawnPlainAliveProcess(): { readonly pid: number; readonly stop: () => void } {
+  const child = spawn('sleep', ['infinity'], { stdio: 'ignore' });
+  const pid = child.pid;
+  if (pid === undefined) {
+    throw new Error('failed to spawn plain alive process for test');
+  }
+  return {
+    pid,
+    stop: () => {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // already exited — fine
+      }
+    },
+  };
+}
+
+// One shared fake-alive-and-channel-server-shaped pid for the whole file —
+// used as the DEFAULT `pid` for any `server_started` fixture line that
+// doesn't explicitly override it, so every pre-existing test in this file
+// (which predates macf#760 and never specified a pid) keeps exercising the
+// SAME branch it always did (a genuinely live, correctly-shaped pid) rather
+// than tripping the NEW no-live-pid fail-open path by accident.
+let fakeChannelServerProcess: { readonly pid: number; readonly stop: () => void };
+
+beforeAll(() => {
+  fakeChannelServerProcess = spawnFakeChannelServerProcess();
+});
+
+afterAll(() => {
+  fakeChannelServerProcess?.stop();
+});
+
+/** A pid that is guaranteed to NOT exist (Linux default pid_max is far below this). */
+const DEAD_PID = 2147480000;
+
+/**
  * Build a directory with a stub `curl` shim that mimics
  * `curl -sS -o <file> -w '%{http_code}' -m <t> --cacert ... --cert ... --key ... <url>`:
  * writes `body` to the `-o` target (if any) and prints `httpCode` to stdout
- * (curl's `-w` behavior, no trailing newline). When `fail` is set, exits
- * non-zero without printing anything (simulates connection refused/timeout/
- * TLS failure — real curl prints "000" in that case too, which the hook's
- * `|| echo "000"` fallback also covers).
+ * (curl's `-w` behavior, no trailing newline). When `fail` is set (and no
+ * `portOverrides` given — see below), exits non-zero without printing
+ * anything (simulates connection refused/timeout/TLS failure — real curl
+ * prints "000" in that case too, which the hook's `|| echo "000"` fallback
+ * also covers).
+ *
+ * `portOverrides` (macf#760 regression coverage): when given, EVERY
+ * invocation is logged to `<dir>/curl.calls.log` (one URL per line) so a
+ * test can assert WHICH port the hook actually probed — the load-bearing
+ * proof that the newest-LIVE-pid selection logic (not just "did curl
+ * respond 2xx") is correct. Per-port entries override the top-level
+ * httpCode/fail for that specific port; unlisted ports fall through to the
+ * top-level httpCode/body defaults.
  */
-function makeStubCurlDir(opts: { readonly httpCode?: string; readonly body?: string; readonly fail?: boolean }): string {
+function makeStubCurlDir(opts: {
+  readonly httpCode?: string;
+  readonly body?: string;
+  readonly fail?: boolean;
+  readonly portOverrides?: Readonly<Record<number, { readonly httpCode?: string; readonly fail?: boolean }>>;
+}): { readonly dir: string; readonly callsLogPath: string } {
   const dir = mkdtempSync(join(tmpdir(), 'macf-chanalive-stub-curl-'));
+  const callsLogPath = join(dir, 'curl.calls.log');
   const httpCode = opts.httpCode ?? '200';
   const body = opts.body ?? '{}';
-  const script = opts.fail
-    ? `#!/usr/bin/env bash\nexit 7\n`
-    : `#!/usr/bin/env bash
+
+  if (opts.fail && !opts.portOverrides) {
+    writeFileSync(join(dir, 'curl'), `#!/usr/bin/env bash\nexit 7\n`);
+    chmodSync(join(dir, 'curl'), 0o755);
+    return { dir, callsLogPath };
+  }
+
+  const overrideCases = Object.entries(opts.portOverrides ?? {})
+    .map(([port, behavior]) =>
+      behavior.fail
+        ? `    ${port}) exit 7 ;;`
+        : `    ${port}) printf '%s' '${behavior.httpCode ?? '200'}'; exit 0 ;;`,
+    )
+    .join('\n');
+
+  const script = `#!/usr/bin/env bash
+url="\${@: -1}"
+printf '%s\\n' "$url" >> '${callsLogPath}'
+port="$(printf '%s' "$url" | sed -n 's#.*:\\([0-9]*\\)/health#\\1#p')"
+case "$port" in
+${overrideCases}
+esac
 outfile=""
 prev=""
 for arg in "$@"; do
@@ -59,20 +175,37 @@ exit 0
   const curlPath = join(dir, 'curl');
   writeFileSync(curlPath, script);
   chmodSync(curlPath, 0o755);
-  return dir;
+  return { dir, callsLogPath };
 }
 
 interface RunResult {
   readonly status: number | null;
   readonly stdout: string;
   readonly stderr: string;
+  /** Every `/health` URL the stub `curl` was invoked with, in call order (macf#760 port-selection proof). Empty if `curl` was never invoked or wasn't stubbed with `portOverrides`. */
+  readonly curlUrls: readonly string[];
+}
+
+interface ServerStartedSpec {
+  readonly port: number;
+  readonly host: string;
+  readonly instanceId?: string;
+  /** Defaults to a real, alive, channel-server-shaped pid (see `fakeChannelServerProcess` above) — matching every pre-#760 test's implicit assumption that the hook actually probes. Override to test dead/pid-reuse scenarios. */
+  readonly pid?: number;
 }
 
 function runHook(opts: {
-  /** Fields for a `server_started` JSONL line; `undefined` → no channel.log at all. */
-  readonly serverStarted?: { readonly port: number; readonly host: string; readonly instanceId?: string };
+  /** Fields for a SINGLE `server_started` JSONL line; `undefined` → no channel.log at all. Mutually exclusive with `serverStartedLines` (which wins if both given). */
+  readonly serverStarted?: ServerStartedSpec;
+  /** Fields for MULTIPLE `server_started` JSONL lines, written oldest → newest in array order — the shape of a channel.log spanning several relaunch generations (macf#760). */
+  readonly serverStartedLines?: readonly ServerStartedSpec[];
   /** Curl stub behavior; `undefined` → no `curl` on PATH at all (simulates missing binary). */
-  readonly curl?: { readonly httpCode?: string; readonly body?: string; readonly fail?: boolean };
+  readonly curl?: {
+    readonly httpCode?: string;
+    readonly body?: string;
+    readonly fail?: boolean;
+    readonly portOverrides?: Readonly<Record<number, { readonly httpCode?: string; readonly fail?: boolean }>>;
+  };
   /** When false, certs are NOT created (simulates missing/unreadable cert paths). Default true. */
   readonly certsPresent?: boolean;
   /** Pre-seed the throttle timestamp file with this many seconds ago (epoch offset). */
@@ -84,23 +217,26 @@ function runHook(opts: {
   const workspace = mkdtempSync(join(tmpdir(), 'macf-chanalive-ws-'));
 
   let logPath: string | undefined;
-  if (opts.serverStarted) {
+  const lineSpecs = opts.serverStartedLines ?? (opts.serverStarted ? [opts.serverStarted] : undefined);
+  if (lineSpecs && lineSpecs.length > 0) {
     const chanDir = join(fakeHome, '.local', 'state', 'macf', 'testproj@test-agent');
     mkdirSync(chanDir, { recursive: true });
     logPath = join(chanDir, 'channel.log');
-    const line = JSON.stringify({
-      ts: '2026-07-01T09:00:01.000Z',
-      level: 'info',
-      event: 'server_started',
-      port: opts.serverStarted.port,
-      host: opts.serverStarted.host,
-      agent: 'test-agent',
-      type: 'permanent',
-      instance_id: opts.serverStarted.instanceId ?? 'abc123',
-      pid: 4242,
-      version: '0.2.47',
-    });
-    writeFileSync(logPath, line + '\n');
+    const lines = lineSpecs.map((spec) =>
+      JSON.stringify({
+        ts: '2026-07-01T09:00:01.000Z',
+        level: 'info',
+        event: 'server_started',
+        port: spec.port,
+        host: spec.host,
+        agent: 'test-agent',
+        type: 'permanent',
+        instance_id: spec.instanceId ?? 'abc123',
+        pid: spec.pid ?? fakeChannelServerProcess.pid,
+        version: '0.2.47',
+      }),
+    );
+    writeFileSync(logPath, lines.join('\n') + '\n');
   }
 
   const certsPresent = opts.certsPresent ?? true;
@@ -128,8 +264,11 @@ function runHook(opts: {
   const basePath = process.env['PATH'] ?? '';
   let path = `/usr/bin:/bin:${basePath}`;
   let stubDir: string | undefined;
+  let callsLogPath: string | undefined;
   if (opts.curl) {
-    stubDir = makeStubCurlDir(opts.curl);
+    const stub = makeStubCurlDir(opts.curl);
+    stubDir = stub.dir;
+    callsLogPath = stub.callsLogPath;
     path = `${stubDir}:${path}`;
   }
 
@@ -156,7 +295,18 @@ function runHook(opts: {
       env: cleanEnv,
       encoding: 'utf-8',
     });
-    return { status: res.status, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
+    let curlUrls: string[] = [];
+    if (callsLogPath) {
+      try {
+        curlUrls = readFileSync(callsLogPath, 'utf-8')
+          .split('\n')
+          .map((s) => s.trim())
+          .filter(Boolean);
+      } catch {
+        curlUrls = [];
+      }
+    }
+    return { status: res.status, stdout: res.stdout ?? '', stderr: res.stderr ?? '', curlUrls };
   } finally {
     if (stubDir) rmSync(stubDir, { recursive: true, force: true });
     rmSync(fakeHome, { recursive: true, force: true });
@@ -302,7 +452,18 @@ describe('check-channel-alive.sh (SessionStart + UserPromptSubmit guard)', () =>
       const logPath = join(chanDir, 'channel.log');
       writeFileSync(
         logPath,
-        JSON.stringify({ ts: 'x', level: 'info', event: 'server_started', port: 8899, host: '127.0.0.1' }) + '\n',
+        // pid MUST be a genuinely live, channel-server-shaped pid (macf#760)
+        // — otherwise the new live-pid selection logic fails open BEFORE
+        // reaching the curl-missing check this test exists to exercise,
+        // making the assertion below pass for the wrong reason.
+        JSON.stringify({
+          ts: 'x',
+          level: 'info',
+          event: 'server_started',
+          port: 8899,
+          host: '127.0.0.1',
+          pid: fakeChannelServerProcess.pid,
+        }) + '\n',
       );
       const certDir = join(fakeHome, 'certs');
       mkdirSync(certDir, { recursive: true });
@@ -314,7 +475,13 @@ describe('check-channel-alive.sh (SessionStart + UserPromptSubmit guard)', () =>
       writeFileSync(agentKey, 'fake-key');
 
       const noCurlDir = mkdtempSync(join(tmpdir(), 'macf-chanalive-nocurl-'));
-      for (const bin of ['bash', 'sh', 'cat', 'sed', 'grep', 'tail', 'date', 'ls', 'mkdir', 'mktemp', 'rm']) {
+      // 'tr' + 'kill' added (macf#760): the new live-pid selection loop uses
+      // `kill -0` (a bash builtin — doesn't need a PATH entry) and pipes
+      // `/proc/<pid>/cmdline` through `tr` for the pid-reuse guard; without
+      // `tr` on PATH that guard would spuriously reject a genuinely-alive,
+      // correctly-shaped pid and fail open before this test's intended
+      // curl-missing path is reached.
+      for (const bin of ['bash', 'sh', 'cat', 'sed', 'grep', 'tail', 'date', 'ls', 'mkdir', 'mktemp', 'rm', 'tr']) {
         const resolved = spawnSync('bash', ['-lc', `command -v ${bin}`], { encoding: 'utf-8' }).stdout.trim();
         if (resolved) {
           try {
@@ -393,6 +560,111 @@ describe('check-channel-alive.sh (SessionStart + UserPromptSubmit guard)', () =>
       ];
       for (const c of cases) {
         expect(runHook(c.opts).status, `case: ${c.name}`).toBe(0);
+      }
+    });
+  });
+
+  describe('(g) newest-LIVE-pid port selection — stale-newest-port trap (macf#760)', () => {
+    it('LOAD-BEARING REGRESSION: selects the OLDER line whose pid is alive when the NEWEST line has a dead pid — does NOT false-alarm on the stale newest port', () => {
+      // Pre-#760 behavior blindly trusted the newest `server_started` line's
+      // port. Here the newest generation's pid is DEAD (relaunched away) and
+      // its port would refuse the connection; the OLDER generation's pid is
+      // still alive and its port answers 200. The port-aware curl stub
+      // proves WHICH port was actually probed — this assertion would FAIL
+      // under the pre-fix "tail -n1" heuristic (it would probe the dead
+      // newest port, get refused, and print the DEAD warning).
+      const OLD_PORT = 8899;
+      const NEW_PORT = 8900;
+      const r = runHook({
+        serverStartedLines: [
+          { port: OLD_PORT, host: '127.0.0.1' }, // oldest generation — alive pid (default)
+          { port: NEW_PORT, host: '127.0.0.1', pid: DEAD_PID }, // newest generation — DEAD pid
+        ],
+        curl: {
+          portOverrides: {
+            [OLD_PORT]: { httpCode: '200' },
+            [NEW_PORT]: { fail: true }, // would fire if the guard mistakenly probed the stale newest port
+          },
+        },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe(''); // silent — proves the ALIVE (older) port was probed, not the dead newest one
+      expect(r.curlUrls).toHaveLength(1);
+      expect(r.curlUrls[0]).toContain(`:${OLD_PORT}/health`);
+      expect(r.curlUrls[0]).not.toContain(`:${NEW_PORT}/health`);
+    });
+
+    it('selects the NEWEST line when its pid IS alive (no regression on the common/happy-path case)', () => {
+      const OLD_PORT = 8901;
+      const NEW_PORT = 8902;
+      const r = runHook({
+        serverStartedLines: [
+          { port: OLD_PORT, host: '127.0.0.1', pid: DEAD_PID }, // old generation — already gone
+          { port: NEW_PORT, host: '127.0.0.1' }, // current generation — alive (default)
+        ],
+        curl: {
+          portOverrides: {
+            [OLD_PORT]: { fail: true },
+            [NEW_PORT]: { httpCode: '200' },
+          },
+        },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('');
+      expect(r.curlUrls).toHaveLength(1);
+      expect(r.curlUrls[0]).toContain(`:${NEW_PORT}/health`);
+    });
+
+    it('NO server_started line has a live pid → fails open silently (transient — the async MCP child hasn\'t logged yet), curl is NEVER invoked', () => {
+      const r = runHook({
+        serverStartedLines: [
+          { port: 8903, host: '127.0.0.1', pid: DEAD_PID },
+          { port: 8904, host: '127.0.0.1', pid: DEAD_PID + 1 },
+        ],
+        // portOverrides: {} forces the call-logging stub variant (rather
+        // than the old bare-exit-7 variant) so ANY invocation — matched
+        // port or not — would show up in curlUrls. Length 0 below proves
+        // curl was never invoked at all, not merely that it "failed".
+        curl: { portOverrides: {} },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('');
+      expect(r.curlUrls).toHaveLength(0);
+    });
+
+    it('a LIVE-pid server that fails to answer /health STILL warns loudly (the true-positive hazard is preserved)', () => {
+      const r = runHook({
+        serverStartedLines: [{ port: 8905, host: '127.0.0.1' }], // alive pid (default)
+        curl: { fail: true },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('YOUR CHANNEL-SERVER IS DEAD');
+    });
+
+    it('pid-reuse guard: an alive pid whose /proc cmdline does NOT look like a channel-server is rejected, falling back to an older properly-shaped alive line', () => {
+      const plain = spawnPlainAliveProcess();
+      try {
+        const OLD_PORT = 8910;
+        const NEWISH_PORT = 8911;
+        const r = runHook({
+          serverStartedLines: [
+            { port: OLD_PORT, host: '127.0.0.1' }, // properly-shaped alive pid (default)
+            { port: NEWISH_PORT, host: '127.0.0.1', pid: plain.pid }, // alive, but NOT a channel-server
+          ],
+          curl: {
+            portOverrides: {
+              [OLD_PORT]: { httpCode: '200' },
+              [NEWISH_PORT]: { fail: true },
+            },
+          },
+        });
+        expect(r.status).toBe(0);
+        expect(r.stdout.trim()).toBe('');
+        expect(r.curlUrls).toHaveLength(1);
+        expect(r.curlUrls[0]).toContain(`:${OLD_PORT}/health`);
+        expect(r.curlUrls[0]).not.toContain(`:${NEWISH_PORT}/health`);
+      } finally {
+        plain.stop();
       }
     });
   });
