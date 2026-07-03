@@ -852,6 +852,48 @@ describe('resolvePluginDirFromClaudeSh (DR-039)', () => {
     expect(result.determinable).toBe(true);
     expect(result.dir).toBe(join(tmpRoot, '.macf', 'plugin'));
   });
+
+  it('IGNORES a --plugin-dir MENTIONED in a comment (macf#756) — the canonical claude.sh shape', () => {
+    // The canonical launcher has a channels-enablement comment whose line ENDS
+    // with the words "...the --plugin-dir" (documentation, not a flag). The old
+    // `\s+`-spanning regex matched that trailing `--plugin-dir` and grabbed the
+    // NEXT line's leading `#` as a spurious second value → false "multiple
+    // distinct --plugin-dir values: #, ..." → macf doctor warned on EVERY
+    // canonical workspace + `canPluginDeliverMigratedHooks` fell to the (safe)
+    // defer path. The real flag lines are on the exec/resume lines below.
+    writeFileSync(
+      join(tmpRoot, 'claude.sh'),
+      [
+        '# The dev-flag form is required because the --plugin-dir',
+        '# macf-agent plugin is not on the curated channel allowlist.',
+        'claude -c --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@" || ' +
+          'exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@"',
+        '',
+      ].join('\n'),
+    );
+    const result = resolvePluginDirFromClaudeSh(tmpRoot);
+    expect(result.determinable).toBe(true);
+    expect(result.dir).toBe(join(tmpRoot, '.macf', 'plugin'));
+    expect(result.detail).not.toMatch(/multiple distinct/i);
+  });
+
+  it('does NOT let a trailing --plugin-dir on one line grab the next line’s token (macf#756 — same-line whitespace only)', () => {
+    // Even for NON-comment lines: a `--plugin-dir` with no same-line argument
+    // must not consume the following line's first token. (The `[^\S\r\n]+`
+    // change makes the flag require a same-line value; here the only real,
+    // resolvable flag is the exec line.)
+    writeFileSync(
+      join(tmpRoot, 'claude.sh'),
+      [
+        'echo "note: pass --plugin-dir"',
+        'exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"',
+        '',
+      ].join('\n'),
+    );
+    const result = resolvePluginDirFromClaudeSh(tmpRoot);
+    expect(result.determinable).toBe(true);
+    expect(result.dir).toBe(join(tmpRoot, '.macf', 'plugin'));
+  });
 });
 
 describe('getEffectiveHookConfig fallback (DR-039 "err toward not-false-alarming")', () => {

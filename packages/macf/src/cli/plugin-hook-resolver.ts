@@ -127,12 +127,23 @@ export function resolvePluginDirFromClaudeSh(workspaceDir: string): PluginDirRes
   // Double-quote checked first so the canonical form's exact prior behavior
   // is unchanged; the unquoted `(\S+)` alternative is a catch-all fallback
   // that only matches when neither quote form applies at that position.
+  // Match per-line, skipping comment lines (macf#756): a `--plugin-dir`
+  // MENTIONED in a claude.sh comment — e.g. the canonical channels-enablement
+  // note whose line ends "...the --plugin-dir" — is documentation, not an
+  // actual flag. Two guards together: (1) skip lines that are comments
+  // (first non-whitespace char is `#`), and (2) `[^\S\r\n]+` (same-line
+  // whitespace only, never `\s+` which spans newlines) so a `--plugin-dir` at
+  // the END of a line can't greedily grab the NEXT line's leading token (the
+  // exact bug: a trailing-`--plugin-dir` comment matched the next line's `#`,
+  // yielding a spurious second "value" and a false "multiple values" verdict).
   const found = new Set<string>();
-  const re = /--plugin-dir\s+(?:"([^"]+)"|'([^']+)'|(\S+))/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null) {
-    const captured = m[1] ?? m[2] ?? m[3];
-    if (captured !== undefined) found.add(captured);
+  const re = /--plugin-dir[^\S\r\n]+(?:"([^"]+)"|'([^']+)'|(\S+))/g;
+  for (const line of content.split('\n')) {
+    if (line.trim().startsWith('#')) continue;
+    for (const m of line.matchAll(re)) {
+      const captured = m[1] ?? m[2] ?? m[3];
+      if (captured !== undefined) found.add(captured);
+    }
   }
   if (found.size === 0) {
     return { dir: null, determinable: false, detail: 'claude.sh has no --plugin-dir flag' };
