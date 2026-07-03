@@ -4,6 +4,31 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.51] — 2026-07-03
+
+Patch: fixes two guard/parser false-positives surfaced by the fleet upgrade.
+Marketplace v0.2.51 is a lockstep bump (the channel-alive guard script is
+plugin-delivered, so the plugin tree changes this release).
+
+### Reliability
+- **#760** — the `check-channel-alive.sh` SessionStart guard (#734) false-
+  alarmed *"YOUR CHANNEL-SERVER IS DEAD"* on **live** servers after every
+  relaunch. The channel-server picks a fresh port per launch and `channel.log`
+  is append-only across generations, so reading the *newest* `server_started`
+  line at SessionStart named a **prior, dead** generation's port (the current
+  server — an async MCP stdio child — hadn't logged yet). Fix: select the
+  most-recent `server_started` whose **pid is confirmed alive** (`kill -0` +
+  `/proc/<pid>/cmdline` pid-reuse guard); fail open when none is alive (the
+  startup transient), and reserve the loud alarm for a **live** server that
+  won't answer `/health` (the genuine stdio-alive-but-HTTP-deaf hazard;
+  complete process-death is surfaced separately by Claude Code's own MCP-
+  disconnect notification).
+- **#756** — `macf doctor` no longer emits a spurious *"multiple distinct
+  --plugin-dir values"* warning on the canonical `claude.sh`. The plugin-dir
+  resolver matched a `--plugin-dir` *mentioned in a comment* (its `\s+` spanned
+  the newline into the next line's `#`); it now parses per-line, skips comment
+  lines, and uses same-line-only whitespace.
+
 ## [0.2.50] — 2026-07-03
 
 Patch: fixes a crash that halted `macf fleet upgrade`. Marketplace v0.2.50 is a
