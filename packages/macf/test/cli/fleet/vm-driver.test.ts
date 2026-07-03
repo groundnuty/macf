@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FleetDriverError, planFleetUpgrade } from '@groundnuty/macf-core';
@@ -23,6 +23,8 @@ import {
   createVmDriver,
   createVmExecSeams,
   resolveTarget,
+  childEnvForTarget,
+  ORCHESTRATOR_IDENTITY_ENV_KEYS,
   type VmDriverOptions,
   type VmDriverSeams,
   type WorkspaceIdentity,
@@ -73,6 +75,15 @@ interface Recorder {
   readonly captured: string[];
   /** `commitCanonicalFiles` calls (DR-040 Decision 3 / macf#698 R1). */
   readonly commits: { workspaceDir: string; files: readonly string[] }[];
+  /**
+   * The `env` arg passed to each `exec` call, in call order (macf#763) —
+   * kept SEPARATE from `execs` (rather than baked into that object's shape)
+   * so the pre-existing `toEqual([{ bin, args, cwd }])` assertions all over
+   * this file don't need to know about env at all.
+   */
+  readonly execEnvs: (NodeJS.ProcessEnv | undefined)[];
+  /** The `env` arg passed to each `spawnDetached` call, in call order (macf#763). */
+  readonly spawnEnvs: (NodeJS.ProcessEnv | undefined)[];
 }
 
 /** Per-call capturePane return values (drained in order; repeats last). */
@@ -95,7 +106,16 @@ interface SeamOverrides {
 }
 
 function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder } {
-  const rec: Recorder = { execs: [], spawns: [], submits: [], sleeps: [], captured: [], commits: [] };
+  const rec: Recorder = {
+    execs: [],
+    spawns: [],
+    submits: [],
+    sleeps: [],
+    captured: [],
+    commits: [],
+    execEnvs: [],
+    spawnEnvs: [],
+  };
   const paneQueue = [...(o.paneReads ?? [])];
   const live = o.liveSessions ?? new Set<string>();
   const dirtyWorkspaces = o.configDirtyWorkspaces ?? new Set<string>();
@@ -118,8 +138,14 @@ function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder
       return v;
     },
     submit: (session, text) => void rec.submits.push({ session, text }),
-    exec: (bin, args, cwd) => void rec.execs.push({ bin, args, cwd }),
-    spawnDetached: (bin, args, cwd) => void rec.spawns.push({ bin, args, cwd }),
+    exec: (bin, args, cwd, env) => {
+      rec.execs.push({ bin, args, cwd });
+      rec.execEnvs.push(env);
+    },
+    spawnDetached: (bin, args, cwd, env) => {
+      rec.spawns.push({ bin, args, cwd });
+      rec.spawnEnvs.push(env);
+    },
     sleep: async (ms) => void rec.sleeps.push(ms),
     isConfigDirty: (workspaceDir: string) => dirtyWorkspaces.has(workspaceDir),
     listDirtyConfig: (workspaceDir: string) => o.dirtyConfigFiles?.get(workspaceDir) ?? [],
@@ -684,6 +710,181 @@ describe('launch', () => {
     await expect(createVmDriver(OPTS, seams).launch('ghost')).rejects.toBeInstanceOf(
       FleetDriverError,
     );
+  });
+});
+
+// --- orchestrator-identity-env scrub (macf#763 — critical self-kill fix) ----
+//
+// THE regression this issue is about: `macf fleet upgrade` run from INSIDE an
+// agent's own tmux session must not leak that agent's `MACF_*` identity into
+// the `macf update`/`macf restart-self` child it execs for a DIFFERENT
+// target agent. `restart-self`'s `resolveIdentity` is env-over-config, so an
+// unscrubbed child derives the ORCHESTRATOR's `${MACF_PROJECT}@${MACF_ROUTING_LABEL}`
+// session and kills IT instead of the target — verified live 2026-07-03.
+//
+// These tests mutate `process.env` to simulate exactly that: the code
+// mutating `process.env` is `code-agent` (project `macf`, routing label
+// `code-agent`) rolling a DIFFERENT agent (`science-agent`, workspace
+// `/w/science`). Without the fix, `rec.execEnvs`/`rec.spawnEnvs` would carry
+// the orchestrator's identity straight through; with the fix, every one of
+// the 5 keys is absent.
+
+describe('orchestrator-identity-env scrub on exec/spawnDetached (macf#763)', () => {
+  const ORIGINAL: Partial<Record<(typeof ORCHESTRATOR_IDENTITY_ENV_KEYS)[number], string>> = {};
+
+  beforeEach(() => {
+    for (const key of ORCHESTRATOR_IDENTITY_ENV_KEYS) {
+      ORIGINAL[key] = process.env[key];
+    }
+    // Simulate code-agent's OWN identity leaking via ambient env — exactly
+    // what claude.sh exports into every agent's session.
+    process.env.MACF_WORKSPACE_DIR = '/w/macf';
+    process.env.MACF_PROJECT = 'macf';
+    process.env.MACF_ROUTING_LABEL = 'code-agent';
+    process.env.MACF_AGENT_NAME = 'macf-code-agent';
+    process.env.CLAUDE_PROJECT_DIR = '/w/macf';
+    process.env.MACF_TEST_UNRELATED = 'keep-me';
+  });
+
+  afterEach(() => {
+    for (const key of ORCHESTRATOR_IDENTITY_ENV_KEYS) {
+      if (ORIGINAL[key] === undefined) delete process.env[key];
+      else process.env[key] = ORIGINAL[key];
+    }
+    delete process.env.MACF_TEST_UNRELATED;
+  });
+
+  it('childEnvForTarget strips exactly the 5 identity keys, preserving everything else', () => {
+    const env = childEnvForTarget();
+    for (const key of ORCHESTRATOR_IDENTITY_ENV_KEYS) {
+      expect(env[key]).toBeUndefined();
+    }
+    expect(env.MACF_TEST_UNRELATED).toBe('keep-me');
+    // Doesn't mutate the caller's process.env — the leak-source is untouched.
+    expect(process.env.MACF_PROJECT).toBe('macf');
+  });
+
+  it('childEnvForTarget scrubs an explicitly-passed base env too', () => {
+    const env = childEnvForTarget({ MACF_PROJECT: 'other', KEEP: '1' });
+    expect(env.MACF_PROJECT).toBeUndefined();
+    expect(env.KEEP).toBe('1');
+  });
+
+  it('upgrade: the `macf update` child env carries NONE of the orchestrator identity', async () => {
+    const { seams, rec } = fakeSeams();
+    await createVmDriver(OPTS, seams).upgrade('science-agent');
+    expect(rec.execEnvs).toHaveLength(1);
+    const env = rec.execEnvs[0]!;
+    for (const key of ORCHESTRATOR_IDENTITY_ENV_KEYS) {
+      expect(env[key]).toBeUndefined();
+    }
+  });
+
+  it('restart (session alive): the `macf restart-self` child env carries NONE of the orchestrator identity — THE #763 self-kill fix', async () => {
+    // code-agent (env above) rolls a DIFFERENT alive agent (science-agent).
+    const { seams, rec } = fakeSeams({ liveSessions: new Set(['macf@science-agent']) });
+    await createVmDriver(OPTS, seams).restart('science-agent');
+    expect(rec.execEnvs).toHaveLength(1);
+    const env = rec.execEnvs[0]!;
+    for (const key of ORCHESTRATOR_IDENTITY_ENV_KEYS) {
+      expect(env[key]).toBeUndefined();
+    }
+    // Without the fix, this env would carry MACF_PROJECT=macf +
+    // MACF_ROUTING_LABEL=code-agent, and restart-self would derive
+    // `macf@code-agent` (the ORCHESTRATOR's session) instead of
+    // `macf@science-agent` (the actual target) — killing the wrong agent.
+  });
+
+  it('restart (session dead → cold-start launch): the spawnDetached child env carries NONE of the orchestrator identity', async () => {
+    const { seams, rec } = fakeSeams({ liveSessions: new Set() });
+    await createVmDriver(OPTS, seams).restart('science-agent');
+    expect(rec.spawnEnvs).toHaveLength(1);
+    const env = rec.spawnEnvs[0]!;
+    for (const key of ORCHESTRATOR_IDENTITY_ENV_KEYS) {
+      expect(env[key]).toBeUndefined();
+    }
+  });
+
+  it('launch: the spawnDetached child env carries NONE of the orchestrator identity', async () => {
+    const { seams, rec } = fakeSeams();
+    await createVmDriver(OPTS, seams).launch('science-agent');
+    expect(rec.spawnEnvs).toHaveLength(1);
+    const env = rec.spawnEnvs[0]!;
+    for (const key of ORCHESTRATOR_IDENTITY_ENV_KEYS) {
+      expect(env[key]).toBeUndefined();
+    }
+  });
+
+  it('pre-existing exec/restart/launch call-shape assertions are unaffected by the env addition', async () => {
+    // Guards that the scrub is additive — bin/args/cwd assertions elsewhere in
+    // this file (which use `rec.execs`/`rec.spawns`, NOT `rec.execEnvs`/
+    // `rec.spawnEnvs`) still hold with the 4th `env` arg now always passed.
+    const { seams, rec } = fakeSeams({ liveSessions: new Set(['macf@code-agent']) });
+    await createVmDriver(OPTS, seams).restart('code-agent');
+    expect(rec.execs).toEqual([
+      { bin: 'macf', args: ['restart-self', '--confirm', '--reason', 'fault'], cwd: '/w/macf' },
+    ]);
+  });
+});
+
+// --- createVmExecSeams — real exec/spawnDetached env passthrough (macf#763) -
+//
+// Verifies the REAL seam implementations (not fakes): `exec` defaults to
+// `process.env` when no 4th arg is given (no regression for any other/future
+// caller that doesn't pass env), and honors an EXPLICIT env override (proof
+// the driver's scrubbed env actually reaches the child process, not just the
+// seam's TypeScript signature).
+
+describe('createVmExecSeams — exec env passthrough, real subprocess (macf#763)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-execenv-'));
+  });
+
+  afterEach(() => {
+    delete process.env.MACF_TEST_EXECENV_PROBE;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('exec with NO env arg inherits the ambient process.env (default, no regression)', () => {
+    process.env.MACF_TEST_EXECENV_PROBE = 'ambient-value';
+    const outFile = join(dir, 'out.txt');
+    const seams = createVmExecSeams(dir);
+    seams.exec('sh', ['-c', `printf '%s' "$MACF_TEST_EXECENV_PROBE" > "${outFile}"`], dir);
+    expect(readFileSync(outFile, 'utf-8')).toBe('ambient-value');
+  });
+
+  it('exec with an EXPLICIT env overrides the ambient process.env for the child', () => {
+    process.env.MACF_TEST_EXECENV_PROBE = 'ambient-value';
+    const outFile = join(dir, 'out.txt');
+    const seams = createVmExecSeams(dir);
+    // Explicit env WITHOUT the probe var (+ PATH, so `sh` resolves) → the
+    // child must NOT see the ambient value.
+    seams.exec(
+      'sh',
+      ['-c', `printf '%s' "\${MACF_TEST_EXECENV_PROBE:-absent}" > "${outFile}"`],
+      dir,
+      { PATH: process.env.PATH ?? '' },
+    );
+    expect(readFileSync(outFile, 'utf-8')).toBe('absent');
+  });
+
+  it('spawnDetached with an EXPLICIT env reaches the detached child (proof env is actually wired, not just accepted)', async () => {
+    const outFile = join(dir, 'out.txt');
+    const seams = createVmExecSeams(dir);
+    seams.spawnDetached(
+      'sh',
+      ['-c', `printf '%s' "\${MACF_TEST_EXECENV_PROBE:-absent}" > "${outFile}"`],
+      dir,
+      { PATH: process.env.PATH ?? '' },
+    );
+    // Detached — poll briefly for the write rather than assuming synchronous completion.
+    for (let i = 0; i < 40 && !existsSync(outFile); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(existsSync(outFile)).toBe(true);
+    expect(readFileSync(outFile, 'utf-8')).toBe('absent');
   });
 });
 
