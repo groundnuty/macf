@@ -4,6 +4,52 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.49] — 2026-07-03
+
+DR-040 reconcile-foundation release. Ratifies + starts implementing the
+canonical-vs-agent-evolution reconciliation protocol for fleet upgrades:
+tamper-resistant hook enforcement, a false-positive-free config-dirty gate,
+tier-first auto-resolve of already-canonical config, and the maintenance-lock
+(upgrade ≠ outage). Marketplace v0.2.49 is a lockstep bump.
+
+### DR-040 — canonical/agent-evolution reconciliation on fleet upgrade
+- **DR-040 ratified (Accepted)** — the design record for upgrading agents
+  without destroying their self-evolution: the plugin-delivery boundary
+  (scripts can move to the plugin; rules/permissions/CLAUDE.md can't —
+  verified against Claude Code's loader), the stash + fresh-session reconcile
+  protocol, and two prerequisite primitives (maintenance-lock,
+  resume-by-session-id). Reviewed by science (owner) + devops (cron/guard).
+
+### Reliability — reconcile-protocol foundation
+- **#749** — DR-039 phase 2: the 7 load-bearing hook scripts now run from
+  `${CLAUDE_PLUGIN_ROOT}/scripts/` (tamper-resistant — an agent can't defeat
+  an enforcement hook by editing its `.claude/scripts/` copy). `.claude/scripts/`
+  compat copies retained for hand-wired substrate hooks pending the DR-039 rollout.
+- **#751** — DR-040 Decision 6: narrow the config-dirty guard off the
+  `.claude/**` wildcard to the exact meaningful config surface (the
+  macf-update overwrite set ∪ operator-evolution `CLAUDE.md`/`env.local.*`).
+  Stops the runtime-`.claude/`-file false-positives (e.g. a churning
+  `audit.log`) that blocked a fleet upgrade, while keeping the operator-evolution
+  union half protected from `restart-self`'s `excludeConfigSurface` stash.
+- **#753** — DR-040 Decision 3 (R1) tier-first auto-resolve: `macf fleet upgrade`
+  now computes what `macf update` would write per file-type (incl. generating
+  `claude.sh` in-memory) and auto-commits the already-canonical dirty files,
+  objecting only on genuine deltas — instead of objecting on everything. Kills
+  the common false-object (a stale-branch workspace whose dirt IS the canonical
+  regen). Fail-safe: any ambiguity → genuine-delta (never a wrong auto-commit);
+  `CLAUDE.md`/`env.local.*` are always genuine-delta (agent evolution, never
+  auto-committed).
+- **#752** — DR-040 Decision 4 maintenance-lock SET-side: `macf fleet upgrade`
+  acquires/heartbeats/releases a per-agent lock around each roll (a TypeScript
+  third-driver conforming to the cross-repo contract in
+  `macf-devops-toolkit#158`), so the DR-006/031 watchdog-cron reads a
+  mid-upgrade agent as planned maintenance, not an outage. Release-on-green-only;
+  a halt leaves the lock (self-clears via TTL) so a mid-transition agent isn't
+  relaunched into the roll.
+
+### Design records
+- **DR-040** (canonical/agent-evolution reconciliation on upgrade, Accepted).
+
 ## [0.2.48] — 2026-07-02
 
 Stability + delivery-guarantee release. Closes the silent-channel-death /
