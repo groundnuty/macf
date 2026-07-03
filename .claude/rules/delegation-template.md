@@ -1,3 +1,9 @@
+<!--
+  This file is managed by `macf`. Do not edit directly — edits are
+  overwritten on the next `macf update`. The canonical source lives at
+  groundnuty/macf:plugin/rules/. To change a rule, file an issue or PR
+  against that file in the macf repo, then run `macf update` here.
+-->
 # Delegation Template (canonical, shared)
 
 **This file is the single source of truth for how one agent delegates work to

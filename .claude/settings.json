@@ -5,13 +5,22 @@
   "enableAllProjectMcpServers": false,
   "permissions": {
     "allow": [
+      "Bash(*)",
       "Read",
+      "Write",
+      "Edit",
       "Glob",
       "Grep",
       "WebFetch",
       "WebSearch",
-      "Bash(*)",
       "Agent",
+      "Skill(macf-agent:macf-status)",
+      "Skill(macf-agent:macf-issues)",
+      "Skill(macf-agent:macf-peers)",
+      "Skill(macf-agent:macf-ping)",
+      "Skill(macf-agent:macf-notify-peer)",
+      "mcp__plugin_macf-agent_macf-agent__notify_peer",
+      "mcp__plugin_macf-agent_macf-agent__checkpoint_to_memory",
       "mcp__*"
     ],
     "deny": [
@@ -19,20 +28,108 @@
       "Read(~/.ssh/*.pem)",
       "Read(~/.aws/**)",
       "Read(~/.gnupg/**)",
+      "Read(~/.kube/**)",
+      "Read(~/.config/gcloud/**)",
+      "Read(~/.netrc)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.bash_history)",
+      "Read(~/.zsh_history)",
+      "Write(~/.claude/settings.json)",
+      "Edit(~/.claude/settings.json)",
+      "Write(~/.claude.json)",
+      "Edit(~/.claude.json)",
+      "Write(~/.ssh/**)",
+      "Edit(~/.ssh/**)",
+      "Write(~/.aws/**)",
+      "Edit(~/.aws/**)",
+      "Write(~/.gnupg/**)",
+      "Edit(~/.gnupg/**)",
+      "Write(~/.kube/**)",
+      "Edit(~/.kube/**)",
+      "Write(~/.config/gcloud/**)",
+      "Edit(~/.config/gcloud/**)",
+      "Write(~/.gitconfig)",
+      "Edit(~/.gitconfig)",
+      "Write(~/.npmrc)",
+      "Edit(~/.npmrc)",
+      "Write(~/.pypirc)",
+      "Edit(~/.pypirc)",
+      "Write(~/.docker/config.json)",
+      "Edit(~/.docker/config.json)",
+      "Write(~/.netrc)",
+      "Edit(~/.netrc)",
+      "Write(~/.config/gh/**)",
+      "Edit(~/.config/gh/**)",
+      "Write(~/.bashrc)",
+      "Edit(~/.bashrc)",
+      "Write(~/.zshrc)",
+      "Edit(~/.zshrc)",
+      "Write(~/.profile)",
+      "Edit(~/.profile)",
+      "Write(~/.bash_profile)",
+      "Edit(~/.bash_profile)",
+      "Write(~/.zprofile)",
+      "Edit(~/.zprofile)",
+      "Write(~/.zshenv)",
+      "Edit(~/.zshenv)",
       "Bash(sudo *)",
       "Bash(rm -rf /)",
-      "Bash(docker push *)",
+      "Bash(git push --force*)",
+      "Bash(git push * --force*)",
+      "Bash(git push -f)",
+      "Bash(git push -f *)",
+      "Bash(git push * -f)",
+      "Bash(git push * -f *)",
       "Bash(git commit --no-verify *)",
-      "Bash(git commit -n *)"
+      "Bash(git commit -n *)",
+      "Bash(docker push *)"
     ]
   },
   "sandbox": {
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
-    "excludedCommands": ["ssh:*", "scp:*", "rsync:*", "devbox:*", "nix:*", "git:*", "gpg:*", "gpg-agent:*", "gh:*", "npx:*", "npm:*", "node:*", "make:*", "tmux:*", "jq:*", "openssl:*"],
+    "excludedCommands": [
+      "ssh:*",
+      "scp:*",
+      "rsync:*",
+      "devbox:*",
+      "nix:*",
+      "git:*",
+      "gpg:*",
+      "gpg-agent:*",
+      "gh:*",
+      "npx:*",
+      "npm:*",
+      "node:*",
+      "make:*",
+      "tmux:*",
+      "jq:*",
+      "openssl:*",
+      "grep:*",
+      "rg:*",
+      "find:*",
+      "head:*",
+      "tail:*",
+      "cat:*",
+      "ls:*",
+      "wc:*",
+      "sort:*",
+      "awk:*",
+      "sed:*",
+      "diff:*",
+      "which:*",
+      "bash:*",
+      "sh:*",
+      "xargs:*",
+      "mkdir:*",
+      "cp:*",
+      "touch:*"
+    ],
     "network": {
-      "allowedDomains": ["*"]
+      "allowedDomains": [
+        "*"
+      ]
     },
     "filesystem": {
       "allowWrite": [
@@ -58,6 +155,9 @@
         "~/.aws",
         "~/.kube",
         "~/.config/gcloud"
+      ],
+      "allowRead": [
+        "/proc/self/fd"
       ]
     }
   },
@@ -97,6 +197,15 @@
             "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-auditor-never-acts.sh"
+          }
+        ]
       }
     ],
     "SessionStart": [
@@ -116,6 +225,14 @@
             "type": "command",
             "command": "echo 'Post-compaction reminder: ESM-only TypeScript project (.js import extensions). Use devbox — do not install on host. Makefile (dev.mk) is primary dev interface. Run make -f dev.mk check before finishing.'",
             "timeout": 5000
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-channels-enabled.sh"
           }
         ]
       }

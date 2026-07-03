@@ -80,18 +80,22 @@ export MACF_HOST="0.0.0.0"
 export MACF_ADVERTISE_HOST="orzech-dev-agents.tail491af.ts.net"
 export MACF_DEBUG="${MACF_DEBUG:-false}"
 
-# macf#632: the channel-server's native log path — its forensic trail. The
+# macf#642: the channel-server's native log path — its forensic trail. The
 # comms-ledger + turn-receipt sink are siblings derived from it, and the
-# channel-server reads MACF_LOG_PATH via @groundnuty/macf-core config. For a
-# fully macf-init'd workspace env.certs already exports this (sourced above),
-# so the ${VAR:-default} form preserves that value and only supplies a
-# default for an older/partial workspace whose env.certs predates the var.
-export MACF_LOG_PATH="${MACF_LOG_PATH:-$SCRIPT_DIR/.claude/.macf/channel.log}"
+# channel-server reads MACF_LOG_PATH via @groundnuty/macf-core config. The
+# whole cluster lives in the agent HOME under the XDG state dir (per-agent
+# <project>@<agent> subdir, matching the forensic-log default base + the
+# tmux session name) — OUT of the repo so it never clutters or is committed.
+# For a fully macf-init'd workspace env.certs already exports this (sourced
+# above) to the SAME path, so the ${VAR:-default} form preserves it and only
+# supplies the default for an older/partial workspace whose env.certs
+# predates the var.
+export MACF_LOG_PATH="${MACF_LOG_PATH:-${XDG_STATE_HOME:-$HOME/.local/state}/macf/macf@code-agent/channel.log}"
 
 # Tmux self-wrap (macf#313 Path-2 promotion of coordination.md
 # §Canonical tmux launch pattern). If launched outside tmux and the
 # operator hasn't opted out, re-exec inside a tmux session named
-# <MACF_PROJECT>@<MACF_AGENT_NAME>. Attach if the session exists;
+# <MACF_PROJECT>@<MACF_ROUTING_LABEL>. Attach if the session exists;
 # otherwise create a new one. The second invocation (inside tmux)
 # has $TMUX set and skips the wrap.
 #
@@ -100,7 +104,7 @@ export MACF_LOG_PATH="${MACF_LOG_PATH:-$SCRIPT_DIR/.claude/.macf/channel.log}"
 # initialized from the SERVER'S GLOBAL env (set once at server
 # start), NOT the calling shell's env. So a second `./claude.sh`
 # from a different workspace would inherit the FIRST agent's
-# MACF_AGENT_NAME from server-global — `${VAR:-default}` shortcut
+# MACF_ROUTING_LABEL from server-global — `${VAR:-default}` shortcut
 # preserves the leaked value, causing AGENT_COLLISION on register.
 # The `-e VAR=VAL` flags built from MACF_TMUX_PASSTHROUGH below pin
 # session-level env that overrides server-global, ensuring this
@@ -113,7 +117,7 @@ export MACF_LOG_PATH="${MACF_LOG_PATH:-$SCRIPT_DIR/.claude/.macf/channel.log}"
 #   For operator-driven manual launches outside tmux, debug sessions,
 #   single-shot CLI use, CI environments.
 if [ -z "${TMUX:-}" ] && [ "${MACF_NO_TMUX_WRAP:-}" != "1" ]; then
-  SESSION_NAME="${MACF_PROJECT}@${MACF_AGENT_NAME}"
+  SESSION_NAME="${MACF_PROJECT}@${MACF_ROUTING_LABEL}"
   if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
     exec tmux attach -t "$SESSION_NAME"
   else
@@ -174,6 +178,19 @@ else
   echo "WARNING: (or its version was unparseable) — MACF channel notifications are" >&2
   echo "WARNING: UNAVAILABLE this session; routed issues/PRs/mentions will be SILENTLY" >&2
   echo "WARNING: dropped. Update Claude Code to >= 2.1.80 to enable them (macf#632/#633)." >&2
+fi
+
+# Interactive-prompt auto-responder (macf#645 / DR-033). Start the pane
+# watcher in the background so it can auto-clear KNOWN launch ceremony
+# prompts (allowlist-only; unknown prompt-like frames are ALERTed, never
+# answered — Inv 1) during the startup window. Only runs in-tmux (a
+# deterministic $TMUX_PANE to watch); survives the claude launch below as a
+# separate process and self-exits when the window elapses. Opt-out:
+# MACF_PROMPT_AUTORESPOND_DISABLED=1 (sister to MACF_OTEL_DISABLED).
+if [ "${MACF_PROMPT_AUTORESPOND_DISABLED:-}" != "1" ] \
+   && [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] \
+   && [ -x "$SCRIPT_DIR/.claude/scripts/macf-prompt-watcher.sh" ]; then
+  "$SCRIPT_DIR/.claude/scripts/macf-prompt-watcher.sh" "$TMUX_PANE" &
 fi
 
 # shellcheck disable=SC2086
