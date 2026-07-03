@@ -1,7 +1,7 @@
 # DR-040: Canonical-vs-agent-evolution reconciliation on fleet upgrade
 
-**Status:** Proposed
-**Date:** 2026-07-02
+**Status:** Accepted (ratified by operator 2026-07-03; see PR #748)
+**Date:** 2026-07-02 (ratified 2026-07-03)
 **Trigger:** Rolling the fleet onto v0.2.48 (operator-driven, 2026-07-02) surfaced the general problem: `macf fleet upgrade` must run `macf update`, which overwrites the agent's macf-managed config (`CLAUDE.md`, `claude.sh`, `.claude/settings.json`, `.claude/rules/*.md`) — but agents **mutate those files as they operate**, and that mutation is not noise: it is the framework's intended self-evolution. Overwriting it silently destroys agent contributions; refusing to upgrade when it is present strands the agent on a stale version. The config-dirty guard (DR-037 Amendment B, `macf#722`) correctly *objects* rather than clobbering, but leaves the operator to manually stash/commit/resolve per agent, per file — the operator was hand-relaying the guard's messages during the v0.2.48 roll. This DR defines the boundary between plugin-delivered (canonical, tamper-resistant) content and the irreducible agent-editable set, and a **safe, agent-driven, operator-hands-off reconciliation protocol** for the latter. Operator-directed (2026-07-02 brainstorm); code-agent researched feasibility + drafts this proposal; science authors/ratifies; devops reviews the supervision/cron-facing primitives.
 
 ## Context — two forces in tension
@@ -112,7 +112,7 @@ The reconcile (Decision 3 step 4) is the agent deciding what of its local evolut
 - **✅ Tier-check canonical-compute (science owner-refinement):** needs a no-mutate compute mode; generated files (`claude.sh`) require generate-to-temp + diff, not fetch-and-diff. → Decision 3 step 1.
 - **✅ Step-4 conflict-handling (science owner-refinement):** hunk-level keep-vs-canonical judgment on `stash pop` conflict; resolve or HALT. → Decision 3 step 4.
 
-**Status: design complete + endorsed by both reviewers (science as DR owner, devops on the cron/guard primitives). Ratification (Proposed → Accepted) is the operator's call.**
+**Status: ACCEPTED — ratified by operator 2026-07-03.** Design endorsed by both reviewers (science as DR owner, devops on the cron/guard primitives). Implementation slices unlocked: Q1 (hook scripts → plugin) already merged (`#749`); next = devops's maintenance-lock (`macf-devops-toolkit#158`), the config-dirty guard precision (Decision 6 / Q2), then the reconcile protocol.
 
 ## Reviewers
 
