@@ -1427,3 +1427,100 @@ export function installGhTokenHook(workspaceDir: string): void {
   const updated = applyGhTokenHookTransform(settings, delivery);
   writeFileSync(path, JSON.stringify(updated, null, 2) + '\n');
 }
+
+/**
+ * Canonical role-aware SessionStart work-pickup hook command
+ * (groundnuty/macf#768). Canonicalizes the "check pending issues at session
+ * start, then nudge yourself to pick them up" behavior agents had
+ * previously hand-rolled (with duplicated `gh issue list` logic + a buggy
+ * single-`Enter` tmux submit) in their gitignored `settings.local.json`.
+ *
+ * THIN BY DESIGN: the hook script does NOT hand-roll a GitHub query — it
+ * delegates the entire queue-discovery + inbox-drain + coordination.md
+ * §Communication 5 sweep-injection to the plugin's OWN `issues` command (the
+ * exact command backing the `/macf-issues` skill; see
+ * `plugin/skills/macf-issues/SKILL.md`), which already mints its own fresh
+ * token via the refresh-aware client (macf#338). Only the SUBMIT step is
+ * bash — the Claude Code TUI's multi-line-input Enter quirk has no
+ * non-bash equivalent — and it goes through the sanctioned
+ * `tmux-send-to-claude.sh` 2-step-Enter helper, never an inline
+ * `tmux send-keys ... Enter` (which silently fails to submit).
+ *
+ * ROLE-AWARE DEFAULT (DR-026): auto-pickup defaults ON for every actuator
+ * role (code/science/devops/writing + the exp-* variants) and OFF for the
+ * auditor — the auditor is a propose-only sensor/discussant, never an
+ * actuator, and auto-submitting a work-pickup turn would make it act (see
+ * `startupPickupAutoResumesByDefault` in role-settings-model.ts). The
+ * default is enforced by the SCRIPT reading `MACF_AGENT_ROLE` at runtime
+ * (exported by claude.sh / env-files.ts) rather than by conditionally
+ * omitting this settings.json entry at generation time: `macf rules
+ * refresh` (the hand-wired-substrate distribution path this hook ALSO ships
+ * through, alongside `macf init` / `macf update` — see `rules-refresh.ts`,
+ * which has no `.macf/macf-agent.json` / role to read at all) has no
+ * workspace-role information available at write time. So the entry is
+ * written unconditionally for every workspace/role, mirroring
+ * `check-auditor-never-acts.sh`'s own "distribute everywhere, gate at
+ * runtime" shape.
+ *
+ * Runs on the `SessionStart` event (matcher-less). OBSERVATIONAL (deposits
+ * the plugin's own issues-command output into the agent's context) +
+ * NON-BLOCKING (the script ALWAYS exits 0 — a missing plugin mount, a query
+ * error, or any internal fault fails open) so it can never delay or block a
+ * session. Override: `MACF_NO_STARTUP_PICKUP=1` (family: `MACF_NO_TMUX_WRAP`
+ * / `MACF_OTEL_DISABLED`).
+ */
+export const MACF_STARTUP_PICKUP_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/macf-startup-pickup.sh';
+
+const STARTUP_PICKUP_HOOK_FILENAME = 'macf-startup-pickup.sh';
+
+/** True iff `command` invokes the startup-pickup hook script (basename match, path-agnostic). */
+function isStartupPickupHookCommand(command: string): boolean {
+  return basenameOfCommand(command) === STARTUP_PICKUP_HOOK_FILENAME;
+}
+
+/**
+ * Pure transform: install (or refresh) the SessionStart work-pickup hook
+ * entry. Exported (mirrors the DR-040 Decision 3 pattern the other
+ * merge-preserving settings.json writers use) so the canonical-compute
+ * tier-check can apply this SAME logic in-memory (without writing).
+ * Preserves every other SessionStart entry verbatim — operator-authored
+ * hooks AND the sibling `check-channels-enabled.sh` MACF entry
+ * `installGhTokenHook` writes — identified ONLY by a basename match on
+ * `macf-startup-pickup.sh`, never by clearing the array.
+ */
+export function applyStartupPickupHookTransform(settings: Settings): Settings {
+  const hooks = settings.hooks ?? {};
+  const sessionStart = hooks.SessionStart ?? [];
+  const preserved = sessionStart.filter(
+    (entry) => !entry.hooks.some((h) => isStartupPickupHookCommand(h.command)),
+  );
+  const macfEntries: readonly HookEntry[] = [
+    { hooks: [{ type: 'command', command: MACF_STARTUP_PICKUP_HOOK_COMMAND }] },
+  ];
+  return {
+    ...settings,
+    hooks: {
+      ...hooks,
+      SessionStart: [...preserved, ...macfEntries],
+    },
+  };
+}
+
+/**
+ * Install (or refresh) the canonical SessionStart work-pickup hook entry in
+ * `.claude/settings.json` (merge-preserving, DR-026/macf#768). Creates the
+ * `.claude/` directory + settings.json if missing. Idempotent: repeated
+ * calls don't duplicate entries (basename-matched refresh, see
+ * `applyStartupPickupHookTransform`).
+ */
+export function installStartupPickupHook(workspaceDir: string): void {
+  const absDir = resolve(workspaceDir);
+  const claudeDir = join(absDir, '.claude');
+  const path = join(claudeDir, 'settings.json');
+
+  mkdirSync(claudeDir, { recursive: true });
+
+  const settings = readSettings(path);
+  const updated = applyStartupPickupHookTransform(settings);
+  writeFileSync(path, JSON.stringify(updated, null, 2) + '\n');
+}

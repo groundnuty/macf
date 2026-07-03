@@ -48,7 +48,7 @@ import { copyCanonicalRules, copyCanonicalScripts, findCliPackageRoot } from '..
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
-import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
+import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
 import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion, linkPluginCliDist } from '../plugin-fetcher.js';
 import { writeClaudeSh, hasManagedHeader } from '../claude-sh.js';
@@ -304,6 +304,12 @@ export async function update(
   // if the CLI changes its form across releases.
   installGhTokenHook(projectDir);
   console.log(`Refreshed gh-token guard hook in .claude/settings.json`);
+
+  // Refresh the canonical role-aware SessionStart work-pickup hook entry
+  // (merge-preserving, DR-026/macf#768). Written for every role — the
+  // auditor's default-OFF gate is enforced by the script at runtime.
+  installStartupPickupHook(projectDir);
+  console.log(`Refreshed SessionStart work-pickup hook in .claude/settings.json`);
 
   // Refresh macf-agent plugin-skill pre-approvals. Picks up new skills
   // added by newer CLI versions + drops any stale patterns pointing

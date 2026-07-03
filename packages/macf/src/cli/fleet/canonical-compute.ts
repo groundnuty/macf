@@ -33,16 +33,16 @@
  *   preserved verbatim and NEVER canonical-computable, so a dirty
  *   header-less claude.sh is always `genuine-delta` here too.
  * - `.claude/settings.json` — NOT a standalone regenerate-from-scratch
- *   file: `installGhTokenHook` / `installPluginSkillPermissions` /
- *   `installSandboxFdAllowRead` / `installSandboxExcludedCommands` all
- *   READ the current file and MERGE canonical entries in. "Already
- *   canonical" for this file means applying those 4 transforms to the
- *   CURRENT parsed object is a NO-OP (a fixed point) — see
- *   `classifySettingsJson` below. Because the merge is order- and
- *   key-position-sensitive on write but not semantically, the comparison
- *   is done at the PARSED-OBJECT level (deep-equal, sorted-key stable
- *   stringify), never a byte/string compare — a byte compare would be
- *   fragile to inconsequential key-reordering.
+ *   file: `installGhTokenHook` / `installStartupPickupHook` /
+ *   `installPluginSkillPermissions` / `installSandboxFdAllowRead` /
+ *   `installSandboxExcludedCommands` all READ the current file and MERGE
+ *   canonical entries in. "Already canonical" for this file means applying
+ *   those 5 transforms to the CURRENT parsed object is a NO-OP (a fixed
+ *   point) — see `classifySettingsJson` below. Because the merge is order-
+ *   and key-position-sensitive on write but not semantically, the
+ *   comparison is done at the PARSED-OBJECT level (deep-equal, sorted-key
+ *   stable stringify), never a byte/string compare — a byte compare would
+ *   be fragile to inconsequential key-reordering.
  * - `CLAUDE.md`, `env.local.*` (any directory) — `macf update` NEVER
  *   writes these (verified: no write path in any CLI command for
  *   CLAUDE.md; `env.local.*` is the operator-extension slot sourced but
@@ -71,6 +71,7 @@ import {
   readSettings,
   canPluginDeliverMigratedHooks,
   applyGhTokenHookTransform,
+  applyStartupPickupHookTransform,
   applyPluginSkillPermissionsTransform,
   applySandboxFdAllowReadTransform,
   applySandboxExcludedCommandsTransform,
@@ -196,11 +197,15 @@ export function computeCanonicalContent(
   return { managed: false };
 }
 
-/** Apply the 4 settings.json merge transforms, in the exact order `update.ts` calls the installXxx writers. */
+/** Apply the 5 settings.json merge transforms, in the exact order `update.ts` calls the installXxx writers. */
 function applyAllSettingsTransforms(settings: Settings, workspaceDir: string): Settings {
   const delivery = canPluginDeliverMigratedHooks(workspaceDir);
   let out: Settings = settings;
   out = applyGhTokenHookTransform(out, delivery);
+  // groundnuty/macf#768: the canonical SessionStart work-pickup hook —
+  // `update.ts` calls `installStartupPickupHook` right after
+  // `installGhTokenHook`, so this transform is applied in the same spot.
+  out = applyStartupPickupHookTransform(out);
   out = applyPluginSkillPermissionsTransform(out);
   out = applySandboxFdAllowReadTransform(out);
   out = applySandboxExcludedCommandsTransform(out);

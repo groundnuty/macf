@@ -22,7 +22,7 @@ import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
-import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
+import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 
 export interface RulesRefreshResult {
   readonly rules: readonly string[];
@@ -81,6 +81,13 @@ export function rulesRefresh(targetDir: string): RulesRefreshResult {
   // etc.) in sync with the same structural guard as macf-init'd agents.
   installGhTokenHook(targetDir);
 
+  // Refresh the canonical role-aware SessionStart work-pickup hook entry
+  // (merge-preserving, DR-026/macf#768). No role is knowable in this
+  // non-init'd path (no `.macf/macf-agent.json`), so the entry is written
+  // unconditionally like the hooks above — the auditor's default-OFF gate
+  // is enforced by the script itself reading `MACF_AGENT_ROLE` at runtime.
+  installStartupPickupHook(targetDir);
+
   // Pre-approve macf-agent plugin skills so SessionStart auto-pickup
   // + /macf-status / /macf-issues don't hit interactive approval
   // dialogs. See macf#189 sub-item 2.
@@ -109,6 +116,7 @@ export function rulesRefresh(targetDir: string): RulesRefreshResult {
   }
 
   console.log('Refreshed gh-token guard hook in .claude/settings.json');
+  console.log('Refreshed SessionStart work-pickup hook in .claude/settings.json');
 
   reportSeedPromptResponses(promptResponses);
   reportSeedStallSignatures(stallSignatures);

@@ -36,6 +36,7 @@ import {
   MACF_AUDITOR_HOOK_COMMAND,
   MACF_TURN_RECEIPT_HOOK_COMMAND,
   MACF_CHANNELS_HOOK_COMMAND,
+  MACF_STARTUP_PICKUP_HOOK_COMMAND,
   ROLE_FLOOR_ALLOW,
   ROLE_FLOOR_DENY,
 } from './settings-writer.js';
@@ -69,6 +70,13 @@ export { ROLE_FLOOR_ALLOW, ROLE_FLOOR_DENY };
 export const ROLE_FLOOR_HOOKS: readonly ExpectedHook[] = [
   { event: 'UserPromptSubmit', command: MACF_TURN_RECEIPT_HOOK_COMMAND, required: false },
   { event: 'SessionStart', command: MACF_CHANNELS_HOOK_COMMAND, required: false },
+  // groundnuty/macf#768: written for every role (including the auditor) —
+  // `installStartupPickupHook` has no per-role branch, matching this floor
+  // entry. The auditor's DR-026 "never auto-resumes" default is enforced by
+  // the hook SCRIPT reading `MACF_AGENT_ROLE` at runtime, not by omitting
+  // this expected-settings entry — see `startupPickupAutoResumesByDefault`
+  // below for the policy the script's runtime check mirrors.
+  { event: 'SessionStart', command: MACF_STARTUP_PICKUP_HOOK_COMMAND, required: false },
 ];
 
 /** Per-role additions beyond the floor (DR-028 §Decision 1, Per-role deltas). */
@@ -136,4 +144,24 @@ export function expectedHooksForRole(role: string): readonly ExpectedHook[] {
 export function expectedAllowForRole(role: string): readonly string[] {
   const delta = ROLE_SETTINGS_DELTAS[role];
   return delta?.allow ? [...ROLE_FLOOR_ALLOW, ...delta.allow] : ROLE_FLOOR_ALLOW;
+}
+
+/**
+ * DR-026: does `role` auto-resume via the canonical SessionStart work-pickup
+ * hook (`MACF_STARTUP_PICKUP_HOOK_COMMAND` / groundnuty/macf#768) by
+ * default? The auditor is a propose-only sensor/discussant, never an
+ * actuator — auto-submitting a work-pickup turn would make it act — so it is
+ * the sole default-OFF role; every other role (known or custom) defaults ON.
+ *
+ * This is the canonical statement of the policy `macf-startup-pickup.sh`
+ * enforces at runtime via its own `MACF_AGENT_ROLE` check (the script can't
+ * import this TS module — see `MACF_STARTUP_PICKUP_HOOK_COMMAND`'s doc
+ * comment for why the gate lives in the script, not in conditional
+ * settings.json generation). Kept here — not just duplicated in the script —
+ * so the policy is unit-testable and documented in the one place DR-028
+ * role-aware settings defaults already live; a lockstep test pins the two
+ * copies to the same 'auditor' sentinel.
+ */
+export function startupPickupAutoResumesByDefault(role: string): boolean {
+  return role !== 'auditor';
 }

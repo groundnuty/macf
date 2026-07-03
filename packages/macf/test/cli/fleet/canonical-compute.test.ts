@@ -24,6 +24,7 @@ import { generateClaudeSh } from '../../../src/cli/claude-sh.js';
 import {
   canPluginDeliverMigratedHooks,
   applyGhTokenHookTransform,
+  applyStartupPickupHookTransform,
   applyPluginSkillPermissionsTransform,
   applySandboxFdAllowReadTransform,
   applySandboxExcludedCommandsTransform,
@@ -297,6 +298,7 @@ describe('classifyDirtyFile', () => {
       const delivery = canPluginDeliverMigratedHooks(workspace);
       let fixedPoint: Settings = {};
       fixedPoint = applyGhTokenHookTransform(fixedPoint, delivery);
+      fixedPoint = applyStartupPickupHookTransform(fixedPoint);
       fixedPoint = applyPluginSkillPermissionsTransform(fixedPoint);
       fixedPoint = applySandboxFdAllowReadTransform(fixedPoint);
       fixedPoint = applySandboxExcludedCommandsTransform(fixedPoint);
@@ -314,6 +316,7 @@ describe('classifyDirtyFile', () => {
       const delivery = canPluginDeliverMigratedHooks(workspace);
       let fixedPoint: Settings = {};
       fixedPoint = applyGhTokenHookTransform(fixedPoint, delivery);
+      fixedPoint = applyStartupPickupHookTransform(fixedPoint);
       fixedPoint = applyPluginSkillPermissionsTransform(fixedPoint);
       fixedPoint = applySandboxFdAllowReadTransform(fixedPoint);
       fixedPoint = applySandboxExcludedCommandsTransform(fixedPoint);
