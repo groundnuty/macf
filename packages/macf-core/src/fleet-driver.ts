@@ -236,6 +236,48 @@ export interface FleetDriver {
    * on a diagnostic-only read).
    */
   readonly listModifiedFiles: (agent: string) => Promise<readonly string[]>;
+
+  /**
+   * SET the maintenance lock for `agent` (DR-040 Decision 4,
+   * macf-devops-toolkit#158/#159 — the canonical "upgrade ≠ outage" contract).
+   * Create/overwrite (atomic write; `started_at`/`heartbeat_at` both = now).
+   * `rollFleet` calls this at the TOP of its per-agent transaction, BEFORE
+   * `upgrade`/`restart` touch the agent's process, so a watchdog sweep racing
+   * the very first SIGTERM already reads "planned maintenance," never
+   * "unplanned outage." VM: a lock FILE under
+   * `$MACF_MAINT_LOCK_DIR/<agent>.lock` (same-directory tempfile + `rename`,
+   * atomic); K8s (future): a pod annotation / ConfigMap patch — same
+   * four-verb contract, different storage (the MAINTENANCE-LOCK.md
+   * decision/driver split).
+   */
+  readonly acquireLock: (agent: string, targetVersion: string) => Promise<void>;
+
+  /**
+   * RELEASE the maintenance lock for `agent` (idempotent — a no-op if none
+   * exists). `rollFleet` calls this ONLY on a confirmed clean GREEN roll — a
+   * HALTed roll deliberately LEAVES the lock in place (DR-040 Decision 3:
+   * the stale heartbeat is the crash-safety backstop, not an immediate
+   * release — see macf-devops-toolkit#158's "release ONLY on confirmed clean
+   * success"). Releasing on failure would hand a possibly-broken, mid-
+   * transition agent straight back to the watchdog's healing ladder the
+   * instant the roll fails — exactly the uncoordinated intervention the
+   * transactional halt exists to avoid.
+   */
+  readonly releaseLock: (agent: string) => Promise<void>;
+
+  /**
+   * Start a BACKGROUND heartbeat loop refreshing `agent`'s maintenance lock —
+   * decoupled from `rollFleet`'s foreground awaits, because `upgrade` /
+   * `restart` / `verifyGreen` can each individually take a while and the
+   * heartbeat must not stall behind whichever step is currently running.
+   * Returns a synchronous STOP handle the caller invokes exactly once, on
+   * EITHER terminal branch (green or halt) — never both, and never omitted.
+   * VM: a bounded interval (period well under `MAINT_LOCK_TTL`), itself
+   * dead-man's-switch-bounded by `MAINT_LOCK_HEARTBEAT_MAX_S` so an orphaned
+   * loop (e.g. its parent process killed before the stop handle ever runs)
+   * cannot refresh the lock forever.
+   */
+  readonly startHeartbeat: (agent: string) => () => void;
 }
 
 /**

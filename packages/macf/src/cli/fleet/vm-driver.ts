@@ -47,6 +47,13 @@ import { createClientFromConfig } from '../registry-helper.js';
 import { discoverWorkspaces } from '../discovery.js';
 import { gatherFleetStatus, type FleetProbeFn } from '../commands/fleet.js';
 import { classifyDirtyFile } from './canonical-compute.js';
+import {
+  acquireLock as acquireMaintenanceLock,
+  releaseLock as releaseMaintenanceLock,
+  resolveMaintenanceLockConfig,
+  startHeartbeatLoop,
+  type MaintenanceLockConfig,
+} from './maintenance-lock.js';
 
 /** Default `capture-pane` content-diff window for the busy gate (ms). */
 export const DEFAULT_BUSY_WINDOW_MS = 2000;
@@ -146,6 +153,15 @@ export interface VmDriverOptions {
   readonly macfBin?: string;
   /** The launcher basename spawned by `launch` (default `'claude.sh'`). */
   readonly launcher?: string;
+  /**
+   * Maintenance-lock config (DR-040 Decision 4, macf#752) — defaults to
+   * env-resolved (`resolveMaintenanceLockConfig()`) so production honors the
+   * SAME `MACF_MAINT_LOCK_*` env vars as `fleet/maintenance-lock.sh` (the
+   * bash reference this driver's lock format interops with —
+   * macf-devops-toolkit#158/#159). Overridable so tests point at an isolated
+   * tmp dir without mutating `process.env`.
+   */
+  readonly maintenanceLock?: MaintenanceLockConfig;
 }
 
 /**
@@ -203,6 +219,11 @@ export function resolveTarget(seams: VmDriverSeams, agent: string): ResolvedTarg
 export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): FleetDriver {
   const busyWindowMs = opts.busyWindowMs ?? DEFAULT_BUSY_WINDOW_MS;
   const macfBin = opts.macfBin ?? 'macf';
+  // DR-040 Decision 4 (macf#752) — resolved ONCE at driver-construction time.
+  // The lock keys directly on the agent's ROUTING LABEL (no workspace
+  // resolution needed, unlike upgrade/restart/inject) — matching the bash
+  // contract's `$MAINT_LOCK_DIR/<agent>.lock` shape exactly.
+  const lockConfig = opts.maintenanceLock ?? resolveMaintenanceLockConfig();
 
   /** Resolve or throw a `FleetDriverError` naming the unresolvable agent. */
   function requireTarget(agent: string): ResolvedTarget {
@@ -353,6 +374,24 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     seams.submit(session, text);
   }
 
+  // --- DR-040 Decision 4 (macf#752) — maintenance-lock SET-side verbs ---
+  // No workspace/session resolution needed: the lock keys directly on the
+  // agent's routing label, matching the bash contract exactly. Real fs I/O
+  // lives in `maintenance-lock.ts` (interop-verified against the bash
+  // reference); this is just the driver-level glue.
+
+  async function acquireLock(agent: string, targetVersion: string): Promise<void> {
+    acquireMaintenanceLock(lockConfig.dir, agent, targetVersion);
+  }
+
+  async function releaseLock(agent: string): Promise<void> {
+    releaseMaintenanceLock(lockConfig.dir, agent);
+  }
+
+  function startHeartbeat(agent: string): () => void {
+    return startHeartbeatLoop(lockConfig.dir, agent, lockConfig.heartbeatIntervalSec, lockConfig.heartbeatMaxS);
+  }
+
   return {
     probe,
     discoverWorkspaces: () => seams.discover(),
@@ -367,6 +406,9 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     inject,
     launch,
     listModifiedFiles,
+    acquireLock,
+    releaseLock,
+    startHeartbeat,
   };
 }
 

@@ -111,6 +111,13 @@ interface DriverCalls {
   restart: string[];
   restartLeaveUncommitted: string[];
   listModifiedFiles: string[];
+  /** DR-040 Decision 4 (macf#752) — maintenance-lock SET-side call log. */
+  acquireLock: { agent: string; target: string }[];
+  releaseLock: string[];
+  startHeartbeat: string[];
+  stopHeartbeat: string[];
+  /** A single ordered event log across ALL verbs (tagged `"<verb>:<agent>"`), for sequencing assertions. */
+  order: string[];
 }
 
 /**
@@ -145,6 +152,11 @@ function makeDriver(opts: {
     restart: [],
     restartLeaveUncommitted: [],
     listModifiedFiles: [],
+    acquireLock: [],
+    releaseLock: [],
+    startHeartbeat: [],
+    stopHeartbeat: [],
+    order: [],
   };
   const perAgent = new Map<string, number>();
   const driver: FleetDriver = {
@@ -181,13 +193,34 @@ function makeDriver(opts: {
     capturePane: async () => null,
     upgrade: async (agent) => {
       calls.upgrade.push(agent);
+      calls.order.push(`upgrade:${agent}`);
     },
     restart: async (agent, restartOpts) => {
       calls.restart.push(agent);
+      calls.order.push(`restart:${agent}`);
       if (restartOpts?.leaveConfigUncommitted) calls.restartLeaveUncommitted.push(agent);
     },
     inject: async () => {},
     launch: async () => {},
+    acquireLock: async (agent, target) => {
+      calls.acquireLock.push({ agent, target });
+      calls.order.push(`acquireLock:${agent}`);
+    },
+    releaseLock: async (agent) => {
+      calls.releaseLock.push(agent);
+      calls.order.push(`releaseLock:${agent}`);
+    },
+    startHeartbeat: (agent) => {
+      calls.startHeartbeat.push(agent);
+      calls.order.push(`startHeartbeat:${agent}`);
+      let stopped = false;
+      return () => {
+        if (stopped) return;
+        stopped = true;
+        calls.stopHeartbeat.push(agent);
+        calls.order.push(`stopHeartbeat:${agent}`);
+      };
+    },
     listModifiedFiles: async (agent) => {
       calls.listModifiedFiles.push(agent);
       return opts.modifiedFiles ? opts.modifiedFiles(agent) : [];
@@ -223,6 +256,11 @@ function makeTransactionalDriver(opts: {
     restart: [],
     restartLeaveUncommitted: [],
     listModifiedFiles: [],
+    acquireLock: [],
+    releaseLock: [],
+    startHeartbeat: [],
+    stopHeartbeat: [],
+    order: [],
   };
   const regenerated = opts.regeneratedFiles ?? ['.claude/rules/coordination.md'];
   // COUPLED STATE: which agents currently have dirty config — starts as
@@ -279,6 +317,25 @@ function makeTransactionalDriver(opts: {
     },
     inject: async () => {},
     launch: async () => {},
+    acquireLock: async (agent, target) => {
+      calls.acquireLock.push({ agent, target });
+      calls.order.push(`acquireLock:${agent}`);
+    },
+    releaseLock: async (agent) => {
+      calls.releaseLock.push(agent);
+      calls.order.push(`releaseLock:${agent}`);
+    },
+    startHeartbeat: (agent) => {
+      calls.startHeartbeat.push(agent);
+      calls.order.push(`startHeartbeat:${agent}`);
+      let stopped = false;
+      return () => {
+        if (stopped) return;
+        stopped = true;
+        calls.stopHeartbeat.push(agent);
+        calls.order.push(`stopHeartbeat:${agent}`);
+      };
+    },
     listModifiedFiles: async (agent) => {
       calls.listModifiedFiles.push(agent);
       return dirty.has(agent) ? regenerated : [];
@@ -396,6 +453,13 @@ describe('rollFleet', () => {
     expect(res.halted).toBe(false);
     expect(res.upgraded).toBe(2);
     expect(res.results.map((r) => r.outcome)).toEqual(['upgraded', 'upgraded']);
+    // DR-040 Decision 4 (macf#752) — every clean-green roll acquires +
+    // releases the maintenance lock exactly once per agent.
+    expect(calls.acquireLock).toEqual([
+      { agent: 'a1', target: '0.2.41' },
+      { agent: 'a2', target: '0.2.41' },
+    ]);
+    expect(calls.releaseLock).toEqual(['a1', 'a2']);
   });
 
   it('config-dirty PRE-FLIGHT gate: OBJECTS with the file list + message BEFORE any mutation, and continues (macf#725)', async () => {
@@ -418,6 +482,9 @@ describe('rollFleet', () => {
     expect(calls.upgrade).toEqual(['a2']);
     expect(calls.restart).toEqual(['a2']);
     expect(calls.isBusy).toEqual(['a2']); // a1's busy-gate never even runs
+    // a1 was pre-flight-gated BEFORE entering the transaction — the
+    // maintenance lock is never touched for it (macf#752).
+    expect(calls.acquireLock.map((c) => c.agent)).toEqual(['a2']);
     expect(res.halted).toBe(false);
     expect(res.configDirtySkipped).toBe(1);
     expect(res.upgraded).toBe(1);
@@ -564,6 +631,8 @@ describe('rollFleet', () => {
       ...noWait,
     });
     expect(calls.upgrade).toEqual(['a2']); // a1 never upgraded (busy)
+    // a1 was busy-gated BEFORE entering the transaction — never locked (macf#752).
+    expect(calls.acquireLock.map((c) => c.agent)).toEqual(['a2']);
     expect(res.busySkipped).toBe(1);
     expect(res.upgraded).toBe(1);
     expect(res.results.map((r) => [r.agent, r.outcome])).toEqual([
@@ -626,6 +695,10 @@ describe('rollFleet', () => {
     expect(res.results).toHaveLength(1);
     expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted', reason: 'bad-release' });
     expect(res.results[0]!.detail).toContain('bad-release');
+    // DR-040 Decision 3/4 (macf#752) — HALT stops the heartbeat but LEAVES
+    // the lock in place; it is never released on a halted roll.
+    expect(calls.stopHeartbeat).toEqual(['a1']);
+    expect(calls.releaseLock).toEqual([]);
   });
 
   it('HALTS with reason relaunch-unconfirmed when verify-green times out unreachable (down the whole grace) — later agents are NOT touched', async () => {
@@ -768,6 +841,78 @@ describe('rollFleet', () => {
     });
   });
 
+  describe('maintenance lock (DR-040 Decision 4, macf-devops-toolkit#158/#159, macf#752)', () => {
+    it('acquires BEFORE upgrade, keeps the heartbeat running through upgrade+restart, and releases ONLY on GREEN', async () => {
+      const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
+      const { verifyGreen } = makeVerify();
+      await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(calls.acquireLock).toEqual([
+        { agent: 'a1', target: '0.2.41' },
+        { agent: 'a2', target: '0.2.41' },
+      ]);
+      expect(calls.releaseLock).toEqual(['a1', 'a2']);
+      // Exact per-agent ordering: acquire → start-heartbeat → upgrade →
+      // restart → stop-heartbeat → release, for EACH agent in turn.
+      expect(calls.order).toEqual([
+        'acquireLock:a1',
+        'startHeartbeat:a1',
+        'upgrade:a1',
+        'restart:a1',
+        'stopHeartbeat:a1',
+        'releaseLock:a1',
+        'acquireLock:a2',
+        'startHeartbeat:a2',
+        'upgrade:a2',
+        'restart:a2',
+        'stopHeartbeat:a2',
+        'releaseLock:a2',
+      ]);
+    });
+
+    it('HALT stops the heartbeat but LEAVES the lock in place (DR-040 Decision 3) — releaseLock is never called for the halted agent', async () => {
+      const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'unreachable', lastVersion: null },
+      });
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.halted).toBe(true);
+      expect(calls.acquireLock).toEqual([{ agent: 'a1', target: '0.2.41' }]);
+      expect(calls.startHeartbeat).toEqual(['a1']);
+      expect(calls.stopHeartbeat).toEqual(['a1']); // the background loop IS stopped...
+      expect(calls.releaseLock).toEqual([]); // ...but the lock itself is NOT released
+      expect(calls.order).toEqual(['acquireLock:a1', 'startHeartbeat:a1', 'upgrade:a1', 'restart:a1', 'stopHeartbeat:a1']);
+      // a2 was never reached at all — no lock activity for it either.
+      expect(calls.acquireLock.some((c) => c.agent === 'a2')).toBe(false);
+    });
+
+    it('config-dirty-skip and busy-skip never touch the maintenance lock (the agent was never mutated)', async () => {
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        dirtyConfigFiles: (agent) => (agent === 'a1' ? ['CLAUDE.md'] : []),
+        busy: (agent) => agent === 'a2',
+      });
+      const { verifyGreen } = makeVerify();
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.results.map((r) => r.outcome)).toEqual(['config-dirty-skipped', 'busy-skipped']);
+      expect(calls.acquireLock).toEqual([]);
+      expect(calls.startHeartbeat).toEqual([]);
+      expect(calls.releaseLock).toEqual([]);
+    });
+  });
+
   it('ignores non-behind plans (at-target / offline) — no driver mutations', async () => {
     const plans = planFleetUpgrade(
       [mkWs('cur', 'g', null), mkWs('off', 'g', null)],
@@ -814,6 +959,10 @@ describe('upgradeFleets', () => {
     expect(calls.upgrade).toEqual([]);
     expect(calls.restart).toEqual([]);
     expect(calls.isBusy).toEqual([]);
+    // DR-040 Decision 4 (macf#752) — dry-run never calls `rollFleet` at all,
+    // so the maintenance lock is never touched.
+    expect(calls.acquireLock).toEqual([]);
+    expect(calls.startHeartbeat).toEqual([]);
     expect(calls.probe).toBe(1); // probed to build the plan
     expect(report.halted).toBe(false);
     expect(report.fleets[0]!.plans.map((p) => p.disposition)).toEqual(['behind']);

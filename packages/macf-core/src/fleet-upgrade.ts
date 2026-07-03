@@ -8,9 +8,9 @@
  * or a future K8s package). It NEVER touches `/proc`, tmux, `capture-pane`, or
  * kubectl — it drives entirely off the injected `FleetDriver` verbs
  * (`probe`/`discoverWorkspaces`/`isBusy`/`listDirtyConfig`/`upgrade`/`restart`/
- * `listModifiedFiles`) plus an injected `verifyGreen` runner, so the SAME
- * sequencer rolls a VM tmux fleet, a macOS host, and a far-future K8s deployment
- * by swapping only the driver.
+ * `listModifiedFiles`/`acquireLock`/`startHeartbeat`/`releaseLock`) plus an
+ * injected `verifyGreen` runner, so the SAME sequencer rolls a VM tmux fleet, a
+ * macOS host, and a far-future K8s deployment by swapping only the driver.
  *
  * The state machine (per fleet, one agent at a time):
  *
@@ -24,6 +24,13 @@
  *             Fix B: rather than silently stashing operator dirt, the roll
  *             OBJECTS and does NOTHING until the agent resolves it)
  *           busy-gate (driver.isBusy → busy ⇒ SKIP+REPORT, or `--wait` for idle)
+ *         → driver.acquireLock(agent, target)  // DR-040 Decision 4 (macf#752):
+ *             SET the maintenance lock BEFORE anything touches the agent, so a
+ *             watchdog sweep racing the restart reads "planned maintenance,"
+ *             never "unplanned outage." driver.startHeartbeat(agent) then
+ *             keeps it fresh across the whole transaction below (background,
+ *             decoupled from these awaits); its stop-handle fires exactly
+ *             once, on whichever terminal branch is reached.
  *         → driver.upgrade(agent)        // dirties the managed config surface —
  *                                        // this is EXPECTED, not a fault
  *         → driver.restart(agent, { leaveConfigUncommitted: true })
@@ -35,25 +42,35 @@
  *             each poll, over a relaunch-aware grace budget (`--verify-timeout`)
  *             → green on TARGET ⇒ driver.listModifiedFiles(agent) → emit an
  *               agent-directed "review + commit what macf update regenerated"
- *               message + list, THEN next agent (`upgraded`)
- *             → confirmed back on the OLD (pre-upgrade) version ⇒ HALT the
- *               roll, reason `bad-release` (a crash-loop / stuck-old-process
- *               release stalls at agent 1 and CANNOT brick the fleet)
+ *               message + list; stopHeartbeat() + driver.releaseLock(agent)
+ *               (DR-040 Decision 3 — release ONLY on confirmed clean success);
+ *               THEN next agent (`upgraded`)
+ *             → confirmed back on the OLD (pre-upgrade) version ⇒ stopHeartbeat()
+ *               WITHOUT releasing the lock, then HALT the roll, reason
+ *               `bad-release` (a crash-loop / stuck-old-process release stalls
+ *               at agent 1 and CANNOT brick the fleet)
  *             → past-grace still NOT confirmed green (down / unreachable /
- *               some other unknown version) ⇒ HALT the roll, reason
+ *               some other unknown version) ⇒ stopHeartbeat() WITHOUT
+ *               releasing the lock, then HALT the roll, reason
  *               `relaunch-unconfirmed` — this is NOT a continue: "not yet
  *               green" cannot distinguish a slow-but-fine relaunch from a
  *               release that crashes on startup (which never shows the old
  *               version either), so continuing past an unconfirmed agent
  *               would risk cascading a crash-on-start release across the
- *               fleet (macf#722 Fix A)
+ *               fleet (macf#722 Fix A). Both HALT paths deliberately LEAVE the
+ *               lock in place (DR-040 Decision 3) — it self-clears once its
+ *               heartbeat goes stale (`MAINT_LOCK_TTL`), giving the operator a
+ *               bounded grace window before the watchdog resumes automatic
+ *               action on a possibly-broken, mid-transition agent.
  *
  * Multi-fleet (`--fleet a,b,c`) rolls fleet-by-fleet: each fleet's roll must
  * finish without a HALT before the next fleet starts (a bad release in fleet-1
  * stops fleet-2 from ever being touched).
  *
  * DRY-RUN is the default at the command boundary: `execute: false` computes +
- * reports the PLAN (probe + classify) and performs NO driver mutations.
+ * reports the PLAN (probe + classify) and performs NO driver mutations —
+ * `rollFleet` (and therefore the maintenance lock) is never even called on
+ * that path; `upgradeFleets` only invokes it when `execute: true`.
  *
  * **Reconcile is MANUAL this iteration (macf#725).** The config-dirty OBJECT
  * path surfaces the dirt via `onEvent` + a non-mutating skip; it does NOT
@@ -593,6 +610,15 @@ export async function rollFleet(
 
     // --- ENTERING THE TRANSACTION: upgrade + restart run together, always. ---
     deps.onEvent?.({ kind: 'roll-start', agent, from: plan.runningVersion, to: opts.targetVersion });
+    // DR-040 Decision 4 (macf-devops-toolkit#158/#159, macf#752) — SET the
+    // maintenance lock BEFORE anything touches the agent's process, so a
+    // watchdog sweep racing the very first SIGTERM already reads "planned
+    // maintenance," never "unplanned outage." The background heartbeat keeps
+    // the lock fresh across the WHOLE transaction below (upgrade → restart →
+    // verify-green can each individually take a while); `stopHeartbeat` is
+    // invoked exactly once, on whichever terminal branch is reached.
+    await deps.driver.acquireLock(agent, opts.targetVersion);
+    const stopHeartbeat = deps.driver.startHeartbeat(agent);
     await deps.driver.upgrade(agent);
     // The pre-flight gate above (clean, or explicitly `--force`-bypassed) is
     // the only thing that decided whether to enter this transaction. Once
@@ -618,6 +644,10 @@ export async function rollFleet(
         ...(autoResolvedFiles ? { autoResolvedFiles } : {}),
       });
       deps.onEvent?.({ kind: 'upgraded', agent, version: green.version, modifiedFiles, message });
+      // Clean GREEN is the ONLY release path (DR-040 Decision 3) — hand the
+      // agent back to normal watchdog reconciliation immediately.
+      stopHeartbeat();
+      await deps.driver.releaseLock(agent);
       continue;
     }
 
@@ -630,6 +660,15 @@ export async function rollFleet(
       ...(autoResolvedFiles ? { autoResolvedFiles } : {}),
     });
     deps.onEvent?.({ kind: 'halt', agent, reason, lastVersion: green.lastVersion });
+    // HALT deliberately LEAVES the lock in place (DR-040 Decision 3): a
+    // possibly-broken, mid-transition agent must NOT be handed straight back
+    // to the watchdog's Tier-1/2/3 healing ladder the instant the roll fails
+    // — that is exactly the uncoordinated, racing intervention the
+    // transactional halt exists to avoid. Only the background heartbeat is
+    // stopped here; the lock self-clears once its heartbeat goes stale
+    // (MAINT_LOCK_TTL), giving the operator a bounded grace window to
+    // inspect the halted roll before the watchdog resumes automatic action.
+    stopHeartbeat();
     return { results, halted: true, upgraded, busySkipped, configDirtySkipped, configAutoResolved };
   }
 

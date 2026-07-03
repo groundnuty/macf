@@ -90,6 +90,9 @@ function makeDriver(
     inject: async () => {},
     launch: async () => {},
     listModifiedFiles: async () => [],
+    acquireLock: async () => {},
+    releaseLock: async () => {},
+    startHeartbeat: () => () => {},
   };
   return { driver, calls, workspaces };
 }
@@ -252,6 +255,9 @@ describe('runFleetUpgrade', () => {
       inject: async () => {},
       launch: async () => {},
       listModifiedFiles: async () => [],
+      acquireLock: async () => {},
+      releaseLock: async () => {},
+      startHeartbeat: () => () => {},
     };
     const { deps } = makeDeps({
       discover: () => [mkWs('a', 'fleet-1', '0.2.40')],
@@ -341,6 +347,9 @@ describe('runFleetUpgrade', () => {
         inject: async () => {},
         launch: async () => {},
         listModifiedFiles: async () => [],
+        acquireLock: async () => {},
+        releaseLock: async () => {},
+        startHeartbeat: () => () => {},
       };
       return { driver, calls };
     }
