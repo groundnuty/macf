@@ -330,7 +330,15 @@ const MIGRATED_HOOK_FILENAMES: readonly string[] = [
  * and `isMigratedHookCommand` (the 7-name migrated subset) so both matchers
  * apply the identical path-end-equality discriminator.
  */
-function basenameOfCommand(command: string): string {
+function basenameOfCommand(command: string | undefined): string {
+  // A hook entry need not have a `command` — a `type: "mcp_tool"` hook (e.g. a
+  // hand-wired PreCompact `checkpoint_to_memory`) has `server`/`tool`/`input`
+  // and NO `command`. Every caller passes `hook.command`, which the settings
+  // shape types as `string` but is `undefined` at runtime for those entries.
+  // Guard here (the shared chokepoint) so the DR-039 hook-strip migration
+  // treats a non-command hook as "not a managed command" (never stripped)
+  // rather than crashing on `undefined.trim()` (groundnuty/macf#757).
+  if (typeof command !== 'string') return '';
   const program = command.trim().split(/\s+/)[0] ?? '';
   const slash = program.lastIndexOf('/');
   return slash >= 0 ? program.slice(slash + 1) : program;
@@ -343,7 +351,7 @@ function basenameOfCommand(command: string): string {
  * operator-authored commands that happen to contain our filename as a
  * substring (e.g. `./my-check-gh-token.sh-wrapper --flag`).
  */
-function isMacfManagedCommand(command: string): boolean {
+function isMacfManagedCommand(command: string | undefined): boolean {
   return MACF_HOOK_FILENAMES.includes(basenameOfCommand(command));
 }
 
@@ -354,7 +362,7 @@ function isMacfManagedCommand(command: string): boolean {
  * the plugin can deliver" entries from the 3 hand-wired hooks that are
  * always stripped-then-replaced unconditionally.
  */
-function isMigratedHookCommand(command: string): boolean {
+function isMigratedHookCommand(command: string | undefined): boolean {
   return MIGRATED_HOOK_FILENAMES.includes(basenameOfCommand(command));
 }
 
@@ -1302,7 +1310,7 @@ export function applyGhTokenHookTransform(settings: Settings, delivery: PluginDe
   // MIGRATED_HOOK_FILENAMES) when the effective loaded plugin can actually
   // deliver the full set. The 3 hand-wired filenames are always eligible for
   // strip-then-replace regardless of plugin-delivery capability.
-  const shouldStrip = (command: string): boolean => {
+  const shouldStrip = (command: string | undefined): boolean => {
     if (!isMacfManagedCommand(command)) return false;
     if (isMigratedHookCommand(command)) return delivery.canDeliver;
     return true;

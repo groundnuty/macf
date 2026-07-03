@@ -525,6 +525,40 @@ describe('installGhTokenHook — DR-039 Decision 2 migration cleanup', () => {
     expect(cmds).toContain('echo edited');
   });
 
+  it('does NOT crash on a type:mcp_tool hook (no command field) and preserves it (groundnuty/macf#757)', () => {
+    // A `type: "mcp_tool"` hook (e.g. a hand-wired PreCompact
+    // `checkpoint_to_memory` — the exact shape on macf-devops-agent) has
+    // server/tool/input and NO `command`. The DR-039 strip iterates every
+    // hook calling the command-matchers, which used to `basenameOfCommand
+    // (undefined).trim()` → "Cannot read properties of undefined (reading
+    // 'trim')" → `macf update` crashed mid-fleet-roll. It must be treated as
+    // a non-command hook (never stripped), not crash.
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        PreCompact: [
+          { hooks: [{ type: 'mcp_tool', server: 'macf-agent', tool: 'checkpoint_to_memory', input: {}, timeout: 60 }] },
+        ],
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'command', command: '.claude/scripts/check-gh-token.sh' }] },
+        ],
+      },
+    }, null, 2));
+
+    // Must not throw.
+    expect(() => installGhTokenHook(tmpRoot)).not.toThrow();
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    // The mcp_tool hook is preserved verbatim (not a managed COMMAND hook).
+    const preCompact = s.hooks.PreCompact.flatMap((e: { hooks: unknown[] }) => e.hooks);
+    expect(preCompact).toContainEqual(
+      expect.objectContaining({ type: 'mcp_tool', tool: 'checkpoint_to_memory' }),
+    );
+    // The genuine command-hook strip still worked alongside it.
+    const preTool = s.hooks.PreToolUse.flatMap((e: { hooks: { command?: string }[] }) => e.hooks.map((h) => h.command));
+    expect(preTool.some((c: string | undefined) => c?.includes('check-gh-token.sh'))).toBe(false);
+  });
+
   it('strips a legacy PostToolUse check-gh-attribution.sh entry without re-adding it', () => {
     mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
     writeFileSync(settingsPath, JSON.stringify({
