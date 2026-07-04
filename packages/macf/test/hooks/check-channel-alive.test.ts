@@ -28,6 +28,15 @@ import { findCliPackageRoot } from '../../src/cli/rules.js';
 
 const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'check-channel-alive.sh');
 
+/** One stubbed curl response: either a `fail` (connection failure, exit 7,
+ * mirrors what a real refused/timeout/TLS-error curl invocation does) or an
+ * HTTP code + body. */
+interface CurlResponseSpec {
+  readonly httpCode?: string;
+  readonly body?: string;
+  readonly fail?: boolean;
+}
+
 /**
  * Spawn a long-lived, real OS process whose pid stays alive for the
  * duration of a test AND whose `/proc/<pid>/cmdline` contains
@@ -114,36 +123,55 @@ const DEAD_PID = 2147480000;
  * Build a directory with a stub `curl` shim that mimics
  * `curl -sS -o <file> -w '%{http_code}' -m <t> --cacert ... --cert ... --key ... <url>`:
  * writes `body` to the `-o` target (if any) and prints `httpCode` to stdout
- * (curl's `-w` behavior, no trailing newline). When `fail` is set (and no
- * `portOverrides` given — see below), exits non-zero without printing
- * anything (simulates connection refused/timeout/TLS failure — real curl
- * prints "000" in that case too, which the hook's `|| echo "000"` fallback
- * also covers).
+ * (curl's `-w` behavior, no trailing newline). When `fail` is set, exits
+ * non-zero without printing anything (simulates connection refused/timeout/
+ * TLS failure — real curl prints "000" in that case too, which the hook's
+ * `|| echo "000"` fallback also covers).
  *
- * `portOverrides` (macf#760 regression coverage): when given, EVERY
- * invocation is logged to `<dir>/curl.calls.log` (one URL per line) so a
- * test can assert WHICH port the hook actually probed — the load-bearing
- * proof that the newest-LIVE-pid selection logic (not just "did curl
- * respond 2xx") is correct. Per-port entries override the top-level
- * httpCode/fail for that specific port; unlisted ports fall through to the
- * top-level httpCode/body defaults.
+ * `portOverrides` (macf#760 regression coverage): per-port entries override
+ * the sequence-based behavior below for that specific port — used to prove
+ * WHICH port the hook actually probed when several `server_started`
+ * generations are in play. Unlisted ports fall through to the `responses`
+ * sequence (or single fixed response) described next.
+ *
+ * `responses` (groundnuty/macf#765 retry-before-DEAD tests need to simulate
+ * "fails N times then succeeds" / "fails exactly N times total"): each
+ * invocation of the stub reads-and-increments a `.call-count` file to learn
+ * its own call index, then serves the corresponding entry (clamping to the
+ * last entry for any calls beyond the configured sequence, so a probe-count
+ * higher than expected degrades to "keep returning the last configured
+ * outcome" rather than crashing the stub). The single-response `{ httpCode,
+ * body, fail }` shape (no `responses`) remains supported — it's sugar for a
+ * one-element sequence repeated for every call.
+ *
+ * EVERY invocation — whether resolved via `portOverrides` or the `responses`
+ * sequence — is logged to `<dir>/curl.calls.log` (one URL per line, always,
+ * regardless of which path decided the response). That log is therefore the
+ * single source of both the port-selection proof (macf#760's `curlUrls`) AND
+ * the call-count proof (macf#765's `curlCallCount`, which the test harness
+ * derives as `curlUrls.length`).
  */
-function makeStubCurlDir(opts: {
-  readonly httpCode?: string;
-  readonly body?: string;
-  readonly fail?: boolean;
-  readonly portOverrides?: Readonly<Record<number, { readonly httpCode?: string; readonly fail?: boolean }>>;
-}): { readonly dir: string; readonly callsLogPath: string } {
+function makeStubCurlDir(
+  opts: CurlResponseSpec & {
+    readonly portOverrides?: Readonly<Record<number, { readonly httpCode?: string; readonly fail?: boolean }>>;
+    readonly responses?: readonly CurlResponseSpec[];
+  },
+): { readonly dir: string; readonly callsLogPath: string } {
+  const responses: readonly CurlResponseSpec[] =
+    opts.responses && opts.responses.length > 0 ? opts.responses : [{ httpCode: opts.httpCode, body: opts.body, fail: opts.fail }];
   const dir = mkdtempSync(join(tmpdir(), 'macf-chanalive-stub-curl-'));
   const callsLogPath = join(dir, 'curl.calls.log');
-  const httpCode = opts.httpCode ?? '200';
-  const body = opts.body ?? '{}';
-
-  if (opts.fail && !opts.portOverrides) {
-    writeFileSync(join(dir, 'curl'), `#!/usr/bin/env bash\nexit 7\n`);
-    chmodSync(join(dir, 'curl'), 0o755);
-    return { dir, callsLogPath };
-  }
+  const countFile = join(dir, '.call-count');
+  writeFileSync(countFile, '0');
+  responses.forEach((r, i) => {
+    if (r.fail) {
+      writeFileSync(join(dir, `fail-${i}`), '1');
+    } else {
+      writeFileSync(join(dir, `code-${i}`), r.httpCode ?? '200');
+      writeFileSync(join(dir, `body-${i}`), r.body ?? '{}');
+    }
+  });
+  const lastIndex = responses.length - 1;
 
   const overrideCases = Object.entries(opts.portOverrides ?? {})
     .map(([port, behavior]) =>
@@ -156,20 +184,35 @@ function makeStubCurlDir(opts: {
   const script = `#!/usr/bin/env bash
 url="\${@: -1}"
 printf '%s\\n' "$url" >> '${callsLogPath}'
+
+n=$(cat "${countFile}" 2>/dev/null || echo 0)
+idx=$n
+if [ "$idx" -gt ${lastIndex} ]; then idx=${lastIndex}; fi
+echo $((n + 1)) > "${countFile}"
+
 port="$(printf '%s' "$url" | sed -n 's#.*:\\([0-9]*\\)/health#\\1#p')"
 case "$port" in
 ${overrideCases}
 esac
+
+if [ -f "${dir}/fail-$idx" ]; then
+  exit 7
+fi
+
 outfile=""
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "-o" ]; then outfile="$arg"; fi
   prev="$arg"
 done
-if [ -n "$outfile" ]; then
-  printf '%s' '${body}' > "$outfile"
+if [ -n "$outfile" ] && [ -f "${dir}/body-$idx" ]; then
+  cp "${dir}/body-$idx" "$outfile"
 fi
-printf '%s' '${httpCode}'
+if [ -f "${dir}/code-$idx" ]; then
+  cat "${dir}/code-$idx"
+else
+  printf '%s' '200'
+fi
 exit 0
 `;
   const curlPath = join(dir, 'curl');
@@ -182,8 +225,10 @@ interface RunResult {
   readonly status: number | null;
   readonly stdout: string;
   readonly stderr: string;
-  /** Every `/health` URL the stub `curl` was invoked with, in call order (macf#760 port-selection proof). Empty if `curl` was never invoked or wasn't stubbed with `portOverrides`. */
+  /** Every `/health` URL the stub `curl` was invoked with, in call order (macf#760 port-selection proof). Empty if `curl` was never invoked or wasn't stubbed. */
   readonly curlUrls: readonly string[];
+  /** Number of times the stubbed curl was invoked — derived from `curlUrls.length` (groundnuty/macf#765 retry-count assertions). `undefined` when no stub was configured. */
+  readonly curlCallCount?: number;
 }
 
 interface ServerStartedSpec {
@@ -199,12 +244,10 @@ function runHook(opts: {
   readonly serverStarted?: ServerStartedSpec;
   /** Fields for MULTIPLE `server_started` JSONL lines, written oldest → newest in array order — the shape of a channel.log spanning several relaunch generations (macf#760). */
   readonly serverStartedLines?: readonly ServerStartedSpec[];
-  /** Curl stub behavior; `undefined` → no `curl` on PATH at all (simulates missing binary). */
-  readonly curl?: {
-    readonly httpCode?: string;
-    readonly body?: string;
-    readonly fail?: boolean;
+  /** Curl stub behavior; `undefined` → no `curl` on PATH at all (simulates missing binary). Accepts a single fixed response, a per-port `portOverrides` map (macf#760 port-selection proof), and/or a `responses` SEQUENCE (groundnuty/macf#765 retry-before-DEAD tests) — see `makeStubCurlDir`. */
+  readonly curl?: CurlResponseSpec & {
     readonly portOverrides?: Readonly<Record<number, { readonly httpCode?: string; readonly fail?: boolean }>>;
+    readonly responses?: readonly CurlResponseSpec[];
   };
   /** When false, certs are NOT created (simulates missing/unreadable cert paths). Default true. */
   readonly certsPresent?: boolean;
@@ -277,6 +320,12 @@ function runHook(opts: {
     HOME: fakeHome,
     CLAUDE_PROJECT_DIR: workspace,
     MACF_CHANNEL_ALIVE_THROTTLE_SECS: '300',
+    // Retry spacing defaults to 0 in the test harness (groundnuty/macf#765
+    // retry-before-DEAD adds a real delay between attempts in production;
+    // tests exercise retry-COUNT semantics, not wall-clock spacing, so keep
+    // the suite fast — override per-test via `env` when timing itself is
+    // under test).
+    MACF_CHANNEL_ALIVE_RETRY_DELAY_SECS: '0',
   };
   if (logPath) cleanEnv['MACF_LOG_PATH'] = logPath;
   if (caCert) cleanEnv['MACF_CA_CERT'] = caCert;
@@ -306,7 +355,8 @@ function runHook(opts: {
         curlUrls = [];
       }
     }
-    return { status: res.status, stdout: res.stdout ?? '', stderr: res.stderr ?? '', curlUrls };
+    const curlCallCount = opts.curl ? curlUrls.length : undefined;
+    return { status: res.status, stdout: res.stdout ?? '', stderr: res.stderr ?? '', curlUrls, curlCallCount };
   } finally {
     if (stubDir) rmSync(stubDir, { recursive: true, force: true });
     rmSync(fakeHome, { recursive: true, force: true });
@@ -666,6 +716,90 @@ describe('check-channel-alive.sh (SessionStart + UserPromptSubmit guard)', () =>
       } finally {
         plain.stop();
       }
+    });
+  });
+
+  describe('(h) retry-before-DEAD (groundnuty/macf#765) — a single transient failure must NOT warn', () => {
+    it('ALL probes fail (default retries=3) → warns DEAD exactly once, after exhausting all 3 attempts', () => {
+      const r = runHook({
+        serverStarted: { port: 8899, host: '127.0.0.1' },
+        curl: { responses: [{ fail: true }, { fail: true }, { fail: true }] },
+      });
+      expect(r.status).toBe(0);
+      expect(r.curlCallCount).toBe(3);
+      expect(r.stdout).toContain('YOUR CHANNEL-SERVER IS DEAD');
+      // Exactly ONE banner — not one per failed attempt.
+      expect(r.stdout.match(/YOUR CHANNEL-SERVER IS DEAD/g)?.length).toBe(1);
+      expect(r.stdout).toContain('after 3 attempts');
+    });
+
+    it('ONE failure then a 2xx success → SILENT, and stops probing early (does not burn the remaining retries)', () => {
+      const r = runHook({
+        serverStarted: { port: 8899, host: '127.0.0.1' },
+        curl: { responses: [{ fail: true }, { httpCode: '200' }, { fail: true }] },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('');
+      // Stopped at attempt 2 (the success) — attempt 3 (which would fail) never ran.
+      expect(r.curlCallCount).toBe(2);
+    });
+
+    it('a single always-failing probe with MACF_CHANNEL_ALIVE_RETRIES=1 → warns after exactly 1 attempt', () => {
+      const r = runHook({
+        serverStarted: { port: 8899, host: '127.0.0.1' },
+        curl: { fail: true },
+        env: { MACF_CHANNEL_ALIVE_RETRIES: '1' },
+      });
+      expect(r.status).toBe(0);
+      expect(r.curlCallCount).toBe(1);
+      expect(r.stdout).toContain('YOUR CHANNEL-SERVER IS DEAD');
+      expect(r.stdout).toContain('after 1 attempts');
+    });
+
+    it('a non-numeric MACF_CHANNEL_ALIVE_RETRIES falls back to the default (3)', () => {
+      const r = runHook({
+        serverStarted: { port: 8899, host: '127.0.0.1' },
+        curl: { fail: true },
+        env: { MACF_CHANNEL_ALIVE_RETRIES: 'banana' },
+      });
+      expect(r.status).toBe(0);
+      expect(r.curlCallCount).toBe(3);
+      expect(r.stdout).toContain('YOUR CHANNEL-SERVER IS DEAD');
+    });
+
+    it('MACF_CHANNEL_ALIVE_RETRIES=0 is floored to the default (3) — never skips the loop into a false DEAD-with-zero-probes verdict', () => {
+      const r = runHook({
+        serverStarted: { port: 8899, host: '127.0.0.1' },
+        curl: { httpCode: '200' },
+        env: { MACF_CHANNEL_ALIVE_RETRIES: '0' },
+      });
+      expect(r.status).toBe(0);
+      // Alive on the very first (post-floor) attempt → silent, stops immediately.
+      expect(r.stdout.trim()).toBe('');
+      expect(r.curlCallCount).toBe(1);
+    });
+
+    it('a non-numeric MACF_CHANNEL_ALIVE_CURL_TIMEOUT_SECS falls back to the default without crashing the hook', () => {
+      const r = runHook({
+        serverStarted: { port: 8899, host: '127.0.0.1' },
+        curl: { httpCode: '200' },
+        env: { MACF_CHANNEL_ALIVE_CURL_TIMEOUT_SECS: 'nope' },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('');
+    });
+
+    it('an unexhausted-attempt failure sequence beyond the configured length repeats the LAST configured outcome (stub sanity, not hook behavior)', () => {
+      // Regression guard for the stub itself: with only 2 responses configured
+      // and RETRIES=3, the 3rd call clamps to the last entry (fail) rather than
+      // crashing — so the hook still sees 3 real invocations and warns.
+      const r = runHook({
+        serverStarted: { port: 8899, host: '127.0.0.1' },
+        curl: { responses: [{ fail: true }, { fail: true }] },
+      });
+      expect(r.status).toBe(0);
+      expect(r.curlCallCount).toBe(3);
+      expect(r.stdout).toContain('YOUR CHANNEL-SERVER IS DEAD');
     });
   });
 });
