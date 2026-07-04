@@ -59,7 +59,32 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 
 ## Implementation Status
 
-> **Current state (updated 2026-06-27).** Substrate fully on **Stage-3** (all 4 repos
+> **Current state (updated 2026-07-04).** **Live on npm through v0.2.53** (7 releases
+> this stretch: v0.2.48→v0.2.53). **DR-040 (canonical/agent-evolution reconciliation on
+> fleet upgrade) RATIFIED + implemented**: Q1 hook-scripts→plugin (tamper-resistant
+> `${CLAUDE_PLUGIN_ROOT}/scripts/`, #749), Q2 config-dirty-guard narrowed off `.claude/**`
+> (#751), R1 tier-first auto-resolve of already-canonical config (#753), maintenance-lock
+> SET-side (#752). A live fleet-upgrade shakeout flushed + fixed a bug cascade: **#757**
+> mcp_tool-hook `macf update` crash (v0.2.50), **#756** doctor `--plugin-dir`-in-comments
+> parser + **#760** channel-alive stale-port (v0.2.51), **#763 CRITICAL — fleet-upgrade
+> run from inside an agent's session self-killed the orchestrator** (restart-self inherited
+> the orchestrator's `MACF_*` env → derived ITS session; fixed by scrubbing the child env)
+> + **#755** canonical-branch guard (never mutate/relaunch off the canonical branch), both
+> v0.2.52. **Release automation shipped (#766/#767, on main):** `make -f dev.mk release
+> VERSION=x.y.z` is now one call (bump→check→marketplace→cli→verify; `release-dry` preview)
+> — use it, don't hand-orchestrate. **v0.2.53 SHIPPED** (#765 channel-alive retry-before-DEAD
+> + #768 canonical SessionStart work-pickup hook — pickup behavior is now framework-generated,
+> not hand-rolled per-workspace; #769/#772 pin @v3.4.1 → origin-routing live). **NEXT:** DRIVE
+> the icsoc-2026 consumer-fleet re-roll as a live agent-driven e2e test (now safe post-#763;
+> host CLI now 0.2.53). **#776** filed (release-verify npm-lag retry). Reconcile
+> protocol tail R2 (resume-by-session-id) + R3 (fresh-session reconcile) still to build.
+> ⚠️ Two operational gotchas that recur: origin is SSH so `git push` HANGS (use the explicit
+> `https://x-access-token:$GH_TOKEN@github.com/...` URL); and the "CHANNEL-SERVER DEAD"
+> SessionStart guard is unreliable (verify via ps + channel.log + `macf fleet status`, don't
+> trust it). Full live working-state: the agent's memory handoff
+> `project_session_handoff_2026_07_03_releases_guards.md`. The 2026-06-27 record below is retained but stale.
+>
+> **Prior (2026-06-27).** Substrate fully on **Stage-3** (all 4 repos
 > `agent-router.yml@v3.3.0`; code-agent migrated). **DR-030 fleet/routing interconnect-doctor
 > COMPLETE** — `macf fleet status` + `macf fleet doctor` (Reachable/Accepted/passive-Processed
 > via `/health.last_processed`/`--inject`) + `macf routing doctor` (routing-infra checks); both
