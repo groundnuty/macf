@@ -12,7 +12,11 @@ import {
   isKnownRole,
   expectedHooksForRole,
   expectedAllowForRole,
+  startupPickupAutoResumesByDefault,
 } from '../../src/cli/role-settings-model.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { findCliPackageRoot } from '../../src/cli/rules.js';
 
 describe('DR-028 role-settings model', () => {
   describe('KNOWN_ROLES / isKnownRole (macf#551)', () => {
@@ -77,10 +81,15 @@ describe('DR-028 role-settings model', () => {
     // turn-receipt hook (UserPromptSubmit) + the channels-enabled guard
     // (SessionStart). Their presence is still asserted overall by the
     // broader DR-039 `checkLoadBearingHooks` union-check in `doctor.ts`.
-    it('includes ONLY the turn-receipt + channels-enabled hooks post-DR-039-Decision-2, none REQUIRED', () => {
+    it('includes the turn-receipt + channels-enabled + startup-pickup hooks post-DR-039-Decision-2, none REQUIRED', () => {
       const cmds = ROLE_FLOOR_HOOKS.map((h) => h.command);
       expect(cmds.some((c) => c.includes('emit-turn-receipt.sh'))).toBe(true);
       expect(cmds.some((c) => c.includes('check-channels-enabled.sh'))).toBe(true);
+      // groundnuty/macf#768: the canonical SessionStart work-pickup hook —
+      // written for EVERY role (including the auditor); the auditor's
+      // DR-026 default-OFF is enforced by the script at runtime, not by
+      // this expected-settings model.
+      expect(cmds.some((c) => c.includes('macf-startup-pickup.sh'))).toBe(true);
       // The 7 hooks single-sourced into the plugin are NOT part of this floor.
       expect(cmds.some((c) => c.includes('check-gh-token.sh'))).toBe(false);
       expect(cmds.some((c) => c.includes('check-mention-routing.sh'))).toBe(false);
@@ -89,14 +98,58 @@ describe('DR-028 role-settings model', () => {
       expect(cmds.some((c) => c.includes('check-gh-attribution.sh'))).toBe(false);
       expect(cmds.some((c) => c.includes('harvest-reflection.sh'))).toBe(false);
       expect(cmds.some((c) => c.includes('check-channel-alive.sh'))).toBe(false);
-      // The channels guard is a SessionStart hook (macf#633).
+      // The channels guard + the startup-pickup hook are both SessionStart
+      // hooks (macf#633 / macf#768).
       expect(
         ROLE_FLOOR_HOOKS.some(
           (h) => h.event === 'SessionStart' && h.command.includes('check-channels-enabled.sh'),
         ),
       ).toBe(true);
+      expect(
+        ROLE_FLOOR_HOOKS.some(
+          (h) => h.event === 'SessionStart' && h.command.includes('macf-startup-pickup.sh'),
+        ),
+      ).toBe(true);
       // No floor hook is REQUIRED (only the auditor's never-acts is).
       expect(ROLE_FLOOR_HOOKS.every((h) => h.required === false)).toBe(true);
+    });
+  });
+
+  describe('startupPickupAutoResumesByDefault (DR-026 / macf#768)', () => {
+    it('defaults ON for actuator roles (code/science/devops/writing + exp-*)', () => {
+      for (const role of [
+        'code-agent',
+        'science-agent',
+        'devops-agent',
+        'writing-agent',
+        'exp-code-agent',
+        'exp-science-code-aware',
+        'exp-science-domain-only',
+        'exp-single-agent',
+      ]) {
+        expect(startupPickupAutoResumesByDefault(role)).toBe(true);
+      }
+    });
+
+    it('defaults OFF for the auditor — a propose-only sensor/discussant, never an actuator', () => {
+      expect(startupPickupAutoResumesByDefault('auditor')).toBe(false);
+    });
+
+    it('defaults ON for an unknown/custom role (auditor is the sole default-OFF role)', () => {
+      expect(startupPickupAutoResumesByDefault('some-custom-role')).toBe(true);
+    });
+
+    // Lockstep: the bash hook script CANNOT import this TS module, so its
+    // runtime role-gate duplicates the same 'auditor' sentinel by hand. This
+    // test pins the two copies together — if either the TS predicate or the
+    // script's gate string drifts off "auditor", this test catches it rather
+    // than the two silently diverging.
+    it('the script re-implements the identical policy (same auditor sentinel)', () => {
+      const scriptPath = join(findCliPackageRoot(), 'scripts', 'macf-startup-pickup.sh');
+      const script = readFileSync(scriptPath, 'utf-8');
+      expect(script).toMatch(/MACF_AGENT_ROLE:-\}"\s*==\s*"auditor"/);
+      // And the TS predicate agrees: false ONLY for 'auditor'.
+      expect(startupPickupAutoResumesByDefault('auditor')).toBe(false);
     });
   });
 

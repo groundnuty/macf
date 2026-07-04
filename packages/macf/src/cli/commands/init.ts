@@ -14,7 +14,7 @@ import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
 import { seedProjectRulesDir } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
-import { installGhTokenHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
+import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { deriveBotLogin, fetchAppSlug } from './doctor.js';
 import { fetchPluginToWorkspace, pinChannelServerVersion, linkPluginCliDist } from '../plugin-fetcher.js';
 import { writeClaudeSh } from '../claude-sh.js';
@@ -552,6 +552,14 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // behavioral controls recurred the trap 5 times in a single day.
   installGhTokenHook(absDir);
   console.log(`  Hooks: installed gh-token guard in .claude/settings.json`);
+
+  // Install the canonical role-aware SessionStart work-pickup hook
+  // (merge-preserving). Per DR-026/macf#768, delegates the pending-issue
+  // query to the plugin's own `issues` command and auto-submits a
+  // follow-up prompt for auto-resuming roles — written for every role;
+  // the auditor's default-OFF gate is enforced by the script at runtime.
+  installStartupPickupHook(absDir);
+  console.log(`  Hooks: installed SessionStart work-pickup hook in .claude/settings.json`);
 
   // Pre-approve the 4 macf-agent plugin skills so first-turn
   // invocations (/macf-status, /macf-issues, etc.) don't block on

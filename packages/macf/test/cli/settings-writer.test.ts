@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, MACF_CHANNEL_ALIVE_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny, canPluginDeliverMigratedHooks } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, MACF_CHANNEL_ALIVE_HOOK_COMMAND, installStartupPickupHook, MACF_STARTUP_PICKUP_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny, canPluginDeliverMigratedHooks } from '../../src/cli/settings-writer.js';
 
 // ── Shared fixtures for the DR-039 Amendment B self-guard (macf#743 review) ──
 //
@@ -416,7 +416,7 @@ describe('installGhTokenHook', () => {
     const raw = readFileSync(settingsPath, 'utf-8');
     // Pretty-printed JSON has newlines and indentation.
     expect(raw).toContain('\n');
-    expect(raw).toMatch(/^\{\n  /); // starts with `{` then newline+2-space indent
+    expect(raw).toMatch(/^\{\n {2}/); // starts with `{` then newline+2-space indent
   });
 
   it('does NOT misclassify operator files with similar basenames as MACF-managed', () => {
@@ -837,6 +837,130 @@ describe('installGhTokenHook — DR-039 Amendment B self-guard (macf#743 review)
 
     expect(warnSpy).not.toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+});
+
+// ── Canonical role-aware SessionStart work-pickup hook (groundnuty/macf#768) ──
+describe('installStartupPickupHook (DR-026 / macf#768)', () => {
+  let tmpRoot: string;
+  let settingsPath: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'macf-startup-pickup-test-'));
+    settingsPath = join(tmpRoot, '.claude', 'settings.json');
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('MACF_STARTUP_PICKUP_HOOK_COMMAND uses $CLAUDE_PROJECT_DIR (cwd-independent absolute path)', () => {
+    expect(MACF_STARTUP_PICKUP_HOOK_COMMAND).toMatch(/^\$CLAUDE_PROJECT_DIR\/\.claude\/scripts\//);
+    expect(MACF_STARTUP_PICKUP_HOOK_COMMAND).toContain('macf-startup-pickup.sh');
+  });
+
+  it('creates .claude/settings.json when missing, with the SessionStart entry', () => {
+    installStartupPickupHook(tmpRoot);
+
+    expect(existsSync(settingsPath)).toBe(true);
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(s.hooks.SessionStart).toHaveLength(1);
+    expect(s.hooks.SessionStart[0].hooks[0].command).toBe(MACF_STARTUP_PICKUP_HOOK_COMMAND);
+    expect(s.hooks.SessionStart[0].hooks[0].type).toBe('command');
+    // No matcher — SessionStart hooks are matcher-less, like the sibling
+    // channels-enabled / turn-receipt hooks.
+    expect(s.hooks.SessionStart[0].matcher).toBeUndefined();
+  });
+
+  it('is written unconditionally — no role parameter, same entry regardless of workspace role', () => {
+    // installStartupPickupHook has no role argument at all: the per-role
+    // DR-026 default lives in the SCRIPT (runtime MACF_AGENT_ROLE check),
+    // not in conditional settings.json generation — see the exported
+    // function's doc comment for why (macf rules refresh has no role to
+    // read). This test just pins the current signature/behavior.
+    installStartupPickupHook(tmpRoot);
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const cmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
+      e.hooks.map((h) => h.command),
+    );
+    expect(cmds).toContain(MACF_STARTUP_PICKUP_HOOK_COMMAND);
+  });
+
+  it('preserves an operator-authored SessionStart hook alongside ours', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: 'command', command: './user-session-hook.sh' }] }],
+      },
+    }, null, 2));
+
+    installStartupPickupHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(s.hooks.SessionStart).toHaveLength(2);
+    const cmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
+      e.hooks.map((h) => h.command),
+    );
+    expect(cmds).toContain('./user-session-hook.sh');
+    expect(cmds).toContain(MACF_STARTUP_PICKUP_HOOK_COMMAND);
+  });
+
+  it('preserves the sibling check-channels-enabled.sh MACF entry installGhTokenHook writes', () => {
+    installGhTokenHook(tmpRoot); // writes check-channels-enabled.sh on SessionStart
+    installStartupPickupHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const cmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
+      e.hooks.map((h) => h.command),
+    );
+    expect(cmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_STARTUP_PICKUP_HOOK_COMMAND);
+  });
+
+  it('is idempotent (managed-header/basename refresh): calling twice does not duplicate', () => {
+    installStartupPickupHook(tmpRoot);
+    installStartupPickupHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const matching = s.hooks.SessionStart.filter((e: { hooks: { command: string }[] }) =>
+      e.hooks.some((h) => h.command === MACF_STARTUP_PICKUP_HOOK_COMMAND),
+    );
+    expect(matching).toHaveLength(1);
+  });
+
+  it('refreshes a legacy/stale command string in place (basename match, not exact-string match)', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { hooks: [{ type: 'command', command: '.claude/scripts/macf-startup-pickup.sh' }] },
+        ],
+      },
+    }, null, 2));
+
+    installStartupPickupHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const cmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
+      e.hooks.map((h) => h.command),
+    );
+    expect(cmds).toEqual([MACF_STARTUP_PICKUP_HOOK_COMMAND]);
+  });
+
+  it('preserves unrelated top-level settings keys', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({ model: 'opus' }, null, 2));
+
+    installStartupPickupHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(s.model).toBe('opus');
+  });
+
+  it('throws on malformed settings.json (consistent with installGhTokenHook)', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, '{ broken json');
+    expect(() => installStartupPickupHook(tmpRoot)).toThrow(/malformed/i);
   });
 });
 

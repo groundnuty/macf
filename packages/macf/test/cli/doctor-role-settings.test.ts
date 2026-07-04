@@ -20,6 +20,7 @@ import {
 } from '../../src/cli/commands/doctor.js';
 import {
   installGhTokenHook,
+  installStartupPickupHook,
   installPluginSkillPermissions,
   installSandboxExcludedCommands,
   installSandboxFdAllowRead,
@@ -43,6 +44,7 @@ function localConfig(role: string): MacfAgentConfig {
 function installFullFloor(dir: string): void {
   installPluginSkillPermissions(dir);
   installGhTokenHook(dir);
+  installStartupPickupHook(dir);
   installSandboxFdAllowRead(dir);
   installSandboxExcludedCommands(dir);
 }

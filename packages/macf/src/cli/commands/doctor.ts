@@ -28,6 +28,7 @@ import {
   getPermissionsDeny,
   getSandboxAllowRead,
   installGhTokenHook,
+  installStartupPickupHook,
   installPluginSkillPermissions,
   installSandboxExcludedCommands,
   installSandboxFdAllowRead,
@@ -1323,6 +1324,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
       } else {
         installPluginSkillPermissions(projectDir);
         installGhTokenHook(projectDir);
+        installStartupPickupHook(projectDir);
         installSandboxFdAllowRead(projectDir);
         installSandboxExcludedCommands(projectDir);
         if (botLoginCheck.status === 'WARN') {
