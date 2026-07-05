@@ -18,6 +18,22 @@ export interface FormattedNotify {
 }
 
 export function formatNotifyContent(payload: NotifyPayload): FormattedNotify {
+  const formatted = renderNotifyContent(payload);
+  // macf#790 Gap 2: when the sender stamped a canonical `<project>/<name>`
+  // reply-to slug, surface it explicitly so the recipient agent has an
+  // unambiguous reply address instead of guessing from the bare `source` —
+  // a guest replying to a bare routing label resolves inside its OWN
+  // project and never reaches the sender's home fleet. Applies uniformly
+  // across every rendered variant that can carry `reply_to` (peer_notification
+  // + mention today, both the legacy `/notify` path and the A2A message
+  // path once converted to NotifyPayload — see a2a-delivery.ts).
+  if (payload.reply_to !== undefined && payload.reply_to.length > 0) {
+    return { ...formatted, content: `${formatted.content}\n(reply to: ${payload.reply_to})` };
+  }
+  return formatted;
+}
+
+function renderNotifyContent(payload: NotifyPayload): FormattedNotify {
   if (payload.type === 'issue_routed') {
     if (payload.issue_number !== undefined) {
       const suffix = payload.title ? `: ${payload.title}` : '';

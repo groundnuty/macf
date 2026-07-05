@@ -66,4 +66,25 @@ describe('a2aMessageToNotifyPayload (macf#428)', () => {
     );
     expect(p.message).toBe('visible');
   });
+
+  describe('reply_to (macf#790 Gap 2)', () => {
+    it('carries reply_to from metadata through to the NotifyPayload', () => {
+      const p = a2aMessageToNotifyPayload(
+        msg([{ text: 'hi' }], { source: 'science-agent', reply_to: 'icsoc-2026/science-agent' }),
+      );
+      expect(p.reply_to).toBe('icsoc-2026/science-agent');
+    });
+
+    it('omits reply_to when metadata does not carry it (pre-#790 back-compat)', () => {
+      const p = a2aMessageToNotifyPayload(msg([{ text: 'hi' }], { source: 's' }));
+      expect('reply_to' in p).toBe(false);
+    });
+
+    it('omits reply_to when it is a non-string value', () => {
+      const p = a2aMessageToNotifyPayload(
+        msg([{ text: 'hi' }], { source: 's', reply_to: 42 as unknown as string }),
+      );
+      expect('reply_to' in p).toBe(false);
+    });
+  });
 });

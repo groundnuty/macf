@@ -55,6 +55,36 @@ describe('NotifyPayloadSchema', () => {
   });
 });
 
+describe('NotifyPayloadSchema — reply_to (macf#790 Gap 2)', () => {
+  it('accepts an optional reply_to slug', () => {
+    const result = NotifyPayloadSchema.parse({
+      type: 'peer_notification',
+      source: 'science-agent',
+      event: 'custom',
+      reply_to: 'icsoc-2026/science-agent',
+    });
+    expect(result.reply_to).toBe('icsoc-2026/science-agent');
+  });
+
+  it('is absent by default — back-compat with pre-#790 senders', () => {
+    const result = NotifyPayloadSchema.parse({
+      type: 'peer_notification',
+      source: 'science-agent',
+      event: 'custom',
+    });
+    expect(result.reply_to).toBeUndefined();
+  });
+
+  it('rejects a non-string reply_to', () => {
+    expect(() => NotifyPayloadSchema.parse({
+      type: 'peer_notification',
+      source: 'a',
+      event: 'custom',
+      reply_to: 42,
+    })).toThrow();
+  });
+});
+
 describe('NotifyPayloadSchema — mention anchor invariant (macf#616)', () => {
   it('rejects a message-less, anchorless type:mention (the stranding hazard)', () => {
     const result = NotifyPayloadSchema.safeParse({ type: 'mention' });
