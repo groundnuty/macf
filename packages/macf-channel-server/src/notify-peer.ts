@@ -73,8 +73,13 @@ export const NotifyPeerInputSchema = {
 export const NotifyPeerOutputSchema = {
   delivered: z.boolean()
     .describe('True if at least one peer received HTTP 200 from /notify.'),
-  channel_state: z.enum(['online', 'offline'])
-    .describe('Aggregate state — "online" if at least one peer reachable, "offline" otherwise.'),
+  // macf#790 Gap 1: `no-peer-resolved` is distinct from `offline` — it means
+  // ADDRESS RESOLUTION failed (no peer was ever dialed), not that a real
+  // peer was attempted and found unreachable. Conflating the two reads as
+  // "my own channel-server is down" when the actual cause is a bad/
+  // unfederated `<project>/<name>` slug. See the `error` field doc below.
+  channel_state: z.enum(['online', 'offline', 'no-peer-resolved'])
+    .describe('Aggregate state — "online" if at least one peer reachable, "offline" if peers were attempted but unreachable, "no-peer-resolved" if address resolution itself failed (see `error`).'),
   peers_attempted: z.number().int().nonnegative()
     .describe('Number of peers the tool attempted to notify.'),
   peers_delivered: z.number().int().nonnegative()
@@ -92,6 +97,20 @@ export const NotifyPeerOutputSchema = {
 export interface NotifyPeerDeps {
   readonly registry: Registry;
   readonly selfAgentName: string;
+  /**
+   * macf#790 Gap 2: this agent's canonical cross-fleet reply-to slug, in
+   * `<project>/<routing-label>` form (e.g. `icsoc-2026/science-agent`).
+   * Computed ONCE at the wiring site (`server.ts`, where both `config.project`
+   * and `config.routingLabel` are available) — NOT derived here, so this
+   * module never needs to know about `ChannelServerConfig`. Stamped onto
+   * every outbound payload (legacy `reply_to` field + A2A
+   * `Message.metadata.reply_to`) so a cross-fleet guest recipient has an
+   * unambiguous address to reply to, instead of resolving the bare
+   * `source`/`selfAgentName` inside ITS OWN project (macf#790's confirmed
+   * live bug: a guest's reply to a bare routing-label never reaches the
+   * sender's home fleet).
+   */
+  readonly selfReplyTo: string;
   readonly mTlsClientCertPem: string;
   readonly mTlsClientKeyPem: string;
   readonly caCertPem: string;
@@ -180,7 +199,8 @@ export interface NotifyPeerInput {
 
 export interface NotifyPeerResult {
   readonly delivered: boolean;
-  readonly channel_state: 'online' | 'offline';
+  /** macf#790 Gap 1 — see `NotifyPeerOutputSchema.channel_state` doc. */
+  readonly channel_state: 'online' | 'offline' | 'no-peer-resolved';
   readonly peers_attempted: number;
   readonly peers_delivered: number;
   /** DR-041 Amendment A (macf#786) — see `NotifyPeerOutputSchema.error` doc. */
@@ -367,7 +387,11 @@ function peerBaseUrl(peer: { readonly info: AgentInfo }): string {
  * must be the SAME across every retry, and this function has no id of its
  * own to offer).
  */
-function buildLegacyPayload(input: NotifyPeerInput, selfAgentName: string): Record<string, unknown> {
+function buildLegacyPayload(
+  input: NotifyPeerInput,
+  selfAgentName: string,
+  selfReplyTo: string,
+): Record<string, unknown> {
   return {
     type: 'peer_notification',
     source: selfAgentName,
@@ -379,6 +403,11 @@ function buildLegacyPayload(input: NotifyPeerInput, selfAgentName: string): Reco
     // legacy recv edge can't derive the anchor → silent drop + send/recv
     // graph-join asymmetry.
     ...(input.github_anchor != null ? { github_anchor: input.github_anchor } : {}),
+    // macf#790 Gap 2: the canonical `<project>/<name>` reply-to slug, always
+    // present (selfReplyTo is required on NotifyPeerDeps) — unlike `source`
+    // (the bare routing label), this is unambiguous for a cross-fleet guest
+    // recipient to reply to.
+    reply_to: selfReplyTo,
   };
 }
 
@@ -408,6 +437,7 @@ function buildLegacyPayload(input: NotifyPeerInput, selfAgentName: string): Reco
 function buildA2aMessageFromPayload(
   input: NotifyPeerInput,
   selfAgentName: string,
+  selfReplyTo: string,
   id: string,
 ): Message {
   const summary = input.message ?? `Notification from ${selfAgentName} (event=${input.event})`;
@@ -422,6 +452,10 @@ function buildA2aMessageFromPayload(
       // macf#473 piece 2: carry the github_anchor on the wire so the
       // receiver records the same anchor on its recv edge (graph join).
       ...(input.github_anchor != null ? { github_anchor: input.github_anchor } : {}),
+      // macf#790 Gap 2: mirror the legacy path's `reply_to` — the canonical
+      // `<project>/<name>` slug the receiver should reply to, distinct from
+      // the bare `source` routing label.
+      reply_to: selfReplyTo,
     },
   };
 }
@@ -539,11 +573,14 @@ async function dispatchToPeer(
   let result: { readonly httpOk: boolean; readonly transportOk: boolean };
 
   if (protocol === 'legacy') {
-    const legacyPayload = { ...buildLegacyPayload(input, deps.selfAgentName), message_id: id };
+    const legacyPayload = {
+      ...buildLegacyPayload(input, deps.selfAgentName, deps.selfReplyTo),
+      message_id: id,
+    };
     result = await postToPeer(deps, peer, legacyPayload, timeoutMs);
   } else {
     // A2A path: construct message (stable id stamped in) + send + map outcome.
-    const message = buildA2aMessageFromPayload(input, deps.selfAgentName, id);
+    const message = buildA2aMessageFromPayload(input, deps.selfAgentName, deps.selfReplyTo, id);
     try {
       const task = await deps.a2aClient!.sendMessage(
         `${peerBaseUrl(peer)}`,
@@ -685,9 +722,15 @@ export async function notifyPeer(
           span.setAttribute(Attr.PeersAttempted, 0);
           span.setAttribute(Attr.PeersDelivered, 0);
           span.setStatus({ code: SpanStatusCode.ERROR, message: resolved.error });
+          // macf#790 Gap 1: this is an ADDRESS RESOLUTION failure (bad/
+          // unfederated `<project>/<name>` slug) — no peer was ever dialed.
+          // `channel_state: 'offline'` here previously misread as "my own
+          // channel-server is down"; `'no-peer-resolved'` names the actual
+          // cause. Distinct from the real-outage path below (peers WERE
+          // attempted and found unreachable), which stays `'offline'`.
           return {
             delivered: false,
-            channel_state: 'offline' as const,
+            channel_state: 'no-peer-resolved' as const,
             peers_attempted: 0,
             peers_delivered: 0,
             error: resolved.error,

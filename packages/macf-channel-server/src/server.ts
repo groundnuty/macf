@@ -626,6 +626,14 @@ async function main(): Promise<void> {
   const notifyDispatchDeps = {
     registry,
     selfAgentName: config.agentName,
+    // macf#790 Gap 2: the canonical cross-fleet reply-to slug, computed ONCE
+    // here (the wiring site — the only place both `config.project` and
+    // `config.routingLabel` are naturally in scope) and threaded through
+    // notify-peer.ts's dispatch so every outbound payload carries an
+    // unambiguous `<project>/<name>` reply address rather than a bare
+    // routing label a cross-fleet guest would resolve inside its OWN
+    // project.
+    selfReplyTo: `${config.project}/${config.routingLabel}`,
     mTlsClientCertPem,
     mTlsClientKeyPem,
     caCertPem,

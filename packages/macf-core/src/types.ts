@@ -88,6 +88,15 @@ export const NotifyPayloadSchema = z.object({
   event: z.enum(['session-end', 'session-compact', 'turn-complete', 'error', 'custom']).optional(),
   // macf#473: optional owner/repo#N anchor a peer_notification nudge is tied to, for the comms-ledger graph join.
   github_anchor: z.string().optional(),
+  // macf#790 Gap 2: the sender's canonical cross-fleet reply-to slug, in
+  // `<project>/<routing-label>` form (e.g. `icsoc-2026/science-agent`). A
+  // BARE `source` (e.g. `science-agent`) is ambiguous once agents talk
+  // across fleets — a guest receiving `source: "science-agent"` resolves a
+  // reply inside its OWN project, never reaching the sender's home fleet.
+  // `reply_to` is the unambiguous address the recipient should use instead.
+  // Optional for back-compat with pre-#790 senders (who never set it) and
+  // with every NotifyType that has no sender-identity concept at all.
+  reply_to: z.string().optional(),
   // DR-038 Decision 2: the sender's stable dedup key for the direct
   // peer_notification path — a UUIDv4 minted ONCE at outbox-enqueue and
   // reused verbatim on every retry (never regenerated). Optional at the

@@ -45,6 +45,11 @@ function isKnownEvent(v: unknown): v is KnownEvent {
  *   trusted clients (fine under mTLS).
  * - **source**: from `Message.metadata.source` (sender agent name); falls
  *   back to a generic label when absent.
+ * - **reply_to** (macf#790 Gap 2): from `Message.metadata.reply_to` — the
+ *   sender's canonical `<project>/<name>` reply address (stamped by
+ *   `notify-peer.ts`'s `buildA2aMessageFromPayload`). Carried straight
+ *   through so `formatNotifyContent` can surface it to the recipient;
+ *   omitted when absent (pre-#790 senders) or non-string.
  */
 export function a2aMessageToNotifyPayload(message: Message): NotifyPayload {
   const body = message.parts
@@ -54,6 +59,7 @@ export function a2aMessageToNotifyPayload(message: Message): NotifyPayload {
 
   const meta = message.metadata ?? {};
   const rawEvent = meta['event'];
+  const rawReplyTo = meta['reply_to'];
   const source = typeof meta['source'] === 'string' && meta['source'].length > 0
     ? meta['source']
     : 'a2a-peer';
@@ -64,5 +70,6 @@ export function a2aMessageToNotifyPayload(message: Message): NotifyPayload {
     message: body,
     // Omit `event` entirely when unrecognized → decideWake → skip (push-only).
     ...(isKnownEvent(rawEvent) ? { event: rawEvent } : {}),
+    ...(typeof rawReplyTo === 'string' && rawReplyTo.length > 0 ? { reply_to: rawReplyTo } : {}),
   };
 }

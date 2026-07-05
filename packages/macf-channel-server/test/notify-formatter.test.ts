@@ -263,4 +263,48 @@ describe('formatNotifyContent', () => {
       expect(result.content).not.toContain('pullrequestreview');
     });
   });
+
+  describe('reply_to surfacing (macf#790 Gap 2)', () => {
+    it('appends the reply-to line for a peer_notification carrying reply_to', () => {
+      const result = formatNotifyContent({
+        type: 'peer_notification',
+        source: 'science-agent',
+        event: 'custom',
+        message: 'need a hand on #12',
+        reply_to: 'icsoc-2026/science-agent',
+      });
+      expect(result.content).toBe(
+        'Peer science-agent: need a hand on #12\n(reply to: icsoc-2026/science-agent)',
+      );
+    });
+
+    it('appends the reply-to line for a mention carrying reply_to', () => {
+      const result = formatNotifyContent({
+        type: 'mention',
+        message: 'please take a look',
+        reply_to: 'icsoc-2026/science-agent',
+      });
+      expect(result.content).toBe('please take a look\n(reply to: icsoc-2026/science-agent)');
+    });
+
+    it('omits the reply-to line when reply_to is absent (pre-#790 back-compat)', () => {
+      const result = formatNotifyContent({
+        type: 'peer_notification',
+        source: 'science-agent',
+        event: 'custom',
+        message: 'no reply-to here',
+      });
+      expect(result.content).toBe('Peer science-agent: no reply-to here');
+      expect(result.content).not.toContain('reply to');
+    });
+
+    it('omits the reply-to line when reply_to is an empty string', () => {
+      const result = formatNotifyContent({
+        type: 'mention',
+        message: 'please take a look',
+        reply_to: '',
+      });
+      expect(result.content).toBe('please take a look');
+    });
+  });
 });

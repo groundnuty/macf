@@ -52,6 +52,9 @@ function makeDeps(reg: FakeRegistry, extra: Record<string, unknown> = {}) {
   const base = {
     registry: reg as unknown as Parameters<typeof notifyPeer>[0]['registry'],
     selfAgentName: 'self-agent',
+    // macf#790 Gap 2: the canonical cross-fleet reply-to slug — wired here
+    // exactly the way server.ts wires it (`${config.project}/${config.routingLabel}`).
+    selfReplyTo: 'self-project/self-agent',
     mTlsClientCertPem: 'test-cert',
     mTlsClientKeyPem: 'test-key',
     caCertPem: 'test-ca',
@@ -214,6 +217,60 @@ describe('notify_peer tool', () => {
       expect(body.event).toBe('turn-complete');
       expect('message' in body).toBe(false);
       expect('context' in body).toBe(false);
+    });
+  });
+
+  describe('reply_to (macf#790 Gap 2 — cross-fleet reply-to slug)', () => {
+    it('legacy POST carries reply_to equal to the wired <project>/<name> slug', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      nextHttpsRespondsWith(200);
+      await notifyPeer(makeDeps(reg), {
+        to: 'peer-a',
+        event: 'session-end',
+        message: 'hi',
+      });
+      const body = JSON.parse(lastPostedBody!);
+      expect(body.reply_to).toBe('self-project/self-agent');
+      // source stays the bare routing label (back-compat) — reply_to is
+      // the NEW, unambiguous field, not a replacement.
+      expect(body.source).toBe('self-agent');
+    });
+
+    it('uses whatever selfReplyTo the deps wire in (not hardcoded)', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      nextHttpsRespondsWith(200);
+      await notifyPeer(makeDeps(reg, { selfReplyTo: 'icsoc-2026/science-agent' }), {
+        to: 'peer-a',
+        event: 'session-end',
+      });
+      const body = JSON.parse(lastPostedBody!);
+      expect(body.reply_to).toBe('icsoc-2026/science-agent');
+    });
+
+    it('the A2A outbound Message carries reply_to in metadata (mirrors github_anchor)', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const card = {
+        supportedInterfaces: [{ protocolBinding: 'JSONRPC', protocolVersion: '1.0', url: 'https://127.0.0.1:9000' }],
+      };
+      const getAgentCard = vi.fn().mockResolvedValue(card);
+      const sendMessage = vi.fn().mockResolvedValue({ id: 'task-1', status: { state: 'TASK_STATE_COMPLETED' } });
+      const a2aClient = { getAgentCard, sendMessage };
+      await notifyPeer(
+        makeDeps(reg, {
+          a2aClient: a2aClient as unknown as Parameters<typeof notifyPeer>[0]['a2aClient'],
+          selfReplyTo: 'icsoc-2026/science-agent',
+        }),
+        { to: 'peer-a', event: 'turn-complete' },
+      );
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      const sentMessage = sendMessage.mock.calls[0]![1] as { metadata: Record<string, unknown> };
+      expect(sentMessage.metadata['reply_to']).toBe('icsoc-2026/science-agent');
     });
   });
 
@@ -385,7 +442,10 @@ describe('notify_peer tool', () => {
       );
       expect(result).toEqual({
         delivered: false,
-        channel_state: 'offline',
+        // macf#790 Gap 1: this is an address-RESOLUTION failure, not a real
+        // outage — 'no-peer-resolved', not 'offline' (which would misread as
+        // "my own channel-server is down").
+        channel_state: 'no-peer-resolved',
         peers_attempted: 0,
         peers_delivered: 0,
         error:
@@ -405,7 +465,8 @@ describe('notify_peer tool', () => {
       );
       expect(result).toEqual({
         delivered: false,
-        channel_state: 'offline',
+        // macf#790 Gap 1 — see rung-2 comment above.
+        channel_state: 'no-peer-resolved',
         peers_attempted: 0,
         peers_delivered: 0,
         error: 'guest ppam-2026/code-agent not found in registry.',
@@ -443,6 +504,8 @@ describe('notify_peer tool', () => {
         "guest ppam-2026/code-agent: home fleet 'ppam-2026' not in federated_cas — " +
           'federate it (DR-041) to message this guest.',
       );
+      // macf#790 Gap 1
+      expect(result.channel_state).toBe('no-peer-resolved');
     });
 
     it('the A2A outbound path dispatches to a resolved guest exactly like an own-project peer (same resolved-peer object)', async () => {
@@ -879,6 +942,7 @@ describe('notify_peer tool', () => {
       const base = {
         registry: reg as unknown as Parameters<typeof notifyPeer>[0]['registry'],
         selfAgentName: 'self-agent',
+        selfReplyTo: 'self-project/self-agent',
         mTlsClientCertPem: 'test-cert',
         mTlsClientKeyPem: 'test-key',
         caCertPem: 'test-ca',
