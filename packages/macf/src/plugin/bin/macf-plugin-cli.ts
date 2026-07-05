@@ -23,9 +23,11 @@ import { getInboxStore } from '../lib/inbox-store.js';
 import { drainInbox } from '../lib/inbox-drain.js';
 import { createRegistryFromConfig } from '@groundnuty/macf-core';
 import { toVariableSegment } from '@groundnuty/macf-core';
-import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
+import { resolveGuestAddress } from '@groundnuty/macf-core';
+import type { AgentInfo, HealthResponse, CrossProjectAgentResolver } from '@groundnuty/macf-core';
 import {
   loadGuestBindings,
+  loadFederatedCas,
   gatherGuestStatuses,
   formatGuestBlock,
   type GuestProbeFn,
@@ -136,27 +138,52 @@ async function main(): Promise<void> {
       // freshness is bounded to one CLI run. macf#338.
       const token = registryConfig.type === 'local' ? '' : await mintFreshGitHubToken();
       const registry = createRegistryFromConfig(registryConfig, project, token);
-      // Look up the target in the registry. Names in the registry are
-      // sanitized (uppercase, underscores), so match in that space.
-      const peers = await listPeers(registry);
-      const targetSanitized = toVariableSegment(targetName);
-      const target = peers.find(p => p.name === targetSanitized);
-      if (!target) {
-        console.error(`Error: agent '${targetName}' not found in registry`);
+
+      // DR-041 Amendment A (macf#786): `targetName` may be a `<project>/<name>`
+      // cross-fleet guest slug — resolve it via the SAME unified ladder
+      // `notify_peer` / outbound A2A use (`resolveGuestAddress`, macf-core),
+      // gated on `federated_cas` (NOT the `guests` binding — DR-041 Amendment
+      // A decision 1). ANY other shape (rung 4) falls through UNCHANGED to
+      // the existing own-project sanitized-name registry lookup below.
+      const workspaceDir = process.env['MACF_WORKSPACE_DIR'] ?? process.cwd();
+      const federatedCas = loadFederatedCas(workspaceDir);
+      const resolveCrossProjectAgent: CrossProjectAgentResolver = (homeProject, name) =>
+        createRegistryFromConfig(registryConfig, homeProject, token).get(name);
+      const guestResolution = await resolveGuestAddress(targetName, federatedCas, resolveCrossProjectAgent);
+
+      let targetInfo: AgentInfo;
+      if (guestResolution.kind === 'resolved') {
+        targetInfo = guestResolution.info;
+      } else if (guestResolution.kind === 'not-a-guest-ref') {
+        // Look up the target in the registry. Names in the registry are
+        // sanitized (uppercase, underscores), so match in that space.
+        const peers = await listPeers(registry);
+        const targetSanitized = toVariableSegment(targetName);
+        const target = peers.find(p => p.name === targetSanitized);
+        if (!target) {
+          console.error(`Error: agent '${targetName}' not found in registry`);
+          process.exitCode = 1;
+          return;
+        }
+        targetInfo = target.info;
+      } else {
+        // 'not-federated' | 'not-found' — the DR-041 Amendment A clear-error
+        // rungs; never a silent "not found in registry" for a guest ref.
+        console.error(`Error: ${guestResolution.error}`);
         process.exitCode = 1;
         return;
       }
 
       const caCertPem = readFileSync(caCertPath, 'utf-8');
       const health = await pingAgent({
-        host: target.info.host,
-        port: target.info.port,
+        host: targetInfo.host,
+        port: targetInfo.port,
         caCertPem,
         certPath: agentCertPath,
         keyPath: agentKeyPath,
       });
 
-      console.log(formatHealthDetail(targetName, target.info, health));
+      console.log(formatHealthDetail(targetName, targetInfo, health));
       if (!health) process.exitCode = 1;
       break;
     }

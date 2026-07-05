@@ -3,15 +3,18 @@
  * groundnuty/macf#679): `.github/macf-fleet.json` guests + the `routing_fleet`
  * marker, plus the `<home-project>/<name>` agent-ref parser.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   GuestBindingSchema,
   MacfFleetConfigSchema,
   parseMacfFleetConfig,
   parseGuestAgentRef,
+  resolveGuestAddress,
   GuestConfigError,
   type GuestBinding,
+  type CrossProjectAgentResolver,
 } from '../src/guest.js';
+import type { AgentInfo } from '../src/registry/types.js';
 
 const validGuest: GuestBinding = {
   agent: 'ppam-2026/code-agent',
@@ -144,5 +147,75 @@ describe('parseGuestAgentRef', () => {
     expect(() => parseGuestAgentRef('code-agent')).toThrow(GuestConfigError);
     expect(() => parseGuestAgentRef('a/b/c')).toThrow(GuestConfigError);
     expect(() => parseGuestAgentRef('ppam-2026/')).toThrow(GuestConfigError);
+  });
+});
+
+// DR-041 Amendment A (groundnuty/macf#786): the unified cross-fleet guest
+// addressing ladder `notify_peer` / outbound A2A / `macf-ping` all reuse.
+describe('resolveGuestAddress (DR-041 Amendment A, macf#786)', () => {
+  const info: AgentInfo = {
+    host: '10.0.0.5',
+    port: 8443,
+    type: 'permanent',
+    instance_id: 'inst-guest',
+    started: '2026-07-01T00:00:00Z',
+  };
+
+  it('rung 4 — not a `<project>/<name>` slug → not-a-guest-ref, resolver never called', async () => {
+    const resolve = vi.fn<CrossProjectAgentResolver>();
+    const result = await resolveGuestAddress('code-agent', ['ppam-2026'], resolve);
+    expect(result).toEqual({ kind: 'not-a-guest-ref' });
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it('rung 2 — slug parses but home fleet is NOT federated → clear error, resolver never called', async () => {
+    const resolve = vi.fn<CrossProjectAgentResolver>();
+    const result = await resolveGuestAddress('ppam-2026/code-agent', [], resolve);
+    expect(result).toEqual({
+      kind: 'not-federated',
+      homeProject: 'ppam-2026',
+      name: 'code-agent',
+      error:
+        "guest ppam-2026/code-agent: home fleet 'ppam-2026' not in federated_cas — " +
+        'federate it (DR-041) to message this guest.',
+    });
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it('rung 2 — federatedCas non-empty but does not include this slug\'s home fleet', async () => {
+    const resolve = vi.fn<CrossProjectAgentResolver>();
+    const result = await resolveGuestAddress('ppam-2026/code-agent', ['other-fleet'], resolve);
+    expect(result.kind).toBe('not-federated');
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it('rung 3 — home fleet federated but the registry slot is missing → clear error', async () => {
+    const resolve = vi.fn<CrossProjectAgentResolver>().mockResolvedValue(null);
+    const result = await resolveGuestAddress('ppam-2026/code-agent', ['ppam-2026'], resolve);
+    expect(result).toEqual({
+      kind: 'not-found',
+      homeProject: 'ppam-2026',
+      name: 'code-agent',
+      error: 'guest ppam-2026/code-agent not found in registry.',
+    });
+    expect(resolve).toHaveBeenCalledWith('ppam-2026', 'code-agent');
+  });
+
+  it('rung 1 — home fleet federated + registry slot resolves → resolved with the AgentInfo', async () => {
+    const resolve = vi.fn<CrossProjectAgentResolver>().mockResolvedValue(info);
+    const result = await resolveGuestAddress('ppam-2026/code-agent', ['ppam-2026'], resolve);
+    expect(result).toEqual({
+      kind: 'resolved',
+      homeProject: 'ppam-2026',
+      name: 'code-agent',
+      info,
+    });
+  });
+
+  it('gates on federatedCas membership alone — a `guests` binding is not consulted here (no such param exists)', async () => {
+    // resolveGuestAddress's signature has no `guests` parameter at all — the
+    // ladder is structurally incapable of gating on it. This test pins that
+    // shape decision (DR-041 Amendment A decision 1) as a regression guard.
+    expect(resolveGuestAddress.length).toBe(3);
   });
 });

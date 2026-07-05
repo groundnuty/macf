@@ -29,6 +29,12 @@ import { request as httpsRequest } from 'node:https';
 import type { Registry, AgentInfo } from '@groundnuty/macf-core';
 import type { Logger } from '@groundnuty/macf-core';
 import { toVariableSegment, fromVariableSegment } from '@groundnuty/macf-core';
+// DR-041 Amendment A (groundnuty/macf#786): the unified cross-fleet guest
+// resolution ladder — same implementation `macf-ping` reuses (see
+// packages/macf/src/plugin/bin/macf-plugin-cli.ts) so the addressing gate +
+// its error text never drifts between call sites.
+import { resolveGuestAddress } from '@groundnuty/macf-core';
+import type { CrossProjectAgentResolver } from '@groundnuty/macf-core';
 import { z } from 'zod';
 // macf#267 Findings 3+4: OTel span on outbound notify_peer + W3C
 // traceparent propagation to receiver. `propagation.inject()` writes
@@ -73,6 +79,14 @@ export const NotifyPeerOutputSchema = {
     .describe('Number of peers the tool attempted to notify.'),
   peers_delivered: z.number().int().nonnegative()
     .describe('Subset of attempted peers that returned HTTP 200.'),
+  // DR-041 Amendment A (macf#786): a `<project>/<name>` cross-fleet guest
+  // target that fails the resolution ladder (home fleet not in
+  // `federated_cas`, or the guest's home-project registry slot is missing)
+  // surfaces here as a CLEAR message instead of a silent `peers_attempted:0`.
+  // Absent on success, and absent for a plain own-project `to` (unchanged
+  // pre-#786 "peer not registered" shape has no error field either).
+  error: z.string().optional()
+    .describe('Clear resolution error for a cross-fleet guest `to` (`<project>/<name>`) that failed the DR-041 Amendment A addressing ladder — home fleet not federated, or not found in the guest\'s home-project registry. Absent on success or for a plain own-project `to`.'),
 } as const;
 
 export interface NotifyPeerDeps {
@@ -124,6 +138,35 @@ export interface NotifyPeerDeps {
    * `createNotifyOutboxSend`'s doc comment for the full accepted-tradeoff note.
    */
   readonly outboxAttempts: Map<string, NotifyOutboxAttempt>;
+  /**
+   * DR-041 Amendment A (groundnuty/macf#786): federated project identifiers
+   * this agent trusts — mirrors `.github/macf-fleet.json`'s `federated_cas`,
+   * loaded ONCE at server startup via `trust-bundle.ts`'s
+   * `loadFederatedCaProjects` and threaded here as the SAME list (not
+   * re-parsed) per `server.ts`. Gates outbound addressing of a
+   * `<project>/<name>` cross-fleet guest slug: a guest's home project MUST
+   * appear here or the send fails with a clear DR-041 error rather than a
+   * silent `peers_attempted:0`. Omitted (or `[]`, the DR-024 local-mode
+   * case — a non-empty `federated_cas` there throws at channel-server
+   * startup, per trust-bundle.ts) means "no federation": every
+   * `<project>/<name>` target fails rung 2.
+   */
+  readonly federatedCas?: readonly string[];
+  /**
+   * DR-041 Amendment A: resolve a federated guest's home-project registry
+   * slot — `(homeProject, name) → AgentInfo | null`. `server.ts` wires this
+   * from the SAME shared-registry client (`varsClient`) already used for the
+   * trust-bundle's federated CA cert reads + the `/sign` flow — a federated
+   * fleet's `<PROJECT>_AGENT_<NAME>` slot lives in that SAME shared registry
+   * namespace (DR-006 shared profile scope), just under a different project
+   * prefix. Mirrors `fleet-guests.ts`'s `GuestResolveFn` (DR-036) exactly —
+   * kept as an independent field (not that type) because this package does
+   * not depend on the `macf` CLI package; the SHARED ladder logic lives in
+   * macf-core's `resolveGuestAddress` instead. Omitted → cross-project
+   * resolution is unavailable (structurally unreachable in practice, since
+   * `federatedCas` is always `[]` whenever this is `undefined`).
+   */
+  readonly resolveCrossProjectAgent?: CrossProjectAgentResolver;
 }
 
 export interface NotifyPeerInput {
@@ -140,6 +183,8 @@ export interface NotifyPeerResult {
   readonly channel_state: 'online' | 'offline';
   readonly peers_attempted: number;
   readonly peers_delivered: number;
+  /** DR-041 Amendment A (macf#786) — see `NotifyPeerOutputSchema.error` doc. */
+  readonly error?: string;
 }
 
 /**
@@ -161,20 +206,69 @@ export interface NotifyPeerResult {
 async function resolveTargetPeers(
   deps: NotifyPeerDeps,
   to: string | undefined,
-): Promise<ReadonlyArray<{ readonly name: string; readonly info: AgentInfo }>> {
+): Promise<{
+  readonly peers: ReadonlyArray<{ readonly name: string; readonly info: AgentInfo }>;
+  /** DR-041 Amendment A (macf#786) — see `resolvePeerAddress`'s doc comment. */
+  readonly error?: string;
+}> {
   const selfNormalized = toVariableSegment(deps.selfAgentName);
   if (to !== undefined && to !== '') {
-    if (toVariableSegment(to) === selfNormalized) return [];
-    const info = await deps.registry.get(to);
-    if (info === null) return [];
-    return [{ name: to, info }];
+    if (toVariableSegment(to) === selfNormalized) return { peers: [] };
+    const { info, error } = await resolvePeerAddress(deps, to);
+    if (error !== undefined) return { peers: [], error };
+    if (info === null) return { peers: [] };
+    return { peers: [{ name: to, info }] };
   }
   // Broadcast: list all registered peers, exclude self. Normalize BOTH
   // sides since Registry.list() can return names in either canonical
   // or variable form depending on the GitHubVariablesClient impl —
-  // safest comparison normalizes both.
+  // safest comparison normalizes both. Own-project ONLY — DR-041 Amendment
+  // A extends explicit single-peer `to` addressing, not broadcast fan-out;
+  // guests are never included in a broadcast.
   const all = await deps.registry.list('');
-  return all.filter(p => toVariableSegment(p.name) !== selfNormalized);
+  return { peers: all.filter(p => toVariableSegment(p.name) !== selfNormalized) };
+}
+
+/**
+ * DR-041 Amendment A (groundnuty/macf#786): resolve ONE address string to its
+ * `AgentInfo`, guest-aware. The SINGLE implementation reused at BOTH initial
+ * resolution (`resolveTargetPeers`, above) and outbox retry-time
+ * RE-resolution (`createNotifyOutboxSend`'s `send`, below) — a guest peer's
+ * LATER retries stay guest-aware too, not just the first attempt, exactly
+ * mirroring why an own-project peer is already re-resolved at send time (a
+ * retry gap can see host/port change via relaunch or collision takeover).
+ *
+ * A `<project>/<name>` slug is resolved via macf-core's `resolveGuestAddress`
+ * (reusing `parseGuestAgentRef` + gating on `deps.federatedCas` — the #785
+ * trust bundle is the SOLE admission gate per DR-041 Amendment A decision 1,
+ * NOT the `guests` binding). ANY other shape (rung 4) falls through to the
+ * UNCHANGED own-project `deps.registry.get()` lookup — byte-identical to the
+ * pre-#786 behavior.
+ *
+ * `error` is populated ONLY for a guest-ref that fails rung 2 (home fleet not
+ * federated) or rung 3 (registry slot missing) — the DR-041 Amendment A
+ * "clear error, not silent peers_attempted:0" AC. A bare own-project miss
+ * (rung 4) carries NO error — unchanged pre-#786 "peer not registered" shape
+ * (`peers_attempted:0`, no error field).
+ */
+async function resolvePeerAddress(
+  deps: NotifyDispatchDeps,
+  to: string,
+): Promise<{ readonly info: AgentInfo | null; readonly error?: string }> {
+  const guestResolution = await resolveGuestAddress(
+    to,
+    deps.federatedCas ?? [],
+    deps.resolveCrossProjectAgent ?? (() => Promise.resolve(null)),
+  );
+  switch (guestResolution.kind) {
+    case 'resolved':
+      return { info: guestResolution.info };
+    case 'not-federated':
+    case 'not-found':
+      return { info: null, error: guestResolution.error };
+    case 'not-a-guest-ref':
+      return { info: await deps.registry.get(to) };
+  }
 }
 
 /**
@@ -582,7 +676,24 @@ export async function notifyPeer(
     },
     async (span) => {
       try {
-        const peers = await resolveTargetPeers(deps, input.to);
+        const resolved = await resolveTargetPeers(deps, input.to);
+        // DR-041 Amendment A (macf#786): a cross-fleet guest `to` that fails
+        // the addressing ladder (home fleet not federated, or its
+        // registry slot is missing) gets a CLEAR error here — never a
+        // silent `peers_attempted:0` (the AC this rung exists to satisfy).
+        if (resolved.error !== undefined) {
+          span.setAttribute(Attr.PeersAttempted, 0);
+          span.setAttribute(Attr.PeersDelivered, 0);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: resolved.error });
+          return {
+            delivered: false,
+            channel_state: 'offline' as const,
+            peers_attempted: 0,
+            peers_delivered: 0,
+            error: resolved.error,
+          };
+        }
+        const peers = resolved.peers;
         if (peers.length === 0) {
           span.setAttribute(Attr.PeersAttempted, 0);
           span.setAttribute(Attr.PeersDelivered, 0);
@@ -746,8 +857,17 @@ export function createNotifyOutboxSend(
     // changed (relaunch, collision takeover), and a stale cached AgentInfo
     // would keep retrying a dead address. `target` is the routing-label
     // string `outbox.enqueue`'s caller passed as its first arg
-    // (`peer.name` in `notifyPeer()`).
-    const info = await deps.registry.get(target);
+    // (`peer.name` in `notifyPeer()`) — for a DR-041 Amendment A cross-fleet
+    // guest peer, that is the ORIGINAL `<project>/<name>` slug (see
+    // `resolveTargetPeers`), so re-resolving via the SAME `resolvePeerAddress`
+    // helper keeps a guest peer's LATER retries guest-aware too, not just the
+    // first attempt. A guest whose federation is revoked between the initial
+    // send and a later retry degrades to a normal failed attempt here (no
+    // `error` propagation on this path — see `resolvePeerAddress`'s doc
+    // comment: the clear DR-041 error text is an INITIAL-resolution UX
+    // guarantee, not a per-retry one, since `OutboxSendFn`'s `{ack}` contract
+    // has no slot to carry a message through).
+    const { info } = await resolvePeerAddress(deps, target);
     if (info === null) {
       // Peer no longer registered — a transient (deregistered mid-restart)
       // or permanent (removed) absence look identical here; either way,
