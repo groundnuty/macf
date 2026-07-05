@@ -10,11 +10,17 @@
  * Guests are resolved from the SHARED registry scope (DR-006 profile scope; the
  * cross-scope union per macf#621) by keying a registry on the guest's HOME
  * project, then reading its slot. Reachability is PATH-AWARE (science #675):
- *   - `route`          guest → attempt a live mTLS `/health` probe (works iff the
- *                      two fleets share trust — the shared-operator case); shows
- *                      online / offline. B1: no NEW cross-fleet CA is established
- *                      — we reuse the consumer's own mTLS material; a different-CA
- *                      guest simply reads offline (still visible via the registry).
+ *   - `route`          guest → attempt a live mTLS `/health` probe. If the guest's
+ *                      home project is declared in `federated_cas`
+ *                      (`.github/macf-fleet.json`, DR-041), the probe uses a
+ *                      federation-aware trust bundle (own CA + the guest's fleet
+ *                      CA, DR-041 Amendment B / macf#794) so a federated guest
+ *                      shows online + its live self-report even under a
+ *                      different per-fleet CA. Non-federated guests fall back to
+ *                      the pre-#794 behavior (B1): we reuse the consumer's own
+ *                      mTLS material as-is — a "shared-operator" (same-CA) guest
+ *                      still verifies; a genuinely-foreign-CA guest still reads
+ *                      offline (still visible via the registry).
  *   - `operator-relay` guest (local-mode / path c) → NEVER probed. A cross-fleet
  *                      probe is not meaningful (it would hit the consumer's own
  *                      localhost or fail), so it renders registry-derived state +
@@ -45,6 +51,7 @@ import type {
   CrossProjectAgentResolver,
 } from '@groundnuty/macf-core';
 import { formatTable } from './ps.js';
+import { formatRunState, rawField } from './health-fields.js';
 
 /**
  * Resolve a guest's registry slot: `(homeProject, name) → AgentInfo | null`.
@@ -56,8 +63,19 @@ import { formatTable } from './ps.js';
  */
 export type GuestResolveFn = CrossProjectAgentResolver;
 
-/** mTLS `/health` probe (same shape as the fleet-status probe); null on any failure. */
-export type GuestProbeFn = (host: string, port: number) => Promise<HealthResponse | null>;
+/**
+ * mTLS `/health` probe for a guest; null on any failure. Takes the guest's
+ * HOME project (DR-041 Amendment B, groundnuty/macf#794) so the probe can
+ * build a federation-aware trust bundle when that project is declared in
+ * `federated_cas` — same shape extension as `probePeerHealth`'s optional
+ * `GuestProbeContext` in the plugin-lib layer, applied here to the CLI-layer
+ * probe function type.
+ */
+export type GuestProbeFn = (
+  homeProject: string,
+  host: string,
+  port: number,
+) => Promise<HealthResponse | null>;
 
 /**
  * Path-aware reachability verdict for a guest:
@@ -166,7 +184,7 @@ export async function resolveGuestStatus(
   if (info === null) {
     return { binding, homeProject, name, info: null, reachability: 'unresolved', health: null };
   }
-  const health = await probe(info.host, info.port).catch(() => null);
+  const health = await probe(homeProject, info.host, info.port).catch(() => null);
   return {
     binding,
     homeProject,
@@ -248,11 +266,19 @@ const GUEST_HEADERS = [
   'VIA',
   'HOST:PORT',
   'REACHABILITY',
+  'STATE',
   'INSTANCE',
   'HEARTBEAT',
 ] as const;
 
-/** Build one display row per guest (pure — exported for tests). */
+/**
+ * Build one display row per guest (pure — exported for tests). The STATE
+ * column (DR-041 Amendment B, groundnuty/macf#794) renders the SAME
+ * `/health.state` self-report field the fleet MEMBERS table shows
+ * (`fleet.ts`'s `formatRunState`) — a federated, live guest surfaces its
+ * idle/busy turn-state exactly like a same-fleet peer does. `—` for any
+ * guest with no live `/health` body (offline / unresolved / local-mode).
+ */
 export function buildGuestRows(
   statuses: readonly GuestStatus[],
   now: number,
@@ -265,6 +291,7 @@ export function buildGuestRows(
       s.binding.delegate_via,
       where,
       formatGuestReachability(s.reachability),
+      formatRunState(rawField(s.health, 'state')),
       s.info?.instance_id ?? '—',
       formatGuestHeartbeat(s.info, now),
     ];

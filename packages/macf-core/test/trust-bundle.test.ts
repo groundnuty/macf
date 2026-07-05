@@ -1,22 +1,28 @@
 /**
  * Tests for src/trust-bundle.ts — DR-041 Decision 1 (groundnuty/macf#784)
- * cross-fleet multi-CA trust bundle resolution.
+ * cross-fleet multi-CA trust bundle resolution. Moved here from
+ * `macf-channel-server` by DR-041 Amendment B (groundnuty/macf#794) when the
+ * module itself moved, so both the channel-server AND the `macf` CLI's guest
+ * probe can share ONE implementation of this security-critical logic.
  *
  * Pure-logic tests only (fakes for the registry client + real-but-throwaway
  * temp files for the `.github/macf-fleet.json` read) — no real TLS here. The
  * empirical "does Node's `ca` array/bundle actually authorize a foreign-CA
  * peer cert" confirm (DR-041 Decision 1b's load-bearing Step-1 gate) lives in
- * `test/trust-bundle-mtls.test.ts`.
+ * `macf-channel-server/test/trust-bundle-mtls.test.ts` (kept there — it tests
+ * `createHttpsServer`'s mTLS behavior directly, not this module's logic).
  */
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { GitHubVariablesClient, Logger } from '@groundnuty/macf-core';
+import type { GitHubVariablesClient } from '../src/registry/types.js';
+import type { Logger } from '../src/types.js';
 import {
   buildTrustBundlePem,
   loadFederatedCaProjects,
   resolveFederatedCaBundle,
+  resolveGuestProbeCaBundle,
   TrustBundleError,
 } from '../src/trust-bundle.js';
 
@@ -264,5 +270,79 @@ describe('buildTrustBundlePem (full orchestration)', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('resolveGuestProbeCaBundle (DR-041 Amendment B, groundnuty/macf#794)', () => {
+  it('homeProject NOT declared in federated_cas → returns ownCaCertPem UNCHANGED (pre-#794 behavior)', async () => {
+    const own = 'OWN-CA-PEM';
+    // No varsClient at all — proves the non-federated path never even
+    // attempts a registry read.
+    const result = await resolveGuestProbeCaBundle(own, 'unknown-fleet', ['ppam-2026'], undefined, makeLogger());
+    expect(result).toBe(own);
+  });
+
+  it('homeProject NOT declared → never calls varsClient.readVariable', async () => {
+    const readVariable = vi.fn(async () => 'SHOULD-NOT-BE-READ');
+    const client: GitHubVariablesClient = {
+      readVariable,
+      writeVariable: async () => undefined,
+      listVariables: async () => [],
+      deleteVariable: async () => undefined,
+    };
+    await resolveGuestProbeCaBundle('OWN', 'unknown-fleet', ['ppam-2026'], client, makeLogger());
+    expect(readVariable).not.toHaveBeenCalled();
+  });
+
+  it('homeProject IS declared → returns own CA + JUST that project\'s CA (minimal, single-project bundle)', async () => {
+    const own = 'OWN-CA-PEM';
+    const client = fakeVarsClient({
+      PPAM_2026_CA_CERT: 'PPAM-CA-PEM',
+      ICSOC_2026_CA_CERT: 'ICSOC-CA-PEM',
+    });
+    const result = await resolveGuestProbeCaBundle(
+      own,
+      'ppam-2026',
+      ['ppam-2026', 'icsoc-2026'],
+      client,
+      makeLogger(),
+    );
+    expect(result).toBe('OWN-CA-PEM\nPPAM-CA-PEM');
+    expect(result).not.toContain('ICSOC-CA-PEM');
+  });
+
+  it('a DIFFERENT federated project\'s unresolvable CA does NOT block probing THIS guest', async () => {
+    // icsoc-2026 is declared federated but its CA var is missing/unreadable;
+    // ppam-2026's CA resolves fine. Probing the ppam-2026 guest must succeed
+    // — resolveFederatedCaBundle's "ANY declared project's CA must resolve"
+    // invariant applies to the FULL federation bundle (server startup), not
+    // to a single-guest probe, which only needs ITS OWN project's CA.
+    const client = fakeVarsClient({ PPAM_2026_CA_CERT: 'PPAM-CA-PEM' }); // ICSOC var absent
+    const result = await resolveGuestProbeCaBundle(
+      'OWN',
+      'ppam-2026',
+      ['ppam-2026', 'icsoc-2026'],
+      client,
+      makeLogger(),
+    );
+    expect(result).toBe('OWN\nPPAM-CA-PEM');
+  });
+
+  it('homeProject IS declared but its own CA var is unresolvable → THROWS TrustBundleError (fail loud for THIS guest)', async () => {
+    const client = fakeVarsClient({}); // PPAM_2026_CA_CERT resolves null
+    await expect(
+      resolveGuestProbeCaBundle('OWN', 'ppam-2026', ['ppam-2026'], client, makeLogger()),
+    ).rejects.toThrow(TrustBundleError);
+  });
+
+  it('homeProject IS declared but varsClient is undefined (local-registry mode) → THROWS TrustBundleError', async () => {
+    await expect(
+      resolveGuestProbeCaBundle('OWN', 'ppam-2026', ['ppam-2026'], undefined, makeLogger()),
+    ).rejects.toThrow(TrustBundleError);
+  });
+
+  it('empty federated_cas declared list → always the non-federated passthrough', async () => {
+    const result = await resolveGuestProbeCaBundle('OWN', 'ppam-2026', [], undefined, makeLogger());
+    expect(result).toBe('OWN');
   });
 });

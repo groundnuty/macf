@@ -56,14 +56,17 @@ import type { OutboxEntry } from '@groundnuty/macf-core';
 // DR-041 Decision 1 (groundnuty/macf#784): cross-fleet multi-CA trust bundle.
 // Built ONCE at startup + threaded unchanged to all three mTLS-configuring
 // sites (inbound https.ts `ca:`, outbound a2a-client.ts + notify-peer.ts
-// `caCertPem`) — see trust-bundle.ts module doc for the full trust model.
+// `caCertPem`) — see macf-core's trust-bundle.ts module doc for the full
+// trust model. Moved to macf-core by DR-041 Amendment B (groundnuty/macf#794)
+// so the `macf` CLI's guest-probe path can share the SAME security-critical
+// resolution logic rather than duplicating it.
 // DR-041 Amendment A (groundnuty/macf#786): `loadFederatedCaProjects` is
 // called ONCE here (below) and its result threaded to BOTH the trust-bundle
 // PEM resolution AND the outbound messaging layer's `federatedCas` dep —
 // `buildTrustBundlePem`'s all-in-one orchestration is bypassed in favor of
 // its two constituent calls so the file is read/parsed exactly once
 // (single source, per the addressing-gate design on #786).
-import { loadFederatedCaProjects, resolveFederatedCaBundle } from './trust-bundle.js';
+import { loadFederatedCaProjects, resolveFederatedCaBundle } from '@groundnuty/macf-core';
 
 // NOTE: `checkPendingIssues` from './startup-issues.js' used to be
 // called here at boot — but the call had a hardcoded

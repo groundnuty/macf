@@ -1,8 +1,17 @@
 /**
  * DR-041 Decision 1 (cross-fleet trust federation, groundnuty/macf#784):
- * builds this channel-server's multi-CA mTLS trust bundle from its own CA +
- * zero-or-more federated fleets' CAs declared in `.github/macf-fleet.json`
- * `federated_cas` (macf-core `guest.ts` schema).
+ * builds a channel-server's (or CLI probe's) multi-CA mTLS trust bundle from
+ * its own CA + zero-or-more federated fleets' CAs declared in
+ * `.github/macf-fleet.json` `federated_cas` (`guest.ts` schema).
+ *
+ * Lives in `macf-core` (moved here from `macf-channel-server` by DR-041
+ * Amendment B, groundnuty/macf#794) because BOTH the channel-server's inbound
+ * mTLS server + outbound A2A/notify clients AND the `macf` CLI's `/macf-peers`
+ * / `/macf-ping` / `macf fleet status` guest probes need this SAME
+ * security-critical trust-resolution logic — duplicating it across two
+ * packages would risk the two copies drifting apart (check-before-propose
+ * §4). This module has zero channel-server-specific coupling: it imports
+ * only from sibling macf-core modules + node builtins.
  *
  * v1 = the STATIC committed-bundle tier (DR-041 Decision 1c Tier v1): the
  * bundle is resolved ONCE at process startup from the shared registry (the
@@ -36,8 +45,11 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { MacfError, parseMacfFleetConfig, toVariableSegment } from '@groundnuty/macf-core';
-import type { GitHubVariablesClient, Logger } from '@groundnuty/macf-core';
+import { MacfError } from './errors.js';
+import { parseMacfFleetConfig } from './guest.js';
+import { toVariableSegment } from './registry/variable-name.js';
+import type { GitHubVariablesClient } from './registry/types.js';
+import type { Logger } from './types.js';
 
 /** Raised when a declared `federated_cas` entry cannot be resolved to a CA PEM. */
 export class TrustBundleError extends MacfError {
@@ -178,4 +190,44 @@ export async function buildTrustBundlePem(deps: {
 }): Promise<string> {
   const federatedProjects = loadFederatedCaProjects(deps.workspaceDir, deps.logger);
   return resolveFederatedCaBundle(deps.ownCaCertPem, federatedProjects, deps.varsClient, deps.logger);
+}
+
+/**
+ * DR-041 Amendment B (federation-aware guest probe, groundnuty/macf#794):
+ * resolve the CA bundle to use when probing ONE specific cross-fleet guest's
+ * `/health` endpoint.
+ *
+ * If `homeProject` is a DECLARED `federated_cas` entry, returns `ownCaCertPem`
+ * plus JUST that project's federated CA — a MINIMAL, single-project bundle,
+ * deliberately narrower than `resolveFederatedCaBundle`'s "all declared
+ * projects" bundle. A resolution failure (missing/unreadable CA variable) for
+ * some OTHER federated project must never block probing THIS guest — each
+ * guest probe is isolated from every other federated project's health.
+ *
+ * If `homeProject` is NOT declared in `federatedCaProjects`, returns
+ * `ownCaCertPem` UNCHANGED — byte-for-byte the pre-#794 behavior (probe with
+ * the own CA only). This preserves both pre-existing outcomes for a
+ * non-federated guest: a "shared-operator" guest signed by the SAME CA still
+ * verifies + reads online; a genuinely-foreign-CA guest still fails the TLS
+ * handshake + reads offline (see `fleet-guests.ts` module doc, path B1).
+ *
+ * Callers that want the security-critical fail-loud behavior for an
+ * unresolvable DECLARED project (e.g. an interactive `macf-ping` command)
+ * should let the thrown `TrustBundleError` propagate. Callers that isolate
+ * per-guest probe failures (e.g. `resolveGuestStatus`'s
+ * `.catch(() => null)`) get the existing degrade-to-offline behavior with no
+ * extra code — a misconfigured federated guest simply reads offline, same as
+ * a genuinely-down one.
+ */
+export async function resolveGuestProbeCaBundle(
+  ownCaCertPem: string,
+  homeProject: string,
+  federatedCaProjects: readonly string[],
+  varsClient: GitHubVariablesClient | undefined,
+  logger: Logger,
+): Promise<string> {
+  if (!federatedCaProjects.includes(homeProject)) {
+    return ownCaCertPem;
+  }
+  return resolveFederatedCaBundle(ownCaCertPem, [homeProject], varsClient, logger);
 }
