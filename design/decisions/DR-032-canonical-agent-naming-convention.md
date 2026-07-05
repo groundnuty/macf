@@ -30,6 +30,18 @@ Every overload incident this lineage records — and the two I hit *this session
 
 **Rationale (operator's):** the GitHub-visible identities are the **handle** (`macf-<role>-agent[bot]`) and the **routing-label** (`<role>-agent`); the telemetry **name** should equal the routing-label so telemetry / labels / `@mentions` all read as one family. A bare `devops` is an orphan matching neither; a `macf-`-prefixed *name* is redundant under `service.namespace=macf`.
 
+**Amendment (2026-07-05, `macf#791`) — consumer-fleet instantiation: only the *handle* carries the project prefix.** The table's examples are all the `macf` project, where the handle `macf-<role>-agent` looks like it just prepends `macf-` — which read ambiguously for a **consumer fleet whose project ≠ `macf`** (e.g. `icsoc-2026`, `ppam-2026`) and let the DR-035 bootstrap onboarding conflate the App name with `agent_name`. The generic column already says handle = `<project>-<name>[bot]`; made explicit for a non-`macf` project (worked example: `icsoc-2026`):
+
+| field | form | `icsoc-2026` instantiation |
+|---|---|---|
+| **project** | the namespace | `icsoc-2026` |
+| **role** | bare | `code` / `science` |
+| **name** | `<role>-agent` | `code-agent` / `science-agent` |
+| **routing-label** | `<role>-agent` (= name) | `code-agent` / `science-agent` |
+| **handle** (GitHub App) | `<project>-<role>-agent[bot]` | `icsoc-2026-code-agent[bot]` |
+
+**The handle is the ONLY identity that carries the `<project>-` prefix** (GitHub Apps are globally unique across GitHub, so the App name must be project-scoped). **`name` and `routing-label` stay `<role>-agent`** — the project scope comes from the registry namespace (`<PROJECT>_AGENT_…`, DR-006) and `service.namespace`, **never from the name itself.** A project-prefixed `name` or `routing-label` (e.g. `icsoc-2026-science-agent`) is a **violation** — it produces the double-prefix registry var (`ICSOC_2026_AGENT_ICSOC_2026_SCIENCE_AGENT`), a redundant `<project>@<project>-<role>` tmux session, and a non-obvious cross-fleet guest slug. **Field-precision note:** the load-bearing field is **`routing-label`** (the registry key / cert CN / A2A / cross-fleet slug — the Enforcement identity-lint below must flag a project-prefixed `routing-label` *and* `name`, the handle being the sole legitimately-prefixed identity); `name` matters because it **defaults into `routing-label`** when the latter is unset (`init.ts` cert CN = `routingLabel ?? agentName`), so a prefixed `name` silently poisons `routing-label`. The identity-lint (§Enforcement step 2) is the structural catch; the DR-035 onboarding text is the prevent-side fix (both tracked on `#791`).
+
 ### Constraint 1 (safety, non-negotiable) — `role` is bare, and the auditor's is exactly `auditor`
 
 `check-auditor-never-acts.sh` (`macf#499`/`#551`) keys on `MACF_AGENT_ROLE == "auditor"`; a near-miss (`auditor-agent`) **silently disables the auditor's write-boundary safety hook**. Bare-role-uniform satisfies this with **zero special-case** — `role` is the *only* safety-load-bearing field, and it is deliberately the one field that is NOT decorated. (This is the trap devops hit + reverted this session: `role` and `name` are different fields; only `role` is safety-critical.)
