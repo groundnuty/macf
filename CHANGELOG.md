@@ -4,6 +4,30 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.54] — 2026-07-05
+
+Cross-fleet trust federation — DR-041 Step 1 (Accepted, operator-ratified). The
+channel-server can now trust a **multi-CA bundle** (its own CA + declared foreign
+fleets' CAs), so a cross-fleet collaborator agent (a DR-036 guest) becomes
+mTLS-reachable **and cross-fleet A2A `message/send` works** — with zero
+certificate regeneration. SPIFFE-federation *pattern*, v1 static tier.
+
+### Features
+- **#784** — multi-CA trust bundle. `federated_cas: ["<project>"]` in
+  `.github/macf-fleet.json` declares which foreign fleets' CAs to trust; the
+  channel-server resolves each `<PROJECT>_CA_CERT` from the shared profile
+  registry at startup and builds one bundle threaded to all three mTLS sites —
+  inbound (`https.ts`, server-verifies-client) **and** both outbound legs
+  (`a2a-client.ts` + `notify-peer.ts`, client-verifies-peer-server) — so trust
+  is symmetric (A2A + notify + health all federate). Fail-loud on a
+  declared-but-unresolvable CA (never a silently-partial bundle, never a fallback
+  to system roots); absent/malformed config degrades conservatively to own-CA
+  only; single-CA (no `federated_cas`) behaves exactly as before. Trust is
+  per-fleet-CA and explicit (a `guests` binding does NOT auto-federate — DR-041
+  Decision 4). Rotation = re-resolve on restart (v1 static tier; the bundle-
+  endpoint+poller automation is v2, backlog #783). Grounded in science's
+  state-of-the-art study (#780); config surface + trust model peer-reviewed.
+
 ## [0.2.53] — 2026-07-04
 
 Reliability + feature release — a channel-alive false-positive fix and the
