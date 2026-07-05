@@ -274,6 +274,30 @@ export function diagnosticAckBody(
 
 export function createHttpsServer(config: {
   readonly caCertPath: string;
+  /**
+   * DR-041 Decision 1 (cross-fleet trust federation, macf#784): optional
+   * PRE-BUILT multi-CA trust bundle — this fleet's own CA cert PEM,
+   * concatenated with zero or more federated fleets' CA cert PEMs (one
+   * bundle string; multiple concatenated PEM blocks are a Node-supported
+   * `tls`/`https` `ca` shape). When present, REPLACES the single-CA read
+   * from `caCertPath` for the `ca:` trust-store option below — Node
+   * validates an incoming client cert as authorized if it chains to ANY
+   * cert in the bundle (any-of-N semantics), so admitting a federated
+   * fleet's CA is purely additive and has zero effect on validation of
+   * this fleet's own certs. When ABSENT (pre-#784 callers, and this
+   * fleet's own zero-federation case), behavior is byte-for-byte the
+   * pre-#784 single-CA path: `readFileSync(config.caCertPath)`.
+   *
+   * SECURITY-CRITICAL trust-boundary note: `ca` REPLACES Node's default
+   * Mozilla root store, so the caller (server.ts) MUST pass the COMPLETE
+   * intended allow-list here — never a partial one. Federating a fleet's
+   * CA trusts EVERY certificate that CA has ever signed or will sign;
+   * admission is per-fleet-CA, all-or-nothing (DR-041 intended model). A
+   * finer per-agent/per-skill trust restriction is explicitly a deferred
+   * capability-token concern (DR-041 Decision 4), NOT something this
+   * bundle mechanism attempts.
+   */
+  readonly caBundlePem?: string;
   readonly agentCertPath: string;
   readonly agentKeyPath: string;
   readonly onNotify: (payload: NotifyPayload) => Promise<void>;
@@ -356,7 +380,12 @@ export function createHttpsServer(config: {
   const tlsOptions = {
     key: readFileSync(config.agentKeyPath),
     cert: readFileSync(config.agentCertPath),
-    ca: readFileSync(config.caCertPath),
+    // DR-041 (macf#784): `caBundlePem`, when supplied by the caller, is the
+    // multi-CA trust bundle (own CA + zero-or-more federated fleets' CAs) —
+    // see the doc comment on `config.caBundlePem` above for the full
+    // trust-model + any-of-N semantics. Falls back to the pre-#784 single-CA
+    // file read when absent (zero behavior change for existing callers).
+    ca: config.caBundlePem ?? readFileSync(config.caCertPath),
     requestCert: true,
     rejectUnauthorized: true,
   };

@@ -84,6 +84,33 @@ describe('MacfFleetConfigSchema', () => {
     expect(r.success).toBe(true);
     if (r.success) expect(r.data.guests).toEqual([]);
   });
+
+  // DR-041 Decision 1 (macf#784): federated_cas — cross-fleet CA trust bundle.
+  it('defaults federated_cas to [] when absent', () => {
+    const r = MacfFleetConfigSchema.safeParse({});
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.federated_cas).toEqual([]);
+  });
+
+  it('parses a federated_cas array of project identifiers', () => {
+    const r = MacfFleetConfigSchema.safeParse({ federated_cas: ['ppam-2026', 'icsoc-2026'] });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.federated_cas).toEqual(['ppam-2026', 'icsoc-2026']);
+  });
+
+  it('rejects a non-string entry in federated_cas', () => {
+    const r = MacfFleetConfigSchema.safeParse({ federated_cas: [123] });
+    expect(r.success).toBe(false);
+  });
+
+  it('federated_cas + guests coexist independently', () => {
+    const r = MacfFleetConfigSchema.safeParse({ guests: [validGuest], federated_cas: ['ppam-2026'] });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.guests).toHaveLength(1);
+      expect(r.data.federated_cas).toEqual(['ppam-2026']);
+    }
+  });
 });
 
 describe('parseMacfFleetConfig', () => {
