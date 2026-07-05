@@ -118,3 +118,19 @@ trigger above ahead of the 12-month window).
 - groundnuty/macf#371 — namespace + Path-2 implementation
 - groundnuty/macf#370 — A2A Phase 1 (AgentCard endpoint; excludes /macf/sign)
 - groundnuty/macf#368 — A2A integration master tracking
+
+## Amendment (2026-07-05, #800) — CA rotation's out-of-band blast radius
+
+**A CA re-init/rotation re-issues the *in-workspace* agent certs, but has an invisible blast radius on CA-signed artifacts that live *out-of-band* — and must enumerate + flag them, or routing breaks silently.** Concretely (root cause of #799): the macf-actions router presents a **routing-client cert** (`ROUTING_CLIENT_CERT`/`ROUTING_CLIENT_KEY` GitHub Actions secrets, per caller repo) in its mTLS `route-by-label` POST. When a fleet's CA is rotated, `macf certs` re-signs the agent certs but **cannot reach the routing-client secret** (agents can't write GitHub secrets — DR-019), so it silently retains a cert signed by the *old* CA → every agent rejects the router's POST → guest-tasking/routing breaks, **undetected until an operator hits it** (~5 days on #799).
+
+This is a **silent-fallback hazard** (`silent-fallback-hazards.md` **Instance 16**): the rotation succeeds at its op boundary (exit 0, agent certs re-issued) while a sibling out-of-band artifact is silently orphaned; detection requires a **result-invariant assertion** (Pattern A), not the rotation's exit code.
+
+**Principle (generalizes beyond the routing-client cert):** *a credential rotation MUST enumerate its full blast radius — including out-of-band copies it cannot directly update — and propagate to them or LOUDLY flag them.*
+
+**Mechanism (#800; code-agent builds — this DR is the lifecycle rule):**
+- **Prevent — rotation-time WARN.** `macf certs init`/`rotate` ends with a loud blast-radius warning enumerating the orphaned out-of-band artifacts (routing-client cert on the caller-repo set, derived from the DR-030/DR-038 install-set) + the exact re-mint (`macf certs issue-routing-client`) + re-set (`gh secret set …`) operator commands. Warn, never auto-write (DR-019).
+- **Detect (static, primary) — issuer-match without reading the secret.** At `issue-routing-client` mint time, record the routing-client cert's **issuer-fingerprint + mint-epoch** in a registry variable (`<PROJECT>_ROUTING_CLIENT_CERT_ISSUER`, DR-006 scope — the CA material already lives there). `macf routing doctor` diffs that recorded issuer against the **current CA fingerprint** → mismatch = orphaned. This is required because a GitHub secret is **write-only** — the doctor cannot read the deployed cert, so it keys on the registry-recorded issuer, not the secret value.
+- **Detect (live, stronger) — result-invariant.** `routing doctor --live` / the rotation e2e (#798) asserts a `route-by-label` mTLS POST actually succeeds after a CA rotation (cause-agnostic; the truest Pattern-A guard).
+- **Remediate.** `macf certs issue-routing-client` re-mints + emits the per-repo `gh secret set` operator commands (DR-019: agent produces the artifact + command; operator executes).
+
+**References:** #799 (the outage) · #800 (this mechanism) · `silent-fallback-hazards.md` Instance 16 · DR-019 (agents can't write secrets) · DR-030/DR-038 (install-set = the caller-repo enumeration) · #798 (rotation e2e).
