@@ -164,6 +164,32 @@ describe('generateAgentConfig', () => {
     expect(parsed.agents['science-agent'].app_name).toBe('science-agent');
   });
 
+  // macf#806 / DR-032: app_name is the GitHub App HANDLE (`<project>-<agent>`),
+  // not the bare routing label — the v3 router matches `${app_name}[bot]`
+  // against a PR/mention participant's login, so a consumer fleet (handle !=
+  // routing label) needs the prefixed handle here or route-by-mention /
+  // route-by-pr-review-state resolve nothing. The map KEY stays the bare
+  // routing label; NO `[bot]` suffix (the router appends it).
+  it('app_name is the <project>-<agent> App handle when project is given (macf#806)', () => {
+    const json = generateAgentConfig(
+      ['code-agent', 'science-agent'],
+      undefined,
+      { project: 'icsoc-2026' },
+    );
+    const parsed = JSON.parse(json);
+    expect(Object.keys(parsed.agents)).toEqual(['code-agent', 'science-agent']);
+    expect(parsed.agents['code-agent'].app_name).toBe('icsoc-2026-code-agent');
+    expect(parsed.agents['science-agent'].app_name).toBe('icsoc-2026-science-agent');
+    // key is still the bare routing label (the route-by-label / agent-config key)
+    expect(parsed.agents['code-agent'].tmux_session).toBe('code-agent');
+  });
+
+  it('app_name stays the bare agent when defaults carry no project (back-compat, #76)', () => {
+    const json = generateAgentConfig(['code-agent'], undefined, { owner: 'o', repo: 'r' });
+    const parsed = JSON.parse(json);
+    expect(parsed.agents['code-agent'].app_name).toBe('code-agent');
+  });
+
   it('includes ssh_key_secret in generated entries (required by routing workflow, #76)', () => {
     const json = generateAgentConfig(['code-agent']);
     const parsed = JSON.parse(json);
