@@ -4,6 +4,26 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.55] — 2026-07-05
+
+Cross-fleet guest **addressing** — DR-041 Amendment A. The second half of
+functional cross-fleet A2A: with the trust bundle (v0.2.54) in place, outbound
+messaging can now **address** a collaborator in another fleet.
+
+### Features
+- **#786** — outbound cross-fleet GUEST addressing. `notify_peer`, outbound A2A
+  `message/send`, and `macf-ping` now resolve a `<home-project>/<name>` guest
+  slug (e.g. `ppam-2026/code-agent`) to its endpoint via the guest's home-project
+  registry slot — gated on the `federated_cas` trust set (v0.2.54). One shared
+  4-rung resolver (`resolveGuestAddress`, reusing DR-036's `parseGuestAgentRef`):
+  federated + resolvable → deliver; not-federated / not-found → a **clear error**
+  (never a silent `peers_attempted:0`); non-slug → unchanged own-project
+  resolution. Gated on `federated_cas` alone (never the `guests` binding);
+  orthogonal to `delegate_via`. Together with v0.2.54's trust bundle, this makes
+  cross-fleet A2A functional end-to-end (activate per-pair via mutual
+  `federated_cas` + relaunch). Grounded in science's SOTA study (#780);
+  design + trust-boundary peer-reviewed.
+
 ## [0.2.54] — 2026-07-05
 
 Cross-fleet trust federation — DR-041 Step 1 (Accepted, operator-ratified). The
