@@ -95,6 +95,38 @@ At minimum-viable complexity (there is **no** real-time per-credential revocatio
 
 **Accepted (operator-ratified 2026-07-04).** The concrete mechanism (Decisions 1–5), the rollout tier (D1c = v1 static bundle), and the incremental path are all settled. code-agent implements, starting with Step 1 (the live icsoc↔ppam `offline → reachable` validation) — subject to the usual PR feasibility review + merge of `#782`.
 
+## Amendment A — Cross-fleet guest *addressing* (the second half; `#786`)
+
+**Status:** Accepted (operator-directed 2026-07-05; science-authored design, code-agent implements `#786`). **Corrects the DR-041 record: trust was necessary but not sufficient.** Step 1 (`#785`, v0.2.54) federated *trust* (the multi-CA mTLS bundle) so a cross-fleet guest CAN be reached — but a live test surfaced a **separate addressing gap** the trust layer doesn't touch: the outbound messaging clients can't *address* a cross-project guest at all.
+
+**Trigger (verified, icsoc-2026-science, 2026-07-05):** `notify_peer(to: "ppam-2026/code-agent")` → `{delivered:false, channel_state:"offline", peers_attempted:0}`; `macf-ping ppam-2026/code-agent` → `not found in registry`. **Zero peers *attempted*** — the send never resolved a route. Root cause: `notify_peer`'s `resolveTargetPeers`, `a2a-client.ts` outbound resolution, and the `macf-ping` CLI all resolve `to` **only** against the agent's own-project namespace; none parses a `<project>/<name>` slug. DR-036 gave the STATUS layer cross-project resolution (`parseGuestAgentRef` + home-project keying — why the guest shows in `fleet status`), but the MESSAGING layer never got it.
+
+**The two-layer reality this amendment records:** functional cross-fleet A2A = **trust (Step 1 / `#785`) + addressing (this / `#786`)**. Neither alone suffices.
+
+### Decision A1 — Addressability is gated on `federated_cas` (the single admission gate)
+
+A federated cross-fleet guest is outbound-addressable (`notify_peer` / A2A `message/send` / `ping`) by its `<home-project>/<name>` slug **iff its home project is in `federated_cas`**. This is Pattern-A at the addressing boundary — assert the trust precondition *at resolution* so a non-federated target fails **early + clear**, not **late + cryptic** at the TLS handshake — and it keeps `federated_cas` the single admission gate (consistent with Decision 1's per-fleet-CA all-or-nothing trust). The resolution ladder (drives the "clear error, never silent `peers_attempted:0`" requirement):
+
+1. slug parses + registry slot resolves + home-project ∈ `federated_cas` → **attempt delivery**.
+2. slug resolves + home-project ∉ `federated_cas` → **error**: *"guest `<project>/<name>`: home fleet `<project>` not in federated_cas — federate it (DR-041 Decision 1) to message this guest."*
+3. slug parses + registry slot missing → **error**: *"guest `<project>/<name>` not found in registry."*
+4. not a `<project>/<name>` slug → **unchanged** own-project resolution (regression-protected).
+
+The `guests` binding is **not** a second addressing gate — `federated_cas` alone gates addressing. `guests` stays the **relationship + metadata** layer (DR-036 + `#779`'s `scope_out`/`capabilities`): *consulted* for scope-awareness, never a hard prerequisite (a second, finer gate would contradict the per-fleet all-or-nothing trust model).
+
+### Decision A2 — Addressability is orthogonal to `delegate_via`
+
+`delegate_via` remains the *work-delegation* channel (`route` = GitHub tasking — auditable structured work, the DR-036 model). Direct messaging (`notify_peer`/`a2a`/`ping`) is a different axis, gated on `federated_cas` (trust); `delegate_via` is untouched. Task-delegation-via-GitHub and direct-messaging-via-A2A coexisting is correct, not confusing (different channels, different purposes). **`delegate_via: a2a` is a documented future extension** — once addressing works, delegating *work* over A2A instead of GitHub becomes possible, but that is a separate work-routing decision, NOT built in `#786`.
+
+### Decision A3 — All three call sites, one shared resolver
+
+`notify_peer` + `a2a-client` outbound + `macf-ping` all get cross-project guest resolution (a subset would leave confusing partial capability). All three **reuse `parseGuestAgentRef` + the DR-036 home-project resolver** — one resolution path, no parallel slug-parsing logic (`check-before-propose §4`: the resolver exists; wire the clients into it).
+
+### Non-goals of this Step (deferred, explicitly recorded)
+
+- **`scope_out` surfacing** — deferred until `#779` ships the `scope_out`/`capabilities` fields on `GuestBinding` (currently backlog). This Step gates purely on `federated_cas`; scope-awareness wires in when the fields exist. The addressing gate is complete without it.
+- **Secrets over A2A** — the encrypted+authenticated A2A/mTLS channel is *why* this matters for sending secrets to a guest (GitHub issue text is plaintext — never secrets there), and it is the direct enabler of the icsoc→ppam secure channel the operator needs. But **secret-*handling* over A2A** (no-log-body, age-vault reuse, trace-redaction) is its own design, filed as a separate follow-up — an explicit non-goal of the addressing Step.
+
 ## References
 - DR-036 Amendment A (`#679`) — the cross-fleet guest primitive this extends.
 - DR-006 — profile-scope registry (shared discovery, per-project CA namespaces).
@@ -102,6 +134,8 @@ At minimum-viable complexity (there is **no** real-time per-credential revocatio
 - `#779` — GuestBinding metadata enrichment (subsumed by Decision 2 card-sourced capabilities).
 - `#780` — the research delegation issue.
 - `#783` — the v2 bundle-endpoint + poller (Decision 1c Tier v2, documented/backlog).
+- `#784` / `#785` — Step 1: the multi-CA trust bundle (v0.2.54, shipped).
+- `#786` — Amendment A: cross-fleet guest *addressing* (the second half; outbound `<project>/<name>` slug resolution).
 - `macf-science-agent:research/2026-07-04-cross-fleet-trust-federation-dr041-sota.md` — the SOTA study grounding this design (26 sources, 22/25 claims verified; full source list + per-claim votes).
 - SPIFFE Federation: https://spiffe.io/docs/latest/spiffe-specs/spiffe_federation/ · `github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Federation.md` · IETF `draft-ietf-oauth-spiffe-client-auth-02`.
 - A2A protocol (v1.0, Linux Foundation) Agent Cards + discovery: https://a2a-protocol.org/latest/specification/ · https://a2a-protocol.org/latest/topics/agent-discovery/
