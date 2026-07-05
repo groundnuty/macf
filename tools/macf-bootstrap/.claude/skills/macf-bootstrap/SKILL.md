@@ -367,11 +367,35 @@ then it is shredded.
   --spec ./.bootstrap-work/spec.json
 ```
 
-This prints **output #2** (the VM-side `git clone` + `macf init` per agent, IDs
-substituted) and **output #3** (the verification commands: `macf fleet status` /
-`macf routing doctor` / `macf fleet doctor --inject`, plus setup asserts that the
-Apps exist + are installed and the secrets are present). Output #1 (the vault) was
-committed in Step 4f.
+This prints **output #2** (the VM-side per-agent setup — `git clone` + `macf init`
++ `macf certs rotate` + **`macf repo-init`** (the routing plane) + the
+**`<PROJECT_SEG>_CA_CERT` repo-variable set**, IDs substituted) and **output #3**
+(the verification commands: `macf fleet status` / `macf routing doctor` /
+`macf fleet doctor --inject`, plus setup asserts that the Apps exist + are
+installed and the secrets are present). Output #1 (the vault) was committed in
+Step 4f.
+
+> **The routing plane MUST be `macf repo-init`, not hand-authored (macf#797/#805/#806).**
+> The bootstrap-generated `agent-router.yml` + `agent-config.json` were the source
+> of every consumer-fleet routing outage this class produced, so the emit runs
+> `macf repo-init --project <P> --agents <FULL-FLEET> --actions-version v3 …` in
+> each repo, generating them **born-correct**:
+>
+> - **router** — the full `permissions:` block (missing it = `startup_failure`,
+>   nothing routes) + an **immutable `@vX.Y.Z` pin** (repo-init resolves `v3` to
+>   the latest full tag; no silent behavioral drift) — macf#797/#804.
+> - **`agent-config.json`** — the **whole fleet** (every agent, so
+>   `route-by-mention` / `route-by-pr-review-state` resolve any of them, not just
+>   the local agent), **keyed by the routing label** (`code-agent`), each entry's
+>   **`app_name` = the App handle `<project>-<role>-agent`** (e.g.
+>   `icsoc-2026-code-agent`) **without** a `[bot]` suffix (the router appends it; a
+>   baked-in `[bot]` double-bots and breaks resolution) — macf#805/#806.
+> - **CA repo-var** — the v3 router reads the CA it trusts for the mTLS POST from
+>   `vars[<PROJECT_SEG>_CA_CERT]` on the caller repo, NOT the registry, so the emit
+>   sets it per agent repo from the vault-materialized CA cert — macf#806.
+>
+> `--agents` is the **full comma-joined fleet** passed to repo-init in EVERY repo,
+> so every repo's config lists the whole fleet.
 
 Hand the operator: (a) the emitted command list, (b) the age key path to scp
 (handed off + shredded in Step 6), and (c) a one-line summary (N Apps created, N
