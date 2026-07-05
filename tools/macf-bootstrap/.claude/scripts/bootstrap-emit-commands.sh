@@ -65,6 +65,19 @@ case "$REG_TYPE" in
   *) echo "FATAL: unknown registry.type '$REG_TYPE' (expected profile|org|repo|local)." >&2; exit 1 ;;
 esac
 
+# macf#805/#806: registry flags for `macf repo-init` (below). repo-init derives
+# repo-scope owner/repo from --repo and does NOT accept --registry-repo, so its
+# flags differ from `macf init`'s REG_FLAGS on the repo case.
+case "$REG_TYPE" in
+  profile) RI_REG="--registry-type profile --registry-user $(jq -r '.registry.user // empty' "$SPEC")" ;;
+  org)     RI_REG="--registry-type org --registry-org $(jq -r '.registry.org // empty' "$SPEC")" ;;
+  *)       RI_REG="--registry-type repo" ;;
+esac
+# Full fleet: every repo's agent-config.json must list ALL agents (keyed by
+# routing label) so route-by-mention/route-by-pr-review-state can resolve any
+# of them, not just the local agent (macf#805). Comma-joined clean `name`s.
+ALL_AGENTS="$(jq -r '[.agents[].name] | join(",")' "$SPEC")"
+
 n_agents="$(jq '.agents | length' "$SPEC")"
 [[ "$n_agents" -gt 0 ]] || { echo "FATAL: spec.agents is empty." >&2; exit 1; }
 
@@ -122,6 +135,17 @@ jq -r '.agents[] | [
   [[ -n "$ADVERTISE" ]] && printf '  --advertise-host %s \\\n' "$ADVERTISE"
   printf '  --dir %s\n' "$deploy_path"
   printf 'macf certs rotate --dir %s   # agent mTLS cert (uses the CA materialized by vault.sh)\n' "$deploy_path"
+  # macf#797/#804/#805/#806: set up the ROUTING PLANE for this repo. repo-init
+  # generates the born-correct agent-router.yml (permissions block + immutable
+  # v3 pin — repo-init resolves `v3` to the latest full tag) AND the full-fleet
+  # agent-config.json (keyed by routing label, app_name=<project>-<agent> App
+  # handle, all agents so cross-agent mention/review routing resolves).
+  printf 'macf repo-init --repo %s --project %s --agents %s \\\n' "$repo" "$PROJECT" "$ALL_AGENTS"
+  printf '  --actions-version v3 %s --dir %s   # born-correct router + full-fleet agent-config\n' "$RI_REG" "$deploy_path"
+  # The v3 router reads the target CA it trusts from a REPO VARIABLE on this
+  # repo (`vars[<PROJECT_SEG>_CA_CERT]`), NOT the registry — set it from the CA
+  # materialized by vault.sh. Public cert → a variable, not a secret (macf#806).
+  printf 'gh variable set %s_CA_CERT --repo %s --body "$(cat ~/.macf/certs/%s/ca-cert.pem)"\n' "$PROJ_SEG" "$repo" "$PROJECT"
 done
 
 echo ""
