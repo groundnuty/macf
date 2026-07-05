@@ -22,17 +22,46 @@ describe('generateWorkflow', () => {
     expect(yaml).toContain('@v1.0.0');
   });
 
-  it('includes all four event triggers', () => {
+  it('includes all five event triggers', () => {
     const yaml = generateWorkflow('v1');
     expect(yaml).toContain('issues:');
     expect(yaml).toContain('issue_comment:');
     expect(yaml).toContain('pull_request:');
     expect(yaml).toContain('pull_request_review:');
+    expect(yaml).toContain('check_suite:');
   });
 
   it('uses secrets: inherit', () => {
     const yaml = generateWorkflow('v1');
     expect(yaml).toContain('secrets: inherit');
+  });
+
+  // macf#797 — the icsoc routing outage root cause: a generated router with NO
+  // permissions block fails the reusable-workflow call at composition with
+  // `startup_failure`, so nothing ever routes. The block must be present for
+  // every pin, sit between `on:` and `jobs:`, and match macf's own router.
+  it('emits the permissions block the reusable workflow requires (macf#797)', () => {
+    const yaml = generateWorkflow('v1');
+    expect(yaml).toContain('\npermissions:\n');
+    expect(yaml).toContain('  contents: read');
+    expect(yaml).toContain('  issues: write');
+    expect(yaml).toContain('  pull-requests: read');
+    expect(yaml).toContain('  checks: read');
+    // Ordering: permissions after the on: triggers, before jobs.
+    expect(yaml.indexOf('permissions:')).toBeGreaterThan(yaml.indexOf('check_suite:'));
+    expect(yaml.indexOf('permissions:')).toBeLessThan(yaml.indexOf('jobs:'));
+  });
+
+  it('emits the permissions block for a v3+ pin too', () => {
+    const yaml = generateWorkflow('v3.4.1', {
+      project: 'macf',
+      registryApiPath: '/repos/groundnuty/groundnuty',
+    });
+    expect(yaml).toContain('\npermissions:\n');
+    expect(yaml).toContain('  issues: write');
+    expect(yaml).toContain('  checks: read');
+    // permissions is caller-side, not a reusable-workflow input, so it precedes with:
+    expect(yaml.indexOf('permissions:')).toBeLessThan(yaml.indexOf('with:'));
   });
 
   // macf#566 — v3+ pins must emit the `with: { project, registry-api-path }`
@@ -745,6 +774,46 @@ describe('repoInit integration', () => {
     expect(wf).toContain('    with:');
     expect(wf).toContain('      project: test-repo');
     expect(wf).toContain('      registry-api-path: /repos/owner/test-repo');
+  });
+
+  // macf#797 — a floating v3+ pin is resolved to an immutable full tag at
+  // generation time, so the born router never silently receives a behavioral
+  // change within the major.
+  it('resolves a floating v3 pin to the latest immutable full tag (macf#797)', async () => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
+      if (String(url).includes('macf-actions/tags')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => [{ name: 'v3.4.1' }, { name: 'v3.4.0' }, { name: 'v3.3.0' }, { name: 'v3' }],
+        });
+      }
+      return Promise.resolve({ status: 201, ok: true }); // label creation
+    }) as typeof fetch;
+
+    await repoInit(dir, { repo: 'owner/test-repo', actionsVersion: 'v3', force: false });
+
+    const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    expect(wf).toContain('agent-router.yml@v3.4.1');
+    expect(wf).not.toContain('agent-router.yml@v3\n'); // NOT the floating ref
+    expect(wf).toContain('      project: test-repo'); // v3 inputs still emitted
+    expect(wf).toContain('\npermissions:\n');
+  });
+
+  it('keeps the floating pin (no crash) when tag resolution is offline (macf#797)', async () => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
+      if (String(url).includes('macf-actions/tags')) {
+        return Promise.reject(new Error('ECONNREFUSED'));
+      }
+      return Promise.resolve({ status: 201, ok: true }); // label creation
+    }) as typeof fetch;
+
+    await expect(
+      repoInit(dir, { repo: 'owner/test-repo', actionsVersion: 'v3', force: false }),
+    ).resolves.toBeUndefined();
+
+    const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    expect(wf).toContain('agent-router.yml@v3\n'); // degraded to floating ref
+    expect(wf).toContain('\npermissions:\n'); // still a valid, permissioned router
   });
 
   it('v3 pin + profile scope emits /repos/<user>/<user>', async () => {
