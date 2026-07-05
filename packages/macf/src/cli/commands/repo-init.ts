@@ -251,8 +251,20 @@ interface AgentConfigEntry {
  * defaults to 'ubuntu' matching the other template defaults.
  */
 export interface AgentEntryDefaults {
-  readonly owner: string;
-  readonly repo: string;
+  readonly owner?: string;
+  readonly repo?: string;
+  /**
+   * Routing "project" (macf#806). When present, a freshly-created entry's
+   * `app_name` becomes `<project>-<agent>` — the GitHub App handle per
+   * DR-032 (the App handle carries the `<project>-` prefix; the bare
+   * `<agent>` is only the routing label/agent-config key). This is the
+   * SAME value threaded into the v3 caller's `with.project` input
+   * (`opts.project ?? repoName`), so a repo's agent-config.json and its
+   * router agree on which project's Apps they address. Omitted (legacy
+   * callers, or callers with no notion of "project") → `app_name` stays
+   * the bare agent/routing label, matching pre-#806 behavior.
+   */
+  readonly project?: string;
 }
 
 const DEFAULT_LABEL_TO_STATUS: Readonly<Record<string, string>> = {
@@ -275,8 +287,15 @@ function makeAgentEntry(
   omitTmuxSession = false,
 ): AgentConfigEntry {
   const sshUser = 'ubuntu';
+  // app_name is the GitHub App handle used by the router to resolve mention/
+  // review participants (`${app_name}[bot]`) — NOT just a routing label. Per
+  // DR-032, the App handle is `<project>-<agent>`; the bare `<agent>` is only
+  // the routing-label/agent-config key. When the caller knows the project
+  // (macf#806), prefix it; legacy/no-project callers keep the pre-#806
+  // unprefixed default. Never append `[bot]` here — the router appends it.
+  const appName = defaults?.project ? `${defaults.project}-${agent}` : agent;
   const entry: AgentConfigEntry = {
-    app_name: agent,
+    app_name: appName,
     host: '<agent-host-ip>',
     // v3+ (registry-routed): omit the vestigial Stage-2 send-target (macf#678).
     ...(omitTmuxSession ? {} : { tmux_session: useWindows ? sessionName! : agent }),
@@ -288,7 +307,7 @@ function makeAgentEntry(
   // Default workspace_dir = /home/<ssh_user>/repos/<owner>/<repo>. Covers
   // the common case where agents are cloned into ~/repos/<owner>/<repo>
   // on the host. Users override per-agent if their layout differs.
-  if (defaults) {
+  if (defaults?.owner && defaults?.repo) {
     entry.workspace_dir = `/home/${sshUser}/repos/${defaults.owner}/${defaults.repo}`;
   }
   return entry;
@@ -384,7 +403,7 @@ export function patchAgentConfig(
     // Inject workspace_dir default for old entries that lack it, so
     // existing configs self-upgrade to enable helper invocation without
     // requiring a hand-edit. Users can customize afterwards.
-    if (!patched.workspace_dir && defaults) {
+    if (!patched.workspace_dir && defaults?.owner && defaults?.repo) {
       patched.workspace_dir = `/home/${patched.ssh_user || 'ubuntu'}/repos/${defaults.owner}/${defaults.repo}`;
     }
     agentEntries[agent] = patched;
@@ -493,13 +512,20 @@ export async function repoInit(
   const workflowPath = join(absDir, '.github', 'workflows', 'agent-router.yml');
   const configPath = join(absDir, '.github', 'agent-config.json');
 
+  // Resolve the routing "project" once — it feeds BOTH the v3 caller's
+  // `with.project` input AND the agent-config.json `app_name` (macf#806): per
+  // DR-032 the GitHub App handle is `<project>-<agent>`, and that's true
+  // regardless of router major version (a v1.x-routed fleet still registers
+  // its Apps under the prefixed handle). Computed unconditionally so
+  // `app_name` is correct even on a v1.x/legacy pin.
+  const project = opts.project ?? repoName!;
+
   // macf#566: a v3+ pin needs the `project` + `registry-api-path` inputs in the
   // generated caller; a v1.x pin must omit them. Resolve the v3 inputs only
   // when the pin is v3+ so `repo-init --actions-version v1.x` still emits a
   // valid v1 caller.
   let v3Inputs: V3WorkflowInputs | undefined;
   if (isV3PlusActionsVersion(pinnedVersion)) {
-    const project = opts.project ?? repoName!;
     if (!isValidProjectName(project)) {
       throw new Error(`Invalid project name "${project}": must match [a-zA-Z0-9_-]+`);
     }
@@ -527,8 +553,12 @@ export async function repoInit(
   // Patch is safe to call repeatedly: unchanged inputs produce the same
   // output (idempotent), new agents are added, existing agent entries
   // preserve app_name/host/ssh_key_secret/ssh_user/tmux_bin/workspace_dir,
-  // and top-level label_to_status + unknown keys pass through.
-  const entryDefaults: AgentEntryDefaults = { owner: owner!, repo: repoName! };
+  // and top-level label_to_status + unknown keys pass through. `project`
+  // (macf#806) makes freshly-created entries' `app_name` the DR-032 App
+  // handle (`<project>-<agent>`) instead of the bare routing label —
+  // required for `route-by-mention`/`route-by-pr-review-state` to resolve
+  // `${app_name}[bot]` against the participant's actual GitHub login.
+  const entryDefaults: AgentEntryDefaults = { owner: owner!, repo: repoName!, project };
   // v3+ routing resolves the channel endpoint from the MACF registry, so the
   // agent-config.json `tmux_session` send-target is vestigial and only drives a
   // false `macf routing doctor` SESSION WARN — omit it on v3+ (macf#678). v1.x
