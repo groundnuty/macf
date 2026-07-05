@@ -74,11 +74,13 @@ questions, **not** per-action approvals:
 
 1. **Project name** (e.g. `icsoc-2026`). Derive `<PROJECT_SEG>` = uppercased,
    hyphens→underscores (used for the `<PROJECT_SEG>_CA_CERT` variable + registry keys).
-2. **For each agent** (repeat until the operator says done):
-   - role/routing label (`science-agent`, `code-agent`, `writer-agent`, …)
-   - agent name (the App name + attribution identity, e.g. `icsoc-2026-code-agent`)
+2. **For each agent** (repeat until the operator says done). **Per DR-032, TWO names are distinct — conflating them is the #1 provisioning trap (macf#791):**
+   - **name = routing label** — the bare `<role>-agent`, e.g. `code-agent` (**CLEAN, no project prefix**). This one value is the agent's `macf init --name`, its `routing_label`, its cert **CN**, its registry-var segment, its tmux session, **and its `agent-config.json` key**. It must be `<role>-agent` and nothing else.
+   - **GitHub App handle** — `<project>-<role>-agent`, e.g. `icsoc-2026-code-agent`. GitHub App names are globally unique, so **only the App** carries the `<project>-` prefix. Derive it as `<project>-<name>`; use it **only** for the App (Step 4b) and its key file. **Never feed it back as the agent `name`.**
    - GitHub repo (`owner/repo`) — created from the template
-   - VM deploy path (where the operator will `git clone` + `macf init` on the VM)
+   - VM deploy path (where the operator will `git clone` + `macf init` + `macf repo-init` on the VM)
+
+   > **⚠ Why this is load-bearing (verified 2026-07-05 — the icsoc routing outage, macf#791/#805/#806):** the previous form said the agent name *was* the App name (`icsoc-2026-code-agent`). That double-prefix silently breaks routing: the registry var becomes `<PROJECT_SEG>_AGENT_<PROJECT_SEG>_CODE_AGENT`, the tmux session doubles, and — the silent killer — `agent-config.json`'s key stops matching the issue's `<role>-agent` label, so `route-by-label` skips with `exit 0` ("not an agent label") and **nothing routes, with no error anywhere**. Keep `name` = bare `<role>-agent`. See DR-032 (+ its consumer-fleet-naming amendment) for the canonical rule.
 3. **Registry** — scope (`profile` / `org` / `repo`) + target (the profile user,
    org name, or `owner/repo`).
 4. **Advertise host** — the tailnet FQDN the channel servers advertise (e.g.
@@ -249,10 +251,24 @@ Set the 6 routing secrets **per agent repo**. Their VALUE FORMATS (per the
 
 Watch the asymmetry: the **vault** stores the app key + client cert/key base64'd
 (the `*_B64` vars), but the **repo secret** `MACF_ROUTING_APP_KEY` is **raw PEM** —
-only the two `ROUTING_CLIENT_*` repo secrets are base64. The `<PROJECT_SEG>_CA_CERT`
-variable on the registry target is set by `macf certs init` (Step 4e). The gh guard
+only the two `ROUTING_CLIENT_*` repo secrets are base64. The gh guard
 enforces **create-only** — an existing name is blocked (overwrite ≠ delete); an
 intended overwrite is opt-in via `MACF_BOOTSTRAP_ALLOW_OVERWRITE=1`.
+
+**⚠ The CA cert goes in TWO places — both required (macf#806).** `macf certs init`
+(Step 4e) uploads `<PROJECT_SEG>_CA_CERT` to the **registry target** (CA backup +
+discovery). But the v3 router reads the CA it trusts for the mTLS `route-by-label`
+POST from a **repo variable on each agent's OWN repo** (`vars[<PROJECT_SEG>_CA_CERT]`),
+NOT from the registry. So after Step 4e, ALSO set `<PROJECT_SEG>_CA_CERT` as a **repo
+variable on every agent repo** — it is a public cert, so a variable, NOT a secret:
+
+    gh variable set <PROJECT_SEG>_CA_CERT --repo <owner>/<agent-repo> < <ca-cert.pem>
+
+Skipping this is invisible until an issue is routed: `route-by-label` then fails
+`CA-cert var empty — check <PROJECT>_CA_CERT is set` (hard exit 1) or silently
+no-delivers. This was the second half of the icsoc-2026 outage. (The durable fix —
+the router reading the CA from the registry so no per-repo copy is needed — is
+macf-actions#66; until it lands, the repo var is required on every agent repo.)
 
 ### 4e. Generate the per-project CA + routing-client cert (Mac-side)
 
