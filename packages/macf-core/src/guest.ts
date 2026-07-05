@@ -86,6 +86,20 @@ export const MacfFleetConfigSchema = z.object({
   routing_fleet: z.boolean().optional(),
   /** Consumer-side cross-fleet guest bindings (DR-036 Amendment A, #679). */
   guests: z.array(GuestBindingSchema).default([]),
+  /**
+   * DR-041 Decision 1 (cross-fleet trust federation, macf#784): home-project
+   * identifiers whose per-fleet CA is added to this fleet's mTLS trust bundle.
+   * Each entry names a project (e.g. `ppam-2026`) — NOT an individual agent —
+   * whose `<PROJECT>_CA_CERT` shared-registry variable the channel-server
+   * resolves at startup and appends to its `ca` trust bundle. v1 (this) is the
+   * static-committed-bundle tier (DR-041 Decision 1c Tier v1); the well-known
+   * bundle-endpoint tier is documented as v2 (backlog `#783`). Federating a
+   * fleet's CA trusts EVERY certificate that CA has signed — admission is
+   * per-fleet-CA, all-or-nothing (intended; per-agent/per-skill restriction is
+   * a deferred capability-token concern, NOT this mechanism). Defaults to `[]`
+   * so an absent key is exactly "no federation" (unchanged single-CA trust).
+   */
+  federated_cas: z.array(z.string()).default([]),
 });
 export type MacfFleetConfig = z.infer<typeof MacfFleetConfigSchema>;
 

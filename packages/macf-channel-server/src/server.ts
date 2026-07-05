@@ -7,6 +7,7 @@
 // created before main() awaits the bootstrap.
 import { bootstrapOtel } from './otel.js';
 
+import { readFileSync } from 'node:fs';
 import { SpanKind, SpanStatusCode } from '@opentelemetry/api';
 import { getTracer, SpanNames } from './tracing.js';
 import { loadConfig } from '@groundnuty/macf-core';
@@ -52,6 +53,11 @@ import { createOutboxTicker } from './delivery/outbox-ticker.js';
 // for the receiver's own in-process undrained entries.
 import { createInboxTicker } from './delivery/inbox-ticker.js';
 import type { OutboxEntry } from '@groundnuty/macf-core';
+// DR-041 Decision 1 (groundnuty/macf#784): cross-fleet multi-CA trust bundle.
+// Built ONCE at startup + threaded unchanged to all three mTLS-configuring
+// sites (inbound https.ts `ca:`, outbound a2a-client.ts + notify-peer.ts
+// `caCertPem`) — see trust-bundle.ts module doc for the full trust model.
+import { buildTrustBundlePem } from './trust-bundle.js';
 
 // NOTE: `checkPendingIssues` from './startup-issues.js' used to be
 // called here at boot — but the call had a hardcoded
@@ -399,6 +405,25 @@ async function main(): Promise<void> {
     });
   }
 
+  // DR-041 Decision 1 (groundnuty/macf#784): resolve this agent's multi-CA
+  // trust bundle ONCE, here, before any of the three mTLS-configuring sites
+  // are constructed below. `varsClient` is the SAME shared-registry client
+  // used for the /sign flow above — a federated fleet's `<PROJECT>_CA_CERT`
+  // lives in that same registry namespace (DR-006 shared profile scope),
+  // just under a different project prefix, so no separate client is needed.
+  // `undefined` in DR-024 local-registry mode; `buildTrustBundlePem` throws
+  // LOUD at startup if federated_cas is declared without a resolvable
+  // shared registry, rather than silently shipping a partial bundle (see
+  // trust-bundle.ts module doc). Zero federation declared → returns
+  // `ownCaCertPem` unchanged, byte-for-byte the pre-#784 single-CA value.
+  const ownCaCertPem = readFileSync(config.caCertPath, 'utf8');
+  const trustBundlePem = await buildTrustBundlePem({
+    workspaceDir: config.workspaceDir,
+    ownCaCertPem,
+    varsClient,
+    logger,
+  });
+
   // In-memory challenge store (DR-010, #80). Process-local; server restart
   // between step 1 and step 2 of a flow invalidates outstanding challenges.
   const challengeStore = createChallengeStore();
@@ -507,6 +532,11 @@ async function main(): Promise<void> {
 
   const httpsServer = createHttpsServer({
     caCertPath: config.caCertPath,
+    // DR-041 Decision 1 (macf#784): the resolved multi-CA trust bundle
+    // (own CA + any federated fleets' CAs) — see the module doc on
+    // `trust-bundle.ts` + the `caBundlePem` doc comment on `https.ts`'s
+    // config for the full trust model + any-of-N semantics.
+    caBundlePem: trustBundlePem,
     agentCertPath: config.agentCertPath,
     agentKeyPath: config.agentKeyPath,
     onNotify,
@@ -538,7 +568,6 @@ async function main(): Promise<void> {
   // Per Option A (impl-time refinement to DR-023 §UC-1, approved on
   // macf#256): `to` field is OPTIONAL — when absent, broadcasts to all
   // peers in the project registry (excluding self).
-  const { readFileSync } = await import('node:fs');
   const { notifyPeer, NotifyPeerInputSchema, NotifyPeerOutputSchema, createNotifyOutboxSend } =
     await import('./notify-peer.js');
   // macf#396 Phase 3: outbound A2A client for protocol-selection.
@@ -548,7 +577,16 @@ async function main(): Promise<void> {
   const { A2aClient } = await import('./a2a-client.js');
   const mTlsClientCertPem = readFileSync(config.agentCertPath, 'utf8');
   const mTlsClientKeyPem = readFileSync(config.agentKeyPath, 'utf8');
-  const caCertPem = readFileSync(config.caCertPath, 'utf8');
+  // DR-041 Decision 1 (macf#784): both outbound mTLS legs (A2A message/send
+  // + legacy /notify POST) validate the REMOTE peer's server cert against
+  // this SAME trust bundle the inbound side validates client certs against
+  // — a foreign fleet's server cert must be accepted here too, or outbound
+  // A2A/notify to a federated guest stays broken even though inbound works.
+  // Deliberately the identical `trustBundlePem` value built once above; do
+  // NOT re-read `config.caCertPath` here (that would silently drop the
+  // federated CAs from the outbound leg only — the exact partial-bundle
+  // hazard trust-bundle.ts's module doc warns against).
+  const caCertPem = trustBundlePem;
   const a2aClient = new A2aClient({
     mTlsClientCertPem,
     mTlsClientKeyPem,
