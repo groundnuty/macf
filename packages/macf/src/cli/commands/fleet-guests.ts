@@ -37,11 +37,24 @@ import {
   isStaleEntry,
   DEFAULT_REGISTRY_TTL_MS,
 } from '@groundnuty/macf-core';
-import type { AgentInfo, GuestBinding, HealthResponse } from '@groundnuty/macf-core';
+import type {
+  AgentInfo,
+  GuestBinding,
+  HealthResponse,
+  MacfFleetConfig,
+  CrossProjectAgentResolver,
+} from '@groundnuty/macf-core';
 import { formatTable } from './ps.js';
 
-/** Resolve a guest's registry slot: `(homeProject, name) → AgentInfo | null`. */
-export type GuestResolveFn = (homeProject: string, name: string) => Promise<AgentInfo | null>;
+/**
+ * Resolve a guest's registry slot: `(homeProject, name) → AgentInfo | null`.
+ * Structurally IDENTICAL to macf-core's `CrossProjectAgentResolver` (DR-041
+ * Amendment A, groundnuty/macf#786) — aliased rather than redefined so the
+ * STATUS layer (this file, DR-036) and the MESSAGING layer (`notify_peer` /
+ * outbound A2A / `macf-ping`) share one resolver shape, never two that could
+ * drift apart.
+ */
+export type GuestResolveFn = CrossProjectAgentResolver;
 
 /** mTLS `/health` probe (same shape as the fleet-status probe); null on any failure. */
 export type GuestProbeFn = (host: string, port: number) => Promise<HealthResponse | null>;
@@ -73,32 +86,60 @@ export interface GuestStatus {
 }
 
 /**
- * Load the consumer-local guest bindings from `<projectDir>/.github/macf-fleet.json`
- * (macf#614 fleet-scope config). DEGRADES rather than crashes: an absent file →
- * `[]`; a malformed file → a LOUD stderr warning + `[]` (loud-but-proceeds, the
- * house posture — a broken guest binding must not take down `fleet status`).
+ * Shared parse of `<projectDir>/.github/macf-fleet.json` (macf#614 fleet-scope
+ * config) — both `loadGuestBindings` (DR-036) and `loadFederatedCas` (DR-041
+ * Amendment A, macf#786) read the SAME file for different fields, so the
+ * degrade-on-absent/malformed logic lives here once. DEGRADES rather than
+ * crashes: an absent file → `null`; a malformed file → a LOUD stderr warning
+ * + `null` (loud-but-proceeds, the house posture — a broken fleet config
+ * must not take down `fleet status` / `/macf-peers` / `macf-ping`).
  */
-export function loadGuestBindings(projectDir: string): readonly GuestBinding[] {
+function loadMacfFleetConfig(projectDir: string): MacfFleetConfig | null {
   const path = join(projectDir, '.github', 'macf-fleet.json');
-  if (!existsSync(path)) return [];
+  if (!existsSync(path)) return null;
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(path, 'utf-8'));
   } catch (e) {
-    console.error(`Warning: .github/macf-fleet.json is not valid JSON — ignoring guests (${String(e)}).`);
-    return [];
+    console.error(`Warning: .github/macf-fleet.json is not valid JSON — ignoring guests/federation (${String(e)}).`);
+    return null;
   }
   const result = MacfFleetConfigSchema.safeParse(raw);
   if (!result.success) {
     const first = result.error.issues[0];
     const where = first && first.path.length > 0 ? ` at ${first.path.join('.')}` : '';
     console.error(
-      `Warning: .github/macf-fleet.json failed validation${where} — ignoring guests ` +
+      `Warning: .github/macf-fleet.json failed validation${where} — ignoring guests/federation ` +
         `(${first ? first.message : 'invalid config'}).`,
     );
-    return [];
+    return null;
   }
-  return result.data.guests;
+  return result.data;
+}
+
+/**
+ * Load the consumer-local guest bindings from `<projectDir>/.github/macf-fleet.json`
+ * (macf#614 fleet-scope config). DEGRADES rather than crashes: an absent file →
+ * `[]`; a malformed file → a LOUD stderr warning + `[]` (loud-but-proceeds, the
+ * house posture — a broken guest binding must not take down `fleet status`).
+ */
+export function loadGuestBindings(projectDir: string): readonly GuestBinding[] {
+  return loadMacfFleetConfig(projectDir)?.guests ?? [];
+}
+
+/**
+ * Load the `federated_cas` project list from `<projectDir>/.github/macf-fleet.json`
+ * (DR-041 Amendment A, groundnuty/macf#786) — the SAME trust list
+ * `trust-bundle.ts`'s `loadFederatedCaProjects` reads for the channel-server's
+ * mTLS trust bundle, re-read here because `macf-ping` (this package) does not
+ * depend on `@groundnuty/macf-channel-server`. Gates `macf-ping`'s
+ * `<project>/<name>` cross-fleet guest addressing via `resolveGuestAddress`
+ * (macf-core) — the SAME ladder + gate `notify_peer` / outbound A2A use.
+ * DEGRADES the same way `loadGuestBindings` does: absent/malformed file → `[]`
+ * (the safe "no federation" default, never a crash).
+ */
+export function loadFederatedCas(projectDir: string): readonly string[] {
+  return loadMacfFleetConfig(projectDir)?.federated_cas ?? [];
 }
 
 /**

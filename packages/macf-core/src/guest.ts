@@ -23,6 +23,7 @@
  */
 import { z } from 'zod';
 import { MacfError } from './errors.js';
+import type { AgentInfo } from './registry/types.js';
 
 /**
  * How the consumer reaches the guest (DR-036 §two enabler paths, Amendment A):
@@ -145,4 +146,119 @@ export function parseGuestAgentRef(agent: string): {
     );
   }
   return { homeProject: agent.slice(0, slash), name: agent.slice(slash + 1) };
+}
+
+/**
+ * DR-041 Amendment A (cross-fleet guest ADDRESSING, groundnuty/macf#786):
+ * resolve a guest's `<home-project>/<name>` registry slot to its `AgentInfo`.
+ * Mirrors `fleet-guests.ts`'s `GuestResolveFn` shape exactly — kept as an
+ * independent type here (rather than the reverse) so the outbound MESSAGING
+ * clients (`macf-channel-server`'s `notify_peer` + outbound A2A dispatch,
+ * `macf`'s `macf-ping` CLI) can depend on macf-core WITHOUT depending on the
+ * `macf` package's `fleet-guests.ts` (the STATUS-layer module, DR-036,
+ * which lives one package over and pulls in CLI-only concerns).
+ */
+export type CrossProjectAgentResolver = (
+  homeProject: string,
+  name: string,
+) => Promise<AgentInfo | null>;
+
+/**
+ * Outcome of resolving a `to` address string against DR-041 Amendment A's
+ * 4-rung cross-fleet guest resolution ladder (groundnuty/macf#786):
+ *
+ *   1. `to` parses as `<project>/<name>` + the home project is federated +
+ *      the registry slot resolves → `resolved` — attempt delivery.
+ *   2. `to` parses but the home project is NOT in `federatedCas` →
+ *      `not-federated` — clear DR-041 error, never a silent no-op.
+ *   3. `to` parses + home project federated, but the registry slot is
+ *      missing/unresolvable → `not-found` — clear error.
+ *   4. `to` does NOT parse as a `<project>/<name>` slug at all →
+ *      `not-a-guest-ref` — the caller falls through to its OWN, UNCHANGED
+ *      own-project resolution. Deliberately NOT folded into this ladder:
+ *      each call site's own-project lookup mechanics differ (a direct
+ *      `registry.get(name)` in `notify-peer.ts` vs. a sanitized-name
+ *      `list()`-then-`find()` in `macf-ping`), so unifying THAT part would
+ *      require reshaping call sites that aren't broken, for no shared
+ *      benefit — only the GUEST ladder (parse + trust-gate + cross-project
+ *      resolve + error text) is common enough to be worth one shared
+ *      implementation.
+ */
+export type GuestAddressResolution =
+  | { readonly kind: 'not-a-guest-ref' }
+  | {
+      readonly kind: 'not-federated';
+      readonly homeProject: string;
+      readonly name: string;
+      readonly error: string;
+    }
+  | {
+      readonly kind: 'not-found';
+      readonly homeProject: string;
+      readonly name: string;
+      readonly error: string;
+    }
+  | {
+      readonly kind: 'resolved';
+      readonly homeProject: string;
+      readonly name: string;
+      readonly info: AgentInfo;
+    };
+
+/**
+ * DR-041 Amendment A's unified cross-fleet guest resolution ladder
+ * (groundnuty/macf#786) — the SINGLE implementation `notify_peer` (outbound
+ * `/notify` + outbound A2A `message/send`, both dispatch through the SAME
+ * resolved peer in `notify-peer.ts`) and `macf-ping` reuse, so the addressing
+ * gate + its exact error text can never drift between call sites.
+ *
+ * Gated on `federatedCas` ALONE (DR-041 Amendment A decision 1) — NEVER on a
+ * `guests` binding. Rationale (science-ratified on macf#786): trust (the
+ * per-fleet-CA mTLS bundle, #785) is the SOLE admission gate for cross-fleet
+ * addressing — once a fleet's CA is federated, every agent that CA has
+ * signed is mTLS-reachable, so gating addressing on that SAME set keeps
+ * "can I address it" and "can I mTLS it" consistent. The `guests` binding
+ * (`.github/macf-fleet.json` `guests[]`) remains a relationship/metadata
+ * layer (DR-036) — consulted for scope-awareness in a FUTURE amendment
+ * (`scope_out`/`capabilities`, #779), never a second hard addressing gate.
+ *
+ * A malformed / non-slug `to` (rung 4) is NOT an error here — it returns
+ * `{ kind: 'not-a-guest-ref' }` so the caller falls through to its own
+ * unchanged own-project resolution, byte-identical to pre-#786 behavior.
+ */
+export async function resolveGuestAddress(
+  to: string,
+  federatedCas: readonly string[],
+  resolve: CrossProjectAgentResolver,
+): Promise<GuestAddressResolution> {
+  let ref: { readonly homeProject: string; readonly name: string };
+  try {
+    ref = parseGuestAgentRef(to);
+  } catch {
+    return { kind: 'not-a-guest-ref' };
+  }
+  const { homeProject, name } = ref;
+
+  if (!federatedCas.includes(homeProject)) {
+    return {
+      kind: 'not-federated',
+      homeProject,
+      name,
+      error:
+        `guest ${homeProject}/${name}: home fleet '${homeProject}' not in federated_cas — ` +
+        'federate it (DR-041) to message this guest.',
+    };
+  }
+
+  const info = await resolve(homeProject, name);
+  if (info === null) {
+    return {
+      kind: 'not-found',
+      homeProject,
+      name,
+      error: `guest ${homeProject}/${name} not found in registry.`,
+    };
+  }
+
+  return { kind: 'resolved', homeProject, name, info };
 }

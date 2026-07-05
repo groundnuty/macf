@@ -57,7 +57,13 @@ import type { OutboxEntry } from '@groundnuty/macf-core';
 // Built ONCE at startup + threaded unchanged to all three mTLS-configuring
 // sites (inbound https.ts `ca:`, outbound a2a-client.ts + notify-peer.ts
 // `caCertPem`) — see trust-bundle.ts module doc for the full trust model.
-import { buildTrustBundlePem } from './trust-bundle.js';
+// DR-041 Amendment A (groundnuty/macf#786): `loadFederatedCaProjects` is
+// called ONCE here (below) and its result threaded to BOTH the trust-bundle
+// PEM resolution AND the outbound messaging layer's `federatedCas` dep —
+// `buildTrustBundlePem`'s all-in-one orchestration is bypassed in favor of
+// its two constituent calls so the file is read/parsed exactly once
+// (single source, per the addressing-gate design on #786).
+import { loadFederatedCaProjects, resolveFederatedCaBundle } from './trust-bundle.js';
 
 // NOTE: `checkPendingIssues` from './startup-issues.js' used to be
 // called here at boot — but the call had a hardcoded
@@ -411,18 +417,27 @@ async function main(): Promise<void> {
   // used for the /sign flow above — a federated fleet's `<PROJECT>_CA_CERT`
   // lives in that same registry namespace (DR-006 shared profile scope),
   // just under a different project prefix, so no separate client is needed.
-  // `undefined` in DR-024 local-registry mode; `buildTrustBundlePem` throws
-  // LOUD at startup if federated_cas is declared without a resolvable
+  // `undefined` in DR-024 local-registry mode; `resolveFederatedCaBundle`
+  // throws LOUD at startup if federated_cas is declared without a resolvable
   // shared registry, rather than silently shipping a partial bundle (see
   // trust-bundle.ts module doc). Zero federation declared → returns
   // `ownCaCertPem` unchanged, byte-for-byte the pre-#784 single-CA value.
+  //
+  // DR-041 Amendment A (groundnuty/macf#786): `federatedCaProjects` is read
+  // HERE (single source) via `loadFederatedCaProjects`, then threaded to
+  // BOTH `resolveFederatedCaBundle` (the trust-bundle PEM, below) AND
+  // `notifyDispatchDeps.federatedCas` (the outbound MESSAGING addressing
+  // gate, further below) — the SAME list gates both "can I mTLS this fleet"
+  // and "can I address this fleet's guest," which is the point (DR-041
+  // Amendment A decision 1: trust is the single admission gate for both).
   const ownCaCertPem = readFileSync(config.caCertPath, 'utf8');
-  const trustBundlePem = await buildTrustBundlePem({
-    workspaceDir: config.workspaceDir,
+  const federatedCaProjects = loadFederatedCaProjects(config.workspaceDir, logger);
+  const trustBundlePem = await resolveFederatedCaBundle(
     ownCaCertPem,
+    federatedCaProjects,
     varsClient,
     logger,
-  });
+  );
 
   // In-memory challenge store (DR-010, #80). Process-local; server restart
   // between step 1 and step 2 of a flow invalidates outstanding challenges.
@@ -592,6 +607,22 @@ async function main(): Promise<void> {
     mTlsClientKeyPem,
     caCertPem,
   });
+  // DR-041 Amendment A (groundnuty/macf#786): outbound cross-fleet GUEST
+  // addressing. `varsClient` is the SAME shared-registry client used for the
+  // trust-bundle's federated CA cert reads above + the /sign flow — a
+  // federated fleet's `<PROJECT>_AGENT_<NAME>` registry slot lives in that
+  // SAME shared registry namespace (DR-006 shared profile scope), just
+  // under a different project prefix, so `createRegistry(varsClient,
+  // homeProject)` resolves it with no separate client + no fresh token
+  // mint. `undefined` in DR-024 local-registry mode — structurally
+  // unreachable in practice anyway, since `federatedCaProjects` is always
+  // `[]` there (a non-empty `federated_cas` throws above, at the trust-
+  // bundle resolution step, before this point is ever reached).
+  const resolveCrossProjectAgent =
+    varsClient === undefined
+      ? undefined
+      : (homeProject: string, name: string): Promise<AgentInfo | null> =>
+          createRegistry(varsClient, homeProject).get(name);
   const notifyDispatchDeps = {
     registry,
     selfAgentName: config.agentName,
@@ -603,6 +634,10 @@ async function main(): Promise<void> {
     // macf#473 piece 2: the outbound send edge site records a ledger edge
     // per peer once the dispatch outcome (delivered) is known.
     recordLedgerEdge,
+    // DR-041 Amendment A (macf#786): the SAME federated-project list that
+    // gated the trust bundle above now gates outbound guest addressing too.
+    federatedCas: federatedCaProjects,
+    resolveCrossProjectAgent,
   };
 
   // DR-038 Slice B: wire the durable outbox — `send` is the ACTUAL peer
@@ -671,9 +706,12 @@ async function main(): Promise<void> {
     {
       description: 'Notify a peer agent of an event via the channel-server network. ' +
         'If `to` is provided, POSTs to that peer\'s /notify. If absent, broadcasts to ' +
-        'all registered peers in the project (excluding self). Failure semantics are ' +
+        'all registered peers in the project (excluding self). `to` also accepts a ' +
+        '`<project>/<name>` cross-fleet guest slug (DR-041 Amendment A, macf#786), gated ' +
+        'on the fleet\'s `federated_cas` trust bundle. Failure semantics are ' +
         'observational + non-blocking per DR-023 §"Failure-mode contract" — `isError: true` ' +
-        'when peers were attempted but none delivered, signaling LLM self-correction; ' +
+        'when peers were attempted but none delivered, OR when a guest `to` fails the DR-041 ' +
+        'addressing ladder (see the `error` field), signaling LLM self-correction; ' +
         'the triggering Stop event proceeds regardless.',
       inputSchema: NotifyPeerInputSchema,
       outputSchema: NotifyPeerOutputSchema,
@@ -687,7 +725,10 @@ async function main(): Promise<void> {
         // it. NotifyPeerResult's `readonly` props make the strict-shape
         // assignment fail otherwise.
         structuredContent: { ...result },
-        isError: result.peers_attempted > 0 && result.peers_delivered === 0,
+        // DR-041 Amendment A (macf#786): a guest-addressing ladder failure
+        // (`result.error` set) is ALSO an error result, not just the
+        // pre-#786 attempted-but-undelivered case.
+        isError: result.error !== undefined || (result.peers_attempted > 0 && result.peers_delivered === 0),
       };
     },
   );

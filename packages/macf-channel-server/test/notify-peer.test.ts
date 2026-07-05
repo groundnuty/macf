@@ -351,6 +351,153 @@ describe('notify_peer tool', () => {
     });
   });
 
+  describe('DR-041 Amendment A — cross-fleet guest addressing (macf#786)', () => {
+    const guestInfo = { host: '10.0.0.5', port: 8443, type: 'permanent' as const, instance_id: 'inst-guest', started: 't' };
+
+    it('rung 1 — federated guest slug resolves via resolveCrossProjectAgent and is ATTEMPTED (not peers_attempted:0)', async () => {
+      const reg = makeRegistry({ get: null }); // own-project registry never used on this path
+      const resolveCrossProjectAgent = vi.fn().mockResolvedValue(guestInfo);
+      nextHttpsRespondsWith(200);
+      const result = await notifyPeer(
+        makeDeps(reg, { federatedCas: ['ppam-2026'], resolveCrossProjectAgent }),
+        { to: 'ppam-2026/code-agent', event: 'session-end' },
+      );
+      expect(result).toEqual({
+        delivered: true,
+        channel_state: 'online',
+        peers_attempted: 1,
+        peers_delivered: 1,
+      });
+      expect(resolveCrossProjectAgent).toHaveBeenCalledWith('ppam-2026', 'code-agent');
+      // Dispatch actually targeted the GUEST's resolved host:port, not the
+      // own-project registry.
+      expect(lastPostedOptions?.['hostname']).toBe('10.0.0.5');
+      expect(lastPostedOptions?.['port']).toBe(8443);
+      expect(reg.get).not.toHaveBeenCalled();
+    });
+
+    it('rung 2 — home fleet NOT in federated_cas → clear error, no silent peers_attempted:0', async () => {
+      const reg = makeRegistry({ get: null });
+      const resolveCrossProjectAgent = vi.fn().mockResolvedValue(guestInfo);
+      const result = await notifyPeer(
+        makeDeps(reg, { federatedCas: [], resolveCrossProjectAgent }),
+        { to: 'ppam-2026/code-agent', event: 'session-end' },
+      );
+      expect(result).toEqual({
+        delivered: false,
+        channel_state: 'offline',
+        peers_attempted: 0,
+        peers_delivered: 0,
+        error:
+          "guest ppam-2026/code-agent: home fleet 'ppam-2026' not in federated_cas — " +
+          'federate it (DR-041) to message this guest.',
+      });
+      expect(resolveCrossProjectAgent).not.toHaveBeenCalled();
+      expect(requestMock).not.toHaveBeenCalled();
+    });
+
+    it('rung 3 — home fleet federated but the guest\'s registry slot is missing → not-found error', async () => {
+      const reg = makeRegistry({ get: null });
+      const resolveCrossProjectAgent = vi.fn().mockResolvedValue(null);
+      const result = await notifyPeer(
+        makeDeps(reg, { federatedCas: ['ppam-2026'], resolveCrossProjectAgent }),
+        { to: 'ppam-2026/code-agent', event: 'session-end' },
+      );
+      expect(result).toEqual({
+        delivered: false,
+        channel_state: 'offline',
+        peers_attempted: 0,
+        peers_delivered: 0,
+        error: 'guest ppam-2026/code-agent not found in registry.',
+      });
+      expect(requestMock).not.toHaveBeenCalled();
+    });
+
+    it('rung 4 — a bare own-project name is unaffected by federatedCas/resolveCrossProjectAgent being wired (regression)', async () => {
+      const reg = makeRegistry({
+        get: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' },
+      });
+      const resolveCrossProjectAgent = vi.fn().mockResolvedValue(guestInfo);
+      nextHttpsRespondsWith(200);
+      const result = await notifyPeer(
+        makeDeps(reg, { federatedCas: ['ppam-2026'], resolveCrossProjectAgent }),
+        { to: 'peer-a', event: 'session-end' },
+      );
+      expect(result).toEqual({
+        delivered: true,
+        channel_state: 'online',
+        peers_attempted: 1,
+        peers_delivered: 1,
+      });
+      expect(reg.get).toHaveBeenCalledWith('peer-a');
+      expect(resolveCrossProjectAgent).not.toHaveBeenCalled();
+    });
+
+    it('omitting federatedCas/resolveCrossProjectAgent entirely degrades a guest slug to the rung-2 not-federated error (never a crash)', async () => {
+      const reg = makeRegistry({ get: null });
+      const result = await notifyPeer(makeDeps(reg), {
+        to: 'ppam-2026/code-agent',
+        event: 'session-end',
+      });
+      expect(result.error).toBe(
+        "guest ppam-2026/code-agent: home fleet 'ppam-2026' not in federated_cas — " +
+          'federate it (DR-041) to message this guest.',
+      );
+    });
+
+    it('the A2A outbound path dispatches to a resolved guest exactly like an own-project peer (same resolved-peer object)', async () => {
+      const reg = makeRegistry({ get: null });
+      const resolveCrossProjectAgent = vi.fn().mockResolvedValue(guestInfo);
+      const agentCard = {
+        supportedInterfaces: [{ protocolBinding: 'JSONRPC' as const, url: 'https://10.0.0.5:8443' }],
+      };
+      const a2aClient = {
+        getAgentCard: vi.fn().mockResolvedValue(agentCard),
+        sendMessage: vi.fn().mockResolvedValue({ id: 'task-1', status: { state: 'TASK_STATE_COMPLETED' } }),
+      };
+      const result = await notifyPeer(
+        makeDeps(reg, { federatedCas: ['ppam-2026'], resolveCrossProjectAgent, a2aClient }),
+        { to: 'ppam-2026/code-agent', event: 'custom', message: 'hi' },
+      );
+      expect(result).toEqual({
+        delivered: true,
+        channel_state: 'online',
+        peers_attempted: 1,
+        peers_delivered: 1,
+      });
+      expect(a2aClient.sendMessage).toHaveBeenCalledWith(
+        'https://10.0.0.5:8443',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('a LATER outbox retry re-resolves the guest via resolveCrossProjectAgent again (guest-aware across retries, not just the first attempt)', async () => {
+      const reg = makeRegistry({ get: null });
+      const resolveCrossProjectAgent = vi.fn().mockResolvedValue(guestInfo);
+      nextHttpsErrorsWith(new Error('ECONNREFUSED'));
+      const deps = makeDeps(reg, { federatedCas: ['ppam-2026'], resolveCrossProjectAgent });
+      const first = await notifyPeer(deps, { to: 'ppam-2026/code-agent', event: 'session-end' });
+      expect(first.channel_state).toBe('offline');
+      // Called TWICE already on the first `notifyPeer()` call — once by
+      // `resolveTargetPeers` (initial ladder evaluation) + once more by the
+      // outbox's `send` adapter re-resolving at SEND time (DR-038 Slice B's
+      // "persist-then-send" fires an immediate `driveOnce()` inline). This
+      // mirrors the pre-#786 own-project `registry.get()` double-call shape
+      // exactly — not a regression this change introduces.
+      expect(resolveCrossProjectAgent).toHaveBeenCalledTimes(2);
+
+      // The entry survived in the outbox (Decision 4) — a later driveOnce()
+      // tick (simulating the periodic ticker, past the backoff window) re-
+      // resolves the SAME guest slug a THIRD time, proving retry-time
+      // resolution is guest-aware too, not just the first attempt.
+      nextHttpsRespondsWith(200);
+      await deps.outbox.driveOnce(Date.now() + 60_000);
+      expect(resolveCrossProjectAgent).toHaveBeenCalledTimes(3);
+      expect(resolveCrossProjectAgent).toHaveBeenNthCalledWith(3, 'ppam-2026', 'code-agent');
+    });
+  });
+
   describe('broadcast mode (`to` absent)', () => {
     it('returns offline+0 when no peers registered', async () => {
       const reg = makeRegistry({ list: [] });

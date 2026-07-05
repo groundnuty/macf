@@ -25,6 +25,7 @@ import {
   gatherGuestStatuses,
   guestStatusesToJson,
   loadGuestBindings,
+  loadFederatedCas,
   resolveGuestStatus,
   type GuestProbeFn,
   type GuestResolveFn,
@@ -288,6 +289,81 @@ describe('loadGuestBindings — fs loader + degradation', () => {
       expect(errSpy).toHaveBeenCalled();
     } finally {
       errSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// DR-041 Amendment A (groundnuty/macf#786): `loadFederatedCas` reads the SAME
+// `.github/macf-fleet.json` file `loadGuestBindings` does (different field) —
+// gates `macf-ping`'s cross-fleet guest addressing.
+describe('loadFederatedCas — fs loader + degradation (macf#786)', () => {
+  function withTmpFleet(content: string | null): string {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-federated-cas-'));
+    if (content !== null) {
+      mkdirSync(join(dir, '.github'), { recursive: true });
+      writeFileSync(join(dir, '.github', 'macf-fleet.json'), content);
+    }
+    return dir;
+  }
+
+  it('returns [] when the file is absent', () => {
+    const dir = withTmpFleet(null);
+    try {
+      expect(loadFederatedCas(dir)).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('loads federated_cas from a valid file', () => {
+    const dir = withTmpFleet(JSON.stringify({ federated_cas: ['ppam-2026', 'icsoc-2026'] }));
+    try {
+      expect(loadFederatedCas(dir)).toEqual(['ppam-2026', 'icsoc-2026']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns [] when federated_cas is absent from an otherwise-valid file', () => {
+    const dir = withTmpFleet(JSON.stringify({ guests: [routeGuest] }));
+    try {
+      expect(loadFederatedCas(dir)).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('degrades to [] (loud) on malformed JSON', () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const dir = withTmpFleet('{ not json');
+    try {
+      expect(loadFederatedCas(dir)).toEqual([]);
+      expect(errSpy).toHaveBeenCalled();
+    } finally {
+      errSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('degrades to [] (loud) on a schema-invalid federated_cas entry', () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const dir = withTmpFleet(JSON.stringify({ federated_cas: [123] }));
+    try {
+      expect(loadFederatedCas(dir)).toEqual([]);
+      expect(errSpy).toHaveBeenCalled();
+    } finally {
+      errSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('guests + federated_cas coexist — loading one does not disturb the other', () => {
+    const dir = withTmpFleet(JSON.stringify({ guests: [routeGuest], federated_cas: ['ppam-2026'] }));
+    try {
+      expect(loadGuestBindings(dir)).toHaveLength(1);
+      expect(loadFederatedCas(dir)).toEqual(['ppam-2026']);
+    } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
