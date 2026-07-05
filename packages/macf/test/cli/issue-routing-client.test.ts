@@ -28,6 +28,11 @@ import * as x509Lib from '@peculiar/x509';
 // everything else is the cleanest way to intercept just the two
 // functions under test without rebuilding the whole barrel.
 const mockRegistryGet = vi.fn<(name: string) => Promise<unknown>>();
+// #800: `issueRoutingClient` also writes the issuer-fingerprint bookkeeping
+// variable via `getVariablesClient` → `createClientFromConfig` → `createGitHubClient`
+// (a raw GitHubVariablesClient, DISTINCT from the AgentInfo registry above). Mock it
+// too so that write is intercepted (never a real network call) + assertable.
+const mockWriteVariable = vi.fn<(name: string, value: string) => Promise<void>>();
 vi.mock('@groundnuty/macf-core', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@groundnuty/macf-core')>();
   return {
@@ -42,6 +47,12 @@ vi.mock('@groundnuty/macf-core', async (importOriginal) => {
       list: vi.fn().mockResolvedValue([]),
       remove: vi.fn(),
     }),
+    createGitHubClient: () => ({
+      writeVariable: mockWriteVariable,
+      readVariable: vi.fn().mockResolvedValue(null),
+      listVariables: vi.fn().mockResolvedValue([]),
+      deleteVariable: vi.fn(),
+    }),
   };
 });
 
@@ -50,7 +61,7 @@ vi.mock('@groundnuty/macf-core', async (importOriginal) => {
 // the provider's module-scoped initialization.
 import '@groundnuty/macf-core';
 import { issueRoutingClient } from '../../src/cli/commands/certs.js';
-import { createCA } from '@groundnuty/macf-core';
+import { createCA, caCertFingerprint, toVariableSegment } from '@groundnuty/macf-core';
 import { writeAgentConfig } from '../../src/cli/config.js';
 import { caDir, caCertPath, caKeyPath } from '../../src/cli/config.js';
 import type { MacfAgentConfig } from '../../src/cli/config.js';
@@ -118,6 +129,7 @@ describe('issueRoutingClient (#119)', () => {
     });
     process.exitCode = 0;
     mockRegistryGet.mockReset().mockResolvedValue(null);
+    mockWriteVariable.mockReset().mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -307,5 +319,49 @@ describe('issueRoutingClient (#119)', () => {
     } finally {
       cleanup(project, projectDir);
     }
+  });
+
+  describe('routing-client cert issuer recording (#800)', () => {
+    it('writes <PROJECT>_ROUTING_CLIENT_CERT_ISSUER with the CA fingerprint + a mint timestamp', async () => {
+      const project = `T${Date.now()}${Math.floor(Math.random() * 1e6)}`;
+      const { projectDir, caCertPath: caCertP } = await setupWorkspace(project);
+      try {
+        const outDir = join(projectDir, 'out');
+        await issueRoutingClient(projectDir, { outDir });
+
+        expect(process.exitCode).toBe(0);
+        const expectedVarName = `${toVariableSegment(project)}_ROUTING_CLIENT_CERT_ISSUER`;
+        const call = mockWriteVariable.mock.calls.find(([name]) => name === expectedVarName);
+        expect(call).toBeDefined();
+
+        const written = JSON.parse(call![1]) as { issuer_fingerprint: string; minted_at: string };
+        const caCertPem = readFileSync(caCertP, 'utf-8');
+        expect(written.issuer_fingerprint).toBe(caCertFingerprint(caCertPem));
+        expect(() => new Date(written.minted_at).toISOString()).not.toThrow();
+        expect(new Date(written.minted_at).toISOString()).toBe(written.minted_at);
+
+        // Confirmed on stdout too — the operator-visible baseline pointer.
+        expect(logs.join('\n')).toContain(expectedVarName);
+      } finally {
+        cleanup(project, projectDir);
+      }
+    });
+
+    it('a registry-write failure warns but does NOT block cert emission', async () => {
+      const project = `T${Date.now()}${Math.floor(Math.random() * 1e6)}`;
+      const { projectDir } = await setupWorkspace(project);
+      try {
+        mockWriteVariable.mockRejectedValueOnce(new Error('simulated registry outage'));
+        const outDir = join(projectDir, 'out');
+        await issueRoutingClient(projectDir, { outDir });
+
+        expect(process.exitCode).toBe(0); // still succeeds
+        expect(existsSync(join(outDir, 'routing-action-cert.pem'))).toBe(true);
+        expect(warnings.join('\n')).toMatch(/failed to record the routing-client cert issuer/);
+        expect(warnings.join('\n')).toMatch(/simulated registry outage/);
+      } finally {
+        cleanup(project, projectDir);
+      }
+    });
   });
 });
