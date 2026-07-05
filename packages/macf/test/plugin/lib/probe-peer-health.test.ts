@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
+import type { AgentInfo, GitHubVariablesClient, HealthResponse } from '@groundnuty/macf-core';
 
 vi.mock('../../../src/plugin/lib/health.js', () => ({
   pingAgent: vi.fn(),
@@ -129,5 +129,92 @@ describe('probePeerHealth (#325 regression)', () => {
     expect(pingAgent).toHaveBeenCalledWith(
       expect.objectContaining({ host: '100.86.5.117', port: 8847 }),
     );
+  });
+});
+
+function fakeVarsClient(vars: Record<string, string | null>): GitHubVariablesClient {
+  return {
+    readVariable: async (name: string) => (name in vars ? vars[name]! : null),
+    writeVariable: async () => undefined,
+    listVariables: async () => [],
+    deleteVariable: async () => undefined,
+  };
+}
+
+describe('probePeerHealth — federation-aware guest probe (DR-041 Amendment B, #794)', () => {
+  function setEnv(): { caPath: string } {
+    const caPath = join(workDir, 'ca.pem');
+    writeFileSync(caPath, 'OWN-CA-PEM');
+    process.env['MACF_CA_CERT'] = caPath;
+    process.env['MACF_AGENT_CERT'] = join(workDir, 'agent-cert.pem');
+    process.env['MACF_AGENT_KEY'] = join(workDir, 'agent-key.pem');
+    return { caPath };
+  }
+
+  it('a guest probe builds a bundle that includes the federated CA', async () => {
+    setEnv();
+    vi.mocked(pingAgent).mockResolvedValue(sampleHealth);
+    const varsClient = fakeVarsClient({ PPAM_2026_CA_CERT: 'FOREIGN-CA-PEM' });
+
+    const result = await probePeerHealth(samplePeer, {
+      homeProject: 'ppam-2026',
+      federatedCaProjects: ['ppam-2026'],
+      varsClient,
+    });
+
+    expect(result).toEqual(sampleHealth);
+    expect(pingAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ caCertPem: 'OWN-CA-PEM\nFOREIGN-CA-PEM' }),
+    );
+  });
+
+  it('a same-fleet peer probe (no guest param) uses own-CA only — UNCHANGED', async () => {
+    setEnv();
+    vi.mocked(pingAgent).mockResolvedValue(sampleHealth);
+
+    await probePeerHealth(samplePeer);
+
+    expect(pingAgent).toHaveBeenCalledWith(expect.objectContaining({ caCertPem: 'OWN-CA-PEM' }));
+  });
+
+  it('homeProject NOT declared in federatedCaProjects → probes with own CA only (pre-#794 passthrough)', async () => {
+    setEnv();
+    vi.mocked(pingAgent).mockResolvedValue(sampleHealth);
+
+    const result = await probePeerHealth(samplePeer, {
+      homeProject: 'unknown-fleet',
+      federatedCaProjects: ['ppam-2026'],
+      varsClient: undefined,
+    });
+
+    expect(result).toEqual(sampleHealth);
+    expect(pingAgent).toHaveBeenCalledWith(expect.objectContaining({ caCertPem: 'OWN-CA-PEM' }));
+  });
+
+  it('an unresolvable DECLARED federated CA degrades the guest to offline (null) — never throws', async () => {
+    setEnv();
+    const varsClient = fakeVarsClient({}); // PPAM_2026_CA_CERT resolves null
+
+    const result = await probePeerHealth(samplePeer, {
+      homeProject: 'ppam-2026',
+      federatedCaProjects: ['ppam-2026'],
+      varsClient,
+    });
+
+    expect(result).toBeNull();
+    expect(pingAgent).not.toHaveBeenCalled();
+  });
+
+  it('local-registry mode (no varsClient) + a declared federated project degrades to offline (null)', async () => {
+    setEnv();
+
+    const result = await probePeerHealth(samplePeer, {
+      homeProject: 'ppam-2026',
+      federatedCaProjects: ['ppam-2026'],
+      varsClient: undefined,
+    });
+
+    expect(result).toBeNull();
+    expect(pingAgent).not.toHaveBeenCalled();
   });
 });

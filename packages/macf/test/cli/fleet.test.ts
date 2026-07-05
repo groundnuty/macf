@@ -26,6 +26,7 @@ import {
   type FleetProbeFn,
   type FleetStatusDeps,
 } from '../../src/cli/commands/fleet.js';
+import type { GuestProbeFn } from '../../src/cli/commands/fleet-guests.js';
 
 const NOW = Date.parse('2026-06-26T12:00:00Z');
 const isoInDays = (d: number): string => new Date(NOW + d * 86_400_000).toISOString();
@@ -377,13 +378,16 @@ describe('runFleetStatus — GUEST block (DR-036 Amendment A, #679)', () => {
     probe: FleetProbeFn,
     guests: readonly GuestBinding[],
     resolveGuest: (home: string, name: string) => Promise<AgentInfo | null>,
+    guestProbe?: GuestProbeFn,
   ): FleetStatusDeps => ({
     project: 'icsoc-2026',
     listPeers: async () => peers,
     probe,
     loadGuests: () => guests,
     resolveGuest,
-    guestProbe: probe,
+    // Adapt the 2-arg members probe to `GuestProbeFn`'s 3-arg shape
+    // (DR-041 Amendment B, macf#794) unless the test supplies its own.
+    guestProbe: guestProbe ?? ((_homeProject, host, port) => probe(host, port)),
   });
 
   it('renders a members table AND a separate GUEST block for a route guest', async () => {

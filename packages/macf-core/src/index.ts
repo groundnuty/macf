@@ -29,6 +29,7 @@ export * from './guest.js';
 export * from './norm.js';
 export * from './protected-invariant-norms.js';
 export * from './mtls-health-ping.js';
+export * from './trust-bundle.js';
 export * from './certs/index.js';
 export * from './registry/index.js';
 export * from './delivery/index.js';

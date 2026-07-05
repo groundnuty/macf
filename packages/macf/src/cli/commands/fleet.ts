@@ -37,11 +37,13 @@ import {
   generateToken,
   pingAgentHealth,
   toVariableSegment,
+  resolveGuestProbeCaBundle,
 } from '@groundnuty/macf-core';
-import type { AgentInfo, GuestBinding, HealthResponse } from '@groundnuty/macf-core';
+import type { AgentInfo, GuestBinding, HealthResponse, Logger } from '@groundnuty/macf-core';
 import { formatTable } from './ps.js';
 import {
   loadGuestBindings,
+  loadFederatedCas,
   gatherGuestStatuses,
   formatGuestBlock,
   guestStatusesToJson,
@@ -49,22 +51,20 @@ import {
   type GuestResolveFn,
   type GuestStatus,
 } from './fleet-guests.js';
+import { rawField, formatUptime, formatRunState, formatOtel } from './health-fields.js';
+import type { AgentRunState, AgentOtelReport } from './health-fields.js';
 
-/**
- * DR-030 sibling-increment `/health.state` object self-report — read
- * DEFENSIVELY (NOT yet in the `HealthResponse` type). All fields optional; the
- * field may also arrive as a plain `"idle"|"busy"` string (DR-030 §5).
- */
-export interface AgentRunState {
-  readonly status?: string;
-  readonly turn_number?: number;
-  readonly elapsed_ms?: number;
-}
+// Re-exported so existing `from './fleet.js'` imports (incl. tests) keep
+// working unchanged after the DR-030 `/health` field renderers moved to
+// `health-fields.ts` (groundnuty/macf#794) to be shared with `fleet-guests.ts`.
+export { rawField, formatUptime, formatRunState, formatOtel };
+export type { AgentRunState, AgentOtelReport };
 
-/** DR-030 sibling-increment `/health.otel` self-report — read DEFENSIVELY. */
-export interface AgentOtelReport {
-  readonly endpoint_reachable?: boolean;
-}
+/** No-op logger for the guest-probe trust-bundle resolution below — a
+ * misconfigured federated project degrades that ONE guest to offline
+ * (caught at the call site); there's no operator-facing sink to log to
+ * mid-`fleet status` render. */
+const SILENT_LOGGER: Logger = { info: () => {}, warn: () => {}, error: () => {} };
 
 /** One agent's roster + reachability + raw self-report body. */
 export interface FleetAgentStatus {
@@ -78,11 +78,6 @@ export interface FleetAgentStatus {
 
 /** Probe a single endpoint's `/health`; null on any failure. Injectable for tests. */
 export type FleetProbeFn = (host: string, port: number) => Promise<HealthResponse | null>;
-
-/** Read an arbitrary (possibly not-yet-typed) field off a `/health` body. */
-function rawField(health: HealthResponse | null, key: string): unknown {
-  return health ? (health as unknown as Record<string, unknown>)[key] : undefined;
-}
 
 /**
  * Probe one peer, treating a REJECTED probe the SAME as a `null` resolution.
@@ -134,16 +129,6 @@ export async function gatherFleetStatus(
   });
 }
 
-/** Human-readable elapsed from whole seconds: `45s` / `18m` / `2h5m`. */
-export function formatUptime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return '—';
-  if (seconds < 60) return `${Math.floor(seconds)}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  return m > 0 ? `${h}h${m}m` : `${h}h`;
-}
-
 /** Whole days from `now` (ms) until an ISO timestamp; negative when past. */
 export function daysUntil(isoDate: string, now: number): number {
   const ms = new Date(isoDate).getTime() - now;
@@ -163,33 +148,6 @@ export function formatCertExpiry(certExpiry: string | null | undefined, now: num
   if (d < 7) return `${d}d ✗`;
   if (d < 30) return `${d}d ⚠`;
   return `${d}d`;
-}
-
-/**
- * Render the `state` self-report. Tolerates the field being absent, a plain
- * `"idle"|"busy"` string (DR-030 §5), or a `{ status, turn_number, elapsed_ms }`
- * object (rendered like `busy 18m on turn 7`).
- */
-export function formatRunState(raw: unknown): string {
-  if (raw == null) return '—';
-  if (typeof raw === 'string') return raw || '—';
-  if (typeof raw === 'object') {
-    const s = raw as AgentRunState;
-    const parts: string[] = [];
-    if (typeof s.status === 'string' && s.status) parts.push(s.status);
-    if (typeof s.elapsed_ms === 'number') parts.push(formatUptime(Math.floor(s.elapsed_ms / 1000)));
-    if (typeof s.turn_number === 'number') parts.push(`on turn ${s.turn_number}`);
-    return parts.length ? parts.join(' ') : '—';
-  }
-  return '—';
-}
-
-/** Render the `otel` self-report's `endpoint_reachable` flag. */
-export function formatOtel(raw: unknown): string {
-  if (raw == null || typeof raw !== 'object') return '—';
-  const o = raw as AgentOtelReport;
-  if (typeof o.endpoint_reachable !== 'boolean') return '—';
-  return o.endpoint_reachable ? 'reachable' : 'unreachable ✗';
 }
 
 /**
@@ -323,6 +281,35 @@ async function resolveDepsFromRegistry(
   const keyPath = agentKeyPath(projectDir);
   const probe: FleetProbeFn = (host, port) =>
     pingAgentHealth({ host, port, caCertPem, certPath, keyPath });
+
+  // DR-041 Amendment B (groundnuty/macf#794): a federation-aware guest probe.
+  // `client` above is the SAME shared-registry `GitHubVariablesClient` already
+  // built for this project's own `<PROJECT>_CA_CERT` read — a federated
+  // fleet's CA variable lives in that SAME registry namespace (DR-006 shared
+  // profile scope), so no separate client is needed (mirrors
+  // `macf-channel-server/src/server.ts`'s `varsClient` reuse). `federated_cas`
+  // is loaded ONCE per `fleet status` invocation, not per-guest.
+  const federatedCaProjects = loadFederatedCas(projectDir);
+  const guestProbe: GuestProbeFn = async (homeProject, host, port) => {
+    let guestCaCertPem: string;
+    try {
+      guestCaCertPem = await resolveGuestProbeCaBundle(
+        caCertPem,
+        homeProject,
+        federatedCaProjects,
+        client,
+        SILENT_LOGGER,
+      );
+    } catch {
+      // A misconfigured DECLARED federated project must never crash the whole
+      // roster — degrade THIS guest to offline (mirrors `resolveGuestStatus`'s
+      // own `.catch(() => null)` around the probe call; this belt-and-braces
+      // catch covers the bundle-resolution step specifically).
+      return null;
+    }
+    return pingAgentHealth({ host, port, caCertPem: guestCaCertPem, certPath, keyPath });
+  };
+
   return {
     ok: true,
     deps: {
@@ -336,7 +323,7 @@ async function resolveDepsFromRegistry(
       // cross-project scope, so a guest resolves only if it lives in this file.
       resolveGuest: (homeProject, name) =>
         createRegistryFromConfig(config.registry, homeProject, token).get(name),
-      guestProbe: probe,
+      guestProbe,
     },
   };
 }
@@ -365,12 +352,16 @@ export async function runFleetStatus(
   // consumer DEPENDS on. Resolved from the shared registry scope; NEVER added to
   // the members list nor to any supervision path.
   const guestBindings = resolved.loadGuests ? resolved.loadGuests() : [];
+  // Fall back to the members probe, adapted to `GuestProbeFn`'s 3-arg shape
+  // (ignoring `homeProject`) — pre-#794 behavior for callers that don't wire
+  // a federation-aware `guestProbe` explicitly.
+  const guestProbeFallback: GuestProbeFn = (_homeProject, host, port) => resolved.probe(host, port);
   const guests =
     guestBindings.length > 0 && resolved.resolveGuest
       ? await gatherGuestStatuses(
           guestBindings,
           resolved.resolveGuest,
-          resolved.guestProbe ?? resolved.probe,
+          resolved.guestProbe ?? guestProbeFallback,
         )
       : [];
 

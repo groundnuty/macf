@@ -182,6 +182,7 @@ describe('buildGuestRows / formatGuestBlock', () => {
       'route',
       '100.64.0.9:4900',
       'online',
+      '—', // STATE — this fixture's health() carries no `state` field
       '100.64.0.9-4900',
       'fresh',
     ]);
@@ -195,9 +196,25 @@ describe('buildGuestRows / formatGuestBlock', () => {
       'operator-relay',
       '—',
       'local-mode — home-fleet-observable only',
+      '—', // STATE — local-mode guest is never probed, no live health
       '—',
       '—',
     ]);
+  });
+
+  it('a federated guest with a live turn-state self-report shows STATE (DR-041 Amendment B, #794)', () => {
+    const busyStatuses: readonly GuestStatus[] = [
+      {
+        binding: routeGuest,
+        homeProject: 'ppam-2026',
+        name: 'code-agent',
+        info: info('100.64.0.9', 4900),
+        reachability: 'online',
+        health: { ...health(), state: { status: 'busy', turn_number: 3 } } as HealthResponse,
+      },
+    ];
+    const rows = buildGuestRows(busyStatuses, NOW);
+    expect(rows[0]).toContain('busy on turn 3');
   });
 
   it('block carries the GUEST header + the unsupervised legend', () => {

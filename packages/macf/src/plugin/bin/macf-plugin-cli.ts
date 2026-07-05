@@ -21,10 +21,18 @@ import { mintFreshGitHubToken } from '../lib/fresh-github-token.js';
 import { checkIssuesAcrossFleet } from '../lib/work.js';
 import { getInboxStore } from '../lib/inbox-store.js';
 import { drainInbox } from '../lib/inbox-drain.js';
+import { buildSharedVarsClient } from '../lib/shared-vars-client.js';
 import { createRegistryFromConfig } from '@groundnuty/macf-core';
 import { toVariableSegment } from '@groundnuty/macf-core';
 import { resolveGuestAddress } from '@groundnuty/macf-core';
-import type { AgentInfo, HealthResponse, CrossProjectAgentResolver } from '@groundnuty/macf-core';
+import { resolveGuestProbeCaBundle } from '@groundnuty/macf-core';
+import type {
+  AgentInfo,
+  HealthResponse,
+  CrossProjectAgentResolver,
+  Logger,
+  GitHubVariablesClient,
+} from '@groundnuty/macf-core';
 import {
   loadGuestBindings,
   loadFederatedCas,
@@ -36,15 +44,33 @@ import {
 
 const command = process.argv[2];
 
+/** No-op logger for guest-probe trust-bundle resolution — a misconfigured
+ * federated project degrades that ONE guest to offline (`probePeerHealth`
+ * swallows the thrown `TrustBundleError`); there's no operator-facing sink
+ * to log to mid-`/macf-peers` render. */
+const SILENT_LOGGER: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+
 /**
  * Probe a `route` guest's `/health` by host:port, reusing the same cert-env
  * mTLS path `probePeerHealth` uses for members (returns null when the cert env
  * is missing or the probe fails → the guest renders offline, still visible via
  * the registry). Only `host`/`port` of the synthetic `AgentInfo` are used.
+ *
+ * Federation-aware (DR-041 Amendment B, groundnuty/macf#794): `homeProject` +
+ * the `federatedCaProjects`/`varsClient` context are threaded through to
+ * `probePeerHealth`'s optional `GuestProbeContext` so a guest whose home
+ * project is declared in `federated_cas` is probed with a trust bundle that
+ * includes that project's federated CA, instead of the own-CA-only default.
  */
-function probeGuestHealth(host: string, port: number): Promise<HealthResponse | null> {
+function probeGuestHealth(
+  homeProject: string,
+  host: string,
+  port: number,
+  federatedCaProjects: readonly string[],
+  varsClient: GitHubVariablesClient | undefined,
+): Promise<HealthResponse | null> {
   const info: AgentInfo = { host, port, type: 'permanent', instance_id: '', started: '' };
-  return probePeerHealth({ name: 'guest', info });
+  return probePeerHealth({ name: 'guest', info }, { homeProject, federatedCaProjects, varsClient });
 }
 
 async function main(): Promise<void> {
@@ -101,8 +127,14 @@ async function main(): Promise<void> {
       if (guestBindings.length > 0) {
         const resolveGuest: GuestResolveFn = (homeProject, name) =>
           createRegistryFromConfig(registryConfig, homeProject, token).get(name);
-        const guestProbe: GuestProbeFn = (host, port) =>
-          probeGuestHealth(host, port);
+        // DR-041 Amendment B (groundnuty/macf#794): federation-aware guest
+        // probe — a guest whose home project is declared in `federated_cas`
+        // gets probed with a trust bundle that includes that project's CA
+        // (loaded/built ONCE here, not per-guest).
+        const federatedCaProjects = loadFederatedCas(workspaceDir);
+        const varsClient = buildSharedVarsClient(registryConfig, token);
+        const guestProbe: GuestProbeFn = (homeProject, host, port) =>
+          probeGuestHealth(homeProject, host, port, federatedCaProjects, varsClient);
         const guests = await gatherGuestStatuses(guestBindings, resolveGuest, guestProbe);
         console.log('');
         console.log(formatGuestBlock(guests, Date.now()));
@@ -151,9 +183,14 @@ async function main(): Promise<void> {
         createRegistryFromConfig(registryConfig, homeProject, token).get(name);
       const guestResolution = await resolveGuestAddress(targetName, federatedCas, resolveCrossProjectAgent);
 
+      // DR-041 Amendment B (groundnuty/macf#794): when the resolved target IS
+      // a cross-fleet guest, remember its home project so the CA bundle built
+      // below is federation-aware instead of own-CA-only.
+      let guestHomeProject: string | undefined;
       let targetInfo: AgentInfo;
       if (guestResolution.kind === 'resolved') {
         targetInfo = guestResolution.info;
+        guestHomeProject = guestResolution.homeProject;
       } else if (guestResolution.kind === 'not-a-guest-ref') {
         // Look up the target in the registry. Names in the registry are
         // sanitized (uppercase, underscores), so match in that space.
@@ -174,7 +211,23 @@ async function main(): Promise<void> {
         return;
       }
 
-      const caCertPem = readFileSync(caCertPath, 'utf-8');
+      let caCertPem = readFileSync(caCertPath, 'utf-8');
+      if (guestHomeProject !== undefined) {
+        // Federation-aware bundle for a resolved cross-fleet guest (macf#794).
+        // Deliberately UNGUARDED here (unlike `probePeerHealth`'s guest path,
+        // which swallows to `null`): `/macf-ping` is an interactive,
+        // single-target command — a `TrustBundleError` from an unresolvable
+        // DECLARED federated project should surface LOUD (via `main()`'s
+        // catch-all below), not silently render as "offline".
+        const varsClient = buildSharedVarsClient(registryConfig, token);
+        caCertPem = await resolveGuestProbeCaBundle(
+          caCertPem,
+          guestHomeProject,
+          federatedCas,
+          varsClient,
+          SILENT_LOGGER,
+        );
+      }
       const health = await pingAgent({
         host: targetInfo.host,
         port: targetInfo.port,
