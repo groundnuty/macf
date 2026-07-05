@@ -4,6 +4,8 @@ import {
   fetchLatestCliVersion,
   fetchLatestPluginVersion,
   fetchLatestActionsVersion,
+  resolveActionsRefToFullTag,
+  isImmutableActionsTag,
   isValidSemver,
   isValidActionsRef,
   compareSemver,
@@ -370,5 +372,79 @@ describe('GitHub API auth (#186)', () => {
   it('keeps 500 classified as invalid_response (non-auth server error)', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 500 }) as typeof fetch;
     expect(await fetchLatestPluginVersion()).toEqual({ status: 'invalid_response', value: null });
+  });
+});
+
+describe('isImmutableActionsTag', () => {
+  it('accepts a three-component tag', () => {
+    expect(isImmutableActionsTag('v3.4.1')).toBe(true);
+    expect(isImmutableActionsTag('v1.0.0')).toBe(true);
+  });
+
+  it('rejects floating major / minor refs and main', () => {
+    expect(isImmutableActionsTag('v3')).toBe(false);
+    expect(isImmutableActionsTag('v3.4')).toBe(false);
+    expect(isImmutableActionsTag('main')).toBe(false);
+  });
+});
+
+describe('resolveActionsRefToFullTag (macf#797)', () => {
+  const tagList = [
+    { name: 'v3.4.1' }, { name: 'v3.4.0' }, { name: 'v3.4' }, { name: 'v3.3.0' },
+    { name: 'v3.10.0' }, { name: 'v3' }, { name: 'v2.1.0' }, { name: 'v1.3.4' }, { name: 'main' },
+  ];
+
+  it('returns an already-immutable tag unchanged WITHOUT a network call', async () => {
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as typeof fetch;
+    expect(await resolveActionsRefToFullTag('v3.4.1')).toBe('v3.4.1');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('returns null for main (no network)', async () => {
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as typeof fetch;
+    expect(await resolveActionsRefToFullTag('main')).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('resolves a bare major to the highest full tag within that major (semver-aware)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true, json: async () => tagList,
+    }) as typeof fetch;
+    // v3.10.0 must beat v3.4.1 — numeric, not lexicographic.
+    expect(await resolveActionsRefToFullTag('v3')).toBe('v3.10.0');
+  });
+
+  it('resolves a bare minor to the highest full tag within that minor', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true, json: async () => tagList,
+    }) as typeof fetch;
+    expect(await resolveActionsRefToFullTag('v3.4')).toBe('v3.4.1');
+  });
+
+  it('does not cross a major boundary (v1 never resolves to a v3 tag)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true, json: async () => tagList,
+    }) as typeof fetch;
+    expect(await resolveActionsRefToFullTag('v1')).toBe('v1.3.4');
+  });
+
+  it('returns null when GitHub is unreachable (caller keeps the floating ref)', async () => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('ECONNREFUSED')) as typeof fetch;
+    expect(await resolveActionsRefToFullTag('v3')).toBeNull();
+  });
+
+  it('returns null on a non-ok response', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 403 }) as typeof fetch;
+    expect(await resolveActionsRefToFullTag('v3')).toBeNull();
+  });
+
+  it('returns null when no full tag matches the requested major', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true, json: async () => [{ name: 'v3' }, { name: 'v3.4' }, { name: 'main' }],
+    }) as typeof fetch;
+    // Only floating refs present, no vX.Y.Z → null.
+    expect(await resolveActionsRefToFullTag('v3')).toBeNull();
   });
 });

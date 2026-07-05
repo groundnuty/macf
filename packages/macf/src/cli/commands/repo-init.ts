@@ -5,6 +5,7 @@ import { generateToken } from '@groundnuty/macf-core';
 import type { RegistryConfig } from '@groundnuty/macf-core';
 import { registryPathPrefix } from '../registry-helper.js';
 import { isValidProjectName } from '../config.js';
+import { resolveActionsRefToFullTag, isImmutableActionsTag } from '../version-resolver.js';
 
 export interface RepoInitOptions {
   readonly repo?: string;
@@ -169,6 +170,25 @@ export function generateWorkflow(
     '    types: [opened]',
     '  pull_request_review:',
     '    types: [submitted]',
+    // CI-completion routing (macf-actions#6, v1.3+/v3+): notify an agent when a
+    // PR's checks finish. Inert on older pins (the reusable workflow's
+    // route-by-ci-completion job simply doesn't fire); present so the generated
+    // router is byte-consistent with macf's own committed router.
+    '  check_suite:',
+    '    types: [completed]',
+    // The caller MUST grant at least what the reusable workflow's jobs declare,
+    // or the reusable-workflow call fails at composition with `startup_failure`
+    // — every event is dropped and NOTHING routes. This was the icsoc-2026
+    // routing outage (macf#797): a bootstrap-generated router with NO
+    // permissions block silently never routed a single event from setup until
+    // an operator noticed days later. `checks: read` backs the check_suite
+    // CI-completion job (without it that job 403s inside the reusable workflow).
+    // Mirrors macf's own committed .github/workflows/agent-router.yml.
+    'permissions:',
+    '  contents: read',
+    '  issues: write',
+    '  pull-requests: read',
+    '  checks: read',
     'jobs:',
     '  route:',
     `    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@${actionsVersion}`,
@@ -424,6 +444,38 @@ export async function repoInit(
 
   validateVersion(opts.actionsVersion);
 
+  // macf#797 + operator decision 2026-07-05: the router pin must be an
+  // IMMUTABLE full tag (`v3.4.1`), not a floating major/minor (`v3`/`v3.4`),
+  // so a fleet never silently receives a behavioral change within a major
+  // (floating `@v3` currently even lags `@v3.4.1`; behavioral shifts like
+  // v3.4.0 origin-routing ship inside the major). Resolve a floating v3+ ref
+  // to the latest full tag at generation time. Degrade LOUDLY — keep the
+  // floating ref + warn — if GitHub is unreachable, rather than hard-fail,
+  // since repo-init otherwise tolerates offline (e.g. label creation is
+  // skipped without a token). Legacy v1.x/v2.x pins (operator-authored
+  // substrate routers, not bootstrap-generated) are left untouched.
+  let pinnedVersion = opts.actionsVersion;
+  if (
+    isV3PlusActionsVersion(opts.actionsVersion) &&
+    !isImmutableActionsTag(opts.actionsVersion) &&
+    opts.actionsVersion !== 'main'
+  ) {
+    const resolved = await resolveActionsRefToFullTag(opts.actionsVersion);
+    if (resolved) {
+      pinnedVersion = resolved;
+      process.stderr.write(
+        `✓ Pinned router to immutable ${resolved} (resolved from floating "${opts.actionsVersion}"; macf#797).\n`,
+      );
+    } else {
+      process.stderr.write(
+        `Warning: could not resolve "${opts.actionsVersion}" to an immutable full tag ` +
+          `(GitHub unreachable or no matching vX.Y.Z). The router will pin the FLOATING ref ` +
+          `"${opts.actionsVersion}", which can silently receive behavioral changes (macf#797). ` +
+          `Re-run with --actions-version vX.Y.Z to pin immutably.\n`,
+      );
+    }
+  }
+
   const repo = opts.repo ?? detectRepoFromGit(absDir);
   if (!repo) {
     throw new Error(
@@ -446,7 +498,7 @@ export async function repoInit(
   // when the pin is v3+ so `repo-init --actions-version v1.x` still emits a
   // valid v1 caller.
   let v3Inputs: V3WorkflowInputs | undefined;
-  if (isV3PlusActionsVersion(opts.actionsVersion)) {
+  if (isV3PlusActionsVersion(pinnedVersion)) {
     const project = opts.project ?? repoName!;
     if (!isValidProjectName(project)) {
       throw new Error(`Invalid project name "${project}": must match [a-zA-Z0-9_-]+`);
@@ -457,7 +509,7 @@ export async function repoInit(
 
   const workflowResult = writeFileSafe(
     workflowPath,
-    generateWorkflow(opts.actionsVersion, v3Inputs),
+    generateWorkflow(pinnedVersion, v3Inputs),
     opts.force,
   );
 

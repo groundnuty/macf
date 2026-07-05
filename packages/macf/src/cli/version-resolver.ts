@@ -231,6 +231,54 @@ export async function fetchLatestActionsVersion(): Promise<FetchResult> {
 }
 
 /**
+ * True for a fully-pinned immutable macf-actions tag (`vX.Y.Z`, three
+ * components). A bare-major (`v3`) or bare-minor (`v3.4`) ref is a FLOATING
+ * pointer GitHub re-points as new releases land — NOT immutable.
+ */
+export function isImmutableActionsTag(v: string): boolean {
+  return /^v\d+\.\d+\.\d+$/.test(v);
+}
+
+/**
+ * Resolve a floating macf-actions ref (`v3`, `v3.4`) to the latest immutable
+ * full tag WITHIN that major (and minor, if given) — e.g. `v3` → `v3.4.1`.
+ *
+ * The router pin must be immutable so a fleet never silently receives a
+ * behavioral change within a major (macf#797 — floating `@v3` currently even
+ * lags `@v3.4.1`; operator decision 2026-07-05). This resolves "the latest at
+ * bootstrap time" so the generated router is born pinned.
+ *
+ * - An already-immutable tag (`v3.4.1`) is returned unchanged (no network).
+ * - `main` returns null (a dev ref; the caller leaves it as-is).
+ * - A floating ref queries macf-actions' /tags, filters to `vMAJOR.*.*`
+ *   (and `.MINOR.` when the ref carries a minor), and returns the highest.
+ * - Any fetch failure / no match returns null so the caller can WARN + keep
+ *   the floating ref rather than hard-fail (repo-init tolerates offline).
+ */
+export async function resolveActionsRefToFullTag(ref: string): Promise<string | null> {
+  if (isImmutableActionsTag(ref)) return ref;
+  const m = /^v(\d+)(?:\.(\d+))?$/.exec(ref);
+  if (!m) return null; // 'main' or any non-`vMAJOR[.MINOR]` ref
+  const prefix = m[2] !== undefined ? `v${m[1]}.${m[2]}.` : `v${m[1]}.`;
+  try {
+    const res = await fetch('https://api.github.com/repos/groundnuty/macf-actions/tags', {
+      headers: githubHeaders(),
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as Array<{ name?: unknown }>;
+    if (!Array.isArray(data)) return null;
+    const matching = data
+      .map(t => (typeof t.name === 'string' ? t.name : null))
+      .filter((n): n is string => n !== null && /^v\d+\.\d+\.\d+$/.test(n) && n.startsWith(prefix));
+    if (matching.length === 0) return null;
+    matching.sort((a, b) => compareSemver(b, a)); // descending
+    return matching[0]!;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolve latest versions for all three components, falling back on error.
  * All three fetches run in parallel.
  */
