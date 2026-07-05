@@ -5,7 +5,7 @@ import {
   caCertPath as caCertPathFor, caKeyPath as caKeyPathFor, caDir,
   tokenSourceFromConfig,
 } from '../config.js';
-import { createCA, backupCAKey, recoverCAKey, loadCA } from '@groundnuty/macf-core';
+import { createCA, backupCAKey, recoverCAKey, loadCA, caCertFingerprint } from '@groundnuty/macf-core';
 import { generateAgentCert, generateClientCert } from '@groundnuty/macf-core';
 import { createClientFromConfig } from '../registry-helper.js';
 import { createRegistryFromConfig } from '@groundnuty/macf-core';
@@ -16,6 +16,58 @@ import { toVariableSegment } from '@groundnuty/macf-core';
 const ROUTING_CLIENT_CN = 'routing-action';
 const DEFAULT_VALIDITY_DAYS = 365;
 const VALIDITY_WARN_DAYS = 730;
+
+/** Registry variable recording the routing-client cert's issuer fingerprint + mint
+ *  time (macf#800). `macf routing doctor` diffs this against the CURRENT CA's
+ *  fingerprint to detect an orphaned routing-client cert without ever reading the
+ *  write-only deployed secret. See `evaluateRoutingClientCertIssuer` in
+ *  `routing-doctor.ts` for the read side. */
+function routingClientCertIssuerVarName(project: string): string {
+  return `${toVariableSegment(project)}_ROUTING_CLIENT_CERT_ISSUER`;
+}
+
+/**
+ * Loud, unmissable blast-radius warning printed at the end of `certs init`
+ * (on re-init over an existing CA) and `certs rotate` (macf#800, DR-010
+ * amendment / silent-fallback-hazards.md Instance 16).
+ *
+ * A CA (re-)issue re-signs the LOCAL/registry CA material + the in-workspace
+ * agent cert — but it CANNOT reach artifacts that live OUT-OF-BAND as GitHub
+ * Actions secrets/variables on caller repos (agents can't write GitHub
+ * secrets — DR-019). Those artifacts are now potentially signed by / naming
+ * the OLD CA and will silently break routing until an operator re-syncs them.
+ * We warn loudly; we never auto-write.
+ */
+function printCaRotationBlastRadiusWarning(project: string): void {
+  const seg = toVariableSegment(project);
+  console.log('');
+  console.log('================================================================');
+  console.log('⚠️  CA (re-)issued — OUT-OF-BAND blast radius (macf#800)');
+  console.log('================================================================');
+  console.log('This command re-issued the CA + in-workspace agent cert, but it CANNOT');
+  console.log("reach artifacts that live out-of-band as GitHub Actions secrets/variables");
+  console.log("on your caller/agent repos (agents can't write GitHub secrets — DR-019).");
+  console.log('Those artifacts may now be silently ORPHANED (signed by / naming the OLD');
+  console.log('CA) — see silent-fallback-hazards.md Instance 16. On EVERY caller/agent');
+  console.log("repo in this project's App install-set:");
+  console.log('');
+  console.log('  1. ROUTING_CLIENT_CERT / ROUTING_CLIENT_KEY (GitHub Actions secrets) —');
+  console.log("     the macf-actions router's mTLS client cert, presented on every");
+  console.log('     route-by-label POST. Re-mint + re-set:');
+  console.log('       macf certs issue-routing-client --out-dir <dir>');
+  console.log('       gh secret set ROUTING_CLIENT_CERT --repo <owner>/<repo> < <dir>/routing-action-cert.pem');
+  console.log('       gh secret set ROUTING_CLIENT_KEY  --repo <owner>/<repo> < <dir>/routing-action-key.pem');
+  console.log('');
+  console.log(`  2. ${seg}_CA_CERT (a GitHub Actions repo VARIABLE, not the registry) —`);
+  console.log("     the v3 router's CA trust anchor (macf#806). Re-set:");
+  console.log(`       gh variable set ${seg}_CA_CERT --repo <owner>/<repo> < <path-to-new-ca-cert.pem>`);
+  console.log('');
+  console.log("This command cannot enumerate your exact caller-repo list — check the");
+  console.log("App's install-set (`macf routing doctor` or `gh api /installation/repositories`)");
+  console.log('and apply BOTH commands above to every repo running the agent-router workflow.');
+  console.log('================================================================');
+  console.log('');
+}
 
 async function promptPassphrase(message: string): Promise<string> {
   try {
@@ -54,6 +106,15 @@ export async function certsInit(projectDir: string): Promise<void> {
   const caCertP = caCertPathFor(config.project);
   const caKeyP = caKeyPathFor(config.project);
 
+  // macf#800: a re-init over an EXISTING CA is the same out-of-band-orphan
+  // hazard as `certs rotate` — the fresh CA re-signs the in-workspace agent
+  // cert but silently orphans any out-of-band artifact (routing-client cert,
+  // caller-repo CA_CERT variable) signed by / naming the OLD CA. A genuine
+  // first-time init has no orphans yet (nothing was signed by a CA that
+  // didn't exist), so we only warn on reinit — checked BEFORE createCA
+  // overwrites the files on disk.
+  const isReinit = existsSync(caCertP);
+
   console.log(`Creating CA for project "${config.project}"...`);
 
   const ca = await createCA({
@@ -71,6 +132,7 @@ export async function certsInit(projectDir: string): Promise<void> {
   const passphrase = await promptPassphrase('Enter passphrase for CA key backup: ');
   if (!passphrase) {
     console.warn('No passphrase provided — skipping encrypted backup.');
+    if (isReinit) printCaRotationBlastRadiusWarning(config.project);
     return;
   }
 
@@ -83,6 +145,7 @@ export async function certsInit(projectDir: string): Promise<void> {
 
   console.log(`  Encrypted CA key backed up to registry as ${toVariableSegment(config.project)}_CA_KEY_ENCRYPTED`);
   console.log('\nCA initialization complete.');
+  if (isReinit) printCaRotationBlastRadiusWarning(config.project);
 }
 
 /**
@@ -168,6 +231,14 @@ export async function certsRotate(projectDir: string): Promise<void> {
   console.log(`  Cert: ${certP}`);
   console.log(`  Key:  ${keyP}`);
   console.log('Rotation complete.');
+
+  // macf#800: warn unconditionally. `certs rotate` re-signs the in-workspace
+  // agent cert against the CA on disk; an operator can't tell FROM HERE
+  // whether that CA is itself the same one out-of-band artifacts were signed
+  // against (e.g. after a `certs init` reinit swapped it), so the safe
+  // default is to always surface the blast-radius reminder rather than try
+  // to detect "did the CA actually change" and risk a false negative.
+  printCaRotationBlastRadiusWarning(config.project);
 }
 
 export interface IssueRoutingClientOptions {
@@ -253,6 +324,32 @@ export async function issueRoutingClient(
     caCertPem: ca.certPem,
     caKeyPem: ca.keyPem,
   });
+
+  // macf#800: record the issuer fingerprint + mint time so `macf routing
+  // doctor` can detect this cert going ORPHANED after a future CA rotation
+  // — a GitHub secret is write-only, so this registry variable (same scope
+  // as the CA material itself, DR-006) is the only way to check without
+  // reading the deployed secret. Best-effort: a write failure here doesn't
+  // block the operator from getting their cert — the doctor's "absent"
+  // state for a missing variable is informational, not fatal (see
+  // `evaluateRoutingClientCertIssuer` in routing-doctor.ts).
+  const issuerVarName = routingClientCertIssuerVarName(config.project);
+  try {
+    const client = getVariablesClient(config, token);
+    const issuerFingerprint = caCertFingerprint(ca.certPem);
+    const mintedAt = new Date().toISOString();
+    await client.writeVariable(
+      issuerVarName,
+      JSON.stringify({ issuer_fingerprint: issuerFingerprint, minted_at: mintedAt }),
+    );
+    console.log(`  Issuer recorded: ${issuerVarName} (baseline for \`macf routing doctor\`'s #800 orphan check)`);
+  } catch (err) {
+    console.warn(
+      `Warning: failed to record the routing-client cert issuer in ${issuerVarName} — ` +
+      `\`macf routing doctor\`'s #800 orphan-detection check will show "absent" until this ` +
+      `succeeds (${err instanceof Error ? err.message : String(err)}).`,
+    );
+  }
 
   if (opts.outDir) {
     mkdirSync(opts.outDir, { recursive: true, mode: 0o700 });

@@ -4,7 +4,7 @@ import { mkdirSync, rmSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
   createCA, encryptCAKey, decryptCAKey, loadCA, backupCAKey, recoverCAKey,
-  isLikelyPemPrivateKey, encryptCAKeyV1Legacy,
+  isLikelyPemPrivateKey, encryptCAKeyV1Legacy, caCertFingerprint,
   WIRE_FORMAT_VERSION, V2_PBKDF2_ITERS, V1_PBKDF2_ITERS,
   CaError,
 } from '../../src/certs/ca.js';
@@ -378,6 +378,60 @@ describe('CA management', () => {
 
     it('throws when cert not found', () => {
       expect(() => loadCA('/nonexistent/cert.pem', '/nonexistent/key.pem')).toThrow(CaError);
+    });
+  });
+
+  describe('caCertFingerprint (#800)', () => {
+    it('is deterministic for the same cert PEM', async () => {
+      const { certPem } = await createCA({
+        project: 'TEST',
+        certPath: join(dir, 'ca-cert.pem'),
+        keyPath: join(dir, 'ca-key.pem'),
+      });
+      expect(caCertFingerprint(certPem)).toBe(caCertFingerprint(certPem));
+    });
+
+    it('differs for different CA certs', async () => {
+      const a = await createCA({
+        project: 'PROJECT-A',
+        certPath: join(dir, 'a-cert.pem'),
+        keyPath: join(dir, 'a-key.pem'),
+      });
+      const b = await createCA({
+        project: 'PROJECT-B',
+        certPath: join(dir, 'b-cert.pem'),
+        keyPath: join(dir, 'b-key.pem'),
+      });
+      expect(caCertFingerprint(a.certPem)).not.toBe(caCertFingerprint(b.certPem));
+    });
+
+    it('is a 64-char lowercase hex SHA-256 digest', async () => {
+      const { certPem } = await createCA({
+        project: 'TEST',
+        certPath: join(dir, 'ca-cert.pem'),
+        keyPath: join(dir, 'ca-key.pem'),
+      });
+      const fp = caCertFingerprint(certPem);
+      expect(fp).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it('ignores cosmetic whitespace/line-wrap differences (hashes the DER, not the PEM text)', async () => {
+      const { certPem } = await createCA({
+        project: 'TEST',
+        certPath: join(dir, 'ca-cert.pem'),
+        keyPath: join(dir, 'ca-key.pem'),
+      });
+      // Re-wrap: strip existing newlines inside the body, re-insert CRLF instead of LF,
+      // add a trailing blank line — none of this should change the DER bytes.
+      const armorless = certPem
+        .replace(/-----BEGIN CERTIFICATE-----/, '')
+        .replace(/-----END CERTIFICATE-----/, '')
+        .replace(/\s+/g, '');
+      const reformatted =
+        '-----BEGIN CERTIFICATE-----\r\n' +
+        (armorless.match(/.{1,76}/g) ?? []).join('\r\n') +
+        '\r\n-----END CERTIFICATE-----\r\n\n';
+      expect(caCertFingerprint(reformatted)).toBe(caCertFingerprint(certPem));
     });
   });
 });

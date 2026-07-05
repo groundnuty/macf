@@ -9,7 +9,8 @@
  * a message was actually delivered end-to-end (that is `--e2e`, a LATER increment,
  * NOT built here). The honesty legend states this loudly.
  *
- * The five checks (DR-030 §4, harvested from the 2026-06-26 Stage-3 outage):
+ * The checks (DR-030 §4, harvested from the 2026-06-26 Stage-3 outage; #6 added
+ * per macf#800):
  *
  *  1. CALLER-PIN consistency — every fleet repo's `agent-router.yml`
  *     `uses: groundnuty/macf-actions/...@<pin>` is on the SAME version. A mixed
@@ -34,6 +35,12 @@
  *  5. SESSION-name drift — `agent-config.json.tmux_session` follows the canonical
  *     `<project>@<routing-label>` convention (the silent Stage-2-routing-drop class).
  *     Vestigial + omitted on v3+ (macf#678): absent = PASS.
+ *  6. ROUTING-CLIENT-CERT issuer staleness (macf#800) — the recorded issuer
+ *     fingerprint of the routing-client cert (a write-only GitHub Actions secret
+ *     this command CANNOT read) vs the project's CURRENT CA fingerprint (local
+ *     disk). Mismatch = the cert was signed by a CA that has since been rotated
+ *     out — the #799 outage class. Absent (never minted) is informational, not
+ *     a failure.
  *
  * Every GitHub read (install-set, caller-pins, agent-config), the registry list,
  * the mTLS `/health` probe, and the CA-var read are INJECTABLE (`RoutingDoctorDeps`)
@@ -46,6 +53,7 @@ import {
   tokenSourceFromConfig,
   agentCertPath,
   agentKeyPath,
+  caCertPath as caCertPathFor,
 } from '../config.js';
 import { createClientFromConfig } from '../registry-helper.js';
 import {
@@ -55,6 +63,7 @@ import {
   toVariableSegment,
   fromVariableSegment,
   isStaleEntry,
+  caCertFingerprint,
   DEFAULT_REGISTRY_TTL_MS,
 } from '@groundnuty/macf-core';
 import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
@@ -265,6 +274,116 @@ export function evaluateCaCert(raw: string | null | undefined): {
   };
 }
 
+/**
+ * Routing-client cert issuer staleness (#800, DR-010 amendment / silent-
+ * fallback-hazards.md Instance 16):
+ *  - `ok`       — the recorded issuer fingerprint matches the CURRENT project
+ *                 CA. The routing-client cert (a GitHub Actions secret this
+ *                 command CANNOT read — secrets are write-only) is presumed
+ *                 signed by the live CA.
+ *  - `orphaned` — the recorded issuer fingerprint does NOT match the current
+ *                 CA. A CA (re-)issue happened since this cert was minted;
+ *                 the deployed routing-client cert is presumed signed by the
+ *                 OLD CA and every mTLS route-by-label POST it makes will be
+ *                 rejected. This is the #799 outage class.
+ *  - `absent`   — no issuer was ever recorded (never minted via `macf certs
+ *                 issue-routing-client`, or a pre-#800 workspace). Assert-
+ *                 IF-PRESENT: this is informational, NOT a failure — there
+ *                 is nothing (yet) to compare against.
+ */
+export type RoutingClientCertIssuerState = 'ok' | 'orphaned' | 'absent';
+
+export interface RoutingClientCertCheckResult {
+  readonly state: RoutingClientCertIssuerState;
+  readonly recordedFingerprint: string | null;
+  readonly currentFingerprint: string | null;
+  readonly mintedAt: string | null;
+  readonly reason?: string;
+}
+
+/**
+ * Parse the `<PROJECT>_ROUTING_CLIENT_CERT_ISSUER` registry variable value
+ * written by `macf certs issue-routing-client` (#800). Returns `null` for
+ * anything that isn't a well-formed `{issuer_fingerprint, minted_at}`
+ * envelope — missing, empty, malformed JSON, and a missing/empty
+ * `issuer_fingerprint` field are ALL treated as "never recorded" (the
+ * `absent` state), never as a parse failure that blocks the check.
+ */
+export function parseRoutingClientCertIssuer(
+  raw: string | null | undefined,
+): { readonly fingerprint: string; readonly mintedAt: string | null } | null {
+  if (!raw || raw.trim() === '') return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const rec = parsed as Record<string, unknown>;
+  const fingerprint = rec['issuer_fingerprint'];
+  if (typeof fingerprint !== 'string' || fingerprint.trim() === '') return null;
+  const mintedAt = typeof rec['minted_at'] === 'string' ? rec['minted_at'] : null;
+  return { fingerprint, mintedAt };
+}
+
+/**
+ * Compare the recorded routing-client cert issuer fingerprint against the
+ * project's CURRENT CA fingerprint. Pure w.r.t. its inputs — the CURRENT CA
+ * fingerprint is read from LOCAL disk (`caCertPathFor`, the same source of
+ * truth `certs rotate` / `issue-routing-client` sign against), not the
+ * registry-stored `CA_CERT` variable, so this check reflects what THIS
+ * machine would sign a fresh routing-client cert with.
+ */
+export function evaluateRoutingClientCertIssuer(
+  recordedRaw: string | null | undefined,
+  currentCaFingerprint: string | null,
+): RoutingClientCertCheckResult {
+  const recorded = parseRoutingClientCertIssuer(recordedRaw);
+  if (!recorded) {
+    return {
+      state: 'absent',
+      recordedFingerprint: null,
+      currentFingerprint: currentCaFingerprint,
+      mintedAt: null,
+      reason:
+        'no routing-client cert issuer recorded yet (never minted via `macf certs ' +
+        'issue-routing-client`, or a pre-#800 workspace) — informational only, not a failure',
+    };
+  }
+  if (currentCaFingerprint === null) {
+    // A recorded issuer exists but this run has no local CA cert to compare
+    // against — can't assert either way. Same "informational, not a
+    // failure" posture as absent: we don't want a locally-missing CA file
+    // to masquerade as an orphaned routing-client cert (false positive).
+    return {
+      state: 'absent',
+      recordedFingerprint: recorded.fingerprint,
+      currentFingerprint: null,
+      mintedAt: recorded.mintedAt,
+      reason: 'no local CA cert found for this project — cannot verify the routing-client cert issuer this run',
+    };
+  }
+  if (recorded.fingerprint === currentCaFingerprint) {
+    return {
+      state: 'ok',
+      recordedFingerprint: recorded.fingerprint,
+      currentFingerprint: currentCaFingerprint,
+      mintedAt: recorded.mintedAt,
+    };
+  }
+  return {
+    state: 'orphaned',
+    recordedFingerprint: recorded.fingerprint,
+    currentFingerprint: currentCaFingerprint,
+    mintedAt: recorded.mintedAt,
+    reason:
+      'routing-client cert is orphaned (signed by a rotated-out CA) — re-mint via `macf ' +
+      'certs issue-routing-client` and re-set ROUTING_CLIENT_CERT/ROUTING_CLIENT_KEY on ' +
+      'every caller repo (macf#800)',
+  };
+}
+
 export type FreshnessState = 'fresh' | 'stale' | 'unreachable' | 'unknown' | 'unregistered';
 
 /**
@@ -365,6 +484,8 @@ export interface RoutingDoctorReport {
   readonly hasRoutingConfig: boolean;
   readonly agents: readonly AgentRow[];
   readonly ca: CaCheckResult;
+  /** #800 — routing-client cert issuer-vs-current-CA staleness check. */
+  readonly routingClientCert: RoutingClientCertCheckResult;
 }
 
 // --- Orchestration ---
@@ -389,6 +510,18 @@ export interface RoutingDoctorDeps {
   readonly probe: RoutingProbeFn;
   /** The `MACF_CA_CERT` variable's raw value. */
   readonly readCaCert: () => Promise<string | null>;
+  /**
+   * The `<PROJECT>_ROUTING_CLIENT_CERT_ISSUER` registry variable's raw value
+   * (#800), written by `macf certs issue-routing-client`. `null` when never
+   * minted (pre-#800 workspace, or the collision-guard blocked minting).
+   */
+  readonly readRoutingClientCertIssuer: () => Promise<string | null>;
+  /**
+   * The project's CURRENT CA cert fingerprint, read from LOCAL disk (#800) —
+   * `null` when this machine has no local CA cert for the project. Sync
+   * because it's a local file read, unlike the other deps which hit GitHub.
+   */
+  readonly currentCaFingerprint: () => string | null;
   /** Authoritative expected bot-logins by routing label (partial; heuristic fallback). */
   readonly botLogins?: Readonly<Record<string, string>>;
   /** Explicit expected caller-pin (else the modal pin). */
@@ -533,7 +666,14 @@ export async function gatherRoutingDoctor(deps: RoutingDoctorDeps): Promise<Rout
   // 4. CA material.
   const ca = evaluateCaCert(await deps.readCaCert());
 
-  return { project: deps.project, repoPins, expectedPin, hasRoutingConfig, agents, ca };
+  // 6. Routing-client cert issuer staleness (#800) — a project-level check,
+  // like CA material, not per-agent/per-repo.
+  const routingClientCert = evaluateRoutingClientCertIssuer(
+    await deps.readRoutingClientCertIssuer(),
+    deps.currentCaFingerprint(),
+  );
+
+  return { project: deps.project, repoPins, expectedPin, hasRoutingConfig, agents, ca, routingClientCert };
 }
 
 // --- Verdict ---
@@ -561,16 +701,27 @@ function agentRoutingOk(a: AgentRow): boolean {
   return a.routable && a.selfSkipOk !== false && !freshnessFails(a.freshness);
 }
 
+/**
+ * Whether the routing-client cert check FAILS the verdict (#800). Only the
+ * `orphaned` state fails — `absent` (never minted) is deliberately excluded,
+ * same "informational, not a failure" posture as a pre-migration workspace
+ * that has nothing to compare against yet.
+ */
+function routingClientCertFails(r: RoutingClientCertCheckResult): boolean {
+  return r.state === 'orphaned';
+}
+
 export function routingVerdict(report: RoutingDoctorReport): RoutingVerdict {
   if (report.repoPins.length === 0 && report.agents.length === 0) return 'EMPTY';
   const participating = report.repoPins.filter((r) => r.consistent !== null);
   const pinFail = participating.some((r) => !r.consistent);
   const agentFail = report.agents.some((a) => !agentRoutingOk(a));
   const caFail = !report.ca.present || !report.ca.valid;
-  return pinFail || agentFail || caFail ? 'DEGRADED' : 'HEALTHY';
+  const routingClientCertFail = routingClientCertFails(report.routingClientCert);
+  return pinFail || agentFail || caFail || routingClientCertFail ? 'DEGRADED' : 'HEALTHY';
 }
 
-/** `4 fleet repos (pins consistent); 3 agents (2 routing-OK); CA ✓; routing plane: HEALTHY`. */
+/** `4 fleet repos (pins consistent); 3 agents (2 routing-OK); CA ✓; routing-client cert ✓; routing plane: HEALTHY`. */
 export function summaryLine(report: RoutingDoctorReport): string {
   const participating = report.repoPins.filter((r) => r.consistent !== null);
   const pinsOk = participating.length > 0 && participating.every((r) => r.consistent);
@@ -581,7 +732,8 @@ export function summaryLine(report: RoutingDoctorReport): string {
       : 'no routing-caller repos discovered';
   return (
     `${pinClause}; ${agentOk}/${report.agents.length} agents routing-OK; ` +
-    `CA ${report.ca.valid ? '✓' : '✗'}; routing plane: ${routingVerdict(report)}`
+    `CA ${report.ca.valid ? '✓' : '✗'}; routing-client cert ${routingClientCertGlyph(report.routingClientCert.state)}; ` +
+    `routing plane: ${routingVerdict(report)}`
   );
 }
 
@@ -656,6 +808,18 @@ export function freshnessGlyph(s: FreshnessState): string {
   }
 }
 
+/** Routing-client cert issuer state → glyph: ok ✓, orphaned ✗ (macf#800), absent — (informational). */
+export function routingClientCertGlyph(s: RoutingClientCertIssuerState): string {
+  switch (s) {
+    case 'ok':
+      return '✓';
+    case 'orphaned':
+      return '✗ orphaned';
+    case 'absent':
+      return '— n/a';
+  }
+}
+
 const REPO_HEADERS = ['REPO', 'CALLER-PIN', 'CONSISTENT'] as const;
 const AGENT_HEADERS = ['AGENT', 'ROUTABLE', 'SELF-SKIP', 'SESSION', 'FRESH'] as const;
 
@@ -701,6 +865,9 @@ export const HONESTY_LEGEND = [
   '        The agent set is the registry fleet ∪ this repo\'s routing config (#621): a registry-only',
   '        agent (one this repo does not route to, e.g. the auditor) shows "— n/a" SELF-SKIP/SESSION',
   '        (REPO-scoped, no local config) but is still ROUTABLE/FRESH-checked (FLEET-scoped).',
+  '        ROUTING-CLIENT CERT (macf#800) = the recorded issuer fingerprint (written by `macf certs',
+  '        issue-routing-client`) vs the CURRENT project CA (local disk). ✗ orphaned = signed by a',
+  '        rotated-out CA (re-mint + re-set the secret); — n/a = never minted, informational only.',
   'NOTE: these are STATIC GitHub-plane checks — they prove the routing PLUMBING is wired right,',
   '      NOT that a message was delivered end-to-end (that is `macf routing doctor --e2e`, a',
   '      later increment). Mesh delivery is `macf fleet doctor`.',
@@ -708,8 +875,9 @@ export const HONESTY_LEGEND = [
 
 const HONESTY_DISCLAIMER =
   'Static GitHub-plane checks: they prove the routing plumbing (caller-pins, registry-as-routing-' +
-  'source, CA material, session-name convention) is wired right, NOT that a message was delivered ' +
-  'end-to-end (that is --e2e, a later increment). Mesh delivery is `macf fleet doctor`.';
+  'source, CA material, routing-client cert issuer, session-name convention) is wired right, NOT ' +
+  'that a message was delivered end-to-end (that is --e2e, a later increment). Mesh delivery is ' +
+  '`macf fleet doctor`.';
 
 // --- JSON contract (DR-031 watchdog input; same hard-version discipline as fleet doctor) ---
 
@@ -736,6 +904,9 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       agents_total: report.agents.length,
       agents_routing_ok: report.agents.filter(agentRoutingOk).length,
       ca_ok: report.ca.present && report.ca.valid,
+      // Additive (schema_version:1, #800): false only for the verdict-failing
+      // `orphaned` state; `absent` (never minted) counts as true (not a fault).
+      routing_client_cert_ok: !routingClientCertFails(report.routingClientCert),
     },
     // Additive (schema_version:1, DR-032 #610): non-verdict-driving observations the
     // watchdog should still SEE — currently the session-name drift (WARN-not-FAIL).
@@ -775,6 +946,15 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       present: report.ca.present,
       valid: report.ca.valid,
       reason: report.ca.reason ?? null,
+    },
+    // Additive (schema_version:1, #800): routing-client cert issuer-vs-current-CA
+    // staleness. `state: "orphaned"` fails the verdict; `"absent"` is informational.
+    routing_client_cert: {
+      state: report.routingClientCert.state,
+      recorded_fingerprint: report.routingClientCert.recordedFingerprint,
+      current_fingerprint: report.routingClientCert.currentFingerprint,
+      minted_at: report.routingClientCert.mintedAt,
+      reason: report.routingClientCert.reason ?? null,
     },
     disclaimer: HONESTY_DISCLAIMER,
   };
@@ -830,6 +1010,10 @@ async function resolveDepsFromRegistry(
   const ghRoutingReader = createRoutingConfigGhReader(token);
   const localRouting = readLocalRoutingConfig(projectDir);
 
+  // #800: the routing-client cert issuer registry variable, same GitHubVariablesClient
+  // + scope as CA material (DR-006) — written by `macf certs issue-routing-client`.
+  const routingClientCertIssuerVarName = `${toVariableSegment(config.project)}_ROUTING_CLIENT_CERT_ISSUER`;
+
   return {
     ok: true,
     deps: {
@@ -842,6 +1026,18 @@ async function resolveDepsFromRegistry(
       listRegistry: () => registry.list(''),
       probe: (host, port) => pingAgentHealth({ host, port, caCertPem: caCertPem ?? '', certPath, keyPath }),
       readCaCert: async () => caCertPem,
+      readRoutingClientCertIssuer: () => client.readVariable(routingClientCertIssuerVarName),
+      // Local disk, NOT the registry-stored CA_CERT var — the same source of truth
+      // `certs rotate` / `issue-routing-client` sign against (#800).
+      currentCaFingerprint: () => {
+        const p = caCertPathFor(config.project);
+        if (!existsSync(p)) return null;
+        try {
+          return caCertFingerprint(readFileSync(p, 'utf-8'));
+        } catch {
+          return null;
+        }
+      },
     },
   };
 }
@@ -940,6 +1136,10 @@ export async function runRoutingDoctor(
 
   console.log(
     `MACF_CA_CERT: ${report.ca.present ? (report.ca.valid ? '✓ present + parses' : `✗ ${report.ca.reason}`) : '✗ absent'}`,
+  );
+  console.log(
+    `ROUTING-CLIENT CERT ISSUER (macf#800): ${routingClientCertGlyph(report.routingClientCert.state)}` +
+    (report.routingClientCert.reason ? ` — ${report.routingClientCert.reason}` : ''),
   );
   console.log('');
   console.log(summaryLine(report));

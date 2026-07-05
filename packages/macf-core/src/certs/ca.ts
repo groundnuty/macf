@@ -1,5 +1,5 @@
 import {
-  createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync,
+  createCipheriv, createDecipheriv, createHash, randomBytes, pbkdf2Sync,
 } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -368,4 +368,36 @@ export function loadCA(certPath: string, keyPath: string): CaKeyPair {
     certPem: readFileSync(certPath, 'utf-8'),
     keyPem: readFileSync(keyPath, 'utf-8'),
   };
+}
+
+/**
+ * Strip PEM armor + whitespace and base64-decode to the raw DER bytes.
+ * Shared by {@link caCertFingerprint}; hashing the DER (not the PEM text)
+ * means cosmetic differences — line wrapping, trailing newline, CRLF vs
+ * LF — never produce a false fingerprint mismatch.
+ */
+function pemToDer(pem: string): Buffer {
+  const body = pem
+    .replace(/-----BEGIN CERTIFICATE-----/g, '')
+    .replace(/-----END CERTIFICATE-----/g, '')
+    .replace(/\s+/g, '');
+  return Buffer.from(body, 'base64');
+}
+
+/**
+ * SHA-256 fingerprint (lowercase hex) of a PEM-encoded certificate's DER
+ * bytes. Deterministic + parse-free (no x509 library round-trip needed) —
+ * good enough to answer "is this the SAME CA cert" without asserting
+ * anything about the cert's structure.
+ *
+ * Purpose-built for macf#800 (DR-010 amendment / silent-fallback-hazards.md
+ * Instance 16): a CA rotation orphans out-of-band artifacts (e.g. the
+ * routing-client cert deployed as a GitHub Actions secret) that this tool
+ * cannot reach to re-sign. Recording this fingerprint at mint time and
+ * diffing it against the CURRENT CA's fingerprint later (`macf routing
+ * doctor`) detects the orphan without ever reading the write-only deployed
+ * secret itself.
+ */
+export function caCertFingerprint(certPem: string): string {
+  return createHash('sha256').update(pemToDer(certPem)).digest('hex');
 }

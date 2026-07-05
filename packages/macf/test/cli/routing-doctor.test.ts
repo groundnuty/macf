@@ -20,6 +20,7 @@ import {
   collectWarnings,
   computeExpectedPin,
   evaluateCaCert,
+  evaluateRoutingClientCertIssuer,
   evaluateSelfSkip,
   evaluateSession,
   formatAgentTable,
@@ -29,7 +30,9 @@ import {
   isFleetMember,
   isStrictBase64,
   normalizeLogin,
+  parseRoutingClientCertIssuer,
   pinGlyph,
+  routingClientCertGlyph,
   sessionGlyph,
   ROUTING_DOCTOR_JSON_SCHEMA_VERSION,
   routingDoctorToJson,
@@ -218,6 +221,10 @@ const HEALTHY_CONFIG: RoutingConfig = {
   },
 };
 
+// #800 default baseline: recorded issuer matches the current CA → `ok`, never
+// verdict-failing unless a test deliberately diverges them.
+const ROUTING_CLIENT_CERT_FINGERPRINT = 'a'.repeat(64);
+
 function deps(over: Partial<RoutingDoctorDeps> = {}): RoutingDoctorDeps {
   return {
     project: 'macf',
@@ -233,6 +240,9 @@ function deps(over: Partial<RoutingDoctorDeps> = {}): RoutingDoctorDeps {
     ],
     probe: async (_h, port) => (port === 4100 ? health('inst-code') : health('inst-science')),
     readCaCert: async () => VALID_PEM,
+    readRoutingClientCertIssuer: async () =>
+      JSON.stringify({ issuer_fingerprint: ROUTING_CLIENT_CERT_FINGERPRINT, minted_at: '2026-06-01T00:00:00Z' }),
+    currentCaFingerprint: () => ROUTING_CLIENT_CERT_FINGERPRINT,
     ...over,
   };
 }
@@ -498,6 +508,128 @@ describe('check 5 — session-name drift is WARN-not-FAIL (DR-032 #610)', () => 
   });
 });
 
+describe('parseRoutingClientCertIssuer (#800)', () => {
+  it('parses a well-formed envelope', () => {
+    const raw = JSON.stringify({ issuer_fingerprint: 'abc123', minted_at: '2026-07-01T00:00:00Z' });
+    expect(parseRoutingClientCertIssuer(raw)).toEqual({ fingerprint: 'abc123', mintedAt: '2026-07-01T00:00:00Z' });
+  });
+  it('null/undefined/empty → null', () => {
+    expect(parseRoutingClientCertIssuer(null)).toBeNull();
+    expect(parseRoutingClientCertIssuer(undefined)).toBeNull();
+    expect(parseRoutingClientCertIssuer('')).toBeNull();
+    expect(parseRoutingClientCertIssuer('   ')).toBeNull();
+  });
+  it('malformed JSON → null (never throws)', () => {
+    expect(parseRoutingClientCertIssuer('{not json')).toBeNull();
+  });
+  it('valid JSON but not an object (e.g. a bare string/number) → null', () => {
+    expect(parseRoutingClientCertIssuer('"just-a-string"')).toBeNull();
+    expect(parseRoutingClientCertIssuer('42')).toBeNull();
+    expect(parseRoutingClientCertIssuer('null')).toBeNull();
+  });
+  it('missing/empty issuer_fingerprint → null', () => {
+    expect(parseRoutingClientCertIssuer(JSON.stringify({ minted_at: 'x' }))).toBeNull();
+    expect(parseRoutingClientCertIssuer(JSON.stringify({ issuer_fingerprint: '' }))).toBeNull();
+    expect(parseRoutingClientCertIssuer(JSON.stringify({ issuer_fingerprint: '  ' }))).toBeNull();
+  });
+  it('missing minted_at → mintedAt is null, fingerprint still parsed', () => {
+    expect(parseRoutingClientCertIssuer(JSON.stringify({ issuer_fingerprint: 'abc' }))).toEqual({
+      fingerprint: 'abc',
+      mintedAt: null,
+    });
+  });
+});
+
+describe('evaluateRoutingClientCertIssuer — orphan detection (#800)', () => {
+  it('matching fingerprints → ok', () => {
+    const raw = JSON.stringify({ issuer_fingerprint: 'FP1', minted_at: '2026-07-01T00:00:00Z' });
+    expect(evaluateRoutingClientCertIssuer(raw, 'FP1')).toEqual({
+      state: 'ok',
+      recordedFingerprint: 'FP1',
+      currentFingerprint: 'FP1',
+      mintedAt: '2026-07-01T00:00:00Z',
+    });
+  });
+
+  it('mismatched fingerprints → orphaned, with a #800 remediation reason', () => {
+    const raw = JSON.stringify({ issuer_fingerprint: 'OLD-FP', minted_at: '2026-06-01T00:00:00Z' });
+    const r = evaluateRoutingClientCertIssuer(raw, 'NEW-FP');
+    expect(r.state).toBe('orphaned');
+    expect(r.recordedFingerprint).toBe('OLD-FP');
+    expect(r.currentFingerprint).toBe('NEW-FP');
+    expect(r.reason).toMatch(/orphaned/);
+    expect(r.reason).toMatch(/macf certs issue-routing-client/);
+    expect(r.reason).toMatch(/#800/);
+  });
+
+  it('never recorded (never minted / pre-#800 workspace) → absent, informational only', () => {
+    const r = evaluateRoutingClientCertIssuer(null, 'CURRENT-FP');
+    expect(r.state).toBe('absent');
+    expect(r.recordedFingerprint).toBeNull();
+    expect(r.reason).toMatch(/never minted|pre-#800/);
+  });
+
+  it('malformed recorded value → absent (never a parse failure)', () => {
+    const r = evaluateRoutingClientCertIssuer('{not json', 'CURRENT-FP');
+    expect(r.state).toBe('absent');
+  });
+
+  it('recorded exists but no local CA to compare against → absent (no false positive)', () => {
+    const raw = JSON.stringify({ issuer_fingerprint: 'FP1' });
+    const r = evaluateRoutingClientCertIssuer(raw, null);
+    expect(r.state).toBe('absent');
+    expect(r.recordedFingerprint).toBe('FP1');
+    expect(r.reason).toMatch(/no local CA cert/);
+  });
+});
+
+describe('routingClientCertGlyph (#800)', () => {
+  it('renders the three states', () => {
+    expect(routingClientCertGlyph('ok')).toBe('✓');
+    expect(routingClientCertGlyph('orphaned')).toMatch(/orphaned/);
+    expect(routingClientCertGlyph('absent')).toMatch(/n\/a/);
+  });
+});
+
+describe('check 6 — routing-client cert orphaned after a CA rotation (#800)', () => {
+  it('an orphaned routing-client cert (issuer != current CA) → DEGRADED', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        readRoutingClientCertIssuer: async () =>
+          JSON.stringify({ issuer_fingerprint: 'OLD-CA-FP', minted_at: '2026-06-01T00:00:00Z' }),
+        currentCaFingerprint: () => 'NEW-CA-FP', // CA rotated since the cert was minted
+      }),
+    );
+    expect(report.routingClientCert.state).toBe('orphaned');
+    expect(routingVerdict(report)).toBe('DEGRADED');
+  });
+
+  it('never-minted routing-client cert (absent) does NOT fail the verdict — informational only', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        readRoutingClientCertIssuer: async () => null,
+      }),
+    );
+    expect(report.routingClientCert.state).toBe('absent');
+    expect(routingVerdict(report)).toBe('HEALTHY'); // nothing else is broken in the baseline
+  });
+
+  it('matching issuer does not mask a genuine OTHER routing fault (still DEGRADED)', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        // Everything routing-client-cert-related is fine...
+        readRoutingClientCertIssuer: async () =>
+          JSON.stringify({ issuer_fingerprint: 'FP1', minted_at: '2026-06-01T00:00:00Z' }),
+        currentCaFingerprint: () => 'FP1',
+        // ...but the CA material check is broken.
+        readCaCert: async () => 'not-a-cert!!!',
+      }),
+    );
+    expect(report.routingClientCert.state).toBe('ok');
+    expect(routingVerdict(report)).toBe('DEGRADED'); // caFail still bites
+  });
+});
+
 describe('#621 — per-agent set is registry ∪ config (registry-only agents fleet-scoped-checked)', () => {
   // A registry that carries an AUDITOR not in HEALTHY_CONFIG — the literal #621 case:
   // the auditor is registered fleet-wide but groundnuty/macf does not route to it, so the
@@ -674,6 +806,11 @@ describe('summaryLine', () => {
     expect(summaryLine(report)).toMatch(/routing plane: HEALTHY/);
     expect(summaryLine(report)).toMatch(/pins consistent/);
   });
+
+  it('carries the routing-client cert clause (#800)', async () => {
+    const report = await gatherRoutingDoctor(deps());
+    expect(summaryLine(report)).toMatch(/routing-client cert ✓/);
+  });
 });
 
 // --- JSON contract ---
@@ -775,6 +912,41 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
     expect(macf.fleet_member).toBe(true);
     expect(macf.consistent).toBe(true);
   });
+
+  it('additive (#800): routing_client_cert + summary.routing_client_cert_ok; orphaned → DEGRADED', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        readRoutingClientCertIssuer: async () =>
+          JSON.stringify({ issuer_fingerprint: 'OLD-FP', minted_at: '2026-06-01T00:00:00Z' }),
+        currentCaFingerprint: () => 'NEW-FP',
+      }),
+    );
+    const json = routingDoctorToJson(report) as {
+      schema_version: number;
+      summary: { verdict: string; routing_client_cert_ok: boolean };
+      routing_client_cert: { state: string; recorded_fingerprint: string | null; current_fingerprint: string | null; minted_at: string | null; reason: string | null };
+    };
+    expect(json.schema_version).toBe(1); // additive → NO bump
+    expect(json.summary.verdict).toBe('DEGRADED');
+    expect(json.summary.routing_client_cert_ok).toBe(false);
+    expect(json.routing_client_cert).toMatchObject({
+      state: 'orphaned',
+      recorded_fingerprint: 'OLD-FP',
+      current_fingerprint: 'NEW-FP',
+      minted_at: '2026-06-01T00:00:00Z',
+    });
+    expect(json.routing_client_cert.reason).toMatch(/#800/);
+  });
+
+  it('additive (#800): an absent (never-minted) routing-client cert reports routing_client_cert_ok:true', async () => {
+    const report = await gatherRoutingDoctor(deps({ readRoutingClientCertIssuer: async () => null }));
+    const json = routingDoctorToJson(report) as {
+      summary: { routing_client_cert_ok: boolean };
+      routing_client_cert: { state: string };
+    };
+    expect(json.routing_client_cert.state).toBe('absent');
+    expect(json.summary.routing_client_cert_ok).toBe(true); // absent is NOT a fault
+  });
 });
 
 // --- Command entry point ---
@@ -811,6 +983,34 @@ describe('runRoutingDoctor (injected deps)', () => {
     const code = await runRoutingDoctor('/unused', {}, deps());
     expect(code).toBe(0);
     expect(logSpy.mock.calls.flat().join('\n')).toContain('routing plane: HEALTHY');
+  });
+
+  it('prints the ROUTING-CLIENT CERT ISSUER line + exits 1 (DEGRADED) when orphaned (#800)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runRoutingDoctor(
+      '/unused',
+      {},
+      deps({
+        readRoutingClientCertIssuer: async () =>
+          JSON.stringify({ issuer_fingerprint: 'OLD-FP', minted_at: '2026-06-01T00:00:00Z' }),
+        currentCaFingerprint: () => 'NEW-FP',
+      }),
+    );
+    expect(code).toBe(1);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('ROUTING-CLIENT CERT ISSUER');
+    expect(out).toMatch(/orphaned/);
+    expect(out).toContain('routing plane: DEGRADED');
+  });
+
+  it('never-minted routing-client cert prints "— n/a" and stays exit 0 (HEALTHY) (#800)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runRoutingDoctor('/unused', {}, deps({ readRoutingClientCertIssuer: async () => null }));
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('ROUTING-CLIENT CERT ISSUER');
+    expect(out).toMatch(/n\/a/);
+    expect(out).toContain('routing plane: HEALTHY');
   });
 
   it('prints the warnings block + exits 0 (HEALTHY) on a stale session (DR-032 #610)', async () => {
