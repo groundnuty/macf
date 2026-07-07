@@ -11,14 +11,14 @@
  */
 import 'reflect-metadata';
 import { readFileSync } from 'node:fs';
-import { formatDashboard, formatPeerTable, formatHealthDetail, formatStartupReconcile } from '../lib/format.js';
+import { formatDashboard, formatPeerTable, formatHealthDetail, formatStartupReconcile, formatIssuesOneline } from '../lib/format.js';
 import { getOwnRegistration, listPeers } from '../lib/registry.js';
 import { pingAgent } from '../lib/health.js';
 import { probePeerHealth } from '../lib/probe-peer-health.js';
 import { buildDashboardHealth } from '../lib/build-dashboard-health.js';
 import { getRegistryConfig } from '../lib/registry-config.js';
 import { mintFreshGitHubToken } from '../lib/fresh-github-token.js';
-import { checkIssuesAcrossFleet } from '../lib/work.js';
+import { checkAllPendingWork, resolveSelfLogin } from '../lib/work.js';
 import { getInboxStore } from '../lib/inbox-store.js';
 import { drainInbox } from '../lib/inbox-drain.js';
 import { buildSharedVarsClient } from '../lib/shared-vars-client.js';
@@ -247,12 +247,27 @@ async function main(): Promise<void> {
       // stale-token-from-long-running-parent class hits here too.
       const token = await mintFreshGitHubToken();
       const label = process.env['MACF_AGENT_LABEL'] ?? 'code-agent';
-      // DR-038 Decision 7: queue-source = App-install-set x label, complete
-      // by construction — NOT a single hardcoded/MACF_REGISTRY_REPO repo
-      // (that var is the registry's scope, not the issue-queue's scope; a
-      // repo can be install-set member + routing target without being the
-      // registry repo, and vice versa).
-      const issues = await checkIssuesAcrossFleet({ label, token });
+      // macf#816: queue-source is the UNION of two poison-free legs —
+      // DR-038 Decision 7's App-install-set x label join (complete WITHIN
+      // the install-set, NOT a single hardcoded/MACF_REGISTRY_REPO repo)
+      // PLUS a generic `involves:<this-bot>[bot]` search (not bounded to
+      // the install-set — see `checkAllPendingWork`'s docstring). Each leg
+      // fails soft independently; `selfLogin` resolves to `undefined` (and
+      // the involves leg is skipped) when MACF_PROJECT/MACF_AGENT_NAME
+      // aren't set.
+      const selfLogin = resolveSelfLogin();
+      const issues = await checkAllPendingWork({ label, token, selfLogin });
+
+      // macf#816: `issues --oneline` is a compact machine-readable mode for
+      // `macf-startup-pickup.sh`'s SUBMIT prompt — a single `repo#N: title;
+      // ...` line built from the SAME union source above, capped + with no
+      // inbox/sweep prose. Checked before the inbox-drain below so the
+      // oneline path never drains the inbox as a side effect of a query
+      // the caller only wanted the issue list from.
+      if (process.argv[3] === '--oneline') {
+        console.log(formatIssuesOneline(issues));
+        break;
+      }
 
       // DR-038 Decision 5 — the on-startup completeness half: drain any
       // inbox message that arrived while the agent was busy/relaunching

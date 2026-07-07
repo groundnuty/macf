@@ -162,6 +162,31 @@ export function formatIssues(
 }
 
 /**
+ * Compact, single-line rendering of the pending-issue queue (macf#816) —
+ * `repo#N: title; repo#N: title`. Built for embedding directly in the
+ * `macf-startup-pickup.sh` SUBMIT prompt so the self-nudge names the
+ * SPECIFIC pending issues, instead of a generic "review the queue above"
+ * pointer that made the agent re-derive what was actually pending.
+ *
+ * Caps at `limit` entries (default 8) — the submit line names the
+ * actionable set for a follow-up turn, not an unbounded backlog dump.
+ * Returns `''` when there is nothing pending (or `issues` is empty) so the
+ * caller can skip the submit entirely rather than send an empty nudge.
+ */
+export function formatIssuesOneline(
+  issues: ReadonlyArray<{ readonly number: number; readonly title: string; readonly repo?: string }>,
+  limit = 8,
+): string {
+  return issues
+    .slice(0, limit)
+    .map((issue) => {
+      const ref = issue.repo ? `${issue.repo}#${issue.number}` : `#${issue.number}`;
+      return `${ref}: ${issue.title}`;
+    })
+    .join('; ');
+}
+
+/**
  * DR-038 Decision 5 — the injected `coordination.md §Communication 5`
  * sweep instruction. Promotes the review/gate/mention pull-disciplines
  * from "a discipline the agent must remember" to an injected startup

@@ -115,10 +115,35 @@ fi
 # 6. Auto-submit. tmux-send-to-claude.sh is the ONLY sanctioned way to
 #    programmatically submit a prompt (2-step Enter quirk) — never inline
 #    `tmux send-keys ... Enter`. Requires an actual tmux session (claude.sh's
-#    canonical self-wrap); silently skip outside one.
+#    canonical self-wrap); silently skip outside one — checked FIRST so we
+#    don't pay for the `--oneline` round-trip below when we couldn't submit
+#    anyway.
 TMUX_SUBMIT="$WORKSPACE/.claude/scripts/tmux-send-to-claude.sh"
-if [[ -n "${TMUX:-}" ]] && [[ -x "$TMUX_SUBMIT" ]]; then
-  "$TMUX_SUBMIT" "" "Pick up pending issues: review the queue above and start on the highest-priority item." || true
+if [[ -z "${TMUX:-}" ]] || [[ ! -x "$TMUX_SUBMIT" ]]; then
+  exit 0
 fi
+
+# 7. Build the DETAILED submit prompt (macf#816) — the operator wants the
+#    pickup prompt to CARRY the pending-issue list, not point back at
+#    context with a generic "review the queue above" line. `issues
+#    --oneline` is a second short-lived plugin-CLI invocation (same query
+#    source as step 4, `checkAllPendingWork`) that renders a compact
+#    `repo#N: title; ...` line with no inbox/sweep prose — never re-parse
+#    $OUTPUT for this (a second source of truth for issue formatting).
+if ONELINE="$(node "$PLUGIN_CLI" issues --oneline 2>/dev/null)" && [[ -n "$ONELINE" ]]; then
+  # `--oneline` succeeded AND named pending GH issues → submit the detailed
+  # list. (The `&&` matters: a non-zero `--oneline` exit must NOT submit even
+  # if partial stdout was captured — a failed issue query is not a queue.)
+  "$TMUX_SUBMIT" "" "Pick up pending issues: ${ONELINE}" || true
+elif grep -q 'inbox message(s) drained on startup:' <<<"$OUTPUT"; then
+  # No open GH issues, but inbox messages were drained on startup (offline-
+  # arrived peer work). The pre-#816 hook fired the self-nudge on the
+  # inbox-drained case too; preserve that so a drained message can't strand
+  # un-processed (the #802 / silent-fallback shape). No issue list to name,
+  # so nudge at the drained messages surfaced in context above.
+  "$TMUX_SUBMIT" "" "Process the inbox message(s) drained on startup (surfaced above)." || true
+fi
+# else: neither issues nor drained inbox (the grep at step 5 already exits
+# otherwise) → nothing to submit.
 
 exit 0
