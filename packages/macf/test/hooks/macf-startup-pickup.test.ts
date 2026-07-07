@@ -61,8 +61,19 @@ interface RunResult {
 function runHook(opts: {
   /** stdout the fake plugin CLI's `issues` command should print; undefined = plugin CLI file absent entirely. */
   readonly pluginOutput?: string;
-  /** Non-zero exit for the fake plugin CLI (simulates a query failure). */
+  /**
+   * stdout the fake plugin CLI's `issues --oneline` command should print
+   * (macf#816 — the detailed-submit source). Defaults to '' (no pending GH
+   * issues) when `pluginOutput` is set but this is omitted — most fail-open
+   * / gated test cases never reach the `--oneline` call at all, so the
+   * default only matters for the handful of tests that assert on submit
+   * text/behavior and set it explicitly.
+   */
+  readonly pluginOnelineOutput?: string;
+  /** Non-zero exit for the fake plugin CLI's plain `issues` call (simulates a query failure). */
   readonly pluginExitNonZero?: boolean;
+  /** Non-zero exit for the fake plugin CLI's `issues --oneline` call specifically (macf#816). */
+  readonly pluginOnelineExitNonZero?: boolean;
   readonly env?: Record<string, string | undefined>;
   /** Whether to set TMUX (simulates running inside a tmux session). Defaults true. */
   readonly inTmux?: boolean;
@@ -72,10 +83,19 @@ function runHook(opts: {
   if (opts.pluginOutput !== undefined) {
     const pluginBinDir = join(workspace, '.macf', 'plugin', 'dist', 'plugin', 'bin');
     mkdirSync(pluginBinDir, { recursive: true });
-    const exitLine = opts.pluginExitNonZero ? 'process.exitCode = 1;' : '';
+    const fullOutput = JSON.stringify(opts.pluginOutput);
+    const onelineOutput = JSON.stringify(opts.pluginOnelineOutput ?? '');
+    const fullExit = opts.pluginExitNonZero ? 1 : 0;
+    const onelineExit = opts.pluginOnelineExitNonZero ? 1 : 0;
     writeFileSync(
       join(pluginBinDir, 'macf-plugin-cli.js'),
-      `#!/usr/bin/env node\nconsole.log(${JSON.stringify(opts.pluginOutput)});\n${exitLine}\n`,
+      [
+        '#!/usr/bin/env node',
+        "const isOneline = process.argv[3] === '--oneline';",
+        `console.log(isOneline ? ${onelineOutput} : ${fullOutput});`,
+        `process.exitCode = isOneline ? ${onelineExit} : ${fullExit};`,
+        '',
+      ].join('\n'),
     );
   }
 
@@ -117,28 +137,42 @@ function runHook(opts: {
 
 describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () => {
   describe('(a) auto-resuming role (e.g. code-agent) + pending work → submits via tmux-send-to-claude.sh', () => {
-    it('prints the plugin output + submits a follow-up prompt', () => {
+    it('prints the plugin output + submits a DETAILED follow-up prompt naming the pending issues (macf#816)', () => {
       const r = runHook({
         pluginOutput: PENDING_OUTPUT,
+        pluginOnelineOutput: '#1: fix the thing; #2: write the docs',
         env: { MACF_AGENT_ROLE: 'code-agent' },
       });
       expect(r.status).toBe(0);
       expect(r.stdout).toContain('pending issue(s):');
       // Submitted via the sanctioned helper with the empty-session ("current
-      // pane") form + a "Pick up pending issues" prompt.
+      // pane") form + a "Pick up pending issues: <oneline list>" prompt —
+      // the detailed line from `issues --oneline`, not the old generic
+      // "review the queue above" pointer.
       expect(r.submitInvocation).not.toBeNull();
       const lines = (r.submitInvocation ?? '').split('\n');
       expect(lines[0]).toBe('');
-      expect(lines[1]).toMatch(/Pick up pending issues/);
+      expect(lines[1]).toBe('Pick up pending issues: #1: fix the thing; #2: write the docs');
     });
 
-    it('also submits when only inbox messages were drained (no open issues)', () => {
+    it('submits the INBOX nudge when only inbox messages were drained and no GH issues are pending (macf#816 review-fix)', () => {
+      // No open GH issues → `--oneline` is empty → there is no detailed issue
+      // list to name. But the inbox WAS drained (offline-arrived peer work),
+      // and the pre-#816 hook fired a self-nudge on that case too. Preserve
+      // it: submit an inbox-oriented nudge (not the issue-list prompt) so a
+      // drained message can't strand un-processed (the #802 silent-fallback
+      // shape). The full drained-message text is also printed in context above.
       const r = runHook({
         pluginOutput: DRAINED_ONLY_OUTPUT,
+        pluginOnelineOutput: '',
         env: { MACF_AGENT_ROLE: 'science-agent' },
       });
       expect(r.status).toBe(0);
+      expect(r.stdout).toContain('inbox message(s) drained on startup:');
       expect(r.submitInvocation).not.toBeNull();
+      const lines = (r.submitInvocation ?? '').split('\n');
+      // tmux-send-to-claude.sh stub records its args; arg[1] is the prompt.
+      expect(lines[1]).toBe('Process the inbox message(s) drained on startup (surfaced above).');
     });
   });
 
@@ -146,6 +180,7 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
     it('prints the plugin output but does NOT invoke the submit helper', () => {
       const r = runHook({
         pluginOutput: NO_PENDING_OUTPUT,
+        pluginOnelineOutput: '',
         env: { MACF_AGENT_ROLE: 'code-agent' },
       });
       expect(r.status).toBe(0);
@@ -180,6 +215,7 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
     it('does NOT trigger on MACF_NO_STARTUP_PICKUP="0" (only "1" opts out)', () => {
       const r = runHook({
         pluginOutput: PENDING_OUTPUT,
+        pluginOnelineOutput: '#1: fix the thing',
         env: { MACF_AGENT_ROLE: 'code-agent', MACF_NO_STARTUP_PICKUP: '0' },
       });
       expect(r.status).toBe(0);
@@ -214,6 +250,20 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
         inTmux: false,
       });
       expect(r.status).toBe(0);
+      expect(r.stdout).toContain('pending issue(s):');
+      expect(r.submitInvocation).toBeNull();
+    });
+
+    it('the `issues --oneline` call fails (non-zero exit) → silent exit 0, no submit (macf#816)', () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        pluginOnelineOutput: '#1: fix the thing',
+        pluginOnelineExitNonZero: true,
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+      });
+      expect(r.status).toBe(0);
+      // The full context was already printed successfully — only the
+      // detailed self-nudge submit is skipped when its own query fails.
       expect(r.stdout).toContain('pending issue(s):');
       expect(r.submitInvocation).toBeNull();
     });

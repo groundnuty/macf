@@ -4,6 +4,7 @@ import {
   formatPeerTable,
   formatHealthDetail,
   formatIssues,
+  formatIssuesOneline,
   formatSweepInstruction,
   formatStartupReconcile,
 } from '../../../src/plugin/lib/format.js';
@@ -173,6 +174,52 @@ describe('formatIssues', () => {
   it('shows no pending issues message', () => {
     const output = formatIssues([]);
     expect(output).toContain('No pending issues');
+  });
+});
+
+describe('formatIssuesOneline (macf#816)', () => {
+  it('renders repo#N: title pairs separated by "; "', () => {
+    const output = formatIssuesOneline([
+      { number: 1, title: 'fix the thing', repo: 'groundnuty/macf' },
+      { number: 2, title: 'write the docs', repo: 'groundnuty/macf' },
+    ]);
+    expect(output).toBe('groundnuty/macf#1: fix the thing; groundnuty/macf#2: write the docs');
+  });
+
+  it('falls back to bare #N when repo is absent (back-compat, single-repo callers)', () => {
+    const output = formatIssuesOneline([{ number: 5, title: 'no repo tag' }]);
+    expect(output).toBe('#5: no repo tag');
+  });
+
+  it('returns an empty string when there are no pending issues (caller skips the submit)', () => {
+    expect(formatIssuesOneline([])).toBe('');
+  });
+
+  it('caps at 8 entries by default', () => {
+    const issues = Array.from({ length: 12 }, (_, i) => ({
+      number: i + 1,
+      title: `issue ${i + 1}`,
+      repo: 'groundnuty/macf',
+    }));
+    const output = formatIssuesOneline(issues);
+    expect(output.split('; ')).toHaveLength(8);
+    expect(output).toContain('groundnuty/macf#8');
+    expect(output).not.toContain('groundnuty/macf#9');
+  });
+
+  it('honors a custom limit', () => {
+    const issues = Array.from({ length: 5 }, (_, i) => ({
+      number: i + 1,
+      title: `issue ${i + 1}`,
+      repo: 'groundnuty/macf',
+    }));
+    const output = formatIssuesOneline(issues, 2);
+    expect(output.split('; ')).toHaveLength(2);
+  });
+
+  it('never emits multi-part "pending issue(s)"/"No pending issues" prose (compact mode, no formatIssues text)', () => {
+    expect(formatIssuesOneline([{ number: 1, title: 'x', repo: 'a/b' }])).not.toContain('pending issue');
+    expect(formatIssuesOneline([])).not.toContain('No pending issues');
   });
 });
 
