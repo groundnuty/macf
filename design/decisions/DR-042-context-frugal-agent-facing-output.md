@@ -1,6 +1,6 @@
 # DR-042: Context-frugal agent-facing coordination output
 
-**Status:** Proposed (science-authored 2026-07-05, operator-directed via `macf#795`; code-agent implements). Not ratified — Proposed→Accepted is the operator's call.
+**Status:** **Accepted** (operator-ratified 2026-08-10; science-authored 2026-07-05, operator-directed via `macf#795`). code-agent implements (`#795` skill surface + the D3 budget test; first instance `#794` already shipped).
 **Date:** 2026-07-05
 **Trigger:** The coordination skills (`/macf-peers`, `/macf-status`, `/macf-ping`, `/macf-issues`) grew organically, each returning a fixed **human-oriented table/dump**. Now that multi-agent + cross-fleet guest collaboration (DR-036/DR-041) is live, a property that was negligible early is now load-bearing: **the consumer of these skills is an LLM agent with finite context.** To answer *"is `ppam-2026/code-agent` idle?"* an agent runs `/macf-peers`, gets the entire fleet table, and pays context for every field to read one cell. Operator framing (2026-07-05): *"the agent should check the status of ONE specific agent and get ONLY the information it wants — we don't want to bloat the agent's context with unneeded information."*
 
