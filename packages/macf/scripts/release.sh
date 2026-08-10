@@ -185,7 +185,7 @@ resolve_key_path() {
 # validation (not just a prefix substring) per silent-fallback-hazards.md
 # Pattern B — a prefix-only check admits shell-metacharacter payloads.
 ensure_gh_token() {
-  if [ -n "${GH_TOKEN:-}" ] && [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then
+  if [ -n "${GH_TOKEN:-}" ] && [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then
     return 0
   fi
   [ -n "${APP_ID:-}" ] || die "GH_TOKEN not set/valid and APP_ID is unset — cannot mint a fresh token"
@@ -201,7 +201,7 @@ ensure_gh_token() {
 
   GH_TOKEN="$("$helper" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$key_path")" \
     || die "token mint via $helper failed"
-  [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9_]+$ ]] || die "minted token has an unexpected shape (not ghs_*) — refusing to use it"
+  [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9._-]+$ ]] || die "minted token has an unexpected shape (not ghs_*) — refusing to use it"
   export GH_TOKEN
 }
 

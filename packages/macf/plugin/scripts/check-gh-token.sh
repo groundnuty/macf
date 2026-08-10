@@ -66,19 +66,30 @@ if [[ "$COMMAND" =~ (^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_
 fi
 
 # Check GH_TOKEN: must be present AND match the bot-token shape
-# ^ghs_[A-Za-z0-9_]+$. Prefix-only check (`${GH_TOKEN:0:4} == ghs_`)
+# ^ghs_[A-Za-z0-9._-]+$. Prefix-only check (`${GH_TOKEN:0:4} == ghs_`)
 # was bypassable by `GH_TOKEN='ghs_; rm -rf <sentinel>'` — the first
 # four chars matched, the rest never validated. Surfaced as Pattern B's
 # 1/10 anomaly in the §4.4 failure-injection sprint (paper-research §27);
 # canonical-rule update in #364, this script in #365.
 # ghp_/gho_/ghu_ are user tokens; empty falls through to stored
 # `gh auth login` (user). Either case fires the trap.
+# GitHub changed the App installation-token format 2026-04-24
+# (github.blog/changelog/2026-04-24-notice-about-upcoming-new-format-...):
+# new tokens are `ghs_<app-id>_<JWT>` — still ghs_-prefixed but now
+# contain dots + dashes and vary in length (~380-520 chars) vs the old
+# opaque 40-char alnum form. GitHub's guidance is to treat the token as
+# opaque and not hardcode length/format — so this predicate validates
+# only what we own: non-empty, `ghs_` prefix, and an injection-safe
+# charset (rejects whitespace/`;`/`$`/`(`/`)`/`|`/`&`/backtick/quotes).
+# The charset, not the length, was always the injection-safety
+# invariant. This predicate MUST stay byte-identical to the launch-time
+# check in claude-sh.ts (`launchTokenValidationLines`) — see #825/#826.
 # Note: `${GH_TOKEN:-}` expansion is mandatory under `set -u`; a bare
 # `${GH_TOKEN:0:4}` errors with "unbound variable" when the env var
 # is unset, which is exactly the case we need to handle.
 GH_TOKEN_VALUE="${GH_TOKEN:-}"
 TOKEN_PREFIX="${GH_TOKEN_VALUE:0:4}"
-if [[ -z "$GH_TOKEN_VALUE" ]] || [[ ! "$GH_TOKEN_VALUE" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then
+if [[ -z "$GH_TOKEN_VALUE" ]] || [[ ! "$GH_TOKEN_VALUE" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then
   cat >&2 <<ERR
 BLOCKED by MACF attribution-trap hook: this command would post as the USER, not the BOT.
 

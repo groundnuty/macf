@@ -363,13 +363,23 @@ describe('check-gh-token.sh (hook)', () => {
   });
 
   // Token-shape regression — tightens prefix-only `${var:0:4} == ghs_`
-  // to full-shape regex `^ghs_[A-Za-z0-9_]+$`. The §4.4 failure-injection
+  // to full-shape regex `^ghs_[A-Za-z0-9._-]+$`. The §4.4 failure-injection
   // sprint surfaced the prefix-only weakness as Pattern B's 1/10 anomaly
   // (paper-research §27): `GH_TOKEN='ghs_; rm -rf <sentinel>'` satisfied
   // the prefix check (first 4 chars match) but smuggled shell
   // metacharacters past the boundary. The regex tightening (#364
   // canonical-rule, #365 deployed-impl) restores Pattern B's contract.
-  describe('shape-validation regex (#365 — tightens prefix-only to full-shape)', () => {
+  //
+  // Charset widened #825/#826: GitHub changed the App installation-token
+  // format 2026-04-24 to `ghs_<app-id>_<JWT>` (dots + dashes, variable
+  // length), replacing the old opaque 40-char form. GitHub's guidance is
+  // to treat tokens as opaque and validate only the invariants we own —
+  // non-empty, `ghs_` prefix, injection-safe charset — not length/format.
+  // The charset now includes `.` and `-` (both appear in base64url JWTs)
+  // while STILL excluding shell metacharacters (whitespace/`;`/`$`/`(`/
+  // `)`/`|`/`&`/backtick/quotes) — the charset, not the length, was
+  // always the injection-safety invariant.
+  describe('shape-validation regex (#365 tightened prefix→full-shape; #825/#826 widened for GitHub new-format tokens)', () => {
     it('blocks the §27 meta-injection variant (GH_TOKEN with embedded shell metacharacters)', () => {
       // The exact injection class that bypassed the prefix-only check
       // in the §4.4 sprint. First 4 chars are `ghs_` but the value
@@ -389,6 +399,14 @@ describe('check-gh-token.sh (hook)', () => {
       expect(r.status).toBe(2);
     });
 
+    it('blocks GH_TOKEN with backtick command-substitution payload (shape escape)', () => {
+      const r = runHook({
+        command: 'gh pr create',
+        env: { GH_TOKEN: 'ghs_`id`' },
+      });
+      expect(r.status).toBe(2);
+    });
+
     it('blocks GH_TOKEN with whitespace after the prefix (shape escape)', () => {
       const r = runHook({
         command: 'gh issue list',
@@ -397,10 +415,10 @@ describe('check-gh-token.sh (hook)', () => {
       expect(r.status).toBe(2);
     });
 
-    it('blocks GH_TOKEN with hyphen in body (regex tolerates [A-Za-z0-9_] only)', () => {
+    it('blocks GH_TOKEN that is only the bare "ghs_ evil" injection shape', () => {
       const r = runHook({
-        command: 'gh api user',
-        env: { GH_TOKEN: 'ghs_token-with-dash' },
+        command: 'gh issue list',
+        env: { GH_TOKEN: 'ghs_ evil' },
       });
       expect(r.status).toBe(2);
     });
@@ -413,7 +431,7 @@ describe('check-gh-token.sh (hook)', () => {
       expect(r.status).toBe(2);
     });
 
-    it('allows GH_TOKEN with underscore in body (regex tolerates [A-Za-z0-9_])', () => {
+    it('allows GH_TOKEN with underscore in body (regex tolerates [A-Za-z0-9._-])', () => {
       // Conservative: underscores are valid in the token shape; only
       // shell metacharacters trigger the block.
       const r = runHook({
@@ -427,6 +445,36 @@ describe('check-gh-token.sh (hook)', () => {
       const r = runHook({
         command: 'gh issue view 1',
         env: { GH_TOKEN: 'ghs_a' },
+      });
+      expect(r.status).toBe(0);
+    });
+
+    // --- #825/#826: GitHub's new ghs_<app-id>_<JWT> format ---
+
+    it('allows GH_TOKEN with hyphen in body (widened #825/#826 — dashes appear in base64url JWTs)', () => {
+      // Was BLOCKED before #825/#826 (regex tolerated [A-Za-z0-9_] only).
+      // GitHub's new-format installation tokens contain `-` from
+      // base64url encoding; this must now pass.
+      const r = runHook({
+        command: 'gh api user',
+        env: { GH_TOKEN: 'ghs_token-with-dash' },
+      });
+      expect(r.status).toBe(0);
+    });
+
+    it('allows a realistic GitHub new-format token: ghs_<app-id>_<JWT> with dots AND dashes', () => {
+      // Mirrors the shape confirmed live 2026-08-10 via a real
+      // `gh token generate` mint for this App (macf#825/#826): ghs_
+      // + numeric app-id + `_` + a base64url JWT (header.payload.signature,
+      // two dots, may contain dashes from base64url encoding).
+      const newFormatToken =
+        'ghs_3378862_' +
+        'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.' +
+        'eyJpc3MiOiIzMzc4ODYyIiwiaWF0IjoxNzU0ODAwMDAwfQ.' +
+        'gK9x-3fQ2z_R8mYqL7pW4vB1cN6dT0aH5jU2sE8oI-yV_gK9x3fQ2z';
+      const r = runHook({
+        command: 'gh issue view 140',
+        env: { GH_TOKEN: newFormatToken },
       });
       expect(r.status).toBe(0);
     });

@@ -330,7 +330,7 @@ function promptWatcherLines(): string[] {
 /**
  * Emit the launch-boundary `GH_TOKEN` full-shape validation block (macf#821).
  *
- * **The incident this closes:** a resumed session carried a corrupt
+ * **The incident this closes:** a resumed session carried an unexpected-shape
  * `GH_TOKEN` in the claude process env (383 chars — a `ghs_`+fragment with
  * an embedded JWT, inherited from the relaunch/resume path and NOT
  * overwritten by the `env.github` mint). The #140 `check-gh-token.sh`
@@ -342,6 +342,14 @@ function promptWatcherLines(): string[] {
  * One bad env value at launch = every GitHub op bricked until an
  * operator-side relaunch — a deadlock by construction.
  *
+ * **Correction (#825, post-merge same day):** the 383-char value above was
+ * NOT corrupt — it was a VALID GitHub App installation token in the new
+ * `ghs_<app-id>_<JWT>` format GitHub began rolling out 2026-04-24 (see the
+ * `^ghs_[A-Za-z0-9._-]+$` predicate below). The #140 hook's block was a
+ * false positive against the old 40-char-only predicate, not a correctly
+ * caught corruption. The launch/deadlock mechanics this function defends
+ * against are unchanged; only the incident's root cause was reframed.
+ *
  * **Pattern B (silent-fallback-hazards.md):** reject/replace the bad shape
  * at the boundary where it enters, so the #140 hook never faces an ambient
  * value the session can't recover from. This is a LAUNCH-time assertion,
@@ -349,11 +357,13 @@ function promptWatcherLines(): string[] {
  * check.
  *
  * **Regex MUST match the #140 hook's predicate exactly**
- * (`check-gh-token.sh`'s `^ghs_[A-Za-z0-9_]+$`, anchored full-shape — not a
- * prefix check; see #364/#365 on why a prefix-only check is bypassable). If
- * this launch check used a looser or different predicate, a token could
- * pass here and still be rejected once inside the session — recreating the
- * exact deadlock this exists to prevent.
+ * (`check-gh-token.sh`'s `^ghs_[A-Za-z0-9._-]+$`, anchored full-shape — not a
+ * prefix check; see #364/#365 on why a prefix-only check is bypassable, and
+ * #825/#826 on why the charset — not the length — is the load-bearing
+ * invariant: GitHub's own token format changed shape but the injection-safe
+ * charset still holds). If this launch check used a looser or different
+ * predicate, a token could pass here and still be rejected once inside the
+ * session — recreating the exact deadlock this exists to prevent.
  *
  * **Placement (why it must sit here, after `promptWatcherLines()`, right
  * before the final `exec claude` block):** the tmux self-wrap
@@ -394,13 +404,18 @@ export function launchTokenValidationLines(config: MacfAgentConfig): string[] {
       '',
       '# Launch-boundary GH_TOKEN validation (macf#821) — local-registry mode.',
       '# DR-024 local-mode legitimately runs with GH_TOKEN unset (no GitHub App,',
-      '# no token mint) — that case is fine, no-op. But a corrupt/inherited value',
-      '# (e.g. carried in from a resumed/relaunched shell, per the #821 incident)',
-      "# is still possible even here, and worth clearing — local-mode doesn't call",
-      '# `gh`, but leaving a malformed value in the exported env is pure downside.',
-      '# Full-shape check (anchored `^ghs_[A-Za-z0-9_]+$`), matching the #140',
+      '# no token mint) — that case is fine, no-op. But a malformed/inherited',
+      '# value (e.g. carried in from a resumed/relaunched shell, per the #821',
+      "# incident) is still possible even here, and worth clearing — local-mode",
+      '# doesn\'t call `gh`, but leaving a malformed value in the exported env is',
+      '# pure downside.',
+      '# Full-shape check (anchored `^ghs_[A-Za-z0-9._-]+$`), matching the #140',
       '# check-gh-token.sh hook\'s own predicate — NOT a prefix check (#364/#365).',
-      'if [ -n "${GH_TOKEN:-}" ] && ! [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then',
+      '# Charset (not length) is the load-bearing invariant: accepts both the',
+      '# old 40-char opaque form AND GitHub\'s new `ghs_<app-id>_<JWT>` format',
+      '# (dots/dashes, variable length) while still excluding shell metachars —',
+      '# see #825/#826.',
+      'if [ -n "${GH_TOKEN:-}" ] && ! [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then',
       '  echo "WARNING (macf#821): GH_TOKEN is set but malformed in local-registry" >&2',
       '  echo "WARNING: mode (no App creds here to re-mint from) — clearing it." >&2',
       '  unset GH_TOKEN',
@@ -421,11 +436,14 @@ export function launchTokenValidationLines(config: MacfAgentConfig): string[] {
     '# the env.github mint or an unclobbered inherited value from the',
     '# relaunch/resume path (the observed incident class).',
     '#',
-    '# Full-shape check, NOT a prefix check: anchored `^ghs_[A-Za-z0-9_]+$`,',
+    '# Full-shape check, NOT a prefix check: anchored `^ghs_[A-Za-z0-9._-]+$`,',
     '# matching the #140 hook\'s own predicate exactly (check-gh-token.sh) — the',
     '# launch check and the hook check MUST agree, or a token could pass here',
-    '# and still be rejected once inside the session.',
-    'if ! [[ "${GH_TOKEN:-}" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then',
+    '# and still be rejected once inside the session. Charset (not length) is',
+    '# the load-bearing invariant: accepts both the old 40-char opaque form',
+    '# AND GitHub\'s new `ghs_<app-id>_<JWT>` format (dots/dashes, variable',
+    '# length) while still excluding shell metacharacters — see #825/#826.',
+    'if ! [[ "${GH_TOKEN:-}" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then',
     '  echo "WARNING (macf#821): GH_TOKEN does not match the expected ghs_" >&2',
     '  echo "WARNING: installation-token shape at the launch boundary — re-minting" >&2',
     '  echo "WARNING: before exec." >&2',
@@ -441,7 +459,7 @@ export function launchTokenValidationLines(config: MacfAgentConfig): string[] {
     '    exit 1',
     '  }',
     '  export GH_TOKEN',
-    '  if ! [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then',
+    '  if ! [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then',
     '    echo "FATAL (macf#821): freshly re-minted GH_TOKEN STILL does not match" >&2',
     '    echo "FATAL: the expected shape. Aborting before exec claude rather" >&2',
     '    echo "FATAL: than starting a session the #140 hook would immediately and" >&2',

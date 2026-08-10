@@ -459,19 +459,21 @@ describe('generateClaudeSh', () => {
   describe('launch-boundary GH_TOKEN full-shape validation (macf#821)', () => {
     it('emits an anchored full-shape check for GH_TOKEN, matching the #140 hook predicate exactly', () => {
       const output = generateClaudeSh(sampleConfig);
-      expect(output).toContain('if ! [[ "${GH_TOKEN:-}" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then');
+      expect(output).toContain('if ! [[ "${GH_TOKEN:-}" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then');
     });
 
     it('every ^ghs_ occurrence in the generated script is the anchored full-shape pattern (never prefix-only)', () => {
       // Regression guard for the exact bug class this issue targets: a
       // `^ghs_` occurrence that is NOT immediately followed by
-      // `[A-Za-z0-9_]+$` would be a prefix-only check (bypassable — see
-      // #364/#365), not a full-shape check.
+      // `[A-Za-z0-9._-]+$` would be a prefix-only check (bypassable — see
+      // #364/#365), not a full-shape check. Charset widened per #825/#826
+      // to accept GitHub's new `ghs_<app-id>_<JWT>` token format (dots +
+      // dashes) alongside the old opaque 40-char form.
       const output = generateClaudeSh(sampleConfig);
       const occurrences = output.match(/\^ghs_\S*/g) ?? [];
       expect(occurrences.length).toBeGreaterThan(0);
       for (const occ of occurrences) {
-        expect(occ.startsWith('^ghs_[A-Za-z0-9_]+$')).toBe(true);
+        expect(occ.startsWith('^ghs_[A-Za-z0-9._-]+$')).toBe(true);
       }
     });
 
@@ -560,7 +562,7 @@ describe('generateClaudeSh', () => {
       it('clears (does not abort on) a malformed-but-present GH_TOKEN', () => {
         const output = generateClaudeSh(localSampleConfig);
         expect(output).toContain(
-          'if [ -n "${GH_TOKEN:-}" ] && ! [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then',
+          'if [ -n "${GH_TOKEN:-}" ] && ! [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then',
         );
         expect(output).toContain('unset GH_TOKEN');
         // No exit-1 abort path exists in the local-mode branch at all.
@@ -572,45 +574,97 @@ describe('generateClaudeSh', () => {
 
       it('still uses the anchored full-shape regex (not a prefix check), same as App-mode', () => {
         const output = generateClaudeSh(localSampleConfig);
-        expect(output).toMatch(/\^ghs_\[A-Za-z0-9_\]\+\$/);
+        expect(output).toMatch(/\^ghs_\[A-Za-z0-9\._-\]\+\$/);
       });
     });
 
     describe('regex semantics (fixture-based, independent of any live token mint)', () => {
       // Pins the REGEX the generated script uses and tests it directly
-      // against fixture strings representing the two shapes the #821
-      // incident distinguishes — a valid classic installation token vs.
-      // the corrupt shape from the incident forensics (`ghs_` + short
-      // fragment + an embedded JWT). Deliberately NOT derived from any
-      // live `gh token generate` output — see check-before-propose.md:
-      // this pins the regex's documented contract, not this build
-      // environment's token-minting behavior.
-      const FULL_SHAPE = /^ghs_[A-Za-z0-9_]+$/;
+      // against fixture strings. Widened per #825/#826: GitHub changed the
+      // App installation-token format 2026-04-24 (staged rollout) to
+      // `ghs_<app-id>_<JWT>` — ghs_-prefixed, dots + dashes, variable
+      // length (~380-520 chars) — replacing the old opaque 40-char form.
+      // GitHub's own guidance is to treat tokens as opaque and drop
+      // hardcoded length/format regexes; this predicate now validates only
+      // the invariants we own (non-empty, `ghs_` prefix, injection-safe
+      // charset) and treats the rest as opaque. Deliberately NOT derived
+      // from any live `gh token generate` output — see
+      // check-before-propose.md: this pins the regex's documented
+      // contract, not this build environment's token-minting behavior.
+      //
+      // IMPORTANT correction (#825): what #821 originally called the
+      // "incident shape" / "corrupt" token (`ghs_` + fragment + embedded
+      // JWT, ~383 chars) was later confirmed to be a VALID GitHub
+      // new-format token, not corruption — the old predicate's rejection
+      // of it was the bug this widening fixes. Fixtures below reflect
+      // that correction: the former "rejects the incident shape" test is
+      // now "accepts" it.
+      const FULL_SHAPE = /^ghs_[A-Za-z0-9._-]+$/;
 
-      it('accepts a valid classic installation token', () => {
+      it('accepts a valid classic (old-format) installation token', () => {
         const validClassicToken =
           'ghs_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0';
         expect(FULL_SHAPE.test(validClassicToken)).toBe(true);
       });
 
-      it('rejects the incident shape (ghs_ + fragment + embedded JWT)', () => {
-        // Per the issue forensics: `ghs_` + 8-char fragment, then a JWT
-        // header/payload/signature — dot-separated base64url segments.
-        // `.` is not in [A-Za-z0-9_], so the anchored full-shape check
-        // must reject this even though it starts with `ghs_`.
+      it('accepts the former "incident shape" — now known to be a valid GitHub new-format token (#825/#826)', () => {
+        // Per the issue forensics: `ghs_` + app-id-shaped fragment, then a
+        // JWT header/payload/signature — dot-separated base64url segments.
+        // This is GitHub's documented `ghs_<app-id>_<JWT>` format
+        // (github.blog/changelog/2026-04-24-...); the widened charset
+        // must accept it.
         const incidentShapeToken =
           'ghs_AbCdEfGh.eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.' +
           'eyJhdWQiOiJhdXRobmQiLCJpc3MiOiJnaXRodWIiLCJ2ZXIiOjN9.' +
           'qFG7VT5FvuM7k07o4qs2BI9c9BLVzpfvNpzV_qLd2TtZuEYrhnrwAkihg3UXZGzkj8OBS7Cpz7ZBYifZzUTQEg';
         expect(incidentShapeToken.startsWith('ghs_')).toBe(true);
-        expect(FULL_SHAPE.test(incidentShapeToken)).toBe(false);
+        expect(FULL_SHAPE.test(incidentShapeToken)).toBe(true);
       });
 
-      it('a prefix-only check would have PASSED the incident shape — pins why full-shape matters', () => {
-        const incidentShapeToken = 'ghs_AbCdEfGh.eyJhbGciOiJFUzI1NiJ9.payload.sig';
-        const prefixOnlyCheck = incidentShapeToken.startsWith('ghs_');
+      it('accepts a realistic new-format token: ghs_<app-id>_<JWT>, ~383 chars, dots AND dashes', () => {
+        // Mirrors the shape a real GitHub App installation token was
+        // observed to have (macf#825 build-finding, empirically re-verified
+        // 2026-08-10 against a live `gh token generate` mint for this
+        // App): `ghs_<7-digit-app-id>_` + a base64url JWT (which can
+        // itself contain `-` from base64url encoding) with two `.`
+        // separators.
+        const appId = '3378862';
+        const header = 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9';
+        const payload =
+          'eyJpc3MiOiIzMzc4ODYyIiwiaWF0IjoxNzU0ODAwMDAwLCJleHAiOjE3NTQ4MDM2MDB9';
+        const signature =
+          'gK9x-3fQ2z_R8mYqL7pW4vB1cN6dT0aH5jU2sE8oI-yV_gK9x3fQ2z';
+        const newFormatToken = `ghs_${appId}_${header}.${payload}.${signature}`;
+        expect(newFormatToken.length).toBeGreaterThan(100);
+        expect(FULL_SHAPE.test(newFormatToken)).toBe(true);
+      });
+
+      it('rejects an empty / unset token', () => {
+        expect(FULL_SHAPE.test('')).toBe(false);
+      });
+
+      it('rejects user-token prefixes (ghp_/gho_/ghu_) — the attribution-trap discriminator is preserved', () => {
+        expect(FULL_SHAPE.test('ghp_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8')).toBe(false);
+        expect(FULL_SHAPE.test('gho_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8')).toBe(false);
+        expect(FULL_SHAPE.test('ghu_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8')).toBe(false);
+      });
+
+      it('rejects injection payloads — the widened charset still excludes shell metacharacters (#364/#365)', () => {
+        // The charset, not the length, was always the injection-safety
+        // invariant (§4.4 failure-injection sprint). Widening to accept
+        // `.`/`-` must NOT widen to accept whitespace, `;`, `$`, `(`, `)`,
+        // `|`, `&`, backtick, or quotes.
+        expect(FULL_SHAPE.test('ghs_; rm -rf x')).toBe(false);
+        expect(FULL_SHAPE.test('ghs_ evil')).toBe(false);
+        expect(FULL_SHAPE.test('ghs_$(whoami)')).toBe(false);
+        expect(FULL_SHAPE.test('ghs_`id`')).toBe(false);
+      });
+
+      it('a prefix-only check would have PASSED an injection payload — pins why the full-shape charset still matters', () => {
+        const injectionToken = 'ghs_; rm -rf /tmp/sentinel';
+        const prefixOnlyCheck = injectionToken.startsWith('ghs_');
         expect(prefixOnlyCheck).toBe(true);
-        expect(FULL_SHAPE.test(incidentShapeToken)).toBe(false);
+        expect(FULL_SHAPE.test(injectionToken)).toBe(false);
       });
     });
   });
