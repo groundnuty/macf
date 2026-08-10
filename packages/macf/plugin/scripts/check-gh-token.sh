@@ -98,6 +98,14 @@ Fix — refresh the bot token via the fail-loud helper:
 If the helper is missing, restore it:
   macf rules refresh --dir .
 
+If GH_TOKEN is persistently bad in THIS session's ambient env (not just this
+one command) — e.g. a corrupt/inherited value from a relaunch or resume path
+— the in-session fixes above cannot reach the process env this hook reads.
+The sanctioned recovery is a relaunch: exit this session and run ./claude.sh
+again. Since macf#821, claude.sh full-shape-validates GH_TOKEN at the launch
+boundary (before exec) and re-mints or aborts loudly rather than starting a
+session this hook would then deadlock.
+
 Override (ONLY for intentional user-attributed ops like onboarding):
   export MACF_SKIP_TOKEN_CHECK=1
 ERR

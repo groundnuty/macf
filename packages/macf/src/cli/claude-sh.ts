@@ -328,6 +328,132 @@ function promptWatcherLines(): string[] {
 }
 
 /**
+ * Emit the launch-boundary `GH_TOKEN` full-shape validation block (macf#821).
+ *
+ * **The incident this closes:** a resumed session carried a corrupt
+ * `GH_TOKEN` in the claude process env (383 chars — a `ghs_`+fragment with
+ * an embedded JWT, inherited from the relaunch/resume path and NOT
+ * overwritten by the `env.github` mint). The #140 `check-gh-token.sh`
+ * PreToolUse hook correctly hard-blocked every `gh` command — but the
+ * session was unrecoverable FROM INSIDE: the hook validates the *ambient*
+ * env, so an in-command re-mint can never satisfy it (Bash-tool shells
+ * don't persist env back to the hook), and `MACF_SKIP_TOKEN_CHECK=1` is
+ * also read from the hook's own env, so it can't be set from inside either.
+ * One bad env value at launch = every GitHub op bricked until an
+ * operator-side relaunch — a deadlock by construction.
+ *
+ * **Pattern B (silent-fallback-hazards.md):** reject/replace the bad shape
+ * at the boundary where it enters, so the #140 hook never faces an ambient
+ * value the session can't recover from. This is a LAUNCH-time assertion,
+ * complementary to (not a replacement for) the #140 hook's own per-command
+ * check.
+ *
+ * **Regex MUST match the #140 hook's predicate exactly**
+ * (`check-gh-token.sh`'s `^ghs_[A-Za-z0-9_]+$`, anchored full-shape — not a
+ * prefix check; see #364/#365 on why a prefix-only check is bypassable). If
+ * this launch check used a looser or different predicate, a token could
+ * pass here and still be rejected once inside the session — recreating the
+ * exact deadlock this exists to prevent.
+ *
+ * **Placement (why it must sit here, after `promptWatcherLines()`, right
+ * before the final `exec claude` block):** the tmux self-wrap
+ * (`tmuxSelfWrapLines()`) `exec`s a brand-new `claude.sh` process inside
+ * tmux when it fires — that process re-runs the ENTIRE script from the top,
+ * including the `env.*` source loop, so `GH_TOKEN` is re-minted fresh in
+ * the tmux-wrapped (inner) invocation. `GH_TOKEN` is NOT among the
+ * `MACF_*`-prefixed vars the wrap passes through via `-e` (macf#340), so
+ * validating right after the `env.*` loop would run BEFORE the wrap
+ * discards that shell's state — checking a value about to be thrown away.
+ * Placed here (after the wrap, channel-notifications, and prompt-watcher
+ * blocks — mirroring their own "only the in-tmux invocation reaches this
+ * point" placement rationale), the check naturally runs exactly ONCE, in
+ * whichever invocation is actually about to `exec claude` — the outer
+ * (pre-wrap) invocation never reaches this point (it's replaced by `exec
+ * tmux ...` first), and the inner/no-wrap invocation reaches it with its
+ * own freshly-sourced `env.*` state intact.
+ *
+ * **App-mode** (`github_app` configured — `APP_ID`/`INSTALL_ID`/`KEY_PATH`
+ * exported by `env.github`): a shape mismatch triggers a re-mint via the
+ * same fail-loud helper `env.github` itself uses (bare assignment +
+ * explicit `|| exit`, never `export GH_TOKEN=$(...)` — that form masks the
+ * substitution's exit status per `gh-token-attribution-traps.md` §3 / SC2155
+ * and would reintroduce silent-fallback Instance 12 into the launcher
+ * itself). If the re-minted value STILL doesn't match, abort LOUDLY before
+ * `exec claude` — never start a session the #140 hook will immediately and
+ * unrecoverably deadlock.
+ *
+ * **Local-mode (DR-024):** no App creds exist to re-mint from. A legitimately
+ * EMPTY `GH_TOKEN` is fine (local-mode never calls `gh`) — no-op. A
+ * non-empty-but-malformed value (the same inherited-not-overwritten class,
+ * just with nothing to re-mint against) is cleared with a warning so it
+ * can't linger in the exported env.
+ */
+export function launchTokenValidationLines(config: MacfAgentConfig): string[] {
+  if (isLocalMode(config)) {
+    return [
+      '',
+      '# Launch-boundary GH_TOKEN validation (macf#821) — local-registry mode.',
+      '# DR-024 local-mode legitimately runs with GH_TOKEN unset (no GitHub App,',
+      '# no token mint) — that case is fine, no-op. But a corrupt/inherited value',
+      '# (e.g. carried in from a resumed/relaunched shell, per the #821 incident)',
+      "# is still possible even here, and worth clearing — local-mode doesn't call",
+      '# `gh`, but leaving a malformed value in the exported env is pure downside.',
+      '# Full-shape check (anchored `^ghs_[A-Za-z0-9_]+$`), matching the #140',
+      '# check-gh-token.sh hook\'s own predicate — NOT a prefix check (#364/#365).',
+      'if [ -n "${GH_TOKEN:-}" ] && ! [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then',
+      '  echo "WARNING (macf#821): GH_TOKEN is set but malformed in local-registry" >&2',
+      '  echo "WARNING: mode (no App creds here to re-mint from) — clearing it." >&2',
+      '  unset GH_TOKEN',
+      'fi',
+    ];
+  }
+
+  return [
+    '',
+    '# Launch-boundary GH_TOKEN validation (macf#821) — Pattern B: reject/replace',
+    '# a bad token shape at the boundary where it enters, so the #140',
+    '# check-gh-token.sh PreToolUse hook never faces an ambient value the',
+    '# session cannot recover from (that hook validates the AMBIENT env only —',
+    '# an in-command re-mint can never satisfy it, and its own',
+    '# MACF_SKIP_TOKEN_CHECK=1 override is unreachable from inside a bricked',
+    '# session either). Validates the FINAL value here, immediately before',
+    '# `exec claude` below — regardless of whether GH_TOKEN got that value from',
+    '# the env.github mint or an unclobbered inherited value from the',
+    '# relaunch/resume path (the observed incident class).',
+    '#',
+    '# Full-shape check, NOT a prefix check: anchored `^ghs_[A-Za-z0-9_]+$`,',
+    '# matching the #140 hook\'s own predicate exactly (check-gh-token.sh) — the',
+    '# launch check and the hook check MUST agree, or a token could pass here',
+    '# and still be rejected once inside the session.',
+    'if ! [[ "${GH_TOKEN:-}" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then',
+    '  echo "WARNING (macf#821): GH_TOKEN does not match the expected ghs_" >&2',
+    '  echo "WARNING: installation-token shape at the launch boundary — re-minting" >&2',
+    '  echo "WARNING: before exec." >&2',
+    '  GH_TOKEN=$("$SCRIPT_DIR/.claude/scripts/macf-gh-token.sh" \\',
+    '      --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") || {',
+    '    echo "FATAL (macf#821): GH_TOKEN re-mint failed at the launch boundary —" >&2',
+    '    echo "FATAL: see stderr above. Aborting before exec claude: a bad token" >&2',
+    '    echo "FATAL: here would deadlock the #140 hook from INSIDE the session" >&2',
+    '    echo "FATAL: (unrecoverable — the hook reads ambient env; its own" >&2',
+    '    echo "FATAL: MACF_SKIP_TOKEN_CHECK=1 override cannot be set from a" >&2',
+    '    echo "FATAL: Bash-tool shell either). Fix the underlying cause (App" >&2',
+    '    echo "FATAL: creds / clock drift / key), then relaunch: ./claude.sh" >&2',
+    '    exit 1',
+    '  }',
+    '  export GH_TOKEN',
+    '  if ! [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then',
+    '    echo "FATAL (macf#821): freshly re-minted GH_TOKEN STILL does not match" >&2',
+    '    echo "FATAL: the expected shape. Aborting before exec claude rather" >&2',
+    '    echo "FATAL: than starting a session the #140 hook would immediately and" >&2',
+    '    echo "FATAL: unrecoverably block. Fix the underlying cause, then" >&2',
+    '    echo "FATAL: relaunch: ./claude.sh" >&2',
+    '    exit 1',
+    '  fi',
+    'fi',
+  ];
+}
+
+/**
  * Emit the Claude Code native OTEL telemetry env block into the
  * generated `claude.sh`. Three mandatory gates per Claude Code docs
  * — missing any one of them → zero traces emit:
@@ -635,8 +761,9 @@ export function githubTokenAndIdentityLines(cfg: MacfAgentConfig): string[] {
  * orchestration: shebang + managed header, SCRIPT_DIR resolution,
  * source-loop, optional non-cleanly-bucketed exports (MACF_HOST /
  * MACF_ADVERTISE_HOST / MACF_DEBUG — see PR body for rationale), tmux
- * self-wrap (macf#340 env-isolation preserved), and the conditional
- * `exec claude` block.
+ * self-wrap (macf#340 env-isolation preserved), a launch-boundary
+ * `GH_TOKEN` full-shape validation (macf#821 — see
+ * `launchTokenValidationLines`), and the conditional `exec claude` block.
  *
  * **Source order is alphabetical** (shell glob expansion). The
  * underscore-prefixed `env._helpers` sorts BEFORE alphabetical-letter
@@ -745,6 +872,7 @@ export function generateClaudeSh(config: MacfAgentConfig): string {
     ...tmuxSelfWrapLines(),
     ...channelNotificationsLines(),
     ...promptWatcherLines(),
+    ...launchTokenValidationLines(config),
     '',
     // --plugin-dir loads the pinned macf-agent plugin from this workspace
     // (per DR-013). Additive — user-scope plugins still load alongside.
