@@ -54,6 +54,8 @@ export GH_TOKEN="$TOKEN"
 
 **The PreToolUse hook does NOT cover this.** `check-gh-token.sh` validates the *ambient* `GH_TOKEN` before the command runs, so an inline `export GH_TOKEN=$(...) && gh ...` (refresh-chain *or* file-cache read) reassigns the token *after* the hook has already passed — the hook is structurally blind to it (silent-fallback **Instance 12**, `silent-fallback-hazards.md`). Refresh in a **separate step** (to a pre-validated file, or a bare-assigned var with the checks above), never inline in the `gh` command. The durable structural cover is a result-invariant **PostToolUse** `author`-check (macf#489), not the PreToolUse precondition.
 
+**Token shape is opaque past the prefix (macf#825/#826).** GitHub changed the App installation-token format 2026-04-24 — new tokens are `ghs_<app-id>_<JWT>` (dots + dashes, variable length ~380-520 chars), replacing the old fixed 40-char opaque form; GitHub's own guidance is to treat tokens as opaque and drop hardcoded length/format regexes. The `ghs_*` prefix checks in this doc stay valid (the prefix didn't change). Where a full-shape check is needed (e.g. `check-gh-token.sh`'s PreToolUse predicate, `claude.sh`'s launch-boundary check), validate only the invariants we own — non-empty, `ghs_` prefix, an injection-safe charset (`^ghs_[A-Za-z0-9._-]+$`) — never length or internal format.
+
 ### 4. Wrong `gh auth` on the VM providing fallback
 
 Having `gh auth login` configured as a user account creates the fallback surface in #3. Even a "good" setup where the script is correct can hide a broken bot token because `gh` quietly uses the user auth.
