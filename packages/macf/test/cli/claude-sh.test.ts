@@ -26,7 +26,13 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { generateClaudeSh, writeClaudeSh, otelTelemetryLines, hasManagedHeader } from '../../src/cli/claude-sh.js';
+import {
+  generateClaudeSh,
+  writeClaudeSh,
+  otelTelemetryLines,
+  hasManagedHeader,
+  launchTokenValidationLines,
+} from '../../src/cli/claude-sh.js';
 import type { MacfAgentConfig } from '../../src/cli/config.js';
 
 const sampleConfig: MacfAgentConfig = {
@@ -40,6 +46,17 @@ const sampleConfig: MacfAgentConfig = {
     install_id: '67890',
     key_path: '.github-app-key.pem',
   },
+  versions: { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' },
+};
+
+// DR-024 local-registry mode: no GitHub App, no token mint. Mirrors the
+// `localConfig` sample in env-files.test.ts.
+const localSampleConfig: MacfAgentConfig = {
+  project: 'TEST',
+  agent_name: 'cv-architect',
+  agent_role: 'cv-architect',
+  agent_type: 'permanent',
+  registry: { type: 'local', path: '/home/u/.macf/registry/TEST.json' },
   versions: { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' },
 };
 
@@ -142,7 +159,16 @@ describe('generateClaudeSh', () => {
       expect(output).not.toContain('export APP_ID="12345"');
       expect(output).not.toContain('export INSTALL_ID="67890"');
       expect(output).not.toContain('export KEY_PATH=".github-app-key.pem"');
-      expect(output).not.toContain('export GH_TOKEN');
+      // macf#821 exception: a CONDITIONAL `export GH_TOKEN` now legitimately
+      // appears inside the launch-boundary re-mint block (only fires when
+      // the ambient token fails the shape check — see the dedicated
+      // describe block below). That is new, intentional behavior, not a
+      // regression of the old UNCONDITIONAL inline mint this guard targets.
+      // Distinguish by position: the pre-#342 / regression shape is a
+      // top-level (column-0) `export GH_TOKEN`; the macf#821 shape is
+      // indented, inside the re-mint conditional.
+      expect(output).not.toMatch(/^export GH_TOKEN$/m);
+      expect(output).toMatch(/^  export GH_TOKEN$/m);
       expect(output).not.toContain('export GIT_AUTHOR_NAME');
       // env.certs owns these:
       expect(output).not.toContain('MACF_CA_CERT');
@@ -427,6 +453,165 @@ describe('generateClaudeSh', () => {
       const execPos = output.indexOf('exec claude --plugin-dir');
       expect(watcherPos).toBeGreaterThan(tmuxPos);
       expect(watcherPos).toBeLessThan(execPos);
+    });
+  });
+
+  describe('launch-boundary GH_TOKEN full-shape validation (macf#821)', () => {
+    it('emits an anchored full-shape check for GH_TOKEN, matching the #140 hook predicate exactly', () => {
+      const output = generateClaudeSh(sampleConfig);
+      expect(output).toContain('if ! [[ "${GH_TOKEN:-}" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then');
+    });
+
+    it('every ^ghs_ occurrence in the generated script is the anchored full-shape pattern (never prefix-only)', () => {
+      // Regression guard for the exact bug class this issue targets: a
+      // `^ghs_` occurrence that is NOT immediately followed by
+      // `[A-Za-z0-9_]+$` would be a prefix-only check (bypassable — see
+      // #364/#365), not a full-shape check.
+      const output = generateClaudeSh(sampleConfig);
+      const occurrences = output.match(/\^ghs_\S*/g) ?? [];
+      expect(occurrences.length).toBeGreaterThan(0);
+      for (const occ of occurrences) {
+        expect(occ.startsWith('^ghs_[A-Za-z0-9_]+$')).toBe(true);
+      }
+    });
+
+    it('re-mints via the fail-loud helper: bare assignment + explicit || exit, never export GH_TOKEN=$(...)', () => {
+      const output = generateClaudeSh(sampleConfig);
+      const start = output.indexOf('Launch-boundary GH_TOKEN validation (macf#821)');
+      const end = output.indexOf('if [ -n "${MACF_TEST:-}" ]; then');
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      const validationBlock = output.slice(start, end);
+
+      expect(validationBlock).toContain(
+        'GH_TOKEN=$("$SCRIPT_DIR/.claude/scripts/macf-gh-token.sh" \\',
+      );
+      expect(validationBlock).toContain(
+        '--app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") || {',
+      );
+      expect(validationBlock).toContain('export GH_TOKEN');
+      // The masking anti-pattern this must never regress to (SC2155 /
+      // gh-token-attribution-traps.md §3 / silent-fallback Instance 12):
+      // `export` is a builtin whose own exit status replaces the
+      // substitution's, so `export GH_TOKEN=$(helper)` would swallow a
+      // failed re-mint instead of aborting.
+      expect(validationBlock).not.toMatch(/export GH_TOKEN=\$\(/);
+    });
+
+    it('aborts LOUDLY (exit 1) both on re-mint failure and on a still-bad re-minted value', () => {
+      const output = generateClaudeSh(sampleConfig);
+      expect(output).toContain(
+        'FATAL (macf#821): GH_TOKEN re-mint failed at the launch boundary —',
+      );
+      expect(output).toContain(
+        'FATAL (macf#821): freshly re-minted GH_TOKEN STILL does not match',
+      );
+      const start = output.indexOf('Launch-boundary GH_TOKEN validation (macf#821)');
+      const end = output.indexOf('if [ -n "${MACF_TEST:-}" ]; then');
+      const validationBlock = output.slice(start, end);
+      const exitOnes = validationBlock.match(/\bexit 1\b/g) ?? [];
+      expect(exitOnes.length).toBe(2);
+    });
+
+    it('never execs claude with a token that failed validation (abort precedes every exec claude path)', () => {
+      // Both `exit 1` FATAL paths must appear strictly BEFORE the final
+      // exec-claude conditional — the launcher must not fall through to
+      // `exec claude` after aborting.
+      const output = generateClaudeSh(sampleConfig);
+      const firstExitPos = output.indexOf('exit 1');
+      const execConditionalPos = output.indexOf('if [ -n "${MACF_TEST:-}" ]; then');
+      expect(firstExitPos).toBeGreaterThan(0);
+      expect(firstExitPos).toBeLessThan(execConditionalPos);
+    });
+
+    it('is positioned AFTER the prompt-watcher block and BEFORE the final exec-claude conditional', () => {
+      const output = generateClaudeSh(sampleConfig);
+      const watcherPos = output.indexOf('macf-prompt-watcher.sh" "$TMUX_PANE" &');
+      const validationPos = output.indexOf('Launch-boundary GH_TOKEN validation (macf#821)');
+      const execConditionalPos = output.indexOf('if [ -n "${MACF_TEST:-}" ]; then');
+      expect(watcherPos).toBeGreaterThan(0);
+      expect(validationPos).toBeGreaterThan(watcherPos);
+      expect(validationPos).toBeLessThan(execConditionalPos);
+    });
+
+    it('is positioned AFTER the tmux self-wrap block (so it validates the token in the process that becomes the session)', () => {
+      // The tmux self-wrap `exec`s a brand-new claude.sh inside tmux when it
+      // fires, re-sourcing env.* (and re-minting GH_TOKEN) fresh in that
+      // inner invocation. Validating before the wrap would check a value
+      // about to be discarded when the outer shell is replaced.
+      const output = generateClaudeSh(sampleConfig);
+      const tmuxWrapPos = output.indexOf('if [ -z "${TMUX:-}" ]');
+      const validationPos = output.indexOf('Launch-boundary GH_TOKEN validation (macf#821)');
+      expect(tmuxWrapPos).toBeGreaterThan(0);
+      expect(validationPos).toBeGreaterThan(tmuxWrapPos);
+    });
+
+    describe('local-registry mode (DR-024)', () => {
+      it('tolerates an absent GH_TOKEN — no abort, no App-creds re-mint reference', () => {
+        const output = generateClaudeSh(localSampleConfig);
+        expect(output).toContain(
+          'Launch-boundary GH_TOKEN validation (macf#821) — local-registry mode.',
+        );
+        // No App creds exist in local-mode to re-mint from.
+        expect(output).not.toContain('--app-id "$APP_ID"');
+        expect(output).not.toContain('FATAL (macf#821): GH_TOKEN re-mint failed');
+      });
+
+      it('clears (does not abort on) a malformed-but-present GH_TOKEN', () => {
+        const output = generateClaudeSh(localSampleConfig);
+        expect(output).toContain(
+          'if [ -n "${GH_TOKEN:-}" ] && ! [[ "$GH_TOKEN" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then',
+        );
+        expect(output).toContain('unset GH_TOKEN');
+        // No exit-1 abort path exists in the local-mode branch at all.
+        const start = output.indexOf('Launch-boundary GH_TOKEN validation (macf#821)');
+        const end = output.indexOf('if [ -n "${MACF_TEST:-}" ]; then');
+        const validationBlock = output.slice(start, end);
+        expect(validationBlock).not.toContain('exit 1');
+      });
+
+      it('still uses the anchored full-shape regex (not a prefix check), same as App-mode', () => {
+        const output = generateClaudeSh(localSampleConfig);
+        expect(output).toMatch(/\^ghs_\[A-Za-z0-9_\]\+\$/);
+      });
+    });
+
+    describe('regex semantics (fixture-based, independent of any live token mint)', () => {
+      // Pins the REGEX the generated script uses and tests it directly
+      // against fixture strings representing the two shapes the #821
+      // incident distinguishes — a valid classic installation token vs.
+      // the corrupt shape from the incident forensics (`ghs_` + short
+      // fragment + an embedded JWT). Deliberately NOT derived from any
+      // live `gh token generate` output — see check-before-propose.md:
+      // this pins the regex's documented contract, not this build
+      // environment's token-minting behavior.
+      const FULL_SHAPE = /^ghs_[A-Za-z0-9_]+$/;
+
+      it('accepts a valid classic installation token', () => {
+        const validClassicToken =
+          'ghs_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0';
+        expect(FULL_SHAPE.test(validClassicToken)).toBe(true);
+      });
+
+      it('rejects the incident shape (ghs_ + fragment + embedded JWT)', () => {
+        // Per the issue forensics: `ghs_` + 8-char fragment, then a JWT
+        // header/payload/signature — dot-separated base64url segments.
+        // `.` is not in [A-Za-z0-9_], so the anchored full-shape check
+        // must reject this even though it starts with `ghs_`.
+        const incidentShapeToken =
+          'ghs_AbCdEfGh.eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.' +
+          'eyJhdWQiOiJhdXRobmQiLCJpc3MiOiJnaXRodWIiLCJ2ZXIiOjN9.' +
+          'qFG7VT5FvuM7k07o4qs2BI9c9BLVzpfvNpzV_qLd2TtZuEYrhnrwAkihg3UXZGzkj8OBS7Cpz7ZBYifZzUTQEg';
+        expect(incidentShapeToken.startsWith('ghs_')).toBe(true);
+        expect(FULL_SHAPE.test(incidentShapeToken)).toBe(false);
+      });
+
+      it('a prefix-only check would have PASSED the incident shape — pins why full-shape matters', () => {
+        const incidentShapeToken = 'ghs_AbCdEfGh.eyJhbGciOiJFUzI1NiJ9.payload.sig';
+        const prefixOnlyCheck = incidentShapeToken.startsWith('ghs_');
+        expect(prefixOnlyCheck).toBe(true);
+        expect(FULL_SHAPE.test(incidentShapeToken)).toBe(false);
+      });
     });
   });
 
