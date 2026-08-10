@@ -4,6 +4,27 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.56] — 2026-08-10
+
+Reliability patch — fixes a **fleet-wide GitHub write-path outage**. Marketplace
+v0.2.56 is a lockstep bump (plugin content changed: the hook + a rule).
+
+### Reliability
+- **#825/#827/#829** — GitHub changed the App installation-token format
+  (2026-04-24) to v3 tokens `ghs_<app-id>_<JWT>` (~380-520 chars, containing
+  `.` and `-`), replacing the opaque 40-char form. Our hardcoded
+  `^ghs_[A-Za-z0-9_]+$` predicate rejected every v3 token, blocking `gh` /
+  `git push` on every call (10 of 14 workspaces on one host). Widen to
+  `^ghs_[A-Za-z0-9._-]+$` — accepts old and new tokens, injection-safe charset
+  preserved (still excludes whitespace / `;` / `$` / `(` / backtick — the
+  charset, not the length, was always the injection defense) — across all
+  three lockstep surfaces: the #140 `check-gh-token.sh` PreToolUse hook, the
+  #821 `claude.sh` launch-boundary check (which LOUD-ABORTs the launch on a
+  v3 mint), and `release.sh`'s mint-validation (which would otherwise refuse
+  to mint a v3 token and abort the release carrying this fix). Validate the
+  invariants we own; treat the provider's token format as opaque, per GitHub's
+  own guidance. Root cause traced from a launch-token incident (#821/#826).
+
 ## [0.2.55] — 2026-07-05
 
 Cross-fleet guest **addressing** — DR-041 Amendment A. The second half of
