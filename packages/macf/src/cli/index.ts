@@ -290,9 +290,19 @@ fleet
   .option('--json', 'Emit the structured per-agent result as JSON (DR-031 watchdog contract)', false)
   .option('--inject', 'INVASIVE Processed-now delivery-proof: routes a real probe + wakes each reachable agent', false)
   .option('--inject-timeout <sec>', 'Per-agent poll budget for --inject, in seconds (default 24)', (v) => parseInt(v, 10))
-  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .option(
+    '--dir <path>',
+    'Project directory (defaults to auto-discovery from cwd). Scheduler-safe (macf#830): unlike ' +
+      'other `fleet` subcommands, resolution failure here never calls process.exit() directly — ' +
+      'under --json it always emits a valid, non-empty JSON {error} object on stdout + a nonzero exit.',
+  )
   .action(async (opts) => {
-    const code = await runFleetDoctor(resolveProjectDir(opts.dir), {
+    // NOTE: unlike the other `fleet` subcommands (which call resolveProjectDir()
+    // here and process.exit(1) on failure BEFORE json-handling even runs), `fleet
+    // doctor` passes the raw --dir value straight through. Resolution happens
+    // INSIDE runFleetDoctor (resolveFleetDoctorProjectDir) so a --json consumer
+    // always gets a valid JSON error object instead of empty stdout (macf#830).
+    const code = await runFleetDoctor(opts.dir, {
       json: opts.json,
       inject: opts.inject,
       injectTimeoutSec: opts.injectTimeout,
