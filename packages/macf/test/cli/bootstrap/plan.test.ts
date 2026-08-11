@@ -10,6 +10,7 @@ import {
   computePlan,
   formatSkippedLines,
   summarizePlan,
+  UNKNOWN_REASONS,
   type ObservedState,
   type PlanItem,
 } from '../../../src/cli/bootstrap/plan.js';
@@ -84,7 +85,12 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
     ]);
     for (const item of caItems) {
       expect(item.verb).toBe('create');
-      expect(item.reason).toMatch(/not observable at plan time/);
+      // CA items are `variable` reads (a registry/repo var fetch, not the
+      // identity plane) — the reason must come from UNKNOWN_REASONS.variable,
+      // never UNKNOWN_REASONS.identity's JWT framing (macf#842 review: naming
+      // the wrong cause is a misleading diagnostic on CA/routing rows).
+      expect(item.reason).toContain(UNKNOWN_REASONS.variable);
+      expect(item.reason).not.toMatch(/JWT/i);
     }
   });
 
