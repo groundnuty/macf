@@ -112,6 +112,11 @@ describe('selectConfirmedInstall (macf#841 review nit d — do not trust entry [
   it('returns undefined on an empty list even with an ExpectedIdentity given', () => {
     expect(selectConfirmedInstall([], { accountLogin: 'groundnuty' })).toBeUndefined();
   });
+
+  it('macf#846 review 3c: an ExpectedIdentity with ZERO criteria ({}) matches nothing — ' +
+    'NOT the same as omitting expected entirely', () => {
+    expect(selectConfirmedInstall([a, b], {})).toBeUndefined();
+  });
 });
 
 describe('appInstallationUrl (DR-043 §D2 consent gate 2)', () => {
@@ -157,6 +162,8 @@ describe('waitForInstallTimeoutMessage (macf#841 review — name the actual last
 
 describe('waitForAppInstallation (DR-043 §D2 consent gate 2 poll loop)', () => {
   const install: ConfirmedInstall = { appId: '1', installId: '2', appSlug: 'demo-code-agent', accountLogin: 'groundnuty' };
+  /** `expected` is REQUIRED as of macf#846 review 3a — every call site below supplies a real identity. */
+  const expected = { accountLogin: 'groundnuty' };
 
   it('checks immediately, then polls on the interval, until confirm() reports confirmed', async () => {
     vi.useFakeTimers();
@@ -170,6 +177,7 @@ describe('waitForAppInstallation (DR-043 §D2 consent gate 2 poll loop)', () => 
       const resultPromise = waitForAppInstallation({
         appId: 'a',
         keyPath: 'k',
+        expected,
         pollIntervalMs: 1_000,
         confirm,
       });
@@ -180,7 +188,7 @@ describe('waitForAppInstallation (DR-043 §D2 consent gate 2 poll loop)', () => 
 
       await expect(resultPromise).resolves.toEqual(install);
       expect(confirm).toHaveBeenCalledTimes(3);
-      expect(confirm).toHaveBeenCalledWith('a', 'k', undefined);
+      expect(confirm).toHaveBeenCalledWith('a', 'k', expected);
     } finally {
       vi.useRealTimers();
     }
@@ -193,10 +201,74 @@ describe('waitForAppInstallation (DR-043 §D2 consent gate 2 poll loop)', () => 
         status: 'confirmed',
         install,
       });
-      const resultPromise = waitForAppInstallation({ appId: 'a', keyPath: 'k', confirm });
+      const resultPromise = waitForAppInstallation({ appId: 'a', keyPath: 'k', expected, confirm });
       await vi.advanceTimersByTimeAsync(0);
       await expect(resultPromise).resolves.toEqual(install);
       expect(confirm).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('macf#846 review 3c: rejects an all-undefined expected ({}) IMMEDIATELY — before the first poll, ' +
+    'no confirm() call at all', async () => {
+    const confirm = vi.fn<(appId: string, keyPath: string) => Promise<IdentityConfirmation>>();
+    await expect(
+      waitForAppInstallation({ appId: 'a', keyPath: 'k', expected: {}, confirm }),
+    ).rejects.toThrow(/must carry at least one of appSlug\/accountLogin/);
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('macf#846 review nit b: fires onUnexpectedTarget ONCE on the first installed-unexpected-target poll, ' +
+    'then keeps polling to a later confirm', async () => {
+    vi.useFakeTimers();
+    try {
+      const wrongInstall: ConfirmedInstall = {
+        appId: '1',
+        installId: '9',
+        appSlug: 'demo-code-agent',
+        accountLogin: 'wrong-account',
+      };
+      const confirm = vi
+        .fn<(appId: string, keyPath: string) => Promise<IdentityConfirmation>>()
+        .mockResolvedValueOnce({ status: 'installed-unexpected-target', installs: [wrongInstall] })
+        .mockResolvedValueOnce({ status: 'installed-unexpected-target', installs: [wrongInstall] })
+        .mockResolvedValueOnce({ status: 'confirmed', install });
+      const onUnexpectedTarget = vi.fn();
+
+      const resultPromise = waitForAppInstallation({
+        appId: 'a',
+        keyPath: 'k',
+        expected,
+        pollIntervalMs: 1_000,
+        confirm,
+        onUnexpectedTarget,
+      });
+
+      await vi.advanceTimersByTimeAsync(0); // 1st confirm — unexpected target, warns
+      await vi.advanceTimersByTimeAsync(1_000); // 2nd confirm — unexpected target AGAIN, must NOT re-warn
+      await vi.advanceTimersByTimeAsync(1_000); // 3rd confirm — confirmed
+      await expect(resultPromise).resolves.toEqual(install);
+
+      expect(onUnexpectedTarget).toHaveBeenCalledTimes(1);
+      expect(onUnexpectedTarget).toHaveBeenCalledWith([wrongInstall]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never calls onUnexpectedTarget when no installed-unexpected-target poll ever occurs', async () => {
+    vi.useFakeTimers();
+    try {
+      const confirm = vi.fn<(appId: string, keyPath: string) => Promise<IdentityConfirmation>>().mockResolvedValue({
+        status: 'confirmed',
+        install,
+      });
+      const onUnexpectedTarget = vi.fn();
+      const resultPromise = waitForAppInstallation({ appId: 'a', keyPath: 'k', expected, confirm, onUnexpectedTarget });
+      await vi.advanceTimersByTimeAsync(0);
+      await resultPromise;
+      expect(onUnexpectedTarget).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -232,6 +304,7 @@ describe('waitForAppInstallation (DR-043 §D2 consent gate 2 poll loop)', () => 
       const resultPromise = waitForAppInstallation({
         appId: 'a',
         keyPath: 'k',
+        expected,
         timeoutMs: 5_000,
         pollIntervalMs: 2_000,
         confirm,
@@ -258,6 +331,7 @@ describe('waitForAppInstallation (DR-043 §D2 consent gate 2 poll loop)', () => 
       const resultPromise = waitForAppInstallation({
         appId: 'a',
         keyPath: 'k',
+        expected,
         timeoutMs: 3_000,
         pollIntervalMs: 1_000,
         confirm,
@@ -306,7 +380,13 @@ describe('waitForAppInstallation (DR-043 §D2 consent gate 2 poll loop)', () => 
         .mockResolvedValueOnce({ status: 'app-no-install' })
         .mockResolvedValueOnce({ status: 'confirmed', install });
 
-      const resultPromise = waitForAppInstallation({ appId: 'a', keyPath: 'k', pollIntervalMs: 5_000, confirm });
+      const resultPromise = waitForAppInstallation({
+        appId: 'a',
+        keyPath: 'k',
+        expected,
+        pollIntervalMs: 5_000,
+        confirm,
+      });
       await vi.advanceTimersByTimeAsync(0);
       expect(confirm).toHaveBeenCalledTimes(1); // must NOT have called again without a timer tick
       await vi.advanceTimersByTimeAsync(5_000);
