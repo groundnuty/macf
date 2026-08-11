@@ -1463,13 +1463,31 @@ export function installGhTokenHook(workspaceDir: string): void {
  * runtime" shape.
  *
  * Runs on the `SessionStart` event (matcher-less). OBSERVATIONAL (deposits
- * the plugin's own issues-command output into the agent's context) +
- * NON-BLOCKING (the script ALWAYS exits 0 — a missing plugin mount, a query
- * error, or any internal fault fails open) so it can never delay or block a
- * session. Override: `MACF_NO_STARTUP_PICKUP=1` (family: `MACF_NO_TMUX_WRAP`
- * / `MACF_OTEL_DISABLED`).
+ * the plugin's own issues-command output into the agent's context) and
+ * ALWAYS exits 0 (a missing plugin mount, a query error, or any internal
+ * fault fails open) — but is NOT instant by design as of groundnuty/macf#802:
+ * the submit step is gated on a bounded pane-readiness poll + a post-send
+ * verify (default budget up to 90s — see the script header) so a relaunch
+ * racing its own unresolved startup prompts (#703) doesn't have its pickup
+ * keystrokes silently swallowed. `MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS`
+ * below gives the hook registration itself enough headroom to outlive that
+ * poll, independent of whatever Claude Code's own default hook timeout is.
+ * Override: `MACF_NO_STARTUP_PICKUP=1` (family: `MACF_NO_TMUX_WRAP` /
+ * `MACF_OTEL_DISABLED`); the poll/verify budgets have their own overrides
+ * documented in the script itself.
  */
 export const MACF_STARTUP_PICKUP_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/macf-startup-pickup.sh';
+
+/**
+ * Explicit hook-registration timeout (seconds) for the startup-pickup hook
+ * (groundnuty/macf#802). Comfortably above the script's own default 90s
+ * readiness-poll budget plus the two plugin-CLI queries (`issues` +
+ * `issues --oneline`, each a real GitHub API round-trip) and the two
+ * bounded post-send verify attempts — set explicitly rather than relying on
+ * Claude Code's own default hook timeout, which this hook did not need to
+ * outlive before the poll/verify gate existed.
+ */
+export const MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS = 120;
 
 const STARTUP_PICKUP_HOOK_FILENAME = 'macf-startup-pickup.sh';
 
@@ -1495,7 +1513,15 @@ export function applyStartupPickupHookTransform(settings: Settings): Settings {
     (entry) => !entry.hooks.some((h) => isStartupPickupHookCommand(h.command)),
   );
   const macfEntries: readonly HookEntry[] = [
-    { hooks: [{ type: 'command', command: MACF_STARTUP_PICKUP_HOOK_COMMAND }] },
+    {
+      hooks: [
+        {
+          type: 'command',
+          command: MACF_STARTUP_PICKUP_HOOK_COMMAND,
+          timeout: MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS,
+        },
+      ],
+    },
   ];
   return {
     ...settings,
