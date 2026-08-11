@@ -38,6 +38,7 @@
     "@groundnuty/macf-core": "0.2.56",
     "commander": "^14.0.3",
     "reflect-metadata": "^0.2.2",
+    "yaml": "^2.8.1",
     "zod": "^4.0.0"
   }
 }
