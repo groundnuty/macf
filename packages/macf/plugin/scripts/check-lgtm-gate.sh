@@ -18,14 +18,24 @@
 # (no macf-agent MCP server) AND consumer workspaces (startup window,
 # transient disconnect). Same reasoning UC-4 (PR #275) demonstrated.
 #
-# Override: MACF_SKIP_LGTM_CHECK=1 bypasses (for legitimate operator-
-# allowed exceptions per pr-discipline.md §"When the reviewer is absent
-# or unreachable" — reporter-sanctioned self-merge, urgent revert, etc.).
+# Override: MACF_SKIP_LGTM_CHECK=1 bypasses (launch-time / operator only —
+# per pr-discipline.md §"When the reviewer is absent or unreachable" —
+# reporter-sanctioned self-merge, urgent revert, etc.).
+#
+# Operator-sanctioned exception, agent-usable (groundnuty/macf#822 Part 2,
+# direction (c) — operator + science + auditor-advisory approved): when
+# MACF_OPERATOR_LOGIN is configured (env.identity, from macf-agent.json
+# `operator_login`), a PR comment authored by THAT login containing the
+# exact marker `[macf-sanction-merge]` clears the gate — un-forgeable,
+# since an agent cannot post a GitHub comment attributed to the operator's
+# own account. Unset (the default) → this path is off and the gate
+# behaves exactly as before #822 Part 2.
 #
 # Refs: groundnuty/macf#270 (this hook); pr-discipline.md (canonical
 #       rule, distributed via `macf rules refresh`); DR-023 amendment
 #       (bash-form decision rule); macf#262 / PR #263 (LGTM rule
-#       codification); PR #275 / macf#244+#272 (empirical pattern).
+#       codification); PR #275 / macf#244+#272 (empirical pattern);
+#       groundnuty/macf#822 (operator-login sanction-comment path).
 set -euo pipefail
 
 # Cheap exit on operator override — no stdin read, no parsing.
@@ -184,16 +194,19 @@ elif [[ "$COMMAND" =~ (^|[[:space:]])-R[[:space:]]+([^[:space:]]+) ]]; then
   REPO_FLAG="--repo ${BASH_REMATCH[2]}"
 fi
 
-# Query PR author + reviews. Use `gh pr view --json author,reviews`
-# rather than two separate `gh api` calls — single round-trip, gh
-# handles repo detection if --repo was on the original command.
-# Defense-in-depth: any failure (gh missing, network, 404, auth) →
+# Query PR author + reviews + comments. Use one `gh pr view --json
+# author,reviews,comments` call rather than separate `gh api` round-trips
+# — gh handles repo detection if --repo was on the original command.
+# `comments` feeds the (c) operator-login sanction-comment path below
+# (macf#822 Part 2); it's always requested (single round-trip) even when
+# MACF_OPERATOR_LOGIN is unset — the extra field is simply unused in that
+# case. Defense-in-depth: any failure (gh missing, network, 404, auth) →
 # fail-open. Same posture as check-gh-token.sh.
 #
 # Strip surrounding quotes from REPO_FLAG's value if quoted.
 PR_JSON=""
 # shellcheck disable=SC2086
-if ! PR_JSON="$(gh pr view "$PR_NUMBER" $REPO_FLAG --json author,reviews 2>/dev/null)"; then
+if ! PR_JSON="$(gh pr view "$PR_NUMBER" $REPO_FLAG --json author,reviews,comments 2>/dev/null)"; then
   exit 0
 fi
 if [[ -z "$PR_JSON" ]]; then
@@ -238,7 +251,49 @@ if [[ "$NON_AUTHOR_APPROVALS" -ge 1 ]]; then
   exit 0
 fi
 
-# No non-author APPROVED review — block.
+# --- (c) operator-login sanction-comment path (groundnuty/macf#822 Part 2) ---
+# Design direction converged operator + science + auditor-advisory
+# (macf#822): the operator's own GitHub login is an UN-FORGEABLE trust
+# anchor — an agent cannot post a comment attributed to it, so a comment
+# authored by that exact login is a structurally-verified artifact, not a
+# self-attestation (unlike a marker file the agent could write itself).
+# Only engages when the workspace has configured MACF_OPERATOR_LOGIN
+# (env.identity, from macf-agent.json `operator_login`); unset (the
+# default) → this whole block is a no-op and the gate behaves exactly as
+# it did before #822 Part 2.
+OPERATOR_LOGIN="${MACF_OPERATOR_LOGIN:-}"
+if [[ -n "$OPERATOR_LOGIN" ]]; then
+  # Normalize the same way PR_AUTHOR / review logins are normalized above
+  # (strip `app/` prefix + `[bot]` suffix) so an operator config value in
+  # any of those shapes still compares correctly.
+  NORM_OPERATOR="${OPERATOR_LOGIN#app/}"
+  NORM_OPERATOR="${NORM_OPERATOR%\[bot\]}"
+
+  if [[ -n "$NORM_OPERATOR" ]]; then
+    # Count comments where: (a) the body contains the exact marker
+    # `[macf-sanction-merge]` (case-insensitive), AND (b) the comment's
+    # author, normalized, equals the configured operator login. Both
+    # conditions must hold on the SAME comment — a marker posted by a
+    # non-operator login does NOT count, regardless of content (the
+    # un-forgeable property this path depends on).
+    SANCTION_HITS="$(
+      jq -r --arg operator "$NORM_OPERATOR" --arg marker '[macf-sanction-merge]' '
+        [.comments[]? |
+          select(((.body // "") | ascii_downcase) | contains($marker | ascii_downcase)) |
+          (.author.login // "" | sub("^app/"; "") | sub("\\[bot\\]$"; "")) |
+          select(. == $operator)
+        ] | length
+      ' <<<"$PR_JSON" 2>/dev/null || echo "0"
+    )"
+
+    if [[ "$SANCTION_HITS" =~ ^[0-9]+$ ]] && [[ "$SANCTION_HITS" -ge 1 ]]; then
+      echo "MACF lgtm-gate: operator-sanction comment ([macf-sanction-merge] authored by ${NORM_OPERATOR}) found on PR #${PR_NUMBER} — clearing gate via the un-forgeable operator-login path (groundnuty/macf#822 Part 2)." >&2
+      exit 0
+    fi
+  fi
+fi
+
+# No non-author APPROVED review, and no operator-sanction comment — block.
 cat >&2 <<ERR
 BLOCKED by MACF lgtm-gate hook: PR #${PR_NUMBER} has no non-author APPROVED
 review on record. Per pr-discipline.md "no LGTM = no merge" (canonical rule
@@ -275,8 +330,17 @@ Need the reporter-sanctioned exception NOW, mid-session? Don't self-apply
 this flag — ask the operator to set it + relaunch, or route the merge
 through the operator directly with the sanction recorded in the artifact.
 
+Preferred agent-usable exception (groundnuty/macf#822 Part 2): if this
+workspace has MACF_OPERATOR_LOGIN configured, ask the operator to post a
+PR comment containing exactly the marker [macf-sanction-merge] under
+THEIR OWN GitHub login (a formal \`gh pr review --approve\` from them also
+clears the gate via the path above). This is un-forgeable — an agent
+cannot post a comment attributed to the operator's account — so the gate
+verifies a real artifact instead of trusting a self-attestation. See
+pr-discipline.md §"Operator-sanctioned exception (macf#822)".
+
 Refs: groundnuty/macf#270 (this hook); pr-discipline.md (canonical rule);
 DR-023 amendment (bash-form decision rule); macf#262 / PR #263 (rule
-codification origin).
+codification origin); groundnuty/macf#822 (operator-login sanction path).
 ERR
 exit 2

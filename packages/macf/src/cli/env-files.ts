@@ -273,6 +273,29 @@ export function generateEnvIdentity(config: MacfAgentConfig): string {
       ? `MACF_ROUTING_LABEL="\${MACF_ROUTING_LABEL:-${config.routing_label}}"`
       : `MACF_ROUTING_LABEL="\${MACF_ROUTING_LABEL:-\${MACF_AGENT_NAME}}"`,
     'export MACF_ROUTING_LABEL',
+    // macf#822 Part 2 — operator-sanctioned-exception mechanism. Optional,
+    // no fallback (unlike MACF_ROUTING_LABEL above): emitted ONLY when
+    // config.operator_login is set, mirroring generateEnvTmux's
+    // conditional-export-when-set pattern (no 3-layer settings priority
+    // needed — there is no meaningful baked default for someone else's
+    // GitHub login). Consumed by check-lgtm-gate.sh's operator-login
+    // sanction-comment path (un-forgeable: an agent can't post a comment
+    // attributed to the operator's own account).
+    ...(config.operator_login !== undefined
+      ? [
+          '',
+          '# Operator GitHub login (macf#822 Part 2). Present only when',
+          '# configured — most workspaces leave this unset. Consumed by',
+          '# check-lgtm-gate.sh\'s operator-login sanction-comment path: a PR',
+          '# comment authored by THIS login containing the exact marker',
+          '# `[macf-sanction-merge]` clears the LGTM gate even absent a formal',
+          '# APPROVED review. Un-forgeable — an agent cannot post a GitHub',
+          '# comment attributed to the operator\'s own account, so the hook',
+          '# verifies a real artifact, not a self-attestation. See',
+          '# pr-discipline.md §"Operator-sanctioned exception (macf#822)".',
+          `export MACF_OPERATOR_LOGIN="${config.operator_login}"`,
+        ]
+      : []),
   ];
   return assemble(managedHeaderLines('generateEnvIdentity'), body);
 }
