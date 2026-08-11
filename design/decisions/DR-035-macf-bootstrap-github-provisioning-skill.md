@@ -159,3 +159,11 @@ Design-now (capture while the dialogue is fresh — done). Build sequences behin
 - DR-033 (interactive-prompt auto-responder) — sibling allowlist-only / never-destructive safety contract.
 - DR-022 (channel-server-npm-npx) — marketplace distribution model.
 - DR-019 — the App permission set the manifest encodes.
+
+## Amendment (2026-08-11, DR-043) — CLI-core repositioning + install-API correction
+
+**DR-043 inverts this DR's skill/mechanism relationship.** The provisioning *mechanism* moves to a deterministic CLI core (`macf bootstrap plan|apply` driven by a declarative `fleet.yaml`); this DR's skill is **repositioned as an optional conversational front-end** that gathers intake, writes `fleet.yaml`, and invokes the CLI core. The skill's field lessons (name-vs-handle trap, shared `macf-routing`, two-place CA, secret value formats, born-correct `repo-init`, vault construction, auth-gate pause/resume) are carried into DR-043 as schema constraints and reconcile invariants — see DR-043's lessons table.
+
+**Correction to the §Context table:** the row "Install an App on repos/org — API-able (`gh`/REST)" is **wrong for the *initial* installation**, as this skill's own Step 4c later established: no REST API creates an installation (`PUT /user/installations/{id}/repositories/{id}` only *extends* an existing one; the user-token install endpoints 403 without `read:user`). The true API-able subset is *extending* an existing installation's repo set. The human floor per App is therefore **two** browser interactions (manifest *Create* + initial *Install*), not one. DR-043 §D2 reduces both to clicks in the operator's normal browser (localhost redirect exchange + App-JWT installation polling — no debug Chrome, no Chrome-MCP).
+
+**The vault is promoted from bootstrap transport to the fleet's credential store of record** (DR-043 §D5): operationally maintained, write-through on every credential-minting reconcile, multi-recipient (operator + VM keys), agents never decrypt.
