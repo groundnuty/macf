@@ -145,7 +145,7 @@ Workspaces include a `PreToolUse` hook that intercepts `gh` and `git push` invoc
 
 Distribution: `macf init` / `macf update` / `macf rules refresh` install the hook + the helper scripts together.
 
-When intentionally bypassing the hook for a knowingly user-attributed op (e.g., `gh auth login` during onboarding), set `MACF_SKIP_TOKEN_CHECK=1` for that one call.
+When intentionally bypassing the hook for a knowingly user-attributed op (e.g., `gh auth login` during onboarding), `MACF_SKIP_TOKEN_CHECK=1` is a **launch-time / operator** override, not an in-session one — the hook reads it from the session's process env, fixed when `./claude.sh` launched it, so an in-session `export MACF_SKIP_TOKEN_CHECK=1` from a Bash tool call never reaches it. Set it in the launch env (or the workspace's `.claude/.macf/env.*` files) before launching, then relaunch; mid-session, ask the operator to set it and relaunch, or route the specific op through the operator directly.
 
 ---
 

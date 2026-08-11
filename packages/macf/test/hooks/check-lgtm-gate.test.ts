@@ -341,6 +341,21 @@ describe('check-lgtm-gate.sh (hook)', () => {
       expect(r.stderr).toContain('--approve');
       expect(r.stderr).toContain('MACF_SKIP_LGTM_CHECK=1');
     });
+
+    it('override guidance is honest: launch-time/operator + relaunch, not an in-session export fix', () => {
+      // groundnuty/macf#822 Part 1.
+      const r = runHook({
+        command: 'gh pr merge 206 --repo owner/repo --squash',
+        stubGh: {
+          '206': { authorLogin: 'app/macf-code-agent', reviews: [] },
+        },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/launch-time\s*\/\s*operator/);
+      expect(r.stderr).toMatch(/relaunch/);
+      expect(r.stderr).toMatch(/does\s+NOT\s+reach\s+it/);
+      expect(r.stderr).not.toMatch(/^\s*export MACF_SKIP_LGTM_CHECK=1\s*$/m);
+    });
   });
 
   describe('wrapper-aware matching (bypass prevention)', () => {

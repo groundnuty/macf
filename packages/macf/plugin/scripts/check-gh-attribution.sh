@@ -245,8 +245,16 @@ Repair:
 Verify your identity any time:
   GH_TOKEN=\$GH_TOKEN "\$MACF_WORKSPACE_DIR/.claude/scripts/macf-whoami.sh"
 
-Override (ONLY for intentional user-attributed ops, e.g. onboarding):
-  export MACF_SKIP_ATTRIBUTION_CHECK=1
+Override (ONLY for intentional user-attributed ops, e.g. onboarding) is
+launch-time / operator only: MACF_SKIP_ATTRIBUTION_CHECK is read from
+THIS session's process env, fixed when ./claude.sh launched it. An
+in-session \`export MACF_SKIP_ATTRIBUTION_CHECK=1\` from a Bash tool call
+does NOT reach it — Bash-tool commands run in a separate subshell that
+never persists into the session's env. To use it: set
+MACF_SKIP_ATTRIBUTION_CHECK=1 in the launch env (or the workspace's
+.claude/.macf/env.* files) BEFORE running ./claude.sh, then relaunch.
+Need it mid-session? Ask the operator to set it + relaunch, or route the
+specific op through the operator directly.
 
 Refs: groundnuty/macf#489 (this hook); silent-fallback-hazards.md Instance 12;
 coordination.md §Token & Git Hygiene.

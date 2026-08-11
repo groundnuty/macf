@@ -214,8 +214,15 @@ Or use one of the equivalent suppression forms (§5):
 Addressing form (line-start, expected to fire routing) is allowed:
   @macf-science-agent[bot] PR ready for review.
 
-Override (ONLY for legitimate raw-mention cases the heuristic catches):
-  export MACF_SKIP_MENTION_CHECK=1
+Override (ONLY for legitimate raw-mention cases the heuristic catches) is
+launch-time / operator only: MACF_SKIP_MENTION_CHECK is read from THIS
+session's process env, fixed when ./claude.sh launched it. An in-session
+\`export MACF_SKIP_MENTION_CHECK=1\` from a Bash tool call does NOT reach
+it — Bash-tool commands run in a separate subshell that never persists
+into the session's env. To use it: set MACF_SKIP_MENTION_CHECK=1 in the
+launch env (or the workspace's .claude/.macf/env.* files) BEFORE running
+./claude.sh, then relaunch. Need it mid-session? Ask the operator to set
+it + relaunch, or route the specific comment through the operator directly.
 
 Refs: groundnuty/macf#244, #272 (this hook); mention-routing-hygiene.md
 (canonical rule, distributed via \`macf rules refresh\`).
@@ -251,8 +258,15 @@ Examples (where <recipient> is the issue reporter, PR reviewer, etc.):
   @macf-code-agent[bot] LGTM, you can merge.
 
 Override (ONLY for legitimate no-recipient cases — rare; status posts
-on self-filed-self-closed issues, or test-orchestration scratch comments):
-  export MACF_SKIP_MENTION_CHECK=1
+on self-filed-self-closed issues, or test-orchestration scratch comments)
+is launch-time / operator only: MACF_SKIP_MENTION_CHECK is read from THIS
+session's process env, fixed when ./claude.sh launched it. An in-session
+\`export MACF_SKIP_MENTION_CHECK=1\` from a Bash tool call does NOT reach
+it — Bash-tool commands run in a separate subshell that never persists
+into the session's env. To use it: set MACF_SKIP_MENTION_CHECK=1 in the
+launch env (or the workspace's .claude/.macf/env.* files) BEFORE running
+./claude.sh, then relaunch. Need it mid-session? Ask the operator to set
+it + relaunch, or route the specific comment through the operator directly.
 
 Refs: groundnuty/macf#244 (this check); coordination.md §Communication 2
 (canonical rule, distributed via \`macf rules refresh\`).

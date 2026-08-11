@@ -150,6 +150,19 @@ describe('check-mention-routing.sh (hook)', () => {
       expect(r.stderr).toMatch(/MACF_SKIP_MENTION_CHECK/);
     });
 
+    it('Check B override guidance is honest: launch-time/operator + relaunch, not an in-session export fix', () => {
+      // groundnuty/macf#822 Part 1.
+      const r = runHook({
+        command:
+          'gh issue comment 123 --body "$(cat <<EOF\nThe @macf-tester-1-agent[bot] response was clean.\nEOF\n)"',
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/launch-time\s*\/\s*operator/);
+      expect(r.stderr).toMatch(/relaunch/);
+      expect(r.stderr).toMatch(/does\s+NOT\s+reach\s+it/);
+      expect(r.stderr).not.toMatch(/^\s*export MACF_SKIP_MENTION_CHECK=1\s*$/m);
+    });
+
     it('blocks mid-line raw `@<bot>[bot]` after a sentence-starter', () => {
       const r = runHook({
         command:
@@ -485,6 +498,18 @@ describe('check-mention-routing.sh (hook)', () => {
       });
       expect(r.stderr).toContain('@<recipient-handle>[bot]');
       expect(r.stderr).toContain('MACF_SKIP_MENTION_CHECK=1');
+    });
+
+    it('Check A override guidance is honest: launch-time/operator + relaunch, not an in-session export fix', () => {
+      // groundnuty/macf#822 Part 1.
+      const r = runHook({
+        command: 'gh issue comment 123 --body "no mention here"',
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/launch-time\s*\/\s*operator/);
+      expect(r.stderr).toMatch(/relaunch/);
+      expect(r.stderr).toMatch(/does\s+NOT\s+reach\s+it/);
+      expect(r.stderr).not.toMatch(/^\s*export MACF_SKIP_MENTION_CHECK=1\s*$/m);
     });
   });
 

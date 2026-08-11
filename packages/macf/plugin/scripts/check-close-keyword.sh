@@ -209,8 +209,15 @@ Fix: replace the close-keyword with \`Refs\` (which references without closing):
 Then the reporter closes it after verifying, per coordination.md.
 
 Override (ONLY for a deliberate cross-fix, or your OWN issue the check
-mis-resolved):
-  export MACF_SKIP_CLOSE_CHECK=1
+mis-resolved) is launch-time / operator only: MACF_SKIP_CLOSE_CHECK is
+read from THIS session's process env, fixed when ./claude.sh launched it.
+An in-session \`export MACF_SKIP_CLOSE_CHECK=1\` from a Bash tool call does
+NOT reach it — Bash-tool commands run in a separate subshell that never
+persists into the session's env. To use it: set MACF_SKIP_CLOSE_CHECK=1
+in the launch env (or the workspace's .claude/.macf/env.* files) BEFORE
+running ./claude.sh, then relaunch. Need it mid-session? Ask the operator
+to set it + relaunch, or route the specific PR through the operator
+directly.
 
 Refs: groundnuty/macf#431 (this hook); coordination.md §Issue Lifecycle 1
 (the 9 forbidden variants); silent-fallback-hazards.md Instance 2.

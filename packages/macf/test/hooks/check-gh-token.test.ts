@@ -928,6 +928,24 @@ describe('check-gh-token.sh (hook)', () => {
       expect(r.stderr).toMatch(/MACF_SKIP_TOKEN_CHECK/);
     });
 
+    it('override guidance is honest: launch-time/operator + relaunch, not an in-session export fix', () => {
+      // groundnuty/macf#822 Part 1 — the override is read from the session's
+      // process env, fixed at ./claude.sh launch; an in-session `export` from
+      // a Bash tool call can never reach it. The block message must say so,
+      // not present a bare `export MACF_SKIP_TOKEN_CHECK=1` as a self-fix.
+      const r = runHook({
+        command: 'gh issue view 1',
+        env: {},
+      });
+      expect(r.stderr).toMatch(/launch-time\s*\/\s*operator/);
+      expect(r.stderr).toMatch(/relaunch/);
+      expect(r.stderr).toMatch(/does\s+NOT\s+reach\s+it/);
+      // The old misleading shape: a bare "export MACF_SKIP_TOKEN_CHECK=1"
+      // line presented on its own as the fix, unqualified by the
+      // launch-time/operator framing above.
+      expect(r.stderr).not.toMatch(/^\s*export MACF_SKIP_TOKEN_CHECK=1\s*$/m);
+    });
+
     it('block message surfaces the offending command', () => {
       const r = runHook({
         command: 'gh issue close 42',

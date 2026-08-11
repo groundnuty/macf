@@ -112,6 +112,16 @@ describe('check-auditor-never-acts.sh (hook)', () => {
       expect(r.stderr).toContain('DR-026');
       expect(r.stderr).toContain('never');
     });
+
+    it('override guidance is honest: launch-time/operator + relaunch, not an in-session export fix', () => {
+      // groundnuty/macf#822 Part 1.
+      const r = runHook({ command: 'gh pr merge 8 --squash', env: AUDITOR });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/launch-time\s*\/\s*operator/);
+      expect(r.stderr).toMatch(/relaunch/);
+      expect(r.stderr).toMatch(/does\s+NOT\s+reach\s+it/);
+      expect(r.stderr).not.toMatch(/^\s*export MACF_SKIP_AUDITOR_ACT_CHECK=1\s*$/m);
+    });
   });
 
   describe('auditor — allows propose verbs + reads (write-proposals-only)', () => {
