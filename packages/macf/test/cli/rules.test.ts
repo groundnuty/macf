@@ -374,6 +374,18 @@ describe('copyCanonicalScripts', () => {
       expect(copied).not.toContain('mark-turn-state.sh');
       expect(existsSync(join(workspace, '.claude', 'scripts', 'mark-turn-state.sh'))).toBe(false);
     });
+
+    it('distributes the #814 framework-surface git-sweep guard pair (check-framework-surface.sh + check-git-sweep.sh)', () => {
+      const workspace = join(tmpRoot, 'workspace');
+      mkdirSync(workspace);
+
+      const copied = copyCanonicalScripts(workspace);
+
+      for (const name of ['check-framework-surface.sh', 'check-git-sweep.sh']) {
+        expect(copied, `expected ${name} to be copied`).toContain(name);
+        expect(existsSync(join(workspace, '.claude', 'scripts', name)), `expected ${name} on disk`).toBe(true);
+      }
+    });
   });
 });
 
