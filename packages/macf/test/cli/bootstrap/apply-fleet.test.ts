@@ -4,19 +4,31 @@
  * `applyAgentIdentity` and `applyRepoInitForAgent` are stubbed via injected
  * `AgentApplyDeps`/`RepoInitStepDeps`; `writeVault`'s `age` call is faked;
  * only `fleet.lock` (a small local JSON file) touches real fs.
+ *
+ * **Exception (macf#852):** the trailing "REAL age binary" test below
+ * deliberately leaves `vaultDeps.encrypt` unset so
+ * `writeVault`/`writeAgentRecoveryArtifact` fall through to the real
+ * `ageEncryptToFile` — the one place in this file that touches the real
+ * `age` binary, gated `skipIf(!HAS_AGE)` per `vault-write.test.ts`'s
+ * "never fake a passing test" convention.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applyFleet, type FleetApplyDeps } from '../../../src/cli/bootstrap/apply-fleet.js';
 import type { FleetAgent, FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
-import { parseFleetLock } from '../../../src/cli/bootstrap/fleet-manifest.js';
+import { parseFleetLock, parseFleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { AgentApplyDeps } from '../../../src/cli/bootstrap/apply-agent.js';
 import type { RepoInitStepDeps } from '../../../src/cli/bootstrap/apply-repo-init.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 
-function manifestWith(agents: readonly FleetAgent[], ageRecipient: string | null = 'age1operator'): FleetManifest {
+// Default mirrors the §D5 multi-recipient shape (operator key + VM key,
+// macf#852) — two entries is the realistic steady-state, not a single
+// string. Tests exercising the "no recipients configured" pre-flight pass
+// `[]` explicitly.
+function manifestWith(agents: readonly FleetAgent[], ageRecipients: readonly string[] = ['age1operator', 'age1vm']): FleetManifest {
   return {
     apiVersion: 'macf/v0',
     kind: 'Fleet',
@@ -26,7 +38,7 @@ function manifestWith(agents: readonly FleetAgent[], ageRecipient: string | null
     versions: { macf: '0.2.56', actions: 'v3.4.1' },
     owner: { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } },
     network: { advertise_host: 'example.ts.net' },
-    transport: { vault_repo: 'groundnuty/demo-science', age_recipient: ageRecipient },
+    transport: { vault_repo: 'groundnuty/demo-science', age_recipients: ageRecipients },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents,
     trust: { ca: 'per-project', federated_cas: [] },
@@ -100,6 +112,33 @@ function agentDepsFor(role: string, outcome: 'reused' | 'resumed-install' | 'cre
 
 const NOOP_REPO_INIT: RepoInitStepDeps = { cloneRepo: async () => {}, commitAndPush: async () => 'pushed' };
 
+// --- Real `age` binary support (macf#852 — see the trailing test below) ---
+//
+// Everything else in this file stubs `vaultDeps.encrypt`, proving the
+// ORCHESTRATION (ordering, lock-write gating, artifact lifecycle) but never
+// the property this issue is actually about: that `transport.age_recipients`
+// being a LIST means `vault.age` decrypts under EITHER key independently,
+// not one shared key copied to two machines. `haveAgeBinaries`/`HAS_AGE`
+// gate the one test that drives `parseFleetManifest` → `applyFleet` → the
+// real `age` binary (no `vaultDeps.encrypt` override — falls through to
+// `writeVault`'s own `ageEncryptToFile` default). Skipped, never faked, when
+// `age`/`age-keygen` are absent from PATH — same convention as
+// `vault-write.test.ts`'s `HAS_AGE`.
+function haveAgeBinaries(cmd: string): boolean {
+  return spawnSync('sh', ['-c', `command -v ${cmd}`], { encoding: 'utf-8' }).status === 0;
+}
+const HAS_AGE = haveAgeBinaries('age') && haveAgeBinaries('age-keygen');
+
+function mintAgeKey(dir: string, name: string): { keyPath: string; publicKey: string } {
+  const keyPath = join(dir, name);
+  const r = spawnSync('age-keygen', ['-o', keyPath], { encoding: 'utf-8' });
+  expect(r.status, r.stderr).toBe(0);
+  const content = readFileSync(keyPath, 'utf-8');
+  const match = /age1[0-9a-z]+/.exec(content);
+  expect(match).not.toBeNull();
+  return { keyPath, publicKey: match?.[0] ?? '' };
+}
+
 describe('applyFleet', () => {
   const dirs: string[] = [];
   // See apply-repo-init.test.ts's identical guard: neutralize ambient
@@ -158,7 +197,7 @@ describe('applyFleet', () => {
     expect(Object.keys(lock.agents[0]?.fingerprints ?? {}).sort()).toEqual(['app_private_key', 'client_secret', 'webhook_secret']);
   });
 
-  it('no age_recipient configured: the DR-043 §D5 pre-flight refuses gate 1 ENTIRELY — no App is ever created, no lock entry, no repo-init', async () => {
+  it('no age_recipients configured: the DR-043 §D5 pre-flight refuses gate 1 ENTIRELY — no App is ever created, no lock entry, no repo-init', async () => {
     // Before the §D5 review fix, this scenario ran BOTH consent gates to
     // completion and only failed at the very end (the batched vault write)
     // — meaning a REAL, irreversible GitHub App got created with an
@@ -168,7 +207,7 @@ describe('applyFleet', () => {
     // `applyAgentIdentity` at all — gate 1 (`startManifestFlow` /
     // `exchangeManifestCode`) is never even attempted, not just gate 2.
     const manifestPath = manifestPathIn();
-    const manifest = manifestWith([CODE_AGENT], /* ageRecipient */ null);
+    const manifest = manifestWith([CODE_AGENT], /* ageRecipients */ []);
     let gate1Called = false;
     let gate2Called = false;
     const agentDeps = agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1');
@@ -190,7 +229,10 @@ describe('applyFleet', () => {
     expect(gate2Called).toBe(false);
     expect(result.agents[0]?.identity.status).toBe('failed');
     if (result.agents[0]?.identity.status === 'failed') {
-      expect(result.agents[0].identity.reason).toMatch(/age_recipient|age recipient/);
+      // Plural specifically — a message that regressed to the old singular
+      // field name would still satisfy a bare /age_recipient/ substring
+      // match, so this asserts the actual list-shape wording (macf#852).
+      expect(result.agents[0].identity.reason).toMatch(/age_recipients|age recipients/);
       expect(result.agents[0].identity.reason).toMatch(/CREATE path/);
     }
     // No 'created' outcome this run -> nothing pending -> vault is 'skipped', not 'failed':
@@ -201,9 +243,9 @@ describe('applyFleet', () => {
     expect(result.finalLock).toBeNull();
   });
 
-  it('no age_recipient configured, but the role HAS a prior lock entry: pre-flight does NOT block it (reuse/resume never mints a fresh credential)', async () => {
+  it('no age_recipients configured, but the role HAS a prior lock entry: pre-flight does NOT block it (reuse/resume never mints a fresh credential)', async () => {
     const manifestPath = manifestPathIn();
-    const manifest = manifestWith([CODE_AGENT], /* ageRecipient */ null);
+    const manifest = manifestWith([CODE_AGENT], /* ageRecipients */ []);
     const priorLock: FleetLock = {
       schema_version: 1,
       fleet: 'demo-fleet',
@@ -486,4 +528,81 @@ describe('applyFleet', () => {
       expect(result.agents[0].identity.reason).toContain(recoveryPath);
     }
   });
+
+  it.skipIf(!HAS_AGE)(
+    'REAL age binary: transport.age_recipients: [operatorKey, vmKey] parses through the schema and produces ' +
+      'a vault.age that EACH key decrypts independently — the property this issue exists for',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-apply-fleet-real-age-test-'));
+      dirs.push(dir);
+      const operatorKey = mintAgeKey(dir, 'operator-key.txt');
+      const vmKey = mintAgeKey(dir, 'vm-key.txt');
+      const manifestPath = join(dir, 'fleet.yaml');
+
+      // Round-trips the two REAL public keys through the actual Zod schema
+      // (not a hand-built FleetManifest object) — proves the schema layer
+      // itself, not just the apply-fleet plumbing below it.
+      const fleetYaml = `
+apiVersion: macf/v0
+kind: Fleet
+metadata:
+  name: demo-fleet
+versions:
+  macf: 0.2.56
+  actions: v3.4.1
+owner:
+  account: groundnuty
+  type: user
+  registry: { type: profile, user: groundnuty }
+network:
+  advertise_host: example.ts.net
+transport:
+  vault_repo: groundnuty/demo-science
+  age_recipients: [${operatorKey.publicKey}, ${vmKey.publicKey}]
+defaults:
+  role_template: groundnuty/agentic-repo-template
+  app_manifest: dr-019
+agents:
+  - role: code-agent
+    profile: code
+    repo: groundnuty/demo-code
+    deploy_path: /x
+trust:
+  ca: per-project
+  federated_cas: []
+`;
+      const manifest = parseFleetManifest(fleetYaml);
+      expect(manifest.transport.age_recipients).toEqual([operatorKey.publicKey, vmKey.publicKey]);
+
+      const deps: FleetApplyDeps = {
+        buildAgentDeps: () => agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+        repoInitDeps: NOOP_REPO_INIT,
+        vaultDeps: { exists: () => false }, // no `encrypt` override — real `age` runs
+        now: () => new Date('2026-08-11T00:00:00.000Z'),
+        log: () => {},
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.vault.status).toBe('written');
+      if (result.vault.status !== 'written') return; // narrows for TS below
+      expect(existsSync(result.vault.path)).toBe(true);
+
+      // The whole point: BOTH keys decrypt the SAME ciphertext independently
+      // — no shared single key copied between the operator's Mac and the VM.
+      const decryptOperator = spawnSync('age', ['-d', '-i', operatorKey.keyPath, result.vault.path], { encoding: 'utf-8' });
+      expect(decryptOperator.status, decryptOperator.stderr).toBe(0);
+      expect(decryptOperator.stdout).toContain('MACF_AGENT_DEMO_FLEET_CODE_AGENT_APP_ID="app-code-agent"');
+
+      const decryptVm = spawnSync('age', ['-d', '-i', vmKey.keyPath, result.vault.path], { encoding: 'utf-8' });
+      expect(decryptVm.status, decryptVm.stderr).toBe(0);
+      expect(decryptVm.stdout).toBe(decryptOperator.stdout);
+
+      // A third, unrelated key must NOT decrypt it — proves this isn't
+      // accidentally permissive (e.g. no-op encryption).
+      const strangerKey = mintAgeKey(dir, 'stranger-key.txt');
+      const decryptStranger = spawnSync('age', ['-d', '-i', strangerKey.keyPath, result.vault.path], { encoding: 'utf-8' });
+      expect(decryptStranger.status).not.toBe(0);
+    },
+  );
 });

@@ -32,7 +32,7 @@ network:
 
 transport:
   vault_repo: groundnuty/icsoc-2026-science-agent
-  age_recipient: null
+  age_recipients: []
 
 defaults:
   role_template: groundnuty/agentic-repo-template
@@ -82,7 +82,7 @@ describe('parseFleetManifest — valid DR-043 §D1 worked example', () => {
       type: 'user',
       registry: { type: 'profile', user: 'groundnuty' },
     });
-    expect(manifest.transport.age_recipient).toBeNull();
+    expect(manifest.transport.age_recipients).toEqual([]);
     expect(manifest.agents).toHaveLength(3);
   });
 
@@ -140,7 +140,7 @@ network:
   advertise_host: example.ts.net
 transport:
   vault_repo: groundnuty/minimal-fleet-science-agent
-  age_recipient: null
+  age_recipients: []
 defaults:
   role_template: groundnuty/agentic-repo-template
   app_manifest: dr-019
@@ -160,6 +160,48 @@ agents:
     // staying undefined (a manifest.trust?.-gate would silently skip the CA
     // plan items — see plan.test.ts's "always emits CA items" coverage).
     expect(manifest.trust).toEqual({ ca: 'per-project', federated_cas: [] });
+  });
+});
+
+describe('parseFleetManifest — transport.age_recipients (macf#852: list, not a single nullable string)', () => {
+  // §D5's multi-recipient requirement (operator key + VM key) is the whole
+  // reason this field is a list. The SCHEMA itself does not enforce a
+  // minimum length — an empty list is the "no key minted yet" state
+  // `apply`'s §D5 pre-flight (`wouldCreateWithNoRecipient` in
+  // `apply-fleet.ts`) and `writeAgentRecoveryArtifact` (`vault-write.ts`)
+  // are the layers that refuse it, deliberately AFTER parse succeeds — see
+  // `apply-fleet.test.ts` + `vault-write.test.ts` for that refusal coverage.
+  it('accepts a list of two recipients (the §D5 operator-key + VM-key shape)', () => {
+    const withTwo = VALID_FLEET_YAML.replace(
+      'age_recipients: []',
+      'age_recipients: [age1operatorxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx, age1vmxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]',
+    );
+    const manifest = parseFleetManifest(withTwo);
+    expect(manifest.transport.age_recipients).toEqual([
+      'age1operatorxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+      'age1vmxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+    ]);
+  });
+
+  it('accepts a single-element list (a v1-style single-recipient vault is still valid)', () => {
+    const withOne = VALID_FLEET_YAML.replace('age_recipients: []', 'age_recipients: [age1solooperatorxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]');
+    const manifest = parseFleetManifest(withOne);
+    expect(manifest.transport.age_recipients).toEqual(['age1solooperatorxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx']);
+  });
+
+  it('accepts an empty list — the pre-first-apply "no key minted yet" state', () => {
+    const manifest = parseFleetManifest(VALID_FLEET_YAML);
+    expect(manifest.transport.age_recipients).toEqual([]);
+  });
+
+  it('rejects an empty-string entry in the list (each recipient is still `.min(1)`)', () => {
+    const bad = VALID_FLEET_YAML.replace('age_recipients: []', "age_recipients: ['']");
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+
+  it('rejects the old singular `age_recipient` key (no back-compat — macf#852)', () => {
+    const bad = VALID_FLEET_YAML.replace('age_recipients: []', 'age_recipient: null');
+    expect(() => parseFleetManifest(bad)).toThrow();
   });
 });
 
@@ -201,7 +243,7 @@ network:
   advertise_host: example.ts.net
 transport:
   vault_repo: groundnuty/empty-fleet-science-agent
-  age_recipient: null
+  age_recipients: []
 defaults:
   role_template: groundnuty/agentic-repo-template
   app_manifest: dr-019

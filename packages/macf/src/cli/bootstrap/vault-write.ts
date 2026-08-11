@@ -521,8 +521,8 @@ export async function writeAgentRecoveryArtifact(
   if (recipients.length === 0) {
     throw new VaultError(
       'vault_no_age_recipient',
-      'writeAgentRecoveryArtifact: transport.age_recipient is not configured — this agent\'s just-issued ' +
-        'credential CANNOT be made durable (DR-043 §D5). Mint an age recipient and set transport.age_recipient ' +
+      'writeAgentRecoveryArtifact: transport.age_recipients is empty — this agent\'s just-issued ' +
+        'credential CANNOT be made durable (DR-043 §D5). Mint an age recipient and add it to transport.age_recipients ' +
         'in fleet.yaml before re-running apply.',
     );
   }

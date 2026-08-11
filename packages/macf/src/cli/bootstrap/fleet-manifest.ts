@@ -75,14 +75,26 @@ export const FleetNetworkSchema = z
   .strict();
 
 /**
- * `age_recipient` is `null` when the fleet has no existing age key yet —
- * `apply` mints one + hands it off (DR-043 §D5). The KEY is always present in
- * a well-formed manifest; only the VALUE is nullable.
+ * `age_recipients` is `[]` when the fleet has no existing age key(s) yet —
+ * `apply` mints one + hands it off (DR-043 §D5). The KEY is always present
+ * in a well-formed manifest; only the array's LENGTH varies.
+ *
+ * List, not a single string (macf#852) — §D5's multi-recipient requirement
+ * (2026-08-11 operator-confirmed amendment) means `vault.age` and every
+ * per-agent recovery artifact encrypt to **two distinct keys**: the
+ * operator's (Mac-side reconcile/recovery) and the VM's (`vault.sh`
+ * decrypting at agent runtime). A single recipient would force "one
+ * master key held in two places" — copying the fleet's highest-value
+ * secret between machines instead of minting each principal its own age
+ * identity. `writeVault` / `writeAgentRecoveryArtifact` already accept
+ * `readonly string[]` and pass every entry to `age -r <r1> -r <r2> ...`
+ * (native multi-recipient encryption) — this schema field is what lets a
+ * `fleet.yaml` actually declare more than one.
  */
 export const FleetTransportSchema = z
   .object({
     vault_repo: z.string().min(1),
-    age_recipient: z.string().min(1).nullable(),
+    age_recipients: z.array(z.string().min(1)),
   })
   .strict();
 

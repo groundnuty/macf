@@ -57,7 +57,7 @@
  *
  *   - **Write side:** `applyFleet` builds ONE `writeRecoveryArtifact`
  *     closure (knowing `manifestPath` → the recovery dir, and
- *     `manifest.transport.age_recipient` → who it encrypts to) and splices
+ *     `manifest.transport.age_recipients` → who it encrypts to) and splices
  *     it onto the `AgentApplyDeps` object `deps.buildAgentDeps` returns —
  *     that factory deliberately does NOT produce this field (see
  *     `apply-agent.ts`'s `realAgentApplyDeps` doc); this module is the one
@@ -73,7 +73,7 @@
  *     from this run in place — see the recovery procedure below.
  *   - **Pre-flight (the part that makes "closed" true, not just "usually
  *     true"):** `writeRecoveryArtifact` itself rejects when
- *     `transport.age_recipient` is unconfigured (nothing to encrypt to) —
+ *     `transport.age_recipients` is empty (nothing to encrypt to) —
  *     but by the time it would run, gate 1 has ALREADY minted a real,
  *     irreversible GitHub App. Discovering the misconfiguration there is
  *     too late: the credential can never be captured (no recipient means
@@ -81,7 +81,7 @@
  *     just delayed. `wouldCreateWithNoRecipient` / `noRecipientPreflightFailure`
  *     close this by refusing gate 1 ENTIRELY for any role that would take
  *     the CREATE path when `recipients` is empty — computed once, before
- *     the loop, from the same immutable `manifest.transport.age_recipient`
+ *     the loop, from the same immutable `manifest.transport.age_recipients`
  *     input `writeRecoveryArtifact` itself would have checked. This is the
  *     ONLY reason the "credential-loss hole is closed" claim below is true
  *     rather than "true except when misconfigured."
@@ -172,7 +172,7 @@ export interface FleetApplyDeps {
    * Builds every `AgentApplyDeps` primitive EXCEPT `writeRecoveryArtifact`
    * — `applyFleet` supplies that one itself (see this module's doc's
    * "Recovery-artifact lifecycle" section); it is the layer with the
-   * fleet-level context (`manifestPath`, `manifest.transport.age_recipient`)
+   * fleet-level context (`manifestPath`, `manifest.transport.age_recipients`)
    * the writer needs.
    */
   readonly buildAgentDeps: (log: (line: string) => void) => Omit<AgentApplyDeps, 'writeRecoveryArtifact'>;
@@ -218,9 +218,9 @@ function agentVaultSecrets(appHandle: string, outcome: Extract<AgentApplyOutcome
   };
 }
 
-/** `manifest.transport.age_recipient` as the single-element recipients list `writeVault`/`writeAgentRecoveryArtifact` both expect — `null` (unconfigured) becomes an empty list, which each of those functions rejects loudly on its own. */
+/** `manifest.transport.age_recipients` is already the exact shape `writeVault`/`writeAgentRecoveryArtifact` expect (macf#852) — an empty list (unconfigured) is rejected loudly by each of those functions on its own. Named accessor kept for the doc-comment cross-references elsewhere in this module ("computed once, before the loop, from the same immutable ..." — see the module doc). */
 function ageRecipients(manifest: FleetManifest): readonly string[] {
-  return manifest.transport.age_recipient !== null ? [manifest.transport.age_recipient] : [];
+  return manifest.transport.age_recipients;
 }
 
 /**
@@ -229,7 +229,7 @@ function ageRecipients(manifest: FleetManifest): readonly string[] {
  * doc's "Recovery-artifact lifecycle" section for why THIS module (not
  * `apply-agent.ts`, not `commands/bootstrap-apply.ts`) owns this wiring:
  * it is the layer that knows both `manifestPath` (→ the recovery dir) and
- * `manifest.transport.age_recipient` (→ who to encrypt to). Reuses
+ * `manifest.transport.age_recipients` (→ who to encrypt to). Reuses
  * `deps.vaultDeps.encrypt` — the SAME injectable `age` seam the final vault
  * write uses (task requirement: no separate encrypt seam to keep in sync).
  *
@@ -286,9 +286,9 @@ function noRecipientPreflightFailure(role: string): AgentApplyOutcome {
     status: 'failed',
     reason:
       `role "${role}" has no prior fleet.lock entry, so it would take the CREATE path — but ` +
-      'transport.age_recipient is not configured (DR-043 §D5), so its credential could NEVER be made durable ' +
+      'transport.age_recipients is empty (DR-043 §D5), so its credential could NEVER be made durable ' +
       '(no recipient to encrypt the recovery artifact OR the final vault to). Refusing to open consent gate 1 ' +
-      "for a credential that can never be saved — mint an age recipient and set transport.age_recipient in " +
+      "for a credential that can never be saved — mint an age recipient and add it to transport.age_recipients in " +
       'fleet.yaml, then re-run.',
   };
 }
@@ -393,20 +393,28 @@ async function settleVault(
   if (pendingVaultAgents.length === 0) return { status: 'skipped' };
 
   try {
-    const recipient = manifest.transport.age_recipient;
-    if (recipient === null) {
+    // Not merely a `writeVault`-will-catch-it-anyway redundancy: this
+    // early throw produces a more actionable message (points at the exact
+    // manifest field + `age-keygen`) than `writeVault`'s generic
+    // `vault_no_recipients`, and by the time `applyFleet`'s loop reaches
+    // here the §D5 pre-flight (`wouldCreateWithNoRecipient`) should already
+    // have made this branch unreachable for any role that actually landed
+    // in `pendingVaultAgents` — this remains as defense-in-depth for a
+    // caller driving `settleVault` outside that orchestration.
+    const recipients = manifest.transport.age_recipients;
+    if (recipients.length === 0) {
       throw new VaultError(
         'vault_no_age_recipient',
-        'transport.age_recipient is null — no age recipient configured to encrypt the newly-minted credentials ' +
-          'to. Mint one with `age-keygen` and set transport.age_recipient in fleet.yaml, then re-run apply — the ' +
-          'App/install identities already recorded above are NOT re-created on re-run (GitHub App-name ' +
+        'transport.age_recipients is empty — no age recipient configured to encrypt the newly-minted credentials ' +
+          'to. Mint one with `age-keygen` and add it to transport.age_recipients in fleet.yaml, then re-run apply ' +
+          '— the App/install identities already recorded above are NOT re-created on re-run (GitHub App-name ' +
           'uniqueness is the guard).',
       );
     }
     const plaintext = buildVaultPlaintext({ agents: [...pendingVaultAgents] });
     const result = await writeVault(
       plaintext,
-      { outPath: vaultOutPath, recipients: [recipient], allowVersion: deps.allowVaultVersion === true, now: deps.now },
+      { outPath: vaultOutPath, recipients, allowVersion: deps.allowVaultVersion === true, now: deps.now },
       deps.vaultDeps,
     );
     return { status: 'written', path: result.path, versioned: result.versioned };

@@ -24,7 +24,7 @@ network:
   advertise_host: example.ts.net
 transport:
   vault_repo: groundnuty/icsoc-2026-science-agent
-  age_recipient: null
+  age_recipients: []
 defaults:
   role_template: groundnuty/agentic-repo-template
   app_manifest: dr-019
