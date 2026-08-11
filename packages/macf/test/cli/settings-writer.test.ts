@@ -1089,6 +1089,22 @@ describe('plugin hooks.json single-source (DR-039 Decision 2)', () => {
       }
     }
   });
+
+  // ── groundnuty/macf#814 — framework-surface git-sweep guard pair ─────────
+  it('registers check-framework-surface.sh on SessionStart, via ${CLAUDE_PLUGIN_ROOT}/scripts/', () => {
+    const parsed = readPluginHooksJson();
+    const sessionStart = commandsFor(parsed.hooks['SessionStart'] ?? []);
+    expect(sessionStart).toContain(pluginRootHookCommand('check-framework-surface.sh'));
+  });
+
+  it('registers check-git-sweep.sh on PreToolUse with matcher Bash, via ${CLAUDE_PLUGIN_ROOT}/scripts/', () => {
+    const parsed = readPluginHooksJson();
+    const preToolUse = parsed.hooks['PreToolUse'] ?? [];
+    const cmd = pluginRootHookCommand('check-git-sweep.sh');
+    const entry = preToolUse.find((e) => e.hooks.some((h) => h.command === cmd));
+    expect(entry, `expected a PreToolUse entry for ${cmd}`).toBeDefined();
+    expect(entry?.matcher).toBe('Bash');
+  });
 });
 
 describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {

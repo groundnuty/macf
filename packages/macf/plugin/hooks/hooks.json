@@ -1,5 +1,5 @@
 {
-  "description": "MACF agent hooks: dependency installer, work check, SessionEnd + PreCompact peer-notification (UC-1 per DR-023; moved off the per-turn Stop hook in macf#673 to stop blocking the TUI every turn — distinguishable session-end vs session-compact events), PreCompact-hook session checkpoint (UC-3 per DR-023), the turn-state marker that lets the channel server report accurate live agent state through long tool waits (DR-030 phase-1, groundnuty/macf#568), and the single-sourced load-bearing guard set (DR-039 Decision 2, groundnuty/macf#731/#739): gh-token attribution-trap (#140), mention-routing-hygiene (#244/#272), LGTM-gate (#270), close-keyword-guard (#431), attribution result-invariant backstop (#489), reflection-harvest (#500), and channel-server liveness guard (#734). As of DR-039 phase 2 (groundnuty/macf#698), these 7 scripts themselves also moved into the plugin (`packages/macf/plugin/scripts/`, joining `mark-turn-state.sh`) and are invoked via ${CLAUDE_PLUGIN_ROOT}/scripts/<name>.sh — tamper-resistant, since an agent can no longer defeat an enforcement hook by editing its workspace `.claude/scripts/` copy. A compat copy is still distributed to `.claude/scripts/` by `macf init`/`update` for hand-wired substrate hooks + non-plugin-init'd workspaces, pending full DR-039 substrate rollout.",
+  "description": "MACF agent hooks: dependency installer, work check, SessionEnd + PreCompact peer-notification (UC-1 per DR-023; moved off the per-turn Stop hook in macf#673 to stop blocking the TUI every turn — distinguishable session-end vs session-compact events), PreCompact-hook session checkpoint (UC-3 per DR-023), the turn-state marker that lets the channel server report accurate live agent state through long tool waits (DR-030 phase-1, groundnuty/macf#568), and the single-sourced load-bearing guard set (DR-039 Decision 2, groundnuty/macf#731/#739): gh-token attribution-trap (#140), mention-routing-hygiene (#244/#272), LGTM-gate (#270), close-keyword-guard (#431), attribution result-invariant backstop (#489), reflection-harvest (#500), channel-server liveness guard (#734), and the framework-surface git-sweep guard pair (#814): check-framework-surface.sh (SessionStart — detects a swept/missing plugin mount, identity config, or guard-hook set and warns loud to run `macf update`) + check-git-sweep.sh (PreToolUse Bash — blocks `git stash -u`/`--include-untracked`/`-a`/`--all` and `git clean` force+directories combos when the untracked macf framework surface would actually be swept). As of DR-039 phase 2 (groundnuty/macf#698), these scripts live in the plugin (`packages/macf/plugin/scripts/`, joining `mark-turn-state.sh`) and are invoked via ${CLAUDE_PLUGIN_ROOT}/scripts/<name>.sh — tamper-resistant, since an agent can no longer defeat an enforcement hook by editing its workspace `.claude/scripts/` copy. A compat copy is still distributed to `.claude/scripts/` by `macf init`/`update` for hand-wired substrate hooks + non-plugin-init'd workspaces, pending full DR-039 substrate rollout.",
   "hooks": {
     "SessionStart": [
       {
@@ -25,6 +25,14 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/check-channel-alive.sh\""
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/check-framework-surface.sh\""
           }
         ]
       }
@@ -92,6 +100,15 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/check-close-keyword.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/check-git-sweep.sh\""
           }
         ]
       }
