@@ -522,6 +522,139 @@ describe('patchAgentConfig (merge-preserving regenerate, #76)', () => {
     expect(parsed.agents['code-agent'].workspace_dir)
       .toBe('/home/deploy/repos/groundnuty/macf');
   });
+
+  // macf#805 / DR-032: pre-fix bootstrap guidance once told operators the
+  // agent NAME *was* the GitHub App handle, so `--agents` got invoked with
+  // the already-prefixed form and the map KEY itself ended up
+  // `<project>-<agent>` instead of the bare routing label. route-by-label
+  // looks the issue's clean `<role>-agent` label up directly against this
+  // key — a lingering double-prefixed key means the lookup silently misses
+  // (route-by-label skips with `exit 0`, no error anywhere). A separate
+  // 2026-06-27 rename pass fixed cert CN / registry keys / tmux sessions on
+  // the live icsoc-2026 fleet but missed this file, so the stale key can
+  // still be sitting in a committed agent-config.json.
+  describe('double-prefixed key normalization (macf#805)', () => {
+    it('renames a stale <project>-<agent> key to the clean routing label', () => {
+      const existing = JSON.stringify({
+        agents: {
+          'icsoc-2026-code-agent': {
+            app_name: 'icsoc-2026-code-agent',
+            host: '100.0.0.9',
+            tmux_session: 'icsoc-2026-code-agent',
+            tmux_bin: 'tmux',
+            ssh_user: 'ubuntu',
+            ssh_key_secret: 'AGENT_SSH_KEY',
+          },
+        },
+      }, null, 2);
+      const patched = patchAgentConfig(
+        existing, ['code-agent'], undefined,
+        { project: 'icsoc-2026' },
+      );
+      const parsed = JSON.parse(patched);
+      // Clean key now exists, carrying the pre-existing (non-placeholder) data forward.
+      expect(parsed.agents['code-agent']).toBeDefined();
+      expect(parsed.agents['code-agent'].host).toBe('100.0.0.9');
+      // The stale double-prefixed key is gone — not left behind as
+      // routing-invisible dead weight.
+      expect(parsed.agents).not.toHaveProperty('icsoc-2026-code-agent');
+    });
+
+    it('does not clobber an already-clean entry when a stale duplicate also lingers', () => {
+      const existing = JSON.stringify({
+        agents: {
+          'code-agent': {
+            app_name: 'icsoc-2026-code-agent',
+            host: '100.0.0.1', // authoritative, current
+            tmux_session: 'code-agent',
+            tmux_bin: 'tmux',
+            ssh_user: 'ubuntu',
+            ssh_key_secret: 'AGENT_SSH_KEY',
+          },
+          'icsoc-2026-code-agent': {
+            app_name: 'icsoc-2026-code-agent',
+            host: '100.0.0.9', // stale
+            tmux_session: 'icsoc-2026-code-agent',
+            tmux_bin: 'tmux',
+            ssh_user: 'ubuntu',
+            ssh_key_secret: 'AGENT_SSH_KEY',
+          },
+        },
+      }, null, 2);
+      const patched = patchAgentConfig(
+        existing, ['code-agent'], undefined,
+        { project: 'icsoc-2026' },
+      );
+      const parsed = JSON.parse(patched);
+      // Clean entry's current data wins — never overwritten by a stale duplicate.
+      expect(parsed.agents['code-agent'].host).toBe('100.0.0.1');
+    });
+
+    it('is idempotent — re-patching an already-normalized config leaves keys unchanged', () => {
+      const existing = JSON.stringify({
+        agents: {
+          'code-agent': {
+            app_name: 'icsoc-2026-code-agent',
+            host: '100.0.0.1',
+            tmux_session: 'code-agent',
+            tmux_bin: 'tmux',
+            ssh_user: 'ubuntu',
+            ssh_key_secret: 'AGENT_SSH_KEY',
+          },
+        },
+      }, null, 2);
+      const patched = patchAgentConfig(
+        existing, ['code-agent'], undefined,
+        { project: 'icsoc-2026' },
+      );
+      const parsed = JSON.parse(patched);
+      expect(Object.keys(parsed.agents)).toEqual(['code-agent']);
+    });
+
+    it('skips normalization when no project is known (can\'t safely distinguish the prefix)', () => {
+      const existing = JSON.stringify({
+        agents: {
+          'icsoc-2026-code-agent': {
+            app_name: 'icsoc-2026-code-agent',
+            host: '100.0.0.9',
+            tmux_session: 'icsoc-2026-code-agent',
+            tmux_bin: 'tmux',
+            ssh_user: 'ubuntu',
+            ssh_key_secret: 'AGENT_SSH_KEY',
+          },
+        },
+      }, null, 2);
+      // No `defaults` (hence no `project`) passed — normalization must not guess.
+      const patched = patchAgentConfig(existing, ['code-agent']);
+      const parsed = JSON.parse(patched);
+      expect(parsed.agents).toHaveProperty('icsoc-2026-code-agent');
+      expect(parsed.agents).toHaveProperty('code-agent');
+    });
+
+    it('leaves an unrelated stale key alone when its agent is not in the current --agents list', () => {
+      // Only "code-agent" is being patched this run; a stale key for a
+      // DIFFERENT agent must not be touched (matches the pre-existing
+      // "agents not in --agents are left alone" contract).
+      const existing = JSON.stringify({
+        agents: {
+          'icsoc-2026-science-agent': {
+            app_name: 'icsoc-2026-science-agent',
+            host: '100.0.0.9',
+            tmux_session: 'icsoc-2026-science-agent',
+            tmux_bin: 'tmux',
+            ssh_user: 'ubuntu',
+            ssh_key_secret: 'AGENT_SSH_KEY',
+          },
+        },
+      }, null, 2);
+      const patched = patchAgentConfig(
+        existing, ['code-agent'], undefined,
+        { project: 'icsoc-2026' },
+      );
+      const parsed = JSON.parse(patched);
+      expect(parsed.agents).toHaveProperty('icsoc-2026-science-agent');
+    });
+  });
 });
 
 describe('createLabel', () => {
@@ -691,6 +824,40 @@ describe('repoInit integration', () => {
     expect(config2.agents['code-agent'].app_name).toBe('custom-app-name');
     // New agent has defaults.
     expect(config2.agents['science-agent'].host).toBe('<agent-host-ip>');
+  });
+
+  it('normalizes a pre-existing double-prefixed agent-config key on re-run (macf#805)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    // Simulate the icsoc-2026 pre-DR-032-fix on-disk state: the map key
+    // itself carries the `<project>-` App-handle prefix instead of the bare
+    // routing label, so `route-by-label` can never find it.
+    mkdirSync(join(dir, '.github'), { recursive: true });
+    writeFileSync(join(dir, '.github', 'agent-config.json'), JSON.stringify({
+      agents: {
+        'icsoc-2026-code-agent': {
+          app_name: 'icsoc-2026-code-agent',
+          host: '100.0.0.9',
+          tmux_session: 'icsoc-2026-code-agent',
+          tmux_bin: 'tmux',
+          ssh_user: 'ubuntu',
+          ssh_key_secret: 'AGENT_SSH_KEY',
+        },
+      },
+    }, null, 2) + '\n');
+
+    await repoInit(dir, {
+      repo: 'owner/icsoc-2026',
+      actionsVersion: 'v1',
+      agents: 'code-agent',
+      project: 'icsoc-2026',
+      force: false,
+    });
+
+    const config = JSON.parse(readFileSync(join(dir, '.github', 'agent-config.json'), 'utf-8'));
+    expect(config.agents).toHaveProperty('code-agent');
+    expect(config.agents).not.toHaveProperty('icsoc-2026-code-agent');
+    expect(config.agents['code-agent'].host).toBe('100.0.0.9');
   });
 
   it('--session-name applied on existing config WITHOUT --force (#82)', async () => {
