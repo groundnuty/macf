@@ -34,7 +34,7 @@ import type { GitHubAppManifest } from '../bootstrap/app-manifest.js';
 import { buildAppManifest, repoHomepageUrl } from '../bootstrap/app-manifest.js';
 import { appInstallationUrl } from '../bootstrap/identity-confirm.js';
 import { realAgentApplyDeps } from '../bootstrap/apply-agent.js';
-import type { AgentApplyDeps, AgentApplyOutcome } from '../bootstrap/apply-agent.js';
+import type { AgentApplyOutcome } from '../bootstrap/apply-agent.js';
 import { realCloneRepo, realCommitAndPush } from '../bootstrap/apply-repo-init.js';
 import type { RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
 import { applyFleet } from '../bootstrap/apply-fleet.js';
@@ -183,7 +183,10 @@ async function realConfirmPlan(plan: FleetPlan, creations: readonly PlannedAppCr
 function resolveMutateDeps(manifestPath: string): MutateApplyDeps {
   const repoInitDeps: RepoInitStepDeps = { cloneRepo: realCloneRepo, commitAndPush: realCommitAndPush };
   return {
-    buildAgentDeps: (log: (line: string) => void): AgentApplyDeps => realAgentApplyDeps(realOpenUrl, log),
+    // `writeRecoveryArtifact` is deliberately absent here — `apply-fleet.ts`
+    // splices it in (it owns the fleet-level context that seam needs; see
+    // its module doc's "Recovery-artifact lifecycle" section).
+    buildAgentDeps: (log: (line: string) => void) => realAgentApplyDeps(realOpenUrl, log),
     repoInitDeps,
     vaultDeps: {},
     now: () => new Date(),

@@ -59,6 +59,7 @@ function baseDeps(overrides: Partial<AgentApplyDeps> = {}): AgentApplyDeps {
     confirmAppInstallation: async () => ({ status: 'unconfirmable' }) as IdentityConfirmation,
     openUrl: async () => {},
     log: (line: string) => logs.push(line),
+    writeRecoveryArtifact: async () => {},
     ...overrides,
   };
 }
@@ -186,6 +187,47 @@ describe('applyAgentIdentity — create path', () => {
     expect(gate2Called).toBe(false);
   });
 
+  it('writes the recovery artifact IMMEDIATELY after gate 1 exchange returns, BEFORE gate 2 starts (DR-043 §D5 durable-before-gate-2)', async () => {
+    const callOrder: string[] = [];
+    const seenCreds: { role: string; appId: string }[] = [];
+    const deps = baseDeps({
+      writeRecoveryArtifact: async (role, creds) => {
+        callOrder.push('recovery-artifact');
+        seenCreds.push({ role, appId: creds.appId });
+      },
+      waitForAppInstallation: async () => {
+        callOrder.push('gate2');
+        return { appId: CREDS.appId, installId: '5555', appSlug: CREDS.slug, accountLogin: 'groundnuty' };
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(callOrder).toEqual(['recovery-artifact', 'gate2']);
+    expect(seenCreds).toEqual([{ role: 'code-agent', appId: CREDS.appId }]);
+    expect(outcome.status).toBe('created');
+  });
+
+  it('recovery-artifact write failure aborts BEFORE gate 2 runs (DR-043 §D5 hard-failure invariant)', async () => {
+    let gate2Called = false;
+    const deps = baseDeps({
+      writeRecoveryArtifact: async () => {
+        throw new Error('disk full');
+      },
+      waitForAppInstallation: async () => {
+        gate2Called = true;
+        throw new Error('must not be called');
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).toMatch(/durab.*gate 2/i);
+      expect(outcome.reason).toContain('disk full');
+      expect(outcome.reason).toContain(CREDS.appId);
+      expect(outcome.reason).toContain(CREDS.name);
+    }
+    expect(gate2Called).toBe(false);
+  });
+
   it('gate 2 failure after gate 1 succeeded -> status failed, names the app_id + a manual-recovery install URL (the gate-1->2 window)', async () => {
     const deps = baseDeps({
       waitForAppInstallation: async () => {
@@ -216,6 +258,7 @@ describe('applyAgentIdentity — create path', () => {
 
   it('NEVER logs a secret value — no PEM/clientSecret/webhookSecret sentinel appears in any log line, on the happy path OR a failure', async () => {
     const logs: string[] = [];
+    const reasons: string[] = [];
     const happy = baseDeps({ log: (l) => logs.push(l) });
     await applyAgentIdentity(AGENT, MANIFEST, undefined, happy);
 
@@ -223,9 +266,20 @@ describe('applyAgentIdentity — create path', () => {
       log: (l) => logs.push(l),
       waitForAppInstallation: async () => { throw new Error('boom'); },
     });
-    await applyAgentIdentity(AGENT, MANIFEST, undefined, failing);
+    const failingOutcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, failing);
+    if (failingOutcome.status === 'failed') reasons.push(failingOutcome.reason);
 
-    const joined = logs.join('\n');
+    // Also the recovery-artifact-write failure path (a DIFFERENT return
+    // statement from the gate-2 failure above) — its reason string embeds
+    // the underlying error message, which must never be a secret either.
+    const recoveryFailing = baseDeps({
+      log: (l) => logs.push(l),
+      writeRecoveryArtifact: async () => { throw new Error('boom'); },
+    });
+    const recoveryOutcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, recoveryFailing);
+    if (recoveryOutcome.status === 'failed') reasons.push(recoveryOutcome.reason);
+
+    const joined = [...logs, ...reasons].join('\n');
     expect(joined).not.toContain('SENTINEL-CLIENT-SECRET');
     expect(joined).not.toContain('SENTINEL-WEBHOOK-SECRET');
     expect(joined).not.toContain('SENTINEL-PEM');

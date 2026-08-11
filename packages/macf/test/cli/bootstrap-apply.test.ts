@@ -223,6 +223,10 @@ function fakeAgentDeps(overrides: Partial<AgentApplyDeps> = {}): AgentApplyDeps 
     confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
     openUrl: async () => {},
     log: () => {},
+    // applyFleet ALWAYS overrides this field with its own real recovery-
+    // artifact writer (see apply-fleet.ts's `buildAgentDepsWithRecovery`) —
+    // present here only to satisfy `AgentApplyDeps`'s type.
+    writeRecoveryArtifact: async () => {},
     ...overrides,
   };
 }

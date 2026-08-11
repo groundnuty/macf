@@ -34,10 +34,31 @@
  * value is guarded against this before it is ever assembled into a line;
  * base64 output (the PEM/cert fields) is inherently safe
  * (`[A-Za-z0-9+/=]` only) and does not need the guard.
+ *
+ * **Per-agent recovery artifacts (§D5 "durable before gate 2," 2026-08-11
+ * review of Slice 2b increment 5a, groundnuty/macf#838):** the FINAL vault
+ * above is a batched, single-shot, whole-payload write — by design, it can
+ * only be composed once every agent in a run has finished. But `apply`'s
+ * per-agent flow (`apply-agent.ts`) parks a multi-minute OPERATOR-WAIT
+ * (consent gate 2, the install click) between "gate 1 just minted a real,
+ * irreversible GitHub App + its ONLY credential copy" and "that credential
+ * is durable anywhere." A crash in that window loses the credential forever
+ * even though the App exists on GitHub. {@link writeAgentRecoveryArtifact}
+ * closes that hole WITHOUT waiting for the batched compose: it encrypts ONE
+ * agent's just-exchanged credentials to their OWN path
+ * ({@link agentRecoveryArtifactPath}, distinct from `vault.age` — the
+ * single-shot clobber guard above is therefore irrelevant to it) the moment
+ * they're received, before gate 2 starts. It is write-only insurance — never
+ * read back by this module — and is deleted ({@link removeAgentRecoveryArtifact})
+ * once the SAME credential has landed in the final `vault.age`. See
+ * `apply-agent.ts` / `apply-fleet.ts` module docs for the call-site wiring
+ * and the operator recovery procedure.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { toVariableSegment } from '@groundnuty/macf-core';
+import type { AppCredentials } from './manifest-exchange.js';
 
 /** Thrown by every failure mode in this module — mirrors `ManifestExchangeError`'s shape. */
 export class VaultError extends Error {
@@ -428,4 +449,99 @@ export async function writeVault(
 
   await encrypt(plaintext, opts.recipients, destPath);
   return { path: destPath, versioned };
+}
+
+// --- Per-agent recovery artifact (§D5 "durable before gate 2") ---
+
+/**
+ * `secrets/vault.age`'s sibling for per-agent write-only insurance —
+ * `<secretsDir>/recovery/<role>.age`. `role` is schema-validated
+ * `[a-z0-9-]` (`fleet-manifest.ts`'s `ROLE_CHARSET_RE`) — filesystem-safe as
+ * written, no `toVariableSegment` transform needed (that transform is for
+ * the shell-variable KEYS inside the plaintext, not this path). Exported so
+ * `apply-fleet.ts` can compute the SAME path on both the write side
+ * (`apply-agent.ts`'s `AgentApplyDeps.writeRecoveryArtifact` callback) and
+ * the delete side (after a successful final vault compose) without the two
+ * ever drifting apart.
+ */
+export function agentRecoveryArtifactPath(secretsDir: string, role: string): string {
+  return join(secretsDir, 'recovery', `${role}.age`);
+}
+
+/**
+ * Assemble the recovery-artifact PLAINTEXT for one agent's just-exchanged
+ * credentials. Deliberately a NARROWER shape than {@link VaultAgentSecrets}:
+ * `installId` isn't knowable yet at the point this fires — it's the product
+ * of gate 2, which hasn't run yet (see `apply-agent.ts`'s "gate 1→2 window"
+ * doc). Reuses `buildVaultPlaintext`'s own safety primitives (`emitLine` —
+ * shell-identifier + shell-metacharacter guards) so a recovery artifact is
+ * exactly as safe to eventually fold into `vault.sh`'s `eval` sourcing as
+ * the real vault is, even though nothing in this codebase does that folding
+ * automatically yet (operator recovery is manual — see `apply-fleet.ts`'s
+ * module doc).
+ */
+function buildRecoveryArtifactPlaintext(role: string, creds: AppCredentials): string {
+  assertNonEmptySegmentSource('role', role);
+  const seg = toVariableSegment(role);
+  const lines: string[] = [];
+  emitLine(lines, `MACF_RECOVERY_${seg}_APP_ID`, creds.appId);
+  emitLine(lines, `MACF_RECOVERY_${seg}_APP_NAME`, creds.name);
+  emitLine(lines, `MACF_RECOVERY_${seg}_APP_SLUG`, creds.slug);
+  emitLine(lines, `MACF_RECOVERY_${seg}_CLIENT_ID`, creds.clientId);
+  emitLine(lines, `MACF_RECOVERY_${seg}_CLIENT_SECRET`, creds.clientSecret);
+  emitLine(lines, `MACF_RECOVERY_${seg}_WEBHOOK_SECRET`, creds.webhookSecret);
+  emitLine(lines, `MACF_RECOVERY_${seg}_PRIVATE_KEY_B64`, toBase64(creds.pem));
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Encrypt one agent's just-exchanged credentials to their own recovery-
+ * artifact path — UNCONDITIONALLY (no `writeVault`-style exists/clobber
+ * check: this file is write-only insurance on ITS OWN path, never the
+ * store of record, so a stale leftover from an earlier interrupted run is
+ * simply superseded). `mkdirSync(..., { recursive: true })` because
+ * `secrets/recovery/` is new territory this increment introduces — unlike
+ * `secrets/vault.age` (whose containing `secrets/` dir is presumed to
+ * pre-exist from the vault-repo checkout, out of this increment's scope
+ * per the module doc), the recovery subdirectory has no other reason to
+ * exist yet, and this write is the one that MUST NOT fail on a missing
+ * directory (that would defeat the entire "durable before gate 2"
+ * invariant this function exists for).
+ *
+ * `encrypt` defaults to the real `age` binary; tests inject a fake (same
+ * seam `writeVault` uses) so no real `age`/keys are needed.
+ */
+export async function writeAgentRecoveryArtifact(
+  role: string,
+  creds: AppCredentials,
+  recipients: readonly string[],
+  outPath: string,
+  encrypt: VaultEncryptFn = ageEncryptToFile,
+): Promise<void> {
+  if (recipients.length === 0) {
+    throw new VaultError(
+      'vault_no_age_recipient',
+      'writeAgentRecoveryArtifact: transport.age_recipient is not configured — this agent\'s just-issued ' +
+        'credential CANNOT be made durable (DR-043 §D5). Mint an age recipient and set transport.age_recipient ' +
+        'in fleet.yaml before re-running apply.',
+    );
+  }
+  const plaintext = buildRecoveryArtifactPlaintext(role, creds);
+  mkdirSync(dirname(outPath), { recursive: true });
+  await encrypt(plaintext, recipients, outPath);
+}
+
+/**
+ * Best-effort delete of a per-agent recovery artifact once its credential
+ * is durably recorded in the FINAL `vault.age` — mirrors
+ * {@link ageEncryptToFile}'s own best-effort-cleanup posture (never let a
+ * SECOND failure, e.g. `ENOENT` because the artifact was already gone, mask
+ * the caller's real success path). Never throws.
+ */
+export function removeAgentRecoveryArtifact(outPath: string): void {
+  try {
+    unlinkSync(outPath);
+  } catch {
+    /* best-effort — ENOENT (already gone) or a permission issue; either way, nothing left to clean up here */
+  }
 }

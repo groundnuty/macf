@@ -12,19 +12,23 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   ageEncryptToFile,
+  agentRecoveryArtifactPath,
   buildVaultPlaintext,
+  removeAgentRecoveryArtifact,
   VaultError,
   vaultAgentSecretsForFingerprint,
   vaultFleetSecretsForFingerprint,
+  writeAgentRecoveryArtifact,
   writeVault,
   type VaultAgentSecrets,
   type VaultPayload,
 } from '../../../src/cli/bootstrap/vault-write.js';
+import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 
 function have(cmd: string): boolean {
   return spawnSync('sh', ['-c', `command -v ${cmd}`], { encoding: 'utf-8' }).status === 0;
@@ -279,6 +283,89 @@ describe('writeVault — orchestration (injected deps, no real age)', () => {
       { exists: () => true, encrypt: async () => {} },
     );
     expect(result.path).toBe('/fake/secrets/vault-noext.20260811T000000Z');
+  });
+});
+
+describe('agentRecoveryArtifactPath / writeAgentRecoveryArtifact / removeAgentRecoveryArtifact — §D5 durable-before-gate-2', () => {
+  const CREDS: AppCredentials = {
+    appId: '111',
+    name: 'demo-fleet-code-agent',
+    slug: 'demo-fleet-code-agent',
+    clientId: 'Iv1.abc',
+    clientSecret: 'SENTINEL-CLIENT-SECRET',
+    webhookSecret: 'SENTINEL-WEBHOOK-SECRET',
+    pem: '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-PEM\n-----END RSA PRIVATE KEY-----\n',
+  };
+
+  it('agentRecoveryArtifactPath: own path under <secretsDir>/recovery/, distinct from vault.age', () => {
+    expect(agentRecoveryArtifactPath('/fake/secrets', 'code-agent')).toBe('/fake/secrets/recovery/code-agent.age');
+  });
+
+  it('writeAgentRecoveryArtifact throws VaultError(vault_no_age_recipient) with zero recipients — never calls encrypt', async () => {
+    let encryptCalled = false;
+    await expect(
+      writeAgentRecoveryArtifact('code-agent', CREDS, [], '/fake/secrets/recovery/code-agent.age', async () => {
+        encryptCalled = true;
+      }),
+    ).rejects.toThrow(VaultError);
+    expect(encryptCalled).toBe(false);
+  });
+
+  it('writeAgentRecoveryArtifact creates the recovery dir for real, then encrypts a role-scoped plaintext to the exact outPath', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-recovery-artifact-test-'));
+    try {
+      const outPath = join(dir, 'secrets', 'recovery', 'code-agent.age');
+      const calls: { plaintext: string; recipients: readonly string[]; outPath: string }[] = [];
+      await writeAgentRecoveryArtifact('code-agent', CREDS, ['age1operator', 'age1vm'], outPath, async (plaintext, recipients, path) => {
+        calls.push({ plaintext, recipients, outPath: path });
+      });
+      expect(existsSync(join(dir, 'secrets', 'recovery'))).toBe(true); // mkdir -p happened for real
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.outPath).toBe(outPath);
+      expect(calls[0]?.recipients).toEqual(['age1operator', 'age1vm']);
+      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_ID="111"');
+      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_SLUG="demo-fleet-code-agent"');
+      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_CLIENT_SECRET="SENTINEL-CLIENT-SECRET"');
+      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_WEBHOOK_SECRET="SENTINEL-WEBHOOK-SECRET"');
+      // PEM is base64-encoded, never raw, in the plaintext:
+      expect(calls[0]?.plaintext).not.toContain('SENTINEL-PEM');
+      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_PRIVATE_KEY_B64="');
+      // No installId anywhere — gate 2 hasn't happened yet at write time:
+      expect(calls[0]?.plaintext).not.toContain('INSTALL_ID');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a rejected encrypt (e.g. age failure) propagates — no swallowed failure', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-recovery-artifact-test-'));
+    try {
+      const outPath = join(dir, 'secrets', 'recovery', 'code-agent.age');
+      await expect(
+        writeAgentRecoveryArtifact('code-agent', CREDS, ['age1operator'], outPath, async () => {
+          throw new Error('age exited 1: boom');
+        }),
+      ).rejects.toThrow(/age exited 1: boom/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('removeAgentRecoveryArtifact deletes a real file for real', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-recovery-artifact-test-'));
+    try {
+      const outPath = join(dir, 'code-agent.age');
+      writeFileSync(outPath, 'FAKE-CIPHERTEXT');
+      expect(existsSync(outPath)).toBe(true);
+      removeAgentRecoveryArtifact(outPath);
+      expect(existsSync(outPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('removeAgentRecoveryArtifact is a silent no-op (never throws) when the file is already gone', () => {
+    expect(() => removeAgentRecoveryArtifact('/definitely/does/not/exist/code-agent.age')).not.toThrow();
   });
 });
 

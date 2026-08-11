@@ -6,7 +6,7 @@
  * only `fleet.lock` (a small local JSON file) touches real fs.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applyFleet, type FleetApplyDeps } from '../../../src/cli/bootstrap/apply-fleet.js';
@@ -64,6 +64,11 @@ function agentDepsFor(role: string, outcome: 'reused' | 'resumed-install' | 'cre
     confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
     openUrl: async () => {},
     log: () => {},
+    // applyFleet ALWAYS overrides this field with its own real recovery-
+    // artifact writer (see apply-fleet.ts's `buildAgentDepsWithRecovery`) —
+    // present here only to satisfy `AgentApplyDeps`'s type; its behavior is
+    // exercised via `vaultDeps.encrypt` in the tests below, not via this stub.
+    writeRecoveryArtifact: async () => {},
   };
   switch (outcome) {
     case 'reused':
@@ -153,19 +158,65 @@ describe('applyFleet', () => {
     expect(Object.keys(lock.agents[0]?.fingerprints ?? {}).sort()).toEqual(['app_private_key', 'client_secret', 'webhook_secret']);
   });
 
-  it('vault write failure (no age_recipient configured): the created agent\'s lock entry is NOT written', async () => {
+  it('no age_recipient configured: the DR-043 §D5 pre-flight refuses gate 1 ENTIRELY — no App is ever created, no lock entry, no repo-init', async () => {
+    // Before the §D5 review fix, this scenario ran BOTH consent gates to
+    // completion and only failed at the very end (the batched vault write)
+    // — meaning a REAL, irreversible GitHub App got created with an
+    // unrecoverable credential. `applyFleet`'s pre-flight (module doc:
+    // `wouldCreateWithNoRecipient` / `noRecipientPreflightFailure`) now
+    // proves this role would hit that dead end BEFORE calling
+    // `applyAgentIdentity` at all — gate 1 (`startManifestFlow` /
+    // `exchangeManifestCode`) is never even attempted, not just gate 2.
     const manifestPath = manifestPathIn();
     const manifest = manifestWith([CODE_AGENT], /* ageRecipient */ null);
-    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'));
+    let gate1Called = false;
+    let gate2Called = false;
+    const agentDeps = agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1');
+    const deps = baseDeps({
+      ...agentDeps,
+      startManifestFlow: async (opts) => {
+        gate1Called = true;
+        return agentDeps.startManifestFlow(opts);
+      },
+      waitForAppInstallation: async (opts) => {
+        gate2Called = true;
+        return agentDeps.waitForAppInstallation(opts);
+      },
+    });
 
     const result = await applyFleet(manifest, manifestPath, null, deps);
 
-    expect(result.vault.status).toBe('failed');
-    if (result.vault.status === 'failed') expect(result.vault.reason).toMatch(/age_recipient/);
-    // repo-init still ran (it doesn't depend on the vault) — but no lock entry:
-    expect(result.agents[0]?.repoInit?.status).toBe('applied');
+    expect(gate1Called).toBe(false);
+    expect(gate2Called).toBe(false);
+    expect(result.agents[0]?.identity.status).toBe('failed');
+    if (result.agents[0]?.identity.status === 'failed') {
+      expect(result.agents[0].identity.reason).toMatch(/age_recipient|age recipient/);
+      expect(result.agents[0].identity.reason).toMatch(/CREATE path/);
+    }
+    // No 'created' outcome this run -> nothing pending -> vault is 'skipped', not 'failed':
+    expect(result.vault.status).toBe('skipped');
+    // No lock write for a 'failed' identity, and repo-init never ran (it only runs for reused/resumed-install/created):
+    expect(result.agents[0]?.repoInit).toBeUndefined();
     expect(existsSync(result.lockPath)).toBe(false);
     expect(result.finalLock).toBeNull();
+  });
+
+  it('no age_recipient configured, but the role HAS a prior lock entry: pre-flight does NOT block it (reuse/resume never mints a fresh credential)', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT], /* ageRecipient */ null);
+    const priorLock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+    };
+    const deps = baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'));
+
+    const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+    // Reused proceeds normally — the pre-flight only fires for a role that
+    // would take the CREATE path (no prior entry):
+    expect(result.agents[0]?.identity.status).toBe('reused');
+    expect(existsSync(result.lockPath)).toBe(true);
   });
 
   it('reused / resumed-install: lock is written IMMEDIATELY, no vault write attempted for them', async () => {
@@ -195,6 +246,7 @@ describe('applyFleet', () => {
       waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: 'install-2-resumed', appSlug: 'demo-fleet-science-agent', accountLogin: 'groundnuty' }),
       openUrl: async () => {},
       log: () => {},
+      writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless — see agentDepsFor's comment
     };
 
     const result = await applyFleet(manifest, manifestPath, priorLock, baseDeps(agentDeps));
@@ -244,6 +296,7 @@ describe('applyFleet', () => {
       waitForAppInstallation: async () => { throw new Error('must not be called'); },
       openUrl: async () => {},
       log: () => {},
+      writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless — see agentDepsFor's comment
     };
     const result = await applyFleet(manifest, manifestPath, priorLock, baseDeps(agentDeps));
     expect(result.identityChanges).toEqual(
@@ -262,7 +315,7 @@ describe('applyFleet', () => {
       fleet: 'demo-fleet',
       agents: [{ role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' }],
     };
-    const encryptCalls: { plaintext: string }[] = [];
+    const encryptCalls: { plaintext: string; outPath: string }[] = [];
     const agentDeps: AgentApplyDeps = {
       startManifestFlow: async () => ({ startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} }),
       exchangeManifestCode: async () => creds('code-agent'),
@@ -271,14 +324,15 @@ describe('applyFleet', () => {
       waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: 'install-1', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
       openUrl: async () => {},
       log: () => {},
+      writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless — see agentDepsFor's comment
     };
     const deps: FleetApplyDeps = {
       buildAgentDeps: () => agentDeps,
       repoInitDeps: NOOP_REPO_INIT,
       vaultDeps: {
         exists: () => false,
-        encrypt: async (plaintext) => {
-          encryptCalls.push({ plaintext });
+        encrypt: async (plaintext, _recipients, outPath) => {
+          encryptCalls.push({ plaintext, outPath });
         },
       },
       now: () => new Date('2026-08-11T00:00:00.000Z'),
@@ -288,9 +342,18 @@ describe('applyFleet', () => {
     const result = await applyFleet(manifest, manifestPath, priorLock, deps);
 
     expect(result.vault.status).toBe('written');
-    expect(encryptCalls).toHaveLength(1);
-    expect(encryptCalls[0]?.plaintext).toContain('CODE_AGENT'); // the freshly-created agent's segment
-    expect(encryptCalls[0]?.plaintext).not.toContain('SCIENCE_AGENT_CLIENT_SECRET'); // reused agent contributes NO fresh secret
+    // TWO encrypt calls now: the pre-gate-2 recovery artifact (DR-043 §D5
+    // durable-before-gate-2) fires first, THEN the batched final vault —
+    // asserted by ORDER, not just presence, so this doesn't just infer the
+    // sequencing from the loop structure.
+    expect(encryptCalls).toHaveLength(2);
+    expect(encryptCalls.map((c) => c.outPath.includes('recovery'))).toEqual([true, false]);
+    const recoveryCall = encryptCalls.find((c) => c.outPath.includes('recovery'));
+    const finalVaultCall = encryptCalls.find((c) => !c.outPath.includes('recovery'));
+    expect(recoveryCall?.outPath).toMatch(/secrets[/\\]recovery[/\\]code-agent\.age$/);
+    expect(recoveryCall?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_ID');
+    expect(finalVaultCall?.plaintext).toContain('CODE_AGENT'); // the freshly-created agent's segment
+    expect(finalVaultCall?.plaintext).not.toContain('SCIENCE_AGENT_CLIENT_SECRET'); // reused agent contributes NO fresh secret
 
     const lock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
     expect(lock.agents.map((a) => a.role).sort()).toEqual(['code-agent', 'science-agent']);
@@ -315,5 +378,112 @@ describe('applyFleet', () => {
     expect(joined).not.toContain('SENTINEL-SECRET-code-agent');
     expect(joined).not.toContain('SENTINEL-HOOK-code-agent');
     expect(joined).not.toContain('SENTINEL-PEM-code-agent');
+  });
+
+  // --- Recovery-artifact lifecycle (DR-043 §D5 "durable before gate 2") ---
+
+  it('recovery artifact: written before gate 2, then REMOVED once the final compose SUCCEEDS', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT]);
+    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'));
+    // A real fake `age`: actually writes a stub file so the artifact's
+    // presence/absence on disk is observable (the `encrypt` seam this
+    // reuses — task requirement: no separate seam, no real `age` binary).
+    const realDeps: FleetApplyDeps = {
+      ...deps,
+      vaultDeps: {
+        exists: () => false,
+        encrypt: async (plaintext, _recipients, outPath) => {
+          writeFileSync(outPath, `FAKE-AGE-CIPHERTEXT\n${plaintext.length.toString()}`);
+        },
+      },
+    };
+
+    const recoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'code-agent.age');
+    const result = await applyFleet(manifest, manifestPath, null, realDeps);
+
+    expect(result.agents[0]?.identity.status).toBe('created');
+    // Insurance copy is gone — the credential now lives durably in the FINAL vault:
+    expect(existsSync(recoveryPath)).toBe(false);
+    if (result.vault.status === 'written') {
+      expect(existsSync(result.vault.path)).toBe(true);
+    } else {
+      expect.fail(`expected vault.status 'written', got ${JSON.stringify(result.vault)}`);
+    }
+  });
+
+  it('recovery artifact: RETAINED when the final compose FAILS (write-only insurance stays until it is actually redundant)', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT]);
+    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'));
+    const realDeps: FleetApplyDeps = {
+      ...deps,
+      vaultDeps: {
+        exists: () => false,
+        encrypt: async (plaintext, _recipients, outPath) => {
+          if (outPath.includes('recovery')) {
+            writeFileSync(outPath, `FAKE-AGE-CIPHERTEXT\n${plaintext.length.toString()}`);
+            return;
+          }
+          // Simulate the FINAL vault's own `age` invocation failing (disk
+          // full, age crashed, etc.) — independent of the recovery write,
+          // which already succeeded.
+          throw new Error('simulated final-vault encrypt failure');
+        },
+      },
+    };
+
+    const recoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'code-agent.age');
+    const result = await applyFleet(manifest, manifestPath, null, realDeps);
+
+    expect(result.vault.status).toBe('failed');
+    expect(result.agents[0]?.identity.status).toBe('created'); // gate 1 + gate 2 both succeeded — only the batched compose failed
+    // The recovery artifact is the ONLY durable copy of this credential
+    // right now — it MUST still be on disk:
+    expect(existsSync(recoveryPath)).toBe(true);
+    // No lock entry either (the vault-before-lock invariant — see module doc):
+    expect(existsSync(result.lockPath)).toBe(false);
+  });
+
+  it('recovery artifact: the PATH is logged on success — an operator reading the transcript can find it after a crash', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT]);
+    const logs: string[] = [];
+    const deps: FleetApplyDeps = {
+      buildAgentDeps: (log) => ({ ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), log }),
+      repoInitDeps: NOOP_REPO_INIT,
+      vaultDeps: { exists: () => false, encrypt: async () => {} },
+      now: () => new Date(),
+      log: (l) => logs.push(l),
+    };
+
+    await applyFleet(manifest, manifestPath, null, deps);
+
+    const recoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'code-agent.age');
+    expect(logs.some((l) => l.includes(recoveryPath))).toBe(true);
+  });
+
+  it('recovery artifact: a write FAILURE surfaces the attempted PATH in AgentApplyOutcome.reason (findable even from --json output alone)', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT]);
+    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'));
+    const realDeps: FleetApplyDeps = {
+      ...deps,
+      vaultDeps: {
+        exists: () => false,
+        encrypt: async () => {
+          throw new Error('disk full');
+        },
+      },
+    };
+
+    const result = await applyFleet(manifest, manifestPath, null, realDeps);
+
+    const recoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'code-agent.age');
+    expect(result.agents[0]?.identity.status).toBe('failed');
+    if (result.agents[0]?.identity.status === 'failed') {
+      expect(result.agents[0].identity.reason).toContain('disk full');
+      expect(result.agents[0].identity.reason).toContain(recoveryPath);
+    }
   });
 });

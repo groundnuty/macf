@@ -61,11 +61,46 @@
  * A gate-2 failure (including a timeout) on the CREATE path is therefore
  * reported as `status: 'failed'`, carrying the install URL so the operator
  * can complete the install manually in the same terminal session — see
- * {@link applyAgentIdentity}'s inline comment on that branch. Closing this
- * window fully requires a vault-aware `resolveKeyPath` (a live PEM→JWT
- * re-check immediately after gate 1, before gate 2) — out of scope for this
- * increment (DR-043 Amendment A's vault-aware observer/confirm is Slice-2+
- * scope); the hook (`AgentApplyDeps.resolveKeyPath`) is already wired for it.
+ * {@link applyAgentIdentity}'s inline comment on that branch. Closing the
+ * DUPLICATE-App-on-retry half of this window fully requires a vault-aware
+ * `resolveKeyPath` (a live PEM→JWT re-check immediately after gate 1, before
+ * gate 2) — out of scope for this increment (DR-043 Amendment A's
+ * vault-aware observer/confirm is Slice-2+ scope); the hook
+ * (`AgentApplyDeps.resolveKeyPath`) is already wired for it.
+ *
+ * **The CREDENTIAL-LOSS half of this window is closed for `applyFleet`, the
+ * sole production caller (2026-08-11 review of this increment) — NOT by
+ * this module alone.** Immediately after `exchangeManifestCode` returns —
+ * BEFORE gate 2 opens — `deps.writeRecoveryArtifact` encrypts the just-
+ * issued credentials to a per-agent recovery artifact
+ * (`vault-write.ts::writeAgentRecoveryArtifact`, its own path, distinct from
+ * the batched `vault.age`). A rejection there is a HARD failure for this
+ * agent: this module refuses to proceed to gate 2 with a credential that
+ * exists ONLY in process memory (DR-043 §D5 — the property that makes the
+ * vault "of record" IS crash-safety, and a multi-minute operator-wait
+ * (gate 2) sits between minting the credential and the batched compose that
+ * would otherwise be its only durable home). But THIS module has no way to
+ * know in advance whether `writeRecoveryArtifact` even CAN succeed (e.g. no
+ * age recipient configured means no artifact is possible at all) — so on
+ * its own, a rejection here would still mean gate 1 already minted a real
+ * App whose credential is now provably unrecoverable. `apply-fleet.ts`
+ * closes that gap with a PRE-FLIGHT (see its module doc) that refuses gate
+ * 1 entirely for a role it can prove would hit this failure — making the
+ * "closed" claim true for the orchestrator as a whole, not just for this
+ * module in isolation. The artifact is deleted once the SAME credential
+ * lands in the FINAL vault (`apply-fleet.ts`'s job, not this module's — it
+ * owns the batched compose). What is still NOT automated
+ * even with the artifact durable: on a crash between gate 1 and the final
+ * vault write, a RE-RUN's confirm-before-create guard sees no `fleet.lock`
+ * entry for this role (a lock entry requires gate 2 + a successful vault
+ * write) and attempts gate 1 AGAIN — GitHub rejects the duplicate App name
+ * loudly rather than resuming, so the re-run reports `status: 'failed'`
+ * too. The App is orphaned-but-real on GitHub and its credential is
+ * durable-but-unmerged in the recovery artifact; folding it into
+ * `fleet.lock` + `vault.age` is a MANUAL operator step (decrypt the
+ * artifact, then either complete the install + hand-merge the secret, or
+ * delete the orphaned App and let a clean re-run recreate it) — see
+ * `apply-fleet.ts`'s module doc for the full recovery procedure.
  */
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -181,10 +216,35 @@ export interface AgentApplyDeps {
   /** Overall budget for EACH gate. Defaults to the gate primitives' own defaults (10 min). */
   readonly gateTimeoutMs?: number;
   readonly pollIntervalMs?: number;
+  /**
+   * Persist `creds` to a durable, per-agent recovery artifact — DR-043 §D5
+   * "durable before gate 2" (see this module's doc). Called EXACTLY once per
+   * CREATE path, immediately after `exchangeManifestCode` resolves and
+   * BEFORE gate 2 starts. MUST NOT be a no-op in production — a rejection
+   * here is treated as a HARD failure for this agent (see
+   * {@link applyAgentIdentity}'s call site): this module refuses to open
+   * gate 2 with a credential durable only in process memory. Required
+   * (not optional) because skipping it silently would reintroduce exactly
+   * the hole this hook exists to close. Fleet-level wiring
+   * (`apply-fleet.ts`) supplies the real implementation — it is the layer
+   * that knows the recovery-artifact path + age recipients; this module
+   * only knows WHEN to call it, not WHERE the artifact lives.
+   */
+  readonly writeRecoveryArtifact: (role: string, creds: AppCredentials) => Promise<void>;
 }
 
-/** The real dependency set — every field is the actual primitive from its sibling module. */
-export function realAgentApplyDeps(openUrl: (url: string) => Promise<void>, log: (line: string) => void): AgentApplyDeps {
+/**
+ * The real dependency set for every gate primitive EXCEPT
+ * `writeRecoveryArtifact` — that one needs fleet-level context (the
+ * manifest's age recipients + the manifest path) this function doesn't
+ * have, so `apply-fleet.ts` supplies it (see that module's doc). The return
+ * type reflects the omission explicitly rather than stubbing a fake writer
+ * here that would just be thrown away.
+ */
+export function realAgentApplyDeps(
+  openUrl: (url: string) => Promise<void>,
+  log: (line: string) => void,
+): Omit<AgentApplyDeps, 'writeRecoveryArtifact'> {
   return {
     startManifestFlow: realStartManifestFlow,
     exchangeManifestCode: realExchangeManifestCode,
@@ -298,7 +358,22 @@ export async function applyAgentIdentity(
     return { role, status: 'failed', reason: `consent gate 1 (App creation) failed: ${errMessage(err)}` };
   }
 
-  deps.log(`Role "${role}": App "${creds.name}" created (app_id ${creds.appId}) — starting consent gate 2 (install).`);
+  // DR-043 §D5 "durable before gate 2" (2026-08-11 review of this
+  // increment) — the App now EXISTS on GitHub and `creds` is its ONLY
+  // credential copy, held in process memory. Gate 2 is a multi-minute
+  // operator-wait; persist the credential to its own recovery artifact
+  // BEFORE opening that wait, not after. A failure here is a HARD stop —
+  // proceeding to gate 2 with a non-durable credential is the exact hole
+  // this call closes. See the module doc's "gate 1→2 window" section.
+  const recoveryFailure = await writeRecoveryArtifactOrFail(role, creds, deps);
+  if (recoveryFailure !== undefined) {
+    return { role, status: 'failed', reason: recoveryFailure };
+  }
+
+  deps.log(
+    `Role "${role}": App "${creds.name}" created (app_id ${creds.appId}), recovery artifact durably written — ` +
+      'starting consent gate 2 (install).',
+  );
   const gate2Expected: ExpectedIdentity = { appSlug: creds.slug, accountLogin: manifest.owner.account };
   const pemPath = writeScratchPem(role, creds.pem);
   try {
@@ -319,6 +394,31 @@ export async function applyAgentIdentity(
     return { role, status: 'created', appId: creds.appId, installId: outcome.installId, credentials: creds };
   } finally {
     cleanupScratchPem(pemPath);
+  }
+}
+
+/**
+ * Wraps `deps.writeRecoveryArtifact` with the DR-043 §D5 "durable before
+ * gate 2" failure framing (see the module doc + {@link applyAgentIdentity}'s
+ * call site). Returns `undefined` on success, or the failure reason string
+ * to return as `{ status: 'failed' }` — kept OUT of `applyAgentIdentity`'s
+ * own body purely to keep that function's already-long branch sequence
+ * scannable (same reasoning `runGate2` was already extracted for). NEVER
+ * includes a credential value in the returned reason — only `role`/`appId`/
+ * `name`, mirroring every other failure-reason string in this module.
+ */
+async function writeRecoveryArtifactOrFail(role: string, creds: AppCredentials, deps: AgentApplyDeps): Promise<string | undefined> {
+  try {
+    await deps.writeRecoveryArtifact(role, creds);
+    return undefined;
+  } catch (err) {
+    return (
+      `credential durability write failed BEFORE consent gate 2 (DR-043 §D5): ${errMessage(err)} — the App WAS ` +
+      `created on GitHub (app_id ${creds.appId}, handle "${creds.name}") but its ONLY credential copy is process ` +
+      'memory, about to be lost if this process exits. Refusing to proceed to gate 2 until the credential is ' +
+      'durable. Fix the durability issue (recovery-artifact write target, disk space, missing age recipient) and ' +
+      're-run — GitHub\'s own App-name uniqueness protects against a duplicate on retry.'
+    );
   }
 }
 
