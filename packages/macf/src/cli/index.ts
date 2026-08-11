@@ -17,6 +17,7 @@ import { runFleetReconcileCommand } from './commands/fleet-reconcile.js';
 import { runFleetResumeCommand } from './commands/fleet-resume.js';
 import { runFleetUpgrade } from './commands/fleet-upgrade.js';
 import { runBootstrapPlan } from './commands/bootstrap.js';
+import { runBootstrapApply } from './commands/bootstrap-apply.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { runRestartSelfCommand } from './commands/restart-self.js';
@@ -489,6 +490,24 @@ bootstrap
   .option('--json', 'Emit the structured plan as JSON', false)
   .action(async (opts) => {
     const code = await runBootstrapPlan({ file: opts.file, json: opts.json });
+    process.exitCode = code;
+  });
+
+bootstrap
+  .command('apply')
+  .description(
+    'Provision the fleet declared in fleet.yaml (DR-043 §D2). CURRENTLY --dry-run ONLY: renders ' +
+    'the read-only plan plus the exact GitHub App manifests that would be submitted at the ' +
+    'operator consent gate — the DR-035 §4 plan-approve-once artifact, shown BEFORE any browser ' +
+    'gate opens. Mutating apply (localhost manifest exchange, install-poll, vault write-through, ' +
+    'fleet.lock, repo-init) is landing incrementally per macf#838; invoking without --dry-run ' +
+    'fails loud rather than exiting 0 having changed nothing.',
+  )
+  .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
+  .option('--dry-run', 'Render the plan + would-be App manifests; mutate nothing', false)
+  .option('--json', 'Emit the structured dry-run result as JSON', false)
+  .action(async (opts) => {
+    const code = await runBootstrapApply({ file: opts.file, dryRun: opts.dryRun, json: opts.json });
     process.exitCode = code;
   });
 
