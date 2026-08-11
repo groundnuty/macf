@@ -350,6 +350,48 @@ export function generateAgentConfig(
 }
 
 /**
+ * DR-032 double-prefix repair (macf#791/#805). Before the bootstrap SKILL's
+ * naming guidance was corrected, operators were told the agent NAME *was*
+ * the GitHub App handle, so `--agents` got invoked with the already-prefixed
+ * form (`<project>-<agent>`) and the map KEY itself ended up carrying the
+ * project prefix instead of the bare routing label. `agent-config.json`'s
+ * key is exactly what `route-by-label` looks the issue's clean `<role>-agent`
+ * label up against — a lingering double-prefixed key means the lookup
+ * silently misses (`route-by-label` skips with `exit 0`, "not an agent
+ * label"), with no error anywhere (see `silent-fallback-hazards.md`). A
+ * separate 2026-06-27 rename pass fixed cert CN / registry keys / tmux
+ * sessions on the live icsoc-2026 fleet but missed this file, so the stale
+ * key can still be sitting in an already-committed agent-config.json.
+ *
+ * Scope is deliberately narrow: only agents named in THIS run's `--agents`
+ * list are considered (mirrors the "agents not in --agents are left alone"
+ * contract of `patchAgentConfig` itself) — a blind `<project>-` prefix strip
+ * over every existing key would risk false-positiving on a legitimately
+ * named agent that happens to start with the project's name. And a clean
+ * key is never clobbered by a stale duplicate: if both `<agent>` and
+ * `<project>-<agent>` are present, the clean entry's data wins and the
+ * stale duplicate is left for the operator to clean up by hand (no data is
+ * silently discarded here, no destructive migration is invented — the
+ * mutation is a rename, applied only when it is unambiguously safe).
+ */
+function normalizeDoublePrefixedKeys(
+  agents: Record<string, AgentConfigEntry>,
+  agentList: readonly string[],
+  project: string | undefined,
+): void {
+  if (!project) return; // can't distinguish "double-prefixed" from "legitimately named" without it
+  for (const agent of agentList) {
+    if (agent in agents) continue; // clean key already present — never overwritten by a stale duplicate
+    const staleKey = `${project}-${agent}`;
+    if (staleKey === agent) continue; // degenerate empty-project guard
+    const stale = agents[staleKey];
+    if (!stale) continue;
+    agents[agent] = stale;
+    delete agents[staleKey];
+  }
+}
+
+/**
  * Merge-preserving regenerate for #76: update only tmux_session/tmux_window
  * fields from user input, preserve app_name/host/ssh_key_secret/ssh_user
  * /tmux_bin/unknown-fields, preserve top-level label_to_status and extras.
@@ -359,6 +401,10 @@ export function generateAgentConfig(
  * DELETES the vestigial `tmux_session`/`tmux_window` from re-patched entries so a
  * substrate agent re-running `macf repo-init` at v3 sheds the leftover Stage-2
  * send-target — clearing `macf routing doctor`'s false SESSION WARN.
+ *
+ * Before touching any entry, also repairs a DR-032 double-prefixed key left
+ * over from a pre-fix bootstrap run or an incomplete rename pass (macf#805)
+ * — see `normalizeDoublePrefixedKeys` above.
  */
 export function patchAgentConfig(
   existingJson: string,
@@ -376,6 +422,12 @@ export function patchAgentConfig(
   if (!parsed.agents || typeof parsed.agents !== 'object') {
     throw new Error('Existing agent-config.json has no `agents` object; aborting.');
   }
+
+  // Repair any DR-032 double-prefixed key BEFORE the merge loop below reads
+  // `parsed.agents[agent]` — normalizing in place here means the loop's
+  // existing-entry lookup transparently finds the (now-renamed) entry and
+  // preserves its fields, same as any other pre-existing agent (macf#805).
+  normalizeDoublePrefixedKeys(parsed.agents, agents, defaults?.project);
 
   const useWindows = !!sessionName && agents.length > 1;
   const agentEntries: Record<string, AgentConfigEntry> = { ...parsed.agents };
