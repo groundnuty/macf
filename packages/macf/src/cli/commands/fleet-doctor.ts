@@ -31,11 +31,13 @@
 import { randomUUID } from 'node:crypto';
 import { request } from 'node:https';
 import { readFileSync, existsSync } from 'node:fs';
+import { join, resolve as resolvePath } from 'node:path';
 import {
   readAgentConfig,
   tokenSourceFromConfig,
   agentCertPath,
   agentKeyPath,
+  findProjectRoot,
 } from '../config.js';
 import { createClientFromConfig } from '../registry-helper.js';
 import {
@@ -474,6 +476,83 @@ export function fleetDoctorToJson(
 }
 
 /**
+ * A structured failure for a non-interactive `--json` consumer (macf#830 —
+ * scheduler-safety: a cron reconciler / CI probe must be able to distinguish
+ * "the CLI failed" from "empty result / healthy quiet fleet"). `code` is a
+ * stable machine-matchable string; `message` is the SAME text also sent to
+ * stderr, so the interactive + `--json` surfaces never disagree.
+ */
+export interface FleetDoctorFailure {
+  readonly code: string;
+  readonly message: string;
+}
+
+/**
+ * The `--json` failure envelope. Carries the SAME `schema_version` as the
+ * success shape (`fleetDoctorToJson`) — `error` is an ADDITIVE field, not a
+ * breaking change to the existing contract (macf#830 AC4): a watchdog that
+ * only reads `summary.verdict` on success is unaffected; one that wants to
+ * distinguish "CLI failed" from "0 agents" checks for `error` first.
+ */
+export function fleetDoctorFailureToJson(failure: FleetDoctorFailure): unknown {
+  return {
+    schema_version: FLEET_DOCTOR_JSON_SCHEMA_VERSION,
+    error: failure,
+  };
+}
+
+/**
+ * Resolve the project directory for `macf fleet doctor` WITHOUT requiring the
+ * caller to be cd'd into a MACF project (macf#830). A cron reconciler / CI
+ * probe's cwd is typically unrelated to any project (e.g. `$HOME`) — the prior
+ * behavior walked up from cwd unconditionally and, on failure, called
+ * `process.exit(1)` directly from the CLI-wiring layer BEFORE `--json` was
+ * even consulted, producing empty stdout for a JSON consumer.
+ *
+ * `--dir <path>` (already wired to every other `fleet` subcommand — the
+ * established cwd-independence flag in this CLI, see `index.ts`'s
+ * `resolveProjectDir`) wins when given and is validated directly (no
+ * walk-up, matching the prior `validateProjectDir` semantics exactly). When
+ * absent, walks up from `cwd` — the prior interactive default, UNCHANGED.
+ *
+ * Pure + never exits the process — returns a `FleetDoctorFailure` on failure
+ * so `runFleetDoctor` can render it consistently under `--json` (a valid,
+ * non-empty JSON error object) or plain-text (stderr only, matching the
+ * pre-#830 message).
+ */
+export function resolveFleetDoctorProjectDir(
+  dirOpt: string | undefined,
+  cwd: string = process.cwd(),
+): { readonly ok: true; readonly dir: string } | { readonly ok: false; readonly failure: FleetDoctorFailure } {
+  if (dirOpt) {
+    const abs = resolvePath(dirOpt);
+    if (!existsSync(join(abs, '.macf', 'macf-agent.json'))) {
+      return {
+        ok: false,
+        failure: {
+          code: 'not_a_macf_project',
+          message: `Not a MACF project: ${abs} has no .macf/macf-agent.json`,
+        },
+      };
+    }
+    return { ok: true, dir: abs };
+  }
+  const found = findProjectRoot(cwd);
+  if (!found) {
+    return {
+      ok: false,
+      failure: {
+        code: 'not_in_macf_project',
+        message:
+          'Not in a MACF project (no .macf/macf-agent.json found walking up from cwd). ' +
+          'Pass --dir <path>, or cd into a project.',
+      },
+    };
+  }
+  return { ok: true, dir: found };
+}
+
+/**
  * The real mTLS diagnostic POST. Mirrors `pingAgentHealth`'s request shape
  * (same CA + client cert/key, `rejectUnauthorized`, timeout) but POSTs the
  * diagnostic body to `/notify`. Resolves with a `DiagnosticAck` describing the
@@ -576,14 +655,35 @@ export interface FleetDoctorDeps {
   readonly injectSleep?: (ms: number) => Promise<void>;
 }
 
-/** Wire the registry + both mTLS calls from a project's config. */
+/**
+ * Wire the registry + both mTLS calls from a project's config. `dirOpt` is the
+ * RAW `--dir` flag value (possibly `undefined`) — resolution (explicit `--dir`
+ * vs cwd walk-up) happens here via `resolveFleetDoctorProjectDir` (macf#830),
+ * so every failure path — unresolvable project dir, missing config, missing
+ * CA cert — returns the SAME `FleetDoctorFailure` shape for `runFleetDoctor`
+ * to render consistently under `--json` or plain-text.
+ */
 async function resolveDepsFromRegistry(
-  projectDir: string,
-): Promise<{ readonly ok: true; readonly deps: FleetDoctorDeps } | { readonly ok: false; readonly code: number }> {
+  dirOpt: string | undefined,
+): Promise<
+  | { readonly ok: true; readonly deps: FleetDoctorDeps }
+  | { readonly ok: false; readonly code: number; readonly failure: FleetDoctorFailure }
+> {
+  const dirResult = resolveFleetDoctorProjectDir(dirOpt);
+  if (!dirResult.ok) {
+    console.error(dirResult.failure.message);
+    return { ok: false, code: 1, failure: dirResult.failure };
+  }
+  const projectDir = dirResult.dir;
+
   const config = readAgentConfig(projectDir);
   if (!config) {
-    console.error('No macf-agent.json found. Run `macf init` first.');
-    return { ok: false, code: 1 };
+    const failure: FleetDoctorFailure = {
+      code: 'no_agent_config',
+      message: 'No macf-agent.json found. Run `macf init` first.',
+    };
+    console.error(failure.message);
+    return { ok: false, code: 1, failure };
   }
 
   const token = await generateToken(tokenSourceFromConfig(projectDir, config));
@@ -591,8 +691,12 @@ async function resolveDepsFromRegistry(
   const client = createClientFromConfig(config.registry, token);
   const caCertPem = await client.readVariable(`${toVariableSegment(config.project)}_CA_CERT`);
   if (!caCertPem) {
-    console.error('CA certificate not found in registry. Run `macf certs init` first.');
-    return { ok: false, code: 1 };
+    const failure: FleetDoctorFailure = {
+      code: 'no_ca_cert',
+      message: 'CA certificate not found in registry. Run `macf certs init` first.',
+    };
+    console.error(failure.message);
+    return { ok: false, code: 1, failure };
   }
 
   const certPath = agentCertPath(projectDir);
@@ -640,69 +744,106 @@ function buildInjectConfig(
 
 /**
  * `macf fleet doctor` entry point. Returns the shell exit code — 1 when the
- * mesh is DEGRADED (any agent unreachable or not-accepting), 0 when HEALTHY or
- * when no agents are registered (matching the `macf doctor` "non-zero on
- * problem" convention). The `--json` body still prints to stdout regardless of
- * exit code; the watchdog reads `summary.verdict` from it. `deps` is injected
- * by tests; production resolves it from the project's registry config.
+ * mesh is DEGRADED (any agent unreachable or not-accepting) OR when the run
+ * FAILED before a verdict could be computed (unresolvable project dir,
+ * missing config, missing CA cert, an unexpected probe/registry error — see
+ * macf#830), 0 when HEALTHY or when no agents are registered (matching the
+ * `macf doctor` "non-zero on problem" convention).
+ *
+ * `dirOpt` is the RAW `--dir` flag value (possibly `undefined` — resolved via
+ * `resolveFleetDoctorProjectDir`, macf#830: explicit `--dir` wins, else walks
+ * up from cwd exactly like the interactive default). This function NEVER
+ * exits the process directly — every failure path returns a `FleetDoctorFailure`-
+ * shaped outcome so a `--json` consumer (a cron reconciler / CI probe) always
+ * gets a valid, non-empty, `jq`-parseable JSON object on stdout PLUS a nonzero
+ * exit code — never empty-stdout+exit-0, and never empty-stdout+exit-nonzero
+ * either. Plain-text mode is UNCHANGED: the failure message goes to stderr
+ * only, same as before #830.
+ *
+ * `deps` is injected by tests; production resolves it from the project's
+ * registry config via `resolveDepsFromRegistry`.
  */
 export async function runFleetDoctor(
-  projectDir: string,
+  dirOpt: string | undefined,
   opts: RunFleetDoctorOptions = {},
   deps?: FleetDoctorDeps,
 ): Promise<number> {
-  let resolved = deps;
-  if (!resolved) {
-    const r = await resolveDepsFromRegistry(projectDir);
-    if (!r.ok) return r.code;
-    resolved = r.deps;
-  }
+  try {
+    let resolved = deps;
+    if (!resolved) {
+      const r = await resolveDepsFromRegistry(dirOpt);
+      if (!r.ok) {
+        // macf#830: never empty stdout under --json, even on the earliest
+        // failure path (project-dir resolution never even reaches a registry).
+        if (opts.json) {
+          console.log(JSON.stringify(fleetDoctorFailureToJson(r.failure), null, 2));
+        }
+        return r.code;
+      }
+      resolved = r.deps;
+    }
 
-  const inject = buildInjectConfig(resolved, opts);
-  const peers = await resolved.listPeers();
+    const inject = buildInjectConfig(resolved, opts);
+    const peers = await resolved.listPeers();
 
-  // Loud up-front INVASIVE warning (DR-030 §3) to stderr BEFORE we route any
-  // real probe. Skipped under --json (machine consumer) + when no agents exist.
-  // The exact reachable count is reported post-gather (we'd otherwise double-
-  // probe every agent just to count).
-  if (inject && !opts.json && peers.length > 0) {
-    console.error(
-      `⚠️  --inject is INVASIVE: it routes a REAL /notify to each REACHABLE agent ` +
-        `(up to ${String(peers.length)} registered), WAKING it + costing it a turn. ` +
-        `IDLE-agent fallback — prefer the passive last_processed self-report for a busy agent.`,
-    );
-  }
+    // Loud up-front INVASIVE warning (DR-030 §3) to stderr BEFORE we route any
+    // real probe. Skipped under --json (machine consumer) + when no agents exist.
+    // The exact reachable count is reported post-gather (we'd otherwise double-
+    // probe every agent just to count).
+    if (inject && !opts.json && peers.length > 0) {
+      console.error(
+        `⚠️  --inject is INVASIVE: it routes a REAL /notify to each REACHABLE agent ` +
+          `(up to ${String(peers.length)} registered), WAKING it + costing it a turn. ` +
+          `IDLE-agent fallback — prefer the passive last_processed self-report for a busy agent.`,
+      );
+    }
 
-  const results = await gatherFleetDoctor(peers, resolved.probe, resolved.diagnose, resolved.genToken, inject);
+    const results = await gatherFleetDoctor(peers, resolved.probe, resolved.diagnose, resolved.genToken, inject);
 
-  if (opts.json) {
-    console.log(JSON.stringify(fleetDoctorToJson(results, resolved.project, { inject: !!inject }), null, 2));
-    return meshVerdict(results) === 'DEGRADED' ? 1 : 0;
-  }
+    if (opts.json) {
+      console.log(JSON.stringify(fleetDoctorToJson(results, resolved.project, { inject: !!inject }), null, 2));
+      return meshVerdict(results) === 'DEGRADED' ? 1 : 0;
+    }
 
-  const header = `macf fleet doctor${resolved.project ? ` — ${resolved.project}` : ''}`;
-  if (results.length === 0) {
-    console.log(`${header}\n\nNo agents registered in the registry.`);
-    return 0;
-  }
+    const header = `macf fleet doctor${resolved.project ? ` — ${resolved.project}` : ''}`;
+    if (results.length === 0) {
+      console.log(`${header}\n\nNo agents registered in the registry.`);
+      return 0;
+    }
 
-  console.log(`${header}\n`);
-  console.log(formatDoctorTable(results, !!inject));
-  console.log('');
-  console.log(summaryLine(results));
-  if (inject) {
-    console.log(
-      `--inject routed a REAL probe to ${String(injectableCount(results))} reachable agent(s), waking each.`,
-    );
-    console.log(injectSummaryLine(results));
-  }
-  console.log('');
-  console.log(HONESTY_LEGEND);
-  if (inject) {
+    console.log(`${header}\n`);
+    console.log(formatDoctorTable(results, !!inject));
     console.log('');
-    console.log(INJECT_LEGEND);
+    console.log(summaryLine(results));
+    if (inject) {
+      console.log(
+        `--inject routed a REAL probe to ${String(injectableCount(results))} reachable agent(s), waking each.`,
+      );
+      console.log(injectSummaryLine(results));
+    }
+    console.log('');
+    console.log(HONESTY_LEGEND);
+    if (inject) {
+      console.log('');
+      console.log(INJECT_LEGEND);
+    }
+    // The Processed tier does NOT fold into the verdict/exit code: an UNCONFIRMED
+    // is "possibly busy," not "broken." Exit stays driven by Reachable+Accepted.
+    return meshVerdict(results) === 'DEGRADED' ? 1 : 0;
+  } catch (err) {
+    // Belt-and-braces (macf#830 AC2, "probe error" / "unresolvable registry"):
+    // any throw we didn't anticipate (a rejected listPeers/probe call, a
+    // registry-client construction failure, etc.) still must not leave a
+    // --json consumer with empty stdout. Plain-text mode gets the message on
+    // stderr only, matching every other failure path's behavior above.
+    const failure: FleetDoctorFailure = {
+      code: 'unexpected_error',
+      message: err instanceof Error ? err.message : String(err),
+    };
+    console.error(`macf fleet doctor: ${failure.message}`);
+    if (opts.json) {
+      console.log(JSON.stringify(fleetDoctorFailureToJson(failure), null, 2));
+    }
+    return 1;
   }
-  // The Processed tier does NOT fold into the verdict/exit code: an UNCONFIRMED
-  // is "possibly busy," not "broken." Exit stays driven by Reachable+Accepted.
-  return meshVerdict(results) === 'DEGRADED' ? 1 : 0;
 }

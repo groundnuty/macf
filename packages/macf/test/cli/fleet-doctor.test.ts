@@ -10,12 +10,16 @@
  * stops at tier 1 and never POSTs).
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AgentInfo } from '@groundnuty/macf-core';
 import {
   acceptFailureReason,
   acceptedGlyph,
   buildDoctorRows,
   defaultRunId,
+  fleetDoctorFailureToJson,
   fleetDoctorToJson,
   FLEET_DOCTOR_JSON_SCHEMA_VERSION,
   formatDoctorTable,
@@ -26,6 +30,7 @@ import {
   meshVerdict,
   processedGlyph,
   reachableGlyph,
+  resolveFleetDoctorProjectDir,
   runFleetDoctor,
   runProcessedInject,
   sanitizeMarkerAgent,
@@ -33,6 +38,7 @@ import {
   type DiagnosticAck,
   type FleetDiagnosticFn,
   type FleetDoctorDeps,
+  type FleetDoctorFailure,
   type FleetDoctorResult,
   type FleetInjectConfig,
   type FleetProbeFn,
@@ -556,5 +562,188 @@ describe('runFleetDoctor --inject (injected deps)', () => {
     await runFleetDoctor('/unused', {}, injectDeps(peers, async () => ONLINE, 4100));
     expect(errSpy.mock.calls.flat().join('\n')).not.toMatch(/INVASIVE/);
     expect(logSpy.mock.calls.flat().join('\n')).not.toContain('PROCESSED');
+  });
+});
+
+// --- macf#830: scheduler-safety — cwd-independence + never-empty-stdout-on-failure ---
+
+/** A temp dir that IS a valid MACF project shell (`.macf/macf-agent.json` present). */
+function makeProjectDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'macf-fleet-doctor-test-'));
+  mkdirSync(join(dir, '.macf'), { recursive: true });
+  writeFileSync(join(dir, '.macf', 'macf-agent.json'), '{}\n');
+  return dir;
+}
+
+/** A temp dir that is NOT a MACF project (no `.macf/` at all). */
+function makeNonProjectDir(): string {
+  return mkdtempSync(join(tmpdir(), 'macf-fleet-doctor-test-nonproj-'));
+}
+
+describe('resolveFleetDoctorProjectDir — cwd-independent project resolution (macf#830)', () => {
+  it('explicit --dir resolves regardless of cwd, even when cwd is NOT a project', () => {
+    const projectDir = makeProjectDir();
+    const bogusCwd = makeNonProjectDir();
+    try {
+      const r = resolveFleetDoctorProjectDir(projectDir, bogusCwd);
+      expect(r).toMatchObject({ ok: true, dir: projectDir });
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(bogusCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('explicit --dir pointing at a non-project dir fails with a structured, non-crashing error', () => {
+    const badDir = makeNonProjectDir();
+    try {
+      const r = resolveFleetDoctorProjectDir(badDir, badDir);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.failure.code).toBe('not_a_macf_project');
+        expect(r.failure.message).toContain('Not a MACF project');
+        expect(r.failure.message).toContain(badDir);
+      }
+    } finally {
+      rmSync(badDir, { recursive: true, force: true });
+    }
+  });
+
+  it('no --dir: walks up from cwd exactly like the interactive default (unchanged behavior)', () => {
+    const projectDir = makeProjectDir();
+    const nested = join(projectDir, 'a', 'b', 'c');
+    mkdirSync(nested, { recursive: true });
+    try {
+      const r = resolveFleetDoctorProjectDir(undefined, nested);
+      expect(r).toMatchObject({ ok: true, dir: projectDir });
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it('no --dir + cwd is NOT in a project: structured failure, never throws/exits', () => {
+    const nonProjectCwd = makeNonProjectDir();
+    try {
+      const r = resolveFleetDoctorProjectDir(undefined, nonProjectCwd);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.failure.code).toBe('not_in_macf_project');
+        expect(r.failure.message).toContain('Not in a MACF project');
+        expect(r.failure.message).toContain('--dir');
+      }
+    } finally {
+      rmSync(nonProjectCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('fleetDoctorFailureToJson — the --json failure envelope (macf#830)', () => {
+  it('carries the SAME schema_version as the success shape + the structured error (additive field)', () => {
+    const failure: FleetDoctorFailure = { code: 'not_in_macf_project', message: 'boom' };
+    const json = fleetDoctorFailureToJson(failure) as { schema_version: number; error: FleetDoctorFailure };
+    expect(json.schema_version).toBe(FLEET_DOCTOR_JSON_SCHEMA_VERSION);
+    expect(json.error).toEqual(failure);
+  });
+});
+
+describe('runFleetDoctor — scheduler-safe JSON failures (macf#830)', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  afterEach(() => {
+    logSpy?.mockRestore();
+    errSpy?.mockRestore();
+  });
+
+  it('--json + unresolvable project dir (--dir given, not a project): non-empty JSON {error} on stdout, nonzero exit', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const badDir = makeNonProjectDir();
+    try {
+      const code = await runFleetDoctor(badDir, { json: true });
+      expect(code).not.toBe(0);
+      const printed = logSpy.mock.calls.flat().join('');
+      expect(printed.length).toBeGreaterThan(0); // never empty stdout
+      const parsed = JSON.parse(printed); // must be jq-parseable
+      expect(parsed.schema_version).toBe(FLEET_DOCTOR_JSON_SCHEMA_VERSION);
+      expect(parsed.error.code).toBe('not_a_macf_project');
+      expect(parsed.error.message).toContain('Not a MACF project');
+    } finally {
+      rmSync(badDir, { recursive: true, force: true });
+    }
+  });
+
+  it('--json + no --dir + cwd not a project: non-empty JSON {error} on stdout, nonzero exit', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const nonProjectCwd = makeNonProjectDir();
+    const originalCwd = process.cwd();
+    process.chdir(nonProjectCwd);
+    try {
+      const code = await runFleetDoctor(undefined, { json: true });
+      expect(code).not.toBe(0);
+      const printed = logSpy.mock.calls.flat().join('');
+      expect(printed.length).toBeGreaterThan(0); // the exact cwd-sensitivity bug this issue fixes
+      const parsed = JSON.parse(printed);
+      expect(parsed.schema_version).toBe(FLEET_DOCTOR_JSON_SCHEMA_VERSION);
+      expect(parsed.error.code).toBe('not_in_macf_project');
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(nonProjectCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('the abort message reflected in --json matches the stderr explanation (AC3)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const badDir = makeNonProjectDir();
+    try {
+      await runFleetDoctor(badDir, { json: true });
+      const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
+      const stderrText = errSpy.mock.calls.flat().join('\n');
+      expect(stderrText).toContain(parsed.error.message);
+    } finally {
+      rmSync(badDir, { recursive: true, force: true });
+    }
+  });
+
+  it('plain-text mode (no --json): failure stays stderr-only — stdout unchanged from pre-#830 behavior', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const badDir = makeNonProjectDir();
+    try {
+      const code = await runFleetDoctor(badDir, {});
+      expect(code).not.toBe(0);
+      expect(logSpy).not.toHaveBeenCalled(); // no stdout noise in plain-text mode
+      expect(errSpy.mock.calls.flat().join('\n')).toContain('Not a MACF project');
+    } finally {
+      rmSync(badDir, { recursive: true, force: true });
+    }
+  });
+
+  it('success path from a NON-project cwd via injected deps + explicit --dir threading: valid JSON, exit 0', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const projectDir = makeProjectDir();
+    const nonProjectCwd = makeNonProjectDir();
+    const originalCwd = process.cwd();
+    process.chdir(nonProjectCwd);
+    try {
+      const deps: FleetDoctorDeps = {
+        project: 'macf',
+        listPeers: async () => [{ name: 'CODE_AGENT', info: info('127.0.0.1', 4100) }],
+        probe: async () => ONLINE,
+        diagnose: echoingDiagnostic,
+      };
+      // deps supplied → resolveFleetDoctorProjectDir is bypassed entirely, but this
+      // pins that the command as a whole is safely callable while cwd is a non-project
+      // dir and --dir is threaded through unused — the production (non-deps) path's
+      // cwd-independence is covered directly above via resolveFleetDoctorProjectDir.
+      const code = await runFleetDoctor(projectDir, { json: true }, deps);
+      expect(code).toBe(0);
+      const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
+      expect(parsed.summary.verdict).toBe('HEALTHY');
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(nonProjectCwd, { recursive: true, force: true });
+    }
   });
 });
