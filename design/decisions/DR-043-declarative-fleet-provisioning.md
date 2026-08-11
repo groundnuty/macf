@@ -58,7 +58,8 @@ network:
 
 transport:
   vault_repo: groundnuty/icsoc-2026-science-agent   # where vault.age is committed
-  age_recipient: null             # existing age1… key, or null → mint + hand off
+  age_recipients: []              # existing age1… key(s), or [] → mint + hand off
+                                  # (§D5 multi-recipient: operator key + VM key, macf#852)
 
 defaults:
   role_template: groundnuty/agentic-repo-template

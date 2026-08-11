@@ -23,7 +23,7 @@ function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
     metadata: { name: 'icsoc-2026' },
     owner: { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } },
     network: { advertise_host: 'example.ts.net' },
-    transport: { vault_repo: 'groundnuty/icsoc-2026-science-agent', age_recipient: null },
+    transport: { vault_repo: 'groundnuty/icsoc-2026-science-agent', age_recipients: [] },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents: [
       {

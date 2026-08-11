@@ -47,7 +47,7 @@ network:
   advertise_host: example.ts.net
 transport:
   vault_repo: groundnuty/demo-science
-  age_recipient: age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  age_recipients: [age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
 defaults:
   role_template: groundnuty/agentic-repo-template
   app_manifest: dr-019
@@ -384,7 +384,7 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
   });
 
   it('applyExitCode: 1 when the vault write failed', () => {
-    expect(applyExitCode(resultWith({ vault: { status: 'failed', reason: 'no age_recipient' } }))).toBe(1);
+    expect(applyExitCode(resultWith({ vault: { status: 'failed', reason: 'no age_recipients' } }))).toBe(1);
   });
 
   it('formatApplyResult never includes a credential value', () => {
