@@ -159,8 +159,17 @@ Fix — route the act to a non-auditor identity:
   Leave the auditor's role to the PROPOSAL (the issue / PR / comment) you
   already created.
 
-Override (ONLY for an operator-sanctioned exception):
-  export MACF_SKIP_AUDITOR_ACT_CHECK=1
+Override (ONLY for an operator-sanctioned exception) is launch-time /
+operator only: MACF_SKIP_AUDITOR_ACT_CHECK is read from THIS session's
+process env, fixed when ./claude.sh launched it. An in-session
+\`export MACF_SKIP_AUDITOR_ACT_CHECK=1\` from a Bash tool call does NOT
+reach it — Bash-tool commands run in a separate subshell that never
+persists into the session's env. To use it: set
+MACF_SKIP_AUDITOR_ACT_CHECK=1 in the launch env (or the workspace's
+.claude/.macf/env.* files) BEFORE running ./claude.sh, then relaunch.
+Need the operator-sanctioned exception NOW, mid-session? Don't self-apply
+this flag — the operator performs (or explicitly directs) the specific
+act, with the sanction recorded in the artifact itself.
 
 Refs: groundnuty/macf#499 (this hook); DR-026 §1/§4 (auditor never-acts).
 ERR

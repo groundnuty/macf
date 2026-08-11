@@ -207,6 +207,20 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
       expect(r.status).toBe(2);
       expect(r.stderr).toContain(ISSUE_URL);
     });
+
+    it('override guidance is honest: launch-time/operator + relaunch, not an in-session export fix', () => {
+      // groundnuty/macf#822 Part 1.
+      const r = runHook({
+        command: 'gh issue create --repo groundnuty/macf --title x --body y',
+        output: `Creating issue...\n${ISSUE_URL}\n`,
+        stubGh: { login: 'orzech', type: 'User' },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/launch-time\s*\/\s*operator/);
+      expect(r.stderr).toMatch(/relaunch/);
+      expect(r.stderr).toMatch(/does\s+NOT\s+reach\s+it/);
+      expect(r.stderr).not.toMatch(/^\s*export MACF_SKIP_ATTRIBUTION_CHECK=1\s*$/m);
+    });
   });
 
   describe('(d) author type=Bot (no expected login set) → exit 0', () => {

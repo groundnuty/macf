@@ -117,8 +117,15 @@ again. Since macf#821, claude.sh full-shape-validates GH_TOKEN at the launch
 boundary (before exec) and re-mints or aborts loudly rather than starting a
 session this hook would then deadlock.
 
-Override (ONLY for intentional user-attributed ops like onboarding):
-  export MACF_SKIP_TOKEN_CHECK=1
+Override (ONLY for intentional user-attributed ops like onboarding) is
+launch-time / operator only: MACF_SKIP_TOKEN_CHECK is read from THIS
+session's process env, fixed when ./claude.sh launched it. An in-session
+\`export MACF_SKIP_TOKEN_CHECK=1\` from a Bash tool call does NOT reach
+it — Bash-tool commands run in a separate subshell that never persists
+into the session's env. To use it: set MACF_SKIP_TOKEN_CHECK=1 in the
+launch env (or the workspace's .claude/.macf/env.* files) BEFORE running
+./claude.sh, then relaunch. Need it mid-session? Ask the operator to set
+it + relaunch, or route the specific op through the operator directly.
 ERR
   exit 2
 fi

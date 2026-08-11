@@ -264,8 +264,16 @@ Then the reviewer @mentions you on the originating issue with the LGTM
 state-change as the wake signal.
 
 Override (ONLY for reporter-sanctioned exceptions per pr-discipline.md
-§"When the reviewer is absent or unreachable"):
-  export MACF_SKIP_LGTM_CHECK=1
+§"When the reviewer is absent or unreachable") is launch-time / operator
+only: MACF_SKIP_LGTM_CHECK is read from THIS session's process env, fixed
+when ./claude.sh launched it. An in-session \`export MACF_SKIP_LGTM_CHECK=1\`
+from a Bash tool call does NOT reach it — Bash-tool commands run in a
+separate subshell that never persists into the session's env. To use it:
+set MACF_SKIP_LGTM_CHECK=1 in the launch env (or the workspace's
+.claude/.macf/env.* files) BEFORE running ./claude.sh, then relaunch.
+Need the reporter-sanctioned exception NOW, mid-session? Don't self-apply
+this flag — ask the operator to set it + relaunch, or route the merge
+through the operator directly with the sanction recorded in the artifact.
 
 Refs: groundnuty/macf#270 (this hook); pr-discipline.md (canonical rule);
 DR-023 amendment (bash-form decision rule); macf#262 / PR #263 (rule
