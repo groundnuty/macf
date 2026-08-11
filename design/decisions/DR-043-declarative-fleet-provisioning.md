@@ -216,3 +216,20 @@ Agents already self-report deployed versions into the registry (the DR-037 machi
 **Operational corollary (first-run blast radius):** the first live provision runs **one agent at a time** (single-agent `fleet.yaml`, re-run per agent) — single-App blast radius, any failure recoverable by deleting exactly one thing. Independent of the durability mechanism; correct posture for a pipeline's first-ever touch of real GitHub state.
 
 **References:** #838 (the orchestrator that surfaced it) · #847 (the `age`-failure path this compounds) · §D5 (the invariant tightened) · Design invariant 5.
+
+## Amendment C (2026-08-11, #838 increment 5a) — age-recipient is operator-provided, never tool-minted; §D1 `null` = refuse
+
+**Trigger:** the `apply` orchestrator (#850) surfaced that §D1's `age_recipient: null` → "mint + hand off" is not just unimplemented but **wrong to implement**, and the implementation correctly *refuses* (pre-flight before consent gate 1) instead.
+
+**Ruling — supersedes the §D1 schema comment `age_recipient: null → mint + hand off`:**
+
+The age **private** key decrypts the entire store-of-record vault — the per-project CA key and every agent's App private key (§D5). It is therefore the fleet's **master secret**. §D1's original "mint + hand off" has the *provisioning tool* generate and print that master key. The correct posture — consistent with the vault-custody invariant this project has held throughout (secrets in operator custody; the tool handles public material only) — is **operator-provided**: the operator runs `age-keygen` out-of-band, only the **public recipient** enters `fleet.yaml`, and the private half never touches the provisioning tool.
+
+- **`transport.age_recipient` unconfigured on a CREATE path = hard refuse, BEFORE gate 1 opens.** Opening consent gate 1 with no recipient mints a real GitHub App whose credential provably cannot be persisted — Amendment B's durability hole, with consent already spent. The pre-flight that refuses this is what makes the "hole closed" claim true (`apply-fleet.ts`'s `wouldCreateWithNoRecipient`). `null` therefore means **error-and-refuse**, not auto-mint.
+- **Auto-minting is dropped from the contract**, not deferred as a feature. (If a future convenience path ever mints an age key, it must do so with a loud master-key-custody warning and explicit operator opt-in — but the canonical path is operator-provided.)
+
+**Multi-recipient consequence (honoring Amendment B).** Amendment B requires the vault to be readable by **both** the VM key (so `vault.sh` decrypts at runtime) and the operator key (so a Mac-side reconcile/re-run can read the prior vault — the CA key + macf-routing creds live only there). Two **distinct** recipients cannot be expressed by the singular `transport.age_recipient`. So the field must become a **recipients list** (`transport.age_recipients: [<operator-pub>, <vm-pub>]`) for the reconcile-enabling increment. This does **not** block the first provision — a single recipient the VM can decrypt suffices to write + use the vault once — so 5a and the first live run proceed on a single recipient; the singular→list schema change is tracked for before reconcile is exercised (exact shape confirmed with code-agent on #838). The weaker "one key held in two places" alternative is explicitly not preferred: two distinct keys is the robust store-of-record posture and is what Amendment B intends.
+
+**First-run operational note:** the operator mints the age key out-of-band and sets the recipient to a key the VM holds (option (b) on #850), provisioning one agent at a time.
+
+**References:** #850 (the orchestrator + the refusal) · §D1 (the schema comment superseded) · Amendment B (the multi-recipient requirement this makes the schema honor) · §D5 (the vault as master-secret-bearing store of record).
