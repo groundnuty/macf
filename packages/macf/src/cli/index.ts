@@ -496,18 +496,21 @@ bootstrap
 bootstrap
   .command('apply')
   .description(
-    'Provision the fleet declared in fleet.yaml (DR-043 §D2). CURRENTLY --dry-run ONLY: renders ' +
-    'the read-only plan plus the exact GitHub App manifests that would be submitted at the ' +
-    'operator consent gate — the DR-035 §4 plan-approve-once artifact, shown BEFORE any browser ' +
-    'gate opens. Mutating apply (localhost manifest exchange, install-poll, vault write-through, ' +
-    'fleet.lock, repo-init) is landing incrementally per macf#838; invoking without --dry-run ' +
-    'fails loud rather than exiting 0 having changed nothing.',
+    'Provision the fleet declared in fleet.yaml (DR-043 §D2/§D3/§D5). `--dry-run` renders the ' +
+    'read-only plan plus the exact GitHub App manifests that would be submitted — mutates nothing. ' +
+    'Without `--dry-run`: shows the same plan-approve-once artifact, obtains ONE operator approval ' +
+    '(`--yes` skips the prompt for automation), then drives confirm-before-create -> consent gate 1 ' +
+    '(App-manifest creation) -> consent gate 2 (install) -> repo-init -> the single whole-payload ' +
+    'vault write -> fleet.lock, per agent. Never silently creates a duplicate App (confirm-before-' +
+    'create guard) and never silently overwrites an existing vault (fails loud unless ' +
+    'MACF_BOOTSTRAP_VAULT_VERSION=1).',
   )
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
   .option('--dry-run', 'Render the plan + would-be App manifests; mutate nothing', false)
-  .option('--json', 'Emit the structured dry-run result as JSON', false)
+  .option('--yes', 'Skip the interactive plan-approval prompt (the one non-interactive escape from DR-035 §4 plan-approve-once)', false)
+  .option('--json', 'Emit the structured result as JSON', false)
   .action(async (opts) => {
-    const code = await runBootstrapApply({ file: opts.file, dryRun: opts.dryRun, json: opts.json });
+    const code = await runBootstrapApply({ file: opts.file, dryRun: opts.dryRun, yes: opts.yes, json: opts.json });
     process.exitCode = code;
   });
 

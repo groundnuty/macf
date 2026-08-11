@@ -12,19 +12,23 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   ageEncryptToFile,
+  agentRecoveryArtifactPath,
   buildVaultPlaintext,
+  removeAgentRecoveryArtifact,
   VaultError,
   vaultAgentSecretsForFingerprint,
   vaultFleetSecretsForFingerprint,
+  writeAgentRecoveryArtifact,
   writeVault,
   type VaultAgentSecrets,
   type VaultPayload,
 } from '../../../src/cli/bootstrap/vault-write.js';
+import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 
 function have(cmd: string): boolean {
   return spawnSync('sh', ['-c', `command -v ${cmd}`], { encoding: 'utf-8' }).status === 0;
@@ -282,6 +286,89 @@ describe('writeVault — orchestration (injected deps, no real age)', () => {
   });
 });
 
+describe('agentRecoveryArtifactPath / writeAgentRecoveryArtifact / removeAgentRecoveryArtifact — §D5 durable-before-gate-2', () => {
+  const CREDS: AppCredentials = {
+    appId: '111',
+    name: 'demo-fleet-code-agent',
+    slug: 'demo-fleet-code-agent',
+    clientId: 'Iv1.abc',
+    clientSecret: 'SENTINEL-CLIENT-SECRET',
+    webhookSecret: 'SENTINEL-WEBHOOK-SECRET',
+    pem: '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-PEM\n-----END RSA PRIVATE KEY-----\n',
+  };
+
+  it('agentRecoveryArtifactPath: own path under <secretsDir>/recovery/, distinct from vault.age', () => {
+    expect(agentRecoveryArtifactPath('/fake/secrets', 'code-agent')).toBe('/fake/secrets/recovery/code-agent.age');
+  });
+
+  it('writeAgentRecoveryArtifact throws VaultError(vault_no_age_recipient) with zero recipients — never calls encrypt', async () => {
+    let encryptCalled = false;
+    await expect(
+      writeAgentRecoveryArtifact('code-agent', CREDS, [], '/fake/secrets/recovery/code-agent.age', async () => {
+        encryptCalled = true;
+      }),
+    ).rejects.toThrow(VaultError);
+    expect(encryptCalled).toBe(false);
+  });
+
+  it('writeAgentRecoveryArtifact creates the recovery dir for real, then encrypts a role-scoped plaintext to the exact outPath', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-recovery-artifact-test-'));
+    try {
+      const outPath = join(dir, 'secrets', 'recovery', 'code-agent.age');
+      const calls: { plaintext: string; recipients: readonly string[]; outPath: string }[] = [];
+      await writeAgentRecoveryArtifact('code-agent', CREDS, ['age1operator', 'age1vm'], outPath, async (plaintext, recipients, path) => {
+        calls.push({ plaintext, recipients, outPath: path });
+      });
+      expect(existsSync(join(dir, 'secrets', 'recovery'))).toBe(true); // mkdir -p happened for real
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.outPath).toBe(outPath);
+      expect(calls[0]?.recipients).toEqual(['age1operator', 'age1vm']);
+      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_ID="111"');
+      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_SLUG="demo-fleet-code-agent"');
+      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_CLIENT_SECRET="SENTINEL-CLIENT-SECRET"');
+      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_WEBHOOK_SECRET="SENTINEL-WEBHOOK-SECRET"');
+      // PEM is base64-encoded, never raw, in the plaintext:
+      expect(calls[0]?.plaintext).not.toContain('SENTINEL-PEM');
+      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_PRIVATE_KEY_B64="');
+      // No installId anywhere — gate 2 hasn't happened yet at write time:
+      expect(calls[0]?.plaintext).not.toContain('INSTALL_ID');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a rejected encrypt (e.g. age failure) propagates — no swallowed failure', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-recovery-artifact-test-'));
+    try {
+      const outPath = join(dir, 'secrets', 'recovery', 'code-agent.age');
+      await expect(
+        writeAgentRecoveryArtifact('code-agent', CREDS, ['age1operator'], outPath, async () => {
+          throw new Error('age exited 1: boom');
+        }),
+      ).rejects.toThrow(/age exited 1: boom/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('removeAgentRecoveryArtifact deletes a real file for real', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-recovery-artifact-test-'));
+    try {
+      const outPath = join(dir, 'code-agent.age');
+      writeFileSync(outPath, 'FAKE-CIPHERTEXT');
+      expect(existsSync(outPath)).toBe(true);
+      removeAgentRecoveryArtifact(outPath);
+      expect(existsSync(outPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('removeAgentRecoveryArtifact is a silent no-op (never throws) when the file is already gone', () => {
+    expect(() => removeAgentRecoveryArtifact('/definitely/does/not/exist/code-agent.age')).not.toThrow();
+  });
+});
+
 describe('ageEncryptToFile (real age binary)', () => {
   const dirs: string[] = [];
   afterEach(() => {
@@ -348,4 +435,70 @@ describe('ageEncryptToFile (real age binary)', () => {
       process.env.PATH = savedPath;
     }
   });
+
+  it('spawn-failed leaves no file at outPath (nothing was ever created — unlink is a no-op ENOENT)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-vault-write-test-'));
+    dirs.push(dir);
+    const outPath = join(dir, 'vault.age');
+    const savedPath = process.env.PATH;
+    try {
+      process.env.PATH = '';
+      await expect(ageEncryptToFile('KEY="v"\n', ['age1fake'], outPath)).rejects.toThrow(VaultError);
+    } finally {
+      process.env.PATH = savedPath;
+    }
+    expect(existsSync(outPath)).toBe(false);
+  });
+
+  // macf#847 review nit 1: `age` opens `-o outPath` before draining a large
+  // STDIN, so a SIGKILL-on-timeout partway through leaves a REAL, truncated
+  // file at outPath — verified empirically against the live `age` binary
+  // before writing this test. Without the unlink-on-failure fix, that
+  // truncated file trips `writeVault`'s clobber guard on the NEXT run,
+  // trapping the operator into a manual `rm` to make a failed apply
+  // re-runnable. Uses a short injected `timeoutMs` + a large plaintext so the
+  // kill reliably lands mid-write without waiting out the real 30s budget.
+  it.skipIf(!HAS_AGE)(
+    'timeout (SIGKILL mid-write) leaves NO truncated file behind — unlink-on-failure (macf#847 nit 1)',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-vault-write-test-'));
+      dirs.push(dir);
+      const key = mintAgeKey(dir, 'k.txt');
+      const outPath = join(dir, 'vault.age');
+      // 200MB — large enough that `age` has opened + started writing outPath
+      // well before it can drain STDIN within the 20ms timeout below.
+      const bigPlaintext = 'A'.repeat(200_000_000);
+
+      await expect(ageEncryptToFile(bigPlaintext, [key.publicKey], outPath, 20)).rejects.toThrow(
+        /did not exit within/,
+      );
+
+      expect(existsSync(outPath)).toBe(false);
+    },
+    15_000,
+  );
+
+  it.skipIf(!HAS_AGE)(
+    'a re-run after a timeout-truncated failure succeeds (the clobber guard does not falsely trip on the cleaned-up path)',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-vault-write-test-'));
+      dirs.push(dir);
+      const key = mintAgeKey(dir, 'k.txt');
+      const outPath = join(dir, 'vault.age');
+      const bigPlaintext = 'A'.repeat(200_000_000);
+
+      await expect(ageEncryptToFile(bigPlaintext, [key.publicKey], outPath, 20)).rejects.toThrow();
+      expect(existsSync(outPath)).toBe(false);
+
+      // writeVault's default (allowVersion: false) clobber guard would reject
+      // this if the truncated file had survived — it succeeding is the proof
+      // the cleanup landed.
+      const result = await writeVault('KEY="v"\n', { outPath, recipients: [key.publicKey] });
+      expect(result).toEqual({ path: outPath, versioned: false });
+      const d = spawnSync('age', ['-d', '-i', key.keyPath, outPath], { encoding: 'utf-8' });
+      expect(d.status, d.stderr).toBe(0);
+      expect(d.stdout).toBe('KEY="v"\n');
+    },
+    15_000,
+  );
 });
