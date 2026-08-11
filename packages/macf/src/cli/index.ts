@@ -16,6 +16,7 @@ import { runFleetInstallCronCommand, DEFAULT_SCHEDULE } from './commands/fleet-i
 import { runFleetReconcileCommand } from './commands/fleet-reconcile.js';
 import { runFleetResumeCommand } from './commands/fleet-resume.js';
 import { runFleetUpgrade } from './commands/fleet-upgrade.js';
+import { runBootstrapPlan } from './commands/bootstrap.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { runRestartSelfCommand } from './commands/restart-self.js';
@@ -467,6 +468,27 @@ fleet
       verifyTimeoutSec: opts.verifyTimeout,
       force: opts.force,
     });
+    process.exitCode = code;
+  });
+
+const bootstrap = program
+  .command('bootstrap')
+  .description('Declarative fleet provisioning from a fleet.yaml manifest (DR-043)');
+
+bootstrap
+  .command('plan')
+  .description(
+    'READ-ONLY: parse fleet.yaml, observe current GitHub-side state (best-effort — no App ' +
+    'JWT exists yet, so App/install existence is read from fleet.lock only), and render the ' +
+    '3-verb reconcile plan (create / confirm-then-update / report-extra — NEVER delete, ' +
+    'DR-043 §D3). Manifest sections not yet reconciled in v1 (collaborators, versions ' +
+    'steering) are surfaced as an explicit SKIPPED line, never a silent no-op. No apply, ' +
+    'no mutation, no browser.',
+  )
+  .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
+  .option('--json', 'Emit the structured plan as JSON', false)
+  .action(async (opts) => {
+    const code = await runBootstrapPlan({ file: opts.file, json: opts.json });
     process.exitCode = code;
   });
 
