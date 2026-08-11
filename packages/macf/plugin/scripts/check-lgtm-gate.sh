@@ -269,7 +269,19 @@ if [[ -n "$OPERATOR_LOGIN" ]]; then
   NORM_OPERATOR="${OPERATOR_LOGIN#app/}"
   NORM_OPERATOR="${NORM_OPERATOR%\[bot\]}"
 
-  if [[ -n "$NORM_OPERATOR" ]]; then
+  # The operator login must ALSO differ from the PR author — mirrors the
+  # non-author condition the review path enforces (groundnuty/macf#822
+  # review). `operator_login` lives in agent-writable macf-agent.json →
+  # env.identity → MACF_OPERATOR_LOGIN, and restart-self is agent-invocable,
+  # so WITHOUT this an agent could set operator_login to its OWN login,
+  # relaunch, post `[macf-sanction-merge]` on its OWN PR, and clear its own
+  # gate — the exact self-attestation (c) exists to eliminate. This kills
+  # the self-sanction shape; poisoning the config toward ANOTHER agent's
+  # login still requires THAT agent to post the marker (cross-agent
+  # collusion, genuinely beyond threat model). Config integrity is this
+  # trust anchor's root assumption; the cleared login is logged below for
+  # the auditor's gate-bypass sweep.
+  if [[ -n "$NORM_OPERATOR" ]] && [[ "$NORM_OPERATOR" != "$PR_AUTHOR" ]]; then
     # Count comments where: (a) the body contains the exact marker
     # `[macf-sanction-merge]` (case-insensitive), AND (b) the comment's
     # author, normalized, equals the configured operator login. Both

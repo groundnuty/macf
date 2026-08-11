@@ -508,6 +508,30 @@ describe('check-lgtm-gate.sh (hook)', () => {
       expect(r.stderr).toMatch(/BLOCKED/);
     });
 
+    it('self-sanction guard: operator login == PR author + marker does NOT clear the gate', () => {
+      // groundnuty/macf#822 review catch: `operator_login` lives in
+      // agent-writable macf-agent.json, so an agent could poison it to its
+      // OWN login (+ restart-self) and self-sanction. The operator!=author
+      // guard (mirroring the review path's non-author condition) blocks that
+      // shape: here MACF_OPERATOR_LOGIN and the PR author are the same login,
+      // and the author posts the marker on its own PR — must still BLOCK.
+      const r = runHook({
+        command: 'gh pr merge 803 --repo owner/repo --squash',
+        env: { MACF_OPERATOR_LOGIN: 'macf-code-agent' },
+        stubGh: {
+          '803': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [],
+            comments: [
+              { authorLogin: 'app/macf-code-agent', body: '[macf-sanction-merge]' },
+            ],
+          },
+        },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/BLOCKED/);
+    });
+
     it('an operator-login comment WITHOUT the marker does NOT clear the gate', () => {
       const r = runHook({
         command: 'gh pr merge 802 --repo owner/repo --squash',
