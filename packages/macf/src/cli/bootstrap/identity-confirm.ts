@@ -179,6 +179,20 @@ export function parseAppInstallations(json: unknown): ConfirmedInstall[] {
  * Amendment-A §A2 lock-vs-live drift check needs: the caller compares a
  * `confirmed` install's ids against `fleet.lock` itself; this function's
  * only job is not to hand back the wrong install in the first place.
+ *
+ * **`expected` given but carrying ZERO discriminating criteria (`{}`, both
+ * fields `undefined`) is deliberately treated like "nothing matched," NOT
+ * like "no `ExpectedIdentity` at all" (macf#846 review 3c).** The two are
+ * different callers: `expected === undefined` is `confirmAppInstallation`'s
+ * legitimate no-prior-identity case (a brand-new App's very first poll —
+ * kept optional there on purpose). `expected: {}` is a caller who DID pass
+ * an `ExpectedIdentity` object but it carries no actual criteria — treating
+ * that the same as "trust the first entry" would silently reinstate the
+ * exact false-consent hole `ExpectedIdentity` exists to close (an unrelated
+ * stale install would satisfy a criterion-less filter vacuously). Failing
+ * closed here is the pure-layer half of that defense; `waitForAppInstallation`
+ * additionally rejects an all-undefined `expected` at entry, before any poll
+ * — see its doc for why both levels are needed.
  */
 export function selectConfirmedInstall(
   installs: readonly ConfirmedInstall[],
@@ -186,6 +200,7 @@ export function selectConfirmedInstall(
 ): ConfirmedInstall | undefined {
   if (installs.length === 0) return undefined;
   if (expected === undefined) return installs[0];
+  if (expected.appSlug === undefined && expected.accountLogin === undefined) return undefined;
   return installs.find(
     (i) =>
       (expected.appSlug === undefined || i.appSlug === expected.appSlug) &&
@@ -304,16 +319,22 @@ export interface WaitForAppInstallationOptions {
   readonly keyPath: string;
   /**
    * Disambiguates among multiple installs — see {@link selectConfirmedInstall}.
-   * **Gate-2 callers SHOULD pass this** (e.g. the fleet owner's
-   * `accountLogin`): if omitted and a stale/unrelated install already exists
-   * for this App (a leftover test install, a prior fleet's misconfiguration),
-   * the very FIRST poll resolves `confirmed` immediately on that unrelated
-   * install — reporting a consent the operator never gave, for an install
-   * they never clicked. Omitting `expected` is only safe when the caller has
-   * independently confirmed zero prior installs exist (e.g. right after this
-   * App was just created by gate 1, at a brand-new App's very first poll).
+   * **REQUIRED (macf#846 review 3a — was optional through Slice 2b increment
+   * 3).** If this could be omitted and a stale/unrelated install already
+   * exists for this App (a leftover test install, a prior fleet's
+   * misconfiguration), the very FIRST poll would resolve `confirmed`
+   * immediately on that unrelated install — reporting a consent the operator
+   * never gave, for an install they never clicked. Quoting the review:
+   * "that's a false consent, not just a false diagnostic." A type-level MUST
+   * so a future caller cannot quietly skip it. (`confirmAppInstallation`
+   * itself, one layer down, KEEPS `expected` optional — its brand-new-App
+   * very first poll legitimately has no prior identity to check against;
+   * this function is the poll LOOP built on top of it, which always has a
+   * fleet-owner account to check against by the time it's invoked.) Must
+   * carry at least one of `appSlug`/`accountLogin` — an all-`undefined`
+   * `{}` is rejected at entry, see {@link waitForAppInstallation}'s doc.
    */
-  readonly expected?: ExpectedIdentity;
+  readonly expected: ExpectedIdentity;
   /** Overall budget. Default 10 min — matches gate 1's `startManifestFlow`. */
   readonly timeoutMs?: number;
   /** Delay between polls. Default 3s — frequent enough to feel live, far from busy-spin. */
@@ -323,6 +344,16 @@ export interface WaitForAppInstallationOptions {
    * the real {@link confirmAppInstallation}.
    */
   readonly confirm?: (appId: string, keyPath: string, expected?: ExpectedIdentity) => Promise<IdentityConfirmation>;
+  /**
+   * Fired ONCE — the first time a poll observes `installed-unexpected-target`
+   * (macf#846 review nit b). A wrong-account install won't fix itself by
+   * waiting, so silently polling the full timeout budget before saying
+   * anything is poor UX; this lets a caller surface it immediately while the
+   * loop keeps polling (in case the operator also completes the CORRECT
+   * install without cancelling). Never hard-codes `console` — callers decide
+   * where the warning goes. Default: no-op.
+   */
+  readonly onUnexpectedTarget?: (installs: readonly ConfirmedInstall[]) => void;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -389,17 +420,44 @@ export function waitForInstallTimeoutMessage(timeoutMs: number, last: IdentityCo
  * (§ module doc A4), so the only way this function throws is the overall
  * timeout — a loud, actionable error (via {@link waitForInstallTimeoutMessage}),
  * because a silent hang here would be indistinguishable from "still working."
+ *
+ * **Entry-time guard, not just a type (macf#846 review 3c):** an
+ * `opts.expected` carrying ZERO discriminating criteria (`{}`) is rejected
+ * IMMEDIATELY, before the first poll — not left to `selectConfirmedInstall`'s
+ * pure-layer "no match" behavior alone. Without this, a `{}` polling a
+ * CORRECTLY-installed App would run the full timeout budget and then throw
+ * `waitForInstallTimeoutMessage`'s `installed-unexpected-target` message —
+ * which names the WRONG cause (the install is fine; the caller's own
+ * `expected` was vacuous) and is exactly the "a diagnostic that names the
+ * wrong cause is a small lie" hazard `waitForInstallTimeoutMessage`'s own doc
+ * warns about. Failing at entry means the actual bug (a caller-constructed
+ * `{}`) is reported as itself, not disguised as an installation problem.
  */
 export async function waitForAppInstallation(opts: WaitForAppInstallationOptions): Promise<ConfirmedInstall> {
+  if (opts.expected.appSlug === undefined && opts.expected.accountLogin === undefined) {
+    throw new Error(
+      'waitForAppInstallation: `expected` must carry at least one of appSlug/accountLogin. An empty ' +
+        'ExpectedIdentity ({}) would otherwise let the FIRST poll silently trust whatever install GitHub ' +
+        'returns first — the exact false-consent hazard `expected` exists to prevent (macf#846 review 3a/3c). ' +
+        "Supply the fleet owner's accountLogin at minimum.",
+    );
+  }
+
   const timeoutMs = opts.timeoutMs ?? 10 * 60 * 1000;
   const pollIntervalMs = opts.pollIntervalMs ?? 3_000;
   const confirm = opts.confirm ?? confirmAppInstallation;
   const deadline = Date.now() + timeoutMs;
+  let warnedUnexpectedTarget = false;
 
   let last: IdentityConfirmation;
   for (;;) {
     last = await confirm(opts.appId, opts.keyPath, opts.expected);
     if (last.status === 'confirmed') return last.install;
+
+    if (last.status === 'installed-unexpected-target' && !warnedUnexpectedTarget) {
+      warnedUnexpectedTarget = true;
+      opts.onUnexpectedTarget?.(last.installs);
+    }
 
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
