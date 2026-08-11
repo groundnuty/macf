@@ -132,6 +132,27 @@ describe('buildVaultPlaintext', () => {
     const withQuote: VaultAgentSecrets = { ...AGENT, pem: 'contains "quotes" and $vars and `backticks`' };
     expect(() => buildVaultPlaintext({ agents: [withQuote] })).not.toThrow();
   });
+
+  it('an EMPTY appHandle is rejected rather than silently emitting a well-formed-but-wrong ' +
+    'MACF_AGENT__APP_ID (double-underscore) key vault.sh could never map back to a real key file', () => {
+    try {
+      buildVaultPlaintext({ agents: [{ ...AGENT, appHandle: '' }] });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VaultError);
+      expect((e as VaultError).code).toBe('vault_empty_segment_source');
+    }
+  });
+
+  it('an EMPTY ca.project is likewise rejected (same silently-wrong-segment hazard)', () => {
+    try {
+      buildVaultPlaintext({ agents: [], ca: { project: '', caKeyPem: 'k', caCertPem: 'c' } });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VaultError);
+      expect((e as VaultError).code).toBe('vault_empty_segment_source');
+    }
+  });
 });
 
 describe('vaultAgentSecretsForFingerprint / vaultFleetSecretsForFingerprint', () => {

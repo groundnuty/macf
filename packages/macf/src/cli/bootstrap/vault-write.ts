@@ -94,7 +94,20 @@ function toBase64(raw: string): string {
   return Buffer.from(raw, 'utf-8').toString('base64');
 }
 
-/** The emitted `KEY` itself must be a valid shell identifier — `eval` sources it as an assignment target. */
+/**
+ * The emitted `KEY` itself must be a valid shell identifier — `eval` sources
+ * it as an assignment target. Defense-in-depth, not a fix for a reachable
+ * bug: every `appHandle`/`project` this module is actually called with
+ * originates from `fleet-manifest.ts`'s schema-validated `metadata.name`
+ * (`FLEET_NAME_RE`) + `role` (`ROLE_CHARSET_RE`) charsets — both restricted
+ * to `[a-z0-9-]`, so `toVariableSegment` can only ever produce `[A-Z0-9_]`,
+ * and every emitted key additionally carries a static alphabetic prefix
+ * (`MACF_AGENT_`, `MACF_`, `ROUTING_CLIENT_`, `TS_OAUTH_`) that keeps the
+ * result identifier-shaped even for a segment starting with a digit. This
+ * guard exists for a caller that hand-constructs a `VaultAgentSecrets`
+ * bypassing that schema (e.g. a test, or a future caller with a different
+ * source of truth) — not because the schema-validated path can trip it.
+ */
 function assertValidShellIdentifier(key: string): void {
   if (!SHELL_IDENTIFIER_RE.test(key)) {
     throw new VaultError(
@@ -129,16 +142,34 @@ function emitLine(lines: string[], key: string, value: string): void {
 }
 
 /**
+ * `toVariableSegment('')` is `''` — a segment source that is present but
+ * EMPTY does not fail `assertValidShellIdentifier` (the surrounding
+ * `MACF_AGENT_`/`MACF_` prefix alone is a valid identifier: `MACF_AGENT__APP_ID`
+ * parses fine), so an empty `appHandle`/`project` would otherwise write a
+ * silently-WRONG-but-well-formed vault entry that `vault.sh` can never map
+ * back to a real key file — a silent-fallback shape, not a loud one. Guard
+ * the segment SOURCE directly, before it is even turned into a segment.
+ */
+function assertNonEmptySegmentSource(fieldName: string, value: string): void {
+  if (value.trim().length === 0) {
+    throw new VaultError('vault_empty_segment_source', `${fieldName}: refusing to write a vault entry keyed on an empty value.`);
+  }
+}
+
+/**
  * Assemble the vault PLAINTEXT (shell-sourceable env-file text, matching
  * `templates/vault.template.txt`'s shape exactly) from typed credentials.
  * Pure — no I/O, no clock, no randomness. Throws {@link VaultError} on an
- * empty payload, an empty/unsafe raw value, or an invalid emitted key name
- * — never silently produces a truncated or corrupt vault body.
+ * empty payload, an empty/unsafe raw value, an invalid emitted key name, or
+ * an empty `appHandle`/`project` (which would otherwise segment-derive to a
+ * silently-wrong key) — never silently produces a truncated or corrupt
+ * vault body.
  */
 export function buildVaultPlaintext(payload: VaultPayload): string {
   const lines: string[] = [];
 
   for (const agent of payload.agents) {
+    assertNonEmptySegmentSource('agent.appHandle', agent.appHandle);
     const seg = toVariableSegment(agent.appHandle);
     emitLine(lines, `MACF_AGENT_${seg}_APP_ID`, agent.appId);
     emitLine(lines, `MACF_AGENT_${seg}_INSTALL_ID`, agent.installId);
@@ -158,6 +189,7 @@ export function buildVaultPlaintext(payload: VaultPayload): string {
   }
 
   if (payload.ca !== undefined) {
+    assertNonEmptySegmentSource('ca.project', payload.ca.project);
     const proj = toVariableSegment(payload.ca.project);
     emitLine(lines, `MACF_${proj}_CA_KEY_B64`, toBase64(payload.ca.caKeyPem));
     emitLine(lines, `MACF_${proj}_CA_CERT_B64`, toBase64(payload.ca.caCertPem));
