@@ -109,7 +109,7 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
     expect(parsed.error.code).toBe('apply_not_implemented');
   });
 
-  it('--dry-run renders the plan + would-be App manifests and mutates nothing', async () => {
+  it('--dry-run renders the plan + would-be App manifests + consent gate 2 URL, and mutates nothing', async () => {
     const file = writeManifest();
     const code = await runBootstrapApply(
       { file, dryRun: true },
@@ -120,10 +120,13 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
     expect(out).toMatch(/demo-fleet-code-agent/);
     expect(out).toMatch(/demo-fleet-science-agent/);
     expect(out).toMatch(/actions_variables:write/);
+    expect(out).toMatch(/consent gate 2/);
+    expect(out).toMatch(/https:\/\/github\.com\/apps\/demo-fleet-code-agent\/installations\/new/);
+    expect(out).toMatch(/https:\/\/github\.com\/apps\/demo-fleet-science-agent\/installations\/new/);
     expect(out).toMatch(/DRY RUN — nothing was created/);
   });
 
-  it('--dry-run --json carries dry_run + planned_app_creations', async () => {
+  it('--dry-run --json carries dry_run + planned_app_creations (incl. installUrl)', async () => {
     const file = writeManifest();
     const code = await runBootstrapApply(
       { file, dryRun: true, json: true },
@@ -132,12 +135,16 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
     expect(code).toBe(0);
     const parsed = JSON.parse(logs.join('\n')) as {
       dry_run: boolean;
-      planned_app_creations: { role: string; manifest: { name: string } }[];
+      planned_app_creations: { role: string; manifest: { name: string }; installUrl: string }[];
     };
     expect(parsed.dry_run).toBe(true);
     expect(parsed.planned_app_creations.map((c) => c.manifest.name)).toEqual([
       'demo-fleet-code-agent',
       'demo-fleet-science-agent',
+    ]);
+    expect(parsed.planned_app_creations.map((c) => c.installUrl)).toEqual([
+      'https://github.com/apps/demo-fleet-code-agent/installations/new',
+      'https://github.com/apps/demo-fleet-science-agent/installations/new',
     ]);
   });
 
@@ -169,6 +176,18 @@ describe('plannedAppCreations (pure)', () => {
     const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
     expect(creations.map((c) => c.role)).toEqual(['code-agent', 'science-agent']);
     expect(creations[0]?.manifest.redirect_url).toBe(DRY_RUN_REDIRECT_PLACEHOLDER);
+  });
+
+  it('pairs each creation with its consent-gate-2 install URL, derived from the SAME handle as the manifest name', () => {
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
+    expect(creations.map((c) => c.installUrl)).toEqual([
+      'https://github.com/apps/demo-fleet-code-agent/installations/new',
+      'https://github.com/apps/demo-fleet-science-agent/installations/new',
+    ]);
+    for (const c of creations) {
+      expect(c.installUrl).toBe(`https://github.com/apps/${c.manifest.name}/installations/new`);
+    }
   });
 
   it('EXCLUDES an agent whose App is already present (no re-create)', () => {

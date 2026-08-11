@@ -7,13 +7,22 @@
  * Mutation (the localhost manifest exchange, install-poll, vault write-through,
  * `fleet.lock`, repo-init) lands in the following increments.
  *
+ * **Increment 3** additionally renders consent gate 2 (§D2 point 2, the App
+ * install click) for each would-be App creation — the install-page URL the
+ * operator would open, from `identity-confirm.ts::appInstallationUrl`. This
+ * keeps the dry-run render a complete preview of BOTH consent gates before
+ * either one opens a browser tab, even though this increment still only
+ * *renders* the URL — the poll that would actually confirm the operator
+ * clicked (`waitForAppInstallation`) is wired in once mutating `apply` lands.
+ *
  * A non-`--dry-run` invocation FAILS LOUD rather than silently doing nothing —
  * "ran and changed nothing" while reporting success is the silent-fallback
  * shape this codebase exists to avoid.
  *
  * The dry-run render is also the DR-035 §4 **plan-approve-once** artifact: the
  * operator sees the full blast radius (which Apps, which permissions, which
- * repos) in one place BEFORE any browser consent gate opens.
+ * repos, which consent clicks) in one place BEFORE any browser consent gate
+ * opens.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
@@ -24,6 +33,7 @@ import { computePlan, fleetPlanFailureToJson, fleetPlanToJson, formatPlanText } 
 import { githubRegistryObserver } from '../bootstrap/observer.js';
 import type { GitHubAppManifest } from '../bootstrap/app-manifest.js';
 import { buildAppManifest, repoHomepageUrl } from '../bootstrap/app-manifest.js';
+import { appInstallationUrl } from '../bootstrap/identity-confirm.js';
 
 /**
  * The redirect URL shown in a dry-run. The REAL one carries the ephemeral
@@ -47,13 +57,24 @@ export interface PlannedAppCreation {
   readonly role: string;
   readonly repo: string;
   readonly manifest: GitHubAppManifest;
+  /**
+   * Consent gate 2 (§D2 point 2) — the install-page URL the operator would
+   * open, once this App exists. PREDICTED from `deriveAppHandle` (this App
+   * doesn't exist yet at dry-run time, so there is no real GitHub-assigned
+   * slug to read). GitHub slugifies the submitted manifest `name` and may
+   * append a disambiguating suffix on a global collision — a future
+   * increment that opens this URL for real (post gate-1 exchange) MUST use
+   * the exchange's returned `AppCredentials.slug` (`manifest-exchange.ts`),
+   * not re-derive it, or the link could 404 on a slug collision.
+   */
+  readonly installUrl: string;
 }
 
 /**
  * Which agents would get an App created, given a computed plan. Pure. An agent
  * whose `app` item is `noop` is NOT re-created — the confirm-before-create
- * guard (increment 3, reusing `confirmAppInstallation`) additionally re-checks
- * live before any create actually fires.
+ * guard (a later increment, reusing `confirmAppInstallation`) additionally
+ * re-checks live before any create actually fires.
  */
 export function plannedAppCreations(
   manifest: FleetManifest,
@@ -70,15 +91,21 @@ export function plannedAppCreations(
     // target shape ever grows a suffix (macf#842 review nit).
     const target = `agent:${agent.role}:app:${deriveAppHandle(manifest.metadata.name, agent.role)}`;
     if (!creating.has(target)) continue;
+    const appManifest = buildAppManifest({
+      fleetName: manifest.metadata.name,
+      role: agent.role,
+      redirectUrl,
+      homepageUrl: repoHomepageUrl(agent.repo),
+    });
     out.push({
       role: agent.role,
       repo: agent.repo,
-      manifest: buildAppManifest({
-        fleetName: manifest.metadata.name,
-        role: agent.role,
-        redirectUrl,
-        homepageUrl: repoHomepageUrl(agent.repo),
-      }),
+      manifest: appManifest,
+      // `appManifest.name` IS `deriveAppHandle(...)` — a PREDICTION of the
+      // real slug GitHub assigns at creation (see `PlannedAppCreation.installUrl`
+      // doc for the collision-suffix caveat), the best available preview
+      // before this App exists to have a real one.
+      installUrl: appInstallationUrl(appManifest.name),
     });
   }
   return out;
@@ -101,6 +128,7 @@ export function formatPlannedAppCreations(creations: readonly PlannedAppCreation
     parts.push(`      permissions (DR-019): ${perms}`);
     parts.push(`      events: ${c.manifest.default_events.join(', ')}`);
     parts.push(`      public: ${String(c.manifest.public)}   webhook active: ${String(c.manifest.hook_attributes.active)}`);
+    parts.push(`      consent gate 2 (install, after gate 1 creates the App): ${c.installUrl}`);
   }
   return parts.join('\n');
 }
