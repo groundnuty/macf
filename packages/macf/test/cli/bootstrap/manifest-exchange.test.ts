@@ -21,6 +21,7 @@ import {
   startManifestFlow,
 } from '../../../src/cli/bootstrap/manifest-flow-server.js';
 import { buildAppManifest } from '../../../src/cli/bootstrap/app-manifest.js';
+import type { GitHubAppManifest } from '../../../src/cli/bootstrap/app-manifest.js';
 
 const FULL = {
   id: 3378862,
@@ -109,10 +110,34 @@ describe('manifest-flow-server (pure parts)', () => {
   });
 });
 
+/**
+ * Inverse of `escapeHtmlAttribute`, for pulling the manifest JSON back out of
+ * the served form's `value="..."` attribute in tests. The specific 4 entities
+ * decode BEFORE `&amp;` (the last thing `escapeHtmlAttribute` produces), the
+ * mirror of the encode order (`&` escaped first, so it can't double-encode the
+ * others) — standard HTML-attribute-unescape ordering.
+ */
+function unescapeHtmlAttribute(s: string): string {
+  return s
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+/** Fetches `flow.startUrl` and extracts+parses the served `manifest` field. */
+async function fetchServedManifest(startUrl: string): Promise<GitHubAppManifest> {
+  const html = await (await fetch(startUrl)).text();
+  const match = html.match(/name="manifest" value="([^"]*)"/);
+  if (!match) throw new Error('served form is missing the manifest field');
+  return JSON.parse(unescapeHtmlAttribute(match[1])) as GitHubAppManifest;
+}
+
 describe('startManifestFlow (live loopback server)', () => {
   it('binds 127.0.0.1, serves the form, and resolves the code from /callback', async () => {
     const flow = await startManifestFlow({
-      manifest: buildAppManifest({ fleetName: 'demo', role: 'code-agent', redirectUrl: 'http://placeholder/callback' }),
+      buildManifest: (redirectUrl) => buildAppManifest({ fleetName: 'demo', role: 'code-agent', redirectUrl }),
       formAction: 'https://github.com/settings/apps/new',
     });
     try {
@@ -134,7 +159,7 @@ describe('startManifestFlow (live loopback server)', () => {
 
   it('rejects when GitHub redirects back without a code', async () => {
     const flow = await startManifestFlow({
-      manifest: buildAppManifest({ fleetName: 'demo', role: 'code-agent', redirectUrl: 'http://placeholder/callback' }),
+      buildManifest: (redirectUrl) => buildAppManifest({ fleetName: 'demo', role: 'code-agent', redirectUrl }),
       formAction: 'https://github.com/settings/apps/new',
     });
     try {
@@ -149,10 +174,30 @@ describe('startManifestFlow (live loopback server)', () => {
 
   it('close() is idempotent', async () => {
     const flow = await startManifestFlow({
-      manifest: buildAppManifest({ fleetName: 'demo', role: 'code-agent', redirectUrl: 'http://placeholder/callback' }),
+      buildManifest: (redirectUrl) => buildAppManifest({ fleetName: 'demo', role: 'code-agent', redirectUrl }),
       formAction: 'https://github.com/settings/apps/new',
     });
     await flow.close();
     await expect(flow.close()).resolves.toBeUndefined();
+  });
+
+  // Regression test for macf#843: the round-trip test above fetches
+  // `flow.redirectUrl` directly, bypassing the manifest → GitHub → redirect
+  // hop that actually carries `redirect_url` in production. GitHub echoes the
+  // code to the `redirect_url` DECLARED INSIDE THE SUBMITTED MANIFEST, not to
+  // wherever the form was served from — so this asserts the served manifest's
+  // own `redirect_url` field, parsed back out of the form HTML exactly as
+  // GitHub would see it, matches the listener's real callback URL.
+  it('serves a manifest whose redirect_url equals the listener callback URL (macf#843)', async () => {
+    const flow = await startManifestFlow({
+      buildManifest: (redirectUrl) => buildAppManifest({ fleetName: 'demo', role: 'code-agent', redirectUrl }),
+      formAction: 'https://github.com/settings/apps/new',
+    });
+    try {
+      const served = await fetchServedManifest(flow.startUrl);
+      expect(served.redirect_url).toBe(flow.redirectUrl);
+    } finally {
+      await flow.close();
+    }
   });
 });

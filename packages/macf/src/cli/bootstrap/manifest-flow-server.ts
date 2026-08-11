@@ -80,7 +80,19 @@ export interface ManifestFlowHandles {
 }
 
 export interface StartManifestFlowOptions {
-  readonly manifest: GitHubAppManifest;
+  /**
+   * Builds the manifest to serve, given the listener's OWN callback URL.
+   * Called only after binding — the port (and therefore `redirectUrl`) isn't
+   * known before then. This is what makes "the `redirect_url` embedded in the
+   * served manifest" and "the URL GitHub will actually redirect the code to"
+   * the same value BY CONSTRUCTION, rather than by caller discipline: GitHub
+   * echoes the one-shot `code` to the `redirect_url` field declared INSIDE the
+   * submitted manifest, not to wherever the form happened to be served from
+   * (groundnuty/macf#843 — a pre-built manifest with a placeholder/stale
+   * `redirect_url` serves fine but the callback never arrives, and
+   * `waitForCode()` silently times out after 10 minutes).
+   */
+  readonly buildManifest: (redirectUrl: string) => GitHubAppManifest;
   readonly formAction: string;
   /** How long to wait for the operator's click before giving up. Default 10 min. */
   readonly timeoutMs?: number;
@@ -89,12 +101,12 @@ export interface StartManifestFlowOptions {
 /**
  * Start the single-shot manifest-flow listener on an ephemeral 127.0.0.1 port.
  *
- * The caller must build the manifest with `redirect_url` equal to the returned
- * `redirectUrl` — GitHub echoes the code to exactly the URL the manifest
- * declared. Because the port is only known after binding, the typical sequence
- * is: start the server, read `redirectUrl`, rebuild the manifest with it, then
- * open `startUrl`. `startManifestFlow` handles this by taking the manifest
- * *after* binding via the returned handles being constructed post-listen.
+ * Binds FIRST, then calls `opts.buildManifest(redirectUrl)` with the
+ * now-known callback URL, and serves exactly that manifest for the lifetime of
+ * this listener — so the manifest GitHub receives and the callback URL this
+ * server listens on can never diverge. `redirectUrl` is also returned on the
+ * handles for callers/tests that want to assert the two match without
+ * re-deriving the URL themselves.
  */
 export async function startManifestFlow(opts: StartManifestFlowOptions): Promise<ManifestFlowHandles> {
   let resolveCode: (code: string) => void;
@@ -114,19 +126,9 @@ export async function startManifestFlow(opts: StartManifestFlowOptions): Promise
     /* swallowed on purpose — see comment above; waitForCode() re-surfaces it */
   });
 
-  const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-    if (url.pathname === '/callback') {
-      const code = url.searchParams.get('code');
-      res.writeHead(code ? 200 : 400, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(renderCallbackPage(opts.manifest.name, Boolean(code)));
-      if (code) resolveCode(code);
-      else rejectCode(new Error('GitHub redirected to the callback without a `code` parameter.'));
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderManifestForm(opts.manifest, opts.formAction));
-  });
+  // No request listener yet — the handler below needs the manifest, which in
+  // turn needs `redirectUrl`, which only exists after `listen()` resolves.
+  const server: Server = createServer();
 
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -136,6 +138,28 @@ export async function startManifestFlow(opts: StartManifestFlowOptions): Promise
 
   const { port } = server.address() as AddressInfo;
   const base = `http://127.0.0.1:${String(port)}`;
+  const redirectUrl = `${base}/callback`;
+
+  // Build the REAL manifest now — `redirectUrl` is the listener's own
+  // callback URL, not a placeholder chosen before the port existed (#843).
+  const manifest = opts.buildManifest(redirectUrl);
+
+  // Attached synchronously, in the same tick as `listen()` resolving — no
+  // request can reach the server before this fires (nothing outside this
+  // function has the URL yet), so `manifest` is never read uninitialized.
+  server.on('request', (req: IncomingMessage, res: ServerResponse) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    if (url.pathname === '/callback') {
+      const code = url.searchParams.get('code');
+      res.writeHead(code ? 200 : 400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderCallbackPage(manifest.name, Boolean(code)));
+      if (code) resolveCode(code);
+      else rejectCode(new Error('GitHub redirected to the callback without a `code` parameter.'));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderManifestForm(manifest, opts.formAction));
+  });
 
   let closed = false;
   const close = async (): Promise<void> => {
@@ -148,7 +172,7 @@ export async function startManifestFlow(opts: StartManifestFlowOptions): Promise
 
   return {
     startUrl: `${base}/`,
-    redirectUrl: `${base}/callback`,
+    redirectUrl,
     waitForCode: () => {
       const timer = setTimeout(() => {
         rejectCode(
