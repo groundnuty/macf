@@ -18,7 +18,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
-import { parseFleetManifest } from '../bootstrap/fleet-manifest.js';
+import { deriveAppHandle, parseFleetManifest } from '../bootstrap/fleet-manifest.js';
 import type { FleetObserverFn, FleetPlan, FleetPlanFailure } from '../bootstrap/plan.js';
 import { computePlan, fleetPlanFailureToJson, fleetPlanToJson, formatPlanText } from '../bootstrap/plan.js';
 import { githubRegistryObserver } from '../bootstrap/observer.js';
@@ -65,9 +65,11 @@ export function plannedAppCreations(
   );
   const out: PlannedAppCreation[] = [];
   for (const agent of manifest.agents) {
-    // `appItem`'s target shape: agent:<role>:app:<handle>
-    const match = [...creating].some((t) => t.startsWith(`agent:${agent.role}:app:`));
-    if (!match) continue;
+    // Reconstruct `appItem`'s EXACT target (`agent:<role>:app:<handle>`) rather
+    // than prefix-scanning: O(1), states the intent, and cannot rot if the
+    // target shape ever grows a suffix (macf#842 review nit).
+    const target = `agent:${agent.role}:app:${deriveAppHandle(manifest.metadata.name, agent.role)}`;
+    if (!creating.has(target)) continue;
     out.push({
       role: agent.role,
       repo: agent.repo,
