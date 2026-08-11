@@ -127,8 +127,27 @@ function computeSkippedSections(manifest: FleetManifest): readonly SkippedSectio
   return out;
 }
 
+/**
+ * Why a given resource kind can read `unknown`. Per-kind because the causes are
+ * genuinely different, and a diagnostic that names the wrong cause is a small
+ * lie compounding with every run (macf#842 review): the identity plane is
+ * unknown for want of an App JWT (DR-043 Amendment A), whereas a repo or
+ * variable read is unknown because the read itself failed (auth / network /
+ * insufficient scope) — nothing to do with JWTs.
+ */
+export const UNKNOWN_REASONS = {
+  identity:
+    'not confirmable at plan time (no App JWT — the PEM lives in the vault; ' +
+    'a vault-aware confirm runs during apply, DR-043 Amendment A)',
+  repo: 'could not be read (auth / network / insufficient scope) — existence unconfirmed',
+  variable: 'could not be read (auth / network / insufficient scope) — existence unconfirmed',
+} as const;
+
 /** Presence → {verb, reason-suffix} for a pure existence-only resource (App / repo / install / CA). */
-function presenceVerb(presence: Presence): { readonly verb: 'create' | 'noop'; readonly reasonSuffix: string } {
+function presenceVerb(
+  presence: Presence,
+  unknownReason: string,
+): { readonly verb: 'create' | 'noop'; readonly reasonSuffix: string } {
   switch (presence) {
     case 'present':
       return { verb: 'noop', reasonSuffix: 'already present' };
@@ -137,16 +156,14 @@ function presenceVerb(presence: Presence): { readonly verb: 'create' | 'noop'; r
     case 'unknown':
       return {
         verb: 'create',
-        reasonSuffix:
-          'not observable at plan time (no JWT for pre-provisioning App/install reads) — ' +
-          'treated as a create-candidate, LOW CONFIDENCE',
+        reasonSuffix: `${unknownReason} — treated as a create-candidate, LOW CONFIDENCE`,
       };
   }
 }
 
 function appItem(fleetName: string, agent: FleetAgent, obs: ObservedAgentState | undefined): PlanItem {
   const handle = deriveAppHandle(fleetName, agent.role);
-  const { verb, reasonSuffix } = presenceVerb(obs?.app ?? 'unknown');
+  const { verb, reasonSuffix } = presenceVerb(obs?.app ?? 'unknown', UNKNOWN_REASONS.identity);
   return {
     kind: 'app',
     target: `agent:${agent.role}:app:${handle}`,
@@ -157,7 +174,7 @@ function appItem(fleetName: string, agent: FleetAgent, obs: ObservedAgentState |
 }
 
 function repoItem(agent: FleetAgent, obs: ObservedAgentState | undefined): PlanItem {
-  const { verb, reasonSuffix } = presenceVerb(obs?.repo ?? 'unknown');
+  const { verb, reasonSuffix } = presenceVerb(obs?.repo ?? 'unknown', UNKNOWN_REASONS.repo);
   return {
     kind: 'repo',
     target: `agent:${agent.role}:repo:${agent.repo}`,
@@ -169,7 +186,7 @@ function repoItem(agent: FleetAgent, obs: ObservedAgentState | undefined): PlanI
 
 function installItem(fleetName: string, agent: FleetAgent, obs: ObservedAgentState | undefined): PlanItem {
   const handle = deriveAppHandle(fleetName, agent.role);
-  const { verb, reasonSuffix } = presenceVerb(obs?.install ?? 'unknown');
+  const { verb, reasonSuffix } = presenceVerb(obs?.install ?? 'unknown', UNKNOWN_REASONS.identity);
   return {
     kind: 'install',
     target: `agent:${agent.role}:install:${handle}`,
@@ -205,7 +222,7 @@ function secretFingerprintItem(agent: FleetAgent, obs: ObservedAgentState | unde
 /** The registry-scope CA plan item — one of the two DR two-place-rule legs (macf#806). */
 function caRegistryItem(seg: string, presence: Presence): PlanItem {
   const varName = `${seg}_CA_CERT`;
-  const { verb, reasonSuffix } = presenceVerb(presence);
+  const { verb, reasonSuffix } = presenceVerb(presence, UNKNOWN_REASONS.variable);
   return {
     kind: 'ca',
     target: `ca:registry:${varName}`,
@@ -222,7 +239,7 @@ function caRegistryItem(seg: string, presence: Presence): PlanItem {
  */
 function caRepoItem(seg: string, repo: string, presence: Presence): PlanItem {
   const varName = `${seg}_CA_CERT`;
-  const { verb, reasonSuffix } = presenceVerb(presence);
+  const { verb, reasonSuffix } = presenceVerb(presence, UNKNOWN_REASONS.variable);
   return {
     kind: 'ca',
     target: `ca:repo:${repo}:${varName}`,
