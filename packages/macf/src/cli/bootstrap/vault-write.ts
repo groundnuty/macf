@@ -36,7 +36,7 @@
  * (`[A-Za-z0-9+/=]` only) and does not need the guard.
  */
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, unlinkSync } from 'node:fs';
 import { toVariableSegment } from '@groundnuty/macf-core';
 
 /** Thrown by every failure mode in this module — mirrors `ManifestExchangeError`'s shape. */
@@ -254,12 +254,36 @@ const AGE_ENCRYPT_TIMEOUT_MS = 30_000;
  * No plaintext ever touches disk — the load-bearing §D5 property. One
  * `-r <recipient>` per entry (age supports multi-recipient natively).
  *
+ * **Best-effort cleanup on every failure path (macf#847 review nit 1):** `age`
+ * opens `outPath` via `-o` before it has consumed all of STDIN, so a failure
+ * partway through (non-zero exit, a killed-on-timeout process, or the process
+ * dying under SIGKILL) can leave a TRUNCATED, corrupt file at `outPath`. The
+ * NEXT `writeVault` call's clobber guard (`WriteVaultOptions.allowVersion`
+ * default-off) then sees `exists(outPath) === true` and refuses to
+ * overwrite — trapping the operator into a `rm` of a file that was never a
+ * real vault. `unlinkOutPath` runs on every reject path below so a failed
+ * apply stays re-runnable without manual cleanup. Best-effort: the unlink
+ * itself is wrapped so a SECOND failure (e.g. permission denied, or the file
+ * was never created at all — `ENOENT`) never masks the ORIGINAL error this
+ * function is already rejecting with.
+ *
  * Thin I/O leaf — not unit-tested against a fake process (same posture as
  * `identity-confirm.ts`'s `confirmAppInstallation`); exercised for real
  * against the actual `age` binary where available (`vault-write.test.ts`,
  * skipped when `age` is not on PATH).
+ *
+ * `timeoutMs` defaults to {@link AGE_ENCRYPT_TIMEOUT_MS} (the production
+ * budget); tests pass a short override to reproduce a genuine kill-mid-write
+ * truncation (verified empirically: `age` opens `-o outPath` before it has
+ * drained a large STDIN, so a SIGKILL partway through leaves real bytes on
+ * disk) without waiting out the full 30s production timeout.
  */
-export function ageEncryptToFile(plaintext: string, recipients: readonly string[], outPath: string): Promise<void> {
+export function ageEncryptToFile(
+  plaintext: string,
+  recipients: readonly string[],
+  outPath: string,
+  timeoutMs: number = AGE_ENCRYPT_TIMEOUT_MS,
+): Promise<void> {
   return new Promise((resolve, reject) => {
     const args: string[] = [];
     for (const r of recipients) args.push('-r', r);
@@ -268,6 +292,15 @@ export function ageEncryptToFile(plaintext: string, recipients: readonly string[
     const child = spawn('age', args, { stdio: ['pipe', 'ignore', 'pipe'] });
     let stderr = '';
     let settled = false;
+
+    /** Best-effort — see the function doc. Never throws, never touched on the success path. */
+    const unlinkOutPath = (): void => {
+      try {
+        unlinkSync(outPath);
+      } catch {
+        /* nothing to clean up (ENOENT), or cleanup itself failed — either way, don't mask the real error */
+      }
+    };
 
     const finish = (fn: () => void): void => {
       if (settled) return;
@@ -279,9 +312,10 @@ export function ageEncryptToFile(plaintext: string, recipients: readonly string[
     const timer = setTimeout(() => {
       finish(() => {
         child.kill('SIGKILL');
-        reject(new VaultError('vault_encrypt_timeout', `age did not exit within ${String(AGE_ENCRYPT_TIMEOUT_MS)}ms.`));
+        unlinkOutPath();
+        reject(new VaultError('vault_encrypt_timeout', `age did not exit within ${String(timeoutMs)}ms.`));
       });
-    }, AGE_ENCRYPT_TIMEOUT_MS);
+    }, timeoutMs);
 
     child.stderr?.on('data', (chunk: Buffer) => {
       stderr += chunk.toString('utf-8');
@@ -294,13 +328,18 @@ export function ageEncryptToFile(plaintext: string, recipients: readonly string[
     });
     child.on('error', (err) => {
       finish(() => {
+        unlinkOutPath();
         reject(new VaultError('vault_encrypt_spawn_failed', `Failed to spawn "age" — is it on PATH? (${err.message})`));
       });
     });
     child.on('close', (code) => {
       finish(() => {
-        if (code === 0) resolve();
-        else reject(new VaultError('vault_encrypt_failed', `age exited ${String(code)}: ${stderr.trim()}`));
+        if (code === 0) {
+          resolve();
+        } else {
+          unlinkOutPath();
+          reject(new VaultError('vault_encrypt_failed', `age exited ${String(code)}: ${stderr.trim()}`));
+        }
       });
     });
 

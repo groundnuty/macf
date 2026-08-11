@@ -12,7 +12,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -348,4 +348,70 @@ describe('ageEncryptToFile (real age binary)', () => {
       process.env.PATH = savedPath;
     }
   });
+
+  it('spawn-failed leaves no file at outPath (nothing was ever created — unlink is a no-op ENOENT)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-vault-write-test-'));
+    dirs.push(dir);
+    const outPath = join(dir, 'vault.age');
+    const savedPath = process.env.PATH;
+    try {
+      process.env.PATH = '';
+      await expect(ageEncryptToFile('KEY="v"\n', ['age1fake'], outPath)).rejects.toThrow(VaultError);
+    } finally {
+      process.env.PATH = savedPath;
+    }
+    expect(existsSync(outPath)).toBe(false);
+  });
+
+  // macf#847 review nit 1: `age` opens `-o outPath` before draining a large
+  // STDIN, so a SIGKILL-on-timeout partway through leaves a REAL, truncated
+  // file at outPath — verified empirically against the live `age` binary
+  // before writing this test. Without the unlink-on-failure fix, that
+  // truncated file trips `writeVault`'s clobber guard on the NEXT run,
+  // trapping the operator into a manual `rm` to make a failed apply
+  // re-runnable. Uses a short injected `timeoutMs` + a large plaintext so the
+  // kill reliably lands mid-write without waiting out the real 30s budget.
+  it.skipIf(!HAS_AGE)(
+    'timeout (SIGKILL mid-write) leaves NO truncated file behind — unlink-on-failure (macf#847 nit 1)',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-vault-write-test-'));
+      dirs.push(dir);
+      const key = mintAgeKey(dir, 'k.txt');
+      const outPath = join(dir, 'vault.age');
+      // 200MB — large enough that `age` has opened + started writing outPath
+      // well before it can drain STDIN within the 20ms timeout below.
+      const bigPlaintext = 'A'.repeat(200_000_000);
+
+      await expect(ageEncryptToFile(bigPlaintext, [key.publicKey], outPath, 20)).rejects.toThrow(
+        /did not exit within/,
+      );
+
+      expect(existsSync(outPath)).toBe(false);
+    },
+    15_000,
+  );
+
+  it.skipIf(!HAS_AGE)(
+    'a re-run after a timeout-truncated failure succeeds (the clobber guard does not falsely trip on the cleaned-up path)',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-vault-write-test-'));
+      dirs.push(dir);
+      const key = mintAgeKey(dir, 'k.txt');
+      const outPath = join(dir, 'vault.age');
+      const bigPlaintext = 'A'.repeat(200_000_000);
+
+      await expect(ageEncryptToFile(bigPlaintext, [key.publicKey], outPath, 20)).rejects.toThrow();
+      expect(existsSync(outPath)).toBe(false);
+
+      // writeVault's default (allowVersion: false) clobber guard would reject
+      // this if the truncated file had survived — it succeeding is the proof
+      // the cleanup landed.
+      const result = await writeVault('KEY="v"\n', { outPath, recipients: [key.publicKey] });
+      expect(result).toEqual({ path: outPath, versioned: false });
+      const d = spawnSync('age', ['-d', '-i', key.keyPath, outPath], { encoding: 'utf-8' });
+      expect(d.status, d.stderr).toBe(0);
+      expect(d.stdout).toBe('KEY="v"\n');
+    },
+    15_000,
+  );
 });
