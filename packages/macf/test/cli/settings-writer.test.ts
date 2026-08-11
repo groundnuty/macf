@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, MACF_CHANNEL_ALIVE_HOOK_COMMAND, installStartupPickupHook, MACF_STARTUP_PICKUP_HOOK_COMMAND, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny, canPluginDeliverMigratedHooks } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, MACF_CHANNEL_ALIVE_HOOK_COMMAND, installStartupPickupHook, MACF_STARTUP_PICKUP_HOOK_COMMAND, MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny, canPluginDeliverMigratedHooks } from '../../src/cli/settings-writer.js';
 
 // ── Shared fixtures for the DR-039 Amendment B self-guard (macf#743 review) ──
 //
@@ -870,6 +870,17 @@ describe('installStartupPickupHook (DR-026 / macf#768)', () => {
     // No matcher — SessionStart hooks are matcher-less, like the sibling
     // channels-enabled / turn-receipt hooks.
     expect(s.hooks.SessionStart[0].matcher).toBeUndefined();
+  });
+
+  it('registers an explicit timeout comfortably above the script\'s own readiness-poll budget (macf#802)', () => {
+    // Claude Code's own default hook timeout is not documented anywhere in
+    // this repo; the script's readiness-poll can legitimately run up to ~90s
+    // (macf#802) so the registration must not rely on an unverified default
+    // — see MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS's doc comment.
+    installStartupPickupHook(tmpRoot);
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(s.hooks.SessionStart[0].hooks[0].timeout).toBe(MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS);
+    expect(MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS).toBeGreaterThan(90);
   });
 
   it('is written unconditionally — no role parameter, same entry regardless of workspace role', () => {

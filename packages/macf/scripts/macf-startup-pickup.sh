@@ -45,18 +45,66 @@
 # comes from $CLAUDE_PROJECT_DIR); STDOUT is injected into the agent's
 # context. OBSERVATIONAL for the query half (deposits the plugin's own
 # `issues`-command output into the agent's context, identical to what
-# `/macf-issues` would print) and NON-BLOCKING throughout — the script
-# ALWAYS exits 0 (fail open on a missing plugin mount, a query error, a
-# missing tmux session, or any internal fault) so it can never delay or
-# block a session.
+# `/macf-issues` would print) — that half is always instant and unconditional.
+# The SUBMIT half ALWAYS exits 0 (fail open on a missing plugin mount, a
+# query error, a missing tmux session, or any internal fault) but is NOT
+# instant by design as of groundnuty/macf#802 — see below.
+#
+# READINESS + VERIFY GATE (groundnuty/macf#802): a synchronous SessionStart
+# submit can race a relaunch (`claude -c`) that hasn't yet cleared its own
+# startup ceremony prompts (#703 — folder-trust / `--dangerously-load-
+# development-channels`). Landing the pickup keystrokes on a menu that
+# doesn't accept free text makes the send "succeed" (tmux send-keys exits 0)
+# while the prompt is silently swallowed — the silent-fallback shape
+# (silent-fallback-hazards.md). Two independent defenses, because the
+# ordering of "prompt renders" vs "hook sends" is a hypothesis, not a
+# verified fact — either could happen first:
+#   (1) PRE-SEND: poll the pane (bounded by READY_TIMEOUT below) and don't
+#       even attempt a submit while it visibly shows a blocking ceremony
+#       menu (numbered-option cursor / (y/n) confirm) — mirrors
+#       macf-prompt-watcher.sh's `_looks_prompt_like`.
+#   (2) POST-SEND: a result-invariant check (Pattern C,
+#       silent-fallback-hazards.md — content-diff via `capture-pane`, NOT
+#       `#{session_activity}`, which does not reliably reflect activity).
+#       Capture before + after the submit; if the pane content is
+#       unchanged, the send didn't visibly land — one bounded retry, then
+#       give up loud rather than silently.
+# Either check alone would miss the ordering it doesn't cover; together they
+# hold under both. If the pane can't be observed at all (no tmux reachable,
+# capture fails), both checks fail open — same fail-open posture as every
+# other gate in this script — and the submit proceeds/records success
+# without a diff to compare against.
 #
 # Overrides:
-#   MACF_NO_STARTUP_PICKUP=1   — skip entirely, no query, no submit (family:
-#                                MACF_NO_TMUX_WRAP / MACF_OTEL_DISABLED).
+#   MACF_NO_STARTUP_PICKUP=1                    — skip entirely, no query, no
+#                                                  submit (family:
+#                                                  MACF_NO_TMUX_WRAP /
+#                                                  MACF_OTEL_DISABLED).
+#   MACF_STARTUP_PICKUP_READY_TIMEOUT_SECS=N    — pre-send poll bound
+#                                                  (default: same as
+#                                                  macf-prompt-watcher.sh's
+#                                                  MACF_PROMPT_WATCH_WINDOW_SECS
+#                                                  if set, else 90 — the two
+#                                                  mechanisms are racing the
+#                                                  SAME startup window, so
+#                                                  they share a default
+#                                                  rather than drift apart).
+#   MACF_STARTUP_PICKUP_READY_INTERVAL_SECS=N   — pre-send poll cadence
+#                                                  (default 1).
+#   MACF_STARTUP_PICKUP_VERIFY_DELAY_SECS=N     — settle time between a
+#                                                  submit attempt and the
+#                                                  post-send capture
+#                                                  (default 1).
 #
-# Refs: groundnuty/macf#768; DR-026 (auditor never-acts boundary);
-#       plugin/skills/macf-issues/SKILL.md (the delegated command);
-#       tmux-send-to-claude.sh (the sanctioned 2-step-Enter submit helper).
+# Refs: groundnuty/macf#768 (this hook); groundnuty/macf#802 (this gate);
+#       #703 (the startup-prompt collision partner); DR-026 (auditor
+#       never-acts boundary); plugin/skills/macf-issues/SKILL.md (the
+#       delegated command); tmux-send-to-claude.sh (the sanctioned
+#       2-step-Enter submit helper); macf-prompt-watcher.sh (sibling pane
+#       watcher whose heuristics this gate mirrors, intentionally
+#       duplicated rather than sourced — bash can't import bash across
+#       distribution boundaries any more than it can import the TS role-gate
+#       above).
 set -uo pipefail
 
 # Defense-in-depth: an unexpected error past this point must NOT brick
@@ -123,7 +171,94 @@ if [[ -z "${TMUX:-}" ]] || [[ ! -x "$TMUX_SUBMIT" ]]; then
   exit 0
 fi
 
-# 7. Build the DETAILED submit prompt (macf#816) — the operator wants the
+# 7. Readiness + verify gate (macf#802) — see the file header for the full
+#    rationale. Tunables read here so an operator override applies to
+#    whichever branch below actually fires.
+READY_TIMEOUT="${MACF_STARTUP_PICKUP_READY_TIMEOUT_SECS:-${MACF_PROMPT_WATCH_WINDOW_SECS:-90}}"
+READY_INTERVAL="${MACF_STARTUP_PICKUP_READY_INTERVAL_SECS:-1}"
+VERIFY_DELAY="${MACF_STARTUP_PICKUP_VERIFY_DELAY_SECS:-1}"
+
+# _pane_frame → best-effort capture of the target pane's current content.
+# Prefers the precise $TMUX_PANE target (exported by claude.sh right before
+# `exec claude` — the same target macf-prompt-watcher.sh watches); falls
+# back to a bare capture (matches tmux-send-to-claude.sh's own "current
+# pane" default target) when TMUX_PANE isn't known — proven present only via
+# $TMUX (the send already fires today), never assume $TMUX_PANE is set too.
+# `|| true` on both branches: a capture failure (no server, stale pane, no
+# tmux binary) is read as "can't tell" everywhere this is called, never as
+# an error — same fail-open posture as the rest of this script.
+_pane_frame() {
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    tmux capture-pane -t "$TMUX_PANE" -p 2>/dev/null || true
+  else
+    tmux capture-pane -p 2>/dev/null || true
+  fi
+}
+
+# _pane_blocked <frame> → 0 if the frame looks like a blocking ceremony
+# prompt (numbered-menu cursor or a (y/n) confirm) that would swallow a
+# free-text submit instead of accepting it as input. Mirrors
+# macf-prompt-watcher.sh's `_looks_prompt_like` (same two signatures);
+# intentionally duplicated, not sourced — see the file header.
+_pane_blocked() {
+  printf '%s' "$1" | grep -qE '❯[[:space:]]*[0-9]+[.)]' && return 0
+  printf '%s' "$1" | grep -qE '\((y/n|y/N|Y/n)\)|\[(y/N|Y/n|y/n)\]' && return 0
+  return 1
+}
+
+# _submit_when_ready <prompt> — the gated submit. Phase 1 (pre-send) waits
+# out a KNOWN-shaped blocking prompt, bounded by READY_TIMEOUT; phase 2
+# (post-send) verifies the pane actually changed after sending, with one
+# bounded retry, because the ordering of "prompt renders" vs "hook sends"
+# is unverified — phase 1 alone cannot catch a prompt that renders AFTER
+# the pre-send check passed. Always returns 0 (never treated as a script
+# fault) but is LOUD — not silent — when a submit could not be verified.
+_submit_when_ready() {
+  local prompt="$1" before after attempt
+
+  # Deliberately NOT `local SECONDS` — declaring bash's special
+  # auto-incrementing SECONDS local strips its auto-increment behavior on
+  # some bash versions, turning it into an ordinary variable that never
+  # advances and silently converting this bounded poll into an infinite
+  # loop gated only by the harness's own hook timeout. A bare assignment
+  # resets the (script-global, single) counter; only this function reads
+  # it, and only one call happens per hook invocation (step 8's if/elif is
+  # mutually exclusive), so the global reset is safe here.
+  SECONDS=0
+  while :; do
+    before="$(_pane_frame)"
+    if [[ -z "$before" ]] || ! _pane_blocked "$before"; then
+      break
+    fi
+    if [[ "$SECONDS" -ge "$READY_TIMEOUT" ]]; then
+      printf '\n[macf-startup-pickup] WARNING: pane still showed a startup ceremony prompt after %ss — skipped the auto-submit to avoid it landing on the wrong menu (groundnuty/macf#802). Pending work is listed above; pick it up manually, or wait for the #703 auto-responder to clear the prompt and re-run /macf-issues.\n' "$READY_TIMEOUT"
+      return 0
+    fi
+    sleep "$READY_INTERVAL"
+  done
+
+  for attempt in 1 2; do
+    "$TMUX_SUBMIT" "" "$prompt" || true
+    sleep "$VERIFY_DELAY"
+    after="$(_pane_frame)"
+    # A pane that now LOOKS blocked is never success, even if its content
+    # differs from $before — that shape is "a new/different ceremony prompt
+    # swallowed the send", not "the send landed". Retry before treating a
+    # content-diff as proof; a diff into a still-blocked pane is exactly the
+    # false-positive a raw diff alone would miss.
+    if [[ -n "$after" ]] && _pane_blocked "$after"; then
+      before="$after"
+      continue
+    fi
+    if [[ -z "$before" ]] || [[ -z "$after" ]] || [[ "$before" != "$after" ]]; then
+      return 0
+    fi
+    before="$after"
+  done
+  printf '\n[macf-startup-pickup] WARNING: could not confirm the auto-submit landed — the pane still looks unchanged, or now shows another blocking prompt, after %d attempt(s) (groundnuty/macf#802). The prompt may have been swallowed by a startup menu that rendered after the readiness check passed. Pending work is listed above; pick it up manually.\n' "$attempt"
+}
+
+# 8. Build the DETAILED submit prompt (macf#816) — the operator wants the
 #    pickup prompt to CARRY the pending-issue list, not point back at
 #    context with a generic "review the queue above" line. `issues
 #    --oneline` is a second short-lived plugin-CLI invocation (same query
@@ -134,14 +269,14 @@ if ONELINE="$(node "$PLUGIN_CLI" issues --oneline 2>/dev/null)" && [[ -n "$ONELI
   # `--oneline` succeeded AND named pending GH issues → submit the detailed
   # list. (The `&&` matters: a non-zero `--oneline` exit must NOT submit even
   # if partial stdout was captured — a failed issue query is not a queue.)
-  "$TMUX_SUBMIT" "" "Pick up pending issues: ${ONELINE}" || true
+  _submit_when_ready "Pick up pending issues: ${ONELINE}"
 elif grep -q 'inbox message(s) drained on startup:' <<<"$OUTPUT"; then
   # No open GH issues, but inbox messages were drained on startup (offline-
   # arrived peer work). The pre-#816 hook fired the self-nudge on the
   # inbox-drained case too; preserve that so a drained message can't strand
   # un-processed (the #802 / silent-fallback shape). No issue list to name,
   # so nudge at the drained messages surfaced in context above.
-  "$TMUX_SUBMIT" "" "Process the inbox message(s) drained on startup (surfaced above)." || true
+  _submit_when_ready "Process the inbox message(s) drained on startup (surfaced above)."
 fi
 # else: neither issues nor drained inbox (the grep at step 5 already exits
 # otherwise) → nothing to submit.
