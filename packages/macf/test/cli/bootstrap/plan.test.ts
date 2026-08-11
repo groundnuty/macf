@@ -38,12 +38,17 @@ function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
         deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-experiment',
       },
     ],
+    // `trust` is required in the `FleetManifest` type (optional-with-default
+    // at the schema level, macf#839 review nit 5) — a hand-built fixture
+    // needs to supply it explicitly, unlike a `parseFleetManifest`-derived
+    // one where the schema default fills it in.
+    trust: { ca: 'per-project', federated_cas: [] },
     ...overrides,
   };
 }
 
 /** Empty observed state — nothing provisioned yet. */
-const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, ca: 'unknown' };
+const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, caRegistry: 'unknown', caRepos: {} };
 
 function itemFor(items: readonly PlanItem[], kind: PlanItem['kind'], target: string): PlanItem | undefined {
   return items.find((i) => i.kind === kind && i.target === target);
@@ -54,31 +59,77 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
     const manifest = baseManifest();
     const plan = computePlan(manifest, EMPTY_OBSERVED);
 
-    // 4 items per agent (app, repo, install, secret_fingerprint) × 2 agents.
-    expect(plan.items).toHaveLength(8);
+    // 4 items per agent (app, repo, install, secret_fingerprint) × 2 agents
+    // + caRegistry (1) + one caRepo per agent (2) — CA items are unconditional
+    // as of macf#839 review nit 5 (never gated on `trust:` being declared).
+    expect(plan.items).toHaveLength(11);
     for (const item of plan.items) {
       expect(item.verb).toBe('create');
       expect(item.confirm_required).toBe(false);
     }
   });
 
-  it('never emits a CA or routing item when neither `trust:` nor `routing:` is declared', () => {
+  it('always emits CA items (registry + one per agent repo) — unconditional, macf#839 review nit 5', () => {
+    // computePlan never consults `manifest.trust`'s VALUE (there is only one
+    // v0 enum member) — the CA items are unconditional on fleet identity +
+    // agent repos alone. The "omitted `trust:` still gets a CA" guarantee is
+    // schema-level and covered in fleet-manifest.test.ts ("trust is
+    // optional-with-default"); this test covers the plan-level consequence.
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
-    expect(plan.items.some((i) => i.kind === 'ca')).toBe(false);
-    expect(plan.items.some((i) => i.kind === 'routing')).toBe(false);
+    const caItems = plan.items.filter((i) => i.kind === 'ca');
+    expect(caItems.map((i) => i.target)).toEqual([
+      'ca:registry:ICSOC_2026_CA_CERT',
+      'ca:repo:groundnuty/icsoc-2026-science-agent:ICSOC_2026_CA_CERT',
+      'ca:repo:groundnuty/icsoc-2026-experiment:ICSOC_2026_CA_CERT',
+    ]);
+    for (const item of caItems) {
+      expect(item.verb).toBe('create');
+      expect(item.reason).toMatch(/not observable at plan time/);
+    }
   });
 
-  it('emits a CA create item when `trust:` IS declared but unobserved', () => {
-    const manifest = baseManifest({ trust: { ca: 'per-project', federated_cas: [] } });
-    const plan = computePlan(manifest, EMPTY_OBSERVED);
-    const ca = itemFor(plan.items, 'ca', 'ca:icsoc-2026');
-    expect(ca?.verb).toBe('create');
-    expect(ca?.reason).toMatch(/not observable at plan time/);
+  it('never emits a routing item when `routing:` is not declared', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.items.some((i) => i.kind === 'routing')).toBe(false);
+  });
+});
+
+describe('computePlan — per-repo CA drift (macf#806 reproduction, macf#839 review [BLOCKING] 3)', () => {
+  it('registry + repo-A present, repo-B absent → noop for registry + repo-A, create for repo-B', () => {
+    const manifest = baseManifest(); // agents: science-agent (repo A), code-agent (repo B)
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      caRegistry: 'present',
+      caRepos: {
+        'groundnuty/icsoc-2026-science-agent': 'present', // repo-A
+        'groundnuty/icsoc-2026-experiment': 'absent', // repo-B
+      },
+    };
+
+    const plan = computePlan(manifest, observed);
+    const caItems = plan.items.filter((i) => i.kind === 'ca');
+    expect(caItems).toEqual([
+      expect.objectContaining({
+        target: 'ca:registry:ICSOC_2026_CA_CERT',
+        verb: 'noop',
+      }),
+      expect.objectContaining({
+        target: 'ca:repo:groundnuty/icsoc-2026-science-agent:ICSOC_2026_CA_CERT',
+        verb: 'noop',
+      }),
+      expect.objectContaining({
+        target: 'ca:repo:groundnuty/icsoc-2026-experiment:ICSOC_2026_CA_CERT',
+        verb: 'create',
+      }),
+    ]);
+    // A single fleet-level representative-repo read (the pre-macf#839 shape)
+    // would have collapsed this to a uniform noop/create — this per-repo
+    // split is exactly what lets the plan reproduce the #806 drift class.
   });
 });
 
 describe('computePlan — all-match observed state → all noops', () => {
-  it('every per-agent resource + CA + routing is noop when fully observed-matching', () => {
+  it('every per-agent resource + CA (registry + per-repo) + routing is noop when fully observed-matching', () => {
     const manifest = baseManifest({
       routing: { runner: { runs_on: 'self-hosted' } },
       trust: { ca: 'per-project', federated_cas: [] },
@@ -103,12 +154,16 @@ describe('computePlan — all-match observed state → all noops', () => {
           fingerprints: { app_private_key: 'sha256:bbb' },
         },
       },
-      ca: 'present',
+      caRegistry: 'present',
+      caRepos: {
+        'groundnuty/icsoc-2026-science-agent': 'present',
+        'groundnuty/icsoc-2026-experiment': 'present',
+      },
       routingRunsOn: 'self-hosted',
     };
 
     const plan = computePlan(manifest, observed);
-    expect(plan.items).toHaveLength(10); // 4 × 2 agents + ca + routing
+    expect(plan.items).toHaveLength(12); // 4 × 2 agents + caRegistry + 2 caRepo + routing
     for (const item of plan.items) {
       expect(item.verb).toBe('noop');
       expect(item.confirm_required).toBe(false);
@@ -146,7 +201,8 @@ describe('computePlan — an observed extra agent → report-extra, NEVER delete
       agents: {
         'writer-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} },
       },
-      ca: 'unknown',
+      caRegistry: 'unknown',
+      caRepos: {},
     };
 
     const plan = computePlan(manifest, observed);
@@ -161,7 +217,8 @@ describe('computePlan — an observed extra agent → report-extra, NEVER delete
     const observed: ObservedState = {
       lock: null,
       agents: { 'orphan-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} } },
-      ca: 'unknown',
+      caRegistry: 'unknown',
+      caRepos: {},
     };
     const plan = computePlan(manifest, observed);
     const verbsSeen = new Set(plan.items.map((i) => i.verb));
@@ -180,7 +237,8 @@ describe('computePlan — an observed extra agent → report-extra, NEVER delete
         'zzz-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} },
         'aaa-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} },
       },
-      ca: 'unknown',
+      caRegistry: 'unknown',
+      caRepos: {},
     };
     const plan = computePlan(manifest, observed);
     const extras = plan.items.filter((i) => i.kind === 'agent').map((i) => i.target);
@@ -193,20 +251,27 @@ describe('computePlan — deterministic ordering', () => {
     const manifest = baseManifest();
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const kinds = plan.items.map((i) => i.kind);
-    expect(kinds).toEqual([
+    expect(kinds.slice(0, 8)).toEqual([
       'app', 'repo', 'install', 'secret_fingerprint', // science-agent
       'app', 'repo', 'install', 'secret_fingerprint', // code-agent
     ]);
   });
 
-  it('CA precedes routing, both after all per-agent items', () => {
+  it('CA items (registry, then one per agent repo in manifest order) precede routing, both after all per-agent items', () => {
     const manifest = baseManifest({
       routing: { runner: { runs_on: 'self-hosted' } },
       trust: { ca: 'per-project', federated_cas: [] },
     });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const kinds = plan.items.map((i) => i.kind);
-    expect(kinds.slice(-2)).toEqual(['ca', 'routing']);
+    // 8 per-agent items, then 3 CA items (registry + 2 agent repos), then routing.
+    expect(kinds.slice(-4)).toEqual(['ca', 'ca', 'ca', 'routing']);
+    const caTargets = plan.items.filter((i) => i.kind === 'ca').map((i) => i.target);
+    expect(caTargets).toEqual([
+      'ca:registry:ICSOC_2026_CA_CERT',
+      'ca:repo:groundnuty/icsoc-2026-science-agent:ICSOC_2026_CA_CERT',
+      'ca:repo:groundnuty/icsoc-2026-experiment:ICSOC_2026_CA_CERT',
+    ]);
   });
 
   it('is stable across repeated calls with the same input', () => {
@@ -282,7 +347,7 @@ describe('summarizePlan', () => {
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
     const plan = computePlan(manifest, observed);
     const summary = summarizePlan(plan.items);
-    // 8 per-agent creates + 1 routing update.
-    expect(summary).toEqual({ creates: 8, updates: 1, noops: 0, extras: 0 });
+    // 8 per-agent creates + 3 CA creates (registry + 2 agent repos) + 1 routing update.
+    expect(summary).toEqual({ creates: 11, updates: 1, noops: 0, extras: 0 });
   });
 });

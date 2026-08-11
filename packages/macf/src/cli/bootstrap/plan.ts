@@ -28,6 +28,7 @@
  * reconciled, `computePlan` surfaces every declared-but-deferred section
  * explicitly via `FleetPlan.skippedSections` — never silent.
  */
+import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
@@ -53,12 +54,23 @@ export interface ObservedAgentState {
  * Everything `macf bootstrap plan` could determine about the fleet's current
  * state. Deliberately data-only (no I/O) so `computePlan` stays pure and
  * every test constructs one by hand — no network, no `gh` shell-outs.
+ *
+ * The CA is observed at BOTH place-types the DR two-place rule requires
+ * (macf#806, until macf-actions#66 collapses it to one): the **registry**
+ * (profile/org/repo scope per `owner.registry`) AND a **per-repo** copy on
+ * EVERY agent repo. A single "representative" read (the Slice-1a-original
+ * shape) cannot reproduce the #806 drift class — a per-repo var absent while
+ * the registry + other repos have it — so both legs are carried separately
+ * (macf#839 review [BLOCKING] 3).
  */
 export interface ObservedState {
   readonly lock: FleetLock | null;
   /** Keyed by the manifest's per-agent `role` field. */
   readonly agents: Readonly<Record<string, ObservedAgentState>>;
-  readonly ca: Presence;
+  /** Registry-scope `<SEG>_CA_CERT` presence. */
+  readonly caRegistry: Presence;
+  /** Per-agent-repo `<SEG>_CA_CERT` presence, keyed by `agent.repo`. */
+  readonly caRepos: Readonly<Record<string, Presence>>;
   /** The `MACF_ROUTING_RUNS_ON` value observed on a caller repo, if any. */
   readonly routingRunsOn?: string;
 }
@@ -190,13 +202,32 @@ function secretFingerprintItem(agent: FleetAgent, obs: ObservedAgentState | unde
   };
 }
 
-function caItem(fleetName: string, presence: Presence): PlanItem {
+/** The registry-scope CA plan item — one of the two DR two-place-rule legs (macf#806). */
+function caRegistryItem(seg: string, presence: Presence): PlanItem {
+  const varName = `${seg}_CA_CERT`;
   const { verb, reasonSuffix } = presenceVerb(presence);
   return {
     kind: 'ca',
-    target: `ca:${fleetName}`,
+    target: `ca:registry:${varName}`,
     verb,
-    reason: `per-project CA ${reasonSuffix}`,
+    reason: `registry CA var "${varName}" ${reasonSuffix}`,
+    confirm_required: false,
+  };
+}
+
+/**
+ * The per-agent-repo CA plan item — the other DR two-place-rule leg
+ * (macf#806). One of these per agent repo is what lets the plan reproduce
+ * the #806 drift class: registry + repo-A present, repo-B absent.
+ */
+function caRepoItem(seg: string, repo: string, presence: Presence): PlanItem {
+  const varName = `${seg}_CA_CERT`;
+  const { verb, reasonSuffix } = presenceVerb(presence);
+  return {
+    kind: 'ca',
+    target: `ca:repo:${repo}:${varName}`,
+    verb,
+    reason: `per-repo CA var "${varName}" on "${repo}" ${reasonSuffix}`,
     confirm_required: false,
   };
 }
@@ -233,14 +264,17 @@ function routingItem(fleetName: string, desiredRunsOn: string, observedRunsOn: s
 /**
  * The pure §D3 three-verb reconcile. Deterministic ordering: per-agent items
  * (app, repo, install, secret_fingerprint) in manifest `agents[]` order, then
- * the fleet-level CA item (only when `trust:` is declared), then the routing
- * item (only when `routing.runner` is declared), then report-extra items for
- * any observed agent NOT in the manifest, sorted by role for determinism.
+ * the CA items (registry, then one per agent repo in manifest order — a MACF
+ * fleet always needs a CA, so these are UNCONDITIONAL as of macf#839 review
+ * nit 5, not gated on `trust:` being declared), then the routing item (only
+ * when `routing.runner` is declared), then report-extra items for any
+ * observed agent NOT in the manifest, sorted by role for determinism.
  *
  * NEVER emits a delete/prune verb (§D3 "play it safe" — Design invariant 4).
  */
 export function computePlan(manifest: FleetManifest, observed: ObservedState): FleetPlan {
   const fleetName = manifest.metadata.name;
+  const seg = toVariableSegment(fleetName);
   const items: PlanItem[] = [];
 
   for (const agent of manifest.agents) {
@@ -251,8 +285,9 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
     items.push(secretFingerprintItem(agent, obs));
   }
 
-  if (manifest.trust) {
-    items.push(caItem(fleetName, observed.ca));
+  items.push(caRegistryItem(seg, observed.caRegistry));
+  for (const agent of manifest.agents) {
+    items.push(caRepoItem(seg, agent.repo, observed.caRepos[agent.repo] ?? 'unknown'));
   }
 
   if (manifest.routing?.runner) {

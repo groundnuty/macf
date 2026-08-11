@@ -46,7 +46,7 @@ function writeManifest(text: string): { dir: string; file: string } {
   return { dir, file };
 }
 
-const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, ca: 'unknown' };
+const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, caRegistry: 'unknown', caRepos: {} };
 
 describe('runBootstrapPlan', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -177,13 +177,15 @@ describe('runBootstrapPlan', () => {
             fingerprints: { app_private_key: 'sha256:aaa' },
           },
         },
-        ca: 'unknown',
+        caRegistry: 'present',
+        caRepos: { 'groundnuty/icsoc-2026-experiment': 'present' },
       }),
     };
     const code = await runBootstrapPlan({ file, json: true }, deps);
     expect(code).toBe(0);
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { summary: { noops: number; creates: number } };
-    expect(json.summary.noops).toBe(4);
+    // 4 per-agent (app, repo, install, secret_fingerprint) + 2 CA (registry + the one agent repo) — all noop.
+    expect(json.summary.noops).toBe(6);
     expect(json.summary.creates).toBe(0);
   });
 });

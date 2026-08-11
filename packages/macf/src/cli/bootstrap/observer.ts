@@ -20,9 +20,11 @@ import { promisify } from 'node:util';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { toVariableSegment } from '@groundnuty/macf-core';
+import type { RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
 import { parseFleetLock } from './fleet-manifest.js';
 import type { ObservedAgentState, ObservedState, Presence } from './plan.js';
+import { registryPathPrefix } from '../registry-helper.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -89,6 +91,57 @@ export async function readRepoVariable(repo: string, name: string): Promise<stri
 }
 
 /**
+ * Read-only repo-scoped Actions-variable EXISTENCE check — the
+ * absent/unknown-distinguishing sibling of {@link readRepoVariable} (which
+ * collapses both into `undefined`; fine for the `routingRunsOn` VALUE read,
+ * but not for the per-repo CA-var drift class the #806 acceptance test needs
+ * to reproduce: telling a confirmed-404 repo-var apart from a couldn't-read
+ * one, same split as {@link checkRepoExists}). A `gh`-reported 404 is a
+ * confident `'absent'`; any other failure degrades to `'unknown'`. NEVER
+ * throws (macf#839 review [BLOCKING] 3).
+ */
+export async function checkRepoVariablePresence(repo: string, name: string): Promise<Presence> {
+  try {
+    await execFileAsync('gh', ['api', `repos/${repo}/actions/variables/${name}`], { encoding: 'utf-8' });
+    return 'present';
+  } catch (err) {
+    const stderr = getStderr(err);
+    if (/HTTP 404|Not Found/i.test(stderr)) return 'absent';
+    return 'unknown';
+  }
+}
+
+/**
+ * Read-only registry-scope Actions-variable EXISTENCE check — the other leg
+ * of the DR two-place rule (macf#806): the CA var lives on the registry
+ * (`owner.registry`: profile/org/repo scope) AND on every agent repo (see
+ * {@link checkRepoVariablePresence}). Reuses `registryPathPrefix` (the same
+ * scope→API-path mapping the agent-side registry client uses) so this stays
+ * in lockstep with how the registry is actually addressed. An unsupported
+ * scope (`local` — no GitHub API path) or any read failure degrades to
+ * `'unknown'` rather than throwing; a confirmed 404 is `'absent'`. NEVER
+ * throws (macf#839 review [BLOCKING] 3).
+ */
+export async function checkRegistryVariablePresence(registry: RegistryConfig, name: string): Promise<Presence> {
+  let pathPrefix: string;
+  try {
+    pathPrefix = registryPathPrefix(registry);
+  } catch {
+    return 'unknown';
+  }
+  try {
+    await execFileAsync('gh', ['api', `${pathPrefix.replace(/^\//, '')}/actions/variables/${name}`], {
+      encoding: 'utf-8',
+    });
+    return 'present';
+  } catch (err) {
+    const stderr = getStderr(err);
+    if (/HTTP 404|Not Found/i.test(stderr)) return 'absent';
+    return 'unknown';
+  }
+}
+
+/**
  * The real `FleetObserverFn`. `manifestPath` is the on-disk path to the
  * `fleet.yaml` that was parsed into `manifest` — used only to locate the
  * co-located `fleet.lock` (never re-parses the manifest itself).
@@ -101,14 +154,24 @@ export async function readRepoVariable(repo: string, name: string): Promise<stri
  * — see `plan.ts`'s `secretFingerprintItem` doc for why drift-detection
  * there is a Slice-2 concern).
  *
- * Fleet-level: CA presence + the routing runner var are both READ on
- * `transport.vault_repo` (a single, always-declared representative target)
- * — a real repo-scoped Actions-variable read, degrading to `'unknown'` /
- * `undefined` on any failure.
+ * CA presence is read at BOTH DR two-place-rule legs (macf#806, until
+ * macf-actions#66 collapses it to one): the **registry** (`owner.registry` —
+ * profile/org/repo scope, read once) AND a **per-agent-repo** copy on EVERY
+ * agent's `repo` (macf#839 review [BLOCKING] 3 — a single "representative"
+ * repo read cannot reproduce the #806 drift class: a per-repo var absent
+ * while the registry + other repos have it).
+ *
+ * The routing runner var is still read on `transport.vault_repo` (a single,
+ * always-declared representative target) — unchanged from Slice 1a, and
+ * unaffected by the CA-observer widening above.
  */
 export async function githubRegistryObserver(manifest: FleetManifest, manifestPath: string): Promise<ObservedState> {
   const lock = readFleetLock(manifestPath);
+  const seg = toVariableSegment(manifest.metadata.name);
+  const caVarName = `${seg}_CA_CERT`;
+
   const agents: Record<string, ObservedAgentState> = {};
+  const caRepos: Record<string, Presence> = {};
 
   for (const agent of manifest.agents) {
     const lockEntry = lock?.agents.find((a) => a.role === agent.role);
@@ -122,15 +185,14 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       fingerprints: lockEntry?.fingerprints ?? {},
       deployedVersion: lockEntry?.deployed_version,
     };
+    caRepos[agent.repo] = await checkRepoVariablePresence(agent.repo, caVarName);
   }
 
-  const seg = toVariableSegment(manifest.metadata.name);
-  const caVarValue = await readRepoVariable(manifest.transport.vault_repo, `${seg}_CA_CERT`);
-  const ca: Presence = caVarValue !== undefined ? 'present' : 'unknown';
+  const caRegistry = await checkRegistryVariablePresence(manifest.owner.registry, caVarName);
 
   const routingRunsOn = manifest.routing?.runner
     ? await readRepoVariable(manifest.transport.vault_repo, 'MACF_ROUTING_RUNS_ON')
     : undefined;
 
-  return { lock, agents, ca, routingRunsOn };
+  return { lock, agents, caRegistry, caRepos, routingRunsOn };
 }

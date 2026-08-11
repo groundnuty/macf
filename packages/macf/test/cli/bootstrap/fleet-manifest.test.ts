@@ -155,7 +155,11 @@ agents:
     expect(manifest.routing).toBeUndefined();
     expect(manifest.collaborators).toBeUndefined();
     expect(manifest.shared).toBeUndefined();
-    expect(manifest.trust).toBeUndefined();
+    // trust is optional-with-default (macf#839 review nit 5) — a MACF fleet
+    // always needs a CA, so an omitted `trust:` section defaults rather than
+    // staying undefined (a manifest.trust?.-gate would silently skip the CA
+    // plan items — see plan.test.ts's "always emits CA items" coverage).
+    expect(manifest.trust).toEqual({ ca: 'per-project', federated_cas: [] });
   });
 });
 
@@ -227,6 +231,50 @@ agents: []
       );
       expect(() => parseFleetManifest(bad)).toThrow(/app_id/);
     });
+  });
+});
+
+describe('parseFleetManifest — role/repo/name hygiene (macf#839 review [BLOCKING] 1 + 2 + nit 4/5)', () => {
+  it('rejects a role starting with the fleet name prefix — the #791 front door', () => {
+    const bad = VALID_FLEET_YAML.replace('role: code-agent', 'role: icsoc-2026-code-agent');
+    expect(() => parseFleetManifest(bad)).toThrow(/791|double-prefix/);
+  });
+
+  it('rejects a bad-charset role (uppercase / underscore)', () => {
+    const bad = VALID_FLEET_YAML.replace('role: code-agent', 'role: Code_Agent');
+    expect(() => parseFleetManifest(bad)).toThrow(/kebab-case/);
+  });
+
+  it('rejects duplicate agents[].role', () => {
+    const bad = VALID_FLEET_YAML.replace('role: writer-agent', 'role: code-agent');
+    expect(() => parseFleetManifest(bad)).toThrow(/duplicate agents\[\]\.role/);
+  });
+
+  it('rejects duplicate agents[].repo', () => {
+    const bad = VALID_FLEET_YAML.replace(
+      'repo: groundnuty/icsoc-2026\n    provenance: mirror',
+      'repo: groundnuty/icsoc-2026-experiment\n    provenance: mirror',
+    );
+    expect(() => parseFleetManifest(bad)).toThrow(/duplicate agents\[\]\.repo/);
+  });
+
+  it('rejects an uppercase metadata.name', () => {
+    const bad = VALID_FLEET_YAML.replace('name: icsoc-2026', 'name: ICSOC-2026');
+    expect(() => parseFleetManifest(bad)).toThrow(/metadata\.name/);
+  });
+
+  it('rejects an underscore-carrying metadata.name', () => {
+    const bad = VALID_FLEET_YAML.replace('name: icsoc-2026', 'name: icsoc_2026');
+    expect(() => parseFleetManifest(bad)).toThrow(/metadata\.name/);
+  });
+
+  it('rejects a non-enum trust.ca value', () => {
+    const bad = VALID_FLEET_YAML.replace('ca: per-project', 'ca: shared-org-wide');
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+
+  it('a well-formed manifest (unique kebab roles/repos, kebab name, per-project ca) still parses clean', () => {
+    expect(() => parseFleetManifest(VALID_FLEET_YAML)).not.toThrow();
   });
 });
 

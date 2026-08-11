@@ -33,9 +33,18 @@ import { RegistryConfigSchema } from '@groundnuty/macf-core';
 
 // --- fleet.yaml (desired state) ---
 
+/**
+ * `metadata.name` shape (macf#839 review nit 4): lowercase kebab, starting
+ * with an alnum. The name propagates verbatim into derived App handles
+ * (`deriveAppHandle`) and the registry variable segment (`toVariableSegment`)
+ * — an uppercase or underscore-carrying name would produce surprising
+ * handle/segment shapes downstream.
+ */
+export const FLEET_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
+
 export const FleetMetadataSchema = z
   .object({
-    name: z.string().min(1),
+    name: z.string().min(1).regex(FLEET_NAME_RE, 'metadata.name must be lowercase kebab-case (^[a-z0-9][a-z0-9-]*$)'),
   })
   .strict();
 
@@ -144,14 +153,25 @@ export const FleetSharedSchema = z
   })
   .strict();
 
+/**
+ * v0 supports exactly one CA mode (macf#839 review nit 5) — `.strict()`'s
+ * typos-fail-loud rationale argues for an enum over a free string here too.
+ */
 export const FleetTrustSchema = z
   .object({
-    ca: z.string().min(1),
+    ca: z.enum(['per-project']).default('per-project'),
     federated_cas: z.array(z.string().min(1)),
   })
   .strict();
 
 export const FLEET_MANIFEST_API_VERSION = 'macf/v0';
+
+/**
+ * `agents[].role` charset (macf#839 review [BLOCKING] 1): lowercase
+ * kebab, no leading/trailing/double dashes. Deliberately does NOT mandate a
+ * `-agent` suffix — a future role (e.g. a bare `auditor`) may not carry one.
+ */
+export const ROLE_CHARSET_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 export const FleetManifestSchema = z
   .object({
@@ -167,9 +187,62 @@ export const FleetManifestSchema = z
     routing: FleetRoutingSchema.optional(),
     collaborators: z.array(FleetCollaboratorSchema).optional(),
     shared: FleetSharedSchema.optional(),
-    trust: FleetTrustSchema.optional(),
+    // Optional-with-default (macf#839 review nit 5): a MACF fleet always
+    // needs a CA, so an omitted `trust:` section must NOT gate the CA plan
+    // items off — it defaults to the only v0 mode, per-project, with no
+    // federation declared.
+    trust: FleetTrustSchema.optional().default({ ca: 'per-project', federated_cas: [] }),
   })
-  .strict();
+  .strict()
+  .superRefine((manifest, ctx) => {
+    // macf#839 review [BLOCKING] 1 + 2: the #791 front door (role mis-written
+    // as the prefixed App handle) + role/repo uniqueness. One pass over
+    // `agents[]` since both checks need per-agent context; `rolePrefix` needs
+    // `metadata.name`, so this can't live on `FleetAgentSchema` alone.
+    const rolePrefix = `${manifest.metadata.name}-`;
+    const seenRoles = new Set<string>();
+    const seenRepos = new Set<string>();
+
+    manifest.agents.forEach((agent, index) => {
+      if (agent.role.startsWith(rolePrefix)) {
+        ctx.addIssue({
+          code: 'custom',
+          message:
+            `agents[${String(index)}].role "${agent.role}" starts with the fleet name prefix "${rolePrefix}" — ` +
+            'this is the macf#791 / DR-032 double-prefix trap: deriveAppHandle would compound it into ' +
+            `"${manifest.metadata.name}-${agent.role}". role is the bare <bare-role> shape (deriveAppHandle ` +
+            'prepends the fleet name); never write the already-prefixed App handle here.',
+          path: ['agents', index, 'role'],
+        });
+      }
+
+      if (!ROLE_CHARSET_RE.test(agent.role)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `agents[${String(index)}].role "${agent.role}" must be lowercase kebab-case (^[a-z0-9]+(-[a-z0-9]+)*$)`,
+          path: ['agents', index, 'role'],
+        });
+      }
+
+      if (seenRoles.has(agent.role)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `duplicate agents[].role "${agent.role}" — every agent needs a unique role`,
+          path: ['agents', index, 'role'],
+        });
+      }
+      seenRoles.add(agent.role);
+
+      if (seenRepos.has(agent.repo)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `duplicate agents[].repo "${agent.repo}" — every agent needs its own home repo`,
+          path: ['agents', index, 'repo'],
+        });
+      }
+      seenRepos.add(agent.repo);
+    });
+  });
 
 export type FleetMetadata = z.infer<typeof FleetMetadataSchema>;
 export type FleetVersions = z.infer<typeof FleetVersionsSchema>;
