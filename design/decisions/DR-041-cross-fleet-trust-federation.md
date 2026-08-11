@@ -127,6 +127,33 @@ The `guests` binding is **not** a second addressing gate — `federated_cas` alo
 - **`scope_out` surfacing** — deferred until `#779` ships the `scope_out`/`capabilities` fields on `GuestBinding` (currently backlog). This Step gates purely on `federated_cas`; scope-awareness wires in when the fields exist. The addressing gate is complete without it.
 - **Secrets over A2A** — the encrypted+authenticated A2A/mTLS channel is *why* this matters for sending secrets to a guest (GitHub issue text is plaintext — never secrets there), and it is the direct enabler of the icsoc→ppam secure channel the operator needs. But **secret-*handling* over A2A** (no-log-body, age-vault reuse, trace-redaction) is its own design, filed as a separate follow-up — an explicit non-goal of the addressing Step.
 
+## Amendment B — Fleet-level trust: declare once, all agents inherit (`#810`)
+
+**Status:** Accepted (operator-directed 2026-07-05, `#810` — *"declare once that the entire fleet trusts someone"*; design settled + peer-endorsed on-thread 2026-07-05; science-authored; code-agent implements v1).
+**Trigger (verified live, 2026-07-05):** Decision 1's `federated_cas` is declared **per agent** (each agent's `.github/macf-fleet.json`), so federating a guest with a host fleet requires N per-agent edits + N relaunches — and the per-agent model made a **half-federated fleet silent**: the `ppam-2026/code-agent` guest could A2A `icsoc-2026/science-agent` (federated) but got a **false "offline"** from `icsoc-2026/code-agent` — up and serving, but `federated_cas: null` (guest-*bound* yet not *federated*), rejecting the guest's client cert at the mTLS handshake (`tls_client_error: socket hang up`). Federation had been set on one agent and not its sibling; nothing surfaced the asymmetry. This is the **trust ⊥ binding** decoupling (Amendment A / `#786`) biting when the *trust* axis is per-agent: binding is correctly per-agent; trust is a **fleet-level** property and belongs at fleet scope.
+
+### B1 — Declaration home: the shared-registry variable `<PROJECT_SEG>_FEDERATED_CAS`
+
+A fleet declares its federated trust **once**, as a registry variable (DR-006 profile scope — the same namespace as `<PROJECT>_CA_CERT`): e.g. `ICSOC_2026_FEDERATED_CAS = ["ppam-2026"]`. Every agent of that project reads it at channel-server startup and unions it into the trust bundle. **NOT a fleet-config file:** there is no "fleet repo" (every agent owns its own home repo), so a canonical fleet file would need one repo anointed as authoritative — recreating the per-repo drift this amendment eliminates. Per-agent HOME config (`macf-fleet.json`) holds an agent's *own* identity + bindings; **fleet-shared state belongs in the registry** (`check-before-propose §4`: the state has a home).
+
+### B2 — Reload semantics: relaunch-to-apply (v1); live reload is the v2 tier
+
+The trust bundle builds at startup (`#785`), so **v1 = set the variable + relaunch the fleet's agents**. Crucially, **v1 already fixes the correctness bug**: the *declaration* becomes 1 (not N per-agent edits), so a fleet cannot be asymmetrically federated; the relaunches are operational cost, not a correctness surface (the silent asymmetry lived in the N config edits). A **reload path** (poll the variable + rebuild the `ca:` bundle without relaunch) is the **Decision-1c Tier-v2 enhancement** — it composes with the `#783` bundle-endpoint poller; do not build it in v1.
+
+### B3 — Precedence: UNION, never override (the load-bearing safety call)
+
+The effective trust set = **fleet-level declaration ∪ per-agent `federated_cas`**. Trust is monotonic-additive: a per-agent entry may **raise** an agent's trust above the fleet floor (this agent also trusts an extra project), **never lower it**. If per-agent config could *override* the fleet set, an agent's local list would silently drop fleet trust — reintroducing the exact asymmetry this amendment kills. **Pattern-B property (`silent-fallback-hazards.md`): union makes a half-federated fleet *unrepresentable***, not merely detectable — every agent inherits the floor by construction, so no doctor-check for "half-federated" is needed; the design eliminates the failure mode rather than policing it.
+
+### Compositions (recorded deliberately)
+
+- **CA-rotation blast radius (`#800` / Instance 16): neutral-to-positive.** `<PROJECT_SEG>_FEDERATED_CAS` is a *project-name list*, not a CA copy (the guest CAs already live in the registry as `<GUEST>_CA_CERT`) — zero new out-of-band CA copies, and it removes the per-agent `federated_cas` drift surface. Combined with `macf-actions#66` (router reads the own-CA from the registry), the registry becomes the **single source of all federation state**: own-CA, federated-trust list, federated CA certs — the smallest possible rotation blast radius.
+- **Trust ⊥ binding preserved:** `guests` stays per-agent HOME config (who this agent collaborates with + the `#779` metadata); trust moves to fleet-registry scope. The two axes remain orthogonal — the trust axis simply can no longer be set asymmetrically.
+- **The unifying principle (three facets, one lesson):** *cross-fleet state must be registry-sourced and fleet-complete — never per-repo / per-agent-config-limited.* Facet 1: A2A addressing (Amendment A — resolve guests from the registry, not own-project config). Facet 2: CA trust (this amendment). Facet 3: GitHub mention-routing (`macf-actions#67` — `route-by-mention` must resolve cross-fleet targets from the shared registry, not the local `agent-config.json`; the reverse-direction cousin of Amendment A, filed as its sibling). Each incident in this family was the same lesson surfacing on a different mechanism.
+
+### Implementation (v1, code-agent — `#810`)
+
+Channel-server startup: read `<PROJECT_SEG>_FEDERATED_CAS` from the shared registry (reusing the exact `#785` registry-read path — one more variable read), **union** with the per-agent `macf-fleet.json` `federated_cas`, feed the result to `buildTrustBundlePem` (fail-loud semantics unchanged: any *declared* project whose CA is unresolvable still refuses a partial bundle). Technically independent of `macf-actions#66` (different component, different variable): ship standalone if the asymmetry bites again, else batch with #66 for the registry-single-source coherence.
+
 ## References
 - DR-036 Amendment A (`#679`) — the cross-fleet guest primitive this extends.
 - DR-006 — profile-scope registry (shared discovery, per-project CA namespaces).
@@ -136,6 +163,8 @@ The `guests` binding is **not** a second addressing gate — `federated_cas` alo
 - `#783` — the v2 bundle-endpoint + poller (Decision 1c Tier v2, documented/backlog).
 - `#784` / `#785` — Step 1: the multi-CA trust bundle (v0.2.54, shipped).
 - `#786` — Amendment A: cross-fleet guest *addressing* (the second half; outbound `<project>/<name>` slug resolution).
+- `#810` — Amendment B: fleet-level trust declaration (`<PROJECT_SEG>_FEDERATED_CAS`, union-never-override).
+- `macf-actions#66` / `macf-actions#67` — the registry-single-source siblings (router reads own-CA from registry; route-by-mention resolves cross-fleet targets from registry).
 - `macf-science-agent:research/2026-07-04-cross-fleet-trust-federation-dr041-sota.md` — the SOTA study grounding this design (26 sources, 22/25 claims verified; full source list + per-claim votes).
 - SPIFFE Federation: https://spiffe.io/docs/latest/spiffe-specs/spiffe_federation/ · `github.com/spiffe/spiffe/blob/main/standards/SPIFFE_Federation.md` · IETF `draft-ietf-oauth-spiffe-client-auth-02`.
 - A2A protocol (v1.0, Linux Foundation) Agent Cards + discovery: https://a2a-protocol.org/latest/specification/ · https://a2a-protocol.org/latest/topics/agent-discovery/
