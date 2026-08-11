@@ -288,6 +288,21 @@ When a PR has been open for an extended period without reviewer signal:
 
 This rule was surfaced 2026-04-26 during the macf-testbed#229 Phase C iter 4 sweep — a tester self-merged when its harness driver (acting as the de-facto reviewer) was killed mid-poll. The work was correct and the scenario AC was met, but the LGTM precondition wasn't. Codified here so the protocol covers reviewer-absence symmetrically with the existing implementer-absence case.
 
+#### Operator-sanctioned exception (groundnuty/macf#822)
+
+When the reporter/operator sanctions a self-merge per step 3 above, `MACF_SKIP_LGTM_CHECK=1` is **NOT** the mechanism — it is a **launch-time / operator-only** flag, read from the session's process env at `./claude.sh` launch and fixed for the session's lifetime. An agent cannot set it in-session (a Bash-tool `export` runs in a subshell that never reaches the hook's process env) — see the flag's own block-stderr for the mechanics. #822 Part 1 corrected every `check-*.sh` hook's stderr to state this honestly rather than presenting `export MACF_SKIP_LGTM_CHECK=1` as an in-session fix. #822 Part 2 (this section) gives the agent an actually-usable in-band path, in preference order:
+
+**(c) Preferred — an operator-authored GitHub artifact (un-forgeable, hook-verified).** When the workspace has `MACF_OPERATOR_LOGIN` configured (`operator_login` in `.macf/macf-agent.json`, flowing to the `MACF_OPERATOR_LOGIN` env var via `env.identity`), `check-lgtm-gate.sh` clears on **either**:
+
+- a formal `gh pr review --approve` from the operator's own login (the operator counts as any other non-author reviewer — no special-casing needed), **or**
+- a one-line PR comment authored by the operator's own login containing the exact marker `[macf-sanction-merge]` (case-insensitive) — e.g. `gh pr comment <N> --body "Reviewer's offline, sanctioning this one. [macf-sanction-merge]"`.
+
+Either form is **un-forgeable**: an agent cannot post a GitHub review or comment attributed to the operator's own account, so the gate is verifying a real artifact, not trusting the agent's self-attestation. Same one-click (or one-comment) friction as a verbal "you can approve for me," but structurally checkable — see `check-lgtm-gate.sh`'s "operator-login sanction-comment path" for the exact query. Direction (c) is the operator + `macf-science-agent[bot]` + `macf-auditor[bot]`-advisory-reviewed outcome of #822 Part 2 (governance record: `groundnuty/macf#822`, comments 2026-08-11).
+
+**(a) Fallback — verbal sanction, recorded in the durable artifact.** When the operator sanctions verbally (a chat message, a terminal instruction) and declines to touch GitHub — `MACF_OPERATOR_LOGIN` isn't configured, or the operator just doesn't want to click anything — the agent uses the documented direct route (e.g. `gh api` to merge, bypassing `gh pr merge` so the hook's exact-subcommand match doesn't even engage) and **records the sanction verbatim in the durable artifact**: the squash-commit body or the issue close comment, quoting who sanctioned it and why. This is self-attested, not hook-verified — acceptable specifically because it stays rare and always leaves an audit trail. **The sweepable invariant this creates:** every merge lacking a non-author APPROVED review MUST carry a recorded sanction (in the squash body, close comment, or PR thread) that names who authorized it. Auditing that invariant — a periodic sweep for gate-bypassed merges lacking a recorded sanction, plus a matching reflection-ledger entry per merge — is `macf-auditor[bot]`'s DR-026 follow-up (propose-only; not built as part of #822 Part 2 itself).
+
+`MACF_SKIP_*` flags across the whole hook family stay **operator/launch-only** (per #822 Part 1) — there is no agent-usable in-session escape hatch for `check-gh-token.sh` / `check-mention-routing.sh` / `check-close-keyword.sh` / `check-gh-attribution.sh` / `check-auditor-never-acts.sh`, because none of those hooks have a legitimate agent-side sanctioned-exception the way the LGTM gate does (agents never do user-attributed ops, so there's no "the operator sanctions this specific bypass" case for the token/mention/close/attribution family — those either hold or the agent fixes its command). The LGTM gate is the one hook in the family with an agent-usable exception, because "operator sanctions a specific merge" is a real, recurring, legitimate case (§"When the reviewer is absent or unreachable" above) that the other hooks don't have an analog for.
+
 ### Before merging
 
 Check `mergeStateStatus` via `gh pr view <N> --json mergeStateStatus`:
@@ -352,7 +367,7 @@ changed.
 
 ## Structural enforcement — `check-lgtm-gate.sh` PreToolUse hook
 
-Per `groundnuty/macf#270` (DR-023 UC-2), the "no LGTM = no merge" rule (codified above in §"How to submit LGTM" + §"When the reviewer is absent or unreachable" + §"Merge-by-implementer") is enforced by a Claude Code PreToolUse hook on `Bash` tool calls. The hook intercepts `gh pr merge` invocations, queries the target PR's review state via `gh pr view --json author,reviews`, and BLOCKs (`exit 2` with stderr explanation) when no APPROVED review from a non-author exists.
+Per `groundnuty/macf#270` (DR-023 UC-2), the "no LGTM = no merge" rule (codified above in §"How to submit LGTM" + §"When the reviewer is absent or unreachable" + §"Merge-by-implementer") is enforced by a Claude Code PreToolUse hook on `Bash` tool calls. The hook intercepts `gh pr merge` invocations, queries the target PR's review state via `gh pr view --json author,reviews,comments`, and BLOCKs (`exit 2` with stderr explanation) when no APPROVED review from a non-author exists AND no operator-sanction comment clears it (see below).
 
 **Architectural shape (DR-023 amendment 2026-04-27):** this is a bash command-type hook, NOT `type: "mcp_tool"`. PreToolUse-blocking semantics + mcp_tool's non-blocking-on-disconnect failure mode are structurally incompatible — a missing or transiently-disconnected MCP server would silently allow the merge. Bash form fires uniformly across substrate workspaces (where the `macf-agent` MCP server is permanently off per operator directive 2026-04-27) AND consumer workspaces (startup window + transient disconnect periods produce silent-fail paths under mcp_tool). Same reasoning UC-4 (`check-mention-routing.sh`, PR #275) demonstrated empirically.
 
@@ -362,19 +377,22 @@ Per `groundnuty/macf#270` (DR-023 UC-2), the "no LGTM = no merge" rule (codified
 
 - Command does NOT match `gh pr merge` (exact subcommand, wrapper-aware) → allow (other gh subcommands pass through unchanged)
 - Command matches but no PR number can be extracted → allow (defense-in-depth; gh itself surfaces the usage error)
-- Command matches AND `gh pr view --json author,reviews` returns at least one APPROVED review where reviewer login != author login (after normalizing `app/` prefix + `[bot]` suffix) → allow
-- Command matches AND no non-author APPROVED review exists → BLOCK with stderr citing this rule + the missing-LGTM diagnosis + the `MACF_SKIP_LGTM_CHECK=1` operator override
+- Command matches AND `gh pr view --json author,reviews,comments` returns at least one APPROVED review where reviewer login != author login (after normalizing `app/` prefix + `[bot]` suffix) → allow
+- Command matches AND `MACF_OPERATOR_LOGIN` is configured AND a PR comment authored by that exact login contains the marker `[macf-sanction-merge]` (case-insensitive) → allow (macf#822 Part 2, direction (c) — un-forgeable, since an agent cannot post a comment attributed to the operator's own account; see §"Operator-sanctioned exception" above)
+- Command matches AND neither of the above holds → BLOCK with stderr citing this rule + the missing-LGTM diagnosis + the `MACF_SKIP_LGTM_CHECK=1` operator override + the operator-sanction-comment path
 - Any infrastructure failure (gh missing, network 404/5xx, malformed JSON) → fail-open (allow). Same defense-in-depth posture as `check-gh-token.sh` and `check-mention-routing.sh` — the hook closes residual policy slips, not all merge paths
 
 **Wrapper coverage:** the regex matches `gh pr merge` preceded by `sudo`, `env VAR=...`, `watch`, `ionice`, `setsid`, `nice`, `time`, bare-`VAR=...` env-prefix forms, and shell wrappers (`bash -c "gh pr merge ..."`, `sh -c`, `zsh -c`, including flag-prefixed forms like `bash -lc`). Same wrapper allow-list as `check-gh-token.sh` + `check-mention-routing.sh`. Chained-form leadins `;` `|` `&&` covered.
 
 **False-positive trade-off:** the hook leans toward false-positive over false-negative on parse-failure paths. PR-number extraction tolerates URL form (`https://github.com/owner/repo/pull/N`), `owner/repo#N` shorthand, and quoted positionals. Bare `gh pr merge` (no positional, gh prompts interactively) passes through unblocked — the operator's discipline catches it because the prompt is visible.
 
-**Override (`MACF_SKIP_LGTM_CHECK=1`)** is the escape hatch for legitimate exceptions documented in §"When the reviewer is absent or unreachable":
+**Override (`MACF_SKIP_LGTM_CHECK=1`) is launch-time / operator only** — read from the session's process env at `./claude.sh` launch, fixed for the session's lifetime. An in-session `export MACF_SKIP_LGTM_CHECK=1` from a Bash tool call does NOT reach the hook (Bash-tool commands run in a subshell that never persists into the session's env); to use it, the operator sets it before launch (or in the workspace's `.claude/.macf/env.*` files) and relaunches (macf#822 Part 1). It covers the same exceptions documented in §"When the reviewer is absent or unreachable":
 
 - Reporter-sanctioned self-merge after extended reviewer absence
 - The "PR author offline → reviewer merges with hand-off comment" exception
 - Urgent reverts where waiting for review is itself a hazard
+
+**For an agent-usable mid-session exception, use the operator-login sanction-comment path (macf#822 Part 2, direction (c))** documented in §"Operator-sanctioned exception" above — un-forgeable, hook-verified, no relaunch required. Fall back to (a) (verbal sanction + recorded artifact) only when `MACF_OPERATOR_LOGIN` isn't configured or the operator declines to touch GitHub.
 
 Per the `check-gh-token.sh` precedent, structural enforcement plus an escape hatch outperforms behavioral discipline alone.
 

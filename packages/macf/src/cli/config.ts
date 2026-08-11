@@ -190,6 +190,19 @@ export const MacfAgentConfigSchema = z.object({
   // absent (and this field is itself overridable by `MACF_CANONICAL_BRANCH`
   // env — see that function's priority order).
   canonicalBranch: z.string().min(1).optional(),
+  // The operator's own GitHub login (macf#822 Part 2, DR-026 advisory
+  // reviewed). Optional — most workspaces leave this unset. When set,
+  // exported as MACF_OPERATOR_LOGIN (env.identity) and consumed by
+  // `check-lgtm-gate.sh`'s operator-login sanction-comment path: a PR
+  // comment authored by THIS login containing the exact marker
+  // `[macf-sanction-merge]` clears the LGTM gate even with no formal
+  // APPROVED review. Un-forgeable because an agent cannot post a GitHub
+  // comment attributed to the operator's own account — the hook verifies
+  // a real artifact (the comment's author), not a self-attestation. Unset
+  // → the sanction-comment path is off; the gate behaves exactly as it did
+  // before #822 Part 2 (non-author APPROVED review or MACF_SKIP_LGTM_CHECK
+  // only). See pr-discipline.md §"Operator-sanctioned exception (macf#822)".
+  operator_login: z.string().min(1).optional(),
 });
 
 export type MacfAgentConfig = z.infer<typeof MacfAgentConfigSchema>;

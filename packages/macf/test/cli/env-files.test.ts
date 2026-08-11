@@ -79,6 +79,11 @@ const advertiseHostConfig: MacfAgentConfig = {
   advertise_host: '100.124.163.105',
 };
 
+const operatorLoginConfig: MacfAgentConfig = {
+  ...baseConfig,
+  operator_login: 'groundnuty',
+};
+
 // ---------------------------------------------------------------------------
 // generateEnvIdentity
 // ---------------------------------------------------------------------------
@@ -166,6 +171,16 @@ describe('generateEnvIdentity', () => {
     const out = generateEnvIdentity(localConfig);
     expect(out).toContain('export MACF_PROJECT="TEST"');
     expect(out).toContain('MACF_AGENT_NAME="${MACF_AGENT_NAME:-cv-architect}"');
+  });
+
+  it('does NOT emit MACF_OPERATOR_LOGIN when operator_login is unset (groundnuty/macf#822 Part 2)', () => {
+    const out = generateEnvIdentity(baseConfig);
+    expect(out).not.toContain('MACF_OPERATOR_LOGIN');
+  });
+
+  it('emits export MACF_OPERATOR_LOGIN when operator_login is set (groundnuty/macf#822 Part 2)', () => {
+    const out = generateEnvIdentity({ ...baseConfig, operator_login: 'groundnuty' });
+    expect(out).toContain('export MACF_OPERATOR_LOGIN="groundnuty"');
   });
 });
 
@@ -654,6 +669,7 @@ describe('cross-concern invariants', () => {
     { name: 'repo + tmux full', cfg: tmuxFullConfig },
     { name: 'repo + tmux session-only', cfg: tmuxSessionOnlyConfig },
     { name: 'repo + advertise_host', cfg: advertiseHostConfig },
+    { name: 'repo + operator_login', cfg: operatorLoginConfig },
   ];
 
   for (const { name, cfg } of matrix) {

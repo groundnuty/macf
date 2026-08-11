@@ -38,9 +38,16 @@ interface StubReview {
   readonly state: string;
 }
 
+interface StubComment {
+  readonly authorLogin: string;
+  readonly body: string;
+}
+
 interface StubPr {
   readonly authorLogin: string;
   readonly reviews: readonly StubReview[];
+  /** Optional — groundnuty/macf#822 Part 2 (operator-sanction-comment path). */
+  readonly comments?: readonly StubComment[];
 }
 
 /**
@@ -119,6 +126,10 @@ ${Object.entries(stubs)
       reviews: stub.reviews.map((r) => ({
         author: { login: r.authorLogin },
         state: r.state,
+      })),
+      comments: (stub.comments ?? []).map((c) => ({
+        author: { login: c.authorLogin },
+        body: c.body,
       })),
     });
     return `  ${prNum}) cat <<'JSON_EOF'\n${json}\nJSON_EOF\n  ;;`;
@@ -453,6 +464,181 @@ describe('check-lgtm-gate.sh (hook)', () => {
         },
       });
       expect(r.status).toBe(2);
+    });
+  });
+
+  describe('operator-login sanction-comment path (groundnuty/macf#822 Part 2)', () => {
+    it('clears the gate on an operator-login [macf-sanction-merge] comment with NO approving review', () => {
+      const r = runHook({
+        command: 'gh pr merge 800 --repo owner/repo --squash',
+        env: { MACF_OPERATOR_LOGIN: 'groundnuty' },
+        stubGh: {
+          '800': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [],
+            comments: [
+              { authorLogin: 'groundnuty', body: 'Reviewer is offline, sanctioning this one. [macf-sanction-merge]' },
+            ],
+          },
+        },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stderr).toMatch(/operator-sanction/i);
+    });
+
+    it('the un-forgeable property: an AGENT/non-operator login posting the marker does NOT clear the gate', () => {
+      // Load-bearing test — this is the whole point of preferring (c) over
+      // a self-writable marker: only a comment AUTHORED BY the configured
+      // operator login counts. A peer agent (or the PR author itself)
+      // posting the exact same marker text must still BLOCK.
+      const r = runHook({
+        command: 'gh pr merge 801 --repo owner/repo --squash',
+        env: { MACF_OPERATOR_LOGIN: 'groundnuty' },
+        stubGh: {
+          '801': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [],
+            comments: [
+              { authorLogin: 'macf-science-agent', body: '[macf-sanction-merge]' },
+            ],
+          },
+        },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/BLOCKED/);
+    });
+
+    it('self-sanction guard: operator login == PR author + marker does NOT clear the gate', () => {
+      // groundnuty/macf#822 review catch: `operator_login` lives in
+      // agent-writable macf-agent.json, so an agent could poison it to its
+      // OWN login (+ restart-self) and self-sanction. The operator!=author
+      // guard (mirroring the review path's non-author condition) blocks that
+      // shape: here MACF_OPERATOR_LOGIN and the PR author are the same login,
+      // and the author posts the marker on its own PR — must still BLOCK.
+      const r = runHook({
+        command: 'gh pr merge 803 --repo owner/repo --squash',
+        env: { MACF_OPERATOR_LOGIN: 'macf-code-agent' },
+        stubGh: {
+          '803': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [],
+            comments: [
+              { authorLogin: 'app/macf-code-agent', body: '[macf-sanction-merge]' },
+            ],
+          },
+        },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/BLOCKED/);
+    });
+
+    it('an operator-login comment WITHOUT the marker does NOT clear the gate', () => {
+      const r = runHook({
+        command: 'gh pr merge 802 --repo owner/repo --squash',
+        env: { MACF_OPERATOR_LOGIN: 'groundnuty' },
+        stubGh: {
+          '802': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [],
+            comments: [{ authorLogin: 'groundnuty', body: 'LGTM, go ahead and merge.' }],
+          },
+        },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/BLOCKED/);
+    });
+
+    it('MACF_OPERATOR_LOGIN unset + sanction comment present + no approval → still BLOCKS (path off)', () => {
+      const r = runHook({
+        command: 'gh pr merge 803 --repo owner/repo --squash',
+        // MACF_OPERATOR_LOGIN intentionally omitted from env.
+        stubGh: {
+          '803': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [],
+            comments: [{ authorLogin: 'groundnuty', body: '[macf-sanction-merge]' }],
+          },
+        },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/BLOCKED/);
+    });
+
+    it('marker match is case-insensitive', () => {
+      const r = runHook({
+        command: 'gh pr merge 804 --repo owner/repo --squash',
+        env: { MACF_OPERATOR_LOGIN: 'groundnuty' },
+        stubGh: {
+          '804': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [],
+            comments: [{ authorLogin: 'groundnuty', body: 'ok — [MACF-SANCTION-MERGE]' }],
+          },
+        },
+      });
+      expect(r.status).toBe(0);
+    });
+
+    it('a non-author APPROVED review still clears the gate when MACF_OPERATOR_LOGIN is configured (unchanged path)', () => {
+      const r = runHook({
+        command: 'gh pr merge 805 --repo owner/repo --squash',
+        env: { MACF_OPERATOR_LOGIN: 'groundnuty' },
+        stubGh: {
+          '805': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [{ authorLogin: 'macf-science-agent', state: 'APPROVED' }],
+            comments: [],
+          },
+        },
+      });
+      expect(r.status).toBe(0);
+    });
+
+    it('an operator FORMAL APPROVE (review, not comment) still clears the gate — the operator IS a valid non-author reviewer', () => {
+      const r = runHook({
+        command: 'gh pr merge 806 --repo owner/repo --squash',
+        env: { MACF_OPERATOR_LOGIN: 'groundnuty' },
+        stubGh: {
+          '806': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [{ authorLogin: 'groundnuty', state: 'APPROVED' }],
+          },
+        },
+      });
+      expect(r.status).toBe(0);
+    });
+
+    it('self-approve by the PR author still does NOT clear the gate even with MACF_OPERATOR_LOGIN configured', () => {
+      const r = runHook({
+        command: 'gh pr merge 807 --repo owner/repo --squash',
+        env: { MACF_OPERATOR_LOGIN: 'groundnuty' },
+        stubGh: {
+          '807': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [{ authorLogin: 'macf-code-agent', state: 'APPROVED' }],
+            comments: [],
+          },
+        },
+      });
+      expect(r.status).toBe(2);
+    });
+
+    it('MACF_SKIP_LGTM_CHECK=1 still short-circuits before any operator-login logic runs', () => {
+      const r = runHook({
+        command: 'gh pr merge 808 --repo owner/repo --squash',
+        env: { MACF_SKIP_LGTM_CHECK: '1', MACF_OPERATOR_LOGIN: 'groundnuty' },
+        // No stub — the skip override should short-circuit before any gh call.
+      });
+      expect(r.status).toBe(0);
+    });
+
+    it('fail-open on gh error is unaffected by MACF_OPERATOR_LOGIN being configured', () => {
+      const r = runHook({
+        command: 'gh pr merge 809 --repo owner/repo --squash',
+        env: { MACF_OPERATOR_LOGIN: 'groundnuty' },
+        stubGh: { '809': null },
+      });
+      expect(r.status).toBe(0);
     });
   });
 
