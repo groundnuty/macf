@@ -6,6 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   deriveAppHandle,
+  deriveControlRepoName,
   parseFleetLock,
   parseFleetManifest,
   FLEET_LOCK_SCHEMA_VERSION,
@@ -31,7 +32,6 @@ network:
   advertise_host: orzech-dev-agents.tail491af.ts.net
 
 transport:
-  vault_repo: groundnuty/icsoc-2026-science-agent
   age_recipients: []
 
 defaults:
@@ -139,7 +139,6 @@ owner:
 network:
   advertise_host: example.ts.net
 transport:
-  vault_repo: groundnuty/minimal-fleet-science-agent
   age_recipients: []
 defaults:
   role_template: groundnuty/agentic-repo-template
@@ -205,6 +204,21 @@ describe('parseFleetManifest — transport.age_recipients (macf#852: list, not a
   });
 });
 
+describe('parseFleetManifest — transport.vault_repo REMOVED (macf#857, DR-043 Amendment F)', () => {
+  // Amendment F: "transport.vault_repo is REMOVED; the vault always lives in
+  // the control repo ... Make the bad state unrepresentable — the vault
+  // location is derived from the control repo, no knob." `.strict()` makes
+  // a reintroduced `vault_repo` key a loud parse rejection, not a silently-
+  // ignored field.
+  it('rejects a manifest that still declares transport.vault_repo', () => {
+    const bad = VALID_FLEET_YAML.replace(
+      'transport:\n  age_recipients: []',
+      'transport:\n  vault_repo: groundnuty/icsoc-2026-science-agent\n  age_recipients: []',
+    );
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+});
+
 describe('parseFleetManifest — rejections', () => {
   it('rejects a wrong apiVersion', () => {
     const bad = VALID_FLEET_YAML.replace('apiVersion: macf/v0', 'apiVersion: macf/v1');
@@ -242,7 +256,6 @@ owner:
 network:
   advertise_host: example.ts.net
 transport:
-  vault_repo: groundnuty/empty-fleet-science-agent
   age_recipients: []
 defaults:
   role_template: groundnuty/agentic-repo-template
@@ -332,6 +345,16 @@ describe('deriveAppHandle — DR-032 Amendment (macf#791): handle = <project>-<r
 
   it('is a pure string concatenation with no normalization surprises', () => {
     expect(deriveAppHandle('ppam-2026', 'writer-agent')).toBe('ppam-2026-writer-agent');
+  });
+});
+
+describe('deriveControlRepoName — DR-043 Amendment F (macf#857): <fleet>-control, always derived', () => {
+  it('is <fleet>-control, no owner prefix (mirrors deriveAppHandle\'s bare-handle convention)', () => {
+    expect(deriveControlRepoName('icsoc-2026')).toBe('icsoc-2026-control');
+  });
+
+  it('is a pure string concatenation with no normalization surprises', () => {
+    expect(deriveControlRepoName('ppam-2026')).toBe('ppam-2026-control');
   });
 });
 

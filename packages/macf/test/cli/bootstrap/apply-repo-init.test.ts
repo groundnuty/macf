@@ -12,8 +12,10 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   applyRepoInitForAgent,
+  ensureAgentRepo,
   repoInitRegistryOptions,
   RepoInitStepError,
+  type AgentRepoDeps,
   type RepoInitStepDeps,
 } from '../../../src/cli/bootstrap/apply-repo-init.js';
 import type { FleetAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
@@ -28,7 +30,7 @@ const MANIFEST: FleetManifest = {
   versions: { macf: '0.2.56', actions: 'v3.4.1' },
   owner: { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } },
   network: { advertise_host: 'example.ts.net' },
-  transport: { vault_repo: 'groundnuty/demo-science', age_recipients: ['age1operator'] },
+  transport: { age_recipients: ['age1operator'] },
   defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
   agents: [{ role: 'code-agent', profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/x' }],
   trust: { ca: 'per-project', federated_cas: [] },
@@ -215,5 +217,79 @@ describe('applyRepoInitForAgent', () => {
     };
     await applyRepoInitForAgent(AGENT, MANIFEST, deps);
     expect(seenOpts).toMatchObject({ repo: 'groundnuty/demo-code', agents: 'code-agent', force: false, project: 'demo-fleet' });
+  });
+});
+
+// --- ensureAgentRepo (macf#857, DR-043 Amendment F / #854 §2) ---
+
+describe('ensureAgentRepo', () => {
+  it('absent + provenance template (default) -> creates FROM defaults.role_template', async () => {
+    const calls: { repo: string; opts: unknown }[] = [];
+    const deps: AgentRepoDeps = {
+      checkExists: async () => 'absent',
+      createRepo: async (repo, opts) => {
+        calls.push({ repo, opts });
+      },
+    };
+    const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
+    expect(outcome).toEqual({ repo: 'groundnuty/demo-code', role: 'code-agent', status: 'created' });
+    expect(calls).toEqual([{ repo: 'groundnuty/demo-code', opts: { template: 'groundnuty/agentic-repo-template' } }]);
+  });
+
+  it('absent + provenance mirror -> creates BLANK (no template)', async () => {
+    const mirrorAgent: FleetAgent = { ...AGENT, provenance: 'mirror' };
+    const calls: { repo: string; opts: unknown }[] = [];
+    const deps: AgentRepoDeps = {
+      checkExists: async () => 'absent',
+      createRepo: async (repo, opts) => {
+        calls.push({ repo, opts });
+      },
+    };
+    const outcome = await ensureAgentRepo(mirrorAgent, MANIFEST, deps);
+    expect(outcome.status).toBe('created');
+    expect(calls).toEqual([{ repo: 'groundnuty/demo-code', opts: undefined }]);
+  });
+
+  it('already present -> left untouched, status "present", createRepo never called', async () => {
+    const createRepo = vi.fn();
+    const deps: AgentRepoDeps = { checkExists: async () => 'present', createRepo };
+    const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
+    expect(outcome).toEqual({ repo: 'groundnuty/demo-code', role: 'code-agent', status: 'present' });
+    expect(createRepo).not.toHaveBeenCalled();
+  });
+
+  it('existence unconfirmable ("unknown") -> failed, refuses to guess, createRepo never called', async () => {
+    const createRepo = vi.fn();
+    const deps: AgentRepoDeps = { checkExists: async () => 'unknown', createRepo };
+    const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/could not confirm/);
+    expect(createRepo).not.toHaveBeenCalled();
+  });
+
+  it('createRepo throwing -> status failed, carries the underlying reason', async () => {
+    const deps: AgentRepoDeps = {
+      checkExists: async () => 'absent',
+      createRepo: async () => {
+        throw new Error('name already exists on this account');
+      },
+    };
+    const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/already exists/);
+  });
+
+  it('NEVER throws, even when checkExists itself throws', async () => {
+    const createRepo = vi.fn();
+    const deps: AgentRepoDeps = {
+      checkExists: async () => {
+        throw new Error('network down');
+      },
+      createRepo,
+    };
+    const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/network down/);
+    expect(createRepo).not.toHaveBeenCalled();
   });
 });

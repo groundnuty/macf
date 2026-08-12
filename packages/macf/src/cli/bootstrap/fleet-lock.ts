@@ -34,9 +34,9 @@
  * on the way in and never appear in a composed/serialized lock.
  */
 import { createHash } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import type { FleetLock, FleetLockAgent, FleetVersions } from './fleet-manifest.js';
-import { FLEET_LOCK_SCHEMA_VERSION, FleetLockSchema } from './fleet-manifest.js';
+import { FLEET_LOCK_SCHEMA_VERSION, FleetLockSchema, parseFleetLock } from './fleet-manifest.js';
 
 /**
  * Non-secret SHA-256 fingerprint of a secret value, `sha256:<hex>` — matches
@@ -299,4 +299,25 @@ export function serializeFleetLock(lock: FleetLock): string {
  */
 export function writeFleetLock(path: string, lock: FleetLock): void {
   writeFileSync(path, serializeFleetLock(lock), 'utf-8');
+}
+
+/**
+ * Read + parse a `FleetLock` from an EXACT path (as opposed to
+ * `observer.ts::readFleetLock`, which derives the path from a manifest
+ * file's directory). Returns `null` when absent or malformed — NEVER throws
+ * (same posture as `observer.ts::readFleetLock`, which now delegates here).
+ *
+ * Added for DR-043 Amendment F (macf#857): `apply-fleet.ts` needs this to
+ * read `fleet.lock` back out of a freshly-cloned `<fleet>-control` checkout
+ * (a plain directory path, not a manifest file path) so a REUSE run
+ * self-heals its `priorLock` from the control repo's own committed history,
+ * rather than trusting only whatever the caller passed in.
+ */
+export function readFleetLockFile(lockPath: string): FleetLock | null {
+  if (!existsSync(lockPath)) return null;
+  try {
+    return parseFleetLock(readFileSync(lockPath, 'utf-8'));
+  } catch {
+    return null;
+  }
 }

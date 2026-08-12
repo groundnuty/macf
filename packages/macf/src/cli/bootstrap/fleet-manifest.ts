@@ -93,7 +93,6 @@ export const FleetNetworkSchema = z
  */
 export const FleetTransportSchema = z
   .object({
-    vault_repo: z.string().min(1),
     age_recipients: z.array(z.string().min(1)),
   })
   .strict();
@@ -342,4 +341,19 @@ export function parseFleetLock(text: string): FleetLock {
  */
 export function deriveAppHandle(fleetName: string, role: string): string {
   return `${fleetName}-${role}`;
+}
+
+/**
+ * Derive a fleet's control-plane repo NAME (bare, no `owner/` prefix — same
+ * convention as {@link deriveAppHandle}'s bare handle) from `metadata.name`
+ * — DR-043 Amendment F. **Derived, never registry-pointed, never a manifest
+ * field** — same "handle derivation, never declaration" posture this module
+ * already establishes for App handles (macf#791): "Discovery is
+ * deterministic derivation from the fleet name (no lookup, no drift
+ * surface)." Callers compose the full `owner/repo` form themselves (see
+ * `control-repo.ts::controlRepoFullName`) — this function doesn't take an
+ * owner because the derivation itself doesn't need one.
+ */
+export function deriveControlRepoName(fleetName: string): string {
+  return `${fleetName}-control`;
 }

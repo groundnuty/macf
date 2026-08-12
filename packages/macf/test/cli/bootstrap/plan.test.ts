@@ -28,7 +28,7 @@ function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
     metadata: { name: 'icsoc-2026' },
     owner: { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } },
     network: { advertise_host: 'example.ts.net' },
-    transport: { vault_repo: 'groundnuty/icsoc-2026-science-agent', age_recipients: [] },
+    transport: { age_recipients: [] },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents: [
       {
@@ -376,18 +376,21 @@ function fakeItem(kind: PlanItemKind, verb: PlanVerb): PlanItem {
   return { kind, target: `${kind}:x`, verb, reason: 'fake', confirm_required: false };
 }
 
-describe('planItemApplyCoverage — the single source of truth for what apply can/cannot action (macf#854)', () => {
+describe('planItemApplyCoverage — the single source of truth for what apply can/cannot action (macf#854, macf#857)', () => {
   it.each<[PlanItemKind, PlanVerb]>([
     ['app', 'create'],
     ['install', 'create'],
     ['secret_fingerprint', 'create'],
     ['repo', 'noop'],
+    // macf#857 (DR-043 Amendment F): apply-fleet.ts now calls
+    // ensureAgentRepo for every agent before either consent gate, so
+    // repo:create IS actioned — it joined the implemented group.
+    ['repo', 'create'],
   ])('%s/%s is implemented', (kind, verb) => {
     expect(planItemApplyCoverage(fakeItem(kind, verb))).toBe('implemented');
   });
 
   it.each<[PlanItemKind, PlanVerb]>([
-    ['repo', 'create'], // apply never creates repos — apply-repo-init.ts §2
     ['ca', 'create'],
     ['ca', 'update'],
     ['routing', 'create'],
@@ -411,13 +414,14 @@ describe('planItemApplyCoverage — the single source of truth for what apply ca
   });
 });
 
-describe('computePlan — unimplementedByApply (plan must not overstate what apply will do, macf#854)', () => {
-  it('flags CA (registry + both repos) — and repo, since EMPTY_OBSERVED has no repo presence either — on a fresh fleet with no routing declared', () => {
+describe('computePlan — unimplementedByApply (plan must not overstate what apply will do, macf#854, macf#857)', () => {
+  it('flags CA (registry + both repos) — and NOT repo (macf#857: apply-fleet.ts now creates agent repos) — on a fresh fleet with no routing declared', () => {
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
-    // 3 CA items (registry + 2 agent repos, all `unknown` → create) + 2 repo
-    // items (EMPTY_OBSERVED carries no agent data at all, so `repoItem` also
-    // degrades to `unknown` → create — genuinely nothing is confirmed yet).
-    expect(plan.unimplementedByApply.map((i) => i.kind).sort()).toEqual(['ca', 'ca', 'ca', 'repo', 'repo']);
+    // 3 CA items (registry + 2 agent repos, all `unknown` → create). `repo`
+    // items are ALWAYS implemented now (macf#857) regardless of verb — see
+    // planItemApplyCoverage's table above — even though EMPTY_OBSERVED's
+    // repo presence is also `unknown` → create here.
+    expect(plan.unimplementedByApply.map((i) => i.kind).sort()).toEqual(['ca', 'ca', 'ca']);
     for (const item of plan.unimplementedByApply) {
       expect(item.reason.length).toBeGreaterThan(0);
       expect(item.reason).not.toBe(plan.items.find((p) => p.target === item.target)?.reason);
@@ -431,10 +435,10 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
     expect(plan.unimplementedByApply.some((i) => i.kind === 'routing' && i.verb === 'update')).toBe(true);
   });
 
-  it('flags repo:create but not repo:noop', () => {
+  it('NEVER flags repo — neither repo:create nor repo:noop (macf#857: ensureAgentRepo actions it)', () => {
     const manifest = baseManifest();
     const freshPlan = computePlan(manifest, EMPTY_OBSERVED);
-    expect(freshPlan.unimplementedByApply.some((i) => i.kind === 'repo')).toBe(true);
+    expect(freshPlan.unimplementedByApply.some((i) => i.kind === 'repo')).toBe(false);
 
     const observedRepoPresent: ObservedState = {
       lock: null,
@@ -493,9 +497,9 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
   it('formatUnimplementedLines renders the exact loud-line shape, distinct wording from SKIPPED', () => {
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
     const lines = formatUnimplementedLines(plan.unimplementedByApply);
-    expect(lines.length).toBe(5); // 3 ca + 2 repo, see the test above
+    expect(lines.length).toBe(3); // 3 ca (registry + 2 agent repos) — see the test above; repo is implemented now (macf#857)
     for (const line of lines) {
-      expect(line).toMatch(/^(ca|repo):.* \(create\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
+      expect(line).toMatch(/^ca:.* \(create\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
       expect(line).not.toContain('SKIPPED');
     }
   });

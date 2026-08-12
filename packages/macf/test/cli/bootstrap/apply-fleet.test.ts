@@ -12,7 +12,7 @@
  * `age` binary, gated `skipIf(!HAS_AGE)` per `vault-write.test.ts`'s
  * "never fake a passing test" convention.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -21,7 +21,8 @@ import { applyFleet, type FleetApplyDeps } from '../../../src/cli/bootstrap/appl
 import type { FleetAgent, FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { parseFleetLock, parseFleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { AgentApplyDeps } from '../../../src/cli/bootstrap/apply-agent.js';
-import type { RepoInitStepDeps } from '../../../src/cli/bootstrap/apply-repo-init.js';
+import type { AgentRepoDeps, RepoInitStepDeps } from '../../../src/cli/bootstrap/apply-repo-init.js';
+import type { ControlRepoDeps } from '../../../src/cli/bootstrap/control-repo.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 
 // Default mirrors the §D5 multi-recipient shape (operator key + VM key,
@@ -38,11 +39,37 @@ function manifestWith(agents: readonly FleetAgent[], ageRecipients: readonly str
     versions: { macf: '0.2.56', actions: 'v3.4.1' },
     owner: { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } },
     network: { advertise_host: 'example.ts.net' },
-    transport: { vault_repo: 'groundnuty/demo-science', age_recipients: ageRecipients },
+    transport: { age_recipients: ageRecipients },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents,
     trust: { ca: 'per-project', federated_cas: [] },
   };
+}
+
+// --- DR-043 Amendment F (macf#857) — control-repo / agent-repo fakes ---
+//
+// `provisionControlRepo`'s `makeScratchDir` (threaded via
+// `FleetApplyDeps.controlRepoOptions`) is pointed at the SAME temp dir
+// `manifestPathIn()` already created + tracks for cleanup — this is what
+// keeps every EXISTING path-based assertion in this file (`result.lockPath`,
+// the hand-built `secrets/recovery/<role>.age` paths) valid unchanged: the
+// control-repo "checkout" IS `dirname(manifestPath)` in every test below,
+// exactly matching this file's pre-Amendment-F behavior. A `checkMeta` that
+// always reports `'absent'` means every test run takes the CREATE path
+// (no real `gh`/`git` — `createRepo`/`cloneRepo`/`commitAndPush` are no-ops).
+function controlRepoDepsFor(): ControlRepoDeps {
+  return {
+    checkMeta: async () => ({ presence: 'absent' }),
+    readManifestFile: async () => undefined,
+    createRepo: async () => {},
+    cloneRepo: async () => {},
+    commitAndPush: async () => 'pushed',
+  };
+}
+
+/** Every agent's repo reports `'absent'` -> `ensureAgentRepo` "creates" it (no-op `createRepo`). */
+function agentRepoDepsFor(): AgentRepoDeps {
+  return { checkExists: async () => 'absent', createRepo: async () => {} };
 }
 
 const CODE_AGENT: FleetAgent = { role: 'code-agent', profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/x' };
@@ -166,11 +193,22 @@ describe('applyFleet', () => {
     return join(dir, 'fleet.yaml');
   }
 
-  function baseDeps(agentDeps: AgentApplyDeps, repoInitDeps: RepoInitStepDeps = NOOP_REPO_INIT): FleetApplyDeps {
+  /**
+   * `manifestPath` is now REQUIRED (macf#857) — `controlRepoOptions.makeScratchDir`
+   * is pinned to `dirname(manifestPath)` so the control-repo "checkout" IS
+   * the same temp dir every OTHER path in this file already assumes (see
+   * this file's top-of-file `controlRepoDepsFor` doc). Every EXISTING
+   * `result.lockPath` / hand-built `secrets/...` assertion in this file
+   * keeps working unchanged.
+   */
+  function baseDeps(agentDeps: AgentApplyDeps, manifestPath: string, repoInitDeps: RepoInitStepDeps = NOOP_REPO_INIT): FleetApplyDeps {
     return {
       buildAgentDeps: () => agentDeps,
       repoInitDeps,
       vaultDeps: { exists: () => false, encrypt: async () => {} },
+      controlRepoDeps: controlRepoDepsFor(),
+      agentRepoDeps: agentRepoDepsFor(),
+      controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
     };
@@ -181,7 +219,7 @@ describe('applyFleet', () => {
     const manifest = manifestWith([CODE_AGENT]);
     let repoInitCalled = false;
     const repoInitDeps: RepoInitStepDeps = { cloneRepo: async () => { repoInitCalled = true; }, commitAndPush: async () => 'pushed' };
-    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), repoInitDeps);
+    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps);
 
     const result = await applyFleet(manifest, manifestPath, null, deps);
 
@@ -221,7 +259,7 @@ describe('applyFleet', () => {
         gate2Called = true;
         return agentDeps.waitForAppInstallation(opts);
       },
-    });
+    }, manifestPath);
 
     const result = await applyFleet(manifest, manifestPath, null, deps);
 
@@ -251,7 +289,7 @@ describe('applyFleet', () => {
       fleet: 'demo-fleet',
       agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
     };
-    const deps = baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'));
+    const deps = baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath);
 
     const result = await applyFleet(manifest, manifestPath, priorLock, deps);
 
@@ -291,7 +329,7 @@ describe('applyFleet', () => {
       writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless — see agentDepsFor's comment
     };
 
-    const result = await applyFleet(manifest, manifestPath, priorLock, baseDeps(agentDeps));
+    const result = await applyFleet(manifest, manifestPath, priorLock, baseDeps(agentDeps, manifestPath));
 
     expect(result.agents.map((r) => r.identity.status)).toEqual(['reused', 'resumed-install']);
     expect(result.vault.status).toBe('skipped'); // nothing NEW to persist
@@ -309,7 +347,7 @@ describe('applyFleet', () => {
       agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
     };
     // No resolveKeyPath -> guard resolves skip-unverified.
-    const deps = baseDeps(agentDepsFor('code-agent', 'skipped-unverified', 'x', 'y'));
+    const deps = baseDeps(agentDepsFor('code-agent', 'skipped-unverified', 'x', 'y'), manifestPath);
     const result = await applyFleet(manifest, manifestPath, priorLock, deps);
     expect(result.agents[0]?.identity.status).toBe('skipped-unverified');
     expect(result.agents[0]?.repoInit).toBeUndefined();
@@ -340,7 +378,7 @@ describe('applyFleet', () => {
       log: () => {},
       writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless — see agentDepsFor's comment
     };
-    const result = await applyFleet(manifest, manifestPath, priorLock, baseDeps(agentDeps));
+    const result = await applyFleet(manifest, manifestPath, priorLock, baseDeps(agentDeps, manifestPath));
     expect(result.identityChanges).toEqual(
       expect.arrayContaining([
         { role: 'code-agent', field: 'app_id', previous: 'OLD-app-id', next: 'NEW-app-id' },
@@ -369,16 +407,13 @@ describe('applyFleet', () => {
       writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless — see agentDepsFor's comment
     };
     const deps: FleetApplyDeps = {
-      buildAgentDeps: () => agentDeps,
-      repoInitDeps: NOOP_REPO_INIT,
+      ...baseDeps(agentDeps, manifestPath),
       vaultDeps: {
         exists: () => false,
         encrypt: async (plaintext, _recipients, outPath) => {
           encryptCalls.push({ plaintext, outPath });
         },
       },
-      now: () => new Date('2026-08-11T00:00:00.000Z'),
-      log: () => {},
     };
 
     const result = await applyFleet(manifest, manifestPath, priorLock, deps);
@@ -406,13 +441,11 @@ describe('applyFleet', () => {
     const manifest = manifestWith([CODE_AGENT]);
     const logs: string[] = [];
     const deps: FleetApplyDeps = {
+      ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
       buildAgentDeps: (log) => {
         const wrapped: AgentApplyDeps = { ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), log };
         return wrapped;
       },
-      repoInitDeps: NOOP_REPO_INIT,
-      vaultDeps: { exists: () => false, encrypt: async () => {} },
-      now: () => new Date(),
       log: (l) => logs.push(l),
     };
     await applyFleet(manifest, manifestPath, null, deps);
@@ -427,7 +460,7 @@ describe('applyFleet', () => {
   it('recovery artifact: written before gate 2, then REMOVED once the final compose SUCCEEDS', async () => {
     const manifestPath = manifestPathIn();
     const manifest = manifestWith([CODE_AGENT]);
-    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'));
+    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
     // A real fake `age`: actually writes a stub file so the artifact's
     // presence/absence on disk is observable (the `encrypt` seam this
     // reuses — task requirement: no separate seam, no real `age` binary).
@@ -457,7 +490,7 @@ describe('applyFleet', () => {
   it('recovery artifact: RETAINED when the final compose FAILS (write-only insurance stays until it is actually redundant)', async () => {
     const manifestPath = manifestPathIn();
     const manifest = manifestWith([CODE_AGENT]);
-    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'));
+    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
     const realDeps: FleetApplyDeps = {
       ...deps,
       vaultDeps: {
@@ -492,10 +525,8 @@ describe('applyFleet', () => {
     const manifest = manifestWith([CODE_AGENT]);
     const logs: string[] = [];
     const deps: FleetApplyDeps = {
+      ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
       buildAgentDeps: (log) => ({ ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), log }),
-      repoInitDeps: NOOP_REPO_INIT,
-      vaultDeps: { exists: () => false, encrypt: async () => {} },
-      now: () => new Date(),
       log: (l) => logs.push(l),
     };
 
@@ -508,7 +539,7 @@ describe('applyFleet', () => {
   it('recovery artifact: a write FAILURE surfaces the attempted PATH in AgentApplyOutcome.reason (findable even from --json output alone)', async () => {
     const manifestPath = manifestPathIn();
     const manifest = manifestWith([CODE_AGENT]);
-    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'));
+    const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
     const realDeps: FleetApplyDeps = {
       ...deps,
       vaultDeps: {
@@ -557,7 +588,6 @@ owner:
 network:
   advertise_host: example.ts.net
 transport:
-  vault_repo: groundnuty/demo-science
   age_recipients: [${operatorKey.publicKey}, ${vmKey.publicKey}]
 defaults:
   role_template: groundnuty/agentic-repo-template
@@ -578,6 +608,9 @@ trust:
         buildAgentDeps: () => agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
         repoInitDeps: NOOP_REPO_INIT,
         vaultDeps: { exists: () => false }, // no `encrypt` override — real `age` runs
+        controlRepoDeps: controlRepoDepsFor(),
+        agentRepoDeps: agentRepoDepsFor(),
+        controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
         now: () => new Date('2026-08-11T00:00:00.000Z'),
         log: () => {},
       };
@@ -605,4 +638,282 @@ trust:
       expect(decryptStranger.status).not.toBe(0);
     },
   );
+
+  // --- DR-043 Amendment F (macf#857): control-repo step 0 + ordering ---
+
+  /**
+   * Discriminates a single SHARED `AgentApplyDeps` object (`buildAgentDeps`
+   * is called ONCE per `applyFleet` run, not per-agent — see the "reused /
+   * resumed-install" test above's identical comment) by role, threading the
+   * role through the opaque `code` string `waitForCode`/`exchangeManifestCode`
+   * pass between them, and through `waitForAppInstallation`'s
+   * `opts.expected.appSlug` (== `deriveAppHandle(fleet, role)`).
+   */
+  function roleTrackingAgentDeps(fleetName: string, calls: string[]): AgentApplyDeps {
+    return {
+      startManifestFlow: async (opts) => {
+        const role = opts.buildManifest('http://x/callback').name.replace(`${fleetName}-`, '');
+        calls.push(`gate1:${role}`);
+        return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => `code-for-${role}`, close: async () => {} };
+      },
+      exchangeManifestCode: async (code) => creds(code.replace('code-for-', '')),
+      waitForAppInstallation: async (opts) => {
+        const role = (opts.expected.appSlug ?? '').replace(`${fleetName}-`, '');
+        calls.push(`gate2:${role}`);
+        return { appId: opts.appId, installId: `install-${role}`, appSlug: opts.expected.appSlug ?? '', accountLogin: 'groundnuty' };
+      },
+      confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
+      openUrl: async () => {},
+      log: () => {},
+      writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless — see agentDepsFor's comment
+    };
+  }
+
+  it('exact ordering: control repo (once, before ANY agent) -> per agent: ensure-repo -> gate 1 -> gate 2, one agent fully before the next starts', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+    const calls: string[] = [];
+
+    const controlRepoDeps: ControlRepoDeps = {
+      checkMeta: async () => {
+        calls.push('control:checkMeta');
+        return { presence: 'absent' };
+      },
+      readManifestFile: async () => undefined,
+      createRepo: async () => {
+        calls.push('control:create');
+      },
+      cloneRepo: async () => {
+        calls.push('control:clone');
+      },
+      commitAndPush: async () => {
+        calls.push('control:commitAndPush');
+        return 'pushed';
+      },
+    };
+    const agentRepoDeps: AgentRepoDeps = {
+      checkExists: async (repo) => {
+        calls.push(`repo:checkExists:${repo}`);
+        return 'absent';
+      },
+      createRepo: async (repo) => {
+        calls.push(`repo:create:${repo}`);
+      },
+    };
+    const deps: FleetApplyDeps = {
+      buildAgentDeps: () => roleTrackingAgentDeps('demo-fleet', calls),
+      repoInitDeps: { cloneRepo: async () => {}, commitAndPush: async () => 'pushed' },
+      vaultDeps: { exists: () => false, encrypt: async () => {} },
+      controlRepoDeps,
+      agentRepoDeps,
+      controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
+      now: () => new Date('2026-08-11T00:00:00.000Z'),
+      log: () => {},
+    };
+
+    const result = await applyFleet(manifest, manifestPath, null, deps);
+
+    expect(result.agents.map((r) => r.identity.status)).toEqual(['created', 'created']);
+
+    // The full sequence, quoted verbatim in this test file so it's citable
+    // directly (see the report requirement to quote ordering from code):
+    //   control:checkMeta -> control:create -> control:clone -> control:commitAndPush
+    //   -> repo:checkExists:<code-repo> -> repo:create:<code-repo> -> gate1:code-agent -> gate2:code-agent
+    //   -> repo:checkExists:<sci-repo>  -> repo:create:<sci-repo>  -> gate1:science-agent -> gate2:science-agent
+    //   -> control:commitAndPush (final sync)
+    const controlCreateIdx = calls.indexOf('control:create');
+    const repoCreateCodeIdx = calls.indexOf('repo:create:groundnuty/demo-code');
+    const gate1CodeIdx = calls.indexOf('gate1:code-agent');
+    const gate2CodeIdx = calls.indexOf('gate2:code-agent');
+    const repoCreateSciIdx = calls.indexOf('repo:create:groundnuty/demo-science');
+    const gate1SciIdx = calls.indexOf('gate1:science-agent');
+    const gate2SciIdx = calls.indexOf('gate2:science-agent');
+
+    // Control repo is step 0 — before EITHER agent's repo-ensure.
+    expect(controlCreateIdx).toBeGreaterThanOrEqual(0);
+    expect(controlCreateIdx).toBeLessThan(repoCreateCodeIdx);
+    expect(controlCreateIdx).toBeLessThan(repoCreateSciIdx);
+    // code-agent: repo BEFORE gate 1 BEFORE gate 2.
+    expect(repoCreateCodeIdx).toBeLessThan(gate1CodeIdx);
+    expect(gate1CodeIdx).toBeLessThan(gate2CodeIdx);
+    // science-agent: same shape.
+    expect(repoCreateSciIdx).toBeLessThan(gate1SciIdx);
+    expect(gate1SciIdx).toBeLessThan(gate2SciIdx);
+    // One agent fully completes (both gates) before the next agent's
+    // repo-ensure even starts — agents are processed one at a time.
+    expect(gate2CodeIdx).toBeLessThan(repoCreateSciIdx);
+    // The control repo's SECOND commitAndPush (the final sync) is the very
+    // LAST call of the whole run.
+    const commitAndPushCalls = calls.filter((c) => c === 'control:commitAndPush');
+    expect(commitAndPushCalls).toHaveLength(2); // step-0's first-commit + the final sync
+    expect(calls.at(-1)).toBe('control:commitAndPush');
+    expect(calls.indexOf('control:commitAndPush')).toBeLessThan(gate1CodeIdx); // the FIRST one is step 0, before gate 1
+  });
+
+  it('vault + lock paths derive from the control-repo CHECKOUT, not dirname(manifestPath), when they differ', async () => {
+    const manifestPath = manifestPathIn(); // dirname(manifestPath) is a DIFFERENT dir than the control checkout below
+    const manifest = manifestWith([CODE_AGENT]);
+    const controlDir = mkdtempSync(join(tmpdir(), 'macf-apply-fleet-control-checkout-'));
+    dirs.push(controlDir);
+    const deps: FleetApplyDeps = {
+      ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+      controlRepoOptions: { makeScratchDir: () => controlDir },
+    };
+
+    const result = await applyFleet(manifest, manifestPath, null, deps);
+
+    expect(result.controlRepo.status).toBe('created');
+    if (result.controlRepo.status === 'created' || result.controlRepo.status === 'reused') {
+      expect(result.controlRepo.localDir).toBe(controlDir);
+    }
+    expect(result.lockPath).toBe(join(controlDir, 'fleet.lock'));
+    expect(result.lockPath).not.toBe(join(join(manifestPath, '..'), 'fleet.lock'));
+    expect(existsSync(result.lockPath)).toBe(true);
+    if (result.vault.status === 'written') {
+      expect(result.vault.path.startsWith(controlDir)).toBe(true);
+    } else {
+      expect.fail(`expected vault.status 'written', got ${JSON.stringify(result.vault)}`);
+    }
+    // Nothing was ever written under dirname(manifestPath) — the actual
+    // structural fix for the #854 "wrote vault.age/fleet.lock to /tmp" bug.
+    expect(existsSync(join(join(manifestPath, '..'), 'fleet.lock'))).toBe(false);
+  });
+
+  it('control repo FOREIGN -> aborts the ENTIRE run: no agent repo, App, or install is ever touched', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+    const agentRepoDeps: AgentRepoDeps = { checkExists: vi.fn(), createRepo: vi.fn() };
+    const deps: FleetApplyDeps = {
+      buildAgentDeps: () => {
+        throw new Error('must not be called — control repo aborted before any agent processing');
+      },
+      repoInitDeps: { cloneRepo: async () => {}, commitAndPush: async () => 'pushed' },
+      vaultDeps: { exists: () => false, encrypt: async () => {} },
+      controlRepoDeps: {
+        checkMeta: async () => ({ presence: 'present', archived: true }),
+        readManifestFile: async () => undefined,
+        createRepo: async () => {
+          throw new Error('must not be called — foreign repo, never created');
+        },
+        cloneRepo: async () => {
+          throw new Error('must not be called — foreign repo, never cloned');
+        },
+        commitAndPush: async () => {
+          throw new Error('must not be called');
+        },
+      },
+      agentRepoDeps,
+      now: () => new Date('2026-08-11T00:00:00.000Z'),
+      log: () => {},
+    };
+
+    const result = await applyFleet(manifest, manifestPath, null, deps);
+
+    expect(result.controlRepo.status).toBe('foreign');
+    expect(result.controlRepoSync).toEqual({ status: 'skipped' });
+    expect(result.agents).toEqual([]);
+    expect(result.vault).toEqual({ status: 'skipped' });
+    expect(result.identityChanges).toEqual([]);
+    expect(agentRepoDeps.checkExists).not.toHaveBeenCalled();
+  });
+
+  it('control repo existence UNCONFIRMABLE ("unknown") -> aborts the ENTIRE run as "failed", not silently treated as absent or ours', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT]);
+    const deps: FleetApplyDeps = {
+      buildAgentDeps: () => {
+        throw new Error('must not be called');
+      },
+      repoInitDeps: { cloneRepo: async () => {}, commitAndPush: async () => 'pushed' },
+      vaultDeps: { exists: () => false, encrypt: async () => {} },
+      controlRepoDeps: {
+        checkMeta: async () => ({ presence: 'unknown' }),
+        readManifestFile: async () => undefined,
+        createRepo: vi.fn(),
+        cloneRepo: vi.fn(),
+        commitAndPush: vi.fn(),
+      },
+      agentRepoDeps: agentRepoDepsFor(),
+      now: () => new Date('2026-08-11T00:00:00.000Z'),
+      log: () => {},
+    };
+
+    const result = await applyFleet(manifest, manifestPath, null, deps);
+
+    expect(result.controlRepo.status).toBe('failed');
+    expect(result.agents).toEqual([]);
+  });
+
+  it('self-heal: a REUSE clone bringing back a committed fleet.lock is preferred over a null/stale caller-supplied priorLock', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT]);
+    const controlDir = mkdtempSync(join(tmpdir(), 'macf-apply-fleet-reuse-checkout-'));
+    dirs.push(controlDir);
+    const priorLockFromControlRepo: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+    };
+    const deps: FleetApplyDeps = {
+      // 'reused' outcome needs confirmAppInstallation to confirm live —
+      // resolveKeyPath present is what routes the guard there.
+      buildAgentDeps: () => agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'),
+      repoInitDeps: { cloneRepo: async () => {}, commitAndPush: async () => 'pushed' },
+      vaultDeps: { exists: () => false, encrypt: async () => {} },
+      controlRepoDeps: {
+        checkMeta: async () => ({ presence: 'present', archived: false }),
+        // A FULL, schema-valid fleet.yaml with a MATCHING metadata.name —
+        // classifyControlRepoOwnership parses this for real (parseFleetManifest),
+        // so a truncated fixture would fail validation and misclassify as
+        // 'foreign' rather than 'ours' (caught empirically: see the earlier
+        // failing run of this exact test before this fixture was filled out).
+        readManifestFile: async () =>
+          [
+            'apiVersion: macf/v0',
+            'kind: Fleet',
+            'metadata:',
+            '  name: demo-fleet',
+            'owner:',
+            '  account: groundnuty',
+            '  type: user',
+            '  registry: { type: profile, user: groundnuty }',
+            'network:',
+            '  advertise_host: example.ts.net',
+            'transport:',
+            '  age_recipients: []',
+            'defaults:',
+            '  role_template: groundnuty/agentic-repo-template',
+            '  app_manifest: dr-019',
+            'agents:',
+            '  - role: code-agent',
+            '    profile: code',
+            '    repo: groundnuty/demo-code',
+            '    deploy_path: /x',
+          ].join('\n'),
+        createRepo: async () => {
+          throw new Error('must not be called — reuse never creates');
+        },
+        // The REAL clone would bring back whatever the control repo already
+        // has committed — simulate that by writing fleet.lock into destDir.
+        cloneRepo: async (_url, destDir) => {
+          writeFileSync(join(destDir, 'fleet.lock'), JSON.stringify(priorLockFromControlRepo), 'utf-8');
+        },
+        commitAndPush: async () => 'nothing-to-commit',
+      },
+      agentRepoDeps: agentRepoDepsFor(),
+      controlRepoOptions: { makeScratchDir: () => controlDir },
+      now: () => new Date('2026-08-11T00:00:00.000Z'),
+      log: () => {},
+    };
+
+    // Caller passes `null` — as it would on a fresh CLI invocation that
+    // never found anything at dirname(manifestPath) (the pre-Amendment-F
+    // read path — see bootstrap-apply.ts's `readPriorLock` residual note).
+    const result = await applyFleet(manifest, manifestPath, null, deps);
+
+    // 'reused' (not 'created') PROVES the checkout's fleet.lock was used as
+    // the prior — the confirm-before-create guard only reaches 'reused' when
+    // `prior !== undefined` for this role.
+    expect(result.agents[0]?.identity.status).toBe('reused');
+  });
 });

@@ -24,12 +24,16 @@
  * `manifest-exchange.ts`'s `gh` call) — exercised for real only via a
  * caller that supplies them, never faked-to-pass.
  *
- * **Out of scope for this increment (documented, not silently skipped):**
- * creating the repo itself from `defaults.role_template` when the "repo"
- * plan item reads `create` — the task's required 6-step sequence for this
- * increment does not include it, and this module's `cloneRepo` step FAILS
- * LOUD (a normal `git clone` failure) if the repo doesn't exist yet. A
- * future increment wires template-based repo creation ahead of this step.
+ * **Repo creation (macf#857, DR-043 Amendment F / #854 §2):** the module
+ * doc used to flag creating the repo from `defaults.role_template` as future
+ * scope — {@link ensureAgentRepo} closes that gap. `apply-fleet.ts` calls it
+ * for EVERY agent, BEFORE `applyAgentIdentity` (i.e. before either consent
+ * gate) — not just before this module's `cloneRepo` step — because consent
+ * gate 2's install page can't list a repo that doesn't exist yet (the
+ * ordering bug the live provision #854 hit on the operator's first Install
+ * click). `cloneRepo` below still FAILS LOUD if the repo is somehow still
+ * missing by the time it runs (`ensureAgentRepo` failed, or a caller drives
+ * this module directly without it) — defense-in-depth, not the primary path.
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -40,6 +44,8 @@ import type { RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetManifest } from './fleet-manifest.js';
 import type { RepoInitOptions } from '../commands/repo-init.js';
 import { repoInit as realRepoInit } from '../commands/repo-init.js';
+import type { Presence } from './plan.js';
+import type { CreateRepoFn } from './repo-create.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -101,7 +107,22 @@ export async function realCloneRepo(url: string, destDir: string): Promise<void>
   await execFileAsync('git', ['clone', '--depth', '1', url, destDir]);
 }
 
-/** Real `git add -A && git commit && git push` — a thin I/O leaf. Detects "nothing to commit" via `git diff --cached --quiet`'s exit code (0 = clean) rather than string-matching git's stdout. Never `--force` (mirrors `bootstrap-commit-vault.sh`'s non-destructive push discipline). */
+/**
+ * Real `git add -A && git commit && git push` — a thin I/O leaf. Detects
+ * "nothing to commit" via `git diff --cached --quiet`'s exit code (0 =
+ * clean) rather than string-matching git's stdout. Never `--force` (mirrors
+ * `bootstrap-commit-vault.sh`'s non-destructive push discipline).
+ *
+ * **Agent-repo repo-init ONLY — do not wire this into `ControlRepoDeps`.**
+ * `-A` is legitimate here because `repoInit()` is the sole writer of this
+ * scratch checkout (`.github/workflows/agent-router.yml` +
+ * `.github/agent-config.json` + labels), so staging everything it produced
+ * is correct by construction. The control repo has a DIFFERENT
+ * git-committed-content invariant (DR-043 Amendment F, "sealed-or-public
+ * ONLY" — `secrets/recovery/<role>.age` must never be swept in) and uses
+ * `control-repo.ts`'s explicit-allowlist `realControlRepoCommitAndPush`
+ * instead — see that module's doc + groundnuty/macf#857's review.
+ */
 export async function realCommitAndPush(dir: string, message: string): Promise<'pushed' | 'nothing-to-commit'> {
   await execFileAsync('git', ['add', '-A'], { cwd: dir });
   try {
@@ -177,4 +198,71 @@ export async function applyRepoInitForAgent(
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+// --- Agent repo creation (macf#857, DR-043 Amendment F / #854 §2) ---
+
+export interface AgentRepoDeps {
+  readonly checkExists: (repo: string) => Promise<Presence>;
+  readonly createRepo: CreateRepoFn;
+}
+
+export type AgentRepoOutcome =
+  | { readonly repo: string; readonly role: string; readonly status: 'created' }
+  | { readonly repo: string; readonly role: string; readonly status: 'present' }
+  | { readonly repo: string; readonly role: string; readonly status: 'failed'; readonly reason: string };
+
+/**
+ * Ensure `agent.repo` exists on GitHub, creating it if absent. Called by
+ * `apply-fleet.ts` for EVERY agent, BEFORE `applyAgentIdentity` — i.e.
+ * before EITHER consent gate for that agent, not merely before this
+ * module's own `cloneRepo` step (see this module's doc for why the ordering
+ * matters: gate 2's install page can't list a repo that doesn't exist).
+ *
+ * `agent.provenance` steers WHAT gets created, mirroring the DR-035 field
+ * lesson this schema field encodes (`fleet-manifest.ts`'s doc):
+ *
+ *   - `'template'` (default/undefined) — `gh repo create --template
+ *     defaults.role_template` (the DR-035 skill's manual step, promoted to
+ *     code — `repo-create.ts`'s doc).
+ *   - `'mirror'` — a BLANK repo, no template. A mirror agent's real content
+ *     comes from an existing local dir (e.g. an Overleaf-backed paper repo)
+ *     being remote-added + pushed — that push is VM-side, out of `apply`'s
+ *     job entirely per DR-043 §D4 (no `deploy_path` checkout exists on the
+ *     Mac side `apply` runs on). This function only ensures the GitHub-side
+ *     repo EXISTS for that later push to target; templating it would just
+ *     mean the mirror push immediately overwrites template content anyway.
+ *
+ * An ALREADY-PRESENT repo is left untouched regardless of `provenance`
+ * (`status: 'present'`) — unlike the control repo (`control-repo.ts`), an
+ * agent repo has no ownership-custody hazard the way the vault-holding
+ * control repo does (the EXISTING `repoItem` plan item already treats any
+ * present repo at the declared full name as `noop`, no ownership check —
+ * `provenance: 'mirror'` explicitly EXPECTS a pre-existing repo in some
+ * flows), so simple presence is sufficient here.
+ *
+ * NEVER throws — every failure resolves to `status: 'failed'`, including a
+ * throwing `deps.checkExists` (the whole body is one try/catch, not just the
+ * `createRepo` call — the real `checkRepoExists` never throws by its own
+ * contract, but a caller-supplied fake shouldn't be able to violate this
+ * function's own contract).
+ */
+export async function ensureAgentRepo(agent: FleetAgent, manifest: FleetManifest, deps: AgentRepoDeps): Promise<AgentRepoOutcome> {
+  try {
+    const presence = await deps.checkExists(agent.repo);
+    if (presence === 'present') return { repo: agent.repo, role: agent.role, status: 'present' };
+    if (presence === 'unknown') {
+      return {
+        repo: agent.repo,
+        role: agent.role,
+        status: 'failed',
+        reason: `could not confirm whether "${agent.repo}" already exists (auth / network / rate-limit) — refusing to attempt creation without a confident existence read.`,
+      };
+    }
+    const template = agent.provenance === 'mirror' ? undefined : manifest.defaults.role_template;
+    await deps.createRepo(agent.repo, template !== undefined ? { template } : undefined);
+    return { repo: agent.repo, role: agent.role, status: 'created' };
+  } catch (err) {
+    return { repo: agent.repo, role: agent.role, status: 'failed', reason: errMessage(err) };
+  }
 }
