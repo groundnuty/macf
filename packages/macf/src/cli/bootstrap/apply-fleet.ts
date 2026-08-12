@@ -604,8 +604,9 @@ export async function applyFleet(
     } else {
       caSkipReason =
         'CA was freshly minted this run but the batched vault write did not succeed — refusing to publish the ' +
-        'cert until its key is durable (DR-043 §D5). Re-run apply once the vault issue is fixed; the CA is NOT ' +
-        're-minted on retry (registry var stays absent, so resolveCaCert takes the same mint path again).';
+        'cert until its key is durable (DR-043 §D5). Re-run apply once the vault issue is fixed. The retry ' +
+        're-mints (the registry cert was never published, so resolveCaCert takes the mint path again), which is ' +
+        'harmless: this run\'s key was never made durable and has signed nothing, so nothing is orphaned.';
     }
   } else {
     caSkipReason = `CA could not be resolved this run: ${caResolve.reason}`;
