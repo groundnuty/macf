@@ -16,6 +16,32 @@
  * `buildCreateVariableArgs` is `PURE` — the "POST, not PATCH" property is
  * pinned by a unit test asserting the literal argv array, not left to a
  * comment that can drift from the implementation (macf#838 Phase 2b review).
+ *
+ * **Scope-aware since groundnuty/macf#866.** `POST /orgs/{org}/actions/variables`
+ * requires a `visibility` field GitHub's repo-scope create endpoint doesn't
+ * have (verified 2026-08-12 against the current GitHub REST docs —
+ * `https://docs.github.com/en/rest/actions/variables?apiVersion=2022-11-28#create-an-organization-variable`
+ * lists `name`/`value`/`visibility` as required, `visibility` in
+ * `all`|`private`|`selected`, with `selected_repository_ids` required only
+ * when `visibility` is `selected`; the sibling
+ * `#create-a-repository-variable` section lists only `name`/`value` and
+ * states no `visibility` field at all). The live #866 failure was an
+ * org-scope registry write (`/orgs/macf-experiment`) 422ing with `object is
+ * missing required key: visibility`. Detected from `pathPrefix`'s own shape
+ * (`orgs/...` after the leading-slash strip below) — no caller signature
+ * change needed; `registryPathPrefix` (`registry-helper.ts`) is the only
+ * producer of an `orgs/...` prefix, for `registry.type === 'org'` only.
+ *
+ * **`{type: 'profile'}` registries do NOT need `visibility`.** They resolve
+ * to `repos/<user>/<user>` (a REPO-scope path, using the user's own
+ * "profile" repo as the storage location — see `registryPathPrefix`), not a
+ * personal-account-level endpoint. Verified against the same GitHub REST
+ * docs page: Actions variables exist ONLY at repository/organization/
+ * environment scope — there is no `/users/{username}/actions/variables`
+ * endpoint at all, so `{type: 'profile'}`'s repo-path choice isn't an
+ * approximation of a "real" user-scope endpoint, it's the ONLY way to store
+ * an account-level variable via this API. It correctly takes the same
+ * (no-`visibility`) contract as `{type: 'repo'}`.
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -31,10 +57,24 @@ export type CreateVariableResult = 'created' | 'exists';
  * `registryPathPrefix` do; repo-scope `repos/<owner>/<repo>` does not) —
  * stripped here, mirroring `observer.ts`'s own convention for the same
  * prefixes so both scopes can share one function.
+ *
+ * Org-scope (`orgs/<org>/...`) additionally carries `visibility=all` — see
+ * the module doc for why `all` (not `private`/`selected`): the fleet CA cert
+ * this write exists to publish must be readable by the routing workflow in
+ * EVERY caller repo (macf#806's two-place-publish is the whole point of the
+ * registry leg), so `all` is the only visibility that doesn't reintroduce a
+ * per-repo allowlist this codebase doesn't otherwise maintain. `selected`
+ * would additionally require threading `selected_repository_ids` through
+ * this function — no caller needs that today, so it's intentionally not
+ * exposed as a parameter (add one if/when a caller does).
  */
 export function buildCreateVariableArgs(pathPrefix: string, name: string, value: string): readonly string[] {
   const prefix = pathPrefix.replace(/^\//, '');
-  return ['api', `${prefix}/actions/variables`, '--method', 'POST', '-f', `name=${name}`, '-f', `value=${value}`];
+  const args = ['api', `${prefix}/actions/variables`, '--method', 'POST', '-f', `name=${name}`, '-f', `value=${value}`];
+  if (prefix.startsWith('orgs/')) {
+    args.push('-f', 'visibility=all');
+  }
+  return args;
 }
 
 /**

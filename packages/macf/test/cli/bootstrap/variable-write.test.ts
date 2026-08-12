@@ -48,3 +48,35 @@ describe('buildCreateVariableArgs (pure)', () => {
     expect(args).toContain(`value=${pem}`);
   });
 });
+
+describe('buildCreateVariableArgs — org-scope visibility (macf#866)', () => {
+  it('appends -f visibility=all for an org-scope prefix (POST /orgs/{org}/actions/variables 422s without it)', () => {
+    const args = buildCreateVariableArgs('orgs/macf-experiment', 'MACF_EXPERIMENT_CA_CERT', 'cert-pem-value');
+    expect(args).toEqual([
+      'api',
+      'orgs/macf-experiment/actions/variables',
+      '--method',
+      'POST',
+      '-f',
+      'name=MACF_EXPERIMENT_CA_CERT',
+      '-f',
+      'value=cert-pem-value',
+      '-f',
+      'visibility=all',
+    ]);
+  });
+
+  it('strips the leading slash before detecting org scope (registryPathPrefix\'s "/orgs/<org>" shape)', () => {
+    const args = buildCreateVariableArgs('/orgs/macf-experiment', 'NAME', 'value');
+    expect(args).toContain('-f');
+    expect(args[args.length - 1]).toBe('visibility=all');
+  });
+
+  it('does NOT append visibility for repo scope (including {type: "profile"}\'s repos/<user>/<user> shape — no user-level Actions-variables endpoint exists)', () => {
+    const repoArgs = buildCreateVariableArgs('repos/groundnuty/demo', 'NAME', 'value');
+    expect(repoArgs).not.toContain('visibility=all');
+
+    const profileArgs = buildCreateVariableArgs('/repos/groundnuty/groundnuty', 'NAME', 'value');
+    expect(profileArgs).not.toContain('visibility=all');
+  });
+});
