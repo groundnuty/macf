@@ -18,6 +18,15 @@
       "ssh_user": "ubuntu",
       "ssh_key_secret": "AGENT_SSH_KEY"
     },
+    "auditor-agent": {
+      "app_name": "macf-auditor-agent",
+      "host": "100.124.163.105",
+      "tmux_session": "macf@auditor-agent",
+      "tmux_bin": "tmux",
+      "workspace_dir": "/home/ubuntu/repos/groundnuty/macf-auditor-agent",
+      "ssh_user": "ubuntu",
+      "ssh_key_secret": "AGENT_SSH_KEY"
+    },
     "devops-agent": {
       "app_name": "macf-devops-agent",
       "host": "100.124.163.105",
