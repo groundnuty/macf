@@ -26,14 +26,36 @@
  * see the module-level report on this increment for why that's a deliberate
  * boundary, not an oversight.
  *
- * **Shell-injection posture (macf#846 review nit b):** `vault.sh` decrypts
- * `vault.age` and sources the result via `eval "$_vault_plain"` on the VM.
- * Inside a `KEY="value"` line under `eval`, `"`, `$`, backtick, and `\` all
- * retain shell meta-meaning — a raw value containing `$(...)` or `` `...` ``
- * would EXECUTE on the VM at `source vault.sh` time. Every raw (non-base64)
- * value is guarded against this before it is ever assembled into a line;
- * base64 output (the PEM/cert fields) is inherently safe
- * (`[A-Za-z0-9+/=]` only) and does not need the guard.
+ * **Shell-injection / quoting posture (macf#848, supersedes the original
+ * macf#846 review nit b):** `vault.sh` USED TO decrypt `vault.age` and source
+ * the result via `eval "$_vault_plain"` on the VM — under the old
+ * `KEY="value"` double-quoted form, `"`, `$`, backtick, and `\` all retained
+ * shell meta-meaning inside `eval`, so a raw value containing `$(...)` or
+ * `` `...` `` would EXECUTE at `source vault.sh` time. That made this file's
+ * entire safety rest on an enumeration argument (the blocklist below) staying
+ * exhaustive forever, across every future format/quoting/secret-set change —
+ * a structural risk even though the enumeration was, at the time, correct.
+ * **macf#848 fixed this at the root:** `vault.sh` no longer calls `eval` at
+ * all — it PARSES `KEY=VALUE` lines directly (split on the first `=`, strip
+ * one layer of matching quoting, `export` the literal bytes; see
+ * `templates/vault.sh`'s export-loop comment for the full mechanism), so a
+ * hostile value can no longer execute regardless of what ANY writer (this
+ * one, a future one, or a hand-edited vault) emits. **This module's own
+ * change in the same fix:** switched from double- to SINGLE-quoted
+ * `KEY='value'` output. Under single quotes (unlike double quotes) `"`, `$`,
+ * backtick, and `\` are ALL inert — the only byte single quotes cannot
+ * represent at all is a literal `'` (there is no escape for it inside
+ * `'...'`), so that's the one residual shell-meaning guard below. CR/LF stay
+ * guarded too, independent of quote-character choice: a raw value containing
+ * a line break would split one `KEY=VALUE` entry across two physical lines,
+ * corrupting `vault.sh`'s line-oriented parse regardless of how the value is
+ * quoted — a format-integrity concern, not a shell-injection one. Every raw
+ * (non-base64) value is guarded against this before it is ever assembled
+ * into a line; base64 output (the PEM/cert fields) is inherently safe
+ * (`[A-Za-z0-9+/=]` only, single-line) and does not need the guard. The two
+ * layers (this writer's guard + `vault.sh`'s no-eval parse) are now
+ * independent: either one can be wrong without the other becoming
+ * exploitable.
  *
  * **Per-agent recovery artifacts (§D5 "durable before gate 2," 2026-08-11
  * review of Slice 2b increment 5a, groundnuty/macf#838):** the FINAL vault
@@ -108,16 +130,24 @@ export interface VaultPayload {
 }
 
 const SHELL_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-/** `"` `$` backtick `\` CR LF — see module doc's shell-injection posture. */
-const SHELL_UNSAFE_VALUE_RE = /["$`\\\r\n]/;
+/**
+ * `'` (unrepresentable inside single-quoted output) + CR/LF (would split one
+ * `KEY=VALUE` line into two) — see module doc's shell-injection / quoting
+ * posture (macf#848). `"`, `$`, backtick, `\` are deliberately NOT guarded
+ * here anymore: they are inert under both this module's single-quoted output
+ * and `vault.sh`'s no-eval parse.
+ */
+const SHELL_UNSAFE_VALUE_RE = /['\r\n]/;
 
 function toBase64(raw: string): string {
   return Buffer.from(raw, 'utf-8').toString('base64');
 }
 
 /**
- * The emitted `KEY` itself must be a valid shell identifier — `eval` sources
- * it as an assignment target. Defense-in-depth, not a fix for a reachable
+ * The emitted `KEY` itself must be a valid shell identifier — `vault.sh`
+ * `export`s it as an assignment target (macf#848: no longer via `eval`, but
+ * `export KEY=value` still requires `KEY` to be identifier-shaped or the
+ * assignment fails). Defense-in-depth, not a fix for a reachable
  * bug: every `appHandle`/`project` this module is actually called with
  * originates from `fleet-manifest.ts`'s schema-validated `metadata.name`
  * (`FLEET_NAME_RE`) + `role` (`ROLE_CHARSET_RE`) charsets — both restricted
@@ -133,13 +163,13 @@ function assertValidShellIdentifier(key: string): void {
   if (!SHELL_IDENTIFIER_RE.test(key)) {
     throw new VaultError(
       'vault_invalid_key',
-      `"${key}" is not a valid shell variable name (^[A-Za-z_][A-Za-z0-9_]*$) — vault.sh sources the ` +
-        'decrypted plaintext via `eval`, so every emitted KEY must be assignable.',
+      `"${key}" is not a valid shell variable name (^[A-Za-z_][A-Za-z0-9_]*$) — vault.sh \`export\`s the ` +
+        'decrypted plaintext KEY by KEY, so every emitted KEY must be assignable.',
     );
   }
 }
 
-/** The RAW value must not carry shell metacharacters — see module doc. Never includes `value` in the thrown message (never log/print a secret). */
+/** The RAW value must not carry the residual-dangerous byte (a literal `'`) or a CR/LF — see module doc. Never includes `value` in the thrown message (never log/print a secret). */
 function assertShellSafeValue(key: string): (value: string) => void {
   return (value: string) => {
     if (value.length === 0) {
@@ -148,9 +178,10 @@ function assertShellSafeValue(key: string): (value: string) => void {
     if (SHELL_UNSAFE_VALUE_RE.test(value)) {
       throw new VaultError(
         'vault_unsafe_value',
-        `${key}: value contains a shell metacharacter (one of " $ \` \\ or a CR/LF) that would not be inert ` +
-          'under vault.sh\'s `eval "$_vault_plain"` on the VM. GitHub-issued client/webhook secrets have not ' +
-          'been observed to contain these; if one legitimately does, base64-encode it upstream like the PEM fields.',
+        `${key}: value contains a single quote or a CR/LF. A literal ' cannot be represented inside vault.sh's ` +
+          "single-quoted KEY='value' lines (there is no escape for ' inside '...'), and a line break would split " +
+          'one KEY=VALUE entry across two physical lines. GitHub-issued client/webhook secrets have not been ' +
+          'observed to contain these; if one legitimately does, base64-encode it upstream like the PEM fields.',
       );
     }
   };
@@ -159,7 +190,7 @@ function assertShellSafeValue(key: string): (value: string) => void {
 function emitLine(lines: string[], key: string, value: string): void {
   assertValidShellIdentifier(key);
   assertShellSafeValue(key)(value);
-  lines.push(`${key}="${value}"`);
+  lines.push(`${key}='${value}'`);
 }
 
 /**

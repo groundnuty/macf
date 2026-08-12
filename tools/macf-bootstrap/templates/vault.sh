@@ -21,10 +21,21 @@
 #   - resolves its own path + parses the vault WITHOUT compgen/${!var}, so it
 #     behaves identically sourced from bash or zsh.
 #
+# NO-EVAL (macf#848 — structural hardening): this used to `eval` the decrypted
+# plaintext to export it. `eval` re-parses its argument as shell code a SECOND
+# time, so the file's entire safety rested on the WRITER (`buildVaultPlaintext`
+# in `vault-write.ts`) exhaustively blocklisting every character that retains
+# meaning under `eval` — forever, across every future format/quoting/secret-set
+# change. This version never calls `eval`: it parses `KEY=VALUE` lines directly
+# and `export`s the literal bytes (see the export-loop comment below for the
+# mechanism + why that removes the hazard class regardless of what a writer,
+# present or future, emits).
+#
 # The age private key is read from (first found):
 #   $MACF_VAULT_AGE_KEY  →  ~/.config/macf/vault-age-key.txt
 #
-# Refs: DR-035 §6 (two-machine handoff); templates/vault.template.txt (the shape).
+# Refs: DR-035 §6 (two-machine handoff); templates/vault.template.txt (the shape);
+# macf#848 (no-eval read path + single-quote write path, two independent layers).
 
 # Resolve this script's own dir across bash + zsh when sourced. The zsh-only
 # `${(%):-%x}` is hidden behind `eval` so bash never parses it (and vice-versa).
@@ -50,16 +61,62 @@ command -v age >/dev/null 2>&1 || _vault_fail "age not found on PATH."
 _vault_plain="$(age -d -i "$_age_key" "$_vault_age")" \
   || _vault_fail "failed to decrypt vault.age (wrong key?)."
 
+# Strip exactly one layer of matching surrounding "..." / '...' quoting from a
+# vault VALUE. Shared by every KEY=VALUE parse site below (the export loop +
+# the two materialize loops) so old- and new-format vaults are handled
+# identically everywhere, not just at the export site. A value with no
+# surrounding quotes is passed through unchanged. This is a plain string
+# operation (prefix/suffix stripping) — never a re-parse of the value's
+# CONTENT, which is the property the no-eval fix above depends on.
+_vault_unquote() {
+  _vu="$1"
+  case "$_vu" in
+    \"*\") _vu="${_vu#\"}"; _vu="${_vu%\"}" ;;
+    \'*\') _vu="${_vu#\'}"; _vu="${_vu%\'}" ;;
+  esac
+  printf '%s' "$_vu"
+}
+
 # Export every cred into the current shell.
-set -a
-eval "$_vault_plain"
-set +a
+#
+# COMPAT (load-bearing — macf#848): a real vault already exists in the wild,
+# written 2026-08-12 by the first live provision, using the OLD `KEY="value"`
+# double-quoted form. This parses BOTH that form AND the new `KEY='value'`
+# single-quoted form (`buildVaultPlaintext` post-macf#848) via `_vault_unquote`
+# above — an unquoted `KEY=value` line is also accepted (harmless
+# permissiveness, not a compat requirement).
+#
+# Uses `<<<` (a redirection, not a `| while`) so `export` lands in THIS
+# (sourced) shell rather than a pipeline subshell — `cmd | while read; do
+# export ...; done` would silently lose every export the instant the loop
+# exits, because the last stage of a pipeline runs in a subshell in both bash
+# and zsh. (The two materialize loops below intentionally STAY piped: they
+# only write files + echo a path, never need to export anything back out, so
+# the subshell is harmless there.) `<<<` is supported identically by bash and
+# zsh, same dual-compat bar as the rest of this file.
+while IFS= read -r _kv_line || [ -n "$_kv_line" ]; do
+  case "$_kv_line" in
+    ''|'#'*) continue ;;  # blank line or comment (vault.template.txt's shape)
+  esac
+  case "$_kv_line" in
+    *=*) ;;
+    *) echo "vault.sh: skipping a vault line with no '=' (malformed/corrupt vault content)." >&2; continue ;;
+  esac
+  _kv_key="${_kv_line%%=*}"
+  case "$_kv_key" in
+    [A-Za-z_]*) ;;
+    *) echo "vault.sh: skipping a vault line whose key is not a valid shell identifier." >&2; continue ;;
+  esac
+  _kv_val="$(_vault_unquote "${_kv_line#*=}")"
+  export "$_kv_key=$_kv_val"
+done <<< "$_vault_plain"
+unset _kv_line _kv_key _kv_val
 
 # Materialize per-agent App PEMs: MACF_AGENT_<NAME>_PRIVATE_KEY_B64 → ~/.macf/keys/<name>.pem
 # Parse the decrypted text directly (no compgen / ${!var}) so it's shell-portable.
 mkdir -p "$HOME/.macf/keys"; chmod 700 "$HOME/.macf/keys" 2>/dev/null || true
 printf '%s\n' "$_vault_plain" | grep -E '^MACF_AGENT_[A-Z0-9_]+_PRIVATE_KEY_B64=' | while IFS= read -r _line; do
-  _val="${_line#*=}"; _val="${_val#\"}"; _val="${_val%\"}"
+  _val="$(_vault_unquote "${_line#*=}")"
   _nm="${_line%%=*}"; _nm="${_nm#MACF_AGENT_}"; _nm="${_nm%_PRIVATE_KEY_B64}"
   _lc="$(printf '%s' "$_nm" | tr 'A-Z_' 'a-z-')"
   _dst="$HOME/.macf/keys/${_lc}.pem"
@@ -71,7 +128,7 @@ done
 # so `macf certs rotate` works on the VM WITHOUT a manual step (and without ever
 # running `macf certs init` there, which would mint a NEW CA + clobber the registry var).
 printf '%s\n' "$_vault_plain" | grep -E '^MACF_[A-Z0-9_]+_CA_(CERT|KEY)_B64=' | while IFS= read -r _line; do
-  _val="${_line#*=}"; _val="${_val#\"}"; _val="${_val%\"}"
+  _val="$(_vault_unquote "${_line#*=}")"
   _key="${_line%%=*}"
   case "$_key" in
     *_CA_KEY_B64)  _proj="${_key#MACF_}"; _proj="${_proj%_CA_KEY_B64}";  _file="ca-key.pem";  _mode=600 ;;
