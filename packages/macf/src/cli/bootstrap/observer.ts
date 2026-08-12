@@ -143,6 +143,37 @@ export async function checkRegistryVariablePresence(registry: RegistryConfig, na
 }
 
 /**
+ * Best-effort read-only registry-scope Actions-variable VALUE read — the
+ * registry-scope sibling of {@link readRepoVariable} (macf#838 Phase 2b, the
+ * CA-reuse path: `apply-ca.ts::resolveCaCert` needs the EXISTING CA cert's
+ * value to backfill any per-repo legs the #806 drift class left missing).
+ * Returns `undefined` on ANY failure (missing var, no access, unsupported
+ * registry scope, `gh` absent) — same "collapse absent + unreadable into one
+ * signal" posture `readRepoVariable` already establishes; a caller that
+ * needs to distinguish MUST run {@link checkRegistryVariablePresence} first
+ * (which `resolveCaCert` does). NEVER throws.
+ */
+export async function readRegistryVariable(registry: RegistryConfig, name: string): Promise<string | undefined> {
+  let pathPrefix: string;
+  try {
+    pathPrefix = registryPathPrefix(registry);
+  } catch {
+    return undefined;
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      'gh',
+      ['api', `${pathPrefix.replace(/^\//, '')}/actions/variables/${name}`, '--jq', '.value'],
+      { encoding: 'utf-8' },
+    );
+    const value = stdout.trim();
+    return value.length > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * The real `FleetObserverFn`. `manifestPath` is the on-disk path to the
  * `fleet.yaml` that was parsed into `manifest` — used only to locate the
  * co-located `fleet.lock` (never re-parses the manifest itself).

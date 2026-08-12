@@ -193,6 +193,7 @@
  * automatic re-use of an orphaned-but-real App is future scope.
  */
 import { dirname, join } from 'node:path';
+import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { FleetLock, FleetLockAgent, FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 import type { AgentApplyDeps, AgentApplyOutcome } from './apply-agent.js';
@@ -204,7 +205,7 @@ import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './
 import { provisionControlRepo } from './control-repo.js';
 import type { FleetLockAgentUpdate, FleetLockIdentityChange } from './fleet-lock.js';
 import { composeFleetLock, readFleetLockFile, writeFleetLock } from './fleet-lock.js';
-import type { VaultAgentSecrets, VaultEncryptFn, WriteVaultDeps } from './vault-write.js';
+import type { VaultAgentSecrets, VaultCaSecrets, VaultEncryptFn, WriteVaultDeps } from './vault-write.js';
 import {
   VaultError,
   ageEncryptToFile,
@@ -212,9 +213,14 @@ import {
   buildVaultPlaintext,
   removeAgentRecoveryArtifact,
   vaultAgentSecretsForFingerprint,
+  vaultFleetSecretsForFingerprint,
   writeAgentRecoveryArtifact,
   writeVault,
 } from './vault-write.js';
+import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } from './apply-ca.js';
+import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
+import type { EnsureVariableOutcome } from './ensure-variable.js';
+import { publishRoutingRunsOn } from './apply-routing.js';
 
 export interface FleetApplyDeps {
   /**
@@ -238,6 +244,14 @@ export interface FleetApplyDeps {
   readonly log: (line: string) => void;
   /** `true` → an existing `secrets/vault.age` is versioned (timestamped sibling), not clobbered. Mirrors `MACF_BOOTSTRAP_VAULT_VERSION=1` (`bootstrap-build-vault.sh` precedent). Default `false` (fail loud on an existing vault). */
   readonly allowVaultVersion?: boolean;
+  /**
+   * DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) — the
+   * CA-ceremony + two-place-publish + `MACF_ROUTING_RUNS_ON` deps. ONE field
+   * covers both `apply-ca.ts` and `apply-routing.ts` — `RoutingApplyDeps` is
+   * a `Pick` of this same shape (see `apply-routing.ts`'s doc), so there is
+   * no second dep object to keep in sync.
+   */
+  readonly trustDeps: CaApplyDeps;
 }
 
 export interface AgentApplyRecord {
@@ -266,6 +280,22 @@ export type ControlRepoSyncOutcome =
   | { readonly status: 'nothing-to-commit' }
   | { readonly status: 'failed'; readonly reason: string };
 
+/**
+ * DR-043 Amendment D phase 2 (macf#838) — the CA ceremony's render-safe
+ * result. `resolve` is {@link CaApplyOutcome} (`apply-ca.ts::redactCaResolve`'s
+ * output — NEVER a raw {@link CaResolveOutcome}, which would carry the
+ * private key on a `'minted'` result). `registryLeg`/`repoLegs` are always
+ * present (never `undefined`) — a `'skipped'` entry (via
+ * `apply-ca.ts::skippedCaPublish`) makes "never attempted this run" as
+ * visible as a real failure, mirroring `plan.ts`'s `unimplementedByApply`
+ * discipline of never letting a gap render as silence.
+ */
+export interface CaApplyResult {
+  readonly resolve: CaApplyOutcome;
+  readonly registryLeg: EnsureVariableOutcome;
+  readonly repoLegs: Readonly<Record<string, EnsureVariableOutcome>>;
+}
+
 export interface FleetApplyResult {
   /** DR-043 Amendment F step 0 — see `control-repo.ts`'s module doc. A `foreign`/`failed` outcome means `agents`/`vault` below are trivially empty/skipped: the run aborted before touching anything else. */
   readonly controlRepo: ControlRepoOutcome;
@@ -277,6 +307,10 @@ export interface FleetApplyResult {
   readonly vault: VaultApplyOutcome;
   /** Accumulated across every incremental `composeFleetLock` call this run — DR-043 Amendment A §A2 "never silently resolve" drift. */
   readonly identityChanges: readonly FleetLockIdentityChange[];
+  /** DR-043 Amendment D phase 2 (macf#838) — the per-project CA ceremony + two-place publish (macf#806). See {@link CaApplyResult}'s doc. */
+  readonly ca: CaApplyResult;
+  /** `MACF_ROUTING_RUNS_ON` create-only writes, keyed by repo — empty `{}` when `routing.runner` is not declared in the manifest. */
+  readonly routing: Readonly<Record<string, EnsureVariableOutcome>>;
 }
 
 function agentVaultSecrets(appHandle: string, outcome: Extract<AgentApplyOutcome, { status: 'created' }>): VaultAgentSecrets {
@@ -404,6 +438,12 @@ export async function applyFleet(
       agents: [],
       vault: { status: 'skipped' },
       identityChanges: [],
+      ca: {
+        resolve: { status: 'failed', reason: 'control repo aborted before the CA ceremony could run — see controlRepo above.' },
+        registryLeg: { status: 'skipped', reason: 'control repo aborted — see controlRepo above.' },
+        repoLegs: {},
+      },
+      routing: {},
     };
   }
   deps.log(`Control repo "${controlRepo.repo}": ${controlRepo.status.toUpperCase()} (checkout: ${controlRepo.localDir}).`);
@@ -428,6 +468,11 @@ export async function applyFleet(
   const pendingVaultAgents: VaultAgentSecrets[] = [];
   const pendingCreatedUpdates: Record<string, FleetLockAgentUpdate> = {};
   const identityChanges: FleetLockIdentityChange[] = [];
+  // DR-043 Amendment D phase 2 (macf#838) — agent repos CONFIRMED to exist
+  // this run (created OR already-present; NOT the ones whose ensureAgentRepo
+  // failed). Feeds both the CA two-place repo legs and the routing-var
+  // write below — neither can target a repo that doesn't exist.
+  const confirmedRepos: string[] = [];
 
   const writeIncrementalLock = (role: string, update: FleetLockAgentUpdate): void => {
     const composed = composeFleetLock({ fleet: manifest.metadata.name, previous: currentLock, agentUpdates: { [role]: update } });
@@ -455,6 +500,7 @@ export async function applyFleet(
       continue;
     }
     deps.log(`Role "${agent.role}": agent repo "${agent.repo}" ${repoOutcome.status.toUpperCase()}.`);
+    confirmedRepos.push(agent.repo);
 
     const prior = currentLock?.agents.find((a) => a.role === agent.role);
     // DR-043 §D5 pre-flight — see `noRecipientPreflightFailure`'s doc.
@@ -486,12 +532,48 @@ export async function applyFleet(
     records.push({ role: agent.role, identity, repoInit: repoInitOutcome });
   }
 
-  const vault = await settleVault(manifest, vaultOutPath, pendingVaultAgents, deps);
-  if (vault.status === 'written' && Object.keys(pendingCreatedUpdates).length > 0) {
+  // --- DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) ---
+  //
+  // Mint-or-reuse decision FIRST (fleet-level, independent of any one
+  // agent's outcome) — `lockHasCaKey` reflects a PRIOR run's success only
+  // (see `apply-ca.ts::resolveCaCert`'s doc); nothing written earlier in
+  // THIS run's loop can set it.
+  const lockHasCaKey = currentLock?.fingerprints?.['ca_key'] !== undefined;
+  const caResolve: CaResolveOutcome = await resolveCaCert(
+    manifest.metadata.name,
+    manifest.owner.registry,
+    lockHasCaKey,
+    recipients,
+    deps.trustDeps,
+  );
+  deps.log(
+    caResolve.status === 'failed'
+      ? `CA: FAILED to resolve — ${caResolve.reason}`
+      : `CA: ${caResolve.status.toUpperCase()} (fingerprint ${caCertFingerprint(caResolve.certPem)}).`,
+  );
+  // A FRESH key needs a durable home before its PUBLIC cert is ever
+  // published (see this module's + `apply-ca.ts`'s doc: publishing first
+  // and losing the vault write would recreate the #799 orphan-cert class).
+  // A REUSED cert has no fresh key this run — nothing to stage.
+  const caSecretsForVault: VaultCaSecrets | undefined =
+    caResolve.status === 'minted' ? { project: manifest.metadata.name, caKeyPem: caResolve.keyPem, caCertPem: caResolve.certPem } : undefined;
+
+  const vault = await settleVault(manifest, vaultOutPath, pendingVaultAgents, caSecretsForVault, deps);
+  if (vault.status === 'written' && (Object.keys(pendingCreatedUpdates).length > 0 || caSecretsForVault !== undefined)) {
     // Batched, not per-role: `writeVault` just persisted EVERY `created`
-    // agent's secret in ONE `age` invocation, so their lock entries become
-    // durable together too — see the module doc's ordering rationale.
-    const composed = composeFleetLock({ fleet: manifest.metadata.name, previous: currentLock, agentUpdates: pendingCreatedUpdates });
+    // agent's secret (+ the CA key, when freshly minted) in ONE `age`
+    // invocation, so their lock entries become durable together too — see
+    // the module doc's ordering rationale. `fleetSecrets` is the CA-key
+    // fingerprint ONLY — this is the SOLE place `fingerprints.ca_key` is
+    // ever written (never an incremental per-agent write), matching
+    // `pendingCreatedUpdates`'s existing batched-only discipline.
+    const fleetSecrets = caSecretsForVault !== undefined ? vaultFleetSecretsForFingerprint({ agents: [], ca: caSecretsForVault }) : undefined;
+    const composed = composeFleetLock({
+      fleet: manifest.metadata.name,
+      previous: currentLock,
+      agentUpdates: pendingCreatedUpdates,
+      ...(fleetSecrets !== undefined ? { fleetSecrets } : {}),
+    });
     writeFleetLock(lockPath, composed.lock);
     currentLock = composed.lock;
     identityChanges.push(...composed.identityChanges);
@@ -503,6 +585,53 @@ export async function applyFleet(
     for (const role of Object.keys(pendingCreatedUpdates)) {
       removeAgentRecoveryArtifact(agentRecoveryArtifactPath(secretsDir, role));
     }
+  }
+
+  // Two-place PUBLIC-cert publish (macf#806) — gated on the ordering rule
+  // above: a MINTED cert publishes only once its key is confirmed durable
+  // (`vault.status === 'written'`); a REUSED cert had no fresh key this run,
+  // so it publishes unconditionally (backfills any repo leg the #806 drift
+  // class left missing); a FAILED resolve or a minted-but-unwritten vault
+  // publishes NOTHING — every leg reads `'skipped'` with the reason, never
+  // silent (mirrors `plan.ts`'s `unimplementedByApply` discipline).
+  let certToPublish: string | undefined;
+  let caSkipReason: string | undefined;
+  if (caResolve.status === 'reused') {
+    certToPublish = caResolve.certPem;
+  } else if (caResolve.status === 'minted') {
+    if (vault.status === 'written') {
+      certToPublish = caResolve.certPem;
+    } else {
+      caSkipReason =
+        'CA was freshly minted this run but the batched vault write did not succeed — refusing to publish the ' +
+        'cert until its key is durable (DR-043 §D5). Re-run apply once the vault issue is fixed. The retry ' +
+        're-mints (the registry cert was never published, so resolveCaCert takes the mint path again), which is ' +
+        'harmless: this run\'s key was never made durable and has signed nothing, so nothing is orphaned.';
+    }
+  } else {
+    caSkipReason = `CA could not be resolved this run: ${caResolve.reason}`;
+  }
+  const caPublish: CaPublishResult =
+    certToPublish !== undefined
+      ? await publishCaCertLegs(certToPublish, manifest.metadata.name, manifest.owner.registry, confirmedRepos, deps.trustDeps)
+      : skippedCaPublish(confirmedRepos, caSkipReason ?? 'CA cert unresolved');
+  deps.log(
+    `CA registry leg: ${caPublish.registryLeg.status}` +
+      (caPublish.registryLeg.status === 'failed' || caPublish.registryLeg.status === 'skipped' ? ` — ${caPublish.registryLeg.reason}` : '.'),
+  );
+  for (const [repo, leg] of Object.entries(caPublish.repoLegs)) {
+    deps.log(`CA repo leg (${repo}): ${leg.status}` + (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'));
+  }
+
+  // `MACF_ROUTING_RUNS_ON` (§D1) — independent of the CA outcome; every
+  // caller repo is a confirmed agent repo, never the control repo (see
+  // `apply-routing.ts`'s doc).
+  const routing =
+    manifest.routing?.runner !== undefined
+      ? await publishRoutingRunsOn(manifest.routing.runner.runs_on, confirmedRepos, deps.trustDeps)
+      : {};
+  for (const [repo, leg] of Object.entries(routing)) {
+    deps.log(`Routing var (${repo}): ${leg.status}` + (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'));
   }
 
   // Final sync (macf#857) — the LAST thing this run does: push whatever
@@ -522,7 +651,8 @@ export async function applyFleet(
   // "git-committed content invariant" section.
   const controlRepoSync = await syncControlRepo(controlDir, deps);
 
-  return { controlRepo, controlRepoSync, lockPath, finalLock: currentLock, agents: records, vault, identityChanges };
+  const ca: CaApplyResult = { resolve: redactCaResolve(caResolve), registryLeg: caPublish.registryLeg, repoLegs: caPublish.repoLegs };
+  return { controlRepo, controlRepoSync, lockPath, finalLock: currentLock, agents: records, vault, identityChanges, ca, routing };
 }
 
 /**
@@ -547,17 +677,22 @@ async function syncControlRepo(controlDir: string, deps: FleetApplyDeps): Promis
 
 /**
  * Assemble + attempt the single, whole-payload vault write for every
- * `created` agent this run. Returns the outcome WITHOUT writing
- * `fleet.lock` — the caller does that only on `status: 'written'` (see
- * module doc's ordering rationale).
+ * `created` agent this run PLUS a freshly-minted CA key, when present
+ * (`caSecrets`, DR-043 Amendment D phase 2 — macf#838). Returns the outcome
+ * WITHOUT writing `fleet.lock` — the caller does that only on
+ * `status: 'written'` (see module doc's ordering rationale). `writeVault`
+ * is single-shot whole-payload (see `vault-write.ts`'s module doc) — there
+ * can be only ONE vault write per run, so a fresh CA key MUST fold into the
+ * SAME call as any fresh agent creds, never a second write.
  */
 async function settleVault(
   manifest: FleetManifest,
   vaultOutPath: string,
   pendingVaultAgents: readonly VaultAgentSecrets[],
+  caSecrets: VaultCaSecrets | undefined,
   deps: FleetApplyDeps,
 ): Promise<VaultApplyOutcome> {
-  if (pendingVaultAgents.length === 0) return { status: 'skipped' };
+  if (pendingVaultAgents.length === 0 && caSecrets === undefined) return { status: 'skipped' };
 
   try {
     // Not merely a `writeVault`-will-catch-it-anyway redundancy: this
@@ -578,7 +713,7 @@ async function settleVault(
           'uniqueness is the guard).',
       );
     }
-    const plaintext = buildVaultPlaintext({ agents: [...pendingVaultAgents] });
+    const plaintext = buildVaultPlaintext({ agents: [...pendingVaultAgents], ...(caSecrets !== undefined ? { ca: caSecrets } : {}) });
     const result = await writeVault(
       plaintext,
       { outPath: vaultOutPath, recipients, allowVersion: deps.allowVaultVersion === true, now: deps.now },

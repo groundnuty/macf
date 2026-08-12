@@ -371,12 +371,19 @@ describe('summarizePlan', () => {
 // truth for "does apply actually do this" — against EVERY `PlanItemKind`,
 // and pin that `computePlan` surfaces the gap via `unimplementedByApply`
 // rather than silently dropping it.
+//
+// macf#838 Amendment D phase 2 retired the CA leg of this gap entirely (`ca`
+// joined the always-implemented group, same shape `repo` did in macf#857)
+// and PARTIALLY retired the routing leg: `create` is now implemented
+// (apply writes MACF_ROUTING_RUNS_ON when absent); `update` is NOT (apply's
+// create-only posture never overwrites a diverging value) — see
+// `plan.ts::planItemApplyCoverage`'s routing case.
 
 function fakeItem(kind: PlanItemKind, verb: PlanVerb): PlanItem {
   return { kind, target: `${kind}:x`, verb, reason: 'fake', confirm_required: false };
 }
 
-describe('planItemApplyCoverage — the single source of truth for what apply can/cannot action (macf#854, macf#857)', () => {
+describe('planItemApplyCoverage — the single source of truth for what apply can/cannot action (macf#854, macf#857, macf#838 Amendment D phase 2)', () => {
   it.each<[PlanItemKind, PlanVerb]>([
     ['app', 'create'],
     ['install', 'create'],
@@ -386,16 +393,20 @@ describe('planItemApplyCoverage — the single source of truth for what apply ca
     // ensureAgentRepo for every agent before either consent gate, so
     // repo:create IS actioned — it joined the implemented group.
     ['repo', 'create'],
+    // macf#838 Amendment D phase 2: apply-fleet.ts now runs the CA ceremony
+    // (mint-or-reuse + two-place publish) for every fleet — `ca` items only
+    // ever carry `create`/`noop` (a pure existence check, presenceVerb), so
+    // the kind joined the always-implemented group entirely.
+    ['ca', 'create'],
+    // routing's `create` verb IS actioned (apply writes the var when
+    // absent) — only `update` (a diverging value) stays not_implemented,
+    // see the table below.
+    ['routing', 'create'],
   ])('%s/%s is implemented', (kind, verb) => {
     expect(planItemApplyCoverage(fakeItem(kind, verb))).toBe('implemented');
   });
 
-  it.each<[PlanItemKind, PlanVerb]>([
-    ['ca', 'create'],
-    ['ca', 'update'],
-    ['routing', 'create'],
-    ['routing', 'update'],
-  ])('%s/%s is not_implemented', (kind, verb) => {
+  it.each<[PlanItemKind, PlanVerb]>([['routing', 'update']])('%s/%s is not_implemented', (kind, verb) => {
     expect(planItemApplyCoverage(fakeItem(kind, verb))).toBe('not_implemented');
   });
 
@@ -414,25 +425,30 @@ describe('planItemApplyCoverage — the single source of truth for what apply ca
   });
 });
 
-describe('computePlan — unimplementedByApply (plan must not overstate what apply will do, macf#854, macf#857)', () => {
-  it('flags CA (registry + both repos) — and NOT repo (macf#857: apply-fleet.ts now creates agent repos) — on a fresh fleet with no routing declared', () => {
+describe('computePlan — unimplementedByApply (plan must not overstate what apply will do, macf#854, macf#857, macf#838 Amendment D phase 2)', () => {
+  it('is EMPTY on a fresh fleet with no routing declared — CA is fully implemented now (macf#838 Amendment D phase 2), repo since macf#857', () => {
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
-    // 3 CA items (registry + 2 agent repos, all `unknown` → create). `repo`
-    // items are ALWAYS implemented now (macf#857) regardless of verb — see
-    // planItemApplyCoverage's table above — even though EMPTY_OBSERVED's
-    // repo presence is also `unknown` → create here.
-    expect(plan.unimplementedByApply.map((i) => i.kind).sort()).toEqual(['ca', 'ca', 'ca']);
+    expect(plan.unimplementedByApply).toEqual([]);
+  });
+
+  it('ONLY flags a diverging routing value (update) — CA never appears', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
+    const plan = computePlan(manifest, observed);
+    expect(plan.unimplementedByApply.map((i) => i.kind)).toEqual(['routing']);
+    expect(plan.unimplementedByApply[0]?.verb).toBe('update');
     for (const item of plan.unimplementedByApply) {
       expect(item.reason.length).toBeGreaterThan(0);
       expect(item.reason).not.toBe(plan.items.find((p) => p.target === item.target)?.reason);
     }
   });
 
-  it('ALSO flags routing when declared and diverging', () => {
+  it('does NOT flag routing when it matches (noop) or is absent (create)', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
-    const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
-    const plan = computePlan(manifest, observed);
-    expect(plan.unimplementedByApply.some((i) => i.kind === 'routing' && i.verb === 'update')).toBe(true);
+    const matching: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'self-hosted' };
+    expect(computePlan(manifest, matching).unimplementedByApply).toEqual([]);
+    const absent: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: undefined };
+    expect(computePlan(manifest, absent).unimplementedByApply).toEqual([]);
   });
 
   it('NEVER flags repo — neither repo:create nor repo:noop (macf#857: ensureAgentRepo actions it)', () => {
@@ -456,6 +472,13 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
     expect(noopRepoPlan.unimplementedByApply.some((i) => i.kind === 'repo')).toBe(false);
     // CA is fully present here too — nothing at all should be unimplemented.
     expect(noopRepoPlan.unimplementedByApply).toEqual([]);
+  });
+
+  it('NEVER flags ca — regardless of create or noop (macf#838 Amendment D phase 2)', () => {
+    const freshPlan = computePlan(baseManifest(), EMPTY_OBSERVED); // ca items are 'create' here
+    expect(freshPlan.unimplementedByApply.some((i) => i.kind === 'ca')).toBe(false);
+    const observedCaPresent: ObservedState = { ...EMPTY_OBSERVED, caRegistry: 'present' }; // ca registry item is 'noop' here
+    expect(computePlan(baseManifest(), observedCaPresent).unimplementedByApply.some((i) => i.kind === 'ca')).toBe(false);
   });
 
   it('is EMPTY when every item is noop/report-extra (fully-provisioned fleet, incl. routing)', () => {
@@ -495,20 +518,26 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
   });
 
   it('formatUnimplementedLines renders the exact loud-line shape, distinct wording from SKIPPED', () => {
-    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    // macf#838 Amendment D phase 2: CA is fully implemented now — the ONE
+    // remaining unimplemented case is a diverging routing value.
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
+    const plan = computePlan(manifest, observed);
     const lines = formatUnimplementedLines(plan.unimplementedByApply);
-    expect(lines.length).toBe(3); // 3 ca (registry + 2 agent repos) — see the test above; repo is implemented now (macf#857)
+    expect(lines.length).toBe(1);
     for (const line of lines) {
-      expect(line).toMatch(/^ca:.* \(create\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
+      expect(line).toMatch(/^routing:.* \(update\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
       expect(line).not.toContain('SKIPPED');
     }
   });
 
   it('formatPlanText includes the ⚠ NOT IMPLEMENTED block when unimplementedByApply is non-empty', () => {
-    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
+    const plan = computePlan(manifest, observed);
     const text = formatPlanText(plan);
     expect(text).toMatch(/NOT IMPLEMENTED BY APPLY/);
-    expect(text).toMatch(/ca:registry:ICSOC_2026_CA_CERT/);
+    expect(text).toMatch(/routing:icsoc-2026:runner/);
   });
 
   it('formatPlanText OMITS the NOT IMPLEMENTED block entirely when unimplementedByApply is empty', () => {

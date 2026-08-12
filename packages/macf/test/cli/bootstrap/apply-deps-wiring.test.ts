@@ -25,6 +25,8 @@ import { describe, it, expect } from 'vitest';
 import { resolveMutateDeps } from '../../../src/cli/commands/bootstrap-apply.js';
 import { realControlRepoCommitAndPush } from '../../../src/cli/bootstrap/control-repo.js';
 import { realCommitAndPush } from '../../../src/cli/bootstrap/apply-repo-init.js';
+import { realCreateRegistryVariable, realCreateRepoVariable, realMintCa } from '../../../src/cli/bootstrap/apply-ca.js';
+import { checkRegistryVariablePresence, checkRepoVariablePresence, readRegistryVariable } from '../../../src/cli/bootstrap/observer.js';
 
 describe('apply real-deps wiring (macf#857 — the seam a unit test cannot see)', () => {
   const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml');
@@ -49,5 +51,37 @@ describe('apply real-deps wiring (macf#857 — the seam a unit test cannot see)'
     // Pins the property that makes calling it in a test safe: it assembles a
     // plain object; nothing runs until a field is invoked.
     expect(() => resolveMutateDeps('/definitely/not/a/real/path/fleet.yaml')).not.toThrow();
+  });
+
+  // --- DR-043 Amendment D phase 2 (macf#838) — the CA/routing trustDeps wiring ---
+  //
+  // Same "defined, tested, never called" shape this file exists to catch
+  // (see the module doc) — `apply-ca.ts`'s create-only write primitives
+  // could ship correct and unit-tested while `resolveMutateDeps` still wired
+  // some OTHER (e.g. upsert) function into production. Pin every field by
+  // identity so that class of regression fails HERE, not in the field.
+
+  it('wires the CA registry presence-check to the SAME read plan-time uses (plan and apply agree on "present")', () => {
+    expect(deps.trustDeps.checkRegistryPresence).toBe(checkRegistryVariablePresence);
+  });
+
+  it('wires the CA registry value-read to observer.ts (never a bot-token upsert client)', () => {
+    expect(deps.trustDeps.readRegistryVariable).toBe(readRegistryVariable);
+  });
+
+  it('wires the CA registry CREATE to the create-only primitive', () => {
+    expect(deps.trustDeps.createRegistryVariable).toBe(realCreateRegistryVariable);
+  });
+
+  it('wires the CA/routing repo presence-check to the SAME read plan-time uses', () => {
+    expect(deps.trustDeps.checkRepoPresence).toBe(checkRepoVariablePresence);
+  });
+
+  it('wires the CA/routing repo CREATE to the create-only primitive', () => {
+    expect(deps.trustDeps.createRepoVariable).toBe(realCreateRepoVariable);
+  });
+
+  it('wires the CA mint to the real createCA-backed primitive', () => {
+    expect(deps.trustDeps.mintCa).toBe(realMintCa);
   });
 });
