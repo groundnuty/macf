@@ -8,11 +8,16 @@ import { describe, it, expect } from 'vitest';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import {
   computePlan,
+  formatPlanText,
   formatSkippedLines,
+  formatUnimplementedLines,
+  planItemApplyCoverage,
   summarizePlan,
   UNKNOWN_REASONS,
   type ObservedState,
   type PlanItem,
+  type PlanItemKind,
+  type PlanVerb,
 } from '../../../src/cli/bootstrap/plan.js';
 
 /** A minimal, valid, 2-agent manifest — no optional sections. */
@@ -355,5 +360,169 @@ describe('summarizePlan', () => {
     const summary = summarizePlan(plan.items);
     // 8 per-agent creates + 3 CA creates (registry + 2 agent repos) + 1 routing update.
     expect(summary).toEqual({ creates: 11, updates: 1, noops: 0, extras: 0 });
+  });
+});
+
+// --- planItemApplyCoverage / unimplementedByApply (groundnuty/macf#854) ---
+//
+// #854: `macf bootstrap plan` emitted 7 create items; `apply` delivered 3,
+// failed 1 loudly, and SILENTLY skipped the other 3 (the two CA legs +
+// routing). These tests pin `planItemApplyCoverage` — the single source of
+// truth for "does apply actually do this" — against EVERY `PlanItemKind`,
+// and pin that `computePlan` surfaces the gap via `unimplementedByApply`
+// rather than silently dropping it.
+
+function fakeItem(kind: PlanItemKind, verb: PlanVerb): PlanItem {
+  return { kind, target: `${kind}:x`, verb, reason: 'fake', confirm_required: false };
+}
+
+describe('planItemApplyCoverage — the single source of truth for what apply can/cannot action (macf#854)', () => {
+  it.each<[PlanItemKind, PlanVerb]>([
+    ['app', 'create'],
+    ['install', 'create'],
+    ['secret_fingerprint', 'create'],
+    ['repo', 'noop'],
+  ])('%s/%s is implemented', (kind, verb) => {
+    expect(planItemApplyCoverage(fakeItem(kind, verb))).toBe('implemented');
+  });
+
+  it.each<[PlanItemKind, PlanVerb]>([
+    ['repo', 'create'], // apply never creates repos — apply-repo-init.ts §2
+    ['ca', 'create'],
+    ['ca', 'update'],
+    ['routing', 'create'],
+    ['routing', 'update'],
+  ])('%s/%s is not_implemented', (kind, verb) => {
+    expect(planItemApplyCoverage(fakeItem(kind, verb))).toBe('not_implemented');
+  });
+
+  it('noop and report-extra are ALWAYS implemented, for EVERY PlanItemKind — nothing calls for action', () => {
+    const allKinds: readonly PlanItemKind[] = ['app', 'repo', 'install', 'secret_fingerprint', 'ca', 'routing', 'agent'];
+    for (const kind of allKinds) {
+      expect(planItemApplyCoverage(fakeItem(kind, 'noop'))).toBe('implemented');
+    }
+    expect(planItemApplyCoverage(fakeItem('agent', 'report-extra'))).toBe('implemented');
+  });
+
+  it('every PlanItemKind is exercised by the two tables above + the noop sweep (exhaustiveness self-check)', () => {
+    const exercised = new Set<PlanItemKind>(['app', 'install', 'secret_fingerprint', 'repo', 'ca', 'routing', 'agent']);
+    const allKinds: readonly PlanItemKind[] = ['app', 'repo', 'install', 'secret_fingerprint', 'ca', 'routing', 'agent'];
+    for (const kind of allKinds) expect(exercised.has(kind)).toBe(true);
+  });
+});
+
+describe('computePlan — unimplementedByApply (plan must not overstate what apply will do, macf#854)', () => {
+  it('flags CA (registry + both repos) — and repo, since EMPTY_OBSERVED has no repo presence either — on a fresh fleet with no routing declared', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    // 3 CA items (registry + 2 agent repos, all `unknown` → create) + 2 repo
+    // items (EMPTY_OBSERVED carries no agent data at all, so `repoItem` also
+    // degrades to `unknown` → create — genuinely nothing is confirmed yet).
+    expect(plan.unimplementedByApply.map((i) => i.kind).sort()).toEqual(['ca', 'ca', 'ca', 'repo', 'repo']);
+    for (const item of plan.unimplementedByApply) {
+      expect(item.reason.length).toBeGreaterThan(0);
+      expect(item.reason).not.toBe(plan.items.find((p) => p.target === item.target)?.reason);
+    }
+  });
+
+  it('ALSO flags routing when declared and diverging', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
+    const plan = computePlan(manifest, observed);
+    expect(plan.unimplementedByApply.some((i) => i.kind === 'routing' && i.verb === 'update')).toBe(true);
+  });
+
+  it('flags repo:create but not repo:noop', () => {
+    const manifest = baseManifest();
+    const freshPlan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(freshPlan.unimplementedByApply.some((i) => i.kind === 'repo')).toBe(true);
+
+    const observedRepoPresent: ObservedState = {
+      lock: null,
+      agents: {
+        'science-agent': { app: 'unknown', install: 'unknown', repo: 'present', fingerprints: {} },
+        'code-agent': { app: 'unknown', install: 'unknown', repo: 'present', fingerprints: {} },
+      },
+      caRegistry: 'present',
+      caRepos: {
+        'groundnuty/icsoc-2026-science-agent': 'present',
+        'groundnuty/icsoc-2026-experiment': 'present',
+      },
+    };
+    const noopRepoPlan = computePlan(manifest, observedRepoPresent);
+    expect(noopRepoPlan.unimplementedByApply.some((i) => i.kind === 'repo')).toBe(false);
+    // CA is fully present here too — nothing at all should be unimplemented.
+    expect(noopRepoPlan.unimplementedByApply).toEqual([]);
+  });
+
+  it('is EMPTY when every item is noop/report-extra (fully-provisioned fleet, incl. routing)', () => {
+    const manifest = baseManifest({
+      routing: { runner: { runs_on: 'self-hosted' } },
+      trust: { ca: 'per-project', federated_cas: [] },
+    });
+    const observed: ObservedState = {
+      lock: null,
+      agents: {
+        'science-agent': {
+          app: 'present',
+          appId: '111111',
+          install: 'present',
+          installId: '22222222',
+          repo: 'present',
+          fingerprints: { app_private_key: 'sha256:aaa' },
+        },
+        'code-agent': {
+          app: 'present',
+          appId: '333333',
+          install: 'present',
+          installId: '44444444',
+          repo: 'present',
+          fingerprints: { app_private_key: 'sha256:bbb' },
+        },
+      },
+      caRegistry: 'present',
+      caRepos: {
+        'groundnuty/icsoc-2026-science-agent': 'present',
+        'groundnuty/icsoc-2026-experiment': 'present',
+      },
+      routingRunsOn: 'self-hosted',
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.unimplementedByApply).toEqual([]);
+  });
+
+  it('formatUnimplementedLines renders the exact loud-line shape, distinct wording from SKIPPED', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const lines = formatUnimplementedLines(plan.unimplementedByApply);
+    expect(lines.length).toBe(5); // 3 ca + 2 repo, see the test above
+    for (const line of lines) {
+      expect(line).toMatch(/^(ca|repo):.* \(create\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
+      expect(line).not.toContain('SKIPPED');
+    }
+  });
+
+  it('formatPlanText includes the ⚠ NOT IMPLEMENTED block when unimplementedByApply is non-empty', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const text = formatPlanText(plan);
+    expect(text).toMatch(/NOT IMPLEMENTED BY APPLY/);
+    expect(text).toMatch(/ca:registry:ICSOC_2026_CA_CERT/);
+  });
+
+  it('formatPlanText OMITS the NOT IMPLEMENTED block entirely when unimplementedByApply is empty', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: null,
+      agents: {
+        'science-agent': { app: 'unknown', install: 'unknown', repo: 'present', fingerprints: {} },
+        'code-agent': { app: 'unknown', install: 'unknown', repo: 'present', fingerprints: {} },
+      },
+      caRegistry: 'present',
+      caRepos: {
+        'groundnuty/icsoc-2026-science-agent': 'present',
+        'groundnuty/icsoc-2026-experiment': 'present',
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.unimplementedByApply).toEqual([]);
+    expect(formatPlanText(plan)).not.toMatch(/NOT IMPLEMENTED/);
   });
 });

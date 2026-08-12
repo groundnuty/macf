@@ -27,8 +27,15 @@ import { createInterface } from 'node:readline';
 import { resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
 import { deriveAppHandle, parseFleetManifest } from '../bootstrap/fleet-manifest.js';
-import type { FleetObserverFn, FleetPlan, FleetPlanFailure } from '../bootstrap/plan.js';
-import { computePlan, fleetPlanFailureToJson, fleetPlanToJson, formatPlanText, summarizePlan } from '../bootstrap/plan.js';
+import type { FleetObserverFn, FleetPlan, FleetPlanFailure, UnimplementedApplyItem } from '../bootstrap/plan.js';
+import {
+  computePlan,
+  fleetPlanFailureToJson,
+  fleetPlanToJson,
+  formatPlanText,
+  formatUnimplementedLines,
+  summarizePlan,
+} from '../bootstrap/plan.js';
 import { githubRegistryObserver, readFleetLock } from '../bootstrap/observer.js';
 import type { GitHubAppManifest } from '../bootstrap/app-manifest.js';
 import { buildAppManifest, repoHomepageUrl } from '../bootstrap/app-manifest.js';
@@ -170,6 +177,16 @@ async function realConfirmPlan(plan: FleetPlan, creations: readonly PlannedAppCr
       `${String(summary.updates)} update(s) requiring confirmation at the point they occur, and leave ` +
       `${String(summary.noops)} already-present resource(s) untouched. Nothing is deleted (§D3 no-prune).\n`,
   );
+  // macf#854 — the plan above already lists the NOT-IMPLEMENTED items loudly
+  // (formatPlanText), but this is the LAST thing the operator reads before
+  // typing "yes" — restate the count here so approving doesn't read as
+  // approving work that will silently never happen.
+  if (plan.unimplementedByApply.length > 0) {
+    process.stderr.write(
+      `⚠ ${String(plan.unimplementedByApply.length)} item(s) in the plan above are NOT IMPLEMENTED by apply yet — ` +
+        'approving will NOT create or update them (see the ⚠ block in the plan above for which).\n',
+    );
+  }
   process.stderr.write('Type "yes" to proceed with this plan, anything else to abort: ');
   return new Promise((resolve) => {
     const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -238,8 +255,19 @@ function agentSummaryLines(result: FleetApplyResult): string[] {
   return lines;
 }
 
-/** Human render of a completed (non-dry-run) apply result. Never a credential value. */
-export function formatApplyResult(result: FleetApplyResult): string {
+/**
+ * Human render of a completed (non-dry-run) apply result. Never a credential
+ * value.
+ *
+ * `unimplemented` is the plan's `unimplementedByApply` (macf#854) — the
+ * caller threads it through from the SAME plan the operator approved, so
+ * this final summary names the same gap the pre-approval render did. This is
+ * the ONLY place that gap is visible under `--yes` (which skips the
+ * pre-approval render entirely) — see the module doc + plan.ts's "Apply
+ * coverage" section. Defaults to `[]` so existing callers/tests that don't
+ * thread it through keep compiling and rendering byte-identically.
+ */
+export function formatApplyResult(result: FleetApplyResult, unimplemented: readonly UnimplementedApplyItem[] = []): string {
   const parts: string[] = ['Agent identities:', ...agentSummaryLines(result), ''];
   switch (result.vault.status) {
     case 'skipped':
@@ -258,6 +286,14 @@ export function formatApplyResult(result: FleetApplyResult): string {
     for (const c of result.identityChanges) {
       parts.push(`  ${c.role}.${c.field}: ${c.previous} → ${c.next}`);
     }
+  }
+  if (unimplemented.length > 0) {
+    parts.push(
+      '',
+      `⚠ apply did NOT action ${String(unimplemented.length)} planned item(s) below — these are NOT IMPLEMENTED ` +
+        'yet, this is not "nothing to do" (macf#854):',
+      ...formatUnimplementedLines(unimplemented),
+    );
   }
   return parts.join('\n');
 }
@@ -287,14 +323,21 @@ function redactIdentity(identity: AgentApplyOutcome): unknown {
   }
 }
 
-/** Structured `--json` render. Never a credential value — only status/id/path/reason fields (see {@link redactIdentity}). */
-export function fleetApplyResultToJson(result: FleetApplyResult): unknown {
+/**
+ * Structured `--json` render. Never a credential value — only status/id/path/
+ * reason fields (see {@link redactIdentity}). `unimplemented` is the plan's
+ * `unimplementedByApply` (macf#854); defaults to `[]` so existing
+ * callers/tests keep compiling — see {@link formatApplyResult}'s doc for why
+ * the caller threads it through.
+ */
+export function fleetApplyResultToJson(result: FleetApplyResult, unimplemented: readonly UnimplementedApplyItem[] = []): unknown {
   return {
     schema_version: FLEET_APPLY_JSON_SCHEMA_VERSION,
     agents: result.agents.map((rec) => ({ role: rec.role, identity: redactIdentity(rec.identity), repo_init: rec.repoInit ?? null })),
     vault: result.vault,
     lock_path: result.lockPath,
     identity_changes: result.identityChanges.map((c) => ({ ...c })),
+    unimplemented_by_apply: unimplemented.map((i) => ({ ...i })),
   };
 }
 
@@ -388,10 +431,10 @@ export async function runBootstrapApply(
     const result = await applyFleet(manifest, manifestPath, priorLock, mutate);
 
     if (opts.json) {
-      console.log(JSON.stringify(fleetApplyResultToJson(result), null, 2));
+      console.log(JSON.stringify(fleetApplyResultToJson(result, plan.unimplementedByApply), null, 2));
     } else {
       console.log('');
-      console.log(formatApplyResult(result));
+      console.log(formatApplyResult(result, plan.unimplementedByApply));
     }
     return applyExitCode(result);
   } catch (err) {
