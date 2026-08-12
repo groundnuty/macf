@@ -31,7 +31,16 @@
  *     reassigned port surfaces as unreachability; an aged `last_heartbeat` is a
  *     definitive stale (DR-031 `isStaleEntry`).
  *  4. CA material — `MACF_CA_CERT` (a readable VARIABLE) is present AND
- *     base64/PEM-parses (the #563 malformed-base64 class — present ≠ valid).
+ *     base64/PEM-parses (the #563 malformed-base64 class — present ≠ valid) AND,
+ *     extended macf#873, IS THE CURRENT local CA. A rotated-out-but-well-formed
+ *     cert used to pass this check outright — but that same variable is the mTLS
+ *     trust anchor for every agent's `/health` probe, so a stale value silently
+ *     fails EVERY probe, and each downstream check independently declines to
+ *     fail on that (`freshnessFails` only fails `'stale'`; `routable` only checks
+ *     the registry key exists) — the #872 "precondition for other checks'
+ *     failures" absorption class. A definite mismatch fails the verdict AND, when
+ *     most/all agents read unreachable, is reported as the LIKELY CAUSE rather
+ *     than a separate, uncorrelated line.
  *  5. SESSION-name drift — `agent-config.json.tmux_session` follows the canonical
  *     `<project>@<routing-label>` convention (the silent Stage-2-routing-drop class).
  *     Vestigial + omitted on v3+ (macf#678): absent = PASS.
@@ -241,37 +250,73 @@ export function isStrictBase64(s: string): boolean {
 }
 
 /**
- * CA material check (#563). `MACF_CA_CERT` is a readable VARIABLE; validate it is
- * present AND parses — either as a PEM cert block whose body is strict base64, or
- * as a base64-of-PEM blob that decodes to a cert. A present-but-malformed value
- * (truncated / garbled base64) is the #563 class: present ≠ valid.
+ * CA material check (#563, extended macf#873). `MACF_CA_CERT` is a readable
+ * VARIABLE; validate it is present AND parses — either as a PEM cert block whose
+ * body is strict base64, or as a base64-of-PEM blob that decodes to a cert. A
+ * present-but-malformed value (truncated / garbled base64) is the #563 class:
+ * present ≠ valid.
+ *
+ * macf#873 extends this from "well-formed" to "well-formed AND CURRENT": a
+ * rotated-out cert still parses cleanly, so present+valid alone let a stale CA
+ * through even though it is the mTLS trust anchor every agent's `/health` probe
+ * uses (see `resolveDepsFromRegistry`). Pass `currentCaFingerprint` — the SAME
+ * local-disk read `deps.currentCaFingerprint()` check 6 already computes; do NOT
+ * add a second local-CA read path — to get a `matchesCurrentCa` verdict alongside
+ * present/valid. Omit it (or pass `null`, the default) to skip the comparison:
+ * `matchesCurrentCa` is `null` (honest-not-asserted, NEVER a pass) whenever the
+ * registry cert doesn't parse OR no local CA fingerprint was given.
  */
-export function evaluateCaCert(raw: string | null | undefined): {
-  readonly present: boolean;
-  readonly valid: boolean;
-  readonly reason?: string;
-} {
+export function evaluateCaCert(
+  raw: string | null | undefined,
+  currentCaFingerprint: string | null = null,
+): CaCheckResult {
   if (raw === null || raw === undefined || raw.trim() === '') {
-    return { present: false, valid: false, reason: 'MACF_CA_CERT absent or empty' };
+    return {
+      present: false,
+      valid: false,
+      reason: 'MACF_CA_CERT absent or empty',
+      matchesCurrentCa: null,
+      registryCaFingerprint: null,
+      currentCaFingerprint,
+    };
   }
   const text = raw.trim();
   const pem = /-----BEGIN CERTIFICATE-----([\s\S]+?)-----END CERTIFICATE-----/.exec(text);
+  let normalizedPem: string | null = null;
+  let base: { present: boolean; valid: boolean; reason?: string };
+
   if (pem) {
-    return isStrictBase64(pem[1]!)
-      ? { present: true, valid: true }
-      : { present: true, valid: false, reason: 'PEM body is not valid base64 (#563 malformed)' };
-  }
-  // No PEM markers — maybe the whole value is base64-of-PEM (#563 storage form).
-  if (isStrictBase64(text)) {
+    const [, body] = pem;
+    if (isStrictBase64(body!)) {
+      normalizedPem = text;
+      base = { present: true, valid: true };
+    } else {
+      base = { present: true, valid: false, reason: 'PEM body is not valid base64 (#563 malformed)' };
+    }
+  } else if (isStrictBase64(text)) {
+    // No PEM markers — maybe the whole value is base64-of-PEM (#563 storage form).
     const decoded = Buffer.from(text, 'base64').toString('utf-8');
-    if (/-----BEGIN CERTIFICATE-----/.test(decoded)) return { present: true, valid: true };
-    return { present: true, valid: false, reason: 'base64 decodes but is not a certificate' };
+    if (/-----BEGIN CERTIFICATE-----/.test(decoded)) {
+      normalizedPem = decoded;
+      base = { present: true, valid: true };
+    } else {
+      base = { present: true, valid: false, reason: 'base64 decodes but is not a certificate' };
+    }
+  } else {
+    base = {
+      present: true,
+      valid: false,
+      reason: 'present but not a parseable PEM/base64 certificate (#563 malformed-base64)',
+    };
   }
-  return {
-    present: true,
-    valid: false,
-    reason: 'present but not a parseable PEM/base64 certificate (#563 malformed-base64)',
-  };
+
+  const registryCaFingerprint = normalizedPem ? caCertFingerprint(normalizedPem) : null;
+  const matchesCurrentCa =
+    registryCaFingerprint !== null && currentCaFingerprint !== null
+      ? registryCaFingerprint === currentCaFingerprint
+      : null;
+
+  return { ...base, matchesCurrentCa, registryCaFingerprint, currentCaFingerprint };
 }
 
 /**
@@ -475,6 +520,22 @@ export interface CaCheckResult {
   readonly present: boolean;
   readonly valid: boolean;
   readonly reason?: string;
+  /**
+   * Whether the registry-published CA cert is the CURRENT local CA (macf#873,
+   * silent-fallback-hazards.md Instance 16's sibling gap — check 6 compares the
+   * routing-client cert's RECORDED issuer against the current CA; this compares
+   * the registry's PUBLISHED CA itself, the mTLS trust anchor every agent's
+   * `/health` probe uses). `false` is a DEFINITE mismatch — a rotated-out-but-
+   * well-formed CA that fails every probe using it (the #872/#873 outage class).
+   * `null` is honest-not-asserted (no valid registry cert to fingerprint, OR no
+   * local CA on this machine) — NEVER treated as a pass by the verdict or the
+   * render.
+   */
+  readonly matchesCurrentCa: boolean | null;
+  /** SHA-256 fingerprint of the registry-published CA cert; `null` if unparseable. */
+  readonly registryCaFingerprint: string | null;
+  /** SHA-256 fingerprint of the CURRENT local CA cert; `null` if none on disk. */
+  readonly currentCaFingerprint: string | null;
 }
 
 export interface RoutingDoctorReport {
@@ -663,14 +724,19 @@ export async function gatherRoutingDoctor(deps: RoutingDoctorDeps): Promise<Rout
     agents.push(await evaluateAgentRow(label, info, configAgents[label], deps, now));
   }
 
-  // 4. CA material.
-  const ca = evaluateCaCert(await deps.readCaCert());
+  // Single local-CA-fingerprint read, shared by check 4 (registry CA currency,
+  // #873) and check 6 (routing-client cert issuer staleness, #800) — do NOT add
+  // a second local-CA read path.
+  const currentCaFp = deps.currentCaFingerprint();
+
+  // 4. CA material — present/valid (#563) AND, extended #873, CURRENT.
+  const ca = evaluateCaCert(await deps.readCaCert(), currentCaFp);
 
   // 6. Routing-client cert issuer staleness (#800) — a project-level check,
   // like CA material, not per-agent/per-repo.
   const routingClientCert = evaluateRoutingClientCertIssuer(
     await deps.readRoutingClientCertIssuer(),
-    deps.currentCaFingerprint(),
+    currentCaFp,
   );
 
   return { project: deps.project, repoPins, expectedPin, hasRoutingConfig, agents, ca, routingClientCert };
@@ -711,14 +777,71 @@ function routingClientCertFails(r: RoutingClientCertCheckResult): boolean {
   return r.state === 'orphaned';
 }
 
+/**
+ * Whether the CA-material check passes: present + parses (#563) AND, extended
+ * #873, matches the CURRENT local CA when that's known. `matchesCurrentCa ===
+ * null` (honest-not-asserted — no local CA to compare against) does NOT fail;
+ * only a DEFINITE mismatch (`=== false`) does. Shared by the verdict, the JSON
+ * `summary.ca_ok`, and `summaryLine` so the three surfaces can't drift apart.
+ */
+function caCheckOk(ca: CaCheckResult): boolean {
+  return ca.present && ca.valid && ca.matchesCurrentCa !== false;
+}
+
 export function routingVerdict(report: RoutingDoctorReport): RoutingVerdict {
   if (report.repoPins.length === 0 && report.agents.length === 0) return 'EMPTY';
   const participating = report.repoPins.filter((r) => r.consistent !== null);
   const pinFail = participating.some((r) => !r.consistent);
   const agentFail = report.agents.some((a) => !agentRoutingOk(a));
-  const caFail = !report.ca.present || !report.ca.valid;
+  const caFail = !caCheckOk(report.ca);
   const routingClientCertFail = routingClientCertFails(report.routingClientCert);
   return pinFail || agentFail || caFail || routingClientCertFail ? 'DEGRADED' : 'HEALTHY';
+}
+
+/**
+ * Whether a DEFINITE CA mismatch (`matchesCurrentCa === false`) is plausibly the
+ * ROOT CAUSE of broad agent unreachability (macf#873 — the absorption half of
+ * the fix, not just the comparison half). The registry CA is the mTLS trust
+ * anchor for every `/health` probe (`resolveDepsFromRegistry`); a rotated-out
+ * cert fails EVERY probe using it, and each downstream check independently
+ * declines to fail on that alone (`freshnessFails` only fails `'stale'`;
+ * `routable` only checks the registry key exists) — see the module doc + #872.
+ *
+ * Deliberately counts only `'unreachable'`, NOT `'stale'`: a `'stale'` agent
+ * already fails the verdict on its own via `freshnessFails`, so the causal line
+ * is most valuable exactly where nothing ELSE in the table would explain a
+ * DEGRADED (or, pre-#873, a false-HEALTHY) verdict.
+ *
+ * Threshold: at least HALF the checked agents unreachable — "a majority, or
+ * all" per the issue's framing (`unreachable * 2 >= total`, so N/N and a bare
+ * majority both qualify). `total === 0` never triggers it.
+ */
+export function caMismatchLikelyCause(report: RoutingDoctorReport): boolean {
+  if (report.ca.matchesCurrentCa !== false) return false;
+  const total = report.agents.length;
+  if (total === 0) return false;
+  const unreachable = report.agents.filter((a) => a.freshness === 'unreachable').length;
+  return unreachable * 2 >= total;
+}
+
+/**
+ * The causal-attribution line (macf#873's absorption fix): states the CA
+ * mismatch is the LIKELY CAUSE of the unreachable agents, with both
+ * fingerprints, instead of leaving a lone CA ✗ and N independent agent ✗/?
+ * marks for a reader to correlate by hand. `null` when `caMismatchLikelyCause`
+ * doesn't hold — a mismatch with agents otherwise reachable (or broad
+ * unreachability with a matching CA) still renders as a plain CA ✗ line / plain
+ * freshness column, never an unsupported causal claim.
+ */
+export function caMismatchCauseLine(report: RoutingDoctorReport): string | null {
+  if (!caMismatchLikelyCause(report)) return null;
+  const total = report.agents.length;
+  const unreachable = report.agents.filter((a) => a.freshness === 'unreachable').length;
+  return (
+    `CA MISMATCH is the likely cause of ${unreachable}/${total} agents unreachable ` +
+    `(registry CA fingerprint ${report.ca.registryCaFingerprint ?? 'unknown'} != ` +
+    `current CA ${report.ca.currentCaFingerprint ?? 'unknown'})`
+  );
 }
 
 /** `4 fleet repos (pins consistent); 3 agents (2 routing-OK); CA ✓; routing-client cert ✓; routing plane: HEALTHY`. */
@@ -732,7 +855,7 @@ export function summaryLine(report: RoutingDoctorReport): string {
       : 'no routing-caller repos discovered';
   return (
     `${pinClause}; ${agentOk}/${report.agents.length} agents routing-OK; ` +
-    `CA ${report.ca.valid ? '✓' : '✗'}; routing-client cert ${routingClientCertGlyph(report.routingClientCert.state)}; ` +
+    `CA ${caCheckOk(report.ca) ? '✓' : '✗'}; routing-client cert ${routingClientCertGlyph(report.routingClientCert.state)}; ` +
     `routing plane: ${routingVerdict(report)}`
   );
 }
@@ -820,6 +943,31 @@ export function routingClientCertGlyph(s: RoutingClientCertIssuerState): string 
   }
 }
 
+/** First 12 hex chars + ellipsis for compact fingerprint display; 'unknown' when absent. */
+function shortFingerprint(fp: string | null): string {
+  return fp ? `${fp.slice(0, 12)}…` : 'unknown';
+}
+
+/**
+ * The `MACF_CA_CERT` status line (#563 present/valid + macf#873 current-CA
+ * match). The `matchesCurrentCa === null` case renders DISTINCTLY from a pass
+ * (`— n/a`, never `✓`) — honest-not-asserted must never read as success.
+ */
+export function caCertLine(ca: CaCheckResult): string {
+  if (!ca.present) return 'MACF_CA_CERT: ✗ absent';
+  if (!ca.valid) return `MACF_CA_CERT: ✗ ${ca.reason}`;
+  if (ca.matchesCurrentCa === false) {
+    return (
+      `MACF_CA_CERT: ✗ present + parses but does NOT match the current CA (macf#873) — ` +
+      `registry ${shortFingerprint(ca.registryCaFingerprint)} != current ${shortFingerprint(ca.currentCaFingerprint)}`
+    );
+  }
+  if (ca.matchesCurrentCa === null) {
+    return 'MACF_CA_CERT: ✓ present + parses — n/a current-CA check (no local CA to compare)';
+  }
+  return `MACF_CA_CERT: ✓ present + parses + matches current CA (${shortFingerprint(ca.currentCaFingerprint)})`;
+}
+
 const REPO_HEADERS = ['REPO', 'CALLER-PIN', 'CONSISTENT'] as const;
 const AGENT_HEADERS = ['AGENT', 'ROUTABLE', 'SELF-SKIP', 'SESSION', 'FRESH'] as const;
 
@@ -865,6 +1013,11 @@ export const HONESTY_LEGEND = [
   '        The agent set is the registry fleet ∪ this repo\'s routing config (#621): a registry-only',
   '        agent (one this repo does not route to, e.g. the auditor) shows "— n/a" SELF-SKIP/SESSION',
   '        (REPO-scoped, no local config) but is still ROUTABLE/FRESH-checked (FLEET-scoped).',
+  '        MACF_CA_CERT = the registry-published CA is present + parses (#563) AND matches the',
+  '        CURRENT local CA (macf#873) — the mTLS trust anchor for every /health probe; a rotated-',
+  '        out-but-well-formed CA fails every probe silently, so a definite mismatch fails the',
+  '        verdict and, when most/all agents read unreachable, is reported as the LIKELY CAUSE',
+  '        rather than a separate line. — n/a = no local CA on this machine to compare (not a fail).',
   '        ROUTING-CLIENT CERT (macf#800) = the recorded issuer fingerprint (written by `macf certs',
   '        issue-routing-client`) vs the CURRENT project CA (local disk). ✗ orphaned = signed by a',
   '        rotated-out CA (re-mint + re-set the secret); — n/a = never minted, informational only.',
@@ -888,8 +1041,14 @@ const HONESTY_DISCLAIMER =
  * LOUD rather than silently misreading. BUMP on any breaking change; additive-
  * optional fields do NOT bump it. Independent from fleet doctor's schema_version
  * (a separate command, a separate contract).
+ *
+ * Bumped 1→2 for macf#873: `summary.ca_ok` gets a SAME-NAME SEMANTIC shift — it
+ * now also fails on a definite `matches_current_ca:false` (previously it only
+ * reflected present+valid), so a consumer trusting the OLD "ca_ok:true always
+ * means present+valid" contract needs to know the meaning changed, not just
+ * that new fields were added.
  */
-export const ROUTING_DOCTOR_JSON_SCHEMA_VERSION = 1;
+export const ROUTING_DOCTOR_JSON_SCHEMA_VERSION = 2;
 
 export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
   const participating = report.repoPins.filter((r) => r.consistent !== null);
@@ -903,7 +1062,9 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       expected_pin: report.expectedPin,
       agents_total: report.agents.length,
       agents_routing_ok: report.agents.filter(agentRoutingOk).length,
-      ca_ok: report.ca.present && report.ca.valid,
+      // Semantic shift (schema_version:2, macf#873): also false on a definite
+      // `matches_current_ca:false` — see caCheckOk + the schema_version doc.
+      ca_ok: caCheckOk(report.ca),
       // Additive (schema_version:1, #800): false only for the verdict-failing
       // `orphaned` state; `absent` (never minted) counts as true (not a fault).
       routing_client_cert_ok: !routingClientCertFails(report.routingClientCert),
@@ -946,6 +1107,17 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       present: report.ca.present,
       valid: report.ca.valid,
       reason: report.ca.reason ?? null,
+      // New (schema_version:2, macf#873): registry-CA-vs-current-CA comparison.
+      // `matches_current_ca:false` is a DEFINITE mismatch (fails the verdict via
+      // caFail); `null` is honest-not-asserted and never reads as a pass.
+      matches_current_ca: report.ca.matchesCurrentCa,
+      registry_fingerprint: report.ca.registryCaFingerprint,
+      current_fingerprint: report.ca.currentCaFingerprint,
+      // The absorption fix (macf#873): explicit causal attribution when the
+      // mismatch is plausibly WHY most/all agents read unreachable, instead of
+      // two independent lines a consumer has to correlate by hand.
+      likely_cause_of_unreachability: caMismatchLikelyCause(report),
+      cause_line: caMismatchCauseLine(report),
     },
     // Additive (schema_version:1, #800): routing-client cert issuer-vs-current-CA
     // staleness. `state: "orphaned"` fails the verdict; `"absent"` is informational.
@@ -1134,13 +1306,19 @@ export async function runRoutingDoctor(
     console.log('');
   }
 
-  console.log(
-    `MACF_CA_CERT: ${report.ca.present ? (report.ca.valid ? '✓ present + parses' : `✗ ${report.ca.reason}`) : '✗ absent'}`,
-  );
+  console.log(caCertLine(report.ca));
   console.log(
     `ROUTING-CLIENT CERT ISSUER (macf#800): ${routingClientCertGlyph(report.routingClientCert.state)}` +
     (report.routingClientCert.reason ? ` — ${report.routingClientCert.reason}` : ''),
   );
+  // The absorption fix (macf#873): a prominent, explicit causal-attribution line
+  // — not a footnote — when a definite CA mismatch is plausibly WHY most/all
+  // agents read unreachable, right before the verdict line it explains.
+  const caCauseLine = caMismatchCauseLine(report);
+  if (caCauseLine) {
+    console.log('');
+    console.log(`⚠️  ${caCauseLine}`);
+  }
   console.log('');
   console.log(summaryLine(report));
   console.log('');

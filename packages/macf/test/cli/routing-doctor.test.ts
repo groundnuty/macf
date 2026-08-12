@@ -11,10 +11,14 @@
  * (d) a malformed `MACF_CA_CERT` fails, plus session-drift + instance_id-stale.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
 import {
   buildAgentRows,
   buildRepoRows,
+  caCertLine,
+  caMismatchCauseLine,
+  caMismatchLikelyCause,
   classifyFreshness,
   collectNonFleetRepos,
   collectWarnings,
@@ -65,6 +69,15 @@ function health(instanceId: string | null): HealthResponse {
 
 /** A valid PEM cert (the body is real base64 → strict-base64-legal). */
 const VALID_PEM = `-----BEGIN CERTIFICATE-----\n${Buffer.from('x'.repeat(120)).toString('base64')}\n-----END CERTIFICATE-----`;
+
+/**
+ * A DIFFERENT well-formed PEM cert (macf#873) — same shape as `VALID_PEM`, but
+ * its fingerprint differs. Simulates a rotated-out-but-well-formed registry CA:
+ * `evaluateCaCert` reports `present:true, valid:true` for this, same as
+ * `VALID_PEM` — the #563 parse check alone cannot distinguish them. Only the
+ * `matchesCurrentCa` comparison against a machine's actual current CA can.
+ */
+const ROTATED_PEM = `-----BEGIN CERTIFICATE-----\n${Buffer.from('y'.repeat(120)).toString('base64')}\n-----END CERTIFICATE-----`;
 
 // --- Pure primitives ---
 
@@ -185,6 +198,79 @@ describe('isStrictBase64 / evaluateCaCert — #563 malformed catch', () => {
   });
 });
 
+describe('evaluateCaCert — current-CA comparison (macf#873)', () => {
+  const VALID_PEM_FP = caCertFingerprint(VALID_PEM);
+
+  it('matching fingerprint → matchesCurrentCa:true, both fingerprints surfaced', () => {
+    const r = evaluateCaCert(VALID_PEM, VALID_PEM_FP);
+    expect(r).toMatchObject({
+      present: true,
+      valid: true,
+      matchesCurrentCa: true,
+      registryCaFingerprint: VALID_PEM_FP,
+      currentCaFingerprint: VALID_PEM_FP,
+    });
+  });
+
+  it('well-formed but DIFFERENT cert → present:true valid:true matchesCurrentCa:false (the #873 gap)', () => {
+    const r = evaluateCaCert(ROTATED_PEM, VALID_PEM_FP);
+    expect(r.present).toBe(true);
+    expect(r.valid).toBe(true); // #563 alone would call this a PASS
+    expect(r.matchesCurrentCa).toBe(false); // #873 catches what #563 cannot
+    expect(r.registryCaFingerprint).not.toBe(r.currentCaFingerprint);
+  });
+
+  it('no currentCaFingerprint given (omitted) → matchesCurrentCa:null, never a silent pass', () => {
+    const r = evaluateCaCert(VALID_PEM);
+    expect(r.present).toBe(true);
+    expect(r.valid).toBe(true);
+    expect(r.matchesCurrentCa).toBeNull();
+  });
+
+  it('currentCaFingerprint explicitly null (no local CA on this machine) → matchesCurrentCa:null', () => {
+    const r = evaluateCaCert(VALID_PEM, null);
+    expect(r.matchesCurrentCa).toBeNull();
+    expect(r.currentCaFingerprint).toBeNull();
+  });
+
+  it('malformed registry cert + a current fingerprint given → matchesCurrentCa:null (nothing to compare)', () => {
+    const bad = '-----BEGIN CERTIFICATE-----\nAAAA!notbase64\n-----END CERTIFICATE-----';
+    const r = evaluateCaCert(bad, VALID_PEM_FP);
+    expect(r.valid).toBe(false);
+    expect(r.matchesCurrentCa).toBeNull();
+    expect(r.registryCaFingerprint).toBeNull();
+  });
+});
+
+describe('caCertLine — text render (macf#873)', () => {
+  it('absent → plain ✗ absent', () => {
+    expect(caCertLine(evaluateCaCert(null))).toBe('MACF_CA_CERT: ✗ absent');
+  });
+  it('malformed → ✗ + reason, no fingerprint talk', () => {
+    const line = caCertLine(evaluateCaCert('not-a-cert!!!'));
+    expect(line).toMatch(/^MACF_CA_CERT: ✗/);
+  });
+  it('matches current CA → ✓ pass, names the fingerprint', () => {
+    const fp = caCertFingerprint(VALID_PEM);
+    const line = caCertLine(evaluateCaCert(VALID_PEM, fp));
+    expect(line).toMatch(/^MACF_CA_CERT: ✓/);
+    expect(line).toMatch(/matches current CA/);
+  });
+  it('definite mismatch → ✗, names macf#873 + both fingerprints, never reads as a pass', () => {
+    const fp = caCertFingerprint(VALID_PEM);
+    const line = caCertLine(evaluateCaCert(ROTATED_PEM, fp));
+    expect(line).toMatch(/^MACF_CA_CERT: ✗/);
+    expect(line).toMatch(/macf#873/);
+    expect(line).toMatch(/does NOT match/);
+  });
+  it('matchesCurrentCa:null (no local CA) → "— n/a", visually distinct from the ✓-match pass', () => {
+    const line = caCertLine(evaluateCaCert(VALID_PEM, null));
+    expect(line).toMatch(/^MACF_CA_CERT: ✓/); // still present+valid
+    expect(line).toMatch(/n\/a/);
+    expect(line).not.toMatch(/matches current CA/); // must NOT read as the full pass
+  });
+});
+
 describe('classifyFreshness — registry vs live /health instance_id', () => {
   const now = Date.parse('2026-06-26T12:00:00Z');
   const ttl = 900_000;
@@ -221,9 +307,12 @@ const HEALTHY_CONFIG: RoutingConfig = {
   },
 };
 
-// #800 default baseline: recorded issuer matches the current CA → `ok`, never
-// verdict-failing unless a test deliberately diverges them.
-const ROUTING_CLIENT_CERT_FINGERPRINT = 'a'.repeat(64);
+// Default baseline (#800 + macf#873): the "current local CA" the fixtures agree
+// on is VALID_PEM's OWN fingerprint — so the default `readCaCert: () => VALID_PEM`
+// (check 4) AND the default `readRoutingClientCertIssuer` recorded value (check 6)
+// both compare EQUAL to `currentCaFingerprint()` out of the box, and neither check
+// fails the baseline unless a test deliberately diverges them.
+const CURRENT_CA_FINGERPRINT = caCertFingerprint(VALID_PEM);
 
 function deps(over: Partial<RoutingDoctorDeps> = {}): RoutingDoctorDeps {
   return {
@@ -241,8 +330,8 @@ function deps(over: Partial<RoutingDoctorDeps> = {}): RoutingDoctorDeps {
     probe: async (_h, port) => (port === 4100 ? health('inst-code') : health('inst-science')),
     readCaCert: async () => VALID_PEM,
     readRoutingClientCertIssuer: async () =>
-      JSON.stringify({ issuer_fingerprint: ROUTING_CLIENT_CERT_FINGERPRINT, minted_at: '2026-06-01T00:00:00Z' }),
-    currentCaFingerprint: () => ROUTING_CLIENT_CERT_FINGERPRINT,
+      JSON.stringify({ issuer_fingerprint: CURRENT_CA_FINGERPRINT, minted_at: '2026-06-01T00:00:00Z' }),
+    currentCaFingerprint: () => CURRENT_CA_FINGERPRINT,
     ...over,
   };
 }
@@ -434,6 +523,126 @@ describe('check 4 — CA material malformed', () => {
     );
     expect(report.ca).toMatchObject({ present: true, valid: false });
     expect(routingVerdict(report)).toBe('DEGRADED');
+  });
+});
+
+describe('check 4 — CA currency: rotated-out-but-well-formed CA (macf#873)', () => {
+  // THE MANDATORY SCENARIO: a well-formed but NON-current CA + every agent
+  // unreachable + registry keys still present. Pre-#873, `evaluateCaCert` only
+  // asserted present+valid (both true for ROTATED_PEM) and `freshnessFails` only
+  // fails a definitive `'stale'`, not `'unreachable'` — so NOTHING failed the
+  // verdict and this exact scenario read HEALTHY. Asserted through
+  // `routingVerdict()`, never by inspecting a value this test just set.
+  it('well-formed NON-current CA + all agents unreachable ⇒ DEGRADED, not HEALTHY (#872/#873 outage class)', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        readCaCert: async () => ROTATED_PEM, // well-formed, but NOT the current CA
+        probe: async () => null, // every /health probe fails (rotated CA can't handshake)
+      }),
+    );
+    // Registry keys are still present (routable) — the #872 absorption trap.
+    expect(report.agents.every((a) => a.routable)).toBe(true);
+    expect(report.agents.every((a) => a.freshness === 'unreachable')).toBe(true);
+    expect(report.ca).toMatchObject({ present: true, valid: true, matchesCurrentCa: false });
+    expect(routingVerdict(report)).toBe('DEGRADED');
+  });
+
+  it('matching CA still yields HEALTHY (no regression)', async () => {
+    const report = await gatherRoutingDoctor(deps()); // default: readCaCert matches currentCaFingerprint
+    expect(report.ca.matchesCurrentCa).toBe(true);
+    expect(routingVerdict(report)).toBe('HEALTHY');
+  });
+
+  it('matchesCurrentCa:null (no local CA on this machine) does NOT fail the verdict and does NOT render as a pass', async () => {
+    const report = await gatherRoutingDoctor(deps({ currentCaFingerprint: () => null }));
+    expect(report.ca.matchesCurrentCa).toBeNull();
+    expect(routingVerdict(report)).toBe('HEALTHY'); // null must NOT fail
+    const line = caCertLine(report.ca);
+    expect(line).not.toMatch(/matches current CA/); // must not read as the full pass
+    expect(line).toMatch(/n\/a/);
+  });
+});
+
+describe('caMismatchLikelyCause / caMismatchCauseLine — the absorption fix (macf#873)', () => {
+  it('mismatch + ALL agents unreachable → likely cause TRUE, line names both fingerprints', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({ readCaCert: async () => ROTATED_PEM, probe: async () => null }),
+    );
+    expect(caMismatchLikelyCause(report)).toBe(true);
+    const line = caMismatchCauseLine(report);
+    expect(line).toMatch(/likely cause/i);
+    expect(line).toMatch(/2\/2 agents unreachable/);
+    expect(line).toContain(report.ca.registryCaFingerprint!.slice(0, 8));
+    expect(line).toContain(report.ca.currentCaFingerprint!.slice(0, 8));
+  });
+
+  it('mismatch + a MAJORITY (not all) unreachable → still TRUE', async () => {
+    // 3 agents; 2 unreachable (majority), 1 fresh.
+    const report = await gatherRoutingDoctor(
+      deps({
+        listRegistry: async () => [
+          { name: 'CODE_AGENT', info: info('h', 4100, 'inst-code') },
+          { name: 'SCIENCE_AGENT', info: info('h', 4200, 'inst-science') },
+          { name: 'AUDITOR', info: info('h', 4900, 'inst-aud') },
+        ],
+        readRoutingConfig: async () => ({
+          agents: {
+            'code-agent': { app_name: 'macf-code-agent', tmux_session: 'macf@code-agent' },
+            'science-agent': { app_name: 'macf-science-agent', tmux_session: 'macf@science-agent' },
+          },
+        }),
+        probe: async (_h, port) => (port === 4900 ? health('inst-aud') : null),
+        readCaCert: async () => ROTATED_PEM,
+      }),
+    );
+    expect(report.agents.filter((a) => a.freshness === 'unreachable')).toHaveLength(2);
+    expect(caMismatchLikelyCause(report)).toBe(true);
+  });
+
+  it('mismatch + a MINORITY unreachable → FALSE (does not over-claim)', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        listRegistry: async () => [
+          { name: 'CODE_AGENT', info: info('h', 4100, 'inst-code') },
+          { name: 'SCIENCE_AGENT', info: info('h', 4200, 'inst-science') },
+          { name: 'AUDITOR', info: info('h', 4900, 'inst-aud') },
+        ],
+        readRoutingConfig: async () => ({
+          agents: {
+            'code-agent': { app_name: 'macf-code-agent', tmux_session: 'macf@code-agent' },
+            'science-agent': { app_name: 'macf-science-agent', tmux_session: 'macf@science-agent' },
+          },
+        }),
+        probe: async (_h, port) =>
+          port === 4100 ? null : port === 4200 ? health('inst-science') : health('inst-aud'),
+        readCaCert: async () => ROTATED_PEM,
+      }),
+    );
+    expect(report.agents.filter((a) => a.freshness === 'unreachable')).toHaveLength(1);
+    expect(caMismatchLikelyCause(report)).toBe(false);
+    expect(caMismatchCauseLine(report)).toBeNull();
+  });
+
+  it('broad unreachability WITHOUT a CA mismatch → FALSE (only one of the two holds)', async () => {
+    const report = await gatherRoutingDoctor(deps({ probe: async () => null })); // CA still matches (default)
+    expect(report.ca.matchesCurrentCa).toBe(true);
+    expect(caMismatchLikelyCause(report)).toBe(false);
+    expect(caMismatchCauseLine(report)).toBeNull();
+  });
+
+  it('CA mismatch WITHOUT broad unreachability → FALSE (only one of the two holds)', async () => {
+    const report = await gatherRoutingDoctor(deps({ readCaCert: async () => ROTATED_PEM })); // agents stay fresh
+    expect(report.agents.every((a) => a.freshness === 'fresh')).toBe(true);
+    expect(caMismatchLikelyCause(report)).toBe(false);
+    expect(caMismatchCauseLine(report)).toBeNull();
+  });
+
+  it('no agents at all → FALSE (nothing to attribute to)', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({ readCaCert: async () => ROTATED_PEM, readRoutingConfig: async () => null, listRegistry: async () => [] }),
+    );
+    expect(report.agents).toHaveLength(0);
+    expect(caMismatchLikelyCause(report)).toBe(false);
   });
 });
 
@@ -719,7 +928,7 @@ describe('#621 — per-agent set is registry ∪ config (registry-only agents fl
     expect(rows[2]).toEqual(['auditor', '✓', '— n/a', '— n/a', '✓']);
   });
 
-  it('--json: registry-only agent carries in_local_config + null repo-scoped fields; schema_version stays 1', async () => {
+  it('--json: registry-only agent carries in_local_config + null repo-scoped fields; schema_version unaffected (additive)', async () => {
     const report = await gatherRoutingDoctor(WITH_AUDITOR());
     const json = routingDoctorToJson(report) as {
       schema_version: number;
@@ -729,7 +938,7 @@ describe('#621 — per-agent set is registry ∪ config (registry-only agents fl
       caller_pins: ReadonlyArray<Record<string, unknown>>;
       agents: ReadonlyArray<Record<string, unknown>>;
     };
-    expect(json.schema_version).toBe(1); // additive → NO bump
+    expect(json.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION); // additive → no further bump
     expect(json.summary.agents_total).toBe(3); // registry-only auditor now counted
     expect(json.summary.agents_routing_ok).toBe(3); // all fresh + routable
     // existing additive channels preserved:
@@ -835,7 +1044,7 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
       disclaimer: string;
     };
     expect(json.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION);
-    expect(json.schema_version).toBe(1);
+    expect(json.schema_version).toBe(2); // pinned literal: fails loud on an accidental bump (macf#873)
     expect(json.project).toBe('macf');
     expect(json.summary.verdict).toBe('DEGRADED');
     expect(json.summary.pins_consistent).toBe(false);
@@ -845,6 +1054,60 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
     expect(json.agents[0]).toMatchObject({ label: 'code-agent', routable: true, self_skip_ok: true });
     expect(json.ca_cert).toMatchObject({ present: true, valid: true });
     expect(json.disclaimer).toMatch(/Static GitHub-plane/);
+  });
+
+  it('macf#873: ca_cert carries matches_current_ca + both fingerprints + causal fields; schema_version bumped to 2', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({ readCaCert: async () => ROTATED_PEM, probe: async () => null }),
+    );
+    const json = routingDoctorToJson(report) as {
+      schema_version: number;
+      summary: { verdict: string; ca_ok: boolean };
+      ca_cert: {
+        matches_current_ca: boolean | null;
+        registry_fingerprint: string | null;
+        current_fingerprint: string | null;
+        likely_cause_of_unreachability: boolean;
+        cause_line: string | null;
+      };
+    };
+    expect(json.schema_version).toBe(2);
+    expect(json.summary.verdict).toBe('DEGRADED');
+    expect(json.summary.ca_ok).toBe(false); // #873 semantic shift: mismatch fails ca_ok too
+    expect(json.ca_cert.matches_current_ca).toBe(false);
+    expect(json.ca_cert.registry_fingerprint).toBeTruthy();
+    expect(json.ca_cert.current_fingerprint).toBeTruthy();
+    expect(json.ca_cert.registry_fingerprint).not.toBe(json.ca_cert.current_fingerprint);
+    expect(json.ca_cert.likely_cause_of_unreachability).toBe(true);
+    expect(json.ca_cert.cause_line).toMatch(/likely cause/i);
+  });
+
+  it('macf#873: matching CA → ca_ok true, likely_cause_of_unreachability false, cause_line null', async () => {
+    const report = await gatherRoutingDoctor(deps());
+    const json = routingDoctorToJson(report) as {
+      summary: { ca_ok: boolean };
+      ca_cert: {
+        matches_current_ca: boolean | null;
+        likely_cause_of_unreachability: boolean;
+        cause_line: string | null;
+      };
+    };
+    expect(json.summary.ca_ok).toBe(true);
+    expect(json.ca_cert.matches_current_ca).toBe(true);
+    expect(json.ca_cert.likely_cause_of_unreachability).toBe(false);
+    expect(json.ca_cert.cause_line).toBeNull();
+  });
+
+  it('macf#873: no local CA (null) → matches_current_ca null, ca_ok stays true (null is not a fail)', async () => {
+    const report = await gatherRoutingDoctor(deps({ currentCaFingerprint: () => null }));
+    const json = routingDoctorToJson(report) as {
+      summary: { verdict: string; ca_ok: boolean };
+      ca_cert: { matches_current_ca: boolean | null; current_fingerprint: string | null };
+    };
+    expect(json.summary.verdict).toBe('HEALTHY');
+    expect(json.summary.ca_ok).toBe(true);
+    expect(json.ca_cert.matches_current_ca).toBeNull();
+    expect(json.ca_cert.current_fingerprint).toBeNull();
   });
 
   it('additive: keeps session_ok, adds session_status + warnings[]; drift does NOT degrade (#610)', async () => {
@@ -864,7 +1127,7 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
       warnings: string[];
       agents: ReadonlyArray<Record<string, unknown>>;
     };
-    expect(json.schema_version).toBe(1); // additive change → NO bump
+    expect(json.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION); // additive change → no further bump
     expect(json.summary.verdict).toBe('HEALTHY'); // session drift no longer degrades
     expect(json.summary.agents_routing_ok).toBe(2); // both agents still routing-OK
     const code = json.agents.find((a) => a.label === 'code-agent')!;
@@ -883,7 +1146,7 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
     expect(json.summary.verdict).not.toBe('DEGRADED');
   });
 
-  it('additive (#614): caller_pins carry fleet_member; non_fleet_repos lists opt-outs; schema_version stays 1', async () => {
+  it('additive (#614): caller_pins carry fleet_member; non_fleet_repos lists opt-outs; schema_version unaffected (additive)', async () => {
     const report = await gatherRoutingDoctor(
       deps({
         listRepos: async () => ['groundnuty/macf', 'groundnuty/macf-testbed'],
@@ -901,7 +1164,7 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
       non_fleet_repos: string[];
       caller_pins: ReadonlyArray<Record<string, unknown>>;
     };
-    expect(json.schema_version).toBe(1); // additive → NO bump
+    expect(json.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION); // additive → no further bump
     expect(json.summary.pins_consistent).toBe(true); // testbed excluded → the member is consistent
     expect(json.summary.routing_repos).toBe(1); // only the member participates
     expect(json.non_fleet_repos).toEqual(['groundnuty/macf-testbed']);
@@ -926,7 +1189,7 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
       summary: { verdict: string; routing_client_cert_ok: boolean };
       routing_client_cert: { state: string; recorded_fingerprint: string | null; current_fingerprint: string | null; minted_at: string | null; reason: string | null };
     };
-    expect(json.schema_version).toBe(1); // additive → NO bump
+    expect(json.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION); // additive → no further bump
     expect(json.summary.verdict).toBe('DEGRADED');
     expect(json.summary.routing_client_cert_ok).toBe(false);
     expect(json.routing_client_cert).toMatchObject({
@@ -983,6 +1246,34 @@ describe('runRoutingDoctor (injected deps)', () => {
     const code = await runRoutingDoctor('/unused', {}, deps());
     expect(code).toBe(0);
     expect(logSpy.mock.calls.flat().join('\n')).toContain('routing plane: HEALTHY');
+  });
+
+  it('macf#873: prints the causal-attribution line prominently when mismatch + broad unreachability coincide', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runRoutingDoctor(
+      '/unused',
+      {},
+      deps({ readCaCert: async () => ROTATED_PEM, probe: async () => null }),
+    );
+    expect(code).toBe(1);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toMatch(/CA MISMATCH is the likely cause/);
+    expect(out).toContain('routing plane: DEGRADED');
+  });
+
+  it('macf#873: does NOT print the causal line when only the CA mismatches (agents stay reachable)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await runRoutingDoctor('/unused', {}, deps({ readCaCert: async () => ROTATED_PEM }));
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).not.toMatch(/likely cause/);
+    expect(out).toMatch(/does NOT match/); // the plain mismatch line still renders
+  });
+
+  it('macf#873: does NOT print the causal line when only agents are broadly unreachable (CA still matches)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await runRoutingDoctor('/unused', {}, deps({ probe: async () => null }));
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).not.toMatch(/likely cause/);
   });
 
   it('prints the ROUTING-CLIENT CERT ISSUER line + exits 1 (DEGRADED) when orphaned (#800)', async () => {
@@ -1043,7 +1334,7 @@ describe('runRoutingDoctor (injected deps)', () => {
     );
     expect(code).toBe(1);
     const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
-    expect(parsed.schema_version).toBe(1);
+    expect(parsed.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION);
     expect(parsed.summary.verdict).toBe('DEGRADED');
     expect(parsed.ca_cert).toMatchObject({ present: true, valid: false });
   });
