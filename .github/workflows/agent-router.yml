@@ -1,6 +1,6 @@
 name: Agent Router
 
-# Delegates to the reusable workflow in groundnuty/macf-actions@v3.4.1
+# Delegates to the reusable workflow in groundnuty/macf-actions@v3.4.2
 # (see https://github.com/groundnuty/macf-actions for source).
 #
 # Stage-3 (registry-driven mTLS channels) per DR-027 (ratified) — supersedes
@@ -49,7 +49,7 @@ permissions:
 
 jobs:
   route:
-    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.4.1
+    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.4.2
     with:
       project: macf
       # Profile-scoped registry (DR-006): groundnuty is a user account, so the
