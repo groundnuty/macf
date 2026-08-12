@@ -17,13 +17,12 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
-import { parseFleetLock } from './fleet-manifest.js';
 import type { ObservedAgentState, ObservedState, Presence } from './plan.js';
+import { readFleetLockFile } from './fleet-lock.js';
 import { registryPathPrefix } from '../registry-helper.js';
 
 const execFileAsync = promisify(execFile);
@@ -31,20 +30,22 @@ const execFileAsync = promisify(execFile);
 /**
  * Read `fleet.lock` from the same directory as the manifest file. Returns
  * `null` when absent (a not-yet-provisioned fleet — the common Slice 1a
- * case) or malformed. NEVER throws.
+ * case) or malformed. NEVER throws. Thin wrapper over
+ * `fleet-lock.ts::readFleetLockFile` (macf#857) — that function takes the
+ * exact lock path directly (needed by `apply-fleet.ts`'s control-repo
+ * self-heal read); this one derives it from a manifest file's directory.
  */
 export function readFleetLock(manifestPath: string): FleetLock | null {
-  const lockPath = join(dirname(manifestPath), 'fleet.lock');
-  if (!existsSync(lockPath)) return null;
-  try {
-    return parseFleetLock(readFileSync(lockPath, 'utf-8'));
-  } catch {
-    return null;
-  }
+  return readFleetLockFile(join(dirname(manifestPath), 'fleet.lock'));
 }
 
-/** Best-effort extraction of a caught `execFile` error's captured stderr. */
-function getStderr(err: unknown): string {
+/**
+ * Best-effort extraction of a caught `execFile` error's captured stderr.
+ * Exported so `control-repo.ts` reuses the same 404-vs-other-failure
+ * discrimination (Amendment F's `checkControlRepoMeta`) instead of
+ * duplicating this parsing.
+ */
+export function getStderr(err: unknown): string {
   if (err && typeof err === 'object' && 'stderr' in err) {
     const s = (err as { readonly stderr?: unknown }).stderr;
     return typeof s === 'string' ? s : '';
@@ -161,9 +162,20 @@ export async function checkRegistryVariablePresence(registry: RegistryConfig, na
  * repo read cannot reproduce the #806 drift class: a per-repo var absent
  * while the registry + other repos have it).
  *
- * The routing runner var is still read on `transport.vault_repo` (a single,
- * always-declared representative target) — unchanged from Slice 1a, and
- * unaffected by the CA-observer widening above.
+ * The routing runner var is read on a single REPRESENTATIVE caller repo —
+ * `manifest.agents[0].repo` (macf#857 / DR-043 Amendment F review). Prior to
+ * Amendment F this read `transport.vault_repo`, which (in every fleet seen
+ * so far) happened to BE an agent repo; Amendment F removes `vault_repo`
+ * entirely (the vault now lives in the derived `<fleet>-control` repo, which
+ * is NEVER a routing caller — `MACF_ROUTING_RUNS_ON` is set per §D1 on
+ * "every caller repo," and the control repo is not one). Reading it from the
+ * control repo would make `routingRunsOn` permanently `undefined`, so
+ * `routingItem` would emit `create` forever and the `noop`/`update`
+ * branches would go permanently dead — a silent plan regression. `agents[0]`
+ * preserves the original "one representative target" semantics;
+ * `FleetManifestSchema.agents` is `.min(1)` so this is always populated at
+ * the type level, but `noUncheckedIndexedAccess` still requires the runtime
+ * guard below.
  */
 export async function githubRegistryObserver(manifest: FleetManifest, manifestPath: string): Promise<ObservedState> {
   const lock = readFleetLock(manifestPath);
@@ -190,9 +202,14 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
 
   const caRegistry = await checkRegistryVariablePresence(manifest.owner.registry, caVarName);
 
-  const routingRunsOn = manifest.routing?.runner
-    ? await readRepoVariable(manifest.transport.vault_repo, 'MACF_ROUTING_RUNS_ON')
-    : undefined;
+  // macf#857 — representative caller repo; see this function's doc for why
+  // it's `agents[0].repo`, not `transport.vault_repo` (removed) or the
+  // control repo (never a routing caller).
+  const representativeCallerRepo = manifest.agents[0]?.repo;
+  const routingRunsOn =
+    manifest.routing?.runner && representativeCallerRepo !== undefined
+      ? await readRepoVariable(representativeCallerRepo, 'MACF_ROUTING_RUNS_ON')
+      : undefined;
 
   return { lock, agents, caRegistry, caRepos, routingRunsOn };
 }

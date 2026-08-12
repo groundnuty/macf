@@ -23,7 +23,7 @@ const MANIFEST: FleetManifest = {
   metadata: { name: 'demo-fleet' },
   owner: { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } },
   network: { advertise_host: 'example.ts.net' },
-  transport: { vault_repo: 'groundnuty/demo-science', age_recipients: ['age1operator'] },
+  transport: { age_recipients: ['age1operator'] },
   defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
   agents: [{ role: 'code-agent', profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/x' }],
   trust: { ca: 'per-project', federated_cas: [] },

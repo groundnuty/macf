@@ -7,9 +7,34 @@
  *
  * Pure orchestration over injected deps — no direct `gh`/`age`/`git` calls
  * live here, only calls into `apply-agent.ts` / `apply-repo-init.ts` /
- * `vault-write.ts` / `fleet-lock.ts`, all deps-injected — so the SEQUENCING
- * (who gets written when, in what order, and why) is unit-testable with
- * zero real I/O.
+ * `control-repo.ts` / `vault-write.ts` / `fleet-lock.ts`, all deps-injected
+ * — so the SEQUENCING (who gets written when, in what order, and why) is
+ * unit-testable with zero real I/O.
+ *
+ * ## Bootstrap ordering — the control repo is step 0 (DR-043 Amendment F, macf#857)
+ *
+ * `applyFleet`'s FIRST action, before the per-agent loop, before ANY
+ * consent gate, is {@link provisionControlRepo}ing `<fleet>-control` (see
+ * `control-repo.ts`'s module doc for the ownership/custody model). A
+ * `foreign` or `failed` outcome there ABORTS THE ENTIRE RUN — no agent's
+ * repo, App, or install is ever touched. On success, `fleet.lock` /
+ * `secrets/vault.age` / `secrets/recovery/<role>.age` all derive from the
+ * control repo's LOCAL CHECKOUT (`controlRepo.localDir`), not from
+ * `dirname(manifestPath)` — this is what structurally fixes the #854 "wrote
+ * vault.age/fleet.lock to /tmp" bug (those paths used to derive from
+ * wherever the OPERATOR happened to point `-f` at; now they derive from a
+ * fresh clone of a repo `apply` itself owns the identity of).
+ *
+ * Within the per-agent loop, {@link ensureAgentRepo} (from
+ * `apply-repo-init.ts`) runs FIRST for each agent — before
+ * `applyAgentIdentity`, i.e. before EITHER of that agent's consent gates.
+ * Ordering matters concretely: consent gate 2 (the App-install page) can't
+ * list a repo that doesn't exist yet — the exact failure the first live
+ * provision (#854) hit on the operator's first Install click.
+ *
+ * The full per-run sequence: **control repo (once) → for each agent:
+ * ensure-repo → confirm-before-create guard → gate 1 → gate 2 → repo-init →
+ * (loop) → the batched vault write → a final control-repo commit+push.**
  *
  * ## Ordering rationale — why lock writes split into TWO moments
  *
@@ -56,8 +81,9 @@
  * side and the delete side can never drift apart:
  *
  *   - **Write side:** `applyFleet` builds ONE `writeRecoveryArtifact`
- *     closure (knowing `manifestPath` → the recovery dir, and
- *     `manifest.transport.age_recipients` → who it encrypts to) and splices
+ *     closure (knowing the control-repo checkout dir, macf#857 — the
+ *     recovery dir since Amendment F, was `dirname(manifestPath)` before —
+ *     and `manifest.transport.age_recipients` → who it encrypts to) and splices
  *     it onto the `AgentApplyDeps` object `deps.buildAgentDeps` returns —
  *     that factory deliberately does NOT produce this field (see
  *     `apply-agent.ts`'s `realAgentApplyDeps` doc); this module is the one
@@ -151,10 +177,12 @@ import { deriveAppHandle } from './fleet-manifest.js';
 import type { AgentApplyDeps, AgentApplyOutcome } from './apply-agent.js';
 import { applyAgentIdentity } from './apply-agent.js';
 import type { AppCredentials } from './manifest-exchange.js';
-import type { RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
-import { applyRepoInitForAgent } from './apply-repo-init.js';
+import type { AgentRepoDeps, RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
+import { applyRepoInitForAgent, ensureAgentRepo } from './apply-repo-init.js';
+import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './control-repo.js';
+import { provisionControlRepo } from './control-repo.js';
 import type { FleetLockAgentUpdate, FleetLockIdentityChange } from './fleet-lock.js';
-import { composeFleetLock, writeFleetLock } from './fleet-lock.js';
+import { composeFleetLock, readFleetLockFile, writeFleetLock } from './fleet-lock.js';
 import type { VaultAgentSecrets, VaultEncryptFn, WriteVaultDeps } from './vault-write.js';
 import {
   VaultError,
@@ -172,12 +200,18 @@ export interface FleetApplyDeps {
    * Builds every `AgentApplyDeps` primitive EXCEPT `writeRecoveryArtifact`
    * — `applyFleet` supplies that one itself (see this module's doc's
    * "Recovery-artifact lifecycle" section); it is the layer with the
-   * fleet-level context (`manifestPath`, `manifest.transport.age_recipients`)
-   * the writer needs.
+   * fleet-level context (the control-repo checkout dir,
+   * `manifest.transport.age_recipients`) the writer needs.
    */
   readonly buildAgentDeps: (log: (line: string) => void) => Omit<AgentApplyDeps, 'writeRecoveryArtifact'>;
   readonly repoInitDeps: RepoInitStepDeps;
   readonly vaultDeps: WriteVaultDeps;
+  /** DR-043 Amendment F (macf#857) — provisions/reuses `<fleet>-control`; see `control-repo.ts`'s module doc. */
+  readonly controlRepoDeps: ControlRepoDeps;
+  /** Optional overrides threaded straight into `provisionControlRepo` (e.g. a deterministic `makeScratchDir` for tests — production leaves this unset, taking the real `mkdtemp` default). */
+  readonly controlRepoOptions?: ControlRepoOptions;
+  /** macf#857 — ensures each agent's OWN repo exists before either consent gate; see `apply-repo-init.ts::ensureAgentRepo`'s doc. */
+  readonly agentRepoDeps: AgentRepoDeps;
   /** Injectable clock, threaded into `writeVault`'s version-suffix (deterministic tests). */
   readonly now: () => Date;
   readonly log: (line: string) => void;
@@ -197,7 +231,25 @@ export type VaultApplyOutcome =
   | { readonly status: 'written'; readonly path: string; readonly versioned: boolean }
   | { readonly status: 'failed'; readonly reason: string };
 
+/**
+ * The FINAL control-repo commit+push this run (macf#857) — distinct from
+ * `controlRepo`'s own outcome (which is about PROVISIONING the repo, step
+ * 0). This is the LAST thing `applyFleet` does: push whatever changed in the
+ * checkout (`fleet.lock`, `vault.age`, any still-present recovery
+ * artifacts) back to `<fleet>-control`. `'skipped'` only when `controlRepo`
+ * itself was `foreign`/`failed` (no checkout ever existed to push from).
+ */
+export type ControlRepoSyncOutcome =
+  | { readonly status: 'skipped' }
+  | { readonly status: 'pushed' }
+  | { readonly status: 'nothing-to-commit' }
+  | { readonly status: 'failed'; readonly reason: string };
+
 export interface FleetApplyResult {
+  /** DR-043 Amendment F step 0 — see `control-repo.ts`'s module doc. A `foreign`/`failed` outcome means `agents`/`vault` below are trivially empty/skipped: the run aborted before touching anything else. */
+  readonly controlRepo: ControlRepoOutcome;
+  /** The final push of this run's control-repo changes — see the type doc. */
+  readonly controlRepoSync: ControlRepoSyncOutcome;
   readonly lockPath: string;
   readonly finalLock: FleetLock | null;
   readonly agents: readonly AgentApplyRecord[];
@@ -228,7 +280,8 @@ function ageRecipients(manifest: FleetManifest): readonly string[] {
  * base `AgentApplyDeps` `deps.buildAgentDeps` returns — see this module's
  * doc's "Recovery-artifact lifecycle" section for why THIS module (not
  * `apply-agent.ts`, not `commands/bootstrap-apply.ts`) owns this wiring:
- * it is the layer that knows both `manifestPath` (→ the recovery dir) and
+ * it is the layer that knows both the recovery dir (`secretsDir`, derived
+ * from the control-repo checkout since macf#857 — see the caller) and
  * `manifest.transport.age_recipients` (→ who to encrypt to). Reuses
  * `deps.vaultDeps.encrypt` — the SAME injectable `age` seam the final vault
  * write uses (task requirement: no separate encrypt seam to keep in sync).
@@ -293,12 +346,18 @@ function noRecipientPreflightFailure(role: string): AgentApplyOutcome {
   };
 }
 
+/** The final control-repo sync commit message (macf#857) — one constant so every call site + every test asserting on it agree. */
+export const CONTROL_REPO_SYNC_COMMIT_MESSAGE = 'chore(bootstrap): apply — fleet.lock / vault.age update (DR-043 §D5)';
+
 /**
- * Drive the full fleet through identity + repo-init + the (deferred, batched)
- * vault write. NEVER throws — every failure resolves into the returned
- * result's per-agent `identity`/`repoInit` outcomes or the top-level `vault`
- * outcome; the caller (`commands/bootstrap-apply.ts`) decides the exit code
- * and renders the human summary.
+ * Drive the full fleet through control-repo provisioning (step 0) + identity
+ * + repo-init + the (deferred, batched) vault write + a final control-repo
+ * push. NEVER throws — every failure resolves into the returned result's
+ * `controlRepo`/`controlRepoSync` outcomes, per-agent `identity`/`repoInit`
+ * outcomes, or the top-level `vault` outcome; the caller
+ * (`commands/bootstrap-apply.ts`) decides the exit code and renders the
+ * human summary. See the module doc's "Bootstrap ordering" section for the
+ * full sequence.
  */
 export async function applyFleet(
   manifest: FleetManifest,
@@ -306,13 +365,44 @@ export async function applyFleet(
   priorLock: FleetLock | null,
   deps: FleetApplyDeps,
 ): Promise<FleetApplyResult> {
-  const lockPath = join(dirname(manifestPath), 'fleet.lock');
-  const secretsDir = join(dirname(manifestPath), 'secrets');
+  // --- Step 0 (DR-043 Amendment F, macf#857): the control repo. THE FIRST
+  // mutating action of this run — before any consent gate, before ANY
+  // per-agent processing. See control-repo.ts's module doc for the
+  // ownership/custody model this enforces.
+  const controlRepo = await provisionControlRepo(manifest, manifestPath, deps.controlRepoDeps, deps.controlRepoOptions);
+  if (controlRepo.status === 'foreign' || controlRepo.status === 'failed') {
+    deps.log(`Control repo "${controlRepo.repo}": ABORTING entire apply run — ${controlRepo.reason}`);
+    // Nothing else is ever touched — no agent repo, App, or install. A
+    // best-effort fallback `lockPath` (never actually written to) so the
+    // caller still has SOMETHING path-shaped to report.
+    return {
+      controlRepo,
+      controlRepoSync: { status: 'skipped' },
+      lockPath: join(dirname(manifestPath), 'fleet.lock'),
+      finalLock: priorLock,
+      agents: [],
+      vault: { status: 'skipped' },
+      identityChanges: [],
+    };
+  }
+  deps.log(`Control repo "${controlRepo.repo}": ${controlRepo.status.toUpperCase()} (checkout: ${controlRepo.localDir}).`);
+
+  const controlDir = controlRepo.localDir;
+  const lockPath = join(controlDir, 'fleet.lock');
+  const secretsDir = join(controlDir, 'secrets');
   const vaultOutPath = join(secretsDir, 'vault.age');
   const recipients = ageRecipients(manifest);
   const agentDeps = buildAgentDepsWithRecovery(secretsDir, recipients, deps);
 
-  let currentLock = priorLock;
+  // Self-heal (macf#857): a REUSE clone brings back whatever the PRIOR apply
+  // already committed. Prefer that over the caller-supplied `priorLock`
+  // (which today still reads from the OPERATOR's local manifest directory —
+  // a residual pre-Amendment-F read path, see the module doc) whenever the
+  // checkout actually has one; a fresh CREATE never has one yet, so this
+  // degrades to `priorLock` there (and in every existing test's no-op fake
+  // clone, which never populates the checkout).
+  let currentLock = readFleetLockFile(lockPath) ?? priorLock;
+
   const records: AgentApplyRecord[] = [];
   const pendingVaultAgents: VaultAgentSecrets[] = [];
   const pendingCreatedUpdates: Record<string, FleetLockAgentUpdate> = {};
@@ -326,6 +416,25 @@ export async function applyFleet(
   };
 
   for (const agent of manifest.agents) {
+    // macf#857 — ensure the agent's OWN repo exists BEFORE either consent
+    // gate: gate 2's install page can't list a repo that doesn't exist yet
+    // (the exact failure the first live provision, #854, hit on the
+    // operator's first Install click).
+    const repoOutcome = await ensureAgentRepo(agent, manifest, deps.agentRepoDeps);
+    if (repoOutcome.status === 'failed') {
+      deps.log(`Role "${agent.role}": agent repo "${agent.repo}" FAILED — ${repoOutcome.reason}`);
+      records.push({
+        role: agent.role,
+        identity: {
+          role: agent.role,
+          status: 'failed',
+          reason: `agent repo "${agent.repo}" could not be ensured before consent gate 1: ${repoOutcome.reason}`,
+        },
+      });
+      continue;
+    }
+    deps.log(`Role "${agent.role}": agent repo "${agent.repo}" ${repoOutcome.status.toUpperCase()}.`);
+
     const prior = currentLock?.agents.find((a) => a.role === agent.role);
     // DR-043 §D5 pre-flight — see `noRecipientPreflightFailure`'s doc.
     // Never opens gate 1 for a role that could never make its credential
@@ -375,7 +484,38 @@ export async function applyFleet(
     }
   }
 
-  return { lockPath, finalLock: currentLock, agents: records, vault, identityChanges };
+  // Final sync (macf#857) — the LAST thing this run does: push whatever
+  // changed in the control-repo checkout (fleet.lock from the incremental +
+  // batched writes above, vault.age if written, and any recovery artifacts
+  // STILL present because the batched compose failed). Deliberately
+  // UNSELECTIVE — `commitAndPush`'s real implementation is `git add -A`, so
+  // a leftover recovery artifact gets swept in too. That is a DELIBERATE
+  // choice, not an oversight: recovery artifacts are already age-encrypted
+  // (never plaintext), so committing them is a Amendment-B durability WIN
+  // (a second, git-hosted copy) rather than a leak — see the module doc.
+  const controlRepoSync = await syncControlRepo(controlDir, deps);
+
+  return { controlRepo, controlRepoSync, lockPath, finalLock: currentLock, agents: records, vault, identityChanges };
+}
+
+/**
+ * The final control-repo commit+push (macf#857) — see `ControlRepoSyncOutcome`'s
+ * doc. NEVER throws; a push failure resolves to `status: 'failed'` so the
+ * caller can render it (the durable-artifacts-exist-but-aren't-pushed-yet
+ * state is recoverable — re-running `apply` re-clones the SAME control repo
+ * and pushes again — but must not be silent, since it means this run's
+ * `fleet.lock`/`vault.age` changes exist ONLY on local disk).
+ */
+async function syncControlRepo(controlDir: string, deps: FleetApplyDeps): Promise<ControlRepoSyncOutcome> {
+  try {
+    const result = await deps.controlRepoDeps.commitAndPush(controlDir, CONTROL_REPO_SYNC_COMMIT_MESSAGE);
+    deps.log(`Control repo: final sync — ${result === 'pushed' ? 'pushed fleet.lock/vault.age changes' : 'nothing new to push'}.`);
+    return { status: result };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    deps.log(`Control repo: FINAL SYNC FAILED — ${reason}`);
+    return { status: 'failed', reason };
+  }
 }
 
 /**

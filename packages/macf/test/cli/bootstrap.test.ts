@@ -23,7 +23,6 @@ owner:
 network:
   advertise_host: example.ts.net
 transport:
-  vault_repo: groundnuty/icsoc-2026-science-agent
   age_recipients: []
 defaults:
   role_template: groundnuty/agentic-repo-template

@@ -186,7 +186,17 @@ export interface UnimplementedApplyItem {
   readonly reason: string;
 }
 
-/** The reason text for each kind `apply` cannot action yet (macf#854). Keyed by kind, not by item, so this stays the ONE place to update when a future increment wires the CA or routing orchestrator step. */
+/**
+ * The reason text for each kind `apply` cannot action yet. Keyed by kind,
+ * not by item, so this stays the ONE place to update when a future
+ * increment wires the CA or routing orchestrator step.
+ *
+ * `repoCreate` is GONE (macf#857, DR-043 Amendment F) — `apply-repo-init.ts`
+ * ::`ensureAgentRepo` now creates a missing agent repo from
+ * `defaults.role_template` (or blank, for `provenance: 'mirror'`) BEFORE
+ * either consent gate opens for that agent. `'repo'` moved into
+ * {@link planItemApplyCoverage}'s always-`'implemented'` group below.
+ */
 export const APPLY_UNIMPLEMENTED_REASONS = {
   ca:
     'apply has no CA-provisioning step — no orchestrator step in apply-fleet.ts writes this variable at all ' +
@@ -196,10 +206,6 @@ export const APPLY_UNIMPLEMENTED_REASONS = {
     'apply has no routing-provisioning step — no orchestrator step in apply-fleet.ts writes MACF_ROUTING_RUNS_ON ' +
     'at all (macf#854). Set the registry variable manually or re-run apply once a future increment adds the step; ' +
     'nothing above was created or changed for this item.',
-  repoCreate:
-    'apply does not create repositories — repo-init (workflow + agent-config.json) only runs against an ' +
-    'ALREADY-EXISTING repo and fails loud (a plain `git clone` error) if it is missing (macf#854 §2, ' +
-    'apply-repo-init.ts). Create the repo manually (e.g. from `defaults.role_template`) and re-run apply.',
 } as const;
 
 /**
@@ -227,11 +233,13 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // relying on that invariant silently.
       return 'implemented';
     case 'repo':
-      // presenceVerb only ever produces 'create' or 'noop' for a repo item
-      // (a pure existence check) — 'noop' is filtered above, so the only
-      // verb reaching here is 'create'. apply-repo-init.ts's module doc:
-      // repo CREATION is explicitly out of scope this increment.
-      return item.verb === 'create' ? 'not_implemented' : 'implemented';
+      // macf#857 (DR-043 Amendment F): apply-fleet.ts now calls
+      // apply-repo-init.ts's `ensureAgentRepo` for every agent BEFORE either
+      // consent gate — a `create` verb here IS actioned. (presenceVerb only
+      // ever produces 'create' or 'noop' for a repo item — a pure
+      // existence check — so this arm's only live input is 'create'; 'noop'
+      // is filtered above.)
+      return 'implemented';
     case 'ca':
     case 'routing':
       // No CA or routing orchestrator step exists in apply-fleet.ts at all
@@ -247,14 +255,14 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
       return APPLY_UNIMPLEMENTED_REASONS.ca;
     case 'routing':
       return APPLY_UNIMPLEMENTED_REASONS.routing;
-    case 'repo':
-      return APPLY_UNIMPLEMENTED_REASONS.repoCreate;
     case 'app':
     case 'install':
     case 'secret_fingerprint':
     case 'agent':
+    case 'repo':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
-      // for these kinds (see its switch above). Kept exhaustive so a NEW
+      // for these kinds (see its switch above — 'repo' joined this group in
+      // macf#857 / DR-043 Amendment F). Kept exhaustive so a NEW
       // `PlanItemKind` added later is a compile error here, not a silent
       // "apply covers everything" false-negative.
       return 'apply has no code path for this item (unclassified — this reason string should be unreachable)';

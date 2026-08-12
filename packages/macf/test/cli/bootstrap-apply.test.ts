@@ -46,7 +46,6 @@ owner:
 network:
   advertise_host: example.ts.net
 transport:
-  vault_repo: groundnuty/demo-science
   age_recipients: [age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
 defaults:
   role_template: groundnuty/agentic-repo-template
@@ -238,11 +237,28 @@ function fakeAgentDeps(overrides: Partial<AgentApplyDeps> = {}): AgentApplyDeps 
   };
 }
 
-function fakeMutateDeps(overrides: Partial<MutateApplyDeps> = {}): MutateApplyDeps {
+/**
+ * `controlRepoOptions.makeScratchDir` is pinned to `dirname(manifestPath)`
+ * (macf#857) — this is what keeps every EXISTING `join(join(file, '..'), ...)`
+ * path assertion in this file valid unchanged: the control-repo "checkout"
+ * IS the same temp dir `writeManifest()` already created. `checkMeta` always
+ * reports `'absent'` -> every run here takes the CREATE path (no real
+ * `gh`/`git`).
+ */
+function fakeMutateDeps(manifestPath: string, overrides: Partial<MutateApplyDeps> = {}): MutateApplyDeps {
   return {
     buildAgentDeps: () => fakeAgentDeps(),
     repoInitDeps: { cloneRepo: async () => {}, commitAndPush: async () => 'pushed', repoInit: async () => {} },
     vaultDeps: { exists: () => false, encrypt: async () => {} },
+    controlRepoDeps: {
+      checkMeta: async () => ({ presence: 'absent' }),
+      readManifestFile: async () => undefined,
+      createRepo: async () => {},
+      cloneRepo: async () => {},
+      commitAndPush: async () => 'pushed',
+    },
+    agentRepoDeps: { checkExists: async () => 'absent', createRepo: async () => {} },
+    controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
     now: () => new Date('2026-08-11T00:00:00.000Z'),
     log: () => {},
     confirmPlan: async () => true,
@@ -281,7 +297,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const code = await runBootstrapApply(
       { file },
       { observe: () => Promise.resolve(EMPTY_OBSERVED) },
-      fakeMutateDeps({ confirmPlan: async () => { confirmPlanCalled = true; return false; } }),
+      fakeMutateDeps(file, { confirmPlan: async () => { confirmPlanCalled = true; return false; } }),
     );
     expect(code).toBe(1);
     expect(confirmPlanCalled).toBe(true);
@@ -296,7 +312,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const code = await runBootstrapApply(
       { file, yes: true },
       { observe: () => Promise.resolve(EMPTY_OBSERVED) },
-      fakeMutateDeps({ confirmPlan: async () => { confirmPlanCalled = true; return true; } }),
+      fakeMutateDeps(file, { confirmPlan: async () => { confirmPlanCalled = true; return true; } }),
     );
     expect(code).toBe(0);
     expect(confirmPlanCalled).toBe(false);
@@ -304,7 +320,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
 
   it('happy path: approves, creates both agents, writes a real fleet.lock + vault.age next to the manifest', async () => {
     const file = writeManifest();
-    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps());
+    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
     expect(code).toBe(0);
     const out = logs.join('\n');
     expect(out).toMatch(/code-agent: CREATED/);
@@ -319,7 +335,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
 
   it('--json emits the FLEET_APPLY_JSON_SCHEMA_VERSION envelope on a successful apply', async () => {
     const file = writeManifest();
-    const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps());
+    const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
     expect(code).toBe(0);
     const parsed = JSON.parse(logs.join('\n')) as { schema_version: number; agents: unknown[]; vault: { status: string } };
     expect(parsed.schema_version).toBe(FLEET_APPLY_JSON_SCHEMA_VERSION);
@@ -327,12 +343,47 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(parsed.vault.status).toBe('written');
   });
 
+  it('control repo FOREIGN end-to-end: exit 1, NO agent App/repo/install is ever touched, no fleet.lock/vault.age written', async () => {
+    const file = writeManifest();
+    let agentDepsBuilt = false;
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+      fakeMutateDeps(file, {
+        buildAgentDeps: () => {
+          agentDepsBuilt = true;
+          return fakeAgentDeps();
+        },
+        controlRepoDeps: {
+          checkMeta: async () => ({ presence: 'present', archived: true }),
+          readManifestFile: async () => undefined,
+          createRepo: async () => {
+            throw new Error('must not be called');
+          },
+          cloneRepo: async () => {
+            throw new Error('must not be called');
+          },
+          commitAndPush: async () => {
+            throw new Error('must not be called');
+          },
+        },
+      }),
+    );
+    expect(code).toBe(1);
+    expect(agentDepsBuilt).toBe(false);
+    const out = logs.join('\n');
+    expect(out).toMatch(/⚠ ABORTED/);
+    expect(out).toMatch(/ARCHIVED/);
+    expect(existsSync(join(join(file, '..'), 'fleet.lock'))).toBe(false);
+    expect(existsSync(join(join(file, '..'), 'secrets', 'vault.age'))).toBe(false);
+  });
+
   it('a per-agent gate failure still exits the run non-zero (via applyExitCode), even though applyFleet itself completed', async () => {
     const file = writeManifest();
     const code = await runBootstrapApply(
       { file, yes: true },
       { observe: () => Promise.resolve(EMPTY_OBSERVED) },
-      fakeMutateDeps({ buildAgentDeps: () => fakeAgentDeps({ exchangeManifestCode: async () => { throw new Error('one-shot code already redeemed'); } }) }),
+      fakeMutateDeps(file, { buildAgentDeps: () => fakeAgentDeps({ exchangeManifestCode: async () => { throw new Error('one-shot code already redeemed'); } }) }),
     );
     expect(code).toBe(1);
     expect(logs.join('\n')).toMatch(/FAILED/);
@@ -341,7 +392,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
   it('NEVER logs a secret value anywhere in stdout/stderr across a full run (text AND --json)', async () => {
     for (const json of [false, true]) {
       const file = writeManifest();
-      await runBootstrapApply({ file, yes: true, json }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps());
+      await runBootstrapApply({ file, yes: true, json }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
     }
     const all = [...logs, ...errs].join('\n');
     expect(all).not.toContain('SENTINEL-CLIENT-SECRET');
@@ -356,27 +407,45 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
 
   it('final summary (--yes, non-json) lists apply-unimplemented items — the plan-approve-once artifact is skipped under --yes, so this is the only place they surface', async () => {
     const file = writeManifest();
-    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps());
+    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
     expect(code).toBe(0);
     const out = logs.join('\n');
     expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
-    expect(out).toMatch(/ca:registry:/);
     // The registry CA var + per-repo CA vars are exactly the #854 incident's
-    // silently-skipped resources — pin the kinds actually named.
+    // silently-skipped resources — pin the kind actually named. `repo` is
+    // NOT listed here (macf#857 — ensureAgentRepo actions it now); see the
+    // dedicated "repo is NEVER unimplemented" test below for that positive
+    // assertion, kept SEPARATE from this one on purpose — a bare `/\brepo:/`
+    // match would otherwise pass for the WRONG reason once the "Control
+    // repo:" status line (also macf#857) was added to this same render.
     expect(out).toMatch(/\bca:/);
-    expect(out).toMatch(/\brepo:/);
   });
 
-  it('final summary (--yes, --json) carries unimplemented_by_apply with the SAME items as the plan', async () => {
+  it('final summary (--yes, non-json) ALSO renders the Control repo: status line (macf#857)', async () => {
     const file = writeManifest();
-    const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps());
+    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    expect(out).toMatch(/^Control repo: CREATED "groundnuty\/demo-fleet-control"/m);
+    expect(out).toMatch(/Control repo sync: pushed\./);
+  });
+
+  it('final summary (--yes, --json) carries unimplemented_by_apply with the SAME items as the plan — repo is NOT among them (macf#857)', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
     expect(code).toBe(0);
     const parsed = JSON.parse(logs.join('\n')) as {
       unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
+      control_repo: { status: string };
+      control_repo_sync: { status: string };
     };
     expect(parsed.unimplemented_by_apply.length).toBeGreaterThan(0);
     expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(true);
-    expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'repo')).toBe(true);
+    // The #857 positive assertion: repo is IMPLEMENTED now, so it must be
+    // ABSENT from the unimplemented set (it was present here before #857).
+    expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'repo')).toBe(false);
+    expect(parsed.control_repo.status).toBe('created');
+    expect(parsed.control_repo_sync.status).toBe('pushed');
     for (const item of parsed.unimplemented_by_apply) {
       expect(item.reason.length).toBeGreaterThan(0);
     }
@@ -399,7 +468,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       const code = await runBootstrapApply(
         { file },
         { observe: () => Promise.resolve(EMPTY_OBSERVED) },
-        fakeMutateDeps({ confirmPlan: async () => false }),
+        fakeMutateDeps(file, { confirmPlan: async () => false }),
       );
       expect(code).toBe(1);
       // The plan-approve-once artifact is written to stderr BEFORE the
@@ -415,6 +484,8 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
 
 function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult {
   return {
+    controlRepo: { status: 'created', repo: 'groundnuty/demo-fleet-control', localDir: '/x' },
+    controlRepoSync: { status: 'pushed' },
     lockPath: '/x/fleet.lock',
     finalLock: null,
     agents: [],
@@ -455,6 +526,34 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(applyExitCode(resultWith({ vault: { status: 'failed', reason: 'no age_recipients' } }))).toBe(1);
   });
 
+  // --- macf#857: control-repo abort states must fail the run too — an
+  // aborted step 0 is not "nothing happened cleanly," it's an operator-
+  // attention state (same shape #854/#861 already established for
+  // unimplementedByApply: a gap must never read as exit-0 success).
+
+  it('applyExitCode: 1 when the control repo is foreign', () => {
+    expect(applyExitCode(resultWith({ controlRepo: { status: 'foreign', repo: 'x/y-control', reason: 'archived' } }))).toBe(1);
+  });
+
+  it('applyExitCode: 1 when the control repo could not be provisioned (failed)', () => {
+    expect(applyExitCode(resultWith({ controlRepo: { status: 'failed', repo: 'x/y-control', reason: 'network down' } }))).toBe(1);
+  });
+
+  it('applyExitCode: 1 when the FINAL control-repo sync failed, even though every agent + the vault succeeded', () => {
+    expect(applyExitCode(resultWith({ controlRepoSync: { status: 'failed', reason: 'push rejected' } }))).toBe(1);
+  });
+
+  it('applyExitCode: 0 when control repo is reused + sync is nothing-to-commit (steady-state re-run)', () => {
+    expect(
+      applyExitCode(
+        resultWith({
+          controlRepo: { status: 'reused', repo: 'x/y-control', localDir: '/x' },
+          controlRepoSync: { status: 'nothing-to-commit' },
+        }),
+      ),
+    ).toBe(0);
+  });
+
   it('formatApplyResult never includes a credential value', () => {
     const result = resultWith({
       agents: [{ role: 'a', identity: { role: 'a', status: 'created', appId: '1', installId: '2', credentials: SENTINEL_CREDS } }],
@@ -473,6 +572,39 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(formatApplyResult(result)).toContain('OLD → NEW');
   });
 
+  // --- macf#857: the Control repo: line is ALWAYS the first thing rendered
+  // — a foreign/failed abort must be visible in the SAME final-result render
+  // a normal run's summary is, not just distinguishable by exit code (the
+  // same false-consent shape #854/#861 already closed for unimplementedByApply,
+  // applied here because --yes skips the pre-approval render entirely — see
+  // this module's formatControlRepoLine doc).
+
+  it('formatApplyResult renders "CREATED" for a fresh control repo', () => {
+    const text = formatApplyResult(resultWith({ controlRepo: { status: 'created', repo: 'groundnuty/demo-fleet-control', localDir: '/tmp/x' } }));
+    expect(text).toMatch(/^Control repo: CREATED "groundnuty\/demo-fleet-control"/m);
+  });
+
+  it('formatApplyResult renders "REUSED" for a steady-state re-run', () => {
+    const text = formatApplyResult(resultWith({ controlRepo: { status: 'reused', repo: 'groundnuty/demo-fleet-control', localDir: '/tmp/x' } }));
+    expect(text).toMatch(/^Control repo: REUSED "groundnuty\/demo-fleet-control"/m);
+  });
+
+  it('formatApplyResult renders a LOUD ⚠ ABORTED line for a foreign control repo — visible even under --yes, which skips the pre-approval render', () => {
+    const text = formatApplyResult(resultWith({ controlRepo: { status: 'foreign', repo: 'groundnuty/demo-fleet-control', reason: 'archived' } }));
+    expect(text).toMatch(/⚠ ABORTED.*groundnuty\/demo-fleet-control.*archived/);
+  });
+
+  it('formatApplyResult renders a LOUD ⚠ ABORTED line for a control repo that could not be provisioned', () => {
+    const text = formatApplyResult(resultWith({ controlRepo: { status: 'failed', repo: 'groundnuty/demo-fleet-control', reason: 'network down' } }));
+    expect(text).toMatch(/⚠ ABORTED.*network down/);
+  });
+
+  it('formatApplyResult renders the control-repo sync outcome, including a loud FAILED line', () => {
+    expect(formatApplyResult(resultWith({ controlRepoSync: { status: 'pushed' } }))).toMatch(/Control repo sync: pushed\./);
+    expect(formatApplyResult(resultWith({ controlRepoSync: { status: 'nothing-to-commit' } }))).toMatch(/Control repo sync: nothing to push/);
+    expect(formatApplyResult(resultWith({ controlRepoSync: { status: 'failed', reason: 'push rejected' } }))).toMatch(/Control repo sync: ⚠ FAILED.*push rejected/);
+  });
+
   it('fleetApplyResultToJson never includes a credential value + always carries schema_version', () => {
     const result = resultWith({
       agents: [{ role: 'a', identity: { role: 'a', status: 'created', appId: '1', installId: '2', credentials: SENTINEL_CREDS } }],
@@ -482,6 +614,19 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(json).not.toContain('SENTINEL-WEBHOOK-SECRET');
     expect(json).not.toContain('SENTINEL-PEM-VALUE');
     expect(JSON.parse(json).schema_version).toBe(FLEET_APPLY_JSON_SCHEMA_VERSION);
+  });
+
+  it('fleetApplyResultToJson carries control_repo + control_repo_sync verbatim (macf#857)', () => {
+    const result = resultWith({
+      controlRepo: { status: 'foreign', repo: 'groundnuty/demo-fleet-control', reason: 'archived' },
+      controlRepoSync: { status: 'skipped' },
+    });
+    const json = JSON.parse(JSON.stringify(fleetApplyResultToJson(result))) as {
+      control_repo: { status: string; reason: string };
+      control_repo_sync: { status: string };
+    };
+    expect(json.control_repo).toEqual({ status: 'foreign', repo: 'groundnuty/demo-fleet-control', reason: 'archived' });
+    expect(json.control_repo_sync).toEqual({ status: 'skipped' });
   });
 
   // --- macf#854: formatApplyResult / fleetApplyResultToJson's optional

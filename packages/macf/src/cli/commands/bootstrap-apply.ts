@@ -43,9 +43,13 @@ import { appInstallationUrl } from '../bootstrap/identity-confirm.js';
 import { realAgentApplyDeps } from '../bootstrap/apply-agent.js';
 import type { AgentApplyOutcome } from '../bootstrap/apply-agent.js';
 import { realCloneRepo, realCommitAndPush } from '../bootstrap/apply-repo-init.js';
-import type { RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
+import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
 import { applyFleet } from '../bootstrap/apply-fleet.js';
-import type { FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
+import type { ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
+import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
+import { checkControlRepoMeta, realReadControlManifestFile } from '../bootstrap/control-repo.js';
+import { checkRepoExists } from '../bootstrap/observer.js';
+import { realCreateRepo } from '../bootstrap/repo-create.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -197,6 +201,21 @@ async function realConfirmPlan(plan: FleetPlan, creations: readonly PlannedAppCr
   });
 }
 
+/** DR-043 Amendment F (macf#857) — the real `<fleet>-control` provisioning primitives. */
+const REAL_CONTROL_REPO_DEPS: ControlRepoDeps = {
+  checkMeta: checkControlRepoMeta,
+  readManifestFile: realReadControlManifestFile,
+  createRepo: realCreateRepo,
+  cloneRepo: realCloneRepo,
+  commitAndPush: realCommitAndPush,
+};
+
+/** macf#857 — the real agent-repo-ensure primitives (`checkRepoExists` is the SAME read `observer.ts`'s plan-time repo-presence check uses; `createRepo` is the SAME primitive the control repo uses, with a template). */
+const REAL_AGENT_REPO_DEPS: AgentRepoDeps = {
+  checkExists: checkRepoExists,
+  createRepo: realCreateRepo,
+};
+
 function resolveMutateDeps(manifestPath: string): MutateApplyDeps {
   const repoInitDeps: RepoInitStepDeps = { cloneRepo: realCloneRepo, commitAndPush: realCommitAndPush };
   return {
@@ -206,12 +225,23 @@ function resolveMutateDeps(manifestPath: string): MutateApplyDeps {
     buildAgentDeps: (log: (line: string) => void) => realAgentApplyDeps(realOpenUrl, log),
     repoInitDeps,
     vaultDeps: {},
+    controlRepoDeps: REAL_CONTROL_REPO_DEPS,
+    agentRepoDeps: REAL_AGENT_REPO_DEPS,
     now: () => new Date(),
     log: (line: string) => {
       process.stderr.write(`${line}\n`);
     },
     allowVaultVersion: process.env['MACF_BOOTSTRAP_VAULT_VERSION'] === '1',
     confirmPlan: realConfirmPlan,
+    // DR-043 Amendment F residual (macf#857): this still reads from the
+    // OPERATOR's local manifest directory, not the (not-yet-cloned, at this
+    // point in the flow) control-repo checkout. `applyFleet`'s own
+    // checkout-lock self-heal (see its module doc) makes this harmless on a
+    // REUSE run — the checkout's own `fleet.lock`, once cloned, wins over
+    // whatever this returns. Fully closing the gap (reading `fleet.lock`
+    // from the control repo BEFORE this function even runs) needs
+    // `provisionControlRepo` to run ahead of this call, which is a bigger
+    // reshuffle than this increment's scope — left for a later phase.
     readPriorLock: () => readFleetLock(manifestPath),
   };
 }
@@ -219,6 +249,43 @@ function resolveMutateDeps(manifestPath: string): MutateApplyDeps {
 // --- Apply-result rendering (never a credential value) ---
 
 export const FLEET_APPLY_JSON_SCHEMA_VERSION = 1;
+
+/**
+ * The control-repo status line — ALWAYS rendered first (macf#857), so a
+ * `foreign`/`failed` step-0 abort is visible in the SAME place a normal run's
+ * "Agent identities:" summary would be, not just as a bare non-zero exit
+ * code. This matters most under `--yes`, which skips the pre-approval render
+ * entirely — this final-result render is the ONLY output a script sees, so
+ * an abort that's only distinguishable by exit code (same shape #854/#861
+ * already closed for `unimplementedByApply`) would be a regression.
+ */
+function formatControlRepoLine(result: FleetApplyResult): string {
+  const cr = result.controlRepo;
+  switch (cr.status) {
+    case 'created':
+      return `CREATED "${cr.repo}" (checkout: ${cr.localDir})`;
+    case 'reused':
+      return `REUSED "${cr.repo}" (checkout: ${cr.localDir})`;
+    case 'foreign':
+      return `⚠ ABORTED — "${cr.repo}" exists but is not this fleet's control repo: ${cr.reason}`;
+    case 'failed':
+      return `⚠ ABORTED — could not provision "${cr.repo}": ${cr.reason}`;
+  }
+}
+
+/** The final control-repo sync line (macf#857) — see `ControlRepoSyncOutcome`'s doc. */
+function formatControlRepoSyncLine(sync: ControlRepoSyncOutcome): string {
+  switch (sync.status) {
+    case 'skipped':
+      return 'skipped (control repo was not provisioned this run — see the Control repo line above).';
+    case 'pushed':
+      return 'pushed.';
+    case 'nothing-to-commit':
+      return 'nothing to push (no fleet.lock/vault.age change this run).';
+    case 'failed':
+      return `⚠ FAILED — ${sync.reason} (fleet.lock/vault.age changes exist only in the local checkout; re-run apply to retry the push).`;
+  }
+}
 
 function agentSummaryLines(result: FleetApplyResult): string[] {
   const lines: string[] = [];
@@ -268,7 +335,7 @@ function agentSummaryLines(result: FleetApplyResult): string[] {
  * thread it through keep compiling and rendering byte-identically.
  */
 export function formatApplyResult(result: FleetApplyResult, unimplemented: readonly UnimplementedApplyItem[] = []): string {
-  const parts: string[] = ['Agent identities:', ...agentSummaryLines(result), ''];
+  const parts: string[] = [`Control repo: ${formatControlRepoLine(result)}`, '', 'Agent identities:', ...agentSummaryLines(result), ''];
   switch (result.vault.status) {
     case 'skipped':
       parts.push('Vault: skipped (no agent needed fresh credentials this run).');
@@ -281,6 +348,7 @@ export function formatApplyResult(result: FleetApplyResult, unimplemented: reado
       break;
   }
   parts.push(`fleet.lock: ${result.lockPath}`);
+  parts.push(`Control repo sync: ${formatControlRepoSyncLine(result.controlRepoSync)}`);
   if (result.identityChanges.length > 0) {
     parts.push('', `⚠ identity DRIFT detected (${String(result.identityChanges.length)}) — confirm before trusting fleet.lock:`);
     for (const c of result.identityChanges) {
@@ -333,6 +401,8 @@ function redactIdentity(identity: AgentApplyOutcome): unknown {
 export function fleetApplyResultToJson(result: FleetApplyResult, unimplemented: readonly UnimplementedApplyItem[] = []): unknown {
   return {
     schema_version: FLEET_APPLY_JSON_SCHEMA_VERSION,
+    control_repo: result.controlRepo,
+    control_repo_sync: result.controlRepoSync,
     agents: result.agents.map((rec) => ({ role: rec.role, identity: redactIdentity(rec.identity), repo_init: rec.repoInit ?? null })),
     vault: result.vault,
     lock_path: result.lockPath,
@@ -341,8 +411,17 @@ export function fleetApplyResultToJson(result: FleetApplyResult, unimplemented: 
   };
 }
 
-/** Non-zero when ANY agent needs operator attention (failed/drift/skipped-unverified/repo-init-failed) or the vault write failed. */
+/**
+ * Non-zero when: the control repo could not be provisioned this run
+ * (`foreign`/`failed`, macf#857 — the entire run aborted), OR the final
+ * control-repo sync failed (durable-locally-but-not-pushed is still an
+ * operator-attention state), OR ANY agent needs operator attention
+ * (failed/drift/skipped-unverified/repo-init-failed), OR the vault write
+ * failed.
+ */
 export function applyExitCode(result: FleetApplyResult): number {
+  const controlRepoBad = result.controlRepo.status === 'foreign' || result.controlRepo.status === 'failed';
+  const controlRepoSyncBad = result.controlRepoSync.status === 'failed';
   const agentBad = result.agents.some(
     (rec) =>
       rec.identity.status === 'failed' ||
@@ -350,7 +429,7 @@ export function applyExitCode(result: FleetApplyResult): number {
       rec.identity.status === 'skipped-unverified' ||
       rec.repoInit?.status === 'failed',
   );
-  return agentBad || result.vault.status === 'failed' ? 1 : 0;
+  return controlRepoBad || controlRepoSyncBad || agentBad || result.vault.status === 'failed' ? 1 : 0;
 }
 
 // --- Entry point ---
