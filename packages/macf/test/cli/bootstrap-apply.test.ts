@@ -34,6 +34,7 @@ import type { ObservedState, UnimplementedApplyItem } from '../../src/cli/bootst
 import type { FleetApplyResult } from '../../src/cli/bootstrap/apply-fleet.js';
 import type { AgentApplyDeps } from '../../src/cli/bootstrap/apply-agent.js';
 import type { AppCredentials } from '../../src/cli/bootstrap/manifest-exchange.js';
+import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
 
 const FLEET_YAML = `apiVersion: macf/v0
 kind: Fleet
@@ -68,6 +69,22 @@ const EMPTY_OBSERVED: ObservedState = {
   caRegistry: 'absent',
   caRepos: {},
 };
+
+/**
+ * DR-043 Amendment D phase 2 (macf#838) — a manifest that DOES declare
+ * `routing:`, plus an observed `routingRunsOn` that DIVERGES from it
+ * (`update` verb). `ca` is fully implemented now (mint-or-reuse + two-place
+ * publish); routing's `create` verb is too — the ONLY plan item that still
+ * legitimately reads `unimplementedByApply` is a routing `update` (apply's
+ * create-only posture never overwrites a present-but-diverging value — see
+ * `plan.ts::planItemApplyCoverage`'s routing case). These two fixtures are
+ * what exercises that one remaining honest gap.
+ */
+const FLEET_YAML_WITH_ROUTING = FLEET_YAML.replace(
+  'agents:\n',
+  'routing:\n  runner:\n    runs_on: self-hosted\nagents:\n',
+);
+const OBSERVED_ROUTING_DRIFT: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
 
 function observedWithApp(role: string): ObservedState {
   return {
@@ -120,10 +137,21 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
     expect(out).toMatch(/https:\/\/github\.com\/apps\/demo-fleet-code-agent\/installations\/new/);
     expect(out).toMatch(/https:\/\/github\.com\/apps\/demo-fleet-science-agent\/installations\/new/);
     expect(out).toMatch(/DRY RUN — nothing was created/);
-    // macf#854 — the --dry-run text render (same formatPlanText the real
-    // apply path's pre-approval render uses) already names the items apply
-    // has no code path for, before any consent gate would open.
+    // macf#838 Amendment D phase 2: CA is fully implemented now and this
+    // fresh-fleet fixture declares no `routing:` section, so nothing is
+    // unimplemented — see the dedicated routing-drift test below (and
+    // `plan.test.ts`) for the ⚠ NOT IMPLEMENTED block's positive case.
+    expect(out).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
+  });
+
+  it('--dry-run STILL renders the ⚠ NOT IMPLEMENTED BY APPLY block for a diverging routing value (macf#838 Amendment D phase 2)', async () => {
+    const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+    const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(OBSERVED_ROUTING_DRIFT) });
+    expect(code).toBe(0);
+    const out = logs.join('\n');
     expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
+    expect(out).toMatch(/\brouting:.*\(update\)/);
+    expect(out).not.toMatch(/\bca:.*\(create\)/);
   });
 
   it('--dry-run --json carries dry_run + planned_app_creations (incl. installUrl) + unimplemented_by_apply (macf#854)', async () => {
@@ -147,8 +175,13 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
       'https://github.com/apps/demo-fleet-code-agent/installations/new',
       'https://github.com/apps/demo-fleet-science-agent/installations/new',
     ]);
-    // Inherited automatically from fleetPlanToJson(plan) — no separate wiring needed.
-    expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(true);
+    // Inherited automatically from fleetPlanToJson(plan) — no separate wiring
+    // needed. macf#838 Amendment D phase 2: `ca` is now fully implemented
+    // (mint-or-reuse + two-place publish, macf#806) and this manifest
+    // declares no `routing:` section, so nothing remains unimplemented for
+    // a fresh fleet — see the dedicated routing-update test below for the
+    // one case that's STILL honestly reported as not_implemented.
+    expect(parsed.unimplemented_by_apply).toEqual([]);
   });
 
   it('reports a missing manifest file without throwing', async () => {
@@ -216,6 +249,25 @@ const SENTINEL_CREDS: AppCredentials = {
   pem: 'SENTINEL-PEM-VALUE',
 };
 
+// DR-043 Amendment D phase 2 (macf#838) — distinct sentinels from
+// SENTINEL_CREDS so a leak test can tell "an AGENT credential leaked" apart
+// from "the CA key leaked" if one but not the other ever regresses.
+const SENTINEL_CA_KEY_PEM = 'SENTINEL-CA-KEY-PEM';
+const SENTINEL_CA_CERT_PEM = 'SENTINEL-CA-CERT-PEM';
+
+/** Default fake `CaApplyDeps` (macf#838 Amendment D phase 2) — everything absent, so a fresh mint + two-place publish succeeds by default; individual tests override to exercise other shapes. */
+function fakeTrustDeps(overrides: Partial<CaApplyDeps> = {}): CaApplyDeps {
+  return {
+    checkRegistryPresence: async () => 'absent',
+    readRegistryVariable: async () => undefined,
+    createRegistryVariable: async () => 'created',
+    checkRepoPresence: async () => 'absent',
+    createRepoVariable: async () => 'created',
+    mintCa: async () => ({ certPem: SENTINEL_CA_CERT_PEM, keyPem: SENTINEL_CA_KEY_PEM }),
+    ...overrides,
+  };
+}
+
 function fakeAgentDeps(overrides: Partial<AgentApplyDeps> = {}): AgentApplyDeps {
   return {
     startManifestFlow: async () => ({
@@ -258,6 +310,7 @@ function fakeMutateDeps(manifestPath: string, overrides: Partial<MutateApplyDeps
       commitAndPush: async () => 'pushed',
     },
     agentRepoDeps: { checkExists: async () => 'absent', createRepo: async () => {} },
+    trustDeps: fakeTrustDeps(),
     controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
     now: () => new Date('2026-08-11T00:00:00.000Z'),
     log: () => {},
@@ -326,11 +379,21 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(out).toMatch(/code-agent: CREATED/);
     expect(out).toMatch(/science-agent: CREATED/);
     expect(out).toMatch(/Vault: written to/);
+    // DR-043 Amendment D phase 2 (macf#838) — the CA ceremony ran too: a
+    // fresh mint (no prior lock, no prior registry var — the default
+    // `fakeTrustDeps()`) publishes to the registry + BOTH agent repos.
+    expect(out).toMatch(/CA: MINTED/);
+    expect(out).toMatch(/registry leg: CREATED/);
 
     const dir = join(file, '..');
     expect(existsSync(join(dir, 'fleet.lock'))).toBe(true);
     const lock = parseFleetLock(readFileSync(join(dir, 'fleet.lock'), 'utf-8'));
     expect(lock.agents.map((a) => a.role).sort()).toEqual(['code-agent', 'science-agent']);
+    // The CA key's fingerprint lands in fleet.lock's FLEET-level
+    // `fingerprints.ca_key` — the SOLE place it is ever written (see
+    // apply-fleet.ts's module doc) — never the raw key value.
+    expect(lock.fingerprints?.['ca_key']).toBeDefined();
+    expect(JSON.stringify(lock)).not.toContain(SENTINEL_CA_KEY_PEM);
   });
 
   it('--json emits the FLEET_APPLY_JSON_SCHEMA_VERSION envelope on a successful apply', async () => {
@@ -389,7 +452,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(logs.join('\n')).toMatch(/FAILED/);
   });
 
-  it('NEVER logs a secret value anywhere in stdout/stderr across a full run (text AND --json)', async () => {
+  it('NEVER logs a secret value anywhere in stdout/stderr across a full run (text AND --json) — agent creds AND the CA key (macf#838 Amendment D phase 2)', async () => {
     for (const json of [false, true]) {
       const file = writeManifest();
       await runBootstrapApply({ file, yes: true, json }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
@@ -398,6 +461,11 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(all).not.toContain('SENTINEL-CLIENT-SECRET');
     expect(all).not.toContain('SENTINEL-WEBHOOK-SECRET');
     expect(all).not.toContain('SENTINEL-PEM-VALUE');
+    expect(all).not.toContain(SENTINEL_CA_KEY_PEM);
+    // The CA CERT is PUBLIC material (published to the registry + repos) —
+    // this only pins that the redacted `resolve.certFingerprint` (a SHA-256
+    // hex digest) shows up instead of the raw PEM text.
+    expect(all).not.toContain(SENTINEL_CA_CERT_PEM);
   });
 
   // --- macf#854: apply must not overstate what it did — the final summary
@@ -405,20 +473,24 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
   // and it must do so EVEN UNDER --yes, since --yes skips the pre-approval
   // render entirely (the final summary is the ONLY output an automated run sees).
 
-  it('final summary (--yes, non-json) lists apply-unimplemented items — the plan-approve-once artifact is skipped under --yes, so this is the only place they surface', async () => {
-    const file = writeManifest();
-    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+  it('final summary (--yes, non-json) lists the ONE remaining apply-unimplemented item — a diverging routing value (macf#838 Amendment D phase 2) — the plan-approve-once artifact is skipped under --yes, so this is the only place it surfaces', async () => {
+    const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(OBSERVED_ROUTING_DRIFT) }, fakeMutateDeps(file));
     expect(code).toBe(0);
     const out = logs.join('\n');
     expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
-    // The registry CA var + per-repo CA vars are exactly the #854 incident's
-    // silently-skipped resources — pin the kind actually named. `repo` is
-    // NOT listed here (macf#857 — ensureAgentRepo actions it now); see the
-    // dedicated "repo is NEVER unimplemented" test below for that positive
-    // assertion, kept SEPARATE from this one on purpose — a bare `/\brepo:/`
-    // match would otherwise pass for the WRONG reason once the "Control
-    // repo:" status line (also macf#857) was added to this same render.
-    expect(out).toMatch(/\bca:/);
+    // CA is fully implemented now (macf#838 Amendment D phase 2) — it must
+    // NOT appear here; ONLY the routing update (diverging value, create-only
+    // posture never overwrites) does.
+    expect(out).not.toMatch(/\bca:/);
+    expect(out).toMatch(/\brouting:.*\(update\)/);
+  });
+
+  it('final summary (--yes, non-json) shows NO unimplemented block on a fresh fleet with no routing declared — CA is fully implemented (macf#838 Amendment D phase 2)', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+    expect(code).toBe(0);
+    expect(logs.join('\n')).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
   });
 
   it('final summary (--yes, non-json) ALSO renders the Control repo: status line (macf#857)', async () => {
@@ -430,19 +502,21 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(out).toMatch(/Control repo sync: pushed\./);
   });
 
-  it('final summary (--yes, --json) carries unimplemented_by_apply with the SAME items as the plan — repo is NOT among them (macf#857)', async () => {
-    const file = writeManifest();
-    const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+  it('final summary (--yes, --json) carries unimplemented_by_apply with ONLY the diverging routing item (macf#838 Amendment D phase 2) — ca and repo are NOT among them', async () => {
+    const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+    const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(OBSERVED_ROUTING_DRIFT) }, fakeMutateDeps(file));
     expect(code).toBe(0);
     const parsed = JSON.parse(logs.join('\n')) as {
       unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
       control_repo: { status: string };
       control_repo_sync: { status: string };
     };
-    expect(parsed.unimplemented_by_apply.length).toBeGreaterThan(0);
-    expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(true);
-    // The #857 positive assertion: repo is IMPLEMENTED now, so it must be
-    // ABSENT from the unimplemented set (it was present here before #857).
+    expect(parsed.unimplemented_by_apply.length).toBe(1);
+    expect(parsed.unimplemented_by_apply[0]?.kind).toBe('routing');
+    expect(parsed.unimplemented_by_apply[0]?.verb).toBe('update');
+    // ca is fully implemented now (macf#838 Amendment D phase 2); repo has
+    // been since macf#857 — neither appears here.
+    expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(false);
     expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'repo')).toBe(false);
     expect(parsed.control_repo.status).toBe('created');
     expect(parsed.control_repo_sync.status).toBe('pushed');
@@ -455,7 +529,9 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     // The DR-035 §4 plan-approve-once artifact goes straight to
     // `process.stderr.write` (not `console.error`) so a human running
     // without --json sees the SAME text a script skips past — spy on the
-    // raw stream to see it.
+    // raw stream to see it. Uses the routing-drift fixture (macf#838
+    // Amendment D phase 2 — ca alone no longer produces an unimplemented
+    // item on a fresh fleet).
     const rawWrites: string[] = [];
     const writeSpy = vi
       .spyOn(process.stderr, 'write')
@@ -464,10 +540,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         return true;
       });
     try {
-      const file = writeManifest();
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
       const code = await runBootstrapApply(
         { file },
-        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        { observe: () => Promise.resolve(OBSERVED_ROUTING_DRIFT) },
         fakeMutateDeps(file, { confirmPlan: async () => false }),
       );
       expect(code).toBe(1);
@@ -491,6 +567,11 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
     agents: [],
     vault: { status: 'skipped' },
     identityChanges: [],
+    // DR-043 Amendment D phase 2 (macf#838) defaults: a REUSED CA (no fresh
+    // key this run, nothing to fail on) + no routing declared. Individual
+    // tests below override to exercise failure/skip shapes.
+    ca: { resolve: { status: 'reused', certFingerprint: 'deadbeef'.repeat(8) }, registryLeg: { status: 'already-present' }, repoLegs: {} },
+    routing: {},
     ...overrides,
   };
 }
@@ -552,6 +633,101 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
         }),
       ),
     ).toBe(0);
+  });
+
+  // --- DR-043 Amendment D phase 2 (macf#838) — CA + routing exit-code / render / JSON ---
+
+  it('applyExitCode: 1 when the CA resolve failed', () => {
+    const result = resultWith({ ca: { resolve: { status: 'failed', reason: 'no recipient' }, registryLeg: { status: 'skipped', reason: 'x' }, repoLegs: {} } });
+    expect(applyExitCode(result)).toBe(1);
+  });
+
+  it('applyExitCode: 1 when the CA registry leg failed', () => {
+    const result = resultWith({ ca: { resolve: { status: 'minted', certFingerprint: 'ab'.repeat(32) }, registryLeg: { status: 'failed', reason: 'race' }, repoLegs: {} } });
+    expect(applyExitCode(result)).toBe(1);
+  });
+
+  it('applyExitCode: 1 when ANY CA repo leg failed', () => {
+    const result = resultWith({
+      ca: {
+        resolve: { status: 'reused', certFingerprint: 'ab'.repeat(32) },
+        registryLeg: { status: 'already-present' },
+        repoLegs: { 'x/y': { status: 'failed', reason: 'network' } },
+      },
+    });
+    expect(applyExitCode(result)).toBe(1);
+  });
+
+  it('applyExitCode: 0 when CA legs are all skipped due to an already-accounted-for vault failure (skipped is not independently bad)', () => {
+    const result = resultWith({
+      vault: { status: 'skipped' },
+      ca: {
+        resolve: { status: 'reused', certFingerprint: 'ab'.repeat(32) },
+        registryLeg: { status: 'skipped', reason: 'unrelated' },
+        repoLegs: { 'x/y': { status: 'skipped', reason: 'unrelated' } },
+      },
+    });
+    expect(applyExitCode(result)).toBe(0);
+  });
+
+  it('applyExitCode: 1 when a routing leg failed', () => {
+    expect(applyExitCode(resultWith({ routing: { 'x/y': { status: 'failed', reason: 'boom' } } }))).toBe(1);
+  });
+
+  it('applyExitCode: 0 when routing legs are created/already-present', () => {
+    expect(
+      applyExitCode(resultWith({ routing: { 'x/y': { status: 'created' }, 'x/z': { status: 'already-present' } } })),
+    ).toBe(0);
+  });
+
+  it('formatApplyResult NEVER includes a CA cert or key value — only status + fingerprint', () => {
+    const result = resultWith({
+      ca: {
+        resolve: { status: 'minted', certFingerprint: 'ab'.repeat(32) },
+        registryLeg: { status: 'created' },
+        repoLegs: { 'groundnuty/x': { status: 'created' } },
+      },
+    });
+    const text = formatApplyResult(result);
+    expect(text).toMatch(/CA: MINTED \(fingerprint (?:ab){32}\)/);
+    expect(text).toMatch(/registry leg: CREATED/);
+    expect(text).toMatch(/repo leg \(groundnuty\/x\): CREATED/);
+    expect(text).not.toContain('-----BEGIN');
+  });
+
+  it('formatApplyResult renders a CA resolve failure loudly', () => {
+    const text = formatApplyResult(resultWith({ ca: { resolve: { status: 'failed', reason: 'no age recipient' }, registryLeg: { status: 'skipped', reason: 'no cert resolved' }, repoLegs: {} } }));
+    expect(text).toMatch(/CA: FAILED to resolve — no age recipient/);
+    expect(text).toMatch(/registry leg: SKIPPED — no cert resolved/);
+  });
+
+  it('formatApplyResult renders routing lines only when routing is non-empty', () => {
+    expect(formatApplyResult(resultWith({ routing: {} }))).not.toMatch(/Routing \(MACF_ROUTING_RUNS_ON\)/);
+    const text = formatApplyResult(resultWith({ routing: { 'groundnuty/x': { status: 'created' }, 'groundnuty/y': { status: 'already-present' } } }));
+    expect(text).toMatch(/Routing \(MACF_ROUTING_RUNS_ON\):/);
+    expect(text).toMatch(/groundnuty\/x: CREATED/);
+    expect(text).toMatch(/groundnuty\/y: ALREADY-PRESENT/);
+  });
+
+  it('fleetApplyResultToJson never includes a CA cert/key value and carries ca + routing verbatim otherwise', () => {
+    const result = resultWith({
+      ca: {
+        resolve: { status: 'minted', certFingerprint: 'cd'.repeat(32) },
+        registryLeg: { status: 'created' },
+        repoLegs: { 'groundnuty/x': { status: 'created' } },
+      },
+      routing: { 'groundnuty/x': { status: 'created' } },
+    });
+    const json = JSON.parse(JSON.stringify(fleetApplyResultToJson(result))) as {
+      ca: { resolve: { status: string; cert_fingerprint?: string; certFingerprint?: string }; registry_leg: { status: string }; repo_legs: Record<string, { status: string }> };
+      routing: Record<string, { status: string }>;
+    };
+    expect(json.ca.resolve.status).toBe('minted');
+    expect(json.ca.registry_leg.status).toBe('created');
+    expect(json.ca.repo_legs['groundnuty/x']?.status).toBe('created');
+    expect(json.routing['groundnuty/x']?.status).toBe('created');
+    const raw = JSON.stringify(json);
+    expect(raw).not.toContain('-----BEGIN');
   });
 
   it('formatApplyResult never includes a credential value', () => {

@@ -24,6 +24,7 @@ import type { AgentApplyDeps } from '../../../src/cli/bootstrap/apply-agent.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../../../src/cli/bootstrap/apply-repo-init.js';
 import type { ControlRepoDeps } from '../../../src/cli/bootstrap/control-repo.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
+import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
 
 // Default mirrors the §D5 multi-recipient shape (operator key + VM key,
 // macf#852) — two entries is the realistic steady-state, not a single
@@ -70,6 +71,31 @@ function controlRepoDepsFor(): ControlRepoDeps {
 /** Every agent's repo reports `'absent'` -> `ensureAgentRepo` "creates" it (no-op `createRepo`). */
 function agentRepoDepsFor(): AgentRepoDeps {
   return { checkExists: async () => 'absent', createRepo: async () => {} };
+}
+
+/**
+ * DR-043 Amendment D phase 2 (macf#838) — the CA-ceremony + routing-var
+ * deps. Default: everything reports `'absent'` (no PRIOR CA / routing var,
+ * matching this file's `priorLock: null` / empty-fleet.lock default), so
+ * `resolveCaCert` takes the MINT path and every publish leg succeeds — a
+ * "happy path" default individual tests override to exercise reuse/failure.
+ * `mintCa` returns SENTINEL PEM strings (never real crypto — this file's own
+ * "never touch the real filesystem/network beyond fleet.lock" posture, see
+ * the module doc) distinct from `creds()`'s agent-credential sentinels so a
+ * leak test can tell CA-key leakage apart from agent-credential leakage.
+ */
+const SENTINEL_CA_KEY_PEM = 'SENTINEL-CA-KEY-PEM';
+const SENTINEL_CA_CERT_PEM = 'SENTINEL-CA-CERT-PEM';
+function trustDepsFor(overrides: Partial<CaApplyDeps> = {}): CaApplyDeps {
+  return {
+    checkRegistryPresence: async () => 'absent',
+    readRegistryVariable: async () => undefined,
+    createRegistryVariable: async () => 'created',
+    checkRepoPresence: async () => 'absent',
+    createRepoVariable: async () => 'created',
+    mintCa: async () => ({ certPem: SENTINEL_CA_CERT_PEM, keyPem: SENTINEL_CA_KEY_PEM }),
+    ...overrides,
+  };
 }
 
 const CODE_AGENT: FleetAgent = { role: 'code-agent', profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/x' };
@@ -208,6 +234,7 @@ describe('applyFleet', () => {
       vaultDeps: { exists: () => false, encrypt: async () => {} },
       controlRepoDeps: controlRepoDepsFor(),
       agentRepoDeps: agentRepoDepsFor(),
+      trustDeps: trustDepsFor(),
       controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
@@ -329,10 +356,20 @@ describe('applyFleet', () => {
       writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless — see agentDepsFor's comment
     };
 
-    const result = await applyFleet(manifest, manifestPath, priorLock, baseDeps(agentDeps, manifestPath));
+    // CA reported ALREADY PRESENT (reuse path, macf#838 Amendment D phase
+    // 2) — this test is about AGENT lock-write timing, not the CA ceremony,
+    // so it keeps `vault.status` at 'skipped' the way it did before the CA
+    // wiring landed (a fresh mint would otherwise stage vault content even
+    // though NO agent needs anything new persisted).
+    const deps: FleetApplyDeps = {
+      ...baseDeps(agentDeps, manifestPath),
+      trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
+    };
+    const result = await applyFleet(manifest, manifestPath, priorLock, deps);
 
     expect(result.agents.map((r) => r.identity.status)).toEqual(['reused', 'resumed-install']);
     expect(result.vault.status).toBe('skipped'); // nothing NEW to persist
+    expect(result.ca.resolve.status).toBe('reused');
     const lock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
     expect(lock.agents.find((a) => a.role === 'code-agent')).toEqual({ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' });
     expect(lock.agents.find((a) => a.role === 'science-agent')).toEqual({ role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2-resumed' });
@@ -346,8 +383,13 @@ describe('applyFleet', () => {
       fleet: 'demo-fleet',
       agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
     };
-    // No resolveKeyPath -> guard resolves skip-unverified.
-    const deps = baseDeps(agentDepsFor('code-agent', 'skipped-unverified', 'x', 'y'), manifestPath);
+    // No resolveKeyPath -> guard resolves skip-unverified. CA reported
+    // ALREADY PRESENT (reuse path) for the same reason as the test above —
+    // this test is about the AGENT skip path, not the CA ceremony.
+    const deps: FleetApplyDeps = {
+      ...baseDeps(agentDepsFor('code-agent', 'skipped-unverified', 'x', 'y'), manifestPath),
+      trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
+    };
     const result = await applyFleet(manifest, manifestPath, priorLock, deps);
     expect(result.agents[0]?.identity.status).toBe('skipped-unverified');
     expect(result.agents[0]?.repoInit).toBeUndefined();
@@ -610,6 +652,7 @@ trust:
         vaultDeps: { exists: () => false }, // no `encrypt` override — real `age` runs
         controlRepoDeps: controlRepoDepsFor(),
         agentRepoDeps: agentRepoDepsFor(),
+        trustDeps: trustDepsFor(),
         controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
         now: () => new Date('2026-08-11T00:00:00.000Z'),
         log: () => {},
@@ -700,12 +743,32 @@ trust:
         calls.push(`repo:create:${repo}`);
       },
     };
+    const trustDeps: CaApplyDeps = {
+      ...trustDepsFor(),
+      checkRegistryPresence: async () => {
+        calls.push('ca:checkRegistryPresence');
+        return 'absent';
+      },
+      createRegistryVariable: async () => {
+        calls.push('ca:createRegistryVariable');
+        return 'created';
+      },
+      checkRepoPresence: async (repo) => {
+        calls.push(`repoVar:checkPresence:${repo}`);
+        return 'absent';
+      },
+      createRepoVariable: async (repo) => {
+        calls.push(`repoVar:create:${repo}`);
+        return 'created';
+      },
+    };
     const deps: FleetApplyDeps = {
       buildAgentDeps: () => roleTrackingAgentDeps('demo-fleet', calls),
       repoInitDeps: { cloneRepo: async () => {}, commitAndPush: async () => 'pushed' },
       vaultDeps: { exists: () => false, encrypt: async () => {} },
       controlRepoDeps,
       agentRepoDeps,
+      trustDeps,
       controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
@@ -714,6 +777,22 @@ trust:
     const result = await applyFleet(manifest, manifestPath, null, deps);
 
     expect(result.agents.map((r) => r.identity.status)).toEqual(['created', 'created']);
+
+    // DR-043 Amendment D phase 2 (macf#838) — the CA/routing sweep runs
+    // AFTER both agents are FULLY processed (both repos ensured, both
+    // gate 1 + gate 2 complete) and BEFORE the final control-repo sync — the
+    // ordering rule that keeps a fresh mint's PUBLIC cert from publishing
+    // before its key is durable (see `apply-fleet.ts`'s doc). This manifest
+    // declares no `routing:`, so only the CA legs fire here.
+    const gate2SciIdxForCa = calls.indexOf('gate2:science-agent');
+    const caRegistryCreateIdx = calls.indexOf('ca:createRegistryVariable');
+    const caRepoCreateCodeIdx = calls.indexOf('repoVar:create:groundnuty/demo-code');
+    const caRepoCreateSciIdx = calls.indexOf('repoVar:create:groundnuty/demo-science');
+    const finalCommitAndPushIdx = calls.lastIndexOf('control:commitAndPush');
+    expect(caRegistryCreateIdx).toBeGreaterThan(gate2SciIdxForCa);
+    expect(caRepoCreateCodeIdx).toBeGreaterThan(gate2SciIdxForCa);
+    expect(caRepoCreateSciIdx).toBeGreaterThan(gate2SciIdxForCa);
+    expect(caRegistryCreateIdx).toBeLessThan(finalCommitAndPushIdx);
 
     // The full sequence, quoted verbatim in this test file so it's citable
     // directly (see the report requirement to quote ordering from code):
@@ -803,6 +882,26 @@ trust:
         },
       },
       agentRepoDeps,
+      trustDeps: {
+        checkRegistryPresence: async () => {
+          throw new Error('must not be called — control repo aborted before the CA ceremony');
+        },
+        readRegistryVariable: async () => {
+          throw new Error('must not be called');
+        },
+        createRegistryVariable: async () => {
+          throw new Error('must not be called');
+        },
+        checkRepoPresence: async () => {
+          throw new Error('must not be called');
+        },
+        createRepoVariable: async () => {
+          throw new Error('must not be called');
+        },
+        mintCa: async () => {
+          throw new Error('must not be called — foreign control repo, CA is never minted');
+        },
+      },
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
     };
@@ -815,6 +914,10 @@ trust:
     expect(result.vault).toEqual({ status: 'skipped' });
     expect(result.identityChanges).toEqual([]);
     expect(agentRepoDeps.checkExists).not.toHaveBeenCalled();
+    // DR-043 Amendment D phase 2 (macf#838) — the CA ceremony never ran
+    // either (every `trustDeps` fn above throws if invoked).
+    expect(result.ca.resolve.status).toBe('failed');
+    expect(result.routing).toEqual({});
   });
 
   it('control repo existence UNCONFIRMABLE ("unknown") -> aborts the ENTIRE run as "failed", not silently treated as absent or ours', async () => {
@@ -834,6 +937,7 @@ trust:
         commitAndPush: vi.fn(),
       },
       agentRepoDeps: agentRepoDepsFor(),
+      trustDeps: trustDepsFor(),
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
     };
@@ -901,6 +1005,7 @@ trust:
         commitAndPush: async () => 'nothing-to-commit',
       },
       agentRepoDeps: agentRepoDepsFor(),
+      trustDeps: trustDepsFor(),
       controlRepoOptions: { makeScratchDir: () => controlDir },
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
@@ -915,5 +1020,255 @@ trust:
     // the prior — the confirm-before-create guard only reaches 'reused' when
     // `prior !== undefined` for this role.
     expect(result.agents[0]?.identity.status).toBe('reused');
+  });
+
+  // --- DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) ---
+
+  describe('CA ceremony + two-place publish + MACF_ROUTING_RUNS_ON', () => {
+    it('fresh mint: publishes to the registry + BOTH agent repos, stages the key for the vault, never a raw key value on any leg outcome', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.ca.resolve.status).toBe('minted');
+      expect(result.ca.resolve).not.toHaveProperty('certPem');
+      expect(result.ca.resolve).not.toHaveProperty('keyPem');
+      expect(result.ca.registryLeg).toEqual({ status: 'created' });
+      expect(result.ca.repoLegs).toEqual({
+        'groundnuty/demo-code': { status: 'created' },
+        'groundnuty/demo-science': { status: 'created' },
+      });
+      expect(JSON.stringify(result)).not.toContain('SENTINEL-CA-KEY-PEM');
+    });
+
+    it('reuse: fleet.lock already records ca_key AND registry reports present -> REUSES (never re-mints), backfills a repo leg the registry has but a repo is missing (#806 drift), and the vault stays skipped (no NEW agent OR CA secret this run)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [
+          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+          { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+        ],
+        fingerprints: { ca_key: 'sha256:deadbeef' },
+      };
+      // BOTH agents already confirmed live (reused) — no fresh credential
+      // for either, so the ONLY thing that could put the vault in
+      // 'written' this run is a fresh CA secret, which reuse must not stage.
+      const agentDeps: AgentApplyDeps = {
+        startManifestFlow: async () => { throw new Error('must not be called — both roles have prior entries'); },
+        exchangeManifestCode: async () => { throw new Error('must not be called'); },
+        resolveKeyPath: () => '/fake.pem',
+        confirmAppInstallation: async (appId) => ({
+          status: 'confirmed',
+          install: { appId, installId: appId === 'app-code-agent' ? 'install-1' : 'install-2', appSlug: `demo-fleet-${appId}`, accountLogin: 'groundnuty' },
+        }),
+        waitForAppInstallation: async () => { throw new Error('must not be called'); },
+        openUrl: async () => {},
+        log: () => {},
+        writeRecoveryArtifact: async () => {},
+      };
+      let mintCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDeps, manifestPath),
+        trustDeps: trustDepsFor({
+          checkRegistryPresence: async () => 'present',
+          readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM',
+          // One repo leg reports the #806 drift class — present on the
+          // registry, absent on THIS one repo.
+          checkRepoPresence: async (repo) => (repo === 'groundnuty/demo-code' ? 'present' : 'absent'),
+          mintCa: async () => {
+            mintCalled = true;
+            throw new Error('must not be called — a CA already exists');
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.agents.map((a) => a.identity.status)).toEqual(['reused', 'reused']);
+      expect(mintCalled).toBe(false);
+      expect(result.ca.resolve.status).toBe('reused');
+      expect(result.ca.repoLegs['groundnuty/demo-code']).toEqual({ status: 'already-present' });
+      expect(result.ca.repoLegs['groundnuty/demo-science']).toEqual({ status: 'created' }); // backfilled
+      expect(result.vault.status).toBe('skipped'); // no NEW agent OR CA secret to persist on a reuse
+    });
+
+    it('ambiguous: fleet.lock records ca_key but the registry cert is NOT confirmable present -> REFUSES to mint (would orphan the vaulted key) — nothing published', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = { schema_version: 1, fleet: 'demo-fleet', agents: [], fingerprints: { ca_key: 'sha256:deadbeef' } };
+      let mintCalled = false;
+      let createRegistryCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRegistryPresence: async () => 'absent', // the ambiguous/dangerous combination
+          mintCa: async () => {
+            mintCalled = true;
+            throw new Error('must not be called');
+          },
+          createRegistryVariable: async () => {
+            createRegistryCalled = true;
+            throw new Error('must not be called — nothing to publish');
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(mintCalled).toBe(false);
+      expect(createRegistryCalled).toBe(false);
+      expect(result.ca.resolve.status).toBe('failed');
+      expect(result.ca.resolve.reason).toMatch(/orphan/);
+      expect(result.ca.registryLeg.status).toBe('skipped');
+    });
+
+    it('unknown registry presence with no prior lock -> REFUSES to mint (honest-unknown, never guesses)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      let mintCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRegistryPresence: async () => 'unknown',
+          mintCa: async () => {
+            mintCalled = true;
+            throw new Error('must not be called');
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(mintCalled).toBe(false);
+      expect(result.ca.resolve.status).toBe('failed');
+      expect(result.ca.resolve.reason).toMatch(/honest-unknown/);
+    });
+
+    it('no age recipients -> the CA mint is refused BEFORE it ever runs (mirrors the per-agent §D5 pre-flight)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([], []); // no agents needed — isolates the CA-level refusal
+      let mintCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'x', 'y'), manifestPath),
+        trustDeps: trustDepsFor({
+          mintCa: async () => {
+            mintCalled = true;
+            throw new Error('must not be called');
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(mintCalled).toBe(false);
+      expect(result.ca.resolve.status).toBe('failed');
+      expect(result.ca.resolve.reason).toMatch(/age_recipients is empty/);
+    });
+
+    it('a fresh mint whose vault write FAILS -> NOTHING is published — every leg reads skipped, the CA key never appears in the registry or any repo', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      let createRegistryCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        vaultDeps: { exists: () => false, encrypt: async () => { throw new Error('simulated disk-full'); } },
+        trustDeps: trustDepsFor({
+          createRegistryVariable: async () => {
+            createRegistryCalled = true;
+            return 'created';
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.vault.status).toBe('failed');
+      expect(result.ca.resolve.status).toBe('minted'); // the mint itself succeeded — only the vault write failed
+      expect(createRegistryCalled).toBe(false); // publish never attempted
+      expect(result.ca.registryLeg.status).toBe('skipped');
+      expect(result.ca.registryLeg).toMatchObject({ reason: expect.stringContaining('vault write did not succeed') });
+      expect(result.ca.repoLegs['groundnuty/demo-code']).toEqual({ status: 'skipped', reason: expect.any(String) });
+    });
+
+    it('create-only: a live presence check reporting "already exists" on a create attempt (absent-then-race) is FAILED, never silently accepted', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({ createRegistryVariable: async () => 'exists' }), // presence said 'absent' (default) but create hits a duplicate
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.ca.registryLeg.status).toBe('failed');
+      expect(result.ca.registryLeg).toMatchObject({ reason: expect.stringContaining('race') });
+    });
+
+    it('routing.runner declared -> writes MACF_ROUTING_RUNS_ON to every confirmed agent repo, never the control repo', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing).toEqual({
+        'groundnuty/demo-code': { status: 'created' },
+        'groundnuty/demo-science': { status: 'created' },
+      });
+    });
+
+    it('routing.runner NOT declared -> the routing map is empty, nothing attempted', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      let createRepoVarCalled = 0;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          createRepoVariable: async (_repo, name) => {
+            // Only the CA leg should ever call this — routing must never
+            // fire when `routing.runner` isn't declared.
+            expect(name).not.toBe('MACF_ROUTING_RUNS_ON');
+            createRepoVarCalled += 1;
+            return 'created';
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing).toEqual({});
+      expect(createRepoVarCalled).toBeGreaterThan(0); // the CA leg DID fire — proves the fake wasn't just unreachable
+    });
+
+    it('routing: a repo where the var is ALREADY PRESENT is left untouched (create-only)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRepoPresence: async (_repo, name) => (name === 'MACF_ROUTING_RUNS_ON' ? 'present' : 'absent'),
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing['groundnuty/demo-code']).toEqual({ status: 'already-present' });
+    });
+
+    it('CA + routing legs are skipped for an agent whose repo-ensure FAILED this run — nothing is written to a repo that does not exist', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const agentRepoDeps: AgentRepoDeps = {
+        checkExists: async (repo) => (repo === 'groundnuty/demo-code' ? 'unknown' : 'absent'), // code-agent's repo-ensure fails
+        createRepo: async () => {},
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        agentRepoDeps,
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.agents.find((a) => a.role === 'code-agent')?.identity.status).toBe('failed');
+      expect(result.ca.repoLegs['groundnuty/demo-code']).toBeUndefined();
+      expect(result.routing['groundnuty/demo-code']).toBeUndefined();
+      // science-agent's repo WAS ensured — its legs still ran.
+      expect(result.ca.repoLegs['groundnuty/demo-science']).toEqual({ status: 'created' });
+      expect(result.routing['groundnuty/demo-science']).toEqual({ status: 'created' });
+    });
   });
 });

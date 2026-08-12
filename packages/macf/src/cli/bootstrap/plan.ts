@@ -187,35 +187,40 @@ export interface UnimplementedApplyItem {
 }
 
 /**
- * The reason text for each kind `apply` cannot action yet. Keyed by kind,
- * not by item, so this stays the ONE place to update when a future
- * increment wires the CA or routing orchestrator step.
+ * The reason text for each kind/verb pair `apply` still cannot action.
+ * Keyed by kind, not by item, so this stays the ONE place to update when a
+ * future increment wires the remaining routing-update orchestrator step.
  *
  * `repoCreate` is GONE (macf#857, DR-043 Amendment F) — `apply-repo-init.ts`
  * ::`ensureAgentRepo` now creates a missing agent repo from
  * `defaults.role_template` (or blank, for `provenance: 'mirror'`) BEFORE
  * either consent gate opens for that agent. `'repo'` moved into
  * {@link planItemApplyCoverage}'s always-`'implemented'` group below.
+ *
+ * `ca` is ALSO GONE (macf#838 Amendment D phase 2) — `apply-fleet.ts` now
+ * runs the CA ceremony (`apply-ca.ts::resolveCaCert` + `publishCaCertLegs`)
+ * for every fleet, mint-or-reuse, two-place-published (macf#806). `'ca'`
+ * items never emit an `update` verb (`presenceVerb` — pure existence check),
+ * so the kind joined the always-`'implemented'` group entirely — same shape
+ * as `'repo'`'s own history above.
  */
 export const APPLY_UNIMPLEMENTED_REASONS = {
-  ca:
-    'apply has no CA-provisioning step — no orchestrator step in apply-fleet.ts writes this variable at all ' +
-    '(macf#854). Provision it manually (mint/publish the CA cert to this GitHub Variable) or re-run apply once a ' +
-    'future increment adds the step; nothing above was created or changed for this item.',
   routing:
-    'apply has no routing-provisioning step — no orchestrator step in apply-fleet.ts writes MACF_ROUTING_RUNS_ON ' +
-    'at all (macf#854). Set the registry variable manually or re-run apply once a future increment adds the step; ' +
-    'nothing above was created or changed for this item.',
+    'apply writes MACF_ROUTING_RUNS_ON when the variable is ABSENT (create-only, macf#838 Amendment D phase 2) ' +
+    'but does NOT overwrite a PRESENT-but-diverging value — the task\'s create-only posture ("never silently ' +
+    'overwrite") leaves this specific update un-actioned. Set the registry variable manually to the declared ' +
+    'value, or re-run apply once a future increment adds confirmed per-item updates; nothing above was changed ' +
+    'for this item.',
 } as const;
 
 /**
  * THE single source of truth for "does `apply` actually do this" — every
  * renderer (plan text, plan `--json`, apply's final summary, apply
  * `--json`) derives from THIS function; none of them hand-roll their own
- * "is this kind implemented" guess. When a future increment wires the CA or
- * routing orchestrator step into `apply-fleet.ts`, flipping the matching
- * arm below is the ONLY change needed for every one of those renderers to
- * pick it up (macf#854).
+ * "is this kind implemented" guess. When a future increment wires confirmed
+ * per-item routing updates into `apply-fleet.ts`, flipping the matching arm
+ * below is the ONLY change needed for every one of those renderers to pick
+ * it up (macf#854).
  */
 export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
   // Nothing calls for action → nothing for apply to have a code path for.
@@ -233,26 +238,28 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // relying on that invariant silently.
       return 'implemented';
     case 'repo':
-      // macf#857 (DR-043 Amendment F): apply-fleet.ts now calls
-      // apply-repo-init.ts's `ensureAgentRepo` for every agent BEFORE either
-      // consent gate — a `create` verb here IS actioned. (presenceVerb only
-      // ever produces 'create' or 'noop' for a repo item — a pure
-      // existence check — so this arm's only live input is 'create'; 'noop'
-      // is filtered above.)
-      return 'implemented';
     case 'ca':
+      // macf#857 (DR-043 Amendment F) / macf#838 Amendment D phase 2:
+      // apply-fleet.ts now calls apply-repo-init.ts's `ensureAgentRepo` /
+      // apply-ca.ts's CA ceremony for every agent — a `create` verb here IS
+      // actioned. Both kinds' items are produced by `presenceVerb`, a pure
+      // existence check that only ever emits 'create' or 'noop' — so this
+      // arm's only live input is 'create'; 'noop' is filtered above.
+      return 'implemented';
     case 'routing':
-      // No CA or routing orchestrator step exists in apply-fleet.ts at all
-      // (macf#854) — every create/update item of these two kinds is
-      // unconditionally un-actioned today, regardless of verb.
-      return 'not_implemented';
+      // macf#838 Amendment D phase 2: apply-fleet.ts writes
+      // MACF_ROUTING_RUNS_ON when absent (create). It does NOT overwrite a
+      // present-but-diverging value — the task's create-only posture forces
+      // `update` to stay un-actioned (see APPLY_UNIMPLEMENTED_REASONS.routing).
+      // By this point in the switch `item.verb` is guaranteed to be
+      // 'create' or 'update' (noop/report-extra returned above), so this is
+      // exhaustive over the two remaining verbs.
+      return item.verb === 'create' ? 'implemented' : 'not_implemented';
   }
 }
 
 function unimplementedReasonFor(kind: PlanItemKind): string {
   switch (kind) {
-    case 'ca':
-      return APPLY_UNIMPLEMENTED_REASONS.ca;
     case 'routing':
       return APPLY_UNIMPLEMENTED_REASONS.routing;
     case 'app':
@@ -260,11 +267,12 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'secret_fingerprint':
     case 'agent':
     case 'repo':
+    case 'ca':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
-      // macf#857 / DR-043 Amendment F). Kept exhaustive so a NEW
-      // `PlanItemKind` added later is a compile error here, not a silent
-      // "apply covers everything" false-negative.
+      // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
+      // 2). Kept exhaustive so a NEW `PlanItemKind` added later is a compile
+      // error here, not a silent "apply covers everything" false-negative.
       return 'apply has no code path for this item (unclassified — this reason string should be unreachable)';
   }
 }

@@ -47,6 +47,22 @@ function writeManifest(text: string): { dir: string; file: string } {
 
 const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, caRegistry: 'unknown', caRepos: {} };
 
+/**
+ * DR-043 Amendment D phase 2 (macf#838) — `ca` is fully implemented now
+ * (mint-or-reuse + two-place publish), so `VALID_FLEET_YAML` + `EMPTY_OBSERVED`
+ * alone no longer produce an `unimplemented_by_apply` entry. These two
+ * fixtures add a `routing:` declaration + an observed value that DIVERGES
+ * from it (`update` verb — the ONE case that still legitimately reads
+ * `unimplemented_by_apply`, since apply's create-only posture never
+ * overwrites a present-but-diverging value) for the tests that specifically
+ * exercise that render.
+ */
+const VALID_FLEET_YAML_WITH_ROUTING = VALID_FLEET_YAML.replace(
+  'agents:\n',
+  'routing:\n  runner:\n    runs_on: self-hosted\nagents:\n',
+);
+const OBSERVED_ROUTING_DRIFT: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
+
 describe('runBootstrapPlan', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
   let errSpy: ReturnType<typeof vi.spyOn>;
@@ -131,11 +147,25 @@ describe('runBootstrapPlan', () => {
     expect(json.skipped_sections).toEqual([
       { section: 'collaborators', reason: 'reconcile not implemented in v1 — see #838 follow-ups' },
     ]);
-    // macf#854 — the plan's json ALWAYS carries the apply-coverage gap for
-    // automation, not just the human-text render. This fixture has no
-    // agent/CA presence observed at all → CA items are unimplemented creates.
-    expect(json.unimplemented_by_apply.length).toBeGreaterThan(0);
-    expect(json.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(true);
+    // macf#838 Amendment D phase 2: CA is fully implemented now — a fresh
+    // fleet with no `routing:` declared has NOTHING unimplemented.
+    expect(json.unimplemented_by_apply).toEqual([]);
+  });
+
+  it('--json ALSO carries a diverging routing value under unimplemented_by_apply — the one remaining honest gap (macf#838 Amendment D phase 2)', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML_WITH_ROUTING);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const deps: BootstrapPlanDeps = { observe: async () => OBSERVED_ROUTING_DRIFT };
+    const code = await runBootstrapPlan({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
+    };
+    expect(json.unimplemented_by_apply.length).toBe(1);
+    expect(json.unimplemented_by_apply[0]?.kind).toBe('routing');
+    expect(json.unimplemented_by_apply[0]?.verb).toBe('update');
+    expect(json.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(false);
   });
 
   it('plain-text mode renders the human table + the skipped-section loud line', async () => {
@@ -150,11 +180,25 @@ describe('runBootstrapPlan', () => {
     expect(out).toContain('macf bootstrap plan — icsoc-2026');
     expect(out).toContain('CREATE');
     expect(out).toContain('collaborators: SKIPPED (reconcile not implemented in v1 — see #838 follow-ups)');
-    // macf#854 — the plan text ALSO names the items apply has no code path
-    // for yet (distinct wording from "SKIPPED" — see plan.ts's
+    // macf#838 Amendment D phase 2: CA is fully implemented now and this
+    // fixture declares no `routing:` — nothing is unimplemented.
+    expect(out).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
+  });
+
+  it('plain-text mode STILL renders the ⚠ NOT IMPLEMENTED BY APPLY block for a diverging routing value', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML_WITH_ROUTING);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const deps: BootstrapPlanDeps = { observe: async () => OBSERVED_ROUTING_DRIFT };
+    const code = await runBootstrapPlan({ file }, deps);
+    expect(code).toBe(0);
+
+    const out = logSpy.mock.calls.flat().join('\n');
+    // macf#854 — the plan text names the items apply has no code path for
+    // yet (distinct wording from "SKIPPED" — see plan.ts's
     // formatUnimplementedLines doc).
     expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
-    expect(out).toContain('ca:registry:ICSOC_2026_CA_CERT');
+    expect(out).toContain('routing:icsoc-2026:runner');
   });
 
   it('plain-text mode omits the skipped-section block entirely when nothing was skipped', async () => {

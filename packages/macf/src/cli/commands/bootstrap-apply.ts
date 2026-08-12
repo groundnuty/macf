@@ -48,8 +48,11 @@ import { applyFleet } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
 import { checkControlRepoMeta, realControlRepoCommitAndPush, realReadControlManifestFile } from '../bootstrap/control-repo.js';
-import { checkRepoExists } from '../bootstrap/observer.js';
+import { checkRepoExists, checkRepoVariablePresence, checkRegistryVariablePresence, readRegistryVariable } from '../bootstrap/observer.js';
 import { realCreateRepo } from '../bootstrap/repo-create.js';
+import type { CaApplyDeps } from '../bootstrap/apply-ca.js';
+import { realCreateRegistryVariable, realCreateRepoVariable, realMintCa } from '../bootstrap/apply-ca.js';
+import type { EnsureVariableOutcome } from '../bootstrap/ensure-variable.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -224,6 +227,23 @@ const REAL_AGENT_REPO_DEPS: AgentRepoDeps = {
 };
 
 /**
+ * DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) — the
+ * real CA-ceremony + two-place-publish + routing-var deps. Every
+ * presence-check function here is the SAME one `observer.ts`'s plan-time
+ * reads already use (`checkRegistryVariablePresence` / `readRegistryVariable`
+ * / `checkRepoVariablePresence`) — plan and apply agree on what "present"
+ * means at the exact same call sites, by construction, not by convention.
+ */
+const REAL_TRUST_DEPS: CaApplyDeps = {
+  checkRegistryPresence: checkRegistryVariablePresence,
+  readRegistryVariable,
+  createRegistryVariable: realCreateRegistryVariable,
+  checkRepoPresence: checkRepoVariablePresence,
+  createRepoVariable: realCreateRepoVariable,
+  mintCa: realMintCa,
+};
+
+/**
  * Build the REAL (production) mutating deps. Exported ONLY so a test can assert
  * the wiring by identity (macf#857 review): a security primitive can be
  * defined, unit-tested, and never actually called — which is exactly what
@@ -245,6 +265,7 @@ export function resolveMutateDeps(manifestPath: string): MutateApplyDeps {
     vaultDeps: {},
     controlRepoDeps: REAL_CONTROL_REPO_DEPS,
     agentRepoDeps: REAL_AGENT_REPO_DEPS,
+    trustDeps: REAL_TRUST_DEPS,
     now: () => new Date(),
     log: (line: string) => {
       process.stderr.write(`${line}\n`);
@@ -340,6 +361,35 @@ function agentSummaryLines(result: FleetApplyResult): string[] {
   return lines;
 }
 
+/** One `<label>: <status>` line, appending `— <reason>` for `failed`/`skipped` — the shared render shape for `EnsureVariableOutcome` (macf#838 Amendment D phase 2). NEVER a value — the type carries none. */
+function formatVariableLegLine(label: string, leg: EnsureVariableOutcome): string {
+  const suffix = leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.';
+  return `  ${label}: ${leg.status.toUpperCase()}${suffix}`;
+}
+
+/** CA ceremony + two-place publish render (macf#838 Amendment D phase 2). Never a credential value — `result.ca.resolve` is the redacted `CaApplyOutcome` (fingerprint only, never cert/key PEM). */
+function caSummaryLines(result: FleetApplyResult): string[] {
+  const r = result.ca.resolve;
+  const resolveLine =
+    r.status === 'failed'
+      ? `CA: FAILED to resolve — ${r.reason}`
+      : `CA: ${r.status.toUpperCase()}${r.certFingerprint !== undefined ? ` (fingerprint ${r.certFingerprint})` : ''}`;
+  const lines = [resolveLine, formatVariableLegLine('registry leg', result.ca.registryLeg)];
+  for (const [repo, leg] of Object.entries(result.ca.repoLegs)) {
+    lines.push(formatVariableLegLine(`repo leg (${repo})`, leg));
+  }
+  return lines;
+}
+
+/** `MACF_ROUTING_RUNS_ON` per-repo render (macf#838 Amendment D phase 2). Empty when `routing.runner` wasn't declared. */
+function routingSummaryLines(result: FleetApplyResult): string[] {
+  const entries = Object.entries(result.routing);
+  if (entries.length === 0) return [];
+  const lines = ['Routing (MACF_ROUTING_RUNS_ON):'];
+  for (const [repo, leg] of entries) lines.push(formatVariableLegLine(repo, leg));
+  return lines;
+}
+
 /**
  * Human render of a completed (non-dry-run) apply result. Never a credential
  * value.
@@ -367,6 +417,9 @@ export function formatApplyResult(result: FleetApplyResult, unimplemented: reado
   }
   parts.push(`fleet.lock: ${result.lockPath}`);
   parts.push(`Control repo sync: ${formatControlRepoSyncLine(result.controlRepoSync)}`);
+  parts.push('', ...caSummaryLines(result));
+  const routingLines = routingSummaryLines(result);
+  if (routingLines.length > 0) parts.push('', ...routingLines);
   if (result.identityChanges.length > 0) {
     parts.push('', `⚠ identity DRIFT detected (${String(result.identityChanges.length)}) — confirm before trusting fleet.lock:`);
     for (const c of result.identityChanges) {
@@ -426,6 +479,13 @@ export function fleetApplyResultToJson(result: FleetApplyResult, unimplemented: 
     lock_path: result.lockPath,
     identity_changes: result.identityChanges.map((c) => ({ ...c })),
     unimplemented_by_apply: unimplemented.map((i) => ({ ...i })),
+    // `result.ca.resolve` is ALREADY the redacted `CaApplyOutcome`
+    // (fingerprint only — see `apply-ca.ts::redactCaResolve`); `registryLeg`/
+    // `repoLegs`/`routing` are `EnsureVariableOutcome`s, which carry no
+    // credential field at all. Safe to spread verbatim (macf#838 Amendment D
+    // phase 2).
+    ca: { resolve: { ...result.ca.resolve }, registry_leg: { ...result.ca.registryLeg }, repo_legs: { ...result.ca.repoLegs } },
+    routing: { ...result.routing },
   };
 }
 
@@ -447,7 +507,17 @@ export function applyExitCode(result: FleetApplyResult): number {
       rec.identity.status === 'skipped-unverified' ||
       rec.repoInit?.status === 'failed',
   );
-  return controlRepoBad || controlRepoSyncBad || agentBad || result.vault.status === 'failed' ? 1 : 0;
+  // DR-043 Amendment D phase 2 (macf#838) — a CA resolve failure or ANY
+  // publish-leg failure needs operator attention, same bar as an agent
+  // failure. A 'skipped' leg does NOT independently fail the run here — it
+  // is always a SYMPTOM of an already-`ca.resolve.status === 'failed'` or
+  // `vault.status === 'failed'` state, both already covered below.
+  const caBad =
+    result.ca.resolve.status === 'failed' ||
+    result.ca.registryLeg.status === 'failed' ||
+    Object.values(result.ca.repoLegs).some((leg) => leg.status === 'failed');
+  const routingBad = Object.values(result.routing).some((leg) => leg.status === 'failed');
+  return controlRepoBad || controlRepoSyncBad || agentBad || result.vault.status === 'failed' || caBad || routingBad ? 1 : 0;
 }
 
 // --- Entry point ---
