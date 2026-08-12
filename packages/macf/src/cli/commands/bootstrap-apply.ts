@@ -47,7 +47,7 @@ import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-in
 import { applyFleet } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
-import { checkControlRepoMeta, realReadControlManifestFile } from '../bootstrap/control-repo.js';
+import { checkControlRepoMeta, realControlRepoCommitAndPush, realReadControlManifestFile } from '../bootstrap/control-repo.js';
 import { checkRepoExists } from '../bootstrap/observer.js';
 import { realCreateRepo } from '../bootstrap/repo-create.js';
 
@@ -201,13 +201,20 @@ async function realConfirmPlan(plan: FleetPlan, creations: readonly PlannedAppCr
   });
 }
 
-/** DR-043 Amendment F (macf#857) — the real `<fleet>-control` provisioning primitives. */
+/**
+ * DR-043 Amendment F (macf#857) — the real `<fleet>-control` provisioning
+ * primitives. `commitAndPush` is deliberately `realControlRepoCommitAndPush`
+ * (the explicit-allowlist commit), NOT the `-A` `realCommitAndPush` used
+ * below for agent-repo `repoInitDeps` — see `control-repo.ts`'s
+ * "git-committed content invariant" doc section (#857 review) for why the
+ * two checkouts need different commit primitives.
+ */
 const REAL_CONTROL_REPO_DEPS: ControlRepoDeps = {
   checkMeta: checkControlRepoMeta,
   readManifestFile: realReadControlManifestFile,
   createRepo: realCreateRepo,
   cloneRepo: realCloneRepo,
-  commitAndPush: realCommitAndPush,
+  commitAndPush: realControlRepoCommitAndPush,
 };
 
 /** macf#857 — the real agent-repo-ensure primitives (`checkRepoExists` is the SAME read `observer.ts`'s plan-time repo-presence check uses; `createRepo` is the SAME primitive the control repo uses, with a template). */
