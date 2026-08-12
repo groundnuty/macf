@@ -316,3 +316,64 @@ The phasing maps onto Amendment A's two observability tiers: phase 2 operates in
 **§D1 amendment:** the ratified line "*that repo IS the GitOps repo*" is superseded — the **`<fleet>-control` repo** is the GitOps repo, and it is deliberately *not* a fleet member's repo.
 
 **References:** §D1 (the line superseded) · Amendments B/C/D (the READ-scope custody this extends to WRITE scope) · #854 (first provision; the `/tmp` path problem this fixes) · #855 (attestation — runs in agent repos, consumed here) · DR-030 (the doctors this schedules) · DR-032 (agent naming, collision-free with `<fleet>-control`) · §D2 (the two-interactions-per-App property the account-shared App preserves).
+
+## Amendment G (2026-08-12, #867 — operator-proposed) — the fleet teardown ladder
+
+**Trigger:** operator-proposed. Amendment F named retirement as a day-2 use case in one sentence; this is its structure. The operator rejected the original "`retire` + `--purge` flag" framing on two counts — *retire* names an intent not an action, and a destructive flag on a safe verb puts wildly different blast radii one typo apart — and reframed teardown as a **ladder whose rungs are distinguished by what REVIVAL costs in operator clicks** (App/repo creation-deletion being exactly the human-gated steps).
+
+**The load-bearing property (§D5 paying off in a direction it wasn't built for):** because the App private keys live in `vault.age`, the Apps AND their installations **survive** the first two rungs — so revival is pure reconciliation with zero consent gates. A store-of-record built for reconcile durability turns out to make fleet revival free. This is what makes the operator's "archive now, redeploy months later" requirement already true rather than something to build.
+
+### The ladder (four verbs, not a flag)
+
+| Verb | Removes | Revival cost |
+|---|---|---|
+| **`deactivate`** | the fleet's **org/account-scope registry presence** — the `<SEG>_CA_CERT` registry leg, the `MACF_<PROJECT>_AGENT_<NAME>` registrations, `<SEG>_FEDERATED_CAS` | `apply` — **0 clicks** |
+| **`archive`** | + archives the control + agent repos | un-archive (API) + `apply` — **0 clicks** |
+| **`delete-apps`** | + deletes the agent GitHub App identities (frees the globally-unique names) | recreate Apps (**2 clicks/agent**, App creation browser-only) + `apply` |
+| **`destroy`** | + deletes the repositories | full re-provision; **history gone forever** |
+
+Separate verbs, never a `--purge` flag — the same make-the-bad-state-unrepresentable principle as removing `transport.vault_repo` and deriving the App handle. `macf fleet archive` and `macf fleet destroy` cannot be confused; `--archive` vs `--purge` can.
+
+### `deactivate` is *deregistration*, not housekeeping (operator correction, 2026-08-12)
+
+The rung targets **org/account-scope entries ONLY** — never repo-scoped variables/secrets, which travel with an archived repo, harm nothing sitting there, and whose deletion is busywork that only makes revival more expensive. The essence: **removing the registry presence is what makes a fleet inactive**, because the registry is how agents are discovered and how routing resolves a target — remove it and the fleet stops being *addressable* while every durable artifact survives. `deactivate ↔ reactivate` names exactly that reversibility. Revival re-derives the org-scope entries from `fleet.yaml` + `vault.age` — §D5 again.
+
+### The rungs are cumulative — **chosen for coherence, NOT forced by a constraint**
+
+`deactivate ⊂ archive ⊂ delete-apps`; `destroy` is terminal (deletes repos directly — archiving something you're about to delete is pointless). The nesting is a *design choice*: an archived-but-still-registered fleet is **incoherent** — the registry would advertise addressable agents whose repos are frozen read-only, so routing keeps resolving targets that can't accept work. It is recorded as chosen-for-coherence deliberately: a rationale anchored to a *removable* constraint (an earlier draft claimed read-only "forces" clean-before-archive) collapses the moment someone re-checks the constraint and finds it inapplicable — and then the nesting reads as arbitrary. `deactivate` and `archive` are in fact **order-independent** on the teardown path (deactivate touches org scope, archive touches repos — no ordering dependency); the read-only fact binds only **revival** (un-archive must precede any `apply` write).
+
+### Amendment G AMENDS Amendment F's ownership rule — `archived → foreign` becomes name-match-discriminated
+
+Amendment F's shipped `classifyControlRepoOwnership` refuses an archived control repo as `foreign` *before any content check*. That was correct when archiving meant only "retired, done" — but the ladder makes archive a **reversible state of a live fleet**, so archived-ness stops being a valid discriminator, and the shipped rule would make `archive → apply` **refuse the fleet's own control repo** — the ladder's central promise (free revival) unreachable, with the worst failure mode: an operator archives expecting to revive and discovers months later the tool rejects its own repo. The fix discriminates on **name-match, not archived-ness**:
+
+- `archived` + `fleet.yaml` parses + `metadata.name` **matches** → **`ours-archived`** (revivable);
+- `archived` + missing/unparseable/mismatched `fleet.yaml` → **`foreign`** (unchanged — the case the original rule actually protects: someone else's `<fleet>-control` or a name collision, which won't carry our `metadata.name`, still fails closed);
+- everything else unchanged.
+
+Reads work on archived repos (read-only ≠ unreadable), so the content check is available. **`apply` must NOT silently un-archive** an `ours-archived` repo: un-archiving reverses a state the operator deliberately set, so it is surfaced as its own **confirm-required plan item** (plan-approve-once governs it). This stays in the "free revival" tier — an approval keystroke + an API PATCH is zero *consent-gate* clicks (no browser round-trip).
+
+### Shared rails (all four verbs)
+
+- **Inventory shown + confirmed before any mutation** (the DR-035 §4 plan-approve-once shape), with irreversible items called out separately from recoverable ones.
+- **Never scan-and-delete by name pattern — EXACT-KEY targeting only, and this is the design's highest-stakes instance of the rail.** The target set is derived from `fleet.yaml` + `fleet.lock` by exact key, never by `<PROJECT>_`-prefix sweep — because `deactivate`'s targets are **org/account-scope entries in a namespace shared with every other fleet**, so a prefix sweep could delete *another live fleet's registration*, not merely a same-named repo.
+- **Refuse a foreign control repo** (reuse the name-match `classifyControlRepoOwnership` above) — teardown cannot be aimed at another fleet's control plane.
+- **Report what could not be done**, never exit green — if App deletion needs a browser, name which Apps remain and where to click (silence here is the #854 shape in its worse direction).
+- **Explicitly NOT reconcile** — §D3's no-prune governs *reconcile*; these are deliberate operator acts on a named fleet, which is why they are separate verbs, not plan verbs.
+
+### `destroy` — friction is the feature
+
+Per the operator ("never — and I repeat never — allow easy repo removal"): `destroy` exists for the create→archive→delete end-to-end test, not routine use. Stack the acknowledgments: an explicit `--destroy-repositories` flag (implied by nothing), typing the **fleet name** to confirm, an environment acknowledgment (e.g. `MACF_I_UNDERSTAND_THIS_DELETES_REPOSITORIES=1`), and the full inventory shown first with irreversible items called out separately.
+
+### The age key
+
+Only `destroy` offers to shred the age key (cryptographic erasure of any surviving vault copy), explicit opt-in only — the single action with no recovery whatsoever, and note it also renders `deactivate`/`archive` unrevivable, since the vault is what makes those free.
+
+### Fact-stability + two build-time confirmations
+
+The revival-cost gradient rests entirely on **verified** facts (Apps survive via the vault; unarchive is API-automatable; App *creation* is browser-only, fixing the 2-clicks/agent *recreation* cost). Two facts remain **build-time confirmations that refine mechanism, not the ladder**: (1) whether Actions variables/secrets stay *readable* on an archived repo — affects only how deep `plan` observes *within* an archived fleet, not the recognition (which keys on the `archived` repo flag, always readable); (2) whether App *deletion* has a REST path or is browser-only — affects only whether the `delete-apps` *action* needs clicks to execute, never the revival cost.
+
+### Enables #869
+
+A repeatable live-smoke (the live-contract-verification class flagged on #868) needs a **disposable target**; the teardown ladder is what makes the create→verify→teardown loop cheap enough to run.
+
+**References:** Amendment F (retirement-as-day-2, now structured here; its `archived → foreign` ownership rule amended) · §D3 (no-prune governs reconcile, not deliberate teardown) · §D5 (the store-of-record that makes revival free) · #854 (report-what-couldn't-be-done) · #868 (live-run findings) · #869 (live-smoke, which this enables).
