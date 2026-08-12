@@ -27,6 +27,16 @@
  * declares a collaborator sees a "clean" plan and reasonably assumes it was
  * reconciled, `computePlan` surfaces every declared-but-deferred section
  * explicitly via `FleetPlan.skippedSections` — never silent.
+ *
+ * A SIBLING gap surfaced on the first real provision (groundnuty/macf#854):
+ * `skippedSections` covers whole MANIFEST SECTIONS apply never reconciles,
+ * but individual `create`/`update` {@link PlanItem}s can ALSO have no `apply`
+ * code path (the CA vars, `MACF_ROUTING_RUNS_ON`, repo creation) without any
+ * section being "skipped" — `plan` listed them as ordinary `create` items,
+ * `apply` silently never attempted 3 of them. `FleetPlan.unimplementedByApply`
+ * (via {@link planItemApplyCoverage}, the single source of truth for "does
+ * apply actually do this") closes that gap the same way `skippedSections`
+ * closes the section-level one — see the "Apply coverage" section below.
  */
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
@@ -101,6 +111,15 @@ export interface FleetPlan {
   readonly fleet: string;
   readonly items: readonly PlanItem[];
   readonly skippedSections: readonly SkippedSection[];
+  /**
+   * The subset of `items` that call for action (`create`/`update`) but
+   * `apply` has no code path for yet — groundnuty/macf#854 ("plan emitted 7
+   * create items; apply delivered 3, failed 1 loudly, silently skipped 3").
+   * Computed via {@link planItemApplyCoverage}, the single source of truth
+   * for "does apply actually do this" — see that function's doc. ALWAYS
+   * present (empty array when apply can action everything the plan lists).
+   */
+  readonly unimplementedByApply: readonly UnimplementedApplyItem[];
 }
 
 /** The reason text for each declared-but-deferred section (Slice 1a; see module doc). */
@@ -123,6 +142,136 @@ function computeSkippedSections(manifest: FleetManifest): readonly SkippedSectio
   }
   if (manifest.versions !== undefined) {
     out.push({ section: 'versions', reason: SKIPPED_SECTION_REASONS.versions });
+  }
+  return out;
+}
+
+// --- Apply coverage (groundnuty/macf#854) ---
+//
+// `computePlan` above is honest about what's OBSERVED vs DESIRED. It says
+// nothing about what `apply` (a DIFFERENT module, `apply-fleet.ts`) is
+// actually capable of DOING about a divergence — and as of Slice 2b
+// increment 5a, `apply` has no CA or routing orchestrator step at all, and
+// never creates a repo (it only runs repo-init config-work against one that
+// already exists — `apply-repo-init.ts`'s module doc). The first real
+// provision (macf#854) hit this the hard way: `plan` listed 7 `create`
+// items, `apply` delivered 3, failed 1 loudly, and SILENTLY skipped the
+// other 3 (the registry CA var, the per-repo CA var, the routing var) — with
+// no line anywhere saying so. DR-035 §4's whole safety model rests on the
+// operator scrutinizing ONE plan before approving; a plan that lists items
+// `apply` will never attempt manufactures false confidence, which is worse
+// than no gate.
+//
+// The fix is NOT to make apply refuse (that blocks all provisioning until
+// the CA/routing ceremony exists) — it's to make the gap IMPOSSIBLE to miss,
+// at both read points: the plan the operator approves, and the summary after
+// the run (which is the ONLY output under `--yes`, where no one reads the
+// pre-approval plan at all).
+
+/**
+ * Whether `apply` has an actual, wired code path for a {@link PlanItem} that
+ * calls for action. `noop` / `report-extra` items never call for action —
+ * there is nothing for apply to "do," so they are trivially `'implemented'`
+ * regardless of kind: the operator must be able to tell "apply won't do
+ * this" (a real gap) from "nothing to do" (no gap at all) — see the section
+ * doc above.
+ */
+export type ApplyCoverage = 'implemented' | 'not_implemented';
+
+export interface UnimplementedApplyItem {
+  readonly kind: PlanItemKind;
+  readonly target: string;
+  readonly verb: PlanVerb;
+  /** Why `apply` has no code path for this item — distinct from `PlanItem.reason`, which explains the observed/desired divergence, not apply's coverage of it. */
+  readonly reason: string;
+}
+
+/** The reason text for each kind `apply` cannot action yet (macf#854). Keyed by kind, not by item, so this stays the ONE place to update when a future increment wires the CA or routing orchestrator step. */
+export const APPLY_UNIMPLEMENTED_REASONS = {
+  ca:
+    'apply has no CA-provisioning step — no orchestrator step in apply-fleet.ts writes this variable at all ' +
+    '(macf#854). Provision it manually (mint/publish the CA cert to this GitHub Variable) or re-run apply once a ' +
+    'future increment adds the step; nothing above was created or changed for this item.',
+  routing:
+    'apply has no routing-provisioning step — no orchestrator step in apply-fleet.ts writes MACF_ROUTING_RUNS_ON ' +
+    'at all (macf#854). Set the registry variable manually or re-run apply once a future increment adds the step; ' +
+    'nothing above was created or changed for this item.',
+  repoCreate:
+    'apply does not create repositories — repo-init (workflow + agent-config.json) only runs against an ' +
+    'ALREADY-EXISTING repo and fails loud (a plain `git clone` error) if it is missing (macf#854 §2, ' +
+    'apply-repo-init.ts). Create the repo manually (e.g. from `defaults.role_template`) and re-run apply.',
+} as const;
+
+/**
+ * THE single source of truth for "does `apply` actually do this" — every
+ * renderer (plan text, plan `--json`, apply's final summary, apply
+ * `--json`) derives from THIS function; none of them hand-roll their own
+ * "is this kind implemented" guess. When a future increment wires the CA or
+ * routing orchestrator step into `apply-fleet.ts`, flipping the matching
+ * arm below is the ONLY change needed for every one of those renderers to
+ * pick it up (macf#854).
+ */
+export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
+  // Nothing calls for action → nothing for apply to have a code path for.
+  if (item.verb === 'noop' || item.verb === 'report-extra') return 'implemented';
+  switch (item.kind) {
+    case 'app':
+    case 'install':
+    case 'secret_fingerprint':
+      // apply-agent.ts's gate 1 / gate 2 / vault-write.ts's secret handling.
+      return 'implemented';
+    case 'agent':
+      // Always `report-extra` in practice (computePlan never emits an
+      // `agent` item with any other verb) — handled above already; kept
+      // here so this switch stays exhaustive over PlanItemKind rather than
+      // relying on that invariant silently.
+      return 'implemented';
+    case 'repo':
+      // presenceVerb only ever produces 'create' or 'noop' for a repo item
+      // (a pure existence check) — 'noop' is filtered above, so the only
+      // verb reaching here is 'create'. apply-repo-init.ts's module doc:
+      // repo CREATION is explicitly out of scope this increment.
+      return item.verb === 'create' ? 'not_implemented' : 'implemented';
+    case 'ca':
+    case 'routing':
+      // No CA or routing orchestrator step exists in apply-fleet.ts at all
+      // (macf#854) — every create/update item of these two kinds is
+      // unconditionally un-actioned today, regardless of verb.
+      return 'not_implemented';
+  }
+}
+
+function unimplementedReasonFor(kind: PlanItemKind): string {
+  switch (kind) {
+    case 'ca':
+      return APPLY_UNIMPLEMENTED_REASONS.ca;
+    case 'routing':
+      return APPLY_UNIMPLEMENTED_REASONS.routing;
+    case 'repo':
+      return APPLY_UNIMPLEMENTED_REASONS.repoCreate;
+    case 'app':
+    case 'install':
+    case 'secret_fingerprint':
+    case 'agent':
+      // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
+      // for these kinds (see its switch above). Kept exhaustive so a NEW
+      // `PlanItemKind` added later is a compile error here, not a silent
+      // "apply covers everything" false-negative.
+      return 'apply has no code path for this item (unclassified — this reason string should be unreachable)';
+  }
+}
+
+/**
+ * The items `computePlan` produced that call for action but `apply` cannot
+ * perform yet — the honesty fix for groundnuty/macf#854. Computed once
+ * inside `computePlan` so every renderer (plan text/json, apply's final
+ * summary/json) agrees; see `planItemApplyCoverage`'s doc.
+ */
+export function computeUnimplementedByApply(items: readonly PlanItem[]): readonly UnimplementedApplyItem[] {
+  const out: UnimplementedApplyItem[] = [];
+  for (const item of items) {
+    if (planItemApplyCoverage(item) !== 'not_implemented') continue;
+    out.push({ kind: item.kind, target: item.target, verb: item.verb, reason: unimplementedReasonFor(item.kind) });
   }
   return out;
 }
@@ -325,7 +474,12 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
     });
   }
 
-  return { fleet: fleetName, items, skippedSections: computeSkippedSections(manifest) };
+  return {
+    fleet: fleetName,
+    items,
+    skippedSections: computeSkippedSections(manifest),
+    unimplementedByApply: computeUnimplementedByApply(items),
+  };
 }
 
 // --- Formatting (human table + --json) ---
@@ -351,6 +505,20 @@ export function summarizePlan(items: readonly PlanItem[]): PlanSummary {
 /** One loud line per skipped section — `<section>: SKIPPED (<reason>)`. */
 export function formatSkippedLines(sections: readonly SkippedSection[]): readonly string[] {
   return sections.map((s) => `${s.section}: SKIPPED (${s.reason})`);
+}
+
+/**
+ * One loud line per apply-unimplemented item — `<kind>: <target> (<verb>)
+ * — NOT IMPLEMENTED BY APPLY (<reason>)`. Deliberately different wording
+ * from `formatSkippedLines`'s "SKIPPED": SKIPPED means the manifest declared
+ * a whole SECTION nothing reconciles at all (§D3-scale, `versions:` /
+ * `collaborators:`); NOT IMPLEMENTED means THIS run's plan needs action on a
+ * SPECIFIC resource that `apply` has no code for (macf#854). The operator
+ * must be able to tell "apply won't do this" from "nothing to do" — see
+ * `planItemApplyCoverage`'s doc.
+ */
+export function formatUnimplementedLines(items: readonly UnimplementedApplyItem[]): readonly string[] {
+  return items.map((i) => `${i.kind}: ${i.target} (${i.verb}) — NOT IMPLEMENTED BY APPLY (${i.reason})`);
 }
 
 const PLAN_HEADERS = ['KIND', 'TARGET', 'VERB', 'CONFIRM', 'REASON'] as const;
@@ -381,10 +549,19 @@ export function formatPlanText(plan: FleetPlan): string {
   if (skipLines.length > 0) {
     parts.push('', ...skipLines);
   }
+  const unimplementedLines = formatUnimplementedLines(plan.unimplementedByApply);
+  if (unimplementedLines.length > 0) {
+    parts.push(
+      '',
+      `⚠ apply cannot action ${String(plan.unimplementedByApply.length)} item(s) below yet — approving this plan ` +
+        'will NOT create or update them; they are NOT implemented, this is not "nothing to do" (macf#854):',
+      ...unimplementedLines,
+    );
+  }
   return parts.join('\n');
 }
 
-/** Structured `--json` shape. `skipped_sections` is ALWAYS present (empty array when nothing was skipped). */
+/** Structured `--json` shape. `skipped_sections` + `unimplemented_by_apply` are ALWAYS present (empty array when nothing applies). */
 export function fleetPlanToJson(plan: FleetPlan): unknown {
   return {
     schema_version: FLEET_PLAN_JSON_SCHEMA_VERSION,
@@ -392,6 +569,7 @@ export function fleetPlanToJson(plan: FleetPlan): unknown {
     plan: plan.items.map((i) => ({ ...i })),
     summary: summarizePlan(plan.items),
     skipped_sections: plan.skippedSections.map((s) => ({ ...s })),
+    unimplemented_by_apply: plan.unimplementedByApply.map((i) => ({ ...i })),
   };
 }
 

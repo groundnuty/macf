@@ -122,6 +122,7 @@ describe('runBootstrapPlan', () => {
       plan: ReadonlyArray<{ kind: string; verb: string }>;
       summary: { creates: number };
       skipped_sections: ReadonlyArray<{ section: string; reason: string }>;
+      unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
     };
     expect(json.schema_version).toBe(1);
     expect(json.fleet).toBe('icsoc-2026');
@@ -131,6 +132,11 @@ describe('runBootstrapPlan', () => {
     expect(json.skipped_sections).toEqual([
       { section: 'collaborators', reason: 'reconcile not implemented in v1 — see #838 follow-ups' },
     ]);
+    // macf#854 — the plan's json ALWAYS carries the apply-coverage gap for
+    // automation, not just the human-text render. This fixture has no
+    // agent/CA presence observed at all → CA items are unimplemented creates.
+    expect(json.unimplemented_by_apply.length).toBeGreaterThan(0);
+    expect(json.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(true);
   });
 
   it('plain-text mode renders the human table + the skipped-section loud line', async () => {
@@ -145,6 +151,11 @@ describe('runBootstrapPlan', () => {
     expect(out).toContain('macf bootstrap plan — icsoc-2026');
     expect(out).toContain('CREATE');
     expect(out).toContain('collaborators: SKIPPED (reconcile not implemented in v1 — see #838 follow-ups)');
+    // macf#854 — the plan text ALSO names the items apply has no code path
+    // for yet (distinct wording from "SKIPPED" — see plan.ts's
+    // formatUnimplementedLines doc).
+    expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
+    expect(out).toContain('ca:registry:ICSOC_2026_CA_CERT');
   });
 
   it('plain-text mode omits the skipped-section block entirely when nothing was skipped', async () => {

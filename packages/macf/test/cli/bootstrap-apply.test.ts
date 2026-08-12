@@ -30,7 +30,7 @@ import {
 import { parseFleetManifest } from '../../src/cli/bootstrap/fleet-manifest.js';
 import { parseFleetLock } from '../../src/cli/bootstrap/fleet-manifest.js';
 import { computePlan } from '../../src/cli/bootstrap/plan.js';
-import type { ObservedState } from '../../src/cli/bootstrap/plan.js';
+import type { ObservedState, UnimplementedApplyItem } from '../../src/cli/bootstrap/plan.js';
 import type { FleetApplyResult } from '../../src/cli/bootstrap/apply-fleet.js';
 import type { AgentApplyDeps } from '../../src/cli/bootstrap/apply-agent.js';
 import type { AppCredentials } from '../../src/cli/bootstrap/manifest-exchange.js';
@@ -121,9 +121,13 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
     expect(out).toMatch(/https:\/\/github\.com\/apps\/demo-fleet-code-agent\/installations\/new/);
     expect(out).toMatch(/https:\/\/github\.com\/apps\/demo-fleet-science-agent\/installations\/new/);
     expect(out).toMatch(/DRY RUN — nothing was created/);
+    // macf#854 — the --dry-run text render (same formatPlanText the real
+    // apply path's pre-approval render uses) already names the items apply
+    // has no code path for, before any consent gate would open.
+    expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
   });
 
-  it('--dry-run --json carries dry_run + planned_app_creations (incl. installUrl)', async () => {
+  it('--dry-run --json carries dry_run + planned_app_creations (incl. installUrl) + unimplemented_by_apply (macf#854)', async () => {
     const file = writeManifest();
     const code = await runBootstrapApply(
       { file, dryRun: true, json: true },
@@ -133,6 +137,7 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
     const parsed = JSON.parse(logs.join('\n')) as {
       dry_run: boolean;
       planned_app_creations: { role: string; manifest: { name: string }; installUrl: string }[];
+      unimplemented_by_apply: ReadonlyArray<{ kind: string }>;
     };
     expect(parsed.dry_run).toBe(true);
     expect(parsed.planned_app_creations.map((c) => c.manifest.name)).toEqual([
@@ -143,6 +148,8 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
       'https://github.com/apps/demo-fleet-code-agent/installations/new',
       'https://github.com/apps/demo-fleet-science-agent/installations/new',
     ]);
+    // Inherited automatically from fleetPlanToJson(plan) — no separate wiring needed.
+    expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(true);
   });
 
   it('reports a missing manifest file without throwing', async () => {
@@ -341,6 +348,67 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(all).not.toContain('SENTINEL-WEBHOOK-SECRET');
     expect(all).not.toContain('SENTINEL-PEM-VALUE');
   });
+
+  // --- macf#854: apply must not overstate what it did — the final summary
+  // must name the plan items it never attempted (CA / routing / repo-create),
+  // and it must do so EVEN UNDER --yes, since --yes skips the pre-approval
+  // render entirely (the final summary is the ONLY output an automated run sees).
+
+  it('final summary (--yes, non-json) lists apply-unimplemented items — the plan-approve-once artifact is skipped under --yes, so this is the only place they surface', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps());
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
+    expect(out).toMatch(/ca:registry:/);
+    // The registry CA var + per-repo CA vars are exactly the #854 incident's
+    // silently-skipped resources — pin the kinds actually named.
+    expect(out).toMatch(/\bca:/);
+    expect(out).toMatch(/\brepo:/);
+  });
+
+  it('final summary (--yes, --json) carries unimplemented_by_apply with the SAME items as the plan', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps());
+    expect(code).toBe(0);
+    const parsed = JSON.parse(logs.join('\n')) as {
+      unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
+    };
+    expect(parsed.unimplemented_by_apply.length).toBeGreaterThan(0);
+    expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(true);
+    expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'repo')).toBe(true);
+    for (const item of parsed.unimplemented_by_apply) {
+      expect(item.reason.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('pre-approval stderr render (interactive path, confirmPlan declines) ALSO shows the NOT IMPLEMENTED block before the abort', async () => {
+    // The DR-035 §4 plan-approve-once artifact goes straight to
+    // `process.stderr.write` (not `console.error`) so a human running
+    // without --json sees the SAME text a script skips past — spy on the
+    // raw stream to see it.
+    const rawWrites: string[] = [];
+    const writeSpy = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: string | Uint8Array) => {
+        rawWrites.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+        return true;
+      });
+    try {
+      const file = writeManifest();
+      const code = await runBootstrapApply(
+        { file },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps({ confirmPlan: async () => false }),
+      );
+      expect(code).toBe(1);
+      // The plan-approve-once artifact is written to stderr BEFORE the
+      // prompt — the operator must see this before typing "yes", not just after.
+      expect(rawWrites.join('')).toMatch(/NOT IMPLEMENTED BY APPLY/);
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
 });
 
 // --- Pure result-rendering helpers ---
@@ -414,5 +482,50 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(json).not.toContain('SENTINEL-WEBHOOK-SECRET');
     expect(json).not.toContain('SENTINEL-PEM-VALUE');
     expect(JSON.parse(json).schema_version).toBe(FLEET_APPLY_JSON_SCHEMA_VERSION);
+  });
+
+  // --- macf#854: formatApplyResult / fleetApplyResultToJson's optional
+  // second param. Defaults to [] so pre-existing call sites (above, and any
+  // caller that doesn't thread the plan through) keep compiling AND keep
+  // rendering byte-identically — no spurious warning when nothing is unimplemented.
+
+  const UNIMPLEMENTED_FIXTURE: readonly UnimplementedApplyItem[] = [
+    { kind: 'ca', target: 'ca:registry:DEMO_FLEET_CA_CERT', verb: 'create', reason: 'no CA orchestrator step exists yet' },
+  ];
+
+  it('formatApplyResult omits the unimplemented block when the param is omitted (default [])', () => {
+    const result = resultWith({});
+    expect(formatApplyResult(result)).not.toMatch(/NOT IMPLEMENTED/);
+  });
+
+  it('formatApplyResult omits the unimplemented block when passed an explicit empty array', () => {
+    const result = resultWith({});
+    expect(formatApplyResult(result, [])).not.toMatch(/NOT IMPLEMENTED/);
+  });
+
+  it('formatApplyResult renders the unimplemented block when items are passed, never a credential value', () => {
+    const result = resultWith({
+      agents: [{ role: 'a', identity: { role: 'a', status: 'created', appId: '1', installId: '2', credentials: SENTINEL_CREDS } }],
+    });
+    const text = formatApplyResult(result, UNIMPLEMENTED_FIXTURE);
+    expect(text).toMatch(/NOT IMPLEMENTED BY APPLY/);
+    expect(text).toContain('ca:registry:DEMO_FLEET_CA_CERT');
+    expect(text).not.toContain('SENTINEL-PEM-VALUE');
+  });
+
+  it('fleetApplyResultToJson defaults unimplemented_by_apply to [] when the param is omitted', () => {
+    const result = resultWith({});
+    const json = JSON.parse(JSON.stringify(fleetApplyResultToJson(result))) as { unimplemented_by_apply: unknown[] };
+    expect(json.unimplemented_by_apply).toEqual([]);
+  });
+
+  it('fleetApplyResultToJson carries the passed unimplemented items verbatim', () => {
+    const result = resultWith({});
+    const json = JSON.parse(JSON.stringify(fleetApplyResultToJson(result, UNIMPLEMENTED_FIXTURE))) as {
+      unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string }>;
+    };
+    expect(json.unimplemented_by_apply).toEqual([
+      { kind: 'ca', target: 'ca:registry:DEMO_FLEET_CA_CERT', verb: 'create', reason: 'no CA orchestrator step exists yet' },
+    ]);
   });
 });
