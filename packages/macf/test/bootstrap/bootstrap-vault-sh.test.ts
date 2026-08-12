@@ -10,6 +10,18 @@
  *       leak into the caller when sourced (the actual shell-kill failure mode);
  *   (2) it materializes the per-project CA (ca-cert.pem + ca-key.pem) in addition
  *       to the per-agent PEMs.
+ *
+ * macf#848 (structural hardening — no-eval read path): `vault.sh` used to
+ * `eval` the decrypted plaintext to export it, so ITS safety rested entirely
+ * on the writer's (`buildVaultPlaintext`) character blocklist staying
+ * exhaustive forever. It now PARSES `KEY=VALUE` lines directly instead — see
+ * the `vault.sh — no-eval KEY=VALUE parse (macf#848)` describe block below,
+ * which pins: (a) compat with the OLD double-quoted `KEY="value"` form (a
+ * real vault already exists in the wild using it, written 2026-08-12 by the
+ * first live provision); (b) the NEW single-quoted `KEY='value'` form; (c)
+ * the load-bearing property — a HOSTILE value (containing `$(...)` or
+ * backticks) is assigned LITERALLY and never executes, regardless of what a
+ * writer emits.
  */
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
@@ -42,6 +54,8 @@ function stubBin(): string {
   return dir;
 }
 
+// OLD double-quoted form — still the live fleet's real vault shape (written
+// 2026-08-12, pre-macf#848). Doubles as the macf#848 read-compat fixture.
 const VAULT_PLAINTEXT = [
   'MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID="333333"',
   `MACF_AGENT_ICSOC_2026_CODE_AGENT_PRIVATE_KEY_B64="${Buffer.from('FAKE-AGENT-PEM').toString('base64')}"`,
@@ -50,15 +64,30 @@ const VAULT_PLAINTEXT = [
   '',
 ].join('\n');
 
+// NEW single-quoted form — what buildVaultPlaintext emits post-macf#848.
+// Same field values as VAULT_PLAINTEXT so the two fixtures are directly comparable.
+const VAULT_PLAINTEXT_SINGLE_QUOTED = [
+  "MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID='333333'",
+  `MACF_AGENT_ICSOC_2026_CODE_AGENT_PRIVATE_KEY_B64='${Buffer.from('FAKE-AGENT-PEM').toString('base64')}'`,
+  `MACF_ICSOC_2026_CA_KEY_B64='${Buffer.from('FAKE-CA-KEY').toString('base64')}'`,
+  `MACF_ICSOC_2026_CA_CERT_B64='${Buffer.from('FAKE-CA-CERT').toString('base64')}'`,
+  '',
+].join('\n');
+
 /** Source vault.sh in `shell` with a stubbed age + the plaintext-as-vault.age,
- *  an isolated HOME, and a trailing marker. Returns the spawn result. */
-function sourceVault(shell: 'bash' | 'zsh', opts: { trailer: string }): ReturnType<typeof spawnSync> {
+ *  an isolated HOME, and a trailing marker. Returns the spawn result.
+ *  `opts.plaintext` overrides the default (OLD double-quoted) fixture — used
+ *  by the macf#848 compat + hostile-value tests below. */
+function sourceVault(
+  shell: 'bash' | 'zsh',
+  opts: { trailer: string; plaintext?: string },
+): ReturnType<typeof spawnSync> {
   const work = mkdtempSync(join(tmpdir(), 'macf-vault-src-'));
   const tpl = join(work, 'tpl');
   mkdirSync(tpl, { recursive: true });
   // Copy the real vault.sh next to a "vault.age" that the stub age will cat back.
   writeFileSync(join(tpl, 'vault.sh'), readFileSync(VAULT_SH, 'utf-8'));
-  writeFileSync(join(tpl, 'vault.age'), VAULT_PLAINTEXT);
+  writeFileSync(join(tpl, 'vault.age'), opts.plaintext ?? VAULT_PLAINTEXT);
   const ageKey = join(work, 'age-key.txt');
   writeFileSync(ageKey, 'AGE-SECRET-KEY-stub');
   const home = join(work, 'home');
@@ -149,5 +178,99 @@ describe('vault.sh — CA materialization (No-CA-on-VM fix)', () => {
     expect(readFileSync(caCertLine![1], 'utf-8')).toBe('FAKE-CA-CERT');
     expect(readFileSync(caKeyLine![1], 'utf-8')).toBe('FAKE-CA-KEY');
     expect(readFileSync(pemLine![1], 'utf-8')).toBe('FAKE-AGENT-PEM');
+  });
+});
+
+describe('vault.sh — no-eval KEY=VALUE parse (macf#848)', () => {
+  it('never evals the decrypted vault plaintext — only the static zsh self-path-resolution eval remains', () => {
+    const code = read(VAULT_SH, 'utf-8')
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    // The load-bearing absence: `eval` applied to attacker-influenced decrypted
+    // content. The ONE legitimate `eval` left resolves this script's own path
+    // under zsh from a hardcoded, script-authored string — never vault content.
+    expect(code).not.toMatch(/eval\s+"?\$_vault_plain"?/);
+    expect(code).not.toMatch(/eval\s+"?\$\{_vault_plain/);
+    // set -a / set +a auto-export (paired with the removed eval) is gone too.
+    expect(code).not.toMatch(/^\s*set\s+-a\b/m);
+  });
+
+  it(
+    'compat: exports OLD double-quoted KEY="value" lines into the sourcing shell ' +
+      '(a real vault already exists in the wild using this form, written 2026-08-12)',
+    () => {
+      const r = sourceVault('bash', {
+        trailer: 'echo "APP_ID=[$MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID]"',
+        plaintext: VAULT_PLAINTEXT,
+      });
+      expect(r.stdout, `stderr:\n${r.stderr}`).toContain('APP_ID=[333333]');
+    },
+  );
+
+  it("exports NEW single-quoted KEY='value' lines into the sourcing shell", () => {
+    const r = sourceVault('bash', {
+      trailer: 'echo "APP_ID=[$MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID]"',
+      plaintext: VAULT_PLAINTEXT_SINGLE_QUOTED,
+    });
+    expect(r.stdout, `stderr:\n${r.stderr}`).toContain('APP_ID=[333333]');
+  });
+
+  it.skipIf(!HAS_ZSH)("compat + new form both export correctly under zsh too", () => {
+    const rOld = sourceVault('zsh', {
+      trailer: 'echo "APP_ID=[$MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID]"',
+      plaintext: VAULT_PLAINTEXT,
+    });
+    expect(rOld.stdout, `stderr:\n${rOld.stderr}`).toContain('APP_ID=[333333]');
+    const rNew = sourceVault('zsh', {
+      trailer: 'echo "APP_ID=[$MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID]"',
+      plaintext: VAULT_PLAINTEXT_SINGLE_QUOTED,
+    });
+    expect(rNew.stdout, `stderr:\n${rNew.stderr}`).toContain('APP_ID=[333333]');
+  });
+
+  it(
+    'a hostile value with $(...) command substitution is assigned LITERALLY and NEVER EXECUTES ' +
+      '(the READER must be safe regardless of what a writer emits — this bypasses buildVaultPlaintext entirely)',
+    () => {
+      const work = mkdtempSync(join(tmpdir(), 'macf-vault-hostile-cmdsub-'));
+      const sentinel = join(work, 'PWNED-CMDSUB');
+      const hostilePlaintext = [`MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID='$(touch ${sentinel})'`, ''].join('\n');
+      const r = sourceVault('bash', {
+        trailer: 'echo "APP_ID=[$MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID]"',
+        plaintext: hostilePlaintext,
+      });
+      // Round-trips as the LITERAL text — not the (never-run) command's output.
+      expect(r.stdout, `stderr:\n${r.stderr}`).toContain(`APP_ID=[$(touch ${sentinel})]`);
+      // The proof: the side effect never happened.
+      expect(existsSync(sentinel)).toBe(false);
+    },
+  );
+
+  it('a hostile value with backticks is also assigned LITERALLY and NEVER EXECUTES', () => {
+    const work = mkdtempSync(join(tmpdir(), 'macf-vault-hostile-backtick-'));
+    const sentinel = join(work, 'PWNED-BACKTICK');
+    const hostilePlaintext = [`MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID='\`touch ${sentinel}\`'`, ''].join('\n');
+    const r = sourceVault('bash', {
+      trailer: 'echo "APP_ID=[$MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID]"',
+      plaintext: hostilePlaintext,
+    });
+    expect(r.stdout, `stderr:\n${r.stderr}`).toContain(`APP_ID=[\`touch ${sentinel}\`]`);
+    expect(existsSync(sentinel)).toBe(false);
+  });
+
+  it('a hostile value under the OLD double-quoted form is also assigned LITERALLY and NEVER EXECUTES', () => {
+    const work = mkdtempSync(join(tmpdir(), 'macf-vault-hostile-dq-'));
+    const sentinel = join(work, 'PWNED-DQ');
+    // The OLD writer's blocklist would have rejected this at write time — but
+    // the READER must not depend on that: a hand-edited or pre-macf#848 vault
+    // with this shape must still be inert.
+    const hostilePlaintext = [`MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID="$(touch ${sentinel})"`, ''].join('\n');
+    const r = sourceVault('bash', {
+      trailer: 'echo "APP_ID=[$MACF_AGENT_ICSOC_2026_CODE_AGENT_APP_ID]"',
+      plaintext: hostilePlaintext,
+    });
+    expect(r.stdout, `stderr:\n${r.stderr}`).toContain(`APP_ID=[$(touch ${sentinel})]`);
+    expect(existsSync(sentinel)).toBe(false);
   });
 });

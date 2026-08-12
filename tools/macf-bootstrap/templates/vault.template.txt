@@ -14,25 +14,30 @@
 # PEMs / certs / keys are base64-encoded (single-line, source-safe). <NAME> is the
 # agent name uppercased with hyphens→underscores. <PROJECT> likewise.
 #
+# Quoting (macf#848): KEY='value' (single-quoted) is the current canonical form
+# — `buildVaultPlaintext` emits this shape. `vault.sh` also still reads the OLDER
+# KEY="value" (double-quoted) form for compat with vaults written before macf#848;
+# a NEW vault should always use single quotes.
+#
 # ── per-agent (repeat the block per agent) ──────────────────────────────────
-MACF_AGENT_<NAME>_APP_ID="<app_id>"
-MACF_AGENT_<NAME>_INSTALL_ID="<install_id>"
-MACF_AGENT_<NAME>_CLIENT_ID="<client_id>"
-MACF_AGENT_<NAME>_CLIENT_SECRET="<client_secret>"
-MACF_AGENT_<NAME>_WEBHOOK_SECRET="<webhook_secret>"
-MACF_AGENT_<NAME>_PRIVATE_KEY_B64="<base64 of the .pem>"
+MACF_AGENT_<NAME>_APP_ID='<app_id>'
+MACF_AGENT_<NAME>_INSTALL_ID='<install_id>'
+MACF_AGENT_<NAME>_CLIENT_ID='<client_id>'
+MACF_AGENT_<NAME>_CLIENT_SECRET='<client_secret>'
+MACF_AGENT_<NAME>_WEBHOOK_SECRET='<webhook_secret>'
+MACF_AGENT_<NAME>_PRIVATE_KEY_B64='<base64 of the .pem>'
 
 # ── macf-routing App (one per fleet) ────────────────────────────────────────
-MACF_ROUTING_APP_ID="<routing_app_id>"
-MACF_ROUTING_APP_KEY_B64="<base64 of the routing App .pem>"
+MACF_ROUTING_APP_ID='<routing_app_id>'
+MACF_ROUTING_APP_KEY_B64='<base64 of the routing App .pem>'
 
 # ── the 6 routing secrets (per macf-consumer-onboarding.md) ──────────────────
-ROUTING_CLIENT_CERT_B64="<base64 PEM>"
-ROUTING_CLIENT_KEY_B64="<base64 PEM>"
-TS_OAUTH_CLIENT_ID="<tailscale oauth client id>"
-TS_OAUTH_SECRET="<tailscale oauth secret>"
+ROUTING_CLIENT_CERT_B64='<base64 PEM>'
+ROUTING_CLIENT_KEY_B64='<base64 PEM>'
+TS_OAUTH_CLIENT_ID='<tailscale oauth client id>'
+TS_OAUTH_SECRET='<tailscale oauth secret>'
 # (MACF_ROUTING_APP_ID + MACF_ROUTING_APP_KEY above complete the 6.)
 
 # ── per-project CA (generated Mac-side via `macf certs init`) ────────────────
-MACF_<PROJECT>_CA_KEY_B64="<base64 of the CA private key>"
-MACF_<PROJECT>_CA_CERT_B64="<base64 of the CA cert>"
+MACF_<PROJECT>_CA_KEY_B64='<base64 of the CA private key>'
+MACF_<PROJECT>_CA_CERT_B64='<base64 of the CA cert>'

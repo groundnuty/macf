@@ -48,16 +48,16 @@ const AGENT: VaultAgentSecrets = {
 describe('buildVaultPlaintext', () => {
   it('emits MACF_AGENT_<HANDLE-SEGMENT>_* lines using the FULL derived handle, not the bare role', () => {
     const out = buildVaultPlaintext({ agents: [AGENT] });
-    expect(out).toContain('MACF_AGENT_DEMO_FLEET_CODE_AGENT_APP_ID="111"');
-    expect(out).toContain('MACF_AGENT_DEMO_FLEET_CODE_AGENT_INSTALL_ID="222"');
-    expect(out).toContain('MACF_AGENT_DEMO_FLEET_CODE_AGENT_CLIENT_ID="Iv1.abc"');
-    expect(out).toContain('MACF_AGENT_DEMO_FLEET_CODE_AGENT_CLIENT_SECRET="client-secret-value"');
-    expect(out).toContain('MACF_AGENT_DEMO_FLEET_CODE_AGENT_WEBHOOK_SECRET="webhook-secret-value"');
+    expect(out).toContain("MACF_AGENT_DEMO_FLEET_CODE_AGENT_APP_ID='111'");
+    expect(out).toContain("MACF_AGENT_DEMO_FLEET_CODE_AGENT_INSTALL_ID='222'");
+    expect(out).toContain("MACF_AGENT_DEMO_FLEET_CODE_AGENT_CLIENT_ID='Iv1.abc'");
+    expect(out).toContain("MACF_AGENT_DEMO_FLEET_CODE_AGENT_CLIENT_SECRET='client-secret-value'");
+    expect(out).toContain("MACF_AGENT_DEMO_FLEET_CODE_AGENT_WEBHOOK_SECRET='webhook-secret-value'");
   });
 
   it('base64-encodes the PEM (single-line, source-safe) and it round-trips back to the original', () => {
     const out = buildVaultPlaintext({ agents: [AGENT] });
-    const match = out.match(/MACF_AGENT_DEMO_FLEET_CODE_AGENT_PRIVATE_KEY_B64="([^"]*)"/);
+    const match = out.match(/MACF_AGENT_DEMO_FLEET_CODE_AGENT_PRIVATE_KEY_B64='([^']*)'/);
     expect(match).not.toBeNull();
     expect(match?.[1]).not.toContain('\n');
     expect(Buffer.from(match?.[1] ?? '', 'base64').toString('utf-8')).toBe(AGENT.pem);
@@ -81,11 +81,11 @@ describe('buildVaultPlaintext', () => {
         tsOauthSecret: 'ts-secret',
       },
     });
-    expect(out).toContain('MACF_ROUTING_APP_ID="999"');
-    expect(out).toContain('TS_OAUTH_CLIENT_ID="ts-client-id"');
-    expect(out).toContain('TS_OAUTH_SECRET="ts-secret"');
-    expect(out).toContain(`ROUTING_CLIENT_CERT_B64="${Buffer.from('CERT-PEM', 'utf-8').toString('base64')}"`);
-    expect(out).toContain(`ROUTING_CLIENT_KEY_B64="${Buffer.from('KEY-PEM', 'utf-8').toString('base64')}"`);
+    expect(out).toContain("MACF_ROUTING_APP_ID='999'");
+    expect(out).toContain("TS_OAUTH_CLIENT_ID='ts-client-id'");
+    expect(out).toContain("TS_OAUTH_SECRET='ts-secret'");
+    expect(out).toContain(`ROUTING_CLIENT_CERT_B64='${Buffer.from('CERT-PEM', 'utf-8').toString('base64')}'`);
+    expect(out).toContain(`ROUTING_CLIENT_KEY_B64='${Buffer.from('KEY-PEM', 'utf-8').toString('base64')}'`);
   });
 
   it('includes the CA block under MACF_<PROJECT>_CA_{KEY,CERT}_B64 when given', () => {
@@ -93,8 +93,8 @@ describe('buildVaultPlaintext', () => {
       agents: [],
       ca: { project: 'demo-fleet', caKeyPem: 'CA-KEY', caCertPem: 'CA-CERT' },
     });
-    expect(out).toContain(`MACF_DEMO_FLEET_CA_KEY_B64="${Buffer.from('CA-KEY', 'utf-8').toString('base64')}"`);
-    expect(out).toContain(`MACF_DEMO_FLEET_CA_CERT_B64="${Buffer.from('CA-CERT', 'utf-8').toString('base64')}"`);
+    expect(out).toContain(`MACF_DEMO_FLEET_CA_KEY_B64='${Buffer.from('CA-KEY', 'utf-8').toString('base64')}'`);
+    expect(out).toContain(`MACF_DEMO_FLEET_CA_CERT_B64='${Buffer.from('CA-CERT', 'utf-8').toString('base64')}'`);
   });
 
   it('throws VaultError(vault_empty_payload) on an entirely empty payload', () => {
@@ -110,8 +110,8 @@ describe('buildVaultPlaintext', () => {
     expect(() => buildVaultPlaintext({ agents: [{ ...AGENT, clientSecret: '' }] })).toThrow(VaultError);
   });
 
-  it.each(['"', '$', '`', '\\', '\r', '\n'])(
-    'throws VaultError(vault_unsafe_value) on a raw value containing %j (eval-unsafe under vault.sh)',
+  it.each(["'", '\r', '\n'])(
+    'throws VaultError(vault_unsafe_value) on a raw value containing %j (unrepresentable/format-breaking under vault.sh\'s single-quoted KEY=\'value\' lines, macf#848)',
     (ch) => {
       try {
         buildVaultPlaintext({ agents: [{ ...AGENT, clientSecret: `bad${ch}value` }] });
@@ -123,17 +123,30 @@ describe('buildVaultPlaintext', () => {
     },
   );
 
+  it.each(['"', '$', '`', '\\'])(
+    'ALLOWS a raw value containing %j (macf#848: inert under single-quote output + vault.sh\'s no-eval parser — ' +
+      'these were guarded ONLY back when vault.sh used eval + double-quoted output)',
+    (ch) => {
+      expect(() => buildVaultPlaintext({ agents: [{ ...AGENT, clientSecret: `ok${ch}value` }] })).not.toThrow();
+      const out = buildVaultPlaintext({ agents: [{ ...AGENT, clientSecret: `ok${ch}value` }] });
+      expect(out).toContain(`MACF_AGENT_DEMO_FLEET_CODE_AGENT_CLIENT_SECRET='ok${ch}value'`);
+    },
+  );
+
   it('never leaks the secret VALUE into the thrown error message (never log/print a secret)', () => {
     try {
-      buildVaultPlaintext({ agents: [{ ...AGENT, clientSecret: 'bad"value' }] });
+      buildVaultPlaintext({ agents: [{ ...AGENT, clientSecret: "bad'value" }] });
       throw new Error('should have thrown');
     } catch (e) {
-      expect((e as VaultError).message).not.toContain('bad"value');
+      expect((e as VaultError).message).not.toContain("bad'value");
     }
   });
 
-  it('a base64-derived field (the PEM) is NEVER subject to the raw-value guard even if the raw PEM contains a quote', () => {
-    const withQuote: VaultAgentSecrets = { ...AGENT, pem: 'contains "quotes" and $vars and `backticks`' };
+  it('a base64-derived field (the PEM) is NEVER subject to the raw-value guard even if the raw PEM contains every guarded byte', () => {
+    const withQuote: VaultAgentSecrets = {
+      ...AGENT,
+      pem: 'contains "quotes" and $vars and `backticks` and \\backslashes and \'single quotes\'',
+    };
     expect(() => buildVaultPlaintext({ agents: [withQuote] })).not.toThrow();
   });
 
@@ -323,13 +336,13 @@ describe('agentRecoveryArtifactPath / writeAgentRecoveryArtifact / removeAgentRe
       expect(calls).toHaveLength(1);
       expect(calls[0]?.outPath).toBe(outPath);
       expect(calls[0]?.recipients).toEqual(['age1operator', 'age1vm']);
-      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_ID="111"');
-      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_SLUG="demo-fleet-code-agent"');
-      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_CLIENT_SECRET="SENTINEL-CLIENT-SECRET"');
-      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_WEBHOOK_SECRET="SENTINEL-WEBHOOK-SECRET"');
+      expect(calls[0]?.plaintext).toContain("MACF_RECOVERY_CODE_AGENT_APP_ID='111'");
+      expect(calls[0]?.plaintext).toContain("MACF_RECOVERY_CODE_AGENT_APP_SLUG='demo-fleet-code-agent'");
+      expect(calls[0]?.plaintext).toContain("MACF_RECOVERY_CODE_AGENT_CLIENT_SECRET='SENTINEL-CLIENT-SECRET'");
+      expect(calls[0]?.plaintext).toContain("MACF_RECOVERY_CODE_AGENT_WEBHOOK_SECRET='SENTINEL-WEBHOOK-SECRET'");
       // PEM is base64-encoded, never raw, in the plaintext:
       expect(calls[0]?.plaintext).not.toContain('SENTINEL-PEM');
-      expect(calls[0]?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_PRIVATE_KEY_B64="');
+      expect(calls[0]?.plaintext).toContain("MACF_RECOVERY_CODE_AGENT_PRIVATE_KEY_B64='");
       // No installId anywhere — gate 2 hasn't happened yet at write time:
       expect(calls[0]?.plaintext).not.toContain('INSTALL_ID');
     } finally {

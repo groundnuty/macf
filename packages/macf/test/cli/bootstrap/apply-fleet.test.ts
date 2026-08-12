@@ -592,7 +592,7 @@ trust:
       // — no shared single key copied between the operator's Mac and the VM.
       const decryptOperator = spawnSync('age', ['-d', '-i', operatorKey.keyPath, result.vault.path], { encoding: 'utf-8' });
       expect(decryptOperator.status, decryptOperator.stderr).toBe(0);
-      expect(decryptOperator.stdout).toContain('MACF_AGENT_DEMO_FLEET_CODE_AGENT_APP_ID="app-code-agent"');
+      expect(decryptOperator.stdout).toContain("MACF_AGENT_DEMO_FLEET_CODE_AGENT_APP_ID='app-code-agent'");
 
       const decryptVm = spawnSync('age', ['-d', '-i', vmKey.keyPath, result.vault.path], { encoding: 'utf-8' });
       expect(decryptVm.status, decryptVm.stderr).toBe(0);
