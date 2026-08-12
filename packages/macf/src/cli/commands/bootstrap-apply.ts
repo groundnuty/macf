@@ -223,7 +223,18 @@ const REAL_AGENT_REPO_DEPS: AgentRepoDeps = {
   createRepo: realCreateRepo,
 };
 
-function resolveMutateDeps(manifestPath: string): MutateApplyDeps {
+/**
+ * Build the REAL (production) mutating deps. Exported ONLY so a test can assert
+ * the wiring by identity (macf#857 review): a security primitive can be
+ * defined, unit-tested, and never actually called — which is exactly what
+ * happened here (commit `2bbc4c3` added the explicit-allowlist commit but left
+ * this function wiring the control repo to the `-A` primitive, so the fix was
+ * inert in production while its own unit tests passed green). Unit-testing a
+ * primitive against itself cannot see that; only asserting through THIS seam
+ * can. Pure — it builds a plain object and performs no I/O until a field is
+ * invoked — so a test may call it directly.
+ */
+export function resolveMutateDeps(manifestPath: string): MutateApplyDeps {
   const repoInitDeps: RepoInitStepDeps = { cloneRepo: realCloneRepo, commitAndPush: realCommitAndPush };
   return {
     // `writeRecoveryArtifact` is deliberately absent here — `apply-fleet.ts`
