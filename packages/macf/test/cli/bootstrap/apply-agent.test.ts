@@ -139,7 +139,35 @@ describe('applyAgentIdentity — create path', () => {
       installId: '5555',
       credentials: CREDS,
     });
-    expect(opened).toEqual(['http://127.0.0.1:9/']);
+    // Gate 1 (the manifest form) then gate 2 (the install page, using the
+    // REAL exchanged slug) — both gates now open a browser tab (consent-gate
+    // UX fix), not just gate 1.
+    expect(opened).toEqual(['http://127.0.0.1:9/', 'https://github.com/apps/demo-fleet-code-agent/installations/new']);
+  });
+
+  it('prints BOTH gates\' URLs before opening the browser, and states what is being waited on', async () => {
+    const logs: string[] = [];
+    const deps = baseDeps({ log: (l) => logs.push(l) });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    const joined = logs.join('\n');
+    // Gate 1's URL is printed (as a fallback, in case the browser-open silently misfired).
+    expect(joined).toContain('http://127.0.0.1:9/');
+    expect(joined).toMatch(/waiting for you to click "Create GitHub App"/);
+    // Gate 2's URL (the REAL exchanged slug, not the derived handle) is also printed.
+    expect(joined).toContain('https://github.com/apps/demo-fleet-code-agent/installations/new');
+    expect(joined).toMatch(/waiting for you to click "Install"/);
+  });
+
+  it('gate 2 browser-open failure does NOT abort the agent — the App already exists on GitHub by then', async () => {
+    const deps = baseDeps({
+      openUrl: async (url) => {
+        if (url.includes('installations/new')) throw new Error('no DISPLAY / xdg-open missing');
+        // gate 1's open still succeeds
+      },
+      log: () => {},
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('created'); // NOT 'failed' — the printed URL is the fallback
   });
 
   it('passes the REAL exchanged slug (not the derived handle) as gate 2\'s expected identity', async () => {
@@ -321,6 +349,37 @@ describe('applyAgentIdentity — non-create outcomes short-circuit before any ga
     expect(outcome).toEqual({ role: 'code-agent', status: 'resumed-install', appId: '9001', installId: '6001' });
     expect(startManifestFlow).not.toHaveBeenCalled();
     expect(seenKeyPath).toBe('/resolved/key.pem'); // the resolver's own path, NOT a scratch file this module wrote
+  });
+
+  it('resume-install: prints gate 2\'s (predicted) URL, opens it, and flags it as a prediction — not a confirmed slug', async () => {
+    const opened: string[] = [];
+    const logs: string[] = [];
+    const deps = baseDeps({
+      openUrl: async (url) => { opened.push(url); },
+      log: (l) => logs.push(l),
+      resolveKeyPath: () => '/resolved/key.pem',
+      confirmAppInstallation: async () => ({ status: 'app-no-install' }),
+      waitForAppInstallation: async () => ({ appId: '9001', installId: '6001', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    // deriveAppHandle('demo-fleet', 'code-agent') — the ONLY slug available on
+    // this path (no vault-decrypt wired to confirm the real one).
+    expect(opened).toEqual(['https://github.com/apps/demo-fleet-code-agent/installations/new']);
+    const joined = logs.join('\n');
+    expect(joined).toMatch(/predicted from the fleet\/role naming convention/);
+    expect(joined).toMatch(/waiting for you to click "Install"/);
+  });
+
+  it('resume-install: a gate-2 browser-open failure does not abort — the App already exists on GitHub', async () => {
+    const deps = baseDeps({
+      openUrl: async () => { throw new Error('no DISPLAY'); },
+      log: () => {},
+      resolveKeyPath: () => '/resolved/key.pem',
+      confirmAppInstallation: async () => ({ status: 'app-no-install' }),
+      waitForAppInstallation: async () => ({ appId: '9001', installId: '6001', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    expect(outcome.status).toBe('resumed-install');
   });
 
   it('skipped-unverified never touches any gate', async () => {

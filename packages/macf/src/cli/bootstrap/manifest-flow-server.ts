@@ -178,7 +178,15 @@ export async function startManifestFlow(opts: StartManifestFlowOptions): Promise
         rejectCode(
           new Error(
             `Timed out after ${String(Math.round(timeoutMs / 1000))}s waiting for the GitHub App-manifest ` +
-              'callback. The operator must click "Create GitHub App" in the opened browser tab.',
+              'callback. The operator must click "Create GitHub App" in the opened browser tab. If the browser ' +
+              // Re-print the URL in the failure message itself — a live
+              // provisioning run showed `openUrl()` can silently misfire (the
+              // process exits 0 but no tab actually appears), and the timeout
+              // is exactly the moment the operator most needs a copy/
+              // pasteable fallback. `startUrl` (== `${base}/`, above) is
+              // captured by this closure at bind time, so it's always the
+              // real listener URL, not a placeholder.
+              `never opened (or you closed it), open this URL yourself: ${base}/`,
           ),
         );
       }, timeoutMs);
