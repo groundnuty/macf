@@ -1,8 +1,13 @@
 /**
  * Tests for `control-repo.ts` — the per-fleet control-plane repo
  * (DR-043 Amendment F, groundnuty/macf#857). Fully offline: `ControlRepoDeps`
- * is injected throughout; the only real fs touch is writing `fleet.yaml`
- * into a scratch dir (a plain local temp dir, not a real clone).
+ * is injected throughout; the only real fs touches are writing `fleet.yaml`
+ * / `.gitignore` into a scratch dir (a plain local temp dir, not a real
+ * clone) and `ensureControlRepoGitignore`'s own read/write. The REAL git I/O
+ * leaf (`realControlRepoCommitAndPush`) is exercised against a real local
+ * git repo in `control-repo-commit.test.ts` (mirrors `self-update.test.ts`'s
+ * bare-upstream harness) — kept in a separate file so this one stays
+ * offline-only per its existing convention.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -11,6 +16,9 @@ import { join } from 'node:path';
 import {
   classifyControlRepoOwnership,
   controlRepoFullName,
+  CONTROL_REPO_COMMIT_ALLOWLIST,
+  CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY,
+  ensureControlRepoGitignore,
   provisionControlRepo,
   type ControlRepoDeps,
   type ControlRepoMeta,
@@ -114,6 +122,68 @@ describe('classifyControlRepoOwnership (pure)', () => {
   });
 });
 
+describe('CONTROL_REPO_COMMIT_ALLOWLIST', () => {
+  it('is exactly fleet.yaml, fleet.lock, secrets/vault.age, .gitignore — and NEVER secrets/recovery', () => {
+    expect(CONTROL_REPO_COMMIT_ALLOWLIST).toEqual(['fleet.yaml', 'fleet.lock', 'secrets/vault.age', '.gitignore']);
+    expect(CONTROL_REPO_COMMIT_ALLOWLIST.some((p) => p.startsWith('secrets/recovery'))).toBe(false);
+  });
+});
+
+describe('ensureControlRepoGitignore', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function scratchDir(): string {
+    const d = mkdtempSync(join(tmpdir(), 'macf-control-gitignore-test-'));
+    dirs.push(d);
+    return d;
+  }
+
+  it('no existing .gitignore -> creates one containing the recovery-exclusion entry', () => {
+    const dir = scratchDir();
+    ensureControlRepoGitignore(dir);
+    const content = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    expect(content).toBe(`${CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY}\n`);
+  });
+
+  it('existing .gitignore WITHOUT the entry -> appends, preserves prior content', () => {
+    const dir = scratchDir();
+    writeFileSync(join(dir, '.gitignore'), 'node_modules/\n', 'utf-8');
+    ensureControlRepoGitignore(dir);
+    const content = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    expect(content).toBe(`node_modules/\n${CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY}\n`);
+  });
+
+  it('existing .gitignore missing a trailing newline -> inserts a separator before appending', () => {
+    const dir = scratchDir();
+    writeFileSync(join(dir, '.gitignore'), 'node_modules/', 'utf-8');
+    ensureControlRepoGitignore(dir);
+    const content = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    expect(content).toBe(`node_modules/\n${CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY}\n`);
+  });
+
+  it('existing .gitignore ALREADY containing the entry -> no-op, does not duplicate', () => {
+    const dir = scratchDir();
+    const already = `node_modules/\n${CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY}\n`;
+    writeFileSync(join(dir, '.gitignore'), already, 'utf-8');
+    ensureControlRepoGitignore(dir);
+    const content = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    expect(content).toBe(already);
+    expect(content.split(CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY)).toHaveLength(2); // exactly one occurrence
+  });
+
+  it('is idempotent across repeated calls', () => {
+    const dir = scratchDir();
+    ensureControlRepoGitignore(dir);
+    ensureControlRepoGitignore(dir);
+    ensureControlRepoGitignore(dir);
+    const content = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    expect(content).toBe(`${CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY}\n`);
+  });
+});
+
 describe('provisionControlRepo', () => {
   const dirs: string[] = [];
   afterEach(() => {
@@ -168,6 +238,9 @@ describe('provisionControlRepo', () => {
     expect(commitCalls).toHaveLength(1);
     expect(commitCalls[0]?.dir).toBe(dir);
     expect(commitCalls[0]?.message).toMatch(/fleet\.yaml/);
+    // Belt-and-suspenders .gitignore (#857 review) — written before the
+    // first commit so it's staged alongside fleet.yaml by the allowlist.
+    expect(readFileSync(join(dir, '.gitignore'), 'utf-8')).toBe(`${CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY}\n`);
   });
 
   it('absent + manifestPath not readable on disk (synthetic in-memory manifest, e.g. a test) -> falls back to a re-serialized fleet.yaml, still commits', async () => {
@@ -201,6 +274,10 @@ describe('provisionControlRepo', () => {
 
     const outcome = await provisionControlRepo(MANIFEST, manifestPath, deps, { makeScratchDir: () => dir });
     expect(outcome).toEqual({ status: 'reused', repo: 'groundnuty/demo-fleet-control', localDir: dir });
+    // Self-heal (#857 review) — a REUSED checkout also gets .gitignore
+    // patched, even though this function doesn't commit it itself (the
+    // final sync in apply-fleet.ts's syncControlRepo picks it up later).
+    expect(readFileSync(join(dir, '.gitignore'), 'utf-8')).toBe(`${CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY}\n`);
   });
 
   it('foreign (archived) -> ABORTS: no create, no clone, no commit', async () => {

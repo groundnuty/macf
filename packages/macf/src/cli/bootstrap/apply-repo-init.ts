@@ -107,7 +107,22 @@ export async function realCloneRepo(url: string, destDir: string): Promise<void>
   await execFileAsync('git', ['clone', '--depth', '1', url, destDir]);
 }
 
-/** Real `git add -A && git commit && git push` — a thin I/O leaf. Detects "nothing to commit" via `git diff --cached --quiet`'s exit code (0 = clean) rather than string-matching git's stdout. Never `--force` (mirrors `bootstrap-commit-vault.sh`'s non-destructive push discipline). */
+/**
+ * Real `git add -A && git commit && git push` — a thin I/O leaf. Detects
+ * "nothing to commit" via `git diff --cached --quiet`'s exit code (0 =
+ * clean) rather than string-matching git's stdout. Never `--force` (mirrors
+ * `bootstrap-commit-vault.sh`'s non-destructive push discipline).
+ *
+ * **Agent-repo repo-init ONLY — do not wire this into `ControlRepoDeps`.**
+ * `-A` is legitimate here because `repoInit()` is the sole writer of this
+ * scratch checkout (`.github/workflows/agent-router.yml` +
+ * `.github/agent-config.json` + labels), so staging everything it produced
+ * is correct by construction. The control repo has a DIFFERENT
+ * git-committed-content invariant (DR-043 Amendment F, "sealed-or-public
+ * ONLY" — `secrets/recovery/<role>.age` must never be swept in) and uses
+ * `control-repo.ts`'s explicit-allowlist `realControlRepoCommitAndPush`
+ * instead — see that module's doc + groundnuty/macf#857's review.
+ */
 export async function realCommitAndPush(dir: string, message: string): Promise<'pushed' | 'nothing-to-commit'> {
   await execFileAsync('git', ['add', '-A'], { cwd: dir });
   try {

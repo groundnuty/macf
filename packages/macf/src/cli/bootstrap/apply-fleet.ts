@@ -76,6 +76,19 @@
  *
  * ## Recovery-artifact lifecycle (§D5 "durable before gate 2," 2026-08-11 review)
  *
+ * **Phase-3 forward guard (#857 review, stated ahead of that increment):**
+ * DR-043 Amendment E's §D5 phasing table names phase 3 as the VAULT-READ
+ * increment — the first code path that will ever decrypt `vault.age` back to
+ * plaintext during an `apply`/reconcile run. That decrypt MUST land in
+ * memory or a scratch dir OUTSIDE the control-repo checkout this module
+ * builds (`controlDir`, below) — NEVER into the working tree. The
+ * control-repo commit path (`control-repo.ts`'s `realControlRepoCommitAndPush`)
+ * stages an explicit allowlist rather than `git add -A` specifically so a
+ * violation of this guard is merely inert (an untracked file `git status`
+ * would show) rather than an auto-committed, published master secret — see
+ * `control-repo.ts`'s "git-committed content invariant" doc section for the
+ * full invariant this binds.
+ *
  * This module OWNS the recovery-artifact path (`vault-write.ts`'s
  * `agentRecoveryArtifactPath`) at both ends of its lifecycle, so the write
  * side and the delete side can never drift apart:
@@ -96,7 +109,15 @@
  *     role's recovery artifact — its credential now has a durable home in
  *     the vault of record, so the write-only insurance copy is no longer
  *     needed. A FAILED compose deliberately leaves every recovery artifact
- *     from this run in place — see the recovery procedure below.
+ *     from this run in place — see the recovery procedure below. "In place"
+ *     means LOCAL DISK ONLY (corrected 2026-08-12, #857 review): the
+ *     control-repo commit path stages an explicit allowlist that
+ *     deliberately excludes `secrets/recovery/` (Amendment B — see
+ *     `control-repo.ts`'s "git-committed content invariant" doc section), so
+ *     a leftover artifact is never pushed to git. It survives only because
+ *     this module never deletes the control-repo checkout dir (`controlDir`,
+ *     below) — the operator recovers it from the persisted local checkout,
+ *     not from git history.
  *   - **Pre-flight (the part that makes "closed" true, not just "usually
  *     true"):** `writeRecoveryArtifact` itself rejects when
  *     `transport.age_recipients` is empty (nothing to encrypt to) —
@@ -486,13 +507,19 @@ export async function applyFleet(
 
   // Final sync (macf#857) — the LAST thing this run does: push whatever
   // changed in the control-repo checkout (fleet.lock from the incremental +
-  // batched writes above, vault.age if written, and any recovery artifacts
-  // STILL present because the batched compose failed). Deliberately
-  // UNSELECTIVE — `commitAndPush`'s real implementation is `git add -A`, so
-  // a leftover recovery artifact gets swept in too. That is a DELIBERATE
-  // choice, not an oversight: recovery artifacts are already age-encrypted
-  // (never plaintext), so committing them is a Amendment-B durability WIN
-  // (a second, git-hosted copy) rather than a leak — see the module doc.
+  // batched writes above, and vault.age if written). Deliberately SELECTIVE
+  // — the real `commitAndPush` wired in here (`control-repo.ts`'s
+  // `realControlRepoCommitAndPush`) stages an explicit allowlist, NEVER
+  // `git add -A` (corrected 2026-08-12, #857 review — the prior framing
+  // here, "UNSELECTIVE is a deliberate Amendment-B durability win," was
+  // WRONG: committing a recovery artifact to permanent git history enlarges
+  // an age-key compromise's blast radius to every HISTORICAL artifact, not
+  // just current state, for a redundant second copy of secrets already in
+  // `vault.age`). Any `secrets/recovery/<role>.age` STILL present because
+  // the batched compose failed is left on LOCAL DISK ONLY, excluded by both
+  // the allowlist and a committed `.gitignore` — see the module doc's
+  // "Recovery-artifact lifecycle" section + `control-repo.ts`'s
+  // "git-committed content invariant" section.
   const controlRepoSync = await syncControlRepo(controlDir, deps);
 
   return { controlRepo, controlRepoSync, lockPath, finalLock: currentLock, agents: records, vault, identityChanges };
