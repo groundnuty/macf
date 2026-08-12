@@ -22,6 +22,12 @@
  *      that class of partial failure recoverable, module doc §"the gate
  *      1→2 window" below).
  *
+ * Both gates share one UX sequence ({@link announceAndOpenGate}): print the
+ * URL, best-effort-open it in the operator's browser, then log what's being
+ * waited on. Gate 1's open is fatal-on-failure (nothing exists on GitHub yet
+ * to orphan); gate 2's is best-effort (a real App already exists by then —
+ * see that function's doc).
+ *
  * Every network/subprocess touch is behind {@link AgentApplyDeps} — this
  * module does zero real I/O when driven by injected fakes, and never throws
  * (every failure mode, including a thrown gate, resolves to an
@@ -288,6 +294,64 @@ function cleanupScratchPem(pemPath: string): void {
 }
 
 /**
+ * The shared consent-gate UX sequence for BOTH gates — print the URL, best-
+ * effort-open it, then log what the operator is being asked to click.
+ *
+ * **Printing the URL BEFORE `deps.openUrl` runs (not after) is the whole
+ * point of this helper.** A live fleet-provisioning run showed `openUrl()`
+ * can return successfully with NO browser tab ever actually appearing (the
+ * silent-fallback-hazards.md shape: the call "succeeds" but the operator-
+ * visible outcome it exists to produce doesn't happen) — recovering meant
+ * `lsof`-ing the operator's Mac to find the ephemeral port by hand. Printing
+ * first means the URL survives in the transcript regardless of whether the
+ * open worked, and regardless of whether the process later hangs on the
+ * gate itself (the operator can always scroll up).
+ *
+ * `opts.fatal` distinguishes the two gates' failure posture:
+ *   - **gate 1** (`fatal: true`) — nothing has been created on GitHub yet, so
+ *     an `openUrl` failure aborting this agent (existing behavior, unchanged
+ *     here) is safe: there's nothing to orphan.
+ *   - **gate 2** (`fatal: false`) — by the time this runs (either the
+ *     just-created App on the CREATE path, or a pre-existing one on the
+ *     resume-install path) a real GitHub App already exists. Aborting on a
+ *     mere browser-launch failure would manufacture exactly the orphaned-App
+ *     class this module's "gate 1→2 window" doc section exists to avoid —
+ *     the printed URL is the fallback, so a launch failure is logged and
+ *     the poll proceeds regardless.
+ *
+ * `opts.caveat`, when given, is appended to the URL line — used by the
+ * resume-install call site to flag that its URL is a DERIVED PREDICTION
+ * (`deriveAppHandle`), not a GitHub-confirmed slug (see
+ * `applyAgentIdentity`'s `guardExpected` comment) — never overclaiming
+ * accuracy the caller doesn't have, same discipline
+ * `waitForInstallTimeoutMessage` already applies to its own diagnostics.
+ */
+async function announceAndOpenGate(
+  deps: Pick<AgentApplyDeps, 'log' | 'openUrl'>,
+  role: string,
+  gateLabel: string,
+  url: string,
+  waitLabel: string,
+  opts: { readonly fatal: boolean; readonly caveat?: string },
+): Promise<void> {
+  const caveatSuffix = opts.caveat !== undefined ? ` ${opts.caveat}` : '';
+  deps.log(
+    `Role "${role}": ${gateLabel} — opening this URL in your browser now (if it didn't open, open it yourself): ` +
+      `${url}${caveatSuffix}`,
+  );
+  if (opts.fatal) {
+    await deps.openUrl(url);
+  } else {
+    try {
+      await deps.openUrl(url);
+    } catch (err) {
+      deps.log(`Role "${role}": could not automatically open a browser (${errMessage(err)}) — use the URL above.`);
+    }
+  }
+  deps.log(`Role "${role}": waiting for you to click "${waitLabel}" …`);
+}
+
+/**
  * Drive ONE agent through confirm-before-create → gate 1 → gate 2. See the
  * module doc for the full sequence + the gate-1→gate-2 window discussion.
  * NEVER throws — every failure path resolves to `status: 'failed'`.
@@ -333,6 +397,12 @@ export async function applyAgentIdentity(
     // the CREATE path below, which writes its own scratch PEM and owns its
     // cleanup).
     deps.log(`Role "${role}": App exists (app_id ${decision.appId}) with zero installs — resuming at consent gate 2.`);
+    await announceAndOpenGate(deps, role, 'consent gate 2 (App install page)', appInstallationUrl(handle), 'Install', {
+      fatal: false,
+      caveat:
+        '(URL predicted from the fleet/role naming convention — no GitHub-confirmed slug is available on this ' +
+        'path; if it 404s, find the App via Settings → Developer settings → GitHub Apps instead.)',
+    });
     return runGate2(role, decision.appId, decision.keyPath, guardExpected, deps);
   }
 
@@ -347,8 +417,9 @@ export async function applyAgentIdentity(
       timeoutMs: deps.gateTimeoutMs,
     });
     try {
-      await deps.openUrl(flow.startUrl);
-      deps.log(`Role "${role}": opened the App-manifest form in your browser — click "Create GitHub App" to continue.`);
+      await announceAndOpenGate(deps, role, 'consent gate 1 (App-manifest form)', flow.startUrl, 'Create GitHub App', {
+        fatal: true,
+      });
       const code = await flow.waitForCode();
       creds = await deps.exchangeManifestCode(code);
     } finally {
@@ -375,6 +446,9 @@ export async function applyAgentIdentity(
       'starting consent gate 2 (install).',
   );
   const gate2Expected: ExpectedIdentity = { appSlug: creds.slug, accountLogin: manifest.owner.account };
+  await announceAndOpenGate(deps, role, 'consent gate 2 (App install page)', appInstallationUrl(creds.slug), 'Install', {
+    fatal: false,
+  });
   const pemPath = writeScratchPem(role, creds.pem);
   try {
     const outcome = await runGate2(role, creds.appId, pemPath, gate2Expected, deps);

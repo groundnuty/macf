@@ -375,28 +375,49 @@ function sleep(ms: number): Promise<void> {
  * that's a broken credential or network path, not "the operator hasn't
  * clicked yet," and telling the operator to go click a button they may have
  * already clicked (successfully) sends them chasing the wrong problem.
+ *
+ * `appSlug`, when given, re-prints {@link appInstallationUrl} in the message
+ * itself — a live provisioning run showed the operator has no other way to
+ * recover the install URL once the terminal has scrolled past the initial
+ * "waiting for you to click Install" log line (see `apply-agent.ts`'s
+ * callers). Optional (not a required param) so every existing call site
+ * keeps compiling; omitted, the message is byte-identical to before. `appSlug`
+ * may be a DERIVED prediction rather than a GitHub-confirmed slug (the
+ * resume-install path has no vault-decrypted real slug to check against —
+ * see `apply-agent.ts::applyAgentIdentity`'s `guardExpected` comment), so the
+ * hint is phrased to not overclaim accuracy either way — same "don't name a
+ * cause you can't back up" discipline as the rest of this function.
  */
-export function waitForInstallTimeoutMessage(timeoutMs: number, last: IdentityConfirmation): string {
+export function waitForInstallTimeoutMessage(timeoutMs: number, last: IdentityConfirmation, appSlug?: string): string {
   const prefix = `Timed out after ${String(Math.round(timeoutMs / 1000))}s waiting for the GitHub App install to appear`;
+  const urlHint =
+    appSlug !== undefined
+      ? ` Install page: ${appInstallationUrl(appSlug)} (if that 404s, GitHub may have appended a disambiguating ` +
+        "suffix to the App's slug on creation — find the real one via Settings → Developer settings → GitHub " +
+        'Apps instead).'
+      : '';
   switch (last.status) {
     case 'unconfirmable':
       return (
         `${prefix} — GitHub was NEVER successfully queried on any poll (JWT mint failure / 401 / network / ` +
         'per-request timeout). This is not necessarily "the operator hasn\'t clicked Install" — check the ' +
-        'app-id↔key-path pairing and network reachability to api.github.com before re-running.'
+        'app-id↔key-path pairing and network reachability to api.github.com before re-running.' +
+        urlHint
       );
     case 'installed-unexpected-target': {
       const seen = last.installs.map((i) => `${i.appSlug || '(no slug)'}@${i.accountLogin || '(no account)'}`).join(', ');
       return (
         `${prefix} — the App IS installed, but not on the expected target (saw: ${seen || 'none'}). The ` +
         'operator may have picked the wrong account/org on the install page, or a stale install from a prior ' +
-        'attempt is shadowing the intended one. Resolve the mismatch before re-running.'
+        'attempt is shadowing the intended one. Resolve the mismatch before re-running.' +
+        urlHint
       );
     }
     case 'app-no-install':
       return (
         `${prefix} (GET /app/installations still returns zero). The operator must click "Install" (and select ` +
-        `repos) in the browser tab opened at the App's install page — re-run once the install is complete.`
+        `repos) in the browser tab opened at the App's install page — re-run once the install is complete.` +
+        urlHint
       );
     case 'confirmed':
       // Unreachable — the loop below returns as soon as `confirmed` is seen,
@@ -404,7 +425,7 @@ export function waitForInstallTimeoutMessage(timeoutMs: number, last: IdentityCo
       // switch stays exhaustive: if `IdentityConfirmation` grows a new
       // variant, TypeScript's "not all code paths return" flags this
       // function rather than silently falling through to a stale message.
-      return `${prefix} (unexpected: install was already confirmed — this indicates a bug in the poll loop, not the operator).`;
+      return `${prefix} (unexpected: install was already confirmed — this indicates a bug in the poll loop, not the operator).${urlHint}`;
   }
 }
 
@@ -461,7 +482,7 @@ export async function waitForAppInstallation(opts: WaitForAppInstallationOptions
 
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      throw new Error(waitForInstallTimeoutMessage(timeoutMs, last));
+      throw new Error(waitForInstallTimeoutMessage(timeoutMs, last, opts.expected.appSlug));
     }
     await sleep(Math.min(pollIntervalMs, remaining));
   }

@@ -375,6 +375,62 @@ describe('applyFleet', () => {
     expect(lock.agents.find((a) => a.role === 'science-agent')).toEqual({ role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2-resumed' });
   });
 
+  it('tags each agent\'s log lines with "[agent N/M]" progress context on a multi-agent fleet (consent-gate UX fix)', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+    const priorLock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [
+        { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+        { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+      ],
+    };
+    const agentDeps: AgentApplyDeps = {
+      startManifestFlow: async () => { throw new Error('must not be called — both roles have prior entries'); },
+      exchangeManifestCode: async () => { throw new Error('must not be called'); },
+      resolveKeyPath: () => '/fake.pem',
+      confirmAppInstallation: async (appId) =>
+        appId === 'app-code-agent'
+          ? { status: 'confirmed', install: { appId, installId: 'install-1', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' } }
+          : { status: 'app-no-install' },
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: 'install-2-resumed', appSlug: 'demo-fleet-science-agent', accountLogin: 'groundnuty' }),
+      openUrl: async () => {},
+      log: () => {},
+      writeRecoveryArtifact: async () => {},
+    };
+    const logs: string[] = [];
+    const deps: FleetApplyDeps = {
+      ...baseDeps(agentDeps, manifestPath),
+      trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
+      log: (l) => logs.push(l),
+    };
+    const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+    expect(result.agents.map((r) => r.identity.status)).toEqual(['reused', 'resumed-install']);
+
+    // "Role \"code-agent\": ..." lines come from BOTH this module's own
+    // per-agent log calls AND applyAgentIdentity's (via agentDeps.log,
+    // wired through the SAME wrapped log per macf's consent-gate UX fix).
+    const codeLines = logs.filter((l) => l.includes('"code-agent"'));
+    const sciLines = logs.filter((l) => l.includes('"science-agent"'));
+    expect(codeLines.length).toBeGreaterThan(0);
+    expect(sciLines.length).toBeGreaterThan(0);
+    expect(codeLines.every((l) => l.startsWith('[agent 1/2] '))).toBe(true);
+    expect(sciLines.every((l) => l.startsWith('[agent 2/2] '))).toBe(true);
+  });
+
+  it('does NOT tag log lines with progress context on a single-agent fleet (no ambiguity to resolve)', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT]);
+    const logs: string[] = [];
+    const deps: FleetApplyDeps = {
+      ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+      log: (l) => logs.push(l),
+    };
+    await applyFleet(manifest, manifestPath, null, deps);
+    expect(logs.some((l) => l.startsWith('[agent'))).toBe(false);
+  });
+
   it('skipped-unverified / drift: no lock write, no repo-init', async () => {
     const manifestPath = manifestPathIn();
     const manifest = manifestWith([CODE_AGENT]);

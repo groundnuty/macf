@@ -453,7 +453,6 @@ export async function applyFleet(
   const secretsDir = join(controlDir, 'secrets');
   const vaultOutPath = join(secretsDir, 'vault.age');
   const recipients = ageRecipients(manifest);
-  const agentDeps = buildAgentDepsWithRecovery(secretsDir, recipients, deps);
 
   // Self-heal (macf#857): a REUSE clone brings back whatever the PRIOR apply
   // already committed. Prefer that over the caller-supplied `priorLock`
@@ -481,14 +480,32 @@ export async function applyFleet(
     identityChanges.push(...composed.identityChanges);
   };
 
-  for (const agent of manifest.agents) {
+  const totalAgents = manifest.agents.length;
+  for (const [agentIndex, agent] of manifest.agents.entries()) {
+    // Operator-facing progress context (consent-gate UX fix) — a live
+    // provisioning run showed the operator has no way to tell WHICH agent a
+    // consent-gate wait belongs to once several are queued; every log line
+    // for this agent's turn (from THIS loop AND from `applyAgentIdentity`'s
+    // own gate messages, via `agentDeps.log` below) carries the same tag.
+    // Suppressed for a single-agent fleet — "(agent 1/1)" is noise when
+    // there's no ambiguity to resolve.
+    const scopedLog = (line: string): void => {
+      deps.log(totalAgents > 1 ? `[agent ${String(agentIndex + 1)}/${String(totalAgents)}] ${line}` : line);
+    };
+    // Built PER AGENT (not once for the whole run) specifically so its
+    // `log` carries this agent's own progress tag — see `scopedLog` above.
+    // `deps.buildAgentDeps` / the recovery-artifact writer are otherwise
+    // identical every call; rebuilding is cheap (no I/O until a field is
+    // invoked).
+    const agentDeps = buildAgentDepsWithRecovery(secretsDir, recipients, { ...deps, log: scopedLog });
+
     // macf#857 — ensure the agent's OWN repo exists BEFORE either consent
     // gate: gate 2's install page can't list a repo that doesn't exist yet
     // (the exact failure the first live provision, #854, hit on the
     // operator's first Install click).
     const repoOutcome = await ensureAgentRepo(agent, manifest, deps.agentRepoDeps);
     if (repoOutcome.status === 'failed') {
-      deps.log(`Role "${agent.role}": agent repo "${agent.repo}" FAILED — ${repoOutcome.reason}`);
+      scopedLog(`Role "${agent.role}": agent repo "${agent.repo}" FAILED — ${repoOutcome.reason}`);
       records.push({
         role: agent.role,
         identity: {
@@ -499,7 +516,7 @@ export async function applyFleet(
       });
       continue;
     }
-    deps.log(`Role "${agent.role}": agent repo "${agent.repo}" ${repoOutcome.status.toUpperCase()}.`);
+    scopedLog(`Role "${agent.role}": agent repo "${agent.repo}" ${repoOutcome.status.toUpperCase()}.`);
     confirmedRepos.push(agent.repo);
 
     const prior = currentLock?.agents.find((a) => a.role === agent.role);

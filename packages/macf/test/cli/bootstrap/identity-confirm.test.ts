@@ -158,6 +158,26 @@ describe('waitForInstallTimeoutMessage (macf#841 review — name the actual last
     ];
     expect(new Set(messages).size).toBe(3);
   });
+
+  it('omitting appSlug leaves the message byte-identical to before (no trailing URL hint)', () => {
+    const msg = waitForInstallTimeoutMessage(60_000, { status: 'app-no-install' });
+    expect(msg).not.toContain('Install page:');
+    expect(msg).not.toContain('installations/new');
+  });
+
+  it('appSlug given -> re-prints the install URL in the timeout message itself (app-no-install)', () => {
+    const msg = waitForInstallTimeoutMessage(60_000, { status: 'app-no-install' }, 'demo-fleet-code-agent');
+    expect(msg).toContain('https://github.com/apps/demo-fleet-code-agent/installations/new');
+  });
+
+  it('appSlug given -> also re-printed on the unconfirmable + installed-unexpected-target branches', () => {
+    expect(waitForInstallTimeoutMessage(60_000, { status: 'unconfirmable' }, 'demo-fleet-code-agent')).toContain(
+      'https://github.com/apps/demo-fleet-code-agent/installations/new',
+    );
+    expect(
+      waitForInstallTimeoutMessage(60_000, { status: 'installed-unexpected-target', installs: [] }, 'demo-fleet-code-agent'),
+    ).toContain('https://github.com/apps/demo-fleet-code-agent/installations/new');
+  });
 });
 
 describe('waitForAppInstallation (DR-043 §D2 consent gate 2 poll loop)', () => {
@@ -316,6 +336,28 @@ describe('waitForAppInstallation (DR-043 §D2 consent gate 2 poll loop)', () => 
       await vi.advanceTimersByTimeAsync(10_000);
       await assertion;
       await expect(resultPromise).rejects.toThrow(/must click "Install"/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('on timeout, re-prints the install URL when expected.appSlug is given (consent-gate UX fix)', async () => {
+    vi.useFakeTimers();
+    try {
+      const confirm = vi
+        .fn<(appId: string, keyPath: string) => Promise<IdentityConfirmation>>()
+        .mockResolvedValue({ status: 'app-no-install' });
+      const resultPromise = waitForAppInstallation({
+        appId: 'a',
+        keyPath: 'k',
+        expected: { appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' },
+        timeoutMs: 3_000,
+        pollIntervalMs: 1_000,
+        confirm,
+      });
+      const assertion = expect(resultPromise).rejects.toThrow(/https:\/\/github\.com\/apps\/demo-fleet-code-agent\/installations\/new/);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await assertion;
     } finally {
       vi.useRealTimers();
     }
