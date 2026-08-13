@@ -50,7 +50,11 @@ import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
 import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
-import { fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion, linkPluginCliDist } from '../plugin-fetcher.js';
+import {
+  fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion, linkPluginCliDist,
+  readPinnedChannelServerVersion,
+} from '../plugin-fetcher.js';
+import { resolvePluginUpdateTarget } from '../plugin-hook-resolver.js';
 import { writeClaudeSh, hasManagedHeader } from '../claude-sh.js';
 import { writeHostPrelude } from '../host-prelude.js';
 import {
@@ -429,6 +433,32 @@ export async function update(
     console.log(`Refreshed host-prelude.sh from current toolchain detection`);
   }
 
+  // Resolve the plugin dir claude.sh ACTUALLY MOUNTS (macf#889) — read here,
+  // after claude.sh has just been refreshed/preserved above, so a
+  // macf-managed launcher regenerated back to the canonical `.macf/plugin`
+  // resolves to what it genuinely mounts post-refresh, and a hand-authored
+  // launcher (e.g. a substrate workspace hand-wired onto the mcpServers-only
+  // `.macf/plugin-cs` variant, DR-005 Decision 6 / macf#533) resolves to
+  // ITS mount, never the conventional default. Every plugin-touching step
+  // below writes here, not to `workspacePluginDir(projectDir)` directly —
+  // macf#889's root cause was exactly that unconditional-default assumption.
+  const pluginTarget = resolvePluginUpdateTarget(projectDir);
+  if (!pluginTarget.determinable) {
+    console.error(
+      `Warning: cannot determine which plugin dir claude.sh mounts (${pluginTarget.detail}). ` +
+        `Refusing to guess — skipping ALL plugin-dir updates (repair-fetch, version pin, dist-link) ` +
+        `this run rather than risk silently updating a manifest nobody mounts (macf#889). Fix ` +
+        `claude.sh's --plugin-dir flag (see \`macf doctor\`), then re-run \`macf update\`.`,
+    );
+  } else if (pluginTarget.divergesFromDefault) {
+    const defaultDir = workspacePluginDir(projectDir);
+    const defaultState = existsSync(defaultDir) ? 'present on disk, unmounted' : 'absent';
+    console.warn(
+      `Warning: claude.sh mounts ${pluginTarget.dir} — that is what this run updates. NOT ` +
+        `touching the conventional default ${defaultDir} (${defaultState}) — see macf#889 / macf#641.`,
+    );
+  }
+
   // macf#342 PR-C deprecation surface: settings.local.json env keys
   // matching MACF_* / OTEL_* are now redundant with the per-concern
   // env files. Backward-compat preserved structurally (macf_settings_get
@@ -472,32 +502,35 @@ export async function update(
     console.warn(`Warning: CA key migration check failed: ${msg}`);
   }
 
-  // Repair-case plugin fetch: if .macf/plugin/ is absent or empty, fetch
-  // the currently-pinned version regardless of whether anything is being
-  // bumped. Runs before every short-circuit so workspaces init'd before
-  // #60 merged (empty .macf/plugin/) don't require `rm -rf + macf update`
-  // to self-heal. See #62. We skip this if config.versions is missing —
-  // legacy configs are handled by the error path below.
-  if (config.versions && pluginDirNeedsRepair(workspacePluginDir(projectDir))) {
+  // Repair-case plugin fetch: if the MOUNTED plugin dir is absent or empty,
+  // fetch the currently-pinned version regardless of whether anything is
+  // being bumped. Runs before every short-circuit so workspaces init'd
+  // before #60 merged (empty plugin dir) don't require `rm -rf + macf
+  // update` to self-heal. See #62. We skip this if config.versions is
+  // missing — legacy configs are handled by the error path below. Gated on
+  // `pluginTarget.dir` (macf#889): an undeterminable mount already warned
+  // loudly above — skip rather than guess at a default.
+  if (config.versions && pluginTarget.dir && pluginDirNeedsRepair(pluginTarget.dir)) {
     try {
-      fetchPluginToWorkspace(projectDir, config.versions.plugin);
-      pinChannelServerVersion(projectDir, config.versions.cli); // groundnuty/macf#421
-      console.log(`Repaired .macf/plugin/ with macf-agent@v${config.versions.plugin} (channel-server pinned @${config.versions.cli})`);
+      fetchPluginToWorkspace(projectDir, config.versions.plugin, { targetDir: pluginTarget.dir });
+      pinChannelServerVersion(projectDir, config.versions.cli, { targetDir: pluginTarget.dir }); // groundnuty/macf#421
+      console.log(`Repaired ${pluginTarget.dir} with macf-agent@v${config.versions.plugin} (channel-server pinned @${config.versions.cli})`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`Warning: plugin repair fetch failed: ${msg}`);
     }
   }
 
-  // Deliver the built plugin-CLI by linking .macf/plugin/dist → the running
+  // Deliver the built plugin-CLI by linking <mounted>/dist → the running
   // CLI's own dist/ (groundnuty/macf#676). The marketplace plugin ships no
   // dist/, so without this the /macf-* skills fail MODULE_NOT_FOUND. Run
-  // unconditionally whenever the plugin dir exists — after the repair fetch
-  // above, AND before every short-circuit return below — so an already-init'd
-  // consumer hit by the missing-dist bug self-heals on a single `macf update`
-  // even when no versions change. Idempotent (replaces a stale link).
-  if (existsSync(workspacePluginDir(projectDir)) && linkPluginCliDist(projectDir)) {
-    console.log(`Linked plugin-CLI dist into .macf/plugin/dist`);
+  // unconditionally whenever the MOUNTED plugin dir exists (macf#889) —
+  // after the repair fetch above, AND before every short-circuit return
+  // below — so an already-init'd consumer hit by the missing-dist bug
+  // self-heals on a single `macf update` even when no versions change.
+  // Idempotent (replaces a stale link).
+  if (pluginTarget.dir && existsSync(pluginTarget.dir) && linkPluginCliDist(projectDir, { targetDir: pluginTarget.dir })) {
+    console.log(`Linked plugin-CLI dist into ${pluginTarget.dir}/dist`);
   }
 
   if (!config.versions) {
@@ -595,33 +628,73 @@ export async function update(
   // Re-fetch the plugin when versions.plugin was bumped. The separate
   // repair-case fetch runs earlier (before short-circuits) for empty/
   // missing dirs; this block handles the pin-bump case specifically.
+  // Gated on `pluginTarget.dir` (macf#889) — an undeterminable mount was
+  // already warned loudly above; the config pin still advances (it's just a
+  // JSON write), but no on-disk manifest is touched, so say so explicitly
+  // rather than leaving the operator to notice the drift later.
   const pluginBumped = toBump.some(r => r.component === 'plugin');
   if (pluginBumped) {
-    try {
-      fetchPluginToWorkspace(projectDir, newVersions.plugin);
-      console.log(`Refreshed .macf/plugin/ to macf-agent@v${newVersions.plugin}`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`Warning: plugin re-fetch failed: ${msg}`);
+    if (pluginTarget.dir) {
+      try {
+        fetchPluginToWorkspace(projectDir, newVersions.plugin, { targetDir: pluginTarget.dir });
+        console.log(`Refreshed ${pluginTarget.dir} to macf-agent@v${newVersions.plugin}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`Warning: plugin re-fetch failed: ${msg}`);
+      }
+    } else {
+      console.error(
+        `Warning: versions.plugin advanced to v${newVersions.plugin} in macf-agent.json, but the ` +
+          `mounted plugin dir is undeterminable — NO on-disk manifest was updated to match (macf#889).`,
+      );
     }
   }
 
-  // Re-pin the channel-server version in the mounted mcpServers args
+  // Re-pin the channel-server version in the MOUNTED mcpServers args
   // (groundnuty/macf#421), regardless of WHICH component bumped: the cs version
   // tracks the CLI (monorepo lockstep), so a CLI bump WITHOUT a plugin bump
   // would otherwise leave the mounted plugin.json carrying a stale cs pin (the
   // plugin re-fetch above only fires on a plugin bump). A fresh re-fetch resets
   // the arg to the bare marketplace form, so this must run after it. Idempotent
-  // when the pin is already current.
-  if (existsSync(workspacePluginDir(projectDir))) {
-    if (pinChannelServerVersion(projectDir, newVersions.cli)) {
-      console.log(`Pinned channel-server @${newVersions.cli} in .macf/plugin/ mcpServers`);
+  // when the pin is already current. Gated on `pluginTarget.dir` (macf#889) —
+  // this is the exact write macf#889 reported missing for a workspace mounting
+  // `.macf/plugin-cs`: the config pin advanced but the MOUNTED manifest never did.
+  if (pluginTarget.dir && existsSync(pluginTarget.dir)) {
+    if (pinChannelServerVersion(projectDir, newVersions.cli, { targetDir: pluginTarget.dir })) {
+      console.log(`Pinned channel-server @${newVersions.cli} in ${pluginTarget.dir} mcpServers`);
     }
     // Re-deliver the plugin-CLI dist link (groundnuty/macf#676). Runs after the
-    // pin and the plugin re-fetch above (a re-fetch wipes .macf/plugin/, taking
-    // the link with it); idempotent so a no-bump update refreshes a stale link.
-    if (linkPluginCliDist(projectDir)) {
-      console.log(`Linked plugin-CLI dist into .macf/plugin/dist`);
+    // pin and the plugin re-fetch above (a re-fetch wipes the mounted dir,
+    // taking the link with it); idempotent so a no-bump update refreshes a
+    // stale link.
+    if (linkPluginCliDist(projectDir, { targetDir: pluginTarget.dir })) {
+      console.log(`Linked plugin-CLI dist into ${pluginTarget.dir}/dist`);
+    }
+
+    // Pattern A (macf#889) — the load-bearing half: don't just trust that the
+    // write above succeeded, READ BACK what the mounted manifest now pins and
+    // assert it matches the target. macf#889's entire failure shape was "the
+    // upgrade reports success (it DID write a real manifest) and the agent
+    // reports its true version (which nobody compares against the intent)" —
+    // this is that comparison. A mismatch here means the write above did not
+    // reach the thing actually being upgraded (wrong dir, permission fault,
+    // race, or a future regression of this same class) — surfaced LOUD rather
+    // than left for an operator to eyeball version columns side by side.
+    // Deliberately does NOT change the exit code: `upgrade()` (the fleet-roll
+    // driver verb, `vm-driver.ts`) shells this command via `execFileSync` with
+    // `stdio: 'inherit'`, which THROWS on a non-zero exit — turning this into
+    // a hard failure would abort the roll's upgrade→restart transaction
+    // mid-flight with the workspace already mutated (exactly the class
+    // macf#725's transactional discipline exists to prevent). The loud
+    // console.error is captured in the inherited output either way.
+    const actualPin = readPinnedChannelServerVersion(pluginTarget.dir);
+    if (actualPin !== null && actualPin !== newVersions.cli) {
+      console.error(
+        `FATAL: post-update verification failed — ${pluginTarget.dir} pins the channel-server at ` +
+          `@${actualPin}, not the target @${newVersions.cli}. The write above did not reach the ` +
+          `mounted manifest (macf#889's failure shape exactly). Inspect ` +
+          `${pluginTarget.dir}/.claude-plugin/plugin.json.`,
+      );
     }
   }
 

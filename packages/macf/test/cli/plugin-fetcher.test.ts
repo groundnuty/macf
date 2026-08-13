@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path';
 import { lstatSync, realpathSync } from 'node:fs';
 import {
   fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion,
-  linkPluginCliDist, resolveCliDistDir,
+  linkPluginCliDist, resolveCliDistDir, readPinnedChannelServerVersion,
 } from '../../src/cli/plugin-fetcher.js';
 
 /**
@@ -150,6 +150,15 @@ describe('fetchPluginToWorkspace', () => {
     expect(stats.isFile()).toBe(true);
     expect(stats.size).toBe('v0.1.0\n'.length);
   });
+
+  it('writes to targetDir when given, not the conventional default (macf#889)', () => {
+    const altDir = join(workspace, '.macf', 'plugin-cs');
+    fetchPluginToWorkspace(workspace, '0.1.0', { marketplaceUrl: bareUrl, targetDir: altDir });
+
+    expect(existsSync(join(altDir, 'manifest.txt'))).toBe(true);
+    // The conventional default was never written.
+    expect(existsSync(workspacePluginDir(workspace))).toBe(false);
+  });
 });
 
 describe('workspacePluginDir', () => {
@@ -229,6 +238,78 @@ describe('pinChannelServerVersion (groundnuty/macf#421)', () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ name: 'macf-agent' }, null, 2));
     expect(pinChannelServerVersion(ws, '0.2.34')).toBe(false);
+  });
+
+  // macf#889: `macf update` must write to the dir claude.sh ACTUALLY mounts,
+  // not always the conventional default — these prove the override reaches
+  // both the write (pinChannelServerVersion) and the read-back
+  // (readPinnedChannelServerVersion) sides identically.
+  it('targetDir option writes to an alternate dir (e.g. .macf/plugin-cs), not the default', () => {
+    const altDir = join(ws, '.macf', 'plugin-cs');
+    const manifestDir = join(altDir, '.claude-plugin');
+    mkdirSync(manifestDir, { recursive: true });
+    const path = join(manifestDir, 'plugin.json');
+    writeFileSync(
+      path,
+      JSON.stringify({ name: 'macf-agent', mcpServers: { 'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server'] } } }, null, 2),
+    );
+
+    expect(pinChannelServerVersion(ws, '0.2.47', { targetDir: altDir })).toBe(true);
+    expect(readArgs(path)).toEqual(['-y', '@groundnuty/macf-channel-server@0.2.47']);
+    // The conventional default was never written (doesn't even exist).
+    expect(existsSync(join(workspacePluginDir(ws), '.claude-plugin', 'plugin.json'))).toBe(false);
+  });
+});
+
+describe('readPinnedChannelServerVersion (macf#889 Pattern A)', () => {
+  let ws: string;
+
+  beforeEach(() => {
+    ws = mkdtempSync(join(tmpdir(), 'macf-read-pin-'));
+  });
+  afterEach(() => {
+    rmSync(ws, { recursive: true, force: true });
+  });
+
+  function writeManifest(pluginDir: string, mcpServers: unknown): void {
+    const dir = join(pluginDir, '.claude-plugin');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ name: 'macf-agent', mcpServers }, null, 2));
+  }
+
+  it('reads back a pinned version', () => {
+    const pluginDir = workspacePluginDir(ws);
+    writeManifest(pluginDir, {
+      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.47'] },
+    });
+    expect(readPinnedChannelServerVersion(pluginDir)).toBe('0.2.47');
+  });
+
+  it('agrees with what pinChannelServerVersion just wrote (write/read-back round-trip)', () => {
+    const pluginDir = join(ws, '.macf', 'plugin-cs');
+    writeManifest(pluginDir, {
+      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server'] },
+    });
+    pinChannelServerVersion(ws, '0.2.56', { targetDir: pluginDir });
+    expect(readPinnedChannelServerVersion(pluginDir)).toBe('0.2.56');
+  });
+
+  it('returns null (nothing to verify, not a mismatch) when the manifest is absent', () => {
+    expect(readPinnedChannelServerVersion(join(ws, 'does-not-exist'))).toBeNull();
+  });
+
+  it('returns null for the legacy non-npx form', () => {
+    const pluginDir = workspacePluginDir(ws);
+    writeManifest(pluginDir, {
+      'macf-agent': { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/dist/server.js'] },
+    });
+    expect(readPinnedChannelServerVersion(pluginDir)).toBeNull();
+  });
+
+  it('returns null when there is no mcpServers block', () => {
+    const pluginDir = workspacePluginDir(ws);
+    writeManifest(pluginDir, undefined);
+    expect(readPinnedChannelServerVersion(pluginDir)).toBeNull();
   });
 });
 
@@ -316,6 +397,18 @@ describe('linkPluginCliDist (groundnuty/macf#676)', () => {
     // No populatePluginDir() — .macf/plugin/ absent. Don't plant a dangling dir.
     expect(linkPluginCliDist(ws, { cliDistDir: fakeCliDist })).toBe(false);
     expect(existsSync(join(workspacePluginDir(ws), 'dist'))).toBe(false);
+  });
+
+  it('links into targetDir when given, not the conventional default (macf#889)', () => {
+    const altDir = join(ws, '.macf', 'plugin-cs');
+    mkdirSync(join(altDir, 'agents'), { recursive: true });
+    writeFileSync(join(altDir, 'manifest.txt'), 'fixture\n');
+
+    expect(linkPluginCliDist(ws, { cliDistDir: fakeCliDist, targetDir: altDir })).toBe(true);
+
+    expect(existsSync(join(altDir, 'dist', 'plugin', 'bin', 'macf-plugin-cli.js'))).toBe(true);
+    // The conventional default was never populated, so nothing to link into.
+    expect(existsSync(workspacePluginDir(ws))).toBe(false);
   });
 
   it('no-ops (returns false) when the override dist lacks the plugin-CLI — n/a; resolveCliDistDir guards real runs', () => {

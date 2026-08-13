@@ -18,6 +18,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { workspacePluginDir } from './plugin-fetcher.js';
 
 /**
  * One hook registration found while scanning a settings.json / hooks.json
@@ -161,5 +162,59 @@ export function resolvePluginDirFromClaudeSh(workspaceDir: string): PluginDirRes
     dir: resolve(substituted),
     determinable: true,
     detail: `resolved from claude.sh --plugin-dir "${raw}"`,
+  };
+}
+
+/**
+ * Where `macf update`'s plugin-touching steps (repair-fetch, version-pin
+ * write, dist-link) should actually WRITE (macf#889).
+ *
+ * `dir` is `null` exactly when `determinable` is `false` — callers MUST
+ * treat that as a loud refusal, never a silent fallback to the conventional
+ * `.macf/plugin` default. `divergesFromDefault` is `true` when the resolved
+ * mount is a DIFFERENT directory than that default (e.g. the mcpServers-only
+ * `.macf/plugin-cs` variant, DR-005 Decision 6 / macf#533) — callers should
+ * warn naming both paths so an operator/agent can see the unmounted default
+ * is being left alone, not silently drifting.
+ */
+export interface PluginUpdateTarget {
+  readonly dir: string | null;
+  readonly determinable: boolean;
+  readonly detail: string;
+  readonly divergesFromDefault: boolean;
+}
+
+/**
+ * Resolve the plugin dir `macf update` should write to — the one
+ * `claude.sh --plugin-dir` actually MOUNTS, never the conventional
+ * `.macf/plugin` default assumed unconditionally pre-macf#889.
+ *
+ * Root cause this closes: a substrate workspace hand-wired onto the
+ * mcpServers-only `.macf/plugin-cs` variant (DR-005 Decision 6 / macf#533)
+ * had its `.macf/plugin/` bumped by every `macf update` roll while the
+ * MOUNTED `plugin-cs` manifest silently rotted at whatever version it was
+ * last hand-pinned to — `devops-agent` ran a real, unmistakable 0.2.47
+ * process while `macf fleet status` (which reads the config pin, not the
+ * mounted manifest) reported the newer target.
+ *
+ * Reuses `resolvePluginDirFromClaudeSh` — the SAME resolver `macf doctor`
+ * (macf#756) and `canPluginDeliverMigratedHooks` (macf#743) already use, so
+ * every plugin-dir-aware call site agrees on which plugin is "the loaded
+ * one." Deliberately does NOT fall back to the default when undeterminable
+ * (claude.sh absent/unreadable, no `--plugin-dir`, multiple distinct
+ * `--plugin-dir` values) — an honest refusal beats a confident update of a
+ * manifest nobody mounts, which is exactly the failure macf#889 reports.
+ */
+export function resolvePluginUpdateTarget(workspaceDir: string): PluginUpdateTarget {
+  const resolution = resolvePluginDirFromClaudeSh(workspaceDir);
+  if (!resolution.determinable || resolution.dir === null) {
+    return { dir: null, determinable: false, detail: resolution.detail, divergesFromDefault: false };
+  }
+  const defaultDir = resolve(workspacePluginDir(workspaceDir));
+  return {
+    dir: resolution.dir,
+    determinable: true,
+    detail: resolution.detail,
+    divergesFromDefault: resolution.dir !== defaultDir,
   };
 }
