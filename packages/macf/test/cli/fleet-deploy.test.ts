@@ -1,0 +1,337 @@
+/**
+ * Tests for the `macf fleet deploy` CLI entry point (`commands/fleet-deploy.ts`).
+ * Fully offline: every dep is injected (`FleetDeployCommandDeps`), no `gh` /
+ * network / real `age` involved here — the real-`age` decrypt contract is
+ * covered by `bootstrap/fleet-deploy.test.ts`'s dedicated block; this file
+ * is about flag resolution (--vault default derivation, the --identity-key
+ * requirement), manifest/role loading, and rendering.
+ */
+import { describe, it, expect, afterEach } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runFleetDeploy, type FleetDeployCommandDeps } from '../../src/cli/commands/fleet-deploy.js';
+import type { InitOptions } from '../../src/cli/commands/init.js';
+
+const FLEET_YAML = `apiVersion: macf/v0
+kind: Fleet
+metadata:
+  name: demo-fleet
+owner:
+  account: groundnuty
+  type: user
+  registry: { type: profile, user: groundnuty }
+network:
+  advertise_host: example.ts.net
+transport:
+  age_recipients: []
+defaults:
+  role_template: groundnuty/agentic-repo-template
+  app_manifest: dr-019
+agents:
+  - role: code-agent
+    profile: code
+    repo: groundnuty/demo-code
+    deploy_path: /unused-in-tests
+trust:
+  ca: per-project
+  federated_cas: []
+`;
+
+const dirs: string[] = [];
+afterEach(() => {
+  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+});
+function scratchDir(prefix = 'macf-fleet-deploy-cmd-test-'): string {
+  const d = mkdtempSync(join(tmpdir(), prefix));
+  dirs.push(d);
+  return d;
+}
+
+/** Writes fleet.yaml (and, unless suppressed, a placeholder secrets/vault.age sibling) into a fresh scratch dir — mirrors the control-repo layout `--vault`'s default derivation relies on. */
+function writeManifest(opts: { withVaultSibling?: boolean } = {}): { manifestPath: string; dir: string } {
+  const dir = scratchDir();
+  const manifestPath = join(dir, 'fleet.yaml');
+  writeFileSync(manifestPath, FLEET_YAML);
+  if (opts.withVaultSibling !== false) {
+    mkdirSync(join(dir, 'secrets'), { recursive: true });
+    writeFileSync(join(dir, 'secrets', 'vault.age'), 'not-real-ciphertext-just-a-presence-marker');
+  }
+  return { manifestPath, dir };
+}
+
+/**
+ * `keyPathFor` here NEVER falls through to the production default
+ * (`defaultAgentKeyPath`, which resolves under the REAL operator's
+ * `~/.macf/keys/`) — every test in this file MUST get a scratch-dir key
+ * path from `depsFor`, never the bare production default. (A prior version
+ * of this suite omitted this override and wrote a synthetic key straight
+ * into the live `~/.macf/keys/code-agent.pem` on the host — caught during
+ * this PR's own verification, fixed here structurally so it can't recur.)
+ */
+function depsFor(overrides: Partial<FleetDeployCommandDeps> = {}): FleetDeployCommandDeps {
+  return {
+    readVault: async () => {
+      throw new Error('must not be called — this test does not exercise vault decrypt');
+    },
+    cloneRepo: async () => {
+      throw new Error('must not be called');
+    },
+    initAgent: async () => {
+      throw new Error('must not be called');
+    },
+    checkCaPresent: () => true,
+    keyPathFor: () => join(scratchDir(), 'scratch-agent-key.pem'),
+    ...overrides,
+  };
+}
+
+function captureConsole(): { logs: string[]; errs: string[]; restore: () => void } {
+  const logs: string[] = [];
+  const errs: string[] = [];
+  const origLog = console.log;
+  const origErr = console.error;
+  const origStderrWrite = process.stderr.write.bind(process.stderr);
+  console.log = (...a: unknown[]) => logs.push(a.map(String).join(' '));
+  console.error = (...a: unknown[]) => errs.push(a.map(String).join(' '));
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    errs.push(typeof chunk === 'string' ? chunk : chunk.toString());
+    return true;
+  }) as typeof process.stderr.write;
+  return {
+    logs,
+    errs,
+    restore: () => {
+      console.log = origLog;
+      console.error = origErr;
+      process.stderr.write = origStderrWrite;
+    },
+  };
+}
+
+describe('runFleetDeploy — flag resolution', () => {
+  it('--identity-key omitted, --vault omitted (neither given) -> vault_flags_incomplete, exit 1', async () => {
+    const { manifestPath } = writeManifest();
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy({ file: manifestPath, agent: 'code-agent', json: true }, depsFor());
+      expect(code).toBe(1);
+      const parsed = JSON.parse(cap.logs.join('')) as { error: { code: string } };
+      expect(parsed.error.code).toBe('vault_flags_incomplete');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('--vault given WITHOUT --identity-key -> vault_flags_incomplete, exit 1 (half-given, direction 1)', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', vault: join(dir, 'secrets', 'vault.age'), json: true },
+        depsFor(),
+      );
+      expect(code).toBe(1);
+      const parsed = JSON.parse(cap.logs.join('')) as { error: { code: string } };
+      expect(parsed.error.code).toBe('vault_flags_incomplete');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('--identity-key given WITHOUT --vault -> NOT incomplete; --vault defaults to <fleet.yaml dir>/secrets/vault.age (half-given, direction 2 does NOT refuse — vault has a default)', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const cap = captureConsole();
+    let seenVaultPath: string | undefined;
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), json: true },
+        depsFor({
+          readVault: async (o) => {
+            seenVaultPath = o.vaultPath;
+            return {};
+          },
+        }),
+      );
+      // Reaches the vault read (proves the XOR guard did NOT fire) and then
+      // fails downstream on the empty-vault content — a DIFFERENT, later
+      // refusal, not vault_flags_incomplete.
+      expect(code).toBe(1);
+      expect(seenVaultPath).toBe(join(dir, 'secrets', 'vault.age'));
+      const parsed = JSON.parse(cap.logs.join('')) as { outcome: { status: string; reason: string } };
+      expect(parsed.outcome.status).toBe('failed');
+      expect(parsed.outcome.reason).not.toContain('vault_flags_incomplete');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('an explicit --vault overrides the default derivation', async () => {
+    const { manifestPath, dir } = writeManifest({ withVaultSibling: false });
+    const explicitVault = join(dir, 'elsewhere-vault.age');
+    writeFileSync(explicitVault, 'marker');
+    const cap = captureConsole();
+    let seenVaultPath: string | undefined;
+    try {
+      await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), vault: explicitVault, json: true },
+        depsFor({ readVault: async (o) => { seenVaultPath = o.vaultPath; return {}; } }),
+      );
+      expect(seenVaultPath).toBe(explicitVault);
+    } finally {
+      cap.restore();
+    }
+  });
+});
+
+describe('runFleetDeploy — manifest / role loading', () => {
+  it('manifest not found -> exit 1, never reaches readVault', async () => {
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: '/definitely/not/a/real/fleet.yaml', agent: 'code-agent', identityKey: '/x' },
+        depsFor(),
+      );
+      expect(code).toBe(1);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('manifest invalid -> exit 1', async () => {
+    const dir = scratchDir();
+    const manifestPath = join(dir, 'fleet.yaml');
+    writeFileSync(manifestPath, 'not: [valid, fleet, yaml');
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy({ file: manifestPath, agent: 'code-agent', identityKey: '/x' }, depsFor());
+      expect(code).toBe(1);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('unknown --agent role -> exit 1, unknown_agent_role, names the known roles, never reaches readVault', async () => {
+    const { manifestPath } = writeManifest();
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'not-a-real-role', identityKey: '/x', json: true },
+        depsFor(),
+      );
+      expect(code).toBe(1);
+      const parsed = JSON.parse(cap.logs.join('')) as { error: { code: string; message: string } };
+      expect(parsed.error.code).toBe('unknown_agent_role');
+      expect(parsed.error.message).toContain('code-agent');
+    } finally {
+      cap.restore();
+    }
+  });
+});
+
+describe('runFleetDeploy — happy path + rendering', () => {
+  it('deploys, exit 0, prints the next-step launch line (never implies the agent is already running)', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const keyPath = join(scratchDir(), 'code-agent.pem');
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          initAgent: async (d, o) => {
+            initCalls.push({ dir: d, opts: o });
+          },
+          keyPathFor: () => keyPath,
+        }),
+      );
+      expect(code).toBe(0);
+      expect(initCalls).toHaveLength(1);
+      expect(initCalls[0]?.opts.appId).toBe('111');
+      expect(initCalls[0]?.opts.installId).toBe('222');
+      expect(initCalls[0]?.opts.keyPath).toBe(keyPath);
+      const out = cap.logs.join('\n');
+      expect(out).toContain('deployed');
+      expect(out).toContain('NOT running yet');
+      expect(out).toContain('./claude.sh');
+      // Never a raw secret in operator-facing output.
+      expect(out).not.toContain('SYNTH-PEM');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('when no local CA is present, the next-step block names the missing prerequisite BEFORE the launch line', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          initAgent: async () => {},
+          checkCaPresent: () => false,
+        }),
+      );
+      expect(code).toBe(0);
+      const out = cap.logs.join('\n');
+      const caWarnIdx = out.indexOf('No per-project CA');
+      const nextStepIdx = out.indexOf('Next step:');
+      expect(caWarnIdx).toBeGreaterThan(-1);
+      expect(nextStepIdx).toBeGreaterThan(caWarnIdx);
+      expect(out).toContain('macf certs rotate');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('--json render never carries the secret value', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const cap = captureConsole();
+    try {
+      await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir, json: true },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-SECRET-PEM', 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          initAgent: async () => {},
+        }),
+      );
+      const out = cap.logs.join('\n');
+      expect(out).not.toContain('SYNTH-SECRET-PEM');
+      expect(out).not.toContain(Buffer.from('SYNTH-SECRET-PEM', 'utf-8').toString('base64'));
+      const parsed = JSON.parse(out) as { outcome: { status: string; key_fingerprint?: string } };
+      expect(parsed.outcome.status).toBe('deployed');
+      expect(parsed.outcome.key_fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+    } finally {
+      cap.restore();
+    }
+  });
+});

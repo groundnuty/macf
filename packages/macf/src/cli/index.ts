@@ -18,6 +18,7 @@ import { runFleetResumeCommand } from './commands/fleet-resume.js';
 import { runFleetUpgrade } from './commands/fleet-upgrade.js';
 import { runFleetDeactivate, runFleetArchive } from './commands/fleet-teardown.js';
 import { runFleetDeleteApps, runFleetDestroy, DESTROY_ENV_ACK_VAR } from './commands/fleet-teardown-destructive.js';
+import { runFleetDeploy } from './commands/fleet-deploy.js';
 import { runBootstrapPlan } from './commands/bootstrap.js';
 import { runBootstrapApply } from './commands/bootstrap-apply.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
@@ -570,6 +571,44 @@ fleet
       destroyRepositories: opts.destroyRepositories,
       shredAgeKey: opts.shredAgeKey,
       ageIdentity: opts.ageIdentity,
+      json: opts.json,
+    });
+    process.exitCode = code;
+  });
+
+fleet
+  .command('deploy')
+  .description(
+    'Materialize ONE agent\'s workspace from an already-provisioned fleet\'s vault — the gap between ' +
+    '`bootstrap apply` ("provisioned") and a running agent ("running"). Decrypts secrets/vault.age (operator-' +
+    'privileged — the same custody boundary as `bootstrap plan --vault`), extracts this role\'s app_id/' +
+    'install_id/private-key, clones its repo into --dir (or the manifest\'s deploy_path) if not already present, ' +
+    'atomically writes the App key at 0600 to the conventional ~/.macf/keys/<role>.pem (never overwritten once ' +
+    'present), then delegates the rest to the real `macf init` — never reimplemented. Idempotent: an already-' +
+    'materialized workspace or key is left untouched, reported as skipped. Never touches the vault\'s write side ' +
+    '(Amendment D: read-only-decryptable) and never deploys anything not already recorded in the vault (Amendment ' +
+    'A: refuses rather than guesses on a missing/partial credential).',
+  )
+  .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
+  .requiredOption('--agent <role>', 'The agent role to deploy (must match one of manifest.agents[].role)')
+  .option(
+    '--identity-key <path>',
+    'age identity (private key) file to decrypt the vault with. Required — no default exists for an age identity path.',
+  )
+  .option(
+    '--vault <path>',
+    'Path to the fleet\'s secrets/vault.age. Optional — defaults to <fleet.yaml dir>/secrets/vault.age (the ' +
+      'control-repo layout).',
+  )
+  .option('--dir <path>', 'Workspace directory to materialize (defaults to the agent\'s deploy_path in fleet.yaml)')
+  .option('--json', 'Emit the structured result as JSON', false)
+  .action(async (opts) => {
+    const code = await runFleetDeploy({
+      file: opts.file,
+      agent: opts.agent,
+      identityKey: opts.identityKey,
+      vault: opts.vault,
+      dir: opts.dir,
       json: opts.json,
     });
     process.exitCode = code;
