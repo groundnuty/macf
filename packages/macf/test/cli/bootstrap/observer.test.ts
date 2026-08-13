@@ -14,12 +14,19 @@
  * `apply-ca.ts`'s `resolveCaCert`. Tested below with both deps faked; the one
  * real `age` I/O leaf it calls through (`vault-read.ts::readVault` /
  * `ageDecryptFile`) is exercised for real in `vault-read.test.ts` instead.
+ *
+ * `extractActionsPin` (DR-043 §D6, `versions.actions` observed-state source)
+ * is the OTHER exception: it was deliberately split out of
+ * `readCallerActionsPin`'s `gh` shell-out as a pure regex-extraction
+ * function specifically so it stays independently testable without
+ * mocking `node:child_process` — see its own doc comment. Tested below,
+ * same "pure(-ish), no-network" bar as `readFleetLock`.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readFleetLock, vaultAwareObserver } from '../../../src/cli/bootstrap/observer.js';
+import { extractActionsPin, readFleetLock, vaultAwareObserver } from '../../../src/cli/bootstrap/observer.js';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { ObservedState } from '../../../src/cli/bootstrap/plan.js';
 import { VaultError } from '../../../src/cli/bootstrap/vault-write.js';
@@ -203,5 +210,35 @@ describe('vaultAwareObserver — DR-043 Amendment D phase 3 (injected deps, no r
       { observe: async () => ({ ...BASE_OBSERVED, agents: {} }), readVault: async () => ({}) },
     );
     expect(Object.keys(observed.agents)).toEqual([]);
+  });
+});
+
+describe('extractActionsPin (DR-043 §D6 — versions.actions observed-state source)', () => {
+  it('extracts the pin from a real agent-router.yml `uses:` line', () => {
+    const content = [
+      'name: Agent Router',
+      'on:',
+      '  issues:',
+      '    types: [opened]',
+      'jobs:',
+      '  route:',
+      '    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.4.1',
+      '    secrets: inherit',
+    ].join('\n');
+    expect(extractActionsPin(content)).toBe('v3.4.1');
+  });
+
+  it('extracts a legacy v1.x pin (still a valid — if deferred — router)', () => {
+    const content = '    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v1.3.3\n';
+    expect(extractActionsPin(content)).toBe('v1.3.3');
+  });
+
+  it('returns undefined when the workflow has no macf-actions `uses:` line', () => {
+    const content = 'name: Some Other Workflow\non:\n  push:\njobs:\n  build:\n    runs-on: ubuntu-latest\n';
+    expect(extractActionsPin(content)).toBeUndefined();
+  });
+
+  it('returns undefined for empty content', () => {
+    expect(extractActionsPin('')).toBeUndefined();
   });
 });
