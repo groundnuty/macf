@@ -196,6 +196,7 @@ describe('executeDeleteApps', () => {
         deletedNames.push(name);
         return 'deleted';
       },
+      checkMeta: async () => ({ presence: 'present', archived: false }),
       archiveRepo: async (repo) => {
         archivedRepos.push(repo);
       },
@@ -213,6 +214,7 @@ describe('executeDeleteApps', () => {
     // just a runtime one. This test documents that structural guarantee.
     const result = await executeDeleteApps(MANIFEST, plan, () => {}, {
       deleteRegistryVariable: async () => 'deleted',
+      checkMeta: async () => ({ presence: 'present', archived: false }),
       archiveRepo: async () => {},
     });
     expect(result.repoOutcomes.every((o) => o.status === 'archived')).toBe(true);
@@ -301,7 +303,7 @@ describe('executeDestroyRepos', () => {
   it('deletes every repo in order, all succeeding', async () => {
     const repos = ['groundnuty/macf-experiment-control', 'groundnuty/macf-experiment-code'];
     const deleted: string[] = [];
-    const outcomes = await executeDestroyRepos(repos, { deleteRepo: async (r) => { deleted.push(r); } });
+    const outcomes = await executeDestroyRepos(repos, { deleteRepo: async (r) => { deleted.push(r); return 'deleted'; } });
     expect(outcomes.every((o) => o.status === 'deleted')).toBe(true);
     expect(deleted).toEqual(repos);
   });
@@ -311,6 +313,7 @@ describe('executeDestroyRepos', () => {
     const outcomes = await executeDestroyRepos(repos, {
       deleteRepo: async (r) => {
         if (r === repos[1]) throw new Error('branch protection blocks delete');
+        return 'deleted';
       },
     });
     expect(outcomes.filter((o) => o.status === 'deleted')).toHaveLength(2);
@@ -326,10 +329,27 @@ describe('executeDestroyRepos', () => {
     for (const f of foreignRepos) expect(plan.repoTargets).not.toContain(f);
 
     const touched: string[] = [];
-    await executeDestroyRepos(plan.repoTargets, { deleteRepo: async (r) => { touched.push(r); } });
+    await executeDestroyRepos(plan.repoTargets, { deleteRepo: async (r) => { touched.push(r); return 'deleted'; } });
     for (const f of foreignRepos) expect(touched).not.toContain(f);
     expect(touched).toHaveLength(3);
     expect(touched.sort()).toEqual([...plan.repoTargets].sort());
+  });
+
+  // --- groundnuty/macf#917 — destroy's idempotency ruling: DELETE-404 is benign success ---
+
+  it('already-absent (404 on delete) is reported faithfully, NOT as a failure — destroy is idempotent-on-rerun, same shape as deactivate', async () => {
+    const repos = ['groundnuty/macf-experiment-control', 'groundnuty/macf-experiment-code'];
+    const outcomes = await executeDestroyRepos(repos, { deleteRepo: async () => 'already-absent' });
+    expect(outcomes.every((o) => o.status === 'already-absent')).toBe(true);
+  });
+
+  it('the idempotency ruling is scoped to a PARTIAL-failure re-run — once the control repo is genuinely gone (a fully successful destroy), the OWNERSHIP GATE refuses the next run with "nothing to tear down," this function is never reached at all', async () => {
+    // checkMeta now reads 'absent' for the control repo — the honest state
+    // AFTER a fully successful destroy, not a partial one.
+    const plan = await buildDestroyPlan(MANIFEST, ownDeps({ checkMeta: async () => ({ presence: 'absent' }) }));
+    expect(plan.gate.allowed).toBe(false);
+    expect(plan.gate.reason).toMatch(/nothing to tear down/);
+    expect(plan.repoTargets).toEqual([]); // no targets derived past a refused gate — executeDestroyRepos is never called
   });
 });
 
@@ -347,6 +367,7 @@ describe('executeDestroy', () => {
       },
       deleteRepo: async (repo) => {
         deletedRepos.push(repo);
+        return 'deleted';
       },
     });
     expect(deletedVars.sort()).toEqual(plan.registryTargets.map((t) => t.name).sort());

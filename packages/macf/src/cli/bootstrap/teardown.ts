@@ -83,7 +83,8 @@
  *   order-independent step of the ladder.
  * - **Report what could not be done, never exit green** — every outcome
  *   (`deleted` / `already-absent` / `failed` for variables; `archived` /
- *   `failed` for repos) is returned, never swallowed; the CLI layer's exit
+ *   `already-archived` / `failed` for repos — groundnuty/macf#917) is
+ *   returned, never swallowed; the CLI layer's exit
  *   code is non-zero on ANY `failed` entry.
  */
 import { toVariableSegment } from '@groundnuty/macf-core';
@@ -298,15 +299,51 @@ export async function executeDeactivate(
 
 export interface RepoArchiveOutcome {
   readonly repo: string;
-  readonly status: 'archived' | 'failed';
+  readonly status: 'archived' | 'already-archived' | 'failed';
   readonly reason?: string;
 }
 
 export interface TeardownRepoArchiveDeps {
+  /**
+   * Reuses `TeardownControlRepoDeps.checkMeta`'s EXACT shape (same
+   * `checkControlRepoMeta` primitive in production) — the state-read this
+   * rung needs is identical to the one `resolveControlRepoOwnership` already
+   * performs for the control repo, just applied per-repo here. Naming the
+   * field `checkMeta` (not a second, differently-named field) means a single
+   * deps bag that already satisfies `TeardownControlRepoDeps` (every
+   * production caller's deps object does) satisfies this interface too, with
+   * nothing new to wire.
+   */
+  readonly checkMeta: (repo: string) => Promise<ControlRepoMeta>;
   readonly archiveRepo: (repo: string) => Promise<void>;
 }
 
-/** Archive every target repo. NEVER throws — same per-target failure isolation as {@link executeDeactivate}. */
+/**
+ * Archive every target repo — reading each repo's CURRENT `archived` state
+ * FIRST and skipping the PATCH entirely when it's already `true`
+ * (groundnuty/macf#917). GitHub 403s a `PATCH archived=true` against an
+ * ALREADY-archived repo ("Repository was archived so is read-only") because
+ * an archived repo is read-only for every write, including a redundant
+ * re-set of the SAME value — but 403 is an overloaded status (a genuine
+ * permission failure produces the identical code), so classifying it from
+ * the error response would be guessing at cause, not asserting it. The
+ * `.archived` read is the actual result-invariant (Pattern A,
+ * `silent-fallback-hazards.md`) — `deps.archiveRepo` (the PATCH) is
+ * therefore NEVER called once the read confirms `archived === true`.
+ *
+ * This is what makes Amendment G's cumulative ladder
+ * (`deactivate` → `archive` → `delete-apps`) actually walk end to end in one
+ * sitting: `delete-apps` re-runs THIS SAME function over the SAME repo
+ * targets `archive` just processed (`teardown-destructive.ts`'s
+ * `executeDeleteApps`), so without this read every real ladder walk would
+ * 403 on its second rung — which is exactly the failure observed on a live
+ * teardown that motivated this fix. A `presence !== 'present'` or
+ * `archived !== true` read (including `'unknown'`, e.g. a transient network
+ * hiccup on the check itself) falls through to attempting the PATCH as
+ * before — this function never REFUSES on an inconclusive read, it only
+ * SKIPS on a confirmed one. NEVER throws — same per-target failure isolation
+ * as {@link executeDeactivate}.
+ */
 export async function executeArchiveRepos(
   repos: readonly string[],
   deps: TeardownRepoArchiveDeps,
@@ -314,6 +351,11 @@ export async function executeArchiveRepos(
   const out: RepoArchiveOutcome[] = [];
   for (const repo of repos) {
     try {
+      const meta = await deps.checkMeta(repo);
+      if (meta.presence === 'present' && meta.archived === true) {
+        out.push({ repo, status: 'already-archived' });
+        continue;
+      }
       await deps.archiveRepo(repo);
       out.push({ repo, status: 'archived' });
     } catch (err) {

@@ -131,7 +131,7 @@ agents:
 });
 
 describe('reportAppIdentityRemoval', () => {
-  it('NEVER returns a status other than manual-action-required, for every target', async () => {
+  it('no checkAppPresence wired -> NEVER returns a status other than manual-action-required, for every target (backward-compatible default)', async () => {
     const targets = computeAppIdentityTargets(ORG_MANIFEST);
     const logs: string[] = [];
     const outcomes = await reportAppIdentityRemoval(targets, (l) => logs.push(l), {});
@@ -192,5 +192,67 @@ agents:
     const outcomes = await reportAppIdentityRemoval(targets, (l) => logs.push(l));
     expect(outcomes[0]?.appId).toBeUndefined();
     expect(logs.join('\n')).toMatch(/no fleet\.lock entry/);
+  });
+
+  // --- groundnuty/macf#917 — App already gone: report already-absent, never instruct a browser deletion of nothing ---
+
+  describe('checkAppPresence wired', () => {
+    it('presence "absent" -> status already-absent, the manual-deletion line is NEVER logged, openUrl is NEVER called', async () => {
+      const targets = computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1);
+      const logs: string[] = [];
+      let openCalled = false;
+      const outcomes = await reportAppIdentityRemoval(targets, (l) => logs.push(l), {
+        checkAppPresence: async () => 'absent',
+        openUrl: async () => {
+          openCalled = true;
+        },
+      });
+      expect(outcomes).toHaveLength(1);
+      expect(outcomes[0]?.status).toBe('already-absent');
+      expect(openCalled).toBe(false);
+      expect(logs.join('\n')).toMatch(/already absent/);
+      expect(logs.join('\n')).not.toMatch(/MANUAL ACTION REQUIRED|Delete at:/);
+    });
+
+    it('presence "absent" -> reason names the check as a PREDICTED-slug read, not a confirmed-deletion claim', async () => {
+      const targets = computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1);
+      const outcomes = await reportAppIdentityRemoval(targets, () => {}, { checkAppPresence: async () => 'absent' });
+      expect(outcomes[0]?.reason).toMatch(/PREDICTION/);
+      expect(outcomes[0]?.reason).toMatch(/404/);
+    });
+
+    it('presence "present" -> stays manual-action-required (an existing App is NOT already-absent)', async () => {
+      const targets = computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1);
+      const outcomes = await reportAppIdentityRemoval(targets, () => {}, { checkAppPresence: async () => 'present' });
+      expect(outcomes[0]?.status).toBe('manual-action-required');
+    });
+
+    it('presence "unknown" (network hiccup on the check) -> stays manual-action-required — never upgrades an inconclusive read to already-absent', async () => {
+      const targets = computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1);
+      const outcomes = await reportAppIdentityRemoval(targets, () => {}, { checkAppPresence: async () => 'unknown' });
+      expect(outcomes[0]?.status).toBe('manual-action-required');
+    });
+
+    it('appId + settingsUrl are still carried through on an already-absent outcome', async () => {
+      const targets = enrichAppIdentityTargetsWithLock(computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1), `schema_version: 1
+fleet: macf-experiment
+agents:
+  - role: code-agent
+    app_id: "555111"
+    install_id: "999222"
+`);
+      const outcomes = await reportAppIdentityRemoval(targets, () => {}, { checkAppPresence: async () => 'absent' });
+      expect(outcomes[0]?.appId).toBe('555111');
+      expect(outcomes[0]?.settingsUrl).toBe(targets[0]?.settingsUrl);
+    });
+
+    it('mixed fleet: one role already-absent, one still present -> each target resolved independently', async () => {
+      const targets = computeAppIdentityTargets(ORG_MANIFEST); // code-agent, science-agent
+      const outcomes = await reportAppIdentityRemoval(targets, () => {}, {
+        checkAppPresence: async (slug) => (slug === targets[0]?.appSlug ? 'absent' : 'present'),
+      });
+      expect(outcomes.find((o) => o.role === 'code-agent')?.status).toBe('already-absent');
+      expect(outcomes.find((o) => o.role === 'science-agent')?.status).toBe('manual-action-required');
+    });
   });
 });

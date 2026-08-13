@@ -27,6 +27,7 @@ import { realArchiveRepo } from '../bootstrap/repo-archive.js';
 import { realDeleteRepo } from '../bootstrap/repo-destroy.js';
 import { assertAgeIdentityReadable, realShredAgeIdentity } from '../bootstrap/age-key-shred.js';
 import type { AppDeletionDeps, AppDeletionOutcome } from '../bootstrap/app-identity-removal.js';
+import { checkAppSlugPresence } from '../bootstrap/app-identity-removal.js';
 import type { DeleteAppsPlan, DestroyPlan, DestroyRepoDeps, RepoDestroyOutcome } from '../bootstrap/teardown-destructive.js';
 import {
   buildDeleteAppsPlan,
@@ -152,7 +153,11 @@ function formatRepoDestroyOutcomeLines(outcomes: readonly RepoDestroyOutcome[]):
 function formatAppOutcomeLines(outcomes: readonly AppDeletionOutcome[]): string[] {
   return outcomes.map((o) => {
     const idSuffix = o.appId === undefined ? '' : ` (app_id ${o.appId})`;
-    return `  ${o.role.padEnd(20)} ${o.appSlug.padEnd(30)}${idSuffix} MANUAL ACTION REQUIRED — ${o.settingsUrl}`;
+    // groundnuty/macf#917: an `'already-absent'` outcome has nothing to
+    // point a browser at — render its own status line instead of the
+    // fixed "MANUAL ACTION REQUIRED — <url>" shape every prior outcome used.
+    const detail = o.status === 'already-absent' ? 'ALREADY-ABSENT — nothing to delete' : `MANUAL ACTION REQUIRED — ${o.settingsUrl}`;
+    return `  ${o.role.padEnd(20)} ${o.appSlug.padEnd(30)}${idSuffix} ${detail}`;
   });
 }
 
@@ -221,6 +226,7 @@ export function resolveDeleteAppsDeps(): FleetDeleteAppsDeps {
     deleteRegistryVariable: realDeleteRegistryVariable,
     archiveRepo: realArchiveRepo,
     openUrl: realOpenUrl,
+    checkAppPresence: checkAppSlugPresence,
     confirm: realConfirm,
   };
 }
@@ -247,12 +253,25 @@ function deleteAppsResultToJson(result: DeleteAppsResult): unknown {
 
 /**
  * `delete-apps`'s exit code is non-zero whenever there is at least ONE App
- * identity that still needs manual browser deletion — which, per
- * `app-identity-removal.ts`, is EVERY App identity, always (there is no
- * REST path). This is deliberate: "report what could not be done, never
- * exit green" (Amendment G) means a `delete-apps` run can never honestly
- * report full success while ANY App registration is still squatting its
- * name. Exit 0 is reserved for the degenerate empty-fleet case.
+ * identity outcome at all — which, per `app-identity-removal.ts`, is EVERY
+ * App identity, always (there is no REST path to delete one). This is
+ * deliberate: "report what could not be done, never exit green" (Amendment
+ * G) means a `delete-apps` run can never honestly report full success while
+ * ANY App-identity outcome exists. Exit 0 is reserved for the degenerate
+ * empty-fleet case.
+ *
+ * **`'already-absent'` (groundnuty/macf#917) does NOT relax this — on
+ * purpose, deliberated during review.** It reads tempting to treat a
+ * confirmed-404 App as "nothing left to do" and let the exit go green, but
+ * `checkAppSlugPresence`'s own doc names the read as a PREDICTED-slug check
+ * (a 404 there means "nothing at THIS exact slug," not "this App is
+ * confirmed gone everywhere" — GitHub may have appended a disambiguating
+ * suffix at creation). Letting that inconclusive-but-plausible signal flip
+ * the exit code to 0 would be exactly the false-absent-drives-a-green-exit
+ * shape DR-043 Amendment A's "honest-unknown over false-`present`" posture
+ * (and this rail's own "never exit green") exist to prevent. The `report`
+ * text changes (`'already-absent'` status, `ALREADY-ABSENT` rendering) —
+ * the exit-code contract does not.
  */
 function deleteAppsExitCode(result: DeleteAppsResult): number {
   if (!result.gate.allowed) return 1;
@@ -382,6 +401,7 @@ export function resolveDestroyDeps(): FleetDestroyDeps {
     deleteRegistryVariable: realDeleteRegistryVariable,
     deleteRepo: realDeleteRepo,
     openUrl: realOpenUrl,
+    checkAppPresence: checkAppSlugPresence,
     confirmFleetName: realConfirmFleetName,
     readEnv: realReadEnv,
     assertAgeIdentityReadable,
@@ -417,7 +437,7 @@ function destroyResultToJson(result: DestroyResult): unknown {
   };
 }
 
-/** Never green while ANY item remains incomplete — the ownership gate, the acknowledgment ladder, any failed mutation, the App-identity report (always non-empty for a non-degenerate fleet — same posture as `deleteAppsExitCode`), and a requested-but-failed/refused shred all force a non-zero exit. */
+/** Never green while ANY item remains incomplete — the ownership gate, the acknowledgment ladder, any failed mutation, the App-identity report (ANY outcome present forces red, including `'already-absent'` — see `deleteAppsExitCode`'s doc for why groundnuty/macf#917 deliberately does NOT relax this), and a requested-but-failed/refused shred all force a non-zero exit. */
 function destroyExitCode(result: DestroyResult): number {
   if (!result.gate.allowed) return 1;
   if (result.acknowledgmentsMissing.length > 0) return 1;

@@ -363,6 +363,47 @@ describe('runFleetArchive', () => {
     }
   });
 
+  // --- groundnuty/macf#917 — the state-read invariant at the CLI layer: the PATCH seam is never even reached ---
+
+  it('every repo is ALREADY archived (checkMeta confirms it) -> exit 0, repo outcomes report ALREADY-ARCHIVED, and the archiveRepo (PATCH) seam is NEVER called', async () => {
+    const file = writeManifest();
+    let archiveRepoCalled = false;
+    const cap = captureConsole();
+    try {
+      const code = await runFleetArchive(
+        { file, yes: true },
+        depsFor({
+          checkMeta: async () => ({ presence: 'present', archived: true }),
+          archiveRepo: async () => {
+            archiveRepoCalled = true;
+          },
+        }),
+      );
+      expect(code).toBe(0);
+      expect(archiveRepoCalled).toBe(false);
+      expect(cap.logs.join('\n')).toMatch(/ALREADY-ARCHIVED/);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('--json on an already-archived fleet -> repo_outcomes carry status "already-archived" for every repo', async () => {
+    const file = writeManifest();
+    const cap = captureConsole();
+    try {
+      const code = await runFleetArchive(
+        { file, yes: true, json: true },
+        depsFor({ checkMeta: async () => ({ presence: 'present', archived: true }), archiveRepo: async () => {} }),
+      );
+      expect(code).toBe(0);
+      const parsed = JSON.parse(cap.logs.join('\n')) as { repo_outcomes: { repo: string; status: string }[] };
+      expect(parsed.repo_outcomes).toHaveLength(2);
+      expect(parsed.repo_outcomes.every((o) => o.status === 'already-archived')).toBe(true);
+    } finally {
+      cap.restore();
+    }
+  });
+
   it('--json emits repo_outcomes alongside the variable outcomes', async () => {
     const file = writeManifest();
     const cap = captureConsole();

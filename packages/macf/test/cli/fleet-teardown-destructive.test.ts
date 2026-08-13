@@ -272,6 +272,57 @@ describe('runFleetDeleteApps', () => {
     }
   });
 
+  // --- groundnuty/macf#917 — App already gone: the REPORT says already-absent, but the EXIT CODE stays red ---
+  //
+  // Deliberate, reviewed choice: `checkAppSlugPresence`'s read is a
+  // PREDICTED-slug 404, not a GitHub-confirmed "this App is gone everywhere"
+  // fact (a disambiguating suffix at creation could mean the real App is
+  // alive under a slug this check never queried). Letting that inconclusive
+  // signal flip the exit code to 0 would be exactly the
+  // false-absent-drives-a-green-exit shape "never exit green" (Amendment G)
+  // + DR-043 Amendment A's "honest-unknown over false-present" exist to
+  // prevent — so ONLY the report text changes here, never the exit contract.
+
+  it('App already gone (checkAppPresence confirms absent) -> renders ALREADY-ABSENT (not MANUAL ACTION REQUIRED), but exit code STAYS 1 — the predicted-slug read never green-lights the exit', async () => {
+    const file = writeManifest();
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeleteApps(
+        { file, yes: true },
+        deleteAppsDepsFor({
+          deleteRegistryVariable: async () => 'deleted',
+          archiveRepo: async () => {},
+          checkAppPresence: async () => 'absent',
+        }),
+      );
+      const out = cap.logs.join('\n') + cap.errs.join('\n');
+      expect(out).toMatch(/ALREADY-ABSENT/);
+      expect(out).not.toMatch(/MANUAL ACTION REQUIRED/);
+      expect(code).toBe(1);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('App presence UNKNOWN (checkAppPresence wired but inconclusive) -> still MANUAL ACTION REQUIRED, exit stays 1 — never upgrades an unconfirmed read', async () => {
+    const file = writeManifest();
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeleteApps(
+        { file, yes: true },
+        deleteAppsDepsFor({
+          deleteRegistryVariable: async () => 'deleted',
+          archiveRepo: async () => {},
+          checkAppPresence: async () => 'unknown',
+        }),
+      );
+      expect(code).toBe(1);
+      expect(cap.logs.join('\n') + cap.errs.join('\n')).toMatch(/MANUAL ACTION REQUIRED/);
+    } finally {
+      cap.restore();
+    }
+  });
+
   it('--json emits a valid, non-empty schema-versioned object with app_outcomes present', async () => {
     const file = writeManifest();
     const cap = captureConsole();
@@ -398,7 +449,7 @@ describe('runFleetDestroy', () => {
             return 'demo-fleet';
           },
           deleteRegistryVariable: async () => 'deleted',
-          deleteRepo: async () => {},
+          deleteRepo: async () => 'deleted',
         }),
       );
       expect(sawInventoryBeforeConfirm).toBe(true);
@@ -413,7 +464,7 @@ describe('runFleetDestroy', () => {
     try {
       await runFleetDestroy(
         { file, ...ALL_ACKS },
-        allAcksDeps({ confirmFleetName: async () => 'demo-fleet', deleteRegistryVariable: async () => 'deleted', deleteRepo: async () => {} }),
+        allAcksDeps({ confirmFleetName: async () => 'demo-fleet', deleteRegistryVariable: async () => 'deleted', deleteRepo: async () => 'deleted' }),
       );
       const text = cap.errs.join('\n');
       const recoverableIdx = text.indexOf('RECOVERABLE');
@@ -444,6 +495,7 @@ describe('runFleetDestroy', () => {
           },
           deleteRepo: async (repo) => {
             deletedRepos.push(repo);
+            return 'deleted';
           },
         }),
       );
@@ -470,6 +522,7 @@ describe('runFleetDestroy', () => {
           deleteRegistryVariable: async () => 'deleted',
           deleteRepo: async (repo) => {
             deletionOrder.push(repo);
+            return 'deleted';
           },
         }),
       );
@@ -490,6 +543,7 @@ describe('runFleetDestroy', () => {
           deleteRegistryVariable: async () => 'deleted',
           deleteRepo: async (repo) => {
             if (repo.endsWith('-control')) throw new Error('required check blocks delete');
+            return 'deleted';
           },
         }),
       );
@@ -512,7 +566,7 @@ describe('runFleetDestroy', () => {
         allAcksDeps({
           confirmFleetName: async () => 'demo-fleet',
           deleteRegistryVariable: async () => 'deleted',
-          deleteRepo: async () => {},
+          deleteRepo: async () => 'deleted',
           shredAgeIdentity: async () => {
             shredCalled = true;
           },
@@ -545,6 +599,7 @@ describe('runFleetDestroy', () => {
           },
           deleteRepo: async () => {
             repoDeleteCalled = true;
+            return 'deleted';
           },
           shredAgeIdentity: async () => {
             shredCalled = true;
@@ -575,6 +630,7 @@ describe('runFleetDestroy', () => {
           deleteRegistryVariable: async () => 'deleted',
           deleteRepo: async () => {
             repoDeleteCalled = true;
+            return 'deleted';
           },
           shredAgeIdentity: async () => {
             shredCalled = true;
@@ -606,6 +662,7 @@ describe('runFleetDestroy', () => {
           deleteRegistryVariable: async () => 'deleted',
           deleteRepo: async (repo) => {
             order.push(`delete-repo:${repo}`);
+            return 'deleted';
           },
           assertAgeIdentityReadable: () => {},
           shredAgeIdentity: async (p) => {
