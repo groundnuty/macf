@@ -4,6 +4,54 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.57] — 2026-08-13
+
+**The DR-043 fleet-provisioning CLI ships.** `macf bootstrap` builds a whole fleet
+from a declarative `fleet.yaml`, and `macf fleet` now covers the full lifecycle —
+provision, observe, reconcile, deactivate, archive, revive, and tear down. This is
+the first published release containing `bootstrap`; prior versions had no such
+command.
+
+### Added
+
+- **`macf bootstrap plan | apply`** — provision a fleet from `fleet.yaml`: control
+  repo → agent repos → both GitHub consent gates → per-project CA → routing
+  variable → age-encrypted vault → `fleet.lock`. Two operator clicks per agent is
+  the floor (GitHub exposes no API for App creation or first install); everything
+  else is automated. Live-proven against a real organization.
+- **`macf fleet deactivate | archive | delete-apps | destroy`** (DR-043 Amendment G)
+  — a teardown ladder ordered by what *revival* costs. `deactivate` and `archive`
+  are free to reverse (the App keys survive in the vault, so revival is pure
+  reconciliation); `delete-apps` costs two clicks per agent and frees the
+  globally-unique App names; `destroy` is irreversible and demands three separate
+  acknowledgments. Separate verbs rather than flags — blast radii this different
+  must not be one typo apart.
+- **Vault read** (DR-043 phase 3) — `plan` can now observe the credential plane,
+  not just the non-secret one, so reconciliation compares intent against reality.
+  Read-only-decryptable, whole-payload-writable, never read-modify-written.
+- **§D6 versions steering** — `versions.macf` / `versions.actions` drift is a
+  first-class plan item naming the correct remedy per kind.
+- **Operator runbook** — `docs/new-fleet-runbook.md`.
+
+### Fixed
+
+- **`macf update` wrote plugin assets to the conventional default rather than the
+  directory `claude.sh` actually mounts**, so an upgrade could report success
+  having updated a directory nobody loads (#889). It now resolves the mounted dir,
+  and refuses loudly rather than guessing when it cannot.
+- **`fleet upgrade` blamed a healthy release for a stale launch pin**, halting the
+  entire roll to contain a bad release that did not exist (#899). A pin mismatch is
+  now `stale-pin` — skip that agent, continue the roll — while a confirmed
+  `bad-release` still halts.
+- **SessionStart guards located "my" channel log by scanning the whole host**, so an
+  agent could report a peer's health as its own (#887). Identity-derived now, and
+  honest about not knowing rather than guessing.
+- **`restart-self --dir` was silently overridden by `MACF_WORKSPACE_DIR`** (#888).
+- **Org-scope variable creation omitted the required `visibility` field** (422), so
+  organization-owned fleets could not publish their registry CA (#866).
+- **Consent-gate URLs are now printed before the browser opens** and re-printed on
+  timeout — a browser launch is an unverifiable side effect.
+
 ## [0.2.56] — 2026-08-10
 
 Reliability patch — fixes a **fleet-wide GitHub write-path outage**. Marketplace
