@@ -140,14 +140,35 @@ done
 # recent `tmux_wake_delivered` events. Only genuine total deafness (native off
 # AND no tmux-wake delivery evidence) gets the loud warning.
 if [ "$state" = "off" ]; then
-  # Locate this agent's channel-server log. MACF_LOG_PATH (set by claude.sh) is
-  # the full path to channel.log; else fall back to the newest channel.log under
-  # ~/.local/state/macf/*/ (this session's is freshest-by-mtime).
+  # Locate THIS agent's own channel-server log — never a peer's (macf#887).
+  #
+  # Preference order:
+  #   1. MACF_LOG_PATH (set by claude.sh / env.certs) — the full, authoritative
+  #      path, when it actually points at a readable file.
+  #   2. Reconstruct the canonical default from THIS agent's own identity —
+  #      MACF_PROJECT + MACF_AGENT_NAME, exported by env.identity — using the
+  #      SAME derivation claude.sh / env-files.ts bake into MACF_LOG_PATH
+  #      (packages/macf/src/cli/{claude-sh,env-files}.ts):
+  #        ${XDG_STATE_HOME:-$HOME/.local/state}/macf/<project>@<agent>/channel.log
+  #      This is scoped to THIS agent's own identity, never a scan of the host.
+  #   3. Neither resolves → CHANNEL_LOG stays empty and
+  #      CHANNEL_LOG_IDENTITY_UNKNOWN is set. Previously this branch fell back
+  #      to `ls -t ~/.local/state/macf/*/channel.log | head -n1` — the NEWEST
+  #      log on the WHOLE HOST. On a multi-agent box that's whichever PEER
+  #      wrote most recently, not this agent — a quiet agent loses that race
+  #      every time, and the guard would confidently report on delivery health
+  #      that isn't its own (silent-fallback-hazards.md Instance 15, false
+  #      green/false alarm both directions). Per DR-043 Amendment A's honest-
+  #      unknown-over-false-present floor: report unknown, never guess.
   CHANNEL_LOG=""
+  CHANNEL_LOG_IDENTITY_UNKNOWN=""
   if [ -n "${MACF_LOG_PATH:-}" ] && [ -r "${MACF_LOG_PATH}" ]; then
     CHANNEL_LOG="${MACF_LOG_PATH}"
+  elif [ -n "${MACF_PROJECT:-}" ] && [ -n "${MACF_AGENT_NAME:-}" ]; then
+    OWN_LOG="${XDG_STATE_HOME:-$HOME_DIR/.local/state}/macf/${MACF_PROJECT}@${MACF_AGENT_NAME}/channel.log"
+    [ -r "$OWN_LOG" ] && CHANNEL_LOG="$OWN_LOG"
   else
-    CHANNEL_LOG="$(ls -t "$HOME_DIR"/.local/state/macf/*/channel.log 2>/dev/null | head -n1 || true)"
+    CHANNEL_LOG_IDENTITY_UNKNOWN=1
   fi
 
   # Evidence the tmux-wake fallback is delivering to THIS agent: a RECENT
@@ -225,6 +246,13 @@ state on hand-offs (coordination.md §Communication 5). Silence: MACF_SKIP_CHANN
 INFO
   else
     # Genuine concern: native-push off AND no evidence tmux-wake is delivering.
+    # macf#887: when that "no evidence" is because this agent's OWN log
+    # couldn't even be identified (as opposed to identified-but-empty), say so
+    # explicitly — an honest unknown, not a confident read of someone else's
+    # log. printf (not the quoted heredoc below) so this line can interpolate.
+    if [ -n "$CHANNEL_LOG_IDENTITY_UNKNOWN" ]; then
+      printf "ℹ️  Also: could not identify this agent's own channel-server log — MACF_LOG_PATH is unset/unreadable, and MACF_PROJECT/MACF_AGENT_NAME (used to derive the default path) are unavailable — so the tmux-wake evidence check above could not even be attempted. This never falls back to a peer's log on a shared host (groundnuty/macf#887); set MACF_LOG_PATH, or relaunch via ./claude.sh, to restore it.\n\n"
+    fi
     cat <<'WARN'
 ⚠️  ROUTED-NOTIFICATION DELIVERY IS UNCONFIRMED this session (macf#632/#633).
 

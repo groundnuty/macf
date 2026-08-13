@@ -48,10 +48,23 @@ function runHook(opts: {
   /** Stdin payload (defaults to a SessionStart-shaped JSON object). */
   readonly stdin?: string;
   /** When set, create a channel-server log at
-   *  `$HOME/.local/state/macf/<sess>/channel.log` with these JSONL lines — the
-   *  tmux-wake fallback evidence the guard reads (macf#633 false-deafness fix).
-   *  `undefined` → no channel.log (can't confirm tmux-wake). */
+   *  `$HOME/.local/state/macf/testproj@test-agent/channel.log` with these JSONL
+   *  lines — the tmux-wake fallback evidence the guard reads (macf#633
+   *  false-deafness fix). `undefined` → no channel.log (can't confirm tmux-wake). */
   readonly channelLogLines?: readonly string[];
+  /** When `channelLogLines` is set, whether to export MACF_LOG_PATH pointing at
+   *  it (the primary locator). Default true. Set false to exercise the
+   *  macf#887 identity-derivation fallback (MACF_PROJECT/MACF_AGENT_NAME) or
+   *  the identity-unknown path instead. */
+  readonly exportLogPathEnv?: boolean;
+  /** MACF_PROJECT / MACF_AGENT_NAME to export — the identity pair the
+   *  macf#887 fallback derives this agent's own log path from. `undefined` for
+   *  either half → that half is left unset (both required to derive). */
+  readonly identityEnv?: { readonly project?: string; readonly agentName?: string };
+  /** Extra channel.log fixtures under OTHER `<project>@<agent>` dirs — never
+   *  this agent's own — used to prove the macf#887 fix does not fall back to
+   *  a cross-agent glob when this agent's own log can't be identified. */
+  readonly peerChannelLogs?: readonly { readonly dir: string; readonly lines: readonly string[] }[];
 }): RunResult {
   const fakeHome = mkdtempSync(join(tmpdir(), 'macf-chan-home-'));
   const workspace = mkdtempSync(join(tmpdir(), 'macf-chan-ws-'));
@@ -79,15 +92,26 @@ function runHook(opts: {
     writeFileSync(channelLogPath, opts.channelLogLines.join('\n') + '\n');
   }
 
+  for (const peer of opts.peerChannelLogs ?? []) {
+    const peerDir = join(fakeHome, '.local', 'state', 'macf', peer.dir);
+    mkdirSync(peerDir, { recursive: true });
+    writeFileSync(join(peerDir, 'channel.log'), peer.lines.join('\n') + '\n');
+  }
+
+  const exportLogPathEnv = opts.exportLogPathEnv ?? true;
+
   // Clean env: temp HOME + workspace, fast poll. Drop ambient MACF_* so the
   // runner's identity doesn't leak in. Point MACF_LOG_PATH at the fake
-  // channel.log when one was created (the guard's primary locator).
+  // channel.log when one was created (the guard's primary locator), unless
+  // the test explicitly wants to exercise the fallback/unknown path instead.
   const cleanEnv: Record<string, string> = {
     PATH: process.env['PATH'] ?? '',
     HOME: fakeHome,
     CLAUDE_PROJECT_DIR: workspace,
     MACF_CHANNELS_POLL_ITERS: '1',
-    ...(channelLogPath ? { MACF_LOG_PATH: channelLogPath } : {}),
+    ...(channelLogPath && exportLogPathEnv ? { MACF_LOG_PATH: channelLogPath } : {}),
+    ...(opts.identityEnv?.project !== undefined ? { MACF_PROJECT: opts.identityEnv.project } : {}),
+    ...(opts.identityEnv?.agentName !== undefined ? { MACF_AGENT_NAME: opts.identityEnv.agentName } : {}),
   };
   if (opts.env) {
     for (const [k, v] of Object.entries(opts.env)) {
@@ -213,6 +237,72 @@ describe('check-channels-enabled.sh (SessionStart guard)', () => {
       });
       expect(r.status).toBe(0);
       expect(r.stdout.trim()).toBe('');
+    });
+  });
+
+  describe("(f) macf#887 — own-log resolution never globs a peer's log", () => {
+    it('MACF_LOG_PATH set + readable → used unchanged (regression pin)', () => {
+      const r = runHook({
+        logDebugLines: [OK_DEBUG, SKIP_DEBUG],
+        channelLogLines: [TMUX_WAKE_DELIVERED],
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('you are NOT deaf to routing');
+    });
+
+    it('MACF_LOG_PATH unset but MACF_PROJECT/MACF_AGENT_NAME derivable → the reconstructed path is read', () => {
+      const r = runHook({
+        logDebugLines: [OK_DEBUG, SKIP_DEBUG],
+        channelLogLines: [TMUX_WAKE_DELIVERED], // written under testproj@test-agent
+        exportLogPathEnv: false,
+        identityEnv: { project: 'testproj', agentName: 'test-agent' },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('you are NOT deaf to routing');
+    });
+
+    it('MACF_LOG_PATH unset AND identity undeterminable, with a BUSIER peer log present → skips with an honest message, never reads the peer log', () => {
+      const r = runHook({
+        logDebugLines: [OK_DEBUG, SKIP_DEBUG],
+        // No channelLogLines for THIS agent — own log genuinely absent/unknown.
+        exportLogPathEnv: false,
+        peerChannelLogs: [
+          // Would satisfy "not deaf" if the old cross-agent glob picked it up.
+          { dir: 'otherproj@busy-peer', lines: [TMUX_WAKE_DELIVERED] },
+        ],
+      });
+      expect(r.status).toBe(0);
+      // Must NOT report "not deaf" based on the peer's delivery evidence —
+      // this is the regression that matters (macf#887).
+      expect(r.stdout).not.toContain('you are NOT deaf to routing');
+      // Must say so explicitly rather than silently guessing.
+      expect(r.stdout).toContain("could not identify this agent's own channel-server log");
+      expect(r.stdout).toContain('macf#887');
+      expect(r.stdout).toContain('UNCONFIRMED');
+    });
+
+    it('MACF_PROJECT set but MACF_AGENT_NAME missing (partial identity) → still undeterminable, never a peer glob', () => {
+      const r = runHook({
+        logDebugLines: [OK_DEBUG, SKIP_DEBUG],
+        exportLogPathEnv: false,
+        identityEnv: { project: 'testproj' }, // agentName omitted
+        peerChannelLogs: [{ dir: 'otherproj@busy-peer', lines: [TMUX_WAKE_DELIVERED] }],
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).not.toContain('you are NOT deaf to routing');
+      expect(r.stdout).toContain('could not identify');
+    });
+
+    it('derivable identity but the reconstructed path has no file on disk → fails open like "no channel.log" (identity WAS known, so no false "could not identify" claim)', () => {
+      const r = runHook({
+        logDebugLines: [OK_DEBUG, SKIP_DEBUG],
+        // channelLogLines omitted → no file exists at the derivable path.
+        exportLogPathEnv: false,
+        identityEnv: { project: 'testproj', agentName: 'test-agent' },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('UNCONFIRMED');
+      expect(r.stdout).not.toContain('could not identify');
     });
   });
 

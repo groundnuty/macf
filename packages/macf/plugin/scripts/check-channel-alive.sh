@@ -140,11 +140,58 @@ if [ "$HOOK_EVENT" != "SessionStart" ] && [ -n "$NOW_EPOCH" ] && [ -r "$THROTTLE
 fi
 
 # ── Locate THIS agent's channel-server log (same locator as #633) ───────────
+# macf#887: this used to fall back to `ls -t .../macf/*/channel.log | head
+# -n1` when MACF_LOG_PATH was unset — the NEWEST channel.log on the WHOLE
+# HOST. On a multi-agent box that's whichever PEER wrote most recently, not
+# this agent: this hook would then probe a PEER's /health endpoint using OUR
+# OWN mTLS cert and report on ITS liveness as if it were ours (false green if
+# the peer happens to share a trusted CA and answers; false DEAD if it
+# doesn't) — exactly the confident-wrong-answer this hook exists to prevent.
+#
+# Fix: prefer MACF_LOG_PATH; else reconstruct THIS agent's own default path
+# from its own identity (MACF_PROJECT + MACF_AGENT_NAME, exported by
+# env.identity) using the SAME derivation claude.sh / env-files.ts bake into
+# MACF_LOG_PATH (packages/macf/src/cli/{claude-sh,env-files}.ts):
+#   ${XDG_STATE_HOME:-$HOME/.local/state}/macf/<project>@<agent>/channel.log
+# Never a scan of the host. When NEITHER resolves, this agent's own log is
+# genuinely unidentifiable — report that explicitly (DR-043 Amendment A's
+# honest-unknown-over-false-present floor) and skip the probe; do NOT read
+# whatever log happens to be newest.
 CHANNEL_LOG=""
+CHANNEL_LOG_IDENTITY_UNKNOWN=""
 if [ -n "${MACF_LOG_PATH:-}" ] && [ -r "${MACF_LOG_PATH}" ]; then
   CHANNEL_LOG="${MACF_LOG_PATH}"
+elif [ -n "${MACF_PROJECT:-}" ] && [ -n "${MACF_AGENT_NAME:-}" ]; then
+  OWN_LOG="${XDG_STATE_HOME:-$HOME_DIR/.local/state}/macf/${MACF_PROJECT}@${MACF_AGENT_NAME}/channel.log"
+  [ -r "$OWN_LOG" ] && CHANNEL_LOG="$OWN_LOG"
 else
-  CHANNEL_LOG="$(ls -t "$HOME_DIR"/.local/state/macf/*/channel.log 2>/dev/null | head -n1 || true)"
+  CHANNEL_LOG_IDENTITY_UNKNOWN=1
+fi
+
+if [ -n "$CHANNEL_LOG_IDENTITY_UNKNOWN" ]; then
+  # Genuinely can't tell which log is ours — MACF_LOG_PATH AND the
+  # MACF_PROJECT/MACF_AGENT_NAME identity pair are both unavailable (e.g. a
+  # hand-authored launcher, or a bare `claude` invocation that dropped the
+  # env — macf#638's class). Say so explicitly and skip: an honest unknown
+  # beats silently reading whichever peer's log happens to be newest.
+  #
+  # Stamp the throttle here too (this exit path predates the main stamp
+  # below) — otherwise a persistently-unidentifiable log would re-print this
+  # note on every UserPromptSubmit instead of once per throttle window.
+  mkdir -p "$THROTTLE_DIR" 2>/dev/null || true
+  if [ -n "$NOW_EPOCH" ]; then
+    printf '%s' "$NOW_EPOCH" >"$THROTTLE_FILE" 2>/dev/null || true
+  fi
+  cat <<'IDUNKNOWN'
+ℹ️  Could not identify this agent's own channel-server log — MACF_LOG_PATH is
+unset/unreadable, and MACF_PROJECT/MACF_AGENT_NAME (used to derive the default
+path) are unavailable. Skipping the liveness probe rather than guessing at a
+peer's log on a shared host (groundnuty/macf#887) — this agent's channel-server
+liveness is UNVERIFIED this check. Set MACF_LOG_PATH, or relaunch via
+./claude.sh (which exports the full env.identity/env.certs cluster), to
+restore this check. Silence: MACF_SKIP_CHANNEL_ALIVE_CHECK=1.
+IDUNKNOWN
+  exit 0
 fi
 [ -n "$CHANNEL_LOG" ] && [ -r "$CHANNEL_LOG" ] || exit 0
 
