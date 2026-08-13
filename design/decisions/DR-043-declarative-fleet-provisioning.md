@@ -146,7 +146,16 @@ Elevated from DR-035's "bootstrap transport" to an operational invariant: **all 
 
 ### D6 — `versions:` makes the manifest the GitOps steering input for fleet upgrades
 
-Agents already self-report deployed versions into the registry (the DR-037 machinery), so the reconciler has an observed-state source with no VM access: compare registry-reported versions against `versions.macf` / `versions.actions` → mismatch → **Confirm-then-update** → drive `macf fleet upgrade` (operational plane, §D4) with DR-037's verify-green gate (continue only on confirmed-green; HALT on bad-release or past-grace-unconfirmed). Re-running `apply` on a version-bumped manifest **is** the fleet upgrade trigger. This is reconcile-on-demand GitOps — no watching controller in v1, deliberately.
+`versions:` declares desired state for **two different planes**, and they must not be conflated — they have different observability sources AND different remedies (corrected 2026-08-13, macf#906; the original text attributed both to `macf fleet upgrade`, which owns neither for the actions pin):
+
+| field | observed from | remedy |
+|---|---|---|
+| `versions.macf` | the agent's self-reported deployed version (registry / `/health`, the DR-037 machinery — no VM access needed) | **`macf fleet upgrade`** (operational plane, §D4) under DR-037's verify-green gate — continue only on confirmed-green; HALT on bad-release or past-grace-unconfirmed (Amendment C refines: continue on a positively-confirmed LOCAL cause such as `stale-pin`) |
+| `versions.actions` | **each caller repo's `.github/workflows/agent-router.yml` `uses:` pin** — NOT registry-reported; the registry has no actions-version concept | **`macf repo-init`** (re-pins, resolving `v3` → the latest immutable tag). `macf fleet upgrade` never touches a caller workflow. Drift detector: the `routing doctor` freshness check (macf#872) |
+
+A mismatch on either is **Confirm-then-update** (§D3), surfaced by `plan` as its own item kind per plane. `apply` **names the remedy and refuses to run it** — provisioning is not software deployment, and a plan that showed a version drift as actionable would overstate what approving it does (the macf#854 false-consent shape). Re-running `plan` on a version-bumped manifest is how the drift becomes visible; the named command is what closes it. An agent whose version cannot be observed reports **`unknown` for that agent alone** — never a guessed match, never contaminating a peer's verdict (Amendment A's floor, per-subject).
+
+This is reconcile-on-demand GitOps — no watching controller in v1, deliberately.
 
 ## Design invariants (each earned by an incident)
 
