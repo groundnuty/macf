@@ -5,12 +5,14 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  buildTrustedActorsValue,
   deriveAppHandle,
   deriveControlRepoName,
   parseFleetLock,
   parseFleetManifest,
   FLEET_LOCK_SCHEMA_VERSION,
 } from '../../../src/cli/bootstrap/fleet-manifest.js';
+import type { FleetAgent } from '../../../src/cli/bootstrap/fleet-manifest.js';
 
 /** The DR-043 §D1 worked example, verbatim. */
 const VALID_FLEET_YAML = `
@@ -345,6 +347,40 @@ describe('deriveAppHandle — DR-032 Amendment (macf#791): handle = <project>-<r
 
   it('is a pure string concatenation with no normalization surprises', () => {
     expect(deriveAppHandle('ppam-2026', 'writer-agent')).toBe('ppam-2026-writer-agent');
+  });
+});
+
+function agent(role: string, repo: string): FleetAgent {
+  return { role, profile: 'x', repo, deploy_path: '/x' };
+}
+
+describe('buildTrustedActorsValue — MACF_TRUSTED_ACTORS shape (macf#922)', () => {
+  it('space-joins every agent\'s <deriveAppHandle>[bot] login, in agents[] order', () => {
+    const agents = [agent('code-agent', 'groundnuty/a'), agent('science-agent', 'groundnuty/b')];
+    expect(buildTrustedActorsValue('icsoc-2026', agents)).toBe(
+      'icsoc-2026-code-agent[bot] icsoc-2026-science-agent[bot]',
+    );
+  });
+
+  it('every entry carries the [bot] suffix — NOT the bare deriveAppHandle output', () => {
+    const value = buildTrustedActorsValue('macf', [agent('devops-agent', 'groundnuty/x')]);
+    expect(value).toBe('macf-devops-agent[bot]');
+    expect(value).not.toBe(deriveAppHandle('macf', 'devops-agent'));
+  });
+
+  it('a single agent produces no separator artifacts', () => {
+    expect(buildTrustedActorsValue('ppam-2026', [agent('writer-agent', 'groundnuty/x')])).toBe('ppam-2026-writer-agent[bot]');
+  });
+
+  it('an empty agents[] produces an empty string (schema forbids this in practice — agents is .min(1) — but the function itself stays total)', () => {
+    expect(buildTrustedActorsValue('icsoc-2026', [])).toBe('');
+  });
+
+  it('is space-separated, never comma or JSON — macf-devops-toolkit RUNNER.md: a JSON array silently fails to match', () => {
+    const value = buildTrustedActorsValue('icsoc-2026', [agent('code-agent', 'groundnuty/a'), agent('science-agent', 'groundnuty/b')]);
+    expect(value).not.toContain(',');
+    expect(value).not.toMatch(/^\[.*\]$/);
+    expect(value.split(' ')).toEqual(['icsoc-2026-code-agent[bot]', 'icsoc-2026-science-agent[bot]']);
   });
 });
 

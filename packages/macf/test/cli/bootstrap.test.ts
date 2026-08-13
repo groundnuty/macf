@@ -61,7 +61,7 @@ const VALID_FLEET_YAML_WITH_ROUTING = VALID_FLEET_YAML.replace(
   'agents:\n',
   'routing:\n  runner:\n    runs_on: self-hosted\nagents:\n',
 );
-const OBSERVED_ROUTING_DRIFT: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
+const OBSERVED_ROUTING_DRIFT: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
 
 describe('runBootstrapPlan', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;

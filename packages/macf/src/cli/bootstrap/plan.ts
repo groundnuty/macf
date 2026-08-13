@@ -53,7 +53,7 @@
  */
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
-import { deriveAppHandle } from './fleet-manifest.js';
+import { buildTrustedActorsValue, deriveAppHandle } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
 import type { VaultAgentObservation, VaultCaObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
@@ -149,7 +149,7 @@ export interface ObservedState {
    * already applies to the CA leg. Sourced from `observer.ts::checkRepoSecretPresence`
    * — the SAME read `apply-fleet.ts`'s routing-client publish step uses (via
    * `RoutingClientApplyDeps.checkRepoSecretPresence`), so plan and apply agree
-   * on presence by construction. Optional (like `routingRunsOn`/`vaultCa`
+   * on presence by construction. Optional (like `routingTrustedActors`/`vaultCa`
    * above) so every pre-#920 hand-built `ObservedState` test fixture keeps
    * compiling — `routingClientItem` treats an absent entry the same as an
    * explicit `'unknown'` (see `computePlan`'s call site).
@@ -160,8 +160,17 @@ export interface ObservedState {
    * 3) — same undefined-vs-observed convention as {@link ObservedAgentState.vault}.
    */
   readonly vaultCa?: VaultCaObservation;
-  /** The `MACF_ROUTING_RUNS_ON` value observed on a caller repo, if any. */
-  readonly routingRunsOn?: string;
+  /** The `MACF_TRUSTED_ACTORS` value observed on a caller repo, if any (macf#922 — was `MACF_ROUTING_RUNS_ON`, a variable the v3 router never reads; see `apply-routing.ts`'s doc). */
+  readonly routingTrustedActors?: string;
+  /**
+   * Register-before-route gate (macf#922) — whether a self-hosted runner is
+   * CONFIRMED REGISTERED on the representative caller repo. This is what
+   * lets `routingItem` state the runner CLASS the fleet will actually route
+   * on (self-hosted vs. github-hosted-and-billed) — a `runs_on: self-hosted`
+   * manifest declaration alone is aspirational; the router only self-hosts
+   * once BOTH the trust var is set AND a runner is registered.
+   */
+  readonly routingRunnerRegistered?: Presence;
   /**
    * DR-043 Amendment G (groundnuty/macf#867) — the `<fleet>-control` repo's
    * own presence. REQUIRED, not optional: an unobservable read must render
@@ -306,11 +315,11 @@ export interface UnimplementedApplyItem {
  */
 export const APPLY_UNIMPLEMENTED_REASONS = {
   routing:
-    'apply writes MACF_ROUTING_RUNS_ON when the variable is ABSENT (create-only, macf#838 Amendment D phase 2) ' +
-    'but does NOT overwrite a PRESENT-but-diverging value — the task\'s create-only posture ("never silently ' +
-    'overwrite") leaves this specific update un-actioned. Set the registry variable manually to the declared ' +
-    'value, or re-run apply once a future increment adds confirmed per-item updates; nothing above was changed ' +
-    'for this item.',
+    'apply writes MACF_TRUSTED_ACTORS when the variable is ABSENT (create-only, macf#838 Amendment D phase 2, ' +
+    'corrected to the router\'s actually-read variable by macf#922) but does NOT overwrite a PRESENT-but-' +
+    'diverging value — the task\'s create-only posture ("never silently overwrite") leaves this specific update ' +
+    'un-actioned. Set the repo variable manually to the declared value, or re-run apply once a future increment ' +
+    'adds confirmed per-item updates; nothing above was changed for this item.',
   // DR-043 §D6 — apply provisions identity/repo/CA/routing-wiring; it never
   // touches deployed SOFTWARE versions, by design (§D4: that is the
   // OPERATIONAL plane, VM-side/agent-privileged, a different tool). This
@@ -382,13 +391,19 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // `presenceVerb`, same 'create'-or-'noop'-only shape as 'ca'.
       return 'implemented';
     case 'routing':
-      // macf#838 Amendment D phase 2: apply-fleet.ts writes
-      // MACF_ROUTING_RUNS_ON when absent (create). It does NOT overwrite a
-      // present-but-diverging value — the task's create-only posture forces
-      // `update` to stay un-actioned (see APPLY_UNIMPLEMENTED_REASONS.routing).
-      // By this point in the switch `item.verb` is guaranteed to be
-      // 'create' or 'update' (noop/report-extra returned above), so this is
-      // exhaustive over the two remaining verbs.
+      // macf#838 Amendment D phase 2: apply-fleet.ts writes MACF_TRUSTED_ACTORS
+      // when absent (create) — macf#922 corrected the target from
+      // MACF_ROUTING_RUNS_ON, a variable the v3 router never reads. It does
+      // NOT overwrite a present-but-diverging value — the task's create-only
+      // posture forces `update` to stay un-actioned (see
+      // APPLY_UNIMPLEMENTED_REASONS.routing). By this point in the switch
+      // `item.verb` is guaranteed to be 'create' or 'update' (noop/report-
+      // extra returned above), so this is exhaustive over the two remaining
+      // verbs. (A 'create' item can STILL be skipped at apply time for want
+      // of a confirmed-registered runner — that is a runtime, per-repo gate
+      // rendered via `EnsureVariableOutcome`'s 'skipped' status in `apply`'s
+      // own summary, not a plan-time apply-coverage gap; see
+      // `apply-routing.ts`'s doc.)
       return item.verb === 'create' ? 'implemented' : 'not_implemented';
     case 'control_repo':
       // DR-043 Amendment G (macf#867): the ONLY verb `controlRepoItem` ever
@@ -686,23 +701,78 @@ function routingClientItem(repo: string, presence: Presence): PlanItem {
   };
 }
 
-function routingItem(fleetName: string, desiredRunsOn: string, observedRunsOn: string | undefined): PlanItem {
-  const target = `routing:${fleetName}:runner`;
-  if (observedRunsOn === undefined) {
-    return {
-      kind: 'routing',
-      target,
-      verb: 'create',
-      reason: 'MACF_ROUTING_RUNS_ON not observable at plan time — treated as a create-candidate',
-      confirm_required: false,
-    };
+/**
+ * The runner-CLASS half of {@link routingItem}'s reason (macf#922 — the plan
+ * must name the billing consequence BEFORE the operator approves apply: a
+ * private repo billed github-hosted draws down the account's Actions-minutes
+ * quota; self-hosted is free). ALWAYS stated from a LIVE register-before-
+ * route check (`runnerRegistered`), never from the manifest's aspirational
+ * `runs_on: self-hosted` declaration alone — a declaration with no
+ * registered runner still routes github-hosted today, regardless of what
+ * `MACF_TRUSTED_ACTORS` ends up containing.
+ */
+function runnerClassReason(runnerRegistered: Presence | undefined, representativeRepo: string | undefined): string {
+  const repoLabel = representativeRepo ?? '(no agent repos declared)';
+  if (runnerRegistered === 'present') {
+    return `Runner class: self-hosted (a runner is confirmed registered on "${repoLabel}").`;
   }
-  if (observedRunsOn === desiredRunsOn) {
+  const cause =
+    runnerRegistered === 'absent'
+      ? `no self-hosted runner is confirmed registered on "${repoLabel}"`
+      : `runner registration on "${repoLabel}" could not be confirmed (auth / network / insufficient scope)`;
+  return (
+    `Runner class: github-hosted (billed on private repos) — ${cause} yet; MACF_TRUSTED_ACTORS will NOT be ` +
+    'written by apply until one is (register-before-route).'
+  );
+}
+
+/**
+ * The `MACF_TRUSTED_ACTORS` plan item (macf#922 — was `MACF_ROUTING_RUNS_ON`,
+ * a variable the v3 router never reads; see `apply-routing.ts`'s doc). `v0`
+ * supports exactly one opt-in `runs_on` value, `"self-hosted"` — any OTHER
+ * declared value (including the router's own fail-safe default) needs no
+ * variable written at all, so it's a `noop` with an explanatory reason, not
+ * a `create`.
+ */
+function routingItem(
+  fleetName: string,
+  desiredRunsOn: string,
+  desiredTrustedActors: string,
+  observedTrustedActors: string | undefined,
+  runnerRegistered: Presence | undefined,
+  representativeRepo: string | undefined,
+): PlanItem {
+  const target = `routing:${fleetName}:runner`;
+
+  if (desiredRunsOn !== 'self-hosted') {
     return {
       kind: 'routing',
       target,
       verb: 'noop',
-      reason: `MACF_ROUTING_RUNS_ON already "${desiredRunsOn}"`,
+      reason:
+        `Runner class: github-hosted — declared runs_on "${desiredRunsOn}" is not "self-hosted", so the v3 ` +
+        "router's fail-safe default applies (no MACF_TRUSTED_ACTORS write needed); nothing to reconcile.",
+      confirm_required: false,
+    };
+  }
+
+  const classSuffix = runnerClassReason(runnerRegistered, representativeRepo);
+
+  if (observedTrustedActors === undefined) {
+    return {
+      kind: 'routing',
+      target,
+      verb: 'create',
+      reason: `MACF_TRUSTED_ACTORS not observable at plan time — treated as a create-candidate. ${classSuffix}`,
+      confirm_required: false,
+    };
+  }
+  if (observedTrustedActors === desiredTrustedActors) {
+    return {
+      kind: 'routing',
+      target,
+      verb: 'noop',
+      reason: `MACF_TRUSTED_ACTORS already matches the fleet's current agents. ${classSuffix}`,
       confirm_required: false,
     };
   }
@@ -710,7 +780,9 @@ function routingItem(fleetName: string, desiredRunsOn: string, observedRunsOn: s
     kind: 'routing',
     target,
     verb: 'update',
-    reason: `MACF_ROUTING_RUNS_ON observed "${observedRunsOn}" but manifest declares "${desiredRunsOn}"`,
+    reason:
+      `MACF_TRUSTED_ACTORS observed "${observedTrustedActors}" but the fleet's current agents derive ` +
+      `"${desiredTrustedActors}" — likely drift from an agent added/removed since the var was last written. ${classSuffix}`,
     confirm_required: true,
   };
 }
@@ -898,7 +970,21 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
   }
 
   if (manifest.routing?.runner) {
-    items.push(routingItem(fleetName, manifest.routing.runner.runs_on, observed.routingRunsOn));
+    const desiredTrustedActors = buildTrustedActorsValue(fleetName, manifest.agents);
+    // Same representative-repo derivation `observer.ts::githubRegistryObserver`
+    // uses for its live reads (macf#857) — recomputed here (not threaded
+    // through `ObservedState`) since `computePlan` already has `manifest`.
+    const representativeRepo = manifest.agents[0]?.repo;
+    items.push(
+      routingItem(
+        fleetName,
+        manifest.routing.runner.runs_on,
+        desiredTrustedActors,
+        observed.routingTrustedActors,
+        observed.routingRunnerRegistered,
+        representativeRepo,
+      ),
+    );
   }
 
   // DR-043 §D6 — only emitted when `versions:` is DECLARED (an omitted

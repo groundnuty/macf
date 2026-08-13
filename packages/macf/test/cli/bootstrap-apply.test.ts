@@ -37,6 +37,7 @@ import type { AgentApplyDeps } from '../../src/cli/bootstrap/apply-agent.js';
 import type { AppCredentials } from '../../src/cli/bootstrap/manifest-exchange.js';
 import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../src/cli/bootstrap/apply-routing-client.js';
+import type { RunnerRegistrationDeps } from '../../src/cli/bootstrap/apply-routing.js';
 import { VaultError, buildVaultPlaintext, type VaultAgentSecrets } from '../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext } from '../../src/cli/bootstrap/vault-read.js';
 
@@ -77,11 +78,13 @@ const EMPTY_OBSERVED: ObservedState = {
 
 /**
  * DR-043 Amendment D phase 2 (macf#838) — a manifest that DOES declare
- * `routing:`, plus an observed `routingRunsOn` that DIVERGES from it
- * (`update` verb). `ca` is fully implemented now (mint-or-reuse + two-place
- * publish); routing's `create` verb is too — the ONLY plan item that still
- * legitimately reads `unimplementedByApply` is a routing `update` (apply's
- * create-only posture never overwrites a present-but-diverging value — see
+ * `routing:`, plus an observed `routingTrustedActors` that DIVERGES from the
+ * manifest-derived value (`update` verb; macf#922 corrected the observed
+ * field from `routingRunsOn`/`MACF_ROUTING_RUNS_ON`). `ca` is fully
+ * implemented now (mint-or-reuse + two-place publish); routing's `create`
+ * verb is too — the ONLY plan item that still legitimately reads
+ * `unimplementedByApply` is a routing `update` (apply's create-only posture
+ * never overwrites a present-but-diverging value — see
  * `plan.ts::planItemApplyCoverage`'s routing case). These two fixtures are
  * what exercises that one remaining honest gap.
  */
@@ -89,7 +92,7 @@ const FLEET_YAML_WITH_ROUTING = FLEET_YAML.replace(
   'agents:\n',
   'routing:\n  runner:\n    runs_on: self-hosted\nagents:\n',
 );
-const OBSERVED_ROUTING_DRIFT: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
+const OBSERVED_ROUTING_DRIFT: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
 
 /**
  * DR-043 §D6 (this change) — a manifest that declares `versions:`, plus an
@@ -291,8 +294,14 @@ const SENTINEL_CA_CERT_PEM = 'SENTINEL-CA-CERT-PEM';
 // secret surface regressed.
 const SENTINEL_VAULT_PEM = '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-VAULT-PEM-BYTES\n-----END RSA PRIVATE KEY-----\n';
 
-/** Default fake `CaApplyDeps` (macf#838 Amendment D phase 2) — everything absent, so a fresh mint + two-place publish succeeds by default; individual tests override to exercise other shapes. */
-function fakeTrustDeps(overrides: Partial<CaApplyDeps> = {}): CaApplyDeps {
+/**
+ * Default fake `CaApplyDeps & RunnerRegistrationDeps` (macf#838 Amendment D
+ * phase 2; `checkRunnerRegistered` added macf#922) — everything absent,
+ * except a runner IS confirmed registered by default (so the pre-existing
+ * "routing var gets written" fixtures below keep exercising the write path
+ * unchanged); individual tests override to exercise other shapes.
+ */
+function fakeTrustDeps(overrides: Partial<CaApplyDeps & RunnerRegistrationDeps> = {}): CaApplyDeps & RunnerRegistrationDeps {
   return {
     checkRegistryPresence: async () => 'absent',
     readRegistryVariable: async () => undefined,
@@ -300,6 +309,7 @@ function fakeTrustDeps(overrides: Partial<CaApplyDeps> = {}): CaApplyDeps {
     checkRepoPresence: async () => 'absent',
     createRepoVariable: async () => 'created',
     mintCa: async () => ({ certPem: SENTINEL_CA_CERT_PEM, keyPem: SENTINEL_CA_KEY_PEM }),
+    checkRunnerRegistered: async () => 'present',
     ...overrides,
   };
 }
@@ -1199,11 +1209,20 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
   });
 
   it('formatApplyResult renders routing lines only when routing is non-empty', () => {
-    expect(formatApplyResult(resultWith({ routing: {} }))).not.toMatch(/Routing \(MACF_ROUTING_RUNS_ON\)/);
+    expect(formatApplyResult(resultWith({ routing: {} }))).not.toMatch(/Routing \(MACF_TRUSTED_ACTORS\)/);
     const text = formatApplyResult(resultWith({ routing: { 'groundnuty/x': { status: 'created' }, 'groundnuty/y': { status: 'already-present' } } }));
-    expect(text).toMatch(/Routing \(MACF_ROUTING_RUNS_ON\):/);
+    expect(text).toMatch(/Routing \(MACF_TRUSTED_ACTORS\):/);
     expect(text).toMatch(/groundnuty\/x: CREATED/);
     expect(text).toMatch(/groundnuty\/y: ALREADY-PRESENT/);
+  });
+
+  it('formatApplyResult renders a SKIPPED routing leg with its reason (macf#922 requirement 3 — the no-runner-registered gap is visible even under --yes)', () => {
+    const text = formatApplyResult(
+      resultWith({
+        routing: { 'groundnuty/x': { status: 'skipped', reason: 'no self-hosted runner is confirmed registered for "groundnuty/x"' } },
+      }),
+    );
+    expect(text).toMatch(/groundnuty\/x: SKIPPED — no self-hosted runner is confirmed registered/);
   });
 
   it('fleetApplyResultToJson never includes a CA cert/key value and carries ca + routing verbatim otherwise', () => {

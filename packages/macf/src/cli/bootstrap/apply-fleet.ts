@@ -196,7 +196,7 @@ import { dirname, join } from 'node:path';
 import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { TokenSource } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetLockAgent, FleetManifest } from './fleet-manifest.js';
-import { deriveAppHandle } from './fleet-manifest.js';
+import { buildTrustedActorsValue, deriveAppHandle } from './fleet-manifest.js';
 import type { AgentApplyDeps, AgentApplyOutcome } from './apply-agent.js';
 import { applyAgentIdentity, cleanupScratchPem, writeScratchPem } from './apply-agent.js';
 import type { AppCredentials } from './manifest-exchange.js';
@@ -221,7 +221,8 @@ import {
 import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } from './apply-ca.js';
 import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
-import { publishRoutingRunsOn } from './apply-routing.js';
+import type { RunnerRegistrationDeps } from './apply-routing.js';
+import { publishTrustedActors } from './apply-routing.js';
 import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientPublishResult } from './apply-routing-client.js';
 import { mintRoutingClient, publishRoutingClientSecrets, skippedRoutingClientPublish } from './apply-routing-client.js';
 
@@ -249,12 +250,17 @@ export interface FleetApplyDeps {
   readonly allowVaultVersion?: boolean;
   /**
    * DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) — the
-   * CA-ceremony + two-place-publish + `MACF_ROUTING_RUNS_ON` deps. ONE field
+   * CA-ceremony + two-place-publish + `MACF_TRUSTED_ACTORS` deps. ONE field
    * covers both `apply-ca.ts` and `apply-routing.ts` — `RoutingApplyDeps` is
-   * a `Pick` of this same shape (see `apply-routing.ts`'s doc), so there is
-   * no second dep object to keep in sync.
+   * a `Pick` of `CaApplyDeps`'s repo-var shape PLUS `RunnerRegistrationDeps`
+   * (see `apply-routing.ts`'s doc), so there is no second dep object to keep
+   * in sync for the CA-shaped half. `RunnerRegistrationDeps` is intersected
+   * in here (not folded into `CaApplyDeps` itself) — the register-before-
+   * route check is routing-specific, not something `apply-ca.ts`'s CA
+   * ceremony uses, so keeping it out of `CaApplyDeps` avoids widening that
+   * module's own tests/fixtures for an unrelated concern (macf#922).
    */
-  readonly trustDeps: CaApplyDeps;
+  readonly trustDeps: CaApplyDeps & RunnerRegistrationDeps;
   /**
    * DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — the
    * mint-or-skip + create-only per-repo secret-deploy deps for the
@@ -356,7 +362,14 @@ export interface FleetApplyResult {
   readonly identityChanges: readonly FleetLockIdentityChange[];
   /** DR-043 Amendment D phase 2 (macf#838) — the per-project CA ceremony + two-place publish (macf#806). See {@link CaApplyResult}'s doc. */
   readonly ca: CaApplyResult;
-  /** `MACF_ROUTING_RUNS_ON` create-only writes, keyed by repo — empty `{}` when `routing.runner` is not declared in the manifest. */
+  /**
+   * `MACF_TRUSTED_ACTORS` create-only writes, keyed by repo — empty `{}`
+   * when `routing.runner` is not declared OR its `runs_on` isn't
+   * `"self-hosted"` (macf#922; was `MACF_ROUTING_RUNS_ON`, see
+   * `apply-routing.ts`'s doc). A `'skipped'` leg here means the register-
+   * before-route gate blocked the write for that repo — see
+   * `apply-routing.ts::noRunnerRegisteredReason`.
+   */
   readonly routing: Readonly<Record<string, EnsureVariableOutcome>>;
   /** DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — see {@link RoutingClientApplyResult}'s doc. ALWAYS present — a fleet with no confirmed agent repos this run still reports `mint.status`. */
   readonly routingClient: RoutingClientApplyResult;
@@ -804,12 +817,20 @@ export async function applyFleet(
     }
   }
 
-  // `MACF_ROUTING_RUNS_ON` (§D1) — independent of the CA outcome; every
-  // caller repo is a confirmed agent repo, never the control repo (see
-  // `apply-routing.ts`'s doc).
+  // `MACF_TRUSTED_ACTORS` (§D1, macf#922) — independent of the CA outcome;
+  // every caller repo is a confirmed agent repo, never the control repo (see
+  // `apply-routing.ts`'s doc). `v0` supports exactly one opt-in `runs_on`
+  // value — any other declared value (including a future non-"self-hosted"
+  // string) needs no write at all, matching `plan.ts::routingItem`'s own
+  // noop-for-non-self-hosted branch (mustn't drift from what `plan` told the
+  // operator would happen).
   const routing =
-    manifest.routing?.runner !== undefined
-      ? await publishRoutingRunsOn(manifest.routing.runner.runs_on, confirmedRepos, deps.trustDeps)
+    manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted'
+      ? await publishTrustedActors(
+          buildTrustedActorsValue(manifest.metadata.name, manifest.agents),
+          confirmedRepos,
+          deps.trustDeps,
+        )
       : {};
   for (const [repo, leg] of Object.entries(routing)) {
     deps.log(`Routing var (${repo}): ${leg.status}` + (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'));

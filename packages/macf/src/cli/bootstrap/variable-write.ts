@@ -1,7 +1,8 @@
 /**
  * Create-only GitHub Actions variable writes — the shared write leaf behind
  * DR-043 Phase 2b (groundnuty/macf#838 Amendment D phase 2): the CA
- * two-place rule (macf#806) and `MACF_ROUTING_RUNS_ON`.
+ * two-place rule (macf#806) and `MACF_TRUSTED_ACTORS` (macf#922; was
+ * `MACF_ROUTING_RUNS_ON`, see `apply-routing.ts`'s module doc).
  *
  * **Create-only by construction, not by convention.** Every write here is
  * `gh api --method POST` — NEVER `PATCH`. GitHub's variables-create endpoint
