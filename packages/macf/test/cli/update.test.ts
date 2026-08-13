@@ -18,6 +18,11 @@ vi.mock('../../src/cli/plugin-fetcher.js', () => ({
   // via import.meta.url, which isn't built in the test runner; a no-op keeps
   // the update flow under test without touching the filesystem.
   linkPluginCliDist: vi.fn(() => false),
+  // macf#889 Pattern A read-back — default "nothing to verify" (no mismatch),
+  // matching the real function's behavior when nothing was ever pinned in the
+  // (unmocked, unwritten-by-tests) manifest. Individual tests override via
+  // `vi.mocked(readPinnedChannelServerVersion).mockReturnValueOnce(...)`.
+  readPinnedChannelServerVersion: vi.fn(() => null),
 }));
 
 // Stub `node:readline.createInterface` so tests can drive the unified
@@ -33,7 +38,9 @@ vi.mock('node:readline', () => ({
 
 import { update, buildDiff, renderDiff } from '../../src/cli/commands/update.js';
 import { agentConfigPath } from '../../src/cli/config.js';
-import { fetchPluginToWorkspace } from '../../src/cli/plugin-fetcher.js';
+import {
+  fetchPluginToWorkspace, pinChannelServerVersion, readPinnedChannelServerVersion,
+} from '../../src/cli/plugin-fetcher.js';
 import type { ResolvedVersions } from '../../src/cli/version-resolver.js';
 import type { MacfAgentConfig } from '../../src/cli/config.js';
 
@@ -463,9 +470,13 @@ describe('update command', () => {
     expect(code).toBe(0);
 
     // Repair case: fetch should have been invoked exactly once with the
-    // pinned version even though nothing was bumped.
+    // pinned version even though nothing was bumped, targeting the resolved
+    // (default, since claude.sh mounts `.macf/plugin` here) plugin dir
+    // (macf#889 — the target is now explicit, not implicit).
     expect(fetchPluginToWorkspace).toHaveBeenCalledTimes(1);
-    expect(fetchPluginToWorkspace).toHaveBeenCalledWith(dir, '0.1.0');
+    expect(fetchPluginToWorkspace).toHaveBeenCalledWith(
+      dir, '0.1.0', { targetDir: join(dir, '.macf', 'plugin') },
+    );
   });
 
   it('does not re-fetch plugin when .macf/plugin/ is populated and no bump happens', async () => {
@@ -480,6 +491,149 @@ describe('update command', () => {
     await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
 
     expect(fetchPluginToWorkspace).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------
+  // macf#889: the roll must write to the plugin dir claude.sh ACTUALLY
+  // MOUNTS, not the conventional `.macf/plugin` default — plus the
+  // post-upgrade result-invariant assertion (Pattern A).
+  // ---------------------------------------------------------------------
+  describe('mounted-plugin-dir resolution (#889)', () => {
+    /** A hand-authored (no managed-header) claude.sh mounting `plugDirName`. */
+    function writeHandAuthoredLauncher(plugDirName: string | null): void {
+      const flag = plugDirName === null ? '' : `--plugin-dir "$SCRIPT_DIR/.macf/${plugDirName}" `;
+      writeFileSync(
+        join(dir, 'claude.sh'),
+        '#!/usr/bin/env bash\n' +
+          '# Hand-wired substrate launcher (DR-005 Decision 6) — no macf managed-header.\n' +
+          'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n' +
+          `exec claude ${flag}"$@"\n`,
+        { mode: 0o755 },
+      );
+    }
+
+    beforeEach(() => {
+      vi.mocked(fetchPluginToWorkspace).mockClear();
+      vi.mocked(pinChannelServerVersion).mockClear();
+      vi.mocked(readPinnedChannelServerVersion).mockClear();
+      vi.mocked(readPinnedChannelServerVersion).mockReturnValue(null);
+    });
+
+    it('claude.sh mounts the default .macf/plugin — that dir is updated (existing behaviour preserved)', async () => {
+      writeConfig(dir, { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' });
+      // No claude.sh pre-seeded — the canonical template mounts .macf/plugin.
+      // Pre-populate it so the #62 repair-fetch path (which fires with the
+      // OLD pin, before the bump) doesn't mask the post-bump re-pin call
+      // this test is asserting on — real dir needed since the mocked
+      // fetchPluginToWorkspace never actually creates one.
+      mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
+      writeFileSync(join(dir, '.macf', 'plugin', 'manifest.txt'), 'seed\n');
+      mockFetchReturning({ cli: '0.3.0', plugin: '0.1.0', actions: 'v1' });
+
+      const code = await update(dir, { all: false, cli: true, plugin: false, actions: false, yes: true, dryRun: false });
+      expect(code).toBe(0);
+
+      expect(pinChannelServerVersion).toHaveBeenCalledWith(
+        dir, '0.3.0', { targetDir: join(dir, '.macf', 'plugin') },
+      );
+    });
+
+    it('claude.sh mounts .macf/plugin-cs — plugin-cs is updated, not the default', async () => {
+      writeConfig(dir, { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' });
+      writeHandAuthoredLauncher('plugin-cs');
+      // Pre-populate plugin-cs so the #62 repair-fetch path doesn't also fire.
+      mkdirSync(join(dir, '.macf', 'plugin-cs'), { recursive: true });
+      writeFileSync(join(dir, '.macf', 'plugin-cs', 'manifest.txt'), 'seed\n');
+      mockFetchReturning({ cli: '0.3.0', plugin: '0.1.0', actions: 'v1' });
+
+      const code = await update(dir, { all: false, cli: true, plugin: false, actions: false, yes: true, dryRun: false });
+      expect(code).toBe(0);
+
+      expect(pinChannelServerVersion).toHaveBeenCalledWith(
+        dir, '0.3.0', { targetDir: join(dir, '.macf', 'plugin-cs') },
+      );
+      // The unmounted default must never be touched by this run.
+      const defaultDir = join(dir, '.macf', 'plugin');
+      for (const call of vi.mocked(pinChannelServerVersion).mock.calls) {
+        expect(call[2]).not.toEqual({ targetDir: defaultDir });
+      }
+      for (const call of vi.mocked(fetchPluginToWorkspace).mock.calls) {
+        expect(call[2]).not.toEqual({ targetDir: defaultDir });
+      }
+    });
+
+    it('both .macf/plugin and .macf/plugin-cs present — the MOUNTED one wins + warns naming both paths', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        writeConfig(dir, { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' });
+        writeHandAuthoredLauncher('plugin-cs');
+        mkdirSync(join(dir, '.macf', 'plugin-cs'), { recursive: true });
+        writeFileSync(join(dir, '.macf', 'plugin-cs', 'manifest.txt'), 'seed\n');
+        // The unmounted default ALSO exists on disk (the macf#889 "loaded gun" shape).
+        mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
+        writeFileSync(join(dir, '.macf', 'plugin', 'manifest.txt'), 'stale\n');
+        mockFetchReturning({ cli: '0.3.0', plugin: '0.1.0', actions: 'v1' });
+
+        const code = await update(dir, { all: false, cli: true, plugin: false, actions: false, yes: true, dryRun: false });
+        expect(code).toBe(0);
+
+        expect(pinChannelServerVersion).toHaveBeenCalledWith(
+          dir, '0.3.0', { targetDir: join(dir, '.macf', 'plugin-cs') },
+        );
+        // Names BOTH paths (AC2) so an operator/agent can see the unmounted
+        // default is deliberately left alone, not silently drifting.
+        const warnOut = warnSpy.mock.calls.flat().join('\n');
+        expect(warnOut).toContain(join(dir, '.macf', 'plugin-cs'));
+        expect(warnOut).toContain(join(dir, '.macf', 'plugin'));
+        expect(warnOut).toMatch(/macf#889/);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('mounted plugin dir undeterminable (no --plugin-dir at all) — loud refusal, no silent default update', async () => {
+      writeConfig(dir, { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' });
+      writeHandAuthoredLauncher(null); // no --plugin-dir flag anywhere
+      // The conventional default exists as an empty dir — a naive fallback
+      // would "repair-fetch" it. It must be left alone instead.
+      mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
+      mockFetchReturning({ cli: '0.3.0', plugin: '0.1.0', actions: 'v1' });
+
+      const code = await update(dir, { all: false, cli: true, plugin: false, actions: false, yes: true, dryRun: false });
+      expect(code).toBe(0); // loud, but non-blocking — asset refresh etc. still succeeded
+
+      expect(fetchPluginToWorkspace).not.toHaveBeenCalled();
+      expect(pinChannelServerVersion).not.toHaveBeenCalled();
+      const errOut = errorSpy.mock.calls.flat().join('\n');
+      expect(errOut).toMatch(/cannot determine which plugin dir claude\.sh mounts/);
+      expect(errOut).toMatch(/macf#889/);
+    });
+
+    it('post-update verification fails LOUDLY on a deliberately mismatched pin (Pattern A)', async () => {
+      writeConfig(dir, { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' });
+      // No claude.sh pre-seeded — canonical .macf/plugin mount. Pre-populate
+      // so `existsSync(pluginTarget.dir)` holds at the Pattern-A assertion
+      // site (the mocked fetchPluginToWorkspace never creates a real dir).
+      mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
+      writeFileSync(join(dir, '.macf', 'plugin', 'manifest.txt'), 'seed\n');
+      mockFetchReturning({ cli: '0.3.0', plugin: '0.1.0', actions: 'v1' });
+      // Simulate the write not reaching the mounted manifest: the read-back
+      // reports the OLD version even after pinChannelServerVersion "ran".
+      vi.mocked(readPinnedChannelServerVersion).mockReturnValue('0.1.0');
+
+      const code = await update(dir, { all: false, cli: true, plugin: false, actions: false, yes: true, dryRun: false });
+
+      // Loud, but non-blocking (see the code comment at the assertion site:
+      // `upgrade()`'s driver shells this via execFileSync({stdio:'inherit'}),
+      // which throws on non-zero — a hard failure here would abort the
+      // roll's upgrade→restart transaction mid-flight).
+      expect(code).toBe(0);
+      const errOut = errorSpy.mock.calls.flat().join('\n');
+      expect(errOut).toMatch(/FATAL/);
+      expect(errOut).toContain('@0.1.0');
+      expect(errOut).toContain('@0.3.0');
+      expect(errOut).toMatch(/macf#889/);
+    });
   });
 
   it('regenerates a macf-managed (header-carrying) stale claude.sh on every update, even when nothing is bumped (#63)', async () => {

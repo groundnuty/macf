@@ -42,6 +42,14 @@ export interface FetchPluginOptions {
   readonly marketplaceUrl?: string;
   /** Override the subdir inside the marketplace repo (for testing). */
   readonly pluginSubdir?: string;
+  /**
+   * Write to this absolute path instead of `workspacePluginDir(workspaceDir)`
+   * (macf#889) — the caller (`macf update`) resolves the dir `claude.sh`
+   * actually MOUNTS via `resolvePluginUpdateTarget` and passes it here so a
+   * workspace mounting the `.macf/plugin-cs` variant (DR-005 Decision 6)
+   * gets THAT manifest refreshed, not the unmounted `.macf/plugin` default.
+   */
+  readonly targetDir?: string;
 }
 
 /**
@@ -49,6 +57,32 @@ export interface FetchPluginOptions {
  */
 export function workspacePluginDir(workspaceDir: string): string {
   return join(resolve(workspaceDir), '.macf', 'plugin');
+}
+
+/** The shape of `plugin.json`'s `mcpServers` block this module reads/writes. */
+type McpServersManifest = {
+  mcpServers?: Record<string, { command?: string; args?: string[] } | undefined>;
+};
+
+/**
+ * Best-effort read of a plugin dir's `.claude-plugin/plugin.json`. Returns
+ * `null` on any absence/parse failure — shared by `pinChannelServerVersion`
+ * (write) and `readPinnedChannelServerVersion` (read-back, macf#889) so both
+ * agree on what counts as "nothing there to touch."
+ */
+function readManifest(pluginDir: string): McpServersManifest | null {
+  const manifestPath = join(pluginDir, '.claude-plugin', 'plugin.json');
+  if (!existsSync(manifestPath)) return null;
+  try {
+    return JSON.parse(readFileSync(manifestPath, 'utf-8')) as McpServersManifest;
+  } catch {
+    return null;
+  }
+}
+
+export interface PinChannelServerVersionOptions {
+  /** Read/write this absolute plugin dir instead of `workspacePluginDir(workspaceDir)` (macf#889). */
+  readonly targetDir?: string;
 }
 
 /**
@@ -74,19 +108,15 @@ export function workspacePluginDir(workspaceDir: string): string {
  * non-npx command (the legacy `node ${CLAUDE_PLUGIN_ROOT}/dist/server.js` form
  * needs no pin), or carries no channel-server arg. Returns true iff it rewrote.
  */
-export function pinChannelServerVersion(workspaceDir: string, version: string): boolean {
-  const manifestPath = join(workspacePluginDir(workspaceDir), '.claude-plugin', 'plugin.json');
-  if (!existsSync(manifestPath)) return false;
-
-  let manifest: {
-    mcpServers?: Record<string, { command?: string; args?: string[] } | undefined>;
-  };
-  try {
-    manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
-  } catch {
-    // Malformed manifest — don't clobber it; leave for the operator to fix.
-    return false;
-  }
+export function pinChannelServerVersion(
+  workspaceDir: string,
+  version: string,
+  options: PinChannelServerVersionOptions = {},
+): boolean {
+  const pluginDir = options.targetDir ?? workspacePluginDir(workspaceDir);
+  const manifestPath = join(pluginDir, '.claude-plugin', 'plugin.json');
+  const manifest = readManifest(pluginDir);
+  if (manifest === null) return false;
 
   const servers = manifest.mcpServers;
   if (!servers || typeof servers !== 'object') return false;
@@ -111,6 +141,32 @@ export function pinChannelServerVersion(workspaceDir: string, version: string): 
 }
 
 /**
+ * Read back the channel-server version currently pinned in `pluginDir`'s
+ * manifest — the read-back half of `pinChannelServerVersion`'s write, used as
+ * `macf update`'s post-upgrade result-invariant assertion (macf#889 Pattern
+ * A): "the upgrade wrote a file" is not "the write reached the thing being
+ * upgraded," which was macf#889's entire failure shape.
+ *
+ * Returns `null` when there's nothing to compare — manifest absent/malformed,
+ * no `mcpServers`, the legacy non-npx form, or no channel-server arg at all.
+ * "Nothing to verify" is deliberately NOT a mismatch; callers only flag a
+ * problem when a real pin was found and it disagrees with the target.
+ */
+export function readPinnedChannelServerVersion(pluginDir: string): string | null {
+  const manifest = readManifest(pluginDir);
+  if (manifest === null) return null;
+  const servers = manifest.mcpServers;
+  if (!servers || typeof servers !== 'object') return null;
+  for (const server of Object.values(servers)) {
+    if (!server || server.command !== 'npx' || !Array.isArray(server.args)) continue;
+    for (const arg of server.args) {
+      if (arg.startsWith(`${CHANNEL_SERVER_PKG}@`)) return arg.slice(CHANNEL_SERVER_PKG.length + 1);
+    }
+  }
+  return null;
+}
+
+/**
  * Clone macf-marketplace at `v<version>`, extract the plugin subdir to
  * `<workspace>/.macf/plugin/`. Idempotent: an existing plugin dir is
  * removed before the new one is written, so re-running gives a clean
@@ -125,7 +181,7 @@ export function fetchPluginToWorkspace(
 ): void {
   const marketplaceUrl = options.marketplaceUrl ?? DEFAULT_MARKETPLACE_URL;
   const pluginSubdir = options.pluginSubdir ?? DEFAULT_PLUGIN_SUBDIR;
-  const target = workspacePluginDir(workspaceDir);
+  const target = options.targetDir ?? workspacePluginDir(workspaceDir);
 
   // git tag for plugin versions is `v<semver>` (e.g. v0.1.0).
   const tag = `v${version}`;
@@ -218,6 +274,8 @@ export interface LinkPluginCliDistOptions {
    * running CLI's own dist is resolved from `import.meta.url`.
    */
   readonly cliDistDir?: string;
+  /** Link into this absolute plugin dir instead of `workspacePluginDir(workspaceDir)` (macf#889). */
+  readonly targetDir?: string;
 }
 
 /**
@@ -249,7 +307,7 @@ export function linkPluginCliDist(
   const cliDistDir = options.cliDistDir ?? resolveCliDistDir();
   if (cliDistDir === null) return false;
 
-  const pluginDir = workspacePluginDir(workspaceDir);
+  const pluginDir = options.targetDir ?? workspacePluginDir(workspaceDir);
   if (!existsSync(pluginDir)) return false;
 
   const target = join(pluginDir, 'dist');
