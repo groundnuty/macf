@@ -93,11 +93,12 @@ function agentRepoDepsFor(): AgentRepoDeps {
 const SENTINEL_CA_KEY_PEM = 'SENTINEL-CA-KEY-PEM';
 const SENTINEL_CA_CERT_PEM = 'SENTINEL-CA-CERT-PEM';
 /**
- * `checkRunnerRegistered` defaults to `'present'` (macf#922) — every
- * PRE-EXISTING fixture in this file that relies on `trustDepsFor()`'s
- * default to exercise the routing-var WRITE path (not the register-before-
- * route gate specifically) keeps doing so unchanged; the dedicated
- * register-before-route tests below override it explicitly.
+ * `checkRunnerUsableByRepo` defaults to `{ presence: 'present' }` (macf#922,
+ * org-scope-corrected by macf#924) — every PRE-EXISTING fixture in this file
+ * that relies on `trustDepsFor()`'s default to exercise the routing-var
+ * WRITE path (not the register-before-route gate specifically) keeps doing
+ * so unchanged; the dedicated register-before-route tests below override it
+ * explicitly.
  */
 function trustDepsFor(overrides: Partial<CaApplyDeps & RunnerRegistrationDeps> = {}): CaApplyDeps & RunnerRegistrationDeps {
   return {
@@ -107,7 +108,7 @@ function trustDepsFor(overrides: Partial<CaApplyDeps & RunnerRegistrationDeps> =
     checkRepoPresence: async () => 'absent',
     createRepoVariable: async () => 'created',
     mintCa: async () => ({ certPem: SENTINEL_CA_CERT_PEM, keyPem: SENTINEL_CA_KEY_PEM }),
-    checkRunnerRegistered: async () => 'present',
+    checkRunnerUsableByRepo: async () => ({ presence: 'present' }),
     ...overrides,
   };
 }
@@ -1063,7 +1064,7 @@ trust:
         mintCa: async () => {
           throw new Error('must not be called — foreign control repo, CA is never minted');
         },
-        checkRunnerRegistered: async () => {
+        checkRunnerUsableByRepo: async () => {
           throw new Error('must not be called');
         },
       },
@@ -1462,7 +1463,7 @@ trust:
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
-        trustDeps: trustDepsFor({ checkRunnerRegistered: async () => 'absent' }),
+        trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
@@ -1476,7 +1477,7 @@ trust:
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
-        trustDeps: trustDepsFor({ checkRunnerRegistered: async () => 'unknown' }),
+        trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'unknown' }) }),
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
@@ -1488,12 +1489,38 @@ trust:
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
-        trustDeps: trustDepsFor({ checkRunnerRegistered: async () => 'absent' }),
+        trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
       const rendered = formatApplyResult(result);
 
       expect(rendered).toMatch(/groundnuty\/demo-code: SKIPPED — no self-hosted runner is confirmed registered/);
+    });
+
+    // --- macf#924 — the org-admin handover survives end-to-end into the rendered report ---
+
+    it('an org-admin handover (macf#924 — org runner exists, group excludes the repo) renders through formatApplyResult, not just the raw outcome map', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRunnerUsableByRepo: async () => ({
+            presence: 'absent',
+            handover:
+              'An org-level self-hosted runner IS registered in "groundnuty", but its runner group\'s repository-access ' +
+              'list excludes "groundnuty/demo-code" — an org admin must add this repo at: ' +
+              'https://github.com/organizations/groundnuty/settings/actions/runner-groups/7. This tool cannot perform ' +
+              'that step itself (org-admin action; macf#924).',
+          }),
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+      const rendered = formatApplyResult(result);
+
+      expect(rendered).toMatch(/groundnuty\/demo-code: SKIPPED — no self-hosted runner is confirmed registered/);
+      expect(rendered).toContain('an org admin must add this repo at');
+      expect(rendered).toContain('runner-groups/7');
     });
 
     it('CA + routing legs are skipped for an agent whose repo-ensure FAILED this run — nothing is written to a repo that does not exist', async () => {

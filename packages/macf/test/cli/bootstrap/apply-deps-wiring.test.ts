@@ -39,7 +39,7 @@ import {
   checkRegistryVariablePresence,
   checkRepoSecretPresence,
   checkRepoVariablePresence,
-  checkRunnerRegistered,
+  checkRunnerUsableByRepo,
   readRegistryVariable,
 } from '../../../src/cli/bootstrap/observer.js';
 import { realMintRoutingClient, realSetRepoSecret } from '../../../src/cli/bootstrap/apply-routing-client.js';
@@ -124,9 +124,11 @@ describe('apply real-deps wiring (macf#857 — the seam a unit test cannot see)'
   // `publishTrustedActors` was defined + unit-tested against a fake, and
   // could ship with `resolveMutateDeps` never wiring the REAL live check in
   // at all (the exact "defined, tested, never called" shape this file
-  // exists to catch — see the module doc).
-  it('wires the runner-registration check to observer.ts\'s real live gh-api read (register-before-route, macf#922)', () => {
-    expect(deps.trustDeps.checkRunnerRegistered).toBe(checkRunnerRegistered);
+  // exists to catch — see the module doc). macf#924 renamed the wired
+  // function from `checkRunnerRegistered` to `checkRunnerUsableByRepo`
+  // (org-scope-corrected) — this identity assertion pins the NEW name.
+  it('wires the runner-usability check to observer.ts\'s real live gh-api read (register-before-route, macf#922/#924)', () => {
+    expect(deps.trustDeps.checkRunnerUsableByRepo).toBe(checkRunnerUsableByRepo);
   });
 
   // --- groundnuty/macf#920 gap 2 — the routing-client re-mint wiring ---

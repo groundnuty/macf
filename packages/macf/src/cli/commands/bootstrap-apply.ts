@@ -57,7 +57,7 @@ import {
   checkRepoSecretPresence,
   checkRepoVariablePresence,
   checkRegistryVariablePresence,
-  checkRunnerRegistered,
+  checkRunnerUsableByRepo,
   readRegistryVariable,
 } from '../bootstrap/observer.js';
 import { realCreateRepo } from '../bootstrap/repo-create.js';
@@ -454,11 +454,12 @@ const REAL_AGENT_REPO_DEPS: AgentRepoDeps = {
  * real CA-ceremony + two-place-publish + routing-var deps. Every
  * presence-check function here is the SAME one `observer.ts`'s plan-time
  * reads already use (`checkRegistryVariablePresence` / `readRegistryVariable`
- * / `checkRepoVariablePresence` / `checkRunnerRegistered`) — plan and apply
- * agree on what "present"/"registered" means at the exact same call sites,
- * by construction, not by convention. `checkRunnerRegistered` (macf#922) is
- * the register-before-route gate `apply-routing.ts::publishTrustedActors`
- * checks per-repo before every write.
+ * / `checkRepoVariablePresence` / `checkRunnerUsableByRepo`) — plan and apply
+ * agree on what "present"/"registered-and-usable" means at the exact same
+ * call sites, by construction, not by convention. `checkRunnerUsableByRepo`
+ * (macf#922, org-scope-corrected by macf#924) is the register-before-route
+ * gate `apply-routing.ts::publishTrustedActors` checks per-repo before every
+ * write.
  */
 const REAL_TRUST_DEPS: CaApplyDeps & RunnerRegistrationDeps = {
   checkRegistryPresence: checkRegistryVariablePresence,
@@ -467,7 +468,7 @@ const REAL_TRUST_DEPS: CaApplyDeps & RunnerRegistrationDeps = {
   checkRepoPresence: checkRepoVariablePresence,
   createRepoVariable: realCreateRepoVariable,
   mintCa: realMintCa,
-  checkRunnerRegistered,
+  checkRunnerUsableByRepo,
 };
 
 /**

@@ -163,14 +163,27 @@ export interface ObservedState {
   /** The `MACF_TRUSTED_ACTORS` value observed on a caller repo, if any (macf#922 — was `MACF_ROUTING_RUNS_ON`, a variable the v3 router never reads; see `apply-routing.ts`'s doc). */
   readonly routingTrustedActors?: string;
   /**
-   * Register-before-route gate (macf#922) — whether a self-hosted runner is
-   * CONFIRMED REGISTERED on the representative caller repo. This is what
-   * lets `routingItem` state the runner CLASS the fleet will actually route
-   * on (self-hosted vs. github-hosted-and-billed) — a `runs_on: self-hosted`
-   * manifest declaration alone is aspirational; the router only self-hosts
-   * once BOTH the trust var is set AND a runner is registered.
+   * Register-before-route gate (macf#922, corrected for the org-runner-blind
+   * cost regression by macf#924) — whether a self-hosted runner is
+   * CONFIRMED REGISTERED AND USABLE by the representative caller repo
+   * (repo-scoped OR org-scoped-with-visibility-admitting-this-repo — see
+   * `observer.ts::checkRunnerUsableByRepo`). This is what lets `routingItem`
+   * state the runner CLASS the fleet will actually route on (self-hosted
+   * vs. github-hosted-and-billed) — a `runs_on: self-hosted` manifest
+   * declaration alone is aspirational; the router only self-hosts once BOTH
+   * the trust var is set AND a runner is registered.
    */
   readonly routingRunnerRegistered?: Presence;
+  /**
+   * Org-admin handover message (macf#924) — set only when an org-level
+   * runner IS registered but its group's repository-access list excludes
+   * the representative caller repo (`routingRunnerRegistered` will be
+   * `'absent'` or `'unknown'` in that case, never `'present'`). Names the
+   * manual org-admin action; this tool never performs it itself. See
+   * `observer.ts::RunnerUsability.handover`'s doc for the full outcome
+   * matrix.
+   */
+  readonly routingRunnerHandover?: string;
   /**
    * DR-043 Amendment G (groundnuty/macf#867) — the `<fleet>-control` repo's
    * own presence. REQUIRED, not optional: an unobservable read must render
@@ -706,12 +719,19 @@ function routingClientItem(repo: string, presence: Presence): PlanItem {
  * must name the billing consequence BEFORE the operator approves apply: a
  * private repo billed github-hosted draws down the account's Actions-minutes
  * quota; self-hosted is free). ALWAYS stated from a LIVE register-before-
- * route check (`runnerRegistered`), never from the manifest's aspirational
- * `runs_on: self-hosted` declaration alone — a declaration with no
- * registered runner still routes github-hosted today, regardless of what
- * `MACF_TRUSTED_ACTORS` ends up containing.
+ * route check (`runnerRegistered`, macf#924-corrected to include org-scope —
+ * see `observer.ts::checkRunnerUsableByRepo`), never from the manifest's
+ * aspirational `runs_on: self-hosted` declaration alone — a declaration with
+ * no registered-and-usable runner still routes github-hosted today,
+ * regardless of what `MACF_TRUSTED_ACTORS` ends up containing.
+ *
+ * `handover` (macf#924) is appended verbatim when set — the org-admin
+ * action the operator needs BEFORE approving apply, surfaced at plan time
+ * rather than discovered only after apply silently skips the write. The
+ * original wording for the no-handover branches is preserved UNCHANGED
+ * (only the suffix is new) so this stays a strict extension.
  */
-function runnerClassReason(runnerRegistered: Presence | undefined, representativeRepo: string | undefined): string {
+function runnerClassReason(runnerRegistered: Presence | undefined, representativeRepo: string | undefined, handover: string | undefined): string {
   const repoLabel = representativeRepo ?? '(no agent repos declared)';
   if (runnerRegistered === 'present') {
     return `Runner class: self-hosted (a runner is confirmed registered on "${repoLabel}").`;
@@ -720,9 +740,10 @@ function runnerClassReason(runnerRegistered: Presence | undefined, representativ
     runnerRegistered === 'absent'
       ? `no self-hosted runner is confirmed registered on "${repoLabel}"`
       : `runner registration on "${repoLabel}" could not be confirmed (auth / network / insufficient scope)`;
+  const handoverSuffix = handover !== undefined ? ` ${handover}` : '';
   return (
     `Runner class: github-hosted (billed on private repos) — ${cause} yet; MACF_TRUSTED_ACTORS will NOT be ` +
-    'written by apply until one is (register-before-route).'
+    `written by apply until one is (register-before-route).${handoverSuffix}`
   );
 }
 
@@ -741,6 +762,7 @@ function routingItem(
   observedTrustedActors: string | undefined,
   runnerRegistered: Presence | undefined,
   representativeRepo: string | undefined,
+  runnerHandover: string | undefined,
 ): PlanItem {
   const target = `routing:${fleetName}:runner`;
 
@@ -756,7 +778,7 @@ function routingItem(
     };
   }
 
-  const classSuffix = runnerClassReason(runnerRegistered, representativeRepo);
+  const classSuffix = runnerClassReason(runnerRegistered, representativeRepo, runnerHandover);
 
   if (observedTrustedActors === undefined) {
     return {
@@ -983,6 +1005,7 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
         observed.routingTrustedActors,
         observed.routingRunnerRegistered,
         representativeRepo,
+        observed.routingRunnerHandover,
       ),
     );
   }

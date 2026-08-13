@@ -296,6 +296,37 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
     expect(routing?.reason).toMatch(/Runner class: github-hosted \(billed on private repos\)/);
   });
+
+  // --- macf#924 — org-admin handover surfaces in the plan's runner-class line ---
+
+  it('appends the org-admin handover to the runner-class reason when an org runner exists but excludes the repo', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingRunnerRegistered: 'absent',
+      routingRunnerHandover:
+        'An org-level self-hosted runner IS registered in "groundnuty", but its runner group\'s repository-access ' +
+        'list excludes "groundnuty/icsoc-2026-science-agent" — an org admin must add this repo at: ' +
+        'https://github.com/organizations/groundnuty/settings/actions/runner-groups/7. This tool cannot perform ' +
+        'that step itself (org-admin action; macf#924).',
+    };
+    const plan = computePlan(manifest, observed);
+    const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+    // Original wording is preserved verbatim (strict extension, not a rewrite).
+    expect(routing?.reason).toMatch(/Runner class: github-hosted \(billed on private repos\)/);
+    expect(routing?.reason).toMatch(/no self-hosted runner is confirmed registered/);
+    // The handover is appended.
+    expect(routing?.reason).toContain('an org admin must add this repo at');
+    expect(routing?.reason).toContain('runner-groups/7');
+  });
+
+  it('never appends a handover when none was observed (the common absent/unknown case)', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: 'absent' };
+    const plan = computePlan(manifest, observed);
+    const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+    expect(routing?.reason).not.toMatch(/org admin/);
+  });
 });
 
 describe('computePlan — an observed extra agent → report-extra, NEVER delete', () => {
