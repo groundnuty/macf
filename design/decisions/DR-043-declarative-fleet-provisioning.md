@@ -327,7 +327,7 @@ The phasing maps onto Amendment A's two observability tiers: phase 2 operates in
 
 | Verb | Removes | Revival cost |
 |---|---|---|
-| **`deactivate`** | the fleet's **org/account-scope registry presence** — the `<SEG>_CA_CERT` registry leg, the `MACF_<PROJECT>_AGENT_<NAME>` registrations, `<SEG>_FEDERATED_CAS` | `apply` — **0 clicks** |
+| **`deactivate`** | the fleet's **org/account-scope registry presence** — the `<SEG>_CA_CERT` registry leg, the `<SEG>_AGENT_<AGENT-SEG>` registrations, `<SEG>_FEDERATED_CAS` | `apply` — **0 clicks** |
 | **`archive`** | + archives the control + agent repos | un-archive (API) + `apply` — **0 clicks** |
 | **`delete-apps`** | + deletes the agent GitHub App identities (frees the globally-unique names) | recreate Apps (**2 clicks/agent**, App creation browser-only) + `apply` |
 | **`destroy`** | + deletes the repositories | full re-provision; **history gone forever** |
@@ -359,6 +359,12 @@ Reads work on archived repos (read-only ≠ unreadable), so the content check is
 - **Refuse a foreign control repo** (reuse the name-match `classifyControlRepoOwnership` above) — teardown cannot be aimed at another fleet's control plane.
 - **Report what could not be done**, never exit green — if App deletion needs a browser, name which Apps remain and where to click (silence here is the #854 shape in its worse direction).
 - **Explicitly NOT reconcile** — §D3's no-prune governs *reconcile*; these are deliberate operator acts on a named fleet, which is why they are separate verbs, not plan verbs.
+
+**Correction (2026-08-13, macf#903) — the registration-key formula, and why it is pinned by test.** This amendment originally wrote the agent-registration variable as `MACF_<PROJECT>_AGENT_<NAME>`. That is **wrong**: the authority is `@groundnuty/macf-core`'s `createRegistry` (`registry.ts`), which computes `${toVariableSegment(project)}_AGENT_${toVariableSegment(agentName)}` — **no separate `MACF_` prefix is ever prepended**. Verified three ways: the writer's source, and the live registry (`MACF_AGENT_CODE_AGENT`, `ICSOC_2026_AGENT_CODE_AGENT`, `PPAM_2026_AGENT_SCIENCE_AGENT`). The mistaken form names `MACF_ICSOC_2026_AGENT_…` for a non-substrate fleet, which exists nowhere.
+
+**The failure it would have caused is the reason this note exists:** `deactivate` built from the prose would compute keys matching nothing, delete nothing, and **report success** — silent under-deletion on the verb whose entire job is deletion, leaving a fleet addressable while telling the operator it was torn down. Note the shape: this amendment escalated *exact-key targeting* to a first-class rail so a prefix sweep could not destroy another fleet's registration — and then specified the target by a **remembered formula instead of the writer's derivation**, which is `silent-fallback-hazards.md` **Instance 20**'s class (subject named by convention rather than resolved from the authority) committed inside the specification written to prevent it. Over-deletion and under-deletion are the same defect facing opposite directions.
+
+**Rule this establishes for target formulas generally:** a DR sentence is a *description* of a writer; **the writer is the authority, and where they disagree the DR is wrong by definition.** Implementations MUST pin such formulas against the real writer in test (as `macf#903` does) rather than re-derive them from prose.
 
 ### `destroy` — friction is the feature
 
