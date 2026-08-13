@@ -108,7 +108,21 @@ describe('applyRepoInitForAgent', () => {
       },
     };
     const outcome = await applyRepoInitForAgent(AGENT, MANIFEST, deps);
-    expect(outcome).toEqual({ repo: 'groundnuty/demo-code', role: 'code-agent', status: 'applied', pushed: true });
+    // No `tokenSource` given (this describe block's beforeEach also strips
+    // ambient GH_TOKEN/APP_ID/etc), so `repoInit`'s own `generateToken()`
+    // degrades to `labels: {status:'skipped'}` — the PRE-EXISTING,
+    // acknowledged gap for the `reused`/`resumed-install` paths this
+    // increment does NOT close (groundnuty/macf#920's "Thread the
+    // freshly-created credentials" scope is `created` only — see
+    // `applyRepoInitForCreatedAgent`'s doc in `apply-fleet.ts`). Leniently
+    // scored `'applied'` — see `labelsAreGoodEnough`'s doc.
+    expect(outcome).toEqual({
+      repo: 'groundnuty/demo-code',
+      role: 'code-agent',
+      status: 'applied',
+      pushed: true,
+      labels: { status: 'skipped', reason: expect.stringContaining('APP_ID') },
+    });
     expect(commits).toHaveLength(1);
     expect(commits[0]?.message).toMatch(/repo-init/);
   });
@@ -119,7 +133,13 @@ describe('applyRepoInitForAgent', () => {
       commitAndPush: async () => 'nothing-to-commit',
     };
     const outcome = await applyRepoInitForAgent(AGENT, MANIFEST, deps);
-    expect(outcome).toEqual({ repo: 'groundnuty/demo-code', role: 'code-agent', status: 'applied', pushed: false });
+    expect(outcome).toEqual({
+      repo: 'groundnuty/demo-code',
+      role: 'code-agent',
+      status: 'applied',
+      pushed: false,
+      labels: { status: 'skipped', reason: expect.stringContaining('APP_ID') },
+    });
   });
 
   it('local registry -> failed BEFORE any clone attempt', async () => {
@@ -209,6 +229,7 @@ describe('applyRepoInitForAgent', () => {
     let seenOpts: unknown;
     const fakeRepoInit = vi.fn(async (_dir: string, opts: unknown) => {
       seenOpts = opts;
+      return { workflow: 'created' as const, config: 'updated' as const, labels: { status: 'ok' as const, created: [], existed: [] } };
     });
     const deps: RepoInitStepDeps = {
       cloneRepo: fakeCloneRepo(),
@@ -217,6 +238,70 @@ describe('applyRepoInitForAgent', () => {
     };
     await applyRepoInitForAgent(AGENT, MANIFEST, deps);
     expect(seenOpts).toMatchObject({ repo: 'groundnuty/demo-code', agents: 'code-agent', force: false, project: 'demo-fleet' });
+  });
+
+  // --- groundnuty/macf#920 gap 1 — tokenSource threading ---
+
+  it('opts.tokenSource is threaded verbatim into repoInit\'s own tokenSource option', async () => {
+    let seenOpts: unknown;
+    const fakeRepoInit = vi.fn(async (_dir: string, opts: unknown) => {
+      seenOpts = opts;
+      return { workflow: 'created' as const, config: 'updated' as const, labels: { status: 'ok' as const, created: ['code-agent'], existed: [] } };
+    });
+    const deps: RepoInitStepDeps = { cloneRepo: fakeCloneRepo(), commitAndPush: async () => 'pushed', repoInit: fakeRepoInit as never };
+    const tokenSource = { appId: 'app-1', installId: 'install-1', keyPath: '/scratch/key.pem' };
+    const outcome = await applyRepoInitForAgent(AGENT, MANIFEST, deps, { tokenSource });
+    expect(seenOpts).toMatchObject({ tokenSource });
+    expect(outcome).toEqual({
+      repo: 'groundnuty/demo-code',
+      role: 'code-agent',
+      status: 'applied',
+      pushed: true,
+      labels: { status: 'ok', created: ['code-agent'], existed: [] },
+    });
+  });
+
+  it('tokenSource given + labels partial-failure -> status FAILED (a fleet missing labels cannot route), workflow/config STILL pushed', async () => {
+    const commits: { dir: string }[] = [];
+    const fakeRepoInit = vi.fn(
+      async () =>
+        ({
+          workflow: 'created' as const,
+          config: 'updated' as const,
+          labels: { status: 'partial-failure' as const, created: [], existed: ['in-progress'], failed: ['code-agent'] },
+        }) as never,
+    );
+    const deps: RepoInitStepDeps = {
+      cloneRepo: fakeCloneRepo(),
+      commitAndPush: async (dir) => {
+        commits.push({ dir });
+        return 'pushed';
+      },
+      repoInit: fakeRepoInit as never,
+    };
+    const tokenSource = { appId: 'app-1', installId: 'install-1', keyPath: '/scratch/key.pem' };
+    const outcome = await applyRepoInitForAgent(AGENT, MANIFEST, deps, { tokenSource });
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).toMatch(/label creation failed/);
+      expect(outcome.reason).toMatch(/code-agent/);
+      expect(outcome.reason).toMatch(/pushed/);
+      expect(outcome.reason).toMatch(/groundnuty\/macf#920/);
+    }
+    // The routing config STILL landed — a label failure doesn't withhold the
+    // workflow/config commit, only the overall step outcome.
+    expect(commits).toHaveLength(1);
+  });
+
+  it('tokenSource given + labels skipped (token mint itself failed even with credentials) -> status FAILED', async () => {
+    const fakeRepoInit = vi.fn(
+      async () => ({ workflow: 'created' as const, config: 'updated' as const, labels: { status: 'skipped' as const, reason: 'gh not on PATH' } }) as never,
+    );
+    const deps: RepoInitStepDeps = { cloneRepo: fakeCloneRepo(), commitAndPush: async () => 'pushed', repoInit: fakeRepoInit as never };
+    const tokenSource = { appId: 'app-1', installId: 'install-1', keyPath: '/scratch/key.pem' };
+    const outcome = await applyRepoInitForAgent(AGENT, MANIFEST, deps, { tokenSource });
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/label creation was skipped/);
   });
 });
 

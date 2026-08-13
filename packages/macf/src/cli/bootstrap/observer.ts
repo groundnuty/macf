@@ -153,6 +153,30 @@ export async function checkRepoVariablePresence(repo: string, name: string): Pro
 }
 
 /**
+ * Read-only repo-scoped Actions-SECRET existence check (groundnuty/macf#920)
+ * — the `GET /repos/<repo>/actions/secrets/<name>` sibling of
+ * {@link checkRepoVariablePresence}. GitHub's secrets API is write-only (a
+ * 200 here returns only `{name, created_at, updated_at}` metadata, NEVER the
+ * value) so this is the ONLY presence signal available — unlike a variable,
+ * there is no create-endpoint 409 to lean on for a create-only guarantee
+ * (`apply-routing-client.ts::publishRoutingClientSecrets`'s doc explains how
+ * that module still stays create-only via a presence-check-BEFORE-write,
+ * non-atomic but sufficient for an operator-driven, non-concurrent bootstrap
+ * tool). A `gh`-reported 404 is a confident `'absent'`; any other failure
+ * degrades to `'unknown'`. NEVER throws.
+ */
+export async function checkRepoSecretPresence(repo: string, name: string): Promise<Presence> {
+  try {
+    await execFileAsync('gh', ['api', `repos/${repo}/actions/secrets/${name}`], { encoding: 'utf-8' });
+    return 'present';
+  } catch (err) {
+    const stderr = getStderr(err);
+    if (/HTTP 404|Not Found/i.test(stderr)) return 'absent';
+    return 'unknown';
+  }
+}
+
+/**
  * Read-only registry-scope Actions-variable EXISTENCE check — the other leg
  * of the DR two-place rule (macf#806): the CA var lives on the registry
  * (`owner.registry`: profile/org/repo scope) AND on every agent repo (see
@@ -336,6 +360,10 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
 
   const agents: Record<string, ObservedAgentState> = {};
   const caRepos: Record<string, Presence> = {};
+  // groundnuty/macf#920 gap 2 — same read `apply-fleet.ts`'s routing-client
+  // publish step uses (`RoutingClientApplyDeps.checkRepoSecretPresence`), so
+  // plan and apply agree on presence by construction.
+  const routingClientRepos: Record<string, Presence> = {};
 
   for (const agent of manifest.agents) {
     const lockEntry = lock?.agents.find((a) => a.role === agent.role);
@@ -352,6 +380,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       actionsPin,
     };
     caRepos[agent.repo] = await checkRepoVariablePresence(agent.repo, caVarName);
+    routingClientRepos[agent.repo] = await checkRepoSecretPresence(agent.repo, 'ROUTING_CLIENT_CERT');
   }
 
   const caRegistry = await checkRegistryVariablePresence(manifest.owner.registry, caVarName);
@@ -375,6 +404,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     agents,
     caRegistry,
     caRepos,
+    routingClientRepos,
     routingRunsOn,
     controlRepoPresence: controlRepoMeta.presence,
     controlRepoArchived: controlRepoMeta.archived,

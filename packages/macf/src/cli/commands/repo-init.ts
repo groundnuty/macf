@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { generateToken } from '@groundnuty/macf-core';
-import type { RegistryConfig } from '@groundnuty/macf-core';
+import type { RegistryConfig, TokenSource } from '@groundnuty/macf-core';
 import { registryPathPrefix } from '../registry-helper.js';
 import { isValidProjectName } from '../config.js';
 import { resolveActionsRefToFullTag, isImmutableActionsTag } from '../version-resolver.js';
@@ -12,6 +12,19 @@ export interface RepoInitOptions {
   readonly actionsVersion: string;
   readonly agents?: string;
   readonly force: boolean;
+  /**
+   * Explicit App credentials for the label-creation token mint (groundnuty/macf#920)
+   * — threaded by `apply-repo-init.ts` from a freshly-created App's in-memory
+   * credentials so `generateToken` doesn't have to fall back to ambient
+   * `GH_TOKEN`/`APP_ID`/`INSTALL_ID`/`KEY_PATH` env vars (which a Mac-side
+   * `macf bootstrap apply` run never has — it operates as the OPERATOR, not
+   * as the just-minted bot). Omitted (the default) preserves the exact
+   * pre-#920 behavior: `generateToken()` falls through its own env-var
+   * chain, degrading to a `labels: {status:'skipped'}` outcome when none of
+   * those are set — the normal case for an interactive `macf repo-init`
+   * run before an App/token exists yet.
+   */
+  readonly tokenSource?: TokenSource;
   /**
    * Optional shared tmux session name. When provided alongside 2+ agents,
    * all agents share this session and each is given a `tmux_window` equal
@@ -101,6 +114,26 @@ interface LabelSpec {
   readonly name: string;
   readonly color: string;
   readonly description: string;
+}
+
+/**
+ * The outcome of `repoInit`'s label-creation step (groundnuty/macf#920).
+ * `'skipped'` is the pre-#920 degrade (no usable token — informational, not
+ * fatal, for the plain interactive CLI); `'ok'`/`'partial-failure'`
+ * distinguish "every expected label is now present" from "some label POST
+ * genuinely failed" so a caller with a stake in routing actually working
+ * (`apply-repo-init.ts`) can tell the two apart instead of both reading as
+ * "repo-init succeeded."
+ */
+export type LabelsOutcome =
+  | { readonly status: 'skipped'; readonly reason: string }
+  | { readonly status: 'ok'; readonly created: readonly string[]; readonly existed: readonly string[] }
+  | { readonly status: 'partial-failure'; readonly created: readonly string[]; readonly existed: readonly string[]; readonly failed: readonly string[] };
+
+export interface RepoInitResult {
+  readonly workflow: 'created' | 'skipped';
+  readonly config: 'created' | 'updated' | 'skipped';
+  readonly labels: LabelsOutcome;
 }
 
 const STATUS_LABELS: readonly LabelSpec[] = [
@@ -510,7 +543,7 @@ function writeFileSafe(path: string, content: string, force: boolean): 'created'
 export async function repoInit(
   projectDir: string,
   opts: RepoInitOptions,
-): Promise<void> {
+): Promise<RepoInitResult> {
   const absDir = resolve(projectDir);
 
   validateVersion(opts.actionsVersion);
@@ -644,14 +677,14 @@ export async function repoInit(
 
   let token: string;
   try {
-    token = await generateToken();
+    token = await generateToken(opts.tokenSource);
   } catch (err) {
-    process.stderr.write(
-      `Warning: could not generate token (${err instanceof Error ? err.message : 'unknown'}). Skipping label creation.\n`,
-    );
-    printResults(workflowResult, configResult, [], [], []);
+    const reason = err instanceof Error ? err.message : 'unknown';
+    process.stderr.write(`Warning: could not generate token (${reason}). Skipping label creation.\n`);
+    const labels: LabelsOutcome = { status: 'skipped', reason };
+    printResults(workflowResult, configResult, labels);
     printNextSteps(configResult, agentList);
-    return;
+    return { workflow: workflowResult, config: configResult, labels };
   }
 
   const created: string[] = [];
@@ -665,23 +698,30 @@ export async function repoInit(
     else failed.push(spec.name);
   }
 
-  printResults(workflowResult, configResult, created, existed, failed);
+  // groundnuty/macf#920 — `failed` is NOT swallowed into the same "success"
+  // shape as `created`/`existed`: a caller that threaded a real tokenSource
+  // (i.e. can actually tell whether this run COULD have succeeded) needs to
+  // distinguish "every expected label is present" from "the API rejected
+  // some of them" — see `apply-repo-init.ts`'s use of this field.
+  const labels: LabelsOutcome = failed.length === 0 ? { status: 'ok', created, existed } : { status: 'partial-failure', created, existed, failed };
+
+  printResults(workflowResult, configResult, labels);
   printNextSteps(configResult, agentList);
+  return { workflow: workflowResult, config: configResult, labels };
 }
 
 function printResults(
   workflowResult: 'created' | 'skipped',
   configResult: 'created' | 'updated' | 'skipped',
-  created: readonly string[],
-  existed: readonly string[],
-  failed: readonly string[],
+  labels: LabelsOutcome,
 ): void {
   if (workflowResult === 'created') console.log('✓ Created .github/workflows/agent-router.yml');
   if (configResult === 'created') console.log('✓ Created .github/agent-config.json');
   if (configResult === 'updated') console.log('✓ Patched .github/agent-config.json (preserving existing entries)');
-  if (created.length > 0) console.log(`✓ Created labels: ${created.join(', ')}`);
-  if (existed.length > 0) console.log(`  Labels already exist: ${existed.join(', ')}`);
-  if (failed.length > 0) console.error(`✗ Failed to create labels: ${failed.join(', ')}`);
+  if (labels.status === 'skipped') return; // the "Skipping label creation" warning was already printed at the call site
+  if (labels.created.length > 0) console.log(`✓ Created labels: ${labels.created.join(', ')}`);
+  if (labels.existed.length > 0) console.log(`  Labels already exist: ${labels.existed.join(', ')}`);
+  if (labels.status === 'partial-failure') console.error(`✗ Failed to create labels: ${labels.failed.join(', ')}`);
 }
 
 function printNextSteps(

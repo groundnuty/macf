@@ -35,7 +35,13 @@ import { realDeleteRepo } from '../../../src/cli/bootstrap/repo-destroy.js';
 import { realShredAgeIdentity } from '../../../src/cli/bootstrap/age-key-shred.js';
 import { realCreateRegistryVariable, realCreateRepoVariable, realMintCa } from '../../../src/cli/bootstrap/apply-ca.js';
 import { realDeleteRegistryVariable } from '../../../src/cli/bootstrap/variable-write.js';
-import { checkRegistryVariablePresence, checkRepoVariablePresence, readRegistryVariable } from '../../../src/cli/bootstrap/observer.js';
+import {
+  checkRegistryVariablePresence,
+  checkRepoSecretPresence,
+  checkRepoVariablePresence,
+  readRegistryVariable,
+} from '../../../src/cli/bootstrap/observer.js';
+import { realMintRoutingClient, realSetRepoSecret } from '../../../src/cli/bootstrap/apply-routing-client.js';
 import { resolveDeleteAppsDeps, resolveDestroyDeps } from '../../../src/cli/commands/fleet-teardown-destructive.js';
 import { checkAppSlugPresence } from '../../../src/cli/bootstrap/app-identity-removal.js';
 
@@ -111,6 +117,33 @@ describe('apply real-deps wiring (macf#857 — the seam a unit test cannot see)'
 
   it('wires the CA mint to the real createCA-backed primitive', () => {
     expect(deps.trustDeps.mintCa).toBe(realMintCa);
+  });
+
+  // --- groundnuty/macf#920 gap 2 — the routing-client re-mint wiring ---
+  //
+  // The EXACT "defined, tested, never called" shape this file exists to
+  // catch: `apply-routing-client.ts`'s mint/publish primitives shipped
+  // correct and unit-tested while `resolveMutateDeps` never wired
+  // `routingClientDeps` in at all — the bug this issue fixes. Pin every
+  // field by identity so a FUTURE regression of the same class (a primitive
+  // defined-but-never-wired) fails HERE, not on a live provision.
+
+  it('wires the routing-client mint to certs.ts::mintRoutingClientCert (reused, never a second issuer)', () => {
+    expect(deps.routingClientDeps.mint).toBe(realMintRoutingClient);
+  });
+
+  it('wires the routing-client secret presence-check to observer.ts (the SAME read apply\'s publish step + a future plan-time observer would use)', () => {
+    expect(deps.routingClientDeps.checkRepoSecretPresence).toBe(checkRepoSecretPresence);
+  });
+
+  it('wires the routing-client secret CREATE to the real gh-secret-set-via-stdin primitive', () => {
+    expect(deps.routingClientDeps.setRepoSecret).toBe(realSetRepoSecret);
+  });
+
+  // --- groundnuty/macf#920 gap 1 — repo-init's tokenSource wiring exists (no npm dep added; asserted for completeness) ---
+
+  it('gap 1: repoInitDeps carries no fake/override repoInit — the REAL commands/repo-init.ts::repoInit runs in production (tokenSource threading is per-agent, at the apply-fleet.ts call site, not a fixed dep here)', () => {
+    expect(deps.repoInitDeps.repoInit).toBeUndefined();
   });
 });
 

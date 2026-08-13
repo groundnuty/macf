@@ -142,6 +142,20 @@ export interface ObservedState {
   /** Per-agent-repo `<SEG>_CA_CERT` presence, keyed by `agent.repo`. */
   readonly caRepos: Readonly<Record<string, Presence>>;
   /**
+   * Per-agent-repo `ROUTING_CLIENT_CERT` secret presence (groundnuty/macf#920
+   * gap 2), keyed by `agent.repo`. A proxy for "has this repo received its
+   * routing-client identity" — checks `ROUTING_CLIENT_CERT` only (not also
+   * `ROUTING_CLIENT_KEY`), same one-representative-var simplicity `caRepos`
+   * already applies to the CA leg. Sourced from `observer.ts::checkRepoSecretPresence`
+   * — the SAME read `apply-fleet.ts`'s routing-client publish step uses (via
+   * `RoutingClientApplyDeps.checkRepoSecretPresence`), so plan and apply agree
+   * on presence by construction. Optional (like `routingRunsOn`/`vaultCa`
+   * above) so every pre-#920 hand-built `ObservedState` test fixture keeps
+   * compiling — `routingClientItem` treats an absent entry the same as an
+   * explicit `'unknown'` (see `computePlan`'s call site).
+   */
+  readonly routingClientRepos?: Readonly<Record<string, Presence>>;
+  /**
    * Vault-derived per-project CA key/cert presence (DR-043 Amendment D phase
    * 3) — same undefined-vs-observed convention as {@link ObservedAgentState.vault}.
    */
@@ -175,7 +189,9 @@ export type PlanItemKind =
   | 'agent'
   | 'control_repo'
   | 'version'
-  | 'actions_pin';
+  | 'actions_pin'
+  | 'labels'
+  | 'routing_client';
 export type PlanVerb = 'create' | 'update' | 'noop' | 'report-extra';
 
 export interface PlanItem {
@@ -353,6 +369,18 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // existence check that only ever emits 'create' or 'noop' — so this
       // arm's only live input is 'create'; 'noop' is filtered above.
       return 'implemented';
+    case 'labels':
+      // groundnuty/macf#920 gap 1 — `apply-repo-init.ts::applyRepoInitForAgent`
+      // attempts label creation on EVERY repo-init run (reused/resumed-install/
+      // created), unconditionally. `labelsItem` only ever emits 'create'
+      // (`presenceVerb` is never called for this kind — see its own doc), so
+      // this arm's only live input is 'create'.
+      return 'implemented';
+    case 'routing_client':
+      // groundnuty/macf#920 gap 2 — apply-fleet.ts's routing-client ceremony
+      // publishes create-only when a mint succeeded. Produced by
+      // `presenceVerb`, same 'create'-or-'noop'-only shape as 'ca'.
+      return 'implemented';
     case 'routing':
       // macf#838 Amendment D phase 2: apply-fleet.ts writes
       // MACF_ROUTING_RUNS_ON when absent (create). It does NOT overwrite a
@@ -402,12 +430,15 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'repo':
     case 'ca':
     case 'control_repo':
+    case 'labels':
+    case 'routing_client':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
-      // 2, 'control_repo' in macf#867 / DR-043 Amendment G). Kept exhaustive
-      // so a NEW `PlanItemKind` added later is a compile error here, not a
-      // silent "apply covers everything" false-negative.
+      // 2, 'control_repo' in macf#867 / DR-043 Amendment G, 'labels'/
+      // 'routing_client' in groundnuty/macf#920). Kept exhaustive so a NEW
+      // `PlanItemKind` added later is a compile error here, not a silent
+      // "apply covers everything" false-negative.
       return 'apply has no code path for this item (unclassified — this reason string should be unreachable)';
   }
 }
@@ -511,6 +542,36 @@ function repoItem(agent: FleetAgent, obs: ObservedAgentState | undefined): PlanI
   };
 }
 
+/**
+ * The role/status labels `repo-init` creates on `agent.repo` (groundnuty/macf#920
+ * gap 1) — the labels the router dispatches on (`route-by-label`) and the
+ * issue-lifecycle status labels (`in-progress`/`in-review`/`blocked`/
+ * `agent-offline`). Always a LOW-CONFIDENCE `unknown`-degrade `create`
+ * candidate: unlike `caRepoItem`/`routingClientItem`, this tool has no
+ * cheap, single-call live read for "are all 5 labels present on this repo"
+ * (it would mean N GitHub API calls per repo just for the plan preview) —
+ * the same `presenceVerb(..., UNKNOWN_REASONS.variable)` degrade
+ * `caRegistryItem`/`caRepoItem` use for a genuinely-unread value, applied
+ * here because there IS no read at all, not because one failed. `apply`
+ * always attempts label creation regardless of this item's verb (repo-init
+ * runs unconditionally for `reused`/`resumed-install`/`created` — see
+ * `apply-fleet.ts`'s loop) — this item exists purely so the operator sees
+ * "labels" named explicitly in the pre-approval plan, not folded silently
+ * into the `repo` item.
+ */
+function labelsItem(agent: FleetAgent): PlanItem {
+  return {
+    kind: 'labels',
+    target: `agent:${agent.role}:labels:${agent.repo}`,
+    verb: 'create',
+    reason:
+      `role + status labels on "${agent.repo}" are not observable at plan time (no per-label API read wired) — ` +
+      'treated as a create-candidate, LOW CONFIDENCE. `apply` attempts label creation unconditionally on every ' +
+      'repo-init run regardless of this item.',
+    confirm_required: false,
+  };
+}
+
 function installItem(fleetName: string, agent: FleetAgent, obs: ObservedAgentState | undefined): PlanItem {
   const handle = deriveAppHandle(fleetName, agent.role);
   const { verb, reasonSuffix } = presenceVerb(obs?.install ?? 'unknown', UNKNOWN_REASONS.identity);
@@ -597,6 +658,30 @@ function caRepoItem(seg: string, repo: string, presence: Presence): PlanItem {
     target: `ca:repo:${repo}:${varName}`,
     verb,
     reason: `per-repo CA var "${varName}" on "${repo}" ${reasonSuffix}`,
+    confirm_required: false,
+  };
+}
+
+/**
+ * The per-agent-repo routing-client secret plan item (groundnuty/macf#920
+ * gap 2) — the `ROUTING_CLIENT_CERT`/`ROUTING_CLIENT_KEY` GitHub Actions
+ * secrets the macf-actions router presents as its mTLS client identity when
+ * POSTing to a peer agent's `/notify`. Live-observable (unlike `labelsItem`)
+ * via `observer.ts::checkRepoSecretPresence` — the SAME read `apply-fleet.ts`'s
+ * publish step uses, so plan and apply agree on presence by construction
+ * (same discipline `caRepoItem`'s presence-source sharing already
+ * establishes). Checks `ROUTING_CLIENT_CERT` only as a proxy for "this repo
+ * has its routing-client identity" — see `ObservedState.routingClientRepos`'s
+ * doc for why a single representative secret is enough (mirrors `caRepoItem`'s
+ * own one-var-per-repo simplicity).
+ */
+function routingClientItem(repo: string, presence: Presence): PlanItem {
+  const { verb, reasonSuffix } = presenceVerb(presence, UNKNOWN_REASONS.variable);
+  return {
+    kind: 'routing_client',
+    target: `routing_client:repo:${repo}:ROUTING_CLIENT_CERT`,
+    verb,
+    reason: `routing-client secret "ROUTING_CLIENT_CERT" on "${repo}" ${reasonSuffix}`,
     confirm_required: false,
   };
 }
@@ -801,11 +886,15 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
     items.push(repoItem(agent, obs));
     items.push(installItem(fleetName, agent, obs));
     items.push(secretFingerprintItem(agent, obs));
+    items.push(labelsItem(agent));
   }
 
   items.push(caRegistryItem(seg, observed.caRegistry, observed.vaultCa));
   for (const agent of manifest.agents) {
     items.push(caRepoItem(seg, agent.repo, observed.caRepos[agent.repo] ?? 'unknown'));
+  }
+  for (const agent of manifest.agents) {
+    items.push(routingClientItem(agent.repo, observed.routingClientRepos?.[agent.repo] ?? 'unknown'));
   }
 
   if (manifest.routing?.runner) {

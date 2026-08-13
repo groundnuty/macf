@@ -36,6 +36,7 @@ import type { FleetApplyResult } from '../../src/cli/bootstrap/apply-fleet.js';
 import type { AgentApplyDeps } from '../../src/cli/bootstrap/apply-agent.js';
 import type { AppCredentials } from '../../src/cli/bootstrap/manifest-exchange.js';
 import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
+import type { RoutingClientApplyDeps } from '../../src/cli/bootstrap/apply-routing-client.js';
 import { VaultError, buildVaultPlaintext, type VaultAgentSecrets } from '../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext } from '../../src/cli/bootstrap/vault-read.js';
 
@@ -332,10 +333,24 @@ function fakeAgentDeps(overrides: Partial<AgentApplyDeps> = {}): AgentApplyDeps 
  * reports `'absent'` -> every run here takes the CREATE path (no real
  * `gh`/`git`).
  */
+/** groundnuty/macf#920 gap 2 default fake — mint returns SENTINEL cert/key (distinct from every other sentinel so a leak test can tell this surface apart), every repo reports 'absent' so a publish is attempted (not silently skipped for want of a dep). */
+function fakeRoutingClientDeps(overrides: Partial<RoutingClientApplyDeps> = {}): RoutingClientApplyDeps {
+  return {
+    mint: async () => ({ certPem: 'SENTINEL-ROUTING-CLIENT-CERT-PEM', keyPem: 'SENTINEL-ROUTING-CLIENT-KEY-PEM' }),
+    checkRepoSecretPresence: async () => 'absent',
+    setRepoSecret: async () => {},
+    ...overrides,
+  };
+}
+
 function fakeMutateDeps(manifestPath: string, overrides: Partial<MutateApplyDeps> = {}): MutateApplyDeps {
   return {
     buildAgentDeps: () => fakeAgentDeps(),
-    repoInitDeps: { cloneRepo: async () => {}, commitAndPush: async () => 'pushed', repoInit: async () => {} },
+    repoInitDeps: {
+      cloneRepo: async () => {},
+      commitAndPush: async () => 'pushed',
+      repoInit: async () => ({ workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } }),
+    },
     vaultDeps: { exists: () => false, encrypt: async () => {} },
     controlRepoDeps: {
       checkMeta: async () => ({ presence: 'absent' }),
@@ -349,6 +364,7 @@ function fakeMutateDeps(manifestPath: string, overrides: Partial<MutateApplyDeps
     },
     agentRepoDeps: { checkExists: async () => 'absent', createRepo: async () => {} },
     trustDeps: fakeTrustDeps(),
+    routingClientDeps: fakeRoutingClientDeps(),
     controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
     now: () => new Date('2026-08-11T00:00:00.000Z'),
     log: () => {},
@@ -1049,6 +1065,10 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
     // tests below override to exercise failure/skip shapes.
     ca: { resolve: { status: 'reused', certFingerprint: 'deadbeef'.repeat(8) }, registryLeg: { status: 'already-present' }, repoLegs: {} },
     routing: {},
+    // groundnuty/macf#920 gap 2 default: mint SKIPPED (steady-state re-run —
+    // matches `ca`'s own REUSED default above), no repos to publish to.
+    // Individual tests below override to exercise minted/failed-leg shapes.
+    routingClient: { mint: { status: 'skipped', reason: 'no CA minted this run' }, certLegs: {}, keyLegs: {} },
     ...overrides,
   };
 }

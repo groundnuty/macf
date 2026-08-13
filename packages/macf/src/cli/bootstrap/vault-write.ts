@@ -123,10 +123,28 @@ export interface VaultCaSecrets {
   readonly caCertPem: string;
 }
 
+/**
+ * The macf-actions router's mTLS client identity (groundnuty/macf#920,
+ * DR-043 "routing-client re-mint" — see this file's module doc's opening
+ * paragraph). Deliberately NARROWER than {@link VaultRoutingSecrets} (which
+ * models the separate, unbuilt "shared macf-routing App" 6-secret block) —
+ * `apply-fleet.ts`'s routing-client ceremony only ever has the CA-signed
+ * cert/key pair, never the other 4 `VaultRoutingSecrets` fields (a different,
+ * future ceremony). Both types happen to target the SAME vault key names
+ * (`ROUTING_CLIENT_CERT_B64`/`ROUTING_CLIENT_KEY_B64`) — see
+ * {@link buildVaultPlaintext}'s guard against supplying both at once.
+ */
+export interface VaultRoutingClientSecrets {
+  readonly clientCertPem: string;
+  /** Secret — never log. */
+  readonly clientKeyPem: string;
+}
+
 export interface VaultPayload {
   readonly agents: readonly VaultAgentSecrets[];
   readonly routing?: VaultRoutingSecrets;
   readonly ca?: VaultCaSecrets;
+  readonly routingClient?: VaultRoutingClientSecrets;
 }
 
 const SHELL_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -247,6 +265,25 @@ export function buildVaultPlaintext(payload: VaultPayload): string {
     emitLine(lines, `MACF_${proj}_CA_CERT_B64`, toBase64(payload.ca.caCertPem));
   }
 
+  if (payload.routingClient !== undefined) {
+    if (payload.routing !== undefined) {
+      // Defense-in-depth (groundnuty/macf#920) — both fields target the SAME
+      // `ROUTING_CLIENT_*_B64` vault keys (see `VaultRoutingClientSecrets`'s
+      // doc); nothing in this codebase populates BOTH today (`payload.routing`
+      // is unused — the "shared macf-routing App" ceremony it models is
+      // future scope), but a silent double-emit of the same key would have
+      // `vault.sh`'s no-eval parse take whichever line landed LAST — never
+      // ambiguous like that.
+      throw new VaultError(
+        'vault_conflicting_routing_client',
+        'buildVaultPlaintext: both payload.routing and payload.routingClient were given — they write the same ' +
+          'ROUTING_CLIENT_CERT_B64/ROUTING_CLIENT_KEY_B64 vault keys. Supply at most one.',
+      );
+    }
+    emitLine(lines, 'ROUTING_CLIENT_CERT_B64', toBase64(payload.routingClient.clientCertPem));
+    emitLine(lines, 'ROUTING_CLIENT_KEY_B64', toBase64(payload.routingClient.clientKeyPem));
+  }
+
   if (lines.length === 0) {
     throw new VaultError(
       'vault_empty_payload',
@@ -290,6 +327,13 @@ export function vaultFleetSecretsForFingerprint(payload: VaultPayload): Record<s
   }
   if (payload.ca !== undefined) {
     out.ca_key = payload.ca.caKeyPem;
+  }
+  if (payload.routingClient !== undefined) {
+    // Same fingerprint field names `payload.routing` would have used (see
+    // `buildVaultPlaintext`'s guard — the two are mutually exclusive per
+    // call, never both populated).
+    out.routing_client_cert = payload.routingClient.clientCertPem;
+    out.routing_client_key = payload.routingClient.clientKeyPem;
   }
   return out;
 }

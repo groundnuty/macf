@@ -194,10 +194,11 @@
  */
 import { dirname, join } from 'node:path';
 import { caCertFingerprint } from '@groundnuty/macf-core';
-import type { FleetLock, FleetLockAgent, FleetManifest } from './fleet-manifest.js';
+import type { TokenSource } from '@groundnuty/macf-core';
+import type { FleetAgent, FleetLock, FleetLockAgent, FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 import type { AgentApplyDeps, AgentApplyOutcome } from './apply-agent.js';
-import { applyAgentIdentity } from './apply-agent.js';
+import { applyAgentIdentity, cleanupScratchPem, writeScratchPem } from './apply-agent.js';
 import type { AppCredentials } from './manifest-exchange.js';
 import type { AgentRepoDeps, RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
 import { applyRepoInitForAgent, ensureAgentRepo } from './apply-repo-init.js';
@@ -205,7 +206,7 @@ import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './
 import { provisionControlRepo } from './control-repo.js';
 import type { FleetLockAgentUpdate, FleetLockIdentityChange } from './fleet-lock.js';
 import { composeFleetLock, readFleetLockFile, writeFleetLock } from './fleet-lock.js';
-import type { VaultAgentSecrets, VaultCaSecrets, VaultEncryptFn, WriteVaultDeps } from './vault-write.js';
+import type { VaultAgentSecrets, VaultCaSecrets, VaultEncryptFn, VaultRoutingClientSecrets, WriteVaultDeps } from './vault-write.js';
 import {
   VaultError,
   ageEncryptToFile,
@@ -221,6 +222,8 @@ import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } f
 import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import { publishRoutingRunsOn } from './apply-routing.js';
+import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientPublishResult } from './apply-routing-client.js';
+import { mintRoutingClient, publishRoutingClientSecrets, skippedRoutingClientPublish } from './apply-routing-client.js';
 
 export interface FleetApplyDeps {
   /**
@@ -252,6 +255,17 @@ export interface FleetApplyDeps {
    * no second dep object to keep in sync.
    */
   readonly trustDeps: CaApplyDeps;
+  /**
+   * DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — the
+   * mint-or-skip + create-only per-repo secret-deploy deps for the
+   * macf-actions router's mTLS client identity. A SEPARATE field from
+   * `trustDeps` (unlike `apply-routing.ts`'s `RoutingApplyDeps`, which really
+   * is a `Pick` of the SAME shape) — this ceremony writes GitHub Actions
+   * SECRETS via a wholly different API surface (`gh secret set`, no 409, no
+   * registry leg) than `trustDeps`' variable-write primitives, so sharing one
+   * dep object would blur two independently-testable seams together.
+   */
+  readonly routingClientDeps: RoutingClientApplyDeps;
 }
 
 export interface AgentApplyRecord {
@@ -296,6 +310,39 @@ export interface CaApplyResult {
   readonly repoLegs: Readonly<Record<string, EnsureVariableOutcome>>;
 }
 
+/**
+ * DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — the render-safe
+ * result of the routing-client mint-or-skip + per-repo secret publish. NEVER
+ * carries `certPem`/`keyPem` — `mint.status === 'minted'` is a boolean-ish
+ * fact, not the credential itself (mirrors `CaApplyResult.resolve` never
+ * carrying `keyPem`; see {@link redactRoutingClientMint}). `certLegs`/
+ * `keyLegs` are always present (never `undefined`) — a `'skipped'` entry
+ * (via `apply-routing-client.ts::skippedRoutingClientPublish`) makes "never
+ * attempted this run" as visible as a real failure, same discipline
+ * `CaApplyResult` already establishes.
+ */
+export interface RoutingClientApplyResult {
+  readonly mint: RedactedRoutingClientMint;
+  readonly certLegs: Readonly<Record<string, EnsureVariableOutcome>>;
+  readonly keyLegs: Readonly<Record<string, EnsureVariableOutcome>>;
+}
+
+/** Render-safe mirror of {@link RoutingClientMintOutcome} — NEVER carries `certPem`/`keyPem`. Explicit field copies (not a spread) per `redactIdentity`'s own precedent — a future variant adding a credential field is then a compile error here, not a silent leak. */
+export interface RedactedRoutingClientMint {
+  readonly status: 'minted' | 'skipped';
+  readonly reason?: string;
+}
+
+/** Strip every credential field before a {@link RoutingClientMintOutcome} is allowed near `FleetApplyResult` or a `--json` render. Pure. Mirrors `apply-ca.ts::redactCaResolve`. */
+export function redactRoutingClientMint(outcome: RoutingClientMintOutcome): RedactedRoutingClientMint {
+  switch (outcome.status) {
+    case 'minted':
+      return { status: 'minted' };
+    case 'skipped':
+      return { status: 'skipped', reason: outcome.reason };
+  }
+}
+
 export interface FleetApplyResult {
   /** DR-043 Amendment F step 0 — see `control-repo.ts`'s module doc. A `foreign`/`failed` outcome means `agents`/`vault` below are trivially empty/skipped: the run aborted before touching anything else. */
   readonly controlRepo: ControlRepoOutcome;
@@ -311,6 +358,8 @@ export interface FleetApplyResult {
   readonly ca: CaApplyResult;
   /** `MACF_ROUTING_RUNS_ON` create-only writes, keyed by repo — empty `{}` when `routing.runner` is not declared in the manifest. */
   readonly routing: Readonly<Record<string, EnsureVariableOutcome>>;
+  /** DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — see {@link RoutingClientApplyResult}'s doc. ALWAYS present — a fleet with no confirmed agent repos this run still reports `mint.status`. */
+  readonly routingClient: RoutingClientApplyResult;
 }
 
 function agentVaultSecrets(appHandle: string, outcome: Extract<AgentApplyOutcome, { status: 'created' }>): VaultAgentSecrets {
@@ -323,6 +372,33 @@ function agentVaultSecrets(appHandle: string, outcome: Extract<AgentApplyOutcome
     webhookSecret: outcome.credentials.webhookSecret,
     pem: outcome.credentials.pem,
   };
+}
+
+/**
+ * `repo-init` for a freshly-CREATED agent (groundnuty/macf#920 gap 1) —
+ * threads the just-exchanged credentials (already in process memory; NEVER
+ * re-reads the vault, NEVER re-prompts the operator) into
+ * `applyRepoInitForAgent`'s `tokenSource` so label creation can actually
+ * mint a token instead of degrading to `labels: {status:'skipped'}` (the
+ * repro this issue closes). Writes ONE scratch-PEM file for the duration of
+ * this ONE repo-init call — `apply-agent.ts`'s `writeScratchPem`/
+ * `cleanupScratchPem`, the SAME 0600-scratch-file primitive that module
+ * already uses for its own JWT mints, reused rather than duplicated. Always
+ * cleaned up in `finally`, regardless of outcome.
+ */
+async function applyRepoInitForCreatedAgent(
+  agent: FleetAgent,
+  manifest: FleetManifest,
+  identity: Extract<AgentApplyOutcome, { status: 'created' }>,
+  deps: RepoInitStepDeps,
+): Promise<RepoInitStepOutcome> {
+  const keyPath = writeScratchPem(agent.role, identity.credentials.pem);
+  try {
+    const tokenSource: TokenSource = { appId: identity.appId, installId: identity.installId, keyPath };
+    return await applyRepoInitForAgent(agent, manifest, deps, { tokenSource });
+  } finally {
+    cleanupScratchPem(keyPath);
+  }
 }
 
 /** `manifest.transport.age_recipients` is already the exact shape `writeVault`/`writeAgentRecoveryArtifact` expect (macf#852) — an empty list (unconfigured) is rejected loudly by each of those functions on its own. Named accessor kept for the doc-comment cross-references elsewhere in this module ("computed once, before the loop, from the same immutable ..." — see the module doc). */
@@ -448,6 +524,11 @@ export async function applyFleet(
         repoLegs: {},
       },
       routing: {},
+      routingClient: {
+        mint: { status: 'skipped', reason: 'control repo aborted before the routing-client ceremony could run — see controlRepo above.' },
+        certLegs: {},
+        keyLegs: {},
+      },
     };
   }
   deps.log(`Control repo "${controlRepo.repo}": ${controlRepo.status.toUpperCase()} (checkout: ${controlRepo.localDir}).`);
@@ -536,6 +617,11 @@ export async function applyFleet(
 
     if (identity.status === 'reused' || identity.status === 'resumed-install') {
       writeIncrementalLock(agent.role, { appId: identity.appId, installId: identity.installId });
+      // No PEM in process memory this run for `reused`/`resumed-install` (no
+      // vault-decrypt seam wired into repo-init yet — see
+      // `RepoInitStepOptions.tokenSource`'s doc) — pre-existing, acknowledged
+      // gap; groundnuty/macf#920 closes ONLY the `created` path below, which
+      // is where apply-fleet.ts already holds a freshly-exchanged credential.
       repoInitOutcome = await applyRepoInitForAgent(agent, manifest, deps.repoInitDeps);
     } else if (identity.status === 'created') {
       const secrets = agentVaultSecrets(handle, identity);
@@ -545,7 +631,7 @@ export async function applyFleet(
         installId: identity.installId,
         secrets: vaultAgentSecretsForFingerprint(secrets),
       };
-      repoInitOutcome = await applyRepoInitForAgent(agent, manifest, deps.repoInitDeps);
+      repoInitOutcome = await applyRepoInitForCreatedAgent(agent, manifest, identity, deps.repoInitDeps);
     }
     // skipped-unverified / drift / failed: no lock write, no repo-init —
     // this agent's identity is unresolved this run.
@@ -579,16 +665,50 @@ export async function applyFleet(
   const caSecretsForVault: VaultCaSecrets | undefined =
     caResolve.status === 'minted' ? { project: manifest.metadata.name, caKeyPem: caResolve.keyPem, caCertPem: caResolve.certPem } : undefined;
 
-  const vault = await settleVault(manifest, vaultOutPath, pendingVaultAgents, caSecretsForVault, deps);
-  if (vault.status === 'written' && (Object.keys(pendingCreatedUpdates).length > 0 || caSecretsForVault !== undefined)) {
+  // DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920 gap 2) —
+  // MINT happens here, right after the CA resolve, because it's the only
+  // point where a freshly-minted CA's private key is (possibly) in process
+  // memory to sign the client cert with (`apply-routing-client.ts`'s "mint
+  // gating" doc). Folds into the SAME `settleVault` call as agents + CA
+  // below — never a second vault write (Amendment D).
+  const lockHasRoutingClientKey = currentLock?.fingerprints?.['routing_client_key'] !== undefined;
+  const routingClientMint: RoutingClientMintOutcome = await mintRoutingClient(
+    caResolve.status === 'minted' ? caResolve.certPem : undefined,
+    caResolve.status === 'minted' ? caResolve.keyPem : undefined,
+    lockHasRoutingClientKey,
+    caResolve.status === 'minted',
+    deps.routingClientDeps,
+  );
+  deps.log(
+    routingClientMint.status === 'minted'
+      ? 'Routing-client cert: MINTED (CN=routing-action).'
+      : `Routing-client cert: SKIPPED — ${routingClientMint.reason}`,
+  );
+  const routingClientSecretsForVault: VaultRoutingClientSecrets | undefined =
+    routingClientMint.status === 'minted' ? { clientCertPem: routingClientMint.certPem, clientKeyPem: routingClientMint.keyPem } : undefined;
+
+  const vault = await settleVault(manifest, vaultOutPath, pendingVaultAgents, caSecretsForVault, routingClientSecretsForVault, deps);
+  if (
+    vault.status === 'written' &&
+    (Object.keys(pendingCreatedUpdates).length > 0 || caSecretsForVault !== undefined || routingClientSecretsForVault !== undefined)
+  ) {
     // Batched, not per-role: `writeVault` just persisted EVERY `created`
-    // agent's secret (+ the CA key, when freshly minted) in ONE `age`
-    // invocation, so their lock entries become durable together too — see
-    // the module doc's ordering rationale. `fleetSecrets` is the CA-key
-    // fingerprint ONLY — this is the SOLE place `fingerprints.ca_key` is
-    // ever written (never an incremental per-agent write), matching
-    // `pendingCreatedUpdates`'s existing batched-only discipline.
-    const fleetSecrets = caSecretsForVault !== undefined ? vaultFleetSecretsForFingerprint({ agents: [], ca: caSecretsForVault }) : undefined;
+    // agent's secret (+ the CA key, when freshly minted, + the routing-client
+    // key, when freshly minted) in ONE `age` invocation, so their lock
+    // entries become durable together too — see the module doc's ordering
+    // rationale. `fleetSecrets` is the CA-key / routing-client fingerprints
+    // ONLY — this is the SOLE place `fingerprints.ca_key`/
+    // `fingerprints.routing_client_key` are ever written (never an
+    // incremental per-agent write), matching `pendingCreatedUpdates`'s
+    // existing batched-only discipline.
+    const fleetSecrets =
+      caSecretsForVault !== undefined || routingClientSecretsForVault !== undefined
+        ? vaultFleetSecretsForFingerprint({
+            agents: [],
+            ...(caSecretsForVault !== undefined ? { ca: caSecretsForVault } : {}),
+            ...(routingClientSecretsForVault !== undefined ? { routingClient: routingClientSecretsForVault } : {}),
+          })
+        : undefined;
     const composed = composeFleetLock({
       fleet: manifest.metadata.name,
       previous: currentLock,
@@ -644,6 +764,46 @@ export async function applyFleet(
     deps.log(`CA repo leg (${repo}): ${leg.status}` + (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'));
   }
 
+  // Per-repo routing-client secret deploy (DR-043 §D5 "routing-client
+  // re-mint," groundnuty/macf#920 gap 2) — same ordering rule as the CA cert
+  // above: only deploy a freshly-minted cert/key once its key is confirmed
+  // durable (`vault.status === 'written'`); a mint that was SKIPPED (reused
+  // CA, already-vaulted routing-client, or a mint failure) publishes
+  // NOTHING — every leg reads `'skipped'` with the reason, never silent.
+  let routingClientSkipReason: string | undefined;
+  if (routingClientMint.status === 'minted' && vault.status !== 'written') {
+    routingClientSkipReason =
+      'routing-client cert was freshly minted this run but the batched vault write did not succeed — refusing to ' +
+      'deploy the private key to any repo until it is durable (DR-043 §D5). Re-run apply once the vault issue is ' +
+      "fixed. The retry re-mints (fleet.lock never recorded a routing_client_key fingerprint), which is harmless: " +
+      "this run's key was never made durable and was never deployed, so nothing is orphaned.";
+  } else if (routingClientMint.status === 'skipped') {
+    routingClientSkipReason = routingClientMint.reason;
+  }
+  const routingClientPublish: RoutingClientPublishResult =
+    routingClientMint.status === 'minted' && vault.status === 'written'
+      ? await publishRoutingClientSecrets(
+          { certPem: routingClientMint.certPem, keyPem: routingClientMint.keyPem },
+          confirmedRepos,
+          deps.routingClientDeps,
+        )
+      : skippedRoutingClientPublish(confirmedRepos, routingClientSkipReason ?? 'routing-client cert unresolved');
+  deps.log(
+    `Routing-client cert legs: ${String(Object.values(routingClientPublish.certLegs).filter((l) => l.status === 'created').length)} created, ` +
+      `${String(Object.values(routingClientPublish.certLegs).filter((l) => l.status === 'already-present').length)} already-present of ` +
+      `${String(confirmedRepos.length)} confirmed repo(s).`,
+  );
+  for (const [repo, leg] of Object.entries(routingClientPublish.certLegs)) {
+    if (leg.status === 'failed' || leg.status === 'skipped') {
+      deps.log(`Routing-client cert leg (${repo}): ${leg.status} — ${leg.reason}`);
+    }
+  }
+  for (const [repo, leg] of Object.entries(routingClientPublish.keyLegs)) {
+    if (leg.status === 'failed' || leg.status === 'skipped') {
+      deps.log(`Routing-client key leg (${repo}): ${leg.status} — ${leg.reason}`);
+    }
+  }
+
   // `MACF_ROUTING_RUNS_ON` (§D1) — independent of the CA outcome; every
   // caller repo is a confirmed agent repo, never the control repo (see
   // `apply-routing.ts`'s doc).
@@ -673,7 +833,12 @@ export async function applyFleet(
   const controlRepoSync = await syncControlRepo(controlDir, deps);
 
   const ca: CaApplyResult = { resolve: redactCaResolve(caResolve), registryLeg: caPublish.registryLeg, repoLegs: caPublish.repoLegs };
-  return { controlRepo, controlRepoSync, lockPath, finalLock: currentLock, agents: records, vault, identityChanges, ca, routing };
+  const routingClient: RoutingClientApplyResult = {
+    mint: redactRoutingClientMint(routingClientMint),
+    certLegs: routingClientPublish.certLegs,
+    keyLegs: routingClientPublish.keyLegs,
+  };
+  return { controlRepo, controlRepoSync, lockPath, finalLock: currentLock, agents: records, vault, identityChanges, ca, routing, routingClient };
 }
 
 /**
@@ -699,21 +864,25 @@ async function syncControlRepo(controlDir: string, deps: FleetApplyDeps): Promis
 /**
  * Assemble + attempt the single, whole-payload vault write for every
  * `created` agent this run PLUS a freshly-minted CA key, when present
- * (`caSecrets`, DR-043 Amendment D phase 2 — macf#838). Returns the outcome
+ * (`caSecrets`, DR-043 Amendment D phase 2 — macf#838), PLUS a freshly-minted
+ * routing-client cert/key, when present (`routingClientSecrets`, DR-043 §D5
+ * "routing-client re-mint" — groundnuty/macf#920). Returns the outcome
  * WITHOUT writing `fleet.lock` — the caller does that only on
  * `status: 'written'` (see module doc's ordering rationale). `writeVault`
  * is single-shot whole-payload (see `vault-write.ts`'s module doc) — there
- * can be only ONE vault write per run, so a fresh CA key MUST fold into the
- * SAME call as any fresh agent creds, never a second write.
+ * can be only ONE vault write per run, so a fresh CA key / routing-client
+ * key MUST fold into the SAME call as any fresh agent creds, never a second
+ * write.
  */
 async function settleVault(
   manifest: FleetManifest,
   vaultOutPath: string,
   pendingVaultAgents: readonly VaultAgentSecrets[],
   caSecrets: VaultCaSecrets | undefined,
+  routingClientSecrets: VaultRoutingClientSecrets | undefined,
   deps: FleetApplyDeps,
 ): Promise<VaultApplyOutcome> {
-  if (pendingVaultAgents.length === 0 && caSecrets === undefined) return { status: 'skipped' };
+  if (pendingVaultAgents.length === 0 && caSecrets === undefined && routingClientSecrets === undefined) return { status: 'skipped' };
 
   try {
     // Not merely a `writeVault`-will-catch-it-anyway redundancy: this
@@ -734,7 +903,11 @@ async function settleVault(
           'uniqueness is the guard).',
       );
     }
-    const plaintext = buildVaultPlaintext({ agents: [...pendingVaultAgents], ...(caSecrets !== undefined ? { ca: caSecrets } : {}) });
+    const plaintext = buildVaultPlaintext({
+      agents: [...pendingVaultAgents],
+      ...(caSecrets !== undefined ? { ca: caSecrets } : {}),
+      ...(routingClientSecrets !== undefined ? { routingClient: routingClientSecrets } : {}),
+    });
     const result = await writeVault(
       plaintext,
       { outPath: vaultOutPath, recipients, allowVersion: deps.allowVaultVersion === true, now: deps.now },

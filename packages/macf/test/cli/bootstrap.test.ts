@@ -233,14 +233,20 @@ describe('runBootstrapPlan', () => {
         },
         caRegistry: 'present',
         caRepos: { 'groundnuty/icsoc-2026-experiment': 'present' },
+        routingClientRepos: { 'groundnuty/icsoc-2026-experiment': 'present' },
       }),
     };
     const code = await runBootstrapPlan({ file, json: true }, deps);
     expect(code).toBe(0);
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { summary: { noops: number; creates: number } };
-    // 4 per-agent (app, repo, install, secret_fingerprint) + 2 CA (registry + the one agent repo) — all noop.
-    expect(json.summary.noops).toBe(6);
-    expect(json.summary.creates).toBe(0);
+    // 4 per-agent (app, repo, install, secret_fingerprint) + 2 CA (registry +
+    // the one agent repo) + 1 routing_client (observed-present) — all noop.
+    // `labels` is the one structural exception (groundnuty/macf#920): it has
+    // no plan-time observed read at all, so it ALWAYS degrades to a
+    // LOW-CONFIDENCE create-candidate — this is not "unclean," it's a
+    // documented limitation (see `labelsItem`'s doc).
+    expect(json.summary.noops).toBe(7);
+    expect(json.summary.creates).toBe(1);
   });
 
   // DR-043 Amendment D phase 3 — proves the `--vault`/`--identity-key` CLI

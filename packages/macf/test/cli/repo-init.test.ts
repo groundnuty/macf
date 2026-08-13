@@ -929,24 +929,26 @@ describe('repoInit integration', () => {
       .mockResolvedValue({ status: 422 });
     globalThis.fetch = fetchMock as typeof fetch;
 
-    // Should not throw
-    await expect(repoInit(dir, {
+    // Should not throw, and every label resolves 'created' or 'exists' — no 'failed'.
+    const result = await repoInit(dir, {
       repo: 'owner/r',
       actionsVersion: 'v1',
       force: false,
-    })).resolves.toBeUndefined();
+    });
+    expect(result.labels.status).toBe('ok');
   });
 
-  it('continues without labels when token fails', async () => {
+  it('continues without labels when token fails, returning labels.status="skipped" (groundnuty/macf#920)', async () => {
     delete process.env['GH_TOKEN'];
     delete process.env['APP_ID'];
 
     // Should not throw — prints warning and continues
-    await expect(repoInit(dir, {
+    const result = await repoInit(dir, {
       repo: 'owner/r',
       actionsVersion: 'v1',
       force: false,
-    })).resolves.toBeUndefined();
+    });
+    expect(result.labels.status).toBe('skipped');
 
     // Files should still be created
     expect(existsSync(join(dir, '.github', 'workflows', 'agent-router.yml'))).toBe(true);
@@ -1000,9 +1002,8 @@ describe('repoInit integration', () => {
       return Promise.resolve({ status: 201, ok: true }); // label creation
     }) as typeof fetch;
 
-    await expect(
-      repoInit(dir, { repo: 'owner/test-repo', actionsVersion: 'v3', force: false }),
-    ).resolves.toBeUndefined();
+    const result = await repoInit(dir, { repo: 'owner/test-repo', actionsVersion: 'v3', force: false });
+    expect(result.labels.status).toBe('ok');
 
     const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
     expect(wf).toContain('agent-router.yml@v3\n'); // degraded to floating ref

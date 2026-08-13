@@ -66,10 +66,12 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
     const manifest = baseManifest();
     const plan = computePlan(manifest, EMPTY_OBSERVED);
 
-    // 4 items per agent (app, repo, install, secret_fingerprint) × 2 agents
-    // + caRegistry (1) + one caRepo per agent (2) — CA items are unconditional
-    // as of macf#839 review nit 5 (never gated on `trust:` being declared).
-    expect(plan.items).toHaveLength(11);
+    // 5 items per agent (app, repo, install, secret_fingerprint, labels) × 2
+    // agents + caRegistry (1) + one caRepo per agent (2) + one routing_client
+    // per agent-repo (2) — CA/labels/routing_client items are unconditional
+    // (never gated on `trust:` being declared — macf#839 review nit 5 for CA;
+    // groundnuty/macf#920 for labels/routing_client).
+    expect(plan.items).toHaveLength(15);
     for (const item of plan.items) {
       expect(item.verb).toBe('create');
       expect(item.confirm_required).toBe(false);
@@ -188,14 +190,30 @@ describe('computePlan — all-match observed state → all noops', () => {
         'groundnuty/icsoc-2026-experiment': 'present',
       },
       routingRunsOn: 'self-hosted',
+      routingClientRepos: {
+        'groundnuty/icsoc-2026-science-agent': 'present',
+        'groundnuty/icsoc-2026-experiment': 'present',
+      },
       controlRepoPresence: 'present',
       controlRepoArchived: false,
     };
 
     const plan = computePlan(manifest, observed);
-    expect(plan.items).toHaveLength(12); // 4 × 2 agents + caRegistry + 2 caRepo + routing (control_repo item absent — not archived)
+    // 5 × 2 agents (app/repo/install/secret_fingerprint/labels) + caRegistry +
+    // 2 caRepo + routing + 2 routing_client (control_repo item absent — not
+    // archived).
+    expect(plan.items).toHaveLength(16);
     for (const item of plan.items) {
-      expect(item.verb).toBe('noop');
+      // `labels` is a structural exception: it has NO plan-time observed
+      // read at all (see `labelsItem`'s doc — a per-label API read is out of
+      // scope), so it ALWAYS degrades to a LOW-CONFIDENCE `create`-candidate
+      // regardless of how "matched" everything else is. Every other kind
+      // genuinely observed-matches here.
+      if (item.kind === 'labels') {
+        expect(item.verb).toBe('create');
+      } else {
+        expect(item.verb).toBe('noop');
+      }
       expect(item.confirm_required).toBe(false);
     }
   });
@@ -280,30 +298,36 @@ describe('computePlan — an observed extra agent → report-extra, NEVER delete
 });
 
 describe('computePlan — deterministic ordering', () => {
-  it('orders per-agent items in manifest agents[] order, each agent app→repo→install→secret_fingerprint', () => {
+  it('orders per-agent items in manifest agents[] order, each agent app→repo→install→secret_fingerprint→labels', () => {
     const manifest = baseManifest();
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const kinds = plan.items.map((i) => i.kind);
-    expect(kinds.slice(0, 8)).toEqual([
-      'app', 'repo', 'install', 'secret_fingerprint', // science-agent
-      'app', 'repo', 'install', 'secret_fingerprint', // code-agent
+    expect(kinds.slice(0, 10)).toEqual([
+      'app', 'repo', 'install', 'secret_fingerprint', 'labels', // science-agent
+      'app', 'repo', 'install', 'secret_fingerprint', 'labels', // code-agent
     ]);
   });
 
-  it('CA items (registry, then one per agent repo in manifest order) precede routing, both after all per-agent items', () => {
+  it('CA items (registry, then one per agent repo in manifest order), then routing_client per agent repo, precede routing, all after per-agent items', () => {
     const manifest = baseManifest({
       routing: { runner: { runs_on: 'self-hosted' } },
       trust: { ca: 'per-project', federated_cas: [] },
     });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const kinds = plan.items.map((i) => i.kind);
-    // 8 per-agent items, then 3 CA items (registry + 2 agent repos), then routing.
-    expect(kinds.slice(-4)).toEqual(['ca', 'ca', 'ca', 'routing']);
+    // 10 per-agent items, then 3 CA items (registry + 2 agent repos), then
+    // 2 routing_client items (one per agent repo), then routing.
+    expect(kinds.slice(-6)).toEqual(['ca', 'ca', 'ca', 'routing_client', 'routing_client', 'routing']);
     const caTargets = plan.items.filter((i) => i.kind === 'ca').map((i) => i.target);
     expect(caTargets).toEqual([
       'ca:registry:ICSOC_2026_CA_CERT',
       'ca:repo:groundnuty/icsoc-2026-science-agent:ICSOC_2026_CA_CERT',
       'ca:repo:groundnuty/icsoc-2026-experiment:ICSOC_2026_CA_CERT',
+    ]);
+    const routingClientTargets = plan.items.filter((i) => i.kind === 'routing_client').map((i) => i.target);
+    expect(routingClientTargets).toEqual([
+      'routing_client:repo:groundnuty/icsoc-2026-science-agent:ROUTING_CLIENT_CERT',
+      'routing_client:repo:groundnuty/icsoc-2026-experiment:ROUTING_CLIENT_CERT',
     ]);
   });
 
@@ -373,8 +397,10 @@ describe('summarizePlan', () => {
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
     const plan = computePlan(manifest, observed);
     const summary = summarizePlan(plan.items);
-    // 8 per-agent creates + 3 CA creates (registry + 2 agent repos) + 1 routing update.
-    expect(summary).toEqual({ creates: 11, updates: 1, noops: 0, extras: 0 });
+    // 10 per-agent creates (app/repo/install/secret_fingerprint/labels × 2) +
+    // 3 CA creates (registry + 2 agent repos) + 2 routing_client creates +
+    // 1 routing update.
+    expect(summary).toEqual({ creates: 15, updates: 1, noops: 0, extras: 0 });
   });
 });
 

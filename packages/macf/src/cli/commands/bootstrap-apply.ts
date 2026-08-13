@@ -52,13 +52,22 @@ import type { ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '.
 import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
 import { checkControlRepoMeta, realControlRepoCommitAndPush, realReadControlManifestFile } from '../bootstrap/control-repo.js';
 import { realUnarchiveRepo } from '../bootstrap/repo-archive.js';
-import { checkRepoExists, checkRepoVariablePresence, checkRegistryVariablePresence, readRegistryVariable } from '../bootstrap/observer.js';
+import {
+  checkRepoExists,
+  checkRepoSecretPresence,
+  checkRepoVariablePresence,
+  checkRegistryVariablePresence,
+  readRegistryVariable,
+} from '../bootstrap/observer.js';
 import { realCreateRepo } from '../bootstrap/repo-create.js';
 import type { CaApplyDeps } from '../bootstrap/apply-ca.js';
 import { realCreateRegistryVariable, realCreateRepoVariable, realMintCa } from '../bootstrap/apply-ca.js';
 import type { EnsureVariableOutcome } from '../bootstrap/ensure-variable.js';
+import type { RoutingClientApplyDeps } from '../bootstrap/apply-routing-client.js';
+import { realMintRoutingClient, realSetRepoSecret } from '../bootstrap/apply-routing-client.js';
 import { readVault, vaultAgentPrivateKeyPem } from '../bootstrap/vault-read.js';
 import type { VaultReadOptions } from '../bootstrap/vault-read.js';
+import type { LabelsOutcome } from './repo-init.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -456,6 +465,20 @@ const REAL_TRUST_DEPS: CaApplyDeps = {
 };
 
 /**
+ * DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920 gap 2) — the real
+ * mint-or-skip + create-only per-repo secret-deploy deps. `checkRepoSecretPresence`
+ * is the SAME read `plan`'s (future) routing-client observation would use
+ * (`observer.ts`, matching `REAL_TRUST_DEPS`'s own "plan and apply agree by
+ * construction" discipline); `setRepoSecret`/`mint` are the real `gh secret
+ * set`-via-stdin + `certs.ts::mintRoutingClientCert` primitives.
+ */
+const REAL_ROUTING_CLIENT_DEPS: RoutingClientApplyDeps = {
+  checkRepoSecretPresence,
+  setRepoSecret: realSetRepoSecret,
+  mint: realMintRoutingClient,
+};
+
+/**
  * Build the REAL (production) mutating deps. Exported ONLY so a test can assert
  * the wiring by identity (macf#857 review): a security primitive can be
  * defined, unit-tested, and never actually called — which is exactly what
@@ -513,6 +536,7 @@ export function resolveMutateDeps(manifestPath: string, vaultAgentPems?: Readonl
     controlRepoOptions: { confirmUnarchive: true },
     agentRepoDeps: REAL_AGENT_REPO_DEPS,
     trustDeps: REAL_TRUST_DEPS,
+    routingClientDeps: REAL_ROUTING_CLIENT_DEPS,
     now: () => new Date(),
     log: (line: string) => {
       process.stderr.write(`${line}\n`);
@@ -613,12 +637,33 @@ function agentSummaryLines(result: FleetApplyResult): string[] {
     if (rec.repoInit) {
       lines.push(
         rec.repoInit.status === 'applied'
-          ? `    repo-init: applied to ${rec.repoInit.repo} (pushed: ${String(rec.repoInit.pushed)})`
+          ? `    repo-init: applied to ${rec.repoInit.repo} (pushed: ${String(rec.repoInit.pushed)}) — ${formatLabelsLine(rec.repoInit.labels)}`
           : `    repo-init: FAILED on ${rec.repoInit.repo} — ${rec.repoInit.reason}`,
       );
     }
   }
   return lines;
+}
+
+/**
+ * One clause describing the label-creation outcome (groundnuty/macf#920) —
+ * appended to `agentSummaryLines`'s `repo-init: applied` line so a
+ * `reused`/`resumed-install` role's SKIPPED labels (the pre-existing,
+ * acknowledged gap `applyRepoInitForAgent`'s doc names — no credentials
+ * threaded for that path yet) never renders as bare, unqualified silence
+ * even though the step's overall `status` is still `'applied'` (this repo's
+ * own "never let a gap render as silence" discipline, `plan.ts`'s
+ * `unimplementedByApply` applied at the render layer here).
+ */
+function formatLabelsLine(labels: LabelsOutcome): string {
+  switch (labels.status) {
+    case 'ok':
+      return `labels: ok (${String(labels.created.length)} created, ${String(labels.existed.length)} already present)`;
+    case 'partial-failure':
+      return `labels: FAILED for ${labels.failed.join(', ')}`;
+    case 'skipped':
+      return `labels: skipped — ${labels.reason}`;
+  }
 }
 
 /** One `<label>: <status>` line, appending `— <reason>` for `failed`/`skipped` — the shared render shape for `EnsureVariableOutcome` (macf#838 Amendment D phase 2). NEVER a value — the type carries none. */
@@ -647,6 +692,19 @@ function routingSummaryLines(result: FleetApplyResult): string[] {
   if (entries.length === 0) return [];
   const lines = ['Routing (MACF_ROUTING_RUNS_ON):'];
   for (const [repo, leg] of entries) lines.push(formatVariableLegLine(repo, leg));
+  return lines;
+}
+
+/** Routing-client mint + per-repo secret-deploy render (groundnuty/macf#920 gap 2). Never a credential value — `result.routingClient.mint` is the redacted `RedactedRoutingClientMint` (status/reason only, never cert/key PEM). */
+function routingClientSummaryLines(result: FleetApplyResult): string[] {
+  const m = result.routingClient.mint;
+  const lines = [m.status === 'minted' ? 'Routing-client cert: MINTED (CN=routing-action).' : `Routing-client cert: SKIPPED — ${m.reason}`];
+  for (const [repo, leg] of Object.entries(result.routingClient.certLegs)) {
+    lines.push(formatVariableLegLine(`cert leg (${repo})`, leg));
+  }
+  for (const [repo, leg] of Object.entries(result.routingClient.keyLegs)) {
+    lines.push(formatVariableLegLine(`key leg (${repo})`, leg));
+  }
   return lines;
 }
 
@@ -680,6 +738,7 @@ export function formatApplyResult(result: FleetApplyResult, unimplemented: reado
   parts.push('', ...caSummaryLines(result));
   const routingLines = routingSummaryLines(result);
   if (routingLines.length > 0) parts.push('', ...routingLines);
+  parts.push('', ...routingClientSummaryLines(result));
   if (result.identityChanges.length > 0) {
     parts.push('', `⚠ identity DRIFT detected (${String(result.identityChanges.length)}) — confirm before trusting fleet.lock:`);
     for (const c of result.identityChanges) {
@@ -746,6 +805,15 @@ export function fleetApplyResultToJson(result: FleetApplyResult, unimplemented: 
     // phase 2).
     ca: { resolve: { ...result.ca.resolve }, registry_leg: { ...result.ca.registryLeg }, repo_legs: { ...result.ca.repoLegs } },
     routing: { ...result.routing },
+    // `result.routingClient.mint` is ALREADY the redacted `RedactedRoutingClientMint`
+    // (status/reason only — see `apply-fleet.ts::redactRoutingClientMint`);
+    // `certLegs`/`keyLegs` are `EnsureVariableOutcome`s, which carry no
+    // credential field. Safe to spread verbatim (groundnuty/macf#920 gap 2).
+    routing_client: {
+      mint: { ...result.routingClient.mint },
+      cert_legs: { ...result.routingClient.certLegs },
+      key_legs: { ...result.routingClient.keyLegs },
+    },
   };
 }
 
@@ -779,7 +847,15 @@ export function applyExitCode(result: FleetApplyResult): number {
     result.ca.registryLeg.status === 'failed' ||
     Object.values(result.ca.repoLegs).some((leg) => leg.status === 'failed');
   const routingBad = Object.values(result.routing).some((leg) => leg.status === 'failed');
-  return controlRepoBad || controlRepoSyncBad || agentBad || result.vault.status === 'failed' || caBad || routingBad ? 1 : 0;
+  // DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920 gap 2) — same
+  // 'skipped' vs 'failed' distinction as `caBad` above: a `'skipped'` mint is
+  // the EXPECTED steady state on an ordinary re-run of an already-provisioned
+  // fleet (CA reused, or the routing-client key already vaulted from a prior
+  // run) — only an actual publish-leg `'failed'` needs operator attention.
+  const routingClientBad =
+    Object.values(result.routingClient.certLegs).some((leg) => leg.status === 'failed') ||
+    Object.values(result.routingClient.keyLegs).some((leg) => leg.status === 'failed');
+  return controlRepoBad || controlRepoSyncBad || agentBad || result.vault.status === 'failed' || caBad || routingBad || routingClientBad ? 1 : 0;
 }
 
 // --- Entry point ---
