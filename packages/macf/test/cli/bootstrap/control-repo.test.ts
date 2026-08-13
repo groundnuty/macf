@@ -77,11 +77,37 @@ describe('classifyControlRepoOwnership (pure)', () => {
     expect(classifyControlRepoOwnership({ presence: 'unknown' }, undefined, MANIFEST)).toEqual({ kind: 'unknown' });
   });
 
-  it('present + archived -> foreign, UNCONDITIONALLY (retired-fleet-leftover case), even with a matching fleet.yaml', () => {
+  // DR-043 Amendment G (groundnuty/macf#867) amends the PRE-Amendment-G rule
+  // this described ("present + archived -> foreign, UNCONDITIONALLY") —
+  // archived-ness alone is no longer a valid "retired leftover" signal once
+  // `archive` makes it a reversible state of a LIVE fleet. Discriminate on
+  // NAME-MATCH instead — see the four cases below.
+
+  it('present + archived + fleet.yaml MATCHES our fleet name -> ours-archived (revivable, DR-043 Amendment G)', () => {
     const meta: ControlRepoMeta = { presence: 'present', archived: true };
-    const result = classifyControlRepoOwnership(meta, SAME_FLEET_YAML, MANIFEST);
+    expect(classifyControlRepoOwnership(meta, SAME_FLEET_YAML, MANIFEST)).toEqual({ kind: 'ours-archived' });
+  });
+
+  it('present + archived + fleet.yaml declares a DIFFERENT fleet -> foreign (the case the original rule actually protects, preserved)', () => {
+    const otherFleetYaml = SAME_FLEET_YAML.replace('name: demo-fleet', 'name: other-fleet');
+    const meta: ControlRepoMeta = { presence: 'present', archived: true };
+    const result = classifyControlRepoOwnership(meta, otherFleetYaml, MANIFEST);
     expect(result.kind).toBe('foreign');
-    if (result.kind === 'foreign') expect(result.reason).toMatch(/ARCHIVED/);
+    if (result.kind === 'foreign') expect(result.reason).toMatch(/other-fleet/);
+  });
+
+  it('present + archived + fleet.yaml missing/unreadable -> foreign', () => {
+    const meta: ControlRepoMeta = { presence: 'present', archived: true };
+    const result = classifyControlRepoOwnership(meta, undefined, MANIFEST);
+    expect(result.kind).toBe('foreign');
+    if (result.kind === 'foreign') expect(result.reason).toMatch(/could not be read/);
+  });
+
+  it('present + archived + fleet.yaml unparseable -> foreign', () => {
+    const meta: ControlRepoMeta = { presence: 'present', archived: true };
+    const result = classifyControlRepoOwnership(meta, 'not: [valid, fleet, yaml', MANIFEST);
+    expect(result.kind).toBe('foreign');
+    if (result.kind === 'foreign') expect(result.reason).toMatch(/schema validation/);
   });
 
   it('present, not archived, fleet.yaml unreadable -> foreign', () => {
@@ -111,12 +137,12 @@ describe('classifyControlRepoOwnership (pure)', () => {
     expect(classifyControlRepoOwnership(meta, SAME_FLEET_YAML, MANIFEST)).toEqual({ kind: 'ours' });
   });
 
-  it('present, archived undefined (could not be read) -> treated as NOT-archived, falls through to content-match', () => {
+  it('present, archived undefined (could not be read) -> treated as NOT-archived (ours, not ours-archived) once a name-match is confirmed', () => {
     // meta.archived is `undefined` when the archived bit itself couldn't be
-    // parsed off the `gh api` response — distinct from a confident `false`.
-    // The classifier's `!== true` check treats both the same way (proceeds
-    // to the content read) rather than refusing outright — the CONTENT
-    // check is still the deciding factor either way.
+    // parsed off the `gh api` response — distinct from a confident `true`.
+    // The classifier's final `archived === true ? 'ours-archived' : 'ours'`
+    // check treats `undefined` the same as `false` (ordinary `ours`) —
+    // only a CONFIRMED `true` produces `ours-archived`.
     const meta: ControlRepoMeta = { presence: 'present' };
     expect(classifyControlRepoOwnership(meta, SAME_FLEET_YAML, MANIFEST)).toEqual({ kind: 'ours' });
   });
@@ -207,6 +233,9 @@ describe('provisionControlRepo', () => {
       checkMeta: async () => ({ presence: 'absent' }),
       readManifestFile: async () => undefined,
       createRepo: async () => {},
+      unarchiveRepo: async () => {
+        throw new Error('must not be called — no test in this describe block confirms revival unless it overrides this');
+      },
       cloneRepo: async () => {},
       commitAndPush: async () => 'pushed',
       ...overrides,
@@ -280,19 +309,104 @@ describe('provisionControlRepo', () => {
     expect(readFileSync(join(dir, '.gitignore'), 'utf-8')).toBe(`${CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY}\n`);
   });
 
-  it('foreign (archived) -> ABORTS: no create, no clone, no commit', async () => {
+  it('foreign (archived + fleet.yaml declares a DIFFERENT fleet) -> ABORTS: no create, no clone, no commit, no unarchiveRepo', async () => {
     const manifestPath = manifestPathIn();
+    const otherFleetYaml = SAME_FLEET_YAML.replace('name: demo-fleet', 'name: other-fleet');
     let cloneCalled = false;
     const deps = baseDeps({
       checkMeta: async () => ({ presence: 'present', archived: true }),
-      readManifestFile: async () => SAME_FLEET_YAML,
+      readManifestFile: async () => otherFleetYaml,
       cloneRepo: async () => {
         cloneCalled = true;
       },
     });
     const outcome = await provisionControlRepo(MANIFEST, manifestPath, deps);
     expect(outcome.status).toBe('foreign');
-    if (outcome.status === 'foreign') expect(outcome.reason).toMatch(/ARCHIVED/);
+    expect(cloneCalled).toBe(false);
+  });
+
+  // --- DR-043 Amendment G (groundnuty/macf#867) — ours-archived / revival ---
+
+  it('ours-archived + confirmUnarchive NOT set (default) -> ABORTS status "archived": no unarchiveRepo, no clone, no commit', async () => {
+    const manifestPath = manifestPathIn();
+    let unarchiveCalled = false;
+    let cloneCalled = false;
+    const deps = baseDeps({
+      checkMeta: async () => ({ presence: 'present', archived: true }),
+      readManifestFile: async () => SAME_FLEET_YAML,
+      unarchiveRepo: async () => {
+        unarchiveCalled = true;
+      },
+      cloneRepo: async () => {
+        cloneCalled = true;
+      },
+    });
+
+    const outcome = await provisionControlRepo(MANIFEST, manifestPath, deps);
+
+    expect(outcome.status).toBe('archived');
+    if (outcome.status === 'archived') expect(outcome.reason).toMatch(/ARCHIVED/);
+    expect(unarchiveCalled).toBe(false);
+    expect(cloneCalled).toBe(false);
+  });
+
+  it('ours-archived + confirmUnarchive: false explicitly -> STILL aborts status "archived" (never inferred true)', async () => {
+    const manifestPath = manifestPathIn();
+    const deps = baseDeps({
+      checkMeta: async () => ({ presence: 'present', archived: true }),
+      readManifestFile: async () => SAME_FLEET_YAML,
+    });
+
+    const outcome = await provisionControlRepo(MANIFEST, manifestPath, deps, { confirmUnarchive: false });
+
+    expect(outcome.status).toBe('archived');
+  });
+
+  it('ours-archived + confirmUnarchive: true -> unarchiveRepo called BEFORE cloneRepo, then proceeds like reuse -> status "revived"', async () => {
+    const manifestPath = manifestPathIn();
+    const dir = scratchDir();
+    const callOrder: string[] = [];
+    const deps = baseDeps({
+      checkMeta: async () => ({ presence: 'present', archived: true }),
+      readManifestFile: async () => SAME_FLEET_YAML,
+      unarchiveRepo: async (repo) => {
+        expect(repo).toBe('groundnuty/demo-fleet-control');
+        callOrder.push('unarchive');
+      },
+      cloneRepo: async () => {
+        callOrder.push('clone');
+      },
+      commitAndPush: () => {
+        throw new Error('must not be called — revival does not re-commit fleet.yaml, same as an ordinary reuse');
+      },
+    });
+
+    const outcome = await provisionControlRepo(MANIFEST, manifestPath, deps, { confirmUnarchive: true, makeScratchDir: () => dir });
+
+    expect(outcome).toEqual({ status: 'revived', repo: 'groundnuty/demo-fleet-control', localDir: dir });
+    expect(callOrder).toEqual(['unarchive', 'clone']);
+    // Belt-and-suspenders .gitignore still applies on a revived checkout.
+    expect(readFileSync(join(dir, '.gitignore'), 'utf-8')).toBe(`${CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY}\n`);
+  });
+
+  it('ours-archived + confirmUnarchive: true, unarchiveRepo throws -> status "failed", cloneRepo never called', async () => {
+    const manifestPath = manifestPathIn();
+    let cloneCalled = false;
+    const deps = baseDeps({
+      checkMeta: async () => ({ presence: 'present', archived: true }),
+      readManifestFile: async () => SAME_FLEET_YAML,
+      unarchiveRepo: async () => {
+        throw new Error('GitHub API rejected the un-archive');
+      },
+      cloneRepo: async () => {
+        cloneCalled = true;
+      },
+    });
+
+    const outcome = await provisionControlRepo(MANIFEST, manifestPath, deps, { confirmUnarchive: true });
+
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/rejected the un-archive/);
     expect(cloneCalled).toBe(false);
   });
 

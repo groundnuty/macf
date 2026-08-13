@@ -11,7 +11,7 @@
  * doc comment) and `repo-create.ts`'s `realCreateRepo`.
  */
 import { describe, it, expect } from 'vitest';
-import { buildCreateVariableArgs } from '../../../src/cli/bootstrap/variable-write.js';
+import { buildCreateVariableArgs, buildDeleteVariableArgs } from '../../../src/cli/bootstrap/variable-write.js';
 
 describe('buildCreateVariableArgs (pure)', () => {
   it('is a POST, never a PATCH — the load-bearing create-only property', () => {
@@ -78,5 +78,23 @@ describe('buildCreateVariableArgs — org-scope visibility (macf#866)', () => {
 
     const profileArgs = buildCreateVariableArgs('/repos/groundnuty/groundnuty', 'NAME', 'value');
     expect(profileArgs).not.toContain('visibility=all');
+  });
+});
+
+describe('buildDeleteVariableArgs (pure) — DR-043 Amendment G (groundnuty/macf#867)', () => {
+  it('is a DELETE, targeting .../actions/variables/<name> (unlike create, which targets the collection endpoint)', () => {
+    const args = buildDeleteVariableArgs('repos/groundnuty/demo', 'ICSOC_2026_CA_CERT');
+    expect(args).toEqual(['api', 'repos/groundnuty/demo/actions/variables/ICSOC_2026_CA_CERT', '--method', 'DELETE']);
+  });
+
+  it('strips a leading slash from a registry-scope prefix, same as buildCreateVariableArgs', () => {
+    const args = buildDeleteVariableArgs('/orgs/macf-experiment', 'MACF_EXPERIMENT_CA_CERT');
+    expect(args).toContain('orgs/macf-experiment/actions/variables/MACF_EXPERIMENT_CA_CERT');
+  });
+
+  it('never carries a -f/-F value field — a delete has no value to send', () => {
+    const args = buildDeleteVariableArgs('repos/o/r', 'NAME');
+    expect(args).not.toContain('-f');
+    expect(args).not.toContain('-F');
   });
 });

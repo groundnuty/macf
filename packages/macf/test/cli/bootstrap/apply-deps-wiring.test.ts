@@ -25,6 +25,7 @@ import { describe, it, expect } from 'vitest';
 import { resolveMutateDeps } from '../../../src/cli/commands/bootstrap-apply.js';
 import { realControlRepoCommitAndPush } from '../../../src/cli/bootstrap/control-repo.js';
 import { realCommitAndPush } from '../../../src/cli/bootstrap/apply-repo-init.js';
+import { realUnarchiveRepo } from '../../../src/cli/bootstrap/repo-archive.js';
 import { realCreateRegistryVariable, realCreateRepoVariable, realMintCa } from '../../../src/cli/bootstrap/apply-ca.js';
 import { checkRegistryVariablePresence, checkRepoVariablePresence, readRegistryVariable } from '../../../src/cli/bootstrap/observer.js';
 
@@ -51,6 +52,23 @@ describe('apply real-deps wiring (macf#857 — the seam a unit test cannot see)'
     // Pins the property that makes calling it in a test safe: it assembles a
     // plain object; nothing runs until a field is invoked.
     expect(() => resolveMutateDeps('/definitely/not/a/real/path/fleet.yaml')).not.toThrow();
+  });
+
+  // --- DR-043 Amendment G (macf#867) — the revival wiring ---
+  //
+  // Same "defined, tested, never called" shape: `provisionControlRepo`'s
+  // `ours-archived` handling could ship correct and unit-tested while
+  // `resolveMutateDeps` left `unarchiveRepo` unwired (a runtime crash on the
+  // very first real revival) OR left `confirmUnarchive` unset/false (a
+  // silent-forever refusal — the ladder's "free revival" promise unreachable
+  // through the CLI even though every underlying primitive works).
+
+  it('wires the control-repo revival primitive to the real unarchive (repo-archive.ts)', () => {
+    expect(deps.controlRepoDeps.unarchiveRepo).toBe(realUnarchiveRepo);
+  });
+
+  it('sets controlRepoOptions.confirmUnarchive: true — reaching applyFleet already means the operator approved the plan', () => {
+    expect(deps.controlRepoOptions?.confirmUnarchive).toBe(true);
   });
 
   // --- DR-043 Amendment D phase 2 (macf#838) — the CA/routing trustDeps wiring ---

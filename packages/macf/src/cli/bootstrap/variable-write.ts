@@ -45,7 +45,9 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import type { RegistryConfig } from '@groundnuty/macf-core';
 import { getStderr } from './observer.js';
+import { registryPathPrefix } from '../registry-helper.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -98,3 +100,53 @@ export async function realCreateVariable(pathPrefix: string, name: string, value
 }
 
 export type CreateVariableFn = (pathPrefix: string, name: string, value: string) => Promise<CreateVariableResult>;
+
+// --- Delete-only writes (DR-043 Amendment G — the fleet teardown ladder, groundnuty/macf#867) ---
+//
+// `deactivate`'s registry-presence removal is the ONLY place this package
+// ever deletes a GitHub Actions variable outside `deregisterConditional`'s
+// agent-runtime path (`@groundnuty/macf-core`'s registry.ts — a DIFFERENT
+// credential surface, the fetch-based `GitHubVariablesClient`, not this
+// `gh`-CLI-shelling module). Mirrors `realCreateVariable`'s shape exactly
+// (pure arg-builder + a thin exec wrapper that classifies ONE expected
+// non-throwing outcome from stderr) so the two write directions stay
+// side-by-side and easy to audit together.
+
+export type DeleteVariableResult = 'deleted' | 'already-absent';
+
+/** Pure — the exact `gh api` argv for a variable delete. Same leading-`/`-stripping convention as {@link buildCreateVariableArgs}. */
+export function buildDeleteVariableArgs(pathPrefix: string, name: string): readonly string[] {
+  const prefix = pathPrefix.replace(/^\//, '');
+  return ['api', `${prefix}/actions/variables/${name}`, '--method', 'DELETE'];
+}
+
+/**
+ * Real delete. `'already-absent'` means the API reported a 404 — GitHub's
+ * own delete-variable contract treats "already gone" as an acceptable
+ * outcome (`@groundnuty/macf-core`'s `github-client.ts::deleteVariable`
+ * treats 204/404 identically), and DR-043 Amendment G's `deactivate` is
+ * explicitly idempotent-on-rerun, so a 404 here is NOT a failure — it is
+ * the expected steady state for e.g. `<SEG>_FEDERATED_CAS`, which nothing
+ * writes yet in this codebase (day-2 federation is out of Slice-1a scope).
+ * Any OTHER failure (auth, network, insufficient scope) throws — never
+ * silently swallowed, so the caller's "report what could not be done" rail
+ * has something concrete to report.
+ */
+export async function realDeleteVariable(pathPrefix: string, name: string): Promise<DeleteVariableResult> {
+  try {
+    await execFileAsync('gh', [...buildDeleteVariableArgs(pathPrefix, name)], { encoding: 'utf-8' });
+    return 'deleted';
+  } catch (err) {
+    const stderr = getStderr(err);
+    if (/HTTP 404|Not Found/i.test(stderr)) return 'already-absent';
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`gh api delete-variable failed for "${name}" at "${pathPrefix}": ${stderr || msg}`, { cause: err });
+  }
+}
+
+export type DeleteVariableFn = (pathPrefix: string, name: string) => Promise<DeleteVariableResult>;
+
+/** Real registry-scope delete — `registryPathPrefix` + {@link realDeleteVariable}, mirroring `apply-ca.ts::realCreateRegistryVariable`'s create-side wrapper. The ONLY delete primitive DR-043 Amendment G's `deactivate` uses — its target set (`teardown.ts::computeDeactivateTargets`) is registry-scope ONLY by construction (never `repos/<agent-repo>` — see that module's doc for why repo-scoped variables are explicitly out of `deactivate`'s blast radius). */
+export async function realDeleteRegistryVariable(registry: RegistryConfig, name: string): Promise<DeleteVariableResult> {
+  return realDeleteVariable(registryPathPrefix(registry), name);
+}

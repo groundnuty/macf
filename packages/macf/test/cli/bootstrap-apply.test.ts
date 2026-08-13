@@ -68,6 +68,7 @@ const EMPTY_OBSERVED: ObservedState = {
   agents: {},
   caRegistry: 'absent',
   caRepos: {},
+  controlRepoPresence: 'absent',
 };
 
 /**
@@ -94,6 +95,7 @@ function observedWithApp(role: string): ObservedState {
     },
     caRegistry: 'present',
     caRepos: {},
+    controlRepoPresence: 'absent',
   };
 }
 
@@ -306,6 +308,9 @@ function fakeMutateDeps(manifestPath: string, overrides: Partial<MutateApplyDeps
       checkMeta: async () => ({ presence: 'absent' }),
       readManifestFile: async () => undefined,
       createRepo: async () => {},
+      unarchiveRepo: async () => {
+        throw new Error('must not be called — this default control repo is always absent, never ours-archived');
+      },
       cloneRepo: async () => {},
       commitAndPush: async () => 'pushed',
     },
@@ -406,7 +411,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(parsed.vault.status).toBe('written');
   });
 
-  it('control repo FOREIGN end-to-end: exit 1, NO agent App/repo/install is ever touched, no fleet.lock/vault.age written', async () => {
+  it('control repo FOREIGN end-to-end (unreadable fleet.yaml): exit 1, NO agent App/repo/install is ever touched, no fleet.lock/vault.age written', async () => {
     const file = writeManifest();
     let agentDepsBuilt = false;
     const code = await runBootstrapApply(
@@ -418,9 +423,12 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
           return fakeAgentDeps();
         },
         controlRepoDeps: {
-          checkMeta: async () => ({ presence: 'present', archived: true }),
+          checkMeta: async () => ({ presence: 'present', archived: false }),
           readManifestFile: async () => undefined,
           createRepo: async () => {
+            throw new Error('must not be called');
+          },
+          unarchiveRepo: async () => {
             throw new Error('must not be called');
           },
           cloneRepo: async () => {
@@ -436,9 +444,100 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(agentDepsBuilt).toBe(false);
     const out = logs.join('\n');
     expect(out).toMatch(/⚠ ABORTED/);
-    expect(out).toMatch(/ARCHIVED/);
+    expect(out).toMatch(/could not be read/);
     expect(existsSync(join(join(file, '..'), 'fleet.lock'))).toBe(false);
     expect(existsSync(join(join(file, '..'), 'secrets', 'vault.age'))).toBe(false);
+  });
+
+  // --- DR-043 Amendment G (macf#867) — the archived/foreign split end-to-end ---
+
+  it('control repo ARCHIVED but a DIFFERENT fleet\'s fleet.yaml -> still FOREIGN (the case the pre-Amendment-G rule protects, preserved)', async () => {
+    const file = writeManifest();
+    const otherFleetYaml = FLEET_YAML.replace('name: demo-fleet', 'name: some-other-fleet');
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+      fakeMutateDeps(file, {
+        controlRepoDeps: {
+          checkMeta: async () => ({ presence: 'present', archived: true }),
+          readManifestFile: async () => otherFleetYaml,
+          createRepo: async () => {
+            throw new Error('must not be called');
+          },
+          unarchiveRepo: async () => {
+            throw new Error('must not be called');
+          },
+          cloneRepo: async () => {
+            throw new Error('must not be called');
+          },
+          commitAndPush: async () => {
+            throw new Error('must not be called');
+          },
+        },
+      }),
+    );
+    expect(code).toBe(1);
+    expect(logs.join('\n')).toMatch(/⚠ ABORTED/);
+  });
+
+  it('control repo ARCHIVED + confirmUnarchive NOT set on the mutate deps -> exit 1, "archived" status, NO unarchiveRepo/clone/commit', async () => {
+    const file = writeManifest();
+    let unarchiveCalled = false;
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+      fakeMutateDeps(file, {
+        // controlRepoOptions deliberately OMITTED — confirmUnarchive defaults to unset/false.
+        controlRepoDeps: {
+          checkMeta: async () => ({ presence: 'present', archived: true }),
+          readManifestFile: async () => FLEET_YAML,
+          createRepo: async () => {
+            throw new Error('must not be called');
+          },
+          unarchiveRepo: async () => {
+            unarchiveCalled = true;
+          },
+          cloneRepo: async () => {
+            throw new Error('must not be called');
+          },
+          commitAndPush: async () => {
+            throw new Error('must not be called');
+          },
+        },
+      }),
+    );
+    expect(code).toBe(1);
+    expect(unarchiveCalled).toBe(false);
+    expect(logs.join('\n')).toMatch(/⚠ ABORTED/);
+  });
+
+  it('control repo ARCHIVED + confirmUnarchive: true -> unarchiveRepo IS called, run proceeds (REVIVED)', async () => {
+    const file = writeManifest();
+    let unarchiveCalled = false;
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+      fakeMutateDeps(file, {
+        // Keep the same manifestPath-relative scratch dir the default uses
+        // (avoids leaking a real `mkdtemp` dir) — only `confirmUnarchive` differs.
+        controlRepoOptions: { confirmUnarchive: true, makeScratchDir: () => join(file, '..') },
+        controlRepoDeps: {
+          checkMeta: async () => ({ presence: 'present', archived: true }),
+          readManifestFile: async () => FLEET_YAML,
+          createRepo: async () => {
+            throw new Error('must not be called — ours-archived never creates');
+          },
+          unarchiveRepo: async () => {
+            unarchiveCalled = true;
+          },
+          cloneRepo: async () => {},
+          commitAndPush: async () => 'nothing-to-commit',
+        },
+      }),
+    );
+    expect(unarchiveCalled).toBe(true);
+    expect(logs.join('\n')).toMatch(/REVIVED/);
+    expect(code).toBe(0);
   });
 
   it('a per-agent gate failure still exits the run non-zero (via applyExitCode), even though applyFleet itself completed', async () => {
@@ -773,6 +872,31 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
   it('formatApplyResult renders a LOUD ⚠ ABORTED line for a control repo that could not be provisioned', () => {
     const text = formatApplyResult(resultWith({ controlRepo: { status: 'failed', repo: 'groundnuty/demo-fleet-control', reason: 'network down' } }));
     expect(text).toMatch(/⚠ ABORTED.*network down/);
+  });
+
+  // --- DR-043 Amendment G (macf#867) — the revival outcomes ---
+
+  it('formatApplyResult renders "REVIVED" for a control repo un-archived this run', () => {
+    const text = formatApplyResult(resultWith({ controlRepo: { status: 'revived', repo: 'groundnuty/demo-fleet-control', localDir: '/tmp/x' } }));
+    expect(text).toMatch(/^Control repo: REVIVED "groundnuty\/demo-fleet-control"/m);
+  });
+
+  it('formatApplyResult renders a LOUD ⚠ ABORTED line when revival was not confirmed', () => {
+    const text = formatApplyResult(
+      resultWith({ controlRepo: { status: 'archived', repo: 'groundnuty/demo-fleet-control', reason: 'revival was not confirmed' } }),
+    );
+    expect(text).toMatch(/⚠ ABORTED.*groundnuty\/demo-fleet-control.*revival was not confirmed/);
+  });
+
+  it('applyExitCode: 1 when the control repo is archived and revival was not confirmed', () => {
+    expect(
+      applyExitCode(resultWith({ controlRepo: { status: 'archived', repo: 'x/y-control', reason: 'revival was not confirmed' } })),
+    ).toBe(1);
+  });
+
+  it('applyExitCode: 0 for a REVIVED control repo (with everything else clean) — revival itself is not a failure', () => {
+    const result = resultWith({ controlRepo: { status: 'revived', repo: 'x/y-control', localDir: '/tmp/x' } });
+    expect(applyExitCode(result)).toBe(0);
   });
 
   it('formatApplyResult renders the control-repo sync outcome, including a loud FAILED line', () => {

@@ -45,7 +45,7 @@ function writeManifest(text: string): { dir: string; file: string } {
   return { dir, file };
 }
 
-const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, caRegistry: 'unknown', caRepos: {} };
+const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, caRegistry: 'unknown', caRepos: {}, controlRepoPresence: 'absent' };
 
 /**
  * DR-043 Amendment D phase 2 (macf#838) — `ca` is fully implemented now

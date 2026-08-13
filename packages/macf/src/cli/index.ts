@@ -16,6 +16,7 @@ import { runFleetInstallCronCommand, DEFAULT_SCHEDULE } from './commands/fleet-i
 import { runFleetReconcileCommand } from './commands/fleet-reconcile.js';
 import { runFleetResumeCommand } from './commands/fleet-resume.js';
 import { runFleetUpgrade } from './commands/fleet-upgrade.js';
+import { runFleetDeactivate, runFleetArchive } from './commands/fleet-teardown.js';
 import { runBootstrapPlan } from './commands/bootstrap.js';
 import { runBootstrapApply } from './commands/bootstrap-apply.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
@@ -474,6 +475,44 @@ fleet
       verifyTimeoutSec: opts.verifyTimeout,
       force: opts.force,
     });
+    process.exitCode = code;
+  });
+
+fleet
+  .command('deactivate')
+  .description(
+    'DR-043 Amendment G — the fleet teardown ladder\'s FIRST reversible rung: deregister the fleet ' +
+    'from the registry. Removes ONLY org/account-scope registry presence (the `<SEG>_CA_CERT` registry ' +
+    'leg, every agent\'s `<SEG>_AGENT_<ROLE>` registration, `<SEG>_FEDERATED_CAS`) by EXACT KEY — never a ' +
+    'prefix sweep. Repo-scoped variables/secrets, the vault, the repos, and the GitHub Apps are ALL left ' +
+    'untouched — revival is `apply` away, zero browser clicks (Amendment G\'s "free revival" property). ' +
+    'Refuses on a foreign/unconfirmed control repo. Shows the exact target set + current registry state ' +
+    'before any mutation (--yes skips the interactive confirmation).',
+  )
+  .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
+  .option('--yes', 'Skip the interactive confirmation prompt', false)
+  .option('--json', 'Emit the structured result as JSON', false)
+  .action(async (opts) => {
+    const code = await runFleetDeactivate({ file: opts.file, yes: opts.yes, json: opts.json });
+    process.exitCode = code;
+  });
+
+fleet
+  .command('archive')
+  .description(
+    'DR-043 Amendment G — the fleet teardown ladder\'s SECOND reversible rung: `deactivate` + archives ' +
+    'the `<fleet>-control` repo and every agent repo (`archived: true` via the GitHub API — read-only, ' +
+    'reversible). Cumulative by design (an archived-but-still-registered fleet would be incoherent). ' +
+    'Revival: un-archive (an `apply` run un-archives its own control repo on approval — see `bootstrap ' +
+    'apply`\'s control-repo-archived confirm-required plan item) + `apply`, still zero browser clicks. ' +
+    'NEVER deletes anything — `delete-apps` / `destroy` are separate, deliberately harder-to-reach verbs, ' +
+    'not flags on this one.',
+  )
+  .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
+  .option('--yes', 'Skip the interactive confirmation prompt', false)
+  .option('--json', 'Emit the structured result as JSON', false)
+  .action(async (opts) => {
+    const code = await runFleetArchive({ file: opts.file, yes: opts.yes, json: opts.json });
     process.exitCode = code;
   });
 
