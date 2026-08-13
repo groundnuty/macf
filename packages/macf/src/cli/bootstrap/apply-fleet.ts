@@ -221,8 +221,8 @@ import {
 import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } from './apply-ca.js';
 import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
-import type { RunnerRegistrationDeps } from './apply-routing.js';
-import { publishTrustedActors } from './apply-routing.js';
+import type { RunnerRegistrationDeps, RunnerTokenPollOptions } from './apply-routing.js';
+import { publishTrustedActorsGated } from './apply-routing.js';
 import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientPublishResult } from './apply-routing-client.js';
 import { mintRoutingClient, publishRoutingClientSecrets, skippedRoutingClientPublish } from './apply-routing-client.js';
 
@@ -272,6 +272,27 @@ export interface FleetApplyDeps {
    * dep object would blur two independently-testable seams together.
    */
   readonly routingClientDeps: RoutingClientApplyDeps;
+  /**
+   * The `--runner-token`/`MACF_BOOTSTRAP_RUNNER_TOKEN` value (macf#929) —
+   * `undefined`/empty means "no token supplied." Threaded verbatim into
+   * `apply-routing.ts::publishTrustedActorsGated`'s POLICY gate; NEVER read
+   * anywhere else in this module, NEVER copied onto `FleetApplyResult` (the
+   * `--json`/text renderers in `commands/bootstrap-apply.ts` serialize
+   * `FleetApplyResult`, not `FleetApplyDeps`, so this field is structurally
+   * unreachable from any render — see `publishTrustedActorsGated`'s doc for
+   * the "token licenses ATTEMPTING detection, never substitutes for it"
+   * contract this field carries into that gate).
+   */
+  readonly runnerToken?: string;
+  /**
+   * Test-only override for {@link RunnerTokenPollOptions} threaded into
+   * `publishTrustedActorsGated`'s bounded poll (macf#929). Production
+   * (`commands/bootstrap-apply.ts::resolveMutateDeps`) leaves this unset,
+   * taking that function's real defaults (10 min / 3s — a genuine deploy
+   * window); tests set a near-zero budget so a "runner never appears" case
+   * resolves without real wall-clock delay.
+   */
+  readonly runnerTokenPollOptions?: RunnerTokenPollOptions;
 }
 
 export interface AgentApplyRecord {
@@ -826,13 +847,18 @@ export async function applyFleet(
   // operator would happen).
   const routing =
     manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted'
-      ? await publishTrustedActors(
+      ? await publishTrustedActorsGated(
           buildTrustedActorsValue(manifest.metadata.name, manifest.agents),
           confirmedRepos,
           deps.trustDeps,
+          // POLICY only (macf#929): the token gates whether we ATTEMPT the
+          // detection-and-write at all; it never substitutes for confirming a
+          // usable runner. `publishTrustedActorsGated` owns that contract.
+          deps.runnerToken,
+          deps.runnerTokenPollOptions,
         )
       : {};
-  for (const [repo, leg] of Object.entries(routing)) {
+  for (const [repo, leg] of Object.entries<EnsureVariableOutcome>(routing)) {
     deps.log(`Routing var (${repo}): ${leg.status}` + (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'));
   }
 

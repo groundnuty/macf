@@ -131,6 +131,28 @@ describe('apply real-deps wiring (macf#857 — the seam a unit test cannot see)'
     expect(deps.trustDeps.checkRunnerUsableByRepo).toBe(checkRunnerUsableByRepo);
   });
 
+  // --- macf#929 — the runner-token CLI-flag/env-fallback wiring ---
+  //
+  // Same "defined, tested, never called" shape this file exists to catch
+  // (see the module doc): `publishTrustedActorsGated` (apply-routing.ts)
+  // could ship correct and unit-tested while `resolveMutateDeps` never
+  // threaded the resolved CLI-flag/env-var token onto
+  // `FleetApplyDeps.runnerToken` at all — leaving the `--runner-token` flag
+  // `index.ts` exposes structurally unreachable from what `apply` actually
+  // runs. This is the earlier failure mode `apply-fleet.ts` wiring the
+  // gate call itself doesn't catch: that wiring is between apply-fleet.ts
+  // and apply-routing.ts, one layer BELOW the CLI's own option-to-deps
+  // threading pinned here.
+
+  it('threads a resolved runner-token verbatim onto FleetApplyDeps.runnerToken (macf#929)', () => {
+    const withToken = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', undefined, 'ghr-sentinel-token');
+    expect(withToken.runnerToken).toBe('ghr-sentinel-token');
+  });
+
+  it('leaves runnerToken undefined when no CLI-flag/env value is resolved — the DEFAULT deps object fails CLOSED, never open', () => {
+    expect(deps.runnerToken).toBeUndefined();
+  });
+
   // --- groundnuty/macf#920 gap 2 — the routing-client re-mint wiring ---
   //
   // The EXACT "defined, tested, never called" shape this file exists to

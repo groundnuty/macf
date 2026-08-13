@@ -67,6 +67,7 @@ import type { EnsureVariableOutcome } from '../bootstrap/ensure-variable.js';
 import type { RoutingClientApplyDeps } from '../bootstrap/apply-routing-client.js';
 import { realMintRoutingClient, realSetRepoSecret } from '../bootstrap/apply-routing-client.js';
 import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
+import { RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
 import { readVault, vaultAgentPrivateKeyPem } from '../bootstrap/vault-read.js';
 import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
@@ -100,6 +101,16 @@ export interface RunBootstrapApplyOptions {
    */
   readonly vaultPath?: string;
   readonly identityKeyPath?: string;
+  /**
+   * `--runner-token` (macf#929) — the CLI-flag form of the register-before-
+   * route POLICY gate `apply-routing.ts::publishTrustedActorsGated` enforces.
+   * `undefined` here does NOT necessarily mean "no token": `runBootstrapApply`
+   * falls back to the {@link RUNNER_TOKEN_ENV_VAR} env var when this is unset
+   * (CLI flag wins on conflict) — see the resolution right before
+   * `resolveMutateDeps` is called. NEVER logged, NEVER copied onto any
+   * rendered result (mirrors `FleetApplyDeps.runnerToken`'s own doc).
+   */
+  readonly runnerToken?: string;
 }
 
 export interface BootstrapApplyDeps {
@@ -496,7 +507,14 @@ const REAL_ROUTING_CLIENT_DEPS: RoutingClientApplyDeps = {
  * can. Pure — it builds a plain object and performs no I/O until a field is
  * invoked — so a test may call it directly.
  */
-export function resolveMutateDeps(manifestPath: string, vaultAgentPems?: ReadonlyMap<string, string>): MutateApplyDeps {
+export function resolveMutateDeps(
+  manifestPath: string,
+  vaultAgentPems?: ReadonlyMap<string, string>,
+  // macf#929 — resolved CLI-flag/env-var token (see `runBootstrapApply`'s
+  // resolution right before this is called); threaded verbatim onto
+  // `FleetApplyDeps.runnerToken`, never read anywhere else in this function.
+  runnerToken?: string,
+): MutateApplyDeps {
   const repoInitDeps: RepoInitStepDeps = { cloneRepo: realCloneRepo, commitAndPush: realCommitAndPush };
 
   // macf#913 — the vault-aware confirm-before-create guard's key resolver.
@@ -549,6 +567,10 @@ export function resolveMutateDeps(manifestPath: string, vaultAgentPems?: Readonl
       process.stderr.write(`${line}\n`);
     },
     allowVaultVersion: process.env['MACF_BOOTSTRAP_VAULT_VERSION'] === '1',
+    // macf#929 — POLICY only (see apply-routing.ts::publishTrustedActorsGated's
+    // doc); `runnerTokenPollOptions` is deliberately left unset here, taking
+    // that function's real 10min/3s deploy-window defaults.
+    runnerToken,
     confirmPlan: realConfirmPlan,
     // DR-043 Amendment F residual (macf#857): this still reads from the
     // OPERATOR's local manifest directory, not the (not-yet-cloned, at this
@@ -972,7 +994,15 @@ export async function runBootstrapApply(
       process.stderr.write(`\n${formatIdentityPreview(preview)}\n`);
     }
 
-    const mutate = mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems);
+    // macf#929 — CLI flag wins on conflict; MACF_BOOTSTRAP_RUNNER_TOKEN is the
+    // fallback (same "flag, then env" precedence `--min-agents`/
+    // MACF_PROPOSE_MIN_AGENTS already establishes in index.ts). Resolved HERE,
+    // not inside `resolveMutateDeps`, so that function stays a pure
+    // plain-object builder — no `process.env` read hidden inside it for this
+    // field (unlike the pre-existing `allowVaultVersion` line above it, which
+    // this does NOT imitate).
+    const resolvedRunnerToken = opts.runnerToken ?? process.env[RUNNER_TOKEN_ENV_VAR];
+    const mutate = mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken);
     try {
       const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, displayCreations);
       if (!approved) {
