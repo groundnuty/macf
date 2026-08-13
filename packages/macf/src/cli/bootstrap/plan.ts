@@ -76,14 +76,23 @@ export interface ObservedAgentState {
    * The agent's deployed macf CLI version — DR-043 §D6. Sourced from
    * `fleet.lock` ONLY ({@link readFleetLock}'s `deployed_version` field);
    * `undefined` when the lock has no entry, or the entry has never recorded
-   * one. **Honest limitation, not a hidden one:** no code path in this
-   * repo currently WRITES `deployed_version` into `fleet.lock` (verified —
-   * `apply-fleet.ts` never sets it), and this Mac-side, GitHub-only tool has
-   * no mTLS path to an agent's live `/health.version` (that read belongs to
-   * `macf fleet upgrade`'s VM-side operational plane, DR-037/§D4) — so this
-   * field is realistically `undefined` for most fleets until a future
-   * increment wires a genuine write-back. `undefined` here MUST read as
-   * `unknown`, never as "matches" or "differs" — see `plan.ts`'s
+   * one. This Mac-side, GitHub-only tool still has no mTLS path to an
+   * agent's live `/health.version` (that read belongs to `macf fleet
+   * upgrade`'s VM-side operational plane, DR-037/§D4) — `deployedVersion`
+   * is a LOCK read, never a live one, by design.
+   *
+   * **The write path exists as of macf#907**: `macf fleet upgrade`'s
+   * `rollFleet` (`@groundnuty/macf-core`'s `fleet-upgrade.ts`) records a
+   * CONFIRMED verify-green into the control repo's `fleet.lock` via
+   * `fleet-lock-recorder.ts`, opt-in behind `fleet upgrade`'s `-f, --file
+   * <fleet.yaml>` flag. `undefined` here can therefore mean either "never
+   * rolled with `-f`/deployed_version-write-back enabled" or "this `plan`
+   * run's `--file` points at a checkout whose `fleet.lock` predates the
+   * roll" ({@link readFleetLock} reads the manifest's OWN directory, a
+   * residual pre-Amendment-F local read — see that function's doc; it
+   * reflects the control repo's committed state only once that local
+   * checkout has been `git pull`ed). Either way, `undefined` here MUST
+   * read as `unknown`, never as "matches" or "differs" — see `plan.ts`'s
    * `UNKNOWN_REASONS.deployedVersion` and Amendment A's honest-unknown floor.
    */
   readonly deployedVersion?: string;
@@ -445,9 +454,11 @@ export const UNKNOWN_REASONS = {
   // DR-043 §D6 — deliberately NOT the same cause as `identity` above (no
   // JWT is not why this is unknown) nor `variable` (this isn't a failed
   // GitHub API read either, most of the time): `fleet.lock` simply has never
-  // had a `deployed_version` recorded for this agent, because no code path
-  // in this repo writes one yet (verified — see `ObservedAgentState.deployedVersion`'s
-  // doc). Naming the real cause matters the same way it did for
+  // had a `deployed_version` recorded for this agent — either no roll has
+  // run the write-back yet (`macf fleet upgrade -f <fleet.yaml>`, macf#907),
+  // or this `plan` run's local checkout hasn't pulled the control repo's
+  // latest committed lock (see `ObservedAgentState.deployedVersion`'s doc).
+  // Naming the real cause matters the same way it did for
   // `identity`/`repo`/`variable` (macf#842 review) — a diagnostic pointing
   // at "no JWT" here would send the operator chasing the wrong fix.
   deployedVersion:

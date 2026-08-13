@@ -438,7 +438,17 @@ export type UpgradeEvent =
    * the next one. Distinct from `halt`: the agent WAS mutated here too, but
    * the cause doesn't implicate the release.
    */
-  | { readonly kind: 'stale-pin-skip'; readonly agent: string; readonly pin: string; readonly target: string };
+  | { readonly kind: 'stale-pin-skip'; readonly agent: string; readonly pin: string; readonly target: string }
+  /**
+   * DR-043 §D6 write-back (macf#907) — `deps.recordDeployedVersion` (the
+   * confirmed-green `fleet.lock` write) rejected. NON-FATAL: `outcome` for
+   * this agent is still `'upgraded'` (the roll's job — mutate + confirm
+   * green — already succeeded) and the roll CONTINUES to the next agent.
+   * Surfaced LOUD rather than swallowed (silent-fallback-hazards.md's whole
+   * point) so a broken control-repo write path doesn't silently leave
+   * `fleet.lock` stale forever.
+   */
+  | { readonly kind: 'lock-write-failed'; readonly agent: string; readonly version: string; readonly error: string };
 
 /**
  * Classify each discovered fleet member against the target version. PURE — no
@@ -512,6 +522,24 @@ export interface RollFleetDeps {
   readonly now: () => number;
   /** Optional progress sink for CLI rendering. */
   readonly onEvent?: (ev: UpgradeEvent) => void;
+  /**
+   * DR-043 §D6 write-back (macf#907) — records `agent`'s CONFIRMED deployed
+   * version into `fleet.lock` (via `@groundnuty/macf` bootstrap's
+   * `fleet-lock.ts::composeFleetLock`/`writeFleetLock`, never a second
+   * writer). Called from EXACTLY ONE place below: the `green.ok === true`
+   * branch, i.e. `verifyGreen` positively confirmed `agent` is running
+   * `version` — the single moment this sequencer genuinely knows the
+   * deployed version (see this module's + `fleet.lock`'s docs on Amendment
+   * A's honest-unknown floor). Every other disposition (busy/config-dirty/
+   * branch-skipped, stale-pin-skipped, halted) must NEVER reach this — none
+   * of them is a positive confirmation. Optional (omitted ⇒ unchanged
+   * behavior, `deployed_version` stays unwritten) and best-effort: a
+   * rejected promise here is caught + surfaced via `onEvent`
+   * (`'lock-write-failed'`), never thrown — the agent IS upgraded regardless
+   * of whether this bookkeeping write lands, so a write failure must not
+   * retract the `'upgraded'` outcome or halt the roll.
+   */
+  readonly recordDeployedVersion?: (agent: string, fleet: string, version: string) => Promise<void>;
 }
 
 /** Default total `--wait` budget for a busy agent to go idle (ms). */
@@ -881,6 +909,24 @@ export async function rollFleet(
       // agent back to normal watchdog reconciliation immediately.
       stopHeartbeat();
       await deps.driver.releaseLock(agent);
+      // DR-043 §D6 write-back (macf#907) — AFTER the lock release, not
+      // inside the transaction above: the agent IS confirmed upgraded
+      // regardless of whether this bookkeeping write succeeds, so it must
+      // not hold the maintenance lock hostage for a clone+commit round-trip,
+      // and a failure here must not retract the `'upgraded'` outcome above
+      // or halt the roll — see `RollFleetDeps.recordDeployedVersion`'s doc.
+      if (deps.recordDeployedVersion) {
+        try {
+          await deps.recordDeployedVersion(agent, plan.fleet, green.version);
+        } catch (err) {
+          deps.onEvent?.({
+            kind: 'lock-write-failed',
+            agent,
+            version: green.version,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       continue;
     }
 
@@ -972,6 +1018,8 @@ export interface UpgradeFleetsDeps {
   readonly sleep: (ms: number) => Promise<void>;
   readonly now: () => number;
   readonly onEvent?: (ev: UpgradeEvent) => void;
+  /** DR-043 §D6 write-back (macf#907) — threaded straight through to `rollFleet`'s `RollFleetDeps.recordDeployedVersion`; see that field's doc. */
+  readonly recordDeployedVersion?: (agent: string, fleet: string, version: string) => Promise<void>;
 }
 
 /** One fleet's slice of the run report. */
@@ -1035,6 +1083,7 @@ export async function upgradeFleets(
       sleep: deps.sleep,
       now: deps.now,
       onEvent: deps.onEvent,
+      recordDeployedVersion: deps.recordDeployedVersion,
     });
     reports.push({ fleet, plans, rolled });
     if (rolled.halted) {

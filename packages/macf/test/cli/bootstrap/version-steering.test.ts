@@ -156,10 +156,13 @@ describe('DR-043 §D6 — versions.macf steering, the whole loop', () => {
   it('step 4 — after the (simulated) roll, both agents observed at Y → drift clears (noop again)', () => {
     const manifest = baseManifest({ versions: { macf: VERSION_Y, actions: ACTIONS_PIN } });
     // Simulates re-running `macf bootstrap plan` after an operator ran
-    // `macf fleet upgrade` and DR-037's verify-green gate confirmed both
-    // agents landed on Y — i.e. a FRESH observation, not a mutation of any
-    // artifact this tool wrote (this tool never writes `deployed_version`;
-    // see `ObservedAgentState.deployedVersion`'s doc for why).
+    // `macf fleet upgrade -f fleet.yaml` and DR-037's verify-green gate
+    // confirmed both agents landed on Y — i.e. a FRESH observation, not a
+    // mutation of any artifact THIS tool (`bootstrap plan`) wrote itself
+    // (`plan` is read-only; the write-back is `fleet upgrade`'s job as of
+    // macf#907 — see `fleet-lock-recorder.test.ts` for the write→read round
+    // trip THROUGH the real `composeFleetLock`/`readFleetLock` path this
+    // hand-built `ObservedState` fixture deliberately bypasses here).
     const observed = observedBothAt(VERSION_Y);
 
     const plan = computePlan(manifest, observed);

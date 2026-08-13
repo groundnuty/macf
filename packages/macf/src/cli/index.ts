@@ -467,6 +467,12 @@ fleet
     false,
   )
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .option(
+    '-f, --file <path>',
+    'Path to the fleet.yaml manifest (DR-043 §D6, macf#907) — when given, a confirmed ' +
+      "verify-green records that agent's deployed_version into the control repo's fleet.lock; " +
+      'omitted = unchanged (no write). Same flag as `fleet deactivate`/`archive`.',
+  )
   .action(async (opts) => {
     const code = await runFleetUpgrade(resolveProjectDir(opts.dir), {
       target: opts.target,
@@ -476,6 +482,7 @@ fleet
       wait: opts.wait,
       verifyTimeoutSec: opts.verifyTimeout,
       force: opts.force,
+      file: opts.file,
     });
     process.exitCode = code;
   });

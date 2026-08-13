@@ -29,6 +29,7 @@ import { readAgentConfig } from '../config.js';
 import { discoverWorkspaces } from '../discovery.js';
 import { createVmDriverFromConfig } from '../fleet/vm-driver.js';
 import { fetchLatestCliVersion } from '../version-resolver.js';
+import { buildRecordDeployedVersion } from '../bootstrap/fleet-lock-recorder.js';
 import { formatTable } from './ps.js';
 
 /**
@@ -76,6 +77,15 @@ export interface RunFleetUpgradeOptions {
    * anyway," so the pre-existing dirt is left in place, not stashed.
    */
   readonly force?: boolean;
+  /**
+   * DR-043 §D6 write-back (macf#907) — path to the fleet's `fleet.yaml`
+   * (mirrors `fleet deactivate`/`archive`'s existing `-f, --file`
+   * convention). When given, a CONFIRMED verify-green records that agent's
+   * `deployed_version` into the control repo's `fleet.lock`
+   * (`fleet-lock-recorder.ts`). Omitted (the default) ⇒ unchanged
+   * pre-macf#907 behavior — no write, `deployed_version` stays unknown.
+   */
+  readonly file?: string;
 }
 
 /** Injectable seams — production resolves them from config; tests supply fakes. */
@@ -97,6 +107,13 @@ export interface FleetUpgradeDeps {
   readonly now: () => number;
   /** Output sink (default `console.log`). */
   readonly log: (line: string) => void;
+  /**
+   * DR-043 §D6 write-back (macf#907) — threaded straight through to
+   * macf-core's `UpgradeFleetsDeps.recordDeployedVersion`; built from
+   * `RunFleetUpgradeOptions.file` by `resolveDepsFromConfig` when given,
+   * `undefined` otherwise (no write).
+   */
+  readonly recordDeployedVersion?: (agent: string, fleet: string, version: string) => Promise<void>;
 }
 
 /**
@@ -243,7 +260,7 @@ export async function runFleetUpgrade(
   opts: RunFleetUpgradeOptions = {},
   deps?: FleetUpgradeDeps,
 ): Promise<number> {
-  const resolved = deps ?? (await resolveDepsFromConfig(projectDir));
+  const resolved = deps ?? (await resolveDepsFromConfig(projectDir, opts.file));
   if (!resolved) return 1;
 
   const targetR = await resolveTargetVersion(opts.target, resolved.fetchLatest);
@@ -305,6 +322,7 @@ export async function runFleetUpgrade(
       sleep: resolved.sleep,
       now: resolved.now,
       onEvent: (ev: UpgradeEvent) => emit(ev, resolved.log),
+      recordDeployedVersion: resolved.recordDeployedVersion,
     },
   );
 
@@ -376,6 +394,11 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
     case 'fleet-skipped':
       log(`── fleet ${ev.fleet}: SKIPPED (${ev.reason}) ──`);
       break;
+    case 'lock-write-failed':
+      // macf#907 — non-fatal: the agent above already reported 'upgraded'.
+      // This is bookkeeping-only, surfaced loud rather than swallowed.
+      log(`   ${ev.agent}: fleet.lock deployed_version write FAILED (non-fatal) — ${ev.error}`);
+      break;
   }
 }
 
@@ -387,8 +410,15 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
  * registry namespace, never a sibling project's sharing the same registry
  * scope). Returns null (diagnostic on stderr) when the project isn't
  * initialised.
+ *
+ * `manifestFile` (DR-043 §D6, macf#907; the `-f, --file` CLI flag) is
+ * OPTIONAL — when given, builds the `recordDeployedVersion` write-back
+ * closure via `fleet-lock-recorder.ts` and fails LOUD (returns `null`) if
+ * the manifest can't be read/parsed, at RESOLVE time, before any agent is
+ * touched. When omitted, `recordDeployedVersion` stays `undefined` —
+ * byte-identical to pre-macf#907 behavior.
  */
-async function resolveDepsFromConfig(projectDir: string): Promise<FleetUpgradeDeps | null> {
+async function resolveDepsFromConfig(projectDir: string, manifestFile?: string): Promise<FleetUpgradeDeps | null> {
   const config = readAgentConfig(projectDir);
   if (!config) {
     console.error('No macf-agent.json found. Run `macf init` first.');
@@ -396,6 +426,19 @@ async function resolveDepsFromConfig(projectDir: string): Promise<FleetUpgradeDe
   }
   const defaultFleet = config.project;
   const discover = (): readonly WorkspaceRecord[] => discoverWorkspaces();
+
+  let recordDeployedVersion: FleetUpgradeDeps['recordDeployedVersion'];
+  if (manifestFile) {
+    try {
+      recordDeployedVersion = buildRecordDeployedVersion(manifestFile);
+    } catch (err) {
+      console.error(
+        `macf fleet upgrade: --file "${manifestFile}" could not be read/parsed as a fleet.yaml manifest — ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
 
   return {
     discover,
@@ -415,5 +458,6 @@ async function resolveDepsFromConfig(projectDir: string): Promise<FleetUpgradeDe
     sleep: (ms: number) => new Promise((res) => setTimeout(res, ms)),
     now: () => Date.now(),
     log: (line: string) => console.log(line),
+    recordDeployedVersion,
   };
 }
