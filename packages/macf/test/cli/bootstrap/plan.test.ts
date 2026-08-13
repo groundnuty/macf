@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import {
   computePlan,
+  fleetPlanToJson,
   formatPlanText,
   formatSkippedLines,
   formatUnimplementedLines,
@@ -557,5 +558,124 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
     const plan = computePlan(manifest, observed);
     expect(plan.unimplementedByApply).toEqual([]);
     expect(formatPlanText(plan)).not.toMatch(/NOT IMPLEMENTED/);
+  });
+});
+
+describe('vault-derived facts (DR-043 Amendment D phase 3) — purely additive over the vault-free reason text', () => {
+  function agentItem(items: readonly PlanItem[], role: string): PlanItem | undefined {
+    return itemFor(items, 'secret_fingerprint', `agent:${role}:secrets`);
+  }
+  function caItem(items: readonly PlanItem[]): PlanItem | undefined {
+    return itemFor(items, 'ca', 'ca:registry:ICSOC_2026_CA_CERT');
+  }
+
+  it('an observation WITHOUT `vault`/`vaultCa` set (every pre-existing fixture) renders byte-identical reason text — zero regression', () => {
+    const manifest = baseManifest();
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(agentItem(plan.items, 'code-agent')?.reason).toBe(
+      'no fingerprints recorded in fleet.lock — agent has not been provisioned yet',
+    );
+    expect(caItem(plan.items)?.reason).toBe(
+      'registry CA var "ICSOC_2026_CA_CERT" could not be read (auth / network / insufficient scope) — existence ' +
+        'unconfirmed — treated as a create-candidate, LOW CONFIDENCE',
+    );
+  });
+
+  it('a CONFIRMED vault observation appends a "present/total" suffix to the secret_fingerprint reason, WITHOUT changing the verb', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'code-agent': {
+          app: 'unknown',
+          install: 'unknown',
+          repo: 'unknown',
+          fingerprints: {},
+          vault: {
+            status: 'confirmed',
+            presence: {
+              appId: { present: true, fingerprint: 'sha256:a' },
+              installId: { present: true, fingerprint: 'sha256:b' },
+              clientId: { present: true, fingerprint: 'sha256:c' },
+              clientSecret: { present: true, fingerprint: 'sha256:d' },
+              webhookSecret: { present: false },
+              privateKey: { present: false },
+            },
+          },
+        },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = agentItem(plan.items, 'code-agent');
+    expect(item?.verb).toBe('create'); // lock has no fingerprints — verb is UNCHANGED by the vault fact
+    expect(item?.reason).toContain('no fingerprints recorded in fleet.lock');
+    expect(item?.reason).toContain('[vault: 4/6 secret fields present]');
+  });
+
+  it('an UNKNOWN vault observation appends "[vault: unknown — <reason>]", never claims presence', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'code-agent': {
+          app: 'unknown',
+          install: 'unknown',
+          repo: 'unknown',
+          fingerprints: {},
+          vault: { status: 'unknown', reason: 'vault file not found at "/fake/secrets/vault.age"' },
+        },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = agentItem(plan.items, 'code-agent');
+    expect(item?.reason).toContain('[vault: unknown — vault file not found at "/fake/secrets/vault.age"]');
+  });
+
+  it('a CONFIRMED vaultCa observation appends a suffix to the registry CA item, without changing its verb', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      caRegistry: 'present',
+      vaultCa: {
+        status: 'confirmed',
+        presence: { caKey: { present: true, fingerprint: 'sha256:e' }, caCert: { present: true, fingerprint: 'sha256:f' } },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = caItem(plan.items);
+    expect(item?.verb).toBe('noop'); // caRegistry Presence still governs the verb
+    expect(item?.reason).toContain('already present');
+    expect(item?.reason).toContain('[vault: 2/2 CA fields present]');
+  });
+
+  it('an UNKNOWN vaultCa observation appends its reason verbatim, never a false "absent"', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      vaultCa: { status: 'unknown', reason: 'age identity key not found or not readable at "/fake/key.txt"' },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = caItem(plan.items);
+    expect(item?.reason).toContain('[vault: unknown — age identity key not found or not readable at "/fake/key.txt"]');
+  });
+
+  it('vault-derived text flows through --json (fleetPlanToJson) unchanged, since it lives in PlanItem.reason', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'code-agent': {
+          app: 'unknown',
+          install: 'unknown',
+          repo: 'unknown',
+          fingerprints: {},
+          vault: { status: 'unknown', reason: 'vault file not found' },
+        },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    const json = fleetPlanToJson(plan) as { plan: ReadonlyArray<{ kind: string; target: string; reason: string }> };
+    const item = json.plan.find((i) => i.kind === 'secret_fingerprint' && i.target === 'agent:code-agent:secrets');
+    expect(item?.reason).toContain('[vault: unknown — vault file not found]');
   });
 });

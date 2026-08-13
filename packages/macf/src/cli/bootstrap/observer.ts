@@ -21,9 +21,12 @@ import { dirname, join } from 'node:path';
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
-import type { ObservedAgentState, ObservedState, Presence } from './plan.js';
+import type { FleetObserverFn, ObservedAgentState, ObservedState, Presence } from './plan.js';
 import { readFleetLockFile } from './fleet-lock.js';
 import { registryPathPrefix } from '../registry-helper.js';
+import type { VaultAgentObservation, VaultCaObservation, VaultReadOptions } from './vault-read.js';
+import { VaultError } from './vault-write.js';
+import { queryVaultAgentPresence, queryVaultCaPresence, readVault } from './vault-read.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -243,4 +246,77 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       : undefined;
 
   return { lock, agents, caRegistry, caRepos, routingRunsOn };
+}
+
+// --- vaultAwareObserver — DR-043 Amendment D phase 3 ("the vault-aware observer") ---
+
+/** Injectable seam for {@link vaultAwareObserver}'s tests — real defaults are `githubRegistryObserver` (bound to `manifestPath`) and `vault-read.ts::readVault`. */
+export interface VaultAwareObserverDeps {
+  readonly observe?: FleetObserverFn;
+  readonly readVault?: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>;
+}
+
+/**
+ * `githubRegistryObserver`, decorated with vault-derived per-agent secret
+ * presence + fleet-level CA-key presence — DR-043 Amendment D phase 3, named
+ * literally in the DR's phasing table: *"Vault read → vault-aware observer +
+ * read-only decrypt... lifts phase 2 into Amendment A's confirm tier."*
+ *
+ * **Operator-gated by construction, not by a runtime check.** A caller only
+ * reaches this function by supplying `vaultOpts` — a vault path AND an age
+ * identity-key PATH it already holds on disk. An agent context never holds
+ * the fleet's age key (Amendment C: the key is operator-provided, never
+ * tool-minted, never handed to a fleet agent), so it structurally cannot
+ * construct these options for a REAL fleet's vault; this module's own tests
+ * exercise it against synthetic keys only (`vault-read.ts`'s module doc).
+ *
+ * **Never a guess — always `confirmed` or honestly `unknown` (Amendment A4).**
+ * Every vault-read failure (missing vault file, missing/unreadable identity,
+ * wrong key, malformed plaintext — see `vault-read.ts::readVault`'s doc)
+ * degrades the WHOLE decoration to `status: 'unknown'` with the causing
+ * `VaultError`'s message (already scrubbed of secret material at the
+ * source) as `reason` — NEVER `'absent'`. "An absent identity key is not
+ * evidence of an empty vault" (this increment's own brief) is exactly this
+ * floor: a caller who forgot `--identity-key`, or pointed it at the wrong
+ * file, gets `unknown`, never a false "nothing's provisioned."
+ *
+ * The BASE observation (`githubRegistryObserver`'s `lock`/`caRepos`/
+ * `routingRunsOn`/non-vault agent fields) is computed exactly as before and
+ * carried through unchanged — this function ADDS `vault`/`vaultCa`, it never
+ * revises anything the non-vault-aware observer already determined.
+ */
+export async function vaultAwareObserver(
+  manifest: FleetManifest,
+  manifestPath: string,
+  vaultOpts: VaultReadOptions,
+  deps?: VaultAwareObserverDeps,
+): Promise<ObservedState> {
+  const observe = deps?.observe ?? ((m: FleetManifest) => githubRegistryObserver(m, manifestPath));
+  const doReadVault = deps?.readVault ?? readVault;
+
+  const base = await observe(manifest);
+
+  let raw: Readonly<Record<string, string>> | undefined;
+  let unknownReason = 'vault not read (no vault/identity-key path given)';
+  try {
+    raw = await doReadVault(vaultOpts);
+  } catch (err) {
+    unknownReason = err instanceof VaultError || err instanceof Error ? err.message : String(err);
+  }
+
+  const agents: Record<string, ObservedAgentState> = {};
+  for (const [role, obs] of Object.entries(base.agents)) {
+    const vault: VaultAgentObservation =
+      raw !== undefined
+        ? { status: 'confirmed', presence: queryVaultAgentPresence(raw, manifest.metadata.name, role) }
+        : { status: 'unknown', reason: unknownReason };
+    agents[role] = { ...obs, vault };
+  }
+
+  const vaultCa: VaultCaObservation =
+    raw !== undefined
+      ? { status: 'confirmed', presence: queryVaultCaPresence(raw, manifest.metadata.name) }
+      : { status: 'unknown', reason: unknownReason };
+
+  return { ...base, agents, vaultCa };
 }
