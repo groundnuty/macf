@@ -170,6 +170,31 @@ describe('buildVaultPlaintext', () => {
       expect((e as VaultError).code).toBe('vault_empty_segment_source');
     }
   });
+
+  // --- groundnuty/macf#920 gap 2 — routingClient (DR-043 §D5 "routing-client re-mint") ---
+
+  it('includes routingClient under the SAME ROUTING_CLIENT_*_B64 keys the (unused) `routing` block would use', () => {
+    const out = buildVaultPlaintext({ agents: [], routingClient: { clientCertPem: 'RC-CERT-PEM', clientKeyPem: 'RC-KEY-PEM' } });
+    expect(out).toContain(`ROUTING_CLIENT_CERT_B64='${Buffer.from('RC-CERT-PEM', 'utf-8').toString('base64')}'`);
+    expect(out).toContain(`ROUTING_CLIENT_KEY_B64='${Buffer.from('RC-KEY-PEM', 'utf-8').toString('base64')}'`);
+    // Never the 4 fields that belong to the OTHER (unbuilt) "shared macf-routing App" ceremony.
+    expect(out).not.toContain('MACF_ROUTING_APP_ID');
+    expect(out).not.toContain('TS_OAUTH');
+  });
+
+  it('throws when BOTH routing and routingClient are given (they write the same vault keys — never a silent double-emit)', () => {
+    try {
+      buildVaultPlaintext({
+        agents: [],
+        routing: { appId: '1', appKeyPem: 'a', clientCertPem: 'b', clientKeyPem: 'c', tsOauthClientId: 'd', tsOauthSecret: 'e' },
+        routingClient: { clientCertPem: 'RC-CERT', clientKeyPem: 'RC-KEY' },
+      });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VaultError);
+      expect((e as VaultError).code).toBe('vault_conflicting_routing_client');
+    }
+  });
 });
 
 describe('vaultAgentSecretsForFingerprint / vaultFleetSecretsForFingerprint', () => {
@@ -205,6 +230,19 @@ describe('vaultAgentSecretsForFingerprint / vaultFleetSecretsForFingerprint', ()
 
   it('returns {} when routing/ca are both absent', () => {
     expect(vaultFleetSecretsForFingerprint({ agents: [] })).toEqual({});
+  });
+
+  it('maps routingClient under the SAME routing_client_cert/routing_client_key names the (unused) `routing` block would use (groundnuty/macf#920)', () => {
+    const payload: VaultPayload = {
+      agents: [],
+      routingClient: { clientCertPem: 'RC-CERT-PEM', clientKeyPem: 'RC-KEY-PEM' },
+      ca: { project: 'demo-fleet', caKeyPem: 'CA-KEY', caCertPem: 'CA-CERT' },
+    };
+    expect(vaultFleetSecretsForFingerprint(payload)).toEqual({
+      routing_client_cert: 'RC-CERT-PEM',
+      routing_client_key: 'RC-KEY-PEM',
+      ca_key: 'CA-KEY',
+    });
   });
 });
 

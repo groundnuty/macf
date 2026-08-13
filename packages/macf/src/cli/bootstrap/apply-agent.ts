@@ -273,19 +273,22 @@ export type AgentApplyOutcome =
  * Write a PEM to a short-lived 0600 scratch file for the duration of a JWT
  * mint (`confirmAppInstallation`/`waitForAppInstallation` both take a FILE
  * path, not raw PEM text — the same contract `identity-confirm.ts` already
- * establishes for the plan-time / resume-install reads). This is the ONLY
- * place this module writes a raw PEM to disk, and callers MUST remove it
+ * establishes for the plan-time / resume-install reads). This was ONCE the
+ * only place this module wrote a raw PEM to disk; exported (groundnuty/macf#920)
+ * so `apply-repo-init.ts` reuses the SAME 0600-scratch-file primitive to mint
+ * a `repoInit` label-creation token from a freshly-created agent's in-memory
+ * PEM, instead of duplicating this pattern. Callers MUST remove the result
  * (`cleanupScratchPem`) in a `finally` — it is never the vault, never
- * permanent, and never survives past the ONE gate-2 poll it exists for.
+ * permanent, and never survives past the ONE call it exists for.
  */
-function writeScratchPem(role: string, pem: string): string {
+export function writeScratchPem(role: string, pem: string): string {
   const dir = mkdtempSync(join(tmpdir(), `macf-bootstrap-agent-${role}-`));
   const path = join(dir, 'key.pem');
   writeFileSync(path, pem, { mode: 0o600 });
   return path;
 }
 
-function cleanupScratchPem(pemPath: string): void {
+export function cleanupScratchPem(pemPath: string): void {
   try {
     rmSync(join(pemPath, '..'), { recursive: true, force: true });
   } catch {

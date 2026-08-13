@@ -13,9 +13,39 @@ import { generateToken } from '@groundnuty/macf-core';
 import { promptPassword, PromptCancelled } from '../prompt.js';
 import { toVariableSegment } from '@groundnuty/macf-core';
 
-const ROUTING_CLIENT_CN = 'routing-action';
-const DEFAULT_VALIDITY_DAYS = 365;
+/**
+ * Exported (groundnuty/macf#920) so `bootstrap/apply-routing-client.ts` can
+ * mint the SAME identity `macf certs issue-routing-client` mints, via the
+ * SAME {@link mintRoutingClientCert} primitive below — never a second
+ * hand-rolled `generateClientCert` call with its own copy of this CN.
+ */
+export const ROUTING_CLIENT_CN = 'routing-action';
+export const DEFAULT_ROUTING_CLIENT_VALIDITY_DAYS = 365;
+const DEFAULT_VALIDITY_DAYS = DEFAULT_ROUTING_CLIENT_VALIDITY_DAYS;
 const VALIDITY_WARN_DAYS = 730;
+
+/**
+ * The routing-client cert-minting primitive (groundnuty/macf#920) — factored
+ * out of {@link issueRoutingClient} so `macf bootstrap apply` can issue the
+ * identical CN=`routing-action` client identity from CA material it holds
+ * IN MEMORY (a freshly-minted or vault-decrypted CA key/cert PEM pair),
+ * without needing a local `macf-agent.json` workspace or CA files on disk
+ * the way the interactive CLI command requires. Pure pass-through to
+ * `@groundnuty/macf-core::generateClientCert` — no crypto logic lives here,
+ * only the CN + default-validity convention every caller must share.
+ */
+export async function mintRoutingClientCert(
+  caCertPem: string,
+  caKeyPem: string,
+  validityDays: number = DEFAULT_ROUTING_CLIENT_VALIDITY_DAYS,
+): Promise<{ readonly certPem: string; readonly keyPem: string }> {
+  return generateClientCert({
+    commonName: ROUTING_CLIENT_CN,
+    validityDays,
+    caCertPem,
+    caKeyPem,
+  });
+}
 
 /** Registry variable recording the routing-client cert's issuer fingerprint + mint
  *  time (macf#800). `macf routing doctor` diffs this against the CURRENT CA's
@@ -318,12 +348,7 @@ export async function issueRoutingClient(
   console.log(`  CN:             ${ROUTING_CLIENT_CN}`);
   console.log(`  Validity:       ${validityDays} days`);
 
-  const result = await generateClientCert({
-    commonName: ROUTING_CLIENT_CN,
-    validityDays,
-    caCertPem: ca.certPem,
-    caKeyPem: ca.keyPem,
-  });
+  const result = await mintRoutingClientCert(ca.certPem, ca.keyPem, validityDays);
 
   // macf#800: record the issuer fingerprint + mint time so `macf routing
   // doctor` can detect this cert going ORPHANED after a future CA rotation

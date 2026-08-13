@@ -25,6 +25,8 @@ import type { AgentRepoDeps, RepoInitStepDeps } from '../../../src/cli/bootstrap
 import type { ControlRepoDeps } from '../../../src/cli/bootstrap/control-repo.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
+import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
+import { applyExitCode, fleetApplyResultToJson, formatApplyResult } from '../../../src/cli/commands/bootstrap-apply.js';
 
 // Default mirrors the §D5 multi-recipient shape (operator key + VM key,
 // macf#852) — two entries is the realistic steady-state, not a single
@@ -168,6 +170,28 @@ function agentDepsFor(role: string, outcome: 'reused' | 'resumed-install' | 'cre
 
 const NOOP_REPO_INIT: RepoInitStepDeps = { cloneRepo: async () => {}, commitAndPush: async () => 'pushed' };
 
+/**
+ * DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920 gap 2) fakes.
+ * `mint` returns SENTINEL cert/key PEM strings (distinct from
+ * `SENTINEL_CA_*`/`creds()`'s sentinels so a leak test can tell them apart);
+ * `checkRepoSecretPresence` defaults every repo to `'absent'` (matches
+ * `trustDepsFor()`'s CA default — every fresh test run's "steady state" is
+ * everything missing, so a MINT this file's default `trustDepsFor` already
+ * takes gets a real routing-client mint + publish attempt too, not silently
+ * skipped for want of a dep).
+ */
+const SENTINEL_ROUTING_CLIENT_CERT_PEM = 'SENTINEL-ROUTING-CLIENT-CERT-PEM';
+const SENTINEL_ROUTING_CLIENT_KEY_PEM = 'SENTINEL-ROUTING-CLIENT-KEY-PEM';
+function routingClientDepsFor(overrides: Partial<RoutingClientApplyDeps> = {}): RoutingClientApplyDeps {
+  return {
+    mint: async () => ({ certPem: SENTINEL_ROUTING_CLIENT_CERT_PEM, keyPem: SENTINEL_ROUTING_CLIENT_KEY_PEM }),
+    checkRepoSecretPresence: async () => 'absent',
+    setRepoSecret: async () => {},
+    ...overrides,
+  };
+}
+const NOOP_ROUTING_CLIENT_DEPS: RoutingClientApplyDeps = routingClientDepsFor();
+
 // --- Real `age` binary support (macf#852 — see the trailing test below) ---
 //
 // Everything else in this file stubs `vaultDeps.encrypt`, proving the
@@ -238,6 +262,7 @@ describe('applyFleet', () => {
       controlRepoDeps: controlRepoDepsFor(),
       agentRepoDeps: agentRepoDepsFor(),
       trustDeps: trustDepsFor(),
+      routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
       controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
@@ -248,7 +273,24 @@ describe('applyFleet', () => {
     const manifestPath = manifestPathIn();
     const manifest = manifestWith([CODE_AGENT]);
     let repoInitCalled = false;
-    const repoInitDeps: RepoInitStepDeps = { cloneRepo: async () => { repoInitCalled = true; }, commitAndPush: async () => 'pushed' };
+    // groundnuty/macf#920 — the `created` path now threads a `tokenSource`
+    // built from `creds()`'s SENTINEL (non-parseable) pem into the REAL
+    // `repoInit()`, so `gh token generate` genuinely fails and labels
+    // correctly score `status:'failed'` (see `apply-repo-init.test.ts`'s
+    // dedicated tokenSource-threading tests for that behavior). THIS test is
+    // about lock/vault ordering, not label wiring — fake `repoInit` itself so
+    // it doesn't need a real, parseable PEM.
+    const repoInitDeps: RepoInitStepDeps = {
+      cloneRepo: async () => {
+        repoInitCalled = true;
+      },
+      commitAndPush: async () => 'pushed',
+      repoInit: (async () => ({
+        workflow: 'created',
+        config: 'created',
+        labels: { status: 'ok', created: ['code-agent'], existed: [] },
+      })) as never,
+    };
     const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps);
 
     const result = await applyFleet(manifest, manifestPath, null, deps);
@@ -759,6 +801,7 @@ trust:
         controlRepoDeps: controlRepoDepsFor(),
         agentRepoDeps: agentRepoDepsFor(),
         trustDeps: trustDepsFor(),
+        routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
         controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
         now: () => new Date('2026-08-11T00:00:00.000Z'),
         log: () => {},
@@ -878,6 +921,7 @@ trust:
       controlRepoDeps,
       agentRepoDeps,
       trustDeps,
+      routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
       controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
@@ -1011,6 +1055,17 @@ trust:
           throw new Error('must not be called — foreign control repo, CA is never minted');
         },
       },
+      routingClientDeps: {
+        mint: async () => {
+          throw new Error('must not be called — foreign control repo, routing-client is never minted');
+        },
+        checkRepoSecretPresence: async () => {
+          throw new Error('must not be called');
+        },
+        setRepoSecret: async () => {
+          throw new Error('must not be called');
+        },
+      },
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
     };
@@ -1027,6 +1082,11 @@ trust:
     // either (every `trustDeps` fn above throws if invoked).
     expect(result.ca.resolve.status).toBe('failed');
     expect(result.routing).toEqual({});
+    // groundnuty/macf#920 gap 2 — the routing-client ceremony never ran
+    // either (every `routingClientDeps` fn above throws if invoked).
+    expect(result.routingClient.mint.status).toBe('skipped');
+    expect(result.routingClient.certLegs).toEqual({});
+    expect(result.routingClient.keyLegs).toEqual({});
   });
 
   it('control repo existence UNCONFIRMABLE ("unknown") -> aborts the ENTIRE run as "failed", not silently treated as absent or ours', async () => {
@@ -1047,6 +1107,7 @@ trust:
       },
       agentRepoDeps: agentRepoDepsFor(),
       trustDeps: trustDepsFor(),
+      routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
     };
@@ -1115,6 +1176,7 @@ trust:
       },
       agentRepoDeps: agentRepoDepsFor(),
       trustDeps: trustDepsFor(),
+      routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
       controlRepoOptions: { makeScratchDir: () => controlDir },
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
@@ -1378,6 +1440,125 @@ trust:
       // science-agent's repo WAS ensured — its legs still ran.
       expect(result.ca.repoLegs['groundnuty/demo-science']).toEqual({ status: 'created' });
       expect(result.routing['groundnuty/demo-science']).toEqual({ status: 'created' });
+    });
+  });
+
+  // --- groundnuty/macf#920 — THE DECISIVE TEST: is the resulting fleet ROUTABLE? ---
+  //
+  // Per-primitive tests (repo-init's `tokenSource` threading, the
+  // routing-client mint/publish ceremony) can't catch this bug's actual
+  // shape — BOTH primitives already worked in isolation and were simply
+  // never invoked from `apply` (macf#862/macf#913's class). Only an
+  // end-to-end assertion that the SAME fleet a real operator would run
+  // through `apply` ends up with (a) the label set `route-by-label` +
+  // `route-by-pr-review-state` dispatch on and (b) a routing-client identity
+  // the router can present, proves the wiring, not just the primitives.
+  //
+  // Deliberately does NOT fake `deps.repoInitDeps.repoInit` — the REAL
+  // `repoInit()` (`commands/repo-init.ts`) runs, for real, against a scratch
+  // clone; only `globalThis.fetch` (the GitHub REST leaf `createLabel` calls)
+  // is intercepted, and `GH_TOKEN` is set ambient so `generateToken` (real,
+  // from `@groundnuty/macf-core`) resolves a token WITHOUT needing a real
+  // `gh token generate` subprocess/network call — the exact same technique
+  // `repo-init.test.ts`'s own "repoInit integration" happy-path tests use.
+  // This is stabilizing an INPUT to the real seam, not swapping out the
+  // function under test (a fake `repoInit` would be — see this project's
+  // own `reference_test_that_constructs_the_seam_it_should_observe` lesson).
+  describe('the decisive routability test (groundnuty/macf#920)', () => {
+    const originalFetch = globalThis.fetch;
+    const originalGhToken = process.env['GH_TOKEN'];
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+      if (originalGhToken === undefined) delete process.env['GH_TOKEN'];
+      else process.env['GH_TOKEN'] = originalGhToken;
+    });
+
+    it('after a freshly-CREATED agent, the resulting fleet has BOTH the router label set AND a routing-client identity — a green exit actually means routable', async () => {
+      process.env['GH_TOKEN'] = 'ghs_e2e-decisive-test-token';
+
+      const labelPosts: { url: string; body: unknown; auth: unknown }[] = [];
+      globalThis.fetch = (async (url: string, init?: RequestInit) => {
+        if (String(url).includes('/labels')) {
+          labelPosts.push({ url: String(url), body: JSON.parse(String(init?.body)), auth: (init?.headers as Record<string, string>)?.['Authorization'] });
+          return { status: 201, ok: true } as Response;
+        }
+        // Any other call (e.g. macf-actions tag resolution) — inert 200.
+        return { status: 200, ok: true, json: async () => [] } as unknown as Response;
+      }) as typeof fetch;
+
+      const routingClientCalls: { repo: string; name: string; value: string }[] = [];
+      const mintCalls: { caCertPem: string; caKeyPem: string }[] = [];
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        routingClientDeps: {
+          mint: async (caCertPem, caKeyPem) => {
+            mintCalls.push({ caCertPem, caKeyPem });
+            return { certPem: 'E2E-ROUTING-CLIENT-CERT-PEM', keyPem: 'E2E-ROUTING-CLIENT-KEY-PEM' };
+          },
+          checkRepoSecretPresence: async () => 'absent',
+          setRepoSecret: async (repo, name, value) => {
+            routingClientCalls.push({ repo, name, value });
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      // --- Gap 1: the fleet's repo can be DISPATCHED to (labels exist) ---
+      expect(result.agents[0]?.identity.status).toBe('created');
+      expect(result.agents[0]?.repoInit?.status).toBe('applied');
+      if (result.agents[0]?.repoInit?.status === 'applied') {
+        expect(result.agents[0].repoInit.labels).toEqual({
+          status: 'ok',
+          created: expect.arrayContaining(['code-agent', 'in-progress', 'in-review', 'blocked', 'agent-offline']),
+          existed: [],
+        });
+      }
+      const postedLabelNames = labelPosts.map((p) => (p.body as { name: string }).name).sort();
+      expect(postedLabelNames).toEqual(['agent-offline', 'blocked', 'code-agent', 'in-progress', 'in-review']);
+      // Every label POST authenticated with the SAME minted token — not a
+      // silently-empty/fallback one (the attribution-trap shape).
+      for (const post of labelPosts) expect(post.auth).toBe('Bearer ghs_e2e-decisive-test-token');
+
+      // --- Gap 2: the fleet's repo can AUTHENTICATE as the router (routing-client identity exists) ---
+      expect(mintCalls).toHaveLength(1);
+      expect(mintCalls[0]?.caCertPem).toBe(SENTINEL_CA_CERT_PEM); // the SAME CA this run minted — never a stale/foreign one
+      expect(result.routingClient.mint.status).toBe('minted');
+      expect(result.routingClient.certLegs['groundnuty/demo-code']).toEqual({ status: 'created' });
+      expect(result.routingClient.keyLegs['groundnuty/demo-code']).toEqual({ status: 'created' });
+      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-code', name: 'ROUTING_CLIENT_CERT', value: 'E2E-ROUTING-CLIENT-CERT-PEM' });
+      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-code', name: 'ROUTING_CLIENT_KEY', value: 'E2E-ROUTING-CLIENT-KEY-PEM' });
+
+      // --- The actual acceptance criterion: green exit ⇒ routable, never the reverse ---
+      expect(applyExitCode(result)).toBe(0);
+
+      // --- The secret key NEVER appears anywhere a human/log/--json would read it ---
+      const rendered = JSON.stringify(fleetApplyResultToJson(result, []));
+      expect(rendered).not.toContain('E2E-ROUTING-CLIENT-KEY-PEM');
+      expect(rendered).not.toContain('E2E-ROUTING-CLIENT-CERT-PEM'); // not secret, but still never rendered raw — only status/fingerprint-shaped fields
+      const humanText = formatApplyResult(result, []);
+      expect(humanText).not.toContain('E2E-ROUTING-CLIENT-KEY-PEM');
+    });
+
+    it('when label creation genuinely fails (no usable credentials threaded), the run is NOT reported as a clean success', async () => {
+      // No GH_TOKEN, no ambient credentials — repoInit's own generateToken()
+      // degrades to labels:{status:'skipped'}, and since apply DID thread a
+      // tokenSource (the `created` path always does), that is scored a
+      // HARD FAILURE — see `apply-repo-init.ts::labelsAreGoodEnough`'s doc.
+      delete process.env['GH_TOKEN'];
+      globalThis.fetch = (async () => ({ status: 201, ok: true }) as Response) as typeof fetch;
+
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.agents[0]?.repoInit?.status).toBe('failed');
+      expect(applyExitCode(result)).toBe(1); // NEVER green when the fleet cannot route
     });
   });
 });
