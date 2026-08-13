@@ -170,3 +170,32 @@ The canonical subcommands are **native TypeScript** (decision layer unit-tested 
 - **`macf#682`** (fleet-upgrade + `/health.version`, P1 shipped `#683`), **`#686`** (watchdog/resume/install-cron promotion), **`#141`** (`ps` dead-enum) — the subcommands built on this substrate.
 - **`packages/macf-core/src/semver.ts`** (`#424` `compareSemver`) — §5.
 - **`check-before-propose.md §4`** — the "don't build a parallel source of truth" rule §4 honors (and the authorship-note race lesson).
+
+## Amendment C — `stale-pin` is not `bad-release`: continue on a confirmed LOCAL cause, halt on anything fleet-wide or unconfirmed (macf#899/#900, 2026-08-13)
+
+**Trigger — a live roll, and a flaw in Amendment B's own inference.** During the `0.2.56` roll, `devops-agent` came back **reachable at its old version** because its launch pin never asked for the new one (the pin-vs-mount bug, macf#889). Amendment B's line 144 — *"came up on the OLD version → **confirmed** bad release → HALT"* — fired and named the cause `bad-release`. That was **false**: `0.2.56` was fine. The blast radius of the mis-diagnosis: the whole fleet roll stopped to contain a bad release that did not exist, the operator was sent to prune a registry entry for a healthy release, and `macf-science-agent` lost its roll until the halt was cleared by hand.
+
+**The flawed step was Amendment B's, not the implementation's.** Amendment B's governing rule is *"continue only on positive confirmation, never on absence-of-failure."* But "came up on the OLD version → **confirmed** bad release" silently assumes the release was **tried and rejected**. When the agent's launch pin never requested the target, the release was never exercised at all — the agent carries **no evidence about the release**. Halting there is halting on *absence of evidence*, presented as confirmation: the very move Amendment B exists to forbid, committed inside Amendment B.
+
+**Decision — discriminate by the launch pin:**
+
+| pin vs target | reason | disposition |
+|---|---|---|
+| pin **==** target, process on old version | `bad-release` | **HALT** (unchanged — a real bad release cascades) |
+| pin **!=** target | **`stale-pin`** (new) | **skip that agent, CONTINUE the roll** |
+| pin **unreadable** | `bad-release`, message marked **UNVERIFIED** | **HALT** conservatively |
+| never answered within grace | `relaunch-unconfirmed` | unchanged (HALT) |
+
+**No-cascade is preserved.** A stale-pin agent never exercised the target, so continuing risks nothing new; if the target genuinely crashes on start, the **next** agent fails to come up and halts as `relaunch-unconfirmed`. The protection still fires — one agent later, on real evidence.
+
+**The unreadable pin: conservative halt, honestly named.** An unreadable pin is evidence of *neither* cause, so it must not silently become either — mapping it to `stale-pin` would skip an agent that might be crash-looping; mapping it silently to `bad-release` blames a release on missing information. The resolution keeps the **halt** (consequences are asymmetric: wrongly continuing past a real bad release cascades fleet-wide and unbounded; wrongly halting costs a paused roll with the operator already present) but marks the reason **UNVERIFIED**. That marking is load-bearing, not cosmetic: it fixes the second half of the #899 harm, where the operator was not merely stopped but *sent to prune a healthy release*. Halting conservatively while saying you do not know why is strictly better than halting confidently under a wrong name — honest-unknown applied to the diagnosis text, not only to control flow.
+
+**Amendment B's "clean line" is refined (this supersedes it).** Amendment B wrote: *"Skip-BEFORE-roll continues; rolled-then-unconfirmed halts."* A **rolled** agent may now continue — when its cause is positively confirmed and provably local. The governing principle those collapse into:
+
+> **Continue only on a positively-confirmed cause that is LOCAL to that agent; halt on anything fleet-wide, ambiguous, or unconfirmed.**
+
+Rolled-vs-not-rolled was a *proxy* for that principle — a good one while every rolled-then-not-green outcome was ambiguous, and superseded the moment a confirmable per-agent cause existed. Amendment B's lines 144 and 153 read subject to this amendment.
+
+**Implementation note (macf#900), recorded because it is what keeps the contract honest:** `readVersionPin` is a `FleetDriver` verb whose real implementation delegates to `resolvePluginUpdateTarget` + `readPinnedChannelServerVersion` — **the same primitives `macf update` uses for its own post-write verification**. One definition of "the launch pin," shared by the roll's diagnosis and the updater's self-check; two independent readers would have been free to drift, and a roll that disagreed with `update` about what the pin *is* would reproduce this class in the opposite direction. `stale-pin-skipped` is its own `RollOutcome` (the agent **was** mutated, so it is neither a pre-flight skip nor terminal), and the maintenance lock is deliberately **left in place** on that path (mirroring the halted branches, DR-040 Decision 3) so a still-old mid-transition agent is not handed straight back to the watchdog's healing ladder; the lock self-clears via TTL.
+
+**References:** macf#899 (the live mis-diagnosis) · macf#900 (the discrimination) · macf#889 (the pin-vs-mount bug that produced the old-version agent) · Amendment B (lines 144/153, refined here) · DR-040 Decision 3 (lock-release-only-on-green) · `silent-fallback-hazards.md` Instance 20 (the wrong-subject write this incident began as).
