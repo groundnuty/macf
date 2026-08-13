@@ -81,10 +81,15 @@ agents:
     deploy_path: /home/ubuntu/repos/papers/icsoc-2026
 
 routing:
-  runner:
-    runs_on: self-hosted          # → MACF_ROUTING_RUNS_ON var on every caller repo.
-                                  #   Runner provisioned out-of-band (DR-003 gates);
-                                  #   the manifest POINTS, it does not provision.
+  runner:                         # Amendment H — DECLARED, then registered by `deploy`.
+    labels: [self-hosted, macf-vm]  # what the router's pick-runner matches
+    scope: repo                     # repo | org (a USER account cannot hold
+                                    #   account-level runners → groundnuty/* is
+                                    #   repo-scoped by necessity)
+    name: macf-vm                   # identity for detect-and-reuse
+                                  # Gates self-hosted eligibility via
+                                  # MACF_TRUSTED_ACTORS (NOT MACF_ROUTING_RUNS_ON,
+                                  # a v1 relic the v3 router never reads — macf#923).
 
 collaborators:                    # cross-fleet guests (DR-036 / DR-041)
   - project: ppam-2026
@@ -400,3 +405,54 @@ The revival-cost gradient rests entirely on **verified** facts (Apps survive via
 A repeatable live-smoke (the live-contract-verification class flagged on #868) needs a **disposable target**; the teardown ladder is what makes the create→verify→teardown loop cheap enough to run.
 
 **References:** Amendment F (retirement-as-day-2, now structured here; its `archived → foreign` ownership rule amended) · §D3 (no-prune governs reconcile, not deliberate teardown) · §D5 (the store-of-record that makes revival free) · #854 (report-what-couldn't-be-done) · #868 (live-run findings) · #869 (live-smoke, which this enables).
+
+
+## Amendment H (2026-08-13, #922/#923/#924 — operator directive) — the runner is DECLARED, not merely pointed at; and the router reads `MACF_TRUSTED_ACTORS`
+
+**Two corrections in one, because the second replaces the field the first got wrong.**
+
+### H1 — the variable: `MACF_TRUSTED_ACTORS`, never `MACF_ROUTING_RUNS_ON`
+
+§D1's original runner block instructed `apply` to write `MACF_ROUTING_RUNS_ON`. **The v3 router never reads it.** Verified against the router source: `grep 'vars\.MACF_' .github/workflows/agent-router.yml` returns **exactly one** hit — `MACF_TRUSTED_ACTORS` — and `MACF_ROUTING_RUNS_ON` appears nowhere in v3 (`git log --all -S` finds it only on the legacy `refs/tags/v1` SSH-routing line). This DR carried a v1-era name into a v3 world; the writer is the authority (Amendment G's correction rule, macf#904) and the DR was wrong.
+
+**The error was conceptual, not just a wrong identifier.** `runs_on` modelled the control as a *runner selector*; the router has none. Self-hosted eligibility is gated by a **trusted-actors allowlist** — an authorization decision, not a placement one: `pick-runner` compares `github.actor` against `MACF_TRUSTED_ACTORS` and emits either `"ubuntu-latest"` or `["self-hosted","macf-vm"]`.
+
+**The failure mode was silent cost**, which is why it survived: an unset variable is not an error — routing simply falls through to GitHub-hosted, on every `issues`/`issue_comment`/`pull_request`/`pull_request_review` event, drawing down quota and billing beyond it on **private** repos, while the paid-for self-hosted runner sat idle. Nothing surfaces that but an invoice.
+
+**Value format (verified three ways, all of which matter):** `<fleet>-<role>[bot]`, **space-separated**. Every entry carries the `[bot]` suffix — the router compares directly against `github.actor` with no in-workflow append. A JSON array silently matches nothing.
+
+### H2 — the runner is DECLARED in the manifest and registered by `deploy` (supersedes "the manifest POINTS, it does not provision")
+
+**Operator directive (2026-08-13):** *"I would expect that I can specify the runner details in our configuration … and all the mechanics should do it in one deterministic run … it should be done in one apply."* The prior boundary produced a two-run flow requiring the operator to hand-sequence `apply → register runner → apply again`; the tool surfaced an ordering constraint and made a human resolve it. That is overruled.
+
+**Why a strictly-single `apply` is not achievable — and what the requirement really demands.** The fleet spans two machines by physical necessity: consent gate 1's localhost redirect must reach the **operator's browser** (pinning `apply` to the Mac, §D2/§D4), while the workspace, the on-disk App key, and the runner service must exist on the **VM** (pinning `deploy` there). Runner registration is likewise two-sided — the token is mintable via API from anywhere, but `config.sh` plus a supervised service must execute on the machine that will run jobs. So:
+
+**`macf fleet deploy` owns runner registration.** It already runs VM-side, already holds credentials, and is **already mandatory before any agent runs** — so this adds **zero new operator steps**, no hand-sequencing, and no improvisation. Rejected: having `apply` SSH into the VM (one *invocation*, but permanently widens what the Mac-side provisioner can reach, for no reduction in operator touches — Amendments C/D are worth more than a command-count optimisation).
+
+**Scope narrowed by operator clarification (2026-08-13):** *"We assume that the runner is deployed, always, somewhere, that it's running, and all we have to do is to register it. Our scope is not deploying runners. Our scope is just pointing our configuration to the existing runner."* So **runner deployment and lifecycle are explicitly OUT of scope**; the fleet points at a runner that already exists. This changes who needs a registration step at all:
+
+| fleet owner | registration | why |
+|---|---|---|
+| **org** (e.g. `macf-experiment`) | **none — a no-op** | an org-level runner already serves **every repo in the org**; there is nothing per-repo to register |
+| **user account** (e.g. `groundnuty/*`) | **`deploy` registers per repo** | a user account **cannot hold account-level runners**, so repo-scoping is forced |
+
+The DR must not imply every fleet needs a registration step — for the org case, the entire remaining job is writing `MACF_TRUSTED_ACTORS`, which `apply` already does.
+
+**The detection invariant is "a runner is USABLE BY THIS REPO" — not "a runner exists."** Two failure directions, both real:
+- Querying only `repos/<repo>/actions/runners` misses **org-level** runners (they live at `orgs/<org>/actions/runners`), so an org fleet with a perfectly good runner reads `total_count: 0` → gate says absent → trust variable skipped → **hosted fallback bills on private repos**. This is macf#922/#923's cost bug reintroduced by an incomplete check (found live, macf#924).
+- But an org runner's **runner group may be restricted to selected repositories**, so a runner can exist, be online, and still never claim this repo's jobs. Asserting mere existence would write the trust variable for an unusable runner — the same proxy-vs-invariant mistake in the opposite direction.
+
+So detection considers **repo-level runners plus org-level runners whose group visibility admits this repo**. Where adding the repo to a runner group is required, that is an **org-admin action the tool NAMES and hands over**, never attempts (the `delete-apps` pattern: report what it cannot do, with the exact step).
+
+**Why the conservative default is right — the failure modes are asymmetric.** Writing the trust variable with no usable runner makes routing jobs queue for a runner that never claims them: **the fleet silently stops coordinating.** Skipping it when a runner does exist causes a hosted fallback: **it costs money, but routing works.** The conservative default therefore fails toward *functional-but-costly*, which is the correct direction — so the fix for a missed runner is to make **detection complete**, never to relax the gate. That makes the honest-unknown path load-bearing: when scope-completeness is genuinely unreadable (e.g. no permission to enumerate org runner groups), the tool **skips LOUDLY and actionably** — naming the scope it could not read and the operator command that settles it — never silently, since a silent skip is indistinguishable from "no runner exists," which is how this class keeps regenerating.
+
+**Requirements on the flow:**
+
+1. **Confirm by result-invariant, never by exit code.** `config.sh` exiting 0 is not evidence of an online runner — assert against `GET /repos/{owner}/{repo}/actions/runners` that the expected runner is present and online (Instance 17 / Amendment C / macf#918's lesson).
+2. **`MACF_TRUSTED_ACTORS` is written only after that confirmation** — register-before-route, never optimistically.
+3. **`apply` states the pending step** rather than silently deferring it: its report names the unregistered runner and `deploy` as the command that completes it (§D3/macf#854 — a green run must never imply a capability that does not exist).
+4. **Reuse is detect-and-reuse, never re-register** — the operator's intent is fleet-agnostic shared routing runners, so a declared runner already present and online is **adopted**, matching the shared `macf-routing` App pattern.
+
+**Scope constraint (a GitHub fact, not a choice):** a **user account cannot hold account-level runners**, so every `groundnuty/*` fleet is **repo-scoped by necessity**; only an org-owned fleet can share one org runner across all its repos. Per-repo runner declaration is deferred — fleet-level first, per the operator.
+
+**References:** #922/#923 (the wrong variable + its silent cost) · #924 (the operator directive + the two-sided constraint) · §D1 (runner block replaced) · §D2/§D4 (why the Mac/VM split is physical) · Amendments C/D (the privilege separation preserved) · #914 (`fleet deploy`, the host-side command this extends).
