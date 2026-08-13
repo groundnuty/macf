@@ -1497,6 +1497,32 @@ trust:
       expect(rendered).toMatch(/groundnuty\/demo-code: SKIPPED — no self-hosted runner is confirmed registered/);
     });
 
+    // --- macf#924 — the org-admin handover survives end-to-end into the rendered report ---
+
+    it('an org-admin handover (macf#924 — org runner exists, group excludes the repo) renders through formatApplyResult, not just the raw outcome map', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRunnerUsableByRepo: async () => ({
+            presence: 'absent',
+            handover:
+              'An org-level self-hosted runner IS registered in "groundnuty", but its runner group\'s repository-access ' +
+              'list excludes "groundnuty/demo-code" — an org admin must add this repo at: ' +
+              'https://github.com/organizations/groundnuty/settings/actions/runner-groups/7. This tool cannot perform ' +
+              'that step itself (org-admin action; macf#924).',
+          }),
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+      const rendered = formatApplyResult(result);
+
+      expect(rendered).toMatch(/groundnuty\/demo-code: SKIPPED — no self-hosted runner is confirmed registered/);
+      expect(rendered).toContain('an org admin must add this repo at');
+      expect(rendered).toContain('runner-groups/7');
+    });
+
     it('CA + routing legs are skipped for an agent whose repo-ensure FAILED this run — nothing is written to a repo that does not exist', async () => {
       const manifestPath = manifestPathIn();
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };

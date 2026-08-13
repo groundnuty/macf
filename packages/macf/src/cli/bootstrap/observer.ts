@@ -260,9 +260,11 @@ export interface RunnerUsability {
  * resolution with a required test matrix (repo-level / org `all` / org
  * `selected`-excluded / org `selected`-included / absent / unreadable) —
  * this is the one exception. `REAL_RUNNER_USABILITY_DEPS` below is the
- * production wiring; every real implementation follows this file's
+ * production wiring; {@link checkRepoScopedRunner} keeps this file's
  * established NEVER-throws / 404-is-confident-absent-else-unknown
- * discrimination.
+ * discrimination (unchanged from macf#922), but the two ORG-scope reads
+ * below deliberately do NOT — see their fields' docs and
+ * `realListRunnerGroupsVisibleToRepo`'s doc for why (macf#924 review).
  */
 export interface RunnerUsabilityDeps {
   /** The repo-scoped leg — {@link checkRepoScopedRunner}, unchanged from macf#922. */
@@ -277,11 +279,12 @@ export interface RunnerUsabilityDeps {
    * (`all` / `selected` / `private`) — in particular `private` depends on
    * the REPO's own private/public bit, which GitHub already resolves
    * server-side and this tool would otherwise have to fetch and reason
-   * about separately. `'unknown'` on any non-404 read failure (auth /
-   * network / missing `admin:org`); a confirmed 404 (no such org — e.g. a
-   * `owner.type: 'user'` fleet, per `fleet-manifest.ts`'s `FleetOwnerSchema`
-   * — or an org with zero visible groups) degrades to an empty array, same
-   * "404 is confident-empty" convention every other read in this file uses.
+   * about separately. `'unknown'` on EVERY read failure, including a 404 —
+   * deliberately NOT this file's usual "404 is confident-absent" convention
+   * (macf#924 review): a 404 here cannot be told apart from a
+   * permission-driven mask without an independent signal this function
+   * doesn't have, and the honest-unknown floor puts the burden of proof on
+   * the confident branch. See `realListRunnerGroupsVisibleToRepo`'s doc.
    */
   readonly listRunnerGroupsVisibleToRepo: (org: string, repoName: string) => Promise<ReadonlyArray<RunnerGroupRef> | 'unknown'>;
   /**
@@ -292,8 +295,9 @@ export interface RunnerUsabilityDeps {
    * resolution distinguish "no org runner exists at all" (nothing to hand
    * over) from "an org runner exists but every group holding one excludes
    * this repo" (hand over to an org admin) — see
-   * {@link checkRunnerUsableByRepo}'s doc. `'unknown'` on any non-404 read
-   * failure; a confirmed 404 degrades to an empty set.
+   * {@link checkRunnerUsableByRepo}'s doc. `'unknown'` on EVERY read
+   * failure, including a 404 — same reasoning as
+   * {@link listRunnerGroupsVisibleToRepo}'s doc.
    */
   readonly listOrgRunnerGroupIds: (org: string) => Promise<ReadonlySet<number> | 'unknown'>;
 }
@@ -301,15 +305,32 @@ export interface RunnerUsabilityDeps {
 /**
  * Real `listRunnerGroupsVisibleToRepo` — `GET /orgs/{org}/actions/runner-groups
  * ?visible_to_repository=<repoName>` (bare repo name, no `owner/` prefix —
- * the org is already the path segment). Verified against GitHub's REST API
- * docs (2026-08): "List self-hosted runner groups for an organization"
- * (https://docs.github.com/en/rest/actions/self-hosted-runner-groups —
- * `visible_to_repository` query param, "Only return runner groups that are
+ * the org is already the path segment; format CONFIRMED, not inferred, via
+ * go-github's `ListOrgRunnerGroupOptions.VisibleToRepository string` field +
+ * its test fixture `VisibleToRepository: "github"` asserting
+ * `visible_to_repository=github` in the request — go-github is generated off
+ * the same OpenAPI description GitHub's own docs render from). Verified
+ * against GitHub's REST API docs (2026-08): "List self-hosted runner groups
+ * for an organization" (https://docs.github.com/en/rest/actions/self-hosted-runner-groups
+ * — `visible_to_repository` query param, "Only return runner groups that are
  * allowed to be used by this repository"; requires `admin:org` scope for
- * classic PAT/OAuth tokens). Community-corroborated that tooling relies on
- * exactly this param to resolve which groups (across all 3 `visibility`
- * values) a given repo may use, rather than re-deriving visibility
- * client-side.
+ * classic PAT/OAuth tokens).
+ *
+ * **Never treats 404 as confident-empty (macf#924 review) — every failure
+ * here degrades to `'unknown'`, deliberately UNLIKE this file's other
+ * `checkRepoExists`-style reads.** Community reports (`gh`/API discussions)
+ * describe the missing-`admin:org` failure as `403 "Must have admin
+ * rights..."` / `"must be an org admin or have the runners and runner
+ * groups fine-grained permission"` — NOT 404 — so the 403 path already
+ * falls through to `'unknown'` correctly. But this function has no
+ * independent way to prove a 404 here is "no such org" rather than some
+ * GitHub-side permission-driven mask, and Amendment A4's honest-unknown
+ * floor puts the burden of proof on the CONFIDENT branch, not the cautious
+ * one — a wrong `'absent'` writes nothing and looks like a clean plan; a
+ * wrong `'unknown'` merely costs a plan line's precision. The ordinary
+ * "zero groups visible" case returns 200 with an empty array regardless (no
+ * confident-empty inference needed for it), so this costs nothing on the
+ * common path.
  */
 async function realListRunnerGroupsVisibleToRepo(org: string, repoName: string): Promise<ReadonlyArray<RunnerGroupRef> | 'unknown'> {
   try {
@@ -323,16 +344,7 @@ async function realListRunnerGroupsVisibleToRepo(org: string, repoName: string):
     return parsed.filter(
       (g): g is RunnerGroupRef => typeof g === 'object' && g !== null && typeof (g as { id?: unknown }).id === 'number' && typeof (g as { name?: unknown }).name === 'string',
     );
-  } catch (err) {
-    const stderr = getStderr(err);
-    // A 404 here means "no such org" (a `owner.type: 'user'` fleet — org-
-    // level runners are structurally impossible) OR "org exists but has
-    // zero runner groups visible to this repo" — GitHub doesn't distinguish
-    // the two via error shape, and an ordinary empty-array 200 is the far
-    // more common real shape for the latter anyway. Either way "confidently
-    // no visible groups" is the correct degrade — same 404-is-absent
-    // convention as `checkRepoExists` et al.
-    if (/HTTP 404|Not Found/i.test(stderr)) return [];
+  } catch {
     return 'unknown';
   }
 }
@@ -347,6 +359,11 @@ async function realListRunnerGroupsVisibleToRepo(org: string, repoName: string):
  * (same posture as {@link checkRepoScopedRunner}'s `.total_count` read,
  * which reads page 1 only) — a judgment call for typical small bootstrap
  * fleets, noted here rather than silently assumed.
+ *
+ * **Never treats 404 as confident-empty — same reasoning as
+ * {@link realListRunnerGroupsVisibleToRepo}'s doc** (macf#924 review): this
+ * function has no independent way to tell "no such org" apart from a
+ * permission-driven mask, so every failure degrades to `'unknown'`.
  */
 async function realListOrgRunnerGroupIds(org: string): Promise<ReadonlySet<number> | 'unknown'> {
   try {
@@ -356,9 +373,7 @@ async function realListOrgRunnerGroupIds(org: string): Promise<ReadonlySet<numbe
     const parsed: unknown = JSON.parse(stdout);
     if (!Array.isArray(parsed)) return 'unknown';
     return new Set(parsed.filter((x): x is number => typeof x === 'number'));
-  } catch (err) {
-    const stderr = getStderr(err);
-    if (/HTTP 404|Not Found/i.test(stderr)) return new Set();
+  } catch {
     return 'unknown';
   }
 }
