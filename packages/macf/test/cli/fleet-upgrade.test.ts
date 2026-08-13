@@ -66,7 +66,17 @@ interface Calls {
  */
 function makeDriver(
   agents: readonly { readonly name: string; readonly registry: string }[],
-  opts: { base: string; target: string; flipOnRestart?: boolean },
+  opts: {
+    base: string;
+    target: string;
+    flipOnRestart?: boolean;
+    /**
+     * Per-agent LAUNCH PIN (macf#899); defaults to `null` (honest-unknown)
+     * for every agent — preserves the PRE-macf#899 conservative
+     * `bad-release` classification for tests that don't configure a pin.
+     */
+    launchPin?: (agent: string) => string | null;
+  },
 ): { driver: FleetDriver; calls: Calls; workspaces: readonly WorkspaceRecord[] } {
   const calls: Calls = { upgrade: [], restart: [] };
   const restarted = new Set<string>();
@@ -92,6 +102,7 @@ function makeDriver(
     inject: async () => {},
     launch: async () => {},
     listModifiedFiles: async () => [],
+    readVersionPin: async (a) => (opts.launchPin ? opts.launchPin(a) : null),
     acquireLock: async () => {},
     releaseLock: async () => {},
     startHeartbeat: () => () => {},
@@ -259,6 +270,7 @@ describe('runFleetUpgrade', () => {
       inject: async () => {},
       launch: async () => {},
       listModifiedFiles: async () => [],
+      readVersionPin: async () => null,
       acquireLock: async () => {},
       releaseLock: async () => {},
       startHeartbeat: () => () => {},
@@ -292,6 +304,28 @@ describe('runFleetUpgrade', () => {
     );
     expect(code).toBe(1);
     expect(calls.upgrade).toEqual(['a']); // fleet-2's 'b' never rolled
+  });
+
+  it('stale-pin (macf#899): agent comes back OLD but its own launch pin never asked for the target — SKIPS, does NOT halt (exit 0)', async () => {
+    // Same shape as the 0.2.56-roll incident this issue fixes: the process
+    // is reachable at the old version, but the LAUNCHER's own pin still
+    // asks for the OLD version too — the release itself was never asked to
+    // roll on this workspace, so it must not be blamed / halted for it.
+    const { driver, calls, workspaces } = makeDriver([AGENTS[0]!], {
+      base: '0.2.40',
+      target: '0.2.41',
+      flipOnRestart: false,
+      launchPin: () => '0.2.40',
+    });
+    const { deps } = makeDeps({
+      discover: () => workspaces,
+      defaultFleet: 'fleet-1',
+      resolveDriver: async () => driver,
+    });
+    const code = await runFleetUpgrade('/proj', { execute: true, verifyTimeoutSec: 0 }, deps);
+    expect(code).toBe(0); // stale-pin is a skip, not a halt
+    expect(calls.upgrade).toEqual(['a']);
+    expect(calls.restart).toEqual(['a']);
   });
 
   it('errors (exit 1) when no target can be resolved', async () => {
@@ -353,6 +387,7 @@ describe('runFleetUpgrade', () => {
         inject: async () => {},
         launch: async () => {},
         listModifiedFiles: async () => [],
+        readVersionPin: async () => null,
         acquireLock: async () => {},
         releaseLock: async () => {},
         startHeartbeat: () => () => {},

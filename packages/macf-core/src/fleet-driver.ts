@@ -213,6 +213,27 @@ export interface FleetDriver {
    */
   readonly capturePane: (agent: string) => Promise<string | null>;
 
+  /**
+   * Read the agent's LAUNCH PIN — the channel-server version its currently
+   * MOUNTED plugin manifest pins (macf#899, driver-layer counterpart to
+   * `macf update`'s own post-write verification, macf#889/#896). Used by
+   * `rollFleet`'s halt-classifier to discriminate a CONFIRMED bad release
+   * (the launcher already asked for the target; the process is stuck
+   * anyway) from a STALE launch pin (the launcher never asked for the
+   * target at all — the release may be fine, only this workspace's launch
+   * config is stale). `null` means "could not determine" (undeterminable
+   * plugin mount, manifest absent/malformed, or no channel-server pin
+   * present) — NEVER treated as evidence for either cause; `rollFleet`
+   * reads `null` as honest-unknown. VM: resolves the agent's workspace +
+   * its MOUNTED plugin dir (`resolvePluginUpdateTarget`) and reads back the
+   * pin (`readPinnedChannelServerVersion`) — the SAME primitives `macf
+   * update`'s own result-invariant check uses, so the roll's diagnosis and
+   * the update's own verification can never disagree about what "the
+   * launch pin" means. Unknown agent → `null` (mirrors `currentBranch`'s
+   * unresolvable-agent handling).
+   */
+  readonly readVersionPin: (agent: string) => Promise<string | null>;
+
   /** Roll the agent's framework version. VM: `macf update` in its workspace. */
   readonly upgrade: (agent: string) => Promise<void>;
 

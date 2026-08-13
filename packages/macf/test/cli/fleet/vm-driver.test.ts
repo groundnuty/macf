@@ -103,6 +103,8 @@ interface SeamOverrides {
   readonly fullConfigs?: ReadonlyMap<string, MacfAgentConfig | null>;
   /** Per-workspace CURRENT branch for `currentBranch` (macf#755); default `'main'`. */
   readonly branches?: ReadonlyMap<string, string | null>;
+  /** Per-workspace LAUNCH PIN for `readLaunchPin` (macf#899); default `null` (unreadable). */
+  readonly launchPins?: ReadonlyMap<string, string | null>;
 }
 
 function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder } {
@@ -152,6 +154,7 @@ function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder
     listModifiedFiles: (workspaceDir: string) => o.modifiedFiles?.get(workspaceDir) ?? [],
     currentBranch: (workspaceDir: string) => (o.branches?.has(workspaceDir) ? (o.branches.get(workspaceDir) ?? null) : 'main'),
     readFullConfig: (workspaceDir: string) => o.fullConfigs?.get(workspaceDir) ?? null,
+    readLaunchPin: (workspaceDir: string) => o.launchPins?.get(workspaceDir) ?? null,
     commitCanonicalFiles: (workspaceDir: string, files: readonly string[]) => {
       rec.commits.push({ workspaceDir, files });
     },
@@ -433,6 +436,34 @@ describe('currentBranch', () => {
     });
     expect(await createVmDriver(OPTS, seams).currentBranch('code-agent')).toBe('main');
     expect(await createVmDriver(OPTS, seams).currentBranch('science-agent')).toBe('feat/science-branch');
+  });
+});
+
+describe('readVersionPin (macf#899)', () => {
+  it('returns the launch pin reported by the workspace seam', async () => {
+    const { seams } = fakeSeams({ launchPins: new Map([['/w/macf', '0.2.56']]) });
+    expect(await createVmDriver(OPTS, seams).readVersionPin('code-agent')).toBe('0.2.56');
+  });
+
+  it('returns null when the agent is unknown — mirrors currentBranch`s unknown handling', async () => {
+    const { seams } = fakeSeams({ launchPins: new Map([['/w/macf', '0.2.56']]) });
+    expect(await createVmDriver(OPTS, seams).readVersionPin('ghost')).toBeNull();
+  });
+
+  it('returns null when the seam itself reports null (unreadable — undeterminable mount / absent manifest / no pin)', async () => {
+    const { seams } = fakeSeams({ launchPins: new Map([['/w/macf', null]]) });
+    expect(await createVmDriver(OPTS, seams).readVersionPin('code-agent')).toBeNull();
+  });
+
+  it('checks the RESOLVED agent workspace, not the driver`s own workspace', async () => {
+    const { seams } = fakeSeams({
+      launchPins: new Map([
+        ['/w/macf', '0.2.55'],
+        ['/w/science', '0.2.56'],
+      ]),
+    });
+    expect(await createVmDriver(OPTS, seams).readVersionPin('code-agent')).toBe('0.2.55');
+    expect(await createVmDriver(OPTS, seams).readVersionPin('science-agent')).toBe('0.2.56');
   });
 });
 
@@ -1117,6 +1148,71 @@ describe('createVmExecSeams — currentBranch, real git (macf#755)', () => {
   it('returns null when the directory is not a git repo (fail-safe, same as detached HEAD)', () => {
     repo = mkdtempSync(join(tmpdir(), 'macf-vmdriver-branch-notgit-'));
     expect(createVmExecSeams(repo).currentBranch(repo)).toBeNull();
+  });
+});
+
+describe('createVmExecSeams — readLaunchPin, real fs (macf#899)', () => {
+  let dir: string;
+
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeClaudeSh(root: string, pluginDirRel: string): void {
+    writeFileSync(
+      join(root, 'claude.sh'),
+      `#!/usr/bin/env bash\nexec claude --plugin-dir "$SCRIPT_DIR/${pluginDirRel}" "$@"\n`,
+    );
+  }
+
+  function writeManifest(pluginDir: string, mcpServers: unknown): void {
+    mkdirSync(join(pluginDir, '.claude-plugin'), { recursive: true });
+    writeFileSync(
+      join(pluginDir, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({ name: 'macf-agent', mcpServers }, null, 2),
+    );
+  }
+
+  // Real-fs round-trip against the SAME primitives `macf update` uses to
+  // WRITE + read back the pin (macf#889/#896) — pins that `rollFleet`'s
+  // macf#899 diagnosis reads the exact "launch pin" `macf update`'s own
+  // post-write verification would.
+  it('reads back the pin from the MOUNTED plugin manifest', () => {
+    dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-launchpin-'));
+    writeClaudeSh(dir, '.macf/plugin');
+    writeManifest(join(dir, '.macf', 'plugin'), {
+      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.56'] },
+    });
+    expect(createVmExecSeams(dir).readLaunchPin(dir)).toBe('0.2.56');
+  });
+
+  it('returns null when claude.sh has no --plugin-dir flag (undeterminable mount)', () => {
+    dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-launchpin-'));
+    writeFileSync(join(dir, 'claude.sh'), '#!/usr/bin/env bash\nexec claude "$@"\n');
+    expect(createVmExecSeams(dir).readLaunchPin(dir)).toBeNull();
+  });
+
+  it('returns null when the MOUNTED manifest has no channel-server pin at all (legacy node dist/server.js form)', () => {
+    dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-launchpin-'));
+    writeClaudeSh(dir, '.macf/plugin');
+    writeManifest(join(dir, '.macf', 'plugin'), {
+      'macf-agent': { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/dist/server.js'] },
+    });
+    expect(createVmExecSeams(dir).readLaunchPin(dir)).toBeNull();
+  });
+
+  it('reads the MOUNTED (non-default) plugin dir, not the conventional .macf/plugin default (macf#889 DR-005 Decision 6 shape)', () => {
+    dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-launchpin-'));
+    writeClaudeSh(dir, '.macf/plugin-cs');
+    // The conventional default is left stale on purpose — the mounted
+    // variant is what must be read.
+    writeManifest(join(dir, '.macf', 'plugin'), {
+      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.40'] },
+    });
+    writeManifest(join(dir, '.macf', 'plugin-cs'), {
+      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.56'] },
+    });
+    expect(createVmExecSeams(dir).readLaunchPin(dir)).toBe('0.2.56');
   });
 });
 

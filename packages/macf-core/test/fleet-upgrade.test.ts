@@ -119,6 +119,8 @@ interface DriverCalls {
   /** macf#755 branch-gate call logs — which agents had their branch checked. */
   currentBranch: string[];
   canonicalBranch: string[];
+  /** macf#899 pin-discrimination call log — which agents had their launch pin read. */
+  readVersionPin: string[];
   /** A single ordered event log across ALL verbs (tagged `"<verb>:<agent>"`), for sequencing assertions. */
   order: string[];
 }
@@ -148,6 +150,13 @@ function makeDriver(opts: {
   branch?: (agent: string) => string | null;
   /** Per-agent CANONICAL branch (macf#755); defaults to `'main'` for every agent. */
   canonicalBranchOf?: (agent: string) => string;
+  /**
+   * Per-agent LAUNCH PIN (macf#899); defaults to `null` (honest-unknown) for
+   * every agent — preserves the PRE-macf#899 conservative `bad-release`
+   * classification for every EXISTING test in this suite that doesn't
+   * explicitly configure a pin.
+   */
+  launchPin?: (agent: string) => string | null;
 }): { driver: FleetDriver; calls: DriverCalls } {
   const calls: DriverCalls = {
     probe: 0,
@@ -165,6 +174,7 @@ function makeDriver(opts: {
     stopHeartbeat: [],
     currentBranch: [],
     canonicalBranch: [],
+    readVersionPin: [],
     order: [],
   };
   const perAgent = new Map<string, number>();
@@ -242,6 +252,10 @@ function makeDriver(opts: {
       calls.listModifiedFiles.push(agent);
       return opts.modifiedFiles ? opts.modifiedFiles(agent) : [];
     },
+    readVersionPin: async (agent) => {
+      calls.readVersionPin.push(agent);
+      return opts.launchPin ? opts.launchPin(agent) : null;
+    },
   };
   return { driver, calls };
 }
@@ -279,6 +293,7 @@ function makeTransactionalDriver(opts: {
     stopHeartbeat: [],
     currentBranch: [],
     canonicalBranch: [],
+    readVersionPin: [],
     order: [],
   };
   const regenerated = opts.regeneratedFiles ?? ['.claude/rules/coordination.md'];
@@ -366,6 +381,10 @@ function makeTransactionalDriver(opts: {
     listModifiedFiles: async (agent) => {
       calls.listModifiedFiles.push(agent);
       return dirty.has(agent) ? regenerated : [];
+    },
+    readVersionPin: async (agent) => {
+      calls.readVersionPin.push(agent);
+      return null;
     },
   };
   return { driver, calls };
@@ -819,11 +838,13 @@ describe('rollFleet', () => {
     expect(res.results[0]!.detail).toContain('still busy');
   });
 
-  it('HALTS with reason bad-release when verify-green sees the agent back on the OLD (pre-upgrade) version — later agents are NOT touched', async () => {
+  it('HALTS with reason bad-release when verify-green sees the agent back on the OLD (pre-upgrade) version, pin UNREADABLE (default) — later agents are NOT touched', async () => {
     // a1's plan.runningVersion is '0.2.40' (the pre-upgrade pin) — verify-green
     // reporting lastVersion '0.2.40' means the restart came back on the SAME old
     // release (crash-loop / stuck-old-process), which is the confirmed-bad-release
-    // signal, distinct from an unconfirmed/unknown state.
+    // signal, distinct from an unconfirmed/unknown state. No `launchPin` configured
+    // (macf#899's DEFAULT — the driver's own launch pin could not be verified) —
+    // pins the judgment call: fall back to the pre-macf#899 conservative HALT.
     const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
     const { verifyGreen, seen } = makeVerify({
       a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40' },
@@ -840,10 +861,114 @@ describe('rollFleet', () => {
     expect(res.results).toHaveLength(1);
     expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted', reason: 'bad-release' });
     expect(res.results[0]!.detail).toContain('bad-release');
+    // macf#899 — the message must say what it could NOT determine, so the
+    // reason string alone is never mistaken for a positively-confirmed
+    // diagnosis (the issue's explicit "make the message say what it could
+    // not determine" constraint).
+    expect(res.results[0]!.detail).toContain('UNVERIFIED');
+    expect(res.results[0]!.detail).toContain('unreadable');
+    expect(res.results[0]!.detail).not.toContain('CONFIRMED');
+    // macf#899 — the pin WAS consulted (the discriminator ran) even though
+    // it came back unreadable.
+    expect(calls.readVersionPin).toEqual(['a1']);
     // DR-040 Decision 3/4 (macf#752) — HALT stops the heartbeat but LEAVES
     // the lock in place; it is never released on a halted roll.
     expect(calls.stopHeartbeat).toEqual(['a1']);
     expect(calls.releaseLock).toEqual([]);
+  });
+
+  describe('launch-pin discrimination (macf#899)', () => {
+    it('pin MATCHES target: still bad-release (CONFIRMED) — HALTS, later agents NOT touched', async () => {
+      // The 0.2.56-roll incident's inverse control: when the launcher DID ask
+      // for the target and the process is STILL on the old version, that's a
+      // genuine crash-loop — the pin-check must not soften this diagnosis.
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        launchPin: (agent) => (agent === 'a1' ? '0.2.41' : null),
+      });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40' },
+      });
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.halted).toBe(true);
+      expect(calls.upgrade).toEqual(['a1']); // a2 never reached
+      expect(calls.readVersionPin).toEqual(['a1']);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted', reason: 'bad-release' });
+      expect(res.results[0]!.detail).toContain('bad-release');
+      expect(res.results[0]!.detail).toContain('CONFIRMED');
+      expect(res.results[0]!.detail).toContain('@0.2.41');
+      expect(calls.releaseLock).toEqual([]);
+    });
+
+    it('pin MISMATCHES target: stale-pin — SKIPS a1 and CONTINUES the roll to a2 (not halted)', async () => {
+      // This is the exact 0.2.56-roll incident shape: the process is back on
+      // the old version, but the LAUNCHER never asked for the target at all
+      // — a stale mounted-plugin pin, not a bad release. A stale pin on a1
+      // endangers no one else, so a2 must still be rolled.
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        launchPin: (agent) => (agent === 'a1' ? '0.2.40' : null),
+      });
+      const { verifyGreen, seen } = makeVerify({
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40' },
+        // a2 rolls clean (default `{ ok: true }`).
+      });
+      const events: UpgradeEvent[] = [];
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+        onEvent: (ev) => events.push(ev),
+      });
+      // NOT halted — the roll must proceed past a1 to a2.
+      expect(res.halted).toBe(false);
+      expect(calls.upgrade).toEqual(['a1', 'a2']);
+      expect(seen).toEqual(['a1', 'a2']);
+      expect(calls.readVersionPin).toEqual(['a1']); // a2 never hit the pin-check (it went green)
+      expect(res.stalePinSkipped).toBe(1);
+      expect(res.upgraded).toBe(1); // a2
+      expect(res.results).toHaveLength(2);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'stale-pin-skipped', reason: 'stale-pin' });
+      expect(res.results[0]!.detail).toContain('stale-pin');
+      expect(res.results[0]!.detail).toContain('@0.2.40');
+      expect(res.results[0]!.detail).toContain('@0.2.41');
+      expect(res.results[1]).toMatchObject({ agent: 'a2', outcome: 'upgraded' });
+      // macf#899 — a1's maintenance lock is NOT released on a stale-pin skip
+      // (DR-040 Decision 3: release ONLY on confirmed clean success), but its
+      // heartbeat DOES stop, mirroring the halted branches' lock posture.
+      expect(calls.stopHeartbeat).toEqual(['a1', 'a2']);
+      expect(calls.releaseLock).toEqual(['a2']); // a2's clean roll releases; a1's does not
+      // Event stream carries the structured stale-pin-skip event.
+      const skipEvent = events.find((e) => e.kind === 'stale-pin-skip');
+      expect(skipEvent).toMatchObject({ kind: 'stale-pin-skip', agent: 'a1', pin: '0.2.40', target: '0.2.41' });
+    });
+
+    it('relaunch-unconfirmed does NOT consult the launch pin at all — the discriminator only applies to the CONFIRMED-old-version precondition', async () => {
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        launchPin: () => {
+          throw new Error('readVersionPin must not be called on this path');
+        },
+      });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'unreachable', lastVersion: null },
+      });
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.halted).toBe(true);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted', reason: 'relaunch-unconfirmed' });
+      expect(calls.readVersionPin).toEqual([]);
+    });
   });
 
   it('HALTS with reason relaunch-unconfirmed when verify-green times out unreachable (down the whole grace) — later agents are NOT touched', async () => {
