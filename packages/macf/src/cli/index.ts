@@ -17,6 +17,7 @@ import { runFleetReconcileCommand } from './commands/fleet-reconcile.js';
 import { runFleetResumeCommand } from './commands/fleet-resume.js';
 import { runFleetUpgrade } from './commands/fleet-upgrade.js';
 import { runFleetDeactivate, runFleetArchive } from './commands/fleet-teardown.js';
+import { runFleetDeleteApps, runFleetDestroy, DESTROY_ENV_ACK_VAR } from './commands/fleet-teardown-destructive.js';
 import { runBootstrapPlan } from './commands/bootstrap.js';
 import { runBootstrapApply } from './commands/bootstrap-apply.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
@@ -513,6 +514,64 @@ fleet
   .option('--json', 'Emit the structured result as JSON', false)
   .action(async (opts) => {
     const code = await runFleetArchive({ file: opts.file, yes: opts.yes, json: opts.json });
+    process.exitCode = code;
+  });
+
+fleet
+  .command('delete-apps')
+  .description(
+    'DR-043 Amendment G — the fleet teardown ladder\'s THIRD rung: `archive` + deletes the per-agent ' +
+    'GitHub App identities, freeing their globally-unique names. GitHub has NO REST endpoint to delete a ' +
+    'App registration (verified against current GitHub docs — see `app-identity-removal.ts`) — this ' +
+    'command reports EVERY App that still needs manual deletion (Settings → Developer settings → GitHub ' +
+    'Apps → Advanced → Delete GitHub App) and best-effort opens the browser there. Revival cost: 2 clicks/agent ' +
+    'to recreate + `apply`. NEVER exits 0 while any App identity remains undeleted — "report what could not ' +
+    'be done, never exit green."',
+  )
+  .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
+  .option('--yes', 'Skip the interactive confirmation prompt', false)
+  .option('--json', 'Emit the structured result as JSON', false)
+  .action(async (opts) => {
+    const code = await runFleetDeleteApps({ file: opts.file, yes: opts.yes, json: opts.json });
+    process.exitCode = code;
+  });
+
+fleet
+  .command('destroy')
+  .description(
+    'DR-043 Amendment G — the fleet teardown ladder\'s TERMINAL rung: `delete-apps`\'s registry + App-identity ' +
+    'work, PLUS deleting the repositories DIRECTLY (never archive-then-delete — pointless work for something ' +
+    'about to be destroyed). History gone forever; full re-provision is the only way back. FRICTION IS THE ' +
+    'FEATURE (operator directive: never allow easy repo removal) — requires ALL THREE of `--destroy-repositories`, ' +
+    `typing the exact fleet name at the interactive prompt, and the environment acknowledgment ` +
+    `${DESTROY_ENV_ACK_VAR}=1. Refuses on a foreign/unconfirmed control repo, same as every other rung. ` +
+    'Optionally, with EXPLICIT opt-in via --shred-age-key + --age-identity <path>, cryptographically shreds ' +
+    'the operator\'s age private key afterward — the single action with NO recovery whatsoever, and it also ' +
+    'makes `deactivate`/`archive` non-revivable for this fleet (their free-revival depends on the vault still ' +
+    'being decryptable). Never implied by any other flag.',
+  )
+  .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
+  .option('--destroy-repositories', 'Required acknowledgment 1 of 3 — implied by nothing else', false)
+  .option(
+    '--shred-age-key',
+    'OPT-IN ONLY, never implied: after destroying, cryptographically shred the age identity at --age-identity. ' +
+      'NO recovery whatsoever. Best-effort (overwrite + unlink) — not a forensic guarantee against backups/snapshots.',
+    false,
+  )
+  .option('--age-identity <path>', 'Path to the operator\'s age private-key file — REQUIRED when --shred-age-key is passed')
+  .option('--json', 'Emit the structured result as JSON', false)
+  .action(async (opts) => {
+    // The env-acknowledgment itself is read INSIDE runFleetDestroy (via its
+    // injectable, wiring-pinned `readEnv` dep) — never resolved here into a
+    // plain boolean, so the read stays inside the tested surface. See
+    // `fleet-teardown-destructive.ts`'s `FleetDestroyDeps.readEnv` doc.
+    const code = await runFleetDestroy({
+      file: opts.file,
+      destroyRepositories: opts.destroyRepositories,
+      shredAgeKey: opts.shredAgeKey,
+      ageIdentity: opts.ageIdentity,
+      json: opts.json,
+    });
     process.exitCode = code;
   });
 

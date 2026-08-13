@@ -211,6 +211,35 @@ export async function realReadControlManifestFile(repo: string): Promise<string 
   }
 }
 
+/**
+ * Real raw-content read of `fleet.lock` off the control repo's default
+ * branch — same shape as {@link realReadControlManifestFile}, sibling file
+ * (both are in {@link CONTROL_REPO_COMMIT_ALLOWLIST}, so both are
+ * committed by every successful `apply`). `undefined` on ANY failure
+ * (missing file — e.g. the fleet was never actually provisioned, or this
+ * is a first-ever teardown attempt against a `fleet.yaml`-only checkout —
+ * private-repo-without-content-scope, network) — NEVER throws.
+ *
+ * Used by `teardown-destructive.ts`'s App-identity enrichment
+ * (`app-identity-removal.ts::enrichAppIdentityTargetsWithLock`) — the
+ * DERIVED App slug (`deriveAppHandle`) is a PREDICTION; `fleet.lock`'s
+ * recorded `app_id` per role is the AUTHORITY for which App actually
+ * exists. Best-effort ONLY: a missing/stale/unreadable lock degrades to
+ * the derived-slug-only report, never blocks or refuses a teardown run.
+ */
+export async function realReadControlFleetLockFile(repo: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync(
+      'gh',
+      ['api', `repos/${repo}/contents/fleet.lock`, '-H', 'Accept: application/vnd.github.raw'],
+      { encoding: 'utf-8' },
+    );
+    return stdout;
+  } catch {
+    return undefined;
+  }
+}
+
 // --- git-committed content invariant (Amendment F, #857 review) ---
 
 /** The `.gitignore` line excluding Amendment B's recovery artifacts. Exported so the allowlist doc + tests reference the same literal rather than duplicating it. */
