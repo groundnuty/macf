@@ -23,11 +23,20 @@
  */
 import { describe, it, expect } from 'vitest';
 import { resolveMutateDeps } from '../../../src/cli/commands/bootstrap-apply.js';
-import { realControlRepoCommitAndPush } from '../../../src/cli/bootstrap/control-repo.js';
+import {
+  realControlRepoCommitAndPush,
+  checkControlRepoMeta,
+  realReadControlFleetLockFile,
+  realReadControlManifestFile,
+} from '../../../src/cli/bootstrap/control-repo.js';
 import { realCommitAndPush } from '../../../src/cli/bootstrap/apply-repo-init.js';
-import { realUnarchiveRepo } from '../../../src/cli/bootstrap/repo-archive.js';
+import { realArchiveRepo, realUnarchiveRepo } from '../../../src/cli/bootstrap/repo-archive.js';
+import { realDeleteRepo } from '../../../src/cli/bootstrap/repo-destroy.js';
+import { realShredAgeIdentity } from '../../../src/cli/bootstrap/age-key-shred.js';
 import { realCreateRegistryVariable, realCreateRepoVariable, realMintCa } from '../../../src/cli/bootstrap/apply-ca.js';
+import { realDeleteRegistryVariable } from '../../../src/cli/bootstrap/variable-write.js';
 import { checkRegistryVariablePresence, checkRepoVariablePresence, readRegistryVariable } from '../../../src/cli/bootstrap/observer.js';
+import { resolveDeleteAppsDeps, resolveDestroyDeps } from '../../../src/cli/commands/fleet-teardown-destructive.js';
 
 describe('apply real-deps wiring (macf#857 — the seam a unit test cannot see)', () => {
   const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml');
@@ -101,5 +110,62 @@ describe('apply real-deps wiring (macf#857 — the seam a unit test cannot see)'
 
   it('wires the CA mint to the real createCA-backed primitive', () => {
     expect(deps.trustDeps.mintCa).toBe(realMintCa);
+  });
+});
+
+// --- DR-043 Amendment G, IRREVERSIBLE rungs (macf#867) — delete-apps / destroy wiring ---
+//
+// Same "defined, tested, never called" shape this file exists to catch (see
+// the module doc) — `teardown-destructive.ts`'s primitives could ship
+// correct and unit-tested while the command layer's real-deps resolver
+// wired the WRONG function (e.g. `realArchiveRepo` where `destroy` needs
+// `realDeleteRepo` — a one-word typo away from silently archiving instead
+// of deleting, or vice versa, which is exactly the "different blast radii
+// must not be one typo apart" hazard Amendment G's own design principle
+// names). Pin every field by identity so that class of regression fails
+// HERE, not in the field.
+
+describe('fleet delete-apps / destroy real-deps wiring (DR-043 Amendment G, macf#867)', () => {
+  const deleteAppsDeps = resolveDeleteAppsDeps();
+  const destroyDeps = resolveDestroyDeps();
+
+  it('delete-apps: wires ownership reads to the SAME primitives the reversible rungs + apply use', () => {
+    expect(deleteAppsDeps.checkMeta).toBe(checkControlRepoMeta);
+    expect(deleteAppsDeps.readManifestFile).toBe(realReadControlManifestFile);
+    expect(deleteAppsDeps.checkRegistryPresence).toBe(checkRegistryVariablePresence);
+  });
+
+  it('delete-apps: wires the fleet.lock App-ID enrichment read to the real control-repo primitive', () => {
+    expect(deleteAppsDeps.readFleetLock).toBe(realReadControlFleetLockFile);
+  });
+
+  it('delete-apps: wires registry DELETE to the delete-only primitive (never a create/upsert)', () => {
+    expect(deleteAppsDeps.deleteRegistryVariable).toBe(realDeleteRegistryVariable);
+  });
+
+  it('delete-apps: wires the repo action to ARCHIVE — never delete (this rung never deletes repos)', () => {
+    expect(deleteAppsDeps.archiveRepo).toBe(realArchiveRepo);
+  });
+
+  it('destroy: wires ownership reads to the SAME primitives every other rung uses', () => {
+    expect(destroyDeps.checkMeta).toBe(checkControlRepoMeta);
+    expect(destroyDeps.readManifestFile).toBe(realReadControlManifestFile);
+    expect(destroyDeps.checkRegistryPresence).toBe(checkRegistryVariablePresence);
+  });
+
+  it('destroy: wires registry DELETE to the delete-only primitive', () => {
+    expect(destroyDeps.deleteRegistryVariable).toBe(realDeleteRegistryVariable);
+  });
+
+  it('destroy: wires the repo action to DELETE — never archive (the one field a typo could silently downgrade to `delete-apps`\' behavior)', () => {
+    expect(destroyDeps.deleteRepo).toBe(realDeleteRepo);
+  });
+
+  it('destroy: wires the age-key shred to the REAL shred primitive (called only behind evaluateShredRequest\'s opt-in gate — see teardown-destructive.ts)', () => {
+    expect(destroyDeps.shredAgeIdentity).toBe(realShredAgeIdentity);
+  });
+
+  it('destroy: wires the fleet.lock App-ID enrichment read to the real control-repo primitive', () => {
+    expect(destroyDeps.readFleetLock).toBe(realReadControlFleetLockFile);
   });
 });
