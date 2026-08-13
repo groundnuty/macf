@@ -378,6 +378,53 @@ describe('applyFleet', () => {
     expect(lock.agents.find((a) => a.role === 'science-agent')).toEqual({ role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2-resumed' });
   });
 
+  // --- DR-043 §D6 write-back anti-regression (macf#907) ----------------------
+  //
+  // `apply` NEVER writes `deployed_version` (that's `macf fleet upgrade`'s
+  // job — `fleet-lock-recorder.ts` — on a CONFIRMED verify-green). Equally
+  // load-bearing: `apply` must never DROP a `deployed_version` a prior
+  // `fleet upgrade` roll already recorded — `fleet-lock.ts`'s
+  // `composeFleetLock` carry-forward (`?? prev?.deployed_version`) is what
+  // protects that; this pins the contract end-to-end THROUGH `applyFleet`,
+  // not just at `composeFleetLock`'s own unit level (`fleet-lock.test.ts`).
+
+  it('apply NEVER writes deployed_version: a priorLock with none stays without one after a "reused" run', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT]);
+    const priorLock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+    };
+    const deps = baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath);
+
+    const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+    expect(result.agents[0]?.identity.status).toBe('reused');
+    const lock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
+    expect(lock.agents.find((a) => a.role === 'code-agent')?.deployed_version).toBeUndefined();
+  });
+
+  it('apply NEVER drops a deployed_version a prior `fleet upgrade` roll recorded: preserved verbatim through a "reused" run', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT]);
+    const priorLock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1', deployed_version: '0.2.56' }],
+    };
+    const deps = baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath);
+
+    const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+    expect(result.agents[0]?.identity.status).toBe('reused');
+    const lock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
+    // Carried forward VERBATIM — `applyFleet` never touches `deployed_version`
+    // in either direction; a future author "fixing" apply must not silently
+    // clobber what `fleet upgrade` already recorded.
+    expect(lock.agents.find((a) => a.role === 'code-agent')?.deployed_version).toBe('0.2.56');
+  });
+
   it('tags each agent\'s log lines with "[agent N/M]" progress context on a multi-agent fleet (consent-gate UX fix)', async () => {
     const manifestPath = manifestPathIn();
     const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);

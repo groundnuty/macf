@@ -316,13 +316,18 @@ export async function readCallerActionsPin(repo: string): Promise<string | undef
  *
  * §D6 version steering (macf#838 follow-up) adds two per-agent reads:
  * `deployedVersion` comes from `fleet.lock` ONLY (same "lock-or-unknown,
- * never live" posture as App/install existence above) — see
- * `ObservedAgentState.deployedVersion`'s doc for why this is realistically
- * `undefined` on every fleet today (no write path populates it yet, and
- * this Mac-side tool has no mTLS route to `/health.version`). `actionsPin`,
- * by contrast, genuinely IS a live read — {@link readCallerActionsPin}
- * against `agent.repo` — same "per-repo, not fleet-representative" posture
- * the CA reads above already use, for the same #806-class reason.
+ * never live" posture as App/install existence above) — this Mac-side tool
+ * still has no mTLS route to `/health.version`, so it never reads live.
+ * `macf fleet upgrade -f <fleet.yaml>`'s confirmed-verify-green write-back
+ * (macf#907, `fleet-lock-recorder.ts`) is what populates `deployed_version`
+ * in the FIRST place; `readFleetLock` here then reads it back from THIS
+ * manifest's own local directory, which reflects the control repo's latest
+ * commit only once that checkout is pulled — see
+ * `ObservedAgentState.deployedVersion`'s doc for the full "why `undefined`
+ * happens" account. `actionsPin`, by contrast, genuinely IS a live read —
+ * {@link readCallerActionsPin} against `agent.repo` — same "per-repo, not
+ * fleet-representative" posture the CA reads above already use, for the
+ * same #806-class reason.
  */
 export async function githubRegistryObserver(manifest: FleetManifest, manifestPath: string): Promise<ObservedState> {
   const lock = readFleetLock(manifestPath);

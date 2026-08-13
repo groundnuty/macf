@@ -1203,6 +1203,175 @@ describe('rollFleet', () => {
     expect(calls.isBusy).toEqual([]);
     expect(res.results).toEqual([]);
   });
+
+  // --- DR-043 §D6 write-back (macf#907) — recordDeployedVersion gating ---
+  //
+  // The single question this suite pins: is `deps.recordDeployedVersion`
+  // called EXACTLY on the confirmed-green disposition, and NEVER on any
+  // other (busy/config-dirty/branch-skipped, stale-pin-skipped, halted)?
+  // The actual `fleet.lock` write mechanics live in `packages/macf`'s
+  // `fleet-lock-recorder.test.ts` — this describe only pins the
+  // CALL-GATING contract at the sequencer level, same "decision layer vs
+  // I/O leaf" split every other seam in this file (driver/verifyGreen)
+  // already follows. Nested inside `describe('rollFleet', ...)` (not a
+  // sibling) so it can reuse the outer `twoBehind` fixture.
+  describe('recordDeployedVersion (DR-043 §D6, macf#907)', () => {
+  it('confirmed verify-green: calls recordDeployedVersion(agent, fleet, version) exactly once, AFTER the lock release', async () => {
+    const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
+    const { verifyGreen } = makeVerify();
+    const recorded: { agent: string; fleet: string; version: string }[] = [];
+    const releaseLockBeforeRecord: boolean[] = [];
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+      recordDeployedVersion: async (agent, fleet, version) => {
+        recorded.push({ agent, fleet, version });
+        releaseLockBeforeRecord.push(calls.releaseLock.includes(agent));
+      },
+    });
+    expect(res.halted).toBe(false);
+    expect(res.results.map((r) => r.outcome)).toEqual(['upgraded', 'upgraded']);
+    expect(recorded).toEqual([
+      { agent: 'a1', fleet: 'g', version: '0.2.41' },
+      { agent: 'a2', fleet: 'g', version: '0.2.41' },
+    ]);
+    // Called AFTER releaseLock for that same agent — a clone+commit
+    // round-trip must never hold the maintenance lock hostage for pure
+    // bookkeeping (this module's `RollFleetDeps.recordDeployedVersion` doc).
+    expect(releaseLockBeforeRecord).toEqual([true, true]);
+  });
+
+  it('is never called when `deps.recordDeployedVersion` is omitted (backward-compatible no-op — pre-macf#907 behavior)', async () => {
+    const { driver } = makeDriver({ state: mkState([]), workspaces: [] });
+    const { verifyGreen } = makeVerify();
+    // No `recordDeployedVersion` field at all — must not throw.
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+    });
+    expect(res.results.map((r) => r.outcome)).toEqual(['upgraded', 'upgraded']);
+  });
+
+  it('busy-skipped: never called (agent never mutated, never confirmed)', async () => {
+    const { driver } = makeDriver({ state: mkState([]), workspaces: [], busy: (agent) => agent === 'a1' });
+    const { verifyGreen } = makeVerify();
+    const recorded: string[] = [];
+    await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+      recordDeployedVersion: async (agent) => { recorded.push(agent); },
+    });
+    // a2 still rolls clean and IS recorded — only a1 (busy-skipped) is excluded.
+    expect(recorded).toEqual(['a2']);
+  });
+
+  it('config-dirty-skipped: never called', async () => {
+    const { driver } = makeDriver({ state: mkState([]), workspaces: [], dirtyConfigFiles: (agent) => (agent === 'a1' ? ['CLAUDE.md'] : []) });
+    const { verifyGreen } = makeVerify();
+    const recorded: string[] = [];
+    await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+      recordDeployedVersion: async (agent) => { recorded.push(agent); },
+    });
+    expect(recorded).toEqual(['a2']);
+  });
+
+  it('branch-skipped: never called', async () => {
+    const { driver } = makeDriver({
+      state: mkState([]),
+      workspaces: [],
+      canonicalBranchOf: () => 'main',
+      branch: (agent) => (agent === 'a1' ? 'feature/x' : 'main'),
+    });
+    const { verifyGreen } = makeVerify();
+    const recorded: string[] = [];
+    await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+      recordDeployedVersion: async (agent) => { recorded.push(agent); },
+    });
+    expect(recorded).toEqual(['a2']);
+  });
+
+  it('stale-pin-skipped: never called (the agent was mutated but NOT confirmed at target)', async () => {
+    const { driver } = makeDriver({
+      state: mkState([]),
+      workspaces: [],
+      launchPin: (agent) => (agent === 'a1' ? '0.2.40' : null),
+    });
+    const { verifyGreen } = makeVerify({
+      a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40' },
+    });
+    const recorded: string[] = [];
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+      recordDeployedVersion: async (agent) => { recorded.push(agent); },
+    });
+    expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'stale-pin-skipped' });
+    expect(recorded).toEqual(['a2']); // a1 (stale-pin) excluded; a2 rolled clean
+  });
+
+  it('halted (bad-release): never called for the halted agent, and later agents are never reached', async () => {
+    const { driver } = makeDriver({ state: mkState([]), workspaces: [], launchPin: (agent) => (agent === 'a1' ? '0.2.41' : null) });
+    const { verifyGreen } = makeVerify({
+      a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40' },
+    });
+    const recorded: string[] = [];
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+      recordDeployedVersion: async (agent) => { recorded.push(agent); },
+    });
+    expect(res.halted).toBe(true);
+    expect(recorded).toEqual([]); // a1 halted; a2 never reached
+  });
+
+  it('halted (relaunch-unconfirmed): never called', async () => {
+    const { driver } = makeDriver({ state: mkState([]), workspaces: [] });
+    const { verifyGreen } = makeVerify({
+      a1: { ok: false, reason: 'unreachable', lastVersion: null },
+    });
+    const recorded: string[] = [];
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+      recordDeployedVersion: async (agent) => { recorded.push(agent); },
+    });
+    expect(res.halted).toBe(true);
+    expect(recorded).toEqual([]);
+  });
+
+  it('a rejected recordDeployedVersion is NON-FATAL: outcome stays `upgraded`, roll continues, failure surfaces via `lock-write-failed`', async () => {
+    const { driver } = makeDriver({ state: mkState([]), workspaces: [] });
+    const { verifyGreen } = makeVerify();
+    const events: UpgradeEvent[] = [];
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+      onEvent: (ev) => events.push(ev),
+      recordDeployedVersion: async (agent) => {
+        if (agent === 'a1') throw new Error('control repo unreachable');
+      },
+    });
+    // Both agents still report 'upgraded' — a write failure never retracts
+    // the confirmed-green outcome, and the roll is NOT halted.
+    expect(res.halted).toBe(false);
+    expect(res.results.map((r) => r.outcome)).toEqual(['upgraded', 'upgraded']);
+    const failEvent = events.find((e) => e.kind === 'lock-write-failed');
+    expect(failEvent).toMatchObject({ kind: 'lock-write-failed', agent: 'a1', version: '0.2.41', error: 'control repo unreachable' });
+  });
+  });
 });
 
 // --- upgradeFleets (multi-fleet + dry-run) ----------------------------------
@@ -1218,6 +1387,18 @@ describe('upgradeFleets', () => {
     const { verifyGreen } = makeVerify();
     return { resolveDriver: async () => driver, verifyGreen, ...noWait, ...extra };
   }
+
+  it('threads recordDeployedVersion through to rollFleet unchanged (DR-043 §D6, macf#907)', async () => {
+    const { driver } = makeDriver({ state, workspaces });
+    const recorded: string[] = [];
+    const report = await upgradeFleets(
+      ['fleet-1', 'fleet-2'],
+      { execute: true, targetVersion: '0.2.41', verifyTimeoutMs: 1000 },
+      deps(driver, { recordDeployedVersion: async (agent) => { recorded.push(agent); } }),
+    );
+    expect(report.halted).toBe(false);
+    expect(recorded.sort()).toEqual(['a', 'b']);
+  });
 
   it('DRY-RUN plans without acting — no upgrade / restart / isBusy calls', async () => {
     const { driver, calls } = makeDriver({ state, workspaces });

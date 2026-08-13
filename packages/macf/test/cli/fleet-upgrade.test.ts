@@ -231,6 +231,55 @@ describe('runFleetUpgrade', () => {
     expect(lines.join('\n')).toContain('EXECUTE');
   });
 
+  // --- DR-043 §D6 write-back wiring (macf#907) -------------------------------
+  //
+  // The heavy call-gating coverage (which dispositions call it, which don't,
+  // non-fatal-on-reject) lives in macf-core's `fleet-upgrade.test.ts`. This
+  // file only verifies the RESOLVE + wiring seam: `FleetUpgradeDeps.recordDeployedVersion`
+  // reaches `upgradeFleets`, and a failure renders through `emit()`.
+
+  it('--execute threads FleetUpgradeDeps.recordDeployedVersion through to a confirmed-green agent', async () => {
+    const { driver, workspaces } = makeDriver(AGENTS, { base: '0.2.40', target: '0.2.41' });
+    const recorded: { agent: string; fleet: string; version: string }[] = [];
+    const { deps } = makeDeps({
+      discover: () => workspaces,
+      defaultFleet: 'fleet-1',
+      resolveDriver: async () => driver,
+      recordDeployedVersion: async (agent, fleet, version) => { recorded.push({ agent, fleet, version }); },
+    });
+    const code = await runFleetUpgrade('/proj', { execute: true }, deps);
+    expect(code).toBe(0);
+    expect(recorded).toEqual([{ agent: 'a', fleet: 'fleet-1', version: '0.2.41' }]);
+  });
+
+  it('omitted recordDeployedVersion (no -f/--file given) is unchanged pre-macf#907 behavior — no crash, no write attempted', async () => {
+    const { driver, calls, workspaces } = makeDriver(AGENTS, { base: '0.2.40', target: '0.2.41' });
+    const { deps } = makeDeps({
+      discover: () => workspaces,
+      defaultFleet: 'fleet-1',
+      resolveDriver: async () => driver,
+      // recordDeployedVersion deliberately absent.
+    });
+    const code = await runFleetUpgrade('/proj', { execute: true }, deps);
+    expect(code).toBe(0);
+    expect(calls.upgrade).toEqual(['a']);
+  });
+
+  it('a rejected recordDeployedVersion renders LOUD via emit() but does not change the exit code', async () => {
+    const { driver, workspaces } = makeDriver(AGENTS, { base: '0.2.40', target: '0.2.41' });
+    const { deps, lines } = makeDeps({
+      discover: () => workspaces,
+      defaultFleet: 'fleet-1',
+      resolveDriver: async () => driver,
+      recordDeployedVersion: async () => { throw new Error('control repo unreachable'); },
+    });
+    const code = await runFleetUpgrade('/proj', { execute: true }, deps);
+    expect(code).toBe(0); // non-fatal — the roll still succeeded
+    const out = lines.join('\n');
+    expect(out).toContain('deployed_version write FAILED');
+    expect(out).toContain('control repo unreachable');
+  });
+
   it('re-resolves the FRESH endpoint on each verify-green poll after a restart-self port churn (macf#722 Fix A)', async () => {
     // Models the real restart-self behavior: the agent relaunches on a NEW
     // port. The wiring under test is `runFleetUpgrade`'s `probe` closure,
