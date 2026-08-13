@@ -58,7 +58,21 @@ versions:
 
 - **`transport.vault_repo` no longer exists** (Amendment F). The vault lives in the control repo, derived — there is no knob, deliberately.
 - **App names are globally unique across GitHub.** `<fleet>-<role>` must not already exist. Check first:
-  `gh api /apps/my-project-science-agent` → a `404` means the name is free.
+
+  ```bash
+  gh api /apps/my-project-science-agent
+  ```
+
+  **Read the result strictly: only a `404` means the name is free.** Anything else means taken-or-unknown, and you must not proceed as if it were free. The response depends on your auth, and all three shapes are distinguishable (verified 2026-08-13):
+
+  | Your auth | App exists | App absent |
+  |---|---|---|
+  | operator `gh` login | `200` + the slug | `404` |
+  | bot installation token | **`403`** *"Resource not accessible by integration"* | `404` |
+
+  So a `403` is **not** permission noise to skim past — under a bot token it is the *positive* signal that the name is taken. Treating any non-404 as "free" is the trap: you would re-run provisioning and GitHub would reject the create on a globally-unique name already in use, which is exactly the squat `macf fleet delete-apps` exists to clear.
+
+  If you need an auth-independent answer, the App-JWT path the codebase already uses is authoritative: mint a JWT from the App's own key and `GET /app/installations` (see `confirmAppInstallation`, macf#841).
 - Start with **one agent**. Add more in later runs; each additional agent costs two clicks.
 
 ---
