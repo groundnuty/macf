@@ -429,6 +429,23 @@ A repeatable live-smoke (the live-contract-verification class flagged on #868) n
 
 **`macf fleet deploy` owns runner registration.** It already runs VM-side, already holds credentials, and is **already mandatory before any agent runs** — so this adds **zero new operator steps**, no hand-sequencing, and no improvisation. Rejected: having `apply` SSH into the VM (one *invocation*, but permanently widens what the Mac-side provisioner can reach, for no reduction in operator touches — Amendments C/D are worth more than a command-count optimisation).
 
+**Scope narrowed by operator clarification (2026-08-13):** *"We assume that the runner is deployed, always, somewhere, that it's running, and all we have to do is to register it. Our scope is not deploying runners. Our scope is just pointing our configuration to the existing runner."* So **runner deployment and lifecycle are explicitly OUT of scope**; the fleet points at a runner that already exists. This changes who needs a registration step at all:
+
+| fleet owner | registration | why |
+|---|---|---|
+| **org** (e.g. `macf-experiment`) | **none — a no-op** | an org-level runner already serves **every repo in the org**; there is nothing per-repo to register |
+| **user account** (e.g. `groundnuty/*`) | **`deploy` registers per repo** | a user account **cannot hold account-level runners**, so repo-scoping is forced |
+
+The DR must not imply every fleet needs a registration step — for the org case, the entire remaining job is writing `MACF_TRUSTED_ACTORS`, which `apply` already does.
+
+**The detection invariant is "a runner is USABLE BY THIS REPO" — not "a runner exists."** Two failure directions, both real:
+- Querying only `repos/<repo>/actions/runners` misses **org-level** runners (they live at `orgs/<org>/actions/runners`), so an org fleet with a perfectly good runner reads `total_count: 0` → gate says absent → trust variable skipped → **hosted fallback bills on private repos**. This is macf#922/#923's cost bug reintroduced by an incomplete check (found live, macf#924).
+- But an org runner's **runner group may be restricted to selected repositories**, so a runner can exist, be online, and still never claim this repo's jobs. Asserting mere existence would write the trust variable for an unusable runner — the same proxy-vs-invariant mistake in the opposite direction.
+
+So detection considers **repo-level runners plus org-level runners whose group visibility admits this repo**. Where adding the repo to a runner group is required, that is an **org-admin action the tool NAMES and hands over**, never attempts (the `delete-apps` pattern: report what it cannot do, with the exact step).
+
+**Why the conservative default is right — the failure modes are asymmetric.** Writing the trust variable with no usable runner makes routing jobs queue for a runner that never claims them: **the fleet silently stops coordinating.** Skipping it when a runner does exist causes a hosted fallback: **it costs money, but routing works.** The conservative default therefore fails toward *functional-but-costly*, which is the correct direction — so the fix for a missed runner is to make **detection complete**, never to relax the gate. That makes the honest-unknown path load-bearing: when scope-completeness is genuinely unreadable (e.g. no permission to enumerate org runner groups), the tool **skips LOUDLY and actionably** — naming the scope it could not read and the operator command that settles it — never silently, since a silent skip is indistinguishable from "no runner exists," which is how this class keeps regenerating.
+
 **Requirements on the flow:**
 
 1. **Confirm by result-invariant, never by exit code.** `config.sh` exiting 0 is not evidence of an online runner — assert against `GET /repos/{owner}/{repo}/actions/runners` that the expected runner is present and online (Instance 17 / Amendment C / macf#918's lesson).
