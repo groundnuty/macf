@@ -32,6 +32,20 @@ command.
 - **§D6 versions steering** — `versions.macf` / `versions.actions` drift is a
   first-class plan item naming the correct remedy per kind.
 - **Operator runbook** — `docs/new-fleet-runbook.md`.
+- Manifest field `transport.age_recipient` is now **`age_recipients`** (a list).
+  `bootstrap` ships publicly for the first time here, so there are no prior
+  released consumers — but anyone who hand-wrote a `fleet.yaml` against a
+  pre-release build will hit this field name.
+
+### Security
+
+- **`vault.sh` no longer `eval`s decrypted vault content.** The reader now parses
+  `KEY=VALUE` directly, so hostile content in a vault cannot execute *regardless of
+  what any writer emitted* — on the file that holds every agent's App private key,
+  the routing client key, and the per-project CA key. As defence-in-depth the writer
+  also emits single-quoted values, shrinking the dangerous character set from four
+  to one. Two independent layers: the writer can be wrong without the reader being
+  exploitable, and vice versa. (#848)
 
 ### Fixed
 
@@ -49,6 +63,13 @@ command.
 - **`restart-self --dir` was silently overridden by `MACF_WORKSPACE_DIR`** (#888).
 - **Org-scope variable creation omitted the required `visibility` field** (422), so
   organization-owned fleets could not publish their registry CA (#866).
+- **A rotated-out CA in the registry reported `HEALTHY` while every agent was
+  unreachable.** `routing doctor` now asserts the registry CA is *current*, not
+  merely well-formed — the previous check returned green during a total routing
+  outage. (#873)
+- **`apply` now names the plan items it cannot action** instead of silently
+  skipping them, so approving a plan no longer means approving more than it
+  delivers. (#854)
 - **Consent-gate URLs are now printed before the browser opens** and re-printed on
   timeout — a browser launch is an unverifiable side effect.
 
