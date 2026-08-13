@@ -134,8 +134,8 @@ export async function readRepoVariable(repo: string, name: string): Promise<stri
 /**
  * Read-only repo-scoped Actions-variable EXISTENCE check — the
  * absent/unknown-distinguishing sibling of {@link readRepoVariable} (which
- * collapses both into `undefined`; fine for the `routingRunsOn` VALUE read,
- * but not for the per-repo CA-var drift class the #806 acceptance test needs
+ * collapses both into `undefined`; fine for the `routingTrustedActors` VALUE
+ * read, but not for the per-repo CA-var drift class the #806 acceptance test needs
  * to reproduce: telling a confirmed-404 repo-var apart from a couldn't-read
  * one, same split as {@link checkRepoExists}). A `gh`-reported 404 is a
  * confident `'absent'`; any other failure degrades to `'unknown'`. NEVER
@@ -169,6 +169,36 @@ export async function checkRepoSecretPresence(repo: string, name: string): Promi
   try {
     await execFileAsync('gh', ['api', `repos/${repo}/actions/secrets/${name}`], { encoding: 'utf-8' });
     return 'present';
+  } catch (err) {
+    const stderr = getStderr(err);
+    if (/HTTP 404|Not Found/i.test(stderr)) return 'absent';
+    return 'unknown';
+  }
+}
+
+/**
+ * Read-only self-hosted-runner-registration check via `gh api
+ * repos/<repo>/actions/runners` — the "register-before-route" gate the v3
+ * router's `pick-runner` job's own doc comment names (macf-actions
+ * `agent-router.yml`: "the self-hosted branch activates only once the var
+ * is set AND a runner is registered," macf#922). `'present'` = at least one
+ * runner is REGISTERED (`total_count > 0`) — deliberately "registered," not
+ * "online": the router's own wording says "registered," and a registered-
+ * but-currently-offline runner is a narrower failure (a hung job) than
+ * writing `MACF_TRUSTED_ACTORS` with zero runners registered at all (every
+ * trusted-actor job would route self-hosted with nothing to receive it). A
+ * confident empty list is `'absent'`; any read failure (auth / network /
+ * insufficient scope / `gh` missing) degrades to `'unknown'` — same
+ * discrimination {@link checkRepoExists} already uses. NEVER throws.
+ */
+export async function checkRunnerRegistered(repo: string): Promise<Presence> {
+  try {
+    const { stdout } = await execFileAsync('gh', ['api', `repos/${repo}/actions/runners`, '--jq', '.total_count'], {
+      encoding: 'utf-8',
+    });
+    const count = Number.parseInt(stdout.trim(), 10);
+    if (Number.isNaN(count)) return 'unknown';
+    return count > 0 ? 'present' : 'absent';
   } catch (err) {
     const stderr = getStderr(err);
     if (/HTTP 404|Not Found/i.test(stderr)) return 'absent';
@@ -314,14 +344,15 @@ export async function readCallerActionsPin(repo: string): Promise<string | undef
  * repo read cannot reproduce the #806 drift class: a per-repo var absent
  * while the registry + other repos have it).
  *
- * The routing runner var is read on a single REPRESENTATIVE caller repo —
- * `manifest.agents[0].repo` (macf#857 / DR-043 Amendment F review). Prior to
- * Amendment F this read `transport.vault_repo`, which (in every fleet seen
- * so far) happened to BE an agent repo; Amendment F removes `vault_repo`
- * entirely (the vault now lives in the derived `<fleet>-control` repo, which
- * is NEVER a routing caller — `MACF_ROUTING_RUNS_ON` is set per §D1 on
+ * The routing vars (`MACF_TRUSTED_ACTORS` value + the register-before-route
+ * runner-registration check, macf#922) are read on a single REPRESENTATIVE
+ * caller repo — `manifest.agents[0].repo` (macf#857 / DR-043 Amendment F
+ * review). Prior to Amendment F this read `transport.vault_repo`, which (in
+ * every fleet seen so far) happened to BE an agent repo; Amendment F removes
+ * `vault_repo` entirely (the vault now lives in the derived `<fleet>-control`
+ * repo, which is NEVER a routing caller — the trust var is set per §D1 on
  * "every caller repo," and the control repo is not one). Reading it from the
- * control repo would make `routingRunsOn` permanently `undefined`, so
+ * control repo would make `routingTrustedActors` permanently `undefined`, so
  * `routingItem` would emit `create` forever and the `noop`/`update`
  * branches would go permanently dead — a silent plan regression. `agents[0]`
  * preserves the original "one representative target" semantics;
@@ -389,9 +420,18 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   // it's `agents[0].repo`, not `transport.vault_repo` (removed) or the
   // control repo (never a routing caller).
   const representativeCallerRepo = manifest.agents[0]?.repo;
-  const routingRunsOn =
+  // macf#922 — 'MACF_TRUSTED_ACTORS' inlined (not imported from
+  // apply-routing.ts's TRUSTED_ACTORS_VAR) matching this file's established
+  // convention of a documented same-literal-string pair rather than a
+  // cross-module import (see apply-routing.ts's own doc: "matches
+  // observer.ts's read of the same name").
+  const routingTrustedActors =
     manifest.routing?.runner && representativeCallerRepo !== undefined
-      ? await readRepoVariable(representativeCallerRepo, 'MACF_ROUTING_RUNS_ON')
+      ? await readRepoVariable(representativeCallerRepo, 'MACF_TRUSTED_ACTORS')
+      : undefined;
+  const routingRunnerRegistered =
+    manifest.routing?.runner && representativeCallerRepo !== undefined
+      ? await checkRunnerRegistered(representativeCallerRepo)
       : undefined;
 
   // DR-043 Amendment G — same derived name `control-repo.ts::controlRepoFullName`
@@ -405,7 +445,8 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     caRegistry,
     caRepos,
     routingClientRepos,
-    routingRunsOn,
+    routingTrustedActors,
+    routingRunnerRegistered,
     controlRepoPresence: controlRepoMeta.presence,
     controlRepoArchived: controlRepoMeta.archived,
   };
@@ -444,7 +485,7 @@ export interface VaultAwareObserverDeps {
  * file, gets `unknown`, never a false "nothing's provisioned."
  *
  * The BASE observation (`githubRegistryObserver`'s `lock`/`caRepos`/
- * `routingRunsOn`/non-vault agent fields) is computed exactly as before and
+ * `routingTrustedActors`/non-vault agent fields) is computed exactly as before and
  * carried through unchanged — this function ADDS `vault`/`vaultCa`, it never
  * revises anything the non-vault-aware observer already determined.
  */

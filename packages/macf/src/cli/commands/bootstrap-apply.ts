@@ -57,6 +57,7 @@ import {
   checkRepoSecretPresence,
   checkRepoVariablePresence,
   checkRegistryVariablePresence,
+  checkRunnerRegistered,
   readRegistryVariable,
 } from '../bootstrap/observer.js';
 import { realCreateRepo } from '../bootstrap/repo-create.js';
@@ -65,6 +66,7 @@ import { realCreateRegistryVariable, realCreateRepoVariable, realMintCa } from '
 import type { EnsureVariableOutcome } from '../bootstrap/ensure-variable.js';
 import type { RoutingClientApplyDeps } from '../bootstrap/apply-routing-client.js';
 import { realMintRoutingClient, realSetRepoSecret } from '../bootstrap/apply-routing-client.js';
+import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
 import { readVault, vaultAgentPrivateKeyPem } from '../bootstrap/vault-read.js';
 import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
@@ -452,16 +454,20 @@ const REAL_AGENT_REPO_DEPS: AgentRepoDeps = {
  * real CA-ceremony + two-place-publish + routing-var deps. Every
  * presence-check function here is the SAME one `observer.ts`'s plan-time
  * reads already use (`checkRegistryVariablePresence` / `readRegistryVariable`
- * / `checkRepoVariablePresence`) — plan and apply agree on what "present"
- * means at the exact same call sites, by construction, not by convention.
+ * / `checkRepoVariablePresence` / `checkRunnerRegistered`) — plan and apply
+ * agree on what "present"/"registered" means at the exact same call sites,
+ * by construction, not by convention. `checkRunnerRegistered` (macf#922) is
+ * the register-before-route gate `apply-routing.ts::publishTrustedActors`
+ * checks per-repo before every write.
  */
-const REAL_TRUST_DEPS: CaApplyDeps = {
+const REAL_TRUST_DEPS: CaApplyDeps & RunnerRegistrationDeps = {
   checkRegistryPresence: checkRegistryVariablePresence,
   readRegistryVariable,
   createRegistryVariable: realCreateRegistryVariable,
   checkRepoPresence: checkRepoVariablePresence,
   createRepoVariable: realCreateRepoVariable,
   mintCa: realMintCa,
+  checkRunnerRegistered,
 };
 
 /**
@@ -686,11 +692,11 @@ function caSummaryLines(result: FleetApplyResult): string[] {
   return lines;
 }
 
-/** `MACF_ROUTING_RUNS_ON` per-repo render (macf#838 Amendment D phase 2). Empty when `routing.runner` wasn't declared. */
+/** `MACF_TRUSTED_ACTORS` per-repo render (macf#838 Amendment D phase 2; corrected target macf#922). Empty when `routing.runner` wasn't declared, or its `runs_on` isn't `"self-hosted"`. A `'skipped'` leg (rendered via `formatVariableLegLine`'s reason suffix) means the register-before-route gate blocked the write — visible here even under `--yes`, which skips the pre-approval plan render entirely. */
 function routingSummaryLines(result: FleetApplyResult): string[] {
   const entries = Object.entries(result.routing);
   if (entries.length === 0) return [];
-  const lines = ['Routing (MACF_ROUTING_RUNS_ON):'];
+  const lines = ['Routing (MACF_TRUSTED_ACTORS):'];
   for (const [repo, leg] of entries) lines.push(formatVariableLegLine(repo, leg));
   return lines;
 }

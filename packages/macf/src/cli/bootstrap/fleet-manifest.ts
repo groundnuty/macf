@@ -347,6 +347,31 @@ export function deriveAppHandle(fleetName: string, role: string): string {
 }
 
 /**
+ * Compute the `MACF_TRUSTED_ACTORS` value for a fleet — every declared
+ * agent's bot login, space-joined (macf#922). **Every entry carries the
+ * `[bot]` suffix** — this is NOT {@link deriveAppHandle}'s bare handle.
+ * `macf-actions`' `agent-router.yml` `pick-runner` job compares entries
+ * DIRECTLY against `github.actor` with no in-workflow suffix append
+ * (`[ "$a" = "$ACTOR" ]`; contrast the router's OTHER `${APP_NAME}[bot]`-
+ * constructing comparisons elsewhere in the same file), and `github.actor`
+ * for a GitHub-App-authored event IS `<app-slug>[bot]` — confirmed against a
+ * real operator-run example in `macf-devops-toolkit/runner/RUNNER.md`
+ * §"The security model" (`gh variable set MACF_TRUSTED_ACTORS --body
+ * 'groundnuty macf-code-agent[bot] macf-science-agent[bot] ...'`) and this
+ * repo's own `repo-init.ts` comment ("app_name is the GitHub App handle used
+ * by the router to resolve mention/review participants (`${app_name}[bot]`)").
+ *
+ * **Space-separated — NOT comma, NOT JSON.** RUNNER.md is explicit: a JSON
+ * array "silently fails to match (splits into bracket/quote tokens) →
+ * everything routes github-hosted + the self-hosted runner sits idle." The
+ * router's own split (`${TRUSTED_ACTORS//,/ }`) tolerates commas too, but
+ * space matches the documented operator convention.
+ */
+export function buildTrustedActorsValue(fleetName: string, agents: readonly FleetAgent[]): string {
+  return agents.map((agent) => `${deriveAppHandle(fleetName, agent.role)}[bot]`).join(' ');
+}
+
+/**
  * Derive a fleet's control-plane repo NAME (bare, no `owner/` prefix — same
  * convention as {@link deriveAppHandle}'s bare handle) from `metadata.name`
  * — DR-043 Amendment F. **Derived, never registry-pointed, never a manifest

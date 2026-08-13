@@ -26,6 +26,7 @@ import type { ControlRepoDeps } from '../../../src/cli/bootstrap/control-repo.js
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
+import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
 import { applyExitCode, fleetApplyResultToJson, formatApplyResult } from '../../../src/cli/commands/bootstrap-apply.js';
 
 // Default mirrors the §D5 multi-recipient shape (operator key + VM key,
@@ -91,7 +92,14 @@ function agentRepoDepsFor(): AgentRepoDeps {
  */
 const SENTINEL_CA_KEY_PEM = 'SENTINEL-CA-KEY-PEM';
 const SENTINEL_CA_CERT_PEM = 'SENTINEL-CA-CERT-PEM';
-function trustDepsFor(overrides: Partial<CaApplyDeps> = {}): CaApplyDeps {
+/**
+ * `checkRunnerRegistered` defaults to `'present'` (macf#922) — every
+ * PRE-EXISTING fixture in this file that relies on `trustDepsFor()`'s
+ * default to exercise the routing-var WRITE path (not the register-before-
+ * route gate specifically) keeps doing so unchanged; the dedicated
+ * register-before-route tests below override it explicitly.
+ */
+function trustDepsFor(overrides: Partial<CaApplyDeps & RunnerRegistrationDeps> = {}): CaApplyDeps & RunnerRegistrationDeps {
   return {
     checkRegistryPresence: async () => 'absent',
     readRegistryVariable: async () => undefined,
@@ -99,6 +107,7 @@ function trustDepsFor(overrides: Partial<CaApplyDeps> = {}): CaApplyDeps {
     checkRepoPresence: async () => 'absent',
     createRepoVariable: async () => 'created',
     mintCa: async () => ({ certPem: SENTINEL_CA_CERT_PEM, keyPem: SENTINEL_CA_KEY_PEM }),
+    checkRunnerRegistered: async () => 'present',
     ...overrides,
   };
 }
@@ -895,7 +904,7 @@ trust:
         calls.push(`repo:create:${repo}`);
       },
     };
-    const trustDeps: CaApplyDeps = {
+    const trustDeps: CaApplyDeps & RunnerRegistrationDeps = {
       ...trustDepsFor(),
       checkRegistryPresence: async () => {
         calls.push('ca:checkRegistryPresence');
@@ -1054,6 +1063,9 @@ trust:
         mintCa: async () => {
           throw new Error('must not be called — foreign control repo, CA is never minted');
         },
+        checkRunnerRegistered: async () => {
+          throw new Error('must not be called');
+        },
       },
       routingClientDeps: {
         mint: async () => {
@@ -1195,7 +1207,7 @@ trust:
 
   // --- DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) ---
 
-  describe('CA ceremony + two-place publish + MACF_ROUTING_RUNS_ON', () => {
+  describe('CA ceremony + two-place publish + MACF_TRUSTED_ACTORS (macf#922 — was MACF_ROUTING_RUNS_ON)', () => {
     it('fresh mint: publishes to the registry + BOTH agent repos, stages the key for the vault, never a raw key value on any leg outcome', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
@@ -1373,7 +1385,7 @@ trust:
       expect(result.ca.registryLeg).toMatchObject({ reason: expect.stringContaining('race') });
     });
 
-    it('routing.runner declared -> writes MACF_ROUTING_RUNS_ON to every confirmed agent repo, never the control repo', async () => {
+    it('routing.runner declared self-hosted -> writes MACF_TRUSTED_ACTORS to every confirmed agent repo, never the control repo', async () => {
       const manifestPath = manifestPathIn();
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
       const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
@@ -1395,7 +1407,7 @@ trust:
           createRepoVariable: async (_repo, name) => {
             // Only the CA leg should ever call this — routing must never
             // fire when `routing.runner` isn't declared.
-            expect(name).not.toBe('MACF_ROUTING_RUNS_ON');
+            expect(name).not.toBe('MACF_TRUSTED_ACTORS');
             createRepoVarCalled += 1;
             return 'created';
           },
@@ -1407,18 +1419,81 @@ trust:
       expect(createRepoVarCalled).toBeGreaterThan(0); // the CA leg DID fire — proves the fake wasn't just unreachable
     });
 
+    // macf#922 — a declared runs_on other than "self-hosted" needs no write
+    // at all (matches plan.ts::routingItem's own noop branch).
+    it('routing.runner declared with runs_on OTHER than "self-hosted" -> the routing map is empty, nothing attempted', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'ubuntu-latest' } } };
+      let createRepoVarCalled = 0;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          createRepoVariable: async (_repo, name) => {
+            expect(name).not.toBe('MACF_TRUSTED_ACTORS');
+            createRepoVarCalled += 1;
+            return 'created';
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing).toEqual({});
+      expect(createRepoVarCalled).toBeGreaterThan(0); // the CA leg DID fire
+    });
+
     it('routing: a repo where the var is ALREADY PRESENT is left untouched (create-only)', async () => {
       const manifestPath = manifestPathIn();
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         trustDeps: trustDepsFor({
-          checkRepoPresence: async (_repo, name) => (name === 'MACF_ROUTING_RUNS_ON' ? 'present' : 'absent'),
+          checkRepoPresence: async (_repo, name) => (name === 'MACF_TRUSTED_ACTORS' ? 'present' : 'absent'),
         }),
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
       expect(result.routing['groundnuty/demo-code']).toEqual({ status: 'already-present' });
+    });
+
+    // --- macf#922 requirement 3 — register-before-route gate ---
+
+    it('no runner registered -> MACF_TRUSTED_ACTORS is NOT written for that repo; the gap is reported as "skipped" with a reason, never silent', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({ checkRunnerRegistered: async () => 'absent' }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
+      const leg = result.routing['groundnuty/demo-code'];
+      expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/no self-hosted runner is confirmed registered/);
+    });
+
+    it('runner registration UNKNOWN -> ALSO refuses the write (honest-unknown, never treated as present)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({ checkRunnerRegistered: async () => 'unknown' }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
+    });
+
+    it('this gap surfaces through formatApplyResult\'s routing summary — visible even under --yes, which skips the pre-approval plan render', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({ checkRunnerRegistered: async () => 'absent' }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+      const rendered = formatApplyResult(result);
+
+      expect(rendered).toMatch(/groundnuty\/demo-code: SKIPPED — no self-hosted runner is confirmed registered/);
     });
 
     it('CA + routing legs are skipped for an agent whose repo-ensure FAILED this run — nothing is written to a repo that does not exist', async () => {
