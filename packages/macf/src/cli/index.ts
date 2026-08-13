@@ -677,6 +677,13 @@ bootstrap
       'Operator-privileged use only; omit for the vault-free default.',
   )
   .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
+  .option(
+    '--runner-token <token>',
+    'GitHub Actions runner-registration token (macf#929) — required when routing.runner declares ' +
+      'runs_on: "self-hosted"; licenses apply to POLL for a usable self-hosted runner before writing ' +
+      'MACF_TRUSTED_ACTORS (never substitutes for that live check). Falls back to MACF_BOOTSTRAP_RUNNER_TOKEN ' +
+      'when unset. Get one with: gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token',
+  )
   .action(async (opts) => {
     const code = await runBootstrapApply({
       file: opts.file,
@@ -685,6 +692,7 @@ bootstrap
       json: opts.json,
       vaultPath: opts.vault,
       identityKeyPath: opts.identityKey,
+      runnerToken: opts.runnerToken,
     });
     process.exitCode = code;
   });

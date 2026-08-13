@@ -57,9 +57,27 @@
  * (still `confirm_required: true`) but left un-actioned by `apply` — see
  * `plan.ts::planItemApplyCoverage`'s routing case for why `update` stays
  * `not_implemented` while `create` joins the implemented group.
+ *
+ * **`--runner-token` — token = POLICY, detection = TIMING (macf#929).**
+ * macf#922/#924 left the register-before-route gate as a single point-in-time
+ * check (`publishTrustedActors`, above): usable NOW or refuse. That is
+ * correct as far as it goes, but forces a two-command choreography when an
+ * operator is registering a runner IN THE SAME breath as running `apply`
+ * (register, THEN re-run apply once it shows up). `publishTrustedActorsGated`
+ * (the NEW production entrypoint `apply-fleet.ts` actually calls) splits the
+ * gate: a `--runner-token`/`MACF_BOOTSTRAP_RUNNER_TOKEN` value is a POLICY
+ * precondition — declaring `routing.runner` self-hosted with no token
+ * supplied REFUSES outright, `'failed'`, before any live check, same posture
+ * as an unconfigured `transport.age_recipients` refusing before consent
+ * gate 1 (Amendment C). A supplied token does NOT license the write by
+ * itself — detection is untouched, still `checkRunnerUsableByRepo` exactly
+ * as macf#927 left it — it licenses `apply` to POLL for usability across a
+ * bounded deploy window instead of checking once, so the common "register a
+ * runner, then apply" case is one command. See
+ * {@link publishTrustedActorsGated}'s doc for the full mechanics.
  */
 import type { EnsureVariableOutcome } from './ensure-variable.js';
-import { ensureVariableCreated } from './ensure-variable.js';
+import { ensureVariableCreated, failedOutcomesFor } from './ensure-variable.js';
 import type { CaApplyDeps } from './apply-ca.js';
 import type { RunnerUsability } from './observer.js';
 
@@ -111,12 +129,35 @@ export function noRunnerRegisteredReason(repo: string, usability: RunnerUsabilit
   );
 }
 
+/** The single per-repo create-only write, shared by {@link publishTrustedActors} (single-check, macf#922/#924) AND {@link publishTrustedActorsGated} (token-gated + polled, macf#929) — a repo that reaches this point has ALREADY been confirmed usable by whichever caller invoked it. Extracted so the real write primitives (`checkRepoPresence`/`createRepoVariable`) stay reachable from the ACTUAL production entrypoint (`publishTrustedActorsGated`, wired at `apply-fleet.ts`'s call site) rather than only from `publishTrustedActors`, which macf#929 demotes to a direct-unit-tested building block — see that function's doc. */
+function writeTrustedActorsVar(repo: string, value: string, deps: RoutingApplyDeps): Promise<EnsureVariableOutcome> {
+  return ensureVariableCreated(
+    {
+      checkPresence: () => deps.checkRepoPresence(repo, TRUSTED_ACTORS_VAR),
+      create: () => deps.createRepoVariable(repo, TRUSTED_ACTORS_VAR, value),
+    },
+    `trusted-actors var "${TRUSTED_ACTORS_VAR}" on "${repo}"`,
+  );
+}
+
 /**
  * Create-only write of `MACF_TRUSTED_ACTORS=<value>` to every repo in
  * `repos` (already-ensured agent repos — see module doc), gated per-repo on
- * a confirmed-registered-and-usable self-hosted runner. NEVER throws; a
- * per-repo failure (including a throwing `checkRunnerUsableByRepo`) is
- * isolated to that repo's entry in the returned map.
+ * a confirmed-registered-and-usable self-hosted runner via ONE live check
+ * (never throws; a per-repo failure, including a throwing
+ * `checkRunnerUsableByRepo`, is isolated to that repo's entry in the
+ * returned map).
+ *
+ * **Superseded as the production entrypoint by {@link publishTrustedActorsGated}
+ * (macf#929).** `apply-fleet.ts` now calls the gated function, which adds the
+ * `--runner-token` policy gate + bounded poll ON TOP of this function's
+ * single-check shape — see that function's doc for the full split. This
+ * function is retained, UNCHANGED, as (a) the direct-unit-tested single-check
+ * building block `apply-routing.test.ts` pins byte-for-byte, and (b) a
+ * reusable primitive for any future caller that legitimately wants a
+ * one-shot check with no token/poll semantics. It is not dead code merely
+ * because it moved off the `apply` call site — `writeTrustedActorsVar` keeps
+ * its write primitives on the SAME path `publishTrustedActorsGated` uses.
  */
 export async function publishTrustedActors(
   value: string,
@@ -136,13 +177,183 @@ export async function publishTrustedActors(
       out[repo] = { status: 'skipped', reason: noRunnerRegisteredReason(repo, usability) };
       continue;
     }
-    out[repo] = await ensureVariableCreated(
-      {
-        checkPresence: () => deps.checkRepoPresence(repo, TRUSTED_ACTORS_VAR),
-        create: () => deps.createRepoVariable(repo, TRUSTED_ACTORS_VAR, value),
-      },
-      `trusted-actors var "${TRUSTED_ACTORS_VAR}" on "${repo}"`,
-    );
+    out[repo] = await writeTrustedActorsVar(repo, value, deps);
+  }
+  return out;
+}
+
+// --- macf#929 — token = POLICY, detection = TIMING ---
+
+/** CLI flag naming the runner-registration-token gate (macf#929) — echoed ONLY by name in refusal messages, never the token value. */
+export const RUNNER_TOKEN_FLAG = '--runner-token';
+/** Env-var form of the same flag, matching this CLI's `MACF_BOOTSTRAP_<THING>` convention (see `commands/bootstrap-apply.ts`'s `MACF_BOOTSTRAP_VAULT_VERSION` precedent). */
+export const RUNNER_TOKEN_ENV_VAR = 'MACF_BOOTSTRAP_RUNNER_TOKEN';
+
+/**
+ * The refusal `apply` shows when `manifest.routing.runner` is declared
+ * `runs_on: "self-hosted"` (DR-043 Amendment H) but no runner-registration
+ * token was supplied via {@link RUNNER_TOKEN_FLAG} / {@link RUNNER_TOKEN_ENV_VAR}
+ * (macf#929). ONE reason for every repo — same shape as
+ * `apply-ca.ts::skippedCaPublish`'s single-reason-for-all-legs precedent —
+ * because the refusal is a manifest-level policy gate, not a per-repo
+ * detection result. Never names a repo (nothing repo-specific to say) and
+ * never echoes the token value (there is none to echo — this fires
+ * precisely because the token is ABSENT).
+ *
+ * `'failed'`, not `'skipped'` (see `ensure-variable.ts::failedOutcomesFor`'s
+ * doc): this is a REFUSAL the operator must act on, same posture as
+ * `apply-fleet.ts::noRecipientPreflightFailure`'s unconfigured-age-recipient
+ * pre-flight — both fire BEFORE any live check, both fail the run
+ * (`commands/bootstrap-apply.ts::applyExitCode`'s `routingBad` only counts
+ * `'failed'` legs), unlike an ordinary "checked and not yet usable" skip.
+ */
+export function noRunnerTokenReason(): string {
+  return (
+    'manifest declares routing.runner (runs_on: "self-hosted", DR-043 Amendment H) but no runner registration ' +
+    'token was supplied — refusing to write MACF_TRUSTED_ACTORS to any repo before a runner can be confirmed ' +
+    '(same posture as an unconfigured transport.age_recipients refusing before consent gate 1: writing trust ' +
+    'ahead of a confirmable runner would route jobs at a self-hosted queue nothing may ever service). Supply ' +
+    `one via ${RUNNER_TOKEN_FLAG} <token> (or the ${RUNNER_TOKEN_ENV_VAR} env var). Obtain a fresh registration ` +
+    'token with: gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token'
+  );
+}
+
+/**
+ * The `'skipped'` (not `'failed'` — see {@link noRunnerTokenReason}'s doc for
+ * the exit-code-relevant distinction) reason when a runner-registration
+ * token WAS supplied but {@link pollForUsableRunner}'s bounded window expired
+ * before `repo` became usable (macf#929 requirement 6) — an honest
+ * incomplete, not a policy refusal: the operator declared intent AND gave
+ * `apply` a way to wait, but the runner genuinely hasn't shown up yet.
+ * Extends `noRunnerRegisteredReason`'s absent/unknown honest-unknown
+ * discrimination + macf#924's org-admin handover verbatim-append (both
+ * still apply — polling doesn't change WHY a runner is unusable, only
+ * WHETHER `apply` waited for it) with the token-specific framing + the
+ * concrete re-run remedy.
+ */
+export function runnerTokenPollExhaustedReason(repo: string, usability: RunnerUsability, timeoutMs: number): string {
+  const cause =
+    usability.presence === 'unknown'
+      ? 'could not confirm whether a self-hosted runner is registered (auth / network / insufficient scope)'
+      : 'no usable self-hosted runner became visible';
+  const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
+  return (
+    `role/repo "${repo}": a runner registration token was supplied (macf#929) but ${cause} within the ` +
+    `${String(Math.round(timeoutMs / 1000))}s poll window — MACF_TRUSTED_ACTORS was NOT written; this repo ` +
+    'routes on hosted runners (billed on private repos) until a runner is confirmed. Re-run `macf bootstrap ' +
+    `apply\` once it is registered.${handoverSuffix}`
+  );
+}
+
+/** Bounded-poll options for {@link pollForUsableRunner} / {@link publishTrustedActorsGated} — mirrors `identity-confirm.ts::WaitForAppInstallationOptions`'s `timeoutMs`/`pollIntervalMs` pair (macf#929: "reuse the shape," not a new polling pattern). */
+export interface RunnerTokenPollOptions {
+  /** Overall budget for THIS poll call. Default 10 min — same default `waitForAppInstallation` uses for its own consent-gate-2 deploy window. */
+  readonly timeoutMs?: number;
+  /** Delay between polls. Default 3s — same default `waitForAppInstallation` uses. */
+  readonly pollIntervalMs?: number;
+}
+
+/** Default poll budget for a single repo when {@link publishTrustedActorsGated} doesn't override it — see {@link RunnerTokenPollOptions}'s doc. */
+export const DEFAULT_RUNNER_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+/** Default poll interval — see {@link RunnerTokenPollOptions}'s doc. */
+export const DEFAULT_RUNNER_POLL_INTERVAL_MS = 3_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/**
+ * Poll `checkRunnerUsableByRepo(repo)` until it reports `presence: 'present'`
+ * or `timeoutMs` elapses — the SAME shape `identity-confirm.ts::waitForAppInstallation`
+ * uses for consent gate 2 (check immediately, then on `pollIntervalMs`,
+ * NEVER busy-spin; macf#929 deliberately reuses this shape rather than
+ * inventing a new one).
+ *
+ * **Unlike `waitForAppInstallation`, this NEVER throws on timeout** — it
+ * returns the LAST observed `RunnerUsability` instead. `checkRunnerUsableByRepo`
+ * itself is documented NEVER-throws (`observer.ts`'s doc); a caller-supplied
+ * fake that throws anyway propagates here uncaught, matching
+ * `publishTrustedActors`'s existing "a throwing check is a wiring bug,
+ * `'failed'`, never `'skipped'`" contract — `publishTrustedActorsGated`
+ * catches it at the call site, exactly where `publishTrustedActors` does.
+ */
+export async function pollForUsableRunner(
+  repo: string,
+  checkRunnerUsableByRepo: (repo: string) => Promise<RunnerUsability>,
+  opts: RunnerTokenPollOptions = {},
+): Promise<RunnerUsability> {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_RUNNER_POLL_TIMEOUT_MS;
+  const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_RUNNER_POLL_INTERVAL_MS;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const usability = await checkRunnerUsableByRepo(repo);
+    if (usability.presence === 'present') return usability;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return usability;
+    await sleep(Math.min(pollIntervalMs, remaining));
+  }
+}
+
+/**
+ * The macf#929 production entrypoint — `apply-fleet.ts`'s ACTUAL call site
+ * (supersedes `publishTrustedActors`, see that function's doc). Splits the
+ * register-before-route gate into a POLICY half and a TIMING half:
+ *
+ * - **POLICY (`runnerToken`):** `undefined`/empty → refuse EVERY repo in
+ *   `repos` outright, `'failed'`, ZERO I/O (`checkRunnerUsableByRepo` is
+ *   never called — see {@link noRunnerTokenReason}'s doc for why this is
+ *   unconditional: a supplied token is required whenever `routing.runner`
+ *   is declared self-hosted, independent of whether a runner ALREADY
+ *   happens to be usable this instant — same "declared intent requires the
+ *   matching precondition, regardless of current state" posture Amendment C
+ *   applies to `age_recipients`). The token itself is NEVER read past this
+ *   presence check — it licenses ATTEMPTING detection, never substitutes
+ *   for it (macf#929 requirement 4: "detection stays exactly as macf#927
+ *   left it").
+ * - **TIMING (poll):** token present → bound ONE shared deadline across ALL
+ *   of `repos` (computed once, `Math.max(0, deadline - now)` threaded into
+ *   each repo's {@link pollForUsableRunner} call) rather than a fresh full
+ *   budget per repo — a fleet that never confirms costs one window total,
+ *   not `repos.length` windows. A repo confirmed usable is written via
+ *   {@link writeTrustedActorsVar}; a repo whose poll expires unconfirmed is
+ *   `'skipped'` with {@link runnerTokenPollExhaustedReason} (honest
+ *   incomplete, does NOT fail the run); a throwing check is `'failed'`
+ *   (wiring bug, isolated to that repo — mirrors `publishTrustedActors`).
+ *
+ * NEVER throws.
+ */
+export async function publishTrustedActorsGated(
+  value: string,
+  repos: readonly string[],
+  deps: RoutingApplyDeps,
+  runnerToken: string | undefined,
+  pollOptions: RunnerTokenPollOptions = {},
+): Promise<Readonly<Record<string, EnsureVariableOutcome>>> {
+  if (runnerToken === undefined || runnerToken.length === 0) {
+    return failedOutcomesFor(repos, noRunnerTokenReason());
+  }
+
+  const timeoutMs = pollOptions.timeoutMs ?? DEFAULT_RUNNER_POLL_TIMEOUT_MS;
+  const pollIntervalMs = pollOptions.pollIntervalMs ?? DEFAULT_RUNNER_POLL_INTERVAL_MS;
+  const deadline = Date.now() + timeoutMs;
+
+  const out: Record<string, EnsureVariableOutcome> = {};
+  for (const repo of repos) {
+    const remaining = Math.max(0, deadline - Date.now());
+    let usability: RunnerUsability;
+    try {
+      usability = await pollForUsableRunner(repo, deps.checkRunnerUsableByRepo, { timeoutMs: remaining, pollIntervalMs });
+    } catch (err) {
+      out[repo] = { status: 'failed', reason: `runner-usability check threw for "${repo}" — ${errMessage(err)}` };
+      continue;
+    }
+    if (usability.presence !== 'present') {
+      out[repo] = { status: 'skipped', reason: runnerTokenPollExhaustedReason(repo, usability, timeoutMs) };
+      continue;
+    }
+    out[repo] = await writeTrustedActorsVar(repo, value, deps);
   }
   return out;
 }

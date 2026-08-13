@@ -295,6 +295,17 @@ const SENTINEL_CA_CERT_PEM = 'SENTINEL-CA-CERT-PEM';
 const SENTINEL_VAULT_PEM = '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-VAULT-PEM-BYTES\n-----END RSA PRIVATE KEY-----\n';
 
 /**
+ * macf#929 — `fakeMutateDeps`'s default `runnerToken`. `fakeTrustDeps`'s own
+ * default already reports `checkRunnerUsableByRepo` as `'present'`, so this
+ * sentinel exists ONLY to satisfy the new POLICY precondition
+ * (`publishTrustedActorsGated` refuses outright with no token, independent of
+ * live usability) — every pre-existing "routing var gets written" fixture in
+ * this file keeps exercising the write path unchanged. Tests exercising the
+ * no-token refusal itself override this to `undefined` explicitly.
+ */
+const SENTINEL_RUNNER_TOKEN = 'SENTINEL-RUNNER-TOKEN';
+
+/**
  * Default fake `CaApplyDeps & RunnerRegistrationDeps` (macf#838 Amendment D
  * phase 2; `checkRunnerUsableByRepo` added macf#922, org-scope-corrected +
  * renamed macf#924) — everything absent, except a runner IS confirmed
@@ -381,6 +392,7 @@ function fakeMutateDeps(manifestPath: string, overrides: Partial<MutateApplyDeps
     log: () => {},
     confirmPlan: async () => true,
     readPriorLock: () => null,
+    runnerToken: SENTINEL_RUNNER_TOKEN,
     ...overrides,
   };
 }
@@ -625,6 +637,27 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     // this only pins that the redacted `resolve.certFingerprint` (a SHA-256
     // hex digest) shows up instead of the raw PEM text.
     expect(all).not.toContain(SENTINEL_CA_CERT_PEM);
+  });
+
+  it('macf#929: the --runner-token value NEVER appears in captured stdout/stderr across a full run (text AND --json), even though it gates + is consumed by a real routing.runner: self-hosted write', async () => {
+    const RUNNER_TOKEN_SECRET = 'ghr-SENTINEL-929-CLI-TOKEN-MUST-NEVER-LEAK';
+    for (const json of [false, true]) {
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply(
+        { file, yes: true, json },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) }, // no drift here -> routing takes the create path, exercising the write
+        fakeMutateDeps(file, { runnerToken: RUNNER_TOKEN_SECRET }),
+      );
+      expect(code).toBe(0);
+    }
+    const all = [...logs, ...errs].join('\n');
+    expect(all).not.toContain(RUNNER_TOKEN_SECRET);
+    // The FLAG/ENV-VAR NAMES are fine to appear (they're what a refusal
+    // names) — only the token VALUE must never leak. Belt-and-suspenders:
+    // this run's runner IS confirmed usable (fakeTrustDeps' default), so it
+    // never even hits the refusal/poll-exhausted text paths — this test
+    // pins the WRITE path specifically.
+    expect(all).toMatch(/Routing \(MACF_TRUSTED_ACTORS\):/);
   });
 
   // --- macf#854: apply must not overstate what it did — the final summary

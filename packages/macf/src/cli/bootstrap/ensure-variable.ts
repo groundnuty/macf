@@ -80,3 +80,21 @@ export function skippedOutcomesFor(repos: readonly string[], reason: string): Re
   for (const repo of repos) out[repo] = { status: 'skipped', reason };
   return out;
 }
+
+/**
+ * A uniform `'failed'` outcome for every entry in `repos` — the `'failed'`
+ * sibling of {@link skippedOutcomesFor}, for a write that was REFUSED
+ * outright (a policy precondition wasn't met — e.g. `apply-routing.ts`'s
+ * `noRunnerTokenReason`, macf#929) rather than merely "not determined yet."
+ * The distinction matters at the exit-code boundary
+ * (`commands/bootstrap-apply.ts::applyExitCode`): a `'skipped'` leg is an
+ * honest incomplete that does NOT fail the run (mirrors an ordinary
+ * register-before-route gap); a `'failed'` leg DOES — same posture as
+ * `apply-fleet.ts::noRecipientPreflightFailure`'s pre-flight refusal, which
+ * also resolves to `'failed'`, never `'skipped'`. Pure.
+ */
+export function failedOutcomesFor(repos: readonly string[], reason: string): Readonly<Record<string, EnsureVariableOutcome>> {
+  const out: Record<string, EnsureVariableOutcome> = {};
+  for (const repo of repos) out[repo] = { status: 'failed', reason };
+  return out;
+}

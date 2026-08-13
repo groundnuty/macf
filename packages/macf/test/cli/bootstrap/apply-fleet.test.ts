@@ -93,6 +93,16 @@ function agentRepoDepsFor(): AgentRepoDeps {
 const SENTINEL_CA_KEY_PEM = 'SENTINEL-CA-KEY-PEM';
 const SENTINEL_CA_CERT_PEM = 'SENTINEL-CA-CERT-PEM';
 /**
+ * macf#929 — `baseDeps`'s default `runnerToken`. `trustDepsFor()`'s own
+ * default already reports `checkRunnerUsableByRepo` as `'present'`, so this
+ * sentinel exists ONLY to satisfy the NEW POLICY precondition
+ * (`publishTrustedActorsGated` refuses outright with no token, independent of
+ * live usability) — every pre-existing "routing var gets written" fixture in
+ * this file keeps exercising the write path unchanged. The dedicated
+ * no-token-refuses test below overrides this to `undefined` explicitly.
+ */
+const SENTINEL_RUNNER_TOKEN = 'SENTINEL-RUNNER-TOKEN';
+/**
  * `checkRunnerUsableByRepo` defaults to `{ presence: 'present' }` (macf#922,
  * org-scope-corrected by macf#924) — every PRE-EXISTING fixture in this file
  * that relies on `trustDepsFor()`'s default to exercise the routing-var
@@ -276,6 +286,7 @@ describe('applyFleet', () => {
       controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
+      runnerToken: SENTINEL_RUNNER_TOKEN,
     };
   }
 
@@ -1458,18 +1469,19 @@ trust:
 
     // --- macf#922 requirement 3 — register-before-route gate ---
 
-    it('no runner registered -> MACF_TRUSTED_ACTORS is NOT written for that repo; the gap is reported as "skipped" with a reason, never silent', async () => {
+    it('token supplied, runner never appears within the poll window -> MACF_TRUSTED_ACTORS is NOT written for that repo; the gap is reported as "skipped" with a reason, never silent (macf#929: timeoutMs 0 makes the poll a single check — no real wall-clock wait)', async () => {
       const manifestPath = manifestPathIn();
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+        runnerTokenPollOptions: { timeoutMs: 0 },
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
       expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
       const leg = result.routing['groundnuty/demo-code'];
-      expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/no self-hosted runner is confirmed registered/);
+      expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/no usable self-hosted runner became visible/);
     });
 
     it('runner registration UNKNOWN -> ALSO refuses the write (honest-unknown, never treated as present)', async () => {
@@ -1478,6 +1490,7 @@ trust:
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'unknown' }) }),
+        runnerTokenPollOptions: { timeoutMs: 0 },
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
@@ -1490,11 +1503,13 @@ trust:
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+        runnerTokenPollOptions: { timeoutMs: 0 },
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
       const rendered = formatApplyResult(result);
 
-      expect(rendered).toMatch(/groundnuty\/demo-code: SKIPPED — no self-hosted runner is confirmed registered/);
+      expect(rendered).toContain('groundnuty/demo-code: SKIPPED —');
+      expect(rendered).toContain('no usable self-hosted runner became visible');
     });
 
     // --- macf#924 — the org-admin handover survives end-to-end into the rendered report ---
@@ -1514,11 +1529,13 @@ trust:
               'that step itself (org-admin action; macf#924).',
           }),
         }),
+        runnerTokenPollOptions: { timeoutMs: 0 },
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
       const rendered = formatApplyResult(result);
 
-      expect(rendered).toMatch(/groundnuty\/demo-code: SKIPPED — no self-hosted runner is confirmed registered/);
+      expect(rendered).toContain('groundnuty/demo-code: SKIPPED —');
+      expect(rendered).toContain('no usable self-hosted runner became visible');
       expect(rendered).toContain('an org admin must add this repo at');
       expect(rendered).toContain('runner-groups/7');
     });
@@ -1542,6 +1559,117 @@ trust:
       // science-agent's repo WAS ensured — its legs still ran.
       expect(result.ca.repoLegs['groundnuty/demo-science']).toEqual({ status: 'created' });
       expect(result.routing['groundnuty/demo-science']).toEqual({ status: 'created' });
+    });
+
+    // --- macf#929 — the runner-token gate itself, wired end-to-end through applyFleet ---
+
+    it('macf#929: no runner-token supplied -> refuses EVERY confirmed repo outright ("failed", not "skipped") BEFORE any live runner check', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      let checkRunnerCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => { checkRunnerCalled = true; return { presence: 'present' }; } }),
+        runnerToken: undefined,
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing['groundnuty/demo-code']?.status).toBe('failed');
+      expect(result.routing['groundnuty/demo-science']?.status).toBe('failed');
+      const leg = result.routing['groundnuty/demo-code'];
+      const reason = leg && 'reason' in leg ? leg.reason : undefined;
+      expect(reason).toContain('--runner-token');
+      expect(reason).toContain('MACF_BOOTSTRAP_RUNNER_TOKEN');
+      expect(reason).toContain('gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token');
+      // ZERO I/O — the POLICY gate fires before any live runner-usability
+      // check is ever attempted (macf#929: "the token licenses ATTEMPTING
+      // detection, never substitutes for it" — but absence of a token means
+      // detection is never even reached).
+      expect(checkRunnerCalled).toBe(false);
+    });
+
+    it('macf#929: token supplied but the runner never appears within the poll window -> a SEPARATE, more specific reason than the no-token refusal, and the write seam is never invoked', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      let createRepoVarCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRunnerUsableByRepo: async () => ({ presence: 'absent' }),
+          createRepoVariable: async (_repo, name) => {
+            if (name === 'MACF_TRUSTED_ACTORS') createRepoVarCalled = true;
+            return 'created';
+          },
+        }),
+        runnerTokenPollOptions: { timeoutMs: 0 },
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing['groundnuty/demo-code']).toEqual({
+        status: 'skipped',
+        reason: expect.stringContaining('a runner registration token was supplied'),
+      });
+      expect(createRepoVarCalled).toBe(false);
+    });
+
+    it('macf#929: token supplied AND the runner appears MID-WINDOW (absent, then present) -> the poll succeeds and the var is written — no real wall-clock wait (pollIntervalMs 0)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      let checkCalls = 0;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRunnerUsableByRepo: async () => {
+            checkCalls += 1;
+            return checkCalls < 3 ? { presence: 'absent' } : { presence: 'present' };
+          },
+        }),
+        runnerTokenPollOptions: { timeoutMs: 60_000, pollIntervalMs: 0 },
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing['groundnuty/demo-code']).toEqual({ status: 'created' });
+      expect(checkCalls).toBe(3);
+    });
+
+    it('macf#929: the token itself never appears in the JSON-renderable result, the fleet.lock written to disk, or the fleet.yaml committed to the control repo — refused, poll-exhausted, AND written paths all checked', async () => {
+      const SECRET = 'ghr-SENTINEL-929-TOKEN-MUST-NEVER-LEAK';
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+
+      // Path 1: poll-exhausted (token supplied, never confirmed usable) — the
+      // token licenses the ATTEMPT, but its VALUE must never appear anywhere,
+      // only the flag/env-var NAMES (see noRunnerTokenReason's doc).
+      const exhaustedManifestPath = manifestPathIn();
+      const exhausted = await applyFleet(manifest, exhaustedManifestPath, null, {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), exhaustedManifestPath),
+        trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+        runnerToken: SECRET,
+        runnerTokenPollOptions: { timeoutMs: 0 },
+      });
+      expect(exhausted.routing['groundnuty/demo-code']?.status).toBe('skipped');
+      expect(JSON.stringify(exhausted)).not.toContain(SECRET);
+      expect(readFileSync(exhausted.lockPath, 'utf-8')).not.toContain(SECRET);
+      // `manifestPath` IS the committed fleet.yaml's path here — `baseDeps`
+      // pins `controlRepoOptions.makeScratchDir` to `dirname(manifestPath)`,
+      // and `provisionControlRepo`'s CREATE path writes `fleet.yaml` into
+      // that SAME dir (see control-repo.ts's `readManifestSourceOrFallback` +
+      // its CREATE branch) — reading it back proves the ACTUAL committed
+      // bytes, not just an inspection of the code that produces them.
+      expect(readFileSync(exhaustedManifestPath, 'utf-8')).not.toContain(SECRET);
+
+      // Path 2: token supplied, runner confirmed usable, write SUCCEEDS — the
+      // happy path must ALSO never leak the token (the write's `value` arg is
+      // `buildTrustedActorsValue(...)`, never the token — this pins that by
+      // observation, not by reading the source).
+      const writtenManifestPath = manifestPathIn();
+      const written = await applyFleet(manifest, writtenManifestPath, null, {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), writtenManifestPath),
+        runnerToken: SECRET,
+      });
+      expect(written.routing['groundnuty/demo-code']).toEqual({ status: 'created' });
+      expect(JSON.stringify(written)).not.toContain(SECRET);
+      expect(readFileSync(written.lockPath, 'utf-8')).not.toContain(SECRET);
+      expect(readFileSync(writtenManifestPath, 'utf-8')).not.toContain(SECRET);
     });
   });
 
