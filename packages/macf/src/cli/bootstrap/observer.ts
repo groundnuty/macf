@@ -214,6 +214,63 @@ export async function readRegistryVariable(registry: RegistryConfig, name: strin
 }
 
 /**
+ * The macf-actions caller `uses:` reference on a repo's committed
+ * `.github/workflows/agent-router.yml` — DR-043 §D6's `versions.actions`
+ * observed-state source. Mirrors `routing-doctor-gh.ts`'s (module-private)
+ * `ACTIONS_USES_RE` of the same shape — kept as an INDEPENDENT copy rather
+ * than a shared import: that module threads a minted App-installation
+ * token per call, whereas every read in THIS file uses the bootstrap tool's
+ * ambient operator `gh` auth (this module's doc; `checkRepoExists` et al.
+ * take no token param either) — importing across that boundary would either
+ * force a token this tool doesn't mint or silently diverge from this file's
+ * "operator-privileged, GitHub-only, no App token" posture.
+ */
+const ACTIONS_USES_RE = /uses:\s*groundnuty\/macf-actions\/\.github\/workflows\/agent-router\.yml@(\S+)/;
+
+/** Decode a GitHub contents-API `.content` base64 blob (newline-wrapped). */
+function decodeGhContent(b64: string): string {
+  return Buffer.from(b64.replace(/\s+/g, ''), 'base64').toString('utf-8');
+}
+
+/**
+ * Pure regex extraction, split out from {@link readCallerActionsPin}'s `gh`
+ * shell-out specifically so it is independently unit-testable — the read
+ * itself follows this module's established "gh-shelling functions are
+ * exercised only via `computePlan`'s injected-fake `ObservedState`
+ * fixtures, not unit-tested directly" posture (see `observer.test.ts`'s doc
+ * comment). Returns `undefined` when the content has no macf-actions
+ * `uses:` line.
+ */
+export function extractActionsPin(content: string): string | undefined {
+  const m = ACTIONS_USES_RE.exec(content);
+  return m?.[1];
+}
+
+/**
+ * Best-effort read-only read of a repo's macf-actions router pin — DR-043
+ * §D6's `versions.actions` observed-state source. Returns the pin string, or
+ * `undefined` on ANY failure (file absent, no macf-actions `uses:` line,
+ * auth / network / `gh` absent) — same "collapse absent + unreadable into
+ * one signal" posture {@link readRepoVariable} already establishes for this
+ * file's other VALUE reads; a caller needing absent-vs-unreadable would need
+ * a presence-style split, which `plan.ts`'s `UNKNOWN_REASONS.actionsPin`
+ * doesn't require (both causes read as the same honest "unknown"). NEVER
+ * throws.
+ */
+export async function readCallerActionsPin(repo: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync(
+      'gh',
+      ['api', `repos/${repo}/contents/.github/workflows/agent-router.yml`, '--jq', '.content'],
+      { encoding: 'utf-8' },
+    );
+    return extractActionsPin(decodeGhContent(stdout));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * The real `FleetObserverFn`. `manifestPath` is the on-disk path to the
  * `fleet.yaml` that was parsed into `manifest` — used only to locate the
  * co-located `fleet.lock` (never re-parses the manifest itself).
@@ -256,6 +313,16 @@ export async function readRegistryVariable(registry: RegistryConfig, name: strin
  * imported from `fleet-manifest.ts`, not `controlRepoFullName` itself — see
  * `checkRepoArchivedState`'s doc for why this module can't import FROM
  * `control-repo.ts`).
+ *
+ * §D6 version steering (macf#838 follow-up) adds two per-agent reads:
+ * `deployedVersion` comes from `fleet.lock` ONLY (same "lock-or-unknown,
+ * never live" posture as App/install existence above) — see
+ * `ObservedAgentState.deployedVersion`'s doc for why this is realistically
+ * `undefined` on every fleet today (no write path populates it yet, and
+ * this Mac-side tool has no mTLS route to `/health.version`). `actionsPin`,
+ * by contrast, genuinely IS a live read — {@link readCallerActionsPin}
+ * against `agent.repo` — same "per-repo, not fleet-representative" posture
+ * the CA reads above already use, for the same #806-class reason.
  */
 export async function githubRegistryObserver(manifest: FleetManifest, manifestPath: string): Promise<ObservedState> {
   const lock = readFleetLock(manifestPath);
@@ -268,6 +335,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   for (const agent of manifest.agents) {
     const lockEntry = lock?.agents.find((a) => a.role === agent.role);
     const repo = await checkRepoExists(agent.repo);
+    const actionsPin = await readCallerActionsPin(agent.repo);
     agents[agent.role] = {
       app: lockEntry ? 'present' : 'unknown',
       appId: lockEntry?.app_id,
@@ -276,6 +344,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       repo,
       fingerprints: lockEntry?.fingerprints ?? {},
       deployedVersion: lockEntry?.deployed_version,
+      actionsPin,
     };
     caRepos[agent.repo] = await checkRepoVariablePresence(agent.repo, caVarName);
   }

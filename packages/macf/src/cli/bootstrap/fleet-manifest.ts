@@ -49,9 +49,12 @@ export const FleetMetadataSchema = z
   .strict();
 
 /**
- * GitOps steering input for `macf fleet upgrade` (DR-043 §D6). Reconciled
- * against registry-reported deployed versions — day-2 wiring (Slice 1a parses
- * this section but does not reconcile it; see `plan.ts`'s `skipped_sections`).
+ * GitOps steering input for `macf fleet upgrade` (DR-043 §D6). Reconciled by
+ * `computePlan` against `fleet.lock`'s recorded `deployed_version` (macf,
+ * per agent — honest-`unknown` when never recorded; see `plan.ts`'s
+ * `UNKNOWN_REASONS.deployedVersion`) and a live read of each agent repo's
+ * committed `agent-router.yml` `uses:@<pin>` line (actions, per repo) —
+ * see `plan.ts`'s `macfVersionItem` / `actionsVersionItem`.
  */
 export const FleetVersionsSchema = z
   .object({

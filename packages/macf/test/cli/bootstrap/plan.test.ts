@@ -300,7 +300,7 @@ describe('computePlan — deterministic ordering', () => {
 });
 
 describe('computePlan — skippedSections (declared-but-deferred sections, no silent caps)', () => {
-  it('is empty when neither collaborators nor versions is declared', () => {
+  it('is empty when collaborators is not declared', () => {
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
     expect(plan.skippedSections).toEqual([]);
   });
@@ -323,26 +323,22 @@ describe('computePlan — skippedSections (declared-but-deferred sections, no si
     expect(plan.skippedSections).toEqual([]);
   });
 
-  it('surfaces versions as SKIPPED whenever declared (object section — declared = key present)', () => {
+  // `versions` is DELIBERATELY ABSENT from this describe block as of DR-043
+  // §D6 being wired — declaring `versions:` no longer produces a
+  // skippedSections entry (it produces real `version` / `actions_pin` plan
+  // items instead; see version-steering.test.ts). This is the direct,
+  // load-bearing regression-guard for that transition: a `versions:`-bearing
+  // manifest staying OUT of `skippedSections` is exactly what "D6 is wired,
+  // not deferred" means.
+  it('does NOT surface versions as SKIPPED anymore — it produces real plan items instead', () => {
     const manifest = baseManifest({ versions: { macf: '0.2.44', actions: 'v3.4.1' } });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
-    expect(plan.skippedSections).toEqual([
-      { section: 'versions', reason: 'fleet-upgrade steering is day-2 — see #838' },
-    ]);
+    expect(plan.skippedSections).toEqual([]);
+    expect(plan.items.some((i) => i.kind === 'version')).toBe(true);
+    expect(plan.items.some((i) => i.kind === 'actions_pin')).toBe(true);
   });
 
-  it('surfaces BOTH when both are declared, collaborators first', () => {
-    const manifest = baseManifest({
-      versions: { macf: '0.2.44', actions: 'v3.4.1' },
-      collaborators: [
-        { project: 'ppam-2026', registry: { type: 'profile', user: 'groundnuty' }, ca_bundle: 'bundles/ppam.pem' },
-      ],
-    });
-    const plan = computePlan(manifest, EMPTY_OBSERVED);
-    expect(plan.skippedSections.map((s) => s.section)).toEqual(['collaborators', 'versions']);
-  });
-
-  it('formatSkippedLines renders the exact loud-line shape', () => {
+  it('formatSkippedLines renders the exact loud-line shape (collaborators only)', () => {
     const manifest = baseManifest({
       versions: { macf: '0.2.44', actions: 'v3.4.1' },
       collaborators: [
@@ -351,10 +347,7 @@ describe('computePlan — skippedSections (declared-but-deferred sections, no si
     });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const lines = formatSkippedLines(plan.skippedSections);
-    expect(lines).toEqual([
-      'collaborators: SKIPPED (reconcile not implemented in v1 — see #838 follow-ups)',
-      'versions: SKIPPED (fleet-upgrade steering is day-2 — see #838)',
-    ]);
+    expect(lines).toEqual(['collaborators: SKIPPED (reconcile not implemented in v1 — see #838 follow-ups)']);
   });
 });
 

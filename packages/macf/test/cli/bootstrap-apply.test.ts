@@ -87,6 +87,30 @@ const FLEET_YAML_WITH_ROUTING = FLEET_YAML.replace(
 );
 const OBSERVED_ROUTING_DRIFT: ObservedState = { ...EMPTY_OBSERVED, routingRunsOn: 'github-hosted' };
 
+/**
+ * DR-043 §D6 (this change) — a manifest that declares `versions:`, plus an
+ * observed state where BOTH agents' deployed macf version DIVERGES from the
+ * declared one. Same "apply cannot action this" shape as
+ * `FLEET_YAML_WITH_ROUTING` / `OBSERVED_ROUTING_DRIFT` above — apply
+ * provisions identity/repo/CA/routing wiring but never rolls fleet software
+ * (§D4); `planItemApplyCoverage`'s `'version'` case is `not_implemented`
+ * for BOTH verbs it can emit, so this fixture is the `--yes`-summary
+ * regression guard for that.
+ */
+const FLEET_YAML_WITH_VERSIONS = FLEET_YAML.replace(
+  'agents:\n',
+  'versions:\n  macf: "0.2.60"\n  actions: v3.4.1\nagents:\n',
+);
+const OBSERVED_VERSION_DRIFT: ObservedState = {
+  lock: null,
+  agents: {
+    'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, deployedVersion: '0.2.44', actionsPin: 'v3.4.1' },
+    'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, deployedVersion: '0.2.44', actionsPin: 'v3.4.1' },
+  },
+  caRegistry: 'present',
+  caRepos: {},
+};
+
 function observedWithApp(role: string): ObservedState {
   return {
     lock: null,
@@ -622,6 +646,48 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     for (const item of parsed.unimplemented_by_apply) {
       expect(item.reason.length).toBeGreaterThan(0);
     }
+  });
+
+  // --- DR-043 §D6 (this change) — versions steering. Same "the --yes
+  // summary is the ONLY place an automated run sees the gap" contract the
+  // routing tests above establish, now for a macf CLI version drift.
+
+  it('final summary (--yes, non-json) surfaces a macf version drift as NOT IMPLEMENTED BY APPLY (DR-043 §D6)', async () => {
+    const file = writeManifest(FLEET_YAML_WITH_VERSIONS);
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(OBSERVED_VERSION_DRIFT) },
+      fakeMutateDeps(file),
+    );
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
+    expect(out).toMatch(/\bversion:.*\(update\)/);
+    // The fixture's `actionsPin` already matches the declared "v3.4.1" —
+    // only the `version` kind should surface here, never `actions_pin`.
+    expect(out).not.toMatch(/\bactions_pin:/);
+  });
+
+  it('final summary (--yes, --json) carries the version-drift items with the `macf fleet upgrade` remedy named in each reason', async () => {
+    const file = writeManifest(FLEET_YAML_WITH_VERSIONS);
+    const code = await runBootstrapApply(
+      { file, yes: true, json: true },
+      { observe: () => Promise.resolve(OBSERVED_VERSION_DRIFT) },
+      fakeMutateDeps(file),
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(logs.join('\n')) as {
+      unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
+    };
+    const versionItems = parsed.unimplemented_by_apply.filter((i) => i.kind === 'version');
+    // One per agent (code-agent + science-agent), both diverging (0.2.44 observed vs "0.2.60" declared).
+    expect(versionItems).toHaveLength(2);
+    for (const item of versionItems) {
+      expect(item.verb).toBe('update');
+      expect(item.reason).toMatch(/macf fleet upgrade/);
+    }
+    // actions_pin must NOT appear — the fixture's observed pin already matches declared.
+    expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'actions_pin')).toBe(false);
   });
 
   it('pre-approval stderr render (interactive path, confirmPlan declines) ALSO shows the NOT IMPLEMENTED block before the abort', async () => {
