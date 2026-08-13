@@ -169,9 +169,21 @@ for every agent App. The manifest to submit is
 > operator almost always already has it from a prior fleet. App names are GLOBALLY
 > unique, so a duplicate `macf-routing` create silently *fails* — GitHub bounces to
 > `/settings/apps` with **no `?code=`** (looks like a successful click). Detect it
-> FIRST: it's a private App, so `gh api /apps/<slug>` is **useless** (404s for every
-> private App, not just nonexistent ones); instead read
-> `https://github.com/settings/apps` or mint a JWT against its known `app_id`. If it
+> FIRST with `gh api /apps/<slug>` — which DOES work, contrary to this doc's
+> earlier claim that it "404s for every private App" (measured 2026-08-13,
+> both auth types, both directions — macf#910):
+>
+> | auth | App EXISTS | App ABSENT |
+> |---|---|---|
+> | operator `gh` login | `200` + slug | `404` |
+> | bot installation token | `403` "Resource not accessible by integration" | `404` |
+>
+> **An existing App never 404s.** So read it strictly: **only a `404` means the
+> name is free**; a `403` is the positive signal that the name is TAKEN (easy to
+> skim past as permission noise) and anything else is taken-or-unknown — never
+> treat a non-404 as free. For certainty independent of auth context, mint a JWT
+> against the known `app_id` (`confirmAppInstallation`, macf#841) or read
+> `https://github.com/settings/apps`. If it
 > exists, reuse its `app_id` + existing private key (the operator supplies the key)
 > and just confirm it's installed on the registry target. Only run the manifest flow
 > for `macf-routing` on a brand-new account that has never hosted a MACF fleet.
