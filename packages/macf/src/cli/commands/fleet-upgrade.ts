@@ -192,7 +192,13 @@ export function formatFleetReport(report: FleetPlanReport, target: string, log: 
     const mark =
       r.outcome === 'upgraded'
         ? '✓'
-        : r.outcome === 'busy-skipped' || r.outcome === 'config-dirty-skipped' || r.outcome === 'branch-skipped'
+        : r.outcome === 'busy-skipped' ||
+            r.outcome === 'config-dirty-skipped' ||
+            r.outcome === 'branch-skipped' ||
+            // macf#899 — POST-mutation but still safe-to-continue (unlike
+            // 'halted' below): a stale launch pin explains the old-version
+            // state without implicating the release.
+            r.outcome === 'stale-pin-skipped'
           ? '•'
           : '✗';
     log(`    ${mark} ${r.agent} — ${r.outcome}${r.detail ? ` (${r.detail})` : ''}`);
@@ -357,6 +363,15 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
       break;
     case 'halt':
       log(`   ${ev.agent}: HALT — verify-green ${ev.reason} (last=${ev.lastVersion ?? 'down'})`);
+      break;
+    case 'stale-pin-skip':
+      // macf#899 — the agent WAS mutated (upgrade+restart already ran) but
+      // its old-version state is explained by a stale LAUNCH pin, not a bad
+      // release: skip it and CONTINUE (distinct from HALT above).
+      log(
+        `   ${ev.agent}: STALE-PIN — skip + CONTINUE (launch pin @${ev.pin} != target ` +
+        `@${ev.target}; fix ${ev.agent}'s launch pin, not the release)`,
+      );
       break;
     case 'fleet-skipped':
       log(`── fleet ${ev.fleet}: SKIPPED (${ev.reason}) ──`);

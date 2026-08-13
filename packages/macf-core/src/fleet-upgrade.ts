@@ -137,24 +137,51 @@ export interface AgentUpgradePlan {
  *                             auto-resolve commit) or a relaunch on the wrong
  *                             branch either corrupts a feature branch or
  *                             relaunches the agent stale on it.
- * - `halted`                — verify-green did NOT confirm the target version;
+ * - `stale-pin-skipped`     — (macf#899, NEW) verify-green did NOT confirm the
+ *                             target version, but the agent's own launch pin
+ *                             explains WHY without implicating the release:
+ *                             `reason: 'stale-pin'` (see `HaltReason`). Unlike
+ *                             `halted`, this is safe to continue past — the
+ *                             agent WAS mutated (upgrade + restart already
+ *                             ran) but its stale-old-pin state endangers no
+ *                             OTHER agent, so `rollFleet` skips it and moves
+ *                             on to the next agent in the SAME fleet.
+ * - `halted`                — verify-green did NOT confirm the target version,
+ *                             and the cause is either a confirmed/unverifiable
+ *                             bad release or a genuinely unconfirmed relaunch;
  *                             the roll STOPS here. `reason` distinguishes WHY
  *                             (see `HaltReason`).
  *
  * The three pre-flight skip outcomes (`busy-skipped` / `config-dirty-skipped`
  * / `branch-skipped`) are safe to continue past because the agent was NEVER
- * mutated. `halted` is always terminal because the agent WAS rolled and its
- * post-restart state is either confirmed-bad or unconfirmed — neither is safe
- * to leave behind while moving on to the next agent (macf#722 Fix A).
+ * mutated. `stale-pin-skipped` (macf#899) IS safe to continue past DESPITE the
+ * agent having been mutated, because the specific cause (a stale LAUNCH pin)
+ * is a property of this one workspace's launch config, not of the release —
+ * see `HaltReason`'s `stale-pin` doc for the full reasoning. `halted` is
+ * always terminal because the agent WAS rolled and its post-restart state is
+ * either confirmed-bad, unverifiable, or unconfirmed — none of those three are
+ * safe to leave behind while moving on to the next agent (macf#722 Fix A,
+ * extended by macf#899).
  */
-export type RollOutcome = 'upgraded' | 'busy-skipped' | 'config-dirty-skipped' | 'branch-skipped' | 'halted';
+export type RollOutcome =
+  | 'upgraded'
+  | 'busy-skipped'
+  | 'config-dirty-skipped'
+  | 'branch-skipped'
+  | 'stale-pin-skipped'
+  | 'halted';
 
 /**
- * WHY a roll halted (only meaningful when `outcome === 'halted'`):
+ * WHY a roll's verify-green did not confirm the target version:
  * - `bad-release`           — verify-green confirmed the agent came back up
- *                             REACHABLE at its OLD (pre-upgrade) version — a
- *                             crash-loop / stuck-old-process release. Terminal;
- *                             stops this fleet's roll + later fleets.
+ *                             REACHABLE at its OLD (pre-upgrade) version, AND
+ *                             (macf#899) its own launch pin either already
+ *                             matches the target (a genuine crash-loop /
+ *                             stuck-old-process release) or could not be
+ *                             read at all (honest-unknown, treated
+ *                             conservatively — see `classifyHalt`). Terminal;
+ *                             `outcome: 'halted'` — stops this fleet's roll +
+ *                             later fleets.
  * - `relaunch-unconfirmed`  — past the full verify-green grace budget, the
  *                             agent was never confirmed at the target version:
  *                             down the whole time, unreachable, or reachable at
@@ -162,15 +189,33 @@ export type RollOutcome = 'upgraded' | 'busy-skipped' | 'config-dirty-skipped' |
  *                             "Not yet green" cannot distinguish a slow-but-fine
  *                             relaunch from a release that crashes on startup
  *                             (which never shows the old version either), so
- *                             this is deliberately NOT a continue.
+ *                             this is deliberately NOT a continue. Terminal;
+ *                             `outcome: 'halted'`. UNCHANGED by macf#899 — the
+ *                             pin-discrimination below only applies to the
+ *                             `bad-release` precondition (a POSITIVELY
+ *                             confirmed old-version match), never to this case.
+ * - `stale-pin`             — (macf#899, NEW) verify-green confirmed the agent
+ *                             came back REACHABLE at its OLD version, but its
+ *                             own launch pin asks for a version OTHER than the
+ *                             target — the LAUNCHER never asked for the
+ *                             upgrade (a stale mounted-plugin pin, macf#889's
+ *                             exact failure shape), not a bad release. NOT
+ *                             terminal; `outcome: 'stale-pin-skipped'` —
+ *                             `rollFleet` skips this ONE agent and CONTINUES,
+ *                             because a stale launch pin on one workspace says
+ *                             nothing about the release quality and endangers
+ *                             no other agent.
  */
-export type HaltReason = 'bad-release' | 'relaunch-unconfirmed';
+export type HaltReason = 'bad-release' | 'relaunch-unconfirmed' | 'stale-pin';
 
 /** The per-agent EXECUTE result. `detail` carries a human-readable summary. */
 export interface AgentRollResult {
   readonly agent: string;
   readonly outcome: RollOutcome;
-  /** Set only when `outcome === 'halted'` — see `HaltReason`. */
+  /**
+   * Set when `outcome === 'halted'` OR `outcome === 'stale-pin-skipped'`
+   * (macf#899 added the latter) — see `HaltReason`.
+   */
   readonly reason?: HaltReason;
   readonly detail?: string;
   /**
@@ -330,6 +375,14 @@ export interface FleetRollResult {
    * macf#755's pre-flight branch-gate, the FIRST gate in the transaction.
    */
   readonly branchSkipped: number;
+  /**
+   * Count of agents skipped because verify-green confirmed them REACHABLE
+   * at their OLD version AND their own launch pin explained why without
+   * implicating the release (`reason: 'stale-pin'`, macf#899) — POST-flight
+   * (the agent WAS mutated: upgrade + restart already ran), unlike the other
+   * skip counters above, but still safe to continue past — see `HaltReason`.
+   */
+  readonly stalePinSkipped: number;
 }
 
 /** Progress events for CLI rendering (the RESULT objects are what tests assert on). */
@@ -376,7 +429,16 @@ export type UpgradeEvent =
    * act as needed).
    */
   | { readonly kind: 'upgraded'; readonly agent: string; readonly version: string; readonly modifiedFiles: readonly string[]; readonly message: string }
-  | { readonly kind: 'halt'; readonly agent: string; readonly reason: HaltReason; readonly lastVersion: string | null };
+  | { readonly kind: 'halt'; readonly agent: string; readonly reason: HaltReason; readonly lastVersion: string | null }
+  /**
+   * The POST-restart STALE-PIN skip (macf#899) — verify-green confirmed the
+   * agent came back reachable at its OLD version, but its own launch `pin`
+   * (read via `driver.readVersionPin`) asks for a version other than
+   * `target`, so `rollFleet` skips this agent (NOT a halt) and continues to
+   * the next one. Distinct from `halt`: the agent WAS mutated here too, but
+   * the cause doesn't implicate the release.
+   */
+  | { readonly kind: 'stale-pin-skip'; readonly agent: string; readonly pin: string; readonly target: string };
 
 /**
  * Classify each discovered fleet member against the target version. PURE — no
@@ -474,24 +536,117 @@ async function waitForIdle(agent: string, opts: RollFleetOptions, deps: RollFlee
   return false;
 }
 
+/** The discriminated result of `classifyHalt` — `pin` is only ever populated on the branches that actually read it. */
+type HaltClassification =
+  | { readonly reason: 'relaunch-unconfirmed'; readonly detail: string }
+  | { readonly reason: 'bad-release'; readonly detail: string; readonly pin: string | null }
+  | { readonly reason: 'stale-pin'; readonly detail: string; readonly pin: string };
+
 /**
  * Classify a failed verify-green against the agent's PRE-upgrade running
- * version (macf#722 Fix A). `bad-release` requires POSITIVE confirmation that
- * the agent came back reachable at the OLD pin — everything else (never
- * reachable, or reachable at some other unrecognized version) is
- * `relaunch-unconfirmed`. Never infer `bad-release` from absence of success;
- * only from the last-seen version actually matching the old pin.
+ * version (macf#722 Fix A) — UNCHANGED precondition — then, ONLY when that
+ * precondition confirms `bad-release`, discriminate further against the
+ * agent's LAUNCH PIN (macf#899) before finalizing the diagnosis.
+ *
+ * ## The macf#722 Fix A precondition (UNCHANGED)
+ *
+ * `bad-release`-shaped confirmation requires POSITIVE proof that the agent
+ * came back reachable at the OLD pin — everything else (never reachable, or
+ * reachable at some other unrecognized version) stays `relaunch-unconfirmed`,
+ * exactly as before macf#899. Never infer a bad-release SHAPE from absence of
+ * success; only from the last-seen version actually matching the old pin.
+ * This half is deliberately untouched — macf#899's own author explicitly
+ * retracted an earlier proposal to touch `relaunch-unconfirmed`'s semantics.
+ *
+ * ## The macf#899 pin-discriminator (NEW)
+ *
+ * A "confirmed reachable at OLD version" agent used to be named
+ * `bad-release` unconditionally. The 0.2.56 roll (this issue's incident)
+ * showed that conflates two causes with OPPOSITE fleet-safety implications:
+ * a genuinely stuck/crash-looping release (cascading risk is real — HALT) vs
+ * a launcher that never asked for the target in the first place (a stale
+ * mounted-plugin pin, macf#889's exact failure shape — no cascading risk to
+ * any OTHER agent — skip and CONTINUE). The discriminator is
+ * `driver.readVersionPin(agent)` — the SAME mounted-manifest primitive
+ * `macf update`'s own post-write verification already reads (macf#889/#896)
+ * — compared against `targetVersion`:
+ *
+ * - `pin === targetVersion` → the launcher DID ask correctly → `bad-release`
+ *   (unchanged terminal semantics, now positively cross-checked rather than
+ *   assumed).
+ * - `pin !== targetVersion` (non-null) → `stale-pin` (NEW, non-terminal —
+ *   `rollFleet` skips this agent and continues).
+ * - `pin === null` (mount undeterminable, manifest absent/malformed, or no
+ *   channel-server pin present at all) → honest-unknown. NEITHER cause is
+ *   evidenced. Per the issue's explicit constraint this must NOT silently
+ *   become `stale-pin` (would skip an agent that might really be
+ *   crash-looping — reintroducing the exact risk macf#722 Fix A closed for
+ *   `relaunch-unconfirmed`) and must NOT silently masquerade as a
+ *   fully-CONFIRMED `bad-release` either. **Judgment call** (documented in
+ *   the implementation report): keep `reason: 'bad-release'` — i.e. preserve
+ *   the PRE-macf#899 conservative default of halting, since an UNVERIFIED
+ *   old-version confirmation carries the same cascading risk an unconfirmed
+ *   one does — but the `detail` message says PLAINLY that the pin could not
+ *   be read, so the reason string alone is never mistaken for a positively
+ *   confirmed diagnosis, and the operator's remedy is "check the launch
+ *   pin/mount," not "assume the release is broken."
  */
-function classifyHalt(green: VerifyGreenResult & { readonly ok: false }, oldVersion: string | null): HaltReason {
-  if (
+async function classifyHalt(
+  green: VerifyGreenResult & { readonly ok: false },
+  oldVersion: string | null,
+  targetVersion: string,
+  agent: string,
+  driver: FleetDriver,
+): Promise<HaltClassification> {
+  const base = `verify-green ${green.reason} (last=${green.lastVersion ?? 'down'})`;
+  const confirmedOldVersion =
     green.reason === 'wrong-version' &&
     green.lastVersion !== null &&
     oldVersion !== null &&
-    compareSemver(green.lastVersion, oldVersion) === 0
-  ) {
-    return 'bad-release';
+    compareSemver(green.lastVersion, oldVersion) === 0;
+
+  if (!confirmedOldVersion) {
+    return { reason: 'relaunch-unconfirmed', detail: `relaunch-unconfirmed: ${base}` };
   }
-  return 'relaunch-unconfirmed';
+
+  // macf#899 — POSITIVELY confirmed reachable-at-OLD-version. Read the
+  // agent's own launch pin before naming this a bad release.
+  const pin = await driver.readVersionPin(agent);
+
+  if (pin === null) {
+    return {
+      reason: 'bad-release',
+      detail:
+        `bad-release: ${base} — UNVERIFIED (launch pin unreadable: mount undeterminable, ` +
+        `manifest absent/malformed, or no channel-server pin present) — NOT a confirmed bad ` +
+        `release; verify ${agent}'s claude.sh --plugin-dir mount + plugin.json pin BEFORE ` +
+        `assuming the ${targetVersion} release itself is broken. Halting conservatively.`,
+      pin: null,
+    };
+  }
+
+  if (compareSemver(pin, targetVersion) === 0) {
+    return {
+      reason: 'bad-release',
+      detail:
+        `bad-release: ${base} — CONFIRMED (launch pin @${pin} already matches target ` +
+        `@${targetVersion}; the process is stuck/crash-looping on the old version despite ` +
+        `asking for the right one). Remedy: investigate ${agent}'s release/process, not its ` +
+        `launch config.`,
+      pin,
+    };
+  }
+
+  return {
+    reason: 'stale-pin',
+    detail:
+      `stale-pin: ${base} — launch pin @${pin} != target @${targetVersion}; the LAUNCHER ` +
+      `never asked for the upgrade (a stale --plugin-dir mount / manifest pin), not a bad ` +
+      `release. Remedy: fix ${agent}'s launch pin (e.g. re-run \`macf update\` against its ` +
+      `mounted plugin dir), then re-roll it — the fleet roll CONTINUES to the next agent; a ` +
+      `stale pin on one workspace endangers no other agent.`,
+    pin,
+  };
 }
 
 /**
@@ -610,6 +765,7 @@ export async function rollFleet(
   let configDirtySkipped = 0;
   let configAutoResolved = 0;
   let branchSkipped = 0;
+  let stalePinSkipped = 0;
 
   for (const plan of plans) {
     if (plan.disposition !== 'behind') continue;
@@ -728,12 +884,38 @@ export async function rollFleet(
       continue;
     }
 
-    const reason = classifyHalt(green, plan.runningVersion);
+    const classification = await classifyHalt(green, plan.runningVersion, opts.targetVersion, agent, deps.driver);
+    const { reason, detail } = classification;
+
+    if (reason === 'stale-pin') {
+      // macf#899 — SAFE TO CONTINUE despite the agent having been mutated
+      // (upgrade + restart already ran): the post-restart old-version state
+      // is explained by a stale LAUNCH pin, not a bad release, and a stale
+      // pin on ONE workspace endangers no OTHER agent — unlike `bad-release`,
+      // where the release itself might be broken and must not cascade. Leave
+      // the maintenance lock in place (DR-040 Decision 3 — "release ONLY on
+      // confirmed clean success"; this agent is NOT confirmed clean): a
+      // still-old, mid-transition agent should not be handed straight back to
+      // the watchdog's healing ladder either. Only the heartbeat stops here;
+      // the lock self-clears via MAINT_LOCK_TTL, same as a genuine halt.
+      stalePinSkipped += 1;
+      results.push({
+        agent,
+        outcome: 'stale-pin-skipped',
+        reason,
+        detail,
+        ...(autoResolvedFiles ? { autoResolvedFiles } : {}),
+      });
+      deps.onEvent?.({ kind: 'stale-pin-skip', agent, pin: classification.pin, target: opts.targetVersion });
+      stopHeartbeat();
+      continue;
+    }
+
     results.push({
       agent,
       outcome: 'halted',
       reason,
-      detail: `${reason}: verify-green ${green.reason} (last=${green.lastVersion ?? 'down'})`,
+      detail,
       ...(autoResolvedFiles ? { autoResolvedFiles } : {}),
     });
     deps.onEvent?.({ kind: 'halt', agent, reason, lastVersion: green.lastVersion });
@@ -746,10 +928,28 @@ export async function rollFleet(
     // (MAINT_LOCK_TTL), giving the operator a bounded grace window to
     // inspect the halted roll before the watchdog resumes automatic action.
     stopHeartbeat();
-    return { results, halted: true, upgraded, busySkipped, configDirtySkipped, configAutoResolved, branchSkipped };
+    return {
+      results,
+      halted: true,
+      upgraded,
+      busySkipped,
+      configDirtySkipped,
+      configAutoResolved,
+      branchSkipped,
+      stalePinSkipped,
+    };
   }
 
-  return { results, halted: false, upgraded, busySkipped, configDirtySkipped, configAutoResolved, branchSkipped };
+  return {
+    results,
+    halted: false,
+    upgraded,
+    busySkipped,
+    configDirtySkipped,
+    configAutoResolved,
+    branchSkipped,
+    stalePinSkipped,
+  };
 }
 
 /** Options for the multi-fleet orchestrator. */

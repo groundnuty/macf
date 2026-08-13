@@ -432,15 +432,20 @@ fleet
     'restart-self (relaunches WITHOUT stashing its own regeneration — left ' +
     'uncommitted for the relaunched agent to see) → verify /health.version == ' +
     'target (re-resolving the fresh restart-self endpoint on EACH poll, over a ' +
-    'relaunch-aware grace budget) → report the regenerated files + next. A HALT ' +
-    'stops the roll (and later fleets): `bad-release` when the agent is ' +
-    'confirmed back on its OLD version (a crash-loop), `relaunch-unconfirmed` ' +
-    'when it is never confirmed green within the grace (down / unreachable / an ' +
-    'unrecognized version) — neither is safe to leave behind while moving on, ' +
-    'so a bad release cannot brick the fleet. Reconcile after an OBJECT is ' +
-    'MANUAL this iteration: resolve the flagged files, then re-run. DRY-RUN by ' +
-    'default (prints the plan); --execute rolls. TARGET defaults to npm-latest ' +
-    'of @groundnuty/macf.',
+    'relaunch-aware grace budget) → report the regenerated files + next. When ' +
+    'an agent comes back reachable but still on its OLD version, its own ' +
+    'LAUNCH PIN discriminates the cause (macf#899): pin already matches ' +
+    'target → `bad-release` (a genuine crash-loop) → HALTS the roll (and ' +
+    'later fleets — a bad release cannot brick the fleet); pin asks for a ' +
+    'DIFFERENT version → `stale-pin` (the launcher, not the release, never ' +
+    'asked for the upgrade) → skips that ONE agent and CONTINUES (no other ' +
+    'agent is endangered); pin unreadable → treated conservatively as ' +
+    '`bad-release` (HALTS) with a message naming the uncertainty. Never ' +
+    'confirmed green within the grace at all (down / unreachable / an ' +
+    'unrecognized version) → `relaunch-unconfirmed` → HALTS, unchanged. ' +
+    'Reconcile after an OBJECT is MANUAL this iteration: resolve the flagged ' +
+    'files, then re-run. DRY-RUN by default (prints the plan); --execute ' +
+    'rolls. TARGET defaults to npm-latest of @groundnuty/macf.',
   )
   .option('--target <version>', 'Target framework version (default: npm-latest of @groundnuty/macf)')
   .option('--fleet <names>', 'Comma-list of fleets (project identifiers) to roll — multi-select, rolled fleet-by-fleet')

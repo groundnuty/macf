@@ -48,6 +48,8 @@ import { createClientFromConfig } from '../registry-helper.js';
 import { discoverWorkspaces } from '../discovery.js';
 import { gatherFleetStatus, type FleetProbeFn } from '../commands/fleet.js';
 import { classifyDirtyFile } from './canonical-compute.js';
+import { readPinnedChannelServerVersion } from '../plugin-fetcher.js';
+import { resolvePluginUpdateTarget } from '../plugin-hook-resolver.js';
 import {
   acquireLock as acquireMaintenanceLock,
   releaseLock as releaseMaintenanceLock,
@@ -134,6 +136,20 @@ export interface VmDriverSeams {
    * line. Best-effort — callers treat an inspection failure as an empty list.
    */
   readonly listModifiedFiles: (workspaceDir: string) => readonly string[];
+  /**
+   * Read `workspaceDir`'s LAUNCH PIN — the channel-server version its
+   * currently MOUNTED plugin manifest pins (macf#899). `null` when
+   * undeterminable (no `claude.sh`, no `--plugin-dir` flag, ambiguous
+   * multiple values), the manifest is absent/malformed, or no
+   * channel-server pin is present at all. Real impl:
+   * `resolvePluginUpdateTarget(workspaceDir)` (the SAME mount-resolution
+   * `macf update` uses to decide WHERE to write the pin, macf#889) +
+   * `readPinnedChannelServerVersion` (the SAME read-back `macf update`'s own
+   * post-write verification uses, macf#889/#896 PR #896) — so `rollFleet`'s
+   * bad-release-vs-stale-pin diagnosis can never disagree with `macf
+   * update`'s own result-invariant check about what "the launch pin" means.
+   */
+  readonly readLaunchPin: (workspaceDir: string) => string | null;
   /**
    * Read a workspace's FULL agent config (DR-040 Decision 3 / macf#698 R1) —
    * the canonical-compute primitive needs it to regenerate `claude.sh` /
@@ -423,6 +439,19 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     return seams.listModifiedFiles(target.workspace);
   }
 
+  /**
+   * The macf#899 pin-discrimination read — the agent's MOUNTED launch pin,
+   * or `null` when unresolvable (unknown agent, undeterminable mount, or no
+   * pin present). See `VmDriverSeams.readLaunchPin` for the real-impl
+   * detail. Unknown agent → `null` (mirrors `currentBranch`'s unresolvable-
+   * agent handling — never throws).
+   */
+  async function readVersionPin(agent: string): Promise<string | null> {
+    const target = resolveTarget(seams, agent);
+    if (!target) return null;
+    return seams.readLaunchPin(target.workspace);
+  }
+
   async function upgrade(agent: string): Promise<void> {
     const target = requireTarget(agent);
     // macf#763: scrub the orchestrator's own identity so `macf update` (run
@@ -502,6 +531,7 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     inject,
     launch,
     listModifiedFiles,
+    readVersionPin,
     acquireLock,
     releaseLock,
     startHeartbeat,
@@ -550,6 +580,7 @@ export function createVmExecSeams(
   | 'listModifiedFiles'
   | 'readFullConfig'
   | 'commitCanonicalFiles'
+  | 'readLaunchPin'
 > {
   return {
     discover: () => discoverWorkspaces(),
@@ -637,6 +668,15 @@ export function createVmExecSeams(
       return { project: cfg.project, routingLabel: cfg.routing_label ?? cfg.agent_name };
     },
     readFullConfig: (dir: string): MacfAgentConfig | null => readAgentConfig(dir),
+    readLaunchPin: (dir: string): string | null => {
+      // Same two primitives `macf update` itself uses to WRITE + read back
+      // the pin (macf#889/#896) — reused here at the DRIVER layer so
+      // `rollFleet`'s diagnosis reads the exact same "launch pin" `macf
+      // update`'s own post-write verification would (macf#899).
+      const target = resolvePluginUpdateTarget(dir);
+      if (!target.determinable || target.dir === null) return null;
+      return readPinnedChannelServerVersion(target.dir);
+    },
     commitCanonicalFiles: (dir: string, files: readonly string[]): void => {
       if (files.length === 0) return;
       try {
