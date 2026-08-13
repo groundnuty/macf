@@ -21,6 +21,7 @@ import { dirname, join } from 'node:path';
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
+import { deriveControlRepoName } from './fleet-manifest.js';
 import type { FleetObserverFn, ObservedAgentState, ObservedState, Presence } from './plan.js';
 import { readFleetLockFile } from './fleet-lock.js';
 import { registryPathPrefix } from '../registry-helper.js';
@@ -70,6 +71,42 @@ export async function checkRepoExists(repo: string): Promise<Presence> {
     const stderr = getStderr(err);
     if (/HTTP 404|Not Found/i.test(stderr)) return 'absent';
     return 'unknown';
+  }
+}
+
+/** One repo's presence + (when present) its `archived` bit — the shape {@link checkRepoArchivedState} returns. */
+export interface RepoArchivedMeta {
+  readonly presence: Presence;
+  readonly archived?: boolean;
+}
+
+/**
+ * Read-only `{archived}` probe — DR-043 Amendment G (groundnuty/macf#867):
+ * `plan` needs to report an archived control repo as a DELIBERATE fleet
+ * state (`plan.ts`'s new `control_repo` item), not as drift, and that read
+ * has to happen at PLAN time (credential-free, live `gh`, per DR-043
+ * Amendment A1) alongside every other repo/variable read this file already
+ * does. Deliberately NOT `control-repo.ts::checkControlRepoMeta` reused
+ * directly here — `control-repo.ts` already imports {@link getStderr} FROM
+ * this module, so a reverse import (this module pulling a function back
+ * FROM `control-repo.ts`) would create a circular module edge. Same
+ * one-round-trip `gh api ... --jq '{archived: .archived}'` shape as that
+ * function's sibling copy — a drift between the two would be caught by
+ * their own tests, never silent.
+ */
+export async function checkRepoArchivedState(repo: string): Promise<RepoArchivedMeta> {
+  try {
+    const { stdout } = await execFileAsync('gh', ['api', `repos/${repo}`, '--jq', '{archived: .archived}'], { encoding: 'utf-8' });
+    const parsed: unknown = JSON.parse(stdout);
+    const archived =
+      typeof parsed === 'object' && parsed !== null && 'archived' in parsed && typeof (parsed as { archived: unknown }).archived === 'boolean'
+        ? (parsed as { archived: boolean }).archived
+        : undefined;
+    return { presence: 'present', archived };
+  } catch (err) {
+    const stderr = getStderr(err);
+    if (/HTTP 404|Not Found/i.test(stderr)) return { presence: 'absent' };
+    return { presence: 'unknown' };
   }
 }
 
@@ -210,6 +247,15 @@ export async function readRegistryVariable(registry: RegistryConfig, name: strin
  * `FleetManifestSchema.agents` is `.min(1)` so this is always populated at
  * the type level, but `noUncheckedIndexedAccess` still requires the runtime
  * guard below.
+ *
+ * The control repo's presence/archived state (DR-043 Amendment G,
+ * `plan.ts`'s new `control_repo` item) is read the SAME way `checkRepoExists`
+ * reads an agent repo — credential-free, live `gh` — via
+ * {@link checkRepoArchivedState} against the SAME derived name
+ * `control-repo.ts::controlRepoFullName` computes (`deriveControlRepoName`
+ * imported from `fleet-manifest.ts`, not `controlRepoFullName` itself — see
+ * `checkRepoArchivedState`'s doc for why this module can't import FROM
+ * `control-repo.ts`).
  */
 export async function githubRegistryObserver(manifest: FleetManifest, manifestPath: string): Promise<ObservedState> {
   const lock = readFleetLock(manifestPath);
@@ -245,7 +291,20 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       ? await readRepoVariable(representativeCallerRepo, 'MACF_ROUTING_RUNS_ON')
       : undefined;
 
-  return { lock, agents, caRegistry, caRepos, routingRunsOn };
+  // DR-043 Amendment G — same derived name `control-repo.ts::controlRepoFullName`
+  // computes; see this function's doc for why it's re-derived here rather
+  // than imported.
+  const controlRepoMeta = await checkRepoArchivedState(`${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`);
+
+  return {
+    lock,
+    agents,
+    caRegistry,
+    caRepos,
+    routingRunsOn,
+    controlRepoPresence: controlRepoMeta.presence,
+    controlRepoArchived: controlRepoMeta.archived,
+  };
 }
 
 // --- vaultAwareObserver — DR-043 Amendment D phase 3 ("the vault-aware observer") ---

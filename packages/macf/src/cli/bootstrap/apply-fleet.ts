@@ -425,7 +425,11 @@ export async function applyFleet(
   // per-agent processing. See control-repo.ts's module doc for the
   // ownership/custody model this enforces.
   const controlRepo = await provisionControlRepo(manifest, manifestPath, deps.controlRepoDeps, deps.controlRepoOptions);
-  if (controlRepo.status === 'foreign' || controlRepo.status === 'failed') {
+  // DR-043 Amendment G: `'archived'` aborts exactly like `'foreign'`/`'failed'`
+  // — `provisionControlRepo` already refused to touch ANYTHING (no
+  // unarchiveRepo, no clone) when it returns this status, so there is
+  // nothing partial to unwind; the run simply never started.
+  if (controlRepo.status === 'foreign' || controlRepo.status === 'failed' || controlRepo.status === 'archived') {
     deps.log(`Control repo "${controlRepo.repo}": ABORTING entire apply run — ${controlRepo.reason}`);
     // Nothing else is ever touched — no agent repo, App, or install. A
     // best-effort fallback `lockPath` (never actually written to) so the

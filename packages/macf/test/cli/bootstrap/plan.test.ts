@@ -54,8 +54,8 @@ function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
   };
 }
 
-/** Empty observed state — nothing provisioned yet. */
-const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, caRegistry: 'unknown', caRepos: {} };
+/** Empty observed state — nothing provisioned yet. `controlRepoPresence: 'absent'` — no control repo yet, so `controlRepoItem` never fires (see the dedicated `control_repo` plan-item describe block below for the archived case). */
+const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, caRegistry: 'unknown', caRepos: {}, controlRepoPresence: 'absent' };
 
 function itemFor(items: readonly PlanItem[], kind: PlanItem['kind'], target: string): PlanItem | undefined {
   return items.find((i) => i.kind === kind && i.target === target);
@@ -172,10 +172,12 @@ describe('computePlan — all-match observed state → all noops', () => {
         'groundnuty/icsoc-2026-experiment': 'present',
       },
       routingRunsOn: 'self-hosted',
+      controlRepoPresence: 'present',
+      controlRepoArchived: false,
     };
 
     const plan = computePlan(manifest, observed);
-    expect(plan.items).toHaveLength(12); // 4 × 2 agents + caRegistry + 2 caRepo + routing
+    expect(plan.items).toHaveLength(12); // 4 × 2 agents + caRegistry + 2 caRepo + routing (control_repo item absent — not archived)
     for (const item of plan.items) {
       expect(item.verb).toBe('noop');
       expect(item.confirm_required).toBe(false);
@@ -215,6 +217,7 @@ describe('computePlan — an observed extra agent → report-extra, NEVER delete
       },
       caRegistry: 'unknown',
       caRepos: {},
+      controlRepoPresence: 'absent',
     };
 
     const plan = computePlan(manifest, observed);
@@ -231,6 +234,7 @@ describe('computePlan — an observed extra agent → report-extra, NEVER delete
       agents: { 'orphan-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} } },
       caRegistry: 'unknown',
       caRepos: {},
+      controlRepoPresence: 'absent',
     };
     const plan = computePlan(manifest, observed);
     const verbsSeen = new Set(plan.items.map((i) => i.verb));
@@ -251,6 +255,7 @@ describe('computePlan — an observed extra agent → report-extra, NEVER delete
       },
       caRegistry: 'unknown',
       caRepos: {},
+      controlRepoPresence: 'absent',
     };
     const plan = computePlan(manifest, observed);
     const extras = plan.items.filter((i) => i.kind === 'agent').map((i) => i.target);
@@ -468,6 +473,7 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
         'groundnuty/icsoc-2026-science-agent': 'present',
         'groundnuty/icsoc-2026-experiment': 'present',
       },
+      controlRepoPresence: 'absent',
     };
     const noopRepoPlan = computePlan(manifest, observedRepoPresent);
     expect(noopRepoPlan.unimplementedByApply.some((i) => i.kind === 'repo')).toBe(false);
@@ -513,6 +519,7 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
         'groundnuty/icsoc-2026-experiment': 'present',
       },
       routingRunsOn: 'self-hosted',
+      controlRepoPresence: 'absent',
     };
     const plan = computePlan(manifest, observed);
     expect(plan.unimplementedByApply).toEqual([]);
@@ -554,6 +561,7 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
         'groundnuty/icsoc-2026-science-agent': 'present',
         'groundnuty/icsoc-2026-experiment': 'present',
       },
+      controlRepoPresence: 'absent',
     };
     const plan = computePlan(manifest, observed);
     expect(plan.unimplementedByApply).toEqual([]);
@@ -677,5 +685,50 @@ describe('vault-derived facts (DR-043 Amendment D phase 3) — purely additive o
     const json = fleetPlanToJson(plan) as { plan: ReadonlyArray<{ kind: string; target: string; reason: string }> };
     const item = json.plan.find((i) => i.kind === 'secret_fingerprint' && i.target === 'agent:code-agent:secrets');
     expect(item?.reason).toContain('[vault: unknown — vault file not found]');
+  });
+});
+
+// --- DR-043 Amendment G (groundnuty/macf#867) — the control-repo-archived plan item ---
+
+describe('computePlan — control-repo-archived item (DR-043 Amendment G)', () => {
+  it('is ABSENT when the control repo is not present at all', () => {
+    const plan = computePlan(baseManifest(), { ...EMPTY_OBSERVED, controlRepoPresence: 'absent' });
+    expect(plan.items.some((i) => i.kind === 'control_repo')).toBe(false);
+  });
+
+  it('is ABSENT when the control repo is present but NOT archived — reads as ordinary, not drift', () => {
+    const plan = computePlan(baseManifest(), { ...EMPTY_OBSERVED, controlRepoPresence: 'present', controlRepoArchived: false });
+    expect(plan.items.some((i) => i.kind === 'control_repo')).toBe(false);
+  });
+
+  it('is ABSENT when the archived bit could not be confirmed (present but archived undefined) — honest-unknown, never assumed archived', () => {
+    const plan = computePlan(baseManifest(), { ...EMPTY_OBSERVED, controlRepoPresence: 'present' });
+    expect(plan.items.some((i) => i.kind === 'control_repo')).toBe(false);
+  });
+
+  it('fires as update + confirm_required: true when present AND archived — a DELIBERATE state, not drift', () => {
+    const plan = computePlan(baseManifest(), { ...EMPTY_OBSERVED, controlRepoPresence: 'present', controlRepoArchived: true });
+    const item = plan.items.find((i) => i.kind === 'control_repo');
+    expect(item).toBeDefined();
+    expect(item?.verb).toBe('update');
+    expect(item?.confirm_required).toBe(true);
+    // Must read as a DELIBERATE state, never as a value mismatch — the
+    // wording is the load-bearing distinction DR-043 Amendment G asks for.
+    expect(item?.reason).toMatch(/ARCHIVED/);
+    expect(item?.reason).toMatch(/DELIBERATE/);
+    expect(item?.reason).not.toMatch(/observed .* but manifest declares/);
+  });
+
+  it('is the FIRST item in the plan — mirrors apply-fleet.ts\'s "control repo is step 0" ordering', () => {
+    const plan = computePlan(baseManifest(), { ...EMPTY_OBSERVED, controlRepoPresence: 'present', controlRepoArchived: true });
+    expect(plan.items[0]?.kind).toBe('control_repo');
+  });
+
+  it('planItemApplyCoverage reports IMPLEMENTED — apply DOES un-archive on approval, this must never render "NOT IMPLEMENTED BY APPLY"', () => {
+    const plan = computePlan(baseManifest(), { ...EMPTY_OBSERVED, controlRepoPresence: 'present', controlRepoArchived: true });
+    const item = plan.items.find((i) => i.kind === 'control_repo');
+    expect(item).toBeDefined();
+    if (item) expect(planItemApplyCoverage(item)).toBe('implemented');
+    expect(plan.unimplementedByApply.some((i) => i.kind === 'control_repo')).toBe(false);
   });
 });

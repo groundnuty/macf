@@ -22,14 +22,24 @@
  * decision core:
  *
  *   - **absent** → safe to create.
- *   - **present, ARCHIVED** → always `foreign`, unconditionally — this is
- *     the "retired fleet's leftover" case by construction: Amendment F's own
- *     retirement sequence archives (never deletes) a control repo, so an
- *     archived repo can NEVER be a live fleet's control repo. Deliberately
- *     checked BEFORE the content read below — a retired fleet's `fleet.yaml`
- *     would otherwise still have a byte-identical `metadata.name` (fleet
- *     names aren't reused casually, but nothing stops it), which would
- *     misclassify the exact case Amendment F warns about as `ours`.
+ *   - **present, ARCHIVED, `fleet.yaml` parses with a matching
+ *     `metadata.name`** → `ours-archived` — DR-043 **Amendment G** (the
+ *     fleet teardown ladder, groundnuty/macf#867) AMENDS the original
+ *     archived-is-always-foreign rule below: the ladder makes `archive` a
+ *     REVERSIBLE state of a LIVE fleet, so archived-ness alone stops being a
+ *     valid "retired leftover" signal — a fleet the operator archived and
+ *     later wants to revive has an archived control repo whose
+ *     `fleet.yaml` STILL declares the correct `metadata.name`. Discriminate
+ *     on NAME-MATCH, not archived-ness (reads work on an archived repo —
+ *     read-only ≠ unreadable — so the content check is available
+ *     regardless). `provisionControlRepo` never silently un-archives this
+ *     case — see that function's doc + `apply-fleet.ts`'s handling.
+ *   - **present, ARCHIVED, `fleet.yaml` missing/unparseable/
+ *     name-mismatched** → `foreign` — the case the PRE-Amendment-G rule
+ *     actually protects, preserved unchanged: a retired fleet's leftover
+ *     (Amendment F's retirement sequence archives, never deletes, a control
+ *     repo) or someone else's unrelated archived repo. Neither carries a
+ *     matching `metadata.name`, so this still fails closed.
  *   - **present, not archived, `fleet.yaml` unreadable/unparseable/
  *     name-mismatched** → `foreign` — someone else's repo, or a different
  *     fleet's control repo occupying this derived name coincidentally
@@ -118,6 +128,8 @@ export interface ControlRepoMeta {
 export type ControlRepoOwnership =
   | { readonly kind: 'absent' }
   | { readonly kind: 'ours' }
+  /** DR-043 Amendment G (groundnuty/macf#867) — ours, but archived (a deliberate, reversible `macf fleet archive` state). Revivable — see `provisionControlRepo`'s + `apply-fleet.ts`'s handling for the confirm-required un-archive path. */
+  | { readonly kind: 'ours-archived' }
   | { readonly kind: 'foreign'; readonly reason: string }
   | { readonly kind: 'unknown' };
 
@@ -130,18 +142,11 @@ export function classifyControlRepoOwnership(
   if (meta.presence === 'absent') return { kind: 'absent' };
   if (meta.presence === 'unknown') return { kind: 'unknown' };
 
-  // presence === 'present' from here on.
-  if (meta.archived === true) {
-    return {
-      kind: 'foreign',
-      reason:
-        'repo exists but is ARCHIVED — DR-043 Amendment F names this explicitly as the "retired fleet leftover" ' +
-        'case: retirement archives (never deletes) a control repo, so an archived repo can never be the LIVE control ' +
-        'repo for a fresh apply. Un-archive it manually first if this fleet is genuinely being revived, or pick a ' +
-        'different fleet name.',
-    };
-  }
-
+  // presence === 'present' from here on. DR-043 Amendment G: discriminate
+  // on NAME-MATCH, not archived-ness — the content check below runs
+  // REGARDLESS of `meta.archived` (reads work on an archived repo), and the
+  // archived bit is consulted only at the very end, to choose between
+  // `ours` and `ours-archived` once a name-match is already confirmed.
   if (manifestFileContent === undefined) {
     return {
       kind: 'foreign',
@@ -170,7 +175,7 @@ export function classifyControlRepoOwnership(
     };
   }
 
-  return { kind: 'ours' };
+  return meta.archived === true ? { kind: 'ours-archived' } : { kind: 'ours' };
 }
 
 // --- I/O leaves (injectable) ---
@@ -280,6 +285,8 @@ export interface ControlRepoDeps {
   readonly checkMeta: (repo: string) => Promise<ControlRepoMeta>;
   readonly readManifestFile: (repo: string) => Promise<string | undefined>;
   readonly createRepo: CreateRepoFn;
+  /** DR-043 Amendment G — the revival primitive (`repo-archive.ts::realUnarchiveRepo` in production). Called ONLY when ownership is `ours-archived` AND `opts.confirmUnarchive === true` — see `ControlRepoOptions.confirmUnarchive`'s doc + `provisionControlRepo`'s `'archived'`/`'revived'` outcome split. */
+  readonly unarchiveRepo: (repo: string) => Promise<void>;
   readonly cloneRepo: (url: string, destDir: string) => Promise<void>;
   readonly commitAndPush: (dir: string, message: string) => Promise<'pushed' | 'nothing-to-commit'>;
 }
@@ -290,12 +297,28 @@ export interface ControlRepoOptions {
   readonly commitMessage?: (repo: string) => string;
   /** Injectable so tests get a deterministic checkout dir instead of a fresh `mkdtemp` each run. Defaults to `mkdtempSync(tmpdir(), prefix)`. */
   readonly makeScratchDir?: (prefix: string) => string;
+  /**
+   * DR-043 Amendment G (groundnuty/macf#867) — the revival confirm gate.
+   * `false`/absent (the safe default) means `provisionControlRepo` NEVER
+   * un-archives an `ours-archived` control repo, no matter how the run got
+   * invoked — it aborts with `status: 'archived'` instead (see that
+   * function's doc). `true` means the caller has ALREADY obtained the
+   * confirm-required plan-approve-once "yes" for this run (`apply-fleet.ts`
+   * sets this from `bootstrap-apply.ts`'s single approval prompt) — un-
+   * archiving reverses a state the operator deliberately set, so it must
+   * never be inferred from anything less than that explicit approval.
+   */
+  readonly confirmUnarchive?: boolean;
 }
 
 export type ControlRepoOutcome =
   | { readonly status: 'created'; readonly repo: string; readonly localDir: string }
   | { readonly status: 'reused'; readonly repo: string; readonly localDir: string }
+  /** DR-043 Amendment G — was `ours-archived`, `opts.confirmUnarchive` was `true`, `deps.unarchiveRepo` was called BEFORE any clone/push, then reused normally. Distinct from `'reused'` so a caller can log/render "this fleet was just revived" rather than a silent ordinary reuse. */
+  | { readonly status: 'revived'; readonly repo: string; readonly localDir: string }
   | { readonly status: 'foreign'; readonly repo: string; readonly reason: string }
+  /** DR-043 Amendment G — `ours-archived` but `opts.confirmUnarchive` was NOT `true`. Abort-like: nothing is cloned, nothing is touched, `deps.unarchiveRepo` is NEVER called (the whole point — un-archiving must never be silent). The caller aborts the run, same as `foreign`/`failed`. */
+  | { readonly status: 'archived'; readonly repo: string; readonly reason: string }
   | { readonly status: 'failed'; readonly repo: string; readonly reason: string };
 
 function defaultCloneUrl(repo: string): string {
@@ -329,9 +352,9 @@ function readManifestSourceOrFallback(manifest: FleetManifest, manifestPath: str
  * Provision `<fleet>-control` — the FIRST mutating step of an apply run (see
  * module doc). NEVER throws (the whole body is one try/catch — a throwing
  * `checkMeta`/`readManifestFile` resolves to `status: 'failed'` the same as
- * a throwing `createRepo`/`cloneRepo`/`commitAndPush`); every failure
- * resolves into a `foreign` or `failed` {@link ControlRepoOutcome} for the
- * caller to abort on.
+ * a throwing `createRepo`/`unarchiveRepo`/`cloneRepo`/`commitAndPush`);
+ * every failure resolves into a `foreign`/`archived`/`failed`
+ * {@link ControlRepoOutcome} for the caller to abort on.
  *
  * - `absent` → `gh repo create` (no template — see `repo-create.ts`'s doc:
  *   the control repo holds only GitOps state, never agent-workspace
@@ -345,6 +368,15 @@ function readManifestSourceOrFallback(manifest: FleetManifest, manifestPath: str
  *   reconciliation of a changed local manifest against an already-live
  *   control repo is out of THIS increment's scope (Amendment D's phasing;
  *   see `apply-fleet.ts`'s module doc for the residual this leaves).
+ * - `ours-archived` (DR-043 Amendment G) → **never silently un-archived.**
+ *   `opts.confirmUnarchive !== true` (the default) → return `status:
+ *   'archived'` IMMEDIATELY, before touching `deps.unarchiveRepo`,
+ *   `deps.cloneRepo`, or anything else — abort-like, same as `foreign`.
+ *   `opts.confirmUnarchive === true` → `deps.unarchiveRepo(repo)` FIRST
+ *   (before any clone — a later push to this checkout needs the repo
+ *   writable again, and calling it first makes the un-archive the
+ *   unambiguous, independently-observable first act of this branch), then
+ *   proceed exactly like `ours` and return `status: 'revived'`.
  * - `foreign` / `unknown` → no repo is created, nothing is cloned; the
  *   caller (`apply-fleet.ts`) aborts the ENTIRE run before any consent gate.
  */
@@ -357,7 +389,11 @@ export async function provisionControlRepo(
   const repo = controlRepoFullName(manifest);
   try {
     const meta = await deps.checkMeta(repo);
-    const manifestFileContent = meta.presence === 'present' && meta.archived !== true ? await deps.readManifestFile(repo) : undefined;
+    // DR-043 Amendment G: read `fleet.yaml` whenever the repo is PRESENT,
+    // regardless of `meta.archived` — reads work on an archived repo
+    // (read-only ≠ unreadable), and `classifyControlRepoOwnership` needs the
+    // content to discriminate `ours-archived` from `foreign` by name-match.
+    const manifestFileContent = meta.presence === 'present' ? await deps.readManifestFile(repo) : undefined;
     const ownership = classifyControlRepoOwnership(meta, manifestFileContent, manifest);
 
     if (ownership.kind === 'foreign') {
@@ -374,6 +410,20 @@ export async function provisionControlRepo(
         reason: `could not confirm whether "${repo}" already exists (auth / network / rate-limit) — refusing to create OR reuse a control repo without a confident existence read. Re-run once the check can complete.`,
       };
     }
+    if (ownership.kind === 'ours-archived' && opts?.confirmUnarchive !== true) {
+      // Amendment G: un-archiving reverses a state the operator DELIBERATELY
+      // set — never inferred, never flipped as a side effect of a plain
+      // `apply` run. `deps.unarchiveRepo` is NOT called on this path.
+      return {
+        status: 'archived',
+        repo,
+        reason:
+          `"${repo}" is this fleet's OWN control repo, but it is ARCHIVED (DR-043 Amendment G — a deliberate, ` +
+          'reversible `macf fleet archive` state). Revival is free but NOT automatic: re-run with confirmation ' +
+          '(the plan-approve-once "yes" that authorizes this apply run must have shown the control-repo-archived ' +
+          'item) to un-archive + resume normal reconcile.',
+      };
+    }
 
     const cloneUrl = opts?.cloneUrl ?? defaultCloneUrl;
     const makeScratchDir = opts?.makeScratchDir ?? ((prefix: string) => mkdtempSync(join(tmpdir(), prefix)));
@@ -385,6 +435,12 @@ export async function provisionControlRepo(
 
     if (ownership.kind === 'absent') {
       await deps.createRepo(repo);
+    }
+    if (ownership.kind === 'ours-archived') {
+      // Reached only when opts.confirmUnarchive === true (the branch above
+      // returned already otherwise). Un-archive BEFORE any clone/push — see
+      // this function's doc.
+      await deps.unarchiveRepo(repo);
     }
     await deps.cloneRepo(cloneUrl(repo), localDir);
     // Belt-and-suspenders (#857 review) — write/patch `.gitignore` on EVERY
@@ -398,6 +454,9 @@ export async function provisionControlRepo(
       writeFileSync(join(localDir, 'fleet.yaml'), manifestYaml, 'utf-8');
       await deps.commitAndPush(localDir, (opts?.commitMessage ?? defaultCommitMessage)(repo));
       return { status: 'created', repo, localDir };
+    }
+    if (ownership.kind === 'ours-archived') {
+      return { status: 'revived', repo, localDir };
     }
     return { status: 'reused', repo, localDir };
   } catch (err) {

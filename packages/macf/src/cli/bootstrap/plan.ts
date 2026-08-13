@@ -99,6 +99,16 @@ export interface ObservedState {
   readonly vaultCa?: VaultCaObservation;
   /** The `MACF_ROUTING_RUNS_ON` value observed on a caller repo, if any. */
   readonly routingRunsOn?: string;
+  /**
+   * DR-043 Amendment G (groundnuty/macf#867) — the `<fleet>-control` repo's
+   * own presence. REQUIRED, not optional: an unobservable read must render
+   * as honest-`unknown` (Amendment A4), never silently default to "not
+   * archived" — an optional field defaulting that way would make an
+   * unconfirmed archive state look identical to a confirmed-live fleet.
+   */
+  readonly controlRepoPresence: Presence;
+  /** Only meaningful when `controlRepoPresence === 'present'` — same convention as `control-repo.ts`'s `ControlRepoMeta.archived`. `undefined` when the archived bit itself couldn't be read. */
+  readonly controlRepoArchived?: boolean;
 }
 
 /** Produces an `ObservedState` for a manifest. Implemented by `observer.ts`'s `githubRegistryObserver`; faked in tests. */
@@ -106,7 +116,7 @@ export type FleetObserverFn = (manifest: FleetManifest) => Promise<ObservedState
 
 // --- Plan ---
 
-export type PlanItemKind = 'app' | 'repo' | 'install' | 'secret_fingerprint' | 'ca' | 'routing' | 'agent';
+export type PlanItemKind = 'app' | 'repo' | 'install' | 'secret_fingerprint' | 'ca' | 'routing' | 'agent' | 'control_repo';
 export type PlanVerb = 'create' | 'update' | 'noop' | 'report-extra';
 
 export interface PlanItem {
@@ -271,6 +281,18 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // 'create' or 'update' (noop/report-extra returned above), so this is
       // exhaustive over the two remaining verbs.
       return item.verb === 'create' ? 'implemented' : 'not_implemented';
+    case 'control_repo':
+      // DR-043 Amendment G (macf#867): the ONLY verb `controlRepoItem` ever
+      // emits is `update` (fired only when archived === true), and
+      // `apply-fleet.ts::provisionControlRepo` DOES action it — un-archives
+      // on the SAME plan-approve-once confirmation this whole render is
+      // building toward (`bootstrap-apply.ts`'s `resolveMutateDeps` sets
+      // `controlRepoOptions: { confirmUnarchive: true }` unconditionally
+      // once the operator has approved). Unlike `routing`'s `update` case,
+      // this one IS wired — `'not_implemented'` here would render a false
+      // "NOT IMPLEMENTED BY APPLY" warning about the very capability this
+      // increment built.
+      return 'implemented';
   }
 }
 
@@ -284,11 +306,13 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'agent':
     case 'repo':
     case 'ca':
+    case 'control_repo':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
-      // 2). Kept exhaustive so a NEW `PlanItemKind` added later is a compile
-      // error here, not a silent "apply covers everything" false-negative.
+      // 2, 'control_repo' in macf#867 / DR-043 Amendment G). Kept exhaustive
+      // so a NEW `PlanItemKind` added later is a compile error here, not a
+      // silent "apply covers everything" false-negative.
       return 'apply has no code path for this item (unclassified — this reason string should be unreachable)';
   }
 }
@@ -485,13 +509,46 @@ function routingItem(fleetName: string, desiredRunsOn: string, observedRunsOn: s
 }
 
 /**
- * The pure §D3 three-verb reconcile. Deterministic ordering: per-agent items
- * (app, repo, install, secret_fingerprint) in manifest `agents[]` order, then
- * the CA items (registry, then one per agent repo in manifest order — a MACF
- * fleet always needs a CA, so these are UNCONDITIONAL as of macf#839 review
- * nit 5, not gated on `trust:` being declared), then the routing item (only
- * when `routing.runner` is declared), then report-extra items for any
- * observed agent NOT in the manifest, sorted by role for determinism.
+ * DR-043 Amendment G (groundnuty/macf#867) — surfaces an ARCHIVED control
+ * repo as a DELIBERATE fleet state, not as drift. Fires ONLY when the repo
+ * is observed present AND archived — the ordinary (non-archived, absent, or
+ * unconfirmed) cases emit nothing, same "silent unless there's something to
+ * say" convention `computeSkippedSections` already uses. `verb: 'update'` +
+ * `confirm_required: true` is the closest existing vocabulary for "not
+ * noop, needs the operator's plan-approve-once yes before apply acts" — but
+ * the REASON text deliberately does NOT use "observed X but manifest
+ * declares Y" phrasing (the pattern `routingItem` uses for genuine drift):
+ * this isn't a mismatched VALUE, it's a state the operator set on purpose
+ * via a prior `macf fleet archive`, and the wording says so explicitly so
+ * it never reads as an error.
+ */
+export const CONTROL_REPO_ARCHIVED_REASON =
+  'control repo is ARCHIVED (DR-043 Amendment G) — a DELIBERATE, reversible fleet state set by a prior ' +
+  '`macf fleet archive`, NOT drift. Approving this plan authorizes `apply` to un-archive it (one API PATCH, ' +
+  'zero browser consent clicks) and resume normal reconcile.';
+
+function controlRepoItem(presence: Presence, archived: boolean | undefined): PlanItem | undefined {
+  if (presence !== 'present' || archived !== true) return undefined;
+  return {
+    kind: 'control_repo',
+    target: 'control_repo:archived',
+    verb: 'update',
+    reason: CONTROL_REPO_ARCHIVED_REASON,
+    confirm_required: true,
+  };
+}
+
+/**
+ * The pure §D3 three-verb reconcile. Deterministic ordering: the
+ * control-repo-archived item FIRST when applicable (DR-043 Amendment G —
+ * mirrors `apply-fleet.ts`'s own "control repo is step 0, before any
+ * per-agent processing" ordering), then per-agent items (app, repo, install,
+ * secret_fingerprint) in manifest `agents[]` order, then the CA items
+ * (registry, then one per agent repo in manifest order — a MACF fleet
+ * always needs a CA, so these are UNCONDITIONAL as of macf#839 review nit 5,
+ * not gated on `trust:` being declared), then the routing item (only when
+ * `routing.runner` is declared), then report-extra items for any observed
+ * agent NOT in the manifest, sorted by role for determinism.
  *
  * NEVER emits a delete/prune verb (§D3 "play it safe" — Design invariant 4).
  */
@@ -499,6 +556,9 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
   const fleetName = manifest.metadata.name;
   const seg = toVariableSegment(fleetName);
   const items: PlanItem[] = [];
+
+  const controlRepo = controlRepoItem(observed.controlRepoPresence, observed.controlRepoArchived);
+  if (controlRepo !== undefined) items.push(controlRepo);
 
   for (const agent of manifest.agents) {
     const obs = observed.agents[agent.role];

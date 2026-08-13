@@ -48,6 +48,7 @@ import { applyFleet } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
 import { checkControlRepoMeta, realControlRepoCommitAndPush, realReadControlManifestFile } from '../bootstrap/control-repo.js';
+import { realUnarchiveRepo } from '../bootstrap/repo-archive.js';
 import { checkRepoExists, checkRepoVariablePresence, checkRegistryVariablePresence, readRegistryVariable } from '../bootstrap/observer.js';
 import { realCreateRepo } from '../bootstrap/repo-create.js';
 import type { CaApplyDeps } from '../bootstrap/apply-ca.js';
@@ -216,6 +217,7 @@ const REAL_CONTROL_REPO_DEPS: ControlRepoDeps = {
   checkMeta: checkControlRepoMeta,
   readManifestFile: realReadControlManifestFile,
   createRepo: realCreateRepo,
+  unarchiveRepo: realUnarchiveRepo,
   cloneRepo: realCloneRepo,
   commitAndPush: realControlRepoCommitAndPush,
 };
@@ -264,6 +266,15 @@ export function resolveMutateDeps(manifestPath: string): MutateApplyDeps {
     repoInitDeps,
     vaultDeps: {},
     controlRepoDeps: REAL_CONTROL_REPO_DEPS,
+    // DR-043 Amendment G — reaching `applyFleet` at all means the operator
+    // already gave the ONE plan-approve-once "yes" this run needed (see
+    // `runBootstrapApply` below); if that plan showed a control-repo-
+    // archived item (`plan.ts`'s new `control_repo` kind), THIS is the
+    // approval that authorizes `provisionControlRepo` to un-archive it.
+    // `false`/absent is the only unsafe alternative here — never invert
+    // this to a conditional without also re-deriving it from the actual
+    // approved plan.
+    controlRepoOptions: { confirmUnarchive: true },
     agentRepoDeps: REAL_AGENT_REPO_DEPS,
     trustDeps: REAL_TRUST_DEPS,
     now: () => new Date(),
@@ -305,8 +316,12 @@ function formatControlRepoLine(result: FleetApplyResult): string {
       return `CREATED "${cr.repo}" (checkout: ${cr.localDir})`;
     case 'reused':
       return `REUSED "${cr.repo}" (checkout: ${cr.localDir})`;
+    case 'revived':
+      return `REVIVED "${cr.repo}" (was archived — DR-043 Amendment G; checkout: ${cr.localDir})`;
     case 'foreign':
       return `⚠ ABORTED — "${cr.repo}" exists but is not this fleet's control repo: ${cr.reason}`;
+    case 'archived':
+      return `⚠ ABORTED — "${cr.repo}" is archived and revival was not confirmed: ${cr.reason}`;
     case 'failed':
       return `⚠ ABORTED — could not provision "${cr.repo}": ${cr.reason}`;
   }
@@ -491,14 +506,16 @@ export function fleetApplyResultToJson(result: FleetApplyResult, unimplemented: 
 
 /**
  * Non-zero when: the control repo could not be provisioned this run
- * (`foreign`/`failed`, macf#857 — the entire run aborted), OR the final
- * control-repo sync failed (durable-locally-but-not-pushed is still an
- * operator-attention state), OR ANY agent needs operator attention
- * (failed/drift/skipped-unverified/repo-init-failed), OR the vault write
- * failed.
+ * (`foreign`/`failed`/`archived` — DR-043 Amendment G added `archived`
+ * alongside macf#857's `foreign`/`failed`; the entire run aborted in all
+ * three cases), OR the final control-repo sync failed (durable-locally-but-
+ * not-pushed is still an operator-attention state), OR ANY agent needs
+ * operator attention (failed/drift/skipped-unverified/repo-init-failed), OR
+ * the vault write failed.
  */
 export function applyExitCode(result: FleetApplyResult): number {
-  const controlRepoBad = result.controlRepo.status === 'foreign' || result.controlRepo.status === 'failed';
+  const controlRepoBad =
+    result.controlRepo.status === 'foreign' || result.controlRepo.status === 'failed' || result.controlRepo.status === 'archived';
   const controlRepoSyncBad = result.controlRepoSync.status === 'failed';
   const agentBad = result.agents.some(
     (rec) =>

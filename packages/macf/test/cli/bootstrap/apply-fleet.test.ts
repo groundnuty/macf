@@ -63,6 +63,9 @@ function controlRepoDepsFor(): ControlRepoDeps {
     checkMeta: async () => ({ presence: 'absent' }),
     readManifestFile: async () => undefined,
     createRepo: async () => {},
+    unarchiveRepo: async () => {
+      throw new Error('must not be called — this file\'s default control repo is always absent, never ours-archived');
+    },
     cloneRepo: async () => {},
     commitAndPush: async () => 'pushed',
   };
@@ -781,6 +784,9 @@ trust:
       readManifestFile: async () => undefined,
       createRepo: async () => {
         calls.push('control:create');
+      },
+      unarchiveRepo: async () => {
+        throw new Error('must not be called — this test\'s control repo is always absent, never ours-archived');
       },
       cloneRepo: async () => {
         calls.push('control:clone');
