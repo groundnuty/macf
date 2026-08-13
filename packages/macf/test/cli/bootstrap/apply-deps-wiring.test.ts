@@ -37,6 +37,7 @@ import { realCreateRegistryVariable, realCreateRepoVariable, realMintCa } from '
 import { realDeleteRegistryVariable } from '../../../src/cli/bootstrap/variable-write.js';
 import { checkRegistryVariablePresence, checkRepoVariablePresence, readRegistryVariable } from '../../../src/cli/bootstrap/observer.js';
 import { resolveDeleteAppsDeps, resolveDestroyDeps } from '../../../src/cli/commands/fleet-teardown-destructive.js';
+import { checkAppSlugPresence } from '../../../src/cli/bootstrap/app-identity-removal.js';
 
 describe('apply real-deps wiring (macf#857 — the seam a unit test cannot see)', () => {
   const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml');
@@ -147,6 +148,10 @@ describe('fleet delete-apps / destroy real-deps wiring (DR-043 Amendment G, macf
     expect(deleteAppsDeps.archiveRepo).toBe(realArchiveRepo);
   });
 
+  it('delete-apps: wires the App-already-gone presence read to the real live check (groundnuty/macf#917)', () => {
+    expect(deleteAppsDeps.checkAppPresence).toBe(checkAppSlugPresence);
+  });
+
   it('destroy: wires ownership reads to the SAME primitives every other rung uses', () => {
     expect(destroyDeps.checkMeta).toBe(checkControlRepoMeta);
     expect(destroyDeps.readManifestFile).toBe(realReadControlManifestFile);
@@ -167,5 +172,9 @@ describe('fleet delete-apps / destroy real-deps wiring (DR-043 Amendment G, macf
 
   it('destroy: wires the fleet.lock App-ID enrichment read to the real control-repo primitive', () => {
     expect(destroyDeps.readFleetLock).toBe(realReadControlFleetLockFile);
+  });
+
+  it('destroy: wires the App-already-gone presence read to the real live check (groundnuty/macf#917)', () => {
+    expect(destroyDeps.checkAppPresence).toBe(checkAppSlugPresence);
   });
 });

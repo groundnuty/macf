@@ -289,7 +289,8 @@ export function evaluateShredRequest(input: ShredRequestInput): ShredRequestDeci
 
 export interface RepoDestroyOutcome {
   readonly repo: string;
-  readonly status: 'deleted' | 'failed';
+  /** `'already-absent'` — groundnuty/macf#917 — see `repo-destroy.ts::realDeleteRepo`'s doc for the idempotency ruling this status carries through. */
+  readonly status: 'deleted' | 'already-absent' | 'failed';
   readonly reason?: string;
 }
 
@@ -297,13 +298,13 @@ export interface DestroyRepoDeps {
   readonly deleteRepo: DeleteRepoFn;
 }
 
-/** Delete every target repo. NEVER throws — same per-target failure isolation as `executeArchiveRepos`/`executeDeactivate`. */
+/** Delete every target repo. NEVER throws — same per-target failure isolation as `executeArchiveRepos`/`executeDeactivate`. Pushes `deps.deleteRepo`'s own result directly (`'deleted'` or `'already-absent'`) rather than assuming success, same shape as `executeDeactivate`'s `deleteRegistryVariable` call. */
 export async function executeDestroyRepos(repos: readonly string[], deps: DestroyRepoDeps): Promise<readonly RepoDestroyOutcome[]> {
   const out: RepoDestroyOutcome[] = [];
   for (const repo of repos) {
     try {
-      await deps.deleteRepo(repo);
-      out.push({ repo, status: 'deleted' });
+      const status = await deps.deleteRepo(repo);
+      out.push({ repo, status });
     } catch (err) {
       out.push({ repo, status: 'failed', reason: errMessage(err) });
     }

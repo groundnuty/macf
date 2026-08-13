@@ -386,7 +386,10 @@ describe('executeArchiveRepos', () => {
   it('archives every repo in the given order, all succeeding', async () => {
     const repos = computeArchiveRepoTargets(MANIFEST);
     const archived: string[] = [];
-    const deps: TeardownRepoArchiveDeps = { archiveRepo: async (repo) => { archived.push(repo); } };
+    const deps: TeardownRepoArchiveDeps = {
+      checkMeta: async () => ({ presence: 'present', archived: false }),
+      archiveRepo: async (repo) => { archived.push(repo); },
+    };
     const outcomes = await executeArchiveRepos(repos, deps);
     expect(outcomes.every((o) => o.status === 'archived')).toBe(true);
     expect(archived).toEqual(repos);
@@ -395,6 +398,7 @@ describe('executeArchiveRepos', () => {
   it('one repo failing does NOT abort the rest — every repo is attempted, failures isolated per-repo', async () => {
     const repos = computeArchiveRepoTargets(MANIFEST);
     const deps: TeardownRepoArchiveDeps = {
+      checkMeta: async () => ({ presence: 'present', archived: false }),
       archiveRepo: async (repo) => {
         if (repo === repos[1]) throw new Error('branch protection blocks archive');
       },
@@ -405,5 +409,46 @@ describe('executeArchiveRepos', () => {
     expect(failed).toHaveLength(1);
     expect(failed[0]?.repo).toBe(repos[1]);
     expect(failed[0]?.reason).toMatch(/branch protection/);
+  });
+
+  // --- groundnuty/macf#917 — the state-read invariant, never an error-shape match ---
+
+  it('already-archived (state read confirms it) -> reported as already-archived, and the PATCH seam (archiveRepo) is NEVER called', async () => {
+    const repos = computeArchiveRepoTargets(MANIFEST);
+    let archiveCalled = false;
+    const deps: TeardownRepoArchiveDeps = {
+      checkMeta: async () => ({ presence: 'present', archived: true }),
+      archiveRepo: async () => {
+        archiveCalled = true;
+      },
+    };
+    const outcomes = await executeArchiveRepos(repos, deps);
+    expect(outcomes.every((o) => o.status === 'already-archived')).toBe(true);
+    expect(archiveCalled).toBe(false);
+  });
+
+  it('a genuine 403 (NOT already-archived — checkMeta confirms archived: false) still fails loudly, never silently swallowed', async () => {
+    const repos = computeArchiveRepoTargets(MANIFEST);
+    const deps: TeardownRepoArchiveDeps = {
+      checkMeta: async () => ({ presence: 'present', archived: false }),
+      archiveRepo: async () => {
+        throw new Error('gh api archive-repo failed: HTTP 403: Resource not accessible by integration');
+      },
+    };
+    const outcomes = await executeArchiveRepos(repos, deps);
+    expect(outcomes.every((o) => o.status === 'failed')).toBe(true);
+    expect(outcomes.every((o) => o.reason?.includes('403'))).toBe(true);
+  });
+
+  it('an inconclusive checkMeta read (unknown) does NOT refuse — falls through to attempting the PATCH, same as absent', async () => {
+    const repos = computeArchiveRepoTargets(MANIFEST);
+    const archived: string[] = [];
+    const deps: TeardownRepoArchiveDeps = {
+      checkMeta: async () => ({ presence: 'unknown' }),
+      archiveRepo: async (repo) => { archived.push(repo); },
+    };
+    const outcomes = await executeArchiveRepos(repos, deps);
+    expect(outcomes.every((o) => o.status === 'archived')).toBe(true);
+    expect(archived).toEqual(repos);
   });
 });

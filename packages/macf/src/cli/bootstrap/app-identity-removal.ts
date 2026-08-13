@@ -29,13 +29,23 @@
  *     promises, so this module deliberately does NOT call it.
  *
  * So this module's ENTIRE job for the App-identity rung is: compute the
- * exact per-agent target set (pure, no I/O), then REPORT — never mutate,
- * never claim success. This is Amendment G's "report what could not be
+ * exact per-agent target set (pure, no I/O), OPTIONALLY read whether the
+ * predicted slug is still live ({@link checkAppSlugPresence},
+ * groundnuty/macf#917 — a READ, never a mutation), then REPORT — never
+ * mutate, never claim success beyond "already absent" when a live read
+ * actually confirms it. This is Amendment G's "report what could not be
  * done, never exit green" rail at its starkest: for this ONE rung, there is
- * NOTHING this codebase can do besides report and point at the URL.
+ * NOTHING this codebase can do besides report and point at the URL, or —
+ * now — honestly report that there is nothing left even to point at.
  */
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle, parseFleetLock } from './fleet-manifest.js';
+import type { Presence } from './plan.js';
+import { getStderr } from './observer.js';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Cited in every report line so an operator reading `delete-apps`/`destroy`
@@ -144,14 +154,31 @@ export interface AppDeletionOutcome {
   readonly settingsUrl: string;
   /** Carried through from {@link AppIdentityTarget.appId} — see that field's doc. */
   readonly appId?: string;
-  /** ALWAYS `'manual-action-required'` — see module doc; this codebase can never honestly report `'deleted'` for this rung. */
-  readonly status: 'manual-action-required';
+  /**
+   * `'already-absent'` — groundnuty/macf#917 — ONLY when `deps.checkAppPresence`
+   * was supplied AND returned `'absent'` (a confirmed 404 at the predicted
+   * slug; see {@link checkAppSlugPresence}'s doc for the "predicted, not
+   * GitHub-confirmed" caveat this status carries into `reason`). Every OTHER
+   * case (no check wired, `'present'`, `'unknown'`) stays
+   * `'manual-action-required'` — see module doc: this codebase can never
+   * honestly report `'deleted'`, but it CAN now honestly report "nothing
+   * left to do" once a live read confirms it.
+   */
+  readonly status: 'manual-action-required' | 'already-absent';
   readonly reason: string;
 }
 
 export interface AppDeletionDeps {
   /** Best-effort browser-open, same non-fatal posture as `apply-agent.ts`'s `announceAndOpenGate` — optional so a headless/CI/test caller can omit it entirely. */
   readonly openUrl?: (url: string) => Promise<void>;
+  /**
+   * Optional live presence check (groundnuty/macf#917) — see
+   * {@link checkAppSlugPresence}. Omitted entirely, every target reports
+   * `'manual-action-required'` exactly as before this fix (backward
+   * compatible, never a new precondition — same additive posture as
+   * `readFleetLock` one layer up in `teardown-destructive.ts`).
+   */
+  readonly checkAppPresence?: (appSlug: string) => Promise<Presence>;
 }
 
 function errMessage(err: unknown): string {
@@ -159,12 +186,60 @@ function errMessage(err: unknown): string {
 }
 
 /**
- * Report every App-identity target — NEVER mutates anything, NEVER returns
- * a status other than `'manual-action-required'`. `log` receives the
- * human-facing line BEFORE `deps.openUrl` is attempted — same "print before
- * open" ordering `apply-agent.ts`'s `announceAndOpenGate` doc establishes (a
- * live provisioning run showed `openUrl()` can silently misfire, so the URL
- * must already be on-screen before the open is even attempted).
+ * Best-effort LIVE presence read for an App's PREDICTED slug —
+ * groundnuty/macf#917's `delete-apps`/`destroy` idempotency: re-running
+ * either rung after the App was ALREADY manually deleted (the operator
+ * completed the browser click-path this rung can only ever recommend)
+ * should report "already absent," never instruct the browser deletion of
+ * something that no longer exists.
+ *
+ * `GET /apps/{app_slug}` — unlike `identity-confirm.ts`'s
+ * `GET /app/installations` — needs NO App-owned JWT; it is queryable with
+ * ANY authenticated token (verified against the current GitHub REST docs,
+ * `https://docs.github.com/en/rest/apps/apps#get-an-app`, 2026-08-13: "same
+ * response schema as Get the authenticated app," 404 when the slug doesn't
+ * exist, no App-JWT requirement documented). So this module's existing "no
+ * vault-read access to a confirmed slug" limit (module doc) does NOT block
+ * this read — the operator's own ambient `gh` auth is sufficient, same as
+ * `control-repo.ts::checkControlRepoMeta`'s repo-presence read.
+ *
+ * **Caveat, carried into the caller's report text.** `appSlug` here is
+ * STILL {@link AppIdentityTarget.appSlug}'s PREDICTION, never a GitHub-
+ * confirmed real slug — a 404 at the predicted slug means "nothing at THIS
+ * exact slug," a strong but not airtight already-absent signal (if GitHub
+ * appended a disambiguating suffix at creation, the real App could still be
+ * alive under a slug this check never queries — {@link AppIdentityTarget.appSlug}'s
+ * own doc names the same limitation). This is why a 404 here degrades to
+ * `'absent'`, never silently upgraded to "confirmed deleted" — the same
+ * present-detector-honesty posture `identity-confirm.ts`'s module doc
+ * establishes for the sibling identity-plane read (DR-043 Amendment A),
+ * applied to this simpler, JWT-free endpoint.
+ *
+ * A non-404 failure (auth, network, rate-limit, `gh` missing) degrades to
+ * `'unknown'` — NEVER throws, matching every other presence-read primitive
+ * in this package (`checkControlRepoMeta`, `checkRepoExists`).
+ */
+export async function checkAppSlugPresence(appSlug: string): Promise<Presence> {
+  try {
+    await execFileAsync('gh', ['api', `apps/${appSlug}`], { encoding: 'utf-8' });
+    return 'present';
+  } catch (err) {
+    const stderr = getStderr(err);
+    if (/HTTP 404|Not Found/i.test(stderr)) return 'absent';
+    return 'unknown';
+  }
+}
+
+/**
+ * Report every App-identity target — NEVER mutates anything. `log` receives
+ * the human-facing line BEFORE `deps.openUrl` is attempted — same "print
+ * before open" ordering `apply-agent.ts`'s `announceAndOpenGate` doc
+ * establishes (a live provisioning run showed `openUrl()` can silently
+ * misfire, so the URL must already be on-screen before the open is even
+ * attempted). When `deps.checkAppPresence` confirms `'absent'`
+ * (groundnuty/macf#917), the target short-circuits to `'already-absent'`
+ * BEFORE the manual-deletion line is logged and BEFORE `deps.openUrl` is
+ * ever attempted — there is nothing to open a browser tab for.
  */
 export async function reportAppIdentityRemoval(
   targets: readonly AppIdentityTarget[],
@@ -173,6 +248,17 @@ export async function reportAppIdentityRemoval(
 ): Promise<readonly AppDeletionOutcome[]> {
   const out: AppDeletionOutcome[] = [];
   for (const t of targets) {
+    const presence = deps.checkAppPresence ? await deps.checkAppPresence(t.appSlug) : 'unknown';
+    if (presence === 'absent') {
+      const reason =
+        `App "${t.appSlug}" returned 404 at its predicted slug — already absent, nothing to delete. (Slug is a ` +
+        'PREDICTION, not GitHub-confirmed; if a disambiguating suffix was appended at creation, verify via ' +
+        'Settings → Developer settings → GitHub Apps before assuming the App is fully gone.)';
+      log(`Role "${t.role}": ${reason}`);
+      out.push({ role: t.role, appSlug: t.appSlug, settingsUrl: t.settingsUrl, appId: t.appId, status: 'already-absent', reason });
+      continue;
+    }
+
     const slugCaveat = t.appId === undefined ? '(predicted slug — no fleet.lock entry to confirm it)' : `(predicted slug — confirmed App ID ${t.appId} from fleet.lock; use the ID to positively identify the App if the slug shown in Settings differs)`;
     log(`Role "${t.role}": App "${t.appSlug}" ${slugCaveat}. ${APP_DELETION_HAS_NO_REST_PATH_NOTE} Delete at: ${t.settingsUrl}`);
     if (deps.openUrl) {
