@@ -624,8 +624,22 @@ bootstrap
   .option('--dry-run', 'Render the plan + would-be App manifests; mutate nothing', false)
   .option('--yes', 'Skip the interactive plan-approval prompt (the one non-interactive escape from DR-035 §4 plan-approve-once)', false)
   .option('--json', 'Emit the structured result as JSON', false)
+  .option(
+    '--vault <path>',
+    'Path to a fleet\'s secrets/vault.age — with --identity-key, confirms a role WITH a prior fleet.lock ' +
+      'entry live against GitHub BEFORE deciding whether to open consent gate 1 (DR-043 Amendment A, macf#913). ' +
+      'Operator-privileged use only; omit for the vault-free default.',
+  )
+  .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
   .action(async (opts) => {
-    const code = await runBootstrapApply({ file: opts.file, dryRun: opts.dryRun, yes: opts.yes, json: opts.json });
+    const code = await runBootstrapApply({
+      file: opts.file,
+      dryRun: opts.dryRun,
+      yes: opts.yes,
+      json: opts.json,
+      vaultPath: opts.vault,
+      identityKeyPath: opts.identityKey,
+    });
     process.exitCode = code;
   });
 

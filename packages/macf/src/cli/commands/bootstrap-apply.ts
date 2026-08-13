@@ -20,15 +20,17 @@
  * only `role`/`status`/`appId`/`installId`/`reason`/paths off the outcomes,
  * never `credentials`.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
-import { resolve as resolvePath } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
 import { deriveAppHandle, parseFleetManifest } from '../bootstrap/fleet-manifest.js';
-import type { FleetObserverFn, FleetPlan, FleetPlanFailure, UnimplementedApplyItem } from '../bootstrap/plan.js';
+import type { FleetObserverFn, FleetPlan, FleetPlanFailure, ObservedState, UnimplementedApplyItem } from '../bootstrap/plan.js';
 import {
+  checkVaultFlagsComplete,
   computePlan,
   fleetPlanFailureToJson,
   fleetPlanToJson,
@@ -39,9 +41,10 @@ import {
 import { githubRegistryObserver, readFleetLock } from '../bootstrap/observer.js';
 import type { GitHubAppManifest } from '../bootstrap/app-manifest.js';
 import { buildAppManifest, repoHomepageUrl } from '../bootstrap/app-manifest.js';
-import { appInstallationUrl } from '../bootstrap/identity-confirm.js';
-import { realAgentApplyDeps } from '../bootstrap/apply-agent.js';
-import type { AgentApplyOutcome } from '../bootstrap/apply-agent.js';
+import { appInstallationUrl, confirmAppInstallation as realConfirmAppInstallation } from '../bootstrap/identity-confirm.js';
+import type { ExpectedIdentity, IdentityConfirmation } from '../bootstrap/identity-confirm.js';
+import { confirmBeforeCreateGuard, realAgentApplyDeps } from '../bootstrap/apply-agent.js';
+import type { AgentApplyOutcome, CreateGuardDecision, CreateGuardDeps } from '../bootstrap/apply-agent.js';
 import { realCloneRepo, realCommitAndPush } from '../bootstrap/apply-repo-init.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
 import { applyFleet } from '../bootstrap/apply-fleet.js';
@@ -54,6 +57,8 @@ import { realCreateRepo } from '../bootstrap/repo-create.js';
 import type { CaApplyDeps } from '../bootstrap/apply-ca.js';
 import { realCreateRegistryVariable, realCreateRepoVariable, realMintCa } from '../bootstrap/apply-ca.js';
 import type { EnsureVariableOutcome } from '../bootstrap/ensure-variable.js';
+import { readVault, vaultAgentPrivateKeyPem } from '../bootstrap/vault-read.js';
+import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -70,16 +75,54 @@ export interface RunBootstrapApplyOptions {
   readonly json?: boolean;
   /** Skip the interactive plan-approval prompt (DR-035 §4 plan-approve-once — this is the one non-interactive escape). */
   readonly yes?: boolean;
+  /**
+   * Vault-aware confirm-before-create (DR-043 Amendment A, macf#913) —
+   * mirrors `bootstrap plan`'s own `--vault`/`--identity-key` pair
+   * (`commands/bootstrap.ts`, `plan.ts::checkVaultFlagsComplete`). When BOTH
+   * are given, `apply` decrypts the vault in memory, recovers each agent's
+   * PEM, and confirms a role WITH a prior `fleet.lock` entry live against
+   * GitHub BEFORE deciding whether to open consent gate 1 — a confirmed App
+   * is reused, gate 1 is never opened (`resolveMutateDeps`'s `resolveKeyPath`
+   * wiring, consumed by `apply-agent.ts::confirmBeforeCreateGuard`).
+   * Omitting either (the default, unchanged behaviour) keeps `apply` exactly
+   * as it was before this flag existed. Half-given is refused loud.
+   */
+  readonly vaultPath?: string;
+  readonly identityKeyPath?: string;
 }
 
 export interface BootstrapApplyDeps {
   readonly observe: FleetObserverFn;
+  /**
+   * Injectable seam for tests (macf#913) — real default is
+   * `vault-read.ts::readVault`. Never invoked unless BOTH `opts.vaultPath`
+   * and `opts.identityKeyPath` were given (see `checkVaultFlagsComplete`).
+   */
+  readonly readVault?: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>;
+  /**
+   * Injectable seam for tests (macf#913) — real default is
+   * `identity-confirm.ts::confirmAppInstallation`. Used ONLY by the
+   * `--dry-run` / pre-approval vault-aware PREVIEW (a read-only GET,
+   * consistent with `--dry-run`'s "mutates nothing" contract); the real
+   * mutating path gets its OWN copy via `resolveMutateDeps`'s
+   * `buildAgentDeps` — this seam never influences what apply actually does.
+   */
+  readonly confirmAppInstallation?: (appId: string, keyPath: string, expected?: ExpectedIdentity) => Promise<IdentityConfirmation>;
 }
 
-/** Extends `apply-fleet.ts`'s `FleetApplyDeps` with the two apply-CLI-level seams: the plan-approval prompt + the prior-lock read. */
+/** Extends `apply-fleet.ts`'s `FleetApplyDeps` with the three apply-CLI-level seams: the plan-approval prompt, the prior-lock read, and vault-scratch cleanup. */
 export interface MutateApplyDeps extends FleetApplyDeps {
   readonly confirmPlan: (plan: FleetPlan, creations: readonly PlannedAppCreation[]) => Promise<boolean>;
   readonly readPriorLock: (manifestPath: string) => ReturnType<typeof readFleetLock>;
+  /**
+   * Cleanup for any vault-derived scratch PEM file(s) `resolveMutateDeps`'s
+   * `resolveKeyPath` closure wrote this run (macf#913) — see that function's
+   * doc. `undefined`/omitted is a no-op (vault-aware confirm wasn't
+   * configured this run, or a test's fake deps don't need one).
+   * `runBootstrapApply` ALWAYS invokes it in a `finally`, so a scratch PEM
+   * never outlives the run regardless of how `applyFleet` exits.
+   */
+  readonly cleanupVaultScratch?: () => void;
 }
 
 /** One agent's would-be App creation, paired with the plan item that motivated it. */
@@ -153,6 +196,173 @@ export function formatPlannedAppCreations(creations: readonly PlannedAppCreation
     parts.push(`      consent gate 2 (install, after gate 1 creates the App): ${c.installUrl}`);
   }
   return parts.join('\n');
+}
+
+// --- Vault-aware identity confirm — DR-043 Amendment A (macf#913) ---
+//
+// The false-promise this closes: through DR-043 Amendment D phase 3, ONLY
+// `plan` had `--vault`/`--identity-key` — `apply` had no such flags at all,
+// so `plan`'s own "a vault-aware confirm runs during apply" text
+// (`plan.ts::UNKNOWN_REASONS.identity`, fixed alongside this change) was
+// simply false. Consequence for a fleet whose App already exists but is
+// unconfirmable (the state after `macf fleet archive` + revival — DR-043
+// Amendment G): apply had no way to reuse it, so a role WITH a prior
+// `fleet.lock` entry fell all the way to `skip-unverified`
+// (`apply-agent.ts::confirmBeforeCreateGuard`'s existing, ALREADY-BUILT
+// `resolveKeyPath` seam — its own doc names this exact gap: "A future
+// increment wires this to the age-decrypted vault"). This section IS that
+// increment.
+
+/**
+ * Decrypt `opts.vaultPath`/`opts.identityKeyPath` (when BOTH given) into a
+ * per-ROLE PEM map — the shared vault-aware-confirm precondition for BOTH
+ * `--dry-run`'s preview and the real mutating path's confirm-before-create
+ * guard. `undefined` means "vault-aware confirm is NOT engaged this run" —
+ * either because the flags weren't given (the vault-free default, unchanged
+ * behaviour) OR because the decrypt failed.
+ *
+ * **Amendment A's honest-unknown floor applies to the failure case too:** a
+ * failed decrypt must never be read as "no App exists" nor fabricate a false
+ * "confirmed" — it degrades to EXACTLY the pre-macf#913 behaviour
+ * (fleet.lock-driven skip-unverified/create), the same floor
+ * `vaultAwareObserver` already establishes for `plan`. The causing error is
+ * logged via `log` (never `console.error`/`console.log` directly — this
+ * function has no opinion on whether the caller is mid-`--json` render) so
+ * the operator sees WHY vault-aware confirm didn't engage rather than
+ * silence; every `VaultError` message from `vault-read.ts` is pre-scrubbed
+ * of secret material at the source (see that module's doc), so logging it
+ * verbatim is safe — never a PEM, client secret, or webhook secret.
+ */
+async function resolveVaultAgentPems(
+  manifest: FleetManifest,
+  vaultOpts: Pick<RunBootstrapApplyOptions, 'vaultPath' | 'identityKeyPath'>,
+  doReadVault: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>,
+  log: (line: string) => void,
+): Promise<ReadonlyMap<string, string> | undefined> {
+  if (vaultOpts.vaultPath === undefined || vaultOpts.identityKeyPath === undefined) return undefined;
+
+  let raw: Readonly<Record<string, string>>;
+  try {
+    raw = await doReadVault({ vaultPath: vaultOpts.vaultPath, identityPath: vaultOpts.identityKeyPath });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    log(
+      `Vault-aware confirm UNAVAILABLE this run — ${reason} — falling back to the vault-free confirm-before-create ` +
+        'guard (DR-043 Amendment A: this is NOT evidence any App is absent, only that the vault could not be read).',
+    );
+    return undefined;
+  }
+
+  const pems = new Map<string, string>();
+  for (const agent of manifest.agents) {
+    const pem = vaultAgentPrivateKeyPem(raw, manifest.metadata.name, agent.role);
+    if (pem !== undefined) pems.set(agent.role, pem);
+  }
+  return pems;
+}
+
+/**
+ * Preview what `confirmBeforeCreateGuard` would decide for every agent —
+ * NEVER mutates (`confirmAppInstallation` is a read-only `GET`, consistent
+ * with `--dry-run`'s "mutates nothing" contract). Consulted by BOTH
+ * `--dry-run` (requirement: "surface which path it would take, before
+ * spending a click," macf#913) and the real mutating path's pre-approval
+ * render, so an operator never sees "N Apps would be created" when some
+ * would actually be silently reused.
+ *
+ * **This is a best-effort EXPLANATION, not the source of truth for what
+ * apply will do.** `prior` here comes from `observed.lock` — whatever
+ * `fleet.lock` this run's OBSERVER could see (the SAME source `plan.ts`'s
+ * own `app`/`install` items already read; for the default
+ * `githubRegistryObserver` that's the OPERATOR's LOCAL manifest directory,
+ * per that module's doc). The REAL apply-time decision is made
+ * independently inside `applyFleet` (via `resolveMutateDeps`'s
+ * `resolveKeyPath` wiring), using `fleet.lock` freshly re-read from the
+ * control-repo's OWN clone — which can see MORE than this preview when the
+ * operator's local directory has no copy (e.g. an archived-then-revived
+ * fleet whose lock lives only in `<fleet>-control`, never locally cloned;
+ * see `apply-fleet.ts`'s own "self-heal" comment). A stale/absent preview
+ * therefore never blocks or misdirects the real run — worst case it
+ * under-reports a reuse the real run still gets right.
+ */
+async function previewIdentityDecisions(
+  manifest: FleetManifest,
+  observed: ObservedState,
+  vaultAgentPems: ReadonlyMap<string, string>,
+  confirmAppInstallation: CreateGuardDeps['confirmAppInstallation'],
+): Promise<ReadonlyMap<string, CreateGuardDecision>> {
+  const scratchDirs: string[] = [];
+  const resolveKeyPath = (role: string): string | undefined => {
+    const pem = vaultAgentPems.get(role);
+    if (pem === undefined) return undefined;
+    const dir = mkdtempSync(join(tmpdir(), `macf-bootstrap-vault-preview-${role}-`));
+    scratchDirs.push(dir);
+    const path = join(dir, 'key.pem');
+    writeFileSync(path, pem, { mode: 0o600 });
+    return path;
+  };
+
+  const out = new Map<string, CreateGuardDecision>();
+  try {
+    for (const agent of manifest.agents) {
+      const prior = observed.lock?.agents.find((a) => a.role === agent.role);
+      const expected: ExpectedIdentity = {
+        appSlug: deriveAppHandle(manifest.metadata.name, agent.role),
+        accountLogin: manifest.owner.account,
+      };
+      const decision = await confirmBeforeCreateGuard(agent.role, prior, expected, { confirmAppInstallation, resolveKeyPath });
+      out.set(agent.role, decision);
+    }
+  } finally {
+    for (const dir of scratchDirs) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* best-effort — never let scratch-file cleanup mask the preview result */
+      }
+    }
+  }
+  return out;
+}
+
+/** Drop a planned creation whose vault-aware preview says it would NOT actually be created — reused, resumable, drifted, or refused-unverified all mean "gate 1 will not open for this role." Pure. */
+function filterCreationsByPreview(
+  creations: readonly PlannedAppCreation[],
+  preview: ReadonlyMap<string, CreateGuardDecision>,
+): readonly PlannedAppCreation[] {
+  return creations.filter((c) => (preview.get(c.role)?.action ?? 'create') === 'create');
+}
+
+/** One `<role>: <PATH>` line for {@link formatIdentityPreview} — never a credential value (`CreateGuardDecision` carries none). */
+function formatIdentityDecisionLine(role: string, decision: CreateGuardDecision): string {
+  switch (decision.action) {
+    case 'create':
+      return `  • ${role}: CREATE — no confirmed prior App; consent gate 1 WILL open.`;
+    case 'reuse-confirmed':
+      return (
+        `  • ${role}: REUSE — confirmed live (app_id ${decision.install.appId}, install_id ` +
+        `${decision.install.installId}); consent gate 1 will be SKIPPED.`
+      );
+    case 'resume-install':
+      return `  • ${role}: RESUME INSTALL — app_id ${decision.appId} exists with zero installs; gate 1 will be SKIPPED, gate 2 (install) will run.`;
+    case 'skip-unverified':
+      return `  • ${role}: SKIP (unverified) — ${decision.reason}`;
+    case 'drift':
+      return `  • ${role}: DRIFT — ${decision.reason}`;
+  }
+}
+
+/** Human render of the vault-aware confirm-before-create preview (macf#913) — never a credential value. */
+export function formatIdentityPreview(decisions: ReadonlyMap<string, CreateGuardDecision>): string {
+  return [
+    'Vault-aware identity confirm (DR-043 Amendment A) — which path each agent would take:',
+    ...[...decisions.entries()].map(([role, decision]) => formatIdentityDecisionLine(role, decision)),
+  ].join('\n');
+}
+
+/** `--json` render of the preview — never a credential value (every `CreateGuardDecision` variant carries only role/status/appId/installId/reason/installs, verified against `apply-agent.ts`'s own union). */
+function identityPreviewToJson(decisions: ReadonlyMap<string, CreateGuardDecision>): unknown {
+  return Object.fromEntries([...decisions.entries()].map(([role, decision]) => [role, { ...decision }]));
 }
 
 function renderFailure(failure: FleetPlanFailure, opts: RunBootstrapApplyOptions): number {
@@ -256,13 +466,39 @@ const REAL_TRUST_DEPS: CaApplyDeps = {
  * can. Pure — it builds a plain object and performs no I/O until a field is
  * invoked — so a test may call it directly.
  */
-export function resolveMutateDeps(manifestPath: string): MutateApplyDeps {
+export function resolveMutateDeps(manifestPath: string, vaultAgentPems?: ReadonlyMap<string, string>): MutateApplyDeps {
   const repoInitDeps: RepoInitStepDeps = { cloneRepo: realCloneRepo, commitAndPush: realCommitAndPush };
+
+  // macf#913 — the vault-aware confirm-before-create guard's key resolver.
+  // ONE scratch dir for the WHOLE run (not one per role), created lazily on
+  // first use so a vault-free run (the common case) never touches the
+  // filesystem for this. `undefined` — the field omitted entirely, not set
+  // to `undefined` — when no vault map was supplied: `confirmBeforeCreateGuard`
+  // then takes EXACTLY its pre-macf#913 path (skip-unverified for a role with
+  // a prior lock entry, unconditional create otherwise). `cleanupVaultScratch`
+  // below is `runBootstrapApply`'s obligation to call once the run is fully
+  // done — see `MutateApplyDeps.cleanupVaultScratch`'s doc.
+  let vaultScratchDir: string | undefined;
+  const resolveKeyPath =
+    vaultAgentPems !== undefined
+      ? (role: string): string | undefined => {
+          const pem = vaultAgentPems.get(role);
+          if (pem === undefined) return undefined;
+          vaultScratchDir ??= mkdtempSync(join(tmpdir(), 'macf-bootstrap-vault-confirm-'));
+          const path = join(vaultScratchDir, `${role}.pem`);
+          writeFileSync(path, pem, { mode: 0o600 });
+          return path;
+        }
+      : undefined;
+
   return {
     // `writeRecoveryArtifact` is deliberately absent here — `apply-fleet.ts`
     // splices it in (it owns the fleet-level context that seam needs; see
     // its module doc's "Recovery-artifact lifecycle" section).
-    buildAgentDeps: (log: (line: string) => void) => realAgentApplyDeps(realOpenUrl, log),
+    buildAgentDeps: (log: (line: string) => void) => ({
+      ...realAgentApplyDeps(realOpenUrl, log),
+      ...(resolveKeyPath !== undefined ? { resolveKeyPath } : {}),
+    }),
     repoInitDeps,
     vaultDeps: {},
     controlRepoDeps: REAL_CONTROL_REPO_DEPS,
@@ -293,6 +529,15 @@ export function resolveMutateDeps(manifestPath: string): MutateApplyDeps {
     // `provisionControlRepo` to run ahead of this call, which is a bigger
     // reshuffle than this increment's scope — left for a later phase.
     readPriorLock: () => readFleetLock(manifestPath),
+    cleanupVaultScratch: () => {
+      if (vaultScratchDir !== undefined) {
+        try {
+          rmSync(vaultScratchDir, { recursive: true, force: true });
+        } catch {
+          /* best-effort — never let scratch-file cleanup mask the apply result */
+        }
+      }
+    },
   };
 }
 
@@ -551,6 +796,15 @@ export async function runBootstrapApply(
   deps?: BootstrapApplyDeps,
   mutateDeps?: MutateApplyDeps,
 ): Promise<number> {
+  // macf#913 — mirrors `bootstrap plan`'s own XOR refusal
+  // (`plan.ts::checkVaultFlagsComplete`'s doc); fires BEFORE the
+  // manifest-file check, same ordering `plan` uses (an argument error, not a
+  // manifest error).
+  const vaultFlagsFailure = checkVaultFlagsComplete(opts.vaultPath, opts.identityKeyPath);
+  if (vaultFlagsFailure !== undefined) {
+    return renderFailure(vaultFlagsFailure, opts);
+  }
+
   const manifestPath = resolvePath(opts.file);
   if (!existsSync(manifestPath)) {
     return renderFailure({ code: 'manifest_not_found', message: `fleet manifest not found: ${manifestPath}` }, opts);
@@ -570,17 +824,41 @@ export async function runBootstrapApply(
   }
 
   const resolved = deps ?? { observe: (m: FleetManifest) => githubRegistryObserver(m, manifestPath) };
+  const stderrLog = (line: string): void => {
+    process.stderr.write(`${line}\n`);
+  };
 
   try {
     const observed = await resolved.observe(manifest);
     const plan = computePlan(manifest, observed);
     const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
 
+    // macf#913 — decrypted ONCE (when both flags given), shared by BOTH the
+    // `--dry-run` preview below and the real mutating path's
+    // confirm-before-create guard (`resolveMutateDeps`). See
+    // `resolveVaultAgentPems`'s doc for the honest-unknown degrade-on-failure
+    // contract.
+    const vaultAgentPems = await resolveVaultAgentPems(manifest, opts, deps?.readVault ?? readVault, stderrLog);
+    const preview =
+      vaultAgentPems !== undefined
+        ? await previewIdentityDecisions(manifest, observed, vaultAgentPems, deps?.confirmAppInstallation ?? realConfirmAppInstallation)
+        : undefined;
+    // requirement 4 (macf#913): an operator must learn which path apply
+    // would ACTUALLY take before spending a browser click — a role the
+    // preview confirms live is dropped from "would be created" in BOTH the
+    // `--dry-run` render below AND the real path's pre-approval render.
+    const displayCreations = preview !== undefined ? filterCreationsByPreview(creations, preview) : creations;
+
     if (opts.dryRun === true) {
       if (opts.json) {
         console.log(
           JSON.stringify(
-            { ...(fleetPlanToJson(plan) as Record<string, unknown>), dry_run: true, planned_app_creations: creations.map((c) => ({ ...c })) },
+            {
+              ...(fleetPlanToJson(plan) as Record<string, unknown>),
+              dry_run: true,
+              planned_app_creations: displayCreations.map((c) => ({ ...c })),
+              ...(preview !== undefined ? { vault_identity_preview: identityPreviewToJson(preview) } : {}),
+            },
             null,
             2,
           ),
@@ -588,7 +866,11 @@ export async function runBootstrapApply(
       } else {
         console.log(formatPlanText(plan));
         console.log('');
-        console.log(formatPlannedAppCreations(creations));
+        console.log(formatPlannedAppCreations(displayCreations));
+        if (preview !== undefined) {
+          console.log('');
+          console.log(formatIdentityPreview(preview));
+        }
         console.log('');
         console.log('DRY RUN — nothing was created, changed, or submitted.');
       }
@@ -602,25 +884,36 @@ export async function runBootstrapApply(
     // clean; keeping it uniform (not conditional on opts.json) means a human
     // running without --json sees the identical preview a script would have
     // to skip past on stderr, rather than two different code paths.
-    process.stderr.write(`${formatPlanText(plan)}\n\n${formatPlannedAppCreations(creations)}\n`);
-
-    const mutate = mutateDeps ?? resolveMutateDeps(manifestPath);
-    const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, creations);
-    if (!approved) {
-      console.error('Aborted by operator — nothing was created, changed, or submitted.');
-      return 1;
+    process.stderr.write(`${formatPlanText(plan)}\n\n${formatPlannedAppCreations(displayCreations)}\n`);
+    if (preview !== undefined) {
+      process.stderr.write(`\n${formatIdentityPreview(preview)}\n`);
     }
 
-    const priorLock = mutate.readPriorLock(manifestPath);
-    const result = await applyFleet(manifest, manifestPath, priorLock, mutate);
+    const mutate = mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems);
+    try {
+      const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, displayCreations);
+      if (!approved) {
+        console.error('Aborted by operator — nothing was created, changed, or submitted.');
+        return 1;
+      }
 
-    if (opts.json) {
-      console.log(JSON.stringify(fleetApplyResultToJson(result, plan.unimplementedByApply), null, 2));
-    } else {
-      console.log('');
-      console.log(formatApplyResult(result, plan.unimplementedByApply));
+      const priorLock = mutate.readPriorLock(manifestPath);
+      const result = await applyFleet(manifest, manifestPath, priorLock, mutate);
+
+      if (opts.json) {
+        console.log(JSON.stringify(fleetApplyResultToJson(result, plan.unimplementedByApply), null, 2));
+      } else {
+        console.log('');
+        console.log(formatApplyResult(result, plan.unimplementedByApply));
+      }
+      return applyExitCode(result);
+    } finally {
+      // macf#913 — a vault-derived scratch PEM must never outlive this run,
+      // regardless of how it ends (declined, applyFleet threw, or a clean
+      // return above). No-op when vault-aware confirm wasn't configured, or
+      // resolveKeyPath was never actually invoked this run.
+      mutate.cleanupVaultScratch?.();
     }
-    return applyExitCode(result);
   } catch (err) {
     return renderFailure({ code: 'unexpected_error', message: err instanceof Error ? err.message : String(err) }, opts);
   }

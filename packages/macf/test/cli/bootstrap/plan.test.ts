@@ -100,6 +100,22 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
     }
   });
 
+  // macf#913 — UNKNOWN_REASONS.identity previously claimed "a vault-aware
+  // confirm runs during apply" UNCONDITIONALLY, which was false: `apply` had
+  // no `--vault`/`--identity-key` flags at all until this change (only
+  // `plan` did). The message must never promise an automatic confirm; it
+  // must condition the promise on the operator actually supplying BOTH flags
+  // to `apply`.
+  it('the identity unknown-reason does NOT unconditionally promise a confirm during apply — it conditions on --vault/--identity-key', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const appItem = itemFor(plan.items, 'app', 'agent:science-agent:app:icsoc-2026-science-agent');
+    expect(appItem?.reason).toContain(UNKNOWN_REASONS.identity);
+    expect(UNKNOWN_REASONS.identity).not.toMatch(/^not confirmable at plan time \(no App JWT — the PEM lives in the vault; a vault-aware confirm runs during apply/);
+    expect(UNKNOWN_REASONS.identity).toMatch(/--vault/);
+    expect(UNKNOWN_REASONS.identity).toMatch(/--identity-key/);
+    expect(UNKNOWN_REASONS.identity).toMatch(/ONLY when invoked with BOTH/);
+  });
+
   it('never emits a routing item when `routing:` is not declared', () => {
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
     expect(plan.items.some((i) => i.kind === 'routing')).toBe(false);

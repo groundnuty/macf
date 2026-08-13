@@ -403,6 +403,44 @@ export function queryVaultAgentPresence(
   };
 }
 
+/**
+ * Decode one agent's PRIVATE KEY PEM out of an already-decrypted vault raw
+ * map — the ONE function in this module that returns a raw secret VALUE
+ * (every other exported query above deliberately returns only
+ * `{present, fingerprint}` — see this module's doc's redaction-boundary
+ * paragraph). Exists for exactly one purpose: `macf bootstrap apply`'s
+ * vault-aware confirm-before-create guard (DR-043 Amendment A, macf#913)
+ * needs the ACTUAL PEM bytes to mint an App JWT via
+ * `identity-confirm.ts::confirmAppInstallation` — a presence-only answer
+ * cannot do that. Keys are derived the SAME forward way
+ * `queryVaultAgentPresence` already uses (`deriveAppHandle` then
+ * `toVariableSegment`) — never reverse-parsed off the vault's own key names
+ * (see that function's doc for why).
+ *
+ * Returns `undefined` when the field is absent or empty — the caller
+ * degrades to the pre-vault-aware behaviour for that role (never a false
+ * "confirmed"; see `apply-agent.ts`'s `CreateGuardDeps.resolveKeyPath`
+ * contract, which this function's return value feeds).
+ *
+ * **Caller obligation — this is the ONE place in this module that returns
+ * cleartext secret material.** The returned string MUST NOT be logged,
+ * printed, or embedded in an error/exception message. A caller that writes
+ * it to a scratch file for a JWT mint (the only legitimate use) must treat
+ * that file the same way `apply-agent.ts`'s `writeScratchPem`/
+ * `cleanupScratchPem` already do: 0600, short-lived, deleted once the confirm
+ * completes — never the vault, never permanent.
+ */
+export function vaultAgentPrivateKeyPem(
+  raw: Readonly<Record<string, string>>,
+  fleetName: string,
+  role: string,
+): string | undefined {
+  const seg = toVariableSegment(deriveAppHandle(fleetName, role));
+  const b64 = raw[`MACF_AGENT_${seg}_PRIVATE_KEY_B64`];
+  if (b64 === undefined || b64.length === 0) return undefined;
+  return Buffer.from(b64, 'base64').toString('utf-8');
+}
+
 export interface VaultCaPresence {
   readonly caKey: VaultFieldPresence;
   readonly caCert: VaultFieldPresence;
