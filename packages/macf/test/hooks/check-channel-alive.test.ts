@@ -253,6 +253,19 @@ function runHook(opts: {
   readonly certsPresent?: boolean;
   /** Pre-seed the throttle timestamp file with this many seconds ago (epoch offset). */
   readonly throttleStampSecondsAgo?: number;
+  /** When a `server_started` fixture was written, whether to export
+   *  MACF_LOG_PATH pointing at it (the primary locator). Default true. Set
+   *  false to exercise the macf#887 identity-derivation fallback
+   *  (MACF_PROJECT/MACF_AGENT_NAME) or the identity-unknown path instead. */
+  readonly exportLogPathEnv?: boolean;
+  /** MACF_PROJECT / MACF_AGENT_NAME to export — the identity pair the
+   *  macf#887 fallback derives this agent's own log path from. `undefined` for
+   *  either half → that half is left unset (both required to derive). */
+  readonly identityEnv?: { readonly project?: string; readonly agentName?: string };
+  /** Extra `server_started` channel.log fixtures under OTHER `<project>@<agent>`
+   *  dirs — never this agent's own — used to prove the macf#887 fix does not
+   *  fall back to probing a cross-agent glob's peer server. */
+  readonly peerChannelLogs?: readonly { readonly dir: string; readonly spec: ServerStartedSpec }[];
   readonly env?: Record<string, string | undefined>;
   readonly stdin?: string;
 }): RunResult {
@@ -280,6 +293,24 @@ function runHook(opts: {
       }),
     );
     writeFileSync(logPath, lines.join('\n') + '\n');
+  }
+
+  for (const peer of opts.peerChannelLogs ?? []) {
+    const peerDir = join(fakeHome, '.local', 'state', 'macf', peer.dir);
+    mkdirSync(peerDir, { recursive: true });
+    const peerLine = JSON.stringify({
+      ts: '2026-07-01T09:00:01.000Z',
+      level: 'info',
+      event: 'server_started',
+      port: peer.spec.port,
+      host: peer.spec.host,
+      agent: 'peer-agent',
+      type: 'permanent',
+      instance_id: peer.spec.instanceId ?? 'peer123',
+      pid: peer.spec.pid ?? fakeChannelServerProcess.pid,
+      version: '0.2.47',
+    });
+    writeFileSync(join(peerDir, 'channel.log'), peerLine + '\n');
   }
 
   const certsPresent = opts.certsPresent ?? true;
@@ -327,7 +358,10 @@ function runHook(opts: {
     // under test).
     MACF_CHANNEL_ALIVE_RETRY_DELAY_SECS: '0',
   };
-  if (logPath) cleanEnv['MACF_LOG_PATH'] = logPath;
+  const exportLogPathEnv = opts.exportLogPathEnv ?? true;
+  if (logPath && exportLogPathEnv) cleanEnv['MACF_LOG_PATH'] = logPath;
+  if (opts.identityEnv?.project !== undefined) cleanEnv['MACF_PROJECT'] = opts.identityEnv.project;
+  if (opts.identityEnv?.agentName !== undefined) cleanEnv['MACF_AGENT_NAME'] = opts.identityEnv.agentName;
   if (caCert) cleanEnv['MACF_CA_CERT'] = caCert;
   if (agentCert) cleanEnv['MACF_AGENT_CERT'] = agentCert;
   if (agentKey) cleanEnv['MACF_AGENT_KEY'] = agentKey;
@@ -450,10 +484,18 @@ describe('check-channel-alive.sh (SessionStart + UserPromptSubmit guard)', () =>
   });
 
   describe('(d) fail-open paths → silent exit 0, never a false alarm', () => {
-    it('no channel.log at all (endpoint undeterminable) → silent exit 0', () => {
-      const r = runHook({ curl: { fail: true } }); // no serverStarted → no log created
+    // macf#887: no serverStarted fixture AND no identity env means BOTH
+    // MACF_LOG_PATH and the MACF_PROJECT/MACF_AGENT_NAME fallback are
+    // unavailable — this agent's own log is genuinely unidentifiable, not
+    // merely "not created yet". That distinct case now says so explicitly
+    // (never silent) — see describe (i) below for the full macf#887 coverage,
+    // including the sibling "identity known but file not yet present" case,
+    // which DOES stay silent.
+    it('no channel.log AND no identity available → identity-unknown message (not silent); still fail-open (exit 0), curl never invoked', () => {
+      const r = runHook({ curl: { fail: true } }); // no serverStarted → no log created, no identityEnv
       expect(r.status).toBe(0);
-      expect(r.stdout.trim()).toBe('');
+      expect(r.stdout).toContain("Could not identify this agent's own channel-server log");
+      expect(r.curlUrls).toHaveLength(0);
     });
 
     it('channel.log present but no server_started line → silent exit 0', () => {
@@ -800,6 +842,84 @@ describe('check-channel-alive.sh (SessionStart + UserPromptSubmit guard)', () =>
       expect(r.status).toBe(0);
       expect(r.curlCallCount).toBe(3);
       expect(r.stdout).toContain('YOUR CHANNEL-SERVER IS DEAD');
+    });
+  });
+
+  describe("(i) macf#887 — own-log resolution never globs a peer's log", () => {
+    it('MACF_LOG_PATH set + readable → used unchanged (regression pin)', () => {
+      const r = runHook({
+        serverStarted: { port: 8899, host: '127.0.0.1' },
+        curl: { httpCode: '200' },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('');
+      expect(r.curlUrls).toHaveLength(1);
+      expect(r.curlUrls[0]).toContain(':8899/health');
+    });
+
+    it('MACF_LOG_PATH unset but MACF_PROJECT/MACF_AGENT_NAME derivable → the reconstructed path is read + probed', () => {
+      const r = runHook({
+        serverStarted: { port: 8899, host: '127.0.0.1' }, // written under testproj@test-agent
+        curl: { httpCode: '200' },
+        exportLogPathEnv: false,
+        identityEnv: { project: 'testproj', agentName: 'test-agent' },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('');
+      expect(r.curlUrls).toHaveLength(1);
+      expect(r.curlUrls[0]).toContain(':8899/health');
+    });
+
+    it('MACF_LOG_PATH unset AND identity undeterminable, with a PEER server_started log present → skips with an honest message, NEVER probes the peer', () => {
+      const r = runHook({
+        // No serverStarted for THIS agent — own log genuinely absent/unknown.
+        exportLogPathEnv: false,
+        peerChannelLogs: [{ dir: 'otherproj@busy-peer', spec: { port: 9500, host: '127.0.0.1' } }],
+        // portOverrides: {} forces the call-logging stub variant so ANY
+        // invocation — matched port or not — would show up in curlUrls.
+        curl: { portOverrides: {} },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("Could not identify this agent's own channel-server log");
+      expect(r.stdout).toContain('macf#887');
+      // The regression that matters: curl must NEVER be invoked against the
+      // peer's server — proves the peer log was not read, not merely that
+      // the verdict happened to come out silent.
+      expect(r.curlUrls).toHaveLength(0);
+    });
+
+    it('MACF_PROJECT set but MACF_AGENT_NAME missing (partial identity) → still undeterminable, never probes a peer', () => {
+      const r = runHook({
+        exportLogPathEnv: false,
+        identityEnv: { project: 'testproj' }, // agentName omitted
+        peerChannelLogs: [{ dir: 'otherproj@busy-peer', spec: { port: 9501, host: '127.0.0.1' } }],
+        curl: { portOverrides: {} },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('Could not identify');
+      expect(r.curlUrls).toHaveLength(0);
+    });
+
+    it('derivable identity but no file at the reconstructed path → fails open SILENTLY like "no channel.log" (identity WAS known, so no "could not identify" claim)', () => {
+      const r = runHook({
+        exportLogPathEnv: false,
+        identityEnv: { project: 'testproj', agentName: 'test-agent' },
+        // no serverStarted → no file at testproj@test-agent/channel.log
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('');
+    });
+
+    it('MACF_SKIP_CHANNEL_ALIVE_CHECK=1 short-circuits before the identity-unknown message too', () => {
+      const r = runHook({
+        exportLogPathEnv: false,
+        peerChannelLogs: [{ dir: 'otherproj@busy-peer', spec: { port: 9502, host: '127.0.0.1' } }],
+        curl: { portOverrides: {} },
+        env: { MACF_SKIP_CHANNEL_ALIVE_CHECK: '1' },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('');
+      expect(r.curlUrls).toHaveLength(0);
     });
   });
 });
