@@ -25,20 +25,22 @@
  * `confirmedRepos` list (agent repos only) it builds for
  * `apply-ca.ts::publishCaCertLegs`'s repo legs, never the control repo.
  *
- * **Register-before-route (macf#922 requirement 3).** The router's own
+ * **Register-before-route (macf#922 requirement 3), corrected for the
+ * org-runner-blind cost regression (macf#923/#924).** The router's own
  * `pick-runner` doc comment is explicit: "the self-hosted branch activates
  * only once the var is set AND a runner is registered." Setting
- * `MACF_TRUSTED_ACTORS` with no runner registered routes trust at a runner
- * that isn't there — so this module checks registration PER REPO
- * (`deps.checkRunnerRegistered`, a live `gh api repos/<repo>/actions/runners`
- * read, `macf-devops-toolkit/runner/RUNNER.md`'s register-before-route
- * ceremony being entirely operator/devops-toolkit-driven, out of `apply`'s
- * own reach) immediately before each repo's write, and REFUSES to write —
- * `EnsureVariableOutcome`'s existing `'skipped'` status, with an explicit
- * reason — when no runner is confirmed registered. This is the SAME
- * "never silently skip" surface `apply-ca.ts::skippedCaPublish` /
- * `apply-routing-client.ts::skippedRoutingClientPublish` already use for
- * "never attempted this run," so the gap renders visibly in
+ * `MACF_TRUSTED_ACTORS` with no USABLE runner routes trust at a runner that
+ * can't pick up the job — so this module checks usability PER REPO
+ * (`deps.checkRunnerUsableByRepo`, `observer.ts`'s repo-scope-then-org-scope
+ * resolution — see that function's doc; `macf-devops-toolkit/runner/RUNNER.md`'s
+ * register-before-route ceremony being entirely operator/devops-toolkit-driven,
+ * out of `apply`'s own reach) immediately before each repo's write, and
+ * REFUSES to write — `EnsureVariableOutcome`'s existing `'skipped'` status,
+ * with an explicit reason (including an org-admin handover when a runner
+ * exists but the repo is excluded from its group) — when no usable runner is
+ * confirmed registered. This is the SAME "never silently skip" surface
+ * `apply-ca.ts::skippedCaPublish` / `apply-routing-client.ts::skippedRoutingClientPublish`
+ * already use for "never attempted this run," so the gap renders visibly in
  * `formatApplyResult`'s routing summary (`formatVariableLegLine`'s
  * `'skipped'` branch) — including under `--yes`, which skips the
  * pre-approval plan render entirely.
@@ -59,15 +61,15 @@
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import { ensureVariableCreated } from './ensure-variable.js';
 import type { CaApplyDeps } from './apply-ca.js';
-import type { Presence } from './plan.js';
+import type { RunnerUsability } from './observer.js';
 
 /** The GitHub Actions variable name the v3 router reads (`agent-router.yml`'s `pick-runner` job) — matches `observer.ts`'s read of the same name (macf#922). */
 export const TRUSTED_ACTORS_VAR = 'MACF_TRUSTED_ACTORS';
 
-/** The single register-before-route gate this module adds on top of `CaApplyDeps`'s repo-var primitives (macf#922 requirement 3). */
+/** The single register-before-route gate this module adds on top of `CaApplyDeps`'s repo-var primitives (macf#922 requirement 3, macf#924 org-scope correction). */
 export interface RunnerRegistrationDeps {
-  /** Live, per-repo "is at least one self-hosted runner REGISTERED" read — see this module's doc. NEVER throws by contract (mirrors `observer.ts`'s other `check*Presence` reads); a throwing fake is still handled defensively below. */
-  readonly checkRunnerRegistered: (repo: string) => Promise<Presence>;
+  /** Live, per-repo "is a self-hosted runner REGISTERED AND USABLE" read (`observer.ts::checkRunnerUsableByRepo` — repo-scope OR org-scope-with-visibility-admitting-this-repo). NEVER throws by contract (mirrors `observer.ts`'s other `check*Presence` reads); a throwing fake is still handled defensively below. */
+  readonly checkRunnerUsableByRepo: (repo: string) => Promise<RunnerUsability>;
 }
 
 /**
@@ -85,30 +87,36 @@ function errMessage(err: unknown): string {
 
 /**
  * Why a repo's `MACF_TRUSTED_ACTORS` write was skipped for want of a
- * confirmed-registered runner (macf#922 requirement 3) — exported so tests
- * assert the REPORT, not just the absence of a write. Distinguishes
- * `'absent'` (a confident empty runner list) from `'unknown'` (the read
- * itself failed) per Amendment A4's honest-unknown floor — both refuse the
- * write, but the diagnostic should never claim more confidence than it has.
+ * confirmed-registered-and-USABLE runner (macf#922 requirement 3, macf#924
+ * org-scope correction) — exported so tests assert the REPORT, not just the
+ * absence of a write. Distinguishes `'absent'` (confidently no usable
+ * runner) from `'unknown'` (some leg of the read failed) per Amendment A4's
+ * honest-unknown floor — both refuse the write, but the diagnostic should
+ * never claim more confidence than it has. The original wording for both
+ * branches is preserved UNCHANGED; `usability.handover` (macf#924 — an org
+ * runner exists but its group excludes this repo) is appended verbatim when
+ * set, naming the org-admin action rather than silently reading as an
+ * ordinary absence.
  */
-export function noRunnerRegisteredReason(repo: string, registered: Presence): string {
+export function noRunnerRegisteredReason(repo: string, usability: RunnerUsability): string {
   const cause =
-    registered === 'unknown'
+    usability.presence === 'unknown'
       ? 'could not confirm whether a self-hosted runner is registered (auth / network / insufficient scope)'
       : 'no self-hosted runner is confirmed registered';
+  const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
   return (
     `${cause} for "${repo}" — MACF_TRUSTED_ACTORS was NOT written; this repo continues routing on ` +
     'ubuntu-latest (billed on private repos) until a runner is registered and confirmed ' +
-    '(register-before-route — macf-devops-toolkit runner/RUNNER.md §"The security model"; macf#922).'
+    `(register-before-route — macf-devops-toolkit runner/RUNNER.md §"The security model"; macf#922).${handoverSuffix}`
   );
 }
 
 /**
  * Create-only write of `MACF_TRUSTED_ACTORS=<value>` to every repo in
  * `repos` (already-ensured agent repos — see module doc), gated per-repo on
- * a confirmed-registered self-hosted runner. NEVER throws; a per-repo
- * failure (including a throwing `checkRunnerRegistered`) is isolated to
- * that repo's entry in the returned map.
+ * a confirmed-registered-and-usable self-hosted runner. NEVER throws; a
+ * per-repo failure (including a throwing `checkRunnerUsableByRepo`) is
+ * isolated to that repo's entry in the returned map.
  */
 export async function publishTrustedActors(
   value: string,
@@ -117,15 +125,15 @@ export async function publishTrustedActors(
 ): Promise<Readonly<Record<string, EnsureVariableOutcome>>> {
   const out: Record<string, EnsureVariableOutcome> = {};
   for (const repo of repos) {
-    let registered: Presence;
+    let usability: RunnerUsability;
     try {
-      registered = await deps.checkRunnerRegistered(repo);
+      usability = await deps.checkRunnerUsableByRepo(repo);
     } catch (err) {
-      out[repo] = { status: 'failed', reason: `runner-registration check threw for "${repo}" — ${errMessage(err)}` };
+      out[repo] = { status: 'failed', reason: `runner-usability check threw for "${repo}" — ${errMessage(err)}` };
       continue;
     }
-    if (registered !== 'present') {
-      out[repo] = { status: 'skipped', reason: noRunnerRegisteredReason(repo, registered) };
+    if (usability.presence !== 'present') {
+      out[repo] = { status: 'skipped', reason: noRunnerRegisteredReason(repo, usability) };
       continue;
     }
     out[repo] = await ensureVariableCreated(

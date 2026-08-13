@@ -296,10 +296,11 @@ const SENTINEL_VAULT_PEM = '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-VAULT-PEM-
 
 /**
  * Default fake `CaApplyDeps & RunnerRegistrationDeps` (macf#838 Amendment D
- * phase 2; `checkRunnerRegistered` added macf#922) — everything absent,
- * except a runner IS confirmed registered by default (so the pre-existing
- * "routing var gets written" fixtures below keep exercising the write path
- * unchanged); individual tests override to exercise other shapes.
+ * phase 2; `checkRunnerUsableByRepo` added macf#922, org-scope-corrected +
+ * renamed macf#924) — everything absent, except a runner IS confirmed
+ * registered-and-usable by default (so the pre-existing "routing var gets
+ * written" fixtures below keep exercising the write path unchanged);
+ * individual tests override to exercise other shapes.
  */
 function fakeTrustDeps(overrides: Partial<CaApplyDeps & RunnerRegistrationDeps> = {}): CaApplyDeps & RunnerRegistrationDeps {
   return {
@@ -309,7 +310,7 @@ function fakeTrustDeps(overrides: Partial<CaApplyDeps & RunnerRegistrationDeps> 
     checkRepoPresence: async () => 'absent',
     createRepoVariable: async () => 'created',
     mintCa: async () => ({ certPem: SENTINEL_CA_CERT_PEM, keyPem: SENTINEL_CA_KEY_PEM }),
-    checkRunnerRegistered: async () => 'present',
+    checkRunnerUsableByRepo: async () => ({ presence: 'present' }),
     ...overrides,
   };
 }

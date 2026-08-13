@@ -2,18 +2,21 @@
  * Tests for `apply-routing.ts` — `MACF_TRUSTED_ACTORS` create-only write,
  * DR-043 Amendment D phase 2 (groundnuty/macf#838, macf#854's routing gap),
  * corrected to the router's actually-read variable + register-before-route
- * gated by macf#922. Fully offline: `checkRepoPresence`/`createRepoVariable`/
- * `checkRunnerRegistered` are hand-scripted fakes, no real `gh`.
+ * gated by macf#922, itself corrected for the org-runner-blind cost
+ * regression by macf#924. Fully offline: `checkRepoPresence`/
+ * `createRepoVariable`/`checkRunnerUsableByRepo` are hand-scripted fakes, no
+ * real `gh`.
  */
 import { describe, it, expect } from 'vitest';
 import { noRunnerRegisteredReason, publishTrustedActors, TRUSTED_ACTORS_VAR } from '../../../src/cli/bootstrap/apply-routing.js';
 import type { RoutingApplyDeps } from '../../../src/cli/bootstrap/apply-routing.js';
+import type { RunnerUsability } from '../../../src/cli/bootstrap/observer.js';
 
 function depsWith(overrides: Partial<RoutingApplyDeps> = {}): RoutingApplyDeps {
   return {
     checkRepoPresence: async () => 'absent',
     createRepoVariable: async () => 'created',
-    checkRunnerRegistered: async () => 'present',
+    checkRunnerUsableByRepo: async () => ({ presence: 'present' }),
     ...overrides,
   };
 }
@@ -83,7 +86,7 @@ describe('publishTrustedActors', () => {
     let checkPresenceCalled = false;
     let createCalled = false;
     const deps = depsWith({
-      checkRunnerRegistered: async () => 'absent',
+      checkRunnerUsableByRepo: async () => ({ presence: 'absent' }),
       checkRepoPresence: async () => {
         checkPresenceCalled = true;
         return 'absent';
@@ -104,15 +107,15 @@ describe('publishTrustedActors', () => {
   });
 
   it('runner registration UNKNOWN (read failed) -> ALSO refuses the write — honest-unknown, never treated as present', async () => {
-    const deps = depsWith({ checkRunnerRegistered: async () => 'unknown' });
+    const deps = depsWith({ checkRunnerUsableByRepo: async () => ({ presence: 'unknown' }) });
     const result = await publishTrustedActors('a-code-agent[bot]', ['a/b'], deps);
     expect(result['a/b']?.status).toBe('skipped');
     expect((result['a/b'] as { reason: string }).reason).toMatch(/could not confirm whether a self-hosted runner is registered/);
   });
 
-  it('a THROWING checkRunnerRegistered resolves to "failed" (a wiring bug), not "skipped" (a legitimate absence)', async () => {
+  it('a THROWING checkRunnerUsableByRepo resolves to "failed" (a wiring bug), not "skipped" (a legitimate absence)', async () => {
     const deps = depsWith({
-      checkRunnerRegistered: async () => {
+      checkRunnerUsableByRepo: async () => {
         throw new Error('gh: rate limited');
       },
     });
@@ -123,17 +126,33 @@ describe('publishTrustedActors', () => {
 
   it('registration is checked PER REPO — one repo registered and one not both get their own correct outcome', async () => {
     const deps = depsWith({
-      checkRunnerRegistered: async (repo) => (repo === 'registered/x' ? 'present' : 'absent'),
+      checkRunnerUsableByRepo: async (repo) => ({ presence: repo === 'registered/x' ? 'present' : 'absent' }),
     });
     const result = await publishTrustedActors('a-code-agent[bot]', ['registered/x', 'unregistered/y'], deps);
     expect(result['registered/x']).toEqual({ status: 'created' });
     expect(result['unregistered/y']?.status).toBe('skipped');
   });
+
+  // --- macf#924 — org-admin handover surfaces through the write-gate report ---
+
+  it('an "excluded from the org runner group" outcome carries the handover into the skip reason', async () => {
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => ({
+        presence: 'absent',
+        handover: 'An org-level self-hosted runner IS registered in "groundnuty", but its runner group excludes "groundnuty/x".',
+      }),
+    });
+    const result = await publishTrustedActors('a-code-agent[bot]', ['groundnuty/x'], deps);
+    expect(result['groundnuty/x']?.status).toBe('skipped');
+    const reason = (result['groundnuty/x'] as { reason: string }).reason;
+    expect(reason).toMatch(/no self-hosted runner is confirmed registered/);
+    expect(reason).toMatch(/its runner group excludes "groundnuty\/x"/);
+  });
 });
 
 describe('noRunnerRegisteredReason', () => {
   it('names the repo + the billing consequence + the register-before-route remedy', () => {
-    const reason = noRunnerRegisteredReason('groundnuty/x', 'absent');
+    const reason = noRunnerRegisteredReason('groundnuty/x', { presence: 'absent' });
     expect(reason).toContain('groundnuty/x');
     expect(reason).toMatch(/billed on private repos/);
     expect(reason).toMatch(/register-before-route/);
@@ -141,7 +160,17 @@ describe('noRunnerRegisteredReason', () => {
   });
 
   it('distinguishes the "unknown" cause from the "absent" cause — never overclaims confidence', () => {
-    const reason = noRunnerRegisteredReason('groundnuty/x', 'unknown');
+    const reason = noRunnerRegisteredReason('groundnuty/x', { presence: 'unknown' });
     expect(reason).toMatch(/could not confirm whether a self-hosted runner is registered/);
+  });
+
+  it('macf#924 — appends the org-admin handover verbatim when present, without dropping the original wording', () => {
+    const usability: RunnerUsability = {
+      presence: 'absent',
+      handover: 'An org admin must add "groundnuty/x" to runner group X at https://example.invalid/.',
+    };
+    const reason = noRunnerRegisteredReason('groundnuty/x', usability);
+    expect(reason).toMatch(/no self-hosted runner is confirmed registered/);
+    expect(reason).toContain('An org admin must add "groundnuty/x" to runner group X at https://example.invalid/.');
   });
 });

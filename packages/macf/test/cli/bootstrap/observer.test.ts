@@ -21,12 +21,23 @@
  * function specifically so it stays independently testable without
  * mocking `node:child_process` — see its own doc comment. Tested below,
  * same "pure(-ish), no-network" bar as `readFleetLock`.
+ *
+ * `checkRunnerUsableByRepo` (macf#924 — correcting the org-runner-blind cost
+ * regression in macf#922/#923) is a THIRD exception, for the same reason as
+ * `vaultAwareObserver`: it's a pure COMPOSITION over an injected
+ * `RunnerUsabilityDeps` seam (repo-scope / org-groups-visible-to-repo /
+ * org-runner-group-ids), not a bare `execFile` wrapper — the required test
+ * matrix (repo-level / org `all` / org `selected`-excluded /
+ * `selected`-included / absent / unreadable) needs per-scenario control over
+ * 3 independent reads that a single `execFile` mock can't cleanly express.
+ * Tested below with `RunnerUsabilityDeps` faked, no real `gh`/network.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { extractActionsPin, readFleetLock, vaultAwareObserver } from '../../../src/cli/bootstrap/observer.js';
+import { checkRunnerUsableByRepo, extractActionsPin, readFleetLock, vaultAwareObserver } from '../../../src/cli/bootstrap/observer.js';
+import type { RunnerUsabilityDeps } from '../../../src/cli/bootstrap/observer.js';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { ObservedState } from '../../../src/cli/bootstrap/plan.js';
 import { VaultError } from '../../../src/cli/bootstrap/vault-write.js';
@@ -240,5 +251,131 @@ describe('extractActionsPin (DR-043 §D6 — versions.actions observed-state sou
 
   it('returns undefined for empty content', () => {
     expect(extractActionsPin('')).toBeUndefined();
+  });
+});
+
+// --- checkRunnerUsableByRepo — macf#924 org-scope register-before-route correction ---
+
+/**
+ * A deps fixture with NO org runner group and NO registered org runner —
+ * the "org scope has nothing" baseline every scenario below overrides from.
+ */
+function depsWith(overrides: Partial<RunnerUsabilityDeps> = {}): RunnerUsabilityDeps {
+  return {
+    checkRepoScopedRunner: async () => 'absent',
+    listRunnerGroupsVisibleToRepo: async () => [],
+    listOrgRunnerGroupIds: async () => new Set<number>(),
+    ...overrides,
+  };
+}
+
+describe('checkRunnerUsableByRepo (macf#924 — corrects the org-runner-blind cost regression from macf#922/#923)', () => {
+  it('repo-level runner present -> present (the ORIGINAL macf#922 fast path; org scope is never even consulted)', async () => {
+    let orgCallMade = false;
+    const deps = depsWith({
+      checkRepoScopedRunner: async () => 'present',
+      listRunnerGroupsVisibleToRepo: async () => {
+        orgCallMade = true;
+        return [];
+      },
+      listOrgRunnerGroupIds: async () => {
+        orgCallMade = true;
+        return new Set();
+      },
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability).toEqual({ presence: 'present' });
+    expect(orgCallMade).toBe(false);
+  });
+
+  it('macf#924 REGRESSION — an org-level runner in an "all"-visibility group is USABLE -> present (repo-scope alone read this as absent and skipped the write)', async () => {
+    const deps = depsWith({
+      checkRepoScopedRunner: async () => 'absent',
+      // "all"-visibility means GitHub's own `visible_to_repository` resolution
+      // returns this group for EVERY repo in the org — group id 1 (the
+      // typical "Default" group id) shows up here without any repo-specific
+      // allowlisting.
+      listRunnerGroupsVisibleToRepo: async () => [{ id: 1, name: 'Default' }],
+      listOrgRunnerGroupIds: async () => new Set([1]),
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('present');
+    expect(usability.handover).toBeUndefined();
+  });
+
+  it('an org runner in a "selected"-visibility group that EXCLUDES this repo -> NOT present, org-admin handover reported', async () => {
+    const deps = depsWith({
+      checkRepoScopedRunner: async () => 'absent',
+      // group 7 has a registered runner (see listOrgRunnerGroupIds) but is
+      // NOT in the visible-to-this-repo list — excluded by selection.
+      listRunnerGroupsVisibleToRepo: async () => [],
+      listOrgRunnerGroupIds: async () => new Set([7]),
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).not.toBe('present');
+    expect(usability.presence).toBe('absent');
+    expect(usability.handover).toBeDefined();
+    expect(usability.handover).toContain('groundnuty');
+    expect(usability.handover).toContain('groundnuty/x');
+    expect(usability.handover).toContain('https://github.com/organizations/groundnuty/settings/actions/runner-groups/7');
+    expect(usability.handover).toMatch(/org admin/);
+    expect(usability.handover).toMatch(/cannot perform that step itself/);
+  });
+
+  it('an org runner in a "selected"-visibility group that INCLUDES this repo -> present', async () => {
+    const deps = depsWith({
+      checkRepoScopedRunner: async () => 'absent',
+      listRunnerGroupsVisibleToRepo: async () => [{ id: 7, name: 'ci-runner' }],
+      listOrgRunnerGroupIds: async () => new Set([7]),
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability).toEqual({ presence: 'present' });
+  });
+
+  it('no runners anywhere (repo scope AND org scope both confidently empty) -> absent, nothing to hand over', async () => {
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', depsWith());
+    expect(usability).toEqual({ presence: 'absent' });
+  });
+
+  it('an unreadable repo-scoped leg -> unknown, NEVER absent, even when the org leg is confirmed empty', async () => {
+    const deps = depsWith({ checkRepoScopedRunner: async () => 'unknown' });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('unknown');
+    expect(usability.presence).not.toBe('absent');
+  });
+
+  it('an unreadable org-groups-visible-to-repo leg (e.g. 403 for missing admin:org) -> unknown, NEVER absent', async () => {
+    const deps = depsWith({ listRunnerGroupsVisibleToRepo: async () => 'unknown' });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('unknown');
+    expect(usability.presence).not.toBe('absent');
+    expect(usability.handover).toBeUndefined();
+  });
+
+  it('an unreadable org-runner-group-ids leg -> unknown, NEVER absent', async () => {
+    const deps = depsWith({ listOrgRunnerGroupIds: async () => 'unknown' });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('unknown');
+    expect(usability.presence).not.toBe('absent');
+  });
+
+  it('a malformed repo string (no "owner/name" shape) degrades to unknown rather than throwing', async () => {
+    const usability = await checkRunnerUsableByRepo('not-a-valid-repo-shape', depsWith());
+    expect(usability.presence).toBe('unknown');
+  });
+
+  it('org-scope resolution derives owner/name from the FULL "owner/repo" string passed to org-scope reads', async () => {
+    let seenOrg: string | undefined;
+    let seenRepoName: string | undefined;
+    const deps = depsWith({
+      listRunnerGroupsVisibleToRepo: async (org, repoName) => {
+        seenOrg = org;
+        seenRepoName = repoName;
+        return [];
+      },
+    });
+    await checkRunnerUsableByRepo('groundnuty/demo-fleet-code-agent', deps);
+    expect(seenOrg).toBe('groundnuty');
+    expect(seenRepoName).toBe('demo-fleet-code-agent');
   });
 });
