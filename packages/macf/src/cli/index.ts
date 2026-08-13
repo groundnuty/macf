@@ -592,8 +592,15 @@ program
       'effect as MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED=1.',
     false,
   )
-  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd). An explicit --dir WINS over MACF_WORKSPACE_DIR (macf#888) — pass it to target a workspace other than your own.')
   .action(async (opts) => {
+    // macf#888 — capture "was --dir passed" BEFORE `resolveProjectDir`
+    // collapses the explicit-vs-auto-discovered paths into the same string
+    // shape. `--dir <path>` above has no commander default (3rd arg), so
+    // `opts.dir` is `undefined` exactly when the flag is absent — that's the
+    // only reliable "explicit" signal (macf#347: a resolved path is truthy
+    // either way and can't be used to infer this).
+    const dirExplicit = opts.dir !== undefined;
     const code = await runRestartSelfCommand(resolveProjectDir(opts.dir), {
       reason: opts.reason,
       confirm: opts.confirm,
@@ -601,6 +608,7 @@ program
       json: opts.json,
       force: opts.force,
       leaveConfigUncommitted: opts.leaveConfigUncommitted,
+      dirExplicit,
     });
     process.exitCode = code;
   });

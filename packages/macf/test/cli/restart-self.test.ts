@@ -12,8 +12,14 @@
  *   - relauncher script sources the host-prelude conditionally + execs claude.sh.
  *   - refuses cleanly when the session name can't be resolved.
  *   - --json emits the versioned state-record.
+ *   - macf#888 — an explicit --dir wins over ambient MACF_WORKSPACE_DIR (never
+ *     silently retargets at the caller), the #763-safe no-`--dir` precedence is
+ *     unchanged, and the resolution + any conflict are surfaced in the plan.
  */
 import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
+import { mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   buildRelauncherScript,
@@ -29,6 +35,22 @@ import {
   type RunRestartSelfOptions,
   type StashResult,
 } from '../../src/cli/commands/restart-self.js';
+import { writeAgentConfig, type MacfAgentConfig } from '../../src/cli/config.js';
+
+/** A scratch workspace dir with a REAL `.macf/macf-agent.json` (macf#888 identity-source tests). */
+function tempWorkspace(config: Partial<MacfAgentConfig> = {}): string {
+  const dir = join(tmpdir(), `macf-restart-self-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  mkdirSync(dir, { recursive: true });
+  writeAgentConfig(dir, {
+    project: 'target-proj',
+    agent_name: 'target-agent',
+    agent_role: 'code-agent',
+    agent_type: 'permanent',
+    registry: { type: 'repo', owner: 'groundnuty', repo: 'target' },
+    ...config,
+  });
+  return dir;
+}
 
 const FIXED_NOW = new Date('2026-06-27T12:00:00.000Z');
 
@@ -112,6 +134,10 @@ function baseOpts(over: Partial<RunRestartSelfOptions> = {}): RunRestartSelfOpti
     // macf#755 — matches fakeDeps()'s default `currentBranch` ('main') so
     // the canonical-branch guard is a no-op for tests that don't care about it.
     canonicalBranch: 'main',
+    // macf#888 — neutral default (no --dir, no env) for tests that don't
+    // exercise the identity-source / conflict-surfacing behavior directly.
+    identitySource: 'cwd-discovery',
+    workspaceDirConflict: null,
     ...over,
   };
 }
@@ -444,6 +470,145 @@ describe('runRestartSelf — confirm path', () => {
   });
 });
 
+/**
+ * macf#888 — `runRestartSelf` never silently resolves a `--dir`/env conflict:
+ * the resolved workspace + its SOURCE are always in the plan (dry-run AND
+ * confirm, text AND --json), and a divergence is surfaced with a loud
+ * conflict banner + a stderr line, on the DEFAULT (dry-run) path specifically
+ * — dry-run is exactly the mode the issue's repro shows ("every line looks
+ * like a normal successful plan").
+ */
+describe('runRestartSelf — macf#888 identity-source + conflict surfacing', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  afterEach(() => {
+    logSpy?.mockRestore();
+    errSpy?.mockRestore();
+  });
+
+  it("THE REGRESSION (dry-run, the default): --dir <other> resolves to <other>, NOT the caller's MACF_WORKSPACE_DIR", async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { deps } = fakeDeps();
+    const opts = baseOpts({
+      confirm: false,
+      workspaceDir: '/other/devops-toolkit',
+      identitySource: 'dir-flag',
+      workspaceDirConflict: '/my/caller/workspace',
+    });
+    const code = await runRestartSelf(opts, deps);
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    const workspaceLine = out.split('\n').find((l) => l.trim().startsWith('workspace:'));
+    // The RESOLVED workspace line must be the target, never the caller's —
+    // the caller's path is expected to appear ONLY in the conflict banner.
+    expect(workspaceLine).toContain('/other/devops-toolkit');
+    expect(workspaceLine).not.toContain('/my/caller/workspace');
+    expect(out).toContain('(from --dir)');
+    expect(out).toContain('CONFLICT');
+    expect(out).toContain('macf#888');
+    // Loud on stderr too — visible even to an operator scanning past stdout.
+    const err = errSpy.mock.calls.flat().join('\n');
+    expect(err).toContain('/my/caller/workspace');
+    expect(err).toContain('/other/devops-toolkit');
+  });
+
+  it('no --dir + MACF_WORKSPACE_DIR set (the #763-safe path): resolves to the env value, no conflict banner', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { deps } = fakeDeps();
+    const opts = baseOpts({
+      confirm: false,
+      workspaceDir: '/env-ws',
+      identitySource: 'env',
+      workspaceDirConflict: null,
+    });
+    const code = await runRestartSelf(opts, deps);
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('/env-ws');
+    expect(out).toContain('(from MACF_WORKSPACE_DIR)');
+    expect(out).not.toContain('CONFLICT');
+    expect(errSpy.mock.calls).toHaveLength(0);
+  });
+
+  it('neither --dir nor env set: prior fallback (cwd-discovery) unchanged, no conflict banner', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { deps } = fakeDeps();
+    const opts = baseOpts({
+      confirm: false,
+      workspaceDir: '/ws',
+      identitySource: 'cwd-discovery',
+      workspaceDirConflict: null,
+    });
+    const code = await runRestartSelf(opts, deps);
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('(from cwd auto-discovery)');
+    expect(out).not.toContain('CONFLICT');
+    expect(errSpy.mock.calls).toHaveLength(0);
+  });
+
+  it('the conflict + source are ALSO carried in the --json plan (dry-run)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { deps } = fakeDeps();
+    const opts = baseOpts({
+      confirm: false,
+      json: true,
+      workspaceDir: '/other/devops-toolkit',
+      identitySource: 'dir-flag',
+      workspaceDirConflict: '/my/caller/workspace',
+    });
+    await runRestartSelf(opts, deps);
+    const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
+    expect(parsed).toMatchObject({
+      workspace_dir: '/other/devops-toolkit',
+      identity_source: 'dir-flag',
+      workspace_dir_conflict: '/my/caller/workspace',
+    });
+  });
+
+  it('the divergence surfaces on the CONFIRM path too (not just dry-run) — text + JSON', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { deps } = fakeDeps();
+    const code = await runRestartSelf(
+      baseOpts({
+        confirm: true,
+        workspaceDir: '/other/devops-toolkit',
+        identitySource: 'dir-flag',
+        workspaceDirConflict: '/my/caller/workspace',
+      }),
+      deps,
+    );
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('CONFLICT');
+    expect(out).toContain('/other/devops-toolkit');
+  });
+
+  it('the conflict warning fires even when session resolution subsequently fails (still visible, still refuses)', async () => {
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { deps } = fakeDeps();
+    const code = await runRestartSelf(
+      baseOpts({
+        confirm: true,
+        project: undefined, // forces the "cannot resolve the tmux session" refusal
+        workspaceDir: '/other/devops-toolkit',
+        identitySource: 'dir-flag',
+        workspaceDirConflict: '/my/caller/workspace',
+      }),
+      deps,
+    );
+    expect(code).toBe(1);
+    const err = errSpy.mock.calls.flat().join('\n');
+    expect(err).toContain('/my/caller/workspace');
+    expect(err).toContain('cannot resolve the tmux session');
+  });
+});
+
 describe('buildResumeNote', () => {
   it('says "nothing was stashed" when stashRef is null', () => {
     const note = buildResumeNote({
@@ -527,33 +692,110 @@ describe('buildRelauncherScript', () => {
 });
 
 describe('resolveIdentity', () => {
-  it('prefers env over config; routingLabel defaults to agentName when MACF_ROUTING_LABEL unset', () => {
-    const id = resolveIdentity('/proj', {
-      MACF_WORKSPACE_DIR: '/env-ws',
-      MACF_PROJECT: 'envproj',
-      MACF_AGENT_NAME: 'envagent',
-    } as NodeJS.ProcessEnv);
-    expect(id).toEqual({
-      workspaceDir: '/env-ws',
-      project: 'envproj',
-      agentName: 'envagent',
-      routingLabel: 'envagent',
+  describe('dirExplicit=false (no --dir) — unchanged pre-macf#888 precedence', () => {
+    it('prefers env over config; routingLabel defaults to agentName when MACF_ROUTING_LABEL unset', () => {
+      const id = resolveIdentity('/proj', {
+        MACF_WORKSPACE_DIR: '/env-ws',
+        MACF_PROJECT: 'envproj',
+        MACF_AGENT_NAME: 'envagent',
+      } as NodeJS.ProcessEnv);
+      expect(id).toEqual({
+        workspaceDir: '/env-ws',
+        identitySource: 'env',
+        workspaceDirConflict: null,
+        project: 'envproj',
+        agentName: 'envagent',
+        routingLabel: 'envagent',
+      });
+    });
+
+    it('resolves routingLabel from MACF_ROUTING_LABEL for a name != routing_label agent (macf#678)', () => {
+      const id = resolveIdentity('/proj', {
+        MACF_PROJECT: 'macf',
+        MACF_AGENT_NAME: 'macf-science-agent',
+        MACF_ROUTING_LABEL: 'science-agent',
+      } as NodeJS.ProcessEnv);
+      expect(id.agentName).toBe('macf-science-agent');
+      expect(id.routingLabel).toBe('science-agent');
+    });
+
+    it('falls back to projectDir for the workspace when env is unset (cwd-discovery — the #763-safe path)', () => {
+      const id = resolveIdentity('/proj', {} as NodeJS.ProcessEnv);
+      expect(id.workspaceDir).toBe('/proj');
+      expect(id.identitySource).toBe('cwd-discovery');
+      expect(id.workspaceDirConflict).toBeNull();
     });
   });
 
-  it('resolves routingLabel from MACF_ROUTING_LABEL for a name != routing_label agent (macf#678)', () => {
-    const id = resolveIdentity('/proj', {
-      MACF_PROJECT: 'macf',
-      MACF_AGENT_NAME: 'macf-science-agent',
-      MACF_ROUTING_LABEL: 'science-agent',
-    } as NodeJS.ProcessEnv);
-    expect(id.agentName).toBe('macf-science-agent');
-    expect(id.routingLabel).toBe('science-agent');
-  });
+  describe('dirExplicit=true (macf#888 — an explicit --dir was passed)', () => {
+    let dir: string;
+    afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
 
-  it('falls back to projectDir for the workspace when env is unset', () => {
-    const id = resolveIdentity('/proj', {} as NodeJS.ProcessEnv);
-    expect(id.workspaceDir).toBe('/proj');
+    it('THE REGRESSION: --dir resolves to the TARGET workspace, not the ambient MACF_WORKSPACE_DIR', () => {
+      dir = tempWorkspace();
+      const id = resolveIdentity(
+        dir,
+        { MACF_WORKSPACE_DIR: '/my/caller/workspace' } as NodeJS.ProcessEnv,
+        true,
+      );
+      expect(id.workspaceDir).toBe(dir);
+      expect(id.identitySource).toBe('dir-flag');
+    });
+
+    it('sources project/agentName/routingLabel from the TARGET config, not the caller env (session-name half of the same bug)', () => {
+      dir = tempWorkspace({
+        project: 'macf-devops-toolkit',
+        agent_name: 'devops-agent',
+        routing_label: 'devops-agent',
+      });
+      const id = resolveIdentity(
+        dir,
+        {
+          MACF_WORKSPACE_DIR: '/my/caller/workspace',
+          MACF_PROJECT: 'macf',
+          MACF_AGENT_NAME: 'code-agent',
+          MACF_ROUTING_LABEL: 'code-agent',
+        } as NodeJS.ProcessEnv,
+        true,
+      );
+      // Would be 'macf' / 'code-agent' if the caller's env leaked through —
+      // that's the `session: macf@code-agent` half of the reported repro.
+      expect(id.project).toBe('macf-devops-toolkit');
+      expect(id.agentName).toBe('devops-agent');
+      expect(id.routingLabel).toBe('devops-agent');
+    });
+
+    it('does NOT fall back to env when the target config lacks a field (no partial env leak)', () => {
+      dir = tempWorkspace(); // routing_label omitted (optional in the schema)
+      const id = resolveIdentity(
+        dir,
+        { MACF_ROUTING_LABEL: 'callers-routing-label' } as NodeJS.ProcessEnv,
+        true,
+      );
+      // Falls back to the TARGET's own agent_name (config-internal fallback,
+      // per resolveIdentity's routing_label || agent_name), never the
+      // caller's MACF_ROUTING_LABEL.
+      expect(id.routingLabel).toBe('target-agent');
+    });
+
+    it('surfaces workspaceDirConflict with the discarded env value when --dir and env DISAGREE', () => {
+      dir = tempWorkspace();
+      const id = resolveIdentity(dir, { MACF_WORKSPACE_DIR: '/my/caller/workspace' } as NodeJS.ProcessEnv, true);
+      expect(id.workspaceDirConflict).toBe('/my/caller/workspace');
+    });
+
+    it('workspaceDirConflict is null when env is simply unset', () => {
+      dir = tempWorkspace();
+      const id = resolveIdentity(dir, {} as NodeJS.ProcessEnv, true);
+      expect(id.workspaceDirConflict).toBeNull();
+    });
+
+    it('workspaceDirConflict is null when --dir and env happen to AGREE (no false-positive warning)', () => {
+      dir = tempWorkspace();
+      const id = resolveIdentity(dir, { MACF_WORKSPACE_DIR: dir } as NodeJS.ProcessEnv, true);
+      expect(id.workspaceDirConflict).toBeNull();
+      expect(id.identitySource).toBe('dir-flag');
+    });
   });
 });
 

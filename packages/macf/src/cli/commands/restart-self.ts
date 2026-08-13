@@ -102,6 +102,9 @@ export interface RestartSelfDeps {
   ) => TranscriptPreState | null;
 }
 
+/** Where `resolveIdentity` sourced `workspaceDir`/`project`/`agentName`/`routingLabel` from. */
+export type IdentitySource = 'dir-flag' | 'env' | 'cwd-discovery';
+
 /** Options for `runRestartSelf` (already-resolved identity; pure orchestrator input). */
 export interface RunRestartSelfOptions {
   /** Absolute workspace dir (holds `claude.sh` + `.claude/.macf/`). */
@@ -163,6 +166,22 @@ export interface RunRestartSelfOptions {
    * already vetted this before calling `upgrade`+`restart`).
    */
   readonly canonicalBranch: string;
+  /**
+   * Where `workspaceDir` / `project` / `agentName` / `routingLabel` were all
+   * resolved from (macf#888) — carried into the plan so the resolution is
+   * never invisible. `'dir-flag'` when an explicit `--dir` won; `'env'` when
+   * ambient `MACF_WORKSPACE_DIR` won (the ordinary no-`--dir` self-restart
+   * case, incl. the #763-scrubbed roll path once env is absent); `'cwd-discovery'`
+   * when neither was set. See `resolveIdentity`.
+   */
+  readonly identitySource: IdentitySource;
+  /**
+   * The discarded `MACF_WORKSPACE_DIR` value, set only when an explicit
+   * `--dir` won over a DIFFERING ambient value (macf#888). `null` whenever
+   * there is nothing to warn about (env unset, env matches `--dir`, or
+   * `--dir` was never passed).
+   */
+  readonly workspaceDirConflict: string | null;
 }
 
 /** The `--json` state-record (mirrors `fleet doctor`'s versioned shape). */
@@ -173,6 +192,11 @@ export interface RestartSelfPlan {
   readonly dry_run: boolean;
   readonly reason: RestartReason;
   readonly session: string;
+  readonly workspace_dir: string;
+  /** macf#888 — see `RunRestartSelfOptions.identitySource`. */
+  readonly identity_source: IdentitySource;
+  /** macf#888 — see `RunRestartSelfOptions.workspaceDirConflict`. */
+  readonly workspace_dir_conflict: string | null;
   readonly stash_ref: string | null;
   readonly resume_note_path: string;
   readonly relauncher_path: string;
@@ -473,19 +497,46 @@ function shq(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-/** Human-readable dry-run / confirm plan for the table (non-JSON) output. */
-function renderPlanText(plan: RestartSelfPlan, dirty: boolean, workspaceDir: string): string {
+/** Human-readable label for `identity_source` — used on both the `workspace:` and `session:` lines. */
+function sourceLabel(source: IdentitySource): string {
+  switch (source) {
+    case 'dir-flag':
+      return 'from --dir';
+    case 'env':
+      return 'from MACF_WORKSPACE_DIR';
+    case 'cwd-discovery':
+      return 'from cwd auto-discovery';
+  }
+}
+
+/**
+ * Human-readable dry-run / confirm plan for the table (non-JSON) output.
+ * macf#888 — every line here used to look like a normal successful plan even
+ * when `--dir` had been silently discarded in favor of the CALLER's ambient
+ * `MACF_WORKSPACE_DIR`. Both the resolution *source* (not just the value) and
+ * an explicit conflict banner are now always rendered, on BOTH the dry-run
+ * and confirm paths (this function is the single render path for both).
+ */
+function renderPlanText(plan: RestartSelfPlan, dirty: boolean): string {
   const lines = [
     `macf restart-self — ${plan.dry_run ? 'DRY-RUN (default; pass --confirm to act)' : 'EXECUTING (--confirm)'}`,
     '',
     `  reason:        ${plan.reason}`,
-    `  workspace:     ${workspaceDir}`,
-    `  session:       ${plan.session}`,
+  ];
+  if (plan.workspace_dir_conflict) {
+    lines.push(
+      `  ⚠ CONFLICT: --dir wins over MACF_WORKSPACE_DIR=${plan.workspace_dir_conflict} — ` +
+        'without this, restart-self would silently target the CALLER, not the named workspace (macf#888).',
+    );
+  }
+  lines.push(
+    `  workspace:     ${plan.workspace_dir} (${sourceLabel(plan.identity_source)})`,
+    `  session:       ${plan.session} (${sourceLabel(plan.identity_source)})`,
     `  would stash:   ${dirty ? 'yes (uncommitted tracked changes)' : 'no (working tree clean)'}`,
     `  resume note:   ${plan.resume_note_path}`,
     `  relauncher:    ${plan.relauncher_path}`,
     `  kill session:  ${plan.dry_run ? 'NO (dry-run)' : `yes — tmux kill-session -t ${plan.session}`}`,
-  ];
+  );
   if (plan.dry_run) {
     lines.push('', 'No stash, no kill, no spawn performed. Re-run with --confirm to execute.');
   } else {
@@ -503,6 +554,21 @@ export async function runRestartSelf(
   opts: RunRestartSelfOptions,
   deps: RestartSelfDeps,
 ): Promise<number> {
+  // macf#888 — fire the conflict warning FIRST, unconditionally (dry-run,
+  // confirm, --json, AND even the session-refusal path below): dry-run is
+  // the default mode and the exact one the issue reports ("every line looks
+  // like a normal successful plan"), so the warning must not be gated behind
+  // any later branch. This is IN ADDITION TO the plan carrying the same
+  // fields (see makePlan below) — stderr for anyone scanning past a wall of
+  // stdout, the plan for anyone parsing --json or reading the rendered text.
+  if (opts.workspaceDirConflict) {
+    console.error(
+      `macf restart-self: --dir wins over MACF_WORKSPACE_DIR=${opts.workspaceDirConflict} ` +
+        `— targeting ${opts.workspaceDir} (macf#888: without this, restart-self would ` +
+        'silently target the CALLER, not the named workspace).',
+    );
+  }
+
   const session = resolveSession(opts);
   if (!session) {
     console.error(
@@ -513,7 +579,7 @@ export async function runRestartSelf(
     return 1;
   }
 
-  const { workspaceDir, reason } = opts;
+  const { workspaceDir, reason, identitySource, workspaceDirConflict } = opts;
   const resumeNotePath = join(workspaceDir, RESUME_NOTE_REL);
   const relauncherPath = join(workspaceDir, RELAUNCHER_REL);
   const prestatePath = join(workspaceDir, SESSION_PRESTATE_REL);
@@ -525,9 +591,20 @@ export async function runRestartSelf(
   const iso = nowDate.toISOString();
 
   if (dryRun) {
-    const plan = makePlan({ dryRun: true, reason, session, stashRef: null, resumeNotePath, relauncherPath, killed: false });
+    const plan = makePlan({
+      dryRun: true,
+      reason,
+      session,
+      workspaceDir,
+      identitySource,
+      workspaceDirConflict,
+      stashRef: null,
+      resumeNotePath,
+      relauncherPath,
+      killed: false,
+    });
     if (opts.json) console.log(JSON.stringify(plan, null, 2));
-    else console.log(renderPlanText(plan, dirty, workspaceDir));
+    else console.log(renderPlanText(plan, dirty));
     return 0;
   }
 
@@ -632,9 +709,20 @@ export async function runRestartSelf(
 
   // Emit the result BEFORE the kill — the kill terminates this very process in
   // production (it kills our own session), so anything after it never prints.
-  const plan = makePlan({ dryRun: false, reason, session, stashRef, resumeNotePath, relauncherPath, killed: true });
+  const plan = makePlan({
+    dryRun: false,
+    reason,
+    session,
+    workspaceDir,
+    identitySource,
+    workspaceDirConflict,
+    stashRef,
+    resumeNotePath,
+    relauncherPath,
+    killed: true,
+  });
   if (opts.json) console.log(JSON.stringify(plan, null, 2));
-  else console.log(renderPlanText(plan, dirty, workspaceDir));
+  else console.log(renderPlanText(plan, dirty));
 
   // 6. Kill the current session — the actual restart trigger.
   deps.killSession(session);
@@ -645,6 +733,9 @@ function makePlan(args: {
   readonly dryRun: boolean;
   readonly reason: RestartReason;
   readonly session: string;
+  readonly workspaceDir: string;
+  readonly identitySource: IdentitySource;
+  readonly workspaceDirConflict: string | null;
   readonly stashRef: string | null;
   readonly resumeNotePath: string;
   readonly relauncherPath: string;
@@ -655,6 +746,9 @@ function makePlan(args: {
     dry_run: args.dryRun,
     reason: args.reason,
     session: args.session,
+    workspace_dir: args.workspaceDir,
+    identity_source: args.identitySource,
+    workspace_dir_conflict: args.workspaceDirConflict,
     stash_ref: args.stashRef,
     resume_note_path: args.resumeNotePath,
     relauncher_path: args.relauncherPath,
@@ -792,31 +886,84 @@ export interface RestartSelfCliOptions {
    * for completeness / scripting.
    */
   readonly leaveConfigUncommitted?: boolean;
+  /**
+   * True iff the caller passed `--dir` on argv (macf#888) — as opposed to
+   * `projectDir` merely holding a resolved path (which is ALWAYS truthy,
+   * whether it came from `--dir` or from cwd auto-discovery; `projectDir`
+   * alone can't distinguish the two — macf#347's lesson about inferring
+   * "explicit" from a value that's equally present on the default path).
+   * index.ts's `--dir <path>` registration carries no commander default, so
+   * `opts.dir` is `undefined` exactly when the flag is absent; the caller
+   * captures `opts.dir !== undefined` BEFORE `resolveProjectDir` collapses
+   * both paths into the same string shape.
+   */
+  readonly dirExplicit?: boolean;
+}
+
+export interface ResolvedIdentity {
+  readonly workspaceDir: string;
+  readonly identitySource: IdentitySource;
+  /** The discarded `MACF_WORKSPACE_DIR`, only when `--dir` won over a DIFFERING one. */
+  readonly workspaceDirConflict: string | null;
+  readonly project?: string;
+  readonly agentName?: string;
+  readonly routingLabel?: string;
 }
 
 /**
- * Resolve identity (workspace / project / agent / routing-label) from env first
- * (the running agent's `claude.sh`-exported values), falling back to
- * `.macf/macf-agent.json`. The canonical session claude.sh self-wraps into is
- * `${MACF_PROJECT}@${MACF_ROUTING_LABEL}` (macf#678); `routingLabel` defaults to
- * `agentName` when neither the env var nor `config.routing_label` is set.
+ * Resolve identity (workspace / project / agent / routing-label).
+ *
+ * `dirExplicit=false` (default — the ordinary self-restart invocation, and
+ * the #763-scrubbed `fleet upgrade` roll path, which passes NO `--dir` at
+ * all): unchanged from pre-macf#888 behavior — ambient env wins over
+ * `.macf/macf-agent.json`, which wins over the auto-discovered `projectDir`.
+ * This is intentionally untouched so #763's fix (scrub the orchestrator's
+ * `MACF_*` env before exec'ing `restart-self` with no `--dir`) keeps working
+ * exactly as before: with env absent, this branch already fell through to
+ * config/cwd, which is what made that fix sufficient.
+ *
+ * `dirExplicit=true` (macf#888 — an explicit `--dir <other-workspace>`): the
+ * operator named a workspace on purpose, almost always NOT their own. Every
+ * `MACF_*` env var belongs to the CALLING agent's session (`claude.sh` sets
+ * them for itself), so none of them may leak into a cross-workspace
+ * resolution — that leak is exactly what silently retargeted `--dir` at the
+ * caller for BOTH `workspaceDir` and the derived `<project>@<routing-label>`
+ * session. Source ONLY the target's own config (`config`, already read from
+ * `projectDir` == the validated `--dir` path) — no env fallback: if the
+ * target's config lacks `project`/`agent_name`, `resolveSession` correctly
+ * refuses (exit 1) rather than silently borrowing the caller's identity.
  */
 export function resolveIdentity(
   projectDir: string,
   env: NodeJS.ProcessEnv = process.env,
-): {
-  readonly workspaceDir: string;
-  readonly project?: string;
-  readonly agentName?: string;
-  readonly routingLabel?: string;
-} {
+  dirExplicit = false,
+): ResolvedIdentity {
   const config = readAgentConfig(projectDir);
-  const workspaceDir = env['MACF_WORKSPACE_DIR']?.trim() || projectDir;
+  const envWorkspaceDir = env['MACF_WORKSPACE_DIR']?.trim();
+
+  if (dirExplicit) {
+    return {
+      workspaceDir: projectDir,
+      identitySource: 'dir-flag',
+      workspaceDirConflict:
+        envWorkspaceDir && envWorkspaceDir !== projectDir ? envWorkspaceDir : null,
+      project: config?.project,
+      agentName: config?.agent_name,
+      routingLabel: config?.routing_label || config?.agent_name,
+    };
+  }
+
   const project = env['MACF_PROJECT']?.trim() || config?.project;
   const agentName = env['MACF_AGENT_NAME']?.trim() || config?.agent_name;
-  const routingLabel =
-    env['MACF_ROUTING_LABEL']?.trim() || config?.routing_label || agentName;
-  return { workspaceDir, project, agentName, routingLabel };
+  const routingLabel = env['MACF_ROUTING_LABEL']?.trim() || config?.routing_label || agentName;
+  return {
+    workspaceDir: envWorkspaceDir || projectDir,
+    identitySource: envWorkspaceDir ? 'env' : 'cwd-discovery',
+    workspaceDirConflict: null,
+    project,
+    agentName,
+    routingLabel,
+  };
 }
 
 /** `macf restart-self` entry point — resolves config, wires real deps, runs. */
@@ -824,7 +971,8 @@ export async function runRestartSelfCommand(
   projectDir: string,
   cliOpts: RestartSelfCliOptions,
 ): Promise<number> {
-  const { workspaceDir, project, agentName, routingLabel } = resolveIdentity(projectDir);
+  const { workspaceDir, identitySource, workspaceDirConflict, project, agentName, routingLabel } =
+    resolveIdentity(projectDir, process.env, cliOpts.dirExplicit === true);
   // macf#755 — resolve the canonical-branch guard's expected branch from the
   // SAME `projectDir` config `resolveIdentity` reads (env override still
   // applies regardless of whether a config is found).
@@ -833,6 +981,8 @@ export async function runRestartSelfCommand(
   return runRestartSelf(
     {
       workspaceDir,
+      identitySource,
+      workspaceDirConflict,
       project,
       agentName,
       routingLabel,
