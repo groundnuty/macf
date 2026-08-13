@@ -42,6 +42,8 @@ import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
+import type { VaultAgentObservation, VaultCaObservation } from './vault-read.js';
+import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
 
 // --- Observed state (the reconcile input; populated by an observer, consumed as data) ---
 
@@ -58,6 +60,15 @@ export interface ObservedAgentState {
   /** Secret-name → fingerprint, sourced from `fleet.lock` (never a secret value). */
   readonly fingerprints: Readonly<Record<string, string>>;
   readonly deployedVersion?: string;
+  /**
+   * Vault-derived secret-field presence for this agent (DR-043 Amendment D
+   * phase 3, `vault-read.ts::queryVaultAgentPresence`) — `undefined` when
+   * `plan` ran without vault access (the phase-2 default; NOT evidence the
+   * vault lacks this agent's secrets, just "not asked this run"). Populated
+   * by `observer.ts::vaultAwareObserver`; `githubRegistryObserver` never
+   * sets it.
+   */
+  readonly vault?: VaultAgentObservation;
 }
 
 /**
@@ -81,6 +92,11 @@ export interface ObservedState {
   readonly caRegistry: Presence;
   /** Per-agent-repo `<SEG>_CA_CERT` presence, keyed by `agent.repo`. */
   readonly caRepos: Readonly<Record<string, Presence>>;
+  /**
+   * Vault-derived per-project CA key/cert presence (DR-043 Amendment D phase
+   * 3) — same undefined-vs-observed convention as {@link ObservedAgentState.vault}.
+   */
+  readonly vaultCa?: VaultCaObservation;
   /** The `MACF_ROUTING_RUNS_ON` value observed on a caller repo, if any. */
   readonly routingRunsOn?: string;
 }
@@ -361,15 +377,40 @@ function installItem(fleetName: string, agent: FleetAgent, obs: ObservedAgentSta
   };
 }
 
+/**
+ * Render a vault-derived agent observation as a plan-reason suffix — the
+ * "plan-visible" half of DR-043 Amendment D phase 3 (`vault-read.ts`'s
+ * module doc: "lifts phase 2 into Amendment A's confirm tier"). Returns `''`
+ * (byte-identical to before this field existed) when `vault` is `undefined`
+ * — a plan run without vault access renders exactly as it always has;
+ * nothing here changes `secretFingerprintItem`'s CREATE/NOOP decision, only
+ * the reason TEXT, so this is purely additive over the phase-2 behavior.
+ */
+function formatVaultAgentSuffix(vault: VaultAgentObservation | undefined): string {
+  if (vault === undefined) return '';
+  if (vault.status === 'unknown') return ` [vault: unknown — ${vault.reason}]`;
+  const { present, total } = countVaultAgentPresence(vault.presence);
+  return ` [vault: ${String(present)}/${String(total)} secret fields present]`;
+}
+
+/** CA sibling of {@link formatVaultAgentSuffix} — same undefined-is-a-no-op contract. */
+function formatVaultCaSuffix(vaultCa: VaultCaObservation | undefined): string {
+  if (vaultCa === undefined) return '';
+  if (vaultCa.status === 'unknown') return ` [vault: unknown — ${vaultCa.reason}]`;
+  const { present, total } = countVaultCaPresence(vaultCa.presence);
+  return ` [vault: ${String(present)}/${String(total)} CA fields present]`;
+}
+
 function secretFingerprintItem(agent: FleetAgent, obs: ObservedAgentState | undefined): PlanItem {
   const fingerprints = obs?.fingerprints ?? {};
   const count = Object.keys(fingerprints).length;
+  const vaultSuffix = formatVaultAgentSuffix(obs?.vault);
   if (count === 0) {
     return {
       kind: 'secret_fingerprint',
       target: `agent:${agent.role}:secrets`,
       verb: 'create',
-      reason: 'no fingerprints recorded in fleet.lock — agent has not been provisioned yet',
+      reason: `no fingerprints recorded in fleet.lock — agent has not been provisioned yet${vaultSuffix}`,
       confirm_required: false,
     };
   }
@@ -379,20 +420,20 @@ function secretFingerprintItem(agent: FleetAgent, obs: ObservedAgentState | unde
     verb: 'noop',
     reason:
       `${String(count)} fingerprint(s) recorded in fleet.lock. Live-registry fingerprint drift-detection ` +
-      '(re-materialize-from-vault on clobber) is a Slice-2 concern — not exercised by plan-only Slice 1a.',
+      `(re-materialize-from-vault on clobber) is a Slice-2 concern — not exercised by plan-only Slice 1a.${vaultSuffix}`,
     confirm_required: false,
   };
 }
 
 /** The registry-scope CA plan item — one of the two DR two-place-rule legs (macf#806). */
-function caRegistryItem(seg: string, presence: Presence): PlanItem {
+function caRegistryItem(seg: string, presence: Presence, vaultCa: VaultCaObservation | undefined): PlanItem {
   const varName = `${seg}_CA_CERT`;
   const { verb, reasonSuffix } = presenceVerb(presence, UNKNOWN_REASONS.variable);
   return {
     kind: 'ca',
     target: `ca:registry:${varName}`,
     verb,
-    reason: `registry CA var "${varName}" ${reasonSuffix}`,
+    reason: `registry CA var "${varName}" ${reasonSuffix}${formatVaultCaSuffix(vaultCa)}`,
     confirm_required: false,
   };
 }
@@ -467,7 +508,7 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
     items.push(secretFingerprintItem(agent, obs));
   }
 
-  items.push(caRegistryItem(seg, observed.caRegistry));
+  items.push(caRegistryItem(seg, observed.caRegistry, observed.vaultCa));
   for (const agent of manifest.agents) {
     items.push(caRepoItem(seg, agent.repo, observed.caRepos[agent.repo] ?? 'unknown'));
   }

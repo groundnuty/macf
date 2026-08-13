@@ -242,4 +242,74 @@ describe('runBootstrapPlan', () => {
     expect(json.summary.noops).toBe(6);
     expect(json.summary.creates).toBe(0);
   });
+
+  // DR-043 Amendment D phase 3 — proves the `--vault`/`--identity-key` CLI
+  // flags actually reach the REAL `vaultAwareObserver` → `readVault` chain
+  // (no injected `deps`, unlike every test above) rather than a fake this
+  // suite constructs. Points both flags at nonexistent paths — no `age`
+  // binary needed, no fake to get wrong — and asserts the resulting plan
+  // carries an honest `[vault: unknown — ...]` fact, not a silently-vault-
+  // free plan (which would mean the flags were plumbed nowhere) and not a
+  // crash (which the observer's own degrade-to-unknown contract forbids).
+  it('--vault + --identity-key (no injected deps) reach the REAL vault-aware observer and surface an honest [vault: unknown] fact for a nonexistent vault', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapPlan({
+      file,
+      json: true,
+      vaultPath: join(dir, 'does-not-exist', 'vault.age'),
+      identityKeyPath: join(dir, 'does-not-exist', 'identity.txt'),
+    });
+    expect(code).toBe(0); // a vault-read failure degrades to unknown; it does NOT fail the plan
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      plan: ReadonlyArray<{ kind: string; target: string; reason: string }>;
+    };
+    const agentSecrets = json.plan.find((i) => i.kind === 'secret_fingerprint');
+    expect(agentSecrets?.reason).toContain('[vault: unknown —');
+    expect(agentSecrets?.reason).toContain('vault file not found');
+  });
+
+  it('--vault WITHOUT --identity-key: refused loud (vault_flags_incomplete), never silently vault-free', async () => {
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapPlan({ file: '/does/not/matter.yaml', json: true, vaultPath: '/fake/vault.age' });
+    expect(code).toBe(1);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { error: { code: string; message: string } };
+    expect(json.error.code).toBe('vault_flags_incomplete');
+    expect(json.error.message).toContain('--identity-key');
+  });
+
+  it('--identity-key WITHOUT --vault: refused loud (vault_flags_incomplete), never silently vault-free', async () => {
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapPlan({ file: '/does/not/matter.yaml', json: true, identityKeyPath: '/fake/key.txt' });
+    expect(code).toBe(1);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { error: { code: string; message: string } };
+    expect(json.error.code).toBe('vault_flags_incomplete');
+    expect(json.error.message).toContain('--vault');
+  });
+
+  it('the half-specified-flags refusal fires BEFORE the manifest-file check — an argument error, not a manifest error', async () => {
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapPlan({ file: '/does/not/exist/fleet.yaml', json: true, vaultPath: '/fake/vault.age' });
+    expect(code).toBe(1);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { error: { code: string } };
+    expect(json.error.code).toBe('vault_flags_incomplete'); // NOT manifest_not_found
+  });
+
+  it('WITHOUT --vault/--identity-key (the default), the plan carries no vault fact at all — vault-free stays vault-free', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const deps: BootstrapPlanDeps = { observe: async () => EMPTY_OBSERVED };
+    const code = await runBootstrapPlan({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      plan: ReadonlyArray<{ kind: string; reason: string }>;
+    };
+    const agentSecrets = json.plan.find((i) => i.kind === 'secret_fingerprint');
+    expect(agentSecrets?.reason).not.toContain('[vault:');
+  });
 });

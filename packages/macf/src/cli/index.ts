@@ -488,8 +488,20 @@ bootstrap
   )
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
   .option('--json', 'Emit the structured plan as JSON', false)
+  .option(
+    '--vault <path>',
+    'Path to a fleet\'s secrets/vault.age — with --identity-key, lifts per-agent/CA observation into the ' +
+      'vault-aware confirm tier (DR-043 Amendment D phase 3). Operator-privileged use only; omit for the ' +
+      'vault-free default.',
+  )
+  .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
   .action(async (opts) => {
-    const code = await runBootstrapPlan({ file: opts.file, json: opts.json });
+    const code = await runBootstrapPlan({
+      file: opts.file,
+      json: opts.json,
+      vaultPath: opts.vault,
+      identityKeyPath: opts.identityKey,
+    });
     process.exitCode = code;
   });
 
