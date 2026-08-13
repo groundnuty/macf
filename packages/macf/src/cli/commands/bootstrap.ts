@@ -15,7 +15,7 @@ import { resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
 import { parseFleetManifest } from '../bootstrap/fleet-manifest.js';
 import type { FleetObserverFn, FleetPlanFailure } from '../bootstrap/plan.js';
-import { computePlan, fleetPlanFailureToJson, fleetPlanToJson, formatPlanText } from '../bootstrap/plan.js';
+import { checkVaultFlagsComplete, computePlan, fleetPlanFailureToJson, fleetPlanToJson, formatPlanText } from '../bootstrap/plan.js';
 import { githubRegistryObserver, vaultAwareObserver } from '../bootstrap/observer.js';
 
 export interface RunBootstrapPlanOptions {
@@ -77,31 +77,12 @@ export async function runBootstrapPlan(
   deps?: BootstrapPlanDeps,
 ): Promise<number> {
   // Half-specified `--vault`/`--identity-key` pair — refuse LOUD rather than
-  // silently falling back to the vault-free observer. Without this check,
-  // `--vault <path>` alone (identity-key forgotten) produces a plan
-  // byte-identical to a vault-free run — no `[vault: ...]` fact anywhere,
-  // no signal the operator's intent (vault-aware observation) was never
-  // honored. That is exactly the shape `plan.ts`'s own
-  // skippedSections/unimplementedByApply machinery exists to prevent for
-  // manifest sections ("a plan that lists items apply will never attempt
-  // manufactures false confidence") and the silent-fallback class this
-  // codebase's Instance 15 documents at the launcher-flag layer — a
-  // half-given flag pair is the CLI-argument-boundary version of the same
-  // hazard. `plan` is read-only (never consent-gated, never irreversible),
-  // so this is a REFUSE at the CLI boundary rather than a degrade-to-warn:
-  // simpler than threading a partial-flags warning through `ObservedState`,
-  // and the operator can immediately supply the missing flag and re-run.
-  if ((opts.vaultPath === undefined) !== (opts.identityKeyPath === undefined)) {
-    return renderFailure(
-      {
-        code: 'vault_flags_incomplete',
-        message:
-          '--vault and --identity-key must be given TOGETHER or not at all — ' +
-          `only ${opts.vaultPath !== undefined ? '--vault' : '--identity-key'} was given. Supply both for a ` +
-          'vault-aware plan (DR-043 Amendment D phase 3), or neither for the vault-free default.',
-      },
-      opts,
-    );
+  // silently falling back to the vault-free observer (macf#913: this check
+  // is now shared with `bootstrap apply`'s own vault-aware confirm — see
+  // `plan.ts::checkVaultFlagsComplete`'s doc for the full rationale).
+  const vaultFlagsFailure = checkVaultFlagsComplete(opts.vaultPath, opts.identityKeyPath);
+  if (vaultFlagsFailure !== undefined) {
+    return renderFailure(vaultFlagsFailure, opts);
   }
 
   const manifestPath = resolvePath(opts.file);

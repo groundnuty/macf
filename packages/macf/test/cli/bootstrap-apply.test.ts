@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runBootstrapApply,
+  resolveMutateDeps,
   plannedAppCreations,
   formatPlannedAppCreations,
   formatApplyResult,
@@ -35,6 +36,8 @@ import type { FleetApplyResult } from '../../src/cli/bootstrap/apply-fleet.js';
 import type { AgentApplyDeps } from '../../src/cli/bootstrap/apply-agent.js';
 import type { AppCredentials } from '../../src/cli/bootstrap/manifest-exchange.js';
 import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
+import { VaultError, buildVaultPlaintext, type VaultAgentSecrets } from '../../src/cli/bootstrap/vault-write.js';
+import { parseVaultPlaintext } from '../../src/cli/bootstrap/vault-read.js';
 
 const FLEET_YAML = `apiVersion: macf/v0
 kind: Fleet
@@ -280,6 +283,12 @@ const SENTINEL_CREDS: AppCredentials = {
 // from "the CA key leaked" if one but not the other ever regresses.
 const SENTINEL_CA_KEY_PEM = 'SENTINEL-CA-KEY-PEM';
 const SENTINEL_CA_CERT_PEM = 'SENTINEL-CA-CERT-PEM';
+
+// macf#913 — a THIRD, distinct sentinel: the vault-derived agent PEM the
+// vault-aware confirm-before-create guard resolves. Distinct from
+// SENTINEL_CREDS/SENTINEL_CA_KEY_PEM so a leak test can tell exactly which
+// secret surface regressed.
+const SENTINEL_VAULT_PEM = '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-VAULT-PEM-BYTES\n-----END RSA PRIVATE KEY-----\n';
 
 /** Default fake `CaApplyDeps` (macf#838 Amendment D phase 2) — everything absent, so a fresh mint + two-place publish succeeds by default; individual tests override to exercise other shapes. */
 function fakeTrustDeps(overrides: Partial<CaApplyDeps> = {}): CaApplyDeps {
@@ -718,6 +727,309 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     } finally {
       writeSpy.mockRestore();
     }
+  });
+
+  // --- Vault-aware confirm-before-create (DR-043 Amendment A, macf#913) ---
+  //
+  // Through DR-043 Amendment D phase 3, `apply` had NO `--vault`/
+  // `--identity-key` flags at all (only `plan` did), so `plan.ts`'s own
+  // "a vault-aware confirm runs during apply" text was simply false. These
+  // tests exercise apply's own flags, the shared XOR refusal, the
+  // honest-unknown degrade on a failed decrypt, and — the load-bearing
+  // behavior — that a role WITH a prior fleet.lock entry AND a confirmable
+  // vault PEM is REUSED, never re-created, with consent gate 1 (the
+  // `startManifestFlow` seam) asserted NEVER CALLED, not merely absent from
+  // the outcome.
+
+  /** A raw vault map carrying a decodable PEM for each of the given roles — built via the REAL write/parse round-trip (never hand-derived key names), same convention as `vault-read.test.ts`. */
+  function vaultRawWithAgentPems(roles: readonly string[], pem = SENTINEL_VAULT_PEM): Readonly<Record<string, string>> {
+    const agents: VaultAgentSecrets[] = roles.map((role) => ({
+      appHandle: `demo-fleet-${role}`,
+      appId: '111',
+      installId: '222',
+      clientId: 'Iv1.abc',
+      clientSecret: 'not-under-test',
+      webhookSecret: 'not-under-test',
+      pem,
+    }));
+    return parseVaultPlaintext(buildVaultPlaintext({ agents }));
+  }
+
+  it('--vault WITHOUT --identity-key: refused loud (vault_flags_incomplete), never silently vault-free', async () => {
+    const code = await runBootstrapApply({ file: '/does/not/matter.yaml', json: true, vaultPath: '/fake/vault.age' });
+    expect(code).toBe(1);
+    const json = JSON.parse(logs.join('\n')) as { error: { code: string; message: string } };
+    expect(json.error.code).toBe('vault_flags_incomplete');
+    expect(json.error.message).toContain('--identity-key');
+  });
+
+  it('--identity-key WITHOUT --vault: refused loud (vault_flags_incomplete), never silently vault-free', async () => {
+    const code = await runBootstrapApply({ file: '/does/not/matter.yaml', json: true, identityKeyPath: '/fake/key.txt' });
+    expect(code).toBe(1);
+    const json = JSON.parse(logs.join('\n')) as { error: { code: string; message: string } };
+    expect(json.error.code).toBe('vault_flags_incomplete');
+    expect(json.error.message).toContain('--vault');
+  });
+
+  it('the half-specified-flags refusal fires BEFORE the manifest-file check — an argument error, not a manifest error', async () => {
+    const code = await runBootstrapApply({ file: '/does/not/exist/fleet.yaml', json: true, vaultPath: '/fake/vault.age' });
+    expect(code).toBe(1);
+    const json = JSON.parse(logs.join('\n')) as { error: { code: string } };
+    expect(json.error.code).toBe('vault_flags_incomplete'); // NOT manifest_not_found
+  });
+
+  it('with identity + genuinely absent App (no prior fleet.lock entry, no vault PEM either) -> creates as today, gate 1 IS opened', async () => {
+    const file = writeManifest();
+    let startManifestFlowCalled = false;
+    const code = await runBootstrapApply(
+      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), readVault: async () => ({}) },
+      fakeMutateDeps(file, {
+        buildAgentDeps: () =>
+          fakeAgentDeps({
+            startManifestFlow: async () => {
+              startManifestFlowCalled = true;
+              return { startUrl: 'http://127.0.0.1:9/', redirectUrl: 'http://127.0.0.1:9/callback', waitForCode: async () => 'the-code', close: async () => {} };
+            },
+          }),
+      }),
+    );
+    expect(code).toBe(0);
+    expect(startManifestFlowCalled).toBe(true);
+    const out = logs.join('\n');
+    expect(out).toMatch(/code-agent: CREATED/);
+    expect(out).toMatch(/science-agent: CREATED/);
+  });
+
+  it('with identity + an existing App recorded in the control-repo checkout -> CONFIRMED, REUSED, gate 1 seam is NEVER called (not merely unused)', async () => {
+    const file = writeManifest();
+    const priorLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [
+        { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+        { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+      ],
+    };
+    let startManifestFlowCalled = false;
+    const code = await runBootstrapApply(
+      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      {
+        observe: () => Promise.resolve(EMPTY_OBSERVED),
+        readVault: async () => vaultRawWithAgentPems(['code-agent', 'science-agent']),
+      },
+      fakeMutateDeps(file, {
+        buildAgentDeps: () =>
+          fakeAgentDeps({
+            // Mirrors resolveMutateDeps's OWN resolveKeyPath shape (pinned
+            // directly, unit-level, in the 'resolveMutateDeps' describe
+            // block below) — proves the OVERALL behavior once such wiring
+            // is present, without a real GitHub App / age binary.
+            resolveKeyPath: (role) => `/fake/${role}.pem`,
+            confirmAppInstallation: async (appId) => ({
+              status: 'confirmed',
+              install: { appId, installId: appId === 'app-code-agent' ? 'install-1' : 'install-2', appSlug: '', accountLogin: 'groundnuty' },
+            }),
+            startManifestFlow: async () => {
+              startManifestFlowCalled = true;
+              throw new Error('must not be called — a CONFIRMED App must skip consent gate 1 entirely (macf#913)');
+            },
+          }),
+        // 'ours' (present, not archived, fleet.yaml name-matches) — a
+        // REALISTIC steady-state re-run against an already-provisioned
+        // fleet, not the archived case (that's the dedicated revival test
+        // below).
+        controlRepoDeps: {
+          checkMeta: async () => ({ presence: 'present', archived: false }),
+          readManifestFile: async () => FLEET_YAML,
+          createRepo: async () => {
+            throw new Error('must not be called — reuse never creates');
+          },
+          unarchiveRepo: async () => {
+            throw new Error('must not be called');
+          },
+          // The real clone brings back whatever the control repo already has
+          // committed — simulate that the SAME way apply-fleet.test.ts's own
+          // self-heal test does (writing fleet.lock into destDir).
+          cloneRepo: async (_url, destDir) => {
+            writeFileSync(join(destDir, 'fleet.lock'), JSON.stringify(priorLock), 'utf-8');
+          },
+          commitAndPush: async () => 'nothing-to-commit',
+        },
+      }),
+    );
+    expect(code).toBe(0);
+    expect(startManifestFlowCalled).toBe(false); // the gate seam was never even invoked
+    const out = logs.join('\n');
+    expect(out).toMatch(/Control repo: REUSED/);
+    expect(out).toMatch(/code-agent: REUSED/);
+    expect(out).toMatch(/science-agent: REUSED/);
+    expect(out).not.toMatch(/code-agent: CREATED/);
+  });
+
+  it('decrypt failure (bad --identity-key) -> honest-unknown, falls back to the vault-free guard, NEVER a secret in any message', async () => {
+    const file = writeManifest();
+    // The diagnostic goes to process.stderr.write (same channel
+    // resolveMutateDeps's `log` field uses for progress narration), not
+    // console.error — spy on the raw stream, same pattern the existing
+    // "pre-approval stderr render" test above already uses.
+    const rawWrites: string[] = [];
+    const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      rawWrites.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+      return true;
+    });
+    let code: number;
+    try {
+      code = await runBootstrapApply(
+        { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/wrong-identity.txt' },
+        {
+          observe: () => Promise.resolve(EMPTY_OBSERVED),
+          readVault: async () => {
+            throw new VaultError('vault_decrypt_failed', 'age -d exited 1 decrypting "/fake/vault.age" — wrong identity key, or a corrupted file.');
+          },
+        },
+        fakeMutateDeps(file),
+      );
+    } finally {
+      writeSpy.mockRestore();
+    }
+    expect(code).toBe(0); // degrades to the vault-free default; does NOT fail the run
+    const stderrOut = rawWrites.join('');
+    expect(stderrOut).toMatch(/Vault-aware confirm UNAVAILABLE/);
+    expect(stderrOut).toMatch(/wrong identity key/);
+    const out = [stderrOut, ...logs, ...errs].join('\n');
+    expect(out).not.toContain('-----BEGIN');
+    expect(out).not.toContain(SENTINEL_VAULT_PEM);
+    // Falls all the way back to today's behaviour — both agents still CREATED.
+    expect(logs.join('\n')).toMatch(/code-agent: CREATED/);
+  });
+
+  it('--dry-run reports which path it would take: a vault-confirmed role is REUSED (excluded from "would be created"), an unconfirmable one stays a create-candidate', async () => {
+    const file = writeManifest();
+    const observedWithLock: ObservedState = {
+      lock: { schema_version: 1, fleet: 'demo-fleet', agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }] },
+      agents: {},
+      caRegistry: 'absent',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const code = await runBootstrapApply(
+      { file, dryRun: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      {
+        observe: () => Promise.resolve(observedWithLock),
+        readVault: async () => vaultRawWithAgentPems(['code-agent']),
+        confirmAppInstallation: async (appId) => ({
+          status: 'confirmed',
+          install: { appId, installId: 'install-1', appSlug: '', accountLogin: 'groundnuty' },
+        }),
+      },
+    );
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    // The operator learns the outcome BEFORE spending a click:
+    expect(out).toMatch(/code-agent: REUSE/);
+    expect(out).not.toMatch(/demo-fleet-code-agent\s+\(role: code-agent/); // dropped from "would be created"
+    // science-agent has no prior lock entry -> still a genuine create-candidate:
+    expect(out).toMatch(/demo-fleet-science-agent\s+\(role: science-agent/);
+    expect(out).toMatch(/DRY RUN — nothing was created/);
+  });
+
+  // --- DR-043 Amendment G (macf#867) + macf#913 — the combined revival case ---
+  // this issue names explicitly: "archive state -> apply with identity ->
+  // zero gate opens."
+
+  it('archived-fleet revival WITH identity: unarchiveRepo IS called, REVIVED, both roles REUSED, gate 1 seam NEVER called', async () => {
+    const file = writeManifest();
+    const priorLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }, { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' }],
+    };
+    let unarchiveCalled = false;
+    let startManifestFlowCalled = false;
+    const code = await runBootstrapApply(
+      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      {
+        observe: () => Promise.resolve(EMPTY_OBSERVED),
+        readVault: async () => vaultRawWithAgentPems(['code-agent', 'science-agent']),
+      },
+      fakeMutateDeps(file, {
+        buildAgentDeps: () =>
+          fakeAgentDeps({
+            resolveKeyPath: (role) => `/fake/${role}.pem`,
+            confirmAppInstallation: async (appId) => ({
+              status: 'confirmed',
+              install: { appId, installId: appId === 'app-code-agent' ? 'install-1' : 'install-2', appSlug: '', accountLogin: 'groundnuty' },
+            }),
+            startManifestFlow: async () => {
+              startManifestFlowCalled = true;
+              throw new Error('must not be called — the archived-then-revived fleet\'s Apps are already confirmed live (macf#913)');
+            },
+          }),
+        controlRepoOptions: { confirmUnarchive: true, makeScratchDir: () => join(file, '..') },
+        controlRepoDeps: {
+          checkMeta: async () => ({ presence: 'present', archived: true }),
+          readManifestFile: async () => FLEET_YAML,
+          createRepo: async () => {
+            throw new Error('must not be called — ours-archived never creates');
+          },
+          unarchiveRepo: async () => {
+            unarchiveCalled = true;
+          },
+          cloneRepo: async (_url, destDir) => {
+            writeFileSync(join(destDir, 'fleet.lock'), JSON.stringify(priorLock), 'utf-8');
+          },
+          commitAndPush: async () => 'pushed',
+        },
+      }),
+    );
+    expect(code).toBe(0);
+    expect(unarchiveCalled).toBe(true);
+    expect(startManifestFlowCalled).toBe(false); // zero gate opens
+    const out = logs.join('\n');
+    expect(out).toMatch(/REVIVED/);
+    expect(out).toMatch(/code-agent: REUSED/);
+    expect(out).toMatch(/science-agent: REUSED/);
+  });
+});
+
+// --- resolveMutateDeps — the vault-aware resolveKeyPath wiring itself (macf#913) ---
+//
+// Unit-level, no gh/git — resolveKeyPath and cleanupVaultScratch only ever
+// touch the local filesystem. Pins the WIRING (opts.vaultPath/identityKeyPath
+// -> resolveVaultAgentPems -> resolveMutateDeps(path, pems) -> this exact
+// resolveKeyPath shape) that the behavioral tests above simulate rather than
+// exercise directly (they use fakeMutateDeps for everything else, per this
+// suite's established no-real-gh/git convention).
+
+describe('resolveMutateDeps — vault-aware resolveKeyPath + cleanupVaultScratch (macf#913)', () => {
+  it('omits resolveKeyPath entirely when no vault map is supplied — byte-identical to pre-macf#913 wiring', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml');
+    expect(deps.buildAgentDeps(() => {}).resolveKeyPath).toBeUndefined();
+  });
+
+  it('resolveKeyPath returns undefined for a role NOT present in the map', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map());
+    expect(deps.buildAgentDeps(() => {}).resolveKeyPath?.('code-agent', 'app-1')).toBeUndefined();
+  });
+
+  it('resolveKeyPath writes the PEM to a 0600 scratch file and returns its path; cleanupVaultScratch removes it', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map([['code-agent', SENTINEL_VAULT_PEM]]));
+    const path = deps.buildAgentDeps(() => {}).resolveKeyPath?.('code-agent', 'app-1');
+    expect(path).toBeDefined();
+    expect(readFileSync(path as string, 'utf-8')).toBe(SENTINEL_VAULT_PEM);
+    deps.cleanupVaultScratch?.();
+    expect(existsSync(path as string)).toBe(false);
+  });
+
+  it('resolveKeyPath returns undefined for a DIFFERENT role even when the map is non-empty for another role', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map([['code-agent', SENTINEL_VAULT_PEM]]));
+    expect(deps.buildAgentDeps(() => {}).resolveKeyPath?.('science-agent', 'app-2')).toBeUndefined();
+  });
+
+  it('cleanupVaultScratch is a safe no-op when resolveKeyPath was configured but never actually invoked', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map([['code-agent', SENTINEL_VAULT_PEM]]));
+    expect(() => deps.cleanupVaultScratch?.()).not.toThrow();
   });
 });
 

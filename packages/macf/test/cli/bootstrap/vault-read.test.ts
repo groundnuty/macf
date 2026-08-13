@@ -28,6 +28,7 @@ import {
   queryVaultCaPresence,
   queryVaultRoutingPresence,
   readVault,
+  vaultAgentPrivateKeyPem,
   type VaultAgentObservation,
   type VaultCaObservation,
 } from '../../../src/cli/bootstrap/vault-read.js';
@@ -324,6 +325,26 @@ describe('presence/derivation queries — non-secret shapes only', () => {
     const serialized = JSON.stringify({ agentObs, caObs });
     expect(serialized).not.toContain(AGENT.clientSecret);
     expect(serialized).not.toContain(PAYLOAD.ca?.caCertPem);
+  });
+});
+
+describe('vaultAgentPrivateKeyPem — the ONE raw-secret-returning query (macf#913)', () => {
+  const raw = parseVaultPlaintext(buildVaultPlaintext(PAYLOAD));
+
+  it('returns the exact original PEM for a fully-provisioned role — round-trips through the base64 storage form', () => {
+    expect(vaultAgentPrivateKeyPem(raw, FLEET, ROLE)).toBe(AGENT.pem);
+  });
+
+  it('returns undefined for an unprovisioned role — never fabricates a PEM', () => {
+    expect(vaultAgentPrivateKeyPem(raw, FLEET, 'never-provisioned-role')).toBeUndefined();
+  });
+
+  it('returns undefined for a DIFFERENT fleet name — the key is derived forward from (fleetName, role), never a bare role lookup', () => {
+    expect(vaultAgentPrivateKeyPem(raw, 'some-other-fleet', ROLE)).toBeUndefined();
+  });
+
+  it('returns undefined against an empty vault map', () => {
+    expect(vaultAgentPrivateKeyPem({}, FLEET, ROLE)).toBeUndefined();
   });
 });
 

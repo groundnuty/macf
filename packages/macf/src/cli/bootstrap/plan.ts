@@ -427,9 +427,19 @@ export function computeUnimplementedByApply(items: readonly PlanItem[]): readonl
  * insufficient scope) — nothing to do with JWTs.
  */
 export const UNKNOWN_REASONS = {
+  // macf#913 — this text previously claimed "a vault-aware confirm runs
+  // during apply" unconditionally. That was false: through DR-043 Amendment
+  // D phase 3, `apply` had no `--vault`/`--identity-key` flags at all (only
+  // `plan` did), so NO confirm ever ran, and the operator had no way to know
+  // that from this message. `apply` now DOES confirm live — but ONLY when
+  // given both flags (see `commands/bootstrap-apply.ts`'s vault-aware
+  // confirm-before-create wiring); the wording below states that condition
+  // explicitly rather than promising a capability the operator's specific
+  // invocation may not have opted into.
   identity:
-    'not confirmable at plan time (no App JWT — the PEM lives in the vault; ' +
-    'a vault-aware confirm runs during apply, DR-043 Amendment A)',
+    'not confirmable at plan time (no App JWT — the PEM lives in the vault). `macf bootstrap apply` confirms ' +
+    'it live ONLY when invoked with BOTH --vault and --identity-key (DR-043 Amendment A) — pass both to avoid ' +
+    'apply colliding with an existing App name; without them, apply treats this the same way plan does here',
   repo: 'could not be read (auth / network / insufficient scope) — existence unconfirmed',
   variable: 'could not be read (auth / network / insufficient scope) — existence unconfirmed',
   // DR-043 §D6 — deliberately NOT the same cause as `identity` above (no
@@ -926,4 +936,39 @@ export interface FleetPlanFailure {
 /** The `--json` failure envelope — same `schema_version` contract as `fleetPlanToJson` (macf#830 lesson: never empty stdout under `--json`). */
 export function fleetPlanFailureToJson(failure: FleetPlanFailure): unknown {
   return { schema_version: FLEET_PLAN_JSON_SCHEMA_VERSION, error: failure };
+}
+
+/**
+ * The `--vault`/`--identity-key` XOR precondition — shared by BOTH `macf
+ * bootstrap plan` (`commands/bootstrap.ts`) and `macf bootstrap apply`
+ * (`commands/bootstrap-apply.ts`, macf#913) so the two commands can never
+ * drift on this check's shape or error code. Returns a `FleetPlanFailure`
+ * (code `vault_flags_incomplete`) when exactly ONE of the two flags was
+ * given, `undefined` when both or neither were given (the two LEGAL states —
+ * vault-aware and vault-free, respectively).
+ *
+ * Without this check, `--vault <path>` alone (identity-key forgotten) would
+ * silently produce a byte-identical run to the vault-free default — no
+ * `[vault: ...]` fact anywhere, no signal the operator's intent (vault-aware
+ * observation/confirm) was never honored. That is exactly the shape this
+ * file's own `skippedSections`/`unimplementedByApply` machinery exists to
+ * prevent for manifest sections, and the silent-fallback class
+ * `silent-fallback-hazards.md` Instance 15 documents at the launcher-flag
+ * layer — a half-given CLI flag pair is the argument-boundary version of the
+ * same hazard. Both commands are safe to REFUSE-at-the-boundary rather than
+ * degrade-to-warn here: `plan` is read-only (never consent-gated, never
+ * irreversible) and `apply` re-derives its own confirm-before-create guard
+ * from this same precondition (macf#913) — in neither case does silently
+ * degrading save the operator anything a loud refusal + immediate re-run
+ * doesn't already give them.
+ */
+export function checkVaultFlagsComplete(vaultPath: string | undefined, identityKeyPath: string | undefined): FleetPlanFailure | undefined {
+  if ((vaultPath === undefined) === (identityKeyPath === undefined)) return undefined;
+  return {
+    code: 'vault_flags_incomplete',
+    message:
+      '--vault and --identity-key must be given TOGETHER or not at all — ' +
+      `only ${vaultPath !== undefined ? '--vault' : '--identity-key'} was given. Supply both for a ` +
+      'vault-aware run (DR-043 Amendment D phase 3), or neither for the vault-free default.',
+  };
 }
