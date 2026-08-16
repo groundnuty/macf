@@ -473,3 +473,51 @@ So the two jobs are split:
 **The two outcomes are encoded distinctly**, so the difference reaches the exit code, the summary and `--json` together: no-token → `failed` → exit 1 (an error the operator must fix); poll-exhausted → `skipped` → exit 0 (a not-yet that a re-run resolves).
 
 **Known gap (not design):** the refusal currently fires at the routing step, after both consent gates. Nothing is lost — the fleet still provisions and a re-run completes it — but the error is knowable before the first click, and the registration token the operator then fetches expires in an hour. A pre-flight beside `runBootstrapApply`'s macf#913 XOR refusal closes it.
+
+## Amendment I (2026-08-16, #939 — operator premise withdrawn) — the fleet CALLS a runner-provisioning contract; H2's out-of-scope clause is replaced
+
+**Trigger.** H2 narrowed scope on an operator clarification — *"We assume that the runner is deployed, always, somewhere… Our scope is not deploying runners."* **That premise rested on runners being reusable across repos, and they are not.** Operator, 2026-08-16: *"The explicit statement in Amendment H was because I was pretty sure that we can reuse runners. Apparently we cannot. Hence there needs to be a little step while deploying the fleet that will actually call something that will provision the runners."*
+
+**The GitHub fact, verified — and it is about REGISTRATION, not machines.** `groundnuty` is a **User** account (`gh api users/groundnuty --jq .type` → `User`), so no organization-level runner tier exists (`gh api orgs/groundnuty/actions/runners` → `404`), and repository-level runners are dedicated to a single repository. But the live fleet shows one VM serving four repos under the *same runner name* — `macf-vm-orzech-dev-agents` appears under both `groundnuty/macf` and `groundnuty/macf-science-agent`. So the **machine is already shared; the registration is what cannot be**. Consequence: a new fleet is not hard-blocked (a manual `config.sh` on the existing VM still works), but every new fleet repo needs a registration that something must create.
+
+### I1 — the fleet calls a CONTRACT, never implementation objects
+
+The runner platform (`groundnuty/runner-platform`: `charts/runner`, `bin/runnerctl`) exposes `provision` / `destroy` / `status` / `list`, taking three fields in **fleet vocabulary** — `repo`, `labels`, `warm`. Nothing a caller touches names the implementation.
+
+**The vocabulary matters more than the transport, and that is the load-bearing property.** The platform has already changed implementation once (scale-sets → webhook mode) and may be deleted entirely if agent channel-servers become reachable without a tailnet join (DR-009 §10 option (c)). A caller that applied implementation objects directly would break on both. **The contract is what we promise not to change; everything behind it is free.** Properties the fleet may rely on: idempotent-by-name (so `provision` is callable unconditionally, with no does-it-exist dance), symmetric destroy, and stable exit codes.
+
+### I2 — the runner step belongs to `apply`, non-fatally; H2's `deploy` placement is retired
+
+**H2's argument dissolved rather than being overruled.** It assigned registration to `deploy` because *"`config.sh` plus a supervised service must execute on the machine that will run jobs."* Under the contract the thing that runs jobs is a pod the controller creates, so provisioning is an API call from anywhere and the two-sided machine split no longer applies to the runner half. **But removing the reason for a placement reopens the question rather than answering it**, and two considerations decide it:
+
+- **Symmetry with teardown → fleet-lifecycle ownership.** The contract is symmetric (`provision`/`destroy`) and Amendment G's ladder gains the destroy side (I3). If `deploy` created while the ladder destroyed, create and destroy would live in different commands — exactly the asymmetry Amendment G's symmetric-destroy property exists to prevent.
+- **Credential and dependency scope → non-fatal.** The contract needs a Kubernetes credential and cluster reachability, neither of which `apply` requires today. Wiring it **inline-and-fatal** would make fleet provisioning depend on the runner platform being up, even though every GitHub-side step would have succeeded — a new coupling in the direction the operator has been trimming (*"the runner tier must not depend on the observability tier"*; the symmetric case is that fleet provisioning must not depend on the runner tier).
+
+**So `apply` calls the contract, non-fatally — and H.1 already supplies the failure semantics, which is the evidence the placement is right.** A failed `provision` (cluster down, unauthorised, contract error) is reported loudly and does not abort the run; `checkRunnerUsableByRepo` then finds no runner, `MACF_TRUSTED_ACTORS` stays unwritten, routing falls back to hosted — costly, working, converging on the next `apply`. **No new failure semantics are invented**, because the policy/timing split already covers "a runner that isn't there yet." `deploy` keeps nothing of the runner half.
+
+**The bootstrap credential is NOT fleet state, so it is not an exception to the config/lock/vault triad — it is outside its scope.** The `runner-bootstrap` ServiceAccount is **shared infrastructure**: one cluster, one namespace-scoped token, every fleet. Placing it in per-fleet vaults would copy a single credential into N vaults and create N rotation sites for it. It is machine-level configuration of the shape `KUBECONFIG` already has. Recorded this way deliberately — as *not fleet state* rather than as *an exception* — so it cannot be cited as precedent for putting genuine fleet secrets outside the vault.
+
+### I3 — Amendment G gains the runner rung, at `deactivate`, with a MANDATORY ordering
+
+**The rung is `deactivate`, and the contract is what moved it there.** Amendment G orders rungs by **revival cost in operator clicks**. Under the VM/token model, destroying a runner meant a human SSHing in to re-run `config.sh` — expensive to reverse, so it would have sat high on the ladder. Under the contract, re-provisioning is an API call and the controller mints its own registration tokens: **zero operator clicks**. An operation changes rungs when its reversal cost changes, which is precisely why revival-cost was chosen as the axis over "how destructive it feels."
+
+This is also consistent with the *reason* for the operator's org-scope-only narrowing of `deactivate`: repo-scoped GitHub state was excluded because it persists harmlessly and deleting it only makes revival costlier. A runner does **not** persist harmlessly — it holds a warm pod and consumes cluster resources — so that exclusion's rationale does not extend to it.
+
+**MANDATORY ORDER: unset `MACF_TRUSTED_ACTORS` FIRST, then `runnerctl destroy`.** (Raised by `macf-devops-agent[bot]` on #939; the amendment would have shipped without it.) `pick-runner` never consults runner existence, so the two orders fail in opposite directions:
+
+| order | window | consequence |
+|---|---|---|
+| **unset → destroy** | variable clear, runner still exists | jobs route hosted — **costs metered minutes, keeps working** |
+| destroy → unset | runner gone, variable still points at it | **every routed job queues to timeout** — and if the second step fails, the window never closes |
+
+The wrong order does not merely open a transient gap: **on partial failure it is permanent**, leaving a fleet that is deactivated *and silently broken* rather than deactivated *and dormant*. This is Amendment H's asymmetry applied to teardown, and it must be stated as a requirement rather than left to the implementer — both orders look equally reasonable to anyone not holding `pick-runner`'s behaviour in mind.
+
+**It also makes `deactivate` symmetric with `apply` for the same reason:** `apply` writes the variable only *after* confirming a usable runner; `deactivate` clears it *before* removing one. One principle, two directions.
+
+### I4 — H.1 is unchanged, and one ordering constraint on wiring
+
+**H.1 survives intact.** `checkRunnerUsableByRepo` asserts against GitHub and is indifferent to who created the runner, so the token-is-policy / detection-is-timing split is untouched by the contract.
+
+**`macf#934` must land BEFORE `apply` calls `provision --labels`.** The gate resolves presence and visibility but never compares labels; today that gap is masked by the convention that every runner carries `macf-vm`. A caller-supplied `--labels` is precisely the mechanism that unmasks it — wiring the call first would take a latent gap and hand it a trigger.
+
+**References:** #939 (this amendment) · H2 (the clause replaced) · H.1 (confirmed unchanged) · Amendment G (the ladder gaining the rung) · #934 (the ordering dependency) · `macf-devops-toolkit` DR-009 §10.3 (the mechanical justification: *"it can destroy one, which the VM path cannot do at all"*).
