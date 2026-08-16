@@ -910,8 +910,22 @@ describe('createVmExecSeams — exec env passthrough, real subprocess (macf#763)
       dir,
       { PATH: process.env.PATH ?? '' },
     );
-    // Detached — poll briefly for the write rather than assuming synchronous completion.
-    for (let i = 0; i < 40 && !existsSync(outFile); i++) {
+    // Detached — poll for the CONTENT, not merely the file's existence (macf#946).
+    //
+    // The child's `> "$outFile"` redirection CREATES (and truncates) the file
+    // before `printf` writes a byte, so `existsSync` goes true while the file
+    // is still empty. Polling on existence therefore races: under CI load the
+    // loop exits in that window and `readFileSync` returns `''` — the observed
+    // `expected '' to be 'absent'` failure, whose empty string is the tell that
+    // nothing was captured rather than the wrong thing being captured.
+    //
+    // Existence is a proxy; a non-empty read is the invariant this test needs.
+    let captured = '';
+    for (let i = 0; i < 40; i++) {
+      if (existsSync(outFile)) {
+        captured = readFileSync(outFile, 'utf-8');
+        if (captured.length > 0) break;
+      }
       await new Promise((r) => setTimeout(r, 50));
     }
     expect(existsSync(outFile)).toBe(true);
