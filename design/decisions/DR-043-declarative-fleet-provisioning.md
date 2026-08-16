@@ -456,3 +456,20 @@ So detection considers **repo-level runners plus org-level runners whose group v
 **Scope constraint (a GitHub fact, not a choice):** a **user account cannot hold account-level runners**, so every `groundnuty/*` fleet is **repo-scoped by necessity**; only an org-owned fleet can share one org runner across all its repos. Per-repo runner declaration is deferred — fleet-level first, per the operator.
 
 **References:** #922/#923 (the wrong variable + its silent cost) · #924 (the operator directive + the two-sided constraint) · §D1 (runner block replaced) · §D2/§D4 (why the Mac/VM split is physical) · Amendments C/D (the privilege separation preserved) · #914 (`fleet deploy`, the host-side command this extends).
+
+### H.1 — who confirms the registration: the token is POLICY, detection is TIMING (2026-08-13, #929/#931)
+
+Amendment H says the runner is *declared* and then registered. It does not say **who confirms the registration**, and the answer is not obvious: `macf bootstrap apply` accepts a `--runner-token` (or `MACF_BOOTSTRAP_RUNNER_TOKEN`), so it is tempting to treat the token's presence as evidence that a runner exists. It is not.
+
+**A registration token is unverifiable by `apply`.** No API validates it, reveals its scope, or proves a runner will follow, and it cannot be redeemed remotely (`config.sh` must run on the host that will serve jobs). Accepting it as evidence would assert an **unverifiable proxy in place of a verifiable invariant** — `silent-fallback-hazards.md` Instance 17's shape, aimed at the register-before-route gate.
+
+So the two jobs are split:
+
+- **The token decides POLICY.** It gates whether provisioning is attempted at all: a manifest that declares `routing.runner` with **no token supplied is a refusal**, naming the flag, the env var, and the command that mints a fresh token. Same posture as an unconfigured `age_recipients` (Amendment C) — a declared intent the tool cannot honour is refused, never silently skipped.
+- **Detection decides TIMING.** `MACF_TRUSTED_ACTORS` is written **only** when `checkRunnerUsableByRepo` confirms a runner usable by that repo, with a bounded poll (consent gate 2's `waitForAppInstallation` shape) so a runner coming up during the deploy window still lands in one command. Token supplied but no runner confirmed → **not written**, reported plainly, converges on re-run.
+
+**Why the conservative default is directionally correct, not merely cautious:** `MACF_TRUSTED_ACTORS` is the switch, not a hint. Verified against `macf-actions` `origin/main` — `pick-runner` checks exactly three things (not-a-fork, var non-empty, actor trusted) and **never consults runner existence**; nothing downstream re-evaluates it. Set it with no matching runner and every routed job emits self-hosted labels and queues to timeout: no fallback, no self-heal, the fleet silently stops coordinating. A hosted fallback merely costs metered minutes while routing keeps working.
+
+**The two outcomes are encoded distinctly**, so the difference reaches the exit code, the summary and `--json` together: no-token → `failed` → exit 1 (an error the operator must fix); poll-exhausted → `skipped` → exit 0 (a not-yet that a re-run resolves).
+
+**Known gap (not design):** the refusal currently fires at the routing step, after both consent gates. Nothing is lost — the fleet still provisions and a re-run completes it — but the error is knowable before the first click, and the registration token the operator then fetches expires in an hour. A pre-flight beside `runBootstrapApply`'s macf#913 XOR refusal closes it.
