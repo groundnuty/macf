@@ -520,4 +520,18 @@ The wrong order does not merely open a transient gap: **on partial failure it is
 
 **`macf#934` must land BEFORE `apply` calls `provision --labels`.** The gate resolves presence and visibility but never compares labels; today that gap is masked by the convention that every runner carries `macf-vm`. A caller-supplied `--labels` is precisely the mechanism that unmasks it — wiring the call first would take a latent gap and hand it a trigger.
 
+
+### I5 — "terminal" means `destroy` skips ARCHIVING, not everything below it (2026-08-16, #939)
+
+I3 gave the ladder its runner rung at `deactivate`. Amendment G, however, states `deactivate ⊂ archive ⊂ delete-apps`; **`destroy` is terminal** — so `archive` and `delete-apps` inherit the rung, and **`destroy` inherits nothing.** Traced through, that produces a specific and ironic outcome:
+
+- variable never unset, runner never destroyed, repos deleted → **no stall** (no repo, no jobs), but the **runner is orphaned** — a scale set for a repository that no longer exists;
+- so **the one verb whose entire purpose is to leave nothing behind is the only rung that cannot reclaim a runner**, which is precisely the teardown-incompleteness I3 exists to close.
+
+**And the obvious fix, applied alone, is worse than the leak.** Adding runner-destroy to `destroy` without the ordering opens the stall door there: a partial repo-deletion failure would strand a live repo with `MACF_TRUSTED_ACTORS` set and no runner — converting a resource leak into a silent coordination death, the wrong side of Amendment H's asymmetry. **The rung and its ordering must land in the same change.**
+
+**Correction:** *terminal* means `destroy` **skips the archiving step** — for G's stated reason, that archiving something about to be deleted is pointless — and **not** that it skips the rungs below it. `destroy` performs `deactivate`'s work in its mandatory order (unset `MACF_TRUSTED_ACTORS`, then `runnerctl destroy`), then deletes Apps and repositories.
+
+**Why this recurred:** the ladder's **composition semantics** were stated compactly — `⊂` for three rungs and one word, *terminal*, for the fourth — and the compact form was ambiguous about exactly the case that mattered. Same class as macf#917, where `⊂` mandated re-execution without stating the idempotency it requires. A ladder's *joins* need as much specification as its rungs; both defects lived in the composition rather than in any step.
+
 **References:** #939 (this amendment) · H2 (the clause replaced) · H.1 (confirmed unchanged) · Amendment G (the ladder gaining the rung) · #934 (the ordering dependency) · `macf-devops-toolkit` DR-009 §10.3 (the mechanical justification: *"it can destroy one, which the VM path cannot do at all"*).
