@@ -237,6 +237,22 @@ export interface AgentApplyDeps {
    * only knows WHEN to call it, not WHERE the artifact lives.
    */
   readonly writeRecoveryArtifact: (role: string, creds: AppCredentials) => Promise<void>;
+  /**
+   * Post-gate-2 install validation (groundnuty/macf#943) — called with the
+   * `ConfirmedInstall` gate 2 just observed, BEFORE this module reports
+   * `'created'`/`'resumed-install'`. Returns a rejection reason string to
+   * fail the identity apply, `undefined` to accept. `undefined`/omitted
+   * (every ordinary agent's deps) preserves the pre-#943 behavior exactly —
+   * gate 2 succeeding is always sufficient. The runner-ops is the only
+   * caller that supplies this (asserting `repositorySelection === 'selected'`
+   * — GitHub's App-manifest flow has no field to FORCE the install-time repo
+   * scope at creation, so this is the verify-then-refuse enforcement point;
+   * see `apply-runner-ops.ts`'s doc). A rejection here does NOT delete
+   * the App or the install — same "GitHub App-name uniqueness is the retry
+   * safety net" posture the rest of this module's gate-2 failures already
+   * rely on (module doc's "gate 1→2 window" section).
+   */
+  readonly validateInstall?: (install: ConfirmedInstall) => string | undefined;
 }
 
 /**
@@ -355,17 +371,39 @@ async function announceAndOpenGate(
 }
 
 /**
- * Drive ONE agent through confirm-before-create → gate 1 → gate 2. See the
+ * The manifest/homepage shape one identity apply needs — deliberately
+ * NARROWER than {@link FleetAgent} (groundnuty/macf#943). A `FleetAgent`
+ * carries `profile`/`repo`/`deploy_path`/`provenance` fields that only make
+ * sense for a fleet.yaml-declared coordination agent; the runner-ops
+ * App (`apply-runner-ops.ts`) is a fleet-level identity with none of
+ * those (no home repo, no deploy target) but goes through the EXACT SAME
+ * confirm-before-create → gate 1 → gate 2 sequence. {@link applyIdentity} is
+ * that sequence, parameterized on this request; {@link applyAgentIdentity}
+ * below is now a thin wrapper deriving one from a `FleetAgent` — its own
+ * behavior for the FleetAgent path is unchanged byte-for-byte.
+ */
+export interface IdentityRequest {
+  readonly role: string;
+  /** Homepage shown on the App page — `undefined` falls through to `buildAppManifest`'s own default. */
+  readonly homepageUrl?: string;
+  /** Overrides `buildAppManifest`'s DR-019-derived permission set. `undefined` (every agent) keeps the DR-019 set. */
+  readonly permissions?: Readonly<Record<string, string>>;
+  /** Overrides `buildAppManifest`'s default coordination events. `undefined` (every agent) keeps the default set. */
+  readonly events?: readonly string[];
+}
+
+/**
+ * Drive ONE identity through confirm-before-create → gate 1 → gate 2. See the
  * module doc for the full sequence + the gate-1→gate-2 window discussion.
  * NEVER throws — every failure path resolves to `status: 'failed'`.
  */
-export async function applyAgentIdentity(
-  agent: FleetAgent,
+export async function applyIdentity(
+  request: IdentityRequest,
   manifest: FleetManifest,
   prior: FleetLockAgent | undefined,
   deps: AgentApplyDeps,
 ): Promise<AgentApplyOutcome> {
-  const role = agent.role;
+  const role = request.role;
   const handle = deriveAppHandle(manifest.metadata.name, role);
   // Best-known slug for a PRE-EXISTING App is the derived handle — a prior
   // successful gate 1 submitted `buildAppManifest`'s `name` field, which IS
@@ -415,7 +453,14 @@ export async function applyAgentIdentity(
   try {
     const flow = await deps.startManifestFlow({
       buildManifest: (redirectUrl) =>
-        buildAppManifest({ fleetName: manifest.metadata.name, role, redirectUrl, homepageUrl: repoHomepageUrl(agent.repo) }),
+        buildAppManifest({
+          fleetName: manifest.metadata.name,
+          role,
+          redirectUrl,
+          homepageUrl: request.homepageUrl,
+          permissions: request.permissions,
+          events: request.events,
+        }),
       formAction: manifestFormAction(manifest.owner),
       timeoutMs: deps.gateTimeoutMs,
     });
@@ -475,6 +520,22 @@ export async function applyAgentIdentity(
 }
 
 /**
+ * Drive ONE agent through confirm-before-create → gate 1 → gate 2. Thin
+ * wrapper over {@link applyIdentity} (groundnuty/macf#943) — derives an
+ * {@link IdentityRequest} from `agent.role`/`agent.repo` and delegates; the
+ * FleetAgent-path behavior is unchanged from before this wrapper existed
+ * (same role, same `repoHomepageUrl`, no permissions/events override).
+ */
+export async function applyAgentIdentity(
+  agent: FleetAgent,
+  manifest: FleetManifest,
+  prior: FleetLockAgent | undefined,
+  deps: AgentApplyDeps,
+): Promise<AgentApplyOutcome> {
+  return applyIdentity({ role: agent.role, homepageUrl: repoHomepageUrl(agent.repo) }, manifest, prior, deps);
+}
+
+/**
  * Wraps `deps.writeRecoveryArtifact` with the DR-043 §D5 "durable before
  * gate 2" failure framing (see the module doc + {@link applyAgentIdentity}'s
  * call site). Returns `undefined` on success, or the failure reason string
@@ -527,6 +588,15 @@ async function runGate2(
         );
       },
     });
+    // groundnuty/macf#943 — post-gate-2 install validation (see
+    // `AgentApplyDeps.validateInstall`'s doc). Checked BEFORE reporting
+    // success: a rejection here means gate 2 technically completed but the
+    // install doesn't satisfy this identity's own contract (e.g. the
+    // runner-ops's repository_selection !== 'selected').
+    const rejection = deps.validateInstall?.(install);
+    if (rejection !== undefined) {
+      return { role, status: 'failed', reason: `consent gate 2 (install) rejected: ${rejection}` };
+    }
     deps.log(`Role "${role}": install confirmed (install_id ${install.installId}).`);
     return { role, status: 'resumed-install', appId, installId: install.installId };
   } catch (err) {

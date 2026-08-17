@@ -54,6 +54,25 @@ export interface BuildAppManifestOptions {
   readonly redirectUrl: string;
   /** Homepage shown on the App page. Defaults to the agent's home repo URL when given. */
   readonly homepageUrl?: string;
+  /**
+   * Override {@link MACF_REQUIRED_PERMISSIONS} (groundnuty/macf#943) — the
+   * ONLY caller that supplies this today is the runner-ops App
+   * (`apply-runner-ops.ts`), whose permission set is deliberately
+   * DR-019-DISJOINT (no coordination-agent permission includes
+   * `administration`, and DR-019 was never widened to add it — see that
+   * module's doc for why). Every ordinary agent App omits this and keeps
+   * getting the derived-from-DR-019 set, byte-identical to before this field
+   * existed.
+   */
+  readonly permissions?: Readonly<Record<string, string>>;
+  /**
+   * Override {@link MACF_APP_DEFAULT_EVENTS} (groundnuty/macf#943). The
+   * runner-ops App subscribes to `[]` — it has none of the
+   * `issues`/`pull_requests`/`contents` read permissions the default events
+   * need, so declaring them would be a manifest inconsistency for an App that
+   * never coordinates. Every ordinary agent App omits this.
+   */
+  readonly events?: readonly string[];
 }
 
 /**
@@ -69,8 +88,12 @@ export interface BuildAppManifestOptions {
  */
 export function buildAppManifest(opts: BuildAppManifestOptions): GitHubAppManifest {
   const permissions: Record<string, string> = {};
-  for (const p of MACF_REQUIRED_PERMISSIONS) {
-    permissions[p.name] = p.level;
+  if (opts.permissions !== undefined) {
+    Object.assign(permissions, opts.permissions);
+  } else {
+    for (const p of MACF_REQUIRED_PERMISSIONS) {
+      permissions[p.name] = p.level;
+    }
   }
   return {
     name: deriveAppHandle(opts.fleetName, opts.role),
@@ -79,7 +102,7 @@ export function buildAppManifest(opts: BuildAppManifestOptions): GitHubAppManife
     redirect_url: opts.redirectUrl,
     public: false,
     default_permissions: permissions,
-    default_events: [...MACF_APP_DEFAULT_EVENTS],
+    default_events: opts.events !== undefined ? [...opts.events] : [...MACF_APP_DEFAULT_EVENTS],
   };
 }
 

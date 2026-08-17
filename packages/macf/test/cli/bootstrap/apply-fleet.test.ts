@@ -630,20 +630,37 @@ describe('applyFleet', () => {
     const result = await applyFleet(manifest, manifestPath, priorLock, deps);
 
     expect(result.vault.status).toBe('written');
-    // TWO encrypt calls now: the pre-gate-2 recovery artifact (DR-043 §D5
-    // durable-before-gate-2) fires first, THEN the batched final vault —
+    // THREE encrypt calls now (groundnuty/macf#943 added the third): the
+    // pre-gate-2 recovery artifact for 'code-agent' (DR-043 §D5
+    // durable-before-gate-2) fires first (inside the per-agent loop), THEN
+    // the runner-ops's OWN recovery artifact (it also takes the
+    // no-prior-lock-entry CREATE path via this same shared `agentDeps`
+    // fixture — see `apply-fleet.ts`'s "runner-ops" step, which runs
+    // right after the per-agent loop), THEN the batched final vault —
     // asserted by ORDER, not just presence, so this doesn't just infer the
-    // sequencing from the loop structure.
-    expect(encryptCalls).toHaveLength(2);
-    expect(encryptCalls.map((c) => c.outPath.includes('recovery'))).toEqual([true, false]);
-    const recoveryCall = encryptCalls.find((c) => c.outPath.includes('recovery'));
+    // sequencing from the loop structure. The runner-ops credential's OWN identity ends
+    // up 'failed' (this fixture's `waitForAppInstallation` doesn't return
+    // `repositorySelection: 'selected'` — `validateRunnerOpsInstall`
+    // rejects it), so it contributes NO lock/vault entry — only its
+    // recovery artifact, exactly like a `created`-then-gate-2-failed agent
+    // would (see `apply-agent.ts`'s "gate 1→2 window" doc).
+    expect(encryptCalls).toHaveLength(3);
+    expect(encryptCalls.map((c) => c.outPath.includes('recovery'))).toEqual([true, true, false]);
+    const recoveryCalls = encryptCalls.filter((c) => c.outPath.includes('recovery'));
     const finalVaultCall = encryptCalls.find((c) => !c.outPath.includes('recovery'));
-    expect(recoveryCall?.outPath).toMatch(/secrets[/\\]recovery[/\\]code-agent\.age$/);
-    expect(recoveryCall?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_ID');
+    const codeAgentRecoveryCall = recoveryCalls.find((c) => c.outPath.includes('code-agent'));
+    const runnerOpsRecoveryCall = recoveryCalls.find((c) => c.outPath.includes('runner-ops'));
+    expect(codeAgentRecoveryCall?.outPath).toMatch(/secrets[/\\]recovery[/\\]code-agent\.age$/);
+    expect(codeAgentRecoveryCall?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_ID');
+    expect(runnerOpsRecoveryCall?.outPath).toMatch(/secrets[/\\]recovery[/\\]runner-ops\.age$/);
     expect(finalVaultCall?.plaintext).toContain('CODE_AGENT'); // the freshly-created agent's segment
     expect(finalVaultCall?.plaintext).not.toContain('SCIENCE_AGENT_CLIENT_SECRET'); // reused agent contributes NO fresh secret
+    expect(finalVaultCall?.plaintext).not.toContain('MACF_RUNNER_OPS_'); // failed gate-2 -> never folded into the final vault
 
     const lock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
+    // The runner-ops's FAILED identity never gets a lock entry (only
+    // `created`/`reused`/`resumed-install` do) — `lock.agents` stays exactly
+    // the two coordination agents, unchanged by groundnuty/macf#943.
     expect(lock.agents.map((a) => a.role).sort()).toEqual(['code-agent', 'science-agent']);
   });
 
@@ -1721,8 +1738,25 @@ trust:
       const mintCalls: { caCertPem: string; caKeyPem: string }[] = [];
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT]);
+      // groundnuty/macf#943 — this test's own focus is agent routability, not
+      // the runner-ops; the SAME shared `agentDepsFor` fixture also
+      // drives the runner-ops credential's gate 2 (it takes the identical no-prior-lock
+      // CREATE path). `repositorySelection: 'selected'` lets the runner-ops credential
+      // ALSO resolve cleanly instead of failing `validateRunnerOpsInstall`
+      // — an unrelated failure there must not spuriously flip THIS test's
+      // "green exit ⇒ routable" assertion below.
+      const codeAgentDeps: AgentApplyDeps = {
+        ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+        waitForAppInstallation: async (opts) => ({
+          appId: opts.appId,
+          installId: 'install-1',
+          appSlug: opts.expected.appSlug ?? 'demo-fleet-code-agent',
+          accountLogin: 'groundnuty',
+          repositorySelection: 'selected',
+        }),
+      };
       const deps: FleetApplyDeps = {
-        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        ...baseDeps(codeAgentDeps, manifestPath),
         routingClientDeps: {
           mint: async (caCertPem, caKeyPem) => {
             mintCalls.push({ caCertPem, caKeyPem });
@@ -1789,6 +1823,368 @@ trust:
 
       expect(result.agents[0]?.repoInit?.status).toBe('failed');
       expect(applyExitCode(result)).toBe(1); // NEVER green when the fleet cannot route
+    });
+  });
+
+  // --- The runner-ops App (groundnuty/macf#943) ---
+
+  describe('the runner-ops App (groundnuty/macf#943)', () => {
+    it('creates it with EXACTLY the three permissions (asserts the manifest actually SENT, not just that a call happened)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const capturedManifests: { name: string; permissions: Record<string, string>; events: readonly string[] }[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: (log) => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          log,
+          // `buildManifest` is called with the REAL redirect URL at exchange
+          // time — capture what it actually produces (the EXACT document
+          // this run would submit to GitHub), not a hand-rolled copy.
+          startManifestFlow: async (opts) => {
+            const built = opts.buildManifest('http://127.0.0.1:9/callback');
+            capturedManifests.push({ name: built.name, permissions: built.default_permissions, events: built.default_events });
+            return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
+          },
+          waitForAppInstallation: async (opts) => ({
+            appId: opts.appId,
+            installId: 'install-x',
+            appSlug: opts.expected.appSlug ?? '',
+            accountLogin: 'groundnuty',
+            repositorySelection: 'selected',
+          }),
+        }),
+      };
+
+      await applyFleet(manifest, manifestPath, null, deps);
+
+      const rrManifest = capturedManifests.find((m) => m.name === 'demo-fleet-runner-ops');
+      expect(rrManifest).toBeDefined();
+      // The exact three permissions — no more, no fewer.
+      expect(rrManifest?.permissions).toEqual({ administration: 'write', actions: 'read', metadata: 'read' });
+      expect(Object.keys(rrManifest?.permissions ?? {})).toHaveLength(3);
+      expect(rrManifest?.events).toEqual([]);
+      // The agent's OWN manifest, sent through the SAME path, still gets the
+      // DR-019 set — proves the override is per-identity, not global.
+      const agentManifest = capturedManifests.find((m) => m.name === 'demo-fleet-code-agent');
+      expect(agentManifest?.permissions['administration']).toBeUndefined();
+    });
+
+    it('repository_selection scoped to fleet repos — an "all"-scoped install is REFUSED, never silently accepted', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: (log) => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          log,
+          waitForAppInstallation: async (opts) => ({
+            appId: opts.appId,
+            installId: 'install-x',
+            appSlug: opts.expected.appSlug ?? '',
+            accountLogin: 'groundnuty',
+            repositorySelection: 'all', // the hazard the task brief names
+          }),
+        }),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.runnerOps.status).toBe('failed');
+      if (result.runnerOps.status === 'failed') {
+        expect(result.runnerOps.reason).toMatch(/repository_selection must be "selected"/);
+        expect(result.runnerOps.reason).toMatch(/"all"/);
+      }
+      // The failure is scoped to the runner-ops credential — the CODE-AGENT still
+      // succeeds (this fixture's `waitForAppInstallation` returns
+      // `repositorySelection: 'all'` for EVERY caller, but the agent path
+      // never consults that field at all).
+      expect(result.agents[0]?.identity.status).toBe('created');
+    });
+
+    it('existing App (prior fleet.lock entry) → reused, NOT recreated — the create-gate (startManifestFlow) is NEVER invoked', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-rr' }],
+      };
+      let startManifestFlowCalledForRunnerOps = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: (log) => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          log,
+          startManifestFlow: async (opts) => {
+            const built = opts.buildManifest('http://x/callback');
+            if (built.name === 'demo-fleet-runner-ops') startManifestFlowCalledForRunnerOps = true;
+            return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
+          },
+        }),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      // No `resolveKeyPath` wired in this fixture (production default, per
+      // `apply-agent.ts::confirmBeforeCreateGuard`'s doc — no vault-decrypt
+      // seam in this increment) — a role WITH a prior lock entry degrades to
+      // `skip-unverified`, NOT a live re-confirm. The load-bearing assertion
+      // either way: gate 1 is NEVER opened a second time for an App that
+      // already has a recorded identity.
+      expect(result.runnerOps.status).toBe('skipped-unverified');
+      expect(startManifestFlowCalledForRunnerOps).toBe(false);
+      if (result.runnerOps.status === 'skipped-unverified') {
+        expect(result.runnerOps.appId).toBe('app-runner-ops');
+      }
+    });
+
+    it('the private key NEVER appears in captured log lines, formatApplyResult text, or fleetApplyResultToJson output', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const logs: string[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: (log) => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          log: (line) => {
+            logs.push(line);
+            log(line);
+          },
+          waitForAppInstallation: async (opts) => ({
+            appId: opts.appId,
+            installId: 'install-x',
+            appSlug: opts.expected.appSlug ?? '',
+            accountLogin: 'groundnuty',
+            repositorySelection: 'selected',
+          }),
+        }),
+        log: (l) => logs.push(l),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.runnerOps.status).toBe('created');
+      // `agentDepsFor('code-agent', 'created', ...)`'s shared `exchangeManifestCode`
+      // is role-agnostic (returns `creds('code-agent')` for ANY caller,
+      // including the runner-ops step) — so the credential the
+      // runner-ops credential receives in THIS fixture carries the code-agent sentinel.
+      // What matters for this test is that whichever sentinel it carries
+      // never leaks, regardless of which one it is.
+      const runnerOpsPemSentinel = 'SENTINEL-PEM-code-agent';
+      // The credential DOES flow through `result.runnerOps.credentials`
+      // in-process (needed for the vault fold) — the property under test is
+      // that it NEVER reaches a rendered/logged surface.
+      if (result.runnerOps.status === 'created') {
+        expect(result.runnerOps.credentials.pem).toBe(runnerOpsPemSentinel);
+      }
+      const joinedLogs = logs.join('\n');
+      expect(joinedLogs).not.toContain(runnerOpsPemSentinel);
+      expect(joinedLogs).not.toContain('SENTINEL-SECRET-code-agent');
+      expect(joinedLogs).not.toContain('SENTINEL-HOOK-code-agent');
+      const humanText = formatApplyResult(result, []);
+      expect(humanText).not.toContain(runnerOpsPemSentinel);
+      const jsonText = JSON.stringify(fleetApplyResultToJson(result, []));
+      expect(jsonText).not.toContain(runnerOpsPemSentinel);
+      expect(jsonText).not.toContain('SENTINEL-SECRET-code-agent');
+      expect(jsonText).not.toContain('SENTINEL-HOOK-code-agent');
+    });
+
+    it('durable-before-gate-2 ordering preserved: its OWN recovery artifact is written BEFORE gate 2, deleted only after the batched vault write succeeds', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const events: string[] = [];
+      // `agentDepsFor`'s shared `exchangeManifestCode` returns FIXED creds
+      // regardless of caller — override it to return DIFFERENT creds per
+      // role, keyed off what gate 1's OWN `buildManifest` actually named
+      // (the one place the caller's role is genuinely observable), so gate
+      // 2's `appId` differs between the agent and the runner-ops credential and this
+      // test can tell their events apart.
+      let lastGate1Name = '';
+      const agentDeps: AgentApplyDeps = {
+        ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+        startManifestFlow: async (opts) => {
+          lastGate1Name = opts.buildManifest('http://x/callback').name;
+          return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
+        },
+        exchangeManifestCode: async () => creds(lastGate1Name === 'demo-fleet-runner-ops' ? 'runner-ops' : 'code-agent'),
+        waitForAppInstallation: async (opts) => {
+          events.push(`gate2:${opts.appId}`);
+          return { appId: opts.appId, installId: 'install-x', appSlug: opts.expected.appSlug ?? '', accountLogin: 'groundnuty', repositorySelection: 'selected' };
+        },
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDeps, manifestPath),
+        buildAgentDeps: (log) => ({ ...agentDeps, log }),
+        vaultDeps: {
+          exists: () => false,
+          encrypt: async (plaintext, _recipients, outPath) => {
+            events.push(outPath.includes('recovery') ? `recovery-write:${outPath}` : 'final-vault-write');
+            writeFileSync(outPath, `FAKE-AGE-CIPHERTEXT\n${plaintext.length.toString()}`);
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+      expect(result.runnerOps.status).toBe('created');
+
+      const rrRecoveryIdx = events.findIndex((e) => e.startsWith('recovery-write:') && e.includes('runner-ops'));
+      const rrGate2Idx = events.findIndex((e) => e === 'gate2:app-runner-ops');
+      const finalVaultIdx = events.findIndex((e) => e === 'final-vault-write');
+      expect(rrRecoveryIdx).toBeGreaterThanOrEqual(0);
+      expect(rrGate2Idx).toBeGreaterThanOrEqual(0);
+      expect(finalVaultIdx).toBeGreaterThanOrEqual(0);
+      // DR-043 §D5: the recovery artifact is durable BEFORE gate 2 opens —
+      // never the other way around.
+      expect(rrRecoveryIdx).toBeLessThan(rrGate2Idx);
+      // Its OWN artifact is deleted only AFTER the batched final vault
+      // write — the recovery artifact PATH is what's asserted (this is not
+      // testing deletion order among peers, just "insurance outlives the
+      // gate it was insuring against").
+      expect(rrRecoveryIdx).toBeLessThan(finalVaultIdx);
+      const rrRecoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'runner-ops.age');
+      expect(existsSync(rrRecoveryPath)).toBe(false); // removed post-successful-compose
+    });
+
+    it('a name exceeding 34 chars refuses BEFORE consent gate 1 — the gate seam is NEVER called', async () => {
+      const manifestPath = manifestPathIn();
+      // Fleet name chosen so `<fleet>-runner-ops` exceeds 34 chars —
+      // `checkAppNameLengths` is the pure function under test elsewhere;
+      // THIS test proves `applyFleet` itself refuses at its own first
+      // statement, before control-repo provisioning or ANY gate.
+      const longFleetManifest: FleetManifest = {
+        ...manifestWith([CODE_AGENT]),
+        metadata: { name: 'this-is-a-very-long-fleet-name-indeed' },
+      };
+      let anyGateSeamCalled = false;
+      const deps: FleetApplyDeps = {
+        buildAgentDeps: () => {
+          throw new Error('must not be called — name-length pre-flight must abort before any identity work');
+        },
+        repoInitDeps: {
+          cloneRepo: async () => {
+            throw new Error('must not be called');
+          },
+          commitAndPush: async () => 'pushed',
+        },
+        vaultDeps: { exists: () => false, encrypt: async () => {} },
+        controlRepoDeps: {
+          checkMeta: async () => {
+            anyGateSeamCalled = true;
+            throw new Error('must not be called — the pre-flight is checked BEFORE step 0 (the control repo)');
+          },
+          readManifestFile: async () => undefined,
+          createRepo: async () => {
+            throw new Error('must not be called');
+          },
+          unarchiveRepo: async () => {
+            throw new Error('must not be called');
+          },
+          cloneRepo: async () => {
+            throw new Error('must not be called');
+          },
+          commitAndPush: async () => {
+            throw new Error('must not be called');
+          },
+        },
+        agentRepoDeps: {
+          checkExists: async () => {
+            throw new Error('must not be called');
+          },
+          createRepo: async () => {
+            throw new Error('must not be called');
+          },
+        },
+        trustDeps: {
+          checkRegistryPresence: async () => {
+            throw new Error('must not be called');
+          },
+          readRegistryVariable: async () => {
+            throw new Error('must not be called');
+          },
+          createRegistryVariable: async () => {
+            throw new Error('must not be called');
+          },
+          checkRepoPresence: async () => {
+            throw new Error('must not be called');
+          },
+          createRepoVariable: async () => {
+            throw new Error('must not be called');
+          },
+          mintCa: async () => {
+            throw new Error('must not be called');
+          },
+          checkRunnerUsableByRepo: async () => {
+            throw new Error('must not be called');
+          },
+        },
+        routingClientDeps: {
+          mint: async () => {
+            throw new Error('must not be called');
+          },
+          checkRepoSecretPresence: async () => {
+            throw new Error('must not be called');
+          },
+          setRepoSecret: async () => {
+            throw new Error('must not be called');
+          },
+        },
+        now: () => new Date('2026-08-11T00:00:00.000Z'),
+        log: () => {},
+      };
+
+      const result = await applyFleet(longFleetManifest, manifestPath, null, deps);
+
+      expect(anyGateSeamCalled).toBe(false);
+      expect(result.controlRepo.status).toBe('failed');
+      // The DETAILED "which name(s), by how much" message lives on
+      // `controlRepo.reason` (the field this abort's `reason` param feeds
+      // directly) — every other field (`runnerOps`, `ca.resolve`,
+      // `routingClient.mint`) points back at it rather than repeating the
+      // detail, same convention the pre-existing control-repo-abort branch
+      // already establishes for its own secondary fields.
+      expect(result.controlRepo.reason).toMatch(/exceed the 34-char/);
+      expect(result.controlRepo.reason).toContain('this-is-a-very-long-fleet-name-indeed-runner-ops');
+      expect(result.runnerOps.status).toBe('failed');
+      if (result.runnerOps.status === 'failed') {
+        expect(result.runnerOps.reason).toMatch(/see controlRepo above/);
+      }
+      expect(applyExitCode(result)).toBe(1);
+    });
+
+    it('unconfirmable identity → honest "unknown" at plan time, never a false "absent" (Amendment A4)', async () => {
+      // Structural proof (not just the plan.test.ts unit test): applyFleet's
+      // own confirm-before-create guard, with NO resolveKeyPath wired (the
+      // production default — no vault-decrypt seam in this increment),
+      // NEVER attempts to distinguish "confirmed absent" from "unconfirmed"
+      // for a role with no prior lock entry — it just authorizes create,
+      // the honest-unknown-over-false-absent posture Amendment A4 requires.
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: (log) => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          log,
+          confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
+          waitForAppInstallation: async (opts) => ({
+            appId: opts.appId,
+            installId: 'install-x',
+            appSlug: opts.expected.appSlug ?? '',
+            accountLogin: 'groundnuty',
+            repositorySelection: 'selected',
+          }),
+        }),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+      // `confirmAppInstallation` reporting 'unconfirmable' is NEVER read as
+      // "the App doesn't exist" — with no prior lock entry, the guard takes
+      // the CREATE path regardless (it never even calls confirmAppInstallation
+      // for a role with no prior — see confirmBeforeCreateGuard's doc), and
+      // create SUCCEEDS here (gate 2 confirms via waitForAppInstallation,
+      // a SEPARATE seam from the guard's own confirm).
+      expect(result.runnerOps.status).toBe('created');
     });
   });
 });
