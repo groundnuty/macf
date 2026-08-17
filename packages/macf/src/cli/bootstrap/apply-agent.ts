@@ -114,8 +114,13 @@ import { join } from 'node:path';
 import type { FleetAgent, FleetLockAgent, FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 import { buildAppManifest, repoHomepageUrl } from './app-manifest.js';
-import { manifestFormAction, startManifestFlow as realStartManifestFlow } from './manifest-flow-server.js';
-import type { ManifestFlowHandles, StartManifestFlowOptions } from './manifest-flow-server.js';
+import {
+  GATE_TOTAL,
+  manifestFormAction,
+  startInstallInterstitial as realStartInstallInterstitial,
+  startManifestFlow as realStartManifestFlow,
+} from './manifest-flow-server.js';
+import type { InstallInterstitialHandles, InstallInterstitialOptions, ManifestFlowHandles, StartManifestFlowOptions } from './manifest-flow-server.js';
 import { exchangeManifestCode as realExchangeManifestCode } from './manifest-exchange.js';
 import type { AppCredentials } from './manifest-exchange.js';
 import {
@@ -212,6 +217,15 @@ export async function confirmBeforeCreateGuard(
 
 export interface AgentApplyDeps {
   readonly startManifestFlow: (opts: StartManifestFlowOptions) => Promise<ManifestFlowHandles>;
+  /**
+   * Consent gate 2's own locally-served interstitial (groundnuty/macf#952) —
+   * serves the "Only select repositories" + exact-repo-list instruction on
+   * OUR page BEFORE the operator ever reaches GitHub's install page. Called
+   * for BOTH the create path and the resume-install path (every gate-2 run
+   * gets an interstitial, regardless of how gate 2 was reached) — see
+   * {@link runGate2WithInterstitial}.
+   */
+  readonly startInstallInterstitial: (opts: InstallInterstitialOptions) => Promise<InstallInterstitialHandles>;
   readonly exchangeManifestCode: (code: string) => Promise<AppCredentials>;
   readonly waitForAppInstallation: (opts: WaitForAppInstallationOptions) => Promise<ConfirmedInstall>;
   readonly confirmAppInstallation: CreateGuardDeps['confirmAppInstallation'];
@@ -269,6 +283,7 @@ export function realAgentApplyDeps(
 ): Omit<AgentApplyDeps, 'writeRecoveryArtifact'> {
   return {
     startManifestFlow: realStartManifestFlow,
+    startInstallInterstitial: realStartInstallInterstitial,
     exchangeManifestCode: realExchangeManifestCode,
     waitForAppInstallation: realWaitForAppInstallation,
     confirmAppInstallation: realConfirmAppInstallation,
@@ -344,6 +359,16 @@ export function cleanupScratchPem(pemPath: string): void {
  * `applyAgentIdentity`'s `guardExpected` comment) — never overclaiming
  * accuracy the caller doesn't have, same discipline
  * `waitForInstallTimeoutMessage` already applies to its own diagnostics.
+ *
+ * `opts.instructionLines` (groundnuty/macf#952) — printed to the terminal
+ * ONE PER LINE, BEFORE `deps.openUrl` is ever called. This is the ordering
+ * the whole issue is about: the operator's first live install picked
+ * GitHub's "All repositories" over "Only select repositories" because the
+ * requirement only appeared in the FAILURE message, after the click. Logging
+ * the instruction ahead of the navigation — headless (`--yes`) runs included,
+ * since `deps.log` is unconditional here — means a run with no page to read
+ * still gets the same instruction, in the same terminal transcript, before
+ * (never after) the point where following it would matter.
  */
 async function announceAndOpenGate(
   deps: Pick<AgentApplyDeps, 'log' | 'openUrl'>,
@@ -351,9 +376,12 @@ async function announceAndOpenGate(
   gateLabel: string,
   url: string,
   waitLabel: string,
-  opts: { readonly fatal: boolean; readonly caveat?: string },
+  opts: { readonly fatal: boolean; readonly caveat?: string; readonly instructionLines?: readonly string[] },
 ): Promise<void> {
   const caveatSuffix = opts.caveat !== undefined ? ` ${opts.caveat}` : '';
+  for (const line of opts.instructionLines ?? []) {
+    deps.log(`Role "${role}": ${line}`);
+  }
   deps.log(
     `Role "${role}": ${gateLabel} — opening this URL in your browser now (if it didn't open, open it yourself): ` +
       `${url}${caveatSuffix}`,
@@ -393,6 +421,48 @@ export interface IdentityRequest {
 }
 
 /**
+ * The EXACT repos consent gate 2's interstitial names for this identity
+ * (groundnuty/macf#952) — derived from the manifest, never a hand-maintained
+ * parallel list. A `role` that matches a declared `manifest.agents[].role`
+ * (every ordinary coordination agent) is scoped to just its OWN home repo —
+ * `FleetAgentSchema` already enforces one repo per role (`fleet-manifest.ts`'s
+ * "every agent needs its own home repo" uniqueness check), so that repo is
+ * the entire, unambiguous answer. A `role` with NO match (today, only the
+ * runner-ops — `RUNNER_OPS_ROLE` is deliberately never declared in
+ * `fleet.yaml`'s `agents[]`, per `apply-runner-ops.ts`'s doc) needs to mint
+ * runner-registration tokens for ANY of the fleet's repos, so every declared
+ * agent's repo is listed.
+ */
+export function installReposForIdentity(role: string, manifest: FleetManifest): readonly string[] {
+  const match = manifest.agents.find((a) => a.role === role);
+  return match !== undefined ? [match.repo] : manifest.agents.map((a) => a.repo);
+}
+
+/**
+ * The one-sentence "why" the gate-2 interstitial shows for THIS identity's
+ * permission set (groundnuty/macf#952). `administration: write` (today, only
+ * the runner-ops — see `apply-runner-ops.ts::RUNNER_OPS_PERMISSIONS`) gets
+ * the specific blast-radius framing the operator's incident report asked
+ * for verbatim, including that `apply` enforces it
+ * (`validateRunnerOpsInstall`'s post-gate-2 refusal, unchanged by this
+ * function). Every other identity (DR-019's set — no `administration` at
+ * all) gets a generic but still concrete reason: broader access is unused
+ * capability, not a convenience.
+ */
+export function installWhyText(permissions: Readonly<Record<string, string>> | undefined): string {
+  if (permissions?.['administration'] === 'write') {
+    return (
+      'Why: this App holds administration:write; granting it every repository in the account is blast radius ' +
+      'the fleet does not need, and apply will refuse an "all" install.'
+    );
+  }
+  return (
+    'Why: this App only needs access to the repo(s) listed above — granting every repository in the account is ' +
+    'broader access than this identity uses.'
+  );
+}
+
+/**
  * Drive ONE identity through confirm-before-create → gate 1 → gate 2. See the
  * module doc for the full sequence + the gate-1→gate-2 window discussion.
  * NEVER throws — every failure path resolves to `status: 'failed'`.
@@ -411,6 +481,11 @@ export async function applyIdentity(
   // same caveat `app-manifest.ts`'s `PlannedAppCreation.installUrl` doc
   // flags for the dry-run preview).
   const guardExpected: ExpectedIdentity = { appSlug: handle, accountLogin: manifest.owner.account };
+  // groundnuty/macf#952 — computed ONCE, valid on EITHER gate-2 path (create
+  // or resume-install): both derive from `request`/`manifest`, neither from
+  // anything gate 1 produces.
+  const repos = installReposForIdentity(role, manifest);
+  const whyText = installWhyText(request.permissions);
 
   let decision: CreateGuardDecision;
   try {
@@ -438,17 +513,15 @@ export async function applyIdentity(
     // the CREATE path below, which writes its own scratch PEM and owns its
     // cleanup).
     deps.log(`Role "${role}": App exists (app_id ${decision.appId}) with zero installs — resuming at consent gate 2.`);
-    await announceAndOpenGate(deps, role, 'consent gate 2 (App install page)', appInstallationUrl(handle), 'Install', {
-      fatal: false,
+    return runGate2WithInterstitial(role, decision.appId, decision.keyPath, guardExpected, handle, appInstallationUrl(handle), repos, whyText, deps, {
       caveat:
         '(URL predicted from the fleet/role naming convention — no GitHub-confirmed slug is available on this ' +
         'path; if it 404s, find the App via Settings → Developer settings → GitHub Apps instead.)',
     });
-    return runGate2(role, decision.appId, decision.keyPath, guardExpected, deps);
   }
 
   // decision.action === 'create' — consent gate 1.
-  deps.log(`Role "${role}": no prior App — starting consent gate 1 (App-manifest creation).`);
+  deps.log(`Role "${role}": no prior App — starting consent gate 1 of ${String(GATE_TOTAL)} (App-manifest creation).`);
   let creds: AppCredentials;
   try {
     const flow = await deps.startManifestFlow({
@@ -463,10 +536,15 @@ export async function applyIdentity(
         }),
       formAction: manifestFormAction(manifest.owner),
       timeoutMs: deps.gateTimeoutMs,
+      role,
     });
     try {
-      await announceAndOpenGate(deps, role, 'consent gate 1 (App-manifest form)', flow.startUrl, 'Create GitHub App', {
+      await announceAndOpenGate(deps, role, `consent gate 1 of ${String(GATE_TOTAL)} (App-manifest form)`, flow.startUrl, 'Create GitHub App', {
         fatal: true,
+        instructionLines: [
+          `creating GitHub App "${handle}" — the page that opened shows the manifest submitted AS-IS (nothing ` +
+            'to edit); GitHub will then show its own confirmation page — click "Create GitHub App" there.',
+        ],
       });
       const code = await flow.waitForCode();
       creds = await deps.exchangeManifestCode(code);
@@ -494,12 +572,9 @@ export async function applyIdentity(
       'starting consent gate 2 (install).',
   );
   const gate2Expected: ExpectedIdentity = { appSlug: creds.slug, accountLogin: manifest.owner.account };
-  await announceAndOpenGate(deps, role, 'consent gate 2 (App install page)', appInstallationUrl(creds.slug), 'Install', {
-    fatal: false,
-  });
   const pemPath = writeScratchPem(role, creds.pem);
   try {
-    const outcome = await runGate2(role, creds.appId, pemPath, gate2Expected, deps);
+    const outcome = await runGate2WithInterstitial(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, {});
     if (outcome.status === 'failed') {
       // Gate 1 succeeded but gate 2 didn't — see the module doc's "gate
       // 1→2 window" section. The App EXISTS on GitHub; give the operator a
@@ -601,6 +676,105 @@ async function runGate2(
     return { role, status: 'resumed-install', appId, installId: install.installId };
   } catch (err) {
     return { role, status: 'failed', reason: `consent gate 2 (install) failed: ${errMessage(err)}` };
+  }
+}
+
+/**
+ * Serve consent gate 2's own interstitial (groundnuty/macf#952), announce +
+ * open ITS URL (never GitHub's install URL directly — see this module's
+ * `manifest-flow-server.ts` doc), run the gate-2 poll, then close the
+ * interstitial. Shared by BOTH gate-2 call sites in {@link applyIdentity}
+ * (create path + resume-install path) so the instruction/repo-list/why-text
+ * content and the "our page first" ordering are identical on either path —
+ * one implementation, not two that could drift.
+ *
+ * `installUrl` is still printed in the terminal instruction lines (never
+ * only embedded in the served page) — a headless/`--yes` run has no page to
+ * read (groundnuty/macf#952 requirement 3).
+ *
+ * **Never lets a local-listener failure become an unhandled throw.**
+ * `applyIdentity` documents (module doc, top of file) that it NEVER throws —
+ * every failure resolves to `status: 'failed'`, which `apply-fleet.ts`
+ * relies on. `deps.startInstallInterstitial` binding an ephemeral port CAN
+ * fail (`EADDRINUSE`, fd exhaustion, sandboxed environments without loopback)
+ * — by the time this runs, a real GitHub App may already exist (CREATE path)
+ * or exist for certain (resume-install path), so treating a bind failure as
+ * fatal would manufacture exactly the orphaned-App class this module's "gate
+ * 1→2 window" doc section exists to avoid. Instead: log the degradation and
+ * fall back to opening GitHub's REAL install URL directly — the terminal
+ * instruction lines (repo list, "Only select repositories", why-text) still
+ * printed either way, so the operator loses the interstitial page, not the
+ * instruction. Same `fatal: false` posture gate 2 already has for a browser-
+ * launch failure.
+ */
+interface Gate2Page {
+  /** What to `openUrl` — the interstitial's own URL on success, GitHub's real install URL on a bind failure. */
+  readonly url: string;
+  readonly close: () => Promise<void>;
+}
+
+/**
+ * Starts the interstitial; on a bind failure, degrades to "open GitHub's
+ * install URL directly" rather than propagating (see
+ * {@link runGate2WithInterstitial}'s doc for why a local-listener failure
+ * must never abort an identity that may already exist on GitHub).
+ */
+async function startInterstitialOrFallback(deps: AgentApplyDeps, role: string, opts: InstallInterstitialOptions): Promise<Gate2Page> {
+  try {
+    const handles = await deps.startInstallInterstitial(opts);
+    return { url: handles.startUrl, close: handles.close };
+  } catch (err) {
+    deps.log(
+      `Role "${role}": could not start the local install-instruction page (${errMessage(err)}) — falling back to ` +
+        "GitHub's install page directly. The instruction below still applies.",
+    );
+    return { url: opts.installUrl, close: () => Promise.resolve() };
+  }
+}
+
+async function runGate2WithInterstitial(
+  role: string,
+  appId: string,
+  keyPath: string,
+  expected: ExpectedIdentity,
+  appSlug: string,
+  installUrl: string,
+  repos: readonly string[],
+  whyText: string,
+  deps: AgentApplyDeps,
+  opts: { readonly caveat?: string },
+): Promise<Gate2Outcome> {
+  const page = await startInterstitialOrFallback(deps, role, {
+    role,
+    appName: appSlug,
+    installUrl,
+    repos,
+    whyText,
+    // The install page is always the SECOND (and last) of the two gates —
+    // literal `2`, not derived from `GATE_TOTAL` (which happens to equal 2
+    // today but means "how many gates total," not "which gate this is").
+    gateNumber: 2,
+    gateTotal: GATE_TOTAL,
+  });
+  try {
+    await announceAndOpenGate(deps, role, `consent gate ${String(GATE_TOTAL)} of ${String(GATE_TOTAL)} (App install page)`, page.url, 'Install', {
+      fatal: false,
+      caveat: opts.caveat,
+      instructionLines: [
+        'on the page that opens, choose "Only select repositories" — NOT "All repositories".',
+        `select exactly: ${repos.length > 0 ? repos.join(', ') : '(no repos declared in the fleet manifest — verify before installing)'}`,
+        whyText,
+        `GitHub's install page: ${installUrl}`,
+      ],
+    });
+    return await runGate2(role, appId, keyPath, expected, deps);
+  } finally {
+    try {
+      await page.close();
+    } catch (err) {
+      // Never let a close-failure mask the real gate-2 result computed above.
+      deps.log(`Role "${role}": closing the local install-instruction page failed (${errMessage(err)}) — harmless, the page is one-shot.`);
+    }
   }
 }
 
