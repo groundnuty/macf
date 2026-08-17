@@ -220,12 +220,16 @@ export async function realReadControlManifestFile(repo: string): Promise<string 
  * is a first-ever teardown attempt against a `fleet.yaml`-only checkout —
  * private-repo-without-content-scope, network) — NEVER throws.
  *
- * Used by `teardown-destructive.ts`'s App-identity enrichment
+ * Used by `teardown-destructive.ts`'s App-identity UNION + enrichment
  * (`app-identity-removal.ts::enrichAppIdentityTargetsWithLock`) — the
  * DERIVED App slug (`deriveAppHandle`) is a PREDICTION; `fleet.lock`'s
  * recorded `app_id` per role is the AUTHORITY for which App actually
- * exists. Best-effort ONLY: a missing/stale/unreadable lock degrades to
- * the derived-slug-only report, never blocks or refuses a teardown run.
+ * exists, AND `fleet.lock` is also the ONLY source for roles `apply`
+ * created OUTSIDE `manifest.agents[]` (the runner-ops App — groundnuty/
+ * macf#953). Best-effort ONLY: a missing/stale/unreadable lock degrades to
+ * the manifest-derived, slug-only report, never blocks or refuses a
+ * teardown run — but see `classifyLockReadability` for how that degrade is
+ * surfaced HONESTLY to the operator rather than silently.
  */
 export async function realReadControlFleetLockFile(repo: string): Promise<string | undefined> {
   try {

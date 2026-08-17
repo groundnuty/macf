@@ -61,6 +61,22 @@ trust:
   federated_cas: []
 `;
 
+// groundnuty/macf#953 — a fleet.lock that records the runner-ops App, which
+// `MANIFEST.agents[]` never declares (by design — `apply-runner-ops.ts`).
+const LOCK_YAML_WITH_RUNNER_OPS = `schema_version: 1
+fleet: macf-experiment
+agents:
+  - role: code-agent
+    app_id: "555111"
+    install_id: "999222"
+  - role: science-agent
+    app_id: "555222"
+    install_id: "999333"
+  - role: runner-ops
+    app_id: "777444"
+    install_id: "888555"
+`;
+
 function ownDeps(overrides: Partial<TeardownControlRepoDeps & Pick<TeardownVariableDeps, 'checkRegistryPresence'>> = {}) {
   return {
     checkMeta: async () => ({ presence: 'present' as const, archived: false }),
@@ -180,6 +196,151 @@ agents:
     const deleteAppsPlan = await buildDeleteAppsPlan(MANIFEST, deps);
     const destroyPlan = await buildDestroyPlan(MANIFEST, deps);
     expect(destroyPlan.appTargets).toEqual(deleteAppsPlan.appTargets);
+  });
+});
+
+// --- groundnuty/macf#953 — appTargets UNION with fleet.lock (the runner-ops gap) ---
+
+describe('buildDeleteAppsPlan / buildDestroyPlan — appTargets UNION with fleet.lock (groundnuty/macf#953)', () => {
+  it('a lock role NOT in manifest.agents[] (runner-ops) is listed by BOTH delete-apps and destroy, carrying its app_id and settings URL', async () => {
+    const deps = { ...ownDeps(), readFleetLock: async () => LOCK_YAML_WITH_RUNNER_OPS };
+    const deleteAppsPlan = await buildDeleteAppsPlan(MANIFEST, deps);
+    const destroyPlan = await buildDestroyPlan(MANIFEST, deps);
+    for (const plan of [deleteAppsPlan, destroyPlan]) {
+      expect(plan.appTargets).toHaveLength(3);
+      const runnerOps = plan.appTargets.find((t) => t.role === 'runner-ops');
+      expect(runnerOps).toBeDefined();
+      expect(runnerOps?.appId).toBe('777444');
+      expect(runnerOps?.settingsUrl).toBe('https://github.com/organizations/groundnuty/settings/apps/macf-experiment-runner-ops/advanced');
+      expect(runnerOps?.extraFromLock).toBe(true);
+    }
+  });
+
+  it('DECISIVE: a lock role absent from manifest.agents[] is still targeted — a FICTIONAL role name (not "runner-ops") proves the fix is GENERAL', async () => {
+    const lockWithFutureRole = `schema_version: 1
+fleet: macf-experiment
+agents:
+  - role: code-agent
+    app_id: "555111"
+    install_id: "999222"
+  - role: science-agent
+    app_id: "555222"
+    install_id: "999333"
+  - role: some-future-non-agent-role
+    app_id: "999000"
+    install_id: "111222"
+`;
+    const plan = await buildDeleteAppsPlan(MANIFEST, { ...ownDeps(), readFleetLock: async () => lockWithFutureRole });
+    expect(plan.appTargets.map((t) => t.role)).toEqual(['some-future-non-agent-role', 'code-agent', 'science-agent']);
+    expect(plan.appTargets[0]?.extraFromLock).toBe(true);
+    expect(plan.appTargets[0]?.appId).toBe('999000');
+  });
+
+  it('manifest-only roles (no lock at all) are still targeted exactly as today', async () => {
+    const plan = await buildDeleteAppsPlan(MANIFEST, ownDeps());
+    expect(plan.appTargets.map((t) => t.role)).toEqual(['code-agent', 'science-agent']);
+    expect(plan.appTargets.every((t) => t.extraFromLock === undefined)).toBe(true);
+  });
+
+  it('the union flows through executeDeleteApps: the runner-ops outcome is REPORTED (app_id, settings URL) and LOGGED with the distinct NOT-DECLARED marker', async () => {
+    const plan = await buildDeleteAppsPlan(MANIFEST, { ...ownDeps(), readFleetLock: async () => LOCK_YAML_WITH_RUNNER_OPS });
+    const logs: string[] = [];
+    const result = await executeDeleteApps(MANIFEST, plan, (l) => logs.push(l), {
+      deleteRegistryVariable: async () => 'deleted',
+      checkMeta: async () => ({ presence: 'present', archived: false }),
+      archiveRepo: async () => {},
+    });
+    expect(result.appOutcomes).toHaveLength(3);
+    const runnerOpsOutcome = result.appOutcomes.find((o) => o.role === 'runner-ops');
+    expect(runnerOpsOutcome?.appId).toBe('777444');
+    expect(runnerOpsOutcome?.extraFromLock).toBe(true);
+    expect(runnerOpsOutcome?.settingsUrl).toBe('https://github.com/organizations/groundnuty/settings/apps/macf-experiment-runner-ops/advanced');
+    const runnerOpsLine = logs.find((l) => l.includes('runner-ops'));
+    expect(runnerOpsLine).toMatch(/NOT DECLARED IN fleet\.yaml/);
+    expect(runnerOpsLine).toMatch(/777444/);
+  });
+
+  it('the union flows through executeDestroy the same way', async () => {
+    const plan = await buildDestroyPlan(MANIFEST, { ...ownDeps(), readFleetLock: async () => LOCK_YAML_WITH_RUNNER_OPS });
+    const logs: string[] = [];
+    const result = await executeDestroy(MANIFEST, plan, (l) => logs.push(l), {
+      deleteRegistryVariable: async () => 'deleted',
+      deleteRepo: async () => 'deleted',
+    });
+    expect(result.appOutcomes).toHaveLength(3);
+    expect(result.appOutcomes.find((o) => o.role === 'runner-ops')?.appId).toBe('777444');
+    expect(logs.some((l) => l.includes('runner-ops') && l.includes('NOT DECLARED IN fleet.yaml'))).toBe(true);
+  });
+
+  it('ADVERSARIAL: a sibling fleet\'s SAME-PREFIXED lock role is never conflated — enrichment is scoped to the fleet.lock this fleet\'s OWN control repo yields, never a broader read', async () => {
+    // This test documents that the union derives ONLY from whatever
+    // `readFleetLock` resolves — the plan never re-reads `fleet.lock` from
+    // any other source, so there is no cross-fleet read path for a sibling
+    // fleet's lock to leak through in the first place. Exact-key discipline
+    // (task hard constraint 1) is preserved because `enrichAppIdentityTargetsWithLock`
+    // only ever consults the ONE lock document it was given.
+    let lockReadCount = 0;
+    const plan = await buildDeleteAppsPlan(MANIFEST, {
+      ...ownDeps(),
+      readFleetLock: async (repo) => {
+        lockReadCount += 1;
+        expect(repo).toBe('groundnuty/macf-experiment-control'); // THIS fleet's control repo, exact
+        return LOCK_YAML_WITH_RUNNER_OPS;
+      },
+    });
+    expect(lockReadCount).toBe(1);
+    expect(plan.appTargets.map((t) => t.role).sort()).toEqual(['code-agent', 'runner-ops', 'science-agent']);
+  });
+});
+
+// --- groundnuty/macf#953 — honest-unknown floor: lockReadStatus ---
+
+describe('IrreversibleTeardownPlan.lockReadStatus (groundnuty/macf#953 honest-unknown floor)', () => {
+  it('readFleetLock omitted entirely -> "not-attempted"', async () => {
+    const plan = await buildDeleteAppsPlan(MANIFEST, ownDeps());
+    expect(plan.lockReadStatus).toBe('not-attempted');
+  });
+
+  it('readFleetLock resolves undefined (no lock committed yet, or the read failed) -> "unreadable", and appTargets is NEVER a silent empty list — the manifest-derived targets are still present', async () => {
+    const plan = await buildDestroyPlan(MANIFEST, { ...ownDeps(), readFleetLock: async () => undefined });
+    expect(plan.lockReadStatus).toBe('unreadable');
+    expect(plan.appTargets).toHaveLength(2); // still the 2 manifest agents — never empty
+    expect(plan.appTargets.map((t) => t.role)).toEqual(['code-agent', 'science-agent']);
+  });
+
+  it('readFleetLock resolves malformed text -> "unreadable"', async () => {
+    const plan = await buildDeleteAppsPlan(MANIFEST, { ...ownDeps(), readFleetLock: async () => 'not: [valid, fleet, lock' });
+    expect(plan.lockReadStatus).toBe('unreadable');
+  });
+
+  it('readFleetLock resolves a valid, parseable lock -> "read"', async () => {
+    const plan = await buildDeleteAppsPlan(MANIFEST, { ...ownDeps(), readFleetLock: async () => LOCK_YAML_WITH_RUNNER_OPS });
+    expect(plan.lockReadStatus).toBe('read');
+  });
+
+  it('readFleetLock THROWS (a dep that violates the "best-effort, never rejects" convention) -> the plan build does NOT throw, degrades to "unreadable", appTargets stays manifest-derived', async () => {
+    const plan = await buildDeleteAppsPlan(MANIFEST, {
+      ...ownDeps(),
+      readFleetLock: async () => {
+        throw new Error('boom — simulated network failure that was not caught internally');
+      },
+    });
+    expect(plan.lockReadStatus).toBe('unreadable');
+    expect(plan.appTargets.map((t) => t.role)).toEqual(['code-agent', 'science-agent']);
+  });
+
+  it('gate REFUSED -> "not-attempted" (readFleetLock never called, nothing to report on regardless)', async () => {
+    let called = false;
+    const plan = await buildDestroyPlan(MANIFEST, {
+      ...ownDeps({ checkMeta: async () => ({ presence: 'absent' }) }),
+      readFleetLock: async () => {
+        called = true;
+        return undefined;
+      },
+    });
+    expect(plan.gate.allowed).toBe(false);
+    expect(plan.lockReadStatus).toBe('not-attempted');
+    expect(called).toBe(false);
   });
 });
 

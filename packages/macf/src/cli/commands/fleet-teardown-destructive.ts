@@ -28,7 +28,7 @@ import { realDeleteRepo } from '../bootstrap/repo-destroy.js';
 import { assertAgeIdentityReadable, realShredAgeIdentity } from '../bootstrap/age-key-shred.js';
 import type { AppDeletionDeps, AppDeletionOutcome } from '../bootstrap/app-identity-removal.js';
 import { checkAppSlugPresence } from '../bootstrap/app-identity-removal.js';
-import type { DeleteAppsPlan, DestroyPlan, DestroyRepoDeps, RepoDestroyOutcome } from '../bootstrap/teardown-destructive.js';
+import type { DeleteAppsPlan, DestroyPlan, DestroyRepoDeps, FleetLockReadStatus, RepoDestroyOutcome } from '../bootstrap/teardown-destructive.js';
 import {
   buildDeleteAppsPlan,
   buildDestroyPlan,
@@ -105,6 +105,23 @@ function formatRegistryTargetsPreview(targets: readonly DeactivateTarget[]): str
 
 type RepoRungAction = 'archive' | 'delete';
 
+/**
+ * Honest-unknown caveat for the App-identity section (groundnuty/macf#953)
+ * — surfaced whenever `fleet.lock` was not successfully read, so an
+ * operator never mistakes "the lock couldn't be checked" for "the lock was
+ * checked and found nothing extra beyond `fleet.yaml`." `undefined` (no
+ * line) only for `'read'` — the one status where the App-identity section
+ * above it can actually claim completeness.
+ */
+function formatLockReadCaveat(status: FleetLockReadStatus): string | undefined {
+  if (status === 'read') return undefined;
+  const why = status === 'not-attempted' ? 'was not read' : 'could not be read or parsed';
+  return (
+    `  ⚠ fleet.lock ${why} — cannot confirm whether ADDITIONAL non-agent App identities (e.g. a runner-ops App ` +
+    "with administration:write) exist beyond what's listed above. This report may be INCOMPLETE."
+  );
+}
+
 /** Shared "here is everything this run would touch" render, with irreversible items called out SEPARATELY from recoverable ones — the shared rail applies to BOTH `delete-apps` and `destroy`; only which section the repo list lands in differs. `action` is an explicit discriminator (never string-sniffed from a display label) so the branch can't silently drift from the label text. */
 function formatFullInventory(plan: DeleteAppsPlan | DestroyPlan, action: RepoRungAction): string[] {
   const lines: string[] = [];
@@ -116,8 +133,14 @@ function formatFullInventory(plan: DeleteAppsPlan | DestroyPlan, action: RepoRun
   lines.push('  App identities (revival cost: 2 browser clicks/agent to recreate) — cannot be deleted via API, manual step reported below:');
   for (const a of plan.appTargets) {
     const idSuffix = a.appId === undefined ? ' (predicted slug — no fleet.lock App ID to confirm it)' : ` (app_id ${a.appId}, confirmed from fleet.lock)`;
-    lines.push(`    ${a.role.padEnd(20)} ${a.appSlug}${idSuffix}`);
+    // groundnuty/macf#953: a lock-only role (e.g. runner-ops) is marked
+    // distinctly — it's already ordered FIRST by `enrichAppIdentityTargetsWithLock`
+    // (see that function's doc), and gets a visible ⚠ here too.
+    const marker = a.extraFromLock === true ? '⚠ NOT IN fleet.yaml (found via fleet.lock only) ' : '';
+    lines.push(`    ${marker}${a.role.padEnd(20)} ${a.appSlug}${idSuffix}`);
   }
+  const lockCaveat = formatLockReadCaveat(plan.lockReadStatus);
+  if (lockCaveat !== undefined) lines.push(lockCaveat);
   lines.push('');
   if (action === 'archive') {
     lines.push('Repositories to be ARCHIVED (reversible via `apply`):');
@@ -157,7 +180,9 @@ function formatAppOutcomeLines(outcomes: readonly AppDeletionOutcome[]): string[
     // point a browser at — render its own status line instead of the
     // fixed "MANUAL ACTION REQUIRED — <url>" shape every prior outcome used.
     const detail = o.status === 'already-absent' ? 'ALREADY-ABSENT — nothing to delete' : `MANUAL ACTION REQUIRED — ${o.settingsUrl}`;
-    return `  ${o.role.padEnd(20)} ${o.appSlug.padEnd(30)}${idSuffix} ${detail}`;
+    // groundnuty/macf#953: mark a lock-only (not in fleet.yaml) role distinctly.
+    const marker = o.extraFromLock === true ? '⚠ NOT IN fleet.yaml ' : '';
+    return `  ${marker}${o.role.padEnd(20)} ${o.appSlug.padEnd(30)}${idSuffix} ${detail}`;
   });
 }
 
@@ -237,6 +262,8 @@ export interface DeleteAppsResult {
   readonly registryOutcomes: readonly VariableTeardownOutcome[];
   readonly repoOutcomes: readonly RepoArchiveOutcome[];
   readonly appOutcomes: readonly AppDeletionOutcome[];
+  /** Carried through from {@link DeleteAppsPlan.lockReadStatus} — groundnuty/macf#953's honest-unknown floor, surfaced to `--json` consumers too. */
+  readonly lockReadStatus: FleetLockReadStatus;
 }
 
 function deleteAppsResultToJson(result: DeleteAppsResult): unknown {
@@ -248,6 +275,7 @@ function deleteAppsResultToJson(result: DeleteAppsResult): unknown {
     registry_outcomes: result.registryOutcomes.map((o) => ({ ...o })),
     repo_outcomes: result.repoOutcomes.map((o) => ({ ...o })),
     app_outcomes: result.appOutcomes.map((o) => ({ ...o })),
+    lock_read_status: result.lockReadStatus,
   };
 }
 
@@ -272,6 +300,16 @@ function deleteAppsResultToJson(result: DeleteAppsResult): unknown {
  * (and this rail's own "never exit green") exist to prevent. The `report`
  * text changes (`'already-absent'` status, `ALREADY-ABSENT` rendering) —
  * the exit-code contract does not.
+ *
+ * **`lockReadStatus` deliberately does NOT affect the exit code** (groundnuty/
+ * macf#953). `result.appOutcomes.length > 0` already forces red for any
+ * fleet (manifest `agents[]` requires >= 1), so gating on `lockReadStatus`
+ * too would be unreachable dead code AND would silently change the one
+ * documented exit-0 case above (degenerate empty-fleet) for the common
+ * "no `readFleetLock` dep wired" path. The honest-unknown floor is carried
+ * by `lock_read_status` in the `--json` payload and the loud
+ * `formatLockReadCaveat` render line instead — visibility, not a new
+ * gating condition.
  */
 function deleteAppsExitCode(result: DeleteAppsResult): number {
   if (!result.gate.allowed) return 1;
@@ -295,7 +333,7 @@ export async function runFleetDeleteApps(opts: RunFleetDeleteAppsOptions, deps?:
 
   process.stderr.write(`${formatGateLine(plan.gate)}\n`);
   if (!plan.gate.allowed) {
-    const result: DeleteAppsResult = { fleet: plan.fleet, gate: plan.gate, registryOutcomes: [], repoOutcomes: [], appOutcomes: [] };
+    const result: DeleteAppsResult = { fleet: plan.fleet, gate: plan.gate, registryOutcomes: [], repoOutcomes: [], appOutcomes: [], lockReadStatus: plan.lockReadStatus };
     if (opts.json) console.log(JSON.stringify(deleteAppsResultToJson(result), null, 2));
     return deleteAppsExitCode(result);
   }
@@ -325,7 +363,7 @@ export async function runFleetDeleteApps(opts: RunFleetDeleteAppsOptions, deps?:
     process.stderr.write(`${line}\n`);
   };
   const { registryOutcomes, repoOutcomes, appOutcomes } = await executeDeleteApps(manifest, plan, log, resolved);
-  const result: DeleteAppsResult = { fleet: plan.fleet, gate: plan.gate, registryOutcomes, repoOutcomes, appOutcomes };
+  const result: DeleteAppsResult = { fleet: plan.fleet, gate: plan.gate, registryOutcomes, repoOutcomes, appOutcomes, lockReadStatus: plan.lockReadStatus };
 
   if (opts.json) {
     console.log(JSON.stringify(deleteAppsResultToJson(result), null, 2));
@@ -419,6 +457,8 @@ export interface DestroyResult {
   readonly shredRequested: boolean;
   readonly shredPerformed: boolean;
   readonly shredReason?: string;
+  /** Carried through from {@link DestroyPlan.lockReadStatus} — groundnuty/macf#953's honest-unknown floor, surfaced to `--json` consumers too. */
+  readonly lockReadStatus: FleetLockReadStatus;
 }
 
 function destroyResultToJson(result: DestroyResult): unknown {
@@ -434,10 +474,19 @@ function destroyResultToJson(result: DestroyResult): unknown {
     shred_requested: result.shredRequested,
     shred_performed: result.shredPerformed,
     shred_reason: result.shredReason ?? null,
+    lock_read_status: result.lockReadStatus,
   };
 }
 
-/** Never green while ANY item remains incomplete — the ownership gate, the acknowledgment ladder, any failed mutation, the App-identity report (ANY outcome present forces red, including `'already-absent'` — see `deleteAppsExitCode`'s doc for why groundnuty/macf#917 deliberately does NOT relax this), and a requested-but-failed/refused shred all force a non-zero exit. */
+/**
+ * Never green while ANY item remains incomplete — the ownership gate, the
+ * acknowledgment ladder, any failed mutation, the App-identity report (ANY
+ * outcome present forces red, including `'already-absent'` — see
+ * `deleteAppsExitCode`'s doc for why groundnuty/macf#917 deliberately does
+ * NOT relax this), and a requested-but-failed/refused shred all force a
+ * non-zero exit. `lockReadStatus` deliberately does NOT gate the exit code
+ * — see `deleteAppsExitCode`'s matching doc (groundnuty/macf#953) for why.
+ */
 function destroyExitCode(result: DestroyResult): number {
   if (!result.gate.allowed) return 1;
   if (result.acknowledgmentsMissing.length > 0) return 1;
@@ -451,7 +500,7 @@ function destroyExitCode(result: DestroyResult): number {
 /** Shared shape for every early-refusal return in {@link runFleetDestroy} — keeps the repeated result-construction below from drifting field-by-field. */
 function destroyRefusalResult(
   plan: DestroyPlan,
-  overrides: Partial<Omit<DestroyResult, 'fleet' | 'gate'>>,
+  overrides: Partial<Omit<DestroyResult, 'fleet' | 'gate' | 'lockReadStatus'>>,
 ): DestroyResult {
   return {
     fleet: plan.fleet,
@@ -462,6 +511,7 @@ function destroyRefusalResult(
     repoOutcomes: [],
     shredRequested: false,
     shredPerformed: false,
+    lockReadStatus: plan.lockReadStatus,
     ...overrides,
   };
 }
@@ -588,6 +638,7 @@ export async function runFleetDestroy(opts: RunFleetDestroyOptions, deps?: Fleet
     shredRequested,
     shredPerformed,
     shredReason,
+    lockReadStatus: plan.lockReadStatus,
   };
 
   if (opts.json) {

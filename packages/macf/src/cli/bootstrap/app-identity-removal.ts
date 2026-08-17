@@ -40,7 +40,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { FleetManifest } from './fleet-manifest.js';
+import type { FleetLock, FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle, parseFleetLock } from './fleet-manifest.js';
 import type { Presence } from './plan.js';
 import { getStderr } from './observer.js';
@@ -87,6 +87,24 @@ export interface AppIdentityTarget {
    * the real, GitHub-assigned slug.
    */
   readonly appId?: string;
+  /**
+   * `true` when this target was discovered ONLY via `fleet.lock` — its
+   * `role` does not appear anywhere in `manifest.agents[]` (groundnuty/
+   * macf#953). `fleet.lock` records what `apply` actually CREATED;
+   * `manifest.agents[]` records only what `fleet.yaml` DECLARED, and at
+   * least one identity — the runner-ops App (`RUNNER_OPS_ROLE`,
+   * `apply-runner-ops.ts`) — is deliberately created OUTSIDE the manifest.
+   * Undefined/`false` for every ordinary manifest-declared agent target;
+   * `true` marks a target `computeAppIdentityTargets` could never have
+   * produced on its own, surfaced by {@link enrichAppIdentityTargetsWithLock}'s
+   * union step. The render layer (`fleet-teardown-destructive.ts`) uses this
+   * to flag the target distinctly (a role `fleet.yaml` never declared is, by
+   * construction, invisible to an operator skimming the manifest) — per
+   * #953's "report it first, or mark it distinctly," these targets are ALSO
+   * ordered first in the array {@link enrichAppIdentityTargetsWithLock}
+   * returns.
+   */
+  readonly extraFromLock?: boolean;
 }
 
 /**
@@ -118,34 +136,111 @@ export function computeAppIdentityTargets(manifest: FleetManifest): readonly App
 }
 
 /**
- * Enrich derived App-identity targets with the RECORDED `app_id` from
- * `fleet.lock`, when available — see {@link AppIdentityTarget.appId}'s doc
- * for why this matters (the derived slug is a prediction; `fleet.lock`'s
- * `app_id` is the authority for WHICH App actually exists).
+ * UNION + enrich derived App-identity targets against `fleet.lock` — two
+ * jobs in one pass (groundnuty/macf#953):
  *
- * Best-effort, additive-only: `lockText` absent/unparseable/lacking an
- * entry for a given role degrades that target back to slug-only — NEVER
- * throws, NEVER blocks a teardown run. This mirrors every other
- * best-effort read in this package (`realReadControlManifestFile`,
- * `checkControlRepoMeta`) — a failure to read auxiliary state is a reason
- * to report less, never a reason to refuse.
+ *   1. **Enrich** (original behavior) — attach the AUTHORITATIVE `app_id`
+ *      from `fleet.lock` onto any target whose `role` the lock also
+ *      recorded. See {@link AppIdentityTarget.appId}'s doc for why this
+ *      matters (the derived slug is a prediction; `fleet.lock`'s `app_id`
+ *      is the authority for WHICH App actually exists).
+ *   2. **Union** (the #953 fix) — `fleet.lock` is the record of what `apply`
+ *      actually CREATED; `manifest.agents[]` (what `targets` was derived
+ *      from, one layer up in `computeAppIdentityTargets`) is only what
+ *      `fleet.yaml` DECLARED. A role `apply` created OUTSIDE the manifest
+ *      — the runner-ops App is the concrete case (`RUNNER_OPS_ROLE`,
+ *      `apply-runner-ops.ts`, deliberately never in `agents[]`) — would
+ *      otherwise NEVER appear in `targets` at all, and `delete-apps`/
+ *      `destroy` would silently omit it from the manual-deletion report:
+ *      exactly the gap #953 reported (the WIDEST-privilege identity in the
+ *      fleet, `administration:write`, went unreported on every teardown).
+ *      Fixed GENERALLY, not by special-casing that one role name — this
+ *      module never imports `RUNNER_OPS_ROLE`; ANY lock role absent from
+ *      `targets` is unioned in, so the next non-agent identity a future App
+ *      gains is covered by this same code path, not a fresh special case.
+ *
+ * Lock-only targets are marked {@link AppIdentityTarget.extraFromLock} and
+ * PREPENDED — ordered BEFORE the manifest-derived targets — per #953's
+ * "report it first, or mark it distinctly" (that field's own doc explains
+ * why). The render layer (`fleet-teardown-destructive.ts`) adds the second
+ * half — a visible `⚠` marker on the rendered line.
+ *
+ * Best-effort, additive-only, same posture as before this fix: `lockText`
+ * absent/unparseable degrades to `targets` UNCHANGED (no union, no
+ * enrichment) — NEVER throws, NEVER blocks a teardown run. This mirrors
+ * every other best-effort read in this package (`realReadControlManifestFile`,
+ * `checkControlRepoMeta`) — a failure to read auxiliary state is a reason to
+ * report less, never a reason to refuse. A degraded (unreadable) lock means
+ * this function can only report what the manifest already told it — it
+ * CANNOT tell the caller "there are no extra identities," only "I don't
+ * know." Surfacing THAT distinction honestly is {@link classifyLockReadability}'s
+ * job, one layer up in `teardown-destructive.ts` — this function stays pure
+ * over its inputs and never itself claims completeness.
  */
 export function enrichAppIdentityTargetsWithLock(
   targets: readonly AppIdentityTarget[],
   lockText: string | undefined,
+  manifest: FleetManifest,
 ): readonly AppIdentityTarget[] {
   if (lockText === undefined) return targets;
-  let appIdByRole: ReadonlyMap<string, string>;
+  let lock: FleetLock;
   try {
-    const lock = parseFleetLock(lockText);
-    appIdByRole = new Map(lock.agents.map((a) => [a.role, a.app_id]));
+    lock = parseFleetLock(lockText);
   } catch {
     return targets;
   }
-  return targets.map((t) => {
+
+  const appIdByRole = new Map(lock.agents.map((a) => [a.role, a.app_id]));
+  const enriched = targets.map((t) => {
     const appId = appIdByRole.get(t.role);
     return appId === undefined ? t : { ...t, appId };
   });
+
+  const knownRoles = new Set(targets.map((t) => t.role));
+  const extraTargets: AppIdentityTarget[] = lock.agents
+    .filter((a) => !knownRoles.has(a.role))
+    .map((a) => {
+      const appSlug = deriveAppHandle(manifest.metadata.name, a.role);
+      return {
+        role: a.role,
+        appSlug,
+        settingsUrl: appSettingsAdvancedUrl(manifest.owner, appSlug),
+        appId: a.app_id,
+        extraFromLock: true,
+      };
+    });
+
+  return [...extraTargets, ...enriched];
+}
+
+/**
+ * `'read'` — `lockText` was present AND parsed as a valid `fleet.lock`
+ * document. `'unreadable'` — `lockText` was `undefined` (nothing to read:
+ * missing file, private-repo, network failure — see
+ * `control-repo.ts::realReadControlFleetLockFile`'s doc) OR present but
+ * failed schema validation (corrupt/malformed). Both `'unreadable'` causes
+ * collapse to one status because from THIS function's caller's perspective
+ * they mean the identical thing: the lock's role list cannot be trusted, so
+ * {@link enrichAppIdentityTargetsWithLock}'s union step could not run.
+ *
+ * Exists so `teardown-destructive.ts` can attach an HONEST read-status to
+ * its plan (groundnuty/macf#953's honest-unknown floor: "if the lock cannot
+ * be read, say so — never infer 'no extra Apps exist' from an unreadable
+ * lock") without re-deriving `fleet.lock` parsing logic independently — a
+ * `'read'`-vs-`'unreadable'` classification of the EXACT SAME `lockText`
+ * {@link enrichAppIdentityTargetsWithLock} was given, so the two can never
+ * disagree about whether the lock was trustworthy.
+ */
+export type LockReadability = 'read' | 'unreadable';
+
+export function classifyLockReadability(lockText: string | undefined): LockReadability {
+  if (lockText === undefined) return 'unreadable';
+  try {
+    parseFleetLock(lockText);
+    return 'read';
+  } catch {
+    return 'unreadable';
+  }
 }
 
 export interface AppDeletionOutcome {
@@ -154,6 +249,8 @@ export interface AppDeletionOutcome {
   readonly settingsUrl: string;
   /** Carried through from {@link AppIdentityTarget.appId} — see that field's doc. */
   readonly appId?: string;
+  /** Carried through from {@link AppIdentityTarget.extraFromLock} — see that field's doc (groundnuty/macf#953). */
+  readonly extraFromLock?: boolean;
   /**
    * `'already-absent'` — groundnuty/macf#917 — ONLY when `deps.checkAppPresence`
    * was supplied AND returned `'absent'` (a confirmed 404 at the predicted
@@ -240,6 +337,13 @@ export async function checkAppSlugPresence(appSlug: string): Promise<Presence> {
  * (groundnuty/macf#917), the target short-circuits to `'already-absent'`
  * BEFORE the manual-deletion line is logged and BEFORE `deps.openUrl` is
  * ever attempted — there is nothing to open a browser tab for.
+ *
+ * A target with {@link AppIdentityTarget.extraFromLock} set gets an extra
+ * `⚠ NOT DECLARED IN fleet.yaml` marker PREPENDED to its log line
+ * (groundnuty/macf#953 "mark it distinctly" — on top of the union step's
+ * "report it first" ordering) — never folded into `reason`, which stays the
+ * exact constant/404-detail text every other target gets, so existing
+ * `reason`-matching callers are unaffected.
  */
 export async function reportAppIdentityRemoval(
   targets: readonly AppIdentityTarget[],
@@ -248,19 +352,23 @@ export async function reportAppIdentityRemoval(
 ): Promise<readonly AppDeletionOutcome[]> {
   const out: AppDeletionOutcome[] = [];
   for (const t of targets) {
+    const notInManifestMarker = t.extraFromLock
+      ? '⚠ NOT DECLARED IN fleet.yaml (recovered from fleet.lock only — verify this is not the widest-privilege ' +
+        'identity in the fleet, e.g. a runner-ops App with administration:write) — '
+      : '';
     const presence = deps.checkAppPresence ? await deps.checkAppPresence(t.appSlug) : 'unknown';
     if (presence === 'absent') {
       const reason =
         `App "${t.appSlug}" returned 404 at its predicted slug — already absent, nothing to delete. (Slug is a ` +
         'PREDICTION, not GitHub-confirmed; if a disambiguating suffix was appended at creation, verify via ' +
         'Settings → Developer settings → GitHub Apps before assuming the App is fully gone.)';
-      log(`Role "${t.role}": ${reason}`);
-      out.push({ role: t.role, appSlug: t.appSlug, settingsUrl: t.settingsUrl, appId: t.appId, status: 'already-absent', reason });
+      log(`Role "${t.role}": ${notInManifestMarker}${reason}`);
+      out.push({ role: t.role, appSlug: t.appSlug, settingsUrl: t.settingsUrl, appId: t.appId, extraFromLock: t.extraFromLock, status: 'already-absent', reason });
       continue;
     }
 
     const slugCaveat = t.appId === undefined ? '(predicted slug — no fleet.lock entry to confirm it)' : `(predicted slug — confirmed App ID ${t.appId} from fleet.lock; use the ID to positively identify the App if the slug shown in Settings differs)`;
-    log(`Role "${t.role}": App "${t.appSlug}" ${slugCaveat}. ${APP_DELETION_HAS_NO_REST_PATH_NOTE} Delete at: ${t.settingsUrl}`);
+    log(`Role "${t.role}": ${notInManifestMarker}App "${t.appSlug}" ${slugCaveat}. ${APP_DELETION_HAS_NO_REST_PATH_NOTE} Delete at: ${t.settingsUrl}`);
     if (deps.openUrl) {
       try {
         await deps.openUrl(t.settingsUrl);
@@ -273,6 +381,7 @@ export async function reportAppIdentityRemoval(
       appSlug: t.appSlug,
       settingsUrl: t.settingsUrl,
       appId: t.appId,
+      extraFromLock: t.extraFromLock,
       status: 'manual-action-required',
       reason: APP_DELETION_HAS_NO_REST_PATH_NOTE,
     });
