@@ -71,16 +71,232 @@ if [[ "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+close ]]; then
   IS_CLOSE_SUBCOMMAND=true
 fi
 
-# `--body-file` reads content from a file path; we don't lint file
-# contents (the file may not exist at hook-fire time, or may be
-# regenerated). Accept the trade-off and allow. The canonical rule
-# still applies; operator discipline catches it without the hook.
-if [[ "$COMMAND" =~ --body-file([[:space:]]|=) ]] && [[ ! "$COMMAND" =~ --body([[:space:]]|=)[[:space:]]*[\"\']*[@] ]]; then
+# --body-file handling (groundnuty/macf#944).
+#
+# The ORIGINAL exemption here unconditionally `exit 0`d for ANY
+# `--body-file` invocation — the form `pr-discipline.md` explicitly
+# recommends for review/comment bodies AND the write-then-post /
+# write-and-post patterns. That blanket exemption silently skipped BOTH
+# Check A and Check B for every `--body-file` call, including bodies with
+# zero mentions (Check A's exact failure mode) or describing-context leaks
+# (Check B's). Fixed per the #944 ruling: resolve the actual body content
+# where possible and lint IT; only fall back to a non-blocking warning
+# (Check A) / today's silent allow (Check B) when content genuinely can't
+# be resolved.
+#
+# Three branches, in order:
+#   1. `--body-file <path>` and the file is READABLE right now → lint the
+#      file's actual content (both checks). Covers the two-call
+#      write-then-post pattern (a prior tool call already wrote the file).
+#   2. Not readable, but $COMMAND contains a heredoc whose redirect TARGET
+#      is exactly the --body-file path, with a QUOTED delimiter → extract
+#      the heredoc BODY TEXT (not evaluated — see the Instance-12 note
+#      below) and lint THAT. Covers the single-call write-and-post pattern
+#      (`cat > f <<'EOF' … EOF; gh … --body-file f` in one Bash call),
+#      where PreToolUse fires before the file exists on disk.
+#   3. Neither resolvable → Check A WARNS on stderr (non-blocking); Check B
+#      keeps the pre-#944 silent allow (nothing lintable, same as before).
+#
+# --- Distinguishing branch 2 from silent-fallback Instance 12's
+# decided-against (silent-fallback-hazards.md) ---
+# Instance 12 records a *decided-against*: teaching a PreToolUse hook to
+# parse inline shell, because doing so would require EVALUATING shell (the
+# value there came from a command substitution `$(...)`, whose result
+# can't be known without running it). Branch 2 here is a different
+# operation: it only SLICES literal text between two known delimiters out
+# of the already-available command STRING. A `<<'EOF'` heredoc body is
+# unexpanded BY DEFINITION — the quoted delimiter is exactly what tells
+# the real shell "don't touch this text" — so no variable substitution,
+# command substitution, or globbing happens to it before it lands in the
+# target file. The text sitting between the heredoc-open line and its
+# closing delimiter line IN THE COMMAND STRING *is* the exact body that
+# will land in the file: reading it off the string is text extraction, not
+# shell evaluation. An UNQUOTED `<<EOF` does not carry this guarantee (its
+# body undergoes expansion), which is exactly why branch 2 refuses to
+# treat an unquoted delimiter as safe — it falls through to branch 3
+# instead of guessing.
+
+# --- Helpers -----------------------------------------------------------
+
+# Bounded path-variable resolution for --body-file paths (branch 1).
+# Expands a leading `~` to $HOME and any $VAR / ${VAR} references using
+# bash's OWN indirect parameter expansion (${!name}) against variables
+# already present in THIS hook process's environment — text substitution,
+# never `eval` or a subshell. A reference to a variable this process
+# doesn't have expands to empty string (same as unset-variable semantics),
+# which naturally fails the subsequent readability check rather than
+# guessing.
+macf_resolve_path_vars() {
+  local raw="$1"
+  local resolved="$raw"
+  # shellcheck disable=SC2088  # intentional: comparing a string's literal
+  # leading chars against "~"/"~/" here, not asking the shell to expand a
+  # tilde inside a quoted string. The manual $HOME substitution below IS
+  # the expansion.
+  if [[ "$resolved" == "~" || "$resolved" == "~/"* ]]; then
+    resolved="${HOME:-}${resolved:1}"
+  fi
+  local out="" rest="$resolved" guard=0
+  while [[ "$rest" =~ \$\{?([A-Za-z_][A-Za-z0-9_]*)\}? ]] && [[ "$guard" -lt 20 ]]; do
+    guard=$((guard + 1))
+    local varname="${BASH_REMATCH[1]}"
+    local whole="${BASH_REMATCH[0]}"
+    local prefix="${rest%%"$whole"*}"
+    out+="${prefix}${!varname:-}"
+    rest="${rest#"${prefix}${whole}"}"
+  done
+  out+="$rest"
+  printf '%s' "$out"
+}
+
+# Literal heredoc-body extraction for --body-file paths (branch 2). Slices
+# TEXT out of the command string — never evaluates shell (see the
+# Instance-12 distinguishing note above). Matching is done via plain
+# substring containment (bash treats a quoted portion of a `[[ ]]` glob
+# pattern as literal), so no path-to-regex escaping is needed anywhere.
+#
+# Contract: prints the extracted body and returns 0 on an UNAMBIGUOUS,
+# quoted-delimiter match; prints nothing and returns 1 on anything else —
+# no candidate line, more than one candidate line, or an unquoted
+# delimiter. Every failure mode here falls through to branch 3; this
+# function never guesses.
+macf_extract_heredoc_body() {
+  local target="$1" cmd="$2"
+  if [[ -z "$target" ]]; then
+    return 1
+  fi
+
+  local heredoc_open_sq_pattern="^-?[[:space:]]*'([A-Za-z_][A-Za-z0-9_]*)'"
+  local heredoc_open_dq_pattern='^-?[[:space:]]*"([A-Za-z_][A-Za-z0-9_]*)"'
+
+  local -a lines=()
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lines+=("$line")
+  done <<<"$cmd"
+
+  local match_idx=-1 match_count=0 delimiter="" strip_tabs=false
+  local i=0
+  while [[ "$i" -lt "${#lines[@]}" ]]; do
+    line="${lines[$i]}"
+    if [[ "$line" == *">"* ]] && [[ "$line" == *"$target"* ]] && [[ "$line" == *"<<"* ]]; then
+      local frag="${line#*<<}"
+      if [[ "$frag" =~ $heredoc_open_sq_pattern ]] || [[ "$frag" =~ $heredoc_open_dq_pattern ]]; then
+        match_count=$((match_count + 1))
+        delimiter="${BASH_REMATCH[1]}"
+        match_idx="$i"
+        if [[ "$frag" == "-"* ]]; then strip_tabs=true; else strip_tabs=false; fi
+      else
+        # Candidate line targets our path but has no safely-literal
+        # (quoted) delimiter — unsafe to treat as this heredoc's body.
+        # Still counts toward ambiguity so a second, quoted-looking match
+        # elsewhere doesn't win by default (fail closed, not a guess).
+        match_count=$((match_count + 1))
+        delimiter=""
+      fi
+    fi
+    i=$((i + 1))
+  done
+
+  if [[ "$match_count" -ne 1 ]] || [[ -z "$delimiter" ]] || [[ "$match_idx" -lt 0 ]]; then
+    return 1
+  fi
+
+  local body="" found_close=false
+  i=$((match_idx + 1))
+  while [[ "$i" -lt "${#lines[@]}" ]]; do
+    line="${lines[$i]}"
+    local cmp_line="$line"
+    if [[ "$strip_tabs" == "true" ]]; then
+      while [[ "$cmp_line" == $'\t'* ]]; do
+        cmp_line="${cmp_line#$'\t'}"
+      done
+    fi
+    if [[ "$cmp_line" == "$delimiter" ]]; then
+      found_close=true
+      break
+    fi
+    body+="${line}"$'\n'
+    i=$((i + 1))
+  done
+
+  if [[ "$found_close" == "false" ]]; then
+    return 1
+  fi
+
+  printf '%s' "$body" || true
+  return 0
+}
+
+# --- Three-branch dispatch ----------------------------------------------
+
+BODY_FILE_MODE=false
+BODY_FILE_RESOLVED=false
+LINT_TARGET="$COMMAND"
+
+BODY_FILE_ARG_PATTERN='--body-file(=|[[:space:]]+)([^[:space:]]+)'
+if [[ "$COMMAND" =~ $BODY_FILE_ARG_PATTERN ]]; then
+  BODY_FILE_MODE=true
+  BODY_FILE_RAW="${BASH_REMATCH[2]}"
+  # Strip one layer of matching wrapping quotes (only the common
+  # no-embedded-space quoted case; quoted paths WITH spaces aren't
+  # captured by [^[:space:]]+ above and fall through to branch 3 —
+  # fail-safe, never a wrong-answer risk).
+  if [[ "$BODY_FILE_RAW" == \"*\" ]] && [[ "$BODY_FILE_RAW" == *\" ]]; then
+    BODY_FILE_RAW="${BODY_FILE_RAW:1:-1}"
+  elif [[ "$BODY_FILE_RAW" == \'*\' ]] && [[ "$BODY_FILE_RAW" == *\' ]]; then
+    BODY_FILE_RAW="${BODY_FILE_RAW:1:-1}"
+  fi
+
+  # Branch 1: readable file right now.
+  RESOLVED_BODY_FILE_PATH="$(macf_resolve_path_vars "$BODY_FILE_RAW")"
+  if [[ -n "$RESOLVED_BODY_FILE_PATH" ]] \
+     && [[ -f "$RESOLVED_BODY_FILE_PATH" ]] \
+     && [[ -r "$RESOLVED_BODY_FILE_PATH" ]]; then
+    LINT_TARGET="$(cat -- "$RESOLVED_BODY_FILE_PATH" 2>/dev/null || true)"
+    BODY_FILE_RESOLVED=true
+  fi
+
+  # Branch 2: literal heredoc targeting the same path.
+  if [[ "$BODY_FILE_RESOLVED" == "false" ]]; then
+    if HEREDOC_BODY="$(macf_extract_heredoc_body "$BODY_FILE_RAW" "$COMMAND")"; then
+      LINT_TARGET="$HEREDOC_BODY"
+      BODY_FILE_RESOLVED=true
+    fi
+  fi
+fi
+
+# Branch 3: neither resolvable.
+if [[ "$BODY_FILE_MODE" == "true" ]] && [[ "$BODY_FILE_RESOLVED" == "false" ]]; then
+  # Check B: nothing lintable — same silent allow as pre-#944 (no leak
+  # check possible without content; operator discipline covers the gap).
+  # Check A: WARN (do not block) — unlike Check B, a missing mention is
+  # the exact silent-failure shape coordination.md §Communication 2 warns
+  # about, so make the gap visible even though we can't prove it either
+  # way. Bypassed for close subcommands — Check A never applies to them
+  # (see IS_CLOSE_SUBCOMMAND above).
+  if [[ "$IS_CLOSE_SUBCOMMAND" == "false" ]]; then
+    cat >&2 <<WARNERR
+WARNING (non-blocking) from MACF mention-routing-hygiene hook: this command
+uses --body-file "$BODY_FILE_RAW" and the hook could not resolve its
+content — the file isn't readable yet AND no literal (quoted-delimiter)
+heredoc in this command targets that same path. The hook cannot verify
+this comment carries a routing-active @<bot>[bot] mention
+(coordination.md §Communication 2) or is free of a describing-context leak
+(mention-routing-hygiene.md §5).
+
+Proceeding WITHOUT blocking (groundnuty/macf#944 branch 3) — double-check
+the file content manually before it posts.
+WARNERR
+  fi
   exit 0
 fi
 
-# Per-occurrence scan for raw @macf-<role>-agent[bot] patterns in the
-# command string. Heuristic per groundnuty/macf#272 design synthesis:
+# Per-occurrence scan for raw @macf-<role>-agent[bot] patterns in the lint
+# target (LINT_TARGET — the command string for a plain `--body`/`--comment`
+# invocation, or the resolved --body-file content per the dispatch above
+# for branches 1/2; branch 3 exits before reaching this scan at all — see
+# groundnuty/macf#944). Heuristic per groundnuty/macf#272 design synthesis:
 #   - Already wrapped in backticks (`@bot[bot]`) → allowed (describing form §5)
 #   - At line start (only whitespace, blockquote `>`, or list markers
 #     `* ` `- ` `1. ` before it on the same line) → allowed (addressing
@@ -184,7 +400,7 @@ AWK_OUTPUT="$(awk -v pat="$HANDLE_PATTERN" '
     }
   }
   END { print "ACTIVE_COUNT:" active_count }
-' <<<"$COMMAND")"
+' <<<"$LINT_TARGET")"
 
 # `grep` returns 1 when no matches; under `set -euo pipefail` that
 # propagates as the script's exit code without `|| true`. The Check A

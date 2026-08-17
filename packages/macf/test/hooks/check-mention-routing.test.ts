@@ -21,9 +21,11 @@
  *     list-marker → allowed (addressing form §3)
  *   - Else → BLOCK
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 
 const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'check-mention-routing.sh');
@@ -226,15 +228,175 @@ describe('check-mention-routing.sh (hook)', () => {
     });
   });
 
-  describe('--body-file path', () => {
-    it('allows `gh issue comment ... --body-file path` (file content not lintable)', () => {
-      // The hook intentionally skips file-based body — content not
-      // available at hook-fire time. Operator discipline + the canonical
-      // rule cover this.
-      const r = runHook({
-        command: 'gh issue comment 123 --body-file /tmp/comment.md',
+  describe('--body-file path (groundnuty/macf#944 three-branch resolution)', () => {
+    // Branch 1: file is readable at hook-fire time (two-call
+    // write-then-post pattern — a prior tool call already wrote it).
+    describe('branch 1 — readable file', () => {
+      let dir: string;
+
+      afterEach(() => {
+        if (dir) rmSync(dir, { recursive: true, force: true });
       });
-      expect(r.status).toBe(0);
+
+      it('BLOCKS on a readable file with zero mentions (the #944 regression)', () => {
+        dir = mkdtempSync(join(tmpdir(), 'macf944-'));
+        const file = join(dir, 'body.md');
+        writeFileSync(file, 'Just a status update, no mentions.\n');
+        const r = runHook({
+          command: `gh issue comment 123 --body-file ${file}`,
+        });
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('zero');
+        expect(r.stderr).toContain('routing-active');
+      });
+
+      it('allows a readable file with a routing-active addressing mention', () => {
+        dir = mkdtempSync(join(tmpdir(), 'macf944-'));
+        const file = join(dir, 'body.md');
+        writeFileSync(file, '@macf-science-agent[bot] PR ready for review.\n');
+        const r = runHook({
+          command: `gh issue comment 123 --body-file ${file}`,
+        });
+        expect(r.status).toBe(0);
+      });
+
+      it('BLOCKS a readable file carrying a describing-context leak (Check B)', () => {
+        dir = mkdtempSync(join(tmpdir(), 'macf944-'));
+        const file = join(dir, 'body.md');
+        writeFileSync(file, 'The @macf-tester-1-agent[bot] response was clean.\n');
+        const r = runHook({
+          command: `gh issue comment 123 --body-file ${file}`,
+        });
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('describing-context');
+      });
+
+      it('resolves --body-file=path (equals form) against a readable file', () => {
+        dir = mkdtempSync(join(tmpdir(), 'macf944-'));
+        const file = join(dir, 'body.md');
+        writeFileSync(file, 'no mention here\n');
+        const r = runHook({
+          command: `gh issue comment 123 --body-file=${file}`,
+        });
+        expect(r.status).toBe(2); // zero mentions -> Check A blocks
+      });
+    });
+
+    // Branch 2: single-call write-and-post — `cat > f <<'EOF' ... EOF`
+    // followed by `gh ... --body-file f` in ONE Bash command, so the file
+    // doesn't exist yet when PreToolUse fires. The hook must extract the
+    // heredoc body TEXT (never executes it) and lint that.
+    describe('branch 2 — literal heredoc targeting the --body-file path', () => {
+      it('BLOCKS a single-call heredoc body with zero mentions', () => {
+        const r = runHook({
+          command:
+            "cat > /tmp/macf944-single.md <<'EOF'\nJust a status update, no mentions.\nEOF\ngh issue comment 123 --body-file /tmp/macf944-single.md",
+        });
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('zero');
+        expect(r.stderr).toContain('routing-active');
+      });
+
+      it('allows a single-call heredoc body with a routing-active mention', () => {
+        const r = runHook({
+          command:
+            "cat > /tmp/macf944-single2.md <<'EOF'\n@macf-science-agent[bot] PR ready for review.\nEOF\ngh issue comment 123 --body-file /tmp/macf944-single2.md",
+        });
+        expect(r.status).toBe(0);
+      });
+
+      it('BLOCKS a single-call heredoc body carrying a describing-context leak', () => {
+        const r = runHook({
+          command:
+            "cat > /tmp/macf944-single3.md <<'EOF'\nThe @macf-tester-1-agent[bot] response was clean.\nEOF\ngh issue comment 123 --body-file /tmp/macf944-single3.md",
+        });
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('describing-context');
+      });
+
+      it('the false-pass trap: two heredocs, only the NON-target one carries a mention → must NOT pass', () => {
+        // The real --body-file target (macf944-real.md) has zero
+        // mentions. An unrelated heredoc earlier in the same command
+        // (macf944-other.md, never referenced by --body-file) DOES carry
+        // one. An extractor that isn't precise about WHICH heredoc it
+        // slices would report "mention present" from the wrong body —
+        // this is exactly the trap groundnuty/macf#944 calls out.
+        const r = runHook({
+          command:
+            "cat > /tmp/macf944-other.md <<'EOF'\n@macf-science-agent[bot] unrelated mention in a different file\nEOF\ncat > /tmp/macf944-real.md <<'EOF'\nJust a status update, no mentions here.\nEOF\ngh issue comment 123 --body-file /tmp/macf944-real.md",
+        });
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('zero');
+        expect(r.stderr).toContain('routing-active');
+      });
+
+      it('the false-pass trap holds in reverse: target heredoc has the mention, decoy does not → allows', () => {
+        const r = runHook({
+          command:
+            "cat > /tmp/macf944-decoy.md <<'EOF'\nJust unrelated decoy content.\nEOF\ncat > /tmp/macf944-target.md <<'EOF'\n@macf-science-agent[bot] please review.\nEOF\ngh issue comment 123 --body-file /tmp/macf944-target.md",
+        });
+        expect(r.status).toBe(0);
+      });
+    });
+
+    // Branch 3: neither a readable file nor an unambiguous literal
+    // heredoc — Check A degrades to a non-blocking warning; Check B keeps
+    // the pre-#944 silent allow (nothing lintable).
+    describe('branch 3 — unresolvable content (non-blocking warn, not a block)', () => {
+      it('an UNQUOTED heredoc delimiter (<<EOF, body may expand) falls to branch 3', () => {
+        const r = runHook({
+          command:
+            'cat > /tmp/macf944-unquoted.md <<EOF\nJust a status update, no mentions.\nEOF\ngh issue comment 123 --body-file /tmp/macf944-unquoted.md',
+        });
+        expect(r.status).toBe(0);
+        expect(r.stderr).toMatch(/WARNING/);
+        expect(r.stderr).not.toMatch(/^BLOCKED/m);
+      });
+
+      it('an unresolvable path with no heredoc at all falls to branch 3 (warns, does not block)', () => {
+        const r = runHook({
+          command: 'gh issue comment 123 --body-file /tmp/macf944-does-not-exist-at-all.md',
+        });
+        expect(r.status).toBe(0);
+        expect(r.stderr).toMatch(/WARNING/);
+        expect(r.stderr).toContain('--body-file');
+      });
+
+      it('the branch-3 warning is suppressed for close subcommands (Check A never applies there)', () => {
+        const r = runHook({
+          command: 'gh issue close 123 --comment "status" --body-file /tmp/macf944-does-not-exist-2.md',
+        });
+        expect(r.status).toBe(0);
+        expect(r.stderr).toBe('');
+      });
+    });
+
+    describe('MACF_SKIP_MENTION_CHECK=1 overrides branch-1 and branch-2 blocks', () => {
+      let dir: string;
+
+      afterEach(() => {
+        if (dir) rmSync(dir, { recursive: true, force: true });
+      });
+
+      it('overrides a branch-1 zero-mention block', () => {
+        dir = mkdtempSync(join(tmpdir(), 'macf944-'));
+        const file = join(dir, 'body.md');
+        writeFileSync(file, 'Just a status update, no mentions.\n');
+        const r = runHook({
+          command: `gh issue comment 123 --body-file ${file}`,
+          env: { MACF_SKIP_MENTION_CHECK: '1' },
+        });
+        expect(r.status).toBe(0);
+      });
+
+      it('overrides a branch-2 zero-mention block', () => {
+        const r = runHook({
+          command:
+            "cat > /tmp/macf944-skip.md <<'EOF'\nJust a status update, no mentions.\nEOF\ngh issue comment 123 --body-file /tmp/macf944-skip.md",
+          env: { MACF_SKIP_MENTION_CHECK: '1' },
+        });
+        expect(r.status).toBe(0);
+      });
     });
   });
 
