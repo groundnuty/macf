@@ -256,6 +256,8 @@ import type { RunnerRegistrationDeps, RunnerTokenPollOptions } from './apply-rou
 import { publishTrustedActorsGated } from './apply-routing.js';
 import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientPublishResult } from './apply-routing-client.js';
 import { mintRoutingClient, publishRoutingClientSecrets, skippedRoutingClientPublish } from './apply-routing-client.js';
+import type { VaultRecipientCountResult } from './vault-read.js';
+import { readVaultRecipientCount, reencryptVault } from './vault-read.js';
 
 export interface FleetApplyDeps {
   /**
@@ -324,6 +326,32 @@ export interface FleetApplyDeps {
    * resolves without real wall-clock delay.
    */
   readonly runnerTokenPollOptions?: RunnerTokenPollOptions;
+  /**
+   * The operator's age identity-key PATH (DR-043 §D5 recipient reconciliation,
+   * groundnuty/macf#957) — mirrors `bootstrap plan`'s own `--identity-key`
+   * (`plan.ts::checkVaultFlagsComplete`). `undefined` means "not supplied
+   * this run": a DETECTED, definite recipient-set shortfall then REFUSES
+   * loudly (see {@link reconcileVaultRecipients}) rather than silently
+   * leaving the vault stale — Amendment D's decrypt-then-whole-rewrite needs
+   * an operator identity able to decrypt the CURRENT vault; there is no
+   * unattended path. Detection itself needs no identity at all (the
+   * recipient stanza COUNT is observable from the ciphertext header) and
+   * runs every `apply`, regardless of this field.
+   */
+  readonly identityKeyPath?: string;
+  /** Injectable seam for the recipient-set reconciliation (macf#957) — real defaults are `vault-read.ts`'s `readVaultRecipientCount`/`reencryptVault`. */
+  readonly vaultRecipientDeps?: VaultRecipientReconcileDeps;
+}
+
+/**
+ * DR-043 §D5 recipient-set reconciliation (macf#957) — the injectable seam
+ * for {@link reconcileVaultRecipients}. Both fields optional; production
+ * (`commands/bootstrap-apply.ts::resolveMutateDeps`) leaves this whole field
+ * unset on `FleetApplyDeps`, taking the real `vault-read.ts` primitives.
+ */
+export interface VaultRecipientReconcileDeps {
+  readonly readRecipientCount?: (vaultPath: string) => VaultRecipientCountResult;
+  readonly reencrypt?: (vaultPath: string, identityPath: string, recipients: readonly string[]) => Promise<void>;
 }
 
 export interface AgentApplyRecord {
@@ -1098,6 +1126,105 @@ async function syncControlRepo(controlDir: string, deps: FleetApplyDeps): Promis
 }
 
 /**
+ * DR-043 §D5 recipient-set reconciliation (groundnuty/macf#957) outcome —
+ * see {@link reconcileVaultRecipients}'s doc.
+ */
+export type VaultRecipientReconcileOutcome =
+  | { readonly status: 'noop' }
+  | { readonly status: 'reencrypted' }
+  | { readonly status: 'refused'; readonly reason: string }
+  | { readonly status: 'failed'; readonly reason: string };
+
+/**
+ * DR-043 §D5 recipient-set reconciliation (groundnuty/macf#957) — closes the
+ * gap `settleVault`'s prior unconditional early-`{status:'skipped'}` left
+ * open: an operator adding a recipient to `transport.age_recipients` with no
+ * NEW agent/CA/routing-client secret this run used to leave the vault
+ * silently stale (§D5's "the vault must hold an identity that can decrypt
+ * it" invariant, written-but-never-applied). See `vault-read.ts`'s module
+ * doc for the full detection-needs-no-key / reencrypt-needs-an-identity
+ * split this function implements.
+ *
+ * **Never auto-shrinks.** `stanzaCount > desired` REFUSES unconditionally
+ * (even WITH an identity key) — re-encrypting to fewer recipients would
+ * REVOKE decrypt access for whichever one was dropped, and §D3's "no delete
+ * verb, extras are reported, never pruned" (Design invariant 4) applies at
+ * the vault layer the same way it does everywhere else in this reconciler.
+ * Only the SAFE, additive direction (fewer stanzas than desired) is ever
+ * auto-applied, and only when `identityKeyPath` is supplied.
+ */
+async function reconcileVaultRecipients(
+  vaultOutPath: string,
+  desiredRecipients: readonly string[],
+  identityKeyPath: string | undefined,
+  deps: VaultRecipientReconcileDeps,
+  log: (line: string) => void,
+): Promise<VaultRecipientReconcileOutcome> {
+  const readRecipientCount = deps.readRecipientCount ?? readVaultRecipientCount;
+  const reencrypt = deps.reencrypt ?? reencryptVault;
+
+  let counted: VaultRecipientCountResult;
+  try {
+    counted = readRecipientCount(vaultOutPath);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return { status: 'failed', reason: `could not read the current vault's recipient count — ${reason}` };
+  }
+
+  if (counted.status === 'absent') {
+    // Nothing provisioned yet this run left un-provisioned — no vault
+    // exists to have drifted; the first successful write will use whatever
+    // is currently declared.
+    return { status: 'noop' };
+  }
+  if (counted.count === desiredRecipients.length) {
+    // Count-only match (age's header never reveals recipient IDENTITY
+    // without decrypting per-key — see vault-read.ts's module doc) — this
+    // IS the "no churn on every apply" steady state, not a claim the sets
+    // are cryptographically confirmed identical.
+    return { status: 'noop' };
+  }
+
+  if (counted.count > desiredRecipients.length) {
+    return {
+      status: 'refused',
+      reason:
+        `vault is encrypted to ${String(counted.count)} recipient(s), MORE than the ${String(desiredRecipients.length)} ` +
+        'declared in transport.age_recipients. apply does NOT auto-shrink the recipient set — re-encrypting to fewer ' +
+        'keys would REVOKE decrypt access for whichever recipient was dropped. Reconcile transport.age_recipients (add ' +
+        'the missing entry back) or re-encrypt the vault manually, then re-run apply.',
+    };
+  }
+
+  // counted.count < desiredRecipients.length — a DEFINITE, SAFE (additive)
+  // shortfall. Needs an operator identity to decrypt the CURRENT vault
+  // before it can re-encrypt to the fuller set (Amendment D).
+  if (identityKeyPath === undefined) {
+    return {
+      status: 'refused',
+      reason:
+        `vault is encrypted to ${String(counted.count)} recipient(s), fewer than the ${String(desiredRecipients.length)} ` +
+        'declared in transport.age_recipients, but no --identity-key was supplied — refusing to silently leave it ' +
+        'stale (DR-043 Amendment D: re-encrypting needs an operator identity able to decrypt the current vault). ' +
+        'Re-run "macf bootstrap apply --vault <path> --identity-key <path>" to reconcile.',
+    };
+  }
+
+  log(
+    `Vault: recipient set changed (${String(counted.count)} → ${String(desiredRecipients.length)}) — ` +
+      're-encrypting (decrypt-then-whole-rewrite, DR-043 Amendment D).',
+  );
+  try {
+    await reencrypt(vaultOutPath, identityKeyPath, desiredRecipients);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return { status: 'failed', reason: `re-encrypt to the new recipient set failed — ${reason}` };
+  }
+  log(`Vault: re-encrypted to ${String(desiredRecipients.length)} recipient(s) at ${vaultOutPath}.`);
+  return { status: 'reencrypted' };
+}
+
+/**
  * Assemble + attempt the single, whole-payload vault write for every
  * `created` agent this run PLUS a freshly-minted CA key, when present
  * (`caSecrets`, DR-043 Amendment D phase 2 — macf#838), PLUS a freshly-minted
@@ -1128,7 +1255,27 @@ async function settleVault(
     routingClientSecrets === undefined &&
     runnerOpsSecrets === undefined
   ) {
-    return { status: 'skipped' };
+    // groundnuty/macf#957 — "nothing NEW to mint this run" does not mean
+    // "nothing to do": a recipient added/removed from transport.age_recipients
+    // since the vault was last written still needs a re-encrypt, and this
+    // branch was previously the exact place that silently skipped it (see
+    // this function's + `reconcileVaultRecipients`'s doc).
+    const recipientOutcome = await reconcileVaultRecipients(
+      vaultOutPath,
+      manifest.transport.age_recipients,
+      deps.identityKeyPath,
+      deps.vaultRecipientDeps ?? {},
+      deps.log,
+    );
+    switch (recipientOutcome.status) {
+      case 'noop':
+        return { status: 'skipped' };
+      case 'reencrypted':
+        return { status: 'written', path: vaultOutPath, versioned: false };
+      case 'refused':
+      case 'failed':
+        return { status: 'failed', reason: recipientOutcome.reason };
+    }
   }
 
   try {

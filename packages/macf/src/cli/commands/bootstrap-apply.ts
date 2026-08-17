@@ -552,6 +552,11 @@ export function resolveMutateDeps(
   // resolution right before this is called); threaded verbatim onto
   // `FleetApplyDeps.runnerToken`, never read anywhere else in this function.
   runnerToken?: string,
+  // macf#957 — `opts.identityKeyPath` (same flag `vaultAgentPems` above was
+  // already decrypted with), threaded verbatim onto
+  // `FleetApplyDeps.identityKeyPath` for `apply-fleet.ts::reconcileVaultRecipients`.
+  // Never read anywhere else in this function.
+  identityKeyPath?: string,
 ): MutateApplyDeps {
   const repoInitDeps: RepoInitStepDeps = { cloneRepo: realCloneRepo, commitAndPush: realCommitAndPush };
 
@@ -609,6 +614,10 @@ export function resolveMutateDeps(
     // doc); `runnerTokenPollOptions` is deliberately left unset here, taking
     // that function's real 10min/3s deploy-window defaults.
     runnerToken,
+    // macf#957 — `vaultRecipientDeps` deliberately left unset here, taking
+    // `apply-fleet.ts::reconcileVaultRecipients`'s real `vault-read.ts`
+    // defaults (`readVaultRecipientCount`/`reencryptVault`).
+    identityKeyPath,
     confirmPlan: realConfirmPlan,
     // DR-043 Amendment F residual (macf#857): this still reads from the
     // OPERATOR's local manifest directory, not the (not-yet-cloned, at this
@@ -1118,7 +1127,7 @@ export async function runBootstrapApply(
     // pure plain-object builder — no `process.env` read hidden inside it for
     // this field (unlike the pre-existing `allowVaultVersion` line above it,
     // which this does NOT imitate).
-    const mutate = mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken);
+    const mutate = mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath);
     try {
       const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, displayCreations);
       if (!approved) {

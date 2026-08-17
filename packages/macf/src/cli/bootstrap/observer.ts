@@ -25,9 +25,9 @@ import { deriveControlRepoName, ROUTER_EMITTED_LABELS } from './fleet-manifest.j
 import type { FleetObserverFn, ObservedAgentState, ObservedState, Presence } from './plan.js';
 import { readFleetLockFile } from './fleet-lock.js';
 import { registryPathPrefix } from '../registry-helper.js';
-import type { VaultAgentObservation, VaultCaObservation, VaultReadOptions } from './vault-read.js';
+import type { VaultAgentObservation, VaultCaObservation, VaultReadOptions, VaultRecipientCountResult, VaultRecipientsObservation } from './vault-read.js';
 import { VaultError } from './vault-write.js';
-import { queryVaultAgentPresence, queryVaultCaPresence, readVault } from './vault-read.js';
+import { queryVaultAgentPresence, queryVaultCaPresence, readVault, readVaultRecipientCount } from './vault-read.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -939,10 +939,12 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
 
 // --- vaultAwareObserver — DR-043 Amendment D phase 3 ("the vault-aware observer") ---
 
-/** Injectable seam for {@link vaultAwareObserver}'s tests — real defaults are `githubRegistryObserver` (bound to `manifestPath`) and `vault-read.ts::readVault`. */
+/** Injectable seam for {@link vaultAwareObserver}'s tests — real defaults are `githubRegistryObserver` (bound to `manifestPath`), `vault-read.ts::readVault`, and `vault-read.ts::readVaultRecipientCount`. */
 export interface VaultAwareObserverDeps {
   readonly observe?: FleetObserverFn;
   readonly readVault?: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>;
+  /** DR-043 §D5 recipient-set reconciliation (macf#957) — see this function's own doc for why it's computed independently of `readVault`/`raw` above. */
+  readonly readVaultRecipientCount?: (vaultPath: string) => VaultRecipientCountResult;
 }
 
 /**
@@ -982,6 +984,7 @@ export async function vaultAwareObserver(
 ): Promise<ObservedState> {
   const observe = deps?.observe ?? ((m: FleetManifest) => githubRegistryObserver(m, manifestPath));
   const doReadVault = deps?.readVault ?? readVault;
+  const doReadRecipientCount = deps?.readVaultRecipientCount ?? readVaultRecipientCount;
 
   const base = await observe(manifest);
 
@@ -1007,5 +1010,18 @@ export async function vaultAwareObserver(
       ? { status: 'confirmed', presence: queryVaultCaPresence(raw, manifest.metadata.name) }
       : { status: 'unknown', reason: unknownReason };
 
-  return { ...base, agents, vaultCa };
+  // DR-043 §D5 recipient-set reconciliation (macf#957) — deliberately
+  // INDEPENDENT of `raw`/`doReadVault` above: the recipient STANZA COUNT
+  // needs no private key at all (see `vault-read.ts`'s module doc), so this
+  // is computed from the vault file's header bytes directly, not gated on
+  // whether the identity-key decrypt above succeeded.
+  let vaultRecipients: VaultRecipientsObservation;
+  try {
+    const counted = doReadRecipientCount(vaultOpts.vaultPath);
+    vaultRecipients = counted.status === 'counted' ? { status: 'confirmed', stanzaCount: counted.count } : { status: 'no-vault' };
+  } catch (err) {
+    vaultRecipients = { status: 'unknown', reason: err instanceof VaultError || err instanceof Error ? err.message : String(err) };
+  }
+
+  return { ...base, agents, vaultCa, vaultRecipients };
 }

@@ -55,7 +55,7 @@ import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
 import { buildTrustedActorsValue, deriveAppHandle } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
-import type { VaultAgentObservation, VaultCaObservation } from './vault-read.js';
+import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
 // macf#932 — reuse the SAME flag/env-var name constants `apply`'s own
 // pre-flight refusal names, rather than re-typing them here (this is a
@@ -168,6 +168,14 @@ export interface ObservedState {
    * 3) — same undefined-vs-observed convention as {@link ObservedAgentState.vault}.
    */
   readonly vaultCa?: VaultCaObservation;
+  /**
+   * The vault's age-header recipient-STANZA-COUNT fact (DR-043 §D5 recipient
+   * reconciliation, groundnuty/macf#957) — `undefined` when this run had no
+   * vault access at all (the vault-free default; NOT evidence of a recipient
+   * mismatch, just "not asked this run" — same convention as `vaultCa`
+   * above). Populated by `observer.ts::vaultAwareObserver`.
+   */
+  readonly vaultRecipients?: VaultRecipientsObservation;
   /** The `MACF_TRUSTED_ACTORS` value observed on a caller repo, if any (macf#922 — was `MACF_ROUTING_RUNS_ON`, a variable the v3 router never reads; see `apply-routing.ts`'s doc). */
   readonly routingTrustedActors?: string;
   /**
@@ -232,7 +240,8 @@ export type PlanItemKind =
   | 'actions_pin'
   | 'labels'
   | 'routing_client'
-  | 'runner_ops';
+  | 'runner_ops'
+  | 'vault_recipients';
 export type PlanVerb = 'create' | 'update' | 'noop' | 'report-extra';
 
 export interface PlanItem {
@@ -466,6 +475,17 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // split — both remaining verbs (noop/report-extra already returned
       // above) stay `not_implemented`.
       return 'not_implemented';
+    case 'vault_recipients':
+      // groundnuty/macf#957 — `apply-fleet.ts::reconcileVaultRecipients` has
+      // a REAL code path for the only two verbs `vaultRecipientsItem` ever
+      // emits ('update' either direction; 'noop' returned above already).
+      // "Implemented" here means "apply has actual behavior for this," not
+      // "apply always auto-fixes it": the safe direction (fewer stanzas than
+      // declared) re-encrypts when `--identity-key` was given, and BOTH the
+      // no-identity-key case and the unsafe shrink direction refuse loudly
+      // (a real, intentional apply behavior — never a silent skip) rather
+      // than falling through un-actioned.
+      return 'implemented';
   }
 }
 
@@ -487,12 +507,14 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'labels':
     case 'routing_client':
     case 'runner_ops':
+    case 'vault_recipients':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
       // 2, 'control_repo' in macf#867 / DR-043 Amendment G, 'labels'/
       // 'routing_client' in groundnuty/macf#920, 'runner_ops' in
-      // groundnuty/macf#943). Kept exhaustive so a NEW `PlanItemKind` added
+      // groundnuty/macf#943, 'vault_recipients' in groundnuty/macf#957).
+      // Kept exhaustive so a NEW `PlanItemKind` added
       // later is a compile error here, not a silent "apply covers
       // everything" false-negative.
       return 'apply has no code path for this item (unclassified — this reason string should be unreachable)';
@@ -931,6 +953,90 @@ function controlRepoItem(presence: Presence, archived: boolean | undefined): Pla
 }
 
 /**
+ * DR-043 §D5 recipient-set reconciliation (groundnuty/macf#957) — one
+ * fleet-level item comparing the vault's OBSERVED age-header recipient
+ * STANZA COUNT against `transport.age_recipients.length`. Only called (see
+ * `computePlan`) when `observed.vaultRecipients !== undefined` — a
+ * vault-free plan run (the common default; no `--vault`/`--identity-key`
+ * given) emits NO item at all for this kind, matching
+ * `formatVaultAgentSuffix`'s own "undefined is a full no-op, not a degraded
+ * unknown" convention, rather than `presenceVerb`'s "unknown degrades to a
+ * LOW-CONFIDENCE create" convention — recipient drift can ONLY ever be
+ * assessed via the vault-aware path, so "not given this run" is a much
+ * weaker signal than "tried and failed," and a permanent "not observed"
+ * noop line on every ordinary plan run would be pure noise.
+ *
+ * **Never claims a definite match it cannot establish (Amendment A4).** A
+ * stanza-count MATCH is reported as a "count-only match" — `age`'s header
+ * never reveals recipient IDENTITY without decrypting per-recipient-key (see
+ * `vault-read.ts`'s module doc), so this is never worded as a confirmed
+ * cryptographic match.
+ *
+ * **Never auto-shrinks (§D3 Design invariant 4 — "no delete verb," applied
+ * at the vault layer).** A HIGHER stanza count than declared could mean a
+ * recipient was intentionally dropped from the manifest — re-encrypting to
+ * the smaller set would REVOKE that recipient's decrypt access, which
+ * `apply` refuses to do automatically regardless of `--identity-key` (see
+ * `apply-fleet.ts::reconcileVaultRecipients`). The reason text for that
+ * direction says so explicitly, distinct from the (safe, auto-applied)
+ * fewer-than-declared direction.
+ */
+function vaultRecipientsItem(desiredCount: number, obs: VaultRecipientsObservation): PlanItem {
+  const target = 'vault:recipients';
+  if (obs.status === 'no-vault') {
+    return {
+      kind: 'vault_recipients',
+      target,
+      verb: 'noop',
+      reason: 'no vault.age exists yet — nothing to reconcile; the first successful apply encrypts fresh to the currently declared recipient(s).',
+      confirm_required: false,
+    };
+  }
+  if (obs.status === 'unknown') {
+    return {
+      kind: 'vault_recipients',
+      target,
+      verb: 'noop',
+      reason: `vault recipient count could not be determined — ${obs.reason} — cannot confirm it matches the ${String(desiredCount)} declared recipient(s); apply re-checks independently at run time`,
+      confirm_required: false,
+    };
+  }
+  if (obs.stanzaCount === desiredCount) {
+    return {
+      kind: 'vault_recipients',
+      target,
+      verb: 'noop',
+      reason:
+        `vault is encrypted to ${String(obs.stanzaCount)} recipient(s), matching the ${String(desiredCount)} declared — ` +
+        "count-only match (age's header never reveals recipient IDENTITY without decrypting with each recipient's own key)",
+      confirm_required: false,
+    };
+  }
+  if (obs.stanzaCount < desiredCount) {
+    return {
+      kind: 'vault_recipients',
+      target,
+      verb: 'update',
+      reason:
+        `vault is encrypted to ${String(obs.stanzaCount)} recipient(s), DEFINITELY fewer than the ${String(desiredCount)} ` +
+        'declared in transport.age_recipients — run "macf bootstrap apply --vault <path> --identity-key <path>" to ' +
+        're-encrypt to the full declared set (decrypt-then-whole-rewrite, DR-043 Amendment D).',
+      confirm_required: true,
+    };
+  }
+  return {
+    kind: 'vault_recipients',
+    target,
+    verb: 'update',
+    reason:
+      `vault is encrypted to ${String(obs.stanzaCount)} recipient(s), MORE than the ${String(desiredCount)} declared in ` +
+      'transport.age_recipients — apply does NOT auto-shrink the recipient set (re-encrypting to fewer keys would ' +
+      'REVOKE decrypt access for whichever recipient was dropped); reconcile transport.age_recipients or the vault manually.',
+    confirm_required: true,
+  };
+}
+
+/**
  * DR-043 §D6 GitOps version steering — one agent's DEPLOYED macf CLI version
  * vs the fleet manifest's declared `versions.macf`. Same inline three-way
  * shape as {@link routingItem} above (a manifest-declared string compared
@@ -1087,6 +1193,13 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
   }
   for (const agent of manifest.agents) {
     items.push(routingClientItem(agent.repo, observed.routingClientRepos?.[agent.repo] ?? 'unknown'));
+  }
+  // DR-043 §D5 recipient-set reconciliation (macf#957) — only when this run
+  // actually had vault access (see `vaultRecipientsItem`'s doc for why a
+  // vault-free run emits no item at all here, rather than a permanent
+  // "not observed" noop).
+  if (observed.vaultRecipients !== undefined) {
+    items.push(vaultRecipientsItem(manifest.transport.age_recipients.length, observed.vaultRecipients));
   }
 
   if (manifest.routing?.runner) {
