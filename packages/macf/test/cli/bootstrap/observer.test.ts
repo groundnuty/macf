@@ -36,8 +36,9 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkRunnerUsableByRepo, extractActionsPin, readFleetLock, vaultAwareObserver } from '../../../src/cli/bootstrap/observer.js';
-import type { RunnerUsabilityDeps } from '../../../src/cli/bootstrap/observer.js';
+import { checkRunnerUsableByRepo, extractActionsPin, isRunnerCapable, readFleetLock, vaultAwareObserver } from '../../../src/cli/bootstrap/observer.js';
+import type { OrgRunnerRecord, RunnerCapability, RunnerUsabilityDeps } from '../../../src/cli/bootstrap/observer.js';
+import { ROUTER_EMITTED_LABELS } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { ObservedState } from '../../../src/cli/bootstrap/plan.js';
 import { VaultError } from '../../../src/cli/bootstrap/vault-write.js';
@@ -254,33 +255,81 @@ describe('extractActionsPin (DR-043 §D6 — versions.actions observed-state sou
   });
 });
 
-// --- checkRunnerUsableByRepo — macf#924 org-scope register-before-route correction ---
+// --- isRunnerCapable — macf#934: the capability predicate, tested standalone (pure) ---
+
+/** A runner carrying online status + exactly the router's required labels — the baseline every fixture below overrides from. */
+function capableRunner(overrides: Partial<RunnerCapability> = {}): RunnerCapability {
+  return { status: 'online', busy: false, labels: new Set(ROUTER_EMITTED_LABELS), ...overrides };
+}
+
+describe('isRunnerCapable (macf#934 — the missing half of register-before-route: CAN this runner claim a routed job)', () => {
+  it('online + exact label match -> capable', () => {
+    expect(isRunnerCapable(capableRunner(), ROUTER_EMITTED_LABELS)).toBe(true);
+  });
+
+  it('the busy trap — BUSY + online + label-matching (our own live runner\'s actual shape) -> STILL capable; busy is never consulted', () => {
+    // Verified live shape (issue brief): status=online busy=true
+    // labels=[self-hosted,Linux,X64,macf-vm] — extra GitHub-assigned OS/arch
+    // labels PLUS busy:true. A naive `online && !busy` predicate would score
+    // this healthy, job-claiming runner as unusable.
+    const runner = capableRunner({ busy: true, labels: new Set(['self-hosted', 'Linux', 'X64', 'macf-vm']) });
+    expect(isRunnerCapable(runner, ROUTER_EMITTED_LABELS)).toBe(true);
+  });
+
+  it('online but missing a required label -> NOT capable', () => {
+    const runner = capableRunner({ labels: new Set(['self-hosted']) }); // missing "macf-vm"
+    expect(isRunnerCapable(runner, ROUTER_EMITTED_LABELS)).toBe(false);
+  });
+
+  it('carries every required label but is OFFLINE -> NOT capable', () => {
+    const runner = capableRunner({ status: 'offline' });
+    expect(isRunnerCapable(runner, ROUTER_EMITTED_LABELS)).toBe(false);
+  });
+
+  it('an unrecognized/future status value (not "online") -> NOT capable — exact equality, never a looser check', () => {
+    const runner = capableRunner({ status: 'idle' });
+    expect(isRunnerCapable(runner, ROUTER_EMITTED_LABELS)).toBe(false);
+  });
+
+  it('extra labels beyond the required set do not disqualify — superset, not equality', () => {
+    const runner = capableRunner({ labels: new Set(['self-hosted', 'macf-vm', 'gpu', 'Linux']) });
+    expect(isRunnerCapable(runner, ROUTER_EMITTED_LABELS)).toBe(true);
+  });
+});
+
+// --- checkRunnerUsableByRepo — macf#924 org-scope correction, macf#934 capability gate ---
+
+/** An org-level runner fixture, capable by default (online + required labels), in group 1. */
+function orgRunner(overrides: Partial<OrgRunnerRecord> = {}): OrgRunnerRecord {
+  return { status: 'online', busy: false, labels: new Set(ROUTER_EMITTED_LABELS), runnerGroupId: 1, ...overrides };
+}
 
 /**
- * A deps fixture with NO org runner group and NO registered org runner —
- * the "org scope has nothing" baseline every scenario below overrides from.
+ * A deps fixture with a confirmed-EMPTY repo scope and NO org runner group/
+ * runner — the "nothing anywhere" baseline every scenario below overrides
+ * from.
  */
 function depsWith(overrides: Partial<RunnerUsabilityDeps> = {}): RunnerUsabilityDeps {
   return {
-    checkRepoScopedRunner: async () => 'absent',
+    listRepoScopedRunners: async () => ({ kind: 'ok', runners: [] }),
     listRunnerGroupsVisibleToRepo: async () => [],
-    listOrgRunnerGroupIds: async () => new Set<number>(),
+    listOrgRunners: async () => [],
     ...overrides,
   };
 }
 
-describe('checkRunnerUsableByRepo (macf#924 — corrects the org-runner-blind cost regression from macf#922/#923)', () => {
-  it('repo-level runner present -> present (the ORIGINAL macf#922 fast path; org scope is never even consulted)', async () => {
+describe('checkRunnerUsableByRepo (macf#924 org-scope correction; macf#934 capability gate)', () => {
+  it('repo-level CAPABLE runner present -> present (org scope never even consulted)', async () => {
     let orgCallMade = false;
     const deps = depsWith({
-      checkRepoScopedRunner: async () => 'present',
+      listRepoScopedRunners: async () => ({ kind: 'ok', runners: [capableRunner()] }),
       listRunnerGroupsVisibleToRepo: async () => {
         orgCallMade = true;
         return [];
       },
-      listOrgRunnerGroupIds: async () => {
+      listOrgRunners: async () => {
         orgCallMade = true;
-        return new Set();
+        return [];
       },
     });
     const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
@@ -288,15 +337,71 @@ describe('checkRunnerUsableByRepo (macf#924 — corrects the org-runner-blind co
     expect(orgCallMade).toBe(false);
   });
 
-  it('macf#924 REGRESSION — an org-level runner in an "all"-visibility group is USABLE -> present (repo-scope alone read this as absent and skipped the write)', async () => {
+  it('online but missing a required label -> NOT present; detail names the missing label AND the runner found', async () => {
     const deps = depsWith({
-      checkRepoScopedRunner: async () => 'absent',
+      listRepoScopedRunners: async () => ({ kind: 'ok', runners: [capableRunner({ labels: new Set(['self-hosted']) })] }),
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('absent');
+    expect(usability.detail).toBeDefined();
+    expect(usability.detail).toContain('macf-vm'); // the missing label, named
+    expect(usability.detail).toMatch(/online/);
+    expect(usability.detail).toContain('self-hosted'); // what WAS found, so the operator isn't sent looking blind
+  });
+
+  it('label-match but OFFLINE -> NOT present; detail says offline, not mislabeled', async () => {
+    const deps = depsWith({
+      listRepoScopedRunners: async () => ({ kind: 'ok', runners: [capableRunner({ status: 'offline' })] }),
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('absent');
+    expect(usability.detail).toBeDefined();
+    expect(usability.detail).toMatch(/offline/);
+    expect(usability.detail).not.toMatch(/missing/);
+  });
+
+  it('the busy trap end-to-end — BUSY + online + label-matching -> present (our own live runner would fail a wrong online&&!busy implementation)', async () => {
+    const deps = depsWith({
+      listRepoScopedRunners: async () => ({
+        kind: 'ok',
+        runners: [capableRunner({ busy: true, labels: new Set(['self-hosted', 'Linux', 'X64', 'macf-vm']) })],
+      }),
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability).toEqual({ presence: 'present' });
+  });
+
+  it('a confirmed HTTP 403 on the repo-scoped leg -> unknown with a permission-specific detail, when the org leg ALSO cannot confirm', async () => {
+    const deps = depsWith({
+      listRepoScopedRunners: async () => ({ kind: 'forbidden' }),
+      listRunnerGroupsVisibleToRepo: async () => 'unknown',
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('unknown');
+    expect(usability.detail).toBeDefined();
+    expect(usability.detail).toMatch(/insufficient permission/);
+    expect(usability.detail).toContain('403');
+    expect(usability.detail).toContain('administration: read');
+  });
+
+  it('a confirmed HTTP 403 on the repo-scoped leg does NOT short-circuit — a CAPABLE org runner still resolves present (macf#924 regression guard)', async () => {
+    const deps = depsWith({
+      listRepoScopedRunners: async () => ({ kind: 'forbidden' }),
+      listRunnerGroupsVisibleToRepo: async () => [{ id: 1, name: 'Default' }],
+      listOrgRunners: async () => [orgRunner()],
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability).toEqual({ presence: 'present' });
+  });
+
+  it('macf#924 REGRESSION — an org-level CAPABLE runner in an "all"-visibility group -> present (repo-scope alone read this as absent and skipped the write)', async () => {
+    const deps = depsWith({
       // "all"-visibility means GitHub's own `visible_to_repository` resolution
       // returns this group for EVERY repo in the org — group id 1 (the
       // typical "Default" group id) shows up here without any repo-specific
       // allowlisting.
       listRunnerGroupsVisibleToRepo: async () => [{ id: 1, name: 'Default' }],
-      listOrgRunnerGroupIds: async () => new Set([1]),
+      listOrgRunners: async () => [orgRunner({ runnerGroupId: 1 })],
     });
     const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
     expect(usability.presence).toBe('present');
@@ -305,11 +410,10 @@ describe('checkRunnerUsableByRepo (macf#924 — corrects the org-runner-blind co
 
   it('an org runner in a "selected"-visibility group that EXCLUDES this repo -> NOT present, org-admin handover reported', async () => {
     const deps = depsWith({
-      checkRepoScopedRunner: async () => 'absent',
-      // group 7 has a registered runner (see listOrgRunnerGroupIds) but is
-      // NOT in the visible-to-this-repo list — excluded by selection.
+      // group 7 has a registered runner (see listOrgRunners) but is NOT in
+      // the visible-to-this-repo list — excluded by selection.
       listRunnerGroupsVisibleToRepo: async () => [],
-      listOrgRunnerGroupIds: async () => new Set([7]),
+      listOrgRunners: async () => [orgRunner({ runnerGroupId: 7 })],
     });
     const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
     expect(usability.presence).not.toBe('present');
@@ -322,23 +426,40 @@ describe('checkRunnerUsableByRepo (macf#924 — corrects the org-runner-blind co
     expect(usability.handover).toMatch(/cannot perform that step itself/);
   });
 
-  it('an org runner in a "selected"-visibility group that INCLUDES this repo -> present', async () => {
+  it('an org runner in a "selected"-visibility group that INCLUDES this repo and IS capable -> present', async () => {
     const deps = depsWith({
-      checkRepoScopedRunner: async () => 'absent',
       listRunnerGroupsVisibleToRepo: async () => [{ id: 7, name: 'ci-runner' }],
-      listOrgRunnerGroupIds: async () => new Set([7]),
+      listOrgRunners: async () => [orgRunner({ runnerGroupId: 7 })],
     });
     const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
     expect(usability).toEqual({ presence: 'present' });
   });
 
-  it('no runners anywhere (repo scope AND org scope both confidently empty) -> absent, nothing to hand over', async () => {
+  it('an org runner visible to this repo but NOT capable (offline) -> NOT present, no handover (visibility was never the problem)', async () => {
+    const deps = depsWith({
+      listRunnerGroupsVisibleToRepo: async () => [{ id: 7, name: 'ci-runner' }],
+      listOrgRunners: async () => [orgRunner({ runnerGroupId: 7, status: 'offline' })],
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('absent');
+    expect(usability.handover).toBeUndefined();
+    expect(usability.detail).toMatch(/offline/);
+  });
+
+  it('no runners anywhere (repo scope AND org scope both confidently empty) -> absent, nothing to hand over, nothing to detail', async () => {
     const usability = await checkRunnerUsableByRepo('groundnuty/x', depsWith());
     expect(usability).toEqual({ presence: 'absent' });
   });
 
-  it('an unreadable repo-scoped leg -> unknown, NEVER absent, even when the org leg is confirmed empty', async () => {
-    const deps = depsWith({ checkRepoScopedRunner: async () => 'unknown' });
+  it('a repo-scoped leg with zero runners (confirmed absent) never produces "found runners" detail wording, even via a 404-folded read', async () => {
+    const deps = depsWith({ listRepoScopedRunners: async () => ({ kind: 'ok', runners: [] }) });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('absent');
+    expect(usability.detail).toBeUndefined();
+  });
+
+  it('an unreadable repo-scoped leg -> falls through to org scope; unknown, NEVER absent, when the org leg is confirmed empty', async () => {
+    const deps = depsWith({ listRepoScopedRunners: async () => ({ kind: 'unknown' }) });
     const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
     expect(usability.presence).toBe('unknown');
     expect(usability.presence).not.toBe('absent');
@@ -352,8 +473,8 @@ describe('checkRunnerUsableByRepo (macf#924 — corrects the org-runner-blind co
     expect(usability.handover).toBeUndefined();
   });
 
-  it('an unreadable org-runner-group-ids leg -> unknown, NEVER absent', async () => {
-    const deps = depsWith({ listOrgRunnerGroupIds: async () => 'unknown' });
+  it('an unreadable listOrgRunners leg -> unknown, NEVER absent', async () => {
+    const deps = depsWith({ listOrgRunners: async () => 'unknown' });
     const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
     expect(usability.presence).toBe('unknown');
     expect(usability.presence).not.toBe('absent');

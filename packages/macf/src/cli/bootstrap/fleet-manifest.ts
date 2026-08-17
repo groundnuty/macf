@@ -128,9 +128,40 @@ export const FleetAgentSchema = z
   })
   .strict();
 
+/**
+ * The label set `macf-actions`' `pick-runner` job emits VERBATIM on its
+ * self-hosted branch (`agent-router.yml`, confirmed against
+ * `groundnuty/macf-actions` `origin/main`: `labels='["self-hosted","macf-vm"]'`
+ * — see `router-trusted-actors-contract.test.ts`'s live-parse pin, extended
+ * for this constant). A GitHub Actions job is claimed iff `runner.labels ⊇`
+ * this set — the router hard-codes its emission independent of what any
+ * fleet declares, so THIS constant is the authoritative expected set
+ * (macf#934 / DR-043 Amendment I4), never `routing.runner.labels` (below).
+ * Hard-coded deliberately: the value is not a magic number but the other
+ * half of a contract owned by `macf-actions`, and a config knob here would
+ * let the two constants drift independently — exactly how macf#934's bug
+ * would keep regenerating. A future change to the router's emitted labels
+ * needs a code change here (and the live-parse test above will catch a
+ * silent drift), not an operator-editable setting.
+ */
+export const ROUTER_EMITTED_LABELS: readonly string[] = ['self-hosted', 'macf-vm'];
+
 export const FleetRoutingRunnerSchema = z
   .object({
     runs_on: z.string().min(1),
+    /**
+     * The label set the operator INTENDS a provisioned runner to carry
+     * (DR-043 §D1 example, Amendment H/I) — optional; v0 fleets have relied
+     * on the `macf-vm` convention without declaring it at all. When present,
+     * this is a CROSS-CHECK against {@link ROUTER_EMITTED_LABELS}
+     * (`FleetManifestSchema`'s `superRefine` below), never the value that
+     * decides what a live runner needs to carry — see
+     * `observer.ts::checkRunnerUsableByRepo` for the LIVE half of the same
+     * invariant, and this field's `superRefine` check for why deriving the
+     * expected label set from the manifest would check the wrong side of
+     * the router's contract (macf#934).
+     */
+    labels: z.array(z.string().min(1)).optional(),
   })
   .strict();
 
@@ -256,6 +287,37 @@ export const FleetManifestSchema = z
       }
       seenRepos.add(agent.repo);
     });
+
+    // macf#934 — a declared `routing.runner.labels` is a CROSS-CHECK against
+    // ROUTER_EMITTED_LABELS, never the value that decides runner usability
+    // (see that constant's doc). Reject at parse time, before any GitHub
+    // call: a manifest that declares e.g. `[self-hosted, arc-runner]` while
+    // the router keeps emitting `[self-hosted, macf-vm]` would provision a
+    // runner the router can never dispatch to — every routed job queues to
+    // timeout, and nothing about that manifest LOOKS wrong until a live
+    // apply's register-before-route gate fails, by which point the operator
+    // has already spent a consent-gate round-trip on it. The check is a
+    // superset test (declared ⊇ router-emitted), not equality — a fleet is
+    // free to declare EXTRA labels (e.g. a `gpu` tag) alongside the two the
+    // router requires.
+    const declaredLabels = manifest.routing?.runner.labels;
+    if (declaredLabels !== undefined) {
+      const declaredSet = new Set(declaredLabels);
+      const missing = ROUTER_EMITTED_LABELS.filter((label) => !declaredSet.has(label));
+      if (missing.length > 0) {
+        ctx.addIssue({
+          code: 'custom',
+          message:
+            `routing.runner.labels [${declaredLabels.join(', ')}] does not carry every label ` +
+            `macf-actions' router actually emits for the self-hosted branch (missing: [${missing.join(', ')}]). ` +
+            'A runner provisioned with these labels would never be dispatched a routed job — every job would ' +
+            'queue to timeout while the plan looks clean. Declare routing.runner.labels as a superset of ' +
+            `[${ROUTER_EMITTED_LABELS.join(', ')}] (extra labels are fine), or omit the field entirely and let ` +
+            'the convention apply (macf#934).',
+          path: ['routing', 'runner', 'labels'],
+        });
+      }
+    }
   });
 
 export type FleetMetadata = z.infer<typeof FleetMetadataSchema>;

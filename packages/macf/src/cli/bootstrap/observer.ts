@@ -21,7 +21,7 @@ import { dirname, join } from 'node:path';
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
-import { deriveControlRepoName } from './fleet-manifest.js';
+import { deriveControlRepoName, ROUTER_EMITTED_LABELS } from './fleet-manifest.js';
 import type { FleetObserverFn, ObservedAgentState, ObservedState, Presence } from './plan.js';
 import { readFleetLockFile } from './fleet-lock.js';
 import { registryPathPrefix } from '../registry-helper.js';
@@ -177,42 +177,132 @@ export async function checkRepoSecretPresence(repo: string, name: string): Promi
 }
 
 /**
- * Read-only REPO-SCOPED self-hosted-runner-registration check via `gh api
- * repos/<repo>/actions/runners` — the ORIGINAL macf#922 register-before-route
- * primitive, UNCHANGED. `'present'` = at least one runner is REGISTERED
- * (`total_count > 0`) to THIS repo directly — deliberately "registered," not
- * "online": the router's own `pick-runner` doc comment says "registered,"
- * and a registered-but-currently-offline runner is a narrower failure (a
- * hung job) than writing `MACF_TRUSTED_ACTORS` with zero runners registered
- * at all. A confident empty list is `'absent'`; any read failure (auth /
- * network / insufficient scope / `gh` missing) degrades to `'unknown'` —
- * same discrimination {@link checkRepoExists} already uses. NEVER throws.
- *
- * **This is only HALF the register-before-route gate as of macf#924** — see
- * {@link checkRunnerUsableByRepo}, which composes this repo-scoped leg with
- * an ORG-scoped leg. GitHub documents self-hosted runners registered at the
- * organization level as usable by "multiple repositories in an
- * organization" WITHOUT per-repo registration — this repo-scoped-only read
- * is structurally blind to that case (confirmed via `gh api
- * repos/<repo>/actions/runners`'s own docs: it lists runners registered TO
- * that repository, nothing org-wide). macf#923 traced exactly this gap: an
- * org fleet with one working org-level runner read `total_count: 0` here,
- * scored `absent`, and `apply` silently fell back to metered github-hosted
- * Actions minutes on a private repo — the router-cost bug macf#922 existed
- * to fix in the first place, reintroduced by this check's narrow scope.
+ * One GitHub-registered runner's capability-relevant fields (macf#934) — the
+ * `GET .../actions/runners` response trimmed to what {@link isRunnerCapable}
+ * needs. `busy` is carried for DIAGNOSTIC messages only — see that
+ * function's doc for why it is never part of the usability predicate.
  */
-async function checkRepoScopedRunner(repo: string): Promise<Presence> {
+export interface RunnerCapability {
+  /**
+   * GitHub's literal runner status (`'online'` | `'offline'`, and possibly
+   * future values). Kept as `string`, not an enum — this module only ever
+   * branches on the `'online'` literal, and an enum would be ceremony
+   * around two known values plus a floor for values GitHub might add.
+   */
+  readonly status: string;
+  /** NEVER consulted by {@link isRunnerCapable} — see that function's doc. Carried only so a diagnostic message can still report it. */
+  readonly busy: boolean;
+  readonly labels: ReadonlySet<string>;
+}
+
+/**
+ * Whether `runner` can actually CLAIM the jobs `macf-actions`' router
+ * dispatches (macf#934) — the missing half of the register-before-route
+ * gate. Prior to this, `checkRunnerUsableByRepo` asked only "does a runner
+ * usable-in-principle by this repo exist"; this asks the question the
+ * router itself asks when GitHub tries to schedule a job onto a runner. TWO
+ * predicates, BOTH required:
+ *
+ * 1. **`status === 'online'`.** An offline runner satisfies existence,
+ *    scope, visibility, and even a label match, and still cannot pick up a
+ *    job. Exact string equality against `'online'`, never a looser check —
+ *    an unrecognized future status value resolves NOT-capable (the same
+ *    conservative "functional-but-costly" direction Amendment H.1 already
+ *    establishes for the whole gate: a false-negative here costs metered
+ *    minutes, a false-positive silently stops the fleet from routing at
+ *    all), never a silent pass.
+ * 2. **`runner.labels ⊇ requiredLabels`** — SUPERSET, not equality. GitHub
+ *    Actions claims a job iff the runner carries EVERY label the job's
+ *    `runs-on` array declares; a runner missing even one of the router's
+ *    emitted labels never sees the job. A real runner's actual label set
+ *    (`["self-hosted","Linux","X64","macf-vm"]` — GitHub appends OS/arch
+ *    labels automatically) still passes: it is a superset of the two
+ *    labels the router requires, which is exactly what claim-eligibility
+ *    needs.
+ *
+ * **`runner.busy` is DELIBERATELY NOT consulted.** It is throughput, not
+ * capability — a BUSY runner is the HEALTHIEST possible signal (it is
+ * claiming jobs right now). The naive `status === 'online' && !busy`
+ * predicate would score our own live runner (which reads `busy: true`
+ * under ordinary load) as unusable and silently drop the whole fleet onto
+ * metered github-hosted runners on sight — verified against a live read:
+ * `status=online busy=true labels=[self-hosted,Linux,X64,macf-vm]`.
+ */
+export function isRunnerCapable(runner: RunnerCapability, requiredLabels: readonly string[]): boolean {
+  if (runner.status !== 'online') return false;
+  for (const label of requiredLabels) {
+    if (!runner.labels.has(label)) return false;
+  }
+  return true;
+}
+
+/**
+ * Outcome of a repo-scoped runner-list read (macf#934 — replaces the
+ * `Presence`-only `checkRepoScopedRunner`, which could answer "a runner is
+ * registered" but never "a runner can claim a job"). `'ok'` carries EVERY
+ * registered runner's capability fields — an empty array is a confident
+ * zero-runners absence, the same case the old function's `count === 0`
+ * branch covered. `'forbidden'` is a confirmed HTTP 403 (insufficient
+ * permission — verified live: `macf-code-agent`'s token 403s on THIS exact
+ * endpoint while `macf-science-agent`'s succeeds, an `administration: read`
+ * gap that is per-App, not per-bot) so the caller can build a
+ * permission-specific message instead of a generic "could not confirm."
+ * `'unknown'` is every other read failure (network, `gh` missing,
+ * malformed response).
+ */
+export type RepoRunnersOutcome =
+  | { readonly kind: 'ok'; readonly runners: readonly RunnerCapability[] }
+  | { readonly kind: 'forbidden' }
+  | { readonly kind: 'unknown' };
+
+/** Parses one `--jq '[.runners[] | {status, busy, labels: [.labels[].name]}]'` array element; `undefined` on any shape mismatch (defensive — this is untyped JSON off the wire, not a Zod-validated boundary). */
+function parseRunnerCapability(item: unknown): RunnerCapability | undefined {
+  if (typeof item !== 'object' || item === null) return undefined;
+  const { status, busy, labels } = item as { status?: unknown; busy?: unknown; labels?: unknown };
+  if (typeof status !== 'string' || typeof busy !== 'boolean' || !Array.isArray(labels)) return undefined;
+  return { status, busy, labels: new Set(labels.filter((l): l is string => typeof l === 'string')) };
+}
+
+/**
+ * Read-only REPO-SCOPED runner-CAPABILITY read via `gh api
+ * repos/<repo>/actions/runners` (macf#934 — supersedes the count-only
+ * `checkRepoScopedRunner`; the ORIGINAL macf#922 primitive was
+ * `total_count > 0` alone, which conflates "registered" with "usable").
+ * Every runner's `status`/`busy`/`labels` is read in the SAME call the old
+ * function used — {@link isRunnerCapable} is what changed, not the read's
+ * cost or its required permission.
+ *
+ * A confirmed-empty list (zero runners registered) is `{kind: 'ok',
+ * runners: []}` — same "confident absence" contract {@link checkRepoExists}
+ * establishes. A 404 folds into that SAME empty-list outcome (matches the
+ * ORIGINAL macf#922 behaviour, which read a 404 as `'absent'`) — see
+ * {@link checkRunnerUsableByRepo}'s doc for why this repo-scoped leg still
+ * needs an org-scoped fallback regardless of which branch produced the
+ * empty list. A confirmed HTTP 403 is distinguished as `'forbidden'`
+ * (macf#934 — a caller lacking `administration: read` must never read as
+ * "no runner," per the honest-unknown floor); every other failure is
+ * `'unknown'`. NEVER throws.
+ */
+async function listRepoScopedRunners(repo: string): Promise<RepoRunnersOutcome> {
   try {
-    const { stdout } = await execFileAsync('gh', ['api', `repos/${repo}/actions/runners`, '--jq', '.total_count'], {
-      encoding: 'utf-8',
-    });
-    const count = Number.parseInt(stdout.trim(), 10);
-    if (Number.isNaN(count)) return 'unknown';
-    return count > 0 ? 'present' : 'absent';
+    const { stdout } = await execFileAsync(
+      'gh',
+      ['api', `repos/${repo}/actions/runners`, '--jq', '[.runners[] | {status, busy, labels: [.labels[].name]}]'],
+      { encoding: 'utf-8' },
+    );
+    const parsed: unknown = JSON.parse(stdout);
+    if (!Array.isArray(parsed)) return { kind: 'unknown' };
+    const runners: RunnerCapability[] = [];
+    for (const item of parsed) {
+      const capability = parseRunnerCapability(item);
+      if (capability !== undefined) runners.push(capability);
+    }
+    return { kind: 'ok', runners };
   } catch (err) {
     const stderr = getStderr(err);
-    if (/HTTP 404|Not Found/i.test(stderr)) return 'absent';
-    return 'unknown';
+    if (/HTTP 404|Not Found/i.test(stderr)) return { kind: 'ok', runners: [] };
+    if (/HTTP 403|Forbidden/i.test(stderr)) return { kind: 'forbidden' };
+    return { kind: 'unknown' };
   }
 }
 
@@ -222,10 +312,15 @@ interface RunnerGroupRef {
   readonly name: string;
 }
 
+/** One org-registered runner (macf#934 — the org-scope sibling of {@link RunnerCapability}, with the group id {@link checkRunnerUsableByRepo} needs to cross-reference against visible groups). */
+export interface OrgRunnerRecord extends RunnerCapability {
+  readonly runnerGroupId: number;
+}
+
 /**
  * Presence + (when NOT present, and there IS something actionable) the
  * org-admin handover message — the richer sibling of {@link RepoArchivedMeta}
- * for {@link checkRunnerUsableByRepo} (macf#924).
+ * for {@link checkRunnerUsableByRepo} (macf#924; `detail` added macf#934).
  */
 export interface RunnerUsability {
   readonly presence: Presence;
@@ -247,28 +342,39 @@ export interface RunnerUsability {
    * `apply-routing.ts::noRunnerRegisteredReason`'s generic unknown branch).
    */
   readonly handover?: string;
+  /**
+   * A plain diagnostic naming WHY a runner that WAS found isn't usable
+   * (macf#934) — distinct from `handover` (an org-admin GROUP-VISIBILITY
+   * action; this carries no action, just an explanation): "found N
+   * runner(s), online but missing label X" / "found a labeled runner but it
+   * is offline" / "could not read runners for `<repo>` — insufficient
+   * permission." `undefined` when there is nothing to explain: `presence`
+   * is `'present'`, or the resolution found ZERO runners anywhere (the
+   * existing generic "no self-hosted runner is confirmed registered"
+   * wording in `apply-routing.ts::noRunnerRegisteredReason` /
+   * `plan.ts::runnerClassReason` already covers that case correctly — this
+   * field exists for the NEW case those callers previously had no way to
+   * describe: a runner exists but fails the capability check.
+   */
+  readonly detail?: string;
 }
 
 /**
- * Injectable seam for {@link checkRunnerUsableByRepo}'s tests (macf#924) —
- * bundles its 3 independent `gh api` reads so a test can fake any
- * combination of repo-scope / org-groups-visible-to-repo / org-runner-group
- * responses WITHOUT mocking `node:child_process`. This file's usual
- * "gh-shelling fns are exercised only via `computePlan`'s injected-fake
- * `ObservedState` fixtures, not unit-tested directly" posture (see
- * `observer.test.ts`'s doc comment) doesn't scale to a 3-call, multi-branch
- * resolution with a required test matrix (repo-level / org `all` / org
- * `selected`-excluded / org `selected`-included / absent / unreadable) —
- * this is the one exception. `REAL_RUNNER_USABILITY_DEPS` below is the
- * production wiring; {@link checkRepoScopedRunner} keeps this file's
- * established NEVER-throws / 404-is-confident-absent-else-unknown
- * discrimination (unchanged from macf#922), but the two ORG-scope reads
- * below deliberately do NOT — see their fields' docs and
- * `realListRunnerGroupsVisibleToRepo`'s doc for why (macf#924 review).
+ * Injectable seam for {@link checkRunnerUsableByRepo}'s tests (macf#924,
+ * reads enriched macf#934) — bundles its 3 independent `gh api` reads so a
+ * test can fake any combination of repo-scope / org-groups-visible-to-repo /
+ * org-runners responses WITHOUT mocking `node:child_process`. This file's
+ * usual "gh-shelling fns are exercised only via `computePlan`'s
+ * injected-fake `ObservedState` fixtures, not unit-tested directly" posture
+ * (see `observer.test.ts`'s doc comment) doesn't scale to a 3-call,
+ * multi-branch resolution with a required test matrix (repo-level / org
+ * `all` / org `selected`-excluded / org `selected`-included / label-match /
+ * label-miss / offline / forbidden / unreadable) — this is the one
+ * exception. `REAL_RUNNER_USABILITY_DEPS` below is the production wiring.
  */
 export interface RunnerUsabilityDeps {
-  /** The repo-scoped leg — {@link checkRepoScopedRunner}, unchanged from macf#922. */
-  readonly checkRepoScopedRunner: (repo: string) => Promise<Presence>;
+  /** The repo-scoped leg — {@link listRepoScopedRunners} (macf#934; was the `Presence`-only `checkRepoScopedRunner` from macf#922). */
+  readonly listRepoScopedRunners: (repo: string) => Promise<RepoRunnersOutcome>;
   /**
    * Runner GROUPS this specific repo is allowed to use, resolved
    * SERVER-SIDE by GitHub's own `visible_to_repository` query param on `GET
@@ -285,21 +391,25 @@ export interface RunnerUsabilityDeps {
    * permission-driven mask without an independent signal this function
    * doesn't have, and the honest-unknown floor puts the burden of proof on
    * the confident branch. See `realListRunnerGroupsVisibleToRepo`'s doc.
+   * UNCHANGED by macf#934 — label/status capability is orthogonal to GROUP
+   * visibility.
    */
   readonly listRunnerGroupsVisibleToRepo: (org: string, repoName: string) => Promise<ReadonlyArray<RunnerGroupRef> | 'unknown'>;
   /**
-   * Every registered org-level runner's `runner_group_id` (`GET
-   * /orgs/{org}/actions/runners`, NOT filtered by group) — crossed against
+   * Every registered org-level runner, WITH its capability fields (macf#934
+   * — was `listOrgRunnerGroupIds`, group-id-only; a group-id-only read could
+   * confirm "a runner is registered in a visible group" but never "that
+   * runner can claim a job"). Crossed against
    * {@link listRunnerGroupsVisibleToRepo}'s result to answer "is there a
-   * registered runner IN a group this repo can use." Also what lets the
-   * resolution distinguish "no org runner exists at all" (nothing to hand
-   * over) from "an org runner exists but every group holding one excludes
-   * this repo" (hand over to an org admin) — see
+   * CAPABLE registered runner IN a group this repo can use." Also what lets
+   * the resolution distinguish "no org runner exists at all" (nothing to
+   * hand over) from "an org runner exists but every group holding one
+   * excludes this repo" (hand over to an org admin) — see
    * {@link checkRunnerUsableByRepo}'s doc. `'unknown'` on EVERY read
    * failure, including a 404 — same reasoning as
    * {@link listRunnerGroupsVisibleToRepo}'s doc.
    */
-  readonly listOrgRunnerGroupIds: (org: string) => Promise<ReadonlySet<number> | 'unknown'>;
+  readonly listOrgRunners: (org: string) => Promise<ReadonlyArray<OrgRunnerRecord> | 'unknown'>;
 }
 
 /**
@@ -314,7 +424,9 @@ export interface RunnerUsabilityDeps {
  * for an organization" (https://docs.github.com/en/rest/actions/self-hosted-runner-groups
  * — `visible_to_repository` query param, "Only return runner groups that are
  * allowed to be used by this repository"; requires `admin:org` scope for
- * classic PAT/OAuth tokens).
+ * classic PAT/OAuth tokens). UNCHANGED by macf#934 (group visibility, not
+ * capability, is this function's whole job — see the module-level "Preserve
+ * the org-scope leg" note on {@link checkRunnerUsableByRepo}).
  *
  * **Never treats 404 as confident-empty (macf#924 review) — every failure
  * here degrades to `'unknown'`, deliberately UNLIKE this file's other
@@ -349,30 +461,50 @@ async function realListRunnerGroupsVisibleToRepo(org: string, repoName: string):
   }
 }
 
+/** Parses one `--jq '[.runners[] | {runnerGroupId: .runner_group_id, status, busy, labels: [.labels[].name]}]'` array element; `undefined` on any shape mismatch. Sibling of {@link parseRunnerCapability}, with the extra `runnerGroupId` field. */
+function parseOrgRunnerRecord(item: unknown): OrgRunnerRecord | undefined {
+  if (typeof item !== 'object' || item === null) return undefined;
+  const { runnerGroupId, ...rest } = item as { runnerGroupId?: unknown };
+  if (typeof runnerGroupId !== 'number') return undefined;
+  const capability = parseRunnerCapability(rest);
+  if (capability === undefined) return undefined;
+  return { ...capability, runnerGroupId };
+}
+
 /**
- * Real `listOrgRunnerGroupIds` — `GET /orgs/{org}/actions/runners`
- * (org-scoped, unfiltered by group). Verified against GitHub's REST API
- * docs (2026-08): "List self-hosted runners for an organization"
+ * Real `listOrgRunners` — `GET /orgs/{org}/actions/runners` (org-scoped,
+ * unfiltered by group; macf#934 — was `listOrgRunnerGroupIds`, group-id-only;
+ * now ALSO reads `status`/`busy`/`labels` in the SAME call, no extra
+ * request). Verified against GitHub's REST API docs (2026-08): "List
+ * self-hosted runners for an organization"
  * (https://docs.github.com/en/rest/actions/self-hosted-runners) — each
- * runner object carries a `runner_group_id` integer field; requires
- * `admin:org` scope. Deliberately does NOT paginate past the default page
- * (same posture as {@link checkRepoScopedRunner}'s `.total_count` read,
- * which reads page 1 only) — a judgment call for typical small bootstrap
- * fleets, noted here rather than silently assumed.
+ * runner object carries a `runner_group_id` integer field alongside
+ * `status`/`busy`/`labels`; requires `admin:org` scope. Deliberately does
+ * NOT paginate past the default page (same posture as
+ * {@link listRepoScopedRunners}'s read, which reads page 1 only) — a
+ * judgment call for typical small bootstrap fleets, noted here rather than
+ * silently assumed.
  *
  * **Never treats 404 as confident-empty — same reasoning as
  * {@link realListRunnerGroupsVisibleToRepo}'s doc** (macf#924 review): this
  * function has no independent way to tell "no such org" apart from a
  * permission-driven mask, so every failure degrades to `'unknown'`.
  */
-async function realListOrgRunnerGroupIds(org: string): Promise<ReadonlySet<number> | 'unknown'> {
+async function realListOrgRunners(org: string): Promise<ReadonlyArray<OrgRunnerRecord> | 'unknown'> {
   try {
-    const { stdout } = await execFileAsync('gh', ['api', `orgs/${org}/actions/runners`, '--jq', '[.runners[].runner_group_id]'], {
-      encoding: 'utf-8',
-    });
+    const { stdout } = await execFileAsync(
+      'gh',
+      ['api', `orgs/${org}/actions/runners`, '--jq', '[.runners[] | {runnerGroupId: .runner_group_id, status, busy, labels: [.labels[].name]}]'],
+      { encoding: 'utf-8' },
+    );
     const parsed: unknown = JSON.parse(stdout);
     if (!Array.isArray(parsed)) return 'unknown';
-    return new Set(parsed.filter((x): x is number => typeof x === 'number'));
+    const runners: OrgRunnerRecord[] = [];
+    for (const item of parsed) {
+      const record = parseOrgRunnerRecord(item);
+      if (record !== undefined) runners.push(record);
+    }
+    return runners;
   } catch {
     return 'unknown';
   }
@@ -380,9 +512,9 @@ async function realListOrgRunnerGroupIds(org: string): Promise<ReadonlySet<numbe
 
 /** Production wiring for {@link RunnerUsabilityDeps} — real `gh api` calls. */
 export const REAL_RUNNER_USABILITY_DEPS: RunnerUsabilityDeps = {
-  checkRepoScopedRunner,
+  listRepoScopedRunners,
   listRunnerGroupsVisibleToRepo: realListRunnerGroupsVisibleToRepo,
-  listOrgRunnerGroupIds: realListOrgRunnerGroupIds,
+  listOrgRunners: realListOrgRunners,
 };
 
 /** Splits `"owner/repo"` into its two parts; `undefined` on any unexpected shape — defensive (schema only enforces `min(1)`, no `owner/repo` regex), and this function must NEVER throw. */
@@ -411,57 +543,141 @@ function buildRunnerHandoverMessage(repo: string, org: string, excludedGroupIdsW
 }
 
 /**
+ * The permission-specific `detail` for a confirmed HTTP 403 on the
+ * repo-scoped runner list (macf#934) — named distinctly from a generic
+ * "could not confirm" so the operator looks at the RIGHT thing (an App
+ * permission grant) instead of chasing a runner that may well exist and be
+ * healthy.
+ */
+function permissionDeniedDetail(repo: string): string {
+  return (
+    `could not read runners for "${repo}" — insufficient permission (HTTP 403; the App's installation token ` +
+    'needs "administration: read" on this repo to list its registered runners — verified per-App, not per-bot: ' +
+    'the same endpoint 200s for a differently-permissioned App on the same fleet; macf#934).'
+  );
+}
+
+/**
+ * Builds the "a runner was found but isn't capable" `detail` (macf#934) —
+ * distinguishes an ONLINE-but-mislabeled runner from a LABEL-MATCHING-but-
+ * OFFLINE one, since they point the operator at different fixes (relabel
+ * the runner vs restart its service). Prefers the label-match-but-offline
+ * explanation when both shapes are present in `runners`, since an offline
+ * service is the more actionable/likely-transient fix. `runners` must be
+ * non-empty — callers only reach this after confirming at least one runner
+ * was found and none is capable (see {@link isRunnerCapable}).
+ */
+function runnerIncapableDetail(repo: string, runners: readonly RunnerCapability[]): string {
+  const offlineButLabeled = runners.find((r) => r.status !== 'online' && ROUTER_EMITTED_LABELS.every((label) => r.labels.has(label)));
+  if (offlineButLabeled !== undefined) {
+    return (
+      `a runner registered for "${repo}" carries the required labels (${ROUTER_EMITTED_LABELS.join(', ')}) but is ` +
+      `offline (status="${offlineButLabeled.status}") — register-before-route requires it ONLINE.`
+    );
+  }
+  const onlineButMislabeled = runners.find((r) => r.status === 'online');
+  if (onlineButMislabeled !== undefined) {
+    const missing = ROUTER_EMITTED_LABELS.filter((label) => !onlineButMislabeled.labels.has(label));
+    const found = [...onlineButMislabeled.labels].sort().join(', ') || '(none)';
+    return (
+      `a runner registered for "${repo}" is online but not carrying required label(s) "${missing.join(', ')}" ` +
+      `(carries: ${found}).`
+    );
+  }
+  return (
+    `${String(runners.length)} runner(s) registered for "${repo}", none online and none carrying every required ` +
+    `label (${ROUTER_EMITTED_LABELS.join(', ')}).`
+  );
+}
+
+/**
  * Whether a self-hosted runner is REGISTERED and USABLE BY `repo` — the
  * register-before-route gate (macf#922), corrected for the org-runner-blind
- * cost regression (macf#923/#924). {@link checkRepoScopedRunner} alone
- * cannot see an ORG-level runner (GitHub's documented "usable by multiple
- * repositories in an organization" registration model has no per-repo
- * registration at all) — an org fleet with one working org runner read
- * `total_count: 0` there, scored `absent`, and `apply` silently fell back
- * to metered github-hosted Actions minutes on a private repo.
+ * cost regression (macf#923/#924), corrected AGAIN to actually check runner
+ * CAPABILITY (macf#934). The gate used to ask only "does a runner usable by
+ * this repo exist" — it never asked whether that runner could CLAIM the
+ * jobs the router dispatches. Latent while every runner happened to carry
+ * `macf-vm` by convention; unmasked the moment a caller's declared/
+ * provisioned labels diverge, or a runner goes offline.
  *
- * **The invariant asserted here is "usable by THIS repo," not "exists
- * somewhere."** An org runner can be online and registered while its
- * runner-GROUP's visibility (`all` / `selected` / `private`) excludes this
- * specific repo — reporting `present` for ANY org runner regardless of
- * group visibility would be the MIRROR-IMAGE bug (trusting a runner that
- * will never pick up this repo's jobs). Group-visibility resolution is
- * delegated to GitHub's own `visible_to_repository` query param
- * ({@link RunnerUsabilityDeps.listRunnerGroupsVisibleToRepo}) rather than
- * re-implemented here.
+ * **The invariant asserted here is "CAN CLAIM a routed job," not "exists
+ * somewhere" and not "is registered."** Three failure directions, all real:
+ * (1) {@link listRepoScopedRunners} alone cannot see an ORG-level runner
+ * (GitHub's documented "usable by multiple repositories in an organization"
+ * registration model has no per-repo registration at all — macf#923/#924);
+ * (2) an org runner's runner-GROUP visibility can exclude this repo even
+ * while the runner itself is healthy (macf#924); (3) a runner found at
+ * EITHER scope can be offline, or online but missing a label the router's
+ * job declaration requires (macf#934 — see {@link isRunnerCapable}).
+ * Reporting `present` on any weaker signal than "found AND capable" is the
+ * SAME shape of bug each time: trusting a proxy that looks like usability
+ * but isn't (Amendment H.1's framing, applied here to the runner's own
+ * fields instead of the token that gates *attempting* detection).
  *
- * Resolution order: (1) repo-scoped registration (unchanged from #922 — the
- * common case, and the ONLY leg that doesn't need `admin:org`); (2) only if
- * NOT present at repo scope, org-scope usability. Any unreadable org-scope
- * leg (403 for missing `admin:org`, network, `gh` missing) degrades the
- * WHOLE resolution to `'unknown'` — Amendment A's honest-unknown floor: a
- * permission gap is not evidence of absence (macf#924 requirement 4). NEVER
- * throws.
+ * Resolution order, PRESERVED from macf#922/#924 (this file's org-scope leg
+ * — group resolution via `visible_to_repository` — is UNCHANGED by
+ * macf#934; only the CAPABILITY predicate applied at each scope is new):
+ * (1) repo-scoped runners (the common case, and the ONLY leg that doesn't
+ * need `admin:org`) — `present` the moment ANY repo-scoped runner is
+ * capable; (2) only if repo scope found no capable runner, org-scope
+ * usability — `present` the moment ANY org runner in a group visible to
+ * this repo is capable. A confirmed HTTP 403 on the repo-scoped leg does
+ * NOT short-circuit to `'unknown'` — it still falls through to the org-scope
+ * leg (a 403 on ONE leg is not evidence the OTHER leg is unreadable; a
+ * fleet whose token can read org-level runners but not repo-level ones must
+ * still resolve `present` off a usable org runner, same as macf#924 — see
+ * this function's own tests for the regression this preserves). Any
+ * unreadable org-scope leg (403 for missing `admin:org`, network, `gh`
+ * missing) degrades the WHOLE resolution to `'unknown'` — Amendment A's
+ * honest-unknown floor: a permission gap is not evidence of absence
+ * (macf#924 requirement 4). NEVER throws.
  */
 export async function checkRunnerUsableByRepo(repo: string, deps: RunnerUsabilityDeps = REAL_RUNNER_USABILITY_DEPS): Promise<RunnerUsability> {
-  const repoScope = await deps.checkRepoScopedRunner(repo);
-  if (repoScope === 'present') return { presence: 'present' };
+  const repoOutcome = await deps.listRepoScopedRunners(repo);
+  if (repoOutcome.kind === 'ok' && repoOutcome.runners.some((r) => isRunnerCapable(r, ROUTER_EMITTED_LABELS))) {
+    return { presence: 'present' };
+  }
 
   const split = splitOwnerRepo(repo);
   if (split === undefined) return { presence: 'unknown' };
 
-  const [visibleGroups, orgRunnerGroupIds] = await Promise.all([
+  const [visibleGroups, orgRunners] = await Promise.all([
     deps.listRunnerGroupsVisibleToRepo(split.owner, split.name),
-    deps.listOrgRunnerGroupIds(split.owner),
+    deps.listOrgRunners(split.owner),
   ]);
-  if (visibleGroups === 'unknown' || orgRunnerGroupIds === 'unknown') return { presence: 'unknown' };
+  if (visibleGroups === 'unknown' || orgRunners === 'unknown') {
+    // repoOutcome may still have something worth explaining (found-but-
+    // incapable runners, or a 403) even though the OVERALL answer is
+    // 'unknown' — surface it rather than a bare "could not confirm."
+    return { presence: 'unknown', detail: repoOutcomeDetail(repo, repoOutcome) };
+  }
 
   const visibleIds = new Set(visibleGroups.map((g) => g.id));
-  if ([...orgRunnerGroupIds].some((id) => visibleIds.has(id))) return { presence: 'present' };
+  const visibleOrgRunners = orgRunners.filter((r) => visibleIds.has(r.runnerGroupId));
+  if (visibleOrgRunners.some((r) => isRunnerCapable(r, ROUTER_EMITTED_LABELS))) {
+    return { presence: 'present' };
+  }
 
-  // repoScope is 'absent' or 'unknown' here (the 'present' case returned
-  // above); org-scope found nothing usable either. An 'unknown' repo-scope
-  // leg keeps the OVERALL answer 'unknown' even though org-scope is
-  // confirmed — we still can't rule out a repo-level runner we failed to read.
-  const overallPresence: Presence = repoScope === 'unknown' ? 'unknown' : 'absent';
-  const excludedGroupIdsWithRunners = new Set([...orgRunnerGroupIds].filter((id) => !visibleIds.has(id)));
-  if (excludedGroupIdsWithRunners.size === 0) return { presence: overallPresence };
-  return { presence: overallPresence, handover: buildRunnerHandoverMessage(repo, split.owner, excludedGroupIdsWithRunners) };
+  // Neither leg found a CAPABLE runner. repoOutcome is 'ok'-with-no-capable-
+  // runner, 'forbidden', or 'unknown' here (the 'ok'-with-capable case
+  // returned above) — an 'ok' outcome keeps the repo-scope contribution
+  // 'absent' (confirmed, even if empty); 'forbidden'/'unknown' keep it
+  // 'unknown', preserving macf#924's "a permission gap is not evidence of
+  // absence" floor at the OVERALL level too.
+  const repoScopePresence: Presence = repoOutcome.kind === 'ok' ? 'absent' : 'unknown';
+  const overallPresence: Presence = repoScopePresence === 'unknown' ? 'unknown' : 'absent';
+  const detail = repoOutcomeDetail(repo, repoOutcome) ?? (visibleOrgRunners.length > 0 ? runnerIncapableDetail(repo, visibleOrgRunners) : undefined);
+
+  const excludedGroupIdsWithRunners = new Set(orgRunners.filter((r) => !visibleIds.has(r.runnerGroupId)).map((r) => r.runnerGroupId));
+  if (excludedGroupIdsWithRunners.size === 0) return { presence: overallPresence, detail };
+  return { presence: overallPresence, detail, handover: buildRunnerHandoverMessage(repo, split.owner, excludedGroupIdsWithRunners) };
+}
+
+/** The `detail` contribution from the repo-scoped leg alone — `undefined` when there is nothing repo-scope-specific to explain (zero runners found, or the leg is a plain unreadable with no permission signal). Factored out of {@link checkRunnerUsableByRepo} so both its early-return-avoided branches build the SAME message for the SAME repo-scope outcome. */
+function repoOutcomeDetail(repo: string, outcome: RepoRunnersOutcome): string | undefined {
+  if (outcome.kind === 'forbidden') return permissionDeniedDetail(repo);
+  if (outcome.kind === 'ok' && outcome.runners.length > 0) return runnerIncapableDetail(repo, outcome.runners);
+  return undefined;
 }
 
 /**
@@ -696,6 +912,10 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     manifest.routing?.runner && representativeCallerRepo !== undefined ? await checkRunnerUsableByRepo(representativeCallerRepo) : undefined;
   const routingRunnerRegistered = routingRunnerUsability?.presence;
   const routingRunnerHandover = routingRunnerUsability?.handover;
+  // macf#934 — the capability diagnostic (found-but-offline /
+  // found-but-mislabeled / permission-denied); see `RunnerUsability.detail`'s
+  // doc for why this is a NEW field, not folded into `routingRunnerHandover`.
+  const routingRunnerDetail = routingRunnerUsability?.detail;
 
   // DR-043 Amendment G — same derived name `control-repo.ts::controlRepoFullName`
   // computes; see this function's doc for why it's re-derived here rather
@@ -711,6 +931,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     routingTrustedActors,
     routingRunnerRegistered,
     routingRunnerHandover,
+    routingRunnerDetail,
     controlRepoPresence: controlRepoMeta.presence,
     controlRepoArchived: controlRepoMeta.archived,
   };
