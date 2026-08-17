@@ -71,8 +71,8 @@ import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/ap
 import { readVault, vaultAgentPrivateKeyPem } from '../bootstrap/vault-read.js';
 import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
-import type { AppNameLengthCheck } from '../bootstrap/apply-runner-registrar.js';
-import { RUNNER_REGISTRAR_ROLE, buildRunnerRegistrarManifest, checkAppNameLengths, deriveRunnerRegistrarHandle } from '../bootstrap/apply-runner-registrar.js';
+import type { AppNameLengthCheck } from '../bootstrap/apply-runner-ops.js';
+import { RUNNER_OPS_ROLE, buildRunnerOpsManifest, checkAppNameLengths, deriveRunnerOpsHandle } from '../bootstrap/apply-runner-ops.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -200,27 +200,27 @@ export function plannedAppCreations(
     });
   }
 
-  // groundnuty/macf#943 — the runner-registrar App, a fleet-level `create`
-  // candidate (`plan.ts::runnerRegistrarItem`), rendered here so the SAME
+  // groundnuty/macf#943 — the runner-ops App, a fleet-level `create`
+  // candidate (`plan.ts::runnerOpsItem`), rendered here so the SAME
   // "exact manifest sent" preview every agent App already gets also covers
   // this one (its 3-permission set, its scoped-install caveat) BEFORE the
   // operator spends the two consent-gate clicks. `repo: ''` — this App has
   // no home repo; `formatPlannedAppCreations` below renders it as `(fleet-
   // level, no home repo)` rather than an empty string.
-  const runnerRegistrarCreating = plan.items.some((i) => i.kind === 'runner_registrar' && i.verb === 'create');
-  if (runnerRegistrarCreating) {
+  const runnerOpsCreating = plan.items.some((i) => i.kind === 'runner_ops' && i.verb === 'create');
+  if (runnerOpsCreating) {
     // Same homepage the REAL apply path will submit (`apply-fleet.ts`'s
     // `repoHomepageUrl(controlRepo.repo)`) — derived without any I/O since
     // both `owner.account` and the control-repo NAME are pure functions of
     // the manifest (`deriveControlRepoName`), so the preview and the real
     // submission never diverge on this field.
     const rrHomepage = repoHomepageUrl(`${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`);
-    const rrManifest = buildRunnerRegistrarManifest(manifest.metadata.name, redirectUrl, rrHomepage);
+    const rrManifest = buildRunnerOpsManifest(manifest.metadata.name, redirectUrl, rrHomepage);
     out.push({
-      role: RUNNER_REGISTRAR_ROLE,
+      role: RUNNER_OPS_ROLE,
       repo: '',
       manifest: rrManifest,
-      installUrl: appInstallationUrl(deriveRunnerRegistrarHandle(manifest.metadata.name)),
+      installUrl: appInstallationUrl(deriveRunnerOpsHandle(manifest.metadata.name)),
     });
   }
 
@@ -237,21 +237,21 @@ export function formatPlannedAppCreations(creations: readonly PlannedAppCreation
     '',
   ];
   for (const c of creations) {
-    // groundnuty/macf#943 — the runner-registrar has no home repo (`c.repo === ''`).
+    // groundnuty/macf#943 — the runner-ops has no home repo (`c.repo === ''`).
     parts.push(`  • ${c.manifest.name}   (role: ${c.role}, home repo: ${c.repo === '' ? '(fleet-level, no home repo)' : c.repo})`);
     const perms = Object.entries(c.manifest.default_permissions)
       .map(([k, v]) => `${k}:${v}`)
       .join(', ');
-    // groundnuty/macf#943 — the runner-registrar's set is DR-019-DISJOINT by
-    // design (see `apply-runner-registrar.ts::RUNNER_REGISTRAR_PERMISSIONS`'s
+    // groundnuty/macf#943 — the runner-ops's set is DR-019-DISJOINT by
+    // design (see `apply-runner-ops.ts::RUNNER_OPS_PERMISSIONS`'s
     // doc); labeling it "(DR-019)" here would misrepresent it as the derived
     // agent set.
-    const permsLabel = c.role === RUNNER_REGISTRAR_ROLE ? 'permissions (runner-registrar, ONE-WAY RATCHET — never widen)' : 'permissions (DR-019)';
+    const permsLabel = c.role === RUNNER_OPS_ROLE ? 'permissions (runner-ops, ONE-WAY RATCHET — never widen)' : 'permissions (DR-019)';
     parts.push(`      ${permsLabel}: ${perms}`);
     parts.push(`      events: ${c.manifest.default_events.join(', ')}`);
     parts.push(`      public: ${String(c.manifest.public)}   webhook active: ${String(c.manifest.hook_attributes.active)}`);
     parts.push(`      consent gate 2 (install, after gate 1 creates the App): ${c.installUrl}`);
-    if (c.role === RUNNER_REGISTRAR_ROLE) {
+    if (c.role === RUNNER_OPS_ROLE) {
       parts.push('      ⚠ on the install page: choose "Only select repositories" and pick exactly this fleet\'s repos — NEVER "All repositories".');
     }
   }
@@ -679,8 +679,8 @@ function formatControlRepoSyncLine(sync: ControlRepoSyncOutcome): string {
 
 /**
  * One identity's status line — shared by `agentSummaryLines` (below, per
- * declared coordination agent) and `runnerRegistrarSummaryLines` (groundnuty/
- * macf#943, the fleet-level runner-registrar App) since both render the
+ * declared coordination agent) and `runnerOpsSummaryLines` (groundnuty/
+ * macf#943, the fleet-level runner-ops App) since both render the
  * IDENTICAL `AgentApplyOutcome` union produced by the SAME `applyIdentity`
  * primitive. Extracted rather than duplicated (macf#943 task requirement).
  */
@@ -701,9 +701,9 @@ function formatIdentityLine(role: string, id: AgentApplyOutcome): string {
   }
 }
 
-/** Runner-registrar App render (groundnuty/macf#943) — its own labeled section, NOT folded into `agentSummaryLines`'s "Agent identities:" list (it isn't a declared coordination agent; see `FleetApplyResult.runnerRegistrar`'s doc). Never a credential value — `formatIdentityLine` reads only status/id/reason fields, same as every agent's render. */
-function runnerRegistrarSummaryLines(result: FleetApplyResult): string[] {
-  return [`Runner-registrar App:`, formatIdentityLine('runner-registrar', result.runnerRegistrar)];
+/** Runner-ops App render (groundnuty/macf#943) — its own labeled section, NOT folded into `agentSummaryLines`'s "Agent identities:" list (it isn't a declared coordination agent; see `FleetApplyResult.runnerOps`'s doc). Never a credential value — `formatIdentityLine` reads only status/id/reason fields, same as every agent's render. */
+function runnerOpsSummaryLines(result: FleetApplyResult): string[] {
+  return [`Runner-ops App:`, formatIdentityLine('runner-ops', result.runnerOps)];
 }
 
 function agentSummaryLines(result: FleetApplyResult): string[] {
@@ -800,7 +800,7 @@ export function formatApplyResult(result: FleetApplyResult, unimplemented: reado
   const parts: string[] = [
     `Control repo: ${formatControlRepoLine(result)}`,
     '',
-    ...runnerRegistrarSummaryLines(result),
+    ...runnerOpsSummaryLines(result),
     '',
     'Agent identities:',
     ...agentSummaryLines(result),
@@ -880,8 +880,8 @@ export function fleetApplyResultToJson(result: FleetApplyResult, unimplemented: 
     // groundnuty/macf#943 — same `redactIdentity` conversion every agent's
     // identity goes through (never a credential value; see that function's
     // doc). Separate top-level key, not folded into `agents` — matches
-    // `FleetApplyResult.runnerRegistrar` being its own field.
-    runner_registrar: redactIdentity(result.runnerRegistrar),
+    // `FleetApplyResult.runnerOps` being its own field.
+    runner_ops: redactIdentity(result.runnerOps),
     agents: result.agents.map((rec) => ({ role: rec.role, identity: redactIdentity(rec.identity), repo_init: rec.repoInit ?? null })),
     vault: result.vault,
     lock_path: result.lockPath,
@@ -913,7 +913,7 @@ export function fleetApplyResultToJson(result: FleetApplyResult, unimplemented: 
  * three cases), OR the final control-repo sync failed (durable-locally-but-
  * not-pushed is still an operator-attention state), OR ANY agent needs
  * operator attention (failed/drift/skipped-unverified/repo-init-failed), OR
- * the runner-registrar App needs operator attention (groundnuty/macf#943 —
+ * the runner-ops App needs operator attention (groundnuty/macf#943 —
  * same failed/drift/skipped-unverified bar as an agent), OR the vault write
  * failed.
  */
@@ -928,10 +928,10 @@ export function applyExitCode(result: FleetApplyResult): number {
       rec.identity.status === 'skipped-unverified' ||
       rec.repoInit?.status === 'failed',
   );
-  const runnerRegistrarBad =
-    result.runnerRegistrar.status === 'failed' ||
-    result.runnerRegistrar.status === 'drift' ||
-    result.runnerRegistrar.status === 'skipped-unverified';
+  const runnerOpsBad =
+    result.runnerOps.status === 'failed' ||
+    result.runnerOps.status === 'drift' ||
+    result.runnerOps.status === 'skipped-unverified';
   // DR-043 Amendment D phase 2 (macf#838) — a CA resolve failure or ANY
   // publish-leg failure needs operator attention, same bar as an agent
   // failure. A 'skipped' leg does NOT independently fail the run here — it
@@ -953,7 +953,7 @@ export function applyExitCode(result: FleetApplyResult): number {
   return controlRepoBad ||
     controlRepoSyncBad ||
     agentBad ||
-    runnerRegistrarBad ||
+    runnerOpsBad ||
     result.vault.status === 'failed' ||
     caBad ||
     routingBad ||
@@ -1029,7 +1029,7 @@ export async function runBootstrapApply(
   // possible (right after the manifest parses, before ANY observe/plan/
   // consent-gate work — including `--dry-run`, which would otherwise render
   // a plan for App names GitHub will reject at submission). `applyFleet`
-  // itself re-derives this SAME check (`apply-runner-registrar.ts::checkAppNameLengths`)
+  // itself re-derives this SAME check (`apply-runner-ops.ts::checkAppNameLengths`)
   // as its own first statement, so this CLI-level refusal is a fast-path,
   // not the only enforcement point — see that module's doc for why both
   // exist. Ordered BEFORE the macf#932 token pre-flight: a name GitHub will

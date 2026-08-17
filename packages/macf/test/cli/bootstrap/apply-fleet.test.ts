@@ -633,14 +633,14 @@ describe('applyFleet', () => {
     // THREE encrypt calls now (groundnuty/macf#943 added the third): the
     // pre-gate-2 recovery artifact for 'code-agent' (DR-043 §D5
     // durable-before-gate-2) fires first (inside the per-agent loop), THEN
-    // the runner-registrar's OWN recovery artifact (it also takes the
+    // the runner-ops's OWN recovery artifact (it also takes the
     // no-prior-lock-entry CREATE path via this same shared `agentDeps`
-    // fixture — see `apply-fleet.ts`'s "runner-registrar" step, which runs
+    // fixture — see `apply-fleet.ts`'s "runner-ops" step, which runs
     // right after the per-agent loop), THEN the batched final vault —
     // asserted by ORDER, not just presence, so this doesn't just infer the
-    // sequencing from the loop structure. The registrar's OWN identity ends
+    // sequencing from the loop structure. The runner-ops credential's OWN identity ends
     // up 'failed' (this fixture's `waitForAppInstallation` doesn't return
-    // `repositorySelection: 'selected'` — `validateRunnerRegistrarInstall`
+    // `repositorySelection: 'selected'` — `validateRunnerOpsInstall`
     // rejects it), so it contributes NO lock/vault entry — only its
     // recovery artifact, exactly like a `created`-then-gate-2-failed agent
     // would (see `apply-agent.ts`'s "gate 1→2 window" doc).
@@ -649,16 +649,16 @@ describe('applyFleet', () => {
     const recoveryCalls = encryptCalls.filter((c) => c.outPath.includes('recovery'));
     const finalVaultCall = encryptCalls.find((c) => !c.outPath.includes('recovery'));
     const codeAgentRecoveryCall = recoveryCalls.find((c) => c.outPath.includes('code-agent'));
-    const runnerRegistrarRecoveryCall = recoveryCalls.find((c) => c.outPath.includes('runner-registrar'));
+    const runnerOpsRecoveryCall = recoveryCalls.find((c) => c.outPath.includes('runner-ops'));
     expect(codeAgentRecoveryCall?.outPath).toMatch(/secrets[/\\]recovery[/\\]code-agent\.age$/);
     expect(codeAgentRecoveryCall?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_ID');
-    expect(runnerRegistrarRecoveryCall?.outPath).toMatch(/secrets[/\\]recovery[/\\]runner-registrar\.age$/);
+    expect(runnerOpsRecoveryCall?.outPath).toMatch(/secrets[/\\]recovery[/\\]runner-ops\.age$/);
     expect(finalVaultCall?.plaintext).toContain('CODE_AGENT'); // the freshly-created agent's segment
     expect(finalVaultCall?.plaintext).not.toContain('SCIENCE_AGENT_CLIENT_SECRET'); // reused agent contributes NO fresh secret
-    expect(finalVaultCall?.plaintext).not.toContain('MACF_RUNNER_REGISTRAR_'); // failed gate-2 -> never folded into the final vault
+    expect(finalVaultCall?.plaintext).not.toContain('MACF_RUNNER_OPS_'); // failed gate-2 -> never folded into the final vault
 
     const lock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
-    // The runner-registrar's FAILED identity never gets a lock entry (only
+    // The runner-ops's FAILED identity never gets a lock entry (only
     // `created`/`reused`/`resumed-install` do) — `lock.agents` stays exactly
     // the two coordination agents, unchanged by groundnuty/macf#943.
     expect(lock.agents.map((a) => a.role).sort()).toEqual(['code-agent', 'science-agent']);
@@ -1739,10 +1739,10 @@ trust:
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT]);
       // groundnuty/macf#943 — this test's own focus is agent routability, not
-      // the runner-registrar; the SAME shared `agentDepsFor` fixture also
-      // drives the registrar's gate 2 (it takes the identical no-prior-lock
-      // CREATE path). `repositorySelection: 'selected'` lets the registrar
-      // ALSO resolve cleanly instead of failing `validateRunnerRegistrarInstall`
+      // the runner-ops; the SAME shared `agentDepsFor` fixture also
+      // drives the runner-ops credential's gate 2 (it takes the identical no-prior-lock
+      // CREATE path). `repositorySelection: 'selected'` lets the runner-ops credential
+      // ALSO resolve cleanly instead of failing `validateRunnerOpsInstall`
       // — an unrelated failure there must not spuriously flip THIS test's
       // "green exit ⇒ routable" assertion below.
       const codeAgentDeps: AgentApplyDeps = {
@@ -1826,9 +1826,9 @@ trust:
     });
   });
 
-  // --- The runner-registrar App (groundnuty/macf#943) ---
+  // --- The runner-ops App (groundnuty/macf#943) ---
 
-  describe('the runner-registrar App (groundnuty/macf#943)', () => {
+  describe('the runner-ops App (groundnuty/macf#943)', () => {
     it('creates it with EXACTLY the three permissions (asserts the manifest actually SENT, not just that a call happened)', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT]);
@@ -1858,7 +1858,7 @@ trust:
 
       await applyFleet(manifest, manifestPath, null, deps);
 
-      const rrManifest = capturedManifests.find((m) => m.name === 'demo-fleet-runner-registrar');
+      const rrManifest = capturedManifests.find((m) => m.name === 'demo-fleet-runner-ops');
       expect(rrManifest).toBeDefined();
       // The exact three permissions — no more, no fewer.
       expect(rrManifest?.permissions).toEqual({ administration: 'write', actions: 'read', metadata: 'read' });
@@ -1890,12 +1890,12 @@ trust:
 
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
-      expect(result.runnerRegistrar.status).toBe('failed');
-      if (result.runnerRegistrar.status === 'failed') {
-        expect(result.runnerRegistrar.reason).toMatch(/repository_selection must be "selected"/);
-        expect(result.runnerRegistrar.reason).toMatch(/"all"/);
+      expect(result.runnerOps.status).toBe('failed');
+      if (result.runnerOps.status === 'failed') {
+        expect(result.runnerOps.reason).toMatch(/repository_selection must be "selected"/);
+        expect(result.runnerOps.reason).toMatch(/"all"/);
       }
-      // The failure is scoped to the registrar — the CODE-AGENT still
+      // The failure is scoped to the runner-ops credential — the CODE-AGENT still
       // succeeds (this fixture's `waitForAppInstallation` returns
       // `repositorySelection: 'all'` for EVERY caller, but the agent path
       // never consults that field at all).
@@ -1908,9 +1908,9 @@ trust:
       const priorLock: FleetLock = {
         schema_version: 1,
         fleet: 'demo-fleet',
-        agents: [{ role: 'runner-registrar', app_id: 'app-runner-registrar', install_id: 'install-rr' }],
+        agents: [{ role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-rr' }],
       };
-      let startManifestFlowCalledForRunnerRegistrar = false;
+      let startManifestFlowCalledForRunnerOps = false;
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         buildAgentDeps: (log) => ({
@@ -1918,7 +1918,7 @@ trust:
           log,
           startManifestFlow: async (opts) => {
             const built = opts.buildManifest('http://x/callback');
-            if (built.name === 'demo-fleet-runner-registrar') startManifestFlowCalledForRunnerRegistrar = true;
+            if (built.name === 'demo-fleet-runner-ops') startManifestFlowCalledForRunnerOps = true;
             return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
           },
         }),
@@ -1932,10 +1932,10 @@ trust:
       // `skip-unverified`, NOT a live re-confirm. The load-bearing assertion
       // either way: gate 1 is NEVER opened a second time for an App that
       // already has a recorded identity.
-      expect(result.runnerRegistrar.status).toBe('skipped-unverified');
-      expect(startManifestFlowCalledForRunnerRegistrar).toBe(false);
-      if (result.runnerRegistrar.status === 'skipped-unverified') {
-        expect(result.runnerRegistrar.appId).toBe('app-runner-registrar');
+      expect(result.runnerOps.status).toBe('skipped-unverified');
+      expect(startManifestFlowCalledForRunnerOps).toBe(false);
+      if (result.runnerOps.status === 'skipped-unverified') {
+        expect(result.runnerOps.appId).toBe('app-runner-ops');
       }
     });
 
@@ -1964,28 +1964,28 @@ trust:
 
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
-      expect(result.runnerRegistrar.status).toBe('created');
+      expect(result.runnerOps.status).toBe('created');
       // `agentDepsFor('code-agent', 'created', ...)`'s shared `exchangeManifestCode`
       // is role-agnostic (returns `creds('code-agent')` for ANY caller,
-      // including the runner-registrar step) — so the credential the
-      // registrar receives in THIS fixture carries the code-agent sentinel.
+      // including the runner-ops step) — so the credential the
+      // runner-ops credential receives in THIS fixture carries the code-agent sentinel.
       // What matters for this test is that whichever sentinel it carries
       // never leaks, regardless of which one it is.
-      const runnerRegistrarPemSentinel = 'SENTINEL-PEM-code-agent';
-      // The credential DOES flow through `result.runnerRegistrar.credentials`
+      const runnerOpsPemSentinel = 'SENTINEL-PEM-code-agent';
+      // The credential DOES flow through `result.runnerOps.credentials`
       // in-process (needed for the vault fold) — the property under test is
       // that it NEVER reaches a rendered/logged surface.
-      if (result.runnerRegistrar.status === 'created') {
-        expect(result.runnerRegistrar.credentials.pem).toBe(runnerRegistrarPemSentinel);
+      if (result.runnerOps.status === 'created') {
+        expect(result.runnerOps.credentials.pem).toBe(runnerOpsPemSentinel);
       }
       const joinedLogs = logs.join('\n');
-      expect(joinedLogs).not.toContain(runnerRegistrarPemSentinel);
+      expect(joinedLogs).not.toContain(runnerOpsPemSentinel);
       expect(joinedLogs).not.toContain('SENTINEL-SECRET-code-agent');
       expect(joinedLogs).not.toContain('SENTINEL-HOOK-code-agent');
       const humanText = formatApplyResult(result, []);
-      expect(humanText).not.toContain(runnerRegistrarPemSentinel);
+      expect(humanText).not.toContain(runnerOpsPemSentinel);
       const jsonText = JSON.stringify(fleetApplyResultToJson(result, []));
-      expect(jsonText).not.toContain(runnerRegistrarPemSentinel);
+      expect(jsonText).not.toContain(runnerOpsPemSentinel);
       expect(jsonText).not.toContain('SENTINEL-SECRET-code-agent');
       expect(jsonText).not.toContain('SENTINEL-HOOK-code-agent');
     });
@@ -1998,7 +1998,7 @@ trust:
       // regardless of caller — override it to return DIFFERENT creds per
       // role, keyed off what gate 1's OWN `buildManifest` actually named
       // (the one place the caller's role is genuinely observable), so gate
-      // 2's `appId` differs between the agent and the registrar and this
+      // 2's `appId` differs between the agent and the runner-ops credential and this
       // test can tell their events apart.
       let lastGate1Name = '';
       const agentDeps: AgentApplyDeps = {
@@ -2007,7 +2007,7 @@ trust:
           lastGate1Name = opts.buildManifest('http://x/callback').name;
           return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
         },
-        exchangeManifestCode: async () => creds(lastGate1Name === 'demo-fleet-runner-registrar' ? 'runner-registrar' : 'code-agent'),
+        exchangeManifestCode: async () => creds(lastGate1Name === 'demo-fleet-runner-ops' ? 'runner-ops' : 'code-agent'),
         waitForAppInstallation: async (opts) => {
           events.push(`gate2:${opts.appId}`);
           return { appId: opts.appId, installId: 'install-x', appSlug: opts.expected.appSlug ?? '', accountLogin: 'groundnuty', repositorySelection: 'selected' };
@@ -2026,10 +2026,10 @@ trust:
       };
 
       const result = await applyFleet(manifest, manifestPath, null, deps);
-      expect(result.runnerRegistrar.status).toBe('created');
+      expect(result.runnerOps.status).toBe('created');
 
-      const rrRecoveryIdx = events.findIndex((e) => e.startsWith('recovery-write:') && e.includes('runner-registrar'));
-      const rrGate2Idx = events.findIndex((e) => e === 'gate2:app-runner-registrar');
+      const rrRecoveryIdx = events.findIndex((e) => e.startsWith('recovery-write:') && e.includes('runner-ops'));
+      const rrGate2Idx = events.findIndex((e) => e === 'gate2:app-runner-ops');
       const finalVaultIdx = events.findIndex((e) => e === 'final-vault-write');
       expect(rrRecoveryIdx).toBeGreaterThanOrEqual(0);
       expect(rrGate2Idx).toBeGreaterThanOrEqual(0);
@@ -2042,13 +2042,13 @@ trust:
       // testing deletion order among peers, just "insurance outlives the
       // gate it was insuring against").
       expect(rrRecoveryIdx).toBeLessThan(finalVaultIdx);
-      const rrRecoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'runner-registrar.age');
+      const rrRecoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'runner-ops.age');
       expect(existsSync(rrRecoveryPath)).toBe(false); // removed post-successful-compose
     });
 
     it('a name exceeding 34 chars refuses BEFORE consent gate 1 — the gate seam is NEVER called', async () => {
       const manifestPath = manifestPathIn();
-      // Fleet name chosen so `<fleet>-runner-registrar` exceeds 34 chars —
+      // Fleet name chosen so `<fleet>-runner-ops` exceeds 34 chars —
       // `checkAppNameLengths` is the pure function under test elsewhere;
       // THIS test proves `applyFleet` itself refuses at its own first
       // statement, before control-repo provisioning or ANY gate.
@@ -2139,15 +2139,15 @@ trust:
       expect(result.controlRepo.status).toBe('failed');
       // The DETAILED "which name(s), by how much" message lives on
       // `controlRepo.reason` (the field this abort's `reason` param feeds
-      // directly) — every other field (`runnerRegistrar`, `ca.resolve`,
+      // directly) — every other field (`runnerOps`, `ca.resolve`,
       // `routingClient.mint`) points back at it rather than repeating the
       // detail, same convention the pre-existing control-repo-abort branch
       // already establishes for its own secondary fields.
       expect(result.controlRepo.reason).toMatch(/exceed the 34-char/);
-      expect(result.controlRepo.reason).toContain('this-is-a-very-long-fleet-name-indeed-runner-registrar');
-      expect(result.runnerRegistrar.status).toBe('failed');
-      if (result.runnerRegistrar.status === 'failed') {
-        expect(result.runnerRegistrar.reason).toMatch(/see controlRepo above/);
+      expect(result.controlRepo.reason).toContain('this-is-a-very-long-fleet-name-indeed-runner-ops');
+      expect(result.runnerOps.status).toBe('failed');
+      if (result.runnerOps.status === 'failed') {
+        expect(result.runnerOps.reason).toMatch(/see controlRepo above/);
       }
       expect(applyExitCode(result)).toBe(1);
     });
@@ -2184,7 +2184,7 @@ trust:
       // for a role with no prior — see confirmBeforeCreateGuard's doc), and
       // create SUCCEEDS here (gate 2 confirms via waitForAppInstallation,
       // a SEPARATE seam from the guard's own confirm).
-      expect(result.runnerRegistrar.status).toBe('created');
+      expect(result.runnerOps.status).toBe('created');
     });
   });
 });

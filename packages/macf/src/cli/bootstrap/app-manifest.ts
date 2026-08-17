@@ -56,8 +56,8 @@ export interface BuildAppManifestOptions {
   readonly homepageUrl?: string;
   /**
    * Override {@link MACF_REQUIRED_PERMISSIONS} (groundnuty/macf#943) — the
-   * ONLY caller that supplies this today is the runner-registrar App
-   * (`apply-runner-registrar.ts`), whose permission set is deliberately
+   * ONLY caller that supplies this today is the runner-ops App
+   * (`apply-runner-ops.ts`), whose permission set is deliberately
    * DR-019-DISJOINT (no coordination-agent permission includes
    * `administration`, and DR-019 was never widened to add it — see that
    * module's doc for why). Every ordinary agent App omits this and keeps
@@ -67,7 +67,7 @@ export interface BuildAppManifestOptions {
   readonly permissions?: Readonly<Record<string, string>>;
   /**
    * Override {@link MACF_APP_DEFAULT_EVENTS} (groundnuty/macf#943). The
-   * runner-registrar App subscribes to `[]` — it has none of the
+   * runner-ops App subscribes to `[]` — it has none of the
    * `issues`/`pull_requests`/`contents` read permissions the default events
    * need, so declaring them would be a manifest inconsistency for an App that
    * never coordinates. Every ordinary agent App omits this.

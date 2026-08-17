@@ -244,9 +244,9 @@ describe('runBootstrapPlan', () => {
     // `labels` is the one structural exception (groundnuty/macf#920): it has
     // no plan-time observed read at all, so it ALWAYS degrades to a
     // LOW-CONFIDENCE create-candidate — this is not "unclean," it's a
-    // documented limitation (see `labelsItem`'s doc). `runner_registrar`
+    // documented limitation (see `labelsItem`'s doc). `runner_ops`
     // (groundnuty/macf#943) is the SAME shape here: this fixture's
-    // `observed.lock` is `null`, so the fleet-level registrar item can only
+    // `observed.lock` is `null`, so the fleet-level runner-ops credential item can only
     // degrade to `unknown` -> `create`, alongside `labels`.
     expect(json.summary.noops).toBe(7);
     expect(json.summary.creates).toBe(2);

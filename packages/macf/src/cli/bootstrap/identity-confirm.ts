@@ -75,7 +75,7 @@ export interface ConfirmedInstall {
   readonly accountLogin: string;
   /**
    * `.repository_selection` (`'all' | 'selected'`), when present in the body
-   * (groundnuty/macf#943 — the runner-registrar App's `validateInstall` seam
+   * (groundnuty/macf#943 — the runner-ops App's `validateInstall` seam
    * needs this to refuse an `'all'`-scoped install; ordinary agent Apps never
    * read it). **Omitted entirely, not `undefined`-valued, when the source
    * body doesn't carry the field** — every existing `parseAppInstallations`

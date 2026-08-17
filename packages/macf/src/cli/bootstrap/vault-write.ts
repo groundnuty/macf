@@ -141,18 +141,18 @@ export interface VaultRoutingClientSecrets {
 }
 
 /**
- * The runner-registrar App's credentials (groundnuty/macf#943) — deliberately
+ * The runner-ops App's credentials (groundnuty/macf#943) — deliberately
  * a SEPARATE type from {@link VaultAgentSecrets}, even though the field shape
  * is identical, because it emits into a DIFFERENT vault namespace (see
- * {@link buildVaultPlaintext}'s `payload.runnerRegistrar` branch). This App's
+ * {@link buildVaultPlaintext}'s `payload.runnerOps` branch). This App's
  * key is EXPORT-CLASS (it leaves the fleet's normal trust boundary — handed
  * to the runner platform, stored in a cluster Secret) and its permission set
- * is a ONE-WAY RATCHET (`apply-runner-registrar.ts::RUNNER_REGISTRAR_PERMISSIONS`'s
+ * is a ONE-WAY RATCHET (`apply-runner-ops.ts::RUNNER_OPS_PERMISSIONS`'s
  * doc) — folding it through `payload.agents[]` would put an export-class
  * credential in the SAME `MACF_AGENT_*` namespace `vault.sh` exports on every
  * VM, exactly the conflation this separate type + namespace exists to avoid.
  */
-export interface VaultRunnerRegistrarSecrets {
+export interface VaultRunnerOpsSecrets {
   readonly appHandle: string;
   readonly appId: string;
   readonly installId: string;
@@ -168,8 +168,8 @@ export interface VaultPayload {
   readonly routing?: VaultRoutingSecrets;
   readonly ca?: VaultCaSecrets;
   readonly routingClient?: VaultRoutingClientSecrets;
-  /** The runner-registrar App's credentials (groundnuty/macf#943), when freshly minted this run — see {@link VaultRunnerRegistrarSecrets}'s doc for why this is its own field, not folded into `agents`. */
-  readonly runnerRegistrar?: VaultRunnerRegistrarSecrets;
+  /** The runner-ops App's credentials (groundnuty/macf#943), when freshly minted this run — see {@link VaultRunnerOpsSecrets}'s doc for why this is its own field, not folded into `agents`. */
+  readonly runnerOps?: VaultRunnerOpsSecrets;
 }
 
 const SHELL_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -290,26 +290,26 @@ export function buildVaultPlaintext(payload: VaultPayload): string {
     emitLine(lines, `MACF_${proj}_CA_CERT_B64`, toBase64(payload.ca.caCertPem));
   }
 
-  if (payload.runnerRegistrar !== undefined) {
+  if (payload.runnerOps !== undefined) {
     // EXPORT-CLASS credential, ONE-WAY-RATCHET permission set (groundnuty/
-    // macf#943 — see `apply-runner-registrar.ts::RUNNER_REGISTRAR_PERMISSIONS`'s
+    // macf#943 — see `apply-runner-ops.ts::RUNNER_OPS_PERMISSIONS`'s
     // doc for the full rationale). This key eventually leaves the fleet's
     // normal trust boundary entirely — handed to the runner platform, stored
     // in a cluster Secret, readable by more parties than an agent App's key
-    // ever is. Kept under its OWN `MACF_RUNNER_REGISTRAR_*` prefix,
+    // ever is. Kept under its OWN `MACF_RUNNER_OPS_*` prefix,
     // deliberately never folded into the `MACF_AGENT_*` block above — a
     // reader of vault.sh's exported names can tell at a glance this
     // credential is a different trust class from an agent's, and a future
     // change that widens this App's permissions must not be able to hide
     // behind the ordinary agent-credential emission path.
-    assertNonEmptySegmentSource('runnerRegistrar.appHandle', payload.runnerRegistrar.appHandle);
-    const rrSeg = toVariableSegment(payload.runnerRegistrar.appHandle);
-    emitLine(lines, `MACF_RUNNER_REGISTRAR_${rrSeg}_APP_ID`, payload.runnerRegistrar.appId);
-    emitLine(lines, `MACF_RUNNER_REGISTRAR_${rrSeg}_INSTALL_ID`, payload.runnerRegistrar.installId);
-    emitLine(lines, `MACF_RUNNER_REGISTRAR_${rrSeg}_CLIENT_ID`, payload.runnerRegistrar.clientId);
-    emitLine(lines, `MACF_RUNNER_REGISTRAR_${rrSeg}_CLIENT_SECRET`, payload.runnerRegistrar.clientSecret);
-    emitLine(lines, `MACF_RUNNER_REGISTRAR_${rrSeg}_WEBHOOK_SECRET`, payload.runnerRegistrar.webhookSecret);
-    emitLine(lines, `MACF_RUNNER_REGISTRAR_${rrSeg}_PRIVATE_KEY_B64`, toBase64(payload.runnerRegistrar.pem));
+    assertNonEmptySegmentSource('runnerOps.appHandle', payload.runnerOps.appHandle);
+    const rrSeg = toVariableSegment(payload.runnerOps.appHandle);
+    emitLine(lines, `MACF_RUNNER_OPS_${rrSeg}_APP_ID`, payload.runnerOps.appId);
+    emitLine(lines, `MACF_RUNNER_OPS_${rrSeg}_INSTALL_ID`, payload.runnerOps.installId);
+    emitLine(lines, `MACF_RUNNER_OPS_${rrSeg}_CLIENT_ID`, payload.runnerOps.clientId);
+    emitLine(lines, `MACF_RUNNER_OPS_${rrSeg}_CLIENT_SECRET`, payload.runnerOps.clientSecret);
+    emitLine(lines, `MACF_RUNNER_OPS_${rrSeg}_WEBHOOK_SECRET`, payload.runnerOps.webhookSecret);
+    emitLine(lines, `MACF_RUNNER_OPS_${rrSeg}_PRIVATE_KEY_B64`, toBase64(payload.runnerOps.pem));
   }
 
   if (payload.routingClient !== undefined) {
@@ -361,14 +361,14 @@ export function vaultAgentSecretsForFingerprint(agent: VaultAgentSecrets): Recor
 }
 
 /**
- * Sibling of {@link vaultAgentSecretsForFingerprint} for the runner-registrar
+ * Sibling of {@link vaultAgentSecretsForFingerprint} for the runner-ops
  * App (groundnuty/macf#943) — same three fingerprinted fields, feeding
- * `fleet.lock`'s `agents[role='runner-registrar']` entry (the LOCK entry
+ * `fleet.lock`'s `agents[role='runner-ops']` entry (the LOCK entry
  * stays in the generic `agents[]` array — only the VAULT payload uses a
- * separate namespace; see `VaultRunnerRegistrarSecrets`'s doc for why those
+ * separate namespace; see `VaultRunnerOpsSecrets`'s doc for why those
  * two decisions are independent).
  */
-export function vaultRunnerRegistrarSecretsForFingerprint(rr: VaultRunnerRegistrarSecrets): Record<string, string> {
+export function vaultRunnerOpsSecretsForFingerprint(rr: VaultRunnerOpsSecrets): Record<string, string> {
   return {
     client_secret: rr.clientSecret,
     webhook_secret: rr.webhookSecret,

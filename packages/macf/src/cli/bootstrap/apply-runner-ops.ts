@@ -1,5 +1,5 @@
 /**
- * The runner-registrar App — a SECOND, minimal GitHub App per fleet whose
+ * The runner-ops App — a SECOND, minimal GitHub App per fleet whose
  * only job is minting self-hosted-runner registration tokens (groundnuty/
  * macf#943, operator-settled design — DR-043 amendment still being drafted;
  * this module implements exactly the settled brief, no invented shape).
@@ -14,7 +14,7 @@
  * deletion must never be easy, and against Amendment G's teardown-ladder
  * design (deletion is a deliberate, measured-cost operator act, never an
  * ambient capability). So this is a NEW, NARROW identity — `<fleet>-runner-
- * registrar` — that exists for exactly one purpose and carries exactly the
+ * runner-ops credential` — that exists for exactly one purpose and carries exactly the
  * three permissions that purpose needs.
  *
  * **This module supplies the PURE pieces** (permission set, manifest
@@ -24,7 +24,7 @@
  * agents, when its recovery artifact gets deleted — lives in `apply-fleet.ts`
  * (its own module doc's "Recovery-artifact lifecycle" section already
  * documents that ownership split for the CA/routing-client ceremonies; the
- * runner-registrar follows the identical shape, reusing `apply-agent.ts`'s
+ * runner-ops follows the identical shape, reusing `apply-agent.ts`'s
  * `applyIdentity` primitive rather than a parallel gate-1/gate-2
  * implementation — see that module's `IdentityRequest` doc).
  */
@@ -36,7 +36,7 @@ import type { ConfirmedInstall } from './identity-confirm.js';
 import type { IdentityRequest } from './apply-agent.js';
 
 /** The reserved `role` this App is derived + recorded under — never declared in `fleet.yaml`'s `agents[]` (that array is coordination agents only; `FleetManifestSchema` has no knowledge of this role at all). */
-export const RUNNER_REGISTRAR_ROLE = 'runner-registrar';
+export const RUNNER_OPS_ROLE = 'runner-ops';
 
 /**
  * **EXPORT-CLASS credential, ONE-WAY-RATCHET permission set (groundnuty/
@@ -59,7 +59,7 @@ export const RUNNER_REGISTRAR_ROLE = 'runner-registrar';
  *     it; listed explicitly here so the manifest sent is self-documenting
  *     rather than relying on an implicit grant).
  */
-export const RUNNER_REGISTRAR_PERMISSIONS: Readonly<Record<string, string>> = {
+export const RUNNER_OPS_PERMISSIONS: Readonly<Record<string, string>> = {
   administration: 'write',
   actions: 'read',
   metadata: 'read',
@@ -71,11 +71,11 @@ export const RUNNER_REGISTRAR_PERMISSIONS: Readonly<Record<string, string>> = {
  * events need; declaring them would be a manifest inconsistency for an App
  * that never coordinates).
  */
-export const RUNNER_REGISTRAR_EVENTS: readonly string[] = [];
+export const RUNNER_OPS_EVENTS: readonly string[] = [];
 
-/** `deriveAppHandle(fleetName, RUNNER_REGISTRAR_ROLE)` — the ONLY place this App's handle is computed (mirrors `fleet-manifest.ts::deriveAppHandle`'s own "handle derivation, never declaration" discipline; macf#791). */
-export function deriveRunnerRegistrarHandle(fleetName: string): string {
-  return deriveAppHandle(fleetName, RUNNER_REGISTRAR_ROLE);
+/** `deriveAppHandle(fleetName, RUNNER_OPS_ROLE)` — the ONLY place this App's handle is computed (mirrors `fleet-manifest.ts::deriveAppHandle`'s own "handle derivation, never declaration" discipline; macf#791). */
+export function deriveRunnerOpsHandle(fleetName: string): string {
+  return deriveAppHandle(fleetName, RUNNER_OPS_ROLE);
 }
 
 /**
@@ -85,31 +85,31 @@ export function deriveRunnerRegistrarHandle(fleetName: string): string {
  * permissions, no events, a homepage that isn't a per-agent repo since this
  * App has none).
  */
-export function runnerRegistrarIdentityRequest(homepageUrl?: string): IdentityRequest {
+export function runnerOpsIdentityRequest(homepageUrl?: string): IdentityRequest {
   return {
-    role: RUNNER_REGISTRAR_ROLE,
+    role: RUNNER_OPS_ROLE,
     homepageUrl,
-    permissions: RUNNER_REGISTRAR_PERMISSIONS,
-    events: RUNNER_REGISTRAR_EVENTS,
+    permissions: RUNNER_OPS_PERMISSIONS,
+    events: RUNNER_OPS_EVENTS,
   };
 }
 
 /**
  * The exact App-manifest document that would be (or was) submitted for the
- * runner-registrar — reuses `app-manifest.ts::buildAppManifest`'s existing
+ * runner-ops — reuses `app-manifest.ts::buildAppManifest`'s existing
  * parameterization (macf#943 task requirement: "a second, differently-
  * configured use of that path — not a parallel implementation"). Used by
  * `commands/bootstrap-apply.ts`'s dry-run "Apps that would be created"
  * render, the same call site that already renders every agent's manifest.
  */
-export function buildRunnerRegistrarManifest(fleetName: string, redirectUrl: string, homepageUrl?: string): GitHubAppManifest {
+export function buildRunnerOpsManifest(fleetName: string, redirectUrl: string, homepageUrl?: string): GitHubAppManifest {
   return buildAppManifest({
     fleetName,
-    role: RUNNER_REGISTRAR_ROLE,
+    role: RUNNER_OPS_ROLE,
     redirectUrl,
     homepageUrl,
-    permissions: RUNNER_REGISTRAR_PERMISSIONS,
-    events: RUNNER_REGISTRAR_EVENTS,
+    permissions: RUNNER_OPS_PERMISSIONS,
+    events: RUNNER_OPS_EVENTS,
   });
 }
 
@@ -141,7 +141,7 @@ export function buildRunnerRegistrarManifest(fleetName: string, redirectUrl: str
  * second live call this increment does not make (flagged as a design
  * question in the implementation report, not decided here).
  */
-export function validateRunnerRegistrarInstall(install: ConfirmedInstall): string | undefined {
+export function validateRunnerOpsInstall(install: ConfirmedInstall): string | undefined {
   if (install.repositorySelection === 'selected') return undefined;
   return (
     'repository_selection must be "selected" (scoped to this fleet\'s repos only) — observed ' +
@@ -158,7 +158,7 @@ export function validateRunnerRegistrarInstall(install: ConfirmedInstall): strin
 /**
  * GitHub App names are globally unique and capped at 34 characters (verified
  * against the App-creation form's `maxlength` + observed rejection on a
- * longer submission). `macf-experiment-runner-registrar` is 32 — the
+ * longer submission). `macf-experiment-runner-ops` is 32 — the
  * documented live-fleet example that motivated this check (a slightly
  * longer fleet name would have exceeded it).
  */
@@ -173,7 +173,7 @@ export type AppNameLengthCheck = { readonly ok: true } | { readonly ok: false; r
 
 /**
  * Every App name THIS run would need — every declared agent's derived handle
- * PLUS the runner-registrar's. Pure; zero I/O. Exported so both call sites
+ * PLUS the runner-ops's. Pure; zero I/O. Exported so both call sites
  * that need the identical list (`commands/bootstrap-apply.ts`'s CLI-level
  * refusal, `apply-fleet.ts`'s own top-of-function refusal — see
  * `checkAppNameLengths`'s doc for why BOTH exist) derive it from one place,
@@ -181,7 +181,7 @@ export type AppNameLengthCheck = { readonly ok: true } | { readonly ok: false; r
  */
 export function plannedAppNames(manifest: FleetManifest): readonly string[] {
   const fleetName = manifest.metadata.name;
-  return [...manifest.agents.map((a: FleetAgent) => deriveAppHandle(fleetName, a.role)), deriveRunnerRegistrarHandle(fleetName)];
+  return [...manifest.agents.map((a: FleetAgent) => deriveAppHandle(fleetName, a.role)), deriveRunnerOpsHandle(fleetName)];
 }
 
 /**

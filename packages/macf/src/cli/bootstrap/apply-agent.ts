@@ -243,11 +243,11 @@ export interface AgentApplyDeps {
    * `'created'`/`'resumed-install'`. Returns a rejection reason string to
    * fail the identity apply, `undefined` to accept. `undefined`/omitted
    * (every ordinary agent's deps) preserves the pre-#943 behavior exactly —
-   * gate 2 succeeding is always sufficient. The runner-registrar is the only
+   * gate 2 succeeding is always sufficient. The runner-ops is the only
    * caller that supplies this (asserting `repositorySelection === 'selected'`
    * — GitHub's App-manifest flow has no field to FORCE the install-time repo
    * scope at creation, so this is the verify-then-refuse enforcement point;
-   * see `apply-runner-registrar.ts`'s doc). A rejection here does NOT delete
+   * see `apply-runner-ops.ts`'s doc). A rejection here does NOT delete
    * the App or the install — same "GitHub App-name uniqueness is the retry
    * safety net" posture the rest of this module's gate-2 failures already
    * rely on (module doc's "gate 1→2 window" section).
@@ -374,8 +374,8 @@ async function announceAndOpenGate(
  * The manifest/homepage shape one identity apply needs — deliberately
  * NARROWER than {@link FleetAgent} (groundnuty/macf#943). A `FleetAgent`
  * carries `profile`/`repo`/`deploy_path`/`provenance` fields that only make
- * sense for a fleet.yaml-declared coordination agent; the runner-registrar
- * App (`apply-runner-registrar.ts`) is a fleet-level identity with none of
+ * sense for a fleet.yaml-declared coordination agent; the runner-ops
+ * App (`apply-runner-ops.ts`) is a fleet-level identity with none of
  * those (no home repo, no deploy target) but goes through the EXACT SAME
  * confirm-before-create → gate 1 → gate 2 sequence. {@link applyIdentity} is
  * that sequence, parameterized on this request; {@link applyAgentIdentity}
@@ -592,7 +592,7 @@ async function runGate2(
     // `AgentApplyDeps.validateInstall`'s doc). Checked BEFORE reporting
     // success: a rejection here means gate 2 technically completed but the
     // install doesn't satisfy this identity's own contract (e.g. the
-    // runner-registrar's repository_selection !== 'selected').
+    // runner-ops's repository_selection !== 'selected').
     const rejection = deps.validateInstall?.(install);
     if (rejection !== undefined) {
       return { role, status: 'failed', reason: `consent gate 2 (install) rejected: ${rejection}` };
