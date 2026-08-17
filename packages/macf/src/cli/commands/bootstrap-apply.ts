@@ -68,7 +68,7 @@ import type { RoutingClientApplyDeps } from '../bootstrap/apply-routing-client.j
 import { realMintRoutingClient, realSetRepoSecret } from '../bootstrap/apply-routing-client.js';
 import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
 import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
-import { readVault, vaultAgentPrivateKeyPem } from '../bootstrap/vault-read.js';
+import { readVault, vaultAgentPrivateKeyPem, vaultRunnerOpsPrivateKeyPem } from '../bootstrap/vault-read.js';
 import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
 import type { AppNameLengthCheck } from '../bootstrap/apply-runner-ops.js';
@@ -292,8 +292,24 @@ export function formatPlannedAppCreations(creations: readonly PlannedAppCreation
  * silence; every `VaultError` message from `vault-read.ts` is pre-scrubbed
  * of secret material at the source (see that module's doc), so logging it
  * verbatim is safe — never a PEM, client secret, or webhook secret.
+ *
+ * **The runner-ops entry (groundnuty/macf#954).** The map is keyed by ROLE,
+ * and `manifest.agents[]` is NOT a complete role enumeration — it never
+ * contains `'runner-ops'` (a fleet-level identity, never declared there; see
+ * `apply-runner-ops.ts`'s module doc). Looping only `manifest.agents` here
+ * used to mean this map could NEVER carry a runner-ops PEM regardless of
+ * what the vault actually held, so `resolveMutateDeps`'s `resolveKeyPath`
+ * closure below (itself entirely role-agnostic — a plain `map.get(role)`)
+ * had nothing to return for that one role, and `confirmBeforeCreateGuard`
+ * fell to `skip-unverified` for runner-ops even with both flags supplied.
+ * This is the SAME "not a complete role enumeration" gap groundnuty/macf#953
+ * found in teardown's App list — resolved here by adding the runner-ops PEM
+ * as an EXPLICIT lookup alongside the loop, not by trying to make the loop
+ * itself exhaustive over roles the manifest structurally cannot declare.
+ * Exported for direct unit testing (macf#954) — mirrors `resolveMutateDeps`'s
+ * own export precedent.
  */
-async function resolveVaultAgentPems(
+export async function resolveVaultAgentPems(
   manifest: FleetManifest,
   vaultOpts: Pick<RunBootstrapApplyOptions, 'vaultPath' | 'identityKeyPath'>,
   doReadVault: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>,
@@ -318,6 +334,13 @@ async function resolveVaultAgentPems(
     const pem = vaultAgentPrivateKeyPem(raw, manifest.metadata.name, agent.role);
     if (pem !== undefined) pems.set(agent.role, pem);
   }
+  // groundnuty/macf#954 — the explicit runner-ops lookup this doc's "The
+  // runner-ops entry" section explains. `RUNNER_OPS_ROLE` (not a hand-typed
+  // 'runner-ops' literal) so this can never drift from the SAME constant
+  // `apply-fleet.ts` keys its `currentLock?.agents.find(...)`/
+  // `pendingCreatedUpdates` lookups on for this role.
+  const runnerOpsPem = vaultRunnerOpsPrivateKeyPem(raw, manifest.metadata.name);
+  if (runnerOpsPem !== undefined) pems.set(RUNNER_OPS_ROLE, runnerOpsPem);
   return pems;
 }
 

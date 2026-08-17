@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import {
   runBootstrapApply,
   resolveMutateDeps,
+  resolveVaultAgentPems,
   plannedAppCreations,
   formatPlannedAppCreations,
   formatApplyResult,
@@ -39,7 +40,8 @@ import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../src/cli/bootstrap/apply-routing-client.js';
 import type { RunnerRegistrationDeps } from '../../src/cli/bootstrap/apply-routing.js';
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../src/cli/bootstrap/apply-routing.js';
-import { VaultError, buildVaultPlaintext, type VaultAgentSecrets } from '../../src/cli/bootstrap/vault-write.js';
+import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle } from '../../src/cli/bootstrap/apply-runner-ops.js';
+import { VaultError, buildVaultPlaintext, type VaultAgentSecrets, type VaultRunnerOpsSecrets } from '../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext } from '../../src/cli/bootstrap/vault-read.js';
 
 const FLEET_YAML = `apiVersion: macf/v0
@@ -1065,6 +1067,151 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     }));
     return parseVaultPlaintext(buildVaultPlaintext({ agents }));
   }
+
+  /**
+   * groundnuty/macf#954 — sibling of {@link vaultRawWithAgentPems} that ALSO
+   * carries the runner-ops App's vault entry (`payload.runnerOps`, a
+   * DIFFERENT vault namespace than `payload.agents` — see
+   * `vault-write.ts::buildVaultPlaintext`'s `payload.runnerOps` branch doc).
+   * Real write/parse round-trip, same discipline as the sibling above — the
+   * key names are never hand-derived in the test.
+   */
+  function vaultRawWithAgentAndRunnerOpsPems(agentRoles: readonly string[], pem = SENTINEL_VAULT_PEM): Readonly<Record<string, string>> {
+    const agents: VaultAgentSecrets[] = agentRoles.map((role) => ({
+      appHandle: `demo-fleet-${role}`,
+      appId: '111',
+      installId: '222',
+      clientId: 'Iv1.abc',
+      clientSecret: 'not-under-test',
+      webhookSecret: 'not-under-test',
+      pem,
+    }));
+    const runnerOps: VaultRunnerOpsSecrets = {
+      appHandle: deriveRunnerOpsHandle('demo-fleet'),
+      appId: '999',
+      installId: '998',
+      clientId: 'Iv1.runner-ops',
+      clientSecret: 'not-under-test',
+      webhookSecret: 'not-under-test',
+      pem,
+    };
+    return parseVaultPlaintext(buildVaultPlaintext({ agents, runnerOps }));
+  }
+
+  // --- groundnuty/macf#954 — the runner-ops vault-confirm reach gap ---
+  //
+  // `resolveVaultAgentPems` used to loop ONLY `manifest.agents` — which
+  // structurally never contains `'runner-ops'` (a fleet-level identity, never
+  // declared there; `apply-runner-ops.ts`'s module doc) — so the returned map
+  // could NEVER carry a runner-ops PEM regardless of what the vault actually
+  // held. The sibling test at "with identity + an existing App recorded..."
+  // above ALREADY covers runner-ops, but ONLY via a hand-rolled
+  // `resolveKeyPath: (role) => ...` stand-in that answers for ANY role — its
+  // own comment names this explicitly as a work-around for the REAL
+  // `resolveMutateDeps`-derived one "which only ever resolves a PEM for a
+  // DECLARED agent." These tests exercise the REAL, FIXED wiring instead.
+
+  it('resolveVaultAgentPems (macf#954): the returned map includes a runner-ops PEM when the vault carries one — NOT gated on manifest.agents[] (the fixture declares only 2 agents, never runner-ops)', async () => {
+    const manifest = parseFleetManifest(FLEET_YAML);
+    const raw = vaultRawWithAgentAndRunnerOpsPems(['code-agent', 'science-agent']);
+    const pems = await resolveVaultAgentPems(
+      manifest,
+      { vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      async () => raw,
+      () => {},
+    );
+    expect(pems?.get('code-agent')).toBe(SENTINEL_VAULT_PEM);
+    expect(pems?.get('science-agent')).toBe(SENTINEL_VAULT_PEM);
+    expect(pems?.get(RUNNER_OPS_ROLE)).toBe(SENTINEL_VAULT_PEM);
+  });
+
+  it('resolveVaultAgentPems: a vault with NO runner-ops entry -> the map has no runner-ops key (never fabricates one)', async () => {
+    const manifest = parseFleetManifest(FLEET_YAML);
+    const raw = vaultRawWithAgentPems(['code-agent', 'science-agent']); // no `runnerOps` payload at all
+    const pems = await resolveVaultAgentPems(
+      manifest,
+      { vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      async () => raw,
+      () => {},
+    );
+    expect(pems?.has(RUNNER_OPS_ROLE)).toBe(false);
+    expect(pems?.get('code-agent')).toBe(SENTINEL_VAULT_PEM); // sibling roles unaffected
+  });
+
+  it('with BOTH flags + fleet.lock entries for every role, the REAL resolveMutateDeps-derived resolveKeyPath (built from resolveVaultAgentPems\'s fixed output) resolves runner-ops too -> CONFIRMED, REUSED, gate 1 seam NEVER called for ANY role (macf#954 — not the hand-rolled any-role stand-in the sibling test above uses)', async () => {
+    const file = writeManifest();
+    const manifest = parseFleetManifest(FLEET_YAML);
+    const priorLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [
+        { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+        { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+        { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-3' },
+      ],
+    };
+    const raw = vaultRawWithAgentAndRunnerOpsPems(['code-agent', 'science-agent']);
+    const vaultAgentPems = await resolveVaultAgentPems(
+      manifest,
+      { vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      async () => raw,
+      () => {},
+    );
+    expect(vaultAgentPems?.has(RUNNER_OPS_ROLE)).toBe(true); // the fix under test
+
+    // The REAL resolveMutateDeps-built resolveKeyPath closure — extracted
+    // once, never a hand-rolled `(role) => ...` any-role stand-in.
+    const realMutate = resolveMutateDeps(file, vaultAgentPems, SENTINEL_RUNNER_TOKEN);
+    const realResolveKeyPath = realMutate.buildAgentDeps(() => {}).resolveKeyPath;
+
+    let startManifestFlowCalled = false;
+    const installIdForAppId = (appId: string): string =>
+      appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-3';
+
+    const code = await runBootstrapApply(
+      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), readVault: async () => raw },
+      fakeMutateDeps(file, {
+        // Cleans up the REAL scratch-PEM dir `realResolveKeyPath` writes into
+        // (mirrors runBootstrapApply's own `finally { mutate.cleanupVaultScratch?.() }`
+        // contract — see resolveMutateDeps's doc).
+        cleanupVaultScratch: realMutate.cleanupVaultScratch,
+        buildAgentDeps: () =>
+          fakeAgentDeps({
+            resolveKeyPath: realResolveKeyPath,
+            confirmAppInstallation: async (appId) => ({
+              status: 'confirmed',
+              install: { appId, installId: installIdForAppId(appId), appSlug: '', accountLogin: 'groundnuty' },
+            }),
+            startManifestFlow: async () => {
+              startManifestFlowCalled = true;
+              throw new Error('must not be called — a CONFIRMED App must skip consent gate 1 entirely (macf#954)');
+            },
+          }),
+        controlRepoDeps: {
+          checkMeta: async () => ({ presence: 'present', archived: false }),
+          readManifestFile: async () => FLEET_YAML,
+          createRepo: async () => {
+            throw new Error('must not be called — reuse never creates');
+          },
+          unarchiveRepo: async () => {
+            throw new Error('must not be called');
+          },
+          cloneRepo: async (_url, destDir) => {
+            writeFileSync(join(destDir, 'fleet.lock'), JSON.stringify(priorLock), 'utf-8');
+          },
+          commitAndPush: async () => 'nothing-to-commit',
+        },
+      }),
+    );
+    expect(code).toBe(0);
+    expect(startManifestFlowCalled).toBe(false); // gate 1 seam never even invoked, for ANY role
+    const out = logs.join('\n');
+    expect(out).toMatch(/code-agent: REUSED/);
+    expect(out).toMatch(/science-agent: REUSED/);
+    expect(out).toMatch(/runner-ops: REUSED/);
+    expect(out).not.toMatch(/runner-ops: SKIPPED/);
+  });
 
   it('--vault WITHOUT --identity-key: refused loud (vault_flags_incomplete), never silently vault-free', async () => {
     const code = await runBootstrapApply({ file: '/does/not/matter.yaml', json: true, vaultPath: '/fake/vault.age' });
