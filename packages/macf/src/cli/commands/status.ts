@@ -1,4 +1,4 @@
-import { loadAllAgents, readAgentConfig, agentCertPath, agentKeyPath, tokenSourceFromConfig } from '../config.js';
+import { loadAllAgentsWithCwdFallback, readAgentConfig, agentCertPath, agentKeyPath, tokenSourceFromConfig } from '../config.js';
 import { toVariableSegment } from '@groundnuty/macf-core';
 import { createClientFromConfig } from '../registry-helper.js';
 import { createRegistryFromConfig } from '@groundnuty/macf-core';
@@ -22,7 +22,12 @@ function formatUptime(seconds: number): string {
  * from the global index and uses the first one's config.
  */
 export async function showStatus(projectDir?: string): Promise<void> {
-  const agents = loadAllAgents();
+  // WHY (#959): loadAllAgents() alone only consults the global
+  // ~/.macf/agents.json index, so a workspace whose config exists at cwd
+  // but never made it into that index misreported "not configured" —
+  // actively wrong advice on an already-initialised workspace. The cwd
+  // fallback closes that gap; see loadAllAgentsWithCwdFallback.
+  const agents = loadAllAgentsWithCwdFallback();
 
   // Pick the config + path that drives registry access and token generation.
   let driverConfig;

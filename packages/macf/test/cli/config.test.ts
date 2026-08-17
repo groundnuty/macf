@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { join } from 'node:path';
-import { mkdirSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { mkdirSync, rmSync, readFileSync, existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
   writeAgentConfig, readAgentConfig, writeAgentsIndex, readAgentsIndex,
-  addToAgentsIndex, loadAllAgents, agentConfigPath,
-  resolveCanonicalBranch, DEFAULT_CANONICAL_BRANCH,
+  addToAgentsIndex, loadAllAgents, loadAllAgentsWithCwdFallback, agentConfigPath,
+  resolveCanonicalBranch, DEFAULT_CANONICAL_BRANCH, AGENTS_INDEX_PATH,
 } from '../../src/cli/config.js';
 import type { MacfAgentConfig } from '../../src/cli/config.js';
 
@@ -51,7 +51,9 @@ describe('CLI config', () => {
     it('returns null for invalid config', () => {
       const path = agentConfigPath(dir);
       mkdirSync(join(dir, '.macf'), { recursive: true });
-      const { writeFileSync } = require('node:fs');
+      // Pre-existing lint fix (unrelated to #959): use the top-level ESM
+      // import (now in scope for the #959 tests below) instead of a
+      // require() — @typescript-eslint/no-require-imports.
       writeFileSync(path, '{"invalid": true}');
       expect(readAgentConfig(dir)).toBeNull();
     });
@@ -76,6 +78,65 @@ describe('CLI config', () => {
       // without side effects. Test the function shape instead.
       const agents = loadAllAgents();
       expect(Array.isArray(agents)).toBe(true);
+    });
+  });
+
+  // #959: `loadAllAgentsWithCwdFallback` is the fix for `macf peers`/`macf
+  // status` misreporting "No agents configured" on a workspace whose
+  // .macf/macf-agent.json exists but never made it into the global index.
+  // These tests temporarily replace the REAL ~/.macf/agents.json (backed up
+  // + restored) so the index side of the picture is fully controlled —
+  // loadAllAgents() has no injectable seam for it (see the note above), and
+  // this machine's real index carries leftover entries from other test
+  // runs that would otherwise make these assertions non-hermetic.
+  describe('loadAllAgentsWithCwdFallback (#959)', () => {
+    let hadIndex: boolean;
+    let originalIndexBytes: string | null = null;
+
+    beforeEach(() => {
+      hadIndex = existsSync(AGENTS_INDEX_PATH);
+      originalIndexBytes = hadIndex ? readFileSync(AGENTS_INDEX_PATH, 'utf-8') : null;
+      writeAgentsIndex({ agents: [] });
+    });
+
+    afterEach(() => {
+      if (hadIndex && originalIndexBytes !== null) {
+        writeFileSync(AGENTS_INDEX_PATH, originalIndexBytes);
+      } else if (existsSync(AGENTS_INDEX_PATH)) {
+        unlinkSync(AGENTS_INDEX_PATH);
+      }
+    });
+
+    it('includes a cwd-discovered project the index does not know about', () => {
+      writeAgentConfig(dir, sampleConfig);
+
+      const agents = loadAllAgentsWithCwdFallback(dir);
+
+      expect(agents.some((a) => resolve(a.path) === resolve(dir))).toBe(true);
+    });
+
+    it('walks up from a nested subdirectory to find the project root', () => {
+      writeAgentConfig(dir, sampleConfig);
+      const nested = join(dir, 'deeply', 'nested');
+      mkdirSync(nested, { recursive: true });
+
+      const agents = loadAllAgentsWithCwdFallback(nested);
+
+      expect(agents.some((a) => resolve(a.path) === resolve(dir))).toBe(true);
+    });
+
+    it('does not duplicate an entry already present via the index', () => {
+      writeAgentConfig(dir, sampleConfig);
+      addToAgentsIndex(dir);
+
+      const agents = loadAllAgentsWithCwdFallback(dir);
+
+      expect(agents.filter((a) => resolve(a.path) === resolve(dir))).toHaveLength(1);
+    });
+
+    it('falls through to the (empty) index when cwd has no project', () => {
+      const agents = loadAllAgentsWithCwdFallback(dir); // dir has no .macf/ written
+      expect(agents).toEqual([]);
     });
   });
 });

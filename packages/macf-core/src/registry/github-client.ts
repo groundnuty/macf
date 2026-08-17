@@ -21,6 +21,34 @@ function headers(token: string): Record<string, string> {
   };
 }
 
+/**
+ * WHY (macf#959): node's built-in `fetch` (undici) throws a bare
+ * `TypeError: fetch failed` on any network-level failure (DNS, connection
+ * refused, TLS, timeout) — no HTTP response is ever received, so the
+ * `res.ok` checks below never run and this class of failure was
+ * previously unwrapped: it reached the CLI's top-level catch-all
+ * (`index.ts`) as literally "Error: fetch failed" — no API name, no
+ * operation, indistinguishable at a glance from a local config problem.
+ * Wrap every call so a network-level failure is attributed the same way
+ * an HTTP-status failure already is via GitHubApiError. Status `0` marks
+ * "no HTTP response was received" (never a real GitHub status code), so
+ * existing status-comparisons (e.g. macf-channel-server's
+ * refresh-aware-client checking `err.status === 401`) safely fall through
+ * instead of misreading a network outage as an auth failure.
+ */
+async function fetchOrThrow(
+  url: string,
+  init: RequestInit,
+  operation: string,
+): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new GitHubApiError(0, `unreachable — could not ${operation} (network error: ${cause})`);
+  }
+}
+
 interface GitHubVariable {
   readonly name: string;
   readonly value: string;
@@ -55,21 +83,21 @@ export function createGitHubClient(
   return {
     async writeVariable(name: string, value: string): Promise<void> {
       // Try PATCH (update) first
-      const patchRes = await fetch(`${baseUrl}/${encodeName(name)}`, {
+      const patchRes = await fetchOrThrow(`${baseUrl}/${encodeName(name)}`, {
         method: 'PATCH',
         headers: { ...headers(token), 'Content-Type': 'application/json' },
         body: JSON.stringify({ value }),
-      });
+      }, `update variable ${name}`);
 
       if (patchRes.ok) return;
 
       // Variable doesn't exist yet — create with POST
       if (patchRes.status === 404) {
-        const postRes = await fetch(baseUrl, {
+        const postRes = await fetchOrThrow(baseUrl, {
           method: 'POST',
           headers: { ...headers(token), 'Content-Type': 'application/json' },
           body: JSON.stringify({ name, value }),
-        });
+        }, `create variable ${name}`);
 
         if (postRes.ok) return;
 
@@ -86,10 +114,10 @@ export function createGitHubClient(
     },
 
     async readVariable(name: string): Promise<string | null> {
-      const res = await fetch(`${baseUrl}/${encodeName(name)}`, {
+      const res = await fetchOrThrow(`${baseUrl}/${encodeName(name)}`, {
         method: 'GET',
         headers: headers(token),
-      });
+      }, `read variable ${name}`);
 
       if (res.status === 404) return null;
 
@@ -111,10 +139,10 @@ export function createGitHubClient(
 
       // Paginate through all variables
       for (;;) {
-        const res = await fetch(`${baseUrl}?per_page=${perPage}&page=${page}`, {
+        const res = await fetchOrThrow(`${baseUrl}?per_page=${perPage}&page=${page}`, {
           method: 'GET',
           headers: headers(token),
-        });
+        }, 'list variables');
 
         if (!res.ok) {
           throw new GitHubApiError(
@@ -138,10 +166,10 @@ export function createGitHubClient(
     },
 
     async deleteVariable(name: string): Promise<void> {
-      const res = await fetch(`${baseUrl}/${encodeName(name)}`, {
+      const res = await fetchOrThrow(`${baseUrl}/${encodeName(name)}`, {
         method: 'DELETE',
         headers: headers(token),
-      });
+      }, `delete variable ${name}`);
 
       // 204 = deleted, 404 = already gone — both OK
       if (res.status === 204 || res.status === 404) return;

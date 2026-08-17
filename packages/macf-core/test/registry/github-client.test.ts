@@ -103,6 +103,59 @@ describe('createGitHubClient', () => {
     });
   });
 
+  // #959: node's built-in fetch throws a bare `TypeError: fetch failed` on
+  // any network-level failure (no HTTP response received at all) — as
+  // opposed to the HTTP-status failures above, which already produce a
+  // well-attributed GitHubApiError. This is the specific class the
+  // operator observed as an unattributed "Error: fetch failed" with no
+  // indication of which GitHub call was attempted.
+  describe('network-level failures (no HTTP response)', () => {
+    it('wraps a rejected fetch as a GitHubApiError naming the operation, never a bare "fetch failed"', async () => {
+      mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
+
+      try {
+        await client.listVariables();
+        expect.unreachable('expected listVariables to throw');
+      } catch (err) {
+        expect(err).toBeInstanceOf(GitHubApiError);
+        expect((err as Error).message).toMatch(/list variables/);
+      }
+    });
+
+    it('uses status 0 to mark "no HTTP response", distinct from any real GitHub status', async () => {
+      mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
+
+      try {
+        await client.readVariable('V');
+        expect.unreachable('expected readVariable to throw');
+      } catch (err) {
+        expect(err).toBeInstanceOf(GitHubApiError);
+        expect((err as InstanceType<typeof GitHubApiError>).status).toBe(0);
+      }
+    });
+
+    it('names the specific operation for writeVariable / deleteVariable too', async () => {
+      mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
+      await expect(client.writeVariable('V', 'x')).rejects.toThrow(/update variable V/);
+
+      mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
+      await expect(client.deleteVariable('V')).rejects.toThrow(/delete variable V/);
+    });
+
+    it('never embeds the bearer token in the wrapped error message', async () => {
+      const secretClient = createGitHubClient('/repos/owner/repo', 'ghs_super_secret_token_value');
+      mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
+
+      try {
+        await secretClient.listVariables();
+        expect.unreachable('expected listVariables to throw');
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        expect(message).not.toContain('ghs_super_secret_token_value');
+      }
+    });
+  });
+
   describe('listVariables', () => {
     it('returns all variables', async () => {
       mockFetch.mockResolvedValueOnce(jsonResponse(200, {
