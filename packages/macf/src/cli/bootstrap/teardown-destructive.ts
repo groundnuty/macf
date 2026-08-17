@@ -98,7 +98,7 @@ import {
   resolveControlRepoOwnership,
 } from './teardown.js';
 import type { AppDeletionDeps, AppDeletionOutcome, AppIdentityTarget } from './app-identity-removal.js';
-import { computeAppIdentityTargets, enrichAppIdentityTargetsWithLock, reportAppIdentityRemoval } from './app-identity-removal.js';
+import { classifyLockReadability, computeAppIdentityTargets, enrichAppIdentityTargetsWithLock, reportAppIdentityRemoval } from './app-identity-removal.js';
 import { controlRepoFullName } from './control-repo.js';
 import type { DeleteRepoFn } from './repo-destroy.js';
 
@@ -108,6 +108,25 @@ function errMessage(err: unknown): string {
 
 // --- Shared plan shape (delete-apps AND destroy derive the SAME targets) ---
 
+/**
+ * `'read'` — `fleet.lock` was read AND parsed (see
+ * `app-identity-removal.ts::classifyLockReadability`). `'unreadable'` — a
+ * `readFleetLock` dep WAS supplied and called but the lock could not be
+ * used (missing/network-failed/malformed). `'not-attempted'` — no
+ * `readFleetLock` dep was supplied at all (a caller/test that never wired
+ * one — production wiring always supplies
+ * `control-repo.ts::realReadControlFleetLockFile`, so this state is a
+ * degrade path, not a normal production outcome), OR the gate refused (no
+ * point reading a lock for a run that touches nothing).
+ *
+ * The three-way split is deliberate (groundnuty/macf#953's honest-unknown
+ * floor) — collapsing `'unreadable'` and `'not-attempted'` into one boolean
+ * would make a caller that never wired `readFleetLock` at all render
+ * identically to one whose lock read genuinely failed, silently implying
+ * "checked, found nothing extra" for a run that never checked at all.
+ */
+export type FleetLockReadStatus = 'read' | 'unreadable' | 'not-attempted';
+
 export interface IrreversibleTeardownPlan {
   readonly fleet: string;
   readonly gate: TeardownGate;
@@ -116,19 +135,32 @@ export interface IrreversibleTeardownPlan {
   /** Repo NAMES both rungs act on — `delete-apps` archives them, `destroy` deletes them (the ACTION differs, never the derivation). Empty when the gate refuses. */
   readonly repoTargets: readonly string[];
   readonly appTargets: readonly AppIdentityTarget[];
+  /**
+   * Whether {@link appTargets} could have included lock-only (non-manifest)
+   * identities — see {@link FleetLockReadStatus}'s doc. The render layer
+   * (`fleet-teardown-destructive.ts`) surfaces a LOUD caveat whenever this
+   * is not `'read'`, so an operator never mistakes "the lock couldn't be
+   * checked" for "the lock was checked and found nothing extra."
+   */
+  readonly lockReadStatus: FleetLockReadStatus;
 }
 
 export type IrreversibleTeardownPlanDeps = TeardownControlRepoDeps &
   Pick<TeardownVariableDeps, 'checkRegistryPresence'> & {
     /**
      * OPTIONAL best-effort read of the control repo's committed
-     * `fleet.lock` — used to enrich {@link IrreversibleTeardownPlan.appTargets}
-     * with the AUTHORITATIVE recorded `app_id` per role (see
-     * `app-identity-removal.ts`'s `enrichAppIdentityTargetsWithLock` doc for
-     * why the derived slug alone isn't enough). Optional — and skipped
-     * entirely when absent — so existing callers/tests that never wire it
-     * keep working with slug-only targets unchanged; this is purely
-     * additive enrichment, never a new precondition.
+     * `fleet.lock` — used to UNION + enrich {@link IrreversibleTeardownPlan.appTargets}
+     * with roles `fleet.lock` recorded that `manifest.agents[]` never
+     * declared (e.g. the runner-ops App), plus the AUTHORITATIVE recorded
+     * `app_id` per role (see `app-identity-removal.ts`'s
+     * `enrichAppIdentityTargetsWithLock` doc for why the derived slug alone
+     * isn't enough — groundnuty/macf#953). Optional — and skipped entirely
+     * when absent — so existing callers/tests that never wire it keep
+     * working with manifest-only, slug-only targets unchanged; this is
+     * purely additive enrichment, never a new precondition. When omitted,
+     * {@link IrreversibleTeardownPlan.lockReadStatus} reads `'not-attempted'`
+     * — the report is honest about not having checked, rather than silently
+     * implying nothing extra exists.
      */
     readonly readFleetLock?: (repo: string) => Promise<string | undefined>;
   };
@@ -146,11 +178,27 @@ async function buildIrreversibleTeardownPlan(manifest: FleetManifest, deps: Irre
   const registryInventory = gate.allowed ? await computeDeactivateInventory(manifest, registryTargets, deps) : [];
   const repoTargets = gate.allowed ? computeArchiveRepoTargets(manifest) : [];
   let appTargets = gate.allowed ? computeAppIdentityTargets(manifest) : [];
+  let lockReadStatus: FleetLockReadStatus = 'not-attempted';
   if (gate.allowed && deps.readFleetLock) {
-    const lockText = await deps.readFleetLock(controlRepoFullName(manifest));
-    appTargets = enrichAppIdentityTargetsWithLock(appTargets, lockText);
+    // `readFleetLock`'s type (`(repo) => Promise<string | undefined>`) does
+    // NOT forbid rejection — only the PRODUCTION implementation
+    // (`realReadControlFleetLockFile`) happens to catch everything and
+    // degrade to `undefined`. A test/alternate dep that throws must not
+    // blow up plan-building: that would kill the command with no `--json`
+    // envelope (this package's own `--json` always-emits-something rail,
+    // groundnuty/macf#830) and, worse, would SKIP reporting the exact
+    // "lock cannot be read" case `lockReadStatus`/`classifyLockReadability`
+    // exist to surface (groundnuty/macf#953's honest-unknown floor). A
+    // throw degrades identically to a resolved `undefined`.
+    try {
+      const lockText = await deps.readFleetLock(controlRepoFullName(manifest));
+      lockReadStatus = classifyLockReadability(lockText);
+      appTargets = enrichAppIdentityTargetsWithLock(appTargets, lockText, manifest);
+    } catch {
+      lockReadStatus = 'unreadable';
+    }
   }
-  return { fleet: manifest.metadata.name, gate, registryTargets, registryInventory, repoTargets, appTargets };
+  return { fleet: manifest.metadata.name, gate, registryTargets, registryInventory, repoTargets, appTargets, lockReadStatus };
 }
 
 // --- delete-apps ---
