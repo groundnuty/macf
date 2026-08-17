@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { toVariableSegment } from '@groundnuty/macf-core';
@@ -22,6 +22,7 @@ import {
   ageDecryptFile,
   countVaultAgentPresence,
   countVaultCaPresence,
+  countVaultRecipientStanzas,
   countVaultRoutingPresence,
   countVaultRunnerOpsPresence,
   parseVaultPlaintext,
@@ -30,6 +31,8 @@ import {
   queryVaultRoutingPresence,
   queryVaultRunnerOpsPresence,
   readVault,
+  readVaultRecipientCount,
+  reencryptVault,
   vaultAgentPrivateKeyPem,
   vaultRunnerOpsPrivateKeyPem,
   type VaultAgentObservation,
@@ -599,4 +602,255 @@ describe('ageDecryptFile / readVault (real age binary)', () => {
       process.env.PATH = savedPath;
     }
   });
+});
+
+// --- countVaultRecipientStanzas / readVaultRecipientCount / reencryptVault (groundnuty/macf#957) ---
+
+describe('countVaultRecipientStanzas — pure header parse, no age binary needed', () => {
+  it('throws vault_header_malformed when the file does not start with the age magic line', () => {
+    try {
+      countVaultRecipientStanzas(Buffer.from('not-an-age-file\n-> X25519 abc\nbody\n---\n'));
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VaultError);
+      expect((e as VaultError).code).toBe('vault_header_malformed');
+    }
+  });
+
+  it('throws vault_header_malformed when no "---" MAC line is ever found', () => {
+    try {
+      countVaultRecipientStanzas(Buffer.from('age-encryption.org/v1\n-> X25519 abc\nbody\n'));
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VaultError);
+      expect((e as VaultError).code).toBe('vault_header_malformed');
+    }
+  });
+
+  it('counts one stanza for a single-recipient header', () => {
+    const bytes = Buffer.from('age-encryption.org/v1\n-> X25519 ephemeral-pubkey-b64\nwrapped-file-key-b64\n--- header-mac-b64\nBINARY-CIPHERTEXT');
+    expect(countVaultRecipientStanzas(bytes)).toBe(1);
+  });
+
+  it('counts two stanzas for a two-recipient header (never confuses a stanza body line with a stanza)', () => {
+    const bytes = Buffer.from(
+      'age-encryption.org/v1\n-> X25519 pub1\nbody1\n-> X25519 pub2\nbody2\n--- mac\nBINARY-CIPHERTEXT',
+    );
+    expect(countVaultRecipientStanzas(bytes)).toBe(2);
+  });
+
+  it('never includes any of the fixed literal ciphertext in the thrown message (no content beyond the module\'s own fixed strings)', () => {
+    try {
+      countVaultRecipientStanzas(Buffer.from('SECRET-LOOKING-GARBAGE-BYTES'));
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect((e as VaultError).message).not.toContain('SECRET-LOOKING-GARBAGE-BYTES');
+    }
+  });
+});
+
+describe('readVaultRecipientCount — orchestration (injected deps, no real age)', () => {
+  it('returns {status:"absent"} when the file does not exist — NOT an error (a not-yet-provisioned fleet has no vault yet)', () => {
+    const result = readVaultRecipientCount('/fake/secrets/vault.age', { exists: () => false });
+    expect(result).toEqual({ status: 'absent' });
+  });
+
+  it('returns {status:"counted", count} for an existing, well-formed header', () => {
+    const bytes = Buffer.from('age-encryption.org/v1\n-> X25519 pub1\nbody1\n--- mac\nBINARY');
+    const result = readVaultRecipientCount('/fake/secrets/vault.age', { exists: () => true, readFile: () => bytes });
+    expect(result).toEqual({ status: 'counted', count: 1 });
+  });
+
+  it('propagates a malformed-header VaultError for a file that EXISTS but does not parse', () => {
+    const bytes = Buffer.from('not-an-age-file');
+    expect(() => readVaultRecipientCount('/fake/secrets/vault.age', { exists: () => true, readFile: () => bytes })).toThrow(VaultError);
+  });
+});
+
+describe('reencryptVault — orchestration + real age binary (groundnuty/macf#957)', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function mintAgeKey(dir: string, name: string): { keyPath: string; publicKey: string } {
+    const keyPath = join(dir, name);
+    const r = spawnSync('age-keygen', ['-o', keyPath], { encoding: 'utf-8' });
+    expect(r.status, r.stderr).toBe(0);
+    const content = readFileSync(keyPath, 'utf-8');
+    const match = /age1[0-9a-z]+/.exec(content);
+    expect(match).not.toBeNull();
+    return { keyPath, publicKey: match?.[0] ?? '' };
+  }
+
+  it('refuses with vault_no_age_recipient when newRecipients is empty — no decrypt/encrypt seam is ever invoked', async () => {
+    let decryptCalled = false;
+    let encryptCalled = false;
+    try {
+      await reencryptVault('/fake/vault.age', '/fake/identity.txt', [], {
+        decrypt: async () => {
+          decryptCalled = true;
+          return '';
+        },
+        encrypt: async () => {
+          encryptCalled = true;
+        },
+      });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VaultError);
+      expect((e as VaultError).code).toBe('vault_no_age_recipient');
+    }
+    expect(decryptCalled).toBe(false);
+    expect(encryptCalled).toBe(false);
+  });
+
+  it('refuses a decrypted payload that does not parse as a vault — never attempts to encrypt garbage', async () => {
+    let encryptCalled = false;
+    await expect(
+      reencryptVault('/fake/vault.age', '/fake/identity.txt', ['age1fake'], {
+        decrypt: async () => 'this-is-not-a-vault-no-equals-sign',
+        encrypt: async () => {
+          encryptCalled = true;
+        },
+      }),
+    ).rejects.toThrow(VaultError);
+    expect(encryptCalled).toBe(false);
+  });
+
+  it('propagates an encrypt failure and cleans up the temp file (never leaves a partial file, never touches vaultPath)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-reencrypt-test-'));
+    dirs.push(dir);
+    const vaultPath = join(dir, 'vault.age');
+    writeFileSync(vaultPath, 'ORIGINAL-CIPHERTEXT-UNCHANGED');
+    const unlinkedPaths: string[] = [];
+    await expect(
+      reencryptVault(vaultPath, '/fake/identity.txt', ['age1fake'], {
+        decrypt: async () => "MACF_AGENT_X_APP_ID='111'\n",
+        encrypt: async () => {
+          throw new Error('simulated age encrypt failure');
+        },
+        unlink: (p) => unlinkedPaths.push(p),
+      }),
+    ).rejects.toThrow(/simulated age encrypt failure/);
+    // The original file is untouched — a failed re-encrypt never clobbers the live vault:
+    expect(readFileSync(vaultPath, 'utf-8')).toBe('ORIGINAL-CIPHERTEXT-UNCHANGED');
+    expect(unlinkedPaths).toHaveLength(1);
+    expect(unlinkedPaths[0]).toMatch(/vault\.age\.reencrypt-.*\.tmp$/);
+  });
+
+  it('propagates a rename failure (temp encrypted successfully, but the atomic swap itself failed) and cleans up the temp file', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-reencrypt-test-'));
+    dirs.push(dir);
+    const vaultPath = join(dir, 'vault.age');
+    writeFileSync(vaultPath, 'ORIGINAL-CIPHERTEXT-UNCHANGED');
+    const unlinkedPaths: string[] = [];
+    try {
+      await reencryptVault(vaultPath, '/fake/identity.txt', ['age1fake'], {
+        decrypt: async () => "MACF_AGENT_X_APP_ID='111'\n",
+        encrypt: async () => {
+          /* pretend the temp file was written */
+        },
+        rename: () => {
+          throw new Error('simulated rename failure');
+        },
+        unlink: (p) => unlinkedPaths.push(p),
+      });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VaultError);
+      expect((e as VaultError).code).toBe('vault_reencrypt_rename_failed');
+    }
+    expect(readFileSync(vaultPath, 'utf-8')).toBe('ORIGINAL-CIPHERTEXT-UNCHANGED');
+    expect(unlinkedPaths).toHaveLength(1);
+  });
+
+  it.skipIf(!HAS_AGE)(
+    'REAL age binary — Amendment D proof: decrypt-then-whole-rewrite reencrypts BYTE-FOR-BYTE identical plaintext ' +
+      'to a new recipient set; the new recipient can decrypt afterward; a third, unrelated key still cannot',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-reencrypt-real-age-test-'));
+      dirs.push(dir);
+      const opKey = mintAgeKey(dir, 'operator-key.txt');
+      const vmKey = mintAgeKey(dir, 'vm-key.txt');
+      const strangerKey = mintAgeKey(dir, 'stranger-key.txt');
+      const vaultPath = join(dir, 'vault.age');
+
+      const plaintext = buildVaultPlaintext(PAYLOAD);
+      await writeVault(plaintext, { outPath: vaultPath, recipients: [opKey.publicKey] });
+
+      // Before: only the operator's key decrypts it; the stanza count is 1.
+      const beforeStanzas = countVaultRecipientStanzas(readFileSync(vaultPath));
+      expect(beforeStanzas).toBe(1);
+      const beforePlaintext = spawnSync('age', ['-d', '-i', opKey.keyPath, vaultPath], { encoding: 'utf-8' });
+      expect(beforePlaintext.status, beforePlaintext.stderr).toBe(0);
+
+      await reencryptVault(vaultPath, opKey.keyPath, [opKey.publicKey, vmKey.publicKey]);
+
+      // After: the stanza count reflects the NEW recipient set.
+      const afterStanzas = countVaultRecipientStanzas(readFileSync(vaultPath));
+      expect(afterStanzas).toBe(2);
+
+      // The operator's key STILL decrypts it, to the EXACT SAME bytes as
+      // before (Amendment D: never a read-modify-write — the payload is
+      // byte-for-byte unchanged, only the recipient set differs):
+      const afterViaOperator = spawnSync('age', ['-d', '-i', opKey.keyPath, vaultPath], { encoding: 'utf-8' });
+      expect(afterViaOperator.status, afterViaOperator.stderr).toBe(0);
+      expect(afterViaOperator.stdout).toBe(beforePlaintext.stdout);
+      expect(afterViaOperator.stdout).toBe(plaintext);
+
+      // The NEW recipient (the VM's key) can now decrypt it too, to the SAME bytes:
+      const afterViaVm = spawnSync('age', ['-d', '-i', vmKey.keyPath, vaultPath], { encoding: 'utf-8' });
+      expect(afterViaVm.status, afterViaVm.stderr).toBe(0);
+      expect(afterViaVm.stdout).toBe(beforePlaintext.stdout);
+
+      // A third, unrelated key must NOT decrypt it — proves this isn't accidentally permissive:
+      const decryptStranger = spawnSync('age', ['-d', '-i', strangerKey.keyPath, vaultPath], { encoding: 'utf-8' });
+      expect(decryptStranger.status).not.toBe(0);
+    },
+  );
+
+  it.skipIf(!HAS_AGE)(
+    'REAL age binary — a WRONG identity (cannot decrypt the CURRENT vault) fails loud and leaves the original vault untouched',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-reencrypt-real-age-test-'));
+      dirs.push(dir);
+      const rightKey = mintAgeKey(dir, 'right-key.txt');
+      const wrongKey = mintAgeKey(dir, 'wrong-key.txt');
+      const vmKey = mintAgeKey(dir, 'vm-key.txt');
+      const vaultPath = join(dir, 'vault.age');
+      await writeVault(buildVaultPlaintext(PAYLOAD), { outPath: vaultPath, recipients: [rightKey.publicKey] });
+      const before = readFileSync(vaultPath);
+
+      try {
+        await reencryptVault(vaultPath, wrongKey.keyPath, [rightKey.publicKey, vmKey.publicKey]);
+        throw new Error('should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaultError);
+        expect((e as VaultError).code).toBe('vault_decrypt_failed');
+      }
+      // Original vault is byte-for-byte untouched — still decryptable by the RIGHT key, still 1 recipient:
+      expect(readFileSync(vaultPath)).toEqual(before);
+      expect(countVaultRecipientStanzas(readFileSync(vaultPath))).toBe(1);
+      const stillDecrypts = spawnSync('age', ['-d', '-i', rightKey.keyPath, vaultPath], { encoding: 'utf-8' });
+      expect(stillDecrypts.status, stillDecrypts.stderr).toBe(0);
+      // No temp file left behind either:
+      expect(existsSync(`${vaultPath}.reencrypt-`)).toBe(false);
+    },
+  );
+
+  it.skipIf(!HAS_AGE)(
+    'REAL age binary — a DUPLICATE recipient in the list produces a MATCHING duplicate stanza count (age does not dedupe) — ' +
+      'confirms stanzaCount === recipients.length exactly at write time',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-reencrypt-real-age-test-'));
+      dirs.push(dir);
+      const key = mintAgeKey(dir, 'key.txt');
+      const vaultPath = join(dir, 'vault.age');
+      await writeVault(buildVaultPlaintext(PAYLOAD), { outPath: vaultPath, recipients: [key.publicKey, key.publicKey] });
+      expect(countVaultRecipientStanzas(readFileSync(vaultPath))).toBe(2);
+      const result = readVaultRecipientCount(vaultPath);
+      expect(result).toEqual({ status: 'counted', count: 2 });
+    },
+  );
 });

@@ -83,9 +83,11 @@
  * hazard — see that function's doc for the full reasoning).
  */
 import { spawn } from 'node:child_process';
-import { accessSync, constants as fsConstants, existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { accessSync, constants as fsConstants, existsSync, readFileSync, renameSync, unlinkSync } from 'node:fs';
 import { toVariableSegment } from '@groundnuty/macf-core';
-import { VaultError } from './vault-write.js';
+import type { VaultEncryptFn } from './vault-write.js';
+import { VaultError, ageEncryptToFile } from './vault-write.js';
 import { secretFingerprint } from './fleet-lock.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 // groundnuty/macf#954 — the runner-ops App's vault namespace is keyed on
@@ -607,3 +609,238 @@ export type VaultAgentObservation =
 export type VaultCaObservation =
   | { readonly status: 'confirmed'; readonly presence: VaultCaPresence }
   | { readonly status: 'unknown'; readonly reason: string };
+
+// --- Recipient-set reconciliation — DR-043 §D5 (groundnuty/macf#957) ---
+//
+// The gap this closes: an operator adds a second `age_recipients` entry
+// (e.g. the VM's key, alongside the operator's) so `macf fleet deploy` can
+// decrypt the vault on the VM — but through this increment, NOTHING ever
+// observed the recipient-set difference (`plan.ts` had no item for it) and
+// `apply-fleet.ts::settleVault` early-returned `{status:'skipped'}` whenever
+// no NEW secret was minted this run, which is the ordinary steady state for
+// an already-provisioned fleet. The manifest change committed cleanly,
+// `fleet.lock` looked healthy, and the vault kept decrypting under the OLD
+// recipient set only — written-but-never-applied.
+//
+// **Detection needs no private key at all.** `age`'s multi-recipient file
+// header carries one `-> X25519 <ephemeral-pubkey>` STANZA per recipient —
+// verified empirically against the real `age` binary (v1.x) for this
+// increment's report: 1 recipient -> 1 stanza, 2 recipients -> 2 stanzas,
+// a DUPLICATE recipient passed twice -> 2 stanzas (age does not dedupe, it
+// only warns) — so the stanza COUNT is exactly `recipients.length` at
+// encrypt time, observable by reading the file's plaintext header bytes.
+// What the header can NEVER reveal is WHICH public key a stanza targets:
+// the stored value is an EPHEMERAL key generated fresh per recipient per
+// encryption (anonymous X25519 ECDH), not the recipient's own `age1...`
+// public key. So a stanza-count comparison is a CEILING on what's
+// observable without holding every declared recipient's private key (which
+// the operator does not, in general — the VM's key lives on the VM):
+//   - `stanzaCount !== recipients.length` is a DEFINITE difference (this
+//     module's own write path, `vault-write.ts::ageEncryptToFile`, always
+//     passes ONE `-r` argument per manifest entry — count and length can
+//     only diverge if the SET actually diverged since the last write).
+//   - `stanzaCount === recipients.length` is only a COUNT match — never
+//     claimed as a confirmed identity match (Amendment A4's honest-unknown
+//     floor extends here: "never report a definite match you cannot
+//     establish").
+//
+// **The actual re-encrypt needs an operator identity.** Amendment D: the
+// vault is read-only-decryptable and whole-payload-writable, NEVER
+// read-modify-written. Reconciling a recipient-set change is therefore a
+// DECRYPT-then-WHOLE-REWRITE — {@link reencryptVault} decrypts the CURRENT
+// vault (needs `--identity-key`), validates the plaintext still parses as a
+// real vault, and re-encrypts the SAME, byte-for-byte UNCHANGED plaintext
+// string to the new recipient set. Never a merge, never a partial update,
+// never a parse-then-reserialize round trip that could silently reshape a
+// value — the exact bytes {@link ageDecryptFile} returned are the exact
+// bytes handed to {@link ageEncryptToFile}.
+
+const AGE_MAGIC_LINE = 'age-encryption.org/v1';
+const AGE_STANZA_PREFIX = '-> ';
+const AGE_MAC_LINE_PREFIX = '---';
+/**
+ * Generous bound on how many header bytes to scan before giving up. A real
+ * vault header is a few hundred bytes even at a dozen recipients (2 lines
+ * per X25519 stanza, ~90 bytes each) — this only guards against treating an
+ * entirely non-age file's whole (potentially large) content as "header."
+ */
+const AGE_HEADER_SCAN_LIMIT_BYTES = 65_536;
+
+/**
+ * Count the age-header recipient STANZAS in `bytes` — the file's declared
+ * recipient CARDINALITY, observable WITHOUT any private key (see this
+ * section's doc for why a stanza count can never name recipients, only
+ * count them). Pure. Throws {@link VaultError} `vault_header_malformed` when
+ * `bytes` doesn't start with the age magic line, or no `---` MAC line is
+ * found within {@link AGE_HEADER_SCAN_LIMIT_BYTES} — the same "throw rather
+ * than silently degrade" posture {@link parseVaultPlaintext} already takes
+ * for a malformed plaintext (a query primitive has no "must never die"
+ * constraint the way `vault.sh`'s sourced-shell reader does). The error
+ * message never includes file content beyond the fixed magic-line/prefix
+ * literals already in this source — nothing here can leak ciphertext bytes
+ * (which are never secret in the confidentiality sense, but are also never
+ * useful to echo).
+ */
+export function countVaultRecipientStanzas(bytes: Buffer): number {
+  const scanBytes = bytes.subarray(0, Math.min(bytes.length, AGE_HEADER_SCAN_LIMIT_BYTES));
+  const lines = scanBytes.toString('utf-8').split('\n');
+  if (lines[0] !== AGE_MAGIC_LINE) {
+    throw new VaultError(
+      'vault_header_malformed',
+      `file does not start with the age magic line ("${AGE_MAGIC_LINE}") — this does not look like an age-encrypted ` +
+        'file (wrong path, or a vault damaged beyond its header).',
+    );
+  }
+  let count = 0;
+  let sawMacLine = false;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i] ?? '';
+    if (line.startsWith(AGE_STANZA_PREFIX)) {
+      count++;
+      continue;
+    }
+    if (line.startsWith(AGE_MAC_LINE_PREFIX)) {
+      sawMacLine = true;
+      break;
+    }
+    // Any other line is a stanza BODY line (the wrapped file key) — not a
+    // stanza of its own, so not counted. Standard base64 (age's alphabet)
+    // never produces a leading '-', so a body line can never be mistaken
+    // for a stanza/MAC line.
+  }
+  if (!sawMacLine) {
+    throw new VaultError(
+      'vault_header_malformed',
+      `no "${AGE_MAC_LINE_PREFIX}" header-MAC line found within the first ${String(AGE_HEADER_SCAN_LIMIT_BYTES)} bytes ` +
+        '— this does not look like a valid age-encrypted file (wrong file, or a vault damaged beyond its header).',
+    );
+  }
+  return count;
+}
+
+export type VaultRecipientCountResult =
+  | { readonly status: 'counted'; readonly count: number }
+  /** No file at all at `vaultPath` — NOT an error: a fleet that has never been provisioned has no vault yet, so there is nothing to compare and no drift is possible. */
+  | { readonly status: 'absent' };
+
+export interface VaultRecipientCountDeps {
+  readonly exists?: (path: string) => boolean;
+  readonly readFile?: (path: string) => Buffer;
+}
+
+/**
+ * Sync I/O leaf — no subprocess involved (a pure local-file header read, not
+ * a decrypt), so unlike every other primitive in this module it needs no
+ * `age` binary and no identity key. Throws {@link VaultError} only when the
+ * file EXISTS but its header doesn't parse (see {@link countVaultRecipientStanzas});
+ * a genuinely missing file is the non-error `{status:'absent'}` branch.
+ */
+export function readVaultRecipientCount(vaultPath: string, deps?: VaultRecipientCountDeps): VaultRecipientCountResult {
+  const exists = deps?.exists ?? existsSync;
+  if (!exists(vaultPath)) return { status: 'absent' };
+  const readFile = deps?.readFile ?? ((p: string) => readFileSync(p));
+  return { status: 'counted', count: countVaultRecipientStanzas(readFile(vaultPath)) };
+}
+
+/**
+ * The plan-time recipient-set fact attached to `plan.ts`'s
+ * `ObservedState.vaultRecipients` — sibling shape to {@link VaultAgentObservation}/
+ * {@link VaultCaObservation}, extended with a THIRD state (`'no-vault'`)
+ * because "no vault exists yet" is a normal, non-alarming lifecycle point
+ * (the first successful apply will encrypt fresh to whatever is currently
+ * declared — no drift is possible against a vault that doesn't exist),
+ * distinct from `'unknown'` (a vault file IS present but its header could
+ * not be read/parsed — a genuine problem worth surfacing).
+ */
+export type VaultRecipientsObservation =
+  | { readonly status: 'confirmed'; readonly stanzaCount: number }
+  | { readonly status: 'no-vault' }
+  | { readonly status: 'unknown'; readonly reason: string };
+
+export interface ReencryptVaultDeps {
+  readonly decrypt?: VaultDecryptFn;
+  readonly encrypt?: VaultEncryptFn;
+  readonly rename?: (from: string, to: string) => void;
+  readonly unlink?: (path: string) => void;
+  /** Injectable randomness for a deterministic temp-file name in tests. Defaults to `crypto.randomBytes(6).toString('hex')`. */
+  readonly tmpSuffix?: () => string;
+}
+
+/**
+ * Decrypt-then-whole-rewrite `vaultPath` to `newRecipients` — the ONLY
+ * mutating primitive in this READ module, existing here (not
+ * `vault-write.ts`) because it needs BOTH the decrypt seam (this module)
+ * and the encrypt seam (`vault-write.ts::ageEncryptToFile`); putting it in
+ * `vault-write.ts` would require that module to import this one, which
+ * already imports FROM `vault-write.ts` (`VaultError`) — a cycle.
+ *
+ * **Never a read-modify-write (Amendment D).** The plaintext returned by
+ * {@link ageDecryptFile} is validated (via {@link parseVaultPlaintext} —
+ * thrown away, never used to reconstruct a new payload) then re-encrypted
+ * BYTE FOR BYTE UNCHANGED — no parse-then-reserialize round trip that could
+ * silently reshape a value. Only the recipient set changes; the payload is
+ * the exact bytes that decrypted, both before and after.
+ *
+ * **Crash-safe.** Encrypts to a TEMP path in the SAME directory as
+ * `vaultPath` (so the final `rename` is atomic on one filesystem), then
+ * atomically renames it over `vaultPath` — the live vault is never touched
+ * until the NEW ciphertext is fully written and verified-openable-by-age.
+ * A crash mid-encrypt leaves the temp file orphaned (best-effort-unlinked on
+ * every failure path below) and the ORIGINAL vault untouched — unlike
+ * `writeVault`'s own `-o vaultPath` direct-overwrite (safe for a FIRST
+ * write, where there is nothing yet to protect), this function is used
+ * exclusively against an ALREADY-LIVE vault, so leaving it correct-or-
+ * untouched is the load-bearing property. The temp filename is never one of
+ * `control-repo.ts`'s `CONTROL_REPO_COMMIT_ALLOWLIST` entries (an exact-path
+ * list, not a glob) — an orphaned temp file is simply an untracked file, the
+ * same "merely inert" property that allowlist's own doc establishes for any
+ * other stray file in the checkout.
+ */
+export async function reencryptVault(
+  vaultPath: string,
+  identityPath: string,
+  newRecipients: readonly string[],
+  deps?: ReencryptVaultDeps,
+): Promise<void> {
+  if (newRecipients.length === 0) {
+    throw new VaultError('vault_no_age_recipient', 'reencryptVault: no recipients supplied to re-encrypt to.');
+  }
+  const decrypt = deps?.decrypt ?? ((vp: string, ip: string) => ageDecryptFile(vp, ip));
+  const encrypt = deps?.encrypt ?? ageEncryptToFile;
+  const rename = deps?.rename ?? renameSync;
+  const unlink =
+    deps?.unlink ??
+    ((p: string): void => {
+      try {
+        unlinkSync(p);
+      } catch {
+        /* best-effort — ENOENT (never created) or a permission issue; either way, nothing left to clean up here */
+      }
+    });
+  const suffix = deps?.tmpSuffix?.() ?? randomBytes(6).toString('hex');
+
+  const plaintext = await decrypt(vaultPath, identityPath);
+  // Validate shape BEFORE ever re-encrypting — never reencrypt bytes that
+  // don't even look like a vault. Parsed map is discarded on purpose: the
+  // ORIGINAL `plaintext` string (never reconstructed) is what gets
+  // re-encrypted below — see this function's doc.
+  parseVaultPlaintext(plaintext);
+
+  const tmpPath = `${vaultPath}.reencrypt-${suffix}.tmp`;
+  try {
+    await encrypt(plaintext, newRecipients, tmpPath);
+  } catch (err) {
+    unlink(tmpPath);
+    throw err;
+  }
+  try {
+    rename(tmpPath, vaultPath);
+  } catch (err) {
+    unlink(tmpPath);
+    throw new VaultError(
+      'vault_reencrypt_rename_failed',
+      `re-encrypted vault written to a temp file but could not be renamed into place at "${vaultPath}": ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}

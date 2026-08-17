@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applyFleet, type FleetApplyDeps } from '../../../src/cli/bootstrap/apply-fleet.js';
@@ -27,6 +27,7 @@ import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchang
 import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
 import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
+import { writeVault } from '../../../src/cli/bootstrap/vault-write.js';
 import { applyExitCode, fleetApplyResultToJson, formatApplyResult } from '../../../src/cli/commands/bootstrap-apply.js';
 
 // Default mirrors the §D5 multi-recipient shape (operator key + VM key,
@@ -2185,6 +2186,252 @@ trust:
       // create SUCCEEDS here (gate 2 confirms via waitForAppInstallation,
       // a SEPARATE seam from the guard's own confirm).
       expect(result.runnerOps.status).toBe('created');
+    });
+  });
+
+  // --- DR-043 §D5 recipient-set reconciliation (groundnuty/macf#957) ---
+  //
+  // The bug: an operator adds a recipient to transport.age_recipients with
+  // NO new agent/CA/routing-client secret this run — settleVault's early
+  // `{status:'skipped'}` used to leave the vault silently stale. Every test
+  // below drives `applyFleet` through a REUSED-everything run (mirrors the
+  // existing "reuse: ... vault stays skipped" CA test above) so
+  // settleVault's early-return branch is the ONLY branch reachable —
+  // exactly the scenario this issue exists for.
+  describe('vault recipient-set reconciliation (DR-043 §D5, groundnuty/macf#957)', () => {
+    /** Every test's "nothing new to mint" precondition: CA already present (reuse, no fresh key) -> mintRoutingClient sees caMintedThisRun===false -> 'skipped' automatically; the agent itself is 'reused'. */
+    function reuseTrustDeps(): CaApplyDeps & RunnerRegistrationDeps {
+      return trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' });
+    }
+    const REUSE_PRIOR_LOCK: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+    };
+
+    it.skipIf(!HAS_AGE)(
+      'REAL age binary — apply reconciles a recipient-set change even when NOTHING NEW is minted this run: ' +
+        'decrypt-then-whole-rewrite (Amendment D — byte-for-byte identical plaintext), the NEWLY-ADDED identity ' +
+        'can decrypt afterward, a stranger cannot, fleet.lock is untouched, and no secret reaches log/--json output',
+      async () => {
+        const manifestPath = manifestPathIn();
+        const dir = join(manifestPath, '..');
+        const opKey = mintAgeKey(dir, 'operator-key.txt');
+        const vmKey = mintAgeKey(dir, 'vm-key.txt');
+        const strangerKey = mintAgeKey(dir, 'stranger-key.txt');
+
+        // Seed the "already-provisioned" state: a real vault.age encrypted
+        // to ONLY the operator's key — the manifest below declares TWO.
+        const secretsDir = join(dir, 'secrets');
+        mkdirSync(secretsDir, { recursive: true });
+        const vaultPath = join(secretsDir, 'vault.age');
+        const seedPlaintext = "MACF_AGENT_DEMO_FLEET_CODE_AGENT_APP_ID='app-code-agent'\nMACF_AGENT_DEMO_FLEET_CODE_AGENT_CLIENT_SECRET='SENTINEL-SEEDED-SECRET'\n";
+        await writeVault(seedPlaintext, { outPath: vaultPath, recipients: [opKey.publicKey] });
+        const beforeBytes = readFileSync(vaultPath);
+
+        const manifest = manifestWith([CODE_AGENT], [opKey.publicKey, vmKey.publicKey]);
+        const logs: string[] = [];
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+          trustDeps: reuseTrustDeps(),
+          identityKeyPath: opKey.keyPath,
+          log: (l) => logs.push(l),
+        };
+
+        const result = await applyFleet(manifest, manifestPath, REUSE_PRIOR_LOCK, deps);
+
+        // Reconciled — NOT silently skipped, and no full mint was needed:
+        expect(result.agents.map((a) => a.identity.status)).toEqual(['reused']);
+        expect(result.ca.resolve.status).toBe('reused');
+        expect(result.vault.status).toBe('written');
+        if (result.vault.status !== 'written') return; // narrows for TS below
+        expect(result.vault.path).toBe(vaultPath);
+        expect(result.vault.versioned).toBe(false); // in-place atomic swap, not a timestamped sibling
+
+        // Amendment D proof: the PAYLOAD is byte-for-byte UNCHANGED — only
+        // the recipient set differs. Decrypting via the operator's
+        // (unchanged) identity reproduces the EXACT seeded plaintext.
+        const afterOperator = spawnSync('age', ['-d', '-i', opKey.keyPath, vaultPath], { encoding: 'utf-8' });
+        expect(afterOperator.status, afterOperator.stderr).toBe(0);
+        expect(afterOperator.stdout).toBe(seedPlaintext);
+
+        // The NEWLY-ADDED identity (the VM's key) can now decrypt it too, to the SAME bytes:
+        const afterVm = spawnSync('age', ['-d', '-i', vmKey.keyPath, vaultPath], { encoding: 'utf-8' });
+        expect(afterVm.status, afterVm.stderr).toBe(0);
+        expect(afterVm.stdout).toBe(seedPlaintext);
+
+        // A third, unrelated key still cannot — not accidentally permissive:
+        const afterStranger = spawnSync('age', ['-d', '-i', strangerKey.keyPath, vaultPath], { encoding: 'utf-8' });
+        expect(afterStranger.status).not.toBe(0);
+
+        // The ciphertext bytes DID change (new recipient stanza) — but that
+        // is the only allowed shape of "changed" (proven by the identity
+        // checks above, not by raw-byte comparison, since age's ephemeral
+        // per-recipient keys make ciphertext bytes differ on every encrypt
+        // regardless of recipient set).
+        expect(readFileSync(vaultPath)).not.toEqual(beforeBytes);
+
+        // fleet.lock is UNAFFECTED — no NEW secret was minted this run, so
+        // the batched-lock-write guard (apply-fleet.ts's
+        // `pendingCreatedUpdates`/caSecrets/routingClientSecrets check) must
+        // NOT have fired even though `vault.status === 'written'`.
+        const lockAfter = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
+        expect(lockAfter.agents).toEqual([{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }]);
+        expect(lockAfter.fingerprints?.['ca_key']).toBeUndefined();
+        expect(lockAfter.fingerprints?.['routing_client_key']).toBeUndefined();
+
+        // No secret ever reaches log output or the --json render:
+        const jsonOutput = JSON.stringify(fleetApplyResultToJson(result));
+        const combined = `${logs.join('\n')}\n${jsonOutput}`;
+        expect(combined).not.toContain(seedPlaintext);
+        expect(combined).not.toContain('SENTINEL-SEEDED-SECRET');
+        expect(combined).not.toContain('EXISTING-CA-CERT-PEM');
+        expect(combined).not.toContain(readFileSync(opKey.keyPath, 'utf-8'));
+        expect(combined).not.toContain(readFileSync(vmKey.keyPath, 'utf-8'));
+      },
+    );
+
+    it('refuses loudly (never silently skips) when a recipient shortfall is detected but --identity-key was NOT supplied', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT], ['age1operator', 'age1vm']); // 2 declared
+      let reencryptCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: reuseTrustDeps(),
+        // identityKeyPath deliberately OMITTED
+        vaultRecipientDeps: {
+          readRecipientCount: () => ({ status: 'counted', count: 1 }), // vault currently has 1
+          reencrypt: async () => {
+            reencryptCalled = true;
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, REUSE_PRIOR_LOCK, deps);
+
+      expect(result.vault.status).toBe('failed');
+      if (result.vault.status === 'failed') {
+        expect(result.vault.reason).toContain('--identity-key');
+        expect(result.vault.reason).toContain('fewer');
+      }
+      expect(reencryptCalled).toBe(false);
+      expect(applyExitCode(result)).toBe(1);
+    });
+
+    it('NEVER auto-shrinks: MORE stanzas than declared refuses even WITH --identity-key (re-encrypting to fewer keys would revoke one)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT], ['age1operator']); // 1 declared
+      let reencryptCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: reuseTrustDeps(),
+        identityKeyPath: '/fake/operator-key.txt',
+        vaultRecipientDeps: {
+          readRecipientCount: () => ({ status: 'counted', count: 2 }), // vault currently has 2
+          reencrypt: async () => {
+            reencryptCalled = true;
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, REUSE_PRIOR_LOCK, deps);
+
+      expect(result.vault.status).toBe('failed');
+      if (result.vault.status === 'failed') {
+        expect(result.vault.reason).toContain('does NOT auto-shrink');
+        expect(result.vault.reason).toContain('REVOKE');
+      }
+      expect(reencryptCalled).toBe(false);
+      expect(applyExitCode(result)).toBe(1);
+    });
+
+    it('unchanged recipient set: no churn — reencrypt is never invoked and the run reports "skipped" (no spurious rewrite on every ordinary apply)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT], ['age1operator', 'age1vm']); // 2 declared
+      let reencryptCalled = false;
+      let readCount = 0;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: reuseTrustDeps(),
+        identityKeyPath: '/fake/operator-key.txt',
+        vaultRecipientDeps: {
+          readRecipientCount: () => {
+            readCount++;
+            return { status: 'counted', count: 2 }; // already matches
+          },
+          reencrypt: async () => {
+            reencryptCalled = true;
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, REUSE_PRIOR_LOCK, deps);
+
+      expect(result.vault.status).toBe('skipped');
+      expect(reencryptCalled).toBe(false);
+      // Detection DID run (every apply checks, regardless of --identity-key) — it just found nothing to do:
+      expect(readCount).toBe(1);
+    });
+
+    it('no vault provisioned yet (a brand-new, never-applied fleet): reads "absent", reports "skipped" — no drift is possible against a vault that does not exist', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT], ['age1operator', 'age1vm']);
+      let reencryptCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: reuseTrustDeps(),
+        identityKeyPath: '/fake/operator-key.txt',
+        vaultRecipientDeps: {
+          readRecipientCount: () => ({ status: 'absent' }),
+          reencrypt: async () => {
+            reencryptCalled = true;
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, REUSE_PRIOR_LOCK, deps);
+
+      expect(result.vault.status).toBe('skipped');
+      expect(reencryptCalled).toBe(false);
+    });
+
+    it('an unreadable/malformed vault header at apply time reports "failed" honestly — never a silent skip, never a false match', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT], ['age1operator', 'age1vm']);
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: reuseTrustDeps(),
+        identityKeyPath: '/fake/operator-key.txt',
+        vaultRecipientDeps: {
+          readRecipientCount: () => {
+            throw new Error('no "---" header-MAC line found within the first 65536 bytes');
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, REUSE_PRIOR_LOCK, deps);
+
+      expect(result.vault.status).toBe('failed');
+      if (result.vault.status === 'failed') {
+        expect(result.vault.reason).toContain('header-MAC line');
+      }
+      expect(applyExitCode(result)).toBe(1);
+    });
+
+    it('a run that DOES mint something new (e.g. a fresh CA) takes the ORDINARY vault-write path, unaffected by the recipient-reconcile branch', async () => {
+      // Guards against a regression where reconcileVaultRecipients's early
+      // return accidentally swallows the pre-existing "something new to
+      // mint" path — this mirrors the very first test in this file
+      // (freshly-created agent) but re-asserted here, in this describe
+      // block, as an explicit non-regression pin.
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('created');
+      expect(result.vault.status).toBe('written');
     });
   });
 });
