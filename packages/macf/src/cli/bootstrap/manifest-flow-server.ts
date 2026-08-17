@@ -1,6 +1,8 @@
 /**
  * The ephemeral localhost listener for GitHub's App-manifest flow — DR-043 §D2
- * consent gate 1 (Slice 2b increment 2, groundnuty/macf#838).
+ * consent gate 1 (Slice 2b increment 2, groundnuty/macf#838), extended
+ * (groundnuty/macf#952) to ALSO serve consent gate 2's install interstitial —
+ * see {@link startInstallInterstitial} below.
  *
  * **This is what removes the browser-driving rail.** The DR-035 skill drove the
  * operator's Chrome through the manifest flow via the chrome-devtools MCP and
@@ -14,11 +16,55 @@
  * Binding is `127.0.0.1`-only (never `0.0.0.0`): the callback carries a
  * credential-bearing one-shot code, so the listener must not be reachable off
  * the host. The server is single-shot — it closes as soon as it has the code.
+ *
+ * **groundnuty/macf#952 — why gate 2 reuses this SAME ephemeral-listener
+ * primitive rather than a new implementation.** The operator's first live
+ * install picked GitHub's "All repositories" over "Only select repositories"
+ * because nothing told them which to choose UNTIL `apply` refused the result
+ * afterward (#943's `validateRunnerOpsInstall` backstop, unchanged by this
+ * file). Sending the operator straight to GitHub's own install page leaves us
+ * with zero control over what they see before they click. The fix is the same
+ * shape as gate 1: serve OUR OWN page first (the instruction), then link out.
+ * {@link bindEphemeralListener} is the ONE `createServer` + `listen(0,
+ * '127.0.0.1', …)` primitive both {@link startManifestFlow} (gate 1) and
+ * {@link startInstallInterstitial} (gate 2) build on — no new dependency, no
+ * second server *implementation*. A second live `Server` OBJECT per gate is
+ * unavoidable (gate 1's listener is already closed by the time gate 2 opens
+ * on the create path, and the resume-install path — `apply-agent.ts`'s
+ * `decision.action === 'resume-install'` — has no gate-1 listener to reuse at
+ * all, since gate 1 never ran that turn) — sharing the bind/close CODE is
+ * what "reuse it" means here.
  */
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { GitHubAppManifest } from './app-manifest.js';
+
+/**
+ * Bind ONE ephemeral `127.0.0.1` HTTP listener — the shared primitive behind
+ * both {@link startManifestFlow} and {@link startInstallInterstitial} (see
+ * module doc). The caller attaches its own `'request'` handler AFTER bind
+ * (both current callers need the bound port to build the content they serve
+ * — gate 1's `redirect_url`, gate 2's own-URL-independent content doesn't
+ * strictly need it, but the symmetry keeps one bind/attach shape for both).
+ */
+async function bindEphemeralListener(): Promise<{ readonly server: Server; readonly baseUrl: string; readonly close: () => Promise<void> }> {
+  const server: Server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    // 127.0.0.1 ONLY — see module doc.
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const { port } = server.address() as AddressInfo;
+  const baseUrl = `http://127.0.0.1:${String(port)}`;
+  let closed = false;
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await new Promise<void>((resolve) => { server.close(() => { resolve(); }); });
+  };
+  return { server, baseUrl, close };
+}
 
 /** Where the manifest form POSTs: personal-account vs organization App creation. */
 export function manifestFormAction(owner: { readonly account: string; readonly type: 'user' | 'org' }): string {
@@ -37,18 +83,34 @@ export function escapeHtmlAttribute(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
+/** Total consent gates per identity (create-manifest + install) — DR-043 §D2. Shared by both pages' "gate N of GATE_TOTAL" numbering (groundnuty/macf#952). */
+export const GATE_TOTAL = 2;
+
 /**
  * The self-submitting form GitHub's manifest flow requires: a POST to
  * `settings/apps/new` with the manifest JSON in a `manifest` field. Pure —
  * exported for testing.
+ *
+ * **groundnuty/macf#952 — carries the gate-1 instruction on the page itself,**
+ * not only in the terminal: which App is being created (role + name) and
+ * that the settings below are submitted AS-IS (nothing for the operator to
+ * review or edit here — GitHub's own confirmation page is next).
  */
-export function renderManifestForm(manifest: GitHubAppManifest, action: string): string {
+export function renderManifestForm(manifest: GitHubAppManifest, action: string, role: string): string {
   const json = escapeHtmlAttribute(JSON.stringify(manifest));
+  const name = escapeHtmlAttribute(manifest.name);
+  const roleEsc = escapeHtmlAttribute(role);
   return `<!doctype html>
-<html><head><meta charset="utf-8"><title>Creating ${escapeHtmlAttribute(manifest.name)}…</title></head>
+<html><head><meta charset="utf-8"><title>Consent gate 1 of ${String(GATE_TOTAL)} — creating ${name}</title></head>
 <body>
-<p>Submitting the App manifest for <strong>${escapeHtmlAttribute(manifest.name)}</strong> to GitHub…</p>
-<p>If this page does not advance on its own, press the button.</p>
+<h1>Consent gate 1 of ${String(GATE_TOTAL)} — role "${roleEsc}"</h1>
+<p>Creating GitHub App: <strong>${name}</strong></p>
+<p>This page automatically submits GitHub's App-manifest creation form below. The settings
+(permissions, webhook events) come from the fleet manifest and are submitted <strong>as-is</strong> —
+there is nothing here to review or edit.</p>
+<p>After it submits, GitHub will show its own confirmation page — click
+<strong>&ldquo;Create GitHub App&rdquo;</strong> there to finish.</p>
+<p>If this page does not advance on its own, press the button below.</p>
 <form id="macf-manifest-form" method="post" action="${escapeHtmlAttribute(action)}">
   <input type="hidden" name="manifest" value="${json}">
   <button type="submit">Continue to GitHub</button>
@@ -96,6 +158,8 @@ export interface StartManifestFlowOptions {
   readonly formAction: string;
   /** How long to wait for the operator's click before giving up. Default 10 min. */
   readonly timeoutMs?: number;
+  /** The role this App is being created for — rendered into the served page's instruction (groundnuty/macf#952). */
+  readonly role: string;
 }
 
 /**
@@ -128,16 +192,7 @@ export async function startManifestFlow(opts: StartManifestFlowOptions): Promise
 
   // No request listener yet — the handler below needs the manifest, which in
   // turn needs `redirectUrl`, which only exists after `listen()` resolves.
-  const server: Server = createServer();
-
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    // 127.0.0.1 ONLY — the callback carries a credential-bearing one-shot code.
-    server.listen(0, '127.0.0.1', resolve);
-  });
-
-  const { port } = server.address() as AddressInfo;
-  const base = `http://127.0.0.1:${String(port)}`;
+  const { server, baseUrl: base, close } = await bindEphemeralListener();
   const redirectUrl = `${base}/callback`;
 
   // Build the REAL manifest now — `redirectUrl` is the listener's own
@@ -158,15 +213,8 @@ export async function startManifestFlow(opts: StartManifestFlowOptions): Promise
       return;
     }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderManifestForm(manifest, opts.formAction));
+    res.end(renderManifestForm(manifest, opts.formAction, opts.role));
   });
-
-  let closed = false;
-  const close = async (): Promise<void> => {
-    if (closed) return;
-    closed = true;
-    await new Promise<void>((resolve) => server.close(() => { resolve(); }));
-  };
 
   const timeoutMs = opts.timeoutMs ?? 10 * 60 * 1000;
 
@@ -208,4 +256,101 @@ export async function startManifestFlow(opts: StartManifestFlowOptions): Promise
     },
     close,
   };
+}
+
+// --- Consent gate 2's install interstitial (groundnuty/macf#952) ---
+
+export interface InstallInterstitialOptions {
+  /** The role this identity is being installed for (e.g. `code-agent`, `runner-ops`). */
+  readonly role: string;
+  /** The App's slug/name, for display only. */
+  readonly appName: string;
+  /** GitHub's real install page — what the page's button links to. NEVER opened directly by the caller; this page is. */
+  readonly installUrl: string;
+  /**
+   * The EXACT repos to select on GitHub's page — literal names, never a
+   * class description (groundnuty/macf#952: "'this fleet's repos' is not
+   * actionable at a dropdown"). Rendered in `owner/repo` form (unambiguous)
+   * with the bare repo name — the form GitHub's own per-account repo picker
+   * uses — called out first.
+   */
+  readonly repos: readonly string[];
+  /** One sentence on why "Only select repositories" matters for THIS identity (varies by permission set — see `apply-agent.ts::installWhyText`). */
+  readonly whyText: string;
+  readonly gateNumber: number;
+  readonly gateTotal: number;
+}
+
+/** `owner/repo` -> `repo` (the form GitHub's own per-account repository picker lists repos in). Falls back to the full string when there's no `/`. */
+function repoShortName(fullName: string): string {
+  const i = fullName.lastIndexOf('/');
+  return i === -1 ? fullName : fullName.slice(i + 1);
+}
+
+/**
+ * The gate-2 interstitial — served on OUR listener, BEFORE the operator ever
+ * reaches GitHub's install page. Pure — exported for testing.
+ *
+ * **Never renders a secret.** {@link InstallInterstitialOptions} carries no
+ * credential field at all (role/appName/installUrl/repos/whyText are all
+ * plan-level facts, not secrets) — structurally, not just by convention.
+ */
+export function renderInstallInterstitial(opts: InstallInterstitialOptions): string {
+  const roleEsc = escapeHtmlAttribute(opts.role);
+  const appNameEsc = escapeHtmlAttribute(opts.appName);
+  const installUrlEsc = escapeHtmlAttribute(opts.installUrl);
+  const repoItems = opts.repos.length > 0
+    ? opts.repos.map((r) => `  <li><strong>${escapeHtmlAttribute(repoShortName(r))}</strong> <span class="dim">(${escapeHtmlAttribute(r)})</span></li>`).join('\n')
+    : '  <li><em>(no repos declared in the fleet manifest — verify before installing)</em></li>';
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>Consent gate ${String(opts.gateNumber)} of ${String(opts.gateTotal)} — installing ${appNameEsc}</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+  .dim { color: #666; }
+  .why { background: #fff3cd; border: 1px solid #d0a02e; border-radius: 4px; padding: 0.75rem 1rem; }
+  .button { display: inline-block; margin-top: 1rem; padding: 0.6rem 1.2rem; background: #1f6feb; color: #fff;
+            text-decoration: none; border-radius: 6px; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Consent gate ${String(opts.gateNumber)} of ${String(opts.gateTotal)} — role "${roleEsc}"</h1>
+<p>Installing GitHub App: <strong>${appNameEsc}</strong></p>
+<p>On the page this button opens, GitHub will ask which repositories to install this App on. You MUST choose:</p>
+<ul>
+  <li><strong>&ldquo;Only select repositories&rdquo;</strong> — NOT &ldquo;All repositories&rdquo;</li>
+</ul>
+<p>Then select exactly:</p>
+<ul>
+${repoItems}
+</ul>
+<p class="why">${escapeHtmlAttribute(opts.whyText)}</p>
+<p><a class="button" href="${installUrlEsc}">Continue to GitHub to install</a></p>
+<p class="dim">If the button doesn't work, open this URL yourself: ${installUrlEsc}</p>
+</body></html>`;
+}
+
+export interface InstallInterstitialHandles {
+  /** Open THIS in a browser — our own page, not GitHub's install URL directly. */
+  readonly startUrl: string;
+  /** Idempotent shutdown. Always call (e.g. in a `finally`). */
+  close: () => Promise<void>;
+}
+
+/**
+ * Start the single-shot gate-2 interstitial listener on an ephemeral
+ * 127.0.0.1 port — the SAME {@link bindEphemeralListener} primitive
+ * {@link startManifestFlow} uses (see module doc). Unlike gate 1, this page
+ * needs no callback: gate 2's completion is observed by polling
+ * `GET /app/installations` (`identity-confirm.ts::waitForAppInstallation`),
+ * not by a redirect this listener would need to catch — so the served
+ * content is static for the listener's whole lifetime, no per-request state.
+ */
+export async function startInstallInterstitial(opts: InstallInterstitialOptions): Promise<InstallInterstitialHandles> {
+  const { server, baseUrl, close } = await bindEphemeralListener();
+  const html = renderInstallInterstitial(opts);
+  server.on('request', (_req: IncomingMessage, res: ServerResponse) => {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+  });
+  return { startUrl: `${baseUrl}/`, close };
 }

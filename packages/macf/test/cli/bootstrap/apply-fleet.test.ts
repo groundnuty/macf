@@ -150,6 +150,8 @@ function agentDepsFor(role: string, outcome: 'reused' | 'resumed-install' | 'cre
     startManifestFlow: async () => ({
       startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {},
     }),
+    // groundnuty/macf#952 — consent gate 2's own locally-served interstitial.
+    startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
     exchangeManifestCode: async () => creds(role),
     waitForAppInstallation: async () => ({ appId, installId, appSlug: `demo-fleet-${role}`, accountLogin: 'groundnuty' }),
     confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
@@ -411,6 +413,7 @@ describe('applyFleet', () => {
     // keyed on the appId being confirmed.
     const agentDeps: AgentApplyDeps = {
       startManifestFlow: async () => { throw new Error('must not be called — both roles have prior entries'); },
+      startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
       exchangeManifestCode: async () => { throw new Error('must not be called'); },
       resolveKeyPath: () => '/fake.pem',
       confirmAppInstallation: async (appId) =>
@@ -502,6 +505,7 @@ describe('applyFleet', () => {
     };
     const agentDeps: AgentApplyDeps = {
       startManifestFlow: async () => { throw new Error('must not be called — both roles have prior entries'); },
+      startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
       exchangeManifestCode: async () => { throw new Error('must not be called'); },
       resolveKeyPath: () => '/fake.pem',
       confirmAppInstallation: async (appId) =>
@@ -579,6 +583,7 @@ describe('applyFleet', () => {
     };
     const agentDeps: AgentApplyDeps = {
       startManifestFlow: async () => { throw new Error('must not be called'); },
+      startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
       exchangeManifestCode: async () => { throw new Error('must not be called'); },
       resolveKeyPath: () => '/fake.pem',
       confirmAppInstallation: async () => ({
@@ -610,6 +615,7 @@ describe('applyFleet', () => {
     const encryptCalls: { plaintext: string; outPath: string }[] = [];
     const agentDeps: AgentApplyDeps = {
       startManifestFlow: async () => ({ startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} }),
+      startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
       exchangeManifestCode: async () => creds('code-agent'),
       resolveKeyPath: () => '/fake.pem',
       confirmAppInstallation: async () => ({ status: 'confirmed', install: { appId: 'app-science-agent', installId: 'install-2', appSlug: 'demo-fleet-science-agent', accountLogin: 'groundnuty' } }),
@@ -887,6 +893,7 @@ trust:
         calls.push(`gate1:${role}`);
         return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => `code-for-${role}`, close: async () => {} };
       },
+      startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
       exchangeManifestCode: async (code) => creds(code.replace('code-for-', '')),
       waitForAppInstallation: async (opts) => {
         const role = (opts.expected.appSlug ?? '').replace(`${fleetName}-`, '');
@@ -1272,6 +1279,7 @@ trust:
       // 'written' this run is a fresh CA secret, which reuse must not stage.
       const agentDeps: AgentApplyDeps = {
         startManifestFlow: async () => { throw new Error('must not be called — both roles have prior entries'); },
+        startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
         exchangeManifestCode: async () => { throw new Error('must not be called'); },
         resolveKeyPath: () => '/fake.pem',
         confirmAppInstallation: async (appId) => ({

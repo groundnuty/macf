@@ -43,7 +43,7 @@ import type { GitHubAppManifest } from '../bootstrap/app-manifest.js';
 import { buildAppManifest, repoHomepageUrl } from '../bootstrap/app-manifest.js';
 import { appInstallationUrl, confirmAppInstallation as realConfirmAppInstallation } from '../bootstrap/identity-confirm.js';
 import type { ExpectedIdentity, IdentityConfirmation } from '../bootstrap/identity-confirm.js';
-import { confirmBeforeCreateGuard, realAgentApplyDeps } from '../bootstrap/apply-agent.js';
+import { confirmBeforeCreateGuard, installReposForIdentity, realAgentApplyDeps } from '../bootstrap/apply-agent.js';
 import type { AgentApplyOutcome, CreateGuardDecision, CreateGuardDeps } from '../bootstrap/apply-agent.js';
 import { realCloneRepo, realCommitAndPush } from '../bootstrap/apply-repo-init.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
@@ -166,6 +166,14 @@ export interface PlannedAppCreation {
    * `AppCredentials.slug` instead, never re-derives it.
    */
   readonly installUrl: string;
+  /**
+   * The EXACT repos consent gate 2 needs selected (groundnuty/macf#952) —
+   * same derivation `apply-agent.ts::installReposForIdentity` uses for the
+   * real gate-2 interstitial, so the dry-run preview and the live gate never
+   * describe the scope differently. Never the phrase "this fleet's repos" —
+   * see `formatPlannedAppCreations`'s doc for why.
+   */
+  readonly installRepos: readonly string[];
 }
 
 /**
@@ -197,6 +205,7 @@ export function plannedAppCreations(
       repo: agent.repo,
       manifest: appManifest,
       installUrl: appInstallationUrl(appManifest.name),
+      installRepos: installReposForIdentity(agent.role, manifest),
     });
   }
 
@@ -221,6 +230,11 @@ export function plannedAppCreations(
       repo: '',
       manifest: rrManifest,
       installUrl: appInstallationUrl(deriveRunnerOpsHandle(manifest.metadata.name)),
+      // No `manifest.agents[]` entry matches `RUNNER_OPS_ROLE` (by design —
+      // see `apply-runner-ops.ts`'s doc), so `installReposForIdentity` falls
+      // through to its "every declared agent repo" branch — same derivation
+      // the live gate-2 interstitial uses.
+      installRepos: installReposForIdentity(RUNNER_OPS_ROLE, manifest),
     });
   }
 
@@ -252,7 +266,14 @@ export function formatPlannedAppCreations(creations: readonly PlannedAppCreation
     parts.push(`      public: ${String(c.manifest.public)}   webhook active: ${String(c.manifest.hook_attributes.active)}`);
     parts.push(`      consent gate 2 (install, after gate 1 creates the App): ${c.installUrl}`);
     if (c.role === RUNNER_OPS_ROLE) {
-      parts.push('      ⚠ on the install page: choose "Only select repositories" and pick exactly this fleet\'s repos — NEVER "All repositories".');
+      // groundnuty/macf#952 — the literal repo names, never "this fleet's
+      // repos": a class description isn't actionable at GitHub's repo-picker
+      // dropdown. `c.installRepos` is the SAME `installReposForIdentity`
+      // derivation the live gate-2 interstitial renders.
+      parts.push(
+        `      ⚠ on the install page: choose "Only select repositories" and select exactly: ` +
+          `${c.installRepos.join(', ')} — NEVER "All repositories".`,
+      );
     }
   }
   return parts.join('\n');

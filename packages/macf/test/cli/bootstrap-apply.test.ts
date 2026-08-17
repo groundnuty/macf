@@ -269,6 +269,27 @@ describe('plannedAppCreations (pure)', () => {
     }
   });
 
+  // groundnuty/macf#952 — the dry-run preview names the LITERAL repos each
+  // App would need selected, using the SAME derivation the live gate-2
+  // interstitial uses (`apply-agent.ts::installReposForIdentity`).
+  it('installRepos: each agent gets just its own repo; the runner-ops gets every declared agent repo', () => {
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
+    const byRole = Object.fromEntries(creations.map((c) => [c.role, c.installRepos]));
+    expect(byRole['code-agent']).toEqual(['groundnuty/demo-code']);
+    expect(byRole['science-agent']).toEqual(['groundnuty/demo-science']);
+    expect(byRole['runner-ops']).toEqual(['groundnuty/demo-code', 'groundnuty/demo-science']);
+  });
+
+  it('formatPlannedAppCreations names the LITERAL runner-ops repos, never the phrase "this fleet\'s repos" (groundnuty/macf#952)', () => {
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
+    const out = formatPlannedAppCreations(creations);
+    expect(out).toContain('select exactly: groundnuty/demo-code, groundnuty/demo-science');
+    expect(out).not.toMatch(/this fleet's repos/);
+    expect(out).toMatch(/Only select repositories/);
+  });
+
   it('EXCLUDES an agent whose App is already present (no re-create)', () => {
     const plan = computePlan(manifest, observedWithApp('code-agent'));
     const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
@@ -363,6 +384,10 @@ function fakeAgentDeps(overrides: Partial<AgentApplyDeps> = {}): AgentApplyDeps 
       waitForCode: async () => 'the-code',
       close: async () => {},
     }),
+    // groundnuty/macf#952 — consent gate 2's own locally-served interstitial;
+    // a fixed, gate-1-distinct URL so tests can tell the two gates' opened
+    // URLs apart without depending on real ephemeral-port allocation.
+    startInstallInterstitial: async () => ({ startUrl: 'http://127.0.0.1:19/', close: async () => {} }),
     exchangeManifestCode: async () => SENTINEL_CREDS,
     // groundnuty/macf#943 — `repository_selection: 'selected'` so the SAME
     // shared fixture also satisfies the runner-ops's own gate-2
@@ -492,6 +517,31 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     );
     expect(code).toBe(0);
     expect(confirmPlanCalled).toBe(false);
+  });
+
+  // groundnuty/macf#952 requirement 5 — "`--yes` must not skip these" (the
+  // per-gate consent instruction). `--yes` skips ONLY the plan-approval
+  // prompt (`confirmPlan`, asserted above) — the gate instruction has no
+  // conditional on `yes` anywhere in `apply-agent.ts` at all, so proving it
+  // still prints under `--yes` is really proving there's nothing to skip.
+  // The run completing synchronously (no manual interaction, no hang) IS
+  // "prints without waiting" — there is no blocking prompt in this path.
+  it('--yes: the gate instructions still print (both gates), even though the plan-approval prompt never fires', async () => {
+    const file = writeManifest();
+    const gateLogs: string[] = [];
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+      fakeMutateDeps(file, {
+        buildAgentDeps: (log) => fakeAgentDeps({ log: (line) => { gateLogs.push(line); log(line); } }),
+      }),
+    );
+    expect(code).toBe(0);
+    const joined = gateLogs.join('\n');
+    expect(joined).toMatch(/consent gate 1 of 2/);
+    expect(joined).toMatch(/consent gate 2 of 2/);
+    expect(joined).toMatch(/submitted AS-IS/i);
+    expect(joined).toMatch(/Only select repositories/);
   });
 
   it('happy path: approves, creates both agents, writes a real fleet.lock + vault.age next to the manifest', async () => {

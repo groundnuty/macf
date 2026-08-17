@@ -17,7 +17,9 @@ import {
   escapeHtmlAttribute,
   manifestFormAction,
   renderCallbackPage,
+  renderInstallInterstitial,
   renderManifestForm,
+  startInstallInterstitial,
   startManifestFlow,
 } from '../../../src/cli/bootstrap/manifest-flow-server.js';
 import { buildAppManifest } from '../../../src/cli/bootstrap/app-manifest.js';
@@ -92,12 +94,30 @@ describe('manifest-flow-server (pure parts)', () => {
   });
 
   it('escapes the manifest JSON into the form value (no attribute break-out)', () => {
-    const html = renderManifestForm(manifest, 'https://github.com/settings/apps/new');
+    const html = renderManifestForm(manifest, 'https://github.com/settings/apps/new', 'code-agent');
     expect(html).toContain('name="manifest"');
     // The JSON's own double quotes must be entity-escaped inside the value attribute.
     expect(html).not.toMatch(/value="\{"/);
     expect(html).toContain('&quot;');
     expect(html).toContain('demo-code-agent');
+  });
+
+  // groundnuty/macf#952 — gate 1's served page carries the instruction: which
+  // App (role + name) is being created, and that the manifest is submitted
+  // as-is.
+  it('carries the gate-1 instruction: role, App name, and "submitted as-is" (groundnuty/macf#952)', () => {
+    const html = renderManifestForm(manifest, 'https://github.com/settings/apps/new', 'code-agent');
+    expect(html).toContain('role "code-agent"');
+    expect(html).toContain('demo-code-agent'); // the App name (manifest.name)
+    expect(html).toMatch(/submitted.*as-is/);
+    expect(html).toMatch(/consent gate 1 of 2/i);
+  });
+
+  it('NEVER renders a secret on gate 1 — GitHubAppManifest has no credential field, and the rendered HTML proves it (groundnuty/macf#952)', () => {
+    const html = renderManifestForm(manifest, 'https://github.com/settings/apps/new', 'code-agent');
+    for (const sentinel of ['BEGIN RSA PRIVATE KEY', 'clientSecret', 'webhookSecret', 'client_secret', 'webhook_secret']) {
+      expect(html).not.toContain(sentinel);
+    }
   });
 
   it('escapeHtmlAttribute covers the injection-relevant characters', () => {
@@ -107,6 +127,93 @@ describe('manifest-flow-server (pure parts)', () => {
   it('renders distinct callback pages for success and a code-less redirect', () => {
     expect(renderCallbackPage('demo-code-agent', true)).toMatch(/created/);
     expect(renderCallbackPage('demo-code-agent', false)).toMatch(/No manifest code/i);
+  });
+});
+
+describe('renderInstallInterstitial (groundnuty/macf#952 — pure)', () => {
+  const OPTS = {
+    role: 'runner-ops',
+    appName: 'demo-fleet-runner-ops',
+    installUrl: 'https://github.com/apps/demo-fleet-runner-ops/installations/new',
+    repos: ['groundnuty/exp-science-agent', 'groundnuty/exp-code-agent'],
+    whyText:
+      'Why: this App holds administration:write; granting it every repository in the account is blast radius ' +
+      'the fleet does not need, and apply will refuse an "all" install.',
+    gateNumber: 2,
+    gateTotal: 2,
+  };
+
+  it('names the literal repositories from the manifest (bare name AND owner/repo)', () => {
+    const html = renderInstallInterstitial(OPTS);
+    expect(html).toContain('exp-science-agent');
+    expect(html).toContain('exp-code-agent');
+    expect(html).toContain('groundnuty/exp-science-agent');
+  });
+
+  it('states the "Only select repositories" requirement', () => {
+    const html = renderInstallInterstitial(OPTS);
+    expect(html).toMatch(/Only select repositories/);
+    expect(html).toMatch(/NOT.*All repositories/);
+  });
+
+  it('links to the correct GitHub install URL', () => {
+    const html = renderInstallInterstitial(OPTS);
+    expect(html).toContain(`href="${OPTS.installUrl}"`);
+  });
+
+  it('is numbered and role-attributed', () => {
+    const html = renderInstallInterstitial(OPTS);
+    expect(html).toMatch(/consent gate 2 of 2/i);
+    expect(html).toContain('role "runner-ops"');
+  });
+
+  it('carries the why-text (HTML-attribute-escaped — the source `"`s become `&quot;`)', () => {
+    expect(renderInstallInterstitial(OPTS)).toContain(escapeHtmlAttribute(OPTS.whyText));
+  });
+
+  it('handles an empty repo list honestly rather than rendering nothing', () => {
+    const html = renderInstallInterstitial({ ...OPTS, repos: [] });
+    expect(html).toMatch(/no repos declared/i);
+  });
+
+  it('NEVER renders a secret — the options shape has no credential field, and the rendered HTML proves it (groundnuty/macf#952)', () => {
+    const html = renderInstallInterstitial(OPTS);
+    for (const sentinel of ['BEGIN RSA PRIVATE KEY', 'clientSecret', 'webhookSecret', 'client_secret', 'webhook_secret']) {
+      expect(html).not.toContain(sentinel);
+    }
+  });
+});
+
+describe('startInstallInterstitial (live loopback server, groundnuty/macf#952)', () => {
+  const OPTS = {
+    role: 'code-agent',
+    appName: 'demo-fleet-code-agent',
+    installUrl: 'https://github.com/apps/demo-fleet-code-agent/installations/new',
+    repos: ['groundnuty/demo-code'],
+    whyText: 'Why: this App only needs access to the repo(s) listed above.',
+    gateNumber: 2,
+    gateTotal: 2,
+  };
+
+  it('binds 127.0.0.1 and serves the interstitial, linking to the real install URL', async () => {
+    const handles = await startInstallInterstitial(OPTS);
+    try {
+      expect(handles.startUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
+      const res = await fetch(handles.startUrl);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('demo-code');
+      expect(html).toContain(`href="${OPTS.installUrl}"`);
+      expect(html).toMatch(/Only select repositories/);
+    } finally {
+      await handles.close();
+    }
+  });
+
+  it('close() is idempotent', async () => {
+    const handles = await startInstallInterstitial(OPTS);
+    await handles.close();
+    await expect(handles.close()).resolves.toBeUndefined();
   });
 });
 
@@ -139,6 +246,7 @@ describe('startManifestFlow (live loopback server)', () => {
     const flow = await startManifestFlow({
       buildManifest: (redirectUrl) => buildAppManifest({ fleetName: 'demo', role: 'code-agent', redirectUrl }),
       formAction: 'https://github.com/settings/apps/new',
+      role: 'code-agent',
     });
     try {
       expect(flow.startUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
@@ -161,6 +269,7 @@ describe('startManifestFlow (live loopback server)', () => {
     const flow = await startManifestFlow({
       buildManifest: (redirectUrl) => buildAppManifest({ fleetName: 'demo', role: 'code-agent', redirectUrl }),
       formAction: 'https://github.com/settings/apps/new',
+      role: 'code-agent',
     });
     try {
       const codePromise = flow.waitForCode();
@@ -176,6 +285,7 @@ describe('startManifestFlow (live loopback server)', () => {
     const flow = await startManifestFlow({
       buildManifest: (redirectUrl) => buildAppManifest({ fleetName: 'demo', role: 'code-agent', redirectUrl }),
       formAction: 'https://github.com/settings/apps/new',
+      role: 'code-agent',
     });
     await flow.close();
     await expect(flow.close()).resolves.toBeUndefined();
@@ -192,6 +302,7 @@ describe('startManifestFlow (live loopback server)', () => {
     const flow = await startManifestFlow({
       buildManifest: (redirectUrl) => buildAppManifest({ fleetName: 'demo', role: 'code-agent', redirectUrl }),
       formAction: 'https://github.com/settings/apps/new',
+      role: 'code-agent',
     });
     try {
       const served = await fetchServedManifest(flow.startUrl);

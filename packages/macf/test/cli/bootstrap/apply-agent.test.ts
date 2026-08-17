@@ -9,13 +9,16 @@ import { describe, it, expect, vi } from 'vitest';
 import { existsSync } from 'node:fs';
 import {
   applyAgentIdentity,
+  applyIdentity,
   confirmBeforeCreateGuard,
+  installReposForIdentity,
+  installWhyText,
   type AgentApplyDeps,
 } from '../../../src/cli/bootstrap/apply-agent.js';
 import type { FleetAgent, FleetLockAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import type { ConfirmedInstall, IdentityConfirmation } from '../../../src/cli/bootstrap/identity-confirm.js';
-import type { ManifestFlowHandles } from '../../../src/cli/bootstrap/manifest-flow-server.js';
+import type { InstallInterstitialHandles, ManifestFlowHandles } from '../../../src/cli/bootstrap/manifest-flow-server.js';
 
 const MANIFEST: FleetManifest = {
   apiVersion: 'macf/v0',
@@ -50,10 +53,21 @@ function fakeFlowHandles(code: string | Error): ManifestFlowHandles {
   };
 }
 
+/** Fixed, distinct-from-gate-1 URL (groundnuty/macf#952) — the LOCAL interstitial `openUrl` now targets on gate 2, never GitHub's install URL directly. */
+const FAKE_INTERSTITIAL_URL = 'http://127.0.0.1:19/';
+
+function fakeInterstitialHandles(): InstallInterstitialHandles {
+  return {
+    startUrl: FAKE_INTERSTITIAL_URL,
+    close: () => Promise.resolve(),
+  };
+}
+
 function baseDeps(overrides: Partial<AgentApplyDeps> = {}): AgentApplyDeps {
   const logs: string[] = [];
   return {
     startManifestFlow: async () => fakeFlowHandles('the-code'),
+    startInstallInterstitial: async () => fakeInterstitialHandles(),
     exchangeManifestCode: async () => CREDS,
     waitForAppInstallation: async () => ({ appId: CREDS.appId, installId: '5555', appSlug: CREDS.slug, accountLogin: 'groundnuty' }),
     confirmAppInstallation: async () => ({ status: 'unconfirmable' }) as IdentityConfirmation,
@@ -139,10 +153,10 @@ describe('applyAgentIdentity — create path', () => {
       installId: '5555',
       credentials: CREDS,
     });
-    // Gate 1 (the manifest form) then gate 2 (the install page, using the
-    // REAL exchanged slug) — both gates now open a browser tab (consent-gate
-    // UX fix), not just gate 1.
-    expect(opened).toEqual(['http://127.0.0.1:9/', 'https://github.com/apps/demo-fleet-code-agent/installations/new']);
+    // Gate 1 (the manifest form) then gate 2 (groundnuty/macf#952: OUR OWN
+    // local interstitial, never GitHub's install URL directly) — both gates
+    // open a browser tab (consent-gate UX fix), not just gate 1.
+    expect(opened).toEqual(['http://127.0.0.1:9/', FAKE_INTERSTITIAL_URL]);
   });
 
   it('prints BOTH gates\' URLs before opening the browser, and states what is being waited on', async () => {
@@ -153,7 +167,12 @@ describe('applyAgentIdentity — create path', () => {
     // Gate 1's URL is printed (as a fallback, in case the browser-open silently misfired).
     expect(joined).toContain('http://127.0.0.1:9/');
     expect(joined).toMatch(/waiting for you to click "Create GitHub App"/);
-    // Gate 2's URL (the REAL exchanged slug, not the derived handle) is also printed.
+    // Gate 2's LOCAL interstitial URL is printed (what's actually opened)...
+    expect(joined).toContain(FAKE_INTERSTITIAL_URL);
+    // ...and the REAL GitHub install URL (the REAL exchanged slug, not the
+    // derived handle) is ALSO printed — a headless/`--yes` run has no page
+    // to read, so the terminal must still carry the actionable URL
+    // (groundnuty/macf#952 requirement 3).
     expect(joined).toContain('https://github.com/apps/demo-fleet-code-agent/installations/new');
     expect(joined).toMatch(/waiting for you to click "Install"/);
   });
@@ -161,7 +180,9 @@ describe('applyAgentIdentity — create path', () => {
   it('gate 2 browser-open failure does NOT abort the agent — the App already exists on GitHub by then', async () => {
     const deps = baseDeps({
       openUrl: async (url) => {
-        if (url.includes('installations/new')) throw new Error('no DISPLAY / xdg-open missing');
+        // Gate 2's open now targets OUR interstitial URL, not GitHub's —
+        // fail on anything that ISN'T gate 1's fixed fake URL.
+        if (url !== 'http://127.0.0.1:9/') throw new Error('no DISPLAY / xdg-open missing');
         // gate 1's open still succeeds
       },
       log: () => {},
@@ -362,11 +383,15 @@ describe('applyAgentIdentity — non-create outcomes short-circuit before any ga
       waitForAppInstallation: async () => ({ appId: '9001', installId: '6001', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
     });
     await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
-    // deriveAppHandle('demo-fleet', 'code-agent') — the ONLY slug available on
-    // this path (no vault-decrypt wired to confirm the real one).
-    expect(opened).toEqual(['https://github.com/apps/demo-fleet-code-agent/installations/new']);
+    // groundnuty/macf#952 — resume-install ALSO opens the local interstitial,
+    // never GitHub's (predicted) install URL directly.
+    expect(opened).toEqual([FAKE_INTERSTITIAL_URL]);
     const joined = logs.join('\n');
     expect(joined).toMatch(/predicted from the fleet\/role naming convention/);
+    // deriveAppHandle('demo-fleet', 'code-agent') — the ONLY slug available on
+    // this path (no vault-decrypt wired to confirm the real one) — still
+    // printed to the terminal even though it's not what got opened.
+    expect(joined).toContain('https://github.com/apps/demo-fleet-code-agent/installations/new');
     expect(joined).toMatch(/waiting for you to click "Install"/);
   });
 
@@ -403,5 +428,236 @@ describe('applyAgentIdentity — non-create outcomes short-circuit before any ga
     const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
     expect(outcome.status).toBe('drift');
     expect(startManifestFlow).not.toHaveBeenCalled();
+  });
+});
+
+// --- groundnuty/macf#952 — the gate-2 interstitial's content derivation ---
+
+const SCI_AGENT: FleetAgent = { role: 'science-agent', profile: 'research', repo: 'groundnuty/demo-science', deploy_path: '/y' };
+const MULTI_AGENT_MANIFEST: FleetManifest = { ...MANIFEST, agents: [AGENT, SCI_AGENT] };
+
+describe('installReposForIdentity (pure, groundnuty/macf#952)', () => {
+  it('a role matching a declared agent gets EXACTLY its own home repo', () => {
+    expect(installReposForIdentity('code-agent', MULTI_AGENT_MANIFEST)).toEqual(['groundnuty/demo-code']);
+    expect(installReposForIdentity('science-agent', MULTI_AGENT_MANIFEST)).toEqual(['groundnuty/demo-science']);
+  });
+
+  it('a role with NO declared-agent match (e.g. runner-ops) gets EVERY declared agent repo', () => {
+    expect(installReposForIdentity('runner-ops', MULTI_AGENT_MANIFEST)).toEqual([
+      'groundnuty/demo-code',
+      'groundnuty/demo-science',
+    ]);
+  });
+
+  it('single-agent manifest: the matching role still gets just its own repo (not the whole array coincidentally)', () => {
+    expect(installReposForIdentity('code-agent', MANIFEST)).toEqual(['groundnuty/demo-code']);
+  });
+});
+
+describe('installWhyText (pure, groundnuty/macf#952)', () => {
+  it('administration:write gets the specific blast-radius framing + the apply-refuses-"all" fact', () => {
+    const text = installWhyText({ administration: 'write', actions: 'read', metadata: 'read' });
+    expect(text).toMatch(/administration:write/);
+    expect(text).toMatch(/blast radius/);
+    expect(text).toMatch(/apply will refuse an "all" install/);
+  });
+
+  it('no administration permission gets the generic-but-concrete reason (undefined = DR-019 default set)', () => {
+    const text = installWhyText(undefined);
+    expect(text).not.toMatch(/administration/);
+    expect(text).toMatch(/only needs access to the repo\(s\) listed above/);
+  });
+
+  it('a non-write administration level (defense-in-depth — never issued today) does NOT get the blast-radius framing', () => {
+    expect(installWhyText({ administration: 'read' })).not.toMatch(/blast radius/);
+  });
+});
+
+describe('gate 2 receives the derived repos/whyText (integration, groundnuty/macf#952)', () => {
+  it('create path: startInstallInterstitial is called with the role, the real exchanged slug, the derived repos, and the why-text', async () => {
+    const seen: { role: string; appName: string; repos: readonly string[]; whyText: string; gateNumber: number; gateTotal: number }[] = [];
+    const deps = baseDeps({
+      startInstallInterstitial: async (opts) => {
+        seen.push(opts);
+        return fakeInterstitialHandles();
+      },
+    });
+    await applyAgentIdentity(AGENT, MULTI_AGENT_MANIFEST, undefined, deps);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      role: 'code-agent',
+      appName: CREDS.slug, // the REAL exchanged slug, not the derived handle
+      repos: ['groundnuty/demo-code'],
+      gateNumber: 2,
+      gateTotal: 2,
+    });
+    expect(seen[0]?.whyText).toMatch(/only needs access to the repo\(s\) listed above/);
+  });
+
+  it('resume-install path: startInstallInterstitial ALSO gets the derived repos/why-text', async () => {
+    const seen: { role: string; repos: readonly string[] }[] = [];
+    const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
+    const deps = baseDeps({
+      startInstallInterstitial: async (opts) => {
+        seen.push(opts);
+        return fakeInterstitialHandles();
+      },
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'app-no-install' }),
+      waitForAppInstallation: async () => ({ appId: '9001', installId: '6001', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
+    });
+    await applyAgentIdentity(AGENT, MULTI_AGENT_MANIFEST, PRIOR, deps);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.repos).toEqual(['groundnuty/demo-code']);
+  });
+
+  it('a role with no matching agent (runner-ops shape) gets every declared repo + the admin-write why-text', async () => {
+    const seen: { role: string; repos: readonly string[]; whyText: string }[] = [];
+    const deps = baseDeps({
+      startInstallInterstitial: async (opts) => {
+        seen.push(opts);
+        return fakeInterstitialHandles();
+      },
+    });
+    await applyIdentity(
+      { role: 'runner-ops', permissions: { administration: 'write', actions: 'read', metadata: 'read' }, events: [] },
+      MULTI_AGENT_MANIFEST,
+      undefined,
+      deps,
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.repos).toEqual(['groundnuty/demo-code', 'groundnuty/demo-science']);
+    expect(seen[0]?.whyText).toMatch(/blast radius/);
+  });
+});
+
+describe('startInstallInterstitial failure degrades, never throws (groundnuty/macf#952)', () => {
+  it('a local-listener bind failure falls back to opening GitHub\'s real install URL directly — status still "created", instruction still logged', async () => {
+    const opened: string[] = [];
+    const logs: string[] = [];
+    const deps = baseDeps({
+      startInstallInterstitial: async () => { throw new Error('EADDRINUSE'); },
+      openUrl: async (url) => { opened.push(url); },
+      log: (l) => logs.push(l),
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    // NEVER throws (module doc invariant) — resolves to a normal outcome.
+    expect(outcome.status).toBe('created');
+    // Falls back to GitHub's REAL install URL, not the (failed) local page.
+    expect(opened).toEqual(['http://127.0.0.1:9/', 'https://github.com/apps/demo-fleet-code-agent/installations/new']);
+    const joined = logs.join('\n');
+    expect(joined).toMatch(/could not start the local install-instruction page/);
+    // The instruction survives the degradation — it's in the terminal
+    // instruction lines regardless of which URL got opened.
+    expect(joined).toMatch(/Only select repositories/);
+  });
+
+  it('resume-install path ALSO degrades gracefully on a bind failure', async () => {
+    const opened: string[] = [];
+    const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
+    const deps = baseDeps({
+      startInstallInterstitial: async () => { throw new Error('EADDRINUSE'); },
+      openUrl: async (url) => { opened.push(url); },
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'app-no-install' }),
+      waitForAppInstallation: async () => ({ appId: '9001', installId: '6001', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    expect(outcome.status).toBe('resumed-install');
+    expect(opened).toEqual(['https://github.com/apps/demo-fleet-code-agent/installations/new']);
+  });
+
+  it('a close() failure on the interstitial does not mask a successful gate-2 result', async () => {
+    const deps = baseDeps({
+      startInstallInterstitial: async () => ({
+        startUrl: FAKE_INTERSTITIAL_URL,
+        close: () => Promise.reject(new Error('already closed')),
+      }),
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('created');
+  });
+});
+
+// --- groundnuty/macf#952 — the decisive ordering test ---
+//
+// The whole defect this issue fixes is ORDERING: the operator's first live
+// install picked GitHub's "All repositories" because the requirement only
+// appeared in the FAILURE message, after the click. A test that merely
+// asserts the instruction text EXISTS somewhere would pass even if it
+// printed AFTER the navigation — this test asserts the instruction is
+// logged strictly BEFORE `openUrl` is ever called, for BOTH gates.
+
+describe('instruction-before-navigation ordering (the decisive test, groundnuty/macf#952)', () => {
+  it('gate 1: the "creating GitHub App" instruction is logged BEFORE openUrl(flow.startUrl) is called', async () => {
+    const events: string[] = [];
+    const deps = baseDeps({
+      log: (line: string) => { events.push(`log:${line}`); },
+      openUrl: async (url: string) => { events.push(`open:${url}`); },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    const instructionIndex = events.findIndex((e) => e.startsWith('log:') && /submitted AS-IS/i.test(e));
+    const gate1OpenIndex = events.findIndex((e) => e === 'open:http://127.0.0.1:9/');
+    expect(instructionIndex).toBeGreaterThanOrEqual(0);
+    expect(gate1OpenIndex).toBeGreaterThanOrEqual(0);
+    expect(instructionIndex).toBeLessThan(gate1OpenIndex);
+  });
+
+  it('gate 2: the interstitial PAGE is started + the "Only select repositories" instruction is logged, BOTH before openUrl(interstitial.startUrl)', async () => {
+    const events: string[] = [];
+    const deps = baseDeps({
+      log: (line: string) => { events.push(`log:${line}`); },
+      openUrl: async (url: string) => { events.push(`open:${url}`); },
+      // Marks the moment OUR page is actually up (bound + serving) — not
+      // just that the intent to serve it was logged. Proves the structural
+      // half of the fix (the page exists before the browser can reach
+      // anything), not only the terminal-text half.
+      startInstallInterstitial: async () => { events.push('interstitial:started'); return fakeInterstitialHandles(); },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    const interstitialStartedIndex = events.indexOf('interstitial:started');
+    const instructionIndex = events.findIndex((e) => e.startsWith('log:') && e.includes('Only select repositories'));
+    const gate2OpenIndex = events.findIndex((e) => e === `open:${FAKE_INTERSTITIAL_URL}`);
+    expect(interstitialStartedIndex).toBeGreaterThanOrEqual(0);
+    expect(instructionIndex).toBeGreaterThanOrEqual(0);
+    expect(gate2OpenIndex).toBeGreaterThanOrEqual(0);
+    // The page is up BEFORE the browser is told to navigate anywhere...
+    expect(interstitialStartedIndex).toBeLessThan(gate2OpenIndex);
+    // ...and the terminal instruction is printed before navigation too.
+    expect(instructionIndex).toBeLessThan(gate2OpenIndex);
+  });
+
+  it('gate 2 (resume-install path): the instruction ALSO precedes the navigation', async () => {
+    const events: string[] = [];
+    const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
+    const deps = baseDeps({
+      log: (line: string) => { events.push(`log:${line}`); },
+      openUrl: async (url: string) => { events.push(`open:${url}`); },
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'app-no-install' }),
+      waitForAppInstallation: async () => ({ appId: '9001', installId: '6001', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+
+    const instructionIndex = events.findIndex((e) => e.startsWith('log:') && e.includes('Only select repositories'));
+    const openIndex = events.findIndex((e) => e === `open:${FAKE_INTERSTITIAL_URL}`);
+    expect(instructionIndex).toBeGreaterThanOrEqual(0);
+    expect(openIndex).toBeGreaterThanOrEqual(0);
+    expect(instructionIndex).toBeLessThan(openIndex);
+  });
+});
+
+// --- groundnuty/macf#952 — gate numbering + role attribution ---
+
+describe('gates are numbered and role-attributed', () => {
+  it('gate 1 and gate 2 log lines both carry "of 2" and the role', async () => {
+    const logs: string[] = [];
+    const deps = baseDeps({ log: (l) => logs.push(l) });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    const joined = logs.join('\n');
+    expect(joined).toMatch(/Role "code-agent": consent gate 1 of 2/);
+    expect(joined).toMatch(/Role "code-agent": consent gate 2 of 2/);
   });
 });
