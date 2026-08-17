@@ -521,6 +521,49 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(JSON.stringify(lock)).not.toContain(SENTINEL_CA_KEY_PEM);
   });
 
+  // groundnuty/macf#954 — the FULL pipeline, end-to-end: on a fresh fleet
+  // (CA minted THIS run — the exact live-run shape the bug report names as
+  // "the exact next live run"), a `routingClientDeps.mint` EXCEPTION used to
+  // collapse into the SAME 'skipped' shape as the two benign steady-state
+  // skips, so `apply` exited 0 while NO routing-client cert reached any
+  // repo. This test drives the exception through the REAL `apply-fleet.ts`
+  // orchestration (not a unit-level `mintRoutingClient` call) and asserts
+  // the OBSERVABLE consequence a script checking `$?` would see.
+  it('a routing-client mint EXCEPTION on a fresh fleet (CA minted this run) makes the WHOLE apply exit non-zero — the defect groundnuty/macf#954 fixes', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+      fakeMutateDeps(file, {
+        routingClientDeps: fakeRoutingClientDeps({
+          mint: async () => {
+            throw new Error('x509 generation failed');
+          },
+        }),
+      }),
+    );
+    // Before the fix: this was 0 (the mint exception silently collapsed into
+    // a "skipped, expected steady state" shape `applyExitCode` never fails
+    // on). After the fix: 1 — an automated gate checking `$?` (e.g. #869's
+    // live-smoke) now actually catches it.
+    expect(code).toBe(1);
+    const out = logs.join('\n');
+    expect(out).toMatch(/Routing-client cert: FAILED to mint — routing-client cert mint failed: x509 generation failed/);
+    // Every OTHER surface of this run still succeeds cleanly — the mint
+    // exception is isolated to its own surface, not a cascading failure:
+    expect(out).toMatch(/code-agent: CREATED/);
+    expect(out).toMatch(/science-agent: CREATED/);
+    expect(out).toMatch(/CA: MINTED/);
+    expect(out).toMatch(/Vault: written to/);
+  });
+
+  it('the SAME fresh-fleet run with a WORKING routing-client mint exits 0 — the fix does not regress the steady/success path', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+    expect(code).toBe(0);
+    expect(logs.join('\n')).toMatch(/Routing-client cert: MINTED/);
+  });
+
   it('--json emits the FLEET_APPLY_JSON_SCHEMA_VERSION envelope on a successful apply', async () => {
     const file = writeManifest();
     const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
@@ -1460,6 +1503,89 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(
       applyExitCode(resultWith({ routing: { 'x/y': { status: 'created' }, 'x/z': { status: 'already-present' } } })),
     ).toBe(0);
+  });
+
+  // --- groundnuty/macf#954 — the routing-client mint's three-way status
+  // distinction (minted / skipped-benign / failed-exception) and its
+  // exit-code consequence. Before this fix, a `deps.mint` exception collapsed
+  // into the SAME `'skipped'` status+reason SHAPE as the two benign skip
+  // causes below, so `applyExitCode` treated it identically — exit 0 — even
+  // though NO routing-client cert ever reached any repo on a run whose CA was
+  // freshly minted. These tests assert the EXIT CODE (the actual severity;
+  // the human-readable message was already correct before this fix).
+
+  it('applyExitCode: 0 when the routing-client mint is SKIPPED because it was already vaulted in a prior run (benign steady state — macf#954)', () => {
+    const result = resultWith({
+      routingClient: { mint: { status: 'skipped', reason: 'already minted in a PRIOR apply run' }, certLegs: {}, keyLegs: {} },
+    });
+    expect(applyExitCode(result)).toBe(0);
+  });
+
+  it('applyExitCode: 0 when the routing-client mint is SKIPPED because the CA was REUSED, not minted, this run (benign steady state — macf#954)', () => {
+    const result = resultWith({
+      routingClient: { mint: { status: 'skipped', reason: 'CA was not freshly minted this run' }, certLegs: {}, keyLegs: {} },
+    });
+    expect(applyExitCode(result)).toBe(0);
+  });
+
+  it('applyExitCode: 1 when the routing-client mint FAILED with a genuine exception — DISTINCT from a benign skip, even with every leg empty (macf#954, the defect #954 fixes)', () => {
+    const result = resultWith({
+      routingClient: { mint: { status: 'failed', reason: 'routing-client cert mint failed: x509 generation failed' }, certLegs: {}, keyLegs: {} },
+    });
+    expect(applyExitCode(result)).toBe(1);
+  });
+
+  it('applyExitCode: 1 when ANY routing-client cert/key leg failed, independent of the mint status', () => {
+    expect(
+      applyExitCode(
+        resultWith({
+          routingClient: {
+            mint: { status: 'minted' },
+            certLegs: { 'x/y': { status: 'failed', reason: 'network' } },
+            keyLegs: { 'x/y': { status: 'created' } },
+          },
+        }),
+      ),
+    ).toBe(1);
+  });
+
+  it('applyExitCode: 0 when the mint is MINTED and every leg created/already-present', () => {
+    expect(
+      applyExitCode(
+        resultWith({
+          routingClient: {
+            mint: { status: 'minted' },
+            certLegs: { 'x/y': { status: 'created' } },
+            keyLegs: { 'x/y': { status: 'created' } },
+          },
+        }),
+      ),
+    ).toBe(0);
+  });
+
+  it('--json (fleetApplyResultToJson) distinguishes all three routing-client mint statuses verbatim — minted / skipped / failed (macf#954)', () => {
+    const minted = fleetApplyResultToJson(resultWith({ routingClient: { mint: { status: 'minted' }, certLegs: {}, keyLegs: {} } })) as {
+      routing_client: { mint: { status: string } };
+    };
+    const skipped = fleetApplyResultToJson(
+      resultWith({ routingClient: { mint: { status: 'skipped', reason: 'CA was reused' }, certLegs: {}, keyLegs: {} } }),
+    ) as { routing_client: { mint: { status: string; reason?: string } } };
+    const failed = fleetApplyResultToJson(
+      resultWith({ routingClient: { mint: { status: 'failed', reason: 'x509 generation failed' }, certLegs: {}, keyLegs: {} } }),
+    ) as { routing_client: { mint: { status: string; reason?: string } } };
+    expect(minted.routing_client.mint.status).toBe('minted');
+    expect(skipped.routing_client.mint.status).toBe('skipped');
+    expect(failed.routing_client.mint.status).toBe('failed');
+    expect(failed.routing_client.mint.reason).toBe('x509 generation failed');
+  });
+
+  it('formatApplyResult renders a routing-client mint FAILURE loudly, distinct from a benign SKIPPED line, and NEVER a secret (macf#954)', () => {
+    const text = formatApplyResult(
+      resultWith({ routingClient: { mint: { status: 'failed', reason: 'routing-client cert mint failed: x509 generation failed' }, certLegs: {}, keyLegs: {} } }),
+    );
+    expect(text).toMatch(/Routing-client cert: FAILED to mint — routing-client cert mint failed: x509 generation failed/);
+    expect(text).not.toMatch(/Routing-client cert: SKIPPED/);
+    expect(text).not.toContain('-----BEGIN');
   });
 
   it('formatApplyResult NEVER includes a CA cert or key value — only status + fingerprint', () => {

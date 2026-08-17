@@ -771,10 +771,24 @@ function routingSummaryLines(result: FleetApplyResult): string[] {
   return lines;
 }
 
-/** Routing-client mint + per-repo secret-deploy render (groundnuty/macf#920 gap 2). Never a credential value — `result.routingClient.mint` is the redacted `RedactedRoutingClientMint` (status/reason only, never cert/key PEM). */
+/**
+ * Routing-client mint + per-repo secret-deploy render (groundnuty/macf#920
+ * gap 2). Never a credential value — `result.routingClient.mint` is the
+ * redacted `RedactedRoutingClientMint` (status/reason only, never cert/key
+ * PEM). `'failed'` (groundnuty/macf#954 — a genuine mint exception, distinct
+ * from the two benign 'skipped' causes) renders its own loud line so a human
+ * reading full stdout sees the operator-attention state named explicitly,
+ * not folded into "SKIPPED" prose that reads as steady-state-benign.
+ */
 function routingClientSummaryLines(result: FleetApplyResult): string[] {
   const m = result.routingClient.mint;
-  const lines = [m.status === 'minted' ? 'Routing-client cert: MINTED (CN=routing-action).' : `Routing-client cert: SKIPPED — ${m.reason}`];
+  const lines = [
+    m.status === 'minted'
+      ? 'Routing-client cert: MINTED (CN=routing-action).'
+      : m.status === 'failed'
+        ? `Routing-client cert: FAILED to mint — ${m.reason}`
+        : `Routing-client cert: SKIPPED — ${m.reason}`,
+  ];
   for (const [repo, leg] of Object.entries(result.routingClient.certLegs)) {
     lines.push(formatVariableLegLine(`cert leg (${repo})`, leg));
   }
@@ -943,11 +957,21 @@ export function applyExitCode(result: FleetApplyResult): number {
     Object.values(result.ca.repoLegs).some((leg) => leg.status === 'failed');
   const routingBad = Object.values(result.routing).some((leg) => leg.status === 'failed');
   // DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920 gap 2) — same
-  // 'skipped' vs 'failed' distinction as `caBad` above: a `'skipped'` mint is
-  // the EXPECTED steady state on an ordinary re-run of an already-provisioned
-  // fleet (CA reused, or the routing-client key already vaulted from a prior
-  // run) — only an actual publish-leg `'failed'` needs operator attention.
+  // 'skipped' vs 'failed' distinction `caBad` above already applies to CA
+  // resolve. A `'skipped'` MINT is the EXPECTED steady state on an ordinary
+  // re-run of an already-provisioned fleet (CA reused, or the routing-client
+  // key already vaulted from a prior run) — it does NOT independently fail
+  // the run. But `mint.status === 'failed'` (groundnuty/macf#954 — a genuine
+  // mint EXCEPTION: crypto/tmpdir/disk, distinct from the two benign skip
+  // causes) MUST fail it, same bar as `caBad`'s `ca.resolve.status ===
+  // 'failed'` check — otherwise a transient mint exception on a freshly-
+  // minted CA (the exact next live run) makes `apply` exit 0 while no
+  // routing-client cert ever reached a repo, and nothing but full-stdout
+  // reading would ever surface it. A publish-leg `'failed'` needs operator
+  // attention too, independent of the mint outcome (a mint can succeed while
+  // an individual repo's `gh secret set` still fails).
   const routingClientBad =
+    result.routingClient.mint.status === 'failed' ||
     Object.values(result.routingClient.certLegs).some((leg) => leg.status === 'failed') ||
     Object.values(result.routingClient.keyLegs).some((leg) => leg.status === 'failed');
   return controlRepoBad ||
