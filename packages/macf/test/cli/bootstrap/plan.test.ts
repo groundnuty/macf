@@ -380,6 +380,49 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
     expect(routing).toBeUndefined();
   });
+
+  // --- macf#934 — capability detail surfaces in the plan's runner-class line, same resolution as the live gate ---
+
+  it('appends the macf#934 capability detail (found-but-mislabeled) to the runner-class reason, without dropping the original wording', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingRunnerRegistered: 'absent',
+      routingRunnerDetail:
+        'a runner registered for "groundnuty/icsoc-2026-science-agent" is online but not carrying required ' +
+        'label(s) "macf-vm" (carries: self-hosted).',
+    };
+    const plan = computePlan(manifest, observed);
+    const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+    // Original wording is preserved verbatim (strict extension, not a rewrite).
+    expect(routing?.reason).toMatch(/Runner class: github-hosted \(billed on private repos\)/);
+    expect(routing?.reason).toMatch(/no self-hosted runner is confirmed registered/);
+    // The detail is appended, naming the missing label and what was found.
+    expect(routing?.reason).toContain('not carrying required label(s) "macf-vm"');
+    expect(routing?.reason).toContain('carries: self-hosted');
+  });
+
+  it('appends BOTH the detail and the handover when both are observed (found-but-excluded org runner, macf#934 + macf#924 together)', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingRunnerRegistered: 'absent',
+      routingRunnerDetail: 'a runner registered for "x" carries the required labels but is offline (status="offline").',
+      routingRunnerHandover: 'An org admin must add this repo at https://example.invalid/.',
+    };
+    const plan = computePlan(manifest, observed);
+    const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+    expect(routing?.reason).toContain('is offline (status="offline")');
+    expect(routing?.reason).toContain('An org admin must add this repo at');
+  });
+
+  it('never appends a detail when none was observed (the common zero-runners absent/unknown case)', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: 'absent' };
+    const plan = computePlan(manifest, observed);
+    const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+    expect(routing?.reason).not.toMatch(/carries|offline|missing/);
+  });
 });
 
 describe('computePlan — an observed extra agent → report-extra, NEVER delete', () => {

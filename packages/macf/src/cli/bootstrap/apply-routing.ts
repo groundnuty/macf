@@ -126,18 +126,22 @@ function errMessage(err: unknown): string {
  * branches is preserved UNCHANGED; `usability.handover` (macf#924 — an org
  * runner exists but its group excludes this repo) is appended verbatim when
  * set, naming the org-admin action rather than silently reading as an
- * ordinary absence.
+ * ordinary absence. `usability.detail` (macf#934 — a runner WAS found but
+ * fails the capability check: offline, missing a required label, or a
+ * permission-denied read) is likewise appended verbatim when set — a
+ * strict extension, not a rewrite, same as `handover`'s addition.
  */
 export function noRunnerRegisteredReason(repo: string, usability: RunnerUsability): string {
   const cause =
     usability.presence === 'unknown'
       ? 'could not confirm whether a self-hosted runner is registered (auth / network / insufficient scope)'
       : 'no self-hosted runner is confirmed registered';
+  const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
   const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
   return (
     `${cause} for "${repo}" — MACF_TRUSTED_ACTORS was NOT written; this repo continues routing on ` +
     'ubuntu-latest (billed on private repos) until a runner is registered and confirmed ' +
-    `(register-before-route — macf-devops-toolkit runner/RUNNER.md §"The security model"; macf#922).${handoverSuffix}`
+    `(register-before-route — macf-devops-toolkit runner/RUNNER.md §"The security model"; macf#922).${detailSuffix}${handoverSuffix}`
   );
 }
 
@@ -311,22 +315,23 @@ export function checkRunnerTokenPreflight(
  * incomplete, not a policy refusal: the operator declared intent AND gave
  * `apply` a way to wait, but the runner genuinely hasn't shown up yet.
  * Extends `noRunnerRegisteredReason`'s absent/unknown honest-unknown
- * discrimination + macf#924's org-admin handover verbatim-append (both
- * still apply — polling doesn't change WHY a runner is unusable, only
- * WHETHER `apply` waited for it) with the token-specific framing + the
- * concrete re-run remedy.
+ * discrimination + macf#924's org-admin handover verbatim-append + macf#934's
+ * capability-detail verbatim-append (all still apply — polling doesn't
+ * change WHY a runner is unusable, only WHETHER `apply` waited for it) with
+ * the token-specific framing + the concrete re-run remedy.
  */
 export function runnerTokenPollExhaustedReason(repo: string, usability: RunnerUsability, timeoutMs: number): string {
   const cause =
     usability.presence === 'unknown'
       ? 'could not confirm whether a self-hosted runner is registered (auth / network / insufficient scope)'
       : 'no usable self-hosted runner became visible';
+  const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
   const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
   return (
     `role/repo "${repo}": a runner registration token was supplied (macf#929) but ${cause} within the ` +
     `${String(Math.round(timeoutMs / 1000))}s poll window — MACF_TRUSTED_ACTORS was NOT written; this repo ` +
     'routes on hosted runners (billed on private repos) until a runner is confirmed. Re-run `macf bootstrap ' +
-    `apply\` once it is registered.${handoverSuffix}`
+    `apply\` once it is registered.${detailSuffix}${handoverSuffix}`
   );
 }
 

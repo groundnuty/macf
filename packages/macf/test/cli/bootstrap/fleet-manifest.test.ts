@@ -221,6 +221,47 @@ describe('parseFleetManifest — transport.vault_repo REMOVED (macf#857, DR-043 
   });
 });
 
+describe('parseFleetManifest — routing.runner.labels cross-check against ROUTER_EMITTED_LABELS (macf#934)', () => {
+  it('omitting routing.runner.labels entirely still parses clean (the pre-macf#934 default; convention applies)', () => {
+    const manifest = parseFleetManifest(VALID_FLEET_YAML);
+    expect(manifest.routing?.runner.labels).toBeUndefined();
+  });
+
+  it('a declared label set that is EXACTLY the router-emitted set parses clean', () => {
+    const withLabels = VALID_FLEET_YAML.replace(
+      'routing:\n  runner:\n    runs_on: self-hosted',
+      'routing:\n  runner:\n    runs_on: self-hosted\n    labels: [self-hosted, macf-vm]',
+    );
+    const manifest = parseFleetManifest(withLabels);
+    expect(manifest.routing?.runner.labels).toEqual(['self-hosted', 'macf-vm']);
+  });
+
+  it('a declared label set that is a SUPERSET of the router-emitted set (extra labels) parses clean — superset, not equality', () => {
+    const withLabels = VALID_FLEET_YAML.replace(
+      'routing:\n  runner:\n    runs_on: self-hosted',
+      'routing:\n  runner:\n    runs_on: self-hosted\n    labels: [self-hosted, macf-vm, gpu]',
+    );
+    const manifest = parseFleetManifest(withLabels);
+    expect(manifest.routing?.runner.labels).toEqual(['self-hosted', 'macf-vm', 'gpu']);
+  });
+
+  it('a declared label set MISSING a router-emitted label is REJECTED at parse time, naming the missing label — the macf#934 worked example', () => {
+    const withLabels = VALID_FLEET_YAML.replace(
+      'routing:\n  runner:\n    runs_on: self-hosted',
+      'routing:\n  runner:\n    runs_on: self-hosted\n    labels: [self-hosted, arc-runner]',
+    );
+    expect(() => parseFleetManifest(withLabels)).toThrow(/macf-vm/);
+  });
+
+  it('a declared label set missing EVERY router-emitted label names both, in ROUTER_EMITTED_LABELS order', () => {
+    const withLabels = VALID_FLEET_YAML.replace(
+      'routing:\n  runner:\n    runs_on: self-hosted',
+      'routing:\n  runner:\n    runs_on: self-hosted\n    labels: [arc-runner]',
+    );
+    expect(() => parseFleetManifest(withLabels)).toThrow(/missing: \[self-hosted, macf-vm\]/);
+  });
+});
+
 describe('parseFleetManifest — rejections', () => {
   it('rejects a wrong apiVersion', () => {
     const bad = VALID_FLEET_YAML.replace('apiVersion: macf/v0', 'apiVersion: macf/v1');

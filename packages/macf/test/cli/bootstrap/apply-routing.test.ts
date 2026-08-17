@@ -184,6 +184,30 @@ describe('noRunnerRegisteredReason', () => {
     expect(reason).toMatch(/no self-hosted runner is confirmed registered/);
     expect(reason).toContain('An org admin must add "groundnuty/x" to runner group X at https://example.invalid/.');
   });
+
+  it('macf#934 — appends the capability detail verbatim when present, without dropping the original wording', () => {
+    const usability: RunnerUsability = {
+      presence: 'absent',
+      detail: 'a runner registered for "groundnuty/x" carries the required labels but is offline (status="offline").',
+    };
+    const reason = noRunnerRegisteredReason('groundnuty/x', usability);
+    expect(reason).toMatch(/no self-hosted runner is confirmed registered/);
+    expect(reason).toContain('carries the required labels but is offline (status="offline")');
+  });
+
+  it('macf#934 — appends BOTH detail and handover, detail first, when both are present', () => {
+    const usability: RunnerUsability = {
+      presence: 'absent',
+      detail: 'a runner registered for "groundnuty/x" is online but not carrying required label(s) "macf-vm" (carries: self-hosted).',
+      handover: 'An org admin must add "groundnuty/x" at https://example.invalid/.',
+    };
+    const reason = noRunnerRegisteredReason('groundnuty/x', usability);
+    const detailIdx = reason.indexOf('not carrying required label');
+    const handoverIdx = reason.indexOf('An org admin must add');
+    expect(detailIdx).toBeGreaterThan(-1);
+    expect(handoverIdx).toBeGreaterThan(-1);
+    expect(detailIdx).toBeLessThan(handoverIdx);
+  });
 });
 
 // --- macf#929 — token = POLICY, detection = TIMING ---
@@ -215,6 +239,15 @@ describe('runnerTokenPollExhaustedReason', () => {
     const usability: RunnerUsability = { presence: 'absent', handover: 'An org admin must add "groundnuty/x" at https://example.invalid/.' };
     const reason = runnerTokenPollExhaustedReason('groundnuty/x', usability, 60_000);
     expect(reason).toContain('An org admin must add "groundnuty/x" at https://example.invalid/.');
+  });
+
+  it('appends the macf#934 capability detail verbatim when present', () => {
+    const usability: RunnerUsability = {
+      presence: 'absent',
+      detail: 'a runner registered for "groundnuty/x" carries the required labels but is offline (status="offline").',
+    };
+    const reason = runnerTokenPollExhaustedReason('groundnuty/x', usability, 60_000);
+    expect(reason).toContain('carries the required labels but is offline (status="offline")');
   });
 });
 

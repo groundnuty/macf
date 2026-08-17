@@ -12,6 +12,7 @@
 import { describe, it, expect } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { TRUSTED_ACTORS_VAR } from '../../../src/cli/bootstrap/apply-routing.js';
+import { ROUTER_EMITTED_LABELS } from '../../../src/cli/bootstrap/fleet-manifest.js';
 
 /**
  * The COMPLETE set of `vars.MACF_*` GitHub Actions variables referenced
@@ -101,5 +102,63 @@ describe('MACF_TRUSTED_ACTORS matches the router\'s actual read (macf#922 — th
     const found = extractVarsMacfReferences(text);
     expect(found).toEqual(EXPECTED_ROUTER_VARS_VARS.slice().sort());
     expect(found).toContain(TRUSTED_ACTORS_VAR);
+  });
+});
+
+// --- macf#934 — the SIBLING decisive test: the self-hosted LABELS literal, not just the var name ---
+
+/**
+ * Extracts every `labels='[...]'` JSON-array literal assignment in the
+ * router's `pick-runner` step and returns the ONE that parses as a JSON
+ * array of strings — the step also assigns `labels='"ubuntu-latest"'`
+ * (a plain JSON STRING, not an array) as its github-hosted default, which
+ * this regex's `\[...\]` bracket requirement already excludes. `undefined`
+ * when no array-literal assignment is found (a structural change to the
+ * step this test should then fail loudly on, not silently pass).
+ */
+function extractSelfHostedLabelsLiteral(workflowText: string): readonly string[] | undefined {
+  const re = /labels='(\[[^']*\])'/g;
+  for (const m of workflowText.matchAll(re)) {
+    const literal = m[1];
+    if (literal === undefined) continue;
+    const parsed: unknown = JSON.parse(literal);
+    if (Array.isArray(parsed) && parsed.every((x): x is string => typeof x === 'string')) return parsed;
+  }
+  return undefined;
+}
+
+describe('extractSelfHostedLabelsLiteral (self-test of the parser used below)', () => {
+  it('finds the array-literal assignment, ignoring the plain-string default', () => {
+    const text = ["labels='\"ubuntu-latest\"'", 'if [ trusted ]; then', "  labels='[\"self-hosted\",\"macf-vm\"]'", 'fi'].join('\n');
+    expect(extractSelfHostedLabelsLiteral(text)).toEqual(['self-hosted', 'macf-vm']);
+  });
+
+  it('returns undefined when no array-literal assignment exists', () => {
+    expect(extractSelfHostedLabelsLiteral("labels='\"ubuntu-latest\"'\n")).toBeUndefined();
+  });
+});
+
+describe("ROUTER_EMITTED_LABELS matches the router's actual self-hosted labels literal (macf#934 — the decisive test)", () => {
+  it('is exactly ["self-hosted", "macf-vm"], in that order — the literal `fleet-manifest.ts`\'s superRefine + observer.ts\'s capability check both pin against', () => {
+    expect(ROUTER_EMITTED_LABELS).toEqual(['self-hosted', 'macf-vm']);
+  });
+
+  // Same best-effort LIVE parse posture as the vars.MACF_* test above —
+  // skips loudly, never fails the suite, when no macf-actions checkout is
+  // present. Reuses the SAME checkoutRoot/workflowPath resolution.
+  it('LIVE PARSE (skips when no macf-actions checkout is present): the router\'s self-hosted labels literal equals ROUTER_EMITTED_LABELS', () => {
+    const checkoutRoot = process.env['MACF_ACTIONS_CHECKOUT'] ?? '/home/ubuntu/repos/groundnuty/macf-actions';
+    const workflowPath = `${checkoutRoot}/.github/workflows/agent-router.yml`;
+    if (!existsSync(workflowPath)) {
+      console.warn(
+        `SKIP (router-trusted-actors-contract labels): no macf-actions checkout found at "${workflowPath}" — the ` +
+          'live parse did not run this pass. The literal pin above (ROUTER_EMITTED_LABELS) still guards drift. ' +
+          'Set MACF_ACTIONS_CHECKOUT to exercise the live parse.',
+      );
+      return;
+    }
+    const text = readFileSync(workflowPath, 'utf-8');
+    const found = extractSelfHostedLabelsLiteral(text);
+    expect(found).toEqual(ROUTER_EMITTED_LABELS);
   });
 });

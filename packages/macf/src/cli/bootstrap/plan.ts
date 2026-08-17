@@ -192,6 +192,16 @@ export interface ObservedState {
    */
   readonly routingRunnerHandover?: string;
   /**
+   * Capability diagnostic (macf#934) — set when a runner (repo- or
+   * org-scoped) WAS found but fails the register-before-route CAPABILITY
+   * check (offline, or online-but-missing-a-required-label), or when the
+   * repo-scoped read was a confirmed permission-denied (403). Distinct from
+   * `routingRunnerHandover` (a GROUP-VISIBILITY org-admin action); this is a
+   * plain explanation with no action implied beyond "check the runner." See
+   * `observer.ts::RunnerUsability.detail`'s doc for the full outcome matrix.
+   */
+  readonly routingRunnerDetail?: string;
+  /**
    * DR-043 Amendment G (groundnuty/macf#867) — the `<fleet>-control` repo's
    * own presence. REQUIRED, not optional: an unobservable read must render
    * as honest-`unknown` (Amendment A4), never silently default to "not
@@ -750,13 +760,21 @@ const RUNNER_TOKEN_PLAN_NOTE =
  *
  * `handover` (macf#924) is appended verbatim when set — the org-admin
  * action the operator needs BEFORE approving apply, surfaced at plan time
- * rather than discovered only after apply silently skips the write. The
- * original wording for the no-handover branches is preserved UNCHANGED
- * (only the suffix is new) so this stays a strict extension. macf#932 adds
- * ANOTHER unconditional suffix on top ({@link RUNNER_TOKEN_PLAN_NOTE}) —
- * same "strict extension, never rewrite" discipline.
+ * rather than discovered only after apply silently skips the write. `detail`
+ * (macf#934 — a runner WAS found but fails the capability check: offline,
+ * missing a required label, or a permission-denied read) is likewise
+ * appended verbatim when set, and macf#932 adds a further unconditional
+ * suffix ({@link RUNNER_TOKEN_PLAN_NOTE}). The original wording for the
+ * no-suffix branches is preserved UNCHANGED (only the suffixes are new) so
+ * this stays a strict extension — same "never rewrite" discipline as
+ * `handover`'s own addition.
  */
-function runnerClassReason(runnerRegistered: Presence | undefined, representativeRepo: string | undefined, handover: string | undefined): string {
+function runnerClassReason(
+  runnerRegistered: Presence | undefined,
+  representativeRepo: string | undefined,
+  handover: string | undefined,
+  detail: string | undefined,
+): string {
   const repoLabel = representativeRepo ?? '(no agent repos declared)';
   if (runnerRegistered === 'present') {
     return `Runner class: self-hosted (a runner is confirmed registered on "${repoLabel}").${RUNNER_TOKEN_PLAN_NOTE}`;
@@ -765,10 +783,11 @@ function runnerClassReason(runnerRegistered: Presence | undefined, representativ
     runnerRegistered === 'absent'
       ? `no self-hosted runner is confirmed registered on "${repoLabel}"`
       : `runner registration on "${repoLabel}" could not be confirmed (auth / network / insufficient scope)`;
+  const detailSuffix = detail !== undefined ? ` ${detail}` : '';
   const handoverSuffix = handover !== undefined ? ` ${handover}` : '';
   return (
     `Runner class: github-hosted (billed on private repos) — ${cause} yet; MACF_TRUSTED_ACTORS will NOT be ` +
-    `written by apply until one is (register-before-route).${handoverSuffix}${RUNNER_TOKEN_PLAN_NOTE}`
+    `written by apply until one is (register-before-route).${detailSuffix}${handoverSuffix}${RUNNER_TOKEN_PLAN_NOTE}`
   );
 }
 
@@ -788,6 +807,7 @@ function routingItem(
   runnerRegistered: Presence | undefined,
   representativeRepo: string | undefined,
   runnerHandover: string | undefined,
+  runnerDetail: string | undefined,
 ): PlanItem {
   const target = `routing:${fleetName}:runner`;
 
@@ -803,7 +823,7 @@ function routingItem(
     };
   }
 
-  const classSuffix = runnerClassReason(runnerRegistered, representativeRepo, runnerHandover);
+  const classSuffix = runnerClassReason(runnerRegistered, representativeRepo, runnerHandover, runnerDetail);
 
   if (observedTrustedActors === undefined) {
     return {
@@ -1031,6 +1051,7 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
         observed.routingRunnerRegistered,
         representativeRepo,
         observed.routingRunnerHandover,
+        observed.routingRunnerDetail,
       ),
     );
   }
