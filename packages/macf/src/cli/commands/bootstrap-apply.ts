@@ -67,7 +67,7 @@ import type { EnsureVariableOutcome } from '../bootstrap/ensure-variable.js';
 import type { RoutingClientApplyDeps } from '../bootstrap/apply-routing-client.js';
 import { realMintRoutingClient, realSetRepoSecret } from '../bootstrap/apply-routing-client.js';
 import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
-import { RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
+import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
 import { readVault, vaultAgentPrivateKeyPem } from '../bootstrap/vault-read.js';
 import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
@@ -106,9 +106,11 @@ export interface RunBootstrapApplyOptions {
    * route POLICY gate `apply-routing.ts::publishTrustedActorsGated` enforces.
    * `undefined` here does NOT necessarily mean "no token": `runBootstrapApply`
    * falls back to the {@link RUNNER_TOKEN_ENV_VAR} env var when this is unset
-   * (CLI flag wins on conflict) — see the resolution right before
-   * `resolveMutateDeps` is called. NEVER logged, NEVER copied onto any
-   * rendered result (mirrors `FleetApplyDeps.runnerToken`'s own doc).
+   * (CLI flag wins on conflict) — see the resolution right after the
+   * manifest is parsed, shared by BOTH the macf#932 pre-flight refusal
+   * (before consent gate 1) AND `resolveMutateDeps`. NEVER logged, NEVER
+   * copied onto any rendered result (mirrors `FleetApplyDeps.runnerToken`'s
+   * own doc).
    */
   readonly runnerToken?: string;
 }
@@ -928,6 +930,35 @@ export async function runBootstrapApply(
     );
   }
 
+  // macf#929 — CLI flag wins on conflict; MACF_BOOTSTRAP_RUNNER_TOKEN is the
+  // fallback (same "flag, then env" precedence `--min-agents`/
+  // MACF_PROPOSE_MIN_AGENTS already establishes in index.ts). Resolved HERE
+  // (moved up from immediately before `resolveMutateDeps` — macf#932) so
+  // BOTH the pre-flight refusal below AND the real mutating wiring further
+  // down read the exact same resolved value; there is exactly one place this
+  // precedence is computed.
+  const resolvedRunnerToken = opts.runnerToken ?? process.env[RUNNER_TOKEN_ENV_VAR];
+
+  // macf#932 — refuse BEFORE consent gate 1 ever opens, not merely before
+  // the LATE gate deep inside `applyFleet`'s routing block
+  // (`apply-routing.ts::publishTrustedActorsGated`, UNCHANGED, still the
+  // actual enforcement point — see `checkRunnerTokenPreflight`'s doc for the
+  // full "why move this earlier" rationale + why the late gate stays
+  // authoritative). Fires immediately after the manifest is parsed, before
+  // ANY observe/plan-render/consent-gate work — an operator who forgot the
+  // flag never spends a browser click and never even costs a read-only `gh`
+  // call. Skipped for `--dry-run`: a dry run never opens a gate to begin
+  // with, and its own plan render already carries the SAME requirement note
+  // unconditionally (`plan.ts::runnerClassReason`'s `RUNNER_TOKEN_PLAN_NOTE`,
+  // macf#932 requirement 3) — nothing is hidden from a `--dry-run` operator
+  // either.
+  if (opts.dryRun !== true) {
+    const runnerTokenFailure = checkRunnerTokenPreflight(manifest.routing, resolvedRunnerToken);
+    if (runnerTokenFailure !== undefined) {
+      return renderFailure(runnerTokenFailure, opts);
+    }
+  }
+
   const resolved = deps ?? { observe: (m: FleetManifest) => githubRegistryObserver(m, manifestPath) };
   const stderrLog = (line: string): void => {
     process.stderr.write(`${line}\n`);
@@ -994,14 +1025,12 @@ export async function runBootstrapApply(
       process.stderr.write(`\n${formatIdentityPreview(preview)}\n`);
     }
 
-    // macf#929 — CLI flag wins on conflict; MACF_BOOTSTRAP_RUNNER_TOKEN is the
-    // fallback (same "flag, then env" precedence `--min-agents`/
-    // MACF_PROPOSE_MIN_AGENTS already establishes in index.ts). Resolved HERE,
-    // not inside `resolveMutateDeps`, so that function stays a pure
-    // plain-object builder — no `process.env` read hidden inside it for this
-    // field (unlike the pre-existing `allowVaultVersion` line above it, which
-    // this does NOT imitate).
-    const resolvedRunnerToken = opts.runnerToken ?? process.env[RUNNER_TOKEN_ENV_VAR];
+    // macf#929/#932 — `resolvedRunnerToken` was already computed above (right
+    // after manifest parsing, shared with the pre-flight refusal); reused
+    // verbatim here, not inside `resolveMutateDeps`, so that function stays a
+    // pure plain-object builder — no `process.env` read hidden inside it for
+    // this field (unlike the pre-existing `allowVaultVersion` line above it,
+    // which this does NOT imitate).
     const mutate = mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken);
     try {
       const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, displayCreations);

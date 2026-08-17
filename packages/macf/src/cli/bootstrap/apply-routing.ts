@@ -75,11 +75,23 @@
  * bounded deploy window instead of checking once, so the common "register a
  * runner, then apply" case is one command. See
  * {@link publishTrustedActorsGated}'s doc for the full mechanics.
+ *
+ * **The policy half moves earlier (macf#932).** Through macf#929,
+ * `publishTrustedActorsGated`'s refusal was the ONLY place the missing-token
+ * policy fired — reachable only after `applyFleet` had already driven both
+ * consent gates for every agent in the fleet (six browser clicks on a
+ * 3-agent fleet, plus a globally-unique-named GitHub App created before the
+ * error surfaces). {@link checkRunnerTokenPreflight} duplicates ONLY the
+ * policy half of the macf#929 split, called by
+ * `commands/bootstrap-apply.ts::runBootstrapApply` before consent gate 1
+ * ever opens. `publishTrustedActorsGated` itself is UNCHANGED and remains
+ * the actual enforcement point — this is a pre-flight, not a relocation.
  */
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import { ensureVariableCreated, failedOutcomesFor } from './ensure-variable.js';
 import type { CaApplyDeps } from './apply-ca.js';
 import type { RunnerUsability } from './observer.js';
+import type { FleetRouting } from './fleet-manifest.js';
 
 /** The GitHub Actions variable name the v3 router reads (`agent-router.yml`'s `pick-runner` job) — matches `observer.ts`'s read of the same name (macf#922). */
 export const TRUSTED_ACTORS_VAR = 'MACF_TRUSTED_ACTORS';
@@ -216,6 +228,79 @@ export function noRunnerTokenReason(): string {
     `one via ${RUNNER_TOKEN_FLAG} <token> (or the ${RUNNER_TOKEN_ENV_VAR} env var). Obtain a fresh registration ` +
     'token with: gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token'
   );
+}
+
+/** The exit-code-relevant refusal code {@link checkRunnerTokenPreflight} returns — distinct from `plan.ts`'s own `'vault_flags_incomplete'` (macf#913's sibling XOR refusal) so a caller/log can tell the two argument-boundary refusals apart. */
+export const RUNNER_TOKEN_MISSING_CODE = 'runner_token_missing';
+
+/**
+ * The shape `commands/bootstrap-apply.ts::renderFailure` (and, structurally,
+ * `plan.ts`'s own `FleetPlanFailure`) both accept. Defined LOCALLY — not
+ * imported from `plan.ts` — so this module keeps ZERO runtime dependency on
+ * `plan.ts` (plan.ts is being edited concurrently for a sibling issue,
+ * macf#934; this module already only ever `import type`s from files that
+ * type-import `plan.ts`, and this keeps it that way — see the module's
+ * existing `import type { RunnerUsability } from './observer.js'` for the
+ * established pattern).
+ */
+export interface RunnerTokenPreflightFailure {
+  readonly code: string;
+  readonly message: string;
+}
+
+/**
+ * The macf#932 PRE-FLIGHT — refuses BEFORE consent gate 1 ever opens, not
+ * merely before the LATE gate deep inside `applyFleet`'s routing block
+ * ({@link publishTrustedActorsGated}, UNCHANGED — still the actual
+ * enforcement point; see this module's doc, "token = POLICY, detection =
+ * TIMING," macf#929). Prior to macf#932, `publishTrustedActorsGated`'s
+ * refusal was the ONLY place this policy fired — reachable only after
+ * `applyFleet` had already driven confirm-before-create, consent gate 1,
+ * consent gate 2, and repo-init for EVERY agent in the fleet. On a 3-agent
+ * fleet that is six browser clicks (two consent gates × 3 agents) spent
+ * before an error knowable from the manifest alone — and gate 1 is not free
+ * to retry (it creates a globally-unique-named GitHub App; a run that dies
+ * past it can leave a squatted name needing `macf fleet delete-apps` to
+ * clear).
+ *
+ * `commands/bootstrap-apply.ts::runBootstrapApply` calls this immediately
+ * after parsing the manifest — mirrors `plan.ts::checkVaultFlagsComplete`'s
+ * own "fires BEFORE [manifest parsing / anything else]" placement for its
+ * sibling XOR refusal (same shape: refuse on an unsatisfiable configuration
+ * before costing the operator anything) — before ANY observe/plan-render, so
+ * an operator who forgot the flag never spends a browser click and never
+ * even costs a read-only `gh` call.
+ *
+ * **This ADDS an early check; it does not move the authority.** Detection
+ * (is a runner actually usable?) still happens exactly where macf#927/#929
+ * left it — inside {@link publishTrustedActorsGated}, at write time, per
+ * repo. The token STILL only decides POLICY (may `apply` attempt detection
+ * at all?), never substitutes for detection itself (Amendment H.1). This
+ * function duplicates ONLY the policy half of that split, earlier.
+ *
+ * `undefined` (no refusal — apply proceeds) when EITHER `routing.runner` is
+ * not declared, OR its `runs_on` isn't `"self-hosted"` (mirrors
+ * `apply-fleet.ts`'s own `manifest.routing?.runner.runs_on === 'self-hosted'`
+ * gate for whether the write is even attempted — this function must never
+ * drift from that condition), OR a non-empty `runnerToken` was resolved.
+ * Reuses {@link noRunnerTokenReason}'s message VERBATIM — same refusal text
+ * the late gate has always shown, only fired earlier — so an operator who's
+ * seen this message before recognizes it instantly, and there is exactly one
+ * place its wording is authored.
+ *
+ * Takes the ALREADY-RESOLVED `runnerToken` value (CLI flag wins over
+ * {@link RUNNER_TOKEN_ENV_VAR}, resolved by the caller) rather than reading
+ * `process.env` itself — keeps this a pure function callers can unit-test
+ * without env stubbing, and keeps exactly ONE place (`runBootstrapApply`)
+ * responsible for the flag-then-env precedence.
+ */
+export function checkRunnerTokenPreflight(
+  routing: FleetRouting | undefined,
+  runnerToken: string | undefined,
+): RunnerTokenPreflightFailure | undefined {
+  if (routing?.runner === undefined || routing.runner.runs_on !== 'self-hosted') return undefined;
+  if (runnerToken !== undefined && runnerToken.length > 0) return undefined;
+  return { code: RUNNER_TOKEN_MISSING_CODE, message: noRunnerTokenReason() };
 }
 
 /**

@@ -20,6 +20,7 @@ import {
   type PlanItemKind,
   type PlanVerb,
 } from '../../../src/cli/bootstrap/plan.js';
+import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../../src/cli/bootstrap/apply-routing.js';
 
 /** A minimal, valid, 2-agent manifest — no optional sections. */
 function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
@@ -326,6 +327,58 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
     expect(routing?.reason).not.toMatch(/org admin/);
+  });
+
+  // --- macf#932 — plan surfaces the --runner-token requirement too, so it's
+  // visible before approval rather than only discovered at apply time. This
+  // is an UNCONDITIONAL note (plan takes no --runner-token flag of its own
+  // and cannot know whether the operator already has one ready for a future
+  // `apply` invocation) — never a "missing" claim, always a "required" one.
+
+  it('always names the flag + env var when self-hosted is declared, regardless of registration status', () => {
+    for (const registered of ['present', 'absent', 'unknown', undefined] as const) {
+      const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+      const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: registered };
+      const plan = computePlan(manifest, observed);
+      const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+      expect(routing?.reason).toContain(RUNNER_TOKEN_FLAG);
+      expect(routing?.reason).toContain(RUNNER_TOKEN_ENV_VAR);
+    }
+  });
+
+  it('also names the flag + env var on the observed-value-matches noop path (routingTrustedActors already correct)', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingTrustedActors: 'icsoc-2026-science-agent[bot] icsoc-2026-code-agent[bot]',
+    };
+    const plan = computePlan(manifest, observed);
+    const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+    expect(routing?.verb).toBe('noop');
+    expect(routing?.reason).toContain(RUNNER_TOKEN_FLAG);
+  });
+
+  it('also names the flag + env var on the drifting-value update path', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted', routingRunnerRegistered: 'present' };
+    const plan = computePlan(manifest, observed);
+    const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+    expect(routing?.verb).toBe('update');
+    expect(routing?.reason).toContain(RUNNER_TOKEN_FLAG);
+  });
+
+  it('never appears when runs_on is declared but is NOT "self-hosted" — no write is ever a candidate, so nothing to require', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'ubuntu-latest' } } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+    expect(routing?.reason).not.toContain(RUNNER_TOKEN_FLAG);
+  });
+
+  it('never appears when routing.runner is not declared at all (no routing item emitted)', () => {
+    const manifest = baseManifest();
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+    expect(routing).toBeUndefined();
   });
 });
 
