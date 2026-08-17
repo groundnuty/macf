@@ -88,6 +88,14 @@ import { toVariableSegment } from '@groundnuty/macf-core';
 import { VaultError } from './vault-write.js';
 import { secretFingerprint } from './fleet-lock.js';
 import { deriveAppHandle } from './fleet-manifest.js';
+// groundnuty/macf#954 — the runner-ops App's vault namespace is keyed on
+// `deriveRunnerOpsHandle` (== `deriveAppHandle(fleetName, RUNNER_OPS_ROLE)`),
+// the SAME derivation `apply-fleet.ts`/`vault-write.ts::buildVaultPlaintext`
+// already use to WRITE `MACF_RUNNER_OPS_<seg>_*` keys — imported from
+// `apply-runner-ops.ts` (no import cycle: that module never reaches back
+// into this one) rather than re-deriving the role string here, so the read
+// side can never drift from the write side on what "runner-ops" means.
+import { deriveRunnerOpsHandle } from './apply-runner-ops.js';
 
 // --- Parse (pure) ---
 
@@ -437,6 +445,84 @@ export function vaultAgentPrivateKeyPem(
 ): string | undefined {
   const seg = toVariableSegment(deriveAppHandle(fleetName, role));
   const b64 = raw[`MACF_AGENT_${seg}_PRIVATE_KEY_B64`];
+  if (b64 === undefined || b64.length === 0) return undefined;
+  return Buffer.from(b64, 'base64').toString('utf-8');
+}
+
+// --- Runner-ops (groundnuty/macf#954) ---
+//
+// The runner-ops App (groundnuty/macf#943) is a FLEET-LEVEL identity, never
+// declared in `manifest.agents[]` — so it has NO home in
+// `queryVaultAgentPresence`/`vaultAgentPrivateKeyPem` above, both of which
+// are keyed on a `role` the caller is expected to have pulled off
+// `manifest.agents`. Before this pair of functions existed, NOTHING in this
+// module could answer a vault-presence/PEM question for "runner-ops" at
+// all — the fifth `queryVault*`/`vault*PrivateKeyPem` sibling the four
+// existing ones (`queryVaultAgentPresence` / `vaultAgentPrivateKeyPem` /
+// `queryVaultCaPresence` / `queryVaultRoutingPresence`) never grew, because
+// every caller that WANTED to reach it (`commands/bootstrap-apply.ts`'s
+// `resolveVaultAgentPems`) only ever iterated `manifest.agents[]` — which
+// structurally cannot enumerate a role the manifest never declares (the same
+// class of gap groundnuty/macf#953 found in teardown's App list). Same vault
+// namespace `vault-write.ts::buildVaultPlaintext`'s `payload.runnerOps`
+// branch writes (`MACF_RUNNER_OPS_<seg>_*`, distinct from `MACF_AGENT_<seg>_*`
+// — see that branch's doc for why the trust-class separation matters), keyed
+// the SAME forward way every other query in this module already is
+// (`deriveRunnerOpsHandle` then `toVariableSegment` — never reverse-parsed).
+
+export type VaultRunnerOpsPresence = VaultAgentPresence;
+
+/**
+ * Presence-only sibling of {@link queryVaultAgentPresence} for the
+ * runner-ops App — same 6-field shape (this App's credential fields are
+ * identical to an agent's; only the vault KEY PREFIX differs), never a raw
+ * value. `fleetName` alone is enough to derive the key (no `role` parameter —
+ * unlike `queryVaultAgentPresence`, there is exactly one runner-ops per
+ * fleet, so there is nothing to disambiguate).
+ */
+export function queryVaultRunnerOpsPresence(raw: Readonly<Record<string, string>>, fleetName: string): VaultRunnerOpsPresence {
+  const seg = toVariableSegment(deriveRunnerOpsHandle(fleetName));
+  return {
+    appId: fieldPresence(raw, `MACF_RUNNER_OPS_${seg}_APP_ID`, false),
+    installId: fieldPresence(raw, `MACF_RUNNER_OPS_${seg}_INSTALL_ID`, false),
+    clientId: fieldPresence(raw, `MACF_RUNNER_OPS_${seg}_CLIENT_ID`, false),
+    clientSecret: fieldPresence(raw, `MACF_RUNNER_OPS_${seg}_CLIENT_SECRET`, false),
+    webhookSecret: fieldPresence(raw, `MACF_RUNNER_OPS_${seg}_WEBHOOK_SECRET`, false),
+    privateKey: fieldPresence(raw, `MACF_RUNNER_OPS_${seg}_PRIVATE_KEY_B64`, true),
+  };
+}
+
+/** Presence-count sibling for {@link queryVaultRunnerOpsPresence} — mirrors `countVaultAgentPresence`/`countVaultCaPresence`/`countVaultRoutingPresence` below. */
+export function countVaultRunnerOpsPresence(p: VaultRunnerOpsPresence): VaultPresenceCount {
+  return countVaultPresence([p.appId, p.installId, p.clientId, p.clientSecret, p.webhookSecret, p.privateKey]);
+}
+
+/**
+ * Decode the runner-ops App's PRIVATE KEY PEM out of an already-decrypted
+ * vault raw map — the runner-ops sibling of {@link vaultAgentPrivateKeyPem}
+ * (groundnuty/macf#954), the SECOND (and only other) raw-secret-returning
+ * query in this module. Exists for the identical reason:
+ * `macf bootstrap apply`'s vault-aware confirm-before-create guard
+ * (DR-043 Amendment A) needs the ACTUAL PEM bytes to mint an App JWT — but
+ * until this function existed, `commands/bootstrap-apply.ts`'s
+ * `resolveVaultAgentPems` had no way to populate a `'runner-ops'` entry in
+ * its role→PEM map (it only ever looped `manifest.agents`, which never
+ * contains this role), so a vault-confirmable runner-ops App fell all the
+ * way to `skip-unverified` even with both `--vault`/`--identity-key` given.
+ *
+ * Returns `undefined` when the field is absent or empty — same
+ * never-fabricate-a-PEM contract as `vaultAgentPrivateKeyPem`.
+ *
+ * **Caller obligation — same as {@link vaultAgentPrivateKeyPem}.** The
+ * returned string MUST NOT be logged, printed, or embedded in an
+ * error/exception message; a caller writing it to a scratch file for a JWT
+ * mint must treat that file exactly the way `apply-agent.ts`'s
+ * `writeScratchPem`/`cleanupScratchPem` do: 0600, short-lived, deleted once
+ * the confirm completes.
+ */
+export function vaultRunnerOpsPrivateKeyPem(raw: Readonly<Record<string, string>>, fleetName: string): string | undefined {
+  const seg = toVariableSegment(deriveRunnerOpsHandle(fleetName));
+  const b64 = raw[`MACF_RUNNER_OPS_${seg}_PRIVATE_KEY_B64`];
   if (b64 === undefined || b64.length === 0) return undefined;
   return Buffer.from(b64, 'base64').toString('utf-8');
 }

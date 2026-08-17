@@ -103,7 +103,13 @@ describe('mintRoutingClient — mint-or-skip decision table', () => {
     expect(outcome.status).toBe('skipped');
   });
 
-  it('deps.mint throwing -> SKIPS with the error in the reason, never throws out of mintRoutingClient itself', async () => {
+  // groundnuty/macf#954 — `deps.mint` throwing (a crypto/tmpdir/disk
+  // exception) is a DISTINCT `'failed'` status, never folded into the two
+  // benign 'skipped' causes above. `applyExitCode`
+  // (`commands/bootstrap-apply.ts`) reads THIS status to decide the exit
+  // code, so the discrimination has to happen right here — see this test's
+  // sibling `applyExitCode` assertions in `bootstrap-apply.test.ts`.
+  it('deps.mint throwing -> FAILS (status "failed", DISTINCT from "skipped") with the error in the reason, never throws out of mintRoutingClient itself (macf#954)', async () => {
     const outcome = await mintRoutingClient(
       'CA-CERT-PEM',
       'CA-KEY-PEM',
@@ -115,20 +121,46 @@ describe('mintRoutingClient — mint-or-skip decision table', () => {
         },
       }),
     );
-    expect(outcome.status).toBe('skipped');
-    if (outcome.status === 'skipped') expect(outcome.reason).toMatch(/x509 generation failed/);
+    expect(outcome.status).toBe('failed');
+    expect(outcome.status).not.toBe('skipped');
+    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/x509 generation failed/);
   });
 
-  it('NEVER logs or returns a raw credential value in the skipped-path reason strings', async () => {
+  it('the two BENIGN skip causes (already-vaulted from a prior run; CA reused not minted this run) stay "skipped", never "failed" — only a genuine mint EXCEPTION is "failed" (macf#954)', async () => {
+    const alreadyVaulted = await mintRoutingClient('CA-CERT-PEM', 'CA-KEY-PEM', true, true, mintDepsWith());
+    const caReused = await mintRoutingClient('CA-CERT-PEM', undefined, false, false, mintDepsWith());
+    expect(alreadyVaulted.status).toBe('skipped');
+    expect(caReused.status).toBe('skipped');
+  });
+
+  it('NEVER logs or returns a raw credential value in the skipped-path OR the failed-path reason strings (macf#954 extends this to "failed")', async () => {
     const outcomes = await Promise.all([
       mintRoutingClient('CA-CERT-PEM', 'CA-KEY-PEM', true, true, mintDepsWith()),
       mintRoutingClient('CA-CERT-PEM', undefined, false, false, mintDepsWith()),
+      mintRoutingClient(
+        'CA-CERT-PEM',
+        'CA-KEY-PEM',
+        false,
+        true,
+        mintDepsWith({
+          mint: async () => {
+            // The exception's own message never mentions the key — proves
+            // `mintRoutingClient` doesn't independently EMBED its `caKeyPem`
+            // argument into the 'failed' reason; it only ever forwards
+            // `err.message` verbatim (a caller/dependency-controlled string,
+            // scrubbed at ITS OWN source, not this function's job to scrub).
+            throw new Error('x509 generation failed');
+          },
+        }),
+      ),
     ]);
     for (const o of outcomes) {
-      if (o.status === 'skipped') {
+      if (o.status === 'skipped' || o.status === 'failed') {
         expect(o.reason).not.toContain('CA-KEY-PEM');
       }
     }
+    // The third outcome above IS the 'failed' path — assert it was actually exercised.
+    expect(outcomes[2]?.status).toBe('failed');
   });
 });
 

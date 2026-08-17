@@ -385,9 +385,19 @@ export interface RoutingClientApplyResult {
   readonly keyLegs: Readonly<Record<string, EnsureVariableOutcome>>;
 }
 
-/** Render-safe mirror of {@link RoutingClientMintOutcome} — NEVER carries `certPem`/`keyPem`. Explicit field copies (not a spread) per `redactIdentity`'s own precedent — a future variant adding a credential field is then a compile error here, not a silent leak. */
+/**
+ * Render-safe mirror of {@link RoutingClientMintOutcome} — NEVER carries
+ * `certPem`/`keyPem`. Explicit field copies (not a spread) per
+ * `redactIdentity`'s own precedent — a future variant adding a credential
+ * field is then a compile error here, not a silent leak. `'failed'`
+ * (groundnuty/macf#954) is a THIRD, distinct status from `'skipped'` — see
+ * {@link RoutingClientMintOutcome}'s doc; `applyExitCode`
+ * (`commands/bootstrap-apply.ts`) reads THIS field to decide whether a mint
+ * exception needs operator attention, so the status must survive redaction
+ * undisturbed.
+ */
 export interface RedactedRoutingClientMint {
-  readonly status: 'minted' | 'skipped';
+  readonly status: 'minted' | 'skipped' | 'failed';
   readonly reason?: string;
 }
 
@@ -398,6 +408,8 @@ export function redactRoutingClientMint(outcome: RoutingClientMintOutcome): Reda
       return { status: 'minted' };
     case 'skipped':
       return { status: 'skipped', reason: outcome.reason };
+    case 'failed':
+      return { status: 'failed', reason: outcome.reason };
   }
 }
 
@@ -882,10 +894,14 @@ export async function applyFleet(
     caResolve.status === 'minted',
     deps.routingClientDeps,
   );
+  // groundnuty/macf#954 — 'failed' (a genuine mint exception) is logged
+  // distinctly from a benign 'skipped' — see `RoutingClientMintOutcome`'s doc.
   deps.log(
     routingClientMint.status === 'minted'
       ? 'Routing-client cert: MINTED (CN=routing-action).'
-      : `Routing-client cert: SKIPPED — ${routingClientMint.reason}`,
+      : routingClientMint.status === 'failed'
+        ? `Routing-client cert: FAILED to mint — ${routingClientMint.reason}`
+        : `Routing-client cert: SKIPPED — ${routingClientMint.reason}`,
   );
   const routingClientSecretsForVault: VaultRoutingClientSecrets | undefined =
     routingClientMint.status === 'minted' ? { clientCertPem: routingClientMint.certPem, clientKeyPem: routingClientMint.keyPem } : undefined;
@@ -979,8 +995,11 @@ export async function applyFleet(
   // re-mint," groundnuty/macf#920 gap 2) — same ordering rule as the CA cert
   // above: only deploy a freshly-minted cert/key once its key is confirmed
   // durable (`vault.status === 'written'`); a mint that was SKIPPED (reused
-  // CA, already-vaulted routing-client, or a mint failure) publishes
-  // NOTHING — every leg reads `'skipped'` with the reason, never silent.
+  // CA, or already-vaulted routing-client — both benign) OR FAILED
+  // (groundnuty/macf#954 — a genuine mint exception) publishes NOTHING —
+  // every leg reads `'skipped'` with the reason, never silent. The
+  // SKIPPED-vs-FAILED distinction itself is carried on `routingClientMint`
+  // (not here) — `applyExitCode` reads it to decide the exit code.
   let routingClientSkipReason: string | undefined;
   if (routingClientMint.status === 'minted' && vault.status !== 'written') {
     routingClientSkipReason =
@@ -988,7 +1007,7 @@ export async function applyFleet(
       'deploy the private key to any repo until it is durable (DR-043 §D5). Re-run apply once the vault issue is ' +
       "fixed. The retry re-mints (fleet.lock never recorded a routing_client_key fingerprint), which is harmless: " +
       "this run's key was never made durable and was never deployed, so nothing is orphaned.";
-  } else if (routingClientMint.status === 'skipped') {
+  } else if (routingClientMint.status === 'skipped' || routingClientMint.status === 'failed') {
     routingClientSkipReason = routingClientMint.reason;
   }
   const routingClientPublish: RoutingClientPublishResult =

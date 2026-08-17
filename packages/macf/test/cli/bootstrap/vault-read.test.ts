@@ -23,17 +23,21 @@ import {
   countVaultAgentPresence,
   countVaultCaPresence,
   countVaultRoutingPresence,
+  countVaultRunnerOpsPresence,
   parseVaultPlaintext,
   queryVaultAgentPresence,
   queryVaultCaPresence,
   queryVaultRoutingPresence,
+  queryVaultRunnerOpsPresence,
   readVault,
   vaultAgentPrivateKeyPem,
+  vaultRunnerOpsPrivateKeyPem,
   type VaultAgentObservation,
   type VaultCaObservation,
 } from '../../../src/cli/bootstrap/vault-read.js';
-import { VaultError, buildVaultPlaintext, writeVault, type VaultAgentSecrets, type VaultPayload } from '../../../src/cli/bootstrap/vault-write.js';
+import { VaultError, buildVaultPlaintext, writeVault, type VaultAgentSecrets, type VaultPayload, type VaultRunnerOpsSecrets } from '../../../src/cli/bootstrap/vault-write.js';
 import { deriveAppHandle } from '../../../src/cli/bootstrap/fleet-manifest.js';
+import { deriveRunnerOpsHandle } from '../../../src/cli/bootstrap/apply-runner-ops.js';
 import { secretFingerprint } from '../../../src/cli/bootstrap/fleet-lock.js';
 
 function have(cmd: string): boolean {
@@ -64,6 +68,21 @@ const PAYLOAD: VaultPayload = {
   },
   ca: { project: FLEET, caKeyPem: 'SYNTH-CA-KEY-PEM', caCertPem: 'SYNTH-CA-CERT-PEM' },
 };
+
+// groundnuty/macf#954 — the runner-ops App's fixtures, kept SEPARATE from
+// `PAYLOAD`/`AGENT` above (a dedicated payload, not a mutation of the shared
+// one) so the new runner-ops tests can't perturb any pre-existing assertion
+// in this file that counts fields/keys off `PAYLOAD`.
+const RUNNER_OPS: VaultRunnerOpsSecrets = {
+  appHandle: deriveRunnerOpsHandle(FLEET),
+  appId: '777',
+  installId: '778',
+  clientId: 'Iv1.runner-ops',
+  clientSecret: 'SYNTH-RUNNER-OPS-CLIENT-SECRET',
+  webhookSecret: 'SYNTH-RUNNER-OPS-WEBHOOK-SECRET',
+  pem: '-----BEGIN RSA PRIVATE KEY-----\nSYNTH-RUNNER-OPS-PEM-BYTES\n-----END RSA PRIVATE KEY-----\n',
+};
+const PAYLOAD_WITH_RUNNER_OPS: VaultPayload = { ...PAYLOAD, runnerOps: RUNNER_OPS };
 
 describe('parseVaultPlaintext', () => {
   it('parses single-quoted KEY=\'value\' lines (buildVaultPlaintext\'s current emission)', () => {
@@ -345,6 +364,105 @@ describe('vaultAgentPrivateKeyPem — the ONE raw-secret-returning query (macf#9
 
   it('returns undefined against an empty vault map', () => {
     expect(vaultAgentPrivateKeyPem({}, FLEET, ROLE)).toBeUndefined();
+  });
+});
+
+// --- groundnuty/macf#954 — the runner-ops App's presence query + PEM
+// accessor, the fifth `queryVault*`/`vault*PrivateKeyPem` sibling. Same
+// shapes as the four pre-existing ones: presence-only for
+// `queryVaultRunnerOpsPresence` (mirrors `queryVaultAgentPresence` /
+// `queryVaultCaPresence` / `queryVaultRoutingPresence`), the ONE raw-secret
+// return for `vaultRunnerOpsPrivateKeyPem` (mirrors `vaultAgentPrivateKeyPem`
+// — macf#913's precedent).
+
+describe('queryVaultRunnerOpsPresence (macf#954)', () => {
+  const raw = parseVaultPlaintext(buildVaultPlaintext(PAYLOAD_WITH_RUNNER_OPS));
+
+  it('every field of a fully-provisioned runner-ops App reads present with a fingerprint', () => {
+    const presence = queryVaultRunnerOpsPresence(raw, FLEET);
+    expect(presence.appId.present).toBe(true);
+    expect(presence.installId.present).toBe(true);
+    expect(presence.clientId.present).toBe(true);
+    expect(presence.clientSecret.present).toBe(true);
+    expect(presence.webhookSecret.present).toBe(true);
+    expect(presence.privateKey.present).toBe(true);
+    expect(presence.clientSecret.fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  it('the clientSecret/webhookSecret fingerprints match fleet-lock.ts\'s secretFingerprint over the SAME raw value (drift-comparable, mirrors queryVaultAgentPresence\'s own test)', () => {
+    const presence = queryVaultRunnerOpsPresence(raw, FLEET);
+    expect(presence.clientSecret.fingerprint).toBe(secretFingerprint(RUNNER_OPS.clientSecret));
+    expect(presence.webhookSecret.fingerprint).toBe(secretFingerprint(RUNNER_OPS.webhookSecret));
+  });
+
+  it('the privateKey fingerprint is computed over the base64-DECODED bytes, not the base64 text stored in the vault', () => {
+    const presence = queryVaultRunnerOpsPresence(raw, FLEET);
+    expect(presence.privateKey.fingerprint).toBe(secretFingerprint(RUNNER_OPS.pem));
+    expect(presence.privateKey.fingerprint).not.toBe(secretFingerprint(Buffer.from(RUNNER_OPS.pem, 'utf-8').toString('base64')));
+  });
+
+  it('a vault with NO runner-ops entry at all (a plain agent-only vault) reads entirely absent, not an error', () => {
+    const agentOnlyRaw = parseVaultPlaintext(buildVaultPlaintext(PAYLOAD)); // PAYLOAD has NO runnerOps field
+    const presence = queryVaultRunnerOpsPresence(agentOnlyRaw, FLEET);
+    expect(presence.appId.present).toBe(false);
+    expect(presence.appId.fingerprint).toBeUndefined();
+    expect(presence.privateKey.present).toBe(false);
+  });
+
+  it('a DIFFERENT fleet name (not this vault\'s) reads entirely absent — never cross-fleet-misattributed', () => {
+    const presence = queryVaultRunnerOpsPresence(raw, 'some-other-fleet');
+    expect(presence.appId.present).toBe(false);
+    expect(presence.privateKey.present).toBe(false);
+  });
+
+  it('countVaultRunnerOpsPresence tallies present/total correctly, mirroring the other count helpers', () => {
+    expect(countVaultRunnerOpsPresence(queryVaultRunnerOpsPresence(raw, FLEET))).toEqual({ present: 6, total: 6 });
+    expect(countVaultRunnerOpsPresence(queryVaultRunnerOpsPresence(raw, 'nope'))).toEqual({ present: 0, total: 6 });
+  });
+
+  it('presence objects NEVER carry the raw secret value anywhere — the same redaction seam every other presence query in this module upholds', () => {
+    const presence = queryVaultRunnerOpsPresence(raw, FLEET);
+    const serialized = JSON.stringify(presence);
+    expect(serialized).not.toContain(RUNNER_OPS.clientSecret);
+    expect(serialized).not.toContain(RUNNER_OPS.webhookSecret);
+    expect(serialized).not.toContain('SYNTH-RUNNER-OPS-PEM-BYTES');
+    expect(serialized).not.toContain(Buffer.from(RUNNER_OPS.pem, 'utf-8').toString('base64'));
+  });
+
+  it('does NOT read an agent\'s MACF_AGENT_* fields as if they were runner-ops fields — the vault namespaces stay distinct', () => {
+    // PAYLOAD_WITH_RUNNER_OPS also carries AGENT (a `MACF_AGENT_*` entry) —
+    // querying runner-ops presence for a role-shaped fleet segment that only
+    // exists in the AGENT namespace must not spuriously read as present.
+    const presence = queryVaultRunnerOpsPresence(raw, FLEET);
+    // Sanity: the agent's OWN presence (different namespace/prefix) is
+    // unaffected by/independent of this query.
+    expect(queryVaultAgentPresence(raw, FLEET, ROLE).appId.present).toBe(true);
+    expect(presence.appId.fingerprint).not.toBe(queryVaultAgentPresence(raw, FLEET, ROLE).appId.fingerprint);
+  });
+});
+
+describe('vaultRunnerOpsPrivateKeyPem — the runner-ops sibling of vaultAgentPrivateKeyPem (macf#954)', () => {
+  const raw = parseVaultPlaintext(buildVaultPlaintext(PAYLOAD_WITH_RUNNER_OPS));
+
+  it('returns the exact original PEM for a fully-provisioned runner-ops App — round-trips through the base64 storage form', () => {
+    expect(vaultRunnerOpsPrivateKeyPem(raw, FLEET)).toBe(RUNNER_OPS.pem);
+  });
+
+  it('returns undefined when the vault carries no runner-ops entry at all — never fabricates a PEM', () => {
+    const agentOnlyRaw = parseVaultPlaintext(buildVaultPlaintext(PAYLOAD));
+    expect(vaultRunnerOpsPrivateKeyPem(agentOnlyRaw, FLEET)).toBeUndefined();
+  });
+
+  it('returns undefined for a DIFFERENT fleet name — derived forward from fleetName, never a bare lookup', () => {
+    expect(vaultRunnerOpsPrivateKeyPem(raw, 'some-other-fleet')).toBeUndefined();
+  });
+
+  it('returns undefined against an empty vault map', () => {
+    expect(vaultRunnerOpsPrivateKeyPem({}, FLEET)).toBeUndefined();
+  });
+
+  it('never returns an AGENT\'s PEM when asked for runner-ops — the two credential classes stay structurally separate', () => {
+    expect(vaultRunnerOpsPrivateKeyPem(raw, FLEET)).not.toBe(AGENT.pem);
   });
 });
 

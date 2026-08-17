@@ -53,15 +53,32 @@ export interface RoutingClientMintDeps {
 
 export type RoutingClientMintOutcome =
   | { readonly status: 'minted'; readonly certPem: string; readonly keyPem: string }
-  | { readonly status: 'skipped'; readonly reason: string };
+  | { readonly status: 'skipped'; readonly reason: string }
+  // groundnuty/macf#954 — a THIRD, distinct outcome from the two benign
+  // 'skipped' causes above (already-vaulted from a prior run; CA reused, not
+  // minted this run — both EXPECTED steady states, never operator-attention).
+  // A `deps.mint` REJECTION (crypto/tmpdir/disk exception) used to collapse
+  // into the SAME 'skipped' status+reason-string shape as those two benign
+  // causes — `applyExitCode` (`commands/bootstrap-apply.ts`) treats every
+  // 'skipped' mint as "nothing to action" and never fails the run on it, so a
+  // transient mint exception on a FRESH fleet (the exact next live run after
+  // a freshly-minted CA) made `apply` exit 0 while no routing-client cert
+  // ever reached any repo — the credential every agent's channel-server needs
+  // for the mTLS mesh. `'failed'` is the discriminated status for a genuine
+  // exception; callers (this module's `apply-fleet.ts` caller, and
+  // `applyExitCode`) must treat it the same operator-attention way `caBad`
+  // already treats a CA resolve failure — never folded back into 'skipped'.
+  | { readonly status: 'failed'; readonly reason: string };
 
 /**
- * Decide mint-vs-skip — see the module doc's "mint gating" section for the
- * full decision table. NEVER throws; a `deps.mint` rejection resolves to
- * `status: 'skipped'` (this ceremony is best-effort relative to the fleet's
- * identity/CA/routing provisioning — a routing-client mint failure must not
- * abort the whole `apply` run, same posture `apply-ca.ts`'s publish leg
- * takes for a publish failure).
+ * Decide mint-vs-skip-vs-fail — see the module doc's "mint gating" section
+ * for the full decision table. NEVER throws — but a `deps.mint` REJECTION
+ * (crypto/tmpdir/disk exception) resolves to the DISTINCT `status: 'failed'`
+ * (groundnuty/macf#954), never folded into the two benign `'skipped'` causes
+ * below (already-vaulted from a prior run; CA reused not minted this run) —
+ * those two are the EXPECTED steady state on an ordinary re-run and must
+ * never fail `apply`'s exit code; a genuine mint exception is an
+ * operator-attention state and MUST (via `applyExitCode`).
  *
  * @param lockHasRoutingClientKey `fleet.lock.fingerprints.routing_client_key
  *   !== undefined` — a PRIOR successful apply already vaulted a routing-client
@@ -103,7 +120,11 @@ export async function mintRoutingClient(
     const { certPem, keyPem } = await deps.mint(caCertPem, caKeyPem);
     return { status: 'minted', certPem, keyPem };
   } catch (err) {
-    return { status: 'skipped', reason: `routing-client cert mint failed: ${err instanceof Error ? err.message : String(err)}` };
+    // groundnuty/macf#954 — DISTINCT from the two benign 'skipped' returns
+    // above: this is a genuine mint exception (crypto/tmpdir/disk), not an
+    // expected steady state. `'failed'`, never `'skipped'` — see this
+    // function's + the type's doc.
+    return { status: 'failed', reason: `routing-client cert mint failed: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
