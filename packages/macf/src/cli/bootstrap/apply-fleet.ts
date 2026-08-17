@@ -32,9 +32,30 @@
  * list a repo that doesn't exist yet — the exact failure the first live
  * provision (#854) hit on the operator's first Install click.
  *
- * The full per-run sequence: **control repo (once) → for each agent:
- * ensure-repo → confirm-before-create guard → gate 1 → gate 2 → repo-init →
- * (loop) → the batched vault write → a final control-repo commit+push.**
+ * The full per-run sequence: **name-length pre-flight (zero I/O) → control
+ * repo (once) → for each agent: ensure-repo → confirm-before-create guard →
+ * gate 1 → gate 2 → repo-init → (loop) → the runner-registrar App (its OWN
+ * confirm-before-create guard → gate 1 → gate 2, fleet-level — DR-043
+ * groundnuty/macf#943, see the "runner-registrar" section below) → the
+ * batched vault write → a final control-repo commit+push.**
+ *
+ * ## The runner-registrar App (groundnuty/macf#943)
+ *
+ * A SECOND, minimal GitHub App per fleet, created via the EXACT SAME
+ * `apply-agent.ts::applyIdentity` gate-1/gate-2 primitive every coordination
+ * agent uses — but it is NOT one of `manifest.agents[]` (no home repo, no
+ * deploy path; `FleetManifestSchema` has no knowledge of this role at all).
+ * Its permission set (`administration:write` / `actions:read` /
+ * `metadata:read`) is deliberately DR-019-DISJOINT — see
+ * `apply-runner-registrar.ts`'s module doc for why DR-019 was never widened
+ * to add `administration` instead. Runs AFTER the per-agent loop (so an
+ * agent's own provisioning is never blocked by it) and BEFORE the batched
+ * vault write (`settleVault`, below) — `writeVault` is single-shot
+ * whole-payload, so a freshly-minted registrar credential MUST fold into the
+ * SAME call as the fleet's agents/CA/routing-client. Its identity outcome is
+ * a SEPARATE `FleetApplyResult.runnerRegistrar` field, not folded into
+ * `agents` — that field is 1:1 with `manifest.agents[]` throughout this
+ * module and every existing test assumes exactly that.
  *
  * ## Ordering rationale — why lock writes split into TWO moments
  *
@@ -196,17 +217,18 @@ import { dirname, join } from 'node:path';
 import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { TokenSource } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetLockAgent, FleetManifest } from './fleet-manifest.js';
-import { buildTrustedActorsValue, deriveAppHandle } from './fleet-manifest.js';
+import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName } from './fleet-manifest.js';
 import type { AgentApplyDeps, AgentApplyOutcome } from './apply-agent.js';
-import { applyAgentIdentity, cleanupScratchPem, writeScratchPem } from './apply-agent.js';
+import { applyAgentIdentity, applyIdentity, cleanupScratchPem, writeScratchPem } from './apply-agent.js';
 import type { AppCredentials } from './manifest-exchange.js';
 import type { AgentRepoDeps, RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
 import { applyRepoInitForAgent, ensureAgentRepo } from './apply-repo-init.js';
+import { repoHomepageUrl } from './app-manifest.js';
 import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './control-repo.js';
 import { provisionControlRepo } from './control-repo.js';
 import type { FleetLockAgentUpdate, FleetLockIdentityChange } from './fleet-lock.js';
 import { composeFleetLock, readFleetLockFile, writeFleetLock } from './fleet-lock.js';
-import type { VaultAgentSecrets, VaultCaSecrets, VaultEncryptFn, VaultRoutingClientSecrets, WriteVaultDeps } from './vault-write.js';
+import type { VaultAgentSecrets, VaultCaSecrets, VaultEncryptFn, VaultRoutingClientSecrets, VaultRunnerRegistrarSecrets, WriteVaultDeps } from './vault-write.js';
 import {
   VaultError,
   ageEncryptToFile,
@@ -215,9 +237,18 @@ import {
   removeAgentRecoveryArtifact,
   vaultAgentSecretsForFingerprint,
   vaultFleetSecretsForFingerprint,
+  vaultRunnerRegistrarSecretsForFingerprint,
   writeAgentRecoveryArtifact,
   writeVault,
 } from './vault-write.js';
+import type { AppNameLengthCheck } from './apply-runner-registrar.js';
+import {
+  RUNNER_REGISTRAR_ROLE,
+  checkAppNameLengths,
+  deriveRunnerRegistrarHandle,
+  runnerRegistrarIdentityRequest,
+  validateRunnerRegistrarInstall,
+} from './apply-runner-registrar.js';
 import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } from './apply-ca.js';
 import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
@@ -378,6 +409,21 @@ export interface FleetApplyResult {
   readonly lockPath: string;
   readonly finalLock: FleetLock | null;
   readonly agents: readonly AgentApplyRecord[];
+  /**
+   * The runner-registrar App's identity outcome (groundnuty/macf#943) — a
+   * SEPARATE field from `agents` above, deliberately: `agents` is keyed 1:1
+   * with `manifest.agents[]` throughout this module (and every existing
+   * `apply-fleet.test.ts` assertion on its length/contents assumes exactly
+   * that), and the runner-registrar is a fleet-level identity that is never
+   * declared there. Reuses `AgentApplyOutcome`'s own union + the SAME
+   * `applyIdentity` primitive `agents[]` entries are built from — see the
+   * "runner-registrar" call-site comment below for the ordering/vault-fold
+   * rationale. ALWAYS present (never `undefined`) — a control-repo abort
+   * (see `controlRepo` above) reports it as `'failed'` with a reason
+   * pointing at the abort, mirroring `ca`/`routingClient`'s own
+   * always-present-even-on-abort discipline below.
+   */
+  readonly runnerRegistrar: AgentApplyOutcome;
   readonly vault: VaultApplyOutcome;
   /** Accumulated across every incremental `composeFleetLock` call this run — DR-043 Amendment A §A2 "never silently resolve" drift. */
   readonly identityChanges: readonly FleetLockIdentityChange[];
@@ -515,6 +561,37 @@ function noRecipientPreflightFailure(role: string): AgentApplyOutcome {
 export const CONTROL_REPO_SYNC_COMMIT_MESSAGE = 'chore(bootstrap): apply — fleet.lock / vault.age update (DR-043 §D5)';
 
 /**
+ * The zero-I/O early-abort shape shared by the name-length pre-flight and
+ * the control-repo abort branch immediately below it — every field
+ * `FleetApplyResult` requires, for a run that never touched anything.
+ * Extracted (groundnuty/macf#943) so the pre-flight doesn't hand-roll a
+ * second copy of this same all-fields-empty object.
+ */
+function abortedFleetApplyResult(manifestPath: string, priorLock: FleetLock | null, controlRepo: ControlRepoOutcome, reason: string): FleetApplyResult {
+  return {
+    controlRepo,
+    controlRepoSync: { status: 'skipped' },
+    lockPath: join(dirname(manifestPath), 'fleet.lock'),
+    finalLock: priorLock,
+    agents: [],
+    runnerRegistrar: { role: RUNNER_REGISTRAR_ROLE, status: 'failed', reason: `${reason} — see controlRepo above.` },
+    vault: { status: 'skipped' },
+    identityChanges: [],
+    ca: {
+      resolve: { status: 'failed', reason: `${reason} — see controlRepo above.` },
+      registryLeg: { status: 'skipped', reason: `${reason} — see controlRepo above.` },
+      repoLegs: {},
+    },
+    routing: {},
+    routingClient: {
+      mint: { status: 'skipped', reason: `${reason} — see controlRepo above.` },
+      certLegs: {},
+      keyLegs: {},
+    },
+  };
+}
+
+/**
  * Drive the full fleet through control-repo provisioning (step 0) + identity
  * + repo-init + the (deferred, batched) vault write + a final control-repo
  * push. NEVER throws — every failure resolves into the returned result's
@@ -530,6 +607,29 @@ export async function applyFleet(
   priorLock: FleetLock | null,
   deps: FleetApplyDeps,
 ): Promise<FleetApplyResult> {
+  // --- Name-length pre-flight (groundnuty/macf#943) — THE FIRST check in
+  // the whole run, before EVEN the control repo (which itself precedes any
+  // consent gate). Zero I/O; every App name this run would need (every
+  // agent's derived handle + the runner-registrar's) is knowable from the
+  // manifest alone. `commands/bootstrap-apply.ts` runs the SAME check even
+  // earlier (right after parsing the manifest, before `--dry-run` even
+  // computes a plan) so a violating fleet.yaml never reaches this far in
+  // practice — this second call site exists so the refusal holds even for a
+  // caller that drives `applyFleet` directly (every test in this suite; a
+  // future programmatic caller), and so "the gate seam is never invoked" is
+  // provable as a property of `applyFleet` itself, not just of the CLI
+  // wrapper around it.
+  const nameLengthCheck: AppNameLengthCheck = checkAppNameLengths(manifest);
+  if (!nameLengthCheck.ok) {
+    deps.log(`ABORTING entire apply run before any consent gate — ${nameLengthCheck.reason}`);
+    return abortedFleetApplyResult(
+      manifestPath,
+      priorLock,
+      { status: 'failed', repo: `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`, reason: nameLengthCheck.reason },
+      'name-length pre-flight refused',
+    );
+  }
+
   // --- Step 0 (DR-043 Amendment F, macf#857): the control repo. THE FIRST
   // mutating action of this run — before any consent gate, before ANY
   // per-agent processing. See control-repo.ts's module doc for the
@@ -544,26 +644,7 @@ export async function applyFleet(
     // Nothing else is ever touched — no agent repo, App, or install. A
     // best-effort fallback `lockPath` (never actually written to) so the
     // caller still has SOMETHING path-shaped to report.
-    return {
-      controlRepo,
-      controlRepoSync: { status: 'skipped' },
-      lockPath: join(dirname(manifestPath), 'fleet.lock'),
-      finalLock: priorLock,
-      agents: [],
-      vault: { status: 'skipped' },
-      identityChanges: [],
-      ca: {
-        resolve: { status: 'failed', reason: 'control repo aborted before the CA ceremony could run — see controlRepo above.' },
-        registryLeg: { status: 'skipped', reason: 'control repo aborted — see controlRepo above.' },
-        repoLegs: {},
-      },
-      routing: {},
-      routingClient: {
-        mint: { status: 'skipped', reason: 'control repo aborted before the routing-client ceremony could run — see controlRepo above.' },
-        certLegs: {},
-        keyLegs: {},
-      },
-    };
+    return abortedFleetApplyResult(manifestPath, priorLock, controlRepo, 'control repo aborted before any provisioning could run');
   }
   deps.log(`Control repo "${controlRepo.repo}": ${controlRepo.status.toUpperCase()} (checkout: ${controlRepo.localDir}).`);
 
@@ -673,6 +754,94 @@ export async function applyFleet(
     records.push({ role: agent.role, identity, repoInit: repoInitOutcome });
   }
 
+  // --- groundnuty/macf#943: the runner-registrar App — a FLEET-LEVEL
+  // identity (never declared in manifest.agents[]; `FleetManifestSchema` has
+  // no knowledge of this role), driven through the EXACT SAME
+  // confirm-before-create → gate 1 → gate 2 primitive
+  // (apply-agent.ts::applyIdentity) every coordination agent uses above —
+  // "a second, differently-configured use of that path, not a parallel
+  // implementation" (task brief). Runs AFTER the per-agent loop (a failure
+  // here never blocks agent provisioning, matching the CA/routing-client
+  // ceremonies' own ordering below) and BEFORE `settleVault` — `writeVault`
+  // is single-shot whole-payload (its own module doc), so a freshly-minted
+  // credential MUST fold into the SAME batched call as the fleet's
+  // agents/CA/routing-client; there is no second write later in this run to
+  // catch one that missed this window. Its recovery artifact is written the
+  // SAME way an agent's is (`buildAgentDepsWithRecovery`, reused verbatim)
+  // and deleted in the SAME `vault.status === 'written'` branch that deletes
+  // every agent's — its role is folded into `pendingCreatedUpdates` alongside
+  // the agents' for exactly that reason (see that branch's
+  // `for (const role of Object.keys(pendingCreatedUpdates))` loop below).
+  const runnerRegistrarPrior = currentLock?.agents.find((a) => a.role === RUNNER_REGISTRAR_ROLE);
+  // Same §D5 pre-flight the per-agent loop already applies above — an empty
+  // `transport.age_recipients` must refuse gate 1 for this identity too, not
+  // just for declared agents (a role absent from `pendingCreatedUpdates`
+  // never gets here on a re-run once a lock entry exists, mirroring the
+  // per-agent guard).
+  const runnerRegistrarDeps: AgentApplyDeps = {
+    ...buildAgentDepsWithRecovery(secretsDir, recipients, {
+      ...deps,
+      log: (line: string): void => {
+        deps.log(`[runner-registrar] ${line}`);
+      },
+    }),
+    // groundnuty/macf#943 — GitHub's App-manifest flow has no field to FORCE
+    // repository_selection at creation time (see
+    // `apply-runner-registrar.ts::validateRunnerRegistrarInstall`'s doc); this
+    // is the verify-then-refuse enforcement point, checked right after gate 2
+    // confirms, before this identity is ever reported as created/resumed.
+    validateInstall: validateRunnerRegistrarInstall,
+  };
+  const runnerRegistrarIdentity: AgentApplyOutcome = wouldCreateWithNoRecipient(runnerRegistrarPrior, recipients)
+    ? noRecipientPreflightFailure(RUNNER_REGISTRAR_ROLE)
+    : await applyIdentity(
+        // No home repo for this App — `controlRepo.repo` (the fleet's OWN
+        // control-plane repo, already confirmed to exist by Step 0 above) is
+        // the closest fleet-level homepage this tool has; a design choice,
+        // not a spec requirement (flagged in the implementation report).
+        runnerRegistrarIdentityRequest(repoHomepageUrl(controlRepo.repo)),
+        manifest,
+        runnerRegistrarPrior,
+        runnerRegistrarDeps,
+      );
+
+  let pendingRunnerRegistrarVaultSecrets: VaultRunnerRegistrarSecrets | undefined;
+  if (runnerRegistrarIdentity.status === 'reused' || runnerRegistrarIdentity.status === 'resumed-install') {
+    writeIncrementalLock(RUNNER_REGISTRAR_ROLE, { appId: runnerRegistrarIdentity.appId, installId: runnerRegistrarIdentity.installId });
+  } else if (runnerRegistrarIdentity.status === 'created') {
+    const rrHandle = deriveRunnerRegistrarHandle(manifest.metadata.name);
+    const rrSecrets: VaultRunnerRegistrarSecrets = {
+      appHandle: rrHandle,
+      appId: runnerRegistrarIdentity.appId,
+      installId: runnerRegistrarIdentity.installId,
+      clientId: runnerRegistrarIdentity.credentials.clientId,
+      clientSecret: runnerRegistrarIdentity.credentials.clientSecret,
+      webhookSecret: runnerRegistrarIdentity.credentials.webhookSecret,
+      pem: runnerRegistrarIdentity.credentials.pem,
+    };
+    pendingRunnerRegistrarVaultSecrets = rrSecrets;
+    pendingCreatedUpdates[RUNNER_REGISTRAR_ROLE] = {
+      appId: runnerRegistrarIdentity.appId,
+      installId: runnerRegistrarIdentity.installId,
+      secrets: vaultRunnerRegistrarSecretsForFingerprint(rrSecrets),
+    };
+  }
+  // skipped-unverified / drift / failed: no lock write this run — same
+  // "unresolved this run" posture the per-agent loop already applies to its
+  // own identical statuses.
+  deps.log(
+    `Runner-registrar App: ${runnerRegistrarIdentity.status.toUpperCase()}` +
+      (runnerRegistrarIdentity.status === 'failed' ||
+      runnerRegistrarIdentity.status === 'drift' ||
+      runnerRegistrarIdentity.status === 'skipped-unverified'
+        ? ` — ${runnerRegistrarIdentity.reason}`
+        : '.'),
+  );
+  // `runnerRegistrarIdentity` is threaded straight onto `FleetApplyResult.runnerRegistrar`
+  // at the end of this function — a SEPARATE field from `agents` (see that
+  // field's doc for why: `agents` is 1:1 with `manifest.agents[]` throughout
+  // this module, and this App is never declared there).
+
   // --- DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) ---
   //
   // Mint-or-reuse decision FIRST (fleet-level, independent of any one
@@ -721,7 +890,15 @@ export async function applyFleet(
   const routingClientSecretsForVault: VaultRoutingClientSecrets | undefined =
     routingClientMint.status === 'minted' ? { clientCertPem: routingClientMint.certPem, clientKeyPem: routingClientMint.keyPem } : undefined;
 
-  const vault = await settleVault(manifest, vaultOutPath, pendingVaultAgents, caSecretsForVault, routingClientSecretsForVault, deps);
+  const vault = await settleVault(
+    manifest,
+    vaultOutPath,
+    pendingVaultAgents,
+    caSecretsForVault,
+    routingClientSecretsForVault,
+    pendingRunnerRegistrarVaultSecrets,
+    deps,
+  );
   if (
     vault.status === 'written' &&
     (Object.keys(pendingCreatedUpdates).length > 0 || caSecretsForVault !== undefined || routingClientSecretsForVault !== undefined)
@@ -885,7 +1062,19 @@ export async function applyFleet(
     certLegs: routingClientPublish.certLegs,
     keyLegs: routingClientPublish.keyLegs,
   };
-  return { controlRepo, controlRepoSync, lockPath, finalLock: currentLock, agents: records, vault, identityChanges, ca, routing, routingClient };
+  return {
+    controlRepo,
+    controlRepoSync,
+    lockPath,
+    finalLock: currentLock,
+    agents: records,
+    runnerRegistrar: runnerRegistrarIdentity,
+    vault,
+    identityChanges,
+    ca,
+    routing,
+    routingClient,
+  };
 }
 
 /**
@@ -919,7 +1108,10 @@ async function syncControlRepo(controlDir: string, deps: FleetApplyDeps): Promis
  * is single-shot whole-payload (see `vault-write.ts`'s module doc) — there
  * can be only ONE vault write per run, so a fresh CA key / routing-client
  * key MUST fold into the SAME call as any fresh agent creds, never a second
- * write.
+ * write. `runnerRegistrarSecrets` (groundnuty/macf#943) is the SAME
+ * once-per-run-only constraint applied to a fourth kind — see this module's
+ * "runner-registrar" call-site comment for why it MUST fold in here rather
+ * than getting its own write.
  */
 async function settleVault(
   manifest: FleetManifest,
@@ -927,9 +1119,17 @@ async function settleVault(
   pendingVaultAgents: readonly VaultAgentSecrets[],
   caSecrets: VaultCaSecrets | undefined,
   routingClientSecrets: VaultRoutingClientSecrets | undefined,
+  runnerRegistrarSecrets: VaultRunnerRegistrarSecrets | undefined,
   deps: FleetApplyDeps,
 ): Promise<VaultApplyOutcome> {
-  if (pendingVaultAgents.length === 0 && caSecrets === undefined && routingClientSecrets === undefined) return { status: 'skipped' };
+  if (
+    pendingVaultAgents.length === 0 &&
+    caSecrets === undefined &&
+    routingClientSecrets === undefined &&
+    runnerRegistrarSecrets === undefined
+  ) {
+    return { status: 'skipped' };
+  }
 
   try {
     // Not merely a `writeVault`-will-catch-it-anyway redundancy: this
@@ -954,6 +1154,7 @@ async function settleVault(
       agents: [...pendingVaultAgents],
       ...(caSecrets !== undefined ? { ca: caSecrets } : {}),
       ...(routingClientSecrets !== undefined ? { routingClient: routingClientSecrets } : {}),
+      ...(runnerRegistrarSecrets !== undefined ? { runnerRegistrar: runnerRegistrarSecrets } : {}),
     });
     const result = await writeVault(
       plaintext,

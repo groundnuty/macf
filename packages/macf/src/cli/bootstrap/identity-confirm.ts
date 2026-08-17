@@ -73,6 +73,17 @@ export interface ConfirmedInstall {
   readonly appSlug: string;
   /** `.account.login` — the account (user or org) the install landed on. `''` when absent from the body. */
   readonly accountLogin: string;
+  /**
+   * `.repository_selection` (`'all' | 'selected'`), when present in the body
+   * (groundnuty/macf#943 — the runner-registrar App's `validateInstall` seam
+   * needs this to refuse an `'all'`-scoped install; ordinary agent Apps never
+   * read it). **Omitted entirely, not `undefined`-valued, when the source
+   * body doesn't carry the field** — every existing `parseAppInstallations`
+   * fixture predates this field and asserts via `toEqual` against literals
+   * that don't include it; an unconditionally-present key (even `''`) would
+   * fail those. See {@link parseAppInstallations}'s call site.
+   */
+  readonly repositorySelection?: string;
 }
 
 /**
@@ -143,7 +154,7 @@ export function parseAppInstallations(json: unknown): ConfirmedInstall[] {
   const out: ConfirmedInstall[] = [];
   for (const item of json) {
     if (!item || typeof item !== 'object') continue;
-    const { id, app_id, app_slug, account } = item as Record<string, unknown>;
+    const { id, app_id, app_slug, account, repository_selection } = item as Record<string, unknown>;
     if (id === undefined || id === null || app_id === undefined || app_id === null) continue;
     const installId = String(id);
     const appId = String(app_id);
@@ -152,7 +163,13 @@ export function parseAppInstallations(json: unknown): ConfirmedInstall[] {
       account !== null && typeof account === 'object' && typeof (account as Record<string, unknown>).login === 'string'
         ? ((account as Record<string, unknown>).login as string)
         : '';
-    out.push({ appId, installId, appSlug: typeof app_slug === 'string' ? app_slug : '', accountLogin });
+    out.push({
+      appId,
+      installId,
+      appSlug: typeof app_slug === 'string' ? app_slug : '',
+      accountLogin,
+      ...(typeof repository_selection === 'string' ? { repositorySelection: repository_selection } : {}),
+    });
   }
   return out;
 }

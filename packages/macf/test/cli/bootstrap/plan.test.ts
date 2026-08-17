@@ -69,10 +69,11 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
 
     // 5 items per agent (app, repo, install, secret_fingerprint, labels) × 2
     // agents + caRegistry (1) + one caRepo per agent (2) + one routing_client
-    // per agent-repo (2) — CA/labels/routing_client items are unconditional
-    // (never gated on `trust:` being declared — macf#839 review nit 5 for CA;
-    // groundnuty/macf#920 for labels/routing_client).
-    expect(plan.items).toHaveLength(15);
+    // per agent-repo (2) + the fleet-level runner_registrar item (1,
+    // groundnuty/macf#943) — CA/labels/routing_client/runner_registrar items
+    // are unconditional (never gated on `trust:` being declared — macf#839
+    // review nit 5 for CA; groundnuty/macf#920 for labels/routing_client).
+    expect(plan.items).toHaveLength(16);
     for (const item of plan.items) {
       expect(item.verb).toBe('create');
       expect(item.confirm_required).toBe(false);
@@ -204,16 +205,19 @@ describe('computePlan — all-match observed state → all noops', () => {
 
     const plan = computePlan(manifest, observed);
     // 5 × 2 agents (app/repo/install/secret_fingerprint/labels) + caRegistry +
-    // 2 caRepo + routing + 2 routing_client (control_repo item absent — not
-    // archived).
-    expect(plan.items).toHaveLength(16);
+    // 2 caRepo + routing + 2 routing_client + the fleet-level runner_registrar
+    // item (groundnuty/macf#943; control_repo item absent — not archived).
+    expect(plan.items).toHaveLength(17);
     for (const item of plan.items) {
       // `labels` is a structural exception: it has NO plan-time observed
       // read at all (see `labelsItem`'s doc — a per-label API read is out of
       // scope), so it ALWAYS degrades to a LOW-CONFIDENCE `create`-candidate
-      // regardless of how "matched" everything else is. Every other kind
-      // genuinely observed-matches here.
-      if (item.kind === 'labels') {
+      // regardless of how "matched" everything else is. `runner_registrar`
+      // is the SAME shape here (groundnuty/macf#943) — this test's
+      // `observed.lock` is `null` (never simulated), so its presence can
+      // only degrade to `unknown` → `create`, same as `labels`. Every other
+      // kind genuinely observed-matches here.
+      if (item.kind === 'labels' || item.kind === 'runner_registrar') {
         expect(item.verb).toBe('create');
       } else {
         expect(item.verb).toBe('noop');
@@ -486,7 +490,12 @@ describe('computePlan — deterministic ordering', () => {
     const manifest = baseManifest();
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const kinds = plan.items.map((i) => i.kind);
-    expect(kinds.slice(0, 10)).toEqual([
+    // groundnuty/macf#943 — the fleet-level `runner_registrar` item comes
+    // FIRST (right after the control-repo item, when present; absent here —
+    // `EMPTY_OBSERVED.controlRepoPresence` is `'absent'`), before any
+    // per-agent item.
+    expect(kinds.slice(0, 11)).toEqual([
+      'runner_registrar',
       'app', 'repo', 'install', 'secret_fingerprint', 'labels', // science-agent
       'app', 'repo', 'install', 'secret_fingerprint', 'labels', // code-agent
     ]);
@@ -583,8 +592,8 @@ describe('summarizePlan', () => {
     const summary = summarizePlan(plan.items);
     // 10 per-agent creates (app/repo/install/secret_fingerprint/labels × 2) +
     // 3 CA creates (registry + 2 agent repos) + 2 routing_client creates +
-    // 1 routing update.
-    expect(summary).toEqual({ creates: 15, updates: 1, noops: 0, extras: 0 });
+    // 1 runner_registrar create (groundnuty/macf#943) + 1 routing update.
+    expect(summary).toEqual({ creates: 16, updates: 1, noops: 0, extras: 0 });
   });
 });
 
@@ -628,6 +637,11 @@ describe('planItemApplyCoverage — the single source of truth for what apply ca
     // absent) — only `update` (a diverging value) stays not_implemented,
     // see the table below.
     ['routing', 'create'],
+    // groundnuty/macf#943 — apply-fleet.ts drives the runner-registrar
+    // through the exact same applyIdentity gate1/gate2 primitive as an
+    // 'app'/'install' item; a pure presence check (presenceVerb) so only
+    // create/noop are reachable, same shape as 'ca'.
+    ['runner_registrar', 'create'],
   ])('%s/%s is implemented', (kind, verb) => {
     expect(planItemApplyCoverage(fakeItem(kind, verb))).toBe('implemented');
   });
@@ -953,5 +967,89 @@ describe('computePlan — control-repo-archived item (DR-043 Amendment G)', () =
     expect(item).toBeDefined();
     if (item) expect(planItemApplyCoverage(item)).toBe('implemented');
     expect(plan.unimplementedByApply.some((i) => i.kind === 'control_repo')).toBe(false);
+  });
+});
+
+// --- The runner-registrar App plan item (groundnuty/macf#943) ---
+
+describe('computePlan — runner_registrar item (groundnuty/macf#943)', () => {
+  it('is present in EVERY plan — a fleet-level item, not per-agent, never declared in fleet.yaml agents[]', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const items = plan.items.filter((i) => i.kind === 'runner_registrar');
+    expect(items).toHaveLength(1); // exactly ONE, not one per agent
+  });
+
+  it('target names the derived handle, distinct from any per-agent app item', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const item = plan.items.find((i) => i.kind === 'runner_registrar');
+    expect(item?.target).toBe('runner_registrar:app:icsoc-2026-runner-registrar');
+  });
+
+  it('reads UNCONFIRMABLE (no fleet.lock entry) as honest "unknown" -> LOW-CONFIDENCE create, NEVER "absent" (Amendment A4)', () => {
+    const plan = computePlan(baseManifest(), { ...EMPTY_OBSERVED, lock: null });
+    const item = plan.items.find((i) => i.kind === 'runner_registrar');
+    expect(item?.verb).toBe('create');
+    expect(item?.reason).toContain(UNKNOWN_REASONS.identity);
+    expect(item?.reason).not.toMatch(/\babsent\b/);
+  });
+
+  it('reads NOOP when fleet.lock already records an entry for role "runner-registrar"', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      lock: { schema_version: 1, fleet: 'icsoc-2026', agents: [{ role: 'runner-registrar', app_id: '1', install_id: '2' }] },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    const item = plan.items.find((i) => i.kind === 'runner_registrar');
+    expect(item?.verb).toBe('noop');
+  });
+
+  it('a fleet.lock with entries for declared AGENTS but not the registrar still reads the registrar as create (independent presence signal)', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      lock: {
+        schema_version: 1,
+        fleet: 'icsoc-2026',
+        agents: [
+          { role: 'science-agent', app_id: '1', install_id: '2' },
+          { role: 'code-agent', app_id: '3', install_id: '4' },
+        ],
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    const item = plan.items.find((i) => i.kind === 'runner_registrar');
+    expect(item?.verb).toBe('create');
+  });
+
+  it('does NOT leak into the report-extra "agent" items — a lock-only runner-registrar role is never mistaken for an observed-but-undeclared coordination agent', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      lock: { schema_version: 1, fleet: 'icsoc-2026', agents: [{ role: 'runner-registrar', app_id: '1', install_id: '2' }] },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    const extraAgentItems = plan.items.filter((i) => i.kind === 'agent' && i.verb === 'report-extra');
+    expect(extraAgentItems.map((i) => i.target)).not.toContain('agent:runner-registrar');
+  });
+
+  it('the reason text names the exact permission set + the DR-019 non-widening rationale, so the operator sees WHY a second App exists', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const item = plan.items.find((i) => i.kind === 'runner_registrar');
+    expect(item?.reason).toMatch(/administration:write/);
+    expect(item?.reason).toMatch(/actions:read/);
+    expect(item?.reason).toMatch(/metadata:read/);
+    expect(item?.reason).toMatch(/DR-019/);
+  });
+
+  it('confirm_required is always false (a pure presence check — never the confirm-then-update path)', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const item = plan.items.find((i) => i.kind === 'runner_registrar');
+    expect(item?.confirm_required).toBe(false);
+  });
+
+  it('planItemApplyCoverage reports IMPLEMENTED — apply DOES drive this identity through gate1/gate2, never renders "NOT IMPLEMENTED BY APPLY"', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const item = plan.items.find((i) => i.kind === 'runner_registrar');
+    expect(item).toBeDefined();
+    if (item) expect(planItemApplyCoverage(item)).toBe('implemented');
+    expect(plan.unimplementedByApply.some((i) => i.kind === 'runner_registrar')).toBe(false);
   });
 });

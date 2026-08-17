@@ -201,13 +201,17 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
       unimplemented_by_apply: ReadonlyArray<{ kind: string }>;
     };
     expect(parsed.dry_run).toBe(true);
+    // groundnuty/macf#943 — the runner-registrar's own planned creation is
+    // ALWAYS last (`plannedAppCreations` appends it after every agent's).
     expect(parsed.planned_app_creations.map((c) => c.manifest.name)).toEqual([
       'demo-fleet-code-agent',
       'demo-fleet-science-agent',
+      'demo-fleet-runner-registrar',
     ]);
     expect(parsed.planned_app_creations.map((c) => c.installUrl)).toEqual([
       'https://github.com/apps/demo-fleet-code-agent/installations/new',
       'https://github.com/apps/demo-fleet-science-agent/installations/new',
+      'https://github.com/apps/demo-fleet-runner-registrar/installations/new',
     ]);
     // Inherited automatically from fleetPlanToJson(plan) — no separate wiring
     // needed. macf#838 Amendment D phase 2: `ca` is now fully implemented
@@ -244,7 +248,9 @@ describe('plannedAppCreations (pure)', () => {
   it('includes an agent whose app item is create', () => {
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
-    expect(creations.map((c) => c.role)).toEqual(['code-agent', 'science-agent']);
+    // groundnuty/macf#943 — the runner-registrar is ALWAYS a create-candidate
+    // on a fresh fleet (no `fleet.lock` entry yet) and is appended LAST.
+    expect(creations.map((c) => c.role)).toEqual(['code-agent', 'science-agent', 'runner-registrar']);
     expect(creations[0]?.manifest.redirect_url).toBe(DRY_RUN_REDIRECT_PLACEHOLDER);
   });
 
@@ -254,6 +260,7 @@ describe('plannedAppCreations (pure)', () => {
     expect(creations.map((c) => c.installUrl)).toEqual([
       'https://github.com/apps/demo-fleet-code-agent/installations/new',
       'https://github.com/apps/demo-fleet-science-agent/installations/new',
+      'https://github.com/apps/demo-fleet-runner-registrar/installations/new',
     ]);
     for (const c of creations) {
       expect(c.installUrl).toBe(`https://github.com/apps/${c.manifest.name}/installations/new`);
@@ -263,7 +270,10 @@ describe('plannedAppCreations (pure)', () => {
   it('EXCLUDES an agent whose App is already present (no re-create)', () => {
     const plan = computePlan(manifest, observedWithApp('code-agent'));
     const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
-    expect(creations.map((c) => c.role)).toEqual(['science-agent']);
+    // groundnuty/macf#943 — the runner-registrar has its OWN presence signal
+    // (`fleet.lock`, not `observedWithApp`'s per-agent fixture), so it stays
+    // a create-candidate here regardless of code-agent's presence.
+    expect(creations.map((c) => c.role)).toEqual(['science-agent', 'runner-registrar']);
   });
 
   it('formats an empty creation set without claiming work', () => {
@@ -352,7 +362,21 @@ function fakeAgentDeps(overrides: Partial<AgentApplyDeps> = {}): AgentApplyDeps 
       close: async () => {},
     }),
     exchangeManifestCode: async () => SENTINEL_CREDS,
-    waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '222', appSlug: opts.expected.appSlug ?? '', accountLogin: 'groundnuty' }),
+    // groundnuty/macf#943 — `repository_selection: 'selected'` so the SAME
+    // shared fixture also satisfies the runner-registrar's own gate-2
+    // `validateRunnerRegistrarInstall` check (it takes the identical
+    // no-prior-lock CREATE path via `apply-fleet.ts`'s runner-registrar
+    // step, using this SAME `buildAgentDeps` factory) — the vast majority of
+    // this file's scenarios are about AGENT behavior, not the registrar, so
+    // the default should make the registrar succeed cleanly rather than
+    // spuriously fail every "happy path" test's exit code.
+    waitForAppInstallation: async (opts) => ({
+      appId: opts.appId,
+      installId: '222',
+      appSlug: opts.expected.appSlug ?? '',
+      accountLogin: 'groundnuty',
+      repositorySelection: 'selected',
+    }),
     confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
     openUrl: async () => {},
     log: () => {},
@@ -475,6 +499,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const out = logs.join('\n');
     expect(out).toMatch(/code-agent: CREATED/);
     expect(out).toMatch(/science-agent: CREATED/);
+    // groundnuty/macf#943 — the runner-registrar App ALSO creates cleanly on
+    // this fleet's first apply (the shared `fakeAgentDeps` fixture's
+    // `repositorySelection: 'selected'` satisfies its own gate-2 check).
+    expect(out).toMatch(/Runner-registrar App:\s*\n\s*runner-registrar: CREATED/);
     expect(out).toMatch(/Vault: written to/);
     // DR-043 Amendment D phase 2 (macf#838) — the CA ceremony ran too: a
     // fresh mint (no prior lock, no prior registry var — the default
@@ -485,7 +513,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const dir = join(file, '..');
     expect(existsSync(join(dir, 'fleet.lock'))).toBe(true);
     const lock = parseFleetLock(readFileSync(join(dir, 'fleet.lock'), 'utf-8'));
-    expect(lock.agents.map((a) => a.role).sort()).toEqual(['code-agent', 'science-agent']);
+    expect(lock.agents.map((a) => a.role).sort()).toEqual(['code-agent', 'runner-registrar', 'science-agent']);
     // The CA key's fingerprint lands in fleet.lock's FLEET-level
     // `fingerprints.ca_key` — the SOLE place it is ever written (see
     // apply-fleet.ts's module doc) — never the raw key value.
@@ -1049,6 +1077,12 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       agents: [
         { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
         { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+        // groundnuty/macf#943 — the runner-registrar ALSO has a prior lock
+        // entry here so "gate 1 seam is NEVER called" holds for it too; a
+        // registrar genuinely ABSENT from a prior lock legitimately takes
+        // the CREATE path (see the dedicated "genuinely absent" test above),
+        // which is not what THIS test is about.
+        { role: 'runner-registrar', app_id: 'app-runner-registrar', install_id: 'install-3' },
       ],
     };
     let startManifestFlowCalled = false;
@@ -1064,11 +1098,20 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
             // Mirrors resolveMutateDeps's OWN resolveKeyPath shape (pinned
             // directly, unit-level, in the 'resolveMutateDeps' describe
             // block below) — proves the OVERALL behavior once such wiring
-            // is present, without a real GitHub App / age binary.
+            // is present, without a real GitHub App / age binary. Also
+            // covers the runner-registrar (groundnuty/macf#943) — this raw
+            // override answers for ANY role, unlike the real
+            // `resolveMutateDeps`'s vault-derived one (which only ever
+            // resolves a PEM for a DECLARED agent — see that function's doc).
             resolveKeyPath: (role) => `/fake/${role}.pem`,
             confirmAppInstallation: async (appId) => ({
               status: 'confirmed',
-              install: { appId, installId: appId === 'app-code-agent' ? 'install-1' : 'install-2', appSlug: '', accountLogin: 'groundnuty' },
+              install: {
+                appId,
+                installId: appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-3',
+                appSlug: '',
+                accountLogin: 'groundnuty',
+              },
             }),
             startManifestFlow: async () => {
               startManifestFlowCalled = true;
@@ -1183,7 +1226,14 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const priorLock = {
       schema_version: 1,
       fleet: 'demo-fleet',
-      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }, { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' }],
+      agents: [
+        { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+        { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+        // groundnuty/macf#943 — see the identical comment on the sibling
+        // "existing App recorded" test above: gate 1 must never open for the
+        // runner-registrar either when it too has a prior lock entry.
+        { role: 'runner-registrar', app_id: 'app-runner-registrar', install_id: 'install-3' },
+      ],
     };
     let unarchiveCalled = false;
     let startManifestFlowCalled = false;
@@ -1199,7 +1249,12 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
             resolveKeyPath: (role) => `/fake/${role}.pem`,
             confirmAppInstallation: async (appId) => ({
               status: 'confirmed',
-              install: { appId, installId: appId === 'app-code-agent' ? 'install-1' : 'install-2', appSlug: '', accountLogin: 'groundnuty' },
+              install: {
+                appId,
+                installId: appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-3',
+                appSlug: '',
+                accountLogin: 'groundnuty',
+              },
             }),
             startManifestFlow: async () => {
               startManifestFlowCalled = true;
@@ -1282,6 +1337,12 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
     lockPath: '/x/fleet.lock',
     finalLock: null,
     agents: [],
+    // groundnuty/macf#943 — a NEUTRAL default ('reused', not
+    // failed/drift/skipped-unverified) so every PRE-EXISTING `applyExitCode`
+    // test in this file that doesn't override it keeps expecting the SAME
+    // exit code it did before this field existed. Individual tests below
+    // override to exercise the runner-registrar's own failure/skip shapes.
+    runnerRegistrar: { role: 'runner-registrar', status: 'reused', appId: '900', installId: '901' },
     vault: { status: 'skipped' },
     identityChanges: [],
     // DR-043 Amendment D phase 2 (macf#838) defaults: a REUSED CA (no fresh

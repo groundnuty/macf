@@ -64,6 +64,7 @@ import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
 // a one-directional runtime dependency — see `apply-routing.ts::
 // checkRunnerTokenPreflight`'s doc).
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from './apply-routing.js';
+import { RUNNER_REGISTRAR_ROLE, deriveRunnerRegistrarHandle } from './apply-runner-registrar.js';
 
 // --- Observed state (the reconcile input; populated by an observer, consumed as data) ---
 
@@ -230,7 +231,8 @@ export type PlanItemKind =
   | 'version'
   | 'actions_pin'
   | 'labels'
-  | 'routing_client';
+  | 'routing_client'
+  | 'runner_registrar';
 export type PlanVerb = 'create' | 'update' | 'noop' | 'report-extra';
 
 export interface PlanItem {
@@ -420,6 +422,13 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // publishes create-only when a mint succeeded. Produced by
       // `presenceVerb`, same 'create'-or-'noop'-only shape as 'ca'.
       return 'implemented';
+    case 'runner_registrar':
+      // groundnuty/macf#943 — apply-fleet.ts drives this identity through
+      // the exact same gate 1/gate 2 primitive as an 'app'/'install' item
+      // (this run's own applyIdentity call, right after the per-agent
+      // loop). Produced by `presenceVerb`, same 'create'-or-'noop'-only
+      // shape as 'ca'/'routing_client' above.
+      return 'implemented';
     case 'routing':
       // macf#838 Amendment D phase 2: apply-fleet.ts writes MACF_TRUSTED_ACTORS
       // when absent (create) — macf#922 corrected the target from
@@ -477,13 +486,15 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'control_repo':
     case 'labels':
     case 'routing_client':
+    case 'runner_registrar':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
       // 2, 'control_repo' in macf#867 / DR-043 Amendment G, 'labels'/
-      // 'routing_client' in groundnuty/macf#920). Kept exhaustive so a NEW
-      // `PlanItemKind` added later is a compile error here, not a silent
-      // "apply covers everything" false-negative.
+      // 'routing_client' in groundnuty/macf#920, 'runner_registrar' in
+      // groundnuty/macf#943). Kept exhaustive so a NEW `PlanItemKind` added
+      // later is a compile error here, not a silent "apply covers
+      // everything" false-negative.
       return 'apply has no code path for this item (unclassified — this reason string should be unreachable)';
   }
 }
@@ -613,6 +624,41 @@ function labelsItem(agent: FleetAgent): PlanItem {
       `role + status labels on "${agent.repo}" are not observable at plan time (no per-label API read wired) — ` +
       'treated as a create-candidate, LOW CONFIDENCE. `apply` attempts label creation unconditionally on every ' +
       'repo-init run regardless of this item.',
+    confirm_required: false,
+  };
+}
+
+/**
+ * The runner-registrar App plan item (groundnuty/macf#943) — ONE item per
+ * fleet (not per agent; this App is never declared in `manifest.agents[]`),
+ * so the operator sees "the extra App and its two clicks" (task brief)
+ * called out explicitly rather than folded silently into the per-agent `app`
+ * items above. Presence is read directly off `observed.lock.agents` (no
+ * `ObservedState` field addition needed — the same `fleet.lock` this
+ * function's caller already threads through) since `githubRegistryObserver`
+ * only ever populates `ObservedState.agents` from `manifest.agents` (never
+ * from lock-only roles), so there is no risk of this role being
+ * double-counted as a `report-extra` `agent` item at the bottom of
+ * `computePlan` — see that function's doc.
+ *
+ * `absent`-vs-`unknown` mirrors `appItem`'s own convention exactly: no lock
+ * entry reads as `unknown` (Amendment A4 — the lock is a HINT, never
+ * authoritative for "does the App exist on GitHub"; only a live JWT check
+ * could confirm `absent`, which this Mac-side, offline-safe function never
+ * attempts), never a false `absent`.
+ */
+function runnerRegistrarItem(fleetName: string, lockHasEntry: boolean): PlanItem {
+  const handle = deriveRunnerRegistrarHandle(fleetName);
+  const { verb, reasonSuffix } = presenceVerb(lockHasEntry ? 'present' : 'unknown', UNKNOWN_REASONS.identity);
+  return {
+    kind: 'runner_registrar',
+    target: `runner_registrar:app:${handle}`,
+    verb,
+    reason:
+      `Runner-registrar GitHub App "${handle}" ${reasonSuffix} — a SECOND, minimal App per fleet ` +
+      '(administration:write / actions:read / metadata:read; DR-019 has no administration permission and ' +
+      'was not widened — groundnuty/macf#943). Provisioning it costs 2 operator consent-gate clicks (App-manifest ' +
+      'creation + install), same shape as a coordination agent App.',
     confirm_required: false,
   };
 }
@@ -1018,6 +1064,13 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
 
   const controlRepo = controlRepoItem(observed.controlRepoPresence, observed.controlRepoArchived);
   if (controlRepo !== undefined) items.push(controlRepo);
+
+  // groundnuty/macf#943 — fleet-level, ordered right after the control-repo
+  // item (both are "before any per-agent processing" fleet-scoped facts) and
+  // before the per-agent app/repo/install items so the operator sees it near
+  // the top of the plan, not buried after every agent.
+  const runnerRegistrarHasLockEntry = observed.lock?.agents.some((a) => a.role === RUNNER_REGISTRAR_ROLE) ?? false;
+  items.push(runnerRegistrarItem(fleetName, runnerRegistrarHasLockEntry));
 
   for (const agent of manifest.agents) {
     const obs = observed.agents[agent.role];
