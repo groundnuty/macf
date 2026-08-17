@@ -57,6 +57,13 @@ import { buildTrustedActorsValue, deriveAppHandle } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
 import type { VaultAgentObservation, VaultCaObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
+// macf#932 — reuse the SAME flag/env-var name constants `apply`'s own
+// pre-flight refusal names, rather than re-typing them here (this is a
+// value import, not `import type`; `apply-routing.ts` only ever `import
+// type`s from files that in turn `import type` this module, so this stays
+// a one-directional runtime dependency — see `apply-routing.ts::
+// checkRunnerTokenPreflight`'s doc).
+import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from './apply-routing.js';
 
 // --- Observed state (the reconcile input; populated by an observer, consumed as data) ---
 
@@ -715,6 +722,22 @@ function routingClientItem(repo: string, presence: Presence): PlanItem {
 }
 
 /**
+ * macf#932 — an UNCONDITIONAL note (not a "you're missing it" detection):
+ * `plan` takes no `--runner-token` flag of its own and never will (see this
+ * note's call site's doc) — it cannot know whether the OPERATOR intends to
+ * supply one directly to a future `apply` invocation without ever exporting
+ * {@link RUNNER_TOKEN_ENV_VAR}. Claiming "missing" here would be FALSE in
+ * exactly that case. Naming the REQUIREMENT rather than guessing at its
+ * satisfaction keeps this honest while still moving the fact "apply needs
+ * this" earlier than `apply` itself shows it — see
+ * `apply-routing.ts::checkRunnerTokenPreflight`'s doc for the actual
+ * enforcement (which DOES know the resolved value, and DOES refuse).
+ */
+const RUNNER_TOKEN_PLAN_NOTE =
+  ` \`macf bootstrap apply\` additionally requires ${RUNNER_TOKEN_FLAG} (or ${RUNNER_TOKEN_ENV_VAR}) before it will ` +
+  'attempt this write at all — macf#932.';
+
+/**
  * The runner-CLASS half of {@link routingItem}'s reason (macf#922 — the plan
  * must name the billing consequence BEFORE the operator approves apply: a
  * private repo billed github-hosted draws down the account's Actions-minutes
@@ -729,12 +752,14 @@ function routingClientItem(repo: string, presence: Presence): PlanItem {
  * action the operator needs BEFORE approving apply, surfaced at plan time
  * rather than discovered only after apply silently skips the write. The
  * original wording for the no-handover branches is preserved UNCHANGED
- * (only the suffix is new) so this stays a strict extension.
+ * (only the suffix is new) so this stays a strict extension. macf#932 adds
+ * ANOTHER unconditional suffix on top ({@link RUNNER_TOKEN_PLAN_NOTE}) —
+ * same "strict extension, never rewrite" discipline.
  */
 function runnerClassReason(runnerRegistered: Presence | undefined, representativeRepo: string | undefined, handover: string | undefined): string {
   const repoLabel = representativeRepo ?? '(no agent repos declared)';
   if (runnerRegistered === 'present') {
-    return `Runner class: self-hosted (a runner is confirmed registered on "${repoLabel}").`;
+    return `Runner class: self-hosted (a runner is confirmed registered on "${repoLabel}").${RUNNER_TOKEN_PLAN_NOTE}`;
   }
   const cause =
     runnerRegistered === 'absent'
@@ -743,7 +768,7 @@ function runnerClassReason(runnerRegistered: Presence | undefined, representativ
   const handoverSuffix = handover !== undefined ? ` ${handover}` : '';
   return (
     `Runner class: github-hosted (billed on private repos) — ${cause} yet; MACF_TRUSTED_ACTORS will NOT be ` +
-    `written by apply until one is (register-before-route).${handoverSuffix}`
+    `written by apply until one is (register-before-route).${handoverSuffix}${RUNNER_TOKEN_PLAN_NOTE}`
   );
 }
 

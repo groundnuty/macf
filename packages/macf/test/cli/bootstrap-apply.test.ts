@@ -38,6 +38,7 @@ import type { AppCredentials } from '../../src/cli/bootstrap/manifest-exchange.j
 import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../src/cli/bootstrap/apply-routing-client.js';
 import type { RunnerRegistrationDeps } from '../../src/cli/bootstrap/apply-routing.js';
+import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../src/cli/bootstrap/apply-routing.js';
 import { VaultError, buildVaultPlaintext, type VaultAgentSecrets } from '../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext } from '../../src/cli/bootstrap/vault-read.js';
 
@@ -302,6 +303,22 @@ const SENTINEL_VAULT_PEM = '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-VAULT-PEM-
  * live usability) — every pre-existing "routing var gets written" fixture in
  * this file keeps exercising the write path unchanged. Tests exercising the
  * no-token refusal itself override this to `undefined` explicitly.
+ *
+ * **macf#932 note — this sentinel alone is NOT enough for a `FLEET_YAML_WITH_ROUTING`
+ * mutating-apply test any more.** The macf#932 pre-flight
+ * (`apply-routing.ts::checkRunnerTokenPreflight`) reads the RESOLVED
+ * `opts.runnerToken ?? process.env[RUNNER_TOKEN_ENV_VAR]` value — NOT
+ * `mutateDeps.runnerToken` — because it fires before `resolveMutateDeps`
+ * (and therefore before a directly-injected `mutateDeps` object) is ever
+ * consulted. A test that sets `fakeMutateDeps(file, { runnerToken:
+ * SENTINEL_RUNNER_TOKEN })` but leaves `opts.runnerToken` unset was ONLY
+ * legal pre-macf#932 because `mutateDeps ?? resolveMutateDeps(...)`
+ * short-circuits `resolveMutateDeps` (and therefore `opts.runnerToken`)
+ * entirely whenever `mutateDeps` is injected directly. Every
+ * `FLEET_YAML_WITH_ROUTING` fixture below that expects the mutating apply to
+ * PROCEED now also passes `runnerToken: SENTINEL_RUNNER_TOKEN` in `opts` —
+ * this is what a real invocation actually looks like (the CLI flag/env var
+ * is what `apply` reads first), not a test-only workaround.
  */
 const SENTINEL_RUNNER_TOKEN = 'SENTINEL-RUNNER-TOKEN';
 
@@ -410,6 +427,9 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
   });
   afterEach(() => {
     vi.restoreAllMocks();
+    // macf#932 — belt-and-suspenders for tests that stub RUNNER_TOKEN_ENV_VAR
+    // via vi.stubEnv; a no-op for every other test in this block.
+    vi.unstubAllEnvs();
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   });
 
@@ -644,7 +664,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     for (const json of [false, true]) {
       const file = writeManifest(FLEET_YAML_WITH_ROUTING);
       const code = await runBootstrapApply(
-        { file, yes: true, json },
+        // macf#932 — opts.runnerToken must ALSO be set: the pre-flight reads
+        // the resolved opts/env value, not mutateDeps.runnerToken directly
+        // (see SENTINEL_RUNNER_TOKEN's doc above).
+        { file, yes: true, json, runnerToken: RUNNER_TOKEN_SECRET },
         { observe: () => Promise.resolve(EMPTY_OBSERVED) }, // no drift here -> routing takes the create path, exercising the write
         fakeMutateDeps(file, { runnerToken: RUNNER_TOKEN_SECRET }),
       );
@@ -660,6 +683,148 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(all).toMatch(/Routing \(MACF_TRUSTED_ACTORS\):/);
   });
 
+  // --- macf#932 — the pre-flight fires BEFORE consent gate 1, not merely
+  // before the late gate deep inside applyFleet's routing block. The
+  // decisive case: zero gate invocations, not merely a non-zero exit code.
+
+  describe('macf#932 — pre-flight refusal before consent gate 1', () => {
+    it('declared routing.runner self-hosted + NO token resolvable -> refuses BEFORE consent gate 1: observe/confirmPlan/buildAgentDeps/openUrl/startManifestFlow/confirmAppInstallation are ALL zero calls', async () => {
+      vi.stubEnv(RUNNER_TOKEN_ENV_VAR, ''); // pin: this test's verdict must not depend on the ambient shell env
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      let observeCalls = 0;
+      let confirmPlanCalls = 0;
+      let buildAgentDepsCalls = 0;
+      let openUrlCalls = 0;
+      let startManifestFlowCalls = 0;
+      let confirmAppInstallationCalls = 0;
+
+      const code = await runBootstrapApply(
+        { file, yes: true }, // no opts.runnerToken
+        {
+          observe: () => {
+            observeCalls += 1;
+            return Promise.resolve(EMPTY_OBSERVED);
+          },
+        },
+        fakeMutateDeps(file, {
+          runnerToken: undefined,
+          confirmPlan: async () => {
+            confirmPlanCalls += 1;
+            return true;
+          },
+          buildAgentDeps: () => {
+            buildAgentDepsCalls += 1;
+            return fakeAgentDeps({
+              openUrl: async () => {
+                openUrlCalls += 1;
+              },
+              startManifestFlow: async () => {
+                startManifestFlowCalls += 1;
+                throw new Error('must not be called — the pre-flight must refuse before this seam is ever reached');
+              },
+              confirmAppInstallation: async () => {
+                confirmAppInstallationCalls += 1;
+                return { status: 'unconfirmable' };
+              },
+            });
+          },
+        }),
+      );
+
+      expect(code).toBe(1);
+      // The whole point: NOT "exited non-zero" but "never even asked the
+      // operator to approve, never even read GitHub state, never opened a
+      // browser." Each of these is a DISTINCT seam any one of which firing
+      // would mean the refusal arrived too late.
+      expect(observeCalls).toBe(0);
+      expect(confirmPlanCalls).toBe(0);
+      expect(buildAgentDepsCalls).toBe(0);
+      expect(openUrlCalls).toBe(0);
+      expect(startManifestFlowCalls).toBe(0);
+      expect(confirmAppInstallationCalls).toBe(0);
+
+      expect(errs.join('\n')).toContain(RUNNER_TOKEN_FLAG);
+      expect(errs.join('\n')).toContain(RUNNER_TOKEN_ENV_VAR);
+      // Nothing mutated — same result-invariant the "operator declines"
+      // test above asserts.
+      const dir = join(file, '..');
+      expect(existsSync(join(dir, 'fleet.lock'))).toBe(false);
+      expect(existsSync(join(dir, 'secrets', 'vault.age'))).toBe(false);
+    });
+
+    it('the refusal is visible under --json too, never empty stdout (macf#830 lesson), and the token flag/env-var names appear but no token VALUE ever could (there is none — this fires precisely because it is absent)', async () => {
+      vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file, { runnerToken: undefined }));
+      expect(code).toBe(1);
+      expect(logs.length).toBeGreaterThan(0);
+      const parsed = JSON.parse(logs.join('\n')) as { error: { code: string; message: string } };
+      expect(parsed.error.code).toBe('runner_token_missing');
+      expect(parsed.error.message).toContain(RUNNER_TOKEN_FLAG);
+      expect(parsed.error.message).toContain(RUNNER_TOKEN_ENV_VAR);
+    });
+
+    it('an empty-string --runner-token is treated the same as no token — still refuses before gate 1', async () => {
+      vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply(
+        { file, yes: true, runnerToken: '' },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file, { runnerToken: undefined }),
+      );
+      expect(code).toBe(1);
+      expect(errs.join('\n')).toContain(RUNNER_TOKEN_FLAG);
+    });
+
+    it('a token supplied via --runner-token proceeds as today — the pre-flight is not a NEW obstacle for the already-satisfied case', async () => {
+      vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply(
+        { file, yes: true, runnerToken: SENTINEL_RUNNER_TOKEN },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file),
+      );
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(RUNNER_TOKEN_FLAG);
+      expect(logs.join('\n')).toMatch(/Routing \(MACF_TRUSTED_ACTORS\):/);
+    });
+
+    it('a token resolvable ONLY via MACF_BOOTSTRAP_RUNNER_TOKEN (no --runner-token flag) also satisfies the pre-flight — the env-var fallback half is exercised, not just the flag half', async () => {
+      vi.stubEnv(RUNNER_TOKEN_ENV_VAR, 'ghr-env-resolved-token');
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply(
+        { file, yes: true }, // no opts.runnerToken — only the env var
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file), // default runnerToken (SENTINEL) drives the actual write path
+      );
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain('runner registration token was supplied');
+      expect(errs.join('\n')).not.toContain(RUNNER_TOKEN_FLAG);
+      expect(logs.join('\n')).toMatch(/Routing \(MACF_TRUSTED_ACTORS\):/);
+    });
+
+    it('no routing.runner declared at all -> unaffected: proceeds with no token and no refusal (unchanged behavior)', async () => {
+      vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
+      const file = writeManifest(); // FLEET_YAML — no routing: section
+      const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file, { runnerToken: undefined }));
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(RUNNER_TOKEN_FLAG);
+    });
+
+    it('--dry-run is UNAFFECTED even with no token resolvable — a dry run never opens a gate to begin with, and its own plan render already carries the requirement note (plan.ts::runnerClassReason, macf#932 requirement 3)', async () => {
+      vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+      expect(code).toBe(0);
+      const out = logs.join('\n');
+      expect(out).toMatch(/DRY RUN — nothing was created/);
+      // The plan's own routing item already names the requirement — see
+      // plan.test.ts's dedicated coverage for this note's unconditional
+      // presence; this test only pins that --dry-run does not ALSO refuse.
+      expect(out).toContain(RUNNER_TOKEN_FLAG);
+    });
+  });
+
   // --- macf#854: apply must not overstate what it did — the final summary
   // must name the plan items it never attempted (CA / routing / repo-create),
   // and it must do so EVEN UNDER --yes, since --yes skips the pre-approval
@@ -667,7 +832,14 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
 
   it('final summary (--yes, non-json) lists the ONE remaining apply-unimplemented item — a diverging routing value (macf#838 Amendment D phase 2) — the plan-approve-once artifact is skipped under --yes, so this is the only place it surfaces', async () => {
     const file = writeManifest(FLEET_YAML_WITH_ROUTING);
-    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(OBSERVED_ROUTING_DRIFT) }, fakeMutateDeps(file));
+    // macf#932 — opts.runnerToken required so the pre-flight doesn't refuse
+    // before this test's routing-drift/unimplemented-block assertions ever
+    // get a plan to inspect (see SENTINEL_RUNNER_TOKEN's doc above).
+    const code = await runBootstrapApply(
+      { file, yes: true, runnerToken: SENTINEL_RUNNER_TOKEN },
+      { observe: () => Promise.resolve(OBSERVED_ROUTING_DRIFT) },
+      fakeMutateDeps(file),
+    );
     expect(code).toBe(0);
     const out = logs.join('\n');
     expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
@@ -696,7 +868,12 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
 
   it('final summary (--yes, --json) carries unimplemented_by_apply with ONLY the diverging routing item (macf#838 Amendment D phase 2) — ca and repo are NOT among them', async () => {
     const file = writeManifest(FLEET_YAML_WITH_ROUTING);
-    const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(OBSERVED_ROUTING_DRIFT) }, fakeMutateDeps(file));
+    // macf#932 — see SENTINEL_RUNNER_TOKEN's doc above.
+    const code = await runBootstrapApply(
+      { file, yes: true, json: true, runnerToken: SENTINEL_RUNNER_TOKEN },
+      { observe: () => Promise.resolve(OBSERVED_ROUTING_DRIFT) },
+      fakeMutateDeps(file),
+    );
     expect(code).toBe(0);
     const parsed = JSON.parse(logs.join('\n')) as {
       unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
@@ -775,8 +952,11 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       });
     try {
       const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      // macf#932 — see SENTINEL_RUNNER_TOKEN's doc above: without this the
+      // macf#932 pre-flight refuses BEFORE the plan is ever rendered, which
+      // would defeat this test's whole point.
       const code = await runBootstrapApply(
-        { file },
+        { file, runnerToken: SENTINEL_RUNNER_TOKEN },
         { observe: () => Promise.resolve(OBSERVED_ROUTING_DRIFT) },
         fakeMutateDeps(file, { confirmPlan: async () => false }),
       );
