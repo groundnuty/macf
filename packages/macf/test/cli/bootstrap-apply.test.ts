@@ -1326,6 +1326,23 @@ describe('resolveMutateDeps — vault-aware resolveKeyPath + cleanupVaultScratch
     const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map([['code-agent', SENTINEL_VAULT_PEM]]));
     expect(() => deps.cleanupVaultScratch?.()).not.toThrow();
   });
+
+  // --- identityKeyPath threading (DR-043 §D5 recipient reconciliation, macf#957) ---
+
+  it('identityKeyPath is undefined on FleetApplyDeps when not supplied — byte-identical to pre-macf#957 wiring', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map(), SENTINEL_RUNNER_TOKEN);
+    expect(deps.identityKeyPath).toBeUndefined();
+  });
+
+  it('identityKeyPath is threaded verbatim onto FleetApplyDeps when supplied — the SAME path opts.identityKeyPath already decrypted vaultAgentPems with', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map(), SENTINEL_RUNNER_TOKEN, '/fake/operator-key.txt');
+    expect(deps.identityKeyPath).toBe('/fake/operator-key.txt');
+  });
+
+  it('vaultRecipientDeps is left unset — apply-fleet.ts::reconcileVaultRecipients takes the real vault-read.ts defaults', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map(), SENTINEL_RUNNER_TOKEN, '/fake/operator-key.txt');
+    expect(deps.vaultRecipientDeps).toBeUndefined();
+  });
 });
 
 // --- Pure result-rendering helpers ---

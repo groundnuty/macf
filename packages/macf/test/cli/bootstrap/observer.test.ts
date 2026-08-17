@@ -223,6 +223,88 @@ describe('vaultAwareObserver — DR-043 Amendment D phase 3 (injected deps, no r
     );
     expect(Object.keys(observed.agents)).toEqual([]);
   });
+
+  // --- vaultRecipients (DR-043 §D5 recipient reconciliation, macf#957) ---
+  //
+  // Deliberately independent of the `readVault`/`raw` decrypt above (see
+  // `observer.ts`'s doc) — every test here supplies its OWN
+  // `readVaultRecipientCount` fake, never reusing the `readVault` fake from
+  // the suites above.
+
+  it('vaultRecipients reads "confirmed" with the stanza count when the header parses', async () => {
+    const observed = await vaultAwareObserver(
+      manifest,
+      '/fake/fleet.yaml',
+      { vaultPath: '/fake/secrets/vault.age', identityPath: '/fake/key.txt' },
+      {
+        observe: async () => BASE_OBSERVED,
+        readVault: async () => ({}),
+        readVaultRecipientCount: () => ({ status: 'counted', count: 2 }),
+      },
+    );
+    expect(observed.vaultRecipients).toEqual({ status: 'confirmed', stanzaCount: 2 });
+  });
+
+  it('vaultRecipients reads "no-vault" when no vault file exists yet — NOT "unknown" (a not-yet-provisioned fleet is not a read failure)', async () => {
+    const observed = await vaultAwareObserver(
+      manifest,
+      '/fake/fleet.yaml',
+      { vaultPath: '/fake/secrets/vault.age', identityPath: '/fake/key.txt' },
+      {
+        observe: async () => BASE_OBSERVED,
+        readVault: async () => {
+          throw new VaultError('vault_not_found', 'vault file not found — nothing to decrypt.');
+        },
+        readVaultRecipientCount: () => ({ status: 'absent' }),
+      },
+    );
+    expect(observed.vaultRecipients).toEqual({ status: 'no-vault' });
+  });
+
+  it('vaultRecipients reads "unknown" (with the scrubbed VaultError message) when the header exists but does not parse', async () => {
+    const observed = await vaultAwareObserver(
+      manifest,
+      '/fake/fleet.yaml',
+      { vaultPath: '/fake/secrets/vault.age', identityPath: '/fake/key.txt' },
+      {
+        observe: async () => BASE_OBSERVED,
+        readVault: async () => ({}),
+        readVaultRecipientCount: () => {
+          throw new VaultError('vault_header_malformed', 'no "---" header-MAC line found.');
+        },
+      },
+    );
+    expect(observed.vaultRecipients).toEqual({ status: 'unknown', reason: expect.stringContaining('header-MAC line') });
+  });
+
+  it('vaultRecipients is populated even when the readVault decrypt itself FAILED — stanza count needs no identity at all', async () => {
+    const observed = await vaultAwareObserver(
+      manifest,
+      '/fake/fleet.yaml',
+      { vaultPath: '/fake/secrets/vault.age', identityPath: '/fake/wrong-key.txt' },
+      {
+        observe: async () => BASE_OBSERVED,
+        readVault: async () => {
+          throw new VaultError('vault_decrypt_failed', 'wrong identity key.');
+        },
+        readVaultRecipientCount: () => ({ status: 'counted', count: 1 }),
+      },
+    );
+    // The agent/CA decorations degrade to unknown (no decrypt access)...
+    expect(observed.vaultCa?.status).toBe('unknown');
+    // ...but the recipient COUNT is still confirmed (no private key needed to count stanzas):
+    expect(observed.vaultRecipients).toEqual({ status: 'confirmed', stanzaCount: 1 });
+  });
+
+  it('defaults to the REAL readVaultRecipientCount when no override is given — a genuinely-missing file reads "no-vault"', async () => {
+    const observed = await vaultAwareObserver(
+      manifest,
+      '/fake/fleet.yaml',
+      { vaultPath: '/definitely/does/not/exist/vault.age', identityPath: '/fake/key.txt' },
+      { observe: async () => BASE_OBSERVED, readVault: async () => ({}) },
+    );
+    expect(observed.vaultRecipients).toEqual({ status: 'no-vault' });
+  });
 });
 
 describe('extractActionsPin (DR-043 §D6 — versions.actions observed-state source)', () => {

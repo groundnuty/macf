@@ -925,6 +925,87 @@ describe('vault-derived facts (DR-043 Amendment D phase 3) — purely additive o
   });
 });
 
+// --- DR-043 §D5 recipient-set reconciliation (groundnuty/macf#957) ---
+
+describe('computePlan — vault_recipients item (DR-043 §D5 recipient reconciliation, macf#957)', () => {
+  function recipientsItem(items: readonly PlanItem[]): PlanItem | undefined {
+    return itemFor(items, 'vault_recipients', 'vault:recipients');
+  }
+
+  it('is ABSENT entirely on a vault-free run (observed.vaultRecipients undefined) — no permanent "not observed" noise line', () => {
+    const manifest = baseManifest({ transport: { age_recipients: ['age1a', 'age1b'] } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(recipientsItem(plan.items)).toBeUndefined();
+  });
+
+  it('"no-vault": noop — nothing to reconcile against a vault that does not exist yet', () => {
+    const manifest = baseManifest({ transport: { age_recipients: ['age1a'] } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultRecipients: { status: 'no-vault' } };
+    const plan = computePlan(manifest, observed);
+    const item = recipientsItem(plan.items);
+    expect(item?.verb).toBe('noop');
+    expect(item?.reason).toContain('no vault.age exists yet');
+  });
+
+  it('"unknown": noop, never a false match — the reason is the scrubbed VaultError message verbatim', () => {
+    const manifest = baseManifest({ transport: { age_recipients: ['age1a'] } });
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      vaultRecipients: { status: 'unknown', reason: 'no "---" header-MAC line found within the first 65536 bytes' },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = recipientsItem(plan.items);
+    expect(item?.verb).toBe('noop');
+    expect(item?.reason).toContain('no "---" header-MAC line found within the first 65536 bytes');
+    expect(item?.reason).toContain('cannot confirm'); // never claims a match it can't establish — an honest hedge, not a positive claim
+  });
+
+  it('equal counts: noop, worded as a COUNT-ONLY match — never claims a confirmed cryptographic identity match', () => {
+    const manifest = baseManifest({ transport: { age_recipients: ['age1a', 'age1b'] } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultRecipients: { status: 'confirmed', stanzaCount: 2 } };
+    const plan = computePlan(manifest, observed);
+    const item = recipientsItem(plan.items);
+    expect(item?.verb).toBe('noop');
+    expect(item?.reason).toContain('count-only match');
+    expect(item?.confirm_required).toBe(false);
+  });
+
+  it('a manifest declaring a recipient the vault lacks (fewer stanzas than declared): update + confirm_required — the exact AC this issue names', () => {
+    const manifest = baseManifest({ transport: { age_recipients: ['age1operator', 'age1vm'] } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultRecipients: { status: 'confirmed', stanzaCount: 1 } };
+    const plan = computePlan(manifest, observed);
+    const item = recipientsItem(plan.items);
+    expect(item?.verb).toBe('update');
+    expect(item?.confirm_required).toBe(true);
+    expect(item?.reason).toContain('DEFINITELY fewer');
+    expect(item?.reason).toContain('--vault <path> --identity-key <path>'); // names an invocation that actually works
+  });
+
+  it('more stanzas than declared (a possible manifest shrink): update + confirm_required, but the reason explicitly warns against auto-shrinking', () => {
+    const manifest = baseManifest({ transport: { age_recipients: ['age1operator'] } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultRecipients: { status: 'confirmed', stanzaCount: 2 } };
+    const plan = computePlan(manifest, observed);
+    const item = recipientsItem(plan.items);
+    expect(item?.verb).toBe('update');
+    expect(item?.confirm_required).toBe(true);
+    expect(item?.reason).toContain('MORE');
+    expect(item?.reason).toContain('does NOT auto-shrink');
+    expect(item?.reason).toContain('REVOKE');
+  });
+
+  it('apply implements this kind — planItemApplyCoverage never flags a vault_recipients update as NOT IMPLEMENTED', () => {
+    const manifest = baseManifest({ transport: { age_recipients: ['age1operator', 'age1vm'] } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultRecipients: { status: 'confirmed', stanzaCount: 1 } };
+    const plan = computePlan(manifest, observed);
+    const item = recipientsItem(plan.items);
+    expect(item).toBeDefined();
+    if (item !== undefined) {
+      expect(planItemApplyCoverage(item)).toBe('implemented');
+    }
+    expect(plan.unimplementedByApply.some((u) => u.kind === 'vault_recipients')).toBe(false);
+  });
+});
+
 // --- DR-043 Amendment G (groundnuty/macf#867) — the control-repo-archived plan item ---
 
 describe('computePlan — control-repo-archived item (DR-043 Amendment G)', () => {
