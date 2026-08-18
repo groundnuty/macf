@@ -34,12 +34,14 @@
  * reuse an App whose private key you no longer hold — so a key left on disk
  * by a PREVIOUS fleet belongs to an App that no longer exists. Minting with
  * it fails as a bare, unhelpful 401 naming nothing about the mismatch. This
- * module now compares the on-disk key's fingerprint against the vault's
- * BEFORE ever attempting a mint: same fingerprint → `'skipped-existing'`,
- * unchanged; different fingerprint → refuses loud (naming both fingerprints
- * + two remedies), unless the caller opts into `--force-key`
- * ({@link FleetDeployDeps.forceKey}), which re-materializes from the vault
- * instead of requiring the operator to hand-delete the stale file.
+ * module now compares the on-disk key's PUBLIC-KEY identity fingerprint
+ * ({@link publicKeyFingerprint} — encoding-invariant, unlike a raw-PEM
+ * byte-hash) against the vault's BEFORE ever attempting a mint: same
+ * identity → `'skipped-existing'`, unchanged; different identity → refuses
+ * loud (naming both fingerprints + two remedies), unless the caller opts
+ * into `--force-key` ({@link FleetDeployDeps.forceKey}), which
+ * re-materializes from the vault instead of requiring the operator to
+ * hand-delete the stale file.
  *
  * **Operator-privileged, same custody boundary as `vault-read.ts`.** This
  * module decrypts real fleet credentials — it is not a fleet-agent-safe
@@ -60,6 +62,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSy
 import { dirname, join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createHash, createPrivateKey, createPublicKey } from 'node:crypto';
 import type { RegistryConfig, TokenSource } from '@groundnuty/macf-core';
 import { toVariableSegment, generateToken } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetManifest } from './fleet-manifest.js';
@@ -498,7 +501,14 @@ export type FleetDeployOutcome =
        * vault's own fingerprint when freshly written or force-re-materialized,
        * or the on-disk key's OWN (verified-matching) fingerprint when
        * `'skipped-existing'` — never assumed equal to the vault's without
-       * checking.
+       * checking. Deliberately a DIFFERENT fingerprint KIND than the one
+       * {@link materializeAgentKey} compares on (see {@link
+       * publicKeyFingerprint}'s doc) — this field stays a byte-hash of the
+       * PEM for cross-surface comparability with `fleet.lock`'s §D5
+       * fingerprint-pairing (`vault-read.ts`'s own doc pins this exact
+       * shape as "directly comparable"); the mismatch CHECK instead uses a
+       * public-key-derived, encoding-invariant identity fingerprint so a
+       * same-key-different-encoding file is never falsely refused.
        */
       readonly keyFingerprint: string;
     }
@@ -508,6 +518,51 @@ export type FleetDeployOutcome =
 interface KeyMaterializeResult {
   readonly keyWrite: 'written' | 'skipped-existing';
   readonly keyFingerprint: string;
+}
+
+/**
+ * SHA-256 fingerprint of the PUBLIC key derived from a private-key PEM —
+ * `sha256:<hex>` over the SPKI DER encoding. **Deliberately NOT
+ * {@link secretFingerprint}** (`fleet-lock.ts`), which hashes the raw PEM
+ * BYTES: two PEMs encoding the IDENTICAL RSA key (PKCS1 vs PKCS8, different
+ * line-wrap, a trailing newline) hash differently there, which would
+ * falsely refuse a legitimately-matching on-disk key. Deriving the public
+ * key makes the comparison encoding-invariant — the actual "is this the
+ * same App identity" check macf#975 needs. This is also the SAME derivation
+ * `gh-token-attribution-traps.md` failure-mode-1 already documents for
+ * comparing a local key against the fingerprint GitHub itself displays on
+ * the App's settings page (`openssl rsa -pubout -outform DER | openssl
+ * dgst -sha256`) — so an operator acting on Remedy 2 below (reconcile
+ * against GitHub) has a fingerprint that is actually comparable to what
+ * GitHub shows, not an opaque hash of private bytes GitHub never exposes.
+ * Throws on unparseable input — never returns a fingerprint for a key that
+ * isn't one; the caller ({@link materializeAgentKey}) turns that into an
+ * operator-actionable refusal, never a raw OpenSSL error string.
+ */
+export function publicKeyFingerprint(pem: string): string {
+  const spkiDer = createPublicKey(createPrivateKey(pem)).export({ type: 'spki', format: 'der' });
+  return `sha256:${createHash('sha256').update(spkiDer).digest('hex')}`;
+}
+
+/**
+ * {@link publicKeyFingerprint}, refusing loud (never a bare OpenSSL parse
+ * error) when `pem` isn't a readable private key. `source` names WHICH side
+ * failed to parse (on-disk vs vault) in the refusal — an unparseable
+ * on-disk file is a much more common real-world shape (hand-edited,
+ * truncated, wrong format) than an unparseable vault entry, but both are
+ * refused the same way: loud, before any mint is attempted.
+ */
+function publicKeyFingerprintOrRefuse(role: string, keyPath: string, pem: string, source: 'on-disk' | 'vault'): string {
+  try {
+    return publicKeyFingerprint(pem);
+  } catch (err) {
+    const where = source === 'on-disk' ? `the App key on disk at ${keyPath}` : "this role's vault entry";
+    throw new FleetDeployError(
+      'agent_key_unparseable',
+      `Role "${role}": ${where} is not a readable RSA private key (${errMessage(err)}) — refusing to compare or ` +
+        'mint with it.',
+    );
+  }
 }
 
 /**
@@ -531,44 +586,52 @@ export function keyFingerprintMismatchMessage(role: string, keyPath: string, onD
 /**
  * Resolve `keyPath`'s materialization state against the vault's credential,
  * per macf#975: an ABSENT key is written fresh (unchanged from before this
- * fix). A PRESENT key is trusted only when its fingerprint matches the
- * vault's — same fingerprint keeps `'skipped-existing'`'s existing
- * "operator-owned, never touched" contract; a MISMATCH throws a
+ * fix). A PRESENT key is trusted only when its PUBLIC-KEY fingerprint
+ * matches the vault's ({@link publicKeyFingerprint} — encoding-invariant,
+ * NOT a byte-hash of the private PEM) — a match keeps `'skipped-existing'`'s
+ * existing "operator-owned, never touched" contract; a MISMATCH throws a
  * {@link FleetDeployError} (`agent_key_fingerprint_mismatch`) BEFORE any
  * network call, unless `deps.forceKey` opts into overwriting it from the
- * vault. Split out of {@link deployAgent} so that function's own body stays
- * within this repo's function-length convention.
+ * vault. The REPORTED `keyFingerprint` on the result is a separate concern
+ * (kept as {@link secretFingerprint} — see that field's own doc on
+ * `FleetDeployOutcome` for why the two fingerprint KINDS are deliberately
+ * different) and always describes the key bytes actually on disk / written,
+ * never assumed equal to the vault's. Split out of {@link deployAgent} so
+ * that function's own body stays within this repo's function-length
+ * convention.
  */
 function materializeAgentKey(
   role: string,
   keyPath: string,
   vaultPem: string,
-  vaultKeyFingerprint: string,
   deps: Pick<FleetDeployDeps, 'forceKey'>,
   log: (line: string) => void,
 ): KeyMaterializeResult {
   if (!existsSync(keyPath)) {
     writeAgentKeyAtomic0600(keyPath, vaultPem);
     log(`Role "${role}": App key materialized at ${keyPath} (0600).`);
-    return { keyWrite: 'written', keyFingerprint: vaultKeyFingerprint };
+    return { keyWrite: 'written', keyFingerprint: secretFingerprint(vaultPem) };
   }
 
-  const onDiskFingerprint = secretFingerprint(readFileSync(keyPath, 'utf-8'));
-  if (onDiskFingerprint === vaultKeyFingerprint) {
+  const onDiskPem = readFileSync(keyPath, 'utf-8');
+  const onDiskIdentity = publicKeyFingerprintOrRefuse(role, keyPath, onDiskPem, 'on-disk');
+  const vaultIdentity = publicKeyFingerprintOrRefuse(role, keyPath, vaultPem, 'vault');
+
+  if (onDiskIdentity === vaultIdentity) {
     log(`Role "${role}": App key already present at ${keyPath} and matches the vault — not overwritten (operator-owned once materialized).`);
-    return { keyWrite: 'skipped-existing', keyFingerprint: onDiskFingerprint };
+    return { keyWrite: 'skipped-existing', keyFingerprint: secretFingerprint(onDiskPem) };
   }
 
   if (deps.forceKey === true) {
     writeAgentKeyAtomic0600(keyPath, vaultPem);
     log(
-      `Role "${role}": App key at ${keyPath} did not match the vault (on-disk ${onDiskFingerprint} vs vault ` +
-        `${vaultKeyFingerprint}) — re-materialized from the vault (--force-key).`,
+      `Role "${role}": App key at ${keyPath} did not match the vault (on-disk ${onDiskIdentity} vs vault ` +
+        `${vaultIdentity}) — re-materialized from the vault (--force-key).`,
     );
-    return { keyWrite: 'written', keyFingerprint: vaultKeyFingerprint };
+    return { keyWrite: 'written', keyFingerprint: secretFingerprint(vaultPem) };
   }
 
-  throw new FleetDeployError('agent_key_fingerprint_mismatch', keyFingerprintMismatchMessage(role, keyPath, onDiskFingerprint, vaultKeyFingerprint));
+  throw new FleetDeployError('agent_key_fingerprint_mismatch', keyFingerprintMismatchMessage(role, keyPath, onDiskIdentity, vaultIdentity));
 }
 
 /**
@@ -587,8 +650,9 @@ function materializeAgentKey(
  * untouched) is unchanged, just evaluated in the other order.
  *
  * **A pre-existing on-disk key is verified against the vault before being
- * trusted (macf#975).** Same fingerprint → `'skipped-existing'`, unchanged.
- * Different fingerprint → refuses with a `FleetDeployError` NAMED before
+ * trusted (macf#975), by PUBLIC-KEY identity, not raw-PEM bytes.** Same
+ * identity → `'skipped-existing'`, unchanged. A different identity → refuses
+ * with a `FleetDeployError` NAMED before
  * `ensureAgentWorkspaceCloned` (and therefore the lazy clone-auth mint) is
  * ever reached — a stale key from a destroyed fleet must never even attempt
  * a mint, since that mint would only 401 without explaining why. Unless
@@ -609,12 +673,11 @@ export async function deployAgent(
   try {
     const raw = await deps.readVault(vaultOpts);
     const creds = extractAgentVaultCredentials(raw, manifest.metadata.name, role);
-    const vaultKeyFingerprint = secretFingerprint(creds.privateKeyPem);
 
     const registryOpts = initRegistryOptionsFor(manifest.owner.registry);
 
     const keyPath = (deps.keyPathFor ?? defaultAgentKeyPath)(role);
-    const { keyWrite, keyFingerprint } = materializeAgentKey(role, keyPath, creds.privateKeyPem, vaultKeyFingerprint, deps, log);
+    const { keyWrite, keyFingerprint } = materializeAgentKey(role, keyPath, creds.privateKeyPem, deps, log);
 
     // The clone-auth token is minted LAZILY (only when `ensureAgentWorkspaceCloned`
     // is actually about to clone — see that function's doc) so a re-run
