@@ -39,11 +39,9 @@ import { readVault } from '../../../src/cli/bootstrap/vault-read.js';
 import { VaultError, buildVaultPlaintext, writeVault, type VaultAgentSecrets, type VaultPayload } from '../../../src/cli/bootstrap/vault-write.js';
 import { secretFingerprint } from '../../../src/cli/bootstrap/fleet-lock.js';
 import type { InitOptions } from '../../../src/cli/commands/init.js';
+import { resolveAgeGate } from './age-binary-gate.js';
 
-function have(cmd: string): boolean {
-  return spawnSync('sh', ['-c', `command -v ${cmd}`], { encoding: 'utf-8' }).status === 0;
-}
-const HAS_AGE = have('age') && have('age-keygen');
+const HAS_AGE = resolveAgeGate('fleet-deploy.test.ts', 2);
 
 const dirs: string[] = [];
 afterEach(() => {

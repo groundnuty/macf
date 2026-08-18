@@ -6,9 +6,10 @@
  * `vaultFleetSecretsForFingerprint` / `writeVault`'s orchestration are pure
  * or injected-deps and fully exercised offline. `ageEncryptToFile` is the
  * one real I/O leaf — exercised for real against the actual `age` binary
- * where available (verified present on this host's PATH via `have('age')`
- * below); the suite SKIPS (not fakes) those cases when `age`/`age-keygen`
- * are absent, per the "never fake a passing test" instruction.
+ * where available (gated via `resolveAgeGate`, `./age-binary-gate.js`); the
+ * suite SKIPS (not fakes) those cases when `age`/`age-keygen` are absent,
+ * per the "never fake a passing test" instruction. See `age-binary-gate.ts`
+ * for why an absent binary WARNS locally and FAILS in CI (groundnuty/macf#963).
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
@@ -29,11 +30,9 @@ import {
   type VaultPayload,
 } from '../../../src/cli/bootstrap/vault-write.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
+import { resolveAgeGate } from './age-binary-gate.js';
 
-function have(cmd: string): boolean {
-  return spawnSync('sh', ['-c', `command -v ${cmd}`], { encoding: 'utf-8' }).status === 0;
-}
-const HAS_AGE = have('age') && have('age-keygen');
+const HAS_AGE = resolveAgeGate('vault-write.test.ts', 4);
 
 const AGENT: VaultAgentSecrets = {
   appHandle: 'demo-fleet-code-agent',

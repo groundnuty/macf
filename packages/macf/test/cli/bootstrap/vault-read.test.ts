@@ -6,11 +6,13 @@
  * `parseVaultPlaintext` / the presence-query functions / `readVault`'s own
  * orchestration are pure or injected-deps and fully exercised offline.
  * `ageDecryptFile` is the one real I/O leaf — exercised for real against the
- * actual `age`/`age-keygen` binaries where available (same `have()` gate
- * `vault-write.test.ts` already uses), SKIPPED (not faked) elsewhere, per
- * the "never fake a passing test" instruction and the "a test that
- * constructs the seam it should observe" lesson: a faked `age` cannot prove
- * the real encrypt→decrypt round-trip actually works.
+ * actual `age`/`age-keygen` binaries where available (same `resolveAgeGate`
+ * gate `vault-write.test.ts` already uses, `./age-binary-gate.js`), SKIPPED
+ * (not faked) elsewhere, per the "never fake a passing test" instruction and
+ * the "a test that constructs the seam it should observe" lesson: a faked
+ * `age` cannot prove the real encrypt→decrypt round-trip actually works. See
+ * `age-binary-gate.ts` for why an absent binary WARNS locally and FAILS in
+ * CI (groundnuty/macf#963).
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
@@ -42,11 +44,9 @@ import { VaultError, buildVaultPlaintext, writeVault, type VaultAgentSecrets, ty
 import { deriveAppHandle } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { deriveRunnerOpsHandle } from '../../../src/cli/bootstrap/apply-runner-ops.js';
 import { secretFingerprint } from '../../../src/cli/bootstrap/fleet-lock.js';
+import { resolveAgeGate } from './age-binary-gate.js';
 
-function have(cmd: string): boolean {
-  return spawnSync('sh', ['-c', `command -v ${cmd}`], { encoding: 'utf-8' }).status === 0;
-}
-const HAS_AGE = have('age') && have('age-keygen');
+const HAS_AGE = resolveAgeGate('vault-read.test.ts', 8);
 
 const FLEET = 'demo-fleet';
 const ROLE = 'code-agent';

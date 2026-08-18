@@ -5,12 +5,14 @@
  * `AgentApplyDeps`/`RepoInitStepDeps`; `writeVault`'s `age` call is faked;
  * only `fleet.lock` (a small local JSON file) touches real fs.
  *
- * **Exception (macf#852):** the trailing "REAL age binary" test below
- * deliberately leaves `vaultDeps.encrypt` unset so
+ * **Exception (macf#852):** the trailing "REAL age binary" tests below
+ * deliberately leave `vaultDeps.encrypt` unset so
  * `writeVault`/`writeAgentRecoveryArtifact` fall through to the real
  * `ageEncryptToFile` — the one place in this file that touches the real
- * `age` binary, gated `skipIf(!HAS_AGE)` per `vault-write.test.ts`'s
- * "never fake a passing test" convention.
+ * `age` binary, gated `skipIf(!HAS_AGE)` (`resolveAgeGate`, see
+ * `./age-binary-gate.js`) per `vault-write.test.ts`'s "never fake a passing
+ * test" convention. See `age-binary-gate.ts` for why an absent binary WARNS
+ * locally and FAILS in CI (groundnuty/macf#963).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
@@ -29,6 +31,7 @@ import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-ro
 import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
 import { writeVault } from '../../../src/cli/bootstrap/vault-write.js';
 import { applyExitCode, fleetApplyResultToJson, formatApplyResult } from '../../../src/cli/commands/bootstrap-apply.js';
+import { resolveAgeGate } from './age-binary-gate.js';
 
 // Default mirrors the §D5 multi-recipient shape (operator key + VM key,
 // macf#852) — two entries is the realistic steady-state, not a single
@@ -221,16 +224,14 @@ const NOOP_ROUTING_CLIENT_DEPS: RoutingClientApplyDeps = routingClientDepsFor();
 // ORCHESTRATION (ordering, lock-write gating, artifact lifecycle) but never
 // the property this issue is actually about: that `transport.age_recipients`
 // being a LIST means `vault.age` decrypts under EITHER key independently,
-// not one shared key copied to two machines. `haveAgeBinaries`/`HAS_AGE`
-// gate the one test that drives `parseFleetManifest` → `applyFleet` → the
-// real `age` binary (no `vaultDeps.encrypt` override — falls through to
-// `writeVault`'s own `ageEncryptToFile` default). Skipped, never faked, when
-// `age`/`age-keygen` are absent from PATH — same convention as
-// `vault-write.test.ts`'s `HAS_AGE`.
-function haveAgeBinaries(cmd: string): boolean {
-  return spawnSync('sh', ['-c', `command -v ${cmd}`], { encoding: 'utf-8' }).status === 0;
-}
-const HAS_AGE = haveAgeBinaries('age') && haveAgeBinaries('age-keygen');
+// not one shared key copied to two machines. `resolveAgeGate`/`HAS_AGE`
+// (`./age-binary-gate.js`) gate the two tests that drive `parseFleetManifest`
+// → `applyFleet` → the real `age` binary (no `vaultDeps.encrypt` override —
+// falls through to `writeVault`'s own `ageEncryptToFile` default). Skipped,
+// never faked, when `age`/`age-keygen` are absent from PATH — same
+// convention as `vault-write.test.ts`'s `HAS_AGE`; see `age-binary-gate.ts`
+// for why an absent binary WARNS locally and FAILS in CI (macf#963).
+const HAS_AGE = resolveAgeGate('apply-fleet.test.ts', 2);
 
 function mintAgeKey(dir: string, name: string): { keyPath: string; publicKey: string } {
   const keyPath = join(dir, name);
