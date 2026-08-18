@@ -36,6 +36,15 @@ export interface RunFleetDeployOptions {
    * Threaded straight through to {@link FleetDeployDeps.forceKey}.
    */
   readonly forceKey?: boolean;
+  /**
+   * Re-materialize the on-disk per-project CA from the vault when it does
+   * NOT match (fingerprint mismatch) — the symmetric counterpart to
+   * `--force-key`, same post-rebuild shape (macf#982). Without this, a
+   * mismatch REFUSES rather than silently overwriting a CA that may be in
+   * independent use. Threaded straight through to
+   * {@link FleetDeployDeps.forceCa}.
+   */
+  readonly forceCa?: boolean;
   readonly json?: boolean;
 }
 
@@ -217,12 +226,14 @@ export async function runFleetDeploy(opts: RunFleetDeployOptions, deps?: FleetDe
   const resolved = deps ?? resolveDeps();
   process.stderr.write(`Deploying role "${agent.role}" for fleet "${manifest.metadata.name}" — vault: ${vaultPath}\n`);
 
-  // --force-key (opts) wins when given; otherwise fall back to whatever the
-  // resolved deps already carry (lets a test drive `deps.forceKey` directly
-  // without going through the CLI-options layer at all).
+  // --force-key / --force-ca (opts) win when given; otherwise fall back to
+  // whatever the resolved deps already carry (lets a test drive
+  // `deps.forceKey`/`deps.forceCa` directly without going through the
+  // CLI-options layer at all).
   const outcome = await deployAgent(agent, manifest, destDir, { vaultPath, identityPath }, {
     ...resolved,
     forceKey: opts.forceKey ?? resolved.forceKey,
+    forceCa: opts.forceCa ?? resolved.forceCa,
   });
 
   if (opts.json) {

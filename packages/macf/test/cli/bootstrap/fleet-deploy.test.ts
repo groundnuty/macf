@@ -1023,6 +1023,63 @@ describe('materializeProjectCa (unit-level)', () => {
     expect(readFileSync(caCertFilePath, 'utf-8')).toBe(ca.certPem);
     expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(ca.keyPem);
   });
+
+  it('local CA present but DIFFERS from the vault, WITH forceCa=true (macf#982): re-materializes from the vault instead of refusing', async () => {
+    const localCa = await mintTestCa('local-forced');
+    const vaultCa = await mintTestCa('vault-forced');
+    const dir = scratchDir();
+    const caCertFilePath = join(dir, 'ca-cert.pem');
+    const caKeyFilePath = join(dir, 'ca-key.pem');
+    writeFileSync(caCertFilePath, localCa.certPem, { mode: 0o644 });
+    writeFileSync(caKeyFilePath, localCa.keyPem, { mode: 0o600 });
+
+    const outcome = await materializeProjectCa(
+      vaultRawWithCa(vaultCa),
+      FLEET,
+      { caCertPathFor: () => caCertFilePath, caKeyPathFor: () => caKeyFilePath },
+      true, // forceCa
+    );
+
+    expect(outcome).toEqual({ status: 'materialized', certFingerprint: caCertFingerprint(vaultCa.certPem) });
+    // Overwritten with the VAULT's material — byte-identical, never a
+    // freshly-minted keypair. This module has no CA-mint seam at all (no
+    // `createCA`/`realMintCa` call anywhere in `materializeProjectCa`'s
+    // call graph); a freshly-minted cert would ALSO have produced a
+    // DIFFERENT fingerprint than the vault's cert, which the assertion
+    // above already rules out — the byte-identity check here is the
+    // stronger, direct proof that nothing was minted.
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(vaultCa.certPem);
+    expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(vaultCa.keyPem);
+    expect(statSync(caKeyFilePath).mode & 0o777).toBe(0o600);
+  });
+
+  it('the refusal (without forceCa) names the remedy (remove/rename) AND the --force-ca flag, mirroring the App-key refusal shape (macf#982)', async () => {
+    const localCa = await mintTestCa('local-msg');
+    const vaultCa = await mintTestCa('vault-msg');
+    const dir = scratchDir();
+    const caCertFilePath = join(dir, 'ca-cert.pem');
+    const caKeyFilePath = join(dir, 'ca-key.pem');
+    writeFileSync(caCertFilePath, localCa.certPem, { mode: 0o644 });
+    writeFileSync(caKeyFilePath, localCa.keyPem, { mode: 0o600 });
+
+    try {
+      await materializeProjectCa(vaultRawWithCa(vaultCa), FLEET, {
+        caCertPathFor: () => caCertFilePath,
+        caKeyPathFor: () => caKeyFilePath,
+      });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(FleetDeployError);
+      const msg = (e as FleetDeployError).message;
+      expect(msg.toLowerCase()).toContain('remove or rename');
+      expect(msg.toLowerCase()).toContain('reconcile');
+      expect(msg).toContain('--force-ca');
+      expect(msg).toContain(caCertFilePath);
+      expect(msg).toContain(caKeyFilePath);
+    }
+    // Untouched — the refusal-with-remedy path never writes.
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(localCa.certPem);
+  });
 });
 
 describe('issueAgentCertIfNeeded (unit-level)', () => {
@@ -1242,6 +1299,208 @@ describe('deployAgent — CA materialization + agent-cert issuance, end to end (
     if (outcome.status !== 'deployed') throw new Error('unreachable');
     expect(outcome.ca).toEqual({ status: 'vault-absent' });
     expect(outcome.certIssue).toBe('not-attempted');
+  });
+});
+
+// --- --force-ca + the combined CA+key stale-material refusal (macf#982) ---
+
+describe('deployAgent — --force-ca and the combined CA+key stale-material refusal (macf#982)', () => {
+  /** Like `vaultRawWithCa` above, but parametrized on the App key PEM/app_id/install_id too — needed for the destroy->rebuild->deploy composition test, where vault A and vault B each carry their OWN App key AND their OWN CA. */
+  function vaultRawWithKeyAndCa(
+    pem: string,
+    appId: string,
+    installId: string,
+    ca: { readonly certPem: string; readonly keyPem: string },
+  ): Record<string, string> {
+    const seg = toVariableSegment(FLEET);
+    return {
+      ...vaultRawFor(appId, installId, pem),
+      [`MACF_${seg}_CA_KEY_B64`]: Buffer.from(ca.keyPem, 'utf-8').toString('base64'),
+      [`MACF_${seg}_CA_CERT_B64`]: Buffer.from(ca.certPem, 'utf-8').toString('base64'),
+    } as Record<string, string>;
+  }
+
+  it('CA present locally but DIFFERS from the vault, WITH deps.forceCa=true: re-materializes the CA from the vault and the deploy proceeds', async () => {
+    const localCa = await mintTestCa('force-ca-local');
+    const vaultCa = await mintTestCa('force-ca-vault');
+    const caScratch = scratchDir();
+    const caCertFilePath = join(caScratch, 'ca-cert.pem');
+    const caKeyFilePath = join(caScratch, 'ca-key.pem');
+    writeFileSync(caCertFilePath, localCa.certPem, { mode: 0o644 });
+    writeFileSync(caKeyFilePath, localCa.keyPem, { mode: 0o600 });
+    const keyPath = join(scratchDir(), `${ROLE}.pem`);
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      join(scratchDir(), 'workspace'),
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawWithCa(vaultCa),
+        cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+        mintCloneToken: async () => FAKE_TOKEN,
+        initAgent: fakeInitAgent(initCalls),
+        keyPathFor: () => keyPath,
+        caCertPathFor: () => caCertFilePath,
+        caKeyPathFor: () => caKeyFilePath,
+        forceCa: true,
+      },
+    );
+
+    expect(outcome.status).toBe('deployed');
+    if (outcome.status !== 'deployed') throw new Error('unreachable');
+    expect(outcome.ca).toEqual({ status: 'materialized', certFingerprint: caCertFingerprint(vaultCa.certPem) });
+    expect(initCalls).toHaveLength(1);
+    // Overwritten with the vault's material — the stale local CA is gone,
+    // and (same proof as the unit-level test) byte-identical to the
+    // vault's PEM, never a freshly-minted keypair.
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(vaultCa.certPem);
+    expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(vaultCa.keyPem);
+  });
+
+  it('BOTH the CA and the App key are stale, NEITHER forced: ONE combined refusal naming all four fingerprints and both flags — NOTHING is written (the decisive test for requirement 3)', async () => {
+    const localCa = await mintTestCa('combined-local');
+    const vaultCa = await mintTestCa('combined-vault');
+    const caScratch = scratchDir();
+    const caCertFilePath = join(caScratch, 'ca-cert.pem');
+    const caKeyFilePath = join(caScratch, 'ca-key.pem');
+    writeFileSync(caCertFilePath, localCa.certPem, { mode: 0o644 });
+    writeFileSync(caKeyFilePath, localCa.keyPem, { mode: 0o600 });
+    const keyPath = join(scratchDir(), `${ROLE}.pem`);
+    writeFileSync(keyPath, OTHER_PEM, { mode: 0o600 }); // stale key — different from the vault's PEM
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      join(scratchDir(), 'workspace'),
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawWithCa(vaultCa), // App key inside is PEM (via vaultRawFor('111','222',PEM))
+        cloneRepo: async () => {
+          throw new Error('must not be called — refused before touching the workspace');
+        },
+        mintCloneToken: mintCloneTokenMustNotBeCalled(),
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => keyPath,
+        caCertPathFor: () => caCertFilePath,
+        caKeyPathFor: () => caKeyFilePath,
+      },
+    );
+
+    expect(outcome.status).toBe('failed');
+    if (outcome.status !== 'failed') throw new Error('unreachable');
+    // ONE message, naming BOTH fingerprint pairs.
+    expect(outcome.reason).toContain(caCertFingerprint(localCa.certPem));
+    expect(outcome.reason).toContain(caCertFingerprint(vaultCa.certPem));
+    expect(outcome.reason).toContain(publicKeyFingerprint(OTHER_PEM));
+    expect(outcome.reason).toContain(publicKeyFingerprint(PEM));
+    // Both remedy flags, together, in the SAME message.
+    expect(outcome.reason).toContain('--force-ca');
+    expect(outcome.reason).toContain('--force-key');
+    // Never raw material, of either kind.
+    expect(outcome.reason).not.toContain(localCa.keyPem);
+    expect(outcome.reason).not.toContain(vaultCa.keyPem);
+    expect(outcome.reason).not.toContain(OTHER_PEM);
+    expect(outcome.reason).not.toContain(PEM);
+
+    // NOTHING written — this is the whole point of the combined pre-check.
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(localCa.certPem);
+    expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(localCa.keyPem);
+    expect(readFileSync(keyPath, 'utf-8')).toBe(OTHER_PEM);
+  });
+
+  it('DECISIVE: destroy -> rebuild -> deploy on an unwiped host — the operator recovers with --force-ca --force-key alone, no manual rm (macf#982)', async () => {
+    const caA = await mintTestCa('decisive-a');
+    const caB = await mintTestCa('decisive-b');
+    const caScratch = scratchDir();
+    const caCertFilePath = join(caScratch, 'ca-cert.pem');
+    const caKeyFilePath = join(caScratch, 'ca-key.pem');
+    const keyPath = join(scratchDir(), `${ROLE}.pem`);
+    const destDir = join(scratchDir(), 'workspace');
+
+    // Cycle 1 — the ORIGINAL fleet, clean host: both CA and App key
+    // materialize fresh.
+    const first = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault-a.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawWithKeyAndCa(PEM, '111', '222', caA),
+        cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+        mintCloneToken: async () => FAKE_TOKEN,
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => keyPath,
+        caCertPathFor: () => caCertFilePath,
+        caKeyPathFor: () => caKeyFilePath,
+      },
+    );
+    expect(first.status).toBe('deployed');
+    if (first.status !== 'deployed') throw new Error('unreachable');
+    expect(readFileSync(keyPath, 'utf-8')).toBe(PEM);
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(caA.certPem);
+
+    // destroy + rebuild: GitHub gives us a NEW App (new key) AND the CA
+    // ceremony mints a NEW CA, both for the SAME role/fleet name. The
+    // WORKSPACE is wiped by the rebuild (as an operator's redeploy would
+    // do), but the key/CA files on the host are NOT — the exact #982
+    // "unwiped host" shape.
+    rmSync(destDir, { recursive: true, force: true });
+
+    // Cycle 2 — deploy against the REBUILT vault, NEITHER flag passed:
+    // refuses with the combined message, nothing touched.
+    const second = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault-b.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawWithKeyAndCa(OTHER_PEM, '999', '888', caB),
+        cloneRepo: async () => {
+          throw new Error('must not be called — refused before the clone');
+        },
+        mintCloneToken: mintCloneTokenMustNotBeCalled(),
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => keyPath,
+        caCertPathFor: () => caCertFilePath,
+        caKeyPathFor: () => caKeyFilePath,
+      },
+    );
+    expect(second.status).toBe('failed');
+    if (second.status !== 'failed') throw new Error('unreachable');
+    expect(second.reason).toContain('--force-ca');
+    expect(second.reason).toContain('--force-key');
+    // Cycle-1 material is STILL on disk, untouched by the refusal.
+    expect(readFileSync(keyPath, 'utf-8')).toBe(PEM);
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(caA.certPem);
+
+    // Cycle 3 — SAME rebuilt vault, BOTH flags: the operator recovers in
+    // ONE re-run, no manual `rm` of anything.
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
+    const third = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault-b.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawWithKeyAndCa(OTHER_PEM, '999', '888', caB),
+        cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+        mintCloneToken: async () => FAKE_TOKEN,
+        initAgent: fakeInitAgent(initCalls),
+        keyPathFor: () => keyPath,
+        caCertPathFor: () => caCertFilePath,
+        caKeyPathFor: () => caKeyFilePath,
+        forceCa: true,
+        forceKey: true,
+      },
+    );
+    expect(third.status).toBe('deployed');
+    if (third.status !== 'deployed') throw new Error('unreachable');
+    expect(initCalls).toHaveLength(1);
+    expect(readFileSync(keyPath, 'utf-8')).toBe(OTHER_PEM);
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(caB.certPem);
+    expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(caB.keyPem);
   });
 });
 

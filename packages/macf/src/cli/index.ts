@@ -592,7 +592,10 @@ fleet
     'install_id/private-key, clones its repo into --dir (or the manifest\'s deploy_path) if not already present, ' +
     'atomically writes the App key at 0600 to the conventional ~/.macf/keys/<role>.pem (never overwritten once ' +
     'present AND its fingerprint matches the vault\'s — a mismatch, e.g. a key left over from a destroyed-and-' +
-    'rebuilt fleet, refuses loud instead of minting with it; see --force-key), then delegates the rest to the ' +
+    'rebuilt fleet, refuses loud instead of minting with it; see --force-key), and re-materializes the ' +
+    'per-project CA the same way on a fingerprint mismatch (see --force-ca; macf#982) — a rebuild rotates BOTH ' +
+    'by construction, so when BOTH are stale the refusal names both flags together in ONE message rather than ' +
+    'the operator discovering the second refusal only after fixing the first. Then delegates the rest to the ' +
     'real `macf init` — never reimplemented. Idempotent: an already-materialized workspace or matching key is ' +
     'left untouched, reported as skipped. Never touches the vault\'s write side (Amendment D: read-only-' +
     'decryptable) and never deploys anything not already recorded in the vault (Amendment A: refuses rather ' +
@@ -616,6 +619,12 @@ fleet
       'on-disk key from the vault instead of refusing (macf#975)',
     false,
   )
+  .option(
+    '--force-ca',
+    'On per-project CA fingerprint mismatch (e.g. a stale CA from a destroyed-and-rebuilt fleet), re-materialize ' +
+      'the on-disk CA from the vault instead of refusing (macf#982)',
+    false,
+  )
   .option('--json', 'Emit the structured result as JSON', false)
   .action(async (opts) => {
     const code = await runFleetDeploy({
@@ -625,6 +634,7 @@ fleet
       vault: opts.vault,
       dir: opts.dir,
       forceKey: opts.forceKey,
+      forceCa: opts.forceCa,
       json: opts.json,
     });
     process.exitCode = code;

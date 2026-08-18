@@ -573,3 +573,107 @@ describe('runFleetDeploy — App-key fingerprint mismatch (macf#975)', () => {
     }
   });
 });
+
+describe('runFleetDeploy — per-project CA fingerprint mismatch (macf#982)', () => {
+  it('a mismatched on-disk CA REFUSES (exit 1, status "failed"), names --force-ca + the manual remedy, and never reaches initAgent', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const localCa = await createCA({
+      project: 'cmd-force-ca-local',
+      certPath: join(scratchDir(), 'local-ca-cert.pem'),
+      keyPath: join(scratchDir(), 'local-ca-key.pem'),
+    });
+    const vaultCa = await createCA({
+      project: 'cmd-force-ca-vault',
+      certPath: join(scratchDir(), 'vault-ca-cert.pem'),
+      keyPath: join(scratchDir(), 'vault-ca-key.pem'),
+    });
+    const caCertFilePath = join(scratchDir(), 'materialized-ca-cert.pem');
+    const caKeyFilePath = join(scratchDir(), 'materialized-ca-key.pem');
+    writeFileSync(caCertFilePath, localCa.certPem, { mode: 0o644 });
+    writeFileSync(caKeyFilePath, localCa.keyPem, { mode: 0o600 });
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir, json: true },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+              MACF_DEMO_FLEET_CA_KEY_B64: Buffer.from(vaultCa.keyPem, 'utf-8').toString('base64'),
+              MACF_DEMO_FLEET_CA_CERT_B64: Buffer.from(vaultCa.certPem, 'utf-8').toString('base64'),
+            };
+          },
+          initAgent: async () => {
+            throw new Error('must not be called — refused before initAgent');
+          },
+          caCertPathFor: () => caCertFilePath,
+          caKeyPathFor: () => caKeyFilePath,
+        }),
+      );
+      expect(code).toBe(1);
+      const parsed = JSON.parse(cap.logs.join('\n')) as { outcome: { status: string; reason: string } };
+      expect(parsed.outcome.status).toBe('failed');
+      expect(parsed.outcome.reason).toContain('does NOT match');
+      expect(parsed.outcome.reason.toLowerCase()).toContain('remove or rename');
+      expect(parsed.outcome.reason).toContain('--force-ca');
+      // The stale on-disk CA was never overwritten by the refusal path.
+      expect(readFileSync(caCertFilePath, 'utf-8')).toBe(localCa.certPem);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('--force-ca re-materializes a mismatched CA from the vault and proceeds to deploy (exit 0)', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const localCa = await createCA({
+      project: 'cmd-force-ca-local2',
+      certPath: join(scratchDir(), 'local2-ca-cert.pem'),
+      keyPath: join(scratchDir(), 'local2-ca-key.pem'),
+    });
+    const vaultCa = await createCA({
+      project: 'cmd-force-ca-vault2',
+      certPath: join(scratchDir(), 'vault2-ca-cert.pem'),
+      keyPath: join(scratchDir(), 'vault2-ca-key.pem'),
+    });
+    const caCertFilePath = join(scratchDir(), 'materialized2-ca-cert.pem');
+    const caKeyFilePath = join(scratchDir(), 'materialized2-ca-key.pem');
+    writeFileSync(caCertFilePath, localCa.certPem, { mode: 0o644 });
+    writeFileSync(caKeyFilePath, localCa.keyPem, { mode: 0o600 });
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir, forceCa: true },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+              MACF_DEMO_FLEET_CA_KEY_B64: Buffer.from(vaultCa.keyPem, 'utf-8').toString('base64'),
+              MACF_DEMO_FLEET_CA_CERT_B64: Buffer.from(vaultCa.certPem, 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          initAgent: async (d, o) => {
+            initCalls.push({ dir: d, opts: o });
+          },
+          caCertPathFor: () => caCertFilePath,
+          caKeyPathFor: () => caKeyFilePath,
+        }),
+      );
+      expect(code).toBe(0);
+      expect(initCalls).toHaveLength(1);
+      expect(readFileSync(caCertFilePath, 'utf-8')).toBe(vaultCa.certPem);
+      expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(vaultCa.keyPem);
+    } finally {
+      cap.restore();
+    }
+  });
+});
