@@ -12,9 +12,8 @@ import { dirname, join, resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
 import { parseFleetManifest } from '../bootstrap/fleet-manifest.js';
 import type { FleetDeployDeps, FleetDeployOutcome } from '../bootstrap/fleet-deploy.js';
-import { deployAgent } from '../bootstrap/fleet-deploy.js';
+import { deployAgent, realAuthenticatedCloneRepo, realMintCloneToken } from '../bootstrap/fleet-deploy.js';
 import { readVault } from '../bootstrap/vault-read.js';
-import { realCloneRepo } from '../bootstrap/apply-repo-init.js';
 import { initAgent as realInitAgent } from './init.js';
 import { caCertPath } from '../config.js';
 
@@ -88,8 +87,9 @@ function isFailure(x: ManifestLoad | DeployFailure): x is DeployFailure {
 function resolveDeps(): FleetDeployCommandDeps {
   return {
     readVault,
-    cloneRepo: realCloneRepo,
+    cloneRepo: realAuthenticatedCloneRepo,
     initAgent: realInitAgent,
+    mintCloneToken: realMintCloneToken,
     checkCaPresent: (project) => existsSync(caCertPath(project)),
   };
 }

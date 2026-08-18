@@ -44,8 +44,10 @@
  */
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { RegistryConfig } from '@groundnuty/macf-core';
-import { toVariableSegment } from '@groundnuty/macf-core';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import type { RegistryConfig, TokenSource } from '@groundnuty/macf-core';
+import { toVariableSegment, generateToken } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 import type { VaultReadOptions } from './vault-read.js';
@@ -53,6 +55,8 @@ import { queryVaultAgentPresence } from './vault-read.js';
 import { secretFingerprint } from './fleet-lock.js';
 import type { InitOptions } from '../commands/init.js';
 import { defaultAgentKeyPath } from '../commands/init.js';
+
+const execFileAsync = promisify(execFile);
 
 /** Thrown by refusal paths in this module — mirrors `VaultError`/`ManifestExchangeError`'s shape. */
 export class FleetDeployError extends Error {
@@ -186,19 +190,204 @@ function defaultCloneUrl(repo: string): string {
  * workspace-directory level (the sibling contract at the key-file level is
  * {@link writeAgentKeyAtomic0600}'s caller-side existence check — see
  * {@link deployAgent}). An absent OR empty `destDir` is cloned into.
+ *
+ * `cloneUrl` may be async (macf#968): {@link deployAgent} passes a builder
+ * that mints a clone-auth token LAZILY, only when this function is actually
+ * about to clone — never on the `'skipped-existing'` path, so a re-run
+ * against an already-deployed workspace stays a zero-network no-op exactly
+ * as it was before #968.
  */
 export async function ensureAgentWorkspaceCloned(
   repo: string,
   destDir: string,
   cloneRepo: (url: string, destDir: string) => Promise<void>,
-  cloneUrl: (repo: string) => string = defaultCloneUrl,
+  cloneUrl: (repo: string) => string | Promise<string> = defaultCloneUrl,
 ): Promise<WorkspaceMaterializeOutcome> {
   if (existsSync(destDir) && !isEmptyDir(destDir)) {
     return 'skipped-existing';
   }
   mkdirSync(dirname(destDir), { recursive: true });
-  await cloneRepo(cloneUrl(repo), destDir);
+  await cloneRepo(await cloneUrl(repo), destDir);
   return 'cloned';
+}
+
+// --- Authenticated clone (macf#968) ---
+//
+// The first-ever live `fleet deploy` 401'd cloning a freshly-provisioned
+// agent's (private, by construction) repo: `defaultCloneUrl` above is
+// anonymous, and nothing authenticated it even though `deployAgent` had
+// already decrypted this exact role's App credentials from the vault 60
+// lines earlier. The fix mints a short-lived installation token from those
+// SAME credentials and authenticates the clone with it — never a second
+// on-disk credential, never a token that outlives this one clone.
+
+const AUTHENTICATED_URL_PATTERN = /^https:\/\/x-access-token:([^@]+)@(.+)$/;
+
+/**
+ * The token alphabet this module is willing to embed in a `git -c
+ * url.<X>.insteadOf=<Y>` config VALUE. Two silent-fallback shapes this
+ * guards against (both would reproduce macf#968 in a new disguise if
+ * unchecked): a token containing `=` would truncate at the FIRST `=` when
+ * git parses `-c <name>=<value>` — the config name would still be dot-valid
+ * (no parse error), the rewrite would just never match, and the clone would
+ * silently fall through to authenticating as nobody; an EMPTY token would
+ * make {@link parseAuthenticatedUrl} fail to recognize its own output as
+ * authenticated (the `[^@]+` requires ≥1 char), same silent anonymous
+ * result. GitHub's installation-token alphabet (base64url, unpadded) is a
+ * subset of this — this is a defensive upper bound, not a format check.
+ */
+const SAFE_TOKEN_PATTERN = /^[A-Za-z0-9._~-]+$/;
+
+/**
+ * The clone-auth URL shape this module both builds ({@link authenticatedCloneUrl}) and parses ({@link parseAuthenticatedUrl}) — `x-access-token` is GitHub's documented username convention for authenticating over HTTPS with an installation token (no password).
+ *
+ * Refuses (never silently degrades) a token outside {@link SAFE_TOKEN_PATTERN}
+ * — see that constant's doc for why. The refusal message never includes the
+ * token itself, only that its SHAPE was rejected.
+ */
+export function authenticatedCloneUrl(repo: string, token: string): string {
+  if (!SAFE_TOKEN_PATTERN.test(token)) {
+    throw new FleetDeployError(
+      'clone_token_unsafe_shape',
+      'minted clone-auth token has an unexpected shape (contains a character outside [A-Za-z0-9._~-], or is empty) — ' +
+        'refusing to embed it in a git-config value where it could silently break the insteadOf rewrite and fall back ' +
+        'to an anonymous, unauthenticated clone. This message never includes the token itself.',
+    );
+  }
+  return `https://x-access-token:${token}@github.com/${repo}.git`;
+}
+
+/**
+ * Inverse of {@link authenticatedCloneUrl} — given ANY url of that shape
+ * (not just a `github.com` one; {@link realAuthenticatedCloneRepo}'s own
+ * tests exercise other hosts so they never need real network), returns the
+ * embedded token plus the CLEAN, credential-free counterpart. Returns
+ * `undefined` for a url that doesn't carry the `x-access-token:` marker —
+ * the caller's signal to fall back to a plain, unauthenticated clone
+ * (macf#968 point 4's "anonymous stays a fallback" case).
+ */
+export function parseAuthenticatedUrl(url: string): { readonly token: string; readonly cleanUrl: string } | undefined {
+  const m = AUTHENTICATED_URL_PATTERN.exec(url);
+  if (!m) return undefined;
+  const token = m[1];
+  const rest = m[2];
+  if (token === undefined || rest === undefined) return undefined;
+  return { token, cleanUrl: `https://${rest}` };
+}
+
+/**
+ * Replace every literal occurrence of `token` in `text` — used ONLY to keep
+ * a minted clone-auth token out of a thrown error's message (macf#968 point
+ * 3: `execFile`'s rejected-promise error ECHOES THE FULL COMMAND LINE it
+ * ran, including any `-c` flag value, so an authenticated clone URL passed
+ * straight through would leak the token into every failure log/reason/
+ * outcome). A plain substring replace, not a regex over "anything
+ * URL-shaped" — the exact token is known, so match it exactly rather than
+ * risk over- or under-redacting adjacent text.
+ */
+function scrubToken(text: string, token: string): string {
+  return token.length > 0 ? text.split(token).join('<redacted>') : text;
+}
+
+/**
+ * Build the `git` argv for cloning `cloneUrl` into `destDir`, but CONNECTING
+ * via `connectUrl` instead when the two differ — `git -c
+ * url.<connectUrl>.insteadOf=<cloneUrl>`, the SAME idiom `coordination.md
+ * §Token & Git Hygiene` rule 4 mandates for `git push` ("never bake tokens
+ * into a remote"), generalized here to `git clone`. Empirically verified
+ * (macf#968's investigation) that `git clone` records the LITERAL argument
+ * it was given (`cloneUrl`) into the new repo's `.git/config` — the
+ * `insteadOf` rewrite happens only at the transport layer when git actually
+ * opens the connection, never at what `git remote add` persists. So when
+ * `connectUrl` carries a credential and `cloneUrl` doesn't, the token
+ * authenticates the fetch WITHOUT ever touching disk in the cloned repo —
+ * not even transiently.
+ *
+ * Pure — no subprocess. Exported so a test can assert the exact argv
+ * WITHOUT running git, closing the specific gap a two-argument helper like
+ * {@link cloneViaInsteadOf} leaves open: calling it with `(cloneUrl,
+ * connectUrl)` swapped is a silent argument-order bug (the token would land
+ * in `.git/config`) that no test exercising the two arguments EQUAL, or
+ * exercising this function only through its own direct call, would catch.
+ * {@link cloneArgsFor} pins the actual composition `realAuthenticatedCloneRepo`
+ * uses so that inversion has a test that fails.
+ */
+export function insteadOfCloneArgs(cloneUrl: string, connectUrl: string, destDir: string): readonly string[] {
+  const configArgs = connectUrl !== cloneUrl ? ['-c', `url.${connectUrl}.insteadOf=${cloneUrl}`] : [];
+  return [...configArgs, 'clone', '--depth', '1', cloneUrl, destDir];
+}
+
+/**
+ * The exact argv {@link realAuthenticatedCloneRepo} runs, pure and
+ * subprocess-free — `url` is either the authenticated form ({@link
+ * authenticatedCloneUrl}) or a plain anonymous url. THE decisive assertion
+ * surface for macf#968: the clone-target argv element (index `-2`) and
+ * `destDir` (index `-1`) never carry the token, while the `-c` value (when
+ * present) does — asserting the full array pins the argument ORDER, not
+ * just that a token appears somewhere.
+ */
+export function cloneArgsFor(url: string, destDir: string): readonly string[] {
+  const parsed = parseAuthenticatedUrl(url);
+  return insteadOfCloneArgs(parsed?.cleanUrl ?? url, url, destDir);
+}
+
+/**
+ * Clone `cloneUrl` into `destDir`, connecting via `connectUrl` — the real
+ * subprocess leaf behind {@link insteadOfCloneArgs}'s argv. Exported ONLY so
+ * the test suite can prove the git MECHANISM against a real local fixture
+ * (two arbitrary `file://` paths — no network, no real GitHub), asserting
+ * the RESULTING `.git/config` directly. {@link realAuthenticatedCloneRepo}
+ * is still the only production entry point.
+ */
+export async function cloneViaInsteadOf(cloneUrl: string, connectUrl: string, destDir: string): Promise<void> {
+  await execFileAsync('git', insteadOfCloneArgs(cloneUrl, connectUrl, destDir));
+}
+
+/**
+ * Real, authenticated `git clone --depth 1` — the production default for
+ * {@link FleetDeployDeps.cloneRepo}. Runs exactly {@link cloneArgsFor}'s
+ * argv, so the origin's stored remote ends up credential-free (see {@link
+ * insteadOfCloneArgs}'s doc), and any failure's message has the token
+ * scrubbed out before it propagates — `deployAgent`'s `reason` and, from
+ * there, `macf fleet deploy`'s console/`--json` output would otherwise leak
+ * it on every clone failure (macf#968, the exact shape the reported bug's
+ * own error message demonstrated).
+ */
+export async function realAuthenticatedCloneRepo(url: string, destDir: string): Promise<void> {
+  const parsed = parseAuthenticatedUrl(url);
+  try {
+    await execFileAsync('git', cloneArgsFor(url, destDir));
+  } catch (err) {
+    const msg = errMessage(err);
+    // Deliberate deviation from this repo's usual `{ cause: err }`
+    // convention: `err` itself (its `.message`, and `execFileException`'s
+    // `.cmd`) carries the RAW, unredacted clone-auth token — `execFile`'s
+    // rejected error echoes the full argv it ran, including the `-c
+    // url....` flag value (macf#968 point 3). Attaching `err` as `cause`
+    // would undo the entire point of this catch: Node's default Error
+    // formatting prints a `.cause` chain, so a bare `console.error(err)`
+    // downstream would still leak the token even with a scrubbed
+    // top-level `.message`. Every field of the thrown error here is
+    // deliberately fresh and secret-free — no cause chain.
+    // eslint-disable-next-line preserve-caught-error
+    throw new Error(parsed !== undefined ? scrubToken(msg, parsed.token) : msg);
+  }
+}
+
+/**
+ * Real clone-auth token mint — the production default for {@link
+ * FleetDeployDeps.mintCloneToken}. Reuses `@groundnuty/macf-core`'s
+ * `generateToken` (the SAME helper every other `gh`-API path in this CLI
+ * already shells through — never a second JWT/token-mint implementation,
+ * per macf#968's own instruction). `forceMint: true` bypasses
+ * `generateToken`'s ambient-`GH_TOKEN`-env shortcut (the macf#338 lesson,
+ * applied at a new call site): whatever token the shell `fleet deploy` runs
+ * from happens to have set — the OPERATOR's own, or nothing at all — is NOT
+ * this role's identity; only the vault-derived {@link TokenSource} may
+ * authenticate as this agent.
+ */
+export async function realMintCloneToken(source: TokenSource): Promise<string> {
+  return generateToken(source, { forceMint: true });
 }
 
 // --- Registry-option mapping (fleet.yaml's RegistryConfig -> InitOptions) ---
@@ -236,10 +425,23 @@ export function initRegistryOptionsFor(
 
 export interface FleetDeployDeps {
   readonly readVault: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>;
-  /** Real `git clone` — a thin network I/O leaf, injectable so tests never touch the network. */
+  /** Real, authenticated `git clone` — a thin network I/O leaf, injectable so tests never touch the network. Production default: {@link realAuthenticatedCloneRepo}. */
   readonly cloneRepo: (url: string, destDir: string) => Promise<void>;
   /** The REAL `initAgent` (`commands/init.ts`) in production; tests inject a recording fake so workspace-generation side effects (network version-resolution, plugin fetch, cert gen) never run in a unit test. */
   readonly initAgent: (projectDir: string, opts: InitOptions) => Promise<void>;
+  /**
+   * Mints a short-lived installation token from the SAME vault credentials
+   * this run already decrypted for this role, used ONLY to authenticate the
+   * clone above (macf#968 — a bootstrap-provisioned agent repo is private
+   * by construction; an anonymous clone 401s). Production default:
+   * {@link realMintCloneToken}. **Tests MUST override this** — the default
+   * shells out to the real `gh` binary. Required (not optional, unlike
+   * `keyPathFor`/`log` below) because a forgotten override here would be a
+   * SILENT real-network call in what every caller of this module assumes is
+   * an offline test — the exact silent-fallback shape `silent-fallback-
+   * hazards.md` catalogs, not a risk worth taking for one fewer field.
+   */
+  readonly mintCloneToken: (source: TokenSource) => Promise<string>;
   /**
    * Resolves the destination App-key path for a role. Defaults to
    * `defaultAgentKeyPath` (the conventional `~/.macf/keys/<role>.pem`,
@@ -268,11 +470,19 @@ export type FleetDeployOutcome =
   | { readonly role: string; readonly status: 'failed'; readonly reason: string };
 
 /**
- * Drive ONE agent through decrypt → extract → materialize workspace →
- * materialize key → delegate to `initAgent`. NEVER throws — every failure
- * path (missing vault, bad identity, wrong key, missing vault entry, an
- * unsupported registry mode, a clone failure, an `initAgent` throw) resolves
- * to `status: 'failed'` with an operator-actionable, secret-free `reason`.
+ * Drive ONE agent through decrypt → extract → materialize key → materialize
+ * workspace → delegate to `initAgent`. NEVER throws — every failure path
+ * (missing vault, bad identity, wrong key, missing vault entry, an
+ * unsupported registry mode, a token-mint failure, a clone failure, an
+ * `initAgent` throw) resolves to `status: 'failed'` with an
+ * operator-actionable, secret-free `reason`.
+ *
+ * **Key materialization now runs BEFORE the clone (macf#968; was clone-then-
+ * key)** — minting the clone-auth token below needs the PEM already on disk
+ * at a path `gh token generate --key <path>` can read. The two steps are
+ * otherwise independent (different destinations), so reordering them is
+ * safe; every existing idempotency contract (pre-existing key/workspace left
+ * untouched) is unchanged, just evaluated in the other order.
  */
 export async function deployAgent(
   agent: FleetAgent,
@@ -291,11 +501,6 @@ export async function deployAgent(
 
     const registryOpts = initRegistryOptionsFor(manifest.owner.registry);
 
-    const workspace = await ensureAgentWorkspaceCloned(agent.repo, destDir, deps.cloneRepo);
-    log(
-      `Role "${role}": workspace ${workspace === 'cloned' ? `cloned into ${destDir}` : `already present at ${destDir} — not re-cloned`}.`,
-    );
-
     const keyPath = (deps.keyPathFor ?? defaultAgentKeyPath)(role);
     let keyWrite: 'written' | 'skipped-existing';
     if (existsSync(keyPath)) {
@@ -306,6 +511,20 @@ export async function deployAgent(
       keyWrite = 'written';
       log(`Role "${role}": App key materialized at ${keyPath} (0600).`);
     }
+
+    // The clone-auth token is minted LAZILY (only when `ensureAgentWorkspaceCloned`
+    // is actually about to clone — see that function's doc) so a re-run
+    // against an already-deployed workspace stays a zero-network no-op.
+    // A mint failure propagates straight to the outer catch below — never a
+    // silent fallback to an anonymous clone that would just reproduce
+    // macf#968's original 401 in a new guise.
+    const workspace = await ensureAgentWorkspaceCloned(agent.repo, destDir, deps.cloneRepo, async (repo) => {
+      const token = await deps.mintCloneToken({ appId: creds.appId, installId: creds.installId, keyPath });
+      return authenticatedCloneUrl(repo, token);
+    });
+    log(
+      `Role "${role}": workspace ${workspace === 'cloned' ? `cloned into ${destDir}` : `already present at ${destDir} — not re-cloned`}.`,
+    );
 
     await deps.initAgent(destDir, {
       project: manifest.metadata.name,
