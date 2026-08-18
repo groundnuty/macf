@@ -68,7 +68,7 @@ import type { RoutingClientApplyDeps } from '../bootstrap/apply-routing-client.j
 import { realMintRoutingClient, realSetRepoSecret } from '../bootstrap/apply-routing-client.js';
 import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
 import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
-import { readVault, vaultAgentPrivateKeyPem, vaultRunnerOpsPrivateKeyPem } from '../bootstrap/vault-read.js';
+import { readVault, vaultAgentPrivateKeyPem, vaultCaCertPem, vaultRunnerOpsPrivateKeyPem } from '../bootstrap/vault-read.js';
 import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
 import type { AppNameLengthCheck } from '../bootstrap/apply-runner-ops.js';
@@ -601,8 +601,55 @@ export function resolveMutateDeps(
   // `FleetApplyDeps.identityKeyPath` for `apply-fleet.ts::reconcileVaultRecipients`.
   // Never read anywhere else in this function.
   identityKeyPath?: string,
+  // groundnuty/macf#978 — `opts.vaultPath`, appended as the LAST parameter
+  // (not inserted before `identityKeyPath`) so every pre-#978 positional
+  // call site — including this file's own `runBootstrapApply` call and every
+  // existing test that stops at `identityKeyPath` — keeps compiling and
+  // behaving byte-identically. Used ONLY to build `trustDeps.readVaultCaCert`
+  // below; paired with `identityKeyPath` (both-or-neither, mirroring
+  // `checkVaultFlagsComplete`'s XOR refusal one layer up in
+  // `runBootstrapApply`, which guarantees these two are never partially set
+  // by the time either reaches here).
+  vaultPath?: string,
 ): MutateApplyDeps {
   const repoInitDeps: RepoInitStepDeps = { cloneRepo: realCloneRepo, commitAndPush: realCommitAndPush };
+
+  // groundnuty/macf#978 — the CA vault-restore fallback (`apply-ca.ts::
+  // resolveCaCert`'s `deps.readVaultCaCert`). `undefined` — the field
+  // omitted entirely from `trustDeps` below, not set to `undefined` — when
+  // either flag is missing: `resolveCaCert` then takes EXACTLY its pre-#978
+  // refusal path, byte-identical (same "vault-aware X is opt-in" shape
+  // `resolveKeyPath` above already establishes for identity-confirm).
+  // Re-decrypts the vault independently of `vaultAgentPems`'s own read
+  // above (`runBootstrapApply::resolveVaultAgentPems`) rather than
+  // threading that map's discarded `raw` payload through — this closure is
+  // invoked at most ONCE per run (only on the rare deactivate-then-apply
+  // refusal path), so a second `age -d` there is not a hot path, and
+  // keeping the two reads independent avoids widening `resolveVaultAgentPems`'s
+  // return shape for a wholly separate concern (agent-PEM confirm vs. CA
+  // cert restore).
+  const readVaultCaCert =
+    vaultPath !== undefined && identityKeyPath !== undefined
+      ? async (project: string): Promise<string | undefined> => {
+          try {
+            const raw = await readVault({ vaultPath, identityPath: identityKeyPath });
+            return vaultCaCertPem(raw, project);
+          } catch (err) {
+            // Amendment A4 honest-unknown floor, extended to CA restore: a
+            // failed decrypt must degrade to `apply-ca.ts`'s existing
+            // refusal, never be read as "no cert exists" nor fabricate a
+            // false restore. `VaultError` messages are pre-scrubbed of
+            // secret material at the source (`vault-read.ts`'s own doc), so
+            // logging one verbatim here is safe — never a PEM.
+            const reason = err instanceof Error ? err.message : String(err);
+            process.stderr.write(
+              `CA vault-restore UNAVAILABLE this run — ${reason} — falling back to the existing refusal ` +
+                '(this is NOT evidence the CA cert is actually gone, only that the vault could not be read).\n',
+            );
+            return undefined;
+          }
+        }
+      : undefined;
 
   // macf#913 — the vault-aware confirm-before-create guard's key resolver.
   // ONE scratch dir for the WHOLE run (not one per role), created lazily on
@@ -647,7 +694,7 @@ export function resolveMutateDeps(
     // approved plan.
     controlRepoOptions: { confirmUnarchive: true },
     agentRepoDeps: REAL_AGENT_REPO_DEPS,
-    trustDeps: REAL_TRUST_DEPS,
+    trustDeps: { ...REAL_TRUST_DEPS, ...(readVaultCaCert !== undefined ? { readVaultCaCert } : {}) },
     routingClientDeps: REAL_ROUTING_CLIENT_DEPS,
     now: () => new Date(),
     log: (line: string) => {
@@ -1195,7 +1242,7 @@ export async function runBootstrapApply(
     // pure plain-object builder — no `process.env` read hidden inside it for
     // this field (unlike the pre-existing `allowVaultVersion` line above it,
     // which this does NOT imitate).
-    const mutate = mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath);
+    const mutate = mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath, opts.vaultPath);
     try {
       const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, displayCreations);
       if (!approved) {

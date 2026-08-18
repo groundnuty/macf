@@ -33,8 +33,22 @@
  * AMBIGUOUS combination (lock says minted, registry says otherwise) REFUSES
  * outright rather than minting a replacement that would silently orphan the
  * already-vaulted key (the exact DR-010-amendment / silent-fallback Instance
- * 16 shape). Re-materializing from an orphaned vault key is DR-043 Amendment
- * D phase 3+ (vault-read) scope — out of this increment.
+ * 16 shape).
+ *
+ * **The ambiguous case now has a THIRD option, not just refuse-or-mint
+ * (groundnuty/macf#978, DR-043 Amendment D phase 3).** `macf fleet
+ * deactivate` deletes exactly the registry leg this refusal is about — and
+ * never touches `fleet.lock` — so "lock says minted, registry says absent"
+ * is not only the orphan-key failure shape, it is also the routine
+ * post-deactivate state. When the caller supplies `deps.readVaultCaCert`
+ * (wired only when the operator gave BOTH `--vault`/`--identity-key`) and
+ * the registry read is a DEFINITE `'absent'` (not `'unknown'` — see below),
+ * {@link resolveCaCert} tries the vault FIRST: the cert is public material
+ * `deactivate` never removes, so republishing it is a plain `'restored'`
+ * reuse — never a re-mint, never the private key leaving the vault. No
+ * vault, no identity, an `'unknown'` registry read, or a vault that simply
+ * has nothing for this fleet all fall through to the ORIGINAL refusal text,
+ * byte-identical.
  *
  * **No-recipient pre-flight (mirrors `apply-fleet.ts::wouldCreateWithNoRecipient`).**
  * A fresh mint is refused OUTRIGHT when `transport.age_recipients` is empty
@@ -73,13 +87,27 @@ export function caCertVariableName(fleetName: string): string {
 export type CaResolveOutcome =
   | { readonly status: 'minted'; readonly certPem: string; readonly keyPem: string }
   | { readonly status: 'reused'; readonly certPem: string }
+  /**
+   * groundnuty/macf#978 — the registry leg was confirmably ABSENT (not
+   * merely unconfirmable) but the cert was recovered from the vault instead
+   * of refused. Deliberately its OWN status, not folded into `'reused'`:
+   * `'reused'` means "the registry already had it, nothing needed fixing";
+   * `'restored'` means "the registry was missing it and this run put it
+   * back" — a real, worth-distinguishing action, even though both publish
+   * the SAME way (see `apply-fleet.ts`'s `certToPublish` gating, which
+   * treats them identically: neither carries a fresh key needing a
+   * durability gate). Same shape as `'reused'` (`certPem` only) — restoring
+   * NEVER hands back a private key; only the public cert is ever pulled out
+   * of the vault on this path.
+   */
+  | { readonly status: 'restored'; readonly certPem: string }
   | { readonly status: 'failed'; readonly reason: string };
 
 /** Render-safe mirror of {@link CaResolveOutcome} — NEVER carries `certPem`/`keyPem`. This, not the raw outcome, is what `FleetApplyResult.ca.resolve` holds. */
 export interface CaApplyOutcome {
-  readonly status: 'minted' | 'reused' | 'failed';
+  readonly status: 'minted' | 'reused' | 'restored' | 'failed';
   readonly reason?: string;
-  /** Non-secret SHA-256 fingerprint of the cert DER (`@groundnuty/macf-core::caCertFingerprint`) — `'minted'`/`'reused'` only. Safe to log/render; proves nothing about the private key. */
+  /** Non-secret SHA-256 fingerprint of the cert DER (`@groundnuty/macf-core::caCertFingerprint`) — `'minted'`/`'reused'`/`'restored'` only. Safe to log/render; proves nothing about the private key. */
   readonly certFingerprint?: string;
 }
 
@@ -88,6 +116,7 @@ export function redactCaResolve(outcome: CaResolveOutcome): CaApplyOutcome {
   switch (outcome.status) {
     case 'minted':
     case 'reused':
+    case 'restored':
       return { status: outcome.status, certFingerprint: caCertFingerprint(outcome.certPem) };
     case 'failed':
       return { status: 'failed', reason: outcome.reason };
@@ -98,6 +127,36 @@ export interface CaMintDeps {
   readonly checkRegistryPresence: (registry: RegistryConfig, name: string) => Promise<Presence>;
   readonly readRegistryVariable: (registry: RegistryConfig, name: string) => Promise<string | undefined>;
   readonly mintCa: (project: string) => Promise<{ readonly certPem: string; readonly keyPem: string }>;
+  /**
+   * groundnuty/macf#978 — the vault-restore fallback for the
+   * `lockHasCaKey && registryPresence === 'absent'` refusal below. `undefined`
+   * (the default — every existing caller/test that doesn't set this field)
+   * means "vault-aware CA restore is NOT engaged this run," the EXACT
+   * pre-#978 behaviour: the refusal fires unconditionally, byte-identical.
+   *
+   * Wired only by `commands/bootstrap-apply.ts::resolveMutateDeps`, and only
+   * when the operator supplied BOTH `--vault`/`--identity-key` — mirrors the
+   * SAME "vault-aware confirm is opt-in, absent flags means absent feature"
+   * contract `resolveVaultAgentPems`/`CreateGuardDeps.resolveKeyPath`
+   * (macf#913) already establish, so this is a THIRD instance of that same
+   * shape, not a new one.
+   *
+   * **Contract: NEVER throws.** Any decrypt/parse failure (missing vault,
+   * wrong identity, malformed plaintext) MUST be swallowed and reported as
+   * `undefined` — the SAME "a failed vault read degrades to the pre-vault-
+   * aware behaviour, never a false state" floor `resolveVaultAgentPems`'s own
+   * doc establishes (DR-043 Amendment A4, honest-unknown-over-false-present,
+   * extended here to honest-refusal-over-false-restore). {@link resolveCaCert}
+   * ALSO wraps this call in its own try/catch as defense-in-depth (it never
+   * throws by its own contract either), but a caller SHOULD NOT rely on that
+   * as the primary safety net.
+   *
+   * **Contract: never logs.** Any diagnostic about WHY the read failed is the
+   * wiring caller's responsibility (see `resolveMutateDeps`'s own
+   * implementation) — this function returns only `string | undefined`, never
+   * a side-channel.
+   */
+  readonly readVaultCaCert?: (project: string) => Promise<string | undefined>;
 }
 
 async function readExistingCert(registry: RegistryConfig, varName: string, deps: CaMintDeps): Promise<CaResolveOutcome> {
@@ -137,17 +196,40 @@ export async function resolveCaCert(
   }
 
   if (lockHasCaKey) {
-    if (registryPresence !== 'present') {
-      return {
-        status: 'failed',
-        reason:
-          `fleet.lock records a previously-minted CA key, but the registry var "${varName}" is not confirmable ` +
-          `present (observed: ${registryPresence}) — refusing to mint a REPLACEMENT (would orphan the already` +
-          '-vaulted key, the #799 failure class). Re-materializing the cert from the vaulted key needs a vault ' +
-          'read (DR-043 Amendment D phase 3+), not a fresh mint. Investigate manually.',
-      };
+    if (registryPresence === 'present') {
+      return readExistingCert(registry, varName, deps);
     }
-    return readExistingCert(registry, varName, deps);
+
+    // groundnuty/macf#978 — try the vault BEFORE refusing, but only for a
+    // DEFINITE 'absent' (the `deactivate`-then-`apply` shape this issue
+    // fixes) and only when a vault-read dep was actually wired (both
+    // --vault/--identity-key supplied this run). An 'unknown' registry read
+    // stays on the refusal path unconditionally — Amendment A4's
+    // honest-unknown floor: an unconfirmable read is not evidence the cert
+    // is gone, so don't spend a vault decrypt chasing a maybe.
+    if (registryPresence === 'absent' && deps.readVaultCaCert !== undefined) {
+      let vaultCertPem: string | undefined;
+      try {
+        vaultCertPem = await deps.readVaultCaCert(fleetName);
+      } catch {
+        // Contract violation by the caller (readVaultCaCert must never
+        // throw) — defense-in-depth only; treat exactly like "vault had
+        // nothing for this fleet" and fall through to the refusal below.
+        vaultCertPem = undefined;
+      }
+      if (vaultCertPem !== undefined) {
+        return { status: 'restored', certPem: vaultCertPem };
+      }
+    }
+
+    return {
+      status: 'failed',
+      reason:
+        `fleet.lock records a previously-minted CA key, but the registry var "${varName}" is not confirmable ` +
+        `present (observed: ${registryPresence}) — refusing to mint a REPLACEMENT (would orphan the already` +
+        '-vaulted key, the #799 failure class). Re-materializing the cert from the vaulted key needs a vault ' +
+        'read (DR-043 Amendment D phase 3+), not a fresh mint. Investigate manually.',
+    };
   }
 
   if (registryPresence === 'present') {

@@ -36,6 +36,7 @@ import {
   readVaultRecipientCount,
   reencryptVault,
   vaultAgentPrivateKeyPem,
+  vaultCaCertPem,
   vaultRunnerOpsPrivateKeyPem,
   type VaultAgentObservation,
   type VaultCaObservation,
@@ -347,6 +348,26 @@ describe('presence/derivation queries — non-secret shapes only', () => {
     const serialized = JSON.stringify({ agentObs, caObs });
     expect(serialized).not.toContain(AGENT.clientSecret);
     expect(serialized).not.toContain(PAYLOAD.ca?.caCertPem);
+  });
+});
+
+describe('vaultCaCertPem — the CA-cert revive query (groundnuty/macf#978)', () => {
+  const raw = parseVaultPlaintext(buildVaultPlaintext(PAYLOAD));
+
+  it('returns the exact original CA cert PEM — round-trips through the base64 storage form', () => {
+    expect(vaultCaCertPem(raw, FLEET)).toBe(PAYLOAD.ca?.caCertPem);
+  });
+
+  it('never returns the CA KEY — only the cert field is decoded', () => {
+    expect(vaultCaCertPem(raw, FLEET)).not.toBe(PAYLOAD.ca?.caKeyPem);
+  });
+
+  it('returns undefined for a DIFFERENT fleet name — derived forward from `project`, never a bare lookup', () => {
+    expect(vaultCaCertPem(raw, 'some-other-fleet')).toBeUndefined();
+  });
+
+  it('returns undefined against an empty vault map — never fabricates a cert', () => {
+    expect(vaultCaCertPem({}, FLEET)).toBeUndefined();
   });
 });
 

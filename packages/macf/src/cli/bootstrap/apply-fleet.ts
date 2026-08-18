@@ -999,14 +999,16 @@ export async function applyFleet(
 
   // Two-place PUBLIC-cert publish (macf#806) — gated on the ordering rule
   // above: a MINTED cert publishes only once its key is confirmed durable
-  // (`vault.status === 'written'`); a REUSED cert had no fresh key this run,
-  // so it publishes unconditionally (backfills any repo leg the #806 drift
-  // class left missing); a FAILED resolve or a minted-but-unwritten vault
-  // publishes NOTHING — every leg reads `'skipped'` with the reason, never
-  // silent (mirrors `plan.ts`'s `unimplementedByApply` discipline).
+  // (`vault.status === 'written'`); a REUSED or RESTORED cert (groundnuty/
+  // macf#978 — vault-recovered after `deactivate` dropped the registry leg)
+  // had no fresh key this run, so both publish unconditionally (backfills
+  // any repo leg the #806 drift class — or the #978 deactivate/apply
+  // revive gap — left missing); a FAILED resolve or a minted-but-unwritten
+  // vault publishes NOTHING — every leg reads `'skipped'` with the reason,
+  // never silent (mirrors `plan.ts`'s `unimplementedByApply` discipline).
   let certToPublish: string | undefined;
   let caSkipReason: string | undefined;
-  if (caResolve.status === 'reused') {
+  if (caResolve.status === 'reused' || caResolve.status === 'restored') {
     certToPublish = caResolve.certPem;
   } else if (caResolve.status === 'minted') {
     if (vault.status === 'written') {
