@@ -86,6 +86,31 @@
  * `commands/bootstrap-apply.ts::runBootstrapApply` before consent gate 1
  * ever opens. `publishTrustedActorsGated` itself is UNCHANGED and remains
  * the actual enforcement point — this is a pre-flight, not a relocation.
+ *
+ * **A poll's duration must be justified by an expectation, not a constant
+ * (macf#972).** A repo CREATED THIS RUN cannot yet have a runner registered
+ * to it by anything `apply` itself does — nothing provisions one in-band
+ * (macf#943, the runner-provisioning call, is unbuilt) — so polling the full
+ * deploy window for it waits on a step nobody was asked to perform: two live
+ * provisions both polled 600s and then reported the same honest skip they
+ * would have reported immediately. {@link publishTrustedActorsGated}'s
+ * OPTIONAL `justCreatedRepos` param (DR-043 Amendment I2) marks exactly
+ * those repos; for one, it performs ONE immediate `checkRunnerUsableByRepo`
+ * call — never the retry-with-sleep loop {@link pollForUsableRunner} owns —
+ * so a runner that is ALREADY usable at t=0 (e.g. an org-wide runner group
+ * with "All repositories" visibility, registered before this run) still
+ * gets its var written, but an absent runner is reported at once with the
+ * SAME {@link runnerTokenPollExhaustedReason} text `apply` has always shown,
+ * just without the wait. A repo that PRE-EXISTED this run keeps polling
+ * exactly as before — a runner may legitimately be registering to it. This
+ * is the interim behaviour the issue asks for independently of macf#943,
+ * which removes the operator from the loop entirely by having `apply` make
+ * the provisioning call itself (at which point a fresh repo's poll becomes
+ * justified again — see {@link publishTrustedActorsGated}'s doc).
+ * {@link RunnerTokenPollOptions}'s new `onProgress`/`now`/`sleepFn` fields
+ * (all optional, defaulting to today's un-instrumented real-clock behavior)
+ * let a long poll narrate itself — macf#972 requirement 3: silence after a
+ * burst of browser consent-gate clicks reads as a hang.
  */
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import { ensureVariableCreated, failedOutcomesFor } from './ensure-variable.js';
@@ -320,6 +345,32 @@ export function checkRunnerTokenPreflight(
  * change WHY a runner is unusable, only WHETHER `apply` waited for it) with
  * the token-specific framing + the concrete re-run remedy.
  */
+/**
+ * The skip reason for the macf#972 FAST PATH — a repo created in THIS run,
+ * where no poll was performed because none could succeed.
+ *
+ * Deliberately NOT {@link runnerTokenPollExhaustedReason}: that text says
+ * "within the Ns poll window", which on this path would assert a wait that
+ * never happened. A message describing work the program did not do is the
+ * same dishonesty this catalog exists to prevent, so the elapsed claim is
+ * dropped and the CAUSE is named instead. The remedy clause is kept
+ * verbatim — operators and macf#932's pre-flight both reference it.
+ */
+export function runnerJustCreatedRepoReason(repo: string, usability: RunnerUsability): string {
+  const cause =
+    usability.presence === 'unknown'
+      ? 'could not confirm whether a self-hosted runner is registered (auth / network / insufficient scope)'
+      : 'no usable self-hosted runner is registered yet — this repo was created during THIS run, so none can have registered on its own';
+  const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
+  const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
+  return (
+    `role/repo "${repo}": a runner registration token was supplied (macf#929) but ${cause} — ` +
+    'MACF_TRUSTED_ACTORS was NOT written; this repo routes on hosted runners (billed on private repos) ' +
+    'until a runner is confirmed. Register a runner for this repo, then re-run `macf bootstrap apply`.' +
+    `${detailSuffix}${handoverSuffix}`
+  );
+}
+
 export function runnerTokenPollExhaustedReason(repo: string, usability: RunnerUsability, timeoutMs: number): string {
   const cause =
     usability.presence === 'unknown'
@@ -341,17 +392,59 @@ export interface RunnerTokenPollOptions {
   readonly timeoutMs?: number;
   /** Delay between polls. Default 3s — same default `waitForAppInstallation` uses. */
   readonly pollIntervalMs?: number;
+  /**
+   * How often (of ELAPSED wait time) {@link pollForUsableRunner} calls
+   * {@link onProgress} while it waits — macf#972 requirement 3. Default 30s,
+   * matching the issue's own "any poll longer than ~30s" threshold. Never
+   * fires for a poll that resolves (or was never entered — see
+   * `publishTrustedActorsGated`'s `justCreatedRepos` fast path) before the
+   * first interval elapses.
+   */
+  readonly progressIntervalMs?: number;
+  /**
+   * Called with `(repo, elapsedMs, totalMs)` roughly every
+   * {@link progressIntervalMs} while a poll waits — macf#972: a silent
+   * multi-minute wait after a burst of browser consent-gate clicks reads as
+   * a hang ("I'm not sure what we are waiting on ... I see no pop-ups and
+   * have nothing to click," the operator's own words on the issue). Never
+   * called for the immediate single-check fast path (nothing to narrate — it
+   * never waits). `undefined` (the default) narrates nothing, matching
+   * every poll's behavior before macf#972.
+   */
+  readonly onProgress?: (repo: string, elapsedMs: number, totalMs: number) => void;
+  /** Injectable clock — default `Date.now`. Test-only; production never overrides this. */
+  readonly now?: () => number;
+  /** Injectable wait primitive — default a real `setTimeout`-based sleep. Test-only; production never overrides this. */
+  readonly sleepFn?: (ms: number) => Promise<void>;
 }
 
 /** Default poll budget for a single repo when {@link publishTrustedActorsGated} doesn't override it — see {@link RunnerTokenPollOptions}'s doc. */
 export const DEFAULT_RUNNER_POLL_TIMEOUT_MS = 10 * 60 * 1000;
 /** Default poll interval — see {@link RunnerTokenPollOptions}'s doc. */
 export const DEFAULT_RUNNER_POLL_INTERVAL_MS = 3_000;
+/** Default progress-narration interval (macf#972 requirement 3: "~30s") — see {@link RunnerTokenPollOptions.progressIntervalMs}'s doc. */
+export const DEFAULT_PROGRESS_INTERVAL_MS = 30_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+/**
+ * The macf#972-requirement-3 progress line — "nothing for you to do" is
+ * deliberate, not filler: the wait follows a burst of browser consent-gate
+ * clicks, so an unexplained silent stretch reads as a hang (the operator's
+ * own words on the issue: "I'm not sure what we are waiting on, I see no
+ * pop-ups and have nothing to click"). Shared by every {@link onProgress}
+ * caller (production wiring lives at `apply-fleet.ts`'s
+ * `publishTrustedActorsGated` call site) so the wording is authored ONCE.
+ */
+export function formatRunnerPollProgress(repo: string, elapsedMs: number, totalMs: number): string {
+  return (
+    `waiting for a usable self-hosted runner for "${repo}" … ${String(Math.round(elapsedMs / 1000))}s/` +
+    `${String(Math.round(totalMs / 1000))}s elapsed; nothing for you to do`
+  );
 }
 
 /**
@@ -368,6 +461,15 @@ function sleep(ms: number): Promise<void> {
  * `publishTrustedActors`'s existing "a throwing check is a wiring bug,
  * `'failed'`, never `'skipped'`" contract — `publishTrustedActorsGated`
  * catches it at the call site, exactly where `publishTrustedActors` does.
+ *
+ * **macf#972 — narrates itself past `progressIntervalMs` of ELAPSED wait.**
+ * `opts.now`/`opts.sleepFn` default to the real clock/`setTimeout`-sleep
+ * (unchanged behavior for every existing caller that doesn't set them);
+ * tests inject a fake pair to assert progress fires without a real wait.
+ * `onProgress` fires at most once per interval, only ahead of a `sleep` —
+ * never on the call that's about to return (a poll that resolves or expires
+ * inside its first interval narrates nothing, matching this function's
+ * pre-macf#972 silent behavior for a short poll).
  */
 export async function pollForUsableRunner(
   repo: string,
@@ -376,13 +478,23 @@ export async function pollForUsableRunner(
 ): Promise<RunnerUsability> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_RUNNER_POLL_TIMEOUT_MS;
   const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_RUNNER_POLL_INTERVAL_MS;
-  const deadline = Date.now() + timeoutMs;
+  const progressIntervalMs = opts.progressIntervalMs ?? DEFAULT_PROGRESS_INTERVAL_MS;
+  const nowFn = opts.now ?? Date.now;
+  const sleepFn = opts.sleepFn ?? sleep;
+  const start = nowFn();
+  const deadline = start + timeoutMs;
+  let lastProgressAt = start;
   for (;;) {
     const usability = await checkRunnerUsableByRepo(repo);
     if (usability.presence === 'present') return usability;
-    const remaining = deadline - Date.now();
+    const elapsedNow = nowFn();
+    const remaining = deadline - elapsedNow;
     if (remaining <= 0) return usability;
-    await sleep(Math.min(pollIntervalMs, remaining));
+    if (opts.onProgress !== undefined && elapsedNow - lastProgressAt >= progressIntervalMs) {
+      opts.onProgress(repo, elapsedNow - start, timeoutMs);
+      lastProgressAt = elapsedNow;
+    }
+    await sleepFn(Math.min(pollIntervalMs, remaining));
   }
 }
 
@@ -412,6 +524,26 @@ export async function pollForUsableRunner(
  *   incomplete, does NOT fail the run); a throwing check is `'failed'`
  *   (wiring bug, isolated to that repo — mirrors `publishTrustedActors`).
  *
+ * **`justCreatedRepos` (macf#972, DR-043 Amendment I2) — a poll must be
+ * justified by an expectation, not a constant.** For a repo in this
+ * OPTIONAL set, the shared deadline above is never consulted for a retry
+ * loop: this function calls `deps.checkRunnerUsableByRepo(repo)` DIRECTLY,
+ * exactly ONCE, never through {@link pollForUsableRunner} (zero `sleep`s,
+ * zero retries — the decisive difference from the poll path). A repo NOT in
+ * the set (or when the param is omitted entirely — every existing caller)
+ * polls exactly as before; `undefined` is the historical, fully-backward-
+ * compatible default. The single check is still a LIVE read, not an assumed
+ * absence: an org-wide runner group ("All repositories" visibility)
+ * registered before this run IS usable at t=0 for a brand-new repo, and
+ * that case still writes the var — only the RETRY LOOP is skipped, never
+ * the one-shot presence read. When the single check finds no usable runner,
+ * the skip reason is {@link runnerTokenPollExhaustedReason} called with the
+ * SAME configured `timeoutMs` the poll path would have used — byte-identical
+ * text to what a full 600s poll would have produced, per the issue's hard
+ * constraint that only the TIMING changes, never the message. See
+ * `apply-fleet.ts`'s call site for how `justCreatedRepos` is populated
+ * (`ensureAgentRepo`'s per-repo `status === 'created'`).
+ *
  * NEVER throws.
  */
 export async function publishTrustedActorsGated(
@@ -420,6 +552,7 @@ export async function publishTrustedActorsGated(
   deps: RoutingApplyDeps,
   runnerToken: string | undefined,
   pollOptions: RunnerTokenPollOptions = {},
+  justCreatedRepos?: ReadonlySet<string>,
 ): Promise<Readonly<Record<string, EnsureVariableOutcome>>> {
   if (runnerToken === undefined || runnerToken.length === 0) {
     return failedOutcomesFor(repos, noRunnerTokenReason());
@@ -427,20 +560,42 @@ export async function publishTrustedActorsGated(
 
   const timeoutMs = pollOptions.timeoutMs ?? DEFAULT_RUNNER_POLL_TIMEOUT_MS;
   const pollIntervalMs = pollOptions.pollIntervalMs ?? DEFAULT_RUNNER_POLL_INTERVAL_MS;
-  const deadline = Date.now() + timeoutMs;
+  const nowFn = pollOptions.now ?? Date.now;
+  const deadline = nowFn() + timeoutMs;
 
   const out: Record<string, EnsureVariableOutcome> = {};
   for (const repo of repos) {
-    const remaining = Math.max(0, deadline - Date.now());
+    const remaining = Math.max(0, deadline - nowFn());
+    // macf#972 — "poll only when a runner is plausibly imminent": a repo
+    // CREATED THIS RUN cannot yet have a runner registered by anything
+    // `apply` itself does (macf#943, the provisioning call, is unbuilt), so
+    // waiting the full deploy window for one waits on a step nobody was
+    // asked to perform. A repo that PRE-EXISTED this run may legitimately be
+    // mid-registration — it still gets the real poll.
+    const pollJustified = justCreatedRepos?.has(repo) !== true;
     let usability: RunnerUsability;
     try {
-      usability = await pollForUsableRunner(repo, deps.checkRunnerUsableByRepo, { timeoutMs: remaining, pollIntervalMs });
+      usability = pollJustified
+        ? await pollForUsableRunner(repo, deps.checkRunnerUsableByRepo, {
+            timeoutMs: remaining,
+            pollIntervalMs,
+            progressIntervalMs: pollOptions.progressIntervalMs,
+            onProgress: pollOptions.onProgress,
+            now: pollOptions.now,
+            sleepFn: pollOptions.sleepFn,
+          })
+        : await deps.checkRunnerUsableByRepo(repo);
     } catch (err) {
       out[repo] = { status: 'failed', reason: `runner-usability check threw for "${repo}" — ${errMessage(err)}` };
       continue;
     }
     if (usability.presence !== 'present') {
-      out[repo] = { status: 'skipped', reason: runnerTokenPollExhaustedReason(repo, usability, timeoutMs) };
+      out[repo] = {
+        status: 'skipped',
+        reason: pollJustified
+          ? runnerTokenPollExhaustedReason(repo, usability, timeoutMs)
+          : runnerJustCreatedRepoReason(repo, usability),
+      };
       continue;
     }
     out[repo] = await writeTrustedActorsVar(repo, value, deps);

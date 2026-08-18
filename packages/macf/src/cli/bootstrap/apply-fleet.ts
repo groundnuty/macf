@@ -253,7 +253,7 @@ import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } f
 import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import type { RunnerRegistrationDeps, RunnerTokenPollOptions } from './apply-routing.js';
-import { publishTrustedActorsGated } from './apply-routing.js';
+import { formatRunnerPollProgress, publishTrustedActorsGated } from './apply-routing.js';
 import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientPublishResult } from './apply-routing-client.js';
 import { mintRoutingClient, publishRoutingClientSecrets, skippedRoutingClientPublish } from './apply-routing-client.js';
 import type { VaultRecipientCountResult } from './vault-read.js';
@@ -712,6 +712,14 @@ export async function applyFleet(
   // failed). Feeds both the CA two-place repo legs and the routing-var
   // write below — neither can target a repo that doesn't exist.
   const confirmedRepos: string[] = [];
+  // macf#972 — the SUBSET of `confirmedRepos` whose `ensureAgentRepo` outcome
+  // was `'created'` (not `'present'`) this run — fed to
+  // `apply-routing.ts::publishTrustedActorsGated`'s `justCreatedRepos` param
+  // so it skips the 600s poll for a repo that, by construction, cannot yet
+  // have a runner registered to it (nothing in this run provisions one —
+  // macf#943 is unbuilt). A repo already present before this run keeps
+  // polling — a runner may legitimately be mid-registration for it.
+  const justCreatedRepos = new Set<string>();
 
   const writeIncrementalLock = (role: string, update: FleetLockAgentUpdate): void => {
     const composed = composeFleetLock({ fleet: manifest.metadata.name, previous: currentLock, agentUpdates: { [role]: update } });
@@ -758,6 +766,12 @@ export async function applyFleet(
     }
     scopedLog(`Role "${agent.role}": agent repo "${agent.repo}" ${repoOutcome.status.toUpperCase()}.`);
     confirmedRepos.push(agent.repo);
+    // macf#972 — only a FRESH creation this run disqualifies the repo from
+    // the register-before-route poll; `'present'` (pre-existing) keeps
+    // polling exactly as today.
+    if (repoOutcome.status === 'created') {
+      justCreatedRepos.add(agent.repo);
+    }
 
     const prior = currentLock?.agents.find((a) => a.role === agent.role);
     // DR-043 §D5 pre-flight — see `noRecipientPreflightFailure`'s doc.
@@ -1069,6 +1083,21 @@ export async function applyFleet(
   // string) needs no write at all, matching `plan.ts::routingItem`'s own
   // noop-for-non-self-hosted branch (mustn't drift from what `plan` told the
   // operator would happen).
+  //
+  // macf#972 — `onProgress` is wired to `deps.log` by default (same stream
+  // every other progress line in this function already uses — see
+  // `commands/bootstrap-apply.ts`'s `log` binding to `process.stderr`, never
+  // stdout, so a `--json` render stays clean). A test-supplied
+  // `deps.runnerTokenPollOptions.onProgress` (or `now`/`sleepFn`) wins over
+  // this default via the spread order below.
+  const routingPollOptions: RunnerTokenPollOptions = {
+    ...deps.runnerTokenPollOptions,
+    onProgress:
+      deps.runnerTokenPollOptions?.onProgress ??
+      ((repo: string, elapsedMs: number, totalMs: number): void => {
+        deps.log(formatRunnerPollProgress(repo, elapsedMs, totalMs));
+      }),
+  };
   const routing =
     manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted'
       ? await publishTrustedActorsGated(
@@ -1079,7 +1108,10 @@ export async function applyFleet(
           // detection-and-write at all; it never substitutes for confirming a
           // usable runner. `publishTrustedActorsGated` owns that contract.
           deps.runnerToken,
-          deps.runnerTokenPollOptions,
+          routingPollOptions,
+          // macf#972 — repos created THIS RUN skip the poll (see
+          // `justCreatedRepos`'s doc above).
+          justCreatedRepos,
         )
       : {};
   for (const [repo, leg] of Object.entries<EnsureVariableOutcome>(routing)) {

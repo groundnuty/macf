@@ -809,6 +809,57 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(all).toMatch(/Routing \(MACF_TRUSTED_ACTORS\):/);
   });
 
+  it('macf#972: a poll longer than ~30s narrates on the log seam (never console.log/stdout) — --json output stays valid JSON with progress enabled', async () => {
+    const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+    const rawWrites: string[] = [];
+    let clock = 0;
+    const code = await runBootstrapApply(
+      { file, yes: true, json: true, runnerToken: SENTINEL_RUNNER_TOKEN },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+      fakeMutateDeps(file, {
+        // Pre-existing repo -> `apply-routing.ts` takes the real poll path
+        // (a repo CREATED this run would skip straight to the immediate
+        // single-check fast path — see apply-fleet.test.ts's macf#972 suite
+        // for that case; this test is specifically about the >30s NARRATION
+        // path, which only the real poll exercises).
+        agentRepoDeps: { checkExists: async () => 'present', createRepo: async () => {} },
+        trustDeps: fakeTrustDeps({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+        // `resolveMutateDeps`'s REAL wiring binds `log` to
+        // `process.stderr.write` (bootstrap-apply.ts's `log: (line) => {
+        // process.stderr.write(...) }`, never console.log — see that
+        // binding's own comment: "stdout stays clean for a --json render").
+        // This fake stands in for that binding: what matters here is that
+        // `apply-fleet.ts`'s progress wiring calls `deps.log`, a channel
+        // structurally distinct from the `console.log(JSON.stringify(...))`
+        // this file's `logs` spy captures — not that THIS PARTICULAR fake
+        // happens to be process.stderr.write.
+        log: (line) => rawWrites.push(line),
+        runnerTokenPollOptions: {
+          timeoutMs: 90_000,
+          pollIntervalMs: 10_000,
+          progressIntervalMs: 30_000,
+          now: () => clock,
+          sleepFn: async (ms) => {
+            clock += ms;
+          },
+        },
+      }),
+    );
+    expect(code).toBe(0);
+
+    const progressLines = rawWrites.filter((l) => l.includes('waiting for a usable self-hosted runner'));
+    expect(progressLines.length).toBeGreaterThan(0);
+    expect(progressLines[0]).toMatch(/\d+s\/90s elapsed; nothing for you to do/);
+
+    // The decisive --json assertion: stdout (what `logs` captures) is STILL
+    // exactly one valid JSON document — progress narration never touched it.
+    const stdout = logs.join('\n');
+    expect(() => JSON.parse(stdout)).not.toThrow();
+    const parsed = JSON.parse(stdout) as { routing: Record<string, { status: string }> };
+    expect(parsed.routing['groundnuty/demo-code']?.status).toBe('skipped');
+    expect(stdout).not.toContain('waiting for a usable self-hosted runner');
+  });
+
   // --- macf#932 — the pre-flight fires BEFORE consent gate 1, not merely
   // before the late gate deep inside applyFleet's routing block. The
   // decisive case: zero gate invocations, not merely a non-zero exit code.

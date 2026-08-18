@@ -1508,7 +1508,7 @@ trust:
 
       expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
       const leg = result.routing['groundnuty/demo-code'];
-      expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/no usable self-hosted runner became visible/);
+      expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/MACF_TRUSTED_ACTORS was NOT written/);
     });
 
     it('runner registration UNKNOWN -> ALSO refuses the write (honest-unknown, never treated as present)', async () => {
@@ -1536,7 +1536,7 @@ trust:
       const rendered = formatApplyResult(result);
 
       expect(rendered).toContain('groundnuty/demo-code: SKIPPED —');
-      expect(rendered).toContain('no usable self-hosted runner became visible');
+      expect(rendered).toContain('MACF_TRUSTED_ACTORS was NOT written');
     });
 
     // --- macf#924 — the org-admin handover survives end-to-end into the rendered report ---
@@ -1562,7 +1562,7 @@ trust:
       const rendered = formatApplyResult(result);
 
       expect(rendered).toContain('groundnuty/demo-code: SKIPPED —');
-      expect(rendered).toContain('no usable self-hosted runner became visible');
+      expect(rendered).toContain('MACF_TRUSTED_ACTORS was NOT written');
       expect(rendered).toContain('an org admin must add this repo at');
       expect(rendered).toContain('runner-groups/7');
     });
@@ -1645,6 +1645,13 @@ trust:
       let checkCalls = 0;
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        // macf#972 — a repo CREATED this run skips the retry-with-sleep poll
+        // entirely (nothing provisions a runner in-band yet; see
+        // `apply-routing.ts::publishTrustedActorsGated`'s `justCreatedRepos`
+        // doc), so a genuine "appears mid-window" recovery is only exercised
+        // for a repo that PRE-EXISTED the run — a runner may legitimately be
+        // registering to it already. Mark the repo present-before-this-run.
+        agentRepoDeps: { checkExists: async () => 'present', createRepo: async () => {} },
         trustDeps: trustDepsFor({
           checkRunnerUsableByRepo: async () => {
             checkCalls += 1;
@@ -1657,6 +1664,88 @@ trust:
 
       expect(result.routing['groundnuty/demo-code']).toEqual({ status: 'created' });
       expect(checkCalls).toBe(3);
+    });
+
+    it('macf#972: token supplied, repo CREATED THIS RUN, no runner -> immediate skip with ZERO poll iterations (checkRunnerUsableByRepo called exactly once, never retried) — the decisive test', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+      let checkCalls = 0;
+      const deps: FleetApplyDeps = {
+        // agentRepoDepsFor() default (via baseDeps) reports every repo
+        // 'absent' -> ensureAgentRepo CREATES it this run.
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRunnerUsableByRepo: async () => {
+            checkCalls += 1;
+            return { presence: 'absent' };
+          },
+        }),
+        // A real 10-minute default budget (`runnerTokenPollOptions` left
+        // UNSET, same as production) — if the fast path fell through to a
+        // real poll, this test would hang for 10 real minutes. It resolves
+        // instantly, proving no poll loop was entered.
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
+      const leg = result.routing['groundnuty/demo-code'];
+      expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/MACF_TRUSTED_ACTORS was NOT written/);
+      // The decisive assertion: exactly ONE call, not the ~200 a 600s/3s poll
+      // would produce, and not zero (a single LIVE check still runs — it's
+      // the RETRY LOOP that's skipped, never the one-shot presence read; see
+      // the sibling "usable runner present" test below for why that matters).
+      expect(checkCalls).toBe(1);
+    });
+
+    it('macf#972: token supplied, repo CREATED THIS RUN, but a runner IS already usable at t=0 -> still writes MACF_TRUSTED_ACTORS exactly as today', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+      let checkCalls = 0;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRunnerUsableByRepo: async () => {
+            checkCalls += 1;
+            // e.g. an org-wide "All repositories" runner group, registered
+            // before this run — already usable for a brand-new repo at t=0.
+            return { presence: 'present' };
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing['groundnuty/demo-code']).toEqual({ status: 'created' });
+      expect(checkCalls).toBe(1);
+    });
+
+    it('macf#972: a poll longer than ~30s emits at least one progress line naming elapsed/total on the log stream — never on stdout/--json', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+      const lines: string[] = [];
+      let clock = 0;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        // Pre-existing repo -> the real poll loop runs (see the mid-window
+        // test above for why a just-created repo never reaches it).
+        agentRepoDeps: { checkExists: async () => 'present', createRepo: async () => {} },
+        trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+        log: (line) => lines.push(line),
+        runnerTokenPollOptions: {
+          timeoutMs: 90_000,
+          pollIntervalMs: 10_000,
+          progressIntervalMs: 30_000,
+          now: () => clock,
+          sleepFn: async (ms) => {
+            clock += ms;
+          },
+        },
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
+      const progressLines = lines.filter((l) => l.includes('waiting for a usable self-hosted runner'));
+      expect(progressLines.length).toBeGreaterThan(0);
+      expect(progressLines[0]).toMatch(/\d+s\/90s elapsed; nothing for you to do/);
     });
 
     it('macf#929: the token itself never appears in the JSON-renderable result, the fleet.lock written to disk, or the fleet.yaml committed to the control repo — refused, poll-exhausted, AND written paths all checked', async () => {
