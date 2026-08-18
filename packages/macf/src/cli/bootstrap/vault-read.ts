@@ -543,6 +543,37 @@ export function queryVaultCaPresence(raw: Readonly<Record<string, string>>, proj
   };
 }
 
+/**
+ * Decode the per-project CA CERT PEM out of an already-decrypted vault raw
+ * map — the revive-path counterpart to {@link queryVaultCaPresence}
+ * (groundnuty/macf#978: `deactivate` deletes the registry `<SEG>_CA_CERT`
+ * leg but never touches the vault or `fleet.lock`, so the cert this function
+ * returns is the SAME bytes `apply-ca.ts::resolveCaCert` would otherwise
+ * refuse to re-materialize). Keyed the SAME forward way
+ * {@link queryVaultCaPresence} already uses (`toVariableSegment(project)`) —
+ * never reverse-parsed off the vault's own key names.
+ *
+ * **Public material, still never logged.** Unlike {@link vaultAgentPrivateKeyPem}
+ * / {@link vaultRunnerOpsPrivateKeyPem} (PRIVATE keys), a CA cert is public
+ * by construction — but this module keeps the SAME never-log discipline for
+ * it anyway: the only intended caller (`apply-ca.ts::resolveCaCert`'s
+ * vault-restore path) threads the returned PEM straight into
+ * `publishCaCertLegs` and its own `redactCaResolve` render boundary, never
+ * into a log line or thrown message — see this module's doc's
+ * redaction-boundary paragraph for why "public" doesn't mean "safe to
+ * print here."
+ *
+ * Returns `undefined` when the field is absent or empty — never fabricates
+ * a cert. The caller (`resolveCaCert`) degrades to its existing refusal in
+ * that case, unchanged.
+ */
+export function vaultCaCertPem(raw: Readonly<Record<string, string>>, project: string): string | undefined {
+  const seg = toVariableSegment(project);
+  const b64 = raw[`MACF_${seg}_CA_CERT_B64`];
+  if (b64 === undefined || b64.length === 0) return undefined;
+  return Buffer.from(b64, 'base64').toString('utf-8');
+}
+
 export interface VaultRoutingPresence {
   readonly appId: VaultFieldPresence;
   readonly appKey: VaultFieldPresence;

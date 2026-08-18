@@ -1346,6 +1346,193 @@ trust:
       expect(result.ca.registryLeg.status).toBe('skipped');
     });
 
+    // --- groundnuty/macf#978 — the deactivate-then-apply revive path ---
+    //
+    // `macf fleet deactivate` deletes exactly the `<SEG>_CA_CERT` registry
+    // leg (never `fleet.lock`), producing the SAME "ambiguous" shape the
+    // test directly above refuses on. These tests exercise the THIRD option
+    // (`deps.readVaultCaCert`) that shape now has.
+
+    it('deactivate-shaped state: lock has ca_key, registry ABSENT, vault has the cert -> RESTORES end-to-end (registry leg actually gets recreated, not just "vault was read"), never mints', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      // BOTH the agent AND the fleet-level runner-ops App get a PRIOR lock
+      // entry (groundnuty/macf#943 — runner-ops is a real, always-resolved
+      // identity on every apply run, not something this CA-focused test can
+      // ignore) so both take the REUSED path and this test exercises ONLY
+      // the CA machinery — no gate-1/gate-2/repo-init/label-creation noise
+      // that a fresh CREATE would pull in and that has nothing to do with
+      // #978. Mirrors the dispatch-by-appId shape the pre-existing "reuse:
+      // fleet.lock already records ca_key AND registry reports present"
+      // test above already uses.
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [
+          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+          { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-runner-ops' },
+        ],
+        fingerprints: { ca_key: 'sha256:deadbeef' },
+      };
+      const agentDeps: AgentApplyDeps = {
+        startManifestFlow: async () => { throw new Error('must not be called — both roles have prior entries'); },
+        startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+        exchangeManifestCode: async () => { throw new Error('must not be called'); },
+        resolveKeyPath: () => '/fake.pem',
+        confirmAppInstallation: async (appId) => ({
+          status: 'confirmed',
+          install: { appId, installId: appId === 'app-code-agent' ? 'install-1' : 'install-runner-ops', appSlug: `demo-fleet-${appId}`, accountLogin: 'groundnuty' },
+        }),
+        waitForAppInstallation: async () => { throw new Error('must not be called'); },
+        openUrl: async () => {},
+        log: () => {},
+        writeRecoveryArtifact: async () => {},
+      };
+      let mintCalled = false;
+      const registryWrites: string[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDeps, manifestPath),
+        trustDeps: trustDepsFor({
+          checkRegistryPresence: async () => 'absent', // exactly what `deactivate` leaves behind
+          readVaultCaCert: async () => 'VAULT-RESTORED-CA-CERT-PEM',
+          mintCa: async () => {
+            mintCalled = true;
+            throw new Error('must not be called — a vault-restored cert exists, minting would orphan it');
+          },
+          createRegistryVariable: async (_registry, _name, value) => {
+            registryWrites.push(value);
+            return 'created';
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      // The decisive assertion: the registry leg is ACTUALLY BACK, not merely
+      // "the resolve step said restored." A test that only checked
+      // `result.ca.resolve.status` would pass even if `publishCaCertLegs`
+      // were never reached.
+      expect(result.ca.resolve.status).toBe('restored');
+      expect(result.ca.registryLeg).toEqual({ status: 'created' });
+      expect(result.ca.repoLegs['groundnuty/demo-code']).toEqual({ status: 'created' });
+      expect(registryWrites).toEqual(['VAULT-RESTORED-CA-CERT-PEM']);
+      expect(result.agents[0]?.identity.status).toBe('reused');
+      expect(result.runnerOps.status).toBe('reused');
+      // `applyExitCode` gates on `ca.resolve.status === 'failed'` (an
+      // explicit equality check, not a closed allowlist of "good" statuses)
+      // — a successful restore must NOT make the run exit non-zero. Asserted
+      // directly rather than inferred: the issue's own symptom report is
+      // that `applyExitCode` correctly returned 1 on the UNFIXED refusal
+      // path, so this is the fix's mirror-image proof for the FIXED path.
+      expect(applyExitCode(result)).toBe(0);
+      // The never-mints property, asserted directly (not merely implied by
+      // `mintCa` throwing above — that only proves it WOULD have failed if
+      // called; this proves it was never called at all):
+      expect(mintCalled).toBe(false);
+      // No CA material (restored cert OR the sentinel mint key/cert this
+      // file's `trustDepsFor` default would otherwise produce) anywhere in
+      // the rendered result:
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain('SENTINEL-CA-KEY-PEM');
+      expect(serialized).not.toContain('SENTINEL-CA-CERT-PEM');
+      expect(result.ca.resolve).not.toHaveProperty('certPem');
+      expect(result.ca.resolve).not.toHaveProperty('keyPem');
+    });
+
+    it('deactivate-shaped state: vault reachable but has NOTHING for this fleet -> REFUSES exactly like the no-vault case, never mints', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = { schema_version: 1, fleet: 'demo-fleet', agents: [], fingerprints: { ca_key: 'sha256:deadbeef' } };
+      let mintCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRegistryPresence: async () => 'absent',
+          readVaultCaCert: async () => undefined, // vault decrypted fine, but has no CA entry for THIS fleet
+          mintCa: async () => {
+            mintCalled = true;
+            throw new Error('must not be called');
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(mintCalled).toBe(false);
+      expect(result.ca.resolve.status).toBe('failed');
+      // Byte-identical to the no-vault refusal text (requirement: "keep
+      // today's refusal, unchanged" — see apply-ca.test.ts's dedicated
+      // exact-text pin for the full string).
+      expect(result.ca.resolve.reason).toMatch(/orphan/);
+      expect(result.ca.registryLeg.status).toBe('skipped');
+    });
+
+    it('deactivate-shaped state: vault decrypt THROWS -> REFUSES, never propagates, never a false restore', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = { schema_version: 1, fleet: 'demo-fleet', agents: [], fingerprints: { ca_key: 'sha256:deadbeef' } };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRegistryPresence: async () => 'absent',
+          readVaultCaCert: async () => {
+            throw new Error('simulated: wrong age identity');
+          },
+        }),
+      };
+      // Must not reject the whole applyFleet call — resolveCaCert's own
+      // "NEVER throws" contract holds even when its injected dep breaks it.
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.ca.resolve.status).toBe('failed');
+      expect(result.ca.resolve.reason).toMatch(/orphan/);
+    });
+
+    it('unknown registry presence does NOT attempt a vault read at all -> stays on the honest-unknown refusal, never chases a maybe', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = { schema_version: 1, fleet: 'demo-fleet', agents: [], fingerprints: { ca_key: 'sha256:deadbeef' } };
+      let vaultReadCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRegistryPresence: async () => 'unknown',
+          readVaultCaCert: async () => {
+            vaultReadCalled = true;
+            return 'SHOULD-NOT-BE-USED-PEM';
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(vaultReadCalled).toBe(false);
+      expect(result.ca.resolve.status).toBe('failed');
+      expect(result.ca.resolve.reason).toMatch(/orphan/);
+    });
+
+    it('registry already PRESENT (no repair needed) does NOT attempt a vault read at all -> plain reuse, unaffected by #978', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = { schema_version: 1, fleet: 'demo-fleet', agents: [], fingerprints: { ca_key: 'sha256:deadbeef' } };
+      let vaultReadCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRegistryPresence: async () => 'present',
+          readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM',
+          readVaultCaCert: async () => {
+            vaultReadCalled = true;
+            return 'SHOULD-NOT-BE-USED-PEM';
+          },
+        }),
+      };
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(vaultReadCalled).toBe(false);
+      // `result.ca.resolve` is the REDACTED `CaApplyOutcome` (fingerprint
+      // only, never a raw cert) — see `redactCaResolve`'s own dedicated
+      // tests in apply-ca.test.ts for the redaction-boundary assertion.
+      expect(result.ca.resolve.status).toBe('reused');
+    });
+
     it('unknown registry presence with no prior lock -> REFUSES to mint (honest-unknown, never guesses)', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT]);

@@ -159,6 +159,117 @@ describe('resolveCaCert — mint-or-reuse decision table', () => {
     if (outcome.status === 'failed') expect(outcome.reason).toMatch(/orphan/);
   });
 
+  // --- groundnuty/macf#978 — the vault-restore fallback for the exact
+  // "lock has ca_key, registry ABSENT" shape `macf fleet deactivate` leaves
+  // behind. ---
+
+  const REFUSAL_TEXT_NO_VAULT =
+    'fleet.lock records a previously-minted CA key, but the registry var "DEMO_FLEET_CA_CERT" is not confirmable ' +
+    'present (observed: absent) — refusing to mint a REPLACEMENT (would orphan the already' +
+    '-vaulted key, the #799 failure class). Re-materializing the cert from the vaulted key needs a vault ' +
+    'read (DR-043 Amendment D phase 3+), not a fresh mint. Investigate manually.';
+
+  it('lock HAS ca_key, registry ABSENT, readVaultCaCert NOT supplied -> REFUSES with the EXACT pre-#978 text, byte-identical', async () => {
+    const outcome = await resolveCaCert(
+      'demo-fleet',
+      REGISTRY,
+      true,
+      ['age1x'],
+      mintDepsWith({ checkRegistryPresence: async () => 'absent' }), // no readVaultCaCert field at all
+    );
+    expect(outcome).toEqual({ status: 'failed', reason: REFUSAL_TEXT_NO_VAULT });
+  });
+
+  it('lock HAS ca_key, registry ABSENT, readVaultCaCert returns a cert -> RESTORES, never mints', async () => {
+    let mintCalled = false;
+    let vaultReadForProject: string | undefined;
+    const outcome = await resolveCaCert(
+      'demo-fleet',
+      REGISTRY,
+      true,
+      ['age1x'],
+      mintDepsWith({
+        checkRegistryPresence: async () => 'absent',
+        mintCa: async () => { mintCalled = true; return { certPem: 'x', keyPem: 'y' }; },
+        readVaultCaCert: async (project) => {
+          vaultReadForProject = project;
+          return 'VAULT-RESTORED-CERT-PEM';
+        },
+      }),
+    );
+    expect(mintCalled).toBe(false);
+    expect(outcome).toEqual({ status: 'restored', certPem: 'VAULT-RESTORED-CERT-PEM' });
+    expect(vaultReadForProject).toBe('demo-fleet');
+  });
+
+  it('lock HAS ca_key, registry ABSENT, readVaultCaCert returns undefined (vault has nothing for this fleet) -> REFUSES, same text as the no-vault case', async () => {
+    let mintCalled = false;
+    const outcome = await resolveCaCert(
+      'demo-fleet',
+      REGISTRY,
+      true,
+      ['age1x'],
+      mintDepsWith({
+        checkRegistryPresence: async () => 'absent',
+        mintCa: async () => { mintCalled = true; return { certPem: 'x', keyPem: 'y' }; },
+        readVaultCaCert: async () => undefined,
+      }),
+    );
+    expect(mintCalled).toBe(false);
+    expect(outcome).toEqual({ status: 'failed', reason: REFUSAL_TEXT_NO_VAULT });
+  });
+
+  it('lock HAS ca_key, registry ABSENT, readVaultCaCert THROWS -> REFUSES, never propagates, never a false restore', async () => {
+    let mintCalled = false;
+    const outcome = await resolveCaCert(
+      'demo-fleet',
+      REGISTRY,
+      true,
+      ['age1x'],
+      mintDepsWith({
+        checkRegistryPresence: async () => 'absent',
+        mintCa: async () => { mintCalled = true; return { certPem: 'x', keyPem: 'y' }; },
+        readVaultCaCert: async () => { throw new Error('simulated: age decrypt failed'); },
+      }),
+    );
+    expect(mintCalled).toBe(false);
+    expect(outcome).toEqual({ status: 'failed', reason: REFUSAL_TEXT_NO_VAULT });
+  });
+
+  it('lock HAS ca_key, registry UNKNOWN (not absent), readVaultCaCert supplied -> REFUSES WITHOUT calling the vault (honest-unknown floor: never chase a maybe)', async () => {
+    let vaultReadCalled = false;
+    const outcome = await resolveCaCert(
+      'demo-fleet',
+      REGISTRY,
+      true,
+      ['age1x'],
+      mintDepsWith({
+        checkRegistryPresence: async () => 'unknown',
+        readVaultCaCert: async () => { vaultReadCalled = true; return 'SHOULD-NOT-BE-USED'; },
+      }),
+    );
+    expect(vaultReadCalled).toBe(false);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/orphan/);
+  });
+
+  it('lock HAS ca_key, registry PRESENT, readVaultCaCert supplied -> REUSES WITHOUT calling the vault (nothing to repair)', async () => {
+    let vaultReadCalled = false;
+    const outcome = await resolveCaCert(
+      'demo-fleet',
+      REGISTRY,
+      true,
+      ['age1x'],
+      mintDepsWith({
+        checkRegistryPresence: async () => 'present',
+        readRegistryVariable: async () => 'EXISTING-CERT-PEM',
+        readVaultCaCert: async () => { vaultReadCalled = true; return 'SHOULD-NOT-BE-USED'; },
+      }),
+    );
+    expect(vaultReadCalled).toBe(false);
+    expect(outcome).toEqual({ status: 'reused', certPem: 'EXISTING-CERT-PEM' });
+  });
+
   it('a throwing checkRegistryPresence resolves to failed, never propagates', async () => {
     const outcome = await resolveCaCert(
       'demo-fleet',
@@ -188,6 +299,13 @@ describe('redactCaResolve — the security-critical redaction boundary', () => {
     const redacted = redactCaResolve({ status: 'reused', certPem: 'SECRET-CERT-PEM' });
     expect(redacted).toEqual({ status: 'reused', certFingerprint: expect.any(String) });
     expect(JSON.stringify(redacted)).not.toContain('SECRET-CERT-PEM');
+  });
+
+  it('a RESTORED outcome (groundnuty/macf#978) carries a fingerprint but NEVER certPem', () => {
+    const redacted = redactCaResolve({ status: 'restored', certPem: 'VAULT-RESTORED-CERT-PEM' });
+    expect(redacted).toEqual({ status: 'restored', certFingerprint: expect.any(String) });
+    expect(JSON.stringify(redacted)).not.toContain('VAULT-RESTORED-CERT-PEM');
+    expect(redacted).not.toHaveProperty('certPem');
   });
 
   it('a FAILED outcome carries only the reason', () => {

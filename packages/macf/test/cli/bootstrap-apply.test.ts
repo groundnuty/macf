@@ -1658,6 +1658,50 @@ describe('resolveMutateDeps — vault-aware resolveKeyPath + cleanupVaultScratch
     const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map(), SENTINEL_RUNNER_TOKEN, '/fake/operator-key.txt');
     expect(deps.vaultRecipientDeps).toBeUndefined();
   });
+
+  // --- trustDeps.readVaultCaCert threading (DR-043 Amendment D phase 3, groundnuty/macf#978) ---
+
+  it('trustDeps.readVaultCaCert is undefined when NEITHER vaultPath nor identityKeyPath is supplied — byte-identical to pre-#978 wiring', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml');
+    expect(deps.trustDeps.readVaultCaCert).toBeUndefined();
+  });
+
+  it('trustDeps.readVaultCaCert is undefined when only identityKeyPath is supplied (no vaultPath) — both-or-neither', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map(), SENTINEL_RUNNER_TOKEN, '/fake/operator-key.txt', undefined);
+    expect(deps.trustDeps.readVaultCaCert).toBeUndefined();
+  });
+
+  it('trustDeps.readVaultCaCert is undefined when only vaultPath is supplied (no identityKeyPath) — both-or-neither', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map(), SENTINEL_RUNNER_TOKEN, undefined, '/fake/vault.age');
+    expect(deps.trustDeps.readVaultCaCert).toBeUndefined();
+  });
+
+  it('trustDeps.readVaultCaCert is wired (a function) when BOTH vaultPath and identityKeyPath are supplied', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map(), SENTINEL_RUNNER_TOKEN, '/fake/operator-key.txt', '/fake/vault.age');
+    expect(typeof deps.trustDeps.readVaultCaCert).toBe('function');
+  });
+
+  it('the wired readVaultCaCert degrades to undefined (never throws) against a genuinely missing vault file, and logs no CA material', async () => {
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const deps = resolveMutateDeps(
+        '/tmp/nonexistent/fleet.yaml',
+        new Map(),
+        SENTINEL_RUNNER_TOKEN,
+        '/definitely/not/a/real/identity-key',
+        '/definitely/not/a/real/vault.age',
+      );
+      await expect(deps.trustDeps.readVaultCaCert?.('demo-fleet')).resolves.toBeUndefined();
+      const logged = stderrSpy.mock.calls.map((c) => String(c[0] ?? '')).join('\n');
+      expect(logged).toMatch(/CA vault-restore UNAVAILABLE/);
+      // The diagnostic carries the VaultError's (pre-scrubbed) reason, never
+      // a PEM — there is no cert/key material to leak here since the vault
+      // never even existed, but the assertion pins the never-a-PEM shape.
+      expect(logged).not.toMatch(/-----BEGIN/);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
 });
 
 // --- Pure result-rendering helpers ---
