@@ -35,6 +35,39 @@ const FULL = {
   pem: '-----BEGIN RSA PRIVATE KEY-----\nMII...\n-----END RSA PRIVATE KEY-----\n',
 };
 
+/**
+ * groundnuty/macf#971 — gate 2's exact rendered output, captured from
+ * `renderInstallInterstitial` on `main` BEFORE this issue's change (which
+ * touches gate 1 only). Gate 2 must come out of this issue byte-identical;
+ * see the "gate 2's rendered HTML is BYTE-IDENTICAL" test below.
+ */
+const GATE2_GOLDEN_HTML = `<!doctype html>
+<html><head><meta charset="utf-8"><title>Consent gate 2 of 2 — installing demo-fleet-runner-ops</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+  .dim { color: #666; }
+  .why { background: #fff3cd; border: 1px solid #d0a02e; border-radius: 4px; padding: 0.75rem 1rem; }
+  .button { display: inline-block; margin-top: 1rem; padding: 0.6rem 1.2rem; background: #1f6feb; color: #fff;
+            text-decoration: none; border-radius: 6px; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Consent gate 2 of 2 — role "runner-ops"</h1>
+<p>Installing GitHub App: <strong>demo-fleet-runner-ops</strong></p>
+<p>On the page this button opens, GitHub will ask which repositories to install this App on. You MUST choose:</p>
+<ul>
+  <li><strong>&ldquo;Only select repositories&rdquo;</strong> — NOT &ldquo;All repositories&rdquo;</li>
+</ul>
+<p>Then select exactly:</p>
+<ul>
+  <li><strong>exp-science-agent</strong> <span class="dim">(groundnuty/exp-science-agent)</span></li>
+  <li><strong>exp-code-agent</strong> <span class="dim">(groundnuty/exp-code-agent)</span></li>
+</ul>
+<p class="why">Why: this App holds administration:write; granting it every repository in the account is blast radius the fleet does not need, and apply will refuse an &quot;all&quot; install.</p>
+<p><a class="button" href="https://github.com/apps/demo-fleet-runner-ops/installations/new">Continue to GitHub to install</a></p>
+<p class="dim">If the button doesn't work, open this URL yourself: https://github.com/apps/demo-fleet-runner-ops/installations/new</p>
+</body></html>`;
+
 describe('normalizeConversionResponse (ported guards)', () => {
   it('normalizes the full response, stringifying the numeric id', () => {
     const c = normalizeConversionResponse(FULL);
@@ -102,15 +135,41 @@ describe('manifest-flow-server (pure parts)', () => {
     expect(html).toContain('demo-code-agent');
   });
 
-  // groundnuty/macf#952 — gate 1's served page carries the instruction: which
-  // App (role + name) is being created, and that the manifest is submitted
-  // as-is.
-  it('carries the gate-1 instruction: role, App name, and "submitted as-is" (groundnuty/macf#952)', () => {
+  // groundnuty/macf#971 — gate 1's served page is now a BARE redirect: it
+  // still identifies which App (role + name) is being created, but the
+  // explanation prose that used to live here (groundnuty/macf#952 via #962)
+  // is GONE — it moved to the terminal (apply-agent.test.ts's ordering
+  // test), because this page's own auto-submit script makes any prose here
+  // unreadable by construction.
+  it('still identifies role + App name + gate numbering (minimal, no-JS-fallback context)', () => {
     const html = renderManifestForm(manifest, 'https://github.com/settings/apps/new', 'code-agent');
     expect(html).toContain('role "code-agent"');
     expect(html).toContain('demo-code-agent'); // the App name (manifest.name)
-    expect(html).toMatch(/submitted.*as-is/);
     expect(html).toMatch(/consent gate 1 of 2/i);
+  });
+
+  it('no longer contains the moved explanation prose (groundnuty/macf#971 — it is unreadable by construction on an auto-submitting page)', () => {
+    const html = renderManifestForm(manifest, 'https://github.com/settings/apps/new', 'code-agent');
+    for (const removedProse of [
+      // Literal removed phrases only (not the bare word "submitted" — the
+      // manifest JSON is embedded in the page as an escaped `value`
+      // attribute, so a future `buildAppManifest` description containing
+      // that substring would fail this test for the wrong reason).
+      'This page automatically submits',
+      'submitted <strong>as-is</strong>',
+      'nothing here to review or edit',
+      'own confirmation page',
+      '&ldquo;Create GitHub App&rdquo;',
+    ]) {
+      expect(html).not.toContain(removedProse);
+    }
+  });
+
+  it('keeps the no-JS fallback: the manual "Continue to GitHub" button + the auto-submit script (groundnuty/macf#971)', () => {
+    const html = renderManifestForm(manifest, 'https://github.com/settings/apps/new', 'code-agent');
+    expect(html).toContain('<button type="submit">Continue to GitHub</button>');
+    expect(html).toContain("document.getElementById('macf-manifest-form').submit();");
+    expect(html).toMatch(/does not advance on its own/);
   });
 
   it('NEVER renders a secret on gate 1 — GitHubAppManifest has no credential field, and the rendered HTML proves it (groundnuty/macf#952)', () => {
@@ -181,6 +240,18 @@ describe('renderInstallInterstitial (groundnuty/macf#952 — pure)', () => {
     for (const sentinel of ['BEGIN RSA PRIVATE KEY', 'clientSecret', 'webhookSecret', 'client_secret', 'webhook_secret']) {
       expect(html).not.toContain(sentinel);
     }
+  });
+
+  // groundnuty/macf#971 — gate 2 is EXPLICITLY unchanged by this issue (it
+  // does not auto-submit, and is where a real choice — "Only select
+  // repositories" + which repos — actually gets made). Pinned byte-for-byte
+  // against a captured-before-this-change fixture so a future edit to THIS
+  // page cannot silently degrade the one page in the flow the operator
+  // actually reads. A deliberate future change to gate 2 updates this
+  // constant along with the code; that is the point of a pin, not a bug in
+  // this test.
+  it('gate 2\'s rendered HTML is BYTE-IDENTICAL to its pre-#971 fixture (pinned regression guard)', () => {
+    expect(renderInstallInterstitial(OPTS)).toBe(GATE2_GOLDEN_HTML);
   });
 });
 

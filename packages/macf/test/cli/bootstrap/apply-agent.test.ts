@@ -694,9 +694,23 @@ describe('startInstallInterstitial failure degrades, never throws (groundnuty/ma
 // asserts the instruction text EXISTS somewhere would pass even if it
 // printed AFTER the navigation — this test asserts the instruction is
 // logged strictly BEFORE `openUrl` is ever called, for BOTH gates.
+//
+// groundnuty/macf#971 extends this same discipline to gate 1's explanation
+// itself: #952/#962 put that explanation ON the served page, where gate 1's
+// own auto-submit script makes it unreadable BY CONSTRUCTION (confirmed live
+// by the operator — "if I cannot see them, I'm not sure why they are
+// there"). The explanation now lives ONLY in the terminal instructionLines
+// printed here. The decisive assertion below is therefore not just
+// "the instruction precedes openUrl" (already true structurally, since
+// `announceAndOpenGate` prints instructionLines before calling `openUrl`)
+// but that the ACTIONABLE clause — "click GitHub's own 'Create GitHub App'
+// button" — is IN that pre-openUrl terminal stream. That clause is the one
+// #971 requires to have moved off the auto-submitting page; a regression
+// that quietly drops it back onto the page (and out of the terminal) would
+// otherwise pass every other test in this file.
 
-describe('instruction-before-navigation ordering (the decisive test, groundnuty/macf#952)', () => {
-  it('gate 1: the "creating GitHub App" instruction is logged BEFORE openUrl(flow.startUrl) is called', async () => {
+describe('instruction-before-navigation ordering (the decisive test, groundnuty/macf#952 + #971)', () => {
+  it('gate 1: the App-name + as-is-submission + "Create GitHub App" click instructions are ALL logged BEFORE openUrl(flow.startUrl) is called', async () => {
     const events: string[] = [];
     const deps = baseDeps({
       log: (line: string) => { events.push(`log:${line}`); },
@@ -704,11 +718,23 @@ describe('instruction-before-navigation ordering (the decisive test, groundnuty/
     });
     await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
 
-    const instructionIndex = events.findIndex((e) => e.startsWith('log:') && /submitted AS-IS/i.test(e));
     const gate1OpenIndex = events.findIndex((e) => e === 'open:http://127.0.0.1:9/');
-    expect(instructionIndex).toBeGreaterThanOrEqual(0);
     expect(gate1OpenIndex).toBeGreaterThanOrEqual(0);
-    expect(instructionIndex).toBeLessThan(gate1OpenIndex);
+
+    // names the App (groundnuty/macf#971 requirement 1a — "which App").
+    const appNameIndex = events.findIndex((e) => e.startsWith('log:') && e.includes(AGENT.role) && /creating GitHub App/i.test(e));
+    // states the as-is submission (requirement 1b).
+    const asIsIndex = events.findIndex((e) => e.startsWith('log:') && /submitted AS-IS/i.test(e));
+    // THE decisive clause (requirement 1c, the actionable one): the next
+    // click is GitHub's OWN "Create GitHub App" button — this exact string
+    // must be in the TERMINAL stream, not only (as before #971) on a page
+    // nobody can read.
+    const clickInstructionIndex = events.findIndex((e) => e.startsWith('log:') && e.includes('Create GitHub App'));
+
+    for (const idx of [appNameIndex, asIsIndex, clickInstructionIndex]) {
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(idx).toBeLessThan(gate1OpenIndex);
+    }
   });
 
   it('gate 2: the interstitial PAGE is started + the "Only select repositories" instruction is logged, BOTH before openUrl(interstitial.startUrl)', async () => {
