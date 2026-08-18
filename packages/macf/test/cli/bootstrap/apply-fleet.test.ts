@@ -1508,7 +1508,7 @@ trust:
 
       expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
       const leg = result.routing['groundnuty/demo-code'];
-      expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/no usable self-hosted runner became visible/);
+      expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/MACF_TRUSTED_ACTORS was NOT written/);
     });
 
     it('runner registration UNKNOWN -> ALSO refuses the write (honest-unknown, never treated as present)', async () => {
@@ -1536,7 +1536,7 @@ trust:
       const rendered = formatApplyResult(result);
 
       expect(rendered).toContain('groundnuty/demo-code: SKIPPED —');
-      expect(rendered).toContain('no usable self-hosted runner became visible');
+      expect(rendered).toContain('MACF_TRUSTED_ACTORS was NOT written');
     });
 
     // --- macf#924 — the org-admin handover survives end-to-end into the rendered report ---
@@ -1562,7 +1562,7 @@ trust:
       const rendered = formatApplyResult(result);
 
       expect(rendered).toContain('groundnuty/demo-code: SKIPPED —');
-      expect(rendered).toContain('no usable self-hosted runner became visible');
+      expect(rendered).toContain('MACF_TRUSTED_ACTORS was NOT written');
       expect(rendered).toContain('an org admin must add this repo at');
       expect(rendered).toContain('runner-groups/7');
     });
@@ -1689,7 +1689,7 @@ trust:
 
       expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
       const leg = result.routing['groundnuty/demo-code'];
-      expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/no usable self-hosted runner became visible/);
+      expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/MACF_TRUSTED_ACTORS was NOT written/);
       // The decisive assertion: exactly ONE call, not the ~200 a 600s/3s poll
       // would produce, and not zero (a single LIVE check still runs — it's
       // the RETRY LOOP that's skipped, never the one-shot presence read; see

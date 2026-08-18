@@ -432,7 +432,7 @@ describe('publishTrustedActorsGated — justCreatedRepos (macf#972)', () => {
     expect(sleepCalls).toBe(0);
   });
 
-  it('the fast-path skip reason is BYTE-IDENTICAL to what a full-window poll-exhausted reason says — same message, only the timing changes', async () => {
+  it('the fast-path skip reason does NOT claim a poll window it never entered, but keeps the poll path\'s remedy clause verbatim (macf#972)', async () => {
     const deps = depsWith({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) });
     // Neither call overrides `timeoutMs` — both use the SAME default 600s
     // budget the message names. The "polled" comparison fast-forwards via an
@@ -448,9 +448,20 @@ describe('publishTrustedActorsGated — justCreatedRepos (macf#972)', () => {
         clock += ms;
       },
     });
-    expect((fast['a/b'] as { reason: string }).reason).toBe((polled['a/b'] as { reason: string }).reason);
-    expect((fast['a/b'] as { reason: string }).reason).toMatch(/no usable self-hosted runner became visible/);
-    expect((fast['a/b'] as { reason: string }).reason).toContain('600s poll window'); // the CONFIGURED (default) budget, not the ~0ms actually spent
+    const fastReason = (fast['a/b'] as { reason: string }).reason;
+    const polledReason = (polled['a/b'] as { reason: string }).reason;
+    // The fast path waited ZERO ms. A message asserting "within the 600s poll
+    // window" would describe work the program did not do — the same dishonesty
+    // this catalog exists to prevent, so the elapsed claim MUST be absent and
+    // the actual cause named instead.
+    expect(fastReason).not.toContain('poll window');
+    expect(fastReason).toContain('created during THIS run');
+    // …while the poll path, which really did wait, still says so.
+    expect(polledReason).toContain('poll window');
+    // Both keep the identical remedy clause — operators and macf#932's
+    // pre-flight reference it, so it must not drift between paths.
+    expect(fastReason).toContain('MACF_TRUSTED_ACTORS was NOT written');
+    expect(polledReason).toContain('MACF_TRUSTED_ACTORS was NOT written');
   });
 
   it('repo created this run, but a runner IS already usable at t=0 (e.g. an org-wide runner group) -> still writes, same as today', async () => {

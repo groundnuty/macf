@@ -345,6 +345,32 @@ export function checkRunnerTokenPreflight(
  * change WHY a runner is unusable, only WHETHER `apply` waited for it) with
  * the token-specific framing + the concrete re-run remedy.
  */
+/**
+ * The skip reason for the macf#972 FAST PATH — a repo created in THIS run,
+ * where no poll was performed because none could succeed.
+ *
+ * Deliberately NOT {@link runnerTokenPollExhaustedReason}: that text says
+ * "within the Ns poll window", which on this path would assert a wait that
+ * never happened. A message describing work the program did not do is the
+ * same dishonesty this catalog exists to prevent, so the elapsed claim is
+ * dropped and the CAUSE is named instead. The remedy clause is kept
+ * verbatim — operators and macf#932's pre-flight both reference it.
+ */
+export function runnerJustCreatedRepoReason(repo: string, usability: RunnerUsability): string {
+  const cause =
+    usability.presence === 'unknown'
+      ? 'could not confirm whether a self-hosted runner is registered (auth / network / insufficient scope)'
+      : 'no usable self-hosted runner is registered yet — this repo was created during THIS run, so none can have registered on its own';
+  const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
+  const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
+  return (
+    `role/repo "${repo}": a runner registration token was supplied (macf#929) but ${cause} — ` +
+    'MACF_TRUSTED_ACTORS was NOT written; this repo routes on hosted runners (billed on private repos) ' +
+    'until a runner is confirmed. Register a runner for this repo, then re-run `macf bootstrap apply`.' +
+    `${detailSuffix}${handoverSuffix}`
+  );
+}
+
 export function runnerTokenPollExhaustedReason(repo: string, usability: RunnerUsability, timeoutMs: number): string {
   const cause =
     usability.presence === 'unknown'
@@ -564,7 +590,12 @@ export async function publishTrustedActorsGated(
       continue;
     }
     if (usability.presence !== 'present') {
-      out[repo] = { status: 'skipped', reason: runnerTokenPollExhaustedReason(repo, usability, timeoutMs) };
+      out[repo] = {
+        status: 'skipped',
+        reason: pollJustified
+          ? runnerTokenPollExhaustedReason(repo, usability, timeoutMs)
+          : runnerJustCreatedRepoReason(repo, usability),
+      };
       continue;
     }
     out[repo] = await writeTrustedActorsVar(repo, value, deps);
