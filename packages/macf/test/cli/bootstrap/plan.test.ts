@@ -7,6 +7,7 @@
 import { describe, it, expect } from 'vitest';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import {
+  APPLY_UNIMPLEMENTED_REASONS,
   computePlan,
   fleetPlanToJson,
   formatPlanText,
@@ -163,7 +164,7 @@ describe('computePlan — per-repo CA drift (macf#806 reproduction, macf#839 rev
 describe('computePlan — all-match observed state → all noops', () => {
   it('every per-agent resource + CA (registry + per-repo) + routing is noop when fully observed-matching', () => {
     const manifest = baseManifest({
-      routing: { runner: { runs_on: 'self-hosted' } },
+      routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
       trust: { ca: 'per-project', federated_cas: [] },
     });
     const observed: ObservedState = {
@@ -205,9 +206,10 @@ describe('computePlan — all-match observed state → all noops', () => {
 
     const plan = computePlan(manifest, observed);
     // 5 × 2 agents (app/repo/install/secret_fingerprint/labels) + caRegistry +
-    // 2 caRepo + routing + 2 routing_client + the fleet-level runner_ops
-    // item (groundnuty/macf#943; control_repo item absent — not archived).
-    expect(plan.items).toHaveLength(17);
+    // 2 caRepo + routing + runner_warm (macf#942) + 2 routing_client + the
+    // fleet-level runner_ops item (groundnuty/macf#943; control_repo item
+    // absent — not archived).
+    expect(plan.items).toHaveLength(18);
     for (const item of plan.items) {
       // `labels` is a structural exception: it has NO plan-time observed
       // read at all (see `labelsItem`'s doc — a per-label API read is out of
@@ -215,9 +217,12 @@ describe('computePlan — all-match observed state → all noops', () => {
       // regardless of how "matched" everything else is. `runner_ops`
       // is the SAME shape here (groundnuty/macf#943) — this test's
       // `observed.lock` is `null` (never simulated), so its presence can
-      // only degrade to `unknown` → `create`, same as `labels`. Every other
-      // kind genuinely observed-matches here.
-      if (item.kind === 'labels' || item.kind === 'runner_ops') {
+      // only degrade to `unknown` → `create`, same as `labels`. `runner_warm`
+      // (macf#942) is ALWAYS `create` too — there is no live-observable
+      // "already at this warm posture" signal to compare against (see
+      // `runnerWarmItem`'s doc). Every other kind genuinely observed-matches
+      // here.
+      if (item.kind === 'labels' || item.kind === 'runner_ops' || item.kind === 'runner_warm') {
         expect(item.verb).toBe('create');
       } else {
         expect(item.verb).toBe('noop');
@@ -229,7 +234,7 @@ describe('computePlan — all-match observed state → all noops', () => {
 
 describe('computePlan — a version/config mismatch → update + confirm_required', () => {
   it('flags a MACF_TRUSTED_ACTORS drift as update, confirm-required, naming the runner class', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted', routingRunnerRegistered: 'present' };
 
     const plan = computePlan(manifest, observed);
@@ -243,7 +248,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   });
 
   it('does not flag update when the observed value already matches', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = {
       ...EMPTY_OBSERVED,
       routingTrustedActors: 'icsoc-2026-science-agent[bot] icsoc-2026-code-agent[bot]',
@@ -257,7 +262,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   // --- macf#922 — runs_on other than "self-hosted" needs no write at all ---
 
   it('a declared runs_on OTHER than "self-hosted" is a noop — no MACF_TRUSTED_ACTORS write is ever candidate', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'ubuntu-latest' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'ubuntu-latest', warm: 1 } } });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
     expect(routing?.verb).toBe('noop');
@@ -269,7 +274,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   // --- macf#922 requirement 4 — plan must name the runner CLASS (billing consequence) ---
 
   it('names "self-hosted" when a runner is confirmed registered', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: 'present' };
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
@@ -278,7 +283,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   });
 
   it('names "github-hosted (billed on private repos)" when no runner is confirmed registered — even though runs_on declares self-hosted', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: 'absent' };
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
@@ -287,7 +292,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   });
 
   it('names "github-hosted (billed on private repos)" when registration is UNKNOWN — never overclaims confidence', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: 'unknown' };
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
@@ -296,7 +301,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   });
 
   it('names "github-hosted (billed on private repos)" when registration was never checked (undefined) — the pre-macf#922 default', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
     expect(routing?.reason).toMatch(/Runner class: github-hosted \(billed on private repos\)/);
@@ -305,7 +310,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   // --- macf#924 — org-admin handover surfaces in the plan's runner-class line ---
 
   it('appends the org-admin handover to the runner-class reason when an org runner exists but excludes the repo', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = {
       ...EMPTY_OBSERVED,
       routingRunnerRegistered: 'absent',
@@ -326,7 +331,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   });
 
   it('never appends a handover when none was observed (the common absent/unknown case)', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: 'absent' };
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
@@ -341,7 +346,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
 
   it('always names the flag + env var when self-hosted is declared, regardless of registration status', () => {
     for (const registered of ['present', 'absent', 'unknown', undefined] as const) {
-      const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+      const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
       const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: registered };
       const plan = computePlan(manifest, observed);
       const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
@@ -351,7 +356,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   });
 
   it('also names the flag + env var on the observed-value-matches noop path (routingTrustedActors already correct)', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = {
       ...EMPTY_OBSERVED,
       routingTrustedActors: 'icsoc-2026-science-agent[bot] icsoc-2026-code-agent[bot]',
@@ -363,7 +368,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   });
 
   it('also names the flag + env var on the drifting-value update path', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted', routingRunnerRegistered: 'present' };
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
@@ -372,7 +377,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   });
 
   it('never appears when runs_on is declared but is NOT "self-hosted" — no write is ever a candidate, so nothing to require', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'ubuntu-latest' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'ubuntu-latest', warm: 1 } } });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
     expect(routing?.reason).not.toContain(RUNNER_TOKEN_FLAG);
@@ -388,7 +393,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   // --- macf#934 — capability detail surfaces in the plan's runner-class line, same resolution as the live gate ---
 
   it('appends the macf#934 capability detail (found-but-mislabeled) to the runner-class reason, without dropping the original wording', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = {
       ...EMPTY_OBSERVED,
       routingRunnerRegistered: 'absent',
@@ -407,7 +412,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   });
 
   it('appends BOTH the detail and the handover when both are observed (found-but-excluded org runner, macf#934 + macf#924 together)', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = {
       ...EMPTY_OBSERVED,
       routingRunnerRegistered: 'absent',
@@ -421,11 +426,78 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   });
 
   it('never appends a detail when none was observed (the common zero-runners absent/unknown case)', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: 'absent' };
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
     expect(routing?.reason).not.toMatch(/carries|offline|missing/);
+  });
+});
+
+// --- DR-043 Amendment I / groundnuty/macf#942 — the runner_warm plan item ---
+
+describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#942)', () => {
+  function warmItem(items: readonly PlanItem[]): PlanItem | undefined {
+    return itemFor(items, 'runner_warm', 'routing:icsoc-2026:runner:warm');
+  }
+
+  it('is ABSENT entirely when routing.runner is not declared — same "nothing was promised" gate as routingItem', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(warmItem(plan.items)).toBeUndefined();
+  });
+
+  it('is present as a create item, naming the declared default (1), when routing.runner is declared', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const item = warmItem(plan.items);
+    expect(item?.verb).toBe('create');
+    expect(item?.confirm_required).toBe(false);
+    expect(item?.reason).toContain('warm: 1');
+    expect(item?.reason).toContain('DR-009 §7.4');
+  });
+
+  // groundnuty/macf#942 §"The decisive test" — a manifest declaring
+  // `warm: 0` (a fleet explicitly declared dormant) must produce a plan
+  // whose un-actioned surface says so. This is the load-bearing case: apply
+  // does NOT yet enforce warm regardless of value, so a dormant fleet's
+  // runner stays warm until #943 wires the contract call — the plan must
+  // name that gap explicitly, not just parse the value silently.
+  it('DECISIVE: warm: 0 (a dormant fleet) still emits the item, naming the dormant state in the reason, AND surfaces in unimplementedByApply', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 0 } } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const item = warmItem(plan.items);
+    expect(item?.verb).toBe('create');
+    expect(item?.reason).toContain('warm: 0');
+    expect(item?.reason).toContain('this fleet is declared dormant');
+    const unimplemented = plan.unimplementedByApply.find((i) => i.kind === 'runner_warm');
+    expect(unimplemented).toBeDefined();
+    expect(unimplemented?.target).toBe('routing:icsoc-2026:runner:warm');
+    expect(unimplemented?.verb).toBe('create');
+    expect(unimplemented?.reason).toBe(APPLY_UNIMPLEMENTED_REASONS.runnerWarm);
+    expect(unimplemented?.reason).toContain('#943');
+  });
+
+  it('is NEVER implemented by apply — planItemApplyCoverage always returns not_implemented, regardless of verb (whole-kind gap, same shape as version/actions_pin)', () => {
+    expect(planItemApplyCoverage(fakeItem('runner_warm', 'create'))).toBe('not_implemented');
+    expect(planItemApplyCoverage(fakeItem('runner_warm', 'update'))).toBe('not_implemented');
+  });
+
+  it('noop/report-extra are still trivially implemented for runner_warm — nothing calls for action', () => {
+    expect(planItemApplyCoverage(fakeItem('runner_warm', 'noop'))).toBe('implemented');
+    expect(planItemApplyCoverage(fakeItem('runner_warm', 'report-extra'))).toBe('implemented');
+  });
+
+  it('the un-actioned reason names #943 as what will wire it, and never claims anything above was changed', () => {
+    expect(APPLY_UNIMPLEMENTED_REASONS.runnerWarm).toContain('groundnuty/macf#943');
+    expect(APPLY_UNIMPLEMENTED_REASONS.runnerWarm).toContain('nothing above was changed');
+  });
+
+  it('is present in EVERY plan that declares routing.runner — a fleet-level item, not per-agent', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 5 } } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const items = plan.items.filter((i) => i.kind === 'runner_warm');
+    expect(items).toHaveLength(1); // exactly ONE, not one per agent
+    expect(items[0]?.reason).toContain('warm: 5');
   });
 });
 
@@ -501,16 +573,17 @@ describe('computePlan — deterministic ordering', () => {
     ]);
   });
 
-  it('CA items (registry, then one per agent repo in manifest order), then routing_client per agent repo, precede routing, all after per-agent items', () => {
+  it('CA items (registry, then one per agent repo in manifest order), then routing_client per agent repo, precede routing, then runner_warm, all after per-agent items', () => {
     const manifest = baseManifest({
-      routing: { runner: { runs_on: 'self-hosted' } },
+      routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
       trust: { ca: 'per-project', federated_cas: [] },
     });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const kinds = plan.items.map((i) => i.kind);
     // 10 per-agent items, then 3 CA items (registry + 2 agent repos), then
-    // 2 routing_client items (one per agent repo), then routing.
-    expect(kinds.slice(-6)).toEqual(['ca', 'ca', 'ca', 'routing_client', 'routing_client', 'routing']);
+    // 2 routing_client items (one per agent repo), then routing, then
+    // runner_warm (macf#942 — pushed right after routingItem).
+    expect(kinds.slice(-7)).toEqual(['ca', 'ca', 'ca', 'routing_client', 'routing_client', 'routing', 'runner_warm']);
     const caTargets = plan.items.filter((i) => i.kind === 'ca').map((i) => i.target);
     expect(caTargets).toEqual([
       'ca:registry:ICSOC_2026_CA_CERT',
@@ -586,14 +659,15 @@ describe('computePlan — skippedSections (declared-but-deferred sections, no si
 
 describe('summarizePlan', () => {
   it('counts each verb independently', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
     const plan = computePlan(manifest, observed);
     const summary = summarizePlan(plan.items);
     // 10 per-agent creates (app/repo/install/secret_fingerprint/labels × 2) +
     // 3 CA creates (registry + 2 agent repos) + 2 routing_client creates +
-    // 1 runner_ops create (groundnuty/macf#943) + 1 routing update.
-    expect(summary).toEqual({ creates: 16, updates: 1, noops: 0, extras: 0 });
+    // 1 runner_ops create (groundnuty/macf#943) + 1 runner_warm create
+    // (macf#942) + 1 routing update.
+    expect(summary).toEqual({ creates: 17, updates: 1, noops: 0, extras: 0 });
   });
 });
 
@@ -671,27 +745,28 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
     expect(plan.unimplementedByApply).toEqual([]);
   });
 
-  it('ONLY flags a diverging routing value (update) — CA never appears', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+  it('flags a diverging routing value (update) AND the runner_warm posture (create, macf#942) — CA never appears', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
     const plan = computePlan(manifest, observed);
-    expect(plan.unimplementedByApply.map((i) => i.kind)).toEqual(['routing']);
+    expect(plan.unimplementedByApply.map((i) => i.kind)).toEqual(['routing', 'runner_warm']);
     expect(plan.unimplementedByApply[0]?.verb).toBe('update');
+    expect(plan.unimplementedByApply[1]?.verb).toBe('create');
     for (const item of plan.unimplementedByApply) {
       expect(item.reason.length).toBeGreaterThan(0);
       expect(item.reason).not.toBe(plan.items.find((p) => p.target === item.target)?.reason);
     }
   });
 
-  it('does NOT flag routing when it matches (noop) or is absent (create)', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+  it('does NOT flag routing when it matches (noop) or is absent (create) — runner_warm still appears regardless (macf#942: no enforcement path yet, independent of routing drift)', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const matching: ObservedState = {
       ...EMPTY_OBSERVED,
       routingTrustedActors: 'icsoc-2026-science-agent[bot] icsoc-2026-code-agent[bot]',
     };
-    expect(computePlan(manifest, matching).unimplementedByApply).toEqual([]);
+    expect(computePlan(manifest, matching).unimplementedByApply.map((i) => i.kind)).toEqual(['runner_warm']);
     const absent: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: undefined };
-    expect(computePlan(manifest, absent).unimplementedByApply).toEqual([]);
+    expect(computePlan(manifest, absent).unimplementedByApply.map((i) => i.kind)).toEqual(['runner_warm']);
   });
 
   it('NEVER flags repo — neither repo:create nor repo:noop (macf#857: ensureAgentRepo actions it)', () => {
@@ -725,9 +800,9 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
     expect(computePlan(baseManifest(), observedCaPresent).unimplementedByApply.some((i) => i.kind === 'ca')).toBe(false);
   });
 
-  it('is EMPTY when every item is noop/report-extra (fully-provisioned fleet, incl. routing)', () => {
+  it('ONLY carries runner_warm (macf#942, no enforcement path yet) when every OTHER item is noop/report-extra (fully-provisioned fleet, incl. routing)', () => {
     const manifest = baseManifest({
-      routing: { runner: { runs_on: 'self-hosted' } },
+      routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
       trust: { ca: 'per-project', federated_cas: [] },
     });
     const observed: ObservedState = {
@@ -759,25 +834,31 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
       controlRepoPresence: 'absent',
     };
     const plan = computePlan(manifest, observed);
-    expect(plan.unimplementedByApply).toEqual([]);
+    // macf#942 (DR-043 Amendment I) — runner_warm is a whole-kind gap
+    // (planItemApplyCoverage's 'runner_warm' case), so it stays un-actioned
+    // even when routing itself fully matches (noop) — every OTHER kind here
+    // is genuinely implemented-or-noop.
+    expect(plan.unimplementedByApply.map((i) => i.kind)).toEqual(['runner_warm']);
   });
 
   it('formatUnimplementedLines renders the exact loud-line shape, distinct wording from SKIPPED', () => {
-    // macf#838 Amendment D phase 2: CA is fully implemented now — the ONE
-    // remaining unimplemented case is a diverging routing value.
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    // macf#838 Amendment D phase 2 + macf#942: CA is fully implemented now —
+    // the two remaining unimplemented cases are a diverging routing value and
+    // the not-yet-enforced runner_warm posture.
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
     const plan = computePlan(manifest, observed);
     const lines = formatUnimplementedLines(plan.unimplementedByApply);
-    expect(lines.length).toBe(1);
+    expect(lines.length).toBe(2);
+    expect(lines[0]).toMatch(/^routing:.* \(update\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
+    expect(lines[1]).toMatch(/^runner_warm:.* \(create\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
     for (const line of lines) {
-      expect(line).toMatch(/^routing:.* \(update\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
       expect(line).not.toContain('SKIPPED');
     }
   });
 
   it('formatPlanText includes the ⚠ NOT IMPLEMENTED block when unimplementedByApply is non-empty', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted' } } });
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
     const plan = computePlan(manifest, observed);
     const text = formatPlanText(plan);

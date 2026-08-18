@@ -162,6 +162,26 @@ export const FleetRoutingRunnerSchema = z
      * the router's contract (macf#934).
      */
     labels: z.array(z.string().min(1)).optional(),
+    /**
+     * Per-fleet hibernation posture for the runner-provisioning contract's
+     * `warm` argument (groundnuty/macf#942, DR-043 Amendment I). DR-009
+     * §7.4: *"latency above all; `warm: 1` is mandatory, not a default to
+     * tune"* — so this is optional-with-default, not merely optional:
+     * every parsed manifest carries a concrete `warm` value, defaulting to
+     * **1**. `0` is meaningful only for a fleet explicitly declared
+     * dormant.
+     *
+     * **Not yet enforced.** `apply` does not yet call the runner-
+     * provisioning contract (`repo`/`labels`/`warm`) that would act on this
+     * value — that wiring is groundnuty/macf#943, still blocked. Declaring
+     * `warm` here only RECORDS the posture; `plan.ts`'s
+     * `planItemApplyCoverage` (groundnuty/macf#861's honest-state
+     * mechanism) surfaces this loudly as NOT IMPLEMENTED BY APPLY on every
+     * `macf bootstrap plan` run, rather than silently accepting a value
+     * nothing acts on — see `plan.ts`'s `runnerWarmItem` +
+     * `APPLY_UNIMPLEMENTED_REASONS.runnerWarm`.
+     */
+    warm: z.number().int().nonnegative().default(1),
   })
   .strict();
 

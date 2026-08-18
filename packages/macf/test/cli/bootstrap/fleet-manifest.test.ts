@@ -123,7 +123,10 @@ describe('parseFleetManifest — valid DR-043 §D1 worked example', () => {
 
   it('parses routing, shared, and trust', () => {
     const manifest = parseFleetManifest(VALID_FLEET_YAML);
-    expect(manifest.routing).toEqual({ runner: { runs_on: 'self-hosted' } });
+    // macf#942 (DR-043 Amendment I) — `warm` defaults to 1 even though the
+    // worked example above never declares it; see the dedicated "warm"
+    // describe block below for the full default/range/coverage story.
+    expect(manifest.routing).toEqual({ runner: { runs_on: 'self-hosted', warm: 1 } });
     expect(manifest.shared).toEqual({ routing_app: 'macf-routing', ts_oauth: 'operator-supplied' });
     expect(manifest.trust).toEqual({ ca: 'per-project', federated_cas: [] });
   });
@@ -259,6 +262,70 @@ describe('parseFleetManifest — routing.runner.labels cross-check against ROUTE
       'routing:\n  runner:\n    runs_on: self-hosted\n    labels: [arc-runner]',
     );
     expect(() => parseFleetManifest(withLabels)).toThrow(/missing: \[self-hosted, macf-vm\]/);
+  });
+});
+
+describe('parseFleetManifest — routing.runner.warm (macf#942, DR-043 Amendment I, DR-009 §7.4)', () => {
+  function withWarm(value: string): string {
+    return VALID_FLEET_YAML.replace(
+      'routing:\n  runner:\n    runs_on: self-hosted',
+      `routing:\n  runner:\n    runs_on: self-hosted\n    warm: ${value}`,
+    );
+  }
+
+  it.each([0, 1, 5])('warm: %i parses, and the PARSED value round-trips exactly (not just "parses without throwing")', (value) => {
+    const manifest = parseFleetManifest(withWarm(String(value)));
+    expect(manifest.routing?.runner.warm).toBe(value);
+  });
+
+  it('omitting warm entirely defaults the PARSED value to 1 (DR-009 §7.4 — mandatory, not a default to tune)', () => {
+    const manifest = parseFleetManifest(VALID_FLEET_YAML);
+    expect(manifest.routing?.runner.warm).toBe(1);
+  });
+
+  it('rejects a negative warm value', () => {
+    expect(() => parseFleetManifest(withWarm('-1'))).toThrow();
+  });
+
+  it('rejects a non-integer warm value', () => {
+    expect(() => parseFleetManifest(withWarm('1.5'))).toThrow();
+  });
+
+  it('rejects a non-numeric warm value', () => {
+    expect(() => parseFleetManifest(withWarm('"dormant"'))).toThrow();
+  });
+
+  it('a manifest without routing.runner declared at all still parses unchanged — warm never fires a gate on a fleet with no routing section', () => {
+    const minimal = VALID_FLEET_YAML.replace(/routing:\n {2}runner:\n {4}runs_on: self-hosted\n\n/, '');
+    const manifest = parseFleetManifest(minimal);
+    expect(manifest.routing).toBeUndefined();
+  });
+
+  // macf#942 §"Do NOT add `name` or `scope`" — pins that `.strict()` is
+  // still intact on `FleetRoutingRunnerSchema` after this change; adding
+  // `warm` must not have loosened the schema for OTHER unknown keys.
+  it('still REJECTS `name` on routing.runner — `.strict()` is intact', () => {
+    const bad = VALID_FLEET_YAML.replace(
+      'routing:\n  runner:\n    runs_on: self-hosted',
+      'routing:\n  runner:\n    runs_on: self-hosted\n    name: some-runner',
+    );
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+
+  it('still REJECTS `scope` on routing.runner — `.strict()` is intact', () => {
+    const bad = VALID_FLEET_YAML.replace(
+      'routing:\n  runner:\n    runs_on: self-hosted',
+      'routing:\n  runner:\n    runs_on: self-hosted\n    scope: org',
+    );
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+
+  it('still REJECTS `name` AND `scope` together, even alongside a valid warm value', () => {
+    const bad = VALID_FLEET_YAML.replace(
+      'routing:\n  runner:\n    runs_on: self-hosted',
+      'routing:\n  runner:\n    runs_on: self-hosted\n    warm: 1\n    name: some-runner\n    scope: org',
+    );
+    expect(() => parseFleetManifest(bad)).toThrow();
   });
 });
 

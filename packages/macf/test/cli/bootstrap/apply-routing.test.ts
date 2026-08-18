@@ -400,15 +400,15 @@ describe('checkRunnerTokenPreflight (macf#932)', () => {
   });
 
   it('undefined (proceeds) when runs_on is declared but is NOT "self-hosted" — no write is ever a candidate, so no token is needed', () => {
-    expect(checkRunnerTokenPreflight({ runner: { runs_on: 'ubuntu-latest' } }, undefined)).toBeUndefined();
+    expect(checkRunnerTokenPreflight({ runner: { runs_on: 'ubuntu-latest', warm: 1 } }, undefined)).toBeUndefined();
   });
 
   it('undefined (proceeds) when a non-empty token IS resolved', () => {
-    expect(checkRunnerTokenPreflight({ runner: { runs_on: 'self-hosted' } }, 'ghr-sentinel-token')).toBeUndefined();
+    expect(checkRunnerTokenPreflight({ runner: { runs_on: 'self-hosted', warm: 1 } }, 'ghr-sentinel-token')).toBeUndefined();
   });
 
   it('refuses when self-hosted is declared and no token was resolved (undefined)', () => {
-    const failure = checkRunnerTokenPreflight({ runner: { runs_on: 'self-hosted' } }, undefined);
+    const failure = checkRunnerTokenPreflight({ runner: { runs_on: 'self-hosted', warm: 1 } }, undefined);
     expect(failure?.code).toBe(RUNNER_TOKEN_MISSING_CODE);
     // Reuses noRunnerTokenReason() VERBATIM — same message the late gate
     // (publishTrustedActorsGated) has always shown, only fired earlier.
@@ -416,13 +416,13 @@ describe('checkRunnerTokenPreflight (macf#932)', () => {
   });
 
   it('refuses on an empty-string token too — matches publishTrustedActorsGated\'s own empty-is-no-token rule', () => {
-    const failure = checkRunnerTokenPreflight({ runner: { runs_on: 'self-hosted' } }, '');
+    const failure = checkRunnerTokenPreflight({ runner: { runs_on: 'self-hosted', warm: 1 } }, '');
     expect(failure?.code).toBe(RUNNER_TOKEN_MISSING_CODE);
     expect(failure?.message).toBe(noRunnerTokenReason());
   });
 
   it('the refusal message names the flag, the env var, and the gh-api command — never a token VALUE', () => {
-    const failure = checkRunnerTokenPreflight({ runner: { runs_on: 'self-hosted' } }, undefined);
+    const failure = checkRunnerTokenPreflight({ runner: { runs_on: 'self-hosted', warm: 1 } }, undefined);
     expect(failure?.message).toContain(RUNNER_TOKEN_FLAG);
     expect(failure?.message).toContain(RUNNER_TOKEN_ENV_VAR);
     expect(failure?.message).toContain('gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token');

@@ -52,10 +52,12 @@ const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, caRegistry: 'unk
  * (mint-or-reuse + two-place publish), so `VALID_FLEET_YAML` + `EMPTY_OBSERVED`
  * alone no longer produce an `unimplemented_by_apply` entry. These two
  * fixtures add a `routing:` declaration + an observed value that DIVERGES
- * from it (`update` verb — the ONE case that still legitimately reads
- * `unimplemented_by_apply`, since apply's create-only posture never
- * overwrites a present-but-diverging value) for the tests that specifically
- * exercise that render.
+ * from it (`update` verb — apply's create-only posture never overwrites a
+ * present-but-diverging value) for the tests that specifically exercise that
+ * render. **Since groundnuty/macf#942** (DR-043 Amendment I), declaring
+ * `routing.runner` ALSO always emits a `runner_warm` item (the `warm` field
+ * it defaults to has no enforcement path yet, groundnuty/macf#943) — so these
+ * fixtures now exercise TWO honest gaps, not one.
  */
 const VALID_FLEET_YAML_WITH_ROUTING = VALID_FLEET_YAML.replace(
   'agents:\n',
@@ -152,7 +154,7 @@ describe('runBootstrapPlan', () => {
     expect(json.unimplemented_by_apply).toEqual([]);
   });
 
-  it('--json ALSO carries a diverging routing value under unimplemented_by_apply — the one remaining honest gap (macf#838 Amendment D phase 2)', async () => {
+  it('--json ALSO carries a diverging routing value + the runner_warm posture under unimplemented_by_apply — the two remaining honest gaps (macf#838 Amendment D phase 2 + macf#942)', async () => {
     const { dir, file } = writeManifest(VALID_FLEET_YAML_WITH_ROUTING);
     dirs.push(dir);
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -162,9 +164,10 @@ describe('runBootstrapPlan', () => {
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
       unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
     };
-    expect(json.unimplemented_by_apply.length).toBe(1);
-    expect(json.unimplemented_by_apply[0]?.kind).toBe('routing');
+    expect(json.unimplemented_by_apply.length).toBe(2);
+    expect(json.unimplemented_by_apply.map((i) => i.kind)).toEqual(['routing', 'runner_warm']);
     expect(json.unimplemented_by_apply[0]?.verb).toBe('update');
+    expect(json.unimplemented_by_apply[1]?.verb).toBe('create');
     expect(json.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(false);
   });
 

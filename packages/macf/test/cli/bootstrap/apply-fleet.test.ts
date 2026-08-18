@@ -1425,7 +1425,7 @@ trust:
 
     it('routing.runner declared self-hosted -> writes MACF_TRUSTED_ACTORS to every confirmed agent repo, never the control repo', async () => {
       const manifestPath = manifestPathIn();
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
@@ -1461,7 +1461,7 @@ trust:
     // at all (matches plan.ts::routingItem's own noop branch).
     it('routing.runner declared with runs_on OTHER than "self-hosted" -> the routing map is empty, nothing attempted', async () => {
       const manifestPath = manifestPathIn();
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'ubuntu-latest' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'ubuntu-latest', warm: 1 } } };
       let createRepoVarCalled = 0;
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
@@ -1481,7 +1481,7 @@ trust:
 
     it('routing: a repo where the var is ALREADY PRESENT is left untouched (create-only)', async () => {
       const manifestPath = manifestPathIn();
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         trustDeps: trustDepsFor({
@@ -1497,7 +1497,7 @@ trust:
 
     it('token supplied, runner never appears within the poll window -> MACF_TRUSTED_ACTORS is NOT written for that repo; the gap is reported as "skipped" with a reason, never silent (macf#929: timeoutMs 0 makes the poll a single check — no real wall-clock wait)', async () => {
       const manifestPath = manifestPathIn();
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
@@ -1512,7 +1512,7 @@ trust:
 
     it('runner registration UNKNOWN -> ALSO refuses the write (honest-unknown, never treated as present)', async () => {
       const manifestPath = manifestPathIn();
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'unknown' }) }),
@@ -1525,7 +1525,7 @@ trust:
 
     it('this gap surfaces through formatApplyResult\'s routing summary — visible even under --yes, which skips the pre-approval plan render', async () => {
       const manifestPath = manifestPathIn();
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
@@ -1542,7 +1542,7 @@ trust:
 
     it('an org-admin handover (macf#924 — org runner exists, group excludes the repo) renders through formatApplyResult, not just the raw outcome map', async () => {
       const manifestPath = manifestPathIn();
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         trustDeps: trustDepsFor({
@@ -1568,7 +1568,7 @@ trust:
 
     it('CA + routing legs are skipped for an agent whose repo-ensure FAILED this run — nothing is written to a repo that does not exist', async () => {
       const manifestPath = manifestPathIn();
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const agentRepoDeps: AgentRepoDeps = {
         checkExists: async (repo) => (repo === 'groundnuty/demo-code' ? 'unknown' : 'absent'), // code-agent's repo-ensure fails
         createRepo: async () => {},
@@ -1591,7 +1591,7 @@ trust:
 
     it('macf#929: no runner-token supplied -> refuses EVERY confirmed repo outright ("failed", not "skipped") BEFORE any live runner check', async () => {
       const manifestPath = manifestPathIn();
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       let checkRunnerCalled = false;
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
@@ -1616,7 +1616,7 @@ trust:
 
     it('macf#929: token supplied but the runner never appears within the poll window -> a SEPARATE, more specific reason than the no-token refusal, and the write seam is never invoked', async () => {
       const manifestPath = manifestPathIn();
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       let createRepoVarCalled = false;
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
@@ -1640,7 +1640,7 @@ trust:
 
     it('macf#929: token supplied AND the runner appears MID-WINDOW (absent, then present) -> the poll succeeds and the var is written — no real wall-clock wait (pollIntervalMs 0)', async () => {
       const manifestPath = manifestPathIn();
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       let checkCalls = 0;
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
@@ -1660,7 +1660,7 @@ trust:
 
     it('macf#929: the token itself never appears in the JSON-renderable result, the fleet.lock written to disk, or the fleet.yaml committed to the control repo — refused, poll-exhausted, AND written paths all checked', async () => {
       const SECRET = 'ghr-SENTINEL-929-TOKEN-MUST-NEVER-LEAK';
-      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted' } } };
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
 
       // Path 1: poll-exhausted (token supplied, never confirmed usable) — the
       // token licenses the ATTEMPT, but its VALUE must never appear anywhere,

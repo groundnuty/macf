@@ -85,11 +85,14 @@ const EMPTY_OBSERVED: ObservedState = {
  * manifest-derived value (`update` verb; macf#922 corrected the observed
  * field from `routingRunsOn`/`MACF_ROUTING_RUNS_ON`). `ca` is fully
  * implemented now (mint-or-reuse + two-place publish); routing's `create`
- * verb is too — the ONLY plan item that still legitimately reads
- * `unimplementedByApply` is a routing `update` (apply's create-only posture
- * never overwrites a present-but-diverging value — see
- * `plan.ts::planItemApplyCoverage`'s routing case). These two fixtures are
- * what exercises that one remaining honest gap.
+ * verb is too — the routing `update` (apply's create-only posture never
+ * overwrites a present-but-diverging value — see
+ * `plan.ts::planItemApplyCoverage`'s routing case) is the ONE legitimately
+ * un-actioned item this fixture originally exercised. **Since
+ * groundnuty/macf#942** (DR-043 Amendment I), declaring `routing.runner` ALSO
+ * always emits a `runner_warm` item — the `warm` field it defaults to (1) has
+ * no enforcement path yet (groundnuty/macf#943, blocked) — so this fixture
+ * now exercises TWO honest gaps, not one; see the `--yes` summary tests below.
  */
 const FLEET_YAML_WITH_ROUTING = FLEET_YAML.replace(
   'agents:\n',
@@ -953,7 +956,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
   // and it must do so EVEN UNDER --yes, since --yes skips the pre-approval
   // render entirely (the final summary is the ONLY output an automated run sees).
 
-  it('final summary (--yes, non-json) lists the ONE remaining apply-unimplemented item — a diverging routing value (macf#838 Amendment D phase 2) — the plan-approve-once artifact is skipped under --yes, so this is the only place it surfaces', async () => {
+  it('final summary (--yes, non-json) lists the TWO remaining apply-unimplemented items — a diverging routing value + the not-yet-enforced warm posture (macf#838 Amendment D phase 2 + macf#942) — the plan-approve-once artifact is skipped under --yes, so this is the only place they surface', async () => {
     const file = writeManifest(FLEET_YAML_WITH_ROUTING);
     // macf#932 — opts.runnerToken required so the pre-flight doesn't refuse
     // before this test's routing-drift/unimplemented-block assertions ever
@@ -967,10 +970,12 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const out = logs.join('\n');
     expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
     // CA is fully implemented now (macf#838 Amendment D phase 2) — it must
-    // NOT appear here; ONLY the routing update (diverging value, create-only
-    // posture never overwrites) does.
+    // NOT appear here; the routing update (diverging value, create-only
+    // posture never overwrites) AND the warm posture (declared, no
+    // enforcement path yet — macf#942/#943) both do.
     expect(out).not.toMatch(/\bca:/);
     expect(out).toMatch(/\brouting:.*\(update\)/);
+    expect(out).toMatch(/\brunner_warm:.*\(create\)/);
   });
 
   it('final summary (--yes, non-json) shows NO unimplemented block on a fresh fleet with no routing declared — CA is fully implemented (macf#838 Amendment D phase 2)', async () => {
@@ -989,7 +994,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(out).toMatch(/Control repo sync: pushed\./);
   });
 
-  it('final summary (--yes, --json) carries unimplemented_by_apply with ONLY the diverging routing item (macf#838 Amendment D phase 2) — ca and repo are NOT among them', async () => {
+  it('final summary (--yes, --json) carries unimplemented_by_apply with the diverging routing item + the warm posture (macf#838 Amendment D phase 2 + macf#942) — ca and repo are NOT among them', async () => {
     const file = writeManifest(FLEET_YAML_WITH_ROUTING);
     // macf#932 — see SENTINEL_RUNNER_TOKEN's doc above.
     const code = await runBootstrapApply(
@@ -1003,9 +1008,21 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       control_repo: { status: string };
       control_repo_sync: { status: string };
     };
-    expect(parsed.unimplemented_by_apply.length).toBe(1);
-    expect(parsed.unimplemented_by_apply[0]?.kind).toBe('routing');
-    expect(parsed.unimplemented_by_apply[0]?.verb).toBe('update');
+    expect(parsed.unimplemented_by_apply.length).toBe(2);
+    const routingItem = parsed.unimplemented_by_apply.find((i) => i.kind === 'routing');
+    expect(routingItem?.verb).toBe('update');
+    // macf#942 (DR-043 Amendment I) — warm defaults to 1 (not declared
+    // explicitly in FLEET_YAML_WITH_ROUTING) and always shows up here
+    // regardless of value, since apply has no enforcement path yet (#943).
+    const warmItem = parsed.unimplemented_by_apply.find((i) => i.kind === 'runner_warm');
+    expect(warmItem?.verb).toBe('create');
+    // unimplemented_by_apply[].reason is the STATIC apply-coverage reason
+    // (APPLY_UNIMPLEMENTED_REASONS.runnerWarm) — the same for every fleet,
+    // not the per-item declared value. The declared "warm: 1" text lives on
+    // the PlanItem itself (plan.items[].reason, via runnerWarmItem), which
+    // this apply-result JSON does not carry (only `unimplemented_by_apply`
+    // does) — pinned instead in plan.test.ts's dedicated runner_warm block.
+    expect(warmItem?.reason).toContain('#943');
     // ca is fully implemented now (macf#838 Amendment D phase 2); repo has
     // been since macf#857 — neither appears here.
     expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(false);
