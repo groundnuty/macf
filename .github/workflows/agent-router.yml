@@ -23,8 +23,17 @@ on:
     types: [labeled, closed]
   issue_comment:
     types: [created]
+  # macf#980: `synchronize` + `ready_for_review` added alongside `opened`. A
+  # PR opened while `mergeStateStatus: DIRTY` produces ZERO workflow runs at
+  # all (GitHub can't build the merge ref `pull_request` events test), so
+  # `opened` — the only trigger before this fix — is unreachable for that
+  # PR's whole life; a later force-push only emits `synchronize`, which
+  # wasn't subscribed. `ready_for_review` closes the parallel draft→ready
+  # gap (#942's disclosure ladder recommends opening a PR as `--draft`,
+  # and a draft marked ready never routed either). See the `gate` job below
+  # for the notification-storm suppression this addition requires.
   pull_request:
-    types: [opened]
+    types: [opened, ready_for_review, synchronize]
   pull_request_review:
     types: [submitted]
   # Also feeds route-by-pr-review-state (macf-actions#432, v1.3.2+): an
@@ -48,7 +57,101 @@ permissions:
   checks: read
 
 jobs:
+  # ─── ROUTE GATE (macf#980) ───
+  # `synchronize` fires on EVERY push to the PR head, and `route-by-mention`
+  # (inside the reusable workflow) re-scans the PR body for @mentions on
+  # every `pull_request` event with no action-type discrimination — so a
+  # naive, unconditional `synchronize` subscription would re-notify the
+  # reviewer on every push during ordinary review iteration. Worse than the
+  # bug it fixes. This gate restores RECOVERY-ONLY semantics for
+  # `synchronize`: route only when NO prior pull_request-triggered "Agent
+  # Router" run exists for the PR's head branch — mirroring the operator's
+  # own diagnostic (`gh run list --workflow "Agent Router" --json
+  # event,headBranch --jq 'select(.headBranch=="<branch>")'`). A rebase that
+  # resolves the DIRTY state (or any push that is the FIRST to reach a valid
+  # merge ref) is then the natural, self-healing recovery.
+  #
+  # `opened` and `ready_for_review` are NOT gated — they always route,
+  # unconditionally, same as `opened` did before this PR. Gating
+  # `ready_for_review` on "no prior run" would wrongly suppress it whenever
+  # `opened` already fired for that PR — which it does today even for draft
+  # PRs (route-by-mention doesn't discriminate on draft state), so a
+  # question-carrying draft (per #942) would still be silenced at the exact
+  # moment (`ready_for_review`) this fix exists to unblock.
+  #
+  # Also closes a `synchronize`/`ready_for_review` exposure macf#872 found in
+  # `opened`: the caller's `secrets: inherit` fails the reusable-workflow
+  # CALL OUTRIGHT for Dependabot-authored pull_request events (Dependabot
+  # PRs get no repository-secrets access — a GitHub security control, not a
+  # misconfiguration), so `route:` would fail at composition before any step
+  # runs. Scoped to non-`opened` actions only, so `opened`'s existing
+  # behaviour — including its own pre-existing #872 exposure — stays
+  # byte-identical; extending the guard to `opened` is a smaller, separate
+  # follow-up (#872 tracks the general case).
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      should-route: ${{ steps.decide.outputs.should-route }}
+    steps:
+      - name: Decide whether to invoke the router
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          ACTOR: ${{ github.actor }}
+          HEAD_REF: ${{ github.head_ref }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Only pull_request events need gating — every other trigger
+          # (issues, issue_comment, pull_request_review, check_suite) is
+          # unaffected by this fix and always routes.
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "should-route=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # #872: skip Dependabot-authored events on the actions THIS fix
+          # adds. `opened`'s existing (pre-#980) Dependabot exposure is left
+          # unchanged — see the job-level comment above.
+          if [ "$ACTION" != "opened" ] && [ "$ACTOR" = "dependabot[bot]" ]; then
+            echo "should-route=false" >> "$GITHUB_OUTPUT"
+            echo "skip: dependabot[bot] actor on a non-opened pull_request action (#872)"
+            exit 0
+          fi
+
+          # opened + ready_for_review: always route, unconditionally.
+          if [ "$ACTION" != "synchronize" ]; then
+            echo "should-route=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # synchronize: recovery-only. Route only if no PRIOR pull_request-
+          # triggered "Agent Router" run exists for this branch, EXCLUDING
+          # the run this step is itself executing in (that run already
+          # appears in `gh run list` — without excluding RUN_ID the query
+          # always finds >=1 and the gate would ALWAYS suppress, permanently
+          # defeating the recovery path this fix exists to restore).
+          PRIOR_COUNT=$(gh run list --repo "$REPO" --workflow agent-router.yml \
+            --branch "$HEAD_REF" --event pull_request --json databaseId \
+            | jq --arg run_id "$RUN_ID" '[.[] | select((.databaseId | tostring) != $run_id)] | length')
+
+          if [ "${PRIOR_COUNT:-0}" -gt 0 ]; then
+            echo "should-route=false" >> "$GITHUB_OUTPUT"
+            echo "skip: $PRIOR_COUNT prior Agent Router run(s) already exist for branch $HEAD_REF — recovery-only semantics suppress this synchronize"
+          else
+            echo "should-route=true" >> "$GITHUB_OUTPUT"
+            echo "route: no prior Agent Router run for branch $HEAD_REF — recovery synchronize"
+          fi
+
   route:
+    needs: gate
+    if: needs.gate.outputs.should-route == 'true'
     uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.4.2
     with:
       project: macf

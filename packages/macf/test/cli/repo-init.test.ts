@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
-import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { parse as parseYaml } from 'yaml';
 import { generateWorkflow, generateAgentConfig, patchAgentConfig, createLabel, repoInit, isV3PlusActionsVersion } from '../../src/cli/commands/repo-init.js';
 
 function tempDir(): string {
@@ -113,6 +115,285 @@ describe('generateWorkflow', () => {
     expect(yaml).not.toContain('with:');
     expect(yaml).toContain('@v3.3.0');
     expect(yaml).toContain('secrets: inherit');
+  });
+});
+
+// macf#980 — a PR opened while mergeStateStatus: DIRTY produces ZERO
+// workflow runs at all, so `opened` (the only pre-#980 pull_request trigger)
+// is unreachable for that PR's whole life. Fix: subscribe to
+// `synchronize` + `ready_for_review` too, gated by a caller-side `gate` job
+// so `synchronize` (which fires on every push) doesn't re-notify on every
+// ordinary review-iteration push — see the `gate` job's comments in
+// generateWorkflow() / the committed .github/workflows/agent-router.yml for
+// the full rationale.
+describe('macf#980 — pull_request synchronize/ready_for_review recovery routing', () => {
+  it('subscribes to [opened, ready_for_review, synchronize], in that order', () => {
+    const yaml = generateWorkflow('v1');
+    expect(yaml).toContain('    types: [opened, ready_for_review, synchronize]');
+  });
+
+  it('preserves every other existing trigger exactly (issues, issue_comment, pull_request_review, check_suite)', () => {
+    const yaml = generateWorkflow('v1');
+    expect(yaml).toContain('  issues:\n    types: [labeled, closed]');
+    expect(yaml).toContain('  issue_comment:\n    types: [created]');
+    expect(yaml).toContain('  pull_request_review:\n    types: [submitted]');
+    expect(yaml).toContain('  check_suite:\n    types: [completed]');
+  });
+
+  it('preserves the permissions: block exactly unchanged (contents/issues/pull-requests/checks)', () => {
+    const yaml = generateWorkflow('v1');
+    expect(yaml).toContain(
+      'permissions:\n  contents: read\n  issues: write\n  pull-requests: read\n  checks: read\n',
+    );
+  });
+
+  it('preserves secrets: inherit on the route: job unchanged', () => {
+    const yaml = generateWorkflow('v1');
+    expect(yaml).toContain('secrets: inherit');
+  });
+
+  it('parses as valid YAML with a gate job (job-scoped actions:read) ahead of route:', () => {
+    const yaml = generateWorkflow('v1');
+    const parsed = parseYaml(yaml) as { jobs: Record<string, any> };
+    expect(Object.keys(parsed.jobs)).toEqual(['gate', 'route']);
+    expect(parsed.jobs['gate'].permissions).toEqual({ actions: 'read' });
+    expect(parsed.jobs['gate']['runs-on']).toBe('ubuntu-latest');
+    // The workflow-level permissions: block (asserted unchanged above) is
+    // NOT touched by the gate job's own job-scoped permissions — job-level
+    // permissions: fully replace, never merge with, the workflow default
+    // for that job only; route: still inherits the workflow-level block.
+    expect(parsed.jobs['route'].permissions).toBeUndefined();
+  });
+
+  it('gates route: on gate.outputs.should-route via needs:, so non-pull_request events (which gate always passes) are unaffected', () => {
+    const yaml = generateWorkflow('v1');
+    const parsed = parseYaml(yaml) as { jobs: Record<string, any> };
+    expect(parsed.jobs['route'].needs).toBe('gate');
+    expect(parsed.jobs['route'].if).toBe("needs.gate.outputs.should-route == 'true'");
+  });
+
+  it('this works for a v3+ pin too (with: block still present, needs:/if: still wired)', () => {
+    const yaml = generateWorkflow('v3.4.2', { project: 'macf', registryApiPath: '/repos/groundnuty/groundnuty' });
+    const parsed = parseYaml(yaml) as { jobs: Record<string, any> };
+    expect(parsed.jobs['route'].needs).toBe('gate');
+    expect(parsed.jobs['route'].with).toEqual({ project: 'macf', 'registry-api-path': '/repos/groundnuty/groundnuty' });
+  });
+
+  it('the generated router is byte-identical (structurally) to the repo\'s own committed .github/workflows/agent-router.yml', () => {
+    // Strip pure-comment + blank lines from both sides — the committed file
+    // carries prose explanatory comments the generator has never fully
+    // byte-mirrored (pre-#980 precedent: route-by-pr-review-state's comment
+    // block above check_suite: is committed-only too), so this pins the
+    // STRUCTURAL YAML shape, matching that existing precedent.
+    function structural(text: string): string {
+      return text
+        .split('\n')
+        .filter(line => {
+          const t = line.trim();
+          return t !== '' && !t.startsWith('#');
+        })
+        .join('\n');
+    }
+    const generated = generateWorkflow('v3.4.2', { project: 'macf', registryApiPath: '/repos/groundnuty/groundnuty' });
+    const committedPath = join(__dirname, '..', '..', '..', '..', '.github', 'workflows', 'agent-router.yml');
+    const committed = readFileSync(committedPath, 'utf-8');
+    expect(structural(generated.slice(generated.indexOf('on:\n')))).toBe(
+      structural(committed.slice(committed.indexOf('on:\n'))),
+    );
+  });
+
+  describe('gate step bash — structural shape', () => {
+    function gateScript(): string {
+      const yaml = generateWorkflow('v1');
+      const parsed = parseYaml(yaml) as { jobs: Record<string, any> };
+      return parsed.jobs['gate'].steps[0].run as string;
+    }
+
+    it('never gates non-pull_request events — issues/issue_comment/pull_request_review/check_suite always route', () => {
+      expect(gateScript()).toContain('if [ "$EVENT_NAME" != "pull_request" ]; then');
+    });
+
+    it('opened + ready_for_review always route unconditionally (no prior-run check reached)', () => {
+      expect(gateScript()).toContain('if [ "$ACTION" != "synchronize" ]; then');
+    });
+
+    it('suppresses Dependabot-authored events, scoped to non-opened actions only (macf#872)', () => {
+      const script = gateScript();
+      expect(script).toContain('if [ "$ACTION" != "opened" ] && [ "$ACTOR" = "dependabot[bot]" ]; then');
+      expect(script).toContain('echo "should-route=false" >> "$GITHUB_OUTPUT"');
+    });
+
+    it('excludes the CURRENT run from the prior-run count (self-exclusion by RUN_ID)', () => {
+      const script = gateScript();
+      expect(script).toContain('--arg run_id "$RUN_ID"');
+      expect(script).toContain('(.databaseId | tostring) != $run_id');
+    });
+
+    it('queries by the committed workflow FILENAME, not the display name (survives a UI rename)', () => {
+      expect(gateScript()).toContain('gh run list --repo "$REPO" --workflow agent-router.yml');
+    });
+
+    it('scopes the prior-run query to pull_request-triggered runs on the PR\'s own head branch', () => {
+      const script = gateScript();
+      expect(script).toContain('--branch "$HEAD_REF"');
+      expect(script).toContain('--event pull_request');
+    });
+  });
+
+  // The bash extracted from generateWorkflow() output, executed directly
+  // against a fake `gh` on PATH. This exercises the actual decision logic
+  // (not just its textual shape) for every macf#980 acceptance criterion —
+  // EXCEPT the true end-to-end runtime path (a real conflicted PR, a real
+  // rebase, a real GitHub Actions run), which only a live PR against real
+  // GitHub proves. That live proof was explicitly out of scope for this fix
+  // (no live-fleet / workflow triggering here).
+  describe('gate step bash — executed decision logic (macf#980 ACs)', () => {
+    let binDir: string;
+
+    beforeEach(() => {
+      binDir = join(tmpdir(), `macf-gate-fakebin-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      mkdirSync(binDir, { recursive: true });
+    });
+
+    afterEach(() => {
+      rmSync(binDir, { recursive: true, force: true });
+    });
+
+    /**
+     * Installs a fake `gh` on PATH ahead of the real one. Only implements
+     * `gh run list ... --json databaseId`, echoing back the FAKE_RUN_LIST_JSON
+     * env var (a JSON array of `{databaseId}` objects) set on the eventual
+     * gate-step invocation — the one subcommand the gate script actually
+     * invokes.
+     */
+    function installFakeGh(): void {
+      const script = [
+        '#!/usr/bin/env bash',
+        'set -euo pipefail',
+        'if [ "$1" = "run" ] && [ "$2" = "list" ]; then',
+        '  echo "$FAKE_RUN_LIST_JSON"',
+        '  exit 0',
+        'fi',
+        'echo "fake gh: unexpected invocation: $*" >&2',
+        'exit 1',
+        '',
+      ].join('\n');
+      const ghPath = join(binDir, 'gh');
+      writeFileSync(ghPath, script);
+      chmodSync(ghPath, 0o755);
+    }
+
+    function runGate(env: Record<string, string>, runListJson = '[]'): string {
+      installFakeGh();
+      const yaml = generateWorkflow('v1');
+      const parsed = parseYaml(yaml) as { jobs: Record<string, any> };
+      const gateRun = parsed.jobs['gate'].steps[0].run as string;
+      // Run the gate step as its OWN bash process (matching how GitHub
+      // Actions actually invokes a `run:` block) and read $GITHUB_OUTPUT
+      // back from a real file afterwards — NOT a chained `cmd1 ; cat file`
+      // in one process, which the script's own `exit 0` (legitimate —
+      // that's how a `run:` step ends early) would kill before the
+      // appended `cat` ever ran.
+      const scriptPath = join(binDir, 'gate-step.sh');
+      writeFileSync(scriptPath, `#!/usr/bin/env bash\n${gateRun}`);
+      chmodSync(scriptPath, 0o755);
+      const outputPath = join(binDir, 'github_output');
+      writeFileSync(outputPath, '');
+      execFileSync('bash', [scriptPath], {
+        env: {
+          PATH: `${binDir}:/usr/bin:/bin`,
+          GITHUB_OUTPUT: outputPath,
+          FAKE_RUN_LIST_JSON: runListJson,
+          ...env,
+        },
+      });
+      const out = readFileSync(outputPath, 'utf-8');
+      const match = /should-route=(true|false)/.exec(out);
+      if (!match) throw new Error(`gate script produced no should-route output. $GITHUB_OUTPUT contents: ${JSON.stringify(out)}`);
+      return match[1]!;
+    }
+
+    const baseEnv = {
+      REPO: 'groundnuty/macf',
+      EVENT_NAME: 'pull_request',
+      ACTOR: 'macf-science-agent[bot]',
+      RUN_ID: '999',
+      HEAD_REF: 'fix/979-something',
+    };
+
+    it('AC: existing opened behaviour is unchanged — opened always routes, even with prior runs present', () => {
+      const shouldRoute = runGate(
+        { ...baseEnv, ACTION: 'opened' },
+        JSON.stringify([{ databaseId: 111 }, { databaseId: 222 }]),
+      );
+      expect(shouldRoute).toBe('true');
+    });
+
+    it('AC: a draft marked ready_for_review routes, even when opened already produced a run for this branch', () => {
+      // Simulates the exact #942 scenario: `opened` already fired (a run
+      // exists for this branch) but ready_for_review must NOT be suppressed
+      // by that prior run — it is deliberately excluded from the
+      // prior-run check entirely.
+      const shouldRoute = runGate(
+        { ...baseEnv, ACTION: 'ready_for_review' },
+        JSON.stringify([{ databaseId: 111 }]),
+      );
+      expect(shouldRoute).toBe('true');
+    });
+
+    it('AC: opened-with-no-run -> push -> routed — a synchronize with NO prior pull_request run for the branch (other than itself) routes', () => {
+      // The current run's own databaseId (RUN_ID=999) is present in the
+      // `gh run list` result (as it would be for a real in-progress run) —
+      // exercising the self-exclusion, not just the empty-array case.
+      const shouldRoute = runGate(
+        { ...baseEnv, ACTION: 'synchronize' },
+        JSON.stringify([{ databaseId: 999 }]),
+      );
+      expect(shouldRoute).toBe('true');
+    });
+
+    it('AC: a push to an already-routed PR does not re-notify — synchronize with a PRIOR run (other than the current one) suppresses', () => {
+      const shouldRoute = runGate(
+        { ...baseEnv, ACTION: 'synchronize' },
+        JSON.stringify([{ databaseId: 111 }, { databaseId: 999 }]),
+      );
+      expect(shouldRoute).toBe('false');
+    });
+
+    it('regression guard: without RUN_ID self-exclusion the gate would ALWAYS suppress synchronize — this run alone must not count as "prior"', () => {
+      // Only the current run appears (the realistic "first synchronize ever
+      // seen for this branch" case) — must NOT be misread as "a prior run
+      // exists".
+      const shouldRoute = runGate(
+        { ...baseEnv, ACTION: 'synchronize' },
+        JSON.stringify([{ databaseId: 999 }]),
+      );
+      expect(shouldRoute).toBe('true');
+    });
+
+    it('macf#872: a Dependabot-authored synchronize is suppressed regardless of prior-run state', () => {
+      const shouldRoute = runGate(
+        { ...baseEnv, ACTION: 'synchronize', ACTOR: 'dependabot[bot]' },
+        '[]',
+      );
+      expect(shouldRoute).toBe('false');
+    });
+
+    it('macf#872: a Dependabot-authored opened is NOT suppressed (existing behaviour preserved byte-for-byte)', () => {
+      const shouldRoute = runGate(
+        { ...baseEnv, ACTION: 'opened', ACTOR: 'dependabot[bot]' },
+        '[]',
+      );
+      expect(shouldRoute).toBe('true');
+    });
+
+    it('non-pull_request events always route, without ever invoking gh', () => {
+      // FAKE_RUN_LIST_JSON left as the default '[]' is irrelevant here — the
+      // fake `gh` would exit 1 on any unexpected invocation, so a passing
+      // result also proves `gh` was never called for this event type.
+      const shouldRoute = runGate({ ...baseEnv, EVENT_NAME: 'issues', ACTION: 'labeled' });
+      expect(shouldRoute).toBe('true');
+    });
   });
 });
 
