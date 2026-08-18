@@ -43,6 +43,17 @@
  * re-materializes from the vault instead of requiring the operator to
  * hand-delete the stale file.
  *
+ * **The per-project CA gets the SAME opt-in treatment, plus a combined
+ * refusal when BOTH are stale (macf#982).** `materializeProjectCa`'s own
+ * local-vs-vault mismatch refusal names its remedy and a `--force-ca` flag
+ * ({@link FleetDeployDeps.forceCa}), mirroring `--force-key` exactly — see
+ * {@link caFingerprintMismatchMessage}. A fleet rebuild rotates BOTH
+ * identities at once, so an unwiped host commonly has BOTH stale;
+ * {@link deployAgent} detects both BEFORE writing either and, when neither
+ * is forced, raises ONE combined refusal naming all four fingerprints and
+ * both flags together ({@link staleCaAndKeyMismatchMessage}) — never two
+ * sequential dead-ends for the operator to discover one at a time.
+ *
  * **Operator-privileged, same custody boundary as `vault-read.ts`.** This
  * module decrypts real fleet credentials — it is not a fleet-agent-safe
  * command. See `vault-read.ts`'s module doc §"Custody boundary" for the
@@ -496,38 +507,43 @@ export interface CaPathDeps {
   readonly caKeyPathFor: (fleetName: string) => string;
 }
 
+/** The vault's decoded CA material, carried on {@link CaDetection}'s `'absent'`/`'mismatch'` variants — the only two that may need to WRITE it. Never carried on `'vault-absent'`/`'match'`, which never write. */
+interface CaVaultMaterial {
+  readonly certPem: string;
+  readonly keyPem: string;
+  readonly fingerprint: string;
+}
+
+/** Pure local-vs-vault CA comparison — never writes, never throws except {@link FleetDeployError} `vault_entry_missing_for_role` (an internal-inconsistency guard, not a genuine refusal path). */
+type CaDetection =
+  | { readonly kind: 'vault-absent' }
+  | { readonly kind: 'absent'; readonly material: CaVaultMaterial }
+  | { readonly kind: 'match'; readonly certFingerprint: string }
+  | { readonly kind: 'mismatch'; readonly localFingerprint: string; readonly vaultFingerprint: string; readonly material: CaVaultMaterial };
+
 /**
  * Decode the per-project CA out of an already-decrypted vault raw map and
- * make it usable locally at the SAME conventional path `certs.ts`/
- * `commands/init.ts` already read from ({@link caCertPath}/{@link caKeyPath}
- * by default) — mint-or-reuse, NEVER re-mint, mirroring
- * `apply-ca.ts::resolveCaCert`'s own "never mint twice" discipline one layer
- * down (this function never mints anything; it only ever writes what the
- * vault already holds).
+ * compare it against whatever is on disk — no writes. Split out of
+ * {@link materializeProjectCa} (macf#982) so {@link deployAgent} can PEEK at
+ * the CA's status before EITHER this or {@link detectKeyStatus}'s sibling
+ * peek performs any write — that ordering is what makes the combined
+ * both-stale refusal possible; see {@link deployAgent}'s own doc.
  *
  * **Compares by PUBLIC-KEY (cert) fingerprint only — never raw key
  * material.** {@link caCertFingerprint} hashes the cert's DER bytes (a
  * public, non-secret value); the private key is never compared byte-for-byte
- * and never appears in this function's return value or in any thrown
- * message (see {@link FleetDeployError} below — both fingerprints named,
- * neither PEM echoed).
+ * and never appears in any thrown message (both fingerprints named, neither
+ * PEM echoed — see {@link caFingerprintMismatchMessage}).
  *
- * A LOCAL CA that exists but DIFFERS from the vault's refuses loudly (never
- * silently overwrites — same "orphan a real credential" hazard
- * `apply-ca.ts`'s own doc names for the mint side). A local pair that is
- * only PARTIALLY present (exactly one of cert/key on disk) is treated the
- * same as "neither present": a lone cert or lone key is not a usable CA
- * pair either way, so there is nothing there worth protecting by refusing —
- * the complete, vault-confirmed pair is materialized fresh over it.
+ * A local pair that is only PARTIALLY present (exactly one of cert/key on
+ * disk) is treated the same as `'absent'`: a lone cert or lone key is not a
+ * usable CA to protect, so the complete, vault-confirmed pair materializes
+ * fresh over it.
  */
-export async function materializeProjectCa(
-  raw: Readonly<Record<string, string>>,
-  fleetName: string,
-  deps: CaPathDeps,
-): Promise<CaMaterializeOutcome> {
+function detectCaStatus(raw: Readonly<Record<string, string>>, fleetName: string, deps: CaPathDeps): CaDetection {
   const presence = queryVaultCaPresence(raw, fleetName);
   if (!(presence.caKey.present && presence.caCert.present)) {
-    return { status: 'vault-absent' };
+    return { kind: 'vault-absent' };
   }
 
   const seg = toVariableSegment(fleetName);
@@ -545,31 +561,103 @@ export async function materializeProjectCa(
         'read back undefined — this indicates a bug in the vault-key derivation, not a genuinely absent credential.',
     );
   }
-  const vaultKeyPem = Buffer.from(vaultKeyB64, 'base64').toString('utf-8');
-  const vaultCertPem = Buffer.from(vaultCertB64, 'base64').toString('utf-8');
-  const vaultFingerprint = caCertFingerprint(vaultCertPem);
+  const certPem = Buffer.from(vaultCertB64, 'base64').toString('utf-8');
+  const keyPem = Buffer.from(vaultKeyB64, 'base64').toString('utf-8');
+  const material: CaVaultMaterial = { certPem, keyPem, fingerprint: caCertFingerprint(certPem) };
 
   const caCertFilePath = deps.caCertPathFor(fleetName);
   const caKeyFilePath = deps.caKeyPathFor(fleetName);
   const localComplete = existsSync(caCertFilePath) && existsSync(caKeyFilePath);
-
-  if (localComplete) {
-    const localFingerprint = caCertFingerprint(readFileSync(caCertFilePath, 'utf-8'));
-    if (localFingerprint !== vaultFingerprint) {
-      throw new FleetDeployError(
-        'ca_mismatch_local_vs_vault',
-        `local per-project CA at "${caCertFilePath}" (fingerprint ${localFingerprint}) does NOT match fleet ` +
-          `"${fleetName}"'s vaulted CA (fingerprint ${vaultFingerprint}) — refusing to overwrite a CA that may be ` +
-          'in independent use. Investigate manually before re-running: was this CA rotated locally without also ' +
-          'updating the vault, or is this the wrong vault/identity for this fleet?',
-      );
-    }
-    return { status: 'already-current', certFingerprint: localFingerprint };
+  if (!localComplete) {
+    return { kind: 'absent', material };
   }
 
-  writeAgentKeyAtomic0600(caKeyFilePath, vaultKeyPem);
-  writeCaCertAtomic0644(caCertFilePath, vaultCertPem);
-  return { status: 'materialized', certFingerprint: vaultFingerprint };
+  const localFingerprint = caCertFingerprint(readFileSync(caCertFilePath, 'utf-8'));
+  if (localFingerprint === material.fingerprint) {
+    return { kind: 'match', certFingerprint: localFingerprint };
+  }
+  return { kind: 'mismatch', localFingerprint, vaultFingerprint: material.fingerprint, material };
+}
+
+/**
+ * The refusal message for a LOCAL-vs-vault CA fingerprint mismatch — names
+ * BOTH fingerprints, BOTH remedies, plus the `--force-ca` opt-in (macf#982),
+ * mirroring {@link keyFingerprintMismatchMessage}'s shape exactly so an
+ * operator who has already internalized the App-key refusal recognizes this
+ * one immediately. Exported so tests can assert its exact shape without
+ * duplicating the prose inline.
+ */
+export function caFingerprintMismatchMessage(
+  fleetName: string,
+  caCertFilePath: string,
+  caKeyFilePath: string,
+  localFingerprint: string,
+  vaultFingerprint: string,
+): string {
+  return (
+    `local per-project CA at "${caCertFilePath}" (fingerprint ${localFingerprint}) does NOT match fleet ` +
+    `"${fleetName}"'s vaulted CA (fingerprint ${vaultFingerprint}) — refusing to overwrite a CA that may be ` +
+    'in independent use. This is expected after a fleet rebuild — a destroyed-and-rebuilt fleet mints a NEW CA ' +
+    'by construction, so a CA left on disk by a PREVIOUS fleet of the same name is stale. ' +
+    `Remedy 1: remove or rename ${caCertFilePath} and ${caKeyFilePath} so the next deploy re-materializes both ` +
+    'from the vault. Remedy 2: if this CA was deliberately rotated locally without also updating the vault, ' +
+    'reconcile it with the vault, then re-run. Or pass --force-ca to re-materialize from the vault now, without ' +
+    'hand-deleting the files.'
+  );
+}
+
+function writeCaMaterial(fleetName: string, deps: CaPathDeps, material: CaVaultMaterial): CaMaterializeOutcome {
+  writeAgentKeyAtomic0600(deps.caKeyPathFor(fleetName), material.keyPem);
+  writeCaCertAtomic0644(deps.caCertPathFor(fleetName), material.certPem);
+  return { status: 'materialized', certFingerprint: material.fingerprint };
+}
+
+/**
+ * Make the per-project CA usable locally at the SAME conventional path
+ * `certs.ts`/`commands/init.ts` already read from ({@link caCertPath}/
+ * {@link caKeyPath} by default) — mint-or-reuse, NEVER re-mint, mirroring
+ * `apply-ca.ts::resolveCaCert`'s own "never mint twice" discipline one layer
+ * down (this function never mints anything; it only ever writes what the
+ * vault already holds).
+ *
+ * A LOCAL CA that exists but DIFFERS from the vault's refuses loudly by
+ * default (never silently overwrites — same "orphan a real credential"
+ * hazard `apply-ca.ts`'s own doc names for the mint side), UNLESS `forceCa`
+ * is `true` (macf#982; CLI flag `--force-ca`), in which case it
+ * re-materializes from the vault instead — the symmetric counterpart to
+ * {@link materializeAgentKey}'s `forceKey`. Defaults to `false`, the SAFER
+ * default: a mismatch refuses rather than silently overwriting a CA that
+ * may be in independent use.
+ */
+export async function materializeProjectCa(
+  raw: Readonly<Record<string, string>>,
+  fleetName: string,
+  deps: CaPathDeps,
+  forceCa = false,
+): Promise<CaMaterializeOutcome> {
+  const detection = detectCaStatus(raw, fleetName, deps);
+  switch (detection.kind) {
+    case 'vault-absent':
+      return { status: 'vault-absent' };
+    case 'match':
+      return { status: 'already-current', certFingerprint: detection.certFingerprint };
+    case 'absent':
+      return writeCaMaterial(fleetName, deps, detection.material);
+    case 'mismatch':
+      if (forceCa) {
+        return writeCaMaterial(fleetName, deps, detection.material);
+      }
+      throw new FleetDeployError(
+        'ca_mismatch_local_vs_vault',
+        caFingerprintMismatchMessage(
+          fleetName,
+          deps.caCertPathFor(fleetName),
+          deps.caKeyPathFor(fleetName),
+          detection.localFingerprint,
+          detection.vaultFingerprint,
+        ),
+      );
+  }
 }
 
 // --- Agent leaf-cert issuance (macf#976) ---
@@ -710,6 +798,20 @@ export interface FleetDeployDeps {
    * is present yet (always `'written'` either way).
    */
   readonly forceKey?: boolean;
+  /**
+   * Opt-in (macf#982; CLI flag `--force-ca`) to re-materialize the on-disk
+   * per-project CA from the vault when its fingerprint does NOT match the
+   * vault's — the symmetric counterpart to {@link forceKey}, for the SAME
+   * post-rebuild shape: a destroyed-and-rebuilt fleet mints a NEW CA by
+   * construction, so a CA left on disk by a previous fleet of the same name
+   * is stale. Defaults to `false` (undefined), the SAFER default: a
+   * mismatch refuses rather than silently overwriting a CA that may be in
+   * independent use. Has NO effect when the on-disk CA already matches the
+   * vault (always `'already-current'`, force or not) or when no local CA is
+   * present yet (always `'materialized'` either way). Threaded straight
+   * through to {@link materializeProjectCa}'s `forceCa` parameter.
+   */
+  readonly forceCa?: boolean;
 }
 
 export type FleetDeployOutcome =
@@ -826,6 +928,34 @@ export function keyFingerprintMismatchMessage(role: string, keyPath: string, onD
   );
 }
 
+/** Pure on-disk-vs-vault App-key comparison — never writes. */
+type KeyDetection =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'match'; readonly onDiskPem: string }
+  | { readonly kind: 'mismatch'; readonly onDiskFingerprint: string; readonly vaultFingerprint: string };
+
+/**
+ * Split out of {@link materializeAgentKey} (macf#982) so {@link deployAgent}
+ * can PEEK at the key's status before EITHER this or {@link detectCaStatus}'s
+ * sibling peek performs any write — see {@link deployAgent}'s own doc for
+ * why that ordering is what makes the combined both-stale refusal possible.
+ * May throw {@link FleetDeployError} `agent_key_unparseable` via
+ * {@link publicKeyFingerprintOrRefuse} — the SAME refusal this always
+ * produced for an unparseable PEM, on either side of the comparison.
+ */
+function detectKeyStatus(role: string, keyPath: string, vaultPem: string): KeyDetection {
+  if (!existsSync(keyPath)) {
+    return { kind: 'absent' };
+  }
+  const onDiskPem = readFileSync(keyPath, 'utf-8');
+  const onDiskIdentity = publicKeyFingerprintOrRefuse(role, keyPath, onDiskPem, 'on-disk');
+  const vaultIdentity = publicKeyFingerprintOrRefuse(role, keyPath, vaultPem, 'vault');
+  if (onDiskIdentity === vaultIdentity) {
+    return { kind: 'match', onDiskPem };
+  }
+  return { kind: 'mismatch', onDiskFingerprint: onDiskIdentity, vaultFingerprint: vaultIdentity };
+}
+
 /**
  * Resolve `keyPath`'s materialization state against the vault's credential,
  * per macf#975: an ABSENT key is written fresh (unchanged from before this
@@ -850,31 +980,69 @@ function materializeAgentKey(
   deps: Pick<FleetDeployDeps, 'forceKey'>,
   log: (line: string) => void,
 ): KeyMaterializeResult {
-  if (!existsSync(keyPath)) {
+  const status = detectKeyStatus(role, keyPath, vaultPem);
+
+  if (status.kind === 'absent') {
     writeAgentKeyAtomic0600(keyPath, vaultPem);
     log(`Role "${role}": App key materialized at ${keyPath} (0600).`);
     return { keyWrite: 'written', keyFingerprint: secretFingerprint(vaultPem) };
   }
 
-  const onDiskPem = readFileSync(keyPath, 'utf-8');
-  const onDiskIdentity = publicKeyFingerprintOrRefuse(role, keyPath, onDiskPem, 'on-disk');
-  const vaultIdentity = publicKeyFingerprintOrRefuse(role, keyPath, vaultPem, 'vault');
-
-  if (onDiskIdentity === vaultIdentity) {
+  if (status.kind === 'match') {
     log(`Role "${role}": App key already present at ${keyPath} and matches the vault — not overwritten (operator-owned once materialized).`);
-    return { keyWrite: 'skipped-existing', keyFingerprint: secretFingerprint(onDiskPem) };
+    return { keyWrite: 'skipped-existing', keyFingerprint: secretFingerprint(status.onDiskPem) };
   }
 
   if (deps.forceKey === true) {
     writeAgentKeyAtomic0600(keyPath, vaultPem);
     log(
-      `Role "${role}": App key at ${keyPath} did not match the vault (on-disk ${onDiskIdentity} vs vault ` +
-        `${vaultIdentity}) — re-materialized from the vault (--force-key).`,
+      `Role "${role}": App key at ${keyPath} did not match the vault (on-disk ${status.onDiskFingerprint} vs vault ` +
+        `${status.vaultFingerprint}) — re-materialized from the vault (--force-key).`,
     );
     return { keyWrite: 'written', keyFingerprint: secretFingerprint(vaultPem) };
   }
 
-  throw new FleetDeployError('agent_key_fingerprint_mismatch', keyFingerprintMismatchMessage(role, keyPath, onDiskIdentity, vaultIdentity));
+  throw new FleetDeployError(
+    'agent_key_fingerprint_mismatch',
+    keyFingerprintMismatchMessage(role, keyPath, status.onDiskFingerprint, status.vaultFingerprint),
+  );
+}
+
+/**
+ * The refusal message for BOTH the App key AND the per-project CA being
+ * stale at once (macf#982) — the routine shape after a destroy -> rebuild
+ * -> deploy cycle on an unwiped host: a rebuilt fleet mints a NEW CA and a
+ * NEW App key by construction, so BOTH credentials left over from the
+ * previous fleet of the same name are simultaneously invalid. Names all
+ * four fingerprints (two mismatched pairs) and BOTH override flags together
+ * (`--force-ca --force-key`) so the operator can recover in ONE re-run
+ * instead of discovering the second refusal only after hand-fixing the
+ * first — the exact discoverability gap {@link deployAgent}'s pre-check
+ * (below) exists to close. Exported so tests can assert its exact shape
+ * without duplicating the prose inline.
+ */
+export function staleCaAndKeyMismatchMessage(
+  role: string,
+  fleetName: string,
+  caCertFilePath: string,
+  caKeyFilePath: string,
+  caLocalFingerprint: string,
+  caVaultFingerprint: string,
+  keyPath: string,
+  keyOnDiskFingerprint: string,
+  keyVaultFingerprint: string,
+): string {
+  return (
+    `Role "${role}": this host holds STALE material from a previous fleet named "${fleetName}" — BOTH the ` +
+    'per-project CA and the App key are left over and do not match the current vault. This is the routine shape ' +
+    'after a destroy -> rebuild -> deploy cycle on the same host (a rebuilt fleet mints a NEW CA and a NEW App ' +
+    'key by construction; nothing on GitHub lets either be reused, and neither CA identity is portable between ' +
+    `fleets). CA at "${caCertFilePath}" (local fingerprint ${caLocalFingerprint}, vault ${caVaultFingerprint}). ` +
+    `App key at "${keyPath}" (local fingerprint ${keyOnDiskFingerprint}, vault ${keyVaultFingerprint}). Remedy: ` +
+    `remove or rename ${caCertFilePath}, ${caKeyFilePath}, and ${keyPath} so the next deploy re-materializes ` +
+    'all three from the vault. Or re-run with --force-ca --force-key to re-materialize both from the vault now, ' +
+    'without hand-deleting any file.'
+  );
 }
 
 /**
@@ -911,6 +1079,18 @@ function materializeAgentKey(
  * `destDir`, so it MUST wait until the workspace is actually cloned (see
  * the inline comment at that call site for why the ordering is load-bearing,
  * not stylistic).
+ *
+ * **Both the CA and the App key are PEEKED AT (read-only, no writes)
+ * before either is materialized (macf#982).** A fleet rebuild rotates BOTH
+ * identities at once, so an unwiped host commonly has BOTH stale. Without
+ * this peek, the CA's own refusal would fire first (per the ordering
+ * above) and hide the fact that the App key is ALSO stale — the operator
+ * would hand-fix the CA, re-run, and only THEN discover the key refusal.
+ * When BOTH would refuse unforced, {@link deployAgent} raises ONE combined
+ * `FleetDeployError` ({@link staleCaAndKeyMismatchMessage}) naming all four
+ * fingerprints and both override flags together, and NOTHING is written.
+ * When only one would refuse, behavior is unchanged from before this fix:
+ * that one refuses (nothing else touched) exactly as it always did.
  */
 export async function deployAgent(
   agent: FleetAgent,
@@ -928,18 +1108,44 @@ export async function deployAgent(
 
     const registryOpts = initRegistryOptionsFor(manifest.owner.registry);
 
-    // CA materialize runs BEFORE any side effect below (macf#976) — a
-    // mismatch refuses the ENTIRE deploy with NOTHING else touched (no App
-    // key written, no clone, no `initAgent`) rather than leaving a
-    // half-deployed workspace behind a loud error.
     const caPathDeps: CaPathDeps = {
       caCertPathFor: deps.caCertPathFor ?? caCertPath,
       caKeyPathFor: deps.caKeyPathFor ?? caKeyPath,
     };
-    const ca = await materializeProjectCa(raw, manifest.metadata.name, caPathDeps);
+    const keyPath = (deps.keyPathFor ?? defaultAgentKeyPath)(role);
+
+    // Combined-stale pre-check (macf#982) — see this function's own doc
+    // "Both the CA and the App key are PEEKED AT" section. Read-only: ONLY
+    // decides whether to raise the combined refusal below; the actual
+    // materialize calls (which redo this comparison) are what write.
+    const caDetection = detectCaStatus(raw, manifest.metadata.name, caPathDeps);
+    const keyDetection = detectKeyStatus(role, keyPath, creds.privateKeyPem);
+    if (caDetection.kind === 'mismatch' && deps.forceCa !== true && keyDetection.kind === 'mismatch' && deps.forceKey !== true) {
+      throw new FleetDeployError(
+        'stale_material_ca_and_key',
+        staleCaAndKeyMismatchMessage(
+          role,
+          manifest.metadata.name,
+          caPathDeps.caCertPathFor(manifest.metadata.name),
+          caPathDeps.caKeyPathFor(manifest.metadata.name),
+          caDetection.localFingerprint,
+          caDetection.vaultFingerprint,
+          keyPath,
+          keyDetection.onDiskFingerprint,
+          keyDetection.vaultFingerprint,
+        ),
+      );
+    }
+
+    // CA materialize runs BEFORE any side effect below (macf#976) — a
+    // mismatch (when not forced) refuses the ENTIRE deploy with NOTHING
+    // else touched (no App key written, no clone, no `initAgent`) rather
+    // than leaving a half-deployed workspace behind a loud error. The
+    // combined pre-check above has already ruled out "both stale,
+    // neither forced" reaching this point.
+    const ca = await materializeProjectCa(raw, manifest.metadata.name, caPathDeps, deps.forceCa === true);
     log(caMaterializeLogLine(role, ca));
 
-    const keyPath = (deps.keyPathFor ?? defaultAgentKeyPath)(role);
     const { keyWrite, keyFingerprint } = materializeAgentKey(role, keyPath, creds.privateKeyPem, deps, log);
 
     // The clone-auth token is minted LAZILY (only when `ensureAgentWorkspaceCloned`
