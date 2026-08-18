@@ -10,8 +10,10 @@
 import { describe, it, expect } from 'vitest';
 import {
   checkRunnerTokenPreflight,
+  formatRunnerPollProgress,
   noRunnerRegisteredReason,
   noRunnerTokenReason,
+  pollForUsableRunner,
   publishTrustedActors,
   publishTrustedActorsGated,
   runnerTokenPollExhaustedReason,
@@ -389,6 +391,213 @@ describe('publishTrustedActorsGated (macf#929)', () => {
 
     const written = await publishTrustedActorsGated('self-hosted', ['a/b'], depsWith(), SECRET);
     expect(JSON.stringify(written)).not.toContain(SECRET);
+  });
+});
+
+// --- macf#972 — a poll must be justified by an expectation, not a constant ---
+
+describe('publishTrustedActorsGated — justCreatedRepos (macf#972)', () => {
+  it('DECISIVE: repo created this run + no runner -> immediate skip, ZERO poll iterations (checkRunnerUsableByRepo called exactly once, sleepFn never invoked)', async () => {
+    let checkCalls = 0;
+    let sleepCalls = 0;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return { presence: 'absent' };
+      },
+    });
+    const result = await publishTrustedActorsGated(
+      'self-hosted',
+      ['a/b'],
+      deps,
+      'ghr-sentinel-token',
+      // A real 10-minute default budget (timeoutMs left UNSET, same as
+      // production) AND a sleepFn that would fail the test if ever called —
+      // if the fast path fell through to the real poll, this test would
+      // either hang or throw, not silently pass.
+      {
+        sleepFn: async (ms) => {
+          sleepCalls += 1;
+          throw new Error(`sleepFn must never be called on the fast path (asked to sleep ${String(ms)}ms)`);
+        },
+      },
+      new Set(['a/b']),
+    );
+    expect(result['a/b']?.status).toBe('skipped');
+    // Exactly ONE call — a single LIVE check still runs (see the sibling
+    // "runner already usable" test below for why zero checks would be
+    // wrong), but the retry-with-sleep LOOP is never entered: that's the
+    // "zero poll iterations" this test decides.
+    expect(checkCalls).toBe(1);
+    expect(sleepCalls).toBe(0);
+  });
+
+  it('the fast-path skip reason is BYTE-IDENTICAL to what a full-window poll-exhausted reason says — same message, only the timing changes', async () => {
+    const deps = depsWith({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) });
+    // Neither call overrides `timeoutMs` — both use the SAME default 600s
+    // budget the message names. The "polled" comparison fast-forwards via an
+    // injected clock (pollIntervalMs 60s, `now`/`sleepFn` faked) so the test
+    // doesn't really wait 10 real minutes to exhaust the same window the
+    // fast path skips instantly.
+    const fast = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', {}, new Set(['a/b']));
+    let clock = 0;
+    const polled = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', {
+      pollIntervalMs: 60_000,
+      now: () => clock,
+      sleepFn: async (ms) => {
+        clock += ms;
+      },
+    });
+    expect((fast['a/b'] as { reason: string }).reason).toBe((polled['a/b'] as { reason: string }).reason);
+    expect((fast['a/b'] as { reason: string }).reason).toMatch(/no usable self-hosted runner became visible/);
+    expect((fast['a/b'] as { reason: string }).reason).toContain('600s poll window'); // the CONFIGURED (default) budget, not the ~0ms actually spent
+  });
+
+  it('repo created this run, but a runner IS already usable at t=0 (e.g. an org-wide runner group) -> still writes, same as today', async () => {
+    let checkCalls = 0;
+    const writes: string[] = [];
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return { presence: 'present' };
+      },
+      createRepoVariable: async (repo) => {
+        writes.push(repo);
+        return 'created';
+      },
+    });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', {}, new Set(['a/b']));
+    expect(result['a/b']).toEqual({ status: 'created' });
+    expect(checkCalls).toBe(1);
+    expect(writes).toEqual(['a/b']);
+  });
+
+  it('a repo NOT in justCreatedRepos keeps polling exactly as before, even when OTHER repos in the same call are just-created', async () => {
+    let preExistingCalls = 0;
+    let freshCalls = 0;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async (repo) => {
+        if (repo === 'pre-existing/x') {
+          preExistingCalls += 1;
+          return preExistingCalls < 3 ? { presence: 'absent' } : { presence: 'present' };
+        }
+        freshCalls += 1;
+        return { presence: 'absent' };
+      },
+    });
+    const result = await publishTrustedActorsGated(
+      'self-hosted',
+      ['pre-existing/x', 'fresh/y'],
+      deps,
+      'ghr-sentinel-token',
+      { timeoutMs: 60_000, pollIntervalMs: 0 },
+      new Set(['fresh/y']),
+    );
+    expect(result['pre-existing/x']).toEqual({ status: 'created' });
+    expect(preExistingCalls).toBe(3); // genuinely polled (mid-window recovery)
+    expect(result['fresh/y']?.status).toBe('skipped');
+    expect(freshCalls).toBe(1); // fast path — one check, no retries
+  });
+
+  it('undefined justCreatedRepos (the param omitted entirely) preserves EVERY existing caller\'s behavior — full poll, no fast path', async () => {
+    let calls = 0;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        calls += 1;
+        return calls < 3 ? { presence: 'absent' } : { presence: 'present' };
+      },
+    });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', { timeoutMs: 60_000, pollIntervalMs: 0 });
+    expect(result['a/b']).toEqual({ status: 'created' });
+    expect(calls).toBe(3);
+  });
+
+  it('a THROWING checkRunnerUsableByRepo on the fast path resolves to "failed" (a wiring bug), not "skipped" — mirrors the polled path', async () => {
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        throw new Error('gh: rate limited');
+      },
+    });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', {}, new Set(['a/b']));
+    expect(result['a/b']?.status).toBe('failed');
+    expect((result['a/b'] as { reason: string }).reason).toContain('rate limited');
+  });
+
+  it('register-before-route holds on the fast path too — the create-only write seam is never invoked when no runner is usable', async () => {
+    let createCalled = false;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => ({ presence: 'absent' }),
+      createRepoVariable: async () => {
+        createCalled = true;
+        return 'created';
+      },
+    });
+    await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', {}, new Set(['a/b']));
+    expect(createCalled).toBe(false);
+  });
+});
+
+describe('pollForUsableRunner — progress narration (macf#972)', () => {
+  it('emits onProgress once elapsed crosses progressIntervalMs, with the repo name + elapsed/total in ms', async () => {
+    let clock = 0;
+    const progressCalls: Array<{ repo: string; elapsedMs: number; totalMs: number }> = [];
+    let checkCalls = 0;
+    const usability = await pollForUsableRunner(
+      'a/b',
+      async () => {
+        checkCalls += 1;
+        return { presence: 'absent' };
+      },
+      {
+        timeoutMs: 90_000,
+        pollIntervalMs: 10_000,
+        progressIntervalMs: 30_000,
+        now: () => clock,
+        sleepFn: async (ms) => {
+          clock += ms;
+        },
+        onProgress: (repo, elapsedMs, totalMs) => {
+          progressCalls.push({ repo, elapsedMs, totalMs });
+        },
+      },
+    );
+    expect(usability).toEqual({ presence: 'absent' }); // exhausted
+    expect(progressCalls.length).toBeGreaterThan(0);
+    expect(progressCalls[0]).toEqual({ repo: 'a/b', elapsedMs: 30_000, totalMs: 90_000 });
+    expect(checkCalls).toBeGreaterThan(1); // a genuine multi-iteration poll, not the fast path
+  });
+
+  it('a poll that resolves (or expires) within its FIRST interval never fires onProgress — matches pre-macf#972 silent behavior for a short poll', async () => {
+    const progressCalls: unknown[] = [];
+    await pollForUsableRunner('a/b', async () => ({ presence: 'absent' }), {
+      timeoutMs: 0,
+      onProgress: (repo, elapsedMs, totalMs) => {
+        progressCalls.push({ repo, elapsedMs, totalMs });
+      },
+    });
+    expect(progressCalls).toEqual([]);
+  });
+
+  it('no onProgress supplied -> no crash, identical result to today (default is silent)', async () => {
+    let calls = 0;
+    const usability = await pollForUsableRunner(
+      'a/b',
+      async () => {
+        calls += 1;
+        return calls < 2 ? { presence: 'absent' } : { presence: 'present' };
+      },
+      { timeoutMs: 60_000, pollIntervalMs: 0 },
+    );
+    expect(usability).toEqual({ presence: 'present' });
+  });
+});
+
+describe('formatRunnerPollProgress (macf#972)', () => {
+  it('names the repo + rounds elapsed/total to whole seconds + the "nothing for you to do" clause', () => {
+    const line = formatRunnerPollProgress('groundnuty/x', 120_000, 600_000);
+    expect(line).toContain('groundnuty/x');
+    expect(line).toContain('120s/600s elapsed');
+    expect(line).toContain('nothing for you to do');
   });
 });
 
