@@ -36,6 +36,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { createPrivateKey, generateKeyPairSync } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { X509Certificate } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -51,6 +52,8 @@ import {
   realAuthenticatedCloneRepo,
   cloneViaInsteadOf,
   publicKeyFingerprint,
+  materializeProjectCa,
+  issueAgentCertIfNeeded,
   type FleetDeployDeps,
 } from '../../../src/cli/bootstrap/fleet-deploy.js';
 import type { FleetAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
@@ -60,6 +63,7 @@ import { VaultError, buildVaultPlaintext, writeVault, type VaultAgentSecrets, ty
 import { secretFingerprint } from '../../../src/cli/bootstrap/fleet-lock.js';
 import type { InitOptions } from '../../../src/cli/commands/init.js';
 import { resolveAgeGate } from './age-binary-gate.js';
+import { toVariableSegment, createCA, caCertFingerprint } from '@groundnuty/macf-core';
 
 const HAS_AGE = resolveAgeGate('fleet-deploy.test.ts', 2);
 
@@ -890,6 +894,354 @@ describe('deployAgent — offline (injected readVault/cloneRepo/initAgent)', () 
 
     expect(outcome.status).toBe('deployed');
     expect(mintCalled).toBe(false);
+  });
+});
+
+// --- Per-project CA materialization from the vault (macf#976) ---
+//
+// Uses REAL crypto throughout (`createCA`/`generateAgentCert` via
+// `deployAgent`, never a mock) — per this codebase's own "test that
+// constructs the seam it should observe" lesson, a fake cert-issuance leaf
+// could pass while producing zero usable output, which is the exact shape
+// of the bug (#976's own report: `deploy` printed success while the CA it
+// had just decrypted went unused).
+
+/** Mints a REAL, valid CA keypair via `@groundnuty/macf-core::createCA` — never a synthetic PEM sentinel, since `generateAgentCert`/`loadCA` genuinely parse this material. */
+async function mintTestCa(label: string): Promise<{ readonly certPem: string; readonly keyPem: string }> {
+  const dir = scratchDir();
+  return createCA({ project: `ca-mint-${label}`, certPath: join(dir, 'ca-cert.pem'), keyPath: join(dir, 'ca-key.pem') });
+}
+
+/** `vaultRawFor` plus the fleet-level (not per-agent) CA fields, matching `vault-write.ts::buildVaultPlaintext`'s `MACF_<SEG>_CA_{KEY,CERT}_B64` key shape exactly. */
+function vaultRawWithCa(ca: { readonly certPem: string; readonly keyPem: string }): Record<string, string> {
+  const seg = toVariableSegment(FLEET);
+  return {
+    ...vaultRawFor('111', '222', PEM),
+    [`MACF_${seg}_CA_KEY_B64`]: Buffer.from(ca.keyPem, 'utf-8').toString('base64'),
+    [`MACF_${seg}_CA_CERT_B64`]: Buffer.from(ca.certPem, 'utf-8').toString('base64'),
+  } as Record<string, string>;
+}
+
+describe('materializeProjectCa (unit-level)', () => {
+  it('vault has no CA fields at all: "vault-absent", never touches the filesystem (caCertPathFor/caKeyPathFor are never called)', async () => {
+    const outcome = await materializeProjectCa(vaultRawFor('111', '222', PEM), FLEET, {
+      caCertPathFor: () => {
+        throw new Error('must not be called — vault has no CA to compare against');
+      },
+      caKeyPathFor: () => {
+        throw new Error('must not be called — vault has no CA to compare against');
+      },
+    });
+    expect(outcome).toEqual({ status: 'vault-absent' });
+  });
+
+  it('neither CA file present locally: materializes both, atomically, at the correct modes', async () => {
+    const ca = await mintTestCa('fresh');
+    const dir = scratchDir();
+    const caCertFilePath = join(dir, 'ca-cert.pem');
+    const caKeyFilePath = join(dir, 'ca-key.pem');
+
+    const outcome = await materializeProjectCa(vaultRawWithCa(ca), FLEET, {
+      caCertPathFor: () => caCertFilePath,
+      caKeyPathFor: () => caKeyFilePath,
+    });
+
+    expect(outcome).toEqual({ status: 'materialized', certFingerprint: caCertFingerprint(ca.certPem) });
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(ca.certPem);
+    expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(ca.keyPem);
+    expect(statSync(caCertFilePath).mode & 0o777).toBe(0o644);
+    expect(statSync(caKeyFilePath).mode & 0o777).toBe(0o600);
+  });
+
+  it('local CA present and MATCHES the vault: "already-current", no write at all (mtimes unchanged — no churn)', async () => {
+    const ca = await mintTestCa('matching');
+    const dir = scratchDir();
+    const caCertFilePath = join(dir, 'ca-cert.pem');
+    const caKeyFilePath = join(dir, 'ca-key.pem');
+    writeFileSync(caCertFilePath, ca.certPem, { mode: 0o644 });
+    writeFileSync(caKeyFilePath, ca.keyPem, { mode: 0o600 });
+    const certMtimeBefore = statSync(caCertFilePath).mtimeMs;
+    const keyMtimeBefore = statSync(caKeyFilePath).mtimeMs;
+
+    const outcome = await materializeProjectCa(vaultRawWithCa(ca), FLEET, {
+      caCertPathFor: () => caCertFilePath,
+      caKeyPathFor: () => caKeyFilePath,
+    });
+
+    expect(outcome).toEqual({ status: 'already-current', certFingerprint: caCertFingerprint(ca.certPem) });
+    expect(statSync(caCertFilePath).mtimeMs).toBe(certMtimeBefore);
+    expect(statSync(caKeyFilePath).mtimeMs).toBe(keyMtimeBefore);
+  });
+
+  it('local CA present but DIFFERS from the vault: refuses loudly, names BOTH fingerprints, never a raw PEM, never overwrites', async () => {
+    const localCa = await mintTestCa('local');
+    const vaultCa = await mintTestCa('vault'); // a genuinely different keypair
+    const dir = scratchDir();
+    const caCertFilePath = join(dir, 'ca-cert.pem');
+    const caKeyFilePath = join(dir, 'ca-key.pem');
+    writeFileSync(caCertFilePath, localCa.certPem, { mode: 0o644 });
+    writeFileSync(caKeyFilePath, localCa.keyPem, { mode: 0o600 });
+
+    const localFp = caCertFingerprint(localCa.certPem);
+    const vaultFp = caCertFingerprint(vaultCa.certPem);
+
+    try {
+      await materializeProjectCa(vaultRawWithCa(vaultCa), FLEET, {
+        caCertPathFor: () => caCertFilePath,
+        caKeyPathFor: () => caKeyFilePath,
+      });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(FleetDeployError);
+      expect((e as FleetDeployError).code).toBe('ca_mismatch_local_vs_vault');
+      expect((e as FleetDeployError).message).toContain(localFp);
+      expect((e as FleetDeployError).message).toContain(vaultFp);
+      // Never any raw key/cert material in the refusal message — fingerprints only.
+      expect((e as FleetDeployError).message).not.toContain(localCa.keyPem);
+      expect((e as FleetDeployError).message).not.toContain(vaultCa.keyPem);
+      expect((e as FleetDeployError).message).not.toContain(localCa.certPem);
+      expect((e as FleetDeployError).message).not.toContain(vaultCa.certPem);
+    }
+    // Untouched.
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(localCa.certPem);
+    expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(localCa.keyPem);
+  });
+
+  it('local CA PARTIALLY present (cert only, no key): treated as absent — materializes the complete pair fresh (a lone cert is not a usable CA to protect)', async () => {
+    const ca = await mintTestCa('partial');
+    const dir = scratchDir();
+    const caCertFilePath = join(dir, 'ca-cert.pem');
+    const caKeyFilePath = join(dir, 'ca-key.pem');
+    writeFileSync(caCertFilePath, 'SOME-ORPHANED-CERT-WITHOUT-A-KEY', { mode: 0o644 });
+
+    const outcome = await materializeProjectCa(vaultRawWithCa(ca), FLEET, {
+      caCertPathFor: () => caCertFilePath,
+      caKeyPathFor: () => caKeyFilePath,
+    });
+
+    expect(outcome).toEqual({ status: 'materialized', certFingerprint: caCertFingerprint(ca.certPem) });
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(ca.certPem);
+    expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(ca.keyPem);
+  });
+});
+
+describe('issueAgentCertIfNeeded (unit-level)', () => {
+  it('no cert present at destDir: issues a REAL, valid, CA-signed cert — cryptographic verification, not just file presence', async () => {
+    const ca = await mintTestCa('issue');
+    const dir = scratchDir();
+    const certPath = join(dir, 'nested', 'agent-cert.pem');
+    const keyPath = join(dir, 'nested', 'agent-key.pem');
+
+    const outcome = await issueAgentCertIfNeeded(dir, 'code-agent', ca.certPem, ca.keyPem, 'example.ts.net', {
+      agentCertPathFor: () => certPath,
+      agentKeyPathFor: () => keyPath,
+    });
+
+    expect(outcome).toBe('issued');
+    const issuedCertPem = readFileSync(certPath, 'utf-8');
+    expect(issuedCertPem).toContain('BEGIN CERTIFICATE');
+    expect(readFileSync(keyPath, 'utf-8')).toContain('BEGIN PRIVATE KEY');
+
+    // Real X.509 parse + signature verification — proves the cert was
+    // ACTUALLY signed by the given CA, not merely a byte-copy of something.
+    const issued = new X509Certificate(issuedCertPem);
+    const caX509 = new X509Certificate(ca.certPem);
+    expect(issued.checkIssued(caX509)).toBe(true);
+    expect(issued.verify(caX509.publicKey)).toBe(true);
+    expect(issued.subject).toBe('CN=code-agent');
+  });
+
+  it('cert+key already present at destDir: "skipped-existing", byte-for-byte untouched (no churn)', async () => {
+    const ca = await mintTestCa('skip');
+    const dir = scratchDir();
+    const certPath = join(dir, 'agent-cert.pem');
+    const keyPath = join(dir, 'agent-key.pem');
+    writeFileSync(certPath, 'PRE-EXISTING-CERT-SENTINEL');
+    writeFileSync(keyPath, 'PRE-EXISTING-KEY-SENTINEL');
+
+    const outcome = await issueAgentCertIfNeeded(dir, 'code-agent', ca.certPem, ca.keyPem, 'example.ts.net', {
+      agentCertPathFor: () => certPath,
+      agentKeyPathFor: () => keyPath,
+    });
+
+    expect(outcome).toBe('skipped-existing');
+    expect(readFileSync(certPath, 'utf-8')).toBe('PRE-EXISTING-CERT-SENTINEL');
+    expect(readFileSync(keyPath, 'utf-8')).toBe('PRE-EXISTING-KEY-SENTINEL');
+  });
+});
+
+describe('deployAgent — CA materialization + agent-cert issuance, end to end (macf#976)', () => {
+  it('CLEAN HOST, no local CA: THE DECISIVE ASSERTION — a real, usable agent cert exists after deploy, not merely "the CA was read from the vault"', async () => {
+    const ca = await mintTestCa('e2e-clean');
+    const caScratch = scratchDir();
+    const caCertFilePath = join(caScratch, 'ca-cert.pem');
+    const caKeyFilePath = join(caScratch, 'ca-key.pem');
+    const workDir = scratchDir();
+    const destDir = join(workDir, 'workspace');
+    const agentScratch = scratchDir();
+    const agentCertFilePath = join(agentScratch, 'agent-cert.pem');
+    const agentKeyFilePath = join(agentScratch, 'agent-key.pem');
+    const keyPath = join(scratchDir(), `${ROLE}.pem`);
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawWithCa(ca),
+        cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+        mintCloneToken: async () => FAKE_TOKEN,
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => keyPath,
+        caCertPathFor: () => caCertFilePath,
+        caKeyPathFor: () => caKeyFilePath,
+        agentCertPathFor: () => agentCertFilePath,
+        agentKeyPathFor: () => agentKeyFilePath,
+      },
+    );
+
+    expect(outcome.status).toBe('deployed');
+    if (outcome.status !== 'deployed') throw new Error('unreachable');
+    expect(outcome.ca).toEqual({ status: 'materialized', certFingerprint: caCertFingerprint(ca.certPem) });
+    expect(outcome.certIssue).toBe('issued');
+
+    // CA landed correctly.
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(ca.certPem);
+    expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(ca.keyPem);
+    expect(statSync(caKeyFilePath).mode & 0o777).toBe(0o600);
+    expect(statSync(caCertFilePath).mode & 0o777).toBe(0o644);
+
+    // THE DECISIVE ASSERTION: a real, usable, CA-signed agent cert exists.
+    const issuedCertPem = readFileSync(agentCertFilePath, 'utf-8');
+    const issued = new X509Certificate(issuedCertPem);
+    const caX509 = new X509Certificate(ca.certPem);
+    expect(issued.checkIssued(caX509)).toBe(true);
+    expect(issued.verify(caX509.publicKey)).toBe(true);
+    expect(issued.subject).toBe(`CN=${ROLE}`);
+
+    // The outcome never carries the secret material anywhere.
+    const serialized = JSON.stringify(outcome);
+    expect(serialized).not.toContain(ca.keyPem);
+    expect(serialized).not.toContain(ca.certPem);
+  });
+
+  it('CA already present and MATCHING + agent cert already present: no re-issue anywhere (no churn) — idempotent re-run', async () => {
+    const ca = await mintTestCa('e2e-idempotent');
+    const caScratch = scratchDir();
+    const caCertFilePath = join(caScratch, 'ca-cert.pem');
+    const caKeyFilePath = join(caScratch, 'ca-key.pem');
+    writeFileSync(caCertFilePath, ca.certPem, { mode: 0o644 });
+    writeFileSync(caKeyFilePath, ca.keyPem, { mode: 0o600 });
+
+    const workDir = scratchDir();
+    const destDir = join(workDir, 'workspace');
+    mkdirSync(destDir, { recursive: true });
+    writeFileSync(join(destDir, 'already-here.txt'), 'x'); // non-empty -> workspace skip too
+    const agentScratch = scratchDir();
+    const agentCertFilePath = join(agentScratch, 'agent-cert.pem');
+    const agentKeyFilePath = join(agentScratch, 'agent-key.pem');
+    writeFileSync(agentCertFilePath, 'PRE-EXISTING-AGENT-CERT-SENTINEL');
+    writeFileSync(agentKeyFilePath, 'PRE-EXISTING-AGENT-KEY-SENTINEL');
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawWithCa(ca),
+        cloneRepo: async () => {
+          throw new Error('must not be called — workspace already populated');
+        },
+        mintCloneToken: mintCloneTokenMustNotBeCalled(),
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => join(scratchDir(), `${ROLE}.pem`),
+        caCertPathFor: () => caCertFilePath,
+        caKeyPathFor: () => caKeyFilePath,
+        agentCertPathFor: () => agentCertFilePath,
+        agentKeyPathFor: () => agentKeyFilePath,
+      },
+    );
+
+    expect(outcome.status).toBe('deployed');
+    if (outcome.status !== 'deployed') throw new Error('unreachable');
+    expect(outcome.ca).toEqual({ status: 'already-current', certFingerprint: caCertFingerprint(ca.certPem) });
+    expect(outcome.certIssue).toBe('skipped-existing');
+
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(ca.certPem);
+    expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(ca.keyPem);
+    expect(readFileSync(agentCertFilePath, 'utf-8')).toBe('PRE-EXISTING-AGENT-CERT-SENTINEL');
+    expect(readFileSync(agentKeyFilePath, 'utf-8')).toBe('PRE-EXISTING-AGENT-KEY-SENTINEL');
+  });
+
+  it('CA present locally but DIFFERS from the vault: the WHOLE deploy fails, names both fingerprints, no App key written, no clone, no initAgent call', async () => {
+    const localCa = await mintTestCa('e2e-local');
+    const vaultCa = await mintTestCa('e2e-vault');
+    const caScratch = scratchDir();
+    const caCertFilePath = join(caScratch, 'ca-cert.pem');
+    const caKeyFilePath = join(caScratch, 'ca-key.pem');
+    writeFileSync(caCertFilePath, localCa.certPem, { mode: 0o644 });
+    writeFileSync(caKeyFilePath, localCa.keyPem, { mode: 0o600 });
+    const keyPath = join(scratchDir(), `${ROLE}.pem`);
+
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      join(scratchDir(), 'workspace'),
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawWithCa(vaultCa),
+        cloneRepo: async () => {
+          throw new Error('must not be called — refused before touching the workspace');
+        },
+        mintCloneToken: mintCloneTokenMustNotBeCalled(),
+        initAgent: fakeInitAgent(initCalls),
+        keyPathFor: () => keyPath,
+        caCertPathFor: () => caCertFilePath,
+        caKeyPathFor: () => caKeyFilePath,
+      },
+    );
+
+    expect(outcome.status).toBe('failed');
+    if (outcome.status !== 'failed') throw new Error('unreachable');
+    const localFp = caCertFingerprint(localCa.certPem);
+    const vaultFp = caCertFingerprint(vaultCa.certPem);
+    expect(outcome.reason).toContain(localFp);
+    expect(outcome.reason).toContain(vaultFp);
+    expect(outcome.reason).not.toContain(localCa.keyPem);
+    expect(outcome.reason).not.toContain(vaultCa.keyPem);
+    expect(outcome.reason).not.toContain(localCa.certPem);
+    expect(outcome.reason).not.toContain(vaultCa.certPem);
+
+    // Refused BEFORE any other side effect.
+    expect(existsSync(keyPath)).toBe(false);
+    expect(initCalls).toHaveLength(0);
+    // Local CA never overwritten.
+    expect(readFileSync(caCertFilePath, 'utf-8')).toBe(localCa.certPem);
+    expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(localCa.keyPem);
+  });
+
+  it('vault has NO CA for this fleet: deploy still succeeds, ca.status is "vault-absent", certIssue is "not-attempted" — degrades gracefully, exactly as before #976', async () => {
+    const keyPath = join(scratchDir(), `${ROLE}.pem`);
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      join(scratchDir(), 'workspace'),
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawFor('111', '222', PEM), // no CA fields
+        cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+        mintCloneToken: async () => FAKE_TOKEN,
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => keyPath,
+      },
+    );
+    expect(outcome.status).toBe('deployed');
+    if (outcome.status !== 'deployed') throw new Error('unreachable');
+    expect(outcome.ca).toEqual({ status: 'vault-absent' });
+    expect(outcome.certIssue).toBe('not-attempted');
   });
 });
 

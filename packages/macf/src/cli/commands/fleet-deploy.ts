@@ -11,11 +11,11 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
 import { parseFleetManifest } from '../bootstrap/fleet-manifest.js';
-import type { FleetDeployDeps, FleetDeployOutcome } from '../bootstrap/fleet-deploy.js';
+import type { CaMaterializeOutcome, FleetDeployDeps, FleetDeployOutcome } from '../bootstrap/fleet-deploy.js';
 import { deployAgent, realAuthenticatedCloneRepo, realMintCloneToken } from '../bootstrap/fleet-deploy.js';
 import { readVault } from '../bootstrap/vault-read.js';
 import { initAgent as realInitAgent } from './init.js';
-import { caCertPath } from '../config.js';
+import { agentCertPath, agentKeyPath } from '../config.js';
 
 export const FLEET_DEPLOY_JSON_SCHEMA_VERSION = 1;
 
@@ -42,16 +42,22 @@ export interface RunFleetDeployOptions {
 /** Injectable seam so tests drive the command without touching the network / a real operator key / a real `macf init` run. */
 export interface FleetDeployCommandDeps extends FleetDeployDeps {
   /**
-   * Confirms a per-project CA is materialized locally — steers the
-   * post-deploy "next step" message ONLY (never gates `deploy` itself;
-   * `initAgent` already degrades gracefully — a warning, not a failure —
-   * when no CA is present). Defaults to a real `existsSync(caCertPath(project))`
-   * check. CA materialization is explicitly OUT OF SCOPE for this command
-   * (see the PR/report for the reasoning) — this hook exists so the
-   * operator-facing message is honest about that gap rather than silently
-   * implying a cert-bearing, launch-ready workspace.
+   * Confirms the WORKSPACE actually has a usable mTLS agent cert — the
+   * ground-truth check {@link nextStepLines} uses to decide whether the
+   * "not running yet" block needs a warning (macf#976). Checked AFTER
+   * `deployAgent` (and therefore after `initAgent`) has run, so it reflects
+   * whatever actually landed on disk regardless of WHICH path produced it —
+   * this command's own vault-sourced CA materialize+issue
+   * (`bootstrap/fleet-deploy.ts::deployAgent`), `initAgent`'s existing
+   * already-local-CA branch, or an operator's manual `macf certs rotate`
+   * run against a pre-existing CA. Defaults to a real
+   * `existsSync(agentCertPath(destDir)) && existsSync(agentKeyPath(destDir))`
+   * check — already scoped under `destDir`, which every caller of this
+   * command already resolves to a real workspace path, so (unlike the
+   * per-project CA path resolvers on {@link FleetDeployDeps}) this default
+   * is test-safe without an override.
    */
-  readonly checkCaPresent?: (project: string) => boolean;
+  readonly checkAgentCertPresent?: (destDir: string) => boolean;
 }
 
 interface DeployFailure {
@@ -98,8 +104,12 @@ function resolveDeps(): FleetDeployCommandDeps {
     cloneRepo: realAuthenticatedCloneRepo,
     initAgent: realInitAgent,
     mintCloneToken: realMintCloneToken,
-    checkCaPresent: (project) => existsSync(caCertPath(project)),
   };
+}
+
+/** snake_case mirror of `CaMaterializeOutcome` (macf#976) — the `--json` wire shape is snake_case throughout; `certFingerprint` alone was the one field that leaked the TS-side camelCase convention into the render. */
+function caOutcomeToJson(ca: CaMaterializeOutcome): unknown {
+  return ca.status === 'vault-absent' ? { status: ca.status } : { status: ca.status, cert_fingerprint: ca.certFingerprint };
 }
 
 function outcomeToJson(outcome: FleetDeployOutcome): unknown {
@@ -114,6 +124,8 @@ function outcomeToJson(outcome: FleetDeployOutcome): unknown {
         key_path: outcome.keyPath,
         key_write: outcome.keyWrite,
         key_fingerprint: outcome.keyFingerprint,
+        ca: caOutcomeToJson(outcome.ca),
+        cert_issue: outcome.certIssue,
       };
     case 'failed':
       return { role: outcome.role, status: outcome.status, reason: outcome.reason };
@@ -122,22 +134,34 @@ function outcomeToJson(outcome: FleetDeployOutcome): unknown {
 
 /**
  * The post-deploy operator-facing "what now" block. Requirement 5's whole
- * point: never imply the agent is already running. When no per-project CA
- * is materialized locally (out of `deploy`'s scope — see module doc), say so
- * explicitly and name the missing prerequisite BEFORE the launch command,
- * rather than printing a bare `./claude.sh` over a workspace with no mTLS
- * cert.
+ * point: never imply the agent is already running. `deployAgent` now
+ * materializes the per-project CA from the vault and issues the agent's own
+ * mTLS cert itself (macf#976) — the residual gap this block still needs to
+ * name honestly is narrower: either NOTHING remains (cert present, just
+ * print the launch line), or the fleet's vault genuinely has no CA yet (say
+ * so, point at the real fix — `macf bootstrap apply`'s CA ceremony — and
+ * NEVER suggest hand-copying a CA private key between hosts), or — the rare
+ * defensive case — a CA was available but no cert landed anyway (say so and
+ * point at the local, key-copy-free `macf certs rotate`).
  */
-function nextStepLines(manifest: FleetManifest, destDir: string, deps: FleetDeployCommandDeps): readonly string[] {
-  const checkCaPresent = deps.checkCaPresent ?? ((project: string) => existsSync(caCertPath(project)));
-  const caPresent = checkCaPresent(manifest.metadata.name);
+function nextStepLines(
+  manifest: FleetManifest,
+  destDir: string,
+  outcome: Extract<FleetDeployOutcome, { status: 'deployed' }>,
+  deps: FleetDeployCommandDeps,
+): readonly string[] {
+  const checkAgentCertPresent =
+    deps.checkAgentCertPresent ?? ((d: string) => existsSync(agentCertPath(d)) && existsSync(agentKeyPath(d)));
+  const certPresent = checkAgentCertPresent(destDir);
   const lines: string[] = ['', `Workspace materialized at ${destDir} — the agent is NOT running yet.`];
-  if (!caPresent) {
+  if (!certPresent) {
     lines.push(
-      `⚠ No per-project CA found locally for fleet "${manifest.metadata.name}" — this workspace has no mTLS cert yet ` +
-        '(CA materialization is out of scope for `fleet deploy`; obtain it from the fleet vault or an already-deployed ' +
-        'agent host, then run):',
-      `  macf certs rotate --dir ${destDir}`,
+      outcome.ca.status === 'vault-absent'
+        ? `⚠ No mTLS cert: fleet "${manifest.metadata.name}"'s vault has no per-project CA yet — \`fleet deploy\` ` +
+            'has nothing to materialize a cert from. Provision the CA first (`macf bootstrap apply`), then re-run ' +
+            '`macf fleet deploy` to pick it up automatically.'
+        : `⚠ No mTLS cert at this workspace despite a per-project CA being available — check the deploy log above ` +
+            `for a cert-issuance error, then run: macf certs rotate --dir ${destDir}`,
     );
   }
   lines.push(`Next step: cd ${destDir} && ./claude.sh`);
@@ -216,7 +240,7 @@ export async function runFleetDeploy(opts: RunFleetDeployOptions, deps?: FleetDe
         `  Key: ${outcome.keyPath} (${outcome.keyWrite === 'written' ? 'materialized' : 'already present, not overwritten'}, ` +
         `fingerprint ${outcome.keyFingerprint})`,
     );
-    console.log(nextStepLines(manifest, destDir, resolved).join('\n'));
+    console.log(nextStepLines(manifest, destDir, outcome, resolved).join('\n'));
   } else {
     console.error(`Role "${outcome.role}" FAILED — ${outcome.reason}`);
   }
