@@ -81,12 +81,14 @@ agents:
     deploy_path: /home/ubuntu/repos/papers/icsoc-2026
 
 routing:
-  runner:                         # Amendment H — DECLARED, then registered by `deploy`.
-    labels: [self-hosted, macf-vm]  # what the router's pick-runner matches
-    scope: repo                     # repo | org (a USER account cannot hold
-                                    #   account-level runners → groundnuty/* is
-                                    #   repo-scoped by necessity)
-    name: macf-vm                   # identity for detect-and-reuse
+  runner:                         # Amendment H, corrected by Amendment J.
+                                  # AUTHORITATIVE FIELD LIST: FleetRoutingRunnerSchema
+                                  # in packages/macf/src/cli/bootstrap/fleet-manifest.ts
+    runs_on: self-hosted            # declaring `self-hosted` is what makes a missing
+                                    #   --runner-token a REFUSAL (Amendment H.1)
+    labels: [self-hosted, macf-vm]  # CROSS-CHECK against what pick-runner emits —
+                                    #   not the value that decides usability (macf#950)
+    warm: 1                         # latency posture; 1 per DR-009 §7.4 (macf#964)
                                   # Gates self-hosted eligibility via
                                   # MACF_TRUSTED_ACTORS (NOT MACF_ROUTING_RUNS_ON,
                                   # a v1 relic the v3 router never reads — macf#923).
@@ -521,3 +523,32 @@ The wrong order does not merely open a transient gap: **on partial failure it is
 **`macf#934` must land BEFORE `apply` calls `provision --labels`.** The gate resolves presence and visibility but never compares labels; today that gap is masked by the convention that every runner carries `macf-vm`. A caller-supplied `--labels` is precisely the mechanism that unmasks it — wiring the call first would take a latent gap and hand it a trigger.
 
 **References:** #939 (this amendment) · H2 (the clause replaced) · H.1 (confirmed unchanged) · Amendment G (the ladder gaining the rung) · #934 (the ordering dependency) · `macf-devops-toolkit` DR-009 §10.3 (the mechanical justification: *"it can destroy one, which the VM path cannot do at all"*).
+
+
+## Amendment J (2026-08-18, #942) — Amendment H's manifest example did not parse; the DR cites the schema rather than copying it
+
+**Trigger.** `#942` was filed — by me — claiming `name`/`scope` were **fossils in the manifest** left over from the withdrawn detect-and-reuse premise. Reading the schema overturned that: they were never in it. `FleetRoutingRunnerSchema` is `runs_on` + optional `labels`, `.strict()`. **The drifted artifact was this DR.**
+
+**The concrete defect was worse than a stale list — the example did not parse.** Amendment H's manifest sample declared `scope:` and `name:` (both rejected by `.strict()`) and omitted `runs_on` (required). An operator copying the DR's own example got a parse failure on three counts. Examples are the most-copied part of a design document, which makes a non-parsing one the most directly harmful form of drift.
+
+### J1 — the field list lives in the schema; this DR names it
+
+The example above now carries only fields that exist, and points at **`FleetRoutingRunnerSchema`** as the authority for *which fields exist*. The DR explains **semantics**; the code holds the **enumeration**.
+
+**This is a rule, not a one-off fix.** A document that *enumerates* a schema will diverge from it, because two copies of one list have nothing keeping them equal — and no one re-reads a DR against code that moved. A document that *names* the schema cannot diverge. So: **reasoning in prose, inventory in code, prose references inventory.** Same move as replacing a magic `32` with a relation (`#951`), and as *"integrate at the state surface, not at the credential"* (`#943`) — do not duplicate the thing, reference it.
+
+The limit, stated honestly: a citation can rot if the symbol is renamed. That failure is **loud** — a reader following `FleetRoutingRunnerSchema` and not finding it knows immediately that something moved — whereas a stale enumeration reads as current and authoritative. Trading a silent failure for a noisy one is the whole trade.
+
+*(Where prose genuinely needs the values — an operator consulting a list without opening TypeScript — the answer is not careful copying but a test that reads the constant and asserts the doc contains it. The discriminator: **is the enumeration the content, or an illustration of it?** Illustration → reference. Content → assert. Two live instances of the content case exist outside this DR: `coordination.md`'s sandbox list and `observability-wiring.md`'s OTEL set, the latter documenting its own defect — *"CI does not enforce the lockstep — keep it manually."*)*
+
+### J2 — the three fields, and what each actually does
+
+- **`runs_on`** — required. Declaring `self-hosted` is precisely what makes a missing `--runner-token` a **refusal** (Amendment H.1's policy gate). H described the runner as "declared" without naming the field the gate keys on, so a reader could not connect the two.
+- **`labels`** — optional, and **a cross-check, not a source.** Post-`#950` the router's emitted constant (`ROUTER_EMITTED_LABELS`) is the source of truth for runner usability; a manifest declaring labels that are not a superset is **rejected at parse**. So **the manifest declares labels it does not control** — counterintuitive enough that leaving it unstated invites someone to "fix" the gate to read from the manifest, which is the exact inversion `#934` closed.
+- **`warm`** — optional, defaulting to **1** per DR-009 §7.4 (*"latency above all; `warm: 1` is mandatory, not a default to tune"*); `0` is meaningful only for a fleet declared dormant. Added in `#964` **together with its registration as un-actioned** in `planItemApplyCoverage`, because `apply` does not yet call the provisioning contract (`#943`): a silently-unenforced `warm` would have reproduced `#957`'s *"desired state accepted, recorded, reported converged, not enforced"* deliberately. The warning renders on every `plan` and stops on its own when `#943` wires it.
+
+### J3 — `scope` stays absent, and the reason is not "we removed it"
+
+On a **User account** `scope` can only ever be `repo` — private accounts cannot hold account-level runners at all — so it is not merely single-valued, it is **meaningless** on the topology that is the design centre. **A field with one legal value is not a choice; it is a knob whose only use is getting it wrong.** Same reason `transport.vault_repo` was removed in Amendment F.
+
+Re-add it when an org-owned fleet makes the choice real — not on a "for completeness" pass. Stating the reason here is what prevents that pass: an unstated exclusion gets re-added, and an exclusion stated with a *false* reason gets **reversed**, which is worse because the reversal looks like a correction.
