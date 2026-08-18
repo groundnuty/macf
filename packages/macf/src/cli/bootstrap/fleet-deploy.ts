@@ -64,14 +64,15 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash, createPrivateKey, createPublicKey } from 'node:crypto';
 import type { RegistryConfig, TokenSource } from '@groundnuty/macf-core';
-import { toVariableSegment, generateToken } from '@groundnuty/macf-core';
+import { toVariableSegment, generateToken, loadCA, caCertFingerprint, generateAgentCert } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 import type { VaultReadOptions } from './vault-read.js';
-import { queryVaultAgentPresence } from './vault-read.js';
+import { queryVaultAgentPresence, queryVaultCaPresence } from './vault-read.js';
 import { secretFingerprint } from './fleet-lock.js';
 import type { InitOptions } from '../commands/init.js';
 import { defaultAgentKeyPath } from '../commands/init.js';
+import { caCertPath, caKeyPath, agentCertPath, agentKeyPath } from '../config.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -161,9 +162,10 @@ export function extractAgentVaultCredentials(
  * remove the scratch dir in `finally` regardless of outcome, so a `rename`
  * failure never leaves the plaintext lingering in the scratch dir.
  *
- * No plaintext ever touches disk anywhere else — this is the ONLY disk write
- * in this module's entire credential path (the decrypted PEM otherwise lives
- * only in {@link AgentVaultCredentials}, a local variable).
+ * No plaintext ever touches disk anywhere else in the APP-KEY path (the
+ * decrypted PEM otherwise lives only in {@link AgentVaultCredentials}, a
+ * local variable). The per-project CA's PRIVATE key (macf#976, below) reuses
+ * this exact function — same secret-material contract, same 0600 mode.
  */
 export function writeAgentKeyAtomic0600(destPath: string, pem: string): void {
   const dir = dirname(destPath);
@@ -176,6 +178,32 @@ export function writeAgentKeyAtomic0600(destPath: string, pem: string): void {
     chmodSync(scratchFile, 0o600);
     renameSync(scratchFile, destPath);
     chmodSync(destPath, 0o600);
+  } finally {
+    rmSync(scratchDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Sibling of {@link writeAgentKeyAtomic0600} for the CA's PUBLIC cert
+ * (mode `0644` — not secret; macf#976). Identical mkdtemp/chmod/rename
+ * atomic-write dance (see that function's doc for the full crash-safety
+ * rationale) — a second, hand-duplicated ~15-line copy rather than threading
+ * a `mode` parameter through the existing, already-tested
+ * `writeAgentKeyAtomic0600`: that function's 0600 contract is the one thing
+ * in this module that must never regress, so it stays untouched and this
+ * sibling carries the only other mode this module ever writes.
+ */
+export function writeCaCertAtomic0644(destPath: string, certPem: string): void {
+  const dir = dirname(destPath);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const scratchDir = mkdtempSync(join(dir, '.macf-ca-cert-'));
+  try {
+    chmodSync(scratchDir, 0o700);
+    const scratchFile = join(scratchDir, 'cert.pem');
+    writeFileSync(scratchFile, certPem, { mode: 0o644 });
+    chmodSync(scratchFile, 0o644);
+    renameSync(scratchFile, destPath);
+    chmodSync(destPath, 0o644);
   } finally {
     rmSync(scratchDir, { recursive: true, force: true });
   }
@@ -438,6 +466,186 @@ export function initRegistryOptionsFor(
   }
 }
 
+// --- Per-project CA materialization from the vault (macf#976) ---
+//
+// The gap this closes: `deployAgent` decrypts the fleet vault (a few lines
+// above) which — when the fleet's CA ceremony has run (`apply-ca.ts`) —
+// holds the per-project CA's key+cert right alongside the App credentials
+// this file already materializes. Nothing ever carried the CA the same 60
+// bytes further: `deploy` finished and told the operator to "obtain it from
+// the fleet vault" — the vault it had JUST decrypted and let go of. Third
+// instance of this shape in this subsystem (#862, #968, now this) — the
+// credential is decrypted, the consumer path (here: `initAgent`'s existing,
+// unconditional "CA present locally -> issue agent cert" branch in
+// `commands/init.ts`) was written independently, and nothing connected them.
+//
+// **Never a second CRYPTO implementation.** {@link materializeProjectCa}
+// only decodes + writes bytes; the actual cert issuance below
+// ({@link issueAgentCertIfNeeded}) calls the SAME `@groundnuty/macf-core`
+// `loadCA`/`generateAgentCert` primitives `certs.ts::certsRotate` already
+// uses — reused, not reimplemented.
+
+export type CaMaterializeOutcome =
+  | { readonly status: 'materialized'; readonly certFingerprint: string }
+  | { readonly status: 'already-current'; readonly certFingerprint: string }
+  /** The fleet vault has no per-project CA at all (this fleet's CA ceremony hasn't run, or predates it) — NOT a failure; `deployAgent` degrades gracefully, same as it always has. */
+  | { readonly status: 'vault-absent' };
+
+export interface CaPathDeps {
+  readonly caCertPathFor: (fleetName: string) => string;
+  readonly caKeyPathFor: (fleetName: string) => string;
+}
+
+/**
+ * Decode the per-project CA out of an already-decrypted vault raw map and
+ * make it usable locally at the SAME conventional path `certs.ts`/
+ * `commands/init.ts` already read from ({@link caCertPath}/{@link caKeyPath}
+ * by default) — mint-or-reuse, NEVER re-mint, mirroring
+ * `apply-ca.ts::resolveCaCert`'s own "never mint twice" discipline one layer
+ * down (this function never mints anything; it only ever writes what the
+ * vault already holds).
+ *
+ * **Compares by PUBLIC-KEY (cert) fingerprint only — never raw key
+ * material.** {@link caCertFingerprint} hashes the cert's DER bytes (a
+ * public, non-secret value); the private key is never compared byte-for-byte
+ * and never appears in this function's return value or in any thrown
+ * message (see {@link FleetDeployError} below — both fingerprints named,
+ * neither PEM echoed).
+ *
+ * A LOCAL CA that exists but DIFFERS from the vault's refuses loudly (never
+ * silently overwrites — same "orphan a real credential" hazard
+ * `apply-ca.ts`'s own doc names for the mint side). A local pair that is
+ * only PARTIALLY present (exactly one of cert/key on disk) is treated the
+ * same as "neither present": a lone cert or lone key is not a usable CA
+ * pair either way, so there is nothing there worth protecting by refusing —
+ * the complete, vault-confirmed pair is materialized fresh over it.
+ */
+export async function materializeProjectCa(
+  raw: Readonly<Record<string, string>>,
+  fleetName: string,
+  deps: CaPathDeps,
+): Promise<CaMaterializeOutcome> {
+  const presence = queryVaultCaPresence(raw, fleetName);
+  if (!(presence.caKey.present && presence.caCert.present)) {
+    return { status: 'vault-absent' };
+  }
+
+  const seg = toVariableSegment(fleetName);
+  const vaultKeyB64 = raw[`MACF_${seg}_CA_KEY_B64`];
+  const vaultCertB64 = raw[`MACF_${seg}_CA_CERT_B64`];
+  // The presence check above already proved these are defined + non-empty;
+  // this defensive re-check (never a `!` assertion) mirrors
+  // `extractAgentVaultCredentials`'s own posture — a future drift between
+  // `queryVaultCaPresence`'s field derivation and this read-back stays a
+  // visible failure, not an unsafe cast.
+  if (vaultKeyB64 === undefined || vaultCertB64 === undefined) {
+    throw new FleetDeployError(
+      'vault_entry_missing_for_role',
+      `internal inconsistency: CA presence check reported complete for fleet "${fleetName}" but the raw fields ` +
+        'read back undefined — this indicates a bug in the vault-key derivation, not a genuinely absent credential.',
+    );
+  }
+  const vaultKeyPem = Buffer.from(vaultKeyB64, 'base64').toString('utf-8');
+  const vaultCertPem = Buffer.from(vaultCertB64, 'base64').toString('utf-8');
+  const vaultFingerprint = caCertFingerprint(vaultCertPem);
+
+  const caCertFilePath = deps.caCertPathFor(fleetName);
+  const caKeyFilePath = deps.caKeyPathFor(fleetName);
+  const localComplete = existsSync(caCertFilePath) && existsSync(caKeyFilePath);
+
+  if (localComplete) {
+    const localFingerprint = caCertFingerprint(readFileSync(caCertFilePath, 'utf-8'));
+    if (localFingerprint !== vaultFingerprint) {
+      throw new FleetDeployError(
+        'ca_mismatch_local_vs_vault',
+        `local per-project CA at "${caCertFilePath}" (fingerprint ${localFingerprint}) does NOT match fleet ` +
+          `"${fleetName}"'s vaulted CA (fingerprint ${vaultFingerprint}) — refusing to overwrite a CA that may be ` +
+          'in independent use. Investigate manually before re-running: was this CA rotated locally without also ' +
+          'updating the vault, or is this the wrong vault/identity for this fleet?',
+      );
+    }
+    return { status: 'already-current', certFingerprint: localFingerprint };
+  }
+
+  writeAgentKeyAtomic0600(caKeyFilePath, vaultKeyPem);
+  writeCaCertAtomic0644(caCertFilePath, vaultCertPem);
+  return { status: 'materialized', certFingerprint: vaultFingerprint };
+}
+
+// --- Agent leaf-cert issuance (macf#976) ---
+
+export type AgentCertIssueOutcome = 'issued' | 'skipped-existing';
+
+export interface AgentCertPathDeps {
+  readonly agentCertPathFor: (destDir: string) => string;
+  readonly agentKeyPathFor: (destDir: string) => string;
+}
+
+/**
+ * Issue this agent's own CA-signed mTLS leaf cert at `destDir` — the SAME
+ * `generateAgentCert` call `commands/init.ts`'s GitHub-mode cert-flow
+ * (macf#545) and `certs.ts::certsRotate` already make, so a workspace
+ * `deployAgent` hands off carries a WORKING cert the moment `deployAgent`
+ * returns, before `initAgent` even runs.
+ *
+ * **Named residual: `initAgent`'s own cert-flow branch
+ * (`commands/init.ts` ~L629-652) is UNCONDITIONAL** — `if (CA files exist)
+ * -> generateAgentCert(...)`, with no existence check on the destination
+ * cert. Once this function has materialized the local CA, `deployAgent`'s
+ * subsequent `initAgent` call therefore ALWAYS re-issues a fresh cert
+ * regardless of what this function just did — harmless for validity (same
+ * CA, same CN, same SAN, so the overwrite is an equally-valid cert), but it
+ * means a `'skipped-existing'` result from THIS function can disagree with
+ * what's actually on disk by the time `deployAgent` returns (init's second
+ * pass may have overwritten it anyway). `FleetDeployOutcome.certIssue`
+ * reports what THIS function did, not the final on-disk state — teaching
+ * `initAgent` an existence guard is out of scope for macf#976 (touches
+ * `InitOptions`, a wider surface than this fix).
+ *
+ * Idempotent AT THIS LAYER: an already-present cert+key pair at `destDir`
+ * is left untouched by THIS function (`'skipped-existing'`) — mirrors
+ * {@link deployAgent}'s own App-key skip-if-exists contract one level up.
+ * `certCn` is the routing identity (macf#545) — callers pass `agent.role`,
+ * matching what `initAgent` itself defaults to when
+ * `InitOptions.routingLabel`/`name` are unset (as `deployAgent`'s own
+ * `initAgent` call already leaves them).
+ */
+export async function issueAgentCertIfNeeded(
+  destDir: string,
+  certCn: string,
+  caCertPem: string,
+  caKeyPem: string,
+  advertiseHost: string,
+  deps: AgentCertPathDeps,
+): Promise<AgentCertIssueOutcome> {
+  const certPath = deps.agentCertPathFor(destDir);
+  const keyPath = deps.agentKeyPathFor(destDir);
+  if (existsSync(certPath) && existsSync(keyPath)) {
+    return 'skipped-existing';
+  }
+  mkdirSync(dirname(certPath), { recursive: true });
+  await generateAgentCert({
+    agentName: certCn,
+    caCertPem,
+    caKeyPem,
+    advertiseHost,
+    certPath,
+    keyPath,
+  });
+  return 'issued';
+}
+
+function caMaterializeLogLine(role: string, ca: CaMaterializeOutcome): string {
+  switch (ca.status) {
+    case 'materialized':
+      return `Role "${role}": per-project CA materialized from the fleet vault (cert fingerprint ${ca.certFingerprint}).`;
+    case 'already-current':
+      return `Role "${role}": per-project CA already present locally and matches the fleet vault — not re-issued.`;
+    case 'vault-absent':
+      return `Role "${role}": fleet vault has no per-project CA yet — skipping cert issuance (run \`macf bootstrap apply\` to mint one).`;
+  }
+}
+
 // --- The per-agent orchestration ---
 
 export interface FleetDeployDeps {
@@ -469,6 +677,26 @@ export interface FleetDeployDeps {
    * operator's home directory, which may hold a real, live fleet's key.
    */
   readonly keyPathFor?: (role: string) => string;
+  /**
+   * Resolves the per-project CA cert/key paths (macf#976). Defaults to
+   * {@link caCertPath}/{@link caKeyPath} (`~/.macf/certs/<project>/ca-{cert,key}.pem`
+   * — the SAME conventional path `certs.ts` and `commands/init.ts`'s
+   * GitHub-mode cert-flow already read from). **Tests MUST override both to
+   * a scratch directory** — the default resolves under the REAL operator's
+   * home directory, which may hold a real, live fleet's CA.
+   */
+  readonly caCertPathFor?: (fleetName: string) => string;
+  readonly caKeyPathFor?: (fleetName: string) => string;
+  /**
+   * Resolves this agent's own mTLS leaf-cert paths at the deployed
+   * workspace (macf#976). Defaults to {@link agentCertPath}/{@link agentKeyPath}
+   * (`<destDir>/.macf/certs/agent-{cert,key}.pem`). Already scoped under
+   * `destDir` — which every test in this suite already points at a scratch
+   * dir — so, unlike `caCertPathFor`/`caKeyPathFor` above, the default is
+   * test-safe without an override; still overridable for direct control.
+   */
+  readonly agentCertPathFor?: (destDir: string) => string;
+  readonly agentKeyPathFor?: (destDir: string) => string;
   readonly log?: (line: string) => void;
   /**
    * Opt-in (macf#975; CLI flag `--force-key`) to re-materialize the on-disk
@@ -511,6 +739,21 @@ export type FleetDeployOutcome =
        * same-key-different-encoding file is never falsely refused.
        */
       readonly keyFingerprint: string;
+      /** Per-project CA materialize-or-reuse-or-refuse outcome (macf#976) — never carries key material, only a public cert fingerprint. */
+      readonly ca: CaMaterializeOutcome;
+      /**
+       * Whether {@link issueAgentCertIfNeeded} (called from within THIS
+       * function) issued the agent's own mTLS leaf cert — `'not-attempted'`
+       * when {@link CaMaterializeOutcome.status} is `'vault-absent'`
+       * (nothing to issue against). Reports what THIS layer did, NOT
+       * necessarily the final on-disk state: `initAgent` (called after,
+       * inside the SAME `deployAgent` run) has its own unconditional
+       * cert-flow branch once a local CA exists — see
+       * {@link issueAgentCertIfNeeded}'s doc "Named residual" for why a
+       * `'skipped-existing'` here can still be followed by `initAgent`
+       * silently re-issuing.
+       */
+      readonly certIssue: AgentCertIssueOutcome | 'not-attempted';
     }
   | { readonly role: string; readonly status: 'failed'; readonly reason: string };
 
@@ -635,11 +878,12 @@ function materializeAgentKey(
 }
 
 /**
- * Drive ONE agent through decrypt → extract → materialize key → materialize
- * workspace → delegate to `initAgent`. NEVER throws — every failure path
- * (missing vault, bad identity, wrong key, missing vault entry, an
- * unsupported registry mode, a key-fingerprint mismatch, a token-mint
- * failure, a clone failure, an `initAgent` throw) resolves to
+ * Drive ONE agent through decrypt → extract → materialize CA → materialize
+ * key → materialize workspace → issue agent cert → delegate to `initAgent`.
+ * NEVER throws — every failure path (missing vault, bad identity, wrong key,
+ * missing vault entry, an unsupported registry mode, a key-fingerprint
+ * mismatch, a CA mismatch, a token-mint failure, a clone failure, an
+ * `initAgent` throw) resolves to
  * `status: 'failed'` with an operator-actionable, secret-free `reason`.
  *
  * **Key materialization now runs BEFORE the clone (macf#968; was clone-then-
@@ -659,6 +903,14 @@ function materializeAgentKey(
  * `deps.forceKey` is `true`, in which case the on-disk key is overwritten
  * from the vault (same atomic-0600 write as the absent-key path) and
  * deployment proceeds normally.
+ *
+ * **CA materialize runs before that, and agent-cert issuance after the
+ * clone (macf#976).** The CA is fleet-level (independent of `destDir`), so
+ * it can — and, to fail fast on a mismatch before any other side effect
+ * runs, should — resolve first. The agent's own leaf cert is written INTO
+ * `destDir`, so it MUST wait until the workspace is actually cloned (see
+ * the inline comment at that call site for why the ordering is load-bearing,
+ * not stylistic).
  */
 export async function deployAgent(
   agent: FleetAgent,
@@ -675,6 +927,17 @@ export async function deployAgent(
     const creds = extractAgentVaultCredentials(raw, manifest.metadata.name, role);
 
     const registryOpts = initRegistryOptionsFor(manifest.owner.registry);
+
+    // CA materialize runs BEFORE any side effect below (macf#976) — a
+    // mismatch refuses the ENTIRE deploy with NOTHING else touched (no App
+    // key written, no clone, no `initAgent`) rather than leaving a
+    // half-deployed workspace behind a loud error.
+    const caPathDeps: CaPathDeps = {
+      caCertPathFor: deps.caCertPathFor ?? caCertPath,
+      caKeyPathFor: deps.caKeyPathFor ?? caKeyPath,
+    };
+    const ca = await materializeProjectCa(raw, manifest.metadata.name, caPathDeps);
+    log(caMaterializeLogLine(role, ca));
 
     const keyPath = (deps.keyPathFor ?? defaultAgentKeyPath)(role);
     const { keyWrite, keyFingerprint } = materializeAgentKey(role, keyPath, creds.privateKeyPem, deps, log);
@@ -693,6 +956,21 @@ export async function deployAgent(
       `Role "${role}": workspace ${workspace === 'cloned' ? `cloned into ${destDir}` : `already present at ${destDir} — not re-cloned`}.`,
     );
 
+    // Agent leaf-cert issuance needs BOTH a resolved CA and a materialized
+    // destDir — this MUST run AFTER the clone above, never before: writing
+    // into `destDir/.macf/certs/` before the clone would make
+    // `ensureAgentWorkspaceCloned`'s own `isEmptyDir` check see a non-empty
+    // dir and skip cloning the real repo content.
+    let certIssue: AgentCertIssueOutcome | 'not-attempted' = 'not-attempted';
+    if (ca.status === 'materialized' || ca.status === 'already-current') {
+      const caPair = loadCA(caPathDeps.caCertPathFor(manifest.metadata.name), caPathDeps.caKeyPathFor(manifest.metadata.name));
+      certIssue = await issueAgentCertIfNeeded(destDir, role, caPair.certPem, caPair.keyPem, manifest.network.advertise_host, {
+        agentCertPathFor: deps.agentCertPathFor ?? agentCertPath,
+        agentKeyPathFor: deps.agentKeyPathFor ?? agentKeyPath,
+      });
+      log(`Role "${role}": agent mTLS cert ${certIssue === 'issued' ? 'issued' : 'already present — not re-issued'}.`);
+    }
+
     await deps.initAgent(destDir, {
       project: manifest.metadata.name,
       role,
@@ -706,7 +984,18 @@ export async function deployAgent(
     });
     log(`Role "${role}": macf init completed at ${destDir}.`);
 
-    return { role, status: 'deployed', appId: creds.appId, installId: creds.installId, workspace, keyPath, keyWrite, keyFingerprint };
+    return {
+      role,
+      status: 'deployed',
+      appId: creds.appId,
+      installId: creds.installId,
+      workspace,
+      keyPath,
+      keyWrite,
+      keyFingerprint,
+      ca,
+      certIssue,
+    };
   } catch (err) {
     return { role, status: 'failed', reason: errMessage(err) };
   }

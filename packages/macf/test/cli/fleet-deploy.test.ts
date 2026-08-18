@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runFleetDeploy, type FleetDeployCommandDeps } from '../../src/cli/commands/fleet-deploy.js';
 import type { InitOptions } from '../../src/cli/commands/init.js';
+import { createCA } from '@groundnuty/macf-core';
 
 const FLEET_YAML = `apiVersion: macf/v0
 kind: Fleet
@@ -84,7 +85,7 @@ function depsFor(overrides: Partial<FleetDeployCommandDeps> = {}): FleetDeployCo
     initAgent: async () => {
       throw new Error('must not be called');
     },
-    checkCaPresent: () => true,
+    checkAgentCertPresent: () => true,
     keyPathFor: () => join(scratchDir(), 'scratch-agent-key.pem'),
     ...overrides,
   };
@@ -275,7 +276,7 @@ describe('runFleetDeploy — happy path + rendering', () => {
     }
   });
 
-  it('when no local CA is present, the next-step block names the missing prerequisite BEFORE the launch line', async () => {
+  it('when the vault has NO per-project CA, the next-step block names the real gap (provision the CA) — NEVER hand-copy advice (macf#976)', async () => {
     const { manifestPath, dir } = writeManifest();
     const destDir = join(dir, 'workspace');
     const cap = captureConsole();
@@ -289,20 +290,81 @@ describe('runFleetDeploy — happy path + rendering', () => {
               [`MACF_AGENT_${seg}_APP_ID`]: '111',
               [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
               [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+              // Deliberately NO CA_KEY_B64 / CA_CERT_B64 fields — the vault
+              // genuinely has no CA for this fleet.
             };
           },
           cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
           initAgent: async () => {},
-          checkCaPresent: () => false,
+          // checkAgentCertPresent NOT overridden here — the real default
+          // (existsSync at destDir) correctly reports "absent" since
+          // nothing in this fake chain ever wrote a cert there.
+          checkAgentCertPresent: undefined,
         }),
       );
       expect(code).toBe(0);
       const out = cap.logs.join('\n');
-      const caWarnIdx = out.indexOf('No per-project CA');
+      const caWarnIdx = out.indexOf('No mTLS cert');
       const nextStepIdx = out.indexOf('Next step:');
       expect(caWarnIdx).toBeGreaterThan(-1);
       expect(nextStepIdx).toBeGreaterThan(caWarnIdx);
-      expect(out).toContain('macf certs rotate');
+      expect(out).toContain('vault has no per-project CA yet');
+      expect(out).toContain('macf bootstrap apply');
+      // The OLD, unsafe advice must never appear again anywhere in this render.
+      expect(out).not.toContain('an already-deployed agent host');
+      expect(out).not.toContain('CA materialization is out of scope');
+      expect(out).not.toContain('macf certs rotate');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('when the vault HAS a per-project CA, deploy materializes it + issues a REAL, usable agent cert — next-step block shows NO warning (macf#976, the decisive rendering assertion)', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const mintDir = scratchDir();
+    const ca = await createCA({
+      project: 'cmd-deploy-ca-test',
+      certPath: join(mintDir, 'minted-ca-cert.pem'),
+      keyPath: join(mintDir, 'minted-ca-key.pem'),
+    });
+    const caCertFilePath = join(scratchDir(), 'materialized-ca-cert.pem');
+    const caKeyFilePath = join(scratchDir(), 'materialized-ca-key.pem');
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+              MACF_DEMO_FLEET_CA_KEY_B64: Buffer.from(ca.keyPem, 'utf-8').toString('base64'),
+              MACF_DEMO_FLEET_CA_CERT_B64: Buffer.from(ca.certPem, 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          initAgent: async () => {},
+          // Only the per-project CA path resolvers need overriding (their
+          // real default resolves under the operator's home). The agent
+          // leaf-cert path resolvers are left at their real default here
+          // ON PURPOSE — `agentCertPath(destDir)`/`agentKeyPath(destDir)`
+          // are already scoped under THIS test's own scratch `destDir`, so
+          // exercising the real function is both safe and the more
+          // faithful test of the actual wiring (deployAgent's write side
+          // and nextStepLines' read side must agree on the SAME path).
+          caCertPathFor: () => caCertFilePath,
+          caKeyPathFor: () => caKeyFilePath,
+        }),
+      );
+      expect(code).toBe(0);
+      const out = cap.logs.join('\n');
+      expect(out).not.toContain('No mTLS cert');
+      expect(out).not.toContain('vault has no per-project CA');
+      expect(out).toContain('Next step:');
+      expect(out).toContain('./claude.sh');
     } finally {
       cap.restore();
     }
@@ -331,9 +393,57 @@ describe('runFleetDeploy — happy path + rendering', () => {
       const out = cap.logs.join('\n');
       expect(out).not.toContain('SYNTH-SECRET-PEM');
       expect(out).not.toContain(Buffer.from('SYNTH-SECRET-PEM', 'utf-8').toString('base64'));
-      const parsed = JSON.parse(out) as { outcome: { status: string; key_fingerprint?: string } };
+      const parsed = JSON.parse(out) as { outcome: { status: string; key_fingerprint?: string; ca?: { status: string }; cert_issue?: string } };
       expect(parsed.outcome.status).toBe('deployed');
       expect(parsed.outcome.key_fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+      // No CA fields in this test's fake vault -> vault-absent, snake_case shape.
+      expect(parsed.outcome.ca).toEqual({ status: 'vault-absent' });
+      expect(parsed.outcome.cert_issue).toBe('not-attempted');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('--json render: the `ca` block is snake_case throughout (macf#976) — `cert_fingerprint`, never the camelCase `certFingerprint` the TS side uses internally', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const ca = await createCA({
+      project: 'json-shape-ca-test',
+      certPath: join(scratchDir(), 'minted-ca-cert.pem'),
+      keyPath: join(scratchDir(), 'minted-ca-key.pem'),
+    });
+    const caCertFilePath = join(scratchDir(), 'materialized-ca-cert.pem');
+    const caKeyFilePath = join(scratchDir(), 'materialized-ca-key.pem');
+    const cap = captureConsole();
+    try {
+      await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir, json: true },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+              MACF_DEMO_FLEET_CA_KEY_B64: Buffer.from(ca.keyPem, 'utf-8').toString('base64'),
+              MACF_DEMO_FLEET_CA_CERT_B64: Buffer.from(ca.certPem, 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          initAgent: async () => {},
+          caCertPathFor: () => caCertFilePath,
+          caKeyPathFor: () => caKeyFilePath,
+        }),
+      );
+      const out = cap.logs.join('\n');
+      const parsed = JSON.parse(out) as {
+        outcome: { status: string; ca: { status: string; cert_fingerprint?: string }; cert_issue: string };
+      };
+      expect(parsed.outcome.ca.status).toBe('materialized');
+      expect(parsed.outcome.ca.cert_fingerprint).toMatch(/^[0-9a-f]{64}$/);
+      expect(parsed.outcome.cert_issue).toBe('issued');
+      // The camelCase TS-internal field name must never leak into the wire shape.
+      expect(out).not.toContain('certFingerprint');
     } finally {
       cap.restore();
     }
