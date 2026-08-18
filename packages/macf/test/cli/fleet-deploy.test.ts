@@ -7,7 +7,7 @@
  * requirement), manifest/role loading, and rendering.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runFleetDeploy, type FleetDeployCommandDeps } from '../../src/cli/commands/fleet-deploy.js';
@@ -333,6 +333,80 @@ describe('runFleetDeploy — happy path + rendering', () => {
       const parsed = JSON.parse(out) as { outcome: { status: string; key_fingerprint?: string } };
       expect(parsed.outcome.status).toBe('deployed');
       expect(parsed.outcome.key_fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+    } finally {
+      cap.restore();
+    }
+  });
+});
+
+describe('runFleetDeploy — App-key fingerprint mismatch (macf#975)', () => {
+  it('a mismatched on-disk key REFUSES (exit 1, status "failed") and never reaches initAgent, without --force-key', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const keyPath = join(scratchDir(), 'code-agent.pem');
+    writeFileSync(keyPath, 'STALE-KEY-FROM-A-DESTROYED-FLEET', { mode: 0o600 });
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir, json: true },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('CURRENT-VAULT-PEM', 'utf-8').toString('base64'),
+            };
+          },
+          initAgent: async () => {
+            throw new Error('must not be called — refused before initAgent');
+          },
+          keyPathFor: () => keyPath,
+        }),
+      );
+      expect(code).toBe(1);
+      const parsed = JSON.parse(cap.logs.join('\n')) as { outcome: { status: string; reason: string } };
+      expect(parsed.outcome.status).toBe('failed');
+      expect(parsed.outcome.reason).toContain('does not match');
+      expect(parsed.outcome.reason).toContain('--force-key');
+      expect(parsed.outcome.reason).not.toContain('STALE-KEY-FROM-A-DESTROYED-FLEET');
+      expect(parsed.outcome.reason).not.toContain('CURRENT-VAULT-PEM');
+      // The stale on-disk key was never overwritten by the refusal path.
+      expect(readFileSync(keyPath, 'utf-8')).toBe('STALE-KEY-FROM-A-DESTROYED-FLEET');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('--force-key re-materializes a mismatched key from the vault and proceeds to deploy (exit 0)', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const keyPath = join(scratchDir(), 'code-agent.pem');
+    writeFileSync(keyPath, 'STALE-KEY-FROM-A-DESTROYED-FLEET', { mode: 0o600 });
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir, forceKey: true },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('CURRENT-VAULT-PEM', 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          initAgent: async (d, o) => {
+            initCalls.push({ dir: d, opts: o });
+          },
+          keyPathFor: () => keyPath,
+        }),
+      );
+      expect(code).toBe(0);
+      expect(initCalls).toHaveLength(1);
+      expect(readFileSync(keyPath, 'utf-8')).toBe('CURRENT-VAULT-PEM');
     } finally {
       cap.restore();
     }

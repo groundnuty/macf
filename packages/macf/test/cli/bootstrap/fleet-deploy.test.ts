@@ -304,7 +304,7 @@ describe('deployAgent — offline (injected readVault/cloneRepo/initAgent)', () 
     });
   });
 
-  it('IDEMPOTENT key write: a pre-existing key file at the destination is left byte-for-byte untouched on re-run', async () => {
+  it('IDEMPOTENT key write: a pre-existing key file that MATCHES the vault is left byte-for-byte untouched on re-run', async () => {
     const dir = scratchDir();
     const destDir = join(dir, 'workspace');
     // Non-empty so the workspace-materialize step ALSO skips (this test
@@ -314,7 +314,9 @@ describe('deployAgent — offline (injected readVault/cloneRepo/initAgent)', () 
     writeFileSync(join(destDir, 'already-here.txt'), 'x');
     const keyDir = scratchDir();
     const keyPath = join(keyDir, `${ROLE}.pem`);
-    writeFileSync(keyPath, 'OPERATOR-ROTATED-KEY-SENTINEL', { mode: 0o600 });
+    // Same content the vault holds (byte-for-byte) — a prior deploy run's
+    // own atomic write would look exactly like this.
+    writeFileSync(keyPath, PEM, { mode: 0o600 });
 
     const outcome = await deployAgent(
       AGENT,
@@ -335,8 +337,238 @@ describe('deployAgent — offline (injected readVault/cloneRepo/initAgent)', () 
     expect(outcome.status).toBe('deployed');
     if (outcome.status !== 'deployed') throw new Error('unreachable');
     expect(outcome.keyWrite).toBe('skipped-existing');
-    // The sentinel content proves this is the SAME file, never clobbered by the vault's (different) PEM.
-    expect(readFileSync(keyPath, 'utf-8')).toBe('OPERATOR-ROTATED-KEY-SENTINEL');
+    expect(outcome.keyFingerprint).toBe(secretFingerprint(PEM));
+    // Same content, never rewritten.
+    expect(readFileSync(keyPath, 'utf-8')).toBe(PEM);
+  });
+
+  it('on-disk key MATCHES the vault -> skipped-existing, deploy proceeds normally (mint IS attempted — no refusal)', async () => {
+    const dir = scratchDir();
+    // Deliberately FRESH (not pre-populated) so the clone — and therefore the
+    // lazy mint — actually runs; this is what proves the matching-fingerprint
+    // path does not block the rest of the deploy (macf#975 AC).
+    const destDir = join(dir, 'workspace');
+    const keyDir = scratchDir();
+    const keyPath = join(keyDir, `${ROLE}.pem`);
+    writeFileSync(keyPath, PEM, { mode: 0o600 });
+    let mintCalled = false;
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawFor('111', '222', PEM),
+        cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+        mintCloneToken: async () => {
+          mintCalled = true;
+          return FAKE_TOKEN;
+        },
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => keyPath,
+      },
+    );
+
+    expect(outcome.status).toBe('deployed');
+    if (outcome.status !== 'deployed') throw new Error('unreachable');
+    expect(outcome.keyWrite).toBe('skipped-existing');
+    expect(mintCalled).toBe(true);
+    expect(readFileSync(keyPath, 'utf-8')).toBe(PEM);
+  });
+
+  it('on-disk key does NOT match the vault -> refuses BEFORE the mint (the decisive assertion: mint seam never called — a post-mint refusal would still 401 first)', async () => {
+    const dir = scratchDir();
+    const destDir = join(dir, 'workspace');
+    const keyDir = scratchDir();
+    const keyPath = join(keyDir, `${ROLE}.pem`);
+    const staleKey = 'STALE-KEY-FROM-A-DESTROYED-FLEET';
+    writeFileSync(keyPath, staleKey, { mode: 0o600 });
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawFor('111', '222', PEM),
+        cloneRepo: async () => {
+          throw new Error('must not be called — refused before touching the workspace');
+        },
+        mintCloneToken: mintCloneTokenMustNotBeCalled(),
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => keyPath,
+      },
+    );
+
+    expect(outcome.status).toBe('failed');
+    if (outcome.status !== 'failed') throw new Error('unreachable');
+    expect(outcome.reason).toContain('does not match');
+    expect(outcome.reason).toContain(secretFingerprint(staleKey));
+    expect(outcome.reason).toContain(secretFingerprint(PEM));
+    // The stale key is NEVER silently overwritten by the refusal path either.
+    expect(readFileSync(keyPath, 'utf-8')).toBe(staleKey);
+  });
+
+  it('the refusal names BOTH fingerprints and BOTH remedies, and --force-key, but never the raw key material', async () => {
+    const dir = scratchDir();
+    const destDir = join(dir, 'workspace');
+    const keyDir = scratchDir();
+    const keyPath = join(keyDir, `${ROLE}.pem`);
+    const staleKey = 'STALE-KEY-FROM-A-DESTROYED-FLEET';
+    writeFileSync(keyPath, staleKey, { mode: 0o600 });
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawFor('111', '222', PEM),
+        cloneRepo: async () => {
+          throw new Error('must not be called');
+        },
+        mintCloneToken: mintCloneTokenMustNotBeCalled(),
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => keyPath,
+      },
+    );
+
+    expect(outcome.status).toBe('failed');
+    if (outcome.status !== 'failed') throw new Error('unreachable');
+    const onDiskFp = secretFingerprint(staleKey);
+    const vaultFp = secretFingerprint(PEM);
+    // Both fingerprints, named.
+    expect(outcome.reason).toContain(onDiskFp);
+    expect(outcome.reason).toContain(vaultFp);
+    // Both remedies, named (remove/rename OR reconcile-and-re-run).
+    expect(outcome.reason.toLowerCase()).toContain('remove or rename');
+    expect(outcome.reason.toLowerCase()).toContain('reconcile');
+    // The opt-in overwrite flag.
+    expect(outcome.reason).toContain('--force-key');
+    // Never the raw key material — neither PEM.
+    expect(outcome.reason).not.toContain(staleKey);
+    expect(outcome.reason).not.toContain(PEM);
+  });
+
+  it('--force-key (deps.forceKey) re-materializes the on-disk key from the vault on mismatch instead of refusing', async () => {
+    const dir = scratchDir();
+    const destDir = join(dir, 'workspace');
+    const keyDir = scratchDir();
+    const keyPath = join(keyDir, `${ROLE}.pem`);
+    writeFileSync(keyPath, 'STALE-KEY-FROM-A-DESTROYED-FLEET', { mode: 0o600 });
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawFor('111', '222', PEM),
+        cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+        mintCloneToken: async () => FAKE_TOKEN,
+        initAgent: fakeInitAgent(initCalls),
+        keyPathFor: () => keyPath,
+        forceKey: true,
+      },
+    );
+
+    expect(outcome.status).toBe('deployed');
+    if (outcome.status !== 'deployed') throw new Error('unreachable');
+    expect(outcome.keyWrite).toBe('written');
+    expect(outcome.keyFingerprint).toBe(secretFingerprint(PEM));
+    // Overwritten with the vault's key — the stale sentinel is gone.
+    expect(readFileSync(keyPath, 'utf-8')).toBe(PEM);
+    expect(statSync(keyPath).mode & 0o777).toBe(0o600);
+    expect(initCalls).toHaveLength(1);
+  });
+
+  it('--force-key has NO effect when the on-disk key already matches the vault (still skipped-existing, no rewrite)', async () => {
+    const dir = scratchDir();
+    const destDir = join(dir, 'workspace');
+    mkdirSync(destDir, { recursive: true });
+    writeFileSync(join(destDir, 'already-here.txt'), 'x');
+    const keyDir = scratchDir();
+    const keyPath = join(keyDir, `${ROLE}.pem`);
+    writeFileSync(keyPath, PEM, { mode: 0o600 });
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawFor('111', '222', PEM),
+        cloneRepo: async () => {
+          throw new Error('must not be called');
+        },
+        mintCloneToken: mintCloneTokenMustNotBeCalled(),
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => keyPath,
+        forceKey: true,
+      },
+    );
+
+    expect(outcome.status).toBe('deployed');
+    if (outcome.status !== 'deployed') throw new Error('unreachable');
+    expect(outcome.keyWrite).toBe('skipped-existing');
+    expect(readFileSync(keyPath, 'utf-8')).toBe(PEM);
+  });
+
+  it('COMPOSITION (macf#975): destroy -> rebuild -> deploy on the same host — a key materialized against vault A, then a deploy against REBUILT vault B (different key, same role) refuses; a single-deploy test would pass either way', async () => {
+    const dir = scratchDir();
+    const destDir = join(dir, 'workspace');
+    const keyDir = scratchDir();
+    const keyPath = join(keyDir, `${ROLE}.pem`);
+    const PEM_A = '-----BEGIN RSA PRIVATE KEY-----\nFLEET-A-ORIGINAL-APP-KEY\n-----END RSA PRIVATE KEY-----\n';
+    const PEM_B = '-----BEGIN RSA PRIVATE KEY-----\nFLEET-B-REBUILT-APP-KEY\n-----END RSA PRIVATE KEY-----\n';
+
+    // Cycle N: deploy against the ORIGINAL fleet's vault -> the key materializes fresh.
+    const first = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault-a.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawFor('111', '222', PEM_A),
+        cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+        mintCloneToken: async () => FAKE_TOKEN,
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => keyPath,
+      },
+    );
+    expect(first.status).toBe('deployed');
+    if (first.status !== 'deployed') throw new Error('unreachable');
+    expect(first.keyWrite).toBe('written');
+    expect(readFileSync(keyPath, 'utf-8')).toBe(PEM_A);
+
+    // destroy + rebuild: the App is destroyed and GitHub gives us a NEW one —
+    // a fresh vault (fresh app_id/install_id/key) for the SAME role. The
+    // on-disk key from cycle N is untouched on the host — exactly #970's
+    // flagged risk. Cycle N+1: deploy against the REBUILT fleet's vault.
+    const second = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault-b.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawFor('999', '888', PEM_B),
+        cloneRepo: async () => {
+          throw new Error('must not be called — refused before the clone');
+        },
+        mintCloneToken: mintCloneTokenMustNotBeCalled(),
+        initAgent: fakeInitAgent([]),
+        keyPathFor: () => keyPath,
+      },
+    );
+
+    expect(second.status).toBe('failed');
+    if (second.status !== 'failed') throw new Error('unreachable');
+    expect(second.reason).toContain(secretFingerprint(PEM_A));
+    expect(second.reason).toContain(secretFingerprint(PEM_B));
+    // The cycle-N key is STILL on disk, untouched — never silently overwritten.
+    expect(readFileSync(keyPath, 'utf-8')).toBe(PEM_A);
   });
 
   it('IDEMPOTENT workspace: a pre-existing populated destDir is left untouched (operator-modified file survives)', async () => {
