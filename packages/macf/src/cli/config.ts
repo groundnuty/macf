@@ -350,3 +350,44 @@ export function loadAllAgents(): ReadonlyArray<{
 
   return results;
 }
+
+/**
+ * Same as `loadAllAgents()`, but ALSO includes the project discovered by
+ * walking up from `cwd` (defaults to `process.cwd()`) when it isn't
+ * already present in the global index.
+ *
+ * WHY (macf#959): `macf peers` / `macf status`, invoked without `--dir`,
+ * drive entirely off the global index at `~/.macf/agents.json` — which is
+ * populated only by `macf init` (`addToAgentsIndex`). A workspace whose
+ * `.macf/macf-agent.json` genuinely exists but whose absolute path never
+ * made it into (or fell out of) that index reads as `agents.length === 0`
+ * even though the workspace IS configured — and the caller told the
+ * operator to re-run `macf init` on an already-initialised workspace.
+ * Confirmed 2026-08-17 (macf#959): `.macf/macf-agent.json` present, four
+ * separate `macf peers` invocations spanning windows where the GitHub API
+ * was demonstrably reachable, all reporting "No agents configured" — a
+ * purely local index-miss, not an API problem (the check never reaches the
+ * network; see `listPeers`/`showStatus`).
+ *
+ * Folding in a cwd walk-up closes the gap without changing what the global
+ * index is FOR (aggregating multiple projects registered on one host) — it
+ * only widens the set of sources consulted before concluding "nothing is
+ * configured." A config discovered this way is exactly as valid as one
+ * loaded from the index.
+ */
+export function loadAllAgentsWithCwdFallback(
+  cwd: string = process.cwd(),
+): ReadonlyArray<{ readonly path: string; readonly config: MacfAgentConfig }> {
+  const fromIndex = loadAllAgents();
+
+  const cwdRoot = findProjectRoot(cwd);
+  if (!cwdRoot) return fromIndex;
+
+  const alreadyIncluded = fromIndex.some((a) => resolve(a.path) === cwdRoot);
+  if (alreadyIncluded) return fromIndex;
+
+  const cwdConfig = readAgentConfig(cwdRoot);
+  if (!cwdConfig) return fromIndex;
+
+  return [...fromIndex, { path: cwdRoot, config: cwdConfig }];
+}

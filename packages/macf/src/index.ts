@@ -27,6 +27,7 @@ export {
 export {
   readAgentConfig,
   loadAllAgents,
+  loadAllAgentsWithCwdFallback,
   readAgentsIndex,
   writeAgentConfig,
   agentCertPath,
