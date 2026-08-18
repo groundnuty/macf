@@ -77,6 +77,9 @@ function depsFor(overrides: Partial<FleetDeployCommandDeps> = {}): FleetDeployCo
     cloneRepo: async () => {
       throw new Error('must not be called');
     },
+    // Lazy (macf#968) — never invoked unless a test's cloneRepo actually
+    // runs. Fully offline: never shells out to real `gh`.
+    mintCloneToken: async () => 'FAKE-CMD-TEST-TOKEN',
     initAgent: async () => {
       throw new Error('must not be called');
     },
