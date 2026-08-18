@@ -544,6 +544,13 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(joined).toMatch(/consent gate 1 of 2/);
     expect(joined).toMatch(/consent gate 2 of 2/);
     expect(joined).toMatch(/submitted AS-IS/i);
+    // groundnuty/macf#971 — the actionable clause (click GitHub's OWN
+    // "Create GitHub App" button) must ALSO survive under `--yes`, same as
+    // every other gate-1 instruction line — it has no `yes`-conditional
+    // either, but a headless run is exactly the case with no page for a
+    // human to fall back to reading, so this is the one case where the
+    // terminal line is the ONLY copy that exists at all.
+    expect(joined).toMatch(/Create GitHub App/);
     expect(joined).toMatch(/Only select repositories/);
   });
 

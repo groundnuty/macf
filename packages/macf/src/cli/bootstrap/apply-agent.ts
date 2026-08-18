@@ -582,11 +582,20 @@ export async function applyIdentity(
       role,
     });
     try {
+      // groundnuty/macf#971 — the explanation lives HERE, not on the served
+      // page: that page's own `<script>` submits it before a human can read
+      // it (the operator, live: "if I cannot see them, I'm not sure why they
+      // are there"). `announceAndOpenGate` prints every `instructionLines`
+      // entry BEFORE `deps.openUrl` runs (see its doc), so this is the first
+      // and only readable copy of the explanation, regardless of whether the
+      // browser opens, a human is watching, or this is a headless `--yes` run.
       await announceAndOpenGate(deps, role, `consent gate 1 of ${String(GATE_TOTAL)} (App-manifest form)`, flow.startUrl, 'Create GitHub App', {
         fatal: true,
         instructionLines: [
-          `creating GitHub App "${handle}" — the page that opened shows the manifest submitted AS-IS (nothing ` +
-            'to edit); GitHub will then show its own confirmation page — click "Create GitHub App" there.',
+          `creating GitHub App "${handle}" — its settings (permissions, webhook events) come from the fleet ` +
+            'manifest and are submitted AS-IS; there is nothing for you to review or edit.',
+          'the browser tab opening next will submit automatically and land on GitHub\'s own confirmation page — ' +
+            'click "Create GitHub App" there to finish.',
         ],
       });
       const code = await flow.waitForCode();

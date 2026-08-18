@@ -91,10 +91,18 @@ export const GATE_TOTAL = 2;
  * `settings/apps/new` with the manifest JSON in a `manifest` field. Pure —
  * exported for testing.
  *
- * **groundnuty/macf#952 — carries the gate-1 instruction on the page itself,**
- * not only in the terminal: which App is being created (role + name) and
- * that the settings below are submitted AS-IS (nothing for the operator to
- * review or edit here — GitHub's own confirmation page is next).
+ * **groundnuty/macf#971 — a BARE redirect, not an instruction surface.**
+ * groundnuty/macf#952 (via #962) put the gate-1 explanation ON this page —
+ * but this page's `<script>` (below) submits it before a human can read a
+ * single word, so the explanation was unreadable BY CONSTRUCTION. The
+ * operator confirmed it live: "if I cannot see them, I'm not sure why they
+ * are there." The explanation now lives in the terminal line
+ * `apply-agent.ts::applyIdentity` prints immediately before `openUrl` —
+ * the surface the operator actually reads — and this page keeps only
+ * what a human might need in the RARE case auto-submit doesn't fire
+ * (JS disabled, a slow/failed script load): identifying context + the
+ * manual "Continue to GitHub" fallback button. No prose paragraph that
+ * only the auto-submit race would ever hide from view.
  */
 export function renderManifestForm(manifest: GitHubAppManifest, action: string, role: string): string {
   const json = escapeHtmlAttribute(JSON.stringify(manifest));
@@ -105,11 +113,6 @@ export function renderManifestForm(manifest: GitHubAppManifest, action: string, 
 <body>
 <h1>Consent gate 1 of ${String(GATE_TOTAL)} — role "${roleEsc}"</h1>
 <p>Creating GitHub App: <strong>${name}</strong></p>
-<p>This page automatically submits GitHub's App-manifest creation form below. The settings
-(permissions, webhook events) come from the fleet manifest and are submitted <strong>as-is</strong> —
-there is nothing here to review or edit.</p>
-<p>After it submits, GitHub will show its own confirmation page — click
-<strong>&ldquo;Create GitHub App&rdquo;</strong> there to finish.</p>
 <p>If this page does not advance on its own, press the button below.</p>
 <form id="macf-manifest-form" method="post" action="${escapeHtmlAttribute(action)}">
   <input type="hidden" name="manifest" value="${json}">
@@ -158,7 +161,7 @@ export interface StartManifestFlowOptions {
   readonly formAction: string;
   /** How long to wait for the operator's click before giving up. Default 10 min. */
   readonly timeoutMs?: number;
-  /** The role this App is being created for — rendered into the served page's instruction (groundnuty/macf#952). */
+  /** The role this App is being created for — rendered into the served page's `<h1>` (identifying label only; the explanation is terminal-only, groundnuty/macf#971). */
   readonly role: string;
 }
 
