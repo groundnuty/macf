@@ -28,6 +28,14 @@ export interface RunFleetDeployOptions {
   readonly identityKey?: string;
   /** Workspace directory. Defaults to the agent's `deploy_path` from the manifest. */
   readonly dir?: string;
+  /**
+   * Re-materialize the on-disk App key from the vault when it does NOT
+   * match (fingerprint mismatch) — the common case after a fleet rebuild
+   * (macf#975). Without this, a mismatch REFUSES rather than silently
+   * overwriting a key the operator may have rotated deliberately on GitHub.
+   * Threaded straight through to {@link FleetDeployDeps.forceKey}.
+   */
+  readonly forceKey?: boolean;
   readonly json?: boolean;
 }
 
@@ -185,7 +193,13 @@ export async function runFleetDeploy(opts: RunFleetDeployOptions, deps?: FleetDe
   const resolved = deps ?? resolveDeps();
   process.stderr.write(`Deploying role "${agent.role}" for fleet "${manifest.metadata.name}" — vault: ${vaultPath}\n`);
 
-  const outcome = await deployAgent(agent, manifest, destDir, { vaultPath, identityPath }, resolved);
+  // --force-key (opts) wins when given; otherwise fall back to whatever the
+  // resolved deps already carry (lets a test drive `deps.forceKey` directly
+  // without going through the CLI-options layer at all).
+  const outcome = await deployAgent(agent, manifest, destDir, { vaultPath, identityPath }, {
+    ...resolved,
+    forceKey: opts.forceKey ?? resolved.forceKey,
+  });
 
   if (opts.json) {
     console.log(
