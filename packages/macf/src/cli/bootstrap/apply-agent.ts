@@ -129,6 +129,9 @@ import {
   waitForAppInstallation as realWaitForAppInstallation,
 } from './identity-confirm.js';
 import type { ConfirmedInstall, ExpectedIdentity, IdentityConfirmation, WaitForAppInstallationOptions } from './identity-confirm.js';
+import { appSettingsAdvancedUrl } from './app-identity-removal.js';
+import { appNameCollisionRefusalMessage, resolveAppPresenceStatus } from './app-presence.js';
+import type { Presence } from './plan.js';
 
 // --- Confirm-before-create guard ---
 
@@ -267,6 +270,25 @@ export interface AgentApplyDeps {
    * rely on (module doc's "gate 1→2 window" section).
    */
   readonly validateInstall?: (install: ConfirmedInstall) => string | undefined;
+  /**
+   * Pre-flight App-NAME-collision check (groundnuty/macf#967 Defect 2) — run
+   * ONLY on the `decision.action === 'create'` path (NO `fleet.lock` entry
+   * for this role), immediately BEFORE gate 1 opens. "No lock entry" ≠ "no
+   * App by this name exists on GitHub" — a prior lock can have been wiped
+   * (`macf fleet destroy`), or the name can collide with something created
+   * out-of-band. Without this check, that collision surfaces as GitHub's raw
+   * "name already taken" error INSIDE the browser gate; this catches it
+   * first and states both remedies.
+   *
+   * Optional — omitted (every pre-fix caller/test) degrades to no refusal:
+   * proceeds to gate 1 exactly as before, GitHub's own App-name uniqueness
+   * remaining the backstop (module doc's "gate 1→2 window"). Only a
+   * confirmed `'present'` refuses — `'unknown'` NEVER blocks a legitimate
+   * create (Amendment A's honest-unknown floor cuts both ways). Real
+   * default: `app-presence.ts::resolveAppPresenceStatus`, a bare top-level
+   * reference — `manifest.owner` is already in scope at the call site.
+   */
+  readonly checkAppNameCollision?: (owner: FleetManifest['owner'], appSlug: string) => Promise<Presence>;
 }
 
 /**
@@ -287,6 +309,7 @@ export function realAgentApplyDeps(
     exchangeManifestCode: realExchangeManifestCode,
     waitForAppInstallation: realWaitForAppInstallation,
     confirmAppInstallation: realConfirmAppInstallation,
+    checkAppNameCollision: resolveAppPresenceStatus,
     openUrl,
     log,
   };
@@ -518,6 +541,26 @@ export async function applyIdentity(
         '(URL predicted from the fleet/role naming convention — no GitHub-confirmed slug is available on this ' +
         'path; if it 404s, find the App via Settings → Developer settings → GitHub Apps instead.)',
     });
+  }
+
+  // Pre-flight the App-NAME collision BEFORE gate 1 (groundnuty/macf#967
+  // Defect 2 — see `checkAppNameCollision`'s doc). Only CONFIRMED 'present'
+  // refuses; 'absent'/'unknown' proceed unchanged.
+  if (deps.checkAppNameCollision) {
+    let collision: Presence;
+    try {
+      collision = await deps.checkAppNameCollision(manifest.owner, handle);
+    } catch (err) {
+      // Fail-open, same posture every honest-unknown read in this package
+      // takes — a throwing dep is inconclusive, never a refusal.
+      deps.log(`Role "${role}": pre-flight App-name-collision check failed (${errMessage(err)}) — proceeding to gate 1; GitHub's own uniqueness check remains the backstop.`);
+      collision = 'unknown';
+    }
+    if (collision === 'present') {
+      const reason = appNameCollisionRefusalMessage(handle, appSettingsAdvancedUrl(manifest.owner, handle));
+      deps.log(`Role "${role}": REFUSED before consent gate 1 — ${reason}`);
+      return { role, status: 'failed', reason };
+    }
   }
 
   // decision.action === 'create' — consent gate 1.

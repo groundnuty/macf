@@ -44,7 +44,7 @@ import {
 } from '../../../src/cli/bootstrap/observer.js';
 import { realMintRoutingClient, realSetRepoSecret } from '../../../src/cli/bootstrap/apply-routing-client.js';
 import { resolveDeleteAppsDeps, resolveDestroyDeps } from '../../../src/cli/commands/fleet-teardown-destructive.js';
-import { checkAppSlugPresence } from '../../../src/cli/bootstrap/app-identity-removal.js';
+import { resolveAppPresenceStatus } from '../../../src/cli/bootstrap/app-presence.js';
 
 describe('apply real-deps wiring (macf#857 — the seam a unit test cannot see)', () => {
   const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml');
@@ -215,8 +215,8 @@ describe('fleet delete-apps / destroy real-deps wiring (DR-043 Amendment G, macf
     expect(deleteAppsDeps.archiveRepo).toBe(realArchiveRepo);
   });
 
-  it('delete-apps: wires the App-already-gone presence read to the real live check (groundnuty/macf#917)', () => {
-    expect(deleteAppsDeps.checkAppPresence).toBe(checkAppSlugPresence);
+  it('delete-apps: wires the App presence read to the "ask, don\'t predict" resolver (groundnuty/macf#917, widened to org-installations-listing-first by macf#967) — NOT the predicted-slug-only primitive that produced the false-absent bug', () => {
+    expect(deleteAppsDeps.checkAppPresence).toBe(resolveAppPresenceStatus);
   });
 
   it('destroy: wires ownership reads to the SAME primitives every other rung uses', () => {
@@ -241,7 +241,7 @@ describe('fleet delete-apps / destroy real-deps wiring (DR-043 Amendment G, macf
     expect(destroyDeps.readFleetLock).toBe(realReadControlFleetLockFile);
   });
 
-  it('destroy: wires the App-already-gone presence read to the real live check (groundnuty/macf#917)', () => {
-    expect(destroyDeps.checkAppPresence).toBe(checkAppSlugPresence);
+  it('destroy: wires the App presence read to the "ask, don\'t predict" resolver (groundnuty/macf#917, widened to org-installations-listing-first by macf#967) — NOT the predicted-slug-only primitive that produced the false-absent bug', () => {
+    expect(destroyDeps.checkAppPresence).toBe(resolveAppPresenceStatus);
   });
 });

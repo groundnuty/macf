@@ -252,7 +252,7 @@ describe('reportAppIdentityRemoval', () => {
   it('no checkAppPresence wired -> NEVER returns a status other than manual-action-required, for every target (backward-compatible default)', async () => {
     const targets = computeAppIdentityTargets(ORG_MANIFEST);
     const logs: string[] = [];
-    const outcomes = await reportAppIdentityRemoval(targets, (l) => logs.push(l), {});
+    const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, (l) => logs.push(l), {});
     expect(outcomes).toHaveLength(2);
     expect(outcomes.every((o) => o.status === 'manual-action-required')).toBe(true);
     expect(outcomes.every((o) => o.reason === APP_DELETION_HAS_NO_REST_PATH_NOTE)).toBe(true);
@@ -262,7 +262,7 @@ describe('reportAppIdentityRemoval', () => {
     const targets = computeAppIdentityTargets(ORG_MANIFEST);
     const logs: string[] = [];
     const opened: string[] = [];
-    await reportAppIdentityRemoval(targets, (l) => logs.push(l), {
+    await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, (l) => logs.push(l), {
       openUrl: async (url) => {
         // The log line for THIS target must already be present by the time openUrl fires.
         expect(logs.some((l) => l.includes(url))).toBe(true);
@@ -275,7 +275,7 @@ describe('reportAppIdentityRemoval', () => {
   it('openUrl failure is non-fatal — still reports manual-action-required, logs the fallback line', async () => {
     const targets = computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1);
     const logs: string[] = [];
-    const outcomes = await reportAppIdentityRemoval(targets, (l) => logs.push(l), {
+    const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, (l) => logs.push(l), {
       openUrl: async () => {
         throw new Error('no display available');
       },
@@ -286,7 +286,7 @@ describe('reportAppIdentityRemoval', () => {
 
   it('openUrl omitted entirely -> still reports every target (headless/CI/test posture)', async () => {
     const targets = computeAppIdentityTargets(ORG_MANIFEST);
-    const outcomes = await reportAppIdentityRemoval(targets, () => {});
+    const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, () => {});
     expect(outcomes).toHaveLength(2);
   });
 
@@ -299,7 +299,7 @@ agents:
     install_id: "999222"
 `, ORG_MANIFEST);
     const logs: string[] = [];
-    const outcomes = await reportAppIdentityRemoval(targets, (l) => logs.push(l));
+    const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, (l) => logs.push(l));
     expect(outcomes[0]?.appId).toBe('555111');
     expect(logs.join('\n')).toMatch(/555111/);
   });
@@ -307,7 +307,7 @@ agents:
   it('a target WITHOUT appId (no lock enrichment) reports undefined and a "no confirmation" caveat', async () => {
     const targets = computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1);
     const logs: string[] = [];
-    const outcomes = await reportAppIdentityRemoval(targets, (l) => logs.push(l));
+    const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, (l) => logs.push(l));
     expect(outcomes[0]?.appId).toBeUndefined();
     expect(logs.join('\n')).toMatch(/no fleet\.lock entry/);
   });
@@ -319,7 +319,7 @@ agents:
       const targets = computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1);
       const logs: string[] = [];
       let openCalled = false;
-      const outcomes = await reportAppIdentityRemoval(targets, (l) => logs.push(l), {
+      const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, (l) => logs.push(l), {
         checkAppPresence: async () => 'absent',
         openUrl: async () => {
           openCalled = true;
@@ -334,20 +334,33 @@ agents:
 
     it('presence "absent" -> reason names the check as a PREDICTED-slug read, not a confirmed-deletion claim', async () => {
       const targets = computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1);
-      const outcomes = await reportAppIdentityRemoval(targets, () => {}, { checkAppPresence: async () => 'absent' });
+      const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, () => {}, { checkAppPresence: async () => 'absent' });
       expect(outcomes[0]?.reason).toMatch(/PREDICTION/);
       expect(outcomes[0]?.reason).toMatch(/404/);
     });
 
     it('presence "present" -> stays manual-action-required (an existing App is NOT already-absent)', async () => {
       const targets = computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1);
-      const outcomes = await reportAppIdentityRemoval(targets, () => {}, { checkAppPresence: async () => 'present' });
+      const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, () => {}, { checkAppPresence: async () => 'present' });
       expect(outcomes[0]?.status).toBe('manual-action-required');
     });
 
-    it('presence "unknown" (network hiccup on the check) -> stays manual-action-required — never upgrades an inconclusive read to already-absent', async () => {
+    // groundnuty/macf#967 — an explicitly-wired-but-inconclusive check now
+    // gets its OWN distinct status, never silently upgraded to
+    // 'already-absent' NOR conflated with the confirmed-present
+    // 'manual-action-required' bucket. See `AppDeletionOutcome.status`'s doc.
+    it('presence "unknown" (permission-denied / listing unavailable) -> its OWN distinct "unknown" status — never already-absent, never silently folded into manual-action-required', async () => {
       const targets = computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1);
-      const outcomes = await reportAppIdentityRemoval(targets, () => {}, { checkAppPresence: async () => 'unknown' });
+      const logs: string[] = [];
+      const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, (l) => logs.push(l), { checkAppPresence: async () => 'unknown' });
+      expect(outcomes[0]?.status).toBe('unknown');
+      expect(outcomes[0]?.reason).toMatch(/could not verify/);
+      expect(logs.join('\n')).toMatch(/UNKNOWN —/);
+    });
+
+    it('checkAppPresence OMITTED entirely still stays manual-action-required (the pre-#917 default — distinct from an explicit inconclusive check)', async () => {
+      const targets = computeAppIdentityTargets(ORG_MANIFEST).slice(0, 1);
+      const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, () => {});
       expect(outcomes[0]?.status).toBe('manual-action-required');
     });
 
@@ -359,15 +372,17 @@ agents:
     app_id: "555111"
     install_id: "999222"
 `, ORG_MANIFEST);
-      const outcomes = await reportAppIdentityRemoval(targets, () => {}, { checkAppPresence: async () => 'absent' });
+      const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, () => {}, { checkAppPresence: async () => 'absent' });
       expect(outcomes[0]?.appId).toBe('555111');
       expect(outcomes[0]?.settingsUrl).toBe(targets[0]?.settingsUrl);
     });
 
     it('mixed fleet: one role already-absent, one still present -> each target resolved independently', async () => {
       const targets = computeAppIdentityTargets(ORG_MANIFEST); // code-agent, science-agent
-      const outcomes = await reportAppIdentityRemoval(targets, () => {}, {
-        checkAppPresence: async (slug) => (slug === targets[0]?.appSlug ? 'absent' : 'present'),
+      const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, () => {}, {
+        // groundnuty/macf#967 widened checkAppPresence to (owner, appSlug) —
+        // appSlug is now the SECOND positional param.
+        checkAppPresence: async (_owner, slug) => (slug === targets[0]?.appSlug ? 'absent' : 'present'),
       });
       expect(outcomes.find((o) => o.role === 'code-agent')?.status).toBe('already-absent');
       expect(outcomes.find((o) => o.role === 'science-agent')?.status).toBe('manual-action-required');
@@ -385,7 +400,7 @@ agents:
 `, ORG_MANIFEST);
       expect(runnerOpsTarget).toHaveLength(1);
       const logs: string[] = [];
-      const outcomes = await reportAppIdentityRemoval(runnerOpsTarget, (l) => logs.push(l), { checkAppPresence: async () => 'absent' });
+      const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, runnerOpsTarget, (l) => logs.push(l), { checkAppPresence: async () => 'absent' });
       expect(outcomes[0]?.status).toBe('already-absent');
       expect(outcomes[0]?.extraFromLock).toBe(true);
       expect(outcomes[0]?.reason).toMatch(/PREDICTION/);
@@ -414,7 +429,7 @@ agents:
     install_id: "888555"
 `, ORG_MANIFEST);
     const logs: string[] = [];
-    const outcomes = await reportAppIdentityRemoval(targets, (l) => logs.push(l));
+    const outcomes = await reportAppIdentityRemoval(ORG_MANIFEST.owner, targets, (l) => logs.push(l));
     expect(outcomes).toHaveLength(3);
     const runnerOpsOutcome = outcomes.find((o) => o.role === 'runner-ops');
     expect(runnerOpsOutcome?.extraFromLock).toBe(true);

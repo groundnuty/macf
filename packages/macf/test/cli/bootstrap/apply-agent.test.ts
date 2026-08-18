@@ -13,12 +13,14 @@ import {
   confirmBeforeCreateGuard,
   installReposForIdentity,
   installWhyText,
+  realAgentApplyDeps,
   type AgentApplyDeps,
 } from '../../../src/cli/bootstrap/apply-agent.js';
 import type { FleetAgent, FleetLockAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import type { ConfirmedInstall, IdentityConfirmation } from '../../../src/cli/bootstrap/identity-confirm.js';
 import type { InstallInterstitialHandles, ManifestFlowHandles } from '../../../src/cli/bootstrap/manifest-flow-server.js';
+import { appNameCollisionRefusalMessage, resolveAppPresenceStatus } from '../../../src/cli/bootstrap/app-presence.js';
 
 const MANIFEST: FleetManifest = {
   apiVersion: 'macf/v0',
@@ -335,16 +337,117 @@ describe('applyAgentIdentity — create path', () => {
   });
 });
 
+// --- groundnuty/macf#967 Defect 2 — pre-flight App-name-collision check, run ONLY on the create path, BEFORE gate 1 ---
+
+describe('applyAgentIdentity — pre-flight App-name-collision check (create path only, groundnuty/macf#967)', () => {
+  it('taken-but-unconfirmable (checkAppNameCollision confirms "present") -> REFUSES before consent gate 1 opens; zero gate invocations; names both remedies', async () => {
+    const startManifestFlow = vi.fn();
+    const startInstallInterstitial = vi.fn();
+    const openUrl = vi.fn(async () => {});
+    let seenOwner: FleetManifest['owner'] | undefined;
+    let seenSlug = '';
+    const deps = baseDeps({
+      startManifestFlow,
+      startInstallInterstitial,
+      openUrl,
+      checkAppNameCollision: async (owner, appSlug) => {
+        seenOwner = owner;
+        seenSlug = appSlug;
+        return 'present';
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    // The decisive assertion — NEITHER gate seam was ever invoked.
+    expect(startManifestFlow).not.toHaveBeenCalled();
+    expect(startInstallInterstitial).not.toHaveBeenCalled();
+    expect(openUrl).not.toHaveBeenCalled();
+
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      // Both remedies named verbatim (macf#967's exact two-option template).
+      expect(outcome.reason).toContain('App "demo-fleet-code-agent" already exists');
+      expect(outcome.reason).toContain("not in this fleet's vault");
+      expect(outcome.reason).toContain('cannot be recovered');
+      expect(outcome.reason).toContain('https://github.com/settings/apps/demo-fleet-code-agent/advanced');
+      expect(outcome.reason).toContain('--vault/--identity-key');
+    }
+    // Checked the RIGHT identity — the fleet's owner + the derived handle.
+    expect(seenOwner).toEqual(MANIFEST.owner);
+    expect(seenSlug).toBe('demo-fleet-code-agent');
+  });
+
+  it('org-owned fleet: the refusal names the ORG-form settings URL (organizations/<org>/settings/apps/.../advanced)', async () => {
+    const ORG_MANIFEST: FleetManifest = { ...MANIFEST, metadata: { name: 'macf-experiment' }, owner: { account: 'macf-experiment', type: 'org', registry: { type: 'org', org: 'macf-experiment' } } };
+    const deps = baseDeps({ checkAppNameCollision: async () => 'present' });
+    const outcome = await applyAgentIdentity(AGENT, ORG_MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).toContain('https://github.com/organizations/macf-experiment/settings/apps/macf-experiment-code-agent/advanced');
+    }
+  });
+
+  it('absent (checkAppNameCollision confirms "absent") -> proceeds to gate 1 unchanged', async () => {
+    const deps = baseDeps({ checkAppNameCollision: async () => 'absent' });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('created'); // the happy path, unimpeded
+  });
+
+  it('unknown (checkAppNameCollision cannot verify) -> NEVER refuses — proceeds to gate 1; GitHub\'s own uniqueness check remains the backstop', async () => {
+    const deps = baseDeps({ checkAppNameCollision: async () => 'unknown' });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('created');
+  });
+
+  it('checkAppNameCollision OMITTED entirely -> no-op, proceeds to gate 1 exactly as before this fix (backward-compatible default)', async () => {
+    const deps = baseDeps(); // no checkAppNameCollision override
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('created');
+  });
+
+  it('a THROWING checkAppNameCollision degrades to unknown (fail-open, never a refusal) and still proceeds to gate 1', async () => {
+    const logs: string[] = [];
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      checkAppNameCollision: async () => {
+        throw new Error('gh unreachable');
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('created');
+    expect(logs.join('\n')).toMatch(/pre-flight App-name-collision check failed/);
+  });
+
+  it('is NEVER invoked on any non-create decision path (resume-install / reuse-confirmed / skip-unverified / drift)', async () => {
+    const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
+    const checkAppNameCollision = vi.fn(async () => 'present' as const);
+    // resume-install
+    const resumeDeps = baseDeps({
+      checkAppNameCollision,
+      resolveKeyPath: () => '/resolved/key.pem',
+      confirmAppInstallation: async () => ({ status: 'app-no-install' }),
+      waitForAppInstallation: async () => ({ appId: '9001', installId: '6001', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, resumeDeps);
+    // skip-unverified (no resolveKeyPath at all)
+    const skipDeps = baseDeps({ checkAppNameCollision });
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, skipDeps);
+    expect(checkAppNameCollision).not.toHaveBeenCalled();
+  });
+});
+
 describe('applyAgentIdentity — non-create outcomes short-circuit before any gate', () => {
   const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
 
-  it('reuse-confirmed: neither gate 1 nor gate 2 is attempted', async () => {
+  it('reuse-confirmed (--vault/--identity-key with matching credentials): neither gate 1 nor gate 2 is attempted, and the NEW pre-flight collision check is never even reached', async () => {
     const install: ConfirmedInstall = { appId: '9001', installId: '5555', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' };
     const startManifestFlow = vi.fn();
     const waitForAppInstallation = vi.fn();
+    const checkAppNameCollision = vi.fn(async () => 'present' as const);
     const deps = baseDeps({
       startManifestFlow,
       waitForAppInstallation,
+      checkAppNameCollision,
       resolveKeyPath: () => '/fake/key.pem',
       confirmAppInstallation: async () => ({ status: 'confirmed', install }),
     });
@@ -352,6 +455,10 @@ describe('applyAgentIdentity — non-create outcomes short-circuit before any ga
     expect(outcome).toEqual({ role: 'code-agent', status: 'reused', appId: '9001', installId: '5555' });
     expect(startManifestFlow).not.toHaveBeenCalled();
     expect(waitForAppInstallation).not.toHaveBeenCalled();
+    // Even wired to unconditionally return 'present', the collision check is
+    // NEVER reached on the reuse-confirmed path — it lives strictly inside
+    // the `decision.action === 'create'` branch.
+    expect(checkAppNameCollision).not.toHaveBeenCalled();
   });
 
   it('resume-install: gate 1 is skipped, gate 2 runs with the resolver-provided key path', async () => {
@@ -659,5 +766,29 @@ describe('gates are numbered and role-attributed', () => {
     const joined = logs.join('\n');
     expect(joined).toMatch(/Role "code-agent": consent gate 1 of 2/);
     expect(joined).toMatch(/Role "code-agent": consent gate 2 of 2/);
+  });
+});
+
+// --- groundnuty/macf#967 Defect 2 — appNameCollisionRefusalMessage (pure) + realAgentApplyDeps wiring ---
+
+describe('appNameCollisionRefusalMessage (pure)', () => {
+  it('names both remedies verbatim: delete-at-URL, or re-run with --vault/--identity-key', () => {
+    const msg = appNameCollisionRefusalMessage(
+      'macf-experiment-runner-ops',
+      'https://github.com/organizations/macf-experiment/settings/apps/macf-experiment-runner-ops/advanced',
+    );
+    expect(msg).toContain('App "macf-experiment-runner-ops" already exists');
+    expect(msg).toContain("not in this fleet's vault");
+    expect(msg).toContain('ownership cannot be proven');
+    expect(msg).toContain('private key cannot be recovered');
+    expect(msg).toContain('https://github.com/organizations/macf-experiment/settings/apps/macf-experiment-runner-ops/advanced');
+    expect(msg).toContain('--vault/--identity-key');
+  });
+});
+
+describe('realAgentApplyDeps wiring (groundnuty/macf#967)', () => {
+  it('wires checkAppNameCollision to the real "ask, don\'t predict" resolver — a bare top-level reference, not a stub', () => {
+    const deps = realAgentApplyDeps(async () => {}, () => {});
+    expect(deps.checkAppNameCollision).toBe(resolveAppPresenceStatus);
   });
 });

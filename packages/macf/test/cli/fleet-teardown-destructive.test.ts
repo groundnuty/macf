@@ -274,16 +274,20 @@ describe('runFleetDeleteApps', () => {
 
   // --- groundnuty/macf#917 — App already gone: the REPORT says already-absent, but the EXIT CODE stays red ---
   //
-  // Deliberate, reviewed choice: `checkAppSlugPresence`'s read is a
-  // PREDICTED-slug 404, not a GitHub-confirmed "this App is gone everywhere"
-  // fact (a disambiguating suffix at creation could mean the real App is
-  // alive under a slug this check never queried). Letting that inconclusive
-  // signal flip the exit code to 0 would be exactly the
+  // Deliberate, reviewed choice: even though groundnuty/macf#967 upgraded
+  // the REAL wiring's confidence (`app-presence.ts::resolveAppPresenceStatus`
+  // asks the org-installations listing first — an authoritative read when it
+  // succeeds), that same resolver can still degrade to the predicted-slug
+  // fallback (personal-account fleets, listing unavailable), which is NOT a
+  // GitHub-confirmed "this App is gone everywhere" fact. This unit test
+  // injects `checkAppPresence` directly (bypassing which resolution PATH
+  // produced the 'absent'), so it exercises the CONSUMPTION contract only —
+  // letting an 'absent' read flip the exit code to 0 would be exactly the
   // false-absent-drives-a-green-exit shape "never exit green" (Amendment G)
   // + DR-043 Amendment A's "honest-unknown over false-present" exist to
   // prevent — so ONLY the report text changes here, never the exit contract.
 
-  it('App already gone (checkAppPresence confirms absent) -> renders ALREADY-ABSENT (not MANUAL ACTION REQUIRED), but exit code STAYS 1 — the predicted-slug read never green-lights the exit', async () => {
+  it('App already gone (checkAppPresence confirms absent) -> renders ALREADY-ABSENT (not MANUAL ACTION REQUIRED), but exit code STAYS 1 — an absent read never green-lights the exit', async () => {
     const file = writeManifest();
     const cap = captureConsole();
     try {
@@ -304,7 +308,10 @@ describe('runFleetDeleteApps', () => {
     }
   });
 
-  it('App presence UNKNOWN (checkAppPresence wired but inconclusive) -> still MANUAL ACTION REQUIRED, exit stays 1 — never upgrades an unconfirmed read', async () => {
+  // groundnuty/macf#967 — an explicitly-wired-but-inconclusive check now
+  // renders its OWN distinct UNKNOWN line, never silently folded into
+  // MANUAL ACTION REQUIRED (which would read as "confirmed present").
+  it('App presence UNKNOWN (checkAppPresence wired but inconclusive) -> renders its OWN UNKNOWN line, exit stays 1 — never upgrades an unconfirmed read to either already-absent OR a confirmed-present claim', async () => {
     const file = writeManifest();
     const cap = captureConsole();
     try {
@@ -316,8 +323,11 @@ describe('runFleetDeleteApps', () => {
           checkAppPresence: async () => 'unknown',
         }),
       );
+      const out = cap.logs.join('\n') + cap.errs.join('\n');
       expect(code).toBe(1);
-      expect(cap.logs.join('\n') + cap.errs.join('\n')).toMatch(/MANUAL ACTION REQUIRED/);
+      expect(out).toMatch(/UNKNOWN/);
+      expect(out).not.toMatch(/MANUAL ACTION REQUIRED/);
+      expect(out).not.toMatch(/ALREADY-ABSENT/);
     } finally {
       cap.restore();
     }

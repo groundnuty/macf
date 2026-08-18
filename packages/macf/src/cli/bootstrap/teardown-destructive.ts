@@ -235,7 +235,7 @@ export async function executeDeleteApps(
 ): Promise<DeleteAppsExecuteResult> {
   const registryOutcomes = await executeDeactivate(manifest, plan.registryTargets, deps);
   const repoOutcomes = await executeArchiveRepos(plan.repoTargets, deps);
-  const appOutcomes = await reportAppIdentityRemoval(plan.appTargets, log, deps);
+  const appOutcomes = await reportAppIdentityRemoval(manifest.owner, plan.appTargets, log, deps);
   return { registryOutcomes, repoOutcomes, appOutcomes };
 }
 
@@ -383,7 +383,7 @@ export async function executeDestroy(
   deps: DestroyExecuteDeps,
 ): Promise<DestroyExecuteResult> {
   const registryOutcomes = await executeDeactivate(manifest, plan.registryTargets, deps);
-  const appOutcomes = await reportAppIdentityRemoval(plan.appTargets, log, deps);
+  const appOutcomes = await reportAppIdentityRemoval(manifest.owner, plan.appTargets, log, deps);
   const repoOutcomes = await executeDestroyRepos(plan.repoTargets, deps);
   return { registryOutcomes, appOutcomes, repoOutcomes };
 }

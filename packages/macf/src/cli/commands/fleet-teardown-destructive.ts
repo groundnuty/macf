@@ -27,7 +27,7 @@ import { realArchiveRepo } from '../bootstrap/repo-archive.js';
 import { realDeleteRepo } from '../bootstrap/repo-destroy.js';
 import { assertAgeIdentityReadable, realShredAgeIdentity } from '../bootstrap/age-key-shred.js';
 import type { AppDeletionDeps, AppDeletionOutcome } from '../bootstrap/app-identity-removal.js';
-import { checkAppSlugPresence } from '../bootstrap/app-identity-removal.js';
+import { resolveAppPresenceStatus } from '../bootstrap/app-presence.js';
 import type { DeleteAppsPlan, DestroyPlan, DestroyRepoDeps, FleetLockReadStatus, RepoDestroyOutcome } from '../bootstrap/teardown-destructive.js';
 import {
   buildDeleteAppsPlan,
@@ -179,7 +179,16 @@ function formatAppOutcomeLines(outcomes: readonly AppDeletionOutcome[]): string[
     // groundnuty/macf#917: an `'already-absent'` outcome has nothing to
     // point a browser at — render its own status line instead of the
     // fixed "MANUAL ACTION REQUIRED — <url>" shape every prior outcome used.
-    const detail = o.status === 'already-absent' ? 'ALREADY-ABSENT — nothing to delete' : `MANUAL ACTION REQUIRED — ${o.settingsUrl}`;
+    // groundnuty/macf#967: `'unknown'` gets ITS OWN line too — never folded
+    // into MANUAL ACTION REQUIRED (which implies a confirmed `'present'`)
+    // nor into ALREADY-ABSENT (a confident negative) — see
+    // `AppDeletionOutcome.status`'s doc for why the three stay distinct.
+    const detail =
+      o.status === 'already-absent'
+        ? 'ALREADY-ABSENT — nothing to delete'
+        : o.status === 'unknown'
+          ? `UNKNOWN — could not verify; check manually: ${o.settingsUrl}`
+          : `MANUAL ACTION REQUIRED — ${o.settingsUrl}`;
     // groundnuty/macf#953: mark a lock-only (not in fleet.yaml) role distinctly.
     const marker = o.extraFromLock === true ? '⚠ NOT IN fleet.yaml ' : '';
     return `  ${marker}${o.role.padEnd(20)} ${o.appSlug.padEnd(30)}${idSuffix} ${detail}`;
@@ -251,7 +260,7 @@ export function resolveDeleteAppsDeps(): FleetDeleteAppsDeps {
     deleteRegistryVariable: realDeleteRegistryVariable,
     archiveRepo: realArchiveRepo,
     openUrl: realOpenUrl,
-    checkAppPresence: checkAppSlugPresence,
+    checkAppPresence: resolveAppPresenceStatus,
     confirm: realConfirm,
   };
 }
@@ -290,16 +299,23 @@ function deleteAppsResultToJson(result: DeleteAppsResult): unknown {
  *
  * **`'already-absent'` (groundnuty/macf#917) does NOT relax this — on
  * purpose, deliberated during review.** It reads tempting to treat a
- * confirmed-404 App as "nothing left to do" and let the exit go green, but
- * `checkAppSlugPresence`'s own doc names the read as a PREDICTED-slug check
- * (a 404 there means "nothing at THIS exact slug," not "this App is
- * confirmed gone everywhere" — GitHub may have appended a disambiguating
- * suffix at creation). Letting that inconclusive-but-plausible signal flip
- * the exit code to 0 would be exactly the false-absent-drives-a-green-exit
- * shape DR-043 Amendment A's "honest-unknown over false-`present`" posture
- * (and this rail's own "never exit green") exist to prevent. The `report`
- * text changes (`'already-absent'` status, `ALREADY-ABSENT` rendering) —
- * the exit-code contract does not.
+ * confirmed-gone App as "nothing left to do" and let the exit go green.
+ * Even though groundnuty/macf#967 upgraded the confidence behind
+ * `'already-absent'` (an org-installations-listing MISS is authoritative,
+ * not the ambiguous predicted-slug 404 alone — see
+ * `app-presence.ts::resolveAppPresence`'s doc), the SAME read can still fall
+ * back to the plain predicted-slug check (personal-account-owned fleets;
+ * listing unavailable) — that fallback path never resolves `'already-absent'`
+ * on its own (an inconclusive fallback degrades to `'unknown'` instead), but
+ * a reader of this exit-code contract shouldn't have to know which resolution
+ * PATH produced a given outcome to trust the code. Letting `'already-absent'`
+ * flip the exit code to 0 would reintroduce exactly the false-absent-drives-
+ * a-green-exit shape DR-043 Amendment A's "honest-unknown over false-
+ * `present`" posture (and this rail's own "never exit green") exist to
+ * prevent — and a NEW `'unknown'` outcome (groundnuty/macf#967) is even
+ * LESS reason to go green: "couldn't verify" is never "nothing to do." The
+ * `report` text changes (`'already-absent'`/`'unknown'` status, their
+ * distinct render lines) — the exit-code contract does not.
  *
  * **`lockReadStatus` deliberately does NOT affect the exit code** (groundnuty/
  * macf#953). `result.appOutcomes.length > 0` already forces red for any
@@ -439,7 +455,7 @@ export function resolveDestroyDeps(): FleetDestroyDeps {
     deleteRegistryVariable: realDeleteRegistryVariable,
     deleteRepo: realDeleteRepo,
     openUrl: realOpenUrl,
-    checkAppPresence: checkAppSlugPresence,
+    checkAppPresence: resolveAppPresenceStatus,
     confirmFleetName: realConfirmFleetName,
     readEnv: realReadEnv,
     assertAgeIdentityReadable,
