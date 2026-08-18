@@ -253,15 +253,23 @@ export interface AppDeletionOutcome {
   readonly extraFromLock?: boolean;
   /**
    * `'already-absent'` — groundnuty/macf#917 — ONLY when `deps.checkAppPresence`
-   * was supplied AND returned `'absent'` (a confirmed 404 at the predicted
-   * slug; see {@link checkAppSlugPresence}'s doc for the "predicted, not
-   * GitHub-confirmed" caveat this status carries into `reason`). Every OTHER
-   * case (no check wired, `'present'`, `'unknown'`) stays
-   * `'manual-action-required'` — see module doc: this codebase can never
-   * honestly report `'deleted'`, but it CAN now honestly report "nothing
-   * left to do" once a live read confirms it.
+   * was supplied AND returned `'absent'` (a confident negative — see
+   * `app-presence.ts::resolveAppPresence`'s doc for how that confidence is
+   * earned). `'unknown'` — groundnuty/macf#967 — `deps.checkAppPresence` WAS
+   * supplied but came back inconclusive (permission-denied / listing
+   * unavailable / an ambiguous 404 at the predicted slug — see
+   * `app-presence.ts`'s module doc for the false-absent bug this status
+   * exists to stop masking). Reported DISTINCTLY from
+   * `'manual-action-required'` so an operator reading `--json` can tell "we
+   * genuinely couldn't check" apart from "we checked and it's still there" —
+   * DR-043 Amendment A's honest-unknown floor, in the status field, not only
+   * in prose. `'manual-action-required'` is every other case: no check
+   * wired (the pre-#917 default) OR a confirmed `'present'`. See module doc:
+   * this codebase can never honestly report `'deleted'`, but it CAN now
+   * honestly report "nothing left to do" once a live read confirms it, and
+   * can honestly report "couldn't tell" when the read is inconclusive.
    */
-  readonly status: 'manual-action-required' | 'already-absent';
+  readonly status: 'manual-action-required' | 'already-absent' | 'unknown';
   readonly reason: string;
 }
 
@@ -269,13 +277,21 @@ export interface AppDeletionDeps {
   /** Best-effort browser-open, same non-fatal posture as `apply-agent.ts`'s `announceAndOpenGate` — optional so a headless/CI/test caller can omit it entirely. */
   readonly openUrl?: (url: string) => Promise<void>;
   /**
-   * Optional live presence check (groundnuty/macf#917) — see
-   * {@link checkAppSlugPresence}. Omitted entirely, every target reports
+   * Optional live presence check (groundnuty/macf#917; widened to
+   * `(owner, appSlug)` by groundnuty/macf#967 so the REAL wiring can ask
+   * `app-presence.ts::resolveAppPresenceStatus` — org-installations-listing
+   * first, predicted-slug fallback second — instead of the predicted-slug-only
+   * {@link checkAppSlugPresence}). Omitted entirely, every target reports
    * `'manual-action-required'` exactly as before this fix (backward
    * compatible, never a new precondition — same additive posture as
-   * `readFleetLock` one layer up in `teardown-destructive.ts`).
+   * `readFleetLock` one layer up in `teardown-destructive.ts`). A zero-arg
+   * mock (`async () => 'absent'`, the common test shape) keeps working
+   * unchanged — TypeScript allows a fewer-parameter function where a
+   * wider-parameter one is expected — but a mock that reads `appSlug`
+   * POSITIONALLY must take BOTH params now (`(owner, appSlug) => ...`), since
+   * `appSlug` moved from the first to the second position.
    */
-  readonly checkAppPresence?: (appSlug: string) => Promise<Presence>;
+  readonly checkAppPresence?: (owner: { readonly account: string; readonly type: 'user' | 'org' }, appSlug: string) => Promise<Presence>;
 }
 
 function errMessage(err: unknown): string {
@@ -283,34 +299,31 @@ function errMessage(err: unknown): string {
 }
 
 /**
- * Best-effort LIVE presence read for an App's PREDICTED slug —
- * groundnuty/macf#917's `delete-apps`/`destroy` idempotency: re-running
- * either rung after the App was ALREADY manually deleted (the operator
- * completed the browser click-path this rung can only ever recommend)
- * should report "already absent," never instruct the browser deletion of
- * something that no longer exists.
- *
+ * Best-effort LIVE presence read for an App's PREDICTED slug, via
  * `GET /apps/{app_slug}` — unlike `identity-confirm.ts`'s
- * `GET /app/installations` — needs NO App-owned JWT; it is queryable with
- * ANY authenticated token (verified against the current GitHub REST docs,
- * `https://docs.github.com/en/rest/apps/apps#get-an-app`, 2026-08-13: "same
- * response schema as Get the authenticated app," 404 when the slug doesn't
- * exist, no App-JWT requirement documented). So this module's existing "no
- * vault-read access to a confirmed slug" limit (module doc) does NOT block
- * this read — the operator's own ambient `gh` auth is sufficient, same as
- * `control-repo.ts::checkControlRepoMeta`'s repo-presence read.
+ * `GET /app/installations`, this needs NO App-owned JWT; it is queryable
+ * with ANY authenticated token (verified against the current GitHub REST
+ * docs, `https://docs.github.com/en/rest/apps/apps#get-an-app`,
+ * 2026-08-13: "same response schema as Get the authenticated app," 404 when
+ * the slug doesn't exist, no App-JWT requirement documented).
  *
- * **Caveat, carried into the caller's report text.** `appSlug` here is
- * STILL {@link AppIdentityTarget.appSlug}'s PREDICTION, never a GitHub-
- * confirmed real slug — a 404 at the predicted slug means "nothing at THIS
- * exact slug," a strong but not airtight already-absent signal (if GitHub
- * appended a disambiguating suffix at creation, the real App could still be
- * alive under a slug this check never queries — {@link AppIdentityTarget.appSlug}'s
- * own doc names the same limitation). This is why a 404 here degrades to
- * `'absent'`, never silently upgraded to "confirmed deleted" — the same
- * present-detector-honesty posture `identity-confirm.ts`'s module doc
- * establishes for the sibling identity-plane read (DR-043 Amendment A),
- * applied to this simpler, JWT-free endpoint.
+ * **⚠ groundnuty/macf#967 — this endpoint's 404 is AMBIGUOUS for a private
+ * App and this function's OWN `'absent'` return must never be read as
+ * "confirmed gone."** Live-verified 2026-08-18: an operator who fully
+ * administers `macf-experiment` still got a 404 here for Apps that were
+ * present and installed the whole time — `GET /apps/{slug}` only returns
+ * full details when the caller is authenticated AS that specific App (its
+ * own JWT), not merely as someone who owns/administers it. Every fleet App
+ * is created `public: false` (`app-manifest.ts`), so in practice this
+ * function's `'absent'` here means "nothing at THIS exact slug, OR it
+ * exists and I can't see it" — not "genuinely absent." **This function is
+ * therefore ONLY the FALLBACK leaf inside `app-presence.ts::resolveAppPresence`,
+ * which is where the ambiguity gets resolved honestly** (a fallback
+ * `'absent'` degrades to `'unknown'` there, never propagated as a confident
+ * negative — see that module's doc for the full "ask, don't predict"
+ * design and why `GET /orgs/{org}/installations` is asked FIRST). Do not
+ * wire this function directly as a presence check outside that composition
+ * — `resolveAppPresenceStatus` is the correct call for any new caller.
  *
  * A non-404 failure (auth, network, rate-limit, `gh` missing) degrades to
  * `'unknown'` — NEVER throws, matching every other presence-read primitive
@@ -328,15 +341,29 @@ export async function checkAppSlugPresence(appSlug: string): Promise<Presence> {
 }
 
 /**
- * Report every App-identity target — NEVER mutates anything. `log` receives
- * the human-facing line BEFORE `deps.openUrl` is attempted — same "print
- * before open" ordering `apply-agent.ts`'s `announceAndOpenGate` doc
- * establishes (a live provisioning run showed `openUrl()` can silently
+ * Report every App-identity target — NEVER mutates anything. `owner` is the
+ * fleet's owner (`FleetManifest['owner']` is always structurally assignable
+ * here) — threaded through to `deps.checkAppPresence` so the REAL wiring can
+ * resolve presence honestly (`app-presence.ts::resolveAppPresenceStatus`,
+ * org-installations-listing first) without this function needing to know
+ * anything about HOW that resolution happens.
+ *
+ * `log` receives the human-facing line BEFORE `deps.openUrl` is attempted —
+ * same "print before open" ordering `apply-agent.ts`'s `announceAndOpenGate`
+ * doc establishes (a live provisioning run showed `openUrl()` can silently
  * misfire, so the URL must already be on-screen before the open is even
  * attempted). When `deps.checkAppPresence` confirms `'absent'`
  * (groundnuty/macf#917), the target short-circuits to `'already-absent'`
  * BEFORE the manual-deletion line is logged and BEFORE `deps.openUrl` is
- * ever attempted — there is nothing to open a browser tab for.
+ * ever attempted — there is nothing to open a browser tab for. When it
+ * confirms `'unknown'` (groundnuty/macf#967 — the check WAS wired but came
+ * back inconclusive), the target ALSO short-circuits, to the distinct
+ * `'unknown'` status — never silently folded into `'manual-action-required'`,
+ * per Amendment A's honest-unknown floor. `deps.checkAppPresence` omitted
+ * entirely (the pre-#917 default) keeps every target `'manual-action-required'`
+ * — that omitted-vs-inconclusive distinction is why this function reads
+ * `presence` as `Presence | undefined`, not defaulting the omitted case to
+ * the string `'unknown'` (which would have collapsed the two).
  *
  * A target with {@link AppIdentityTarget.extraFromLock} set gets an extra
  * `⚠ NOT DECLARED IN fleet.yaml` marker PREPENDED to its log line
@@ -346,6 +373,7 @@ export async function checkAppSlugPresence(appSlug: string): Promise<Presence> {
  * `reason`-matching callers are unaffected.
  */
 export async function reportAppIdentityRemoval(
+  owner: { readonly account: string; readonly type: 'user' | 'org' },
   targets: readonly AppIdentityTarget[],
   log: (line: string) => void,
   deps: AppDeletionDeps = {},
@@ -356,7 +384,7 @@ export async function reportAppIdentityRemoval(
       ? '⚠ NOT DECLARED IN fleet.yaml (recovered from fleet.lock only — verify this is not the widest-privilege ' +
         'identity in the fleet, e.g. a runner-ops App with administration:write) — '
       : '';
-    const presence = deps.checkAppPresence ? await deps.checkAppPresence(t.appSlug) : 'unknown';
+    const presence: Presence | undefined = deps.checkAppPresence ? await deps.checkAppPresence(owner, t.appSlug) : undefined;
     if (presence === 'absent') {
       const reason =
         `App "${t.appSlug}" returned 404 at its predicted slug — already absent, nothing to delete. (Slug is a ` +
@@ -364,6 +392,17 @@ export async function reportAppIdentityRemoval(
         'Settings → Developer settings → GitHub Apps before assuming the App is fully gone.)';
       log(`Role "${t.role}": ${notInManifestMarker}${reason}`);
       out.push({ role: t.role, appSlug: t.appSlug, settingsUrl: t.settingsUrl, appId: t.appId, extraFromLock: t.extraFromLock, status: 'already-absent', reason });
+      continue;
+    }
+    if (presence === 'unknown') {
+      const reason =
+        `could not verify whether App "${t.appSlug}" still exists — GitHub's per-slug read (GET /apps/${t.appSlug}) ` +
+        'cannot distinguish "genuinely absent" from "exists, private, and this token cannot see it," and the ' +
+        'organization-installations listing (the authoritative alternative) was unavailable, forbidden, or ' +
+        'inconclusive too. Verify manually (Settings → Developer settings → GitHub Apps) before assuming this App ' +
+        'is gone OR that it still needs deletion.';
+      log(`Role "${t.role}": ${notInManifestMarker}UNKNOWN — ${reason}`);
+      out.push({ role: t.role, appSlug: t.appSlug, settingsUrl: t.settingsUrl, appId: t.appId, extraFromLock: t.extraFromLock, status: 'unknown', reason });
       continue;
     }
 
