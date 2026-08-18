@@ -433,3 +433,73 @@ issue.
 - groundnuty/macf#377 — sigstore-TLOG hazard + test-flake stabilization (sibling concern from same session)
 - `reference_macf_app_permissions.md` (science-agent memory) — recurring-friction history
 - `groundnuty/macf-devops-toolkit#74` (issue) + `groundnuty/macf-devops-toolkit#77` (impl PR, merged at `85c966a8`) — release-hygiene Grafana dashboard + alerts (dashboard UID `macf-release-hygiene`)
+
+## Amendment B — runner registration does NOT widen this permission set; a second minimal App holds it (2026-08-18, #943)
+
+**Trigger.** Registering a self-hosted runner requires `POST /repos/{owner}/{repo}/actions/runners/registration-token`, which needs **`administration: write`**. The canonical manifest has no `administration` at all (verified: `metadata:read, contents:write, issues:write, pull_requests:write, actions_variables:write, workflows:write, actions:read`), so **no MACF agent App can register a runner, on any fleet, present or future.** The question was whether to add it here.
+
+### B1 — widening this set is REJECTED, not weighed
+
+**`administration: write` is *repository* administration, not runner administration, and it includes `DELETE /repos/{owner}/{repo}`** (GitHub's permissions reference: *write | UAT, IAT*). Adding it to the canonical manifest would grant **every agent App, in every fleet, permanently, the ability to delete its own repositories** — with the private key materialised onto the agent's VM by `vault.sh` at launch.
+
+That is irreconcilable with two ratified positions: DR-043 Amendment G puts repo deletion behind an explicit flag, a typed fleet name, an environment acknowledgment and a printed inventory, on the operator's instruction *"never — and I repeat never — allow to easily remove repositories"*; and this DR's set is deliberately narrow. A permanent, fleet-wide privilege expansion is not a proportionate price for one registration token.
+
+### B2 — a second, minimal, per-fleet App instead
+
+**`<fleet>-runner-ops`** holds exactly `administration: write` + `actions: read` + `metadata: read` and nothing else. Cost: **+2 consent clicks per fleet**, one-time — not per agent.
+
+- **Installed on AGENT repos only.** The `<fleet>-control` repo is deliberately outside its scope, for two reasons that hold regardless of what runs there: DR-043 Amendment F constrains control-repo Actions secrets to *"READ-ONLY credentials … never a write-scoped token"*, and `administration: write` there would give deletion authority over **the repository holding the sealed vault**. *(Not because the control repo "runs no CI" — it runs the scheduled doctors, under the account-shared read-only control-plane App. Its CI need is already served by a correctly-scoped identity, which is a stronger reason than an absence.)*
+- **`repository_selection` is not manifest-declarable** — it is an install-page choice at consent gate 2. The achievable guarantee is therefore **post-gate-2 verify-then-refuse**: assert the install is not `'all'` and refuse if it is, treating an *omitted* value as not-satisfying rather than as a convenient pass.
+
+### B3 — the KEY-CLASS rule: the ceiling is set by whether the key leaves the vault
+
+This App's key is **exported** — it is sent to the runner platform and stored in a cluster Secret readable by the ARC controller and any cluster-admin. That makes it a **second key class with its own custody rule**, *not an exception to DR-043 Amendments C/D*:
+
+| key class | custody | permission ceiling |
+|---|---|---|
+| agent App key | vault-only; the agent provably cannot decrypt it | DR-019's set, narrow |
+| **exported key** (`runner-ops`) | vault **+ deliberately exported**; readable by the controller and every cluster-admin, permanently | **minimal, permanently** |
+| future management key | vault-only, operator-invoked | may hold fleet authority |
+
+**The discriminator is custody, not job description.** A vault-only key is decrypted where `apply` runs and discarded, so its authority stays inside **one trust boundary** — the operator's machine, which already holds the age key and therefore everything. An exported key adds **parties**, permanently, so authority on it **multiplies across readers**. Exported keys widen the party set; vault-only keys do not.
+
+Recording this as a *class* rather than an *exception* is deliberate: written as an exception it becomes precedent for exporting agent keys whenever convenient.
+
+### B4 — export is a ONE-WAY GATE
+
+1. **Re-scope to minimal BEFORE export, never after.** *"We'll narrow it once it's working"* does not happen — the pressure to narrow disappears at the moment the thing starts working.
+2. **Once exported, the ceiling never rises.** A new capability requires a **new identity**, not a widened one.
+3. **Export is a recorded decision**, not an operational step — that moment is the only point at which anyone weighs the trade.
+
+Both directions are closed by this: an exported key cannot accrete authority, and an authoritative key cannot be quietly exported.
+
+### B5 — the ratchet is an OBSERVABLE INVARIANT, not a promise
+
+*"The ceiling never rises"* is otherwise unverifiable: a permission added six months from now surfaces nothing, because the App keeps working. It **is** checkable — `GET /app` returns `permissions` under the App's own JWT.
+
+- **Record** the exported App's permission set in `fleet.lock` at export time (Amendment D's triad already assigns observed non-secret state there; a fourth surface would be the drift-prone parallel this project avoids).
+- **Assert** later that `current ⊆ recorded`, and flag additions loudly.
+
+**Subset, NOT equality — and the reason must be written at the comparison site, or someone will "tighten" it.** Additions are privilege creep: silent, permanent, the whole invariant. Removals are capability loss: self-revealing, because the App simply stops working. Equality would fire on **deliberate narrowing** — exactly the tightening this amendment asks for — and a guard that alarms when you improve your posture trains people to disable it.
+
+**Where it must NOT live: a VM-side `macf fleet doctor`.** Reading `GET /app` requires the App's own JWT (verified: an installation token returns `401` on that endpoint), so a VM-side check would have to materialise the very key whose custody this rule constrains. **A check that requires materialising the key it protects is worse than the drift it detects.** It belongs Mac-side, with the `#855` attestation track — the same question (*did a deployed thing drift from what we recorded?*) asked of a permission set instead of a secret's bytes.
+
+### B6 — naming: roles vs credentials, and the 34-character budget
+
+**Agent names describe the role; App names describe the credential's *permanent* cap.** Capability-names never go stale here *because* B4 freezes the capability — the usual objection (*"it will do more later"*) is false for this class by construction.
+
+GitHub App names are capped at **34 characters** and are globally unique. The derived scheme spends most of that budget, and the binding constraint is the longest role:
+
+    science-agent      13  → max fleet name 20
+    runner-ops         10  → max fleet name 23
+    runner-registrar   16  → max fleet name 17   ← would have LOWERED the ceiling
+
+**Criterion (test-enforced): a new derived role must be no longer than the longest existing role**, so adding a credential never lowers the fleet-name ceiling. `runner-ops` was chosen over `runner-admin` on the operator's ruling — name for the **resource**, not the permission level — which also avoids a name that reads as a mandate at the consent gate.
+
+### B7 — the `fleet-manager` role: named now, built later, and `manager ∉ managed`
+
+The operator has named the future agent that will own fleet upkeep. It is named now and unbuilt; today's `runner-ops` credential is **not** its identity, and its eventual authority arrives as a **separate, vault-only** credential. **The manager grows; the exported key does not.**
+
+**`<fleet>-control` is that agent's WORK SURFACE, not its HOME.** Amendment F is explicit — *"NO fleet agent granted write … the managed must not be able to rewrite the terms of its own management."* So the precondition on any future write grant there is **`manager ∉ managed`**: the manager must not be a member of the fleet it manages, or F's privilege inversion returns wearing a manager's title. Its home, when it exists, is its own repo.
+
+**Integrate at the state surface, not at the credential.** The future agent connects to today's work through the control repo, the manifest and the reconcile verbs — never by reusing this App. Reusing an identity to avoid provisioning one is how two blast radii merge into the larger of the two, and it always presents as economy rather than as a privilege decision.
