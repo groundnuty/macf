@@ -12,12 +12,23 @@
  * `readVault` from `vault-read.ts`, gated `skipIf(!HAS_AGE)` per
  * `vault-read.test.ts`'s own convention.
  *
- * **Never touches a real operator path.** Every test that reaches
- * `deployAgent` supplies `keyPathFor` pointed at a `mkdtempSync` scratch
- * dir — the production default (`defaultAgentKeyPath`) resolves under the
- * REAL operator's `~/.macf/keys/`, which may hold a live fleet's key; a
- * test that omitted this seam could read a real key as "already present" or
- * (worse) overwrite one.
+ * **Never touches a real operator path — with ONE deliberate, documented
+ * exception (macf#1000).** Every test that reaches `deployAgent` supplies
+ * `keyPathFor` pointed at a `mkdtempSync` scratch dir — the production
+ * default (`defaultAgentKeyPath`) resolves under the REAL operator's
+ * `~/.macf/keys/`, which may hold a live fleet's key; a test that omitted
+ * this seam could read a real key as "already present" or (worse) overwrite
+ * one. The ONE exception is the "REAL `initAgent`, the decisive
+ * seam-call-count proof" block near the end of this file: `commands/init.ts`'s
+ * GitHub-mode cert-flow has NO path-override seam for the per-project CA
+ * (`caCertPath(project)`/`caKeyPath(project)`, home-dir-rooted, always), so
+ * proving the REAL integration doesn't double-issue a cert requires the CA
+ * to actually live there. That block follows `certs.test.ts`'s own
+ * established convention instead — a RANDOMIZED, per-test project name
+ * (never collides with a real fleet) + guaranteed cleanup in `finally` —
+ * rather than stubbing `HOME` (`config.ts`'s `MACF_GLOBAL_DIR` is a
+ * module-scope `const` computed from `homedir()` at import time, so
+ * `vi.stubEnv('HOME', …)` after import is a no-op).
  *
  * **`PEM` / `OTHER_PEM` are REAL RSA keys (macf#975), not opaque strings.**
  * The macf#975 fingerprint-mismatch check parses whatever is on disk with
@@ -32,13 +43,37 @@
  * "the vault's key" concept in this file, not a fake one for old tests and
  * a real one for new tests.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { createPrivateKey, generateKeyPairSync } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, resolve as resolvePath } from 'node:path';
 import { X509Certificate } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// `vi.hoisted` runs BEFORE the hoisted `vi.mock` factory below (and before
+// this file's real ESM imports, which the JS spec hoists ahead of ordinary
+// top-level statements) — same reasoning as `certs.test.ts`'s own
+// `vi.hoisted` comment. This counter is what makes the macf#1000 "exactly
+// once" test decisive: it counts calls to the REAL `@groundnuty/macf-core`
+// `generateAgentCert` (delegated through, never faked) across an entire
+// `deployAgent` run that uses the REAL `initAgent` — the only way to prove
+// the seam is reached exactly once rather than asserting "a cert exists,"
+// which the pre-#1000 duplicate-issuance bug would ALSO have satisfied.
+const certCallState = vi.hoisted(() => ({ count: 0 }));
+
+vi.mock('@groundnuty/macf-core', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@groundnuty/macf-core')>();
+  return {
+    ...actual,
+    generateAgentCert: async (...args: Parameters<typeof actual.generateAgentCert>) => {
+      certCallState.count += 1;
+      return actual.generateAgentCert(...args);
+    },
+  };
+});
+
 import {
   FleetDeployError,
   deployAgent,
@@ -53,7 +88,6 @@ import {
   cloneViaInsteadOf,
   publicKeyFingerprint,
   materializeProjectCa,
-  issueAgentCertIfNeeded,
   type FleetDeployDeps,
 } from '../../../src/cli/bootstrap/fleet-deploy.js';
 import type { FleetAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
@@ -62,6 +96,8 @@ import { readVault } from '../../../src/cli/bootstrap/vault-read.js';
 import { VaultError, buildVaultPlaintext, writeVault, type VaultAgentSecrets, type VaultPayload } from '../../../src/cli/bootstrap/vault-write.js';
 import { secretFingerprint } from '../../../src/cli/bootstrap/fleet-lock.js';
 import type { InitOptions } from '../../../src/cli/commands/init.js';
+import { initAgent as realInitAgent } from '../../../src/cli/commands/init.js';
+import { agentCertPath, agentKeyPath, caCertPath, caDir, readAgentsIndex, writeAgentsIndex } from '../../../src/cli/config.js';
 import { resolveAgeGate } from './age-binary-gate.js';
 import { toVariableSegment, createCA, caCertFingerprint } from '@groundnuty/macf-core';
 
@@ -71,10 +107,30 @@ const dirs: string[] = [];
 afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
+beforeEach(() => {
+  certCallState.count = 0;
+});
 function scratchDir(prefix = 'macf-fleet-deploy-test-'): string {
   const d = mkdtempSync(join(tmpdir(), prefix));
   dirs.push(d);
   return d;
+}
+
+/**
+ * Removes `absDir` from the REAL `~/.macf/agents.json` index (macf#1000) —
+ * cleanup for the ONE test in this file that calls the REAL `initAgent`,
+ * whose `addToAgentsIndex` appends to that file unconditionally. Read-
+ * filter-write rather than a blind delete: `addToAgentsIndex` is
+ * append-if-absent, so this is the exact inverse, and it leaves any OTHER
+ * (real, operator's) entries in the index untouched.
+ */
+function removeFromAgentsIndex(absDir: string): void {
+  const resolved = resolvePath(absDir);
+  const index = readAgentsIndex();
+  const filtered = index.agents.filter((p) => p !== resolved);
+  if (filtered.length !== index.agents.length) {
+    writeAgentsIndex({ agents: filtered });
+  }
 }
 
 const FLEET = 'demo-fleet';
@@ -279,6 +335,45 @@ describe('initRegistryOptionsFor', () => {
 function fakeInitAgent(calls: { dir: string; opts: InitOptions }[]): FleetDeployDeps['initAgent'] {
   return async (dir, opts) => {
     calls.push({ dir, opts });
+  };
+}
+
+/**
+ * A cert-AWARE `initAgent` fake (macf#1000) — unlike {@link fakeInitAgent}
+ * (a pure recorder), this ALSO simulates the SHAPE of `commands/init.ts`'s
+ * GitHub-mode cert-flow closely enough to exercise `deployAgent`'s OWN
+ * before/after-existence `certIssue` computation: when a CA is present at
+ * `caPaths` (the SAME conventional location `deployAgent`'s own
+ * `materializeProjectCa` step wrote to), it writes a cert+key SENTINEL at
+ * `destDir`'s conventional agent-cert path — UNLESS `opts.skipCertIfPresent`
+ * is `true` AND a cert+key pair is ALREADY there, mirroring the REAL
+ * `initAgent`'s skip-if-present contract exactly.
+ *
+ * **This is a SIMULATION, never the real crypto path** — no CA is loaded,
+ * no `generateAgentCert` call happens, the "cert" is an opaque sentinel
+ * string. It exists so `deployAgent`-level tests can assert `certIssue` +
+ * on-disk-presence cheaply (no real CA mint, no real `initAgent`'s dozen
+ * unrelated side effects — network plugin fetch, env files, hooks, …) —
+ * this codebase's own "a test that constructs the seam it should observe"
+ * lesson means a fake reimplementing the behavior under test can prove
+ * `deployAgent`'s OWN logic (the pre/post existence check) but can NEVER
+ * prove the real integration doesn't double-issue. That proof is the
+ * SEPARATE "REAL `initAgent`" describe block below, which deliberately does
+ * NOT use this fake.
+ */
+function fakeInitAgentWithCertSim(
+  calls: { dir: string; opts: InitOptions }[],
+  caPaths: { certPath: string; keyPath: string },
+): FleetDeployDeps['initAgent'] {
+  return async (dir, opts) => {
+    calls.push({ dir, opts });
+    if (!(existsSync(caPaths.certPath) && existsSync(caPaths.keyPath))) return;
+    const certDest = agentCertPath(dir);
+    const keyDest = agentKeyPath(dir);
+    if (opts.skipCertIfPresent === true && existsSync(certDest) && existsSync(keyDest)) return;
+    mkdirSync(dirname(certDest), { recursive: true });
+    writeFileSync(certDest, 'SIMULATED-AGENT-CERT-SENTINEL');
+    writeFileSync(keyDest, 'SIMULATED-AGENT-KEY-SENTINEL');
   };
 }
 
@@ -1082,63 +1177,16 @@ describe('materializeProjectCa (unit-level)', () => {
   });
 });
 
-describe('issueAgentCertIfNeeded (unit-level)', () => {
-  it('no cert present at destDir: issues a REAL, valid, CA-signed cert — cryptographic verification, not just file presence', async () => {
-    const ca = await mintTestCa('issue');
-    const dir = scratchDir();
-    const certPath = join(dir, 'nested', 'agent-cert.pem');
-    const keyPath = join(dir, 'nested', 'agent-key.pem');
-
-    const outcome = await issueAgentCertIfNeeded(dir, 'code-agent', ca.certPem, ca.keyPem, 'example.ts.net', {
-      agentCertPathFor: () => certPath,
-      agentKeyPathFor: () => keyPath,
-    });
-
-    expect(outcome).toBe('issued');
-    const issuedCertPem = readFileSync(certPath, 'utf-8');
-    expect(issuedCertPem).toContain('BEGIN CERTIFICATE');
-    expect(readFileSync(keyPath, 'utf-8')).toContain('BEGIN PRIVATE KEY');
-
-    // Real X.509 parse + signature verification — proves the cert was
-    // ACTUALLY signed by the given CA, not merely a byte-copy of something.
-    const issued = new X509Certificate(issuedCertPem);
-    const caX509 = new X509Certificate(ca.certPem);
-    expect(issued.checkIssued(caX509)).toBe(true);
-    expect(issued.verify(caX509.publicKey)).toBe(true);
-    expect(issued.subject).toBe('CN=code-agent');
-  });
-
-  it('cert+key already present at destDir: "skipped-existing", byte-for-byte untouched (no churn)', async () => {
-    const ca = await mintTestCa('skip');
-    const dir = scratchDir();
-    const certPath = join(dir, 'agent-cert.pem');
-    const keyPath = join(dir, 'agent-key.pem');
-    writeFileSync(certPath, 'PRE-EXISTING-CERT-SENTINEL');
-    writeFileSync(keyPath, 'PRE-EXISTING-KEY-SENTINEL');
-
-    const outcome = await issueAgentCertIfNeeded(dir, 'code-agent', ca.certPem, ca.keyPem, 'example.ts.net', {
-      agentCertPathFor: () => certPath,
-      agentKeyPathFor: () => keyPath,
-    });
-
-    expect(outcome).toBe('skipped-existing');
-    expect(readFileSync(certPath, 'utf-8')).toBe('PRE-EXISTING-CERT-SENTINEL');
-    expect(readFileSync(keyPath, 'utf-8')).toBe('PRE-EXISTING-KEY-SENTINEL');
-  });
-});
-
-describe('deployAgent — CA materialization + agent-cert issuance, end to end (macf#976)', () => {
-  it('CLEAN HOST, no local CA: THE DECISIVE ASSERTION — a real, usable agent cert exists after deploy, not merely "the CA was read from the vault"', async () => {
+describe('deployAgent — CA materialization + agent-cert issuance, end to end (macf#976, delegation shape per macf#1000)', () => {
+  it('CLEAN HOST, no local CA: certIssue is "issued" once `initAgent` lands a cert, computed from the SAME `agentCertPath(destDir)`/`agentKeyPath(destDir)` initAgent itself writes to (no agentCertPathFor/agentKeyPathFor override exists anymore — deployAgent no longer issues a cert itself; see the REAL-`initAgent` block below for the actual generateAgentCert crypto proof)', async () => {
     const ca = await mintTestCa('e2e-clean');
     const caScratch = scratchDir();
     const caCertFilePath = join(caScratch, 'ca-cert.pem');
     const caKeyFilePath = join(caScratch, 'ca-key.pem');
     const workDir = scratchDir();
     const destDir = join(workDir, 'workspace');
-    const agentScratch = scratchDir();
-    const agentCertFilePath = join(agentScratch, 'agent-cert.pem');
-    const agentKeyFilePath = join(agentScratch, 'agent-key.pem');
     const keyPath = join(scratchDir(), `${ROLE}.pem`);
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
 
     const outcome = await deployAgent(
       AGENT,
@@ -1149,12 +1197,10 @@ describe('deployAgent — CA materialization + agent-cert issuance, end to end (
         readVault: async () => vaultRawWithCa(ca),
         cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
         mintCloneToken: async () => FAKE_TOKEN,
-        initAgent: fakeInitAgent([]),
+        initAgent: fakeInitAgentWithCertSim(initCalls, { certPath: caCertFilePath, keyPath: caKeyFilePath }),
         keyPathFor: () => keyPath,
         caCertPathFor: () => caCertFilePath,
         caKeyPathFor: () => caKeyFilePath,
-        agentCertPathFor: () => agentCertFilePath,
-        agentKeyPathFor: () => agentKeyFilePath,
       },
     );
 
@@ -1162,6 +1208,10 @@ describe('deployAgent — CA materialization + agent-cert issuance, end to end (
     if (outcome.status !== 'deployed') throw new Error('unreachable');
     expect(outcome.ca).toEqual({ status: 'materialized', certFingerprint: caCertFingerprint(ca.certPem) });
     expect(outcome.certIssue).toBe('issued');
+    // `deployAgent` always delegates with the skip signal set — it never
+    // knows in advance whether `initAgent` will find a pre-existing cert.
+    expect(initCalls).toHaveLength(1);
+    expect(initCalls[0]?.opts.skipCertIfPresent).toBe(true);
 
     // CA landed correctly.
     expect(readFileSync(caCertFilePath, 'utf-8')).toBe(ca.certPem);
@@ -1169,13 +1219,11 @@ describe('deployAgent — CA materialization + agent-cert issuance, end to end (
     expect(statSync(caKeyFilePath).mode & 0o777).toBe(0o600);
     expect(statSync(caCertFilePath).mode & 0o777).toBe(0o644);
 
-    // THE DECISIVE ASSERTION: a real, usable, CA-signed agent cert exists.
-    const issuedCertPem = readFileSync(agentCertFilePath, 'utf-8');
-    const issued = new X509Certificate(issuedCertPem);
-    const caX509 = new X509Certificate(ca.certPem);
-    expect(issued.checkIssued(caX509)).toBe(true);
-    expect(issued.verify(caX509.publicKey)).toBe(true);
-    expect(issued.subject).toBe(`CN=${ROLE}`);
+    // The cert landed at the REAL conventional path — the only path
+    // `deployAgent`'s pre/post check (and the real `initAgent`) ever look
+    // at now.
+    expect(readFileSync(agentCertPath(destDir), 'utf-8')).toBe('SIMULATED-AGENT-CERT-SENTINEL');
+    expect(readFileSync(agentKeyPath(destDir), 'utf-8')).toBe('SIMULATED-AGENT-KEY-SENTINEL');
 
     // The outcome never carries the secret material anywhere.
     const serialized = JSON.stringify(outcome);
@@ -1183,7 +1231,7 @@ describe('deployAgent — CA materialization + agent-cert issuance, end to end (
     expect(serialized).not.toContain(ca.certPem);
   });
 
-  it('CA already present and MATCHING + agent cert already present: no re-issue anywhere (no churn) — idempotent re-run', async () => {
+  it('CA already present and MATCHING + agent cert already present: certIssue is "skipped-existing", byte-for-byte untouched (no churn) — idempotent re-run', async () => {
     const ca = await mintTestCa('e2e-idempotent');
     const caScratch = scratchDir();
     const caCertFilePath = join(caScratch, 'ca-cert.pem');
@@ -1195,11 +1243,12 @@ describe('deployAgent — CA materialization + agent-cert issuance, end to end (
     const destDir = join(workDir, 'workspace');
     mkdirSync(destDir, { recursive: true });
     writeFileSync(join(destDir, 'already-here.txt'), 'x'); // non-empty -> workspace skip too
-    const agentScratch = scratchDir();
-    const agentCertFilePath = join(agentScratch, 'agent-cert.pem');
-    const agentKeyFilePath = join(agentScratch, 'agent-key.pem');
+    const agentCertFilePath = agentCertPath(destDir);
+    const agentKeyFilePath = agentKeyPath(destDir);
+    mkdirSync(dirname(agentCertFilePath), { recursive: true });
     writeFileSync(agentCertFilePath, 'PRE-EXISTING-AGENT-CERT-SENTINEL');
     writeFileSync(agentKeyFilePath, 'PRE-EXISTING-AGENT-KEY-SENTINEL');
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
 
     const outcome = await deployAgent(
       AGENT,
@@ -1212,12 +1261,10 @@ describe('deployAgent — CA materialization + agent-cert issuance, end to end (
           throw new Error('must not be called — workspace already populated');
         },
         mintCloneToken: mintCloneTokenMustNotBeCalled(),
-        initAgent: fakeInitAgent([]),
+        initAgent: fakeInitAgentWithCertSim(initCalls, { certPath: caCertFilePath, keyPath: caKeyFilePath }),
         keyPathFor: () => join(scratchDir(), `${ROLE}.pem`),
         caCertPathFor: () => caCertFilePath,
         caKeyPathFor: () => caKeyFilePath,
-        agentCertPathFor: () => agentCertFilePath,
-        agentKeyPathFor: () => agentKeyFilePath,
       },
     );
 
@@ -1225,9 +1272,12 @@ describe('deployAgent — CA materialization + agent-cert issuance, end to end (
     if (outcome.status !== 'deployed') throw new Error('unreachable');
     expect(outcome.ca).toEqual({ status: 'already-current', certFingerprint: caCertFingerprint(ca.certPem) });
     expect(outcome.certIssue).toBe('skipped-existing');
+    expect(initCalls[0]?.opts.skipCertIfPresent).toBe(true);
 
     expect(readFileSync(caCertFilePath, 'utf-8')).toBe(ca.certPem);
     expect(readFileSync(caKeyFilePath, 'utf-8')).toBe(ca.keyPem);
+    // Untouched — the sentinel fake's own skip-if-present branch (mirroring
+    // the real initAgent's) left the pre-existing pair exactly as it was.
     expect(readFileSync(agentCertFilePath, 'utf-8')).toBe('PRE-EXISTING-AGENT-CERT-SENTINEL');
     expect(readFileSync(agentKeyFilePath, 'utf-8')).toBe('PRE-EXISTING-AGENT-KEY-SENTINEL');
   });
@@ -1299,6 +1349,98 @@ describe('deployAgent — CA materialization + agent-cert issuance, end to end (
     if (outcome.status !== 'deployed') throw new Error('unreachable');
     expect(outcome.ca).toEqual({ status: 'vault-absent' });
     expect(outcome.certIssue).toBe('not-attempted');
+  });
+});
+
+// --- REAL `initAgent` — the decisive seam-call-count proof (macf#1000) ---
+//
+// Every test above uses an INJECTED `initAgent` fake — necessary for
+// speed/determinism, but per this file's own "test that constructs the
+// seam it should observe" lesson, a fake can only prove `deployAgent`'s
+// OWN logic is correct; it can never prove the REAL `initAgent` doesn't
+// independently re-issue the cert `deployAgent` just delegated. Before
+// macf#1000, `deployAgent` called `issueAgentCertIfNeeded` directly AND
+// delegated to `initAgent`, whose own cert-flow branch was unconditional —
+// TWO real `generateAgentCert` calls per deploy, agreeing only by luck
+// (same CA/CN/SAN). A fake `initAgent` could never have caught that: it
+// doesn't call `generateAgentCert` at all, so "a cert exists after deploy"
+// passed whether the seam was hit once, twice, or (with a differently-CA'd
+// fake) inconsistently. This block uses the REAL `commands/init.ts::initAgent`
+// and counts calls to the REAL `@groundnuty/macf-core::generateAgentCert`
+// (via the `certCallState` seam declared near this file's top) — the only
+// assertion that actually distinguishes "collapsed onto one path" from
+// "duplicated, but the duplicate happened to agree."
+describe('deployAgent — REAL `initAgent`, the decisive seam-call-count proof (macf#1000)', () => {
+  it('a deploy issues the agent cert EXACTLY ONCE — the decisive assertion is the SEAM CALL COUNT, not "a cert exists" (which the pre-#1000 duplicate-issuance bug would ALSO have satisfied)', async () => {
+    // A dedicated, randomized project name — NEVER `FLEET` ('demo-fleet') —
+    // so the per-project CA this test's `deployAgent` call materializes
+    // lands under a throwaway `~/.macf/certs/<project>/`, never a real
+    // fleet's. `caCertPathFor`/`caKeyPathFor` are deliberately OMITTED
+    // below (left at their real default) — see this file's header doc +
+    // `FleetDeployDeps.caCertPathFor`'s own doc for why an override here
+    // would make the real `initAgent` silently find no CA.
+    const project = `T${Date.now()}${Math.floor(Math.random() * 1e6)}`;
+    const role = 'code-agent';
+    const agent: FleetAgent = { role, profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/unused-in-tests' };
+    const manifest: FleetManifest = { ...manifestWith(), metadata: { name: project } };
+    const destDir = join(scratchDir(), 'workspace');
+    // A nonexistent scratch path — `initAgent`'s best-effort bot_login
+    // resolution (`fetchAppSlug`) fails fast trying to read/parse this
+    // (file-not-found), caught internally as a non-fatal warning; never a
+    // real network call. Same posture `init.test.ts`'s own suite already
+    // accepts for its (also fake-App-id) `initAgent()` calls.
+    const keyPath = join(scratchDir(), `${role}.pem`);
+    const ca = await mintTestCa('macf1000-seam-proof');
+
+    const seg = toVariableSegment(project);
+    const appSeg = deriveAppHandle(project, role).toUpperCase().replace(/-/g, '_');
+    const raw: Record<string, string> = {
+      [`MACF_AGENT_${appSeg}_APP_ID`]: '111',
+      [`MACF_AGENT_${appSeg}_INSTALL_ID`]: '222',
+      [`MACF_AGENT_${appSeg}_PRIVATE_KEY_B64`]: Buffer.from(PEM, 'utf-8').toString('base64'),
+      [`MACF_${seg}_CA_KEY_B64`]: Buffer.from(ca.keyPem, 'utf-8').toString('base64'),
+      [`MACF_${seg}_CA_CERT_B64`]: Buffer.from(ca.certPem, 'utf-8').toString('base64'),
+    };
+
+    try {
+      const outcome = await deployAgent(
+        agent,
+        manifest,
+        destDir,
+        { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+        {
+          readVault: async () => raw,
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          mintCloneToken: async () => FAKE_TOKEN,
+          initAgent: realInitAgent,
+          keyPathFor: () => keyPath,
+          // caCertPathFor / caKeyPathFor: DEFAULT (real) — required, see doc above.
+        },
+      );
+
+      expect(outcome.status).toBe('deployed');
+      if (outcome.status !== 'deployed') throw new Error('unreachable');
+      expect(outcome.ca.status).toBe('materialized');
+      expect(outcome.certIssue).toBe('issued');
+
+      // THE decisive assertion (macf#1000 AC 1): the seam was reached
+      // EXACTLY once. See this test's own title for why "a cert exists"
+      // alone is not decisive.
+      expect(certCallState.count).toBe(1);
+
+      // AC 2 ("certIssue reflects the final on-disk cert"), proven with
+      // real crypto: a genuine, CA-signed cert landed at the conventional
+      // path — not merely "some file got written."
+      const issuedCertPem = readFileSync(agentCertPath(destDir), 'utf-8');
+      const caX509 = new X509Certificate(readFileSync(caCertPath(project), 'utf-8'));
+      const issued = new X509Certificate(issuedCertPem);
+      expect(issued.checkIssued(caX509)).toBe(true);
+      expect(issued.verify(caX509.publicKey)).toBe(true);
+      expect(issued.subject).toBe(`CN=${role}`);
+    } finally {
+      rmSync(caDir(project), { recursive: true, force: true });
+      removeFromAgentsIndex(destDir);
+    }
   });
 });
 

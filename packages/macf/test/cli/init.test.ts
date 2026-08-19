@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { initAgent } from '../../src/cli/commands/init.js';
-import { readAgentConfig } from '../../src/cli/config.js';
+import { readAgentConfig, agentCertPath, caCertPath, caKeyPath, caDir, readAgentsIndex, writeAgentsIndex } from '../../src/cli/config.js';
+import { createCA } from '@groundnuty/macf-core';
 
 function tempDir(): string {
   const dir = join(tmpdir(), `macf-init-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -465,4 +466,114 @@ describe('macf init', () => {
       expect(config!.github_app).toBeUndefined();
     });
   });
+});
+
+// --- GitHub-mode agent leaf-cert flow: `skipCertIfPresent` (macf#1000) ---
+//
+// These tests touch the REAL `~/.macf/certs/<project>/` — the GitHub-mode
+// cert-flow (`issueGithubModeAgentCert` in `commands/init.ts`) has NO
+// path-override seam for the per-project CA; it always reads
+// `caCertPath(project)`/`caKeyPath(project)` from `../../src/cli/config.js`
+// directly. Proving the "no behaviour change for `macf init` used directly"
+// AC (macf#1000) therefore requires the CA to actually live at that
+// conventional location. Same convention `certs.test.ts` already
+// established: a RANDOMIZED per-test project name (never collides with a
+// real fleet) + guaranteed cleanup in `finally` — not `vi.stubEnv('HOME', …)`,
+// which is a no-op here (`config.ts`'s `MACF_GLOBAL_DIR` is a module-scope
+// `const` computed from `homedir()` at import time).
+describe('macf init — GitHub-mode agent leaf-cert flow, skipCertIfPresent (macf#1000)', () => {
+  function freshProject(): string {
+    return `T${Date.now()}${Math.floor(Math.random() * 1e6)}`;
+  }
+
+  async function mintRealCaFor(project: string): Promise<void> {
+    await createCA({ project, certPath: caCertPath(project), keyPath: caKeyPath(project) });
+  }
+
+  function removeFromAgentsIndex(absDir: string): void {
+    const resolved = resolve(absDir);
+    const index = readAgentsIndex();
+    const filtered = index.agents.filter((p) => p !== resolved);
+    if (filtered.length !== index.agents.length) {
+      writeAgentsIndex({ agents: filtered });
+    }
+  }
+
+  it('DEFAULT (skipCertIfPresent unset): a `macf init` re-run UNCONDITIONALLY reissues the cert — the "no behaviour change for `macf init` used directly" AC, proven as a DISCRIMINATING PAIR (differ across two runs), not merely "a cert exists"', async () => {
+    const project = freshProject();
+    const dir = tempDir();
+    const initOpts = {
+      project,
+      role: 'code-agent',
+      appId: '111',
+      installId: '222',
+      keyPath: 'k.pem',
+      registryType: 'repo' as const,
+      registryRepo: 'owner/repo',
+      cliVersion: '0.1.0',
+      pluginVersion: '0.1.0',
+      actionsVersion: 'v1',
+    };
+    try {
+      await mintRealCaFor(project);
+
+      await initAgent(dir, initOpts);
+      const firstCertPem = readFileSync(agentCertPath(dir), 'utf-8');
+
+      await initAgent(dir, initOpts);
+      const secondCertPem = readFileSync(agentCertPath(dir), 'utf-8');
+
+      // Unconditional reissue (unchanged, pre-#1000 contract): a fresh
+      // random serial number (agent-cert.ts::generateAgentCert) makes the
+      // second cert BYTE-DIFFERENT from the first, even against the SAME
+      // CA/CN/inputs.
+      expect(secondCertPem).not.toBe(firstCertPem);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(caDir(project), { recursive: true, force: true });
+      removeFromAgentsIndex(dir);
+    }
+    // Two full `initAgent()` runs (each hitting the network for the plugin
+    // fetch — same accepted cost this file's OTHER tests already pay once
+    // per test, per this file's own "routing_label" test comment) exceed
+    // vitest's 5000ms default under full-suite parallel load, even though
+    // both runs complete comfortably under it in isolation (verified:
+    // `vitest run test/cli/init.test.ts` alone, 31.94s / 35 tests total).
+    // Matches this monorepo's own convention for real-crypto/real-network
+    // tests (`ca.test.ts`, `migrate-ca-key.test.ts`).
+  }, 20000);
+
+  it('skipCertIfPresent: true (the `fleet deploy` delegation signal): a re-run with an existing cert leaves it byte-for-byte UNTOUCHED', async () => {
+    const project = freshProject();
+    const dir = tempDir();
+    const initOpts = {
+      project,
+      role: 'code-agent',
+      appId: '111',
+      installId: '222',
+      keyPath: 'k.pem',
+      registryType: 'repo' as const,
+      registryRepo: 'owner/repo',
+      cliVersion: '0.1.0',
+      pluginVersion: '0.1.0',
+      actionsVersion: 'v1',
+      skipCertIfPresent: true,
+    };
+    try {
+      await mintRealCaFor(project);
+
+      await initAgent(dir, initOpts);
+      const firstCertPem = readFileSync(agentCertPath(dir), 'utf-8');
+
+      await initAgent(dir, initOpts);
+      const secondCertPem = readFileSync(agentCertPath(dir), 'utf-8');
+
+      expect(secondCertPem).toBe(firstCertPem);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(caDir(project), { recursive: true, force: true });
+      removeFromAgentsIndex(dir);
+    }
+    // See the sibling test's own comment on the explicit timeout below.
+  }, 20000);
 });
