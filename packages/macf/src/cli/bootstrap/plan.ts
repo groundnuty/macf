@@ -65,6 +65,14 @@ import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
 // checkRunnerTokenPreflight`'s doc).
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from './apply-routing.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle } from './apply-runner-ops.js';
+// groundnuty/macf#999 — the SAME pure pre-flight `commands/bootstrap-apply.ts`
+// refuses `apply` on; `plan` never refuses (it is read-only end to end — see
+// this module's own `checkVaultFlagsComplete` doc for the contrast), it
+// states the SAME fact as a loud banner instead (requirement 3: "plan states
+// it"). One check function, two renderings — never two independently
+// hand-authored copies of the underlying fact that could drift.
+import type { RegistryScopeConflict } from './registry-scope-preflight.js';
+import { checkRegistryScopePreflight } from './registry-scope-preflight.js';
 
 // --- Observed state (the reconcile input; populated by an observer, consumed as data) ---
 
@@ -272,6 +280,16 @@ export interface FleetPlan {
    * present (empty array when apply can action everything the plan lists).
    */
   readonly unimplementedByApply: readonly UnimplementedApplyItem[];
+  /**
+   * groundnuty/macf#999 — 0 or 1 entries: `owner.registry` is singular per
+   * fleet (DR-006), so there is at most one conflict to report. ALWAYS
+   * present (empty array — same "always present, empty when nothing
+   * applies" convention as {@link skippedSections} /
+   * {@link unimplementedByApply}) on the `FleetPlan` TYPE; the `--json`
+   * serialization deliberately deviates from that convention — see
+   * `fleetPlanToJson`'s doc for why.
+   */
+  readonly registryScopeIssues: readonly RegistryScopeConflict[];
 }
 
 /**
@@ -1335,11 +1353,20 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
     });
   }
 
+  // groundnuty/macf#999 requirement 3 — "plan states it": the SAME pure
+  // check `apply` refuses on (see `registry-scope-preflight.ts`'s doc),
+  // surfaced here as data rather than a refusal — `plan` is read-only end
+  // to end and never exits non-zero for a manifest fact alone (mirrors
+  // `skippedSections`/`unimplementedByApply`'s own "state it, don't abort
+  // the render" posture).
+  const registryScopeFailure = checkRegistryScopePreflight(manifest.owner);
+
   return {
     fleet: fleetName,
     items,
     skippedSections: computeSkippedSections(manifest),
     unimplementedByApply: computeUnimplementedByApply(items),
+    registryScopeIssues: registryScopeFailure !== undefined ? [registryScopeFailure] : [],
   };
 }
 
@@ -1382,6 +1409,16 @@ export function formatUnimplementedLines(items: readonly UnimplementedApplyItem[
   return items.map((i) => `${i.kind}: ${i.target} (${i.verb}) — NOT IMPLEMENTED BY APPLY (${i.reason})`);
 }
 
+/**
+ * groundnuty/macf#999 requirement 3 — one loud line per registry-scope
+ * conflict (0 or 1; see {@link FleetPlan.registryScopeIssues}'s doc). Says
+ * plainly that `apply` REFUSES for this manifest — a `plan` operator must
+ * not read this fleet's exit-0 render as "this will provision fine."
+ */
+export function formatRegistryScopeLines(issues: readonly RegistryScopeConflict[]): readonly string[] {
+  return issues.map((i) => `registry: UNSATISFIABLE — \`macf bootstrap apply\` will refuse before any consent gate (${i.message})`);
+}
+
 const PLAN_HEADERS = ['KIND', 'TARGET', 'VERB', 'CONFIRM', 'REASON'] as const;
 
 /** Build one display row per plan item (pure — exported for tests). */
@@ -1419,10 +1456,22 @@ export function formatPlanText(plan: FleetPlan): string {
       ...unimplementedLines,
     );
   }
+  const registryScopeLines = formatRegistryScopeLines(plan.registryScopeIssues);
+  if (registryScopeLines.length > 0) {
+    parts.push('', ...registryScopeLines);
+  }
   return parts.join('\n');
 }
 
-/** Structured `--json` shape. `skipped_sections` + `unimplemented_by_apply` are ALWAYS present (empty array when nothing applies). */
+/**
+ * Structured `--json` shape. `skipped_sections` + `unimplemented_by_apply`
+ * are ALWAYS present (empty array when nothing applies). `registry_scope_issues`
+ * (groundnuty/macf#999) deliberately does NOT follow that convention — it is
+ * omitted entirely when empty, rather than an always-present `[]`, because a
+ * `type: profile` fleet's `--json` output must stay byte-identical to its
+ * pre-#999 shape (an unconditional new key would not be). Included only when
+ * `plan.registryScopeIssues` is non-empty (`type: org`, today, always).
+ */
 export function fleetPlanToJson(plan: FleetPlan): unknown {
   return {
     schema_version: FLEET_PLAN_JSON_SCHEMA_VERSION,
@@ -1431,6 +1480,9 @@ export function fleetPlanToJson(plan: FleetPlan): unknown {
     summary: summarizePlan(plan.items),
     skipped_sections: plan.skippedSections.map((s) => ({ ...s })),
     unimplemented_by_apply: plan.unimplementedByApply.map((i) => ({ ...i })),
+    ...(plan.registryScopeIssues.length > 0
+      ? { registry_scope_issues: plan.registryScopeIssues.map((i) => ({ ...i })) }
+      : {}),
   };
 }
 

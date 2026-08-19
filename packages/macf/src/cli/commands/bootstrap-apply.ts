@@ -81,6 +81,7 @@ import type { LabelsOutcome } from './repo-init.js';
 import type { AppNameLengthCheck } from '../bootstrap/apply-runner-ops.js';
 import { RUNNER_OPS_ROLE, buildRunnerOpsManifest, checkAppNameLengths, deriveRunnerOpsHandle } from '../bootstrap/apply-runner-ops.js';
 import { defaultOperatorRecoveryRootDir, operatorRecoveryArtifactPath } from '../bootstrap/vault-write.js';
+import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflight.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -1257,6 +1258,21 @@ export async function runBootstrapApply(
   const nameLengthCheck: AppNameLengthCheck = checkAppNameLengths(manifest);
   if (!nameLengthCheck.ok) {
     return renderFailure({ code: 'app_name_too_long', message: nameLengthCheck.reason }, opts);
+  }
+
+  // groundnuty/macf#999 — the registry-scope pre-flight, same placement
+  // rationale as the name-length check immediately above (unconditional,
+  // including `--dry-run`): `registry: { type: org }` is unsatisfiable with
+  // this tool's current provisioning regardless of what `apply` would go on
+  // to do, so there is nothing later a `--dry-run` operator would learn by
+  // NOT seeing this refusal now. See `registry-scope-preflight.ts`'s doc for
+  // what this checks (a manifest-derived permission-set fact) and what it
+  // deliberately does NOT decide (which resolution #999 requirement 2
+  // adopts). Pure; zero I/O; asserts the SAME "gate seam never invoked"
+  // contract `checkAppNameLengths` does.
+  const registryScopeFailure = checkRegistryScopePreflight(manifest.owner);
+  if (registryScopeFailure !== undefined) {
+    return renderFailure(registryScopeFailure, opts);
   }
 
   if (opts.dryRun !== true) {
