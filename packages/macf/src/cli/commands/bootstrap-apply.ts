@@ -82,6 +82,8 @@ import type { AppNameLengthCheck } from '../bootstrap/apply-runner-ops.js';
 import { RUNNER_OPS_ROLE, buildRunnerOpsManifest, checkAppNameLengths, deriveRunnerOpsHandle } from '../bootstrap/apply-runner-ops.js';
 import { defaultOperatorRecoveryRootDir, operatorRecoveryArtifactPath } from '../bootstrap/vault-write.js';
 import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflight.js';
+import type { RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
+import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -143,6 +145,16 @@ export interface BootstrapApplyDeps {
    * `buildAgentDeps` — this seam never influences what apply actually does.
    */
   readonly confirmAppInstallation?: (appId: string, keyPath: string, expected?: ExpectedIdentity) => Promise<IdentityConfirmation>;
+  /**
+   * Injectable filesystem-existence check for the DR-043 §D2 "honest
+   * completion" remaining-deploy report (macf#1014,
+   * `remaining-deploy.ts::computeRemainingDeploy`'s seam). Defaults to a
+   * real `existsSync`. Tests inject a fake so the decisive "no workspaces" /
+   * "already deployed" / "unknown" scenarios don't depend on real host
+   * filesystem state — mirrors `findAvailableRecoveryArtifacts`'s own
+   * injectable-`exists` parameter in this same file.
+   */
+  readonly checkDeployPathExists?: (path: string) => boolean;
 }
 
 /** Extends `apply-fleet.ts`'s `FleetApplyDeps` with the three apply-CLI-level seams: the plan-approval prompt, the prior-lock read, and vault-scratch cleanup. */
@@ -958,8 +970,20 @@ function routingClientSummaryLines(result: FleetApplyResult): string[] {
  * pre-approval render entirely) — see the module doc + plan.ts's "Apply
  * coverage" section. Defaults to `[]` so existing callers/tests that don't
  * thread it through keep compiling and rendering byte-identically.
+ *
+ * `remainingDeploy` (macf#1014) is `remaining-deploy.ts::computeRemainingDeploy`'s
+ * output — which declared agents have no local workspace yet, appended as
+ * the LAST section (after the "what apply didn't implement" gap, above)
+ * since it's the final "what remains, period" note. Defaults to `{ steps: [] }`
+ * (silent — `formatRemainingDeployLines` renders no lines at all for an
+ * empty `steps`) so every existing 2-arg call site keeps compiling and
+ * rendering byte-identically.
  */
-export function formatApplyResult(result: FleetApplyResult, unimplemented: readonly UnimplementedApplyItem[] = []): string {
+export function formatApplyResult(
+  result: FleetApplyResult,
+  unimplemented: readonly UnimplementedApplyItem[] = [],
+  remainingDeploy: RemainingDeployReport = { steps: [] },
+): string {
   const parts: string[] = [
     `Control repo: ${formatControlRepoLine(result)}`,
     '',
@@ -1000,6 +1024,10 @@ export function formatApplyResult(result: FleetApplyResult, unimplemented: reado
       ...formatUnimplementedLines(unimplemented),
     );
   }
+  const remainingDeployLines = formatRemainingDeployLines(remainingDeploy);
+  if (remainingDeployLines.length > 0) {
+    parts.push('', ...remainingDeployLines);
+  }
   return parts.join('\n');
 }
 
@@ -1028,14 +1056,38 @@ function redactIdentity(identity: AgentApplyOutcome): unknown {
   }
 }
 
+/** `RemainingDeployStep` → the `--json` snake_case shape. Never a credential value — only role/path/presence/reason/command (all path-shaped or plain strings; see that type's own doc). */
+function remainingDeployStepToJson(step: RemainingDeployStep): unknown {
+  return {
+    role: step.role,
+    deploy_path: step.deployPath,
+    presence: step.presence,
+    ...(step.reason !== undefined ? { reason: step.reason } : {}),
+    command: step.command,
+  };
+}
+
 /**
  * Structured `--json` render. Never a credential value — only status/id/path/
  * reason fields (see {@link redactIdentity}). `unimplemented` is the plan's
  * `unimplementedByApply` (macf#854); defaults to `[]` so existing
  * callers/tests keep compiling — see {@link formatApplyResult}'s doc for why
  * the caller threads it through.
+ *
+ * `remainingDeploy` (macf#1014) defaults to `{ steps: [] }`. `remaining_deploy`
+ * (and its sibling `remaining_deploy_note`, when present) is OMITTED
+ * ENTIRELY (never an empty-array key) when `remainingDeploy.steps` is
+ * empty — deliberately deviating from `unimplemented_by_apply`'s
+ * always-present convention, mirroring `plan.ts::fleetPlanToJson`'s
+ * `registry_scope_issues` precedent (macf#999/macf#1010): a fully-deployed
+ * fleet's `--json` output must stay byte-identical to its pre-#1014 shape,
+ * which an unconditional new key would not be.
  */
-export function fleetApplyResultToJson(result: FleetApplyResult, unimplemented: readonly UnimplementedApplyItem[] = []): unknown {
+export function fleetApplyResultToJson(
+  result: FleetApplyResult,
+  unimplemented: readonly UnimplementedApplyItem[] = [],
+  remainingDeploy: RemainingDeployReport = { steps: [] },
+): unknown {
   return {
     schema_version: FLEET_APPLY_JSON_SCHEMA_VERSION,
     control_repo: result.controlRepo,
@@ -1050,6 +1102,12 @@ export function fleetApplyResultToJson(result: FleetApplyResult, unimplemented: 
     lock_path: result.lockPath,
     identity_changes: result.identityChanges.map((c) => ({ ...c })),
     unimplemented_by_apply: unimplemented.map((i) => ({ ...i })),
+    ...(remainingDeploy.steps.length > 0
+      ? {
+          remaining_deploy: remainingDeploy.steps.map(remainingDeployStepToJson),
+          ...(remainingDeploy.vaultLocationNote !== undefined ? { remaining_deploy_note: remainingDeploy.vaultLocationNote } : {}),
+        }
+      : {}),
     // `result.ca.resolve` is ALREADY the redacted `CaApplyOutcome`
     // (fingerprint only — see `apply-ca.ts::redactCaResolve`); `registryLeg`/
     // `repoLegs`/`routing` are `EnsureVariableOutcome`s, which carry no
@@ -1378,11 +1436,32 @@ export async function runBootstrapApply(
       const priorLock = mutate.readPriorLock(manifestPath);
       const result = await applyFleet(manifest, manifestPath, priorLock, mutate);
 
+      // macf#1014 — computed AFTER applyFleet (so a fresh `created` agent's
+      // just-materialized workspace, if any, is reflected too) but
+      // completely independent of `result`: a plain filesystem check against
+      // each declared agent's `deploy_path`, echoing the SAME --vault/
+      // --identity-key flags THIS run was invoked with (never re-derived
+      // from `result.vault.path` — that's an ephemeral scratch checkout, not
+      // a stable path to hand an operator; see `remaining-deploy.ts`'s
+      // module doc). Never changes `applyExitCode` below (requirement 3).
+      //
+      // SUPPRESSED when the control repo itself aborted this run (SAME
+      // three statuses `applyExitCode`'s `controlRepoBad` checks below) —
+      // "deploy the agents" is not the operator's next step when the run
+      // never got past step 0; the actionable next step there is fixing the
+      // control-repo conflict, not a deploy command that would be
+      // misleading noise alongside it.
+      const controlRepoAborted =
+        result.controlRepo.status === 'foreign' || result.controlRepo.status === 'failed' || result.controlRepo.status === 'archived';
+      const remainingDeploy: RemainingDeployReport = controlRepoAborted
+        ? { steps: [] }
+        : computeRemainingDeploy(manifest, manifestPath, opts, resolved.checkDeployPathExists);
+
       if (opts.json) {
-        console.log(JSON.stringify(fleetApplyResultToJson(result, plan.unimplementedByApply), null, 2));
+        console.log(JSON.stringify(fleetApplyResultToJson(result, plan.unimplementedByApply, remainingDeploy), null, 2));
       } else {
         console.log('');
-        console.log(formatApplyResult(result, plan.unimplementedByApply));
+        console.log(formatApplyResult(result, plan.unimplementedByApply, remainingDeploy));
       }
       return applyExitCode(result);
     } finally {
