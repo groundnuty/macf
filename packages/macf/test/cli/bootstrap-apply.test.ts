@@ -476,7 +476,7 @@ function fakeMutateDeps(manifestPath: string, overrides: Partial<MutateApplyDeps
       cloneRepo: async () => {},
       commitAndPush: async () => 'pushed',
     },
-    agentRepoDeps: { checkExists: async () => 'absent', createRepo: async () => {} },
+    agentRepoDeps: { checkMeta: async () => ({ presence: 'absent' }), createRepo: async () => {}, unarchiveRepo: async () => {} },
     trustDeps: fakeTrustDeps(),
     routingClientDeps: fakeRoutingClientDeps(),
     controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
@@ -801,6 +801,75 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(code).toBe(0);
   });
 
+  // --- DR-043 Amendment G correction (groundnuty/macf#1034) — every
+  // declared repo revives, under ONE approval covering the whole set ---
+
+  it('macf#1034: control repo + BOTH agent repos archived -> the plan shows THREE update items, but confirmPlan fires EXACTLY ONCE (one approval covers the set)', async () => {
+    const file = writeManifest();
+    const archivedObserved: ObservedState = {
+      lock: null,
+      agents: {
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, archived: true },
+        'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, archived: true },
+      },
+      caRegistry: 'present',
+      caRepos: {},
+      controlRepoPresence: 'present',
+      controlRepoArchived: true,
+    };
+    let confirmPlanCallCount = 0;
+    const unarchivedRepos: string[] = [];
+    const code = await runBootstrapApply(
+      { file },
+      { observe: () => Promise.resolve(archivedObserved) },
+      fakeMutateDeps(file, {
+        confirmPlan: async (plan) => {
+          confirmPlanCallCount += 1;
+          // Sanity: the plan the operator is approving DOES list all three
+          // archived-repo update items — this is what makes "one approval"
+          // an honest claim rather than reviving repos the operator never
+          // saw counted (Amendment G's "Inventory shown + confirmed before
+          // any mutation" rail).
+          const archivedItems = plan.items.filter((i) => i.kind === 'control_repo' || i.kind === 'agent_repo_archived');
+          expect(archivedItems).toHaveLength(3);
+          expect(archivedItems.every((i) => i.verb === 'update' && i.confirm_required)).toBe(true);
+          return true;
+        },
+        controlRepoOptions: { confirmUnarchive: true, makeScratchDir: () => join(file, '..') },
+        agentRepoOptions: { confirmUnarchive: true },
+        controlRepoDeps: {
+          checkMeta: async () => ({ presence: 'present', archived: true }),
+          readManifestFile: async () => FLEET_YAML,
+          createRepo: async () => {
+            throw new Error('must not be called — ours-archived never creates');
+          },
+          unarchiveRepo: async (repo) => {
+            unarchivedRepos.push(repo);
+          },
+          cloneRepo: async () => {},
+          commitAndPush: async () => 'nothing-to-commit',
+        },
+        agentRepoDeps: {
+          checkMeta: async () => ({ presence: 'present', archived: true }),
+          createRepo: async () => {
+            throw new Error('must not be called — every agent repo is present, not absent');
+          },
+          unarchiveRepo: async (repo) => {
+            unarchivedRepos.push(repo);
+          },
+        },
+      }),
+    );
+
+    expect(code).toBe(0);
+    // Exactly ONE approval, regardless of the THREE archived repos it covers
+    // — the decisive proof for "one approval covers the set, no per-repo
+    // prompting" (macf#1034 requirement 2).
+    expect(confirmPlanCallCount).toBe(1);
+    expect([...unarchivedRepos].sort()).toEqual(['groundnuty/demo-code', 'groundnuty/demo-fleet-control', 'groundnuty/demo-science'].sort());
+    expect(logs.join('\n')).toMatch(/REVIVED/);
+  });
+
   it('a per-agent gate failure still exits the run non-zero (via applyExitCode), even though applyFleet itself completed', async () => {
     const file = writeManifest();
     const code = await runBootstrapApply(
@@ -865,7 +934,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         // single-check fast path — see apply-fleet.test.ts's macf#972 suite
         // for that case; this test is specifically about the >30s NARRATION
         // path, which only the real poll exercises).
-        agentRepoDeps: { checkExists: async () => 'present', createRepo: async () => {} },
+        agentRepoDeps: { checkMeta: async () => ({ presence: 'present', archived: false }), createRepo: async () => {}, unarchiveRepo: async () => {} },
         trustDeps: fakeTrustDeps({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
         // `resolveMutateDeps`'s REAL wiring binds `log` to
         // `process.stderr.write` (bootstrap-apply.ts's `log: (line) => {

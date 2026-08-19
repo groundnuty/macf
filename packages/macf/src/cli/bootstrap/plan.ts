@@ -150,6 +150,17 @@ export interface ObservedAgentState {
    * sets it.
    */
   readonly vault?: VaultAgentObservation;
+  /**
+   * DR-043 Amendment G correction (groundnuty/macf#1034) — this agent repo's
+   * `archived` bit, the per-agent sibling of `ObservedState.controlRepoArchived`'s
+   * convention: only meaningful when `repo === 'present'`; `undefined` when
+   * `repo` isn't `'present'` (nothing to explain) or the archived bit itself
+   * couldn't be read. A STANDALONE read (`observer.ts::checkRepoArchivedState`,
+   * the SAME function `plan.ts`'s control-repo observation already uses) —
+   * deliberately NOT threaded through `resolveAgentRepoState` (macf#1026),
+   * which serves the unrelated CA/routing-client presence trio.
+   */
+  readonly archived?: boolean;
 }
 
 /**
@@ -261,6 +272,8 @@ export type PlanItemKind =
   | 'runner_warm'
   | 'agent'
   | 'control_repo'
+  /** DR-043 Amendment G correction (groundnuty/macf#1034) — an agent repo observed ARCHIVED; the per-agent sibling of `'control_repo'`. See {@link agentRepoArchivedItem}'s doc. */
+  | 'agent_repo_archived'
   | 'version'
   | 'actions_pin'
   | 'labels'
@@ -532,6 +545,17 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // "NOT IMPLEMENTED BY APPLY" warning about the very capability this
       // increment built.
       return 'implemented';
+    case 'agent_repo_archived':
+      // DR-043 Amendment G correction (macf#1034) — the per-agent sibling of
+      // 'control_repo' above: the ONLY verb `agentRepoArchivedItem` ever
+      // emits is `update` (fired only when `obs.archived === true`), and
+      // `apply-fleet.ts`'s `ensureAgentRepo` call DOES action it — un-archives
+      // on the SAME plan-approve-once confirmation `'control_repo'` already
+      // relies on (`bootstrap-apply.ts`'s `resolveMutateDeps` sets
+      // `agentRepoOptions: { confirmUnarchive: true }` unconditionally once
+      // the operator has approved). Same "this IS wired, not a gap" reasoning
+      // as 'control_repo'.
+      return 'implemented';
     case 'version':
     case 'actions_pin':
       // DR-043 §D6 — apply NEVER acts on either kind, regardless of verb:
@@ -573,6 +597,7 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'repo':
     case 'ca':
     case 'control_repo':
+    case 'agent_repo_archived':
     case 'labels':
     case 'routing_client':
     case 'runner_ops':
@@ -580,7 +605,8 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
-      // 2, 'control_repo' in macf#867 / DR-043 Amendment G, 'labels'/
+      // 2, 'control_repo' in macf#867 / DR-043 Amendment G, 'agent_repo_archived'
+      // in macf#1034 (DR-043 Amendment G correction), 'labels'/
       // 'routing_client' in groundnuty/macf#920, 'runner_ops' in
       // groundnuty/macf#943, 'vault_recipients' in groundnuty/macf#957).
       // Kept exhaustive so a NEW `PlanItemKind` added
@@ -1081,6 +1107,35 @@ function controlRepoItem(presence: Presence, archived: boolean | undefined): Pla
 }
 
 /**
+ * DR-043 Amendment G correction (groundnuty/macf#1034) — the per-agent
+ * sibling of {@link controlRepoItem}, same shape: fires ONLY when THIS
+ * agent's repo is observed present AND archived, so the operator's ONE
+ * plan-approve-once "yes" (`realConfirmPlan`'s "N update(s) requiring
+ * confirmation" count, `bootstrap-apply.ts`) actually SHOWS every repo
+ * `apply` is about to revive — not just the control repo. Amendment G's
+ * revival clause named only the control repo; the fix corrects the clause
+ * AND gives the plan-preview the same "Inventory shown + confirmed before
+ * any mutation" rail the control repo already had (Amendment G's "Shared
+ * rails" section) rather than reviving agent repos the operator never saw
+ * counted.
+ */
+export const AGENT_REPO_ARCHIVED_REASON = (repo: string): string =>
+  `repo "${repo}" is ARCHIVED (DR-043 Amendment G) — a DELIBERATE, reversible fleet state set by a prior ` +
+  '`macf fleet archive`, NOT drift. Approving this plan authorizes `apply` to un-archive it (one API PATCH, ' +
+  'zero browser consent clicks) and resume normal reconcile.';
+
+function agentRepoArchivedItem(agent: FleetAgent, obs: ObservedAgentState | undefined): PlanItem | undefined {
+  if (obs?.repo !== 'present' || obs.archived !== true) return undefined;
+  return {
+    kind: 'agent_repo_archived',
+    target: `agent:${agent.role}:repo:${agent.repo}:archived`,
+    verb: 'update',
+    reason: AGENT_REPO_ARCHIVED_REASON(agent.repo),
+    confirm_required: true,
+  };
+}
+
+/**
  * DR-043 §D5 recipient-set reconciliation (groundnuty/macf#957) — one
  * fleet-level item comparing the vault's OBSERVED age-header recipient
  * STANZA COUNT against `transport.age_recipients.length`. Only called (see
@@ -1279,7 +1334,9 @@ function actionsVersionItem(agent: FleetAgent, desired: string, obs: ObservedAge
  * The pure §D3 three-verb reconcile. Deterministic ordering: the
  * control-repo-archived item FIRST when applicable (DR-043 Amendment G —
  * mirrors `apply-fleet.ts`'s own "control repo is step 0, before any
- * per-agent processing" ordering), then per-agent items (app, repo, install,
+ * per-agent processing" ordering), then per-agent items (app, repo, an
+ * agent-repo-archived item right after `repo` when applicable — macf#1034,
+ * the per-agent sibling of the control-repo-archived item above — install,
  * secret_fingerprint) in manifest `agents[]` order, then the CA items
  * (registry, then one per agent repo in manifest order — a MACF fleet
  * always needs a CA, so these are UNCONDITIONAL as of macf#839 review nit 5,
@@ -1310,6 +1367,11 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
     const obs = observed.agents[agent.role];
     items.push(appItem(fleetName, agent, obs));
     items.push(repoItem(agent, obs));
+    // DR-043 Amendment G correction (macf#1034) — right after `repoItem`
+    // (both describe `agent.repo`); fires only when archived, same "silent
+    // unless there's something to say" convention `controlRepoItem` uses.
+    const agentRepoArchived = agentRepoArchivedItem(agent, obs);
+    if (agentRepoArchived !== undefined) items.push(agentRepoArchived);
     items.push(installItem(fleetName, agent, obs));
     items.push(secretFingerprintItem(agent, obs));
     items.push(labelsItem(agent));

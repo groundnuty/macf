@@ -354,6 +354,8 @@ The phasing maps onto Amendment A's two observability tiers: phase 2 operates in
 | **`archive`** | + archives the control + agent repos | un-archive (API) + `apply --vault --identity-key` — **0 clicks** |
 
 > **Corrected by Amendment K3** — the revival column measures **browser consent clicks (operator interaction) only**, NOT prerequisites: both 0-click rungs require `apply --vault --identity-key`, because a bare `apply` refuses to restore a deleted registry leg (`#981`).
+>
+> **Further corrected by Amendment K4** — "un-archive (API)" on the `archive` row un-archives **every repo `archive` targeted** (control + every agent repo), not the control repo alone; see K4.
 | **`delete-apps`** | + deletes the agent GitHub App identities (frees the globally-unique names) | recreate Apps (**2 clicks/agent**, App creation browser-only) + `apply` |
 | **`destroy`** | + deletes the repositories | full re-provision; **history gone forever** |
 
@@ -384,6 +386,8 @@ Amendment F's shipped `classifyControlRepoOwnership` refuses an archived control
 - everything else unchanged.
 
 Reads work on archived repos (read-only ≠ unreadable), so the content check is available. **`apply` must NOT silently un-archive** an `ours-archived` repo: un-archiving reverses a state the operator deliberately set, so it is surfaced as its own **confirm-required plan item** (plan-approve-once governs it). This stays in the "free revival" tier — an approval keystroke + an API PATCH is zero *consent-gate* clicks (no browser round-trip).
+
+> **Corrected by Amendment K4** — this paragraph names "an `ours-archived` repo," singular, because this section is scoped to `classifyControlRepoOwnership` (the control repo's ownership classifier). Read alongside the ladder table above (`archive` removes "the control + agent repos," plural), the revival half was under-specified: it named only the control repo. The fix does not add a second per-repo ownership classifier — see K4 for why one gate, established once at the control repo, licenses the whole declared repo set.
 
 ### Shared rails (all four verbs)
 
@@ -629,3 +633,17 @@ Two corrections to the ladder table:
 **And the enumeration G originally lacked:** `deactivate` removes the `<SEG>_CA_CERT` registry leg, the `<SEG>_AGENT_<AGENT-SEG>` registrations, and `<SEG>_FEDERATED_CAS`. Revival must restore **each**; `#981` restores the CA leg from the vault, which is why the flags are mandatory. A recovery promise is only as good as its inventory of what was destroyed.
 
 **References:** `#981` (CA-leg restore) · `#990` (vault compose) · `#991`/`#997` (recovery-artifact durability) · `#998` (the citation convention this amendment is the first consumer of).
+
+### K4 (2026-08-19, `#1034`) — corrects Amendment G: revival covers every declared repo, not the control repo alone
+
+**Trigger:** `#1034` — a second live walk of the ladder (`archive` then `apply`, twenty minutes after `#1033`, on the same `macf-experiment` fleet). Same shape as K0's table above: an **incomplete enumeration**. `archive`'s own description is explicit — it "archives the control + agent repos" (the ladder table above) — but the revival half was specified for the control repo alone: §"Amendment G AMENDS Amendment F's ownership rule" above discriminates `classifyControlRepoOwnership` — a control-repo-only function — and its closing sentence names "an `ours-archived` repo," singular. `archive` is cumulative over N repos; revival was specified for exactly one. The shipped code was faithful to that (incomplete) text — `provisionControlRepo`'s `confirmUnarchive` gate only ever un-archived `<fleet>-control`, and nothing else in the apply path even READ an agent repo's archived bit.
+
+**Observed:** `after archive: control=archived, both agent repos=archived` → `after apply: control=false (revived), both agent repos=STILL archived`. `apply` reported success; the fleet stayed inert — both agent repos remain read-only, so every agent push fails, invisibly, until the operator (or the agent) tries to write.
+
+**Ownership does not re-derive per repo.** Amendment G's `ours-archived`/`foreign` split exists to answer one question — does this run own the fleet it is about to mutate — and that question is already answered ONCE, at the control repo, before any agent repo is ever touched: a `foreign` or unconfirmable control repo aborts the entire run before the per-agent loop starts (`applyFleet`'s own "control repo is step 0" ordering, unchanged by this correction). `teardown.ts::computeArchiveRepoTargets` already established the pattern for the teardown direction — one ownership gate (`resolveControlRepoOwnership`), then EXACT-KEY targeting over `[control repo, ...agents[].repo]`, no second per-repo classifier (Amendment G's own "Never scan-and-delete by name pattern — EXACT-KEY targeting only" rail). Revival is symmetric: the SAME one gate, the SAME declared target set, reused — not a second, agent-repo-specific `ours-archived`/`foreign` classifier invented to re-derive a fact the control repo already established. A second classifier for the same fact is exactly the class `#1000`'s golden-path rule (§"Read the permission map through `doctor`'s existing path, never a second reader" — DR-044 Decision 3) names: two readers of one fact can drift; this correction keeps there being exactly one.
+
+**The corrected clause:** an `apply` run un-archives **every repo `archive` would have targeted for this fleet** — the control repo AND every `manifest.agents[].repo` found archived — under the SAME single plan-approve-once confirmation that already licenses the control repo's revival (never a second per-repo prompt: the ladder's "0-click revival" promise, K3, extends to the whole set, not a set of individually-gated clicks). Reported per repo (revived vs. already-active, mirroring `control-repo.ts`'s `'revived'`/`'reused'` split). An inconclusive existence/archived-state read on an agent repo reports `unknown` — never silently treated as "not archived," and never silently folded into "present" the way `classifyControlRepoOwnership`'s own `archived === true ? … : 'ours'` fallthrough would (found, not fixed, in the same review — see that function's `ControlRepoMeta.archived` doc, which claims a degrade this correction's own code deliberately does NOT mirror).
+
+**K4 references:** `#1034` (this correction) · `#1033` (the sibling ladder defect — `deactivate` orphans running agents — found in the same live walk) · `#867` (Amendment G, the ladder this corrects) · `#1000` (the golden-path rule this correction applies) · `#917`/`#918` (the cumulative-rungs idempotency correction above, the closest prior precedent for "a live walk of the ladder finds what per-rung unit tests cannot").
+
+**Asserted by:** `packages/macf/test/cli/bootstrap/apply-fleet.test.ts` → `"THE DECISIVE TEST — archive then apply leaves EVERY declared repo (control + every agent) revived, matching computeArchiveRepoTargets exactly"`

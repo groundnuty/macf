@@ -32,6 +32,7 @@ import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-ro
 import { operatorRecoveryArtifactPath, writeAgentRecoveryArtifact, writeVault } from '../../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext } from '../../../src/cli/bootstrap/vault-read.js';
 import { applyExitCode, fleetApplyResultToJson, formatApplyResult } from '../../../src/cli/commands/bootstrap-apply.js';
+import { computeArchiveRepoTargets } from '../../../src/cli/bootstrap/teardown.js';
 import { resolveAgeGate } from './age-binary-gate.js';
 
 // Default mirrors the §D5 multi-recipient shape (operator key + VM key,
@@ -102,7 +103,7 @@ function pushSucceedsOnceThenFails(): ControlRepoDeps['commitAndPush'] {
 
 /** Every agent's repo reports `'absent'` -> `ensureAgentRepo` "creates" it (no-op `createRepo`). */
 function agentRepoDepsFor(): AgentRepoDeps {
-  return { checkExists: async () => 'absent', createRepo: async () => {} };
+  return { checkMeta: async () => ({ presence: 'absent' }), createRepo: async () => {}, unarchiveRepo: async () => {} };
 }
 
 /**
@@ -1336,13 +1337,14 @@ trust:
       },
     };
     const agentRepoDeps: AgentRepoDeps = {
-      checkExists: async (repo) => {
+      checkMeta: async (repo) => {
         calls.push(`repo:checkExists:${repo}`);
-        return 'absent';
+        return { presence: 'absent' };
       },
       createRepo: async (repo) => {
         calls.push(`repo:create:${repo}`);
       },
+      unarchiveRepo: async () => {},
     };
     const trustDeps: CaApplyDeps & RunnerRegistrationDeps = {
       ...trustDepsFor(),
@@ -1466,7 +1468,7 @@ trust:
   it('control repo FOREIGN -> aborts the ENTIRE run: no agent repo, App, or install is ever touched', async () => {
     const manifestPath = manifestPathIn();
     const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
-    const agentRepoDeps: AgentRepoDeps = { checkExists: vi.fn(), createRepo: vi.fn() };
+    const agentRepoDeps: AgentRepoDeps = { checkMeta: vi.fn(), createRepo: vi.fn(), unarchiveRepo: vi.fn() };
     const deps: FleetApplyDeps = {
       buildAgentDeps: () => {
         throw new Error('must not be called — control repo aborted before any agent processing');
@@ -1532,7 +1534,12 @@ trust:
     expect(result.agents).toEqual([]);
     expect(result.vault).toEqual({ status: 'skipped' });
     expect(result.identityChanges).toEqual([]);
-    expect(agentRepoDeps.checkExists).not.toHaveBeenCalled();
+    expect(agentRepoDeps.checkMeta).not.toHaveBeenCalled();
+    // groundnuty/macf#1034 — a foreign control repo must abort BEFORE any
+    // agent repo is even checked, let alone un-archived: the whole point of
+    // "ownership established once, fleet-level" is that a foreign fleet
+    // never reaches the per-agent loop at all.
+    expect(agentRepoDeps.unarchiveRepo).not.toHaveBeenCalled();
     // DR-043 Amendment D phase 2 (macf#838) — the CA ceremony never ran
     // either (every `trustDeps` fn above throws if invoked).
     expect(result.ca.resolve.status).toBe('failed');
@@ -2172,8 +2179,9 @@ trust:
       const manifestPath = manifestPathIn();
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const agentRepoDeps: AgentRepoDeps = {
-        checkExists: async (repo) => (repo === 'groundnuty/demo-code' ? 'unknown' : 'absent'), // code-agent's repo-ensure fails
+        checkMeta: async (repo) => (repo === 'groundnuty/demo-code' ? { presence: 'unknown' } : { presence: 'absent' }), // code-agent's repo-ensure fails
         createRepo: async () => {},
+        unarchiveRepo: async () => {},
       };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
@@ -2253,7 +2261,7 @@ trust:
         // doc), so a genuine "appears mid-window" recovery is only exercised
         // for a repo that PRE-EXISTED the run — a runner may legitimately be
         // registering to it already. Mark the repo present-before-this-run.
-        agentRepoDeps: { checkExists: async () => 'present', createRepo: async () => {} },
+        agentRepoDeps: { checkMeta: async () => ({ presence: 'present', archived: false }), createRepo: async () => {}, unarchiveRepo: async () => {} },
         trustDeps: trustDepsFor({
           checkRunnerUsableByRepo: async () => {
             checkCalls += 1;
@@ -2330,7 +2338,7 @@ trust:
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         // Pre-existing repo -> the real poll loop runs (see the mid-window
         // test above for why a just-created repo never reaches it).
-        agentRepoDeps: { checkExists: async () => 'present', createRepo: async () => {} },
+        agentRepoDeps: { checkMeta: async () => ({ presence: 'present', archived: false }), createRepo: async () => {}, unarchiveRepo: async () => {} },
         trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
         log: (line) => lines.push(line),
         runnerTokenPollOptions: {
@@ -2988,10 +2996,13 @@ trust:
           },
         },
         agentRepoDeps: {
-          checkExists: async () => {
+          checkMeta: async () => {
             throw new Error('must not be called');
           },
           createRepo: async () => {
+            throw new Error('must not be called');
+          },
+          unarchiveRepo: async () => {
             throw new Error('must not be called');
           },
         },
@@ -3804,5 +3815,227 @@ trust:
     // validateRunnerOpsInstall`, unchanged), so its reuse path is not newly
     // re-validated. No additional test is needed here; a redundant one would
     // just re-assert what that test already covers.
+  });
+
+  // --- DR-043 Amendment G correction (groundnuty/macf#1034) — revival
+  // covers every declared repo, not the control repo alone ---
+  describe('agent-repo revival (macf#1034 — corrects Amendment G\'s control-repo-only revival)', () => {
+    // Same shape as `control-repo.test.ts`'s `SAME_FLEET_YAML` — only
+    // `metadata.name` is compared by `classifyControlRepoOwnership`
+    // (`control-repo.ts`'s doc), so a MINIMAL single-agent manifest body
+    // satisfies the name-match check regardless of this file's own
+    // `manifestWith([CODE_AGENT, SCI_AGENT])` having two.
+    const SAME_FLEET_YAML = `apiVersion: macf/v0
+kind: Fleet
+metadata:
+  name: demo-fleet
+owner:
+  account: groundnuty
+  type: user
+  registry: { type: profile, user: groundnuty }
+network:
+  advertise_host: example.ts.net
+transport:
+  age_recipients: []
+defaults:
+  role_template: groundnuty/agentic-repo-template
+  app_manifest: dr-019
+agents:
+  - role: code-agent
+    profile: code
+    repo: groundnuty/demo-code
+    deploy_path: /x
+trust:
+  ca: per-project
+  federated_cas: []
+`;
+
+    /**
+     * BOTH agents already confirmed live via `priorLock` — the `reused`
+     * path (`agentDepsFor`-equivalent, keyed by `appId` like the existing
+     * "reuse: fleet.lock already records..." test above) — so this test is
+     * about repo REVIVAL, not identity provisioning.
+     */
+    function reusedTwoAgentDeps(): AgentApplyDeps {
+      return {
+        startManifestFlow: async () => {
+          throw new Error('must not be called — both roles have prior entries');
+        },
+        startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+        exchangeManifestCode: async () => {
+          throw new Error('must not be called');
+        },
+        resolveKeyPath: () => '/fake.pem',
+        confirmAppInstallation: async (appId) => ({
+          status: 'confirmed',
+          install: { appId, installId: appId === 'app-code-agent' ? 'install-1' : 'install-2', appSlug: `demo-fleet-${appId}`, accountLogin: 'groundnuty' },
+        }),
+        waitForAppInstallation: async () => {
+          throw new Error('must not be called');
+        },
+        openUrl: async () => {},
+        log: () => {},
+        writeRecoveryArtifact: async () => {},
+      };
+    }
+
+    const PRIOR_LOCK: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [
+        { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+        { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+      ],
+    };
+
+    it('THE DECISIVE TEST — archive then apply leaves EVERY declared repo (control + every agent) revived, matching computeArchiveRepoTargets exactly', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const revivedRepos: string[] = [];
+
+      const controlRepoDeps: ControlRepoDeps = {
+        ...controlRepoDepsFor(),
+        checkMeta: async () => ({ presence: 'present', archived: true }),
+        readManifestFile: async () => SAME_FLEET_YAML,
+        unarchiveRepo: async (repo) => {
+          revivedRepos.push(repo);
+        },
+      };
+      const agentRepoDeps: AgentRepoDeps = {
+        // EVERY declared agent repo reports archived — the exact `archive`
+        // then `apply` scenario from the issue.
+        checkMeta: async () => ({ presence: 'present', archived: true }),
+        createRepo: async () => {
+          throw new Error('must not be called — every agent repo is present, not absent');
+        },
+        unarchiveRepo: async (repo) => {
+          revivedRepos.push(repo);
+        },
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedTwoAgentDeps(), manifestPath),
+        controlRepoDeps,
+        agentRepoDeps,
+        // Mirrors `bootstrap-apply.ts`'s `resolveMutateDeps` production
+        // wiring EXACTLY — the SAME single plan-approve-once "yes" licenses
+        // both (see `FleetApplyDeps.agentRepoOptions`'s doc).
+        controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..'), confirmUnarchive: true },
+        agentRepoOptions: { confirmUnarchive: true },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, PRIOR_LOCK, deps);
+
+      expect(result.controlRepo.status).toBe('revived');
+      expect(result.agents.map((a) => a.identity.status)).toEqual(['reused', 'reused']);
+
+      // The decisive assertion (macf#1034 requirement 1): the SET of repos
+      // this run revived is EXACTLY the SET `archive` would have targeted —
+      // `computeArchiveRepoTargets` (`teardown.ts`), the same target-set
+      // function the teardown direction already uses. Order-independent
+      // (both sides sorted) — what matters is set equality, not sequence.
+      expect([...revivedRepos].sort()).toEqual([...computeArchiveRepoTargets(manifest)].sort());
+      expect(revivedRepos).toContain('groundnuty/demo-fleet-control');
+      expect(revivedRepos).toContain('groundnuty/demo-code');
+      expect(revivedRepos).toContain('groundnuty/demo-science');
+
+      // "one approval covers the set" (macf#1034 requirement 2): every
+      // repo's revival fires from the SAME single `confirmUnarchive: true`
+      // — there is no per-repo confirm callback in `FleetApplyDeps` at all,
+      // so a second/duplicate revival attempt per repo would be the only
+      // way this count could exceed 1-per-repo. Exactly 3 calls for 3
+      // archived repos, never more.
+      expect(revivedRepos).toHaveLength(3);
+    });
+
+    it('control repo FOREIGN -> no agent repo is ever checked for archived state, let alone revived (a repo archived by someone else stays untouched)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const agentCheckMeta = vi.fn();
+      const agentUnarchive = vi.fn();
+      const controlRepoDeps: ControlRepoDeps = {
+        ...controlRepoDepsFor(),
+        checkMeta: async () => ({ presence: 'present', archived: true }),
+        // A DIFFERENT fleet's fleet.yaml — name-mismatch -> 'foreign'
+        // (`classifyControlRepoOwnership`'s doc). The whole run aborts
+        // before the per-agent loop; no agent repo is even READ, let alone
+        // un-archived.
+        readManifestFile: async () => SAME_FLEET_YAML.replace('name: demo-fleet', 'name: someone-elses-fleet'),
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedTwoAgentDeps(), manifestPath),
+        controlRepoDeps,
+        agentRepoDeps: { checkMeta: agentCheckMeta, createRepo: vi.fn(), unarchiveRepo: agentUnarchive },
+        agentRepoOptions: { confirmUnarchive: true },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, PRIOR_LOCK, deps);
+
+      expect(result.controlRepo.status).toBe('foreign');
+      expect(result.agents).toEqual([]);
+      expect(agentCheckMeta).not.toHaveBeenCalled();
+      expect(agentUnarchive).not.toHaveBeenCalled();
+    });
+
+    it('already-active repos report as such with NO archived-state mutation attempted — unarchiveRepo never called for a non-archived repo', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const unarchiveRepo = vi.fn();
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedTwoAgentDeps(), manifestPath),
+        // Control repo is a normal, ALREADY-created `'ours'` repo (never
+        // archived this run) — `controlRepoDepsFor()`'s default `'absent'`
+        // would instead exercise the CREATE path, which is a different
+        // scenario; force `'ours'` explicitly here.
+        controlRepoDeps: {
+          ...controlRepoDepsFor(),
+          checkMeta: async () => ({ presence: 'present', archived: false }),
+          readManifestFile: async () => SAME_FLEET_YAML,
+        },
+        agentRepoDeps: {
+          checkMeta: async () => ({ presence: 'present', archived: false }),
+          createRepo: async () => {
+            throw new Error('must not be called — every repo is already present');
+          },
+          unarchiveRepo,
+        },
+        agentRepoOptions: { confirmUnarchive: true },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, PRIOR_LOCK, deps);
+
+      expect(result.controlRepo.status).toBe('reused');
+      expect(result.agents.map((a) => a.identity.status)).toEqual(['reused', 'reused']);
+      expect(unarchiveRepo).not.toHaveBeenCalled();
+    });
+
+    it('unreachable archived-state read on an agent repo -> "unknown", reported (not silently skipped), unarchiveRepo never called for that repo', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const unarchiveRepo = vi.fn();
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedTwoAgentDeps(), manifestPath),
+        controlRepoDeps: {
+          ...controlRepoDepsFor(),
+          checkMeta: async () => ({ presence: 'present', archived: false }),
+          readManifestFile: async () => SAME_FLEET_YAML,
+        },
+        agentRepoDeps: {
+          checkMeta: async (repo) => (repo === 'groundnuty/demo-code' ? { presence: 'unknown' } : { presence: 'present', archived: false }),
+          createRepo: async () => {},
+          unarchiveRepo,
+        },
+        agentRepoOptions: { confirmUnarchive: true },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, PRIOR_LOCK, deps);
+
+      expect(result.agents.find((a) => a.role === 'code-agent')?.identity.status).toBe('failed');
+      expect(result.agents.find((a) => a.role === 'code-agent')?.identity.status === 'failed' && result.agents.find((a) => a.role === 'code-agent')?.identity).toMatchObject({
+        reason: expect.stringContaining('could not be ensured before consent gate 1'),
+      });
+      // science-agent's repo WAS confirmed non-archived -> proceeds normally.
+      expect(result.agents.find((a) => a.role === 'science-agent')?.identity.status).toBe('reused');
+      expect(unarchiveRepo).not.toHaveBeenCalled();
+    });
   });
 });

@@ -44,8 +44,8 @@ import type { RegistryConfig, TokenSource } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetManifest } from './fleet-manifest.js';
 import type { LabelsOutcome, RepoInitOptions } from '../commands/repo-init.js';
 import { repoInit as realRepoInit } from '../commands/repo-init.js';
-import type { Presence } from './plan.js';
 import type { CreateRepoFn } from './repo-create.js';
+import type { RepoArchivedMeta } from './observer.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -261,23 +261,79 @@ function errMessage(err: unknown): string {
 }
 
 // --- Agent repo creation (macf#857, DR-043 Amendment F / #854 §2) ---
+// --- + agent repo revival (DR-043 Amendment G correction, groundnuty/macf#1034) ---
 
 export interface AgentRepoDeps {
-  readonly checkExists: (repo: string) => Promise<Presence>;
+  /**
+   * Presence + `archived` bit — the SAME shape `control-repo.ts`'s
+   * `ControlRepoMeta` uses, here typed as `observer.ts::RepoArchivedMeta`
+   * (structurally identical; kept as a separate alias because the two
+   * domains — control repo vs. agent repo — are semantically distinct even
+   * though the read is not). Production wires this to
+   * `observer.ts::checkRepoArchivedState` — the EXACT function `plan.ts`'s
+   * control-repo-archived observation already uses, reused verbatim rather
+   * than adding a second `{archived}` reader (groundnuty/macf#1034, the
+   * #1000 golden-path rule: one reader per fact).
+   */
+  readonly checkMeta: (repo: string) => Promise<RepoArchivedMeta>;
   readonly createRepo: CreateRepoFn;
+  /**
+   * DR-043 Amendment G revival primitive (groundnuty/macf#1034) —
+   * `repo-archive.ts::realUnarchiveRepo` in production, the EXACT SAME
+   * function `control-repo.ts::provisionControlRepo` already calls to
+   * revive the control repo. Never a second un-archive primitive. Called
+   * ONLY when `checkMeta` confirms `archived === true` AND
+   * `opts.confirmUnarchive === true` — see {@link ensureAgentRepo}'s doc.
+   */
+  readonly unarchiveRepo: (repo: string) => Promise<void>;
+}
+
+export interface AgentRepoOptions {
+  /**
+   * DR-043 Amendment G revival confirm gate (groundnuty/macf#1034) — mirrors
+   * `control-repo.ts`'s `ControlRepoOptions.confirmUnarchive` EXACTLY. The
+   * SAME single plan-approve-once "yes" that authorizes the control repo's
+   * revival (`apply-fleet.ts`'s `provisionControlRepo` call) ALSO authorizes
+   * every declared agent repo's revival — one approval covers the whole
+   * declared repo set (control + every `manifest.agents[].repo`), never a
+   * second per-repo prompt (Amendment G's "one approval covering the set"
+   * requirement — the SAME target-set symmetry `teardown.ts`'s
+   * `computeArchiveRepoTargets` already establishes for the teardown
+   * direction). `false`/absent (the safe default) means `ensureAgentRepo`
+   * NEVER un-archives, no matter how the run got invoked — see
+   * `provisionControlRepo`'s identical safe-default rationale.
+   */
+  readonly confirmUnarchive?: boolean;
 }
 
 export type AgentRepoOutcome =
   | { readonly repo: string; readonly role: string; readonly status: 'created' }
   | { readonly repo: string; readonly role: string; readonly status: 'present' }
+  /** DR-043 Amendment G (groundnuty/macf#1034) — was archived, `opts.confirmUnarchive` was `true`, now un-archived. Distinct from `'present'` so a caller can log/render "this repo was just revived" rather than a silent ordinary presence. */
+  | { readonly repo: string; readonly role: string; readonly status: 'revived' }
+  /** DR-043 Amendment G (groundnuty/macf#1034) — `archived === true` but `opts.confirmUnarchive` was NOT `true`. `deps.unarchiveRepo` is NEVER called on this path — the whole point (un-archiving must never be silent). */
+  | { readonly repo: string; readonly role: string; readonly status: 'archived'; readonly reason: string }
+  /**
+   * Amendment A's honest-unknown floor, applied here (groundnuty/macf#1034
+   * requirement 4): the existence/archived read was inconclusive
+   * (auth/network/rate-limit), OR existence was confirmed but the archived
+   * bit itself could not be parsed from the response. EITHER sub-case is
+   * reported `'unknown'`, never silently folded into `'present'` (which
+   * would be the false-`present` Amendment A specifically forbids) — see
+   * this function's doc for why `classifyControlRepoOwnership`'s existing
+   * `meta.archived === true ? … : 'ours'` fallthrough is NOT mirrored here.
+   */
+  | { readonly repo: string; readonly role: string; readonly status: 'unknown'; readonly reason: string }
   | { readonly repo: string; readonly role: string; readonly status: 'failed'; readonly reason: string };
 
 /**
- * Ensure `agent.repo` exists on GitHub, creating it if absent. Called by
- * `apply-fleet.ts` for EVERY agent, BEFORE `applyAgentIdentity` — i.e.
- * before EITHER consent gate for that agent, not merely before this
- * module's own `cloneRepo` step (see this module's doc for why the ordering
- * matters: gate 2's install page can't list a repo that doesn't exist).
+ * Ensure `agent.repo` exists on GitHub (creating it if absent) and, when
+ * archived, reviving it — DR-043 Amendment G (groundnuty/macf#1034 correcting
+ * #867). Called by `apply-fleet.ts` for EVERY agent, BEFORE
+ * `applyAgentIdentity` — i.e. before EITHER consent gate for that agent, not
+ * merely before this module's own `cloneRepo` step (see this module's doc for
+ * why the ordering matters: gate 2's install page can't list a repo that
+ * doesn't exist, and `applyRepoInitForAgent`'s push needs a WRITABLE repo).
  *
  * `agent.provenance` steers WHAT gets created, mirroring the DR-035 field
  * lesson this schema field encodes (`fleet-manifest.ts`'s doc):
@@ -293,35 +349,91 @@ export type AgentRepoOutcome =
  *     repo EXISTS for that later push to target; templating it would just
  *     mean the mirror push immediately overwrites template content anyway.
  *
- * An ALREADY-PRESENT repo is left untouched regardless of `provenance`
- * (`status: 'present'`) — unlike the control repo (`control-repo.ts`), an
- * agent repo has no ownership-custody hazard the way the vault-holding
- * control repo does (the EXISTING `repoItem` plan item already treats any
- * present repo at the declared full name as `noop`, no ownership check —
- * `provenance: 'mirror'` explicitly EXPECTS a pre-existing repo in some
- * flows), so simple presence is sufficient here.
+ * An ALREADY-PRESENT, non-archived repo is left untouched regardless of
+ * `provenance` (`status: 'present'`) — unlike the control repo
+ * (`control-repo.ts`), an agent repo has no ownership-custody hazard the way
+ * the vault-holding, DERIVED-name control repo does (its full name is
+ * OPERATOR-DECLARED in `fleet.yaml`, not derived, so there is no collision
+ * surface to classify against — the EXISTING `repoItem` plan item already
+ * treats any present repo at the declared full name as `noop`, no ownership
+ * check; `provenance: 'mirror'` explicitly EXPECTS a pre-existing repo in
+ * some flows), so simple presence is sufficient for the create/reuse
+ * decision. **Ownership for REVIVAL is established once, fleet-level, via
+ * the control repo's `classifyControlRepoOwnership`** (reached this function
+ * at all means `provisionControlRepo` already confirmed `ours`/
+ * `ours-archived` — a `foreign` control repo aborts the entire run before
+ * this function is ever called, per `apply-fleet.ts`'s doc) — this function
+ * does NOT re-derive a second, per-agent-repo ownership classifier (the
+ * #1000 golden-path rule); it trusts `agent.repo`'s EXACT declared name the
+ * same way `teardown.ts::computeArchiveRepoTargets` already does for the
+ * teardown direction.
+ *
+ * An ARCHIVED repo is revived only when `opts.confirmUnarchive === true`
+ * (see {@link AgentRepoOptions.confirmUnarchive}'s doc) — `deps.unarchiveRepo`
+ * is called BEFORE this function returns, so a caller's subsequent
+ * `cloneRepo`/push against this repo lands on a writable target.
  *
  * NEVER throws — every failure resolves to `status: 'failed'`, including a
- * throwing `deps.checkExists` (the whole body is one try/catch, not just the
- * `createRepo` call — the real `checkRepoExists` never throws by its own
- * contract, but a caller-supplied fake shouldn't be able to violate this
- * function's own contract).
+ * throwing `deps.checkMeta` (the whole body is one try/catch, not just the
+ * `createRepo`/`unarchiveRepo` calls — the real `checkRepoArchivedState`
+ * never throws by its own contract, but a caller-supplied fake shouldn't be
+ * able to violate this function's own contract).
  */
-export async function ensureAgentRepo(agent: FleetAgent, manifest: FleetManifest, deps: AgentRepoDeps): Promise<AgentRepoOutcome> {
+export async function ensureAgentRepo(
+  agent: FleetAgent,
+  manifest: FleetManifest,
+  deps: AgentRepoDeps,
+  opts?: AgentRepoOptions,
+): Promise<AgentRepoOutcome> {
   try {
-    const presence = await deps.checkExists(agent.repo);
-    if (presence === 'present') return { repo: agent.repo, role: agent.role, status: 'present' };
-    if (presence === 'unknown') {
+    const meta = await deps.checkMeta(agent.repo);
+    if (meta.presence === 'absent') {
+      const template = agent.provenance === 'mirror' ? undefined : manifest.defaults.role_template;
+      await deps.createRepo(agent.repo, template !== undefined ? { template } : undefined);
+      return { repo: agent.repo, role: agent.role, status: 'created' };
+    }
+    if (meta.presence === 'unknown') {
       return {
         repo: agent.repo,
         role: agent.role,
-        status: 'failed',
-        reason: `could not confirm whether "${agent.repo}" already exists (auth / network / rate-limit) — refusing to attempt creation without a confident existence read.`,
+        status: 'unknown',
+        reason: `could not confirm whether "${agent.repo}" already exists (auth / network / rate-limit) — refusing to attempt creation or archived-state action without a confident existence read.`,
       };
     }
-    const template = agent.provenance === 'mirror' ? undefined : manifest.defaults.role_template;
-    await deps.createRepo(agent.repo, template !== undefined ? { template } : undefined);
-    return { repo: agent.repo, role: agent.role, status: 'created' };
+    // meta.presence === 'present' from here on.
+    if (meta.archived === undefined) {
+      // Existence is confirmed, but the archived bit itself could not be
+      // read/parsed — Amendment A's honest-unknown floor: this must NOT
+      // fall through to "present, not archived" (that would be the
+      // false-`present` Amendment A forbids — see this function's doc for
+      // why `classifyControlRepoOwnership`'s own `=== true ? … : 'ours'`
+      // fallthrough is deliberately not mirrored here).
+      return {
+        repo: agent.repo,
+        role: agent.role,
+        status: 'unknown',
+        reason: `"${agent.repo}" exists, but its archived state could not be confirmed (the read succeeded but did not report a boolean \`archived\` field) — refusing to guess whether it needs reviving.`,
+      };
+    }
+    if (meta.archived === true) {
+      if (opts?.confirmUnarchive !== true) {
+        // Amendment G: un-archiving reverses a state the operator
+        // DELIBERATELY set — never inferred, never flipped as a side effect.
+        // `deps.unarchiveRepo` is NOT called on this path.
+        return {
+          repo: agent.repo,
+          role: agent.role,
+          status: 'archived',
+          reason:
+            `"${agent.repo}" is ARCHIVED (DR-043 Amendment G — a deliberate, reversible \`macf fleet archive\` ` +
+            'state). Revival is free but NOT automatic: re-run with confirmation (the plan-approve-once "yes" ' +
+            'that authorizes this apply run) to un-archive + resume normal reconcile.',
+        };
+      }
+      await deps.unarchiveRepo(agent.repo);
+      return { repo: agent.repo, role: agent.role, status: 'revived' };
+    }
+    return { repo: agent.repo, role: agent.role, status: 'present' };
   } catch (err) {
     return { repo: agent.repo, role: agent.role, status: 'failed', reason: errMessage(err) };
   }
