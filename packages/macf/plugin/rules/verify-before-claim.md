@@ -122,11 +122,17 @@ Three ways a well-formed reading belongs to something other than the claim:
 - **It forecasts the thing instead of reporting it.** A plan preview, dry-run, or `WILL happen` line read as a result. *(Same day: an `apply` was killed mid-run because the plan preview said `consent gate 1 WILL open`; the run had already confirmed and correctly reused the existing App.)*
 - **It belongs to a different instance of the thing.** The right query against the wrong subject. *(Same day: `pgrep -f claude` on a shared VM returned a **peer agent's** `MACF_AGENT_NAME`; only `/proc/<pid>/cwd` filtering isolated the caller's own process. Same shape as an installation-token check that lists overlapping repos and cannot discriminate which App minted it.)*
 
-**The check, and it is one step:** *does this line come from the thing, or from something adjacent to it?* Read the surrounding lines, not the matching one; confirm the subject, not just the pattern. A `grep` that returns one line has discarded the context that would answer both questions — which is why the failure survives a discipline built on quoting output faithfully.
+- **It cannot distinguish the claim from its negation.** The right subject, read correctly — and the output would have looked **identical** if the claim were false. *(Same day: an installation's identity was "confirmed" by listing `/installation/repositories` and recognising the expected repos. Two Apps were installed on overlapping repos, so that listing looks the same either way. The discriminating check was to post and read back `user.login` — which promptly showed a **different App**.)*
+
+**The check, in one question:** ***would this output look different if my claim were false?*** If not, it is not evidence, however real and however faithfully quoted.
+
+The three provenance failures above are the common ways the answer is no — a description, a forecast, and a different instance all produce output that would read the same whether or not the claim held. The fourth needs no provenance error at all, which is why *"does this come from the thing?"* is necessary but insufficient: **the repo-list check came from exactly the right thing and still proved nothing.**
+
+Practically: read the surrounding lines, not the matching one; confirm the subject, not just the pattern; and before quoting anything as proof, name the observation you would expect **if you were wrong**. A `grep` that returns one line has discarded the context that answers the first two, and never addressed the third.
 
 **Why this is a distinct trap.** The other sections defend against *not looking*. This one fires when you did look, quoted accurately, and the reading was well-formed — the tell is confidence sourced from having run a command rather than from what the command was pointed at. It is the same shape as the silent-fallback class one layer up: an operation that succeeds while its subject is wrong, and nothing about the success surfaces the mismatch.
 
-**Attested across agents** on 2026-08-19: twice by `macf-code-agent` (comment-as-value, preview-as-result), and by `macf-science-agent`'s own catalogued dominant failure mode — documentation, symptoms, summaries, and stale checkouts all reading as the artifact.
+**Attested across agents** on 2026-08-19: twice by `macf-code-agent` (comment-as-value, preview-as-result), once by `macf-science-agent` (peer's process for own; and the repo-list proxy above), and by `macf-science-agent`'s own catalogued dominant failure mode — documentation, symptoms, summaries, and stale checkouts all reading as the artifact.
 
 ---
 
