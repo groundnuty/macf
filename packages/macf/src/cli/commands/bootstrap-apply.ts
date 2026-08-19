@@ -910,7 +910,7 @@ function caSummaryLines(result: FleetApplyResult): string[] {
   return lines;
 }
 
-/** `MACF_TRUSTED_ACTORS` per-repo render (macf#838 Amendment D phase 2; corrected target macf#922). Empty when `routing.runner` wasn't declared, or its `runs_on` isn't `"self-hosted"`. A `'skipped'` leg (rendered via `formatVariableLegLine`'s reason suffix) means the register-before-route gate blocked the write — visible here even under `--yes`, which skips the pre-approval plan render entirely. */
+/** `MACF_TRUSTED_ACTORS` per-repo render (macf#838 Amendment D phase 2; corrected target macf#922). Empty when `routing.runner` wasn't declared, or its `runs_on` isn't `"self-hosted"`. A `'failed'` leg (rendered via `formatVariableLegLine`'s reason suffix — groundnuty/macf#993 corrected this from `'skipped'`: a declared runner is REQUIRED, so the register-before-route gate blocking the write now fails the run, not just the leg) is visible here even under `--yes`, which skips the pre-approval plan render entirely. */
 function routingSummaryLines(result: FleetApplyResult): string[] {
   const entries = Object.entries(result.routing);
   if (entries.length === 0) return [];
@@ -1103,6 +1103,18 @@ export function applyExitCode(result: FleetApplyResult): number {
     result.ca.resolve.status === 'failed' ||
     result.ca.registryLeg.status === 'failed' ||
     Object.values(result.ca.repoLegs).some((leg) => leg.status === 'failed');
+  // groundnuty/macf#993 — the operator's ruling: "the failure of our runner
+  // should be loud, and the lack of it being provisioned at this stage
+  // should block everything else." No code change was needed HERE: a
+  // declared-self-hosted-runner repo with no usable runner confirmed is now
+  // reported as `'failed'`, not `'skipped'`, by
+  // `apply-routing.ts::publishTrustedActorsGated` (the only producer of
+  // `result.routing` entries — `result.routing` stays `{}` when
+  // `routing.runner` isn't declared self-hosted, so an undeclared fleet
+  // never reaches this check either way). This `some(status === 'failed')`
+  // already covers that outcome — it did before macf#993 too, for the
+  // missing-`--runner-token` refusal; #993 only widened WHICH outcomes the
+  // gate reports as `'failed'` rather than changing this check itself.
   const routingBad = Object.values(result.routing).some((leg) => leg.status === 'failed');
   // DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920 gap 2) — same
   // 'skipped' vs 'failed' distinction `caBad` above already applies to CA

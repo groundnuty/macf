@@ -111,6 +111,35 @@
  * (all optional, defaulting to today's un-instrumented real-clock behavior)
  * let a long poll narrate itself — macf#972 requirement 3: silence after a
  * burst of browser consent-gate clicks reads as a hang.
+ *
+ * **A declared runner is REQUIRED, never a silent hosted-runner fallback
+ * (groundnuty/macf#993).** The operator's ruling, verbatim: "When we specify
+ * that the runner has to be our runner that we create, it should be
+ * impossible and forbidden to fall back to the metered hosted runners...
+ * the failure of our runner should be loud, and the lack of it being
+ * provisioned at this stage should block everything else." Before macf#993,
+ * a per-repo "no usable runner confirmed" outcome from
+ * {@link publishTrustedActorsGated} — whether via {@link pollForUsableRunner}
+ * exhausting its window OR the macf#972 fast path finding none at t=0 — was
+ * `'skipped'`, the SAME "honest incomplete, does not fail the run" status
+ * `ensure-variable.ts` uses for benign steady states elsewhere in this
+ * codebase. That let a live two-agent fleet run finish reporting the routing
+ * gap in one transcript line while every OTHER step read green, and exit 0
+ * — the fleet then billed github-hosted Actions minutes indefinitely with no
+ * further signal. `publishTrustedActorsGated` now reports that SAME outcome
+ * as `'failed'` instead (the reason TEXT is UNCHANGED —
+ * {@link runnerTokenPollExhaustedReason} / {@link runnerJustCreatedRepoReason}
+ * already named the billing consequence — only the status tag flips). No
+ * OTHER file needed a code change for this: `commands/bootstrap-apply.ts::applyExitCode`'s
+ * `routingBad` check already treats ANY `'failed'` routing leg as
+ * run-failing, and `result.routing` is populated ONLY when
+ * `routing.runner.runs_on === 'self-hosted'` was declared (see
+ * `apply-fleet.ts`'s call site) — so a fleet that never declares a runner is
+ * structurally unreachable here and stays exit-0, unaffected. The ungated
+ * {@link publishTrustedActors} (superseded as the production entrypoint by
+ * macf#929, retained only as a direct-unit-tested building block — see its
+ * own doc) is NOT part of this change; it keeps reporting `'skipped'` for the
+ * same shape, since it is never reached from `apply` at all.
  */
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import { ensureVariableCreated, failedOutcomesFor } from './ensure-variable.js';
@@ -333,20 +362,26 @@ export function checkRunnerTokenPreflight(
 }
 
 /**
- * The `'skipped'` (not `'failed'` — see {@link noRunnerTokenReason}'s doc for
- * the exit-code-relevant distinction) reason when a runner-registration
- * token WAS supplied but {@link pollForUsableRunner}'s bounded window expired
- * before `repo` became usable (macf#929 requirement 6) — an honest
- * incomplete, not a policy refusal: the operator declared intent AND gave
- * `apply` a way to wait, but the runner genuinely hasn't shown up yet.
- * Extends `noRunnerRegisteredReason`'s absent/unknown honest-unknown
- * discrimination + macf#924's org-admin handover verbatim-append + macf#934's
- * capability-detail verbatim-append (all still apply — polling doesn't
- * change WHY a runner is unusable, only WHETHER `apply` waited for it) with
- * the token-specific framing + the concrete re-run remedy.
+ * The reason text for a runner-registration token WAS supplied but
+ * {@link pollForUsableRunner}'s bounded window expired before `repo` became
+ * usable (macf#929 requirement 6) — an honest incomplete outcome: the
+ * operator declared intent AND gave `apply` a way to wait, but the runner
+ * genuinely hasn't shown up yet. Extends `noRunnerRegisteredReason`'s
+ * absent/unknown honest-unknown discrimination + macf#924's org-admin
+ * handover verbatim-append + macf#934's capability-detail verbatim-append
+ * (all still apply — polling doesn't change WHY a runner is unusable, only
+ * WHETHER `apply` waited for it) with the token-specific framing + the
+ * concrete re-run remedy.
+ *
+ * **Status note (groundnuty/macf#993):** {@link publishTrustedActorsGated}
+ * pairs this text with `status: 'failed'`, not `'skipped'` — a declared
+ * runner is REQUIRED, so "no usable runner confirmed" now fails the run
+ * (see this module's top-level doc, "A declared runner is REQUIRED"
+ * section). This function's TEXT is unchanged; only the caller's status tag
+ * changed.
  */
 /**
- * The skip reason for the macf#972 FAST PATH — a repo created in THIS run,
+ * The reason text for the macf#972 FAST PATH — a repo created in THIS run,
  * where no poll was performed because none could succeed.
  *
  * Deliberately NOT {@link runnerTokenPollExhaustedReason}: that text says
@@ -355,6 +390,10 @@ export function checkRunnerTokenPreflight(
  * same dishonesty this catalog exists to prevent, so the elapsed claim is
  * dropped and the CAUSE is named instead. The remedy clause is kept
  * verbatim — operators and macf#932's pre-flight both reference it.
+ *
+ * **Status note (groundnuty/macf#993):** same status change as
+ * {@link runnerTokenPollExhaustedReason} above — `'failed'`, not
+ * `'skipped'`. This function's TEXT is unchanged.
  */
 export function runnerJustCreatedRepoReason(repo: string, usability: RunnerUsability): string {
   const cause =
@@ -520,9 +559,12 @@ export async function pollForUsableRunner(
  *   budget per repo — a fleet that never confirms costs one window total,
  *   not `repos.length` windows. A repo confirmed usable is written via
  *   {@link writeTrustedActorsVar}; a repo whose poll expires unconfirmed is
- *   `'skipped'` with {@link runnerTokenPollExhaustedReason} (honest
- *   incomplete, does NOT fail the run); a throwing check is `'failed'`
- *   (wiring bug, isolated to that repo — mirrors `publishTrustedActors`).
+ *   `'failed'` with {@link runnerTokenPollExhaustedReason} (groundnuty/macf#993
+ *   — a declared runner is REQUIRED, so an unconfirmed runner now FAILS the
+ *   run, same bar as the missing-token refusal below; the reason text is the
+ *   SAME honest-incomplete wording used before this change, only the status
+ *   tag flipped); a throwing check is ALSO `'failed'` (wiring bug, isolated
+ *   to that repo — mirrors `publishTrustedActors`).
  *
  * **`justCreatedRepos` (macf#972, DR-043 Amendment I2) — a poll must be
  * justified by an expectation, not a constant.** For a repo in this
@@ -537,10 +579,11 @@ export async function pollForUsableRunner(
  * registered before this run IS usable at t=0 for a brand-new repo, and
  * that case still writes the var — only the RETRY LOOP is skipped, never
  * the one-shot presence read. When the single check finds no usable runner,
- * the skip reason is {@link runnerTokenPollExhaustedReason} called with the
- * SAME configured `timeoutMs` the poll path would have used — byte-identical
- * text to what a full 600s poll would have produced, per the issue's hard
- * constraint that only the TIMING changes, never the message. See
+ * the outcome is `'failed'` (groundnuty/macf#993) with
+ * {@link runnerTokenPollExhaustedReason} called with the SAME configured
+ * `timeoutMs` the poll path would have used — byte-identical text to what a
+ * full 600s poll would have produced, per the issue's hard constraint that
+ * only the TIMING changes, never the message. See
  * `apply-fleet.ts`'s call site for how `justCreatedRepos` is populated
  * (`ensureAgentRepo`'s per-repo `status === 'created'`).
  *
@@ -590,8 +633,15 @@ export async function publishTrustedActorsGated(
       continue;
     }
     if (usability.presence !== 'present') {
+      // groundnuty/macf#993 — the operator's ruling: a declared runner is
+      // REQUIRED, never a silent hosted-runner fallback. `'failed'`, not
+      // `'skipped'` — this is the ONE line that makes the whole run
+      // non-zero-exit via `commands/bootstrap-apply.ts::applyExitCode`'s
+      // existing `routingBad` check (already `.some((leg) => leg.status ===
+      // 'failed')`, unchanged). The reason TEXT is untouched — it already
+      // names the billing consequence — only the status tag flips.
       out[repo] = {
-        status: 'skipped',
+        status: 'failed',
         reason: pollJustified
           ? runnerTokenPollExhaustedReason(repo, usability, timeoutMs)
           : runnerJustCreatedRepoReason(repo, usability),

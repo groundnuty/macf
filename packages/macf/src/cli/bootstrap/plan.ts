@@ -841,6 +841,27 @@ const RUNNER_TOKEN_PLAN_NOTE =
   'attempt this write at all — macf#932.';
 
 /**
+ * groundnuty/macf#993 — the operator's ruling, stated plainly BEFORE the
+ * operator approves the plan (not just discovered at `apply` time): "the
+ * failure of our runner should be loud, and the lack of it being
+ * provisioned at this stage should block everything else." A declared
+ * `routing.runner` is a REQUIREMENT, not a preference — `apply` refuses to
+ * fall back to a metered hosted runner. UNCONDITIONAL (appended in both
+ * `runnerClassReason` branches, mirroring {@link RUNNER_TOKEN_PLAN_NOTE}'s
+ * own unconditional design): even when a runner IS confirmed registered at
+ * PLAN time, `apply` can still fail on it later (the runner going offline
+ * between plan and apply, or {@link RUNNER_TOKEN_PLAN_NOTE}'s own missing-
+ * token refusal) — so the requirement is named regardless of the currently-
+ * observed registration state, not only in the "absent" branch. Additive —
+ * appended alongside the existing sentences above it, never a rewrite of
+ * them (see `apply-routing.ts::publishTrustedActorsGated`'s doc for the
+ * actual enforcement this note describes).
+ */
+const RUNNER_REQUIRED_FAILURE_PLAN_NOTE =
+  ' A declared routing.runner is REQUIRED: if no usable runner is confirmed when `apply` runs, `apply` FAILS ' +
+  '(non-zero exit) rather than silently falling back to a metered hosted runner — groundnuty/macf#993.';
+
+/**
  * The runner-CLASS half of {@link routingItem}'s reason (macf#922 — the plan
  * must name the billing consequence BEFORE the operator approves apply: a
  * private repo billed github-hosted draws down the account's Actions-minutes
@@ -857,10 +878,12 @@ const RUNNER_TOKEN_PLAN_NOTE =
  * (macf#934 — a runner WAS found but fails the capability check: offline,
  * missing a required label, or a permission-denied read) is likewise
  * appended verbatim when set, and macf#932 adds a further unconditional
- * suffix ({@link RUNNER_TOKEN_PLAN_NOTE}). The original wording for the
- * no-suffix branches is preserved UNCHANGED (only the suffixes are new) so
- * this stays a strict extension — same "never rewrite" discipline as
- * `handover`'s own addition.
+ * suffix ({@link RUNNER_TOKEN_PLAN_NOTE}), followed by macf#993's own
+ * unconditional suffix ({@link RUNNER_REQUIRED_FAILURE_PLAN_NOTE} — plan
+ * states plainly, before approval, that `apply` will FAIL without a
+ * confirmed runner). The original wording for the no-suffix branches is
+ * preserved UNCHANGED (only the suffixes are new) so this stays a strict
+ * extension — same "never rewrite" discipline as `handover`'s own addition.
  */
 function runnerClassReason(
   runnerRegistered: Presence | undefined,
@@ -870,7 +893,10 @@ function runnerClassReason(
 ): string {
   const repoLabel = representativeRepo ?? '(no agent repos declared)';
   if (runnerRegistered === 'present') {
-    return `Runner class: self-hosted (a runner is confirmed registered on "${repoLabel}").${RUNNER_TOKEN_PLAN_NOTE}`;
+    return (
+      `Runner class: self-hosted (a runner is confirmed registered on "${repoLabel}").` +
+      `${RUNNER_TOKEN_PLAN_NOTE}${RUNNER_REQUIRED_FAILURE_PLAN_NOTE}`
+    );
   }
   const cause =
     runnerRegistered === 'absent'
@@ -880,7 +906,8 @@ function runnerClassReason(
   const handoverSuffix = handover !== undefined ? ` ${handover}` : '';
   return (
     `Runner class: github-hosted (billed on private repos) — ${cause} yet; MACF_TRUSTED_ACTORS will NOT be ` +
-    `written by apply until one is (register-before-route).${detailSuffix}${handoverSuffix}${RUNNER_TOKEN_PLAN_NOTE}`
+    `written by apply until one is (register-before-route).${detailSuffix}${handoverSuffix}${RUNNER_TOKEN_PLAN_NOTE}` +
+    RUNNER_REQUIRED_FAILURE_PLAN_NOTE
   );
 }
 
