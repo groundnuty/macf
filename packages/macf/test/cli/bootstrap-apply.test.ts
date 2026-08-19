@@ -1821,6 +1821,248 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
   });
 });
 
+// --- runBootstrapApply — remaining-deploy honest completion (macf#1014) ---
+//
+// `FLEET_YAML`'s two agents deploy_path to `/home/ubuntu/repos/demo-code`
+// and `/home/ubuntu/repos/demo-science` — real-looking absolute paths this
+// suite must NEVER depend on the actual host filesystem for (that would make
+// these tests non-deterministic across machines/CI). Every test here injects
+// `checkDeployPathExists` explicitly instead of relying on `BootstrapApplyDeps`'s
+// real `existsSync` default (`remaining-deploy.ts::computeRemainingDeploy`'s
+// own doc: `apply`'s wiring only falls back to a real fs probe when the CLI
+// caller supplies no `deps` at all — a case this suite never exercises).
+describe('runBootstrapApply — remaining-deploy honest completion (macf#1014)', () => {
+  const dirs: string[] = [];
+  let logs: string[];
+  let errs: string[];
+  const DEMO_CODE_PATH = '/home/ubuntu/repos/demo-code';
+  const DEMO_SCIENCE_PATH = '/home/ubuntu/repos/demo-science';
+  const DEMO_REPOS_PARENT = '/home/ubuntu/repos';
+
+  beforeEach(() => {
+    logs = [];
+    errs = [];
+    vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => logs.push(a.join(' ')));
+    vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => errs.push(a.join(' ')));
+    const recoverySafetyDir = mkdtempSync(join(tmpdir(), 'macf-apply-remaining-deploy-recovery-safety-'));
+    dirs.push(recoverySafetyDir);
+    vi.stubEnv('MACF_RECOVERY_DIR', recoverySafetyDir);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function writeManifest(body = FLEET_YAML): string {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-apply-remaining-deploy-test-'));
+    dirs.push(dir);
+    const p = join(dir, 'fleet.yaml');
+    writeFileSync(p, body);
+    return p;
+  }
+
+  it('the decisive case: a fleet with no workspaces names EVERY agent + a copy-pasteable command per agent (not merely "some text was printed")', async () => {
+    const file = writeManifest();
+    // Parent (/home/ubuntu/repos) exists on this fake fs, neither leaf does
+    // — the realistic "operator's workspaces tree exists, nothing deployed
+    // into it yet" shape (`computeRemainingDeploy`'s `not-deployed` case).
+    const checkDeployPathExists = (p: string): boolean => p === DEMO_REPOS_PARENT;
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists },
+      fakeMutateDeps(file),
+    );
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    expect(out).toContain('code-agent: NOT DEPLOYED');
+    expect(out).toContain('science-agent: NOT DEPLOYED');
+    // The DECISIVE assertion: an exact, copy-pasteable command naming the
+    // SPECIFIC agent + manifest path — not merely that some warning text
+    // was printed.
+    expect(out).toContain(`macf fleet deploy --agent code-agent -f ${file} --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY`);
+    expect(out).toContain(`macf fleet deploy --agent science-agent -f ${file} --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY`);
+    // The --vault-omitted precondition note (review finding): the operator
+    // must know the constructed commands' default --vault resolution only
+    // works from a local clone of the fleet's OWN control repo.
+    expect(out).toContain('demo-fleet-control');
+    expect(out).toContain('git pull');
+  });
+
+  it('echoes the --vault/--identity-key flags apply was ITSELF invoked with into every deploy command, and OMITS the vault-location note', async () => {
+    const file = writeManifest();
+    const checkDeployPathExists = (p: string): boolean => p === DEMO_REPOS_PARENT;
+    const code = await runBootstrapApply(
+      { file, yes: true, vaultPath: '/fake/secrets/vault.age', identityKeyPath: '/home/op/age-identity.txt' },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists },
+      fakeMutateDeps(file),
+    );
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    expect(out).toContain(
+      `macf fleet deploy --agent code-agent -f ${file} --vault /fake/secrets/vault.age --identity-key /home/op/age-identity.txt`,
+    );
+    // The operator already gave a real --vault — no precondition note needed
+    // (the bare "demo-fleet-control" repo name legitimately appears in the
+    // unrelated "Control repo: CREATED ..." line above; assert against the
+    // note's distinctive phrasing instead).
+    expect(out).not.toContain('these commands omit --vault');
+    expect(out).not.toContain('git pull');
+  });
+
+  it('a deploy_path not resolvable locally (parent ALSO absent) is reported as UNKNOWN, never NOT DEPLOYED', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists: () => false },
+      fakeMutateDeps(file),
+    );
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    expect(out).toContain('code-agent: UNKNOWN');
+    expect(out).toContain('science-agent: UNKNOWN');
+    expect(out).not.toContain('NOT DEPLOYED');
+    expect(out).toContain('multi-host fleet');
+  });
+
+  it('a fully-deployed fleet reports NOTHING remaining — no nagging on a re-run', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists: () => true },
+      fakeMutateDeps(file),
+    );
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    expect(out).not.toContain('NOT DEPLOYED');
+    expect(out).not.toContain('UNKNOWN');
+    expect(out).not.toContain('macf fleet deploy');
+    expect(out).not.toContain('macf#1014');
+  });
+
+  it('exit code is UNCHANGED by deploy presence — an undeployed fleet still exits 0 on a successful apply', async () => {
+    const file = writeManifest();
+    const codeAllMissing = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists: () => false },
+      fakeMutateDeps(file),
+    );
+    expect(codeAllMissing).toBe(0);
+
+    const file2 = writeManifest();
+    const codeAllPresent = await runBootstrapApply(
+      { file: file2, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists: () => true },
+      fakeMutateDeps(file2),
+    );
+    expect(codeAllPresent).toBe(0);
+    expect(codeAllMissing).toBe(codeAllPresent);
+  });
+
+  it('--json carries the same remaining_deploy facts the human-readable text shows', async () => {
+    const file = writeManifest();
+    const checkDeployPathExists = (p: string): boolean => p === DEMO_REPOS_PARENT;
+    const code = await runBootstrapApply(
+      { file, yes: true, json: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists },
+      fakeMutateDeps(file),
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(logs.join('\n')) as {
+      remaining_deploy: ReadonlyArray<{ role: string; deploy_path: string; presence: string; command: string }>;
+    };
+    expect(parsed.remaining_deploy).toHaveLength(2);
+    const roles = parsed.remaining_deploy.map((s) => s.role).sort();
+    expect(roles).toEqual(['code-agent', 'science-agent']);
+    const codeAgentEntry = parsed.remaining_deploy.find((s) => s.role === 'code-agent');
+    expect(codeAgentEntry?.deploy_path).toBe(DEMO_CODE_PATH);
+    expect(codeAgentEntry?.presence).toBe('not-deployed');
+    expect(codeAgentEntry?.command).toBe(`macf fleet deploy --agent code-agent -f ${file} --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY`);
+    const scienceAgentEntry = parsed.remaining_deploy.find((s) => s.role === 'science-agent');
+    expect(scienceAgentEntry?.deploy_path).toBe(DEMO_SCIENCE_PATH);
+  });
+
+  it('--json OMITS remaining_deploy entirely (not an empty array) for a fully-deployed fleet — byte-identical to pre-#1014 shape', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply(
+      { file, yes: true, json: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists: () => true },
+      fakeMutateDeps(file),
+    );
+    expect(code).toBe(0);
+    const raw = logs.join('\n');
+    expect(raw).not.toContain('remaining_deploy');
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    expect('remaining_deploy' in parsed).toBe(false);
+  });
+
+  it('never leaks secret material through the remaining-deploy report, in text or --json', async () => {
+    const file = writeManifest();
+    const checkDeployPathExists = (p: string): boolean => p === DEMO_REPOS_PARENT;
+
+    const textCode = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists },
+      fakeMutateDeps(file),
+    );
+    expect(textCode).toBe(0);
+    const text = logs.join('\n');
+    expect(text).not.toContain('-----BEGIN');
+    expect(text).not.toContain('SENTINEL-CLIENT-SECRET');
+    expect(text).not.toContain('SENTINEL-WEBHOOK-SECRET');
+    expect(text).not.toContain('SENTINEL-PEM-VALUE');
+
+    logs = [];
+    const file2 = writeManifest();
+    const jsonCode = await runBootstrapApply(
+      { file: file2, yes: true, json: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists },
+      fakeMutateDeps(file2),
+    );
+    expect(jsonCode).toBe(0);
+    const json = logs.join('\n');
+    expect(json).not.toContain('-----BEGIN');
+    expect(json).not.toContain('SENTINEL-CLIENT-SECRET');
+    expect(json).not.toContain('SENTINEL-WEBHOOK-SECRET');
+    expect(json).not.toContain('SENTINEL-PEM-VALUE');
+  });
+
+  it('suppresses the remaining-deploy block entirely on a control-repo-ABORTED run (foreign) — deploying is not the next step there', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      // Neither leaf nor parent exists — every declared agent WOULD be
+      // flagged, if the block weren't suppressed for this abort shape.
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists: () => false },
+      fakeMutateDeps(file, {
+        controlRepoDeps: {
+          checkMeta: async () => ({ presence: 'present', archived: false }),
+          readManifestFile: async () => undefined,
+          createRepo: async () => {
+            throw new Error('must not be called — foreign never creates');
+          },
+          unarchiveRepo: async () => {
+            throw new Error('must not be called — foreign never unarchives');
+          },
+          cloneRepo: async () => {
+            throw new Error('must not be called — foreign never clones');
+          },
+          commitAndPush: async () => {
+            throw new Error('must not be called — foreign never commits');
+          },
+        },
+      }),
+    );
+    expect(code).toBe(1);
+    const out = logs.join('\n');
+    expect(out).toMatch(/⚠ ABORTED/);
+    expect(out).not.toContain('NOT DEPLOYED');
+    expect(out).not.toContain('UNKNOWN whether deployed');
+    expect(out).not.toContain('macf fleet deploy --agent');
+    expect(out).not.toContain('macf#1014');
+  });
+});
+
 // --- resolveMutateDeps — the vault-aware resolveKeyPath wiring itself (macf#913) ---
 //
 // Unit-level, no gh/git — resolveKeyPath and cleanupVaultScratch only ever
