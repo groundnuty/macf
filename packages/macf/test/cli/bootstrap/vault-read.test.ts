@@ -22,6 +22,8 @@ import { join } from 'node:path';
 import { toVariableSegment } from '@groundnuty/macf-core';
 import {
   ageDecryptFile,
+  assertNoDroppedVaultKeys,
+  composeAndWriteVault,
   countVaultAgentPresence,
   countVaultCaPresence,
   countVaultRecipientStanzas,
@@ -908,6 +910,281 @@ describe('reencryptVault — orchestration + real age binary (groundnuty/macf#95
       expect(countVaultRecipientStanzas(readFileSync(vaultPath))).toBe(2);
       const result = readVaultRecipientCount(vaultPath);
       expect(result).toEqual({ status: 'counted', count: 2 });
+    },
+  );
+});
+
+describe('assertNoDroppedVaultKeys — the provenance guard (DR-043 Amendment D, groundnuty/macf#989)', () => {
+  it('does not throw when the composed map is a superset of the existing map (the ordinary compose shape)', () => {
+    const existing = { A: '1', B: '2' };
+    const composed = { A: '1', B: '2', C: '3' };
+    expect(() => assertNoDroppedVaultKeys(existing, composed)).not.toThrow();
+  });
+
+  it('does not throw when a shared key\'s VALUE changed (an overwrite is not a drop)', () => {
+    const existing = { A: '1' };
+    const composed = { A: 'CHANGED' };
+    expect(() => assertNoDroppedVaultKeys(existing, composed)).not.toThrow();
+  });
+
+  it('throws vault_would_drop_keys when the composed map is missing a key the existing map had — the decisive safety property', () => {
+    const existing = { A: '1', B: '2', C: '3' };
+    const composed = { A: '1', C: '3' }; // B silently dropped
+    try {
+      assertNoDroppedVaultKeys(existing, composed);
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VaultError);
+      expect((e as VaultError).code).toBe('vault_would_drop_keys');
+      expect((e as VaultError).message).toContain('B');
+      // Key NAMES are fine to surface (never secret); values never appear:
+      expect((e as VaultError).message).not.toContain('2');
+    }
+  });
+
+  it('lists every dropped key, not just the first', () => {
+    const existing = { A: '1', B: '2', C: '3' };
+    const composed = {}; // everything dropped
+    try {
+      assertNoDroppedVaultKeys(existing, composed);
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect((e as VaultError).message).toContain('A');
+      expect((e as VaultError).message).toContain('B');
+      expect((e as VaultError).message).toContain('C');
+      expect((e as VaultError).message).toContain('3 key');
+    }
+  });
+});
+
+describe('composeAndWriteVault — orchestration (injected deps, no real age, groundnuty/macf#989)', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function mintAgeKey(dir: string, name: string): { keyPath: string; publicKey: string } {
+    const keyPath = join(dir, name);
+    const r = spawnSync('age-keygen', ['-o', keyPath], { encoding: 'utf-8' });
+    expect(r.status, r.stderr).toBe(0);
+    const content = readFileSync(keyPath, 'utf-8');
+    const match = /age1[0-9a-z]+/.exec(content);
+    expect(match).not.toBeNull();
+    return { keyPath, publicKey: match?.[0] ?? '' };
+  }
+
+  it('refuses with vault_no_recipients when recipients is empty — no decrypt/encrypt seam is ever invoked', async () => {
+    let decryptCalled = false;
+    let encryptCalled = false;
+    try {
+      await composeAndWriteVault('/fake/vault.age', '/fake/identity.txt', "MACF_X_APP_ID='1'\n", [], {
+        decrypt: async () => {
+          decryptCalled = true;
+          return '';
+        },
+        encrypt: async () => {
+          encryptCalled = true;
+        },
+      });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VaultError);
+      expect((e as VaultError).code).toBe('vault_no_recipients');
+    }
+    expect(decryptCalled).toBe(false);
+    expect(encryptCalled).toBe(false);
+  });
+
+  it('merges the decrypted CURRENT vault with the new receipts and encrypts the composed plaintext — prior keys AND new keys both present', async () => {
+    let encryptedPlaintext: string | undefined;
+    const result = await composeAndWriteVault(
+      '/fake/vault.age',
+      '/fake/identity.txt',
+      "MACF_AGENT_CODE_AGENT_APP_ID='new-app-id'\n",
+      ['age1fake'],
+      {
+        exists: () => true,
+        assertIdentityReadable: () => {},
+        decrypt: async () => "MACF_AGENT_SCIENCE_AGENT_APP_ID='old-app-id'\nMACF_AGENT_SCIENCE_AGENT_CLIENT_SECRET='OLD-SECRET'\n",
+        encrypt: async (plaintext) => {
+          encryptedPlaintext = plaintext;
+        },
+        rename: () => {}, // no real temp file was written — the fake encrypt above is a no-op
+        unlink: () => {},
+      },
+    );
+    expect(result).toEqual({ path: '/fake/vault.age', versioned: false });
+    expect(encryptedPlaintext).toContain("MACF_AGENT_SCIENCE_AGENT_APP_ID='old-app-id'");
+    expect(encryptedPlaintext).toContain("MACF_AGENT_SCIENCE_AGENT_CLIENT_SECRET='OLD-SECRET'");
+    expect(encryptedPlaintext).toContain("MACF_AGENT_CODE_AGENT_APP_ID='new-app-id'");
+  });
+
+  it('a shared key is won by the NEW receipt (this run\'s fresher value supersedes the vault\'s prior one)', async () => {
+    let encryptedPlaintext: string | undefined;
+    await composeAndWriteVault('/fake/vault.age', '/fake/identity.txt', "MACF_AGENT_X_APP_ID='NEW'\n", ['age1fake'], {
+      exists: () => true,
+      assertIdentityReadable: () => {},
+      decrypt: async () => "MACF_AGENT_X_APP_ID='OLD'\n",
+      encrypt: async (plaintext) => {
+        encryptedPlaintext = plaintext;
+      },
+      rename: () => {},
+      unlink: () => {},
+    });
+    expect(encryptedPlaintext).toBe("MACF_AGENT_X_APP_ID='NEW'\n");
+  });
+
+  it('propagates a readVault failure (e.g. wrong identity) — never attempts to encrypt', async () => {
+    let encryptCalled = false;
+    await expect(
+      composeAndWriteVault('/fake/vault.age', '/fake/identity.txt', "MACF_X_APP_ID='1'\n", ['age1fake'], {
+        exists: () => true,
+        assertIdentityReadable: () => {},
+        decrypt: async () => {
+          throw new VaultError('vault_decrypt_failed', 'simulated wrong identity');
+        },
+        encrypt: async () => {
+          encryptCalled = true;
+        },
+      }),
+    ).rejects.toThrow(/simulated wrong identity/);
+    expect(encryptCalled).toBe(false);
+  });
+
+  it('propagates an encrypt failure and cleans up the temp file (never leaves a partial file, never touches vaultPath)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-compose-test-'));
+    dirs.push(dir);
+    const vaultPath = join(dir, 'vault.age');
+    writeFileSync(vaultPath, 'ORIGINAL-CIPHERTEXT-UNCHANGED');
+    const unlinkedPaths: string[] = [];
+    await expect(
+      composeAndWriteVault(vaultPath, '/fake/identity.txt', "MACF_AGENT_X_APP_ID='1'\n", ['age1fake'], {
+        exists: () => true,
+        assertIdentityReadable: () => {},
+        decrypt: async () => "MACF_AGENT_Y_APP_ID='2'\n",
+        encrypt: async () => {
+          throw new Error('simulated age encrypt failure');
+        },
+        unlink: (p) => unlinkedPaths.push(p),
+      }),
+    ).rejects.toThrow(/simulated age encrypt failure/);
+    expect(readFileSync(vaultPath, 'utf-8')).toBe('ORIGINAL-CIPHERTEXT-UNCHANGED');
+    expect(unlinkedPaths).toHaveLength(1);
+    expect(unlinkedPaths[0]).toMatch(/vault\.age\.compose-.*\.tmp$/);
+  });
+
+  it('propagates a rename failure (temp encrypted successfully, but the atomic swap itself failed) and cleans up the temp file', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-compose-test-'));
+    dirs.push(dir);
+    const vaultPath = join(dir, 'vault.age');
+    writeFileSync(vaultPath, 'ORIGINAL-CIPHERTEXT-UNCHANGED');
+    const unlinkedPaths: string[] = [];
+    try {
+      await composeAndWriteVault(vaultPath, '/fake/identity.txt', "MACF_AGENT_X_APP_ID='1'\n", ['age1fake'], {
+        exists: () => true,
+        assertIdentityReadable: () => {},
+        decrypt: async () => "MACF_AGENT_Y_APP_ID='2'\n",
+        encrypt: async () => {
+          /* pretend the temp file was written */
+        },
+        rename: () => {
+          throw new Error('simulated rename failure');
+        },
+        unlink: (p) => unlinkedPaths.push(p),
+      });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VaultError);
+      expect((e as VaultError).code).toBe('vault_compose_rename_failed');
+    }
+    expect(readFileSync(vaultPath, 'utf-8')).toBe('ORIGINAL-CIPHERTEXT-UNCHANGED');
+    expect(unlinkedPaths).toHaveLength(1);
+  });
+
+  it.skipIf(!HAS_AGE)(
+    'REAL age binary — the decisive property: composing a SECOND agent into an already-provisioned vault leaves the ' +
+      'FIRST agent\'s secret decryptable, byte-for-byte, alongside the new one (DR-043 Amendment D, groundnuty/macf#989)',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-compose-real-age-test-'));
+      dirs.push(dir);
+      const opKey = mintAgeKey(dir, 'operator-key.txt');
+      const vaultPath = join(dir, 'vault.age');
+
+      // Seed: ONE agent already provisioned (mirrors a real first apply).
+      const scienceAgent: VaultAgentSecrets = {
+        appHandle: deriveAppHandle(FLEET, 'science-agent'),
+        appId: 'app-science-agent',
+        installId: 'install-science-agent',
+        clientId: 'Iv1.science',
+        clientSecret: 'SENTINEL-SCIENCE-CLIENT-SECRET',
+        webhookSecret: 'SENTINEL-SCIENCE-WEBHOOK-SECRET',
+        pem: '-----BEGIN RSA PRIVATE KEY-----\nSCIENCE-PEM-BYTES\n-----END RSA PRIVATE KEY-----\n',
+      };
+      const seedPlaintext = buildVaultPlaintext({ agents: [scienceAgent] });
+      await writeVault(seedPlaintext, { outPath: vaultPath, recipients: [opKey.publicKey] });
+      const seedRaw = parseVaultPlaintext(seedPlaintext);
+
+      // The second agent's fresh receipt — exactly what `applyFleet`'s
+      // `settleVault` would hand to `composeAndWriteVault` this run.
+      const codeAgent: VaultAgentSecrets = {
+        appHandle: deriveAppHandle(FLEET, 'code-agent'),
+        appId: 'app-code-agent',
+        installId: 'install-code-agent',
+        clientId: 'Iv1.code',
+        clientSecret: 'SENTINEL-CODE-CLIENT-SECRET',
+        webhookSecret: 'SENTINEL-CODE-WEBHOOK-SECRET',
+        pem: '-----BEGIN RSA PRIVATE KEY-----\nCODE-PEM-BYTES\n-----END RSA PRIVATE KEY-----\n',
+      };
+      const newPlaintext = buildVaultPlaintext({ agents: [codeAgent] });
+
+      const result = await composeAndWriteVault(vaultPath, opKey.keyPath, newPlaintext, [opKey.publicKey]);
+      expect(result).toEqual({ path: vaultPath, versioned: false });
+
+      // Decrypt the FINAL vault and assert BOTH agents' credentials are present:
+      const afterPlaintext = spawnSync('age', ['-d', '-i', opKey.keyPath, vaultPath], { encoding: 'utf-8' });
+      expect(afterPlaintext.status, afterPlaintext.stderr).toBe(0);
+      const afterRaw = parseVaultPlaintext(afterPlaintext.stdout);
+
+      // The decisive assertion — every prior key survives with its EXACT
+      // prior VALUE (per-key comparison, not whole-plaintext equality —
+      // `serializeVaultRawMap`'s sorted-key output is not byte-identical to
+      // `buildVaultPlaintext`'s insertion-order output even when every value
+      // is unchanged):
+      for (const [key, value] of Object.entries(seedRaw)) {
+        expect(afterRaw[key]).toBe(value);
+      }
+      // The new agent's keys are ALSO present, with THEIR values:
+      const newRaw = parseVaultPlaintext(newPlaintext);
+      for (const [key, value] of Object.entries(newRaw)) {
+        expect(afterRaw[key]).toBe(value);
+      }
+      // Total key count is the sum — nothing extra, nothing missing:
+      expect(Object.keys(afterRaw).sort()).toEqual([...Object.keys(seedRaw), ...Object.keys(newRaw)].sort());
+    },
+  );
+
+  it.skipIf(!HAS_AGE)(
+    'REAL age binary — a WRONG identity (cannot decrypt the CURRENT vault) fails loud and leaves the original vault untouched',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-compose-real-age-test-'));
+      dirs.push(dir);
+      const rightKey = mintAgeKey(dir, 'right-key.txt');
+      const wrongKey = mintAgeKey(dir, 'wrong-key.txt');
+      const vaultPath = join(dir, 'vault.age');
+      await writeVault(buildVaultPlaintext(PAYLOAD), { outPath: vaultPath, recipients: [rightKey.publicKey] });
+      const before = readFileSync(vaultPath);
+
+      try {
+        await composeAndWriteVault(vaultPath, wrongKey.keyPath, "MACF_AGENT_X_APP_ID='1'\n", [rightKey.publicKey]);
+        throw new Error('should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaultError);
+        expect((e as VaultError).code).toBe('vault_decrypt_failed');
+      }
+      // Original vault is byte-for-byte untouched:
+      expect(readFileSync(vaultPath)).toEqual(before);
+      const stillDecrypts = spawnSync('age', ['-d', '-i', rightKey.keyPath, vaultPath], { encoding: 'utf-8' });
+      expect(stillDecrypts.status, stillDecrypts.stderr).toBe(0);
     },
   );
 });
