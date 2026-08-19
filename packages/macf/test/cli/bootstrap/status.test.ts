@@ -204,6 +204,86 @@ describe('computeBootstrapStatus — partially-provisioned fleet (decisive case)
   });
 });
 
+describe('computeBootstrapStatus — 404-ambiguous repo visibility (groundnuty/macf#1026, the live symptom)', () => {
+  // The exact live shape: `macf bootstrap status` run with science-agent's
+  // installation token. code-agent's repo/CA-var/routing-client-secret are
+  // ALL fully present on GitHub — but invisible to THIS token, so
+  // `observer.ts::resolveAgentRepoState` downgrades all three to `'unknown'`
+  // with a diagnostic reason, never the raw `'absent'` the old code produced.
+  const REASON = 'this token cannot see "groundnuty/exp-code-agent" (HTTP 404 reading the repo itself; not installed on it? ...)';
+  const OBSERVED_WITH_INVISIBLE_REPO: ObservedState = {
+    lock: null,
+    agents: {
+      'science-agent': { app: 'unknown', install: 'unknown', repo: 'present', fingerprints: {} },
+      'code-agent': { app: 'unknown', install: 'unknown', repo: 'unknown', repoVisibilityReason: REASON, fingerprints: {} },
+    },
+    caRegistry: 'unknown',
+    caRepos: { 'groundnuty/exp-science-agent': 'present', 'groundnuty/exp-code-agent': 'unknown' },
+    routingClientRepos: { 'groundnuty/exp-science-agent': 'unknown', 'groundnuty/exp-code-agent': 'unknown' },
+    controlRepoPresence: 'unknown',
+  };
+  const manifest = baseManifest({
+    agents: [
+      { role: 'science-agent', profile: 'research', repo: 'groundnuty/exp-science-agent', deploy_path: '/deploy/science-agent' },
+      { role: 'code-agent', profile: 'code', repo: 'groundnuty/exp-code-agent', deploy_path: '/deploy/code-agent' },
+    ],
+  });
+
+  it('DECISIVE — code-agent renders repo/CA(repo)/ROUTING-CLIENT all "unknown", never "absent" — the exact regression this issue fixes', () => {
+    const view = computeBootstrapStatus(manifest, OBSERVED_WITH_INVISIBLE_REPO, {});
+    const code = view.agents.find((a) => a.role === 'code-agent');
+    expect(code?.repoPresence).toBe('unknown');
+    expect(code?.caRepo).toBe('unknown');
+    expect(code?.routingClientRepo).toBe('unknown');
+    expect(code?.repoPresence).not.toBe('absent');
+    expect(code?.caRepo).not.toBe('absent');
+    expect(code?.routingClientRepo).not.toBe('absent');
+  });
+
+  it('the PROVISIONING row embeds the reason inline — "unknown (...)" not a bare "unknown" — in all three affected cells', () => {
+    const view = computeBootstrapStatus(manifest, OBSERVED_WITH_INVISIBLE_REPO, {});
+    const codeRow = buildProvisioningRows(view.agents).find((r) => r[0] === 'code-agent');
+    expect(codeRow).toBeDefined();
+    // REPO, CA(repo), ROUTING-CLIENT are columns 3, 4, 5 (0-indexed) per
+    // PROVISIONING_HEADERS — see buildProvisioningRows.
+    expect(codeRow?.[3]).toContain('unknown (');
+    expect(codeRow?.[3]).toContain('groundnuty/exp-code-agent');
+    expect(codeRow?.[4]).toContain('unknown (');
+    expect(codeRow?.[5]).toContain('unknown (');
+    const text = formatBootstrapStatusText(view);
+    expect(text).toContain('this token cannot see');
+    expect(text).toContain('404');
+  });
+
+  it('the JSON render carries repoVisibilityReason as a fact, not a summary — same posture as every other AgentStatusView field', () => {
+    const view = computeBootstrapStatus(manifest, OBSERVED_WITH_INVISIBLE_REPO, {});
+    const json = bootstrapStatusToJson(view) as { agents: ReadonlyArray<{ role: string; repoVisibilityReason?: string }> };
+    const code = json.agents.find((a) => a.role === 'code-agent');
+    expect(code?.repoVisibilityReason).toBe(REASON);
+    const sci = json.agents.find((a) => a.role === 'science-agent');
+    expect(sci?.repoVisibilityReason).toBeUndefined();
+  });
+
+  it('MUST-NOT-REGRESS — science-agent (visible to this token) renders its present repo cleanly, no reason text leaking in', () => {
+    const view = computeBootstrapStatus(manifest, OBSERVED_WITH_INVISIBLE_REPO, {});
+    const sci = view.agents.find((a) => a.role === 'science-agent');
+    expect(sci?.repoPresence).toBe('present');
+    expect(sci?.repoVisibilityReason).toBeUndefined();
+    const sciRow = buildProvisioningRows(view.agents).find((r) => r[0] === 'science-agent');
+    expect(sciRow?.[3]).toBe('present');
+  });
+
+  it('never renders raw credential material (no PEM/token-shaped strings anywhere in text or JSON)', () => {
+    const view = computeBootstrapStatus(manifest, OBSERVED_WITH_INVISIBLE_REPO, {});
+    const text = formatBootstrapStatusText(view);
+    const json = JSON.stringify(bootstrapStatusToJson(view));
+    expect(text).not.toContain('-----BEGIN');
+    expect(json).not.toContain('-----BEGIN');
+    expect(text).not.toMatch(/ghs_|ghp_/);
+    expect(json).not.toMatch(/ghs_|ghp_/);
+  });
+});
+
 describe('computeBootstrapStatus — honest unknown, never absent, on unreadable resources', () => {
   it('an unread CA registry var + unread agent fields render "unknown", never "absent"', () => {
     const observed: ObservedState = {

@@ -66,6 +66,16 @@ export interface AgentStatusView {
   readonly repoPresence: Presence;
   readonly caRepo: Presence;
   readonly routingClientRepo: Presence;
+  /**
+   * WHY `repoPresence`/`caRepo`/`routingClientRepo` read `'unknown'` instead
+   * of a committed value — set only when that downgrade happened
+   * (groundnuty/macf#1026: a 404 on a per-agent repo-scoped resource is
+   * ambiguous between "doesn't exist" and "this token can't see it," so a
+   * confident `'absent'` requires independently proving the caller can see
+   * the repo first — see `observer.ts::resolveAgentRepoState`). `undefined`
+   * when `repoPresence === 'present'` (nothing to explain).
+   */
+  readonly repoVisibilityReason?: string;
   readonly fingerprintCount: number;
   readonly deployedVersion?: string;
   readonly actionsPin?: string;
@@ -153,6 +163,7 @@ function buildAgentView(
     repoPresence: obs?.repo ?? 'unknown',
     caRepo: observed.caRepos[agent.repo] ?? 'unknown',
     routingClientRepo: observed.routingClientRepos?.[agent.repo] ?? 'unknown',
+    repoVisibilityReason: obs?.repoVisibilityReason,
     fingerprintCount: Object.keys(obs?.fingerprints ?? {}).length,
     deployedVersion: obs?.deployedVersion,
     actionsPin: obs?.actionsPin,
@@ -268,6 +279,19 @@ function presenceCell(p: Presence, id: string | undefined): string {
   return p;
 }
 
+/**
+ * REPO / CA(repo) / ROUTING-CLIENT cell renderer — the same "say why"
+ * treatment {@link formatVaultAgentCell}/{@link formatVaultCaCell} already
+ * give an `unknown` vault read, applied to the groundnuty/macf#1026
+ * repo-visibility downgrade: a bare `unknown` cell can't distinguish "never
+ * observed" from "this token cannot see the repo," and the latter is
+ * actionable (check the App's install scope) in a way the former isn't.
+ */
+function repoScopedCell(p: Presence, reason: string | undefined): string {
+  if (p === 'unknown' && reason !== undefined) return `unknown (${reason})`;
+  return p;
+}
+
 function formatVaultAgentCell(vault: VaultAgentObservation | undefined): string {
   if (vault === undefined) return 'not read this run';
   if (vault.status === 'unknown') return `unknown (${vault.reason})`;
@@ -288,9 +312,9 @@ export function buildProvisioningRows(agents: readonly AgentStatusView[]): reado
     a.role,
     presenceCell(a.app, a.appId),
     presenceCell(a.install, a.installId),
-    a.repoPresence,
-    a.caRepo,
-    a.routingClientRepo,
+    repoScopedCell(a.repoPresence, a.repoVisibilityReason),
+    repoScopedCell(a.caRepo, a.repoVisibilityReason),
+    repoScopedCell(a.routingClientRepo, a.repoVisibilityReason),
     a.fingerprintCount > 0 ? `${String(a.fingerprintCount)} fingerprint(s)` : 'none recorded',
     a.deployedVersion ?? 'unknown',
     a.actionsPin ?? 'unknown',
