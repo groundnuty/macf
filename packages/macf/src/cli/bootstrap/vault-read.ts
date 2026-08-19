@@ -595,6 +595,56 @@ export function queryVaultRoutingPresence(raw: Readonly<Record<string, string>>)
   };
 }
 
+/**
+ * Decode the routing-client CERT PEM out of an already-decrypted vault raw
+ * map — the routing-client sibling of {@link vaultCaCertPem} (groundnuty/
+ * macf#986: minting the routing-client cert is fleet-scoped, but PUBLISHING
+ * it to a repo is per-repo — a repo added to the fleet AFTER the cert was
+ * minted in a prior run needs its cert/key re-read from the vault, not a
+ * re-mint). Fleet-level, not per-project — mirrors
+ * {@link queryVaultRoutingPresence}'s own un-prefixed `ROUTING_CLIENT_CERT_B64`
+ * key (see `vault-write.ts::VaultRoutingClientSecrets`'s doc for why: the
+ * routing-client cert is ONE fleet-wide credential, `CN=routing-action`,
+ * never per-agent or per-project, so there is no `project`/`fleetName`
+ * parameter to key on here, unlike {@link vaultCaCertPem}).
+ *
+ * Public material (a cert) — same never-log discipline as
+ * {@link vaultCaCertPem} anyway (see that function's doc for why "public"
+ * doesn't mean "safe to print here"). Returns `undefined` when the field is
+ * absent or empty — never fabricates a cert.
+ */
+export function vaultRoutingClientCertPem(raw: Readonly<Record<string, string>>): string | undefined {
+  const b64 = raw['ROUTING_CLIENT_CERT_B64'];
+  if (b64 === undefined || b64.length === 0) return undefined;
+  return Buffer.from(b64, 'base64').toString('utf-8');
+}
+
+/**
+ * Decode the routing-client PRIVATE KEY PEM out of an already-decrypted
+ * vault raw map (groundnuty/macf#986) — the routing-client sibling of
+ * {@link vaultAgentPrivateKeyPem}/{@link vaultRunnerOpsPrivateKeyPem} (a
+ * THIRD raw-PRIVATE-KEY-secret-returning query in this module). Same
+ * fleet-level keying as {@link vaultRoutingClientCertPem} — see that
+ * function's doc.
+ *
+ * **Caller obligation — same as {@link vaultAgentPrivateKeyPem}.** The
+ * returned string MUST NOT be logged, printed, or embedded in an
+ * error/exception message. The only legitimate use is
+ * `apply-routing-client.ts::realSetRepoSecret`'s STDIN pipe to `gh secret
+ * set` — never a scratch file on disk (unlike an agent's App private key,
+ * this credential never needs to mint a JWT, so it never needs the
+ * `writeScratchPem`/`cleanupScratchPem` 0600-scratch-file treatment
+ * {@link vaultAgentPrivateKeyPem}'s callers use).
+ *
+ * Returns `undefined` when the field is absent or empty — never fabricates
+ * a key.
+ */
+export function vaultRoutingClientKeyPem(raw: Readonly<Record<string, string>>): string | undefined {
+  const b64 = raw['ROUTING_CLIENT_KEY_B64'];
+  if (b64 === undefined || b64.length === 0) return undefined;
+  return Buffer.from(b64, 'base64').toString('utf-8');
+}
+
 export interface VaultPresenceCount {
   readonly present: number;
   readonly total: number;

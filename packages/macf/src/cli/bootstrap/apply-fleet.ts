@@ -254,8 +254,13 @@ import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } f
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import type { RunnerRegistrationDeps, RunnerTokenPollOptions } from './apply-routing.js';
 import { formatRunnerPollProgress, publishTrustedActorsGated } from './apply-routing.js';
-import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientPublishResult } from './apply-routing-client.js';
-import { mintRoutingClient, publishRoutingClientSecrets, skippedRoutingClientPublish } from './apply-routing-client.js';
+import type {
+  RoutingClientApplyDeps,
+  RoutingClientMintOutcome,
+  RoutingClientPublishResult,
+  RoutingClientSecretsForPublish,
+} from './apply-routing-client.js';
+import { mintRoutingClient, publishRoutingClientSecrets, resolveRoutingClientSecretsForPublish, skippedRoutingClientPublish } from './apply-routing-client.js';
 import type { VaultRecipientCountResult } from './vault-read.js';
 import { readVaultRecipientCount, reencryptVault } from './vault-read.js';
 
@@ -1036,32 +1041,63 @@ export async function applyFleet(
   }
 
   // Per-repo routing-client secret deploy (DR-043 §D5 "routing-client
-  // re-mint," groundnuty/macf#920 gap 2) — same ordering rule as the CA cert
-  // above: only deploy a freshly-minted cert/key once its key is confirmed
-  // durable (`vault.status === 'written'`); a mint that was SKIPPED (reused
-  // CA, or already-vaulted routing-client — both benign) OR FAILED
-  // (groundnuty/macf#954 — a genuine mint exception) publishes NOTHING —
-  // every leg reads `'skipped'` with the reason, never silent. The
-  // SKIPPED-vs-FAILED distinction itself is carried on `routingClientMint`
-  // (not here) — `applyExitCode` reads it to decide the exit code.
-  let routingClientSkipReason: string | undefined;
+  // re-mint," groundnuty/macf#920 gap 2; per-repo publish groundnuty/macf#986)
+  // — three cases, deliberately kept as three DISTINCT branches rather than
+  // one blanket "always run the loop" so the two byte-identical-with-pre-#986
+  // cases stay verifiably untouched:
+  //
+  //   1. A cert freshly minted THIS run whose key isn't confirmed durable
+  //      yet (`vault.status !== 'written'`) publishes NOTHING — same
+  //      ordering-safety rule as the CA cert above (deploying an unvaulted
+  //      key would recreate the #799 orphan-cert class). fleet.lock never
+  //      recorded a fingerprint for this run's key, so a retry safely
+  //      re-mints; nothing is orphaned. UNCHANGED from pre-#986.
+  //   2. A cert freshly minted THIS run with its key durable -> publish the
+  //      in-memory material directly, exactly as before (just re-expressed
+  //      through the same `RoutingClientSecretsForPublish` shape case 3
+  //      below uses). UNCHANGED from pre-#986.
+  //   3. Mint was SKIPPED because `lockHasRoutingClientKey` — a PRIOR run
+  //      already minted this fleet's routing-client cert (the ONLY case
+  //      `mintRoutingClient` can return 'skipped' for when this boolean is
+  //      true). THIS is the case #986 is about: a repo added to the fleet
+  //      AFTER that prior mint needs the cert/key published to it, not a
+  //      re-mint. `resolveRoutingClientSecretsForPublish` tries a
+  //      vault-restore (only when `--vault`/`--identity-key` were both
+  //      supplied) before degrading to an honest 'unavailable';
+  //      `publishRoutingClientSecrets` THEN always runs its per-repo
+  //      idempotent loop — `'already-present'` for a repo that already has
+  //      the secret, a loud `'failed'` (never a silent `'skipped'`) for one
+  //      that's missing it and has no material to create it with.
+  //
+  // Every OTHER skip/failure shape — mint skipped because CA was reused and
+  // NOTHING has ever been minted for this fleet (`!lockHasRoutingClientKey`),
+  // or a genuine mint EXCEPTION (groundnuty/macf#954; only reachable when
+  // `!lockHasRoutingClientKey` too, since `mintRoutingClient` only calls
+  // `deps.mint` on that branch) — has NOTHING recoverable from the vault
+  // either way (nothing was ever minted to restore), so it stays the
+  // ORIGINAL blanket `skippedRoutingClientPublish`, byte-identical to
+  // pre-#986 behaviour. Verified against `apply-fleet.test.ts`'s existing
+  // CA-restore fixture (macf#978), which reuses this exact shape
+  // (`lockHasRoutingClientKey === false`, CA restored not minted) and must
+  // NOT start failing `apply`'s exit code over an orthogonal CA concern.
+  let routingClientPublish: RoutingClientPublishResult;
   if (routingClientMint.status === 'minted' && vault.status !== 'written') {
-    routingClientSkipReason =
+    routingClientPublish = skippedRoutingClientPublish(
+      confirmedRepos,
       'routing-client cert was freshly minted this run but the batched vault write did not succeed — refusing to ' +
-      'deploy the private key to any repo until it is durable (DR-043 §D5). Re-run apply once the vault issue is ' +
-      "fixed. The retry re-mints (fleet.lock never recorded a routing_client_key fingerprint), which is harmless: " +
-      "this run's key was never made durable and was never deployed, so nothing is orphaned.";
-  } else if (routingClientMint.status === 'skipped' || routingClientMint.status === 'failed') {
-    routingClientSkipReason = routingClientMint.reason;
+        'deploy the private key to any repo until it is durable (DR-043 §D5). Re-run apply once the vault issue is ' +
+        "fixed. The retry re-mints (fleet.lock never recorded a routing_client_key fingerprint), which is harmless: " +
+        "this run's key was never made durable and was never deployed, so nothing is orphaned.",
+    );
+  } else if (routingClientMint.status === 'minted') {
+    const secretsForPublish: RoutingClientSecretsForPublish = { status: 'available', certPem: routingClientMint.certPem, keyPem: routingClientMint.keyPem };
+    routingClientPublish = await publishRoutingClientSecrets(secretsForPublish, confirmedRepos, deps.routingClientDeps);
+  } else if (lockHasRoutingClientKey) {
+    const secretsForPublish = await resolveRoutingClientSecretsForPublish(routingClientMint, true, deps.routingClientDeps);
+    routingClientPublish = await publishRoutingClientSecrets(secretsForPublish, confirmedRepos, deps.routingClientDeps);
+  } else {
+    routingClientPublish = skippedRoutingClientPublish(confirmedRepos, routingClientMint.reason);
   }
-  const routingClientPublish: RoutingClientPublishResult =
-    routingClientMint.status === 'minted' && vault.status === 'written'
-      ? await publishRoutingClientSecrets(
-          { certPem: routingClientMint.certPem, keyPem: routingClientMint.keyPem },
-          confirmedRepos,
-          deps.routingClientDeps,
-        )
-      : skippedRoutingClientPublish(confirmedRepos, routingClientSkipReason ?? 'routing-client cert unresolved');
   deps.log(
     `Routing-client cert legs: ${String(Object.values(routingClientPublish.certLegs).filter((l) => l.status === 'created').length)} created, ` +
       `${String(Object.values(routingClientPublish.certLegs).filter((l) => l.status === 'already-present').length)} already-present of ` +
