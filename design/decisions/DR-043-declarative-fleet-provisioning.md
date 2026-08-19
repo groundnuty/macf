@@ -522,6 +522,24 @@ The wrong order does not merely open a transient gap: **on partial failure it is
 
 **`macf#934` must land BEFORE `apply` calls `provision --labels`.** The gate resolves presence and visibility but never compares labels; today that gap is masked by the convention that every runner carries `macf-vm`. A caller-supplied `--labels` is precisely the mechanism that unmasks it — wiring the call first would take a latent gap and hand it a trigger.
 
+
+### I5 — "terminal" means `destroy` skips ARCHIVING, not everything below it (2026-08-16, #939)
+
+I3 gave the ladder its runner rung at `deactivate`. Amendment G, however, states `deactivate ⊂ archive ⊂ delete-apps`; **`destroy` is terminal** — so `archive` and `delete-apps` inherit the rung, and **`destroy` inherits nothing.** Traced through, that produces a specific and ironic outcome:
+
+- variable never unset, runner never destroyed, repos deleted → **no stall** (no repo, no jobs), but the **runner is orphaned** — a scale set for a repository that no longer exists;
+- so **the one verb whose entire purpose is to leave nothing behind is the only rung that cannot reclaim a runner**, which is precisely the teardown-incompleteness I3 exists to close.
+
+**And the obvious fix, applied alone, is worse than the leak.** Adding runner-destroy to `destroy` without the ordering opens the stall door there: a partial repo-deletion failure would strand a live repo with `MACF_TRUSTED_ACTORS` set and no runner — converting a resource leak into a silent coordination death, the wrong side of Amendment H's asymmetry. **The rung and its ordering must land in the same change.**
+
+**Correction:** *terminal* means `destroy` **skips the archiving step** — for G's stated reason, that archiving something about to be deleted is pointless — and **not** that it skips the rungs below it. `destroy` performs `deactivate`'s work in its mandatory order (unset `MACF_TRUSTED_ACTORS`, then `runnerctl destroy`), then deletes Apps and repositories.
+
+**The orphan's blast radius is plausibly cross-fleet, and is UNVERIFIED (`macf-devops-agent[bot]`, #939).** Characterising it as "an idle warm pod" may understate it: with `warm: 1` the RunnerDeployment keeps a pod alive and the controller keeps attempting to **register it against a repository that no longer exists**, using the *platform's* App credential. If that produces repeated failed registrations, the leak is a **rate-limit surface shared by every other fleet on the platform**, not wasted CPU in one namespace — which would raise this from tidiness to a cross-tenant concern. Recorded as *expected-but-unverified* rather than asserted: there is no cluster yet, and devops owns confirming it at canary and reporting either way. **The severity is open; the correction above is not contingent on it.**
+
+**It is cheaply detectable in the meantime.** Every object the platform creates carries `app.kubernetes.io/managed-by=runner-platform` and a `runner-platform.io/repo` annotation holding the un-sanitised repo, and the list endpoint selects on that label and returns the annotation. So an orphan is one call away from being listed *with the dead repo's name attached*, and reconciling that list against live repos is a comparison rather than an investigation — a reasonable thing for `macf fleet doctor` to fold in later, requiring no new mechanism.
+
+**Why this recurred:** the ladder's **composition semantics** were stated compactly — `⊂` for three rungs and one word, *terminal*, for the fourth — and the compact form was ambiguous about exactly the case that mattered. Same class as macf#917, where `⊂` mandated re-execution without stating the idempotency it requires. A ladder's *joins* need as much specification as its rungs; both defects lived in the composition rather than in any step.
+
 **References:** #939 (this amendment) · H2 (the clause replaced) · H.1 (confirmed unchanged) · Amendment G (the ladder gaining the rung) · #934 (the ordering dependency) · `macf-devops-toolkit` DR-009 §10.3 (the mechanical justification: *"it can destroy one, which the VM path cannot do at all"*).
 
 
