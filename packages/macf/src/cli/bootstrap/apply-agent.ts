@@ -149,7 +149,17 @@ import type { Presence } from './plan.js';
 
 export type CreateGuardDecision =
   | { readonly action: 'create' }
-  | { readonly action: 'reuse-confirmed'; readonly install: ConfirmedInstall }
+  /**
+   * `keyPath` (groundnuty/macf#1012) — the SAME decryptable PEM path used to
+   * live-reconfirm this install, carried forward so `applyIdentity` can run
+   * `AgentApplyDeps.validateInstall` on THIS path too, not only on the
+   * CREATE/`resume-install` paths that flow through `runGate2`. Without it,
+   * a post-gate-2 live check (e.g. registry-repo installation coverage)
+   * would be structurally silent on every already-provisioned role re-
+   * confirmed on a re-run — see `registry-repo-coverage.ts`'s "Coverage
+   * scope" doc section for why that gap matters concretely.
+   */
+  | { readonly action: 'reuse-confirmed'; readonly install: ConfirmedInstall; readonly keyPath: string }
   | { readonly action: 'resume-install'; readonly appId: string; readonly keyPath: string }
   | { readonly action: 'skip-unverified'; readonly appId: string; readonly reason: string }
   | { readonly action: 'drift'; readonly reason: string; readonly installs: readonly ConfirmedInstall[] };
@@ -205,7 +215,7 @@ export async function confirmBeforeCreateGuard(
   const confirmation = await deps.confirmAppInstallation(prior.app_id, keyPath, expected);
   switch (confirmation.status) {
     case 'confirmed':
-      return { action: 'reuse-confirmed', install: confirmation.install };
+      return { action: 'reuse-confirmed', install: confirmation.install, keyPath };
     case 'app-no-install':
       return { action: 'resume-install', appId: prior.app_id, keyPath };
     case 'installed-unexpected-target':
@@ -292,21 +302,56 @@ export interface AgentApplyDeps {
    */
   readonly findRecoveryArtifact?: (role: string) => Promise<AppCredentials | undefined>;
   /**
-   * Post-gate-2 install validation (groundnuty/macf#943) — called with the
-   * `ConfirmedInstall` gate 2 just observed, BEFORE this module reports
-   * `'created'`/`'resumed-install'`. Returns a rejection reason string to
-   * fail the identity apply, `undefined` to accept. `undefined`/omitted
-   * (every ordinary agent's deps) preserves the pre-#943 behavior exactly —
-   * gate 2 succeeding is always sufficient. The runner-ops is the only
-   * caller that supplies this (asserting `repositorySelection === 'selected'`
-   * — GitHub's App-manifest flow has no field to FORCE the install-time repo
-   * scope at creation, so this is the verify-then-refuse enforcement point;
-   * see `apply-runner-ops.ts`'s doc). A rejection here does NOT delete
+   * Post-install validation — called with the `ConfirmedInstall` just
+   * observed PLUS the decryptable key path used to observe it (groundnuty/
+   * macf#1012 added the `keyPath` param; originally install-only, macf#943),
+   * BEFORE this module reports `'created'`/`'resumed-install'`/`'reused'`.
+   * Called on EVERY path that resolves a `ConfirmedInstall` — the CREATE
+   * path, `resume-install` (both via `runGate2`), AND `reuse-confirmed`
+   * (an already-provisioned role re-confirmed live on a re-run — see
+   * `applyIdentity`'s `decision.action === 'reuse-confirmed'` branch). May
+   * return synchronously OR a `Promise` — `runGate2`/`applyIdentity` always
+   * `await` the result, so a plain sync return (every pre-#1012 caller)
+   * resolves immediately with no behavior change. Returns a rejection
+   * reason string to fail the identity apply, `undefined` to accept.
+   * `undefined`/omitted (every ordinary agent's deps pre-#1012) preserves
+   * the pre-#943 behavior exactly — a confirmed install is always
+   * sufficient. Two callers supply this today: the runner-ops
+   * (`apply-runner-ops.ts::validateRunnerOpsInstall`, asserting
+   * `repositorySelection === 'selected'` — GitHub's App-manifest flow has no
+   * field to FORCE the install-time repo scope at creation, so this is the
+   * verify-then-refuse enforcement point; see that module's doc) and, when
+   * `registry.type === 'repo'`, every ordinary agent (`apply-fleet.ts`
+   * wiring `registry-repo-coverage.ts::buildRegistryRepoValidateInstall` —
+   * verifies the registry repo is actually reachable by this App's
+   * installation; see that module's doc). A rejection here does NOT delete
    * the App or the install — same "GitHub App-name uniqueness is the retry
    * safety net" posture the rest of this module's gate-2 failures already
    * rely on (module doc's "gate 1→2 window" section).
    */
-  readonly validateInstall?: (install: ConfirmedInstall) => string | undefined;
+  readonly validateInstall?: (install: ConfirmedInstall, keyPath: string) => string | undefined | Promise<string | undefined>;
+  /**
+   * Post-REUSE validation (groundnuty/macf#1012) — SEPARATE from
+   * {@link validateInstall} on purpose, checked in
+   * `applyIdentity`'s `decision.action === 'reuse-confirmed'` branch only.
+   * `validateInstall` is invoked for the runner-ops (`apply-runner-ops.ts::
+   * validateRunnerOpsInstall`) on the CREATE/`resume-install` paths (via
+   * `runGate2`) — reusing that SAME hook for `reuse-confirmed` too would
+   * have silently started re-checking `repository_selection` on every
+   * runner-ops REUSE, a behavior change for an EXISTING caller this issue
+   * never asked for (confirmed empirically: doing so broke 6 unrelated
+   * `apply-fleet`/`bootstrap-apply` tests whose fixtures never populate
+   * `repositorySelection` on a reuse-confirmed install, because nothing
+   * checked it there before). A dedicated field means a caller opts a
+   * ROLE's REUSE path in explicitly (today: only the registry-repo-coverage
+   * check, `apply-fleet.ts` wiring `registry-repo-coverage.ts::
+   * buildRegistryRepoValidateInstall` onto BOTH `validateInstall` AND this
+   * field for ordinary agents when `registry.type === 'repo'`) rather than
+   * inheriting it implicitly. `undefined`/omitted (every pre-#1012 caller,
+   * and the runner-ops today) means reuse is never re-validated — preserves
+   * pre-#1012 behavior exactly.
+   */
+  readonly validateReuse?: (install: ConfirmedInstall, keyPath: string) => string | undefined | Promise<string | undefined>;
   /**
    * Pre-flight App-NAME-collision check (groundnuty/macf#967 Defect 2) — run
    * ONLY on the `decision.action === 'create'` path (NO `fleet.lock` entry
@@ -555,6 +600,19 @@ export async function applyIdentity(
   }
 
   if (decision.action === 'reuse-confirmed') {
+    // groundnuty/macf#1012 — `validateReuse` (DELIBERATELY separate from
+    // `validateInstall` — see that field's doc for why sharing one hook
+    // would have silently widened the runner-ops's `repository_selection`
+    // check onto every reuse, a behavior change for an existing caller this
+    // issue never asked for). An already-provisioned role re-confirmed on a
+    // re-run is exactly the shape a registry-repo-coverage regression would
+    // otherwise hit silently — the fleet was already `reused`, never
+    // touching `runGate2` again.
+    const rejection = await deps.validateReuse?.(decision.install, decision.keyPath);
+    if (rejection !== undefined) {
+      deps.log(`Role "${role}": REFUSED on reuse — ${rejection}`);
+      return { role, status: 'failed', reason: `existing install re-verification rejected: ${rejection}` };
+    }
     deps.log(`Role "${role}": App + install already confirmed live (app_id ${decision.install.appId}) — nothing to do.`);
     return { role, status: 'reused', appId: decision.install.appId, installId: decision.install.installId };
   }
@@ -825,8 +883,11 @@ async function runGate2(
     // `AgentApplyDeps.validateInstall`'s doc). Checked BEFORE reporting
     // success: a rejection here means gate 2 technically completed but the
     // install doesn't satisfy this identity's own contract (e.g. the
-    // runner-ops's repository_selection !== 'selected').
-    const rejection = deps.validateInstall?.(install);
+    // runner-ops's repository_selection !== 'selected', or — macf#1012 —
+    // the registry repo isn't reachable by this install). `await`ed
+    // unconditionally: `validateInstall` may return sync or async (see its
+    // doc), and `await` on a plain value resolves immediately.
+    const rejection = await deps.validateInstall?.(install, keyPath);
     if (rejection !== undefined) {
       return { role, status: 'failed', reason: `consent gate 2 (install) rejected: ${rejection}` };
     }

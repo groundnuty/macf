@@ -121,9 +121,57 @@ export function registryScopeUnsatisfiableReason(org: string): string {
     'ordinary agent App\'s manifest derives its permissions solely from MACF_REQUIRED_PERMISSIONS (DR-019, ' +
     'packages/macf/src/cli/commands/doctor.ts), which contains no organization-scoped permission — so no App ' +
     '`macf bootstrap` provisions can read GET /orgs/{org}/actions/variables/{name}, independent of install scope. ' +
-    'registry: { type: profile, user: <account> } works today (DR-006) — the substrate fleet uses it. The ' +
-    'resolution (repo-scoping the registry onto the control repo, widening the permission set, or declaring org ' +
-    'scope unsupported) is open — see groundnuty/macf#999. Refusing before any consent gate opens; nothing on ' +
-    'GitHub was touched.'
+    'registry: { type: profile, user: <account> } works today (DR-006) — the substrate fleet uses it. For an ' +
+    'org-owned fleet specifically, registry: { type: repo, owner: <org>, repo: <org-owned-repo> } is ALSO ' +
+    "supported today (groundnuty/macf#1012) — apply verifies live, per App, that every agent's installation " +
+    'actually covers that repo. The resolution for `type: org` itself (widening the permission set, or declaring ' +
+    'org scope unsupported outright) is open — see groundnuty/macf#999. Refusing before any consent gate opens; ' +
+    'nothing on GitHub was touched.'
+  );
+}
+
+// --- groundnuty/macf#1012: `registry.type === 'repo'` plan-time notice ---
+
+/** Distinct from `REGISTRY_SCOPE_UNSATISFIABLE_CODE` and its siblings — lets a caller/log tell this NOTICE (never a refusal) apart from the org-scope conflict. */
+export const REGISTRY_REPO_SCOPE_NOTICE_CODE = 'registry_repo_scope_requires_full_install_coverage';
+
+/** The shape `plan.ts`'s `FleetPlan.registryRepoScopeNotices` carries — a notice, never a refusal (`plan` never refuses on a manifest fact alone; see this function's doc). */
+export interface RegistryRepoScopeNotice {
+  readonly code: typeof REGISTRY_REPO_SCOPE_NOTICE_CODE;
+  readonly message: string;
+}
+
+/**
+ * groundnuty/macf#1012 requirement 4 — `plan` states, from the manifest
+ * alone, that `registry: { type: repo, ... }` needs every agent App
+ * installed on the registry repo, BEFORE the operator spends any
+ * consent-gate clicks. Unlike {@link checkRegistryScopePreflight}
+ * (`type: org`), this is a NOTICE, never a refusal — `plan` never refuses on
+ * a manifest fact alone (see this module's own org-scope doc + `plan.ts`'s
+ * `checkVaultFlagsComplete` doc for the contrast), and `type: repo` itself
+ * IS satisfiable (unlike `type: org` — see this module's top doc); what is
+ * unverified at PLAN time is a LIVE per-install fact this function cannot
+ * observe (no App/install exists yet before `apply`'s consent gate 1 — see
+ * `registry-repo-coverage.ts`'s doc for why the live check can only run
+ * post-gate-2). `undefined` for every registry type except `'repo'`.
+ */
+export function checkRegistryRepoScopeNotice(owner: FleetOwner): RegistryRepoScopeNotice | undefined {
+  if (owner.registry.type !== 'repo') return undefined;
+  return {
+    code: REGISTRY_REPO_SCOPE_NOTICE_CODE,
+    message: registryRepoScopeNoticeText(owner.registry.owner, owner.registry.repo),
+  };
+}
+
+/** The notice text — see {@link checkRegistryRepoScopeNotice}'s doc for what this states and why `plan` never refuses on it. */
+export function registryRepoScopeNoticeText(owner: string, repo: string): string {
+  return (
+    `registry: { type: repo, owner: "${owner}", repo: "${repo}" } requires EVERY declared agent App's ` +
+    `installation to include ${owner}/${repo} — an App installed with "Only select repositories" that omits it ` +
+    "would provision successfully and then be unable to read/write its own registry entry (groundnuty/macf#999's " +
+    "exact failure mode). `macf bootstrap apply` verifies this live, per App, right after each App's install is " +
+    'confirmed (consent gate 2) — and refuses, naming the App and the repo, if any App is missing it ' +
+    '(groundnuty/macf#1012). Nothing to do here except be aware: when the install page opens for each agent, make ' +
+    `sure the repo list you select includes ${owner}/${repo}.`
   );
 }

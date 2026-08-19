@@ -3670,4 +3670,139 @@ trust:
       },
     );
   });
+
+  // groundnuty/macf#1012 — repo-scoped registry install-coverage. A manifest
+  // whose `owner.registry.type === 'repo'`; `deriveAppHandle('demo-fleet',
+  // 'code-agent')` === 'demo-fleet-code-agent' throughout.
+  describe('groundnuty/macf#1012 — registry-repo installation-coverage', () => {
+    function repoScopedManifest(agents: readonly FleetAgent[] = [CODE_AGENT]): FleetManifest {
+      return {
+        ...manifestWith(agents),
+        owner: { account: 'demo-org', type: 'org', registry: { type: 'repo', owner: 'demo-org', repo: 'demo-org-registry' } },
+      };
+    }
+
+    it('DECISIVE: an App whose install lacks the registry repo -> REFUSES, the failure reason names the App and the repo, and the overall apply outcome is non-zero', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = repoScopedManifest();
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        checkRegistryRepoCoverage: async () => 'absent',
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('failed');
+      const identity = result.agents[0]?.identity;
+      const reason = identity && identity.status === 'failed' ? identity.reason : '';
+      expect(reason).toContain('demo-fleet-code-agent'); // deriveAppHandle('demo-fleet', 'code-agent') — WHICH App
+      expect(reason).toContain('demo-org/demo-org-registry'); // WHICH repo
+      // The overall apply outcome reaches a non-zero exit — a refusal here
+      // must not be swallowed into a green run (mirrors this file's own
+      // "applyExitCode gates on ... an explicit equality check" convention
+      // used elsewhere in this describe block).
+      expect(applyExitCode(result)).not.toBe(0);
+    });
+
+    it('every App includes the registry repo ("present") -> proceeds, no churn (an already-reused role stays reused)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = repoScopedManifest();
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      let checkCalls = 0;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        checkRegistryRepoCoverage: async () => {
+          checkCalls += 1;
+          return 'present';
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      // `applyExitCode` is NOT asserted here — this fixture's shared
+      // `agentDepsFor('code-agent', ...)` object is ALSO handed to the
+      // runner-ops (this file's documented "one AgentApplyDeps per role via
+      // buildAgentDeps" convention), whose `waitForAppInstallation` fake
+      // therefore returns an install with no `repositorySelection`, which
+      // `validateRunnerOpsInstall` correctly rejects — an orthogonal,
+      // PRE-EXISTING fixture artifact unrelated to #1012 (the SAME shape
+      // every other `agentDepsFor('code-agent', 'reused', ...)` test in this
+      // file already has, none of which assert `applyExitCode` either). The
+      // load-bearing assertion for THIS test is `identity.status`.
+      expect(result.agents[0]?.identity.status).toBe('reused');
+      // Verified on the REUSE path too (groundnuty/macf#1012's headline
+      // gap — an already-provisioned role re-confirmed on a re-run): the
+      // check actually ran, it just didn't reject.
+      expect(checkCalls).toBeGreaterThan(0);
+    });
+
+    it('the repo list is unreadable -> UNKNOWN, never "missing" — does not block, but the run reports it', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = repoScopedManifest();
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      const logs: string[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        log: (line: string) => logs.push(line),
+        checkRegistryRepoCoverage: async () => 'unknown',
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      // Honest-unknown never blocks (DR-043 Amendment A) — the role is
+      // still reused. (`applyExitCode` not asserted — see the sibling
+      // "present" test above for why this fixture's shared `agentDepsFor`
+      // makes the runner-ops leg an orthogonal, pre-existing non-zero exit
+      // unrelated to this check.)
+      expect(result.agents[0]?.identity.status).toBe('reused');
+      // But the run REPORTS it — a warning naming the App + repo reaches
+      // the operator-visible log, not silently dropped:
+      const joined = logs.join('\n');
+      expect(joined).toContain('demo-fleet-code-agent');
+      expect(joined).toContain('demo-org/demo-org-registry');
+      expect(joined).toMatch(/UNKNOWN/);
+    });
+
+    it('profile scope (registry.type !== "repo") is byte-identical: checkRegistryRepoCoverage is NEVER invoked', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]); // default owner.registry.type === 'profile'
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        checkRegistryRepoCoverage: async () => {
+          throw new Error('must not be called — registry.type is "profile", not "repo"');
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      // `applyExitCode` not asserted — see the "present" test above for why
+      // this fixture's shared `agentDepsFor` makes the runner-ops leg an
+      // orthogonal, pre-existing non-zero exit unrelated to this check.
+      expect(result.agents[0]?.identity.status).toBe('reused');
+    });
+
+    // groundnuty/macf#950/#951's "never All repositories" runner-ops refusal
+    // is verified UNCHANGED by this file's PRE-EXISTING test
+    // ('repository_selection scoped to fleet repos — an "all"-scoped install
+    // is REFUSED, never silently accepted', in the CA/routing-client
+    // describe block above) remaining green after this describe block's
+    // changes — `validateReuse` (macf#1012's new hook) is deliberately NEVER
+    // wired for the runner-ops (`runnerOpsDeps` only sets `validateInstall:
+    // validateRunnerOpsInstall`, unchanged), so its reuse path is not newly
+    // re-validated. No additional test is needed here; a redundant one would
+    // just re-assert what that test already covers.
+  });
 });
