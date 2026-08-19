@@ -30,6 +30,7 @@ import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
 import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
 import { writeVault } from '../../../src/cli/bootstrap/vault-write.js';
+import { parseVaultPlaintext } from '../../../src/cli/bootstrap/vault-read.js';
 import { applyExitCode, fleetApplyResultToJson, formatApplyResult } from '../../../src/cli/commands/bootstrap-apply.js';
 import { resolveAgeGate } from './age-binary-gate.js';
 
@@ -231,7 +232,7 @@ const NOOP_ROUTING_CLIENT_DEPS: RoutingClientApplyDeps = routingClientDepsFor();
 // never faked, when `age`/`age-keygen` are absent from PATH — same
 // convention as `vault-write.test.ts`'s `HAS_AGE`; see `age-binary-gate.ts`
 // for why an absent binary WARNS locally and FAILS in CI (macf#963).
-const HAS_AGE = resolveAgeGate('apply-fleet.test.ts', 2);
+const HAS_AGE = resolveAgeGate('apply-fleet.test.ts', 3);
 
 function mintAgeKey(dir: string, name: string): { keyPath: string; publicKey: string } {
   const keyPath = join(dir, name);
@@ -2913,5 +2914,322 @@ trust:
       expect(result.agents[0]?.identity.status).toBe('created');
       expect(result.vault.status).toBe('written');
     });
+  });
+
+  // --- Adding an agent to an ALREADY-VAULTED fleet (DR-043 Amendment D,
+  // groundnuty/macf#989) — the vault-exists compose path. Before this fix,
+  // `settleVault` unconditionally called `writeVault`, which REFUSES to
+  // overwrite an existing `vault.age` — so a run that opened + spent BOTH
+  // consent gates for a genuinely new agent reported that agent `CREATED`
+  // while its just-minted credential was discarded (never durably
+  // recorded anywhere reachable). See the issue for the full incident.
+  describe('vault-exists compose path (DR-043 Amendment D, groundnuty/macf#989)', () => {
+    /** Mirrors the recipient-reconciliation describe block's own helper — CA registry already has a cert, so `resolveCaCert` REUSES rather than mints (keeps a test's "nothing pending" precondition free of CA noise). */
+    function reuseTrustDeps(): CaApplyDeps & RunnerRegistrationDeps {
+      return trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' });
+    }
+
+    it('vault already exists, no --identity-key supplied: the pre-flight refuses gate 1 ENTIRELY for a role with no prior lock entry — no App is ever created, zero gate invocations', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      let gate1Called = false;
+      let gate2Called = false;
+      const agentDeps = agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1');
+      const deps: FleetApplyDeps = {
+        ...baseDeps(
+          {
+            ...agentDeps,
+            startManifestFlow: async (opts) => {
+              gate1Called = true;
+              return agentDeps.startManifestFlow(opts);
+            },
+            waitForAppInstallation: async (opts) => {
+              gate2Called = true;
+              return agentDeps.waitForAppInstallation(opts);
+            },
+          },
+          manifestPath,
+        ),
+        trustDeps: reuseTrustDeps(), // keep the CA out of the "pending" set — this test is about the AGENT's pre-flight only
+        vaultDeps: { exists: () => true }, // the vault ALREADY exists in this checkout
+        // identityKeyPath deliberately OMITTED
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(gate1Called).toBe(false);
+      expect(gate2Called).toBe(false);
+      expect(result.agents[0]?.identity.status).toBe('failed');
+      if (result.agents[0]?.identity.status === 'failed') {
+        expect(result.agents[0].identity.reason).toContain('--identity-key');
+        expect(result.agents[0].identity.reason).toContain('CREATE path');
+        expect(result.agents[0].identity.reason).toContain('macf#989');
+      }
+      // Nothing else pending this run (CA reused, agent refused pre-gate,
+      // runner-ops equally refused by the SAME pre-flight) -> settleVault
+      // never even reaches the compose branch:
+      expect(result.vault.status).toBe('skipped');
+      expect(existsSync(result.lockPath)).toBe(false);
+      expect(applyExitCode(result)).toBe(1);
+    });
+
+    it('same pre-flight applies to the runner-ops App (no prior lock entry, vault exists, no --identity-key)', async () => {
+      const manifestPath = manifestPathIn();
+      // No coordination agents at all — isolates the runner-ops's OWN pre-flight.
+      const manifest = manifestWith([]);
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('runner-ops', 'created', 'app-runner-ops', 'install-1'), manifestPath),
+        trustDeps: reuseTrustDeps(),
+        vaultDeps: { exists: () => true },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.runnerOps.status).toBe('failed');
+      if (result.runnerOps.status === 'failed') {
+        expect(result.runnerOps.reason).toContain('--identity-key');
+        expect(result.runnerOps.reason).toContain('macf#989');
+      }
+      expect(result.vault.status).toBe('skipped');
+    });
+
+    it('vault exists + --identity-key supplied, but no prior lock entry for a REUSED-CA-only run: reachable defense-in-depth throw is ACTIONABLE (tells the operator to supply --identity-key, never "file a bug")', async () => {
+      // A fresh CA mint opens NO consent gate (no App, no operator click) —
+      // so the per-agent/runner-ops pre-flight (gated on a role taking the
+      // CREATE path) does not cover this case. If every agent REUSES but
+      // the CA mints fresh this run (the groundnuty/macf#978 deactivate-
+      // then-apply shape) and the vault already exists with no
+      // --identity-key, settleVault's OWN defense-in-depth throw is what
+      // fires — genuinely reachable, not dead code (macf#989 review).
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor(), // default: registry absent -> CA MINTS fresh this run
+        // `encrypt` faked too — this fixture's runner-ops ALSO takes the
+        // CREATE path (no prior lock entry for it), so its OWN pre-gate-2
+        // recovery artifact write must succeed cleanly; the scenario this
+        // test isolates is specifically "CA pending, no --identity-key",
+        // not an incidental runner-ops recovery-write failure.
+        vaultDeps: { exists: () => true, encrypt: async () => {} },
+        // identityKeyPath deliberately OMITTED
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('reused'); // no gate ever opened for it — unaffected
+      expect(result.ca.resolve.status).toBe('minted');
+      expect(result.vault.status).toBe('failed');
+      if (result.vault.status === 'failed') {
+        expect(result.vault.reason).toContain('--identity-key');
+        expect(result.vault.reason).not.toMatch(/file a bug/i);
+      }
+      expect(applyExitCode(result)).toBe(1);
+    });
+
+    it('a vault-write failure on the compose path is non-zero exit and is NEVER reported as a success alongside the agent\'s CREATED status (macf#989 Required #3)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: reuseTrustDeps(),
+        // `encrypt` faked (not just `exists`) — the pre-gate-2 RECOVERY
+        // artifact write (a separate seam, `vaultDeps.encrypt`) must succeed
+        // so gate 1 + gate 2 resolve to 'created' cleanly; only the FINAL
+        // batched compose (`vaultComposeDeps`, below) is meant to fail here.
+        vaultDeps: { exists: () => true, encrypt: async () => {} },
+        identityKeyPath: '/fake/operator-key.txt', // supplied -> gate 1/2 proceed, compose IS attempted
+        vaultComposeDeps: {
+          exists: () => true, // composeAndWriteVault's OWN readVault pre-flight also needs to see "the vault exists"
+          assertIdentityReadable: () => {}, // and skip the real fs.accessSync check on the fake identity path
+          decrypt: async () => {
+            throw new Error('simulated wrong identity key');
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      // Gate 1 + gate 2 both succeeded (this fixture's `agentDepsFor('created', ...)`
+      // never fails them) — the credential WAS minted; only the batched
+      // compose failed:
+      expect(result.agents[0]?.identity.status).toBe('created');
+      expect(result.vault.status).toBe('failed');
+      if (result.vault.status === 'failed') {
+        expect(result.vault.reason).toContain('simulated wrong identity key');
+      }
+      // The decisive requirement: this is NEVER a success-shaped exit —
+      // never conflate "the agent shows CREATED" with "the run succeeded":
+      expect(applyExitCode(result)).toBe(1);
+      // No lock entry either — the vault-before-lock invariant this module
+      // already upholds for the ordinary first-write failure path:
+      expect(existsSync(result.lockPath)).toBe(false);
+    });
+
+    it('never auto-shrinks the recipient set while composing new secrets in (DR-043 §D3 invariant 4, same rule reconcileVaultRecipients already enforces)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT], ['age1operator']); // 1 declared
+      let composeCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: reuseTrustDeps(),
+        vaultDeps: { exists: () => true, encrypt: async () => {} }, // see the sibling test's comment on why `encrypt` (not just `exists`) is faked
+        identityKeyPath: '/fake/operator-key.txt',
+        vaultRecipientDeps: {
+          readRecipientCount: () => ({ status: 'counted', count: 2 }), // vault currently has 2 — MORE than declared
+        },
+        vaultComposeDeps: {
+          decrypt: async () => {
+            composeCalled = true;
+            return "MACF_AGENT_X_APP_ID='1'\n";
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.vault.status).toBe('failed');
+      if (result.vault.status === 'failed') {
+        expect(result.vault.reason).toContain('does NOT auto-shrink');
+        expect(result.vault.reason).toContain('REVOKE');
+      }
+      expect(composeCalled).toBe(false); // refused BEFORE any decrypt was ever attempted
+      expect(applyExitCode(result)).toBe(1);
+    });
+
+    it('never logs or --json-renders decrypted vault material from the compose path', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const logs: string[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: (log) => ({ ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), log }),
+        trustDeps: reuseTrustDeps(),
+        vaultDeps: { exists: () => true, encrypt: async () => {} }, // fakes the pre-gate-2 recovery-artifact encrypt too
+        identityKeyPath: '/fake/operator-key.txt',
+        vaultComposeDeps: {
+          exists: () => true, // composeAndWriteVault's OWN readVault pre-flight also needs to see "the vault exists"
+          assertIdentityReadable: () => {}, // and skip the real fs.accessSync check on the fake identity path
+          decrypt: async () => "MACF_AGENT_SCIENCE_AGENT_CLIENT_SECRET='SENTINEL-DECRYPTED-SECRET'\n",
+          encrypt: async () => {},
+          rename: () => {}, // no real temp file was written — the fake encrypt above is a no-op
+          unlink: () => {},
+        },
+        log: (l) => logs.push(l),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.vault.status).toBe('written');
+      const jsonOutput = JSON.stringify(fleetApplyResultToJson(result));
+      const combined = `${logs.join('\n')}\n${jsonOutput}`;
+      expect(combined).not.toContain('SENTINEL-DECRYPTED-SECRET');
+      expect(combined).not.toContain('SENTINEL-SECRET-code-agent');
+    });
+
+    it.skipIf(!HAS_AGE)(
+      'REAL age binary — THE DECISIVE TEST (groundnuty/macf#989): provision one agent, then apply again adding a ' +
+        'second agent to the SAME already-vaulted fleet — BOTH agents\' credentials decrypt from the resulting ' +
+        'vault; the FIRST agent\'s prior entries survive PER-KEY unchanged; a first-provision test alone could not ' +
+        'have caught this (it never re-applies against an existing vault)',
+      async () => {
+        const manifestPath = manifestPathIn();
+        const dir = join(manifestPath, '..');
+        const opKey = mintAgeKey(dir, 'operator-key.txt');
+
+        // --- Step 1: provision science-agent alone (an ordinary first apply). ---
+        const manifest1 = manifestWith([SCI_AGENT], [opKey.publicKey]);
+        const deps1: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('science-agent', 'created', 'app-science-agent', 'install-science-agent'), manifestPath),
+          vaultDeps: { exists: () => false }, // no `encrypt` override — real `age` runs
+        };
+        const result1 = await applyFleet(manifest1, manifestPath, null, deps1);
+        expect(result1.agents[0]?.identity.status).toBe('created');
+        expect(result1.vault.status).toBe('written');
+        if (result1.vault.status !== 'written') return; // narrows for TS below
+        const vaultPath = result1.vault.path;
+        expect(existsSync(vaultPath)).toBe(true);
+
+        const beforeDecrypt = spawnSync('age', ['-d', '-i', opKey.keyPath, vaultPath], { encoding: 'utf-8' });
+        expect(beforeDecrypt.status, beforeDecrypt.stderr).toBe(0);
+        const seedRaw = parseVaultPlaintext(beforeDecrypt.stdout);
+        expect(seedRaw['MACF_AGENT_DEMO_FLEET_SCIENCE_AGENT_APP_ID']).toBe('app-science-agent');
+
+        // --- Step 2: add code-agent to the SAME fleet. The vault at
+        // `vaultPath` ALREADY has science-agent's content — the exact
+        // scenario the issue reports as discarding the new credential.
+        // Deliberately does NOT use `baseDeps` (which stubs
+        // `vaultDeps.exists: () => false` unconditionally) and does NOT
+        // override `vaultDeps.exists` here at all — the REAL `existsSync`
+        // must see the REAL file step 1 just wrote, or this test would
+        // pass regardless of whether the fix works (the exact "test that
+        // constructs the seam it should observe" trap).
+        const manifest2 = manifestWith([SCI_AGENT, CODE_AGENT], [opKey.publicKey]);
+        const agentDeps2: AgentApplyDeps = {
+          startManifestFlow: async () => ({ startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} }),
+          startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+          exchangeManifestCode: async () => creds('code-agent'),
+          resolveKeyPath: () => '/fake.pem',
+          confirmAppInstallation: async () => ({
+            status: 'confirmed',
+            install: { appId: 'app-science-agent', installId: 'install-science-agent', appSlug: 'demo-fleet-science-agent', accountLogin: 'groundnuty' },
+          }),
+          waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: 'install-code-agent', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
+          openUrl: async () => {},
+          log: () => {},
+          writeRecoveryArtifact: async () => {},
+        };
+        const deps2: FleetApplyDeps = {
+          buildAgentDeps: () => agentDeps2,
+          repoInitDeps: NOOP_REPO_INIT,
+          vaultDeps: {}, // real `exists` AND real `encrypt` — must see + extend the REAL file on disk
+          controlRepoDeps: controlRepoDepsFor(),
+          agentRepoDeps: agentRepoDepsFor(),
+          trustDeps: reuseTrustDeps(), // CA already minted in step 1 -> reused here, keeps the vault diff isolated to the agents
+          routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
+          controlRepoOptions: { makeScratchDir: () => dir }, // SAME checkout dir as step 1
+          now: () => new Date('2026-08-11T00:00:00.000Z'),
+          log: () => {},
+          identityKeyPath: opKey.keyPath, // THE fix's precondition — decrypt-and-fold is now possible
+        };
+
+        const result2 = await applyFleet(manifest2, manifestPath, null, deps2);
+
+        expect(result2.agents.find((a) => a.role === 'code-agent')?.identity.status).toBe('created');
+        expect(result2.vault.status).toBe('written');
+        if (result2.vault.status !== 'written') return; // narrows for TS below
+        expect(result2.vault.path).toBe(vaultPath); // the SAME canonical path — never a versioned sibling nothing reads
+
+        // THE decisive assertion — decrypt the FINAL vault and confirm BOTH
+        // agents' credentials are present:
+        const afterDecrypt = spawnSync('age', ['-d', '-i', opKey.keyPath, vaultPath], { encoding: 'utf-8' });
+        expect(afterDecrypt.status, afterDecrypt.stderr).toBe(0);
+        const afterRaw = parseVaultPlaintext(afterDecrypt.stdout);
+
+        // Every key science-agent had BEFORE step 2 survives with the EXACT
+        // SAME value (per-key comparison — `composeAndWriteVault`'s
+        // sorted-key serialization is not byte-identical to the ORIGINAL
+        // insertion-order plaintext even when every value is unchanged, so
+        // this is the correct notion of "byte-identical" here: the VALUES,
+        // not the file text):
+        for (const [key, value] of Object.entries(seedRaw)) {
+          expect(afterRaw[key]).toBe(value);
+        }
+        // code-agent's fresh credentials are ALSO present:
+        expect(afterRaw['MACF_AGENT_DEMO_FLEET_CODE_AGENT_APP_ID']).toBe('app-code-agent');
+        expect(afterRaw['MACF_AGENT_DEMO_FLEET_CODE_AGENT_CLIENT_SECRET']).toBe('SENTINEL-SECRET-code-agent');
+        expect(afterRaw['MACF_AGENT_DEMO_FLEET_CODE_AGENT_INSTALL_ID']).toBe('install-code-agent');
+
+        // No secret ever reaches --json output:
+        const jsonOutput = JSON.stringify(fleetApplyResultToJson(result2));
+        expect(jsonOutput).not.toContain('SENTINEL-SECRET-code-agent');
+        expect(jsonOutput).not.toContain(readFileSync(opKey.keyPath, 'utf-8'));
+      },
+    );
   });
 });

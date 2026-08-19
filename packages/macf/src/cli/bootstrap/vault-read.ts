@@ -86,8 +86,8 @@ import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { accessSync, constants as fsConstants, existsSync, readFileSync, renameSync, unlinkSync } from 'node:fs';
 import { toVariableSegment } from '@groundnuty/macf-core';
-import type { VaultEncryptFn } from './vault-write.js';
-import { VaultError, ageEncryptToFile } from './vault-write.js';
+import type { VaultEncryptFn, WriteVaultResult } from './vault-write.js';
+import { VaultError, ageEncryptToFile, serializeVaultRawMap } from './vault-write.js';
 import { secretFingerprint } from './fleet-lock.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 // groundnuty/macf#954 — the runner-ops App's vault namespace is keyed on
@@ -924,4 +924,158 @@ export async function reencryptVault(
         `${err instanceof Error ? err.message : String(err)}`,
     );
   }
+}
+
+// --- Compose-and-write — DR-043 Amendment D "whole-payload, never
+// read-modify-written" applied to ADDING a fresh credential to a vault that
+// already has content (groundnuty/macf#989).
+//
+// The bug this closes: adding a second agent to a fleet that already had a
+// vault reported the new App as CREATED (gate 1 + gate 2 both spent a real,
+// irreversible consent click) and then `writeVault` REFUSED to overwrite the
+// existing `vault.age` — discarding the just-minted credential entirely (no
+// program can ever re-read a GitHub App's private key after the one-time
+// manifest exchange). The refusal guarded the right INVARIANT (never clobber
+// a vault that wasn't fully accounted for) but on the wrong AXIS: it refused
+// on the file's EXISTENCE, when Amendment D's actual contract is about the
+// PAYLOAD's PROVENANCE — a whole-payload rewrite composed from the vault's
+// complete current contents plus this run's new receipts is exactly the
+// sanctioned operation; a rewrite that would silently drop existing entries
+// is what must be refused.
+
+/**
+ * Refuse a composed payload that would DROP a key present in the vault's
+ * CURRENT contents — the provenance guard DR-043 Amendment D requires
+ * (macf#989 "Refuse on provenance of the payload, not on existence of the
+ * file"). Pure; never mutates either map.
+ *
+ * By construction, {@link composeAndWriteVault}'s own merge
+ * (`{...existingRaw, ...newRaw}`) can never actually trigger this — an
+ * object spread cannot omit a key it started with. This assertion exists as
+ * an EXPLICIT, independently-testable statement of the invariant anyway
+ * (not "dead code"): it is the one place a reader can see the safety
+ * property stated directly rather than infer it from spread semantics, and
+ * it keeps failing loud if a future refactor of the compose step (a filter,
+ * a transform, a different merge strategy) ever stops preserving it.
+ */
+export function assertNoDroppedVaultKeys(
+  existingRaw: Readonly<Record<string, string>>,
+  composedRaw: Readonly<Record<string, string>>,
+): void {
+  const dropped = Object.keys(existingRaw).filter((k) => !(k in composedRaw));
+  if (dropped.length > 0) {
+    throw new VaultError(
+      'vault_would_drop_keys',
+      `composed payload is missing ${String(dropped.length)} key(s) present in the CURRENT vault (${dropped.join(', ')}) ` +
+        '— refusing to write. A whole-payload vault rewrite must be composed from the vault\'s complete current ' +
+        'contents; a payload that would drop existing entries is never written (DR-043 Amendment D, groundnuty/macf#989).',
+    );
+  }
+}
+
+export interface ComposeAndWriteVaultDeps {
+  readonly exists?: (path: string) => boolean;
+  readonly assertIdentityReadable?: (path: string) => void;
+  readonly decrypt?: VaultDecryptFn;
+  readonly encrypt?: VaultEncryptFn;
+  readonly rename?: (from: string, to: string) => void;
+  readonly unlink?: (path: string) => void;
+  /** Injectable randomness for a deterministic temp-file name in tests. Defaults to `crypto.randomBytes(6).toString('hex')`. */
+  readonly tmpSuffix?: () => string;
+}
+
+/**
+ * Decrypt the CURRENT `vaultPath`, fold `newPlaintext` (this run's freshly
+ * `buildVaultPlaintext`-built receipts) into it, and atomically rewrite the
+ * SAME path — the compose-and-write primitive DR-043 Amendment D sanctions
+ * for extending a vault that already has content (macf#989). Sibling to
+ * {@link reencryptVault} (same decrypt-then-whole-rewrite shape, same
+ * crash-safety posture, same reason it lives HERE rather than in
+ * `vault-write.ts`: it needs both the decrypt seam this module owns and the
+ * encrypt seam `vault-write.ts` owns) — the difference is WHAT gets
+ * re-encrypted: `reencryptVault` re-encrypts the SAME bytes to a new
+ * recipient set; this composes DIFFERENT (larger) bytes to the SAME
+ * recipient set.
+ *
+ * **Never a read-modify-write of ciphertext (Amendment D).** The merge
+ * happens entirely on DECRYPTED plaintext, in memory, as two raw
+ * `KEY -> value` maps: `existingRaw` (from decrypting the CURRENT vault) and
+ * `newRaw` (from parsing `newPlaintext`). `{...existingRaw, ...newRaw}` — a
+ * key present in BOTH is won by `newRaw` (this run's fresher receipt for a
+ * role it just processed supersedes whatever the vault held for that same
+ * key). This is a DIFFERENT credential-lifecycle concern than #989's own
+ * scope: if a role's App was re-created this run because a PRIOR one was
+ * orphaned (the #969 dead end), the OLD App's now-stale entry is silently
+ * overwritten by the NEW one under the same vault key — correct (a stale
+ * key pointing at a now-abandoned App is not worth keeping), but named here
+ * so it reads as a considered boundary, not an unexamined one.
+ *
+ * **Crash-safe.** Same atomic temp-file-in-the-same-directory + rename
+ * pattern {@link reencryptVault} uses — the live vault is never touched
+ * until the new ciphertext is fully written; a crash mid-encrypt leaves an
+ * orphaned (best-effort-unlinked) temp file and the ORIGINAL vault
+ * untouched, never a truncated live vault.
+ *
+ * Throws {@link VaultError} on every failure mode `readVault` already
+ * distinguishes (`vault_not_found` / `vault_identity_unreadable` /
+ * `vault_decrypt_failed` / `vault_malformed_plaintext`), plus
+ * `vault_would_drop_keys` ({@link assertNoDroppedVaultKeys}) and
+ * `vault_compose_rename_failed` (the atomic swap itself failed after a
+ * successful encrypt). Never partially writes — either the FULL composed
+ * vault lands at `vaultPath`, or `vaultPath` is byte-for-byte unchanged.
+ */
+export async function composeAndWriteVault(
+  vaultPath: string,
+  identityPath: string,
+  newPlaintext: string,
+  recipients: readonly string[],
+  deps?: ComposeAndWriteVaultDeps,
+): Promise<WriteVaultResult> {
+  if (recipients.length === 0) {
+    throw new VaultError('vault_no_recipients', 'composeAndWriteVault: at least one age recipient is required.');
+  }
+  const encrypt = deps?.encrypt ?? ageEncryptToFile;
+  const rename = deps?.rename ?? renameSync;
+  const unlink =
+    deps?.unlink ??
+    ((p: string): void => {
+      try {
+        unlinkSync(p);
+      } catch {
+        /* best-effort — ENOENT (never created) or a permission issue; either way, nothing left to clean up here */
+      }
+    });
+  const suffix = deps?.tmpSuffix?.() ?? randomBytes(6).toString('hex');
+
+  const existingRaw = await readVault(
+    { vaultPath, identityPath },
+    { exists: deps?.exists, assertIdentityReadable: deps?.assertIdentityReadable, decrypt: deps?.decrypt },
+  );
+  // Shape-validate the new receipts too (defense-in-depth — `newPlaintext`
+  // is always `buildVaultPlaintext` output in production, already valid by
+  // construction, but a caller driving this function directly could hand it
+  // something else).
+  const newRaw = parseVaultPlaintext(newPlaintext);
+  const composedRaw: Record<string, string> = { ...existingRaw, ...newRaw };
+  assertNoDroppedVaultKeys(existingRaw, composedRaw);
+  const composedPlaintext = serializeVaultRawMap(composedRaw);
+
+  const tmpPath = `${vaultPath}.compose-${suffix}.tmp`;
+  try {
+    await encrypt(composedPlaintext, recipients, tmpPath);
+  } catch (err) {
+    unlink(tmpPath);
+    throw err;
+  }
+  try {
+    rename(tmpPath, vaultPath);
+  } catch (err) {
+    unlink(tmpPath);
+    throw new VaultError(
+      'vault_compose_rename_failed',
+      `composed vault written to a temp file but could not be renamed into place at "${vaultPath}": ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return { path: vaultPath, versioned: false };
 }

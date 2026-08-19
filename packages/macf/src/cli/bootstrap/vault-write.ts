@@ -341,6 +341,41 @@ export function buildVaultPlaintext(payload: VaultPayload): string {
 }
 
 /**
+ * Re-serialize an already-decrypted, already-merged raw `KEY -> value` map
+ * back into vault plaintext — the write-side counterpart to
+ * `vault-read.ts::parseVaultPlaintext` (macf#989: `composeAndWriteVault`
+ * decrypts the CURRENT vault into a raw map, folds in this run's freshly
+ * `buildVaultPlaintext`-built lines, and needs to turn the MERGED map back
+ * into vault plaintext — `buildVaultPlaintext` itself only accepts a typed
+ * {@link VaultPayload}, not a raw map, so it cannot serve this role).
+ *
+ * Reuses the SAME per-line guards {@link emitLine} already applies
+ * (shell-identifier KEY, shell-safe VALUE) — belt-and-suspenders, not
+ * redundant-in-principle: every value here was already validated once
+ * (either by the ORIGINAL `buildVaultPlaintext` call that first wrote it,
+ * or by THIS run's own call for the new entries), but re-validating on the
+ * way back out means a hand-edited or format-drifted vault can never
+ * silently carry an unsafe value forward through a compose — it fails loud
+ * here instead.
+ *
+ * Keys are emitted in SORTED order — deterministic output regardless of
+ * `Object.entries` iteration order or which of the two source maps
+ * (existing vs new) a key came from, so two composes of the same logical
+ * merged map always produce byte-identical plaintext (useful for tests
+ * asserting exact output).
+ */
+export function serializeVaultRawMap(raw: Readonly<Record<string, string>>): string {
+  const lines: string[] = [];
+  for (const [key, value] of Object.entries(raw).sort(([a], [b]) => a.localeCompare(b))) {
+    emitLine(lines, key, value);
+  }
+  if (lines.length === 0) {
+    throw new VaultError('vault_empty_payload', 'serializeVaultRawMap: empty map — nothing to write.');
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+/**
  * Derive the RAW secret-name → value map for one agent's fingerprint-pairing
  * (§D5) — the SAME field set {@link buildVaultPlaintext} writes into the
  * vault (`client_secret`, `webhook_secret`, `app_private_key`), named once

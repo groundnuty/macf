@@ -213,6 +213,7 @@
  * nothing is silently gone for any App that DOES get created), but
  * automatic re-use of an orphaned-but-real App is future scope.
  */
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { TokenSource } from '@groundnuty/macf-core';
@@ -261,8 +262,8 @@ import type {
   RoutingClientSecretsForPublish,
 } from './apply-routing-client.js';
 import { mintRoutingClient, publishRoutingClientSecrets, resolveRoutingClientSecretsForPublish, skippedRoutingClientPublish } from './apply-routing-client.js';
-import type { VaultRecipientCountResult } from './vault-read.js';
-import { readVaultRecipientCount, reencryptVault } from './vault-read.js';
+import type { ComposeAndWriteVaultDeps, VaultRecipientCountResult } from './vault-read.js';
+import { composeAndWriteVault, readVaultRecipientCount, reencryptVault } from './vault-read.js';
 
 export interface FleetApplyDeps {
   /**
@@ -346,6 +347,19 @@ export interface FleetApplyDeps {
   readonly identityKeyPath?: string;
   /** Injectable seam for the recipient-set reconciliation (macf#957) — real defaults are `vault-read.ts`'s `readVaultRecipientCount`/`reencryptVault`. */
   readonly vaultRecipientDeps?: VaultRecipientReconcileDeps;
+  /**
+   * Injectable seam for the vault-exists compose-and-write path (DR-043
+   * Amendment D, groundnuty/macf#989) — real default is
+   * `vault-read.ts::composeAndWriteVault`. Only ever invoked when
+   * `settleVault` finds `vaultOutPath` already exists AND there is a fresh
+   * secret to fold in this run (see `settleVault`'s doc). Kept separate from
+   * `vaultDeps` (which is `WriteVaultDeps` — a narrower `exists`/`encrypt`
+   * shape) because `composeAndWriteVault` needs the FULL decrypt-then-write
+   * seam set (`decrypt`/`assertIdentityReadable`/`rename`/`unlink`/`tmpSuffix`
+   * too), mirroring `vaultRecipientDeps`'s own "separate optional seam,
+   * unset in production" precedent.
+   */
+  readonly vaultComposeDeps?: ComposeAndWriteVaultDeps;
 }
 
 /**
@@ -602,6 +616,48 @@ function noRecipientPreflightFailure(role: string): AgentApplyOutcome {
   };
 }
 
+/**
+ * DR-043 Amendment D pre-flight (groundnuty/macf#989) — the SIBLING of
+ * {@link wouldCreateWithNoRecipient}, for the OTHER way a `created` role's
+ * credential could never make it into the final vault: `vaultOutPath`
+ * already has content (a REUSE clone brought back a prior apply's committed
+ * `vault.age`), so the batched compose (`settleVault`, below) would need to
+ * DECRYPT it before folding in a fresh receipt — and that decrypt needs an
+ * operator identity (`deps.identityKeyPath`) this run may not have been
+ * given. Without this pre-flight, the OLD bug recurs: gate 1 + gate 2 both
+ * spend a real consent click, mint a real GitHub App, and ONLY THEN does
+ * `settleVault` discover it cannot durably record the credential — by which
+ * point the click is already spent and, absent a working recovery-artifact
+ * path, the credential is gone (no program can re-read an App's private key
+ * after the one-time manifest exchange). Refusing HERE, before gate 1, is
+ * what makes "the credential-loss hole is closed" true for THIS cause too,
+ * the same way `wouldCreateWithNoRecipient` already closes it for an empty
+ * `transport.age_recipients`.
+ *
+ * A role WITH a prior lock entry is unaffected (reuse/resume/skip/drift
+ * never mint a new credential); a role that would create but the vault
+ * doesn't exist yet is unaffected either (the ordinary first-write path,
+ * `writeVault`, needs no decrypt).
+ */
+function wouldCreateWithUnreadableVault(prior: FleetLockAgent | undefined, vaultAlreadyExists: boolean, identityKeyPath: string | undefined): boolean {
+  return prior === undefined && vaultAlreadyExists && identityKeyPath === undefined;
+}
+
+function noVaultAccessPreflightFailure(role: string, vaultOutPath: string): AgentApplyOutcome {
+  return {
+    role,
+    status: 'failed',
+    reason:
+      `role "${role}" has no prior fleet.lock entry, so it would take the CREATE path — but a vault already ` +
+      `exists at "${vaultOutPath}" and no --identity-key (paired with --vault) was supplied to decrypt-and-fold ` +
+      'its current contents into a fresh compose (DR-043 Amendment D: the vault is never read-modify-written — a ' +
+      "whole-payload rewrite of a LIVE vault must be composed from the vault's complete current contents, never a " +
+      'partial payload). Refusing to open consent gate 1 for a credential whose vault write would fail after the ' +
+      'fact (groundnuty/macf#989). Re-run with "macf bootstrap apply --vault <path> --identity-key <path>" so the ' +
+      'existing vault can be decrypted, merged, and rewritten.',
+  };
+}
+
 /** The final control-repo sync commit message (macf#857) — one constant so every call site + every test asserting on it agree. */
 export const CONTROL_REPO_SYNC_COMMIT_MESSAGE = 'chore(bootstrap): apply — fleet.lock / vault.age update (DR-043 §D5)';
 
@@ -698,6 +754,16 @@ export async function applyFleet(
   const secretsDir = join(controlDir, 'secrets');
   const vaultOutPath = join(secretsDir, 'vault.age');
   const recipients = ageRecipients(manifest);
+  // DR-043 Amendment D pre-flight (macf#989) — computed ONCE, right after
+  // the control-repo checkout is confirmed (this is the earliest point
+  // `vaultOutPath` reflects reality: a REUSE clone brings back whatever the
+  // prior apply committed, a CREATE clone has nothing yet). Fed into
+  // `wouldCreateWithUnreadableVault` below for every role that might take
+  // the CREATE path this run, AND reused (same resolved function, same
+  // path) inside `settleVault` — a test that stubs `vaultDeps.exists`
+  // therefore sees ONE coherent answer everywhere in this run, not two
+  // independently-resolved calls that could in principle disagree.
+  const vaultAlreadyExists = (deps.vaultDeps.exists ?? existsSync)(vaultOutPath);
 
   // Self-heal (macf#857): a REUSE clone brings back whatever the PRIOR apply
   // already committed. Prefer that over the caller-supplied `priorLock`
@@ -781,10 +847,14 @@ export async function applyFleet(
     const prior = currentLock?.agents.find((a) => a.role === agent.role);
     // DR-043 §D5 pre-flight — see `noRecipientPreflightFailure`'s doc.
     // Never opens gate 1 for a role that could never make its credential
-    // durable in the first place.
+    // durable in the first place. Two independent ways that can be true —
+    // no recipient to encrypt to AT ALL, or a live vault this run cannot
+    // decrypt to fold into (macf#989) — checked in sequence.
     const identity = wouldCreateWithNoRecipient(prior, recipients)
       ? noRecipientPreflightFailure(agent.role)
-      : await applyAgentIdentity(agent, manifest, prior, agentDeps);
+      : wouldCreateWithUnreadableVault(prior, vaultAlreadyExists, deps.identityKeyPath)
+        ? noVaultAccessPreflightFailure(agent.role, vaultOutPath)
+        : await applyAgentIdentity(agent, manifest, prior, agentDeps);
 
     let repoInitOutcome: RepoInitStepOutcome | undefined;
     const handle = deriveAppHandle(manifest.metadata.name, agent.role);
@@ -853,16 +923,18 @@ export async function applyFleet(
   };
   const runnerOpsIdentity: AgentApplyOutcome = wouldCreateWithNoRecipient(runnerOpsPrior, recipients)
     ? noRecipientPreflightFailure(RUNNER_OPS_ROLE)
-    : await applyIdentity(
-        // No home repo for this App — `controlRepo.repo` (the fleet's OWN
-        // control-plane repo, already confirmed to exist by Step 0 above) is
-        // the closest fleet-level homepage this tool has; a design choice,
-        // not a spec requirement (flagged in the implementation report).
-        runnerOpsIdentityRequest(repoHomepageUrl(controlRepo.repo)),
-        manifest,
-        runnerOpsPrior,
-        runnerOpsDeps,
-      );
+    : wouldCreateWithUnreadableVault(runnerOpsPrior, vaultAlreadyExists, deps.identityKeyPath)
+      ? noVaultAccessPreflightFailure(RUNNER_OPS_ROLE, vaultOutPath)
+      : await applyIdentity(
+          // No home repo for this App — `controlRepo.repo` (the fleet's OWN
+          // control-plane repo, already confirmed to exist by Step 0 above) is
+          // the closest fleet-level homepage this tool has; a design choice,
+          // not a spec requirement (flagged in the implementation report).
+          runnerOpsIdentityRequest(repoHomepageUrl(controlRepo.repo)),
+          manifest,
+          runnerOpsPrior,
+          runnerOpsDeps,
+        );
 
   let pendingRunnerOpsVaultSecrets: VaultRunnerOpsSecrets | undefined;
   if (runnerOpsIdentity.status === 'reused' || runnerOpsIdentity.status === 'resumed-install') {
@@ -1392,6 +1464,56 @@ async function settleVault(
       ...(routingClientSecrets !== undefined ? { routingClient: routingClientSecrets } : {}),
       ...(runnerOpsSecrets !== undefined ? { runnerOps: runnerOpsSecrets } : {}),
     });
+
+    // DR-043 Amendment D (groundnuty/macf#989) — a vault that ALREADY has
+    // content needs a compose (decrypt current -> fold in `plaintext` ->
+    // rewrite), never a direct single-shot `writeVault` — that either
+    // refuses (the original bug) or, with `allowVersion`, writes a
+    // timestamped SIBLING that nothing else ever reads, in neither case
+    // extending the vault callers actually consult. `allowVaultVersion` is
+    // therefore consulted ONLY on the first-write path below — once a vault
+    // exists, `--identity-key` (checked by the per-agent/runner-ops
+    // pre-flight, `wouldCreateWithUnreadableVault`) is the sole gate.
+    const exists = deps.vaultDeps.exists ?? existsSync;
+    if (exists(vaultOutPath)) {
+      if (deps.identityKeyPath === undefined) {
+        // Defense-in-depth, but genuinely REACHABLE (not dead code): the
+        // per-agent/runner-ops pre-flight above only gates roles that would
+        // CREATE a fresh App this run — a fresh CA-key or routing-client-cert
+        // mint (`caSecrets`/`routingClientSecrets`) opens NO consent gate at
+        // all (no App, no operator click), so a fleet where every agent
+        // REUSES but the CA mints fresh this run (groundnuty/macf#978's
+        // deactivate-then-apply shape) can reach here with an existing vault
+        // and no identityKeyPath, entirely legitimately.
+        throw new VaultError(
+          'vault_no_identity_key',
+          `vault already exists at "${vaultOutPath}" — this run has new secret(s) to fold into it, but no ` +
+            '--identity-key (paired with --vault) was supplied to decrypt its current contents (DR-043 Amendment ' +
+            'D: a whole-payload rewrite of a live vault must be composed from its complete current contents, never ' +
+            'a partial payload). Re-run "macf bootstrap apply --vault <path> --identity-key <path>" to reconcile.',
+        );
+      }
+      // §D3 invariant 4 ("no delete verb, extras are reported, never
+      // pruned") applies here exactly as it does to `reconcileVaultRecipients`
+      // — composing this run's new secret(s) in must not ALSO silently
+      // shrink the recipient set (which would revoke whichever recipient
+      // transport.age_recipients dropped, as a side effect of an unrelated
+      // add-agent run).
+      const recipientCount = (deps.vaultRecipientDeps?.readRecipientCount ?? readVaultRecipientCount)(vaultOutPath);
+      if (recipientCount.status === 'counted' && recipientCount.count > recipients.length) {
+        throw new VaultError(
+          'vault_would_shrink_recipients',
+          `vault is encrypted to ${String(recipientCount.count)} recipient(s), MORE than the ${String(recipients.length)} ` +
+            "declared in transport.age_recipients. Composing this run's new secret(s) in would ALSO re-encrypt to " +
+            'fewer recipients, and would REVOKE decrypt access for whichever recipient was dropped (DR-043 §D3 ' +
+            'invariant 4 — apply does NOT auto-shrink). Reconcile transport.age_recipients (add the missing entry ' +
+            'back) first, then re-run apply.',
+        );
+      }
+      const result = await composeAndWriteVault(vaultOutPath, deps.identityKeyPath, plaintext, recipients, deps.vaultComposeDeps);
+      return { status: 'written', path: result.path, versioned: result.versioned };
+    }
+
     const result = await writeVault(
       plaintext,
       { outPath: vaultOutPath, recipients, allowVersion: deps.allowVaultVersion === true, now: deps.now },
