@@ -28,6 +28,23 @@ This is the **root of fleet authority**, and it is why this DR states a structur
 
 Everything else in MACF's identity model is **delegation beneath that root** — which retroactively explains every consent gate in DR-043 as *the fleet's root of authority being exercised*, not as a UX limitation we tolerate.
 
+**This is verified, not asserted — established by running into it.** The overnight autonomous directive asked for a full end-to-end *including creating a new fleet*. `macf-code-agent` reported it impossible in these terms: *"creating a NEW App needs the operator's browser gates — no API exists — so an unattended new-fleet e2e is impossible; the archive→revive cycle is the unattended proof."* That boundary was discovered by attempting to cross it, months before this DR had words for it, and the 2026-08-19 provisioning confirmed it four more times — every consent gate is a point where the tool stopped and could not proceed on any credential it held or could mint. The natural objection to a constitutional claim is *"surely with enough permissions…"*; the answer is **no, and here is the run where we tried.**
+
+**Stated positively: a fleet cannot be created unattended, ever, by construction.** Not *"not yet"* and not *"we have not automated it"* — the root action has no API. Three consequences worth having in writing:
+
+- it **bounds what any future automation can promise**;
+- the wide-App extension (Decision 5) therefore has a **known ceiling** — however wide, it cannot create the next App, so a fully self-provisioning MACF is not a thing that can exist;
+- and it is why **archive→revive** was the only unattended lifecycle proof available — a distinction discovered operationally that now has a principled reason.
+
+**Two floors, and only one of them is constitutional.** These must not be conflated:
+
+| | example | who imposes it | revisable? |
+|---|---|---|---|
+| **platform floor** | App creation + installation | **GitHub** — no credential of any kind can hold it | **no** |
+| **design floor** | repo deletion | **us** — `administration: write` *does* include `DELETE /repos` (verified, `macf#943`), and we deliberately withhold it from exported agent keys | yes, at the cost `#943` records |
+
+Decision 1 rests **only on the platform floor.** The design floor is a ratified decision (Amendment G's deletion ceremony + the key-class rule) and could in principle be revisited; the platform floor cannot. A reader who takes both as immovable will over-constrain future designs, and one who takes both as negotiable will propose an App that creates Apps.
+
 **Corollary the check must respect:** the App-creation gate is **not a permission**, so a capability check must not attempt to verify it, and must say so at the site. Otherwise a future reader "fixes" its absence by inventing a permission that does not exist.
 
 ## Decision 2 — the rule
