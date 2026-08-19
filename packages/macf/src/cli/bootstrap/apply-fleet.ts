@@ -209,6 +209,8 @@ import type { FleetAgent, FleetLock, FleetLockAgent, FleetManifest } from './fle
 import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName } from './fleet-manifest.js';
 import type { AgentApplyDeps, AgentApplyOutcome } from './apply-agent.js';
 import { applyAgentIdentity, applyIdentity, cleanupScratchPem, writeScratchPem } from './apply-agent.js';
+import type { Presence } from './plan.js';
+import { buildRegistryRepoValidateInstall } from './registry-repo-coverage.js';
 import type { AppCredentials } from './manifest-exchange.js';
 import type { AgentRepoDeps, RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
 import { applyRepoInitForAgent, ensureAgentRepo } from './apply-repo-init.js';
@@ -371,6 +373,17 @@ export interface FleetApplyDeps {
     readonly exists?: (path: string) => boolean;
     readonly decrypt?: (artifactPath: string, identityPath: string) => Promise<string>;
   };
+  /**
+   * Injectable seam for the registry-repo installation-coverage LIVE check
+   * (groundnuty/macf#1012) — real default (when `undefined`) is
+   * `registry-repo-coverage.ts::checkRepoInAppInstallation`. Only ever
+   * invoked when `manifest.owner.registry.type === 'repo'`; every other
+   * registry type never wires `validateInstall` for ordinary agents at all
+   * (byte-identical `profile`/`org`/`local` behavior — requirement 5). Tests
+   * inject a fake so the suite never makes a real `gh token generate --jwt`
+   * / `fetch` call.
+   */
+  readonly checkRegistryRepoCoverage?: (appId: string, keyPath: string, owner: string, repo: string) => Promise<Presence>;
 }
 
 /**
@@ -883,6 +896,13 @@ export async function applyFleet(
     identityChanges.push(...composed.identityChanges);
   };
 
+  // groundnuty/macf#1012 — computed ONCE (fleet-level, not per-agent):
+  // `registry.type === 'repo'` is the only registry shape this run needs to
+  // live-verify install coverage for. `type: profile`/`org`/`local` never
+  // reach `buildRegistryRepoValidateInstall` at all — byte-identical
+  // behavior to pre-#1012 (requirement 5).
+  const registry = manifest.owner.registry;
+
   const totalAgents = manifest.agents.length;
   for (const [agentIndex, agent] of manifest.agents.entries()) {
     // Operator-facing progress context (consent-gate UX fix) — a live
@@ -900,7 +920,32 @@ export async function applyFleet(
     // `deps.buildAgentDeps` / the recovery-artifact writer are otherwise
     // identical every call; rebuilding is cheap (no I/O until a field is
     // invoked).
-    const agentDeps = buildAgentDepsWithRecovery(recoveryRootDir, manifest.metadata.name, recipients, { ...deps, log: scopedLog });
+    const agentDepsBase = buildAgentDepsWithRecovery(recoveryRootDir, manifest.metadata.name, recipients, { ...deps, log: scopedLog });
+    // groundnuty/macf#1012 — when the registry is repo-scoped, every
+    // ordinary agent's install must be live-verified to actually cover the
+    // registry repo (never the runner-ops, below — it never touches the
+    // registry). Wired here (not in `apply-agent.ts::realAgentApplyDeps`)
+    // because this check needs FLEET-level context
+    // (`manifest.owner.registry`) `realAgentApplyDeps` doesn't have — same
+    // reasoning `buildAgentDepsWithRecovery`'s own splice already
+    // establishes for `writeRecoveryArtifact`/`findRecoveryArtifact`.
+    const agentDeps: AgentApplyDeps = (() => {
+      if (registry.type !== 'repo') return agentDepsBase;
+      // Wired onto BOTH `validateInstall` (CREATE / resume-install, via
+      // `runGate2`) AND `validateReuse` (an already-provisioned role
+      // re-confirmed on a re-run, via `applyIdentity`'s `reuse-confirmed`
+      // branch — see that field's doc for why it's separate from
+      // `validateInstall`) — the SAME closure, so an agent's install is
+      // verified identically regardless of which path resolved it this run.
+      const registryRepoValidate = buildRegistryRepoValidateInstall(
+        registry.owner,
+        registry.repo,
+        deriveAppHandle(manifest.metadata.name, agent.role),
+        scopedLog,
+        deps.checkRegistryRepoCoverage,
+      );
+      return { ...agentDepsBase, validateInstall: registryRepoValidate, validateReuse: registryRepoValidate };
+    })();
 
     // macf#857 — ensure the agent's OWN repo exists BEFORE either consent
     // gate: gate 2's install page can't list a repo that doesn't exist yet

@@ -113,7 +113,9 @@ describe('confirmBeforeCreateGuard', () => {
       resolveKeyPath: () => '/fake/key.pem',
       confirmAppInstallation: async () => ({ status: 'confirmed', install }),
     });
-    expect(decision).toEqual({ action: 'reuse-confirmed', install });
+    // groundnuty/macf#1012 — `keyPath` is now carried on `reuse-confirmed`
+    // so `applyIdentity` can run `validateReuse` on this path too.
+    expect(decision).toEqual({ action: 'reuse-confirmed', install, keyPath: '/fake/key.pem' });
   });
 
   it('resume-install when confirmAppInstallation returns app-no-install (the gate-1-succeeded/gate-2-interrupted resume case)', async () => {

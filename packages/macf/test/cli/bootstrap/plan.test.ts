@@ -1291,6 +1291,11 @@ describe('computePlan — registryScopeIssues (macf#999 requirement 3: "plan sta
     expect(message).toContain('registry: { type: org, org: "demo-org" }');
     expect(message).toContain('type: profile');
     expect(message).toContain('groundnuty/macf#999');
+    // groundnuty/macf#1012 requirement 4 (from the issue's original ACs,
+    // carried into this codification): the org-scope refusal now ALSO
+    // points at `type: repo` as a supported org-owned-fleet shape.
+    expect(message).toContain('type: repo');
+    expect(message).toContain('groundnuty/macf#1012');
     // Deliberately does NOT decide #999 requirement 2 — no assertion that
     // any specific resolution ("unsupported" / "repo-scoped" / a wider
     // permission set) is the chosen fix; only that ONE exists and is named
@@ -1318,5 +1323,61 @@ describe('computePlan — registryScopeIssues (macf#999 requirement 3: "plan sta
     expect('registry_scope_issues' in json).toBe(true);
     expect(Array.isArray(json.registry_scope_issues)).toBe(true);
     expect((json.registry_scope_issues as unknown[]).length).toBe(1);
+  });
+
+  // groundnuty/macf#1012 requirement 4 — `type: repo` is SATISFIABLE (unlike
+  // `type: org` above), so `plan` never refuses for it; it states, from the
+  // manifest alone, that `apply` will verify install coverage live.
+  it('is empty for the type: profile default — the load-bearing profile-fleet-unaffected case', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.registryRepoScopeNotices).toEqual([]);
+  });
+
+  it('surfaces exactly one notice for registry: { type: repo }, naming the owner/repo and that apply verifies+refuses live', () => {
+    const manifest = baseManifest({
+      owner: { account: 'demo-org', type: 'org', registry: { type: 'repo', owner: 'demo-org', repo: 'demo-org-registry' } },
+    });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(plan.registryRepoScopeNotices).toHaveLength(1);
+    const message = plan.registryRepoScopeNotices[0]?.message ?? '';
+    expect(message).toContain('registry: { type: repo, owner: "demo-org", repo: "demo-org-registry" }');
+    expect(message).toContain('demo-org/demo-org-registry');
+    expect(message).toContain('groundnuty/macf#999');
+    expect(message).toContain('groundnuty/macf#1012');
+  });
+
+  it('formatPlanText for a repo-scoped fleet carries a NOTICE line (never "UNSATISFIABLE" — type: repo works)', () => {
+    const manifest = baseManifest({
+      owner: { account: 'demo-org', type: 'org', registry: { type: 'repo', owner: 'demo-org', repo: 'demo-org-registry' } },
+    });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const text = formatPlanText(plan);
+    expect(text).toContain('registry: NOTICE');
+    expect(text).not.toContain('registry: UNSATISFIABLE');
+  });
+
+  it('fleetPlanToJson for a profile fleet OMITS the registry_repo_scope_notice key entirely — byte-identical to pre-#1012 output for every OTHER registry type', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const json = fleetPlanToJson(plan) as Record<string, unknown>;
+    expect('registry_repo_scope_notice' in json).toBe(false);
+  });
+
+  it('fleetPlanToJson for a repo-scoped fleet carries the registry_repo_scope_notice key', () => {
+    const manifest = baseManifest({
+      owner: { account: 'demo-org', type: 'org', registry: { type: 'repo', owner: 'demo-org', repo: 'demo-org-registry' } },
+    });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const json = fleetPlanToJson(plan) as Record<string, unknown>;
+    expect('registry_repo_scope_notice' in json).toBe(true);
+    expect(Array.isArray(json.registry_repo_scope_notice)).toBe(true);
+    expect((json.registry_repo_scope_notice as unknown[]).length).toBe(1);
+  });
+
+  it('an org-scoped fleet carries the org UNSATISFIABLE banner and NOT the repo-scope notice (the two are mutually exclusive per fleet)', () => {
+    const manifest = baseManifest({
+      owner: { account: 'demo-org', type: 'org', registry: { type: 'org', org: 'demo-org' } },
+    });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(plan.registryRepoScopeNotices).toEqual([]);
   });
 });

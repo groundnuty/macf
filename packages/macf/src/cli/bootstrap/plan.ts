@@ -71,8 +71,8 @@ import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle } from './apply-runner-ops.js';
 // states the SAME fact as a loud banner instead (requirement 3: "plan states
 // it"). One check function, two renderings — never two independently
 // hand-authored copies of the underlying fact that could drift.
-import type { RegistryScopeConflict } from './registry-scope-preflight.js';
-import { checkRegistryScopePreflight } from './registry-scope-preflight.js';
+import type { RegistryRepoScopeNotice, RegistryScopeConflict } from './registry-scope-preflight.js';
+import { checkRegistryRepoScopeNotice, checkRegistryScopePreflight } from './registry-scope-preflight.js';
 
 // --- Observed state (the reconcile input; populated by an observer, consumed as data) ---
 
@@ -290,6 +290,16 @@ export interface FleetPlan {
    * `fleetPlanToJson`'s doc for why.
    */
   readonly registryScopeIssues: readonly RegistryScopeConflict[];
+  /**
+   * groundnuty/macf#1012 — 0 or 1 entries: `owner.registry` is singular per
+   * fleet (DR-006), so there is at most one notice to report. ALWAYS present
+   * on the `FleetPlan` TYPE (same "always present, empty when nothing
+   * applies" convention as {@link registryScopeIssues}); the `--json`
+   * serialization deliberately deviates from that convention for the SAME
+   * reason `registryScopeIssues`'s own `fleetPlanToJson` doc gives — see
+   * that function's doc.
+   */
+  readonly registryRepoScopeNotices: readonly RegistryRepoScopeNotice[];
 }
 
 /**
@@ -1360,6 +1370,12 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
   // `skippedSections`/`unimplementedByApply`'s own "state it, don't abort
   // the render" posture).
   const registryScopeFailure = checkRegistryScopePreflight(manifest.owner);
+  // groundnuty/macf#1012 requirement 4 — the pure, manifest-only SIBLING of
+  // the check above, for `registry.type === 'repo'`: a NOTICE (never a
+  // refusal — `type: repo` IS satisfiable), stating that `apply` will
+  // verify install coverage live, per App, post-gate-2. See
+  // `registry-scope-preflight.ts::checkRegistryRepoScopeNotice`'s doc.
+  const registryRepoScopeNotice = checkRegistryRepoScopeNotice(manifest.owner);
 
   return {
     fleet: fleetName,
@@ -1367,6 +1383,7 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
     skippedSections: computeSkippedSections(manifest),
     unimplementedByApply: computeUnimplementedByApply(items),
     registryScopeIssues: registryScopeFailure !== undefined ? [registryScopeFailure] : [],
+    registryRepoScopeNotices: registryRepoScopeNotice !== undefined ? [registryRepoScopeNotice] : [],
   };
 }
 
@@ -1419,6 +1436,17 @@ export function formatRegistryScopeLines(issues: readonly RegistryScopeConflict[
   return issues.map((i) => `registry: UNSATISFIABLE — \`macf bootstrap apply\` will refuse before any consent gate (${i.message})`);
 }
 
+/**
+ * groundnuty/macf#1012 requirement 4 — one loud line per repo-scope notice
+ * (0 or 1; see {@link FleetPlan.registryRepoScopeNotices}'s doc). Says
+ * plainly that `apply` VERIFIES this live post-gate-2 — distinct wording
+ * from {@link formatRegistryScopeLines}'s "UNSATISFIABLE": this is a NOTICE
+ * (`type: repo` works), not a refusal.
+ */
+export function formatRegistryRepoScopeLines(notices: readonly RegistryRepoScopeNotice[]): readonly string[] {
+  return notices.map((n) => `registry: NOTICE — ${n.message}`);
+}
+
 const PLAN_HEADERS = ['KIND', 'TARGET', 'VERB', 'CONFIRM', 'REASON'] as const;
 
 /** Build one display row per plan item (pure — exported for tests). */
@@ -1460,6 +1488,10 @@ export function formatPlanText(plan: FleetPlan): string {
   if (registryScopeLines.length > 0) {
     parts.push('', ...registryScopeLines);
   }
+  const registryRepoScopeLines = formatRegistryRepoScopeLines(plan.registryRepoScopeNotices);
+  if (registryRepoScopeLines.length > 0) {
+    parts.push('', ...registryRepoScopeLines);
+  }
   return parts.join('\n');
 }
 
@@ -1471,6 +1503,11 @@ export function formatPlanText(plan: FleetPlan): string {
  * `type: profile` fleet's `--json` output must stay byte-identical to its
  * pre-#999 shape (an unconditional new key would not be). Included only when
  * `plan.registryScopeIssues` is non-empty (`type: org`, today, always).
+ * `registry_repo_scope_notice` (groundnuty/macf#1012) follows the SAME
+ * omit-when-empty convention, for the SAME reason — a `type: profile`/
+ * `type: org`/`type: local` fleet's `--json` output must stay byte-identical
+ * to its pre-#1012 shape. Included only when `plan.registryRepoScopeNotices`
+ * is non-empty (`type: repo`, today, always).
  */
 export function fleetPlanToJson(plan: FleetPlan): unknown {
   return {
@@ -1482,6 +1519,9 @@ export function fleetPlanToJson(plan: FleetPlan): unknown {
     unimplemented_by_apply: plan.unimplementedByApply.map((i) => ({ ...i })),
     ...(plan.registryScopeIssues.length > 0
       ? { registry_scope_issues: plan.registryScopeIssues.map((i) => ({ ...i })) }
+      : {}),
+    ...(plan.registryRepoScopeNotices.length > 0
+      ? { registry_repo_scope_notice: plan.registryRepoScopeNotices.map((i) => ({ ...i })) }
       : {}),
   };
 }
