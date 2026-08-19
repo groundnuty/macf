@@ -79,6 +79,27 @@ function controlRepoDepsFor(): ControlRepoDeps {
   };
 }
 
+/**
+ * macf#992 — a `commitAndPush` fake that succeeds its FIRST call (step 0's
+ * own commit, made by `provisionControlRepo` inside `applyFleet` BEFORE the
+ * per-agent loop even starts — see `control-repo.ts::provisionControlRepo`)
+ * and throws on every call after that (the FINAL sync at the very end of
+ * `applyFleet`, `syncControlRepo`'s call site). Isolates "the push this
+ * test is actually about" (the final sync) from step 0's unrelated,
+ * always-succeeding commit — a bare always-throwing fake would abort the
+ * ENTIRE run at step 0 (`provisionControlRepo` returns `'failed'`) before
+ * ever reaching the per-agent loop, which is a different bug shape
+ * entirely (see `abortedFleetApplyResult`) from the one macf#992 is about.
+ */
+function pushSucceedsOnceThenFails(): ControlRepoDeps['commitAndPush'] {
+  let calls = 0;
+  return async (dir: string, message: string): Promise<'pushed' | 'nothing-to-commit'> => {
+    calls += 1;
+    if (calls === 1) return controlRepoDepsFor().commitAndPush(dir, message);
+    throw new Error('git push rejected — stale token (simulated)');
+  };
+}
+
 /** Every agent's repo reports `'absent'` -> `ensureAgentRepo` "creates" it (no-op `createRepo`). */
 function agentRepoDepsFor(): AgentRepoDeps {
   return { checkExists: async () => 'absent', createRepo: async () => {} };
@@ -803,6 +824,200 @@ describe('applyFleet', () => {
     expect(existsSync(recoveryPath)).toBe(true);
     // No lock entry either (the vault-before-lock invariant — see module doc):
     expect(existsSync(result.lockPath)).toBe(false);
+  });
+
+  // --- macf#992 — delete-timing fix: the artifact must survive a PUSH
+  // failure, not just a COMPOSE failure (the case above). The batched vault
+  // compose can succeed entirely LOCALLY (inside this run's per-process
+  // `mkdtemp` checkout) while the subsequent `syncControlRepo` push fails
+  // for an entirely ordinary reason (expired 1-hour bot token, network
+  // blip, branch-protection rejection, a concurrent push). Pre-#992, the
+  // delete fired the moment the LOCAL compose succeeded — before the push
+  // was even attempted — so this exact window silently destroyed the
+  // artifact while the vault it insured was durable nowhere but the
+  // about-to-be-discarded checkout.
+
+  it('THE DECISIVE macf#992 TEST: vault compose succeeds LOCALLY but the control-repo PUSH fails — the recovery artifact is RETAINED (not deleted), its path is named LOUDLY in the log, and the run reports a non-zero exit code', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT]);
+    const logs: string[] = [];
+    const deps: FleetApplyDeps = {
+      ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+      vaultDeps: {
+        exists: () => false,
+        encrypt: async (plaintext, _recipients, outPath) => writeFileSync(outPath, `FAKE-AGE-CIPHERTEXT\n${plaintext.length.toString()}`),
+      },
+      controlRepoDeps: {
+        ...controlRepoDepsFor(),
+        // A boring, realistic push failure — NOT a crash, NOT a corrupted
+        // checkout. The task brief is explicit that this is the likelier
+        // trigger than an exotic process kill. `provisionControlRepo` (step
+        // 0) makes its OWN `commitAndPush` call for the initial
+        // `fleet.yaml` commit BEFORE the per-agent loop even starts — that
+        // first call must keep succeeding (this test is about the FINAL
+        // sync at the end of the run, not step 0), so only the SECOND call
+        // onward fails.
+        commitAndPush: pushSucceedsOnceThenFails(),
+      },
+      buildAgentDeps: (log) => ({ ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), log }),
+      log: (l) => logs.push(l),
+    };
+
+    const recoveryPath = operatorRecoveryArtifactPath(join(manifestPath, '..'), 'demo-fleet', 'code-agent');
+    const result = await applyFleet(manifest, manifestPath, null, deps);
+
+    // The local compose DID succeed — this is exactly the state the bug
+    // fired from pre-#992 (deletion used to happen right here, before any
+    // push was even attempted).
+    expect(result.vault.status).toBe('written');
+    expect(result.agents[0]?.identity.status).toBe('created');
+
+    // The push itself failed — LOUD, not silent. `applyExitCode` /
+    // `formatControlRepoSyncLine` already carry this contract from #857;
+    // this pins that #992 doesn't regress it (task requirement 3: "a push
+    // failure must be loud and non-zero-exit, the same standard #990 set
+    // for a vault-write failure").
+    expect(result.controlRepoSync.status).toBe('failed');
+    if (result.controlRepoSync.status === 'failed') {
+      expect(result.controlRepoSync.reason).toContain('git push rejected');
+    }
+    expect(applyExitCode(result)).toBe(1);
+
+    // THE DECISIVE ASSERTION — the artifact SURVIVES a push failure that
+    // arrives AFTER a successful local compose. A happy-path test proves
+    // nothing about this: delete-timing IS the entire property.
+    expect(existsSync(recoveryPath)).toBe(true);
+
+    // Retention is LOUD, not silent (task requirement 2) — an operator
+    // reading the transcript finds the exact path and is told a re-run
+    // recovers automatically, without needing to decrypt anything first.
+    const retentionLine = logs.find((l) => l.includes('RETAINED') && l.includes(recoveryPath));
+    expect(retentionLine).toBeDefined();
+    expect(retentionLine).toMatch(/re-run/i);
+
+    // No credential value anywhere in the transcript — retention logging
+    // must never leak what it's protecting.
+    const joined = logs.join('\n');
+    expect(joined).not.toContain('SENTINEL-SECRET-code-agent');
+    expect(joined).not.toContain('SENTINEL-HOOK-code-agent');
+    expect(joined).not.toContain('SENTINEL-PEM-code-agent');
+  });
+
+  it('a recovery artifact retained after a push failure is CONSUMED by the NEXT apply — no new App is created, gate 1 is never re-attempted for that role (macf#992 closes the loop macf#991 opened)', async () => {
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT]);
+
+    // Operator-scoped recovery root — STABLE across runs (production shape:
+    // `~/.config/macf/recovery/<fleet>/`), independent of either run's OWN
+    // per-process control-repo checkout below.
+    const recoveryRootDir = mkdtempSync(join(tmpdir(), 'macf-992-recovery-root-'));
+    dirs.push(recoveryRootDir);
+
+    // Fake `age` as an IDENTITY transform (write plaintext verbatim, read it
+    // back verbatim) — this test's property is ORCHESTRATION (does a SECOND
+    // run find + consume a retained artifact, skip gate 1, mint no new App),
+    // not the cryptographic round-trip — that property is already proven
+    // with the REAL `age` binary by "THE DECISIVE CRASH-RECOVERY TEST" below
+    // (macf#988). Per the task brief, real `age` is reserved for tests whose
+    // property IS cryptographic; this one is not.
+    const identityKeyPath = '/fake-identity-key';
+    const fakeVaultDeps: FleetApplyDeps['vaultDeps'] = {
+      exists: () => false,
+      encrypt: async (plaintext, _recipients, outPath) => writeFileSync(outPath, plaintext),
+    };
+
+    // --- Run 1: gate 1 + gate 2 both succeed for 'code-agent', the batched
+    // vault compose succeeds LOCALLY, but the control-repo PUSH fails —
+    // exactly the state the decisive test above establishes in isolation. ---
+    const checkoutDir1 = mkdtempSync(join(tmpdir(), 'macf-992-checkout1-'));
+    dirs.push(checkoutDir1);
+    const run1Deps: FleetApplyDeps = {
+      ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+      vaultDeps: fakeVaultDeps,
+      controlRepoOptions: { makeScratchDir: () => checkoutDir1 },
+      recoveryRootDir,
+      // Same "step-0 commit succeeds, FINAL sync fails" shape as the
+      // decisive test above — `provisionControlRepo` makes its own
+      // `commitAndPush` call before the per-agent loop even starts.
+      controlRepoDeps: { ...controlRepoDepsFor(), commitAndPush: pushSucceedsOnceThenFails() },
+    };
+    const result1 = await applyFleet(manifest, manifestPath, null, run1Deps);
+    expect(result1.controlRepoSync.status).toBe('failed');
+    const recoveryPath = operatorRecoveryArtifactPath(recoveryRootDir, 'demo-fleet', 'code-agent');
+    expect(existsSync(recoveryPath)).toBe(true); // retained — re-verifies run 1 alone reaches the same state as the decisive test above
+
+    // --- Run 2: a FRESH apply — a NEW checkout (simulating a fresh clone of
+    // `<fleet>-control`, which never received run 1's failed push, so it
+    // carries NO entry for 'code-agent'), `priorLock: null` (the exact
+    // "post-push-failure" starting state a real re-run would have). ---
+    const checkoutDir2 = mkdtempSync(join(tmpdir(), 'macf-992-checkout2-'));
+    dirs.push(checkoutDir2);
+    let gate1Called = false;
+    const collisionCalls: string[] = [];
+    const agentDeps: AgentApplyDeps = {
+      startManifestFlow: async () => {
+        gate1Called = true;
+        throw new Error('must not be called — a found + decrypted recovery artifact resumes straight at gate 2');
+      },
+      startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+      exchangeManifestCode: async () => {
+        throw new Error('must not be called — no fresh App exchange for a recovered role');
+      },
+      waitForAppInstallation: async (opts) => ({
+        appId: opts.appId,
+        installId: 'install-recovered',
+        appSlug: opts.expected.appSlug ?? '',
+        accountLogin: 'groundnuty',
+        repositorySelection: 'selected',
+      }),
+      confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
+      // Would REFUSE 'code-agent' before gate 1 if the collision pre-flight
+      // were ever reached — proves the recovery-consume check runs BEFORE
+      // it, not just before gate 1 itself (same shape as macf#988's own
+      // decisive test below).
+      checkAppNameCollision: async (_owner, appSlug) => {
+        collisionCalls.push(appSlug);
+        return 'present';
+      },
+      openUrl: async () => {},
+      log: () => {},
+      writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless
+    };
+    const run2Deps: FleetApplyDeps = {
+      ...baseDeps(agentDeps, manifestPath),
+      vaultDeps: fakeVaultDeps,
+      controlRepoOptions: { makeScratchDir: () => checkoutDir2 },
+      recoveryRootDir,
+      // macf#991's consume path (`readRecoveryArtifact`) — `decrypt` reads
+      // back the SAME plaintext `fakeVaultDeps.encrypt` wrote verbatim above.
+      recoveryReadDeps: { decrypt: async (path: string) => readFileSync(path, 'utf-8') },
+      identityKeyPath,
+    };
+
+    const result2 = await applyFleet(manifest, manifestPath, null, run2Deps);
+
+    // gate 1 (and the collision pre-flight it would otherwise hit) NEVER
+    // fired for the recovered role.
+    expect(gate1Called).toBe(false);
+    expect(collisionCalls).not.toContain('demo-fleet-code-agent');
+
+    // The RECOVERED credential (run 1's `app-code-agent`, not a freshly
+    // minted one) reached the vault — proves the artifact retained by the
+    // push failure still satisfies macf#991's consume path end to end.
+    const rec = result2.agents.find((a) => a.role === 'code-agent');
+    expect(rec?.identity.status).toBe('created');
+    if (rec?.identity.status === 'created') {
+      expect(rec.identity.appId).toBe('app-code-agent');
+    }
+    expect(result2.vault.status).toBe('written');
+
+    // Run 2 uses `baseDeps`'s default `commitAndPush` ('pushed' — a normal,
+    // successful re-run), so the now-redundant insurance copy is deleted —
+    // closing the full lifecycle in one test: retained-across-a-failed-push
+    // → consumed-on-retry → durable-in-the-vault → deleted (never
+    // accumulates on disk across repeated retries).
+    expect(result2.controlRepoSync.status).toBe('pushed');
+    expect(existsSync(recoveryPath)).toBe(false);
   });
 
   it('recovery artifact: the PATH is logged on success — an operator reading the transcript can find it after a crash', async () => {

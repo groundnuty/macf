@@ -137,13 +137,20 @@
  *     decrypts the vault); existence alone is reported without it (task
  *     requirement: the operator learns recovery is available even on a run
  *     that forgot the flag).
- *   - **Delete side:** ONLY after the batched final-vault compose SUCCEEDS
- *     (the same `vault.status === 'written'` branch that writes the batched
- *     `fleet.lock` entries below) does this module delete each `created`
- *     role's recovery artifact — its credential now has a durable home in
- *     the vault of record, so the write-only insurance copy is no longer
- *     needed. A FAILED compose deliberately leaves every recovery artifact
- *     from this run in place, findable by the NEXT run's consume side above.
+ *   - **Delete side (macf#992):** ONLY after the batched final-vault compose
+ *     SUCCEEDS locally (`vault.status === 'written'`) AND the FINAL
+ *     control-repo push CONFIRMS (`syncControlRepo`'s `status === 'pushed'`)
+ *     does this module delete each `created` role's recovery artifact — its
+ *     credential now has a durable home OUTSIDE this run's per-process
+ *     checkout, so the write-only insurance copy is no longer needed. A
+ *     FAILED compose, a FAILED push, or anything short of a confirmed
+ *     `'pushed'` deliberately leaves every recovery artifact from this run in
+ *     place (loudly logged, by path — never silent), findable by the NEXT
+ *     run's consume side above. Through macf#991 the delete fired on the
+ *     local-compose success alone, before any push was even attempted — see
+ *     the "Location, corrected" section below for the crash-window that
+ *     defeated (macf#988 was filed about a different route into the same
+ *     state; macf#992 closes THIS route).
  *   - **Pre-flight (the part that makes "closed" true, not just "usually
  *     true"):** `writeRecoveryArtifact` itself rejects when
  *     `transport.age_recipients` is empty (nothing to encrypt to) —
@@ -178,22 +185,21 @@
  * consume side above is what makes that location fix actually pay off (a
  * durable-but-never-read artifact is just as useless as a purged one).
  *
- * **A sibling durable-write of the SAME class, found but NOT fixed here**
- * (scope discipline — macf#988's brief is the recovery artifact
- * specifically): `secrets/vault.age` and `fleet.lock` are STILL written into
- * `controlDir` (the same per-run `mkdtemp` checkout) and only become
+ * **A sibling durable-write of the SAME class, found in macf#988's review and
+ * FIXED HERE (macf#992):** `secrets/vault.age` and `fleet.lock` are written
+ * into `controlDir` (the same per-run `mkdtemp` checkout) and only become
  * genuinely durable once `syncControlRepo` pushes them to `<fleet>-control`
- * at the very end of this function. The recovery-artifact DELETE above fires
- * on `vault.status === 'written'` — which is the LOCAL encrypt succeeding,
- * BEFORE that push. A crash (or a push failure) between "vault compose
- * succeeded, artifacts deleted" and "the push actually landed" leaves the
- * fresh `vault.age` durable ONLY in the about-to-be-purged checkout, with
- * its own insurance already gone. Reordering the delete to after a
- * confirmed push (or delaying it one run) would close this; left as a named
- * gap rather than folded into this fix — `syncControlRepo` is also where a
- * sibling in-flight fix (macf#989, the vault-rewrite refusal) is landing in
- * this same file, and widening the touched surface there risks the two
- * colliding mid-flight.
+ * at the very end of this function — `vault.status === 'written'` proves
+ * only that the LOCAL encrypt succeeded, which is BEFORE that push. Through
+ * macf#991, the recovery-artifact DELETE fired on `vault.status === 'written'`
+ * alone; a crash (or a push failure) between "vault compose succeeded,
+ * artifacts deleted" and "the push actually landed" left the fresh
+ * `vault.age` durable ONLY in the about-to-be-purged checkout, with its own
+ * insurance already gone — reaching exactly the state macf#988 was filed
+ * about, by a different route. macf#992 moves the delete to AFTER
+ * `syncControlRepo` confirms `status === 'pushed'` — see the call site right
+ * after that function's call for the retain-and-say-so behavior on anything
+ * else (`'failed'` or `'nothing-to-commit'`).
  */
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -1142,14 +1148,17 @@ export async function applyFleet(
     writeFleetLock(lockPath, composed.lock);
     currentLock = composed.lock;
     identityChanges.push(...composed.identityChanges);
-    // The credential each `created` role's recovery artifact was insurance
-    // FOR now has a durable home in the FINAL vault (§D5 store of record) —
-    // the write-only insurance copy is no longer needed. A FAILED compose
-    // (the `if` above not taken) deliberately leaves every artifact from
-    // this run in place — see the module doc's recovery procedure.
-    for (const role of Object.keys(pendingCreatedUpdates)) {
-      removeAgentRecoveryArtifact(operatorRecoveryArtifactPath(recoveryRootDir, manifest.metadata.name, role));
-    }
+    // macf#992 — recovery-artifact DELETION does NOT happen here anymore.
+    // `vault.status === 'written'` only proves the LOCAL encrypt succeeded
+    // into this run's per-process `mkdtemp` control-repo checkout
+    // (`controlDir`) — that checkout is NOT durable; it dies with the
+    // process. The credential is genuinely durable outside this checkout
+    // only once `syncControlRepo` (below) has PUSHED it to `<fleet>-control`.
+    // Deleting the write-only insurance copy here — before that push is even
+    // attempted — is the exact bug this issue closes: a crash or a rejected
+    // push between this line and the push leaves NEITHER a durable vault NOR
+    // a recovery artifact. See the deletion site after `syncControlRepo`,
+    // and the module doc's "Recovery-artifact lifecycle" section.
   }
 
   // Two-place PUBLIC-cert publish (macf#806) — gated on the ordering rule
@@ -1322,6 +1331,74 @@ export async function applyFleet(
   // "Recovery-artifact lifecycle" section + `control-repo.ts`'s
   // "git-committed content invariant" section.
   const controlRepoSync = await syncControlRepo(controlDir, deps);
+
+  // macf#992 (DR-043 Amendment B, the delete-timing fix) — recovery-artifact
+  // DELETION happens HERE, after the push attempt, never at the earlier
+  // `vault.status === 'written'` branch above. `vault.status === 'written'`
+  // proves only that the LOCAL `age` encrypt into this run's per-process
+  // `mkdtemp` checkout (`controlDir`) succeeded — that checkout is NOT
+  // durable, it dies with the process. The credential is durable outside
+  // this run's process only once `syncControlRepo` (immediately above) has
+  // CONFIRMED a push. Deleting before that confirmation is exactly the bug
+  // this issue closes: a crash or a rejected push in the window between
+  // "local encrypt succeeded" and "push landed" would leave a freshly-minted
+  // App on GitHub, a vault that existed only in the about-to-be-discarded
+  // checkout, and no recovery artifact — because it was already gone. See
+  // the module doc's "Recovery-artifact lifecycle" + "A sibling durable-write
+  // of the SAME class" sections.
+  //
+  // Guarded on `pendingCreatedUpdates` being non-empty so a run with nothing
+  // NEW this run (e.g. only a `transport.age_recipients` reencrypt via
+  // `reconcileVaultRecipients`, which can independently set
+  // `vault.status === 'written'` with zero created roles) never touches this
+  // branch at all — there is nothing to retain OR delete for it.
+  if (vault.status === 'written' && Object.keys(pendingCreatedUpdates).length > 0) {
+    const createdRoles = Object.keys(pendingCreatedUpdates);
+    if (controlRepoSync.status === 'pushed') {
+      // The credential each `created` role's recovery artifact was insurance
+      // FOR now has a CONFIRMED durable home outside this run's checkout —
+      // the write-only insurance copy is no longer needed.
+      for (const role of createdRoles) {
+        removeAgentRecoveryArtifact(operatorRecoveryArtifactPath(recoveryRootDir, manifest.metadata.name, role));
+      }
+    } else {
+      // NEVER delete insurance for a credential that is not confirmed
+      // durable. `controlRepoSync.status === 'failed'` is the expected shape
+      // here — the push failed for a boring reason (expired 1-hour bot
+      // token, network blip, branch-protection rejection, a concurrent
+      // push) — but `'nothing-to-commit'` is treated identically on
+      // purpose: this branch only runs when THIS run's `settleVault` call
+      // wrote FRESH content for at least one `created` role, so a
+      // "nothing changed" push result here would itself be a symptom that
+      // something is wrong, not proof the credential is safe. Retention is
+      // the only safe default either way — say so LOUDLY, by path, so an
+      // operator reading the transcript can find + recover it without
+      // needing to decrypt anything first.
+      const retainedPaths = createdRoles.map((role) => operatorRecoveryArtifactPath(recoveryRootDir, manifest.metadata.name, role));
+      const syncReason = controlRepoSync.status === 'failed' ? ` — ${controlRepoSync.reason}` : '';
+      // The consume path (`buildAgentDepsWithRecovery`'s `findRecoveryArtifact`,
+      // above) only ever DECRYPTS when `deps.identityKeyPath` is supplied on
+      // the NEXT run — without it, the artifact is found-but-unconsumed and
+      // the role instead refuses on the App-name-collision pre-flight
+      // (no duplicate App, but no automatic recovery either). Saying
+      // "will consume automatically" unconditionally here would be exactly
+      // the symmetric mistake this fix exists to prevent — an operator who
+      // skips `--identity-key` on the re-run must not believe recovery is
+      // automatic. Mirrors `commands/bootstrap-apply.ts::formatRecoveryArtifactNotice`'s
+      // wording (the SAME conditional, surfaced pre-approval on the run
+      // that FINDS the artifact — this log line is its sibling, surfaced
+      // in-run on the run that RETAINS it).
+      deps.log(
+        `Recovery artifact(s) RETAINED for ${createdRoles.join(', ')} — the batched vault compose succeeded ` +
+          `locally, but the control-repo push did not confirm as 'pushed' (status: ${controlRepoSync.status}` +
+          `${syncReason}), so this run's fresh credential(s) are not yet durable outside the local checkout. ` +
+          `Retained at: ${retainedPaths.join(', ')}. Re-run "macf bootstrap apply --vault <path> --identity-key ` +
+          '<path>" and it will be found, decrypted, and consumed automatically (DR-043 Amendment B, macf#992) — no ' +
+          'new App is created for these role(s). Without --identity-key, the role is NOT auto-recovered; it refuses ' +
+          'on the App-name-collision pre-flight instead (no duplicate App, but no automatic recovery either).',
+      );
+    }
+  }
 
   const ca: CaApplyResult = { resolve: redactCaResolve(caResolve), registryLeg: caPublish.registryLeg, repoLegs: caPublish.repoLegs };
   const routingClient: RoutingClientApplyResult = {
