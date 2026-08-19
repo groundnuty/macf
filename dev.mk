@@ -1,5 +1,6 @@
 .PHONY: install check test lint typecheck build clean test-e2e test-integration install-hooks \
-	release-bump release-check release-marketplace release-cli release-verify release release-dry
+	release-bump release-check release-marketplace release-cli release-verify release release-dry \
+	dr-citations-state dr-citations-diff
 
 install:
 	devbox run -- npm ci
@@ -116,3 +117,21 @@ release:
 release-dry:
 	@test -n "$(VERSION)" || { echo "VERSION is required, e.g. make -f dev.mk release-dry VERSION=0.2.53"; exit 1; }
 	MACF_RELEASE_DRY_RUN=1 bash $(RELEASE_SH) all $(VERSION)
+
+# ---------------------------------------------------------------------------
+# DR-citation enforcement (groundnuty/macf#998) — local convenience wrappers
+# around packages/macf/scripts/check-dr-citations{,-diff}.sh. See those
+# scripts' headers for the convention + semantics. Not part of `check:` —
+# the diff check needs a base ref to compare against, which a bare local
+# run doesn't have a canonical default for (unlike `check:`, which is
+# meaningful with zero arguments). Wired into CI instead: `ci.yml`'s
+# `dr-citations` job runs both on every pull_request.
+# ---------------------------------------------------------------------------
+HEAD ?= HEAD
+
+dr-citations-state:
+	bash packages/macf/scripts/check-dr-citations.sh
+
+dr-citations-diff:
+	@test -n "$(BASE)" || { echo "BASE is required, e.g. make -f dev.mk dr-citations-diff BASE=origin/main"; exit 1; }
+	bash packages/macf/scripts/check-dr-citations-diff.sh "$(BASE)" "$(HEAD)"
