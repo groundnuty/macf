@@ -224,6 +224,8 @@ This is reconcile-on-demand GitOps — no watching controller in v1, deliberatel
 
 **Trigger:** the `apply` orchestrator (increment 5a) revealed that §D5's "writes it into the vault *in the same apply*" is ambiguous, and the natural batch-at-loop-end reading violates the store-of-record property. Between "operator clicks Create for agent N" (App now exists on GitHub, consent given, effectively irreversible) and the post-loop vault write, agent N's private key lives **only in process memory** — and **gate 2 parks a multi-minute operator-wait inside that window**. A process death, ctrl-C, escaped exception, or a failed final vault write (the #847 nit-1 `age`-failure path) orphans every already-created App with an automation-captured credential set that is painful (manual, per-App) to recover. Same-apply-batching satisfies §D5's letter and defeats its point.
 
+> **Corrected by Amendment K1** — *durable* is defined operationally there (survives the loss of the writing process AND confirmed at its destination); this clause never defined it, and all three of B's failures fit in that gap.
+
 **Clarification (tightens §D5, does not replace it):** *A received credential MUST reach durable, operator-recoverable storage before the apply proceeds to any further fallible or operator-gated step* — before gate 2, before the next agent. The store-of-record property **is** crash-safety; a window where a created-on-GitHub App's key is memory-only is the exact durability hole the vault exists to close. Batch-compose-at-end remains fine for assembling the *final* `vault.age` — it must simply not be the *first* moment the credential is durable.
 
 **This does NOT reopen the decrypt-merge-reencrypt path** (increment-4's deliberate scope-out stands). The contract is "durable before the next gate," satisfiable with today's single-shot `writeVault`: the happy path still composes the final vault from in-memory plaintext at loop end, plus a **per-agent encrypted recovery artifact** written the moment the manifest exchange returns credentials (multi-recipient, its own path so no clobber) — write-only insurance, never read on the happy path, deleted on successful compose, the durable recoverable record on a crash. Never composed *from* (memory is the compose source), so no merge/decrypt is needed. Any lighter mechanism that still makes the credential durable-before-gate-2 is acceptable — the invariant is the contract, not the artifact.
@@ -258,6 +260,8 @@ The age **private** key decrypts the entire store-of-record vault — the per-pr
 **Ruling — the vault's access model:** the vault is **read-only-decryptable into memory** and **whole-payload-writable single-shot**, and is **NEVER read-modify-written in place.** There is deliberately **no decrypt-merge-reencrypt primitive.**
 
 - **Reads** decrypt an existing `vault.age` to a plaintext `VaultPayload` in memory — for the vault-aware observer (mint JWTs → live-confirm identity, Amendment A's confirm tier) and for re-materialization (§D5 / DR-010 / silent-fallback Instance 16 — read a secret's value, re-write it to the clobbered out-of-band copy).
+> **Corrected by Amendment K2** — the "typed plaintext struct" merge below is WITHDRAWN; the merge is on the raw `KEY→value` map, because a typed reconstruction silently drops keys the types do not model.
+
 - **Writes** always produce a *fresh full* `vault.age` from a fully-assembled in-memory payload via the existing single-shot `writeVault` (prior vault versioned aside by the clobber guard, never mutated). **add-agent does NOT force in-place RMW:** its "merge" is `{...priorAgentsReadFromVault, newAgent}` on the *typed plaintext struct*, then a whole-payload write — the merge is in the payload, never on ciphertext. Every write stays on the one Amendment-B-clean path.
 
 **Custody boundary preserved through reconcile (extends Amendment C).** The vault decryptor is the **operator-privileged bootstrap CLI holding the operator's age key** (§D4 Mac-side plane) — never an agent context. Reading the vault into the CLI's memory does not breach "agents never decrypt": an *agent* pulling the vault into its LLM context would; the operator's CLI on the operator's machine with the operator's key does not. Consequence: the **real-fleet vault read is operator-gated** (only the operator-key holder can run it — exactly as #854 showed the building agent could not decrypt); code-agent tests the read/merge logic against **synthetic age keys + a synthetic vault**, and the real reconcile is an operator-run exercise.
@@ -343,8 +347,10 @@ The phasing maps onto Amendment A's two observability tiers: phase 2 operates in
 
 | Verb | Removes | Revival cost |
 |---|---|---|
-| **`deactivate`** | the fleet's **org/account-scope registry presence** — the `<SEG>_CA_CERT` registry leg, the `<SEG>_AGENT_<AGENT-SEG>` registrations, `<SEG>_FEDERATED_CAS` | `apply` — **0 clicks** |
-| **`archive`** | + archives the control + agent repos | un-archive (API) + `apply` — **0 clicks** |
+| **`deactivate`** | the fleet's **org/account-scope registry presence** — the `<SEG>_CA_CERT` registry leg, the `<SEG>_AGENT_<AGENT-SEG>` registrations, `<SEG>_FEDERATED_CAS` | `apply --vault --identity-key` — **0 clicks** |
+| **`archive`** | + archives the control + agent repos | un-archive (API) + `apply --vault --identity-key` — **0 clicks** |
+
+> **Corrected by Amendment K3** — the revival column measures **browser consent clicks (operator interaction) only**, NOT prerequisites: both 0-click rungs require `apply --vault --identity-key`, because a bare `apply` refuses to restore a deleted registry leg (`#981`).
 | **`delete-apps`** | + deletes the agent GitHub App identities (frees the globally-unique names) | recreate Apps (**2 clicks/agent**, App creation browser-only) + `apply` |
 | **`destroy`** | + deletes the repositories | full re-provision; **history gone forever** |
 
@@ -570,3 +576,53 @@ The limit, stated honestly: a citation can rot if the symbol is renamed. That fa
 On a **User account** `scope` can only ever be `repo` — private accounts cannot hold account-level runners at all — so it is not merely single-valued, it is **meaningless** on the topology that is the design centre. **A field with one legal value is not a choice; it is a knob whose only use is getting it wrong.** Same reason `transport.vault_repo` was removed in Amendment F.
 
 Re-add it when an org-owned fleet makes the choice real — not on a "for completeness" pass. Stating the reason here is what prevents that pass: an unstated exclusion gets re-added, and an exclusion stated with a *false* reason gets **reversed**, which is worse because the reversal looks like a correction.
+
+---
+
+## Amendment K (2026-08-19, #981/#990/#991/#997 — three ratified rulings were wrong) — B, D and G corrected, and the shape of the error is the finding
+
+**Trigger:** within 48 hours, live runs falsified three separate rulings in this DR. Each was found by *executing* the path, none by re-reading the text. They are corrected below, in place-pointed form: the original wording stays (a ratified record is not rewritten), and each carries a pointer here.
+
+The corrections matter less than what they have in common, so that is stated first.
+
+### K0 — the common defect: a DR asserting a property that nothing can check
+
+Three different errors, one shape:
+
+| | ruling | error class | falsified by |
+|---|---|---|---|
+| **G** | 0-click revival for the top two teardown rungs | **incomplete enumeration** — promised a recovery path without listing what the destructive step removes | `#981` — `deactivate` deletes `<SEG>_CA_CERT`; `apply` refused to restore it, so revive was impossible |
+| **D** | add-agent merges "on the *typed plaintext struct*" | **untraced consequence** — specified a mechanism without asking what it does to data the types do not model | `#990` — a typed merge silently drops any key outside the types; in a vault those values may exist nowhere else |
+| **B** | a credential must be **durable** before the next gated step | **undefined predicate** — the load-bearing word was never given an operational meaning | `#988`/`#992` — satisfied by the run's own `mkdtemp`, and by deleting the artifact before the push that made it durable |
+
+**Amendment B is the clearest case, because it failed three times in one guarantee** — written at the wrong *moment* (batch-at-loop-end, the original defect), to the wrong *place* (`#988`), and deleted at the wrong *time* (`#997`). One invariant, three independent ways to satisfy its words and miss its intent.
+
+**Standing rule for every future amendment in this DR:** before ratifying, ask **"what would falsify this, and can anyone run that check?"** If the answer names nothing runnable, the ruling is prose, not a decision — and prose is satisfiable nominally. Where the mechanism names an artifact the tool must produce, the amendment carries an **`Asserted by:`** citation to the test that proves it, attached **to the clause it asserts** so an uncited clause is visible against its neighbours (convention ratified on `#998`, enforced by `check-dr-citations{,-diff}.sh`).
+
+### K1 — corrects Amendment B: *durable* now has an operational definition
+
+**Durable** means both of:
+
+1. **It survives the loss of the process that wrote it.** A path under the run's own temporary checkout is NOT durable, however early it is written. (`#988`: the artifact was correctly written before gate 2 — into a `mkdtemp` directory purged with the run.)
+2. **It is confirmed at its destination, not merely attempted.** Insurance is retained until the durable home is *confirmed*; a local compose is not the destination when the destination is a push. (`#997`: the recovery artifact was deleted when the local compose succeeded, before `syncControlRepo` pushed — destroying the insurance inside the window it insured.)
+
+Both halves are the same correction applied at one more boundary, which is why the guarantee had to fail twice to be stated once.
+
+### K2 — corrects Amendment D: the merge is on the RAW key space, never a typed reconstruction
+
+D's *"its `merge` is `{...priorAgentsReadFromVault, newAgent}` on the **typed plaintext struct**"* is **withdrawn**. The merge operates on the raw `KEY→value` map.
+
+**Invariant:** the composed payload MUST preserve **every key present in the prior payload**, including keys the current types do not model — hand-added entries, a future writer's fields, an older writer's fields. A typed reconstruction can only carry what the types know, so it drops the rest **silently**, and in this store the dropped values are secrets that may exist nowhere else. This is stricter than ordinary merge hygiene because the loss is unrecoverable, not merely inconvenient.
+
+Everything else in D stands unchanged: read-only-decryptable into memory, whole-payload-writable single-shot, never read-modify-written, decryptor is the operator-privileged CLI.
+
+### K3 — corrects Amendment G: the cost table measures operator interaction, not preconditions
+
+Two corrections to the ladder table:
+
+- The revival column reads **`apply --vault --identity-key`** on the `deactivate` and `archive` rows. A bare `apply` cannot restore a deleted registry leg — it refuses — so "0 clicks" was true about clicks and silent about flags, and "0 clicks" reads as "nothing required."
+- The column is explicitly scoped: **it measures browser consent clicks, i.e. operator interaction — NOT prerequisites, flags, or credentials that must be present.** A single-axis cost column invites reading as a total ordering of effort; saying which axis it measures is what stops that.
+
+**And the enumeration G originally lacked:** `deactivate` removes the `<SEG>_CA_CERT` registry leg, the `<SEG>_AGENT_<AGENT-SEG>` registrations, and `<SEG>_FEDERATED_CAS`. Revival must restore **each**; `#981` restores the CA leg from the vault, which is why the flags are mandatory. A recovery promise is only as good as its inventory of what was destroyed.
+
+**References:** `#981` (CA-leg restore) · `#990` (vault compose) · `#991`/`#997` (recovery-artifact durability) · `#998` (the citation convention this amendment is the first consumer of).
