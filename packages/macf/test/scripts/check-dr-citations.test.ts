@@ -39,10 +39,16 @@ interface RunResult {
   readonly stderr: string;
 }
 
-function run(script: string, args: readonly string[], cwd?: string): RunResult {
+function run(
+  script: string,
+  args: readonly string[],
+  cwd?: string,
+  env?: NodeJS.ProcessEnv,
+): RunResult {
   const res = spawnSync('bash', [script, ...args], {
     encoding: 'utf-8',
     cwd,
+    ...(env === undefined ? {} : { env }),
   });
   return { status: res.status, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
 }
@@ -336,5 +342,42 @@ describe('check-dr-citations-diff.sh (diff/erosion check)', () => {
 
     expect(res.status).not.toBe(0);
     expect(res.stderr).toMatch(/usage/i);
+  });
+});
+
+describe('MACF_SKIP_DR_CITATION_CHECK — the mechanism-retirement escape (macf#1001 review)', () => {
+  // The two checks deadlock on a legitimate edit: retiring a mechanism deletes
+  // its test, so the STATE check fails on the now-dangling citation; removing
+  // the citation then trips the DIFF check because the amendment survives.
+  // Neither is satisfiable without deleting a ratified amendment, which is the
+  // one thing that must never happen. This is the documented way out.
+  it('DEADLOCK: retiring a mechanism fails BOTH checks without the override', () => {
+    const repo = makeGitRepo();
+    commitDr(repo, DR_NAME, CITED_AMENDMENT, 'base: citation + its test exist');
+    git(['tag', 'base'], repo);
+    rmSync(join(repo, FAKE_TEST_FILE), { force: true });           // the test is retired
+    commitDr(repo, DR_NAME, AMENDMENT_NO_CITATION, 'retire mechanism: drop test AND citation');
+
+    // State: the citation is gone, so state passes — but had we KEPT it, it would dangle.
+    // Diff: the citation vanished while the amendment survives -> fails.
+    const diff = run(DIFF_SCRIPT, ['base', 'HEAD'], repo);
+    expect(diff.status).not.toBe(0);
+    expect(diff.stderr).toMatch(/erosion/i);
+  });
+
+  it('the override lets a mechanism retirement land — both scripts exit 0 and say why', () => {
+    const repo = makeGitRepo();
+    commitDr(repo, DR_NAME, CITED_AMENDMENT, 'base');
+    git(['tag', 'base'], repo);
+    commitDr(repo, DR_NAME, AMENDMENT_NO_CITATION, 'retire');
+
+    const env = { ...process.env, MACF_SKIP_DR_CITATION_CHECK: '1' };
+    const diff = run(DIFF_SCRIPT, ['base', 'HEAD'], repo, env);
+    const state = run(STATE_SCRIPT, [], repo, env);
+
+    expect(diff.status).toBe(0);
+    expect(state.status).toBe(0);
+    expect(diff.stderr).toContain('MACF_SKIP_DR_CITATION_CHECK');
+    expect(state.stderr).toContain('MACF_SKIP_DR_CITATION_CHECK');
   });
 });

@@ -46,6 +46,28 @@
 # Amendment P (the amendment whose half-implementation motivated the rule).
 set -euo pipefail
 
+# --- Override (groundnuty/macf#998, added on operator review of macf#1001) ---
+#
+# `MACF_SKIP_DR_CITATION_CHECK=1` skips this check. Its KNOWN LEGITIMATE USE is
+# MECHANISM RETIREMENT, which the two checks otherwise deadlock on:
+#
+#   1. An amendment cites test T. The mechanism is retired; T is deleted.
+#   2. STATE check: the citation must resolve to an existing test -> T is gone -> FAIL.
+#   3. So remove the citation. DIFF check: a citation vanished while its
+#      amendment survives -> FAIL.
+#
+# Neither check can be satisfied without deleting the amendment itself, and a
+# ratified record must never be deleted to satisfy a checker. (DR-022 Amendment
+# O is explicitly a sunset criterion, so this repo already contains the shape.)
+# Retiring a mechanism is a legitimate edit; this is how you land it.
+#
+# It is NOT for "the check is inconvenient today" — every other failure this
+# pair reports is fixable by editing the DR or the test.
+if [ "${MACF_SKIP_DR_CITATION_CHECK:-}" = "1" ]; then
+  echo "$(basename "$0"): SKIPPED via MACF_SKIP_DR_CITATION_CHECK=1 (mechanism retirement, or an explicit operator override)." >&2
+  exit 0
+fi
+
 REPO_ROOT="${1:-.}"
 cd "$REPO_ROOT"
 
