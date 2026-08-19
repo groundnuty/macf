@@ -70,6 +70,9 @@ agents:
     profile: research             #   tmux session, agent-config key (DR-032).
     repo: groundnuty/icsoc-2026-science-agent      # App handle is DERIVED.
     deploy_path: /home/ubuntu/repos/agh/icsoc-2026-science-agent
+
+> **`deploy_path` is a path on the host that will run the agent — today implicitly the LOCAL one.** The manifest has no field naming *which* host; a future remote-deploy mode would need one. Deliberately not added — see DR-037 **Amendment D** (`#1018`).
+
   - role: code-agent
     profile: code
     repo: groundnuty/icsoc-2026-experiment

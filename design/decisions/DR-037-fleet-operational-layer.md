@@ -199,3 +199,33 @@ Rolled-vs-not-rolled was a *proxy* for that principle — a good one while every
 **Implementation note (macf#900), recorded because it is what keeps the contract honest:** `readVersionPin` is a `FleetDriver` verb whose real implementation delegates to `resolvePluginUpdateTarget` + `readPinnedChannelServerVersion` — **the same primitives `macf update` uses for its own post-write verification**. One definition of "the launch pin," shared by the roll's diagnosis and the updater's self-check; two independent readers would have been free to drift, and a roll that disagreed with `update` about what the pin *is* would reproduce this class in the opposite direction. `stale-pin-skipped` is its own `RollOutcome` (the agent **was** mutated, so it is neither a pre-flight skip nor terminal), and the maintenance lock is deliberately **left in place** on that path (mirroring the halted branches, DR-040 Decision 3) so a still-old mid-transition agent is not handed straight back to the watchdog's healing ladder; the lock self-clears via TTL.
 
 **References:** macf#899 (the live mis-diagnosis) · macf#900 (the discrimination) · macf#889 (the pin-vs-mount bug that produced the old-version agent) · Amendment B (lines 144/153, refined here) · DR-040 Decision 3 (lock-release-only-on-green) · `silent-fallback-hazards.md` Instance 20 (the wrong-subject write this incident began as).
+
+---
+
+## Amendment D — deployment is LOCAL-ONLY by construction; a remote mode is a new driver, not a redesign (#1018, 2026-08-19, operator directive)
+
+**Trigger — operator, 2026-08-19:**
+
+> *"It's quite possible that at some point we might have a remote mode of deployment — as in, the deploy will happen on a virtual machine somewhere else, not localhost. **We are not implementing it.** We should just be aware of such possibility that may come in the future."*
+>
+> *"I am not sure if [our update commands] consider the multi-host deployment of agents. I only tested them on localhost. So there might be a silent assumption in our framework already."*
+
+**The suspicion was correct, and the distinction is the whole value of recording it.** Verified rather than assumed:
+
+    grep -rniE '\bssh\b' packages/macf/src/cli/fleet/     → no matches
+
+**The localhost assumption is in the IMPLEMENTATION, not the architecture.** `FleetDriver` is already runtime-agnostic — this DR's hard rule that *nothing VM-specific leaks above the interface* holds, and `vm-driver.ts` states its own scope in its first line. So a remote mode is **a second driver behind an existing seam**, not a redesign.
+
+That difference is load-bearing for planning: *"we have a silent localhost assumption"* and *"our only driver is local"* carry very different costs, and a reader who saw only the first would over-plan a rewrite that is not needed.
+
+**Recorded, deliberately not built:**
+
+1. **Agents may in future be deployed to hosts other than the one running the CLI.** `FleetDriver` is the seam that makes it possible. `vm-driver` is local-only **by construction, not by accident** — the absence of `ssh` is a scope boundary, not an oversight.
+2. **`deploy_path` is a path on the host that will run the agent** — today *implicitly* the local one. **That implicitness is the thing being named**: the manifest has no field saying *which* host, and a remote mode would need one. **Do not add it now.** A field with one possible value is a field that will be wrong when the second value arrives; recording what a remote mode would require costs nothing and pre-empts nothing.
+3. **Operational commands are local-only today** — `fleet upgrade`, `restart-self`, workspace scans, tmux wake. A multi-host fleet needs each run **where its agents live**. `#1014` (`apply` naming the deploy steps that remain) is this same shape one phase earlier: the tool completing its own scope while the operator's remaining work goes unstated.
+
+**Why this is written down at all.** A stated-but-unrecorded assumption is exactly how DR-022 Amendment P went unimplemented for eight weeks — the difference being that P *was* meant to be built, and this deliberately is not. The failure mode here is the mirror image: not *"we said we would and did not,"* but *"nobody knew this only worked on one host until a fleet spanned two."*
+
+**No `Asserted by:` citation** (`#998`'s convention): this amendment names no artifact the tool must produce, and the self-limiting test answers cleanly — *nothing would break if this were "unimplemented,"* because it records a boundary rather than a mechanism. First non-mechanism amendment under that convention, and it correctly requires nothing.
+
+**References:** `#1018` (the directive) · `#1014` (the same unstated-remaining-work shape) · DR-043 §`deploy_path` · DR-022 Amendment P (the recording failure this pre-empts).
