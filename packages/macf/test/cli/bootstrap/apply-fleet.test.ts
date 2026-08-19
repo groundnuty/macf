@@ -2112,6 +2112,174 @@ trust:
     });
   });
 
+  // --- groundnuty/macf#986 — minting is fleet-scoped, publishing is per-repo ---
+  //
+  // Reproduces the reported live symptom: a working single-agent fleet
+  // extended to a SECOND agent. `fleet.lock` already records
+  // `routing_client_key` (a PRIOR apply run minted+published it for the
+  // FIRST agent's repo); the SECOND agent's repo is CONFIRMED this run but
+  // was never a publish target before. `mintRoutingClient` correctly SKIPS
+  // (never re-mints — that part always worked); the bug was that the
+  // publish loop was skipped ENTIRELY alongside it, so the second repo
+  // silently never got the secret even though `apply` exited 0.
+  describe('routing-client publish for a repo added AFTER the fleet-level mint (groundnuty/macf#986)', () => {
+    const PRIOR_LOCK_TWO_AGENTS: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [
+        { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+        { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+        { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-runner-ops' },
+      ],
+      fingerprints: { ca_key: 'sha256:deadbeef', routing_client_key: 'sha256:cafef00d' },
+    };
+
+    /** Every agent (both roles + runner-ops) takes the REUSED path — dispatch by appId, same technique as the "reused / resumed-install" test above. */
+    function reusedAgentDeps(): AgentApplyDeps {
+      return {
+        startManifestFlow: async () => { throw new Error('must not be called — every role has a prior lock entry'); },
+        startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+        exchangeManifestCode: async () => { throw new Error('must not be called'); },
+        resolveKeyPath: () => '/fake.pem',
+        confirmAppInstallation: async (appId) => {
+          const installId = appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-runner-ops';
+          return { status: 'confirmed', install: { appId, installId, appSlug: `demo-fleet-${appId}`, accountLogin: 'groundnuty' } };
+        },
+        waitForAppInstallation: async () => { throw new Error('must not be called'); },
+        openUrl: async () => {},
+        log: () => {},
+        writeRecoveryArtifact: async () => {},
+      };
+    }
+
+    /** CA already present in the registry -> `resolveCaCert` REUSES (never mints this run) -> `caMintedThisRun === false`, matching the reported live state. */
+    function reuseCaTrustDeps(): CaApplyDeps & RunnerRegistrationDeps {
+      return trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' });
+    }
+
+    it('THE DECISIVE TEST: with --vault/--identity-key wired, the NEW repo gets the secret CREATED and the mint seam (deps.mint) is NEVER called', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      let mintCalled = false;
+      const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedAgentDeps(), manifestPath),
+        trustDeps: reuseCaTrustDeps(),
+        routingClientDeps: {
+          mint: async () => {
+            mintCalled = true;
+            throw new Error('must not be called — a routing_client_key fingerprint is already recorded');
+          },
+          // code-agent's repo already has it (from the ORIGINAL apply run);
+          // science-agent's repo is the one just added — missing it.
+          checkRepoSecretPresence: async (repo) => (repo === 'groundnuty/demo-code' ? 'present' : 'absent'),
+          setRepoSecret: async (repo, name, value) => {
+            setSecretCalls.push({ repo, name, value });
+          },
+          readVaultRoutingClient: async () => ({ certPem: 'VAULT-RESTORED-CERT-PEM', keyPem: 'VAULT-RESTORED-KEY-PEM' }),
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, PRIOR_LOCK_TWO_AGENTS, deps);
+
+      // Mint decision unchanged — this always worked; asserted as the
+      // precondition the rest of this test depends on.
+      expect(result.routingClient.mint.status).toBe('skipped');
+      // THE decisive assertion: the crypto mint seam was NEVER invoked on
+      // the publish-to-new-repo path — the fix reads the vault, it never
+      // re-mints.
+      expect(mintCalled).toBe(false);
+
+      // Repo already holding it: untouched, reports already-present.
+      expect(result.routingClient.certLegs['groundnuty/demo-code']).toEqual({ status: 'already-present' });
+      expect(result.routingClient.keyLegs['groundnuty/demo-code']).toEqual({ status: 'already-present' });
+
+      // The NEW repo: actually gets the secret, sourced from the vault-restore.
+      expect(result.routingClient.certLegs['groundnuty/demo-science']).toEqual({ status: 'created' });
+      expect(result.routingClient.keyLegs['groundnuty/demo-science']).toEqual({ status: 'created' });
+      expect(setSecretCalls).toContainEqual({ repo: 'groundnuty/demo-science', name: 'ROUTING_CLIENT_CERT', value: 'VAULT-RESTORED-CERT-PEM' });
+      expect(setSecretCalls).toContainEqual({ repo: 'groundnuty/demo-science', name: 'ROUTING_CLIENT_KEY', value: 'VAULT-RESTORED-KEY-PEM' });
+      // The already-provisioned repo is NEVER re-written (create-only, no churn):
+      expect(setSecretCalls.some((c) => c.repo === 'groundnuty/demo-code')).toBe(false);
+
+      // A fully-covered fleet is a GREEN exit — the actual acceptance bar
+      // (this is the fix's positive mirror of the "no vault" test below,
+      // which asserts the run correctly goes RED instead).
+      expect(applyExitCode(result)).toBe(0);
+    });
+
+    it('prior mint + new repo + NO vault/--identity-key -> the new repo leg is a LOUD "failed", never a silent "skipped" — and it fails the run', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedAgentDeps(), manifestPath),
+        trustDeps: reuseCaTrustDeps(),
+        routingClientDeps: {
+          mint: async () => { throw new Error('must not be called'); },
+          checkRepoSecretPresence: async (repo) => (repo === 'groundnuty/demo-code' ? 'present' : 'absent'),
+          setRepoSecret: async () => { throw new Error('must not be called — no material to publish'); },
+          // readVaultRoutingClient deliberately OMITTED — no --vault/--identity-key this run.
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, PRIOR_LOCK_TWO_AGENTS, deps);
+
+      expect(result.routingClient.mint.status).toBe('skipped');
+      // The repo that already has it is unaffected by the missing vault:
+      expect(result.routingClient.certLegs['groundnuty/demo-code']).toEqual({ status: 'already-present' });
+      // The new repo: LOUD failure, never the old blanket 'skipped':
+      expect(result.routingClient.certLegs['groundnuty/demo-science']?.status).toBe('failed');
+      expect(result.routingClient.certLegs['groundnuty/demo-science']?.status).not.toBe('skipped');
+      if (result.routingClient.certLegs['groundnuty/demo-science']?.status === 'failed') {
+        expect(result.routingClient.certLegs['groundnuty/demo-science'].reason).toMatch(/--vault/);
+        expect(result.routingClient.certLegs['groundnuty/demo-science'].reason).toMatch(/--identity-key/);
+      }
+      // Never a silent green exit while a confirmed repo is unroutable:
+      expect(applyExitCode(result)).toBe(1);
+    });
+
+    it('never-minted-at-all fleets (no prior routing_client_key fingerprint) keep the ORIGINAL blanket-skip behaviour, byte-identical — this is NOT the #986 case', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLockNoRoutingClient: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [
+          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+          { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-runner-ops' },
+        ],
+        // NO fingerprints.routing_client_key — nothing has EVER been minted.
+      };
+      let presenceChecked = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedAgentDeps(), manifestPath),
+        trustDeps: reuseCaTrustDeps(),
+        routingClientDeps: {
+          mint: async () => { throw new Error('must not be called — CA was reused, not minted, this run'); },
+          checkRepoSecretPresence: async () => {
+            presenceChecked = true;
+            return 'absent';
+          },
+          setRepoSecret: async () => { throw new Error('must not be called'); },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLockNoRoutingClient, deps);
+
+      expect(result.routingClient.mint.status).toBe('skipped');
+      // Byte-identical to pre-#986: a blanket skip, no per-repo presence
+      // check even attempted — there is genuinely nothing anywhere (no fresh
+      // mint, no vaulted prior mint) that could ever be published.
+      expect(presenceChecked).toBe(false);
+      expect(result.routingClient.certLegs['groundnuty/demo-code']).toEqual({
+        status: 'skipped',
+        reason: result.routingClient.mint.status === 'skipped' ? result.routingClient.mint.reason : undefined,
+      });
+      // This orthogonal, pre-existing steady state must NOT fail the run:
+      expect(applyExitCode(result)).toBe(0);
+    });
+  });
+
   // --- The runner-ops App (groundnuty/macf#943) ---
 
   describe('the runner-ops App (groundnuty/macf#943)', () => {

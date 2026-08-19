@@ -37,6 +37,8 @@ import {
   reencryptVault,
   vaultAgentPrivateKeyPem,
   vaultCaCertPem,
+  vaultRoutingClientCertPem,
+  vaultRoutingClientKeyPem,
   vaultRunnerOpsPrivateKeyPem,
   type VaultAgentObservation,
   type VaultCaObservation,
@@ -368,6 +370,40 @@ describe('vaultCaCertPem — the CA-cert revive query (groundnuty/macf#978)', ()
 
   it('returns undefined against an empty vault map — never fabricates a cert', () => {
     expect(vaultCaCertPem({}, FLEET)).toBeUndefined();
+  });
+});
+
+describe('vaultRoutingClientCertPem / vaultRoutingClientKeyPem — the routing-client publish-restore query (groundnuty/macf#986)', () => {
+  const raw = parseVaultPlaintext(buildVaultPlaintext(PAYLOAD));
+
+  it('returns the exact original routing-client CERT PEM — round-trips through the base64 storage form', () => {
+    expect(vaultRoutingClientCertPem(raw)).toBe(PAYLOAD.routing?.clientCertPem);
+  });
+
+  it('returns the exact original routing-client KEY PEM', () => {
+    expect(vaultRoutingClientKeyPem(raw)).toBe(PAYLOAD.routing?.clientKeyPem);
+  });
+
+  it('the cert query never returns the key, and vice versa', () => {
+    expect(vaultRoutingClientCertPem(raw)).not.toBe(PAYLOAD.routing?.clientKeyPem);
+    expect(vaultRoutingClientKeyPem(raw)).not.toBe(PAYLOAD.routing?.clientCertPem);
+  });
+
+  it('fleet-level, not per-project — unlike vaultCaCertPem there is no fleetName parameter to key on', () => {
+    // Same `raw` map, no second argument — the routing-client cert is ONE
+    // fleet-wide credential (CN=routing-action), never per-project.
+    expect(vaultRoutingClientCertPem(raw)).toBeDefined();
+  });
+
+  it('returns undefined against an empty vault map — never fabricates a cert/key', () => {
+    expect(vaultRoutingClientCertPem({})).toBeUndefined();
+    expect(vaultRoutingClientKeyPem({})).toBeUndefined();
+  });
+
+  it('returns undefined when only the OTHER routing field is present (partial vault content)', () => {
+    const partial = { ROUTING_CLIENT_CERT_B64: Buffer.from('CERT-ONLY', 'utf-8').toString('base64') };
+    expect(vaultRoutingClientCertPem(partial)).toBe('CERT-ONLY');
+    expect(vaultRoutingClientKeyPem(partial)).toBeUndefined();
   });
 });
 

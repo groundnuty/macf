@@ -68,7 +68,14 @@ import type { RoutingClientApplyDeps } from '../bootstrap/apply-routing-client.j
 import { realMintRoutingClient, realSetRepoSecret } from '../bootstrap/apply-routing-client.js';
 import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
 import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
-import { readVault, vaultAgentPrivateKeyPem, vaultCaCertPem, vaultRunnerOpsPrivateKeyPem } from '../bootstrap/vault-read.js';
+import {
+  readVault,
+  vaultAgentPrivateKeyPem,
+  vaultCaCertPem,
+  vaultRoutingClientCertPem,
+  vaultRoutingClientKeyPem,
+  vaultRunnerOpsPrivateKeyPem,
+} from '../bootstrap/vault-read.js';
 import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
 import type { AppNameLengthCheck } from '../bootstrap/apply-runner-ops.js';
@@ -651,6 +658,46 @@ export function resolveMutateDeps(
         }
       : undefined;
 
+  // groundnuty/macf#986 — the routing-client vault-restore fallback
+  // (`apply-routing-client.ts::RoutingClientVaultRestoreDeps.readVaultRoutingClient`).
+  // Same both-or-neither / never-throws / never-logs-a-value contract as
+  // `readVaultCaCert` above, and the SAME reasoning for re-decrypting the
+  // vault independently rather than threading a shared `raw` payload
+  // through — this closure is invoked at most once per run (only on the
+  // "a prior run already minted this fleet's routing-client cert" path),
+  // so a third `age -d` in the same run is not a hot path. Unlike
+  // `readVaultCaCert` (cert PEM only — the CA's public material), this
+  // returns BOTH `certPem` AND `keyPem`: a routing-client secret has no
+  // registry-variable "public half" to reuse — the only way to publish it
+  // to a new repo is to hold the actual key bytes.
+  const readVaultRoutingClient =
+    vaultPath !== undefined && identityKeyPath !== undefined
+      ? async (): Promise<{ readonly certPem: string; readonly keyPem: string } | undefined> => {
+          try {
+            const raw = await readVault({ vaultPath, identityPath: identityKeyPath });
+            const certPem = vaultRoutingClientCertPem(raw);
+            const keyPem = vaultRoutingClientKeyPem(raw);
+            if (certPem === undefined || keyPem === undefined) return undefined;
+            return { certPem, keyPem };
+          } catch (err) {
+            // Amendment A4 honest-unknown floor, extended to routing-client
+            // restore: a failed decrypt must degrade to the existing
+            // "no material available" outcome, never be read as "the vault
+            // has nothing" nor fabricate a false restore. `VaultError`
+            // messages are pre-scrubbed of secret material at the source
+            // (`vault-read.ts`'s own doc), so logging one verbatim here is
+            // safe — never a PEM.
+            const reason = err instanceof Error ? err.message : String(err);
+            process.stderr.write(
+              `Routing-client vault-restore UNAVAILABLE this run — ${reason} — falling back to the existing ` +
+                'honest-unavailable reason (this is NOT evidence the routing-client cert is actually gone, only ' +
+                'that the vault could not be read).\n',
+            );
+            return undefined;
+          }
+        }
+      : undefined;
+
   // macf#913 — the vault-aware confirm-before-create guard's key resolver.
   // ONE scratch dir for the WHOLE run (not one per role), created lazily on
   // first use so a vault-free run (the common case) never touches the
@@ -695,7 +742,7 @@ export function resolveMutateDeps(
     controlRepoOptions: { confirmUnarchive: true },
     agentRepoDeps: REAL_AGENT_REPO_DEPS,
     trustDeps: { ...REAL_TRUST_DEPS, ...(readVaultCaCert !== undefined ? { readVaultCaCert } : {}) },
-    routingClientDeps: REAL_ROUTING_CLIENT_DEPS,
+    routingClientDeps: { ...REAL_ROUTING_CLIENT_DEPS, ...(readVaultRoutingClient !== undefined ? { readVaultRoutingClient } : {}) },
     now: () => new Date(),
     log: (line: string) => {
       process.stderr.write(`${line}\n`);

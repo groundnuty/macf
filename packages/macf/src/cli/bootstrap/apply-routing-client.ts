@@ -17,10 +17,7 @@
  * `gh secret set`'s own libsodium handling rather than this codebase's `gh
  * api --method POST` variable primitive), different create-only mechanics
  * (no 409-on-duplicate to lean on — see {@link checkRepoSecretPresence in observer.ts}'s
- * doc), and a narrower reuse story (a routing-client cert minted in a PRIOR
- * run can never be re-published to a repo THIS run adds, because its private
- * key was never durable anywhere `apply` can read back from — DR-043
- * Amendment C: apply never decrypt-reads the vault in this increment).
+ * doc).
  *
  * **Mint gating (the fork the task brief's "reused CA" edge case forces):**
  * a routing-client cert can only be minted on a run where `apply-fleet.ts`'s
@@ -31,8 +28,38 @@
  * built here). A fleet whose CA was minted in an EARLIER run, or whose
  * routing-client cert was ALREADY minted in a prior run (`fleet.lock`
  * recording a `routing_client_key` fingerprint — the SAME signal
- * `apply-fleet.ts` already uses for `lockHasCaKey`), skips with an explicit,
- * honest reason — never fabricated, never silently absent (Amendment A4).
+ * `apply-fleet.ts` already uses for `lockHasCaKey`), skips MINTING with an
+ * explicit, honest reason — never fabricated, never silently absent
+ * (Amendment A4).
+ *
+ * **Minting is fleet-scoped; publishing is per-repo (groundnuty/macf#986).**
+ * The paragraph this replaces used to end here: "...its private key was
+ * never durable anywhere `apply` can read back from — DR-043 Amendment C:
+ * apply never decrypt-reads the vault in this increment." That was true when
+ * this module was first built (macf#920), but `vault-read.ts` (Amendment D
+ * phase 3, macf#838) has since given `apply` exactly that read-back
+ * capability, and `apply-ca.ts::resolveCaCert`'s `'restored'` outcome
+ * (macf#978) already proves out the pattern for the CA cert. This module now
+ * has the routing-client sibling: {@link resolveRoutingClientSecretsForPublish}
+ * — called ONLY when {@link mintRoutingClient} itself did NOT mint this run
+ * (i.e. `deps.mint` is never invoked on this path, see that function's own
+ * "never re-mint" contract) — tries `deps.readVaultRoutingClient` (wired only
+ * when the operator supplied BOTH `--vault`/`--identity-key`, mirroring
+ * `CaMintDeps.readVaultCaCert`'s opt-in contract) to recover the ALREADY-
+ * minted cert/key pair from the vault so {@link publishRoutingClientSecrets}
+ * can create-only-deploy it to a repo the fleet gained AFTER the original
+ * mint — the exact "add a second agent" reproduction #986 reports. The bug
+ * this fixes: the OLD code folded "no fresh key in process memory this run"
+ * into "skip publishing to EVERY repo, including ones this run just
+ * confirmed" — treating "already minted" as "already published everywhere,"
+ * which are different facts. {@link publishRoutingClientSecrets} now ALWAYS
+ * runs its per-repo idempotent create-only loop (repos already holding the
+ * secret report `'already-present'` without ever touching `secrets`; repos
+ * missing it need `secrets.status === 'available'` or the leg reports a
+ * loud `'failed'` — see that function's doc) — the ONLY case that still
+ * skips the loop entirely is a FRESH mint whose vault write hasn't durably
+ * landed yet (the pre-existing `apply-fleet.ts` ordering-safety gate, kept
+ * byte-identical).
  */
 import { spawn } from 'node:child_process';
 import type { Presence } from './plan.js';
@@ -99,10 +126,11 @@ export async function mintRoutingClient(
       status: 'skipped',
       reason:
         'a routing-client cert was already minted for this fleet in a PRIOR apply run (fleet.lock records a ' +
-        'routing_client_key fingerprint) — its private key is not in process memory this run (DR-043 Amendment ' +
-        'C: apply does not decrypt-read the vault in this increment), so it cannot be re-derived to publish to any ' +
-        'repo this run might add. Re-mint manually via `macf certs issue-routing-client` + `gh secret set` if a ' +
-        'new agent repo needs it, or extend a future vault-aware apply increment.',
+        'routing_client_key fingerprint) — its private key is not in process memory this run. Never re-minted ' +
+        '(groundnuty/macf#986: minting is fleet-scoped, so this is the expected steady state, not a problem) — ' +
+        'publishing the already-minted cert/key to any repo this run confirms is handled SEPARATELY by ' +
+        '`resolveRoutingClientSecretsForPublish`, which reads it back from the vault when `--vault`/`--identity-key` ' +
+        'were both supplied.',
     };
   }
   if (!caMintedThisRun || caCertPem === undefined || caKeyPem === undefined) {
@@ -128,6 +156,120 @@ export async function mintRoutingClient(
   }
 }
 
+// --- Vault-restore (publish-time secrets resolution, groundnuty/macf#986) ---
+
+/**
+ * The already-resolved cert/key PAIR a publish attempt needs — sourced
+ * EITHER from a fresh {@link mintRoutingClient} `'minted'` result (in
+ * process memory this run) OR from {@link resolveRoutingClientSecretsForPublish}'s
+ * vault-restore (read back from a PRIOR run's mint). `'unavailable'` is a
+ * genuine, honest gap (DR-043 Amendment A4) — never fabricated material —
+ * and is NOT the same as "nothing to do": {@link publishRoutingClientSecrets}
+ * still runs its per-repo presence check when `'unavailable'`, so a repo
+ * that already has the secret still reports `'already-present'`; only a repo
+ * actually MISSING it turns the gap into a loud per-leg `'failed'` (see that
+ * function's doc).
+ */
+export type RoutingClientSecretsForPublish =
+  | { readonly status: 'available'; readonly certPem: string; readonly keyPem: string }
+  | { readonly status: 'unavailable'; readonly reason: string };
+
+export interface RoutingClientVaultRestoreDeps {
+  /**
+   * groundnuty/macf#986 — the vault-restore fallback for a routing-client
+   * cert/key that was minted in a PRIOR run (`fleet.lock` records a
+   * `routing_client_key` fingerprint) and therefore is NOT in process memory
+   * this run. Mirrors `apply-ca.ts::CaMintDeps.readVaultCaCert`'s contract
+   * exactly: `undefined` (the field omitted entirely — the default for every
+   * existing caller/test) means "vault-aware routing-client restore is NOT
+   * engaged this run," the byte-identical pre-#986 behaviour. Wired only by
+   * `commands/bootstrap-apply.ts::resolveMutateDeps`, and only when the
+   * operator supplied BOTH `--vault`/`--identity-key`.
+   *
+   * Unlike `readVaultCaCert` (cert PEM only — the CA's public material),
+   * this returns BOTH `certPem` AND `keyPem`: the routing-client secret is a
+   * GitHub Actions SECRET (write-only, no registry leg to reuse), so the
+   * only way to (re-)publish it to a repo is to hold the actual key bytes,
+   * never just a public fingerprint.
+   *
+   * **Contract: NEVER throws.** Any decrypt/parse failure (missing vault,
+   * wrong identity, malformed plaintext, field absent) MUST resolve to
+   * `undefined` — the same honest-unknown-over-false-present floor
+   * `readVaultCaCert`'s own doc establishes.
+   * {@link resolveRoutingClientSecretsForPublish} ALSO wraps this call in
+   * its own try/catch as defense-in-depth, but a caller SHOULD NOT rely on
+   * that as the primary safety net.
+   *
+   * **Contract: never logs.** Any diagnostic about WHY the read failed is
+   * the wiring caller's responsibility (see `resolveMutateDeps`'s own
+   * implementation) — this function returns only the PEMs or `undefined`,
+   * never a side-channel.
+   */
+  readonly readVaultRoutingClient?: () => Promise<{ readonly certPem: string; readonly keyPem: string } | undefined>;
+}
+
+/**
+ * Resolve what secrets (if any) a publish attempt has to work with, for the
+ * case {@link mintRoutingClient} did NOT mint this run (`mint.status` is
+ * `'skipped'` or `'failed'`) — a `'minted'` result is handled directly by
+ * the caller (`apply-fleet.ts`), never routed through here (see this
+ * function's own callers).
+ *
+ * **Never calls `deps.mint` (the crypto mint seam) — that is the whole
+ * point.** This function only ever reads `deps.readVaultRoutingClient`, an
+ * entirely separate dependency from {@link RoutingClientMintDeps.mint}; a
+ * caller wiring vault-restore can verifiably never trigger a re-mint through
+ * this path (groundnuty/macf#986's hard constraint).
+ *
+ * Vault-restore is attempted ONLY when `lockHasRoutingClientKey` is true
+ * (there is something in the vault worth trying to read back — mirrors
+ * `apply-ca.ts::resolveCaCert`'s own `lockHasCaKey`-gated vault-restore
+ * attempt) AND `deps.readVaultRoutingClient` is wired (both `--vault`/
+ * `--identity-key` were supplied). When `lockHasRoutingClientKey` is false,
+ * NOTHING has ever been minted for this fleet — there is nothing in the
+ * vault to restore either, so this degrades straight to `'unavailable'`
+ * with `mint.reason` unchanged, byte-identical to pre-#986 behaviour for
+ * that case.
+ */
+export async function resolveRoutingClientSecretsForPublish(
+  mint: Extract<RoutingClientMintOutcome, { status: 'skipped' | 'failed' }>,
+  lockHasRoutingClientKey: boolean,
+  deps: RoutingClientVaultRestoreDeps,
+): Promise<RoutingClientSecretsForPublish> {
+  if (lockHasRoutingClientKey && deps.readVaultRoutingClient !== undefined) {
+    let restored: { readonly certPem: string; readonly keyPem: string } | undefined;
+    try {
+      restored = await deps.readVaultRoutingClient();
+    } catch {
+      // Contract violation by the caller (readVaultRoutingClient must never
+      // throw) — defense-in-depth only; degrade exactly like "vault had
+      // nothing for this fleet" and fall through to the reason below.
+      restored = undefined;
+    }
+    if (restored !== undefined) {
+      return { status: 'available', certPem: restored.certPem, keyPem: restored.keyPem };
+    }
+    // Wired, but the vault read failed OR the vault simply doesn't have the
+    // fields (an inconsistent-but-real state: fleet.lock says minted, the
+    // vault says otherwise) — distinct hint from the "not wired at all" case
+    // below, since telling an operator who ALREADY supplied both flags to
+    // "supply both flags" would be actively misleading.
+    return {
+      status: 'unavailable',
+      reason:
+        `${mint.reason} A vault-restore was attempted (--vault/--identity-key were both supplied) but did not ` +
+        'yield a routing-client cert/key — check the vault actually holds ROUTING_CLIENT_CERT_B64/' +
+        'ROUTING_CLIENT_KEY_B64 for this fleet, or re-mint manually via `macf certs issue-routing-client`.',
+    };
+  }
+  const vaultHint =
+    lockHasRoutingClientKey && deps.readVaultRoutingClient === undefined
+      ? ' Supply both --vault and --identity-key to `macf bootstrap apply` so this fleet\'s already-minted ' +
+        'routing-client cert/key can be read back from the vault and published to any repo that does not yet have it.'
+      : '';
+  return { status: 'unavailable', reason: `${mint.reason}${vaultHint}` };
+}
+
 // --- Publish (create-only, per-repo GitHub Actions secrets) ---
 
 export interface RoutingClientPublishDeps {
@@ -141,27 +283,48 @@ export interface RoutingClientPublishResult {
 }
 
 /**
- * Create-only per-repo deploy of an ALREADY-MINTED routing-client cert/key
- * pair. Reuses `ensure-variable.ts::ensureVariableCreated` verbatim — its
- * `EnsureVariableDeps` shape (`checkPresence` + `create` returning
- * `'created'|'exists'`) is generic enough for a secret leg too: `create`
- * here NEVER returns `'exists'` (secrets have no distinguishable "the API
- * itself reported a duplicate" response the way a variable's 409 does — see
- * `observer.ts::checkRepoSecretPresence`'s doc), which is fine — `ensureVariableCreated`
- * only inspects that branch when `checkPresence` returned `'unknown'`, and
- * the un-atomicity between the presence check and the write is the SAME
- * accepted, documented gap `apply-ca.ts`/`ensure-variable.ts` already
- * carry for an operator-driven, non-concurrent bootstrap tool.
+ * Create-only per-repo deploy of a routing-client cert/key pair — ALWAYS
+ * runs the presence-check-then-maybe-create loop for EVERY given repo,
+ * regardless of whether `secrets` is `'available'` (groundnuty/macf#986:
+ * this is the fix — minting is fleet-scoped, but publishing is per-repo, so
+ * a repo already holding the secret must report `'already-present'` and a
+ * repo missing it must be actioned, INDEPENDENTLY of whether this run has
+ * fresh key material in memory). Reuses `ensure-variable.ts::ensureVariableCreated`
+ * verbatim — its `EnsureVariableDeps` shape (`checkPresence` + `create`
+ * returning `'created'|'exists'`) is generic enough for a secret leg too:
+ * `create` here NEVER returns `'exists'` (secrets have no distinguishable
+ * "the API itself reported a duplicate" response the way a variable's 409
+ * does — see `observer.ts::checkRepoSecretPresence`'s doc), which is fine —
+ * `ensureVariableCreated` only inspects that branch when `checkPresence`
+ * returned `'unknown'`, and the un-atomicity between the presence check and
+ * the write is the SAME accepted, documented gap `apply-ca.ts`/
+ * `ensure-variable.ts` already carry for an operator-driven, non-concurrent
+ * bootstrap tool.
  *
- * `keyPem` is SECRET — this function never logs it, never includes it in a
- * thrown message (a `setRepoSecret` failure's error text comes from `gh`'s
- * OWN stderr, which never echoes stdin-piped input — see
- * `realSetRepoSecret`'s doc), and never returns it in `RoutingClientPublishResult`
- * (which carries only `EnsureVariableOutcome`s — status/reason strings, no
- * value field exists to leak into).
+ * **`secrets.status === 'unavailable'` is NOT a reason to skip the loop —
+ * it only forecloses the `create` branch.** `checkPresence` runs
+ * regardless, so a repo that already has the secret (from an earlier apply
+ * run, or a manual `gh secret set`) reports `'already-present'` exactly as
+ * it would with fresh material in hand; `create` is only ever REACHED for a
+ * repo actually missing the secret, and there it throws `secrets.reason`
+ * verbatim — `ensureVariableCreated` folds that into a `'failed'` leg
+ * carrying the label + the honest-unavailable reason. This is the "genuine
+ * `unknown`, reported LOUDLY, never a silent skip" contract #986 asks for:
+ * a `'failed'` leg fails `apply`'s exit code (`commands/bootstrap-apply.ts::
+ * applyExitCode`'s `routingClientBad`), unlike the OLD blanket `'skipped'`
+ * this replaced, which reported "nothing attempted" for repos that were, in
+ * fact, missing routable credentials.
+ *
+ * `keyPem` is SECRET (when `secrets.status === 'available'`) — this
+ * function never logs it, never includes it in a thrown message (a
+ * `setRepoSecret` failure's error text comes from `gh`'s OWN stderr, which
+ * never echoes stdin-piped input — see `realSetRepoSecret`'s doc), and
+ * never returns it in `RoutingClientPublishResult` (which carries only
+ * `EnsureVariableOutcome`s — status/reason strings, no value field exists
+ * to leak into).
  */
 export async function publishRoutingClientSecrets(
-  secrets: { readonly certPem: string; readonly keyPem: string },
+  secrets: RoutingClientSecretsForPublish,
   repos: readonly string[],
   deps: RoutingClientPublishDeps,
 ): Promise<RoutingClientPublishResult> {
@@ -171,6 +334,7 @@ export async function publishRoutingClientSecrets(
     const certDeps: EnsureVariableDeps = {
       checkPresence: () => deps.checkRepoSecretPresence(repo, ROUTING_CLIENT_CERT_SECRET_NAME),
       create: async () => {
+        if (secrets.status !== 'available') throw new Error(secrets.reason);
         await deps.setRepoSecret(repo, ROUTING_CLIENT_CERT_SECRET_NAME, secrets.certPem);
         return 'created';
       },
@@ -180,6 +344,7 @@ export async function publishRoutingClientSecrets(
     const keyDeps: EnsureVariableDeps = {
       checkPresence: () => deps.checkRepoSecretPresence(repo, ROUTING_CLIENT_KEY_SECRET_NAME),
       create: async () => {
+        if (secrets.status !== 'available') throw new Error(secrets.reason);
         await deps.setRepoSecret(repo, ROUTING_CLIENT_KEY_SECRET_NAME, secrets.keyPem);
         return 'created';
       },
@@ -196,7 +361,7 @@ export function skippedRoutingClientPublish(repos: readonly string[], reason: st
 
 // --- Combined deps (what `apply-fleet.ts` actually wires) ---
 
-export interface RoutingClientApplyDeps extends RoutingClientMintDeps, RoutingClientPublishDeps {}
+export interface RoutingClientApplyDeps extends RoutingClientMintDeps, RoutingClientPublishDeps, RoutingClientVaultRestoreDeps {}
 
 // --- Real deps ---
 

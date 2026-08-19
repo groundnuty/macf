@@ -17,9 +17,16 @@ import {
   buildSetSecretArgs,
   mintRoutingClient,
   publishRoutingClientSecrets,
+  resolveRoutingClientSecretsForPublish,
   skippedRoutingClientPublish,
 } from '../../../src/cli/bootstrap/apply-routing-client.js';
-import type { RoutingClientMintDeps, RoutingClientPublishDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
+import type {
+  RoutingClientMintDeps,
+  RoutingClientMintOutcome,
+  RoutingClientPublishDeps,
+  RoutingClientSecretsForPublish,
+  RoutingClientVaultRestoreDeps,
+} from '../../../src/cli/bootstrap/apply-routing-client.js';
 
 function mintDepsWith(overrides: Partial<RoutingClientMintDeps> = {}): RoutingClientMintDeps {
   return {
@@ -165,7 +172,7 @@ describe('mintRoutingClient — mint-or-skip decision table', () => {
 });
 
 describe('publishRoutingClientSecrets — create-only per-repo deploy', () => {
-  const SECRETS = { certPem: 'CERT-PEM-VALUE', keyPem: 'KEY-PEM-VALUE' };
+  const SECRETS: RoutingClientSecretsForPublish = { status: 'available', certPem: 'CERT-PEM-VALUE', keyPem: 'KEY-PEM-VALUE' };
 
   it('publishes BOTH cert and key to every given repo, using the correct secret names', async () => {
     const calls: { repo: string; name: string; value: string }[] = [];
@@ -222,6 +229,123 @@ describe('publishRoutingClientSecrets — create-only per-repo deploy', () => {
     const result = await publishRoutingClientSecrets(SECRETS, [], publishDepsWith({ setRepoSecret: async () => { called = true; } }));
     expect(result).toEqual({ certLegs: {}, keyLegs: {} });
     expect(called).toBe(false);
+  });
+
+  // --- groundnuty/macf#986 — the loop runs REGARDLESS of secrets.status ---
+
+  const UNAVAILABLE: RoutingClientSecretsForPublish = { status: 'unavailable', reason: 'no vault, no fresh mint' };
+
+  it('secrets UNAVAILABLE + repo already has it -> already-present, setRepoSecret NEVER called (idempotent presence check runs independent of secret availability)', async () => {
+    const calls: { repo: string; name: string }[] = [];
+    const result = await publishRoutingClientSecrets(
+      UNAVAILABLE,
+      ['o/already-has-it'],
+      publishDepsWith({
+        checkRepoSecretPresence: async () => 'present',
+        setRepoSecret: async (repo, name) => {
+          calls.push({ repo, name });
+        },
+      }),
+    );
+    expect(result.certLegs['o/already-has-it']).toEqual({ status: 'already-present' });
+    expect(result.keyLegs['o/already-has-it']).toEqual({ status: 'already-present' });
+    expect(calls).toEqual([]);
+  });
+
+  it('secrets UNAVAILABLE + repo is MISSING it -> a LOUD "failed" leg carrying the reason, never a silent "skipped"', async () => {
+    const result = await publishRoutingClientSecrets(UNAVAILABLE, ['o/missing-it'], publishDepsWith());
+    expect(result.certLegs['o/missing-it']?.status).toBe('failed');
+    expect(result.keyLegs['o/missing-it']?.status).toBe('failed');
+    if (result.certLegs['o/missing-it']?.status === 'failed') expect(result.certLegs['o/missing-it'].reason).toContain('no vault, no fresh mint');
+    if (result.keyLegs['o/missing-it']?.status === 'failed') expect(result.keyLegs['o/missing-it'].reason).toContain('no vault, no fresh mint');
+  });
+
+  it('secrets UNAVAILABLE, mixed repos -> already-present for the one that has it, failed for the one that does not — never a blanket outcome', async () => {
+    const result = await publishRoutingClientSecrets(
+      UNAVAILABLE,
+      ['o/has-it', 'o/missing-it'],
+      publishDepsWith({ checkRepoSecretPresence: async (repo) => (repo === 'o/has-it' ? 'present' : 'absent') }),
+    );
+    expect(result.certLegs['o/has-it']).toEqual({ status: 'already-present' });
+    expect(result.certLegs['o/missing-it']?.status).toBe('failed');
+    if (result.certLegs['o/missing-it']?.status === 'failed') expect(result.certLegs['o/missing-it'].reason).toContain('no vault, no fresh mint');
+  });
+});
+
+describe('resolveRoutingClientSecretsForPublish (groundnuty/macf#986)', () => {
+  const SKIPPED_PRIOR_MINT: Extract<RoutingClientMintOutcome, { status: 'skipped' }> = {
+    status: 'skipped',
+    reason: 'a routing-client cert was already minted for this fleet in a PRIOR apply run',
+  };
+  const SKIPPED_NEVER_MINTED: Extract<RoutingClientMintOutcome, { status: 'skipped' }> = {
+    status: 'skipped',
+    reason: 'CA was not freshly minted this run',
+  };
+  const FAILED_MINT: Extract<RoutingClientMintOutcome, { status: 'failed' }> = {
+    status: 'failed',
+    reason: 'routing-client cert mint failed: x509 generation failed',
+  };
+
+  it('prior mint (lockHasRoutingClientKey) + vault WIRED + vault HAS it -> available, deps.mint is not part of this seam at all', async () => {
+    const deps: RoutingClientVaultRestoreDeps = {
+      readVaultRoutingClient: async () => ({ certPem: 'VAULT-CERT', keyPem: 'VAULT-KEY' }),
+    };
+    const result = await resolveRoutingClientSecretsForPublish(SKIPPED_PRIOR_MINT, true, deps);
+    expect(result).toEqual({ status: 'available', certPem: 'VAULT-CERT', keyPem: 'VAULT-KEY' });
+  });
+
+  it('prior mint + vault NOT wired (no --vault/--identity-key) -> unavailable, reason hints at supplying both flags', async () => {
+    const result = await resolveRoutingClientSecretsForPublish(SKIPPED_PRIOR_MINT, true, {});
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') {
+      expect(result.reason).toMatch(/already minted/);
+      expect(result.reason).toMatch(/--vault/);
+      expect(result.reason).toMatch(/--identity-key/);
+    }
+  });
+
+  it('prior mint + vault WIRED but returns undefined (vault read failed / field absent) -> unavailable, DIFFERENT reason (does not tell an operator who already supplied the flags to supply them)', async () => {
+    const deps: RoutingClientVaultRestoreDeps = { readVaultRoutingClient: async () => undefined };
+    const result = await resolveRoutingClientSecretsForPublish(SKIPPED_PRIOR_MINT, true, deps);
+    expect(result.status).toBe('unavailable');
+    if (result.status === 'unavailable') {
+      expect(result.reason).toMatch(/vault-restore was attempted/);
+    }
+  });
+
+  it('prior mint + vault WIRED but throws -> degrades to unavailable, NEVER throws out of this function (contract violation defense-in-depth)', async () => {
+    const deps: RoutingClientVaultRestoreDeps = {
+      readVaultRoutingClient: async () => {
+        throw new Error('age -d exploded');
+      },
+    };
+    await expect(resolveRoutingClientSecretsForPublish(SKIPPED_PRIOR_MINT, true, deps)).resolves.toMatchObject({ status: 'unavailable' });
+  });
+
+  it('NEVER minted at all (lockHasRoutingClientKey false) -> unavailable, vault is not even attempted (nothing to restore) even if a readVaultRoutingClient dep IS wired', async () => {
+    let vaultCalled = false;
+    const deps: RoutingClientVaultRestoreDeps = {
+      readVaultRoutingClient: async () => {
+        vaultCalled = true;
+        return { certPem: 'x', keyPem: 'y' };
+      },
+    };
+    const result = await resolveRoutingClientSecretsForPublish(SKIPPED_NEVER_MINTED, false, deps);
+    expect(vaultCalled).toBe(false);
+    expect(result).toEqual({ status: 'unavailable', reason: SKIPPED_NEVER_MINTED.reason });
+  });
+
+  it('a genuine mint FAILURE (crypto exception) -> unavailable, carrying the mint failure reason (lockHasRoutingClientKey is always false on this path, so vault is never attempted)', async () => {
+    const result = await resolveRoutingClientSecretsForPublish(FAILED_MINT, false, {});
+    expect(result).toEqual({ status: 'unavailable', reason: FAILED_MINT.reason });
+  });
+
+  it('NEVER includes raw cert/key material in an "unavailable" reason string', async () => {
+    const deps: RoutingClientVaultRestoreDeps = { readVaultRoutingClient: async () => undefined };
+    const result = await resolveRoutingClientSecretsForPublish(SKIPPED_PRIOR_MINT, true, deps);
+    if (result.status === 'unavailable') {
+      expect(result.reason).not.toMatch(/-----BEGIN/);
+    }
   });
 });
 
