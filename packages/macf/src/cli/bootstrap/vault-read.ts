@@ -90,6 +90,7 @@ import type { VaultEncryptFn, WriteVaultResult } from './vault-write.js';
 import { VaultError, ageEncryptToFile, serializeVaultRawMap } from './vault-write.js';
 import { secretFingerprint } from './fleet-lock.js';
 import { deriveAppHandle } from './fleet-manifest.js';
+import type { AppCredentials } from './manifest-exchange.js';
 // groundnuty/macf#954 — the runner-ops App's vault namespace is keyed on
 // `deriveRunnerOpsHandle` (== `deriveAppHandle(fleetName, RUNNER_OPS_ROLE)`),
 // the SAME derivation `apply-fleet.ts`/`vault-write.ts::buildVaultPlaintext`
@@ -334,6 +335,94 @@ export async function readVault(
 
   const plaintext = await decrypt(opts.vaultPath, opts.identityPath);
   return parseVaultPlaintext(plaintext);
+}
+
+// --- Recovery-artifact READ (macf#988, DR-043 Amendment B consume side) ---
+//
+// The write side (`vault-write.ts::writeAgentRecoveryArtifact` +
+// `operatorRecoveryArtifactPath`) is the DURABLE half of Amendment B; this
+// is the CONSUME half — decrypt + parse a recovery artifact back into a
+// typed `AppCredentials`, the same shape `manifest-exchange.ts::exchangeManifestCode`
+// produces, so a caller (`apply-agent.ts::finishGate2FromCredentials`) can
+// fold a recovered credential into the identical `status: 'created'` code
+// path a fresh gate-1 exchange would produce. Reuses this module's own
+// `ageDecryptFile` + `parseVaultPlaintext` primitives — the recovery
+// artifact is written with the SAME `KEY='value'` shape `buildVaultPlaintext`
+// uses (`vault-write.ts::buildRecoveryArtifactPlaintext`'s own `emitLine`
+// reuse), just under a `MACF_RECOVERY_<SEG>_*` prefix instead of
+// `MACF_AGENT_<SEG>_*`.
+
+/**
+ * Parse a decrypted recovery-artifact PLAINTEXT into a typed
+ * {@link AppCredentials} — the read-side mirror of
+ * `vault-write.ts::buildRecoveryArtifactPlaintext`. Pure — no I/O. Throws
+ * {@link VaultError} `recovery_artifact_malformed` (mirrors
+ * {@link parseVaultPlaintext}'s "throw rather than silently degrade"
+ * posture — a data primitive feeding a credential the caller is about to
+ * ACT on has no "must never die" constraint) when any expected
+ * `MACF_RECOVERY_<SEG>_*` field is missing or empty — a wrong role, a wrong
+ * fleet segment, or a corrupted/foreign file that happened to decrypt under
+ * the given identity all surface as this, never as a partially-populated
+ * `AppCredentials` with silently-empty fields.
+ */
+export function parseRecoveryArtifactPlaintext(plaintext: string, role: string): AppCredentials {
+  const raw = parseVaultPlaintext(plaintext);
+  const seg = toVariableSegment(role);
+  const need = (suffix: string): string => {
+    const key = `MACF_RECOVERY_${seg}_${suffix}`;
+    const value = raw[key];
+    if (value === undefined || value.length === 0) {
+      throw new VaultError(
+        'recovery_artifact_malformed',
+        `decrypted recovery artifact is missing "${key}" — not a valid recovery artifact for role "${role}" ` +
+          '(wrong role/fleet, or a corrupted file that still happened to decrypt under the given identity).',
+      );
+    }
+    return value;
+  };
+  return {
+    appId: need('APP_ID'),
+    name: need('APP_NAME'),
+    slug: need('APP_SLUG'),
+    clientId: need('CLIENT_ID'),
+    clientSecret: need('CLIENT_SECRET'),
+    webhookSecret: need('WEBHOOK_SECRET'),
+    pem: Buffer.from(need('PRIVATE_KEY_B64'), 'base64').toString('utf-8'),
+  };
+}
+
+export interface ReadRecoveryArtifactDeps {
+  readonly exists?: (path: string) => boolean;
+  readonly decrypt?: VaultDecryptFn;
+}
+
+/**
+ * Find + decrypt + parse a durable per-agent recovery artifact at
+ * `artifactPath` (macf#988). `undefined` means "nothing there" — the
+ * ORDINARY case (most roles never crash mid-gate) — checked via `exists`
+ * BEFORE ever invoking `age`, so the common "no artifact" path costs one
+ * `fs.existsSync` call, never a subprocess spawn. A file that DOES exist but
+ * fails to decrypt or parse REJECTS (wrong identity, corrupt file, or a
+ * `recovery_artifact_malformed` shape mismatch) — the caller
+ * (`apply-fleet.ts::buildAgentDepsWithRecovery`) is expected to catch that
+ * and log it, so an operator learns an artifact exists but couldn't be
+ * consumed, rather than the failure silently degrading to "nothing to
+ * recover."
+ *
+ * No plaintext ever touches disk (delegates to {@link ageDecryptFile}) —
+ * same load-bearing §D5 property {@link readVault} already establishes.
+ */
+export async function readRecoveryArtifact(
+  artifactPath: string,
+  identityPath: string,
+  role: string,
+  deps?: ReadRecoveryArtifactDeps,
+): Promise<AppCredentials | undefined> {
+  const exists = deps?.exists ?? existsSync;
+  if (!exists(artifactPath)) return undefined;
+  const decrypt = deps?.decrypt ?? ((p: string, ip: string) => ageDecryptFile(p, ip));
+  const plaintext = await decrypt(artifactPath, identityPath);
+  return parseRecoveryArtifactPlaintext(plaintext, role);
 }
 
 // --- Presence / derivation queries (pure, never throw, never return a value) ---

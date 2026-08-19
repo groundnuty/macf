@@ -68,17 +68,32 @@
  * even though the App exists on GitHub. {@link writeAgentRecoveryArtifact}
  * closes that hole WITHOUT waiting for the batched compose: it encrypts ONE
  * agent's just-exchanged credentials to their OWN path
- * ({@link agentRecoveryArtifactPath}, distinct from `vault.age` — the
+ * ({@link operatorRecoveryArtifactPath}, distinct from `vault.age` — the
  * single-shot clobber guard above is therefore irrelevant to it) the moment
- * they're received, before gate 2 starts. It is write-only insurance — never
- * read back by this module — and is deleted ({@link removeAgentRecoveryArtifact})
- * once the SAME credential has landed in the final `vault.age`. See
- * `apply-agent.ts` / `apply-fleet.ts` module docs for the call-site wiring
- * and the operator recovery procedure.
+ * they're received, before gate 2 starts, and is deleted
+ * ({@link removeAgentRecoveryArtifact}) once the SAME credential has landed
+ * in the final `vault.age`. See `apply-agent.ts` / `apply-fleet.ts` module
+ * docs for the call-site wiring.
+ *
+ * **Location, corrected (groundnuty/macf#988):** the artifact used to live
+ * inside `apply-fleet.ts`'s per-run control-repo `mkdtemp` checkout
+ * (`<secretsDir>/recovery/<role>.age`) — a directory that dies WITH the
+ * process. A run killed in the exact window this mechanism exists to
+ * survive (App created, credential durably written, then the process
+ * itself lost before the batched vault compose) took the artifact down
+ * with it, defeating the durability guarantee by its own location. The
+ * artifact now lives at {@link operatorRecoveryArtifactPath} — an
+ * operator-scoped, stable path OUTSIDE any per-run checkout — and, new in
+ * the same fix, {@link readRecoveryArtifact} in `vault-read.ts` makes it
+ * consumable: a LATER `apply` run finds + decrypts it and folds the
+ * credential into the vault instead of refusing (see `apply-agent.ts`'s
+ * `AgentApplyDeps.findRecoveryArtifact` doc for the consume-side wiring).
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { AppCredentials } from './manifest-exchange.js';
 
@@ -627,18 +642,53 @@ export async function writeVault(
 // --- Per-agent recovery artifact (§D5 "durable before gate 2") ---
 
 /**
- * `secrets/vault.age`'s sibling for per-agent write-only insurance —
- * `<secretsDir>/recovery/<role>.age`. `role` is schema-validated
- * `[a-z0-9-]` (`fleet-manifest.ts`'s `ROLE_CHARSET_RE`) — filesystem-safe as
- * written, no `toVariableSegment` transform needed (that transform is for
- * the shell-variable KEYS inside the plaintext, not this path). Exported so
- * `apply-fleet.ts` can compute the SAME path on both the write side
- * (`apply-agent.ts`'s `AgentApplyDeps.writeRecoveryArtifact` callback) and
- * the delete side (after a successful final vault compose) without the two
- * ever drifting apart.
+ * The real, operator-scoped recovery-artifact ROOT directory (macf#988,
+ * DR-043 Amendment B) — `~/.config/macf/recovery`, honoring `$XDG_CONFIG_HOME`
+ * when set (the XDG base-directory spec's own override for `~/.config`).
+ *
+ * `MACF_RECOVERY_DIR` is an explicit escape hatch — same `MACF_*`-override
+ * family as `MACF_BOOTSTRAP_VAULT_VERSION` / `MACF_OTEL_ENDPOINT`. Its real
+ * purpose is TEST SAFETY: `apply-fleet.ts::FleetApplyDeps.recoveryRootDir`
+ * is the preferred per-run injection seam (a test passes a tmpdir there
+ * directly), but honoring the env var HERE too means a test literal that
+ * forgets to set that field still cannot reach the real operator's home
+ * directory, as long as the suite sets this env var once, centrally
+ * (belt-and-suspenders — see `apply-fleet.test.ts`'s top-of-file setup).
  */
-export function agentRecoveryArtifactPath(secretsDir: string, role: string): string {
-  return join(secretsDir, 'recovery', `${role}.age`);
+export function defaultOperatorRecoveryRootDir(): string {
+  const override = process.env['MACF_RECOVERY_DIR'];
+  if (override !== undefined && override.length > 0) return override;
+  const xdgConfigHome = process.env['XDG_CONFIG_HOME'];
+  const configHome = xdgConfigHome !== undefined && xdgConfigHome.length > 0 ? xdgConfigHome : join(homedir(), '.config');
+  return join(configHome, 'macf', 'recovery');
+}
+
+/**
+ * `<recoveryRootDir>/<fleet>/<role>.age` — the durable per-agent recovery-
+ * artifact path (macf#988, DR-043 Amendment B's consume side). Pure
+ * path-join; `recoveryRootDir` is always an explicit argument, resolved
+ * ONCE by the caller (via {@link defaultOperatorRecoveryRootDir}, or a test
+ * override) — this function never reads `homedir()`/env itself, the same DI
+ * shape every other path-deriving function in this module already takes.
+ * `fleetName` (`fleet-manifest.ts`'s `FLEET_NAME_RE`) and `role`
+ * (`ROLE_CHARSET_RE`) are BOTH schema-restricted to `[a-z0-9-]` — neither
+ * can ever contain a path-traversal segment (`..`, `/`), which matters more
+ * now that this path lands under the operator's own `$HOME` rather than an
+ * ephemeral checkout. Exported so `apply-fleet.ts` can compute the SAME
+ * path on the write side (`apply-agent.ts`'s
+ * `AgentApplyDeps.writeRecoveryArtifact` callback), the consume side
+ * (`AgentApplyDeps.findRecoveryArtifact`, via `vault-read.ts`'s
+ * `readRecoveryArtifact`), and the delete side (after a successful final
+ * vault compose) without any of the three ever drifting apart.
+ *
+ * **Replaces the PRE-#988 location** this function used to derive
+ * (`<secretsDir>/recovery/<role>.age`, inside the per-run `mkdtemp`
+ * control-repo checkout — purged with the process, defeating Amendment B's
+ * own "durable before gate 2" promise; see the module doc's "Location,
+ * corrected" paragraph for the full incident).
+ */
+export function operatorRecoveryArtifactPath(recoveryRootDir: string, fleetName: string, role: string): string {
+  return join(recoveryRootDir, fleetName, `${role}.age`);
 }
 
 /**
@@ -667,19 +717,38 @@ function buildRecoveryArtifactPlaintext(role: string, creds: AppCredentials): st
   return `${lines.join('\n')}\n`;
 }
 
+/** Injectable seam for {@link writeAgentRecoveryArtifact}'s atomic-write tail (mirrors `vault-read.ts::ReencryptVaultDeps`'s identical shape). Production takes the real `fs` primitives; tests inject fakes for deterministic temp-file names / failure injection. */
+export interface WriteRecoveryArtifactDeps {
+  readonly rename?: (from: string, to: string) => void;
+  readonly chmod?: (path: string, mode: number) => void;
+  readonly unlink?: (path: string) => void;
+  /** Injectable randomness for a deterministic temp-file name in tests. Defaults to `crypto.randomBytes(6).toString('hex')`. */
+  readonly tmpSuffix?: () => string;
+}
+
 /**
  * Encrypt one agent's just-exchanged credentials to their own recovery-
  * artifact path — UNCONDITIONALLY (no `writeVault`-style exists/clobber
  * check: this file is write-only insurance on ITS OWN path, never the
  * store of record, so a stale leftover from an earlier interrupted run is
- * simply superseded). `mkdirSync(..., { recursive: true })` because
- * `secrets/recovery/` is new territory this increment introduces — unlike
- * `secrets/vault.age` (whose containing `secrets/` dir is presumed to
- * pre-exist from the vault-repo checkout, out of this increment's scope
- * per the module doc), the recovery subdirectory has no other reason to
- * exist yet, and this write is the one that MUST NOT fail on a missing
- * directory (that would defeat the entire "durable before gate 2"
- * invariant this function exists for).
+ * simply superseded). `mkdirSync(..., { recursive: true, mode: 0o700 })`
+ * because the per-fleet recovery directory is new territory every time a
+ * fleet is first provisioned, and this write is the one that MUST NOT fail
+ * on a missing directory (that would defeat the entire "durable before
+ * gate 2" invariant this function exists for).
+ *
+ * **Atomic + 0600 (macf#988 hard constraint — this artifact now lives under
+ * the operator's own `$HOME`, not a throwaway checkout, so both properties
+ * matter far more than they did at the old location):** encrypts to a
+ * `.tmp-<random>` sibling in the SAME directory (so the final `rename` is
+ * atomic on one filesystem — mirrors `vault-read.ts::reencryptVault`'s
+ * identical crash-safety shape), `chmod`s it `0600` BEFORE the rename (so
+ * the credential is never briefly world-readable at its final name), then
+ * renames it into place. A failure at ANY step (encrypt, chmod, rename)
+ * best-effort-unlinks the temp file and re-throws/rejects — never leaves a
+ * partial temp artifact behind, and never leaves a wrongly-permissioned
+ * file at `outPath` (either the atomic rename lands the fully-chmod'd file,
+ * or `outPath` is untouched).
  *
  * `encrypt` defaults to the real `age` binary; tests inject a fake (same
  * seam `writeVault` uses) so no real `age`/keys are needed.
@@ -690,6 +759,7 @@ export async function writeAgentRecoveryArtifact(
   recipients: readonly string[],
   outPath: string,
   encrypt: VaultEncryptFn = ageEncryptToFile,
+  deps: WriteRecoveryArtifactDeps = {},
 ): Promise<void> {
   if (recipients.length === 0) {
     throw new VaultError(
@@ -700,8 +770,40 @@ export async function writeAgentRecoveryArtifact(
     );
   }
   const plaintext = buildRecoveryArtifactPlaintext(role, creds);
-  mkdirSync(dirname(outPath), { recursive: true });
-  await encrypt(plaintext, recipients, outPath);
+  const dir = dirname(outPath);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+  const rename = deps.rename ?? renameSync;
+  const chmod = deps.chmod ?? chmodSync;
+  const unlink =
+    deps.unlink ??
+    ((p: string): void => {
+      try {
+        unlinkSync(p);
+      } catch {
+        /* best-effort — ENOENT (never created) or a permission issue; either way, nothing left to clean up here */
+      }
+    });
+  const suffix = deps.tmpSuffix?.() ?? randomBytes(6).toString('hex');
+  const tmpPath = join(dir, `.${basename(outPath)}.tmp-${suffix}`);
+
+  try {
+    await encrypt(plaintext, recipients, tmpPath);
+  } catch (err) {
+    unlink(tmpPath);
+    throw err;
+  }
+  try {
+    chmod(tmpPath, 0o600);
+    rename(tmpPath, outPath);
+  } catch (err) {
+    unlink(tmpPath);
+    throw new VaultError(
+      'vault_recovery_artifact_rename_failed',
+      `recovery artifact encrypted to a temp file but could not be made 0600 + renamed into place at "${outPath}": ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 /**

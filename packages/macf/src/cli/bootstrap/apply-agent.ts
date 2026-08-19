@@ -95,18 +95,30 @@
  * "closed" claim true for the orchestrator as a whole, not just for this
  * module in isolation. The artifact is deleted once the SAME credential
  * lands in the FINAL vault (`apply-fleet.ts`'s job, not this module's — it
- * owns the batched compose). What is still NOT automated
- * even with the artifact durable: on a crash between gate 1 and the final
- * vault write, a RE-RUN's confirm-before-create guard sees no `fleet.lock`
- * entry for this role (a lock entry requires gate 2 + a successful vault
- * write) and attempts gate 1 AGAIN — GitHub rejects the duplicate App name
- * loudly rather than resuming, so the re-run reports `status: 'failed'`
- * too. The App is orphaned-but-real on GitHub and its credential is
- * durable-but-unmerged in the recovery artifact; folding it into
- * `fleet.lock` + `vault.age` is a MANUAL operator step (decrypt the
- * artifact, then either complete the install + hand-merge the secret, or
- * delete the orphaned App and let a clean re-run recreate it) — see
- * `apply-fleet.ts`'s module doc for the full recovery procedure.
+ * owns the batched compose).
+ *
+ * **The RE-RUN half of this window is ALSO closed, as of macf#988
+ * (DR-043 Amendment B's consume side).** Originally: on a crash between
+ * gate 1 and the final vault write, a RE-RUN's confirm-before-create guard
+ * sees no `fleet.lock` entry for this role (a lock entry requires gate 2 +
+ * a successful vault write) and attempts gate 1 AGAIN — GitHub rejects the
+ * duplicate App name loudly rather than resuming, so the re-run ALSO
+ * reported `status: 'failed'`, leaving the App orphaned-but-real on GitHub
+ * and its credential durable-but-unmerged, recoverable only via a MANUAL
+ * operator decrypt-and-fold. `deps.findRecoveryArtifact` closes this
+ * automatically: `applyIdentity` checks it BEFORE either the App-name-
+ * collision pre-flight or gate 1 (see that function's call site + the
+ * artifact's new durable, operator-scoped location in `vault-write.ts`'s
+ * module doc — the location fix is WHAT makes automatic re-run recovery
+ * possible; the artifact has to outlive the crashed run for a later run to
+ * find it). A found + decrypted artifact resumes straight at consent gate
+ * 2 (see {@link finishGate2FromCredentials}) instead of re-attempting gate
+ * 1 — no manual decrypt-and-fold needed for the common case. The one
+ * residual: `deps.findRecoveryArtifact` can only decrypt when
+ * `--identity-key` is supplied to this `apply` run (the same operator
+ * identity that would decrypt the vault); without it, the artifact is
+ * still FOUND (existence is reported) but not consumed, and the run falls
+ * through to the pre-#988 refusal.
  */
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -254,6 +266,31 @@ export interface AgentApplyDeps {
    * only knows WHEN to call it, not WHERE the artifact lives.
    */
   readonly writeRecoveryArtifact: (role: string, creds: AppCredentials) => Promise<void>;
+  /**
+   * Look for + decrypt a durable recovery artifact for this role, checked
+   * ONCE on the CREATE path — BEFORE either the App-name-collision
+   * pre-flight or consent gate 1 (macf#988, DR-043 Amendment B's consume
+   * side; see this module's + `vault-write.ts`'s "Location, corrected" doc
+   * sections). A resolved credential means gate 1 is skipped entirely —
+   * this role already has a real GitHub App and its only credential copy
+   * from a PRIOR run that crashed after gate 1 succeeded but before that
+   * credential ever reached the vault — and the run resumes straight at
+   * consent gate 2 with the recovered credentials (see
+   * {@link finishGate2FromCredentials}). `undefined` (the RESOLVED value,
+   * not the field itself) means "nothing usable this run": either no
+   * artifact exists (the ordinary case), or one exists but couldn't be
+   * consumed (no `--identity-key` supplied, wrong key, or a
+   * malformed/corrupted file) — a real implementation logs WHY before
+   * resolving `undefined` so the operator can tell "nothing to recover"
+   * apart from "recovery was available but not applied." `undefined`/omitted
+   * (every pre-#988 caller/test) preserves the pre-#988 behavior exactly —
+   * always attempt gate 1 fresh, with the App-name-collision pre-flight as
+   * the (weaker, refuse-only) backstop. Optional — fleet-level wiring
+   * (`apply-fleet.ts`, mirroring `writeRecoveryArtifact`'s own wiring)
+   * supplies the real implementation; this module only knows WHEN to call
+   * it, not WHERE the artifact lives or how it's decrypted.
+   */
+  readonly findRecoveryArtifact?: (role: string) => Promise<AppCredentials | undefined>;
   /**
    * Post-gate-2 install validation (groundnuty/macf#943) — called with the
    * `ConfirmedInstall` gate 2 just observed, BEFORE this module reports
@@ -543,6 +580,38 @@ export async function applyIdentity(
     });
   }
 
+  // macf#988 (DR-043 Amendment B consume side) — checked BEFORE either the
+  // App-name-collision pre-flight or gate 1: a role whose App already
+  // exists on GitHub but crashed before its credential reached the vault
+  // (this is the EXACT trace macf#988 reproduced: "REFUSED before consent
+  // gate 1 — App … already exists but is not in this fleet's vault") may
+  // have left a durable recovery artifact behind. Finding one here answers
+  // the collision question implicitly (the App exists AND we hold its only
+  // credential copy) and turns today's refusal into automatic resume —
+  // exactly the point of writing the artifact durably in the first place.
+  if (deps.findRecoveryArtifact) {
+    let recovered: AppCredentials | undefined;
+    try {
+      recovered = await deps.findRecoveryArtifact(role);
+    } catch (err) {
+      // Fail-open, same posture `checkAppNameCollision`'s own catch below
+      // takes — a throwing dep is inconclusive, never a refusal; GitHub's
+      // own App-name uniqueness remains the backstop either way.
+      deps.log(
+        `Role "${role}": recovery-artifact check failed (${errMessage(err)}) — proceeding as a normal create; ` +
+          "GitHub's own App-name uniqueness remains the backstop.",
+      );
+      recovered = undefined;
+    }
+    if (recovered !== undefined) {
+      deps.log(
+        `Role "${role}": recovered credentials from a durable recovery artifact (app_id ${recovered.appId}, ` +
+          `handle "${recovered.name}") — resuming at consent gate 2 instead of re-creating (DR-043 Amendment B, macf#988).`,
+      );
+      return finishGate2FromCredentials(role, recovered, manifest, repos, whyText, deps, true);
+    }
+  }
+
   // Pre-flight the App-NAME collision BEFORE gate 1 (groundnuty/macf#967
   // Defect 2 — see `checkAppNameCollision`'s doc). Only CONFIRMED 'present'
   // refuses; 'absent'/'unknown' proceed unchanged.
@@ -623,6 +692,43 @@ export async function applyIdentity(
     `Role "${role}": App "${creds.name}" created (app_id ${creds.appId}), recovery artifact durably written — ` +
       'starting consent gate 2 (install).',
   );
+  return finishGate2FromCredentials(role, creds, manifest, repos, whyText, deps, false);
+}
+
+/**
+ * Run (or resume) consent gate 2 for a role whose credential is ALREADY
+ * known — either freshly minted via gate 1 moments ago, or recovered from a
+ * durable artifact a PRIOR run's gate 1 left behind before it crashed
+ * (macf#988, DR-043 Amendment B's consume side — see
+ * {@link applyIdentity}'s `deps.findRecoveryArtifact` call site). Both
+ * paths report the IDENTICAL `status: 'created'` shape — `apply-fleet.ts`'s
+ * vault-fold logic only cares that credentials exist to fold in, never
+ * which path produced them. `viaRecovery` changes only the wording of a
+ * gate-2-failure reason (naming the credential's origin for an operator
+ * reading the transcript), never the control flow.
+ *
+ * **Why the recovered path does NOT call `deps.writeRecoveryArtifact`
+ * again:** `AgentApplyDeps.writeRecoveryArtifact`'s own doc says "called
+ * EXACTLY once per CREATE path" — that invariant is about the FRESH-mint
+ * path (this function's `viaRecovery: false` caller), where writing the
+ * artifact IS what makes the just-exchanged credential durable. On the
+ * recovered path the credential is ALREADY durable — it is, by
+ * construction, the artifact `deps.findRecoveryArtifact` just read back —
+ * so re-writing it would just re-encrypt the identical bytes to the same
+ * path. Both paths still delete the SAME artifact once the credential
+ * lands in the final vault (`apply-fleet.ts`'s `operatorRecoveryArtifactPath`
+ * is deterministic in `(fleetName, role)`, independent of which path wrote
+ * it), so the durable-before-gate-2 invariant holds either way.
+ */
+async function finishGate2FromCredentials(
+  role: string,
+  creds: AppCredentials,
+  manifest: FleetManifest,
+  repos: readonly string[],
+  whyText: string,
+  deps: AgentApplyDeps,
+  viaRecovery: boolean,
+): Promise<AgentApplyOutcome> {
   const gate2Expected: ExpectedIdentity = { appSlug: creds.slug, accountLogin: manifest.owner.account };
   const pemPath = writeScratchPem(role, creds.pem);
   try {
@@ -635,7 +741,7 @@ export async function applyIdentity(
         role,
         status: 'failed',
         reason:
-          `${outcome.reason} — the App WAS created on GitHub (app_id ${creds.appId}, handle "${creds.name}") but ` +
+          `${outcome.reason} — the App WAS created on GitHub (${viaRecovery ? 'recovered from a durable recovery artifact; ' : ''}app_id ${creds.appId}, handle "${creds.name}") but ` +
           `its install did not complete. Finish the install manually at ${appInstallationUrl(creds.slug)} and ` +
           're-run once a vault-aware confirm is available, or delete the orphaned App on GitHub and retry.',
       };

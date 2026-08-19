@@ -80,6 +80,7 @@ import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
 import type { AppNameLengthCheck } from '../bootstrap/apply-runner-ops.js';
 import { RUNNER_OPS_ROLE, buildRunnerOpsManifest, checkAppNameLengths, deriveRunnerOpsHandle } from '../bootstrap/apply-runner-ops.js';
+import { defaultOperatorRecoveryRootDir, operatorRecoveryArtifactPath } from '../bootstrap/vault-write.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -1133,6 +1134,42 @@ export function applyExitCode(result: FleetApplyResult): number {
     : 0;
 }
 
+// --- Recovery-artifact presence notice (macf#988, DR-043 Amendment B requirement 4) ---
+
+/**
+ * A CHEAP, existence-only sweep for durable recovery artifacts
+ * (`vault-write.ts::operatorRecoveryArtifactPath`'s `~/.config/macf/recovery/<fleet>/<role>.age`)
+ * — surfaces "recovery is available" to the operator BEFORE any browser
+ * click, even on a `--dry-run` or a `--yes` run with no `--identity-key`
+ * supplied. Deliberately existence-only: `exists` is a bare `fs.existsSync`
+ * check, NEVER an `age -d` invocation — no identity key is read or needed
+ * here. The actual CONSUME path (`apply-fleet.ts::buildAgentDepsWithRecovery`'s
+ * `findRecoveryArtifact`) is the only place these artifacts are ever
+ * decrypted; this function only answers "does a file exist at that path."
+ * `recoveryRootDir` defaults to the real
+ * {@link defaultOperatorRecoveryRootDir}; tests inject an `exists` fake
+ * (never a real filesystem probe against a fixture's fake paths).
+ */
+export function findAvailableRecoveryArtifacts(
+  manifest: FleetManifest,
+  exists: (path: string) => boolean = existsSync,
+  recoveryRootDir: string = defaultOperatorRecoveryRootDir(),
+): readonly string[] {
+  const roles = [...manifest.agents.map((a) => a.role), RUNNER_OPS_ROLE];
+  return roles.filter((role) => exists(operatorRecoveryArtifactPath(recoveryRootDir, manifest.metadata.name, role)));
+}
+
+/** Pure text builder for {@link findAvailableRecoveryArtifacts}'s result — shared by the `--dry-run` render and the real pre-approval render so the wording never drifts between the two. */
+export function formatRecoveryArtifactNotice(roles: readonly string[]): string {
+  return (
+    `⚠ Durable recovery artifact(s) found for: ${roles.join(', ')} (DR-043 Amendment B, macf#988) — a prior run's ` +
+    'App creation reached the vault-durability step but that run did not complete. Supply --identity-key (and ' +
+    '--vault) to this apply and it will be consumed automatically — the recovered credential folds into the vault ' +
+    'instead of a new App being created. Without --identity-key, this run treats the role the same as before this ' +
+    'fix (a collision refusal if the App also still exists on GitHub).'
+  );
+}
+
 // --- Entry point ---
 
 /**
@@ -1242,6 +1279,12 @@ export async function runBootstrapApply(
     // preview confirms live is dropped from "would be created" in BOTH the
     // `--dry-run` render below AND the real path's pre-approval render.
     const displayCreations = preview !== undefined ? filterCreationsByPreview(creations, preview) : creations;
+    // macf#988 requirement 4 — existence-only, never decrypted here (see
+    // `findAvailableRecoveryArtifacts`'s doc); surfaced on BOTH the
+    // `--dry-run` render and the real pre-approval render so an operator
+    // learns recovery is available before spending a browser click,
+    // regardless of whether `--identity-key` was supplied this run.
+    const availableRecoveryRoles = findAvailableRecoveryArtifacts(manifest);
 
     if (opts.dryRun === true) {
       if (opts.json) {
@@ -1265,6 +1308,10 @@ export async function runBootstrapApply(
           console.log('');
           console.log(formatIdentityPreview(preview));
         }
+        if (availableRecoveryRoles.length > 0) {
+          console.log('');
+          console.log(formatRecoveryArtifactNotice(availableRecoveryRoles));
+        }
         console.log('');
         console.log('DRY RUN — nothing was created, changed, or submitted.');
       }
@@ -1281,6 +1328,9 @@ export async function runBootstrapApply(
     process.stderr.write(`${formatPlanText(plan)}\n\n${formatPlannedAppCreations(displayCreations)}\n`);
     if (preview !== undefined) {
       process.stderr.write(`\n${formatIdentityPreview(preview)}\n`);
+    }
+    if (availableRecoveryRoles.length > 0) {
+      process.stderr.write(`\n${formatRecoveryArtifactNotice(availableRecoveryRoles)}\n`);
     }
 
     // macf#929/#932 — `resolvedRunnerToken` was already computed above (right

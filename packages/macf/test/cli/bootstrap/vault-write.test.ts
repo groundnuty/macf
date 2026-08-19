@@ -13,15 +13,15 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  ageEncryptToFile,
-  agentRecoveryArtifactPath,
-  buildVaultPlaintext,
-  removeAgentRecoveryArtifact,
   VaultError,
+  ageEncryptToFile,
+  buildVaultPlaintext,
+  operatorRecoveryArtifactPath,
+  removeAgentRecoveryArtifact,
   vaultAgentSecretsForFingerprint,
   vaultFleetSecretsForFingerprint,
   writeAgentRecoveryArtifact,
@@ -32,7 +32,7 @@ import {
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import { resolveAgeGate } from './age-binary-gate.js';
 
-const HAS_AGE = resolveAgeGate('vault-write.test.ts', 4);
+const HAS_AGE = resolveAgeGate('vault-write.test.ts', 6);
 
 const AGENT: VaultAgentSecrets = {
   appHandle: 'demo-fleet-code-agent',
@@ -336,7 +336,7 @@ describe('writeVault — orchestration (injected deps, no real age)', () => {
   });
 });
 
-describe('agentRecoveryArtifactPath / writeAgentRecoveryArtifact / removeAgentRecoveryArtifact — §D5 durable-before-gate-2', () => {
+describe('operatorRecoveryArtifactPath / writeAgentRecoveryArtifact / removeAgentRecoveryArtifact — macf#988, §D5 durable-before-gate-2', () => {
   const CREDS: AppCredentials = {
     appId: '111',
     name: 'demo-fleet-code-agent',
@@ -347,31 +347,46 @@ describe('agentRecoveryArtifactPath / writeAgentRecoveryArtifact / removeAgentRe
     pem: '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-PEM\n-----END RSA PRIVATE KEY-----\n',
   };
 
-  it('agentRecoveryArtifactPath: own path under <secretsDir>/recovery/, distinct from vault.age', () => {
-    expect(agentRecoveryArtifactPath('/fake/secrets', 'code-agent')).toBe('/fake/secrets/recovery/code-agent.age');
+  it('operatorRecoveryArtifactPath: <recoveryRootDir>/<fleet>/<role>.age, distinct from vault.age', () => {
+    expect(operatorRecoveryArtifactPath('/fake/recovery-root', 'demo-fleet', 'code-agent')).toBe(
+      '/fake/recovery-root/demo-fleet/code-agent.age',
+    );
+  });
+
+  it('operatorRecoveryArtifactPath: DIFFERENT fleets with the SAME role never collide (the whole point of the fleet segment)', () => {
+    const a = operatorRecoveryArtifactPath('/fake/recovery-root', 'fleet-a', 'code-agent');
+    const b = operatorRecoveryArtifactPath('/fake/recovery-root', 'fleet-b', 'code-agent');
+    expect(a).not.toBe(b);
   });
 
   it('writeAgentRecoveryArtifact throws VaultError(vault_no_age_recipient) with zero recipients — never calls encrypt', async () => {
     let encryptCalled = false;
     await expect(
-      writeAgentRecoveryArtifact('code-agent', CREDS, [], '/fake/secrets/recovery/code-agent.age', async () => {
+      writeAgentRecoveryArtifact('code-agent', CREDS, [], '/fake/recovery-root/demo-fleet/code-agent.age', async () => {
         encryptCalled = true;
       }),
     ).rejects.toThrow(VaultError);
     expect(encryptCalled).toBe(false);
   });
 
-  it('writeAgentRecoveryArtifact creates the recovery dir for real, then encrypts a role-scoped plaintext to the exact outPath', async () => {
+  it('writeAgentRecoveryArtifact creates the recovery dir for real, encrypts to a TEMP sibling (never the final path directly), then atomically renames into place', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'macf-recovery-artifact-test-'));
     try {
-      const outPath = join(dir, 'secrets', 'recovery', 'code-agent.age');
+      const outPath = join(dir, 'demo-fleet', 'code-agent.age');
       const calls: { plaintext: string; recipients: readonly string[]; outPath: string }[] = [];
       await writeAgentRecoveryArtifact('code-agent', CREDS, ['age1operator', 'age1vm'], outPath, async (plaintext, recipients, path) => {
         calls.push({ plaintext, recipients, outPath: path });
+        // A real encrypt call always creates a file at the path it's given —
+        // the fake must too, or the atomic rename below has nothing to
+        // chmod/rename (macf#988's own hard constraint).
+        writeFileSync(path, 'FAKE-CIPHERTEXT');
       });
-      expect(existsSync(join(dir, 'secrets', 'recovery'))).toBe(true); // mkdir -p happened for real
+      expect(existsSync(join(dir, 'demo-fleet'))).toBe(true); // mkdir -p happened for real
       expect(calls).toHaveLength(1);
-      expect(calls[0]?.outPath).toBe(outPath);
+      // `encrypt` is called with a TEMP sibling path, NEVER the final
+      // outPath directly — the atomicity property macf#988 adds.
+      expect(calls[0]?.outPath).not.toBe(outPath);
+      expect(calls[0]?.outPath).toContain('.tmp-');
       expect(calls[0]?.recipients).toEqual(['age1operator', 'age1vm']);
       expect(calls[0]?.plaintext).toContain("MACF_RECOVERY_CODE_AGENT_APP_ID='111'");
       expect(calls[0]?.plaintext).toContain("MACF_RECOVERY_CODE_AGENT_APP_SLUG='demo-fleet-code-agent'");
@@ -382,20 +397,59 @@ describe('agentRecoveryArtifactPath / writeAgentRecoveryArtifact / removeAgentRe
       expect(calls[0]?.plaintext).toContain("MACF_RECOVERY_CODE_AGENT_PRIVATE_KEY_B64='");
       // No installId anywhere — gate 2 hasn't happened yet at write time:
       expect(calls[0]?.plaintext).not.toContain('INSTALL_ID');
+      // The temp file is GONE (renamed away); the FINAL file exists at outPath, mode 0600:
+      expect(existsSync(calls[0]!.outPath)).toBe(false);
+      expect(existsSync(outPath)).toBe(true);
+      expect(statSync(outPath).mode & 0o777).toBe(0o600);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it('a rejected encrypt (e.g. age failure) propagates — no swallowed failure', async () => {
+  it('a rejected encrypt (e.g. age failure) propagates — no swallowed failure, no temp file left behind', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'macf-recovery-artifact-test-'));
     try {
-      const outPath = join(dir, 'secrets', 'recovery', 'code-agent.age');
+      const outPath = join(dir, 'demo-fleet', 'code-agent.age');
       await expect(
         writeAgentRecoveryArtifact('code-agent', CREDS, ['age1operator'], outPath, async () => {
           throw new Error('age exited 1: boom');
         }),
       ).rejects.toThrow(/age exited 1: boom/);
+      expect(existsSync(outPath)).toBe(false);
+      // Nothing (not even a stray .tmp- sibling) left in the recovery dir:
+      expect(readdirSync(join(dir, 'demo-fleet'))).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a rename failure (post-encrypt) unlinks the temp file + rejects VaultError(vault_recovery_artifact_rename_failed) — never leaves a wrongly-permissioned file at outPath', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-recovery-artifact-test-'));
+    try {
+      const outPath = join(dir, 'demo-fleet', 'code-agent.age');
+      const unlinked: string[] = [];
+      await expect(
+        writeAgentRecoveryArtifact(
+          'code-agent',
+          CREDS,
+          ['age1operator'],
+          outPath,
+          async (_plaintext, _recipients, path) => {
+            writeFileSync(path, 'FAKE-CIPHERTEXT');
+          },
+          {
+            rename: () => {
+              throw new Error('simulated cross-device rename failure');
+            },
+            unlink: (p) => {
+              unlinked.push(p);
+            },
+          },
+        ),
+      ).rejects.toThrow(VaultError);
+      expect(unlinked).toHaveLength(1);
+      expect(unlinked[0]).toContain('.tmp-');
+      expect(existsSync(outPath)).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -416,6 +470,58 @@ describe('agentRecoveryArtifactPath / writeAgentRecoveryArtifact / removeAgentRe
 
   it('removeAgentRecoveryArtifact is a silent no-op (never throws) when the file is already gone', () => {
     expect(() => removeAgentRecoveryArtifact('/definitely/does/not/exist/code-agent.age')).not.toThrow();
+  });
+
+  it.skipIf(!HAS_AGE)(
+    'REAL age binary: the artifact is genuinely encrypted (age magic bytes, no PEM sentinel in the ciphertext) and mode 0600',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-recovery-artifact-real-age-test-'));
+      try {
+        const keyPath = join(dir, 'key.txt');
+        const r = spawnSync('age-keygen', ['-o', keyPath], { encoding: 'utf-8' });
+        expect(r.status, r.stderr).toBe(0);
+        const match = /age1[0-9a-z]+/.exec(readFileSync(keyPath, 'utf-8'));
+        expect(match).not.toBeNull();
+        const publicKey = match?.[0] ?? '';
+
+        const outPath = join(dir, 'demo-fleet', 'code-agent.age');
+        // No `encrypt` override — real `ageEncryptToFile` runs.
+        await writeAgentRecoveryArtifact('code-agent', CREDS, [publicKey], outPath);
+
+        expect(existsSync(outPath)).toBe(true);
+        expect(statSync(outPath).mode & 0o777).toBe(0o600);
+        const bytes = readFileSync(outPath);
+        expect(bytes.toString('utf-8').startsWith('age-encryption.org/v1')).toBe(true);
+        // The plaintext PEM sentinel must NEVER appear in the ciphertext:
+        expect(bytes.toString('latin1')).not.toContain('SENTINEL-PEM');
+
+        const d = spawnSync('age', ['-d', '-i', keyPath, outPath], { encoding: 'utf-8' });
+        expect(d.status, d.stderr).toBe(0);
+        expect(d.stdout).toContain("MACF_RECOVERY_CODE_AGENT_APP_ID='111'");
+        expect(d.stdout).toContain("MACF_RECOVERY_CODE_AGENT_PRIVATE_KEY_B64='");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!HAS_AGE)('REAL age binary: a WRONG identity cannot decrypt the recovery artifact', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-recovery-artifact-real-age-test-'));
+    try {
+      const rightKeyPath = join(dir, 'right-key.txt');
+      const wrongKeyPath = join(dir, 'wrong-key.txt');
+      expect(spawnSync('age-keygen', ['-o', rightKeyPath], { encoding: 'utf-8' }).status).toBe(0);
+      expect(spawnSync('age-keygen', ['-o', wrongKeyPath], { encoding: 'utf-8' }).status).toBe(0);
+      const rightPublicKey = /age1[0-9a-z]+/.exec(readFileSync(rightKeyPath, 'utf-8'))?.[0] ?? '';
+
+      const outPath = join(dir, 'demo-fleet', 'code-agent.age');
+      await writeAgentRecoveryArtifact('code-agent', CREDS, [rightPublicKey], outPath);
+
+      const d = spawnSync('age', ['-d', '-i', wrongKeyPath, outPath], { encoding: 'utf-8' });
+      expect(d.status).not.toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

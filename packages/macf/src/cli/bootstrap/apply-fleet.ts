@@ -18,12 +18,15 @@
  * `control-repo.ts`'s module doc for the ownership/custody model). A
  * `foreign` or `failed` outcome there ABORTS THE ENTIRE RUN — no agent's
  * repo, App, or install is ever touched. On success, `fleet.lock` /
- * `secrets/vault.age` / `secrets/recovery/<role>.age` all derive from the
- * control repo's LOCAL CHECKOUT (`controlRepo.localDir`), not from
- * `dirname(manifestPath)` — this is what structurally fixes the #854 "wrote
- * vault.age/fleet.lock to /tmp" bug (those paths used to derive from
- * wherever the OPERATOR happened to point `-f` at; now they derive from a
- * fresh clone of a repo `apply` itself owns the identity of).
+ * `secrets/vault.age` derive from the control repo's LOCAL CHECKOUT
+ * (`controlRepo.localDir`), not from `dirname(manifestPath)` — this is what
+ * structurally fixes the #854 "wrote vault.age/fleet.lock to /tmp" bug
+ * (those paths used to derive from wherever the OPERATOR happened to point
+ * `-f` at; now they derive from a fresh clone of a repo `apply` itself owns
+ * the identity of). The per-agent RECOVERY artifact does NOT derive from
+ * this checkout (macf#988 moved it OUT — see the "Recovery-artifact
+ * lifecycle" section below for why an ephemeral checkout was itself the
+ * bug for that one path).
  *
  * Within the per-agent loop, {@link ensureAgentRepo} (from
  * `apply-repo-init.ts`) runs FIRST for each agent — before
@@ -111,34 +114,36 @@
  * full invariant this binds.
  *
  * This module OWNS the recovery-artifact path (`vault-write.ts`'s
- * `agentRecoveryArtifactPath`) at both ends of its lifecycle, so the write
- * side and the delete side can never drift apart:
+ * `operatorRecoveryArtifactPath`) at ALL THREE ends of its lifecycle —
+ * write, consume, delete — so none of the three can ever drift apart:
  *
  *   - **Write side:** `applyFleet` builds ONE `writeRecoveryArtifact`
- *     closure (knowing the control-repo checkout dir, macf#857 — the
- *     recovery dir since Amendment F, was `dirname(manifestPath)` before —
- *     and `manifest.transport.age_recipients` → who it encrypts to) and splices
- *     it onto the `AgentApplyDeps` object `deps.buildAgentDeps` returns —
- *     that factory deliberately does NOT produce this field (see
- *     `apply-agent.ts`'s `realAgentApplyDeps` doc); this module is the one
- *     with the fleet-level context to build it. `apply-agent.ts` calls it
- *     per-agent, immediately after gate 1, before gate 2 — see its module
- *     doc.
+ *     closure (knowing `recoveryRootDir` — macf#988's operator-scoped,
+ *     stable directory, see below — and `manifest.transport.age_recipients`
+ *     → who it encrypts to) and splices it onto the `AgentApplyDeps` object
+ *     `deps.buildAgentDeps` returns — that factory deliberately does NOT
+ *     produce this field (see `apply-agent.ts`'s `realAgentApplyDeps` doc);
+ *     this module is the one with the fleet-level context to build it.
+ *     `apply-agent.ts` calls it per-agent, immediately after gate 1, before
+ *     gate 2 — see its module doc.
+ *   - **Consume side (macf#988, DR-043 Amendment B's read half):** the SAME
+ *     closure-builder (`buildAgentDepsWithRecovery`) also supplies
+ *     `findRecoveryArtifact` — called by `apply-agent.ts::applyIdentity`
+ *     BEFORE either the App-name-collision pre-flight or gate 1, on the
+ *     CREATE path only. A found + decryptable artifact resumes straight at
+ *     consent gate 2 with the recovered credentials instead of re-attempting
+ *     gate 1 (which would hit GitHub's duplicate-App-name rejection anyway).
+ *     Decrypting needs `--identity-key` (the SAME operator identity that
+ *     decrypts the vault); existence alone is reported without it (task
+ *     requirement: the operator learns recovery is available even on a run
+ *     that forgot the flag).
  *   - **Delete side:** ONLY after the batched final-vault compose SUCCEEDS
  *     (the same `vault.status === 'written'` branch that writes the batched
  *     `fleet.lock` entries below) does this module delete each `created`
  *     role's recovery artifact — its credential now has a durable home in
  *     the vault of record, so the write-only insurance copy is no longer
  *     needed. A FAILED compose deliberately leaves every recovery artifact
- *     from this run in place — see the recovery procedure below. "In place"
- *     means LOCAL DISK ONLY (corrected 2026-08-12, #857 review): the
- *     control-repo commit path stages an explicit allowlist that
- *     deliberately excludes `secrets/recovery/` (Amendment B — see
- *     `control-repo.ts`'s "git-committed content invariant" doc section), so
- *     a leftover artifact is never pushed to git. It survives only because
- *     this module never deletes the control-repo checkout dir (`controlDir`,
- *     below) — the operator recovers it from the persisted local checkout,
- *     not from git history.
+ *     from this run in place, findable by the NEXT run's consume side above.
  *   - **Pre-flight (the part that makes "closed" true, not just "usually
  *     true"):** `writeRecoveryArtifact` itself rejects when
  *     `transport.age_recipients` is empty (nothing to encrypt to) —
@@ -154,66 +159,43 @@
  *     ONLY reason the "credential-loss hole is closed" claim below is true
  *     rather than "true except when misconfigured."
  *
- * ## Recovery procedure — "App created, not yet in the final vault"
+ * ## Location, corrected (macf#988) — why the artifact used to defeat its own purpose
  *
- * A crash (or a failed batched vault write) after gate 1 succeeded for one
- * or more agents but before this module's `vault.status === 'written'`
- * branch runs leaves: (a) a REAL App on GitHub for each such role, (b) that
- * role's credential durable in `secrets/recovery/<role>.age`, and (c) NO
- * `fleet.lock` entry for that role (lock entries for `created` outcomes are
- * written only in the SAME branch that deletes the artifacts, above).
+ * Through 2026-08-12, the artifact lived at `<controlDir>/secrets/recovery/<role>.age`
+ * — INSIDE the per-run `mkdtemp` control-repo checkout (`controlDir`, above).
+ * That checkout dies with the process. A run killed in the EXACT window this
+ * mechanism exists to survive — gate 1 minted a real App, the artifact was
+ * durably written, then the PROCESS ITSELF was lost before the batched vault
+ * compose — took the artifact down with it: the App existed on GitHub, its
+ * credential was unrecoverable, and every subsequent `apply` correctly
+ * refused (the App-name-collision pre-flight, "already exists but is not in
+ * this fleet's vault") because ownership could never be proven again. The
+ * durability guarantee was defeated by its own location. `recoveryRootDir`
+ * (this function's first local, computed from `deps.recoveryRootDir` ??
+ * `vault-write.ts::defaultOperatorRecoveryRootDir()`) is now an
+ * OPERATOR-SCOPED, STABLE directory (`~/.config/macf/recovery/<fleet>/`)
+ * that outlives every `apply` run's checkout — the fix is the LOCATION; the
+ * consume side above is what makes that location fix actually pay off (a
+ * durable-but-never-read artifact is just as useless as a purged one).
  *
- * **Being accurate about what a re-run actually does today (no
- * auto-resume):** a re-run's `confirmBeforeCreateGuard` sees no
- * `fleet.lock` entry for the role, so it authorizes `create` again —
- * `apply-agent.ts` attempts gate 1 A SECOND TIME with the SAME derived App
- * name. GitHub rejects the duplicate name loudly (rather than silently
- * creating a second App or transparently resuming the first), so the
- * re-run also reports `status: 'failed'` for that role. There is currently
- * NO code path that detects "this App already exists, resume from here" on
- * a re-run for a role with no lock entry — that would require a live
- * PEM→JWT presence check keyed on the DERIVED handle before attempting
- * create, which is out of this increment's scope (the same vault-aware
- * `resolveKeyPath` gap `apply-agent.ts`'s module doc already flags).
- *
- * **What IS durable, and the MANUAL recovery it enables:** the credential
- * itself is not lost — it survives in the recovery artifact. To recover:
- *
- *   1. Decrypt the artifact with the operator's (or the VM's) age identity:
- *      `age -d -i <identity-file> secrets/recovery/<role>.age` — the
- *      plaintext is a small shell-sourceable block (`MACF_RECOVERY_<ROLE>_*`
- *      keys: app id/name/slug/client id/client secret/webhook secret/PEM
- *      base64 — no `install_id`, since gate 2 never completed).
- *   2. If the App's install did NOT complete: finish it manually at
- *      `https://github.com/apps/<app-slug>/installations/new`, or delete
- *      the orphaned App in GitHub Settings → Developer settings → GitHub
- *      Apps and let a clean re-run recreate it from scratch (simpler if the
- *      install never happened and no other secret already depends on this
- *      App's identity).
- *   3. If the App's install DID complete (recorded install_id obtainable
- *      via `gh api /app/installations` with the recovered PEM, or from the
- *      GitHub UI): hand-compose a `fleet.lock` entry + fold the recovered
- *      secret into `vault.age` — `writeVault` does not merge, so this is a
- *      manual, one-off decrypt-edit-reencrypt of the vault by the operator,
- *      not an `apply` invocation. There is no automated tool for this fold
- *      in the current increment. **Field mapping** (the two plaintexts use
- *      DIFFERENT key prefixes — `buildVaultPlaintext` in `vault-write.ts`
- *      is the canonical target shape): recovery's `MACF_RECOVERY_<ROLE>_*`
- *      → vault's `MACF_AGENT_<HANDLE-SEGMENT>_*`, where `<HANDLE-SEGMENT>`
- *      is `toVariableSegment(deriveAppHandle(fleet, role))` — i.e. the
- *      SAME value as recovery's own `APP_NAME` field, NOT the bare role.
- *      `client_id`/`client_secret`/`webhook_secret` carry over 1:1;
- *      `PRIVATE_KEY_B64` in both is the SAME base64 PEM, copied verbatim;
- *      `install_id` has no source in the recovery artifact — it comes from
- *      wherever step 3 obtained it (the `gh api` call or the UI), above.
- *
- * This procedure is intentionally NOT fully automated in Slice 2b increment
- * 5a — the credential-loss hole IS closed (the pre-flight above means no
- * App is ever created when its credential could never be captured, so
- * nothing is silently gone for any App that DOES get created), but
- * automatic re-use of an orphaned-but-real App is future scope.
+ * **A sibling durable-write of the SAME class, found but NOT fixed here**
+ * (scope discipline — macf#988's brief is the recovery artifact
+ * specifically): `secrets/vault.age` and `fleet.lock` are STILL written into
+ * `controlDir` (the same per-run `mkdtemp` checkout) and only become
+ * genuinely durable once `syncControlRepo` pushes them to `<fleet>-control`
+ * at the very end of this function. The recovery-artifact DELETE above fires
+ * on `vault.status === 'written'` — which is the LOCAL encrypt succeeding,
+ * BEFORE that push. A crash (or a push failure) between "vault compose
+ * succeeded, artifacts deleted" and "the push actually landed" leaves the
+ * fresh `vault.age` durable ONLY in the about-to-be-purged checkout, with
+ * its own insurance already gone. Reordering the delete to after a
+ * confirmed push (or delaying it one run) would close this; left as a named
+ * gap rather than folded into this fix — `syncControlRepo` is also where a
+ * sibling in-flight fix (macf#989, the vault-rewrite refusal) is landing in
+ * this same file, and widening the touched surface there risks the two
+ * colliding mid-flight.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { TokenSource } from '@groundnuty/macf-core';
@@ -233,8 +215,9 @@ import type { VaultAgentSecrets, VaultCaSecrets, VaultEncryptFn, VaultRoutingCli
 import {
   VaultError,
   ageEncryptToFile,
-  agentRecoveryArtifactPath,
   buildVaultPlaintext,
+  defaultOperatorRecoveryRootDir,
+  operatorRecoveryArtifactPath,
   removeAgentRecoveryArtifact,
   vaultAgentSecretsForFingerprint,
   vaultFleetSecretsForFingerprint,
@@ -263,7 +246,7 @@ import type {
 } from './apply-routing-client.js';
 import { mintRoutingClient, publishRoutingClientSecrets, resolveRoutingClientSecretsForPublish, skippedRoutingClientPublish } from './apply-routing-client.js';
 import type { ComposeAndWriteVaultDeps, VaultRecipientCountResult } from './vault-read.js';
-import { composeAndWriteVault, readVaultRecipientCount, reencryptVault } from './vault-read.js';
+import { composeAndWriteVault, readRecoveryArtifact, readVaultRecipientCount, reencryptVault } from './vault-read.js';
 
 export interface FleetApplyDeps {
   /**
@@ -360,6 +343,28 @@ export interface FleetApplyDeps {
    * unset in production" precedent.
    */
   readonly vaultComposeDeps?: ComposeAndWriteVaultDeps;
+  /**
+   * Override for the recovery-artifact ROOT directory (macf#988, DR-043
+   * Amendment B). `undefined` (production —
+   * `commands/bootstrap-apply.ts::resolveMutateDeps` never sets this) takes
+   * {@link defaultOperatorRecoveryRootDir}'s real `~/.config/macf/recovery`
+   * default. Tests ALWAYS set this to a tracked tmpdir — see
+   * `apply-fleet.test.ts`'s `baseDeps` — so the suite never creates or
+   * touches anything under the real developer/CI machine's home directory.
+   */
+  readonly recoveryRootDir?: string;
+  /**
+   * Injectable seam for the recovery-artifact CONSUME side (macf#988) —
+   * mirrors `vaultRecipientDeps`'s own test-injection shape. `exists`
+   * overrides the file-presence check (defaults to real `fs.existsSync`);
+   * `decrypt` overrides the `age -d` call (defaults to real
+   * `vault-read.ts::ageDecryptFile` via `readRecoveryArtifact`'s own
+   * default). Production leaves both unset.
+   */
+  readonly recoveryReadDeps?: {
+    readonly exists?: (path: string) => boolean;
+    readonly decrypt?: (artifactPath: string, identityPath: string) => Promise<string>;
+  };
 }
 
 /**
@@ -546,30 +551,48 @@ function ageRecipients(manifest: FleetManifest): readonly string[] {
 }
 
 /**
- * Splice the fleet-level `writeRecoveryArtifact` implementation onto the
- * base `AgentApplyDeps` `deps.buildAgentDeps` returns — see this module's
- * doc's "Recovery-artifact lifecycle" section for why THIS module (not
- * `apply-agent.ts`, not `commands/bootstrap-apply.ts`) owns this wiring:
- * it is the layer that knows both the recovery dir (`secretsDir`, derived
- * from the control-repo checkout since macf#857 — see the caller) and
- * `manifest.transport.age_recipients` (→ who to encrypt to). Reuses
+ * Splice the fleet-level `writeRecoveryArtifact` + `findRecoveryArtifact`
+ * implementations onto the base `AgentApplyDeps` `deps.buildAgentDeps`
+ * returns — see this module's doc's "Recovery-artifact lifecycle" section
+ * for why THIS module (not `apply-agent.ts`, not `commands/bootstrap-apply.ts`)
+ * owns this wiring: it is the layer that knows the recovery ROOT
+ * (`recoveryRootDir`, macf#988 — an operator-scoped, stable directory,
+ * NOT the per-run control-repo checkout the pre-#988 wiring used), the
+ * fleet name, `manifest.transport.age_recipients` (→ who to encrypt to),
+ * and the operator's `--identity-key` (→ what can decrypt back). Reuses
  * `deps.vaultDeps.encrypt` — the SAME injectable `age` seam the final vault
  * write uses (task requirement: no separate encrypt seam to keep in sync).
  *
- * Logs the artifact's PATH (never its contents) on success — the whole
- * point of the artifact is that an operator can FIND it after a crash, so
- * the transcript has to say where. On failure, the path is folded into the
- * re-thrown error's message so it also reaches `AgentApplyOutcome.reason`
- * (the one surface `--json` output guarantees callers see) without
- * `apply-agent.ts` needing to know anything about paths.
+ * `writeRecoveryArtifact` logs the artifact's PATH (never its contents) on
+ * success — the whole point of the artifact is that an operator can FIND it
+ * after a crash, so the transcript has to say where. On failure, the path
+ * is folded into the re-thrown error's message so it also reaches
+ * `AgentApplyOutcome.reason` (the one surface `--json` output guarantees
+ * callers see) without `apply-agent.ts` needing to know anything about
+ * paths.
+ *
+ * `findRecoveryArtifact` (macf#988 consume side) checks existence
+ * UNCONDITIONALLY (needs no `--identity-key`) so a found-but-undecryptable
+ * artifact is still logged — the operator learns recovery is AVAILABLE even
+ * on a run that didn't supply the key to consume it (task requirement 4:
+ * "report when an artifact is found"). Only attempts the actual decrypt
+ * when `deps.identityKeyPath` is set.
  */
-function buildAgentDepsWithRecovery(secretsDir: string, recipients: readonly string[], deps: FleetApplyDeps): AgentApplyDeps {
+function buildAgentDepsWithRecovery(
+  recoveryRootDir: string,
+  fleetName: string,
+  recipients: readonly string[],
+  deps: FleetApplyDeps,
+): AgentApplyDeps {
   const base = deps.buildAgentDeps(deps.log);
   const encrypt: VaultEncryptFn = deps.vaultDeps.encrypt ?? ageEncryptToFile;
+  const identityKeyPath = deps.identityKeyPath;
+  const recoveryExists = deps.recoveryReadDeps?.exists ?? existsSync;
+  const recoveryDecrypt = deps.recoveryReadDeps?.decrypt;
   return {
     ...base,
     writeRecoveryArtifact: async (role: string, creds: AppCredentials): Promise<void> => {
-      const outPath = agentRecoveryArtifactPath(secretsDir, role);
+      const outPath = operatorRecoveryArtifactPath(recoveryRootDir, fleetName, role);
       try {
         await writeAgentRecoveryArtifact(role, creds, recipients, outPath, encrypt);
       } catch (err) {
@@ -577,6 +600,38 @@ function buildAgentDepsWithRecovery(secretsDir: string, recipients: readonly str
         throw new Error(`${msg} (recovery-artifact path: ${outPath})`, { cause: err });
       }
       deps.log(`Role "${role}": credential durably recorded at ${outPath} (recovery artifact, pre-gate-2, DR-043 §D5).`);
+    },
+    findRecoveryArtifact: async (role: string): Promise<AppCredentials | undefined> => {
+      const artifactPath = operatorRecoveryArtifactPath(recoveryRootDir, fleetName, role);
+      if (!recoveryExists(artifactPath)) return undefined;
+      if (identityKeyPath === undefined) {
+        deps.log(
+          `Role "${role}": a durable recovery artifact exists at ${artifactPath} (from a prior run's crash before ` +
+            'its credential reached the vault — DR-043 Amendment B, macf#988) but no --identity-key was given this ' +
+            'run, so it cannot be decrypted. Re-run with --identity-key <path> to consume it automatically.',
+        );
+        return undefined;
+      }
+      try {
+        const recovered = await readRecoveryArtifact(artifactPath, identityKeyPath, role, {
+          exists: recoveryExists,
+          ...(recoveryDecrypt !== undefined ? { decrypt: recoveryDecrypt } : {}),
+        });
+        if (recovered !== undefined) {
+          deps.log(
+            `Role "${role}": found + decrypted a durable recovery artifact at ${artifactPath} — consuming it ` +
+              '(DR-043 Amendment B, macf#988).',
+          );
+        }
+        return recovered;
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        deps.log(
+          `Role "${role}": a durable recovery artifact exists at ${artifactPath} but could not be decrypted ` +
+            `(${reason}) — proceeding as though it were absent; GitHub's own App-name uniqueness remains the backstop.`,
+        );
+        return undefined;
+      }
     },
   };
 }
@@ -764,6 +819,25 @@ export async function applyFleet(
   // therefore sees ONE coherent answer everywhere in this run, not two
   // independently-resolved calls that could in principle disagree.
   const vaultAlreadyExists = (deps.vaultDeps.exists ?? existsSync)(vaultOutPath);
+  // macf#988 review — `secretsDir` MUST exist before `settleVault`'s
+  // `writeVault` call (below) ever runs `age -o <vaultOutPath>`, which does
+  // NOT create missing parent directories itself. Pre-#988, this held only
+  // as an UNDOCUMENTED side effect: the per-agent recovery-artifact write
+  // used to live at `<secretsDir>/recovery/<role>.age`, and its own
+  // `mkdirSync(..., { recursive: true })` recursively created `secretsDir`
+  // as a byproduct, for any run with at least one `created` role. Moving
+  // the recovery artifact OUT of `secretsDir` (this fix's whole point)
+  // removes that byproduct — the precondition needs to be its own explicit
+  // statement now, not inherited from an unrelated write. (This was ALSO
+  // latently broken before #988 for a run that mints a FRESH CA/routing-
+  // client with ZERO created agents — no recovery write ever fired to
+  // create the directory as a side effect; this fix closes that case too.)
+  mkdirSync(secretsDir, { recursive: true });
+  // macf#988 (DR-043 Amendment B) — the recovery-artifact ROOT is
+  // DELIBERATELY not derived from `controlDir` (see `buildAgentDepsWithRecovery`'s
+  // doc): `controlDir` is a per-run `mkdtemp` checkout that dies with the
+  // process, exactly the location this fix moves the artifact AWAY from.
+  const recoveryRootDir = deps.recoveryRootDir ?? defaultOperatorRecoveryRootDir();
 
   // Self-heal (macf#857): a REUSE clone brings back whatever the PRIOR apply
   // already committed. Prefer that over the caller-supplied `priorLock`
@@ -816,7 +890,7 @@ export async function applyFleet(
     // `deps.buildAgentDeps` / the recovery-artifact writer are otherwise
     // identical every call; rebuilding is cheap (no I/O until a field is
     // invoked).
-    const agentDeps = buildAgentDepsWithRecovery(secretsDir, recipients, { ...deps, log: scopedLog });
+    const agentDeps = buildAgentDepsWithRecovery(recoveryRootDir, manifest.metadata.name, recipients, { ...deps, log: scopedLog });
 
     // macf#857 — ensure the agent's OWN repo exists BEFORE either consent
     // gate: gate 2's install page can't list a repo that doesn't exist yet
@@ -908,7 +982,7 @@ export async function applyFleet(
   // never gets here on a re-run once a lock entry exists, mirroring the
   // per-agent guard).
   const runnerOpsDeps: AgentApplyDeps = {
-    ...buildAgentDepsWithRecovery(secretsDir, recipients, {
+    ...buildAgentDepsWithRecovery(recoveryRootDir, manifest.metadata.name, recipients, {
       ...deps,
       log: (line: string): void => {
         deps.log(`[runner-ops] ${line}`);
@@ -1070,7 +1144,7 @@ export async function applyFleet(
     // (the `if` above not taken) deliberately leaves every artifact from
     // this run in place — see the module doc's recovery procedure.
     for (const role of Object.keys(pendingCreatedUpdates)) {
-      removeAgentRecoveryArtifact(agentRecoveryArtifactPath(secretsDir, role));
+      removeAgentRecoveryArtifact(operatorRecoveryArtifactPath(recoveryRootDir, manifest.metadata.name, role));
     }
   }
 

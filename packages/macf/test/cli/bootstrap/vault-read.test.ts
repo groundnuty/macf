@@ -39,19 +39,30 @@ import {
   reencryptVault,
   vaultAgentPrivateKeyPem,
   vaultCaCertPem,
+  parseRecoveryArtifactPlaintext,
+  readRecoveryArtifact,
   vaultRoutingClientCertPem,
   vaultRoutingClientKeyPem,
   vaultRunnerOpsPrivateKeyPem,
   type VaultAgentObservation,
   type VaultCaObservation,
 } from '../../../src/cli/bootstrap/vault-read.js';
-import { VaultError, buildVaultPlaintext, writeVault, type VaultAgentSecrets, type VaultPayload, type VaultRunnerOpsSecrets } from '../../../src/cli/bootstrap/vault-write.js';
+import {
+  VaultError,
+  buildVaultPlaintext,
+  writeAgentRecoveryArtifact,
+  writeVault,
+  type VaultAgentSecrets,
+  type VaultPayload,
+  type VaultRunnerOpsSecrets,
+} from '../../../src/cli/bootstrap/vault-write.js';
+import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import { deriveAppHandle } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { deriveRunnerOpsHandle } from '../../../src/cli/bootstrap/apply-runner-ops.js';
 import { secretFingerprint } from '../../../src/cli/bootstrap/fleet-lock.js';
 import { resolveAgeGate } from './age-binary-gate.js';
 
-const HAS_AGE = resolveAgeGate('vault-read.test.ts', 8);
+const HAS_AGE = resolveAgeGate('vault-read.test.ts', 9);
 
 const FLEET = 'demo-fleet';
 const ROLE = 'code-agent';
@@ -259,6 +270,115 @@ describe('readVault — orchestration (injected deps, no real age)', () => {
       expect((e as VaultError).code).toBe('vault_malformed_plaintext');
     }
   });
+});
+
+// --- macf#988, DR-043 Amendment B consume side ---
+
+const RECOVERY_CREDS: AppCredentials = {
+  appId: '9001',
+  name: 'demo-fleet-code-agent',
+  slug: 'demo-fleet-code-agent',
+  clientId: 'Iv1.recovery',
+  clientSecret: 'SYNTH-RECOVERY-CLIENT-SECRET',
+  webhookSecret: 'SYNTH-RECOVERY-WEBHOOK-SECRET',
+  pem: '-----BEGIN RSA PRIVATE KEY-----\nSYNTH-RECOVERY-PEM-BYTES\n-----END RSA PRIVATE KEY-----\n',
+};
+
+describe('parseRecoveryArtifactPlaintext — pure, offline', () => {
+  it('round-trips a well-formed recovery-artifact plaintext back into AppCredentials', () => {
+    const plaintext = [
+      "MACF_RECOVERY_CODE_AGENT_APP_ID='9001'",
+      "MACF_RECOVERY_CODE_AGENT_APP_NAME='demo-fleet-code-agent'",
+      "MACF_RECOVERY_CODE_AGENT_APP_SLUG='demo-fleet-code-agent'",
+      "MACF_RECOVERY_CODE_AGENT_CLIENT_ID='Iv1.recovery'",
+      "MACF_RECOVERY_CODE_AGENT_CLIENT_SECRET='SYNTH-RECOVERY-CLIENT-SECRET'",
+      "MACF_RECOVERY_CODE_AGENT_WEBHOOK_SECRET='SYNTH-RECOVERY-WEBHOOK-SECRET'",
+      `MACF_RECOVERY_CODE_AGENT_PRIVATE_KEY_B64='${Buffer.from(RECOVERY_CREDS.pem, 'utf-8').toString('base64')}'`,
+      '',
+    ].join('\n');
+    expect(parseRecoveryArtifactPlaintext(plaintext, 'code-agent')).toEqual(RECOVERY_CREDS);
+  });
+
+  it('throws recovery_artifact_malformed when a required field is missing (e.g. wrong role)', () => {
+    const plaintext = "MACF_RECOVERY_SCIENCE_AGENT_APP_ID='9001'\n";
+    try {
+      parseRecoveryArtifactPlaintext(plaintext, 'code-agent');
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect((e as VaultError).code).toBe('recovery_artifact_malformed');
+      expect((e as VaultError).message).toContain('MACF_RECOVERY_CODE_AGENT_APP_ID');
+      // Never leaks a value in the thrown message:
+      expect((e as VaultError).message).not.toContain('9001');
+    }
+  });
+});
+
+describe('readRecoveryArtifact — orchestration (injected deps, no real age)', () => {
+  it('returns undefined (never throws) when nothing exists at artifactPath — the ordinary "no crash happened" case', async () => {
+    const result = await readRecoveryArtifact('/fake/recovery-root/demo-fleet/code-agent.age', '/fake/key.txt', 'code-agent', {
+      exists: () => false,
+      decrypt: async () => {
+        throw new Error('must not be called — exists() already said absent');
+      },
+    });
+    expect(result).toBeUndefined();
+  });
+
+  it('decrypts + parses when the artifact exists', async () => {
+    const plaintext = [
+      "MACF_RECOVERY_CODE_AGENT_APP_ID='9001'",
+      "MACF_RECOVERY_CODE_AGENT_APP_NAME='demo-fleet-code-agent'",
+      "MACF_RECOVERY_CODE_AGENT_APP_SLUG='demo-fleet-code-agent'",
+      "MACF_RECOVERY_CODE_AGENT_CLIENT_ID='Iv1.recovery'",
+      "MACF_RECOVERY_CODE_AGENT_CLIENT_SECRET='SYNTH-RECOVERY-CLIENT-SECRET'",
+      "MACF_RECOVERY_CODE_AGENT_WEBHOOK_SECRET='SYNTH-RECOVERY-WEBHOOK-SECRET'",
+      `MACF_RECOVERY_CODE_AGENT_PRIVATE_KEY_B64='${Buffer.from(RECOVERY_CREDS.pem, 'utf-8').toString('base64')}'`,
+      '',
+    ].join('\n');
+    const seenArgs: { path: string; identity: string }[] = [];
+    const result = await readRecoveryArtifact('/fake/recovery-root/demo-fleet/code-agent.age', '/fake/key.txt', 'code-agent', {
+      exists: () => true,
+      decrypt: async (p, ip) => {
+        seenArgs.push({ path: p, identity: ip });
+        return plaintext;
+      },
+    });
+    expect(result).toEqual(RECOVERY_CREDS);
+    expect(seenArgs).toEqual([{ path: '/fake/recovery-root/demo-fleet/code-agent.age', identity: '/fake/key.txt' }]);
+  });
+
+  it('a decrypt failure (wrong identity / corrupt file) REJECTS — never silently returns undefined', async () => {
+    await expect(
+      readRecoveryArtifact('/fake/recovery-root/demo-fleet/code-agent.age', '/fake/key.txt', 'code-agent', {
+        exists: () => true,
+        decrypt: async () => {
+          throw new VaultError('vault_decrypt_failed', 'age -d exited 1: wrong identity');
+        },
+      }),
+    ).rejects.toThrow(/wrong identity/);
+  });
+
+  it.skipIf(!HAS_AGE)(
+    'REAL age binary FULL ROUND-TRIP (the decisive crash-recovery proof): writeAgentRecoveryArtifact (real age -e) → ' +
+      'readRecoveryArtifact (real age -d) reproduces the EXACT AppCredentials — the same shape a fresh gate-1 exchange would produce',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-vault-read-recovery-test-'));
+      try {
+        const keyPath = join(dir, 'operator-key.txt');
+        const r = spawnSync('age-keygen', ['-o', keyPath], { encoding: 'utf-8' });
+        expect(r.status, r.stderr).toBe(0);
+        const publicKey = /age1[0-9a-z]+/.exec(readFileSync(keyPath, 'utf-8'))?.[0] ?? '';
+
+        const artifactPath = join(dir, 'demo-fleet', 'code-agent.age');
+        await writeAgentRecoveryArtifact('code-agent', RECOVERY_CREDS, [publicKey], artifactPath);
+
+        const recovered = await readRecoveryArtifact(artifactPath, keyPath, 'code-agent');
+        expect(recovered).toEqual(RECOVERY_CREDS);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe('presence/derivation queries — non-secret shapes only', () => {

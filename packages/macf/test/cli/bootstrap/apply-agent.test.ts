@@ -436,6 +436,128 @@ describe('applyAgentIdentity — pre-flight App-name-collision check (create pat
   });
 });
 
+// --- macf#988, DR-043 Amendment B consume side — findRecoveryArtifact ---
+
+describe('applyAgentIdentity — recovery-artifact consume path (create path only, macf#988)', () => {
+  const RECOVERED: AppCredentials = {
+    appId: 'recovered-app-id',
+    name: 'demo-fleet-code-agent',
+    slug: 'demo-fleet-code-agent',
+    clientId: 'Iv1.recovered',
+    clientSecret: 'SENTINEL-RECOVERED-CLIENT-SECRET',
+    webhookSecret: 'SENTINEL-RECOVERED-WEBHOOK-SECRET',
+    pem: '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-RECOVERED-PEM\n-----END RSA PRIVATE KEY-----\n',
+  };
+
+  it('a found recovery artifact skips gate 1 ENTIRELY (the decisive assertion) and resumes at gate 2, reporting status "created" with the recovered credentials', async () => {
+    const startManifestFlow = vi.fn();
+    const checkAppNameCollision = vi.fn(async () => 'present' as const); // would normally REFUSE — must never even be asked
+    const deps = baseDeps({
+      startManifestFlow,
+      checkAppNameCollision,
+      findRecoveryArtifact: async (role) => {
+        expect(role).toBe('code-agent');
+        return RECOVERED;
+      },
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '7001', appSlug: RECOVERED.slug, accountLogin: 'groundnuty' }),
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    // The decisive assertion — gate 1's OWN seam was never invoked, and the
+    // collision pre-flight (which would have refused) was never even asked.
+    expect(startManifestFlow).not.toHaveBeenCalled();
+    expect(checkAppNameCollision).not.toHaveBeenCalled();
+
+    expect(outcome.status).toBe('created');
+    if (outcome.status === 'created') {
+      expect(outcome.appId).toBe(RECOVERED.appId);
+      expect(outcome.installId).toBe('7001');
+      expect(outcome.credentials).toEqual(RECOVERED);
+    }
+  });
+
+  it('findRecoveryArtifact resolving undefined -> falls through to the #967 collision-refusal UNCHANGED (does not weaken it)', async () => {
+    const findRecoveryArtifact = vi.fn(async () => undefined);
+    const deps = baseDeps({
+      findRecoveryArtifact,
+      checkAppNameCollision: async () => 'present',
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(findRecoveryArtifact).toHaveBeenCalledWith('code-agent');
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      // Byte-identical #967 refusal text — proves the consume-path addition
+      // doesn't change the refusal's shape when nothing was recoverable.
+      expect(outcome.reason).toContain('App "demo-fleet-code-agent" already exists');
+      expect(outcome.reason).toContain("not in this fleet's vault");
+    }
+  });
+
+  it('findRecoveryArtifact OMITTED entirely -> no-op, proceeds exactly as before this fix (backward-compatible default)', async () => {
+    const deps = baseDeps({ checkAppNameCollision: async () => 'absent' }); // no findRecoveryArtifact override
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('created');
+  });
+
+  it('a THROWING findRecoveryArtifact degrades to "nothing recovered" (fail-open) and still proceeds to the collision check + gate 1', async () => {
+    const logs: string[] = [];
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      findRecoveryArtifact: async () => {
+        throw new Error('decrypt exploded');
+      },
+      checkAppNameCollision: async () => 'absent',
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('created');
+    expect(logs.join('\n')).toMatch(/recovery-artifact check failed/);
+  });
+
+  it('is NEVER invoked on any non-create decision path (resume-install / reuse-confirmed / skip-unverified / drift)', async () => {
+    const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
+    const findRecoveryArtifact = vi.fn(async () => RECOVERED);
+    const resumeDeps = baseDeps({
+      findRecoveryArtifact,
+      resolveKeyPath: () => '/resolved/key.pem',
+      confirmAppInstallation: async () => ({ status: 'app-no-install' }),
+      waitForAppInstallation: async () => ({ appId: '9001', installId: '6001', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, resumeDeps);
+    const skipDeps = baseDeps({ findRecoveryArtifact });
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, skipDeps);
+    expect(findRecoveryArtifact).not.toHaveBeenCalled();
+  });
+
+  it('gate 2 failure on the recovered path names the app_id + notes the credential came from a recovery artifact', async () => {
+    const deps = baseDeps({
+      findRecoveryArtifact: async () => RECOVERED,
+      waitForAppInstallation: async () => {
+        throw new Error('timed out waiting for the install');
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).toContain('recovered from a durable recovery artifact');
+      expect(outcome.reason).toContain(RECOVERED.appId);
+    }
+  });
+
+  it('NEVER logs a secret value on the recovered path — no PEM/clientSecret/webhookSecret sentinel in any log line', async () => {
+    const logs: string[] = [];
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      findRecoveryArtifact: async () => RECOVERED,
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '7001', appSlug: RECOVERED.slug, accountLogin: 'groundnuty' }),
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    const joined = logs.join('\n');
+    expect(joined).not.toContain('SENTINEL-RECOVERED-CLIENT-SECRET');
+    expect(joined).not.toContain('SENTINEL-RECOVERED-WEBHOOK-SECRET');
+    expect(joined).not.toContain('SENTINEL-RECOVERED-PEM');
+  });
+});
+
 describe('applyAgentIdentity — non-create outcomes short-circuit before any gate', () => {
   const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
 
