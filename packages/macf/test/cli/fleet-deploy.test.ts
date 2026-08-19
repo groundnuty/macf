@@ -8,12 +8,38 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { generateKeyPairSync } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { runFleetDeploy, type FleetDeployCommandDeps } from '../../src/cli/commands/fleet-deploy.js';
 import type { InitOptions } from '../../src/cli/commands/init.js';
+import { agentCertPath, agentKeyPath } from '../../src/cli/config.js';
 import { createCA } from '@groundnuty/macf-core';
+
+/**
+ * A cert-AWARE `initAgent` fake (macf#1000) — mirrors
+ * `bootstrap/fleet-deploy.test.ts`'s own `fakeInitAgentWithCertSim`: unlike
+ * a pure no-op, this writes a sentinel cert+key at the destination's
+ * conventional `agentCertPath`/`agentKeyPath` when a CA is present
+ * (matching `opts.skipCertIfPresent`'s skip-if-already-there contract).
+ * `deployAgent` no longer issues the agent cert itself (macf#1000) — a
+ * no-op `initAgent` fake now correctly leaves the cert-facing render tests
+ * below seeing NO cert on disk, which is accurate to "the delegate did
+ * nothing," not a regression. This fake exists so these RENDERING tests
+ * (whose point is the `nextStepLines` / `--json` shape, not cert crypto)
+ * can still exercise the "a cert IS present" branch cheaply.
+ */
+function fakeInitAgentWritingCertWhenCaPresent(caPaths: { certPath: string; keyPath: string }): FleetDeployCommandDeps['initAgent'] {
+  return async (dir, opts) => {
+    if (!(existsSync(caPaths.certPath) && existsSync(caPaths.keyPath))) return;
+    const certDest = agentCertPath(dir);
+    const keyDest = agentKeyPath(dir);
+    if (opts.skipCertIfPresent === true && existsSync(certDest) && existsSync(keyDest)) return;
+    mkdirSync(dirname(certDest), { recursive: true });
+    writeFileSync(certDest, 'SIMULATED-AGENT-CERT-SENTINEL');
+    writeFileSync(keyDest, 'SIMULATED-AGENT-KEY-SENTINEL');
+  };
+}
 
 const FLEET_YAML = `apiVersion: macf/v0
 kind: Fleet
@@ -346,15 +372,21 @@ describe('runFleetDeploy — happy path + rendering', () => {
             };
           },
           cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
-          initAgent: async () => {},
+          // `deployAgent` delegates ALL agent-cert issuance to `initAgent`
+          // (macf#1000) — this fake simulates `initAgent` writing a cert
+          // when a CA is present, so `nextStepLines`' `checkAgentCertPresent`
+          // read-side sees the SAME conventional `agentCertPath(destDir)`/
+          // `agentKeyPath(destDir)` a real deploy would have populated.
+          initAgent: fakeInitAgentWritingCertWhenCaPresent({ certPath: caCertFilePath, keyPath: caKeyFilePath }),
           // Only the per-project CA path resolvers need overriding (their
           // real default resolves under the operator's home). The agent
-          // leaf-cert path resolvers are left at their real default here
-          // ON PURPOSE — `agentCertPath(destDir)`/`agentKeyPath(destDir)`
+          // leaf-cert path resolvers have no override seam anymore
+          // (macf#1000 removed `agentCertPathFor`/`agentKeyPathFor` from
+          // `FleetDeployDeps` — `agentCertPath(destDir)`/`agentKeyPath(destDir)`
           // are already scoped under THIS test's own scratch `destDir`, so
           // exercising the real function is both safe and the more
-          // faithful test of the actual wiring (deployAgent's write side
-          // and nextStepLines' read side must agree on the SAME path).
+          // faithful test of the actual wiring (the fake's write side and
+          // `nextStepLines`' read side must agree on the SAME path).
           caCertPathFor: () => caCertFilePath,
           caKeyPathFor: () => caKeyFilePath,
         }),
@@ -430,7 +462,11 @@ describe('runFleetDeploy — happy path + rendering', () => {
             };
           },
           cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
-          initAgent: async () => {},
+          // See `fakeInitAgentWritingCertWhenCaPresent`'s own doc — deploy
+          // no longer issues the cert itself (macf#1000); this fake
+          // simulates `initAgent` doing so, needed here so `cert_issue`
+          // actually renders `'issued'` (this test's assertion below).
+          initAgent: fakeInitAgentWritingCertWhenCaPresent({ certPath: caCertFilePath, keyPath: caKeyFilePath }),
           caCertPathFor: () => caCertFilePath,
           caKeyPathFor: () => caKeyFilePath,
         }),

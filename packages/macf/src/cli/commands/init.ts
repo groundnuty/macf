@@ -100,6 +100,25 @@ export interface InitOptions {
   readonly cliVersion?: string;
   readonly pluginVersion?: string;
   readonly actionsVersion?: string;
+  /**
+   * Skip issuing a fresh agent mTLS leaf cert when a valid cert+key pair
+   * ALREADY exists at the destination workspace (macf#1000). Defaults to
+   * `undefined` (falsy) — the historical, UNCHANGED behavior for `macf
+   * init` used directly: {@link issueGithubModeAgentCert} below is
+   * unconditional whenever a local CA is present, so a bare `macf init`
+   * re-run always refreshes the cert, exactly as before this option
+   * existed. Set to `true` ONLY by `fleet deploy`
+   * (`bootstrap/fleet-deploy.ts::deployAgent`), which delegates ALL
+   * agent-leaf-cert issuance to this function so `generateAgentCert` is
+   * reachable from exactly one place per deploy run — see that module's
+   * doc + macf#1000 ("one cert-issuance path per run"; #979/#1002 had
+   * introduced a SECOND, duplicate call site in `fleet-deploy.ts` itself).
+   * Deliberately NOT exposed as a `macf init` CLI flag — it is an internal
+   * delegation signal between two code paths, not a second operator-facing
+   * way to skip cert issuance (that would just be a new golden-path
+   * violation of the same shape this option exists to close).
+   */
+  readonly skipCertIfPresent?: boolean;
 }
 
 /**
@@ -654,38 +673,10 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     return;
   }
 
-  // GitHub-mode cert flow (unchanged).
-  const caCertFile = caCertPathFor(opts.project);
-  const caKeyFile = caKeyPathFor(opts.project);
-  if (existsSync(caCertFile) && existsSync(caKeyFile)) {
-    try {
-      const ca = loadCA(caCertFile, caKeyFile);
-      await generateAgentCert({
-        // macf#545: cert CN = the routing identity (defaults to agentName), so
-        // mTLS validates the CN against the registry slot the router resolved.
-        agentName: opts.routingLabel ?? agentName,
-        caCertPem: ca.certPem,
-        caKeyPem: ca.keyPem,
-        ...(opts.advertiseHost !== undefined ? { advertiseHost: opts.advertiseHost } : {}),
-        certPath: agentCertPath(absDir),
-        keyPath: agentKeyPath(absDir),
-      });
-      console.log(`Agent "${agentName}" initialized in ${absDir}`);
-      console.log(`  Config: ${join(macfDir, 'macf-agent.json')}`);
-      console.log(`  Cert:   ${agentCertPath(absDir)}`);
-      console.log(`  Launcher: ${claudeShPath}`);
-    } catch (err) {
-      console.warn(`  Warning: cert generation failed: ${err instanceof Error ? err.message : String(err)}`);
-      console.log(`Agent "${agentName}" initialized in ${absDir} (no cert — run macf certs rotate)`);
-    }
-  } else {
-    console.log(`Agent "${agentName}" initialized in ${absDir}`);
-    console.log(`  Config: ${join(macfDir, 'macf-agent.json')}`);
-    console.log(`  Launcher: ${claudeShPath}`);
-    console.log(`\n  No CA found locally. To generate agent cert:`);
-    console.log(`    macf certs init     (if first agent — creates CA)`);
-    console.log(`    macf certs rotate   (if CA already exists)`);
-  }
+  // GitHub-mode cert flow — the ONLY place in this codebase that issues an
+  // agent's own mTLS leaf cert for a GitHub-backed registry (macf#1000; see
+  // {@link issueGithubModeAgentCert}'s own doc).
+  await issueGithubModeAgentCert(absDir, macfDir, agentName, claudeShPath, opts);
 
   // GitHub-mode migration: read agent records from a local-registry
   // JSON file and write each into the new GitHub-backed registry.
@@ -701,6 +692,83 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
       console.warn(`  Warning: migration from "${opts.migrateFrom}" failed: ${msg}`);
       console.warn(`  Re-run with \`macf init --migrate-from <path>\` after fixing the source.`);
     }
+  }
+}
+
+/**
+ * `initAgent`'s GitHub-mode agent leaf-cert flow — the ONLY place in this
+ * codebase that calls `generateAgentCert` for an agent's own mTLS leaf cert
+ * against a GitHub-backed registry (macf#1000). Reads the per-project CA
+ * from the conventional, non-injectable path (`caCertPathFor(opts.project)`/
+ * `caKeyPathFor(opts.project)` — GitHub mode has no path-override seam; a
+ * `fleet deploy` caller materializes the CA at that SAME conventional path
+ * BEFORE calling `initAgent` — see `bootstrap/fleet-deploy.ts`'s module doc
+ * for why the two must agree on one un-overridden location).
+ *
+ * **`opts.skipCertIfPresent` (macf#1000) is existence-only.** When `true`
+ * AND a cert+key pair is ALREADY at the destination, this function returns
+ * without touching either file — it does NOT verify the existing cert is
+ * still signed by the CURRENT CA. A stale cert left over from a previous CA
+ * is reported the same as a valid one (`'already present — not re-issued'`)
+ * and is left in place; chain-validating an existing cert against the
+ * current CA is a separate concern, not implemented here. This is UNCHANGED
+ * from the pre-#1000 duplicate call site's own contract (`fleet-deploy.ts`'s
+ * removed `issueAgentCertIfNeeded` was equally existence-only), so it is not
+ * a regression — just a residual worth naming rather than assuming away.
+ *
+ * Defaults to `skipCertIfPresent` falsy — unconditional reissue whenever a
+ * CA is present, which is the historical `macf init` contract and MUST stay
+ * unchanged for direct callers (macf#1000 AC "no behaviour change for
+ * `macf init` used directly"); only `fleet deploy` passes `true`.
+ */
+async function issueGithubModeAgentCert(
+  absDir: string,
+  macfDir: string,
+  agentName: string,
+  claudeShPath: string,
+  opts: Pick<InitOptions, 'project' | 'routingLabel' | 'advertiseHost' | 'skipCertIfPresent'>,
+): Promise<void> {
+  const caCertFile = caCertPathFor(opts.project);
+  const caKeyFile = caKeyPathFor(opts.project);
+  if (!(existsSync(caCertFile) && existsSync(caKeyFile))) {
+    console.log(`Agent "${agentName}" initialized in ${absDir}`);
+    console.log(`  Config: ${join(macfDir, 'macf-agent.json')}`);
+    console.log(`  Launcher: ${claudeShPath}`);
+    console.log(`\n  No CA found locally. To generate agent cert:`);
+    console.log(`    macf certs init     (if first agent — creates CA)`);
+    console.log(`    macf certs rotate   (if CA already exists)`);
+    return;
+  }
+
+  const certDest = agentCertPath(absDir);
+  const keyDest = agentKeyPath(absDir);
+  if (opts.skipCertIfPresent === true && existsSync(certDest) && existsSync(keyDest)) {
+    console.log(`Agent "${agentName}" initialized in ${absDir}`);
+    console.log(`  Config: ${join(macfDir, 'macf-agent.json')}`);
+    console.log(`  Cert:   ${certDest} (already present — not re-issued)`);
+    console.log(`  Launcher: ${claudeShPath}`);
+    return;
+  }
+
+  try {
+    const ca = loadCA(caCertFile, caKeyFile);
+    await generateAgentCert({
+      // macf#545: cert CN = the routing identity (defaults to agentName), so
+      // mTLS validates the CN against the registry slot the router resolved.
+      agentName: opts.routingLabel ?? agentName,
+      caCertPem: ca.certPem,
+      caKeyPem: ca.keyPem,
+      ...(opts.advertiseHost !== undefined ? { advertiseHost: opts.advertiseHost } : {}),
+      certPath: certDest,
+      keyPath: keyDest,
+    });
+    console.log(`Agent "${agentName}" initialized in ${absDir}`);
+    console.log(`  Config: ${join(macfDir, 'macf-agent.json')}`);
+    console.log(`  Cert:   ${certDest}`);
+    console.log(`  Launcher: ${claudeShPath}`);
+  } catch (err) {
+    console.warn(`  Warning: cert generation failed: ${err instanceof Error ? err.message : String(err)}`);
+    console.log(`Agent "${agentName}" initialized in ${absDir} (no cert — run macf certs rotate)`);
   }
 }
 

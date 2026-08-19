@@ -75,7 +75,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash, createPrivateKey, createPublicKey } from 'node:crypto';
 import type { RegistryConfig, TokenSource } from '@groundnuty/macf-core';
-import { toVariableSegment, generateToken, loadCA, caCertFingerprint, generateAgentCert } from '@groundnuty/macf-core';
+import { toVariableSegment, generateToken, caCertFingerprint } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 import type { VaultReadOptions } from './vault-read.js';
@@ -491,10 +491,20 @@ export function initRegistryOptionsFor(
 // `commands/init.ts`) was written independently, and nothing connected them.
 //
 // **Never a second CRYPTO implementation.** {@link materializeProjectCa}
-// only decodes + writes bytes; the actual cert issuance below
-// ({@link issueAgentCertIfNeeded}) calls the SAME `@groundnuty/macf-core`
-// `loadCA`/`generateAgentCert` primitives `certs.ts::certsRotate` already
-// uses — reused, not reimplemented.
+// only decodes + writes bytes — it has no `generateAgentCert` (or
+// `createCA`) call anywhere in its call graph. The agent's own leaf-cert
+// issuance is NOT duplicated here either (macf#1000; a PRIOR version of
+// this file had a second `generateAgentCert` call site,
+// `issueAgentCertIfNeeded`, that ran immediately before `deployAgent`
+// delegated to `initAgent` — whose own cert-flow branch is unconditional,
+// so the two writers raced the SAME file every run and agreed only by
+// luck). `deployAgent` now materializes the CA onto disk here and leaves
+// ALL cert issuance to `initAgent`'s `commands/init.ts::
+// issueGithubModeAgentCert` (the SAME `@groundnuty/macf-core`
+// `loadCA`/`generateAgentCert` primitives `certs.ts::certsRotate` also
+// reuses) — `deps.initAgent`'s `skipCertIfPresent: true` argument, set
+// below in {@link deployAgent}, is what keeps that ONE call idempotent
+// across re-runs.
 
 export type CaMaterializeOutcome =
   | { readonly status: 'materialized'; readonly certFingerprint: string }
@@ -660,68 +670,25 @@ export async function materializeProjectCa(
   }
 }
 
-// --- Agent leaf-cert issuance (macf#976) ---
-
-export type AgentCertIssueOutcome = 'issued' | 'skipped-existing';
-
-export interface AgentCertPathDeps {
-  readonly agentCertPathFor: (destDir: string) => string;
-  readonly agentKeyPathFor: (destDir: string) => string;
-}
+// --- Agent leaf-cert issuance (macf#976; delegated entirely to `initAgent`
+// as of macf#1000 — see this module's doc "Never a second CRYPTO
+// implementation" above) ---
 
 /**
- * Issue this agent's own CA-signed mTLS leaf cert at `destDir` — the SAME
- * `generateAgentCert` call `commands/init.ts`'s GitHub-mode cert-flow
- * (macf#545) and `certs.ts::certsRotate` already make, so a workspace
- * `deployAgent` hands off carries a WORKING cert the moment `deployAgent`
- * returns, before `initAgent` even runs.
+ * The final on-disk state of the agent's own mTLS leaf cert when a
+ * `deployAgent` run ends (macf#1000 — renamed in spirit, not in shape, from
+ * "what the removed `issueAgentCertIfNeeded` step did" to "what's actually
+ * at `agentCertPath(destDir)`/`agentKeyPath(destDir)` now"). `deployAgent`
+ * computes this by checking file existence immediately BEFORE and AFTER its
+ * single `deps.initAgent(...)` call — never by asking `initAgent` what it
+ * did (it returns `void`) and never by writing the cert itself.
  *
- * **Named residual: `initAgent`'s own cert-flow branch
- * (`commands/init.ts` ~L629-652) is UNCONDITIONAL** — `if (CA files exist)
- * -> generateAgentCert(...)`, with no existence check on the destination
- * cert. Once this function has materialized the local CA, `deployAgent`'s
- * subsequent `initAgent` call therefore ALWAYS re-issues a fresh cert
- * regardless of what this function just did — harmless for validity (same
- * CA, same CN, same SAN, so the overwrite is an equally-valid cert), but it
- * means a `'skipped-existing'` result from THIS function can disagree with
- * what's actually on disk by the time `deployAgent` returns (init's second
- * pass may have overwritten it anyway). `FleetDeployOutcome.certIssue`
- * reports what THIS function did, not the final on-disk state — teaching
- * `initAgent` an existence guard is out of scope for macf#976 (touches
- * `InitOptions`, a wider surface than this fix).
- *
- * Idempotent AT THIS LAYER: an already-present cert+key pair at `destDir`
- * is left untouched by THIS function (`'skipped-existing'`) — mirrors
- * {@link deployAgent}'s own App-key skip-if-exists contract one level up.
- * `certCn` is the routing identity (macf#545) — callers pass `agent.role`,
- * matching what `initAgent` itself defaults to when
- * `InitOptions.routingLabel`/`name` are unset (as `deployAgent`'s own
- * `initAgent` call already leaves them).
+ * Existence-only, same as `initAgent`'s own `skipCertIfPresent` contract: a
+ * `'skipped-existing'` result does NOT mean the pre-existing cert is still
+ * signed by the CURRENT CA, only that a cert+key pair was already there and
+ * `initAgent` left it alone.
  */
-export async function issueAgentCertIfNeeded(
-  destDir: string,
-  certCn: string,
-  caCertPem: string,
-  caKeyPem: string,
-  advertiseHost: string,
-  deps: AgentCertPathDeps,
-): Promise<AgentCertIssueOutcome> {
-  const certPath = deps.agentCertPathFor(destDir);
-  const keyPath = deps.agentKeyPathFor(destDir);
-  if (existsSync(certPath) && existsSync(keyPath)) {
-    return 'skipped-existing';
-  }
-  mkdirSync(dirname(certPath), { recursive: true });
-  await generateAgentCert({
-    agentName: certCn,
-    caCertPem,
-    caKeyPem,
-    advertiseHost,
-    certPath,
-    keyPath,
-  });
-  return 'issued';
-}
+export type AgentCertIssueOutcome = 'issued' | 'skipped-existing';
 
 function caMaterializeLogLine(role: string, ca: CaMaterializeOutcome): string {
   switch (ca.status) {
@@ -772,19 +739,23 @@ export interface FleetDeployDeps {
    * GitHub-mode cert-flow already read from). **Tests MUST override both to
    * a scratch directory** — the default resolves under the REAL operator's
    * home directory, which may hold a real, live fleet's CA.
+   *
+   * **Overriding this while `deps.initAgent` is the REAL `initAgent`
+   * (macf#1000) breaks agent-cert issuance silently.** `commands/init.ts`'s
+   * GitHub-mode cert-flow has NO path-override seam of its own — it always
+   * reads `caCertPath(project)`/`caKeyPath(project)` from `../config.js`
+   * directly. If this override points `deployAgent`'s OWN CA materialize
+   * step somewhere else, `initAgent` looks for the CA at the conventional
+   * (un-overridden) path, finds nothing, and silently takes its "No CA
+   * found locally" branch — the agent cert is never issued, and nothing
+   * throws. This override exists for tests that inject a FAKE `initAgent`
+   * (which never reads any path itself); a test exercising the real
+   * integration must leave this at its default. See
+   * `fleet-deploy.test.ts`'s "REAL `initAgent` — the decisive seam-call-count
+   * proof" block for the pattern that stays correct.
    */
   readonly caCertPathFor?: (fleetName: string) => string;
   readonly caKeyPathFor?: (fleetName: string) => string;
-  /**
-   * Resolves this agent's own mTLS leaf-cert paths at the deployed
-   * workspace (macf#976). Defaults to {@link agentCertPath}/{@link agentKeyPath}
-   * (`<destDir>/.macf/certs/agent-{cert,key}.pem`). Already scoped under
-   * `destDir` — which every test in this suite already points at a scratch
-   * dir — so, unlike `caCertPathFor`/`caKeyPathFor` above, the default is
-   * test-safe without an override; still overridable for direct control.
-   */
-  readonly agentCertPathFor?: (destDir: string) => string;
-  readonly agentKeyPathFor?: (destDir: string) => string;
   readonly log?: (line: string) => void;
   /**
    * Opt-in (macf#975; CLI flag `--force-key`) to re-materialize the on-disk
@@ -844,16 +815,21 @@ export type FleetDeployOutcome =
       /** Per-project CA materialize-or-reuse-or-refuse outcome (macf#976) — never carries key material, only a public cert fingerprint. */
       readonly ca: CaMaterializeOutcome;
       /**
-       * Whether {@link issueAgentCertIfNeeded} (called from within THIS
-       * function) issued the agent's own mTLS leaf cert — `'not-attempted'`
-       * when {@link CaMaterializeOutcome.status} is `'vault-absent'`
-       * (nothing to issue against). Reports what THIS layer did, NOT
-       * necessarily the final on-disk state: `initAgent` (called after,
-       * inside the SAME `deployAgent` run) has its own unconditional
-       * cert-flow branch once a local CA exists — see
-       * {@link issueAgentCertIfNeeded}'s doc "Named residual" for why a
-       * `'skipped-existing'` here can still be followed by `initAgent`
-       * silently re-issuing.
+       * The FINAL on-disk state of the agent's own mTLS leaf cert when this
+       * `deployAgent` run ends (macf#1000). `'not-attempted'` covers TWO
+       * cases, both meaning "no cert landed": {@link CaMaterializeOutcome.status}
+       * is `'vault-absent'` (nothing to issue against — `initAgent`'s own
+       * cert-flow takes its "No CA found" branch too), OR a CA WAS available
+       * but `initAgent`'s cert generation failed internally (it warns +
+       * degrades rather than throwing — see
+       * `commands/init.ts::issueGithubModeAgentCert`'s catch block). Computed
+       * by `deployAgent` checking `agentCertPath(destDir)`/
+       * `agentKeyPath(destDir)` existence immediately before and after its
+       * single `deps.initAgent(...)` call — never by asking what that call
+       * did (it returns `void`) and never by issuing a cert itself. See
+       * {@link AgentCertIssueOutcome}'s own doc for the existence-only
+       * caveat (a stale-but-present cert reports `'skipped-existing'`, not
+       * re-validated against the current CA).
        */
       readonly certIssue: AgentCertIssueOutcome | 'not-attempted';
     }
@@ -1047,7 +1023,11 @@ export function staleCaAndKeyMismatchMessage(
 
 /**
  * Drive ONE agent through decrypt → extract → materialize CA → materialize
- * key → materialize workspace → issue agent cert → delegate to `initAgent`.
+ * key → materialize workspace → delegate to `initAgent` (which — as of
+ * macf#1000 — is ALSO where the agent's own leaf cert is issued;
+ * `deployAgent` only observes the before/after on-disk state around that
+ * one call to compute {@link FleetDeployOutcome.certIssue}, it never issues
+ * a cert itself).
  * NEVER throws — every failure path (missing vault, bad identity, wrong key,
  * missing vault entry, an unsupported registry mode, a key-fingerprint
  * mismatch, a CA mismatch, a token-mint failure, a clone failure, an
@@ -1072,13 +1052,14 @@ export function staleCaAndKeyMismatchMessage(
  * from the vault (same atomic-0600 write as the absent-key path) and
  * deployment proceeds normally.
  *
- * **CA materialize runs before that, and agent-cert issuance after the
- * clone (macf#976).** The CA is fleet-level (independent of `destDir`), so
- * it can — and, to fail fast on a mismatch before any other side effect
- * runs, should — resolve first. The agent's own leaf cert is written INTO
- * `destDir`, so it MUST wait until the workspace is actually cloned (see
- * the inline comment at that call site for why the ordering is load-bearing,
- * not stylistic).
+ * **CA materialize runs before that, and the `initAgent` call that issues
+ * the agent cert runs after the clone (macf#976; delegation shape per
+ * macf#1000).** The CA is fleet-level (independent of `destDir`), so it can
+ * — and, to fail fast on a mismatch before any other side effect runs,
+ * should — resolve first. The agent's own leaf cert is written INTO
+ * `destDir` (by `initAgent`, not by this function), so the `initAgent` call
+ * MUST wait until the workspace is actually cloned (see the inline comment
+ * at that call site for why the ordering is load-bearing, not stylistic).
  *
  * **Both the CA and the App key are PEEKED AT (read-only, no writes)
  * before either is materialized (macf#982).** A fleet rebuild rotates BOTH
@@ -1162,20 +1143,24 @@ export async function deployAgent(
       `Role "${role}": workspace ${workspace === 'cloned' ? `cloned into ${destDir}` : `already present at ${destDir} — not re-cloned`}.`,
     );
 
-    // Agent leaf-cert issuance needs BOTH a resolved CA and a materialized
-    // destDir — this MUST run AFTER the clone above, never before: writing
-    // into `destDir/.macf/certs/` before the clone would make
-    // `ensureAgentWorkspaceCloned`'s own `isEmptyDir` check see a non-empty
-    // dir and skip cloning the real repo content.
-    let certIssue: AgentCertIssueOutcome | 'not-attempted' = 'not-attempted';
-    if (ca.status === 'materialized' || ca.status === 'already-current') {
-      const caPair = loadCA(caPathDeps.caCertPathFor(manifest.metadata.name), caPathDeps.caKeyPathFor(manifest.metadata.name));
-      certIssue = await issueAgentCertIfNeeded(destDir, role, caPair.certPem, caPair.keyPem, manifest.network.advertise_host, {
-        agentCertPathFor: deps.agentCertPathFor ?? agentCertPath,
-        agentKeyPathFor: deps.agentKeyPathFor ?? agentKeyPath,
-      });
-      log(`Role "${role}": agent mTLS cert ${certIssue === 'issued' ? 'issued' : 'already present — not re-issued'}.`);
-    }
+    // Agent leaf-cert issuance is now ENTIRELY `initAgent`'s job (macf#1000
+    // — one cert-issuance path per run; see this module's own doc "Never a
+    // second CRYPTO implementation"). `skipCertIfPresent: true` below is
+    // what keeps that ONE call idempotent across re-runs — see
+    // `commands/init.ts::issueGithubModeAgentCert`'s doc.
+    //
+    // The pre/post `existsSync` peek around the call is NOT a second
+    // issuance path — it never writes, only OBSERVES the same conventional
+    // `agentCertPath`/`agentKeyPath(destDir)` `initAgent` itself reads and
+    // writes, so `certIssue` reflects the REAL on-disk state when this run
+    // ends, not an intermediate step's belief about it. This MUST run
+    // AFTER the clone above, never before: writing into `destDir/.macf/certs/`
+    // before the clone would make `ensureAgentWorkspaceCloned`'s own
+    // `isEmptyDir` check see a non-empty dir and skip cloning the real repo
+    // content.
+    const certDestPath = agentCertPath(destDir);
+    const keyDestPath = agentKeyPath(destDir);
+    const certPreExisted = ca.status !== 'vault-absent' && existsSync(certDestPath) && existsSync(keyDestPath);
 
     await deps.initAgent(destDir, {
       project: manifest.metadata.name,
@@ -1184,11 +1169,32 @@ export async function deployAgent(
       installId: creds.installId,
       keyPath,
       advertiseHost: manifest.network.advertise_host,
+      skipCertIfPresent: true,
       ...(manifest.versions?.macf !== undefined ? { cliVersion: manifest.versions.macf } : {}),
       ...(manifest.versions?.actions !== undefined ? { actionsVersion: manifest.versions.actions } : {}),
       ...registryOpts,
     });
     log(`Role "${role}": macf init completed at ${destDir}.`);
+
+    const certIssue: AgentCertIssueOutcome | 'not-attempted' =
+      ca.status === 'vault-absent'
+        ? 'not-attempted'
+        : certPreExisted
+          ? 'skipped-existing'
+          : existsSync(certDestPath) && existsSync(keyDestPath)
+            ? 'issued'
+            : 'not-attempted';
+    log(
+      `Role "${role}": agent mTLS cert ${
+        certIssue === 'issued'
+          ? 'issued'
+          : certIssue === 'skipped-existing'
+            ? 'already present — not re-issued'
+            : ca.status === 'vault-absent'
+              ? 'not attempted — no per-project CA'
+              : 'NOT issued — check the `macf init` output above'
+      }.`,
+    );
 
     return {
       role,
