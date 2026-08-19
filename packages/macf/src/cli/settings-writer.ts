@@ -21,6 +21,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { readHooksMapEntries, resolvePluginDirFromClaudeSh } from './plugin-hook-resolver.js';
+import { MCP_SERVER_NAME } from './mcp-json.js';
 
 /**
  * The command path written into settings.json. Uses
@@ -469,6 +470,13 @@ export interface Settings {
     SessionStart?: HookEntry[];
     [key: string]: HookEntry[] | undefined;
   };
+  /**
+   * Pre-approved `.mcp.json` MCP servers (DR-022 Amendment P,
+   * groundnuty/macf#995) — skips Claude Code's server-approval prompt for
+   * a non-plugin MCP server. Written/merged by
+   * `applyPluginSkillPermissionsTransform`.
+   */
+  enabledMcpjsonServers?: string[];
   [key: string]: unknown;
 }
 
@@ -613,11 +621,11 @@ export const PLUGIN_SKILL_PERMISSIONS: readonly string[] = [
 
 /**
  * Permission patterns pre-approving the MCP tools that
- * `@groundnuty/macf-channel-server` registers on the plugin's
- * `macf-agent` MCP server. Without these, every first invocation of
- * `notify_peer` or `checkpoint_to_memory` (autonomous agent calls AND
- * operator-driven coordination) fires an interactive approval dialog,
- * blocking the Stop-hook autonomy contract from DR-023 UC-1 + UC-3.
+ * `@groundnuty/macf-channel-server` registers on the `macf-agent` MCP
+ * server. Without these, every first invocation of `notify_peer` or
+ * `checkpoint_to_memory` (autonomous agent calls AND operator-driven
+ * coordination) fires an interactive approval dialog, blocking the
+ * Stop-hook autonomy contract from DR-023 UC-1 + UC-3.
  *
  * macf#349: operator-witnessed 2026-05-04 on PPAM 2026 macbook —
  * cross-agent `notify_peer` worked but each fresh workspace prompted
@@ -626,13 +634,17 @@ export const PLUGIN_SKILL_PERMISSIONS: readonly string[] = [
  * sub-item 2 (skill pre-approval) but for the MCP-tool surface that
  * the original install-time pre-approval missed.
  *
- * Pattern format: `mcp__plugin_<plugin-name>_<server-key>__<tool-name>`.
- * Plugin name = `macf-agent` (per the canonical manifest in
- * `groundnuty/macf-marketplace:macf-agent/.claude-plugin/plugin.json` `name`
- * field — the repo copy was removed as vestigial per macf#426; marketplace is
- * source). Server key = `macf-agent` (per that manifest's `mcpServers.macf-agent`
- * map key). Tool names match the channel-server's `mcp.mcp.registerTool(...)`
- * first-arg in `packages/macf-channel-server/src/server.ts`.
+ * **Pattern format flipped to `mcp__<server-key>__<tool-name>` (DR-022
+ * Amendment P, groundnuty/macf#995).** Through macf#889 the channel-server
+ * mounted via the plugin's `mcpServers` (`mcp__plugin_<plugin-name>_
+ * <server-key>__<tool-name>`); Amendment P moved it to a project
+ * `.mcp.json` `server:macf-agent` entry (`mcp-json.ts`), and Claude Code's
+ * MCP tool namespace for a manually-configured server drops the `plugin_`
+ * infix entirely — `mcp__macf-agent__<tool-name>`. Server key = `macf-agent`
+ * (per `mcp-json.ts::MCP_SERVER_NAME`, the SAME key `.mcp.json`'s
+ * `mcpServers` map uses). Tool names match the channel-server's
+ * `mcp.mcp.registerTool(...)` first-arg in
+ * `packages/macf-channel-server/src/server.ts`.
  *
  * Keep in lockstep with the channel-server's tool registration list.
  * When a new tool is added to the channel-server, add its pattern here
@@ -640,8 +652,8 @@ export const PLUGIN_SKILL_PERMISSIONS: readonly string[] = [
  * one-time approval until they `macf update`.
  */
 export const PLUGIN_MCP_TOOL_PERMISSIONS: readonly string[] = [
-  'mcp__plugin_macf-agent_macf-agent__notify_peer',
-  'mcp__plugin_macf-agent_macf-agent__checkpoint_to_memory',
+  'mcp__macf-agent__notify_peer',
+  'mcp__macf-agent__checkpoint_to_memory',
 ];
 
 /**
@@ -1089,16 +1101,31 @@ const MACF_SKILL_PATTERN_PREFIX = 'Skill(macf-agent:';
  * `installPluginSkillPermissions` call so a since-removed channel-server
  * tool's pre-approval doesn't linger.
  */
-const MACF_MCP_TOOL_PATTERN_PREFIX = 'mcp__plugin_macf-agent_macf-agent__';
+const MACF_MCP_TOOL_PATTERN_PREFIX = 'mcp__macf-agent__';
+
+/**
+ * The PRE-macf#995 pattern prefix (plugin-mounted namespace, DR-022
+ * Amendment P). Kept ONLY so the drop-and-replace below also strips a
+ * workspace's stale pre-migration entries — without this, an
+ * already-init'd workspace's old `mcp__plugin_macf-agent_macf-agent__*`
+ * patterns would fail to match the NEW `MACF_MCP_TOOL_PATTERN_PREFIX` and
+ * be mistaken for operator-authored (preserved forever instead of cleaned
+ * up). Same migration-cleanup shape as `MACF_HOOK_FILENAMES` /
+ * `isMacfManagedCommand` elsewhere in this file.
+ */
+const MACF_LEGACY_MCP_TOOL_PATTERN_PREFIX = 'mcp__plugin_macf-agent_macf-agent__';
 
 /**
  * Install (or refresh) the MACF plugin-skill + MCP-tool pre-approval
- * entries in `.claude/settings.json`'s `permissions.allow` array.
- * Idempotent: stale entries (e.g. from a prior CLI version that listed
- * a since-removed skill or MCP tool) are dropped + replaced with the
- * current set. Non-MACF entries in `permissions.allow` are preserved.
+ * entries in `.claude/settings.json` (kept-named for back-compat — see
+ * `installGhTokenHook`'s doc comment for the same naming convention; this
+ * function now manages a THIRD settings.json surface alongside its
+ * original two). Idempotent: stale entries (e.g. from a prior CLI version
+ * that listed a since-removed skill or MCP tool, or the pre-macf#995
+ * plugin-mounted MCP-tool namespace) are dropped + replaced with the
+ * current set. Non-MACF entries are preserved.
  *
- * Two pre-approval surfaces installed in lockstep:
+ * Three pre-approval surfaces installed in lockstep:
  *
  * 1. **Skill permissions** (`PLUGIN_SKILL_PERMISSIONS`) — pre-trust the
  *    4 plugin slash-commands (macf-status / macf-issues / macf-peers /
@@ -1110,10 +1137,19 @@ const MACF_MCP_TOOL_PATTERN_PREFIX = 'mcp__plugin_macf-agent_macf-agent__';
  *    fires an interactive approval dialog — blocking the Stop-hook
  *    autonomy contract from DR-023 UC-1 + UC-3.
  *
- * Both surfaces are MACF-managed: stale entries from prior CLI
- * versions get cleaned up via prefix-match drop. Operator-authored
- * patterns (like a wildcard `mcp__*` set up via Claude Code's "yes
- * and don't ask again" flow) are preserved verbatim.
+ * 3. **`enabledMcpjsonServers`** (DR-022 Amendment P, groundnuty/macf#995) —
+ *    pre-approve the `.mcp.json` `macf-agent` server ITSELF, so launch
+ *    doesn't stall on Claude Code's server-approval prompt for a
+ *    non-plugin MCP server. Merge-preserving (ensures `macf-agent` is
+ *    present in the array; never overwrites operator-added entries) rather
+ *    than drop-and-replace, since this array isn't scoped to MACF-managed
+ *    patterns the way `permissions.allow` is.
+ *
+ * All three surfaces are MACF-managed: stale entries from prior CLI
+ * versions get cleaned up via prefix-match drop (surfaces 1+2) or
+ * presence-merge (surface 3). Operator-authored patterns (like a wildcard
+ * `mcp__*` set up via Claude Code's "yes and don't ask again" flow, or an
+ * operator's own `.mcp.json` server enabled here) are preserved verbatim.
  *
  * Creates the `.claude/` directory + settings.json if missing.
  */
@@ -1130,11 +1166,16 @@ export function applyPluginSkillPermissionsTransform(settings: Settings): Settin
 
   // Drop any prior MACF-managed entries so we install the current list
   // fresh (handles "skill or MCP tool was removed in plugin v0.1.N"
-  // case — otherwise the stale pre-approval lingers forever).
+  // case — otherwise the stale pre-approval lingers forever). Also drops
+  // the PRE-macf#995 legacy MCP-tool pattern prefix (DR-022 Amendment P) —
+  // a workspace updating from before the mount moved would otherwise keep
+  // a dead `mcp__plugin_macf-agent_macf-agent__*` entry forever, mistaken
+  // for operator-authored.
   const preserved = existingAllow.filter((entry) => {
     if (typeof entry !== 'string') return true;
     if (entry.startsWith(MACF_SKILL_PATTERN_PREFIX)) return false;
     if (entry.startsWith(MACF_MCP_TOOL_PATTERN_PREFIX)) return false;
+    if (entry.startsWith(MACF_LEGACY_MCP_TOOL_PATTERN_PREFIX)) return false;
     return true;
   });
 
@@ -1170,6 +1211,21 @@ export function applyPluginSkillPermissionsTransform(settings: Settings): Settin
   ];
 
   const existingPermissions = (settings['permissions'] as Record<string, unknown> | undefined) ?? {};
+
+  // Pre-approve the .mcp.json macf-agent server itself (DR-022 Amendment P,
+  // groundnuty/macf#995) — without this, EVERY launch stalls on the
+  // server-approval prompt Claude Code shows for a non-plugin `.mcp.json`
+  // MCP server before it will connect. Merge-preserving: an operator may
+  // have their own `.mcp.json` servers already enabled here (macf#995's
+  // merge-not-clobber contract applies to this array too) — ensure
+  // `macf-agent` is present, never overwrite the whole array.
+  const existingEnabledMcpServers = Array.isArray(settings['enabledMcpjsonServers'])
+    ? (settings['enabledMcpjsonServers'] as readonly unknown[]).filter((e): e is string => typeof e === 'string')
+    : [];
+  const enabledMcpjsonServers = existingEnabledMcpServers.includes(MCP_SERVER_NAME)
+    ? existingEnabledMcpServers
+    : [...existingEnabledMcpServers, MCP_SERVER_NAME];
+
   return {
     ...settings,
     permissions: {
@@ -1177,6 +1233,7 @@ export function applyPluginSkillPermissionsTransform(settings: Settings): Settin
       allow,
       deny,
     },
+    enabledMcpjsonServers,
   };
 }
 

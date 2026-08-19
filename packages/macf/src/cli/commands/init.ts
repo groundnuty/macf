@@ -16,7 +16,8 @@ import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
 import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { deriveBotLogin, fetchAppSlug } from './doctor.js';
-import { fetchPluginToWorkspace, pinChannelServerVersion, linkPluginCliDist } from '../plugin-fetcher.js';
+import { fetchPluginToWorkspace, stripPluginMcpServers, linkPluginCliDist } from '../plugin-fetcher.js';
+import { writeMcpJsonChannelServer } from '../mcp-json.js';
 import { writeClaudeSh } from '../claude-sh.js';
 import { writeEnvFiles } from '../env-files.js';
 import { writeHostPrelude } from '../host-prelude.js';
@@ -593,10 +594,14 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // re-try with `macf update` once connectivity is back.
   try {
     fetchPluginToWorkspace(absDir, versions.plugin);
-    // Pin the channel-server version in the mounted mcpServers args so a bare
-    // `npx` can't serve a stale cached cs (groundnuty/macf#421). cs ships with
-    // the CLI in the monorepo, so the cs version = versions.cli.
-    pinChannelServerVersion(absDir, versions.cli);
+    // Strip mcpServers from the fetched local plugin.json copy (DR-022
+    // Amendment P, groundnuty/macf#995) — the channel-server no longer
+    // mounts via the plugin; it mounts as a project .mcp.json server below.
+    // Leaving mcpServers here would let Claude Code spawn a SECOND
+    // channel-server child from the plugin mount, under a tool namespace
+    // nothing pre-approves. MUST run after the fetch (a re-clone would
+    // otherwise reintroduce the block).
+    stripPluginMcpServers(absDir);
     // Deliver the built plugin-CLI by linking .macf/plugin/dist → the running
     // CLI's own dist/ (groundnuty/macf#676). The marketplace plugin ships no
     // dist/, so without this the /macf-* skills fail MODULE_NOT_FOUND. MUST run
@@ -604,12 +609,25 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     const linkedDist = linkPluginCliDist(absDir);
     console.log(
       `  Plugin: fetched macf-agent@v${versions.plugin} to .macf/plugin/ ` +
-      `(channel-server pinned @${versions.cli}${linkedDist ? '; plugin-CLI dist linked' : ''})`,
+      `(mcpServers stripped${linkedDist ? '; plugin-CLI dist linked' : ''})`,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`  Warning: plugin fetch failed: ${msg}`);
     console.warn(`  You can retry later with \`macf update\` once the issue is resolved.`);
+  }
+
+  // Write <workspace>/.mcp.json with the channel-server as a project MCP
+  // server (DR-022 Amendment P, groundnuty/macf#995) — the mount the
+  // launcher's `--dangerously-load-development-channels server:macf-agent`
+  // flag (channelNotificationsLines in claude-sh.ts, macf#632) actually
+  // resolves against. cs version = versions.cli (monorepo lockstep,
+  // groundnuty/macf#421 — never a bare, unpinned npx spec).
+  const mcpJsonResult = writeMcpJsonChannelServer(absDir, config, versions.cli);
+  if (mcpJsonResult.status === 'refused') {
+    console.warn(`  Warning: .mcp.json not written: ${mcpJsonResult.reason}`);
+  } else {
+    console.log(`  MCP: wrote .mcp.json (macf-agent channel-server, pinned @${versions.cli})`);
   }
 
   // Generate agent cert. Local-registry mode (DR-024) auto-generates a

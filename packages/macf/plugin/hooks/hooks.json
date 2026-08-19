@@ -180,7 +180,7 @@
         "hooks": [
           {
             "type": "mcp_tool",
-            "server": "plugin:macf-agent:macf-agent",
+            "server": "macf-agent",
             "tool": "notify_peer",
             "input": {
               "event": "session-end"
@@ -196,7 +196,7 @@
         "hooks": [
           {
             "type": "mcp_tool",
-            "server": "plugin:macf-agent:macf-agent",
+            "server": "macf-agent",
             "tool": "checkpoint_to_memory",
             "input": {
               "session_id": "${session_id}",
@@ -212,7 +212,7 @@
         "hooks": [
           {
             "type": "mcp_tool",
-            "server": "plugin:macf-agent:macf-agent",
+            "server": "macf-agent",
             "tool": "notify_peer",
             "input": {
               "event": "session-compact"

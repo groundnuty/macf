@@ -48,8 +48,7 @@ import { createClientFromConfig } from '../registry-helper.js';
 import { discoverWorkspaces } from '../discovery.js';
 import { gatherFleetStatus, type FleetProbeFn } from '../commands/fleet.js';
 import { classifyDirtyFile } from './canonical-compute.js';
-import { readPinnedChannelServerVersion } from '../plugin-fetcher.js';
-import { resolvePluginUpdateTarget } from '../plugin-hook-resolver.js';
+import { readMcpJsonChannelServerVersion } from '../mcp-json.js';
 import {
   acquireLock as acquireMaintenanceLock,
   releaseLock as releaseMaintenanceLock,
@@ -137,17 +136,21 @@ export interface VmDriverSeams {
    */
   readonly listModifiedFiles: (workspaceDir: string) => readonly string[];
   /**
-   * Read `workspaceDir`'s LAUNCH PIN — the channel-server version its
-   * currently MOUNTED plugin manifest pins (macf#899). `null` when
-   * undeterminable (no `claude.sh`, no `--plugin-dir` flag, ambiguous
-   * multiple values), the manifest is absent/malformed, or no
-   * channel-server pin is present at all. Real impl:
-   * `resolvePluginUpdateTarget(workspaceDir)` (the SAME mount-resolution
-   * `macf update` uses to decide WHERE to write the pin, macf#889) +
-   * `readPinnedChannelServerVersion` (the SAME read-back `macf update`'s own
-   * post-write verification uses, macf#889/#896 PR #896) — so `rollFleet`'s
-   * bad-release-vs-stale-pin diagnosis can never disagree with `macf
-   * update`'s own result-invariant check about what "the launch pin" means.
+   * Read `workspaceDir`'s LAUNCH PIN — the channel-server version pinned in
+   * its `.mcp.json` (macf#899, repointed by DR-022 Amendment P /
+   * macf#995 from the retired plugin-manifest mount). `null` when
+   * `.mcp.json` is absent/malformed or carries no channel-server pin at
+   * all. Real impl: `readMcpJsonChannelServerVersion(workspaceDir)` — the
+   * SAME read-back `macf update`'s own post-write verification uses
+   * (macf#889/#896/#995) — so `rollFleet`'s bad-release-vs-stale-pin
+   * diagnosis can never disagree with `macf update`'s own result-invariant
+   * check about what "the launch pin" means. Unlike the retired
+   * plugin-manifest reader, there is no "mount undeterminable" case here —
+   * `.mcp.json` always lives at a fixed path (`<workspaceDir>/.mcp.json`),
+   * independent of which `--plugin-dir` variant is mounted — so a workspace
+   * that predates the macf#995 retrofit (no `.mcp.json` yet) reads back
+   * `null`, the same "honest unknown" `classifyHalt` already conservatively
+   * treats as `bad-release` (fleet-upgrade.ts).
    */
   readonly readLaunchPin: (workspaceDir: string) => string | null;
   /**
@@ -669,13 +672,13 @@ export function createVmExecSeams(
     },
     readFullConfig: (dir: string): MacfAgentConfig | null => readAgentConfig(dir),
     readLaunchPin: (dir: string): string | null => {
-      // Same two primitives `macf update` itself uses to WRITE + read back
-      // the pin (macf#889/#896) — reused here at the DRIVER layer so
+      // Same primitive `macf update` itself uses to WRITE + read back the
+      // pin (macf#889/#896/#995) — reused here at the DRIVER layer so
       // `rollFleet`'s diagnosis reads the exact same "launch pin" `macf
-      // update`'s own post-write verification would (macf#899).
-      const target = resolvePluginUpdateTarget(dir);
-      if (!target.determinable || target.dir === null) return null;
-      return readPinnedChannelServerVersion(target.dir);
+      // update`'s own post-write verification would (macf#899). No
+      // plugin-mount resolution needed post-macf#995 — `.mcp.json` always
+      // lives at a fixed path.
+      return readMcpJsonChannelServerVersion(dir);
     },
     commitCanonicalFiles: (dir: string, files: readonly string[]): void => {
       if (files.length === 0) return;
