@@ -31,13 +31,29 @@
  * `selected`-included / absent / unreadable) needs per-scenario control over
  * 3 independent reads that a single `execFile` mock can't cleanly express.
  * Tested below with `RunnerUsabilityDeps` faked, no real `gh`/network.
+ *
+ * `resolveAgentRepoState` (groundnuty/macf#1026 — the 404-ambiguity gate) is
+ * a FOURTH exception, same reason as `checkRunnerUsableByRepo`: a pure
+ * composition over an injected `AgentRepoStateDeps` seam, not a bare
+ * `execFile` wrapper. Tested below with the 3 reads faked, no real
+ * `gh`/network — this is the ONLY place the decisive "a token that cannot
+ * see one agent's repo renders unknown, never absent" scenario from macf#1026
+ * is reproducible, since `checkRepoExists` et al. themselves are thin
+ * `execFile` wrappers this file's module doc says NOT to re-mock directly.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkRunnerUsableByRepo, extractActionsPin, isRunnerCapable, readFleetLock, vaultAwareObserver } from '../../../src/cli/bootstrap/observer.js';
-import type { OrgRunnerRecord, RunnerCapability, RunnerUsabilityDeps } from '../../../src/cli/bootstrap/observer.js';
+import {
+  checkRunnerUsableByRepo,
+  extractActionsPin,
+  isRunnerCapable,
+  readFleetLock,
+  resolveAgentRepoState,
+  vaultAwareObserver,
+} from '../../../src/cli/bootstrap/observer.js';
+import type { AgentRepoStateDeps, OrgRunnerRecord, RunnerCapability, RunnerUsabilityDeps } from '../../../src/cli/bootstrap/observer.js';
 import { ROUTER_EMITTED_LABELS } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { ObservedState } from '../../../src/cli/bootstrap/plan.js';
@@ -580,5 +596,109 @@ describe('checkRunnerUsableByRepo (macf#924 org-scope correction; macf#934 capab
     await checkRunnerUsableByRepo('groundnuty/demo-fleet-code-agent', deps);
     expect(seenOrg).toBe('groundnuty');
     expect(seenRepoName).toBe('demo-fleet-code-agent');
+  });
+});
+
+// --- resolveAgentRepoState — groundnuty/macf#1026: the 404-ambiguity gate ---
+//
+// Live symptom this closes: `macf bootstrap status` run with science-agent's
+// installation token rendered code-agent's repo/CA-var/routing-client-secret
+// all `'absent'` — code-agent's repo was fully present, merely invisible to
+// that token. GitHub 404s identically for "doesn't exist" and "exists but
+// this token can't see it" (macf#969's same fact for `GET /apps/{slug}`).
+
+/** A deps fixture where the repo is confidently VISIBLE (checkRepoExists -> 'present') and both sub-reads are confidently PRESENT — the baseline every scenario below overrides from. */
+function repoDepsWith(overrides: Partial<AgentRepoStateDeps> = {}): AgentRepoStateDeps {
+  return {
+    checkRepoExists: async () => 'present',
+    checkRepoVariablePresence: async () => 'present',
+    checkRepoSecretPresence: async () => 'present',
+    ...overrides,
+  };
+}
+
+describe('resolveAgentRepoState (groundnuty/macf#1026 — 404 is ambiguous for a resource this token may not be entitled to see)', () => {
+  it('DECISIVE — a token that cannot see the repo (confirmed 404) renders repo/caRepo/routingClientRepo ALL unknown, never absent — the exact live symptom', async () => {
+    const deps = repoDepsWith({
+      checkRepoExists: async () => 'absent', // the repo IS present on GitHub; this token's 404 cannot tell that apart from genuine absence
+      checkRepoVariablePresence: async () => 'absent',
+      checkRepoSecretPresence: async () => 'absent',
+    });
+    const state = await resolveAgentRepoState('groundnuty/exp-code-agent', 'EXP_CA_CERT', 'ROUTING_CLIENT_CERT', deps);
+    expect(state.repo).toBe('unknown');
+    expect(state.caRepo).toBe('unknown');
+    expect(state.routingClientRepo).toBe('unknown');
+    expect(state.repo).not.toBe('absent');
+    expect(state.caRepo).not.toBe('absent');
+    expect(state.routingClientRepo).not.toBe('absent');
+  });
+
+  it('the reason names the repo, cites the 404, and asks "not installed on it?" — matching the runner-detail line\'s shape, never a bare "unknown"', async () => {
+    const deps = repoDepsWith({ checkRepoExists: async () => 'absent' });
+    const state = await resolveAgentRepoState('groundnuty/exp-code-agent', 'EXP_CA_CERT', 'ROUTING_CLIENT_CERT', deps);
+    expect(state.reason).toBeDefined();
+    expect(state.reason).toContain('groundnuty/exp-code-agent');
+    expect(state.reason).toContain('404');
+    expect(state.reason).toMatch(/not installed on it\?/);
+  });
+
+  it('sub-reads are never even attempted when the repo itself is not confirmed visible — nothing to gain from an ambiguous read, and no wasted call', async () => {
+    let subReadsCalled = false;
+    const deps = repoDepsWith({
+      checkRepoExists: async () => 'absent',
+      checkRepoVariablePresence: async () => {
+        subReadsCalled = true;
+        return 'absent';
+      },
+      checkRepoSecretPresence: async () => {
+        subReadsCalled = true;
+        return 'absent';
+      },
+    });
+    await resolveAgentRepoState('groundnuty/exp-code-agent', 'EXP_CA_CERT', 'ROUTING_CLIENT_CERT', deps);
+    expect(subReadsCalled).toBe(false);
+  });
+
+  it('MUST-NOT-REGRESS — a genuinely-absent CA var/secret on a repo the caller CAN see still renders absent', async () => {
+    const deps = repoDepsWith({
+      checkRepoExists: async () => 'present', // caller proven entitled — repo IS visible
+      checkRepoVariablePresence: async () => 'absent', // the var itself genuinely does not exist
+      checkRepoSecretPresence: async () => 'absent',
+    });
+    const state = await resolveAgentRepoState('groundnuty/exp-science-agent', 'EXP_CA_CERT', 'ROUTING_CLIENT_CERT', deps);
+    expect(state.repo).toBe('present');
+    expect(state.caRepo).toBe('absent');
+    expect(state.routingClientRepo).toBe('absent');
+    expect(state.reason).toBeUndefined();
+  });
+
+  it('a fully-visible fleet (everything present) renders unchanged — no reason, no downgrade', async () => {
+    const state = await resolveAgentRepoState('groundnuty/exp-science-agent', 'EXP_CA_CERT', 'ROUTING_CLIENT_CERT', repoDepsWith());
+    expect(state).toEqual({ repo: 'present', caRepo: 'present', routingClientRepo: 'present' });
+  });
+
+  it('a repo-existence read that fails WITHOUT a confirmed 404 (network/auth/gh failure) still collapses to unknown, with a DIFFERENT reason that never claims HTTP evidence it does not have', async () => {
+    const deps = repoDepsWith({ checkRepoExists: async () => 'unknown' });
+    const state = await resolveAgentRepoState('groundnuty/exp-code-agent', 'EXP_CA_CERT', 'ROUTING_CLIENT_CERT', deps);
+    expect(state.repo).toBe('unknown');
+    expect(state.caRepo).toBe('unknown');
+    expect(state.routingClientRepo).toBe('unknown');
+    expect(state.reason).toBeDefined();
+    // Never claims a confirmed HTTP 404 (the read never got that far) and
+    // never asks the confirmed-404-specific "not installed on it?" question
+    // — distinct wording from the confirmed-404 case above.
+    expect(state.reason).not.toContain('HTTP 404');
+    expect(state.reason).not.toMatch(/not installed on it\?/);
+  });
+
+  it('a repo confirmed visible but with an unreadable (not 404) CA var/secret still surfaces that unknown as-is — no credential material anywhere in the result', async () => {
+    const deps = repoDepsWith({ checkRepoVariablePresence: async () => 'unknown', checkRepoSecretPresence: async () => 'unknown' });
+    const state = await resolveAgentRepoState('groundnuty/exp-science-agent', 'EXP_CA_CERT', 'ROUTING_CLIENT_CERT', deps);
+    expect(state.repo).toBe('present');
+    expect(state.caRepo).toBe('unknown');
+    expect(state.routingClientRepo).toBe('unknown');
+    const serialized = JSON.stringify(state);
+    expect(serialized).not.toContain('-----BEGIN');
+    expect(serialized).not.toMatch(/ghs_|ghp_/);
   });
 });

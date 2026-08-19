@@ -86,6 +86,22 @@ export interface ObservedAgentState {
   readonly install: Presence;
   readonly installId?: string;
   readonly repo: Presence;
+  /**
+   * WHY this agent's `repo` — and, by construction, its `caRepos`/
+   * `routingClientRepos` entries too — read `'unknown'` instead of a
+   * committed value, set ONLY when that downgrade happened (groundnuty/macf#1026).
+   * GitHub returns HTTP 404 identically for "doesn't exist" and "exists but
+   * this token isn't entitled to see it" (the SAME ambiguity #969 established
+   * for `GET /apps/{slug}` — Amendment A's honest-unknown floor: the API can
+   * confirm present, never prove absent). `githubRegistryObserver` therefore
+   * only trusts a repo-scoped 404 as confident `'absent'` once THIS run has
+   * independently proven the caller can see the parent repo (a `'present'`
+   * repo-existence read) — see `observer.ts::resolveAgentRepoState`.
+   * `undefined` when `repo` is `'present'` (nothing to explain) or when the
+   * downgrade never applied (e.g. `repo` was never even read, the vault-free
+   * default).
+   */
+  readonly repoVisibilityReason?: string;
   /** Secret-name → fingerprint, sourced from `fleet.lock` (never a secret value). */
   readonly fingerprints: Readonly<Record<string, string>>;
   /**

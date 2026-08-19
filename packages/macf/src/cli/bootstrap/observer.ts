@@ -177,6 +177,110 @@ export async function checkRepoSecretPresence(repo: string, name: string): Promi
 }
 
 /**
+ * Injectable seam for {@link resolveAgentRepoState} — same "pure composition
+ * over injected deps, testable without `execFile`" shape
+ * {@link checkRunnerUsableByRepo}'s `RunnerUsabilityDeps` already establishes
+ * for this file. `REAL_AGENT_REPO_STATE_DEPS` below is the production wiring
+ * (the same three functions this module already exports).
+ */
+export interface AgentRepoStateDeps {
+  readonly checkRepoExists: (repo: string) => Promise<Presence>;
+  readonly checkRepoVariablePresence: (repo: string, name: string) => Promise<Presence>;
+  readonly checkRepoSecretPresence: (repo: string, name: string) => Promise<Presence>;
+}
+
+/** Production wiring for {@link AgentRepoStateDeps} — the real `gh api` calls this module already exports. */
+export const REAL_AGENT_REPO_STATE_DEPS: AgentRepoStateDeps = {
+  checkRepoExists,
+  checkRepoVariablePresence,
+  checkRepoSecretPresence,
+};
+
+/** {@link resolveAgentRepoState}'s result — one agent repo's gated presence trio. */
+export interface AgentRepoState {
+  readonly repo: Presence;
+  readonly caRepo: Presence;
+  readonly routingClientRepo: Presence;
+  /**
+   * Set iff ANY of the three fields above was downgraded to `'unknown'` by
+   * this function's visibility gate — `undefined` when `repo` resolved
+   * `'present'` (the sub-reads' own values are trusted as-is; nothing to
+   * explain).
+   */
+  readonly reason?: string;
+}
+
+/**
+ * The `reason` text for a confirmed 404 on the repo itself — groundnuty/macf#1026
+ * requirement 2's exact suggested shape ("say why: `unknown — this token
+ * cannot see <repo> (404; not installed on it?)`, not a bare `unknown`"),
+ * matched to {@link runnerIncapableDetail}'s established style (name the
+ * resource, cite the HTTP evidence, explain the mechanism).
+ */
+function repoNotVisibleReason(repo: string): string {
+  return (
+    `this token cannot see "${repo}" (HTTP 404 reading the repo itself; not installed on it? GitHub returns 404 ` +
+    'both for a repo that genuinely does not exist and for a private repo this token lacks access to — the two ' +
+    'are indistinguishable to an unauthorized caller by design, so a 404 here is never confident evidence of ' +
+    'absence — macf#1026, same shape macf#969 established for `GET /apps/{slug}`). Its CA variable and ' +
+    'routing-client secret reads are unknown for the same reason.'
+  );
+}
+
+/**
+ * The `reason` text for a repo-existence read that failed WITHOUT a
+ * confirmed 404 (network/auth/`gh` failure) — distinguished from
+ * {@link repoNotVisibleReason} so the message never claims "404" when the
+ * read never got that far.
+ */
+function repoUnreadableReason(repo: string): string {
+  return (
+    `could not confirm "${repo}" is reachable this run (network/auth/gh failure reading the repo itself, not a ` +
+    'confirmed 404) — its CA variable and routing-client secret reads are unknown for the same reason; macf#1026.'
+  );
+}
+
+/**
+ * Resolve one agent repo's gated presence trio — the fix for groundnuty/macf#1026:
+ * a 404 on a per-agent repo-scoped resource is ambiguous (GitHub returns 404
+ * identically for "doesn't exist" and "exists but this token can't see it" —
+ * the SAME fact groundnuty/macf#969 established for `GET /apps/{slug}`), so
+ * `'absent'` is only trustworthy once THIS run has independently proven the
+ * caller can see the PARENT repo.
+ *
+ * The proof: {@link AgentRepoStateDeps.checkRepoExists} returning `'present'`
+ * for `repo` — a 200 response is unambiguous (it proves existence AND
+ * visibility at once), so once that holds, `caRepo`/`routingClientRepo` are
+ * read for real and returned exactly as observed — a subsequent 404 there IS
+ * genuine absence (macf#1026 requirement 3: "where the caller IS entitled to
+ * see the resource… absent is still correct and must survive"). When
+ * `checkRepoExists` does NOT return `'present'` (its own 404, or any other
+ * read failure), visibility is unproven for the WHOLE repo — the sub-reads
+ * are never even attempted (their result would be equally ambiguous: a 404
+ * inside an unconfirmed-visible repo can't be told apart from "the repo
+ * itself is invisible"), and all three fields collapse to `'unknown'` with a
+ * diagnostic `reason` (requirement 1 + 2). NEVER throws — every injected dep
+ * is itself documented never-throw.
+ */
+export async function resolveAgentRepoState(
+  repo: string,
+  caVarName: string,
+  routingClientSecretName: string,
+  deps: AgentRepoStateDeps = REAL_AGENT_REPO_STATE_DEPS,
+): Promise<AgentRepoState> {
+  const repoPresence = await deps.checkRepoExists(repo);
+  if (repoPresence !== 'present') {
+    const reason = repoPresence === 'absent' ? repoNotVisibleReason(repo) : repoUnreadableReason(repo);
+    return { repo: 'unknown', caRepo: 'unknown', routingClientRepo: 'unknown', reason };
+  }
+  const [caRepo, routingClientRepo] = await Promise.all([
+    deps.checkRepoVariablePresence(repo, caVarName),
+    deps.checkRepoSecretPresence(repo, routingClientSecretName),
+  ]);
+  return { repo: 'present', caRepo, routingClientRepo };
+}
+
+/**
  * One GitHub-registered runner's capability-relevant fields (macf#934) — the
  * `GET .../actions/runners` response trimmed to what {@link isRunnerCapable}
  * needs. `busy` is carried for DIAGNOSTIC messages only — see that
@@ -931,20 +1035,27 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
 
   for (const agent of manifest.agents) {
     const lockEntry = lock?.agents.find((a) => a.role === agent.role);
-    const repo = await checkRepoExists(agent.repo);
+    // groundnuty/macf#1026 — gated read: a raw 404 on `agent.repo` (or its
+    // CA var / routing-client secret) is ambiguous for a token that may not
+    // be entitled to see it (same 404-ambiguity macf#969 fixed for App
+    // presence). `resolveAgentRepoState` only trusts `'absent'` once this
+    // run has independently proven the caller can see the repo itself — see
+    // that function's doc.
+    const repoState = await resolveAgentRepoState(agent.repo, caVarName, 'ROUTING_CLIENT_CERT');
     const actionsPin = await readCallerActionsPin(agent.repo);
     agents[agent.role] = {
       app: lockEntry ? 'present' : 'unknown',
       appId: lockEntry?.app_id,
       install: lockEntry ? 'present' : 'unknown',
       installId: lockEntry?.install_id,
-      repo,
+      repo: repoState.repo,
+      repoVisibilityReason: repoState.reason,
       fingerprints: lockEntry?.fingerprints ?? {},
       deployedVersion: lockEntry?.deployed_version,
       actionsPin,
     };
-    caRepos[agent.repo] = await checkRepoVariablePresence(agent.repo, caVarName);
-    routingClientRepos[agent.repo] = await checkRepoSecretPresence(agent.repo, 'ROUTING_CLIENT_CERT');
+    caRepos[agent.repo] = repoState.caRepo;
+    routingClientRepos[agent.repo] = repoState.routingClientRepo;
   }
 
   const caRegistry = await checkRegistryVariablePresence(manifest.owner.registry, caVarName);
