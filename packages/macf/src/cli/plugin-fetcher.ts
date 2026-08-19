@@ -26,9 +26,6 @@ import { findCliPackageRoot } from './rules.js';
 const DEFAULT_MARKETPLACE_URL = 'https://github.com/groundnuty/macf-marketplace';
 const DEFAULT_PLUGIN_SUBDIR = 'macf-agent';
 
-/** The channel-server npm package the plugin's mcpServers launches via npx. */
-const CHANNEL_SERVER_PKG = '@groundnuty/macf-channel-server';
-
 /**
  * Plugin-CLI path the `/macf-*` skills invoke, relative to CLAUDE_PLUGIN_ROOT
  * (= the workspace's `.macf/plugin/`). The skills run
@@ -59,111 +56,68 @@ export function workspacePluginDir(workspaceDir: string): string {
   return join(resolve(workspaceDir), '.macf', 'plugin');
 }
 
-/** The shape of `plugin.json`'s `mcpServers` block this module reads/writes. */
+/** The shape of `plugin.json`'s `mcpServers` block this module reads/strips. */
 type McpServersManifest = {
-  mcpServers?: Record<string, { command?: string; args?: string[] } | undefined>;
+  mcpServers?: Record<string, unknown>;
+  [key: string]: unknown;
 };
 
-/**
- * Best-effort read of a plugin dir's `.claude-plugin/plugin.json`. Returns
- * `null` on any absence/parse failure — shared by `pinChannelServerVersion`
- * (write) and `readPinnedChannelServerVersion` (read-back, macf#889) so both
- * agree on what counts as "nothing there to touch."
- */
-function readManifest(pluginDir: string): McpServersManifest | null {
-  const manifestPath = join(pluginDir, '.claude-plugin', 'plugin.json');
-  if (!existsSync(manifestPath)) return null;
-  try {
-    return JSON.parse(readFileSync(manifestPath, 'utf-8')) as McpServersManifest;
-  } catch {
-    return null;
-  }
-}
-
-export interface PinChannelServerVersionOptions {
+export interface StripPluginMcpServersOptions {
   /** Read/write this absolute plugin dir instead of `workspacePluginDir(workspaceDir)` (macf#889). */
   readonly targetDir?: string;
 }
 
 /**
- * Pin the channel-server version in the workspace plugin's `mcpServers` args
- * (groundnuty/macf#421).
+ * Delete the `mcpServers` key from a workspace's FETCHED (local) copy of
+ * `.claude-plugin/plugin.json` (DR-022 Amendment P, groundnuty/macf#995).
  *
- * The marketplace plugin ships `args: ["-y", "@groundnuty/macf-channel-server"]`
- * — a BARE npx spec. `npx -y <pkg>` reuses whatever is already in the npx cache
- * (it does NOT re-resolve to latest on a cache hit), so a consumer that ran the
- * channel-server before a version bump keeps serving its stale cached cs even
- * after `macf update` advances the pins — a silent floating-version skew (sister
- * to the no-floating-tags-in-CI directive). Rewrite the bare spec to
- * `@groundnuty/macf-channel-server@<version>` so each launch resolves the exact
- * version the resolved version-set implies.
+ * Amendment P retires the channel-server's plugin-`mcpServers` mount in
+ * favor of a project `.mcp.json` `server:macf-agent` entry (see
+ * `mcp-json.ts::writeMcpJsonChannelServer`) — a `--plugin-dir`-mounted
+ * server's channel id (`plugin:<name>:<server>`) is rejected by the
+ * `--dangerously-load-development-channels` dev-flag, so native channel-push
+ * never worked while the mount lived here. Leaving `mcpServers` in the local
+ * plugin.json copy after the fetch would let Claude Code ALSO spawn a second
+ * channel-server child from the plugin mount (for MCP tool calls under the
+ * `mcp__plugin_macf-agent_macf-agent__*` namespace) alongside the `.mcp.json`
+ * one — a redundant process plus a stale tool namespace nothing pre-approves
+ * (see `settings-writer.ts::PLUGIN_MCP_TOOL_PERMISSIONS`, updated to the
+ * `.mcp.json` namespace in the same change).
  *
- * `version` is the channel-server version — the same as the resolved CLI
- * version (cs is published from the monorepo in lockstep with `@groundnuty/macf`),
- * NOT the marketplace plugin tag (which can lag — e.g. plugin v0.2.33 while cs
- * was 0.2.34). Call this AFTER fetchPluginToWorkspace.
+ * **Why this strips the LOCAL fetched copy rather than editing the source:**
+ * the canonical plugin manifest is authored in a SEPARATE repo
+ * (`groundnuty/macf-marketplace`, per `packages/macf/plugin/README.md`) —
+ * this CLI's `fetchPluginToWorkspace` only clones it. Until that repo's own
+ * `mcpServers` block is removed, every fetch would otherwise re-introduce it;
+ * stripping it here, post-fetch, on every `macf init`/`update` makes the
+ * FUNCTIONAL fix apply immediately regardless of marketplace timing, and is
+ * a safe no-op once the upstream manifest drops the block itself (`servers`
+ * absent → this function no-ops cleanly).
  *
- * Idempotent + graceful: re-pins an already-pinned spec to the new version, and
- * no-ops cleanly when the plugin.json is absent, has no `mcpServers`, uses a
- * non-npx command (the legacy `node ${CLAUDE_PLUGIN_ROOT}/dist/server.js` form
- * needs no pin), or carries no channel-server arg. Returns true iff it rewrote.
+ * Idempotent: no-ops (`false`) when the manifest is absent/malformed or
+ * already has no `mcpServers` key. Call this AFTER `fetchPluginToWorkspace`
+ * (a re-fetch overwrites the manifest, undoing the strip) — same call-order
+ * contract the retired `pinChannelServerVersion` had.
  */
-export function pinChannelServerVersion(
+export function stripPluginMcpServers(
   workspaceDir: string,
-  version: string,
-  options: PinChannelServerVersionOptions = {},
+  options: StripPluginMcpServersOptions = {},
 ): boolean {
   const pluginDir = options.targetDir ?? workspacePluginDir(workspaceDir);
   const manifestPath = join(pluginDir, '.claude-plugin', 'plugin.json');
-  const manifest = readManifest(pluginDir);
-  if (manifest === null) return false;
+  if (!existsSync(manifestPath)) return false;
 
-  const servers = manifest.mcpServers;
-  if (!servers || typeof servers !== 'object') return false;
-
-  let changed = false;
-  for (const server of Object.values(servers)) {
-    // Only the npx-launched form carries an npm spec to pin; the legacy
-    // `node dist/server.js` form has no version to drift (AC: no regression).
-    if (!server || server.command !== 'npx' || !Array.isArray(server.args)) continue;
-    server.args = server.args.map((arg) => {
-      if (arg === CHANNEL_SERVER_PKG || arg.startsWith(`${CHANNEL_SERVER_PKG}@`)) {
-        const pinned = `${CHANNEL_SERVER_PKG}@${version}`;
-        if (arg !== pinned) changed = true;
-        return pinned;
-      }
-      return arg;
-    });
+  let manifest: McpServersManifest;
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as McpServersManifest;
+  } catch {
+    return false;
   }
 
-  if (changed) writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
-  return changed;
-}
-
-/**
- * Read back the channel-server version currently pinned in `pluginDir`'s
- * manifest — the read-back half of `pinChannelServerVersion`'s write, used as
- * `macf update`'s post-upgrade result-invariant assertion (macf#889 Pattern
- * A): "the upgrade wrote a file" is not "the write reached the thing being
- * upgraded," which was macf#889's entire failure shape.
- *
- * Returns `null` when there's nothing to compare — manifest absent/malformed,
- * no `mcpServers`, the legacy non-npx form, or no channel-server arg at all.
- * "Nothing to verify" is deliberately NOT a mismatch; callers only flag a
- * problem when a real pin was found and it disagrees with the target.
- */
-export function readPinnedChannelServerVersion(pluginDir: string): string | null {
-  const manifest = readManifest(pluginDir);
-  if (manifest === null) return null;
-  const servers = manifest.mcpServers;
-  if (!servers || typeof servers !== 'object') return null;
-  for (const server of Object.values(servers)) {
-    if (!server || server.command !== 'npx' || !Array.isArray(server.args)) continue;
-    for (const arg of server.args) {
-      if (arg.startsWith(`${CHANNEL_SERVER_PKG}@`)) return arg.slice(CHANNEL_SERVER_PKG.length + 1);
-    }
-  }
-  return null;
+  if (manifest.mcpServers === undefined) return false;
+  const { mcpServers: _mcpServers, ...rest } = manifest;
+  writeFileSync(manifestPath, JSON.stringify(rest, null, 2) + '\n');
+  return true;
 }
 
 /**

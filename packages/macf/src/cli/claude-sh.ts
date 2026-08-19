@@ -12,6 +12,7 @@
 import { chmodSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { MacfAgentConfig } from './config.js';
+import { MCP_SERVER_NAME } from './mcp-json.js';
 
 // ---------------------------------------------------------------------------
 // Legacy per-concern emitters (macf#342 PR-B note)
@@ -270,7 +271,7 @@ function channelNotificationsLines(): string[] {
     'elif [ -n "${MACF_CHANNELS_ARGS:-}" ]; then',
     '  : # operator-supplied override — respect it verbatim (version gate bypassed)',
     'elif [ "$macf_channels_supported" = "1" ]; then',
-    '  MACF_CHANNELS_ARGS="--dangerously-load-development-channels server:macf-agent"',
+    `  MACF_CHANNELS_ARGS="--dangerously-load-development-channels server:${MCP_SERVER_NAME}"`,
     'else',
     '  MACF_CHANNELS_ARGS=""',
     '  echo "WARNING (macf#632): Claude Code ${macf_cc_ver:-<unknown>} is older than 2.1.80" >&2',

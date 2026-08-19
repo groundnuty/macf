@@ -34,6 +34,47 @@ describe('macf init', () => {
     expect(existsSync(join(dir, '.macf', 'plugin'))).toBe(true);
   });
 
+  // groundnuty/macf#995 (DR-022 Amendment P): a fresh init writes .mcp.json
+  // with the pinned channel-server + strips mcpServers from the fetched
+  // local plugin.json copy. Piggybacks on the network-hitting plugin-fetch
+  // test above's sibling below (own `dir`, but still one initAgent() call —
+  // this file's convention is to keep network-hitting initAgent() calls to
+  // a minimum, not to zero, per the comment on the routing_label test).
+  it('writes .mcp.json with the pinned channel-server + strips plugin.json mcpServers (macf#995)', async () => {
+    await initAgent(dir, {
+      project: 'TEST',
+      role: 'code-agent',
+      appId: '123',
+      installId: '456',
+      keyPath: '.key.pem',
+      registryType: 'repo',
+      registryRepo: 'owner/repo',
+    });
+
+    const cliVersion = readAgentConfig(dir)!.versions!.cli;
+
+    const mcpJsonPath = join(dir, '.mcp.json');
+    expect(existsSync(mcpJsonPath)).toBe(true);
+    const mcpJson = JSON.parse(readFileSync(mcpJsonPath, 'utf-8')) as {
+      mcpServers: { 'macf-agent': { command: string; args: string[]; env: Record<string, string> } };
+    };
+    expect(mcpJson.mcpServers['macf-agent'].command).toBe('npx');
+    expect(mcpJson.mcpServers['macf-agent'].args).toContain(`@groundnuty/macf-channel-server@${cliVersion}`);
+    // OTEL env block present, not assumed inherited across the MCP spawn
+    // boundary (macf#422).
+    expect(mcpJson.mcpServers['macf-agent'].env['OTEL_SERVICE_NAME']).toBe('macf-agent-code-agent');
+    // No secret/credential leakage into a committed workspace file.
+    expect(Object.keys(mcpJson.mcpServers['macf-agent'].env)).not.toContain('GH_TOKEN');
+
+    // The fetched local plugin.json copy no longer carries mcpServers — the
+    // channel-server mounts via .mcp.json only, never both (macf#995).
+    const pluginManifestPath = join(dir, '.macf', 'plugin', '.claude-plugin', 'plugin.json');
+    if (existsSync(pluginManifestPath)) {
+      const pluginManifest = JSON.parse(readFileSync(pluginManifestPath, 'utf-8')) as Record<string, unknown>;
+      expect(pluginManifest['mcpServers']).toBeUndefined();
+    }
+  });
+
   it('writes routing_label to config when --routing-label is provided (macf#545)', async () => {
     // Single init (these tests hit the network for the plugin fetch — keep it
     // to one). The omitted→undefined case is covered by the next test, which

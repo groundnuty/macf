@@ -1165,65 +1165,58 @@ describe('createVmExecSeams — currentBranch, real git (macf#755)', () => {
   });
 });
 
-describe('createVmExecSeams — readLaunchPin, real fs (macf#899)', () => {
+describe('createVmExecSeams — readLaunchPin, real fs (macf#899, repointed to .mcp.json by macf#995)', () => {
   let dir: string;
 
   afterEach(() => {
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
-  function writeClaudeSh(root: string, pluginDirRel: string): void {
-    writeFileSync(
-      join(root, 'claude.sh'),
-      `#!/usr/bin/env bash\nexec claude --plugin-dir "$SCRIPT_DIR/${pluginDirRel}" "$@"\n`,
-    );
+  function writeMcpJson(root: string, mcpServers: unknown): void {
+    writeFileSync(join(root, '.mcp.json'), JSON.stringify({ mcpServers }, null, 2));
   }
 
-  function writeManifest(pluginDir: string, mcpServers: unknown): void {
-    mkdirSync(join(pluginDir, '.claude-plugin'), { recursive: true });
-    writeFileSync(
-      join(pluginDir, '.claude-plugin', 'plugin.json'),
-      JSON.stringify({ name: 'macf-agent', mcpServers }, null, 2),
-    );
-  }
-
-  // Real-fs round-trip against the SAME primitives `macf update` uses to
-  // WRITE + read back the pin (macf#889/#896) — pins that `rollFleet`'s
+  // Real-fs round-trip against the SAME primitive `macf update` uses to
+  // WRITE + read back the pin (macf#889/#896/#995) — pins that `rollFleet`'s
   // macf#899 diagnosis reads the exact "launch pin" `macf update`'s own
   // post-write verification would.
-  it('reads back the pin from the MOUNTED plugin manifest', () => {
+  it('reads back the pin from .mcp.json', () => {
     dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-launchpin-'));
-    writeClaudeSh(dir, '.macf/plugin');
-    writeManifest(join(dir, '.macf', 'plugin'), {
+    writeMcpJson(dir, {
       'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.56'] },
     });
     expect(createVmExecSeams(dir).readLaunchPin(dir)).toBe('0.2.56');
   });
 
-  it('returns null when claude.sh has no --plugin-dir flag (undeterminable mount)', () => {
+  it('returns null when .mcp.json is absent (a workspace that predates the macf#995 retrofit)', () => {
     dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-launchpin-'));
-    writeFileSync(join(dir, 'claude.sh'), '#!/usr/bin/env bash\nexec claude "$@"\n');
+    // No claude.sh, no .mcp.json — the pre-retrofit shape. classifyHalt
+    // treats this null the same conservative "honest unknown" way it always
+    // has (fleet-upgrade.ts).
     expect(createVmExecSeams(dir).readLaunchPin(dir)).toBeNull();
   });
 
-  it('returns null when the MOUNTED manifest has no channel-server pin at all (legacy node dist/server.js form)', () => {
+  it('returns null when .mcp.json has no channel-server pin at all (legacy node dist/server.js form)', () => {
     dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-launchpin-'));
-    writeClaudeSh(dir, '.macf/plugin');
-    writeManifest(join(dir, '.macf', 'plugin'), {
-      'macf-agent': { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/dist/server.js'] },
+    writeMcpJson(dir, {
+      'macf-agent': { command: 'node', args: ['dist/server.js'] },
     });
     expect(createVmExecSeams(dir).readLaunchPin(dir)).toBeNull();
   });
 
-  it('reads the MOUNTED (non-default) plugin dir, not the conventional .macf/plugin default (macf#889 DR-005 Decision 6 shape)', () => {
+  // .mcp.json always lives at the workspace root — unlike the retired
+  // plugin-manifest reader, there is no "which --plugin-dir variant is
+  // mounted" question to resolve. Prove the read is independent of it: a
+  // claude.sh mounting a NON-default plugin dir (the DR-005 Decision 6
+  // `.macf/plugin-cs` shape macf#889 was about) still reads the SAME
+  // .mcp.json pin, because the two are unrelated files.
+  it('reads .mcp.json regardless of which --plugin-dir claude.sh mounts (independent of the mount, macf#995)', () => {
     dir = mkdtempSync(join(tmpdir(), 'macf-vmdriver-launchpin-'));
-    writeClaudeSh(dir, '.macf/plugin-cs');
-    // The conventional default is left stale on purpose — the mounted
-    // variant is what must be read.
-    writeManifest(join(dir, '.macf', 'plugin'), {
-      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.40'] },
-    });
-    writeManifest(join(dir, '.macf', 'plugin-cs'), {
+    writeFileSync(
+      join(dir, 'claude.sh'),
+      '#!/usr/bin/env bash\nexec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin-cs" "$@"\n',
+    );
+    writeMcpJson(dir, {
       'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.56'] },
     });
     expect(createVmExecSeams(dir).readLaunchPin(dir)).toBe('0.2.56');

@@ -339,6 +339,19 @@ export const ROLL_TOUCHED_CONFIG_PATTERNS = [
   '.claude/.macf/env.certs',
   '.claude/.macf/env.registry',
   '.claude/.macf/host-prelude.sh',
+  // `.mcp.json` (DR-022 Amendment P, groundnuty/macf#995) — `macf update`
+  // writes/merges the `macf-agent` key on every run (`mcp-json.ts
+  // ::writeMcpJsonChannelServer`), same as the other macf-managed files
+  // above; without this entry, a workspace whose `.mcp.json` is dirty right
+  // after the macf#995 retrofit reads as unexpected operator work at the
+  // pre-flight gate. NOT yet taught to `canonical-compute.ts`'s tier-first
+  // classifier (`classifyDirtyFile`) — a dirty `.mcp.json` falls through to
+  // its documented `genuine-delta` fail-safe default (OBJECTs the roll
+  // rather than auto-committing), never a false `already-canonical`. Safe
+  // but conservative; teaching the classifier `.mcp.json`'s merge-preserving
+  // shape (closer to `.claude/settings.json`'s classifier than a
+  // regenerate-from-scratch file) is a follow-up, not required for #995.
+  '.mcp.json',
   // (b) operator-evolution files that must NOT be silently stashed on relaunch
   //     (macf#725 union half — `excludeConfigSurface` leaves these uncommitted):
   'CLAUDE.md',

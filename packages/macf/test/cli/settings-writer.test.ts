@@ -1154,8 +1154,8 @@ describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {
     expect(s.permissions.allow).toContain('Skill(macf-agent:macf-status)');
     expect(s.permissions.allow).toContain('Skill(macf-agent:macf-notify-peer)');
     // Spot-check the 2 MCP tools (macf#349).
-    expect(s.permissions.allow).toContain('mcp__plugin_macf-agent_macf-agent__notify_peer');
-    expect(s.permissions.allow).toContain('mcp__plugin_macf-agent_macf-agent__checkpoint_to_memory');
+    expect(s.permissions.allow).toContain('mcp__macf-agent__notify_peer');
+    expect(s.permissions.allow).toContain('mcp__macf-agent__checkpoint_to_memory');
   });
 
   it('preserves non-MACF permissions.allow entries', () => {
@@ -1239,16 +1239,16 @@ describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {
       // Lockstep with channel-server's `mcp.mcp.registerTool(...)` calls
       // in `packages/macf-channel-server/src/server.ts`. When a new tool
       // is added, this list must be updated + CLI version bumped.
-      expect(PLUGIN_MCP_TOOL_PERMISSIONS).toContain('mcp__plugin_macf-agent_macf-agent__notify_peer');
-      expect(PLUGIN_MCP_TOOL_PERMISSIONS).toContain('mcp__plugin_macf-agent_macf-agent__checkpoint_to_memory');
+      expect(PLUGIN_MCP_TOOL_PERMISSIONS).toContain('mcp__macf-agent__notify_peer');
+      expect(PLUGIN_MCP_TOOL_PERMISSIONS).toContain('mcp__macf-agent__checkpoint_to_memory');
     });
 
     it('installs MCP tool permissions on a fresh workspace', () => {
       installPluginSkillPermissions(tmpRoot);
       const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
       const allow: readonly string[] = s.permissions.allow;
-      expect(allow).toContain('mcp__plugin_macf-agent_macf-agent__notify_peer');
-      expect(allow).toContain('mcp__plugin_macf-agent_macf-agent__checkpoint_to_memory');
+      expect(allow).toContain('mcp__macf-agent__notify_peer');
+      expect(allow).toContain('mcp__macf-agent__checkpoint_to_memory');
     });
 
     it('installs both skill + MCP tool permissions in lockstep', () => {
@@ -1277,8 +1277,8 @@ describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {
       const allow = JSON.parse(readFileSync(settingsPath, 'utf-8')).permissions.allow;
       expect(allow).toContain('mcp__*');                                                     // operator
       expect(allow).toContain('Bash(*)');                                                    // operator
-      expect(allow).toContain('mcp__plugin_macf-agent_macf-agent__notify_peer');             // ours
-      expect(allow).toContain('mcp__plugin_macf-agent_macf-agent__checkpoint_to_memory');    // ours
+      expect(allow).toContain('mcp__macf-agent__notify_peer');             // ours
+      expect(allow).toContain('mcp__macf-agent__checkpoint_to_memory');    // ours
     });
 
     it('drops stale MCP tool entries (e.g. tool removed in newer plugin) on refresh', () => {
@@ -1286,8 +1286,8 @@ describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {
       writeFileSync(settingsPath, JSON.stringify({
         permissions: {
           allow: [
-            'mcp__plugin_macf-agent_macf-agent__since_removed_tool',  // stale ours
-            'mcp__plugin_macf-agent_macf-agent__notify_peer',         // current
+            'mcp__macf-agent__since_removed_tool',  // stale ours
+            'mcp__macf-agent__notify_peer',         // current
             'Bash(*)',                                                 // operator — preserved
           ],
         },
@@ -1296,8 +1296,8 @@ describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {
       installPluginSkillPermissions(tmpRoot);
 
       const allow = JSON.parse(readFileSync(settingsPath, 'utf-8')).permissions.allow;
-      expect(allow).not.toContain('mcp__plugin_macf-agent_macf-agent__since_removed_tool');  // dropped
-      expect(allow).toContain('mcp__plugin_macf-agent_macf-agent__notify_peer');             // current re-installed
+      expect(allow).not.toContain('mcp__macf-agent__since_removed_tool');  // dropped
+      expect(allow).toContain('mcp__macf-agent__notify_peer');             // current re-installed
       expect(allow).toContain('Bash(*)');                                                    // operator preserved
     });
 
@@ -1306,10 +1306,64 @@ describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {
       installPluginSkillPermissions(tmpRoot);
       installPluginSkillPermissions(tmpRoot);
       const allow = JSON.parse(readFileSync(settingsPath, 'utf-8')).permissions.allow;
-      const notifyCount = allow.filter((e: string) => e === 'mcp__plugin_macf-agent_macf-agent__notify_peer').length;
-      const checkpointCount = allow.filter((e: string) => e === 'mcp__plugin_macf-agent_macf-agent__checkpoint_to_memory').length;
+      const notifyCount = allow.filter((e: string) => e === 'mcp__macf-agent__notify_peer').length;
+      const checkpointCount = allow.filter((e: string) => e === 'mcp__macf-agent__checkpoint_to_memory').length;
       expect(notifyCount).toBe(1);
       expect(checkpointCount).toBe(1);
+    });
+
+    // DR-022 Amendment P / groundnuty/macf#995: the channel-server moved off
+    // the plugin's mcpServers to a project .mcp.json server, flipping the MCP
+    // tool namespace from `mcp__plugin_macf-agent_macf-agent__*` to
+    // `mcp__macf-agent__*`. A workspace updating from before the move would
+    // otherwise keep the dead legacy-namespace entry forever (mistaken for
+    // operator-authored, since it no longer matches the new prefix).
+    it('drops the PRE-macf#995 legacy-namespace entry on refresh (migration cleanup)', () => {
+      mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+      writeFileSync(settingsPath, JSON.stringify({
+        permissions: {
+          allow: [
+            'mcp__plugin_macf-agent_macf-agent__notify_peer',           // legacy — dead post-migration
+            'mcp__plugin_macf-agent_macf-agent__checkpoint_to_memory',  // legacy — dead post-migration
+            'Bash(*)',                                                   // operator — preserved
+          ],
+        },
+      }, null, 2));
+
+      installPluginSkillPermissions(tmpRoot);
+
+      const allow = JSON.parse(readFileSync(settingsPath, 'utf-8')).permissions.allow;
+      expect(allow).not.toContain('mcp__plugin_macf-agent_macf-agent__notify_peer');
+      expect(allow).not.toContain('mcp__plugin_macf-agent_macf-agent__checkpoint_to_memory');
+      expect(allow).toContain('mcp__macf-agent__notify_peer');           // current namespace re-installed
+      expect(allow).toContain('mcp__macf-agent__checkpoint_to_memory');  // current namespace re-installed
+      expect(allow).toContain('Bash(*)');                                // operator preserved
+    });
+  });
+
+  describe('enabledMcpjsonServers (DR-022 Amendment P, groundnuty/macf#995)', () => {
+    it('pre-approves the macf-agent .mcp.json server on a fresh workspace', () => {
+      installPluginSkillPermissions(tmpRoot);
+      const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      expect(s.enabledMcpjsonServers).toEqual(['macf-agent']);
+    });
+
+    it('merges macf-agent into an operator-authored enabledMcpjsonServers array, never clobbering it', () => {
+      mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+      writeFileSync(settingsPath, JSON.stringify({ enabledMcpjsonServers: ['operator-tool'] }, null, 2));
+
+      installPluginSkillPermissions(tmpRoot);
+
+      const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      expect(s.enabledMcpjsonServers).toContain('operator-tool');
+      expect(s.enabledMcpjsonServers).toContain('macf-agent');
+    });
+
+    it('is idempotent — repeated calls do not duplicate macf-agent', () => {
+      installPluginSkillPermissions(tmpRoot);
+      installPluginSkillPermissions(tmpRoot);
+      const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      expect((s.enabledMcpjsonServers as string[]).filter((e) => e === 'macf-agent')).toHaveLength(1);
     });
   });
 });

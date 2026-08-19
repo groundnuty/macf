@@ -13,17 +13,30 @@ import { tmpdir } from 'node:os';
 vi.mock('../../src/cli/plugin-fetcher.js', () => ({
   fetchPluginToWorkspace: vi.fn(),
   workspacePluginDir: (dir: string) => join(dir, '.macf', 'plugin'),
-  pinChannelServerVersion: vi.fn(() => false),
+  // DR-022 Amendment P / groundnuty/macf#995 successor to the retired
+  // pinChannelServerVersion — strips mcpServers from the (mocked, never
+  // really fetched) local plugin.json copy.
+  stripPluginMcpServers: vi.fn(() => false),
   // Stub the #676 dist-link delivery — it resolves the running CLI's own dist
   // via import.meta.url, which isn't built in the test runner; a no-op keeps
   // the update flow under test without touching the filesystem.
   linkPluginCliDist: vi.fn(() => false),
-  // macf#889 Pattern A read-back — default "nothing to verify" (no mismatch),
-  // matching the real function's behavior when nothing was ever pinned in the
-  // (unmocked, unwritten-by-tests) manifest. Individual tests override via
-  // `vi.mocked(readPinnedChannelServerVersion).mockReturnValueOnce(...)`.
-  readPinnedChannelServerVersion: vi.fn(() => null),
 }));
+
+// `.mcp.json` writing (groundnuty/macf#995) is REAL pure-fs code (no
+// network, no git clone) — left UNMOCKED by default so the decisive
+// retrofit test below asserts against a genuine on-disk file. Only
+// `readMcpJsonChannelServerVersion` is wrapped in `vi.fn()` (delegating to
+// the real implementation by default) so the ONE Pattern-A-mismatch test
+// can override a single call via `mockReturnValueOnce` — same shape the
+// retired `readPinnedChannelServerVersion` mock served.
+vi.mock('../../src/cli/mcp-json.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/cli/mcp-json.js')>();
+  return {
+    ...actual,
+    readMcpJsonChannelServerVersion: vi.fn(actual.readMcpJsonChannelServerVersion),
+  };
+});
 
 // Stub `node:readline.createInterface` so tests can drive the unified
 // Proceed? prompt (macf#334) without attaching to real stdin. Tests set
@@ -38,9 +51,8 @@ vi.mock('node:readline', () => ({
 
 import { update, buildDiff, renderDiff } from '../../src/cli/commands/update.js';
 import { agentConfigPath } from '../../src/cli/config.js';
-import {
-  fetchPluginToWorkspace, pinChannelServerVersion, readPinnedChannelServerVersion,
-} from '../../src/cli/plugin-fetcher.js';
+import { fetchPluginToWorkspace, stripPluginMcpServers, linkPluginCliDist } from '../../src/cli/plugin-fetcher.js';
+import { mcpJsonPath, readMcpJsonChannelServerVersion, MCP_SERVER_NAME } from '../../src/cli/mcp-json.js';
 import type { ResolvedVersions } from '../../src/cli/version-resolver.js';
 import type { MacfAgentConfig } from '../../src/cli/config.js';
 
@@ -514,18 +526,23 @@ describe('update command', () => {
 
     beforeEach(() => {
       vi.mocked(fetchPluginToWorkspace).mockClear();
-      vi.mocked(pinChannelServerVersion).mockClear();
-      vi.mocked(readPinnedChannelServerVersion).mockClear();
-      vi.mocked(readPinnedChannelServerVersion).mockReturnValue(null);
+      vi.mocked(stripPluginMcpServers).mockClear();
+      vi.mocked(linkPluginCliDist).mockClear();
+      vi.mocked(readMcpJsonChannelServerVersion).mockClear();
     });
 
     it('claude.sh mounts the default .macf/plugin — that dir is updated (existing behaviour preserved)', async () => {
       writeConfig(dir, { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' });
       // No claude.sh pre-seeded — the canonical template mounts .macf/plugin.
-      // Pre-populate it so the #62 repair-fetch path (which fires with the
-      // OLD pin, before the bump) doesn't mask the post-bump re-pin call
-      // this test is asserting on — real dir needed since the mocked
-      // fetchPluginToWorkspace never actually creates one.
+      // Pre-populate it so the #62 repair-fetch path doesn't also fire — real
+      // dir needed since the mocked fetchPluginToWorkspace never actually
+      // creates one. This is a CLI-only bump (plugin: false), so neither
+      // fetchPluginToWorkspace NOR stripPluginMcpServers fire (both are
+      // paired with an actual re-fetch, macf#995) — the mount-resolution
+      // proof for a component-agnostic write is `linkPluginCliDist`
+      // (unconditional on pluginTarget.dir existing) + `.mcp.json`'s pin
+      // (unconditional on config.versions, independent of pluginTarget
+      // entirely).
       mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
       writeFileSync(join(dir, '.macf', 'plugin', 'manifest.txt'), 'seed\n');
       mockFetchReturning({ cli: '0.3.0', plugin: '0.1.0', actions: 'v1' });
@@ -533,9 +550,13 @@ describe('update command', () => {
       const code = await update(dir, { all: false, cli: true, plugin: false, actions: false, yes: true, dryRun: false });
       expect(code).toBe(0);
 
-      expect(pinChannelServerVersion).toHaveBeenCalledWith(
-        dir, '0.3.0', { targetDir: join(dir, '.macf', 'plugin') },
+      expect(linkPluginCliDist).toHaveBeenCalledWith(
+        dir, { targetDir: join(dir, '.macf', 'plugin') },
       );
+      // .mcp.json is independent of plugin-mount resolution — it always
+      // lands at the workspace root, pinned to the bumped CLI version.
+      expect(existsSync(mcpJsonPath(dir))).toBe(true);
+      expect(readMcpJsonChannelServerVersion(dir)).toBe('0.3.0');
     });
 
     it('claude.sh mounts .macf/plugin-cs — plugin-cs is updated, not the default', async () => {
@@ -549,13 +570,13 @@ describe('update command', () => {
       const code = await update(dir, { all: false, cli: true, plugin: false, actions: false, yes: true, dryRun: false });
       expect(code).toBe(0);
 
-      expect(pinChannelServerVersion).toHaveBeenCalledWith(
-        dir, '0.3.0', { targetDir: join(dir, '.macf', 'plugin-cs') },
+      expect(linkPluginCliDist).toHaveBeenCalledWith(
+        dir, { targetDir: join(dir, '.macf', 'plugin-cs') },
       );
       // The unmounted default must never be touched by this run.
       const defaultDir = join(dir, '.macf', 'plugin');
-      for (const call of vi.mocked(pinChannelServerVersion).mock.calls) {
-        expect(call[2]).not.toEqual({ targetDir: defaultDir });
+      for (const call of vi.mocked(linkPluginCliDist).mock.calls) {
+        expect(call[1]).not.toEqual({ targetDir: defaultDir });
       }
       for (const call of vi.mocked(fetchPluginToWorkspace).mock.calls) {
         expect(call[2]).not.toEqual({ targetDir: defaultDir });
@@ -577,8 +598,8 @@ describe('update command', () => {
         const code = await update(dir, { all: false, cli: true, plugin: false, actions: false, yes: true, dryRun: false });
         expect(code).toBe(0);
 
-        expect(pinChannelServerVersion).toHaveBeenCalledWith(
-          dir, '0.3.0', { targetDir: join(dir, '.macf', 'plugin-cs') },
+        expect(linkPluginCliDist).toHaveBeenCalledWith(
+          dir, { targetDir: join(dir, '.macf', 'plugin-cs') },
         );
         // Names BOTH paths (AC2) so an operator/agent can see the unmounted
         // default is deliberately left alone, not silently drifting.
@@ -603,23 +624,24 @@ describe('update command', () => {
       expect(code).toBe(0); // loud, but non-blocking — asset refresh etc. still succeeded
 
       expect(fetchPluginToWorkspace).not.toHaveBeenCalled();
-      expect(pinChannelServerVersion).not.toHaveBeenCalled();
+      expect(stripPluginMcpServers).not.toHaveBeenCalled();
       const errOut = errorSpy.mock.calls.flat().join('\n');
       expect(errOut).toMatch(/cannot determine which plugin dir claude\.sh mounts/);
       expect(errOut).toMatch(/macf#889/);
+      // .mcp.json is UNAFFECTED by plugin-mount undeterminability — it's not
+      // resolved through pluginTarget at all (macf#995).
+      expect(existsSync(mcpJsonPath(dir))).toBe(true);
     });
 
-    it('post-update verification fails LOUDLY on a deliberately mismatched pin (Pattern A)', async () => {
+    it('post-update verification fails LOUDLY on a deliberately mismatched .mcp.json pin (Pattern A, macf#889/#995)', async () => {
       writeConfig(dir, { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' });
-      // No claude.sh pre-seeded — canonical .macf/plugin mount. Pre-populate
-      // so `existsSync(pluginTarget.dir)` holds at the Pattern-A assertion
-      // site (the mocked fetchPluginToWorkspace never creates a real dir).
       mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
       writeFileSync(join(dir, '.macf', 'plugin', 'manifest.txt'), 'seed\n');
       mockFetchReturning({ cli: '0.3.0', plugin: '0.1.0', actions: 'v1' });
-      // Simulate the write not reaching the mounted manifest: the read-back
-      // reports the OLD version even after pinChannelServerVersion "ran".
-      vi.mocked(readPinnedChannelServerVersion).mockReturnValue('0.1.0');
+      // Simulate the write not reaching .mcp.json: the read-back reports the
+      // OLD version even after the real write "ran" (one-shot override —
+      // readMcpJsonChannelServerVersion is otherwise the real implementation).
+      vi.mocked(readMcpJsonChannelServerVersion).mockReturnValueOnce('0.1.0');
 
       const code = await update(dir, { all: false, cli: true, plugin: false, actions: false, yes: true, dryRun: false });
 
@@ -633,6 +655,61 @@ describe('update command', () => {
       expect(errOut).toContain('@0.1.0');
       expect(errOut).toContain('@0.3.0');
       expect(errOut).toMatch(/macf#889/);
+    });
+  });
+
+  // groundnuty/macf#995 (DR-022 Amendment P) — THE DECISIVE test. A fresh
+  // `macf init`-only test would pass while every EXISTING fleet workspace
+  // stayed deaf to native channel routing; this proves `macf update` alone,
+  // on a workspace that predates the change entirely, adds the mount.
+  describe('.mcp.json retrofit (DR-022 Amendment P, groundnuty/macf#995)', () => {
+    it('update on a workspace with NO .mcp.json adds it, merge-not-clobber for one with other servers, refuses on malformed', async () => {
+      writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      expect(existsSync(mcpJsonPath(dir))).toBe(false);
+
+      const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+      expect(code).toBe(0);
+
+      expect(existsSync(mcpJsonPath(dir))).toBe(true);
+      const written = JSON.parse(readFileSync(mcpJsonPath(dir), 'utf-8'));
+      expect(written.mcpServers[MCP_SERVER_NAME].command).toBe('npx');
+      expect(written.mcpServers[MCP_SERVER_NAME].args).toContain('@groundnuty/macf-channel-server@0.2.0');
+    });
+
+    it('merges into an operator-authored .mcp.json with OTHER servers, preserving them (never clobbers)', async () => {
+      writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      writeFileSync(
+        mcpJsonPath(dir),
+        JSON.stringify({ mcpServers: { 'operator-tool': { command: 'node', args: ['other.js'] } } }, null, 2) + '\n',
+      );
+
+      const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+      expect(code).toBe(0);
+
+      const written = JSON.parse(readFileSync(mcpJsonPath(dir), 'utf-8'));
+      expect(written.mcpServers['operator-tool']).toEqual({ command: 'node', args: ['other.js'] });
+      expect(written.mcpServers[MCP_SERVER_NAME].command).toBe('npx');
+    });
+
+    it('refuses loudly + writes nothing when .mcp.json is malformed JSON', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+        mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+        writeFileSync(mcpJsonPath(dir), '{ not valid json');
+        const before = readFileSync(mcpJsonPath(dir), 'utf-8');
+
+        const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+        expect(code).toBe(0); // loud warn, non-blocking — matches the plugin-fetch-failure posture
+
+        expect(readFileSync(mcpJsonPath(dir), 'utf-8')).toBe(before);
+        const warnOut = warnSpy.mock.calls.flat().join('\n');
+        expect(warnOut).toMatch(/\.mcp\.json not written/);
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
   });
 

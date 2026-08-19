@@ -10,8 +10,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { lstatSync, realpathSync } from 'node:fs';
 import {
-  fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion,
-  linkPluginCliDist, resolveCliDistDir, readPinnedChannelServerVersion,
+  fetchPluginToWorkspace, workspacePluginDir, stripPluginMcpServers,
+  linkPluginCliDist, resolveCliDistDir,
 } from '../../src/cli/plugin-fetcher.js';
 
 /**
@@ -174,77 +174,56 @@ describe('workspacePluginDir', () => {
   });
 });
 
-describe('pinChannelServerVersion (groundnuty/macf#421)', () => {
+describe('stripPluginMcpServers (DR-022 Amendment P, groundnuty/macf#995)', () => {
   let ws: string;
 
   beforeEach(() => {
-    ws = mkdtempSync(join(tmpdir(), 'macf-pin-cs-'));
+    ws = mkdtempSync(join(tmpdir(), 'macf-strip-mcp-'));
   });
   afterEach(() => {
     rmSync(ws, { recursive: true, force: true });
   });
 
-  function writeManifest(mcpServers: unknown): string {
+  function writeManifest(manifest: Record<string, unknown>): string {
     const dir = join(workspacePluginDir(ws), '.claude-plugin');
     mkdirSync(dir, { recursive: true });
     const path = join(dir, 'plugin.json');
-    writeFileSync(path, JSON.stringify({ name: 'macf-agent', mcpServers }, null, 2));
+    writeFileSync(path, JSON.stringify(manifest, null, 2));
     return path;
   }
-  function readArgs(path: string): string[] {
-    const m = JSON.parse(readFileSync(path, 'utf-8'));
-    return m.mcpServers['macf-agent'].args;
-  }
 
-  it('pins a bare npx channel-server spec to @<version>', () => {
+  it('deletes the mcpServers key, preserving every other key', () => {
     const path = writeManifest({
-      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server'], env: { MACF_VERSION: '${MACF_VERSION:-}' } },
+      name: 'macf-agent',
+      version: '0.2.60',
+      mcpServers: { 'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server'] } },
     });
-    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(true);
-    expect(readArgs(path)).toEqual(['-y', '@groundnuty/macf-channel-server@0.2.34']);
-    // env block preserved.
-    expect(JSON.parse(readFileSync(path, 'utf-8')).mcpServers['macf-agent'].env).toEqual({ MACF_VERSION: '${MACF_VERSION:-}' });
+    expect(stripPluginMcpServers(ws)).toBe(true);
+    const result = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+    expect(result['mcpServers']).toBeUndefined();
+    expect(result['name']).toBe('macf-agent');
+    expect(result['version']).toBe('0.2.60');
   });
 
-  it('re-pins an already-pinned spec to the new version', () => {
-    const path = writeManifest({
-      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.20'] },
-    });
-    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(true);
-    expect(readArgs(path)).toEqual(['-y', '@groundnuty/macf-channel-server@0.2.34']);
-  });
-
-  it('is idempotent (no rewrite, returns false) when already at the target version', () => {
-    writeManifest({
-      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.34'] },
-    });
-    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(false);
-  });
-
-  it('no-ops on the legacy node dist/server.js form (no npm spec to pin)', () => {
-    const path = writeManifest({
-      'macf-agent': { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/dist/server.js'] },
-    });
-    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(false);
-    expect(readArgs(path)).toEqual(['${CLAUDE_PLUGIN_ROOT}/dist/server.js']);
+  it('is idempotent (no-ops, returns false) once mcpServers is already absent', () => {
+    writeManifest({ name: 'macf-agent', version: '0.2.60' });
+    expect(stripPluginMcpServers(ws)).toBe(false);
   });
 
   it('no-ops (returns false) when the plugin.json is absent', () => {
-    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(false);
+    expect(stripPluginMcpServers(ws)).toBe(false);
   });
 
-  it('no-ops when there is no mcpServers block', () => {
+  it('no-ops (returns false) on malformed JSON, without throwing', () => {
     const dir = join(workspacePluginDir(ws), '.claude-plugin');
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ name: 'macf-agent' }, null, 2));
-    expect(pinChannelServerVersion(ws, '0.2.34')).toBe(false);
+    writeFileSync(join(dir, 'plugin.json'), '{ not valid json');
+    expect(stripPluginMcpServers(ws)).toBe(false);
   });
 
   // macf#889: `macf update` must write to the dir claude.sh ACTUALLY mounts,
-  // not always the conventional default — these prove the override reaches
-  // both the write (pinChannelServerVersion) and the read-back
-  // (readPinnedChannelServerVersion) sides identically.
-  it('targetDir option writes to an alternate dir (e.g. .macf/plugin-cs), not the default', () => {
+  // not always the conventional default.
+  it('targetDir option strips an alternate dir (e.g. .macf/plugin-cs), not the default', () => {
     const altDir = join(ws, '.macf', 'plugin-cs');
     const manifestDir = join(altDir, '.claude-plugin');
     mkdirSync(manifestDir, { recursive: true });
@@ -254,62 +233,10 @@ describe('pinChannelServerVersion (groundnuty/macf#421)', () => {
       JSON.stringify({ name: 'macf-agent', mcpServers: { 'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server'] } } }, null, 2),
     );
 
-    expect(pinChannelServerVersion(ws, '0.2.47', { targetDir: altDir })).toBe(true);
-    expect(readArgs(path)).toEqual(['-y', '@groundnuty/macf-channel-server@0.2.47']);
+    expect(stripPluginMcpServers(ws, { targetDir: altDir })).toBe(true);
+    expect((JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>)['mcpServers']).toBeUndefined();
     // The conventional default was never written (doesn't even exist).
     expect(existsSync(join(workspacePluginDir(ws), '.claude-plugin', 'plugin.json'))).toBe(false);
-  });
-});
-
-describe('readPinnedChannelServerVersion (macf#889 Pattern A)', () => {
-  let ws: string;
-
-  beforeEach(() => {
-    ws = mkdtempSync(join(tmpdir(), 'macf-read-pin-'));
-  });
-  afterEach(() => {
-    rmSync(ws, { recursive: true, force: true });
-  });
-
-  function writeManifest(pluginDir: string, mcpServers: unknown): void {
-    const dir = join(pluginDir, '.claude-plugin');
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ name: 'macf-agent', mcpServers }, null, 2));
-  }
-
-  it('reads back a pinned version', () => {
-    const pluginDir = workspacePluginDir(ws);
-    writeManifest(pluginDir, {
-      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server@0.2.47'] },
-    });
-    expect(readPinnedChannelServerVersion(pluginDir)).toBe('0.2.47');
-  });
-
-  it('agrees with what pinChannelServerVersion just wrote (write/read-back round-trip)', () => {
-    const pluginDir = join(ws, '.macf', 'plugin-cs');
-    writeManifest(pluginDir, {
-      'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server'] },
-    });
-    pinChannelServerVersion(ws, '0.2.56', { targetDir: pluginDir });
-    expect(readPinnedChannelServerVersion(pluginDir)).toBe('0.2.56');
-  });
-
-  it('returns null (nothing to verify, not a mismatch) when the manifest is absent', () => {
-    expect(readPinnedChannelServerVersion(join(ws, 'does-not-exist'))).toBeNull();
-  });
-
-  it('returns null for the legacy non-npx form', () => {
-    const pluginDir = workspacePluginDir(ws);
-    writeManifest(pluginDir, {
-      'macf-agent': { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/dist/server.js'] },
-    });
-    expect(readPinnedChannelServerVersion(pluginDir)).toBeNull();
-  });
-
-  it('returns null when there is no mcpServers block', () => {
-    const pluginDir = workspacePluginDir(ws);
-    writeManifest(pluginDir, undefined);
-    expect(readPinnedChannelServerVersion(pluginDir)).toBeNull();
   });
 });
 

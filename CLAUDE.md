@@ -454,12 +454,17 @@ One-off test: `devbox run -- npx vitest run test/path/to/file.test.ts`
 - CLI ships via npm (eventual)
 - Plugin ships via `groundnuty/macf-marketplace@v<version>` (separate repo)
   — `macf init` and `macf update` clone `macf-marketplace:macf-agent/` at
-  the pinned tag into `<workspace>/.macf/plugin/`; `claude.sh` uses
-  `--plugin-dir` per DR-013. The marketplace `mcpServers` args ship a BARE
-  `npx -y @groundnuty/macf-channel-server` spec; `macf init`/`update` rewrite
-  the mounted copy to pin `@<cli-version>` via `pinChannelServerVersion`
-  (macf#421) so a bare-npx cache hit can't silently serve a stale channel-server
-  (the cs version tracks the CLI in the monorepo, not the marketplace plugin tag)
+  the pinned tag into `<workspace>/.macf/plugin/` for skills/agents/hooks/
+  rules; `claude.sh` uses `--plugin-dir` per DR-013. **The channel-server no
+  longer mounts via the plugin's `mcpServers`** (DR-022 Amendment P,
+  groundnuty/macf#995): `macf init`/`update` strip `mcpServers` from the
+  fetched local plugin.json copy (`stripPluginMcpServers`) and instead write
+  `<workspace>/.mcp.json` with a pinned `npx -y
+  @groundnuty/macf-channel-server@<cli-version>` entry
+  (`mcp-json.ts::writeMcpJsonChannelServer`) — the mount the launcher's
+  `--dangerously-load-development-channels server:macf-agent` flag
+  (macf#632) actually resolves against. cs version pin tracks the CLI in
+  the monorepo (macf#421), never a bare unpinned `npx` spec.
 - Routing workflow ships via `groundnuty/macf-actions@v<version>` — consumers
   reference it from their `.github/workflows/agent-router.yml` via
   `uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3`

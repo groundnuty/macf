@@ -51,6 +51,7 @@ describe('ROLL_TOUCHED_CONFIG_PATTERNS (DR-040 Decision 6, macf#698)', () => {
       '.claude/.macf/env.certs',
       '.claude/.macf/env.registry',
       '.claude/.macf/host-prelude.sh',
+      '.mcp.json', // DR-022 Amendment P, groundnuty/macf#995
       // (b) operator-evolution files kept per macf#725 (must-not-silently-stash):
       'CLAUDE.md',
       'env.local.*',

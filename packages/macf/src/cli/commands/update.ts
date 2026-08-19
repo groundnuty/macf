@@ -51,9 +51,9 @@ import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-s
 import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
 import {
-  fetchPluginToWorkspace, workspacePluginDir, pinChannelServerVersion, linkPluginCliDist,
-  readPinnedChannelServerVersion,
+  fetchPluginToWorkspace, workspacePluginDir, stripPluginMcpServers, linkPluginCliDist,
 } from '../plugin-fetcher.js';
+import { writeMcpJsonChannelServer, readMcpJsonChannelServerVersion } from '../mcp-json.js';
 import { resolvePluginUpdateTarget } from '../plugin-hook-resolver.js';
 import { writeClaudeSh, hasManagedHeader } from '../claude-sh.js';
 import { writeHostPrelude } from '../host-prelude.js';
@@ -513,11 +513,35 @@ export async function update(
   if (config.versions && pluginTarget.dir && pluginDirNeedsRepair(pluginTarget.dir)) {
     try {
       fetchPluginToWorkspace(projectDir, config.versions.plugin, { targetDir: pluginTarget.dir });
-      pinChannelServerVersion(projectDir, config.versions.cli, { targetDir: pluginTarget.dir }); // groundnuty/macf#421
-      console.log(`Repaired ${pluginTarget.dir} with macf-agent@v${config.versions.plugin} (channel-server pinned @${config.versions.cli})`);
+      // Strip mcpServers from the repaired local copy (DR-022 Amendment P,
+      // groundnuty/macf#995) — a fetch always reintroduces whatever the
+      // marketplace manifest currently ships, so this must re-run after
+      // every fetch, not just the first one.
+      stripPluginMcpServers(projectDir, { targetDir: pluginTarget.dir });
+      console.log(`Repaired ${pluginTarget.dir} with macf-agent@v${config.versions.plugin} (mcpServers stripped)`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`Warning: plugin repair fetch failed: ${msg}`);
+    }
+  }
+
+  // Write/refresh <workspace>/.mcp.json with the channel-server as a project
+  // MCP server (DR-022 Amendment P, groundnuty/macf#995) — THE RETROFIT: runs
+  // on every `macf update`, unconditionally of whether the plugin needed
+  // repair or any version is being bumped, so an EXISTING workspace that
+  // predates this change (all nine on the operator's machine, per #995's
+  // survey) gets the mount on its next `macf update`, not only on a fresh
+  // `macf init`. Gated on `config.versions` (skipped for legacy configs —
+  // same posture as the repair-fetch above; the error path just below tells
+  // the operator to `macf init --force`). Merge-preserving + idempotent — see
+  // `mcp-json.ts::writeMcpJsonChannelServer`'s doc comment for the refuse
+  // conditions.
+  if (config.versions) {
+    const mcpJsonResult = writeMcpJsonChannelServer(projectDir, config, config.versions.cli);
+    if (mcpJsonResult.status === 'refused') {
+      console.warn(`Warning: .mcp.json not written: ${mcpJsonResult.reason}`);
+    } else if (mcpJsonResult.changed) {
+      console.log(`Refreshed .mcp.json (macf-agent channel-server, pinned @${config.versions.cli})`);
     }
   }
 
@@ -623,7 +647,13 @@ export async function update(
     return 0;
   }
 
-  writeAgentConfig(projectDir, { ...config, versions: newVersions });
+  // Used below (in-memory) so the .mcp.json OTEL env block's baked
+  // MACF_VERSION / service.version reflect THIS bump — `config` itself is
+  // never reassigned, only the on-disk file is (macf#995: a stale in-memory
+  // `config.versions.cli` would otherwise pin the npx arg to the new version
+  // while baking OTEL attrs that still say the old one).
+  const updatedConfig = { ...config, versions: newVersions };
+  writeAgentConfig(projectDir, updatedConfig);
 
   // Re-fetch the plugin when versions.plugin was bumped. The separate
   // repair-case fetch runs earlier (before short-circuits) for empty/
@@ -637,7 +667,11 @@ export async function update(
     if (pluginTarget.dir) {
       try {
         fetchPluginToWorkspace(projectDir, newVersions.plugin, { targetDir: pluginTarget.dir });
-        console.log(`Refreshed ${pluginTarget.dir} to macf-agent@v${newVersions.plugin}`);
+        // A fetch always overwrites the manifest, reintroducing mcpServers if
+        // the marketplace still ships it — strip again (DR-022 Amendment P,
+        // groundnuty/macf#995).
+        stripPluginMcpServers(projectDir, { targetDir: pluginTarget.dir });
+        console.log(`Refreshed ${pluginTarget.dir} to macf-agent@v${newVersions.plugin} (mcpServers stripped)`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`Warning: plugin re-fetch failed: ${msg}`);
@@ -650,51 +684,57 @@ export async function update(
     }
   }
 
-  // Re-pin the channel-server version in the MOUNTED mcpServers args
-  // (groundnuty/macf#421), regardless of WHICH component bumped: the cs version
-  // tracks the CLI (monorepo lockstep), so a CLI bump WITHOUT a plugin bump
-  // would otherwise leave the mounted plugin.json carrying a stale cs pin (the
-  // plugin re-fetch above only fires on a plugin bump). A fresh re-fetch resets
-  // the arg to the bare marketplace form, so this must run after it. Idempotent
-  // when the pin is already current. Gated on `pluginTarget.dir` (macf#889) —
-  // this is the exact write macf#889 reported missing for a workspace mounting
-  // `.macf/plugin-cs`: the config pin advanced but the MOUNTED manifest never did.
+  // Re-pin the channel-server version in .mcp.json (successor to the retired
+  // plugin-manifest pin — groundnuty/macf#421 + DR-022 Amendment P /
+  // groundnuty/macf#995), regardless of WHICH component bumped: the cs
+  // version tracks the CLI (monorepo lockstep), so a CLI bump WITHOUT a
+  // plugin bump would otherwise leave `.mcp.json` carrying a stale cs pin.
+  // Idempotent when the pin is already current. Unlike the retired
+  // plugin-manifest pin, this does NOT depend on `pluginTarget.dir` —
+  // `.mcp.json` always lives at the workspace root, independent of which
+  // `--plugin-dir` variant is mounted.
+  const mcpJsonBumpResult = writeMcpJsonChannelServer(projectDir, updatedConfig, newVersions.cli);
+  if (mcpJsonBumpResult.status === 'refused') {
+    console.error(`FATAL: post-bump .mcp.json write refused: ${mcpJsonBumpResult.reason}`);
+  } else if (mcpJsonBumpResult.changed) {
+    console.log(`Pinned channel-server @${newVersions.cli} in .mcp.json`);
+  }
+
+  // Pattern A (macf#889/#995) — the load-bearing half: don't just trust that
+  // the write above succeeded, READ BACK what `.mcp.json` now pins and
+  // assert it matches the target. macf#889's entire failure shape was "the
+  // upgrade reports success (it DID write a real manifest) and the agent
+  // reports its true version (which nobody compares against the intent)" —
+  // this is that comparison, repointed at the new mount. A mismatch here
+  // means the write above did not reach the file actually being upgraded
+  // (permission fault, race, or a future regression of this same class) —
+  // surfaced LOUD rather than left for an operator to eyeball version
+  // columns side by side. Deliberately does NOT change the exit code:
+  // `upgrade()` (the fleet-roll driver verb, `vm-driver.ts`) shells this
+  // command via `execFileSync` with `stdio: 'inherit'`, which THROWS on a
+  // non-zero exit — turning this into a hard failure would abort the roll's
+  // upgrade→restart transaction mid-flight with the workspace already
+  // mutated (exactly the class macf#725's transactional discipline exists
+  // to prevent). The loud console.error is captured in the inherited output
+  // either way.
+  const actualMcpPin = readMcpJsonChannelServerVersion(projectDir);
+  if (actualMcpPin !== null && actualMcpPin !== newVersions.cli) {
+    console.error(
+      `FATAL: post-update verification failed — .mcp.json pins the channel-server at ` +
+        `@${actualMcpPin}, not the target @${newVersions.cli}. The write above did not reach ` +
+        `the file actually being upgraded (macf#889's failure shape, repointed). Inspect ` +
+        `${join(projectDir, '.mcp.json')}.`,
+    );
+  }
+
   if (pluginTarget.dir && existsSync(pluginTarget.dir)) {
-    if (pinChannelServerVersion(projectDir, newVersions.cli, { targetDir: pluginTarget.dir })) {
-      console.log(`Pinned channel-server @${newVersions.cli} in ${pluginTarget.dir} mcpServers`);
-    }
-    // Re-deliver the plugin-CLI dist link (groundnuty/macf#676). Runs after the
-    // pin and the plugin re-fetch above (a re-fetch wipes the mounted dir,
-    // taking the link with it); idempotent so a no-bump update refreshes a
-    // stale link.
+    // Re-deliver the plugin-CLI dist link (groundnuty/macf#676). Runs after
+    // the plugin re-fetch above (a re-fetch wipes the mounted dir, taking
+    // the link with it); idempotent so a no-bump update refreshes a stale
+    // link. Unrelated to the channel-server pin above — this delivers the
+    // `/macf-*` skill CLI, which still ships via the `--plugin-dir` mount.
     if (linkPluginCliDist(projectDir, { targetDir: pluginTarget.dir })) {
       console.log(`Linked plugin-CLI dist into ${pluginTarget.dir}/dist`);
-    }
-
-    // Pattern A (macf#889) — the load-bearing half: don't just trust that the
-    // write above succeeded, READ BACK what the mounted manifest now pins and
-    // assert it matches the target. macf#889's entire failure shape was "the
-    // upgrade reports success (it DID write a real manifest) and the agent
-    // reports its true version (which nobody compares against the intent)" —
-    // this is that comparison. A mismatch here means the write above did not
-    // reach the thing actually being upgraded (wrong dir, permission fault,
-    // race, or a future regression of this same class) — surfaced LOUD rather
-    // than left for an operator to eyeball version columns side by side.
-    // Deliberately does NOT change the exit code: `upgrade()` (the fleet-roll
-    // driver verb, `vm-driver.ts`) shells this command via `execFileSync` with
-    // `stdio: 'inherit'`, which THROWS on a non-zero exit — turning this into
-    // a hard failure would abort the roll's upgrade→restart transaction
-    // mid-flight with the workspace already mutated (exactly the class
-    // macf#725's transactional discipline exists to prevent). The loud
-    // console.error is captured in the inherited output either way.
-    const actualPin = readPinnedChannelServerVersion(pluginTarget.dir);
-    if (actualPin !== null && actualPin !== newVersions.cli) {
-      console.error(
-        `FATAL: post-update verification failed — ${pluginTarget.dir} pins the channel-server at ` +
-          `@${actualPin}, not the target @${newVersions.cli}. The write above did not reach the ` +
-          `mounted manifest (macf#889's failure shape exactly). Inspect ` +
-          `${pluginTarget.dir}/.claude-plugin/plugin.json.`,
-      );
     }
   }
 
