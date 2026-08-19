@@ -1512,7 +1512,12 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-3';
 
     const code = await runBootstrapApply(
-      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      // macf#1013 — deploy:false: this test is about macf#954's vault-aware
+      // confirm-before-create wiring, not the (later) default deploy phase;
+      // decoupling keeps it hermetic (this fixture's `deploy_path`s are
+      // real-looking absolute paths, never a scratch dir — see
+      // `BootstrapApplyDeps.deployDeps`'s own doc for why that's deliberate).
+      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt', deploy: false },
       { observe: () => Promise.resolve(EMPTY_OBSERVED), readVault: async () => raw },
       fakeMutateDeps(file, {
         // Cleans up the REAL scratch-PEM dir `realResolveKeyPath` writes into
@@ -1583,7 +1588,8 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const file = writeManifest();
     let startManifestFlowCalled = false;
     const code = await runBootstrapApply(
-      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      // macf#1013 — deploy:false, see the sibling test above's comment.
+      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt', deploy: false },
       { observe: () => Promise.resolve(EMPTY_OBSERVED), readVault: async () => ({}) },
       fakeMutateDeps(file, {
         buildAgentDeps: () =>
@@ -1620,7 +1626,8 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     };
     let startManifestFlowCalled = false;
     const code = await runBootstrapApply(
-      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      // macf#1013 — deploy:false, see the sibling test above's comment.
+      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt', deploy: false },
       {
         observe: () => Promise.resolve(EMPTY_OBSERVED),
         readVault: async () => vaultRawWithAgentPems(['code-agent', 'science-agent']),
@@ -1697,7 +1704,12 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     let code: number;
     try {
       code = await runBootstrapApply(
-        { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/wrong-identity.txt' },
+        // macf#1013 — deploy:false: this test is specifically about the
+        // vault-aware CONFIRM PREVIEW degrading gracefully on a bad
+        // identity key; the deploy phase would ALSO (correctly) fail loud
+        // on the same bad key, which is a distinct, separately-tested
+        // concern (see the "deploy phase" describe block below).
+        { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/wrong-identity.txt', deploy: false },
         {
           observe: () => Promise.resolve(EMPTY_OBSERVED),
           readVault: async () => {
@@ -1771,7 +1783,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     let unarchiveCalled = false;
     let startManifestFlowCalled = false;
     const code = await runBootstrapApply(
-      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      // macf#1013 — deploy:false, see the sibling test above's comment
+      // ("with identity + an existing App recorded..."): this test is about
+      // the revival wiring, not the default deploy phase.
+      { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt', deploy: false },
       {
         observe: () => Promise.resolve(EMPTY_OBSERVED),
         readVault: async () => vaultRawWithAgentPems(['code-agent', 'science-agent']),
@@ -1893,7 +1908,11 @@ describe('runBootstrapApply — remaining-deploy honest completion (macf#1014)',
     const file = writeManifest();
     const checkDeployPathExists = (p: string): boolean => p === DEMO_REPOS_PARENT;
     const code = await runBootstrapApply(
-      { file, yes: true, vaultPath: '/fake/secrets/vault.age', identityKeyPath: '/home/op/age-identity.txt' },
+      // macf#1013 — deploy:false: this test is about `remaining-deploy.ts`'s
+      // OWN flag-echoing behavior (macf#1014), independent of whether the
+      // NEW default deploy phase (macf#1013) itself ran; a real vault path
+      // here would make the deploy phase attempt a real decrypt.
+      { file, yes: true, vaultPath: '/fake/secrets/vault.age', identityKeyPath: '/home/op/age-identity.txt', deploy: false },
       { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists },
       fakeMutateDeps(file),
     );
