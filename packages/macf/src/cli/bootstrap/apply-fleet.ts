@@ -212,7 +212,7 @@ import { applyAgentIdentity, applyIdentity, cleanupScratchPem, writeScratchPem }
 import type { Presence } from './plan.js';
 import { buildRegistryRepoValidateInstall } from './registry-repo-coverage.js';
 import type { AppCredentials } from './manifest-exchange.js';
-import type { AgentRepoDeps, RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
+import type { AgentRepoDeps, AgentRepoOptions, RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
 import { applyRepoInitForAgent, ensureAgentRepo } from './apply-repo-init.js';
 import { repoHomepageUrl } from './app-manifest.js';
 import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './control-repo.js';
@@ -273,6 +273,15 @@ export interface FleetApplyDeps {
   readonly controlRepoOptions?: ControlRepoOptions;
   /** macf#857 — ensures each agent's OWN repo exists before either consent gate; see `apply-repo-init.ts::ensureAgentRepo`'s doc. */
   readonly agentRepoDeps: AgentRepoDeps;
+  /**
+   * DR-043 Amendment G revival confirm gate for agent repos (groundnuty/macf#1034)
+   * — threaded straight into every `ensureAgentRepo` call, mirroring
+   * `controlRepoOptions.confirmUnarchive` exactly (same single
+   * plan-approve-once "yes" licenses both). Optional/`undefined` behaves
+   * identically to `confirmUnarchive: false` (the safe default —
+   * `ensureAgentRepo` never un-archives without it).
+   */
+  readonly agentRepoOptions?: AgentRepoOptions;
   /** Injectable clock, threaded into `writeVault`'s version-suffix (deterministic tests). */
   readonly now: () => Date;
   readonly log: (line: string) => void;
@@ -950,10 +959,20 @@ export async function applyFleet(
     // macf#857 — ensure the agent's OWN repo exists BEFORE either consent
     // gate: gate 2's install page can't list a repo that doesn't exist yet
     // (the exact failure the first live provision, #854, hit on the
-    // operator's first Install click).
-    const repoOutcome = await ensureAgentRepo(agent, manifest, deps.agentRepoDeps);
-    if (repoOutcome.status === 'failed') {
-      scopedLog(`Role "${agent.role}": agent repo "${agent.repo}" FAILED — ${repoOutcome.reason}`);
+    // operator's first Install click). macf#1034 (DR-043 Amendment G
+    // correction) — the SAME call also revives an archived agent repo, under
+    // the SAME single plan-approve-once "yes" `deps.controlRepoOptions`
+    // already threads to `provisionControlRepo` (see `agentRepoOptions`'s
+    // doc on `FleetApplyDeps`).
+    const repoOutcome = await ensureAgentRepo(agent, manifest, deps.agentRepoDeps, deps.agentRepoOptions);
+    // macf#1034 — `'archived'` (un-archive not confirmed) and `'unknown'`
+    // (existence/archived-state inconclusive) abort exactly like `'failed'`:
+    // none of the three leaves a repo this run can safely install an App
+    // onto or push routing config to, so this agent's turn stops here —
+    // same treatment `applyFleet`'s control-repo step 0 already gives its
+    // own `'archived'`/`'failed'` outcomes.
+    if (repoOutcome.status === 'failed' || repoOutcome.status === 'archived' || repoOutcome.status === 'unknown') {
+      scopedLog(`Role "${agent.role}": agent repo "${agent.repo}" ${repoOutcome.status.toUpperCase()} — ${repoOutcome.reason}`);
       records.push({
         role: agent.role,
         identity: {
@@ -967,8 +986,8 @@ export async function applyFleet(
     scopedLog(`Role "${agent.role}": agent repo "${agent.repo}" ${repoOutcome.status.toUpperCase()}.`);
     confirmedRepos.push(agent.repo);
     // macf#972 — only a FRESH creation this run disqualifies the repo from
-    // the register-before-route poll; `'present'` (pre-existing) keeps
-    // polling exactly as today.
+    // the register-before-route poll; `'present'`/`'revived'` (pre-existing)
+    // keeps polling exactly as today.
     if (repoOutcome.status === 'created') {
       justCreatedRepos.add(agent.repo);
     }

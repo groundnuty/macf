@@ -53,7 +53,7 @@ import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
 import { checkControlRepoMeta, realControlRepoCommitAndPush, realReadControlManifestFile } from '../bootstrap/control-repo.js';
 import { realUnarchiveRepo } from '../bootstrap/repo-archive.js';
 import {
-  checkRepoExists,
+  checkRepoArchivedState,
   checkRepoSecretPresence,
   checkRepoVariablePresence,
   checkRegistryVariablePresence,
@@ -606,10 +606,21 @@ const REAL_CONTROL_REPO_DEPS: ControlRepoDeps = {
   commitAndPush: realControlRepoCommitAndPush,
 };
 
-/** macf#857 — the real agent-repo-ensure primitives (`checkRepoExists` is the SAME read `observer.ts`'s plan-time repo-presence check uses; `createRepo` is the SAME primitive the control repo uses, with a template). */
+/**
+ * macf#857 + macf#1034 (DR-043 Amendment G correction) — the real
+ * agent-repo-ensure/revive primitives. `checkRepoArchivedState` is the SAME
+ * `{archived}` read `observer.ts`'s plan-time control-repo observation
+ * already uses (macf#1034: one reader, not a second `checkRepoExists`-only
+ * read plus a separate archived probe). `createRepo` is the SAME primitive
+ * the control repo uses, with a template. `unarchiveRepo` is
+ * `repo-archive.ts::realUnarchiveRepo` — the EXACT SAME PATCH primitive
+ * `REAL_CONTROL_REPO_DEPS.unarchiveRepo` (above) already wires for the
+ * control repo, never a second un-archive implementation.
+ */
 const REAL_AGENT_REPO_DEPS: AgentRepoDeps = {
-  checkExists: checkRepoExists,
+  checkMeta: checkRepoArchivedState,
   createRepo: realCreateRepo,
+  unarchiveRepo: realUnarchiveRepo,
 };
 
 /**
@@ -804,6 +815,14 @@ export function resolveMutateDeps(
     // approved plan.
     controlRepoOptions: { confirmUnarchive: true },
     agentRepoDeps: REAL_AGENT_REPO_DEPS,
+    // macf#1034 (DR-043 Amendment G correction) — the SAME single
+    // plan-approve-once "yes" ALSO covers every declared agent repo the
+    // plan showed archived (`agentRepoArchivedItems`, threaded into
+    // `computePlan` above) — one approval for the whole declared repo set,
+    // not a second per-repo prompt. Same "never invert to a conditional
+    // without re-deriving from the approved plan" caveat as
+    // `controlRepoOptions` above.
+    agentRepoOptions: { confirmUnarchive: true },
     trustDeps: { ...REAL_TRUST_DEPS, ...(readVaultCaCert !== undefined ? { readVaultCaCert } : {}) },
     routingClientDeps: { ...REAL_ROUTING_CLIENT_DEPS, ...(readVaultRoutingClient !== undefined ? { readVaultRoutingClient } : {}) },
     now: () => new Date(),

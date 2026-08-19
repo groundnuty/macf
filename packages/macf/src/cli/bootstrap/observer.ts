@@ -1043,6 +1043,13 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     // that function's doc.
     const repoState = await resolveAgentRepoState(agent.repo, caVarName, 'ROUTING_CLIENT_CERT');
     const actionsPin = await readCallerActionsPin(agent.repo);
+    // DR-043 Amendment G correction (groundnuty/macf#1034) — a STANDALONE
+    // `{archived}` read, deliberately NOT threaded through
+    // `resolveAgentRepoState` (macf#1026-gated, serves the unrelated
+    // CA/routing-client presence trio above). The SAME function this
+    // module's control-repo observation already uses (below) — one reader
+    // per fact, not a second `{archived}` primitive.
+    const repoArchivedMeta = await checkRepoArchivedState(agent.repo);
     agents[agent.role] = {
       app: lockEntry ? 'present' : 'unknown',
       appId: lockEntry?.app_id,
@@ -1053,6 +1060,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       fingerprints: lockEntry?.fingerprints ?? {},
       deployedVersion: lockEntry?.deployed_version,
       actionsPin,
+      archived: repoArchivedMeta.archived,
     };
     caRepos[agent.repo] = repoState.caRepo;
     routingClientRepos[agent.repo] = repoState.routingClientRepo;

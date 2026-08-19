@@ -305,16 +305,18 @@ describe('applyRepoInitForAgent', () => {
   });
 });
 
-// --- ensureAgentRepo (macf#857, DR-043 Amendment F / #854 §2) ---
+// --- ensureAgentRepo (macf#857, DR-043 Amendment F / #854 §2;
+// + revival, DR-043 Amendment G correction, groundnuty/macf#1034) ---
 
 describe('ensureAgentRepo', () => {
   it('absent + provenance template (default) -> creates FROM defaults.role_template', async () => {
     const calls: { repo: string; opts: unknown }[] = [];
     const deps: AgentRepoDeps = {
-      checkExists: async () => 'absent',
+      checkMeta: async () => ({ presence: 'absent' }),
       createRepo: async (repo, opts) => {
         calls.push({ repo, opts });
       },
+      unarchiveRepo: vi.fn(),
     };
     const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
     expect(outcome).toEqual({ repo: 'groundnuty/demo-code', role: 'code-agent', status: 'created' });
@@ -325,56 +327,119 @@ describe('ensureAgentRepo', () => {
     const mirrorAgent: FleetAgent = { ...AGENT, provenance: 'mirror' };
     const calls: { repo: string; opts: unknown }[] = [];
     const deps: AgentRepoDeps = {
-      checkExists: async () => 'absent',
+      checkMeta: async () => ({ presence: 'absent' }),
       createRepo: async (repo, opts) => {
         calls.push({ repo, opts });
       },
+      unarchiveRepo: vi.fn(),
     };
     const outcome = await ensureAgentRepo(mirrorAgent, MANIFEST, deps);
     expect(outcome.status).toBe('created');
     expect(calls).toEqual([{ repo: 'groundnuty/demo-code', opts: undefined }]);
   });
 
-  it('already present -> left untouched, status "present", createRepo never called', async () => {
+  it('already present, not archived -> left untouched, status "present", createRepo/unarchiveRepo never called', async () => {
     const createRepo = vi.fn();
-    const deps: AgentRepoDeps = { checkExists: async () => 'present', createRepo };
+    const unarchiveRepo = vi.fn();
+    const deps: AgentRepoDeps = { checkMeta: async () => ({ presence: 'present', archived: false }), createRepo, unarchiveRepo };
     const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
     expect(outcome).toEqual({ repo: 'groundnuty/demo-code', role: 'code-agent', status: 'present' });
     expect(createRepo).not.toHaveBeenCalled();
+    expect(unarchiveRepo).not.toHaveBeenCalled();
   });
 
-  it('existence unconfirmable ("unknown") -> failed, refuses to guess, createRepo never called', async () => {
+  it('existence unconfirmable ("unknown") -> status "unknown", refuses to guess, createRepo never called', async () => {
     const createRepo = vi.fn();
-    const deps: AgentRepoDeps = { checkExists: async () => 'unknown', createRepo };
+    const deps: AgentRepoDeps = { checkMeta: async () => ({ presence: 'unknown' }), createRepo, unarchiveRepo: vi.fn() };
     const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
-    expect(outcome.status).toBe('failed');
-    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/could not confirm/);
+    expect(outcome.status).toBe('unknown');
+    if (outcome.status === 'unknown') expect(outcome.reason).toMatch(/could not confirm/);
     expect(createRepo).not.toHaveBeenCalled();
+  });
+
+  it('present but the archived bit itself is unreadable -> status "unknown" (Amendment A: never falls through to "present")', async () => {
+    const createRepo = vi.fn();
+    const unarchiveRepo = vi.fn();
+    // `archived: undefined` while `presence: 'present'` — the read succeeded
+    // (existence confirmed) but the response didn't carry a boolean
+    // `archived` field. Requirement 4 (macf#1034): unreadable -> 'unknown',
+    // never silently folded into 'present'.
+    const deps: AgentRepoDeps = { checkMeta: async () => ({ presence: 'present' }), createRepo, unarchiveRepo };
+    const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
+    expect(outcome.status).toBe('unknown');
+    if (outcome.status === 'unknown') expect(outcome.reason).toMatch(/archived state could not be confirmed/);
+    expect(createRepo).not.toHaveBeenCalled();
+    expect(unarchiveRepo).not.toHaveBeenCalled();
   });
 
   it('createRepo throwing -> status failed, carries the underlying reason', async () => {
     const deps: AgentRepoDeps = {
-      checkExists: async () => 'absent',
+      checkMeta: async () => ({ presence: 'absent' }),
       createRepo: async () => {
         throw new Error('name already exists on this account');
       },
+      unarchiveRepo: vi.fn(),
     };
     const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
     expect(outcome.status).toBe('failed');
     if (outcome.status === 'failed') expect(outcome.reason).toMatch(/already exists/);
   });
 
-  it('NEVER throws, even when checkExists itself throws', async () => {
+  it('NEVER throws, even when checkMeta itself throws', async () => {
     const createRepo = vi.fn();
     const deps: AgentRepoDeps = {
-      checkExists: async () => {
+      checkMeta: async () => {
         throw new Error('network down');
       },
       createRepo,
+      unarchiveRepo: vi.fn(),
     };
     const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
     expect(outcome.status).toBe('failed');
     if (outcome.status === 'failed') expect(outcome.reason).toMatch(/network down/);
     expect(createRepo).not.toHaveBeenCalled();
+  });
+
+  // --- Revival (DR-043 Amendment G correction, groundnuty/macf#1034) ---
+
+  it('archived + confirmUnarchive true -> unarchiveRepo called, status "revived", createRepo never called', async () => {
+    const createRepo = vi.fn();
+    const unarchiveRepo = vi.fn(async () => {});
+    const deps: AgentRepoDeps = { checkMeta: async () => ({ presence: 'present', archived: true }), createRepo, unarchiveRepo };
+    const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps, { confirmUnarchive: true });
+    expect(outcome).toEqual({ repo: 'groundnuty/demo-code', role: 'code-agent', status: 'revived' });
+    expect(unarchiveRepo).toHaveBeenCalledWith('groundnuty/demo-code');
+    expect(unarchiveRepo).toHaveBeenCalledTimes(1);
+    expect(createRepo).not.toHaveBeenCalled();
+  });
+
+  it('archived + confirmUnarchive NOT true (absent opts) -> status "archived", unarchiveRepo NEVER called — never silent', async () => {
+    const unarchiveRepo = vi.fn();
+    const deps: AgentRepoDeps = { checkMeta: async () => ({ presence: 'present', archived: true }), createRepo: vi.fn(), unarchiveRepo };
+    const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps);
+    expect(outcome.status).toBe('archived');
+    if (outcome.status === 'archived') expect(outcome.reason).toMatch(/ARCHIVED/);
+    expect(unarchiveRepo).not.toHaveBeenCalled();
+  });
+
+  it('archived + confirmUnarchive explicitly false -> status "archived", unarchiveRepo NEVER called', async () => {
+    const unarchiveRepo = vi.fn();
+    const deps: AgentRepoDeps = { checkMeta: async () => ({ presence: 'present', archived: true }), createRepo: vi.fn(), unarchiveRepo };
+    const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps, { confirmUnarchive: false });
+    expect(outcome.status).toBe('archived');
+    expect(unarchiveRepo).not.toHaveBeenCalled();
+  });
+
+  it('unarchiveRepo throwing -> status failed, carries the underlying reason', async () => {
+    const deps: AgentRepoDeps = {
+      checkMeta: async () => ({ presence: 'present', archived: true }),
+      createRepo: vi.fn(),
+      unarchiveRepo: async () => {
+        throw new Error('403: insufficient permission');
+      },
+    };
+    const outcome = await ensureAgentRepo(AGENT, MANIFEST, deps, { confirmUnarchive: true });
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/insufficient permission/);
   });
 });
