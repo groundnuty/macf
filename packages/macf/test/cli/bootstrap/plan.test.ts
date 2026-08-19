@@ -11,6 +11,7 @@ import {
   computePlan,
   fleetPlanToJson,
   formatPlanText,
+  formatRegistryScopeLines,
   formatSkippedLines,
   formatUnimplementedLines,
   planItemApplyCoverage,
@@ -22,6 +23,7 @@ import {
   type PlanVerb,
 } from '../../../src/cli/bootstrap/plan.js';
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../../src/cli/bootstrap/apply-routing.js';
+import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../../src/cli/bootstrap/registry-scope-preflight.js';
 
 /** A minimal, valid, 2-agent manifest — no optional sections. */
 function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
@@ -1242,5 +1244,79 @@ describe('computePlan — runner_ops item (groundnuty/macf#943)', () => {
     expect(item).toBeDefined();
     if (item) expect(planItemApplyCoverage(item)).toBe('implemented');
     expect(plan.unimplementedByApply.some((i) => i.kind === 'runner_ops')).toBe(false);
+  });
+});
+
+// groundnuty/macf#999 — `registry: { type: org }` is unsatisfiable with
+// this tool's current provisioning (see `registry-scope-preflight.ts`'s
+// doc). `plan` never refuses for it (read-only end to end); it states the
+// fact as a loud banner instead (requirement 3). `type: profile` — every
+// OTHER describe block in this file — must stay completely unaffected.
+describe('computePlan — registryScopeIssues (macf#999 requirement 3: "plan states it")', () => {
+  it('is empty for the type: profile default (baseManifest) — the load-bearing profile-fleet-unaffected case', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.registryScopeIssues).toEqual([]);
+  });
+
+  it('formatRegistryScopeLines([]) renders nothing', () => {
+    expect(formatRegistryScopeLines([])).toEqual([]);
+  });
+
+  it('formatPlanText for a profile fleet carries NO registry banner text at all', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(formatPlanText(plan)).not.toContain('registry: UNSATISFIABLE');
+  });
+
+  it('fleetPlanToJson for a profile fleet OMITS the registry_scope_issues key entirely (not merely an empty array) — the mechanism that keeps --json byte-identical to pre-#999 output', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const json = fleetPlanToJson(plan) as Record<string, unknown>;
+    expect('registry_scope_issues' in json).toBe(false);
+    // Every other key is exactly what pre-#999 `fleetPlanToJson` produced —
+    // pinned individually rather than via one giant frozen full-object
+    // literal, so an unrelated future change to plan-item reason text
+    // doesn't turn this into a brittle snapshot test.
+    expect(Object.keys(json).sort()).toEqual(
+      ['fleet', 'plan', 'schema_version', 'skipped_sections', 'summary', 'unimplemented_by_apply'].sort(),
+    );
+  });
+
+  it('surfaces exactly one conflict for registry: { type: org }, naming profile scope as the working alternative and leaving the resolution open', () => {
+    const manifest = baseManifest({
+      owner: { account: 'demo-org', type: 'org', registry: { type: 'org', org: 'demo-org' } },
+    });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(plan.registryScopeIssues).toHaveLength(1);
+    expect(plan.registryScopeIssues[0]?.code).toBe(REGISTRY_SCOPE_UNSATISFIABLE_CODE);
+    const message = plan.registryScopeIssues[0]?.message ?? '';
+    expect(message).toContain('registry: { type: org, org: "demo-org" }');
+    expect(message).toContain('type: profile');
+    expect(message).toContain('groundnuty/macf#999');
+    // Deliberately does NOT decide #999 requirement 2 — no assertion that
+    // any specific resolution ("unsupported" / "repo-scoped" / a wider
+    // permission set) is the chosen fix; only that ONE exists and is named
+    // as open.
+  });
+
+  it('formatRegistryScopeLines states plainly that apply WILL refuse — an exit-0 plan render must not read as "this will provision fine"', () => {
+    const manifest = baseManifest({
+      owner: { account: 'demo-org', type: 'org', registry: { type: 'org', org: 'demo-org' } },
+    });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const lines = formatRegistryScopeLines(plan.registryScopeIssues);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/registry: UNSATISFIABLE/);
+    expect(lines[0]).toMatch(/`macf bootstrap apply` will refuse before any consent gate/);
+  });
+
+  it('formatPlanText for an org fleet carries the banner; fleetPlanToJson carries the registry_scope_issues key', () => {
+    const manifest = baseManifest({
+      owner: { account: 'demo-org', type: 'org', registry: { type: 'org', org: 'demo-org' } },
+    });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(formatPlanText(plan)).toContain('registry: UNSATISFIABLE');
+    const json = fleetPlanToJson(plan) as Record<string, unknown>;
+    expect('registry_scope_issues' in json).toBe(true);
+    expect(Array.isArray(json.registry_scope_issues)).toBe(true);
+    expect((json.registry_scope_issues as unknown[]).length).toBe(1);
   });
 });

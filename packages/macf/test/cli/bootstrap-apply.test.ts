@@ -45,6 +45,7 @@ import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../src/cli/bootstrap
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle } from '../../src/cli/bootstrap/apply-runner-ops.js';
 import { VaultError, buildVaultPlaintext, type VaultAgentSecrets, type VaultRunnerOpsSecrets } from '../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext } from '../../src/cli/bootstrap/vault-read.js';
+import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../src/cli/bootstrap/registry-scope-preflight.js';
 
 const FLEET_YAML = `apiVersion: macf/v0
 kind: Fleet
@@ -71,6 +72,18 @@ agents:
     repo: groundnuty/demo-science
     deploy_path: /home/ubuntu/repos/demo-science
 `;
+
+/**
+ * groundnuty/macf#999 — same fixture as {@link FLEET_YAML}, `owner.type` +
+ * `owner.registry` swapped to the org shape. Used ONLY by the registry-scope
+ * pre-flight describe block below; every other test in this file keeps
+ * using the `type: profile` {@link FLEET_YAML} default, which is the point
+ * (#999 requirement: profile-scope fleets stay completely unaffected).
+ */
+const FLEET_YAML_WITH_ORG_REGISTRY = FLEET_YAML.replace('type: user', 'type: org').replace(
+  'registry: { type: profile, user: groundnuty }',
+  'registry: { type: org, org: demo-org }',
+);
 
 /** Observed state where NOTHING exists — every agent is an App create-candidate. */
 const EMPTY_OBSERVED: ObservedState = {
@@ -1104,6 +1117,113 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // plan.test.ts's dedicated coverage for this note's unconditional
       // presence; this test only pins that --dry-run does not ALSO refuse.
       expect(out).toContain(RUNNER_TOKEN_FLAG);
+    });
+  });
+
+  // --- macf#999 — `registry: { type: org }` is unsatisfiable with this
+  // tool's current provisioning (no organization-scoped permission anywhere
+  // in the manifest-building path); refuses BEFORE consent gate 1, same
+  // shape as macf#932 immediately above. The decisive case: zero gate
+  // invocations, not merely a non-zero exit code.
+
+  describe('macf#999 — registry-scope pre-flight refusal before consent gate 1', () => {
+    it('registry: { type: org } -> refuses BEFORE consent gate 1: observe/confirmPlan/buildAgentDeps/openUrl/startManifestFlow/confirmAppInstallation are ALL zero calls', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_ORG_REGISTRY);
+      let observeCalls = 0;
+      let confirmPlanCalls = 0;
+      let buildAgentDepsCalls = 0;
+      let openUrlCalls = 0;
+      let startManifestFlowCalls = 0;
+      let confirmAppInstallationCalls = 0;
+
+      const code = await runBootstrapApply(
+        { file, yes: true },
+        {
+          observe: () => {
+            observeCalls += 1;
+            return Promise.resolve(EMPTY_OBSERVED);
+          },
+        },
+        fakeMutateDeps(file, {
+          confirmPlan: async () => {
+            confirmPlanCalls += 1;
+            return true;
+          },
+          buildAgentDeps: () => {
+            buildAgentDepsCalls += 1;
+            return fakeAgentDeps({
+              openUrl: async () => {
+                openUrlCalls += 1;
+              },
+              startManifestFlow: async () => {
+                startManifestFlowCalls += 1;
+                throw new Error('must not be called — the pre-flight must refuse before this seam is ever reached');
+              },
+              confirmAppInstallation: async () => {
+                confirmAppInstallationCalls += 1;
+                return { status: 'unconfirmable' };
+              },
+            });
+          },
+        }),
+      );
+
+      expect(code).toBe(1);
+      // Same discipline as the macf#932 test above: "never even asked the
+      // operator to approve, never even read GitHub state, never opened a
+      // browser." Each seam firing would mean the refusal arrived too late
+      // — and would mean a later refactor moved this check after `observe`
+      // without a test catching it.
+      expect(observeCalls).toBe(0);
+      expect(confirmPlanCalls).toBe(0);
+      expect(buildAgentDepsCalls).toBe(0);
+      expect(openUrlCalls).toBe(0);
+      expect(startManifestFlowCalls).toBe(0);
+      expect(confirmAppInstallationCalls).toBe(0);
+
+      expect(errs.join('\n')).toContain('registry: { type: org, org: "demo-org" }');
+      // Names the supported alternative plainly (task requirement 2) —
+      // without asserting a resolution (#999 requirement 2 stays open).
+      expect(errs.join('\n')).toContain('type: profile');
+      expect(errs.join('\n')).toContain('groundnuty/macf#999');
+      // Nothing mutated.
+      const dir = join(file, '..');
+      expect(existsSync(join(dir, 'fleet.lock'))).toBe(false);
+      expect(existsSync(join(dir, 'secrets', 'vault.age'))).toBe(false);
+    });
+
+    it('the refusal is visible under --json too, never empty stdout (macf#830 lesson), and carries the registry_scope_unsatisfiable code', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_ORG_REGISTRY);
+      const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+      expect(code).toBe(1);
+      expect(logs.length).toBeGreaterThan(0);
+      const parsed = JSON.parse(logs.join('\n')) as { error: { code: string; message: string } };
+      expect(parsed.error.code).toBe(REGISTRY_SCOPE_UNSATISFIABLE_CODE);
+      expect(parsed.error.message).toContain('type: profile');
+    });
+
+    it('--dry-run is ALSO refused (unlike macf#932s runner-token check) — mirrors checkAppNameLengths, not checkRunnerTokenPreflight: a dry-run render for an unsatisfiable registry would itself be misleading', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_ORG_REGISTRY);
+      let observeCalls = 0;
+      const code = await runBootstrapApply(
+        { file, dryRun: true },
+        {
+          observe: () => {
+            observeCalls += 1;
+            return Promise.resolve(EMPTY_OBSERVED);
+          },
+        },
+      );
+      expect(code).toBe(1);
+      expect(observeCalls).toBe(0);
+      expect(errs.join('\n')).toContain('type: profile');
+    });
+
+    it('registry: { type: profile } (the FLEET_YAML default) is completely unaffected — proceeds exactly as every other test in this file', async () => {
+      const file = writeManifest(); // FLEET_YAML default — type: profile
+      const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(REGISTRY_SCOPE_UNSATISFIABLE_CODE);
     });
   });
 
