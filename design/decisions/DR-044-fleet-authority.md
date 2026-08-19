@@ -1,6 +1,6 @@
 # DR-044: Fleet authority — who may ask a fleet-wide question
 
-**Status:** **Proposed** (science-authored 2026-08-19, operator-directed via `macf#1027`; awaiting operator ratification)
+**Status:** **Accepted** (operator-ratified 2026-08-19 with the failure policy in Decision 6; science-authored same day, operator-directed via `macf#1027`)
 **Date:** 2026-08-19
 **Trigger:** `macf#1026` — `macf bootstrap status`, a fleet command, was run with **science-agent's** installation token and rendered every resource that agent cannot see as `absent`, including a repo that exists and holds the CA variable. The tool had no notion that it had been handed the wrong identity for the question.
 
@@ -93,6 +93,28 @@ The delta is small: fleet operations need approximately the agent set plus `admi
 Under Decision 3 this arrives **without contradicting anything**: a wide fleet App either holds the required power or does not, and the check asks exactly that. No clause needs amending — which is the test a rule should pass before ratification.
 
 **The cost, recorded so the decision is made knowingly, not to block it:** such an App needs enough permission to do what the operator does by hand — repo creation, deletion, org reads. Its private key would **leave the vault**, and under the key-class rule **export is a one-way gate**: the ceiling never lowers afterwards. Agent Apps are deliberately minimal *because* their keys are exported; a wide fleet App is the opposite trade at the highest ceiling in the system. Not wrong — **not walk-back-able**.
+
+## Decision 6 — the failure policy attached at ratification
+
+**Operator, ratifying this DR:**
+
+> *"I accept DR-044 — with the policy that we already employ, that **things should fail loudly and eagerly** to produce the **cleanest, simplest reasons** for the operator or other agent to act on. And things should **fail as fast as possible** as well."*
+
+Three properties. Two are already this DR's shape; the third is a constraint it did not previously state.
+
+1. **Fail loudly** — refuse, do not degrade (Decision 2). A partial view rendered as fact is the `#1026` defect.
+2. **Fail fast** — the capability check runs **before** the operation, never on the resulting error. This is why `#932` and `#1010` refuse *before* a consent gate rather than after: past a gate, the operator's clicks are already spent, and a refusal there costs work it cannot give back.
+3. **Produce the cleanest, simplest reason to act on** — a constraint on the **message**, not on the refusal. **A refusal that is correct and unreadable has failed this policy.**
+
+### Loud is not the same as voluminous
+
+Property 3 has a failure mode that looks like compliance. Established immediately, on this DR's own safety-net PR: `#1029`'s 404→`unknown` mapping is correct, and its *rendering* repeated the full explanatory reason in three separate cells — ~1400-character columns that pushed an entire agent's row off-screen (`#1030`).
+
+**Three copies of a paragraph is QUIETER than one marker plus one footnote**, because it destroys the surrounding signal. Volume is not loudness; a message that displaces the context a reader needs has reduced what they can act on, however true each copy is.
+
+**The standard: one reason, once, in the place a reader will look.** A short marker at each affected point, the full explanation once — the `runnerDetail` line of that same command is the working model.
+
+---
 
 ## Consequences
 
