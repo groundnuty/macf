@@ -15,8 +15,12 @@ vi.mock('../../src/cli/plugin-fetcher.js', () => ({
   workspacePluginDir: (dir: string) => join(dir, '.macf', 'plugin'),
   // DR-022 Amendment P / groundnuty/macf#995 successor to the retired
   // pinChannelServerVersion — strips mcpServers from the (mocked, never
-  // really fetched) local plugin.json copy.
-  stripPluginMcpServers: vi.fn(() => false),
+  // really fetched) local plugin.json copy. Default mock return matches
+  // the post-#1005 result-object shape (StripPluginMcpServersResult) —
+  // 'noop' is the common case (nothing to strip in a mocked, never-really-
+  // written manifest). Individual tests override with mockReturnValueOnce
+  // where the 'stripped' / 'refused' branches matter.
+  stripPluginMcpServers: vi.fn(() => ({ status: 'noop' as const, path: '/mock/plugin.json' })),
   // Stub the #676 dist-link delivery — it resolves the running CLI's own dist
   // via import.meta.url, which isn't built in the test runner; a no-op keeps
   // the update flow under test without touching the filesystem.
@@ -503,6 +507,107 @@ describe('update command', () => {
     await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
 
     expect(fetchPluginToWorkspace).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------
+  // groundnuty/macf#1005: the #995 retrofit only stripped mcpServers
+  // adjacent to a fetch, so a workspace already at the pinned plugin
+  // version — the common steady state, no fetch this run — never
+  // converged. The strip must run unconditionally on every invocation.
+  // ---------------------------------------------------------------------
+  describe('unconditional mcpServers strip (macf#1005)', () => {
+    beforeEach(() => {
+      vi.mocked(fetchPluginToWorkspace).mockClear();
+      vi.mocked(stripPluginMcpServers).mockClear();
+    });
+
+    // THE DECISIVE TEST: same no-fetch setup as "does not re-fetch plugin
+    // when .macf/plugin/ is populated and no bump happens" above — the
+    // exact steady-state case #1002's fetch-coupled strip missed.
+    it('strips mcpServers even when the plugin is already at the pinned version (no fetch this run)', async () => {
+      writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
+      writeFileSync(join(dir, '.macf', 'plugin', 'manifest.txt'), 'v0.1.0\n');
+      mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+
+      const stripPath = join(dir, '.macf', 'plugin', '.claude-plugin', 'plugin.json');
+      vi.mocked(stripPluginMcpServers).mockReturnValueOnce({ status: 'stripped', path: stripPath });
+
+      const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+      expect(code).toBe(0);
+
+      // Confirms this really is the no-fetch path (same assertion as the
+      // sibling test above).
+      expect(fetchPluginToWorkspace).not.toHaveBeenCalled();
+      // But the strip STILL ran, targeting the resolved (mounted) plugin dir.
+      expect(stripPluginMcpServers).toHaveBeenCalledWith(
+        dir, { targetDir: join(dir, '.macf', 'plugin') },
+      );
+      // Reported — an operator sees the old mount being removed, not left
+      // to infer it.
+      expect(logSpy.mock.calls.flat().join('\n')).toMatch(/Stripped mcpServers/);
+    });
+
+    it('is silent (no report line) when there is nothing to strip', async () => {
+      writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
+      writeFileSync(join(dir, '.macf', 'plugin', 'manifest.txt'), 'v0.1.0\n');
+      mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      // Default mock return is 'noop' — already-stripped / nothing to do.
+
+      const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+      expect(code).toBe(0);
+
+      expect(stripPluginMcpServers).toHaveBeenCalled();
+      expect(logSpy.mock.calls.flat().join('\n')).not.toMatch(/Stripped mcpServers/);
+    });
+
+    it('refuses loudly (warns) without crashing update when the manifest is malformed', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+        mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
+        writeFileSync(join(dir, '.macf', 'plugin', 'manifest.txt'), 'v0.1.0\n');
+        mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+        const stripPath = join(dir, '.macf', 'plugin', '.claude-plugin', 'plugin.json');
+        vi.mocked(stripPluginMcpServers).mockReturnValueOnce({
+          status: 'refused',
+          reason: `${stripPath} is not valid JSON: Unexpected token. Fix by hand, then re-run.`,
+          path: stripPath,
+        });
+
+        const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+        // Loud warn, non-blocking — matches the plugin-fetch-failure /
+        // .mcp.json-write-failure posture elsewhere in this file.
+        expect(code).toBe(0);
+
+        const warnOut = warnSpy.mock.calls.flat().join('\n');
+        expect(warnOut).toMatch(/mcpServers not stripped/);
+        expect(warnOut).toMatch(/not valid JSON/);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('strips again after a repair-fetch — the repair path and the unconditional call do not double-report', async () => {
+      // Repair case: dir exists but empty, so pluginDirNeedsRepair is true
+      // and fetchPluginToWorkspace DOES run this time.
+      writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
+      mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      const stripPath = join(dir, '.macf', 'plugin', '.claude-plugin', 'plugin.json');
+      vi.mocked(stripPluginMcpServers).mockReturnValueOnce({ status: 'stripped', path: stripPath });
+
+      const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+      expect(code).toBe(0);
+
+      expect(fetchPluginToWorkspace).toHaveBeenCalledTimes(1);
+      // The strip is called exactly once for this run (the single
+      // unconditional call site right after the repair-fetch block, not a
+      // second call baked into the fetch branch itself).
+      expect(stripPluginMcpServers).toHaveBeenCalledTimes(1);
+      expect(logSpy.mock.calls.flat().join('\n')).toMatch(/Stripped mcpServers/);
+    });
   });
 
   // ---------------------------------------------------------------------

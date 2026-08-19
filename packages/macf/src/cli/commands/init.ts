@@ -600,8 +600,17 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     // Leaving mcpServers here would let Claude Code spawn a SECOND
     // channel-server child from the plugin mount, under a tool namespace
     // nothing pre-approves. MUST run after the fetch (a re-clone would
-    // otherwise reintroduce the block).
-    stripPluginMcpServers(absDir);
+    // otherwise reintroduce the block). `init` always fetches, so this is
+    // unconditionally reached here — unlike `macf update`'s equivalent
+    // convergence call (macf#1005), there's no no-fetch path to worry about.
+    const stripResult = stripPluginMcpServers(absDir);
+    if (stripResult.status === 'refused') {
+      // Loud-refuse rather than silently leaving mcpServers in place
+      // (silent-fallback-hazards.md) — defensive surface only: a manifest
+      // we JUST fetched should always be valid JSON, but a parse failure
+      // here must never look like a quiet no-op (macf#1005).
+      console.warn(`  Warning: mcpServers not stripped: ${stripResult.reason}`);
+    }
     // Deliver the built plugin-CLI by linking .macf/plugin/dist → the running
     // CLI's own dist/ (groundnuty/macf#676). The marketplace plugin ships no
     // dist/, so without this the /macf-* skills fail MODULE_NOT_FOUND. MUST run
@@ -609,7 +618,8 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     const linkedDist = linkPluginCliDist(absDir);
     console.log(
       `  Plugin: fetched macf-agent@v${versions.plugin} to .macf/plugin/ ` +
-      `(mcpServers stripped${linkedDist ? '; plugin-CLI dist linked' : ''})`,
+      `(mcpServers ${stripResult.status === 'stripped' ? 'stripped' : 'already absent'}` +
+      `${linkedDist ? '; plugin-CLI dist linked' : ''})`,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

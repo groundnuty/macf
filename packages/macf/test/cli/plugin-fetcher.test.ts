@@ -198,27 +198,72 @@ describe('stripPluginMcpServers (DR-022 Amendment P, groundnuty/macf#995)', () =
       version: '0.2.60',
       mcpServers: { 'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server'] } },
     });
-    expect(stripPluginMcpServers(ws)).toBe(true);
+    expect(stripPluginMcpServers(ws)).toEqual({ status: 'stripped', path });
     const result = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
     expect(result['mcpServers']).toBeUndefined();
     expect(result['name']).toBe('macf-agent');
     expect(result['version']).toBe('0.2.60');
   });
 
-  it('is idempotent (no-ops, returns false) once mcpServers is already absent', () => {
-    writeManifest({ name: 'macf-agent', version: '0.2.60' });
-    expect(stripPluginMcpServers(ws)).toBe(false);
+  it('is idempotent (no-ops) once mcpServers is already absent — re-running does not error or rewrite', () => {
+    const path = writeManifest({ name: 'macf-agent', version: '0.2.60' });
+    const before = readFileSync(path, 'utf-8');
+    expect(stripPluginMcpServers(ws)).toEqual({ status: 'noop', path });
+    // Second call (simulating a repeat `macf update` run) — still a no-op,
+    // still no error, file byte-identical to before either call (#1005 hard
+    // constraint: "running twice must not error or rewrite an already-
+    // stripped manifest").
+    expect(stripPluginMcpServers(ws)).toEqual({ status: 'noop', path });
+    expect(readFileSync(path, 'utf-8')).toBe(before);
   });
 
-  it('no-ops (returns false) when the plugin.json is absent', () => {
-    expect(stripPluginMcpServers(ws)).toBe(false);
+  it('is idempotent across a real strip + re-run: second call no-ops without rewriting', () => {
+    const path = writeManifest({
+      name: 'macf-agent',
+      mcpServers: { 'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server'] } },
+    });
+    expect(stripPluginMcpServers(ws)).toEqual({ status: 'stripped', path });
+    const afterStrip = readFileSync(path, 'utf-8');
+    expect(stripPluginMcpServers(ws)).toEqual({ status: 'noop', path });
+    expect(readFileSync(path, 'utf-8')).toBe(afterStrip);
   });
 
-  it('no-ops (returns false) on malformed JSON, without throwing', () => {
+  it('no-ops when the plugin.json is absent — no crash', () => {
+    const path = join(workspacePluginDir(ws), '.claude-plugin', 'plugin.json');
+    expect(stripPluginMcpServers(ws)).toEqual({ status: 'noop', path });
+  });
+
+  it('no-ops when the mounted plugin dir itself is absent — no crash', () => {
+    // Nothing created under `ws` at all (not even .macf/plugin/).
+    expect(() => stripPluginMcpServers(ws)).not.toThrow();
+    expect(stripPluginMcpServers(ws).status).toBe('noop');
+  });
+
+  it('refuses loudly + writes nothing on malformed JSON (does not throw; is not a silent skip) (#1005)', () => {
     const dir = join(workspacePluginDir(ws), '.claude-plugin');
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'plugin.json'), '{ not valid json');
-    expect(stripPluginMcpServers(ws)).toBe(false);
+    const path = join(dir, 'plugin.json');
+    writeFileSync(path, '{ not valid json');
+    const before = readFileSync(path, 'utf-8');
+
+    let result: ReturnType<typeof stripPluginMcpServers>;
+    expect(() => { result = stripPluginMcpServers(ws); }).not.toThrow();
+    expect(result!.status).toBe('refused');
+    expect((result! as { reason: string }).reason).toMatch(/not valid JSON/);
+    // Refuses to write — content on disk is byte-identical to before.
+    expect(readFileSync(path, 'utf-8')).toBe(before);
+  });
+
+  it('refuses loudly when the manifest top-level is a JSON array, not an object', () => {
+    const dir = join(workspacePluginDir(ws), '.claude-plugin');
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, 'plugin.json');
+    writeFileSync(path, JSON.stringify(['not', 'an', 'object']));
+
+    const result = stripPluginMcpServers(ws);
+    expect(result.status).toBe('refused');
+    expect(existsSync(path)).toBe(true);
+    expect(readFileSync(path, 'utf-8')).toBe(JSON.stringify(['not', 'an', 'object']));
   });
 
   // macf#889: `macf update` must write to the dir claude.sh ACTUALLY mounts,
@@ -233,10 +278,23 @@ describe('stripPluginMcpServers (DR-022 Amendment P, groundnuty/macf#995)', () =
       JSON.stringify({ name: 'macf-agent', mcpServers: { 'macf-agent': { command: 'npx', args: ['-y', '@groundnuty/macf-channel-server'] } } }, null, 2),
     );
 
-    expect(stripPluginMcpServers(ws, { targetDir: altDir })).toBe(true);
+    expect(stripPluginMcpServers(ws, { targetDir: altDir })).toEqual({ status: 'stripped', path });
     expect((JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>)['mcpServers']).toBeUndefined();
     // The conventional default was never written (doesn't even exist).
     expect(existsSync(join(workspacePluginDir(ws), '.claude-plugin', 'plugin.json'))).toBe(false);
+  });
+
+  it('preserves formatting convention: 2-space indent + trailing newline (matches other keys unchanged)', () => {
+    const path = writeManifest({
+      name: 'macf-agent',
+      nested: { keep: ['a', 'b'] },
+      mcpServers: { 'macf-agent': { command: 'npx' } },
+    });
+    stripPluginMcpServers(ws);
+    const raw = readFileSync(path, 'utf-8');
+    expect(raw.endsWith('\n')).toBe(true);
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    expect(parsed['nested']).toEqual({ keep: ['a', 'b'] });
   });
 });
 

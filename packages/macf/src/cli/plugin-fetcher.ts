@@ -68,6 +68,23 @@ export interface StripPluginMcpServersOptions {
 }
 
 /**
+ * Outcome of `stripPluginMcpServers` (groundnuty/macf#1005).
+ *
+ * `noop` covers every "nothing to do, nothing wrong" case uniformly — dir
+ * absent, manifest absent, `mcpServers` already gone (idempotent re-run).
+ * `refused` is the loud-refuse case (malformed JSON / unreadable / non-object
+ * top-level) — mirrors `McpJsonWriteResult`'s `'refused'` variant in
+ * `mcp-json.ts` (same "refuse loudly rather than silently skip content this
+ * tool didn't write" contract; silent-fallback-hazards.md is this repo's
+ * most-catalogued defect class, so a parse failure must never look like a
+ * quiet no-op).
+ */
+export type StripPluginMcpServersResult =
+  | { readonly status: 'stripped'; readonly path: string }
+  | { readonly status: 'noop'; readonly path: string }
+  | { readonly status: 'refused'; readonly reason: string; readonly path: string };
+
+/**
  * Delete the `mcpServers` key from a workspace's FETCHED (local) copy of
  * `.claude-plugin/plugin.json` (DR-022 Amendment P, groundnuty/macf#995).
  *
@@ -94,30 +111,65 @@ export interface StripPluginMcpServersOptions {
  * a safe no-op once the upstream manifest drops the block itself (`servers`
  * absent → this function no-ops cleanly).
  *
- * Idempotent: no-ops (`false`) when the manifest is absent/malformed or
- * already has no `mcpServers` key. Call this AFTER `fetchPluginToWorkspace`
- * (a re-fetch overwrites the manifest, undoing the strip) — same call-order
- * contract the retired `pinChannelServerVersion` had.
+ * **Caller contract (groundnuty/macf#1005):** call this UNCONDITIONALLY on
+ * every `macf init`/`update` invocation, not only right after a fetch. The
+ * original #995 wiring called this only adjacent to `fetchPluginToWorkspace`
+ * — correct for "a fetch always reintroduces the key" but blind to the far
+ * more common steady state where the plugin is ALREADY at its pinned
+ * version and no fetch happens at all; that workspace never converged. This
+ * function is a cheap, idempotent, local read-modify-write — safe to call
+ * on every invocation regardless of whether a fetch just ran.
+ *
+ * Idempotent: `status: 'noop'` when the manifest is absent (dir missing,
+ * manifest missing) or already has no `mcpServers` key — re-running against
+ * an already-stripped manifest is a silent no-op, never an error. Malformed
+ * JSON (or a non-object top-level, or an unreadable file) is `status:
+ * 'refused'` with a `reason` — written NOTHING, per the caller contract
+ * above. Still call this AFTER `fetchPluginToWorkspace` when a fetch does
+ * happen in the same invocation (a re-fetch overwrites the manifest, undoing
+ * a prior strip) — same call-order contract the retired
+ * `pinChannelServerVersion` had — but never ONLY there.
  */
 export function stripPluginMcpServers(
   workspaceDir: string,
   options: StripPluginMcpServersOptions = {},
-): boolean {
+): StripPluginMcpServersResult {
   const pluginDir = options.targetDir ?? workspacePluginDir(workspaceDir);
   const manifestPath = join(pluginDir, '.claude-plugin', 'plugin.json');
-  if (!existsSync(manifestPath)) return false;
+  if (!existsSync(manifestPath)) return { status: 'noop', path: manifestPath };
 
-  let manifest: McpServersManifest;
+  let raw: string;
   try {
-    manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as McpServersManifest;
-  } catch {
-    return false;
+    raw = readFileSync(manifestPath, 'utf-8');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { status: 'refused', reason: `cannot read ${manifestPath}: ${msg}`, path: manifestPath };
   }
 
-  if (manifest.mcpServers === undefined) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      status: 'refused',
+      reason: `${manifestPath} is not valid JSON: ${msg}. Fix by hand, then re-run.`,
+      path: manifestPath,
+    };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {
+      status: 'refused',
+      reason: `${manifestPath} top-level content is not a JSON object — refusing to modify content this tool didn't write.`,
+      path: manifestPath,
+    };
+  }
+
+  const manifest = parsed as McpServersManifest;
+  if (manifest.mcpServers === undefined) return { status: 'noop', path: manifestPath };
   const { mcpServers: _mcpServers, ...rest } = manifest;
   writeFileSync(manifestPath, JSON.stringify(rest, null, 2) + '\n');
-  return true;
+  return { status: 'stripped', path: manifestPath };
 }
 
 /**
