@@ -41,6 +41,22 @@
  * `unknown` with a pointer to `macf fleet status`, never fabricated as
  * "online" or "offline." This is Amendment A's honest-`unknown` floor
  * applied at the plane boundary, not just the per-field boundary.
+ *
+ * **groundnuty/macf#1030 — loud is not voluminous (DR-044 Decision 6).**
+ * The #1026 fix above made `unknown` cells honest by inlining a diagnostic
+ * `reason` — correct in substance, but a `reason` shared by REPO/CA(repo)/
+ * ROUTING-CLIENT was repeated in full in all three cells, producing
+ * ~1400-char PROVISIONING columns that pushed every OTHER agent's row off a
+ * readable width. A status view nobody can read is not better than one that
+ * lies. The fix keeps the reason text verbatim but says it ONCE — a short
+ * `[N]` marker in the cell, the full text as a numbered footnote printed
+ * once below the table (`FootnoteRegistry`, dedup'd by string equality
+ * across cells AND across agents) — the same "detail on its own line, not
+ * inlined per occurrence" treatment `formatRoutingBlock`'s `runnerDetail`
+ * line already models. `--json` is untouched: it reads the raw
+ * `AgentStatusView`/`AgentRegistryObservation` fields directly, never the
+ * footnote-bearing table-cell strings, so structured consumers still get
+ * the reason per-field.
  */
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetManifest } from './fleet-manifest.js';
@@ -261,7 +277,8 @@ export function computeBootstrapStatus(
 const RUNTIME_UNOBSERVABLE_NOTE =
   'unknown — not observable from this plane (run `macf fleet status` from a deployed agent workspace for live health)';
 
-const PROVISIONING_HEADERS = [
+/** Exported for tests — column-width assertions (groundnuty/macf#1030) need the same header list `formatTable` renders against. */
+export const PROVISIONING_HEADERS = [
   'ROLE',
   'APP',
   'INSTALL',
@@ -280,21 +297,64 @@ function presenceCell(p: Presence, id: string | undefined): string {
 }
 
 /**
+ * Collects distinct "why is this unknown" reason strings into numbered
+ * footnotes so a table cell can carry a short marker (`unknown[1]`) instead
+ * of repeating the FULL explanation inline in every cell it applies to —
+ * groundnuty/macf#1030: the identical repo-visibility reason, printed
+ * verbatim in the REPO/CA(repo)/ROUTING-CLIENT cells of one row, produced
+ * ~1400-char columns and pushed every other agent's row off past a readable
+ * width. Dedup is by string EQUALITY, not by call site or row — two cells
+ * (same row, a different row, even a different agent) that cite the
+ * identical reason text share ONE footnote, per the operator's requirement
+ * that a shared cause gets one explanation, not one per cell it touches.
+ * Same "say once, not per cell" treatment as {@link formatRoutingBlock}'s
+ * `runnerDetail` line already gives its one long field — the model this
+ * class generalizes to every reason that can recur across cells.
+ */
+class FootnoteRegistry {
+  private readonly order: string[] = [];
+  private readonly indexOf = new Map<string, number>();
+
+  /** `undefined` (nothing to explain) → `''`, no marker. Otherwise registers (or reuses) the reason and returns `[N]`. */
+  ref(reason: string | undefined): string {
+    if (reason === undefined) return '';
+    const existing = this.indexOf.get(reason);
+    if (existing !== undefined) return `[${String(existing)}]`;
+    const index = this.order.length + 1;
+    this.indexOf.set(reason, index);
+    this.order.push(reason);
+    return `[${String(index)}]`;
+  }
+
+  /** `true` when no cell in this render section ever cited a reason — caller skips the footnote block entirely. */
+  isEmpty(): boolean {
+    return this.order.length === 0;
+  }
+
+  /** Ordered `{ index, reason }` pairs, 1-based, in first-cited order — the footnote list to print below the table. */
+  entries(): readonly { readonly index: number; readonly reason: string }[] {
+    return this.order.map((reason, i) => ({ index: i + 1, reason }));
+  }
+}
+
+/**
  * REPO / CA(repo) / ROUTING-CLIENT cell renderer — the same "say why"
  * treatment {@link formatVaultAgentCell}/{@link formatVaultCaCell} already
  * give an `unknown` vault read, applied to the groundnuty/macf#1026
  * repo-visibility downgrade: a bare `unknown` cell can't distinguish "never
  * observed" from "this token cannot see the repo," and the latter is
  * actionable (check the App's install scope) in a way the former isn't.
+ * The reason itself is a `footnotes` marker (groundnuty/macf#1030), not the
+ * inlined text — see {@link FootnoteRegistry}.
  */
-function repoScopedCell(p: Presence, reason: string | undefined): string {
-  if (p === 'unknown' && reason !== undefined) return `unknown (${reason})`;
+function repoScopedCell(p: Presence, reason: string | undefined, footnotes: FootnoteRegistry): string {
+  if (p === 'unknown' && reason !== undefined) return `unknown${footnotes.ref(reason)}`;
   return p;
 }
 
-function formatVaultAgentCell(vault: VaultAgentObservation | undefined): string {
+function formatVaultAgentCell(vault: VaultAgentObservation | undefined, footnotes: FootnoteRegistry): string {
   if (vault === undefined) return 'not read this run';
-  if (vault.status === 'unknown') return `unknown (${vault.reason})`;
+  if (vault.status === 'unknown') return `unknown${footnotes.ref(vault.reason)}`;
   const { present, total } = countVaultAgentPresence(vault.presence);
   return `${String(present)}/${String(total)} fields`;
 }
@@ -306,30 +366,43 @@ function formatVaultCaCell(vault: VaultCaObservation | undefined): string {
   return `${String(present)}/${String(total)} fields`;
 }
 
-/** Build one PROVISIONING row per agent (pure — exported for tests). */
-export function buildProvisioningRows(agents: readonly AgentStatusView[]): readonly (readonly string[])[] {
+/**
+ * Build one PROVISIONING row per agent (pure — exported for tests).
+ * `footnotes` defaults to a fresh, throwaway registry so ad-hoc callers
+ * (tests checking presence/shape, not footnote text) don't need to thread
+ * one through; `formatBootstrapStatusText` passes its own so it can print
+ * the accumulated footnote list right after the table (groundnuty/macf#1030).
+ */
+export function buildProvisioningRows(
+  agents: readonly AgentStatusView[],
+  footnotes: FootnoteRegistry = new FootnoteRegistry(),
+): readonly (readonly string[])[] {
   return agents.map((a) => [
     a.role,
     presenceCell(a.app, a.appId),
     presenceCell(a.install, a.installId),
-    repoScopedCell(a.repoPresence, a.repoVisibilityReason),
-    repoScopedCell(a.caRepo, a.repoVisibilityReason),
-    repoScopedCell(a.routingClientRepo, a.repoVisibilityReason),
+    repoScopedCell(a.repoPresence, a.repoVisibilityReason, footnotes),
+    repoScopedCell(a.caRepo, a.repoVisibilityReason, footnotes),
+    repoScopedCell(a.routingClientRepo, a.repoVisibilityReason, footnotes),
     a.fingerprintCount > 0 ? `${String(a.fingerprintCount)} fingerprint(s)` : 'none recorded',
     a.deployedVersion ?? 'unknown',
     a.actionsPin ?? 'unknown',
-    formatVaultAgentCell(a.vault),
+    formatVaultAgentCell(a.vault, footnotes),
   ]);
 }
 
-const RUNTIME_HEADERS = ['ROLE', 'REGISTRY', 'HOST:PORT', 'INSTANCE-ID', 'TYPE', 'STARTED', 'LAST-HEARTBEAT', 'LIVENESS'] as const;
+/** Exported for tests — see {@link PROVISIONING_HEADERS}'s doc. */
+export const RUNTIME_HEADERS = ['ROLE', 'REGISTRY', 'HOST:PORT', 'INSTANCE-ID', 'TYPE', 'STARTED', 'LAST-HEARTBEAT', 'LIVENESS'] as const;
 
-/** Build one RUNTIME row per agent (pure — exported for tests). */
-export function buildRuntimeRows(agents: readonly AgentStatusView[]): readonly (readonly string[])[] {
+/** Build one RUNTIME row per agent (pure — exported for tests). Same `footnotes` default-param convention as {@link buildProvisioningRows}. */
+export function buildRuntimeRows(
+  agents: readonly AgentStatusView[],
+  footnotes: FootnoteRegistry = new FootnoteRegistry(),
+): readonly (readonly string[])[] {
   return agents.map((a) => {
     const r = a.registry;
     if (r.status === 'unknown') {
-      return [a.role, `unknown (${r.reason})`, '—', '—', '—', '—', '—', RUNTIME_UNOBSERVABLE_NOTE];
+      return [a.role, `unknown${footnotes.ref(r.reason)}`, '—', '—', '—', '—', '—', RUNTIME_UNOBSERVABLE_NOTE];
     }
     if (r.presence === 'absent') {
       return [a.role, 'absent (never registered, or deregistered)', '—', '—', '—', '—', '—', RUNTIME_UNOBSERVABLE_NOTE];
@@ -346,6 +419,18 @@ export function buildRuntimeRows(agents: readonly AgentStatusView[]): readonly (
       RUNTIME_UNOBSERVABLE_NOTE,
     ];
   });
+}
+
+/**
+ * Render a footnote registry as trailing lines — `[]` when empty (no
+ * footnote section at all, matching {@link formatBootstrapStatusText}'s
+ * pre-#1030 output byte-for-byte on an all-known fleet), otherwise a
+ * leading blank line plus one `[N] <reason>` line per distinct cause, in
+ * first-cited order.
+ */
+function formatFootnotes(footnotes: FootnoteRegistry): readonly string[] {
+  if (footnotes.isEmpty()) return [];
+  return ['', ...footnotes.entries().map((e) => `[${String(e.index)}] ${e.reason}`)];
 }
 
 function formatVaultRecipientsLine(view: VaultRecipientsView): string {
@@ -377,8 +462,23 @@ function formatRoutingBlock(view: RoutingView): readonly string[] {
   return lines;
 }
 
-/** Full human-readable render (pure — exported for tests). */
+/**
+ * Full human-readable render (pure — exported for tests).
+ *
+ * PROVISIONING and RUNTIME each get their OWN {@link FootnoteRegistry}
+ * (groundnuty/macf#1030) — the two tables' `unknown` reasons come from
+ * unrelated causes (repo visibility / vault reads vs. registry reads), so
+ * numbering them independently and printing each table's footnotes
+ * immediately below it keeps a footnote physically near the cells it
+ * explains, the same placement `formatRoutingBlock`'s `runnerDetail` line
+ * already uses for its one long field.
+ */
 export function formatBootstrapStatusText(view: FleetStatusView): string {
+  const provisioningFootnotes = new FootnoteRegistry();
+  const provisioningRows = buildProvisioningRows(view.agents, provisioningFootnotes);
+  const runtimeFootnotes = new FootnoteRegistry();
+  const runtimeRows = buildRuntimeRows(view.agents, runtimeFootnotes);
+
   const parts: string[] = [
     `macf bootstrap status — ${view.fleet}`,
     '',
@@ -387,7 +487,8 @@ export function formatBootstrapStatusText(view: FleetStatusView): string {
     formatRunnerOpsLine(view.runnerOps),
     '',
     'PROVISIONING',
-    formatTable(PROVISIONING_HEADERS, buildProvisioningRows(view.agents)),
+    formatTable(PROVISIONING_HEADERS, provisioningRows),
+    ...formatFootnotes(provisioningFootnotes),
     '',
     `CA registry var "${view.ca.varName}": ${view.ca.registryPresence}  [vault CA: ${formatVaultCaCell(view.ca.vault)}]`,
     formatVaultRecipientsLine(view.vaultRecipients),
@@ -400,7 +501,8 @@ export function formatBootstrapStatusText(view: FleetStatusView): string {
   parts.push(
     '',
     'RUNTIME (registry-observed registration identity only — see header note; this plane cannot confirm liveness)',
-    formatTable(RUNTIME_HEADERS, buildRuntimeRows(view.agents)),
+    formatTable(RUNTIME_HEADERS, runtimeRows),
+    ...formatFootnotes(runtimeFootnotes),
   );
 
   if (view.extraLockAgents.length > 0) {

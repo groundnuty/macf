@@ -10,12 +10,37 @@ import type { ObservedState } from '../../../src/cli/bootstrap/plan.js';
 import type { AgentRegistryObservation } from '../../../src/cli/bootstrap/observer.js';
 import {
   BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION,
+  PROVISIONING_HEADERS,
+  RUNTIME_HEADERS,
   bootstrapStatusToJson,
   buildProvisioningRows,
   buildRuntimeRows,
   computeBootstrapStatus,
   formatBootstrapStatusText,
 } from '../../../src/cli/bootstrap/status.js';
+
+/**
+ * Mirrors `formatTable`'s own per-column width formula
+ * (`commands/ps.ts::formatTable`) — the widest of the header or any row's
+ * cell, per column, maxed across all columns. This is "the rendered
+ * table's maximum column width" groundnuty/macf#1030 requires a decisive
+ * assertion on: computed directly from the same row/header data
+ * `formatTable` renders from, not by re-parsing rendered text.
+ */
+function maxColumnWidth(headers: readonly string[], rows: readonly (readonly string[])[]): number {
+  return Math.max(...headers.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length))));
+}
+
+/**
+ * groundnuty/macf#1030 — a generous but bounded terminal-reasonable column
+ * width. The pre-fix defect produced ~500-1400-char single columns (the
+ * full repo-visibility reason inlined, then tripled across REPO/CA(repo)/
+ * ROUTING-CLIENT), so 200 is decisively smaller than the regression while
+ * leaving headroom over static explanatory text already in the table
+ * (e.g. `RUNTIME_UNOBSERVABLE_NOTE`, ~114 chars) so an unrelated future
+ * wording tweak doesn't flake this test.
+ */
+const MAX_TERMINAL_REASONABLE_COLUMN_WIDTH = 200;
 
 /** Same 2-agent shape `plan.test.ts::baseManifest` uses, for cross-file familiarity. */
 function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
@@ -240,28 +265,72 @@ describe('computeBootstrapStatus — 404-ambiguous repo visibility (groundnuty/m
     expect(code?.routingClientRepo).not.toBe('absent');
   });
 
-  it('the PROVISIONING row embeds the reason inline — "unknown (...)" not a bare "unknown" — in all three affected cells', () => {
+  it('groundnuty/macf#1030 — the PROVISIONING row carries a SHORT marker, "unknown[1]" not the inlined reason, in all three affected cells', () => {
     const view = computeBootstrapStatus(manifest, OBSERVED_WITH_INVISIBLE_REPO, {});
     const codeRow = buildProvisioningRows(view.agents).find((r) => r[0] === 'code-agent');
     expect(codeRow).toBeDefined();
     // REPO, CA(repo), ROUTING-CLIENT are columns 3, 4, 5 (0-indexed) per
-    // PROVISIONING_HEADERS — see buildProvisioningRows.
-    expect(codeRow?.[3]).toContain('unknown (');
-    expect(codeRow?.[3]).toContain('groundnuty/exp-code-agent');
-    expect(codeRow?.[4]).toContain('unknown (');
-    expect(codeRow?.[5]).toContain('unknown (');
+    // PROVISIONING_HEADERS — see buildProvisioningRows. All three cite the
+    // SAME underlying reason (one repoVisibilityReason for the whole
+    // agent), so all three carry the SAME marker.
+    expect(codeRow?.[3]).toBe('unknown[1]');
+    expect(codeRow?.[4]).toBe('unknown[1]');
+    expect(codeRow?.[5]).toBe('unknown[1]');
+    // The full explanation is NOT in any cell — moved to a footnote below
+    // the table (this is the substance of the #1030 fix).
+    expect(codeRow?.[3]).not.toContain('groundnuty/exp-code-agent');
+    expect(codeRow?.[3]).not.toContain('this token cannot see');
+  });
+
+  it('groundnuty/macf#1030 — the full reason survives, unshortened, as a footnote below the PROVISIONING table', () => {
+    const view = computeBootstrapStatus(manifest, OBSERVED_WITH_INVISIBLE_REPO, {});
     const text = formatBootstrapStatusText(view);
     expect(text).toContain('this token cannot see');
     expect(text).toContain('404');
+    expect(text).toContain(`[1] ${REASON}`);
   });
 
-  it('the JSON render carries repoVisibilityReason as a fact, not a summary — same posture as every other AgentStatusView field', () => {
+  it('groundnuty/macf#1030 DECISIVE — the full reason appears EXACTLY ONCE in the rendered text, not once per cell', () => {
+    const view = computeBootstrapStatus(manifest, OBSERVED_WITH_INVISIBLE_REPO, {});
+    const text = formatBootstrapStatusText(view);
+    const occurrences = text.split(REASON).length - 1;
+    expect(occurrences).toBe(1);
+  });
+
+  it('groundnuty/macf#1030 — the marker in each cell maps unambiguously to its footnote', () => {
+    // Registry supplied as CONFIRMED (not the `{}` default-unknown fallback
+    // used by the other tests in this block) so the RUNTIME table's OWN,
+    // independently-numbered footnote registry stays empty — isolating
+    // this assertion to PROVISIONING's `[1]` so a coincidental `[1]` in a
+    // DIFFERENT table's footnote section can't produce a false ambiguity.
+    const registry: Readonly<Record<string, AgentRegistryObservation>> = {
+      'science-agent': { status: 'confirmed', presence: 'absent' },
+      'code-agent': { status: 'confirmed', presence: 'absent' },
+    };
+    const view = computeBootstrapStatus(manifest, OBSERVED_WITH_INVISIBLE_REPO, registry);
+    const codeRow = buildProvisioningRows(view.agents).find((r) => r[0] === 'code-agent');
+    const marker = codeRow?.[3]; // 'unknown[1]'
+    const match = /\[(\d+)\]$/.exec(marker ?? '');
+    expect(match).not.toBeNull();
+    const footnoteNumber = match?.[1];
+    const text = formatBootstrapStatusText(view);
+    // Exactly one footnote line begins with this exact marker number.
+    const footnoteLines = text.split('\n').filter((line) => line.startsWith(`[${String(footnoteNumber)}] `));
+    expect(footnoteLines).toHaveLength(1);
+    expect(footnoteLines[0]).toContain(REASON);
+  });
+
+  it('the JSON render carries the FULL, untouched repoVisibilityReason — a fact, not a summary, and never footnote-shortened (--json unaffected by #1030)', () => {
     const view = computeBootstrapStatus(manifest, OBSERVED_WITH_INVISIBLE_REPO, {});
     const json = bootstrapStatusToJson(view) as { agents: ReadonlyArray<{ role: string; repoVisibilityReason?: string }> };
     const code = json.agents.find((a) => a.role === 'code-agent');
     expect(code?.repoVisibilityReason).toBe(REASON);
     const sci = json.agents.find((a) => a.role === 'science-agent');
     expect(sci?.repoVisibilityReason).toBeUndefined();
+    // The JSON reads straight off AgentStatusView fields — never through the
+    // table-cell/footnote-marker rendering path — so no `[N]` marker syntax
+    // leaks into it.
+    expect(JSON.stringify(json)).not.toMatch(/unknown\[\d+\]/);
   });
 
   it('MUST-NOT-REGRESS — science-agent (visible to this token) renders its present repo cleanly, no reason text leaking in', () => {
@@ -281,6 +350,55 @@ describe('computeBootstrapStatus — 404-ambiguous repo visibility (groundnuty/m
     expect(json).not.toContain('-----BEGIN');
     expect(text).not.toMatch(/ghs_|ghp_/);
     expect(json).not.toMatch(/ghs_|ghp_/);
+  });
+
+  it('groundnuty/macf#1030 DECISIVE — no PROVISIONING or RUNTIME column exceeds a terminal-reasonable width, even with a long repo-visibility reason', () => {
+    const view = computeBootstrapStatus(manifest, OBSERVED_WITH_INVISIBLE_REPO, {});
+    const provisioningWidth = maxColumnWidth(PROVISIONING_HEADERS, buildProvisioningRows(view.agents));
+    const runtimeWidth = maxColumnWidth(RUNTIME_HEADERS, buildRuntimeRows(view.agents));
+    // Pre-fix, this same fixture produced a ~508-char REPO/CA(repo)/
+    // ROUTING-CLIENT column (the reason inlined three times) — comfortably
+    // over any terminal-reasonable bound. Post-fix, cells carry only a
+    // short `unknown[N]` marker.
+    expect(provisioningWidth).toBeLessThanOrEqual(MAX_TERMINAL_REASONABLE_COLUMN_WIDTH);
+    expect(runtimeWidth).toBeLessThanOrEqual(MAX_TERMINAL_REASONABLE_COLUMN_WIDTH);
+  });
+});
+
+describe('computeBootstrapStatus — footnote dedup + no-footnote-when-clean (groundnuty/macf#1030)', () => {
+  it('two agents that hit the SAME cause share ONE footnote, not two identical ones', () => {
+    // Both agents' registry read fails for the identical generic reason —
+    // the realistic shape of "same cause affecting two agents" (e.g. one
+    // shared network/auth failure), same fixture shape already used above
+    // in the "honest unknown" describe block, but now asserting the
+    // footnote-dedup behavior specifically.
+    const SHARED_REASON = 'registry variable could not be read (network/auth/gh failure)';
+    const registry: Readonly<Record<string, AgentRegistryObservation>> = {
+      'science-agent': { status: 'unknown', reason: SHARED_REASON },
+      'code-agent': { status: 'unknown', reason: SHARED_REASON },
+    };
+    const view = computeBootstrapStatus(baseManifest(), EMPTY_OBSERVED, registry);
+    const rows = buildRuntimeRows(view.agents);
+    expect(rows.every((r) => r[1] === 'unknown[1]')).toBe(true);
+
+    const text = formatBootstrapStatusText(view);
+    // The reason text appears exactly once...
+    expect(text.split(SHARED_REASON).length - 1).toBe(1);
+    // ...as exactly one footnote line, numbered [1].
+    const footnoteLines = text.split('\n').filter((line) => line.startsWith('[1] '));
+    expect(footnoteLines).toHaveLength(1);
+    expect(footnoteLines[0]).toBe(`[1] ${SHARED_REASON}`);
+    // No second footnote was allocated for the duplicate cause.
+    expect(text).not.toContain('[2]');
+  });
+
+  it('a fleet with no unknowns renders no footnote section at all', () => {
+    const view = computeBootstrapStatus(baseManifest(), FULLY_PROVISIONED_OBSERVED, FULLY_PROVISIONED_REGISTRY);
+    const text = formatBootstrapStatusText(view);
+    // No footnote-marker syntax anywhere (cells) and no footnote-list line
+    // (a line starting with `[<digit>] `) anywhere in the render.
+    expect(text).not.toMatch(/\[\d+\]/);
+    expect(text.split('\n').some((line) => /^\[\d+\] /.test(line))).toBe(false);
   });
 });
 
