@@ -112,6 +112,24 @@ The data-quality buck stops at whoever promotes the claim into the higher-visibi
 
 ---
 
+## 5b. Literal output is not automatically evidence — check whose, and of what
+
+§1 requires pasting **literal output** rather than narrating it. That is necessary and **not sufficient**: output can be entirely real and still not be evidence for the claim it is attached to. Running the command proves you ran it; it does not prove the bytes describe the thing you are asserting.
+
+Three ways a well-formed reading belongs to something other than the claim:
+
+- **It describes the mechanism instead of being the mechanism.** A `grep` hit inside a comment, docstring, or usage example that sits beside the assignment it documents. *(Observed 2026-08-19: `grep -hoE 'MACF_AGENT_NAME=...' env.identity` matched a comment reading `MACF_AGENT_NAME=foo ./claude.sh` — an override-precedence example — and was reported as the workspace's configured value, with a recommendation to go fix it. The live value was correct.)*
+- **It forecasts the thing instead of reporting it.** A plan preview, dry-run, or `WILL happen` line read as a result. *(Same day: an `apply` was killed mid-run because the plan preview said `consent gate 1 WILL open`; the run had already confirmed and correctly reused the existing App.)*
+- **It belongs to a different instance of the thing.** The right query against the wrong subject. *(Same day: `pgrep -f claude` on a shared VM returned a **peer agent's** `MACF_AGENT_NAME`; only `/proc/<pid>/cwd` filtering isolated the caller's own process. Same shape as an installation-token check that lists overlapping repos and cannot discriminate which App minted it.)*
+
+**The check, and it is one step:** *does this line come from the thing, or from something adjacent to it?* Read the surrounding lines, not the matching one; confirm the subject, not just the pattern. A `grep` that returns one line has discarded the context that would answer both questions — which is why the failure survives a discipline built on quoting output faithfully.
+
+**Why this is a distinct trap.** The other sections defend against *not looking*. This one fires when you did look, quoted accurately, and the reading was well-formed — the tell is confidence sourced from having run a command rather than from what the command was pointed at. It is the same shape as the silent-fallback class one layer up: an operation that succeeds while its subject is wrong, and nothing about the success surfaces the mismatch.
+
+**Attested across agents** on 2026-08-19: twice by `macf-code-agent` (comment-as-value, preview-as-result), and by `macf-science-agent`'s own catalogued dominant failure mode — documentation, symptoms, summaries, and stale checkouts all reading as the artifact.
+
+---
+
 ## 6. When mis-attribution is discovered mid-thread
 
 If you post a comment and later realize it was attributed to the wrong identity (typically: chat-fallback to user because GH_TOKEN was the string "null"), **do not delete-and-repost**. Downstream references — @mentions to you, PR thread anchors, peer agents quoting the comment — break when the original is deleted.
