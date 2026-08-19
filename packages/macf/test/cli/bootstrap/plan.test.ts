@@ -390,6 +390,35 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     expect(routing).toBeUndefined();
   });
 
+  // --- groundnuty/macf#993 — plan states plainly, BEFORE approval, that a
+  // declared runner is REQUIRED and `apply` will FAIL without one. Same
+  // "unconditional note" shape as the macf#932 suite immediately above
+  // (plan cannot know the LIVE outcome `apply` will observe, so it names the
+  // REQUIREMENT, not a "missing" claim).
+
+  it('states plainly that apply will FAIL without a confirmed runner — regardless of registration status observed at plan time', () => {
+    for (const registered of ['present', 'absent', 'unknown', undefined] as const) {
+      const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+      const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: registered };
+      const plan = computePlan(manifest, observed);
+      const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+      expect(routing?.reason).toContain('REQUIRED');
+      expect(routing?.reason).toMatch(/`apply` FAILS/);
+      expect(routing?.reason).toContain('groundnuty/macf#993');
+    }
+  });
+
+  it('never appears when runs_on is declared but is NOT "self-hosted" — nothing to fail on', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'ubuntu-latest', warm: 1 } } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+    expect(routing?.reason).not.toContain('groundnuty/macf#993');
+  });
+
+  // The "routing.runner not declared at all -> no routing item emitted"
+  // regression guard is already covered above (line ~386-391) — not
+  // duplicated here.
+
   // --- macf#934 — capability detail surfaces in the plan's runner-class line, same resolution as the live gate ---
 
   it('appends the macf#934 capability detail (found-but-mislabeled) to the runner-class reason, without dropping the original wording', () => {

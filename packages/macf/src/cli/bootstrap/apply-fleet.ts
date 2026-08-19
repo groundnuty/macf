@@ -497,9 +497,13 @@ export interface FleetApplyResult {
    * `MACF_TRUSTED_ACTORS` create-only writes, keyed by repo — empty `{}`
    * when `routing.runner` is not declared OR its `runs_on` isn't
    * `"self-hosted"` (macf#922; was `MACF_ROUTING_RUNS_ON`, see
-   * `apply-routing.ts`'s doc). A `'skipped'` leg here means the register-
-   * before-route gate blocked the write for that repo — see
-   * `apply-routing.ts::noRunnerRegisteredReason`.
+   * `apply-routing.ts`'s doc). A `'failed'` leg here means the register-
+   * before-route gate blocked the write for that repo — groundnuty/macf#993
+   * corrected this from `'skipped'`: a declared runner is REQUIRED, so this
+   * FAILS the whole run (`commands/bootstrap-apply.ts::applyExitCode`'s
+   * `routingBad`), never a silent hosted-runner fallback. See
+   * `apply-routing.ts::runnerTokenPollExhaustedReason` /
+   * `runnerJustCreatedRepoReason` for the reason text.
    */
   readonly routing: Readonly<Record<string, EnsureVariableOutcome>>;
   /** DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — see {@link RoutingClientApplyResult}'s doc. ALWAYS present — a fleet with no confirmed agent repos this run still reports `mint.status`. */

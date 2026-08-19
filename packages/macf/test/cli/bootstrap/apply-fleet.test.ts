@@ -1878,7 +1878,7 @@ trust:
 
     // --- macf#922 requirement 3 — register-before-route gate ---
 
-    it('token supplied, runner never appears within the poll window -> MACF_TRUSTED_ACTORS is NOT written for that repo; the gap is reported as "skipped" with a reason, never silent (macf#929: timeoutMs 0 makes the poll a single check — no real wall-clock wait)', async () => {
+    it('groundnuty/macf#993: token supplied, runner never appears within the poll window -> MACF_TRUSTED_ACTORS is NOT written for that repo; the gap is reported as "failed" (not "skipped") with a reason, never silent (macf#929: timeoutMs 0 makes the poll a single check — no real wall-clock wait)', async () => {
       const manifestPath = manifestPathIn();
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const deps: FleetApplyDeps = {
@@ -1888,7 +1888,10 @@ trust:
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
-      expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
+      // DECISIVE (groundnuty/macf#993): 'failed', not 'skipped' — a declared
+      // runner is REQUIRED, so this leg must fail the whole run via
+      // applyExitCode's existing routingBad check.
+      expect(result.routing['groundnuty/demo-code']?.status).toBe('failed');
       const leg = result.routing['groundnuty/demo-code'];
       expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/MACF_TRUSTED_ACTORS was NOT written/);
     });
@@ -1903,10 +1906,10 @@ trust:
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
-      expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
+      expect(result.routing['groundnuty/demo-code']?.status).toBe('failed'); // groundnuty/macf#993 — was 'skipped'
     });
 
-    it('this gap surfaces through formatApplyResult\'s routing summary — visible even under --yes, which skips the pre-approval plan render', async () => {
+    it('this gap surfaces through formatApplyResult\'s routing summary as FAILED (groundnuty/macf#993) — visible even under --yes, which skips the pre-approval plan render', async () => {
       const manifestPath = manifestPathIn();
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const deps: FleetApplyDeps = {
@@ -1917,7 +1920,8 @@ trust:
       const result = await applyFleet(manifest, manifestPath, null, deps);
       const rendered = formatApplyResult(result);
 
-      expect(rendered).toContain('groundnuty/demo-code: SKIPPED —');
+      expect(rendered).toContain('groundnuty/demo-code: FAILED —');
+      expect(rendered).not.toContain('groundnuty/demo-code: SKIPPED');
       expect(rendered).toContain('MACF_TRUSTED_ACTORS was NOT written');
     });
 
@@ -1943,7 +1947,7 @@ trust:
       const result = await applyFleet(manifest, manifestPath, null, deps);
       const rendered = formatApplyResult(result);
 
-      expect(rendered).toContain('groundnuty/demo-code: SKIPPED —');
+      expect(rendered).toContain('groundnuty/demo-code: FAILED —'); // groundnuty/macf#993 — was SKIPPED
       expect(rendered).toContain('MACF_TRUSTED_ACTORS was NOT written');
       expect(rendered).toContain('an org admin must add this repo at');
       expect(rendered).toContain('runner-groups/7');
@@ -2014,8 +2018,9 @@ trust:
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
+      // groundnuty/macf#993 — 'failed', not 'skipped'.
       expect(result.routing['groundnuty/demo-code']).toEqual({
-        status: 'skipped',
+        status: 'failed',
         reason: expect.stringContaining('a runner registration token was supplied'),
       });
       expect(createRepoVarCalled).toBe(false);
@@ -2069,7 +2074,8 @@ trust:
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
-      expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
+      // groundnuty/macf#993 — 'failed', not 'skipped'.
+      expect(result.routing['groundnuty/demo-code']?.status).toBe('failed');
       const leg = result.routing['groundnuty/demo-code'];
       expect(leg && 'reason' in leg ? leg.reason : undefined).toMatch(/MACF_TRUSTED_ACTORS was NOT written/);
       // The decisive assertion: exactly ONE call, not the ~200 a 600s/3s poll
@@ -2124,7 +2130,7 @@ trust:
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
-      expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
+      expect(result.routing['groundnuty/demo-code']?.status).toBe('failed'); // groundnuty/macf#993 — was 'skipped'
       const progressLines = lines.filter((l) => l.includes('waiting for a usable self-hosted runner'));
       expect(progressLines.length).toBeGreaterThan(0);
       expect(progressLines[0]).toMatch(/\d+s\/90s elapsed; nothing for you to do/);
@@ -2144,7 +2150,7 @@ trust:
         runnerToken: SECRET,
         runnerTokenPollOptions: { timeoutMs: 0 },
       });
-      expect(exhausted.routing['groundnuty/demo-code']?.status).toBe('skipped');
+      expect(exhausted.routing['groundnuty/demo-code']?.status).toBe('failed'); // groundnuty/macf#993 — was 'skipped'
       expect(JSON.stringify(exhausted)).not.toContain(SECRET);
       expect(readFileSync(exhausted.lockPath, 'utf-8')).not.toContain(SECRET);
       // `manifestPath` IS the committed fleet.yaml's path here — `baseDeps`

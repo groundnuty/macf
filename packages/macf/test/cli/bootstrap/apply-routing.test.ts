@@ -315,7 +315,7 @@ describe('publishTrustedActorsGated (macf#929)', () => {
     expect(createCalled).toBe(false);
   });
 
-  it('token supplied but the runner NEVER appears within the poll window -> NOT written; a poll-exhausted "skipped" (not "failed") is reported, and the write seam is never invoked', async () => {
+  it('groundnuty/macf#993: token supplied but the runner NEVER appears within the poll window -> NOT written; a poll-exhausted "failed" (not "skipped") is reported, and the write seam is never invoked', async () => {
     let createCalled = false;
     const deps = depsWith({
       checkRunnerUsableByRepo: async () => ({ presence: 'absent' }),
@@ -325,11 +325,15 @@ describe('publishTrustedActorsGated (macf#929)', () => {
       },
     });
     const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', { timeoutMs: 0 });
-    expect(result['a/b']?.status).toBe('skipped');
+    // DECISIVE (groundnuty/macf#993): 'failed', not 'skipped' — a declared
+    // runner is REQUIRED, so an unconfirmed runner must fail the run.
+    expect(result['a/b']?.status).toBe('failed');
     const reason = (result['a/b'] as { reason: string }).reason;
     expect(reason).toContain('a runner registration token was supplied');
     expect(reason).toMatch(/no usable self-hosted runner became visible/);
     expect(reason).toContain('MACF_TRUSTED_ACTORS was NOT written');
+    // The cost consequence is named in the SAME reason text — unchanged.
+    expect(reason).toContain('billed on private repos');
     expect(createCalled).toBe(false);
   });
 
@@ -397,7 +401,7 @@ describe('publishTrustedActorsGated (macf#929)', () => {
 // --- macf#972 — a poll must be justified by an expectation, not a constant ---
 
 describe('publishTrustedActorsGated — justCreatedRepos (macf#972)', () => {
-  it('DECISIVE: repo created this run + no runner -> immediate skip, ZERO poll iterations (checkRunnerUsableByRepo called exactly once, sleepFn never invoked)', async () => {
+  it('DECISIVE: repo created this run + no runner -> immediate FAILURE (groundnuty/macf#993), ZERO poll iterations (checkRunnerUsableByRepo called exactly once, sleepFn never invoked)', async () => {
     let checkCalls = 0;
     let sleepCalls = 0;
     const deps = depsWith({
@@ -423,7 +427,10 @@ describe('publishTrustedActorsGated — justCreatedRepos (macf#972)', () => {
       },
       new Set(['a/b']),
     );
-    expect(result['a/b']?.status).toBe('skipped');
+    // 'failed', not 'skipped' (groundnuty/macf#993) — the poll is STILL
+    // skipped (the fast path this describe block is about); only the
+    // outcome's STATUS changed.
+    expect(result['a/b']?.status).toBe('failed');
     // Exactly ONE call — a single LIVE check still runs (see the sibling
     // "runner already usable" test below for why zero checks would be
     // wrong), but the retry-with-sleep LOOP is never entered: that's the
@@ -506,7 +513,7 @@ describe('publishTrustedActorsGated — justCreatedRepos (macf#972)', () => {
     );
     expect(result['pre-existing/x']).toEqual({ status: 'created' });
     expect(preExistingCalls).toBe(3); // genuinely polled (mid-window recovery)
-    expect(result['fresh/y']?.status).toBe('skipped');
+    expect(result['fresh/y']?.status).toBe('failed'); // groundnuty/macf#993 — was 'skipped'
     expect(freshCalls).toBe(1); // fast path — one check, no retries
   });
 

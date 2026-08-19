@@ -875,7 +875,13 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         },
       }),
     );
-    expect(code).toBe(0);
+    // groundnuty/macf#993 — the runner never becomes usable across this
+    // whole poll (`checkRunnerUsableByRepo` always reports 'absent'), so the
+    // run now exits non-zero: a declared runner is REQUIRED, never a silent
+    // hosted-runner fallback. This test's OWN concern (progress narration
+    // stays off stdout, --json stays parseable) is unaffected by the exit
+    // code — both are asserted below regardless.
+    expect(code).toBe(1);
 
     const progressLines = rawWrites.filter((l) => l.includes('waiting for a usable self-hosted runner'));
     expect(progressLines.length).toBeGreaterThan(0);
@@ -886,8 +892,77 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const stdout = logs.join('\n');
     expect(() => JSON.parse(stdout)).not.toThrow();
     const parsed = JSON.parse(stdout) as { routing: Record<string, { status: string }> };
-    expect(parsed.routing['groundnuty/demo-code']?.status).toBe('skipped');
+    expect(parsed.routing['groundnuty/demo-code']?.status).toBe('failed'); // groundnuty/macf#993 — was 'skipped'
     expect(stdout).not.toContain('waiting for a usable self-hosted runner');
+  });
+
+  // --- groundnuty/macf#993 — the operator's ruling: a declared runner is
+  // REQUIRED, never a silent hosted-runner fallback. Full end-to-end
+  // `runBootstrapApply` coverage — the pure `applyExitCode` unit tests below
+  // (in the "formatApplyResult / fleetApplyResultToJson / applyExitCode"
+  // describe block) already prove the exit-code MECHANISM in isolation; this
+  // block proves the WHOLE CLI entrypoint, wired end-to-end, actually
+  // produces that outcome for the exact scenario the issue reports:
+  // "Routing var (...): skipped — ... MACF_TRUSTED_ACTORS was NOT written
+  // ... until a runner is confirmed" printed beside otherwise-green output,
+  // with `apply` still exiting 0.
+  describe('groundnuty/macf#993 — a declared runner is REQUIRED, never a silent hosted-runner fallback', () => {
+    it('DECISIVE: routing.runner declared self-hosted + a runner-token supplied + NO usable runner ever confirmed -> non-zero exit, and the message names the billing consequence', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply(
+        { file, yes: true, runnerToken: SENTINEL_RUNNER_TOKEN },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file, {
+          trustDeps: fakeTrustDeps({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+          runnerTokenPollOptions: { timeoutMs: 0 }, // no real wall-clock wait
+        }),
+      );
+      // The decisive assertion: the EXIT CODE, not just the message — a test
+      // asserting only the warning text passes against the pre-#993 code,
+      // which exits 0. That is exactly the gap this issue closes.
+      expect(code).toBe(1);
+      const all = [...logs, ...errs].join('\n');
+      // The message names the cost consequence — same reason text
+      // `apply-routing.ts::runnerTokenPollExhaustedReason` has always
+      // produced, now paired with a FAILED status instead of SKIPPED.
+      expect(all).toContain('billed on private repos');
+      expect(all).toContain('MACF_TRUSTED_ACTORS was NOT written');
+      expect(all).toContain('groundnuty/demo-code: FAILED —');
+      expect(all).not.toContain('groundnuty/demo-code: SKIPPED');
+    });
+
+    it('declared routing.runner self-hosted + a USABLE runner confirmed -> exit 0, MACF_TRUSTED_ACTORS written, unchanged from today', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply(
+        { file, yes: true, json: true, runnerToken: SENTINEL_RUNNER_TOKEN },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file), // fakeTrustDeps' default checkRunnerUsableByRepo reports 'present'
+      );
+      expect(code).toBe(0);
+      const parsed = JSON.parse(logs.join('\n')) as { routing: Record<string, { status: string }> };
+      expect(parsed.routing['groundnuty/demo-code']?.status).toBe('created');
+    });
+
+    it('REGRESSION GUARD: routing.runner NOT declared at all -> exit 0 even though no usable runner would ever be confirmed — an undeclared fleet is structurally unreachable by this change', async () => {
+      const file = writeManifest(); // base FLEET_YAML — no `routing:` section at all
+      const code = await runBootstrapApply(
+        { file, yes: true, json: true }, // deliberately no runnerToken — an undeclared fleet needs none
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file, {
+          // Even if a runner-usability check WERE wired in, an undeclared
+          // fleet must never call it — `apply-fleet.ts`'s
+          // `manifest.routing?.runner.runs_on === 'self-hosted'` gate keeps
+          // `publishTrustedActorsGated` (and therefore this fake) entirely
+          // unreached. Asserting `presence: 'absent'` here — rather than
+          // 'present' — is the point: this run must stay green regardless
+          // of what a live check WOULD have said, because it's never asked.
+          trustDeps: fakeTrustDeps({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+        }),
+      );
+      expect(code).toBe(0);
+      const parsed = JSON.parse(logs.join('\n')) as { routing: Record<string, unknown> };
+      expect(parsed.routing).toEqual({});
+    });
   });
 
   // --- macf#932 — the pre-flight fires BEFORE consent gate 1, not merely
@@ -2059,13 +2134,23 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(text).toMatch(/groundnuty\/y: ALREADY-PRESENT/);
   });
 
-  it('formatApplyResult renders a SKIPPED routing leg with its reason (macf#922 requirement 3 — the no-runner-registered gap is visible even under --yes)', () => {
+  it('formatApplyResult renders a SKIPPED routing leg with its reason (generic render behavior — EnsureVariableOutcome still admits "skipped")', () => {
     const text = formatApplyResult(
       resultWith({
-        routing: { 'groundnuty/x': { status: 'skipped', reason: 'no self-hosted runner is confirmed registered for "groundnuty/x"' } },
+        routing: { 'groundnuty/x': { status: 'skipped', reason: 'some future skip reason' } },
       }),
     );
-    expect(text).toMatch(/groundnuty\/x: SKIPPED — no self-hosted runner is confirmed registered/);
+    expect(text).toMatch(/groundnuty\/x: SKIPPED — some future skip reason/);
+  });
+
+  it('formatApplyResult renders a FAILED routing leg loudly, never as a SKIPPED line beside otherwise-green output (groundnuty/macf#993 — the no-runner-registered gap)', () => {
+    const text = formatApplyResult(
+      resultWith({
+        routing: { 'groundnuty/x': { status: 'failed', reason: 'no self-hosted runner is confirmed registered for "groundnuty/x"' } },
+      }),
+    );
+    expect(text).toMatch(/groundnuty\/x: FAILED — no self-hosted runner is confirmed registered/);
+    expect(text).not.toMatch(/groundnuty\/x: SKIPPED/);
   });
 
   it('fleetApplyResultToJson never includes a CA cert/key value and carries ca + routing verbatim otherwise', () => {
