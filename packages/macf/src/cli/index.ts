@@ -21,6 +21,7 @@ import { runFleetDeleteApps, runFleetDestroy, DESTROY_ENV_ACK_VAR } from './comm
 import { runFleetDeploy } from './commands/fleet-deploy.js';
 import { runBootstrapPlan } from './commands/bootstrap.js';
 import { runBootstrapApply } from './commands/bootstrap-apply.js';
+import { runBootstrapStatus } from './commands/bootstrap-status.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { runRestartSelfCommand } from './commands/restart-self.js';
@@ -665,6 +666,36 @@ bootstrap
   .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
   .action(async (opts) => {
     const code = await runBootstrapPlan({
+      file: opts.file,
+      json: opts.json,
+      vaultPath: opts.vault,
+      identityKeyPath: opts.identityKey,
+    });
+    process.exitCode = code;
+  });
+
+bootstrap
+  .command('status')
+  .description(
+    'READ-ONLY: renders OBSERVED fleet state — no diff, nothing stored (groundnuty/macf#1017). Same ' +
+    'provisioning observation `plan` uses (Apps, installs, repos, CA both DR two-place legs, routing-client ' +
+    'secrets, control repo, versions), plus each declared agent\'s registry-registration identity ' +
+    '(host:port/instance_id/last_heartbeat). Live agent LIVENESS (online/uptime/cert_expiry) is NOT observable ' +
+    'from this operator-privileged plane (no agent client cert, by design) — use `macf fleet status` from a ' +
+    'deployed agent workspace for that. Every unobservable fact renders honest `unknown`, never `absent`. ' +
+    'No mutation, no consent gates, no fleet.lock write.',
+  )
+  .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
+  .option('--json', 'Emit the structured status as JSON', false)
+  .option(
+    '--vault <path>',
+    'Path to a fleet\'s secrets/vault.age — with --identity-key, lifts per-agent/CA observation into the ' +
+      'vault-aware confirm tier (DR-043 Amendment D phase 3), same as `bootstrap plan --vault`. Operator-' +
+      'privileged use only; omit for the vault-free default (vault-dependent rows render `unknown`).',
+  )
+  .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
+  .action(async (opts) => {
+    const code = await runBootstrapStatus({
       file: opts.file,
       json: opts.json,
       vaultPath: opts.vault,
