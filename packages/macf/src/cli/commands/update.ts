@@ -157,6 +157,35 @@ function pluginDirNeedsRepair(dir: string): boolean {
   return readdirSync(dir).length === 0;
 }
 
+/**
+ * Strip mcpServers from the MOUNTED plugin manifest + report the outcome
+ * (DR-022 Amendment P, groundnuty/macf#995, fixed groundnuty/macf#1005).
+ *
+ * Call this UNCONDITIONALLY, independent of whether a fetch happened this
+ * invocation — #995's original wiring only called `stripPluginMcpServers`
+ * immediately after `fetchPluginToWorkspace`, which is correct for "a fetch
+ * always reintroduces the key" but blind to the far more common steady
+ * state: a workspace already at the pinned plugin version never re-fetches,
+ * so the strip never ran and the old plugin mount survived indefinitely
+ * (macf#1005). `stripPluginMcpServers` is a cheap, idempotent, local
+ * read-modify-write — safe to call on every invocation regardless of fetch
+ * state; it silently no-ops when there's nothing to strip.
+ *
+ * Reports (console.log) only when the file actually changed, so an
+ * already-converged workspace stays quiet on repeat runs. A malformed
+ * manifest refuses loudly (console.warn, same posture as the sibling
+ * `.mcp.json` write-refusal a few lines below) and writes nothing —
+ * silent-fallback-hazards.md is this repo's most-catalogued defect class.
+ */
+function reportPluginMcpServersStrip(projectDir: string, targetDir: string): void {
+  const result = stripPluginMcpServers(projectDir, { targetDir });
+  if (result.status === 'stripped') {
+    console.log(`Stripped mcpServers from ${result.path} (DR-022 Amendment P)`);
+  } else if (result.status === 'refused') {
+    console.warn(`Warning: mcpServers not stripped from ${result.path}: ${result.reason}`);
+  }
+}
+
 function formatRow(row: DiffRow): string {
   const name = row.component.padEnd(10);
   const cur = row.current.padEnd(10);
@@ -513,16 +542,24 @@ export async function update(
   if (config.versions && pluginTarget.dir && pluginDirNeedsRepair(pluginTarget.dir)) {
     try {
       fetchPluginToWorkspace(projectDir, config.versions.plugin, { targetDir: pluginTarget.dir });
-      // Strip mcpServers from the repaired local copy (DR-022 Amendment P,
-      // groundnuty/macf#995) — a fetch always reintroduces whatever the
-      // marketplace manifest currently ships, so this must re-run after
-      // every fetch, not just the first one.
-      stripPluginMcpServers(projectDir, { targetDir: pluginTarget.dir });
-      console.log(`Repaired ${pluginTarget.dir} with macf-agent@v${config.versions.plugin} (mcpServers stripped)`);
+      console.log(`Repaired ${pluginTarget.dir} with macf-agent@v${config.versions.plugin}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`Warning: plugin repair fetch failed: ${msg}`);
     }
+  }
+
+  // Strip mcpServers from the MOUNTED plugin manifest — UNCONDITIONALLY,
+  // independent of whether the repair-fetch above just ran (groundnuty/
+  // macf#1005). This is the convergence step for the common steady state:
+  // a workspace whose plugin is ALREADY at the pinned version never hits
+  // the repair-fetch branch above, so without this call it would never be
+  // stripped at all. Placed here — before every short-circuit `return`
+  // below (no-bump-candidates / no-changes / dry-run / legacy-config) — so
+  // none of those exit paths skip convergence either. See
+  // `reportPluginMcpServersStrip`'s doc comment for the full rationale.
+  if (pluginTarget.dir) {
+    reportPluginMcpServersStrip(projectDir, pluginTarget.dir);
   }
 
   // Write/refresh <workspace>/.mcp.json with the channel-server as a project
@@ -667,15 +704,17 @@ export async function update(
     if (pluginTarget.dir) {
       try {
         fetchPluginToWorkspace(projectDir, newVersions.plugin, { targetDir: pluginTarget.dir });
-        // A fetch always overwrites the manifest, reintroducing mcpServers if
-        // the marketplace still ships it — strip again (DR-022 Amendment P,
-        // groundnuty/macf#995).
-        stripPluginMcpServers(projectDir, { targetDir: pluginTarget.dir });
-        console.log(`Refreshed ${pluginTarget.dir} to macf-agent@v${newVersions.plugin} (mcpServers stripped)`);
+        console.log(`Refreshed ${pluginTarget.dir} to macf-agent@v${newVersions.plugin}`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`Warning: plugin re-fetch failed: ${msg}`);
       }
+      // A fetch always overwrites the manifest, reintroducing mcpServers if
+      // the marketplace still ships it — strip again (DR-022 Amendment P,
+      // groundnuty/macf#995, macf#1005). Runs whether or not the fetch above
+      // succeeded — `stripPluginMcpServers` is idempotent against whatever
+      // is actually on disk, so this is safe either way.
+      reportPluginMcpServersStrip(projectDir, pluginTarget.dir);
     } else {
       console.error(
         `Warning: versions.plugin advanced to v${newVersions.plugin} in macf-agent.json, but the ` +
