@@ -18,8 +18,8 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dirname, join } from 'node:path';
-import { toVariableSegment } from '@groundnuty/macf-core';
-import type { RegistryConfig } from '@groundnuty/macf-core';
+import { toVariableSegment, AgentInfoSchema } from '@groundnuty/macf-core';
+import type { AgentInfo, RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
 import { deriveControlRepoName, ROUTER_EMITTED_LABELS } from './fleet-manifest.js';
 import type { FleetObserverFn, ObservedAgentState, ObservedState, Presence } from './plan.js';
@@ -739,6 +739,65 @@ export async function readRegistryVariable(registry: RegistryConfig, name: strin
   } catch {
     return undefined;
   }
+}
+
+/**
+ * One agent's registry-observed RUNTIME identity fact — groundnuty/macf#1017
+ * ("a command that shows observed fleet state, no stored status"). This is
+ * the honest CEILING of what the bootstrap plane can say about "is the
+ * agent running": the registry entry (`MACF_<PROJECT>_AGENT_<ROLE>`,
+ * written at agent-process startup via `Registry.registerConditional` — same key shape
+ * `@groundnuty/macf-core`'s `registry/registry.ts::variableName` derives)
+ * proves the agent REGISTERED at some point; it can NEVER prove the agent is
+ * still alive right now (that needs a live mTLS `/health` probe, which
+ * requires a per-agent CLIENT cert this operator-privileged, credential-free
+ * tool structurally never holds — DR-035 §2: "it never mints a fleet-agent
+ * bot token" — and by the same custody boundary never borrows a deployed
+ * agent's client cert either). `commands/fleet.ts::runFleetStatus` is the
+ * tool that CAN prove liveness (it runs from an already-deployed agent
+ * workspace holding that agent's own cert); this function's caller renders
+ * that split explicitly rather than papering over it (see
+ * `status.ts`'s module doc).
+ *
+ * `'confirmed'`/`'present'` never means "online" — only "was registered, as
+ * of the write, with this host/port/instance_id." `'confirmed'`/`'absent'`
+ * is a live confirmed-404. Every other outcome (registry read failure,
+ * present-but-unreadable value, present-but-not-JSON, present-but-not-
+ * `AgentInfo`-shaped) degrades to `'unknown'` with a diagnostic `reason` —
+ * Amendment A4's honest-unknown floor: an unreadable/malformed entry is
+ * evidence of nothing about whether the agent is registered. NEVER throws.
+ */
+export type AgentRegistryObservation =
+  | { readonly status: 'confirmed'; readonly presence: 'present'; readonly info: AgentInfo }
+  | { readonly status: 'confirmed'; readonly presence: 'absent' }
+  | { readonly status: 'unknown'; readonly reason: string };
+
+export async function readAgentRegistryInfo(registry: RegistryConfig, fleetName: string, role: string): Promise<AgentRegistryObservation> {
+  const name = `${toVariableSegment(fleetName)}_AGENT_${toVariableSegment(role)}`;
+
+  const presence = await checkRegistryVariablePresence(registry, name);
+  if (presence === 'absent') return { status: 'confirmed', presence: 'absent' };
+  if (presence === 'unknown') {
+    return { status: 'unknown', reason: `registry variable "${name}" could not be read (network/auth/gh failure)` };
+  }
+
+  const raw = await readRegistryVariable(registry, name);
+  if (raw === undefined) {
+    return { status: 'unknown', reason: `registry variable "${name}" is present but its value could not be read` };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { status: 'unknown', reason: `registry variable "${name}" is present but is not valid JSON` };
+  }
+
+  const result = AgentInfoSchema.safeParse(parsed);
+  if (!result.success) {
+    return { status: 'unknown', reason: `registry variable "${name}" is present but does not match the expected agent-registration shape` };
+  }
+  return { status: 'confirmed', presence: 'present', info: result.data };
 }
 
 /**
