@@ -2162,9 +2162,11 @@ trust:
       const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
       let mintCalled = false;
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      const logs: string[] = [];
       const deps: FleetApplyDeps = {
         ...baseDeps(reusedAgentDeps(), manifestPath),
         trustDeps: reuseCaTrustDeps(),
+        log: (l) => logs.push(l),
         routingClientDeps: {
           mint: async () => {
             mintCalled = true;
@@ -2206,6 +2208,21 @@ trust:
       // (this is the fix's positive mirror of the "no vault" test below,
       // which asserts the run correctly goes RED instead).
       expect(applyExitCode(result)).toBe(0);
+
+      // The vault-restored material NEVER reaches a human/log/--json
+      // surface — this is the ONE test in the file where vault-restored
+      // (not freshly-minted) key material flows through `applyFleet`, so
+      // it needs its OWN leak check; the #920 decisive test above only
+      // proves this for a freshly-minted secret.
+      const rendered = JSON.stringify(fleetApplyResultToJson(result, []));
+      expect(rendered).not.toContain('VAULT-RESTORED-KEY-PEM');
+      expect(rendered).not.toContain('VAULT-RESTORED-CERT-PEM');
+      const humanText = formatApplyResult(result, []);
+      expect(humanText).not.toContain('VAULT-RESTORED-KEY-PEM');
+      expect(humanText).not.toContain('VAULT-RESTORED-CERT-PEM');
+      const logged = logs.join('\n');
+      expect(logged).not.toContain('VAULT-RESTORED-KEY-PEM');
+      expect(logged).not.toContain('VAULT-RESTORED-CERT-PEM');
     });
 
     it('prior mint + new repo + NO vault/--identity-key -> the new repo leg is a LOUD "failed", never a silent "skipped" — and it fails the run', async () => {
@@ -2231,8 +2248,14 @@ trust:
       expect(result.routingClient.certLegs['groundnuty/demo-science']?.status).toBe('failed');
       expect(result.routingClient.certLegs['groundnuty/demo-science']?.status).not.toBe('skipped');
       if (result.routingClient.certLegs['groundnuty/demo-science']?.status === 'failed') {
-        expect(result.routingClient.certLegs['groundnuty/demo-science'].reason).toMatch(/--vault/);
-        expect(result.routingClient.certLegs['groundnuty/demo-science'].reason).toMatch(/--identity-key/);
+        // The DISTINCTIVE hint phrase `resolveRoutingClientSecretsForPublish`
+        // appends (not just a loose "mentions --vault somewhere" match,
+        // which `mintRoutingClient`'s OWN skip reason would also satisfy —
+        // see that function's "already minted" text — and would pass even
+        // if this hint were deleted).
+        expect(result.routingClient.certLegs['groundnuty/demo-science'].reason).toMatch(
+          /Supply both --vault and --identity-key/,
+        );
       }
       // Never a silent green exit while a confirmed repo is unroutable:
       expect(applyExitCode(result)).toBe(1);
@@ -2271,10 +2294,14 @@ trust:
       // check even attempted — there is genuinely nothing anywhere (no fresh
       // mint, no vaulted prior mint) that could ever be published.
       expect(presenceChecked).toBe(false);
-      expect(result.routingClient.certLegs['groundnuty/demo-code']).toEqual({
-        status: 'skipped',
-        reason: result.routingClient.mint.status === 'skipped' ? result.routingClient.mint.reason : undefined,
-      });
+      expect(result.routingClient.certLegs['groundnuty/demo-code']?.status).toBe('skipped');
+      // A literal substring pin (NOT a self-referential compare against
+      // `result.routingClient.mint.reason` — a drift in both places at once
+      // could otherwise pass) — this is `mintRoutingClient`'s exact
+      // "no CA minted this run" skip text.
+      if (result.routingClient.certLegs['groundnuty/demo-code']?.status === 'skipped') {
+        expect(result.routingClient.certLegs['groundnuty/demo-code'].reason).toMatch(/was not freshly minted/);
+      }
       // This orthogonal, pre-existing steady state must NOT fail the run:
       expect(applyExitCode(result)).toBe(0);
     });

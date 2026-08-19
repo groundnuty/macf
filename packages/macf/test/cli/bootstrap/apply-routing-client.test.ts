@@ -270,6 +270,26 @@ describe('publishRoutingClientSecrets — create-only per-repo deploy', () => {
     expect(result.certLegs['o/missing-it']?.status).toBe('failed');
     if (result.certLegs['o/missing-it']?.status === 'failed') expect(result.certLegs['o/missing-it'].reason).toContain('no vault, no fresh mint');
   });
+
+  // groundnuty/macf#986 review — a DELIBERATE choice, not an accidental
+  // side-effect: `checkRepoSecretPresence` returning `'unknown'` (auth /
+  // network / rate-limit — `observer.ts::checkRepoSecretPresence` NEVER
+  // throws, it degrades to `'unknown'` on any non-404 error) is treated
+  // IDENTICALLY to `'absent'` when `secrets` is `'unavailable'` — both fall
+  // through to `create()`, which throws, which `ensureVariableCreated`
+  // folds into `'failed'`. This is the SAME Amendment A4 honest-unknown
+  // floor `apply-ca.ts::resolveCaCert` already applies (never treat an
+  // unconfirmable read as evidence of "already there"): a transient
+  // presence-check blip on a repo that in fact already has the secret is
+  // indistinguishable, from here, from a repo that genuinely lacks it AND
+  // has no material to fix it with — so it fails loud rather than silently
+  // passing. Pinned here so this is a documented, tested choice, not
+  // something a future refactor discovers by accident.
+  it('secrets UNAVAILABLE + presence UNKNOWN (unconfirmable, e.g. rate-limited) -> "failed", same as "absent" — a DELIBERATE Amendment A4 choice, pinned here', async () => {
+    const result = await publishRoutingClientSecrets(UNAVAILABLE, ['o/unconfirmable'], publishDepsWith({ checkRepoSecretPresence: async () => 'unknown' }));
+    expect(result.certLegs['o/unconfirmable']?.status).toBe('failed');
+    expect(result.keyLegs['o/unconfirmable']?.status).toBe('failed');
+  });
 });
 
 describe('resolveRoutingClientSecretsForPublish (groundnuty/macf#986)', () => {

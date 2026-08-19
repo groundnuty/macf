@@ -354,7 +354,20 @@ export async function publishRoutingClientSecrets(
   return { certLegs, keyLegs };
 }
 
-/** The `RoutingClientPublishResult` shape for "never attempted this run" (mint skipped, or a fresh mint's vault write did not succeed) — mirrors `apply-ca.ts::skippedCaPublish`. Pure. */
+/**
+ * The `RoutingClientPublishResult` shape for "never attempted this run" —
+ * mirrors `apply-ca.ts::skippedCaPublish`. Pure. Used by `apply-fleet.ts`
+ * for exactly the cases where NOTHING could ever be published this run
+ * (never a per-repo attempt, not even a presence check): a fresh mint whose
+ * vault write hasn't durably landed yet (ordering safety), a fleet where
+ * NOTHING has ever been minted (`!lockHasRoutingClientKey`), or a genuine
+ * mint exception (groundnuty/macf#954). **NOT** used for the
+ * `lockHasRoutingClientKey === true` case (a PRIOR run already minted this
+ * fleet's cert) — that path runs `publishRoutingClientSecrets`'s per-repo
+ * idempotent loop instead (groundnuty/macf#986), because a repo added
+ * since that prior mint needs an actual per-repo answer, not a blanket
+ * "nothing attempted."
+ */
 export function skippedRoutingClientPublish(repos: readonly string[], reason: string): RoutingClientPublishResult {
   return { certLegs: skippedOutcomesFor(repos, reason), keyLegs: skippedOutcomesFor(repos, reason) };
 }
