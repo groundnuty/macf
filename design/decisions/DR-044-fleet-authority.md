@@ -64,7 +64,7 @@ An override exists per this project's escape-hatch convention, and is **safe onl
 - **Held power** is read by introspection — verified live on both classes: `GET /installation/repositories` → `repository_selection` for installation tokens; `HEAD /` → `x-oauth-scopes` for user tokens; and the App installation's full permission map, which `macf doctor` already reads to verify a workspace against DR-019.
 - **Required power** is declared per fleet operation, and **verified against `X-Accepted-Github-Permissions`** — the header reporting what an endpoint itself requires. The header cannot serve the pre-flight (it is only visible *after* a call), but it makes the declaration **self-checking** rather than hand-maintained-and-trusted.
 
-> **Asserted by:** `packages/macf/test/cli/bootstrap/fleet-authority.test.ts` → `"each fleet operation's declared required-power matches what GitHub's X-Accepted-Github-Permissions reports for the endpoints it calls"`
+> **This mechanism is NOT YET IMPLEMENTED, and therefore carries no `Asserted by:` citation.** Its absence is the signal (`#998` Ruling 2, as refined on `#1002`): a clause claiming a mechanism the tool does not yet produce must be **conspicuously uncited**, never cited aspirationally. The citation is added when the assertion exists — a test that each fleet operation's declared required-power matches what `X-Accepted-Github-Permissions` reports for the endpoints it calls. Implementation follows this DR's ratification, not the other way round.
 
 **Read the permission map through `doctor`'s existing path, never a second reader** — the operator's golden-path directive, with `#1000` as the local proof that a second path in one area goes unnoticed until it diverges.
 
