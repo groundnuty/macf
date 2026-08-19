@@ -25,6 +25,8 @@ import {
   formatApplyResult,
   fleetApplyResultToJson,
   applyExitCode,
+  findAvailableRecoveryArtifacts,
+  formatRecoveryArtifactNotice,
   DRY_RUN_REDIRECT_PLACEHOLDER,
   FLEET_APPLY_JSON_SCHEMA_VERSION,
   type MutateApplyDeps,
@@ -444,7 +446,13 @@ function fakeMutateDeps(manifestPath: string, overrides: Partial<MutateApplyDeps
       commitAndPush: async () => 'pushed',
       repoInit: async () => ({ workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } }),
     },
-    vaultDeps: { exists: () => false, encrypt: async () => {} },
+    // macf#988 — `encrypt` MUST create a real file at the path it's given:
+    // `writeAgentRecoveryArtifact`'s atomic-write tail (temp file -> chmod
+    // 0600 -> rename into place) needs something to chmod/rename, the same
+    // way a REAL `age -o <path>` invocation always would. A pure no-op (the
+    // pre-#988 default here) now throws inside `chmodSync` (ENOENT) for any
+    // test that reaches the CREATE path.
+    vaultDeps: { exists: () => false, encrypt: async (_plaintext, _recipients, outPath) => writeFileSync(outPath, 'FAKE-CIPHERTEXT') },
     controlRepoDeps: {
       checkMeta: async () => ({ presence: 'absent' }),
       readManifestFile: async () => undefined,
@@ -459,6 +467,12 @@ function fakeMutateDeps(manifestPath: string, overrides: Partial<MutateApplyDeps
     trustDeps: fakeTrustDeps(),
     routingClientDeps: fakeRoutingClientDeps(),
     controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
+    // macf#988 — the SAME tracked/cleaned-up tmpdir every other path in
+    // this file already uses (see `controlRepoOptions.makeScratchDir`'s
+    // identical shape above) — the primary test-safety seam; the
+    // `MACF_RECOVERY_DIR` env stub in this describe block's `beforeEach` is
+    // the belt-and-suspenders backstop.
+    recoveryRootDir: join(manifestPath, '..'),
     now: () => new Date('2026-08-11T00:00:00.000Z'),
     log: () => {},
     confirmPlan: async () => true,
@@ -478,6 +492,15 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     errs = [];
     vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => logs.push(a.join(' ')));
     vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => errs.push(a.join(' ')));
+    // macf#988 belt-and-suspenders (see `vault-write.ts::defaultOperatorRecoveryRootDir`'s
+    // doc): `fakeMutateDeps` below ALWAYS pins `recoveryRootDir` explicitly,
+    // but this env override means even a hand-built `MutateApplyDeps`
+    // literal that forgets it still cannot reach the real operator's
+    // `~/.config/macf/recovery` — this suite never creates or touches
+    // anything outside a tracked, per-test tmpdir.
+    const recoverySafetyDir = mkdtempSync(join(tmpdir(), 'macf-apply-mutate-recovery-safety-'));
+    dirs.push(recoverySafetyDir);
+    vi.stubEnv('MACF_RECOVERY_DIR', recoverySafetyDir);
   });
   afterEach(() => {
     vi.restoreAllMocks();
@@ -1776,6 +1799,49 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
     ...overrides,
   };
 }
+
+describe('findAvailableRecoveryArtifacts / formatRecoveryArtifactNotice — macf#988, DR-043 Amendment B requirement 4', () => {
+  const MANIFEST_FOR_RECOVERY_CHECK = parseFleetManifest(FLEET_YAML);
+
+  it('is EXISTENCE-ONLY: probes manifest.agents[] roles + RUNNER_OPS_ROLE at operatorRecoveryArtifactPath, decrypts nothing', () => {
+    const probed: string[] = [];
+    const roles = findAvailableRecoveryArtifacts(
+      MANIFEST_FOR_RECOVERY_CHECK,
+      (path) => {
+        probed.push(path);
+        return false;
+      },
+      '/fake/recovery-root',
+    );
+    expect(roles).toEqual([]);
+    expect(probed).toEqual([
+      '/fake/recovery-root/demo-fleet/code-agent.age',
+      '/fake/recovery-root/demo-fleet/science-agent.age',
+      '/fake/recovery-root/demo-fleet/runner-ops.age',
+    ]);
+  });
+
+  it('returns only the roles whose artifact actually exists', () => {
+    const roles = findAvailableRecoveryArtifacts(
+      MANIFEST_FOR_RECOVERY_CHECK,
+      (path) => path.endsWith('code-agent.age'),
+      '/fake/recovery-root',
+    );
+    expect(roles).toEqual(['code-agent']);
+  });
+
+  it('returns [] when nothing exists (the ordinary, common-case fleet)', () => {
+    const roles = findAvailableRecoveryArtifacts(MANIFEST_FOR_RECOVERY_CHECK, () => false, '/fake/recovery-root');
+    expect(roles).toEqual([]);
+  });
+
+  it('formatRecoveryArtifactNotice names the roles + macf#988 + the --identity-key remedy', () => {
+    const text = formatRecoveryArtifactNotice(['code-agent', 'runner-ops']);
+    expect(text).toContain('code-agent, runner-ops');
+    expect(text).toContain('macf#988');
+    expect(text).toContain('--identity-key');
+  });
+});
 
 describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', () => {
   it('applyExitCode: 0 when every agent is created/reused/resumed-install and vault didn\'t fail', () => {

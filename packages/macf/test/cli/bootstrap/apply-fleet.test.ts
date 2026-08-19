@@ -29,7 +29,7 @@ import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchang
 import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
 import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
-import { writeVault } from '../../../src/cli/bootstrap/vault-write.js';
+import { operatorRecoveryArtifactPath, writeAgentRecoveryArtifact, writeVault } from '../../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext } from '../../../src/cli/bootstrap/vault-read.js';
 import { applyExitCode, fleetApplyResultToJson, formatApplyResult } from '../../../src/cli/commands/bootstrap-apply.js';
 import { resolveAgeGate } from './age-binary-gate.js';
@@ -256,10 +256,22 @@ describe('applyFleet', () => {
       savedEnv[k] = process.env[k];
       delete process.env[k];
     }
+    // macf#988 belt-and-suspenders (see `vault-write.ts::defaultOperatorRecoveryRootDir`'s
+    // doc): `baseDeps` below ALWAYS sets `FleetApplyDeps.recoveryRootDir`
+    // explicitly, but a test literal that constructs `FleetApplyDeps` by
+    // hand (not spreading `baseDeps`) could forget to. This env override
+    // means even THAT test still cannot reach the real operator's
+    // `~/.config/macf/recovery` — `applyFleet` never creates or touches
+    // anything outside a tracked, per-test tmpdir. `dirs.push` below is the
+    // SAME cleanup array every other tmpdir in this file already uses.
+    savedEnv['MACF_RECOVERY_DIR'] = process.env['MACF_RECOVERY_DIR'];
+    const recoverySafetyDir = mkdtempSync(join(tmpdir(), 'macf-apply-fleet-recovery-safety-'));
+    dirs.push(recoverySafetyDir);
+    process.env['MACF_RECOVERY_DIR'] = recoverySafetyDir;
   });
   afterEach(() => {
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
-    for (const k of ['GH_TOKEN', 'APP_ID', 'INSTALL_ID', 'KEY_PATH']) {
+    for (const k of ['GH_TOKEN', 'APP_ID', 'INSTALL_ID', 'KEY_PATH', 'MACF_RECOVERY_DIR']) {
       if (savedEnv[k] === undefined) delete process.env[k];
       else process.env[k] = savedEnv[k];
     }
@@ -278,17 +290,32 @@ describe('applyFleet', () => {
    * this file's top-of-file `controlRepoDepsFor` doc). Every EXISTING
    * `result.lockPath` / hand-built `secrets/...` assertion in this file
    * keeps working unchanged.
+   *
+   * `recoveryRootDir` (macf#988) is ALSO pinned to `dirname(manifestPath)` —
+   * the SAME tracked/cleaned-up tmpdir, just no longer nested under
+   * `secrets/recovery/` (that nesting was the control-repo-checkout
+   * derivation this fix removes). This is the PRIMARY test-safety seam (see
+   * the top-of-file `beforeEach`'s `MACF_RECOVERY_DIR` env override for the
+   * belt-and-suspenders backstop covering test literals that don't call
+   * this helper).
    */
   function baseDeps(agentDeps: AgentApplyDeps, manifestPath: string, repoInitDeps: RepoInitStepDeps = NOOP_REPO_INIT): FleetApplyDeps {
     return {
       buildAgentDeps: () => agentDeps,
       repoInitDeps,
-      vaultDeps: { exists: () => false, encrypt: async () => {} },
+      // macf#988 — `encrypt` MUST create a real file at the path it's given:
+      // `writeAgentRecoveryArtifact`'s new atomic-write tail (temp file →
+      // chmod 0600 → rename into place) needs something to chmod/rename, the
+      // same way a REAL `age -o <path>` invocation always would. A pure
+      // no-op (the pre-#988 default here) now throws inside `chmodSync`
+      // (ENOENT) for any test that reaches the CREATE path.
+      vaultDeps: { exists: () => false, encrypt: async (_plaintext, _recipients, outPath) => writeFileSync(outPath, 'FAKE-CIPHERTEXT') },
       controlRepoDeps: controlRepoDepsFor(),
       agentRepoDeps: agentRepoDepsFor(),
       trustDeps: trustDepsFor(),
       routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
       controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
+      recoveryRootDir: join(manifestPath, '..'),
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
       runnerToken: SENTINEL_RUNNER_TOKEN,
@@ -632,6 +659,9 @@ describe('applyFleet', () => {
         exists: () => false,
         encrypt: async (plaintext, _recipients, outPath) => {
           encryptCalls.push({ plaintext, outPath });
+          // macf#988 — must create a real file: `writeAgentRecoveryArtifact`'s
+          // atomic-write tail chmods + renames whatever `encrypt` wrote.
+          writeFileSync(outPath, 'FAKE-CIPHERTEXT');
         },
       },
     };
@@ -654,14 +684,19 @@ describe('applyFleet', () => {
     // recovery artifact, exactly like a `created`-then-gate-2-failed agent
     // would (see `apply-agent.ts`'s "gate 1→2 window" doc).
     expect(encryptCalls).toHaveLength(3);
-    expect(encryptCalls.map((c) => c.outPath.includes('recovery'))).toEqual([true, true, false]);
-    const recoveryCalls = encryptCalls.filter((c) => c.outPath.includes('recovery'));
-    const finalVaultCall = encryptCalls.find((c) => !c.outPath.includes('recovery'));
+    // macf#988: `encrypt` is called with a TEMP sibling for a recovery
+    // write (atomic-write tail — see `writeAgentRecoveryArtifact`'s doc),
+    // never for the final vault write — `.tmp-` is now the discriminator
+    // (recovery paths no longer contain the literal word "recovery"; see
+    // `operatorRecoveryArtifactPath`'s new `<recoveryRootDir>/<fleet>/<role>.age` shape).
+    expect(encryptCalls.map((c) => c.outPath.includes('.tmp-'))).toEqual([true, true, false]);
+    const recoveryCalls = encryptCalls.filter((c) => c.outPath.includes('.tmp-'));
+    const finalVaultCall = encryptCalls.find((c) => !c.outPath.includes('.tmp-'));
     const codeAgentRecoveryCall = recoveryCalls.find((c) => c.outPath.includes('code-agent'));
     const runnerOpsRecoveryCall = recoveryCalls.find((c) => c.outPath.includes('runner-ops'));
-    expect(codeAgentRecoveryCall?.outPath).toMatch(/secrets[/\\]recovery[/\\]code-agent\.age$/);
+    expect(codeAgentRecoveryCall?.outPath).toMatch(/demo-fleet[/\\]\.code-agent\.age\.tmp-/);
     expect(codeAgentRecoveryCall?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_ID');
-    expect(runnerOpsRecoveryCall?.outPath).toMatch(/secrets[/\\]recovery[/\\]runner-ops\.age$/);
+    expect(runnerOpsRecoveryCall?.outPath).toMatch(/demo-fleet[/\\]\.runner-ops\.age\.tmp-/);
     expect(finalVaultCall?.plaintext).toContain('CODE_AGENT'); // the freshly-created agent's segment
     expect(finalVaultCall?.plaintext).not.toContain('SCIENCE_AGENT_CLIENT_SECRET'); // reused agent contributes NO fresh secret
     expect(finalVaultCall?.plaintext).not.toContain('MACF_RUNNER_OPS_'); // failed gate-2 -> never folded into the final vault
@@ -711,7 +746,11 @@ describe('applyFleet', () => {
       },
     };
 
-    const recoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'code-agent.age');
+    // macf#988 — <recoveryRootDir>/<fleet>/<role>.age, NOT under `secrets/recovery/`
+    // (that nesting was the per-run control-repo-checkout derivation this
+    // fix removes — see `baseDeps`'s doc for why `recoveryRootDir` here is
+    // the SAME `dirname(manifestPath)` this file's OTHER paths already use).
+    const recoveryPath = join(join(manifestPath, '..'), 'demo-fleet', 'code-agent.age');
     const result = await applyFleet(manifest, manifestPath, null, realDeps);
 
     expect(result.agents[0]?.identity.status).toBe('created');
@@ -733,7 +772,12 @@ describe('applyFleet', () => {
       vaultDeps: {
         exists: () => false,
         encrypt: async (plaintext, _recipients, outPath) => {
-          if (outPath.includes('recovery')) {
+          // macf#988 — a recovery write always goes through a TEMP sibling
+          // (`writeAgentRecoveryArtifact`'s atomic-write tail); `.tmp-` is
+          // now the discriminator (the temp path no longer contains the
+          // literal word "recovery" — see `operatorRecoveryArtifactPath`'s
+          // new `<recoveryRootDir>/<fleet>/<role>.age` shape).
+          if (outPath.includes('.tmp-')) {
             writeFileSync(outPath, `FAKE-AGE-CIPHERTEXT\n${plaintext.length.toString()}`);
             return;
           }
@@ -745,7 +789,11 @@ describe('applyFleet', () => {
       },
     };
 
-    const recoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'code-agent.age');
+    // macf#988 — <recoveryRootDir>/<fleet>/<role>.age, NOT under `secrets/recovery/`
+    // (that nesting was the per-run control-repo-checkout derivation this
+    // fix removes — see `baseDeps`'s doc for why `recoveryRootDir` here is
+    // the SAME `dirname(manifestPath)` this file's OTHER paths already use).
+    const recoveryPath = join(join(manifestPath, '..'), 'demo-fleet', 'code-agent.age');
     const result = await applyFleet(manifest, manifestPath, null, realDeps);
 
     expect(result.vault.status).toBe('failed');
@@ -769,7 +817,11 @@ describe('applyFleet', () => {
 
     await applyFleet(manifest, manifestPath, null, deps);
 
-    const recoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'code-agent.age');
+    // macf#988 — <recoveryRootDir>/<fleet>/<role>.age, NOT under `secrets/recovery/`
+    // (that nesting was the per-run control-repo-checkout derivation this
+    // fix removes — see `baseDeps`'s doc for why `recoveryRootDir` here is
+    // the SAME `dirname(manifestPath)` this file's OTHER paths already use).
+    const recoveryPath = join(join(manifestPath, '..'), 'demo-fleet', 'code-agent.age');
     expect(logs.some((l) => l.includes(recoveryPath))).toBe(true);
   });
 
@@ -789,7 +841,11 @@ describe('applyFleet', () => {
 
     const result = await applyFleet(manifest, manifestPath, null, realDeps);
 
-    const recoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'code-agent.age');
+    // macf#988 — <recoveryRootDir>/<fleet>/<role>.age, NOT under `secrets/recovery/`
+    // (that nesting was the per-run control-repo-checkout derivation this
+    // fix removes — see `baseDeps`'s doc for why `recoveryRootDir` here is
+    // the SAME `dirname(manifestPath)` this file's OTHER paths already use).
+    const recoveryPath = join(join(manifestPath, '..'), 'demo-fleet', 'code-agent.age');
     expect(result.agents[0]?.identity.status).toBe('failed');
     if (result.agents[0]?.identity.status === 'failed') {
       expect(result.agents[0].identity.reason).toContain('disk full');
@@ -850,6 +906,12 @@ trust:
         trustDeps: trustDepsFor(),
         routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
         controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
+        // macf#988 — this test reaches `status: 'created'` with NO
+        // `recoveryRootDir` override would default to the REAL operator's
+        // `~/.config/macf/recovery` (this test's `deps` is hand-built, not
+        // spread from `baseDeps`) — pin it to the SAME tracked tmpdir every
+        // other path in this test already uses.
+        recoveryRootDir: join(manifestPath, '..'),
         now: () => new Date('2026-08-11T00:00:00.000Z'),
         log: () => {},
       };
@@ -875,6 +937,130 @@ trust:
       const strangerKey = mintAgeKey(dir, 'stranger-key.txt');
       const decryptStranger = spawnSync('age', ['-d', '-i', strangerKey.keyPath, result.vault.path], { encoding: 'utf-8' });
       expect(decryptStranger.status).not.toBe(0);
+    },
+  );
+
+  // --- macf#988 — THE DECISIVE crash-recovery test (DR-043 Amendment B) ---
+
+  it.skipIf(!HAS_AGE)(
+    'THE DECISIVE CRASH-RECOVERY TEST: a recovery artifact staged by an ABANDONED prior run (killed between App ' +
+      'creation and vault compose) is found + consumed by a FRESH apply — the credential reaches the vault WITHOUT ' +
+      "gate 1 (or the collision-refusal it would otherwise hit) EVER firing again for that role — and no NEW App is created",
+    async () => {
+      const manifestPath = manifestPathIn();
+      // Deliberately a SEPARATE tmpdir from the control-repo checkout
+      // (`dirname(manifestPath)`) — the whole point of macf#988 is that the
+      // recovery artifact survives OUTSIDE whatever directory a run's own
+      // checkout happens to be, so this test proves the CONSUME side reads
+      // from a genuinely independent, durable location.
+      const recoveryRootDir = mkdtempSync(join(tmpdir(), 'macf-crash-recovery-root-'));
+      dirs.push(recoveryRootDir);
+      const operatorKey = mintAgeKey(recoveryRootDir, 'operator-key.txt');
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT], [operatorKey.publicKey]);
+
+      // --- Step 1: simulate the ABANDONED prior run ---
+      // Gate 1 succeeded for 'code-agent' — a REAL App was created on
+      // GitHub, its credential durably recorded (DR-043 Amendment B,
+      // "durable before gate 2") — then the PROCESS ITSELF was lost before
+      // the batched vault compose ever ran (so NO fleet.lock entry exists
+      // for this role — a lock entry requires a successful compose). There
+      // is no clean way to simulate a SIGKILL through async/await; calling
+      // `writeAgentRecoveryArtifact` directly — the exact primitive
+      // `apply-agent.ts` invokes right after gate 1 — stages the ONE
+      // observable trace a real crash leaves behind: the artifact's
+      // presence on disk. This deliberately does NOT go through
+      // `applyFleet` at all for "run 1".
+      const ABANDONED_CREDS: AppCredentials = {
+        appId: 'abandoned-app-id',
+        name: 'demo-fleet-code-agent',
+        slug: 'demo-fleet-code-agent',
+        clientId: 'Iv1.abandoned',
+        clientSecret: 'SENTINEL-ABANDONED-CLIENT-SECRET',
+        webhookSecret: 'SENTINEL-ABANDONED-WEBHOOK-SECRET',
+        pem: '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-ABANDONED-PEM\n-----END RSA PRIVATE KEY-----\n',
+      };
+      const artifactPath = operatorRecoveryArtifactPath(recoveryRootDir, 'demo-fleet', 'code-agent');
+      await writeAgentRecoveryArtifact('code-agent', ABANDONED_CREDS, [operatorKey.publicKey], artifactPath);
+      expect(existsSync(artifactPath)).toBe(true);
+      // 0600 + genuinely encrypted (age magic bytes) — proof this "abandoned
+      // run" artifact is exactly as durable/secure as a live one.
+      const artifactBytes = readFileSync(artifactPath);
+      expect(artifactBytes.toString('utf-8').startsWith('age-encryption.org/v1')).toBe(true);
+
+      // --- Step 2: a FRESH apply, priorLock === null (no fleet.lock entry
+      // exists ANYWHERE for either role — exactly the post-crash state). ---
+      const gate1Calls: string[] = [];
+      const collisionCalls: string[] = [];
+      const agentDeps: AgentApplyDeps = {
+        startManifestFlow: async (opts) => {
+          gate1Calls.push(opts.buildManifest('http://x/callback').name);
+          return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
+        },
+        startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+        exchangeManifestCode: async () => creds('science-agent'), // only a role WITHOUT a recovery artifact ever reaches this
+        waitForAppInstallation: async (opts) => ({
+          appId: opts.appId,
+          installId: 'install-x',
+          appSlug: opts.expected.appSlug ?? '',
+          accountLogin: 'groundnuty',
+          repositorySelection: 'selected',
+        }),
+        confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
+        // Would REFUSE code-agent before gate 1 if ever reached — the exact
+        // macf#988 reproduction shape ("REFUSED before consent gate 1 —
+        // already exists but is not in this fleet's vault"). Proves the
+        // recovery-consume check runs BEFORE this pre-flight, not just
+        // before gate 1 itself.
+        checkAppNameCollision: async (_owner, appSlug) => {
+          collisionCalls.push(appSlug);
+          return 'present';
+        },
+        openUrl: async () => {},
+        log: () => {},
+        writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless — see agentDepsFor's comment
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDeps, manifestPath),
+        // No `encrypt` override — the FINAL vault is REAL `age`-encrypted
+        // (unlike `baseDeps`'s own fake) so this test can decrypt it with
+        // the operator's REAL key below and prove the recovered credential
+        // genuinely round-tripped, not merely that orchestration ran.
+        vaultDeps: { exists: () => false },
+        recoveryRootDir,
+        identityKeyPath: operatorKey.keyPath,
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      // THE DECISIVE ASSERTION — code-agent's gate 1 (and the collision
+      // pre-flight that would otherwise refuse it) were NEVER invoked.
+      // (science-agent legitimately DOES reach both — it has no staged
+      // recovery artifact — so this checks the ABSENCE of one specific
+      // name, not "neither seam fired at all this run.")
+      expect(gate1Calls).not.toContain('demo-fleet-code-agent');
+      expect(collisionCalls).not.toContain('demo-fleet-code-agent');
+
+      // The RECOVERED credential (not a freshly-minted one) reached the vault.
+      const codeAgentRecord = result.agents.find((a) => a.role === 'code-agent');
+      expect(codeAgentRecord?.identity.status).toBe('created');
+      if (codeAgentRecord?.identity.status === 'created') {
+        expect(codeAgentRecord.identity.appId).toBe(ABANDONED_CREDS.appId);
+      }
+      expect(result.vault.status).toBe('written');
+      if (result.vault.status === 'written') {
+        const d = spawnSync('age', ['-d', '-i', operatorKey.keyPath, result.vault.path], { encoding: 'utf-8' });
+        expect(d.status, d.stderr).toBe(0);
+        expect(d.stdout).toContain("MACF_AGENT_DEMO_FLEET_CODE_AGENT_APP_ID='abandoned-app-id'");
+        expect(d.stdout).toContain('MACF_AGENT_DEMO_FLEET_CODE_AGENT_PRIVATE_KEY_B64=');
+      }
+
+      // fleet.lock now carries a REAL entry for the recovered role.
+      const lock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
+      expect(lock.agents.find((a) => a.role === 'code-agent')?.app_id).toBe('abandoned-app-id');
+
+      // Successful compose deletes the now-redundant recovery artifact —
+      // its credential has a durable home in the vault of record now.
+      expect(existsSync(artifactPath)).toBe(false);
     },
   );
 
@@ -965,12 +1151,15 @@ trust:
     const deps: FleetApplyDeps = {
       buildAgentDeps: () => roleTrackingAgentDeps('demo-fleet', calls),
       repoInitDeps: { cloneRepo: async () => {}, commitAndPush: async () => 'pushed' },
-      vaultDeps: { exists: () => false, encrypt: async () => {} },
+      // macf#988 — must write a real file (see `baseDeps`'s identical comment).
+      vaultDeps: { exists: () => false, encrypt: async (_plaintext, _recipients, outPath) => writeFileSync(outPath, 'FAKE-CIPHERTEXT') },
       controlRepoDeps,
       agentRepoDeps,
       trustDeps,
       routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
       controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
+      // macf#988 — see the "REAL age binary" test's identical comment above.
+      recoveryRootDir: join(manifestPath, '..'),
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
     };
@@ -1229,6 +1418,11 @@ trust:
       trustDeps: trustDepsFor(),
       routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
       controlRepoOptions: { makeScratchDir: () => controlDir },
+      // macf#988 — defense-in-depth (this test's empty `age_recipients: []`
+      // fixture means no recovery write is actually reachable here, but see
+      // the "REAL age binary" test's identical comment for why every
+      // hand-built `FleetApplyDeps` in this file pins this anyway).
+      recoveryRootDir: controlDir,
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
     };
@@ -2500,8 +2694,10 @@ trust:
         buildAgentDeps: (log) => ({ ...agentDeps, log }),
         vaultDeps: {
           exists: () => false,
+          // macf#988 — `.tmp-` (not "recovery") is now the discriminator;
+          // see the earlier recovery-lifecycle tests' identical comment.
           encrypt: async (plaintext, _recipients, outPath) => {
-            events.push(outPath.includes('recovery') ? `recovery-write:${outPath}` : 'final-vault-write');
+            events.push(outPath.includes('.tmp-') ? `recovery-write:${outPath}` : 'final-vault-write');
             writeFileSync(outPath, `FAKE-AGE-CIPHERTEXT\n${plaintext.length.toString()}`);
           },
         },
@@ -2524,7 +2720,8 @@ trust:
       // testing deletion order among peers, just "insurance outlives the
       // gate it was insuring against").
       expect(rrRecoveryIdx).toBeLessThan(finalVaultIdx);
-      const rrRecoveryPath = join(join(manifestPath, '..'), 'secrets', 'recovery', 'runner-ops.age');
+      // macf#988 — see the earlier recovery-lifecycle tests' identical comment.
+      const rrRecoveryPath = join(join(manifestPath, '..'), 'demo-fleet', 'runner-ops.age');
       expect(existsSync(rrRecoveryPath)).toBe(false); // removed post-successful-compose
     });
 
@@ -3016,7 +3213,12 @@ trust:
         // recovery artifact write must succeed cleanly; the scenario this
         // test isolates is specifically "CA pending, no --identity-key",
         // not an incidental runner-ops recovery-write failure.
-        vaultDeps: { exists: () => true, encrypt: async () => {} },
+        // macf#988 made the recovery-artifact write ATOMIC (encrypt -> tmp,
+        // chmod, rename). A no-op `encrypt` leaves no tmp file for the rename,
+        // so the artifact write — and therefore the identity — would fail for
+        // a reason this test is not about. Materialize the file the real
+        // rename expects; the FINAL compose is still the thing made to fail.
+        vaultDeps: { exists: () => true, encrypt: async (_pt, _r, outPath) => { writeFileSync(outPath, 'fake-encrypted'); } },
         // identityKeyPath deliberately OMITTED
       };
 
@@ -3042,7 +3244,12 @@ trust:
         // artifact write (a separate seam, `vaultDeps.encrypt`) must succeed
         // so gate 1 + gate 2 resolve to 'created' cleanly; only the FINAL
         // batched compose (`vaultComposeDeps`, below) is meant to fail here.
-        vaultDeps: { exists: () => true, encrypt: async () => {} },
+        // macf#988 made the recovery-artifact write ATOMIC (encrypt -> tmp,
+        // chmod, rename). A no-op `encrypt` leaves no tmp file for the rename,
+        // so the artifact write — and therefore the identity — would fail for
+        // a reason this test is not about. Materialize the file the real
+        // rename expects; the FINAL compose is still the thing made to fail.
+        vaultDeps: { exists: () => true, encrypt: async (_pt, _r, outPath) => { writeFileSync(outPath, 'fake-encrypted'); } },
         identityKeyPath: '/fake/operator-key.txt', // supplied -> gate 1/2 proceed, compose IS attempted
         vaultComposeDeps: {
           exists: () => true, // composeAndWriteVault's OWN readVault pre-flight also needs to see "the vault exists"
@@ -3078,7 +3285,12 @@ trust:
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         trustDeps: reuseTrustDeps(),
-        vaultDeps: { exists: () => true, encrypt: async () => {} }, // see the sibling test's comment on why `encrypt` (not just `exists`) is faked
+        // macf#988 made the recovery-artifact write ATOMIC (encrypt -> tmp,
+        // chmod, rename). A no-op `encrypt` leaves no tmp file for the rename,
+        // so the artifact write — and therefore the identity — would fail for
+        // a reason this test is not about. Materialize the file the real
+        // rename expects; the FINAL compose is still the thing made to fail.
+        vaultDeps: { exists: () => true, encrypt: async (_pt, _r, outPath) => { writeFileSync(outPath, 'fake-encrypted'); } }, // see the sibling test's comment on why `encrypt` (not just `exists`) is faked
         identityKeyPath: '/fake/operator-key.txt',
         vaultRecipientDeps: {
           readRecipientCount: () => ({ status: 'counted', count: 2 }), // vault currently has 2 — MORE than declared
@@ -3110,7 +3322,12 @@ trust:
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         buildAgentDeps: (log) => ({ ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), log }),
         trustDeps: reuseTrustDeps(),
-        vaultDeps: { exists: () => true, encrypt: async () => {} }, // fakes the pre-gate-2 recovery-artifact encrypt too
+        // macf#988 made the recovery-artifact write ATOMIC (encrypt -> tmp,
+        // chmod, rename). A no-op `encrypt` leaves no tmp file for the rename,
+        // so the artifact write — and therefore the identity — would fail for
+        // a reason this test is not about. Materialize the file the real
+        // rename expects; the FINAL compose is still the thing made to fail.
+        vaultDeps: { exists: () => true, encrypt: async (_pt, _r, outPath) => { writeFileSync(outPath, 'fake-encrypted'); } }, // fakes the pre-gate-2 recovery-artifact encrypt too
         identityKeyPath: '/fake/operator-key.txt',
         vaultComposeDeps: {
           exists: () => true, // composeAndWriteVault's OWN readVault pre-flight also needs to see "the vault exists"
