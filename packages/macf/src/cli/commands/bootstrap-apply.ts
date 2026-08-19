@@ -84,6 +84,12 @@ import { defaultOperatorRecoveryRootDir, operatorRecoveryArtifactPath } from '..
 import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflight.js';
 import type { RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
 import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
+import type { ApplyDeployPhaseDeps, DeployPhaseAgentResult } from '../bootstrap/apply-deploy.js';
+import { anyDeployFailed, runApplyDeployPhase } from '../bootstrap/apply-deploy.js';
+import { realAuthenticatedCloneRepo, realMintCloneToken } from '../bootstrap/fleet-deploy.js';
+import { outcomeToJson as fleetDeployOutcomeToJson } from './fleet-deploy.js';
+import { initAgent as realInitAgent } from './init.js';
+import { agentCertPath, agentKeyPath } from '../config.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -126,6 +132,22 @@ export interface RunBootstrapApplyOptions {
    * own doc).
    */
   readonly runnerToken?: string;
+  /**
+   * `--no-deploy` (macf#1013) — commander's `--no-<flag>` convention: the
+   * CLI registration carries NO explicit 3rd-arg default (macf#347 — a
+   * `--no-` flag with an explicit default silently pins the option
+   * always-true/always-false regardless of what's on the command line), so
+   * `opts.deploy` is `true` unless `--no-deploy` was actually passed.
+   * `undefined` here (a caller that never set the field at all, e.g. every
+   * pre-#1013 test) behaves identically to `true` — deploy is attempted by
+   * default, per the operator's own directive: *"Deployment should be
+   * default, definitely."* Explicit `false` restores the pre-#1013,
+   * GitHub-phase-only behaviour byte-for-byte — for multi-host fleets, and
+   * for operators who want the two phases apart (the operator's own words:
+   * *"I very much like and respect this separation"* — `--no-deploy` is how
+   * that separation stays available, not how it's removed).
+   */
+  readonly deploy?: boolean;
 }
 
 export interface BootstrapApplyDeps {
@@ -155,6 +177,33 @@ export interface BootstrapApplyDeps {
    * injectable-`exists` parameter in this same file.
    */
   readonly checkDeployPathExists?: (path: string) => boolean;
+  /**
+   * Injectable deploy-phase deps (macf#1013) — the SAME `ApplyDeployPhaseDeps`
+   * shape `apply-deploy.ts::runApplyDeployPhase` takes (which itself mirrors
+   * `commands/fleet-deploy.ts::FleetDeployCommandDeps`). `undefined` (the
+   * production default) resolves to REAL functions — see
+   * `resolveApplyDeployDeps()` below: real network clone, a real minted
+   * installation token, the real `macf init`. **Tests that reach the deploy
+   * phase (vault flags given, `opts.deploy !== false`, control repo not
+   * aborted) MUST override this to hermetic fakes** — same "tests MUST
+   * override" posture `FleetDeployDeps.mintCloneToken`'s own doc establishes
+   * for `commands/fleet-deploy.ts`'s tests; the fixture `deploy_path`s in
+   * this file's tests are real-looking absolute paths (`/home/ubuntu/repos/
+   * demo-code`), never a scratch dir, precisely so a forgotten override here
+   * fails loud (real clone / real CA-materialize under the actual test
+   * runner's home dir) rather than silently touching a real path.
+   */
+  readonly deployDeps?: ApplyDeployPhaseDeps;
+  /**
+   * Ground-truth mTLS-cert-present check for the "Next step: launch" render
+   * (macf#1013 requirement 5 — "the final output names `./claude.sh`, not
+   * `fleet deploy`, for a fully-deployed local fleet"). Mirrors
+   * `commands/fleet-deploy.ts::FleetDeployCommandDeps.checkAgentCertPresent`'s
+   * own doc + default exactly (`agentCertPath`/`agentKeyPath(destDir)`
+   * existence) — checked AFTER the deploy phase, reflecting whatever
+   * actually landed on disk regardless of which path produced it.
+   */
+  readonly checkAgentCertPresent?: (destDir: string) => boolean;
 }
 
 /** Extends `apply-fleet.ts`'s `FleetApplyDeps` with the three apply-CLI-level seams: the plan-approval prompt, the prior-lock read, and vault-scratch cleanup. */
@@ -793,6 +842,97 @@ export function resolveMutateDeps(
   };
 }
 
+// --- Deploy phase (macf#1013) — production deps + rendering ---
+
+/**
+ * Real deploy-phase deps — the SAME real functions `commands/fleet-deploy.ts::resolveDeps`
+ * wires for a standalone `macf fleet deploy` call (`readVault` is this file's
+ * OWN existing import, already shared with the vault-aware confirm-before-
+ * create preview above). Never invoked when `BootstrapApplyDeps.deployDeps`
+ * was supplied (tests) — only the production CLI path (no `deps` argument
+ * at all) reaches this.
+ */
+function resolveApplyDeployDeps(): ApplyDeployPhaseDeps {
+  return {
+    readVault,
+    cloneRepo: realAuthenticatedCloneRepo,
+    initAgent: realInitAgent,
+    mintCloneToken: realMintCloneToken,
+  };
+}
+
+/** Real ground-truth cert-present check — mirrors `commands/fleet-deploy.ts::nextStepLines`'s own default exactly. */
+function defaultCheckAgentCertPresent(destDir: string): boolean {
+  return existsSync(agentCertPath(destDir)) && existsSync(agentKeyPath(destDir));
+}
+
+/**
+ * Bundles the deploy phase's render inputs (macf#1013) — `undefined` as a
+ * WHOLE (never passed to {@link formatApplyResult}/{@link fleetApplyResultToJson})
+ * means the phase was never attempted at all (`--no-deploy`, or the control
+ * repo itself aborted): renders NOTHING new, byte-identical to pre-#1013
+ * output (requirement 3). Exactly one of `results`/`skipReason` is set when
+ * this IS passed — `results` for an attempted run (deployed/failed per
+ * agent), `skipReason` for the loud "deploy needs the vault" refusal
+ * (requirement: "skip with a loud, explicit reason, never silently").
+ */
+export interface DeployPhaseRenderInput {
+  readonly results?: readonly DeployPhaseAgentResult[];
+  readonly skipReason?: string;
+  readonly checkAgentCertPresent?: (destDir: string) => boolean;
+}
+
+/**
+ * Human render of the deploy phase itself (macf#1013) — deployed/failed per
+ * agent, or the skip banner. Distinct from {@link launchNextStepLines} below
+ * (the "what to do now" section, requirement 5) — this section is "what
+ * just happened."
+ */
+function deployPhaseSummaryLines(deployPhase: DeployPhaseRenderInput): string[] {
+  if (deployPhase.skipReason !== undefined) {
+    return ['', `⚠ ${deployPhase.skipReason}`];
+  }
+  const results = deployPhase.results ?? [];
+  if (results.length === 0) return [];
+  const lines: string[] = ['', 'Deploy phase (macf#1013 — runs after the GitHub phase above):'];
+  for (const r of results) {
+    lines.push(
+      r.outcome.status === 'deployed'
+        ? `  • ${r.role}: DEPLOYED — workspace ${r.outcome.workspace === 'cloned' ? 'cloned' : 'already present (not re-cloned)'} at ${r.destDir}`
+        : `  • ${r.role}: FAILED — ${r.outcome.reason}`,
+    );
+  }
+  return lines;
+}
+
+/**
+ * The operator's concrete next step (macf#1013 requirement 5 — "the end of
+ * the output is the operator's next step... for a fully-deployed local
+ * fleet that is the `./claude.sh` launch command per agent, not a `fleet
+ * deploy` command"). Only ever names `./claude.sh` for an agent THIS run's
+ * deploy phase reported `'deployed'` — never for an agent `remainingDeploy`
+ * (computed separately, AFTER the deploy phase, from real on-disk state)
+ * still lists as missing, so the two sections can never disagree about the
+ * SAME agent (a deployed agent's `deploy_path` exists on disk by the time
+ * `remainingDeploy` runs, so it is silently absent from that report — see
+ * `remaining-deploy.ts`'s own "silent when nothing applies" convention).
+ */
+function launchNextStepLines(deployPhase: DeployPhaseRenderInput): string[] {
+  const results = deployPhase.results ?? [];
+  const deployed = results.filter((r) => r.outcome.status === 'deployed');
+  if (deployed.length === 0) return [];
+  const checkAgentCertPresent = deployPhase.checkAgentCertPresent ?? defaultCheckAgentCertPresent;
+  const lines: string[] = ['', 'Next step — launch the deployed agent(s):'];
+  for (const r of deployed) {
+    lines.push(
+      checkAgentCertPresent(r.destDir)
+        ? `  cd ${r.destDir} && ./claude.sh`
+        : `  ⚠ ${r.role}: no mTLS cert at ${r.destDir} yet — check the deploy phase output above before launching.`,
+    );
+  }
+  return lines;
+}
+
 // --- Apply-result rendering (never a credential value) ---
 
 export const FLEET_APPLY_JSON_SCHEMA_VERSION = 1;
@@ -972,17 +1112,25 @@ function routingClientSummaryLines(result: FleetApplyResult): string[] {
  * thread it through keep compiling and rendering byte-identically.
  *
  * `remainingDeploy` (macf#1014) is `remaining-deploy.ts::computeRemainingDeploy`'s
- * output — which declared agents have no local workspace yet, appended as
- * the LAST section (after the "what apply didn't implement" gap, above)
- * since it's the final "what remains, period" note. Defaults to `{ steps: [] }`
- * (silent — `formatRemainingDeployLines` renders no lines at all for an
- * empty `steps`) so every existing 2-arg call site keeps compiling and
- * rendering byte-identically.
+ * output — which declared agents have no local workspace yet. Defaults to
+ * `{ steps: [] }` (silent — `formatRemainingDeployLines` renders no lines at
+ * all for an empty `steps`) so every existing 2-arg call site keeps
+ * compiling and rendering byte-identically.
+ *
+ * `deployPhase` (macf#1013) is `undefined` by default — the ENTIRE deploy
+ * phase (`--no-deploy`, or the control repo aborted) — so every existing
+ * 3-arg call site keeps compiling and rendering BYTE-IDENTICALLY
+ * (requirement 3: "`--no-deploy` restores today's behaviour"). When given,
+ * it renders as the LAST two sections, in order: "what the deploy phase
+ * just did" ({@link deployPhaseSummaryLines}), then "what to do now"
+ * ({@link launchNextStepLines}) — deliberately AFTER `remainingDeploy`
+ * (requirement 5: "the end of the output is the operator's next step").
  */
 export function formatApplyResult(
   result: FleetApplyResult,
   unimplemented: readonly UnimplementedApplyItem[] = [],
   remainingDeploy: RemainingDeployReport = { steps: [] },
+  deployPhase?: DeployPhaseRenderInput,
 ): string {
   const parts: string[] = [
     `Control repo: ${formatControlRepoLine(result)}`,
@@ -1028,6 +1176,10 @@ export function formatApplyResult(
   if (remainingDeployLines.length > 0) {
     parts.push('', ...remainingDeployLines);
   }
+  if (deployPhase !== undefined) {
+    parts.push(...deployPhaseSummaryLines(deployPhase));
+    parts.push(...launchNextStepLines(deployPhase));
+  }
   return parts.join('\n');
 }
 
@@ -1068,6 +1220,34 @@ function remainingDeployStepToJson(step: RemainingDeployStep): unknown {
 }
 
 /**
+ * `DeployPhaseAgentResult` → the `--json` snake_case shape (macf#1013).
+ * Reuses `commands/fleet-deploy.ts::outcomeToJson` verbatim for the
+ * `FleetDeployOutcome` fields (role/status/app_id/install_id/workspace/
+ * key_path/key_write/key_fingerprint/ca/cert_issue, or role/status/reason
+ * on failure) — the SAME redaction `macf fleet deploy --json` already
+ * applies, never a second, possibly-diverging one — and adds only
+ * `workspace_dir` (the resolved absolute path) plus, when deployed AND a
+ * cert is present, the copy-pasteable `next_step` command (symmetry with
+ * `remainingDeployStepToJson`'s own `command` field).
+ */
+function deployPhaseResultToJson(r: DeployPhaseAgentResult, checkAgentCertPresent: (destDir: string) => boolean): unknown {
+  const base = { ...(fleetDeployOutcomeToJson(r.outcome) as Record<string, unknown>), workspace_dir: r.destDir };
+  if (r.outcome.status !== 'deployed') return base;
+  return {
+    ...base,
+    next_step: checkAgentCertPresent(r.destDir) ? `cd ${r.destDir} && ./claude.sh` : null,
+  };
+}
+
+/** `DeployPhaseRenderInput` → the `--json` `deploy_phase` key (macf#1013). `undefined` in, `undefined` out (the caller omits the whole key — see {@link fleetApplyResultToJson}'s doc). */
+function deployPhaseToJson(deployPhase: DeployPhaseRenderInput | undefined): unknown {
+  if (deployPhase === undefined) return undefined;
+  if (deployPhase.skipReason !== undefined) return { attempted: false, reason: deployPhase.skipReason };
+  const checkAgentCertPresent = deployPhase.checkAgentCertPresent ?? defaultCheckAgentCertPresent;
+  return { attempted: true, results: (deployPhase.results ?? []).map((r) => deployPhaseResultToJson(r, checkAgentCertPresent)) };
+}
+
+/**
  * Structured `--json` render. Never a credential value — only status/id/path/
  * reason fields (see {@link redactIdentity}). `unimplemented` is the plan's
  * `unimplementedByApply` (macf#854); defaults to `[]` so existing
@@ -1082,11 +1262,18 @@ function remainingDeployStepToJson(step: RemainingDeployStep): unknown {
  * `registry_scope_issues` precedent (macf#999/macf#1010): a fully-deployed
  * fleet's `--json` output must stay byte-identical to its pre-#1014 shape,
  * which an unconditional new key would not be.
+ *
+ * `deployPhase` (macf#1013) defaults to `undefined` — `deploy_phase` is
+ * OMITTED ENTIRELY (never present-but-empty) whenever the deploy phase was
+ * never attempted at all (`--no-deploy`, or the control repo aborted), same
+ * omit-when-N/A convention `remaining_deploy` above already established —
+ * every existing 2-arg call site's `--json` output stays byte-identical.
  */
 export function fleetApplyResultToJson(
   result: FleetApplyResult,
   unimplemented: readonly UnimplementedApplyItem[] = [],
   remainingDeploy: RemainingDeployReport = { steps: [] },
+  deployPhase?: DeployPhaseRenderInput,
 ): unknown {
   return {
     schema_version: FLEET_APPLY_JSON_SCHEMA_VERSION,
@@ -1124,6 +1311,7 @@ export function fleetApplyResultToJson(
       cert_legs: { ...result.routingClient.certLegs },
       key_legs: { ...result.routingClient.keyLegs },
     },
+    ...(deployPhase !== undefined ? { deploy_phase: deployPhaseToJson(deployPhase) } : {}),
   };
 }
 
@@ -1136,9 +1324,12 @@ export function fleetApplyResultToJson(
  * operator attention (failed/drift/skipped-unverified/repo-init-failed), OR
  * the runner-ops App needs operator attention (groundnuty/macf#943 —
  * same failed/drift/skipped-unverified bar as an agent), OR the vault write
- * failed.
+ * failed, OR ANY agent's deploy-phase attempt failed (macf#1013 requirement
+ * 4 — "partial failure exits non-zero"; `deployResults` defaults to `[]`,
+ * matching "the deploy phase was never attempted" — see
+ * `anyDeployFailed`'s own doc).
  */
-export function applyExitCode(result: FleetApplyResult): number {
+export function applyExitCode(result: FleetApplyResult, deployResults: readonly DeployPhaseAgentResult[] = []): number {
   const controlRepoBad =
     result.controlRepo.status === 'foreign' || result.controlRepo.status === 'failed' || result.controlRepo.status === 'archived';
   const controlRepoSyncBad = result.controlRepoSync.status === 'failed';
@@ -1200,7 +1391,8 @@ export function applyExitCode(result: FleetApplyResult): number {
     result.vault.status === 'failed' ||
     caBad ||
     routingBad ||
-    routingClientBad
+    routingClientBad ||
+    anyDeployFailed(deployResults)
     ? 1
     : 0;
 }
@@ -1453,17 +1645,65 @@ export async function runBootstrapApply(
       // misleading noise alongside it.
       const controlRepoAborted =
         result.controlRepo.status === 'foreign' || result.controlRepo.status === 'failed' || result.controlRepo.status === 'archived';
+
+      // macf#1013 — the default deploy phase. Operator directive quoted
+      // verbatim in the issue: *"Deployment should be default, definitely."*
+      // Runs AFTER the GitHub phase above (`applyFleet`) and BEFORE
+      // `computeRemainingDeploy` below, so a workspace this phase just
+      // materialized is reflected as "no longer remaining" rather than
+      // double-reported. Gated off (no attempt, no skip banner — `undefined`
+      // stays `undefined`) on the SAME `controlRepoAborted` condition
+      // `remainingDeploy` itself already suppresses on (deploying is not the
+      // next step when step 0 never completed), and on `--no-deploy`
+      // (`opts.deploy === false`) — both restore byte-identical pre-#1013
+      // output (requirement 3).
+      let deployResults: readonly DeployPhaseAgentResult[] | undefined;
+      let deploySkipReason: string | undefined;
+      if (!controlRepoAborted && opts.deploy !== false) {
+        // Hard constraint (macf#1013): "Deploy needs the vault... if they
+        // are absent, deploying is impossible — skip with a loud, explicit
+        // reason (never silently)." `checkVaultFlagsComplete` at the top of
+        // this function already guarantees `vaultPath`/`identityKeyPath` are
+        // never HALF given by this point — either both are present (deploy
+        // this run), or (this branch) both are absent.
+        if (opts.vaultPath === undefined || opts.identityKeyPath === undefined) {
+          deploySkipReason =
+            `deploy phase SKIPPED for all ${String(manifest.agents.length)} declared agent(s) — deploying needs ` +
+            '--vault + --identity-key (this apply run was invoked without them). Supply both to deploy ' +
+            'automatically next run, or run the per-agent `macf fleet deploy` command(s) named below.';
+        } else {
+          const deployDeps: ApplyDeployPhaseDeps = resolved.deployDeps ?? { ...resolveApplyDeployDeps(), log: stderrLog };
+          deployResults = await runApplyDeployPhase(
+            manifest,
+            { vaultPath: resolvePath(opts.vaultPath), identityPath: resolvePath(opts.identityKeyPath) },
+            deployDeps,
+          );
+        }
+      }
+
       const remainingDeploy: RemainingDeployReport = controlRepoAborted
         ? { steps: [] }
         : computeRemainingDeploy(manifest, manifestPath, opts, resolved.checkDeployPathExists);
+      // macf#1013 + macf#1014 consistency: a SKIP banner on a fleet with
+      // nothing left to deploy is pure noise — "I could not deploy" is a
+      // non-event when every declared agent already has a workspace. Suppress
+      // the skip-only banner in that case so a re-run of a complete fleet
+      // stays silent (macf#1014's no-nagging contract). A skip alongside
+      // genuinely-remaining agents still renders, because there the operator
+      // does need to know why nothing was attempted.
+      const deploySkipIsNoise = deployResults === undefined && remainingDeploy.steps.length === 0;
+      const deployPhase: DeployPhaseRenderInput | undefined =
+        (deployResults === undefined && deploySkipReason === undefined) || deploySkipIsNoise
+          ? undefined
+          : { results: deployResults, skipReason: deploySkipReason, checkAgentCertPresent: resolved.checkAgentCertPresent };
 
       if (opts.json) {
-        console.log(JSON.stringify(fleetApplyResultToJson(result, plan.unimplementedByApply, remainingDeploy), null, 2));
+        console.log(JSON.stringify(fleetApplyResultToJson(result, plan.unimplementedByApply, remainingDeploy, deployPhase), null, 2));
       } else {
         console.log('');
-        console.log(formatApplyResult(result, plan.unimplementedByApply, remainingDeploy));
+        console.log(formatApplyResult(result, plan.unimplementedByApply, remainingDeploy, deployPhase));
       }
-      return applyExitCode(result);
+      return applyExitCode(result, deployResults);
     } finally {
       // macf#913 — a vault-derived scratch PEM must never outlive this run,
       // regardless of how it ends (declined, applyFleet threw, or a clean

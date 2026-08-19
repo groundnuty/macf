@@ -703,6 +703,13 @@ bootstrap
       'MACF_TRUSTED_ACTORS (never substitutes for that live check). Falls back to MACF_BOOTSTRAP_RUNNER_TOKEN ' +
       'when unset. Get one with: gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token',
   )
+  .option(
+    '--no-deploy',
+    'macf#1013 — skip the default per-agent deploy phase that otherwise runs after the GitHub phase above ' +
+      '(needs --vault + --identity-key; without them the deploy phase is skipped anyway, loudly). Restores ' +
+      'the pre-macf#1013 GitHub-only apply, for multi-host fleets (deploy runs per-host via `macf fleet ' +
+      'deploy`) or operators who want the two phases apart.',
+  )
   .action(async (opts) => {
     const code = await runBootstrapApply({
       file: opts.file,
@@ -712,6 +719,7 @@ bootstrap
       vaultPath: opts.vault,
       identityKeyPath: opts.identityKey,
       runnerToken: opts.runnerToken,
+      deploy: opts.deploy,
     });
     process.exitCode = code;
   });

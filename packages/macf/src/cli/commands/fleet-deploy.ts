@@ -121,7 +121,15 @@ function caOutcomeToJson(ca: CaMaterializeOutcome): unknown {
   return ca.status === 'vault-absent' ? { status: ca.status } : { status: ca.status, cert_fingerprint: ca.certFingerprint };
 }
 
-function outcomeToJson(outcome: FleetDeployOutcome): unknown {
+/**
+ * Exported (macf#1013) so `commands/bootstrap-apply.ts`'s default deploy
+ * phase can render the SAME redacted per-agent `--json` shape this file's
+ * own single-agent `macf fleet deploy` already emits, rather than a second,
+ * possibly-diverging redaction of `FleetDeployOutcome` — same "don't
+ * reimplement" posture the module doc's "Golden-path rule" holds for the
+ * deploy LOGIC, applied here to the deploy RENDER.
+ */
+export function outcomeToJson(outcome: FleetDeployOutcome): unknown {
   switch (outcome.status) {
     case 'deployed':
       return {
