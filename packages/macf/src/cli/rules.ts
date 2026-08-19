@@ -178,12 +178,29 @@ const PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT: ReadonlySet<string> = new Set(['mark-
  * individually (not a hard failure) — the target dir is created only if at
  * least one source dir exists and yields a script to copy.
  */
+/**
+ * Scripts that live in the canonical dir for co-location but are REPO-LOCAL
+ * to `groundnuty/macf` — they operate on things a consumer workspace does not
+ * have (`design/decisions/*.md`, the release pipeline), so distributing them
+ * ships dead weight to every fleet. Excluded from `copyCanonicalScripts`
+ * (groundnuty/macf#998).
+ *
+ * `release.sh`/`release.test.sh` were already being distributed before this
+ * set existed; adding them here corrects that rather than preserving it.
+ */
+export const CANONICAL_SCRIPTS_REPO_LOCAL: ReadonlySet<string> = new Set([
+  'check-dr-citations.sh',
+  'check-dr-citations-diff.sh',
+  'release.sh',
+  'release.test.sh',
+]);
+
 export function copyCanonicalScripts(workspaceDir: string, options: {
   readonly canonicalDir?: string;
   readonly pluginScriptsDir?: string;
 } = {}): readonly string[] {
   const sourceDirs: readonly { readonly dir: string; readonly excluded: ReadonlySet<string> }[] = [
-    { dir: options.canonicalDir ?? canonicalScriptsDir(), excluded: new Set() },
+    { dir: options.canonicalDir ?? canonicalScriptsDir(), excluded: CANONICAL_SCRIPTS_REPO_LOCAL },
     { dir: options.pluginScriptsDir ?? canonicalPluginScriptsDir(), excluded: PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT },
   ];
 
