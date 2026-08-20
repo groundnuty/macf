@@ -6,10 +6,9 @@
  * ./claude.sh` as the operator's next step — but that step cannot complete
  * unattended. Claude Code's own "Do you trust this folder?" dialog blocks
  * the FIRST launch of any workspace it has not seen before, and — because
- * `macf-prompt-watcher.sh`'s auto-responder (DR-033, macf#645) watches for a
- * bounded window starting at launch, not from whenever the trust dialog
- * happens to get answered — an operator who is not there within that window
- * can also miss the auto-responder's chance to clear the UNRELATED
+ * `macf-prompt-watcher.sh`'s auto-responder (DR-033, macf#645) has a bounded
+ * total lifetime — an operator who takes long enough to get there can also
+ * miss the auto-responder's chance to clear the UNRELATED
  * `--dangerously-load-development-channels` confirmation, which then also
  * needs a manual answer. Both are silent to `deploy`/`apply`'s own printed
  * output today; this module names them.
@@ -23,13 +22,23 @@
  * example). So on a normally-functioning launch, the operator answers ONLY
  * the trust dialog; the channels confirmation clears itself. The reason it
  * can ALSO need a manual answer is a **timing interaction**, not a second
- * un-auto-answerable prompt: the watcher's deadline is `launch + 90s`
- * (`MACF_PROMPT_WATCH_WINDOW_SECS`), computed once at watcher start — if the
- * trust dialog sits unanswered past that deadline (the common case for an
- * unattended/overnight launch), the watcher process has already exited by
- * the time the channels prompt would appear, and THAT prompt then also
- * needs a human. This module words the channels line conditionally for
- * exactly that reason — never asserting it always appears.
+ * un-auto-answerable prompt.
+ *
+ * **macf#1041 (fixed after #994 shipped):** the watcher's deadline used to be
+ * a FIXED `launch + 90s` (`MACF_PROMPT_WATCH_WINDOW_SECS`), computed once at
+ * watcher start — the unattended/overnight case (nobody answers trust within
+ * 90s of launch) was the NORMAL case, not the exception, so the seeded
+ * auto-response effectively never got the chance to fire. Fixed: the
+ * deadline now RESTARTS on every prompt-relevant signal (a successful
+ * auto-answer, or the still-unanswered trust dialog itself sitting on
+ * screen), bounded by a total lifetime cap
+ * (`MACF_PROMPT_WATCH_TOTAL_CAP_SECS`, default 1800s / 30min) — see that
+ * script's "DEADLINE MODEL" header comment. The channels prompt now
+ * self-clears for any trust-dialog delay up to the cap, not just the first
+ * 90s. This module still words the channels line conditionally (never
+ * asserting it always appears) because the cap, while generous, is still
+ * finite — an operator who is away for materially longer than the cap will
+ * still see it.
  *
  * **The watcher's own refusal is untouched by this module (macf#994 hard
  * constraint).** `macf-prompt-watcher.sh` hard-refuses (Inv 2) any ceremony
@@ -67,15 +76,22 @@ import { readFileSync } from 'node:fs';
 import { agentConfigPath } from '../config.js';
 
 /**
- * `macf-prompt-watcher.sh`'s default startup window in seconds (macf#645) —
- * the wall-clock budget its `dev-channels` auto-responder entry has to catch
- * the channels confirmation before it gives up and exits. Mirrors that
- * script's `MACF_PROMPT_WATCH_WINDOW_SECS` default. Used here only to word
- * an operator-facing HINT ("if more than ~90s pass..."); an operator who
- * customized the env var still sees the guidance, just with the stock
- * number — acceptable for a first-launch hint, not a functional gate.
+ * `macf-prompt-watcher.sh`'s default TOTAL lifetime cap in seconds
+ * (macf#1041) — the outer wall-clock budget the watcher's deadline-extension
+ * mechanism is bounded by, past which its `dev-channels` auto-responder
+ * entry can no longer catch the channels confirmation no matter how much
+ * prompt-relevant activity (e.g. an unanswered trust dialog) keeps
+ * restarting its deadline. Mirrors that script's
+ * `MACF_PROMPT_WATCH_TOTAL_CAP_SECS` default. Used here only to word an
+ * operator-facing HINT ("if unattended for more than ~30 minutes..."); an
+ * operator who customized the env var still sees the guidance, just with the
+ * stock number — acceptable for a first-launch hint, not a functional gate.
+ *
+ * Pre-macf#1041 this named the (much shorter, fixed) per-launch WINDOW —
+ * renamed alongside that fix since the number an operator actually needs to
+ * worry about is now the total cap, not the base window.
  */
-export const DEV_CHANNELS_WATCH_WINDOW_SECS = 90;
+export const DEV_CHANNELS_WATCH_TOTAL_CAP_SECS = 1800;
 
 /**
  * `<project>@<routing-label>` — coordination.md's canonical tmux session
@@ -130,12 +146,14 @@ function readRoutingLabelOrAgentName(destDir: string): string | undefined {
  * answers either prompt — see module doc.
  */
 export function firstLaunchGuidanceHeaderLines(): readonly string[] {
+  const capMinutes = String(Math.round(DEV_CHANNELS_WATCH_TOTAL_CAP_SECS / 60));
   return [
     `  First launch of a workspace needs Claude Code's own "Do you trust this folder?" dialog answered by hand — ` +
-      `once per workspace, never automatically (macf-prompt-watcher deliberately refuses to answer it). If more ` +
-      `than ~${String(DEV_CHANNELS_WATCH_WINDOW_SECS)}s pass before you get there, a one-time "Loading development ` +
-      `channels" confirmation may ALSO need a manual answer (select the local-development option) — its own ` +
-      `auto-responder's watch window can elapse while the trust dialog sits unanswered. Attach to answer either ` +
+      `once per workspace, never automatically (macf-prompt-watcher deliberately refuses to answer it). Once you ` +
+      `answer it, a one-time "Loading development channels" confirmation usually clears itself automatically — ` +
+      `but if you leave the trust dialog unattended for more than ~${capMinutes} minutes, the auto-responder's ` +
+      `watch window can elapse and the channels prompt may ALSO need a manual answer (select the ` +
+      `local-development option). Attach to answer either ` +
       `(detach again with Ctrl-b d; once per workspace, not per relaunch):`,
   ];
 }

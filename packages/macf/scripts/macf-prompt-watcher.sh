@@ -34,7 +34,60 @@
 #
 # Opt-out: MACF_PROMPT_AUTORESPOND_DISABLED=1 (also gated in claude.sh).
 # Tunables: MACF_PROMPT_RESPONSES_PATH, MACF_PROMPT_WATCH_WINDOW_SECS (default 90),
-#           MACF_PROMPT_WATCH_INTERVAL_SECS (default 1).
+#           MACF_PROMPT_WATCH_INTERVAL_SECS (default 1),
+#           MACF_PROMPT_WATCH_TOTAL_CAP_SECS (default 1800 — see below).
+#
+# DEADLINE MODEL (groundnuty/macf#1041 — fixes the #994-discovered defect below):
+#   the pre-#1041 deadline was `launch + WINDOW`, computed ONCE at watcher
+#   start. `macf init` already seeds a `dev-channels` auto-response
+#   (PROMPT_RESPONSES_SEED, @groundnuty/macf-core) matching the channels-
+#   confirmation prompt exactly — so under normal conditions only the trust
+#   dialog needs a human. But the trust dialog is HARD-REFUSED (Inv 2, never
+#   auto-answered) and the unattended/overnight case — nobody attends within
+#   WINDOW (90s) of launch — is the NORMAL case, not the exception: by the
+#   time an operator answers trust, the watcher had already exited on the
+#   fixed deadline, and the channels prompt that follows finds nobody
+#   watching. The invariant that matters: the watcher should be alive while
+#   prompts it can answer are still possible, and a fixed wall-clock window
+#   from LAUNCH does not express that.
+#
+#   Fix: the deadline is `<last prompt-relevant signal> + WINDOW`, RESTARTED
+#   every time the pane shows something the watcher cares about — either a
+#   successful auto-answer (Option 1, "restart on each answered prompt") OR
+#   an unanswerable/unrecognized prompt-like frame it correctly refuses to
+#   touch, e.g. the still-unanswered trust dialog (the generalization to
+#   "last observed [prompt-relevant] activity", Option 2 in #1041). The
+#   trust dialog sitting on screen, unanswered, for 10 minutes IS the signal
+#   that a subsequent prompt (channels) is still possible once it clears —
+#   so its mere continued presence keeps the deadline alive, exactly as
+#   Option 2 generalizes Option 1. This does NOT touch Inv 1/2/3 above: a
+#   longer-lived watcher still only ever auto-answers an allowlisted,
+#   Inv-2-surviving entry — it is simply awake for longer.
+#
+#   Bounded total lifetime (`MACF_PROMPT_WATCH_TOTAL_CAP_SECS`, default 1800s
+#   / 30 min): every recomputed deadline is clamped to `launch + TOTAL_CAP`,
+#   so no amount of prompt-relevant activity keeps the watcher alive past
+#   this hard ceiling — "an idle watcher should still exit" and "no watcher
+#   runs forever" both hold regardless of what the pane keeps showing. 30
+#   minutes is 3x the #1041 acceptance scenario (a trust dialog answered at
+#   t+10min) — generous headroom for a distracted operator while still
+#   finite; tune via the env var if a deployment needs a different bound. A
+#   pane showing nothing prompt-relevant is unaffected and still exits at the
+#   base WINDOW, unchanged from pre-#1041 behavior.
+#
+#   KNOWN TRADE-OFF, not fixed here (#1041 review): there is no pidfile/
+#   flock/instance guard. `claude.sh` backgrounds one watcher per launch
+#   unconditionally. Pre-#1041 (fixed 90s deadline), two watchers could only
+#   overlap on the SAME pane if relaunched within 90s of each other —
+#   effectively never. Post-#1041, the overlap window is as wide as
+#   TOTAL_CAP (1800s default), and a relaunch inside that window commonly
+#   re-attaches the SAME `<project>@<agent>` tmux session/pane (canonical
+#   session-naming, coordination.md), so two live watcher processes could
+#   both match the same frame and both send — the exact "menus advance on
+#   the digit alone" hazard `_handle_match` already guards against
+#   single-process-internally. This widens a pre-existing hazard rather than
+#   introducing a new one, and is left as a follow-up rather than gating
+#   #1041 on a concurrency-control redesign.
 #
 # Fail-open by design: any missing dependency (jq/tmux), missing/invalid config,
 # or empty pane makes the watcher a silent no-op — it never blocks the launch and
@@ -95,6 +148,19 @@ fi
 
 WINDOW="${MACF_PROMPT_WATCH_WINDOW_SECS:-90}"
 INTERVAL="${MACF_PROMPT_WATCH_INTERVAL_SECS:-1}"
+# Total lifetime cap (macf#1041) — the hard ceiling the per-activity deadline
+# below is clamped to, regardless of how much prompt-relevant activity keeps
+# recomputing it. See the file header "DEADLINE MODEL" section.
+TOTAL_CAP="${MACF_PROMPT_WATCH_TOTAL_CAP_SECS:-1800}"
+case "$TOTAL_CAP" in ''|*[!0-9]*) TOTAL_CAP=1800 ;; esac
+# Never let the cap collapse below the base window. Without this floor,
+# MACF_PROMPT_WATCH_TOTAL_CAP_SECS=0 (or any value under WINDOW) would make
+# HARD_DEADLINE <= launch time, so the poll loop's very first condition is
+# already false and the watcher exits without a single poll — a silent
+# second disable path alongside MACF_PROMPT_AUTORESPOND_DISABLED=1 (macf#1041
+# review finding). TOTAL_CAP is a ceiling above the base window, not a
+# switch — use the DISABLED flag to actually disable the watcher.
+[ "$TOTAL_CAP" -lt "$WINDOW" ] && TOTAL_CAP="$WINDOW"
 
 # Inv-2 substring lists — kept in lockstep with PROMPT_{REFUSE,WARN}_SUBSTRINGS
 # in @groundnuty/macf-core prompt-responses.ts.
@@ -293,9 +359,47 @@ _maybe_alert_unknown() { # <frame>
   _alert "UNKNOWN prompt-like frame on pane $PANE not on the allowlist — NOT answering (Inv 1). First line: $(printf '%s' "$1" | grep -m1 -E '❯|\(y/n\)' | sed 's/^[[:space:]]*//' | cut -c1-120)"
 }
 
-# --- poll loop, bounded by the startup window --------------------------------
-now="$(date +%s 2>/dev/null || echo 0)"
-deadline=$((now + WINDOW))
+# --- deadline extension (macf#1041) -------------------------------------
+# LAUNCH_TS/HARD_DEADLINE are fixed once; `deadline` is the live, extendable
+# bound the poll loop actually checks — always clamped to HARD_DEADLINE, so
+# the total cap holds no matter how much activity keeps restarting it.
+LAUNCH_TS="$(date +%s 2>/dev/null || echo 0)"
+HARD_DEADLINE=$((LAUNCH_TS + TOTAL_CAP))
+deadline=$((LAUNCH_TS + WINDOW))
+[ "$deadline" -gt "$HARD_DEADLINE" ] && deadline="$HARD_DEADLINE"
+
+# _extend_deadline — called on prompt-relevant activity (a successful
+# auto-answer OR a still-unanswered/unrecognized prompt-like frame, e.g. the
+# hard-refused trust dialog). Restarts the WINDOW-sized grace period from
+# NOW, clamped to HARD_DEADLINE (macf#1041 Option 1+2). Does nothing —
+# `deadline` is simply left as-is — when the candidate wouldn't move it
+# forward, so an idle pane (no activity) still exits at the original
+# WINDOW-from-launch bound, unchanged from pre-#1041 behavior.
+#
+# EXTENDED_LOGGED gates the forensic log line to ONCE per run (macf#1041
+# review): an unattended prompt sitting on screen re-triggers this every
+# poll (once per INTERVAL, default 1s) for as long as it lingers — up to
+# TOTAL_CAP/INTERVAL times (≈1800 lines at the defaults) into a
+# never-rotated prompt-watcher.log absent this gate. "This watcher outlived
+# its base window" is the one forensically interesting event; "still alive"
+# on every subsequent poll is not. The final "total lifetime cap reached" /
+# "startup window elapsed" line at exit still reports the outcome either way.
+EXTENDED_LOGGED=0
+_extend_deadline() {
+  local t candidate
+  t="$(date +%s 2>/dev/null || echo "$deadline")"
+  candidate=$((t + WINDOW))
+  [ "$candidate" -gt "$HARD_DEADLINE" ] && candidate="$HARD_DEADLINE"
+  if [ "$candidate" -gt "$deadline" ]; then
+    deadline="$candidate"
+    if [ "$EXTENDED_LOGGED" -eq 0 ]; then
+      EXTENDED_LOGGED=1
+      _log INFO "prompt-relevant activity — deadline extended past the base window (hard cap: launch+${TOTAL_CAP}s)"
+    fi
+  fi
+}
+
+# --- poll loop, bounded by the (extendable, capped) deadline -----------------
 while [ "$(date +%s 2>/dev/null || echo "$deadline")" -lt "$deadline" ]; do
   frame="$(_capture)"
   if [ -n "$frame" ]; then
@@ -308,12 +412,19 @@ while [ "$(date +%s 2>/dev/null || echo "$deadline")" -lt "$deadline" ]; do
         break
       fi
     done
-    if [ "$matched" -eq 0 ] && _looks_prompt_like "$frame"; then
+    if [ "$matched" -eq 1 ]; then
+      _extend_deadline
+    elif _looks_prompt_like "$frame"; then
       _maybe_alert_unknown "$frame"
+      _extend_deadline
     fi
   fi
   sleep "$INTERVAL"
 done
 
-_log INFO "startup window elapsed — watcher exiting"
+if [ "$deadline" -ge "$HARD_DEADLINE" ]; then
+  _log INFO "total lifetime cap (${TOTAL_CAP}s from launch) reached — watcher exiting"
+else
+  _log INFO "startup window elapsed with no further prompt-relevant activity — watcher exiting"
+fi
 exit 0

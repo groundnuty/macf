@@ -17,7 +17,7 @@ import {
   firstLaunchSessionName,
   firstLaunchGuidanceHeaderLines,
   firstLaunchAttachLine,
-  DEV_CHANNELS_WATCH_WINDOW_SECS,
+  DEV_CHANNELS_WATCH_TOTAL_CAP_SECS,
 } from '../../../src/cli/bootstrap/first-launch-guidance.js';
 import { writeAgentConfig, agentConfigPath } from '../../../src/cli/config.js';
 
@@ -113,7 +113,12 @@ describe('firstLaunchGuidanceHeaderLines + firstLaunchAttachLine', () => {
     // the channels prompt WILL show up.
     expect(header).toContain('Loading development channels');
     expect(header).toContain('may ALSO need a manual answer');
-    expect(header).toContain(`~${String(DEV_CHANNELS_WATCH_WINDOW_SECS)}s`);
+    // macf#1041: the operator-facing number is now the TOTAL lifetime cap
+    // (minutes), not the old fixed per-launch WINDOW (seconds) — the
+    // channels prompt self-clears for any trust-dialog delay up to the cap.
+    expect(header).toContain(
+      `~${String(Math.round(DEV_CHANNELS_WATCH_TOTAL_CAP_SECS / 60))} minutes`,
+    );
     // Describes the ANSWER conditionally too (a menu-option choice), not a
     // specific keystroke that may not match every Claude Code build's
     // rendering of the prompt.
