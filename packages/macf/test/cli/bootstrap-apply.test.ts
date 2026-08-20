@@ -2295,6 +2295,48 @@ describe('resolveMutateDeps — vault-aware resolveKeyPath + cleanupVaultScratch
   });
 });
 
+// --- resolveMutateDeps — waitForOperatorBeat wiring (groundnuty/macf#952
+// follow-up: give the operator a beat to read the just-printed instructions
+// BEFORE the browser opens) ---
+//
+// The interactive ("press Enter") branch touches real `process.stdin` via
+// `node:readline` — the SAME reason `realOpenUrl`/`realConfirmPlan` above are
+// never invoked for real in this suite (OS/stdin-interactive primitives are
+// pinned by WIRING identity, not by driving a real prompt). The decisive
+// assertion this issue's hard constraint needs — "`--yes` must never hang" —
+// IS safe to drive for real: the `assumeYes: true` branch never touches
+// stdin or stderr at all, so invoking it can't leave a dangling listener.
+
+describe('resolveMutateDeps — waitForOperatorBeat wiring (groundnuty/macf#952 follow-up)', () => {
+  it('is always wired as a function on buildAgentDeps(log), regardless of assumeYes', () => {
+    const withYes = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', undefined, undefined, undefined, undefined, true);
+    const interactive = resolveMutateDeps('/tmp/nonexistent/fleet.yaml');
+    expect(typeof withYes.buildAgentDeps(() => {}).waitForOperatorBeat).toBe('function');
+    expect(typeof interactive.buildAgentDeps(() => {}).waitForOperatorBeat).toBe('function');
+  });
+
+  it('--yes (assumeYes=true): the wired waitForOperatorBeat resolves WITHOUT writing to stderr — no prompt seam is invoked, so it cannot hang an unattended run (the decisive "never hangs" assertion)', async () => {
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', undefined, undefined, undefined, undefined, true);
+      const beat = deps.buildAgentDeps(() => {}).waitForOperatorBeat;
+      await expect(beat?.('code-agent', 'consent gate 1 of 2 (App-manifest form)')).resolves.toBeUndefined();
+      // Zero stderr writes proves the prompt branch (which writes the
+      // "press Enter" line BEFORE ever touching readline) was never reached
+      // — not merely that the promise happened to resolve quickly.
+      expect(stderrSpy).not.toHaveBeenCalled();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('assumeYes omitted (interactive default, undefined -> false): still resolves to a function distinct from the --yes no-op — the interactive real-prompt behavior itself is NOT driven here (would block on real stdin; same convention as realOpenUrl/realConfirmPlan, verified instead via the apply-agent.ts injected-fake ordering tests)', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml');
+    const beat = deps.buildAgentDeps(() => {}).waitForOperatorBeat;
+    expect(typeof beat).toBe('function');
+  });
+});
+
 // --- Pure result-rendering helpers ---
 
 function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult {

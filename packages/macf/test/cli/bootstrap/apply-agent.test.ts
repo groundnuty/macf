@@ -906,6 +906,76 @@ describe('instruction-before-navigation ordering (the decisive test, groundnuty/
   });
 });
 
+// --- groundnuty/macf#952 follow-up — the operator-beat happens AFTER the
+// instructions are logged and BEFORE the browser opens ---
+//
+// The ordering fix above (#962/#974) closed "the requirement only appears in
+// the failure message" — but printing and opening back-to-back left a
+// SEPARATE, live-witnessed gap: "the first instructions were so fast that I
+// didn't notice them at all." These tests assert the THIRD event
+// (`waitForOperatorBeat`) sits strictly BETWEEN the instruction logs and
+// `openUrl` — a test that only checked "beat happened at some point" would
+// pass even if it fired after the browser already had focus, which is
+// exactly the shape of bug this issue is about.
+
+describe('waitForOperatorBeat sits between instructions and openUrl (the decisive ordering test, groundnuty/macf#952 follow-up)', () => {
+  it('gate 1: waitForOperatorBeat is called with the role + gate label AFTER the instructions are logged and BEFORE openUrl(flow.startUrl)', async () => {
+    const events: string[] = [];
+    const deps = baseDeps({
+      log: (line: string) => { events.push(`log:${line}`); },
+      openUrl: async (url: string) => { events.push(`open:${url}`); },
+      waitForOperatorBeat: async (role: string, gateLabel: string) => { events.push(`beat:${role}:${gateLabel}`); },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    const clickInstructionIndex = events.findIndex((e) => e.startsWith('log:') && e.includes('Create GitHub App'));
+    const beatIndex = events.findIndex((e) => e.startsWith(`beat:${AGENT.role}:`) && e.includes('consent gate 1 of 2'));
+    const gate1OpenIndex = events.findIndex((e) => e === 'open:http://127.0.0.1:9/');
+
+    expect(clickInstructionIndex).toBeGreaterThanOrEqual(0);
+    expect(beatIndex).toBeGreaterThanOrEqual(0);
+    expect(gate1OpenIndex).toBeGreaterThanOrEqual(0);
+    // Ordering, not merely presence — the whole defect is ordering.
+    expect(clickInstructionIndex).toBeLessThan(beatIndex);
+    expect(beatIndex).toBeLessThan(gate1OpenIndex);
+  });
+
+  it('gate 2: waitForOperatorBeat is called AFTER the "Only select repositories" instruction and BEFORE openUrl(interstitial.startUrl)', async () => {
+    const events: string[] = [];
+    const deps = baseDeps({
+      log: (line: string) => { events.push(`log:${line}`); },
+      openUrl: async (url: string) => { events.push(`open:${url}`); },
+      waitForOperatorBeat: async (role: string, gateLabel: string) => { events.push(`beat:${role}:${gateLabel}`); },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    const instructionIndex = events.findIndex((e) => e.startsWith('log:') && e.includes('Only select repositories'));
+    const beatIndex = events.findIndex((e) => e.startsWith(`beat:${AGENT.role}:`) && e.includes('consent gate 2 of 2'));
+    const gate2OpenIndex = events.findIndex((e) => e === `open:${FAKE_INTERSTITIAL_URL}`);
+
+    expect(instructionIndex).toBeGreaterThanOrEqual(0);
+    expect(beatIndex).toBeGreaterThanOrEqual(0);
+    expect(gate2OpenIndex).toBeGreaterThanOrEqual(0);
+    expect(instructionIndex).toBeLessThan(beatIndex);
+    expect(beatIndex).toBeLessThan(gate2OpenIndex);
+  });
+
+  it('OMITTED entirely -> no-op, proceeds straight to openUrl exactly as before this fix (backward-compatible default)', async () => {
+    const events: string[] = [];
+    // baseDeps never sets waitForOperatorBeat — every pre-this-fix test in
+    // this file already exercises this path implicitly; this test pins it
+    // explicitly so a future regression that makes the hook non-optional
+    // (breaking every caller that doesn't supply it) fails loudly here.
+    const deps = baseDeps({
+      log: (line: string) => { events.push(`log:${line}`); },
+      openUrl: async (url: string) => { events.push(`open:${url}`); },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(events).toContain('open:http://127.0.0.1:9/');
+    expect(events).toContain(`open:${FAKE_INTERSTITIAL_URL}`);
+  });
+});
+
 // --- groundnuty/macf#952 — gate numbering + role attribution ---
 
 describe('gates are numbered and role-attributed', () => {
@@ -940,5 +1010,19 @@ describe('realAgentApplyDeps wiring (groundnuty/macf#967)', () => {
   it('wires checkAppNameCollision to the real "ask, don\'t predict" resolver — a bare top-level reference, not a stub', () => {
     const deps = realAgentApplyDeps(async () => {}, () => {});
     expect(deps.checkAppNameCollision).toBe(resolveAppPresenceStatus);
+  });
+
+  // groundnuty/macf#952 follow-up — waitForOperatorBeat is a THIRD, optional,
+  // trailing parameter (see this function's own doc for why trailing).
+  it('the 2-arg call (every pre-this-fix caller) OMITS waitForOperatorBeat entirely — byte-identical to pre-fix wiring', () => {
+    const deps = realAgentApplyDeps(async () => {}, () => {});
+    expect(deps.waitForOperatorBeat).toBeUndefined();
+    expect('waitForOperatorBeat' in deps).toBe(false);
+  });
+
+  it('a supplied 3rd arg is wired onto waitForOperatorBeat by identity — not wrapped, not a stub', () => {
+    const beat = async (_role: string, _gateLabel: string): Promise<void> => {};
+    const deps = realAgentApplyDeps(async () => {}, () => {}, beat);
+    expect(deps.waitForOperatorBeat).toBe(beat);
   });
 });
