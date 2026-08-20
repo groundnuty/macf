@@ -3255,7 +3255,7 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     const clean: ApplyVersionPhaseResult = { ...partial, totalMembers: 1, skipBreakdown: [] };
     const partialText = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, partial);
     const cleanText = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, clean);
-    expect(partialText).toMatch(/Version reconcile: rolled 1 agent\(s\) to macf@0\.2\.57 — code-agent — 2 busy not rolled/);
+    expect(partialText).toMatch(/Version reconcile: rolled 1 agent\(s\) to macf@0\.2\.57 — code-agent \(2 busy not rolled\)/);
     expect(partialText).not.toBe(cleanText);
     expect(cleanText).not.toMatch(/not rolled/);
   });

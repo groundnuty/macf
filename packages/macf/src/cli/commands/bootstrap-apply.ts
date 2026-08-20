@@ -1445,7 +1445,11 @@ function formatVersionReconcileLine(versionPhase: ApplyVersionPhaseResult): stri
     // dropped `breakdown` here — the exact "summary reads as authoritative
     // while describing something that did not happen" shape this issue is
     // about, reproduced one branch over.
-    const notRolledNote = breakdown.length > 0 ? ` — ${breakdown.join(', ')} not rolled` : '';
+    // Parenthesized, not a second em-dash clause — two `—`s at the same
+    // nesting level read as one flat list ("code-agent" / "2 busy not
+    // rolled" looking like peers); parens make clear the second clause is
+    // subordinate to the first.
+    const notRolledNote = breakdown.length > 0 ? ` (${breakdown.join(', ')} not rolled)` : '';
     return `Version reconcile: rolled ${String(rolled.length)} agent(s) to macf@${target} — ${rolled.join(', ')}${notRolledNote} (${cite}).`;
   }
   // Zero rolled — say so explicitly, with a reason, per macf#1053's
