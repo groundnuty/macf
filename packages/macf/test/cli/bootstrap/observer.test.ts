@@ -469,7 +469,7 @@ describe('checkRunnerUsableByRepo (macf#924 org-scope correction; macf#934 capab
     expect(usability).toEqual({ presence: 'present' });
   });
 
-  it('a confirmed HTTP 403 on the repo-scoped leg -> unknown with a permission-specific detail, when the org leg ALSO cannot confirm', async () => {
+  it('a confirmed HTTP 403 on the repo-scoped leg -> unknown with a permission-specific detail, when the org leg ALSO cannot confirm; permissionDenied set (macf#1054, the EARLY-return exit point)', async () => {
     const deps = depsWith({
       listRepoScopedRunners: async () => ({ kind: 'forbidden' }),
       listRunnerGroupsVisibleToRepo: async () => 'unknown',
@@ -480,6 +480,41 @@ describe('checkRunnerUsableByRepo (macf#924 org-scope correction; macf#934 capab
     expect(usability.detail).toMatch(/insufficient permission/);
     expect(usability.detail).toContain('403');
     expect(usability.detail).toContain('administration: read');
+    expect(usability.permissionDenied).toBe(true);
+  });
+
+  it('macf#1054 — a confirmed HTTP 403 on the repo-scoped leg sets permissionDenied at the OTHER (FINAL) non-present exit point too, when the org legs resolve but find nothing usable', async () => {
+    const deps = depsWith({
+      listRepoScopedRunners: async () => ({ kind: 'forbidden' }),
+      // Org legs are NOT 'unknown' here — they resolve confidently, just to
+      // "nothing usable." This exercises checkRunnerUsableByRepo's SECOND
+      // non-present return (the one after the visibleGroups/orgRunners
+      // 'unknown' early-return), which the live 403 scenario (agent token
+      // also lacking admin:org) never reaches — but a token WITH admin:org
+      // and WITHOUT administration:read on this one repo legitimately can.
+      listRunnerGroupsVisibleToRepo: async () => [],
+      listOrgRunners: async () => [],
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('unknown');
+    expect(usability.permissionDenied).toBe(true);
+    expect(usability.detail).toContain('403');
+  });
+
+  it('macf#1054 — genuine absence (repo-scope confirmed EMPTY, not forbidden) never sets permissionDenied', async () => {
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', depsWith());
+    expect(usability.presence).toBe('absent');
+    expect(usability.permissionDenied).toBeUndefined();
+  });
+
+  it('macf#1054 — an unreadable (non-403) repo-scoped leg never sets permissionDenied — only a CONFIRMED 403 does', async () => {
+    const deps = depsWith({
+      listRepoScopedRunners: async () => ({ kind: 'unknown' }),
+      listRunnerGroupsVisibleToRepo: async () => 'unknown',
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('unknown');
+    expect(usability.permissionDenied).toBeUndefined();
   });
 
   it('a confirmed HTTP 403 on the repo-scoped leg does NOT short-circuit — a CAPABLE org runner still resolves present (macf#924 regression guard)', async () => {

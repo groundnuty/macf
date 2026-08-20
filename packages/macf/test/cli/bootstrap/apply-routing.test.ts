@@ -16,6 +16,7 @@ import {
   pollForUsableRunner,
   publishTrustedActors,
   publishTrustedActorsGated,
+  runnerPermissionDeniedReason,
   runnerTokenPollExhaustedReason,
   RUNNER_TOKEN_ENV_VAR,
   RUNNER_TOKEN_FLAG,
@@ -607,6 +608,203 @@ describe('pollForUsableRunner — progress narration (macf#972)', () => {
       { timeoutMs: 60_000, pollIntervalMs: 0 },
     );
     expect(usability).toEqual({ presence: 'present' });
+  });
+});
+
+// --- groundnuty/macf#1054 — a confirmed 403 fails FAST, never polls to timeout ---
+//
+// Live symptom this closes: an agent installation token lacking
+// "administration: read" 403s on EVERY poll tick of `listRepoScopedRunners`
+// (the runner itself was `status=online busy=false` the whole time), so the
+// pre-fix poll burned the FULL 600s budget for a precondition that could
+// never resolve by waiting. Per `assert-the-wrong-path.md`: "it eventually
+// errored" is satisfied by BOTH a fast refusal and a 600s wait-then-fail —
+// the decisive assertion below is that the retry-with-sleep loop was NEVER
+// ENTERED, via a `sleepFn` fake that throws if invoked at all.
+
+describe('pollForUsableRunner — permissionDenied fail-fast (groundnuty/macf#1054)', () => {
+  it('DECISIVE: permissionDenied on the FIRST check exits immediately — sleepFn is NEVER called, even with the real 10-minute default budget', async () => {
+    let checkCalls = 0;
+    let sleepCalls = 0;
+    const usability = await pollForUsableRunner(
+      'groundnuty/x',
+      async () => {
+        checkCalls += 1;
+        return { presence: 'unknown', permissionDenied: true, detail: 'could not read runners — insufficient permission (HTTP 403)' };
+      },
+      {
+        // timeoutMs deliberately UNSET — the real 10-minute production
+        // default (DEFAULT_RUNNER_POLL_TIMEOUT_MS). If the fail-fast check
+        // did not fire before the retry loop's sleep, this test would hang
+        // (or time out the whole suite) rather than merely being slow.
+        sleepFn: async (ms) => {
+          sleepCalls += 1;
+          throw new Error(`sleepFn must never be called on the permissionDenied fast path (asked to sleep ${String(ms)}ms)`);
+        },
+      },
+    );
+    expect(usability.presence).toBe('unknown');
+    expect(usability.permissionDenied).toBe(true);
+    expect(checkCalls).toBe(1); // ONE check, never retried
+    expect(sleepCalls).toBe(0); // the retry-with-sleep loop was never entered
+  });
+
+  it('NON-REGRESSION: a genuine "unknown" WITHOUT permissionDenied keeps polling to the full budget — sleepFn IS called, proving the fast-fail is narrowed to the flag, not "any non-present"', async () => {
+    let checkCalls = 0;
+    let clock = 0;
+    const sleeps: number[] = [];
+    const usability = await pollForUsableRunner(
+      'groundnuty/x',
+      async () => {
+        checkCalls += 1;
+        return { presence: 'unknown' }; // no permissionDenied — e.g. a transient network read failure
+      },
+      {
+        timeoutMs: 30_000,
+        pollIntervalMs: 10_000,
+        now: () => clock,
+        sleepFn: async (ms) => {
+          sleeps.push(ms);
+          clock += ms;
+        },
+      },
+    );
+    expect(usability).toEqual({ presence: 'unknown' });
+    expect(checkCalls).toBeGreaterThan(1); // genuinely retried
+    expect(sleeps.length).toBeGreaterThan(0); // the budget was actually consumed, not skipped
+  });
+
+  it('NON-REGRESSION: a genuine "absent" (registered-but-not-yet-visible shape) also keeps polling — permissionDenied is the ONLY fast-fail trigger', async () => {
+    let checkCalls = 0;
+    let clock = 0;
+    const usability = await pollForUsableRunner(
+      'groundnuty/x',
+      async () => {
+        checkCalls += 1;
+        return checkCalls < 3 ? { presence: 'absent' } : { presence: 'present' };
+      },
+      {
+        timeoutMs: 60_000,
+        pollIntervalMs: 5_000,
+        now: () => clock,
+        sleepFn: async (ms) => {
+          clock += ms;
+        },
+      },
+    );
+    expect(usability).toEqual({ presence: 'present' }); // recovered mid-poll, as before this fix
+    expect(checkCalls).toBe(3);
+  });
+});
+
+describe('runnerPermissionDeniedReason (groundnuty/macf#1054)', () => {
+  it('names the 403, the DR-044 fleet-authority cause, and makes NO elapsed-time claim; appends detail/handover verbatim like its siblings', () => {
+    const usability: RunnerUsability = {
+      presence: 'unknown',
+      permissionDenied: true,
+      detail: 'could not read runners for "groundnuty/x" — insufficient permission (HTTP 403; the App\'s installation token needs "administration: read"...)',
+    };
+    const reason = runnerPermissionDeniedReason('groundnuty/x', usability);
+    expect(reason).toContain('403');
+    expect(reason).toContain('DR-044');
+    expect(reason).toMatch(/fleet/i);
+    expect(reason).toContain('MACF_TRUSTED_ACTORS was NOT written');
+    // Never the runnerTokenPollExhaustedReason-style elapsed-time claim
+    // ("within the Ns poll window") — no wait happened here.
+    expect(reason).not.toMatch(/\d+s poll window/);
+    expect(reason).not.toMatch(/\d+s elapsed/);
+    expect(reason).toContain('administration: read'); // the detail, appended verbatim
+  });
+
+  it('appends handover verbatim when set, same discipline as runnerTokenPollExhaustedReason', () => {
+    const usability: RunnerUsability = { presence: 'unknown', permissionDenied: true, handover: 'An org-level self-hosted runner IS registered...' };
+    const reason = runnerPermissionDeniedReason('groundnuty/x', usability);
+    expect(reason).toContain('An org-level self-hosted runner IS registered');
+  });
+});
+
+describe('publishTrustedActorsGated — permissionDenied fail-fast (groundnuty/macf#1054)', () => {
+  it('DECISIVE: a confirmed 403 on the poll path fails FAST — status "failed", the permission-specific reason (never the poll-window reason), sleepFn never invoked', async () => {
+    let checkCalls = 0;
+    let sleepCalls = 0;
+    let createCalled = false;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return { presence: 'unknown', permissionDenied: true, detail: 'could not read runners for "a/b" — insufficient permission (HTTP 403; the App\'s installation token needs "administration: read"...)' };
+      },
+      createRepoVariable: async () => {
+        createCalled = true;
+        return 'created';
+      },
+    });
+    const result = await publishTrustedActorsGated(
+      'self-hosted',
+      ['a/b'],
+      deps,
+      'ghr-sentinel-token',
+      // timeoutMs deliberately UNSET (the real 600s default) — same "would
+      // hang, not just be slow" proof as the pollForUsableRunner test above.
+      {
+        sleepFn: async (ms) => {
+          sleepCalls += 1;
+          throw new Error(`sleepFn must never be called on a confirmed 403 (asked to sleep ${String(ms)}ms)`);
+        },
+      },
+    );
+    expect(result['a/b']?.status).toBe('failed');
+    const reason = (result['a/b'] as { reason: string }).reason;
+    expect(reason).toContain('403');
+    expect(reason).toContain('DR-044');
+    expect(reason).not.toMatch(/\d+s poll window/); // never the exhausted-poll elapsed-time claim — no wait happened
+    expect(checkCalls).toBe(1);
+    expect(sleepCalls).toBe(0);
+    expect(createCalled).toBe(false); // register-before-route still holds
+  });
+
+  it('NON-REGRESSION: a genuine "not yet online" runner still polls the FULL configured budget and eventually fails with the poll-exhausted reason, not the permission one', async () => {
+    let checkCalls = 0;
+    let clock = 0;
+    const sleeps: number[] = [];
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return { presence: 'absent' }; // registered-but-not-online shape, no permissionDenied
+      },
+    });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', {
+      timeoutMs: 20_000,
+      pollIntervalMs: 5_000,
+      now: () => clock,
+      sleepFn: async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+    });
+    expect(result['a/b']?.status).toBe('failed');
+    const reason = (result['a/b'] as { reason: string }).reason;
+    expect(reason).toMatch(/poll window/); // the genuine timeout wording — budget WAS spent
+    expect(reason).not.toContain('DR-044');
+    expect(checkCalls).toBeGreaterThan(1);
+    expect(sleeps.length).toBeGreaterThan(0); // proves the budget was actually consumed this time
+  });
+
+  it('the justCreatedRepos fast path ALSO reports the permission-specific reason on a confirmed 403 — unified messaging across both entry points', async () => {
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => ({
+        presence: 'unknown',
+        permissionDenied: true,
+        detail: 'could not read runners for "a/b" — insufficient permission (HTTP 403; the App\'s installation token needs "administration: read"...)',
+      }),
+    });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', {}, new Set(['a/b']));
+    expect(result['a/b']?.status).toBe('failed');
+    const reason = (result['a/b'] as { reason: string }).reason;
+    expect(reason).toContain('403');
+    expect(reason).toContain('DR-044');
+    // NOT the justCreatedRepos generic "created during THIS run" framing —
+    // the permission cause is more specific and wins.
+    expect(reason).not.toContain('created during THIS run');
   });
 });
 

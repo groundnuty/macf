@@ -134,6 +134,7 @@ const FLEET_YAML_WITH_VERSIONS = FLEET_YAML.replace(
   'agents:\n',
   'versions:\n  macf: "0.2.60"\n  actions: v3.4.1\nagents:\n',
 );
+
 const OBSERVED_VERSION_DRIFT: ObservedState = {
   lock: null,
   agents: {
@@ -143,6 +144,20 @@ const OBSERVED_VERSION_DRIFT: ObservedState = {
   caRegistry: 'present',
   caRepos: {},
 };
+
+/**
+ * groundnuty/macf#1054 — declares BOTH `routing.runner` AND `versions:`, so a
+ * single run exercises the runner-gate (inside `applyFleet`) AND the
+ * version-reconcile phase (AFTER `applyFleet` returns, in
+ * `runBootstrapApply`) together. Used ONLY by the "runner-gate failure does
+ * not block the version phase" regression test below — every other fixture
+ * in this file keeps `routing:`/`versions:` separate on purpose.
+ */
+const FLEET_YAML_WITH_ROUTING_AND_VERSIONS = FLEET_YAML.replace(
+  'agents:\n',
+  'routing:\n  runner:\n    runs_on: self-hosted\nversions:\n  macf: "0.2.60"\n  actions: v3.4.1\nagents:\n',
+);
+const OBSERVED_ROUTING_AND_VERSION_DRIFT: ObservedState = { ...OBSERVED_VERSION_DRIFT, routingTrustedActors: 'github-hosted' };
 
 function observedWithApp(role: string): ObservedState {
   return {
@@ -1478,6 +1493,73 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       skip_breakdown: [],
       flagless: true,
     });
+  });
+
+  // --- groundnuty/macf#1054 defect 2 — a runner-gate FAILURE must not
+  // prevent phases that don't depend on it, at minimum the version phase.
+  //
+  // This pins a property that already holds in `applyFleet`/`runBootstrapApply`'s
+  // control flow (a `'failed'` routing leg only logs and continues; the
+  // version phase is gated on `controlRepoAborted || opts.deploy === false`,
+  // never on the routing outcome) — turning an ACCIDENTAL non-gating
+  // property into an ASSERTED one, so a future refactor that couples them
+  // fails a test instead of silently reintroducing the block. Combined with
+  // this issue's defect-1 fix (a confirmed 403 now fails in one `gh` call,
+  // not after a 600s poll), this closes the practical "runner wait sits
+  // ahead of the version phase" complaint the issue reports; a
+  // *legitimately* still-polling (non-403) runner-gate remains a real,
+  // separate, NOT-fixed-here sequencing delay — see the report for that
+  // judgment call.
+  it('groundnuty/macf#1054 defect 2 — a runner-gate FAILURE (confirmed 403, fails fast per defect 1) still lets the version-reconcile phase run + report; the routing failure is reported clearly, never silently swallowed', async () => {
+    const file = writeManifest(FLEET_YAML_WITH_ROUTING_AND_VERSIONS);
+    let sleepCalled = false;
+    const code = await runBootstrapApply(
+      { file, yes: true, json: true, runnerToken: SENTINEL_RUNNER_TOKEN },
+      { observe: () => Promise.resolve(OBSERVED_ROUTING_AND_VERSION_DRIFT), versionDeps: fakeVersionDeps() },
+      fakeMutateDeps(file, {
+        trustDeps: fakeTrustDeps({
+          checkRunnerUsableByRepo: async () => ({
+            presence: 'unknown',
+            permissionDenied: true,
+            detail: 'could not read runners for "groundnuty/demo-code" — insufficient permission (HTTP 403; the App\'s installation token needs "administration: read"...)',
+          }),
+        }),
+        // A sleepFn that fails the test if invoked — if defect 1's fail-fast
+        // regressed, this run would try to poll and this would fire (or the
+        // real 600s default would hang the test), not merely run slow.
+        runnerTokenPollOptions: {
+          sleepFn: async (ms) => {
+            sleepCalled = true;
+            throw new Error(`sleepFn must never be called on a confirmed 403 (asked to sleep ${String(ms)}ms)`);
+          },
+        },
+      }),
+    );
+    // The routing gate failure alone must NOT fail exit code differently
+    // than expected — applyExitCode's routingBad path makes a failed
+    // routing leg non-zero-exit (groundnuty/macf#993), independent of the
+    // version phase's own success.
+    expect(code).not.toBe(0);
+    expect(sleepCalled).toBe(false);
+    const parsed = JSON.parse(logs.join('\n')) as {
+      routing: Record<string, { status: string; reason?: string }>;
+      version_phase?: { target: string; halted: boolean };
+    };
+    // The routing gate genuinely failed (not silently skipped, not
+    // silently succeeded) — clearly reported with the permission cause.
+    const routingLeg = parsed.routing['groundnuty/demo-code'];
+    expect(routingLeg?.status).toBe('failed');
+    expect(routingLeg?.reason).toContain('403');
+    expect(routingLeg?.reason).toContain('DR-044');
+    // DECISIVE — the version-reconcile phase STILL attempted + reported,
+    // despite the routing gate having failed. Before this issue's fix this
+    // would have been reached only after a 600s poll; the sleepFn assertion
+    // above proves it was never even entered.
+    // macf#1054 + macf#1055: assert the fields THIS test is about, not deep-equality
+    // on the whole object — #1055 widened ApplyVersionPhaseResult with the
+    // rolled/unreachable/skip discriminators, and a toEqual here couples this
+    // routing test to that unrelated shape.
+    expect(parsed.version_phase).toMatchObject({ target: '0.2.60', halted: false });
   });
 
   it('pre-approval stderr render (interactive path, confirmPlan declines) ALSO shows the NOT IMPLEMENTED block before the abort', async () => {
