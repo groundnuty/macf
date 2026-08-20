@@ -579,9 +579,9 @@ describe('checkRunnerUsableByRepo (macf#924 org-scope correction; macf#934 capab
     expect(usability.detail).toMatch(/offline/);
   });
 
-  it('no runners anywhere (repo scope AND org scope both confidently empty) -> absent, nothing to hand over, nothing to detail', async () => {
+  it('no runners anywhere (repo scope AND org scope both confidently empty) -> absent, nothing to hand over, nothing to detail, neverRegistered set (macf#943)', async () => {
     const usability = await checkRunnerUsableByRepo('groundnuty/x', depsWith());
-    expect(usability).toEqual({ presence: 'absent' });
+    expect(usability).toEqual({ presence: 'absent', neverRegistered: true });
   });
 
   it('a repo-scoped leg with zero runners (confirmed absent) never produces "found runners" detail wording, even via a 404-folded read', async () => {
@@ -631,6 +631,77 @@ describe('checkRunnerUsableByRepo (macf#924 org-scope correction; macf#934 capab
     await checkRunnerUsableByRepo('groundnuty/demo-fleet-code-agent', deps);
     expect(seenOrg).toBe('groundnuty');
     expect(seenRepoName).toBe('demo-fleet-code-agent');
+  });
+});
+
+// --- checkRunnerUsableByRepo — neverRegistered (groundnuty/macf#943) ---
+//
+// The third state a bare `presence: 'absent'` could not distinguish from
+// "something is registering": TRUE zero, confirmed at BOTH scopes. Live
+// symptom this closes: adding an agent to an existing fleet, `apply` polled
+// the full 600s budget for a repo with ZERO runners registered anywhere —
+// the SAME shape macf#1054 fixed for a confirmed 403, one state over.
+
+describe('checkRunnerUsableByRepo — neverRegistered (groundnuty/macf#943)', () => {
+  it('DECISIVE: zero runners at BOTH scopes -> neverRegistered true, alongside absent', async () => {
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', depsWith());
+    expect(usability.presence).toBe('absent');
+    expect(usability.neverRegistered).toBe(true);
+  });
+
+  it('repo-scope found N>0 runners (none capable yet, e.g. still registering/offline) -> neverRegistered NOT set — this is the "registered but not yet online" case that MUST keep polling', async () => {
+    const deps = depsWith({
+      listRepoScopedRunners: async () => ({ kind: 'ok', runners: [capableRunner({ status: 'offline' })] }),
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('absent');
+    expect(usability.neverRegistered).toBeUndefined();
+  });
+
+  it('org-scope has a runner EXCLUDED from every visible group (the handover case) -> neverRegistered NOT set — a runner IS registered somewhere, just not here', async () => {
+    const deps = depsWith({
+      listRunnerGroupsVisibleToRepo: async () => [],
+      listOrgRunners: async () => [orgRunner({ runnerGroupId: 7 })],
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('absent');
+    expect(usability.handover).toBeDefined();
+    expect(usability.neverRegistered).toBeUndefined();
+  });
+
+  it('org-scope has a runner VISIBLE but not capable (offline) -> neverRegistered NOT set', async () => {
+    const deps = depsWith({
+      listRunnerGroupsVisibleToRepo: async () => [{ id: 7, name: 'ci-runner' }],
+      listOrgRunners: async () => [orgRunner({ runnerGroupId: 7, status: 'offline' })],
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('absent');
+    expect(usability.neverRegistered).toBeUndefined();
+  });
+
+  it('a confirmed HTTP 403 on the repo-scoped leg -> neverRegistered NEVER set, even when the org legs resolve to confidently empty — mutually exclusive with permissionDenied', async () => {
+    const deps = depsWith({
+      listRepoScopedRunners: async () => ({ kind: 'forbidden' }),
+      listRunnerGroupsVisibleToRepo: async () => [],
+      listOrgRunners: async () => [],
+    });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.permissionDenied).toBe(true);
+    expect(usability.neverRegistered).toBeUndefined();
+  });
+
+  it('an unreadable (non-403, non-ok) repo-scoped leg -> neverRegistered NOT set — honest-unknown, never treated as confirmed-zero', async () => {
+    const deps = depsWith({ listRepoScopedRunners: async () => ({ kind: 'unknown' }) });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('unknown');
+    expect(usability.neverRegistered).toBeUndefined();
+  });
+
+  it('an unreadable org-scope leg -> neverRegistered NOT set, even though the repo-scoped leg alone is confidently empty', async () => {
+    const deps = depsWith({ listOrgRunners: async () => 'unknown' });
+    const usability = await checkRunnerUsableByRepo('groundnuty/x', deps);
+    expect(usability.presence).toBe('unknown');
+    expect(usability.neverRegistered).toBeUndefined();
   });
 });
 

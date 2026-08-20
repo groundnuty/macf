@@ -163,6 +163,43 @@
  * confirmed-403 shape, per DR-044 Decision 6's floor: the operator's own
  * runner-missing ruling (macf#993, above) is unchanged and still fires loud
  * for a genuinely-absent runner.
+ *
+ * **A confirmed zero-runners-anywhere read ALSO fails FAST — the third state
+ * a bare `presence: 'absent'` could not see (groundnuty/macf#943, operator
+ * ruling: "the apply should fail loudly").** Measured live: adding an agent
+ * to an existing fleet, `apply` reached the runner gate for a repo with
+ * ZERO runners registered at either scope and polled the full 600s budget
+ * anyway — the SAME shape macf#1054 fixed for a 403, one state over. A
+ * confirmed 403 means "not entitled to look"; this is "looked, and there is
+ * genuinely nothing there, at either scope" — `checkRunnerUsableByRepo` now
+ * threads that confirmation through as `RunnerUsability.neverRegistered`
+ * (see that field's doc in `observer.ts` for exactly what "confirmed" +
+ * "both scopes" require — the distinction from a merely-repo-scope-empty
+ * read that macf#924's org-scope leg or the excluded-group `handover` case
+ * would otherwise wrongly collapse into "nothing here"). {@link
+ * pollForUsableRunner} exits on the SAME first check as `permissionDenied`,
+ * before `sleepFn`; {@link publishTrustedActorsGated} reports it via the NEW
+ * {@link runnerNeverRegisteredReason} — plain user-facing wording, no
+ * internal issue/DR references (groundnuty/macf#1061) — on the ordinary
+ * poll path only; the `justCreatedRepos` fast path keeps its OWN, more
+ * specific "created during THIS run" text even when `neverRegistered` is
+ * ALSO true. A repo with SOMETHING registered (found-but-not-yet-online,
+ * found-but-excluded) never sets the flag and keeps polling to the full
+ * budget exactly as before — this fix narrows ONLY the confirmed-zero shape.
+ *
+ * **No grace window, deliberately.** A runner an operator is registering
+ * BY HAND at the exact moment `apply` runs can, in principle, still be
+ * mid-registration on the FIRST check — GitHub's runner list is empty until
+ * the registration call lands, not merely until the runner goes online — so
+ * this fix CAN reject a genuine race, not only a permanently-empty repo.
+ * Accepted anyway: the decisive test for this fix requires `sleepFn` is
+ * NEVER invoked on a confirmed-zero read (the same bar `permissionDenied`
+ * already set), a few seconds of registration lag racing a 3s poll interval
+ * is a narrow window, and the remedy is one more `apply` run — no different
+ * from re-running today after registering a runner that missed the window
+ * entirely. A retry-budget for this ONE case would reintroduce exactly the
+ * "wait for something that might not be worth waiting for" shape this issue
+ * exists to remove, for a race this narrow.
  */
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import { ensureVariableCreated, failedOutcomesFor } from './ensure-variable.js';
@@ -461,6 +498,37 @@ export function runnerPermissionDeniedReason(repo: string, usability: RunnerUsab
   );
 }
 
+/**
+ * The reason text for the groundnuty/macf#943 FAST-FAIL path — a CONFIRMED
+ * zero-runners-anywhere read (`usability.neverRegistered === true`), the
+ * third state a bare `presence: 'absent'` could not distinguish from
+ * "something is registering" before this fix. Sibling of
+ * {@link runnerPermissionDeniedReason}: SAME "no wait happened, don't claim
+ * one" discipline ({@link runnerJustCreatedRepoReason}'s doc explains why a
+ * message describing work the program did not do is the dishonesty this
+ * catalog exists to prevent) — this text never mentions a poll window
+ * either, because {@link pollForUsableRunner} exits before ever waiting.
+ *
+ * **User-facing text — plain words, no internal issue/DR references
+ * (groundnuty/macf#1061).** Every OTHER reason function in this module still
+ * predates that ruling; this one is written to it directly, since it is new.
+ *
+ * **Status note (groundnuty/macf#993, unchanged by this function):**
+ * {@link publishTrustedActorsGated} pairs this text with `status: 'failed'`,
+ * same bar as every other non-present routing outcome.
+ */
+export function runnerNeverRegisteredReason(repo: string, usability: RunnerUsability): string {
+  const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
+  const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
+  return (
+    `role/repo "${repo}": no runner is registered for this repository, at either the repo or the organization ` +
+    'level, and this tool does not provision one for you yet. MACF_TRUSTED_ACTORS was NOT written; this repo ' +
+    'continues routing on ubuntu-latest (billed on private repos). Register a self-hosted runner for this repo ' +
+    "(or the organization), or change `runs_on` in the fleet manifest, then re-run `macf bootstrap apply`." +
+    `${detailSuffix}${handoverSuffix}`
+  );
+}
+
 export function runnerJustCreatedRepoReason(repo: string, usability: RunnerUsability): string {
   const cause =
     usability.presence === 'unknown'
@@ -588,6 +656,17 @@ export function formatRunnerPollProgress(repo: string, elapsedMs: number, totalM
  * WITHOUT `permissionDenied`) is UNCHANGED — it keeps polling to the full
  * budget exactly as before this fix; only the confirmed-403 shape short-
  * circuits.
+ *
+ * **groundnuty/macf#943 — fails FAST on a confirmed zero-runners-anywhere
+ * read too, the SAME shape one gate over.** A `usability.neverRegistered
+ * === true` result (see `observer.ts::RunnerUsability.neverRegistered`'s
+ * doc) exits the loop on THIS SAME check, before `sleepFn`, for the SAME
+ * reason `permissionDenied` does: a confirmed-empty runner registry cannot
+ * populate itself by being polled again on the SAME cadence this tool
+ * controls — nothing `apply` does provisions a runner in-band. A repo with
+ * SOMETHING registered (found-but-not-yet-online, found-but-excluded-from-
+ * a-visible-group) never sets `neverRegistered` and keeps polling exactly
+ * as before — only the TRUE-zero shape short-circuits.
  */
 export async function pollForUsableRunner(
   repo: string,
@@ -608,6 +687,17 @@ export async function pollForUsableRunner(
     // groundnuty/macf#1054 — a confirmed 403 is "not entitled to look," never
     // "not there yet." Return on the FIRST check; never reaches `sleepFn`.
     if (usability.permissionDenied === true) return usability;
+    // groundnuty/macf#943 — a CONFIRMED zero-runners-anywhere read is not
+    // "not there yet" either; it is "nothing here, and nothing in `apply`
+    // creates one" (runner provisioning is unbuilt). Same fail-fast shape as
+    // `permissionDenied` immediately above, on the SAME first check, before
+    // `sleepFn` — a confirmed-empty registry cannot populate itself between
+    // one poll tick and the next by the mere act of asking again. A repo
+    // that HAS something registered (offline, still registering, excluded
+    // from a group) never sets this flag — see `RunnerUsability.
+    // neverRegistered`'s doc — so that case is UNCHANGED and keeps polling
+    // to the full budget exactly as before this fix.
+    if (usability.neverRegistered === true) return usability;
     const elapsedNow = nowFn();
     const remaining = deadline - elapsedNow;
     if (remaining <= 0) return usability;
@@ -731,13 +821,27 @@ export async function publishTrustedActorsGated(
       // `runnerJustCreatedRepoReason`'s generic "could not confirm" framing
       // is honest here; `runnerPermissionDeniedReason` names the 403 + DR-044
       // cause explicitly on EITHER path.
+      //
+      // groundnuty/macf#943 — `neverRegistered` wins over the ORDINARY
+      // poll-exhausted branch ONLY (`pollJustified === true`): on that path
+      // `pollForUsableRunner` also exits on the FIRST check for this flag
+      // (see its doc), so `runnerTokenPollExhaustedReason`'s "within the Ns
+      // poll window" claim would be dishonest — no wait happened. The
+      // `justCreatedRepos` fast path (`!pollJustified`) deliberately keeps
+      // its OWN `runnerJustCreatedRepoReason` even when `neverRegistered` is
+      // ALSO true (it almost always is, for a repo this run itself created)
+      // — that text already explains WHY zero is expected ("created during
+      // THIS run") more precisely than the generic never-registered wording
+      // would, and downgrading it would lose that specificity for no gain.
       out[repo] = {
         status: 'failed',
         reason:
           usability.permissionDenied === true
             ? runnerPermissionDeniedReason(repo, usability)
             : pollJustified
-              ? runnerTokenPollExhaustedReason(repo, usability, timeoutMs)
+              ? usability.neverRegistered === true
+                ? runnerNeverRegisteredReason(repo, usability)
+                : runnerTokenPollExhaustedReason(repo, usability, timeoutMs)
               : runnerJustCreatedRepoReason(repo, usability),
       };
       continue;
