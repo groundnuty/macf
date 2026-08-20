@@ -87,6 +87,7 @@ import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap
 import type { ApplyDeployPhaseDeps, DeployPhaseAgentResult } from '../bootstrap/apply-deploy.js';
 import { anyDeployFailed, runApplyDeployPhase } from '../bootstrap/apply-deploy.js';
 import { realAuthenticatedCloneRepo, realMintCloneToken } from '../bootstrap/fleet-deploy.js';
+import { firstLaunchGuidanceHeaderLines, firstLaunchAttachLine } from '../bootstrap/first-launch-guidance.js';
 import { outcomeToJson as fleetDeployOutcomeToJson } from './fleet-deploy.js';
 import { initAgent as realInitAgent } from './init.js';
 import { agentCertPath, agentKeyPath } from '../config.js';
@@ -974,6 +975,17 @@ export interface DeployPhaseRenderInput {
   readonly results?: readonly DeployPhaseAgentResult[];
   readonly skipReason?: string;
   readonly checkAgentCertPresent?: (destDir: string) => boolean;
+  /**
+   * The fleet name (`manifest.metadata.name`) — macf#994's first-launch
+   * guidance block needs it to build `<project>@<routing-label>`
+   * (coordination.md's canonical tmux session name) for each deployed
+   * agent's `tmux attach` line. Threaded from the ONE production call site
+   * (`runBootstrapApply`'s `manifest`, already in scope there); required
+   * (not defaulted) because {@link launchNextStepLines} has no other source
+   * for it — `DeployPhaseAgentResult` carries per-agent `role`/`destDir`
+   * only, never the fleet-level name.
+   */
+  readonly project: string;
 }
 
 /**
@@ -1017,12 +1029,31 @@ function launchNextStepLines(deployPhase: DeployPhaseRenderInput): string[] {
   if (deployed.length === 0) return [];
   const checkAgentCertPresent = deployPhase.checkAgentCertPresent ?? defaultCheckAgentCertPresent;
   const lines: string[] = ['', 'Next step — launch the deployed agent(s):'];
+  // macf#994 — that step cannot complete unattended for a FIRST launch of a
+  // workspace (trust dialog, conditionally the channels-confirmation
+  // prompt). Named ONCE for the whole section (DR-044 Decision 6 — "one
+  // reason, once"; see first-launch-guidance.ts's module doc), never once
+  // per agent, and only when at least one agent below actually gets a
+  // launch line (a cert-absent agent gets the ⚠ bullet instead — see that
+  // branch below — so the explanation would otherwise dangle with nothing
+  // to attach to).
+  const launchable = deployed.filter((r) => checkAgentCertPresent(r.destDir));
+  if (launchable.length > 0) {
+    lines.push(...firstLaunchGuidanceHeaderLines());
+  }
   for (const r of deployed) {
-    lines.push(
-      checkAgentCertPresent(r.destDir)
-        ? `  cd ${r.destDir} && ./claude.sh`
-        : `  ⚠ ${r.role}: no mTLS cert at ${r.destDir} yet — check the deploy phase output above before launching.`,
-    );
+    // Pre-existing asymmetry with `fleet-deploy.ts::nextStepLines` (macf#976,
+    // predates macf#994): the single-agent command always prints its launch
+    // line even when the cert is missing; this multi-agent one withholds it
+    // and prints ONLY the warning bullet below. Not something macf#994
+    // changes — the guidance here simply follows wherever the pre-existing
+    // launch line already appears, per agent.
+    if (!checkAgentCertPresent(r.destDir)) {
+      lines.push(`  ⚠ ${r.role}: no mTLS cert at ${r.destDir} yet — check the deploy phase output above before launching.`);
+      continue;
+    }
+    lines.push(`  cd ${r.destDir} && ./claude.sh`);
+    lines.push(`  ${firstLaunchAttachLine(deployPhase.project, r.destDir, r.role)}`);
   }
   return lines;
 }
@@ -1790,7 +1821,12 @@ export async function runBootstrapApply(
       const deployPhase: DeployPhaseRenderInput | undefined =
         (deployResults === undefined && deploySkipReason === undefined) || deploySkipIsNoise
           ? undefined
-          : { results: deployResults, skipReason: deploySkipReason, checkAgentCertPresent: resolved.checkAgentCertPresent };
+          : {
+              results: deployResults,
+              skipReason: deploySkipReason,
+              checkAgentCertPresent: resolved.checkAgentCertPresent,
+              project: manifest.metadata.name,
+            };
 
       if (opts.json) {
         console.log(JSON.stringify(fleetApplyResultToJson(result, plan.unimplementedByApply, remainingDeploy, deployPhase), null, 2));

@@ -30,7 +30,10 @@ import {
   DRY_RUN_REDIRECT_PLACEHOLDER,
   FLEET_APPLY_JSON_SCHEMA_VERSION,
   type MutateApplyDeps,
+  type DeployPhaseRenderInput,
 } from '../../src/cli/commands/bootstrap-apply.js';
+import type { DeployPhaseAgentResult } from '../../src/cli/bootstrap/apply-deploy.js';
+import { writeAgentConfig } from '../../src/cli/config.js';
 import { parseFleetManifest } from '../../src/cli/bootstrap/fleet-manifest.js';
 import { parseFleetLock } from '../../src/cli/bootstrap/fleet-manifest.js';
 import { computePlan } from '../../src/cli/bootstrap/plan.js';
@@ -2809,5 +2812,149 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(json.unimplemented_by_apply).toEqual([
       { kind: 'ca', target: 'ca:registry:DEMO_FLEET_CA_CERT', verb: 'create', reason: 'no CA orchestrator step exists yet' },
     ]);
+  });
+});
+
+// --- macf#994: `apply`'s deploy-phase "launch the deployed agent(s)" block
+// carries the SAME first-launch guidance `macf fleet deploy`'s own
+// `nextStepLines` does (`fleet-deploy.test.ts` covers that surface; this
+// block covers `formatApplyResult`'s `launchNextStepLines`, the apply-side
+// mirror — both consume `first-launch-guidance.ts`, never duplicate it).
+describe('formatApplyResult — macf#994 first-launch guidance (deploy phase)', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+  function scratchDir(): string {
+    const d = mkdtempSync(join(tmpdir(), 'macf-apply-first-launch-test-'));
+    dirs.push(d);
+    return d;
+  }
+
+  /** A minimal, valid `'deployed'` `DeployPhaseAgentResult` — field values beyond role/destDir are arbitrary but schema-valid (this block is about the RENDER, not deploy internals). */
+  function deployedResult(role: string, destDir: string): DeployPhaseAgentResult {
+    return {
+      role,
+      destDir,
+      outcome: {
+        role,
+        status: 'deployed',
+        appId: '1',
+        installId: '2',
+        workspace: 'cloned',
+        keyPath: join(destDir, 'key.pem'),
+        keyWrite: 'written',
+        keyFingerprint: 'sha256:deadbeef',
+        ca: { status: 'vault-absent' },
+        certIssue: 'not-attempted',
+      },
+    };
+  }
+
+  it('names BOTH first-launch prompts + the exact tmux attach command per deployed agent (falls back to role when no macf-agent.json exists)', () => {
+    const destDir = scratchDir();
+    const deployPhase: DeployPhaseRenderInput = {
+      results: [deployedResult('code-agent', destDir)],
+      checkAgentCertPresent: () => true,
+      project: 'demo-fleet',
+    };
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, deployPhase);
+    expect(text).toContain('Do you trust this folder?');
+    expect(text).toContain('Loading development channels');
+    expect(text).toContain('may ALSO need a manual answer');
+    expect(text).toContain('tmux attach -t demo-fleet@code-agent');
+  });
+
+  it('the tmux attach command uses routing_label, NEVER agent_name, when a deployed workspace\'s config diverges (the decisive session-naming fixture, mirrors fleet-deploy.test.ts\'s own)', () => {
+    const destDir = scratchDir();
+    writeAgentConfig(destDir, {
+      project: 'demo-fleet',
+      agent_name: 'demo-fleet-science-agent',
+      agent_role: 'science-agent',
+      routing_label: 'totally-different-routing-label',
+      agent_type: 'permanent',
+      registry: { type: 'profile', user: 'groundnuty' },
+    });
+    const deployPhase: DeployPhaseRenderInput = {
+      results: [deployedResult('science-agent', destDir)],
+      checkAgentCertPresent: () => true,
+      project: 'demo-fleet',
+    };
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, deployPhase);
+    expect(text).toContain('tmux attach -t demo-fleet@totally-different-routing-label');
+    expect(text).not.toContain('demo-fleet@demo-fleet-science-agent');
+    expect(text).not.toContain('demo-fleet@science-agent');
+  });
+
+  it('DECISIVE two-agent case (DR-044 Decision 6, "say it once"): the explanation prints EXACTLY ONCE for the whole section, and each of TWO deployed agents gets its own correct attach line', () => {
+    const codeDir = scratchDir();
+    const scienceDir = scratchDir();
+    writeAgentConfig(scienceDir, {
+      project: 'demo-fleet',
+      agent_name: 'macf-science-agent',
+      agent_role: 'science-agent',
+      routing_label: 'science-agent',
+      agent_type: 'permanent',
+      registry: { type: 'profile', user: 'groundnuty' },
+    });
+    const deployPhase: DeployPhaseRenderInput = {
+      results: [deployedResult('code-agent', codeDir), deployedResult('science-agent', scienceDir)],
+      checkAgentCertPresent: () => true,
+      project: 'demo-fleet',
+    };
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, deployPhase);
+    // The decisive assertion: the (agent-independent) explanation is NOT
+    // repeated per agent — DR-044 Decision 6, "three copies of a paragraph
+    // is quieter than one marker plus one footnote."
+    const trustMentions = text.split('Do you trust this folder?').length - 1;
+    expect(trustMentions).toBe(1);
+    const channelsMentions = text.split('Loading development channels').length - 1;
+    expect(channelsMentions).toBe(1);
+    // Both agents still get their OWN attach line — the one agent-specific
+    // piece — each with the CORRECT session name for that agent.
+    expect(text).toContain('tmux attach -t demo-fleet@code-agent');
+    expect(text).toContain('tmux attach -t demo-fleet@science-agent');
+    // The explanation appears BEFORE either agent's attach line (read once,
+    // top of the section, before the per-agent lines).
+    const headerIdx = text.indexOf('Do you trust this folder?');
+    const codeAttachIdx = text.indexOf('tmux attach -t demo-fleet@code-agent');
+    const scienceAttachIdx = text.indexOf('tmux attach -t demo-fleet@science-agent');
+    expect(headerIdx).toBeGreaterThan(-1);
+    expect(headerIdx).toBeLessThan(codeAttachIdx);
+    expect(headerIdx).toBeLessThan(scienceAttachIdx);
+  });
+
+  it('emits NOTHING for an agent whose deploy FAILED (no trust-dialog / tmux-attach text for an agent that never deployed)', () => {
+    const deployedDir = scratchDir();
+    const deployPhase: DeployPhaseRenderInput = {
+      results: [
+        deployedResult('code-agent', deployedDir),
+        { role: 'science-agent', destDir: '/unused', outcome: { role: 'science-agent', status: 'failed', reason: 'clone failed' } },
+      ],
+      checkAgentCertPresent: () => true,
+      project: 'demo-fleet',
+    };
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, deployPhase);
+    // The deployed agent gets the full guidance block.
+    const codeIdx = text.indexOf(`tmux attach -t demo-fleet@code-agent`);
+    expect(codeIdx).toBeGreaterThan(-1);
+    // The failed agent's role never appears anywhere in the launch section
+    // — no guidance, no attach command, nothing implying it can be launched.
+    const launchSectionIdx = text.indexOf('Next step — launch the deployed agent(s):');
+    expect(launchSectionIdx).toBeGreaterThan(-1);
+    expect(text.slice(launchSectionIdx)).not.toContain('science-agent');
+  });
+
+  it('omits the guidance entirely (no trust-dialog / tmux-attach text) when an agent has NO cert yet — the existing ⚠ warning bullet stands alone', () => {
+    const destDir = scratchDir();
+    const deployPhase: DeployPhaseRenderInput = {
+      results: [deployedResult('code-agent', destDir)],
+      checkAgentCertPresent: () => false,
+      project: 'demo-fleet',
+    };
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, deployPhase);
+    expect(text).toContain('no mTLS cert');
+    expect(text).not.toContain('tmux attach');
+    expect(text).not.toContain('Do you trust this folder');
   });
 });

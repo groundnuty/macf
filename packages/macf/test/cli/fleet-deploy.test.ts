@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { runFleetDeploy, type FleetDeployCommandDeps } from '../../src/cli/commands/fleet-deploy.js';
 import type { InitOptions } from '../../src/cli/commands/init.js';
-import { agentCertPath, agentKeyPath } from '../../src/cli/config.js';
+import { agentCertPath, agentKeyPath, writeAgentConfig } from '../../src/cli/config.js';
 import { createCA } from '@groundnuty/macf-core';
 
 /**
@@ -302,6 +302,88 @@ describe('runFleetDeploy — happy path + rendering', () => {
     }
   });
 
+  it('macf#994: names BOTH first-launch prompts + the exact tmux attach command (falls back to role when no macf-agent.json was written)', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          // No macf-agent.json written — nextStepLines must fall back to the
+          // manifest-declared role, never crash.
+          initAgent: async () => {},
+        }),
+      );
+      expect(code).toBe(0);
+      const out = cap.logs.join('\n');
+      // Prompt 1 — the trust dialog. Named, never answered.
+      expect(out).toContain('Do you trust this folder?');
+      // Prompt 2 — the channels confirmation. Worded conditionally
+      // (macf#994: "may ALSO need"), not asserted to always appear.
+      expect(out).toContain('Loading development channels');
+      expect(out).toContain('may ALSO need a manual answer');
+      // The exact reach-it command, falling back to the manifest role
+      // ("code-agent") since no on-disk config exists in this fixture.
+      expect(out).toContain('tmux attach -t demo-fleet@code-agent');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('macf#994: the tmux attach command uses routing_label, NEVER agent_name, when a deployed workspace\'s config diverges (the decisive session-naming fixture)', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          // Simulates the REAL initAgent writing macf-agent.json with
+          // agent_name != routing_label — the macf#678 science-agent shape
+          // (`agent_name=macf-science-agent`, `routing_label=science-agent`).
+          // A fixture where they COINCIDE would pass even with the wrong
+          // field read; this is the decisive test macf#994 asks for.
+          initAgent: async (d) => {
+            writeAgentConfig(d, {
+              project: 'demo-fleet',
+              agent_name: 'demo-fleet-code-agent',
+              agent_role: 'code-agent',
+              routing_label: 'totally-different-routing-label',
+              agent_type: 'permanent',
+              registry: { type: 'profile', user: 'groundnuty' },
+            });
+          },
+        }),
+      );
+      expect(code).toBe(0);
+      const out = cap.logs.join('\n');
+      expect(out).toContain('tmux attach -t demo-fleet@totally-different-routing-label');
+      expect(out).not.toContain('demo-fleet@demo-fleet-code-agent');
+      expect(out).not.toContain('demo-fleet@code-agent');
+    } finally {
+      cap.restore();
+    }
+  });
+
   it('when the vault has NO per-project CA, the next-step block names the real gap (provision the CA) — NEVER hand-copy advice (macf#976)', async () => {
     const { manifestPath, dir } = writeManifest();
     const destDir = join(dir, 'workspace');
@@ -536,6 +618,43 @@ describe('runFleetDeploy — App-key fingerprint mismatch (macf#975)', () => {
       expect(parsed.outcome.reason).not.toContain(VAULT_KEY_PEM);
       // The stale on-disk key was never overwritten by the refusal path.
       expect(readFileSync(keyPath, 'utf-8')).toBe(STALE_ON_DISK_PEM);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('macf#994: a FAILED deploy emits NO first-launch guidance (no trust-dialog / tmux-attach text for an agent that never deployed)', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const keyPath = join(scratchDir(), 'code-agent.pem');
+    writeFileSync(keyPath, STALE_ON_DISK_PEM, { mode: 0o600 });
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        // Non-JSON render — this is the human-facing path `nextStepLines`
+        // (and therefore macf#994's guidance block) would append to, IF it
+        // were reached for a failed outcome. It must not be.
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from(VAULT_KEY_PEM, 'utf-8').toString('base64'),
+            };
+          },
+          initAgent: async () => {
+            throw new Error('must not be called — refused before initAgent');
+          },
+          keyPathFor: () => keyPath,
+        }),
+      );
+      expect(code).toBe(1);
+      const out = [...cap.logs, ...cap.errs].join('\n');
+      expect(out).not.toContain('tmux attach');
+      expect(out).not.toContain('Do you trust this folder');
+      expect(out).not.toContain('Loading development channels');
     } finally {
       cap.restore();
     }
