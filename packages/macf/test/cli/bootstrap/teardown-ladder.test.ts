@@ -119,7 +119,17 @@ function makeStatefulFakeBackend() {
     return 'already-absent';
   };
 
-  return { checkMeta, archiveRepo, deleteRegistryVariable, registryVars, repoArchived };
+  // groundnuty/macf#1033 — this ladder test predates the graceful-stop state
+  // machine and is about REGISTRY/REPO re-run idempotency across the three
+  // rungs, not agent liveness; every agent classifies 'dead' so every
+  // agent_registration target keeps taking the SAME direct-delete path this
+  // file's assertions already depend on.
+  const checkRegistryPresence = async (_registry: unknown, name: string) => (registryVars.has(name) ? ('present' as const) : ('absent' as const));
+  const checkAgentReachability = async () => 'dead' as const;
+  const requestGracefulExit = async (): Promise<void> => {};
+  const sleep = async (): Promise<void> => {};
+
+  return { checkMeta, archiveRepo, deleteRegistryVariable, checkRegistryPresence, checkAgentReachability, requestGracefulExit, sleep, registryVars, repoArchived };
 }
 
 describe('the full ladder — deactivate -> archive -> delete-apps — runs clean end to end on one fleet (groundnuty/macf#917)', () => {

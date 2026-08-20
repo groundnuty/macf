@@ -357,6 +357,13 @@ describe('executeDeleteApps', () => {
         deletedNames.push(name);
         return 'deleted';
       },
+      // groundnuty/macf#1033 — `delete-apps` is explicitly OUT OF SCOPE for
+      // the graceful-stop feature; 'dead' keeps every agent_registration
+      // target on the SAME direct-delete path this test already asserts.
+      checkRegistryPresence: async () => 'absent',
+      checkAgentReachability: async () => 'dead',
+      requestGracefulExit: async () => {},
+      sleep: async () => {},
       checkMeta: async () => ({ presence: 'present', archived: false }),
       archiveRepo: async (repo) => {
         archivedRepos.push(repo);
@@ -526,6 +533,13 @@ describe('executeDestroy', () => {
         deletedVars.push(name);
         return 'deleted';
       },
+      // groundnuty/macf#1033 — `destroy` is explicitly OUT OF SCOPE for the
+      // graceful-stop feature; 'dead' keeps every agent_registration target
+      // on the SAME direct-delete path this test already asserts.
+      checkRegistryPresence: async () => 'absent',
+      checkAgentReachability: async () => 'dead',
+      requestGracefulExit: async () => {},
+      sleep: async () => {},
       deleteRepo: async (repo) => {
         deletedRepos.push(repo);
         return 'deleted';

@@ -41,12 +41,33 @@ import type {
   DeactivateInventoryEntry,
   DeactivateTarget,
   RepoArchiveOutcome,
+  TeardownAgentDeps,
   TeardownControlRepoDeps,
   TeardownGate,
   TeardownRepoArchiveDeps,
   TeardownVariableDeps,
   VariableTeardownOutcome,
 } from '../bootstrap/teardown.js';
+
+/**
+ * `groundnuty/macf#1033` extended `executeDeactivate` (shared by `deactivate`
+ * / `archive` / this module's `delete-apps` / `destroy`) to stop a LIVE
+ * agent gracefully before deleting its registration. That graceful-stop
+ * behavior is EXPLICITLY OUT OF SCOPE for `delete-apps`/`destroy`
+ * (`teardown.ts`'s own module doc: "explicitly OUT OF SCOPE for this
+ * module" — irreversible rungs need a separate, harder-to-reach command,
+ * never new behavior smuggled in via a shared helper). This shim keeps
+ * BOTH irreversible commands byte-for-byte behaviorally unchanged: every
+ * `agent_registration` target is always classified `'dead'`, so
+ * `executeDeactivate` takes the SAME direct-delete path it always did here
+ * — only the TYPE surface grew (the shared function now requires
+ * `TeardownAgentDeps`), never the runtime behavior of these two commands.
+ */
+const AGENT_STOP_OUT_OF_SCOPE_SHIM: TeardownAgentDeps = {
+  checkAgentReachability: () => Promise.resolve('dead'),
+  requestGracefulExit: () => Promise.resolve(),
+  sleep: () => Promise.resolve(),
+};
 
 const execFileAsync = promisify(execFile);
 
@@ -244,6 +265,7 @@ export interface FleetDeleteAppsDeps
   extends TeardownControlRepoDeps,
     Pick<TeardownVariableDeps, 'checkRegistryPresence' | 'deleteRegistryVariable'>,
     TeardownRepoArchiveDeps,
+    TeardownAgentDeps,
     AppDeletionDeps {
   readonly confirm: (question: string) => Promise<boolean>;
   /** Best-effort `fleet.lock` App-ID enrichment — see `teardown-destructive.ts`'s `IrreversibleTeardownPlanDeps.readFleetLock` doc. Optional; omitting it degrades gracefully to slug-only App-identity targets. */
@@ -262,6 +284,7 @@ export function resolveDeleteAppsDeps(): FleetDeleteAppsDeps {
     openUrl: realOpenUrl,
     checkAppPresence: resolveAppPresenceStatus,
     confirm: realConfirm,
+    ...AGENT_STOP_OUT_OF_SCOPE_SHIM,
   };
 }
 
@@ -409,6 +432,7 @@ export interface FleetDestroyDeps
   extends TeardownControlRepoDeps,
     Pick<TeardownVariableDeps, 'checkRegistryPresence' | 'deleteRegistryVariable'>,
     DestroyRepoDeps,
+    TeardownAgentDeps,
     AppDeletionDeps {
   readonly confirmFleetName: (question: string) => Promise<string>;
   /**
@@ -460,6 +484,7 @@ export function resolveDestroyDeps(): FleetDestroyDeps {
     readEnv: realReadEnv,
     assertAgeIdentityReadable,
     shredAgeIdentity: realShredAgeIdentity,
+    ...AGENT_STOP_OUT_OF_SCOPE_SHIM,
   };
 }
 

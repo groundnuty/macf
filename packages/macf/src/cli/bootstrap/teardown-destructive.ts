@@ -82,6 +82,7 @@ import type {
   DeactivateInventoryEntry,
   DeactivateTarget,
   RepoArchiveOutcome,
+  TeardownAgentDeps,
   TeardownControlRepoDeps,
   TeardownGate,
   TeardownRepoArchiveDeps,
@@ -211,7 +212,10 @@ export async function buildDeleteAppsPlan(manifest: FleetManifest, deps: DeleteA
   return buildIrreversibleTeardownPlan(manifest, deps);
 }
 
-export type DeleteAppsExecuteDeps = Pick<TeardownVariableDeps, 'deleteRegistryVariable'> & TeardownRepoArchiveDeps & AppDeletionDeps;
+export type DeleteAppsExecuteDeps = Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> &
+  TeardownRepoArchiveDeps &
+  TeardownAgentDeps &
+  AppDeletionDeps;
 
 export interface DeleteAppsExecuteResult {
   readonly registryOutcomes: readonly VariableTeardownOutcome[];
@@ -360,7 +364,10 @@ export async function executeDestroyRepos(repos: readonly string[], deps: Destro
   return out;
 }
 
-export type DestroyExecuteDeps = Pick<TeardownVariableDeps, 'deleteRegistryVariable'> & DestroyRepoDeps & AppDeletionDeps;
+export type DestroyExecuteDeps = Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> &
+  DestroyRepoDeps &
+  TeardownAgentDeps &
+  AppDeletionDeps;
 
 export interface DestroyExecuteResult {
   readonly registryOutcomes: readonly VariableTeardownOutcome[];

@@ -78,7 +78,16 @@ function captureConsole(): { logs: string[]; errs: string[]; restore: () => void
   };
 }
 
-/** Gate allowed (`ours`) by default; every mutating call throws unless a test overrides it — surfaces an unexpected touch immediately (same discipline `fleet-teardown.test.ts` uses). */
+/**
+ * Gate allowed (`ours`) by default; every mutating call throws unless a test
+ * overrides it — surfaces an unexpected touch immediately (same discipline
+ * `fleet-teardown.test.ts` uses).
+ *
+ * `checkAgentReachability` defaults to `'dead'` (groundnuty/macf#1033) —
+ * `delete-apps` is explicitly OUT OF SCOPE for the graceful-stop feature, so
+ * every `agent_registration` target keeps taking the SAME direct-delete
+ * path these pre-#1033 tests already assert on.
+ */
 function deleteAppsDepsFor(overrides: Partial<FleetDeleteAppsDeps> = {}): FleetDeleteAppsDeps {
   return {
     checkMeta: async () => ({ presence: 'present', archived: false }),
@@ -91,6 +100,9 @@ function deleteAppsDepsFor(overrides: Partial<FleetDeleteAppsDeps> = {}): FleetD
       throw new Error('must not be called — this test did not override archiveRepo');
     },
     confirm: async () => true,
+    checkAgentReachability: async () => 'dead',
+    requestGracefulExit: async () => {},
+    sleep: async () => {},
     ...overrides,
   };
 }
@@ -112,6 +124,12 @@ function destroyDepsFor(overrides: Partial<FleetDestroyDeps> = {}): FleetDestroy
     },
     readEnv: () => undefined,
     assertAgeIdentityReadable: () => {},
+    // groundnuty/macf#1033 — `destroy` is explicitly OUT OF SCOPE for the
+    // graceful-stop feature; 'dead' keeps the pre-#1033 direct-delete
+    // behavior for every agent_registration target.
+    checkAgentReachability: async () => 'dead',
+    requestGracefulExit: async () => {},
+    sleep: async () => {},
     ...overrides,
   };
 }
