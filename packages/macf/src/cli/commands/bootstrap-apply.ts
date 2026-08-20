@@ -586,6 +586,22 @@ async function realOpenUrl(url: string): Promise<void> {
  * hang on). The instruction text itself is unconditional either way — this
  * hook only ever gates the PAUSE, never the printing (`announceAndOpenGate`'s
  * `deps.log` calls run regardless).
+ *
+ * **A second, independent reason a non-`--yes` run is never a SURPRISE hang:**
+ * `runBootstrapApply` already gates entry to `applyFleet` (and therefore every
+ * gate) on `realConfirmPlan`'s own blocking prompt — `opts.yes === true ? true
+ * : await mutate.confirmPlan(...)`. Any invocation that reaches a consent gate
+ * without `--yes` has, by construction, already sat through one interactive
+ * prompt on the SAME stdin; this hook adds no NEW class of "a script that
+ * never expected to block did." A future auto-approve path that bypasses
+ * `confirmPlan` while still reaching this closure would reintroduce that gap
+ * — anyone adding one must thread `assumeYes` through it too.
+ *
+ * The `rl.on('close', ...)` below is defence-in-depth on top of both of the
+ * above, not a substitute: if stdin is CLOSED (piped-from-`/dev/null`,
+ * redirected-EOF) rather than merely non-interactive, `question`'s callback
+ * never fires — `close` does, and this run's beat resolves instead of
+ * hanging on a stream that will never produce another byte.
  */
 function realWaitForOperatorBeat(assumeYes: boolean): (role: string, gateLabel: string) => Promise<void> {
   if (assumeYes) {
@@ -595,10 +611,12 @@ function realWaitForOperatorBeat(assumeYes: boolean): (role: string, gateLabel: 
     new Promise((resolve) => {
       process.stderr.write(`Role "${role}": press Enter to open the browser for ${gateLabel}… `);
       const rl = createInterface({ input: process.stdin, output: process.stderr });
-      rl.question('', () => {
+      const done = (): void => {
         rl.close();
         resolve();
-      });
+      };
+      rl.once('close', done);
+      rl.question('', done);
     });
 }
 
