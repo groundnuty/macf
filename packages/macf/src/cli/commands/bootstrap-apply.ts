@@ -1437,8 +1437,16 @@ function formatVersionReconcileLine(versionPhase: ApplyVersionPhaseResult): stri
     return `Version reconcile: HALTED — a bad release stopped the roll toward macf@${target} (see log above; ${cite}).`;
   }
   const rolled = versionPhase.rolledAgents ?? [];
+  const breakdown = versionPhase.skipBreakdown ?? [];
   if (rolled.length > 0) {
-    return `Version reconcile: rolled ${String(rolled.length)} agent(s) to macf@${target} — ${rolled.join(', ')} (${cite}).`;
+    // groundnuty/macf#1053 review — a PARTIAL roll (some agents rolled,
+    // others busy/config-dirty/branch-mismatched/stale-pinned) must name
+    // BOTH halves. Returning early on `rolled.length > 0` alone silently
+    // dropped `breakdown` here — the exact "summary reads as authoritative
+    // while describing something that did not happen" shape this issue is
+    // about, reproduced one branch over.
+    const notRolledNote = breakdown.length > 0 ? ` — ${breakdown.join(', ')} not rolled` : '';
+    return `Version reconcile: rolled ${String(rolled.length)} agent(s) to macf@${target} — ${rolled.join(', ')}${notRolledNote} (${cite}).`;
   }
   // Zero rolled — say so explicitly, with a reason, per macf#1053's
   // requirement 3 ("a no-op must not read as a completed roll"). The
@@ -1454,9 +1462,12 @@ function formatVersionReconcileLine(versionPhase: ApplyVersionPhaseResult): stri
     );
   }
   const total = versionPhase.totalMembers ?? 0;
-  const breakdown = versionPhase.skipBreakdown ?? [];
+  // "discovered member(s)" (not "declared agent(s)") — `total` counts what
+  // THIS host found locally (`report.fleets[0].plans.length`), which can be
+  // fewer than the manifest's full agent list when only some workspaces are
+  // reachable from here; naming it "declared" would overclaim.
   const reason = breakdown.length > 0 ? breakdown.join(', ') : total > 0 ? 'none behind target' : 'no fleet members discovered locally';
-  return `Version reconcile: 0 of ${String(total)} agent(s) rolled toward macf@${target} — ${reason}.${flaglessNote} (${cite}).`;
+  return `Version reconcile: 0 of ${String(total)} discovered member(s) rolled toward macf@${target} — ${reason}.${flaglessNote} (${cite}).`;
 }
 
 /**

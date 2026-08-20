@@ -3232,7 +3232,32 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, VERSION_ROLLED);
     expect(text).toMatch(/Version reconcile: rolled 2 agent\(s\) to macf@0\.2\.57 — code-agent, science-agent/);
     expect(text).not.toMatch(/could not attempt/);
-    expect(text).not.toMatch(/0 of \d+ agent/);
+    expect(text).not.toMatch(/0 of \d+/);
+  });
+
+  it('formatApplyResult: a PARTIAL roll names BOTH the rolled agent(s) AND what was skipped (never drops the skip breakdown)', () => {
+    // groundnuty/macf#1053 review — the `rolled.length > 0` branch used to
+    // return before `skipBreakdown` was ever read, so 1 rolled + 2 busy
+    // rendered identically to 1 rolled + 0 remaining: the exact
+    // "authoritative-looking summary that omits what didn't happen" shape
+    // this issue reports, reproduced in this branch. Decisive per
+    // `assert-the-wrong-path.md`: compare against the CLEAN-roll line, not
+    // just "the text is non-empty" — a weaker assertion passes either way.
+    const partial: ApplyVersionPhaseResult = {
+      attempted: true,
+      target: '0.2.57',
+      halted: false,
+      rolledAgents: ['code-agent'],
+      unreachable: false,
+      totalMembers: 3,
+      skipBreakdown: ['2 busy'],
+    };
+    const clean: ApplyVersionPhaseResult = { ...partial, totalMembers: 1, skipBreakdown: [] };
+    const partialText = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, partial);
+    const cleanText = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, clean);
+    expect(partialText).toMatch(/Version reconcile: rolled 1 agent\(s\) to macf@0\.2\.57 — code-agent — 2 busy not rolled/);
+    expect(partialText).not.toBe(cleanText);
+    expect(cleanText).not.toMatch(/not rolled/);
   });
 
   it('formatApplyResult: an unreachable fleet says "could not attempt", never "completed"', () => {
@@ -3264,7 +3289,7 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
       skipBreakdown: ['1 busy', '1 config-dirty'],
     };
     const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, versionPhase);
-    expect(text).toMatch(/Version reconcile: 0 of 2 agent\(s\) rolled toward macf@0\.2\.57 — 1 busy, 1 config-dirty/);
+    expect(text).toMatch(/Version reconcile: 0 of 2 discovered member\(s\) rolled toward macf@0\.2\.57 — 1 busy, 1 config-dirty/);
     expect(text).not.toMatch(/completed/);
     expect(text).not.toMatch(/could not attempt/);
   });
@@ -3280,7 +3305,7 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
       skipBreakdown: [],
     };
     const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, versionPhase);
-    expect(text).toMatch(/Version reconcile: 0 of 2 agent\(s\) rolled toward macf@0\.2\.57 — none behind target/);
+    expect(text).toMatch(/Version reconcile: 0 of 2 discovered member\(s\) rolled toward macf@0\.2\.57 — none behind target/);
   });
 
   it('formatApplyResult: no fleet members discovered at all (0 total, reachable) names that, distinct from unreachable', () => {
@@ -3294,7 +3319,7 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
       skipBreakdown: [],
     };
     const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, versionPhase);
-    expect(text).toMatch(/Version reconcile: 0 of 0 agent\(s\) rolled toward macf@0\.2\.57 — no fleet members discovered locally/);
+    expect(text).toMatch(/Version reconcile: 0 of 0 discovered member\(s\) rolled toward macf@0\.2\.57 — no fleet members discovered locally/);
     expect(text).not.toMatch(/driver-unresolved/);
   });
 
@@ -3348,6 +3373,20 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     };
     expect(json.version_phase.rolled_agents).toEqual([]);
     expect(json.version_phase.unreachable).toBe(true);
+  });
+
+  // groundnuty/macf#1053 hard constraint — "do not change what the version
+  // phase DOES, this is reporting only." `applyExitCode` reads ONLY
+  // `versionPhase?.halted`, never any of the new discriminator fields — so a
+  // no-op / unreachable reconcile exits exactly as it did before this issue
+  // (0, same as a genuine roll); only HALTED still forces non-zero.
+  it('applyExitCode: an unreachable/no-op version phase does NOT force a non-zero exit (reporting only, unchanged)', () => {
+    expect(applyExitCode(resultWith({}), [], VERSION_UNREACHABLE)).toBe(0);
+    expect(applyExitCode(resultWith({}), [], { attempted: true, target: '0.2.57', halted: false, rolledAgents: [], unreachable: false, totalMembers: 2, skipBreakdown: ['1 busy', '1 config-dirty'] })).toBe(0);
+  });
+
+  it('applyExitCode: HALTED still forces a non-zero exit, exactly as before #1053', () => {
+    expect(applyExitCode(resultWith({}), [], { attempted: true, target: '0.2.57', halted: true })).toBe(1);
   });
 });
 
