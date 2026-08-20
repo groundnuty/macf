@@ -15,7 +15,17 @@ import { resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
 import { parseFleetManifest } from '../bootstrap/fleet-manifest.js';
 import type { FleetObserverFn, FleetPlanFailure } from '../bootstrap/plan.js';
-import { checkVaultFlagsComplete, computePlan, fleetPlanFailureToJson, fleetPlanToJson, formatPlanText } from '../bootstrap/plan.js';
+import {
+  checkVaultFlagsComplete,
+  computePlan,
+  countAppsToCreate,
+  fleetPlanFailureToJson,
+  fleetPlanToJson,
+  formatOperatorInteractionLine,
+  formatPlanText,
+  operatorInteractionBudget,
+  operatorInteractionToJson,
+} from '../bootstrap/plan.js';
 import { githubRegistryObserver, vaultAwareObserver } from '../bootstrap/observer.js';
 
 export interface RunBootstrapPlanOptions {
@@ -112,11 +122,19 @@ export async function runBootstrapPlan(
   try {
     const observed = await resolved.observe(manifest);
     const plan = computePlan(manifest, observed);
+    // groundnuty/macf#880 — the operator's consent-click budget, projected
+    // from the SAME `plan.items` this render already computed (no new
+    // observation; see `plan.ts`'s "Operator interaction budget" section
+    // doc for why `--vault`/`--identity-key` on `plan` itself never tightens
+    // this number — only `apply`'s confirm-before-create guard can).
+    const budget = operatorInteractionBudget(countAppsToCreate(plan.items));
 
     if (opts.json) {
-      console.log(JSON.stringify(fleetPlanToJson(plan), null, 2));
+      console.log(JSON.stringify({ ...(fleetPlanToJson(plan) as Record<string, unknown>), operator_interaction: operatorInteractionToJson(budget) }, null, 2));
     } else {
       console.log(formatPlanText(plan));
+      console.log('');
+      console.log(formatOperatorInteractionLine(budget));
     }
     return 0;
   } catch (err) {

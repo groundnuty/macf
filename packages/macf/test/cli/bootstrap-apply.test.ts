@@ -1906,6 +1906,336 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(out).toMatch(/code-agent: REUSED/);
     expect(out).toMatch(/science-agent: REUSED/);
   });
+
+  // --- Operator interaction budget (groundnuty/macf#880) ---
+  //
+  // Anchored on `displayCreations.length` (the SAME vault-aware-filtered
+  // list `formatPlannedAppCreations` already renders — see that function's
+  // doc), not `plan.items` directly: `bootstrap-apply.ts`'s own `plan` is
+  // ALWAYS built from the non-vault-aware `githubRegistryObserver`
+  // (`resolved.observe` defaults to it unconditionally), so `plan.items`
+  // never reflects a vault-confirmed reuse — only `displayCreations` does.
+  // Using `plan.items` here would print an overstated number on exactly the
+  // run that matters most (archive→revive, macf#913/#915's zero-click
+  // property).
+  describe('operator interaction budget (groundnuty/macf#880)', () => {
+    // --- resume-install: gate 1 is SKIPPED but gate 2 STILL RUNS ---
+    //
+    // `filterCreationsByPreview` drops every non-'create' decision —
+    // correctly, for GATE 1. But `apply-agent.ts::runGate2WithInterstitial`
+    // is "called for BOTH the create path and the resume-install path —
+    // every gate-2 run gets an interstitial, regardless of how gate 2 was
+    // reached." A role whose preview decision is 'resume-install' (App
+    // confirmed live, ZERO installs) is therefore dropped from
+    // `displayCreations` (gate 1 correctly excluded) but STILL costs one
+    // gate-2 install flow — a gate-1-only count would silently drop it,
+    // which is exactly the false-"none" regression these two tests pin.
+
+    it('DECISIVE — every role resume-install (gate1=0, gate2>0): NEVER "none" — a fleet needing ONLY install flows is not zero-click', async () => {
+      const file = writeManifest();
+      const observedWithLock: ObservedState = {
+        lock: {
+          schema_version: 1,
+          fleet: 'demo-fleet',
+          agents: [
+            { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+            { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+            { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+          ],
+        },
+        // Empty, same as the fully-provisioned tests below — plan.items
+        // shows every agent app as a create-candidate; ONLY the vault-aware
+        // preview (via `lock` above) resolves the real decision.
+        agents: {},
+        caRegistry: 'present',
+        caRepos: {},
+        controlRepoPresence: 'present',
+      };
+      const code = await runBootstrapApply(
+        { file, dryRun: true, json: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+        {
+          observe: () => Promise.resolve(observedWithLock),
+          readVault: async () => vaultRawWithAgentAndRunnerOpsPems(['code-agent', 'science-agent']),
+          // BOTH agents confirmed live with ZERO installs — 'resume-install'
+          // for both, per `confirmBeforeCreateGuard`'s `'app-no-install'`
+          // switch arm. Runner-ops never reaches this fake at all (its
+          // plan-level item is already noop via the lock entry above; see
+          // `countResumeInstallFlows`'s doc for why the preview never even
+          // loops it).
+          confirmAppInstallation: async () => ({ status: 'app-no-install' }),
+        },
+      );
+      expect(code).toBe(0);
+      const json = JSON.parse(logs.join('')) as {
+        planned_app_creations: readonly unknown[];
+        operator_interaction: { gate1_clicks: number; gate2_flows: number; bound: string };
+      };
+      expect(json.planned_app_creations).toEqual([]); // gate 1 correctly empty — both roles' Apps already exist
+      // ...but gate 2 is NOT empty: both roles still need their install flow.
+      expect(json.operator_interaction).toEqual({ gate1_clicks: 0, gate2_flows: 2, bound: 'maximum' });
+      const out = logs.join('\n');
+      expect(out).not.toContain('Operator interaction: none — no consent gates this run.');
+    });
+
+    it('DECISIVE — one create + one resume-install: gate1_clicks !== gate2_flows, text names both counts directly (never "Apps to create")', async () => {
+      const file = writeManifest();
+      const observedWithLock: ObservedState = {
+        lock: {
+          schema_version: 1,
+          fleet: 'demo-fleet',
+          // ONLY code-agent has a prior lock entry — science-agent is a
+          // genuine first-time create-candidate; runner-ops noop as usual.
+          agents: [
+            { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+            { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+          ],
+        },
+        agents: {},
+        caRegistry: 'present',
+        caRepos: {},
+        controlRepoPresence: 'present',
+      };
+      const code = await runBootstrapApply(
+        { file, dryRun: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+        {
+          observe: () => Promise.resolve(observedWithLock),
+          readVault: async () => vaultRawWithAgentAndRunnerOpsPems(['code-agent']),
+          confirmAppInstallation: async () => ({ status: 'app-no-install' }), // code-agent -> resume-install
+        },
+      );
+      expect(code).toBe(0);
+      const out = logs.join('\n');
+      // code-agent RESUMEs (gate 1 skipped, gate 2 still runs); science-agent
+      // has no prior lock entry at all -> genuine CREATE (both gates).
+      expect(out).toMatch(/code-agent: RESUME INSTALL/);
+      expect(out).toMatch(/demo-fleet-science-agent\s+\(role: science-agent/); // still in "would be created"
+      expect(out).not.toMatch(/demo-fleet-code-agent\s+\(role: code-agent/); // dropped — gate 1 will NOT open
+      expect(out).toContain('up to 1 "Create GitHub App" click');
+      expect(out).toContain('up to 2 install flows');
+      expect(out).toContain('1 already-created App still needs its install flow');
+    });
+
+    it('DECISIVE — fresh 2-agent fleet, --dry-run, no vault flags: 3 Apps to create (2 agents + runner-ops) -> honest maximum of 6 total consent-gate clicks (3 gate-1 + 3 gate-2)', async () => {
+      const file = writeManifest();
+      const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+      expect(code).toBe(0);
+      const out = logs.join('\n');
+      expect(out).toMatch(/Operator interaction: up to 3 Apps to create/);
+      expect(out).toContain('3 "Create GitHub App" clicks');
+      expect(out).toContain('3 install flows');
+      expect(out).toContain('macf#913/#915');
+    });
+
+    it('DECISIVE — fresh 2-agent fleet, --dry-run --json: operator_interaction carries gate1_clicks/gate2_flows both = 3 (2 declared agents + the unconditional runner-ops), bound "maximum"', async () => {
+      const file = writeManifest();
+      const code = await runBootstrapApply({ file, dryRun: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+      expect(code).toBe(0);
+      const json = JSON.parse(logs.join('')) as {
+        operator_interaction: { gate1_clicks: number; gate2_flows: number; bound: string };
+      };
+      expect(json.operator_interaction).toEqual({ gate1_clicks: 3, gate2_flows: 3, bound: 'maximum' });
+    });
+
+    it('adding one agent to an already-provisioned fleet (2 existing confirmed via vault, 1 new): budget is 2 clicks (1 App)', async () => {
+      const file = writeManifest(
+        FLEET_YAML.replace(
+          '  - role: science-agent',
+          '  - role: new-agent\n    profile: code\n    repo: groundnuty/demo-new-agent\n    deploy_path: /home/ubuntu/repos/demo-new-agent\n  - role: science-agent',
+        ),
+      );
+      const observedWithLock: ObservedState = {
+        lock: {
+          schema_version: 1,
+          fleet: 'demo-fleet',
+          agents: [
+            { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+            { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+            { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+          ],
+        },
+        agents: {},
+        caRegistry: 'present',
+        caRepos: {},
+        controlRepoPresence: 'present',
+      };
+      const code = await runBootstrapApply(
+        { file, dryRun: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+        {
+          observe: () => Promise.resolve(observedWithLock),
+          readVault: async () => vaultRawWithAgentAndRunnerOpsPems(['code-agent', 'science-agent']),
+          confirmAppInstallation: async (appId) => ({
+            status: 'confirmed',
+            install: {
+              appId,
+              installId: appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-3',
+              appSlug: '',
+              accountLogin: 'groundnuty',
+            },
+          }),
+        },
+      );
+      expect(code).toBe(0);
+      const out = logs.join('\n');
+      expect(out).toMatch(/code-agent: REUSE/);
+      expect(out).toMatch(/science-agent: REUSE/);
+      expect(out).toMatch(/Operator interaction: up to 1 App to create/);
+      expect(out).toContain('1 "Create GitHub App" click ');
+      expect(out).toContain('1 install flow (');
+    });
+
+    // groundnuty/macf#880 — a PRODUCTION-shape zero test. `githubRegistryObserver`
+    // derives `observed.agents[role].app` FROM `lock` (`lockEntry ? 'present'
+    // : 'unknown'` — `observer.ts`), so a lock populated with `agents: {}`
+    // (the shape the tests below this one use) is unreachable from the real
+    // observer: where the lock has an entry, `observed.agents` reports
+    // 'present' too. This test uses that PRODUCTION-REACHABLE shape — no
+    // vault flags needed at all, since `plan.items` itself already shows
+    // every app/runner_ops item as noop.
+    it('a fully-provisioned fleet, PRODUCTION shape (observed.agents populated, no vault flags): "none — no consent gates this run"', async () => {
+      const file = writeManifest();
+      const observedProduction: ObservedState = {
+        lock: {
+          schema_version: 1,
+          fleet: 'demo-fleet',
+          agents: [
+            { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+            { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+            { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+          ],
+        },
+        agents: {
+          'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} },
+          'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} },
+        },
+        caRegistry: 'present',
+        caRepos: {},
+        controlRepoPresence: 'present',
+      };
+      const code = await runBootstrapApply({ file, dryRun: true, json: true }, { observe: () => Promise.resolve(observedProduction) });
+      expect(code).toBe(0);
+      const json = JSON.parse(logs.join('')) as {
+        planned_app_creations: readonly unknown[];
+        operator_interaction: { gate1_clicks: number; gate2_flows: number; bound: string };
+      };
+      expect(json.planned_app_creations).toEqual([]);
+      expect(json.operator_interaction).toEqual({ gate1_clicks: 0, gate2_flows: 0, bound: 'exact' });
+    });
+
+    // NOTE — this test's `observe` fake (`agents: {}` + a populated `lock`)
+    // is a shape the REAL `githubRegistryObserver` cannot emit (it derives
+    // `observed.agents[role].app` FROM `lock` — see `observer.ts` — so a
+    // populated lock always implies 'present' agents too). It exists to
+    // isolate ONE thing: does the budget line track `displayCreations`
+    // (post vault-preview) rather than `plan.items` (pre-preview)? The
+    // PRODUCTION-reachable zero-click shape is the "PRODUCTION shape" test
+    // above this one (no vault flags needed — plan.items alone is already
+    // all-noop). This test's value is the wiring proof, not the "does a
+    // real fleet reach zero via vault flags" claim.
+    it('DECISIVE — a fully-provisioned fleet WITH --vault/--identity-key: every App (agents + runner-ops) confirmed REUSED -> "none — no consent gates this run", stated explicitly', async () => {
+      const file = writeManifest();
+      const observedWithLock: ObservedState = {
+        lock: {
+          schema_version: 1,
+          fleet: 'demo-fleet',
+          agents: [
+            { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+            { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+            { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+          ],
+        },
+        // Deliberately EMPTY — see the NOTE above this test.
+        agents: {},
+        caRegistry: 'present',
+        caRepos: {},
+        controlRepoPresence: 'present',
+      };
+      const code = await runBootstrapApply(
+        { file, dryRun: true, json: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+        {
+          observe: () => Promise.resolve(observedWithLock),
+          readVault: async () => vaultRawWithAgentAndRunnerOpsPems(['code-agent', 'science-agent']),
+          confirmAppInstallation: async (appId) => ({
+            status: 'confirmed',
+            install: {
+              appId,
+              installId: appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-3',
+              appSlug: '',
+              accountLogin: 'groundnuty',
+            },
+          }),
+        },
+      );
+      expect(code).toBe(0);
+      const json = JSON.parse(logs.join('')) as {
+        planned_app_creations: readonly unknown[];
+        operator_interaction: { gate1_clicks: number; gate2_flows: number; bound: string };
+      };
+      expect(json.planned_app_creations).toEqual([]); // every role REUSED, none left "would be created"
+      expect(json.operator_interaction).toEqual({ gate1_clicks: 0, gate2_flows: 0, bound: 'exact' });
+    });
+
+    it('DECISIVE — the SAME fully-provisioned fixture, plain text, non-json: "Operator interaction: none — no consent gates this run." stated explicitly, not silently omitted', async () => {
+      const file = writeManifest();
+      const observedWithLock: ObservedState = {
+        lock: {
+          schema_version: 1,
+          fleet: 'demo-fleet',
+          agents: [
+            { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+            { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+            { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+          ],
+        },
+        agents: {},
+        caRegistry: 'present',
+        caRepos: {},
+        controlRepoPresence: 'present',
+      };
+      const code = await runBootstrapApply(
+        { file, dryRun: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+        {
+          observe: () => Promise.resolve(observedWithLock),
+          readVault: async () => vaultRawWithAgentAndRunnerOpsPems(['code-agent', 'science-agent']),
+          confirmAppInstallation: async (appId) => ({
+            status: 'confirmed',
+            install: {
+              appId,
+              installId: appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-3',
+              appSlug: '',
+              accountLogin: 'groundnuty',
+            },
+          }),
+        },
+      );
+      expect(code).toBe(0);
+      expect(logs.join('\n')).toContain('Operator interaction: none — no consent gates this run.');
+    });
+
+    it('the REAL (non-dry-run) pre-approval render carries the identical budget line on stderr — same formatPlannedAppCreations call site', async () => {
+      // The pre-approval render uses `process.stderr.write` directly (never
+      // `console.error`), same channel `resolveMutateDeps`'s `log` field
+      // uses — see the existing "decrypt failure" test above for the same
+      // spy pattern.
+      const file = writeManifest();
+      const rawWrites: string[] = [];
+      const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+        rawWrites.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+        return true;
+      });
+      let code: number;
+      try {
+        code = await runBootstrapApply(
+          { file, yes: true, deploy: false },
+          { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+          fakeMutateDeps(file),
+        );
+      } finally {
+        writeSpy.mockRestore();
+      }
+      expect(code).toBe(0);
+      expect(rawWrites.join('')).toMatch(/Operator interaction: up to 3 Apps to create/);
+    });
+  });
 });
 
 // --- runBootstrapApply — remaining-deploy honest completion (macf#1014) ---

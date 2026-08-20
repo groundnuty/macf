@@ -1525,6 +1525,168 @@ export function formatRegistryRepoScopeLines(notices: readonly RegistryRepoScope
   return notices.map((n) => `registry: NOTICE — ${n.message}`);
 }
 
+// --- Operator interaction budget (groundnuty/macf#880, DR-044 Decision 6) ---
+//
+// DR-044 §D2's operator cost model is measured in consent clicks; Amendment
+// G extends that to the whole lifecycle (revival cost in clicks). Neither
+// `plan` nor `apply --dry-run` told the operator the interaction budget
+// up front — they discovered the click count by living it, one browser tab
+// at a time. This section is a PURE PROJECTION over counts a caller
+// already computed — no new observation (the #1000 golden-path rule: one
+// way to answer "how many gates," not a second one that could drift from
+// the first).
+//
+// gate1 (App creation) and gate2 (install) are counted SEPARATELY, not as
+// one number doubled — they are NOT always equal. Every `'app'`-kind create
+// item (or the unconditional `'runner_ops'`-kind one, macf#943) is ONE
+// gate-1-then-gate-2 pair — the common case `countAppsToCreate` covers. But
+// `apply-agent.ts`'s vault-aware confirm-before-create guard can ALSO
+// produce a `'resume-install'` decision (an App exists, confirmed live, with
+// ZERO installs) — gate 1 is SKIPPED for that role, but gate 2 still runs
+// (`apply-agent.ts::runGate2WithInterstitial`'s own doc: "Called for BOTH
+// the create path and the resume-install path — every gate-2 run gets an
+// interstitial, regardless of how gate 2 was reached"). A role in that state
+// is EXCLUDED from `commands/bootstrap-apply.ts::filterCreationsByPreview`'s
+// output (it dropped every non-`'create'` decision, correctly, for GATE 1),
+// so a gate-1-only count silently underclaims gate 2 for it — the one
+// direction `bound: 'maximum'` promises never happens. Callers that can see
+// `'resume-install'` decisions (only `bootstrap-apply.ts`'s vault-aware
+// preview can; `plan` never live-confirms) MUST fold that count into their
+// gate-2 number before calling {@link operatorInteractionBudget} — see that
+// function's doc.
+//
+// **Known residual — NOT closed by the fold-in above.** The preview that
+// detects `'resume-install'` (`commands/bootstrap-apply.ts::previewIdentityDecisions`)
+// loops ONLY `manifest.agents` — it structurally never considers
+// `RUNNER_OPS_ROLE` (a fleet-level identity `FleetManifest.agents[]` never
+// declares — `apply-runner-ops.ts`'s own doc). So a runner-ops App that
+// exists live with zero installs is invisible to `countResumeInstallFlows`
+// too: `bound: 'maximum'` still holds (the reported gate-2 count is a
+// ceiling on what THIS preview could see), but it is not a ceiling on the
+// real run's gate-2 opens in that one narrow lane. Extending the preview to
+// cover `RUNNER_OPS_ROLE` is a NEW observation (a live confirm this module
+// doesn't make today) — out of `commands/bootstrap-apply.ts`'s current
+// preview shape, left for a future increment rather than folded in here.
+
+/**
+ * How many App-identity creations (coordination agents + the runner-ops)
+ * this plan's items call for — gate-1 driver in the common case where every
+ * counted role also needs gate 2 (the `plan`-only vantage point: it never
+ * live-confirms, so it cannot distinguish a `'resume-install'`-shaped role
+ * from a plain create-candidate — see {@link operatorInteractionBudget}'s
+ * doc for the richer apply-side count that CAN). Pure; zero I/O. Callers
+ * that already filtered/refined a plan's items for a richer reason (e.g.
+ * `commands/bootstrap-apply.ts`'s vault-aware `displayCreations`, which can
+ * be LOWER than this count when a prior `fleet.lock` entry lets `apply`
+ * confirm-and-reuse — macf#913/#915) should pass THEIR OWN count into
+ * {@link operatorInteractionBudget} directly rather than recomputing from
+ * `items` — this function is for the plain "as `computePlan` sees it" count
+ * `macf bootstrap plan` renders.
+ */
+export function countAppsToCreate(items: readonly PlanItem[]): number {
+  return items.filter((i) => (i.kind === 'app' || i.kind === 'runner_ops') && i.verb === 'create').length;
+}
+
+/**
+ * `'exact'` vs `'maximum'` — the honesty axis DR-043 Amendment A's floor
+ * demands (`UNKNOWN_REASONS.identity`: "the API can confirm present, never
+ * prove absent"). Zero gates on BOTH counts is the ONLY exact case: nothing
+ * left to overstate. Any non-zero count is a CEILING, never a promise —
+ * `presenceVerb`'s `'unknown'` degrade means a counted create-candidate
+ * might already exist and simply be unconfirmed at this call's vantage
+ * point (no local `fleet.lock` entry, no App JWT to check live);
+ * `confirmBeforeCreateGuard`'s own contract (`apply-agent.ts`) requires a
+ * PRIOR lock entry before it will even ATTEMPT a live re-check — a role
+ * with none is a `'create'` decision regardless of `--vault`/
+ * `--identity-key`, not because absence was proven. `bound` is carried as
+ * an explicit field (not left for a JSON consumer to re-derive from a count
+ * being zero) so a future increment that adds a genuine live-absence proof
+ * doesn't silently change what today's `0` means without also changing
+ * this contract.
+ */
+export type OperatorInteractionBound = 'exact' | 'maximum';
+
+export interface OperatorInteractionBudget {
+  readonly gate1Clicks: number;
+  readonly gate2Flows: number;
+  readonly bound: OperatorInteractionBound;
+}
+
+/**
+ * `gate1Clicks`/`gate2Flows` → the full budget, deriving `bound` per
+ * {@link OperatorInteractionBound}'s doc. Pure. `gate2Flows` defaults to
+ * `gate1Clicks` — the common shape every `plan`-only caller has (it cannot
+ * see `'resume-install'` decisions, so its two counts are always equal);
+ * `commands/bootstrap-apply.ts`'s vault-aware call site passes both
+ * explicitly, folding any `'resume-install'` roles into `gate2Flows` alone
+ * (see the section doc above).
+ */
+export function operatorInteractionBudget(gate1Clicks: number, gate2Flows: number = gate1Clicks): OperatorInteractionBudget {
+  return { gate1Clicks, gate2Flows, bound: gate1Clicks === 0 && gate2Flows === 0 ? 'exact' : 'maximum' };
+}
+
+/**
+ * One human line stating the operator's consent-click budget for this run —
+ * DR-044 Decision 6 ("cleanest, simplest reasons to act on"): one line, not
+ * a table. Zero is stated explicitly (Amendment G's revival-cost property,
+ * surfaced where the operator can see it) rather than silently omitted,
+ * which would read as "unknown" instead of "free." The common
+ * `gate1Clicks === gate2Flows` case (every counted role needs both gates)
+ * gets the friendlier "N Apps to create" framing; the two counts DIVERGE
+ * only when a vault-confirmed `'resume-install'` role adds an
+ * install-only gate 2 with no matching gate 1 (see the section doc above)
+ * — that shape gets its own wording naming both counts directly, since
+ * "Apps to create" would misdescribe a role whose App already exists.
+ */
+export function formatOperatorInteractionLine(budget: OperatorInteractionBudget): string {
+  const { gate1Clicks, gate2Flows, bound } = budget;
+  if (gate1Clicks === 0 && gate2Flows === 0) {
+    return 'Operator interaction: none — no consent gates this run.';
+  }
+  const qualifier = bound === 'maximum' ? 'up to ' : '';
+  const ceilingNote =
+    bound === 'maximum'
+      ? ' This is a ceiling, not a promise — `macf bootstrap apply --vault <path> --identity-key <path>` may ' +
+        'confirm some of these already exist and skip their gates (macf#913/#915).'
+      : '';
+  if (gate1Clicks === gate2Flows) {
+    const n = gate1Clicks;
+    const plural = n === 1 ? '' : 's';
+    return (
+      `Operator interaction: ${qualifier}${String(n)} App${plural} to create → ${qualifier}${String(n)} ` +
+      `"Create GitHub App" click${plural} + ${String(n)} install flow${plural} (browser); everything else is ` +
+      `automatic.${ceilingNote}`
+    );
+  }
+  const p1 = gate1Clicks === 1 ? '' : 's';
+  const p2 = gate2Flows === 1 ? '' : 's';
+  const resumeOnly = gate2Flows - gate1Clicks;
+  // "up to 0" reads as a contradiction (0 is 0, not a ceiling) — the
+  // qualifier only makes sense prefixing a positive count, so it's applied
+  // per-count here rather than once for the whole line (unlike the
+  // gate1Clicks === gate2Flows branch above, where both counts are equal
+  // and — by this point — always positive, since the all-zero case already
+  // returned above).
+  const q1 = gate1Clicks > 0 ? qualifier : '';
+  const q2 = gate2Flows > 0 ? qualifier : '';
+  const resumePlural = resumeOnly === 1;
+  return (
+    `Operator interaction: ${q1}${String(gate1Clicks)} "Create GitHub App" click${p1} + ` +
+    `${q2}${String(gate2Flows)} install flow${p2} (browser) — ${String(resumeOnly)} already-created App` +
+    `${resumePlural ? '' : 's'} still need${resumePlural ? 's' : ''} ${resumePlural ? 'its' : 'their'} install ` +
+    `flow${resumePlural ? '' : 's'}; everything else is automatic.${ceilingNote}`
+  );
+}
+
+/** `--json` shape for {@link OperatorInteractionBudget}. `gate1_clicks`/`gate2_flows` are named SEPARATELY (not one field doubled) because they can genuinely diverge (a `'resume-install'` role) — see the section doc above. */
+export function operatorInteractionToJson(budget: OperatorInteractionBudget): unknown {
+  return {
+    gate1_clicks: budget.gate1Clicks,
+    gate2_flows: budget.gate2Flows,
+    bound: budget.bound,
+  };
+}
+
 const PLAN_HEADERS = ['KIND', 'TARGET', 'VERB', 'CONFIRM', 'REASON'] as const;
 
 /** Build one display row per plan item (pure — exported for tests). */
