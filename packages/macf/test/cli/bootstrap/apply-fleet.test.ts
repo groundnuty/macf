@@ -153,6 +153,19 @@ function trustDepsFor(overrides: Partial<CaApplyDeps & RunnerRegistrationDeps> =
 const CODE_AGENT: FleetAgent = { role: 'code-agent', profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/x' };
 const SCI_AGENT: FleetAgent = { role: 'science-agent', profile: 'research', repo: 'groundnuty/demo-science', deploy_path: '/y' };
 
+/**
+ * groundnuty/macf#1012 — repo-scoped registry install-coverage. A manifest
+ * whose `owner.registry.type === 'repo'`; `deriveAppHandle('demo-fleet',
+ * 'code-agent')` === 'demo-fleet-code-agent' throughout. Module-scoped (used
+ * by BOTH the #1012 describe block and #1016's sibling describe block).
+ */
+function repoScopedManifest(agents: readonly FleetAgent[] = [CODE_AGENT]): FleetManifest {
+  return {
+    ...manifestWith(agents),
+    owner: { account: 'demo-org', type: 'org', registry: { type: 'repo', owner: 'demo-org', repo: 'demo-org-registry' } },
+  };
+}
+
 function creds(seed: string): AppCredentials {
   return {
     appId: `app-${seed}`,
@@ -3684,15 +3697,10 @@ trust:
 
   // groundnuty/macf#1012 — repo-scoped registry install-coverage. A manifest
   // whose `owner.registry.type === 'repo'`; `deriveAppHandle('demo-fleet',
-  // 'code-agent')` === 'demo-fleet-code-agent' throughout.
+  // 'code-agent')` === 'demo-fleet-code-agent' throughout. Module-scoped
+  // (not local to this describe) — groundnuty/macf#1016's sibling describe
+  // block below needs the SAME repo-scoped manifest shape.
   describe('groundnuty/macf#1012 — registry-repo installation-coverage', () => {
-    function repoScopedManifest(agents: readonly FleetAgent[] = [CODE_AGENT]): FleetManifest {
-      return {
-        ...manifestWith(agents),
-        owner: { account: 'demo-org', type: 'org', registry: { type: 'repo', owner: 'demo-org', repo: 'demo-org-registry' } },
-      };
-    }
-
     it('DECISIVE: an App whose install lacks the registry repo -> REFUSES, the failure reason names the App and the repo, and the overall apply outcome is non-zero', async () => {
       const manifestPath = manifestPathIn();
       const manifest = repoScopedManifest();
@@ -3815,6 +3823,148 @@ trust:
     // validateRunnerOpsInstall`, unchanged), so its reuse path is not newly
     // re-validated. No additional test is needed here; a redundant one would
     // just re-assert what that test already covers.
+  });
+
+  // groundnuty/macf#1016 — #1012/#1015's registry-repo coverage check can
+  // only fire once `confirmBeforeCreateGuard` reaches `reuse-confirmed`/
+  // `resume-install`, which needs `AgentApplyDeps.resolveKeyPath` wired
+  // (vault-aware). A FLAGLESS re-run against an already-provisioned
+  // repo-scoped role lands on `skip-unverified` instead — silently, unless
+  // the reason names the gap explicitly. See `registry-repo-coverage.ts`'s
+  // "The gap THAT coverage scope leaves open" doc section.
+  describe('groundnuty/macf#1016 — skip-unverified states coverage was not verified', () => {
+    it('DECISIVE: a flagless apply on a repo-scoped fleet with TWO already-provisioned roles states, per role, that coverage was NOT verified — naming EACH role\'s own App handle, not one fleet-wide note', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = repoScopedManifest([CODE_AGENT, SCI_AGENT]);
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [
+          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+          { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+        ],
+      };
+      // No resolveKeyPath anywhere in this run's deps -> confirmBeforeCreateGuard
+      // resolves skip-unverified for BOTH roles WITHOUT ever calling
+      // checkRegistryRepoCoverage — the throwing stub below asserts that.
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'skipped-unverified', 'x', 'y'), manifestPath),
+        trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
+        checkRegistryRepoCoverage: async () => {
+          throw new Error('must not be called — skip-unverified never reaches the live coverage check');
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.agents.map((a) => a.identity.status)).toEqual(['skipped-unverified', 'skipped-unverified']);
+
+      const codeIdentity = result.agents.find((a) => a.role === 'code-agent')?.identity;
+      const sciIdentity = result.agents.find((a) => a.role === 'science-agent')?.identity;
+      const codeReason = codeIdentity?.status === 'skipped-unverified' ? codeIdentity.reason : '';
+      const sciReason = sciIdentity?.status === 'skipped-unverified' ? sciIdentity.reason : '';
+
+      // Each role's OWN reason names coverage as unverified, its OWN App
+      // handle, the registry repo, AND how to verify it (macf#1016's own
+      // two acceptance criteria: states it + says how to verify) — never a
+      // fleet-wide note shared across roles. Per-role scoping is the whole
+      // point (`assert-the-wrong-path.md`) — a single-agent fleet couldn't
+      // distinguish "per role" from "per fleet."
+      expect(codeReason).toContain('groundnuty/macf#1016');
+      expect(codeReason).toContain('demo-fleet-code-agent');
+      expect(codeReason).toContain('demo-org/demo-org-registry');
+      expect(codeReason).toContain('--vault');
+      expect(codeReason).toContain('--identity-key');
+      expect(sciReason).toContain('demo-fleet-science-agent');
+      expect(sciReason).toContain('demo-org/demo-org-registry');
+      // No cross-role bleed — code-agent's note never names science-agent's
+      // handle and vice versa.
+      expect(sciReason).not.toContain('demo-fleet-code-agent');
+      expect(codeReason).not.toContain('demo-fleet-science-agent');
+
+      // Already non-green BEFORE this fix — `skip-unverified` sits at the
+      // same "requires operator attention" bar as `failed`/`drift`
+      // (`applyExitCode`'s own doc). This fix adds a coverage-SPECIFIC
+      // statement to an ALREADY-attention-flagged run; it does not turn a
+      // green run non-green (the run was never green).
+      expect(applyExitCode(result)).not.toBe(0);
+
+      // AC: "--json carries the unverified state" — asserted against the
+      // ACTUAL serialized render, not inferred from reading `redactIdentity`.
+      const json = JSON.stringify(fleetApplyResultToJson(result));
+      expect(json).toContain('groundnuty/macf#1016');
+      expect(json).toContain('demo-fleet-code-agent');
+      expect(json).toContain('demo-fleet-science-agent');
+    });
+
+    it('a vault-aware run that still lands on skip-unverified for an UNRELATED reason (confirmAppInstallation unconfirmable) is UNCHANGED — no coverage note, since re-running with the same flags would not fix it', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = repoScopedManifest();
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      // resolveKeyPath IS wired (this run had --vault/--identity-key) but
+      // the live re-confirm itself couldn't complete — a DIFFERENT failure
+      // shape than #1016's flagless gap; re-running with the SAME flags
+      // would not fix it, so the coverage-not-verified note must NOT appear.
+      const vaultAwareUnconfirmableDeps: AgentApplyDeps = {
+        startManifestFlow: async () => {
+          throw new Error('must not be called — a prior lock entry never reaches the create path');
+        },
+        startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+        exchangeManifestCode: async () => {
+          throw new Error('must not be called');
+        },
+        resolveKeyPath: () => '/fake.pem',
+        confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
+        waitForAppInstallation: async () => {
+          throw new Error('must not be called');
+        },
+        openUrl: async () => {},
+        log: () => {},
+        writeRecoveryArtifact: async () => {},
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(vaultAwareUnconfirmableDeps, manifestPath),
+        checkRegistryRepoCoverage: async () => {
+          throw new Error('must not be called — skip-unverified never reaches the live coverage check');
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('skipped-unverified');
+      const identity = result.agents[0]?.identity;
+      const reason = identity?.status === 'skipped-unverified' ? identity.reason : '';
+      // The ORIGINAL, unextended `confirmBeforeCreateGuard` text — proves
+      // this run is byte-identical to pre-#1016 (requirement 3).
+      expect(reason).toContain('Could not confirm the existing App');
+      expect(reason).not.toContain('groundnuty/macf#1016');
+      expect(reason).not.toContain('Registry-repo coverage');
+    });
+
+    it('registry.type !== "repo" (profile scope): a flagless skip-unverified run emits NOTHING new — byte-identical to pre-#1016', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]); // default owner.registry.type === 'profile'
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'skipped-unverified', 'x', 'y'), manifestPath),
+        trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      const identity = result.agents[0]?.identity;
+      const reason = identity?.status === 'skipped-unverified' ? identity.reason : '';
+      expect(reason).not.toContain('groundnuty/macf#1016');
+      expect(reason).not.toContain('Registry-repo coverage');
+    });
   });
 
   // --- DR-043 Amendment G correction (groundnuty/macf#1034) — revival

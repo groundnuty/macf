@@ -104,6 +104,87 @@
  * ALREADY fully provisioned (every role `reused`) when its registry gap was
  * discovered — a guard that only fired on first-create would have been
  * silent on the exact re-run shape that incident was.
+ *
+ * ## The gap THAT coverage scope leaves open (groundnuty/macf#1016)
+ *
+ * `resume-install`/`reuse-confirmed` both require `confirmBeforeCreateGuard`
+ * to hold a decryptable `keyPath` — i.e. `AgentApplyDeps.resolveKeyPath` was
+ * wired for this run (`apply-agent.ts`'s own doc on that field: `undefined`
+ * is "the production default … always"). `resolveKeyPath` is wired ONLY
+ * when `apply` was invoked WITH BOTH `--vault`/`--identity-key`
+ * (`commands/bootstrap-apply.ts::resolveMutateDeps`) — never per-check, a
+ * single fleet-level switch for the whole run. A FLAGLESS re-run against a
+ * role that already has a `fleet.lock` entry therefore lands on
+ * `skip-unverified` — `confirmBeforeCreateGuard` returns before it ever
+ * calls `confirmAppInstallation`, so `reuse-confirmed`/`resume-install` are
+ * structurally unreachable, and this module's `validateInstall`/
+ * `validateReuse` hooks are never invoked. The registry-repo coverage check
+ * this module exists to run is silently absent on exactly the re-run shape
+ * `apply-fleet.ts`'s own "Coverage scope" comment above calls out as the
+ * concrete motivating incident.
+ *
+ * The CREATE path (a role with NO prior `fleet.lock` entry) is NOT affected
+ * — its `keyPath` comes from the just-exchanged manifest credential
+ * (`apply-agent.ts::finishGate2FromCredentials`'s `writeScratchPem`), never
+ * from `resolveKeyPath`, so a first-time role is coverage-checked
+ * regardless of vault flags.
+ *
+ * **Fix (macf#1016 requirement 1, the floor):** `apply-fleet.ts`'s per-agent
+ * loop extends a `skip-unverified` outcome's `reason` with
+ * {@link registryRepoCoverageUnverifiedOnSkipNote} whenever
+ * `registry.type === 'repo'` AND `agentDeps.resolveKeyPath === undefined`
+ * (this RUN never had a vault-aware resolver wired at all — the precise
+ * "flagless" condition, not merely "this outcome happened to be
+ * skip-unverified"). Gating on the run-level flag (not the per-role
+ * outcome alone) deliberately leaves TWO adjacent skip-unverified shapes
+ * untouched, both already carrying their own honest diagnostic from
+ * `confirmBeforeCreateGuard`:
+ *   - vault flags WERE given but `confirmAppInstallation` itself couldn't
+ *     confirm the existing App live (`'unconfirmable'` — JWT mint failure /
+ *     network / an unexpected HTTP status). Re-running with the SAME two
+ *     flags would not fix this, so this note's "re-run with --vault
+ *     --identity-key" advice would be actively wrong here.
+ *   - vault flags WERE given but THIS role's PEM specifically isn't in the
+ *     vault (`resolveVaultAgentPems`'s per-role `map.get(role)` miss).
+ *     `confirmBeforeCreateGuard` produces the IDENTICAL generic reason text
+ *     as the fully-flagless case (it has no way to distinguish "no resolver
+ *     at all" from "resolver present, this role missing" once `keyPath` is
+ *     `undefined`), so it gets no note either — the same residual, left as
+ *     future work rather than silently claimed closed.
+ *
+ * **Requirement 2 (make the check runnable without the vault) — investigated,
+ * a dead end for `apply` itself.** `GET /repos/{owner}/{repo}/installation`
+ * needs an App JWT (see this module's "What is verified" section above) —
+ * not a `ghs_` installation token, so there is no "read the ambient
+ * `GH_TOKEN` instead" shortcut. An App JWT needs the App's PEM, and for an
+ * ALREADY-PROVISIONED role (the exact shape this gap is about) the App's
+ * PEM exists in exactly one durable place by design: the operator's vault
+ * (DR-043 Amendment D — read-only-decryptable, never read-modify-written).
+ * The per-role recovery artifact (DR-043 Amendment B, `vault-write.ts`) is
+ * NOT an alternate source here — it is deleted once the credential reaches
+ * the vault, so it never exists for a role this gap applies to (one already
+ * fully provisioned). There is no PEM to mint a JWT from without decrypting
+ * the vault; requirement 2 is confirmed a dead end for `bootstrap apply`.
+ *
+ * **Requirement 3 (fold the real check into `macf fleet doctor`) —
+ * investigated, plausible but NOT wired today; not implemented this issue.**
+ * Unlike `apply` (which runs on the OPERATOR's machine with no PEM outside
+ * the vault), `macf fleet doctor` runs FROM a deployed agent's OWN
+ * workspace — which already holds a decrypted copy of ITS OWN App PEM
+ * on disk (`$KEY_PATH`, workspace-relative, the SAME credential
+ * `macf-gh-token.sh` mints `GH_TOKEN` from; see `gh-token-refresh.md`).
+ * Minting an App JWT from that PEM needs no vault access at all — a
+ * genuinely different, already-available credential source, so requirement
+ * 2's dead end does NOT apply to doctor. That said, `commands/fleet-doctor.ts`
+ * as it stands today has NEITHER piece this would need: it resolves
+ * `agentCertPath`/`agentKeyPath` (`config.ts`) — the mTLS ROUTING cert/key,
+ * a different credential entirely from the App PEM — and it never reads
+ * `fleet.yaml`'s `owner.registry` (its own "registry" means the MACF
+ * coordination registry of peer agents, not DR-043's App-installation
+ * registry-repo concept). Wiring requirement 3 for real needs BOTH a new
+ * App-JWT-from-`$KEY_PATH` read AND a new `fleet.yaml` parse inside doctor
+ * — real work, out of scope for this issue's floor. Recorded here as the
+ * recommended future home, not claimed done.
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -229,6 +310,31 @@ export function registryRepoCoverageUnknownWarning(appHandle: string, owner: str
     'an unexpected HTTP status). This is UNKNOWN, never treated as confirmed-missing (DR-043 Amendment A) — but it ' +
     "also means #1012's guard could not verify this App. Check manually: GitHub → Settings → Applications → " +
     `${appHandle} → Configure → Repository access.`
+  );
+}
+
+/**
+ * The `skip-unverified` addendum for a FLAGLESS re-run against a
+ * repo-scoped registry (groundnuty/macf#1016 — see this module's "The gap
+ * THAT coverage scope leaves open" doc section for the full mechanism +
+ * why this is gated on the run having NO vault-aware resolver at all,
+ * never merely on the outcome shape). Appended to — never replacing —
+ * `confirmBeforeCreateGuard`'s own `skip-unverified` reason
+ * (`apply-agent.ts`'s generic "no private-key path is available to
+ * live-reconfirm it" text), so both the identity-confirm gap AND this
+ * check's own gap are named in one `reason` string. Amendment A's
+ * honest-unknown floor applies here exactly as it does to
+ * {@link registryRepoCoverageUnknownWarning}: this is `unknown`, never a
+ * silent `ok` — the message states what's unverified AND how to verify it
+ * (macf#1016 requirement's own two acceptance criteria), never just the
+ * first half.
+ */
+export function registryRepoCoverageUnverifiedOnSkipNote(appHandle: string, owner: string, repo: string): string {
+  return (
+    `Registry-repo coverage for ${owner}/${repo} was ALSO not verified this run (groundnuty/macf#1016) — App ` +
+    `"${appHandle}"'s installation was never live-checked against ${owner}/${repo} because this run has no ` +
+    'vault-aware confirm wired (no --vault/--identity-key given). Re-run with "macf bootstrap apply --vault ' +
+    '<path> --identity-key <path>" to verify it.'
   );
 }
 
