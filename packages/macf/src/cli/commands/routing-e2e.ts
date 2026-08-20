@@ -87,6 +87,22 @@
  * repo, so a credential proven to see the repo at all is proven for its
  * workflow file, its agent-config, and its Actions runs alike; re-checking
  * per read would just repeat an already-answered question.
+ *
+ * REFUSE, not proceed-and-report, is the deliberate choice for an unknown
+ * visibility result — the alternative considered was letting the flow run
+ * on anyway and let `createProbeIssue`'s own failure carry the diagnosis.
+ * Rejected for two reasons. First, this credential's write path shares the
+ * SAME installation boundary as its read path (one App install grants
+ * both), so proceeding would almost always just trade one honest "unknown"
+ * for a less legible "could not create the probe issue: <gh error>" a few
+ * steps later — strictly less informative, at the cost of an extra write
+ * attempt against a repo already known to be unreadable.
+ * Second, refusing here costs nothing: no issue exists yet, so there is
+ * nothing to clean up (same "nothing filed, nothing to clean up" contract
+ * every other `target_*` precondition in this file already holds) — where
+ * `probe_creation_failed` DOES need a cleanup attempt because a write may
+ * have partially landed. Fail fast, name the ambiguity precisely, and stop
+ * — the same shape every other precondition refusal in this module takes.
  */
 import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
 import {
@@ -322,17 +338,33 @@ async function resolveTargetLabel(
  * The `target_visibility_unknown` message — names the credential (its
  * routing label) and the mechanism, in plain words (no internal issue/DR
  * references; those belong in code comments, not operator-facing output).
+ *
+ * Two distinct causes, two distinct messages — collapsing them would repeat
+ * this very issue's own Defect 2 shape (a line describing something that
+ * did not happen): `'listing-unreadable'` means the install listing itself
+ * never came back this run (nothing was confirmed either way — the target
+ * repo is not "checked and absent," it is "never checked"); `'not-in-listing'`
+ * means the listing WAS read successfully and the target genuinely was not
+ * in it (the entitlement gap this issue reports).
  */
-function visibilityUnknownMessage(currentLabel: string | null, repo: string): string {
+function visibilityUnknownMessage(currentLabel: string | null, repo: string, cause: 'listing-unreadable' | 'not-in-listing'): string {
   const who = currentLabel !== null ? `"${currentLabel}"'s credential` : "this agent's credential";
+  if (cause === 'listing-unreadable') {
+    return (
+      `${who} could not read its own installed-repository list this run (a network/auth failure, not a confirmed ` +
+      `answer) — nothing about "${repo}"'s routing workflow, label configuration, or recent runs can be asserted ` +
+      'from here. Retry, or confirm this credential can reach the GitHub API at all before assuming anything ' +
+      'about the target.'
+    );
+  }
   return (
     `${who} cannot confirm "${repo}" is visible to it — the repo is absent from that credential's own ` +
-    'installed-repository list. GitHub answers a read against a private repo with the identical 404 whether the ' +
-    'repo genuinely has nothing there or the credential simply is not installed on it, so nothing about its ' +
-    'routing workflow, its label configuration, or its recent runs can be asserted from here. This is the expected ' +
-    "shape when probing a peer's repo with an agent's own narrowly-scoped credential — not itself a failure. " +
-    're-run with a credential installed on the target repo, or confirm its routing workflow another way before ' +
-    'treating this result as proof the target cannot route.'
+    "installed-repository list, which WAS read successfully this run. GitHub answers a read against a private " +
+    'repo with the identical 404 whether the repo genuinely has nothing there or the credential simply is not ' +
+    'installed on it, so nothing about its routing workflow, its label configuration, or its recent runs can be ' +
+    "asserted from here. This is the expected shape when probing a peer's repo with an agent's own " +
+    'narrowly-scoped credential — not itself a failure. Re-run with a credential installed on the target repo, or ' +
+    'confirm its routing workflow another way before treating this result as proof the target cannot route.'
   );
 }
 
@@ -356,9 +388,29 @@ export async function runRoutingE2eCore(
   // listing doesn't contain can never yield a trustworthy `absent` from a
   // per-file 404, so every one of those reads is skipped entirely rather
   // than attempted and misread. See the module doc for the full rationale.
+  //
+  // `[]` is itself ambiguous — `listInstallRepos` degrades to `[]` on ANY
+  // failure (network, auth, `gh` missing), and a real installation always
+  // covers at least this agent's own repo, so an empty result here means
+  // the listing read never actually landed, not "confirmed zero repos."
+  // Reported as its OWN cause so the message never claims the listing
+  // named this repo absent when it was never read at all (the exact
+  // asserts-something-that-didn't-happen shape Defect 2 is about).
+  // Case-folded: GitHub's listing returns its own canonical casing, and an
+  // operator-typed `--target-repo` case mismatch must not read as "unknown."
   const installRepos = await deps.listInstallRepos();
-  if (!installRepos.includes(repo)) {
-    return refuse('target_visibility_unknown', repo, null, visibilityUnknownMessage(deps.currentLabel, repo), startedAt, now);
+  if (installRepos.length === 0) {
+    return refuse(
+      'target_visibility_unknown',
+      repo,
+      null,
+      visibilityUnknownMessage(deps.currentLabel, repo, 'listing-unreadable'),
+      startedAt,
+      now,
+    );
+  }
+  if (!installRepos.some((r) => r.toLowerCase() === repo.toLowerCase())) {
+    return refuse('target_visibility_unknown', repo, null, visibilityUnknownMessage(deps.currentLabel, repo, 'not-in-listing'), startedAt, now);
   }
 
   if (!(await deps.isTargetCaller(repo))) {
