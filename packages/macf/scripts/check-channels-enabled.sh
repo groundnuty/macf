@@ -23,10 +23,26 @@
 # session). Override with MACF_SKIP_CHANNELS_CHECK=1.
 #
 # FRAGILITY NOTE: this parses Claude Code's INTERNAL, UNDOCUMENTED MCP-server
-# log files under ~/.cache/claude-cli-nodejs/<encoded-cwd>/mcp-logs-plugin-
-# macf-agent-macf-agent/<timestamp>.jsonl. The format + path were verified
-# against claude 2.1.195; a future Claude Code may rename/relocate them, in
-# which case this guard fails open (no false alarms) and should be re-pointed.
+# log files under ~/.cache/claude-cli-nodejs/<encoded-cwd>/mcp-logs-*macf-agent/
+# <timestamp>.jsonl. The directory name is derived from the server's MOUNT and
+# has already been renamed TWICE (groundnuty/macf#1004): a --plugin-dir mount
+# named it `mcp-logs-plugin-macf-agent-macf-agent`; an even older plugin
+# naming used `mcp-logs-plugin-macf-channel-server-macf-agent`; the current
+# `.mcp.json server:macf-agent` mount (macf#1002 / DR-022 Amendment P) names
+# it `mcp-logs-macf-agent`. A guard hardcoded to any ONE of these "runs,
+# passes, and detects nothing" the moment the mount changes again — the exact
+# hazard this guard exists to catch, recursing on itself. So this script globs
+# every `mcp-logs-*macf-agent` directory under the workspace's cache dir
+# (macf-agent is the mount's server name, `MCP_SERVER_NAME` in
+# packages/macf/src/cli/mcp-json.ts) and searches the newest log across ALL of
+# them for the marker TEXT below — the directory shape is treated as
+# best-effort routing to a candidate file, never as the thing being asserted.
+# Format verified against claude 2.1.195; a future Claude Code may still
+# rename/relocate in a way this glob doesn't anticipate (e.g. dropping
+# "macf-agent" from the name entirely) — in that case this guard now reports
+# an explicit "could not verify" note instead of failing silently in a way
+# indistinguishable from a clean pass (see the NO_CANDIDATE_LOG_DIRS branch
+# below).
 set -euo pipefail
 
 # macf#701: how far back a `tmux_wake_delivered` line's `ts` may be and still
@@ -62,11 +78,32 @@ HOME_DIR="${HOME:-}"
 # `/` and `.` with `-` (e.g. /home/u/repos/macf -> -home-u-repos-macf). Verify
 # with: ls ~/.cache/claude-cli-nodejs/. We derive the same encoding here.
 ENCODED="$(printf '%s' "$WORKSPACE" | sed 's#[/.]#-#g')"
-LOG_DIR="$HOME_DIR/.cache/claude-cli-nodejs/$ENCODED/mcp-logs-plugin-macf-agent-macf-agent"
+CACHE_ROOT="$HOME_DIR/.cache/claude-cli-nodejs/$ENCODED"
 
-# No log dir (workspace never ran the macf-agent MCP server, encoding drifted,
-# or a fresh machine) -> nothing to assert. Fail open.
-[ -d "$LOG_DIR" ] || exit 0
+# Glob every candidate MCP-log directory rather than trust one hardcoded name
+# (macf#1004 — see the FRAGILITY NOTE above). No `nullglob`/`shopt` dependency:
+# a non-matching glob expands to its own literal pattern string, and `[ -d ]`
+# on that literal is simply false, so it's filtered out below same as any
+# other non-directory. Portable to bash 3.2 (macOS system bash) without shopt.
+CANDIDATE_LOG_DIRS=()
+for cand in "$CACHE_ROOT"/mcp-logs-*macf-agent; do
+  [ -d "$cand" ] || continue
+  CANDIDATE_LOG_DIRS+=("$cand")
+done
+
+# No candidate directory at all (workspace never ran the macf-agent MCP
+# server, the encoding drifted, a fresh machine, OR the mount was renamed
+# again in a way this glob doesn't cover) -> this session's channel status
+# could not be checked. Track it explicitly (NO_CANDIDATE_LOG_DIRS) instead of
+# exiting silently here: silent-exit-0 is indistinguishable from "checked and
+# found on" — precisely the regression this issue is about (macf#1004,
+# assert-the-wrong-path.md). The poll loop below still runs (harmlessly
+# no-ops when the array is empty) so `state` stays "unknown" and the reporting
+# block after it can tell "never checked" apart from "checked, inconclusive".
+NO_CANDIDATE_LOG_DIRS="no"
+if [ "${#CANDIDATE_LOG_DIRS[@]}" -eq 0 ]; then
+  NO_CANDIDATE_LOG_DIRS="yes"
+fi
 
 # iso_to_epoch ISO_TS — print ISO_TS (e.g. "2026-07-01T09:05:06.742Z") as Unix
 # epoch seconds on stdout, or nothing + non-zero exit if parsing fails on this
@@ -107,26 +144,45 @@ case "$poll_iters" in
   '' | *[!0-9]*) poll_iters=12 ;;
 esac
 state="unknown"
-for ((i = 0; i < poll_iters; i++)); do
-  # Re-evaluate the newest log each iteration — this session's log file is
-  # created near MCP-connect time, so the freshest-by-mtime jsonl is the one to
-  # read. `|| true` + the `-r` guard keep the no-match / unreadable cases quiet.
-  newest="$(ls -t "$LOG_DIR"/*.jsonl 2>/dev/null | head -n1 || true)"
-  if [ -n "$newest" ] && [ -r "$newest" ]; then
-    if grep -q "$SKIP_MARKER" "$newest" 2>/dev/null; then
-      state="off"
-      break
-    elif grep -q "$OK_MARKER" "$newest" 2>/dev/null; then
-      state="on"
-      break
+if [ "${#CANDIDATE_LOG_DIRS[@]}" -gt 0 ]; then
+  for ((i = 0; i < poll_iters; i++)); do
+    # Re-evaluate the newest log each iteration, across ALL candidate
+    # directories — this session's log file is created near MCP-connect time
+    # under whichever mount is actually active, so the freshest-by-mtime
+    # jsonl GLOBALLY is the one to read regardless of which directory shape
+    # produced it. `[ -e ]` guards the no-match-literal-glob case (no
+    # nullglob dependency, see above); `-nt` is bash's builtin mtime compare.
+    newest=""
+    for d in "${CANDIDATE_LOG_DIRS[@]}"; do
+      for f in "$d"/*.jsonl; do
+        [ -e "$f" ] || continue
+        if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then
+          newest="$f"
+        fi
+      done
+    done
+    if [ -n "$newest" ] && [ -r "$newest" ]; then
+      if grep -q "$SKIP_MARKER" "$newest" 2>/dev/null; then
+        state="off"
+        break
+      elif grep -q "$OK_MARKER" "$newest" 2>/dev/null; then
+        state="on"
+        break
+      fi
     fi
-  fi
-  sleep 1
-done
+    sleep 1
+  done
+fi
 
-# on / unknown / inconclusive → stay silent (native channel-push is fine or
-# undeterminable). Only the CONFIRMED-off case says anything — and WHAT it says
-# depends on whether the tmux-wake FALLBACK is delivering, because
+# on, and unknown-because-the-poll-timed-out-with-a-log-present → stay silent
+# (native channel-push is fine, or a transient still-connecting window that
+# will very likely resolve on the next session; not worth a warning every
+# time). unknown-because-NO-candidate-log-directory-was-found is different —
+# that is the "never actually checked" state (macf#1004) and gets its own
+# explicit, non-alarming note in the final `elif` below, distinguishable from
+# both a clean pass (silent) and a confirmed-off warning (loud). Only the
+# CONFIRMED-off case among these three says anything alarming — and WHAT it
+# says depends on whether the tmux-wake FALLBACK is delivering, because
 # "native-push off" is NOT "deaf to routing": tmux-wake (send-keys) is the
 # load-bearing last-hop and is DELIVERING routed notifications on every current
 # agent (macf#641/DR-022-Amendment-P: native channels are a pending UPGRADE, not
@@ -271,6 +327,31 @@ channel-server is running (its log should show `tmux_wake_delivered` on
 delivery). Silence: MACF_SKIP_CHANNELS_CHECK=1.
 WARN
   fi
+elif [ "$state" = "unknown" ] && [ "$NO_CANDIDATE_LOG_DIRS" = "yes" ]; then
+  # "Never actually checked" — distinguishable from BOTH a clean pass (fully
+  # silent, state=on) and a confirmed-off warning (loud, state=off). Without
+  # this branch, "no candidate directory matched" and "checked, found clean"
+  # are the same observable outcome (silent, exit 0) — exactly the regression
+  # macf#1004 is about: a guard pointed at a stale/wrong directory name runs,
+  # passes, and detects nothing, forever, with no way to tell it apart from a
+  # genuinely healthy session. Non-alarming tone: this is routinely true for a
+  # few seconds after a fresh launch before the MCP server's log dir exists.
+  cat <<INFO
+ℹ️  Could not verify routed-notification channel status this session — no
+Claude Code MCP log directory matching \`mcp-logs-*macf-agent\` was found under
+$CACHE_ROOT/. This means "not yet checked", not "checked and found clean" —
+those two look identical unless this note says which one happened.
+
+Usually harmless: this directory is created once the macf-agent MCP server
+first connects, so it can be legitimately absent for the first few seconds of
+a fresh launch — no action needed if this doesn't recur. If it persists across
+relaunches, Claude Code's MCP-log directory naming may have shifted again the
+way it already has twice (groundnuty/macf#1002, groundnuty/macf#1004): this
+guard globs any directory ending in \`macf-agent\` rather than one fixed path,
+but a rename that drops "macf-agent" from the name entirely would still slip
+past it — \`ls $CACHE_ROOT/\` to see what's actually there and re-point the glob.
+Silence: MACF_SKIP_CHANNELS_CHECK=1.
+INFO
 fi
 
 exit 0
