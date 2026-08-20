@@ -1403,6 +1403,101 @@ describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {
       expect((s.enabledMcpjsonServers as string[]).filter((e) => e === 'macf-agent')).toHaveLength(1);
     });
   });
+
+  describe('existing-workspace convergence: superseded Write(<credential-path>) deny entries (macf#1067)', () => {
+    // Claude Code's file-permission check consults only Edit(path) +
+    // Read(path) rules; a Write(path) deny entry is accepted into
+    // settings.json but never consulted, and Claude Code warns at startup
+    // that it's ineffective on every launch. The canonical floor
+    // (ROLE_FLOOR_DENY) no longer emits the Write(path) half of the old
+    // pair — only the already-present, actually-enforced Edit(path) half.
+    // A workspace provisioned before this fix still carries the stale
+    // Write(path) entry in its settings.json; these tests exercise the
+    // REAL convergence path (`installPluginSkillPermissions`, the exact
+    // function `macf update` / `doctor --fix` call) rather than just the
+    // in-memory transform, to prove the fix actually reaches disk.
+    it("replaces EVERY pre-#1067 workspace's stale Write(<path>) with nothing extra — every paired Edit(<path>) survives, deduped", () => {
+      // Seeds the FULL pre-#1067 shape (all 19 known credential paths, each
+      // as a Write(path)+Edit(path) pair, exactly how earlier CLI versions
+      // wrote ROLE_FLOOR_DENY) as LITERAL strings — not by importing
+      // MACF_LEGACY_DENY_WRITE_PATTERNS and iterating it, which would only
+      // prove the production list agrees with itself. Asserting over all 19
+      // (not a 2-of-19 sample) is the same "whole set, not a sample"
+      // discipline the production DECISIVE test below applies.
+      const legacyCredentialPaths = [
+        '~/.claude/settings.json',
+        '~/.claude.json',
+        '~/.ssh/**',
+        '~/.aws/**',
+        '~/.gnupg/**',
+        '~/.kube/**',
+        '~/.config/gcloud/**',
+        '~/.gitconfig',
+        '~/.npmrc',
+        '~/.pypirc',
+        '~/.docker/config.json',
+        '~/.netrc',
+        '~/.config/gh/**',
+        '~/.bashrc',
+        '~/.zshrc',
+        '~/.profile',
+        '~/.bash_profile',
+        '~/.zprofile',
+        '~/.zshenv',
+      ];
+      const staleDeny = legacyCredentialPaths.flatMap((p) => [`Write(${p})`, `Edit(${p})`]);
+
+      mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+      writeFileSync(settingsPath, JSON.stringify({
+        permissions: { deny: staleDeny },
+      }, null, 2));
+
+      installPluginSkillPermissions(tmpRoot);
+
+      const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const deny: readonly string[] = s.permissions.deny;
+      for (const p of legacyCredentialPaths) {
+        // The corrected entry REPLACES the stale one on disk — it does not
+        // sit alongside it forever (the exact convergence gap #1067 flagged).
+        expect(deny).not.toContain(`Write(${p})`);
+        // The effective form is present exactly once — no duplicate from the
+        // union-merge (it was already in both the old settings.json AND the
+        // new canonical ROLE_FLOOR_DENY).
+        expect(deny.filter((d) => d === `Edit(${p})`)).toHaveLength(1);
+      }
+    });
+
+    it('does not touch a genuinely operator-authored Write(<path>) deny on a non-canonical path', () => {
+      // Regression guard, sibling to the #302 operator-preservation test
+      // above: the strip is scoped to the exact set of superseded
+      // MACF-managed credential paths, never a generic "any Write(...)"
+      // wipe. An operator's own Write(/etc/*) deny (not one of the 19
+      // credential paths this fix touches) must round-trip untouched.
+      mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+      writeFileSync(settingsPath, JSON.stringify({
+        permissions: { deny: ['Write(/etc/*)'] },
+      }, null, 2));
+
+      installPluginSkillPermissions(tmpRoot);
+
+      const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      expect(s.permissions.deny).toContain('Write(/etc/*)');
+    });
+
+    it('DECISIVE: fresh-install deny floor contains zero ineffective path-scoped Write/NotebookEdit/Glob/MultiEdit rules', () => {
+      // Assert over the WHOLE written array, not a sample of known-bad
+      // entries — a test that only checked 3 specific strings would pass
+      // while other entries stayed broken, which is exactly how #1067
+      // shipped (a startup warning nobody read, on every launch).
+      installPluginSkillPermissions(tmpRoot);
+      const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const deny: readonly string[] = s.permissions.deny;
+      expect(deny.length).toBeGreaterThan(0);
+      for (const entry of deny) {
+        expect(entry).not.toMatch(/^(Write|NotebookEdit|Glob|MultiEdit)\(.+\)$/);
+      }
+    });
+  });
 });
 
 describe('installSandboxFdAllowRead (macf#200)', () => {

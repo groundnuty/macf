@@ -546,6 +546,24 @@ export const ROLE_FLOOR_ALLOW: readonly string[] = [
  * DR-028 universal floor `deny` — the real guardrail (seeded from devops's set,
  * the most complete of the three working agents): credential/secret reads +
  * config/dotfile writes + dangerous commands.
+ *
+ * **Only `Edit(<path>)` for the config/dotfile-write section — never
+ * `Write(<path>)` (groundnuty/macf#1067).** Per Claude Code's permissions
+ * docs ("Configure permissions" § Read and Edit): "Claude Code checks file
+ * permissions against `Edit(path)` and `Read(path)` rules only. If you
+ * write a path rule for `Write`, `NotebookEdit`, `Glob`, or the legacy
+ * `MultiEdit` tool instead, Claude Code accepts the rule but never
+ * consults it" — and prints a startup warning naming the dead rule on
+ * every launch. `Edit(path)` alone is sufficient: "`Edit` rules apply to
+ * all built-in tools that edit files" (Write, NotebookEdit, Glob,
+ * MultiEdit included). This array used to carry a `Write(<path>)` +
+ * `Edit(<path>)` PAIR per credential path — the `Write()` half never did
+ * anything and only produced startup-warning noise; it has been dropped.
+ * See `MACF_LEGACY_DENY_WRITE_PATTERNS` below for the existing-workspace
+ * convergence story (a workspace provisioned before this fix carries the
+ * stale `Write(<path>)` entries in its settings.json and needs them
+ * actively stripped on `macf update` / `doctor --fix`, not just omitted
+ * from the new canonical list).
  */
 export const ROLE_FLOOR_DENY: readonly string[] = [
   // credential / secret reads
@@ -559,44 +577,25 @@ export const ROLE_FLOOR_DENY: readonly string[] = [
   'Read(~/.config/gh/**)',
   'Read(~/.bash_history)',
   'Read(~/.zsh_history)',
-  // config / dotfile writes
-  'Write(~/.claude/settings.json)',
+  // config / dotfile writes — Edit(path) only; see doc comment above.
   'Edit(~/.claude/settings.json)',
-  'Write(~/.claude.json)',
   'Edit(~/.claude.json)',
-  'Write(~/.ssh/**)',
   'Edit(~/.ssh/**)',
-  'Write(~/.aws/**)',
   'Edit(~/.aws/**)',
-  'Write(~/.gnupg/**)',
   'Edit(~/.gnupg/**)',
-  'Write(~/.kube/**)',
   'Edit(~/.kube/**)',
-  'Write(~/.config/gcloud/**)',
   'Edit(~/.config/gcloud/**)',
-  'Write(~/.gitconfig)',
   'Edit(~/.gitconfig)',
-  'Write(~/.npmrc)',
   'Edit(~/.npmrc)',
-  'Write(~/.pypirc)',
   'Edit(~/.pypirc)',
-  'Write(~/.docker/config.json)',
   'Edit(~/.docker/config.json)',
-  'Write(~/.netrc)',
   'Edit(~/.netrc)',
-  'Write(~/.config/gh/**)',
   'Edit(~/.config/gh/**)',
-  'Write(~/.bashrc)',
   'Edit(~/.bashrc)',
-  'Write(~/.zshrc)',
   'Edit(~/.zshrc)',
-  'Write(~/.profile)',
   'Edit(~/.profile)',
-  'Write(~/.bash_profile)',
   'Edit(~/.bash_profile)',
-  'Write(~/.zprofile)',
   'Edit(~/.zprofile)',
-  'Write(~/.zshenv)',
   'Edit(~/.zshenv)',
   // dangerous commands
   'Bash(sudo *)',
@@ -1116,6 +1115,59 @@ const MACF_MCP_TOOL_PATTERN_PREFIX = 'mcp__macf-agent__';
 const MACF_LEGACY_MCP_TOOL_PATTERN_PREFIX = 'mcp__plugin_macf-agent_macf-agent__';
 
 /**
+ * Superseded `Write(<credential-path>)` deny entries earlier CLI versions
+ * wrote into `ROLE_FLOOR_DENY` alongside a paired `Edit(<same-path>)` entry
+ * (groundnuty/macf#1067). Claude Code's file-permission check consults only
+ * `Edit(path)` + `Read(path)` rules; a `Write(path)` entry is accepted into
+ * settings.json but never consulted, and Claude Code prints a startup
+ * warning naming it as ineffective on every agent launch. The paired
+ * `Edit(<path>)` entry already provides the real protection (`Edit` rules
+ * cover all built-in file-editing tools for that path — Write, NotebookEdit,
+ * Glob, MultiEdit), so dropping the `Write()` half from the canonical list
+ * doesn't weaken anything.
+ *
+ * Listed here (distinct from the canonical `ROLE_FLOOR_DENY` above) so an
+ * ALREADY-provisioned workspace's stale copy of these entries is actively
+ * stripped on `macf update` / `doctor --fix`, not just silently omitted
+ * from the new canonical list. Without this, the union-preserve merge below
+ * can't tell "a canonical entry this CLI version superseded" from "a
+ * genuine operator-authored deny on some other path" — the stale entry
+ * would be treated as the latter and preserved forever. Same migration-
+ * cleanup shape as `MACF_LEGACY_MCP_TOOL_PATTERN_PREFIX` /
+ * `MACF_LEGACY_FD_PATTERNS` elsewhere in this file.
+ *
+ * Exported so `doctor.ts` can flag PRESENCE of any of these as drift (not
+ * just absence of the canonical floor) — otherwise `macf doctor` reports a
+ * stale-but-otherwise-compliant workspace as PASS (it already has all 39
+ * current `ROLE_FLOOR_DENY` entries; `denyFindings` only checks for missing
+ * entries, never superseded ones) and `doctor --fix`'s `needsFix` gate never
+ * trips, so `--fix` never calls the emitter that would strip them. `macf
+ * update` still converges unconditionally regardless of this — see
+ * `commands/update.ts`.
+ */
+export const MACF_LEGACY_DENY_WRITE_PATTERNS: readonly string[] = [
+  'Write(~/.claude/settings.json)',
+  'Write(~/.claude.json)',
+  'Write(~/.ssh/**)',
+  'Write(~/.aws/**)',
+  'Write(~/.gnupg/**)',
+  'Write(~/.kube/**)',
+  'Write(~/.config/gcloud/**)',
+  'Write(~/.gitconfig)',
+  'Write(~/.npmrc)',
+  'Write(~/.pypirc)',
+  'Write(~/.docker/config.json)',
+  'Write(~/.netrc)',
+  'Write(~/.config/gh/**)',
+  'Write(~/.bashrc)',
+  'Write(~/.zshrc)',
+  'Write(~/.profile)',
+  'Write(~/.bash_profile)',
+  'Write(~/.zprofile)',
+  'Write(~/.zshenv)',
+];
+
+/**
  * Install (or refresh) the MACF plugin-skill + MCP-tool pre-approval
  * entries in `.claude/settings.json` (kept-named for back-compat — see
  * `installGhTokenHook`'s doc comment for the same naming convention; this
@@ -1198,16 +1250,25 @@ export function applyPluginSkillPermissionsTransform(settings: Settings): Settin
   ];
 
   // DR-028 deny floor — union with operator-authored deny entries (preserve
-  // extras, dedup, idempotent on re-run).
+  // extras, dedup, idempotent on re-run). Drop superseded MACF-managed
+  // `Write(<credential-path>)` entries first (groundnuty/macf#1067) — those
+  // are no longer in ROLE_FLOOR_DENY (replaced by the already-paired
+  // `Edit(<path>)` entry, the form Claude Code actually consults), so
+  // without this explicit strip an already-provisioned workspace's stale
+  // copies would be mistaken for operator-authored and preserved forever.
   const existingDeny = Array.isArray(
     settings['permissions'] && (settings['permissions'] as { deny?: unknown })['deny'],
   )
     ? (settings['permissions'] as { deny: readonly string[] }).deny
     : [];
+  const legacyDenyWriteSet = new Set<string>(MACF_LEGACY_DENY_WRITE_PATTERNS);
+  const preservedDeny = existingDeny.filter(
+    (e) => !(typeof e === 'string' && legacyDenyWriteSet.has(e)),
+  );
   const denySet = new Set<string>(ROLE_FLOOR_DENY);
   const deny: string[] = [
     ...ROLE_FLOOR_DENY,
-    ...existingDeny.filter((e) => !(typeof e === 'string' && denySet.has(e))),
+    ...preservedDeny.filter((e) => !(typeof e === 'string' && denySet.has(e))),
   ];
 
   const existingPermissions = (settings['permissions'] as Record<string, unknown> | undefined) ?? {};

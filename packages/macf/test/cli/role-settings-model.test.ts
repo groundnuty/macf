@@ -57,9 +57,19 @@ describe('DR-028 role-settings model', () => {
         expect(ROLE_FLOOR_DENY).toContain(d);
       }
     });
-    it('blocks config/dotfile writes (incl. its own settings.json)', () => {
-      for (const d of ['Write(~/.claude/settings.json)', 'Write(~/.ssh/**)', 'Write(~/.aws/**)']) {
+    it('blocks config/dotfile writes (incl. its own settings.json) via Edit(path), never Write(path)', () => {
+      // groundnuty/macf#1067: Claude Code's file-permission check consults
+      // only Edit(path) + Read(path) rules — a Write(path) deny entry is
+      // accepted but never consulted, and Claude Code warns at startup that
+      // it's ineffective. Edit(path) alone covers Write/NotebookEdit/Glob/
+      // MultiEdit for that path, so it's both necessary and sufficient here.
+      for (const d of ['Edit(~/.claude/settings.json)', 'Edit(~/.ssh/**)', 'Edit(~/.aws/**)']) {
         expect(ROLE_FLOOR_DENY).toContain(d);
+      }
+      // Regression guard: the ineffective Write(<path>) form must never
+      // reappear in the canonical floor.
+      for (const entry of ROLE_FLOOR_DENY) {
+        expect(entry).not.toMatch(/^Write\(.+\)$/);
       }
     });
     it('blocks the dangerous commands', () => {
@@ -68,6 +78,49 @@ describe('DR-028 role-settings model', () => {
       }
       // some force-push variant is denied
       expect(ROLE_FLOOR_DENY.some((d) => /git push.*(--force|-f)/.test(d))).toBe(true);
+    });
+
+    it('DECISIVE (macf#1067): every entry is a form Claude Code actually consults for file-permission checks', () => {
+      // Per Claude Code's permissions docs ("Configure permissions" §
+      // "Read and Edit"): "Claude Code checks file permissions against
+      // Edit(path) and Read(path) rules only. If you write a path rule
+      // for Write, NotebookEdit, Glob, or the legacy MultiEdit tool
+      // instead, Claude Code accepts the rule but never consults it" —
+      // and warns at startup, on every launch, that the rule is dead.
+      //
+      // Assert over the WHOLE array, not a sample of known-bad entries:
+      // the #1067 defect shipped specifically because a prior review only
+      // checked a handful of paths (the ones quoted in the operator's
+      // startup log) while 13 other Write(<path>) entries stayed broken
+      // unexamined. A set-membership question needs a set-membership
+      // test, not a spot-check.
+      const INEFFECTIVE_PATH_SCOPED_FILE_RULE = /^(Write|NotebookEdit|Glob|MultiEdit)\(.+\)$/;
+      for (const entry of ROLE_FLOOR_DENY) {
+        expect(entry).not.toMatch(INEFFECTIVE_PATH_SCOPED_FILE_RULE);
+      }
+
+      // Positive half of the same assertion: every file-tool entry present
+      // uses one of the two forms Claude Code's docs confirm ARE consulted.
+      const fileToolEntries = ROLE_FLOOR_DENY.filter((e) => /^(Read|Edit|Write|NotebookEdit|Glob|MultiEdit)\(/.test(e));
+      expect(fileToolEntries.length).toBeGreaterThan(0);
+      for (const entry of fileToolEntries) {
+        expect(entry).toMatch(/^(Read|Edit)\(.+\)$/);
+      }
+
+      // Bash entries are a DIFFERENT tool-rule family (fully supported —
+      // Bash(<command-pattern>) rules ARE consulted per the same docs'
+      // "Bash" section) — sanity-check none accidentally collapsed into
+      // the file-tool shape being tested above, and that every Bash entry
+      // is well-formed (non-empty command specifier).
+      const bashEntries = ROLE_FLOOR_DENY.filter((e) => e.startsWith('Bash('));
+      expect(bashEntries.length).toBeGreaterThan(0);
+      for (const entry of bashEntries) {
+        expect(entry).toMatch(/^Bash\(.+\)$/);
+      }
+
+      // Every entry falls into exactly one of the three known-good
+      // families above — nothing unaccounted for.
+      expect(fileToolEntries.length + bashEntries.length).toBe(ROLE_FLOOR_DENY.length);
     });
   });
 
