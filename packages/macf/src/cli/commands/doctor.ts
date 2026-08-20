@@ -32,6 +32,7 @@ import {
   installPluginSkillPermissions,
   installSandboxExcludedCommands,
   installSandboxFdAllowRead,
+  MACF_LEGACY_DENY_WRITE_PATTERNS,
   SANDBOX_FD_READ_PATTERN,
 } from '../settings-writer.js';
 import {
@@ -671,6 +672,37 @@ function denyFindings(deny: readonly string[]): RoleSettingFinding[] {
   return findings;
 }
 
+/**
+ * Flags PRESENCE (not absence) of a superseded `Write(<credential-path>)`
+ * deny entry (groundnuty/macf#1067) — `denyFindings` above only checks for
+ * MISSING canonical entries, so a workspace provisioned before this fix
+ * (which already carries every current `ROLE_FLOOR_DENY` entry, plus the
+ * 19 now-dead `Write()` ones) would otherwise report a clean `denyFindings`
+ * result and never trip `checkRoleSettings`'s `status !== 'PASS'`, which is
+ * exactly what `doctor --fix`'s `needsFix` gate checks (doctor.ts's `--fix`
+ * handler) — without this check, `--fix` would print "nothing to fix" on a
+ * workspace that still carries 19 dead rules and a per-launch warning.
+ * `macf update` converges unconditionally regardless (it calls
+ * `installPluginSkillPermissions` outside any drift gate — see
+ * `commands/update.ts`); this closes the parallel gap on the `--fix` path.
+ */
+function legacyDenyWriteFindings(deny: readonly string[]): RoleSettingFinding[] {
+  const findings: RoleSettingFinding[] = [];
+  for (const entry of MACF_LEGACY_DENY_WRITE_PATTERNS) {
+    if (deny.includes(entry)) {
+      findings.push({
+        category: 'deny',
+        item: entry,
+        severity: 'WARN',
+        message: `superseded deny entry "${entry}" present — Claude Code never consults a ` +
+          'Write(path) rule (only Edit(path)/Read(path)); the paired Edit(path) entry already ' +
+          'protects this path. Run `macf doctor --fix` or `macf update` to drop it.',
+      });
+    }
+  }
+  return findings;
+}
+
 function hookFindings(commands: readonly string[], role: string): RoleSettingFinding[] {
   const findings: RoleSettingFinding[] = [];
   for (const hook of expectedHooksForRole(role)) {
@@ -716,6 +748,7 @@ export function checkRoleSettings(workspaceDir: string, role: string): RoleSetti
   const findings: RoleSettingFinding[] = [
     ...allowFindings(allow, role),
     ...denyFindings(deny),
+    ...legacyDenyWriteFindings(deny),
     ...hookFindings(commands, role),
   ];
 

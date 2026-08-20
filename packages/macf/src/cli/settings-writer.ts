@@ -1135,8 +1135,17 @@ const MACF_LEGACY_MCP_TOOL_PATTERN_PREFIX = 'mcp__plugin_macf-agent_macf-agent__
  * would be treated as the latter and preserved forever. Same migration-
  * cleanup shape as `MACF_LEGACY_MCP_TOOL_PATTERN_PREFIX` /
  * `MACF_LEGACY_FD_PATTERNS` elsewhere in this file.
+ *
+ * Exported so `doctor.ts` can flag PRESENCE of any of these as drift (not
+ * just absence of the canonical floor) — otherwise `macf doctor` reports a
+ * stale-but-otherwise-compliant workspace as PASS (it already has all 39
+ * current `ROLE_FLOOR_DENY` entries; `denyFindings` only checks for missing
+ * entries, never superseded ones) and `doctor --fix`'s `needsFix` gate never
+ * trips, so `--fix` never calls the emitter that would strip them. `macf
+ * update` still converges unconditionally regardless of this — see
+ * `commands/update.ts`.
  */
-const MACF_LEGACY_DENY_WRITE_PATTERNS: readonly string[] = [
+export const MACF_LEGACY_DENY_WRITE_PATTERNS: readonly string[] = [
   'Write(~/.claude/settings.json)',
   'Write(~/.claude.json)',
   'Write(~/.ssh/**)',

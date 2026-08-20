@@ -1416,32 +1416,55 @@ describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {
     // REAL convergence path (`installPluginSkillPermissions`, the exact
     // function `macf update` / `doctor --fix` call) rather than just the
     // in-memory transform, to prove the fix actually reaches disk.
-    it("replaces a pre-#1067 workspace's stale Write(<path>) with nothing extra — the paired Edit(<path>) survives, deduped", () => {
+    it("replaces EVERY pre-#1067 workspace's stale Write(<path>) with nothing extra — every paired Edit(<path>) survives, deduped", () => {
+      // Seeds the FULL pre-#1067 shape (all 19 known credential paths, each
+      // as a Write(path)+Edit(path) pair, exactly how earlier CLI versions
+      // wrote ROLE_FLOOR_DENY) as LITERAL strings — not by importing
+      // MACF_LEGACY_DENY_WRITE_PATTERNS and iterating it, which would only
+      // prove the production list agrees with itself. Asserting over all 19
+      // (not a 2-of-19 sample) is the same "whole set, not a sample"
+      // discipline the production DECISIVE test below applies.
+      const legacyCredentialPaths = [
+        '~/.claude/settings.json',
+        '~/.claude.json',
+        '~/.ssh/**',
+        '~/.aws/**',
+        '~/.gnupg/**',
+        '~/.kube/**',
+        '~/.config/gcloud/**',
+        '~/.gitconfig',
+        '~/.npmrc',
+        '~/.pypirc',
+        '~/.docker/config.json',
+        '~/.netrc',
+        '~/.config/gh/**',
+        '~/.bashrc',
+        '~/.zshrc',
+        '~/.profile',
+        '~/.bash_profile',
+        '~/.zprofile',
+        '~/.zshenv',
+      ];
+      const staleDeny = legacyCredentialPaths.flatMap((p) => [`Write(${p})`, `Edit(${p})`]);
+
       mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
       writeFileSync(settingsPath, JSON.stringify({
-        permissions: {
-          deny: [
-            'Write(~/.ssh/**)',
-            'Edit(~/.ssh/**)',
-            'Write(~/.claude/settings.json)',
-            'Edit(~/.claude/settings.json)',
-          ],
-        },
+        permissions: { deny: staleDeny },
       }, null, 2));
 
       installPluginSkillPermissions(tmpRoot);
 
       const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
       const deny: readonly string[] = s.permissions.deny;
-      // The corrected entry REPLACES the stale one on disk — it does not
-      // sit alongside it forever (the exact convergence gap #1067 flagged).
-      expect(deny).not.toContain('Write(~/.ssh/**)');
-      expect(deny).not.toContain('Write(~/.claude/settings.json)');
-      // The effective form is present exactly once — no duplicate from the
-      // union-merge (it was already in both the old settings.json AND the
-      // new canonical ROLE_FLOOR_DENY).
-      expect(deny.filter((d) => d === 'Edit(~/.ssh/**)')).toHaveLength(1);
-      expect(deny.filter((d) => d === 'Edit(~/.claude/settings.json)')).toHaveLength(1);
+      for (const p of legacyCredentialPaths) {
+        // The corrected entry REPLACES the stale one on disk — it does not
+        // sit alongside it forever (the exact convergence gap #1067 flagged).
+        expect(deny).not.toContain(`Write(${p})`);
+        // The effective form is present exactly once — no duplicate from the
+        // union-merge (it was already in both the old settings.json AND the
+        // new canonical ROLE_FLOOR_DENY).
+        expect(deny.filter((d) => d === `Edit(${p})`)).toHaveLength(1);
+      }
     });
 
     it('does not touch a genuinely operator-authored Write(<path>) deny on a non-canonical path', () => {

@@ -166,6 +166,25 @@ describe('checkRoleSettings (DR-028)', () => {
     expect(denyFindings.length).toBeGreaterThan(0);
     expect(denyFindings.every((f) => f.severity === 'WARN')).toBe(true);
   });
+
+  it('WARNs on a superseded Write(<credential-path>) deny entry even when the full floor is otherwise present (macf#1067)', () => {
+    // Reproduces the exact stale-workspace shape: everything ROLE_FLOOR_DENY
+    // currently expects is present (so denyFindings() alone reports clean),
+    // PLUS a leftover Write(<path>) entry from a pre-#1067 CLI version.
+    // Without a dedicated presence check, this workspace would read PASS —
+    // the doctor equivalent of the silent-startup-warning #1067 is about.
+    installFullFloor(tmpRoot);
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    settings.permissions.deny.push('Write(~/.ssh/**)');
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+
+    const result = checkRoleSettings(tmpRoot, 'code-agent');
+    expect(result.status).toBe('WARN');
+    const legacyFinding = result.findings.find((f) => f.item === 'Write(~/.ssh/**)');
+    expect(legacyFinding).toBeDefined();
+    expect(legacyFinding?.category).toBe('deny');
+    expect(legacyFinding?.severity).toBe('WARN');
+  });
 });
 
 describe('inferRole (DR-028)', () => {
@@ -257,5 +276,34 @@ describe('runDoctor --fix (DR-028)', () => {
     const after = JSON.parse(readFileSync(path, 'utf-8'));
     expect(after.permissions.deny).not.toContain('Bash(sudo *)');
     expect(checkRoleSettings(tmpRoot, 'code-agent').status).toBe('WARN');
+  });
+
+  it('--fix strips a superseded Write(<credential-path>) deny entry from an otherwise-compliant workspace (macf#1067)', async () => {
+    // End-to-end proof that `doctor --fix` actually converges the exact
+    // stale-workspace shape #1067's requirement 4 asked about — not just
+    // that installPluginSkillPermissions *would* strip it in isolation.
+    // Before the legacyDenyWriteFindings() detection wired into
+    // checkRoleSettings, this workspace read PASS (denyFindings() only
+    // checks for MISSING canonical entries, never superseded ones), so
+    // --fix's needsFix gate never tripped and "nothing to fix" printed
+    // while the dead rule (and its per-launch warning) stayed forever.
+    writeAgentConfig(tmpRoot, localConfig('code-agent'));
+    installFullFloor(tmpRoot);
+    const path = join(tmpRoot, '.claude', 'settings.json');
+    const before = JSON.parse(readFileSync(path, 'utf-8'));
+    before.permissions.deny.push('Write(~/.ssh/**)', 'Write(~/.claude/settings.json)');
+    writeFileSync(path, JSON.stringify(before, null, 2) + '\n');
+    expect(checkRoleSettings(tmpRoot, 'code-agent').status).toBe('WARN');
+
+    const code = await runDoctor(tmpRoot, { fix: true, yes: true });
+    expect(code).toBe(0);
+
+    const after = JSON.parse(readFileSync(path, 'utf-8'));
+    expect(after.permissions.deny).not.toContain('Write(~/.ssh/**)');
+    expect(after.permissions.deny).not.toContain('Write(~/.claude/settings.json)');
+    // The actually-effective paired Edit(path) entries survive.
+    expect(after.permissions.deny).toContain('Edit(~/.ssh/**)');
+    expect(after.permissions.deny).toContain('Edit(~/.claude/settings.json)');
+    expect(checkRoleSettings(tmpRoot, 'code-agent').status).toBe('PASS');
   });
 });
