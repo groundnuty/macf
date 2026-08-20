@@ -22,7 +22,11 @@
  * source-shape regression pins (cf. the macf#347 commander-default test).
  */
 import { describe, it, expect } from 'vitest';
-import { resolveMutateDeps } from '../../../src/cli/commands/bootstrap-apply.js';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { upgradeFleets } from '@groundnuty/macf-core';
+import { resolveMutateDeps, resolveApplyVersionDeps } from '../../../src/cli/commands/bootstrap-apply.js';
 import {
   realControlRepoCommitAndPush,
   checkControlRepoMeta,
@@ -243,5 +247,57 @@ describe('fleet delete-apps / destroy real-deps wiring (DR-043 Amendment G, macf
 
   it('destroy: wires the App presence read to the "ask, don\'t predict" resolver (groundnuty/macf#917, widened to org-installations-listing-first by macf#967) — NOT the predicted-slug-only primitive that produced the false-absent bug', () => {
     expect(destroyDeps.checkAppPresence).toBe(resolveAppPresenceStatus);
+  });
+});
+
+// --- DR-043 Amendment L (macf#1045) — the version-reconcile phase's golden-path seam ---
+//
+// The IDENTITY-ASSERTION shape `#1024` asked for on `apply-deploy.ts`'s own
+// (still-open) `deployAgentFn` seam, carried here as the "same structural
+// obligation" Amendment L2 names explicitly: the production wiring site
+// (`resolveApplyVersionDeps`) must resolve `runUpgradeFleetsFn` to the REAL
+// `@groundnuty/macf-core::upgradeFleets` — not merely something callable,
+// and not a same-signature wrapper a future edit could silently substitute
+// unnoticed. `resolveApplyVersionDeps` reads the manifest file eagerly
+// (mirrors `commands/fleet-upgrade.ts::resolveDepsFromConfig`'s own
+// `buildRecordDeployedVersion` call — fail loud at RESOLVE time), so this
+// needs a REAL, parseable manifest file on disk (unlike `resolveMutateDeps`,
+// which is deliberately I/O-free for a nonexistent path).
+
+describe('apply version-reconcile-phase real-deps wiring (DR-043 Amendment L, macf#1045)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'macf-version-deps-wiring-'));
+  const manifestPath = join(dir, 'fleet.yaml');
+  writeFileSync(
+    manifestPath,
+    `apiVersion: macf/v0
+kind: Fleet
+metadata:
+  name: wiring-test-fleet
+owner:
+  account: groundnuty
+  type: user
+  registry: { type: profile, user: groundnuty }
+network:
+  advertise_host: example.ts.net
+transport:
+  age_recipients: [age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+defaults:
+  role_template: groundnuty/agentic-repo-template
+  app_manifest: dr-019
+agents:
+  - role: code-agent
+    profile: code
+    repo: groundnuty/wiring-code
+    deploy_path: /home/ubuntu/repos/wiring-code
+`,
+  );
+  const versionDeps = resolveApplyVersionDeps(manifestPath);
+
+  it('wires the roll to the REAL upgradeFleets — the "the production path\'s dependency IS the real roll, provably" assertion', () => {
+    expect(versionDeps.runUpgradeFleetsFn).toBe(upgradeFleets);
+  });
+
+  it('wires recordDeployedVersion (DR-043 §D6 write-back) — not silently omitted for the apply-driven roll', () => {
+    expect(versionDeps.recordDeployedVersion).toBeDefined();
   });
 });

@@ -175,7 +175,7 @@ describe('DR-043 §D6 — versions.macf steering, the whole loop', () => {
     }
   });
 
-  it('step 5 — planItemApplyCoverage reports the version kind as NOT actionable by apply, for both the drift (update) and the unknown-degrade (create) shape', () => {
+  it('step 5 — planItemApplyCoverage reports the version kind as ACTIONABLE by apply (DR-043 Amendment L, macf#1045 — apply reconciles by calling the fleet-upgrade roll), for both the drift (update) and the unknown-degrade (create) shape', () => {
     const manifest = baseManifest({ versions: { macf: VERSION_Y, actions: ACTIONS_PIN } });
     const observed: ObservedState = {
       lock: null,
@@ -190,24 +190,25 @@ describe('DR-043 §D6 — versions.macf steering, the whole loop', () => {
 
     for (const item of versionItems) {
       // Direct call — the single source of truth every renderer derives from.
-      expect(planItemApplyCoverage(item)).toBe('not_implemented');
+      // Both the drift (update) AND the unknown-degrade (create) shape are
+      // 'implemented' — apply's version phase calls the roll unconditionally
+      // whenever versions: is declared; the roll's own LIVE probe resolves
+      // what the Mac-side plan could only guess at.
+      expect(planItemApplyCoverage(item)).toBe('implemented');
     }
 
     // computeUnimplementedByApply / plan.unimplementedByApply are the SAME
     // computation `computePlan` already ran — assert both agree, and that
-    // the reason surfaced points at the real remedy, not a generic "TODO".
+    // NEITHER version item is reported as a gap anymore.
     expect(computeUnimplementedByApply(plan.items)).toEqual(plan.unimplementedByApply);
     const unimplementedVersionItems = plan.unimplementedByApply.filter((i) => i.kind === 'version');
-    expect(unimplementedVersionItems).toHaveLength(2);
-    for (const item of unimplementedVersionItems) {
-      expect(item.reason).toMatch(/macf fleet upgrade/);
-    }
+    expect(unimplementedVersionItems).toHaveLength(0);
 
-    // The rendered "not implemented" block — the text an operator running
-    // --yes actually sees (mirrors bootstrap-apply.test.ts's CLI-level
-    // assertion of the same contract via the full command).
+    // The rendered "not implemented" block no longer names the version kind
+    // — mirrors bootstrap-apply.test.ts's CLI-level assertion of the same
+    // contract via the full command.
     const lines = formatUnimplementedLines(plan.unimplementedByApply);
-    expect(lines.some((l) => l.startsWith('version:') && l.includes('NOT IMPLEMENTED BY APPLY'))).toBe(true);
+    expect(lines.some((l) => l.startsWith('version:'))).toBe(false);
   });
 
   it('a noop-clean fleet (step 1 restated) never reports the version kind as unimplemented — "nothing to do" is not "apply won\'t do this"', () => {

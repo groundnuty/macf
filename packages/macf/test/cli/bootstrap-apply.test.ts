@@ -49,6 +49,8 @@ import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle } from '../../src/cli/bootstrap/
 import { VaultError, buildVaultPlaintext, type VaultAgentSecrets, type VaultRunnerOpsSecrets } from '../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext } from '../../src/cli/bootstrap/vault-read.js';
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../src/cli/bootstrap/registry-scope-preflight.js';
+import { upgradeFleets } from '@groundnuty/macf-core';
+import type { ApplyVersionPhaseDeps } from '../../src/cli/bootstrap/apply-version.js';
 
 const FLEET_YAML = `apiVersion: macf/v0
 kind: Fleet
@@ -450,6 +452,31 @@ function fakeRoutingClientDeps(overrides: Partial<RoutingClientApplyDeps> = {}):
     mint: async () => ({ certPem: 'SENTINEL-ROUTING-CLIENT-CERT-PEM', keyPem: 'SENTINEL-ROUTING-CLIENT-KEY-PEM' }),
     checkRepoSecretPresence: async () => 'absent',
     setRepoSecret: async () => {},
+    ...overrides,
+  };
+}
+
+/**
+ * DR-043 Amendment L (macf#1045) — hermetic version-reconcile-phase deps.
+ * `discover: () => []` + `resolveDriver: async () => null` mean the REAL
+ * `upgradeFleets` (used unmocked here — delegation, not a fake sequencer)
+ * gracefully reports `fleet-skipped` (driver-unresolved) and returns
+ * `{halted:false}` — deterministic, no real host filesystem / VM-driver I/O.
+ * `fetchLatest` THROWS if called — `FLEET_YAML_WITH_VERSIONS` always
+ * declares `versions.macf`, so Amendment L3's manifest-authoritative branch
+ * must never reach it (`assert-the-wrong-path.md`).
+ */
+function fakeVersionDeps(overrides: Partial<ApplyVersionPhaseDeps> = {}): ApplyVersionPhaseDeps {
+  return {
+    discover: () => [],
+    resolveDriver: async () => null,
+    fetchLatest: async () => {
+      throw new Error('fetchLatest must not be called — versions.macf is declared (DR-043 Amendment L3)');
+    },
+    sleep: async () => {},
+    now: () => 0,
+    log: () => {},
+    runUpgradeFleetsFn: upgradeFleets,
     ...overrides,
   };
 }
@@ -1386,42 +1413,44 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
   // summary is the ONLY place an automated run sees the gap" contract the
   // routing tests above establish, now for a macf CLI version drift.
 
-  it('final summary (--yes, non-json) surfaces a macf version drift as NOT IMPLEMENTED BY APPLY (DR-043 §D6)', async () => {
+  it('final summary (--yes, non-json) no longer reports a macf version drift as NOT IMPLEMENTED BY APPLY — apply reconciles it (DR-043 Amendment L, macf#1045)', async () => {
     const file = writeManifest(FLEET_YAML_WITH_VERSIONS);
     const code = await runBootstrapApply(
       { file, yes: true },
-      { observe: () => Promise.resolve(OBSERVED_VERSION_DRIFT) },
+      { observe: () => Promise.resolve(OBSERVED_VERSION_DRIFT), versionDeps: fakeVersionDeps() },
       fakeMutateDeps(file),
     );
     expect(code).toBe(0);
     const out = logs.join('\n');
-    expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
-    expect(out).toMatch(/\bversion:.*\(update\)/);
-    // The fixture's `actionsPin` already matches the declared "v3.4.1" —
-    // only the `version` kind should surface here, never `actions_pin`.
+    // Neither versions.* kind is unimplemented anymore for 'version'
+    // (macf#1045); 'actions_pin' was never unimplemented in this fixture
+    // (observed pin already matches declared) — so the whole block is gone.
+    expect(out).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
+    expect(out).not.toMatch(/\bversion:.*\(update\)/);
     expect(out).not.toMatch(/\bactions_pin:/);
+    // The version-reconcile phase DID attempt (versions.macf is declared) —
+    // the final summary names the target it reconciled toward.
+    expect(out).toMatch(/Version reconcile: completed toward macf@0\.2\.60/);
   });
 
-  it('final summary (--yes, --json) carries the version-drift items with the `macf fleet upgrade` remedy named in each reason', async () => {
+  it('final summary (--yes, --json) carries version_phase (attempted + target), and unimplemented_by_apply no longer names the version kind (DR-043 Amendment L, macf#1045)', async () => {
     const file = writeManifest(FLEET_YAML_WITH_VERSIONS);
     const code = await runBootstrapApply(
       { file, yes: true, json: true },
-      { observe: () => Promise.resolve(OBSERVED_VERSION_DRIFT) },
+      { observe: () => Promise.resolve(OBSERVED_VERSION_DRIFT), versionDeps: fakeVersionDeps() },
       fakeMutateDeps(file),
     );
     expect(code).toBe(0);
     const parsed = JSON.parse(logs.join('\n')) as {
       unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
+      version_phase?: { target: string; halted: boolean };
     };
-    const versionItems = parsed.unimplemented_by_apply.filter((i) => i.kind === 'version');
-    // One per agent (code-agent + science-agent), both diverging (0.2.44 observed vs "0.2.60" declared).
-    expect(versionItems).toHaveLength(2);
-    for (const item of versionItems) {
-      expect(item.verb).toBe('update');
-      expect(item.reason).toMatch(/macf fleet upgrade/);
-    }
-    // actions_pin must NOT appear — the fixture's observed pin already matches declared.
+    // version is GONE from unimplemented_by_apply (macf#1045) — apply now
+    // reconciles it; actions_pin was never present in this fixture either
+    // way (observed pin already matches declared).
+    expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'version')).toBe(false);
     expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'actions_pin')).toBe(false);
+    expect(parsed.version_phase).toEqual({ target: '0.2.60', halted: false });
   });
 
   it('pre-approval stderr render (interactive path, confirmPlan declines) ALSO shows the NOT IMPLEMENTED block before the abort', async () => {

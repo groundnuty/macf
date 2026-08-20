@@ -34,12 +34,19 @@
  * router pin committed to that repo's `agent-router.yml`) — see
  * `macfVersionItem` / `actionsVersionItem` below. Both are pure
  * value-comparisons against `ObservedState`, same three-verb shape as every
- * other item in this file; `apply` has NO code path for either kind
- * (`planItemApplyCoverage`'s `'version'` / `'actions_pin'` cases) — the
- * remedy is a DIFFERENT command per kind (`macf fleet upgrade` for the macf
- * CLI version; `macf repo-init --actions-version <pin> --force` for the
- * router pin — verified independently, NOT the same command, despite DR-043
- * §D6's prose naming `macf fleet upgrade` generically for "a mismatch").
+ * other item in this file.
+ *
+ * **`version` gained a real `apply` code path under DR-043 Amendment L
+ * (groundnuty/macf#1045) — `actions_pin` did NOT.** `apply`'s
+ * version-reconcile phase (`apply-version.ts`) now CALLS the `macf fleet
+ * upgrade` roll machinery (delegation, never reimplementation — Amendment
+ * L2) for a diverging `versions.macf`, so `planItemApplyCoverage`'s
+ * `'version'` case is `'implemented'`. `actions_pin` remains
+ * `'not_implemented'` — its remedy (`macf repo-init --actions-version <pin>
+ * --force`, rewriting a repo's committed `agent-router.yml`) is a genuinely
+ * DIFFERENT command that `apply` still never calls, verified independently,
+ * despite DR-043 §D6's prose naming `macf fleet upgrade` generically for "a
+ * mismatch" against either `versions.*` field.
  *
  * A SIBLING gap surfaced on the first real provision (groundnuty/macf#854):
  * `skippedSections` covers whole MANIFEST SECTIONS apply never reconciles,
@@ -411,6 +418,16 @@ export interface UnimplementedApplyItem {
  * items never emit an `update` verb (`presenceVerb` — pure existence check),
  * so the kind joined the always-`'implemented'` group entirely — same shape
  * as `'repo'`'s own history above.
+ *
+ * `version` is ALSO GONE (macf#1045, DR-043 Amendment L) — `apply-version.ts`
+ * now calls the `macf fleet upgrade` roll machinery (delegation, never
+ * reimplementation) for a diverging `versions.macf`, for BOTH verbs this
+ * kind can emit ('create'/unknown-degrade included — the roll's own live
+ * probe resolves what the Mac-side plan could only guess at). `'version'`
+ * moved into {@link planItemApplyCoverage}'s always-`'implemented'` group.
+ * `actions_pin` (the OTHER `versions:` field, `versions.actions`) is
+ * UNCHANGED — its remedy is still a different command apply never calls;
+ * see this file's module doc.
  */
 export const APPLY_UNIMPLEMENTED_REASONS = {
   routing:
@@ -419,19 +436,8 @@ export const APPLY_UNIMPLEMENTED_REASONS = {
     'diverging value — the task\'s create-only posture ("never silently overwrite") leaves this specific update ' +
     'un-actioned. Set the repo variable manually to the declared value, or re-run apply once a future increment ' +
     'adds confirmed per-item updates; nothing above was changed for this item.',
-  // DR-043 §D6 — apply provisions identity/repo/CA/routing-wiring; it never
-  // touches deployed SOFTWARE versions, by design (§D4: that is the
-  // OPERATIONAL plane, VM-side/agent-privileged, a different tool). This
-  // holds for BOTH the 'create' (unknown-degrade) and 'update' (confirmed
-  // drift) verbs this kind can emit — there is no create-a-version
-  // primitive either.
-  version:
-    'apply provisions identity/repo/CA/routing wiring; it deliberately never rolls the deployed macf CLI ' +
-    'version (§D4 — the operational plane is `macf fleet upgrade`, VM-side, agent-privileged, gated by ' +
-    'DR-037\'s verify-green outcome). Run "macf fleet upgrade" (optionally --target <version>) to converge; ' +
-    'nothing above was changed for this item.',
-  // Deliberately a DIFFERENT remedy than `version` above — `macf fleet
-  // upgrade` / `macf update` never touch a repo's committed
+  // Deliberately a DIFFERENT remedy than `version` (now implemented,
+  // macf#1045) — `macf fleet upgrade` / `macf update` never touch a repo's committed
   // `.github/workflows/agent-router.yml` (verified: neither reads nor
   // writes that path). Only `macf repo-init --actions-version ... --force`
   // regenerates it (repo-init.ts's "--force only controls the workflow
@@ -488,6 +494,19 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // actioned. Both kinds' items are produced by `presenceVerb`, a pure
       // existence check that only ever emits 'create' or 'noop' — so this
       // arm's only live input is 'create'; 'noop' is filtered above.
+      return 'implemented';
+    case 'version':
+      // DR-043 Amendment L (macf#1045) — `apply-version.ts` now calls the
+      // `macf fleet upgrade` roll machinery (delegation, never
+      // reimplementation) for a diverging `versions.macf`, unconditionally
+      // whenever `versions:` is declared — for BOTH verbs this kind can
+      // emit. 'create' (the unobservable-degrade candidate — see
+      // `macfVersionItem`'s doc) is included: the roll's own LIVE probe
+      // resolves what the Mac-side plan could only guess at from
+      // `fleet.lock`, so there is no honest reason to withhold the attempt
+      // just because the Mac-side plan-time confidence was low. Unlike
+      // `'actions_pin'` below (still a different, un-called command), this
+      // kind left the not_implemented group entirely.
       return 'implemented';
     case 'labels':
       // groundnuty/macf#920 gap 1 — `apply-repo-init.ts::applyRepoInitForAgent`
@@ -556,15 +575,15 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // the operator has approved). Same "this IS wired, not a gap" reasoning
       // as 'control_repo'.
       return 'implemented';
-    case 'version':
     case 'actions_pin':
-      // DR-043 §D6 — apply NEVER acts on either kind, regardless of verb:
+      // DR-043 §D6 — apply NEVER acts on this kind, regardless of verb:
       // 'create' here is the unobservable-degrade candidate (see
-      // `macfVersionItem` / `actionsVersionItem`), and there is no
-      // create-a-version / create-a-router-pin primitive either. Unlike
-      // 'routing' above, this is a WHOLE-KIND gap, not a create-vs-update
-      // split — both remaining verbs (noop/report-extra already returned
-      // above) stay `not_implemented`.
+      // `actionsVersionItem`), and there is no create-a-router-pin
+      // primitive either. Unlike 'routing' above, this is a WHOLE-KIND gap,
+      // not a create-vs-update split — both remaining verbs (noop/report-
+      // extra already returned above) stay `not_implemented`. `'version'`
+      // (the OTHER `versions:` field) moved to the always-`'implemented'`
+      // group above (macf#1045, DR-043 Amendment L) — this kind did not.
       return 'not_implemented';
     case 'vault_recipients':
       // groundnuty/macf#957 — `apply-fleet.ts::reconcileVaultRecipients` has
@@ -584,8 +603,6 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
   switch (kind) {
     case 'routing':
       return APPLY_UNIMPLEMENTED_REASONS.routing;
-    case 'version':
-      return APPLY_UNIMPLEMENTED_REASONS.version;
     case 'actions_pin':
       return APPLY_UNIMPLEMENTED_REASONS.actionsPin;
     case 'runner_warm':
@@ -602,13 +619,15 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'routing_client':
     case 'runner_ops':
     case 'vault_recipients':
+    case 'version':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
       // 2, 'control_repo' in macf#867 / DR-043 Amendment G, 'agent_repo_archived'
       // in macf#1034 (DR-043 Amendment G correction), 'labels'/
       // 'routing_client' in groundnuty/macf#920, 'runner_ops' in
-      // groundnuty/macf#943, 'vault_recipients' in groundnuty/macf#957).
+      // groundnuty/macf#943, 'vault_recipients' in groundnuty/macf#957,
+      // 'version' in macf#1045 / DR-043 Amendment L).
       // Kept exhaustive so a NEW `PlanItemKind` added
       // later is a compile error here, not a silent "apply covers
       // everything" false-negative.
@@ -1235,10 +1254,14 @@ function vaultRecipientsItem(desiredCount: number, obs: VaultRecipientsObservati
  *     this file uses) — explicitly NOT `noop` and NOT `update`.
  *   - equals `desired` → `noop`.
  *   - differs from `desired` → `update`, `confirm_required: true` (§D3).
- *     `apply` never actions this verb (`planItemApplyCoverage`'s `'version'`
- *     case) — the reason text NAMES the actual remedy (`macf fleet upgrade`)
- *     so re-running `plan` after editing `versions.macf` doesn't leave the
- *     operator guessing what converges it.
+ *     `apply` DOES action this verb as of macf#1045 (DR-043 Amendment L —
+ *     `planItemApplyCoverage`'s `'version'` case is `'implemented'`) by
+ *     calling the `macf fleet upgrade` roll machinery during the run this
+ *     plan is approving — the reason text still NAMES that underlying
+ *     mechanism (never claims apply won't roll fleets; that was true only
+ *     pre-Amendment-L) so an operator reading the plan sees what's about to
+ *     restart the agent, per Amendment L2's "make the widening visible in
+ *     the plan the operator approves" requirement.
  */
 function macfVersionItem(agent: FleetAgent, desired: string, obs: ObservedAgentState | undefined): PlanItem {
   const target = `agent:${agent.role}:version:macf`;
@@ -1269,7 +1292,8 @@ function macfVersionItem(agent: FleetAgent, desired: string, obs: ObservedAgentS
     verb: 'update',
     reason:
       `deployed macf version observed "${observed}" but manifest declares "${desired}" — ` +
-      'run "macf fleet upgrade" to converge (DR-037 operational plane, §D4); apply does not roll fleets',
+      'apply reconciles this by calling the "macf fleet upgrade" roll during this run (DR-043 Amendment L; ' +
+      'DR-037 verify-green gated, §D4) — this restarts the agent',
     confirm_required: true,
   };
 }
