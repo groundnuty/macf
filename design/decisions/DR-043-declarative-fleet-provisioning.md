@@ -647,3 +647,51 @@ Two corrections to the ladder table:
 **K4 references:** `#1034` (this correction) · `#1033` (the sibling ladder defect — `deactivate` orphans running agents — found in the same live walk) · `#867` (Amendment G, the ladder this corrects) · `#1000` (the golden-path rule this correction applies) · `#917`/`#918` (the cumulative-rungs idempotency correction above, the closest prior precedent for "a live walk of the ladder finds what per-rung unit tests cannot").
 
 **Asserted by:** `packages/macf/test/cli/bootstrap/apply-fleet.test.ts` → `"THE DECISIVE TEST — archive then apply leaves EVERY declared repo (control + every agent) revived, matching computeArchiveRepoTargets exactly"`
+
+---
+
+## Amendment L (2026-08-20, #1045 — operator objection) — `versions:` is authoritative; `apply` reconciles it by calling the roll
+
+**Trigger — operator:**
+
+> *"I would like to object [that] we should ever need to run apply, not upgrade. We should be thinking in terms of **`kubectl apply`**, which basically takes the manifest and forwards it to the controller."*
+
+The two-verb split was the symptom. **The cause is worse and was verified at source:**
+
+    fleet-upgrade.ts:50   "Explicit target pin (--target); default = npm-latest of @groundnuty/macf"
+    fleet-upgrade.ts:123  resolveTargetVersion(… fetchLatest …)
+    grep manifest-versions in fleet-upgrade.ts  → nothing
+
+**`versions:` is never consulted for the target.** The field is not merely unenforced by `apply` — it is **unread by the command that does the work**, so it reads as declared desired state and is decoration. Observed live: a manifest declaring `macf: 0.2.55`, both agents at `0.2.55`, and `fleet upgrade` reporting *"2/2 behind target 0.2.57"* — correctly reporting drift **from a target the operator never declared**, obtained from the internet.
+
+### L1 — npm-latest as the silent default is the `:latest` anti-pattern
+
+**A manifest whose application depends on WHEN you run it is not a manifest.** `kubectl apply -f` with `image: nginx:1.2.3` yields 1.2.3 today and next year; `image: nginx:latest` is a textbook anti-pattern for exactly this reason. MACF was in the second state **by default and without saying so** — the same `fleet.yaml` applied a week apart producing two different fleets, contradicting the property this DR's config/lock/vault triad rests on: **`fleet.yaml` is desired state.**
+
+### L2 — the rulings
+
+1. **`apply` reconciles versions.** A declared-and-ignored field is worse than no field.
+2. **By delegation, never reimplementation.** `fleet upgrade`'s properties are load-bearing and must not be duplicated — roll one agent at a time, never interrupt a busy agent, config-dirty pre-flight, per-agent verify-green with timeout, transactional rollback. Same rule and same shape as `apply`→`deployAgent` (`#1023`), and it carries the same structural obligation: the production path's dependency **is** the real roll, provably (`#1024`).
+3. **`versions:` is AUTHORITATIVE when present.** `--target` remains the explicit override for an out-of-manifest roll; npm-latest stops being the silent default when a manifest is supplied.
+4. **Absent `versions:` means "no opinion", NOT "latest".** Reconcile takes **no version action** and says so — `absent` vs `unknown` at the manifest layer. The one place latest is correct is a **fresh** install, which has no deployed version to preserve; `fleet.lock` records what landed, giving the next reconcile something real to compare against.
+5. **`fleet upgrade` survives** as the direct verb; given `-f`, its default target becomes the manifest's.
+
+### L3 — the acceptance criterion is the invariant, not the behaviour
+
+*"`apply` reconciles versions"* is satisfiable by an implementation that **still consults npm when it feels underspecified**. The property to assert:
+
+**The same `fleet.yaml`, applied twice with time and npm state changed between, produces the same fleet.**
+
+Concretely: pin `0.2.55` while npm-latest is `0.2.57`; assert the reconcile targets **`0.2.55`** *and* that **`fetchLatest` is never invoked**. The second half matters — targeting the right version while still fetching leaves a latent coupling one *"use it as a fallback"* away from silently restoring the defect (`assert-the-wrong-path.md`). `resolveTargetVersion` is already pure w.r.t. an injected `fetchLatest`, so the seam exists.
+
+Same treatment for L2.4: absent `versions:` → **no version action AND no fetch**.
+
+> **NOT YET IMPLEMENTED — no `Asserted by:` citation.** Its absence is the signal (`#998`); the citation is added when those tests exist. A citation is a fact, never a plan.
+
+### L4 — why "we have no controller" does not weaken this
+
+MACF deliberately has no reconciler and never will (operator, `#1017`). That bounds **when** convergence happens, not **whether the manifest means what it says**: a control loop makes convergence *continuous*, a human invocation makes it *punctual*. **The difference is who triggers reconciliation, not what reconciliation means.**
+
+Recorded explicitly because *"we have no controller"* will otherwise be cited later as a reason MACF cannot be declarative. It can be. It reconciles when asked.
+
+**References:** `#1045` · `#1000` (one path per outcome) · `#1023`/`#1024` (the delegation shape and its assertion) · `#1017` (no controller, by choice) · Amendment A (honest-unknown) · `assert-the-wrong-path.md`.
