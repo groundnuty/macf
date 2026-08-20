@@ -725,7 +725,7 @@ function buildAgentDepsWithRecovery(
         const msg = err instanceof Error ? err.message : String(err);
         throw new Error(`${msg} (recovery-artifact path: ${outPath})`, { cause: err });
       }
-      deps.log(`Role "${role}": credential durably recorded at ${outPath} (recovery artifact, pre-gate-2, DR-043 §D5).`);
+      deps.log(`Role "${role}": credential durably recorded at ${outPath} (recovery artifact, pre-gate-2).`);
     },
     findRecoveryArtifact: async (role: string): Promise<AppCredentials | undefined> => {
       const artifactPath = operatorRecoveryArtifactPath(recoveryRootDir, fleetName, role);
@@ -733,7 +733,7 @@ function buildAgentDepsWithRecovery(
       if (identityKeyPath === undefined) {
         deps.log(
           `Role "${role}": a durable recovery artifact exists at ${artifactPath} (from a prior run's crash before ` +
-            'its credential reached the vault — DR-043 Amendment B, macf#988) but no --identity-key was given this ' +
+            'its credential reached the vault) but no --identity-key was given this ' +
             'run, so it cannot be decrypted. Re-run with --identity-key <path> to consume it automatically.',
         );
         return undefined;
@@ -746,7 +746,7 @@ function buildAgentDepsWithRecovery(
         if (recovered !== undefined) {
           deps.log(
             `Role "${role}": found + decrypted a durable recovery artifact at ${artifactPath} — consuming it ` +
-              '(DR-043 Amendment B, macf#988).',
+              '.',
           );
         }
         return recovered;
@@ -790,7 +790,7 @@ function noRecipientPreflightFailure(role: string): AgentApplyOutcome {
     status: 'failed',
     reason:
       `role "${role}" has no prior fleet.lock entry, so it would take the CREATE path — but ` +
-      'transport.age_recipients is empty (DR-043 §D5), so its credential could NEVER be made durable ' +
+      'transport.age_recipients is empty, so its credential could NEVER be made durable ' +
       '(no recipient to encrypt the recovery artifact OR the final vault to). Refusing to open consent gate 1 ' +
       "for a credential that can never be saved — mint an age recipient and add it to transport.age_recipients in " +
       'fleet.yaml, then re-run.',
@@ -831,16 +831,16 @@ function noVaultAccessPreflightFailure(role: string, vaultOutPath: string): Agen
     reason:
       `role "${role}" has no prior fleet.lock entry, so it would take the CREATE path — but a vault already ` +
       `exists at "${vaultOutPath}" and no --identity-key (paired with --vault) was supplied to decrypt-and-fold ` +
-      'its current contents into a fresh compose (DR-043 Amendment D: the vault is never read-modify-written — a ' +
+      'its current contents into a fresh compose (the vault is never read-modify-written — a ' +
       "whole-payload rewrite of a LIVE vault must be composed from the vault's complete current contents, never a " +
       'partial payload). Refusing to open consent gate 1 for a credential whose vault write would fail after the ' +
-      'fact (groundnuty/macf#989). Re-run with "macf bootstrap apply --vault <path> --identity-key <path>" so the ' +
+      'fact. Re-run with "macf bootstrap apply --vault <path> --identity-key <path>" so the ' +
       'existing vault can be decrypted, merged, and rewritten.',
   };
 }
 
 /** The final control-repo sync commit message (macf#857) — one constant so every call site + every test asserting on it agree. */
-export const CONTROL_REPO_SYNC_COMMIT_MESSAGE = 'chore(bootstrap): apply — fleet.lock / vault.age update (DR-043 §D5)';
+export const CONTROL_REPO_SYNC_COMMIT_MESSAGE = 'chore(bootstrap): apply — fleet.lock / vault.age update';
 
 /**
  * The zero-I/O early-abort shape shared by the name-length pre-flight and
@@ -1463,7 +1463,7 @@ export async function applyFleet(
     } else {
       caSkipReason =
         'CA was freshly minted this run but the batched vault write did not succeed — refusing to publish the ' +
-        'cert until its key is durable (DR-043 §D5). Re-run apply once the vault issue is fixed. The retry ' +
+        'cert until its key is durable. Re-run apply once the vault issue is fixed. The retry ' +
         're-mints (the registry cert was never published, so resolveCaCert takes the mint path again), which is ' +
         'harmless: this run\'s key was never made durable and has signed nothing, so nothing is orphaned.';
     }
@@ -1527,7 +1527,7 @@ export async function applyFleet(
     routingClientPublish = skippedRoutingClientPublish(
       routerCarryingRepos,
       'routing-client cert was freshly minted this run but the batched vault write did not succeed — refusing to ' +
-        'deploy the private key to any repo until it is durable (DR-043 §D5). Re-run apply once the vault issue is ' +
+        'deploy the private key to any repo until it is durable. Re-run apply once the vault issue is ' +
         "fixed. The retry re-mints (fleet.lock never recorded a routing_client_key fingerprint), which is harmless: " +
         "this run's key was never made durable and was never deployed, so nothing is orphaned.",
     );
@@ -1676,7 +1676,7 @@ export async function applyFleet(
           `locally, but the control-repo push did not confirm as 'pushed' (status: ${controlRepoSync.status}` +
           `${syncReason}), so this run's fresh credential(s) are not yet durable outside the local checkout. ` +
           `Retained at: ${retainedPaths.join(', ')}. Re-run "macf bootstrap apply --vault <path> --identity-key ` +
-          '<path>" and it will be found, decrypted, and consumed automatically (DR-043 Amendment B, macf#992) — no ' +
+          '<path>" and it will be found, decrypted, and consumed automatically — no ' +
           'new App is created for these role(s). Without --identity-key, the role is NOT auto-recovered; it refuses ' +
           'on the App-name-collision pre-flight instead (no duplicate App, but no automatic recovery either).',
       );
@@ -1808,14 +1808,14 @@ async function reconcileVaultRecipients(
       reason:
         `vault is encrypted to ${String(counted.count)} recipient(s), fewer than the ${String(desiredRecipients.length)} ` +
         'declared in transport.age_recipients, but no --identity-key was supplied — refusing to silently leave it ' +
-        'stale (DR-043 Amendment D: re-encrypting needs an operator identity able to decrypt the current vault). ' +
+        'stale (re-encrypting needs an operator identity able to decrypt the current vault). ' +
         'Re-run "macf bootstrap apply --vault <path> --identity-key <path>" to reconcile.',
     };
   }
 
   log(
     `Vault: recipient set changed (${String(counted.count)} → ${String(desiredRecipients.length)}) — ` +
-      're-encrypting (decrypt-then-whole-rewrite, DR-043 Amendment D).',
+      're-encrypting (decrypt-then-whole-rewrite).',
   );
   try {
     await reencrypt(vaultOutPath, identityKeyPath, desiredRecipients);
@@ -1930,8 +1930,8 @@ async function settleVault(
         throw new VaultError(
           'vault_no_identity_key',
           `vault already exists at "${vaultOutPath}" — this run has new secret(s) to fold into it, but no ` +
-            '--identity-key (paired with --vault) was supplied to decrypt its current contents (DR-043 Amendment ' +
-            'D: a whole-payload rewrite of a live vault must be composed from its complete current contents, never ' +
+            '--identity-key (paired with --vault) was supplied to decrypt its current contents (a whole-payload ' +
+            'rewrite of a live vault must be composed from its complete current contents, never ' +
             'a partial payload). Re-run "macf bootstrap apply --vault <path> --identity-key <path>" to reconcile.',
         );
       }
@@ -1947,8 +1947,8 @@ async function settleVault(
           'vault_would_shrink_recipients',
           `vault is encrypted to ${String(recipientCount.count)} recipient(s), MORE than the ${String(recipients.length)} ` +
             "declared in transport.age_recipients. Composing this run's new secret(s) in would ALSO re-encrypt to " +
-            'fewer recipients, and would REVOKE decrypt access for whichever recipient was dropped (DR-043 §D3 ' +
-            'invariant 4 — apply does NOT auto-shrink). Reconcile transport.age_recipients (add the missing entry ' +
+            'fewer recipients, and would REVOKE decrypt access for whichever recipient was dropped ' +
+            '(apply does NOT auto-shrink). Reconcile transport.age_recipients (add the missing entry ' +
             'back) first, then re-run apply.',
         );
       }
