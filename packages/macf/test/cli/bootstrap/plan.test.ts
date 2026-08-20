@@ -9,11 +9,15 @@ import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js
 import {
   APPLY_UNIMPLEMENTED_REASONS,
   computePlan,
+  countAppsToCreate,
   fleetPlanToJson,
+  formatOperatorInteractionLine,
   formatPlanText,
   formatRegistryScopeLines,
   formatSkippedLines,
   formatUnimplementedLines,
+  operatorInteractionBudget,
+  operatorInteractionToJson,
   planItemApplyCoverage,
   summarizePlan,
   UNKNOWN_REASONS,
@@ -1379,5 +1383,155 @@ describe('computePlan — registryScopeIssues (macf#999 requirement 3: "plan sta
     });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     expect(plan.registryRepoScopeNotices).toEqual([]);
+  });
+});
+
+// --- Operator interaction budget (groundnuty/macf#880, DR-044 Decision 6) ---
+//
+// `countAppsToCreate` is a pure projection over `PlanItem[]` — these are the
+// arithmetic-decisive cases: the exact numbers an operator plans a
+// provisioning session around. `install`-kind items are DELIBERATELY not
+// counted (gate 2 rides the same per-identity flow gate 1 opens — see
+// `plan.ts`'s "Operator interaction budget" section doc) — a test below
+// pins that a manifest with a declared `routing.runner` (which adds
+// `routing`/`runner_warm` items, NOT app/runner_ops items) doesn't move the
+// count, guarding against counting the wrong kinds.
+describe('countAppsToCreate / operatorInteractionBudget (groundnuty/macf#880)', () => {
+  it('DECISIVE — a fresh 2-agent fleet (baseManifest, EMPTY_OBSERVED): 2 agent Apps + the unconditional runner-ops = 3 to create (→ 6 total consent-gate interactions: 3 gate-1 + 3 gate-2)', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(countAppsToCreate(plan.items)).toBe(3);
+    const budget = operatorInteractionBudget(countAppsToCreate(plan.items));
+    expect(budget).toEqual({ gate1Clicks: 3, gate2Flows: 3, bound: 'maximum' });
+    expect(operatorInteractionToJson(budget)).toEqual({ gate1_clicks: 3, gate2_flows: 3, bound: 'maximum' });
+  });
+
+  it('DECISIVE — adding one agent to an already-provisioned fleet (2 existing agents + runner-ops confirmed present, 1 new agent): exactly 1 to create (→ 2 clicks)', () => {
+    const manifest = baseManifest({
+      agents: [
+        // science-agent + code-agent mirror baseManifest()'s own two, kept
+        // byte-identical so their `observed.agents` entries below are
+        // unambiguous; new-agent is the ONE role with no observation at all.
+        {
+          role: 'science-agent',
+          profile: 'research',
+          repo: 'groundnuty/icsoc-2026-science-agent',
+          deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-science-agent',
+        },
+        {
+          role: 'code-agent',
+          profile: 'code',
+          repo: 'groundnuty/icsoc-2026-experiment',
+          deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-experiment',
+        },
+        {
+          role: 'new-agent',
+          profile: 'code',
+          repo: 'groundnuty/icsoc-2026-new-agent',
+          deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-new-agent',
+        },
+      ],
+    });
+    const observed: ObservedState = {
+      lock: {
+        schema_version: 1,
+        fleet: 'icsoc-2026',
+        agents: [
+          { role: 'science-agent', app_id: 'a1', install_id: 'i1' },
+          { role: 'code-agent', app_id: 'a2', install_id: 'i2' },
+          { role: 'runner-ops', app_id: 'a3', install_id: 'i3' },
+        ],
+      },
+      agents: {
+        'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} },
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} },
+        // 'new-agent' deliberately absent — no observation exists for it yet.
+      },
+      caRegistry: 'present',
+      caRepos: { 'groundnuty/icsoc-2026-science-agent': 'present', 'groundnuty/icsoc-2026-experiment': 'present' },
+      controlRepoPresence: 'present',
+    };
+    const plan = computePlan(manifest, observed);
+    expect(countAppsToCreate(plan.items)).toBe(1);
+    expect(operatorInteractionBudget(countAppsToCreate(plan.items))).toEqual({ gate1Clicks: 1, gate2Flows: 1, bound: 'maximum' });
+  });
+
+  it('a declared routing.runner (routing + runner_warm items) does NOT move the count — only app/runner_ops kinds are counted', () => {
+    const withRouting = computePlan(baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } }), EMPTY_OBSERVED);
+    const withoutRouting = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(countAppsToCreate(withRouting.items)).toBe(countAppsToCreate(withoutRouting.items));
+  });
+
+  it('operatorInteractionBudget(0): bound "exact" — the only case with nothing left to overstate', () => {
+    expect(operatorInteractionBudget(0)).toEqual({ gate1Clicks: 0, gate2Flows: 0, bound: 'exact' });
+  });
+
+  it('operatorInteractionBudget: gate2Flows defaults to gate1Clicks — the common shape every plan-only caller has (it cannot see resume-install decisions)', () => {
+    expect(operatorInteractionBudget(5)).toEqual({ gate1Clicks: 5, gate2Flows: 5, bound: 'maximum' });
+  });
+
+  it('operatorInteractionBudget: a DIVERGENT pair (gate1 < gate2, e.g. a resume-install-only role) is bound "maximum" too, and NOT "exact" even if gate1 is 0', () => {
+    // gate1=0 alone must NOT read as "exact" — only BOTH counts at 0 do
+    // (groundnuty/macf#880: a resume-install role still needs its gate-2
+    // install flow, so a fleet with only such roles is NOT zero-click).
+    expect(operatorInteractionBudget(0, 1)).toEqual({ gate1Clicks: 0, gate2Flows: 1, bound: 'maximum' });
+  });
+
+  it('operatorInteractionBudget(N>0): always bound "maximum" — a counted create-candidate is never proven absent (Amendment A floor)', () => {
+    expect(operatorInteractionBudget(1).bound).toBe('maximum');
+    expect(operatorInteractionBudget(6).bound).toBe('maximum');
+  });
+
+  it('formatOperatorInteractionLine(0): states zero explicitly, never silence — Amendment G revival-cost property surfaced', () => {
+    expect(formatOperatorInteractionLine(operatorInteractionBudget(0))).toBe('Operator interaction: none — no consent gates this run.');
+  });
+
+  it('formatOperatorInteractionLine(N>0, gate1===gate2): "up to N Apps to create", correct click/flow counts, singular for N=1, plural for N>1', () => {
+    const one = formatOperatorInteractionLine(operatorInteractionBudget(1));
+    expect(one).toContain('up to 1 App to create');
+    expect(one).toContain('1 "Create GitHub App" click ');
+    expect(one).toContain('1 install flow (');
+    expect(one).not.toContain('Apps');
+    expect(one).not.toContain('clicks');
+
+    const six = formatOperatorInteractionLine(operatorInteractionBudget(6));
+    expect(six).toContain('up to 6 Apps to create');
+    expect(six).toContain('6 "Create GitHub App" clicks');
+    expect(six).toContain('6 install flows');
+    expect(six).toContain('macf bootstrap apply --vault');
+    expect(six).toContain('macf#913/#915');
+  });
+
+  // groundnuty/macf#880 — a role whose vault-aware preview decision is
+  // `'resume-install'` (App exists, ZERO installs) is dropped from gate 1
+  // but still costs a gate-2 install flow
+  // (`apply-agent.ts::runGate2WithInterstitial`'s doc). The "N Apps to
+  // create" framing above would misdescribe this — the App already exists —
+  // so a DIVERGENT budget gets its own wording naming both counts directly.
+  it('formatOperatorInteractionLine(gate1 !== gate2): names both counts directly, never "Apps to create" — the resume-install shape', () => {
+    const line = formatOperatorInteractionLine(operatorInteractionBudget(2, 3));
+    expect(line).toContain('up to 2 "Create GitHub App" clicks');
+    expect(line).toContain('up to 3 install flows');
+    expect(line).toContain('1 already-created App still needs its install flow');
+    expect(line).not.toContain('Apps to create');
+  });
+
+  it('formatOperatorInteractionLine(gate1=0, gate2>0): still non-empty — a fleet with ONLY resume-install-shaped roles is NOT "none"', () => {
+    const line = formatOperatorInteractionLine(operatorInteractionBudget(0, 1));
+    expect(line).not.toBe('Operator interaction: none — no consent gates this run.');
+    expect(line).toContain('0 "Create GitHub App" clicks');
+    expect(line).toContain('1 install flow');
+  });
+
+  it('operatorInteractionToJson: gate1_clicks and gate2_flows are named SEPARATELY (not one field doubled) — they can diverge', () => {
+    expect(operatorInteractionToJson(operatorInteractionBudget(4))).toEqual({
+      gate1_clicks: 4,
+      gate2_flows: 4,
+      bound: 'maximum',
+    });
+    expect(operatorInteractionToJson(operatorInteractionBudget(2, 3))).toEqual({
+      gate1_clicks: 2,
+      gate2_flows: 3,
+      bound: 'maximum',
+    });
   });
 });

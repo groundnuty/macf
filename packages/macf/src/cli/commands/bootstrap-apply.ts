@@ -34,8 +34,11 @@ import {
   computePlan,
   fleetPlanFailureToJson,
   fleetPlanToJson,
+  formatOperatorInteractionLine,
   formatPlanText,
   formatUnimplementedLines,
+  operatorInteractionBudget,
+  operatorInteractionToJson,
   summarizePlan,
 } from '../bootstrap/plan.js';
 import { githubRegistryObserver, readFleetLock } from '../bootstrap/observer.js';
@@ -312,10 +315,30 @@ export function plannedAppCreations(
   return out;
 }
 
-/** Human render of the would-be App creations (pure — exported for tests). */
-export function formatPlannedAppCreations(creations: readonly PlannedAppCreation[]): string {
+/**
+ * Human render of the would-be App creations (pure — exported for tests).
+ * `gate2InstallOnly` (groundnuty/macf#880) is the count of roles the
+ * vault-aware preview confirmed `'resume-install'` for — an App exists
+ * (gate 1 SKIPPED) but has ZERO installs, so gate 2 still runs
+ * (`apply-agent.ts::runGate2WithInterstitial`'s doc). Those roles are
+ * already excluded from `creations` (`filterCreationsByPreview` drops every
+ * non-`'create'` decision — correctly, for gate 1), so `creations.length`
+ * ALONE would silently drop their gate-2 cost; this parameter recovers it.
+ * Defaults to 0 (no preview ran, or nothing resume-eligible) — every
+ * pre-#880-preview call site stays byte-identical.
+ */
+export function formatPlannedAppCreations(creations: readonly PlannedAppCreation[], gate2InstallOnly = 0): string {
+  // groundnuty/macf#880 — the operator's consent-click budget, projected
+  // from `creations` itself (already the vault-aware-filtered list when a
+  // preview ran — see `filterCreationsByPreview`'s doc) plus any
+  // resume-install-only gate-2 flows the caller counted separately: no new
+  // observation, just naming what this run's own decisions already imply.
+  // Appended to BOTH branches so it shows up identically on `--dry-run` and
+  // the real pre-approval render (both call this same function — see the
+  // call sites below).
+  const budgetLine = formatOperatorInteractionLine(operatorInteractionBudget(creations.length, creations.length + gate2InstallOnly));
   if (creations.length === 0) {
-    return 'No GitHub Apps would be created (every declared agent already has one, or presence is confirmed).';
+    return `No GitHub Apps would be created (every declared agent already has one, or presence is confirmed).\n${budgetLine}`;
   }
   const parts: string[] = [
     `GitHub Apps that would be created (${String(creations.length)}) — consent gate 1 (§D2), one operator click each:`,
@@ -347,6 +370,7 @@ export function formatPlannedAppCreations(creations: readonly PlannedAppCreation
       );
     }
   }
+  parts.push('', budgetLine);
   return parts.join('\n');
 }
 
@@ -506,6 +530,23 @@ function filterCreationsByPreview(
   preview: ReadonlyMap<string, CreateGuardDecision>,
 ): readonly PlannedAppCreation[] {
   return creations.filter((c) => (preview.get(c.role)?.action ?? 'create') === 'create');
+}
+
+/**
+ * Count of roles the preview confirmed `'resume-install'` for — an App
+ * exists live (gate 1 SKIPPED) with ZERO installs, so gate 2 still runs
+ * (groundnuty/macf#880; see `formatPlannedAppCreations`'s `gate2InstallOnly`
+ * doc for the full rationale). `'resume-install'`-shaped roles are already
+ * excluded from `filterCreationsByPreview`'s output, so this is how the
+ * caller recovers their gate-2-only cost before rendering the budget.
+ */
+function countResumeInstallFlows(preview: ReadonlyMap<string, CreateGuardDecision> | undefined): number {
+  if (preview === undefined) return 0;
+  let n = 0;
+  for (const decision of preview.values()) {
+    if (decision.action === 'resume-install') n += 1;
+  }
+  return n;
 }
 
 /** One `<role>: <PATH>` line for {@link formatIdentityPreview} — never a credential value (`CreateGuardDecision` carries none). */
@@ -1682,6 +1723,12 @@ export async function runBootstrapApply(
     // preview confirms live is dropped from "would be created" in BOTH the
     // `--dry-run` render below AND the real path's pre-approval render.
     const displayCreations = preview !== undefined ? filterCreationsByPreview(creations, preview) : creations;
+    // groundnuty/macf#880 — roles the preview confirmed `'resume-install'`
+    // for: gate 1 SKIPPED (already excluded from `displayCreations` above)
+    // but gate 2 still runs — see `formatPlannedAppCreations`'s
+    // `gate2InstallOnly` doc. Zero when no preview ran (matches
+    // `countResumeInstallFlows`'s own `undefined` short-circuit).
+    const gate2InstallOnly = countResumeInstallFlows(preview);
     // macf#988 requirement 4 — existence-only, never decrypted here (see
     // `findAvailableRecoveryArtifacts`'s doc); surfaced on BOTH the
     // `--dry-run` render and the real pre-approval render so an operator
@@ -1697,6 +1744,16 @@ export async function runBootstrapApply(
               ...(fleetPlanToJson(plan) as Record<string, unknown>),
               dry_run: true,
               planned_app_creations: displayCreations.map((c) => ({ ...c })),
+              // groundnuty/macf#880 — from `displayCreations.length`/
+              // `gate2InstallOnly`, NOT `plan.items` (see
+              // `plan.ts::countAppsToCreate`'s doc): `displayCreations` is
+              // the vault-aware-filtered list, so gate1 is the tighter of
+              // the two counts whenever a preview ran; `gate2InstallOnly`
+              // folds back in any `'resume-install'` role's gate-2-only cost
+              // `displayCreations.length` alone would silently drop.
+              operator_interaction: operatorInteractionToJson(
+                operatorInteractionBudget(displayCreations.length, displayCreations.length + gate2InstallOnly),
+              ),
               ...(preview !== undefined ? { vault_identity_preview: identityPreviewToJson(preview) } : {}),
             },
             null,
@@ -1706,7 +1763,7 @@ export async function runBootstrapApply(
       } else {
         console.log(formatPlanText(plan));
         console.log('');
-        console.log(formatPlannedAppCreations(displayCreations));
+        console.log(formatPlannedAppCreations(displayCreations, gate2InstallOnly));
         if (preview !== undefined) {
           console.log('');
           console.log(formatIdentityPreview(preview));
@@ -1728,7 +1785,7 @@ export async function runBootstrapApply(
     // clean; keeping it uniform (not conditional on opts.json) means a human
     // running without --json sees the identical preview a script would have
     // to skip past on stderr, rather than two different code paths.
-    process.stderr.write(`${formatPlanText(plan)}\n\n${formatPlannedAppCreations(displayCreations)}\n`);
+    process.stderr.write(`${formatPlanText(plan)}\n\n${formatPlannedAppCreations(displayCreations, gate2InstallOnly)}\n`);
     if (preview !== undefined) {
       process.stderr.write(`\n${formatIdentityPreview(preview)}\n`);
     }
