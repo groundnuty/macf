@@ -686,7 +686,9 @@ Concretely: pin `0.2.55` while npm-latest is `0.2.57`; assert the reconcile targ
 
 Same treatment for L2.4: absent `versions:` → **no version action AND no fetch**.
 
-> **NOT YET IMPLEMENTED — no `Asserted by:` citation.** Its absence is the signal (`#998`); the citation is added when those tests exist. A citation is a fact, never a plan.
+**Asserted by:** `packages/macf/test/cli/fleet-upgrade.test.ts` → `"DECISIVE — manifest pins 0.2.55 (npm-latest would be 0.2.57): the roll targets 0.2.55 AND fetchLatest is never invoked"` (end-to-end through the real `runFleetUpgrade`/`upgradeFleets` roll — the throwing `fetchLatest` fake fires if the manifest-authoritative path is ever bypassed).
+
+**Asserted by:** `packages/macf/test/cli/fleet-upgrade.test.ts` → `"a manifest given but declaring no versions.macf: no version action, no fetch, no roll attempted"` (L2.4's own case — no target resolved, nothing rolled, `fetchLatest` untouched).
 
 ### L4 — why "we have no controller" does not weaken this
 

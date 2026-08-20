@@ -20,6 +20,7 @@ import {
   formatPlanTable,
   type FleetUpgradeDeps,
 } from '../../src/cli/commands/fleet-upgrade.js';
+import { NO_MANIFEST_VERSION } from '../../src/cli/bootstrap/version-target.js';
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -126,22 +127,59 @@ function makeDeps(over: Partial<FleetUpgradeDeps>): { deps: FleetUpgradeDeps; li
   return { deps, lines };
 }
 
-// --- resolveTargetVersion ---------------------------------------------------
+// --- resolveTargetVersion (DR-043 Amendment L, macf#1045) -------------------
+//
+// The manifest-authoritative target-resolution rule now lives in
+// `bootstrap/version-target.ts`; `commands/fleet-upgrade.ts` re-exports it
+// unchanged (see that module's doc). `NO_MANIFEST_VERSION` models the
+// standalone `macf fleet upgrade` call with no `-f/--file` — the ONLY
+// reachable `fetchLatest` path (L2.5).
 
 describe('resolveTargetVersion', () => {
-  it('uses an explicit --target (stripping a leading v) over npm-latest', async () => {
-    const r = await resolveTargetVersion('v0.2.40', async () => '0.2.41');
-    expect(r).toEqual({ ok: true, target: '0.2.40' });
+  it('uses an explicit --target (stripping a leading v) over npm-latest — no manifest given', async () => {
+    const r = await resolveTargetVersion('v0.2.40', NO_MANIFEST_VERSION, async () => '0.2.41');
+    expect(r).toEqual({ kind: 'resolved', target: '0.2.40' });
   });
 
-  it('falls back to npm-latest when no --target is given', async () => {
-    const r = await resolveTargetVersion(undefined, async () => '0.2.41');
-    expect(r).toEqual({ ok: true, target: '0.2.41' });
+  it('no manifest given, no --target: falls back to npm-latest (fleet upgrade standalone unchanged — L2.5)', async () => {
+    const r = await resolveTargetVersion(undefined, NO_MANIFEST_VERSION, async () => '0.2.41');
+    expect(r).toEqual({ kind: 'resolved', target: '0.2.41' });
   });
 
-  it('errors when neither --target nor npm-latest resolves', async () => {
-    const r = await resolveTargetVersion(undefined, async () => null);
-    expect(r.ok).toBe(false);
+  it('errors when neither --target nor npm-latest resolves (no manifest given)', async () => {
+    const r = await resolveTargetVersion(undefined, NO_MANIFEST_VERSION, async () => null);
+    expect(r.kind).toBe('error');
+  });
+
+  // --- Decisive test #1 (Amendment L3 / L2.3) — the manifest pins a version
+  // OLDER than npm-latest; the reconcile must target the PIN, and the
+  // network path must be NEVER ENTERED — not merely that the right target
+  // happened to win (`assert-the-wrong-path.md`).
+  it('DECISIVE — manifest pins 0.2.55 while npm-latest is 0.2.57: resolves to 0.2.55 AND fetchLatest is NEVER invoked', async () => {
+    const fetchLatest = async (): Promise<string | null> => {
+      throw new Error('fetchLatest must not be called when versions.macf is declared (DR-043 Amendment L3)');
+    };
+    const r = await resolveTargetVersion(undefined, { given: true, macf: '0.2.55' }, fetchLatest);
+    expect(r).toEqual({ kind: 'resolved', target: '0.2.55' });
+  });
+
+  // --- Decisive test #2 (Amendment L2.4) — a manifest WAS given but
+  // declares no versions: section at all: "no opinion", not "latest" — and
+  // the network path is likewise never entered.
+  it('DECISIVE — manifest given but versions.macf absent: no-opinion, NOT latest, AND fetchLatest is NEVER invoked', async () => {
+    const fetchLatest = async (): Promise<string | null> => {
+      throw new Error('fetchLatest must not be called when a manifest was given but declares no versions.macf');
+    };
+    const r = await resolveTargetVersion(undefined, { given: true, macf: undefined }, fetchLatest);
+    expect(r.kind).toBe('no-opinion');
+  });
+
+  it('--target still overrides an authoritative manifest version (L2.3\'s own escape hatch)', async () => {
+    const fetchLatest = async (): Promise<string | null> => {
+      throw new Error('fetchLatest must not be called when --target is given');
+    };
+    const r = await resolveTargetVersion('0.2.99', { given: true, macf: '0.2.55' }, fetchLatest);
+    expect(r).toEqual({ kind: 'resolved', target: '0.2.99' });
   });
 });
 
@@ -517,5 +555,73 @@ describe('runFleetUpgrade', () => {
         errSpy.mockRestore();
       }
     });
+  });
+});
+
+// --- DR-043 Amendment L, end-to-end through the REAL roll (macf#1045) ------
+//
+// The pure `resolveTargetVersion` tests above prove the resolution RULE in
+// isolation; this proves it through `runFleetUpgrade` itself — the same
+// entry point `apply-version.ts` calls (DR-043 Amendment L2) — with the
+// REAL driver fixtures from `runFleetUpgrade`'s own describe block above.
+// One test proves all three properties the amendment names: delegation is
+// real (the roll actually upgrades the pinned-behind agent), the target
+// came from the manifest (not from npm), and the network path was
+// structurally never entered (the throwing fake fires if it is).
+
+describe('DR-043 Amendment L — manifest-authoritative target, end-to-end through runFleetUpgrade (macf#1045)', () => {
+  const AGENTS = [{ name: 'a', registry: 'fleet-1' }] as const;
+
+  it('DECISIVE — manifest pins 0.2.55 (npm-latest would be 0.2.57): the roll targets 0.2.55 AND fetchLatest is never invoked', async () => {
+    const { driver, calls, workspaces } = makeDriver(AGENTS, { base: '0.2.40', target: '0.2.55' });
+    const throwingFetchLatest = async (): Promise<string | null> => {
+      throw new Error('fetchLatest must not be called — DR-043 Amendment L3, versions.macf is declared');
+    };
+    const { deps, lines } = makeDeps({
+      discover: () => workspaces,
+      defaultFleet: 'fleet-1',
+      resolveDriver: async () => driver,
+      fetchLatest: throwingFetchLatest,
+      manifestVersion: { given: true, macf: '0.2.55' },
+    });
+    const code = await runFleetUpgrade('/proj', { execute: true }, deps);
+    expect(code).toBe(0);
+    // Delegation is real — the agent actually rolled, to the MANIFEST's version.
+    expect(calls.upgrade).toEqual(['a']);
+    expect(calls.restart).toEqual(['a']);
+    expect(lines.join('\n')).toContain('target macf@0.2.55');
+  });
+
+  it('a manifest given but declaring no versions.macf: no version action, no fetch, no roll attempted', async () => {
+    const { driver, calls, workspaces } = makeDriver(AGENTS, { base: '0.2.40', target: '0.2.55' });
+    const throwingFetchLatest = async (): Promise<string | null> => {
+      throw new Error('fetchLatest must not be called — a manifest was given, even without versions.macf');
+    };
+    const { deps, lines } = makeDeps({
+      discover: () => workspaces,
+      defaultFleet: 'fleet-1',
+      resolveDriver: async () => driver,
+      fetchLatest: throwingFetchLatest,
+      manifestVersion: { given: true, macf: undefined },
+    });
+    const code = await runFleetUpgrade('/proj', { execute: true }, deps);
+    expect(code).toBe(0); // no-opinion is not an error
+    expect(calls.upgrade).toEqual([]); // nothing rolled — no target was ever resolved
+    expect(calls.restart).toEqual([]);
+    expect(lines.join('\n')).toMatch(/no opinion/);
+  });
+
+  it('omitted manifestVersion (no -f/--file at all): standalone behaviour is byte-identical — npm-latest via fetchLatest', async () => {
+    const { driver, calls, workspaces } = makeDriver(AGENTS, { base: '0.2.40', target: '0.2.41' });
+    const { deps } = makeDeps({
+      discover: () => workspaces,
+      defaultFleet: 'fleet-1',
+      resolveDriver: async () => driver,
+      fetchLatest: async () => '0.2.41',
+      // manifestVersion deliberately omitted — defaults to NO_MANIFEST_VERSION.
+    });
+    const code = await runFleetUpgrade('/proj', { execute: true }, deps);
+    expect(code).toBe(0);
+    expect(calls.upgrade).toEqual(['a']);
   });
 });

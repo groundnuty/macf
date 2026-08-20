@@ -2,7 +2,9 @@
  * `macf fleet upgrade` — the rolling fleet-upgrade orchestrator (DR-037 /
  * macf#682 Phase 2). The CLI/production half of the decision/driver split: it
  * wires the runtime-agnostic decision layer (`upgradeFleets` in macf-core) to the
- * real VM driver (`createVmDriverFromConfig`), the npm-latest target resolver, the
+ * real VM driver (`createVmDriverFromConfig`), the target resolver (DR-043
+ * Amendment L, groundnuty/macf#1045 — manifest-authoritative when `-f/--file`
+ * is given, npm-latest ONLY as the standalone no-manifest default), the
  * `.macf/`-marker fleet discovery, and a re-resolving `verifyGreen` probe.
  *
  * Nothing runtime-specific lives here above the driver line — the sequencer,
@@ -12,25 +14,35 @@
  * DRY-RUN by default: without `--execute` it probes + prints the PLAN and touches
  * nothing. `--execute` rolls one agent at a time, verify-green-before-next; a bad
  * release HALTS the roll (and, across `--fleet a,b,c`, stops later fleets).
+ *
+ * **DR-043 Amendment L / groundnuty/macf#1045 — this is also "the roll"**
+ * `macf bootstrap apply`'s version-reconcile phase calls into, per
+ * `apply-version.ts`'s module doc: by delegation, never reimplementation —
+ * `resolveTargetVersion` and the re-resolving `verifyGreen` adapter both
+ * moved to `bootstrap/version-target.ts` / `bootstrap/roll-verify-green.ts`
+ * so BOTH callers share one copy rather than two that could silently drift.
  */
 import {
-  verifyGreen,
   upgradeFleets,
   type FleetDriver,
   type FleetUpgradeReport,
   type FleetPlanReport,
   type AgentUpgradePlan,
-  type HealthResponse,
   type UpgradeEvent,
-  type VerifyGreenOptions,
   type WorkspaceRecord,
 } from '@groundnuty/macf-core';
+import { readFileSync } from 'node:fs';
 import { readAgentConfig } from '../config.js';
 import { discoverWorkspaces } from '../discovery.js';
 import { createVmDriverFromConfig } from '../fleet/vm-driver.js';
 import { fetchLatestCliVersion } from '../version-resolver.js';
 import { buildRecordDeployedVersion } from '../bootstrap/fleet-lock-recorder.js';
+import { parseFleetManifest } from '../bootstrap/fleet-manifest.js';
+import { resolveTargetVersion, NO_MANIFEST_VERSION, type ManifestVersionInput } from '../bootstrap/version-target.js';
+import { makeReResolvingVerifyGreen } from '../bootstrap/roll-verify-green.js';
 import { formatTable } from './ps.js';
+
+export { resolveTargetVersion, type ManifestVersionInput, type TargetResolution } from '../bootstrap/version-target.js';
 
 /**
  * Default per-agent verify-green budget (ms) — mirrors `fleet/upgrade.sh`'s
@@ -114,24 +126,16 @@ export interface FleetUpgradeDeps {
    * `undefined` otherwise (no write).
    */
   readonly recordDeployedVersion?: (agent: string, fleet: string, version: string) => Promise<void>;
-}
-
-/**
- * Choose the target version: an explicit `--target` wins (leading `v` stripped);
- * otherwise npm-latest. Pure w.r.t. the injected `fetchLatest`.
- */
-export async function resolveTargetVersion(
-  explicit: string | undefined,
-  fetchLatest: () => Promise<string | null>,
-): Promise<{ readonly ok: true; readonly target: string } | { readonly ok: false; readonly message: string }> {
-  if (explicit && explicit.trim().length > 0) {
-    return { ok: true, target: explicit.trim().replace(/^v/, '') };
-  }
-  const latest = await fetchLatest();
-  if (!latest) {
-    return { ok: false, message: 'could not resolve npm-latest target — pass --target <version>' };
-  }
-  return { ok: true, target: latest };
+  /**
+   * DR-043 Amendment L (groundnuty/macf#1045) — the manifest's declared
+   * `versions.macf` state, threaded to `resolveTargetVersion` (moved to
+   * `bootstrap/version-target.ts` — see that module's doc for the full
+   * resolution order). **Optional, defaulting to `NO_MANIFEST_VERSION`**
+   * (`{ given: false }`) — every pre-Amendment-L construction site (every
+   * existing test fixture, every standalone `macf fleet upgrade` call with
+   * no `-f/--file`) stays byte-identical without touching this field.
+   */
+  readonly manifestVersion?: ManifestVersionInput;
 }
 
 /**
@@ -263,10 +267,17 @@ export async function runFleetUpgrade(
   const resolved = deps ?? (await resolveDepsFromConfig(projectDir, opts.file));
   if (!resolved) return 1;
 
-  const targetR = await resolveTargetVersion(opts.target, resolved.fetchLatest);
-  if (!targetR.ok) {
+  const targetR = await resolveTargetVersion(opts.target, resolved.manifestVersion ?? NO_MANIFEST_VERSION, resolved.fetchLatest);
+  if (targetR.kind === 'error') {
     console.error(`macf fleet upgrade: ${targetR.message}`);
     return 1;
+  }
+  if (targetR.kind === 'no-opinion') {
+    // DR-043 Amendment L2.4 — nothing to reconcile, and nothing WRONG
+    // either: exit 0, narrate why, touch nothing (no discovery, no driver,
+    // no roll attempted).
+    resolved.log(`macf fleet upgrade: ${targetR.message}`);
+    return 0;
   }
   const target = targetR.target;
 
@@ -285,23 +296,13 @@ export async function runFleetUpgrade(
   }
 
   // A single re-resolving verify-green probe, bound to whichever fleet's driver is
-  // CURRENTLY being rolled. `upgradeFleets` processes fleets serially and calls
-  // `resolveDriver(fleet)` immediately before rolling it, so `current` is always
-  // the right driver during that fleet's verify polls (DR-037 Decision 5:
-  // `driver.probe()` re-lists the registry each call → the fresh restart-self port).
-  let current: FleetDriver | null = null;
-  const resolveDriver = async (fleet: string): Promise<FleetDriver | null> => {
-    current = await resolved.resolveDriver(fleet);
-    return current;
-  };
-  const probe = async (agent: string): Promise<HealthResponse | null> => {
-    if (!current) return null;
-    const state = await current.probe();
-    const found = state.agents.find((a) => a.name === agent);
-    return found && found.online ? found.health : null;
-  };
-  const runVerifyGreen = (o: VerifyGreenOptions) =>
-    verifyGreen(o, { probe, sleep: resolved.sleep, now: resolved.now });
+  // CURRENTLY being rolled — see `bootstrap/roll-verify-green.ts`'s doc (shared
+  // with `apply-version.ts`'s version-reconcile phase, DR-043 Amendment L).
+  const { resolveDriver, verifyGreen: runVerifyGreen } = makeReResolvingVerifyGreen(
+    resolved.resolveDriver,
+    resolved.sleep,
+    resolved.now,
+  );
 
   const execute = Boolean(opts.execute);
   const report = await upgradeFleets(
@@ -413,10 +414,14 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
  *
  * `manifestFile` (DR-043 §D6, macf#907; the `-f, --file` CLI flag) is
  * OPTIONAL — when given, builds the `recordDeployedVersion` write-back
- * closure via `fleet-lock-recorder.ts` and fails LOUD (returns `null`) if
- * the manifest can't be read/parsed, at RESOLVE time, before any agent is
- * touched. When omitted, `recordDeployedVersion` stays `undefined` —
- * byte-identical to pre-macf#907 behavior.
+ * closure via `fleet-lock-recorder.ts` AND parses `versions.macf` into
+ * `manifestVersion` (DR-043 Amendment L, macf#1045 — makes the manifest
+ * AUTHORITATIVE over the target, per `bootstrap/version-target.ts`'s doc),
+ * failing LOUD (returns `null`) if the manifest can't be read/parsed, at
+ * RESOLVE time, before any agent is touched. When omitted,
+ * `recordDeployedVersion` stays `undefined` and `manifestVersion` stays
+ * `{ given: false }` — byte-identical to pre-macf#907 / pre-Amendment-L
+ * standalone behavior (npm-latest remains the default target).
  */
 async function resolveDepsFromConfig(projectDir: string, manifestFile?: string): Promise<FleetUpgradeDeps | null> {
   const config = readAgentConfig(projectDir);
@@ -428,8 +433,11 @@ async function resolveDepsFromConfig(projectDir: string, manifestFile?: string):
   const discover = (): readonly WorkspaceRecord[] => discoverWorkspaces();
 
   let recordDeployedVersion: FleetUpgradeDeps['recordDeployedVersion'];
+  let manifestVersion: ManifestVersionInput = NO_MANIFEST_VERSION;
   if (manifestFile) {
     try {
+      const manifest = parseFleetManifest(readFileSync(manifestFile, 'utf-8'));
+      manifestVersion = { given: true, macf: manifest.versions?.macf };
       recordDeployedVersion = buildRecordDeployedVersion(manifestFile);
     } catch (err) {
       console.error(
@@ -457,6 +465,7 @@ async function resolveDepsFromConfig(projectDir: string, manifestFile?: string):
     },
     sleep: (ms: number) => new Promise((res) => setTimeout(res, ms)),
     now: () => Date.now(),
+    manifestVersion,
     log: (line: string) => console.log(line),
     recordDeployedVersion,
   };

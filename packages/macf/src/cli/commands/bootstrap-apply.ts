@@ -90,6 +90,17 @@ import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap
 import type { ApplyDeployPhaseDeps, DeployPhaseAgentResult } from '../bootstrap/apply-deploy.js';
 import { anyDeployFailed, runApplyDeployPhase } from '../bootstrap/apply-deploy.js';
 import { realAuthenticatedCloneRepo, realMintCloneToken } from '../bootstrap/fleet-deploy.js';
+// DR-043 Amendment L (macf#1045) — the version-reconcile phase; production
+// deps mirror `commands/fleet-upgrade.ts::resolveDepsFromConfig`'s discover
+// + driver + npm-latest wiring, minus the `readAgentConfig(projectDir)`
+// requirement (apply already knows its ONE fleet — the manifest's own).
+import { upgradeFleets, type FleetDriver, type WorkspaceRecord } from '@groundnuty/macf-core';
+import type { ApplyVersionPhaseDeps, ApplyVersionPhaseResult } from '../bootstrap/apply-version.js';
+import { runApplyVersionPhase } from '../bootstrap/apply-version.js';
+import { discoverWorkspaces } from '../discovery.js';
+import { createVmDriverFromConfig } from '../fleet/vm-driver.js';
+import { fetchLatestCliVersion } from '../version-resolver.js';
+import { buildRecordDeployedVersion } from '../bootstrap/fleet-lock-recorder.js';
 import { firstLaunchGuidanceHeaderLines, firstLaunchAttachLine } from '../bootstrap/first-launch-guidance.js';
 import { outcomeToJson as fleetDeployOutcomeToJson } from './fleet-deploy.js';
 import { initAgent as realInitAgent } from './init.js';
@@ -198,6 +209,21 @@ export interface BootstrapApplyDeps {
    * runner's home dir) rather than silently touching a real path.
    */
   readonly deployDeps?: ApplyDeployPhaseDeps;
+  /**
+   * Injectable version-reconcile-phase deps (DR-043 Amendment L, macf#1045)
+   * — the SAME `ApplyVersionPhaseDeps` shape `apply-version.ts::
+   * runApplyVersionPhase` takes. `undefined` (the production default)
+   * resolves to REAL functions — see `resolveApplyVersionDeps()` below: real
+   * host-workspace discovery, a real VM driver, real npm-latest (defensive-
+   * only — structurally unreachable once `versions.macf` is declared, per
+   * Amendment L3). **Tests whose fixture manifest declares `versions:` MUST
+   * override this to hermetic fakes** — same "tests MUST override" posture
+   * `deployDeps`'s own doc establishes; this phase runs UNCONDITIONALLY
+   * (no vault-flag gate — see `apply-version.ts`'s module doc for why) so a
+   * forgotten override here reaches real `discoverWorkspaces()` /
+   * `createVmDriverFromConfig()` against the actual test-runner host.
+   */
+  readonly versionDeps?: ApplyVersionPhaseDeps;
   /**
    * Ground-truth mTLS-cert-present check for the "Next step: launch" render
    * (macf#1013 requirement 5 — "the final output names `./claude.sh`, not
@@ -997,6 +1023,46 @@ function resolveApplyDeployDeps(): ApplyDeployPhaseDeps {
   };
 }
 
+// --- Version-reconcile phase (DR-043 Amendment L, macf#1045) — production deps ---
+
+/**
+ * Real version-reconcile-phase deps — mirrors `commands/fleet-upgrade.ts::
+ * resolveDepsFromConfig`'s discover/driver/npm-latest wiring exactly, minus
+ * the `readAgentConfig(projectDir)` requirement (apply already knows its
+ * fleet — the manifest's own `metadata.name`, never a host-config lookup).
+ * `runUpgradeFleetsFn: upgradeFleets` is the identity-pinned golden-path
+ * seam (see `apply-version.ts`'s `ApplyVersionPhaseDeps.runUpgradeFleetsFn`
+ * doc + `apply-deps-wiring.test.ts`'s sibling assertion for THIS field) —
+ * the ONE place production decides what "the roll" means. Never invoked
+ * when `BootstrapApplyDeps.versionDeps` was supplied (tests) — only the
+ * production CLI path reaches this.
+ *
+ * `recordDeployedVersion` mirrors `macf fleet upgrade -f <fleet.yaml>`'s own
+ * write-back (macf#907) — apply's version phase behaves exactly like a
+ * `-f`-scoped roll, so a confirmed-green agent updates `fleet.lock` the same
+ * way, keeping the NEXT `plan`/`apply` run's honest-unknown floor accurate.
+ */
+export function resolveApplyVersionDeps(manifestPath: string): ApplyVersionPhaseDeps {
+  const discover = (): readonly WorkspaceRecord[] => discoverWorkspaces();
+  return {
+    discover,
+    resolveDriver: async (fleet: string): Promise<FleetDriver | null> => {
+      const rep = discover().find((r) => r.project === fleet);
+      if (!rep) return null; // graceful skip+report — see apply-version.ts's module doc
+      return createVmDriverFromConfig(rep.workspace);
+    },
+    fetchLatest: async () => {
+      const r = await fetchLatestCliVersion();
+      return r.status === 'ok' ? r.value : null;
+    },
+    sleep: (ms: number) => new Promise((res) => setTimeout(res, ms)),
+    now: () => Date.now(),
+    log: (line: string) => console.log(line),
+    recordDeployedVersion: buildRecordDeployedVersion(manifestPath),
+    runUpgradeFleetsFn: upgradeFleets,
+  };
+}
+
 /** Real ground-truth cert-present check — mirrors `commands/fleet-deploy.ts::nextStepLines`'s own default exactly. */
 function defaultCheckAgentCertPresent(destDir: string): boolean {
   return existsSync(agentCertPath(destDir)) && existsSync(agentKeyPath(destDir));
@@ -1297,6 +1363,7 @@ export function formatApplyResult(
   unimplemented: readonly UnimplementedApplyItem[] = [],
   remainingDeploy: RemainingDeployReport = { steps: [] },
   deployPhase?: DeployPhaseRenderInput,
+  versionPhase?: ApplyVersionPhaseResult,
 ): string {
   const parts: string[] = [
     `Control repo: ${formatControlRepoLine(result)}`,
@@ -1345,6 +1412,14 @@ export function formatApplyResult(
   if (deployPhase !== undefined) {
     parts.push(...deployPhaseSummaryLines(deployPhase));
     parts.push(...launchNextStepLines(deployPhase));
+  }
+  if (versionPhase?.attempted === true) {
+    parts.push(
+      '',
+      versionPhase.halted === true
+        ? `Version reconcile: HALTED — a bad release stopped the roll toward macf@${versionPhase.target ?? '?'} (see log above; DR-043 Amendment L, macf#1045).`
+        : `Version reconcile: completed toward macf@${versionPhase.target ?? '?'} (DR-043 Amendment L — see log above).`,
+    );
   }
   return parts.join('\n');
 }
@@ -1440,6 +1515,7 @@ export function fleetApplyResultToJson(
   unimplemented: readonly UnimplementedApplyItem[] = [],
   remainingDeploy: RemainingDeployReport = { steps: [] },
   deployPhase?: DeployPhaseRenderInput,
+  versionPhase?: ApplyVersionPhaseResult,
 ): unknown {
   return {
     schema_version: FLEET_APPLY_JSON_SCHEMA_VERSION,
@@ -1478,6 +1554,13 @@ export function fleetApplyResultToJson(
       key_legs: { ...result.routingClient.keyLegs },
     },
     ...(deployPhase !== undefined ? { deploy_phase: deployPhaseToJson(deployPhase) } : {}),
+    // DR-043 Amendment L (macf#1045) — same omit-when-N/A convention as
+    // `deploy_phase` above: absent entirely when the version phase was never
+    // attempted (no `versions:` declared, or the control repo aborted), so
+    // every pre-Amendment-L `--json` call site stays byte-identical.
+    ...(versionPhase?.attempted === true
+      ? { version_phase: { target: versionPhase.target, halted: versionPhase.halted === true } }
+      : {}),
   };
 }
 
@@ -1493,9 +1576,15 @@ export function fleetApplyResultToJson(
  * failed, OR ANY agent's deploy-phase attempt failed (macf#1013 requirement
  * 4 — "partial failure exits non-zero"; `deployResults` defaults to `[]`,
  * matching "the deploy phase was never attempted" — see
- * `anyDeployFailed`'s own doc).
+ * `anyDeployFailed`'s own doc), OR the version-reconcile phase HALTED (DR-043
+ * Amendment L, macf#1045 — a bad release during the roll; `versionPhase`
+ * defaults to `undefined`, matching "the phase was never attempted").
  */
-export function applyExitCode(result: FleetApplyResult, deployResults: readonly DeployPhaseAgentResult[] = []): number {
+export function applyExitCode(
+  result: FleetApplyResult,
+  deployResults: readonly DeployPhaseAgentResult[] = [],
+  versionPhase?: ApplyVersionPhaseResult,
+): number {
   const controlRepoBad =
     result.controlRepo.status === 'foreign' || result.controlRepo.status === 'failed' || result.controlRepo.status === 'archived';
   const controlRepoSyncBad = result.controlRepoSync.status === 'failed';
@@ -1558,7 +1647,8 @@ export function applyExitCode(result: FleetApplyResult, deployResults: readonly 
     caBad ||
     routingBad ||
     routingClientBad ||
-    anyDeployFailed(deployResults)
+    anyDeployFailed(deployResults) ||
+    versionPhase?.halted === true
     ? 1
     : 0;
 }
@@ -1864,6 +1954,26 @@ export async function runBootstrapApply(
         }
       }
 
+      // DR-043 Amendment L (macf#1045) — the version-reconcile phase. Runs
+      // AFTER deploy (so a workspace THIS run just materialized is freshly
+      // discoverable). Gated on `controlRepoAborted` (same as deploy — step
+      // 0 never completed) AND `opts.deploy !== false`: `--no-deploy` is the
+      // operator's explicit "keep the two phases apart, don't touch
+      // workspaces this run" signal (deploy's own doc quotes the operator:
+      // *"I very much like and respect this separation"*) — rolling an
+      // agent restarts it, which is workspace-adjacent in the same sense.
+      // Deliberately NOT gated on vault/identity-key (unlike deploy):
+      // rolling an ALREADY-deployed agent needs no vault access, and an
+      // unreachable/undiscoverable fleet is a graceful skip+report inside
+      // `upgradeFleets` itself, never a hard failure (see `apply-version.ts`'s
+      // module doc) — so attempting whenever deploy would have run cannot
+      // make an otherwise-successful run fail just because nothing local is
+      // reachable yet.
+      const versionResult: ApplyVersionPhaseResult =
+        controlRepoAborted || opts.deploy === false
+          ? { attempted: false }
+          : await runApplyVersionPhase(manifest, resolved.versionDeps ?? { ...resolveApplyVersionDeps(manifestPath), log: stderrLog });
+
       const remainingDeploy: RemainingDeployReport = controlRepoAborted
         ? { steps: [] }
         : computeRemainingDeploy(manifest, manifestPath, opts, resolved.checkDeployPathExists);
@@ -1886,12 +1996,14 @@ export async function runBootstrapApply(
             };
 
       if (opts.json) {
-        console.log(JSON.stringify(fleetApplyResultToJson(result, plan.unimplementedByApply, remainingDeploy, deployPhase), null, 2));
+        console.log(
+          JSON.stringify(fleetApplyResultToJson(result, plan.unimplementedByApply, remainingDeploy, deployPhase, versionResult), null, 2),
+        );
       } else {
         console.log('');
-        console.log(formatApplyResult(result, plan.unimplementedByApply, remainingDeploy, deployPhase));
+        console.log(formatApplyResult(result, plan.unimplementedByApply, remainingDeploy, deployPhase, versionResult));
       }
-      return applyExitCode(result, deployResults);
+      return applyExitCode(result, deployResults, versionResult);
     } finally {
       // macf#913 — a vault-derived scratch PEM must never outlive this run,
       // regardless of how it ends (declined, applyFleet threw, or a clean
