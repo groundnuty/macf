@@ -210,7 +210,7 @@ import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName } from 
 import type { AgentApplyDeps, AgentApplyOutcome } from './apply-agent.js';
 import { applyAgentIdentity, applyIdentity, cleanupScratchPem, writeScratchPem } from './apply-agent.js';
 import type { Presence } from './plan.js';
-import { buildRegistryRepoValidateInstall } from './registry-repo-coverage.js';
+import { buildRegistryRepoValidateInstall, registryRepoCoverageUnverifiedOnSkipNote } from './registry-repo-coverage.js';
 import type { AppCredentials } from './manifest-exchange.js';
 import type { AgentRepoDeps, AgentRepoOptions, RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
 import { applyRepoInitForAgent, ensureAgentRepo } from './apply-repo-init.js';
@@ -998,11 +998,34 @@ export async function applyFleet(
     // durable in the first place. Two independent ways that can be true —
     // no recipient to encrypt to AT ALL, or a live vault this run cannot
     // decrypt to fold into (macf#989) — checked in sequence.
-    const identity = wouldCreateWithNoRecipient(prior, recipients)
+    const rawIdentity = wouldCreateWithNoRecipient(prior, recipients)
       ? noRecipientPreflightFailure(agent.role)
       : wouldCreateWithUnreadableVault(prior, vaultAlreadyExists, deps.identityKeyPath)
         ? noVaultAccessPreflightFailure(agent.role, vaultOutPath)
         : await applyAgentIdentity(agent, manifest, prior, agentDeps);
+
+    // groundnuty/macf#1016 — see `registry-repo-coverage.ts`'s "The gap
+    // THAT coverage scope leaves open" doc section for the full mechanism.
+    // `skip-unverified` means `confirmBeforeCreateGuard` never reached
+    // `reuse-confirmed`/`resume-install`, so `validateReuse`/`validateInstall`
+    // (and this fleet's registry-repo coverage check with them, wired above
+    // when `registry.type === 'repo'`) never ran for this role. Gated on
+    // `agentDeps.resolveKeyPath === undefined` — THIS RUN never had a
+    // vault-aware resolver wired at all (requirement 3: "a vault-aware run
+    // is unchanged" — a run where `resolveKeyPath` IS wired but still lands
+    // on skip-unverified for an unrelated reason, e.g. `confirmAppInstallation`
+    // itself unconfirmable, is untouched; re-running with the SAME flags
+    // would not fix that case, so this note's advice would be wrong there).
+    // Extends — never replaces — `confirmBeforeCreateGuard`'s own reason
+    // text, so both gaps are named in one string (Amendment A: unverified is
+    // `unknown`, never silently `ok`).
+    const identity: AgentApplyOutcome =
+      registry.type === 'repo' && rawIdentity.status === 'skipped-unverified' && agentDeps.resolveKeyPath === undefined
+        ? {
+            ...rawIdentity,
+            reason: `${rawIdentity.reason} ${registryRepoCoverageUnverifiedOnSkipNote(deriveAppHandle(manifest.metadata.name, agent.role), registry.owner, registry.repo)}`,
+          }
+        : rawIdentity;
 
     let repoInitOutcome: RepoInitStepOutcome | undefined;
     const handle = deriveAppHandle(manifest.metadata.name, agent.role);
