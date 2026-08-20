@@ -140,6 +140,29 @@
  * macf#929, retained only as a direct-unit-tested building block — see its
  * own doc) is NOT part of this change; it keeps reporting `'skipped'` for the
  * same shape, since it is never reached from `apply` at all.
+ *
+ * **A confirmed 403 fails FAST, not after the full poll window
+ * (groundnuty/macf#1054, DR-044 Decision 6).** Observed twice on the live
+ * fleet: an AGENT installation token (lacking `administration: read` — that
+ * scope is FLEET authority under DR-044, "the apply runs with operator
+ * authority," not agent authority) makes `observer.ts::listRepoScopedRunners`
+ * 403 on EVERY poll tick — the runner itself was healthy the whole time
+ * (`status=online busy=false`), but the caller was never entitled to see it,
+ * so the poll burned the entire 600s budget waiting for a precondition that
+ * cannot change mid-poll. `checkRunnerUsableByRepo` now threads a confirmed
+ * repo-scoped 403 through as `RunnerUsability.permissionDenied` (see that
+ * field's doc in `observer.ts`); {@link pollForUsableRunner} exits on the
+ * VERY FIRST check when it sees that flag (before ever calling `sleepFn`),
+ * and {@link publishTrustedActorsGated} reports the outcome via the NEW
+ * {@link runnerPermissionDeniedReason} — never {@link runnerTokenPollExhaustedReason}
+ * (which would falsely claim a wait happened) — naming the 403 + the
+ * DR-044 fleet-authority cause explicitly. A genuine "registered but not yet
+ * online" `'unknown'`/`'absent'` (network hiccup, transient `gh` failure, a
+ * runner mid-registration) carries NO `permissionDenied` flag and keeps
+ * polling to the full budget exactly as before — this fix narrows ONLY the
+ * confirmed-403 shape, per DR-044 Decision 6's floor: the operator's own
+ * runner-missing ruling (macf#993, above) is unchanged and still fires loud
+ * for a genuinely-absent runner.
  */
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import { ensureVariableCreated, failedOutcomesFor } from './ensure-variable.js';
@@ -395,6 +418,49 @@ export function checkRunnerTokenPreflight(
  * {@link runnerTokenPollExhaustedReason} above — `'failed'`, not
  * `'skipped'`. This function's TEXT is unchanged.
  */
+/**
+ * The reason text for the groundnuty/macf#1054 FAST-FAIL path — a CONFIRMED
+ * HTTP 403 on the repo-scoped runner list (`usability.permissionDenied ===
+ * true`), observed on the runner's OWN check or on the caller's very first
+ * poll iteration. Deliberately NOT {@link runnerTokenPollExhaustedReason}:
+ * that text asserts "within the Ns poll window" — a wait that, on THIS path,
+ * never happened (or ran for a single, sub-second check) — see
+ * {@link runnerJustCreatedRepoReason}'s doc for the same "a message
+ * describing work the program did not do is the same dishonesty this catalog
+ * exists to prevent" reasoning this function follows for the SAME class of
+ * lie, one gate over.
+ *
+ * DR-044 Decision 6 ("fail as fast as possible, with the cleanest reasons to
+ * act on") is why this fails immediately instead of retrying: a permission
+ * gap cannot resolve itself by waiting — the caller is not entitled to look,
+ * a fact that does not change between one poll tick and the next. DR-044
+ * also names listing a repo's registered runners as **fleet authority**, not
+ * agent authority — the operator's own words on groundnuty/macf#1054: "the
+ * apply runs with operator authority." The remedy clause says exactly that,
+ * distinct from {@link runnerTokenPollExhaustedReason}'s "register a runner
+ * and re-run" (there is no runner to register here — the runner is fine;
+ * the CALLER cannot see it).
+ *
+ * **Status note (groundnuty/macf#993, unchanged by this function):**
+ * {@link publishTrustedActorsGated} pairs this text with `status: 'failed'`,
+ * same bar as every other non-present routing outcome — a declared runner is
+ * REQUIRED, so an unconfirmable one still fails the run. Only the TIMING and
+ * the WORDING change here, never the severity.
+ */
+export function runnerPermissionDeniedReason(repo: string, usability: RunnerUsability): string {
+  const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
+  const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
+  return (
+    `role/repo "${repo}": a runner registration token was supplied (macf#929) but the repo-scoped runner list was ` +
+    'refused outright (HTTP 403) — failing immediately, WITHOUT retrying, because a permission gap cannot resolve ' +
+    'itself given more time (DR-044 Decision 6, groundnuty/macf#1054). MACF_TRUSTED_ACTORS was NOT written. ' +
+    "Listing a repo's registered runners is FLEET authority, not agent authority (DR-044) — re-run " +
+    '`macf bootstrap apply` with a runner-registration token (and, if this run used the agent identity\'s own ' +
+    'installation token for the underlying `gh` auth, with an identity holding "administration: read" on this ' +
+    `repo).${detailSuffix}${handoverSuffix}`
+  );
+}
+
 export function runnerJustCreatedRepoReason(repo: string, usability: RunnerUsability): string {
   const cause =
     usability.presence === 'unknown'
@@ -509,6 +575,19 @@ export function formatRunnerPollProgress(repo: string, elapsedMs: number, totalM
  * never on the call that's about to return (a poll that resolves or expires
  * inside its first interval narrates nothing, matching this function's
  * pre-macf#972 silent behavior for a short poll).
+ *
+ * **groundnuty/macf#1054 — fails FAST on a confirmed permission denial,
+ * never retries it.** A `usability.permissionDenied === true` result (see
+ * `observer.ts::RunnerUsability.permissionDenied`'s doc) exits the loop on
+ * THIS SAME check, before the `remaining <= 0` budget test and before EVER
+ * calling `sleepFn` — a 403 "I am not entitled to look" cannot resolve into
+ * "now I can" by waiting, so retrying it for the full `timeoutMs` budget
+ * would only ever reproduce the same 403 on every tick (DR-044 Decision 6:
+ * "fail as fast as possible, with the cleanest reasons to act on"). A
+ * genuinely absent/unregistering runner (`presence` `'unknown'`/`'absent'`
+ * WITHOUT `permissionDenied`) is UNCHANGED — it keeps polling to the full
+ * budget exactly as before this fix; only the confirmed-403 shape short-
+ * circuits.
  */
 export async function pollForUsableRunner(
   repo: string,
@@ -526,6 +605,9 @@ export async function pollForUsableRunner(
   for (;;) {
     const usability = await checkRunnerUsableByRepo(repo);
     if (usability.presence === 'present') return usability;
+    // groundnuty/macf#1054 — a confirmed 403 is "not entitled to look," never
+    // "not there yet." Return on the FIRST check; never reaches `sleepFn`.
+    if (usability.permissionDenied === true) return usability;
     const elapsedNow = nowFn();
     const remaining = deadline - elapsedNow;
     if (remaining <= 0) return usability;
@@ -638,13 +720,25 @@ export async function publishTrustedActorsGated(
       // `'skipped'` — this is the ONE line that makes the whole run
       // non-zero-exit via `commands/bootstrap-apply.ts::applyExitCode`'s
       // existing `routingBad` check (already `.some((leg) => leg.status ===
-      // 'failed')`, unchanged). The reason TEXT is untouched — it already
-      // names the billing consequence — only the status tag flips.
+      // 'failed')`, unchanged). The reason TEXT is untouched for the two
+      // pre-existing branches — only the status tag flips.
+      //
+      // groundnuty/macf#1054 — `permissionDenied` wins over BOTH existing
+      // branches, regardless of `pollJustified`: a confirmed 403 asserts NO
+      // wait happened (or, on the poll path, that the wait was cut short on
+      // the very first check — see `pollForUsableRunner`'s doc), so neither
+      // `runnerTokenPollExhaustedReason` ("within the Ns poll window") nor
+      // `runnerJustCreatedRepoReason`'s generic "could not confirm" framing
+      // is honest here; `runnerPermissionDeniedReason` names the 403 + DR-044
+      // cause explicitly on EITHER path.
       out[repo] = {
         status: 'failed',
-        reason: pollJustified
-          ? runnerTokenPollExhaustedReason(repo, usability, timeoutMs)
-          : runnerJustCreatedRepoReason(repo, usability),
+        reason:
+          usability.permissionDenied === true
+            ? runnerPermissionDeniedReason(repo, usability)
+            : pollJustified
+              ? runnerTokenPollExhaustedReason(repo, usability, timeoutMs)
+              : runnerJustCreatedRepoReason(repo, usability),
       };
       continue;
     }

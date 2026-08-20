@@ -461,6 +461,28 @@ export interface RunnerUsability {
    * describe: a runner exists but fails the capability check.
    */
   readonly detail?: string;
+  /**
+   * Set `true` iff the repo-scoped runner-list read ({@link listRepoScopedRunners})
+   * came back a CONFIRMED HTTP 403 (`RepoRunnersOutcome.kind === 'forbidden'`)
+   * AND the resolution as a whole did not end in `presence: 'present'`
+   * (groundnuty/macf#1054, DR-044 Decision 6: "fail as fast as possible, with
+   * the cleanest reasons to act on"). A 403 here means *"I am not entitled to
+   * look,"* never *"it is not there"* (Amendment A's floor) — a caller
+   * lacking `administration: read` cannot make a runner appear by waiting
+   * longer, so a poll built to wait out a REGISTERING runner (the honest
+   * `'unknown'`/`'absent'` case this flag does NOT set) has no chance of ever
+   * resolving `'present'` here. `pollForUsableRunner` (`apply-routing.ts`)
+   * reads this flag to exit its retry loop on the FIRST check rather than
+   * exhausting the whole deploy-window budget on a precondition that cannot
+   * change mid-poll. `undefined` (never `false`) in every other case —
+   * including a genuine "registered but not yet online" `'unknown'`/`'absent'`
+   * (network hiccup, `gh` failure, or a runner mid-registration), which MUST
+   * keep polling; see `checkRunnerUsableByRepo`'s doc for exactly where this
+   * is set. Deliberately NOT folded into the shared {@link Presence} union
+   * (which is used far beyond this one gate) — an additive field on THIS
+   * richer type keeps the blast radius to the one caller that needs it.
+   */
+  readonly permissionDenied?: true;
 }
 
 /**
@@ -749,11 +771,23 @@ export async function checkRunnerUsableByRepo(repo: string, deps: RunnerUsabilit
     deps.listRunnerGroupsVisibleToRepo(split.owner, split.name),
     deps.listOrgRunners(split.owner),
   ]);
+  // groundnuty/macf#1054 (DR-044 Decision 6) — a CONFIRMED 403 on the
+  // repo-scoped leg means "I am not entitled to look," never "it is not
+  // there." Computed once here and threaded into every non-present return
+  // below so `pollForUsableRunner` can fail fast instead of polling a
+  // precondition that cannot change mid-poll — see `RunnerUsability.
+  // permissionDenied`'s doc for the full contract.
+  const repoForbidden = repoOutcome.kind === 'forbidden';
+
   if (visibleGroups === 'unknown' || orgRunners === 'unknown') {
     // repoOutcome may still have something worth explaining (found-but-
     // incapable runners, or a 403) even though the OVERALL answer is
     // 'unknown' — surface it rather than a bare "could not confirm."
-    return { presence: 'unknown', detail: repoOutcomeDetail(repo, repoOutcome) };
+    return {
+      presence: 'unknown',
+      detail: repoOutcomeDetail(repo, repoOutcome),
+      ...(repoForbidden ? { permissionDenied: true } : {}),
+    };
   }
 
   const visibleIds = new Set(visibleGroups.map((g) => g.id));
@@ -767,14 +801,18 @@ export async function checkRunnerUsableByRepo(repo: string, deps: RunnerUsabilit
   // returned above) — an 'ok' outcome keeps the repo-scope contribution
   // 'absent' (confirmed, even if empty); 'forbidden'/'unknown' keep it
   // 'unknown', preserving macf#924's "a permission gap is not evidence of
-  // absence" floor at the OVERALL level too.
+  // absence" floor at the OVERALL level too. Note `repoForbidden` therefore
+  // only ever pairs with `overallPresence === 'unknown'` here — never
+  // `'absent'` — since a 'forbidden' repoOutcome forces `repoScopePresence`
+  // to `'unknown'` on the very next line.
   const repoScopePresence: Presence = repoOutcome.kind === 'ok' ? 'absent' : 'unknown';
   const overallPresence: Presence = repoScopePresence === 'unknown' ? 'unknown' : 'absent';
   const detail = repoOutcomeDetail(repo, repoOutcome) ?? (visibleOrgRunners.length > 0 ? runnerIncapableDetail(repo, visibleOrgRunners) : undefined);
 
   const excludedGroupIdsWithRunners = new Set(orgRunners.filter((r) => !visibleIds.has(r.runnerGroupId)).map((r) => r.runnerGroupId));
-  if (excludedGroupIdsWithRunners.size === 0) return { presence: overallPresence, detail };
-  return { presence: overallPresence, detail, handover: buildRunnerHandoverMessage(repo, split.owner, excludedGroupIdsWithRunners) };
+  const permissionDenied = repoForbidden ? ({ permissionDenied: true } as const) : {};
+  if (excludedGroupIdsWithRunners.size === 0) return { presence: overallPresence, detail, ...permissionDenied };
+  return { presence: overallPresence, detail, handover: buildRunnerHandoverMessage(repo, split.owner, excludedGroupIdsWithRunners), ...permissionDenied };
 }
 
 /** The `detail` contribution from the repo-scoped leg alone — `undefined` when there is nothing repo-scope-specific to explain (zero runners found, or the leg is a plain unreadable with no permission signal). Factored out of {@link checkRunnerUsableByRepo} so both its early-return-avoided branches build the SAME message for the SAME repo-scope outcome. */
