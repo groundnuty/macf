@@ -257,7 +257,12 @@ export const CONTROL_REPO_RECOVERY_GITIGNORE_ENTRY = 'secrets/recovery/';
  * `.gitignore` itself is included so the belt-and-suspenders file (below)
  * actually gets committed, not just written to local disk.
  */
-export const CONTROL_REPO_COMMIT_ALLOWLIST: readonly string[] = ['fleet.yaml', 'fleet.lock', 'secrets/vault.age', '.gitignore'];
+// macf#1057 — the control repo is the fleet's cross-agent coordination surface, so it
+// carries the router workflow and its config. TWO EXACT PATHS, never a `.github/**`
+// glob: a glob turns "explicitly listed" into "happens to be in the right folder",
+// which is the property this list exists to hold. Both files are already committed in
+// the open in every agent repo, so listing them withholds nothing already public.
+export const CONTROL_REPO_COMMIT_ALLOWLIST: readonly string[] = ['fleet.yaml', 'fleet.lock', 'secrets/vault.age', '.gitignore', '.github/workflows/agent-router.yml', '.github/agent-config.json'];
 
 /**
  * Idempotently ensure the control-repo checkout's `.gitignore` excludes

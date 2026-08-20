@@ -217,6 +217,8 @@ import { applyRepoInitForAgent, ensureAgentRepo } from './apply-repo-init.js';
 import { repoHomepageUrl } from './app-manifest.js';
 import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './control-repo.js';
 import { provisionControlRepo } from './control-repo.js';
+import type { ControlRepoInitOutcome } from './apply-control-repo-init.js';
+import { applyControlRepoInit } from './apply-control-repo-init.js';
 import type { FleetLockAgentUpdate, FleetLockIdentityChange } from './fleet-lock.js';
 import { composeFleetLock, readFleetLockFile, writeFleetLock } from './fleet-lock.js';
 import type { VaultAgentSecrets, VaultCaSecrets, VaultEncryptFn, VaultRoutingClientSecrets, VaultRunnerOpsSecrets, WriteVaultDeps } from './vault-write.js';
@@ -498,6 +500,15 @@ export interface FleetApplyResult {
   readonly controlRepo: ControlRepoOutcome;
   /** The final push of this run's control-repo changes — see the type doc. */
   readonly controlRepoSync: ControlRepoSyncOutcome;
+  /**
+   * Control-repo `repo-init` (groundnuty/macf#1057) — the router workflow +
+   * one label per declared fleet agent, run against the SAME `controlDir`
+   * `controlRepoSync` above pushes. See `apply-control-repo-init.ts`'s
+   * module doc. `'skipped'` only when `controlRepo` itself aborted (no
+   * checkout ever existed to run repo-init against) — mirrors
+   * `controlRepoSync`'s own abort shape.
+   */
+  readonly controlRepoInit: ControlRepoInitOutcome | { readonly status: 'skipped' };
   readonly lockPath: string;
   readonly finalLock: FleetLock | null;
   readonly agents: readonly AgentApplyRecord[];
@@ -759,6 +770,7 @@ function abortedFleetApplyResult(manifestPath: string, priorLock: FleetLock | nu
   return {
     controlRepo,
     controlRepoSync: { status: 'skipped' },
+    controlRepoInit: { status: 'skipped' },
     lockPath: join(dirname(manifestPath), 'fleet.lock'),
     finalLock: priorLock,
     agents: [],
@@ -837,6 +849,29 @@ export async function applyFleet(
   deps.log(`Control repo "${controlRepo.repo}": ${controlRepo.status.toUpperCase()} (checkout: ${controlRepo.localDir}).`);
 
   const controlDir = controlRepo.localDir;
+
+  // --- Step 0.5 (groundnuty/macf#1057): control-repo repo-init — the router
+  // workflow + one label per DECLARED fleet agent, so cross-agent
+  // coordination has a repo every agent's App can already reach. Runs
+  // straight against `controlDir` (no clone/commit/push of its own — see
+  // `apply-control-repo-init.ts`'s module doc); commit/push happens ONCE,
+  // at the very end of this run, via `syncControlRepo` below. Non-fatal on
+  // failure (reported on the result, logged loud) — an agent repo's own
+  // repo-init already established this precedent (`applyRepoInitForAgent`'s
+  // callers below), and a control-repo-init failure must not prevent the
+  // rest of the run (identities, vault) from proceeding.
+  const controlRepoInit = await applyControlRepoInit(controlDir, manifest, { repoInit: deps.repoInitDeps.repoInit });
+  if (controlRepoInit.status === 'failed') {
+    deps.log(`Control repo "${controlRepo.repo}" repo-init: FAILED — ${controlRepoInit.reason}`);
+  } else {
+    deps.log(
+      `Control repo "${controlRepo.repo}" repo-init: labels ${controlRepoInit.labels.status} for [${controlRepoInit.agents.join(', ')}]` +
+        (controlRepoInit.workflowAndConfigAllowlisted
+          ? '.'
+          : ' (router workflow was written locally but is not yet part of what gets committed — see the release notes for this behavior).'),
+    );
+  }
+
   const lockPath = join(controlDir, 'fleet.lock');
   const secretsDir = join(controlDir, 'secrets');
   const vaultOutPath = join(secretsDir, 'vault.age');
@@ -1496,6 +1531,7 @@ export async function applyFleet(
   return {
     controlRepo,
     controlRepoSync,
+    controlRepoInit,
     lockPath,
     finalLock: currentLock,
     agents: records,
