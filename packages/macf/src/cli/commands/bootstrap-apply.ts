@@ -1240,6 +1240,35 @@ function formatControlRepoLine(result: FleetApplyResult): string {
   }
 }
 
+/**
+ * The control-repo routing setup line (groundnuty/macf#1057) — reports
+ * whether the router workflow + per-agent labels were installed on the
+ * control repo, so cross-agent coordination there is actually usable.
+ * Explains outcomes in plain language rather than citing an internal
+ * tracker reference (operator ruling: user-facing output should stand on
+ * its own).
+ */
+function formatControlRepoInitLine(init: FleetApplyResult['controlRepoInit']): string {
+  switch (init.status) {
+    case 'skipped':
+      return 'skipped (control repo was not provisioned this run — see the Control repo line above).';
+    case 'failed':
+      return `⚠ FAILED — ${init.reason}`;
+    case 'written': {
+      const labelNote =
+        init.labels.status === 'skipped'
+          ? `labels not created this run (${init.labels.reason}) — will retry on the next apply`
+          : init.labels.status === 'partial-failure'
+            ? `some labels failed: ${init.labels.failed.join(', ')}`
+            : 'labels present for every declared agent';
+      const workflowNote = init.workflowAndConfigAllowlisted
+        ? ''
+        : ' The router workflow file is not yet included in what gets pushed to this repo — cross-agent GitHub Actions routing is not live until that is addressed.';
+      return `${labelNote} (${init.agents.join(', ')}).${workflowNote}`;
+    }
+  }
+}
+
 /** The final control-repo sync line (macf#857) — see `ControlRepoSyncOutcome`'s doc. */
 function formatControlRepoSyncLine(sync: ControlRepoSyncOutcome): string {
   switch (sync.status) {
@@ -1411,6 +1440,7 @@ export function formatApplyResult(
 ): string {
   const parts: string[] = [
     `Control repo: ${formatControlRepoLine(result)}`,
+    `Control repo routing setup: ${formatControlRepoInitLine(result.controlRepoInit)}`,
     '',
     ...runnerOpsSummaryLines(result),
     '',
@@ -1615,6 +1645,7 @@ export function fleetApplyResultToJson(
     schema_version: FLEET_APPLY_JSON_SCHEMA_VERSION,
     control_repo: result.controlRepo,
     control_repo_sync: result.controlRepoSync,
+    control_repo_init: result.controlRepoInit,
     // groundnuty/macf#943 — same `redactIdentity` conversion every agent's
     // identity goes through (never a credential value; see that function's
     // doc). Separate top-level key, not folded into `agents` — matches
@@ -1678,7 +1709,11 @@ export function fleetApplyResultToJson(
  * (`foreign`/`failed`/`archived` — DR-043 Amendment G added `archived`
  * alongside macf#857's `foreign`/`failed`; the entire run aborted in all
  * three cases), OR the final control-repo sync failed (durable-locally-but-
- * not-pushed is still an operator-attention state), OR ANY agent needs
+ * not-pushed is still an operator-attention state), OR the control-repo
+ * repo-init step genuinely failed (groundnuty/macf#1057 — e.g. a
+ * local-registry misconfiguration; NOT the ordinary "no token this run"
+ * label-skip, which stays `'written'` — see `applyControlRepoInit`'s doc),
+ * OR ANY agent needs
  * operator attention (failed/drift/skipped-unverified/repo-init-failed), OR
  * the runner-ops App needs operator attention (groundnuty/macf#943 —
  * same failed/drift/skipped-unverified bar as an agent), OR the vault write
@@ -1697,6 +1732,16 @@ export function applyExitCode(
   const controlRepoBad =
     result.controlRepo.status === 'foreign' || result.controlRepo.status === 'failed' || result.controlRepo.status === 'archived';
   const controlRepoSyncBad = result.controlRepoSync.status === 'failed';
+  // groundnuty/macf#1057 — a GENUINE control-repo repo-init failure (e.g. a
+  // local-registry misconfiguration) needs operator attention, same bar as
+  // `controlRepoSyncBad`. Deliberately narrower than "labels weren't
+  // created": `controlRepoInit.status` stays `'written'` even when
+  // `labels.status === 'skipped'` (no token minted this run — see
+  // `apply-control-repo-init.ts`'s "Token sourcing" doc; the common,
+  // EXPECTED case for a Mac-side apply run today) — that skip is a known,
+  // reported gap, not a run-level failure, and must not flip every ordinary
+  // apply to a non-zero exit over it.
+  const controlRepoInitBad = result.controlRepoInit.status === 'failed';
   const agentBad = result.agents.some(
     (rec) =>
       rec.identity.status === 'failed' ||
@@ -1750,6 +1795,7 @@ export function applyExitCode(
     Object.values(result.routingClient.keyLegs).some((leg) => leg.status === 'failed');
   return controlRepoBad ||
     controlRepoSyncBad ||
+    controlRepoInitBad ||
     agentBad ||
     runnerOpsBad ||
     result.vault.status === 'failed' ||

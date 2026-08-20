@@ -150,7 +150,7 @@ describe('classifyControlRepoOwnership (pure)', () => {
 
 describe('CONTROL_REPO_COMMIT_ALLOWLIST', () => {
   it('is exactly fleet.yaml, fleet.lock, secrets/vault.age, .gitignore — and NEVER secrets/recovery', () => {
-    expect(CONTROL_REPO_COMMIT_ALLOWLIST).toEqual(['fleet.yaml', 'fleet.lock', 'secrets/vault.age', '.gitignore']);
+    expect(CONTROL_REPO_COMMIT_ALLOWLIST).toEqual(['fleet.yaml', 'fleet.lock', 'secrets/vault.age', '.gitignore', '.github/workflows/agent-router.yml', '.github/agent-config.json']);
     expect(CONTROL_REPO_COMMIT_ALLOWLIST.some((p) => p.startsWith('secrets/recovery'))).toBe(false);
   });
 });

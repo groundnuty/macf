@@ -2858,6 +2858,17 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
   return {
     controlRepo: { status: 'created', repo: 'groundnuty/demo-fleet-control', localDir: '/x' },
     controlRepoSync: { status: 'pushed' },
+    // groundnuty/macf#1057 default: a NEUTRAL 'written' shape (every declared
+    // agent's label present) so pre-existing tests in this file that don't
+    // override it see a steady, non-alarming line. Tests exercising the
+    // allowlist-gap / failed / skipped shapes override explicitly.
+    controlRepoInit: {
+      status: 'written',
+      repo: 'groundnuty/demo-fleet-control',
+      agents: ['code-agent'],
+      labels: { status: 'ok', created: [], existed: ['code-agent', 'in-progress', 'in-review', 'blocked', 'agent-offline'] },
+      workflowAndConfigAllowlisted: false,
+    },
     lockPath: '/x/fleet.lock',
     finalLock: null,
     agents: [],
@@ -2971,6 +2982,30 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
 
   it('applyExitCode: 1 when the FINAL control-repo sync failed, even though every agent + the vault succeeded', () => {
     expect(applyExitCode(resultWith({ controlRepoSync: { status: 'failed', reason: 'push rejected' } }))).toBe(1);
+  });
+
+  it('applyExitCode: 1 when control-repo repo-init genuinely FAILED (groundnuty/macf#1057)', () => {
+    expect(
+      applyExitCode(
+        resultWith({ controlRepoInit: { status: 'failed', repo: 'groundnuty/demo-fleet-control', agents: ['code-agent'], reason: 'local registry' } }),
+      ),
+    ).toBe(1);
+  });
+
+  it('applyExitCode: 0 when control-repo repo-init wrote successfully but labels were SKIPPED (no token this run — the expected steady state, not a failure)', () => {
+    expect(
+      applyExitCode(
+        resultWith({
+          controlRepoInit: {
+            status: 'written',
+            repo: 'groundnuty/demo-fleet-control',
+            agents: ['code-agent'],
+            labels: { status: 'skipped', reason: 'no GH_TOKEN/APP_ID this run' },
+            workflowAndConfigAllowlisted: false,
+          },
+        }),
+      ),
+    ).toBe(0);
   });
 
   it('applyExitCode: 0 when control repo is reused + sync is nothing-to-commit (steady-state re-run)', () => {

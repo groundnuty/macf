@@ -152,6 +152,8 @@ function trustDepsFor(overrides: Partial<CaApplyDeps & RunnerRegistrationDeps> =
 
 const CODE_AGENT: FleetAgent = { role: 'code-agent', profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/x' };
 const SCI_AGENT: FleetAgent = { role: 'science-agent', profile: 'research', repo: 'groundnuty/demo-science', deploy_path: '/y' };
+/** groundnuty/macf#1057 — a third agent, used only by the control-repo-init tests (a 2-agent manifest can't distinguish "all declared agents" from "the first N-1"). */
+const WRITING_AGENT: FleetAgent = { role: 'writing-agent', profile: 'writing', repo: 'groundnuty/demo-writing', deploy_path: '/z' };
 
 /**
  * groundnuty/macf#1012 — repo-scoped registry install-coverage. A manifest
@@ -1544,6 +1546,10 @@ trust:
 
     expect(result.controlRepo.status).toBe('foreign');
     expect(result.controlRepoSync).toEqual({ status: 'skipped' });
+    // groundnuty/macf#1057 — control-repo repo-init (labels + router
+    // workflow) never runs either: it needs the SAME `controlDir` a foreign
+    // control repo never clones.
+    expect(result.controlRepoInit).toEqual({ status: 'skipped' });
     expect(result.agents).toEqual([]);
     expect(result.vault).toEqual({ status: 'skipped' });
     expect(result.identityChanges).toEqual([]);
@@ -1562,6 +1568,185 @@ trust:
     expect(result.routingClient.mint.status).toBe('skipped');
     expect(result.routingClient.certLegs).toEqual({});
     expect(result.routingClient.keyLegs).toEqual({});
+  });
+
+  describe('control-repo repo-init wiring (groundnuty/macf#1057)', () => {
+    /** Role-dispatching `AgentApplyDeps` for a 3-agent "every role already reused" run — same `confirmAppInstallation`-keyed-on-appId shape the file's other multi-agent reused fixtures already use (see the archive/revive describe block above). */
+    function reusedThreeAgentDeps(): AgentApplyDeps {
+      return {
+        startManifestFlow: async () => {
+          throw new Error('must not be called — all three roles have prior lock entries');
+        },
+        startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+        exchangeManifestCode: async () => {
+          throw new Error('must not be called');
+        },
+        resolveKeyPath: () => '/fake.pem',
+        confirmAppInstallation: async (appId) => ({
+          status: 'confirmed',
+          install: { appId, installId: `install-${appId}`, appSlug: `demo-fleet-${appId}`, accountLogin: 'groundnuty' },
+        }),
+        waitForAppInstallation: async () => {
+          throw new Error('must not be called — reused path');
+        },
+        openUrl: async () => {},
+        log: () => {},
+        writeRecoveryArtifact: async () => {},
+      };
+    }
+
+    const PRIOR_LOCK_THREE_AGENTS: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [
+        { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+        { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+        { role: 'writing-agent', app_id: 'app-writing-agent', install_id: 'install-3' },
+      ],
+    };
+
+    it('DECISIVE — control repo repo-init receives ALL three declared agents; each agent repo still receives only its OWN role (private-queue separation preserved)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT, WRITING_AGENT]);
+      const repoInitCalls: { repo: string | undefined; agents: string | undefined }[] = [];
+      const repoInitDeps: RepoInitStepDeps = {
+        cloneRepo: async () => {},
+        commitAndPush: async () => 'pushed',
+        repoInit: async (_dir, opts) => {
+          repoInitCalls.push({ repo: opts.repo, agents: opts.agents });
+          return { workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } };
+        },
+      };
+      const deps = baseDeps(reusedThreeAgentDeps(), manifestPath, repoInitDeps);
+
+      const result = await applyFleet(manifest, manifestPath, PRIOR_LOCK_THREE_AGENTS, deps);
+
+      expect(result.agents.map((a) => a.identity.status)).toEqual(['reused', 'reused', 'reused']);
+
+      // The control repo's OWN repo-init call carries ALL THREE roles,
+      // comma-joined — not just one, and not derived from a subset (per
+      // assert-the-wrong-path.md: a call-count assertion alone can't tell
+      // "1 agent" from "3 agents").
+      const controlCall = repoInitCalls.find((c) => c.repo === 'groundnuty/demo-fleet-control');
+      expect(controlCall?.agents).toBe('code-agent,science-agent,writing-agent');
+      expect(result.controlRepoInit.status).toBe('written');
+      if (result.controlRepoInit.status === 'written') {
+        expect(result.controlRepoInit.agents).toEqual(['code-agent', 'science-agent', 'writing-agent']);
+        expect(result.controlRepoInit.repo).toBe('groundnuty/demo-fleet-control');
+      }
+
+      // Each AGENT repo's own repo-init call still carries ONLY its own
+      // role — the private-queue separation #1057's design explicitly
+      // preserves is unaffected by the new control-repo call.
+      expect(repoInitCalls.find((c) => c.repo === 'groundnuty/demo-code')?.agents).toBe('code-agent');
+      expect(repoInitCalls.find((c) => c.repo === 'groundnuty/demo-science')?.agents).toBe('science-agent');
+      expect(repoInitCalls.find((c) => c.repo === 'groundnuty/demo-writing')?.agents).toBe('writing-agent');
+
+      // Exactly 4 repoInit calls total: 1 control repo + 3 agent repos — no
+      // extra, no missing.
+      expect(repoInitCalls).toHaveLength(4);
+    });
+
+    it('does not touch any App-installation seam — every identity/install dep is the SAME "reused, prior-confirmed" fixture already used for the private-queue test above', async () => {
+      // No new call to `waitForAppInstallation` (gate 2 / App install) is
+      // introduced by the control-repo-init step — it throws if called, and
+      // this run completes successfully, proving it never fires. This is
+      // the executable half of the "no App installation is modified" claim
+      // (the structural half — `ControlRepoInitDeps` has no install-capable
+      // field at all — is documented in apply-control-repo-init.test.ts).
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT, WRITING_AGENT]);
+      const deps = baseDeps(reusedThreeAgentDeps(), manifestPath, {
+        cloneRepo: async () => {},
+        commitAndPush: async () => 'pushed',
+        repoInit: async () => ({ workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } }),
+      });
+
+      const result = await applyFleet(manifest, manifestPath, PRIOR_LOCK_THREE_AGENTS, deps);
+
+      expect(result.agents.map((a) => a.identity.status)).toEqual(['reused', 'reused', 'reused']);
+      expect(result.controlRepoInit.status).toBe('written');
+    });
+
+    it('DECISIVE (real GitHub label API) — the control repo receives a label POST for all three agents + the 4 status labels; idempotent re-run reports "existed", never a duplicate "created", and does not rewrite the workflow file', async () => {
+      // Same shape as "the decisive routability test" above (macf#920) —
+      // real repoInit()'s createLabel() hits a stubbed `fetch`, so this
+      // observes the ACTUAL label POSTs the control repo receives, not a
+      // proxy for them (assert-the-wrong-path.md: the agents-string and
+      // agent-config.json assertions in apply-control-repo-init.test.ts are
+      // strong proxies, but this is the only place in the suite that
+      // watches the real GitHub label API surface for the CONTROL repo
+      // specifically, and does so for a 3-agent manifest — the #920 test's
+      // fetch stub only ever exercises a 1-agent manifest).
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT, WRITING_AGENT]);
+      const originalFetch = globalThis.fetch;
+      const originalGhToken = process.env['GH_TOKEN'];
+      process.env['GH_TOKEN'] = 'ghs_control-repo-labels-test-token';
+      const controlLabelPosts: { name: string; auth: unknown }[] = [];
+      let runNumber = 1;
+      globalThis.fetch = (async (url: string, init?: RequestInit) => {
+        if (String(url) === 'https://api.github.com/repos/groundnuty/demo-fleet-control/labels' && init?.method === 'POST') {
+          const body = JSON.parse(String(init.body)) as { name: string };
+          controlLabelPosts.push({ name: body.name, auth: (init.headers as Record<string, string>)?.['Authorization'] });
+          // Run 1: every label is newly created (201). Run 2 (the
+          // idempotent re-run): every label already exists (422) —
+          // `createLabel()` maps 422 to 'exists', proving the re-run
+          // reports existed, never a silently-duplicated created.
+          return { status: runNumber === 1 ? 201 : 422 } as Response;
+        }
+        // Every OTHER repo's label POST (each agent's own — this test's
+        // assertions are scoped to the control repo) + any other call —
+        // inert 200.
+        return { status: 200, ok: true, json: async () => [] } as unknown as Response;
+      }) as typeof fetch;
+      try {
+        const deps = baseDeps(reusedThreeAgentDeps(), manifestPath);
+        const workflowPath = join(manifestPath, '..', '.github', 'workflows', 'agent-router.yml');
+
+        const first = await applyFleet(manifest, manifestPath, PRIOR_LOCK_THREE_AGENTS, deps);
+        expect(first.controlRepoInit.status).toBe('written');
+        if (first.controlRepoInit.status === 'written') {
+          expect(first.controlRepoInit.labels).toEqual({
+            status: 'ok',
+            created: expect.arrayContaining(['in-progress', 'in-review', 'blocked', 'agent-offline', 'code-agent', 'science-agent', 'writing-agent']),
+            existed: [],
+          });
+        }
+        expect(controlLabelPosts.map((p) => p.name).sort()).toEqual([
+          'agent-offline', 'blocked', 'code-agent', 'in-progress', 'in-review', 'science-agent', 'writing-agent',
+        ]);
+        for (const post of controlLabelPosts) expect(post.auth).toBe('Bearer ghs_control-repo-labels-test-token');
+        const workflowAfterFirst = readFileSync(workflowPath, 'utf-8');
+
+        controlLabelPosts.length = 0;
+        runNumber = 2;
+        const second = await applyFleet(manifest, manifestPath, PRIOR_LOCK_THREE_AGENTS, deps);
+        expect(second.controlRepoInit.status).toBe('written');
+        if (second.controlRepoInit.status === 'written') {
+          expect(second.controlRepoInit.labels).toEqual({
+            status: 'ok',
+            created: [],
+            existed: expect.arrayContaining(['in-progress', 'in-review', 'blocked', 'agent-offline', 'code-agent', 'science-agent', 'writing-agent']),
+          });
+        }
+        // Every label is POSTed again (repoInit doesn't cache — it always
+        // attempts the create call), but every one now maps to 'existed',
+        // never a second 'created' — the idempotency guarantee.
+        expect(controlLabelPosts.map((p) => p.name).sort()).toEqual([
+          'agent-offline', 'blocked', 'code-agent', 'in-progress', 'in-review', 'science-agent', 'writing-agent',
+        ]);
+        // The workflow file itself is untouched byte-for-byte on the
+        // re-run — writeFileSafe skips an existing file without --force
+        // (visible as "Skipping existing file" in stdout); this asserts
+        // the outcome, not just the log line.
+        expect(readFileSync(workflowPath, 'utf-8')).toBe(workflowAfterFirst);
+      } finally {
+        globalThis.fetch = originalFetch;
+        if (originalGhToken === undefined) delete process.env['GH_TOKEN'];
+        else process.env['GH_TOKEN'] = originalGhToken;
+      }
+    });
   });
 
   it('control repo existence UNCONFIRMABLE ("unknown") -> aborts the ENTIRE run as "failed", not silently treated as absent or ours', async () => {
@@ -2504,10 +2689,24 @@ trust:
           existed: [],
         });
       }
-      const postedLabelNames = labelPosts.map((p) => (p.body as { name: string }).name).sort();
+      // groundnuty/macf#1057 — the control-repo repo-init step now ALSO
+      // posts labels for this run's declared agents (here, the SAME single
+      // `code-agent` — a 1-agent manifest can't tell the two repos' posts
+      // apart by label NAME, only by which repo's `/labels` URL received
+      // them). Filter to the AGENT repo's own URL to preserve this test's
+      // original intent (the agent's OWN repo-init posted its full label
+      // set), then separately confirm the control repo's posts landed too.
+      const agentLabelPosts = labelPosts.filter((p) => p.url.includes('/repos/groundnuty/demo-code/'));
+      const controlLabelPosts = labelPosts.filter((p) => p.url.includes('/repos/groundnuty/demo-fleet-control/'));
+      const postedLabelNames = agentLabelPosts.map((p) => (p.body as { name: string }).name).sort();
       expect(postedLabelNames).toEqual(['agent-offline', 'blocked', 'code-agent', 'in-progress', 'in-review']);
-      // Every label POST authenticated with the SAME minted token — not a
-      // silently-empty/fallback one (the attribution-trap shape).
+      const controlLabelNames = controlLabelPosts.map((p) => (p.body as { name: string }).name).sort();
+      expect(controlLabelNames).toEqual(['agent-offline', 'blocked', 'code-agent', 'in-progress', 'in-review']);
+      expect(result.controlRepoInit.status).toBe('written');
+      if (result.controlRepoInit.status === 'written') expect(result.controlRepoInit.labels.status).toBe('ok');
+      // Every label POST (agent AND control repo) authenticated with the
+      // SAME minted token — not a silently-empty/fallback one (the
+      // attribution-trap shape).
       for (const post of labelPosts) expect(post.auth).toBe('Bearer ghs_e2e-decisive-test-token');
 
       // --- Gap 2: the fleet's repo can AUTHENTICATE as the router (routing-client identity exists) ---
