@@ -23,6 +23,7 @@ import { runBootstrapPlan } from './commands/bootstrap.js';
 import { runBootstrapApply } from './commands/bootstrap-apply.js';
 import { runBootstrapStatus } from './commands/bootstrap-status.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
+import { runRoutingE2e } from './commands/routing-e2e.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { runRestartSelfCommand } from './commands/restart-self.js';
 import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './commands/certs.js';
@@ -774,13 +775,35 @@ routing
     '+ SELF-SKIP (agent-config app_name == bot-login, #566), (3) registration ' +
     'FRESHNESS (registry instance_id == live /health), (4) MACF_CA_CERT present + ' +
     'parses (#563), (5) tmux_session <project>@<routing-label> convention. These prove the ' +
-    'PLUMBING, NOT end-to-end delivery (that is --e2e, a later increment). Exits ' +
-    'non-zero when DEGRADED.',
+    'PLUMBING, NOT end-to-end delivery. Exits non-zero when DEGRADED. Pass --e2e for the ' +
+    'CAPABILITY test instead: files a real issue on --target-repo, labels it there (the full ' +
+    'router path, not a direct channel-server POST), and polls for the recipient recording ' +
+    'delivery -- a RED result there needs no checklist of what to check, it just needs the ' +
+    'message to not arrive, and names the stage the chain stopped at.',
   )
   .option('--json', 'Emit the structured per-check result as JSON (DR-031 watchdog contract)', false)
   .option('--expected-pin <pin>', 'Expected macf-actions caller-pin (else the modal pin across the fleet)')
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .option('--e2e', 'Run the routing CAPABILITY probe instead of the static checks (requires --target-repo)', false)
+  .option('--target-repo <owner/repo>', 'The --e2e probe target: files + labels the probe issue on THIS repo')
+  .option('--target-label <label>', '--e2e: which routing label to probe (default: the target repo\'s sole configured label)')
+  .option('--e2e-timeout-sec <n>', '--e2e: how long to wait for the delivery receipt before giving up (default 180)', (v) => Number(v))
   .action(async (opts) => {
+    if (opts.e2e) {
+      if (!opts.targetRepo) {
+        console.error('--e2e requires --target-repo <owner/repo> (the repo the probe issue is filed + labeled on).');
+        process.exitCode = 1;
+        return;
+      }
+      const code = await runRoutingE2e(resolveProjectDir(opts.dir), {
+        json: opts.json,
+        targetRepo: opts.targetRepo,
+        targetLabel: opts.targetLabel,
+        timeoutSec: opts.e2eTimeoutSec,
+      });
+      process.exitCode = code;
+      return;
+    }
     const code = await runRoutingDoctor(resolveProjectDir(opts.dir), {
       json: opts.json,
       expectedPin: opts.expectedPin,
