@@ -36,6 +36,19 @@ command.
   `bootstrap` ships publicly for the first time here, so there are no prior
   released consumers — but anyone who hand-wrote a `fleet.yaml` against a
   pre-release build will hit this field name.
+- **`plan` and `apply` state the operator consent-click budget** up front, as two
+  independent counts — gate-1 "Create GitHub App" clicks and gate-2 install flows.
+  A role that only needs re-installing costs a gate-2 flow but no gate-1 click, so
+  a single doubled number would understate it. Honestly bounded: zero is the only
+  count reported as exact. (#1043)
+- **`deploy` and `apply` name the first-launch prompts** an operator may still have
+  to answer by hand — Claude Code's trust dialog, and the dev-channels confirmation
+  — and print the exact `tmux attach -t <project>@<routing-label>` command per
+  agent, read from the deployed workspace's real config so an `agent_name` that
+  differs from `routing_label` still renders correctly. (#1040)
+- **`apply` pauses for the operator before opening each consent gate.** A blocking
+  prompt rather than a timed sleep — a sleep can elapse unread just as easily as a
+  fast scroll can. `--yes` is unaffected and never hangs. (#1038)
 
 ### Security
 
@@ -72,6 +85,25 @@ command.
   delivers. (#854)
 - **Consent-gate URLs are now printed before the browser opens** and re-printed on
   timeout — a browser launch is an unverifiable side effect.
+- **A graceful exit never actually deregistered the agent**, so a clean shutdown
+  left a stale registry slot behind forever. Two independent defects in
+  `shutdown.ts`: a once-guard memoized a boolean and a stale default result rather
+  than the in-flight promise, so stdin `close` (which always follows `end`) got an
+  immediate `true` and its `process.exit(0)` beat the real registry delete's network
+  round trip; and `SIGHUP` was unhandled entirely. Diagnosed and verified with
+  real-subprocess and tmux-topology repros — the existing unit tests mocked
+  `process.exit`, which is precisely why they could not see it. (#1037)
+- **`apply` now un-archives every declared repo, not just the control repo**
+  (DR-043 Amendment K4, correcting Amendment G). `archive` archives the control repo
+  *and* every agent repo, but revival named only the control repo — so after
+  `archive` → `apply` the agent repos stayed read-only while `apply` reported
+  success. Un-archiving stays behind the same single approval, and a repo whose
+  state cannot be read is reported `unknown` rather than folded into `present`.
+  (#1036)
+- **SessionStart work-pickup fired on compact, resume, clear and fork**, not only on
+  a genuine session start, and reached at least one orchestrated worker session. The
+  hook now reads its own payload and requires `source` to be exactly `startup`,
+  failing closed when the trigger is absent or unparseable. (#1039)
 
 ## [0.2.56] — 2026-08-10
 
