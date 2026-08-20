@@ -867,9 +867,12 @@ describe('installStartupPickupHook (DR-026 / macf#768)', () => {
     expect(s.hooks.SessionStart).toHaveLength(1);
     expect(s.hooks.SessionStart[0].hooks[0].command).toBe(MACF_STARTUP_PICKUP_HOOK_COMMAND);
     expect(s.hooks.SessionStart[0].hooks[0].type).toBe('command');
-    // No matcher — SessionStart hooks are matcher-less, like the sibling
-    // channels-enabled / turn-receipt hooks.
-    expect(s.hooks.SessionStart[0].matcher).toBeUndefined();
+    // groundnuty/macf#930: `matcher: "startup"` — was matcher-less pre-#930
+    // (fired on every SessionStart source, incl. compact/resume/clear/fork).
+    // Defense-in-depth only; the script itself re-checks `source` on the
+    // payload, since Claude Code evaluates the matcher before invoking the
+    // command (see MACF_STARTUP_PICKUP_HOOK_COMMAND's doc comment).
+    expect(s.hooks.SessionStart[0].matcher).toBe('startup');
   });
 
   it('registers an explicit timeout comfortably above the script\'s own readiness-poll budget (macf#802)', () => {
@@ -1060,6 +1063,40 @@ describe('plugin hooks.json single-source (DR-039 Decision 2)', () => {
     const expected = pluginRootHookCommand('check-channel-alive.sh');
     expect(sessionStart).toContain(expected);
     expect(userPromptSubmit).toContain(expected);
+  });
+
+  // groundnuty/macf#930: every plugin SessionStart hook gets a DELIBERATE,
+  // documented source list — pinned here so a future edit can't silently
+  // drop a hook back to "all sources" (the issue's own acceptance
+  // criterion). Pre-#930 all 4 SessionStart entries below were
+  // matcher-less.
+  it('narrows the freshness-check + work-pickup-pointer + check-channel-alive.sh SessionStart entries to matcher "startup" (groundnuty/macf#930)', () => {
+    const parsed = readPluginHooksJson();
+    const sessionStart = parsed.hooks['SessionStart'] ?? [];
+
+    const freshnessEntry = sessionStart.find((e) =>
+      e.hooks.some((h) => h.type === 'command' && h.command?.includes('CLAUDE_PLUGIN_DATA')),
+    );
+    expect(freshnessEntry?.matcher).toBe('startup');
+
+    const pointerEntry = sessionStart.find((e) =>
+      e.hooks.some((h) => h.type === 'command' && h.command?.includes('/macf-issues')),
+    );
+    expect(pointerEntry?.matcher).toBe('startup');
+
+    const channelAliveEntry = sessionStart.find((e) =>
+      e.hooks.some((h) => h.command === pluginRootHookCommand('check-channel-alive.sh')),
+    );
+    expect(channelAliveEntry?.matcher).toBe('startup');
+  });
+
+  it('leaves check-framework-surface.sh matcher-less on SessionStart DELIBERATELY (groundnuty/macf#930 audit — sweep detection needs every resumption chance, not just startup)', () => {
+    const parsed = readPluginHooksJson();
+    const sessionStart = parsed.hooks['SessionStart'] ?? [];
+    const entry = sessionStart.find((e) =>
+      e.hooks.some((h) => h.command === pluginRootHookCommand('check-framework-surface.sh')),
+    );
+    expect(entry?.matcher).toBeUndefined();
   });
 
   it('does NOT register check-channels-enabled.sh, check-auditor-never-acts.sh, or emit-turn-receipt.sh (those stay hand-wired in settings.json)', () => {
