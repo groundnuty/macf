@@ -10,14 +10,17 @@
  * log, a poll timeout, or any internal error). Override: MACF_SKIP_CHANNELS_CHECK=1.
  *
  * The guard parses Claude Code's internal MCP-log layout under
- * ~/.cache/claude-cli-nodejs/<encoded-cwd>/mcp-logs-plugin-macf-agent-macf-agent/
- * <ts>.jsonl. These tests fake that layout under a temp HOME + temp workspace,
- * and pin the poll to 1 iteration (MACF_CHANNELS_POLL_ITERS=1) so the
- * inconclusive path doesn't burn the full ~12s.
+ * ~/.cache/claude-cli-nodejs/<encoded-cwd>/mcp-logs-*macf-agent/<ts>.jsonl —
+ * globbed rather than one fixed directory name, because that name has already
+ * changed twice (groundnuty/macf#1002 moved the mount from --plugin-dir to
+ * .mcp.json; #1004 is the fix for the guard still greping the OLD name after
+ * that move). These tests fake that layout under a temp HOME + temp
+ * workspace, and pin the poll to 1 iteration (MACF_CHANNELS_POLL_ITERS=1) so
+ * the inconclusive path doesn't burn the full ~12s.
  */
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
@@ -27,6 +30,15 @@ const HOOK_SCRIPT = join(findCliPackageRoot(), 'scripts', 'check-channels-enable
 const SKIP_DEBUG =
   'Channel notifications skipped: server plugin:macf-agent:macf-agent not in --channels list for this session';
 const OK_DEBUG = 'Successfully connected (transport: stdio) in 2927ms';
+
+// The three MCP-log directory names observed live (macf#1004): the legacy
+// --plugin-dir mount, an even older plugin-manifest naming, and the current
+// .mcp.json server:macf-agent mount (macf#1002 / DR-022 Amendment P). Default
+// fixture dir name stays the LEGACY one so every pre-existing test below is
+// unchanged; new tests exercise the other two explicitly.
+const LEGACY_PLUGIN_DIR_NAME = 'mcp-logs-plugin-macf-agent-macf-agent';
+const OLDER_PLUGIN_DIR_NAME = 'mcp-logs-plugin-macf-channel-server-macf-agent';
+const CURRENT_MCP_JSON_DIR_NAME = 'mcp-logs-macf-agent';
 
 /** Encode a path the way Claude Code names its cache dir: `/` and `.` → `-`. */
 function encodeCwd(p: string): string {
@@ -43,6 +55,24 @@ function runHook(opts: {
   /** Lines to write into the newest jsonl log (each becomes one JSONL object).
    *  `undefined` → don't create the log dir at all. */
   readonly logDebugLines?: readonly string[];
+  /** MCP-log directory name to write `logDebugLines` under (macf#1004 —
+   *  the guard now globs `mcp-logs-*macf-agent` instead of one fixed name).
+   *  Default: the legacy --plugin-dir mount name, so every test that doesn't
+   *  care about the specific shape is unaffected. */
+  readonly logDirName?: string;
+  /** Additional MCP-log directories to create alongside the primary one
+   *  (e.g. a stale legacy-mount dir coexisting with the current mount) —
+   *  proves the guard picks the globally-newest log across ALL matching
+   *  directories, not just whichever one `logDirName` names. Each entry's
+   *  file mtime is set to `mtimeOffsetSecs` seconds before "now" (default
+   *  -3600, i.e. an hour older than the primary log) so cross-directory
+   *  newest-wins ordering is deterministic regardless of write/filesystem
+   *  mtime-resolution timing — never inferred from write order alone. */
+  readonly extraLogDirs?: readonly {
+    readonly name: string;
+    readonly lines: readonly string[];
+    readonly mtimeOffsetSecs?: number;
+  }[];
   /** Override env (e.g. MACF_SKIP_CHANNELS_CHECK). */
   readonly env?: Record<string, string | undefined>;
   /** Stdin payload (defaults to a SessionStart-shaped JSON object). */
@@ -69,20 +99,35 @@ function runHook(opts: {
   const fakeHome = mkdtempSync(join(tmpdir(), 'macf-chan-home-'));
   const workspace = mkdtempSync(join(tmpdir(), 'macf-chan-ws-'));
 
-  if (opts.logDebugLines !== undefined) {
-    const logDir = join(
-      fakeHome,
-      '.cache',
-      'claude-cli-nodejs',
-      encodeCwd(workspace),
-      'mcp-logs-plugin-macf-agent-macf-agent',
-    );
+  const cacheRoot = join(fakeHome, '.cache', 'claude-cli-nodejs', encodeCwd(workspace));
+
+  /** Write one MCP-log directory fixture (`debug` line each, one jsonl file),
+   *  with an explicit mtime (seconds offset from "now") so cross-directory
+   *  newest-wins ordering never depends on write-order/filesystem timing. */
+  const writeMcpLogDir = (dirName: string, lines: readonly string[], filename: string, mtimeOffsetSecs: number): void => {
+    const logDir = join(cacheRoot, dirName);
     mkdirSync(logDir, { recursive: true });
-    const lines = opts.logDebugLines
-      .map((d) => JSON.stringify({ debug: d, timestamp: '2026-06-27T15:58:10.141Z' }))
-      .join('\n');
-    writeFileSync(join(logDir, '2026-06-27T15-58-04-000Z.jsonl'), lines + '\n');
+    const body = lines.map((d) => JSON.stringify({ debug: d, timestamp: '2026-06-27T15:58:10.141Z' })).join('\n');
+    const filePath = join(logDir, filename);
+    writeFileSync(filePath, body + '\n');
+    const mtime = new Date(Date.now() + mtimeOffsetSecs * 1000);
+    utimesSync(filePath, mtime, mtime);
+  };
+
+  if (opts.logDebugLines !== undefined) {
+    writeMcpLogDir(opts.logDirName ?? LEGACY_PLUGIN_DIR_NAME, opts.logDebugLines, '2026-06-27T15-58-04-000Z.jsonl', 0);
   }
+
+  // Each extra dir gets its own filename so the fixtures never collide on
+  // disk even when several are written in the same test.
+  (opts.extraLogDirs ?? []).forEach((extra, i) => {
+    writeMcpLogDir(
+      extra.name,
+      extra.lines,
+      `2026-06-27T15-58-0${5 + i}-000Z.jsonl`,
+      extra.mtimeOffsetSecs ?? -3600,
+    );
+  });
 
   let channelLogPath: string | undefined;
   if (opts.channelLogLines !== undefined) {
@@ -210,11 +255,23 @@ describe('check-channels-enabled.sh (SessionStart guard)', () => {
     });
   });
 
-  describe('(c) fail-open paths → silent exit 0', () => {
-    it('no log dir at all → silent exit 0', () => {
-      const r = runHook({}); // logDebugLines undefined → dir not created
+  describe('(c) fail-open paths → exit 0 (silent OR honest-unknown, never blocking)', () => {
+    // macf#1004 / assert-the-wrong-path.md: "no candidate directory matched"
+    // and "checked, found clean" (test (b) above) were IDENTICAL observable
+    // outcomes before this fix — both silent, exit 0. That is precisely how
+    // the guard's own log-path regression went undetected: pointed at a
+    // renamed directory, it "ran, passed, and detected nothing." So this is
+    // no longer silent — it must say SOMETHING that a clean pass does not.
+    it('no log dir at all → reports "could not verify" (unknown), NOT the silence a clean pass produces', () => {
+      const r = runHook({}); // logDebugLines undefined → no directory created at all
       expect(r.status).toBe(0);
-      expect(r.stdout.trim()).toBe('');
+      expect(r.stdout.trim()).not.toBe(''); // the decisive negative: (b)'s clean pass IS empty
+      expect(r.stdout).toContain('Could not verify');
+      expect(r.stdout).toContain('not yet checked');
+      expect(r.stdout).toContain('macf#1004');
+      // Must stay non-alarming — this is "unknown", not "you are deaf".
+      expect(r.stdout).not.toContain('UNCONFIRMED');
+      expect(r.stdout).not.toContain('you are NOT deaf to routing');
     });
 
     it('log present but inconclusive (no marker) → silent exit 0 (poll times out)', () => {
@@ -303,6 +360,84 @@ describe('check-channels-enabled.sh (SessionStart guard)', () => {
       expect(r.status).toBe(0);
       expect(r.stdout).toContain('UNCONFIRMED');
       expect(r.stdout).not.toContain('could not identify');
+    });
+  });
+
+  describe('(g) macf#1004 — mount-name-agnostic log-dir discovery', () => {
+    // THE decisive regression test. Before macf#1004, the guard's LOG_DIR was
+    // hardcoded to the LEGACY --plugin-dir mount name. On a workspace whose
+    // channel-server is mounted the CURRENT way (.mcp.json server:macf-agent,
+    // macf#1002), that hardcoded path never existed — the guard hit its
+    // `[ -d "$LOG_DIR" ] || exit 0` fail-open branch and stayed silent, EVEN
+    // THOUGH native channel-push was genuinely off and no tmux-wake evidence
+    // existed. That is a silent PASS on a genuinely broken session — it would
+    // pass here too if the code still had the old hardcoded path, because the
+    // fixture below deliberately writes ONLY the current-mount directory name.
+    it('current .mcp.json-mount directory name is CHECKED, not silently skipped (the regression itself)', () => {
+      const r = runHook({
+        logDirName: CURRENT_MCP_JSON_DIR_NAME,
+        logDebugLines: [SKIP_DEBUG],
+        // No channelLogLines → tmux-wake fallback evidence unavailable either
+        // → the loud, checked-and-broken path is the only honest outcome.
+      });
+      expect(r.status).toBe(0);
+      // The regression's fingerprint: a broken guard would produce '' here
+      // (identical to test (b)'s clean pass) — see assert-the-wrong-path.md.
+      expect(r.stdout.trim()).not.toBe('');
+      expect(r.stdout).toContain('UNCONFIRMED');
+      expect(r.stdout).not.toContain('Could not verify'); // this is CHECKED, not "unknown"
+    });
+
+    it('current .mcp.json-mount directory name, channels genuinely ON → still a clean, silent pass', () => {
+      const r = runHook({ logDirName: CURRENT_MCP_JSON_DIR_NAME, logDebugLines: [OK_DEBUG] });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('');
+    });
+
+    it('legacy --plugin-dir mount name still works unchanged (no regression on old fleets)', () => {
+      const r = runHook({ logDirName: LEGACY_PLUGIN_DIR_NAME, logDebugLines: [SKIP_DEBUG] });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('UNCONFIRMED');
+    });
+
+    it('the even-older plugin-manifest naming also works (a 3rd observed live shape)', () => {
+      const r = runHook({ logDirName: OLDER_PLUGIN_DIR_NAME, logDebugLines: [SKIP_DEBUG] });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('UNCONFIRMED');
+    });
+
+    it('a directory name NOT ending in "macf-agent" is never matched (glob is scoped, not `mcp-logs-*`)', () => {
+      // Guards against widening the glob so far it picks up an unrelated MCP
+      // server's log (which would ALSO contain a generic "Successfully
+      // connected" line) and reports a false "on" for macf-agent itself.
+      const r = runHook({ logDirName: 'mcp-logs-some-other-server', logDebugLines: [OK_DEBUG] });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('Could not verify'); // never matched → honest unknown, not a false "on"
+    });
+
+    it('stale legacy-mount log coexists with a fresher current-mount log → the CURRENT one wins', () => {
+      // Primary (current mount) is "now"; the legacy dir's fixture is
+      // deliberately backdated (default -3600s) so newest-across-directories
+      // selection is unambiguous rather than relying on write-order timing.
+      const r = runHook({
+        logDirName: CURRENT_MCP_JSON_DIR_NAME,
+        logDebugLines: [OK_DEBUG],
+        extraLogDirs: [{ name: LEGACY_PLUGIN_DIR_NAME, lines: [SKIP_DEBUG] }],
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe(''); // reads the fresher ON log, not the stale OFF one
+    });
+
+    it('stale current-mount log coexists with a fresher legacy-mount log → the LEGACY (newer) one wins', () => {
+      // Inverts the previous case: proves selection is genuinely by mtime
+      // across directories, not by any directory-name preference order.
+      const r = runHook({
+        logDirName: CURRENT_MCP_JSON_DIR_NAME,
+        logDebugLines: [OK_DEBUG],
+        extraLogDirs: [{ name: LEGACY_PLUGIN_DIR_NAME, lines: [SKIP_DEBUG], mtimeOffsetSecs: 3600 }],
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('UNCONFIRMED');
     });
   });
 
