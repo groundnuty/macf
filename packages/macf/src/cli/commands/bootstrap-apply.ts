@@ -675,17 +675,46 @@ function realWaitForOperatorBeat(assumeYes: boolean): (role: string, gateLabel: 
   if (assumeYes) {
     return () => Promise.resolve();
   }
-  return (role: string, gateLabel: string) =>
-    new Promise((resolve) => {
-      process.stderr.write(`Role "${role}": press Enter to open the browser for ${gateLabel}… `);
-      const rl = createInterface({ input: process.stdin, output: process.stderr });
-      const done = (): void => {
-        rl.close();
-        resolve();
-      };
-      rl.once('close', done);
-      rl.question('', done);
-    });
+  return (role: string, gateLabel: string) => blockingEnterPrompt(`Role "${role}": press Enter to open the browser for ${gateLabel}… `);
+}
+
+/**
+ * Real `AgentApplyDeps.waitForOperatorFix` (groundnuty/macf#1063) — the
+ * SAME blocking-"press Enter"-not-a-sleep primitive `realWaitForOperatorBeat`
+ * already establishes (see that function's own doc for why: a fixed sleep
+ * can elapse unread; a prompt cannot), reused here for a DIFFERENT moment —
+ * after the retry browser tab opens, before `apply` re-checks. Distinct
+ * wording ("press Enter once you've fixed it," not "press Enter to open the
+ * browser") because the browser is ALREADY open by the time this runs; see
+ * `AgentApplyDeps.waitForOperatorFix`'s own doc for why this exists at all
+ * (the App is already installed on a retry, so `waitForAppInstallation`'s
+ * poll would otherwise resolve — and re-validate — on its very first check,
+ * before the operator could possibly have acted).
+ *
+ * Same `--yes` never-hangs contract as `realWaitForOperatorBeat`: moot in
+ * practice, since `allowInstallRetry` (wired from the SAME `assumeYes`
+ * immediately below) is never `true` under `--yes` either, so a retry never
+ * happens for this closure to be called on.
+ */
+function realWaitForOperatorFix(assumeYes: boolean): (role: string, gateLabel: string) => Promise<void> {
+  if (assumeYes) {
+    return () => Promise.resolve();
+  }
+  return (role: string, gateLabel: string) => blockingEnterPrompt(`Role "${role}": press Enter once you've fixed it on GitHub for ${gateLabel}… `);
+}
+
+/** Shared blocking-"press Enter" mechanics for both operator-pause prompts above — same `readline` + stderr idiom, varying only the printed prompt text. See `realWaitForOperatorBeat`'s doc for why `close` is a defence-in-depth branch, not the primary resolve path. */
+function blockingEnterPrompt(promptText: string): Promise<void> {
+  return new Promise((resolve) => {
+    process.stderr.write(promptText);
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    const done = (): void => {
+      rl.close();
+      resolve();
+    };
+    rl.once('close', done);
+    rl.question('', done);
+  });
 }
 
 /** Real y/N prompt on stderr (stdout stays clean for a `--json` render). */
@@ -936,6 +965,11 @@ export function resolveMutateDeps(
   // own doc for why the branch lives here (closure SELECTION) rather than
   // inside a single closure (runtime branch).
   const waitForOperatorBeat = realWaitForOperatorBeat(assumeYes === true);
+  // groundnuty/macf#1063 — resolved ONCE per run, same reasoning as
+  // `waitForOperatorBeat` immediately above (and paired with it: both derive
+  // from the SAME `assumeYes`, both closure-SELECTED here rather than
+  // runtime-branched inside `buildAgentDeps`).
+  const waitForOperatorFix = realWaitForOperatorFix(assumeYes === true);
 
   return {
     // `writeRecoveryArtifact` is deliberately absent here — `apply-fleet.ts`
@@ -943,6 +977,16 @@ export function resolveMutateDeps(
     // its module doc's "Recovery-artifact lifecycle" section).
     buildAgentDeps: (log: (line: string) => void) => ({
       ...realAgentApplyDeps(realOpenUrl, log, waitForOperatorBeat),
+      // groundnuty/macf#1063 — a recoverable consent-gate-2 rejection
+      // (missing-repo install, etc.) re-opens the install page ONLY on an
+      // interactive run. `--yes` verifies once, refuses, and exits — exactly
+      // as before this issue (see `AgentApplyDeps.allowInstallRetry`'s doc).
+      // `waitForOperatorFix` is ALWAYS paired with `allowInstallRetry` —
+      // never one without the other — so a retry that DOES fire always has
+      // its genuine operator-wait wired too (see that field's own doc for
+      // why a retry without it would burn its whole budget in milliseconds).
+      allowInstallRetry: assumeYes !== true,
+      waitForOperatorFix,
       ...(resolveKeyPath !== undefined ? { resolveKeyPath } : {}),
     }),
     repoInitDeps,

@@ -240,6 +240,32 @@ export async function confirmBeforeCreateGuard(
 
 // --- Per-agent identity flow ---
 
+/**
+ * What `validateInstall`/`validateReuse` may return on rejection
+ * (groundnuty/macf#1063 widens this from a bare `string`).
+ *
+ * A bare `string` — every pre-#1063 caller, e.g. `apply-runner-ops.ts::
+ * validateRunnerOpsInstall` — is used AS-IS for both the technical
+ * `AgentApplyOutcome.reason`/`Gate2Outcome.reason` AND, because there is no
+ * cleaner alternative supplied, the interactive retry dialogue too.
+ *
+ * `{ message, retryInstruction }` lets a caller supply a SEPARATE,
+ * plain-language sentence for the interactive "here's what to click"
+ * dialogue (macf#1063 requirement 2 — "say exactly what to click," never a
+ * 404/HTTP-status/issue-number sentence) while `message` still carries the
+ * full technical detail into `reason` — the CLI's `--json`/log surface,
+ * unchanged from #1012's own accepted text. `retryInstruction` omitted (or
+ * a bare-string rejection) falls back to `message` for the dialogue too —
+ * preserves every pre-#1063 caller's behavior exactly (see
+ * {@link rejectionParts}).
+ */
+export type InstallRejection = string | { readonly message: string; readonly retryInstruction?: string };
+
+/** Normalizes an {@link InstallRejection} to its two logical parts — the ONE place both `runGate2` and `applyIdentity`'s reuse-confirmed branch extract `message`/`retryInstruction`, so the two never drift on how a bare string degrades. */
+function rejectionParts(rejection: InstallRejection): { readonly message: string; readonly retryInstruction?: string } {
+  return typeof rejection === 'string' ? { message: rejection } : rejection;
+}
+
 export interface AgentApplyDeps {
   readonly startManifestFlow: (opts: StartManifestFlowOptions) => Promise<ManifestFlowHandles>;
   /**
@@ -350,7 +376,7 @@ export interface AgentApplyDeps {
    * safety net" posture the rest of this module's gate-2 failures already
    * rely on (module doc's "gate 1→2 window" section).
    */
-  readonly validateInstall?: (install: ConfirmedInstall, keyPath: string) => string | undefined | Promise<string | undefined>;
+  readonly validateInstall?: (install: ConfirmedInstall, keyPath: string) => InstallRejection | undefined | Promise<InstallRejection | undefined>;
   /**
    * Post-REUSE validation (groundnuty/macf#1012) — SEPARATE from
    * {@link validateInstall} on purpose, checked in
@@ -372,7 +398,7 @@ export interface AgentApplyDeps {
    * and the runner-ops today) means reuse is never re-validated — preserves
    * pre-#1012 behavior exactly.
    */
-  readonly validateReuse?: (install: ConfirmedInstall, keyPath: string) => string | undefined | Promise<string | undefined>;
+  readonly validateReuse?: (install: ConfirmedInstall, keyPath: string) => InstallRejection | undefined | Promise<InstallRejection | undefined>;
   /**
    * Pre-flight App-NAME-collision check (groundnuty/macf#967 Defect 2) — run
    * ONLY on the `decision.action === 'create'` path (NO `fleet.lock` entry
@@ -392,6 +418,66 @@ export interface AgentApplyDeps {
    * reference — `manifest.owner` is already in scope at the call site.
    */
   readonly checkAppNameCollision?: (owner: FleetManifest['owner'], appSlug: string) => Promise<Presence>;
+  /**
+   * Whether a RECOVERABLE consent-gate-2 rejection (a `validateInstall` /
+   * `validateReuse` rejection — see those fields' docs) re-opens the SAME
+   * install page and re-checks, instead of failing on the first rejection
+   * (groundnuty/macf#1063 — the operator's own words: *"it has to have a
+   * verify step, and then report to the user that he made a mistake and
+   * tell him to redo it, and present him with the dialogue again"*).
+   * Bounded to {@link MAX_GATE2_REOPEN_ATTEMPTS} re-opens, then fails with
+   * the full explanation — see {@link retryRecoverableGate2Rejection}.
+   *
+   * **Recoverable vs not (macf#1063 requirement 4) is decided structurally,
+   * not by inspecting the rejection message.** By the time `validateInstall`
+   * / `validateReuse` is ever CALLED, gate 1 has already succeeded (or an
+   * existing install has already been CONFIRMED live) — the App, its key,
+   * and the fact that some install exists are already good. A rejection
+   * from one of those two hooks is therefore, by construction, an
+   * install-SCOPE problem only (missing repo, "All repositories" instead of
+   * "Only select") — fixable by revisiting the SAME page. A wrong App, a
+   * revoked key, or a non-200/404 read failure never reach this flag at
+   * all: those resolve to `unconfirmable` / `skip-unverified` / `drift` /
+   * a gate-1 failure, all BEFORE either hook is ever called — untouched by
+   * this retry, exactly as before #1063.
+   *
+   * **Only ever `true` for an INTERACTIVE run.** `bootstrap-apply.ts`'s
+   * production wiring derives it from the SAME `assumeYes` that already
+   * gates `waitForOperatorBeat`'s prompt-vs-no-op split (`assumeYes !==
+   * true`) — a closure-SELECTION at `resolveMutateDeps` call time, never a
+   * runtime branch inside a shared closure (mirrors `realWaitForOperatorBeat`'s
+   * own doc on why that split lives there). An unattended `--yes` run must
+   * verify once, refuse, and exit — EXACTLY as before this issue — never
+   * reopen a browser with nobody there to click it (macf#1038's same
+   * constraint). `undefined`/omitted (every pre-#1063 caller/test, and
+   * every `--yes` run) preserves the exact pre-#1063 behavior: one check,
+   * then fail.
+   */
+  readonly allowInstallRetry?: boolean;
+  /**
+   * Blocks a gate-2 RETRY (never the first, normal attempt) between the
+   * browser opening and the re-check that follows (groundnuty/macf#1063) —
+   * the operator's own genuine window to go fix the install and come back,
+   * distinct from {@link waitForOperatorBeat} (which only guarantees the
+   * INSTRUCTIONS were read before the browser took focus, not that the fix
+   * was made). Needed because on a retry the App is ALREADY installed —
+   * that is WHY the rejection was recoverable — so `waitForAppInstallation`'s
+   * poll resolves on its very first check with no wait at all; without this
+   * hook, `validate` would re-run before the operator could possibly have
+   * acted, burning the whole retry budget in milliseconds (see
+   * `runGate2WithInterstitial`'s `postOpenWait` doc for the mechanics).
+   *
+   * Same closure-SELECTION-not-runtime-branch + never-hangs-under-`--yes`
+   * contract as `waitForOperatorBeat` (`bootstrap-apply.ts`'s production
+   * wiring pairs the two, both derived from the SAME `assumeYes`) — moot
+   * under `--yes` in practice, since `allowInstallRetry` is never `true`
+   * there either, so this is never even called. `undefined`/omitted
+   * (every pre-#1063 caller/test) is a safe no-op — `runGate2WithInterstitial`
+   * only calls it when `retryRecoverableGate2Rejection` explicitly supplies
+   * `postOpenWait`, and that closure treats a missing hook as "proceed
+   * immediately" rather than hanging.
+   */
+  readonly waitForOperatorFix?: (role: string, gateLabel: string) => Promise<void>;
 }
 
 /**
@@ -649,8 +735,48 @@ export async function applyIdentity(
     // touching `runGate2` again.
     const rejection = await deps.validateReuse?.(decision.install, decision.keyPath);
     if (rejection !== undefined) {
-      deps.log(`Role "${role}": REFUSED on reuse — ${rejection}`);
-      return { role, status: 'failed', reason: `existing install re-verification rejected: ${rejection}` };
+      const { message, retryInstruction } = rejectionParts(rejection);
+      deps.log(`Role "${role}": REFUSED on reuse — ${message}`);
+      // groundnuty/macf#1063 — the ONE edge back to the gate this issue adds.
+      // Pre-#1063 this branch `return`ed here unconditionally (the module
+      // doc's own words: "never touching `runGate2` again") — a role that
+      // was ALREADY provisioned, re-confirmed live on THIS run, but whose
+      // install scope has drifted (or was wrong from the start) had no path
+      // back to consent gate 2 short of a full manual re-provision. Retrying
+      // re-runs the SAME gate-2 UX (`runGate2WithInterstitial`, never a
+      // second gate path) with `deps.validateReuse` itself as the
+      // re-check — not `validateInstall` — so a caller that wires the two
+      // hooks differently (today none do; `apply-fleet.ts` wires both to the
+      // SAME closure) still gets re-verified against the check that
+      // actually rejected it.
+      const retried = await retryRecoverableGate2Rejection(
+        role,
+        decision.install.appId,
+        decision.keyPath,
+        guardExpected,
+        handle,
+        appInstallationUrl(handle),
+        repos,
+        whyText,
+        deps,
+        {
+          role,
+          status: 'failed',
+          reason: `existing install re-verification rejected: ${message}`,
+          recoverable: true,
+          ...(retryInstruction !== undefined ? { retryInstruction } : {}),
+        },
+        deps.validateReuse,
+      );
+      if (retried.status === 'resumed-install') {
+        // Nothing was minted this run (no gate 1, no new credential) —
+        // 'reused' is the honest status for "the install is confirmed good
+        // NOW," matching what this branch would have reported had the
+        // operator's FIRST click already been correct.
+        deps.log(`Role "${role}": install corrected on retry (app_id ${decision.install.appId}) — treated as reused.`);
+        return { role, status: 'reused', appId: decision.install.appId, installId: retried.installId };
+      }
+      return { role, status: 'failed', reason: retried.reason };
     }
     deps.log(`Role "${role}": App + install already confirmed live (app_id ${decision.install.appId}) — nothing to do.`);
     return { role, status: 'reused', appId: decision.install.appId, installId: decision.install.installId };
@@ -670,11 +796,18 @@ export async function applyIdentity(
     // the CREATE path below, which writes its own scratch PEM and owns its
     // cleanup).
     deps.log(`Role "${role}": App exists (app_id ${decision.appId}) with zero installs — resuming at consent gate 2.`);
-    return runGate2WithInterstitial(role, decision.appId, decision.keyPath, guardExpected, handle, appInstallationUrl(handle), repos, whyText, deps, {
+    const resumeCaveat = {
       caveat:
         '(URL predicted from the fleet/role naming convention — no GitHub-confirmed slug is available on this ' +
         'path; if it 404s, find the App via Settings → Developer settings → GitHub Apps instead.)',
-    });
+    };
+    const firstAttempt = await runGate2WithInterstitial(role, decision.appId, decision.keyPath, guardExpected, handle, appInstallationUrl(handle), repos, whyText, deps, resumeCaveat);
+    // groundnuty/macf#1063 — no-op unless `firstAttempt` is a recoverable
+    // `validateInstall` rejection AND `deps.allowInstallRetry` is set (see
+    // `retryRecoverableGate2Rejection`'s doc); every pre-#1063 outcome shape
+    // (success, a `waitForAppInstallation` throw, an unwired validateInstall)
+    // returns `firstAttempt` unchanged on the FIRST loop check.
+    return retryRecoverableGate2Rejection(role, decision.appId, decision.keyPath, guardExpected, handle, appInstallationUrl(handle), repos, whyText, deps, firstAttempt);
   }
 
   // macf#988 (DR-043 Amendment B consume side) — checked BEFORE either the
@@ -829,7 +962,14 @@ async function finishGate2FromCredentials(
   const gate2Expected: ExpectedIdentity = { appSlug: creds.slug, accountLogin: manifest.owner.account };
   const pemPath = writeScratchPem(role, creds.pem);
   try {
-    const outcome = await runGate2WithInterstitial(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, {});
+    const firstAttempt = await runGate2WithInterstitial(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, {});
+    // groundnuty/macf#1063 — the SAME recoverable-rejection retry the
+    // resume-install path gets (see that call site's doc); a no-op unless
+    // `firstAttempt` is a recoverable `validateInstall` rejection AND
+    // `deps.allowInstallRetry` is set. `pemPath` stays alive across every
+    // retry — it's cleaned up once, in this function's own `finally`, only
+    // after the LAST attempt returns.
+    const outcome = await retryRecoverableGate2Rejection(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, firstAttempt);
     if (outcome.status === 'failed') {
       // Gate 1 succeeded but gate 2 didn't — see the module doc's "gate
       // 1→2 window" section. The App EXISTS on GitHub; give the operator a
@@ -890,18 +1030,49 @@ async function writeRecoveryArtifactOrFail(role: string, creds: AppCredentials, 
   }
 }
 
-/** The only two shapes `runGate2` itself produces — narrower than the full {@link AgentApplyOutcome} union so callers can narrow on `status === 'failed'` without a cast. */
+/**
+ * The only two shapes `runGate2` itself produces — narrower than the full
+ * {@link AgentApplyOutcome} union so callers can narrow on `status ===
+ * 'failed'` without a cast. `recoverable` (groundnuty/macf#1063) is `true`
+ * ONLY on the `validateInstall`/`validateReuse`-rejection branch of
+ * {@link runGate2} — never on a `waitForAppInstallation` throw (a poll
+ * timeout, a JWT/network failure) — see `AgentApplyDeps.allowInstallRetry`'s
+ * doc for why that specific branch, and only that one, is treated as
+ * fixable by revisiting the SAME install page.
+ */
 type Gate2Outcome =
   | { readonly role: string; readonly status: 'resumed-install'; readonly appId: string; readonly installId: string }
-  | { readonly role: string; readonly status: 'failed'; readonly reason: string };
+  | {
+      readonly role: string;
+      readonly status: 'failed';
+      readonly reason: string;
+      readonly recoverable?: boolean;
+      /** The plain-language dialogue text (groundnuty/macf#1063) — see {@link InstallRejection}'s doc. Present only when the rejecting hook supplied one; the retry dialogue falls back to `reason` otherwise. */
+      readonly retryInstruction?: string;
+    };
 
-/** Runs the gate-2 poll. Cleanup of `keyPath` (when it's a scratch file this module owns) is the CALLER's job — see call sites. */
+/** The hook shape shared by `validateInstall`/`validateReuse` — {@link runGate2}'s `validate` param is typed against this rather than either field name so it can stand in for either. */
+type ValidateInstallHook = (install: ConfirmedInstall, keyPath: string) => InstallRejection | undefined | Promise<InstallRejection | undefined>;
+
+/**
+ * Runs the gate-2 poll. Cleanup of `keyPath` (when it's a scratch file this
+ * module owns) is the CALLER's job — see call sites.
+ *
+ * `validate` (groundnuty/macf#1063) defaults to `deps.validateInstall` —
+ * every pre-#1063 call site omits it and gets EXACTLY the prior behavior.
+ * {@link retryRecoverableGate2Rejection}'s reuse-confirmed retry passes
+ * `deps.validateReuse` explicitly instead, so a re-check after reopening the
+ * page re-runs the SAME hook that rejected in the first place, never
+ * silently substituting `validateInstall` for a caller that (today,
+ * theoretically) wires the two differently.
+ */
 async function runGate2(
   role: string,
   appId: string,
   keyPath: string,
   expected: ExpectedIdentity,
   deps: AgentApplyDeps,
+  validate: ValidateInstallHook | undefined = deps.validateInstall,
 ): Promise<Gate2Outcome> {
   try {
     const install = await deps.waitForAppInstallation({
@@ -926,9 +1097,20 @@ async function runGate2(
     // the registry repo isn't reachable by this install). `await`ed
     // unconditionally: `validateInstall` may return sync or async (see its
     // doc), and `await` on a plain value resolves immediately.
-    const rejection = await deps.validateInstall?.(install, keyPath);
+    const rejection = await validate?.(install, keyPath);
     if (rejection !== undefined) {
-      return { role, status: 'failed', reason: `consent gate 2 (install) rejected: ${rejection}` };
+      // groundnuty/macf#1063 — `recoverable: true` ONLY here: the App, its
+      // key, and a live install are already confirmed good by this point;
+      // what's wrong is scoped to install SCOPE, fixable by revisiting the
+      // SAME page (see `AgentApplyDeps.allowInstallRetry`'s doc).
+      const { message, retryInstruction } = rejectionParts(rejection);
+      return {
+        role,
+        status: 'failed',
+        reason: `consent gate 2 (install) rejected: ${message}`,
+        recoverable: true,
+        ...(retryInstruction !== undefined ? { retryInstruction } : {}),
+      };
     }
     deps.log(`Role "${role}": install confirmed (install_id ${install.installId}).`);
     return { role, status: 'resumed-install', appId, installId: install.installId };
@@ -990,6 +1172,14 @@ async function startInterstitialOrFallback(deps: AgentApplyDeps, role: string, o
   }
 }
 
+/**
+ * `opts.instructionLines`/`waitLabel`/`gateLabelSuffix` (groundnuty/macf#1063)
+ * let {@link retryRecoverableGate2Rejection} drive a REOPEN of this exact
+ * function with retry-specific wording, without a second gate
+ * implementation — every pre-#1063 call site omits all three and gets the
+ * original hard-coded "choose Only select repositories" instructions,
+ * `'Install'` wait-label, and un-suffixed gate label, byte-identical.
+ */
 async function runGate2WithInterstitial(
   role: string,
   appId: string,
@@ -1000,7 +1190,28 @@ async function runGate2WithInterstitial(
   repos: readonly string[],
   whyText: string,
   deps: AgentApplyDeps,
-  opts: { readonly caveat?: string },
+  opts: {
+    readonly caveat?: string;
+    readonly instructionLines?: readonly string[];
+    readonly waitLabel?: string;
+    readonly gateLabelSuffix?: string;
+    /**
+     * Awaited AFTER the browser opens and BEFORE `runGate2` polls/validates
+     * (groundnuty/macf#1063 — the operator needs a genuine window to act,
+     * not merely to read). Every pre-#1063 call site (the FIRST, normal
+     * gate-2 attempt) omits this: on that path `runGate2`'s own
+     * `waitForAppInstallation` poll already blocks for real (the App isn't
+     * installed yet, so the poll waits until it is). {@link retryRecoverableGate2Rejection}
+     * supplies it ONLY on a reopen — there, the App is ALREADY installed
+     * (that's WHY the rejection was recoverable), so `waitForAppInstallation`
+     * would resolve on its very FIRST poll with no wait at all; without this
+     * hook, `validate` would re-run before the operator had any chance to
+     * act, burning the whole retry budget in milliseconds. See
+     * `AgentApplyDeps.waitForOperatorFix`'s doc for the production wiring.
+     */
+    readonly postOpenWait?: () => Promise<void>;
+  },
+  validate?: ValidateInstallHook,
 ): Promise<Gate2Outcome> {
   const page = await startInterstitialOrFallback(deps, role, {
     role,
@@ -1015,17 +1226,25 @@ async function runGate2WithInterstitial(
     gateTotal: GATE_TOTAL,
   });
   try {
-    await announceAndOpenGate(deps, role, `consent gate ${String(GATE_TOTAL)} of ${String(GATE_TOTAL)} (App install page)`, page.url, 'Install', {
-      fatal: false,
-      caveat: opts.caveat,
-      instructionLines: [
-        'on the page that opens, choose "Only select repositories" — NOT "All repositories".',
-        `select exactly: ${repos.length > 0 ? repos.join(', ') : '(no repos declared in the fleet manifest — verify before installing)'}`,
-        whyText,
-        `GitHub's install page: ${installUrl}`,
-      ],
-    });
-    return await runGate2(role, appId, keyPath, expected, deps);
+    await announceAndOpenGate(
+      deps,
+      role,
+      `consent gate ${String(GATE_TOTAL)} of ${String(GATE_TOTAL)} (App install page)${opts.gateLabelSuffix ?? ''}`,
+      page.url,
+      opts.waitLabel ?? 'Install',
+      {
+        fatal: false,
+        caveat: opts.caveat,
+        instructionLines: opts.instructionLines ?? [
+          'on the page that opens, choose "Only select repositories" — NOT "All repositories".',
+          `select exactly: ${repos.length > 0 ? repos.join(', ') : '(no repos declared in the fleet manifest — verify before installing)'}`,
+          whyText,
+          `GitHub's install page: ${installUrl}`,
+        ],
+      },
+    );
+    await opts.postOpenWait?.();
+    return await runGate2(role, appId, keyPath, expected, deps, validate);
   } finally {
     try {
       await page.close();
@@ -1034,6 +1253,130 @@ async function runGate2WithInterstitial(
       deps.log(`Role "${role}": closing the local install-instruction page failed (${errMessage(err)}) — harmless, the page is one-shot.`);
     }
   }
+}
+
+/**
+ * Bounds how many times {@link retryRecoverableGate2Rejection} reopens the
+ * install page after the FIRST recoverable rejection (groundnuty/macf#1063
+ * requirement 3 — "an operator who cannot get it after N tries needs a
+ * different message, not a loop"). Small on purpose: each attempt is a full
+ * operator round-trip (read the reason, go fix it on GitHub, come back) —
+ * this is not a network-flake retry budget.
+ */
+const MAX_GATE2_REOPEN_ATTEMPTS = 2;
+
+/**
+ * The retry-attempt instruction lines (groundnuty/macf#1063 requirement 2 —
+ * "say exactly what to click" — and requirement 6, "no internal references
+ * in user-facing text").
+ *
+ * **`retryInstruction`, when the rejecting hook supplied one, is what's
+ * shown — never `reason`.** `reason` is a technical string built for
+ * `Gate2Outcome.reason`/`AgentApplyOutcome.reason` (the CLI's `--json`/log
+ * surface); today's one real caller
+ * (`registry-repo-coverage.ts::registryRepoNotInstalledReason`) names the
+ * `GET /repos/…/installation` endpoint AND cites `groundnuty/macf#999`/
+ * `#1012` by number — exactly the "read a 404 to figure out what to click"
+ * shape and the internal-reference shape this issue's requirements 2 and 6
+ * both name. `retryInstruction` (`registry-repo-coverage.ts::
+ * registryRepoRetryInstruction`) is the SAME fact in plain words: the App
+ * handle, the repo, "tick it under Repository access, click Save" — no HTTP
+ * verbs, no issue numbers. A bare-string rejection (no cleaner alternative
+ * supplied — e.g. `apply-runner-ops.ts::validateRunnerOpsInstall`, which
+ * this issue doesn't touch) falls back to `reason`, preserving exactly the
+ * pre-widening dialogue for every caller that hasn't opted in.
+ */
+function gate2RetryInstructionLines(reason: string, retryInstruction: string | undefined): readonly string[] {
+  return [
+    retryInstruction ?? reason,
+    'Reopening the install page — fix it there (or via its "Configure" link if it lands on the App\'s settings ' +
+      'page instead), then click "Save". I will re-check automatically once you do.',
+  ];
+}
+
+/**
+ * The "no edge back to the gate" fix (groundnuty/macf#1063) — the operator's
+ * own words: *"it has to have a verify step, and then report to the user
+ * that he made a mistake and tell him to redo it, and present him with the
+ * dialogue again."* Wraps an ALREADY-COMPUTED `outcome` (either `runGate2`'s
+ * fresh result, or a hand-built one on the `reuse-confirmed` path — see that
+ * call site) and, while it is a RECOVERABLE rejection AND
+ * `deps.allowInstallRetry` is set, reopens the SAME gate-2 UX
+ * ({@link runGate2WithInterstitial} — never a second gate path) up to
+ * {@link MAX_GATE2_REOPEN_ATTEMPTS} times.
+ *
+ * A no-op (returns `outcome` unchanged) for every shape this issue does NOT
+ * touch: a success, a NON-recoverable failure (`recoverable` unset — a gate-1
+ * failure, a `waitForAppInstallation` throw, `unconfirmable`/`skip-unverified`/
+ * `drift`, all resolved before this is ever called), or `deps.allowInstallRetry
+ * !== true` (every pre-#1063 caller/test, and every `--yes` run — see
+ * `AgentApplyDeps.allowInstallRetry`'s doc). This is what makes "recoverable
+ * vs not" (requirement 4) and "`--yes` never gains a loop" (requirement 5)
+ * hold simultaneously: both are the SAME early-return, not two separate
+ * checks that could drift apart.
+ *
+ * `validate`, when given, is threaded straight through to every reopened
+ * `runGate2WithInterstitial` call — the reuse-confirmed call site passes
+ * `deps.validateReuse` so a retry re-runs the check that actually rejected
+ * it; the create/resume-install call sites omit it, so `runGate2`'s own
+ * `deps.validateInstall` default applies on every reopened attempt too.
+ */
+async function retryRecoverableGate2Rejection(
+  role: string,
+  appId: string,
+  keyPath: string,
+  expected: ExpectedIdentity,
+  appSlug: string,
+  installUrl: string,
+  repos: readonly string[],
+  whyText: string,
+  deps: AgentApplyDeps,
+  outcome: Gate2Outcome,
+  validate?: ValidateInstallHook,
+): Promise<Gate2Outcome> {
+  if (deps.allowInstallRetry !== true) return outcome;
+
+  const waitForFix = deps.waitForOperatorFix;
+  let current = outcome;
+  for (let attempt = 1; attempt <= MAX_GATE2_REOPEN_ATTEMPTS; attempt++) {
+    if (!(current.status === 'failed' && current.recoverable === true)) return current;
+    const gateLabel = `consent gate ${String(GATE_TOTAL)} of ${String(GATE_TOTAL)} — retry ${String(attempt)} of ${String(MAX_GATE2_REOPEN_ATTEMPTS)}`;
+    current = await runGate2WithInterstitial(
+      role,
+      appId,
+      keyPath,
+      expected,
+      appSlug,
+      installUrl,
+      repos,
+      whyText,
+      deps,
+      {
+        waitLabel: 'Save',
+        gateLabelSuffix: ` — reopened after a rejection, attempt ${String(attempt)} of ${String(MAX_GATE2_REOPEN_ATTEMPTS)}`,
+        instructionLines: gate2RetryInstructionLines(current.reason, current.retryInstruction),
+        // groundnuty/macf#1063 — the operator's genuine window to act (see
+        // `AgentApplyDeps.waitForOperatorFix`'s doc). `undefined` when
+        // `waitForFix` is unset — `runGate2WithInterstitial`'s
+        // `opts.postOpenWait?.()` treats that as "proceed immediately"
+        // rather than hanging. Production ALWAYS wires `waitForOperatorFix`
+        // alongside `allowInstallRetry` (`bootstrap-apply.ts`), so this
+        // fallback only matters for a caller/test that opts into retries
+        // without also wiring the wait.
+        postOpenWait: waitForFix !== undefined ? () => waitForFix(role, gateLabel) : undefined,
+      },
+      validate,
+    );
+  }
+
+  if (current.status === 'failed' && current.recoverable === true) {
+    const reason =
+      `${current.reason} Gave up after ${String(MAX_GATE2_REOPEN_ATTEMPTS)} attempt(s) to fix it via the install ` +
+      'page — an operator must correct it manually on GitHub, then re-run apply.';
+    deps.log(`Role "${role}": ${reason}`);
+    return { ...current, reason };
+  }
+  return current;
 }
 
 function errMessage(err: unknown): string {

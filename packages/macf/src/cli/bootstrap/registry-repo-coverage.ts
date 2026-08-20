@@ -190,6 +190,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ConfirmedInstall } from './identity-confirm.js';
 import type { Presence } from './plan.js';
+import type { InstallRejection } from './apply-agent.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -296,6 +297,22 @@ export function registryRepoNotInstalledReason(appHandle: string, owner: string,
 }
 
 /**
+ * The plain-language companion to {@link registryRepoNotInstalledReason}
+ * (groundnuty/macf#1063 requirement 2 — "say exactly what to click" — and
+ * requirement 6 — "no internal references in user-facing text"). Shown ONLY
+ * in the interactive "here's what to click" retry dialogue when a rejected
+ * install is retried in place
+ * (`apply-agent.ts::gate2RetryInstructionLines`) — `registryRepoNotInstalledReason`
+ * itself still carries the full technical detail (the `GET …/installation`
+ * 404, the `groundnuty/macf#999`/`#1012` cross-reference) into
+ * `AgentApplyOutcome.reason` unchanged, exactly as #1012 shipped it. This
+ * function states the SAME fact — App, repo, what to click — with neither.
+ */
+export function registryRepoRetryInstruction(appHandle: string, owner: string, repo: string): string {
+  return `App "${appHandle}" is missing access to ${owner}/${repo}. On the page that opens, tick "${owner}/${repo}" under "Repository access," then click "Save."`;
+}
+
+/**
  * The non-blocking `apply` warning for `'unknown'` (#1012 requirement 3 —
  * honest-unknown never silently passes as confirmed-fine, but also never
  * refuses a possibly-healthy run on a mere read failure — the same floor
@@ -363,11 +380,18 @@ export function buildRegistryRepoValidateInstall(
   appHandle: string,
   log: (line: string) => void,
   checkFn: (appId: string, keyPath: string, owner: string, repo: string) => Promise<Presence> = checkRepoInAppInstallation,
-): (install: ConfirmedInstall, keyPath: string) => Promise<string | undefined> {
+): (install: ConfirmedInstall, keyPath: string) => Promise<InstallRejection | undefined> {
   return async (install, keyPath) => {
     const presence = await checkFn(install.appId, keyPath, registryOwner, registryRepo);
     if (presence === 'absent') {
-      return registryRepoNotInstalledReason(appHandle, registryOwner, registryRepo);
+      // groundnuty/macf#1063 — structured rejection: `message` keeps
+      // #1012's own technical text (unchanged) for `AgentApplyOutcome.reason`;
+      // `retryInstruction` is the plain-language companion the interactive
+      // retry dialogue shows instead (see that field's own doc).
+      return {
+        message: registryRepoNotInstalledReason(appHandle, registryOwner, registryRepo),
+        retryInstruction: registryRepoRetryInstruction(appHandle, registryOwner, registryRepo),
+      };
     }
     if (presence === 'unknown') {
       log(registryRepoCoverageUnknownWarning(appHandle, registryOwner, registryRepo));

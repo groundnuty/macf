@@ -69,8 +69,28 @@ describe('buildRegistryRepoValidateInstall — the AgentApplyDeps.validateInstal
     const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn);
     const rejection = await validate(INSTALL, '/fake/key.pem');
     expect(rejection).toBeDefined();
-    expect(rejection).toContain('demo-fleet-code-agent');
-    expect(rejection).toContain('demo-org/demo-org-registry');
+    // groundnuty/macf#1063 widened the rejection to `{ message, retryInstruction }`
+    // — `message` keeps #1012's own technical text (assert unchanged below);
+    // this test's "names the App and the repo" AC is satisfied by BOTH halves.
+    if (typeof rejection === 'object') {
+      expect(rejection.message).toContain('demo-fleet-code-agent');
+      expect(rejection.message).toContain('demo-org/demo-org-registry');
+    } else {
+      throw new Error('expected the structured { message, retryInstruction } rejection shape (macf#1063)');
+    }
+  });
+
+  it('groundnuty/macf#1063: the "absent" rejection ALSO carries a plain-language retryInstruction — no HTTP verbs, no issue numbers — for the interactive retry dialogue', async () => {
+    const checkFn = async (): Promise<Presence> => 'absent';
+    const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn);
+    const rejection = await validate(INSTALL, '/fake/key.pem');
+    if (typeof rejection !== 'object' || rejection.retryInstruction === undefined) {
+      throw new Error('expected a retryInstruction on the structured rejection');
+    }
+    const { retryInstruction } = rejection;
+    expect(retryInstruction).toContain('demo-fleet-code-agent');
+    expect(retryInstruction).toContain('demo-org/demo-org-registry');
+    expect(retryInstruction).not.toMatch(/GET \/repos|HTTP|404|#\d+/);
   });
 
   it('presence "present" -> accepts (undefined), no churn, no warning logged', async () => {
