@@ -24,6 +24,7 @@ import type { FleetAgent, FleetLock, FleetManifest } from '../../../src/cli/boot
 import { parseFleetLock, parseFleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { AgentApplyDeps } from '../../../src/cli/bootstrap/apply-agent.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../../../src/cli/bootstrap/apply-repo-init.js';
+import { repoInit as realRepoInit } from '../../../src/cli/commands/repo-init.js';
 import type { ControlRepoDeps } from '../../../src/cli/bootstrap/control-repo.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
@@ -2718,6 +2719,25 @@ trust:
       expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-code', name: 'ROUTING_CLIENT_CERT', value: 'E2E-ROUTING-CLIENT-CERT-PEM' });
       expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-code', name: 'ROUTING_CLIENT_KEY', value: 'E2E-ROUTING-CLIENT-KEY-PEM' });
 
+      // --- Gap 3 (groundnuty/macf#1071): the CONTROL repo — which carries the
+      // SAME router workflow (Gap 1's controlLabelPosts assertion above
+      // already proves `controlRepoInit.status === 'written'`) — is ALSO in
+      // the routing-client publish TARGET SET, not just the agent repo. Per
+      // `assert-the-wrong-path.md`: this checks TARGET-SET MEMBERSHIP (a key
+      // present in `certLegs`/`keyLegs`, an actual `setRepoSecret` call for
+      // THIS repo) — not merely that `publishRoutingClientSecrets` ran (it
+      // already ran for the agent repo above; that alone can't distinguish
+      // "control repo also targeted" from "control repo silently excluded,"
+      // which is exactly the shape #1071 reports broken.
+      expect(result.routingClient.certLegs['groundnuty/demo-fleet-control']).toEqual({ status: 'created' });
+      expect(result.routingClient.keyLegs['groundnuty/demo-fleet-control']).toEqual({ status: 'created' });
+      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-fleet-control', name: 'ROUTING_CLIENT_CERT', value: 'E2E-ROUTING-CLIENT-CERT-PEM' });
+      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-fleet-control', name: 'ROUTING_CLIENT_KEY', value: 'E2E-ROUTING-CLIENT-KEY-PEM' });
+      // Exactly TWO repos got legs — the agent repo AND the control repo,
+      // never a THIRD stray target and never just one.
+      expect(Object.keys(result.routingClient.certLegs).sort()).toEqual(['groundnuty/demo-code', 'groundnuty/demo-fleet-control']);
+      expect(Object.keys(result.routingClient.keyLegs).sort()).toEqual(['groundnuty/demo-code', 'groundnuty/demo-fleet-control']);
+
       // --- The actual acceptance criterion: green exit ⇒ routable, never the reverse ---
       expect(applyExitCode(result)).toBe(0);
 
@@ -2727,6 +2747,66 @@ trust:
       expect(rendered).not.toContain('E2E-ROUTING-CLIENT-CERT-PEM'); // not secret, but still never rendered raw — only status/fingerprint-shaped fields
       const humanText = formatApplyResult(result, []);
       expect(humanText).not.toContain('E2E-ROUTING-CLIENT-KEY-PEM');
+    });
+
+    it('groundnuty/macf#1071 — when the control repo does NOT carry the router (its repo-init failed this run), it does NOT get routing-client secrets published to it', async () => {
+      process.env['GH_TOKEN'] = 'ghs_e2e-decisive-test-token';
+      globalThis.fetch = (async () => ({ status: 201, ok: true, json: async () => [] }) as unknown as Response) as typeof fetch;
+
+      const routingClientCalls: { repo: string; name: string; value: string }[] = [];
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const codeAgentDeps: AgentApplyDeps = {
+        ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+        waitForAppInstallation: async (opts) => ({
+          appId: opts.appId,
+          installId: 'install-1',
+          appSlug: opts.expected.appSlug ?? 'demo-fleet-code-agent',
+          accountLogin: 'groundnuty',
+          repositorySelection: 'selected',
+        }),
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(codeAgentDeps, manifestPath, {
+          cloneRepo: async () => {},
+          commitAndPush: async () => 'pushed',
+          // Discriminates by target repo — the AGENT repo's own repo-init
+          // succeeds normally (real repoInit, since this returns undefined
+          // is NOT an option here; call the real one only for the agent
+          // repo, and fail ONLY for the control repo) so this test isolates
+          // the ONE fact under test: a control repo whose OWN repo-init
+          // failed must not become a publish target, while the agent repo
+          // (unaffected) still does.
+          repoInit: async (dir, opts) => {
+            if (opts.repo === 'groundnuty/demo-fleet-control') throw new Error('simulated control-repo repo-init failure');
+            return realRepoInit(dir, opts);
+          },
+        }),
+        routingClientDeps: {
+          mint: async () => ({ certPem: 'E2E-ROUTING-CLIENT-CERT-PEM', keyPem: 'E2E-ROUTING-CLIENT-KEY-PEM' }),
+          checkRepoSecretPresence: async () => 'absent',
+          setRepoSecret: async (repo, name, value) => {
+            routingClientCalls.push({ repo, name, value });
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      // Precondition: the control repo's OWN repo-init genuinely failed this run.
+      expect(result.controlRepoInit.status).toBe('failed');
+
+      // The agent repo (unaffected by the injected failure) IS still a target.
+      expect(result.routingClient.certLegs['groundnuty/demo-code']).toEqual({ status: 'created' });
+      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-code', name: 'ROUTING_CLIENT_CERT', value: 'E2E-ROUTING-CLIENT-CERT-PEM' });
+
+      // The control repo is NOT a target — no leg AT ALL (not even a
+      // 'skipped'/'failed' one — see `deriveRouterCarryingRepos`'s doc: a
+      // repo excluded from the target set never reaches the per-repo loop),
+      // and no `setRepoSecret` call for it.
+      expect(result.routingClient.certLegs['groundnuty/demo-fleet-control']).toBeUndefined();
+      expect(result.routingClient.keyLegs['groundnuty/demo-fleet-control']).toBeUndefined();
+      expect(routingClientCalls.some((c) => c.repo === 'groundnuty/demo-fleet-control')).toBe(false);
     });
 
     it('when label creation genuinely fails (no usable credentials threaded), the run is NOT reported as a clean success', async () => {
@@ -2895,6 +2975,62 @@ trust:
       }
       // Never a silent green exit while a confirmed repo is unroutable:
       expect(applyExitCode(result)).toBe(1);
+    });
+
+    it('groundnuty/macf#1071 — idempotent re-run: a control repo that ALREADY holds the routing-client secrets reports "already-present" for both, never re-minted, never re-written', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLockAlreadyMinted: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [
+          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+          { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-runner-ops' },
+        ],
+        fingerprints: { routing_client_key: 'sha256:cafef00d' },
+      };
+      let mintCalled = false;
+      const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedAgentDeps(), manifestPath),
+        trustDeps: reuseCaTrustDeps(),
+        routingClientDeps: {
+          mint: async () => {
+            mintCalled = true;
+            throw new Error('must not be called — a routing_client_key fingerprint is already recorded');
+          },
+          // BOTH repos (the agent repo AND the control repo) already hold
+          // the secrets — the steady state on a SECOND `apply` run against
+          // an otherwise-unchanged fleet.
+          checkRepoSecretPresence: async () => 'present',
+          setRepoSecret: async (repo, name, value) => {
+            setSecretCalls.push({ repo, name, value });
+          },
+          // readVaultRoutingClient deliberately OMITTED — nothing needs
+          // restoring; every repo already has the secret, so `create` is
+          // never even reached (`publishRoutingClientSecrets`'s doc: the
+          // presence check runs BEFORE `create` would need material).
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLockAlreadyMinted, deps);
+
+      expect(result.routingClient.mint.status).toBe('skipped');
+      expect(mintCalled).toBe(false);
+
+      // Every repo in the target set — the agent repo AND the control
+      // repo — reports 'already-present', not re-created and not silently
+      // absent from the result at all.
+      expect(result.routingClient.certLegs['groundnuty/demo-code']).toEqual({ status: 'already-present' });
+      expect(result.routingClient.keyLegs['groundnuty/demo-code']).toEqual({ status: 'already-present' });
+      expect(result.routingClient.certLegs['groundnuty/demo-fleet-control']).toEqual({ status: 'already-present' });
+      expect(result.routingClient.keyLegs['groundnuty/demo-fleet-control']).toEqual({ status: 'already-present' });
+
+      // THE decisive idempotence proof: never re-minted (asserted above via
+      // `mintCalled`), and never re-WRITTEN either — zero `setRepoSecret`
+      // calls for ANY repo, agent or control.
+      expect(setSecretCalls).toHaveLength(0);
+      expect(applyExitCode(result)).toBe(0);
     });
 
     it('never-minted-at-all fleets (no prior routing_client_key fingerprint) keep the ORIGINAL blanket-skip behaviour, byte-identical — this is NOT the #986 case', async () => {
