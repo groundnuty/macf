@@ -28,25 +28,24 @@
  * declared-but-deferred section explicitly via `FleetPlan.skippedSections`
  * — never silent.
  *
- * `versions:` (§D6 GitOps steering) is WIRED as of this change: once
- * declared, `computePlan` emits a `version` item per agent (deployed macf
- * CLI version) and an `actions_pin` item per agent repo (the macf-actions
- * router pin committed to that repo's `agent-router.yml`) — see
- * `macfVersionItem` / `actionsVersionItem` below. Both are pure
- * value-comparisons against `ObservedState`, same three-verb shape as every
- * other item in this file.
+ * `versions:` (§D6 GitOps steering) is WIRED: once declared, `computePlan`
+ * emits a `version` item per agent (deployed macf CLI version) and an
+ * `actions_pin` item per ROUTER-CARRYING repo — every agent's repo AND the
+ * control repo (`fleet-manifest.ts::routerCarryingRepos`, groundnuty/macf#1072
+ * — the control repo has carried a committed `agent-router.yml` since
+ * `#1070`) — see `macfVersionItem` / `actionsVersionItem` below. Both are
+ * pure value-comparisons against `ObservedState`, same three-verb shape as
+ * every other item in this file.
  *
- * **`version` gained a real `apply` code path under DR-043 Amendment L
- * (groundnuty/macf#1045) — `actions_pin` did NOT.** `apply`'s
- * version-reconcile phase (`apply-version.ts`) now CALLS the `macf fleet
- * upgrade` roll machinery (delegation, never reimplementation — Amendment
- * L2) for a diverging `versions.macf`, so `planItemApplyCoverage`'s
- * `'version'` case is `'implemented'`. `actions_pin` remains
- * `'not_implemented'` — its remedy (`macf repo-init --actions-version <pin>
- * --force`, rewriting a repo's committed `agent-router.yml`) is a genuinely
- * DIFFERENT command that `apply` still never calls, verified independently,
- * despite DR-043 §D6's prose naming `macf fleet upgrade` generically for "a
- * mismatch" against either `versions.*` field.
+ * **Both `version` AND `actions_pin` have a real `apply` code path.**
+ * `apply`'s version-reconcile phase (`apply-version.ts`) CALLS the `macf
+ * fleet upgrade` roll machinery (delegation, never reimplementation —
+ * DR-043 Amendment L2) for a diverging `versions.macf` (groundnuty/macf#1045).
+ * `apply-fleet.ts`'s `resolveActionsPinReconcile` call sites do the SAME for
+ * a diverging `versions.actions` — force-rewriting the committed
+ * `agent-router.yml` by delegating to `commands/repo-init.ts::repoInit`
+ * (Amendment L extended, groundnuty/macf#1072). Both kinds are
+ * `'implemented'` in `planItemApplyCoverage`.
  *
  * A SIBLING gap surfaced on the first real provision (groundnuty/macf#854):
  * `skippedSections` covers whole MANIFEST SECTIONS apply never reconciles,
@@ -60,7 +59,7 @@
  */
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
-import { buildTrustedActorsValue, deriveAppHandle } from './fleet-manifest.js';
+import { buildTrustedActorsValue, deriveAppHandle, routerCarryingRepos } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
 import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
@@ -262,6 +261,19 @@ export interface ObservedState {
   readonly controlRepoPresence: Presence;
   /** Only meaningful when `controlRepoPresence === 'present'` — same convention as `control-repo.ts`'s `ControlRepoMeta.archived`. `undefined` when the archived bit itself couldn't be read. */
   readonly controlRepoArchived?: boolean;
+  /**
+   * groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+   * — the control repo's committed macf-actions router pin, the per-repo
+   * sibling of {@link ObservedAgentState.actionsPin} (same live read,
+   * `observer.ts::readCallerActionsPin`, targeted at the control repo's
+   * full name rather than an agent's). The control repo has carried a
+   * committed `agent-router.yml` since `#1070`
+   * (`apply-control-repo-init.ts`), so it is a router-carrying repo just
+   * like every agent repo — see `fleet-manifest.ts::routerCarryingRepos`.
+   * `undefined` on ANY read failure (same "collapse absent + unreadable
+   * into one signal" posture `actionsPin` already establishes).
+   */
+  readonly controlRepoActionsPin?: string;
 }
 
 /** Produces an `ObservedState` for a manifest. Implemented by `observer.ts`'s `githubRegistryObserver`; faked in tests. */
@@ -425,9 +437,15 @@ export interface UnimplementedApplyItem {
  * kind can emit ('create'/unknown-degrade included — the roll's own live
  * probe resolves what the Mac-side plan could only guess at). `'version'`
  * moved into {@link planItemApplyCoverage}'s always-`'implemented'` group.
- * `actions_pin` (the OTHER `versions:` field, `versions.actions`) is
- * UNCHANGED — its remedy is still a different command apply never calls;
- * see this file's module doc.
+ *
+ * `actions_pin` (the OTHER `versions:` field, `versions.actions`) is ALSO
+ * GONE (macf#1072, DR-043 Amendment L extended) — `apply-fleet.ts` now
+ * force-rewrites a diverging `agent-router.yml` (per-agent AND control
+ * repo — `resolveActionsPinReconcile`), delegating to the SAME
+ * `commands/repo-init.ts::repoInit` primitive that already wrote a
+ * FRESHLY-CREATED repo's workflow, never a second writer. `'actions_pin'`
+ * moved into {@link planItemApplyCoverage}'s always-`'implemented'` group
+ * too — no reason string remains here for it.
  */
 export const APPLY_UNIMPLEMENTED_REASONS = {
   routing:
@@ -436,18 +454,6 @@ export const APPLY_UNIMPLEMENTED_REASONS = {
     'diverging value — the task\'s create-only posture ("never silently overwrite") leaves this specific update ' +
     'un-actioned. Set the repo variable manually to the declared value, or re-run apply once a future increment ' +
     'adds confirmed per-item updates; nothing above was changed for this item.',
-  // Deliberately a DIFFERENT remedy than `version` (now implemented,
-  // macf#1045) — `macf fleet upgrade` / `macf update` never touch a repo's committed
-  // `.github/workflows/agent-router.yml` (verified: neither reads nor
-  // writes that path). Only `macf repo-init --actions-version ... --force`
-  // regenerates it (repo-init.ts's "--force only controls the workflow
-  // file" contract) — naming the WRONG remedy here would send the operator
-  // to a command that cannot fix this resource.
-  actionsPin:
-    'apply provisions identity/repo/CA/routing wiring; it does not rewrite an existing repo\'s committed ' +
-    '"agent-router.yml" — that file is only regenerated by `macf repo-init --actions-version <pin> --force`, ' +
-    'not by `macf fleet upgrade` / `macf update` (neither touches that path). Run "macf repo-init ' +
-    '--actions-version <pin> --force" on the drifted repo to converge; nothing above was changed for this item.',
   // groundnuty/macf#942 (DR-043 Amendment I) — `warm` is declared + recorded
   // (FleetRoutingRunnerSchema, DR-009 §7.4) but `apply` does not yet call the
   // runner-provisioning contract (repo/labels/warm) that would establish it
@@ -576,15 +582,19 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // as 'control_repo'.
       return 'implemented';
     case 'actions_pin':
-      // DR-043 §D6 — apply NEVER acts on this kind, regardless of verb:
-      // 'create' here is the unobservable-degrade candidate (see
-      // `actionsVersionItem`), and there is no create-a-router-pin
-      // primitive either. Unlike 'routing' above, this is a WHOLE-KIND gap,
-      // not a create-vs-update split — both remaining verbs (noop/report-
-      // extra already returned above) stay `not_implemented`. `'version'`
-      // (the OTHER `versions:` field) moved to the always-`'implemented'`
-      // group above (macf#1045, DR-043 Amendment L) — this kind did not.
-      return 'not_implemented';
+      // groundnuty/macf#1072 (DR-043 Amendment L extended to
+      // `versions.actions`) — `apply-fleet.ts`'s `resolveActionsPinReconcile`
+      // call sites (per-agent + control repo) now force-rewrite a diverging
+      // `agent-router.yml`, for BOTH verbs this kind can emit. 'create' (the
+      // unobservable-degrade candidate — see `actionsVersionItem`'s doc) is
+      // included, same "the attempt resolves what the Mac-side plan could
+      // only guess at" reasoning `'version'` already established one entry
+      // above this join in macf#1045 — this kind now joins that same
+      // always-`'implemented'` group. "Implemented" here means "apply has
+      // actual behavior for this," not "every attempt lands a change" — the
+      // `vault_recipients` precedent immediately below states the same
+      // distinction for its own kind.
+      return 'implemented';
     case 'vault_recipients':
       // groundnuty/macf#957 — `apply-fleet.ts::reconcileVaultRecipients` has
       // a REAL code path for the only two verbs `vaultRecipientsItem` ever
@@ -603,8 +613,6 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
   switch (kind) {
     case 'routing':
       return APPLY_UNIMPLEMENTED_REASONS.routing;
-    case 'actions_pin':
-      return APPLY_UNIMPLEMENTED_REASONS.actionsPin;
     case 'runner_warm':
       return APPLY_UNIMPLEMENTED_REASONS.runnerWarm;
     case 'app':
@@ -620,6 +628,7 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'runner_ops':
     case 'vault_recipients':
     case 'version':
+    case 'actions_pin':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
@@ -627,7 +636,8 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
       // in macf#1034 (DR-043 Amendment G correction), 'labels'/
       // 'routing_client' in groundnuty/macf#920, 'runner_ops' in
       // groundnuty/macf#943, 'vault_recipients' in groundnuty/macf#957,
-      // 'version' in macf#1045 / DR-043 Amendment L).
+      // 'version' in macf#1045 / DR-043 Amendment L, 'actions_pin' in
+      // macf#1072 / DR-043 Amendment L extended).
       // Kept exhaustive so a NEW `PlanItemKind` added
       // later is a compile error here, not a silent "apply covers
       // everything" false-negative.
@@ -1309,26 +1319,33 @@ function macfVersionItem(agent: FleetAgent, desired: string, obs: ObservedAgentS
  * "representative" repo read hides real per-repo drift, same reasoning
  * `caRepoItem` already applies to the CA var.
  *
- * The remedy NAMED in the `update` reason is deliberately DIFFERENT from
- * `macfVersionItem`'s: `macf fleet upgrade` / `macf update` never touch a
- * repo's committed `agent-router.yml` (verified — neither reads nor writes
- * that path); only `macf repo-init --actions-version <pin> --force`
- * regenerates it. DR-043 §D6's prose names `macf fleet upgrade` generically
- * for "a mismatch" against either `versions.*` field — that reads correctly
- * for `versions.macf` but not for `versions.actions`, so this reason text
- * intentionally diverges from the DR's prose rather than repeating a remedy
- * that would send the operator to the wrong command.
+ * **Taking `repo: string` directly (not `agent: FleetAgent`), unlike
+ * `macfVersionItem`** — groundnuty/macf#1072 extends this item's target set
+ * from "every agent repo" to "every ROUTER-CARRYING repo"
+ * (`fleet-manifest.ts::routerCarryingRepos`), which includes the control
+ * repo — a repo with no corresponding `FleetAgent`/role. `agent.repo` was
+ * the only field this function ever read from its `FleetAgent` parameter,
+ * so callers now pass the repo string directly (agent callers: `agent.repo`;
+ * the control-repo caller: the derived control-repo full name).
+ *
+ * **The remedy NAMED in the `update`/`create` reason changed under #1072**
+ * (was: `macf repo-init --actions-version <pin> --force`, since `apply`
+ * never rewrote `agent-router.yml`). `apply` now DOES reconcile this field
+ * (`apply-fleet.ts`'s `resolveActionsPinReconcile` call sites, DR-043
+ * Amendment L extended) — the reason text names that instead, mirroring
+ * `macfVersionItem`'s own "apply reconciles this" phrasing. The old
+ * operator-remedy command still WORKS (unchanged) as a manual escape hatch,
+ * but is no longer the primary path this reason recommends.
  */
-function actionsVersionItem(agent: FleetAgent, desired: string, obs: ObservedAgentState | undefined): PlanItem {
-  const target = `repo:${agent.repo}:version:actions`;
-  const observed = obs?.actionsPin;
+function actionsVersionItem(repo: string, desired: string, observed: string | undefined): PlanItem {
+  const target = `repo:${repo}:version:actions`;
   if (observed === undefined) {
     return {
       kind: 'actions_pin',
       target,
       verb: 'create',
       reason:
-        `macf-actions router pin on "${agent.repo}" ${UNKNOWN_REASONS.actionsPin} — ` +
+        `macf-actions router pin on "${repo}" ${UNKNOWN_REASONS.actionsPin} — ` +
         'not drift, not a match — LOW CONFIDENCE',
       confirm_required: false,
     };
@@ -1338,7 +1355,7 @@ function actionsVersionItem(agent: FleetAgent, desired: string, obs: ObservedAge
       kind: 'actions_pin',
       target,
       verb: 'noop',
-      reason: `macf-actions router pin on "${agent.repo}" already "${desired}"`,
+      reason: `macf-actions router pin on "${repo}" already "${desired}"`,
       confirm_required: false,
     };
   }
@@ -1347,9 +1364,9 @@ function actionsVersionItem(agent: FleetAgent, desired: string, obs: ObservedAge
     target,
     verb: 'update',
     reason:
-      `macf-actions router pin on "${agent.repo}" observed "${observed}" but manifest declares "${desired}" — ` +
-      `run "macf repo-init --actions-version ${desired} --force" on that repo to converge; ` +
-      'apply does not rewrite agent-router.yml',
+      `macf-actions router pin on "${repo}" observed "${observed}" but manifest declares "${desired}" — ` +
+      'apply reconciles this by rewriting the committed agent-router.yml during this run — manual escape hatch: ' +
+      `"macf repo-init --repo ${repo} --actions-version ${desired} --force"`,
     confirm_required: true,
   };
 }
@@ -1447,8 +1464,20 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
     for (const agent of manifest.agents) {
       const obs = observed.agents[agent.role];
       items.push(macfVersionItem(agent, desiredMacf, obs));
-      items.push(actionsVersionItem(agent, desiredActions, obs));
+      items.push(actionsVersionItem(agent.repo, desiredActions, obs?.actionsPin));
     }
+    // groundnuty/macf#1072 — the control repo is ALSO a router-carrying
+    // repo (since `#1070`); its pin reconciles the same way an agent
+    // repo's does. No `version`(macf) item for it though — the control
+    // repo never runs a deployed macf CLI to roll (Amendment L's `macf
+    // fleet upgrade` delegation is scoped to AGENT identity, DR-043 §D4);
+    // only the router-pin field applies here. Derived from
+    // `routerCarryingRepos(manifest)`'s LAST element — that function
+    // ALWAYS appends the control repo after every agent repo (see its own
+    // doc) — rather than re-deriving the name a second way, so this stays
+    // in lockstep with `apply-fleet.ts`'s reconcile enumeration of the
+    // SAME function.
+    items.push(actionsVersionItem(routerCarryingRepos(manifest).at(-1)!, desiredActions, observed.controlRepoActionsPin));
   }
 
   const manifestRoles = new Set(manifest.agents.map((a) => a.role));

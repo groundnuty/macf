@@ -135,6 +135,21 @@ export interface ControlRepoInitDeps {
   readonly repoInit?: typeof realRepoInit;
 }
 
+/**
+ * groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+ * — mirrors `apply-repo-init.ts::RepoInitStepOptions`'s `actionsVersion`/
+ * `force` pair exactly, for the SAME reason: the caller computes the
+ * reconcile decision once, via `resolveActionsPinReconcile`, from the
+ * ALREADY-OBSERVED `ObservedState.controlRepoActionsPin` — this module
+ * never reads it itself. Omitted (both undefined) preserves the exact
+ * pre-#1072 fallback (`manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION`,
+ * always `force: false`).
+ */
+export interface ControlRepoInitOptions {
+  readonly actionsVersion?: string;
+  readonly force?: boolean;
+}
+
 export type ControlRepoInitOutcome =
   | {
       readonly repo: string;
@@ -218,6 +233,7 @@ export async function applyControlRepoInit(
   controlDir: string,
   manifest: FleetManifest,
   deps?: ControlRepoInitDeps,
+  opts?: ControlRepoInitOptions,
 ): Promise<ControlRepoInitOutcome> {
   const repo = controlRepoFullName(manifest);
   const agents = manifest.agents.map((a) => a.role);
@@ -226,13 +242,14 @@ export async function applyControlRepoInit(
     const registryOpts = repoInitRegistryOptions(manifest.owner.registry);
     const result = await runRepoInit(controlDir, {
       repo,
-      actionsVersion: manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION,
+      // groundnuty/macf#1072 — see `ControlRepoInitOptions`'s doc.
+      actionsVersion: opts?.actionsVersion ?? manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION,
       // ALL declared agents, comma-joined — `repoInit`'s own `agents` option
       // shape (`commands/repo-init.ts`: `opts.agents.split(',')`). This is
       // the single line that makes the control repo carry every agent's
       // label instead of one.
       agents: agents.join(','),
-      force: false,
+      force: opts?.force ?? false,
       project: manifest.metadata.name,
       ...registryOpts,
     });

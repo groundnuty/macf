@@ -4523,4 +4523,110 @@ trust:
       expect(unarchiveRepo).not.toHaveBeenCalled();
     });
   });
+
+  // --- groundnuty/macf#1072 (DR-043 Amendment L extended to
+  // `versions.actions`) — the actions-pin reconcile, end to end through
+  // `applyFleet`. ---
+  describe('actions-pin reconcile (groundnuty/macf#1072)', () => {
+    it('DECISIVE — a stale agent pin RECONCILES, an already-matching control-repo pin reports already-current, and the two statuses are TEXTUALLY DISTINCT (never inferable from one summary line)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        // manifest declares 'v3.4.1' (see manifestWith); the agent repo was
+        // observed at the STALE 'v3.4.0', the control repo already matches.
+        observedActionsPins: { agents: { 'code-agent': 'v3.4.0' }, controlRepo: 'v3.4.1' },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.actionsPin.attempted).toBe(true);
+      expect(result.actionsPin.target).toBe('v3.4.1');
+      const agentResult = result.actionsPin.results.find((r) => r.repo === 'groundnuty/demo-code');
+      const controlResult = result.actionsPin.results.find((r) => r.repo === 'groundnuty/demo-fleet-control');
+      expect(agentResult?.status).toBe('reconciled');
+      expect(controlResult?.status).toBe('already-current');
+      // Textually distinct — not two phrasings of one line (assert-the-wrong-path.md).
+      expect(agentResult?.status).not.toBe(controlResult?.status);
+      expect(['reconciled', 'already-current', 'could-not-attempt']).toContain(agentResult?.status);
+      expect(['reconciled', 'already-current', 'could-not-attempt']).toContain(controlResult?.status);
+    });
+
+    it('an agent whose identity is unresolved this run (failed) reports could-not-attempt — TEXTUALLY DISTINCT from both reconciled and already-current, never silently folded into either', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+        // science-agent has NO prior entry -> takes the CREATE path, and its
+        // identity deps (below) fail during that path -> status 'failed'.
+      };
+      // ONE shared AgentApplyDeps, dispatched per-role by `applyIdentity`
+      // itself based on prior-lock presence (mirrors this file's own
+      // `reusedTwoAgentDeps` pattern above) — code-agent HAS a prior entry
+      // so it takes the `confirmAppInstallation` (reused) path and never
+      // reaches `exchangeManifestCode`; science-agent has none, so it takes
+      // the CREATE path via `exchangeManifestCode`, which throws here.
+      const sharedAgentDeps: AgentApplyDeps = {
+        startManifestFlow: async () => ({
+          startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {},
+        }),
+        startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+        exchangeManifestCode: async () => {
+          throw new Error('boom — science-agent identity unresolved this run');
+        },
+        resolveKeyPath: () => '/fake.pem',
+        confirmAppInstallation: async () => ({
+          status: 'confirmed',
+          install: { appId: 'app-code-agent', installId: 'install-1', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' },
+        }),
+        waitForAppInstallation: async () => {
+          throw new Error('must not be called — no role reaches gate 2 in this scenario');
+        },
+        openUrl: async () => {},
+        log: () => {},
+        writeRecoveryArtifact: async () => {},
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(sharedAgentDeps, manifestPath),
+        buildAgentDeps: () => sharedAgentDeps,
+        observedActionsPins: { agents: { 'code-agent': 'v3.4.1' }, controlRepo: 'v3.4.1' },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.agents.find((a) => a.role === 'science-agent')?.identity.status).toBe('failed');
+      const sciResult = result.actionsPin.results.find((r) => r.repo === 'groundnuty/demo-science');
+      expect(sciResult?.status).toBe('could-not-attempt');
+      expect(sciResult?.reason).toMatch(/identity is unresolved/);
+      // The reused agent's own pin already matched -> distinct status, not swept into the same bucket.
+      const codeResult = result.actionsPin.results.find((r) => r.repo === 'groundnuty/demo-code');
+      expect(codeResult?.status).toBe('already-current');
+      expect(codeResult?.status).not.toBe(sciResult?.status);
+    });
+
+    it('absent versions.actions (versions: not declared at all): NO action is recorded — attempted:false, results empty — the same no-opinion gate the version(macf) phase already uses', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), versions: undefined };
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        observedActionsPins: { agents: { 'code-agent': 'v9.9.9' }, controlRepo: 'v9.9.9' },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.actionsPin).toEqual({ attempted: false, results: [] });
+    });
+  });
 });

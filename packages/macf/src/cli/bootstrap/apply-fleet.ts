@@ -213,7 +213,7 @@ import type { Presence } from './plan.js';
 import { buildRegistryRepoValidateInstall, registryRepoCoverageUnverifiedOnSkipNote } from './registry-repo-coverage.js';
 import type { AppCredentials } from './manifest-exchange.js';
 import type { AgentRepoDeps, AgentRepoOptions, RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
-import { applyRepoInitForAgent, ensureAgentRepo } from './apply-repo-init.js';
+import { applyRepoInitForAgent, ensureAgentRepo, resolveActionsPinReconcile } from './apply-repo-init.js';
 import { repoHomepageUrl } from './app-manifest.js';
 import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './control-repo.js';
 import { provisionControlRepo } from './control-repo.js';
@@ -395,6 +395,28 @@ export interface FleetApplyDeps {
    * / `fetch` call.
    */
   readonly checkRegistryRepoCoverage?: (appId: string, keyPath: string, owner: string, repo: string) => Promise<Presence>;
+  /**
+   * groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+   * — the ALREADY-OBSERVED macf-actions router pin per repo
+   * (`ObservedState.agents[role].actionsPin` / `.controlRepoActionsPin`),
+   * threaded in from `commands/bootstrap-apply.ts` (where `observed` is
+   * computed once, before `applyFleet` is ever called) so this module never
+   * performs a SECOND live read of the same fact (#1000 golden path).
+   * `undefined` (the default — every existing test/caller that doesn't set
+   * it) means "no observed data available this run" — `resolveActionsPinReconcile`
+   * then treats every repo's observed pin as an UNREADABLE pin (same as a
+   * live read that failed), which is the ALREADY-established "not drift,
+   * not a match — LOW CONFIDENCE" case `plan.ts::actionsVersionItem` reports
+   * as `create`: a declared `versions.actions` STILL attempts to force-write
+   * (mirroring `version`(macf)'s symmetric create+update treatment — the
+   * roll's own attempt resolves what the Mac-side plan could only guess
+   * at); it simply never claims `already-current` without positive evidence
+   * the pin actually matched.
+   */
+  readonly observedActionsPins?: {
+    readonly agents: Readonly<Record<string, string | undefined>>;
+    readonly controlRepo: string | undefined;
+  };
 }
 
 /**
@@ -495,6 +517,57 @@ export function redactRoutingClientMint(outcome: RoutingClientMintOutcome): Reda
   }
 }
 
+/**
+ * groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+ * — the #1055 honest-report vocabulary applied to the router-pin reconcile:
+ * `'reconciled'` (this run attempted AND the pin actually changed),
+ * `'already-current'` (nothing needed reconciling — either the pin already
+ * matched, or an attempted write turned out byte-identical), and
+ * `'could-not-attempt'` (this run tried and failed, OR could not even try —
+ * e.g. the agent's identity was unresolved this run). The three are
+ * TEXTUALLY DISTINCT statuses, not phrasings of one summary line — see
+ * `assert-the-wrong-path.md`.
+ */
+export type ActionsPinRepoStatus = 'reconciled' | 'already-current' | 'could-not-attempt';
+
+export interface ActionsPinRepoResult {
+  readonly repo: string;
+  readonly status: ActionsPinRepoStatus;
+  /** Present only for `'could-not-attempt'`. */
+  readonly reason?: string;
+}
+
+/**
+ * groundnuty/macf#1072 — the whole-run actions-pin reconcile report.
+ * `attempted: false` (Amendment L2.4's "absent means no opinion", applied
+ * to `versions.actions`) means `manifest.versions` was never declared this
+ * run — `results` is empty and `target` is absent; no repo was even
+ * examined, let alone force-rewritten.
+ */
+export interface ActionsPinReport {
+  readonly attempted: boolean;
+  readonly target?: string;
+  readonly results: readonly ActionsPinRepoResult[];
+}
+
+/**
+ * groundnuty/macf#1072 — the per-agent-repo report entry, computed from the
+ * SAME decision (`pinReconcile.force`) and outcome (`repoInitOutcome`) the
+ * per-agent loop already has in hand; never a second `resolveActionsPinReconcile`
+ * call or a second read of anything. `force === false` is decision-time
+ * "nothing to reconcile" (`already-current`, no repoInit write attempted for
+ * THIS reason — the general identity-sync call may still have run for
+ * labels/config, independent of this field). `force === true` defers to
+ * `repoInitOutcome.pushed` — the ACTUAL git-diff ground truth (`apply-repo-init.ts`'s
+ * `-A` commit) — over the decision-time guess: an attempted rewrite that
+ * turns out byte-identical is honestly `already-current`, not `reconciled`.
+ */
+function actionsPinResultFor(repo: string, force: boolean, outcome: RepoInitStepOutcome): ActionsPinRepoResult {
+  if (outcome.status === 'failed') return { repo, status: 'could-not-attempt', reason: outcome.reason };
+  if (!force) return { repo, status: 'already-current' };
+  return { repo, status: outcome.pushed ? 'reconciled' : 'already-current' };
+}
+
 export interface FleetApplyResult {
   /** DR-043 Amendment F step 0 — see `control-repo.ts`'s module doc. A `foreign`/`failed` outcome means `agents`/`vault` below are trivially empty/skipped: the run aborted before touching anything else. */
   readonly controlRepo: ControlRepoOutcome;
@@ -547,6 +620,16 @@ export interface FleetApplyResult {
   readonly routing: Readonly<Record<string, EnsureVariableOutcome>>;
   /** DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — see {@link RoutingClientApplyResult}'s doc. ALWAYS present — a fleet with no confirmed agent repos this run still reports `mint.status`. */
   readonly routingClient: RoutingClientApplyResult;
+  /**
+   * DR-043 Amendment L extended to `versions.actions` (groundnuty/macf#1072)
+   * — see {@link ActionsPinReport}'s doc. The REAL `applyFleet` return ALWAYS
+   * sets this (`attempted: false` when `versions:` was never declared this
+   * run) — optional at the TYPE level only so every pre-#1072 hand-built
+   * `FleetApplyResult` test fixture (this file's own test suite has dozens)
+   * keeps compiling and behaving byte-identically; every reader treats
+   * `undefined` the same as `{ attempted: false, results: [] }`.
+   */
+  readonly actionsPin?: ActionsPinReport;
 }
 
 function agentVaultSecrets(appHandle: string, outcome: Extract<AgentApplyOutcome, { status: 'created' }>): VaultAgentSecrets {
@@ -788,6 +871,10 @@ function abortedFleetApplyResult(manifestPath: string, priorLock: FleetLock | nu
       certLegs: {},
       keyLegs: {},
     },
+    // groundnuty/macf#1072 — the control repo aborted before step 0.5 (its
+    // own repo-init) ever ran, so no repo was even examined for this run —
+    // `attempted: false`, same as the "versions: never declared" gate.
+    actionsPin: { attempted: false, results: [] },
   };
 }
 
@@ -849,6 +936,14 @@ export async function applyFleet(
   deps.log(`Control repo "${controlRepo.repo}": ${controlRepo.status.toUpperCase()} (checkout: ${controlRepo.localDir}).`);
 
   const controlDir = controlRepo.localDir;
+  // groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+  // — one entry per router-carrying repo (`fleet-manifest.ts::routerCarryingRepos`)
+  // this run had an opinion about; stays empty when `manifest.versions` is
+  // absent (see `actionsPin`'s final assembly near the end of this
+  // function, `attempted: false`). Declared here (control repo is step 0,
+  // before any per-agent processing) so both this control-repo entry and
+  // every per-agent entry (pushed inside the loop below) land in ONE array.
+  const actionsPinResults: ActionsPinRepoResult[] = [];
 
   // --- Step 0.5 (groundnuty/macf#1057): control-repo repo-init — the router
   // workflow + one label per DECLARED fleet agent, so cross-agent
@@ -860,7 +955,35 @@ export async function applyFleet(
   // repo-init already established this precedent (`applyRepoInitForAgent`'s
   // callers below), and a control-repo-init failure must not prevent the
   // rest of the run (identities, vault) from proceeding.
-  const controlRepoInit = await applyControlRepoInit(controlDir, manifest, { repoInit: deps.repoInitDeps.repoInit });
+  // groundnuty/macf#1072 — the SAME `resolveActionsPinReconcile` decision
+  // point every per-agent call site routes through, applied to the control
+  // repo's ALREADY-OBSERVED pin (`deps.observedActionsPins?.controlRepo`,
+  // never a second live read here — #1000 golden path).
+  const controlPinReconcile = resolveActionsPinReconcile(manifest.versions?.actions, deps.observedActionsPins?.controlRepo);
+  const controlRepoInit = await applyControlRepoInit(
+    controlDir,
+    manifest,
+    { repoInit: deps.repoInitDeps.repoInit },
+    { actionsVersion: controlPinReconcile.actionsVersion, force: controlPinReconcile.force },
+  );
+  if (manifest.versions) {
+    // Unlike the per-agent case, the control repo's write here is NOT
+    // pushed yet (that happens once, at the very end of this run, via
+    // `syncControlRepo` — see this section's own doc above) — there is no
+    // local "did the byte content actually change" ground truth available
+    // at this point the way `RepoInitStepOutcome.pushed` gives the agent
+    // path. The decision-time signal (`force`) is therefore the report:
+    // `force: false` means nothing needed reconciling (`already-current`);
+    // `force: true` + a successful write means this run DID reconcile it
+    // (`reconciled`) — `controlRepoSync`'s own outcome (reported
+    // separately, `FleetApplyResult.controlRepoSync`) is what confirms the
+    // push landed.
+    actionsPinResults.push(
+      controlRepoInit.status === 'failed'
+        ? { repo: controlRepoInit.repo, status: 'could-not-attempt', reason: controlRepoInit.reason }
+        : { repo: controlRepoInit.repo, status: controlPinReconcile.force ? 'reconciled' : 'already-current' },
+    );
+  }
   if (controlRepoInit.status === 'failed') {
     deps.log(`Control repo "${controlRepo.repo}" repo-init: FAILED — ${controlRepoInit.reason}`);
   } else {
@@ -1065,6 +1188,16 @@ export async function applyFleet(
     let repoInitOutcome: RepoInitStepOutcome | undefined;
     const handle = deriveAppHandle(manifest.metadata.name, agent.role);
 
+    // groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+    // — computed unconditionally (pure, no I/O) but only PUSHED into
+    // `actionsPinResults` when `manifest.versions` is declared, mirroring
+    // `apply-version.ts`'s own "absent means no opinion, nothing recorded"
+    // gate. `deps.observedActionsPins` is the ALREADY-READ pin
+    // (`ObservedState.agents[role].actionsPin`, computed once in
+    // `commands/bootstrap-apply.ts` before `applyFleet` was ever called) —
+    // never a second live read here (#1000 golden path).
+    const pinReconcile = resolveActionsPinReconcile(manifest.versions?.actions, deps.observedActionsPins?.agents[agent.role]);
+
     if (identity.status === 'reused' || identity.status === 'resumed-install') {
       writeIncrementalLock(agent.role, { appId: identity.appId, installId: identity.installId });
       // No PEM in process memory this run for `reused`/`resumed-install` (no
@@ -1072,7 +1205,11 @@ export async function applyFleet(
       // `RepoInitStepOptions.tokenSource`'s doc) — pre-existing, acknowledged
       // gap; groundnuty/macf#920 closes ONLY the `created` path below, which
       // is where apply-fleet.ts already holds a freshly-exchanged credential.
-      repoInitOutcome = await applyRepoInitForAgent(agent, manifest, deps.repoInitDeps);
+      repoInitOutcome = await applyRepoInitForAgent(agent, manifest, deps.repoInitDeps, {
+        actionsVersion: pinReconcile.actionsVersion,
+        force: pinReconcile.force,
+      });
+      if (manifest.versions) actionsPinResults.push(actionsPinResultFor(agent.repo, pinReconcile.force, repoInitOutcome));
     } else if (identity.status === 'created') {
       const secrets = agentVaultSecrets(handle, identity);
       pendingVaultAgents.push(secrets);
@@ -1082,9 +1219,26 @@ export async function applyFleet(
         secrets: vaultAgentSecretsForFingerprint(secrets),
       };
       repoInitOutcome = await applyRepoInitForCreatedAgent(agent, manifest, identity, deps.repoInitDeps);
+      // A brand-new repo's workflow file is written unconditionally as part
+      // of creation (no existing file to force past) — the declared pin (or
+      // the bootstrap default, when nothing was declared) lands regardless
+      // of `force`. Reported 'reconciled' when `versions:` was declared
+      // (the pin now matches it, by construction); no entry otherwise.
+      if (manifest.versions && repoInitOutcome.status === 'applied') {
+        actionsPinResults.push({ repo: agent.repo, status: 'reconciled' });
+      } else if (manifest.versions && repoInitOutcome.status === 'failed') {
+        actionsPinResults.push({ repo: agent.repo, status: 'could-not-attempt', reason: repoInitOutcome.reason });
+      }
+    } else if (manifest.versions) {
+      // skipped-unverified / drift / failed: no lock write, no repo-init —
+      // this agent's identity is unresolved this run, so its router pin
+      // cannot be examined or reconciled either.
+      actionsPinResults.push({
+        repo: agent.repo,
+        status: 'could-not-attempt',
+        reason: `agent identity is unresolved this run (${identity.status}) — the router pin was not examined`,
+      });
     }
-    // skipped-unverified / drift / failed: no lock write, no repo-init —
-    // this agent's identity is unresolved this run.
 
     records.push({ role: agent.role, identity, repoInit: repoInitOutcome });
   }
@@ -1548,6 +1702,9 @@ export async function applyFleet(
     ca,
     routing,
     routingClient,
+    actionsPin: manifest.versions
+      ? { attempted: true, target: manifest.versions.actions, results: actionsPinResults }
+      : { attempted: false, results: [] },
   };
 }
 

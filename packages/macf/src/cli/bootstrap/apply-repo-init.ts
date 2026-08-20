@@ -108,6 +108,73 @@ export interface RepoInitStepOptions {
    * so nothing new is asserted about it).
    */
   readonly tokenSource?: TokenSource;
+  /**
+   * groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+   * — override the `actionsVersion` `repoInit()` receives, computed by the
+   * caller via {@link resolveActionsPinReconcile} from the ALREADY-OBSERVED
+   * pin (`ObservedState.agents[role].actionsPin` / `.controlRepoActionsPin`
+   * — never re-read here, per the #1000 golden path: one reader per fact).
+   * Omitted (the default) preserves the exact pre-#1072 fallback chain:
+   * `manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION`.
+   */
+  readonly actionsVersion?: string;
+  /**
+   * groundnuty/macf#1072 — force `repoInit()` to REWRITE an existing
+   * `agent-router.yml` even though the file is already present. `false`
+   * (the default, unchanged pre-#1072 behavior) means an existing workflow
+   * file is left untouched no matter how far its pin has drifted — this is
+   * the exact defect #1072 reports ("apply sees the drift... and declines
+   * to act"). Callers set `true` ONLY when {@link resolveActionsPinReconcile}
+   * determined the declared pin diverges from (or is unobservable against)
+   * the manifest's `versions.actions` — never unconditionally, so an
+   * ordinary identity-sync run on an already-converged repo never produces
+   * a spurious commit.
+   */
+  readonly force?: boolean;
+}
+
+/**
+ * groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+ * — whether THIS repo's committed macf-actions router pin needs a
+ * force-rewrite this run, and what `actionsVersion` to hand `repoInit()`
+ * either way. Pure; the single decision point both `apply-fleet.ts` call
+ * sites (per-agent + control repo) route through, so "does this repo need
+ * reconciling" is answered in exactly one place.
+ *
+ * Mirrors Amendment L2's ordering for `versions.macf`, applied to the OTHER
+ * `versions:` field:
+ *
+ *   - `declaredActions` ABSENT (`versions:` not declared, or declared
+ *     without `actions` — schema-unreachable, `FleetVersionsSchema` requires
+ *     both fields together) → "no opinion" (L2.4): `force` stays `false`,
+ *     and the returned `actionsVersion` prefers the OBSERVED pin (already
+ *     committed, already immutable in every real repo-init-generated repo)
+ *     over the floating `DEFAULT_ACTIONS_VERSION` bootstrap default. This
+ *     closes a pre-#1072 gap: the unconditional per-agent identity-sync
+ *     call previously defaulted to the FLOATING `'v3'` whenever nothing was
+ *     declared, which made `repoInit()` query GitHub's `/tags` endpoint for
+ *     "latest v3" on every ordinary sync run even though nothing was ever
+ *     going to be written (`force` was — and stays — `false` on this path).
+ *   - `declaredActions` present and EQUALS the observed pin → no force
+ *     (nothing to reconcile; `actionsVersion` is the declared value, moot
+ *     since nothing gets written).
+ *   - `declaredActions` present and DIVERGES from the observed pin (or the
+ *     pin could not be read at all — `observedPin === undefined`) →
+ *     `force: true`, and `actionsVersion` is the MANIFEST's value VERBATIM
+ *     — never resolved from anywhere else. This is Amendment L3's
+ *     no-fetch-for-the-TARGET guarantee applied to this field: the target
+ *     this function returns is never a function of `observedPin` when
+ *     `declaredActions` is present, so a manifest-declared pin is what
+ *     lands regardless of what was observed.
+ */
+export function resolveActionsPinReconcile(
+  declaredActions: string | undefined,
+  observedPin: string | undefined,
+): { readonly actionsVersion: string; readonly force: boolean } {
+  if (declaredActions !== undefined) {
+    return { actionsVersion: declaredActions, force: observedPin !== declaredActions };
+  }
+  return { actionsVersion: observedPin ?? DEFAULT_ACTIONS_VERSION, force: false };
 }
 
 export interface RepoInitStepDeps {
@@ -218,12 +285,17 @@ export async function applyRepoInitForAgent(
 
     const result = await runRepoInit(dir, {
       repo: agent.repo,
-      actionsVersion: manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION,
+      // groundnuty/macf#1072 — `opts.actionsVersion`/`opts.force` are the
+      // caller's already-computed `resolveActionsPinReconcile` decision;
+      // omitted (both undefined) preserves the exact pre-#1072 fallback
+      // (`manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION`, always
+      // `force: false`) for every caller that doesn't pass them.
+      actionsVersion: opts?.actionsVersion ?? manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION,
       // repo/role are unique-per-manifest (FleetManifestSchema's superRefine
       // rejects duplicate agents[].repo) — one agent per repo in v0, so the
       // routing config for THIS repo names exactly this agent's role.
       agents: agent.role,
-      force: false,
+      force: opts?.force ?? false,
       project: manifest.metadata.name,
       ...(opts?.tokenSource !== undefined ? { tokenSource: opts.tokenSource } : {}),
       ...registryOpts,

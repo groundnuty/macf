@@ -467,3 +467,20 @@ export function buildTrustedActorsValue(fleetName: string, agents: readonly Flee
 export function deriveControlRepoName(fleetName: string): string {
   return `${fleetName}-control`;
 }
+
+/**
+ * groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+ * — the FULL set of repos that carry a committed macf-actions router
+ * workflow: every declared agent's repo, AND the control repo (which has
+ * carried one since `#1070` — `apply-control-repo-init.ts` runs
+ * `repoInit()` against it on every `apply`). Single source of truth for
+ * "derive the target set from repos carrying the router, never a hardcoded
+ * list" — both `plan.ts::computePlan` (which repos get an `actions_pin`
+ * item) and `apply-fleet.ts`'s reconcile step (which repos get a
+ * force-rewrite attempt when their pin diverges) enumerate THIS list, so a
+ * router added to a THIRD kind of repo in the future is a one-line change
+ * here, never a two-place drift risk between plan and apply.
+ */
+export function routerCarryingRepos(manifest: FleetManifest): readonly string[] {
+  return [...manifest.agents.map((a) => a.repo), `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`];
+}
