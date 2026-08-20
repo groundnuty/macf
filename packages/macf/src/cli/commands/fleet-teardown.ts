@@ -20,12 +20,16 @@ import { checkControlRepoMeta, realReadControlManifestFile } from '../bootstrap/
 import { checkRegistryVariablePresence } from '../bootstrap/observer.js';
 import { realDeleteRegistryVariable } from '../bootstrap/variable-write.js';
 import { realArchiveRepo } from '../bootstrap/repo-archive.js';
+import { createVmExecSeams, resolveTarget, type VmDriverSeams } from '../fleet/vm-driver.js';
 import type {
+  AgentReachability,
+  AgentStopCategory,
   ArchivePlan,
   DeactivateInventoryEntry,
   DeactivatePlan,
   DeactivateTarget,
   RepoArchiveOutcome,
+  TeardownAgentDeps,
   TeardownControlRepoDeps,
   TeardownGate,
   TeardownRepoArchiveDeps,
@@ -41,10 +45,19 @@ export interface RunFleetTeardownOptions {
   /** Skip the interactive confirmation prompt (the one non-interactive escape, mirroring `bootstrap apply --yes`). */
   readonly yes?: boolean;
   readonly json?: boolean;
+  /**
+   * `groundnuty/macf#1033` — the host-local directory used ONLY to locate
+   * the canonical `tmux-send-to-claude.sh` submit helper for the
+   * graceful-exit request (any macf workspace's copy works — it's not
+   * role-specific). Defaults to `process.cwd()`. Discovery itself
+   * (`discoverWorkspaces()`) is host-wide, independent of this value — see
+   * `resolveAgentStopDeps`'s doc.
+   */
+  readonly dir?: string;
 }
 
 /** Injectable seam so tests drive the command without touching `gh` / stdin. */
-export interface FleetTeardownDeps extends TeardownControlRepoDeps, TeardownVariableDeps, TeardownRepoArchiveDeps {
+export interface FleetTeardownDeps extends TeardownControlRepoDeps, TeardownVariableDeps, TeardownRepoArchiveDeps, TeardownAgentDeps {
   readonly confirm: (question: string) => Promise<boolean>;
 }
 
@@ -62,7 +75,75 @@ async function realConfirm(question: string): Promise<boolean> {
   });
 }
 
-function resolveDeps(): FleetTeardownDeps {
+/**
+ * `groundnuty/macf#1033` — local-only reachability, reusing DR-037's
+ * `FleetDriver` primitives (`resolveTarget` + `hasSession`, the SAME two
+ * `vm-driver.ts::isBusy` already composes) — never a new mechanism.
+ * `session: null` unless `'alive'` (nothing to submit into otherwise).
+ * Exported so tests can pin the name-form contract directly against
+ * `VmDriverSeams` fakes (the seam THIS function actually reads) rather than
+ * only against `TeardownAgentDeps` fakes one level removed from it — the
+ * class of gap `assert-the-wrong-path.md` names: a role-name-form mismatch
+ * between `fleet.yaml`'s kebab `agents[].role` and whatever
+ * `discoverWorkspaces()` puts in `WorkspaceRecord.agent` would silently
+ * degrade every agent to `'unknown'` (never an error) — exactly the shape
+ * `vm-driver.ts`'s own macf#708 docblock warns a name-form mismatch produces.
+ */
+export function reachabilityFor(seams: VmDriverSeams, role: string): { readonly reachability: AgentReachability; readonly session: string | null } {
+  const target = resolveTarget(seams, role);
+  if (!target?.session) return { reachability: 'unknown', session: null };
+  const alive = seams.hasSession(target.session);
+  return { reachability: alive ? 'alive' : 'dead', session: alive ? target.session : null };
+}
+
+/**
+ * The `TeardownAgentDeps` trio's PURE logic over an already-built
+ * `VmDriverSeams` (`groundnuty/macf#1033`) — factored out of
+ * `resolveAgentStopDeps` so it is unit-testable with seam fakes instead of
+ * only through `resolveDeps`'s real `createVmExecSeams(dir)` wiring. Never
+ * a signal, never `tmux kill-session` — `submit(session, '/exit')` is the
+ * ONLY agent-facing primitive this calls.
+ */
+export function agentStopDepsOverSeams(seams: VmDriverSeams): TeardownAgentDeps {
+  return {
+    checkAgentReachability: (role) => Promise.resolve(reachabilityFor(seams, role).reachability),
+    requestGracefulExit: (role) => {
+      const { session } = reachabilityFor(seams, role);
+      if (!session) return Promise.resolve();
+      // The native Claude Code TUI `/exit` slash command — the SAME "normal
+      // TUI exit" `macf-channel-server`'s `shutdown.ts` stdin close/end
+      // wiring already treats as the graceful-deregister trigger (macf#627).
+      // NEVER a signal, NEVER `tmux kill-session` — see `TeardownAgentDeps`'s
+      // doc in teardown.ts for the full mechanism rationale + the live
+      // verification (macf#1033, 2026-08-20) that this submit dispatches.
+      seams.submit(session, '/exit');
+      return Promise.resolve();
+    },
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+  };
+}
+
+/**
+ * Builds the `TeardownAgentDeps` trio over a MINIMAL local `VmDriverSeams` —
+ * `createVmExecSeams(dir)` plus inert `listPeers`/`probeHealth` stubs (never
+ * called by `resolveTarget` / `hasSession` / `submit`), so this needs NO
+ * GitHub token mint and NO registry read, unlike the full
+ * `createVmDriverFromConfig`. Discovery (`discoverWorkspaces()`, inside
+ * `createVmExecSeams`'s `discover` field) is host-wide (`MACF_WORKSPACE_ROOT`
+ * or the sensible default), independent of `dir` — `dir` is used ONLY to
+ * locate `tmux-send-to-claude.sh` (see `vm-driver.ts::tmuxSubmitScript`), so
+ * it works from ANY macf workspace, not necessarily the target agent's own.
+ */
+function resolveAgentStopDeps(dir: string): TeardownAgentDeps {
+  const seams: VmDriverSeams = {
+    listPeers: async () => [],
+    probeHealth: async () => null,
+    ...createVmExecSeams(dir),
+  };
+  return agentStopDepsOverSeams(seams);
+}
+
+function resolveDeps(dir?: string): FleetTeardownDeps {
   return {
     checkMeta: checkControlRepoMeta,
     readManifestFile: realReadControlManifestFile,
@@ -70,6 +151,7 @@ function resolveDeps(): FleetTeardownDeps {
     deleteRegistryVariable: realDeleteRegistryVariable,
     archiveRepo: realArchiveRepo,
     confirm: realConfirm,
+    ...resolveAgentStopDeps(dir ?? process.cwd()),
   };
 }
 
@@ -121,9 +203,72 @@ function formatInventoryLines(inventory: readonly DeactivateInventoryEntry[]): s
 
 function formatVariableOutcomeLines(outcomes: readonly VariableTeardownOutcome[]): string[] {
   return outcomes.map((o) => {
-    const suffix = o.status === 'failed' ? ` — ${o.reason ?? 'unknown error'}` : '';
+    const suffix = o.reason !== undefined ? ` — ${o.reason}` : '';
     return `  ${o.target.kind.padEnd(20)} ${o.target.name.padEnd(40)} ${o.status.toUpperCase()}${suffix}`;
   });
+}
+
+/**
+ * `groundnuty/macf#1033` — the pre-confirmation reachability preview: which
+ * `agent_registration` targets are alive/dead/unknown from THIS host, and
+ * what `deactivate` will therefore do to each, BEFORE the operator
+ * confirms. `deactivate` may now stop a running agent — that belongs in the
+ * plan the operator sees, not discovered only after the fact.
+ */
+async function renderAgentReachabilityPreview(targets: readonly DeactivateTarget[], deps: Pick<TeardownAgentDeps, 'checkAgentReachability'>): Promise<void> {
+  const agentTargets = targets.filter((t): t is DeactivateTarget & { role: string } => t.kind === 'agent_registration' && t.role !== undefined);
+  if (agentTargets.length === 0) return;
+
+  const rows: { readonly role: string; readonly reachability: AgentReachability }[] = [];
+  for (const t of agentTargets) {
+    rows.push({ role: t.role, reachability: await deps.checkAgentReachability(t.role) });
+  }
+  const lines = rows.map((r) => {
+    const note =
+      r.reachability === 'alive'
+        ? 'will be asked to exit gracefully (/exit) and self-deregister'
+        : r.reachability === 'dead'
+          ? 'no live session on this host — will be deregistered directly'
+          : 'not discoverable on this host — left UNTOUCHED (a fleet may span hosts, #1018)';
+    return `  ${r.role.padEnd(20)} ${r.reachability.toUpperCase().padEnd(9)} ${note}`;
+  });
+  process.stderr.write('\nLive-agent reachability (this host only, DR-037 Amendment D — a fleet may span hosts):\n');
+  process.stderr.write(`${lines.join('\n')}\n`);
+}
+
+/** `groundnuty/macf#1033` — the three-category report (issue's requirement 4), exhaustively over the 4 reachable {@link AgentStopCategory} values. Empty when the fleet has no agent targets (never rendered). */
+function formatAgentStopSummary(outcomes: readonly VariableTeardownOutcome[]): string[] {
+  const categorized = outcomes.filter((o): o is VariableTeardownOutcome & { agentStopCategory: AgentStopCategory } => o.agentStopCategory !== undefined);
+  if (categorized.length === 0) return [];
+
+  const counts: Record<AgentStopCategory, number> = {
+    'stopped-self-deregistered': 0,
+    'deregistered-directly': 0,
+    unreachable: 0,
+    'stop-unconfirmed': 0,
+  };
+  for (const o of categorized) counts[o.agentStopCategory] += 1;
+
+  return [
+    'Agent-stop summary:',
+    `  stopped + self-deregistered:              ${String(counts['stopped-self-deregistered'])}`,
+    `  deregistered directly (no live owner):     ${String(counts['deregistered-directly'])}`,
+    `  unreachable (unknown — never assumed stopped): ${String(counts.unreachable)}`,
+    `  graceful exit requested, unconfirmed:      ${String(counts['stop-unconfirmed'])}`,
+  ];
+}
+
+function agentStopSummaryToJson(outcomes: readonly VariableTeardownOutcome[]): Record<AgentStopCategory, number> | null {
+  const categorized = outcomes.filter((o): o is VariableTeardownOutcome & { agentStopCategory: AgentStopCategory } => o.agentStopCategory !== undefined);
+  if (categorized.length === 0) return null;
+  const counts: Record<AgentStopCategory, number> = {
+    'stopped-self-deregistered': 0,
+    'deregistered-directly': 0,
+    unreachable: 0,
+    'stop-unconfirmed': 0,
+  };
+  for (const o of categorized) counts[o.agentStopCategory] += 1;
+  return counts;
 }
 
 function formatRepoOutcomeLines(outcomes: readonly RepoArchiveOutcome[]): string[] {
@@ -155,6 +300,9 @@ function deactivateResultToJson(result: DeactivateResult): unknown {
     fleet: result.fleet,
     gate: { allowed: result.gate.allowed, ownership: result.gate.ownership, reason: result.gate.reason ?? null },
     outcomes: result.outcomes.map((o) => ({ ...o })),
+    // groundnuty/macf#1033 — the three(-plus-one)-category report, null when
+    // this fleet has no agent_registration targets at all.
+    agent_stop_summary: agentStopSummaryToJson(result.outcomes),
   };
 }
 
@@ -172,7 +320,7 @@ export async function runFleetDeactivate(opts: RunFleetTeardownOptions, deps?: F
   if (isFailure(loaded)) return renderFailure(loaded, opts);
   const manifest = loaded;
 
-  const resolved = deps ?? resolveDeps();
+  const resolved = deps ?? resolveDeps(opts.dir);
   const plan: DeactivatePlan = await buildDeactivatePlan(manifest, resolved);
 
   process.stderr.write(`${formatGateLine(plan.gate)}\n`);
@@ -185,6 +333,7 @@ export async function runFleetDeactivate(opts: RunFleetTeardownOptions, deps?: F
   process.stderr.write(`${planTargetsPreview(plan.targets).join('\n')}\n\n`);
   process.stderr.write('Current registry state:\n');
   process.stderr.write(`${formatInventoryLines(plan.inventory).join('\n')}\n`);
+  await renderAgentReachabilityPreview(plan.targets, resolved);
 
   const approved = opts.yes === true ? true : await resolved.confirm(`\nDeactivate fleet "${plan.fleet}" (remove ${String(plan.targets.length)} registry key(s))?`);
   if (!approved) {
@@ -200,6 +349,11 @@ export async function runFleetDeactivate(opts: RunFleetTeardownOptions, deps?: F
   } else {
     console.log('');
     console.log(formatVariableOutcomeLines(outcomes).join('\n'));
+    const summary = formatAgentStopSummary(outcomes);
+    if (summary.length > 0) {
+      console.log('');
+      console.log(summary.join('\n'));
+    }
   }
   return deactivateExitCode(result);
 }
@@ -230,7 +384,7 @@ export async function runFleetArchive(opts: RunFleetTeardownOptions, deps?: Flee
   if (isFailure(loaded)) return renderFailure(loaded, opts);
   const manifest = loaded;
 
-  const resolved = deps ?? resolveDeps();
+  const resolved = deps ?? resolveDeps(opts.dir);
   const plan: ArchivePlan = await buildArchivePlan(manifest, resolved);
 
   process.stderr.write(`${formatGateLine(plan.gate)}\n`);
@@ -245,6 +399,7 @@ export async function runFleetArchive(opts: RunFleetTeardownOptions, deps?: Flee
   process.stderr.write(`${formatInventoryLines(plan.inventory).join('\n')}\n\n`);
   process.stderr.write('The following repos would be ARCHIVED (read-only; reversible via `apply`):\n');
   process.stderr.write(`${plan.repoTargets.map((r) => `  ${r}`).join('\n')}\n`);
+  await renderAgentReachabilityPreview(plan.targets, resolved);
 
   const approved =
     opts.yes === true
@@ -266,6 +421,11 @@ export async function runFleetArchive(opts: RunFleetTeardownOptions, deps?: Flee
   } else {
     console.log('');
     console.log(formatVariableOutcomeLines(outcomes).join('\n'));
+    const summary = formatAgentStopSummary(outcomes);
+    if (summary.length > 0) {
+      console.log('');
+      console.log(summary.join('\n'));
+    }
     console.log('');
     console.log(formatRepoOutcomeLines(repoOutcomes).join('\n'));
   }

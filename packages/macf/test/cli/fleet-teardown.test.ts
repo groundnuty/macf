@@ -7,7 +7,14 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runFleetArchive, runFleetDeactivate, type FleetTeardownDeps } from '../../src/cli/commands/fleet-teardown.js';
+import {
+  runFleetArchive,
+  runFleetDeactivate,
+  reachabilityFor,
+  agentStopDepsOverSeams,
+  type FleetTeardownDeps,
+} from '../../src/cli/commands/fleet-teardown.js';
+import type { VmDriverSeams } from '../../src/cli/fleet/vm-driver.js';
 
 const FLEET_YAML = `apiVersion: macf/v0
 kind: Fleet
@@ -47,7 +54,15 @@ function writeManifest(body = FLEET_YAML): string {
   return p;
 }
 
-/** Gate allowed (`ours`) by default; every mutating call throws unless a test overrides it — surfaces an unexpected touch immediately. */
+/**
+ * Gate allowed (`ours`) by default; every mutating call throws unless a test
+ * overrides it — surfaces an unexpected touch immediately.
+ *
+ * `checkAgentReachability` defaults to `'dead'` (groundnuty/macf#1033) —
+ * every `agent_registration` target keeps taking the SAME direct-delete
+ * path these pre-#1033 tests already assert on; tests exercising the new
+ * stop-then-verify-else-fallback state machine override it explicitly.
+ */
 function depsFor(overrides: Partial<FleetTeardownDeps> = {}): FleetTeardownDeps {
   return {
     checkMeta: async () => ({ presence: 'present', archived: false }),
@@ -58,6 +73,11 @@ function depsFor(overrides: Partial<FleetTeardownDeps> = {}): FleetTeardownDeps 
       throw new Error('must not be called — this test did not override archiveRepo');
     },
     confirm: async () => true,
+    checkAgentReachability: async () => 'dead',
+    requestGracefulExit: async () => {
+      throw new Error('must not be called — this test did not override requestGracefulExit (default reachability is dead)');
+    },
+    sleep: async () => {},
     ...overrides,
   };
 }
@@ -249,6 +269,140 @@ describe('runFleetDeactivate', () => {
       cap.restore();
     }
   });
+
+  // --- groundnuty/macf#1033 — the CLI-layer wiring of the stop-then-verify-else-fallback state machine ---
+
+  it('a LIVE agent -> requestGracefulExit fires, its slot self-clears, deleteRegistryVariable is NEVER called for that role, exit 0', async () => {
+    const file = writeManifest();
+    const gracefulExitRoles: string[] = [];
+    const deletedNames: string[] = [];
+    let presencePolls = 0;
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeactivate(
+        { file, yes: true },
+        depsFor({
+          checkAgentReachability: async () => 'alive',
+          requestGracefulExit: async (role) => {
+            gracefulExitRoles.push(role);
+          },
+          checkRegistryPresence: async () => {
+            presencePolls += 1;
+            return presencePolls >= 2 ? 'absent' : 'present';
+          },
+          deleteRegistryVariable: async (_registry, name) => {
+            deletedNames.push(name);
+            return 'deleted';
+          },
+        }),
+      );
+      expect(code).toBe(0);
+      expect(gracefulExitRoles).toEqual(['code-agent']);
+      expect(deletedNames).not.toContain('DEMO_FLEET_AGENT_CODE_AGENT');
+      expect(cap.logs.join('\n')).toMatch(/SELF-DEREGISTERED/);
+      expect(cap.logs.join('\n')).toMatch(/stopped \+ self-deregistered:\s+1/);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('an UNREACHABLE agent -> reported unknown/unreachable, delete NEVER attempted, exit STAYS 0 (an honest partial view, not a failure)', async () => {
+    const file = writeManifest();
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeactivate(
+        { file, yes: true },
+        depsFor({
+          checkAgentReachability: async () => 'unknown',
+          deleteRegistryVariable: async (_registry, name) => {
+            if (name === 'DEMO_FLEET_AGENT_CODE_AGENT') throw new Error('must not be called for an unreachable agent');
+            return 'deleted';
+          },
+        }),
+      );
+      expect(code).toBe(0);
+      expect(cap.logs.join('\n')).toMatch(/UNREACHABLE/);
+      expect(cap.logs.join('\n')).toMatch(/unreachable \(unknown — never assumed stopped\):\s+1/);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('a LIVE agent that never confirms self-deregister -> stop-unconfirmed, status FAILED, exit 1, direct-delete still never called', async () => {
+    const file = writeManifest();
+    const deletedNames: string[] = [];
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeactivate(
+        { file, yes: true },
+        depsFor({
+          checkAgentReachability: async () => 'alive',
+          requestGracefulExit: async () => {},
+          checkRegistryPresence: async () => 'present', // never confirms
+          deleteRegistryVariable: async (_registry, name) => {
+            deletedNames.push(name);
+            return 'deleted';
+          },
+        }),
+      );
+      expect(code).toBe(1);
+      expect(deletedNames).not.toContain('DEMO_FLEET_AGENT_CODE_AGENT');
+      expect(cap.logs.join('\n')).toMatch(/did not self-deregister/);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('the reachability preview is rendered BEFORE the confirmation prompt (the operator sees what will be stopped before approving)', async () => {
+    const file = writeManifest();
+    const cap = captureConsole();
+    let confirmCalledAfterPreview = false;
+    try {
+      await runFleetDeactivate(
+        { file },
+        depsFor({
+          checkAgentReachability: async () => 'alive',
+          requestGracefulExit: async () => {},
+          checkRegistryPresence: async () => 'absent',
+          confirm: async () => {
+            // By the time confirm() runs, the reachability preview line must
+            // already be in the captured stream.
+            confirmCalledAfterPreview = cap.errs.join('\n').includes('Live-agent reachability');
+            return false;
+          },
+        }),
+      );
+      expect(confirmCalledAfterPreview).toBe(true);
+      expect(cap.errs.join('\n')).toMatch(/will be asked to exit gracefully \(\/exit\)/);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('--json carries agent_stop_summary with all four categories present and summing to the agent count', async () => {
+    const file = writeManifest();
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeactivate(
+        { file, yes: true, json: true },
+        depsFor({
+          checkAgentReachability: async () => 'unknown',
+        }),
+      );
+      expect(code).toBe(0);
+      const parsed = JSON.parse(cap.logs.join('\n')) as {
+        agent_stop_summary: Record<string, number> | null;
+      };
+      expect(parsed.agent_stop_summary).toEqual({
+        'stopped-self-deregistered': 0,
+        'deregistered-directly': 0,
+        unreachable: 1,
+        'stop-unconfirmed': 0,
+      });
+    } finally {
+      cap.restore();
+    }
+  });
 });
 
 describe('runFleetArchive', () => {
@@ -417,5 +571,110 @@ describe('runFleetArchive', () => {
     } finally {
       cap.restore();
     }
+  });
+});
+
+// --- groundnuty/macf#1033 — reachabilityFor / agentStopDepsOverSeams over the
+// PRODUCTION seam (VmDriverSeams), not the TeardownAgentDeps fake one level
+// removed from it. Every test above this point injects TeardownAgentDeps
+// directly, so `resolveTarget`'s role-name-form resolution (fleet.yaml's
+// kebab `agents[].role` vs whatever `discoverWorkspaces()` puts in
+// `WorkspaceRecord.agent`) is never exercised by the suite otherwise — see
+// `assert-the-wrong-path.md` + vm-driver.ts's own macf#708 docblock, which
+// documents exactly this class of silent name-form mismatch. ---
+
+/** Every field `reachabilityFor`/`agentStopDepsOverSeams` does NOT read throws if called — surfaces an unexpected touch immediately. */
+function minimalSeams(overrides: Partial<VmDriverSeams> = {}): { seams: VmDriverSeams; submits: { session: string; text: string }[] } {
+  const submits: { session: string; text: string }[] = [];
+  const unexpected = (name: string) => () => {
+    throw new Error(`must not be called — reachabilityFor/agentStopDepsOverSeams never reaches '${name}'`);
+  };
+  const seams: VmDriverSeams = {
+    discover: () => [],
+    readConfig: () => null,
+    hasSession: () => false,
+    submit: (session, text) => submits.push({ session, text }),
+    listPeers: unexpected('listPeers'),
+    probeHealth: unexpected('probeHealth'),
+    capturePane: unexpected('capturePane'),
+    exec: unexpected('exec'),
+    spawnDetached: unexpected('spawnDetached'),
+    sleep: unexpected('sleep'),
+    isConfigDirty: unexpected('isConfigDirty'),
+    listDirtyConfig: unexpected('listDirtyConfig'),
+    currentBranch: unexpected('currentBranch'),
+    listModifiedFiles: unexpected('listModifiedFiles'),
+    readFullConfig: unexpected('readFullConfig'),
+    commitCanonicalFiles: unexpected('commitCanonicalFiles'),
+    readLaunchPin: unexpected('readLaunchPin'),
+    ...overrides,
+  };
+  return { seams, submits };
+}
+
+describe('reachabilityFor — the production seam macf#1033 stops agents through', () => {
+  it('discoverable + live tmux session -> alive, session = <project>@<routing-label>', () => {
+    const { seams } = minimalSeams({
+      discover: () => [{ agent: 'code-agent', workspace: '/w/macf', registry: 'g', project: 'macf', versionPin: null }],
+      readConfig: (dir) => (dir === '/w/macf' ? { project: 'macf', routingLabel: 'code-agent' } : null),
+      hasSession: (s) => s === 'macf@code-agent',
+    });
+    expect(reachabilityFor(seams, 'code-agent')).toEqual({ reachability: 'alive', session: 'macf@code-agent' });
+  });
+
+  it('discoverable, no live tmux session -> dead, session null', () => {
+    const { seams } = minimalSeams({
+      discover: () => [{ agent: 'code-agent', workspace: '/w/macf', registry: 'g', project: 'macf', versionPin: null }],
+      readConfig: (dir) => (dir === '/w/macf' ? { project: 'macf', routingLabel: 'code-agent' } : null),
+      hasSession: () => false,
+    });
+    expect(reachabilityFor(seams, 'code-agent')).toEqual({ reachability: 'dead', session: null });
+  });
+
+  it('NOT discoverable at all (this host has no workspace for the role) -> unknown, never dead', () => {
+    const { seams } = minimalSeams({ discover: () => [] });
+    expect(reachabilityFor(seams, 'code-agent')).toEqual({ reachability: 'unknown', session: null });
+  });
+
+  it('a fleet.yaml role that does not name-form-match discoverWorkspaces() -> unknown (the macf#708 hazard, applied to this seam)', () => {
+    // discover() carries a DIFFERENT shape ('CODE_AGENT') than the role this
+    // is queried with ('code-agent') — simulates the exact name-form
+    // mismatch vm-driver.ts's macf#708 docblock warns about, to pin that
+    // THIS function degrades to 'unknown' (never throws, never 'dead') on it.
+    const { seams } = minimalSeams({
+      discover: () => [{ agent: 'CODE_AGENT', workspace: '/w/macf', registry: 'g', project: 'macf', versionPin: null }],
+      hasSession: () => true,
+    });
+    expect(reachabilityFor(seams, 'code-agent')).toEqual({ reachability: 'unknown', session: null });
+  });
+});
+
+describe('agentStopDepsOverSeams — the submit contract (groundnuty/macf#1033)', () => {
+  it('an alive role -> submit is called with EXACTLY (session, "/exit") — no other payload, no signal seam exists to call', async () => {
+    const { seams, submits } = minimalSeams({
+      discover: () => [{ agent: 'code-agent', workspace: '/w/macf', registry: 'g', project: 'macf', versionPin: null }],
+      readConfig: (dir) => (dir === '/w/macf' ? { project: 'macf', routingLabel: 'code-agent' } : null),
+      hasSession: (s) => s === 'macf@code-agent',
+    });
+    const deps = agentStopDepsOverSeams(seams);
+    await deps.requestGracefulExit('code-agent');
+    expect(submits).toEqual([{ session: 'macf@code-agent', text: '/exit' }]);
+  });
+
+  it('a dead/unreachable role -> submit is NEVER called (nothing to submit into)', async () => {
+    const { seams, submits } = minimalSeams({ discover: () => [] });
+    const deps = agentStopDepsOverSeams(seams);
+    await deps.requestGracefulExit('code-agent');
+    expect(submits).toEqual([]);
+  });
+
+  it('checkAgentReachability reads through the SAME reachabilityFor this submit contract uses — the two never disagree', async () => {
+    const { seams } = minimalSeams({
+      discover: () => [{ agent: 'code-agent', workspace: '/w/macf', registry: 'g', project: 'macf', versionPin: null }],
+      readConfig: (dir) => (dir === '/w/macf' ? { project: 'macf', routingLabel: 'code-agent' } : null),
+      hasSession: (s) => s === 'macf@code-agent',
+    });
+    const deps = agentStopDepsOverSeams(seams);
+    expect(await deps.checkAgentReachability('code-agent')).toBe('alive');
   });
 });

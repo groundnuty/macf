@@ -497,13 +497,18 @@ fleet
     'prefix sweep. Repo-scoped variables/secrets, the vault, the repos, and the GitHub Apps are ALL left ' +
     'untouched — revival is `apply` away, zero browser clicks (Amendment G\'s "free revival" property). ' +
     'Refuses on a foreign/unconfirmed control repo. Shows the exact target set + current registry state ' +
-    'before any mutation (--yes skips the interactive confirmation).',
+    'before any mutation (--yes skips the interactive confirmation). groundnuty/macf#1033 — a LIVE agent ' +
+    'discoverable on THIS host is asked to exit gracefully (the native `/exit`) and lets its own ' +
+    '`shutdown.ts` deregister clear its slot; direct deletion is only the fallback for an agent with no ' +
+    'live owner; an agent this host cannot discover is reported `unknown`, never assumed stopped (a fleet ' +
+    'may span hosts, #1018). Never SIGKILL.',
   )
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
   .option('--yes', 'Skip the interactive confirmation prompt', false)
   .option('--json', 'Emit the structured result as JSON', false)
+  .option('--dir <path>', 'Host-local dir to locate the tmux-submit helper from (default: cwd) — macf#1033 agent-stop only, any macf workspace works')
   .action(async (opts) => {
-    const code = await runFleetDeactivate({ file: opts.file, yes: opts.yes, json: opts.json });
+    const code = await runFleetDeactivate({ file: opts.file, yes: opts.yes, json: opts.json, dir: opts.dir });
     process.exitCode = code;
   });
 
@@ -521,8 +526,9 @@ fleet
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
   .option('--yes', 'Skip the interactive confirmation prompt', false)
   .option('--json', 'Emit the structured result as JSON', false)
+  .option('--dir <path>', 'Host-local dir to locate the tmux-submit helper from (default: cwd) — macf#1033 agent-stop only, any macf workspace works')
   .action(async (opts) => {
-    const code = await runFleetArchive({ file: opts.file, yes: opts.yes, json: opts.json });
+    const code = await runFleetArchive({ file: opts.file, yes: opts.yes, json: opts.json, dir: opts.dir });
     process.exitCode = code;
   });
 

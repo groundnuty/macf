@@ -24,6 +24,24 @@
  * stops being addressable while every durable artifact (the vault, the
  * repos, the Apps) survives untouched.
  *
+ * ## Agent-owned slots are stopped-then-deregistered, never deleted out from
+ * under a live owner (groundnuty/macf#1033)
+ *
+ * `deactivate` used to delete every `agent_registration` target directly,
+ * even while the agent was still running — a live agent never re-asserts
+ * its own registration (it has no reason to, and no signal that its slot
+ * was removed), so the fleet was left with every agent alive, healthy, and
+ * invisible to routing. The operator's fix (issue #1033, reframed twice
+ * before landing here) is ownership, not reconciliation: a fleet command
+ * must not reach into a value the AGENT owns while the agent is alive.
+ * {@link deactivateAgentTarget} asks a live agent to exit gracefully and
+ * lets its own instance-id-guarded `shutdown.ts` deregister (DR-031,
+ * groundnuty/macf#627) clear the slot; direct deletion survives ONLY as
+ * the fallback for a target with no live owner. See that function's doc
+ * for the full state machine + the mechanism this reuses (never invents).
+ * DR-044's fleet/agent split is why an agent this host cannot discover is
+ * `'unknown'`, never assumed dead — a fleet may span hosts (#1018).
+ *
  * ## Exact-key targeting — the highest-stakes rail in this module
  *
  * {@link computeDeactivateTargets} derives the target set from `fleet.yaml`
@@ -264,10 +282,36 @@ export async function buildArchivePlan(
 
 // --- Execute (mutating) ---
 
+/**
+ * `groundnuty/macf#1033` — a `deactivate` target's own reachability, from
+ * THIS host only. `'alive'` = a live tmux session is discoverable for the
+ * role (DR-037's `FleetDriver` local-only workspace scan, Amendment D);
+ * `'dead'` = the workspace is discoverable but has no live session;
+ * `'unknown'` = this host cannot discover a workspace for the role AT ALL
+ * — it may be running on a DIFFERENT host (a fleet may span hosts, #1018),
+ * and DR-037 Amendment D states `FleetDriver` discovery is local-only BY
+ * CONSTRUCTION, never a cross-host claim. `'unknown'` must NEVER be treated
+ * as `'dead'` — that would license the direct-delete fallback against a
+ * possibly-live owner on another host, exactly the defect #1033 reports.
+ */
+export type AgentReachability = 'alive' | 'dead' | 'unknown';
+
+/**
+ * `groundnuty/macf#1033` — which of the four pathways an `agent_registration`
+ * target went through. Exhaustive over every reachable outcome (including
+ * the graceful-exit-requested-but-unconfirmed edge state, which the issue's
+ * three named categories don't literally cover but which IS reachable in
+ * practice — see `deactivateAgentTarget`'s doc) so a `deactivate` report's
+ * per-category counts always sum to the agent-target count.
+ */
+export type AgentStopCategory = 'stopped-self-deregistered' | 'deregistered-directly' | 'unreachable' | 'stop-unconfirmed';
+
 export interface VariableTeardownOutcome {
   readonly target: DeactivateTarget;
-  readonly status: 'deleted' | 'already-absent' | 'failed';
+  readonly status: 'deleted' | 'already-absent' | 'failed' | 'self-deregistered' | 'unreachable';
   readonly reason?: string;
+  /** Present ONLY for `target.kind === 'agent_registration'` — see {@link AgentStopCategory}. */
+  readonly agentStopCategory?: AgentStopCategory;
 }
 
 function errMessage(err: unknown): string {
@@ -275,18 +319,191 @@ function errMessage(err: unknown): string {
 }
 
 /**
+ * `groundnuty/macf#1033` — the side effects `deactivateAgentTarget` needs to
+ * gracefully stop a LIVE agent instead of deleting its registry slot out
+ * from under it. Deliberately split into small, individually-fakeable
+ * primitives (never a bundled "stopAgent" verb) so the STATE-MACHINE
+ * (`deactivateAgentTarget`) stays pure orchestration, unit-testable with
+ * hand-built fakes — same posture as every other dep bag in this module.
+ *
+ * **Mechanism, and why this one:** the operator's own reframing on the
+ * issue is the design — `deactivate` must STOP the agent and let it
+ * deregister ITSELF via the ALREADY-EXISTING instance-id-guarded path
+ * (`macf-channel-server`'s `shutdown.ts`, DR-031/#627), not reach into a
+ * value it does not own. The candidates considered (issue body): (1)
+ * `restart-self` (DR-031 piece 3) — REJECTED, its entire design is to
+ * RELAUNCH after killing the session (a detached relauncher is spawned
+ * BEFORE the kill specifically so the agent comes back up) — the opposite
+ * of what `deactivate` wants, and repurposing it would mean either fighting
+ * its relaunch machinery or forking it, neither of which is "reuse." (2)
+ * The canonical tmux session name + `tmux-send-to-claude.sh` submit
+ * primitive (DR-037's `FleetDriver`, already used by `inject`/`isBusy`) —
+ * CHOSEN: submitting the literal `/exit` slash command is the Claude Code
+ * TUI's own normal-exit path, and `shutdown.ts`'s own module doc names
+ * `/exit` explicitly as the trigger for its stdin `'end'`/`'close'`
+ * graceful-deregister wiring ("A normal TUI exit (`/exit`, or
+ * SIGTERM-to-the-TUI) does NOT deliver a SIGTERM/SIGINT to this process —
+ * it only sees its stdin reach EOF"); `fleet reconcile`'s own description
+ * separately treats `last-exit==0 /exit` as the recognized clean-shutdown
+ * signature. No new mechanism is invented — `requestGracefulExit`'s real
+ * implementation (`fleet-teardown.ts`) is the SAME `discover` +
+ * `readConfig` + `hasSession` + `submit` seam quartet `vm-driver.ts`'s
+ * `isBusy`/`inject` already compose, just without minting a registry token
+ * (this command needs no `listPeers`/`probeHealth`).
+ *
+ * **Verified live (groundnuty/macf#1033, 2026-08-20):** the one prior
+ * open question — whether `/exit` typed through `tmux-send-to-claude.sh`'s
+ * double-Enter submit pattern (built for free-text prompts) actually
+ * dispatches as a slash command rather than sitting in the input buffer or
+ * being read as prose — was run against a real live agent: the tmux
+ * session went away AND the channel-server process exited, confirming the
+ * submit dispatches as intended. This module's own worktree still never
+ * touches a live fleet (the decisive unit test below asserts the same
+ * contract against fakes), but the mechanism itself is no longer an
+ * open assumption.
+ */
+export interface TeardownAgentDeps {
+  readonly checkAgentReachability: (role: string) => Promise<AgentReachability>;
+  /**
+   * Ask a LIVE agent to exit gracefully. ONLY ever called after
+   * `checkAgentReachability` returned `'alive'`. NEVER a signal, NEVER
+   * `tmux kill-session` — see this interface's doc for the mechanism.
+   */
+  readonly requestGracefulExit: (role: string) => Promise<void>;
+  /** Sleep between deregister-poll attempts — injected so tests never wait in real time. */
+  readonly sleep: (ms: number) => Promise<void>;
+}
+
+/** `deactivateAgentTarget`'s poll budget for a live agent's self-deregister, attempt-count-based (never `Date.now()` — keeps the state machine deterministic under fakes). */
+export const DEFAULT_AGENT_STOP_GRACE_TIMEOUT_MS = 30_000;
+export const DEFAULT_AGENT_STOP_POLL_INTERVAL_MS = 2_000;
+
+export interface DeactivateAgentStopOptions {
+  /** Total budget to wait for a live agent's self-deregister (default {@link DEFAULT_AGENT_STOP_GRACE_TIMEOUT_MS}). */
+  readonly graceTimeoutMs?: number;
+  /** Interval between presence polls within the budget (default {@link DEFAULT_AGENT_STOP_POLL_INTERVAL_MS}). */
+  readonly pollIntervalMs?: number;
+}
+
+/**
+ * The `groundnuty/macf#1033` state machine for ONE `agent_registration`
+ * target — never called for `ca_registry`/`federated_cas` targets (those
+ * have no owning agent to stop; `executeDeactivate` routes them straight
+ * to the direct-delete path unchanged). Four reachable outcomes:
+ *
+ * - **`'unknown'` reachability** → `'unreachable'` — the direct-delete seam
+ *   is NEVER called (module doc: "never assumed stopped").
+ * - **`'dead'` reachability** → the pre-existing direct-delete FALLBACK
+ *   (`'deregistered-directly'`) — a stale slot with no live owner is
+ *   exactly what that path is for (issue requirement 3).
+ * - **`'alive'` reachability, self-deregisters within the grace budget** →
+ *   `'stopped-self-deregistered'` — the decisive case: `deleteRegistryVariable`
+ *   is NEVER called for this target; the registry key going absent is
+ *   entirely the agent's own `shutdown.ts` deregister.
+ * - **`'alive'` reachability, does NOT self-deregister within the grace
+ *   budget** → `'stop-unconfirmed'`, `status: 'failed'`. Deliberately NOT
+ *   folded into a direct-delete fallback: the agent asked-but-unconfirmed
+ *   is still POSSIBLY alive (busy, slow, or the `/exit` submission failed
+ *   silently) — deleting its slot here would re-risk exactly the "delete
+ *   out from under a live owner" defect #1033 reports. Surfaced loud
+ *   instead (module doc's "report what could not be done, never exit
+ *   green" rail) so the operator investigates rather than the command
+ *   guessing.
+ */
+async function deactivateAgentTarget(
+  manifest: FleetManifest,
+  target: DeactivateTarget,
+  role: string,
+  deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps,
+  graceTimeoutMs: number,
+  pollIntervalMs: number,
+): Promise<VariableTeardownOutcome> {
+  let reachability: AgentReachability;
+  try {
+    reachability = await deps.checkAgentReachability(role);
+  } catch {
+    // A reachability-check FAILURE is not evidence of death — degrade to
+    // 'unknown' (DR-044's honest-unknown-over-false-present spirit) rather
+    // than risk the direct-delete fallback against a possibly-live owner.
+    reachability = 'unknown';
+  }
+
+  if (reachability === 'unknown') {
+    return { target, status: 'unreachable', agentStopCategory: 'unreachable' };
+  }
+
+  if (reachability === 'dead') {
+    try {
+      const status = await deps.deleteRegistryVariable(manifest.owner.registry, target.name);
+      return { target, status, agentStopCategory: 'deregistered-directly' };
+    } catch (err) {
+      return { target, status: 'failed', reason: errMessage(err), agentStopCategory: 'deregistered-directly' };
+    }
+  }
+
+  // reachability === 'alive' — the graceful path (#1033's decisive case).
+  try {
+    await deps.requestGracefulExit(role);
+  } catch (err) {
+    return {
+      target,
+      status: 'failed',
+      reason: `graceful-exit request failed: ${errMessage(err)}`,
+      agentStopCategory: 'stop-unconfirmed',
+    };
+  }
+
+  const maxAttempts = Math.max(1, Math.ceil(graceTimeoutMs / pollIntervalMs));
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    await deps.sleep(pollIntervalMs);
+    let presence: Presence;
+    try {
+      presence = await deps.checkRegistryPresence(manifest.owner.registry, target.name);
+    } catch {
+      presence = 'unknown';
+    }
+    if (presence === 'absent') {
+      // The agent's OWN instance-id-guarded deregister cleared this — we
+      // never called deleteRegistryVariable for it (the decisive assertion).
+      return { target, status: 'self-deregistered', agentStopCategory: 'stopped-self-deregistered' };
+    }
+  }
+
+  return {
+    target,
+    status: 'failed',
+    reason:
+      `requested a graceful exit but the agent did not self-deregister within ${String(graceTimeoutMs)}ms — ` +
+      'never deleted directly under a possibly-live owner (macf#1033).',
+    agentStopCategory: 'stop-unconfirmed',
+  };
+}
+
+/**
  * Delete every target by EXACT KEY. NEVER throws — each target's own
  * failure resolves to `status: 'failed'` with a reason, so one bad key
  * cannot abort the rest of the run (the caller reports failures, never
  * exits green on any — module doc's "report what could not be done" rail).
+ *
+ * `groundnuty/macf#1033` — `agent_registration` targets are routed through
+ * {@link deactivateAgentTarget}'s stop-then-verify-else-fallback state
+ * machine instead of the direct delete; `ca_registry`/`federated_cas`
+ * targets (no owning agent) are unchanged.
  */
 export async function executeDeactivate(
   manifest: FleetManifest,
   targets: readonly DeactivateTarget[],
-  deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable'>,
+  deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps,
+  opts?: DeactivateAgentStopOptions,
 ): Promise<readonly VariableTeardownOutcome[]> {
+  const graceTimeoutMs = opts?.graceTimeoutMs ?? DEFAULT_AGENT_STOP_GRACE_TIMEOUT_MS;
+  const pollIntervalMs = opts?.pollIntervalMs ?? DEFAULT_AGENT_STOP_POLL_INTERVAL_MS;
   const out: VariableTeardownOutcome[] = [];
   for (const target of targets) {
+    if (target.kind === 'agent_registration' && target.role !== undefined) {
+      out.push(await deactivateAgentTarget(manifest, target, target.role, deps, graceTimeoutMs, pollIntervalMs));
+      continue;
+    }
     try {
       const status = await deps.deleteRegistryVariable(manifest.owner.registry, target.name);
       out.push({ target, status });
