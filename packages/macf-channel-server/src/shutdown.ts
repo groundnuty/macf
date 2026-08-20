@@ -2,8 +2,8 @@ import type { Registry } from '@groundnuty/macf-core';
 import type { HttpsServer, HealthState, Logger } from '@groundnuty/macf-core';
 
 /**
- * Registers SIGTERM, SIGINT, and MCP-stdin-close handlers that clean up
- * the agent's registry variable and stop the HTTPS server.
+ * Registers SIGTERM, SIGINT, SIGHUP, and MCP-stdin-close handlers that clean
+ * up the agent's registry variable and stop the HTTPS server.
  *
  * The channel-server runs as the Claude TUI's MCP stdio child. A normal TUI
  * exit (`/exit`, or SIGTERM-to-the-TUI) does NOT deliver a SIGTERM/SIGINT to
@@ -12,6 +12,37 @@ import type { HttpsServer, HealthState, Logger } from '@groundnuty/macf-core';
  * trigger on a normal TUI exit; the signal handlers cover direct kills; the
  * DR-031 TTL heartbeat (#589) remains the backstop for hard kills (SIGKILL /
  * OOM / power loss) where no handler runs at all.
+ *
+ * macf#1035: `#627`'s stdin wiring was verified live to NOT actually
+ * deregister, despite passing every existing (mocked-`process.exit`) unit
+ * test. Root-caused to two independent, additive defects, both fixed here:
+ *
+ * 1. **Once-guard stale-value race (this file).** The previous guard was a
+ *    `shuttingDown` boolean + a `lastResult` snapshot updated only when the
+ *    WINNING invocation finished. Node's stdin 'end' is ALWAYS immediately
+ *    followed by 'close' (`autoDestroy`/`emitClose` default `true` — verified
+ *    empirically via a real child-process repro, not a rare race), and both
+ *    are wired to the same handler. The 'close'-triggered second call saw
+ *    `shuttingDown === true` and returned `lastResult` — which was still its
+ *    *initial* value (`true`), because the first (real) call was still
+ *    awaiting the async registry delete. That spurious `true` needs only one
+ *    microtask hop to resolve, so its `process.exit(0)` always won the race
+ *    against the real cleanup's multi-await chain (a genuine network round
+ *    trip) and killed the process mid-deregister — on every graceful exit,
+ *    not occasionally. Existing tests never caught this because they mock
+ *    `process.exit`, so the abandoned real cleanup kept running silently in
+ *    the background instead of being cut off (see `cleanupPromise` below for
+ *    the fix: memoize the in-flight PROMISE, not a boolean-plus-snapshot).
+ * 2. **SIGHUP was unhandled (fixed by the new `process.on('SIGHUP', ...)`
+ *    below).** Verified live via a tmux-topology repro matching how
+ *    `claude.sh` actually launches agents (DR-013 tmux self-wrap execs into
+ *    `claude`, which spawns the channel-server as a non-detached child —
+ *    same session/process group as the pty): tearing down the pane after the
+ *    simulated TUI process exits (tmux's default `remain-on-exit off`
+ *    destroys the pty) delivers SIGHUP to the still-running channel-server
+ *    child. SIGHUP's default disposition is immediate termination with NO
+ *    handler run — worse than defect 1, since it skips the graceful path
+ *    (and the stdin 'end' event) entirely rather than merely racing it.
  *
  * Returns a cleanup function that can also be called directly.
  */
@@ -68,13 +99,17 @@ export function registerShutdownHandler(config: {
   readonly stdin?: Pick<NodeJS.ReadStream, 'on'>;
 }): (trigger?: string) => Promise<boolean> {
   const { agentName, registry, instanceId, httpsServer, healthState, registryHeartbeat, outboxTicker, inboxTicker, logger } = config;
-  let shuttingDown = false;
-  let lastResult = true;
 
-  async function cleanup(trigger?: string): Promise<boolean> {
-    if (shuttingDown) return lastResult;
-    shuttingDown = true;
+  // macf#1035: memoize the IN-FLIGHT PROMISE, not a `shuttingDown` boolean +
+  // `lastResult` snapshot. The old shape returned `lastResult`'s stale
+  // default (`true`) to any trigger that arrived while the winning trigger's
+  // cleanup was still in flight (see the module docblock for the verified
+  // 'end'-then-'close' race). Sharing the actual promise means every caller
+  // — however many triggers land in the same tick — awaits the SAME real
+  // outcome; none can observe a not-yet-updated placeholder.
+  let cleanupPromise: Promise<boolean> | undefined;
 
+  async function runCleanup(trigger?: string): Promise<boolean> {
     logger.info('shutdown_start', {
       agent: agentName,
       ...(trigger !== undefined ? { trigger } : {}),
@@ -176,8 +211,21 @@ export function registerShutdownHandler(config: {
     }
 
     logger.info('shutdown_complete', { agent: agentName, ok });
-    lastResult = ok;
     return ok;
+  }
+
+  // macf#1035: the exported `cleanup` is now a thin memoizing wrapper. The
+  // FIRST call assigns `cleanupPromise` synchronously (before `runCleanup`'s
+  // first `await` — `??=` and the assignment inside it happen in the same
+  // synchronous tick, so no second caller can ever race the assignment
+  // itself) and every subsequent call — regardless of trigger — returns that
+  // SAME promise. Only the winning trigger's value is ever passed to
+  // `runCleanup` (matches the pre-#1035 "trigger recorded once" contract);
+  // later triggers are ignored for logging purposes but correctly await the
+  // real, shared outcome instead of a stale placeholder.
+  function cleanup(trigger?: string): Promise<boolean> {
+    cleanupPromise ??= runCleanup(trigger);
+    return cleanupPromise;
   }
 
   // Exit 1 when any cleanup step failed so external monitors (systemd,
@@ -193,14 +241,26 @@ export function registerShutdownHandler(config: {
 
   process.on('SIGTERM', handlerFor('SIGTERM'));
   process.on('SIGINT', handlerFor('SIGINT'));
+  // macf#1035: tmux teardown after a TUI `/exit` closes the pane's pty and
+  // delivers SIGHUP to the channel-server child (spawned by Claude Code
+  // without setsid/detach, so it shares the pty's foreground process group)
+  // — verified live via a tmux-topology repro. SIGHUP's default disposition
+  // is immediate, unconditional termination; without a handler the process
+  // dies before the stdin 'end' event below ever fires. This process has no
+  // useful existence without its parent TUI, so treating a hangup exactly
+  // like SIGTERM/SIGINT (graceful deregister, then exit) is the correct
+  // response, not merely a defensive one.
+  process.on('SIGHUP', handlerFor('SIGHUP'));
 
   // macf#627: a normal Claude-TUI exit does NOT signal this MCP-stdio child —
   // it only sees stdin reach EOF ('end') / be destroyed ('close') as the parent
   // departs. Wire the SAME deregister handler to both events so a graceful TUI
   // exit deregisters rather than stranding the registry slot until the DR-031
-  // TTL backstop (#589). `cleanup()`'s once-guard (set synchronously before any
-  // await) makes a stdin-close racing a SIGTERM — or 'end' then 'close' — run
-  // the deregister exactly once. The child lingers ~8s after TUI exit
+  // TTL backstop (#589). `cleanup()`'s once-guard (memoized promise, set
+  // synchronously before any await — macf#1035) makes a stdin-close racing a
+  // SIGTERM — or 'end' then 'close' — run the deregister exactly once, and
+  // every racing trigger awaits the SAME real completion rather than a stale
+  // placeholder. The child lingers ~8s after TUI exit
   // (devops-observed), ample for the async deregister: the in-flight `cleanup()`
   // promise plus the still-bound HTTPS server keep the event loop alive, and we
   // exit only from `cleanup()`'s `.then()` — never mid-deregister.
