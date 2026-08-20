@@ -41,7 +41,7 @@
  * `rollFleet`'s own gate (macf-core) — this module adds no gate of its own
  * and removes none of macf-core's.
  */
-import type { FleetDriver, WorkspaceRecord } from '@groundnuty/macf-core';
+import type { FleetDriver, FleetPlanReport, FleetRollResult, WorkspaceRecord } from '@groundnuty/macf-core';
 import { upgradeFleets, type UpgradeEvent } from '@groundnuty/macf-core';
 import type { FleetManifest } from './fleet-manifest.js';
 import { resolveTargetVersion } from './version-target.js';
@@ -104,6 +104,62 @@ export interface ApplyVersionPhaseResult {
   readonly halted?: boolean;
   /** Narration lines this phase emitted (via `deps.log`) — for CLI rendering. */
   readonly logLines?: readonly string[];
+  /**
+   * groundnuty/macf#1053 — agents this run actually rolled + verified green
+   * (`outcome === 'upgraded'` in the roll's own report), by name. Reporting
+   * only — computed from the SAME `report` `runUpgradeFleetsFn` already
+   * returns, never a second decision about what to roll. Present only when
+   * `attempted` (empty array is a real, distinct value: "attempted, rolled
+   * nothing" — NOT the same as absent/not-attempted).
+   */
+  readonly rolledAgents?: readonly string[];
+  /**
+   * groundnuty/macf#1053 — `true` when the fleet's driver could not be
+   * resolved locally AT ALL (`report.fleets[0].skipped`, e.g.
+   * `'driver-unresolved'` — no representative workspace for this project on
+   * this host) — the roll never got to examine a single member. Distinct
+   * from "examined members, rolled none of them" (`rolledAgents: []` with
+   * this `false`): naming THIS case "could not attempt" rather than folding
+   * it into a generic no-op is the whole point of this issue.
+   */
+  readonly unreachable?: boolean;
+  /** groundnuty/macf#1053 — fleet members discovered locally this run (`report.fleets[0].plans.length`), for the "0 of N" no-op phrasing. `0` when `unreachable`. */
+  readonly totalMembers?: number;
+  /**
+   * groundnuty/macf#1053 — non-zero pre-flight skip-category counts
+   * (off-canonical-branch / config-dirty / busy / stale-pin) explaining WHY
+   * a member that WAS behind target still didn't roll, in priority order.
+   * Empty when nothing was behind target at all (see {@link totalMembers}).
+   */
+  readonly skipBreakdown?: readonly string[];
+  /**
+   * groundnuty/macf#1053 — `true` when THIS apply run was invoked without
+   * both `--vault`/`--identity-key` (mirrors `bootstrap-apply.ts`'s own
+   * `deploySkipReason` gate). Set by the caller (`resolveApplyVersionDeps`'s
+   * consumer in `commands/bootstrap-apply.ts`), never by this module — this
+   * phase itself needs no vault access (see the module doc) and has no CLI
+   * flags to read. Rendered as an adjacent FACT alongside a no-op reason,
+   * never as an asserted CAUSE (the roll's own driver-resolution / pre-flight
+   * gates are independent of these flags — see #1053's own investigation).
+   */
+  readonly flagless?: boolean;
+}
+
+/**
+ * groundnuty/macf#1053 — non-zero pre-flight skip-category counts from one
+ * fleet's EXECUTE-mode roll result, in priority order (mirrors the gate
+ * ORDER `rollFleet` itself applies: branch, then config-dirty, then busy,
+ * then stale-pin). Pure; only counts a member once (each `behind` plan
+ * produces exactly one `AgentRollResult`, `rollFleet`'s own invariant), so
+ * the parts never double-count.
+ */
+export function versionRollSkipBreakdown(rolled: FleetRollResult): readonly string[] {
+  const parts: string[] = [];
+  if (rolled.branchSkipped > 0) parts.push(`${String(rolled.branchSkipped)} off-canonical-branch`);
+  if (rolled.configDirtySkipped > 0) parts.push(`${String(rolled.configDirtySkipped)} config-dirty`);
+  if (rolled.busySkipped > 0) parts.push(`${String(rolled.busySkipped)} busy`);
+  if (rolled.stalePinSkipped > 0) parts.push(`${String(rolled.stalePinSkipped)} stale-pin`);
+  return parts;
 }
 
 /**
@@ -162,7 +218,30 @@ export async function runApplyVersionPhase(
     },
   );
 
-  return { attempted: true, target: targetR.target, halted: report.halted, logLines };
+  // groundnuty/macf#1053 — apply calls `runUpgradeFleetsFn` with EXACTLY one
+  // fleet name (`[manifest.metadata.name]`, above), so `report.fleets` always
+  // has length 1 in practice; `[0]` is still `FleetPlanReport | undefined`
+  // under `noUncheckedIndexedAccess`, and an absent report renders as
+  // `unreachable` rather than ever being able to claim a roll happened.
+  const fleetReport = report.fleets[0];
+  return { attempted: true, target: targetR.target, halted: report.halted, logLines, ...summarizeVersionRoll(fleetReport) };
+}
+
+/**
+ * groundnuty/macf#1053 — the reporting-only outcome discriminator for ONE
+ * fleet's version-reconcile result. Pure; never called before the roll has
+ * already run (this only reads `report`, it makes no decisions the roll
+ * itself didn't already make — DR-043 Amendment L2 untouched).
+ */
+function summarizeVersionRoll(
+  fleetReport: FleetPlanReport | undefined,
+): Pick<ApplyVersionPhaseResult, 'rolledAgents' | 'unreachable' | 'totalMembers' | 'skipBreakdown'> {
+  if (fleetReport === undefined || fleetReport.skipped !== undefined) {
+    return { rolledAgents: [], unreachable: true, totalMembers: 0, skipBreakdown: [] };
+  }
+  const rolledAgents = fleetReport.rolled?.results.filter((r) => r.outcome === 'upgraded').map((r) => r.agent) ?? [];
+  const skipBreakdown = fleetReport.rolled !== undefined ? versionRollSkipBreakdown(fleetReport.rolled) : [];
+  return { rolledAgents, unreachable: false, totalMembers: fleetReport.plans.length, skipBreakdown };
 }
 
 /**
