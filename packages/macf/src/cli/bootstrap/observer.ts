@@ -483,6 +483,42 @@ export interface RunnerUsability {
    * richer type keeps the blast radius to the one caller that needs it.
    */
   readonly permissionDenied?: true;
+  /**
+   * Set `true` iff BOTH legs {@link checkRunnerUsableByRepo} can read
+   * CONFIRM zero runners — the repo-scoped leg returned `{kind: 'ok',
+   * runners: []}` (an empty list, not a 403/unreadable) AND the org-scope
+   * leg's {@link RunnerUsabilityDeps.listOrgRunners} read (also confirmed,
+   * not `'unknown'`) found zero runners in the WHOLE org, not merely zero
+   * VISIBLE to this repo (groundnuty/macf#943, the third state the #1054
+   * fix's `presence: 'absent'` couldn't distinguish from "something is
+   * registering"). This is the caller-is-entitled-to-look sibling of
+   * {@link permissionDenied}'s caller-is-NOT-entitled-to-look flag — the two
+   * are mutually exclusive by construction (`permissionDenied` requires
+   * `RepoRunnersOutcome.kind === 'forbidden'`; this flag requires
+   * `kind === 'ok'`).
+   *
+   * **Deliberately NOT set merely because the repo-scoped leg is empty.** A
+   * runner CAN be registered at org scope only (macf#924) or excluded from
+   * every group visible to this repo (the `handover` case) — either shape
+   * means a runner genuinely IS registered somewhere, so this flag stays
+   * `undefined` and the honest "found something, not capable/visible yet"
+   * detail/handover carries the explanation instead. Symmetrically, a
+   * repo-scoped leg that found N>0 runners none of which are capable YET
+   * (offline, still registering, a label not yet applied) also leaves this
+   * `undefined` — that is precisely the "registered but not yet online"
+   * case `pollForUsableRunner` MUST keep polling (a poll can observe that
+   * runner transition to capable; it can never make a truly nonexistent one
+   * appear). Only the TRUE zero — nothing at either scope — sets this.
+   *
+   * `pollForUsableRunner` (`apply-routing.ts`) reads this flag the same way
+   * it reads `permissionDenied`: exit the retry loop on the FIRST check,
+   * before ever calling `sleepFn` — a confirmed empty registry cannot
+   * populate itself by being asked again on the SAME poll tick cadence this
+   * tool controls (nothing in `apply` provisions a runner in-band). `undefined`
+   * (never `false`) in every other case, matching `permissionDenied`'s own
+   * convention.
+   */
+  readonly neverRegistered?: true;
 }
 
 /**
@@ -809,10 +845,27 @@ export async function checkRunnerUsableByRepo(repo: string, deps: RunnerUsabilit
   const overallPresence: Presence = repoScopePresence === 'unknown' ? 'unknown' : 'absent';
   const detail = repoOutcomeDetail(repo, repoOutcome) ?? (visibleOrgRunners.length > 0 ? runnerIncapableDetail(repo, visibleOrgRunners) : undefined);
 
+  // groundnuty/macf#943 — the third state a bare `presence: 'absent'` cannot
+  // see: TRUE zero, at BOTH scopes, confirmed (never merely "not visible to
+  // this repo" — see `RunnerUsability.neverRegistered`'s doc for why the
+  // repo-scope-only or org-runners-count-only checks would be wrong here).
+  // `orgRunners.length` (not `visibleOrgRunners.length`) is deliberate — an
+  // org runner excluded from every group visible to this repo IS registered
+  // somewhere, so it must NOT read as "never registered" (the `handover`
+  // branch below already names that case correctly).
+  const neverRegistered = repoOutcome.kind === 'ok' && repoOutcome.runners.length === 0 && orgRunners.length === 0;
+
   const excludedGroupIdsWithRunners = new Set(orgRunners.filter((r) => !visibleIds.has(r.runnerGroupId)).map((r) => r.runnerGroupId));
   const permissionDenied = repoForbidden ? ({ permissionDenied: true } as const) : {};
-  if (excludedGroupIdsWithRunners.size === 0) return { presence: overallPresence, detail, ...permissionDenied };
-  return { presence: overallPresence, detail, handover: buildRunnerHandoverMessage(repo, split.owner, excludedGroupIdsWithRunners), ...permissionDenied };
+  const neverRegisteredFlag = neverRegistered ? ({ neverRegistered: true } as const) : {};
+  if (excludedGroupIdsWithRunners.size === 0) return { presence: overallPresence, detail, ...permissionDenied, ...neverRegisteredFlag };
+  return {
+    presence: overallPresence,
+    detail,
+    handover: buildRunnerHandoverMessage(repo, split.owner, excludedGroupIdsWithRunners),
+    ...permissionDenied,
+    ...neverRegisteredFlag,
+  };
 }
 
 /** The `detail` contribution from the repo-scoped leg alone — `undefined` when there is nothing repo-scope-specific to explain (zero runners found, or the leg is a plain unreadable with no permission signal). Factored out of {@link checkRunnerUsableByRepo} so both its early-return-avoided branches build the SAME message for the SAME repo-scope outcome. */

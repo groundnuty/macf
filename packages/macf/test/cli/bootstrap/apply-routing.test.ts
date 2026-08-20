@@ -16,6 +16,7 @@ import {
   pollForUsableRunner,
   publishTrustedActors,
   publishTrustedActorsGated,
+  runnerNeverRegisteredReason,
   runnerPermissionDeniedReason,
   runnerTokenPollExhaustedReason,
   RUNNER_TOKEN_ENV_VAR,
@@ -805,6 +806,197 @@ describe('publishTrustedActorsGated — permissionDenied fail-fast (groundnuty/m
     // NOT the justCreatedRepos generic "created during THIS run" framing —
     // the permission cause is more specific and wins.
     expect(reason).not.toContain('created during THIS run');
+  });
+});
+
+// --- groundnuty/macf#943 — a confirmed zero-runners-anywhere read fails
+// FAST, never polls to timeout — the third state a bare `presence: 'absent'`
+// could not distinguish from "something is registering." Same "the
+// retry-with-sleep loop was NEVER ENTERED" decisive shape as the #1054 suite
+// immediately above (a `sleepFn` fake that throws if invoked at all, real
+// 10-minute default budget left unset so a regression would hang, not merely
+// run slow).
+
+describe('pollForUsableRunner — neverRegistered fail-fast (groundnuty/macf#943)', () => {
+  it('DECISIVE: neverRegistered on the FIRST check exits immediately — sleepFn is NEVER called, even with the real 10-minute default budget', async () => {
+    let checkCalls = 0;
+    let sleepCalls = 0;
+    const usability = await pollForUsableRunner(
+      'groundnuty/x',
+      async () => {
+        checkCalls += 1;
+        return { presence: 'absent', neverRegistered: true };
+      },
+      {
+        // timeoutMs deliberately UNSET — the real 10-minute production
+        // default. If the fail-fast check did not fire before the retry
+        // loop's sleep, this test would hang rather than merely being slow.
+        sleepFn: async (ms) => {
+          sleepCalls += 1;
+          throw new Error(`sleepFn must never be called on the neverRegistered fast path (asked to sleep ${String(ms)}ms)`);
+        },
+      },
+    );
+    expect(usability.presence).toBe('absent');
+    expect(usability.neverRegistered).toBe(true);
+    expect(checkCalls).toBe(1); // ONE check, never retried
+    expect(sleepCalls).toBe(0); // the retry-with-sleep loop was never entered
+  });
+
+  it('NON-REGRESSION: a registered-but-not-yet-online runner (neverRegistered NOT set) keeps polling to the full budget — sleepFn IS called', async () => {
+    let checkCalls = 0;
+    let clock = 0;
+    const sleeps: number[] = [];
+    const usability = await pollForUsableRunner(
+      'groundnuty/x',
+      async () => {
+        checkCalls += 1;
+        // "found, still offline" shape — a runner IS registered, just not
+        // capable yet. No neverRegistered flag, matching what
+        // checkRunnerUsableByRepo actually returns for this case.
+        return { presence: 'absent', detail: 'a runner registered for "groundnuty/x" carries the required labels but is offline (status="offline")' };
+      },
+      {
+        timeoutMs: 30_000,
+        pollIntervalMs: 10_000,
+        now: () => clock,
+        sleepFn: async (ms) => {
+          sleeps.push(ms);
+          clock += ms;
+        },
+      },
+    );
+    expect(usability.neverRegistered).toBeUndefined();
+    expect(checkCalls).toBeGreaterThan(1); // genuinely retried
+    expect(sleeps.length).toBeGreaterThan(0); // the budget was actually consumed, not skipped
+  });
+
+  it('NON-REGRESSION: a runner that appears mid-poll still resolves present — neverRegistered is the ONLY fast-fail trigger, same as permissionDenied', async () => {
+    let checkCalls = 0;
+    let clock = 0;
+    const usability = await pollForUsableRunner(
+      'groundnuty/x',
+      async () => {
+        checkCalls += 1;
+        return checkCalls < 3 ? { presence: 'absent' } : { presence: 'present' };
+      },
+      {
+        timeoutMs: 60_000,
+        pollIntervalMs: 5_000,
+        now: () => clock,
+        sleepFn: async (ms) => {
+          clock += ms;
+        },
+      },
+    );
+    expect(usability).toEqual({ presence: 'present' });
+    expect(checkCalls).toBe(3);
+  });
+});
+
+describe('runnerNeverRegisteredReason (groundnuty/macf#943)', () => {
+  it('names the repo, says apply does not provision a runner, and gives the register-or-reconfigure remedy', () => {
+    const usability: RunnerUsability = { presence: 'absent', neverRegistered: true };
+    const reason = runnerNeverRegisteredReason('groundnuty/exp-code-agent', usability);
+    expect(reason).toContain('groundnuty/exp-code-agent');
+    expect(reason).toMatch(/no runner is registered/);
+    expect(reason).toMatch(/does not provision/);
+    expect(reason).toMatch(/register/i);
+    expect(reason).toMatch(/runs_on/);
+    expect(reason).toContain('MACF_TRUSTED_ACTORS was NOT written');
+  });
+
+  it('carries NO internal issue numbers or DR names — user-facing text must stand alone (groundnuty/macf#1061)', () => {
+    const usability: RunnerUsability = { presence: 'absent', neverRegistered: true };
+    const reason = runnerNeverRegisteredReason('groundnuty/x', usability);
+    expect(reason).not.toMatch(/#\d+/);
+    expect(reason).not.toMatch(/DR-\d+/);
+    expect(reason).not.toMatch(/Amendment/i);
+  });
+
+  it('appends detail/handover verbatim when present, same discipline as its siblings', () => {
+    const withDetail = runnerNeverRegisteredReason('groundnuty/x', { presence: 'absent', neverRegistered: true, detail: 'sentinel-detail-text' });
+    expect(withDetail).toContain('sentinel-detail-text');
+    const withHandover = runnerNeverRegisteredReason('groundnuty/x', { presence: 'absent', neverRegistered: true, handover: 'sentinel-handover-text' });
+    expect(withHandover).toContain('sentinel-handover-text');
+  });
+});
+
+describe('publishTrustedActorsGated — neverRegistered fail-fast (groundnuty/macf#943)', () => {
+  it('DECISIVE: a confirmed zero-runners-anywhere read on the poll path fails FAST — status "failed", the never-registered reason (never the poll-window reason), sleepFn never invoked', async () => {
+    let checkCalls = 0;
+    let sleepCalls = 0;
+    let createCalled = false;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return { presence: 'absent', neverRegistered: true };
+      },
+      createRepoVariable: async () => {
+        createCalled = true;
+        return 'created';
+      },
+    });
+    const result = await publishTrustedActorsGated(
+      'self-hosted',
+      ['a/b'],
+      deps,
+      'ghr-sentinel-token',
+      // timeoutMs deliberately UNSET (the real 600s default) — same "would
+      // hang, not just be slow" proof as the pollForUsableRunner test above.
+      {
+        sleepFn: async (ms) => {
+          sleepCalls += 1;
+          throw new Error(`sleepFn must never be called on a confirmed neverRegistered read (asked to sleep ${String(ms)}ms)`);
+        },
+      },
+    );
+    expect(result['a/b']?.status).toBe('failed');
+    const reason = (result['a/b'] as { reason: string }).reason;
+    expect(reason).toContain('a/b');
+    expect(reason).toMatch(/no runner is registered/);
+    expect(reason).not.toMatch(/\d+s poll window/); // never the exhausted-poll elapsed-time claim — no wait happened
+    expect(checkCalls).toBe(1);
+    expect(sleepCalls).toBe(0);
+    expect(createCalled).toBe(false); // register-before-route still holds
+  });
+
+  it('NON-REGRESSION: a registered-but-offline runner still polls the FULL configured budget and fails with the poll-exhausted reason, not the never-registered one', async () => {
+    let checkCalls = 0;
+    let clock = 0;
+    const sleeps: number[] = [];
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return { presence: 'absent', detail: 'a runner registered for "a/b" carries the required labels but is offline (status="offline")' };
+      },
+    });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', {
+      timeoutMs: 20_000,
+      pollIntervalMs: 5_000,
+      now: () => clock,
+      sleepFn: async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+    });
+    expect(result['a/b']?.status).toBe('failed');
+    const reason = (result['a/b'] as { reason: string }).reason;
+    expect(reason).toMatch(/poll window/); // the genuine timeout wording — budget WAS spent
+    expect(reason).not.toMatch(/does not provision/);
+    expect(checkCalls).toBeGreaterThan(1);
+    expect(sleeps.length).toBeGreaterThan(0); // proves the budget was actually consumed this time
+  });
+
+  it('the justCreatedRepos fast path keeps ITS OWN "created during THIS run" reason even when neverRegistered is ALSO true — more specific, and no gain from downgrading it', async () => {
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => ({ presence: 'absent', neverRegistered: true }),
+    });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', {}, new Set(['a/b']));
+    expect(result['a/b']?.status).toBe('failed');
+    const reason = (result['a/b'] as { reason: string }).reason;
+    expect(reason).toContain('created during THIS run');
+    expect(reason).not.toMatch(/does not provision/); // not the generic never-registered wording
   });
 });
 
