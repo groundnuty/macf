@@ -1414,14 +1414,64 @@ export function formatApplyResult(
     parts.push(...launchNextStepLines(deployPhase));
   }
   if (versionPhase?.attempted === true) {
-    parts.push(
-      '',
-      versionPhase.halted === true
-        ? `Version reconcile: HALTED — a bad release stopped the roll toward macf@${versionPhase.target ?? '?'} (see log above; DR-043 Amendment L, macf#1045).`
-        : `Version reconcile: completed toward macf@${versionPhase.target ?? '?'} (DR-043 Amendment L — see log above).`,
-    );
+    parts.push('', formatVersionReconcileLine(versionPhase));
   }
   return parts.join('\n');
+}
+
+/**
+ * groundnuty/macf#1053 — the version-reconcile phase's ONE summary line, now
+ * naming which of three outcomes actually happened. Before this, "completed"
+ * covered a genuine roll AND a zero-agent no-op AND an unreachable fleet
+ * identically — indistinguishable from an actual rollout on a live run
+ * (agent uptimes never moved; #1053's own incident). HALTED keeps its
+ * existing dedicated message, unchanged — a bad release was already loud.
+ * Reporting only: reads fields `runApplyVersionPhase` already computed
+ * (`apply-version.ts`'s `summarizeVersionRoll`), never re-decides anything
+ * the roll itself decided (DR-043 Amendment L2).
+ */
+function formatVersionReconcileLine(versionPhase: ApplyVersionPhaseResult): string {
+  const target = versionPhase.target ?? '?';
+  const cite = 'DR-043 Amendment L, macf#1045';
+  if (versionPhase.halted === true) {
+    return `Version reconcile: HALTED — a bad release stopped the roll toward macf@${target} (see log above; ${cite}).`;
+  }
+  const rolled = versionPhase.rolledAgents ?? [];
+  const breakdown = versionPhase.skipBreakdown ?? [];
+  if (rolled.length > 0) {
+    // groundnuty/macf#1053 review — a PARTIAL roll (some agents rolled,
+    // others busy/config-dirty/branch-mismatched/stale-pinned) must name
+    // BOTH halves. Returning early on `rolled.length > 0` alone silently
+    // dropped `breakdown` here — the exact "summary reads as authoritative
+    // while describing something that did not happen" shape this issue is
+    // about, reproduced one branch over.
+    // Parenthesized, not a second em-dash clause — two `—`s at the same
+    // nesting level read as one flat list ("code-agent" / "2 busy not
+    // rolled" looking like peers); parens make clear the second clause is
+    // subordinate to the first.
+    const notRolledNote = breakdown.length > 0 ? ` (${breakdown.join(', ')} not rolled)` : '';
+    return `Version reconcile: rolled ${String(rolled.length)} agent(s) to macf@${target} — ${rolled.join(', ')}${notRolledNote} (${cite}).`;
+  }
+  // Zero rolled — say so explicitly, with a reason, per macf#1053's
+  // requirement 3 ("a no-op must not read as a completed roll"). The
+  // flagless note is an adjacent FACT (this run had no --vault/
+  // --identity-key), never an asserted CAUSE — the roll's own
+  // driver-resolution + pre-flight gates don't read those flags at all (see
+  // `apply-version.ts`'s `ApplyVersionPhaseResult.flagless` doc).
+  const flaglessNote = versionPhase.flagless === true ? ' This apply run was invoked without --vault/--identity-key.' : '';
+  if (versionPhase.unreachable === true) {
+    return (
+      `Version reconcile: could not attempt toward macf@${target} — no locally-discoverable workspace for this ` +
+      `fleet on this host (driver-unresolved).${flaglessNote} (${cite}).`
+    );
+  }
+  const total = versionPhase.totalMembers ?? 0;
+  // "discovered member(s)" (not "declared agent(s)") — `total` counts what
+  // THIS host found locally (`report.fleets[0].plans.length`), which can be
+  // fewer than the manifest's full agent list when only some workspaces are
+  // reachable from here; naming it "declared" would overclaim.
+  const reason = breakdown.length > 0 ? breakdown.join(', ') : total > 0 ? 'none behind target' : 'no fleet members discovered locally';
+  return `Version reconcile: 0 of ${String(total)} discovered member(s) rolled toward macf@${target} — ${reason}.${flaglessNote} (${cite}).`;
 }
 
 /**
@@ -1558,8 +1608,23 @@ export function fleetApplyResultToJson(
     // `deploy_phase` above: absent entirely when the version phase was never
     // attempted (no `versions:` declared, or the control repo aborted), so
     // every pre-Amendment-L `--json` call site stays byte-identical.
+    // groundnuty/macf#1053 — `rolled_agents`/`unreachable`/`total_members`/
+    // `skip_breakdown` are the SAME outcome discriminator the human render
+    // (`formatVersionReconcileLine`) reads, so a script consuming `--json`
+    // gets the real outcome as a field, not just as prose it would have to
+    // parse out of the old (misleading) "completed" string.
     ...(versionPhase?.attempted === true
-      ? { version_phase: { target: versionPhase.target, halted: versionPhase.halted === true } }
+      ? {
+          version_phase: {
+            target: versionPhase.target,
+            halted: versionPhase.halted === true,
+            rolled_agents: versionPhase.rolledAgents ?? [],
+            unreachable: versionPhase.unreachable === true,
+            total_members: versionPhase.totalMembers ?? 0,
+            skip_breakdown: versionPhase.skipBreakdown ?? [],
+            ...(versionPhase.flagless === true ? { flagless: true } : {}),
+          },
+        }
       : {}),
   };
 }
@@ -1969,10 +2034,20 @@ export async function runBootstrapApply(
       // module doc) — so attempting whenever deploy would have run cannot
       // make an otherwise-successful run fail just because nothing local is
       // reachable yet.
+      // groundnuty/macf#1053 — `flagless` is threaded onto the result AFTER
+      // the phase runs, never INTO it: this phase's own roll needs no vault
+      // access (see the comment above + `apply-version.ts`'s module doc), so
+      // the flag is reporting-only context for the summary line, not an
+      // input the roll's decisions read. Same `--vault`/`--identity-key`
+      // absence check `deploySkipReason` above already used.
+      const versionRunFlagless = opts.vaultPath === undefined || opts.identityKeyPath === undefined;
       const versionResult: ApplyVersionPhaseResult =
         controlRepoAborted || opts.deploy === false
           ? { attempted: false }
-          : await runApplyVersionPhase(manifest, resolved.versionDeps ?? { ...resolveApplyVersionDeps(manifestPath), log: stderrLog });
+          : {
+              ...(await runApplyVersionPhase(manifest, resolved.versionDeps ?? { ...resolveApplyVersionDeps(manifestPath), log: stderrLog })),
+              flagless: versionRunFlagless,
+            };
 
       const remainingDeploy: RemainingDeployReport = controlRepoAborted
         ? { steps: [] }

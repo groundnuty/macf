@@ -50,7 +50,7 @@ import { VaultError, buildVaultPlaintext, type VaultAgentSecrets, type VaultRunn
 import { parseVaultPlaintext } from '../../src/cli/bootstrap/vault-read.js';
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../src/cli/bootstrap/registry-scope-preflight.js';
 import { upgradeFleets } from '@groundnuty/macf-core';
-import type { ApplyVersionPhaseDeps } from '../../src/cli/bootstrap/apply-version.js';
+import type { ApplyVersionPhaseDeps, ApplyVersionPhaseResult } from '../../src/cli/bootstrap/apply-version.js';
 
 const FLEET_YAML = `apiVersion: macf/v0
 kind: Fleet
@@ -1428,9 +1428,16 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(out).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
     expect(out).not.toMatch(/\bversion:.*\(update\)/);
     expect(out).not.toMatch(/\bactions_pin:/);
-    // The version-reconcile phase DID attempt (versions.macf is declared) —
-    // the final summary names the target it reconciled toward.
-    expect(out).toMatch(/Version reconcile: completed toward macf@0\.2\.60/);
+    // groundnuty/macf#1053 — `fakeVersionDeps()` (`resolveDriver: async () =>
+    // null`) is the UNREACHABLE fixture: the roll never found a local
+    // workspace for this fleet, so it rolled ZERO agents. This USED to
+    // render "completed toward macf@0.2.60" — indistinguishable from an
+    // actual rollout (#1053's own live incident: agent uptimes never moved,
+    // yet the summary said "completed"). The decisive assertion per
+    // `assert-the-wrong-path.md`: the no-op line must NOT say "completed",
+    // and must name why nothing was attempted.
+    expect(out).not.toMatch(/Version reconcile: completed/);
+    expect(out).toMatch(/Version reconcile: could not attempt toward macf@0\.2\.60 — no locally-discoverable workspace.*driver-unresolved/);
   });
 
   it('final summary (--yes, --json) carries version_phase (attempted + target), and unimplemented_by_apply no longer names the version kind (DR-043 Amendment L, macf#1045)', async () => {
@@ -1443,14 +1450,34 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(code).toBe(0);
     const parsed = JSON.parse(logs.join('\n')) as {
       unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
-      version_phase?: { target: string; halted: boolean };
+      version_phase?: {
+        target: string;
+        halted: boolean;
+        rolled_agents: readonly string[];
+        unreachable: boolean;
+        total_members: number;
+        skip_breakdown: readonly string[];
+        flagless?: boolean;
+      };
     };
     // version is GONE from unimplemented_by_apply (macf#1045) — apply now
     // reconciles it; actions_pin was never present in this fixture either
     // way (observed pin already matches declared).
     expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'version')).toBe(false);
     expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'actions_pin')).toBe(false);
-    expect(parsed.version_phase).toEqual({ target: '0.2.60', halted: false });
+    // groundnuty/macf#1053 — same UNREACHABLE fixture as the non-json test
+    // above: `--json` now carries the outcome as fields, not just prose —
+    // `rolled_agents` is empty, `unreachable` is true, and `flagless` is
+    // true (this test never passes --vault/--identity-key).
+    expect(parsed.version_phase).toEqual({
+      target: '0.2.60',
+      halted: false,
+      rolled_agents: [],
+      unreachable: true,
+      total_members: 0,
+      skip_breakdown: [],
+      flagless: true,
+    });
   });
 
   it('pre-approval stderr render (interactive path, confirmPlan declines) ALSO shows the NOT IMPLEMENTED block before the abort', async () => {
@@ -3171,6 +3198,195 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(json.unimplemented_by_apply).toEqual([
       { kind: 'ca', target: 'ca:registry:DEMO_FLEET_CA_CERT', verb: 'create', reason: 'no CA orchestrator step exists yet' },
     ]);
+  });
+
+  // --- groundnuty/macf#1053 — version-reconcile summary names the actual
+  // outcome (rolled N / had nothing to roll / could not attempt), never the
+  // single word "completed" that used to collapse all three (#1053's own
+  // live incident: two agents at unchanged uptimes, summary said
+  // "completed"). Fixtures here construct `ApplyVersionPhaseResult` directly
+  // — `apply-version.test.ts` covers `runApplyVersionPhase` computing these
+  // fields FROM a `FleetUpgradeReport`; this block covers the RENDER, the
+  // layer the bug actually lived in.
+
+  const VERSION_ROLLED: ApplyVersionPhaseResult = {
+    attempted: true,
+    target: '0.2.57',
+    halted: false,
+    rolledAgents: ['code-agent', 'science-agent'],
+    unreachable: false,
+    totalMembers: 2,
+    skipBreakdown: [],
+  };
+  const VERSION_UNREACHABLE: ApplyVersionPhaseResult = {
+    attempted: true,
+    target: '0.2.57',
+    halted: false,
+    rolledAgents: [],
+    unreachable: true,
+    totalMembers: 0,
+    skipBreakdown: [],
+  };
+
+  it('formatApplyResult: a genuine roll names the count + the agents, and does not say "could not attempt"', () => {
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, VERSION_ROLLED);
+    expect(text).toMatch(/Version reconcile: rolled 2 agent\(s\) to macf@0\.2\.57 — code-agent, science-agent/);
+    expect(text).not.toMatch(/could not attempt/);
+    expect(text).not.toMatch(/0 of \d+/);
+  });
+
+  it('formatApplyResult: a PARTIAL roll names BOTH the rolled agent(s) AND what was skipped (never drops the skip breakdown)', () => {
+    // groundnuty/macf#1053 review — the `rolled.length > 0` branch used to
+    // return before `skipBreakdown` was ever read, so 1 rolled + 2 busy
+    // rendered identically to 1 rolled + 0 remaining: the exact
+    // "authoritative-looking summary that omits what didn't happen" shape
+    // this issue reports, reproduced in this branch. Decisive per
+    // `assert-the-wrong-path.md`: compare against the CLEAN-roll line, not
+    // just "the text is non-empty" — a weaker assertion passes either way.
+    const partial: ApplyVersionPhaseResult = {
+      attempted: true,
+      target: '0.2.57',
+      halted: false,
+      rolledAgents: ['code-agent'],
+      unreachable: false,
+      totalMembers: 3,
+      skipBreakdown: ['2 busy'],
+    };
+    const clean: ApplyVersionPhaseResult = { ...partial, totalMembers: 1, skipBreakdown: [] };
+    const partialText = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, partial);
+    const cleanText = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, clean);
+    expect(partialText).toMatch(/Version reconcile: rolled 1 agent\(s\) to macf@0\.2\.57 — code-agent \(2 busy not rolled\)/);
+    expect(partialText).not.toBe(cleanText);
+    expect(cleanText).not.toMatch(/not rolled/);
+  });
+
+  it('formatApplyResult: an unreachable fleet says "could not attempt", never "completed"', () => {
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, VERSION_UNREACHABLE);
+    expect(text).toMatch(/Version reconcile: could not attempt toward macf@0\.2\.57 — no locally-discoverable workspace.*driver-unresolved/);
+    expect(text).not.toMatch(/completed/);
+  });
+
+  // The decisive assertion per `assert-the-wrong-path.md`: a bare "a Version
+  // reconcile line was printed" check cannot distinguish these two outcomes
+  // — that indistinguishability IS the bug #1053 reports. The two rendered
+  // lines must differ, and specifically neither collapses to "completed".
+  it('formatApplyResult: the rolled line and the no-op line are NOT the same text (the collapse #1053 reports)', () => {
+    const rolledLine = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, VERSION_ROLLED);
+    const noOpLine = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, VERSION_UNREACHABLE);
+    expect(rolledLine).not.toBe(noOpLine);
+    expect(rolledLine).not.toMatch(/completed/);
+    expect(noOpLine).not.toMatch(/completed/);
+  });
+
+  it('formatApplyResult: examined members but rolled none of them names the skip breakdown (busy/config-dirty/…)', () => {
+    const versionPhase: ApplyVersionPhaseResult = {
+      attempted: true,
+      target: '0.2.57',
+      halted: false,
+      rolledAgents: [],
+      unreachable: false,
+      totalMembers: 2,
+      skipBreakdown: ['1 busy', '1 config-dirty'],
+    };
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, versionPhase);
+    expect(text).toMatch(/Version reconcile: 0 of 2 discovered member\(s\) rolled toward macf@0\.2\.57 — 1 busy, 1 config-dirty/);
+    expect(text).not.toMatch(/completed/);
+    expect(text).not.toMatch(/could not attempt/);
+  });
+
+  it('formatApplyResult: members discovered but none behind target says so, not a breakdown', () => {
+    const versionPhase: ApplyVersionPhaseResult = {
+      attempted: true,
+      target: '0.2.57',
+      halted: false,
+      rolledAgents: [],
+      unreachable: false,
+      totalMembers: 2,
+      skipBreakdown: [],
+    };
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, versionPhase);
+    expect(text).toMatch(/Version reconcile: 0 of 2 discovered member\(s\) rolled toward macf@0\.2\.57 — none behind target/);
+  });
+
+  it('formatApplyResult: no fleet members discovered at all (0 total, reachable) names that, distinct from unreachable', () => {
+    const versionPhase: ApplyVersionPhaseResult = {
+      attempted: true,
+      target: '0.2.57',
+      halted: false,
+      rolledAgents: [],
+      unreachable: false,
+      totalMembers: 0,
+      skipBreakdown: [],
+    };
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, versionPhase);
+    expect(text).toMatch(/Version reconcile: 0 of 0 discovered member\(s\) rolled toward macf@0\.2\.57 — no fleet members discovered locally/);
+    expect(text).not.toMatch(/driver-unresolved/);
+  });
+
+  it('formatApplyResult: flagless note appears only when the phase says so, and never on a genuine roll', () => {
+    const unreachableFlagless: ApplyVersionPhaseResult = { ...VERSION_UNREACHABLE, flagless: true };
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, unreachableFlagless);
+    expect(text).toMatch(/This apply run was invoked without --vault\/--identity-key/);
+
+    const unreachableNotFlagless = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, VERSION_UNREACHABLE);
+    expect(unreachableNotFlagless).not.toMatch(/invoked without --vault/);
+
+    const rolledFlagless: ApplyVersionPhaseResult = { ...VERSION_ROLLED, flagless: true };
+    const rolledText = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, rolledFlagless);
+    // Even when this run WAS flagless, a genuine roll never carries the
+    // note — the flagless fact is irrelevant once agents actually rolled.
+    expect(rolledText).not.toMatch(/invoked without --vault/);
+  });
+
+  it('formatApplyResult: HALTED keeps its own dedicated message, unaffected by #1053 (well-formed parens, target named)', () => {
+    const versionPhase: ApplyVersionPhaseResult = { attempted: true, target: '0.2.57', halted: true };
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, versionPhase);
+    expect(text).toMatch(
+      /Version reconcile: HALTED — a bad release stopped the roll toward macf@0\.2\.57 \(see log above; DR-043 Amendment L, macf#1045\)\.$/m,
+    );
+  });
+
+  it('fleetApplyResultToJson: version_phase carries the outcome discriminator as fields, not just prose', () => {
+    const json = JSON.parse(JSON.stringify(fleetApplyResultToJson(resultWith({}), [], { steps: [] }, undefined, VERSION_ROLLED))) as {
+      version_phase: {
+        target: string;
+        halted: boolean;
+        rolled_agents: readonly string[];
+        unreachable: boolean;
+        total_members: number;
+        skip_breakdown: readonly string[];
+      };
+    };
+    expect(json.version_phase).toEqual({
+      target: '0.2.57',
+      halted: false,
+      rolled_agents: ['code-agent', 'science-agent'],
+      unreachable: false,
+      total_members: 2,
+      skip_breakdown: [],
+    });
+  });
+
+  it('fleetApplyResultToJson: an unreachable no-op carries unreachable:true + empty rolled_agents (never the JSON equivalent of "completed")', () => {
+    const json = JSON.parse(JSON.stringify(fleetApplyResultToJson(resultWith({}), [], { steps: [] }, undefined, VERSION_UNREACHABLE))) as {
+      version_phase: { rolled_agents: readonly string[]; unreachable: boolean };
+    };
+    expect(json.version_phase.rolled_agents).toEqual([]);
+    expect(json.version_phase.unreachable).toBe(true);
+  });
+
+  // groundnuty/macf#1053 hard constraint — "do not change what the version
+  // phase DOES, this is reporting only." `applyExitCode` reads ONLY
+  // `versionPhase?.halted`, never any of the new discriminator fields — so a
+  // no-op / unreachable reconcile exits exactly as it did before this issue
+  // (0, same as a genuine roll); only HALTED still forces non-zero.
+  it('applyExitCode: an unreachable/no-op version phase does NOT force a non-zero exit (reporting only, unchanged)', () => {
+    expect(applyExitCode(resultWith({}), [], VERSION_UNREACHABLE)).toBe(0);
+    expect(applyExitCode(resultWith({}), [], { attempted: true, target: '0.2.57', halted: false, rolledAgents: [], unreachable: false, totalMembers: 2, skipBreakdown: ['1 busy', '1 config-dirty'] })).toBe(0);
+  });
+
+  it('applyExitCode: HALTED still forces a non-zero exit, exactly as before #1053', () => {
+    expect(applyExitCode(resultWith({}), [], { attempted: true, target: '0.2.57', halted: true })).toBe(1);
   });
 });
 
