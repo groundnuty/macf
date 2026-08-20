@@ -169,9 +169,9 @@ Important — what gets refreshed UNCONDITIONALLY (independent of --cli/--plugin
                              entries (merge-preserving — operator-authored entries kept)
   - claude.sh               regenerated from the installed CLI's launcher template
                              so template-evolution lands without re-running \`macf init\`
-                             (e.g., #60 added --plugin-dir; #283 fixed retired :4318
-                             OTLP endpoint). The generated file carries a managed-file
-                             warning header.
+                             (it has, for example, picked up a new launcher flag and
+                             fixed a retired OTLP endpoint port in the past). The
+                             generated file carries a managed-file warning header.
 
 What the flags actually control:
   --cli       bump versions.cli pin to latest
@@ -182,7 +182,7 @@ What the flags actually control:
   --confirm   explicit opt-in to the unified preview-then-prompt flow
               (also the default for bare \`macf update\`; --yes overrides)
   --no-migrate-env-files
-              skip the macf#342 monolithic→multi-file claude.sh migration
+              skip the monolithic-to-multi-file claude.sh migration
               AND env-file refresh (operator opt-out for hand-modified
               launchers; does NOT roll back already-migrated workspaces)
   --dry-run   show diff + would-bump list, write nothing
@@ -191,7 +191,7 @@ Implication for reproducible bootstrap (cv-e2e-test, harness pinning, etc.):
   The CLI BINARY's installed version determines what claude.sh template lands.
   Pin via \`npx -y @groundnuty/macf@<version> update\` instead of bare \`macf update\`
   if the bootstrap needs to use a specific binary version (vs whatever brew/system
-  has). See macf#291 for the surfacing context.
+  has).
 `)
   .option('--all', 'Bump all version pins non-interactively', false)
   .option('--cli', 'Bump only the CLI version pin', false)
@@ -207,7 +207,7 @@ Implication for reproducible bootstrap (cv-e2e-test, harness pinning, etc.):
   // block in update.ts skipped on every invocation. Empirically reproduced
   // via commander v14. The fix is to omit the explicit 3rd arg so the
   // canonical `--no-` semantic holds. See macf#347.
-  .option('--no-migrate-env-files', 'Skip the macf#342 monolithic→multi-file claude.sh migration AND env-file refresh (operator opt-out)')
+  .option('--no-migrate-env-files', 'Skip the monolithic-to-multi-file claude.sh migration AND env-file refresh (operator opt-out)')
   .option('--dry-run', 'Show the diff but do not write the config', false)
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .action(async (opts) => {
@@ -263,7 +263,7 @@ program
 
 const fleet = program
   .command('fleet')
-  .description('Fleet roster + interconnect-health (DR-030)');
+  .description('Fleet roster + interconnect-health');
 
 fleet
   .command('status')
@@ -272,7 +272,7 @@ fleet
     'online-offline (mTLS /health) / uptime + the present self-report fields ' +
     '(instance_id, cert_expiry warn<30d/crit<7d, and idle/busy state + otel ' +
     'reachability when the agent reports them). Reachable + self-reports only — ' +
-    'no inject/delivery probes (those are later DR-030 increments).',
+    'no inject/delivery probes (those are a planned future addition).',
   )
   .option('--json', 'Emit the structured roster as JSON for automation', false)
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
@@ -294,12 +294,12 @@ fleet
     'is UNCONFIRMED (possibly busy), NOT a gap. Exits non-zero when DEGRADED ' +
     '(Reachable+Accepted; PROCESSED does not affect the verdict).',
   )
-  .option('--json', 'Emit the structured per-agent result as JSON (DR-031 watchdog contract)', false)
+  .option('--json', 'Emit the structured per-agent result as JSON (for scripting/automation)', false)
   .option('--inject', 'INVASIVE Processed-now delivery-proof: routes a real probe + wakes each reachable agent', false)
   .option('--inject-timeout <sec>', 'Per-agent poll budget for --inject, in seconds (default 24)', (v) => parseInt(v, 10))
   .option(
     '--dir <path>',
-    'Project directory (defaults to auto-discovery from cwd). Scheduler-safe (macf#830): unlike ' +
+    'Project directory (defaults to auto-discovery from cwd). Scheduler-safe: unlike ' +
       'other `fleet` subcommands, resolution failure here never calls process.exit() directly — ' +
       'under --json it always emits a valid, non-empty JSON {error} object on stdout + a nonzero exit.',
   )
@@ -321,8 +321,8 @@ fleet
   .command('install-cron')
   .description(
     'Install a HOST crontab entry that periodically runs the watchdog (`macf ' +
-    'fleet reconcile`) — DR-037 / macf#686, porting devops-toolkit fleet/install-cron.sh ' +
-    '(DR-006 §A.4). Host-installed so it survives a reboot (the first post-boot sweep ' +
+    'fleet reconcile`), porting devops-toolkit\'s fleet/install-cron.sh. ' +
+    'Host-installed so it survives a reboot (the first post-boot sweep ' +
     'launches the desired fleet from a cold box). The generated line sources the ' +
     'host-prelude (cron has a bare env), mints a FRESH GH_TOKEN fail-loud (cron has no ' +
     'ambient token), then runs reconcile, appending to a log. SAFE DEFAULT: REPORT-ONLY ' +
@@ -363,8 +363,8 @@ fleet
 fleet
   .command('reconcile')
   .description(
-    'The DR-006 desired-state reconciler (DR-037 / macf#686, porting devops-toolkit ' +
-    'fleet/reconcile.sh). Probes ACTUAL state (fleet /health) and drives it toward the ' +
+    'The desired-state reconciler, porting devops-toolkit\'s fleet/reconcile.sh. ' +
+    'Probes ACTUAL state (fleet /health) and drives it toward the ' +
     'operator-owned DESIRED set (a desired-agents.yaml manifest if present, else the ' +
     "host's discovered workspaces): desired-and-down → LAUNCH; desired-and-deaf → HEAL " +
     'via the tiered ladder (Tier-1 gated inject → Tier-2 graceful-restart [--allow-restart] → ' +
@@ -382,7 +382,7 @@ fleet
   .option('--last-exit-dir <dir>', 'Per-agent last-exit-code dir (default: $HOME/.macf/last-exit)')
   .option('--paused-dir <dir>', 'Paused-sentinel dir (default: $HOME/.macf/paused)')
   .option('--heartbeat-file <path>', 'Watchdog self-heartbeat file (default: $HOME/.macf/watchdog-heartbeat)')
-  .option('--json', 'Emit the structured sweep result as JSON (DR-031 watchdog contract)', false)
+  .option('--json', 'Emit the structured sweep result as JSON (for scripting/automation)', false)
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .action(async (opts) => {
     process.exitCode = await runFleetReconcileCommand(resolveProjectDir(opts.dir), {
@@ -401,13 +401,13 @@ fleet
 fleet
   .command('resume')
   .description(
-    'Nudge a STALLED idle agent to continue, or REPORT a BLOCKED one — DR-037 / ' +
-    'macf#686, porting devops-toolkit fleet/resume.sh + stall-signatures.json. An idle ' +
+    'Nudge a STALLED idle agent to continue, or REPORT a BLOCKED one — ' +
+    'porting devops-toolkit\'s fleet/resume.sh + stall-signatures.json. An idle ' +
     'agent is one of three things and only its pane tells them apart: idle-CLEAN (no ' +
     'signature) → never touched; idle-STALLED (rate-limit/turn-abort) → NUDGE (resume ' +
     'the SAME session, preserving work); idle-BLOCKED (permission/trust/skill/memory ' +
     'prompt) → REPORT (a durable operator alert, NEVER auto-answered — an authorization ' +
-    'decision needs a human, DR-033). SAFETY: allowlist-only (never a blind nudge), ' +
+    'decision needs a human). SAFETY: allowlist-only (never a blind nudge), ' +
     'idle-gated (never interrupt a busy agent), verify-resumed (a nudge that does not ' +
     'take → back off, don\'t re-spam), fire-capped per episode. The allowlist lives in ' +
     '.claude/.macf/stall-signatures.json (operator-tunable). DRY-RUN BY DEFAULT — prints ' +
@@ -425,9 +425,8 @@ fleet
 fleet
   .command('upgrade')
   .description(
-    'Rolling framework-version upgrade (DR-037 / macf#682, hardened macf#722, ' +
-    'transactional + object-with-message macf#725). For each selected fleet (a ' +
-    "fleet == one PROJECT, macf#710 — its own CA + registry namespace, NOT the " +
+    'Rolling framework-version upgrade. For each selected fleet (a ' +
+    "fleet == one PROJECT — its own CA + registry namespace, NOT the " +
     'coarser registry scope, since one profile/org registry can host several ' +
     'distinct projects), roll every agent whose RUNNING /health.version is ' +
     'behind TARGET, ONE AT A TIME: pre-flight gates (config-dirty — OBJECTS ' +
@@ -439,7 +438,7 @@ fleet
     'target (re-resolving the fresh restart-self endpoint on EACH poll, over a ' +
     'relaunch-aware grace budget) → report the regenerated files + next. When ' +
     'an agent comes back reachable but still on its OLD version, its own ' +
-    'LAUNCH PIN discriminates the cause (macf#899): pin already matches ' +
+    'LAUNCH PIN discriminates the cause: pin already matches ' +
     'target → `bad-release` (a genuine crash-loop) → HALTS the roll (and ' +
     'later fleets — a bad release cannot brick the fleet); pin asks for a ' +
     'DIFFERENT version → `stale-pin` (the launcher, not the release, never ' +
@@ -454,7 +453,7 @@ fleet
   )
   .option('--target <version>', 'Target framework version (default: npm-latest of @groundnuty/macf)')
   .option('--fleet <names>', 'Comma-list of fleets (project identifiers) to roll — multi-select, rolled fleet-by-fleet')
-  .option('--registry <ids>', 'Comma-list of project identifiers to roll (same selector space as --fleet; historical flag name predates macf#710\'s project-based grouping)')
+  .option('--registry <ids>', 'Comma-list of project identifiers to roll (same selector space as --fleet; historical flag name predates the current project-based grouping)')
   .option('--execute', 'ACTUALLY roll the upgrade (default: dry-run — print the plan)', false)
   .option('--wait', 'On a busy agent, poll for idle up to a bound instead of skipping', false)
   .option('--verify-timeout <sec>', 'Per-agent verify-green budget, in seconds (default 120)', (v) => parseInt(v, 10))
@@ -462,8 +461,7 @@ fleet
     '--force',
     'Roll an agent even if its config surface (claude.sh, .claude/rules/**, ' +
       '.claude/scripts/**, .claude/settings.json, the managed .claude/.macf/env.* ' +
-      '+ host-prelude.sh, CLAUDE.md, env.local.* — the DR-040 Decision 6 union, ' +
-      'macf#698) is dirty PRE-flight (macf#722/#725) — bypasses the pre-flight ' +
+      '+ host-prelude.sh, CLAUDE.md, env.local.*) is dirty PRE-flight — bypasses the pre-flight ' +
       'config-dirty OBJECT gate. The bypassed agent\'s restart still leaves the ' +
       'config surface uncommitted (same as the normal path), it does not stash it.',
     false,
@@ -471,7 +469,7 @@ fleet
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .option(
     '-f, --file <path>',
-    'Path to the fleet.yaml manifest (DR-043 §D6, macf#907) — when given, a confirmed ' +
+    'Path to the fleet.yaml manifest — when given, a confirmed ' +
       "verify-green records that agent's deployed_version into the control repo's fleet.lock; " +
       'omitted = unchanged (no write). Same flag as `fleet deactivate`/`archive`.',
   )
@@ -492,22 +490,22 @@ fleet
 fleet
   .command('deactivate')
   .description(
-    'DR-043 Amendment G — the fleet teardown ladder\'s FIRST reversible rung: deregister the fleet ' +
+    'The fleet teardown ladder\'s FIRST reversible rung: deregister the fleet ' +
     'from the registry. Removes ONLY org/account-scope registry presence (the `<SEG>_CA_CERT` registry ' +
     'leg, every agent\'s `<SEG>_AGENT_<ROLE>` registration, `<SEG>_FEDERATED_CAS`) by EXACT KEY — never a ' +
     'prefix sweep. Repo-scoped variables/secrets, the vault, the repos, and the GitHub Apps are ALL left ' +
-    'untouched — revival is `apply` away, zero browser clicks (Amendment G\'s "free revival" property). ' +
+    'untouched — revival is `apply` away, zero browser clicks. ' +
     'Refuses on a foreign/unconfirmed control repo. Shows the exact target set + current registry state ' +
-    'before any mutation (--yes skips the interactive confirmation). groundnuty/macf#1033 — a LIVE agent ' +
+    'before any mutation (--yes skips the interactive confirmation). A LIVE agent ' +
     'discoverable on THIS host is asked to exit gracefully (the native `/exit`) and lets its own ' +
     '`shutdown.ts` deregister clear its slot; direct deletion is only the fallback for an agent with no ' +
     'live owner; an agent this host cannot discover is reported `unknown`, never assumed stopped (a fleet ' +
-    'may span hosts, #1018). Never SIGKILL.',
+    'may span hosts). Never SIGKILL.',
   )
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
   .option('--yes', 'Skip the interactive confirmation prompt', false)
   .option('--json', 'Emit the structured result as JSON', false)
-  .option('--dir <path>', 'Host-local dir to locate the tmux-submit helper from (default: cwd) — macf#1033 agent-stop only, any macf workspace works')
+  .option('--dir <path>', 'Host-local dir to locate the tmux-submit helper from (default: cwd) — agent-stop only, any macf workspace works')
   .action(async (opts) => {
     const code = await runFleetDeactivate({ file: opts.file, yes: opts.yes, json: opts.json, dir: opts.dir });
     process.exitCode = code;
@@ -516,7 +514,7 @@ fleet
 fleet
   .command('archive')
   .description(
-    'DR-043 Amendment G — the fleet teardown ladder\'s SECOND reversible rung: `deactivate` + archives ' +
+    'The fleet teardown ladder\'s SECOND reversible rung: `deactivate` + archives ' +
     'the `<fleet>-control` repo and every agent repo (`archived: true` via the GitHub API — read-only, ' +
     'reversible). Cumulative by design (an archived-but-still-registered fleet would be incoherent). ' +
     'Revival: un-archive (an `apply` run un-archives its own control repo on approval — see `bootstrap ' +
@@ -527,7 +525,7 @@ fleet
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
   .option('--yes', 'Skip the interactive confirmation prompt', false)
   .option('--json', 'Emit the structured result as JSON', false)
-  .option('--dir <path>', 'Host-local dir to locate the tmux-submit helper from (default: cwd) — macf#1033 agent-stop only, any macf workspace works')
+  .option('--dir <path>', 'Host-local dir to locate the tmux-submit helper from (default: cwd) — agent-stop only, any macf workspace works')
   .action(async (opts) => {
     const code = await runFleetArchive({ file: opts.file, yes: opts.yes, json: opts.json, dir: opts.dir });
     process.exitCode = code;
@@ -536,7 +534,7 @@ fleet
 fleet
   .command('delete-apps')
   .description(
-    'DR-043 Amendment G — the fleet teardown ladder\'s THIRD rung: `archive` + deletes the per-agent ' +
+    'The fleet teardown ladder\'s THIRD rung: `archive` + deletes the per-agent ' +
     'GitHub App identities, freeing their globally-unique names. GitHub has NO REST endpoint to delete a ' +
     'App registration (verified against current GitHub docs — see `app-identity-removal.ts`) — this ' +
     'command reports EVERY App that still needs manual deletion (Settings → Developer settings → GitHub ' +
@@ -555,7 +553,7 @@ fleet
 fleet
   .command('destroy')
   .description(
-    'DR-043 Amendment G — the fleet teardown ladder\'s TERMINAL rung: `delete-apps`\'s registry + App-identity ' +
+    'The fleet teardown ladder\'s TERMINAL rung: `delete-apps`\'s registry + App-identity ' +
     'work, PLUS deleting the repositories DIRECTLY (never archive-then-delete — pointless work for something ' +
     'about to be destroyed). History gone forever; full re-provision is the only way back. FRICTION IS THE ' +
     'FEATURE (operator directive: never allow easy repo removal) — requires ALL THREE of `--destroy-repositories`, ' +
@@ -601,12 +599,12 @@ fleet
     'atomically writes the App key at 0600 to the conventional ~/.macf/keys/<role>.pem (never overwritten once ' +
     'present AND its fingerprint matches the vault\'s — a mismatch, e.g. a key left over from a destroyed-and-' +
     'rebuilt fleet, refuses loud instead of minting with it; see --force-key), and re-materializes the ' +
-    'per-project CA the same way on a fingerprint mismatch (see --force-ca; macf#982) — a rebuild rotates BOTH ' +
+    'per-project CA the same way on a fingerprint mismatch (see --force-ca) — a rebuild rotates BOTH ' +
     'by construction, so when BOTH are stale the refusal names both flags together in ONE message rather than ' +
     'the operator discovering the second refusal only after fixing the first. Then delegates the rest to the ' +
     'real `macf init` — never reimplemented. Idempotent: an already-materialized workspace or matching key is ' +
-    'left untouched, reported as skipped. Never touches the vault\'s write side (Amendment D: read-only-' +
-    'decryptable) and never deploys anything not already recorded in the vault (Amendment A: refuses rather ' +
+    'left untouched, reported as skipped. Never touches the vault\'s write side (read-only-' +
+    'decryptable) and never deploys anything not already recorded in the vault (refuses rather ' +
     'than guesses on a missing/partial credential).',
   )
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
@@ -624,13 +622,13 @@ fleet
   .option(
     '--force-key',
     'On App-key fingerprint mismatch (e.g. a stale key from a destroyed-and-rebuilt fleet), re-materialize the ' +
-      'on-disk key from the vault instead of refusing (macf#975)',
+      'on-disk key from the vault instead of refusing)',
     false,
   )
   .option(
     '--force-ca',
     'On per-project CA fingerprint mismatch (e.g. a stale CA from a destroyed-and-rebuilt fleet), re-materialize ' +
-      'the on-disk CA from the vault instead of refusing (macf#982)',
+      'the on-disk CA from the vault instead of refusing)',
     false,
   )
   .option('--json', 'Emit the structured result as JSON', false)
@@ -650,15 +648,15 @@ fleet
 
 const bootstrap = program
   .command('bootstrap')
-  .description('Declarative fleet provisioning from a fleet.yaml manifest (DR-043)');
+  .description('Declarative fleet provisioning from a fleet.yaml manifest');
 
 bootstrap
   .command('plan')
   .description(
     'READ-ONLY: parse fleet.yaml, observe current GitHub-side state (best-effort — no App ' +
     'JWT exists yet, so App/install existence is read from fleet.lock only), and render the ' +
-    '3-verb reconcile plan (create / confirm-then-update / report-extra — NEVER delete, ' +
-    'DR-043 §D3). Manifest sections not yet reconciled in v1 (collaborators, versions ' +
+    '3-verb reconcile plan (create / confirm-then-update / report-extra — NEVER delete). ' +
+    'Manifest sections not yet reconciled in v1 (collaborators, versions ' +
     'steering) are surfaced as an explicit SKIPPED line, never a silent no-op. No apply, ' +
     'no mutation, no browser.',
   )
@@ -667,7 +665,7 @@ bootstrap
   .option(
     '--vault <path>',
     'Path to a fleet\'s secrets/vault.age — with --identity-key, lifts per-agent/CA observation into the ' +
-      'vault-aware confirm tier (DR-043 Amendment D phase 3). Operator-privileged use only; omit for the ' +
+      'vault-aware confirm tier. Operator-privileged use only; omit for the ' +
       'vault-free default.',
   )
   .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
@@ -684,7 +682,7 @@ bootstrap
 bootstrap
   .command('status')
   .description(
-    'READ-ONLY: renders OBSERVED fleet state — no diff, nothing stored (groundnuty/macf#1017). Same ' +
+    'READ-ONLY: renders OBSERVED fleet state — no diff, nothing stored. Same ' +
     'provisioning observation `plan` uses (Apps, installs, repos, CA both DR two-place legs, routing-client ' +
     'secrets, control repo, versions), plus each declared agent\'s registry-registration identity ' +
     '(host:port/instance_id/last_heartbeat). Live agent LIVENESS (online/uptime/cert_expiry) is NOT observable ' +
@@ -697,7 +695,7 @@ bootstrap
   .option(
     '--vault <path>',
     'Path to a fleet\'s secrets/vault.age — with --identity-key, lifts per-agent/CA observation into the ' +
-      'vault-aware confirm tier (DR-043 Amendment D phase 3), same as `bootstrap plan --vault`. Operator-' +
+      'vault-aware confirm tier, same as `bootstrap plan --vault`. Operator-' +
       'privileged use only; omit for the vault-free default (vault-dependent rows render `unknown`).',
   )
   .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
@@ -714,7 +712,7 @@ bootstrap
 bootstrap
   .command('apply')
   .description(
-    'Provision the fleet declared in fleet.yaml (DR-043 §D2/§D3/§D5). `--dry-run` renders the ' +
+    'Provision the fleet declared in fleet.yaml. `--dry-run` renders the ' +
     'read-only plan plus the exact GitHub App manifests that would be submitted — mutates nothing. ' +
     'Without `--dry-run`: shows the same plan-approve-once artifact, obtains ONE operator approval ' +
     '(`--yes` skips the prompt for automation), then drives confirm-before-create -> consent gate 1 ' +
@@ -725,27 +723,27 @@ bootstrap
   )
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
   .option('--dry-run', 'Render the plan + would-be App manifests; mutate nothing', false)
-  .option('--yes', 'Skip the interactive plan-approval prompt (the one non-interactive escape from DR-035 §4 plan-approve-once)', false)
+  .option('--yes', 'Skip the interactive plan-approval prompt (the one non-interactive escape from the plan-approve-once flow)', false)
   .option('--json', 'Emit the structured result as JSON', false)
   .option(
     '--vault <path>',
     'Path to a fleet\'s secrets/vault.age — with --identity-key, confirms a role WITH a prior fleet.lock ' +
-      'entry live against GitHub BEFORE deciding whether to open consent gate 1 (DR-043 Amendment A, macf#913). ' +
+      'entry live against GitHub BEFORE deciding whether to open consent gate 1. ' +
       'Operator-privileged use only; omit for the vault-free default.',
   )
   .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
   .option(
     '--runner-token <token>',
-    'GitHub Actions runner-registration token (macf#929) — required when routing.runner declares ' +
+    'GitHub Actions runner-registration token — required when routing.runner declares ' +
       'runs_on: "self-hosted"; licenses apply to POLL for a usable self-hosted runner before writing ' +
       'MACF_TRUSTED_ACTORS (never substitutes for that live check). Falls back to MACF_BOOTSTRAP_RUNNER_TOKEN ' +
       'when unset. Get one with: gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token',
   )
   .option(
     '--no-deploy',
-    'macf#1013 — skip the default per-agent deploy phase that otherwise runs after the GitHub phase above ' +
+    'Skip the default per-agent deploy phase that otherwise runs after the GitHub phase above ' +
       '(needs --vault + --identity-key; without them the deploy phase is skipped anyway, loudly). Restores ' +
-      'the pre-macf#1013 GitHub-only apply, for multi-host fleets (deploy runs per-host via `macf fleet ' +
+      'the previous GitHub-only apply, for multi-host fleets (deploy runs per-host via `macf fleet ' +
       'deploy`) or operators who want the two phases apart.',
   )
   .action(async (opts) => {
@@ -764,24 +762,24 @@ bootstrap
 
 const routing = program
   .command('routing')
-  .description('Routing-infra (GitHub delivery plane) interconnect-health (DR-030)');
+  .description('Routing-infra (GitHub delivery plane) interconnect-health');
 
 routing
   .command('doctor')
   .description(
-    'Routing-infra interconnect check (DR-030 phase-2): STATIC GitHub-plane checks ' +
+    'Routing-infra interconnect check: STATIC GitHub-plane checks ' +
     'that the delivery plane is wired right — (1) CALLER-PIN consistency across the ' +
-    'App install-set, (2) the #538 split: ROUTABLE (MACF_AGENT_<LABEL> registry key) ' +
-    '+ SELF-SKIP (agent-config app_name == bot-login, #566), (3) registration ' +
+    'App install-set, (2) the ROUTABLE (MACF_AGENT_<LABEL> registry key) ' +
+    'vs SELF-SKIP (agent-config app_name == bot-login) split, (3) registration ' +
     'FRESHNESS (registry instance_id == live /health), (4) MACF_CA_CERT present + ' +
-    'parses (#563), (5) tmux_session <project>@<routing-label> convention. These prove the ' +
+    'parses, (5) tmux_session <project>@<routing-label> convention. These prove the ' +
     'PLUMBING, NOT end-to-end delivery. Exits non-zero when DEGRADED. Pass --e2e for the ' +
     'CAPABILITY test instead: files a real issue on --target-repo, labels it there (the full ' +
     'router path, not a direct channel-server POST), and polls for the recipient recording ' +
     'delivery -- a RED result there needs no checklist of what to check, it just needs the ' +
     'message to not arrive, and names the stage the chain stopped at.',
   )
-  .option('--json', 'Emit the structured per-check result as JSON (DR-031 watchdog contract)', false)
+  .option('--json', 'Emit the structured per-check result as JSON (for scripting/automation)', false)
   .option('--expected-pin <pin>', 'Expected macf-actions caller-pin (else the modal pin across the fleet)')
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .option('--e2e', 'Run the routing CAPABILITY probe instead of the static checks (requires --target-repo)', false)
@@ -831,7 +829,7 @@ registry
 program
   .command('restart-self')
   .description(
-    'DR-031 piece 3 (be-replaceable): prepare the workspace + spawn a DETACHED ' +
+    'Prepare the workspace (be-replaceable design) + spawn a DETACHED ' +
     'relauncher that OUTLIVES this session, so a watchdog (or the agent) can ' +
     'trigger a clean restart without losing work. DRY-RUN BY DEFAULT — emits the ' +
     'plan (marked-stash, RESUME-note, relauncher cmd, session to kill) and does ' +
@@ -845,24 +843,24 @@ program
   .option('--json', 'Emit the structured plan/result as JSON', false)
   .option(
     '--force',
-    'Bypass the STANDALONE config-surface stash-refusal guard (macf#722) — ' +
+    'Bypass the STANDALONE config-surface stash-refusal guard — ' +
       'proceed (and STASH, same as any other dirt) even when claude.sh, ' +
       '.claude/rules/**, .claude/scripts/**, .claude/settings.json, the ' +
       'managed .claude/.macf/env.* + host-prelude.sh, CLAUDE.md, or env.local.* ' +
-      '(the DR-040 Decision 6 union, macf#698) are dirty. Same effect as ' +
+      'are dirty. Same effect as ' +
       'MACF_RESTART_STASH_CONFIG=1.',
     false,
   )
   .option(
     '--leave-config-uncommitted',
-    'Roll-path flag (macf#725, set by `macf fleet upgrade`\'s driver — not ' +
+    'Roll-path flag (set by `macf fleet upgrade`\'s driver — not ' +
       'intended for direct operator use): skip the config-surface guard ' +
       'entirely and LEAVE the config surface uncommitted instead of ' +
       'stashing it (any other tracked dirt still stashes normally). Same ' +
       'effect as MACF_RESTART_LEAVE_CONFIG_UNCOMMITTED=1.',
     false,
   )
-  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd). An explicit --dir WINS over MACF_WORKSPACE_DIR (macf#888) — pass it to target a workspace other than your own.')
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd). An explicit --dir WINS over MACF_WORKSPACE_DIR — pass it to target a workspace other than your own.')
   .action(async (opts) => {
     // macf#888 — capture "was --dir passed" BEFORE `resolveProjectDir`
     // collapses the explicit-vs-auto-discovered paths into the same string
@@ -929,7 +927,7 @@ program
   .command('self-update')
   .description(
     'Pull origin/main + rebuild the installed CLI\'s dist/ (for npm-link dev installs). ' +
-    'Note: this command only helps CLI versions >= 0.1.1 (#144); pre-#144 installs were silent.',
+    'Note: this command only helps CLI versions >= 0.1.1; older installs failed silently.',
   )
   .action(() => {
     try {
@@ -942,9 +940,9 @@ program
 
 program
   .command('doctor')
-  .description('Verify the workspace\'s bot token (DR-019) + settings match the role-aware floor (DR-028)')
+  .description('Verify the workspace\'s bot token + settings match the role-aware floor')
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
-  .option('--fix', 'Write the DR-028 role-settings floor (allow/deny/hooks) + sandbox entries into .claude/settings.json after confirmation', false)
+  .option('--fix', 'Write the role-settings floor (allow/deny/hooks) + sandbox entries into .claude/settings.json after confirmation', false)
   .option('--yes', 'Skip the --fix confirmation prompt (non-interactive)', false)
   .action(async (opts) => {
     const code = await runDoctor(resolveProjectDir(opts.dir), { fix: opts.fix, yes: opts.yes });
@@ -955,9 +953,9 @@ program
   .command('monitor')
   .description(
     'Read-only auditor: emit a protocol-health digest for the operator ' +
-    '(DR-026 F4). Aggregates open issues/PRs + F2 reflection signals; ' +
+    'Aggregates open issues/PRs + reflection signals; ' +
     'surfaces drift WITHOUT acting on it. Never mutates GitHub — ' +
-    'proposing/actuation is a separate, ratification-gated step (DR-026 G1).',
+    'proposing/actuation is a separate, ratification-gated step.',
   )
   .addHelpText('after', `
 This command is STRICTLY READ-ONLY. It issues only GitHub reads (gh issue/pr
@@ -982,7 +980,7 @@ Sample digest shape:
   ## Summary
   - Open issues: 6 (stale: 1)
   ...
-  > read-only report. No issues created/commented/closed/merged. (DR-026 G1)
+  > read-only report. No issues created/commented/closed/merged.
 `)
   .option('--repo <owner/repo>', 'Target GitHub repo (defaults to the project\'s repo registry config)')
   .option('--since <days>', 'Stale threshold in days (open issues older than this are flagged)', '14')
@@ -1004,7 +1002,7 @@ Sample digest shape:
 program
   .command('propose')
   .description(
-    'Auditor Plan membrane (DR-026 G1): turn F2 reflection signals into ' +
+    'Auditor Plan membrane: turn reflection signals into ' +
     'RATIFIABLE rule-evolution proposals. DRY-RUN BY DEFAULT — emits a report ' +
     'and opens NOTHING. Only --file opens ratifiable auditor-proposal issues ' +
     '(create-only). The operator ratifies; the auditor never merges/applies.',
@@ -1021,7 +1019,7 @@ TWO MODES — the distinction is load-bearing:
       Opens ONE 'auditor-proposal' issue per promoted candidate via a
       create-only seam (no merge/close/edit method exists). Needs a bot token
       (configured MACF project or GH_TOKEN). The operator ratifies each issue;
-      nothing is ever auto-merged or auto-applied (invariants #8 + #9).
+      nothing is ever auto-merged or auto-applied.
 
 THREE SAFETY GATES (the whole safety model):
   1. N>1 = distinct AGENTS, not occurrences. A candidate promotes only when it
@@ -1096,7 +1094,7 @@ program
   .option('--agents <list>', 'Comma-separated agent names to scaffold (e.g., code-agent,science-agent)')
   .option('--session-name <name>', 'Shared tmux session name; when set with multiple --agents, each agent gets a window inside this session')
   .option('--project <name>', 'Project name for the v3 router caller\'s required `project` input (defaults to the repo name). Must match the agents\' macf-agent.json project. v3+ only.')
-  .option('--registry-type <type>', 'Registry scope for the v3 router\'s registry-api-path: repo (default), org, or profile (DR-006). v3+ only.', 'repo')
+  .option('--registry-type <type>', 'Registry scope for the v3 router\'s registry-api-path: repo (default), org, or profile. v3+ only.', 'repo')
   .option('--registry-org <org>', 'Org login (for --registry-type org)')
   .option('--registry-user <user>', 'User login (for --registry-type profile)')
   .option('--force', 'Overwrite existing files', false)
