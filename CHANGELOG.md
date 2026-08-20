@@ -4,7 +4,7 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.57] — 2026-08-13
+## [0.2.57] — 2026-08-20
 
 **The DR-043 fleet-provisioning CLI ships.** `macf bootstrap` builds a whole fleet
 from a declarative `fleet.yaml`, and `macf fleet` now covers the full lifecycle —
