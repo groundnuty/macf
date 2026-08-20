@@ -45,6 +45,17 @@
 # surprising, slow, network-touching side effect buried inside a SessionStart
 # hook) — and it ALWAYS exits 0. Override: MACF_SKIP_FRAMEWORK_CHECK=1.
 #
+# DELIBERATELY matcher-less (groundnuty/macf#930 audit — kept, not an
+# oversight): unlike the work-pickup hook (macf-startup-pickup.sh, narrowed
+# to `matcher: "startup"` by #930), this guard's whole purpose is catching a
+# sweep that happened via some OTHER path mid-session (a hand-run command
+# outside a Bash tool call, per the WHY above) — the earliest re-check
+# opportunity after such a sweep may be a `compact`/`resume`/`clear`/`fork`,
+# not a fresh `startup`. Restricting this hook to `startup` would reopen the
+# exact detection gap #814 closed. It stays silent (no stdout) unless
+# something is actually swept, so it doesn't share #930's noise/subagent
+# concern in the first place.
+#
 # FALSE-WARN GUARD: a bare checkout of `groundnuty/macf` itself (the
 # framework source repo), or any workspace that was simply never
 # `macf init`'d, legitimately has none of `.macf/plugin`,

@@ -41,14 +41,64 @@
 # check-auditor-never-acts.sh's own "distribute everywhere, gate at runtime"
 # shape.
 #
-# Hook contract (SessionStart): JSON on stdin (ignored — the workspace path
-# comes from $CLAUDE_PROJECT_DIR); STDOUT is injected into the agent's
+# Hook contract (SessionStart): JSON on stdin — the workspace path comes from
+# $CLAUDE_PROJECT_DIR, but the payload IS now read (see TRIGGER + SUBAGENT
+# GATE below, groundnuty/macf#930). STDOUT is injected into the agent's
 # context. OBSERVATIONAL for the query half (deposits the plugin's own
 # `issues`-command output into the agent's context, identical to what
-# `/macf-issues` would print) — that half is always instant and unconditional.
-# The SUBMIT half ALWAYS exits 0 (fail open on a missing plugin mount, a
-# query error, a missing tmux session, or any internal fault) but is NOT
-# instant by design as of groundnuty/macf#802 — see below.
+# `/macf-issues` would print) — that half is instant once the gate below
+# passes. The SUBMIT half ALWAYS exits 0 (fail open on a missing plugin
+# mount, a query error, a missing tmux session, or any internal fault) but is
+# NOT instant by design as of groundnuty/macf#802 — see below.
+#
+# TRIGGER + SUBAGENT GATE (groundnuty/macf#930): the pickup nudge is
+# appropriate ONLY for a genuine fresh client start. Pre-#930 this hook was
+# registered matcher-less (fires on every SessionStart source) and never
+# read its own payload, so it ALSO fired on `compact` / `resume` / `clear` /
+# `fork` (competing with in-flight work right after the agent lost context
+# to compaction — the worst time to spend it re-injecting a queue prompt)
+# and reached at least one MACF-orchestrated worker/subagent session
+# (operator-witnessed live, groundnuty/macf#930 comments), which cannot
+# distinguish an ambient framework injection from a genuine task from its
+# principal. Two independent, deliberately non-bypassable checks below:
+#   - `source` must be exactly `startup` (registration also carries
+#     `matcher: "startup"` as defense-in-depth, but the script-side check is
+#     the one that actually gates the payload — Claude Code evaluates a
+#     `matcher` before invoking the command at all, which makes a matcher
+#     alone unobservable/untestable from inside the script, and this script
+#     is what a test actually drives). Field name + values (startup/resume/
+#     clear/compact/fork) verified against Claude Code's own hooks reference
+#     (https://code.claude.com/docs/en/hooks — SessionStart matcher row)
+#     plus a captured payload example, corroborated internally by this
+#     repo's own DR-034 `SessionStart(source=compact)` usage — not
+#     assumed from memory.
+#   - `agent_id` must be absent — Claude Code documents `agent_id` as
+#     present "ONLY when the hook fires inside a subagent", the precise
+#     signal (deliberately NOT `agent_type` too — see the inline comment at
+#     the check itself for why that field would false-positive on a
+#     legitimate `--agent`-launched top-level session). This is a
+#     BEST-EFFORT check, not a verified fix for the operator-witnessed
+#     incident: a MACF-orchestrated worktree/background worker plausibly
+# Tracked as groundnuty/macf#1042 (spawn-side fix: the spawner sets
+#   MACF_NO_STARTUP_PICKUP=1 on the child; the spawned session cannot know what it is).
+#     presents as a genuine `source: startup` session with `agent_id` unset
+#     (it is not Claude Code's own Task-tool subagent, which per the docs
+#     doesn't fire SessionStart at all), so this check cannot see it.
+#     Shipped anyway — ambient framework instructions must never reach a
+#     scoped worker; see the fix's issue thread for the residual + the
+#     proposed real fix
+#     (the spawning mechanism setting `MACF_NO_STARTUP_PICKUP=1` on the
+#     child — no new mechanism needed, the override already exists below).
+#
+# Both checks fail the SAME way (`exit 0`, no stdout) but for a DIFFERENT
+# reason than the error-handling `trap` above — two distinct axes:
+#   - INTERNAL ERRORS (a read/parse fault, an unexpected trap) fail OPEN:
+#     never block a session regardless of what breaks internally.
+#   - TRIGGER AMBIGUITY (`source` absent/unrecognised, or a subagent-shaped
+#     payload) fails CLOSED: silently skip rather than risk an unwanted
+#     injection. A missing pickup prompt is recoverable (`/macf-issues`); a
+#     spurious one costs context in every session and, for a subagent, is
+#     an unauthenticatable instruction landing in a narrow-brief context.
 #
 # READINESS + VERIFY GATE (groundnuty/macf#802): a synchronous SessionStart
 # submit can race a relaunch (`claude -c`) that hasn't yet cleared its own
@@ -96,12 +146,13 @@
 #                                                  post-send capture
 #                                                  (default 1).
 #
-# Refs: groundnuty/macf#768 (this hook); groundnuty/macf#802 (this gate);
-#       #703 (the startup-prompt collision partner); DR-026 (auditor
-#       never-acts boundary); plugin/skills/macf-issues/SKILL.md (the
-#       delegated command); tmux-send-to-claude.sh (the sanctioned
+# Refs: groundnuty/macf#768 (this hook); groundnuty/macf#802 (the
+#       readiness/verify gate); groundnuty/macf#930 (the trigger + subagent
+#       gate below); #703 (the startup-prompt collision partner); DR-026
+#       (auditor never-acts boundary); plugin/skills/macf-issues/SKILL.md
+#       (the delegated command); tmux-send-to-claude.sh (the sanctioned
 #       2-step-Enter submit helper); macf-prompt-watcher.sh (sibling pane
-#       watcher whose heuristics this gate mirrors, intentionally
+#       watcher whose heuristics the #802 gate mirrors, intentionally
 #       duplicated rather than sourced — bash can't import bash across
 #       distribution boundaries any more than it can import the TS role-gate
 #       above).
@@ -112,11 +163,8 @@ set -uo pipefail
 # check-channels-enabled.sh.
 trap 'exit 0' ERR
 
-# Drain + ignore the SessionStart payload — no field is needed; the
-# workspace path comes from $CLAUDE_PROJECT_DIR / $PWD.
-cat >/dev/null 2>&1 || true
-
-# 1. Operator override first — cheapest exit, no query, no submit.
+# 1. Operator override first — cheapest exit, no stdin read, no query, no
+#    submit.
 if [[ "${MACF_NO_STARTUP_PICKUP:-}" == "1" ]]; then
   exit 0
 fi
@@ -129,10 +177,44 @@ if [[ "${MACF_AGENT_ROLE:-}" == "auditor" ]]; then
   exit 0
 fi
 
+# 3. Trigger + subagent gate (groundnuty/macf#930) — see the file header
+#    "TRIGGER + SUBAGENT GATE" section for the full rationale + citations.
+#    Read now (not drained/ignored, pre-#930 behavior) because this is the
+#    place that can actually be tested: the `matcher: "startup"` on this
+#    hook's registration (settings-writer.ts / hooks.json) is
+#    defense-in-depth, but Claude Code evaluates matchers before invoking
+#    the command at all, so a matcher alone is unobservable/untestable from
+#    inside the script — this script-side check is what a test actually
+#    drives.
+INPUT_JSON="$(cat 2>/dev/null || echo '')"
+SESSION_SOURCE="$(printf '%s' "$INPUT_JSON" | sed -n 's/.*"source":"\([^"]*\)".*/\1/p' 2>/dev/null || true)"
+# Fail CLOSED on anything but an exact "startup" match — absent, malformed,
+# or any of resume/clear/compact/fork all take this exit. No override: this
+# is a correctness gate (matching Claude Code's own definition of "a client
+# actually started"), not an optional feature toggle.
+[[ "$SESSION_SOURCE" == "startup" ]] || exit 0
+
+# Best-effort subagent no-op — see the file header for why this does NOT
+# fully cover the operator-witnessed incident. Checked AFTER the source
+# gate (cheaper to fail on source first) but still before any GitHub call.
+# `agent_id` ONLY — deliberately NOT `agent_type` too. Claude Code documents
+# `agent_type` as present "when the session uses --agent OR the hook fires
+# inside a subagent" (two conditions); `agent_id` is documented as present
+# "ONLY when the hook fires inside a subagent" — the exact signal. Gating on
+# `agent_type` as well would treat a legitimate `--agent`-launched TOP-LEVEL
+# session as a subagent and silently drop its pickup prompt, which is a
+# correctness regression the fix must not introduce (requirement #3: preserve
+# genuine-startup behavior exactly). `claude.sh`'s `exec claude` never emits
+# `--agent` today (verified: no such flag in claude-sh.ts's invocation), so
+# this is currently latent, not reachable — but `agent_id` is the textually
+# correct reading regardless of what any particular launcher does.
+AGENT_ID="$(printf '%s' "$INPUT_JSON" | sed -n 's/.*"agent_id":"\([^"]*\)".*/\1/p' 2>/dev/null || true)"
+[[ -z "$AGENT_ID" ]] || exit 0
+
 WORKSPACE="${CLAUDE_PROJECT_DIR:-${PWD:-}}"
 [[ -n "$WORKSPACE" ]] || exit 0
 
-# 3. Locate the mounted plugin's CLI. `.macf/plugin` is the canonical mount
+# 4. Locate the mounted plugin's CLI. `.macf/plugin` is the canonical mount
 #    point for BOTH macf-init'd consumer workspaces
 #    (plugin-fetcher.ts `workspacePluginDir`) AND hand-wired substrate
 #    workspaces (claude.sh's `--plugin-dir "$SCRIPT_DIR/.macf/plugin"`) —
@@ -141,7 +223,7 @@ PLUGIN_CLI="$WORKSPACE/.macf/plugin/dist/plugin/bin/macf-plugin-cli.js"
 [[ -f "$PLUGIN_CLI" ]] || exit 0
 command -v node >/dev/null 2>&1 || exit 0
 
-# 4. Delegate the query — see the file header for why this is `issues`, not
+# 5. Delegate the query — see the file header for why this is `issues`, not
 #    a hand-rolled `gh issue list`. Never treat a non-zero exit (a
 #    transient GitHub API error, a token the refresh-aware client couldn't
 #    recover) as fatal to the SESSION — just skip the pickup this start.
@@ -152,7 +234,7 @@ OUTPUT="$(node "$PLUGIN_CLI" issues 2>/dev/null)" || exit 0
 # text `/macf-issues` would print.
 printf '%s\n' "$OUTPUT"
 
-# 5. Pending work? Match the plugin's own literal text
+# 6. Pending work? Match the plugin's own literal text
 #    (plugin/lib/format.ts `formatIssues` / `formatStartupReconcile`) rather
 #    than re-parsing its output — avoids a second source of truth for "what
 #    counts as pending."
@@ -160,7 +242,7 @@ if ! grep -qE 'pending issue\(s\):|inbox message\(s\) drained on startup:' <<<"$
   exit 0
 fi
 
-# 6. Auto-submit. tmux-send-to-claude.sh is the ONLY sanctioned way to
+# 7. Auto-submit. tmux-send-to-claude.sh is the ONLY sanctioned way to
 #    programmatically submit a prompt (2-step Enter quirk) — never inline
 #    `tmux send-keys ... Enter`. Requires an actual tmux session (claude.sh's
 #    canonical self-wrap); silently skip outside one — checked FIRST so we
@@ -171,7 +253,7 @@ if [[ -z "${TMUX:-}" ]] || [[ ! -x "$TMUX_SUBMIT" ]]; then
   exit 0
 fi
 
-# 7. Readiness + verify gate (macf#802) — see the file header for the full
+# 8. Readiness + verify gate (macf#802) — see the file header for the full
 #    rationale. Tunables read here so an operator override applies to
 #    whichever branch below actually fires.
 READY_TIMEOUT="${MACF_STARTUP_PICKUP_READY_TIMEOUT_SECS:-${MACF_PROMPT_WATCH_WINDOW_SECS:-90}}"
@@ -258,7 +340,7 @@ _submit_when_ready() {
   printf '\n[macf-startup-pickup] WARNING: could not confirm the auto-submit landed — the pane still looks unchanged, or now shows another blocking prompt, after %d attempt(s) (groundnuty/macf#802). The prompt may have been swallowed by a startup menu that rendered after the readiness check passed. Pending work is listed above; pick it up manually.\n' "$attempt"
 }
 
-# 8. Build the DETAILED submit prompt (macf#816) — the operator wants the
+# 9. Build the DETAILED submit prompt (macf#816) — the operator wants the
 #    pickup prompt to CARRY the pending-issue list, not point back at
 #    context with a generic "review the queue above" line. `issues
 #    --oneline` is a second short-lived plugin-CLI invocation (same query

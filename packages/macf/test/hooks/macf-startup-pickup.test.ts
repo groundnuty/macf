@@ -13,9 +13,19 @@
  * invocation instead of touching a real tmux session), so no real GitHub
  * or tmux access is needed.
  *
- * Hook contract (SessionStart): JSON on stdin (ignored); STDOUT is injected
- * into the agent's context. OBSERVATIONAL + NON-BLOCKING — the script
- * ALWAYS exits 0. Overrides: MACF_NO_STARTUP_PICKUP=1.
+ * Hook contract (SessionStart): JSON on stdin; STDOUT is injected into the
+ * agent's context. OBSERVATIONAL + NON-BLOCKING — the script ALWAYS exits
+ * 0. Overrides: MACF_NO_STARTUP_PICKUP=1.
+ *
+ * groundnuty/macf#930: the payload is now READ (not drained/ignored) for a
+ * `source` field (must be exactly `"startup"` — resume/clear/compact/fork/
+ * absent/unrecognised all fail CLOSED, no injection) and `agent_id` alone
+ * (present → best-effort subagent no-op; deliberately NOT `agent_type`,
+ * which Claude Code also sets for a legitimate `--agent`-launched top-level
+ * session — gating on it would false-positive and drop the prompt for a
+ * genuine startup). `runHook`'s `source`/`agentId`/`agentType` options
+ * exercise this; `source` defaults to `'startup'` so every pre-#930 call
+ * site (none of which pass it) keeps exercising a genuine startup unchanged.
  */
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
@@ -129,6 +139,19 @@ function runHook(opts: {
    * "can't tell" — the pre-#802 behavior (immediate, unconditional submit).
    */
   readonly tmuxFrames?: readonly string[];
+  /**
+   * SessionStart payload `source` field (groundnuty/macf#930). Defaults to
+   * `'startup'` — matches the ORIGINAL hardcoded stdin this file always
+   * sent, so every pre-#930 test case keeps exercising a genuine startup
+   * unchanged. Pass `null` to omit the `source` key entirely (the
+   * field-absent case); pass any other string (`'compact'`, `'resume'`,
+   * `'clear'`, `'fork'`, `'wat'`) to exercise the fail-closed gate.
+   */
+  readonly source?: string | null;
+  /** SessionStart payload `agent_id` field (groundnuty/macf#930 subagent no-op). Omitted by default. */
+  readonly agentId?: string;
+  /** SessionStart payload `agent_type` field (groundnuty/macf#930 subagent no-op). Omitted by default. */
+  readonly agentType?: string;
 }): RunResult {
   const workspace = mkdtempSync(join(tmpdir(), 'macf-startup-pickup-ws-'));
 
@@ -195,8 +218,17 @@ function runHook(opts: {
     }
   }
 
+  // groundnuty/macf#930: build the payload's `source` (default 'startup' —
+  // preserves every pre-#930 call site unchanged) + optional agent_id /
+  // agent_type. `source: null` omits the key entirely (field-absent case).
+  const payload: Record<string, string> = { session_id: 'sess-x' };
+  const sourceValue = opts.source === undefined ? 'startup' : opts.source;
+  if (sourceValue !== null) payload['source'] = sourceValue;
+  if (opts.agentId !== undefined) payload['agent_id'] = opts.agentId;
+  if (opts.agentType !== undefined) payload['agent_type'] = opts.agentType;
+
   const res = spawnSync('bash', [HOOK_SCRIPT], {
-    input: JSON.stringify({ session_id: 'sess-x', source: 'startup' }),
+    input: JSON.stringify(payload),
     env: cleanEnv,
     encoding: 'utf-8',
   });
@@ -260,6 +292,106 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
       });
       expect(r.status).toBe(0);
       expect(r.stdout).toContain('No pending issues.');
+      expect(r.submitInvocation).toBeNull();
+    });
+  });
+
+  describe('(b.5) trigger + subagent gate (groundnuty/macf#930) — genuine startup only, never a subagent-shaped payload', () => {
+    // Decisive per the #930 fix: compact/resume/clear/fork must NOT inject,
+    // and a genuine startup must be UNCHANGED (covered by every other
+    // describe block in this file, none of which override `source` — they
+    // all still send the default 'startup').
+    for (const source of ['compact', 'resume', 'clear', 'fork']) {
+      it(`source: '${source}' → does NOT inject (fails CLOSED, not the pre-#930 fire-on-everything behavior)`, () => {
+        const r = runHook({
+          pluginOutput: PENDING_OUTPUT,
+          pluginOnelineOutput: '#1: fix the thing; #2: write the docs',
+          env: { MACF_AGENT_ROLE: 'code-agent' },
+          source,
+        });
+        expect(r.status).toBe(0);
+        expect(r.stdout).toBe('');
+        expect(r.submitInvocation).toBeNull();
+      });
+    }
+
+    it("an unrecognised source ('wat') → does NOT inject (fail-closed on ambiguity, not just the 4 known non-startup values)", () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: 'wat',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe('');
+      expect(r.submitInvocation).toBeNull();
+    });
+
+    it('source field ABSENT entirely from the payload → does NOT inject (fail-closed, never assume startup)', () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: null,
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe('');
+      expect(r.submitInvocation).toBeNull();
+    });
+
+    it("source: 'startup' (the default every other test in this file sends) still injects — genuine startup is UNCHANGED", () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        pluginOnelineOutput: '#1: fix the thing',
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: 'startup',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('pending issue(s):');
+      expect(r.submitInvocation).not.toBeNull();
+    });
+
+    it('agent_id present (source still startup) → does NOT inject (subagent no-op, best-effort per the file header)', () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: 'startup',
+        agentId: 'sub-1',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe('');
+      expect(r.submitInvocation).toBeNull();
+    });
+
+    it("agent_type present WITHOUT agent_id (source still startup) → STILL injects (agent_type alone is NOT the subagent signal)", () => {
+      // Claude Code documents agent_type as present "when the session uses
+      // --agent OR the hook fires inside a subagent" — two conditions, only
+      // one of which is a subagent. agent_id is documented as present ONLY
+      // for the subagent case. Gating on agent_type too would silently drop
+      // the pickup prompt for a legitimate top-level `--agent`-launched
+      // session (unreachable via claude.sh today — it never emits --agent —
+      // but the gate must not regress requirement #3, "preserve genuine-
+      // startup behavior exactly", if that ever changes). This is the
+      // regression test for that false-positive.
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        pluginOnelineOutput: '#1: fix the thing',
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: 'startup',
+        agentType: 'general-purpose',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('pending issue(s):');
+      expect(r.submitInvocation).not.toBeNull();
+    });
+
+    it('a subagent-shaped payload (source=startup + agent_id) on a compact ALSO does not inject (both gates independently fail closed)', () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: 'compact',
+        agentId: 'sub-1',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe('');
       expect(r.submitInvocation).toBeNull();
     });
   });
@@ -343,14 +475,22 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
       expect(r.submitInvocation).toBeNull();
     });
 
-    it('malformed / empty stdin → still exits 0', () => {
+    it('malformed / empty stdin → still exits 0 (semantic shift post-#930: fails closed with empty stdout, not just non-blocking)', () => {
+      // Pre-#930 this only asserted non-blocking (status 0) — the payload was
+      // drained/ignored, so malformed stdin was harmless by construction.
+      // Post-#930 the payload IS parsed for `source`; malformed input can't
+      // match "startup" (the sed extraction simply finds nothing), so this
+      // now ALSO exercises the fail-closed path, not merely the fail-open
+      // `trap`. Both assertions below hold for the same reason but are
+      // conceptually distinct — pinning both so neither regresses silently.
       const workspace = mkdtempSync(join(tmpdir(), 'macf-startup-pickup-ws-'));
       const res = spawnSync('bash', [HOOK_SCRIPT], {
         input: 'not json {{{',
         env: { PATH: process.env['PATH'] ?? '', CLAUDE_PROJECT_DIR: workspace },
         encoding: 'utf-8',
       });
-      expect(res.status).toBe(0);
+      expect(res.status).toBe(0); // never blocks the session (fail-open on errors)
+      expect(res.stdout).toBe(''); // and never injects on unparseable input (fail-closed on ambiguity)
     });
   });
 

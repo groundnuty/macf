@@ -1519,19 +1519,34 @@ export function installGhTokenHook(workspaceDir: string): void {
  * `check-auditor-never-acts.sh`'s own "distribute everywhere, gate at
  * runtime" shape.
  *
- * Runs on the `SessionStart` event (matcher-less). OBSERVATIONAL (deposits
- * the plugin's own issues-command output into the agent's context) and
- * ALWAYS exits 0 (a missing plugin mount, a query error, or any internal
- * fault fails open) — but is NOT instant by design as of groundnuty/macf#802:
- * the submit step is gated on a bounded pane-readiness poll + a post-send
- * verify (default budget up to 90s — see the script header) so a relaunch
- * racing its own unresolved startup prompts (#703) doesn't have its pickup
- * keystrokes silently swallowed. `MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS`
- * below gives the hook registration itself enough headroom to outlive that
- * poll, independent of whatever Claude Code's own default hook timeout is.
+ * Runs on the `SessionStart` event, registered with `matcher: "startup"`
+ * (groundnuty/macf#930 — was matcher-less pre-#930, which meant this fired
+ * on `compact`/`resume`/`clear`/`fork` too, and reached at least one
+ * MACF-orchestrated worker/subagent session). The matcher is
+ * defense-in-depth, NOT the load-bearing gate: Claude Code evaluates
+ * matchers before invoking the command at all, which means a matcher alone
+ * is unobservable from a unit test driving the script's stdin directly — the
+ * SCRIPT ITSELF re-checks the payload's `source` field (and, best-effort,
+ * `agent_id` alone — deliberately not `agent_type` too, see the script's
+ * own header) and is what a test actually exercises. See the script's own
+ * header for the full rationale + the residual subagent-detection gap.
+ *
+ * OBSERVATIONAL (deposits the plugin's own issues-command output into the
+ * agent's context) and ALWAYS exits 0 (a missing plugin mount, a query
+ * error, a trigger that isn't a genuine startup, or any internal fault all
+ * fail the SAME way but for different reasons — see the script header's
+ * "fail open on errors, fail closed on ambiguity" split) — but is NOT
+ * instant by design as of groundnuty/macf#802: the submit step is gated on
+ * a bounded pane-readiness poll + a post-send verify (default budget up to
+ * 90s — see the script header) so a relaunch racing its own unresolved
+ * startup prompts (#703) doesn't have its pickup keystrokes silently
+ * swallowed. `MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS` below gives the hook
+ * registration itself enough headroom to outlive that poll, independent of
+ * whatever Claude Code's own default hook timeout is.
  * Override: `MACF_NO_STARTUP_PICKUP=1` (family: `MACF_NO_TMUX_WRAP` /
  * `MACF_OTEL_DISABLED`); the poll/verify budgets have their own overrides
- * documented in the script itself.
+ * documented in the script itself. The `source`/subagent gate has
+ * deliberately NO override — see the script header for why.
  */
 export const MACF_STARTUP_PICKUP_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/macf-startup-pickup.sh';
 
@@ -1562,6 +1577,11 @@ function isStartupPickupHookCommand(command: string): boolean {
  * hooks AND the sibling `check-channels-enabled.sh` MACF entry
  * `installGhTokenHook` writes — identified ONLY by a basename match on
  * `macf-startup-pickup.sh`, never by clearing the array.
+ *
+ * `matcher: "startup"` (groundnuty/macf#930) is defense-in-depth only — the
+ * script itself re-checks the payload's `source` field, which is the part a
+ * test can actually drive. See `MACF_STARTUP_PICKUP_HOOK_COMMAND`'s doc
+ * comment for why the matcher alone isn't sufficient.
  */
 export function applyStartupPickupHookTransform(settings: Settings): Settings {
   const hooks = settings.hooks ?? {};
@@ -1571,6 +1591,7 @@ export function applyStartupPickupHookTransform(settings: Settings): Settings {
   );
   const macfEntries: readonly HookEntry[] = [
     {
+      matcher: 'startup',
       hooks: [
         {
           type: 'command',
