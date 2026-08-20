@@ -218,7 +218,7 @@ import { repoHomepageUrl } from './app-manifest.js';
 import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './control-repo.js';
 import { provisionControlRepo } from './control-repo.js';
 import type { ControlRepoInitOutcome } from './apply-control-repo-init.js';
-import { applyControlRepoInit } from './apply-control-repo-init.js';
+import { applyControlRepoInit, deriveRouterCarryingRepos } from './apply-control-repo-init.js';
 import type { FleetLockAgentUpdate, FleetLockIdentityChange } from './fleet-lock.js';
 import { composeFleetLock, readFleetLockFile, writeFleetLock } from './fleet-lock.js';
 import type { VaultAgentSecrets, VaultCaSecrets, VaultEncryptFn, VaultRoutingClientSecrets, VaultRunnerOpsSecrets, WriteVaultDeps } from './vault-write.js';
@@ -1089,6 +1089,13 @@ export async function applyFleet(
     records.push({ role: agent.role, identity, repoInit: repoInitOutcome });
   }
 
+  // groundnuty/macf#1071 — the publish target set for anything the router
+  // job itself needs (today: ONLY the routing-client mTLS secrets — see the
+  // routing-client publish section below). See
+  // `apply-control-repo-init.ts::deriveRouterCarryingRepos`'s doc for the
+  // fix's decisive derivation logic.
+  const routerCarryingRepos: readonly string[] = deriveRouterCarryingRepos(confirmedRepos, controlRepo, controlRepoInit);
+
   // --- groundnuty/macf#943: the runner-ops App — a FLEET-LEVEL
   // identity (never declared in manifest.agents[]; `FleetManifestSchema` has
   // no knowledge of this role), driven through the EXACT SAME
@@ -1364,7 +1371,7 @@ export async function applyFleet(
   let routingClientPublish: RoutingClientPublishResult;
   if (routingClientMint.status === 'minted' && vault.status !== 'written') {
     routingClientPublish = skippedRoutingClientPublish(
-      confirmedRepos,
+      routerCarryingRepos,
       'routing-client cert was freshly minted this run but the batched vault write did not succeed — refusing to ' +
         'deploy the private key to any repo until it is durable (DR-043 §D5). Re-run apply once the vault issue is ' +
         "fixed. The retry re-mints (fleet.lock never recorded a routing_client_key fingerprint), which is harmless: " +
@@ -1372,17 +1379,17 @@ export async function applyFleet(
     );
   } else if (routingClientMint.status === 'minted') {
     const secretsForPublish: RoutingClientSecretsForPublish = { status: 'available', certPem: routingClientMint.certPem, keyPem: routingClientMint.keyPem };
-    routingClientPublish = await publishRoutingClientSecrets(secretsForPublish, confirmedRepos, deps.routingClientDeps);
+    routingClientPublish = await publishRoutingClientSecrets(secretsForPublish, routerCarryingRepos, deps.routingClientDeps);
   } else if (lockHasRoutingClientKey) {
     const secretsForPublish = await resolveRoutingClientSecretsForPublish(routingClientMint, true, deps.routingClientDeps);
-    routingClientPublish = await publishRoutingClientSecrets(secretsForPublish, confirmedRepos, deps.routingClientDeps);
+    routingClientPublish = await publishRoutingClientSecrets(secretsForPublish, routerCarryingRepos, deps.routingClientDeps);
   } else {
-    routingClientPublish = skippedRoutingClientPublish(confirmedRepos, routingClientMint.reason);
+    routingClientPublish = skippedRoutingClientPublish(routerCarryingRepos, routingClientMint.reason);
   }
   deps.log(
     `Routing-client cert legs: ${String(Object.values(routingClientPublish.certLegs).filter((l) => l.status === 'created').length)} created, ` +
       `${String(Object.values(routingClientPublish.certLegs).filter((l) => l.status === 'already-present').length)} already-present of ` +
-      `${String(confirmedRepos.length)} confirmed repo(s).`,
+      `${String(routerCarryingRepos.length)} confirmed repo(s).`,
   );
   for (const [repo, leg] of Object.entries(routingClientPublish.certLegs)) {
     if (leg.status === 'failed' || leg.status === 'skipped') {

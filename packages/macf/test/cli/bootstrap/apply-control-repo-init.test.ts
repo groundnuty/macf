@@ -17,10 +17,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   applyControlRepoInit,
+  controlRepoCarriesRouter,
   controlRepoWorkflowAllowlisted,
+  deriveRouterCarryingRepos,
   CONTROL_REPO_AGENT_CONFIG_RELATIVE_PATH,
   CONTROL_REPO_WORKFLOW_RELATIVE_PATH,
 } from '../../../src/cli/bootstrap/apply-control-repo-init.js';
+import type { ControlRepoInitOutcome } from '../../../src/cli/bootstrap/apply-control-repo-init.js';
 import type { RepoInitOptions, RepoInitResult } from '../../../src/cli/commands/repo-init.js';
 import type { FleetAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { CONTROL_REPO_COMMIT_ALLOWLIST } from '../../../src/cli/bootstrap/control-repo.js';
@@ -58,6 +61,90 @@ describe('controlRepoWorkflowAllowlisted', () => {
     expect(CONTROL_REPO_COMMIT_ALLOWLIST).toContain(CONTROL_REPO_WORKFLOW_RELATIVE_PATH);
     expect(CONTROL_REPO_COMMIT_ALLOWLIST).toContain(CONTROL_REPO_AGENT_CONFIG_RELATIVE_PATH);
     expect(controlRepoWorkflowAllowlisted()).toBe(true);
+  });
+});
+
+describe('controlRepoCarriesRouter (groundnuty/macf#1071)', () => {
+  it('written + allowlisted -> true (the control repo belongs in a router-carrying-repo publish set)', () => {
+    const outcome: ControlRepoInitOutcome = {
+      repo: 'groundnuty/demo-fleet-control',
+      agents: ['code-agent'],
+      status: 'written',
+      labels: { status: 'ok', created: [], existed: [] },
+      workflowAndConfigAllowlisted: true,
+    };
+    expect(controlRepoCarriesRouter(outcome)).toBe(true);
+  });
+
+  it('written but NOT allowlisted -> false (the write never actually gets committed/pushed)', () => {
+    const outcome: ControlRepoInitOutcome = {
+      repo: 'groundnuty/demo-fleet-control',
+      agents: ['code-agent'],
+      status: 'written',
+      labels: { status: 'ok', created: [], existed: [] },
+      workflowAndConfigAllowlisted: false,
+    };
+    expect(controlRepoCarriesRouter(outcome)).toBe(false);
+  });
+
+  it('failed -> false', () => {
+    const outcome: ControlRepoInitOutcome = { repo: 'groundnuty/demo-fleet-control', agents: ['code-agent'], status: 'failed', reason: 'disk full' };
+    expect(controlRepoCarriesRouter(outcome)).toBe(false);
+  });
+
+  it('skipped (aborted-run fallback shape) -> false', () => {
+    expect(controlRepoCarriesRouter({ status: 'skipped' })).toBe(false);
+  });
+});
+
+describe('deriveRouterCarryingRepos (groundnuty/macf#1071) — the decisive target-set derivation', () => {
+  const CONTROL_REPO = { repo: 'groundnuty/demo-fleet-control' };
+  const WRITTEN_ALLOWLISTED: ControlRepoInitOutcome = {
+    repo: CONTROL_REPO.repo,
+    agents: ['code-agent'],
+    status: 'written',
+    labels: { status: 'ok', created: [], existed: [] },
+    workflowAndConfigAllowlisted: true,
+  };
+
+  // Per `assert-the-wrong-path.md`: asserting the RETURNED LIST's exact
+  // membership — not merely that the function ran, or that its length grew
+  // by one — is what distinguishes "the control repo specifically joined
+  // the set" from "some unrelated string got appended." This is the exact
+  // property #1071 reports broken: three agent-repo entries where four
+  // (three agents + control) belong.
+  it('DECISIVE — a fleet whose control repo carries the router has the control repo IN the target set, alongside every agent repo', () => {
+    const agentRepos = ['groundnuty/demo-code', 'groundnuty/demo-science', 'groundnuty/demo-writing'];
+    const result = deriveRouterCarryingRepos(agentRepos, CONTROL_REPO, WRITTEN_ALLOWLISTED);
+    expect(result).toEqual([...agentRepos, 'groundnuty/demo-fleet-control']);
+    expect(result).toContain('groundnuty/demo-fleet-control');
+    expect(result).toHaveLength(4);
+  });
+
+  it('a fleet whose control repo does NOT carry the router (repo-init failed) does not get the control repo in the target set', () => {
+    const agentRepos = ['groundnuty/demo-code'];
+    const failed: ControlRepoInitOutcome = { repo: CONTROL_REPO.repo, agents: ['code-agent'], status: 'failed', reason: 'disk full' };
+    const result = deriveRouterCarryingRepos(agentRepos, CONTROL_REPO, failed);
+    expect(result).toEqual(agentRepos);
+    expect(result).not.toContain('groundnuty/demo-fleet-control');
+  });
+
+  it('a fleet whose control repo wrote the workflow but it is not yet allowlisted for commit does not get it in the target set', () => {
+    const agentRepos = ['groundnuty/demo-code'];
+    const writtenNotAllowlisted: ControlRepoInitOutcome = { ...WRITTEN_ALLOWLISTED, workflowAndConfigAllowlisted: false };
+    const result = deriveRouterCarryingRepos(agentRepos, CONTROL_REPO, writtenNotAllowlisted);
+    expect(result).toEqual(agentRepos);
+  });
+
+  it('the aborted-run `{ status: "skipped" }` fallback shape does not get the control repo in the target set', () => {
+    const agentRepos: readonly string[] = [];
+    const result = deriveRouterCarryingRepos(agentRepos, CONTROL_REPO, { status: 'skipped' });
+    expect(result).toEqual([]);
+  });
+
+  it('zero agent repos + a router-carrying control repo -> the target set is exactly [control repo]', () => {
+    const result = deriveRouterCarryingRepos([], CONTROL_REPO, WRITTEN_ALLOWLISTED);
+    expect(result).toEqual(['groundnuty/demo-fleet-control']);
   });
 });
 

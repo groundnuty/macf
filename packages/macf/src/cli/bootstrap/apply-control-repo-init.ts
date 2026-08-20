@@ -153,6 +153,59 @@ export type ControlRepoInitOutcome =
     };
 
 /**
+ * Whether the control repo, as of THIS run's `applyControlRepoInit` outcome,
+ * actually carries a router workflow that will reach GitHub — i.e. whether
+ * it belongs in the target-repo set for anything the router job itself
+ * needs (groundnuty/macf#1071's fix: derive the publish target set from
+ * "repos that carry the router" instead of a hand-maintained agent-repo
+ * list, which is exactly what let the control repo — a NEW router-carrying
+ * repo added by #1057/#1070 — go unpublished).
+ *
+ * Requires BOTH:
+ *   - `status === 'written'` — `repoInit()` actually wrote the workflow file
+ *     into `controlDir`'s working tree this run (a `'failed'` repo-init, or
+ *     the caller's `{ status: 'skipped' }` fallback for an aborted apply,
+ *     never wrote anything to check).
+ *   - `workflowAndConfigAllowlisted` — the write is actually going to be
+ *     COMMITTED to the repo (`controlRepoWorkflowAllowlisted`'s doc): a
+ *     `'written'` outcome whose files aren't allowlisted for commit exists
+ *     only in the ephemeral `controlDir` checkout, which dies with the
+ *     process — publishing a secret to a repo whose router workflow was
+ *     never actually pushed would orphan it on a repo the router job never
+ *     evaluates.
+ *
+ * Pure — no I/O, just reads the already-computed outcome.
+ */
+export function controlRepoCarriesRouter(outcome: ControlRepoInitOutcome | { readonly status: 'skipped' }): boolean {
+  return outcome.status === 'written' && outcome.workflowAndConfigAllowlisted;
+}
+
+/**
+ * The publish target set for anything the router job itself needs (today:
+ * ONLY the routing-client mTLS secrets — `apply-fleet.ts`'s call site) —
+ * every agent repo CONFIRMED to exist this run, plus the control repo IF
+ * (and only if) {@link controlRepoCarriesRouter}. Pure — no I/O, just
+ * combines two already-computed facts.
+ *
+ * groundnuty/macf#1071 — this IS the fix's decisive derivation: the OLD
+ * code passed the confirmed-agent-repo list alone to
+ * `publishRoutingClientSecrets` (`apply-routing-client.ts`), an implicit
+ * "agent repos only" assumption. That assumption is exactly what let the
+ * control repo — a NEW router-carrying repo added by #1057/#1070 — stay
+ * outside every per-repo publish loop no matter how many times `apply`
+ * re-ran: nothing was hand-maintaining an "also target the control repo"
+ * case, because nothing derived the target set FROM router-carrying-ness
+ * in the first place.
+ */
+export function deriveRouterCarryingRepos(
+  confirmedAgentRepos: readonly string[],
+  controlRepo: { readonly repo: string },
+  controlRepoInit: ControlRepoInitOutcome | { readonly status: 'skipped' },
+): readonly string[] {
+  return controlRepoCarriesRouter(controlRepoInit) ? [...confirmedAgentRepos, controlRepo.repo] : confirmedAgentRepos;
+}
+
+/**
  * Run `repoInit()` against the control repo's ALREADY-CLONED checkout
  * (`controlDir` — `control-repo.ts::provisionControlRepo`'s `localDir`),
  * requesting a label for EVERY declared fleet agent. Writes files into
