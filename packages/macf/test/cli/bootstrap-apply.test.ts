@@ -2808,6 +2808,50 @@ describe('resolveMutateDeps — waitForOperatorBeat wiring (groundnuty/macf#952 
   });
 });
 
+// --- resolveMutateDeps — allowInstallRetry / waitForOperatorFix wiring
+// (groundnuty/macf#1063) ---
+//
+// `resolveMutateDeps` is exported "ONLY so a test can assert the wiring by
+// identity" (this file's own doc, macf#857 review) — a security/UX primitive
+// can be defined, unit-tested in isolation, and never actually threaded
+// through the seam the CLI builds. Asserting `allowInstallRetry` only at the
+// `AgentApplyDeps` level (as `apply-agent.test.ts` does) would NOT catch a
+// wiring regression here — this describe block is that seam-level check,
+// mirroring the `waitForOperatorBeat` block immediately above by pattern
+// (both derive from the SAME `assumeYes`, both pinned by identity/value here
+// rather than by driving a real interactive prompt).
+
+describe('resolveMutateDeps — allowInstallRetry / waitForOperatorFix wiring (groundnuty/macf#1063)', () => {
+  it('--yes (assumeYes=true): allowInstallRetry is false — a recoverable consent-gate-2 rejection must NOT re-open the page unattended', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', undefined, undefined, undefined, undefined, true);
+    expect(deps.buildAgentDeps(() => {}).allowInstallRetry).toBe(false);
+  });
+
+  it('interactive (assumeYes omitted): allowInstallRetry is true', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml');
+    expect(deps.buildAgentDeps(() => {}).allowInstallRetry).toBe(true);
+  });
+
+  it('waitForOperatorFix is always wired as a function on buildAgentDeps(log), regardless of assumeYes — paired with allowInstallRetry, never omitted', () => {
+    const withYes = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', undefined, undefined, undefined, undefined, true);
+    const interactive = resolveMutateDeps('/tmp/nonexistent/fleet.yaml');
+    expect(typeof withYes.buildAgentDeps(() => {}).waitForOperatorFix).toBe('function');
+    expect(typeof interactive.buildAgentDeps(() => {}).waitForOperatorFix).toBe('function');
+  });
+
+  it('--yes (assumeYes=true): the wired waitForOperatorFix resolves WITHOUT writing to stderr — moot in practice (allowInstallRetry is false so it is never called), but asserted anyway so the SAME "never hangs unattended" contract waitForOperatorBeat gets is verified for this hook too', async () => {
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', undefined, undefined, undefined, undefined, true);
+      const fix = deps.buildAgentDeps(() => {}).waitForOperatorFix;
+      await expect(fix?.('code-agent', 'consent gate 2 of 2 — retry 1 of 2')).resolves.toBeUndefined();
+      expect(stderrSpy).not.toHaveBeenCalled();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+});
+
 // --- Pure result-rendering helpers ---
 
 function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult {

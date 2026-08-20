@@ -21,6 +21,7 @@ import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchang
 import type { ConfirmedInstall, IdentityConfirmation } from '../../../src/cli/bootstrap/identity-confirm.js';
 import type { InstallInterstitialHandles, ManifestFlowHandles } from '../../../src/cli/bootstrap/manifest-flow-server.js';
 import { appNameCollisionRefusalMessage, resolveAppPresenceStatus } from '../../../src/cli/bootstrap/app-presence.js';
+import { registryRepoNotInstalledReason, registryRepoRetryInstruction } from '../../../src/cli/bootstrap/registry-repo-coverage.js';
 
 const MANIFEST: FleetManifest = {
   apiVersion: 'macf/v0',
@@ -1024,5 +1025,248 @@ describe('realAgentApplyDeps wiring (groundnuty/macf#967)', () => {
     const beat = async (_role: string, _gateLabel: string): Promise<void> => {};
     const deps = realAgentApplyDeps(async () => {}, () => {}, beat);
     expect(deps.waitForOperatorBeat).toBe(beat);
+  });
+});
+
+// --- groundnuty/macf#1063 — a recoverable consent-gate-2 rejection re-opens the SAME page instead of failing outright ---
+
+describe('groundnuty/macf#1063 — recoverable consent-gate-2 rejection re-opens the same page', () => {
+  const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
+  const REUSE_INSTALL: ConfirmedInstall = { appId: '9001', installId: '5555', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' };
+  const MISSING_REPO_REASON = registryRepoNotInstalledReason('demo-fleet-code-agent', 'groundnuty', 'demo-fleet-control');
+
+  it('DECISIVE: a reuse rejected for a missing registry repo re-opens the gate and succeeds on the second attempt — the check seam is invoked AGAIN, not just once', async () => {
+    let validateReuseCalls = 0;
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const deps = baseDeps({
+      startInstallInterstitial,
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      waitForAppInstallation: async () => REUSE_INSTALL,
+      allowInstallRetry: true,
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        // Rejects on the FIRST check (the live incident's shape — install
+        // exists but is missing the registry repo); accepts on the SECOND,
+        // simulating the operator fixing it on the reopened page.
+        return validateReuseCalls === 1 ? MISSING_REPO_REASON : undefined;
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    // Per assert-the-wrong-path.md: "it eventually succeeded" alone cannot
+    // tell a genuine retry-then-fix apart from a fake that always accepted.
+    // The call-count assertion is what distinguishes them — a
+    // never-rejects fake would show validateReuseCalls === 1, not 2.
+    expect(validateReuseCalls).toBe(2);
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1); // exactly ONE reopen — not a re-poll disguised as a fresh gate
+    expect(outcome).toEqual({ role: 'code-agent', status: 'reused', appId: '9001', installId: '5555' });
+  });
+
+  it('CREATE path: a validateInstall rejection on the freshly-installed App also re-opens gate 2 and succeeds on retry', async () => {
+    let validateInstallCalls = 0;
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const deps = baseDeps({
+      startInstallInterstitial,
+      allowInstallRetry: true,
+      waitForAppInstallation: async () => ({ appId: CREDS.appId, installId: '5555', appSlug: CREDS.slug, accountLogin: 'groundnuty' }),
+      validateInstall: async () => {
+        validateInstallCalls += 1;
+        return validateInstallCalls === 1 ? MISSING_REPO_REASON : undefined;
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(validateInstallCalls).toBe(2);
+    // Gate 2's interstitial opens once for the NORMAL first attempt (every
+    // create goes through it regardless of #1063) + once more for the retry.
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(2);
+    expect(outcome).toEqual({ role: 'code-agent', status: 'created', appId: '9001', installId: '5555', credentials: CREDS });
+  });
+
+  it('bounds the retries: after the configured number of attempts it still fails, with the full explanation (assert the count)', async () => {
+    let validateReuseCalls = 0;
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const deps = baseDeps({
+      startInstallInterstitial,
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      waitForAppInstallation: async () => REUSE_INSTALL,
+      allowInstallRetry: true,
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        return MISSING_REPO_REASON; // NEVER fixed — the operator never gets it right
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    // 1 initial check + N reopen-and-recheck retries — a small, FIXED bound,
+    // not an unbounded loop. Pinned here as a literal so a future change to
+    // the bound is a deliberate, reviewed test edit, not a silent drift.
+    expect(validateReuseCalls).toBe(3);
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(2);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).toContain(MISSING_REPO_REASON);
+      expect(outcome.reason).toMatch(/gave up after 2 attempt/i);
+    }
+  });
+
+  it('--yes / unattended (allowInstallRetry omitted) never re-opens the gate — verifies once, refuses, exits, exactly as before #1063; the prompt/open seam is never reached', async () => {
+    let validateReuseCalls = 0;
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const openUrl = vi.fn(async () => {});
+    const waitForOperatorBeat = vi.fn(async () => {});
+    const deps = baseDeps({
+      startInstallInterstitial,
+      openUrl,
+      waitForOperatorBeat,
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      // allowInstallRetry deliberately OMITTED — this is bootstrap-apply.ts's
+      // real `--yes` wiring (`assumeYes !== true` -> false).
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        return MISSING_REPO_REASON;
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    expect(validateReuseCalls).toBe(1); // one check, no retry
+    expect(startInstallInterstitial).not.toHaveBeenCalled();
+    expect(openUrl).not.toHaveBeenCalled();
+    expect(waitForOperatorBeat).not.toHaveBeenCalled(); // the prompt seam is UNREACHED, not merely a no-op
+    expect(outcome).toEqual({
+      role: 'code-agent',
+      status: 'failed',
+      reason: `existing install re-verification rejected: ${MISSING_REPO_REASON}`,
+    });
+  });
+
+  it('DECISIVE: the operator gets a genuine post-open wait before each re-check — waitForOperatorFix runs BEFORE the poll/re-validate, not merely wired', async () => {
+    const callOrder: string[] = [];
+    let validateReuseCalls = 0;
+    const deps = baseDeps({
+      startInstallInterstitial: async () => fakeInterstitialHandles(),
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      waitForAppInstallation: async () => {
+        callOrder.push('poll');
+        return REUSE_INSTALL;
+      },
+      allowInstallRetry: true,
+      waitForOperatorFix: async () => {
+        callOrder.push('wait-for-fix');
+      },
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        callOrder.push(`validate-${String(validateReuseCalls)}`);
+        return validateReuseCalls === 1 ? MISSING_REPO_REASON : undefined;
+      },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    // validate-1 is the instant reuse check (no page open, pre-#1063
+    // behavior). Then: reopen -> wait-for-fix (the operator's genuine
+    // window) -> poll -> validate-2. Without the wait step, poll/validate-2
+    // would immediately follow validate-1 with nothing giving the operator
+    // a chance to act — this ordering assertion is what catches that.
+    expect(callOrder).toEqual(['validate-1', 'wait-for-fix', 'poll', 'validate-2']);
+  });
+
+  it('the retry dialogue shows the CLEAN retryInstruction, never the technical message (its GET/HTTP/issue-number detail), when the rejecting hook supplies one', async () => {
+    const logs: string[] = [];
+    let validateReuseCalls = 0;
+    const cleanInstruction = registryRepoRetryInstruction('demo-fleet-code-agent', 'groundnuty', 'demo-fleet-control');
+    const deps = baseDeps({
+      startInstallInterstitial: async () => fakeInterstitialHandles(),
+      log: (l) => logs.push(l),
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      waitForAppInstallation: async () => REUSE_INSTALL,
+      allowInstallRetry: true,
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        if (validateReuseCalls === 1) return { message: MISSING_REPO_REASON, retryInstruction: cleanInstruction };
+        return undefined;
+      },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    // The clean sentence IS shown, as its own printed line (the retry
+    // dialogue's instructionLines are logged one-per-line).
+    expect(logs).toContain(`Role "code-agent": ${cleanInstruction}`);
+    // The technical `message` (its GET/HTTP-status/issue-number detail)
+    // reaches the ONE pre-existing diagnostic line ("REFUSED on reuse — …",
+    // unchanged from before #1063) — but the interactive dialogue's OWN
+    // lines (everything logged as part of reopening the gate: from the
+    // "reopened after a rejection" gate label onward) must never repeat it.
+    const reopenIndex = logs.findIndex((l) => l.includes('reopened after a rejection'));
+    expect(reopenIndex).toBeGreaterThanOrEqual(0);
+    const dialogueLines = logs.slice(reopenIndex);
+    expect(dialogueLines.some((l) => l.includes('GET /repos'))).toBe(false);
+    expect(dialogueLines.some((l) => l.includes('#999') || l.includes('#1012'))).toBe(false);
+  });
+
+  it('a NON-recoverable failure (waitForAppInstallation itself throwing — not a validateInstall rejection) is never retried, even with allowInstallRetry set', async () => {
+    let waitCalls = 0;
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const deps = baseDeps({
+      startInstallInterstitial,
+      allowInstallRetry: true,
+      waitForAppInstallation: async () => {
+        waitCalls += 1;
+        throw new Error('timed out waiting for the install');
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(waitCalls).toBe(1); // no retry — this class of failure is untouched by #1063
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1); // the ONE normal gate-2 attempt only
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/consent gate 2 \(install\) failed/);
+  });
+
+  it('the retry announcement names the specific repo — the underlying rejection is printed verbatim, never summarized away', async () => {
+    const logs: string[] = [];
+    let validateReuseCalls = 0;
+    const deps = baseDeps({
+      startInstallInterstitial: async () => fakeInterstitialHandles(),
+      log: (l) => logs.push(l),
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      waitForAppInstallation: async () => REUSE_INSTALL,
+      allowInstallRetry: true,
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        return validateReuseCalls === 1 ? MISSING_REPO_REASON : undefined;
+      },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    const joined = logs.join('\n');
+    expect(joined).toContain('groundnuty/demo-fleet-control'); // the repo named by the (real) registry-repo-coverage message
+    expect(joined).toContain('demo-fleet-code-agent'); // the App handle, same message
+  });
+
+  it('no internal issue/PR references leak into any of the NEW #1063 text (the retry instruction + the "gave up" explanation) — comments may cite them freely, output may not', async () => {
+    // A rejection reason with NO issue references of its own (unlike the
+    // real `registryRepoNotInstalledReason`, which — pre-existing, #1012's
+    // own shipped text — cites `groundnuty/macf#999`/`#1012` by design; that
+    // choice belongs to #1012, not this issue, so re-litigating it here
+    // would test the wrong code). Isolating the reason this way means every
+    // reference this assertion could catch is one #1063 itself introduced.
+    const NO_REF_REASON = 'App is installed, but its install does not cover the required repository.';
+    const logs: string[] = [];
+    let validateReuseCalls = 0;
+    const deps = baseDeps({
+      startInstallInterstitial: async () => fakeInterstitialHandles(),
+      log: (l) => logs.push(l),
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      waitForAppInstallation: async () => REUSE_INSTALL,
+      allowInstallRetry: true,
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        return NO_REF_REASON; // never fixed -> exhausts retries -> the "gave up" message also gets checked
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    expect(validateReuseCalls).toBe(3); // sanity: the retry path (and its "gave up" text) actually ran
+    const issueRefPattern = /#\d+|DR-\d+/i;
+    expect(logs.join('\n')).not.toMatch(issueRefPattern);
+    if (outcome.status === 'failed') expect(outcome.reason).not.toMatch(issueRefPattern);
   });
 });
