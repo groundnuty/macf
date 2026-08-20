@@ -560,6 +560,66 @@ async function realOpenUrl(url: string): Promise<void> {
   }
 }
 
+/**
+ * Real `AgentApplyDeps.waitForOperatorBeat` (groundnuty/macf#952 follow-up)
+ * — the operator, live: *"the first instructions were so fast that I didn't
+ * notice them at all … if I cannot see them, I'm not sure why they are
+ * there."* `announceAndOpenGate` already logs every instruction line before
+ * this runs (#962/#974); what was missing is a GAP between printing and the
+ * browser taking focus.
+ *
+ * **Judgment call (groundnuty/macf#952 requirement 1): a blocking "press
+ * Enter" prompt, not a fixed-duration sleep.** A sleep can still be missed if
+ * the operator glances away at the exact moment it elapses — which is
+ * functionally the SAME failure this issue reports, just with a shorter
+ * fuse. A prompt that only proceeds on an explicit keypress cannot silently
+ * elapse unread; the browser cannot take focus until the operator has acted.
+ * Reuses the exact `readline` + stderr pattern `realConfirmPlan` above
+ * already uses, so there is one interactive-prompt idiom in this file, not
+ * two.
+ *
+ * **Hard constraint: `--yes` must never hang (groundnuty/macf#952
+ * requirement 4).** `assumeYes` is resolved ONCE, at `resolveMutateDeps` call
+ * time, into which of these two closures gets wired — never a runtime branch
+ * inside a single closure — so an unattended run's code path never so much
+ * as constructs a `readline.Interface` (no stdin listener exists to leak or
+ * hang on). The instruction text itself is unconditional either way — this
+ * hook only ever gates the PAUSE, never the printing (`announceAndOpenGate`'s
+ * `deps.log` calls run regardless).
+ *
+ * **A second, independent reason a non-`--yes` run is never a SURPRISE hang:**
+ * `runBootstrapApply` already gates entry to `applyFleet` (and therefore every
+ * gate) on `realConfirmPlan`'s own blocking prompt — `opts.yes === true ? true
+ * : await mutate.confirmPlan(...)`. Any invocation that reaches a consent gate
+ * without `--yes` has, by construction, already sat through one interactive
+ * prompt on the SAME stdin; this hook adds no NEW class of "a script that
+ * never expected to block did." A future auto-approve path that bypasses
+ * `confirmPlan` while still reaching this closure would reintroduce that gap
+ * — anyone adding one must thread `assumeYes` through it too.
+ *
+ * The `rl.on('close', ...)` below is defence-in-depth on top of both of the
+ * above, not a substitute: if stdin is CLOSED (piped-from-`/dev/null`,
+ * redirected-EOF) rather than merely non-interactive, `question`'s callback
+ * never fires — `close` does, and this run's beat resolves instead of
+ * hanging on a stream that will never produce another byte.
+ */
+function realWaitForOperatorBeat(assumeYes: boolean): (role: string, gateLabel: string) => Promise<void> {
+  if (assumeYes) {
+    return () => Promise.resolve();
+  }
+  return (role: string, gateLabel: string) =>
+    new Promise((resolve) => {
+      process.stderr.write(`Role "${role}": press Enter to open the browser for ${gateLabel}… `);
+      const rl = createInterface({ input: process.stdin, output: process.stderr });
+      const done = (): void => {
+        rl.close();
+        resolve();
+      };
+      rl.once('close', done);
+      rl.question('', done);
+    });
+}
+
 /** Real y/N prompt on stderr (stdout stays clean for a `--json` render). */
 async function realConfirmPlan(plan: FleetPlan, creations: readonly PlannedAppCreation[]): Promise<boolean> {
   const summary = summarizePlan(plan.items);
@@ -692,6 +752,13 @@ export function resolveMutateDeps(
   // `runBootstrapApply`, which guarantees these two are never partially set
   // by the time either reaches here).
   vaultPath?: string,
+  // groundnuty/macf#952 follow-up — `opts.yes`, appended as the LAST
+  // parameter for the SAME reason `vaultPath` was (macf#978's comment
+  // above): every pre-existing positional call site keeps compiling and
+  // behaving byte-identically. `undefined`/omitted defaults to `false`
+  // (interactive) below — matching `RunBootstrapApplyOptions.yes?: boolean`'s
+  // own "undefined means the interactive default" contract one layer up.
+  assumeYes?: boolean,
 ): MutateApplyDeps {
   const repoInitDeps: RepoInitStepDeps = { cloneRepo: realCloneRepo, commitAndPush: realCommitAndPush };
 
@@ -794,12 +861,20 @@ export function resolveMutateDeps(
         }
       : undefined;
 
+  // groundnuty/macf#952 follow-up — resolved ONCE per run, outside the
+  // `buildAgentDeps` closure (which runs once per agent): every agent in the
+  // fleet shares the SAME interactive-vs-headless posture, derived from the
+  // SAME `assumeYes` this function received. See `realWaitForOperatorBeat`'s
+  // own doc for why the branch lives here (closure SELECTION) rather than
+  // inside a single closure (runtime branch).
+  const waitForOperatorBeat = realWaitForOperatorBeat(assumeYes === true);
+
   return {
     // `writeRecoveryArtifact` is deliberately absent here — `apply-fleet.ts`
     // splices it in (it owns the fleet-level context that seam needs; see
     // its module doc's "Recovery-artifact lifecycle" section).
     buildAgentDeps: (log: (line: string) => void) => ({
-      ...realAgentApplyDeps(realOpenUrl, log),
+      ...realAgentApplyDeps(realOpenUrl, log, waitForOperatorBeat),
       ...(resolveKeyPath !== undefined ? { resolveKeyPath } : {}),
     }),
     repoInitDeps,
@@ -1636,7 +1711,8 @@ export async function runBootstrapApply(
     // pure plain-object builder — no `process.env` read hidden inside it for
     // this field (unlike the pre-existing `allowVaultVersion` line above it,
     // which this does NOT imitate).
-    const mutate = mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath, opts.vaultPath);
+    const mutate =
+      mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath, opts.vaultPath, opts.yes);
     try {
       const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, displayCreations);
       if (!approved) {

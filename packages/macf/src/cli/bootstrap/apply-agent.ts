@@ -258,6 +258,27 @@ export interface AgentApplyDeps {
   /** Open a URL in the operator's own browser — injectable so tests never launch one. */
   readonly openUrl: (url: string) => Promise<void>;
   readonly log: (line: string) => void;
+  /**
+   * Give the operator a beat to read {@link announceAndOpenGate}'s just-
+   * printed instructions BEFORE the browser opens (groundnuty/macf#952
+   * follow-up). The ordering fix alone (instructionLines logged before
+   * `openUrl`, #962/#974) closed "the requirement only appears in the
+   * failure message" — but print-then-open-immediately left a live-witnessed
+   * SEPARATE gap: *"the first instructions were so fast that I didn't notice
+   * them at all."* Called ONCE per gate, with the role + gate label already
+   * logged, immediately BEFORE `deps.openUrl` runs — see that call site.
+   *
+   * MUST resolve on its own under a headless run — this hook is the only
+   * thing standing between "an unattended `--yes` run" and "a scripted run
+   * that hangs forever on stdin" (coordination.md's "never hang an
+   * unattended run"), so the production wiring
+   * (`bootstrap-apply.ts::realWaitForOperatorBeat`) is unconditional-resolve
+   * under `--yes` and a real blocking "press Enter" prompt only when
+   * interactive. Optional; omitted (every pre-this-fix test, and any caller
+   * that doesn't supply it) is a no-op — preserves the immediate-open
+   * behavior exactly.
+   */
+  readonly waitForOperatorBeat?: (role: string, gateLabel: string) => Promise<void>;
   /** Overall budget for EACH gate. Defaults to the gate primitives' own defaults (10 min). */
   readonly gateTimeoutMs?: number;
   readonly pollIntervalMs?: number;
@@ -380,10 +401,19 @@ export interface AgentApplyDeps {
  * have, so `apply-fleet.ts` supplies it (see that module's doc). The return
  * type reflects the omission explicitly rather than stubbing a fake writer
  * here that would just be thrown away.
+ *
+ * `waitForOperatorBeat` (groundnuty/macf#952 follow-up) is a THIRD, optional,
+ * trailing parameter — appended last so every pre-this-fix positional call
+ * site keeps compiling unchanged, same convention `resolveMutateDeps`'s own
+ * trailing optional params already establish. Omitted entirely (not merely
+ * `undefined`) when the caller doesn't pass one, so `AgentApplyDeps`'s own
+ * "omitted is a no-op" default applies — never silently overridden to a
+ * no-op function this call site would own.
  */
 export function realAgentApplyDeps(
   openUrl: (url: string) => Promise<void>,
   log: (line: string) => void,
+  waitForOperatorBeat?: (role: string, gateLabel: string) => Promise<void>,
 ): Omit<AgentApplyDeps, 'writeRecoveryArtifact'> {
   return {
     startManifestFlow: realStartManifestFlow,
@@ -394,6 +424,7 @@ export function realAgentApplyDeps(
     checkAppNameCollision: resolveAppPresenceStatus,
     openUrl,
     log,
+    ...(waitForOperatorBeat !== undefined ? { waitForOperatorBeat } : {}),
   };
 }
 
@@ -474,9 +505,16 @@ export function cleanupScratchPem(pemPath: string): void {
  * since `deps.log` is unconditional here — means a run with no page to read
  * still gets the same instruction, in the same terminal transcript, before
  * (never after) the point where following it would matter.
+ *
+ * `deps.waitForOperatorBeat` (groundnuty/macf#952 follow-up) runs AFTER every
+ * line above is logged and BEFORE `deps.openUrl` — the same "before, never
+ * after" ordering `instructionLines` already established, extended from "the
+ * text exists in the transcript" to "the operator had a beat to read it
+ * before the browser took focus." See that field's own doc on `AgentApplyDeps`
+ * for why the production wiring never blocks a headless run.
  */
 async function announceAndOpenGate(
-  deps: Pick<AgentApplyDeps, 'log' | 'openUrl'>,
+  deps: Pick<AgentApplyDeps, 'log' | 'openUrl' | 'waitForOperatorBeat'>,
   role: string,
   gateLabel: string,
   url: string,
@@ -491,6 +529,7 @@ async function announceAndOpenGate(
     `Role "${role}": ${gateLabel} — opening this URL in your browser now (if it didn't open, open it yourself): ` +
       `${url}${caveatSuffix}`,
   );
+  await deps.waitForOperatorBeat?.(role, gateLabel);
   if (opts.fatal) {
     await deps.openUrl(url);
   } else {
