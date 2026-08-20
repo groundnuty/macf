@@ -650,7 +650,7 @@ Two corrections to the ladder table:
 
 ---
 
-## Amendment L (2026-08-20, #1045 — operator objection) — `versions:` is authoritative; `apply` reconciles it by calling the roll
+## Amendment L (2026-08-20, #1045 — operator objection; extended 2026-08-20 by `#1072`, see L5) — `versions:` is authoritative; `apply` reconciles it by calling the roll
 
 **Trigger — operator:**
 
@@ -696,4 +696,26 @@ MACF deliberately has no reconciler and never will (operator, `#1017`). That bou
 
 Recorded explicitly because *"we have no controller"* will otherwise be cited later as a reason MACF cannot be declarative. It can be. It reconciles when asked.
 
+### L5 (2026-08-20, `#1072`) — extended to `versions.actions`: the SAME ruling, the OTHER field
+
+L1–L4 above ruled on `versions.macf`. `versions.actions` (the macf-actions router pin committed to each caller repo's `agent-router.yml`) is the identical shape — **declared desired state, observed drift, no reconciliation** — and was left in that state deliberately: `#1049`'s implementer flagged leaving `actions_pin` alone as an explicit, scoped-out judgment call at the time. Observed live on a real fleet: the manifest was edited from `v3.4.1` to `v3.4.2`, `apply` was re-run, and it reported drift on every repo by name — then declined to act, identically to the `versions.macf` defect L1 named. **This section is the follow-through**, not a new ruling: every clause of L2 applies to `versions.actions` verbatim, with one field-specific note (L5.2 below) on what "the roll" means for a repo-committed file rather than a deployed CLI.
+
+**L5.1 — `apply` reconciles `versions.actions`.** `apply-fleet.ts`'s two `applyRepoInitForAgent`/`applyControlRepoInit` call sites (per agent repo, and the control repo — a router-carrying repo since `#1070`) now route through `resolveActionsPinReconcile(declared, observed)` (`apply-repo-init.ts`): when the manifest's declared pin diverges from (or cannot be confirmed against) the repo's committed pin, the call is made with `force: true`, force-rewriting `agent-router.yml`.
+
+**L5.2 — by delegation, to the SAME primitive `#1049` used for the OTHER field, not a new one.** `commands/repo-init.ts::repoInit` already generates a `agent-router.yml` from an `actionsVersion` argument — it is what wrote a freshly-created repo's workflow file all along. `resolveActionsPinReconcile` decides the two arguments (`actionsVersion`, `force`) that call already accepted; no second writer exists. This is L2's delegation rule (L2.2) applied to the field-appropriate primitive: `versions.macf` delegates to `macf fleet upgrade`'s roll (a VM-side restart); `versions.actions` delegates to `repoInit`'s file generation (a git commit) — different mechanism, same rule: apply calls the thing that already does this, never reimplements it.
+
+**L5.3 — absent means no opinion, not latest — extended, and a pre-existing gap it closes.** Verified BEFORE this change: the per-agent identity-sync call already ran unconditionally on every `apply`, and its target defaulted to `manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION` — a **floating** `'v3'` ref. `commands/repo-init.ts` resolves a floating ref to an immutable full tag via a live GitHub `/tags` read (`resolveActionsRefToFullTag`) — so an `apply` run against a manifest with **no `versions:` declared at all** was ALREADY querying GitHub for "the latest v3.x.y" on every ordinary sync, before ever checking whether anything needed writing. This is precisely the `:latest` anti-pattern L1 named, on the other field, already live. `resolveActionsPinReconcile`'s L2.4 branch closes it: absent `versions.actions` now returns the repo's OWN already-committed pin (already immutable in every repo-init-generated repo) in place of the floating default, and `force` stays `false` — no fetch is reachable from that branch. The floating default is retained ONLY for the genuine bootstrap case (a brand-new repo/control-repo with no committed pin to prefer at all).
+
+**L5.4 — report honestly: reconciled / already-current / could-not-attempt (`#1055`'s treatment).** `FleetApplyResult.actionsPin` carries one entry per router-carrying repo with a status from this three-way, mutually-exclusive, textually-distinct set — never a single "completed" line collapsing "attempted and changed something" into "nothing needed doing." `already-current` covers BOTH "the declared pin already matched" and "an attempted force-write turned out byte-identical" (the DECISION to attempt and the OUTCOME of attempting are scored separately, same as `#1053`'s correction to the `versions.macf` phase's own reporting). `could-not-attempt` covers a genuine repo-init failure AND the case where the repo's identity was never resolved this run (no App/install confirmed, so its pin was never even examined) — never silently absent, never folded into either of the other two.
+
+**L5.5 — the target set is every router-carrying repo, not a hardcoded agent list.** `fleet-manifest.ts::routerCarryingRepos` is the single derivation both `plan.ts` (which repos get an `actions_pin` plan item) and `apply-fleet.ts` (which repos get a reconcile attempt) enumerate — every declared agent's repo, plus the control repo (a router-carrying repo since `#1070`, `apply-control-repo-init.ts`). A repo added to a third kind in the future is a one-line change in that one function, not a two-place drift risk between plan and apply.
+
+**Asserted by:** `packages/macf/test/cli/bootstrap/apply-repo-init.test.ts` → `"DECISIVE — manifest declares v3.4.2 against a repo pinned v3.4.1: the force-rewrite lands @v3.4.2 in agent-router.yml, and fetch is NEVER called"` (L5.1/L5.2/L5.3, end-to-end through the REAL `repoInit`, with `global.fetch` a throwing spy — the manifest-authoritative target lands, and the network is structurally unreachable, mirroring L3's own decisive-test shape for the sibling field).
+
+**Asserted by:** `packages/macf/test/cli/bootstrap/apply-fleet.test.ts` → `"DECISIVE — a stale agent pin RECONCILES, an already-matching control-repo pin reports already-current, and the two statuses are TEXTUALLY DISTINCT (never inferable from one summary line)"` (L5.4/L5.5, end-to-end through `applyFleet` — a drifted agent repo AND the control repo in the SAME run, both reported, distinctly).
+
+**Asserted by:** `packages/macf/test/cli/bootstrap/apply-fleet.test.ts` → `"absent versions.actions (versions: not declared at all): NO action is recorded — attempted:false, results empty — the same no-opinion gate the version(macf) phase already uses"` (L5.3's own case, at the whole-run level).
+
 **References:** `#1045` · `#1000` (one path per outcome) · `#1023`/`#1024` (the delegation shape and its assertion) · `#1017` (no controller, by choice) · Amendment A (honest-unknown) · `assert-the-wrong-path.md`.
+
+**References (L5):** `#1072` · `#1049` (the `versions.macf` precedent this section follows through on) · `#1055` (the honest-report vocabulary) · `#1070`/`#1071` (the control repo as a router-carrying repo) · `#1000` (one writer, one target-set derivation).

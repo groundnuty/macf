@@ -1189,7 +1189,14 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   // DR-043 Amendment G — same derived name `control-repo.ts::controlRepoFullName`
   // computes; see this function's doc for why it's re-derived here rather
   // than imported.
-  const controlRepoMeta = await checkRepoArchivedState(`${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`);
+  const controlRepoFullNameHere = `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`;
+  const controlRepoMeta = await checkRepoArchivedState(controlRepoFullNameHere);
+  // groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+  // — the control repo is a router-carrying repo too (since `#1070`), so it
+  // gets the SAME live pin read every agent repo already gets
+  // ({@link readCallerActionsPin}), targeted at the SAME derived full name
+  // `controlRepoMeta` above already computed.
+  const controlRepoActionsPin = await readCallerActionsPin(controlRepoFullNameHere);
 
   return {
     lock,
@@ -1203,6 +1210,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     routingRunnerDetail,
     controlRepoPresence: controlRepoMeta.presence,
     controlRepoArchived: controlRepoMeta.archived,
+    controlRepoActionsPin,
   };
 }
 

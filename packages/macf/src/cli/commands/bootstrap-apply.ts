@@ -51,7 +51,7 @@ import type { AgentApplyOutcome, CreateGuardDecision, CreateGuardDeps } from '..
 import { realCloneRepo, realCommitAndPush } from '../bootstrap/apply-repo-init.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
 import { applyFleet } from '../bootstrap/apply-fleet.js';
-import type { ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
+import type { ActionsPinRepoStatus, ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
 import { checkControlRepoMeta, realControlRepoCommitAndPush, realReadControlManifestFile } from '../bootstrap/control-repo.js';
 import { realUnarchiveRepo } from '../bootstrap/repo-archive.js';
@@ -817,6 +817,25 @@ const REAL_ROUTING_CLIENT_DEPS: RoutingClientApplyDeps = {
 };
 
 /**
+ * groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+ * — projects the ALREADY-COMPUTED `observed` (`computePlan`'s own input,
+ * read once via `githubRegistryObserver` before `applyFleet` is ever
+ * called) into the shape `FleetApplyDeps.observedActionsPins` expects.
+ * Pure; never re-reads anything — the #1000 golden path applied to this
+ * field's threading.
+ */
+function actionsPinsFromObserved(
+  manifest: FleetManifest,
+  observed: ObservedState,
+): { readonly agents: Readonly<Record<string, string | undefined>>; readonly controlRepo: string | undefined } {
+  const agents: Record<string, string | undefined> = {};
+  for (const agent of manifest.agents) {
+    agents[agent.role] = observed.agents[agent.role]?.actionsPin;
+  }
+  return { agents, controlRepo: observed.controlRepoActionsPin };
+}
+
+/**
  * Build the REAL (production) mutating deps. Exported ONLY so a test can assert
  * the wiring by identity (macf#857 review): a security primitive can be
  * defined, unit-tested, and never actually called — which is exactly what
@@ -1405,6 +1424,38 @@ function routingClientSummaryLines(result: FleetApplyResult): string[] {
 }
 
 /**
+ * groundnuty/macf#1072 — the actions-pin reconcile report, one line per
+ * router-carrying repo. `[]` (no section rendered at all) when
+ * `result.actionsPin.attempted` is `false` — `versions:` was never
+ * declared this run, same "nothing was promised, say nothing" convention
+ * `routingSummaryLines` already uses when `routing.runner` isn't declared.
+ *
+ * Plain-language explanation, never a DR/issue citation — this is
+ * user-facing stdout (per this repo's convention: explain, don't cite).
+ */
+function actionsPinSummaryLines(result: FleetApplyResult): string[] {
+  if (result.actionsPin?.attempted !== true) return [];
+  const target = result.actionsPin.target ?? '?';
+  const lines = [`Router pin (macf-actions@${target}):`];
+  for (const r of result.actionsPin.results) {
+    const suffix = r.status === 'could-not-attempt' && r.reason !== undefined ? ` — ${r.reason}` : '';
+    lines.push(`  ${r.repo}: ${actionsPinStatusLabel(r.status)}${suffix}`);
+  }
+  return lines;
+}
+
+function actionsPinStatusLabel(status: ActionsPinRepoStatus): string {
+  switch (status) {
+    case 'reconciled':
+      return 'RECONCILED (router workflow rewritten this run)';
+    case 'already-current':
+      return 'already current (no change needed)';
+    case 'could-not-attempt':
+      return 'COULD NOT ATTEMPT';
+  }
+}
+
+/**
  * Human render of a completed (non-dry-run) apply result. Never a credential
  * value.
  *
@@ -1465,6 +1516,8 @@ export function formatApplyResult(
   const routingLines = routingSummaryLines(result);
   if (routingLines.length > 0) parts.push('', ...routingLines);
   parts.push('', ...routingClientSummaryLines(result));
+  const actionsPinLines = actionsPinSummaryLines(result);
+  if (actionsPinLines.length > 0) parts.push('', ...actionsPinLines);
   if (result.identityChanges.length > 0) {
     parts.push('', `⚠ identity DRIFT detected (${String(result.identityChanges.length)}) — confirm before trusting fleet.lock:`);
     for (const c of result.identityChanges) {
@@ -1701,6 +1754,19 @@ export function fleetApplyResultToJson(
           },
         }
       : {}),
+    // groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+    // — same omit-when-N/A convention as `version_phase` above: absent
+    // entirely when `versions:` was never declared this run (or the control
+    // repo aborted before this ever ran), so every pre-#1072 `--json` call
+    // site stays byte-identical.
+    ...(result.actionsPin?.attempted === true
+      ? {
+          actions_pin: {
+            target: result.actionsPin.target,
+            results: result.actionsPin.results.map((r) => ({ repo: r.repo, status: r.status, ...(r.reason !== undefined ? { reason: r.reason } : {}) })),
+          },
+        }
+      : {}),
   };
 }
 
@@ -1793,6 +1859,11 @@ export function applyExitCode(
     result.routingClient.mint.status === 'failed' ||
     Object.values(result.routingClient.certLegs).some((leg) => leg.status === 'failed') ||
     Object.values(result.routingClient.keyLegs).some((leg) => leg.status === 'failed');
+  // groundnuty/macf#1072 — a 'could-not-attempt' router-pin reconcile needs
+  // operator attention, same bar as an agent identity failure (`agentBad`
+  // above already covers "identity unresolved" independently; this covers
+  // the repo-init-itself-failed sub-case of 'could-not-attempt').
+  const actionsPinBad = result.actionsPin?.results.some((r) => r.status === 'could-not-attempt') ?? false;
   return controlRepoBad ||
     controlRepoSyncBad ||
     controlRepoInitBad ||
@@ -1803,7 +1874,8 @@ export function applyExitCode(
     routingBad ||
     routingClientBad ||
     anyDeployFailed(deployResults) ||
-    versionPhase?.halted === true
+    versionPhase?.halted === true ||
+    actionsPinBad
     ? 1
     : 0;
 }
@@ -2044,8 +2116,20 @@ export async function runBootstrapApply(
     // pure plain-object builder — no `process.env` read hidden inside it for
     // this field (unlike the pre-existing `allowVaultVersion` line above it,
     // which this does NOT imitate).
-    const mutate =
-      mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath, opts.vaultPath, opts.yes);
+    // groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
+    // — merged on TOP of whatever `mutateDeps ?? resolveMutateDeps(...)`
+    // produced, never threaded through `resolveMutateDeps`'s own (long,
+    // carefully-ordered, positional) parameter list: `observed` is in scope
+    // HERE (computed once, above, before `applyFleet` is ever called — the
+    // #1000 golden path), and every EXISTING test/caller that supplies its
+    // own `mutateDeps` keeps its own `observedActionsPins` (or the SAFE
+    // `undefined` default — see `FleetApplyDeps.observedActionsPins`'s doc)
+    // untouched, same "tests MUST override or it safely no-ops" posture
+    // `deployDeps`/`versionDeps` already establish elsewhere in this file.
+    const mutate: MutateApplyDeps = {
+      ...(mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath, opts.vaultPath, opts.yes)),
+      observedActionsPins: mutateDeps?.observedActionsPins ?? actionsPinsFromObserved(manifest, observed),
+    };
     try {
       const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, displayCreations);
       if (!approved) {

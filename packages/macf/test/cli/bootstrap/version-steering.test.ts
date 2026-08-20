@@ -75,6 +75,10 @@ function observedBothAt(version: string | undefined): ObservedState {
     agents: { [AGENT_A]: provisionedAt(version), [AGENT_B]: provisionedAt(version) },
     caRegistry: 'present',
     caRepos: { [REPO_A]: 'present', [REPO_B]: 'present' },
+    // groundnuty/macf#1072 — the control repo is a router-carrying repo too
+    // (since #1070); matches ACTIONS_PIN so the noop-clean fixtures above
+    // stay noop-clean once its `actions_pin` item joins the plan.
+    controlRepoActionsPin: ACTIONS_PIN,
   };
 }
 
@@ -223,13 +227,16 @@ describe('DR-043 §D6 — versions.actions steering (the caller-repos\' router p
     const manifest = baseManifest({ versions: { macf: VERSION_X, actions: ACTIONS_PIN } });
     const plan = computePlan(manifest, observedBothAt(VERSION_X));
     const pinItems = plan.items.filter((i) => i.kind === 'actions_pin');
-    expect(pinItems).toHaveLength(2);
+    // groundnuty/macf#1072 — 2 agent repos + the control repo (a
+    // router-carrying repo since #1070).
+    expect(pinItems).toHaveLength(3);
     for (const item of pinItems) {
       expect(item.verb).toBe('noop');
+      expect(planItemApplyCoverage(item)).toBe('implemented');
     }
   });
 
-  it('diverges on ONE repo (per-repo drift, macf#806-class) → update for that repo only, naming the repo-init remedy — NOT the fleet-upgrade one', () => {
+  it('diverges on ONE repo (per-repo drift, macf#806-class) → update for that repo only, naming the reconcile behavior AND the manual escape hatch', () => {
     const manifest = baseManifest({ versions: { macf: VERSION_X, actions: 'v3.5.0' } });
     const observed: ObservedState = {
       lock: null,
@@ -239,6 +246,7 @@ describe('DR-043 §D6 — versions.actions steering (the caller-repos\' router p
       },
       caRegistry: 'present',
       caRepos: { [REPO_A]: 'present', [REPO_B]: 'present' },
+      controlRepoActionsPin: 'v3.5.0', // already current — not under test here
     };
 
     const plan = computePlan(manifest, observed);
@@ -247,13 +255,20 @@ describe('DR-043 §D6 — versions.actions steering (the caller-repos\' router p
 
     expect(staleItem?.verb).toBe('update');
     expect(staleItem?.confirm_required).toBe(true);
-    expect(staleItem?.reason).toMatch(/macf repo-init --actions-version v3\.5\.0 --force/);
+    // groundnuty/macf#1072 — apply now reconciles this itself; the reason
+    // names that AND keeps the manual `repo-init --force` command as a
+    // documented escape hatch, never the `fleet upgrade` remedy (that's
+    // `version`(macf)'s, a different field).
+    expect(staleItem?.reason).toMatch(/apply reconciles this/);
+    expect(staleItem?.reason).toMatch(/macf repo-init --repo .+ --actions-version v3\.5\.0 --force/);
     expect(staleItem?.reason).not.toMatch(/macf fleet upgrade/); // wrong remedy for this kind
 
     expect(currentItem?.verb).toBe('noop');
 
-    // apply cannot rewrite agent-router.yml either — same whole-kind gap as `version`.
-    expect(planItemApplyCoverage(staleItem!)).toBe('not_implemented');
+    // groundnuty/macf#1072 — apply DOES reconcile this now (force-rewrites
+    // agent-router.yml by delegating to repoInit), same "'version' joined
+    // the always-implemented group" shape macf#1045 already established.
+    expect(planItemApplyCoverage(staleItem!)).toBe('implemented');
   });
 
   it('unreadable pin (repo unreachable / no macf-actions uses: line) → unknown (create), never drift', () => {
@@ -292,16 +307,20 @@ describe('DR-043 §D6 — versions: section gating (no silent auto-inclusion)', 
     expect(plan.skippedSections).toEqual([]);
   });
 
-  it('declaring versions: emits exactly 2 items per agent (one version, one actions_pin), in manifest agent order', () => {
+  it('declaring versions: emits exactly 2 items per agent (one version, one actions_pin) PLUS one actions_pin item for the control repo, in manifest agent order with the control repo LAST', () => {
     const manifest = baseManifest({ versions: { macf: VERSION_X, actions: ACTIONS_PIN } });
     const plan = computePlan(manifest, observedBothAt(VERSION_X));
     const versionAndPinItems = plan.items.filter((i) => i.kind === 'version' || i.kind === 'actions_pin');
-    expect(versionAndPinItems).toHaveLength(4);
+    // groundnuty/macf#1072 — 4 per-agent items + 1 control-repo actions_pin
+    // item (the control repo is a router-carrying repo since #1070; it has
+    // no `version`(macf) item — see `computePlan`'s doc).
+    expect(versionAndPinItems).toHaveLength(5);
     expect(versionAndPinItems.map((i) => i.target)).toEqual([
       `agent:${AGENT_A}:version:macf`,
       `repo:${REPO_A}:version:actions`,
       `agent:${AGENT_B}:version:macf`,
       `repo:${REPO_B}:version:actions`,
+      'repo:groundnuty/icsoc-2026-control:version:actions',
     ]);
   });
 });

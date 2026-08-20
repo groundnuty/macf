@@ -14,6 +14,7 @@ import {
   applyRepoInitForAgent,
   ensureAgentRepo,
   repoInitRegistryOptions,
+  resolveActionsPinReconcile,
   RepoInitStepError,
   type AgentRepoDeps,
   type RepoInitStepDeps,
@@ -302,6 +303,98 @@ describe('applyRepoInitForAgent', () => {
     const outcome = await applyRepoInitForAgent(AGENT, MANIFEST, deps, { tokenSource });
     expect(outcome.status).toBe('failed');
     if (outcome.status === 'failed') expect(outcome.reason).toMatch(/label creation was skipped/);
+  });
+
+  // --- groundnuty/macf#1072 (DR-043 Amendment L extended to
+  // `versions.actions`) — force-rewrite, end to end through the REAL
+  // `repoInit()`, with the network structurally unreachable. ---
+
+  it('DECISIVE — manifest declares v3.4.2 against a repo pinned v3.4.1: the force-rewrite lands @v3.4.2 in agent-router.yml, and fetch is NEVER called', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
+      throw new Error('fetch must not be called — the manifest declares an immutable pin AND opts.force/opts.actionsVersion already carry the resolved decision (groundnuty/macf#1072)');
+    });
+    try {
+      let written = '';
+      const deps: RepoInitStepDeps = {
+        cloneRepo: fakeCloneRepo(),
+        // Read the ACTUAL written file back HERE — inside the commit step,
+        // before `applyRepoInitForAgent`'s `finally` deletes the scratch
+        // dir. "What lands" is the acceptance criterion, not just the
+        // argument `repoInit` was called with.
+        commitAndPush: async (dir) => {
+          written = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+          return 'pushed';
+        },
+      };
+      // Mirrors exactly what `apply-fleet.ts`'s call site computes via
+      // `resolveActionsPinReconcile(manifest.versions?.actions, observedPin)`
+      // for a repo observed at the STALE pin `v3.4.1` while the manifest
+      // now declares `v3.4.2` — the live bug this issue reports.
+      const { actionsVersion, force } = resolveActionsPinReconcile('v3.4.2', 'v3.4.1');
+      expect(force).toBe(true);
+      expect(actionsVersion).toBe('v3.4.2');
+
+      const outcome = await applyRepoInitForAgent(AGENT, MANIFEST, deps, { actionsVersion, force });
+
+      expect(outcome.status).toBe('applied');
+      if (outcome.status === 'applied') expect(outcome.pushed).toBe(true);
+      expect(written).toContain('uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.4.2');
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('already-current (observed already matches declared): resolveActionsPinReconcile keeps force false, so a caller following its decision never rewrites an up-to-date file', async () => {
+    const { actionsVersion, force } = resolveActionsPinReconcile('v3.4.1', 'v3.4.1');
+    expect(force).toBe(false);
+    expect(actionsVersion).toBe('v3.4.1');
+
+    let repoInitCalls = 0;
+    const fakeRepoInit = vi.fn(async () => {
+      repoInitCalls += 1;
+      return { workflow: 'created' as const, config: 'updated' as const, labels: { status: 'skipped' as const, reason: 'no token' } };
+    });
+    const deps: RepoInitStepDeps = { cloneRepo: fakeCloneRepo(), commitAndPush: async () => 'nothing-to-commit', repoInit: fakeRepoInit as never };
+    await applyRepoInitForAgent(AGENT, MANIFEST, deps, { actionsVersion, force });
+    // The caller (apply-fleet.ts) still runs the general identity-sync
+    // repoInit call regardless of `force` (labels/config-merge are
+    // independent concerns — see this module's doc); what THIS assertion
+    // proves is that the `force` flag itself carried through unchanged.
+    expect(repoInitCalls).toBe(1);
+    const seenOpts = fakeRepoInit.mock.calls[0]?.[1] as { force?: boolean; actionsVersion?: string };
+    expect(seenOpts.force).toBe(false);
+    expect(seenOpts.actionsVersion).toBe('v3.4.1');
+  });
+});
+
+// --- resolveActionsPinReconcile (groundnuty/macf#1072, DR-043 Amendment L
+// extended to `versions.actions`) — pure decision point, zero I/O. ---
+
+describe('resolveActionsPinReconcile', () => {
+  it('absent versions.actions (declaredActions undefined) + an observed pin present: force stays false, actionsVersion is the OBSERVED pin — never the floating DEFAULT_ACTIONS_VERSION', () => {
+    const r = resolveActionsPinReconcile(undefined, 'v3.4.1');
+    expect(r).toEqual({ actionsVersion: 'v3.4.1', force: false });
+  });
+
+  it('absent versions.actions AND no observed pin at all: falls back to the DEFAULT_ACTIONS_VERSION bootstrap default (the brand-new-repo case), force stays false', () => {
+    const r = resolveActionsPinReconcile(undefined, undefined);
+    expect(r).toEqual({ actionsVersion: 'v3', force: false });
+  });
+
+  it('declared and matches observed: force stays false (nothing to reconcile)', () => {
+    const r = resolveActionsPinReconcile('v3.4.2', 'v3.4.2');
+    expect(r).toEqual({ actionsVersion: 'v3.4.2', force: false });
+  });
+
+  it('declared and diverges from observed: force true, actionsVersion is the DECLARED value verbatim — never a function of what was observed', () => {
+    const r = resolveActionsPinReconcile('v3.4.2', 'v3.4.1');
+    expect(r).toEqual({ actionsVersion: 'v3.4.2', force: true });
+  });
+
+  it('declared but the observed pin is unreadable (undefined): force true, same treatment as drift — mirrors version(macf)\'s create+update symmetry, never silently treated as already-current', () => {
+    const r = resolveActionsPinReconcile('v3.4.2', undefined);
+    expect(r).toEqual({ actionsVersion: 'v3.4.2', force: true });
   });
 });
 
