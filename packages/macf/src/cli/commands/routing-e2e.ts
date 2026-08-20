@@ -68,8 +68,23 @@
  * label, rather than let that skip present as an ambiguous timeout.
  */
 import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
-import { fromVariableSegment } from '@groundnuty/macf-core';
+import {
+  createRegistryFromConfig,
+  fromVariableSegment,
+  generateToken,
+  pingAgentHealth,
+  toVariableSegment,
+} from '@groundnuty/macf-core';
+import { readAgentConfig, tokenSourceFromConfig, agentCertPath, agentKeyPath } from '../config.js';
+import { createClientFromConfig } from '../registry-helper.js';
 import type { RoutingConfig } from './routing-doctor.js';
+import { createCallerPinReader, createRoutingConfigGhReader } from './routing-doctor-gh.js';
+import {
+  createIssueCloser,
+  createLabelApplier,
+  createProbeIssueCreator,
+  createRouterRunFinder,
+} from './routing-e2e-gh.js';
 
 // --- Result shape ---
 
@@ -488,4 +503,92 @@ export function formatRoutingE2eText(result: RoutingE2eResult): string {
       'on it — a receipt is not the same thing as a distinct turn.',
   );
   return lines.join('\n');
+}
+
+// --- Production dep wiring + CLI entrypoint ---
+
+export interface RunRoutingE2eCliOptions {
+  readonly json?: boolean;
+  readonly targetRepo: string;
+  readonly targetLabel?: string;
+  readonly timeoutSec?: number;
+}
+
+async function resolveE2eDepsFromRegistry(
+  projectDir: string,
+): Promise<{ readonly ok: true; readonly deps: RoutingE2eDeps } | { readonly ok: false; readonly code: number; readonly message: string }> {
+  const config = readAgentConfig(projectDir);
+  if (!config) {
+    return { ok: false, code: 1, message: 'No macf-agent.json found. Run `macf init` first.' };
+  }
+  if (config.registry.type === 'local') {
+    return {
+      ok: false,
+      code: 1,
+      message: '`macf routing doctor --e2e` checks the GitHub routing plane; local-registry mode has none.',
+    };
+  }
+
+  const token = await generateToken(tokenSourceFromConfig(projectDir, config));
+  const registry = createRegistryFromConfig(config.registry, config.project, token);
+  const client = createClientFromConfig(config.registry, token);
+  const caCertPem = (await client.readVariable(`${toVariableSegment(config.project)}_CA_CERT`)) ?? '';
+  const certPath = agentCertPath(projectDir);
+  const keyPath = agentKeyPath(projectDir);
+
+  return {
+    ok: true,
+    deps: {
+      currentLabel: config.routing_label ?? config.agent_name ?? null,
+      isTargetCaller: async (repo) => (await createCallerPinReader(token)(repo)).status === 'pinned',
+      readTargetRoutingConfig: createRoutingConfigGhReader(token),
+      listRegistry: () => registry.list(''),
+      probe: (host, port) => pingAgentHealth({ host, port, caCertPem, certPath, keyPath }),
+      createProbeIssue: createProbeIssueCreator(token),
+      applyLabel: createLabelApplier(token),
+      closeIssue: createIssueCloser(token),
+      findRouterRun: createRouterRunFinder(token),
+    },
+  };
+}
+
+/**
+ * `macf routing doctor --e2e` entry point. Returns the shell exit code — 1
+ * on RED (including every precondition refusal), 0 on GREEN, matching the
+ * "non-zero on problem" convention `fleet doctor` / `routing doctor` share.
+ * `deps` is injected by tests; production resolves it from the project's
+ * registry config via `resolveE2eDepsFromRegistry`.
+ */
+export async function runRoutingE2e(
+  projectDir: string,
+  opts: RunRoutingE2eCliOptions,
+  deps?: RoutingE2eDeps,
+): Promise<number> {
+  let resolved = deps;
+  if (!resolved) {
+    const r = await resolveE2eDepsFromRegistry(projectDir);
+    if (!r.ok) {
+      console.error(r.message);
+      if (opts.json) {
+        console.log(JSON.stringify({ schema_version: ROUTING_E2E_JSON_SCHEMA_VERSION, error: r.message }, null, 2));
+      }
+      return r.code;
+    }
+    resolved = r.deps;
+  }
+
+  const result = await runRoutingE2eCore(resolved, {
+    targetRepo: opts.targetRepo,
+    targetLabel: opts.targetLabel,
+    timeoutSec: opts.timeoutSec,
+  });
+
+  if (opts.json) {
+    console.log(JSON.stringify(routingE2eToJson(result), null, 2));
+  } else {
+    console.log(`macf routing doctor --e2e — ${opts.targetRepo}\n`);
+    console.log(formatRoutingE2eText(result));
+  }
+
+  return result.verdict === 'GREEN' ? 0 : 1;
 }
