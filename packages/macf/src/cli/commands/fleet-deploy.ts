@@ -14,6 +14,7 @@ import { parseFleetManifest } from '../bootstrap/fleet-manifest.js';
 import type { CaMaterializeOutcome, FleetDeployDeps, FleetDeployOutcome } from '../bootstrap/fleet-deploy.js';
 import { deployAgent, realAuthenticatedCloneRepo, realMintCloneToken } from '../bootstrap/fleet-deploy.js';
 import { readVault } from '../bootstrap/vault-read.js';
+import { firstLaunchGuidanceHeaderLines, firstLaunchAttachLine } from '../bootstrap/first-launch-guidance.js';
 import { initAgent as realInitAgent } from './init.js';
 import { agentCertPath, agentKeyPath } from '../config.js';
 
@@ -182,6 +183,14 @@ function nextStepLines(
     );
   }
   lines.push(`Next step: cd ${destDir} && ./claude.sh`);
+  // macf#994 — that step cannot complete unattended: first launch of a
+  // workspace blocks on Claude Code's own trust dialog (and, conditionally,
+  // a channels-confirmation prompt the auto-responder can miss). Named
+  // here, never answered — see first-launch-guidance.ts's module doc. A
+  // single agent is the N=1 case of the same header+attach-line shape
+  // `bootstrap-apply.ts::launchNextStepLines` uses for N deployed agents.
+  lines.push(...firstLaunchGuidanceHeaderLines());
+  lines.push(firstLaunchAttachLine(manifest.metadata.name, destDir, outcome.role));
   return lines;
 }
 
