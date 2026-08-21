@@ -28,6 +28,14 @@
 #                         commit for <version> + remote main is HEAD~1
 #                         (fast-forward); push HEAD -> main + tag
 #                         v<version> + push the tag (triggers publish.yml).
+#                         Under --dry-run this is an ADVISORY preview, not
+#                         the same gate: clean-tree/HEAD-version/fast-forward
+#                         only hold once `bump` has committed for real, which
+#                         a dry `bump` never does — so the preview reports
+#                         what WOULD block the real run (tree dirty beyond
+#                         the authored CHANGELOG entry, wrong branch, tag
+#                         already exists) instead of aborting on the
+#                         inevitable dry-chain shape (groundnuty/macf#1099).
 #   verify VERSION        Poll the publish.yml run for tag v<version> to
 #                         completion; on failure, print the DR-022
 #                         Amendment L no-retry-same-version guidance
@@ -50,7 +58,17 @@
 # with an append-only (sigstore TLOG) failure surface. Read-only network
 # calls used purely for realistic diagnostics (e.g. would-refuse-because-
 # tag-already-exists checks) are the only thing that may still run under
-# --dry-run; nothing that could ever be undone runs.
+# --dry-run; nothing that could ever be undone runs. A precondition that is
+# only ever true AFTER an earlier step's real (non-dry) mutation must not be
+# asked unconditionally — under a chained `all --dry-run`, earlier steps
+# correctly perform none of those mutations, so the precondition would fail
+# on every single preview for a reason that carries no information (see
+# `cli`'s doc above + `cli_dry_preview` for the worked fix). Such
+# preconditions live ONLY in the non-dry continuation; the dry branch either
+# evaluates an independent form of the same concern and reports it as an
+# advisory "[dry-run] NOTE: ... this would block the real run" (never an
+# abort), or skips it with a neutral note when there is no dry-mode-
+# meaningful answer at all.
 #
 # SSH-origin gotcha: `origin` on both groundnuty/macf and
 # groundnuty/macf-marketplace is an SSH remote, and this tool's sandboxed
@@ -350,6 +368,54 @@ cmd_marketplace() {
   log "marketplace v${version} live — plugin.json version confirmed via raw URL"
 }
 
+# cli_dry_preview VERSION — advisory-only preview for `cli` under --dry-run.
+# Deliberately NOT the same checks as the real path below (groundnuty/macf#1099):
+# clean-tree, HEAD's-version-equals-target, and remote-main-is-HEAD~1 are all
+# true only once `bump`'s REAL branch has committed — and a dry `bump` never
+# commits (dry-run mutates nothing, by design; see the file header). Gating
+# a preview on the result of a mutation the preview itself guarantees didn't
+# happen means the gate fires on every single dry `all` run, for a reason
+# that carries zero information (the exact defect reported: a check that is
+# always wrong stops being a signal). So here each of those three is either:
+#   (a) evaluated in a form that's genuinely independent of `bump` real-vs-
+#       dry status — working-tree-clean EXCLUDING CHANGELOG.md (the one file
+#       `bump` requires be pre-authored-but-uncommitted; see
+#       changelog_has_heading) and on-main and tag-not-already-existing — and
+#       surfaced as an advisory NOTE ("this would block the real run")
+#       instead of an abort, since a preview mutates nothing regardless of
+#       what it finds; or
+#   (b) skipped with a neutral note when there is no dry-mode-meaningful
+#       answer at all: HEAD's-version-equals-target and remote-is-exactly-
+#       one-commit-behind ARE the question "did bump's commit happen", which
+#       is unanswerable without performing the mutation dry-run exists to
+#       avoid.
+# The REAL path (below) is untouched: same checks, same order, same
+# messages, same failures — this is a scoping fix, not a weakening.
+cli_dry_preview() {
+  local version="$1"
+
+  local branch
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '<detached>')"
+  if [ "$branch" != "main" ]; then
+    log "[dry-run] NOTE: not on main (current branch: $branch) — this would block the real 'cli' step"
+  fi
+
+  local other_dirty
+  other_dirty="$(git status --porcelain | grep -v -E ' CHANGELOG\.md$' || true)"
+  if [ -n "$other_dirty" ]; then
+    log "[dry-run] NOTE: working tree has uncommitted changes beyond the authored CHANGELOG.md entry — this would block the real 'cli' step until committed or stashed:"
+    log "$other_dirty"
+  fi
+
+  if gh api "repos/${CLI_REPO}/git/ref/tags/v${version}" >/dev/null 2>&1; then
+    log "[dry-run] NOTE: tag v${version} already exists on ${CLI_REPO} — this would block the real 'cli' step (idempotent guard)"
+  fi
+
+  dry "would verify HEAD's macf-core version == $version and that remote main is exactly one commit behind HEAD — both depend on 'bump' having committed for real; not evaluated in preview"
+  dry "would push HEAD to ${CLI_REPO}:main (fast-forward)"
+  dry "would tag v${version} and push it to ${CLI_REPO} (triggers publish.yml)"
+}
+
 cmd_cli() {
   local version="${1:-}"
   [ -n "$version" ] || die "cli requires <version>"
@@ -357,6 +423,11 @@ cmd_cli() {
   ensure_gh_token
 
   cd "$REPO_ROOT"
+
+  if [ "$DRY_RUN" = "1" ]; then
+    cli_dry_preview "$version"
+    return 0
+  fi
 
   [ -z "$(git status --porcelain)" ] || die "working tree not clean — commit or stash before release-cli"
 
@@ -376,12 +447,6 @@ cmd_cli() {
 
   if gh api "repos/${CLI_REPO}/git/ref/tags/v${version}" >/dev/null 2>&1; then
     die "tag v${version} already exists on ${CLI_REPO} — refusing (idempotent guard)"
-  fi
-
-  if [ "$DRY_RUN" = "1" ]; then
-    dry "would push HEAD ($local_parent -> HEAD) to ${CLI_REPO}:main (fast-forward)"
-    dry "would tag v${version} and push it to ${CLI_REPO} (triggers publish.yml)"
-    return 0
   fi
 
   git push "$(gh_https_url "$CLI_REPO")" HEAD:main
