@@ -1682,9 +1682,15 @@ export async function applyFleet(
   let tsOauthClientId: RoutingSecretResolution;
   let tsOauthSecret: RoutingSecretResolution;
   if (!manifest.transport.tailscale_oauth_required) {
+    // 'not-required', NOT 'unavailable' — an undeclared fleet is an honest
+    // "not ready yet," and must never fail the run the way a genuinely
+    // missing DECLARED secret does (see `RoutingSecretResolution`'s doc for
+    // why the two are distinct states, and the incident that motivated the
+    // split: without it, every fleet that hasn't set up Tailscale yet
+    // would fail `apply` outright over an unrelated presence check).
     const reason = 'transport.tailscale_oauth_required is not declared in fleet.yaml — Tailscale OAuth was never requested for this fleet.';
-    tsOauthClientId = { status: 'unavailable', reason };
-    tsOauthSecret = { status: 'unavailable', reason };
+    tsOauthClientId = { status: 'not-required', reason };
+    tsOauthSecret = { status: 'not-required', reason };
   } else {
     const restored = deps.routingSecretsDeps.readVaultTsOauth !== undefined ? await deps.routingSecretsDeps.readVaultTsOauth() : undefined;
     const reason =

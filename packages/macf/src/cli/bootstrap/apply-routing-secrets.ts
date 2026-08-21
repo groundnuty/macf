@@ -104,8 +104,35 @@ export type RoutingSecretName = (typeof ALL_ROUTING_SECRET_NAMES)[number];
  * time, per the module doc's per-field encoding table) — this module's
  * {@link publishRoutingSecrets} never transforms a value, only transports
  * it.
+ *
+ * **Three states, not two — `'not-required'` is DISTINCT from
+ * `'unavailable'` (groundnuty/macf#1074).** Both describe "no value in
+ * hand this run," but they answer different questions and
+ * {@link publishRoutingSecrets} treats them differently on a repo that
+ * lacks the secret:
+ *
+ *   - `'unavailable'` — this run SHOULD have been able to provide the
+ *     value (it was declared/expected) but couldn't (mint failed, vault
+ *     restore came up empty, identity unresolved). A repo missing it is a
+ *     genuine gap — LOUD `'failed'`, never silent.
+ *   - `'not-required'` — this run was never ASKED to provide the value
+ *     (e.g. `transport.tailscale_oauth_required` is `false` — the
+ *     operator hasn't set up Tailscale for this fleet yet). A repo
+ *     missing it is the EXPECTED, honest state — `'skipped'`, never
+ *     `'failed'`. Without this distinction, every fleet that hasn't
+ *     declared Tailscale yet would fail `apply` outright the moment any
+ *     OTHER of the six secrets needed a fresh presence check — conflating
+ *     "not ready yet" with "broken."
+ *
+ * Both still run `checkPresence` (the #986 "never blanket-skip" discipline
+ * applies to `'not-required'` too — a repo that happens to already HAVE
+ * the secret reports `'already-present'`, not a groundless `'skipped'`);
+ * only the ABSENT-repo outcome differs.
  */
-export type RoutingSecretResolution = { readonly status: 'available'; readonly value: string } | { readonly status: 'unavailable'; readonly reason: string };
+export type RoutingSecretResolution =
+  | { readonly status: 'available'; readonly value: string }
+  | { readonly status: 'unavailable'; readonly reason: string }
+  | { readonly status: 'not-required'; readonly reason: string };
 
 /** The resolved (or honestly-unavailable) value for EVERY one of the six secrets — what `apply-fleet.ts` assembles before calling {@link publishRoutingSecrets} exactly once. */
 export type RoutingSecretsForPublish = Readonly<Record<RoutingSecretName, RoutingSecretResolution>>;
@@ -133,14 +160,22 @@ export function toBase64ForSecret(value: string): string {
  * Create-only per-repo deploy of ALL SIX routing secrets — the ONE
  * publisher (module doc's hard constraint). ALWAYS runs the
  * presence-check-then-maybe-create loop for EVERY given repo and EVERY one
- * of the six names, regardless of whether any individual secret's
- * resolution is `'available'` — mirrors `apply-routing-client.ts`'s
- * (retired) per-repo idempotent-loop contract: a repo already holding a
- * secret reports `'already-present'`; a repo missing one whose resolution
- * is `'unavailable'` reports a loud `'failed'` carrying the honest reason
- * (never a silent `'skipped'` for a secret this run SHOULD have been able
- * to provide); `ensureVariableCreated`'s own create-only semantics are
- * reused verbatim, never re-implemented.
+ * of the six names, regardless of the resolution status — mirrors
+ * `apply-routing-client.ts`'s (retired) per-repo idempotent-loop contract:
+ * a repo already holding a secret reports `'already-present'`, for ANY
+ * resolution status (including `'not-required'` — the #986 "never
+ * blanket-skip" discipline is unconditional on presence, never on need).
+ * For an ABSENT repo, the resolution status decides the outcome:
+ *
+ *   - `'available'` — created.
+ *   - `'unavailable'` — a LOUD `'failed'` carrying the honest reason
+ *     (never a silent `'skipped'` for a secret this run SHOULD have been
+ *     able to provide — `ensureVariableCreated`'s create-only semantics,
+ *     reused verbatim).
+ *   - `'not-required'` — `'skipped'`, carrying the reason, WITHOUT ever
+ *     invoking `create()` (so it never throws, never becomes `'failed'`) —
+ *     see {@link RoutingSecretResolution}'s doc for why this third case
+ *     exists.
  *
  * Never logs a secret value — `deps.setRepoSecret`'s own contract (the
  * value is piped to `gh secret set`'s STDIN, per
@@ -160,6 +195,11 @@ export async function publishRoutingSecrets(
   for (const repo of repos) {
     for (const name of ALL_ROUTING_SECRET_NAMES) {
       const resolution = secrets[name];
+      if (resolution.status === 'not-required') {
+        const presence = await deps.checkRepoSecretPresence(repo, name);
+        result[name][repo] = presence === 'present' ? { status: 'already-present' } : { status: 'skipped', reason: resolution.reason };
+        continue;
+      }
       const legDeps: EnsureVariableDeps = {
         checkPresence: () => deps.checkRepoSecretPresence(repo, name),
         create: async () => {

@@ -89,6 +89,7 @@ import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
 import type { AppNameLengthCheck } from '../bootstrap/apply-runner-ops.js';
 import { RUNNER_OPS_ROLE, buildRunnerOpsManifest, checkAppNameLengths, deriveRunnerOpsHandle } from '../bootstrap/apply-runner-ops.js';
+import { ROUTER_APP_ROLE } from '../bootstrap/apply-router-app.js';
 import { defaultOperatorRecoveryRootDir, operatorRecoveryArtifactPath } from '../bootstrap/vault-write.js';
 import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflight.js';
 import type { RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
@@ -489,6 +490,19 @@ export async function resolveVaultAgentPems(
   // `pendingCreatedUpdates` lookups on for this role.
   const runnerOpsPem = vaultRunnerOpsPrivateKeyPem(raw, manifest.metadata.name);
   if (runnerOpsPem !== undefined) pems.set(RUNNER_OPS_ROLE, runnerOpsPem);
+  // groundnuty/macf#1074 — the SAME gap #954 closed for runner-ops,
+  // reopened for the router App: `manifest.agents[]` never contains
+  // `ROUTER_APP_ROLE` either (`apply-router-app.ts`'s module doc), so
+  // without this explicit lookup a vault-confirmable router App (a
+  // `'reused'`/`'resumed-install'` outcome with both --vault/--identity-key
+  // supplied) would fall all the way to `skip-unverified` even with a
+  // decryptable key sitting right there — unlike `vaultRunnerOpsPrivateKeyPem`
+  // (which is fleet-name-segmented, since a runner-ops key lives under
+  // `MACF_RUNNER_OPS_<seg>_*`), `vaultRouterAppKeyPem` reads a FLAT key
+  // (`MACF_ROUTING_APP_KEY_B64`, unsegmented — see that function's own doc)
+  // so it takes no `manifest.metadata.name` argument.
+  const routerAppPem = vaultRouterAppKeyPem(raw);
+  if (routerAppPem !== undefined) pems.set(ROUTER_APP_ROLE, routerAppPem);
   return pems;
 }
 

@@ -43,11 +43,13 @@ import type { AgentApplyDeps } from '../../src/cli/bootstrap/apply-agent.js';
 import type { AppCredentials } from '../../src/cli/bootstrap/manifest-exchange.js';
 import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../src/cli/bootstrap/apply-routing-client.js';
+import type { RoutingSecretsPublishDeps } from '../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RunnerRegistrationDeps } from '../../src/cli/bootstrap/apply-routing.js';
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../src/cli/bootstrap/apply-routing.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle } from '../../src/cli/bootstrap/apply-runner-ops.js';
 import { VaultError, buildVaultPlaintext, type VaultAgentSecrets, type VaultRunnerOpsSecrets } from '../../src/cli/bootstrap/vault-write.js';
-import { parseVaultPlaintext } from '../../src/cli/bootstrap/vault-read.js';
+import { parseVaultPlaintext, vaultRouterAppId, vaultRouterAppKeyPem } from '../../src/cli/bootstrap/vault-read.js';
+import { ROUTER_APP_ROLE } from '../../src/cli/bootstrap/apply-router-app.js';
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../src/cli/bootstrap/registry-scope-preflight.js';
 import { upgradeFleets } from '@groundnuty/macf-core';
 import type { ApplyVersionPhaseDeps, ApplyVersionPhaseResult } from '../../src/cli/bootstrap/apply-version.js';
@@ -461,10 +463,19 @@ function fakeAgentDeps(overrides: Partial<AgentApplyDeps> = {}): AgentApplyDeps 
  * reports `'absent'` -> every run here takes the CREATE path (no real
  * `gh`/`git`).
  */
-/** groundnuty/macf#920 gap 2 default fake — mint returns SENTINEL cert/key (distinct from every other sentinel so a leak test can tell this surface apart), every repo reports 'absent' so a publish is attempted (not silently skipped for want of a dep). */
+/** groundnuty/macf#920 gap 2 default fake — mint returns SENTINEL cert/key (distinct from every other sentinel so a leak test can tell this surface apart). */
 function fakeRoutingClientDeps(overrides: Partial<RoutingClientApplyDeps> = {}): RoutingClientApplyDeps {
   return {
     mint: async () => ({ certPem: 'SENTINEL-ROUTING-CLIENT-CERT-PEM', keyPem: 'SENTINEL-ROUTING-CLIENT-KEY-PEM' }),
+    ...overrides,
+  };
+}
+
+/** groundnuty/macf#1074 — the unified six-secret publisher's deps default fake: every repo reports 'absent' so a publish is attempted (not silently skipped for want of a dep). */
+function fakeRoutingSecretsDeps(
+  overrides: Partial<RoutingSecretsPublishDeps & { readVaultTsOauth?: () => Promise<{ readonly clientId: string; readonly secret: string } | undefined> }> = {},
+): RoutingSecretsPublishDeps & { readVaultTsOauth?: () => Promise<{ readonly clientId: string; readonly secret: string } | undefined> } {
+  return {
     checkRepoSecretPresence: async () => 'absent',
     setRepoSecret: async () => {},
     ...overrides,
@@ -524,6 +535,8 @@ function fakeMutateDeps(manifestPath: string, overrides: Partial<MutateApplyDeps
     agentRepoDeps: { checkMeta: async () => ({ presence: 'absent' }), createRepo: async () => {}, unarchiveRepo: async () => {} },
     trustDeps: fakeTrustDeps(),
     routingClientDeps: fakeRoutingClientDeps(),
+    routingSecretsDeps: fakeRoutingSecretsDeps(),
+    routerAppVaultDeps: {},
     controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
     // macf#988 — the SAME tracked/cleaned-up tmpdir every other path in
     // this file already uses (see `controlRepoOptions.makeScratchDir`'s
@@ -656,7 +669,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const dir = join(file, '..');
     expect(existsSync(join(dir, 'fleet.lock'))).toBe(true);
     const lock = parseFleetLock(readFileSync(join(dir, 'fleet.lock'), 'utf-8'));
-    expect(lock.agents.map((a) => a.role).sort()).toEqual(['code-agent', 'runner-ops', 'science-agent']);
+    expect(lock.agents.map((a) => a.role).sort()).toEqual(['code-agent', 'router', 'runner-ops', 'science-agent']);
     // The CA key's fingerprint lands in fleet.lock's FLEET-level
     // `fingerprints.ca_key` — the SOLE place it is ever written (see
     // apply-fleet.ts's module doc) — never the raw key value.
@@ -1651,6 +1664,34 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     return parseVaultPlaintext(buildVaultPlaintext({ agents, runnerOps }));
   }
 
+  /**
+   * groundnuty/macf#1074 — sibling of {@link vaultRawWithAgentAndRunnerOpsPems}
+   * that ALSO carries the router App's vault entry (`payload.routingApp`,
+   * the SAME "reopened gap #954 already closed for runner-ops" reasoning —
+   * see `resolveVaultAgentPems`'s router-App explicit-lookup comment).
+   */
+  function vaultRawWithAgentRunnerOpsAndRouterPems(agentRoles: readonly string[], pem = SENTINEL_VAULT_PEM): Readonly<Record<string, string>> {
+    const agents: VaultAgentSecrets[] = agentRoles.map((role) => ({
+      appHandle: `demo-fleet-${role}`,
+      appId: '111',
+      installId: '222',
+      clientId: 'Iv1.abc',
+      clientSecret: 'not-under-test',
+      webhookSecret: 'not-under-test',
+      pem,
+    }));
+    const runnerOps: VaultRunnerOpsSecrets = {
+      appHandle: deriveRunnerOpsHandle('demo-fleet'),
+      appId: '999',
+      installId: '998',
+      clientId: 'Iv1.runner-ops',
+      clientSecret: 'not-under-test',
+      webhookSecret: 'not-under-test',
+      pem,
+    };
+    return parseVaultPlaintext(buildVaultPlaintext({ agents, runnerOps, routingApp: { appId: '997', appKeyPem: pem } }));
+  }
+
   // --- groundnuty/macf#954 — the runner-ops vault-confirm reach gap ---
   //
   // `resolveVaultAgentPems` used to loop ONLY `manifest.agents` — which
@@ -1701,9 +1742,11 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
         { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
         { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-3' },
+        // groundnuty/macf#1074 — the router App gets the SAME treatment.
+        { role: 'router', app_id: 'app-router', install_id: 'install-4' },
       ],
     };
-    const raw = vaultRawWithAgentAndRunnerOpsPems(['code-agent', 'science-agent']);
+    const raw = vaultRawWithAgentRunnerOpsAndRouterPems(['code-agent', 'science-agent']);
     const vaultAgentPems = await resolveVaultAgentPems(
       manifest,
       { vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
@@ -1711,6 +1754,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       () => {},
     );
     expect(vaultAgentPems?.has(RUNNER_OPS_ROLE)).toBe(true); // the fix under test
+    expect(vaultAgentPems?.has(ROUTER_APP_ROLE)).toBe(true); // groundnuty/macf#1074 — the SAME fix, reopened for the router App
 
     // The REAL resolveMutateDeps-built resolveKeyPath closure — extracted
     // once, never a hand-rolled `(role) => ...` any-role stand-in.
@@ -1719,7 +1763,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
 
     let startManifestFlowCalled = false;
     const installIdForAppId = (appId: string): string =>
-      appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-3';
+      appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : appId === 'app-runner-ops' ? 'install-3' : 'install-4';
 
     const code = await runBootstrapApply(
       // macf#1013 — deploy:false: this test is about macf#954's vault-aware
@@ -1734,6 +1778,18 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         // (mirrors runBootstrapApply's own `finally { mutate.cleanupVaultScratch?.() }`
         // contract — see resolveMutateDeps's doc).
         cleanupVaultScratch: realMutate.cleanupVaultScratch,
+        // groundnuty/macf#1074 — the router App is REUSED (a prior lock
+        // entry above), so its MACF_ROUTING_APP_ID/KEY publish resolves via
+        // vault-restore, not fresh-creation credentials. Wired against the
+        // SAME `raw` vault map this test's `readVault` already returns —
+        // the real read-side primitives, not a stand-in.
+        routerAppVaultDeps: {
+          readVaultRouterApp: async () => {
+            const appId = vaultRouterAppId(raw);
+            const appKeyPem = vaultRouterAppKeyPem(raw);
+            return appId !== undefined && appKeyPem !== undefined ? { appId, appKeyPem } : undefined;
+          },
+        },
         buildAgentDeps: () =>
           fakeAgentDeps({
             resolveKeyPath: realResolveKeyPath,
@@ -1832,6 +1888,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         // the CREATE path (see the dedicated "genuinely absent" test above),
         // which is not what THIS test is about.
         { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-3' },
+        // groundnuty/macf#1074 — the router App gets the SAME treatment as
+        // runner-ops immediately above: a prior lock entry so it too takes
+        // the REUSE path, not CREATE.
+        { role: 'router', app_id: 'app-router', install_id: 'install-4' },
       ],
     };
     let startManifestFlowCalled = false;
@@ -1849,16 +1909,17 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
             // directly, unit-level, in the 'resolveMutateDeps' describe
             // block below) — proves the OVERALL behavior once such wiring
             // is present, without a real GitHub App / age binary. Also
-            // covers the runner-ops (groundnuty/macf#943) — this raw
-            // override answers for ANY role, unlike the real
-            // `resolveMutateDeps`'s vault-derived one (which only ever
-            // resolves a PEM for a DECLARED agent — see that function's doc).
+            // covers the runner-ops + router (groundnuty/macf#943,
+            // groundnuty/macf#1074) — this raw override answers for ANY
+            // role, unlike the real `resolveMutateDeps`'s vault-derived one
+            // (which only ever resolves a PEM for a DECLARED agent — see
+            // that function's doc).
             resolveKeyPath: (role) => `/fake/${role}.pem`,
             confirmAppInstallation: async (appId) => ({
               status: 'confirmed',
               install: {
                 appId,
-                installId: appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-3',
+                installId: appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : appId === 'app-runner-ops' ? 'install-3' : 'install-4',
                 appSlug: '',
                 accountLogin: 'groundnuty',
               },
@@ -1889,6 +1950,14 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
           },
           commitAndPush: async () => 'nothing-to-commit',
         },
+        // groundnuty/macf#1074 — this test's focus is the vault-aware
+        // confirm-before-create gate skip, not the routing-secrets publish
+        // (the router App is REUSED with no vault-restore wired here, so
+        // its own MACF_ROUTING_APP_ID/KEY would otherwise report an
+        // UNRELATED 'failed' leg and contaminate this test's exit-code
+        // assertion — same fix as apply-fleet.test.ts's "deactivate-shaped
+        // state" test).
+        routingSecretsDeps: fakeRoutingSecretsDeps({ checkRepoSecretPresence: async () => 'present' }),
       }),
     );
     expect(code).toBe(0);
@@ -1988,6 +2057,8 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         // "existing App recorded" test above: gate 1 must never open for the
         // runner-ops either when it too has a prior lock entry.
         { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-3' },
+        // groundnuty/macf#1074 — the router App gets the SAME treatment.
+        { role: 'router', app_id: 'app-router', install_id: 'install-4' },
       ],
     };
     let unarchiveCalled = false;
@@ -2009,7 +2080,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
               status: 'confirmed',
               install: {
                 appId,
-                installId: appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-3',
+                installId: appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : appId === 'app-runner-ops' ? 'install-3' : 'install-4',
                 appSlug: '',
                 accountLogin: 'groundnuty',
               },
@@ -2034,6 +2105,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
           },
           commitAndPush: async () => 'pushed',
         },
+        // groundnuty/macf#1074 — see the identical comment on the sibling
+        // "existing App recorded" test above: this test's focus is
+        // revival, not routing-secrets specifics.
+        routingSecretsDeps: fakeRoutingSecretsDeps({ checkRepoSecretPresence: async () => 'present' }),
       }),
     );
     expect(code).toBe(0);
@@ -2878,6 +2953,11 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
     // exit code it did before this field existed. Individual tests below
     // override to exercise the runner-ops's own failure/skip shapes.
     runnerOps: { role: 'runner-ops', status: 'reused', appId: '900', installId: '901' },
+    // groundnuty/macf#1074 — same NEUTRAL-default reasoning as `runnerOps`
+    // immediately above: a REUSED router App (never failed/drift/skipped-
+    // unverified) so every PRE-EXISTING `applyExitCode` test in this file
+    // keeps expecting the SAME exit code it did before this field existed.
+    routerApp: { role: 'router', status: 'reused', appId: '902', installId: '903' },
     vault: { status: 'skipped' },
     identityChanges: [],
     // DR-043 Amendment D phase 2 (macf#838) defaults: a REUSED CA (no fresh
@@ -2889,6 +2969,17 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
     // matches `ca`'s own REUSED default above), no repos to publish to.
     // Individual tests below override to exercise minted/failed-leg shapes.
     routingClient: { mint: { status: 'skipped', reason: 'no CA minted this run' }, certLegs: {}, keyLegs: {} },
+    // groundnuty/macf#1074 — the unified six-secret publish result. Empty
+    // (no repos, nothing attempted) is the NEUTRAL default matching
+    // `routingClient`'s own no-repos-to-publish-to default above.
+    routingSecrets: {
+      MACF_ROUTING_APP_ID: {},
+      MACF_ROUTING_APP_KEY: {},
+      ROUTING_CLIENT_CERT: {},
+      ROUTING_CLIENT_KEY: {},
+      TS_OAUTH_CLIENT_ID: {},
+      TS_OAUTH_SECRET: {},
+    },
     ...overrides,
   };
 }
