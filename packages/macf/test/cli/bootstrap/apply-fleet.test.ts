@@ -29,6 +29,9 @@ import type { ControlRepoDeps } from '../../../src/cli/bootstrap/control-repo.js
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
+import type { RoutingSecretsPublishDeps } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
+import { toBase64ForSecret } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
+import type { RouterAppVaultRestoreDeps } from '../../../src/cli/bootstrap/apply-router-app.js';
 import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
 import { operatorRecoveryArtifactPath, writeAgentRecoveryArtifact, writeVault } from '../../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext } from '../../../src/cli/bootstrap/vault-read.js';
@@ -250,12 +253,25 @@ const SENTINEL_ROUTING_CLIENT_KEY_PEM = 'SENTINEL-ROUTING-CLIENT-KEY-PEM';
 function routingClientDepsFor(overrides: Partial<RoutingClientApplyDeps> = {}): RoutingClientApplyDeps {
   return {
     mint: async () => ({ certPem: SENTINEL_ROUTING_CLIENT_CERT_PEM, keyPem: SENTINEL_ROUTING_CLIENT_KEY_PEM }),
+    ...overrides,
+  };
+}
+const NOOP_ROUTING_CLIENT_DEPS: RoutingClientApplyDeps = routingClientDepsFor();
+
+// groundnuty/macf#1074 — the unified six-secret publish deps (the SAME
+// checkRepoSecretPresence/setRepoSecret shape `routingClientDepsFor` used to
+// carry, now on its own bag since publish moved out of `RoutingClientApplyDeps`).
+function routingSecretsDepsFor(
+  overrides: Partial<RoutingSecretsPublishDeps & { readVaultTsOauth?: () => Promise<{ readonly clientId: string; readonly secret: string } | undefined> }> = {},
+): RoutingSecretsPublishDeps & { readVaultTsOauth?: () => Promise<{ readonly clientId: string; readonly secret: string } | undefined> } {
+  return {
     checkRepoSecretPresence: async () => 'absent',
     setRepoSecret: async () => {},
     ...overrides,
   };
 }
-const NOOP_ROUTING_CLIENT_DEPS: RoutingClientApplyDeps = routingClientDepsFor();
+const NOOP_ROUTING_SECRETS_DEPS = routingSecretsDepsFor();
+const NOOP_ROUTER_APP_VAULT_DEPS: RouterAppVaultRestoreDeps = {};
 
 // --- Real `age` binary support (macf#852 — see the trailing test below) ---
 //
@@ -352,6 +368,8 @@ describe('applyFleet', () => {
       agentRepoDeps: agentRepoDepsFor(),
       trustDeps: trustDepsFor(),
       routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
+      routingSecretsDeps: NOOP_ROUTING_SECRETS_DEPS,
+      routerAppVaultDeps: NOOP_ROUTER_APP_VAULT_DEPS,
       controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
       recoveryRootDir: join(manifestPath, '..'),
       now: () => new Date('2026-08-11T00:00:00.000Z'),
@@ -707,37 +725,43 @@ describe('applyFleet', () => {
     const result = await applyFleet(manifest, manifestPath, priorLock, deps);
 
     expect(result.vault.status).toBe('written');
-    // THREE encrypt calls now (groundnuty/macf#943 added the third): the
-    // pre-gate-2 recovery artifact for 'code-agent' (DR-043 §D5
-    // durable-before-gate-2) fires first (inside the per-agent loop), THEN
-    // the runner-ops's OWN recovery artifact (it also takes the
+    // FOUR encrypt calls now (groundnuty/macf#943 added the third, #1074
+    // added the fourth): the pre-gate-2 recovery artifact for 'code-agent'
+    // (DR-043 §D5 durable-before-gate-2) fires first (inside the per-agent
+    // loop), THEN the runner-ops's OWN recovery artifact (it also takes the
     // no-prior-lock-entry CREATE path via this same shared `agentDeps`
     // fixture — see `apply-fleet.ts`'s "runner-ops" step, which runs
-    // right after the per-agent loop), THEN the batched final vault —
-    // asserted by ORDER, not just presence, so this doesn't just infer the
-    // sequencing from the loop structure. The runner-ops credential's OWN identity ends
-    // up 'failed' (this fixture's `waitForAppInstallation` doesn't return
-    // `repositorySelection: 'selected'` — `validateRunnerOpsInstall`
-    // rejects it), so it contributes NO lock/vault entry — only its
-    // recovery artifact, exactly like a `created`-then-gate-2-failed agent
-    // would (see `apply-agent.ts`'s "gate 1→2 window" doc).
-    expect(encryptCalls).toHaveLength(3);
+    // right after the per-agent loop), THEN the router App's OWN recovery
+    // artifact (SAME shared fixture, SAME CREATE path, runs right after
+    // runner-ops), THEN the batched final vault — asserted by ORDER, not
+    // just presence, so this doesn't just infer the sequencing from the
+    // loop structure. Both the runner-ops's AND the router App's OWN
+    // identities end up 'failed' (this fixture's `waitForAppInstallation`
+    // doesn't return `repositorySelection: 'selected'` —
+    // `validateRunnerOpsInstall`/`validateRouterAppInstall` reject it), so
+    // NEITHER contributes a lock/vault entry — only their recovery
+    // artifacts, exactly like a `created`-then-gate-2-failed agent would
+    // (see `apply-agent.ts`'s "gate 1→2 window" doc).
+    expect(encryptCalls).toHaveLength(4);
     // macf#988: `encrypt` is called with a TEMP sibling for a recovery
     // write (atomic-write tail — see `writeAgentRecoveryArtifact`'s doc),
     // never for the final vault write — `.tmp-` is now the discriminator
     // (recovery paths no longer contain the literal word "recovery"; see
     // `operatorRecoveryArtifactPath`'s new `<recoveryRootDir>/<fleet>/<role>.age` shape).
-    expect(encryptCalls.map((c) => c.outPath.includes('.tmp-'))).toEqual([true, true, false]);
+    expect(encryptCalls.map((c) => c.outPath.includes('.tmp-'))).toEqual([true, true, true, false]);
     const recoveryCalls = encryptCalls.filter((c) => c.outPath.includes('.tmp-'));
     const finalVaultCall = encryptCalls.find((c) => !c.outPath.includes('.tmp-'));
     const codeAgentRecoveryCall = recoveryCalls.find((c) => c.outPath.includes('code-agent'));
     const runnerOpsRecoveryCall = recoveryCalls.find((c) => c.outPath.includes('runner-ops'));
+    const routerRecoveryCall = recoveryCalls.find((c) => c.outPath.includes('.router.age'));
     expect(codeAgentRecoveryCall?.outPath).toMatch(/demo-fleet[/\\]\.code-agent\.age\.tmp-/);
     expect(codeAgentRecoveryCall?.plaintext).toContain('MACF_RECOVERY_CODE_AGENT_APP_ID');
     expect(runnerOpsRecoveryCall?.outPath).toMatch(/demo-fleet[/\\]\.runner-ops\.age\.tmp-/);
+    expect(routerRecoveryCall?.outPath).toMatch(/demo-fleet[/\\]\.router\.age\.tmp-/);
     expect(finalVaultCall?.plaintext).toContain('CODE_AGENT'); // the freshly-created agent's segment
     expect(finalVaultCall?.plaintext).not.toContain('SCIENCE_AGENT_CLIENT_SECRET'); // reused agent contributes NO fresh secret
     expect(finalVaultCall?.plaintext).not.toContain('MACF_RUNNER_OPS_'); // failed gate-2 -> never folded into the final vault
+    expect(finalVaultCall?.plaintext).not.toContain('MACF_ROUTING_APP_'); // failed gate-2 -> never folded into the final vault
 
     const lock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
     // The runner-ops's FAILED identity never gets a lock entry (only
@@ -1532,6 +1556,8 @@ trust:
         mint: async () => {
           throw new Error('must not be called — foreign control repo, routing-client is never minted');
         },
+      },
+      routingSecretsDeps: {
         checkRepoSecretPresence: async () => {
           throw new Error('must not be called');
         },
@@ -1539,6 +1565,7 @@ trust:
           throw new Error('must not be called');
         },
       },
+      routerAppVaultDeps: {},
       now: () => new Date('2026-08-11T00:00:00.000Z'),
       log: () => {},
     };
@@ -1972,32 +1999,37 @@ trust:
     it('deactivate-shaped state: lock has ca_key, registry ABSENT, vault has the cert -> RESTORES end-to-end (registry leg actually gets recreated, not just "vault was read"), never mints', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT]);
-      // BOTH the agent AND the fleet-level runner-ops App get a PRIOR lock
-      // entry (groundnuty/macf#943 — runner-ops is a real, always-resolved
-      // identity on every apply run, not something this CA-focused test can
-      // ignore) so both take the REUSED path and this test exercises ONLY
-      // the CA machinery — no gate-1/gate-2/repo-init/label-creation noise
-      // that a fresh CREATE would pull in and that has nothing to do with
-      // #978. Mirrors the dispatch-by-appId shape the pre-existing "reuse:
-      // fleet.lock already records ca_key AND registry reports present"
-      // test above already uses.
+      // The agent, the fleet-level runner-ops App, AND the router App
+      // (groundnuty/macf#1074 — a third always-resolved identity on every
+      // apply run) all get a PRIOR lock entry so all three take the REUSED
+      // path and this test exercises ONLY the CA machinery — no
+      // gate-1/gate-2/repo-init/label-creation noise that a fresh CREATE
+      // would pull in and that has nothing to do with #978. Mirrors the
+      // dispatch-by-appId shape the pre-existing "reuse: fleet.lock already
+      // records ca_key AND registry reports present" test above already uses.
       const priorLock: FleetLock = {
         schema_version: 1,
         fleet: 'demo-fleet',
         agents: [
           { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
           { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-runner-ops' },
+          { role: 'router', app_id: 'app-router', install_id: 'install-router' },
         ],
         fingerprints: { ca_key: 'sha256:deadbeef' },
       };
+      const INSTALL_IDS: Record<string, string> = {
+        'app-code-agent': 'install-1',
+        'app-runner-ops': 'install-runner-ops',
+        'app-router': 'install-router',
+      };
       const agentDeps: AgentApplyDeps = {
-        startManifestFlow: async () => { throw new Error('must not be called — both roles have prior entries'); },
+        startManifestFlow: async () => { throw new Error('must not be called — all roles have prior entries'); },
         startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
         exchangeManifestCode: async () => { throw new Error('must not be called'); },
         resolveKeyPath: () => '/fake.pem',
         confirmAppInstallation: async (appId) => ({
           status: 'confirmed',
-          install: { appId, installId: appId === 'app-code-agent' ? 'install-1' : 'install-runner-ops', appSlug: `demo-fleet-${appId}`, accountLogin: 'groundnuty' },
+          install: { appId, installId: INSTALL_IDS[appId] ?? 'install-unexpected', appSlug: `demo-fleet-${appId}`, accountLogin: 'groundnuty' },
         }),
         waitForAppInstallation: async () => { throw new Error('must not be called'); },
         openUrl: async () => {},
@@ -2020,6 +2052,14 @@ trust:
             return 'created';
           },
         }),
+        // groundnuty/macf#1074 — this test's focus is the CA restore, not
+        // the routing-client cert (genuinely never minted for this fleet —
+        // no `routing_client_key` fingerprint). Report every routing
+        // secret as already-present so the unified publisher's now-ALWAYS
+        // presence check (never a blanket skip — see the "never-minted-at-
+        // all fleets" test) doesn't produce an UNRELATED 'failed' leg that
+        // would contaminate this test's `applyExitCode` assertion below.
+        routingSecretsDeps: routingSecretsDepsFor({ checkRepoSecretPresence: async () => 'present' }),
       };
       const result = await applyFleet(manifest, manifestPath, priorLock, deps);
 
@@ -2033,6 +2073,7 @@ trust:
       expect(registryWrites).toEqual(['VAULT-RESTORED-CA-CERT-PEM']);
       expect(result.agents[0]?.identity.status).toBe('reused');
       expect(result.runnerOps.status).toBe('reused');
+      expect(result.routerApp.status).toBe('reused');
       // `applyExitCode` gates on `ca.resolve.status === 'failed'` (an
       // explicit equality check, not a closed allowlist of "good" statuses)
       // — a successful restore must NOT make the run exit non-zero. Asserted
@@ -2671,11 +2712,13 @@ trust:
             mintCalls.push({ caCertPem, caKeyPem });
             return { certPem: 'E2E-ROUTING-CLIENT-CERT-PEM', keyPem: 'E2E-ROUTING-CLIENT-KEY-PEM' };
           },
+        },
+        routingSecretsDeps: routingSecretsDepsFor({
           checkRepoSecretPresence: async () => 'absent',
           setRepoSecret: async (repo, name, value) => {
             routingClientCalls.push({ repo, name, value });
           },
-        },
+        }),
       };
 
       const result = await applyFleet(manifest, manifestPath, null, deps);
@@ -2716,8 +2759,8 @@ trust:
       expect(result.routingClient.mint.status).toBe('minted');
       expect(result.routingClient.certLegs['groundnuty/demo-code']).toEqual({ status: 'created' });
       expect(result.routingClient.keyLegs['groundnuty/demo-code']).toEqual({ status: 'created' });
-      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-code', name: 'ROUTING_CLIENT_CERT', value: 'E2E-ROUTING-CLIENT-CERT-PEM' });
-      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-code', name: 'ROUTING_CLIENT_KEY', value: 'E2E-ROUTING-CLIENT-KEY-PEM' });
+      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-code', name: 'ROUTING_CLIENT_CERT', value: toBase64ForSecret('E2E-ROUTING-CLIENT-CERT-PEM') });
+      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-code', name: 'ROUTING_CLIENT_KEY', value: toBase64ForSecret('E2E-ROUTING-CLIENT-KEY-PEM') });
 
       // --- Gap 3 (groundnuty/macf#1071): the CONTROL repo — which carries the
       // SAME router workflow (Gap 1's controlLabelPosts assertion above
@@ -2731,8 +2774,8 @@ trust:
       // which is exactly the shape #1071 reports broken.
       expect(result.routingClient.certLegs['groundnuty/demo-fleet-control']).toEqual({ status: 'created' });
       expect(result.routingClient.keyLegs['groundnuty/demo-fleet-control']).toEqual({ status: 'created' });
-      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-fleet-control', name: 'ROUTING_CLIENT_CERT', value: 'E2E-ROUTING-CLIENT-CERT-PEM' });
-      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-fleet-control', name: 'ROUTING_CLIENT_KEY', value: 'E2E-ROUTING-CLIENT-KEY-PEM' });
+      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-fleet-control', name: 'ROUTING_CLIENT_CERT', value: toBase64ForSecret('E2E-ROUTING-CLIENT-CERT-PEM') });
+      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-fleet-control', name: 'ROUTING_CLIENT_KEY', value: toBase64ForSecret('E2E-ROUTING-CLIENT-KEY-PEM') });
       // Exactly TWO repos got legs — the agent repo AND the control repo,
       // never a THIRD stray target and never just one.
       expect(Object.keys(result.routingClient.certLegs).sort()).toEqual(['groundnuty/demo-code', 'groundnuty/demo-fleet-control']);
@@ -2784,11 +2827,13 @@ trust:
         }),
         routingClientDeps: {
           mint: async () => ({ certPem: 'E2E-ROUTING-CLIENT-CERT-PEM', keyPem: 'E2E-ROUTING-CLIENT-KEY-PEM' }),
+        },
+        routingSecretsDeps: routingSecretsDepsFor({
           checkRepoSecretPresence: async () => 'absent',
           setRepoSecret: async (repo, name, value) => {
             routingClientCalls.push({ repo, name, value });
           },
-        },
+        }),
       };
 
       const result = await applyFleet(manifest, manifestPath, null, deps);
@@ -2798,7 +2843,7 @@ trust:
 
       // The agent repo (unaffected by the injected failure) IS still a target.
       expect(result.routingClient.certLegs['groundnuty/demo-code']).toEqual({ status: 'created' });
-      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-code', name: 'ROUTING_CLIENT_CERT', value: 'E2E-ROUTING-CLIENT-CERT-PEM' });
+      expect(routingClientCalls).toContainEqual({ repo: 'groundnuty/demo-code', name: 'ROUTING_CLIENT_CERT', value: toBase64ForSecret('E2E-ROUTING-CLIENT-CERT-PEM') });
 
       // The control repo is NOT a target — no leg AT ALL (not even a
       // 'skipped'/'failed' one — see `deriveRouterCarryingRepos`'s doc: a
@@ -2888,14 +2933,16 @@ trust:
             mintCalled = true;
             throw new Error('must not be called — a routing_client_key fingerprint is already recorded');
           },
+          readVaultRoutingClient: async () => ({ certPem: 'VAULT-RESTORED-CERT-PEM', keyPem: 'VAULT-RESTORED-KEY-PEM' }),
+        },
+        routingSecretsDeps: routingSecretsDepsFor({
           // code-agent's repo already has it (from the ORIGINAL apply run);
           // science-agent's repo is the one just added — missing it.
           checkRepoSecretPresence: async (repo) => (repo === 'groundnuty/demo-code' ? 'present' : 'absent'),
           setRepoSecret: async (repo, name, value) => {
             setSecretCalls.push({ repo, name, value });
           },
-          readVaultRoutingClient: async () => ({ certPem: 'VAULT-RESTORED-CERT-PEM', keyPem: 'VAULT-RESTORED-KEY-PEM' }),
-        },
+        }),
       };
 
       const result = await applyFleet(manifest, manifestPath, PRIOR_LOCK_TWO_AGENTS, deps);
@@ -2915,8 +2962,8 @@ trust:
       // The NEW repo: actually gets the secret, sourced from the vault-restore.
       expect(result.routingClient.certLegs['groundnuty/demo-science']).toEqual({ status: 'created' });
       expect(result.routingClient.keyLegs['groundnuty/demo-science']).toEqual({ status: 'created' });
-      expect(setSecretCalls).toContainEqual({ repo: 'groundnuty/demo-science', name: 'ROUTING_CLIENT_CERT', value: 'VAULT-RESTORED-CERT-PEM' });
-      expect(setSecretCalls).toContainEqual({ repo: 'groundnuty/demo-science', name: 'ROUTING_CLIENT_KEY', value: 'VAULT-RESTORED-KEY-PEM' });
+      expect(setSecretCalls).toContainEqual({ repo: 'groundnuty/demo-science', name: 'ROUTING_CLIENT_CERT', value: toBase64ForSecret('VAULT-RESTORED-CERT-PEM') });
+      expect(setSecretCalls).toContainEqual({ repo: 'groundnuty/demo-science', name: 'ROUTING_CLIENT_KEY', value: toBase64ForSecret('VAULT-RESTORED-KEY-PEM') });
       // The already-provisioned repo is NEVER re-written (create-only, no churn):
       expect(setSecretCalls.some((c) => c.repo === 'groundnuty/demo-code')).toBe(false);
 
@@ -2949,10 +2996,12 @@ trust:
         trustDeps: reuseCaTrustDeps(),
         routingClientDeps: {
           mint: async () => { throw new Error('must not be called'); },
-          checkRepoSecretPresence: async (repo) => (repo === 'groundnuty/demo-code' ? 'present' : 'absent'),
-          setRepoSecret: async () => { throw new Error('must not be called — no material to publish'); },
           // readVaultRoutingClient deliberately OMITTED — no --vault/--identity-key this run.
         },
+        routingSecretsDeps: routingSecretsDepsFor({
+          checkRepoSecretPresence: async (repo) => (repo === 'groundnuty/demo-code' ? 'present' : 'absent'),
+          setRepoSecret: async () => { throw new Error('must not be called — no material to publish'); },
+        }),
       };
 
       const result = await applyFleet(manifest, manifestPath, PRIOR_LOCK_TWO_AGENTS, deps);
@@ -2999,18 +3048,20 @@ trust:
             mintCalled = true;
             throw new Error('must not be called — a routing_client_key fingerprint is already recorded');
           },
-          // BOTH repos (the agent repo AND the control repo) already hold
-          // the secrets — the steady state on a SECOND `apply` run against
-          // an otherwise-unchanged fleet.
+          // readVaultRoutingClient deliberately OMITTED — nothing needs
+          // restoring; every repo already has the secret, so `create` is
+          // never even reached (`publishRoutingSecrets`'s doc: the
+          // presence check runs BEFORE `create` would need material).
+        },
+        routingSecretsDeps: routingSecretsDepsFor({
+          // Every secret, on every repo (the agent repo AND the control
+          // repo), already exists — the steady state on a SECOND `apply`
+          // run against an otherwise-unchanged fleet.
           checkRepoSecretPresence: async () => 'present',
           setRepoSecret: async (repo, name, value) => {
             setSecretCalls.push({ repo, name, value });
           },
-          // readVaultRoutingClient deliberately OMITTED — nothing needs
-          // restoring; every repo already has the secret, so `create` is
-          // never even reached (`publishRoutingClientSecrets`'s doc: the
-          // presence check runs BEFORE `create` would need material).
-        },
+        }),
       };
 
       const result = await applyFleet(manifest, manifestPath, priorLockAlreadyMinted, deps);
@@ -3033,7 +3084,7 @@ trust:
       expect(applyExitCode(result)).toBe(0);
     });
 
-    it('never-minted-at-all fleets (no prior routing_client_key fingerprint) keep the ORIGINAL blanket-skip behaviour, byte-identical — this is NOT the #986 case', async () => {
+    it('groundnuty/macf#1074 — never-minted-at-all fleets now get a LOUD per-repo presence check too, never the OLD blanket "skipped, exit 0"; a repo genuinely missing the secret fails the run (the exact "green check, dead fleet" gap #1074 closes)', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT]);
       const priorLockNoRoutingClient: FleetLock = {
@@ -3051,31 +3102,39 @@ trust:
         trustDeps: reuseCaTrustDeps(),
         routingClientDeps: {
           mint: async () => { throw new Error('must not be called — CA was reused, not minted, this run'); },
+        },
+        routingSecretsDeps: routingSecretsDepsFor({
           checkRepoSecretPresence: async () => {
             presenceChecked = true;
             return 'absent';
           },
-          setRepoSecret: async () => { throw new Error('must not be called'); },
-        },
+          setRepoSecret: async () => { throw new Error('must not be called — no material to publish'); },
+        }),
       };
 
       const result = await applyFleet(manifest, manifestPath, priorLockNoRoutingClient, deps);
 
       expect(result.routingClient.mint.status).toBe('skipped');
-      // Byte-identical to pre-#986: a blanket skip, no per-repo presence
-      // check even attempted — there is genuinely nothing anywhere (no fresh
-      // mint, no vaulted prior mint) that could ever be published.
-      expect(presenceChecked).toBe(false);
-      expect(result.routingClient.certLegs['groundnuty/demo-code']?.status).toBe('skipped');
-      // A literal substring pin (NOT a self-referential compare against
-      // `result.routingClient.mint.reason` — a drift in both places at once
-      // could otherwise pass) — this is `mintRoutingClient`'s exact
-      // "no CA minted this run" skip text.
-      if (result.routingClient.certLegs['groundnuty/demo-code']?.status === 'skipped') {
+      // groundnuty/macf#1074: the unified six-secret publisher ALWAYS checks
+      // presence per (repo, name) — "unavailable" only forecloses the
+      // create branch, it never skips the check itself (the SAME "never
+      // blanket-skip" lesson #986 already established for the
+      // prior-mint-exists case, now applied uniformly to EVERY case,
+      // including this one). A repo genuinely missing
+      // ROUTING_CLIENT_CERT/KEY is unroutable regardless of WHY the value
+      // is unavailable this run — reporting it as a benign 'skipped' would
+      // be exactly the "green check, dead fleet" gap this issue closes.
+      expect(presenceChecked).toBe(true);
+      expect(result.routingClient.certLegs['groundnuty/demo-code']?.status).toBe('failed');
+      if (result.routingClient.certLegs['groundnuty/demo-code']?.status === 'failed') {
+        // `mintRoutingClient`'s exact "no CA minted this run" skip text,
+        // now surfacing as the FAILURE reason rather than a skip reason.
         expect(result.routingClient.certLegs['groundnuty/demo-code'].reason).toMatch(/was not freshly minted/);
       }
-      // This orthogonal, pre-existing steady state must NOT fail the run:
-      expect(applyExitCode(result)).toBe(0);
+      // A repo confirmed to lack a secret its router requires is a FAILING
+      // run — never a silent green exit (groundnuty/macf#1074's core
+      // requirement).
+      expect(applyExitCode(result)).toBe(1);
     });
   });
 
@@ -3381,6 +3440,8 @@ trust:
           mint: async () => {
             throw new Error('must not be called');
           },
+        },
+        routingSecretsDeps: {
           checkRepoSecretPresence: async () => {
             throw new Error('must not be called');
           },
@@ -3388,6 +3449,7 @@ trust:
             throw new Error('must not be called');
           },
         },
+        routerAppVaultDeps: {},
         now: () => new Date('2026-08-11T00:00:00.000Z'),
         log: () => {},
       };

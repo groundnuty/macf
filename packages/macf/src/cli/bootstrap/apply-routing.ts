@@ -39,7 +39,7 @@
  * with an explicit reason (including an org-admin handover when a runner
  * exists but the repo is excluded from its group) — when no usable runner is
  * confirmed registered. This is the SAME "never silently skip" surface
- * `apply-ca.ts::skippedCaPublish` / `apply-routing-client.ts::skippedRoutingClientPublish`
+ * `apply-ca.ts::skippedCaPublish` / `apply-routing-secrets.ts::skippedRoutingSecretsPublish`
  * already use for "never attempted this run," so the gap renders visibly in
  * `formatApplyResult`'s routing summary (`formatVariableLegLine`'s
  * `'skipped'` branch) — including under `--yes`, which skips the

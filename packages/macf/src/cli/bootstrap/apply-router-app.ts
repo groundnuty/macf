@@ -87,7 +87,7 @@ import { deriveAppHandle } from './fleet-manifest.js';
 import type { GitHubAppManifest } from './app-manifest.js';
 import { buildAppManifest } from './app-manifest.js';
 import type { ConfirmedInstall } from './identity-confirm.js';
-import type { IdentityRequest } from './apply-agent.js';
+import type { AgentApplyOutcome, IdentityRequest } from './apply-agent.js';
 
 /**
  * The reserved `role` this App is derived + recorded under — never declared
@@ -239,4 +239,112 @@ export function validateRouterAppInstall(install: ConfirmedInstall): string | un
     'export-class; an unnecessarily broad install widens what every repo secret it is copied into can reach). ' +
     "Correct the installation's repository access on GitHub, then re-run apply."
   );
+}
+
+// --- Publish-time resolution (groundnuty/macf#1074) ---
+//
+// Mirrors `apply-routing-client.ts`'s mint/vault-restore split for the
+// SAME reason: a value only exists in process memory on the run that just
+// created it (gate 1's `AppCredentials.pem`); any OTHER run needs to read
+// it back from the vault. `MACF_ROUTING_APP_ID`/`MACF_ROUTING_APP_KEY`'s
+// two-secret bag joins `apply-routing-secrets.ts::publishRoutingSecrets`'s
+// six-value assembly via this resolution, never a second publisher.
+
+export interface RouterAppVaultRestoreDeps {
+  /**
+   * The vault-restore fallback for the router App's key, when this run's
+   * `AgentApplyOutcome` for role `router` is `'reused'`/`'resumed-install'`
+   * (no PEM in process memory — only a fresh gate-1 exchange ever produces
+   * one). Mirrors `apply-routing-client.ts::RoutingClientVaultRestoreDeps.
+   * readVaultRoutingClient`'s contract exactly: `undefined` (the field
+   * omitted) means "vault-aware restore is NOT engaged this run" (the
+   * byte-identical degrade every sibling vault-restore closure uses when
+   * `--vault`/`--identity-key` weren't both supplied).
+   *
+   * **Contract: NEVER throws.** Any decrypt/parse failure MUST resolve to
+   * `undefined` — the same honest-unknown-over-false-present floor every
+   * other vault-restore closure in this codebase establishes.
+   *
+   * **Contract: never logs.** Returns only the id/PEM or `undefined`, never
+   * a side-channel diagnostic.
+   */
+  readonly readVaultRouterApp?: () => Promise<{ readonly appId: string; readonly appKeyPem: string } | undefined>;
+}
+
+/** What a publish attempt has to work with for the router App's TWO secrets — mirrors `apply-routing-client.ts::RoutingClientSecretsForPublish`'s shape exactly (`'unavailable'` is an honest gap, Amendment A4, never a fabricated credential). */
+export type RouterAppSecretsForPublish =
+  | { readonly status: 'available'; readonly appId: string; readonly appKeyPem: string }
+  | { readonly status: 'unavailable'; readonly reason: string };
+
+/**
+ * Resolve the router App's id/key for THIS run's publish attempt from
+ * `identity` (this run's `AgentApplyOutcome` for role `router`) — never
+ * calls a mint/create seam (there is none here; App creation is
+ * `applyIdentity`'s job, already run before this).
+ *
+ * - `'created'` THIS run: the credential is in process memory
+ *   (`identity.credentials.pem`) — available UNLESS `vaultWritten` is
+ *   `false`, in which case this is the SAME ordering-safety refusal
+ *   `apply-routing-client.ts`'s mint-gating applies to a freshly-minted
+ *   routing-client key: deploying an export-class key before its ONLY
+ *   canonical-vault copy is durable would recreate the #799 orphan-cert
+ *   class if the vault write is later retried and this run's App entry is
+ *   never recorded in `fleet.lock` (the recovery artifact softens but does
+ *   not eliminate this — see `apply-agent.ts`'s "gate-1→gate-2 window" doc
+ *   for why the SAME discipline applies there too).
+ * - `'reused'`/`'resumed-install'`: no PEM in process memory — tries
+ *   `deps.readVaultRouterApp` (wired only when both `--vault`/
+ *   `--identity-key` were supplied); degrades to `'unavailable'` with an
+ *   honest reason otherwise.
+ * - `'skipped-unverified'`/`'drift'`/`'failed'`: unresolved this run —
+ *   `'unavailable'`, carrying the identity outcome's own reason.
+ */
+export async function resolveRouterAppSecretsForPublish(
+  identity: AgentApplyOutcome,
+  vaultWritten: boolean,
+  deps: RouterAppVaultRestoreDeps,
+): Promise<RouterAppSecretsForPublish> {
+  if (identity.status === 'created') {
+    if (!vaultWritten) {
+      return {
+        status: 'unavailable',
+        reason:
+          'router App was freshly created this run but the batched vault write did not succeed — refusing to ' +
+          'deploy its private key to any repo until it is durable (DR-043 §D5). Re-run apply once the vault issue ' +
+          'is fixed; the App itself already exists on GitHub and is NOT re-created on retry.',
+      };
+    }
+    return { status: 'available', appId: identity.appId, appKeyPem: identity.credentials.pem };
+  }
+  if (identity.status === 'reused' || identity.status === 'resumed-install') {
+    if (deps.readVaultRouterApp !== undefined) {
+      let restored: { readonly appId: string; readonly appKeyPem: string } | undefined;
+      try {
+        restored = await deps.readVaultRouterApp();
+      } catch {
+        restored = undefined;
+      }
+      if (restored !== undefined) {
+        return { status: 'available', appId: restored.appId, appKeyPem: restored.appKeyPem };
+      }
+      return {
+        status: 'unavailable',
+        reason:
+          'router App exists on GitHub (a prior run confirmed it) but a vault-restore was attempted ' +
+          '(--vault/--identity-key were both supplied) and did not yield its key — check the vault actually holds ' +
+          'MACF_ROUTING_APP_ID/MACF_ROUTING_APP_KEY_B64 for this fleet.',
+      };
+    }
+    return {
+      status: 'unavailable',
+      reason:
+        'router App exists on GitHub (a prior run confirmed it) but its key is not in process memory this run. ' +
+        'Supply both --vault and --identity-key to `macf bootstrap apply` so it can be read back from the vault ' +
+        'and published to any repo that does not yet have it.',
+    };
+  }
+  return {
+    status: 'unavailable',
+    reason: `router App identity is unresolved this run (${identity.status}${identity.reason !== undefined ? `: ${identity.reason}` : ''}).`,
+  };
 }

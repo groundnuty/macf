@@ -197,20 +197,24 @@ export function controlRepoCarriesRouter(outcome: ControlRepoInitOutcome | { rea
 
 /**
  * The publish target set for anything the router job itself needs (today:
- * ONLY the routing-client mTLS secrets — `apply-fleet.ts`'s call site) —
- * every agent repo CONFIRMED to exist this run, plus the control repo IF
- * (and only if) {@link controlRepoCarriesRouter}. Pure — no I/O, just
- * combines two already-computed facts.
+ * all six routing secrets — `apply-fleet.ts`'s call site, feeding
+ * `apply-routing-secrets.ts::publishRoutingSecrets`; groundnuty/macf#1074
+ * generalized the ONE caller of this function from two secrets to six,
+ * reusing this SAME target-set derivation rather than building a second
+ * one) — every agent repo CONFIRMED to exist this run, plus the control
+ * repo IF (and only if) {@link controlRepoCarriesRouter}. Pure — no I/O,
+ * just combines two already-computed facts.
  *
  * groundnuty/macf#1071 — this IS the fix's decisive derivation: the OLD
  * code passed the confirmed-agent-repo list alone to
- * `publishRoutingClientSecrets` (`apply-routing-client.ts`), an implicit
- * "agent repos only" assumption. That assumption is exactly what let the
- * control repo — a NEW router-carrying repo added by #1057/#1070 — stay
- * outside every per-repo publish loop no matter how many times `apply`
- * re-ran: nothing was hand-maintaining an "also target the control repo"
- * case, because nothing derived the target set FROM router-carrying-ness
- * in the first place.
+ * `publishRoutingClientSecrets` (`apply-routing-client.ts`, since retired
+ * by #1074 — see `apply-routing-secrets.ts`), an implicit "agent repos
+ * only" assumption. That assumption is exactly what let the control repo —
+ * a NEW router-carrying repo added by #1057/#1070 — stay outside every
+ * per-repo publish loop no matter how many times `apply` re-ran: nothing
+ * was hand-maintaining an "also target the control repo" case, because
+ * nothing derived the target set FROM router-carrying-ness in the first
+ * place.
  */
 export function deriveRouterCarryingRepos(
   confirmedAgentRepos: readonly string[],

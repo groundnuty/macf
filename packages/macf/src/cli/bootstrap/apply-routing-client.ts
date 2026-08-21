@@ -46,25 +46,31 @@
  * "never re-mint" contract) — tries `deps.readVaultRoutingClient` (wired only
  * when the operator supplied BOTH `--vault`/`--identity-key`, mirroring
  * `CaMintDeps.readVaultCaCert`'s opt-in contract) to recover the ALREADY-
- * minted cert/key pair from the vault so {@link publishRoutingClientSecrets}
- * can create-only-deploy it to a repo the fleet gained AFTER the original
+ * minted cert/key pair from the vault so the publish step (below) can
+ * create-only-deploy it to a repo the fleet gained AFTER the original
  * mint — the exact "add a second agent" reproduction #986 reports. The bug
  * this fixes: the OLD code folded "no fresh key in process memory this run"
  * into "skip publishing to EVERY repo, including ones this run just
  * confirmed" — treating "already minted" as "already published everywhere,"
- * which are different facts. {@link publishRoutingClientSecrets} now ALWAYS
- * runs its per-repo idempotent create-only loop (repos already holding the
- * secret report `'already-present'` without ever touching `secrets`; repos
- * missing it need `secrets.status === 'available'` or the leg reports a
- * loud `'failed'` — see that function's doc) — the ONLY case that still
- * skips the loop entirely is a FRESH mint whose vault write hasn't durably
- * landed yet (the pre-existing `apply-fleet.ts` ordering-safety gate, kept
- * byte-identical).
+ * which are different facts.
+ *
+ * **The PUBLISH half moved to `apply-routing-secrets.ts` (groundnuty/
+ * macf#1074).** This module used to also own `publishRoutingClientSecrets`
+ * — a per-repo idempotent create-only loop for JUST
+ * `ROUTING_CLIENT_CERT`/`ROUTING_CLIENT_KEY`, two of the six secrets
+ * `agent-router.yml` actually requires (groundnuty/macf#1074: "the fleet
+ * routes" needed all six through ONE publisher, never two). That function
+ * is RETIRED; `resolveRoutingClientSecretsForPublish`'s result
+ * (`RoutingClientSecretsForPublish`) now feeds one of the six
+ * `RoutingSecretResolution` entries `apply-fleet.ts` assembles for
+ * `apply-routing-secrets.ts::publishRoutingSecrets` — same per-repo
+ * idempotent-loop contract (repos already holding a secret report
+ * `'already-present'`; repos missing one whose resolution is
+ * `'unavailable'` report a loud `'failed'`), just emitting all six names
+ * instead of two. See that module's doc for the full publish contract —
+ * including a live base64-encoding bug this move fixed.
  */
 import { spawn } from 'node:child_process';
-import type { Presence } from './plan.js';
-import type { EnsureVariableDeps, EnsureVariableOutcome } from './ensure-variable.js';
-import { ensureVariableCreated, skippedOutcomesFor } from './ensure-variable.js';
 import { mintRoutingClientCert } from '../commands/certs.js';
 
 /** `ROUTING_CLIENT_CERT` / `ROUTING_CLIENT_KEY` — the GitHub Actions secret names `certs.ts::issueRoutingClient` already documents pasting into a consumer repo's secrets (macf#800's blast-radius warning). Reused verbatim so the interactive-CLI and `apply`-driven paths deploy under the identical names. */
@@ -270,111 +276,26 @@ export async function resolveRoutingClientSecretsForPublish(
   return { status: 'unavailable', reason: `${mint.reason}${vaultHint}` };
 }
 
-// --- Publish (create-only, per-repo GitHub Actions secrets) ---
-
-export interface RoutingClientPublishDeps {
-  readonly checkRepoSecretPresence: (repo: string, name: string) => Promise<Presence>;
-  readonly setRepoSecret: (repo: string, name: string, value: string) => Promise<void>;
-}
-
-export interface RoutingClientPublishResult {
-  readonly certLegs: Readonly<Record<string, EnsureVariableOutcome>>;
-  readonly keyLegs: Readonly<Record<string, EnsureVariableOutcome>>;
-}
-
-/**
- * Create-only per-repo deploy of a routing-client cert/key pair — ALWAYS
- * runs the presence-check-then-maybe-create loop for EVERY given repo,
- * regardless of whether `secrets` is `'available'` (groundnuty/macf#986:
- * this is the fix — minting is fleet-scoped, but publishing is per-repo, so
- * a repo already holding the secret must report `'already-present'` and a
- * repo missing it must be actioned, INDEPENDENTLY of whether this run has
- * fresh key material in memory). Reuses `ensure-variable.ts::ensureVariableCreated`
- * verbatim — its `EnsureVariableDeps` shape (`checkPresence` + `create`
- * returning `'created'|'exists'`) is generic enough for a secret leg too:
- * `create` here NEVER returns `'exists'` (secrets have no distinguishable
- * "the API itself reported a duplicate" response the way a variable's 409
- * does — see `observer.ts::checkRepoSecretPresence`'s doc), which is fine —
- * `ensureVariableCreated` only inspects that branch when `checkPresence`
- * returned `'unknown'`, and the un-atomicity between the presence check and
- * the write is the SAME accepted, documented gap `apply-ca.ts`/
- * `ensure-variable.ts` already carry for an operator-driven, non-concurrent
- * bootstrap tool.
- *
- * **`secrets.status === 'unavailable'` is NOT a reason to skip the loop —
- * it only forecloses the `create` branch.** `checkPresence` runs
- * regardless, so a repo that already has the secret (from an earlier apply
- * run, or a manual `gh secret set`) reports `'already-present'` exactly as
- * it would with fresh material in hand; `create` is only ever REACHED for a
- * repo actually missing the secret, and there it throws `secrets.reason`
- * verbatim — `ensureVariableCreated` folds that into a `'failed'` leg
- * carrying the label + the honest-unavailable reason. This is the "genuine
- * `unknown`, reported LOUDLY, never a silent skip" contract #986 asks for:
- * a `'failed'` leg fails `apply`'s exit code (`commands/bootstrap-apply.ts::
- * applyExitCode`'s `routingClientBad`), unlike the OLD blanket `'skipped'`
- * this replaced, which reported "nothing attempted" for repos that were, in
- * fact, missing routable credentials.
- *
- * `keyPem` is SECRET (when `secrets.status === 'available'`) — this
- * function never logs it, never includes it in a thrown message (a
- * `setRepoSecret` failure's error text comes from `gh`'s OWN stderr, which
- * never echoes stdin-piped input — see `realSetRepoSecret`'s doc), and
- * never returns it in `RoutingClientPublishResult` (which carries only
- * `EnsureVariableOutcome`s — status/reason strings, no value field exists
- * to leak into).
- */
-export async function publishRoutingClientSecrets(
-  secrets: RoutingClientSecretsForPublish,
-  repos: readonly string[],
-  deps: RoutingClientPublishDeps,
-): Promise<RoutingClientPublishResult> {
-  const certLegs: Record<string, EnsureVariableOutcome> = {};
-  const keyLegs: Record<string, EnsureVariableOutcome> = {};
-  for (const repo of repos) {
-    const certDeps: EnsureVariableDeps = {
-      checkPresence: () => deps.checkRepoSecretPresence(repo, ROUTING_CLIENT_CERT_SECRET_NAME),
-      create: async () => {
-        if (secrets.status !== 'available') throw new Error(secrets.reason);
-        await deps.setRepoSecret(repo, ROUTING_CLIENT_CERT_SECRET_NAME, secrets.certPem);
-        return 'created';
-      },
-    };
-    certLegs[repo] = await ensureVariableCreated(certDeps, `routing-client secret "${ROUTING_CLIENT_CERT_SECRET_NAME}" on "${repo}"`);
-
-    const keyDeps: EnsureVariableDeps = {
-      checkPresence: () => deps.checkRepoSecretPresence(repo, ROUTING_CLIENT_KEY_SECRET_NAME),
-      create: async () => {
-        if (secrets.status !== 'available') throw new Error(secrets.reason);
-        await deps.setRepoSecret(repo, ROUTING_CLIENT_KEY_SECRET_NAME, secrets.keyPem);
-        return 'created';
-      },
-    };
-    keyLegs[repo] = await ensureVariableCreated(keyDeps, `routing-client secret "${ROUTING_CLIENT_KEY_SECRET_NAME}" on "${repo}"`);
-  }
-  return { certLegs, keyLegs };
-}
-
-/**
- * The `RoutingClientPublishResult` shape for "never attempted this run" —
- * mirrors `apply-ca.ts::skippedCaPublish`. Pure. Used by `apply-fleet.ts`
- * for exactly the cases where NOTHING could ever be published this run
- * (never a per-repo attempt, not even a presence check): a fresh mint whose
- * vault write hasn't durably landed yet (ordering safety), a fleet where
- * NOTHING has ever been minted (`!lockHasRoutingClientKey`), or a genuine
- * mint exception (groundnuty/macf#954). **NOT** used for the
- * `lockHasRoutingClientKey === true` case (a PRIOR run already minted this
- * fleet's cert) — that path runs `publishRoutingClientSecrets`'s per-repo
- * idempotent loop instead (groundnuty/macf#986), because a repo added
- * since that prior mint needs an actual per-repo answer, not a blanket
- * "nothing attempted."
- */
-export function skippedRoutingClientPublish(repos: readonly string[], reason: string): RoutingClientPublishResult {
-  return { certLegs: skippedOutcomesFor(repos, reason), keyLegs: skippedOutcomesFor(repos, reason) };
-}
+// --- Publish: RETIRED (groundnuty/macf#1074) ---
+//
+// `publishRoutingClientSecrets`/`skippedRoutingClientPublish`/
+// `RoutingClientPublishDeps`/`RoutingClientPublishResult` used to live here,
+// publishing ONLY `ROUTING_CLIENT_CERT`/`ROUTING_CLIENT_KEY` — two of the
+// six secrets `agent-router.yml` actually requires. #1074 folds ALL SIX
+// into ONE publisher (`apply-routing-secrets.ts::publishRoutingSecrets`,
+// the task's explicit "not a second publisher" constraint) and — in the
+// same move — fixes a live encoding bug: this module's old publish function
+// passed raw PEM text where the router job's `base64 -d` expects base64
+// (see `apply-routing-secrets.ts`'s module doc for the full incident).
+// `RoutingClientSecretsForPublish` (the type this module's MINT/RESOLVE
+// half still produces, below) is now consumed by `apply-fleet.ts` to build
+// ONE OF the six `RoutingSecretResolution` entries it passes to
+// `publishRoutingSecrets` — the resolution logic here is UNCHANGED; only
+// the emission moved.
 
 // --- Combined deps (what `apply-fleet.ts` actually wires) ---
 
-export interface RoutingClientApplyDeps extends RoutingClientMintDeps, RoutingClientPublishDeps, RoutingClientVaultRestoreDeps {}
+export interface RoutingClientApplyDeps extends RoutingClientMintDeps, RoutingClientVaultRestoreDeps {}
 
 // --- Real deps ---
 
