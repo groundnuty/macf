@@ -2,9 +2,12 @@
 #
 # check-mention-routing.sh — Claude Code PreToolUse hook that blocks
 # `gh issue comment` / `gh pr comment` / `gh issue close --comment` /
-# `gh pr close --comment` invocations when the `--body` content contains
-# raw `@macf-<role>-agent[bot]` mentions in describing contexts (mid-line,
-# not backticked). Implements `mention-routing-hygiene.md` §5 structurally.
+# `gh pr close --comment` / `gh issue create` / `gh pr create` invocations
+# when the body content contains raw `@macf-<role>-agent[bot]` mentions in
+# describing contexts (mid-line, not backticked) — Check B — or, for a
+# routed `create`, carries none at all — Check A. Implements
+# `mention-routing-hygiene.md` §5 + `coordination.md` §Communication 1
+# structurally.
 #
 # Hook contract: JSON on stdin, exit 0 = allow, exit 2 = block (stderr
 # is fed back to Claude as the error). Mirrors the shape of #140's
@@ -14,8 +17,51 @@
 # cases the heuristic catches; rare per the canonical rule's structure
 # but mirrors check-gh-token.sh's escape hatch).
 #
+# ── `create` coverage (groundnuty/macf#1091) ──────────────────────────────
+# Check B (must-not-leak) applies to `gh issue create` / `gh pr create`
+# bodies unconditionally — a describing-context leak fires false-positive
+# routing regardless of the creator's intent.
+#
+# Check A (must-have-mention) does NOT apply unconditionally to `create` —
+# `delegation-template.md`'s canonical Backlog mode ("Route this now or
+# backlog?") deliberately files an issue unassigned and unmentioned, and a
+# guard that punished that workflow would be hostile to the rule it exists
+# to protect. Three cases, discriminated by the create's `--label`/`-l`
+# values against THIS repo's actual routing-label registry
+# (`.github/agent-config.json`'s `.agents` keys — the file `macf repo-init`
+# writes and the router reads; never a hardcoded role list, since fleets
+# choose their own):
+#   1. no assignee label at all           → backlog, ALLOW, no mention needed
+#   2. assignee label names ANOTHER agent → route-by-label already delivers
+#                                            it; mention optional, ALLOW
+#   3. assignee label names the ACTING agent itself (self-label) → route-
+#      by-label is a no-op (it "delivers" to the author) — a mention is the
+#      ONLY path to anyone else, so Check A REQUIRES one
+# Case 3 is the failure this hook exists to catch: groundnuty/macf#1088 was
+# filed self-labeled `code-agent`, route-by-label reported SUCCESS (routed
+# to the filer), route-by-mention had nothing to match, and the blocking
+# design question sat unanswered for 11 minutes until a follow-up comment
+# finally carried a mention. "Delivered to the person who wrote it" is
+# indistinguishable from silently undelivered without this check — same
+# silent-fallback shape as Instance 12 (a defense that validates a narrower
+# surface than the rule it enforces).
+#
+# Self-identity for case 3 comes from `$MACF_ROUTING_LABEL` (canonical,
+# always-exported by claude.sh's env.identity — coordination.md's tmux
+# launch-pattern section documents it as the routing/registry/cert-CN key,
+# distinct from the OTEL display name `$MACF_AGENT_NAME`). If it's unset
+# (workspace without full macf init), the hook can't tell self from peer —
+# fallback per design review: require a mention whenever ANY assignee label
+# is present, accepting harmless friction on the names-someone-else case
+# (already delivered by route-by-label) in exchange for never missing case
+# 3. If `.github/agent-config.json` itself is unavailable, no registry
+# means no label can be classified as an assignee label at all — Check A
+# doesn't apply (same fail-open-on-infrastructure-absence posture as the
+# rest of this hook family; a create in that state is treated as backlog).
+#
 # Refs: groundnuty/macf#244 (must-have-mention class — orthogonal, deferred),
 #       groundnuty/macf#272 (must-not-leak — what this script enforces),
+#       groundnuty/macf#1091 (this `create` extension),
 #       DR-023 UC-4 (bash-form per substrate-compat — mcp_tool variant
 #       won't fire on substrate workspaces where the macf-agent MCP server
 #       isn't loaded, but the breach pattern is concentrated on substrate).
@@ -32,7 +78,7 @@ fi
 INPUT_JSON="$(cat)"
 COMMAND="$(jq -r '.tool_input.command // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
 
-# Wrapper-aware match for the comment-posting subcommands. Mirrors
+# Wrapper-aware match for the body-carrying subcommands. Mirrors
 # check-gh-token.sh's pattern shape — covers sudo, env VAR=, watch,
 # ionice, setsid, nice, time prefix wrappers + chained-form leadins
 # `;` `|` `&`. The subcommands we care about are exactly those that
@@ -40,14 +86,15 @@ COMMAND="$(jq -r '.tool_input.command // ""' <<<"$INPUT_JSON" 2>/dev/null || ech
 #   gh issue comment    gh pr comment
 #   gh issue close      gh pr close      (only when --comment is present;
 #                                          plain close has no body)
-GH_COMMENT_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|watch[[:space:]]+|ionice[[:space:]]+|setsid[[:space:]]+|nice[[:space:]]+|time[[:space:]]+|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close)([[:space:]]|$)'
+#   gh issue create      gh pr create    (groundnuty/macf#1091)
+GH_COMMENT_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|watch[[:space:]]+|ionice[[:space:]]+|setsid[[:space:]]+|nice[[:space:]]+|time[[:space:]]+|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create)([[:space:]]|$)'
 
 # Shell-wrapper bypass: catches `bash -c "gh issue comment ..."` and
 # variants. Same flag-handling logic as check-gh-token.sh.
-SHELL_C_GH_COMMENT_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+[^[:space:]].*gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close)([[:space:]]|$)'
+SHELL_C_GH_COMMENT_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+[^[:space:]].*gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create)([[:space:]]|$)'
 
 if [[ ! "$COMMAND" =~ $GH_COMMENT_PATTERN ]] && [[ ! "$COMMAND" =~ $SHELL_C_GH_COMMENT_PATTERN ]]; then
-  # Not a comment-posting command — allow.
+  # Not a body-carrying command — allow.
   exit 0
 fi
 
@@ -69,6 +116,110 @@ fi
 IS_CLOSE_SUBCOMMAND=false
 if [[ "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+close ]]; then
   IS_CLOSE_SUBCOMMAND=true
+fi
+
+# ── `create`-subcommand + assignee-label discriminator (macf#1091) ────────
+# See the file-header "`create` coverage" section for the full 3-case
+# rationale. Computed here (before the --body-file dispatch below) because
+# the branch-3 warning also needs to know whether Check A applies.
+IS_CREATE_SUBCOMMAND=false
+if [[ "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+create ]]; then
+  IS_CREATE_SUBCOMMAND=true
+fi
+
+# Extracts every --label/-l VALUE (comma-split, one wrapping-quote layer
+# stripped) from a gh command string. Prints one label per line. Single-
+# token match only — assignee labels are always single hyphenated words in
+# this framework (`code-agent`, `science-agent`, ...) — same simplifying
+# assumption the --body-file extraction below already makes for its own
+# no-embedded-space args. Mirrors macf_resolve_path_vars's match-advance
+# loop shape (bounded by a guard counter, never `eval`).
+macf_extract_labels() {
+  local cmd="$1"
+  local pattern='(--label|-l)(=|[[:space:]]+)([^[:space:]]+)'
+  local rest="$cmd" guard=0
+  while [[ "$rest" =~ $pattern ]] && [[ "$guard" -lt 50 ]]; do
+    guard=$((guard + 1))
+    local raw="${BASH_REMATCH[3]}"
+    raw="${raw%\"}"; raw="${raw#\"}"
+    raw="${raw%\'}"; raw="${raw#\'}"
+    local whole="${BASH_REMATCH[0]}"
+    local prefix="${rest%%"$whole"*}"
+    local -a toks=()
+    IFS=',' read -r -a toks <<<"$raw"
+    local tok
+    for tok in "${toks[@]}"; do
+      [[ -n "$tok" ]] && printf '%s\n' "$tok"
+    done
+    rest="${rest#"${prefix}${whole}"}"
+  done
+}
+
+# CREATE_HAS_ASSIGNEE_LABEL: at least one --label/-l value matches this
+# repo's routing-label registry (case 1 vs. cases 2/3).
+# CREATE_SELF_LABELED: a matched value equals $MACF_ROUTING_LABEL — the
+# acting agent's own routing label (case 3), OR self-identity is unknown
+# (conservative fallback: require a mention whenever ANY assignee label is
+# present rather than silently assume "names someone else").
+# CREATE_MATCHED_LABELS: matched labels, for the block message.
+# CREATE_SELF_IDENTITY_UNKNOWN: true when CREATE_SELF_LABELED fired via the
+# unknown-identity fallback rather than a genuine $MACF_ROUTING_LABEL match
+# — kept separate purely so the block message can say which is true instead
+# of asserting a match that may not exist.
+CREATE_HAS_ASSIGNEE_LABEL=false
+CREATE_SELF_LABELED=false
+CREATE_SELF_IDENTITY_UNKNOWN=false
+CREATE_MATCHED_LABELS=""
+if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
+  PROJECT_DIR="${CLAUDE_PROJECT_DIR:-}"
+  if [[ -z "$PROJECT_DIR" ]]; then
+    PROJECT_DIR="$(jq -r '.cwd // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
+  fi
+  AGENT_CONFIG_PATH="${PROJECT_DIR:+$PROJECT_DIR/.github/agent-config.json}"
+  ROUTING_LABELS=()
+  if [[ -n "$AGENT_CONFIG_PATH" ]] && [[ -f "$AGENT_CONFIG_PATH" ]] && [[ -r "$AGENT_CONFIG_PATH" ]]; then
+    # Registry keys = this fleet's actual routing labels (repo-specific;
+    # never hardcoded — see repo-init.ts, the file's writer, and the
+    # router that reads it the same way).
+    while IFS= read -r rl; do
+      [[ -n "$rl" ]] && ROUTING_LABELS+=("$rl")
+    done < <(jq -r '.agents // {} | keys[]?' "$AGENT_CONFIG_PATH" 2>/dev/null || true)
+  fi
+
+  if [[ "${#ROUTING_LABELS[@]}" -gt 0 ]]; then
+    while IFS= read -r tok; do
+      [[ -z "$tok" ]] && continue
+      for rl in "${ROUTING_LABELS[@]}"; do
+        if [[ "$tok" == "$rl" ]]; then
+          CREATE_HAS_ASSIGNEE_LABEL=true
+          CREATE_MATCHED_LABELS+="${CREATE_MATCHED_LABELS:+, }$tok"
+          if [[ -z "${MACF_ROUTING_LABEL:-}" ]]; then
+            CREATE_SELF_LABELED=true
+            CREATE_SELF_IDENTITY_UNKNOWN=true
+          elif [[ "$tok" == "${MACF_ROUTING_LABEL}" ]]; then
+            CREATE_SELF_LABELED=true
+          fi
+        fi
+      done
+    done < <(macf_extract_labels "$COMMAND")
+  fi
+fi
+
+# CHECK_A_APPLIES replaces the old close-only gate on the must-have-mention
+# check (macf#244): close subcommands never require one (self-close verify
+# is reporter-internal — see IS_CLOSE_SUBCOMMAND above); a `create` requires
+# one only in case 3 (self-labeled — see the file-header rationale); every
+# other subcommand this hook guards (comment) is unchanged — always applies.
+CHECK_A_APPLIES=true
+if [[ "$IS_CLOSE_SUBCOMMAND" == "true" ]]; then
+  CHECK_A_APPLIES=false
+elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
+  if [[ "$CREATE_HAS_ASSIGNEE_LABEL" == "false" ]]; then
+    CHECK_A_APPLIES=false  # case 1: backlog, no assignee label at all
+  elif [[ "$CREATE_SELF_LABELED" == "false" ]]; then
+    CHECK_A_APPLIES=false  # case 2: labeled at another agent — route-by-label delivers it
+  fi
+  # else: case 3 (self-labeled, or self-identity unknown + any match) — stays true
 fi
 
 # --body-file handling (groundnuty/macf#944).
@@ -273,9 +424,10 @@ if [[ "$BODY_FILE_MODE" == "true" ]] && [[ "$BODY_FILE_RESOLVED" == "false" ]]; 
   # Check A: WARN (do not block) — unlike Check B, a missing mention is
   # the exact silent-failure shape coordination.md §Communication 2 warns
   # about, so make the gap visible even though we can't prove it either
-  # way. Bypassed for close subcommands — Check A never applies to them
-  # (see IS_CLOSE_SUBCOMMAND above).
-  if [[ "$IS_CLOSE_SUBCOMMAND" == "false" ]]; then
+  # way. Bypassed wherever Check A itself doesn't apply — close
+  # subcommands (see IS_CLOSE_SUBCOMMAND above), and `create` cases 1/2
+  # (see CHECK_A_APPLIES above, macf#1091).
+  if [[ "$CHECK_A_APPLIES" == "true" ]]; then
     cat >&2 <<WARNERR
 WARNING (non-blocking) from MACF mention-routing-hygiene hook: this command
 uses --body-file "$BODY_FILE_RAW" and the hook could not resolve its
@@ -411,9 +563,10 @@ ACTIVE_COUNT="$(grep '^ACTIVE_COUNT:' <<<"$AWK_OUTPUT" | sed 's/^ACTIVE_COUNT://
 
 if [[ -n "$OFFENDING" ]]; then
   cat >&2 <<ERR
-BLOCKED by MACF mention-routing-hygiene hook: this comment contains raw
-@<bot>[bot] mention(s) in describing-context (mid-line, not backticked) which
-would fire false-positive routing per mention-routing-hygiene.md §5.
+BLOCKED by MACF mention-routing-hygiene hook: this comment/issue/PR body
+contains raw @<bot>[bot] mention(s) in describing-context (mid-line, not
+backticked) which would fire false-positive routing per
+mention-routing-hygiene.md §5.
 
 Offending line(s) within the command:
 $OFFENDING
@@ -454,17 +607,41 @@ fi
 # Bypassed for `gh (issue|pr) close --comment` — self-close verification
 # comments are canonically no-recipient (reporter-internal). The close
 # action itself signals routing-end; no addressed mention required.
-if [[ "$IS_CLOSE_SUBCOMMAND" == "false" ]] && [[ "$ACTIVE_COUNT" == "0" ]]; then
+#
+# Bypassed for `create` cases 1/2 (no assignee label; label names another
+# agent) — CHECK_A_APPLIES already folds those in (macf#1091). Fires for
+# `create` case 3 (self-labeled): route-by-label "delivers" to the author,
+# which is a no-op, so a mention is the only real path to anyone else.
+if [[ "$CHECK_A_APPLIES" == "true" ]] && [[ "$ACTIVE_COUNT" == "0" ]]; then
+  SELF_LABEL_NOTE=""
+  if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]] && [[ "$CREATE_SELF_LABELED" == "true" ]]; then
+    if [[ "$CREATE_SELF_IDENTITY_UNKNOWN" == "true" ]]; then
+      SELF_LABEL_NOTE="
+This create carries assignee label(s) from this repo's routing registry
+($CREATE_MATCHED_LABELS), but \$MACF_ROUTING_LABEL isn't set in this
+session, so the hook can't confirm whether that label names you or a peer.
+Conservative fallback: require a mention whenever ANY assignee label is
+present (groundnuty/macf#1091) — if this labels a peer and route-by-label
+already delivers it to them, the mention is redundant but harmless."
+    else
+      SELF_LABEL_NOTE="
+This create carries assignee label(s) matching the acting agent's own
+routing label ($CREATE_MATCHED_LABELS): route-by-label already \"delivers\"
+this to whoever filed it — a no-op. A mention is the only path to anyone
+else (groundnuty/macf#1091 case 3 — the shape that stranded #1088)."
+    fi
+  fi
   cat >&2 <<ERR
-BLOCKED by MACF mention-routing-hygiene hook: this comment has zero
-routing-active @<bot>[bot] mentions. Per coordination.md §Communication 2:
+BLOCKED by MACF mention-routing-hygiene hook: this comment/issue/PR body has
+zero routing-active @<bot>[bot] mentions. Per coordination.md §Communication 2:
 
   "@mention in EVERY comment. Routing depends on it. A comment without
   @mention is invisible to the recipient agent."
 
-Without a routing-active mention, the comment is silently invisible to
+Without a routing-active mention, the content is silently invisible to
 peer agents — they have no notification that you posted, even if the
 issue/PR is on their assigned-label queue.
+$SELF_LABEL_NOTE
 
 Fix: add an addressing mention naming the recipient:
   @<recipient-handle>[bot] <your message>
