@@ -189,3 +189,105 @@ export function skippedRoutingSecretsPublish(repos: readonly string[], reason: s
   for (const name of ALL_ROUTING_SECRET_NAMES) result[name] = skippedOutcomesFor(repos, reason);
   return result;
 }
+
+// --- Tailscale-declared refuse-before-gate-1 preflight (groundnuty/macf#1074) ---
+
+export const TAILSCALE_OAUTH_MISSING_CODE = 'tailscale_oauth_missing';
+
+/** The shape `commands/bootstrap-apply.ts::renderFailure` accepts — mirrors `apply-routing.ts::RunnerTokenPreflightFailure`'s doc for why this is defined locally rather than imported from a shared location (zero cross-module runtime coupling for a type this narrow). */
+export interface TailscaleOauthPreflightFailure {
+  readonly code: string;
+  readonly message: string;
+}
+
+export interface TailscaleOauthPreflightDeps {
+  /**
+   * Decrypt `vaultPath`/`identityPath` into the raw vault map — injected so
+   * this preflight is unit-testable without real `age`. Production wiring
+   * passes `vault-read.ts::readVault` verbatim. Any decrypt/parse failure
+   * MUST propagate as a thrown error (this function's own try/catch turns
+   * it into an honest refusal, never a silent pass) — same contract every
+   * other vault-restore closure in this codebase follows for its OWN
+   * internal try/catch, inverted here because a preflight's job is to
+   * REFUSE on doubt, not degrade past it.
+   */
+  readonly readVault: (opts: { readonly vaultPath: string; readonly identityPath: string }) => Promise<Readonly<Record<string, string>>>;
+}
+
+/**
+ * The groundnuty/macf#1074 ruling's refuse-before-gate-1 precedent, applied
+ * to Tailscale: "Refuse before gate 1 if declared-and-absent, per Amendment
+ * C's `age_recipients: []` refusal. Spending consent clicks on a fleet that
+ * cannot route is the waste refusal exists to prevent." Mirrors
+ * `apply-routing.ts::checkRunnerTokenPreflight`'s placement contract:
+ * `commands/bootstrap-apply.ts::runBootstrapApply` calls this immediately
+ * after the manifest parses, before ANY observe/plan-render/consent-gate
+ * work — an operator who forgot to supply Tailscale OAuth never spends a
+ * browser click and never even costs a read-only `gh` call.
+ *
+ * Three cases:
+ *   1. **Not declared** (`transport.tailscale_oauth_required` is `false`,
+ *      the default) — `undefined`. Undeclared is honest "not ready yet,"
+ *      never an error (see `apply-routing-secrets.ts`'s module doc).
+ *   2. **Declared, but `vaultPath`/`identityPath` not BOTH supplied** —
+ *      REFUSE. There is no way to verify presence without decrypting, and
+ *      per Amendment C's precedent an unverifiable declared-requirement
+ *      refuses rather than silently proceeding on a fleet that might not
+ *      be able to route.
+ *   3. **Declared, both supplied** — decrypt + check
+ *      `vaultTsOauthClientId`/`vaultTsOauthSecret` presence. Either
+ *      missing (or the decrypt itself fails) — REFUSE. Both present —
+ *      `undefined` (proceed; the publish-time resolution in
+ *      `apply-fleet.ts` reads the SAME fields again independently, per
+ *      this codebase's "each concern gets its own decrypt, not a hot
+ *      path" convention already established for CA/routing-client
+ *      restores).
+ *
+ * NEVER throws — a `deps.readVault` rejection is caught and folded into
+ * the SAME refusal case 3 already returns (the decrypt failing IS the
+ * "did not yield the values" case), never propagated as an unhandled
+ * exception that would crash `runBootstrapApply` before it can render a
+ * clean error.
+ */
+export async function checkTailscaleOauthPreflight(
+  tailscaleOauthRequired: boolean,
+  vaultPath: string | undefined,
+  identityKeyPath: string | undefined,
+  deps: TailscaleOauthPreflightDeps,
+): Promise<TailscaleOauthPreflightFailure | undefined> {
+  if (!tailscaleOauthRequired) return undefined;
+
+  if (vaultPath === undefined || identityKeyPath === undefined) {
+    return {
+      code: TAILSCALE_OAUTH_MISSING_CODE,
+      message:
+        'transport.tailscale_oauth_required is declared, but --vault/--identity-key were not both supplied, so ' +
+        `${TS_OAUTH_CLIENT_ID_SECRET_NAME}/${TS_OAUTH_SECRET_SECRET_NAME} cannot be verified present in the vault. ` +
+        'Refusing before consent gate 1 — supply both flags so the operator-supplied Tailscale OAuth credentials ' +
+        'can be confirmed, or unset transport.tailscale_oauth_required if this fleet genuinely does not need ' +
+        'Tailscale routing yet.',
+    };
+  }
+
+  const missing = (reason: string): TailscaleOauthPreflightFailure => ({
+    code: TAILSCALE_OAUTH_MISSING_CODE,
+    message:
+      `transport.tailscale_oauth_required is declared, but the vault did not yield ${TS_OAUTH_CLIENT_ID_SECRET_NAME}/` +
+      `${TS_OAUTH_SECRET_SECRET_NAME} (${reason}). Refusing before consent gate 1 — spending consent clicks on a ` +
+      'fleet that cannot route is exactly the waste this refusal exists to prevent (DR-043 Amendment C precedent). ' +
+      'Supply the operator-provided values into the vault, then re-run apply.',
+  });
+
+  try {
+    const raw = await deps.readVault({ vaultPath, identityPath: identityKeyPath });
+    const clientId = raw[TS_OAUTH_CLIENT_ID_SECRET_NAME];
+    const secret = raw[TS_OAUTH_SECRET_SECRET_NAME];
+    if (clientId === undefined || clientId.length === 0 || secret === undefined || secret.length === 0) {
+      return missing('both fields present in the manifest requirement but absent or empty in the decrypted vault');
+    }
+    return undefined;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return missing(`vault decrypt failed: ${reason}`);
+  }
+}
