@@ -61,7 +61,7 @@ import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
 import { buildTrustedActorsValue, deriveAppHandle, routerCarryingRepos } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
-import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation, VaultRouterAppObservation } from './vault-read.js';
+import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation, VaultRouterAppObservation, VaultTsOauthObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
 // macf#932 — reuse the SAME flag/env-var name constants `apply`'s own
 // pre-flight refusal names, rather than re-typing them here (this is a
@@ -292,6 +292,16 @@ export interface ObservedState {
    * presence: a SHARED-scope vault-reuse never writes a `fleet.lock` entry.
    */
   readonly vaultRouterApp?: VaultRouterAppObservation;
+  /**
+   * groundnuty/macf#1109 — the operator-supplied Tailscale OAuth pair's
+   * presence in THIS fleet's own vault, the fleet-level sibling of
+   * {@link vaultRouterApp} for the OTHER read-only-vault routing secret.
+   * `undefined` when this run had no vault access at all (same
+   * "not asked this run" convention every other optional vault-derived
+   * field above uses). Populated by `observer.ts::vaultAwareObserver`;
+   * `githubRegistryObserver` never sets it. See {@link tsOauthItem}'s doc.
+   */
+  readonly vaultTsOauth?: VaultTsOauthObservation;
 }
 
 /** Produces an `ObservedState` for a manifest. Implemented by `observer.ts`'s `githubRegistryObserver`; faked in tests. */
@@ -318,7 +328,9 @@ export type PlanItemKind =
   | 'runner_ops'
   | 'vault_recipients'
   /** groundnuty/macf#1105 — the routing App (`apply-router-app.ts`), a fleet-level identity like `'runner_ops'`, but UNCONDITIONAL: `apply-fleet.ts` reaches its ceremony for every fleet (`routerAppScope === 'shared'` is the schema default). See {@link routerAppItem}'s doc. */
-  | 'router_app';
+  | 'router_app'
+  /** groundnuty/macf#1109 — the operator-supplied Tailscale OAuth pair (`TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`), a fleet-level, read-only-vault credential like `'router_app'`'s own App id/key, but never minted — see {@link tsOauthItem}'s doc. */
+  | 'ts_oauth';
 export type PlanVerb = 'create' | 'update' | 'noop' | 'report-extra';
 
 export interface PlanItem {
@@ -634,6 +646,15 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // never a behavior change on apply's side. Produced by `presenceVerb`,
       // same 'create'-or-'noop'-only shape as 'ca'/'runner_ops' above.
       return 'implemented';
+    case 'ts_oauth':
+      // groundnuty/macf#1109 — `apply-fleet.ts` reads this fleet's vault for
+      // the pair on EVERY run (unconditional, see `apply-fleet.ts`'s doc)
+      // and publishes it through `publishRoutingSecrets` alongside the other
+      // five secrets whenever available. `tsOauthItem` only ever emits
+      // 'create' (available) or 'noop' (absent, either sub-case) — both
+      // reflect exactly what `apply` does this run, so this is 'implemented'
+      // unconditionally, same shape as 'router_app' immediately above.
+      return 'implemented';
   }
 }
 
@@ -658,6 +679,7 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'version':
     case 'actions_pin':
     case 'router_app':
+    case 'ts_oauth':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
@@ -667,7 +689,7 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
       // groundnuty/macf#943, 'vault_recipients' in groundnuty/macf#957,
       // 'version' in macf#1045 / DR-043 Amendment L, 'actions_pin' in
       // macf#1072 / DR-043 Amendment L extended, 'router_app' in
-      // groundnuty/macf#1105).
+      // groundnuty/macf#1105, 'ts_oauth' in groundnuty/macf#1109).
       // Kept exhaustive so a NEW `PlanItemKind` added
       // later is a compile error here, not a silent "apply covers
       // everything" false-negative.
@@ -965,6 +987,87 @@ function routerAppItem(
       '"agent-router.yml" needs to route; without it the routing plane is fully wired (workflow + client-cert ' +
       'secrets) but structurally incapable of routing. Provisioning costs 2 operator consent-gate clicks ' +
       '(App-manifest creation + install), same shape as a coordination agent App.',
+    confirm_required: false,
+  };
+}
+
+/**
+ * The Tailscale-OAuth-pair plan item (groundnuty/macf#1109) — ONE item per
+ * fleet, the read-only sibling of {@link routerAppItem}: `TS_OAUTH_CLIENT_ID`/
+ * `TS_OAUTH_SECRET` are Amendment C operator-supplied credentials (never
+ * minted), published to every router-carrying repo through the SAME unified
+ * `publishRoutingSecrets` call `routerAppItem`'s own `MACF_ROUTING_APP_*`
+ * pair goes through (`apply-fleet.ts`'s doc — "not a second path"). Disclosed
+ * here so the operator learns whether the run will actually publish them
+ * BEFORE approving the plan, rather than from a trailing "next steps" note
+ * after the fact — the groundnuty/macf#1109 defect this item closes: `apply`
+ * silently asked the operator to hand-type values that were already sitting
+ * in the vault it had just read.
+ *
+ * **Vault presence is checked UNCONDITIONALLY, regardless of
+ * `transport.tailscale_oauth_required`** — mirrors the `apply-fleet.ts` fix
+ * this same issue makes: the manifest flag only changes how loudly `apply`
+ * treats an ABSENT vault (refuse-before-gate-1 vs. an honest not-ready-yet
+ * skip); it never gates whether a PRESENT vault value gets used, and this
+ * plan item must not disagree with what `apply` actually does. `verb: 'noop'`
+ * for BOTH absent sub-cases (declared-and-absent, undeclared-and-absent) —
+ * in neither case does THIS run write these two secrets, which is what
+ * `verb` describes; the REASON text (not the verb) carries the honest
+ * "routing will not function" consequence, same "verb describes apply's
+ * action, reason carries nuance" split `routingItem`'s non-self-hosted noop
+ * branch already establishes.
+ */
+function tsOauthItem(
+  fleetName: string,
+  tailscaleOauthRequired: boolean,
+  vaultTsOauth: VaultTsOauthObservation | undefined,
+): PlanItem {
+  const target = `ts_oauth:fleet:${fleetName}:TS_OAUTH`;
+  const requirementNote = tailscaleOauthRequired
+    ? ' transport.tailscale_oauth_required is declared true on this fleet.'
+    : ' transport.tailscale_oauth_required is NOT declared on this fleet, but agent-router.yml requires this pair ' +
+      'unconditionally regardless of that flag — apply publishes it whenever the supplied vault has it, declared ' +
+      'or not, and the flag only governs how loudly an ABSENT vault is treated.';
+
+  if (vaultTsOauth === undefined || vaultTsOauth.status === 'unknown') {
+    const unknownReason = vaultTsOauth?.status === 'unknown' ? vaultTsOauth.reason : 'no --vault/--identity-key given this run';
+    return {
+      kind: 'ts_oauth',
+      target,
+      verb: 'create',
+      reason:
+        `Tailscale OAuth pair (TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET) presence could not be confirmed at plan time ` +
+        `(${unknownReason}) — treated as a create-candidate.${requirementNote} Routing will not function without ` +
+        'this pair regardless of how apply ultimately resolves it.',
+      confirm_required: false,
+    };
+  }
+
+  if (vaultTsOauth.present) {
+    return {
+      kind: 'ts_oauth',
+      target,
+      verb: 'create',
+      reason:
+        'Tailscale OAuth pair (TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET) present in the supplied vault — apply WILL ' +
+        'publish both to every router-carrying repo through the same unified six-secret publisher.' + requirementNote,
+      confirm_required: false,
+    };
+  }
+
+  return {
+    kind: 'ts_oauth',
+    target,
+    verb: 'noop',
+    reason: tailscaleOauthRequired
+      ? 'Tailscale OAuth pair ABSENT from the supplied vault though transport.tailscale_oauth_required is ' +
+        'declared true — apply will REFUSE THE ENTIRE RUN before consent gate 1. Supply the operator-provided ' +
+        'values into the vault before running apply.'
+      : 'Tailscale OAuth pair ABSENT from the supplied vault (or no vault supplied) and ' +
+        'transport.tailscale_oauth_required is not declared — apply will NOT publish these secrets this run. ' +
+        'Routing will NOT function on this fleet until TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET are supplied — ' +
+        'agent-router.yml requires this pair unconditionally; the GitHub-hosted runner cannot reach agent VMs ' +
+        'without joining the tailnet through it.',
     confirm_required: false,
   };
 }
@@ -1535,10 +1638,11 @@ function actionsVersionItem(repo: string, desired: string, observed: string | un
  * The pure §D3 three-verb reconcile. Deterministic ordering: the
  * control-repo-archived item FIRST when applicable (DR-043 Amendment G —
  * mirrors `apply-fleet.ts`'s own "control repo is step 0, before any
- * per-agent processing" ordering), then the two fleet-level identities —
+ * per-agent processing" ordering), then the three fleet-level identities —
  * `runner_ops` (conditional on `routing.runner.runs_on: self-hosted`,
- * macf#943/#1083) then `router_app` (UNCONDITIONAL, macf#1105) — then
- * per-agent items (app, repo, an agent-repo-archived item right after `repo`
+ * macf#943/#1083) then `router_app` then `ts_oauth` (both UNCONDITIONAL,
+ * macf#1105 / macf#1109) — then per-agent items (app, repo, an
+ * agent-repo-archived item right after `repo`
  * when applicable — macf#1034, the per-agent sibling of the
  * control-repo-archived item above — install, secret_fingerprint) in
  * manifest `agents[]` order, then the CA items
@@ -1579,6 +1683,14 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
   const routerAppScope: RouterAppScope = manifest.transport.router_app_scope === 'per-fleet' ? 'per-fleet' : 'shared';
   const routerAppHasLockEntry = observed.lock?.agents.some((a) => a.role === ROUTER_APP_ROLE) ?? false;
   items.push(routerAppItem(fleetName, manifest.owner.account, routerAppScope, routerAppHasLockEntry, observed.vaultRouterApp));
+
+  // groundnuty/macf#1109 — fleet-level, ordered right after `router_app`
+  // (both are the two routing secrets `apply-fleet.ts` resolves independently
+  // of the per-agent loop) — UNCONDITIONAL, unlike `runnerOps`: `apply`
+  // reads this fleet's vault for TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET on every
+  // run regardless of `transport.tailscale_oauth_required` (see
+  // `tsOauthItem`'s doc).
+  items.push(tsOauthItem(fleetName, manifest.transport.tailscale_oauth_required, observed.vaultTsOauth));
 
   for (const agent of manifest.agents) {
     const obs = observed.agents[agent.role];

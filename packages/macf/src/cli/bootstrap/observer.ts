@@ -32,9 +32,18 @@ import type {
   VaultRecipientCountResult,
   VaultRecipientsObservation,
   VaultRouterAppObservation,
+  VaultTsOauthObservation,
 } from './vault-read.js';
 import { VaultError } from './vault-write.js';
-import { queryVaultAgentPresence, queryVaultCaPresence, readVault, readVaultRecipientCount, vaultRouterAppId } from './vault-read.js';
+import {
+  queryVaultAgentPresence,
+  queryVaultCaPresence,
+  readVault,
+  readVaultRecipientCount,
+  vaultRouterAppId,
+  vaultTsOauthClientId,
+  vaultTsOauthSecret,
+} from './vault-read.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -1258,8 +1267,9 @@ export interface VaultAwareObserverDeps {
  * The BASE observation (`githubRegistryObserver`'s `lock`/`caRepos`/
  * `routingTrustedActors`/non-vault agent fields) is computed exactly as before and
  * carried through unchanged — this function ADDS `vault`/`vaultCa`/
- * `vaultRecipients`/`vaultRouterApp` (groundnuty/macf#1105), it never revises
- * anything the non-vault-aware observer already determined.
+ * `vaultRecipients`/`vaultRouterApp` (groundnuty/macf#1105) /`vaultTsOauth`
+ * (groundnuty/macf#1109), it never revises anything the non-vault-aware
+ * observer already determined.
  */
 export async function vaultAwareObserver(
   manifest: FleetManifest,
@@ -1308,6 +1318,19 @@ export async function vaultAwareObserver(
       ? { status: 'confirmed', present: vaultRouterAppId(raw) !== undefined }
       : { status: 'unknown', reason: unknownReason };
 
+  // groundnuty/macf#1109 — this fleet's own vault's Tailscale-OAuth-pair
+  // presence, the fleet-level sibling of `vaultRouterApp` immediately above.
+  // Needed so `plan.ts::tsOauthItem` can disclose "will publish" /
+  // "absent and required" BEFORE the operator approves `apply` — see that
+  // function's doc + `VaultTsOauthObservation`'s doc for why `present`
+  // requires BOTH fields. Same `raw !== undefined` gate as `vaultRouterApp`:
+  // a vault this run couldn't decrypt degrades to honest 'unknown', never a
+  // false 'absent' (Amendment A4).
+  const vaultTsOauth: VaultTsOauthObservation =
+    raw !== undefined
+      ? { status: 'confirmed', present: vaultTsOauthClientId(raw) !== undefined && vaultTsOauthSecret(raw) !== undefined }
+      : { status: 'unknown', reason: unknownReason };
+
   // DR-043 §D5 recipient-set reconciliation (macf#957) — deliberately
   // INDEPENDENT of `raw`/`doReadVault` above: the recipient STANZA COUNT
   // needs no private key at all (see `vault-read.ts`'s module doc), so this
@@ -1321,5 +1344,5 @@ export async function vaultAwareObserver(
     vaultRecipients = { status: 'unknown', reason: err instanceof VaultError || err instanceof Error ? err.message : String(err) };
   }
 
-  return { ...base, agents, vaultCa, vaultRecipients, vaultRouterApp };
+  return { ...base, agents, vaultCa, vaultRecipients, vaultRouterApp, vaultTsOauth };
 }
