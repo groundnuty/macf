@@ -203,6 +203,25 @@ export interface FleetDriver {
   readonly canonicalBranch: (agent: string) => Promise<string>;
 
   /**
+   * Diagnostic-only: a driver-specific description of WHERE `agent` was
+   * inspected — VM: the resolved absolute workspace directory; a future K8s
+   * driver: pod/namespace. `null` when `agent` could not be resolved at all
+   * (unknown agent, or — VM specifically — no workspace matches BOTH the
+   * agent's routing label AND this driver's own bound project; see
+   * `vm-driver.ts`'s `resolveTarget`). NEVER used for decision-branching
+   * (that stays on `currentBranch`/`classifyDirtyConfig`/etc. — the DR-037
+   * hard rule that nothing runtime-specific leaks above the driver line is
+   * about DECISIONS, not diagnostics) — its ONLY consumer is `rollFleet`'s
+   * pre-flight OBJECT messages (macf#1101), so an operator reading a
+   * branch/config-dirty objection can see EXACTLY which on-disk location
+   * produced it and catch a misattribution instead of trusting the agent
+   * name alone. Optional: a driver that has no meaningful "where" (or
+   * predates this field) simply omits it — callers treat the omission the
+   * same as `null`.
+   */
+  readonly resolveWorkspace?: (agent: string) => Promise<string | null>;
+
+  /**
    * Read the agent's current pane content for stall-signature matching
    * (`macf fleet resume`, DR-037 / macf#686). VM: a single `tmux capture-pane`
    * of the live session; K8s: recent pod logs. Returns `null` when the agent has

@@ -12,6 +12,9 @@ import {
   rollFleet,
   upgradeFleets,
   ROLL_TOUCHED_CONFIG_PATTERNS,
+  buildConfigDirtyMessage,
+  buildBranchSkipMessage,
+  describeInspectedWorkspace,
   type FleetDriver,
   type FleetState,
   type WorkspaceRecord,
@@ -158,6 +161,13 @@ function makeDriver(opts: {
    * explicitly configure a pin.
    */
   launchPin?: (agent: string) => string | null;
+  /**
+   * Per-agent inspected-workspace path (macf#1101) — omitted by default
+   * (mirrors a driver that doesn't implement the OPTIONAL verb at all), so
+   * every EXISTING test in this suite that doesn't configure it exercises
+   * the "driver has no `resolveWorkspace`" fallback unchanged.
+   */
+  resolveWorkspace?: (agent: string) => string | null;
 }): { driver: FleetDriver; calls: DriverCalls } {
   const calls: DriverCalls = {
     probe: 0,
@@ -257,6 +267,13 @@ function makeDriver(opts: {
       calls.readVersionPin.push(agent);
       return opts.launchPin ? opts.launchPin(agent) : null;
     },
+    // macf#1101 — omitted entirely (not even `undefined`-valued) unless the
+    // test explicitly configures it, so a test that doesn't pass
+    // `resolveWorkspace` exercises the SAME "driver doesn't implement the
+    // optional verb" path as a pre-#1101 driver fake.
+    ...(opts.resolveWorkspace
+      ? { resolveWorkspace: async (agent: string) => opts.resolveWorkspace!(agent) }
+      : {}),
   };
   return { driver, calls };
 }
@@ -471,6 +488,46 @@ describe('planFleetUpgrade', () => {
   });
 });
 
+// --- describeInspectedWorkspace / buildConfigDirtyMessage / buildBranchSkipMessage (macf#1101) ---
+
+describe('describeInspectedWorkspace (macf#1101)', () => {
+  it('renders a real path verbatim', () => {
+    expect(describeInspectedWorkspace('/w/exp-writing-agent')).toBe('/w/exp-writing-agent');
+  });
+
+  it('renders an explicit UNRESOLVED diagnostic for null — never a blank clause', () => {
+    expect(describeInspectedWorkspace(null)).toMatch(/UNRESOLVED/);
+  });
+});
+
+describe('buildConfigDirtyMessage — workspace naming (macf#1101)', () => {
+  it('names the inspected workspace when given', () => {
+    const msg = buildConfigDirtyMessage('exp-writing-agent', ['CLAUDE.md'], '/w/exp-writing-agent');
+    expect(msg).toContain('/w/exp-writing-agent');
+    expect(msg).toContain('exp-writing-agent');
+    expect(msg).toContain('CLAUDE.md');
+  });
+
+  it('reads UNRESOLVED when workspace is omitted (backward-compatible default)', () => {
+    const msg = buildConfigDirtyMessage('exp-writing-agent', ['CLAUDE.md']);
+    expect(msg).toContain('UNRESOLVED');
+  });
+});
+
+describe('buildBranchSkipMessage — workspace naming (macf#1101)', () => {
+  it('names the inspected workspace when given', () => {
+    const msg = buildBranchSkipMessage('exp-science-agent', 'fix/check-gh-token-v3-widen', 'main', '/w/exp-science-agent');
+    expect(msg).toContain('/w/exp-science-agent');
+    expect(msg).toContain('exp-science-agent');
+    expect(msg).toContain('fix/check-gh-token-v3-widen');
+  });
+
+  it('reads UNRESOLVED when workspace is omitted (backward-compatible default)', () => {
+    const msg = buildBranchSkipMessage('exp-science-agent', 'fix/x', 'main');
+    expect(msg).toContain('UNRESOLVED');
+  });
+});
+
 // --- rollFleet --------------------------------------------------------------
 
 describe('rollFleet', () => {
@@ -547,6 +604,44 @@ describe('rollFleet', () => {
     const skipEvent = events.find((e) => e.kind === 'config-dirty-skip');
     expect(skipEvent).toMatchObject({ kind: 'config-dirty-skip', agent: 'a1', files: dirtyFiles });
     expect(skipEvent && 'message' in skipEvent ? skipEvent.message : '').toContain('a1');
+  });
+
+  it('config-dirty OBJECT message + event NAME the inspected workspace (macf#1101)', async () => {
+    const dirtyFiles = ['CLAUDE.md'];
+    const { driver } = makeDriver({
+      state: mkState([]),
+      workspaces: [],
+      dirtyConfigFiles: (agent) => (agent === 'a1' ? dirtyFiles : []),
+      resolveWorkspace: (agent) => `/w/${agent}`,
+    });
+    const { verifyGreen } = makeVerify();
+    const events: UpgradeEvent[] = [];
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+      onEvent: (ev) => events.push(ev),
+    });
+    expect(res.results[0]!.detail).toContain('/w/a1');
+    const skipEvent = events.find((e) => e.kind === 'config-dirty-skip');
+    expect(skipEvent).toMatchObject({ kind: 'config-dirty-skip', agent: 'a1', workspace: '/w/a1' });
+  });
+
+  it('config-dirty OBJECT message reads UNRESOLVED when the driver has no `resolveWorkspace` at all (macf#1101)', async () => {
+    const { driver } = makeDriver({
+      state: mkState([]),
+      workspaces: [],
+      dirtyConfigFiles: (agent) => (agent === 'a1' ? ['CLAUDE.md'] : []),
+      // resolveWorkspace deliberately omitted — pins the graceful fallback
+      // for a driver that doesn't implement the optional verb.
+    });
+    const { verifyGreen } = makeVerify();
+    const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+      driver,
+      verifyGreen,
+      ...noWait,
+    });
+    expect(res.results[0]!.detail).toContain('UNRESOLVED');
   });
 
   it('--force bypasses the config-dirty OBJECT gate AND leaves the (pre-existing dirty) config surface uncommitted, not stashed', async () => {
@@ -628,6 +723,42 @@ describe('rollFleet', () => {
         current: 'feat/some-branch',
         canonical: 'main',
       });
+    });
+
+    it('branch-gate OBJECT message + event NAME the inspected workspace (macf#1101)', async () => {
+      const { driver } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        branch: (agent) => (agent === 'a1' ? 'feat/some-branch' : 'main'),
+        resolveWorkspace: (agent) => `/w/${agent}`,
+      });
+      const { verifyGreen } = makeVerify();
+      const events: UpgradeEvent[] = [];
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+        onEvent: (ev) => events.push(ev),
+      });
+      expect(res.results[0]!.detail).toContain('/w/a1');
+      const skipEvent = events.find((e) => e.kind === 'branch-skip');
+      expect(skipEvent).toMatchObject({ kind: 'branch-skip', agent: 'a1', workspace: '/w/a1' });
+    });
+
+    it('branch-gate OBJECT message reads UNRESOLVED when the driver has no `resolveWorkspace` at all (macf#1101)', async () => {
+      const { driver } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        branch: (agent) => (agent === 'a1' ? 'feat/some-branch' : 'main'),
+        // resolveWorkspace deliberately omitted.
+      });
+      const { verifyGreen } = makeVerify();
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.results[0]!.detail).toContain('UNRESOLVED');
     });
 
     it('detached HEAD / unresolvable branch (currentBranch → null) is treated as non-canonical → OBJECTS', async () => {
