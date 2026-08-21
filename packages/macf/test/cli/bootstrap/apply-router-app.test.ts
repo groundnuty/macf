@@ -12,17 +12,31 @@ import {
   ROUTER_APP_ROLE,
   ROUTER_APP_PERMISSIONS,
   ROUTER_APP_EVENTS,
+  SHARED_ROUTER_APP_HANDLE,
   deriveRouterAppHandle,
   routerAppIdentityRequest,
   buildRouterAppManifest,
   routerAppInstallRepos,
   validateRouterAppInstall,
+  resolveSharedRouterAppReuse,
+  routerAppNameCollisionMessage,
+  resolveRouterAppSecretsForPublish,
 } from '../../../src/cli/bootstrap/apply-router-app.js';
+import type { SharedRouterAppReuseDeps } from '../../../src/cli/bootstrap/apply-router-app.js';
 import { plannedAppNames, checkAppNameLengths } from '../../../src/cli/bootstrap/apply-runner-ops.js';
 import type { ConfirmedInstall } from '../../../src/cli/bootstrap/identity-confirm.js';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { RegistryConfig } from '@groundnuty/macf-core';
 
+/**
+ * `router_app_scope: 'per-fleet'` (groundnuty/macf#1082) pins every test in
+ * THIS file that doesn't care about scope (routerAppInstallRepos,
+ * validateRouterAppInstall, plannedAppNames/checkAppNameLengths) to the
+ * pre-#1082 fleet-derived handle, so their existing assertions stay
+ * byte-identical under the new 'shared' default. The dedicated
+ * `resolveSharedRouterAppReuse` / `deriveRouterAppHandle('shared')` describe
+ * blocks below construct their own scope-specific manifests directly.
+ */
 function manifestWithRegistry(fleetName: string, registry: RegistryConfig, roles: readonly string[] = ['code-agent']): FleetManifest {
   return {
     apiVersion: 'macf/v0',
@@ -30,7 +44,7 @@ function manifestWithRegistry(fleetName: string, registry: RegistryConfig, roles
     metadata: { name: fleetName },
     owner: { account: 'groundnuty', type: 'user', registry },
     network: { advertise_host: 'example.ts.net' },
-    transport: { age_recipients: ['age1operator'], tailscale_oauth_required: false },
+    transport: { age_recipients: ['age1operator'], tailscale_oauth_required: false, router_app_scope: 'per-fleet' },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents: roles.map((role) => ({ role, profile: 'x', repo: `groundnuty/${fleetName}-${role}`, deploy_path: '/x' })),
     trust: { ca: 'per-project', federated_cas: [] },
@@ -42,9 +56,18 @@ describe('ROUTER_APP_ROLE / deriveRouterAppHandle', () => {
     expect(ROUTER_APP_ROLE).toBe('router');
   });
 
-  it('handle is derived via the SAME deriveAppHandle convention every agent App / runner-ops uses — <fleet>-<role>', () => {
-    expect(deriveRouterAppHandle('macf-experiment')).toBe('macf-experiment-router');
-    expect(deriveRouterAppHandle('macf-experiment').length).toBeLessThanOrEqual(34);
+  it('per-fleet scope: handle is derived via the SAME deriveAppHandle convention every agent App / runner-ops uses — <fleet>-<role>', () => {
+    expect(deriveRouterAppHandle('macf-experiment', 'per-fleet')).toBe('macf-experiment-router');
+    expect(deriveRouterAppHandle('macf-experiment', 'per-fleet').length).toBeLessThanOrEqual(34);
+  });
+
+  it('shared scope (groundnuty/macf#1082): handle is the FIXED SHARED_ROUTER_APP_HANDLE, fleetName unused', () => {
+    expect(deriveRouterAppHandle('macf-experiment', 'shared')).toBe(SHARED_ROUTER_APP_HANDLE);
+    expect(deriveRouterAppHandle('a-totally-different-fleet', 'shared')).toBe(SHARED_ROUTER_APP_HANDLE);
+  });
+
+  it('SHARED_ROUTER_APP_HANDLE matches the DR-035 tools/macf-bootstrap skill\'s fixed name exactly (deliberate interop)', () => {
+    expect(SHARED_ROUTER_APP_HANDLE).toBe('macf-routing');
   });
 
   it('macf#943 budget criterion: role length <= "science-agent" (13), so a new role never lowers the fleet-name ceiling', () => {
@@ -92,6 +115,17 @@ describe('buildRouterAppManifest — reuses buildAppManifest, differently config
     const manifest = buildRouterAppManifest('macf-experiment', 'http://x/callback', 'https://github.com/groundnuty/macf-experiment-control');
     expect(manifest.url).toBe('https://github.com/groundnuty/macf-experiment-control');
   });
+
+  it('groundnuty/macf#1082: scope defaults to per-fleet — every pre-#1082 call site keeps the fleet-derived name unchanged', () => {
+    const manifest = buildRouterAppManifest('macf-experiment', 'http://x/callback');
+    expect(manifest.name).toBe('macf-experiment-router');
+  });
+
+  it('groundnuty/macf#1082: scope "shared" submits SHARED_ROUTER_APP_HANDLE as name, not the fleet-derived one', () => {
+    const manifest = buildRouterAppManifest('macf-experiment', 'http://x/callback', undefined, 'shared');
+    expect(manifest.name).toBe(SHARED_ROUTER_APP_HANDLE);
+    expect(manifest.name).not.toContain('macf-experiment');
+  });
 });
 
 describe('routerAppIdentityRequest', () => {
@@ -104,6 +138,13 @@ describe('routerAppIdentityRequest', () => {
       events: ROUTER_APP_EVENTS,
       installRepos: ['groundnuty/groundnuty'],
     });
+    // handleOverride omitted -> undefined, `toEqual` treats it as absent.
+    expect(req.handleOverride).toBeUndefined();
+  });
+
+  it('groundnuty/macf#1082: threads an explicit handleOverride through (the shared-scope create path)', () => {
+    const req = routerAppIdentityRequest(['groundnuty/groundnuty'], undefined, SHARED_ROUTER_APP_HANDLE);
+    expect(req.handleOverride).toBe(SHARED_ROUTER_APP_HANDLE);
   });
 });
 
@@ -184,5 +225,125 @@ describe('plannedAppNames / checkAppNameLengths — router handle joins the SAME
     const manifest = manifestWithRegistry('macf-experiment', { type: 'profile', user: 'groundnuty' }, ['code-agent']);
     const check = checkAppNameLengths(manifest);
     expect(check.ok).toBe(true);
+  });
+});
+
+// --- groundnuty/macf#1082 — shared-scope reuse decision ---
+
+const OWNER: FleetManifest['owner'] = { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } };
+
+describe('resolveSharedRouterAppReuse — vault first, name-collision second, never throws', () => {
+  it('THE DECISIVE TEST: vault carries id+key -> "reuse", and checkAppNameCollision is NEVER called (per assert-the-wrong-path.md: a throwing fake, not a call-count)', async () => {
+    const decision = await resolveSharedRouterAppReuse(OWNER, SHARED_ROUTER_APP_HANDLE, {
+      readVaultRouterApp: async () => ({ appId: '9001', appKeyPem: 'SENTINEL-SHARED-PEM' }),
+      checkAppNameCollision: async () => {
+        throw new Error('must not be called — a vault hit resolves reuse without ever asking GitHub about the name');
+      },
+    });
+    expect(decision).toEqual({ kind: 'reuse', appId: '9001' });
+  });
+
+  it('decision carries only the non-secret appId — the PEM never appears anywhere in the returned decision', async () => {
+    const decision = await resolveSharedRouterAppReuse(OWNER, SHARED_ROUTER_APP_HANDLE, {
+      readVaultRouterApp: async () => ({ appId: '9001', appKeyPem: 'SENTINEL-SHARED-PEM-MUST-NOT-LEAK' }),
+    });
+    expect(JSON.stringify(decision)).not.toContain('SENTINEL-SHARED-PEM-MUST-NOT-LEAK');
+  });
+
+  it('empty vault (readVaultRouterApp undefined) + name confirmed FREE -> "create" (the non-regression: an empty vault still creates)', async () => {
+    let collisionCalls = 0;
+    const decision = await resolveSharedRouterAppReuse(OWNER, SHARED_ROUTER_APP_HANDLE, {
+      checkAppNameCollision: async () => {
+        collisionCalls += 1;
+        return 'absent';
+      },
+    });
+    expect(decision).toEqual({ kind: 'create' });
+    expect(collisionCalls).toBe(1);
+  });
+
+  it('empty vault + name UNCONFIRMABLE (unknown) -> "create" (fail-open, same posture as every other collision pre-flight in this codebase)', async () => {
+    const decision = await resolveSharedRouterAppReuse(OWNER, SHARED_ROUTER_APP_HANDLE, {
+      checkAppNameCollision: async () => 'unknown',
+    });
+    expect(decision).toEqual({ kind: 'create' });
+  });
+
+  it('neither dep wired (both undefined) -> "create" (vault-aware / collision-aware confirm NOT engaged this run, same opt-in contract as every sibling vault-restore closure)', async () => {
+    const decision = await resolveSharedRouterAppReuse(OWNER, SHARED_ROUTER_APP_HANDLE, {});
+    expect(decision).toEqual({ kind: 'create' });
+  });
+
+  it('empty vault + name CONFIRMED TAKEN -> "name-taken", carrying routerAppNameCollisionMessage\'s exact text — produces the instruction, not a silent failure', async () => {
+    const decision = await resolveSharedRouterAppReuse(OWNER, SHARED_ROUTER_APP_HANDLE, {
+      checkAppNameCollision: async () => 'present',
+    });
+    expect(decision.kind).toBe('name-taken');
+    if (decision.kind !== 'name-taken') return;
+    expect(decision.reason).toBe(routerAppNameCollisionMessage(SHARED_ROUTER_APP_HANDLE, 'https://github.com/settings/apps/macf-routing/advanced'));
+  });
+
+  it('a throwing readVaultRouterApp degrades to the vault being empty, never propagates — falls through to the collision check', async () => {
+    let collisionCalls = 0;
+    const decision = await resolveSharedRouterAppReuse(OWNER, SHARED_ROUTER_APP_HANDLE, {
+      readVaultRouterApp: async () => {
+        throw new Error('simulated decrypt failure');
+      },
+      checkAppNameCollision: async () => {
+        collisionCalls += 1;
+        return 'absent';
+      },
+    });
+    expect(decision).toEqual({ kind: 'create' });
+    expect(collisionCalls).toBe(1);
+  });
+
+  it('a throwing checkAppNameCollision degrades to "unknown", never propagates -> "create" (fail-open)', async () => {
+    const deps: SharedRouterAppReuseDeps = {
+      checkAppNameCollision: async () => {
+        throw new Error('simulated network failure');
+      },
+    };
+    await expect(resolveSharedRouterAppReuse(OWNER, SHARED_ROUTER_APP_HANDLE, deps)).resolves.toEqual({ kind: 'create' });
+  });
+});
+
+describe('routerAppNameCollisionMessage — the shared-scope instruction text', () => {
+  it('names both operator next steps: supply vault credentials, or opt into per-fleet scope', () => {
+    const msg = routerAppNameCollisionMessage('macf-routing', 'https://github.com/settings/apps/macf-routing/advanced');
+    expect(msg).toMatch(/MACF_ROUTING_APP_ID/);
+    expect(msg).toMatch(/MACF_ROUTING_APP_KEY_B64/);
+    expect(msg).toMatch(/--vault\/--identity-key/);
+    expect(msg).toMatch(/transport\.router_app_scope: per-fleet/);
+    expect(msg).toContain('macf-routing');
+  });
+
+  it('never mentions a credential value — only the vault KEY NAMES, never a PEM or secret', () => {
+    const msg = routerAppNameCollisionMessage('macf-routing', 'https://github.com/settings/apps/macf-routing/advanced');
+    expect(msg).not.toMatch(/BEGIN.*PRIVATE KEY/);
+  });
+
+  it('carries no internal issue/DR citation — user-facing output, per the citation guard (groundnuty/macf#1061)', () => {
+    const msg = routerAppNameCollisionMessage('macf-routing', 'https://github.com/settings/apps/macf-routing/advanced');
+    expect(msg).not.toMatch(/\bmacf#\d+\b|\bgroundnuty\/macf#\d+\b|\bDR-0\d{2}\b|\bAmendment [A-Z0-9]\b/);
+  });
+});
+
+describe('resolveRouterAppSecretsForPublish — the "vault-reused" status (groundnuty/macf#1082) joins the SAME publish path, no second seam', () => {
+  it('"vault-reused": resolves "available" by re-reading the SAME vault closure — one publisher, not a new one', async () => {
+    let readCalls = 0;
+    const result = await resolveRouterAppSecretsForPublish({ role: 'router', status: 'vault-reused', appId: '9001' }, true, {
+      readVaultRouterApp: async () => {
+        readCalls += 1;
+        return { appId: '9001', appKeyPem: 'SENTINEL-PUBLISH-PEM' };
+      },
+    });
+    expect(result).toEqual({ status: 'available', appId: '9001', appKeyPem: 'SENTINEL-PUBLISH-PEM' });
+    expect(readCalls).toBe(1);
+  });
+
+  it('"vault-reused" + no readVaultRouterApp wired -> "unavailable", never fabricates a credential', async () => {
+    const result = await resolveRouterAppSecretsForPublish({ role: 'router', status: 'vault-reused', appId: '9001' }, true, {});
+    expect(result.status).toBe('unavailable');
   });
 });
