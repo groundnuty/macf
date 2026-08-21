@@ -21,10 +21,10 @@
  *     list-marker → allowed (addressing form §3)
  *   - Else → BLOCK
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 
@@ -716,6 +716,285 @@ describe('check-mention-routing.sh (hook)', () => {
           'gh issue close 123 --comment "Verified `@macf-tester-1-agent[bot]` data; closing."',
       });
       expect(r.status).toBe(0);
+    });
+  });
+
+  describe('create-subcommand coverage — declared, not inferred (groundnuty/macf#1091)', () => {
+    // Registry fixture: this repo's routing-label registry as `macf
+    // repo-init` actually writes it (`.github/agent-config.json`'s
+    // `.agents` keys). code-agent is the "self" identity throughout this
+    // describe block via MACF_ROUTING_LABEL; science-agent is "a peer".
+    let dir: string;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), 'macf1091-'));
+      mkdirSync(join(dir, '.github'), { recursive: true });
+      writeFileSync(
+        join(dir, '.github', 'agent-config.json'),
+        JSON.stringify({ agents: { 'code-agent': {}, 'science-agent': {} } }),
+      );
+    });
+
+    afterEach(() => {
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    });
+
+    function runCreate(command: string, extraEnv: Record<string, string | undefined> = {}): ReturnType<typeof runHook> {
+      return runHook({
+        command,
+        env: { CLAUDE_PROJECT_DIR: dir, MACF_ROUTING_LABEL: 'code-agent', ...extraEnv },
+      });
+    }
+
+    describe('the four cases', () => {
+      it('case 1 — `backlog` label, no mention → ALLOWED (declared: nobody\'s queue)', () => {
+        const r = runCreate('gh issue create --title "x" --label backlog --body "no mention here"');
+        expect(r.status).toBe(0);
+      });
+
+      it('the backlog label is what makes the difference — same body, label removed → BLOCKED', () => {
+        // Decisive pairing (assert-the-wrong-path.md): proves the ALLOW
+        // above is because the hook recognized the `backlog` label, not
+        // because `create` silently passes through unguarded. Same body,
+        // same everything, only the label is gone.
+        const r = runCreate('gh issue create --title "x" --body "no mention here"');
+        expect(r.status).toBe(2);
+      });
+
+      it('case 2 — assignee label CONFIRMED naming another agent, no mention → ALLOWED', () => {
+        const r = runCreate('gh issue create --title "x" --label science-agent --body "no mention here"');
+        expect(r.status).toBe(0);
+      });
+
+      it('case 3 — assignee label CONFIRMED naming the acting agent itself, no mention → BLOCKED (decisive)', () => {
+        // The failure this hook exists to catch: route-by-label "delivers"
+        // a self-labeled create to its own author — a no-op — and nothing
+        // else points at anyone who needs to see it.
+        const r = runCreate('gh issue create --title "x" --label code-agent --body "no mention here"');
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('labeled for you');
+        expect(r.stderr).toContain('backlog');
+      });
+
+      it('same label value, different acting identity → the SAME label that blocked case 3 now ALLOWS', () => {
+        // Decisive pairing for case 2 vs. case 3: identical command, only
+        // MACF_ROUTING_LABEL differs. Proves the self/peer distinction is
+        // real discrimination, not a hardcoded verdict on the label name.
+        const r = runCreate('gh issue create --title "x" --label code-agent --body "no mention here"', {
+          MACF_ROUTING_LABEL: 'science-agent',
+        });
+        expect(r.status).toBe(0);
+      });
+
+      it('case 4 — no labels at all, no mention → BLOCKED, message names all three remedies', () => {
+        const r = runCreate('gh issue create --title "x" --body "no mention here"');
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('no assignee label');
+        expect(r.stderr).toContain('assignee label');
+        expect(r.stderr).toMatch(/mention/);
+        expect(r.stderr).toContain('backlog');
+      });
+
+      it('case 4 — an unrecognized label (not backlog, not in the registry) → BLOCKED same as no labels', () => {
+        // A label like `docs` doesn't route anywhere — it must not be
+        // treated as evidence of a confirmed peer-routing decision.
+        const r = runCreate('gh issue create --title "x" --label docs --body "no mention here"');
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('no assignee label');
+      });
+
+      it('case 4 — assignee label present but self-identity unknown (MACF_ROUTING_LABEL unset) → BLOCKED', () => {
+        // Can't confirm self vs. peer → ambiguous → blocks, per the
+        // operator's ruling that uncertainty defaults to BLOCK not ALLOW.
+        const r = runCreate('gh issue create --title "x" --label science-agent --body "no mention here"', {
+          MACF_ROUTING_LABEL: undefined,
+        });
+        expect(r.status).toBe(2);
+      });
+
+      it('a mention satisfies Check A even on a self-labeled create (case 3 escape via mention, not backlog)', () => {
+        const r = runCreate(
+          'gh issue create --title "x" --label code-agent --body "$(cat <<EOF\n@macf-science-agent[bot] please advise\nEOF\n)"',
+        );
+        expect(r.status).toBe(0);
+      });
+    });
+
+    describe('Check B (must-not-leak) is unconditional — not gated on routing intent', () => {
+      it('fires on a describing-leak in a backlog-labeled create', () => {
+        const r = runCreate(
+          'gh issue create --title "x" --label backlog --body "$(cat <<EOF\nThe @macf-tester-1-agent[bot] response was clean.\nEOF\n)"',
+        );
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('describing-context');
+      });
+
+      it('fires on a describing-leak in a peer-labeled create', () => {
+        const r = runCreate(
+          'gh issue create --title "x" --label science-agent --body "$(cat <<EOF\nThe @macf-tester-1-agent[bot] response was clean.\nEOF\n)"',
+        );
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('describing-context');
+      });
+
+      it('fires on a describing-leak in a self-labeled create', () => {
+        const r = runCreate(
+          'gh issue create --title "x" --label code-agent --body "$(cat <<EOF\nThe @macf-tester-1-agent[bot] response was clean.\nEOF\n)"',
+        );
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('describing-context');
+      });
+
+      it('fires on a describing-leak in a create with no labels at all', () => {
+        const r = runCreate(
+          'gh issue create --title "x" --body "$(cat <<EOF\nThe @macf-tester-1-agent[bot] response was clean.\nEOF\n)"',
+        );
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('describing-context');
+      });
+    });
+
+    describe('`gh pr create` — sister subcommand, same shape', () => {
+      it('case 3 sister-case: self-labeled `gh pr create`, no mention → BLOCKED', () => {
+        const r = runCreate('gh pr create --title "x" --label code-agent --body "Refs #1"');
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('labeled for you');
+      });
+
+      it('the canonical unlabeled `gh pr create --body "Refs #N"` shape (agent-identity.md) stays ALLOWED', () => {
+        // Case 4 ("no confirmed routing signal → BLOCK") is scoped to
+        // `gh issue create` only — it does NOT extend to `gh pr create`.
+        // A PR isn't ambiguous the way an issue is: it has no backlog
+        // concept, and its real routing signal is the pull_request_review
+        // state-change event (route-by-pr-review-state) plus a
+        // separately-mentioned issue comment, not the PR body itself
+        // (pr-discipline.md). This IS the exact unlabeled, unmentioned
+        // shape agent-identity.md documents as the standard PR-creation
+        // call — blocking it would break every PR the fleet creates, with
+        // no mid-session fix available (MACF_SKIP_MENTION_CHECK is
+        // launch-time-only).
+        const r = runCreate('gh pr create --title "x" --body "Refs #1"');
+        expect(r.status).toBe(0);
+      });
+
+      it('a peer-labeled `gh pr create` with no mention still ALLOWS (case 2 applies the same to PRs)', () => {
+        const r = runCreate('gh pr create --title "x" --label science-agent --body "Refs #1"');
+        expect(r.status).toBe(0);
+      });
+    });
+
+    describe('registry / infrastructure edge cases', () => {
+      it('`backlog` label allows even with NO registry available (registry-independent check)', () => {
+        const r = runHook({
+          command: 'gh issue create --title "x" --label backlog --body "no mention here"',
+          // No CLAUDE_PROJECT_DIR at all — backlog detection doesn't need it.
+        });
+        expect(r.status).toBe(0);
+      });
+
+      it('no registry + no labels at all → still BLOCKED (registry-independent case 4)', () => {
+        const r = runHook({
+          command: 'gh issue create --title "x" --body "no mention here"',
+        });
+        expect(r.status).toBe(2);
+      });
+
+      it('no registry + a non-backlog label present → BLOCKED (can\'t confirm, falls to case 4)', () => {
+        const r = runHook({
+          command: 'gh issue create --title "x" --label code-agent --body "no mention here"',
+        });
+        expect(r.status).toBe(2);
+      });
+    });
+
+    describe('--body-file handling for create forms', () => {
+      it('resolves a readable --body-file for a self-labeled create with zero mentions → BLOCKED', () => {
+        const file = join(dir, 'body.md');
+        writeFileSync(file, 'no mention here\n');
+        const r = runCreate(`gh issue create --title "x" --label code-agent --body-file ${file}`);
+        expect(r.status).toBe(2);
+      });
+
+      it('resolves a readable --body-file for a self-labeled create WITH a mention → ALLOWED', () => {
+        const file = join(dir, 'body.md');
+        writeFileSync(file, '@macf-science-agent[bot] please advise\n');
+        const r = runCreate(`gh issue create --title "x" --label code-agent --body-file ${file}`);
+        expect(r.status).toBe(0);
+      });
+
+      it('resolves a readable --body-file for a backlog-labeled create with zero mentions → ALLOWED', () => {
+        const file = join(dir, 'body.md');
+        writeFileSync(file, 'no mention here\n');
+        const r = runCreate(`gh issue create --title "x" --label backlog --body-file ${file}`);
+        expect(r.status).toBe(0);
+      });
+    });
+
+    describe('MACF_SKIP_MENTION_CHECK=1 overrides the create-guard', () => {
+      it('bypasses a case-3 (self-labeled) block', () => {
+        const r = runCreate('gh issue create --title "x" --label code-agent --body "no mention here"', {
+          MACF_SKIP_MENTION_CHECK: '1',
+        });
+        expect(r.status).toBe(0);
+      });
+
+      it('bypasses a case-4 (no labels) block', () => {
+        const r = runCreate('gh issue create --title "x" --body "no mention here"', {
+          MACF_SKIP_MENTION_CHECK: '1',
+        });
+        expect(r.status).toBe(0);
+      });
+    });
+
+    describe('--title mentions (mechanical consequence of whole-command scanning)', () => {
+      // Documented judgment call (see the report): Check A/B's LINT_TARGET
+      // for the inline (non --body-file) form is the whole raw $COMMAND
+      // string, same as it always was for `comment` subcommands — there is
+      // no reliable way to slice out just --body's value from --title's
+      // without real shell-quote evaluation. A mention landing in --title
+      // therefore mechanically counts, even though GitHub's own mention/
+      // notification parsing does not apply to title text.
+      it('a mention ONLY in --title (not in --body) satisfies Check A for a self-labeled create', () => {
+        // The title mention must be in the SAME line-start form Check B
+        // already requires everywhere else (a mid-line mention right after
+        // an opening quote is flagged as a describing-context leak
+        // regardless of which flag carries it — see the next describe
+        // block). A heredoc-substituted --title puts it at true line-start.
+        const r = runCreate(
+          'gh issue create --title "$(cat <<EOF\n@macf-science-agent[bot] please advise\nEOF\n)" --label code-agent --body "no mention in the body"',
+        );
+        expect(r.status).toBe(0);
+      });
+    });
+
+    describe('pre-existing Check B heuristic, now visible on a canonical doc example', () => {
+      // NOT a regression introduced by macf#1091 — verified the identical
+      // shape already blocked `gh issue comment` one-liners before this fix
+      // (mid-line-vs-line-start heuristic, documented since #272). What's
+      // NEW is that this exact shape is agent-identity.md's own canonical
+      // "Creating Issues for Other Agents" example:
+      //   gh issue create --repo groundnuty/macf --title "<description>" \
+      //     --label "science-agent" --body "@macf-science-agent[bot] <details>"
+      // The mention sits immediately after `--body "` with no preceding
+      // newline, which the existing heuristic treats as mid-line, not
+      // line-start addressing — Check B blocks it. Reported, not silently
+      // patched: widening the line-start allowance is a Check-B-wide
+      // heuristic change out of scope for this fix; the doc example needs
+      // a heredoc (matching the pattern already required for `comment`).
+      it('blocks the literal agent-identity.md issue-create example as written (documents the friction, does not endorse it)', () => {
+        const r = runCreate(
+          'gh issue create --repo groundnuty/macf --title "some description" --label "science-agent" --body "@macf-science-agent[bot] some details"',
+        );
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('describing-context');
+      });
+
+      it('the heredoc form of the same example passes (the documented workaround already required for `comment`)', () => {
+        const r = runCreate(
+          'gh issue create --repo groundnuty/macf --title "some description" --label "science-agent" --body "$(cat <<EOF\n@macf-science-agent[bot] some details\nEOF\n)"',
+        );
+        expect(r.status).toBe(0);
+      });
     });
   });
 });

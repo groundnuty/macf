@@ -55,10 +55,20 @@
 #      the rule it enforces).
 #   4. anything else — no labels at all; labels that don't match the
 #      registry; a registry match the hook can't confirm as self or peer
-#      (`$MACF_ROUTING_LABEL` unset) → BLOCK. Ambiguous states default to
-#      BLOCK, never ALLOW — the same posture as case 3, and the reason
-#      case 1 has to be a POSITIVE declaration rather than "well, nothing
-#      else matched."
+#      (`$MACF_ROUTING_LABEL` unset) → BLOCK on `gh issue create`; ALLOW on
+#      `gh pr create`. Ambiguous states default to BLOCK for issues, never
+#      ALLOW — the same posture as case 3, and the reason case 1 has to be
+#      a POSITIVE declaration rather than "well, nothing else matched." A
+#      PR is NOT ambiguous the same way: it has no backlog concept, and
+#      its real routing signal is the pull_request_review state-change
+#      event (route-by-pr-review-state) plus a separately-mentioned issue
+#      comment, not the PR body — see `pr-discipline.md`. agent-identity.md's
+#      canonical PR-creation call is unlabeled, unmentioned
+#      (`--body "Refs #<N>"`); blocking case 4 there would break every PR
+#      the fleet creates, and — because `MACF_SKIP_MENTION_CHECK` is
+#      launch-time-only (see the override guidance in the Check A block
+#      below) — unrecoverably until an operator relaunches. Case 3 still
+#      blocks a self-labeled `gh pr create`; only case 4 is issue-only.
 # Self-identity (cases 2 vs. 3) comes from `$MACF_ROUTING_LABEL` (canonical,
 # always-exported by claude.sh's env.identity — coordination.md's tmux
 # launch-pattern section documents it as the routing/registry/cert-CN key,
@@ -131,12 +141,20 @@ if [[ "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+close ]]; then
 fi
 
 # ── `create`-subcommand + assignee-label discriminator (macf#1091) ────────
-# See the file-header "`create` coverage" section for the full 3-case
+# See the file-header "`create` coverage" section for the full 4-case
 # rationale. Computed here (before the --body-file dispatch below) because
 # the branch-3 warning also needs to know whether Check A applies.
 IS_CREATE_SUBCOMMAND=false
 if [[ "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+create ]]; then
   IS_CREATE_SUBCOMMAND=true
+fi
+
+# `gh pr create` is tracked separately from `gh issue create` because case 4
+# ("no confirmed routing signal → BLOCK") does NOT extend to it — see the
+# CHECK_A_APPLIES computation below for why.
+IS_PR_CREATE=false
+if [[ "$COMMAND" =~ gh[[:space:]]+pr[[:space:]]+create ]]; then
+  IS_PR_CREATE=true
 fi
 
 # Extracts every --label/-l VALUE (comma-split, one wrapping-quote layer
@@ -148,11 +166,23 @@ fi
 # loop shape (bounded by a guard counter, never `eval`).
 macf_extract_labels() {
   local cmd="$1"
-  local pattern='(--label|-l)(=|[[:space:]]+)([^[:space:]]+)'
+  # Leading `(^|[[:space:]])` boundary closes the glued-word collision:
+  # without it, `-l` (the short form) matches inside an unrelated LONGER
+  # flag name that happens to end in `-l<sep><token>` (e.g. `--tool-label
+  # backlog`). It does NOT close — and cannot, without real shell-quote-
+  # boundary awareness this whole-command-string scan doesn't have anywhere
+  # in this file — the narrower case of genuine PROSE containing an
+  # isolated, whitespace-bounded "-l <label>"/"--label <label>" sequence
+  # (e.g. a body discussing this very flag). That residual is a documented,
+  # accepted trade-off, same class as every other whole-command-scan
+  # imprecision in this hook (the --body-file / --title extraction below
+  # has the identical limitation) — flagged here rather than silently
+  # assumed closed.
+  local pattern='(^|[[:space:]])(--label|-l)(=|[[:space:]]+)([^[:space:]]+)'
   local rest="$cmd" guard=0
   while [[ "$rest" =~ $pattern ]] && [[ "$guard" -lt 50 ]]; do
     guard=$((guard + 1))
-    local raw="${BASH_REMATCH[3]}"
+    local raw="${BASH_REMATCH[4]}"
     raw="${raw%\"}"; raw="${raw#\"}"
     raw="${raw%\'}"; raw="${raw#\'}"
     local whole="${BASH_REMATCH[0]}"
@@ -251,8 +281,26 @@ elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
     CHECK_A_APPLIES=false  # case 1: backlog — declared, deliberately unrouted
   elif [[ "$CREATE_CONFIRMED_PEER_LABEL" == "true" ]]; then
     CHECK_A_APPLIES=false  # case 2: confirmed routed to a different agent
+  elif [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+    CHECK_A_APPLIES=true   # case 3: confirmed self-label — blocks for BOTH
+                            # issue and PR creates (route-by-label really is
+                            # a no-op either way)
+  elif [[ "$IS_PR_CREATE" == "true" ]]; then
+    # Case 4 does NOT extend to `gh pr create`. A PR isn't ambiguous the
+    # way an issue is: it has no "backlog" concept, and its actual routing
+    # signal is the pull_request_review state-change event
+    # (route-by-pr-review-state) plus a separately-mentioned issue
+    # comment — NOT the PR body (pr-discipline.md). agent-identity.md's
+    # canonical "Finishing Work" flow creates every PR unlabeled with
+    # `--body "Refs #<N>"` and no mention; blocking that here would break
+    # every PR the fleet creates, and the override can't fix it mid-session
+    # (MACF_SKIP_MENTION_CHECK is launch-time-only per this hook's own
+    # message below) — an unrecoverable-until-relaunch failure mode far
+    # worse than the gap this fix closes. So case 4 blocks only
+    # `gh issue create`.
+    CHECK_A_APPLIES=false
   fi
-  # else: case 3 (confirmed self-label) or case 4 (ambiguous) — stays true
+  # else: case 4 on `gh issue create` — stays true (block)
 fi
 
 # --body-file handling (groundnuty/macf#944).
