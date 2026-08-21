@@ -6,6 +6,9 @@ import type { RegistryConfig, TokenSource } from '@groundnuty/macf-core';
 import { registryPathPrefix } from '../registry-helper.js';
 import { isValidProjectName } from '../config.js';
 import { resolveActionsRefToFullTag, isImmutableActionsTag } from '../version-resolver.js';
+import { detectStaleDist } from '../build-info.js';
+import { findCliPackageRoot } from '../rules.js';
+import { assertRouterWorkflowWellFormed } from './repo-init-router-guard.js';
 
 export interface RepoInitOptions {
   readonly repo?: string;
@@ -638,11 +641,25 @@ export async function createLabel(
   return 'failed';
 }
 
-function writeFileSafe(path: string, content: string, force: boolean): 'created' | 'skipped' {
+/**
+ * `validate`, when given, runs ONLY on the branch that actually writes —
+ * never on the "existing file, no --force" skip branch (groundnuty/macf#886).
+ * That scoping matters: an unrelated pre-existing file left untouched by a
+ * plain re-run must never fail this check, because the content the
+ * validator would inspect is never used. A throw from `validate` propagates
+ * before `writeFileSync` runs, so a degraded artifact never touches disk.
+ */
+function writeFileSafe(
+  path: string,
+  content: string,
+  force: boolean,
+  validate?: (content: string) => void,
+): 'created' | 'skipped' {
   if (existsSync(path) && !force) {
     process.stderr.write(`Skipping existing file (use --force to overwrite): ${path}\n`);
     return 'skipped';
   }
+  validate?.(content);
   ensureDir(path);
   writeFileSync(path, content);
   return 'created';
@@ -658,6 +675,29 @@ export async function repoInit(
   const absDir = resolve(projectDir);
 
   validateVersion(opts.actionsVersion);
+
+  // groundnuty/macf#886 — companion signal to the artifact self-check below
+  // (`assertRouterWorkflowWellFormed`). Reuses the existing stale-dist
+  // detector (previously wired only into `macf update`) so a dev/git-clone
+  // install that's behind its own source HEAD gets an early, causal hint
+  // pointing at WHY the output might be wrong. Deliberately a WARNING, not a
+  // block: staleness is a proxy, not proof — it says nothing about whether
+  // THIS command's output is actually affected, and (per the detector's own
+  // fail-soft contract) it has no signal at all for an install with no
+  // `.git/` directory. The artifact check below is what actually blocks a
+  // bad emission; this is strictly an earlier, narrower hint for the subset
+  // of installs it can see.
+  const cliPackageRoot = findCliPackageRoot();
+  const staleDist = detectStaleDist(cliPackageRoot);
+  if (staleDist) {
+    process.stderr.write(
+      'Warning: the installed macf CLI dist/ is stale.\n' +
+        `  built from: ${staleDist.buildCommit.slice(0, 7)} (at ${staleDist.builtAt})\n` +
+        `  source HEAD: ${staleDist.currentCommit.slice(0, 7)}\n` +
+        '  The files this command generates may not reflect the latest repo-init behavior.\n' +
+        `  Fix: run \`macf self-update\` (or \`cd ${cliPackageRoot} && npm run build\`) and re-run repo-init.\n`,
+    );
+  }
 
   // macf#797 + operator decision 2026-07-05: the router pin must be an
   // IMMUTABLE full tag (`v3.4.1`), not a floating major/minor (`v3`/`v3.4`),
@@ -729,10 +769,16 @@ export async function repoInit(
     v3Inputs = { project, registryApiPath: registryPathPrefix(registry) };
   }
 
+  // groundnuty/macf#886 — the artifact self-check: assert the emitted
+  // content actually carries every element the reusable workflow consumes
+  // BEFORE it is written to disk. Runs only on the branch that would
+  // actually write (see `writeFileSafe`'s doc) — an unrelated existing file
+  // left alone by a plain re-run is never affected.
   const workflowResult = writeFileSafe(
     workflowPath,
     generateWorkflow(pinnedVersion, v3Inputs),
     opts.force,
+    assertRouterWorkflowWellFormed,
   );
 
   // Agent-config handling: always merge-preserve when the file exists,
