@@ -1285,8 +1285,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     }
     if (finding.missing.length > 0 || finding.insufficient.length > 0) {
       console.log('');
-      console.log('See design/decisions/DR-019-app-permissions.md for the full doctrine,');
-      console.log('and GitHub → Settings → Developer settings → GitHub Apps → <your App> → Permissions');
+      console.log('Fix: GitHub → Settings → Developer settings → GitHub Apps → <your App> → Permissions');
       console.log('to update the App. Users with the App installed must accept the new permissions.');
       permissionsFailed = true;
     }
@@ -1444,7 +1443,7 @@ function printLoadBearingHooksSection(check: LoadBearingHooksCheckResult): void 
   console.log(
     '    Fix: re-run `macf update` (or `macf init --force`) to restore the full plugin + settings ' +
     'floor. A stripped --plugin-dir (a hooks-less plugin variant), a bad stash, or a hand-edit can ' +
-    'drop these silently — see design/decisions/DR-039-hook-delivery-and-presence-guarantee.md.',
+    'drop these silently.',
   );
 }
 

@@ -367,11 +367,11 @@ export async function issueRoutingClient(
       issuerVarName,
       JSON.stringify({ issuer_fingerprint: issuerFingerprint, minted_at: mintedAt }),
     );
-    console.log(`  Issuer recorded: ${issuerVarName} (baseline for \`macf routing doctor\`'s #800 orphan check)`);
+    console.log(`  Issuer recorded: ${issuerVarName} (baseline for \`macf routing doctor\`'s orphan check)`);
   } catch (err) {
     console.warn(
       `Warning: failed to record the routing-client cert issuer in ${issuerVarName} — ` +
-      `\`macf routing doctor\`'s #800 orphan-detection check will show "absent" until this ` +
+      `\`macf routing doctor\`'s orphan-detection check will show "absent" until this ` +
       `succeeds (${err instanceof Error ? err.message : String(err)}).`,
     );
   }

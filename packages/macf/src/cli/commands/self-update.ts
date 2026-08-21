@@ -44,8 +44,7 @@ export function selfUpdate(sourceRepoDir: string): SelfUpdateResult {
   if (!existsSync(join(sourceRepoDir, '.git'))) {
     throw new Error(
       `${sourceRepoDir} is not a git-cloned install (no .git/ directory). ` +
-        `self-update only works for npm-link dev installs, not tarball extracts. ` +
-        `See the bootstrap-limitation note in #144.`,
+        `self-update only works for npm-link dev installs, not tarball extracts.`,
     );
   }
 

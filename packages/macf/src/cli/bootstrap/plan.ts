@@ -356,7 +356,7 @@ export interface FleetPlan {
  * this change, not deferred) — `collaborators` is the sole remaining member.
  */
 export const SKIPPED_SECTION_REASONS = {
-  collaborators: 'reconcile not implemented in v1 — see #838 follow-ups',
+  collaborators: 'reconcile not implemented in v1',
 } as const;
 
 /**
