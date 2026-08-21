@@ -252,10 +252,12 @@ describe('runBootstrapPlan', () => {
     // `VALID_FLEET_YAML` declares no `routing:` section, so this fleet needs
     // no runner-ops App. `router_app` (groundnuty/macf#1105) IS present
     // here though — UNCONDITIONAL, and this fixture's `lock: null` has no
-    // 'router' entry — so `labels` + `router_app` are the two
-    // create-candidates.
+    // 'router' entry. `ts_oauth` (groundnuty/macf#1109) is ALSO
+    // UNCONDITIONAL, and `deps.observe`'s fixture above sets no
+    // `vaultTsOauth` — so `labels` + `router_app` + `ts_oauth` are the
+    // three create-candidates.
     expect(json.summary.noops).toBe(7);
-    expect(json.summary.creates).toBe(2);
+    expect(json.summary.creates).toBe(3);
   });
 
   // DR-043 Amendment D phase 3 — proves the `--vault`/`--identity-key` CLI
