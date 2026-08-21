@@ -43,6 +43,10 @@ const NOT_FOUND_RUN: RoutingE2eRouterRun = { found: false, conclusion: null, sta
 function baseDeps(overrides: Partial<RoutingE2eDeps> = {}): RoutingE2eDeps {
   return {
     currentLabel: 'code-agent',
+    // Confirmed-visible by default (matches `targetRepo: 'o/r'` used
+    // throughout) so every existing scenario below exercises the SAME
+    // entitled-repo path it always did; only the new tests override this.
+    listInstallRepos: vi.fn(async () => ['o/r']),
     isTargetCaller: vi.fn(async () => true),
     readTargetRoutingConfig: vi.fn(async (): Promise<RoutingConfig | null> => ({ agents: { 'science-agent': {} } })),
     listRegistry: vi.fn(async () => [{ name: 'SCIENCE_AGENT', info: AGENT_INFO }]),
@@ -63,7 +67,56 @@ function baseDeps(overrides: Partial<RoutingE2eDeps> = {}): RoutingE2eDeps {
 }
 
 describe('runRoutingE2eCore — preconditions (nothing filed, nothing to clean up)', () => {
-  it('refuses when the target repo has no committed routing workflow', async () => {
+  // Decisive per assert-the-wrong-path.md: a broken gate that calls
+  // isTargetCaller regardless (letting its own ambiguous 404-collapse decide)
+  // could still land on SOME red stage — asserting only `verdict === 'RED'`
+  // would not catch that. Asserting the SPECIFIC stage plus that the
+  // ambiguous per-file reads were never even attempted is what a correct
+  // gate uniquely produces.
+  it('reports unknown, not absent, when the listing succeeds but does not contain the target repo (macf#1077)', async () => {
+    // The listing IS non-empty (a real read landed) — 'o/r' is simply not
+    // in it, the actual entitlement-gap shape the issue reports. A `[]`
+    // fake here would instead exercise the "listing itself failed" cause
+    // (covered separately below) and bless the wrong message.
+    const deps = baseDeps({ listInstallRepos: vi.fn(async () => ['o/some-other-repo']) });
+    const r = await runRoutingE2eCore(deps, { targetRepo: 'o/r' });
+    expect(r.verdict).toBe('RED');
+    expect(r.stage).toBe('target_visibility_unknown');
+    expect(r.stage).not.toBe('target_not_a_caller'); // never a false claim of confirmed absence
+    expect(deps.isTargetCaller).not.toHaveBeenCalled();
+    expect(deps.readTargetRoutingConfig).not.toHaveBeenCalled();
+    expect(deps.createProbeIssue).not.toHaveBeenCalled();
+    expect(r.cleanup.attempted).toBe(false);
+    expect(r.message).toContain('code-agent'); // names the credential
+    expect(r.message).toContain('read successfully'); // never claims a read that didn't happen
+  });
+
+  it('reports unknown for the DIFFERENT reason when the install listing read itself never comes back', async () => {
+    // `listInstallRepos` degrades to `[]` on any failure (network/auth/gh
+    // missing) — a real installation always covers at least this agent's
+    // own repo, so `[]` means "never read," not "confirmed empty." The
+    // message must say so, not claim the (never-read) listing named the
+    // target absent.
+    const deps = baseDeps({ listInstallRepos: vi.fn(async () => []) });
+    const r = await runRoutingE2eCore(deps, { targetRepo: 'o/r' });
+    expect(r.stage).toBe('target_visibility_unknown');
+    expect(r.message).toContain('could not read its own installed-repository list');
+    expect(r.message).not.toContain('read successfully');
+    expect(deps.isTargetCaller).not.toHaveBeenCalled();
+  });
+
+  it('is case-insensitive matching the target repo against the install listing', async () => {
+    const deps = baseDeps({ listInstallRepos: vi.fn(async () => ['O/R']) }); // GitHub's own casing may differ
+    const r = await runRoutingE2eCore(deps, { targetRepo: 'o/r' });
+    expect(r.stage).not.toBe('target_visibility_unknown');
+    expect(deps.isTargetCaller).toHaveBeenCalledTimes(1);
+  });
+
+  // The confirmed-absent sibling: when the install-set DOES contain the
+  // repo (this credential is entitled to read it), a 404 on the workflow
+  // file is trustworthy and still reports absent — the fix narrows WHEN a
+  // 404 is trusted, it does not make every 404 unknown.
+  it('refuses when the target repo has no committed routing workflow (confirmed via the install-set, not merely a 404)', async () => {
     const deps = baseDeps({ isTargetCaller: vi.fn(async () => false) });
     const r = await runRoutingE2eCore(deps, { targetRepo: 'o/r' });
     expect(r.verdict).toBe('RED');
@@ -255,6 +308,31 @@ describe('routingE2eToJson / formatRoutingE2eText', () => {
   it('never leaks credential-shaped material (host/port/certs) into either render', async () => {
     const deps = baseDeps();
     const r = await runRoutingE2eCore(deps, { targetRepo: 'o/r' });
+    const jsonStr = JSON.stringify(routingE2eToJson(r));
+    expect(jsonStr).not.toContain(AGENT_INFO.host);
+    expect(jsonStr).not.toContain(String(AGENT_INFO.port));
+    expect(formatRoutingE2eText(r)).not.toContain(AGENT_INFO.host);
+  });
+
+  // Defect 2 (macf#1077): the delivery caveat describes what a GREEN
+  // verdict means. A RED run delivered nothing, so the note must not print
+  // — it would assert something that never happened.
+  it('the delivery disclaimer is present on a GREEN result and absent on a RED one (#1077)', async () => {
+    const green = await runRoutingE2eCore(baseDeps(), { targetRepo: 'o/r' });
+    expect(green.verdict).toBe('GREEN');
+    expect(formatRoutingE2eText(green)).toContain('DELIVERED to the recipient channel-server');
+    expect((routingE2eToJson(green) as Record<string, unknown>)['disclaimer']).not.toBeNull();
+
+    const red = await runRoutingE2eCore(baseDeps({ isTargetCaller: vi.fn(async () => false) }), { targetRepo: 'o/r' });
+    expect(red.verdict).toBe('RED');
+    expect(formatRoutingE2eText(red)).not.toContain('DELIVERED to the recipient channel-server');
+    expect((routingE2eToJson(red) as Record<string, unknown>)['disclaimer']).toBeNull();
+  });
+
+  it('the target_visibility_unknown message never leaks credential-shaped material either', async () => {
+    const deps = baseDeps({ listInstallRepos: vi.fn(async () => []) });
+    const r = await runRoutingE2eCore(deps, { targetRepo: 'o/r' });
+    expect(r.stage).toBe('target_visibility_unknown');
     const jsonStr = JSON.stringify(routingE2eToJson(r));
     expect(jsonStr).not.toContain(AGENT_INFO.host);
     expect(jsonStr).not.toContain(String(AGENT_INFO.port));
