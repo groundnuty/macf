@@ -276,17 +276,18 @@ export const FleetCollaboratorSchema = z
  * replaces.** #1074 shipped a dedicated PER-FLEET routing App and dismissed
  * this field's account-wide model outright; #1082 reversed that instance
  * count and built the shared/reused App this field's OWN doc describes
- * (`apply-router-app.ts`'s `resolveSharedRouterAppReuse` + the fixed
- * `SHARED_ROUTER_APP_HANDLE` name) — so the underlying DESIGN this field
- * anticipated is now real. It stays unconsumed anyway: this field is
- * `.strict()` and requires BOTH `routing_app` AND `ts_oauth` together, so
- * wiring just the scope concept from it would force an operator to also
- * supply a `ts_oauth` reference this codebase still has no consumer for —
- * the same "operator believes X, tool does Y" trap `tailscale_oauth_required`'s
- * own doc warns about. `FleetTransportSchema.router_app_scope` (above) is
- * the field that actually carries #1082's shared-vs-per-fleet choice; this
- * one is left here unconsumed pending an explicit future reconciliation of
- * whether an operator-NAMED shared App (vs. the fixed name #1082 uses) is
+ * (`apply-router-app.ts`'s `resolveSharedRouterAppReuse` + the
+ * owner-keyed `deriveRouterAppHandle` name, groundnuty/macf#1088) — so the
+ * underlying DESIGN this field anticipated is now real. It stays unconsumed
+ * anyway: this field is `.strict()` and requires BOTH `routing_app` AND
+ * `ts_oauth` together, so wiring just the scope concept from it would force
+ * an operator to also supply a `ts_oauth` reference this codebase still has
+ * no consumer for — the same "operator believes X, tool does Y" trap
+ * `tailscale_oauth_required`'s own doc warns about.
+ * `FleetTransportSchema.router_app_scope` (above) is the field that
+ * actually carries #1082's shared-vs-per-fleet choice; this one is left
+ * here unconsumed pending an explicit future reconciliation of whether an
+ * operator-NAMED shared App (vs. the owner-derived name #1088 uses) is
  * ever worth building.
  */
 export const FleetSharedSchema = z

@@ -25,12 +25,18 @@
  * {@link resolveSharedRouterAppReuse}'s doc for the ported mechanism itself).
  *
  * **The two scopes, both real, both tested:**
- *   - **`'shared'` (default)** — one App per account, detected via the
- *     vault first (operator-supplied credentials, Amendment C's pattern —
- *     see {@link resolveSharedRouterAppReuse}) and via a live GitHub
- *     name-presence check second; minted fresh only on the account's
- *     first-ever fleet. Fixed handle ({@link SHARED_ROUTER_APP_HANDLE}),
- *     never fleet-prefixed.
+ *   - **`'shared'` (default)** — one App per OWNER SCOPE (an org or a user
+ *     account — `manifest.owner.account`, groundnuty/macf#1088; NOT the
+ *     operator's own account, which is a different thing whenever the
+ *     fleet lives on an org — see {@link deriveRouterAppHandle}), detected
+ *     via the vault first (operator-supplied credentials, Amendment C's
+ *     pattern — see {@link resolveSharedRouterAppReuse}) and via a live
+ *     GitHub name-presence check second; minted fresh only on the scope's
+ *     first-ever fleet. Owner-keyed handle (never a global fixed string —
+ *     the fixed `macf-routing` name #1082 shipped is what #1088/#1090
+ *     found broken: it collides across owner scopes and, worse, silently
+ *     reuses a personally-owned credential for an org-hosted fleet),
+ *     never fleet-prefixed but always distinct between owner scopes.
  *   - **`'per-fleet'` (opt-in, `transport.router_app_scope: per-fleet` in
  *     `fleet.yaml`)** — #1074's original mechanism, byte-identical: a fresh
  *     App minted for THIS fleet alone, `deriveAppHandle(fleetName,
@@ -161,27 +167,34 @@ export const ROUTER_APP_EVENTS: readonly string[] = [];
 export type RouterAppScope = 'shared' | 'per-fleet';
 
 /**
- * The routing App's SHARED handle (groundnuty/macf#1082) — fixed, never
- * fleet-prefixed, matching the DR-035 `tools/macf-bootstrap` skill's
- * `macf-routing` name exactly. Deliberate interop: an operator who
- * provisioned a fleet via the skill and one via `macf bootstrap apply`
- * should find the SAME App on GitHub either way — a different constant here
- * would silently fork the ecosystem into two "shared" Apps that don't share.
- */
-export const SHARED_ROUTER_APP_HANDLE = 'macf-routing';
-
-/**
- * The router App's handle for THIS run's scope (groundnuty/macf#1082).
- * `'shared'` (default) is the fixed {@link SHARED_ROUTER_APP_HANDLE},
- * unconditionally — `fleetName` is intentionally unused on that branch (a
- * shared name cannot be fleet-derived; that is the entire point of
- * "shared"). `'per-fleet'` is `deriveAppHandle(fleetName, ROUTER_APP_ROLE)`,
+ * **The routing App's handle — the resolution point groundnuty/macf#1088
+ * fixes.** `'per-fleet'` is `deriveAppHandle(fleetName, ROUTER_APP_ROLE)`,
  * BYTE-IDENTICAL to this function's pre-#1082 sole behavior — the ONLY place
  * this App's per-fleet handle is computed (mirrors `deriveRunnerOpsHandle`'s
  * "handle derivation, never declaration" discipline; macf#791).
+ *
+ * **`'shared'` is `deriveAppHandle(ownerAccount, ROUTER_APP_ROLE)` —
+ * `fleetName` is intentionally unused on that branch**, exactly as it was
+ * unused when the handle was the fixed `macf-routing` constant; the
+ * difference #1088 makes is WHICH string besides `fleetName` supplies the
+ * scope: `ownerAccount` (`manifest.owner.account` — an org or a user
+ * account, whichever actually owns the fleet), never a single global
+ * literal and never the operator's own account when those differ (the
+ * org-hosted-fleet case #1088 reported).
+ *
+ * This is the SAME `deriveAppHandle` convention every agent App / runner-ops
+ * already uses, applied to a different first argument — no new naming
+ * concept, just a different string playing the "namespace" role
+ * `deriveAppHandle` already generalizes over. The three properties this
+ * buys, all restated as tests below: two fleets under the SAME owner
+ * resolve to the SAME handle (the `#1086` reuse saving survives — same
+ * `ownerAccount` in, same string out); two fleets under DIFFERENT owners
+ * resolve to DIFFERENT handles (no cross-scope collision, no cross-scope
+ * credential reuse); `'per-fleet'` scope is untouched (still keyed on
+ * `fleetName`, never `ownerAccount`).
  */
-export function deriveRouterAppHandle(fleetName: string, scope: RouterAppScope): string {
-  return scope === 'per-fleet' ? deriveAppHandle(fleetName, ROUTER_APP_ROLE) : SHARED_ROUTER_APP_HANDLE;
+export function deriveRouterAppHandle(fleetName: string, ownerAccount: string, scope: RouterAppScope): string {
+  return deriveAppHandle(scope === 'per-fleet' ? fleetName : ownerAccount, ROUTER_APP_ROLE);
 }
 
 /**
@@ -198,9 +211,10 @@ export function deriveRouterAppHandle(fleetName: string, scope: RouterAppScope):
  * pre-#1082 caller (and the `'per-fleet'` scope) keeps `applyIdentity`'s own
  * derived handle, byte-identical. Callers taking the `'shared'`-scope CREATE
  * path (only reachable through {@link resolveSharedRouterAppReuse} returning
- * `'create'`) pass {@link SHARED_ROUTER_APP_HANDLE} here so the App GitHub
- * actually creates carries the fixed, cross-fleet-recognizable name, not a
- * fleet-prefixed one.
+ * `'create'`) pass the owner-keyed handle from {@link deriveRouterAppHandle}
+ * here (groundnuty/macf#1088) so the App GitHub actually creates carries the
+ * scope-shared, cross-fleet-recognizable name for THIS owner, never a
+ * fleet-prefixed one and never another owner's.
  */
 export function routerAppIdentityRequest(installRepos: readonly string[], homepageUrl?: string, handleOverride?: string): IdentityRequest {
   return {
@@ -224,17 +238,27 @@ export function routerAppIdentityRequest(installRepos: readonly string[], homepa
  *
  * `scope` defaults to `'per-fleet'` (groundnuty/macf#1082) — BYTE-IDENTICAL
  * to this function's pre-#1082 sole behavior for every existing caller.
- * Passing `'shared'` submits {@link SHARED_ROUTER_APP_HANDLE} as `name`
- * instead of the fleet-derived one.
+ * Passing `'shared'` submits {@link deriveRouterAppHandle}'s owner-keyed
+ * name (groundnuty/macf#1088) as `name` instead of the fleet-derived one —
+ * `ownerAccount` is a required parameter (not optional) precisely because a
+ * missing owner has no honest default here: the whole point of this
+ * function post-#1088 is that "shared" means "shared within `ownerAccount`,"
+ * never "shared globally."
  */
-export function buildRouterAppManifest(fleetName: string, redirectUrl: string, homepageUrl?: string, scope: RouterAppScope = 'per-fleet'): GitHubAppManifest {
+export function buildRouterAppManifest(
+  fleetName: string,
+  ownerAccount: string,
+  redirectUrl: string,
+  homepageUrl?: string,
+  scope: RouterAppScope = 'per-fleet',
+): GitHubAppManifest {
   return buildAppManifest({
     fleetName,
     role: ROUTER_APP_ROLE,
     redirectUrl,
     homepageUrl,
     permissions: ROUTER_APP_PERMISSIONS,
-    nameOverride: scope === 'shared' ? SHARED_ROUTER_APP_HANDLE : undefined,
+    nameOverride: scope === 'shared' ? deriveRouterAppHandle(fleetName, ownerAccount, 'shared') : undefined,
     events: ROUTER_APP_EVENTS,
   });
 }

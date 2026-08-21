@@ -74,12 +74,13 @@ export interface BuildAppManifestOptions {
    */
   readonly events?: readonly string[];
   /**
-   * Override the derived `name` (groundnuty/macf#1082) — the ONLY caller
-   * that supplies this is the router App's SHARED-scope path
-   * (`apply-router-app.ts::routerAppIdentityRequest`), whose whole point is
-   * a name that is NOT fleet-prefixed (`deriveAppHandle` always prepends
-   * `fleetName`, which can never produce the fixed, cross-fleet-recognizable
-   * `SHARED_ROUTER_APP_HANDLE`). `undefined` (every other caller — every
+   * Override the derived `name` (groundnuty/macf#1082, owner-keyed per
+   * groundnuty/macf#1088) — the ONLY caller that supplies this is the router
+   * App's SHARED-scope path (`apply-router-app.ts::routerAppIdentityRequest`),
+   * whose whole point is a name that is NOT fleet-prefixed (`deriveAppHandle`
+   * always prepends `fleetName`, which can never produce the owner-scoped,
+   * cross-fleet-recognizable name `apply-router-app.ts::deriveRouterAppHandle`
+   * derives for the shared scope). `undefined` (every other caller — every
    * ordinary agent App, runner-ops, and the router App's own PER-FLEET
    * scope) keeps the derived `deriveAppHandle(fleetName, role)` name,
    * byte-identical to before this field existed.
