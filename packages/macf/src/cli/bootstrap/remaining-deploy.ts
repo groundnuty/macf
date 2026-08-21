@@ -130,7 +130,7 @@ function vaultLocationNote(manifest: FleetManifest): string {
   return (
     `these commands omit --vault, so \`fleet deploy\` will default to <dirname-of--f>/secrets/vault.age — that ` +
     `default is WRONG unless -f points at (or, after a \`git pull\`, becomes) a local clone of "${controlRepo}": ` +
-    `apply durably wrote this run's vault ONLY by pushing to that repo (DR-043 Amendment F), never to a stable ` +
+    `apply durably wrote this run's vault ONLY by pushing to that repo, never to a stable ` +
     'local path. Clone it first, or pass --vault explicitly.'
   );
 }
@@ -169,8 +169,8 @@ export function computeRemainingDeploy(
         ? {
             reason:
               `parent directory ${parent} does not exist on this host — deploy_path may belong to a ` +
-              'different host in a multi-host fleet; absence cannot be confirmed from here (DR-043 Amendment A ' +
-              'honest-unknown floor).',
+              'different host in a multi-host fleet; absence cannot be confirmed from here (honest-unknown ' +
+              'floor).',
           }
         : {}),
       command,
@@ -195,7 +195,7 @@ export function formatRemainingDeployLines(report: RemainingDeployReport): reado
   if (report.steps.length === 0) return [];
   const lines: string[] = [
     `⚠ ${String(report.steps.length)} declared agent(s) have no local workspace yet — the fleet is provisioned but ` +
-      'NOT running (DR-043 Amendment A honest completion, macf#1014; same family as #979/#987/#999). apply ' +
+      'NOT running. apply ' +
       'succeeded at its own job; deploy each agent to bring the fleet up:',
   ];
   if (report.vaultLocationNote !== undefined) {
