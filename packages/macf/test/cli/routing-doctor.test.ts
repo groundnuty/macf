@@ -129,7 +129,7 @@ describe('evaluateSelfSkip — #538(b) / #566', () => {
   it('heuristic: bare routing label (the #566 bug) fails with no authoritative login', () => {
     const r = evaluateSelfSkip('code-agent', 'code-agent');
     expect(r.ok).toBe(false);
-    expect(r.reason).toMatch(/#566/);
+    expect(r.reason).toMatch(/bare routing label, not a bot-login/);
   });
   it('heuristic: a bot-login-shaped app_name passes', () => {
     expect(evaluateSelfSkip('code-agent', 'macf-code-agent')).toEqual({ ok: true });
@@ -260,7 +260,7 @@ describe('caCertLine — text render (macf#873)', () => {
     const fp = caCertFingerprint(VALID_PEM);
     const line = caCertLine(evaluateCaCert(ROTATED_PEM, fp));
     expect(line).toMatch(/^MACF_CA_CERT: ✗/);
-    expect(line).toMatch(/macf#873/);
+    expect(line).toMatch(/does NOT match the current CA/);
     expect(line).toMatch(/does NOT match/);
   });
   it('matchesCurrentCa:null (no local CA) → "— n/a", visually distinct from the ✓-match pass', () => {
@@ -768,7 +768,7 @@ describe('evaluateRoutingClientCertIssuer — orphan detection (#800)', () => {
     expect(r.currentFingerprint).toBe('NEW-FP');
     expect(r.reason).toMatch(/orphaned/);
     expect(r.reason).toMatch(/macf certs issue-routing-client/);
-    expect(r.reason).toMatch(/#800/);
+    expect(r.reason).toMatch(/re-mint via `macf certs issue-routing-client`/);
   });
 
   it('never recorded (never minted / pre-#800 workspace) → absent, informational only', () => {
@@ -1198,7 +1198,7 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
       current_fingerprint: 'NEW-FP',
       minted_at: '2026-06-01T00:00:00Z',
     });
-    expect(json.routing_client_cert.reason).toMatch(/#800/);
+    expect(json.routing_client_cert.reason).toMatch(/re-mint via `macf certs issue-routing-client`/);
   });
 
   it('additive (#800): an absent (never-minted) routing-client cert reports routing_client_cert_ok:true', async () => {
