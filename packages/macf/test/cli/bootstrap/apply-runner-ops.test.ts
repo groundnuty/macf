@@ -21,6 +21,12 @@ import {
 import type { ConfirmedInstall } from '../../../src/cli/bootstrap/identity-confirm.js';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 
+/**
+ * `router_app_scope: 'per-fleet'` (groundnuty/macf#1082) pins this file's
+ * `plannedAppNames` router-handle assertion to the pre-#1082 fleet-derived
+ * name — that default flip is covered separately in `apply-router-app.test.ts`
+ * / `apply-fleet.test.ts`, not re-verified here.
+ */
 function manifestWithRoles(fleetName: string, roles: readonly string[]): FleetManifest {
   return {
     apiVersion: 'macf/v0',
@@ -28,7 +34,7 @@ function manifestWithRoles(fleetName: string, roles: readonly string[]): FleetMa
     metadata: { name: fleetName },
     owner: { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } },
     network: { advertise_host: 'example.ts.net' },
-    transport: { age_recipients: ['age1operator'] },
+    transport: { age_recipients: ['age1operator'], router_app_scope: 'per-fleet' },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents: roles.map((role) => ({ role, profile: 'x', repo: `groundnuty/${fleetName}-${role}`, deploy_path: '/x' })),
     trust: { ca: 'per-project', federated_cas: [] },
