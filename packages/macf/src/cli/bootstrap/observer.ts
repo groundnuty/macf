@@ -25,9 +25,16 @@ import { deriveControlRepoName, ROUTER_EMITTED_LABELS } from './fleet-manifest.j
 import type { FleetObserverFn, ObservedAgentState, ObservedState, Presence } from './plan.js';
 import { readFleetLockFile } from './fleet-lock.js';
 import { registryPathPrefix } from '../registry-helper.js';
-import type { VaultAgentObservation, VaultCaObservation, VaultReadOptions, VaultRecipientCountResult, VaultRecipientsObservation } from './vault-read.js';
+import type {
+  VaultAgentObservation,
+  VaultCaObservation,
+  VaultReadOptions,
+  VaultRecipientCountResult,
+  VaultRecipientsObservation,
+  VaultRouterAppObservation,
+} from './vault-read.js';
 import { VaultError } from './vault-write.js';
-import { queryVaultAgentPresence, queryVaultCaPresence, readVault, readVaultRecipientCount } from './vault-read.js';
+import { queryVaultAgentPresence, queryVaultCaPresence, readVault, readVaultRecipientCount, vaultRouterAppId } from './vault-read.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -1250,8 +1257,9 @@ export interface VaultAwareObserverDeps {
  *
  * The BASE observation (`githubRegistryObserver`'s `lock`/`caRepos`/
  * `routingTrustedActors`/non-vault agent fields) is computed exactly as before and
- * carried through unchanged — this function ADDS `vault`/`vaultCa`, it never
- * revises anything the non-vault-aware observer already determined.
+ * carried through unchanged — this function ADDS `vault`/`vaultCa`/
+ * `vaultRecipients`/`vaultRouterApp` (groundnuty/macf#1105), it never revises
+ * anything the non-vault-aware observer already determined.
  */
 export async function vaultAwareObserver(
   manifest: FleetManifest,
@@ -1287,6 +1295,19 @@ export async function vaultAwareObserver(
       ? { status: 'confirmed', presence: queryVaultCaPresence(raw, manifest.metadata.name) }
       : { status: 'unknown', reason: unknownReason };
 
+  // groundnuty/macf#1105 — the router App's presence in THIS fleet's own
+  // vault. Needed because a SHARED-scope reuse (`apply-router-app.ts::
+  // RouterAppApplyOutcome`'s `'vault-reused'` status) deliberately never
+  // writes a `fleet.lock` entry — lock-based presence alone (the
+  // `runnerOpsItem` convention) would read this fleet as "create" forever,
+  // even after a successful vault-backed reuse. `raw !== undefined` mirrors
+  // `vaultCa`'s own gate exactly: a vault this run couldn't decrypt degrades
+  // to honest 'unknown', never a false 'absent' (Amendment A4).
+  const vaultRouterApp: VaultRouterAppObservation =
+    raw !== undefined
+      ? { status: 'confirmed', present: vaultRouterAppId(raw) !== undefined }
+      : { status: 'unknown', reason: unknownReason };
+
   // DR-043 §D5 recipient-set reconciliation (macf#957) — deliberately
   // INDEPENDENT of `raw`/`doReadVault` above: the recipient STANZA COUNT
   // needs no private key at all (see `vault-read.ts`'s module doc), so this
@@ -1300,5 +1321,5 @@ export async function vaultAwareObserver(
     vaultRecipients = { status: 'unknown', reason: err instanceof VaultError || err instanceof Error ? err.message : String(err) };
   }
 
-  return { ...base, agents, vaultCa, vaultRecipients };
+  return { ...base, agents, vaultCa, vaultRecipients, vaultRouterApp };
 }
