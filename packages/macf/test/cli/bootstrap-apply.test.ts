@@ -44,6 +44,7 @@ import type { AppCredentials } from '../../src/cli/bootstrap/manifest-exchange.j
 import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../src/cli/bootstrap/apply-routing-client.js';
 import type { RoutingSecretsPublishDeps } from '../../src/cli/bootstrap/apply-routing-secrets.js';
+import { TAILSCALE_OAUTH_MISSING_CODE } from '../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RunnerRegistrationDeps } from '../../src/cli/bootstrap/apply-routing.js';
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../src/cli/bootstrap/apply-routing.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle } from '../../src/cli/bootstrap/apply-runner-ops.js';
@@ -90,6 +91,12 @@ agents:
 const FLEET_YAML_WITH_ORG_REGISTRY = FLEET_YAML.replace('type: user', 'type: org').replace(
   'registry: { type: profile, user: groundnuty }',
   'registry: { type: org, org: demo-org }',
+);
+
+/** groundnuty/macf#1074 — same fixture as {@link FLEET_YAML}, `transport.tailscale_oauth_required: true` declared. Used ONLY by the Tailscale-preflight describe block below. */
+const FLEET_YAML_WITH_TAILSCALE = FLEET_YAML.replace(
+  'age_recipients: [age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]',
+  'age_recipients: [age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]\n  tailscale_oauth_required: true',
 );
 
 /** Observed state where NOTHING exists — every agent is an App create-candidate. */
@@ -1244,6 +1251,142 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // plan.test.ts's dedicated coverage for this note's unconditional
       // presence; this test only pins that --dry-run does not ALSO refuse.
       expect(out).toContain(RUNNER_TOKEN_FLAG);
+    });
+  });
+
+  // --- groundnuty/macf#1074 — Tailscale-declared refuse-before-gate-1
+  // pre-flight, same shape as macf#932 immediately above: the decisive case
+  // is zero gate invocations, not merely a non-zero exit code.
+  describe('groundnuty/macf#1074 — Tailscale-declared pre-flight refusal before consent gate 1', () => {
+    it('declared + NO --vault/--identity-key supplied -> refuses BEFORE consent gate 1: observe/confirmPlan/buildAgentDeps/openUrl/startManifestFlow/confirmAppInstallation are ALL zero calls', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      let observeCalls = 0;
+      let confirmPlanCalls = 0;
+      let buildAgentDepsCalls = 0;
+      let openUrlCalls = 0;
+      let startManifestFlowCalls = 0;
+      let confirmAppInstallationCalls = 0;
+
+      const code = await runBootstrapApply(
+        { file, yes: true }, // no vaultPath/identityKeyPath
+        {
+          observe: () => {
+            observeCalls += 1;
+            return Promise.resolve(EMPTY_OBSERVED);
+          },
+        },
+        fakeMutateDeps(file, {
+          confirmPlan: async () => {
+            confirmPlanCalls += 1;
+            return true;
+          },
+          buildAgentDeps: () => {
+            buildAgentDepsCalls += 1;
+            return fakeAgentDeps({
+              openUrl: async () => {
+                openUrlCalls += 1;
+              },
+              startManifestFlow: async () => {
+                startManifestFlowCalls += 1;
+                throw new Error('must not be called — the pre-flight must refuse before this seam is ever reached');
+              },
+              confirmAppInstallation: async () => {
+                confirmAppInstallationCalls += 1;
+                return { status: 'unconfirmable' };
+              },
+            });
+          },
+        }),
+      );
+
+      expect(code).toBe(1);
+      // THE decisive assertion: not "exited non-zero" but "never even
+      // asked the operator to approve, never even read GitHub state,
+      // never opened a browser." Each seam firing would mean the refusal
+      // arrived too late (mirrors macf#932's identical discipline above).
+      expect(observeCalls).toBe(0);
+      expect(confirmPlanCalls).toBe(0);
+      expect(buildAgentDepsCalls).toBe(0);
+      expect(openUrlCalls).toBe(0);
+      expect(startManifestFlowCalls).toBe(0);
+      expect(confirmAppInstallationCalls).toBe(0);
+
+      expect(errs.join('\n')).toContain('--vault/--identity-key');
+      // Nothing mutated:
+      const dir = join(file, '..');
+      expect(existsSync(join(dir, 'fleet.lock'))).toBe(false);
+      expect(existsSync(join(dir, 'secrets', 'vault.age'))).toBe(false);
+    });
+
+    it('declared + both flags supplied + vault lacks the values -> STILL refuses before gate 1 (same zero-calls proof)', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      let startManifestFlowCalls = 0;
+      const code = await runBootstrapApply(
+        { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED), readVault: async () => ({}) },
+        fakeMutateDeps(file, {
+          buildAgentDeps: () =>
+            fakeAgentDeps({
+              startManifestFlow: async () => {
+                startManifestFlowCalls += 1;
+                throw new Error('must not be called');
+              },
+            }),
+        }),
+      );
+      expect(code).toBe(1);
+      expect(startManifestFlowCalls).toBe(0);
+      expect(errs.join('\n')).toMatch(/did not yield TS_OAUTH_CLIENT_ID/);
+    });
+
+    it('the refusal is visible under --json too, never empty stdout', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+      expect(code).toBe(1);
+      expect(logs.length).toBeGreaterThan(0);
+      const parsed = JSON.parse(logs.join('\n')) as { error: { code: string; message: string } };
+      expect(parsed.error.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
+    });
+
+    it('NOT declared at all -> unaffected: proceeds with no vault flags and no refusal (a fleet that has not set up Tailscale yet is not broken)', async () => {
+      const file = writeManifest(); // FLEET_YAML — no tailscale_oauth_required
+      const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(TAILSCALE_OAUTH_MISSING_CODE);
+    });
+
+    it('declared + both flags supplied + vault YIELDS the values -> proceeds (not a new obstacle for the already-satisfied case)', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      const code = await runBootstrapApply(
+        // macf#1013 — deploy:false: this test is about the Tailscale
+        // preflight + publish-time resolution, not the (unrelated) deploy
+        // phase, which would otherwise try to decrypt the fake vault path
+        // for real and fail, contaminating this test's exit-code assertion.
+        { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt', deploy: false },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED), readVault: async () => ({ TS_OAUTH_CLIENT_ID: 'ts-client-id', TS_OAUTH_SECRET: 'ts-secret' }) },
+        fakeMutateDeps(file, {
+          // The preflight (above) and the PUBLISH-time resolution
+          // (apply-fleet.ts, via routingSecretsDeps.readVaultTsOauth) are
+          // two SEPARATE reads (the "each concern gets its own decrypt"
+          // convention this codebase already follows for CA/routing-client
+          // restores) — both need wiring for the run to fully succeed, not
+          // just clear the preflight.
+          routingSecretsDeps: fakeRoutingSecretsDeps({
+            checkRepoSecretPresence: async () => 'present',
+            readVaultTsOauth: async () => ({ clientId: 'ts-client-id', secret: 'ts-secret' }),
+          }),
+        }),
+      );
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(TAILSCALE_OAUTH_MISSING_CODE);
+    });
+
+    it('--dry-run is UNAFFECTED even with no vault flags — a dry run never opens a gate to begin with', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+      expect(code).toBe(0);
+      const out = logs.join('\n');
+      expect(out).toMatch(/DRY RUN — nothing was created/);
     });
   });
 

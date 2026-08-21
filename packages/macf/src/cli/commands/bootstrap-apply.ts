@@ -2129,7 +2129,7 @@ export async function runBootstrapApply(
     // `checkAppNameLengths`/`checkRegistryScopePreflight` checks above), so
     // it is the ONE async pre-flight in this block.
     const tailscaleFailure = await checkTailscaleOauthPreflight(manifest.transport.tailscale_oauth_required, opts.vaultPath, opts.identityKeyPath, {
-      readVault,
+      readVault: deps?.readVault ?? readVault,
     });
     if (tailscaleFailure !== undefined) {
       return renderFailure(tailscaleFailure, opts);
