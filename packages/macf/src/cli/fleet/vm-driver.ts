@@ -75,6 +75,23 @@ export const DEFAULT_BUSY_WINDOW_MS = 2000;
 export const WORKSPACE_INSPECTION_FAILED =
   '<git status failed — workspace missing, unreadable, or not a git repository; verify manually>';
 
+/**
+ * Sentinel `listDirtyConfig`/`classifyDirtyConfig` entry (macf#1101) for the
+ * DIFFERENT failure shape: `resolveTarget` itself found NO workspace at all
+ * matching this agent under this driver's bound project (an agent that
+ * `discoverWorkspaces()` returned as a fleet member moments earlier, at
+ * `upgradeFleets`'s `members` computation, yet a fresh re-resolution can no
+ * longer find — a transient host-discovery inconsistency, a workspace
+ * removed mid-run, or a same-routing-label ambiguity within the SAME
+ * project). Distinct from `WORKSPACE_INSPECTION_FAILED` (a real, resolved
+ * directory that `git status` couldn't read) — this fires BEFORE any git
+ * call is even attempted, because there is no directory to `cwd` into.
+ * Same fail-CLOSED contract: an unresolvable workspace must never read as a
+ * pass.
+ */
+export const WORKSPACE_UNRESOLVED =
+  '<no workspace could be resolved for this agent under this fleet; verify manually>';
+
 /** The identity a target workspace's config yields for session derivation. */
 export interface WorkspaceIdentity {
   readonly project?: string;
@@ -415,15 +432,24 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
 
   async function isConfigDirty(agent: string): Promise<boolean> {
     const target = resolveTarget(seams, agent, opts.project);
-    // Unknown agent → nothing to check (mirrors isBusy's dead/unknown → false).
-    if (!target) return false;
+    // macf#1101 — fail CLOSED (dirty), NOT `isBusy`'s dead/unknown → false.
+    // `isBusy`'s "false" is about SESSION liveness on an agent whose
+    // workspace genuinely resolved; here `!target` means no workspace could
+    // be resolved AT ALL under this driver's bound project — "couldn't
+    // verify" must never read as "verified clean" (the false-pass hazard
+    // this issue codifies). A downstream `upgrade()`/`restart()` on the
+    // SAME unresolvable agent already throws (`requireTarget`); this keeps
+    // the pre-flight gate consistent with that same conservative posture.
+    if (!target) return true;
     return seams.isConfigDirty(target.workspace);
   }
 
   async function listDirtyConfig(agent: string): Promise<readonly string[]> {
     const target = resolveTarget(seams, agent, opts.project);
-    // Unknown agent → nothing to check (mirrors isConfigDirty's unknown → false).
-    if (!target) return [];
+    // macf#1101 — same fail-CLOSED rationale as isConfigDirty above; see
+    // `WORKSPACE_UNRESOLVED`'s doc for why this is a DISTINCT sentinel from
+    // `WORKSPACE_INSPECTION_FAILED` (no directory to even `cwd` into here).
+    if (!target) return [WORKSPACE_UNRESOLVED];
     return seams.listDirtyConfig(target.workspace);
   }
 
@@ -480,13 +506,17 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
    * EACH path via the canonical-compute primitive (`classifyDirtyFile`).
    * Unknown agent / unresolvable config → everything classifies as
    * genuine-delta (fail-safe — never auto-resolve without a config to
-   * compute canonical content against).
+   * compute canonical content against). This is THE gate `rollFleet` calls
+   * pre-flight (macf#725/DR-040 Decision 3), so its fail-safe direction is
+   * load-bearing: an unresolvable agent (macf#1101 — no workspace matches
+   * this routing label under this driver's bound project) must OBJECT via
+   * `WORKSPACE_UNRESOLVED`, never silently return "nothing dirty."
    */
   async function classifyDirtyConfig(
     agent: string,
   ): Promise<{ readonly alreadyCanonical: readonly string[]; readonly genuineDelta: readonly string[] }> {
     const target = resolveTarget(seams, agent, opts.project);
-    if (!target) return { alreadyCanonical: [], genuineDelta: [] };
+    if (!target) return { alreadyCanonical: [], genuineDelta: [WORKSPACE_UNRESOLVED] };
 
     const dirty = seams.listDirtyConfig(target.workspace);
     if (dirty.length === 0) return { alreadyCanonical: [], genuineDelta: [] };

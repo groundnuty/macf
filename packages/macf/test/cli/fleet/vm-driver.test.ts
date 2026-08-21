@@ -26,6 +26,7 @@ import {
   childEnvForTarget,
   ORCHESTRATOR_IDENTITY_ENV_KEYS,
   WORKSPACE_INSPECTION_FAILED,
+  WORKSPACE_UNRESOLVED,
   type VmDriverOptions,
   type VmDriverSeams,
   type WorkspaceIdentity,
@@ -421,9 +422,9 @@ describe('isConfigDirty', () => {
     expect(await createVmDriver(OPTS, seams).isConfigDirty('code-agent')).toBe(false);
   });
 
-  it('is clean (false) when the agent is unknown — nothing to check', async () => {
+  it('fails CLOSED (dirty) when the agent is unknown — "could not verify" must never read as "clean" (macf#1101)', async () => {
     const { seams } = fakeSeams({ configDirtyWorkspaces: new Set(['/w/macf']) });
-    expect(await createVmDriver(OPTS, seams).isConfigDirty('ghost')).toBe(false);
+    expect(await createVmDriver(OPTS, seams).isConfigDirty('ghost')).toBe(true);
   });
 
   it('checks the RESOLVED agent workspace, not the driver`s own workspace', async () => {
@@ -449,9 +450,9 @@ describe('listDirtyConfig', () => {
     expect(await createVmDriver(OPTS, seams).listDirtyConfig('code-agent')).toEqual([]);
   });
 
-  it('returns an empty list when the agent is unknown — nothing to check', async () => {
+  it('returns the WORKSPACE_UNRESOLVED sentinel when the agent is unknown — never an empty (= clean) list (macf#1101)', async () => {
     const { seams } = fakeSeams({ dirtyConfigFiles: new Map([['/w/macf', ['CLAUDE.md']]]) });
-    expect(await createVmDriver(OPTS, seams).listDirtyConfig('ghost')).toEqual([]);
+    expect(await createVmDriver(OPTS, seams).listDirtyConfig('ghost')).toEqual([WORKSPACE_UNRESOLVED]);
   });
 
   it('checks the RESOLVED agent workspace, not the driver`s own workspace', async () => {
@@ -669,6 +670,23 @@ describe('createVmDriver — cross-project routing-label collision, decisive pai
     const driver = createVmDriver({ workspaceDir: TARGET_WORKSPACE, project: 'macf-experiment' }, seams);
     expect(await driver.resolveWorkspace?.('code-agent')).toBeNull();
   });
+
+  // THE BLOCKER CASE (macf#1101): the project-scoping fix means a
+  // same-routing-label-different-project record no longer silently
+  // substitutes — `resolveTarget` now correctly returns null. That is only
+  // a real fix if the GATE `rollFleet` actually calls (`classifyDirtyConfig`)
+  // treats null as "object", not as its pre-fix "nothing dirty" default. If
+  // this test used the pre-#1101 `classifyDirtyConfig` body (`!target →
+  // {[],[]}`), it would PASS even against code that still silently lets an
+  // unresolvable target roll clean — proving nothing about the fix. The
+  // assertion below is the one that actually distinguishes them.
+  it('classifyDirtyConfig OBJECTS (never silently clean) when NO record exists under the bound project at all', async () => {
+    const { seams } = fakeSeams({ workspaces: [orchOwnRecord] }); // no macf-experiment record present
+    const driver = createVmDriver({ workspaceDir: TARGET_WORKSPACE, project: 'macf-experiment' }, seams);
+    const result = await driver.classifyDirtyConfig('code-agent');
+    expect(result.genuineDelta.length).toBeGreaterThan(0);
+    expect(result).toEqual({ alreadyCanonical: [], genuineDelta: [WORKSPACE_UNRESOLVED] });
+  });
 });
 
 // --- createVmExecSeams — discover() scan-root binding (macf#1101) -----------
@@ -724,10 +742,10 @@ describe('createVmExecSeams — discover() scan-root binding (macf#1101)', () =>
 // seam (or no-ops on an unknown agent / empty file list).
 
 describe('classifyDirtyConfig', () => {
-  it('returns both tiers empty when the agent is unknown — never calls readFullConfig', async () => {
+  it('OBJECTS with the WORKSPACE_UNRESOLVED sentinel when the agent is unknown — never a silent "nothing dirty" (macf#1101)', async () => {
     const { seams } = fakeSeams({ dirtyConfigFiles: new Map([['/w/macf', ['CLAUDE.md']]]) });
     const result = await createVmDriver(OPTS, seams).classifyDirtyConfig('ghost');
-    expect(result).toEqual({ alreadyCanonical: [], genuineDelta: [] });
+    expect(result).toEqual({ alreadyCanonical: [], genuineDelta: [WORKSPACE_UNRESOLVED] });
   });
 
   it('returns both tiers empty when nothing is dirty', async () => {

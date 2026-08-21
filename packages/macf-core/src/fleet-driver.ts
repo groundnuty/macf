@@ -113,12 +113,18 @@ export interface FleetDriver {
    * `.claude/.macf/env.*` + `host-prelude.sh`, `CLAUDE.md`, `env.local.*` —
    * see `ROLL_TOUCHED_CONFIG_PATTERNS` in `fleet-upgrade.ts`, narrowed off a
    * `.claude/**` wildcard by DR-040 Decision 6 / macf#698). VM: `git status`
-   * in the agent's workspace, filtered to that path set. A DEAD/absent agent
-   * reads `false` (nothing to check; reconcile will launch it). Kept as a
-   * boolean convenience alongside `listDirtyConfig` below — `rollFleet`'s
-   * pre-flight gate itself calls `listDirtyConfig` (it needs the file list to
-   * OBJECT with, macf#725), so this predicate form is for OTHER callers that
-   * only need the yes/no answer.
+   * in the agent's workspace, filtered to that path set. Kept as a boolean
+   * convenience alongside `listDirtyConfig` below — `rollFleet`'s pre-flight
+   * gate itself calls `classifyDirtyConfig` (it needs the tiered file list
+   * to OBJECT with, macf#725/macf#1101), so this predicate form is for OTHER
+   * callers that only need the yes/no answer.
+   *
+   * `true` when the workspace itself couldn't be resolved OR inspected at
+   * all (macf#1101) — DISTINCT from `isBusy`'s "DEAD/absent agent is not
+   * busy": that predicate concerns SESSION liveness on an agent whose
+   * workspace resolved fine; this one concerns whether the workspace could
+   * be found/read in the first place. "Couldn't verify" must never read as
+   * "verified clean" — the false-pass hazard this issue codifies.
    */
   readonly isConfigDirty: (agent: string) => Promise<boolean>;
 
@@ -129,7 +135,9 @@ export interface FleetDriver {
    * uncommitted paths rather than a boolean. Empty array == clean
    * (equivalent to `isConfigDirty` reading `false`). VM: `git status
    * --porcelain` in the agent's workspace, filtered to that path set, one
-   * path per line.
+   * path per line. An unresolvable/unreadable workspace (macf#1101) returns
+   * a single diagnostic SENTINEL entry (never a real path), not an empty
+   * array — see `isConfigDirty`'s doc for why.
    *
    * **Superseded as `rollFleet`'s pre-flight call site by `classifyDirtyConfig`
    * below (DR-040 Decision 3 / macf#698 R1)** — the roll no longer treats
@@ -160,7 +168,12 @@ export interface FleetDriver {
    * Both arrays are empty when the agent has no dirty config surface at all
    * (mirrors `listDirtyConfig`'s empty-array-== -clean contract). VM: reuses
    * `listDirtyConfig` for the raw list, then classifies each path via
-   * `classifyDirtyFile`.
+   * `classifyDirtyFile`. An unresolvable agent (macf#1101 — no workspace
+   * matches this routing label under the driver's bound project) yields a
+   * NON-EMPTY `genuineDelta` (a diagnostic sentinel) — this is the gate
+   * `rollFleet` actually calls, so its fail-safe direction is load-bearing:
+   * an unresolvable agent must OBJECT, never silently read as "nothing
+   * dirty."
    */
   readonly classifyDirtyConfig: (agent: string) => Promise<{
     readonly alreadyCanonical: readonly string[];
