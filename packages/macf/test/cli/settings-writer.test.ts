@@ -814,7 +814,7 @@ describe('installGhTokenHook — DR-039 Amendment B self-guard (macf#743 review)
     expect(warnSpy).toHaveBeenCalled();
     const messages = warnSpy.mock.calls.map((args) => String(args[0]));
     expect(messages.some((m) => m.includes('deferring hook-strip'))).toBe(true);
-    expect(messages.some((m) => m.includes('DR-039'))).toBe(true);
+    expect(messages.some((m) => m.includes('load the full .macf/plugin'))).toBe(true);
     warnSpy.mockRestore();
   });
 
