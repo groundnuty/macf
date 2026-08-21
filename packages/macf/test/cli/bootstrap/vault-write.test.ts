@@ -194,6 +194,42 @@ describe('buildVaultPlaintext', () => {
       expect((e as VaultError).code).toBe('vault_conflicting_routing_client');
     }
   });
+
+  // --- groundnuty/macf#1074 — routingApp (the dedicated per-fleet router App) ---
+
+  it('includes routingApp under the SAME MACF_ROUTING_APP_* keys the (unused) `routing` block would use', () => {
+    const out = buildVaultPlaintext({ agents: [], routingApp: { appId: '999', appKeyPem: 'ROUTER-APP-PEM' } });
+    expect(out).toContain(`MACF_ROUTING_APP_ID='999'`);
+    expect(out).toContain(`MACF_ROUTING_APP_KEY_B64='${Buffer.from('ROUTER-APP-PEM', 'utf-8').toString('base64')}'`);
+    // Never the routing-client or TS_OAUTH fields — those belong to routingClient / the vault-only-never-written TS_OAUTH pair.
+    expect(out).not.toContain('ROUTING_CLIENT_CERT');
+    expect(out).not.toContain('ROUTING_CLIENT_KEY');
+    expect(out).not.toContain('TS_OAUTH');
+  });
+
+  it('routingApp and routingClient coexist in ONE call — disjoint key sets, both real ceremonies for the same fleet', () => {
+    const out = buildVaultPlaintext({
+      agents: [],
+      routingApp: { appId: '999', appKeyPem: 'ROUTER-APP-PEM' },
+      routingClient: { clientCertPem: 'RC-CERT-PEM', clientKeyPem: 'RC-KEY-PEM' },
+    });
+    expect(out).toContain(`MACF_ROUTING_APP_ID='999'`);
+    expect(out).toContain(`ROUTING_CLIENT_CERT_B64='${Buffer.from('RC-CERT-PEM', 'utf-8').toString('base64')}'`);
+  });
+
+  it('throws when BOTH routing and routingApp are given (they write the same MACF_ROUTING_APP_* vault keys — never a silent double-emit)', () => {
+    try {
+      buildVaultPlaintext({
+        agents: [],
+        routing: { appId: '1', appKeyPem: 'a', clientCertPem: 'b', clientKeyPem: 'c', tsOauthClientId: 'd', tsOauthSecret: 'e' },
+        routingApp: { appId: '999', appKeyPem: 'ROUTER-APP-PEM' },
+      });
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VaultError);
+      expect((e as VaultError).code).toBe('vault_conflicting_routing_app');
+    }
+  });
 });
 
 describe('vaultAgentSecretsForFingerprint / vaultFleetSecretsForFingerprint', () => {
@@ -241,6 +277,16 @@ describe('vaultAgentSecretsForFingerprint / vaultFleetSecretsForFingerprint', ()
       routing_client_cert: 'RC-CERT-PEM',
       routing_client_key: 'RC-KEY-PEM',
       ca_key: 'CA-KEY',
+    });
+  });
+
+  it('maps routingApp under the SAME routing_app_key name the (unused) `routing` block would use, omitting the public appId (groundnuty/macf#1074)', () => {
+    const payload: VaultPayload = {
+      agents: [],
+      routingApp: { appId: '999', appKeyPem: 'ROUTER-APP-PEM' },
+    };
+    expect(vaultFleetSecretsForFingerprint(payload)).toEqual({
+      routing_app_key: 'ROUTER-APP-PEM',
     });
   });
 });
