@@ -702,7 +702,7 @@ export function createVmExecSeams(
           [
             'commit',
             '-m',
-            'chore(config): commit already-canonical macf-update regen (auto-resolved, DR-040 Decision 3 tier-first)',
+            'chore(config): commit already-canonical macf-update regen (auto-resolved)',
           ],
           { cwd: dir, stdio: 'ignore' },
         );

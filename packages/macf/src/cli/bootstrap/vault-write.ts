@@ -698,7 +698,7 @@ export async function writeVault(
     if (opts.allowVersion !== true) {
       throw new VaultError(
         'vault_exists',
-        `${destPath} already exists — refusing to overwrite an existing vault (DR-043 §D5 non-destructive ` +
+        `${destPath} already exists — refusing to overwrite an existing vault (a non-destructive ` +
           "guarantee; mirrors bootstrap-commit-vault.sh's fail-loud-on-clobber). Pass { allowVersion: true } " +
           'to version instead of overwrite (writes a timestamped sibling file, mirrors MACF_BOOTSTRAP_VAULT_VERSION=1).',
       );
@@ -837,7 +837,7 @@ export async function writeAgentRecoveryArtifact(
     throw new VaultError(
       'vault_no_age_recipient',
       'writeAgentRecoveryArtifact: transport.age_recipients is empty — this agent\'s just-issued ' +
-        'credential CANNOT be made durable (DR-043 §D5). Mint an age recipient and add it to transport.age_recipients ' +
+        'credential CANNOT be made durable. Mint an age recipient and add it to transport.age_recipients ' +
         'in fleet.yaml before re-running apply.',
     );
   }

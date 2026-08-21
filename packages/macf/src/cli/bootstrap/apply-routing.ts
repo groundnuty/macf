@@ -255,7 +255,7 @@ export function noRunnerRegisteredReason(repo: string, usability: RunnerUsabilit
   return (
     `${cause} for "${repo}" — MACF_TRUSTED_ACTORS was NOT written; this repo continues routing on ` +
     'ubuntu-latest (billed on private repos) until a runner is registered and confirmed ' +
-    `(register-before-route — macf-devops-toolkit runner/RUNNER.md §"The security model"; macf#922).${detailSuffix}${handoverSuffix}`
+    `(register-before-route — see macf-devops-toolkit's runner/RUNNER.md §"The security model").${detailSuffix}${handoverSuffix}`
   );
 }
 
@@ -339,7 +339,7 @@ export const RUNNER_TOKEN_ENV_VAR = 'MACF_BOOTSTRAP_RUNNER_TOKEN';
  */
 export function noRunnerTokenReason(): string {
   return (
-    'manifest declares routing.runner (runs_on: "self-hosted", DR-043 Amendment H) but no runner registration ' +
+    'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration ' +
     'token was supplied — refusing to write MACF_TRUSTED_ACTORS to any repo before a runner can be confirmed ' +
     '(same posture as an unconfigured transport.age_recipients refusing before consent gate 1: writing trust ' +
     'ahead of a confirmable runner would route jobs at a self-hosted queue nothing may ever service). Supply ' +
@@ -488,10 +488,10 @@ export function runnerPermissionDeniedReason(repo: string, usability: RunnerUsab
   const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
   const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
   return (
-    `role/repo "${repo}": a runner registration token was supplied (macf#929) but the repo-scoped runner list was ` +
+    `role/repo "${repo}": a runner registration token was supplied but the repo-scoped runner list was ` +
     'refused outright (HTTP 403) — failing immediately, WITHOUT retrying, because a permission gap cannot resolve ' +
-    'itself given more time (DR-044 Decision 6, groundnuty/macf#1054). MACF_TRUSTED_ACTORS was NOT written. ' +
-    "Listing a repo's registered runners is FLEET authority, not agent authority (DR-044) — re-run " +
+    'itself given more time. MACF_TRUSTED_ACTORS was NOT written. ' +
+    "Listing a repo's registered runners is FLEET authority, not agent authority — re-run " +
     '`macf bootstrap apply` with a runner-registration token (and, if this run used the agent identity\'s own ' +
     'installation token for the underlying `gh` auth, with an identity holding "administration: read" on this ' +
     `repo).${detailSuffix}${handoverSuffix}`
@@ -537,7 +537,7 @@ export function runnerJustCreatedRepoReason(repo: string, usability: RunnerUsabi
   const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
   const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
   return (
-    `role/repo "${repo}": a runner registration token was supplied (macf#929) but ${cause} — ` +
+    `role/repo "${repo}": a runner registration token was supplied but ${cause} — ` +
     'MACF_TRUSTED_ACTORS was NOT written; this repo routes on hosted runners (billed on private repos) ' +
     'until a runner is confirmed. Register a runner for this repo, then re-run `macf bootstrap apply`.' +
     `${detailSuffix}${handoverSuffix}`
@@ -552,7 +552,7 @@ export function runnerTokenPollExhaustedReason(repo: string, usability: RunnerUs
   const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
   const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
   return (
-    `role/repo "${repo}": a runner registration token was supplied (macf#929) but ${cause} within the ` +
+    `role/repo "${repo}": a runner registration token was supplied but ${cause} within the ` +
     `${String(Math.round(timeoutMs / 1000))}s poll window — MACF_TRUSTED_ACTORS was NOT written; this repo ` +
     'routes on hosted runners (billed on private repos) until a runner is confirmed. Re-run `macf bootstrap ' +
     `apply\` once it is registered.${detailSuffix}${handoverSuffix}`

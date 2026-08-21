@@ -46,7 +46,7 @@ describe('seedPromptResponsesConfig — absent', () => {
     expect(loaded.refused).toHaveLength(0);
     expect(loaded.warned).toHaveLength(0);
     // Carries an operator `_comment` note.
-    expect((raw as Record<string, unknown>)['_comment']).toContain('DR-033');
+    expect((raw as Record<string, unknown>)['_comment']).toContain('Interactive-prompt auto-responder allowlist');
   });
 });
 

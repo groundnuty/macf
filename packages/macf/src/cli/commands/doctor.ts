@@ -541,7 +541,7 @@ export function checkBotLogin(config: MacfAgentConfig): BotLoginCheckResult {
   if (!config.github_app) {
     return {
       status: 'INFO',
-      detail: 'local-registry mode (DR-024) — no GitHub App; bot_login check skipped',
+      detail: 'local-registry mode — no GitHub App; bot_login check skipped',
     };
   }
   const botLogin = config.github_app.bot_login;
@@ -552,7 +552,7 @@ export function checkBotLogin(config: MacfAgentConfig): BotLoginCheckResult {
     status: 'WARN',
     detail:
       'github_app.bot_login is unset — attribution hook inert (check-gh-attribution.sh falls ' +
-      'back to a non-authoritative agent_name guess, per macf#535). Repair via `macf doctor --fix` ' +
+      'back to a non-authoritative agent_name guess). Repair via `macf doctor --fix` ' +
       'or by re-running `macf init`.',
   };
 }
@@ -944,56 +944,56 @@ export const DR039_LOAD_BEARING_HOOKS: readonly LoadBearingHookSpec[] = [
     kind: 'mcp_tool',
     match: 'checkpoint_to_memory',
     events: ['PreCompact'],
-    citation: 'DR-034 session-handoff memory write — its absence was the DR-039 trigger incident',
+    citation: 'session-handoff memory write — a missing copy of this hook previously let an agent lose its session notes at compaction',
   },
   {
     name: 'check-gh-attribution',
     kind: 'command',
     match: 'check-gh-attribution.sh',
     events: ['PostToolUse'],
-    citation: 'macf#491 — attribution-trap result-invariant backstop',
+    citation: 'attribution-trap result-invariant backstop',
   },
   {
     name: 'harvest-reflection',
     kind: 'command',
     match: 'harvest-reflection.sh',
     events: ['PreCompact'],
-    citation: 'macf#500 — reflection-staging harvest at compaction',
+    citation: 'reflection-staging harvest at compaction',
   },
   {
     name: 'check-gh-token',
     kind: 'command',
     match: 'check-gh-token.sh',
     events: ['PreToolUse'],
-    citation: 'macf#140 — gh-token attribution-trap guard',
+    citation: 'gh-token attribution-trap guard',
   },
   {
     name: 'check-mention-routing',
     kind: 'command',
     match: 'check-mention-routing.sh',
     events: ['PreToolUse'],
-    citation: 'macf#244 / macf#272 — mention-routing-hygiene guard',
+    citation: 'mention-routing-hygiene guard',
   },
   {
     name: 'check-lgtm-gate',
     kind: 'command',
     match: 'check-lgtm-gate.sh',
     events: ['PreToolUse'],
-    citation: 'macf#270 — no-LGTM-no-merge guard',
+    citation: 'no-LGTM-no-merge guard',
   },
   {
     name: 'check-close-keyword',
     kind: 'command',
     match: 'check-close-keyword.sh',
     events: ['PreToolUse'],
-    citation: 'macf#431 — auto-close-keyword guard',
+    citation: 'auto-close-keyword guard',
   },
   {
     name: 'check-channel-alive',
     kind: 'command',
     match: 'check-channel-alive.sh',
     events: ['SessionStart', 'UserPromptSubmit'],
-    citation: 'macf#734 — channel-server liveness guard',
+    citation: 'channel-server liveness guard',
   },
 ];
 
@@ -1115,8 +1115,8 @@ export function checkLoadBearingHooks(workspaceDir: string): LoadBearingHooksChe
       totalCount: DR039_LOAD_BEARING_HOOKS.length,
       missing: [],
       detail:
-        'no .macf/ directory — not a macf-init-managed workspace; skipping the DR-039 ' +
-        'hook-presence assertion',
+        'no .macf/ directory — not a macf-init-managed workspace; skipping the ' +
+        'load-bearing-hook-presence assertion',
     };
   }
 
@@ -1156,7 +1156,7 @@ function promptYesNo(question: string): Promise<boolean> {
 /** Print the DR-028 "Role settings" report section for the given check. */
 function printRoleSettingsSection(role: string | null, check: RoleSettingsCheckResult | null): void {
   console.log('');
-  console.log('Role settings (DR-028)');
+  console.log('Role settings');
   console.log('──────────────────────────────────────────────────────────────');
   if (!role || !check) {
     console.log('  ⚠ role indeterminable — skipping role-settings validation');
@@ -1180,7 +1180,7 @@ function printRoleSettingsSection(role: string | null, check: RoleSettingsCheckR
     );
   }
   if (check.status === 'PASS') {
-    console.log(`  ✓ role "${role}" settings match the DR-028 floor + role deltas  [PASS]`);
+    console.log(`  ✓ role "${role}" settings match the role-aware floor + role deltas  [PASS]`);
     return;
   }
   const errors = check.findings.filter((f) => f.severity === 'ERROR');
@@ -1250,10 +1250,10 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('──────────────────────────────────────────────────────────────');
   let permissionsFailed = false;
   if (tokenSkipped) {
-    console.log('  ℹ local-registry mode (DR-024) — no GitHub App; DR-019 token check skipped.');
+    console.log('  ℹ local-registry mode — no GitHub App; token permissions check skipped.');
   } else if (tokenError || !permissions) {
     permissionsFailed = true;
-    console.error(`  ✗ DR-019 token check failed: ${tokenError ?? 'unknown error'}`);
+    console.error(`  ✗ token permissions check failed: ${tokenError ?? 'unknown error'}`);
     console.error('    See coordination.md Token & Git Hygiene for diagnostics.');
   } else {
     const finding = diffPermissions(permissions);
@@ -1285,21 +1285,20 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     }
     if (finding.missing.length > 0 || finding.insufficient.length > 0) {
       console.log('');
-      console.log('See design/decisions/DR-019-app-permissions.md for the full doctrine,');
-      console.log('and GitHub → Settings → Developer settings → GitHub Apps → <your App> → Permissions');
+      console.log('Fix: GitHub → Settings → Developer settings → GitHub Apps → <your App> → Permissions');
       console.log('to update the App. Users with the App installed must accept the new permissions.');
       permissionsFailed = true;
     }
   }
 
   console.log('');
-  console.log('Sandbox filesystem (macf#200)');
+  console.log('Sandbox filesystem');
   console.log('──────────────────────────────────────────────────────────────');
   let sandboxCheck = checkSandboxFdAllowRead(projectDir);
   printSandboxSection(sandboxCheck);
 
   console.log('');
-  console.log('Workspace permissions (macf#296)');
+  console.log('Workspace permissions');
   console.log('──────────────────────────────────────────────────────────────');
   let permsCheck = checkPermissionsAllow(projectDir);
   printPermissionsAllowSection(permsCheck);
@@ -1309,23 +1308,23 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   printRoleSettingsSection(role, roleCheck);
 
   console.log('');
-  console.log('OTEL launch boundary (macf#554/#556)');
+  console.log('OTEL launch boundary');
   console.log('──────────────────────────────────────────────────────────────');
   printOtelLaunchSection(checkOtelLaunchBoundary(projectDir));
 
   console.log('');
-  console.log('Canonical branch (macf#755)');
+  console.log('Canonical branch');
   console.log('──────────────────────────────────────────────────────────────');
   printCanonicalBranchSection(checkCanonicalBranch(config, readCurrentBranch(projectDir)));
 
   console.log('');
-  console.log('Attribution identity (DR-028 / macf#535 / macf#707)');
+  console.log('Attribution identity');
   console.log('──────────────────────────────────────────────────────────────');
   let botLoginCheck = checkBotLogin(config);
   printBotLoginSection(botLoginCheck);
 
   console.log('');
-  console.log('Load-bearing hooks (DR-039)');
+  console.log('Load-bearing hooks');
   console.log('──────────────────────────────────────────────────────────────');
   printLoadBearingHooksSection(checkLoadBearingHooks(projectDir));
 
@@ -1343,7 +1342,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
       console.log('--fix: nothing to fix — settings already satisfy the floor.');
     } else {
       console.log('');
-      console.log('--fix will write the DR-028 floor into .claude/settings.json:');
+      console.log('--fix will write the role-aware settings floor into .claude/settings.json:');
       console.log('  - permissions.allow/deny floor (installPluginSkillPermissions)');
       console.log('  - PreToolUse/PostToolUse/UserPromptSubmit/PreCompact/SessionStart hooks (installGhTokenHook)');
       console.log('  - sandbox.filesystem.allowRead + sandbox.excludedCommands');
@@ -1444,7 +1443,7 @@ function printLoadBearingHooksSection(check: LoadBearingHooksCheckResult): void 
   console.log(
     '    Fix: re-run `macf update` (or `macf init --force`) to restore the full plugin + settings ' +
     'floor. A stripped --plugin-dir (a hooks-less plugin variant), a bad stash, or a hand-edit can ' +
-    'drop these silently — see design/decisions/DR-039-hook-delivery-and-presence-guarantee.md.',
+    'drop these silently.',
   );
 }
 

@@ -222,7 +222,7 @@ function repoNotVisibleReason(repo: string): string {
     `this token cannot see "${repo}" (HTTP 404 reading the repo itself; not installed on it? GitHub returns 404 ` +
     'both for a repo that genuinely does not exist and for a private repo this token lacks access to — the two ' +
     'are indistinguishable to an unauthorized caller by design, so a 404 here is never confident evidence of ' +
-    'absence — macf#1026, same shape macf#969 established for `GET /apps/{slug}`). Its CA variable and ' +
+    'absence). Its CA variable and ' +
     'routing-client secret reads are unknown for the same reason.'
   );
 }
@@ -236,7 +236,7 @@ function repoNotVisibleReason(repo: string): string {
 function repoUnreadableReason(repo: string): string {
   return (
     `could not confirm "${repo}" is reachable this run (network/auth/gh failure reading the repo itself, not a ` +
-    'confirmed 404) — its CA variable and routing-client secret reads are unknown for the same reason; macf#1026.'
+    'confirmed 404) — its CA variable and routing-client secret reads are unknown for the same reason.'
   );
 }
 
@@ -700,7 +700,7 @@ function buildRunnerHandoverMessage(repo: string, org: string, excludedGroupIdsW
   return (
     `An org-level self-hosted runner IS registered in "${org}", but its runner group's repository-access ` +
     `list excludes "${repo}" — an org admin must add this repo at: ${links}. This tool cannot perform that ` +
-    'step itself (org-admin action; macf#924).'
+    'step itself (org-admin action).'
   );
 }
 
@@ -715,7 +715,7 @@ function permissionDeniedDetail(repo: string): string {
   return (
     `could not read runners for "${repo}" — insufficient permission (HTTP 403; the App's installation token ` +
     'needs "administration: read" on this repo to list its registered runners — verified per-App, not per-bot: ' +
-    'the same endpoint 200s for a differently-permissioned App on the same fleet; macf#934).'
+    'the same endpoint 200s for a differently-permissioned App on the same fleet).'
   );
 }
 

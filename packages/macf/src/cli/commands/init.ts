@@ -222,7 +222,7 @@ function validateInitOpts(opts: InitOptions): void {
     if (opts.registryPath !== undefined) {
       if (!isAbsolute(opts.registryPath)) {
         throw new Error(
-          `--path "${opts.registryPath}" must be an absolute path (DR-024 §File format)`,
+          `--path "${opts.registryPath}" must be an absolute path`,
         );
       }
       if (/["$`\\\n\r]/.test(opts.registryPath)) {
@@ -396,7 +396,7 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   if (regType === 'local' && opts.migrateFrom !== undefined) {
     throw new Error(
       '--migrate-from cannot be combined with --local; migration only ' +
-        'applies when moving INTO a GitHub-backed registry (DR-024 §Migration path).',
+        'applies when moving INTO a GitHub-backed registry.',
     );
   }
 
@@ -496,7 +496,7 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`  Warning: could not resolve App slug for bot_login: ${msg}`);
       console.warn('    The attribution hook will fall back to a non-authoritative agent_name');
-      console.warn('    guess (macf#535) until this is repaired — run `macf doctor --fix` once');
+      console.warn('    guess until this is repaired — run `macf doctor --fix` once');
       console.warn('    the App/key are reachable.');
     }
   }

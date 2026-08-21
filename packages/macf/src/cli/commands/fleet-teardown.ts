@@ -229,10 +229,10 @@ async function renderAgentReachabilityPreview(targets: readonly DeactivateTarget
         ? 'will be asked to exit gracefully (/exit) and self-deregister'
         : r.reachability === 'dead'
           ? 'no live session on this host — will be deregistered directly'
-          : 'not discoverable on this host — left UNTOUCHED (a fleet may span hosts, #1018)';
+          : 'not discoverable on this host — left UNTOUCHED (a fleet may span hosts)';
     return `  ${r.role.padEnd(20)} ${r.reachability.toUpperCase().padEnd(9)} ${note}`;
   });
-  process.stderr.write('\nLive-agent reachability (this host only, DR-037 Amendment D — a fleet may span hosts):\n');
+  process.stderr.write('\nLive-agent reachability (this host only — a fleet may span hosts):\n');
   process.stderr.write(`${lines.join('\n')}\n`);
 }
 
@@ -280,7 +280,7 @@ function formatRepoOutcomeLines(outcomes: readonly RepoArchiveOutcome[]): string
 
 function planTargetsPreview(targets: readonly DeactivateTarget[]): string[] {
   return [
-    'The following EXACT registry keys would be removed (never a prefix sweep — DR-043 Amendment G):',
+    'The following EXACT registry keys would be removed (never a prefix sweep):',
     ...targets.map((t) => `  ${t.kind.padEnd(20)} ${t.name}`),
   ];
 }

@@ -364,7 +364,7 @@ function defaultCloneUrl(repo: string): string {
 }
 
 function defaultCommitMessage(repo: string): string {
-  return `chore(bootstrap): commit fleet.yaml — control repo first act (DR-043 Amendment F, ${repo})`;
+  return `chore(bootstrap): commit fleet.yaml — control repo first act (${repo})`;
 }
 
 /**
@@ -438,7 +438,7 @@ export async function provisionControlRepo(
       return {
         status: 'foreign',
         repo,
-        reason: `"${repo}" already exists but was not created by this apply for fleet "${manifest.metadata.name}" (DR-043 Amendment F — control repos are never silently adopted): ${ownership.reason}`,
+        reason: `"${repo}" already exists but was not created by this apply for fleet "${manifest.metadata.name}" (control repos are never silently adopted): ${ownership.reason}`,
       };
     }
     if (ownership.kind === 'unknown') {
@@ -456,7 +456,7 @@ export async function provisionControlRepo(
         status: 'archived',
         repo,
         reason:
-          `"${repo}" is this fleet's OWN control repo, but it is ARCHIVED (DR-043 Amendment G — a deliberate, ` +
+          `"${repo}" is this fleet's OWN control repo, but it is ARCHIVED (a deliberate, ` +
           'reversible `macf fleet archive` state). Revival is free but NOT automatic: re-run with confirmation ' +
           '(the plan-approve-once "yes" that authorizes this apply run must have shown the control-repo-archived ' +
           'item) to un-archive + resume normal reconcile.',

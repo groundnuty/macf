@@ -194,7 +194,7 @@ export function refreshEnvFiles(
     // managed-file contract.
     process.stderr.write(
       `Warning: hand-edited macf-managed env file detected: .claude/.macf/${name}\n` +
-        `  Overwriting with the canonical generator output (macf#342).\n` +
+        `  Overwriting with the canonical generator output.\n` +
         `  To customize identity / endpoints, prefer:\n` +
         `    - .claude/settings.local.json \`env\` block (read by macf_settings_get)\n` +
         `    - .claude/.macf/env.local.<name> (sources after canonical files)\n`,
@@ -381,7 +381,7 @@ export function detectSettingsLocalEnvKeys(
 export function formatDeprecationWarning(keys: readonly string[]): string {
   if (keys.length === 0) return '';
   const lines = [
-    `Warning: deprecated env key(s) in .claude/settings.local.json (macf#342):`,
+    `Warning: deprecated env key(s) in .claude/settings.local.json:`,
   ];
   for (const k of keys) {
     lines.push(`  env.${k}`);
@@ -389,7 +389,7 @@ export function formatDeprecationWarning(keys: readonly string[]): string {
   lines.push(
     `  These are still read at runtime by macf_settings_get (backward-compat),`,
     `  but the canonical location is now .claude/.macf/env.* (or env.local.*`,
-    `  for operator overrides). See macf#342.`,
+    `  for operator overrides).`,
     '',
   );
   return lines.join('\n');

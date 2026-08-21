@@ -287,7 +287,7 @@ describe('applyRepoInitForAgent', () => {
       expect(outcome.reason).toMatch(/label creation failed/);
       expect(outcome.reason).toMatch(/code-agent/);
       expect(outcome.reason).toMatch(/pushed/);
-      expect(outcome.reason).toMatch(/groundnuty\/macf#920/);
+      expect(outcome.reason).toMatch(/a fleet missing its role\/status labels cannot route/);
     }
     // The routing config STILL landed — a label failure doesn't withhold the
     // workflow/config commit, only the overall step outcome.

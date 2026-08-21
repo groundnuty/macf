@@ -82,7 +82,7 @@ describe('resolveCaCert — mint-or-reuse decision table', () => {
     );
     expect(mintCalled).toBe(false);
     expect(outcome.status).toBe('failed');
-    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/honest-unknown/);
+    if (outcome.status === 'failed') expect(outcome.reason).toMatch(/never treated as confirmed-present/);
   });
 
   it('registry PRESENT, no prior lock -> REUSES (out-of-band CA), reads the value, never mints', async () => {
@@ -166,8 +166,8 @@ describe('resolveCaCert — mint-or-reuse decision table', () => {
   const REFUSAL_TEXT_NO_VAULT =
     'fleet.lock records a previously-minted CA key, but the registry var "DEMO_FLEET_CA_CERT" is not confirmable ' +
     'present (observed: absent) — refusing to mint a REPLACEMENT (would orphan the already' +
-    '-vaulted key, the #799 failure class). Re-materializing the cert from the vaulted key needs a vault ' +
-    'read (DR-043 Amendment D phase 3+), not a fresh mint. Investigate manually.';
+    '-vaulted key). Re-materializing the cert from the vaulted key needs a vault ' +
+    'read, not a fresh mint. Investigate manually.';
 
   it('lock HAS ca_key, registry ABSENT, readVaultCaCert NOT supplied -> REFUSES with the EXACT pre-#978 text, byte-identical', async () => {
     const outcome = await resolveCaCert(

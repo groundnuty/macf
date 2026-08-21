@@ -239,8 +239,7 @@ export async function resolveAppPresence(
     checkPredictedSlug,
     `App "${predictedSlug}" is owned by a personal account ("${owner.account}"), not an organization — GitHub exposes no ` +
       "installations-listing endpoint reachable with ambient `gh` auth for personal accounts (verified live: `/user/installations` " +
-      "403s on both bot installation tokens AND the operator's own `gh auth login` token — see identity-confirm.ts's module doc, " +
-      'macf#838)',
+      "403s on both bot installation tokens AND the operator's own `gh auth login` token — see identity-confirm.ts's module doc)",
   );
 }
 

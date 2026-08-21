@@ -474,7 +474,7 @@ async function deactivateAgentTarget(
     status: 'failed',
     reason:
       `requested a graceful exit but the agent did not self-deregister within ${String(graceTimeoutMs)}ms — ` +
-      'never deleted directly under a possibly-live owner (macf#1033).',
+      'never deleted directly under a possibly-live owner.',
     agentStopCategory: 'stop-unconfirmed',
   };
 }

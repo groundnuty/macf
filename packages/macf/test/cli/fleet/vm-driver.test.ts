@@ -1306,7 +1306,7 @@ describe('createVmDriver — classifyDirtyConfig / autoResolveCanonical, real gi
     const log = execFileSync('git', ['log', '--oneline'], { cwd: repo, encoding: 'utf-8' });
     expect(log.trim().split('\n')).toHaveLength(2);
     const lastCommitMsg = execFileSync('git', ['log', '-1', '--pretty=%s'], { cwd: repo, encoding: 'utf-8' });
-    expect(lastCommitMsg).toContain('DR-040');
+    expect(lastCommitMsg).toContain('already-canonical macf-update regen (auto-resolved)');
   });
 
   it('a dirty CLAUDE.md → genuine-delta (never auto-committed, even though it is a real dirty file)', async () => {

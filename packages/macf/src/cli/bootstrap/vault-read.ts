@@ -1145,7 +1145,7 @@ export function assertNoDroppedVaultKeys(
       'vault_would_drop_keys',
       `composed payload is missing ${String(dropped.length)} key(s) present in the CURRENT vault (${dropped.join(', ')}) ` +
         '— refusing to write. A whole-payload vault rewrite must be composed from the vault\'s complete current ' +
-        'contents; a payload that would drop existing entries is never written (DR-043 Amendment D, groundnuty/macf#989).',
+        'contents; a payload that would drop existing entries is never written.',
     );
   }
 }

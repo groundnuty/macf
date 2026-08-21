@@ -227,8 +227,8 @@ export function buildDigest(input: DigestInput): string {
   lines.push(`- Generated at: ${isoUtc(nowMs)}`);
   lines.push(`- Stale threshold: ${input.sinceDays} days`);
   lines.push(
-    `- Read-only auditor (DR-026 F4). Drift + candidate signals below are ` +
-    `**surfaced, not acted on** — proposing/actuation is gated (DR-026 G1).`,
+    `- Read-only auditor. Drift + candidate signals below are ` +
+    `**surfaced, not acted on** — proposing/actuation is gated.`,
   );
   lines.push('');
 
@@ -334,7 +334,7 @@ export function buildDigest(input: DigestInput): string {
   lines.push(
     `> This is a read-only protocol-health report. No issues were created, ` +
     `commented on, closed, or merged. Proposing rule changes / actuation is a ` +
-    `separate, ratification-gated step (DR-026 G1).`,
+    `separate, ratification-gated step.`,
   );
 
   // Collapse any accidental 3+ blank-line runs to a single blank line.

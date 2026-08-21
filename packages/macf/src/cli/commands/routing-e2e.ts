@@ -66,6 +66,43 @@
  * `agent-router.yml` source). This module refuses BEFORE filing anything
  * when the resolved target label equals the invoking agent's own routing
  * label, rather than let that skip present as an ambiguous timeout.
+ *
+ * Visibility gate (fix for a false-absence bug, macf#1077): every read this
+ * module does past this point is scoped to the TARGET's own repo — a repo
+ * this agent's own credential is frequently NOT installed on, because each
+ * agent's credential is deliberately narrow (its own repo + the control
+ * repo, nothing else). GitHub answers a 404 identically whether a private
+ * repo genuinely has no committed workflow or the calling credential simply
+ * cannot see the repo at all — those are NOT the same fact, and the first
+ * live run of this probe collapsed them, reporting a confident "no router"
+ * for a repo it was never entitled to read. The fix asks the ONE question
+ * that IS answerable without ambiguity — "what does this credential's own
+ * install listing contain?" (a complete enumeration, not a single scoped
+ * read) — exactly once, before `isTargetCaller` or any other repo-scoped
+ * read runs. A `repo` absent from that listing refuses immediately as
+ * `target_visibility_unknown`, distinct from a confirmed-absent
+ * `target_not_a_caller`, and none of the ambiguous per-file reads are even
+ * attempted. One gate suffices for every later read on the SAME repo with
+ * the SAME token — the App's permission grant is uniform per installed
+ * repo, so a credential proven to see the repo at all is proven for its
+ * workflow file, its agent-config, and its Actions runs alike; re-checking
+ * per read would just repeat an already-answered question.
+ *
+ * REFUSE, not proceed-and-report, is the deliberate choice for an unknown
+ * visibility result — the alternative considered was letting the flow run
+ * on anyway and let `createProbeIssue`'s own failure carry the diagnosis.
+ * Rejected for two reasons. First, this credential's write path shares the
+ * SAME installation boundary as its read path (one App install grants
+ * both), so proceeding would almost always just trade one honest "unknown"
+ * for a less legible "could not create the probe issue: <gh error>" a few
+ * steps later — strictly less informative, at the cost of an extra write
+ * attempt against a repo already known to be unreadable.
+ * Second, refusing here costs nothing: no issue exists yet, so there is
+ * nothing to clean up (same "nothing filed, nothing to clean up" contract
+ * every other `target_*` precondition in this file already holds) — where
+ * `probe_creation_failed` DOES need a cleanup attempt because a write may
+ * have partially landed. Fail fast, name the ambiguity precisely, and stop
+ * — the same shape every other precondition refusal in this module takes.
  */
 import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
 import {
@@ -78,7 +115,7 @@ import {
 import { readAgentConfig, tokenSourceFromConfig, agentCertPath, agentKeyPath } from '../config.js';
 import { createClientFromConfig } from '../registry-helper.js';
 import type { RoutingConfig } from './routing-doctor.js';
-import { createCallerPinReader, createRoutingConfigGhReader } from './routing-doctor-gh.js';
+import { createCallerPinReader, createInstallRepoLister, createRoutingConfigGhReader } from './routing-doctor-gh.js';
 import {
   createIssueCloser,
   createLabelApplier,
@@ -94,9 +131,16 @@ import {
  * `target_*` / precondition stages fire BEFORE any probe issue is filed (no
  * cleanup needed); everything from `probe_creation_failed` on fires AFTER an
  * issue exists (cleanup always attempted).
+ *
+ * `target_visibility_unknown` is deliberately distinct from
+ * `target_not_a_caller` (macf#1077): the first means "this credential
+ * cannot tell," the second means "confirmed absent." Collapsing them was
+ * the bug — a credential not entitled to read a peer's repo got 404s on
+ * every read and reported a confident absence it never actually confirmed.
  */
 export type RoutingE2eStage =
   | 'delivered'
+  | 'target_visibility_unknown'
   | 'target_not_a_caller'
   | 'target_label_not_found'
   | 'target_label_ambiguous'
@@ -160,6 +204,13 @@ export type RoutingE2eLabelResult = { readonly ok: true } | { readonly ok: false
 export interface RoutingE2eDeps {
   /** This agent's own routing label — the self-route guard compares against it. */
   readonly currentLabel: string | null;
+  /**
+   * The COMPLETE set of repos this agent's own credential is installed on
+   * (`GET /installation/repositories`) — the one unambiguous signal about
+   * what it can see. Checked ONCE, before any repo-scoped read, so a 404 on
+   * a peer's repo is never mistaken for confirmed absence (macf#1077).
+   */
+  readonly listInstallRepos: () => Promise<readonly string[]>;
   readonly isTargetCaller: (repo: string) => Promise<boolean>;
   readonly readTargetRoutingConfig: (repo: string) => Promise<RoutingConfig | null>;
   readonly listRegistry: () => Promise<readonly { readonly name: string; readonly info: AgentInfo }[]>;
@@ -284,6 +335,40 @@ async function resolveTargetLabel(
 }
 
 /**
+ * The `target_visibility_unknown` message — names the credential (its
+ * routing label) and the mechanism, in plain words (no internal issue/DR
+ * references; those belong in code comments, not operator-facing output).
+ *
+ * Two distinct causes, two distinct messages — collapsing them would repeat
+ * this very issue's own Defect 2 shape (a line describing something that
+ * did not happen): `'listing-unreadable'` means the install listing itself
+ * never came back this run (nothing was confirmed either way — the target
+ * repo is not "checked and absent," it is "never checked"); `'not-in-listing'`
+ * means the listing WAS read successfully and the target genuinely was not
+ * in it (the entitlement gap this issue reports).
+ */
+function visibilityUnknownMessage(currentLabel: string | null, repo: string, cause: 'listing-unreadable' | 'not-in-listing'): string {
+  const who = currentLabel !== null ? `"${currentLabel}"'s credential` : "this agent's credential";
+  if (cause === 'listing-unreadable') {
+    return (
+      `${who} could not read its own installed-repository list this run (a network/auth failure, not a confirmed ` +
+      `answer) — nothing about "${repo}"'s routing workflow, label configuration, or recent runs can be asserted ` +
+      'from here. Retry, or confirm this credential can reach the GitHub API at all before assuming anything ' +
+      'about the target.'
+    );
+  }
+  return (
+    `${who} cannot confirm "${repo}" is visible to it — the repo is absent from that credential's own ` +
+    "installed-repository list, which WAS read successfully this run. GitHub answers a read against a private " +
+    'repo with the identical 404 whether the repo genuinely has nothing there or the credential simply is not ' +
+    'installed on it, so nothing about its routing workflow, its label configuration, or its recent runs can be ' +
+    "asserted from here. This is the expected shape when probing a peer's repo with an agent's own " +
+    'narrowly-scoped credential — not itself a failure. Re-run with a credential installed on the target repo, or ' +
+    'confirm its routing workflow another way before treating this result as proof the target cannot route.'
+  );
+}
+
+/**
  * Run the routing capability probe end-to-end. PURE w.r.t. the injected
  * `deps` — tests pass fakes so nothing hits `gh` / the registry / the
  * network. Never throws: every failure surface resolves to a RED
@@ -297,6 +382,36 @@ export async function runRoutingE2eCore(
   const startedAt = now();
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const repo = opts.targetRepo;
+
+  // Visibility gate (macf#1077) — checked ONCE, before `isTargetCaller` or
+  // any other repo-scoped read: a `repo` this credential's own install
+  // listing doesn't contain can never yield a trustworthy `absent` from a
+  // per-file 404, so every one of those reads is skipped entirely rather
+  // than attempted and misread. See the module doc for the full rationale.
+  //
+  // `[]` is itself ambiguous — `listInstallRepos` degrades to `[]` on ANY
+  // failure (network, auth, `gh` missing), and a real installation always
+  // covers at least this agent's own repo, so an empty result here means
+  // the listing read never actually landed, not "confirmed zero repos."
+  // Reported as its OWN cause so the message never claims the listing
+  // named this repo absent when it was never read at all (the exact
+  // asserts-something-that-didn't-happen shape Defect 2 is about).
+  // Case-folded: GitHub's listing returns its own canonical casing, and an
+  // operator-typed `--target-repo` case mismatch must not read as "unknown."
+  const installRepos = await deps.listInstallRepos();
+  if (installRepos.length === 0) {
+    return refuse(
+      'target_visibility_unknown',
+      repo,
+      null,
+      visibilityUnknownMessage(deps.currentLabel, repo, 'listing-unreadable'),
+      startedAt,
+      now,
+    );
+  }
+  if (!installRepos.some((r) => r.toLowerCase() === repo.toLowerCase())) {
+    return refuse('target_visibility_unknown', repo, null, visibilityUnknownMessage(deps.currentLabel, repo, 'not-in-listing'), startedAt, now);
+  }
 
   if (!(await deps.isTargetCaller(repo))) {
     return refuse(
@@ -475,9 +590,15 @@ export function routingE2eToJson(result: RoutingE2eResult): unknown {
       error: result.cleanup.error ?? null,
     },
     elapsed_ms: result.elapsedMs,
+    // Describes what a GREEN verdict means — nothing was delivered on a RED
+    // one, so the caveat would assert something that never happened
+    // (macf#1077). `null`, not omitted, so the field is always present and
+    // its meaning ("no delivery to caveat") is explicit in the JSON shape.
     disclaimer:
-      'Proves the probe was DELIVERED to the recipient channel-server, not that the agent acted on it ' +
-      '(receipt is not the same thing as a distinct turn).',
+      result.verdict === 'GREEN'
+        ? 'Proves the probe was DELIVERED to the recipient channel-server, not that the agent acted on it ' +
+          '(receipt is not the same thing as a distinct turn).'
+        : null,
   };
 }
 
@@ -497,11 +618,15 @@ export function formatRoutingE2eText(result: RoutingE2eResult): string {
         : `Probe issue was NOT closed — clean it up manually${result.cleanup.error ? ` (${result.cleanup.error})` : ''}.`,
     );
   }
-  lines.push('');
-  lines.push(
-    'Note: this proves the probe was DELIVERED to the recipient channel-server, not that the agent acted ' +
-      'on it — a receipt is not the same thing as a distinct turn.',
-  );
+  // Describes what a GREEN verdict means — a RED run delivered nothing, so
+  // the caveat would assert something that never happened (macf#1077).
+  if (result.verdict === 'GREEN') {
+    lines.push('');
+    lines.push(
+      'Note: this proves the probe was DELIVERED to the recipient channel-server, not that the agent acted ' +
+        'on it — a receipt is not the same thing as a distinct turn.',
+    );
+  }
   return lines.join('\n');
 }
 
@@ -540,6 +665,7 @@ async function resolveE2eDepsFromRegistry(
     ok: true,
     deps: {
       currentLabel: config.routing_label ?? config.agent_name ?? null,
+      listInstallRepos: createInstallRepoLister(token),
       isTargetCaller: async (repo) => (await createCallerPinReader(token)(repo)).status === 'pinned',
       readTargetRoutingConfig: createRoutingConfigGhReader(token),
       listRegistry: () => registry.list(''),

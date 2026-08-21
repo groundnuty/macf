@@ -711,7 +711,7 @@ describe('update command', () => {
         const warnOut = warnSpy.mock.calls.flat().join('\n');
         expect(warnOut).toContain(join(dir, '.macf', 'plugin-cs'));
         expect(warnOut).toContain(join(dir, '.macf', 'plugin'));
-        expect(warnOut).toMatch(/macf#889/);
+        expect(warnOut).toMatch(/that is what this run updates/);
       } finally {
         warnSpy.mockRestore();
       }
@@ -732,7 +732,7 @@ describe('update command', () => {
       expect(stripPluginMcpServers).not.toHaveBeenCalled();
       const errOut = errorSpy.mock.calls.flat().join('\n');
       expect(errOut).toMatch(/cannot determine which plugin dir claude\.sh mounts/);
-      expect(errOut).toMatch(/macf#889/);
+      expect(errOut).toMatch(/Refusing to guess/);
       // .mcp.json is UNAFFECTED by plugin-mount undeterminability — it's not
       // resolved through pluginTarget at all (macf#995).
       expect(existsSync(mcpJsonPath(dir))).toBe(true);
@@ -759,7 +759,7 @@ describe('update command', () => {
       expect(errOut).toMatch(/FATAL/);
       expect(errOut).toContain('@0.1.0');
       expect(errOut).toContain('@0.3.0');
-      expect(errOut).toMatch(/macf#889/);
+      expect(errOut).toMatch(/did not reach the file actually being upgraded/);
     });
   });
 
@@ -1031,7 +1031,7 @@ describe('update command', () => {
 
         const stderrOut = stderrSpy.mock.calls.flat().join('\n');
         expect(stderrOut).toMatch(/env\.MACF_OTEL_ENDPOINT/);
-        expect(stderrOut).toMatch(/macf#342/);
+        expect(stderrOut).toMatch(/\.claude\/\.macf\/env\.\*/);
       } finally {
         stderrSpy.mockRestore();
       }

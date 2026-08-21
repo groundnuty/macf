@@ -192,7 +192,7 @@ export function evaluateSelfSkip(
   if (normalizeLogin(appName) === normalizeLogin(label)) {
     return {
       ok: false,
-      reason: `app_name "${appName}" is the bare routing label, not a bot-login (#566)`,
+      reason: `app_name "${appName}" is the bare routing label, not a bot-login`,
     };
   }
   return { ok: true };
@@ -238,7 +238,7 @@ export function evaluateSession(
     expected,
     reason:
       `tmux_session "${tmuxSession}" != "${expected}" (<project>@<routing-label> convention; ` +
-      `WARN-not-FAIL pending the DR-032 session-rename migration)`,
+      `WARN-not-FAIL pending a future session-rename migration)`,
   };
 }
 
@@ -291,7 +291,7 @@ export function evaluateCaCert(
       normalizedPem = text;
       base = { present: true, valid: true };
     } else {
-      base = { present: true, valid: false, reason: 'PEM body is not valid base64 (#563 malformed)' };
+      base = { present: true, valid: false, reason: 'PEM body is not valid base64 (malformed)' };
     }
   } else if (isStrictBase64(text)) {
     // No PEM markers — maybe the whole value is base64-of-PEM (#563 storage form).
@@ -306,7 +306,7 @@ export function evaluateCaCert(
     base = {
       present: true,
       valid: false,
-      reason: 'present but not a parseable PEM/base64 certificate (#563 malformed-base64)',
+      reason: 'present but not a parseable PEM/base64 certificate (malformed-base64)',
     };
   }
 
@@ -393,7 +393,7 @@ export function evaluateRoutingClientCertIssuer(
       mintedAt: null,
       reason:
         'no routing-client cert issuer recorded yet (never minted via `macf certs ' +
-        'issue-routing-client`, or a pre-#800 workspace) — informational only, not a failure',
+        'issue-routing-client`, or an older workspace) — informational only, not a failure',
     };
   }
   if (currentCaFingerprint === null) {
@@ -425,7 +425,7 @@ export function evaluateRoutingClientCertIssuer(
     reason:
       'routing-client cert is orphaned (signed by a rotated-out CA) — re-mint via `macf ' +
       'certs issue-routing-client` and re-set ROUTING_CLIENT_CERT/ROUTING_CLIENT_KEY on ' +
-      'every caller repo (macf#800)',
+      'every caller repo',
   };
 }
 
@@ -958,7 +958,7 @@ export function caCertLine(ca: CaCheckResult): string {
   if (!ca.valid) return `MACF_CA_CERT: ✗ ${ca.reason}`;
   if (ca.matchesCurrentCa === false) {
     return (
-      `MACF_CA_CERT: ✗ present + parses but does NOT match the current CA (macf#873) — ` +
+      `MACF_CA_CERT: ✗ present + parses but does NOT match the current CA — ` +
       `registry ${shortFingerprint(ca.registryCaFingerprint)} != current ${shortFingerprint(ca.currentCaFingerprint)}`
     );
   }
@@ -1003,22 +1003,22 @@ export function formatAgentTable(rows: readonly AgentRow[]): string {
 export const HONESTY_LEGEND = [
   'Legend: CALLER-PIN = the macf-actions @version each routing repo pins (must all match).',
   '        A repo opts OUT of the pin check via .github/macf-fleet.json {"routing_fleet":false}',
-  '        (e.g. an intentional-Stage-2 test harness); absent marker = fleet member (#614).',
+  '        (e.g. an intentional-Stage-2 test harness); absent marker = fleet member.',
   '        ROUTABLE = a MACF_AGENT_<LABEL> registry key exists (router resolves by LABEL).',
-  '        SELF-SKIP = agent-config.json app_name is the bot-LOGIN, not the bare label (#566).',
+  '        SELF-SKIP = agent-config.json app_name is the bot-LOGIN, not the bare label.',
   '        SESSION = agent-config.json tmux_session follows <project>@<routing-label> (assert-IF-',
-  '                  PRESENT: absent = PASS, vestigial + omitted on v3 (#678); ⚠ warn = stale drift,',
-  '                  WARN-not-FAIL — visible but does NOT drive the verdict, DR-032 session-rename).',
+  '                  PRESENT: absent = PASS, vestigial + omitted on v3; ⚠ warn = stale drift,',
+  '                  WARN-not-FAIL — visible but does NOT drive the verdict, pending a session-rename migration).',
   '                  FRESH = registry instance_id == live /health instance_id (✗ stale / ? unreach).',
-  '        The agent set is the registry fleet ∪ this repo\'s routing config (#621): a registry-only',
+  '        The agent set is the registry fleet ∪ this repo\'s routing config: a registry-only',
   '        agent (one this repo does not route to, e.g. the auditor) shows "— n/a" SELF-SKIP/SESSION',
   '        (REPO-scoped, no local config) but is still ROUTABLE/FRESH-checked (FLEET-scoped).',
-  '        MACF_CA_CERT = the registry-published CA is present + parses (#563) AND matches the',
-  '        CURRENT local CA (macf#873) — the mTLS trust anchor for every /health probe; a rotated-',
+  '        MACF_CA_CERT = the registry-published CA is present + parses AND matches the',
+  '        CURRENT local CA — the mTLS trust anchor for every /health probe; a rotated-',
   '        out-but-well-formed CA fails every probe silently, so a definite mismatch fails the',
   '        verdict and, when most/all agents read unreachable, is reported as the LIKELY CAUSE',
   '        rather than a separate line. — n/a = no local CA on this machine to compare (not a fail).',
-  '        ROUTING-CLIENT CERT (macf#800) = the recorded issuer fingerprint (written by `macf certs',
+  '        ROUTING-CLIENT CERT = the recorded issuer fingerprint (written by `macf certs',
   '        issue-routing-client`) vs the CURRENT project CA (local disk). ✗ orphaned = signed by a',
   '        rotated-out CA (re-mint + re-set the secret); — n/a = never minted, informational only.',
   'NOTE: these are STATIC GitHub-plane checks — they prove the routing PLUMBING is wired right,',
@@ -1308,7 +1308,7 @@ export async function runRoutingDoctor(
 
   console.log(caCertLine(report.ca));
   console.log(
-    `ROUTING-CLIENT CERT ISSUER (macf#800): ${routingClientCertGlyph(report.routingClientCert.state)}` +
+    `ROUTING-CLIENT CERT ISSUER: ${routingClientCertGlyph(report.routingClientCert.state)}` +
     (report.routingClientCert.reason ? ` — ${report.routingClientCert.reason}` : ''),
   );
   // The absorption fix (macf#873): a prominent, explicit causal-attribution line

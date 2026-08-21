@@ -46,10 +46,10 @@ describe('registryRepoNotInstalledReason — the refusal text names WHICH App an
     expect(reason).toMatch(/does not exist or was renamed/);
   });
 
-  it('cites the originating issues for traceability', () => {
+  it('explains the failure mode plainly, without citing internal issue numbers (#1061)', () => {
     const reason = registryRepoNotInstalledReason('demo-fleet-code-agent', 'demo-org', 'demo-org-registry');
-    expect(reason).toContain('groundnuty/macf#999');
-    expect(reason).toContain('#1012');
+    expect(reason).toContain('a known failure mode');
+    expect(reason).toContain('now guarded for registry.type: repo');
   });
 });
 
