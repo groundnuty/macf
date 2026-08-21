@@ -719,3 +719,215 @@ L1–L4 above ruled on `versions.macf`. `versions.actions` (the macf-actions rou
 **References:** `#1045` · `#1000` (one path per outcome) · `#1023`/`#1024` (the delegation shape and its assertion) · `#1017` (no controller, by choice) · Amendment A (honest-unknown) · `assert-the-wrong-path.md`.
 
 **References (L5):** `#1072` · `#1049` (the `versions.macf` precedent this section follows through on) · `#1055` (the honest-report vocabulary) · `#1070`/`#1071` (the control repo as a router-carrying repo) · `#1000` (one writer, one target-set derivation).
+
+---
+
+## Amendment M (2026-08-21, #1062 + #1057) — Amendment F's invariants, corrected
+
+**Amendment F asserted two guarantees and supplied a mechanism for neither.** Both are corrected here rather than restated, because a restated guarantee with no mechanism is what F already was.
+
+### M0 — the error class: an invariant the platform cannot express
+
+Amendment K catalogued three ways an amendment of mine failed: **incomplete enumeration** (G), **untraced consequence** (D), **undefined predicate** (B). This is a fourth:
+
+> **An invariant asserted at a boundary the platform has no way to draw.**
+
+F said *"`<fleet>-control`, operator-owned, **NO fleet agent granted write**."* That assumes a **per-repo write grant exists to withhold**. It does not: **GitHub App permissions are per-App, not per-repo**, so *"installed but read-only"* is unsayable for an App that needs `contents: write` anywhere — which every agent App does, for its own repo. The sentence described a configuration that cannot be expressed, and read as a guarantee for months.
+
+**The check that would have caught it is the one that eventually did: attempt the violation.** Not *"is the permission declared"* — ***can I actually do the thing.*** An invariant nobody has tried to breach is an intention.
+
+### M1 — "no agent write" is WITHDRAWN as false; the invariant is now about what LANDS
+
+Verified by capability, not by reading a permission field (`#1062`): an agent's installation token **created a real branch** on a live control repo.
+
+    POST repos/<owner>/<fleet>-control/git/refs   →  SUCCEEDED (probe branch, then deleted)
+
+**Scope, stated precisely, because integrity and confidentiality diverge here:**
+
+| | holds? | by what |
+|---|---|---|
+| an agent can **read** `vault.age` | yes | it is in the repo, and the App is installed |
+| an agent can **decrypt** it | **no** | age encryption to operator-held recipients (Amendments C/D) |
+| an agent can **modify or delete** `fleet.lock` / `vault.age` | **yes** | `contents: write` from the App bundle |
+
+**Confidentiality holds by encryption; integrity did not hold at all.** The corrected invariant:
+
+> **No agent write can LAND on the control repo's protected branch.**
+
+Enforced by **branch protection on the default branch**, which holds against agents specifically because changing protection requires `administration`, deliberately withheld from every agent App (`#943`). **The guard cannot be disabled by the party it constrains** — that is what makes it a mechanism rather than a policy.
+
+**Asserted at provisioning:** branch protection is queryable, so `apply` must assert it and fail loudly when absent. An invariant this DR has just watched go unenforced for months is not re-stated in prose and left there.
+
+> **NOT YET IMPLEMENTED — no `Asserted by:` citation.** Its absence is the signal (`#998`).
+
+### M2 — the commit allowlist is accident-prevention, not access control
+
+`CONTROL_REPO_COMMIT_ALLOWLIST` gains exactly two entries — `.github/workflows/agent-router.yml` and `.github/agent-config.json` — required once the control repo became the fleet's coordination surface (`#1057`).
+
+**They qualify on evidence, not judgement: both files are already committed in the open in every agent repo.** Refusing to commit them here protects nothing that is not already published.
+
+**And the mechanism is reclassified.** The allowlist guards against *the tool committing something nobody intended*; it is client-side, inside `apply`, and cannot stop a determined writer — M1 establishes that agents can write regardless. **The security boundary is branch protection. The allowlist is tool discipline.**
+
+**Globbing it is prohibited.** A `.github/**` glob converts *"explicitly listed"* into *"happens to be in the right folder"*, over a directory anyone can later add files to — which destroys the one property the list has.
+
+### M3 — what remains unmitigated, stated rather than discovered later
+
+**Nothing mitigates a deleted `fleet.lock`.** Amendment B's per-agent recovery artifacts cover *credential* loss; there is no equivalent for shared-state loss. Branch protection is therefore the only thing between a compromised agent and the fleet's lock file, which is the argument for **asserting** it rather than configuring it once.
+
+**References:** `#1062` (verified by capability) · `#1057` (the allowlist ruling) · `#943` (`administration` withheld) · Amendment K (the first three error classes) · Amendment F (corrected here).
+
+---
+
+## Amendment N (2026-08-21, #1084 + #1087) — key custody: one master, per-agent slices, and where a key may rest
+
+Amendments C and D put the fleet's secrets outside the agent's **read** scope and they work, because encryption is a mechanism the platform expresses. This amendment answers the two questions C/D left open: **where the master key rests**, and **what each host holds** once a fleet spans machines.
+
+### N1 — the key-store rule
+
+> **Never store a key in a store that the ciphertext's readers can also read. Do that and the encryption is decorative.**
+
+**Verified instance, which is why this is a rule and not a caution:** storing the master in a **registry-scope variable** was proposed and is unsafe. Two different agent Apps demonstrated it independently:
+
+    GET repos/<owner>/<owner>/actions/variables   →  readable: YES — 12 variables
+    GET /installation/repositories                →  includes <owner>/<owner>
+
+**Structural, not incidental:** for profile scope the registry **is** `<owner>/<owner>`, and agent Apps **must** be installed there to read and write their own registrations. **The one store that can never hold the master is the registry**, for exactly the reason it is the registry. Combined with M1 — agents can already fetch the vault ciphertext — an agent would have held both halves.
+
+**The corollary that decides candidate stores:** *"private"* is **not** a reader set. A `401` to an anonymous caller proves a store is not **public**; it says nothing about **which installed Apps can read it**, which is the question this rule asks.
+
+**So the master's store must have no App installations — and that absence must be ASSERTED, not assumed.** M0's lesson applies to its own successor: an unasserted *"no App is installed here"* has Amendment F's lifespan. The acceptance criterion is a **capability check** — mint an agent token and prove it **cannot** read the key store.
+
+> **NOT YET IMPLEMENTED — no `Asserted by:` citation.**
+
+### N2 — one operator master key; host keys stay per host
+
+Per-fleet master keys were nominal isolation: they lived **in one directory on one machine**, which by N5 below is *a per-fleet key in a shared store — a shared key with extra steps.* **One operator master key**, machine-independent, is the model.
+
+**Host keys remain per host** — those live on genuinely different machines, so their separation is real rather than nominal. Each host's key is precisely what its own slice is encrypted to.
+
+### N3 — per-agent slices, because age encrypts whole files
+
+**age encrypts whole files.** Adding a VM as a recipient lets it decrypt the **entire** vault, so *"the fleet key on every VM"* and *"each VM as its own recipient"* are **security-equivalent**: one compromised host yields every agent's credentials. There is no position between them — the only real alternative is changing **what gets encrypted**.
+
+| model | each host holds | blast radius of one host |
+|---|---|---|
+| fleet key on every host | the whole vault | **all N agents** |
+| **per-agent slices** | only its own credentials | **1 agent** |
+
+**Whole-vault-per-host makes per-agent identity decorative.** MACF gives each agent its own App precisely so a compromised agent is one agent; a distribution model where every host decrypts every key dissolves that at the storage layer while leaving it intact on paper — the same failure shape as a key beside its ciphertext.
+
+**The property, which is the operator's fleet asymmetry recursed one level:** *the master opens everything; each host opens only what it runs.*
+
+### N4 — one implementation, two artifacts
+
+Amendment B's **recovery artifact** and a **deployment slice** share a shape (a per-agent blob encrypted to `[master, host]`) and have genuinely different lifecycles — the recovery artifact is **deleted on confirmed durability** (`#997`), which is exactly what a deployment payload must not be.
+
+> **A golden path means one IMPLEMENTATION per operation, not one ARTIFACT per shape.**
+
+Reuse the slicing/encryption path; emit distinct artifacts.
+
+### N5 — slicing runs operator-side; nothing holds plaintext at rest
+
+Slicing requires the full plaintext, so the question is **where**. Under DR-044 it is a **fleet operation**: it runs with the operator's credential in the operator's environment, **never on an agent VM**. Promoting one agent VM to "managing host" would hand it the master and recreate N3's problem under another name.
+
+**Amendment D is unchanged:** read-only-decryptable into memory, whole-payload-writable, never read-modify-written. The vault decrypts transiently to produce slices; no plaintext persists anywhere.
+
+### N6 — the transport constraint, binding remote deploy before it exists
+
+`macf fleet deploy` is local-only by construction (DR-037 Amendment D); remote deploy is unbuilt (`#1018`). This amendment does not build it. It **binds** it:
+
+> **Whatever remote-deploy transport ships MUST carry per-agent slices, never whole vaults.**
+
+Recorded now because **an unstated constraint gets resolved by whatever is easiest to implement, and then reads as a decision nobody made.** Narrowing later costs a re-key of every agent.
+
+### N7 — the concentration is present today, and what slicing does NOT fix
+
+Measured on a live fleet with the operator's credential (so `404` means genuinely absent, not invisible): **exactly one vault, control-repo only, ~18 KB** — the intended shape. But that one file holds **every agent's App id, install id and private key**, and per M1 every agent App can read that repo.
+
+Today's isolation rests on **a single condition** — no agent holds a recipient key — and it **holds absolutely until it does not**. Slices do not make that condition harder to breach; they make **breaching it proportionate**.
+
+**The honest bound, so this is not overclaimed:**
+
+- **On any topology** — slices remove the whole-fleet blob that every agent can fetch remotely with only an App token. That is the widest surface and the one worth narrowing first.
+- **On a single-host fleet** — the host-level concentration **remains**: one VM, one host key, every slice on it. Real win, partial, and the residue is a property of the topology rather than of the design.
+
+**References:** `#1084` · `#1087` · `#1062`/M1 (agents read the ciphertext) · `#997` (delete-on-durability) · `#1018` (unbuilt transport) · Amendments B/C/D.
+
+---
+
+## Amendment O (2026-08-21, #1089 + #1082 + #1083 + #1088) — the scope model: what is shared, and the three conditions
+
+A **scope** is an owner (an org or a user account) that may host many fleets. Within a scope, some resources are shared; **nothing is shared across scopes**, which is what makes handover a transfer rather than an unpicking.
+
+### O1 — the sharing rule, in three conditions
+
+Share one instance of a resource across a scope's fleets only when **all three** hold:
+
+1. **Read-only ceiling** — the credential grants no write anywhere.
+2. **Non-secret data** — what it reads is not itself a secret.
+3. **Owner-boundary match** — *the sharing boundary IS an ownership boundary.*
+
+Conditions 1 and 2 are about the credential. **Condition 3 is about who holds it**, and was missing from the first two statements of this rule (`#1082`, `#1083`) until `#1088`: an org-hosted fleet reusing a **personally-owned** routing App means the org's routing depends on an individual's credential, and **transfer the org and the App stays behind** — the new owner inherits a fleet whose routing they cannot manage or rotate.
+
+> **A read-only credential over non-secret data can still be the WRONG credential, if its owner is not the resource's owner.**
+
+### O2 — the boundaries
+
+| resource | shared within a scope | why |
+|---|---|---|
+| master age key | ✅ | machine-independent recovery (N2) |
+| routing App | ✅ | `actions_variables: read` + `metadata: read` — read-only over non-secret data |
+| Tailscale OAuth | ✅ | one tailnet; operator-supplied and un-mintable (Amendment C's pattern) |
+| the scope store | ✅ | it **is** the scope's shared surface |
+| **agent Apps** | ❌ never | identity is the product |
+| **fleet vault** | ❌ never | holds that fleet's credentials |
+| **control repo, CA** | ❌ never | per-fleet state |
+| **`runner-ops`** | ❌ never | `administration: write` → repo deletion across every fleet |
+| host keys | per host | tied to a machine that can be lost (N2) |
+
+**`runner-ops` is the clearest application of O1**: it fails condition 1 outright, and its key leaves the fleet's trust boundary entirely into a cluster Secret. Sharing it would put repo deletion behind whatever runs on that runner platform, for every fleet.
+
+### O3 — the economics, and why they are the acceptance criterion
+
+The shared pieces are **fixed overhead paid once per scope, not once per fleet**:
+
+    scope's 1st fleet:  routing App (2 clicks) + N agent Apps (2N clicks)
+    scope's 2nd fleet:  N agent Apps only
+
+**A fixed overhead never amortises when fleets are small by design** — and they are: at two agents the routing App was a quarter of the clicks, and two agents is the shape a first adopter starts with. App creation is a capability **no credential can hold** (DR-044 Decision 1), so clicks are the one cost the tool cannot pay.
+
+**Corollary to Decision 1, surfaced by `#1086`:** GitHub emits an App's private key **exactly once** and it can never be fetched again, by any credential including the owner's. So creation is human-only **and the result is unrecoverable** — which is why a discarded key makes an App *permanently unadoptable* (`#990`), why Amendment B exists, and why **reuse is a possession check, not a lookup**: an App you can find on GitHub but whose key you do not hold is not reusable.
+
+**The acceptance criterion is the economic property, measured — not the store's existence:**
+
+> **The second fleet in a scope costs strictly fewer operator clicks than the first, and the difference equals the shared pieces.**
+
+A checklist item (*"the scope store exists"*) passes while a store sits unconsulted. Provision two fleets in one scope and assert the **reported click ceiling** — visible for exactly this reason.
+
+> **NOT YET IMPLEMENTED — no `Asserted by:` citation.** The scope store where a scope's shared master and Tailscale credentials live does not exist, so fleet #2 has nowhere to find fleet #1's shared pieces and re-mints. **Until it does, this amendment's sharing rulings are correct and inert** — the same shape as a ratified-but-unbuilt contract, with every artifact reporting success while the property they jointly assert does not hold.
+
+### O4 — isolation is only as strong as the store beneath it
+
+Three independent instances established one rule:
+
+> **Credential isolation is only as strong as the isolation of the store the key lands in. A per-fleet key in a shared store is a shared key with extra steps.**
+
+- **`#1083`** — per-fleet `runner-ops` keys, all landing in Secrets on **one shared cluster**.
+- **`#1084`** — a key proposed for a store its own ciphertext's readers can read (N1).
+- **`#1087`/N7** — per-agent slices on **one shared host**, under one host key.
+
+The key-class rule says **export is a one-way gate** and governs *whether* a key leaves the vault. This governs **where it goes**, and the two must be decided together: a minimal ceiling exported into a shared store still merges blast radii.
+
+### O5 — isolation stays available; the default is the cheap thing
+
+`transport.router_app_scope: per-fleet` and per-fleet keys both remain supported. The default leans shared because **one trust domain per scope** is the common case; someone with genuinely separate clients should not have to fork to get isolation.
+
+**That is the shape of every ruling in this family: default to the cheap thing, keep the strict thing available, and let the manifest say which** — so the choice is recorded rather than implicit in which code path someone took.
+
+### O6 — a premise that stopped holding, recorded as a shape
+
+DR-035's *"one routing App per registry/account"* was **correct when written**: fleets lived on the operator's personal account, so account-scope **was** owner-scope. Fleets moved to organisations and the model did not move with them; two subsequent amendments inherited it faithfully and it was ratified twice without anyone asking **whose** account.
+
+**That is not an error — it is an unrevisited assumption, and nothing in the system re-checks a premise when the world underneath it changes.** The practice it argues for: when prior art differs from a proposed design, do not only ask *why the prior art does that* — ask **what it assumed, and whether that still holds.** Prior art is right about the world it was written for and silent about the world it is being reused in.
+
+**References:** `#1089` (the consolidation) · `#1082` (the reversal) · `#1083` (`runner-ops`; the storage extension) · `#1088` (the owner boundary) · `#1086` (possession-based reuse) · DR-044 Decision 1.
