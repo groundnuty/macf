@@ -141,6 +141,14 @@ const STATUS_LABELS: readonly LabelSpec[] = [
   { name: 'in-review', color: '0e8a16', description: 'PR created, awaiting review' },
   { name: 'blocked', color: 'e11d48', description: 'Needs help or input' },
   { name: 'agent-offline', color: 'b60205', description: 'Agent VM unreachable' },
+  // groundnuty/macf#1091: the declared "route this later, not now" signal —
+  // delegation-template.md's canonical Backlog-mode label, and the escape
+  // hatch check-mention-routing.sh's `create`-guard requires an agent to
+  // reach for explicitly instead of silently omitting both a label and a
+  // mention. Every freshly repo-init'd fleet needs this label to exist
+  // before that guard can be satisfied without friction. Color/description
+  // match the pre-existing `backlog` label on groundnuty/macf itself.
+  { name: 'backlog', color: 'ededed', description: 'Filed for later — deliberately unassigned, not yet routed to anyone' },
 ];
 
 const AGENT_LABEL_COLOR = '1d76db';

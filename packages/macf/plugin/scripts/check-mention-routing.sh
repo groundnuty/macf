@@ -22,42 +22,54 @@
 # bodies unconditionally — a describing-context leak fires false-positive
 # routing regardless of the creator's intent.
 #
-# Check A (must-have-mention) does NOT apply unconditionally to `create` —
-# `delegation-template.md`'s canonical Backlog mode ("Route this now or
-# backlog?") deliberately files an issue unassigned and unmentioned, and a
-# guard that punished that workflow would be hostile to the rule it exists
-# to protect. Three cases, discriminated by the create's `--label`/`-l`
-# values against THIS repo's actual routing-label registry
-# (`.github/agent-config.json`'s `.agents` keys — the file `macf repo-init`
-# writes and the router reads; never a hardcoded role list, since fleets
-# choose their own):
-#   1. no assignee label at all           → backlog, ALLOW, no mention needed
-#   2. assignee label names ANOTHER agent → route-by-label already delivers
-#                                            it; mention optional, ALLOW
-#   3. assignee label names the ACTING agent itself (self-label) → route-
-#      by-label is a no-op (it "delivers" to the author) — a mention is the
-#      ONLY path to anyone else, so Check A REQUIRES one
-# Case 3 is the failure this hook exists to catch: groundnuty/macf#1088 was
-# filed self-labeled `code-agent`, route-by-label reported SUCCESS (routed
-# to the filer), route-by-mention had nothing to match, and the blocking
-# design question sat unanswered for 11 minutes until a follow-up comment
-# finally carried a mention. "Delivered to the person who wrote it" is
-# indistinguishable from silently undelivered without this check — same
-# silent-fallback shape as Instance 12 (a defense that validates a narrower
-# surface than the rule it enforces).
-#
-# Self-identity for case 3 comes from `$MACF_ROUTING_LABEL` (canonical,
+# Check A (must-have-mention) is DECLARED, not inferred, per the operator's
+# ruling: "obvious for an agent" is the binding constraint, and inferring
+# intent from label absence is ambiguous (backlog, or forgot?) in a way an
+# agent can't self-diagnose. So the author states intent via labels, and
+# the hook enforces that the statement is present. Four cases, evaluated
+# against the create's `--label`/`-l` values:
+#   1. `backlog` label present                        → ALLOW. Declared:
+#      nobody's queue, on purpose. `delegation-template.md`'s canonical
+#      Backlog mode ("Route this now or backlog?" → "Use a separate
+#      `backlog` label"). `macf repo-init` creates this label on every
+#      freshly-provisioned repo (STATUS_LABELS in repo-init.ts) so the
+#      escape hatch always exists, not just on repos with prior history.
+#   2. assignee label CONFIRMED naming ANOTHER agent   → ALLOW. route-by-
+#      label already delivers it — a mention would be redundant.
+#      "Confirmed" requires BOTH: the label matches THIS repo's actual
+#      routing-label registry (`.github/agent-config.json`'s `.agents`
+#      keys — the file `macf repo-init` writes and the router reads;
+#      never a hardcoded role list, since fleets choose their own role
+#      names) AND it differs from the acting agent's own routing label.
+#   3. assignee label CONFIRMED naming the ACTING agent itself → BLOCK.
+#      route-by-label "delivers" this to whoever filed it — a no-op — so
+#      a mention is the only real path to anyone else. This is the
+#      failure this hook exists to catch: an issue self-labeled by its
+#      filer got reported as successfully routed (to the filer) while a
+#      blocking design question inside it sat unanswered for several
+#      minutes, because nothing else pointed at the peer who needed to
+#      see it. "Delivered to the person who wrote it" reads identically
+#      to "successfully routed" unless something asserts WHO it reached —
+#      same silent-fallback shape as Instance 12 in this framework's
+#      hazard catalog (a defense that validates a narrower surface than
+#      the rule it enforces).
+#   4. anything else — no labels at all; labels that don't match the
+#      registry; a registry match the hook can't confirm as self or peer
+#      (`$MACF_ROUTING_LABEL` unset) → BLOCK. Ambiguous states default to
+#      BLOCK, never ALLOW — the same posture as case 3, and the reason
+#      case 1 has to be a POSITIVE declaration rather than "well, nothing
+#      else matched."
+# Self-identity (cases 2 vs. 3) comes from `$MACF_ROUTING_LABEL` (canonical,
 # always-exported by claude.sh's env.identity — coordination.md's tmux
 # launch-pattern section documents it as the routing/registry/cert-CN key,
-# distinct from the OTEL display name `$MACF_AGENT_NAME`). If it's unset
-# (workspace without full macf init), the hook can't tell self from peer —
-# fallback per design review: require a mention whenever ANY assignee label
-# is present, accepting harmless friction on the names-someone-else case
-# (already delivered by route-by-label) in exchange for never missing case
-# 3. If `.github/agent-config.json` itself is unavailable, no registry
-# means no label can be classified as an assignee label at all — Check A
-# doesn't apply (same fail-open-on-infrastructure-absence posture as the
-# rest of this hook family; a create in that state is treated as backlog).
+# distinct from the OTEL display name `$MACF_AGENT_NAME`). If unset, or if
+# `.github/agent-config.json` itself is unavailable, the hook can't confirm
+# case 2 — it falls to case 4 (block), the same fail-toward-block-on-
+# uncertainty posture as case 4's other branches (this differs from the
+# rest of this hook family's fail-OPEN-on-infrastructure-absence norm,
+# because here "can't tell" and "genuinely no signal" are the same
+# observable state from the recipient's side, and the operator's ruling is
+# that state must block).
 #
 # Refs: groundnuty/macf#244 (must-have-mention class — orthogonal, deferred),
 #       groundnuty/macf#272 (must-not-leak — what this script enforces),
@@ -155,20 +167,20 @@ macf_extract_labels() {
   done
 }
 
-# CREATE_HAS_ASSIGNEE_LABEL: at least one --label/-l value matches this
-# repo's routing-label registry (case 1 vs. cases 2/3).
-# CREATE_SELF_LABELED: a matched value equals $MACF_ROUTING_LABEL — the
-# acting agent's own routing label (case 3), OR self-identity is unknown
-# (conservative fallback: require a mention whenever ANY assignee label is
-# present rather than silently assume "names someone else").
-# CREATE_MATCHED_LABELS: matched labels, for the block message.
-# CREATE_SELF_IDENTITY_UNKNOWN: true when CREATE_SELF_LABELED fired via the
-# unknown-identity fallback rather than a genuine $MACF_ROUTING_LABEL match
-# — kept separate purely so the block message can say which is true instead
-# of asserting a match that may not exist.
-CREATE_HAS_ASSIGNEE_LABEL=false
-CREATE_SELF_LABELED=false
-CREATE_SELF_IDENTITY_UNKNOWN=false
+# Four cases (the operator's final ruling — DECLARED, not inferred, is the
+# binding constraint; see the file-header "`create` coverage" section):
+#   1. `backlog` label present                       → ALLOW (declared: for later, nobody's queue)
+#   2. assignee label naming ANOTHER agent (confirmed)→ ALLOW (route-by-label delivers it)
+#   3. assignee label naming the ACTING agent itself  → BLOCK (route-by-label is a no-op)
+#   4. anything else (no labels; unrecognized labels; can't confirm 2 vs 3) → BLOCK (ambiguous)
+# Only case 2 is a CONFIRMED allow: it requires BOTH the routing-label
+# registry to resolve the label as real for this repo AND $MACF_ROUTING_LABEL
+# to be known and different from it. Every state the hook can't positively
+# resolve to case 1 or case 2 blocks — ambiguity defaults to BLOCK, not
+# ALLOW, per the operator's ruling.
+CREATE_HAS_BACKLOG_LABEL=false
+CREATE_CONFIRMED_PEER_LABEL=false
+CREATE_CONFIRMED_SELF_LABEL=false
 CREATE_MATCHED_LABELS=""
 if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
   PROJECT_DIR="${CLAUDE_PROJECT_DIR:-}"
@@ -186,40 +198,61 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
     done < <(jq -r '.agents // {} | keys[]?' "$AGENT_CONFIG_PATH" 2>/dev/null || true)
   fi
 
-  if [[ "${#ROUTING_LABELS[@]}" -gt 0 ]]; then
-    while IFS= read -r tok; do
-      [[ -z "$tok" ]] && continue
-      for rl in "${ROUTING_LABELS[@]}"; do
-        if [[ "$tok" == "$rl" ]]; then
-          CREATE_HAS_ASSIGNEE_LABEL=true
-          CREATE_MATCHED_LABELS+="${CREATE_MATCHED_LABELS:+, }$tok"
-          if [[ -z "${MACF_ROUTING_LABEL:-}" ]]; then
-            CREATE_SELF_LABELED=true
-            CREATE_SELF_IDENTITY_UNKNOWN=true
-          elif [[ "$tok" == "${MACF_ROUTING_LABEL}" ]]; then
-            CREATE_SELF_LABELED=true
+  # Collect into an array first (rather than testing membership inline)
+  # so `"${EXTRACTED_LABELS[@]}"` / `"${ROUTING_LABELS[@]}"` can each be
+  # guarded by a `${#arr[@]} -gt 0` check before expansion — an empty-array
+  # expansion under `set -u` is an unbound-variable error on older bash
+  # (pre-4.4 — macOS's shipped /bin/bash is 3.2), so this script never
+  # expands `"${arr[@]}"` without that guard anywhere.
+  EXTRACTED_LABELS=()
+  while IFS= read -r tok; do
+    [[ -n "$tok" ]] && EXTRACTED_LABELS+=("$tok")
+  done < <(macf_extract_labels "$COMMAND")
+
+  if [[ "${#EXTRACTED_LABELS[@]}" -gt 0 ]]; then
+    # `backlog` detection is registry-independent — it's a fixed literal
+    # this framework's repo-init always creates, not a per-fleet routing
+    # label, so it needs no lookup to recognize.
+    for tok in "${EXTRACTED_LABELS[@]}"; do
+      [[ "$tok" == "backlog" ]] && CREATE_HAS_BACKLOG_LABEL=true
+    done
+
+    if [[ "${#ROUTING_LABELS[@]}" -gt 0 ]]; then
+      for tok in "${EXTRACTED_LABELS[@]}"; do
+        for rl in "${ROUTING_LABELS[@]}"; do
+          if [[ "$tok" == "$rl" ]]; then
+            CREATE_MATCHED_LABELS+="${CREATE_MATCHED_LABELS:+, }$tok"
+            if [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$tok" == "${MACF_ROUTING_LABEL}" ]]; then
+              CREATE_CONFIRMED_SELF_LABEL=true
+            elif [[ -n "${MACF_ROUTING_LABEL:-}" ]]; then
+              CREATE_CONFIRMED_PEER_LABEL=true
+            fi
+            # $MACF_ROUTING_LABEL unset: a real assignee label matched, but
+            # self vs. peer can't be confirmed either way — falls through
+            # to case 4 (ambiguous → block) below, same as an unrecognized
+            # label would.
           fi
-        fi
+        done
       done
-    done < <(macf_extract_labels "$COMMAND")
+    fi
   fi
 fi
 
 # CHECK_A_APPLIES replaces the old close-only gate on the must-have-mention
 # check (macf#244): close subcommands never require one (self-close verify
 # is reporter-internal — see IS_CLOSE_SUBCOMMAND above); a `create` requires
-# one only in case 3 (self-labeled — see the file-header rationale); every
-# other subcommand this hook guards (comment) is unchanged — always applies.
+# one in cases 3 and 4 (see above); every other subcommand this hook guards
+# (comment) is unchanged — always applies.
 CHECK_A_APPLIES=true
 if [[ "$IS_CLOSE_SUBCOMMAND" == "true" ]]; then
   CHECK_A_APPLIES=false
 elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
-  if [[ "$CREATE_HAS_ASSIGNEE_LABEL" == "false" ]]; then
-    CHECK_A_APPLIES=false  # case 1: backlog, no assignee label at all
-  elif [[ "$CREATE_SELF_LABELED" == "false" ]]; then
-    CHECK_A_APPLIES=false  # case 2: labeled at another agent — route-by-label delivers it
+  if [[ "$CREATE_HAS_BACKLOG_LABEL" == "true" ]]; then
+    CHECK_A_APPLIES=false  # case 1: backlog — declared, deliberately unrouted
+  elif [[ "$CREATE_CONFIRMED_PEER_LABEL" == "true" ]]; then
+    CHECK_A_APPLIES=false  # case 2: confirmed routed to a different agent
   fi
-  # else: case 3 (self-labeled, or self-identity unknown + any match) — stays true
+  # else: case 3 (confirmed self-label) or case 4 (ambiguous) — stays true
 fi
 
 # --body-file handling (groundnuty/macf#944).
@@ -608,27 +641,27 @@ fi
 # comments are canonically no-recipient (reporter-internal). The close
 # action itself signals routing-end; no addressed mention required.
 #
-# Bypassed for `create` cases 1/2 (no assignee label; label names another
-# agent) — CHECK_A_APPLIES already folds those in (macf#1091). Fires for
-# `create` case 3 (self-labeled): route-by-label "delivers" to the author,
-# which is a no-op, so a mention is the only real path to anyone else.
+# Bypassed for `create` cases 1/2 (backlog label; label confirmed naming
+# another agent) — CHECK_A_APPLIES already folds those in. Fires for
+# `create` case 3 (self-labeled) and case 4 (no confirmed routing signal —
+# no labels, unrecognized labels, or a label the hook can't confirm is
+# self vs. peer). The two messages below are what make the fix obvious to
+# the agent: plain remedies, no internal citations — this text is
+# user-facing (macf#1061's rule for CLI output applies here too, even
+# though the automated guard for it doesn't currently scan shell scripts).
 if [[ "$CHECK_A_APPLIES" == "true" ]] && [[ "$ACTIVE_COUNT" == "0" ]]; then
-  SELF_LABEL_NOTE=""
-  if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]] && [[ "$CREATE_SELF_LABELED" == "true" ]]; then
-    if [[ "$CREATE_SELF_IDENTITY_UNKNOWN" == "true" ]]; then
-      SELF_LABEL_NOTE="
-This create carries assignee label(s) from this repo's routing registry
-($CREATE_MATCHED_LABELS), but \$MACF_ROUTING_LABEL isn't set in this
-session, so the hook can't confirm whether that label names you or a peer.
-Conservative fallback: require a mention whenever ANY assignee label is
-present (groundnuty/macf#1091) — if this labels a peer and route-by-label
-already delivers it to them, the mention is redundant but harmless."
+  CREATE_NOTE=""
+  if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
+    if [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+      CREATE_NOTE="
+This issue or pull request is labeled for you, so routing delivers it to
+you and no one else will see it. Add a mention for whoever should read
+it, or the \"backlog\" label if it's for later."
     else
-      SELF_LABEL_NOTE="
-This create carries assignee label(s) matching the acting agent's own
-routing label ($CREATE_MATCHED_LABELS): route-by-label already \"delivers\"
-this to whoever filed it — a no-op. A mention is the only path to anyone
-else (groundnuty/macf#1091 case 3 — the shape that stranded #1088)."
+      CREATE_NOTE="
+This issue or pull request has no assignee label, so nothing will route
+it to anyone. Add an assignee label, a mention, or the \"backlog\" label
+if it's deliberately for later."
     fi
   fi
   cat >&2 <<ERR
@@ -641,7 +674,7 @@ zero routing-active @<bot>[bot] mentions. Per coordination.md §Communication 2:
 Without a routing-active mention, the content is silently invisible to
 peer agents — they have no notification that you posted, even if the
 issue/PR is on their assigned-label queue.
-$SELF_LABEL_NOTE
+$CREATE_NOTE
 
 Fix: add an addressing mention naming the recipient:
   @<recipient-handle>[bot] <your message>

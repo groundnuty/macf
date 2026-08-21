@@ -1198,8 +1198,34 @@ describe('repoInit integration', () => {
       force: false,
     });
 
-    // 4 status labels + 2 agent labels = 6 API calls
-    expect(fetchMock).toHaveBeenCalledTimes(6);
+    // 5 status labels (in-progress, in-review, blocked, agent-offline,
+    // backlog — macf#1091 added `backlog`) + 2 agent labels = 7 API calls
+    expect(fetchMock).toHaveBeenCalledTimes(7);
+  });
+
+  it('creates the backlog label (macf#1091 — the check-mention-routing.sh create-guard escape hatch)', async () => {
+    const createdNames: string[] = [];
+    const fetchMock = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+      const body = init?.body ? (JSON.parse(String(init.body)) as { name: string }) : undefined;
+      if (body?.name) createdNames.push(body.name);
+      return Promise.resolve({ status: 201 });
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    const result = await repoInit(dir, {
+      repo: 'owner/r',
+      actionsVersion: 'v1',
+      force: false,
+    });
+
+    // Set membership, not a count or exact order — the assertion this test
+    // exists for is "backlog is among the labels repo-init creates", not
+    // "repo-init creates exactly N labels in exactly this order."
+    expect(createdNames).toContain('backlog');
+    expect(result.labels.status).toBe('ok');
+    if (result.labels.status === 'ok') {
+      expect(result.labels.created).toContain('backlog');
+    }
   });
 
   it('handles 422 (label already exists) gracefully', async () => {
