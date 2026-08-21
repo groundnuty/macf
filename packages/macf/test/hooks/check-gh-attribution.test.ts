@@ -32,7 +32,8 @@ const BOT = 'macf-code-agent[bot]';
  *  a failure sentinel. */
 type GhStub =
   | { readonly login: string; readonly type: 'Bot' | 'User' }
-  | 'fail'; // gh api exits non-zero (network / 404 / auth)
+  | 'fail' // gh api exits non-zero, non-auth (network / 404 / 5xx)
+  | 'authfail'; // gh api exits non-zero with an auth-failure shape (groundnuty/macf#938)
 
 /**
  * Build a directory with a stub `gh` shim that answers
@@ -48,6 +49,11 @@ function makeStubGhDir(stub: GhStub): string {
   let arm: string;
   if (stub === 'fail') {
     arm = `echo "gh: HTTP 503 Service Unavailable" >&2; exit 1`;
+  } else if (stub === 'authfail') {
+    // Same shape gh 2.95.0 emits live for a dead installation token,
+    // verified against both its REST form (`gh api`) and GraphQL form
+    // (`gh pr view`) — groundnuty/macf#938.
+    arm = `echo "gh: Bad credentials (HTTP 401)" >&2; exit 1`;
   } else {
     const body = JSON.stringify({ login: stub.login, type: stub.type });
     // Single-quote the JSON for echo; JSON has no single quotes.
@@ -294,6 +300,53 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
         stubGh: 'fail',
       });
       expect(r.status).toBe(0);
+    });
+  });
+
+  describe('(h2) credential expired + unrefreshable (groundnuty/macf#938)', () => {
+    it('still fails open (exit 0) — this hook cannot block a write that already happened', () => {
+      // No MACF_WORKSPACE_DIR / APP_ID / INSTALL_ID / KEY_PATH supplied, so
+      // the refresh helper is unreachable and macf_hook_gh's refresh
+      // attempt fails too — this is the "refresh helper's own failure is
+      // handled" case, exercised together with the auth-failure path.
+      const r = runHook({
+        command: 'gh issue create --repo groundnuty/macf --title x --body y',
+        output: `${ISSUE_URL}\n`,
+        stubGh: 'authfail',
+      });
+      expect(r.status).toBe(0);
+    });
+
+    it('prints a diagnostic to stderr instead of silently doing nothing', () => {
+      // The decisive assertion for this hook: exit code alone cannot
+      // distinguish "verified clean" from "never verified" (both are 0) —
+      // per assert-the-wrong-path.md, assert the SIGNAL this fix actually
+      // changed (stderr visibility), not just the unchanged exit code.
+      const r = runHook({
+        command: 'gh issue create --repo groundnuty/macf --title x --body y',
+        output: `${ISSUE_URL}\n`,
+        stubGh: 'authfail',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stderr).toMatch(/could not verify/i);
+      expect(r.stderr).toMatch(/did not run/i);
+    });
+
+    it('never prints anything token-shaped to stdout or stderr', () => {
+      const r = runHook({
+        command: 'gh issue create --repo groundnuty/macf --title x --body y',
+        output: `${ISSUE_URL}\n`,
+        stubGh: 'authfail',
+        env: {
+          MACF_WORKSPACE_DIR: '/nonexistent-workspace',
+          APP_ID: 'test-app-id',
+          INSTALL_ID: 'test-install-id',
+          KEY_PATH: '/nonexistent-key.pem',
+        },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout ?? '').not.toMatch(/ghs_/);
+      expect(r.stderr ?? '').not.toMatch(/ghs_/);
     });
   });
 

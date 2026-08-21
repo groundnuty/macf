@@ -26,12 +26,47 @@
 #
 # Refs: groundnuty/macf#431 (this hook); coordination.md §Issue Lifecycle 1
 #       (the 9 forbidden variants + reporter-owns-closure); silent-fallback-
-#       hazards.md Instance 2; #140 / #244+#272 / #270 (sister Path-2 hooks).
+#       hazards.md Instance 2; #140 / #244+#272 / #270 (sister Path-2 hooks);
+#       groundnuty/macf#938 (authorship-lookup routed through a credential-
+#       refresh wrapper — see resolve_issue() below; the fail-CLOSED posture
+#       on an unresolvable lookup is unchanged by that fix, only the odds of
+#       needing it on a merely-stale ambient token improve).
 set -euo pipefail
 
 # Cheap exit on operator override — no stdin read, no parsing.
 if [[ "${MACF_SKIP_CLOSE_CHECK:-}" == "1" ]]; then
   exit 0
+fi
+
+# hook-gh-token.sh is copied alongside this file by every distribution path,
+# so it should always be right here — but `source`ing a missing file would
+# abort this whole script under `set -e`. Guard it: if the sibling is
+# somehow missing (a stale or partial distribution), degrade to a plain,
+# non-refreshing gh call instead of crashing — this hook's fail-closed
+# posture on an unresolved lookup is unaffected either way.
+HOOK_GH_TOKEN_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hook-gh-token.sh"
+if [[ -r "$HOOK_GH_TOKEN_LIB" ]]; then
+  # shellcheck source=./hook-gh-token.sh
+  source "$HOOK_GH_TOKEN_LIB"
+else
+  echo "MACF close-keyword: the credential-refresh helper library is missing from this workspace's scripts — running without token refresh. Update this workspace to pick up the missing file." >&2
+  macf_hook_gh() {
+    local out err errfile rc=0
+    errfile="$(mktemp 2>/dev/null)" || { printf 'could not allocate a temp file'; return 2; }
+    out="$(gh "$@" 2>"$errfile")" || rc=$?
+    err="$(cat "$errfile" 2>/dev/null || true)"
+    rm -f "$errfile"
+    if [[ "$rc" -eq 0 ]]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    # Preserve gh's stderr in the diagnostic (matches the real
+    # macf_hook_gh's on-failure contract) so callers that pattern-match it
+    # — e.g. resolve_issue()'s 404-vs-APIERROR split below — keep working
+    # in degraded mode, not just when the library is present.
+    printf '%s' "$err"
+    return 2
+  }
 fi
 
 # Read PreToolUse payload. Fall through to allow on parse error — a broken
@@ -74,7 +109,15 @@ fi
 # back to gh's default repo resolution for the cwd.
 PR_REPO="$(grep -oE -- '--repo[ =][^[:space:]]+' <<<"$COMMAND" | head -1 | sed -E 's/^--repo[ =]//' | tr -d "\"'" || true)"
 if [[ -z "$PR_REPO" ]]; then
-  PR_REPO="$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null || true)"
+  # Routed through macf_hook_gh (groundnuty/macf#938) for the same
+  # refresh-on-401 benefit as resolve_issue() below. macf_hook_gh's stdout
+  # is a diagnostic string (not empty) on EITHER failure kind, unlike the
+  # plain `gh ... 2>/dev/null || true` this replaces — explicitly reset to
+  # empty on any non-zero so a stale-token diagnostic never gets mistaken
+  # for a repo name downstream.
+  REPO_LOOKUP_RC=0
+  PR_REPO="$(macf_hook_gh repo view --json nameWithOwner --jq '.nameWithOwner')" || REPO_LOOKUP_RC=$?
+  [[ "$REPO_LOOKUP_RC" -eq 0 ]] || PR_REPO=""
 fi
 
 # ── Build the scan text: the raw command (covers inline --body, --title, and
@@ -122,25 +165,43 @@ MATCHES="$(grep -oiE "$ADJ_RE" <<<"$SCAN_TEXT" | sed -E 's/^[^A-Za-z]+//' || tru
 # ── Resolve authorship for each unique ref + classify ────────────────────
 # Returns one of: NOTFOUND (no such issue → safe, no auto-close target),
 # OK:<PR|ISSUE>:<login>, or APIERROR:<msg>.
+#
+# groundnuty/macf#938: the gh call is routed through macf_hook_gh
+# (hook-gh-token.sh) instead of a bare `gh api` — a merely-EXPIRED ambient
+# token now gets one refresh-and-retry before this falls into the
+# already-conservative APIERROR path below, so a long session doesn't start
+# blocking every `Closes #N` on token staleness alone. The posture is
+# UNCHANGED either way this can end: this hook already fails CLOSED
+# (APIERROR) on anything it can't resolve, auth-related or not — refreshing
+# the token only reduces how often a merely-stale credential produces a
+# false block; it does not loosen what gets blocked once genuinely
+# unresolved.
 resolve_issue() {
-  local repo="$1" num="$2" out rc err errfile
-  # Single gh call: capture stdout + stderr + rc atomically so the
-  # success/404/error classification can't split across two flaky calls.
-  errfile="$(mktemp)"
-  out="$(GH_PAGER= gh api "repos/${repo}/issues/${num}" 2>"$errfile")"; rc=$?
-  err="$(cat "$errfile" 2>/dev/null || true)"; rm -f "$errfile"
-  if [[ $rc -ne 0 ]]; then
-    if grep -qiE '404|not found' <<<"$err"; then
-      echo "NOTFOUND"
-    else
-      echo "APIERROR:$(tr '\n' ' ' <<<"$err" | cut -c1-120)"
-    fi
+  local repo="$1" num="$2" resp rc=0
+  resp="$(macf_hook_gh api "repos/${repo}/issues/${num}")" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    local login ispr
+    login="$(jq -r '.user.login // ""' <<<"$resp")"
+    ispr="$(jq -r 'if .pull_request then "PR" else "ISSUE" end' <<<"$resp")"
+    echo "OK:${ispr}:${login}"
     return 0
   fi
-  local login ispr
-  login="$(jq -r '.user.login // ""' <<<"$out")"
-  ispr="$(jq -r 'if .pull_request then "PR" else "ISSUE" end' <<<"$out")"
-  echo "OK:${ispr}:${login}"
+  # auth_failed (rc=1): macf_hook_gh already attempted a refresh + retry —
+  # this IS the conservative "cannot verify" outcome, distinct only in
+  # diagnostic wording from the other_failed case below.
+  if [[ "$rc" -eq 1 ]]; then
+    echo "APIERROR:credential expired/invalid and refresh failed — $(tr '\n' ' ' <<<"$resp" | cut -c1-120)"
+    return 0
+  fi
+  # other_failed (rc=2): same NOTFOUND-vs-APIERROR split as before this
+  # change — macf_hook_gh's diagnostic wraps gh's own stderr text, so the
+  # "404 / not found" substring check below still fires correctly through
+  # that wrapper.
+  if grep -qiE '404|not found' <<<"$resp"; then
+    echo "NOTFOUND"
+  else
+    echo "APIERROR:$(tr '\n' ' ' <<<"$resp" | cut -c1-120)"
+  fi
 }
 
 BLOCKED=""        # accumulated human-readable offenders
