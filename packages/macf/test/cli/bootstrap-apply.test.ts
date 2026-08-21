@@ -255,14 +255,18 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
     // creation set entirely (never appended, unlike the pre-#1083
     // unconditional shape — see the dedicated `plannedAppCreations` describe
     // block above, whose manifest DOES declare self-hosted routing, for the
-    // "runner-ops IS appended last" case).
+    // "runner-ops IS appended last" case). groundnuty/macf#1105 — the router
+    // App IS always a create-candidate (UNCONDITIONAL, no `fleet.lock` entry
+    // here) and is appended LAST, after runner-ops when present.
     expect(parsed.planned_app_creations.map((c) => c.manifest.name)).toEqual([
       'demo-fleet-code-agent',
       'demo-fleet-science-agent',
+      'groundnuty-router',
     ]);
     expect(parsed.planned_app_creations.map((c) => c.installUrl)).toEqual([
       'https://github.com/apps/demo-fleet-code-agent/installations/new',
       'https://github.com/apps/demo-fleet-science-agent/installations/new',
+      'https://github.com/apps/groundnuty-router/installations/new',
     ]);
     // Inherited automatically from fleetPlanToJson(plan) — no separate wiring
     // needed. macf#838 Amendment D phase 2: `ca` is now fully implemented
@@ -306,8 +310,9 @@ describe('plannedAppCreations (pure)', () => {
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
     // groundnuty/macf#943 — the runner-ops is ALWAYS a create-candidate
-    // on a fresh fleet (no `fleet.lock` entry yet) and is appended LAST.
-    expect(creations.map((c) => c.role)).toEqual(['code-agent', 'science-agent', 'runner-ops']);
+    // on a fresh fleet (no `fleet.lock` entry yet). groundnuty/macf#1105 —
+    // the router App is UNCONDITIONAL and appended LAST, after runner-ops.
+    expect(creations.map((c) => c.role)).toEqual(['code-agent', 'science-agent', 'runner-ops', 'router']);
     expect(creations[0]?.manifest.redirect_url).toBe(DRY_RUN_REDIRECT_PLACEHOLDER);
   });
 
@@ -318,6 +323,7 @@ describe('plannedAppCreations (pure)', () => {
       'https://github.com/apps/demo-fleet-code-agent/installations/new',
       'https://github.com/apps/demo-fleet-science-agent/installations/new',
       'https://github.com/apps/demo-fleet-runner-ops/installations/new',
+      'https://github.com/apps/groundnuty-router/installations/new',
     ]);
     for (const c of creations) {
       expect(c.installUrl).toBe(`https://github.com/apps/${c.manifest.name}/installations/new`);
@@ -351,7 +357,9 @@ describe('plannedAppCreations (pure)', () => {
     // groundnuty/macf#943 — the runner-ops has its OWN presence signal
     // (`fleet.lock`, not `observedWithApp`'s per-agent fixture), so it stays
     // a create-candidate here regardless of code-agent's presence.
-    expect(creations.map((c) => c.role)).toEqual(['science-agent', 'runner-ops']);
+    // groundnuty/macf#1105 — same for the router App (UNCONDITIONAL, its own
+    // `fleet.lock`/vault presence signal, absent here too).
+    expect(creations.map((c) => c.role)).toEqual(['science-agent', 'runner-ops', 'router']);
   });
 
   it('formats an empty creation set without claiming work', () => {
@@ -2312,6 +2320,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
             { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
             { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
             { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+            // groundnuty/macf#1105 — the router App is UNCONDITIONAL; a
+            // lock entry here keeps this test isolated to its actual point
+            // (agent resume-install semantics), not a router_app create.
+            { role: 'router', app_id: 'app-router', install_id: 'install-4' },
           ],
         },
         // Empty, same as the fully-provisioned tests below — plan.items
@@ -2356,9 +2368,12 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
           fleet: 'demo-fleet',
           // ONLY code-agent has a prior lock entry — science-agent is a
           // genuine first-time create-candidate; runner-ops noop as usual.
+          // groundnuty/macf#1105 — router App noop too (UNCONDITIONAL; a
+          // lock entry keeps this test isolated to its actual point).
           agents: [
             { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
             { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+            { role: 'router', app_id: 'app-router', install_id: 'install-4' },
           ],
         },
         agents: {},
@@ -2386,21 +2401,21 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(out).toContain('1 already-created App still needs its install flow');
     });
 
-    it('DECISIVE — fresh 2-agent HOSTED-runner fleet (FLEET_YAML declares no routing:), --dry-run, no vault flags: just 2 Apps to create, NO runner-ops (groundnuty/macf#1083) -> honest maximum of 4 total consent-gate clicks (2 gate-1 + 2 gate-2)', async () => {
+    it('DECISIVE — fresh 2-agent HOSTED-runner fleet (FLEET_YAML declares no routing:), --dry-run, no vault flags: 2 agent Apps + the UNCONDITIONAL router App (groundnuty/macf#1105), NO runner-ops (groundnuty/macf#1083) -> honest maximum of 6 total consent-gate clicks (3 gate-1 + 3 gate-2)', async () => {
       const file = writeManifest();
       const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
       expect(code).toBe(0);
       const out = logs.join('\n');
-      expect(out).toMatch(/Operator interaction: up to 2 Apps to create/);
-      expect(out).toContain('2 "Create GitHub App" clicks');
-      expect(out).toContain('2 install flows');
+      expect(out).toMatch(/Operator interaction: up to 3 Apps to create/);
+      expect(out).toContain('3 "Create GitHub App" clicks');
+      expect(out).toContain('3 install flows');
       expect(out).toContain('may confirm some of these already exist and skip their gates');
       // Set membership, not just arithmetic — the App-creation set genuinely
-      // excludes runner-ops, never merely happens to count to 2.
+      // excludes runner-ops, never merely happens to count to 3.
       expect(out).not.toMatch(/runner-ops/);
     });
 
-    it('DECISIVE non-regression — the SAME fresh 2-agent fleet, but SELF-HOSTED declared (FLEET_YAML_WITH_ROUTING): 3 Apps to create (2 agents + runner-ops) -> honest maximum of 6 total consent-gate clicks (3 gate-1 + 3 gate-2)', async () => {
+    it('DECISIVE non-regression — the SAME fresh 2-agent fleet, but SELF-HOSTED declared (FLEET_YAML_WITH_ROUTING): 4 Apps to create (2 agents + runner-ops + router App) -> honest maximum of 8 total consent-gate clicks (4 gate-1 + 4 gate-2)', async () => {
       const file = writeManifest(FLEET_YAML_WITH_ROUTING);
       const code = await runBootstrapApply(
         { file, dryRun: true, runnerToken: SENTINEL_RUNNER_TOKEN },
@@ -2408,23 +2423,23 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       );
       expect(code).toBe(0);
       const out = logs.join('\n');
-      expect(out).toMatch(/Operator interaction: up to 3 Apps to create/);
-      expect(out).toContain('3 "Create GitHub App" clicks');
-      expect(out).toContain('3 install flows');
+      expect(out).toMatch(/Operator interaction: up to 4 Apps to create/);
+      expect(out).toContain('4 "Create GitHub App" clicks');
+      expect(out).toContain('4 install flows');
       expect(out).toContain('may confirm some of these already exist and skip their gates');
     });
 
-    it('DECISIVE — fresh 2-agent HOSTED-runner fleet, --dry-run --json: operator_interaction carries gate1_clicks/gate2_flows both = 2 (no runner-ops, groundnuty/macf#1083), bound "maximum"', async () => {
+    it('DECISIVE — fresh 2-agent HOSTED-runner fleet, --dry-run --json: operator_interaction carries gate1_clicks/gate2_flows both = 3 (2 agent Apps + the UNCONDITIONAL router App, groundnuty/macf#1105; no runner-ops, groundnuty/macf#1083), bound "maximum"', async () => {
       const file = writeManifest();
       const code = await runBootstrapApply({ file, dryRun: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
       expect(code).toBe(0);
       const json = JSON.parse(logs.join('')) as {
         operator_interaction: { gate1_clicks: number; gate2_flows: number; bound: string };
       };
-      expect(json.operator_interaction).toEqual({ gate1_clicks: 2, gate2_flows: 2, bound: 'maximum' });
+      expect(json.operator_interaction).toEqual({ gate1_clicks: 3, gate2_flows: 3, bound: 'maximum' });
     });
 
-    it('DECISIVE non-regression — the SAME fresh fleet, but SELF-HOSTED declared, --dry-run --json: operator_interaction carries gate1_clicks/gate2_flows both = 3 (2 declared agents + the now-needed runner-ops), bound "maximum"', async () => {
+    it('DECISIVE non-regression — the SAME fresh fleet, but SELF-HOSTED declared, --dry-run --json: operator_interaction carries gate1_clicks/gate2_flows both = 4 (2 declared agents + the now-needed runner-ops + the router App), bound "maximum"', async () => {
       const file = writeManifest(FLEET_YAML_WITH_ROUTING);
       const code = await runBootstrapApply(
         { file, dryRun: true, json: true, runnerToken: SENTINEL_RUNNER_TOKEN },
@@ -2434,7 +2449,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       const json = JSON.parse(logs.join('')) as {
         operator_interaction: { gate1_clicks: number; gate2_flows: number; bound: string };
       };
-      expect(json.operator_interaction).toEqual({ gate1_clicks: 3, gate2_flows: 3, bound: 'maximum' });
+      expect(json.operator_interaction).toEqual({ gate1_clicks: 4, gate2_flows: 4, bound: 'maximum' });
     });
 
     it('adding one agent to an already-provisioned fleet (2 existing confirmed via vault, 1 new): budget is 2 clicks (1 App)', async () => {
@@ -2452,6 +2467,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
             { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
             { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
             { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+            // groundnuty/macf#1105 — router App noop too (UNCONDITIONAL; a
+            // lock entry keeps this test isolated to its actual point: the
+            // ONE new agent's click cost).
+            { role: 'router', app_id: 'app-router', install_id: 'install-4' },
           ],
         },
         agents: {},
@@ -2502,6 +2521,9 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
             { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
             { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
             { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+            // groundnuty/macf#1105 — the router App is UNCONDITIONAL; without
+            // this entry it would be the one remaining create-candidate.
+            { role: 'router', app_id: 'app-router', install_id: 'install-4' },
           ],
         },
         agents: {
@@ -2542,6 +2564,9 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
             { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
             { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
             { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+            // groundnuty/macf#1105 — the router App is UNCONDITIONAL; without
+            // this entry it would be the one remaining create-candidate.
+            { role: 'router', app_id: 'app-router', install_id: 'install-4' },
           ],
         },
         // Deliberately EMPTY — see the NOTE above this test.
@@ -2585,6 +2610,9 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
             { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
             { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
             { role: RUNNER_OPS_ROLE, app_id: 'app-runner-ops', install_id: 'install-3' },
+            // groundnuty/macf#1105 — the router App is UNCONDITIONAL; without
+            // this entry it would be the one remaining create-candidate.
+            { role: 'router', app_id: 'app-router', install_id: 'install-4' },
           ],
         },
         agents: {},
@@ -2635,8 +2663,9 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       }
       expect(code).toBe(0);
       // groundnuty/macf#1083 — `FLEET_YAML` declares no self-hosted routing:
-      // 2 Apps to create, not 3 (no runner-ops).
-      expect(rawWrites.join('')).toMatch(/Operator interaction: up to 2 Apps to create/);
+      // no runner-ops. groundnuty/macf#1105 — the router App IS always a
+      // create-candidate (UNCONDITIONAL): 2 agent Apps + 1 router App = 3.
+      expect(rawWrites.join('')).toMatch(/Operator interaction: up to 3 Apps to create/);
     });
   });
 });

@@ -81,8 +81,10 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
     // CA; groundnuty/macf#920 for labels/routing_client). NO runner_ops item
     // — `baseManifest()` declares no `routing:` at all, so this fleet needs
     // no runner-ops App (groundnuty/macf#1083; see the dedicated describe
-    // block for the conditional-creation behavior itself).
-    expect(plan.items).toHaveLength(15);
+    // block for the conditional-creation behavior itself). +1 `router_app`
+    // item — UNCONDITIONAL regardless of `routing:` (groundnuty/macf#1105;
+    // see the dedicated describe block below).
+    expect(plan.items).toHaveLength(16);
     for (const item of plan.items) {
       expect(item.verb).toBe('create');
       expect(item.confirm_required).toBe(false);
@@ -216,21 +218,23 @@ describe('computePlan — all-match observed state → all noops', () => {
     // 5 × 2 agents (app/repo/install/secret_fingerprint/labels) + caRegistry +
     // 2 caRepo + routing + runner_warm (macf#942) + 2 routing_client + the
     // fleet-level runner_ops item (groundnuty/macf#943; control_repo item
-    // absent — not archived).
-    expect(plan.items).toHaveLength(18);
+    // absent — not archived) + the fleet-level router_app item
+    // (groundnuty/macf#1105, UNCONDITIONAL).
+    expect(plan.items).toHaveLength(19);
     for (const item of plan.items) {
       // `labels` is a structural exception: it has NO plan-time observed
       // read at all (see `labelsItem`'s doc — a per-label API read is out of
       // scope), so it ALWAYS degrades to a LOW-CONFIDENCE `create`-candidate
-      // regardless of how "matched" everything else is. `runner_ops`
-      // is the SAME shape here (groundnuty/macf#943) — this test's
-      // `observed.lock` is `null` (never simulated), so its presence can
-      // only degrade to `unknown` → `create`, same as `labels`. `runner_warm`
-      // (macf#942) is ALWAYS `create` too — there is no live-observable
-      // "already at this warm posture" signal to compare against (see
-      // `runnerWarmItem`'s doc). Every other kind genuinely observed-matches
-      // here.
-      if (item.kind === 'labels' || item.kind === 'runner_ops' || item.kind === 'runner_warm') {
+      // regardless of how "matched" everything else is. `runner_ops`/
+      // `router_app` are the SAME shape here (groundnuty/macf#943,
+      // groundnuty/macf#1105) — this test's `observed.lock` is `null`
+      // (never simulated) and `vaultRouterApp` is unset, so their presence
+      // can only degrade to `unknown` → `create`, same as `labels`.
+      // `runner_warm` (macf#942) is ALWAYS `create` too — there is no
+      // live-observable "already at this warm posture" signal to compare
+      // against (see `runnerWarmItem`'s doc). Every other kind genuinely
+      // observed-matches here.
+      if (item.kind === 'labels' || item.kind === 'runner_ops' || item.kind === 'runner_warm' || item.kind === 'router_app') {
         expect(item.verb).toBe('create');
       } else {
         expect(item.verb).toBe('noop');
@@ -605,10 +609,12 @@ describe('computePlan — deterministic ordering', () => {
     const kinds = plan.items.map((i) => i.kind);
     // groundnuty/macf#943 — the fleet-level `runner_ops` item comes
     // FIRST (right after the control-repo item, when present; absent here —
-    // `EMPTY_OBSERVED.controlRepoPresence` is `'absent'`), before any
-    // per-agent item.
-    expect(kinds.slice(0, 11)).toEqual([
+    // `EMPTY_OBSERVED.controlRepoPresence` is `'absent'`), then the
+    // fleet-level `router_app` item (groundnuty/macf#1105, UNCONDITIONAL),
+    // before any per-agent item.
+    expect(kinds.slice(0, 12)).toEqual([
       'runner_ops',
+      'router_app',
       'app', 'repo', 'install', 'secret_fingerprint', 'labels', // science-agent
       'app', 'repo', 'install', 'secret_fingerprint', 'labels', // code-agent
     ]);
@@ -706,9 +712,10 @@ describe('summarizePlan', () => {
     const summary = summarizePlan(plan.items);
     // 10 per-agent creates (app/repo/install/secret_fingerprint/labels × 2) +
     // 3 CA creates (registry + 2 agent repos) + 2 routing_client creates +
-    // 1 runner_ops create (groundnuty/macf#943) + 1 runner_warm create
+    // 1 runner_ops create (groundnuty/macf#943) + 1 router_app create
+    // (groundnuty/macf#1105, UNCONDITIONAL) + 1 runner_warm create
     // (macf#942) + 1 routing update.
-    expect(summary).toEqual({ creates: 17, updates: 1, noops: 0, extras: 0 });
+    expect(summary).toEqual({ creates: 18, updates: 1, noops: 0, extras: 0 });
   });
 });
 
@@ -1312,8 +1319,10 @@ describe('computePlan — runner_ops is CONDITIONAL on self-hosted (groundnuty/m
     const hostedLine = formatOperatorInteractionLine(operatorInteractionBudget(countAppsToCreate(hostedPlan.items)));
     const selfHostedLine = formatOperatorInteractionLine(operatorInteractionBudget(countAppsToCreate(selfHostedPlan.items)));
     expect(hostedLine).not.toBe(selfHostedLine);
-    expect(hostedLine).toContain('2 Apps to create');
-    expect(selfHostedLine).toContain('3 Apps to create');
+    // 2 agent Apps + 1 router_app (groundnuty/macf#1105, UNCONDITIONAL) = 3;
+    // self-hosted adds runner-ops on top = 4.
+    expect(hostedLine).toContain('3 Apps to create');
+    expect(selfHostedLine).toContain('4 Apps to create');
   });
 
   it('later declaring self-hosted on a PREVIOUSLY-hosted fleet reads as a plain create — the SAME reuse-or-create path, no second mechanism', () => {
@@ -1343,8 +1352,11 @@ describe('computePlan — runner_ops is CONDITIONAL on self-hosted (groundnuty/m
     expect(item?.reason).toMatch(/ORPHAN/);
     expect(item?.reason).toContain('icsoc-2026-runner-ops');
     expect(item?.reason).not.toMatch(/see controlRepo above/); // not an abort — a real orphan report
-    // Never counted as an app-creation — an orphan costs zero clicks.
-    expect(countAppsToCreate(plan.items)).toBe(2);
+    // Never counted as an app-creation — an orphan costs zero clicks. 2
+    // agent Apps + 1 router_app (groundnuty/macf#1105, UNCONDITIONAL,
+    // `lock` here has no 'router' entry) = 3; the runner-ops orphan itself
+    // contributes 0.
+    expect(countAppsToCreate(plan.items)).toBe(3);
   });
 
   it('an orphan does NOT resurrect as a report-extra "agent" item either — same non-leak guarantee the needed-case test above already covers', () => {
@@ -1367,6 +1379,149 @@ describe('computePlan — runner_ops is CONDITIONAL on self-hosted (groundnuty/m
     expect(item).toBeDefined();
     if (item) expect(planItemApplyCoverage(item)).toBe('implemented');
     expect(plan.unimplementedByApply.some((i) => i.kind === 'runner_ops')).toBe(false);
+  });
+});
+
+// --- groundnuty/macf#1105 — `apply` never planned the routing App, so the
+// routing plane shipped unable to route. `apply-fleet.ts` reaches the router
+// App's ceremony UNCONDITIONALLY (`routerAppScope === 'shared'` is the schema
+// default), but `plan.ts` never rendered it — the operator's click-ceiling
+// read one consent gate short of what `apply` actually opens. These tests
+// pin the fix: `routerAppItem`'s presence resolution (lock then vault, per
+// that function's doc) and the ceiling recompute in `countAppsToCreate`.
+describe('computePlan — router App item (groundnuty/macf#1105)', () => {
+  // Decisive pair (per the issue's own requirement 5: assert BOTH, because
+  // either alone passes a broken implementation — a count-only assertion
+  // passes if the item is mis-modelled; an item-only assertion passes if the
+  // ceiling is not recomputed).
+  it('DECISIVE 1/2 — a fleet with NO router App (no lock entry, no vault) yields a plan whose App-creation SET CONTAINS a router-App create item (set membership, not a count)', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    // Per `assert-the-wrong-path.md`: assert the ACTUAL target string, not
+    // merely that "some item somewhere" is a create — a bare count would
+    // pass even if a DIFFERENT create-candidate happened to make the
+    // arithmetic work.
+    const createTargets = new Set(plan.items.filter((i) => i.kind === 'router_app' && i.verb === 'create').map((i) => i.target));
+    expect(createTargets.has('router_app:app:groundnuty-router')).toBe(true);
+  });
+
+  it('DECISIVE 2/2 — that SAME plan\'s click ceiling is exactly ONE HIGHER than the agent-App-alone count', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const agentAppCreateCount = plan.items.filter((i) => i.kind === 'app' && i.verb === 'create').length;
+    expect(agentAppCreateCount).toBe(2); // baseManifest() declares exactly 2 agents
+    expect(countAppsToCreate(plan.items)).toBe(agentAppCreateCount + 1);
+  });
+
+  it('a fleet whose VAULT carries the router App (MACF_ROUTING_APP_ID present, no lock entry) yields noop (reuse) and NO ceiling bump', () => {
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultRouterApp: { status: 'confirmed', present: true } };
+    const plan = computePlan(baseManifest(), observed);
+    const item = plan.items.find((i) => i.kind === 'router_app');
+    expect(item?.verb).toBe('noop');
+    const agentAppCreateCount = plan.items.filter((i) => i.kind === 'app' && i.verb === 'create').length;
+    expect(countAppsToCreate(plan.items)).toBe(agentAppCreateCount); // no bump — router_app contributed 0
+  });
+
+  it('a fleet.lock entry for role "router" ALSO reads present (this fleet\'s own prior create/reuse) — noop, no ceiling bump', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      lock: { schema_version: 1, fleet: 'icsoc-2026', agents: [{ role: 'router', app_id: 'app-router', install_id: 'install-router' }] },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    const item = plan.items.find((i) => i.kind === 'router_app');
+    expect(item?.verb).toBe('noop');
+    const agentAppCreateCount = plan.items.filter((i) => i.kind === 'app' && i.verb === 'create').length;
+    expect(countAppsToCreate(plan.items)).toBe(agentAppCreateCount);
+  });
+
+  it('lock wins over a vault-confirmed-ABSENT — a lock entry is the STRONGER fact (this run\'s own prior apply already confirmed it live)', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      lock: { schema_version: 1, fleet: 'icsoc-2026', agents: [{ role: 'router', app_id: 'app-router', install_id: 'install-router' }] },
+      vaultRouterApp: { status: 'confirmed', present: false },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.items.find((i) => i.kind === 'router_app')?.verb).toBe('noop');
+  });
+
+  it('a vault CONFIRMED-decrypted-but-absent (no MACF_ROUTING_APP_ID) is a genuine, FULL-CONFIDENCE create — never the LOW-CONFIDENCE wording (Amendment A4: a decrypted vault is definitive, unlike an unconfirmable App JWT)', () => {
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultRouterApp: { status: 'confirmed', present: false } };
+    const plan = computePlan(baseManifest(), observed);
+    const item = plan.items.find((i) => i.kind === 'router_app');
+    expect(item?.verb).toBe('create');
+    expect(item?.reason).toContain('missing');
+    expect(item?.reason).not.toMatch(/LOW CONFIDENCE/);
+  });
+
+  it('a vault status of "unknown" (vault unreadable this run) degrades to the SAME LOW-CONFIDENCE create-candidate every other identity item uses — never a false "absent"', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      vaultRouterApp: { status: 'unknown', reason: 'vault file not found' },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    const item = plan.items.find((i) => i.kind === 'router_app');
+    expect(item?.verb).toBe('create');
+    expect(item?.reason).toMatch(/LOW CONFIDENCE/);
+    expect(item?.reason).not.toMatch(/\bmissing\b/);
+  });
+
+  it('router_app_scope: per-fleet still models its OWN item — fleet-name-keyed handle, distinct wording, never the owner-keyed shared one', () => {
+    const manifest = baseManifest({ transport: { age_recipients: [], router_app_scope: 'per-fleet' } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const item = plan.items.find((i) => i.kind === 'router_app');
+    expect(item?.target).toBe('router_app:app:icsoc-2026-router');
+    expect(item?.reason).toContain('per-fleet');
+    expect(item?.reason).not.toContain('SHARED App reused');
+  });
+
+  it('router_app_scope: shared (the default, undeclared) keys the handle on OWNER account, never the fleet name — groundnuty/macf#1088', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const item = plan.items.find((i) => i.kind === 'router_app');
+    // Fleet is "icsoc-2026", owner is "groundnuty" — the handle must be
+    // owner-keyed ("groundnuty-router"), NEVER fleet-keyed
+    // ("icsoc-2026-router", which is what per-fleet scope derives).
+    expect(item?.target).toBe('router_app:app:groundnuty-router');
+    expect(item?.reason).toContain('SHARED App reused across every fleet owned by "groundnuty"');
+  });
+
+  it('is UNCONDITIONAL — present regardless of routing:/versions: declarations, unlike the CONDITIONAL runner_ops (the contrast the issue itself draws)', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED); // no routing: declared at all
+    expect(plan.items.some((i) => i.kind === 'router_app')).toBe(true);
+    expect(plan.items.some((i) => i.kind === 'runner_ops')).toBe(false);
+  });
+
+  it('planItemApplyCoverage reports IMPLEMENTED — this is a DISCLOSURE fix only; apply already creates this identity through the ordinary gates, unchanged', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const item = plan.items.find((i) => i.kind === 'router_app');
+    expect(item).toBeDefined();
+    if (item) expect(planItemApplyCoverage(item)).toBe('implemented');
+    expect(plan.unimplementedByApply.some((i) => i.kind === 'router_app')).toBe(false);
+  });
+
+  it('confirm_required is always false — a pure presence check, never the confirm-then-update path', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.items.find((i) => i.kind === 'router_app')?.confirm_required).toBe(false);
+  });
+
+  it('the existing agent-App and runner_ops items are UNCHANGED by the router-App addition (regression guard)', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const appTargets = plan.items.filter((i) => i.kind === 'app').map((i) => i.target);
+    expect(appTargets).toEqual([
+      'agent:science-agent:app:icsoc-2026-science-agent',
+      'agent:code-agent:app:icsoc-2026-code-agent',
+    ]);
+    const runnerOpsItem = plan.items.find((i) => i.kind === 'runner_ops');
+    expect(runnerOpsItem?.target).toBe('runner_ops:app:icsoc-2026-runner-ops');
+    expect(runnerOpsItem?.verb).toBe('create');
+  });
+
+  it('does NOT leak into the report-extra "agent" items — the router role is never mistaken for an observed-but-undeclared coordination agent', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      lock: { schema_version: 1, fleet: 'icsoc-2026', agents: [{ role: 'router', app_id: 'app-router', install_id: 'install-router' }] },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    const extraAgentItems = plan.items.filter((i) => i.kind === 'agent' && i.verb === 'report-extra');
+    expect(extraAgentItems.map((i) => i.target)).not.toContain('agent:router');
   });
 });
 
@@ -1515,30 +1670,30 @@ describe('computePlan — registryScopeIssues (macf#999 requirement 3: "plan sta
 // `routing`/`runner_warm` items, NOT app/runner_ops items) doesn't move the
 // count, guarding against counting the wrong kinds.
 describe('countAppsToCreate / operatorInteractionBudget (groundnuty/macf#880)', () => {
-  it('DECISIVE — a fresh 2-agent HOSTED-runner fleet (baseManifest declares no routing:, EMPTY_OBSERVED): just the 2 agent Apps, NO runner-ops (groundnuty/macf#1083) = 2 to create (→ 4 total consent-gate interactions: 2 gate-1 + 2 gate-2)', () => {
+  it('DECISIVE — a fresh 2-agent HOSTED-runner fleet (baseManifest declares no routing:, EMPTY_OBSERVED): the 2 agent Apps + the UNCONDITIONAL router_app (groundnuty/macf#1105), NO runner-ops (groundnuty/macf#1083) = 3 to create', () => {
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
     // Set-membership, not merely a count — proves it's specifically
     // runner-ops that's absent, not some other create-candidate that
     // happened to make the arithmetic work (see the dedicated #1083
     // describe block below for the full set-membership assertion).
     expect(plan.items.some((i) => i.kind === 'runner_ops')).toBe(false);
-    expect(countAppsToCreate(plan.items)).toBe(2);
-    const budget = operatorInteractionBudget(countAppsToCreate(plan.items));
-    expect(budget).toEqual({ gate1Clicks: 2, gate2Flows: 2, bound: 'maximum' });
-    expect(operatorInteractionToJson(budget)).toEqual({ gate1_clicks: 2, gate2_flows: 2, bound: 'maximum' });
-  });
-
-  it('DECISIVE non-regression — the SAME fresh 2-agent fleet, but SELF-HOSTED declared: 2 agent Apps + runner-ops = 3 to create (groundnuty/macf#1083 must not weaken the self-hosted path)', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
-    const plan = computePlan(manifest, EMPTY_OBSERVED);
-    expect(plan.items.some((i) => i.kind === 'runner_ops' && i.verb === 'create')).toBe(true);
     expect(countAppsToCreate(plan.items)).toBe(3);
     const budget = operatorInteractionBudget(countAppsToCreate(plan.items));
     expect(budget).toEqual({ gate1Clicks: 3, gate2Flows: 3, bound: 'maximum' });
     expect(operatorInteractionToJson(budget)).toEqual({ gate1_clicks: 3, gate2_flows: 3, bound: 'maximum' });
   });
 
-  it('DECISIVE — adding one agent to an already-provisioned fleet (2 existing agents + runner-ops confirmed present, 1 new agent): exactly 1 to create (→ 2 clicks)', () => {
+  it('DECISIVE non-regression — the SAME fresh 2-agent fleet, but SELF-HOSTED declared: 2 agent Apps + router_app + runner-ops = 4 to create (groundnuty/macf#1083 must not weaken the self-hosted path)', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(plan.items.some((i) => i.kind === 'runner_ops' && i.verb === 'create')).toBe(true);
+    expect(countAppsToCreate(plan.items)).toBe(4);
+    const budget = operatorInteractionBudget(countAppsToCreate(plan.items));
+    expect(budget).toEqual({ gate1Clicks: 4, gate2Flows: 4, bound: 'maximum' });
+    expect(operatorInteractionToJson(budget)).toEqual({ gate1_clicks: 4, gate2_flows: 4, bound: 'maximum' });
+  });
+
+  it('DECISIVE — adding one agent to an already-provisioned fleet (2 existing agents + runner-ops confirmed present, 1 new agent, no router-App lock entry): the new agent + the UNCONDITIONAL router_app (groundnuty/macf#1105) = 2 to create', () => {
     const manifest = baseManifest({
       agents: [
         // science-agent + code-agent mirror baseManifest()'s own two, kept
@@ -1584,8 +1739,8 @@ describe('countAppsToCreate / operatorInteractionBudget (groundnuty/macf#880)', 
       controlRepoPresence: 'present',
     };
     const plan = computePlan(manifest, observed);
-    expect(countAppsToCreate(plan.items)).toBe(1);
-    expect(operatorInteractionBudget(countAppsToCreate(plan.items))).toEqual({ gate1Clicks: 1, gate2Flows: 1, bound: 'maximum' });
+    expect(countAppsToCreate(plan.items)).toBe(2);
+    expect(operatorInteractionBudget(countAppsToCreate(plan.items))).toEqual({ gate1Clicks: 2, gate2Flows: 2, bound: 'maximum' });
   });
 
   it('a declared routing.runner adds exactly ONE countable create (the now-needed runner-ops, groundnuty/macf#1083) — the routing/runner_warm item KINDS themselves are never counted', () => {
