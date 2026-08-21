@@ -32,7 +32,7 @@ import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-ro
 import type { RoutingSecretsPublishDeps } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import { toBase64ForSecret } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RouterAppVaultRestoreDeps } from '../../../src/cli/bootstrap/apply-router-app.js';
-import { SHARED_ROUTER_APP_HANDLE } from '../../../src/cli/bootstrap/apply-router-app.js';
+import { deriveRouterAppHandle } from '../../../src/cli/bootstrap/apply-router-app.js';
 import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
 import { operatorRecoveryArtifactPath, writeAgentRecoveryArtifact, writeVault } from '../../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext } from '../../../src/cli/bootstrap/vault-read.js';
@@ -4837,8 +4837,9 @@ trust:
       expect(routerGate1Called).toBe(true);
       expect(result.routerApp.status).toBe('created');
       if (result.routerApp.status === 'created') {
-        // The manifest actually submitted to GitHub carries the FIXED
-        // shared handle, never a fleet-prefixed one.
+        // The manifest actually submitted to GitHub carries this manifest
+        // owner's shared (owner-keyed, groundnuty/macf#1088) handle, never
+        // a fleet-prefixed one.
         expect(result.routerApp.appId).toBeDefined();
       }
     });
@@ -4891,15 +4892,16 @@ trust:
           },
           exchangeManifestCode: async () => creds('router'),
           waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: 'install-router', appSlug: opts.expected.appSlug ?? '', accountLogin: 'groundnuty', repositorySelection: 'selected' }),
-          // The SHARED name reads "present" (taken); the PER-FLEET handle
-          // reads "absent" (free) — discriminated by the slug actually
-          // queried, not the role, because `applyIdentity`'s OWN generic
-          // collision pre-flight (apply-agent.ts) uses this SAME hook for
-          // EVERY role including per-fleet-scope's router App. If per-fleet
-          // scope silently queried the shared name instead of its own
+          // The SHARED (owner-keyed, groundnuty/macf#1088) name reads
+          // "present" (taken); the PER-FLEET handle reads "absent" (free) —
+          // discriminated by the slug actually queried, not the role,
+          // because `applyIdentity`'s OWN generic collision pre-flight
+          // (apply-agent.ts) uses this SAME hook for EVERY role including
+          // per-fleet-scope's router App. If per-fleet scope silently
+          // queried this manifest owner's shared name instead of its own
           // fleet-derived one, this fake would refuse it — proving the
           // isolation, not just asserting it.
-          checkAppNameCollision: async (_owner, appSlug) => (appSlug === SHARED_ROUTER_APP_HANDLE ? 'present' : 'absent'),
+          checkAppNameCollision: async (_owner, appSlug) => (appSlug === deriveRouterAppHandle('demo-fleet', 'groundnuty', 'shared') ? 'present' : 'absent'),
         }),
         // A vault carrying SHARED credentials must NOT be consulted either —
         // per-fleet scope has its own identity, never the shared one.

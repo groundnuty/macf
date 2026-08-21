@@ -221,10 +221,13 @@ export type AppNameLengthCheck = { readonly ok: true } | { readonly ok: false; r
  *
  * groundnuty/macf#1082 — the router handle now depends on
  * `manifest.transport.router_app_scope`: `'shared'` (default, including a
- * hand-built manifest that predates this field) resolves to the fixed
- * `SHARED_ROUTER_APP_HANDLE`, always well under the 34-char cap;
- * `'per-fleet'` keeps the pre-#1082 fleet-derived handle this check was
- * originally built for.
+ * hand-built manifest that predates this field) resolves to the OWNER-KEYED
+ * handle (`manifest.owner.account`, groundnuty/macf#1088 — this is what
+ * makes the budget check below meaningful: a long owner account name is
+ * exactly the case this pre-flight exists to catch, per #1090's carried-over
+ * criterion, rather than a hazard this check is blind to); `'per-fleet'`
+ * keeps the pre-#1082 fleet-derived handle this check was originally built
+ * for.
  */
 export function plannedAppNames(manifest: FleetManifest): readonly string[] {
   const fleetName = manifest.metadata.name;
@@ -232,7 +235,7 @@ export function plannedAppNames(manifest: FleetManifest): readonly string[] {
   return [
     ...manifest.agents.map((a: FleetAgent) => deriveAppHandle(fleetName, a.role)),
     deriveRunnerOpsHandle(fleetName),
-    deriveRouterAppHandle(fleetName, routerScope),
+    deriveRouterAppHandle(fleetName, manifest.owner.account, routerScope),
   ];
 }
 

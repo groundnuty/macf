@@ -1491,7 +1491,10 @@ export async function applyFleet(
   // new default, matching `tailscale_oauth_required`'s own
   // treat-falsy-as-undeclared precedent immediately below.
   const routerAppScope = manifest.transport.router_app_scope === 'per-fleet' ? 'per-fleet' : 'shared';
-  const routerAppHandle = deriveRouterAppHandle(manifest.metadata.name, routerAppScope);
+  // groundnuty/macf#1088 — `manifest.owner.account` (this FLEET's owner —
+  // an org or user account), never the operator's own account, is what the
+  // 'shared' branch keys on. See `deriveRouterAppHandle`'s doc for why.
+  const routerAppHandle = deriveRouterAppHandle(manifest.metadata.name, manifest.owner.account, routerAppScope);
   const routerAppPrior = currentLock?.agents.find((a) => a.role === ROUTER_APP_ROLE);
   const routerAppDeps: AgentApplyDeps = {
     ...buildAgentDepsWithRecovery(recoveryRootDir, manifest.metadata.name, recipients, {
