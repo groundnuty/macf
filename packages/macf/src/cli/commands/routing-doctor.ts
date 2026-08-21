@@ -25,7 +25,13 @@
  *         bot-LOGIN, not the bare routing label (the #566 root cause:
  *         `repo-init.ts` wrote the agent-name). Independent of (a): a wrong
  *         `app_name` still ROUTES (resolution never touches it) — it breaks the
- *         actor-skip instead.
+ *         actor-skip instead. Tri-state (macf#874, the #872 completeness audit):
+ *         an authoritative bot-login (known for THIS agent's own label; a peer's
+ *         is rarely known) verifies exactly (`ok`/`not_ok`); without one, the
+ *         #566 heuristic can only rule out the ONE known-bad shape, so clearing
+ *         it reports `unresolvable`, never `ok` — a check that only ruled out
+ *         one bad value was previously reporting a positive verification it
+ *         never performed.
  *  3. REGISTRATION freshness — `registry.instance_id == /health.instance_id`
  *     (precise current-vs-stale; disambiguates the #553 dying-server race). A
  *     reassigned port surfaces as unreachability; an aged `last_heartbeat` is a
@@ -49,7 +55,10 @@
  *     this command CANNOT read) vs the project's CURRENT CA fingerprint (local
  *     disk). Mismatch = the cert was signed by a CA that has since been rotated
  *     out — the #799 outage class. Absent (never minted) is informational, not
- *     a failure.
+ *     a failure. The matching state is named `presumed-ok`, not `ok` (macf#874,
+ *     the #872 completeness audit): the deployed secret itself is unreadable, so
+ *     a match is a comparison of the one proxy value available, never a
+ *     verification of the cert.
  *
  * Every GitHub read (install-set, caller-pins, agent-config), the registry list,
  * the mTLS `/health` probe, and the CA-var read are INJECTABLE (`RoutingDoctorDeps`)
@@ -169,33 +178,70 @@ export function isFleetMember(marker: FleetMarker | null | undefined): boolean {
 }
 
 /**
- * Self-skip correctness (#538 check b / #566). `app_name` must be the bot-LOGIN.
- * When an authoritative `expectedBotLogin` is known (the running agent's own
- * `github_app.bot_login`, macf#535), compare exactly (normalized). Otherwise fall
- * back to the structural heuristic: the #566 bug is literally `app_name === <bare
- * routing label>`, so flag that — anything else passes (we can't prove the exact
- * bot-login without an authoritative actor source; stated in the legend).
+ * Tri-state self-skip verdict (macf#874). `ok` — an authoritative bot-login was
+ * available and matched. `not_ok` — a definite fault: `app_name` is missing, is
+ * the bare routing label (the #566 shape), or mismatches a known authoritative
+ * login. `unresolvable` — the #566 heuristic cleared (`app_name` is not the bare
+ * label) but there was no authoritative login to confirm it against, so the
+ * property was never actually established.
+ */
+export type SelfSkipStatus = 'ok' | 'not_ok' | 'unresolvable';
+
+/**
+ * Self-skip correctness (#538 check b / #566 / macf#874). `app_name` must be the
+ * bot-LOGIN. When an authoritative `expectedBotLogin` is known (the running
+ * agent's own `github_app.bot_login`, macf#535), compare exactly (normalized):
+ * `ok` on match, `not_ok` on mismatch — this is a genuine positive verification.
+ *
+ * Without an authoritative login (the common case for a PEER — this command
+ * only ever knows its OWN agent's bot-login), fall back to the structural #566
+ * heuristic: `app_name === <bare routing label>` is the one shape #566 proved
+ * broken, so that shape is `not_ok`. But clearing that one known-bad shape does
+ * NOT prove `app_name` is a real, correct bot-login — a typo'd, renamed, or
+ * stale peer `app_name` clears the heuristic too. An earlier version of this
+ * function returned `ok: true` for every non-bare-label value, which reported a
+ * positive verification for a check that had only ruled out one specific known-
+ * bad value (macf#874's audit finding). `unresolvable` names that gap honestly:
+ * the heuristic stays a POSITIVE detector for the #566 shape, but it can no
+ * longer produce a green.
  */
 export function evaluateSelfSkip(
   label: string,
   appName: string | undefined,
   expectedBotLogin?: string,
-): { readonly ok: boolean; readonly reason?: string } {
+): { readonly status: SelfSkipStatus; readonly reason?: string } {
   if (!appName || appName.trim() === '') {
-    return { ok: false, reason: 'app_name missing' };
+    return { status: 'not_ok', reason: 'app_name missing' };
   }
   if (expectedBotLogin) {
     return normalizeLogin(appName) === normalizeLogin(expectedBotLogin)
-      ? { ok: true }
-      : { ok: false, reason: `app_name "${appName}" != bot-login "${expectedBotLogin}"` };
+      ? { status: 'ok' }
+      : { status: 'not_ok', reason: `app_name "${appName}" != bot-login "${expectedBotLogin}"` };
   }
   if (normalizeLogin(appName) === normalizeLogin(label)) {
     return {
-      ok: false,
+      status: 'not_ok',
       reason: `app_name "${appName}" is the bare routing label, not a bot-login`,
     };
   }
-  return { ok: true };
+  return {
+    status: 'unresolvable',
+    reason:
+      `app_name "${appName}" is not the bare routing label, but no authoritative bot-login ` +
+      'is known for this peer to confirm it against — not asserted',
+  };
+}
+
+/**
+ * The `selfSkipOk` back-compat boolean (macf#874): `true` ONLY for a verified
+ * `ok`, `false` for a definite `not_ok`, `null` for `unresolvable` — the
+ * honest-not-asserted state collapses to the SAME `null` a registry-only
+ * agent's absent local config already renders as, never to `true`.
+ */
+function selfSkipStatusToBackCompatBool(status: SelfSkipStatus): boolean | null {
+  if (status === 'ok') return true;
+  if (status === 'not_ok') return false;
+  return null;
 }
 
 /** Session-name check tri-state (DR-032 #610): present+match / present+stale / absent. */
@@ -322,10 +368,18 @@ export function evaluateCaCert(
 /**
  * Routing-client cert issuer staleness (#800, DR-010 amendment / silent-
  * fallback-hazards.md Instance 16):
- *  - `ok`       — the recorded issuer fingerprint matches the CURRENT project
- *                 CA. The routing-client cert (a GitHub Actions secret this
- *                 command CANNOT read — secrets are write-only) is presumed
- *                 signed by the live CA.
+ *  - `presumed-ok` — the recorded issuer fingerprint matches the CURRENT
+ *                 project CA. The routing-client cert itself is a GitHub
+ *                 Actions secret this command CANNOT read — secrets are
+ *                 write-only — so this is NOT a verification that the
+ *                 deployed cert is good; it is a comparison of the one
+ *                 proxy value this command CAN read (the recorded issuer
+ *                 fingerprint) against the current CA. An earlier version
+ *                 named this state `ok`, which rendered indistinguishably
+ *                 from a verified pass elsewhere in this table (macf#874's
+ *                 audit finding) — `presumed-ok` names the forced proxy
+ *                 honestly, in the state literal itself, not just in a
+ *                 doc comment nobody sees at the CLI.
  *  - `orphaned` — the recorded issuer fingerprint does NOT match the current
  *                 CA. A CA (re-)issue happened since this cert was minted;
  *                 the deployed routing-client cert is presumed signed by the
@@ -336,7 +390,7 @@ export function evaluateCaCert(
  *                 IF-PRESENT: this is informational, NOT a failure — there
  *                 is nothing (yet) to compare against.
  */
-export type RoutingClientCertIssuerState = 'ok' | 'orphaned' | 'absent';
+export type RoutingClientCertIssuerState = 'presumed-ok' | 'orphaned' | 'absent';
 
 export interface RoutingClientCertCheckResult {
   readonly state: RoutingClientCertIssuerState;
@@ -411,10 +465,13 @@ export function evaluateRoutingClientCertIssuer(
   }
   if (recorded.fingerprint === currentCaFingerprint) {
     return {
-      state: 'ok',
+      state: 'presumed-ok',
       recordedFingerprint: recorded.fingerprint,
       currentFingerprint: currentCaFingerprint,
       mintedAt: recorded.mintedAt,
+      reason:
+        'issuer fingerprint matches the current CA — the deployed routing-client cert ' +
+        '(a write-only Actions secret this command cannot read) is PRESUMED signed by it, not independently verified',
     };
   }
   return {
@@ -491,11 +548,21 @@ export interface AgentRow {
    */
   readonly inLocalConfig: boolean;
   /**
-   * REPO-scoped self-skip (#538b / #566). `null` for a registry-only agent — no local
-   * `agent-config.json` entry, so there is no `app_name` to assert (honest-not-asserted,
-   * NOT a fault). A boolean only when `inLocalConfig` is true.
+   * Back-compat boolean (schema_version:2, macf#874): `true` ONLY for a
+   * genuinely-VERIFIED `ok` — never for `unresolvable` (see `selfSkipStatus`).
+   * `null` covers BOTH a registry-only agent (no local config to check, #621)
+   * AND an `unresolvable` local-config agent (heuristic cleared but not
+   * authoritatively confirmed) — disambiguate via `inLocalConfig` +
+   * `selfSkipStatus`, the same way `sessionOk`/`sessionStatus` disambiguate.
    */
   readonly selfSkipOk: boolean | null;
+  /**
+   * Tri-state self-skip check (macf#874): `ok` (authoritative match) / `not_ok`
+   * (definite #538b/#566 fault) / `unresolvable` (heuristic cleared, no
+   * authoritative login to confirm — honest-not-asserted, NEVER a pass). `null`
+   * for a registry-only agent (REPO-scoped; no local config to check, #621).
+   */
+  readonly selfSkipStatus: SelfSkipStatus | null;
   readonly selfSkipReason?: string;
   /**
    * Back-compat boolean (schema_version:1): `true` for `ok` + `absent`, `false` for
@@ -661,7 +728,8 @@ async function evaluateAgentRow(
     tmuxSession: entry?.tmux_session ?? null,
     routable: info !== null,
     inLocalConfig,
-    selfSkipOk: selfSkip ? selfSkip.ok : null,
+    selfSkipOk: selfSkip ? selfSkipStatusToBackCompatBool(selfSkip.status) : null,
+    selfSkipStatus: selfSkip ? selfSkip.status : null,
     selfSkipReason: selfSkip?.reason,
     // `session` is tri-state (DR-032 #610). `sessionOk` stays for back-compat (true for
     // `ok` + `absent`, false for the stale `warn`); null for a registry-only agent (#621).
@@ -757,9 +825,13 @@ function freshnessFails(s: FreshnessState): boolean {
  * invariants (routability + freshness) so it covers REGISTRY-ONLY agents too (#621): a
  * registered fleet agent that has gone definitively `stale` still DEGRADES the plane from
  * ANY repo's run, even with no local config. The SELF-SKIP clause is REPO-scoped — it
- * constrains a locally-configured agent (`selfSkipOk === false` is the #566 fault) but a
- * registry-only agent's `null` self-skip is honest-not-asserted, NOT a failure
- * (`!== false`). The SESSION-name drift is deliberately EXCLUDED (DR-032 §6th-surface
+ * constrains a locally-configured agent (`selfSkipOk === false` is the #566 fault) but
+ * `null` self-skip does NOT fail — that covers BOTH a registry-only agent (honest-not-
+ * asserted, no local config) AND an `unresolvable` local-config agent (macf#874: the
+ * #566 heuristic cleared but no authoritative login confirmed it — a genuine unknown,
+ * not a proven fault; `unresolvable` must not fail the verdict any more than the
+ * pre-existing "no local config" `null` does, or a peer this check can never fully
+ * verify would DEGRADE the plane on every run). The SESSION-name drift is deliberately EXCLUDED (DR-032 §6th-surface
  * amendment, #610): a stale `agent-config.json:tmux_session` is the known-pending
  * session-rename migration — WARN-not-FAIL, surfaced via `sessionStatus` + `warnings[]`.
  */
@@ -931,11 +1003,15 @@ export function freshnessGlyph(s: FreshnessState): string {
   }
 }
 
-/** Routing-client cert issuer state → glyph: ok ✓, orphaned ✗ (macf#800), absent — (informational). */
+/**
+ * Routing-client cert issuer state → glyph: presumed-ok ✓ presumed (macf#874 —
+ * the deployed secret can't be read, so this can never render as a plain
+ * unqualified ✓ pass), orphaned ✗ (macf#800), absent — (informational).
+ */
 export function routingClientCertGlyph(s: RoutingClientCertIssuerState): string {
   switch (s) {
-    case 'ok':
-      return '✓';
+    case 'presumed-ok':
+      return '✓ presumed';
     case 'orphaned':
       return '✗ orphaned';
     case 'absent':
@@ -968,6 +1044,23 @@ export function caCertLine(ca: CaCheckResult): string {
   return `MACF_CA_CERT: ✓ present + parses + matches current CA (${shortFingerprint(ca.currentCaFingerprint)})`;
 }
 
+/**
+ * Self-skip status → glyph: ok ✓, not_ok ✗, unresolvable `? unresolved` (macf#874 —
+ * distinct from BOTH a pass and the registry-only `— n/a`; a reader must not be able
+ * to mistake "heuristic cleared, unconfirmed" for either "verified good" or "not
+ * applicable here").
+ */
+export function selfSkipGlyph(s: SelfSkipStatus): string {
+  switch (s) {
+    case 'ok':
+      return '✓';
+    case 'not_ok':
+      return '✗';
+    case 'unresolvable':
+      return '? unresolved';
+  }
+}
+
 const REPO_HEADERS = ['REPO', 'CALLER-PIN', 'CONSISTENT'] as const;
 const AGENT_HEADERS = ['AGENT', 'ROUTABLE', 'SELF-SKIP', 'SESSION', 'FRESH'] as const;
 
@@ -980,8 +1073,9 @@ export function buildAgentRows(rows: readonly AgentRow[]): readonly (readonly st
     a.label,
     boolGlyph(a.routable),
     // REPO-scoped self-skip + session render `— n/a` for a registry-only agent (#621):
-    // null = no local config to assert, distinct from a ✗ failure.
-    a.selfSkipOk === null ? '— n/a' : boolGlyph(a.selfSkipOk),
+    // null status = no local config to assert, distinct from both a pass AND the
+    // `unresolvable` "checked but couldn't confirm" state (macf#874).
+    a.selfSkipStatus === null ? '— n/a' : selfSkipGlyph(a.selfSkipStatus),
     a.sessionStatus === null ? '— n/a' : sessionGlyph(a.sessionStatus),
     freshnessGlyph(a.freshness),
   ]);
@@ -1005,7 +1099,10 @@ export const HONESTY_LEGEND = [
   '        A repo opts OUT of the pin check via .github/macf-fleet.json {"routing_fleet":false}',
   '        (e.g. an intentional-Stage-2 test harness); absent marker = fleet member.',
   '        ROUTABLE = a MACF_AGENT_<LABEL> registry key exists (router resolves by LABEL).',
-  '        SELF-SKIP = agent-config.json app_name is the bot-LOGIN, not the bare label.',
+  '        SELF-SKIP = agent-config.json app_name is the bot-LOGIN, not the bare label. ✓ = an',
+  '        authoritative login confirmed it; ✗ = a definite fault (missing/bare-label/mismatch);',
+  '        "? unresolved" = the known-bad shape was ruled out but no authoritative login was',
+  '        available to confirm it — honestly unresolved, NOT a pass (does not fail the verdict).',
   '        SESSION = agent-config.json tmux_session follows <project>@<routing-label> (assert-IF-',
   '                  PRESENT: absent = PASS, vestigial + omitted on v3; ⚠ warn = stale drift,',
   '                  WARN-not-FAIL — visible but does NOT drive the verdict, pending a session-rename migration).',
@@ -1019,7 +1116,9 @@ export const HONESTY_LEGEND = [
   '        verdict and, when most/all agents read unreachable, is reported as the LIKELY CAUSE',
   '        rather than a separate line. — n/a = no local CA on this machine to compare (not a fail).',
   '        ROUTING-CLIENT CERT = the recorded issuer fingerprint (written by `macf certs',
-  '        issue-routing-client`) vs the CURRENT project CA (local disk). ✗ orphaned = signed by a',
+  '        issue-routing-client`) vs the CURRENT project CA (local disk); the deployed cert ITSELF',
+  '        is a write-only secret this command cannot read, so ✓ presumed = the recorded issuer',
+  '        matches, NOT an independent verification of the deployed cert. ✗ orphaned = signed by a',
   '        rotated-out CA (re-mint + re-set the secret); — n/a = never minted, informational only.',
   'NOTE: these are STATIC GitHub-plane checks — they prove the routing PLUMBING is wired right,',
   '      NOT that a message was delivered end-to-end (that is `macf routing doctor --e2e`, a',
@@ -1047,8 +1146,21 @@ const HONESTY_DISCLAIMER =
  * reflected present+valid), so a consumer trusting the OLD "ca_ok:true always
  * means present+valid" contract needs to know the meaning changed, not just
  * that new fields were added.
+ *
+ * Bumped 2→3 for macf#874, two SAME-NAME SEMANTIC shifts from the doctor-check
+ * completeness audit (#872):
+ *  - `agents[].self_skip_ok`: `true` previously meant "the #566 known-bad shape
+ *    was ruled out" (a heuristic could reach `true` without ever confirming the
+ *    correct value); it now means "an authoritative bot-login verified the
+ *    match" — the unresolved-heuristic case reports `null` (see the new
+ *    `self_skip_status` field for the full tri-state).
+ *  - `routing_client_cert.state`: the passing literal renamed `"ok"` →
+ *    `"presumed-ok"` — the deployed cert is a write-only secret this command
+ *    cannot read, so the old `"ok"` literal read as a verification it never
+ *    was. A consumer string-matching `state === "ok"` needs to know the
+ *    literal changed, not just that the underlying check got stricter.
  */
-export const ROUTING_DOCTOR_JSON_SCHEMA_VERSION = 2;
+export const ROUTING_DOCTOR_JSON_SCHEMA_VERSION = 3;
 
 export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
   const participating = report.repoPins.filter((r) => r.consistent !== null);
@@ -1093,7 +1205,15 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       // registry-only, NOT null-because-failed. FLEET-scoped fields (routable, freshness)
       // are still asserted for it.
       in_local_config: a.inLocalConfig,
+      // Semantic shift (schema_version:3, macf#874): `true` only for a
+      // VERIFIED match — see the schema_version doc comment.
       self_skip_ok: a.selfSkipOk,
+      // New (schema_version:3, macf#874): the full tri-state driving
+      // `self_skip_ok` — `"unresolvable"` is the honest-not-asserted case a
+      // consumer reading only the boolean can't distinguish from "no local
+      // config" (both render `self_skip_ok: null`); disambiguate via
+      // `in_local_config` + this field.
+      self_skip_status: a.selfSkipStatus,
       self_skip_reason: a.selfSkipReason ?? null,
       session_ok: a.sessionOk,
       session_status: a.sessionStatus,
