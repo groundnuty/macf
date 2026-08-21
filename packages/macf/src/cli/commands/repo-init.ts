@@ -297,7 +297,7 @@ export function generateWorkflow(
     '          # unchanged — see the job-level comment above.',
     '          if [ "$ACTION" != "opened" ] && [ "$ACTOR" = "dependabot[bot]" ]; then',
     '            echo "should-route=false" >> "$GITHUB_OUTPUT"',
-    '            echo "skip: dependabot[bot] actor on a non-opened pull_request action"',
+    '            echo "skip: dependabot[bot] actor on a non-opened pull_request action (#872)"',
     '            exit 0',
     '          fi',
     '',
