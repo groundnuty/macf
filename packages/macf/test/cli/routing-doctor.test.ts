@@ -37,6 +37,7 @@ import {
   parseRoutingClientCertIssuer,
   pinGlyph,
   routingClientCertGlyph,
+  selfSkipGlyph,
   sessionGlyph,
   ROUTING_DOCTOR_JSON_SCHEMA_VERSION,
   routingDoctorToJson,
@@ -117,25 +118,34 @@ describe('isFleetMember — opt-out semantics (#614)', () => {
   });
 });
 
-describe('evaluateSelfSkip — #538(b) / #566', () => {
-  it('exact bot-login match passes (normalized, [bot]-tolerant)', () => {
-    expect(evaluateSelfSkip('code-agent', 'macf-code-agent', 'macf-code-agent[bot]')).toEqual({ ok: true });
+describe('evaluateSelfSkip — #538(b) / #566, tri-state (macf#874)', () => {
+  it('exact bot-login match passes (normalized, [bot]-tolerant) — a VERIFIED ok', () => {
+    expect(evaluateSelfSkip('code-agent', 'macf-code-agent', 'macf-code-agent[bot]')).toEqual({ status: 'ok' });
   });
   it('app_name != bot-login fails when the authoritative login is known', () => {
     const r = evaluateSelfSkip('code-agent', 'something-wrong', 'macf-code-agent[bot]');
-    expect(r.ok).toBe(false);
+    expect(r.status).toBe('not_ok');
     expect(r.reason).toMatch(/!= bot-login/);
   });
   it('heuristic: bare routing label (the #566 bug) fails with no authoritative login', () => {
     const r = evaluateSelfSkip('code-agent', 'code-agent');
-    expect(r.ok).toBe(false);
+    expect(r.status).toBe('not_ok');
     expect(r.reason).toMatch(/bare routing label, not a bot-login/);
   });
-  it('heuristic: a bot-login-shaped app_name passes', () => {
-    expect(evaluateSelfSkip('code-agent', 'macf-code-agent')).toEqual({ ok: true });
+  // DECISIVE (macf#874 / assert-the-wrong-path.md): a broken implementation that
+  // reports `ok` for ANY non-bare-label value would ALSO pass a bare `status !==
+  // 'ok'`-is-false-only check — that's exactly the pre-#874 defect. The property
+  // this check can actually establish here is "not the one known-bad shape", NOT
+  // "is a correct bot-login" — so the outcome MUST be the specific literal
+  // `'unresolvable'`, not `'ok'` and not merely "not not_ok".
+  it('heuristic: a bot-login-shaped app_name with NO authoritative login → unresolvable, NOT ok', () => {
+    const r = evaluateSelfSkip('code-agent', 'macf-code-agent');
+    expect(r.status).toBe('unresolvable');
+    expect(r.status).not.toBe('ok');
+    expect(r.reason).toMatch(/no authoritative bot-login/);
   });
   it('missing app_name fails', () => {
-    expect(evaluateSelfSkip('code-agent', undefined).ok).toBe(false);
+    expect(evaluateSelfSkip('code-agent', undefined).status).toBe('not_ok');
   });
 });
 
@@ -332,6 +342,12 @@ function deps(over: Partial<RoutingDoctorDeps> = {}): RoutingDoctorDeps {
     readRoutingClientCertIssuer: async () =>
       JSON.stringify({ issuer_fingerprint: CURRENT_CA_FINGERPRINT, minted_at: '2026-06-01T00:00:00Z' }),
     currentCaFingerprint: () => CURRENT_CA_FINGERPRINT,
+    // macf#874: an authoritative login for BOTH fixture agents, so the "all-green
+    // baseline" genuinely VERIFIES self-skip (`ok`) rather than resting on the
+    // pre-#874 heuristic-passes-without-confirmation shape. Real production deps
+    // only ever populate the RUNNING agent's own label (`resolveDepsFromRegistry`)
+    // — a peer is the `unresolvable` case exercised explicitly below.
+    botLogins: { 'code-agent': 'macf-code-agent[bot]', 'science-agent': 'macf-science-agent[bot]' },
     ...over,
   };
 }
@@ -346,6 +362,9 @@ describe('gatherRoutingDoctor — the all-green baseline', () => {
     expect(report.agents.every((a) => a.routable && a.selfSkipOk && a.sessionOk && a.freshness === 'fresh')).toBe(
       true,
     );
+    // macf#874: the baseline's self-skip is a genuine VERIFIED ok (both fixture
+    // agents have an authoritative botLogins entry), not the pre-#874 heuristic pass.
+    expect(report.agents.every((a) => a.selfSkipStatus === 'ok')).toBe(true);
     expect(report.ca).toMatchObject({ present: true, valid: true });
   });
 });
@@ -489,8 +508,35 @@ describe('check 2b — self-skip independent of routability', () => {
     const code = report.agents.find((a) => a.label === 'code-agent')!;
     expect(code.routable).toBe(true); // STILL routes — resolution never touches app_name
     expect(code.selfSkipOk).toBe(false);
+    expect(code.selfSkipStatus).toBe('not_ok');
     expect(code.selfSkipReason).toMatch(/!= bot-login/);
     expect(routingVerdict(report)).toBe('DEGRADED');
+  });
+
+  // DECISIVE (macf#874): a PEER agent — the common real-world case, since
+  // `resolveDepsFromRegistry` only ever populates the RUNNING agent's own
+  // label in `botLogins`. Before #874 this reported `selfSkipOk: true` (a
+  // silent pass on a presumption); it must now report `null` / `unresolvable`
+  // and must NOT drive the verdict to DEGRADED on its own.
+  it('a peer with no authoritative bot-login known reports unresolvable, NOT a pass, and does NOT degrade the verdict', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        // Only THIS agent's own label is authoritative — science-agent is a peer.
+        botLogins: { 'code-agent': 'macf-code-agent[bot]' },
+      }),
+    );
+    const science = report.agents.find((a) => a.label === 'science-agent')!;
+    expect(science.selfSkipStatus).toBe('unresolvable');
+    expect(science.selfSkipOk).toBeNull(); // never true on an unconfirmed heuristic pass
+    expect(science.selfSkipReason).toMatch(/no authoritative bot-login/);
+    // Regression guard (real detection unchanged): the OWN-label agent still
+    // gets a genuine verified `ok` from the authoritative comparison.
+    const code = report.agents.find((a) => a.label === 'code-agent')!;
+    expect(code.selfSkipStatus).toBe('ok');
+    expect(code.selfSkipOk).toBe(true);
+    // `unresolvable` is an honest unknown, not a proven fault — same posture
+    // as "no local config" — so it must not degrade the plane on its own.
+    expect(routingVerdict(report)).toBe('HEALTHY');
   });
 });
 
@@ -677,6 +723,9 @@ describe('check 5 — session-name drift is WARN-not-FAIL (DR-032 #610)', () => 
     expect(report.agents.every((a) => a.inLocalConfig === false)).toBe(true);
     expect(report.agents.every((a) => a.routable && a.freshness === 'fresh')).toBe(true);
     expect(report.agents.every((a) => a.selfSkipOk === null && a.sessionStatus === null)).toBe(true);
+    // No local config at all → `selfSkipStatus` is null too (distinct from `unresolvable`,
+    // which requires a local config entry to have been evaluated in the first place).
+    expect(report.agents.every((a) => a.selfSkipStatus === null)).toBe(true);
     expect(routingVerdict(report)).toBe('HEALTHY'); // all fresh → no fleet-scoped fault
     expect(collectWarnings(report)).toEqual([]); // null session → no warn
   });
@@ -750,14 +799,19 @@ describe('parseRoutingClientCertIssuer (#800)', () => {
 });
 
 describe('evaluateRoutingClientCertIssuer — orphan detection (#800)', () => {
-  it('matching fingerprints → ok', () => {
+  // macf#874: the matching state is `presumed-ok`, not `ok` — the deployed cert
+  // is a write-only secret this command cannot read, so a match is a comparison
+  // of the one readable proxy, never a verification of the cert itself. Assert
+  // the exact literal (not just "not orphaned") and that the reason SAYS so.
+  it('matching fingerprints → presumed-ok, with a reason naming the presumption', () => {
     const raw = JSON.stringify({ issuer_fingerprint: 'FP1', minted_at: '2026-07-01T00:00:00Z' });
-    expect(evaluateRoutingClientCertIssuer(raw, 'FP1')).toEqual({
-      state: 'ok',
-      recordedFingerprint: 'FP1',
-      currentFingerprint: 'FP1',
-      mintedAt: '2026-07-01T00:00:00Z',
-    });
+    const r = evaluateRoutingClientCertIssuer(raw, 'FP1');
+    expect(r.state).toBe('presumed-ok');
+    expect((r.state as string)).not.toBe('ok');
+    expect(r.recordedFingerprint).toBe('FP1');
+    expect(r.currentFingerprint).toBe('FP1');
+    expect(r.mintedAt).toBe('2026-07-01T00:00:00Z');
+    expect(r.reason).toMatch(/PRESUMED/);
   });
 
   it('mismatched fingerprints → orphaned, with a #800 remediation reason', () => {
@@ -792,9 +846,11 @@ describe('evaluateRoutingClientCertIssuer — orphan detection (#800)', () => {
   });
 });
 
-describe('routingClientCertGlyph (#800)', () => {
-  it('renders the three states', () => {
-    expect(routingClientCertGlyph('ok')).toBe('✓');
+describe('routingClientCertGlyph (#800, macf#874)', () => {
+  it('renders the three states — presumed-ok is visually distinct from a plain pass', () => {
+    const g = routingClientCertGlyph('presumed-ok');
+    expect(g).toContain('✓');
+    expect(g).toMatch(/presum/i); // never an unqualified ✓ — the deployed secret was never read
     expect(routingClientCertGlyph('orphaned')).toMatch(/orphaned/);
     expect(routingClientCertGlyph('absent')).toMatch(/n\/a/);
   });
@@ -834,7 +890,7 @@ describe('check 6 — routing-client cert orphaned after a CA rotation (#800)', 
         readCaCert: async () => 'not-a-cert!!!',
       }),
     );
-    expect(report.routingClientCert.state).toBe('ok');
+    expect(report.routingClientCert.state).toBe('presumed-ok');
     expect(routingVerdict(report)).toBe('DEGRADED'); // caFail still bites
   });
 });
@@ -867,6 +923,7 @@ describe('#621 — per-agent set is registry ∪ config (registry-only agents fl
     expect(auditor.healthInstanceId).toBe('inst-aud');
     // REPO-scoped checks are NULL (no local config to assert — honest-not-asserted):
     expect(auditor.selfSkipOk).toBeNull();
+    expect(auditor.selfSkipStatus).toBeNull();
     expect(auditor.sessionOk).toBeNull();
     expect(auditor.sessionStatus).toBeNull();
     expect(auditor.sessionExpected).toBeNull();
@@ -938,7 +995,9 @@ describe('#621 — per-agent set is registry ∪ config (registry-only agents fl
       caller_pins: ReadonlyArray<Record<string, unknown>>;
       agents: ReadonlyArray<Record<string, unknown>>;
     };
-    expect(json.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION); // additive → no further bump
+    // #621's own additive fields don't independently bump schema_version; the
+    // version is currently 3 for the unrelated macf#874 semantic shift.
+    expect(json.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION);
     expect(json.summary.agents_total).toBe(3); // registry-only auditor now counted
     expect(json.summary.agents_routing_ok).toBe(3); // all fresh + routable
     // existing additive channels preserved:
@@ -950,6 +1009,7 @@ describe('#621 — per-agent set is registry ∪ config (registry-only agents fl
     expect(auditor.routable).toBe(true);
     expect(auditor.freshness).toBe('fresh');
     expect(auditor.self_skip_ok).toBeNull();
+    expect(auditor.self_skip_status).toBeNull();
     expect(auditor.session_ok).toBeNull();
     expect(auditor.session_status).toBeNull();
     expect(auditor.session_expected).toBeNull();
@@ -957,6 +1017,7 @@ describe('#621 — per-agent set is registry ∪ config (registry-only agents fl
     const code = json.agents.find((a) => a.label === 'code-agent')!;
     expect(code.in_local_config).toBe(true);
     expect(code.self_skip_ok).toBe(true);
+    expect(code.self_skip_status).toBe('ok');
     expect(code.session_status).toBe('ok');
   });
 });
@@ -989,6 +1050,13 @@ describe('rendering — tables + glyphs', () => {
     expect(sessionGlyph('ok')).toBe('✓');
     expect(sessionGlyph('warn')).toBe('⚠ warn');
     expect(sessionGlyph('absent')).toBe('—');
+  });
+  it('selfSkipGlyph maps each state (macf#874) — unresolvable is distinct from ok', () => {
+    expect(selfSkipGlyph('ok')).toBe('✓');
+    expect(selfSkipGlyph('not_ok')).toBe('✗');
+    const unresolved = selfSkipGlyph('unresolvable');
+    expect(unresolved).not.toBe('✓');
+    expect(unresolved).toMatch(/unresolved/);
   });
   it('buildRepoRows + formatRepoTable render REPO / CALLER-PIN / CONSISTENT', () => {
     const rows = [
@@ -1044,7 +1112,7 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
       disclaimer: string;
     };
     expect(json.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION);
-    expect(json.schema_version).toBe(2); // pinned literal: fails loud on an accidental bump (macf#873)
+    expect(json.schema_version).toBe(3); // pinned literal: fails loud on an accidental bump (macf#874)
     expect(json.project).toBe('macf');
     expect(json.summary.verdict).toBe('DEGRADED');
     expect(json.summary.pins_consistent).toBe(false);
@@ -1056,7 +1124,7 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
     expect(json.disclaimer).toMatch(/Static GitHub-plane/);
   });
 
-  it('macf#873: ca_cert carries matches_current_ca + both fingerprints + causal fields; schema_version bumped to 2', async () => {
+  it('macf#873: ca_cert carries matches_current_ca + both fingerprints + causal fields', async () => {
     const report = await gatherRoutingDoctor(
       deps({ readCaCert: async () => ROTATED_PEM, probe: async () => null }),
     );
@@ -1071,7 +1139,7 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
         cause_line: string | null;
       };
     };
-    expect(json.schema_version).toBe(2);
+    expect(json.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION);
     expect(json.summary.verdict).toBe('DEGRADED');
     expect(json.summary.ca_ok).toBe(false); // #873 semantic shift: mismatch fails ca_ok too
     expect(json.ca_cert.matches_current_ca).toBe(false);
