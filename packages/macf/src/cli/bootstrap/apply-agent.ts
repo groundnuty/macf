@@ -206,8 +206,8 @@ export async function confirmBeforeCreateGuard(
       appId: prior.app_id,
       reason:
         `fleet.lock records an App for "${role}" (app_id ${prior.app_id}) but no private-key path is ` +
-        'available to live-reconfirm it (vault-decrypt is not wired in this apply increment — DR-043 ' +
-        'Amendment A). Refusing to create a possibly-duplicate App. Verify manually on GitHub, or extend ' +
+        'available to live-reconfirm it (vault-decrypt is not wired in this apply increment). ' +
+        'Refusing to create a possibly-duplicate App. Verify manually on GitHub, or extend ' +
         'this run with a resolveKeyPath once a vault-decrypt seam exists.',
     };
   }
@@ -223,7 +223,7 @@ export async function confirmBeforeCreateGuard(
         action: 'drift',
         reason:
           `App "${role}" (app_id ${prior.app_id}) is installed, but not on the expected target — ` +
-          'DR-043 Amendment A §A2 lock-vs-live drift. Never silently resolved; requires operator confirmation.',
+          'a lock-vs-live drift. Never silently resolved; requires operator confirmation.',
         installs: confirmation.installs,
       };
     case 'unconfirmable':
@@ -836,7 +836,7 @@ export async function applyIdentity(
     if (recovered !== undefined) {
       deps.log(
         `Role "${role}": recovered credentials from a durable recovery artifact (app_id ${recovered.appId}, ` +
-          `handle "${recovered.name}") — resuming at consent gate 2 instead of re-creating (DR-043 Amendment B, macf#988).`,
+          `handle "${recovered.name}") — resuming at consent gate 2 instead of re-creating.`,
       );
       return finishGate2FromCredentials(role, recovered, manifest, repos, whyText, deps, true);
     }
@@ -1021,7 +1021,7 @@ async function writeRecoveryArtifactOrFail(role: string, creds: AppCredentials, 
     return undefined;
   } catch (err) {
     return (
-      `credential durability write failed BEFORE consent gate 2 (DR-043 §D5): ${errMessage(err)} — the App WAS ` +
+      `credential durability write failed BEFORE consent gate 2: ${errMessage(err)} — the App WAS ` +
       `created on GitHub (app_id ${creds.appId}, handle "${creds.name}") but its ONLY credential copy is process ` +
       'memory, about to be lost if this process exits. Refusing to proceed to gate 2 until the credential is ' +
       'durable. Fix the durability issue (recovery-artifact write target, disk space, missing age recipient) and ' +
