@@ -4,6 +4,37 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.58] — 2026-08-21
+
+**Six silent-failure and operator-facing fixes**, spanning the LGTM merge gate, the
+prompt-watcher's alert cadence, `routing doctor`'s self-reported certainty,
+`repo-init`'s degraded-artifact guard, the routing App's owner binding, and the
+mention hook's `gh issue create` coverage.
+
+### Fixed
+
+- **PreToolUse hooks inherited the launch-time `GH_TOKEN`**, so once the 1-hour
+  token TTL elapsed the LGTM merge gate silently failed OPEN. The gate now
+  refreshes the token before checking, and an auth failure that survives a
+  refresh fails CLOSED with a *"could not verify"* reason distinct from *"no
+  approval exists"*. (#1098)
+- **`macf-prompt-watcher.sh` alerted once per poll instead of once per distinct
+  frame**, burying a prompt an operator had to answer under 321 lines from 23
+  duplicate alerts; the retry path also sent `Enter` without the guard the first
+  attempt had. (#1097)
+- **Two `routing doctor` checks overstated what they knew.** The self-skip check
+  is now tri-state (`unresolvable` instead of a false `ok`), and the
+  routing-client cert state is renamed `presumed-ok` — the deployed cert is a
+  write-only secret the command cannot read. `schema_version` 2 → 3. (#1096)
+- **A stale `dist` could emit a routing workflow with no `permissions:` block and
+  no `check_suite` trigger, and still report success.** `repo-init` now refuses
+  to write a degraded artifact, naming the missing element. (#1095)
+- **The shared routing App was keyed on the operator's personal account** while
+  fleets live on organizations. It now keys on `manifest.owner`. (#1094)
+- **The mention hook did not guard `gh issue create`**, so an issue labelled for
+  yourself at creation time reached nobody; `repo-init` also now creates the
+  `backlog` label the declared-backlog mode requires. (#1093)
+
 ## [0.2.57] — 2026-08-20
 
 **The DR-043 fleet-provisioning CLI ships.** `macf bootstrap` builds a whole fleet
