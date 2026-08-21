@@ -410,7 +410,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
       const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
       expect(routing?.reason).toContain('REQUIRED');
       expect(routing?.reason).toMatch(/`apply` FAILS/);
-      expect(routing?.reason).toContain('groundnuty/macf#993');
+      expect(routing?.reason).toContain('rather than silently falling back to a metered hosted runner');
     }
   });
 
@@ -488,7 +488,7 @@ describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#
     expect(item?.verb).toBe('create');
     expect(item?.confirm_required).toBe(false);
     expect(item?.reason).toContain('warm: 1');
-    expect(item?.reason).toContain('DR-009 §7.4');
+    expect(item?.reason).toContain('not yet observable or enforced by apply');
   });
 
   // groundnuty/macf#942 §"The decisive test" — a manifest declaring
@@ -509,7 +509,7 @@ describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#
     expect(unimplemented?.target).toBe('routing:icsoc-2026:runner:warm');
     expect(unimplemented?.verb).toBe('create');
     expect(unimplemented?.reason).toBe(APPLY_UNIMPLEMENTED_REASONS.runnerWarm);
-    expect(unimplemented?.reason).toContain('#943');
+    expect(unimplemented?.reason).toContain('until that contract call is wired');
   });
 
   it('is NEVER implemented by apply — planItemApplyCoverage always returns not_implemented, regardless of verb (whole-kind gap, same shape as version/actions_pin)', () => {
@@ -523,7 +523,7 @@ describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#
   });
 
   it('the un-actioned reason names #943 as what will wire it, and never claims anything above was changed', () => {
-    expect(APPLY_UNIMPLEMENTED_REASONS.runnerWarm).toContain('groundnuty/macf#943');
+    expect(APPLY_UNIMPLEMENTED_REASONS.runnerWarm).toContain('until that contract call is wired');
     expect(APPLY_UNIMPLEMENTED_REASONS.runnerWarm).toContain('nothing above was changed');
   });
 
@@ -654,7 +654,7 @@ describe('computePlan — skippedSections (declared-but-deferred sections, no si
     });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     expect(plan.skippedSections).toEqual([
-      { section: 'collaborators', reason: 'reconcile not implemented in v1 — see #838 follow-ups' },
+      { section: 'collaborators', reason: 'reconcile not implemented in v1' },
     ]);
   });
 
@@ -688,7 +688,7 @@ describe('computePlan — skippedSections (declared-but-deferred sections, no si
     });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const lines = formatSkippedLines(plan.skippedSections);
-    expect(lines).toEqual(['collaborators: SKIPPED (reconcile not implemented in v1 — see #838 follow-ups)']);
+    expect(lines).toEqual(['collaborators: SKIPPED (reconcile not implemented in v1)']);
   });
 });
 
@@ -1233,7 +1233,7 @@ describe('computePlan — runner_ops item (groundnuty/macf#943)', () => {
     expect(item?.reason).toMatch(/administration:write/);
     expect(item?.reason).toMatch(/actions:read/);
     expect(item?.reason).toMatch(/metadata:read/);
-    expect(item?.reason).toMatch(/DR-019/);
+    expect(item?.reason).toMatch(/administration rights/);
   });
 
   it('confirm_required is always false (a pure presence check — never the confirm-then-update path)', () => {
@@ -1294,12 +1294,12 @@ describe('computePlan — registryScopeIssues (macf#999 requirement 3: "plan sta
     const message = plan.registryScopeIssues[0]?.message ?? '';
     expect(message).toContain('registry: { type: org, org: "demo-org" }');
     expect(message).toContain('type: profile');
-    expect(message).toContain('groundnuty/macf#999');
+    expect(message).toContain('is not yet decided');
     // groundnuty/macf#1012 requirement 4 (from the issue's original ACs,
     // carried into this codification): the org-scope refusal now ALSO
     // points at `type: repo` as a supported org-owned-fleet shape.
     expect(message).toContain('type: repo');
-    expect(message).toContain('groundnuty/macf#1012');
+    expect(message).toContain('is ALSO supported today');
     // Deliberately does NOT decide #999 requirement 2 — no assertion that
     // any specific resolution ("unsupported" / "repo-scoped" / a wider
     // permission set) is the chosen fix; only that ONE exists and is named
@@ -1346,8 +1346,7 @@ describe('computePlan — registryScopeIssues (macf#999 requirement 3: "plan sta
     const message = plan.registryRepoScopeNotices[0]?.message ?? '';
     expect(message).toContain('registry: { type: repo, owner: "demo-org", repo: "demo-org-registry" }');
     expect(message).toContain('demo-org/demo-org-registry');
-    expect(message).toContain('groundnuty/macf#999');
-    expect(message).toContain('groundnuty/macf#1012');
+    expect(message).toContain('and refuses, naming the App and the repo');
   });
 
   it('formatPlanText for a repo-scoped fleet carries a NOTICE line (never "UNSATISFIABLE" — type: repo works)', () => {
@@ -1498,7 +1497,7 @@ describe('countAppsToCreate / operatorInteractionBudget (groundnuty/macf#880)', 
     expect(six).toContain('6 "Create GitHub App" clicks');
     expect(six).toContain('6 install flows');
     expect(six).toContain('macf bootstrap apply --vault');
-    expect(six).toContain('macf#913/#915');
+    expect(six).toContain('may confirm some of these already exist and skip their gates');
   });
 
   // groundnuty/macf#880 — a role whose vault-aware preview decision is
