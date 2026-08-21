@@ -194,7 +194,7 @@ export async function runRegistryPrune(
   }
   if (config.registry.type === 'local') {
     console.error(
-      'registry prune targets GitHub-backed registries; local-registry mode (DR-024) ' +
+      'registry prune targets GitHub-backed registries; local-registry mode ' +
         'is not supported. Edit the local JSON registry file directly.',
     );
     return 1;

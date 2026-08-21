@@ -130,7 +130,6 @@ describe('certsInit / certsRotate — macf#800 out-of-band blast-radius WARN', (
       expect(process.exitCode).toBe(0);
       const out = logs.join('\n');
       expect(out).toContain('CA initialization complete.');
-      expect(out).not.toMatch(/macf#800/);
       expect(out).not.toMatch(/OUT-OF-BAND blast radius/);
     } finally {
       cleanup(project, projectDir);
@@ -149,7 +148,6 @@ describe('certsInit / certsRotate — macf#800 out-of-band blast-radius WARN', (
 
       const out = logs.join('\n');
       expect(out).toContain('CA initialization complete.');
-      expect(out).toMatch(/macf#800/);
       expect(out).toMatch(/OUT-OF-BAND blast radius/);
       expect(out).toMatch(/ROUTING_CLIENT_CERT/);
       expect(out).toMatch(/ROUTING_CLIENT_KEY/);
@@ -175,7 +173,6 @@ describe('certsInit / certsRotate — macf#800 out-of-band blast-radius WARN', (
       const out = logs.join('\n');
       expect(out).toMatch(/No passphrase provided/);
       expect(out).not.toContain('CA initialization complete.'); // early-return path
-      expect(out).toMatch(/macf#800/);
       expect(out).toMatch(/OUT-OF-BAND blast radius/);
     } finally {
       cleanup(project, projectDir);
@@ -199,7 +196,6 @@ describe('certsInit / certsRotate — macf#800 out-of-band blast-radius WARN', (
       const out = logs.join('\n');
       expect(process.exitCode).toBe(0);
       expect(out).toContain('Rotation complete.');
-      expect(out).toMatch(/macf#800/);
       expect(out).toMatch(/OUT-OF-BAND blast radius/);
       expect(out).toContain(`${toVariableSegment(project)}_CA_CERT`);
     } finally {
@@ -217,7 +213,7 @@ describe('certsInit / certsRotate — macf#800 out-of-band blast-radius WARN', (
       expect(process.exitCode).toBe(1);
       const out = logs.join('\n');
       expect(out).toMatch(/CA cert or key not found/);
-      expect(out).not.toMatch(/macf#800/); // refused before reaching the warn
+      expect(out).not.toMatch(/OUT-OF-BAND blast radius/); // refused before reaching the warn
     } finally {
       cleanup(project, projectDir);
     }

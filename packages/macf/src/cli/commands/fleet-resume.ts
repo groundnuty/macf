@@ -355,8 +355,8 @@ function createRealAlert(projectDir: string): (input: ResumeAlertInput) => Promi
       `- **Detected by:** \`macf fleet resume\` (capture-pane-diff idle + prompt-signature match).\n\n` +
       `**Action needed:** attach to the agent's TUI and respond to the prompt.\n\n` +
       `This alert was raised because the prompt is an **authorization** decision the fleet must NOT ` +
-      `auto-answer (DR-033 ceremony-not-authorization). Close it once you've handled the prompt.\n\n` +
-      `Refs: DR-037 ; macf-devops-toolkit#132 ; silent-fallback-hazards.md (idle-blocked is invisible unless surfaced).`;
+      `auto-answer. Close it once you've handled the prompt.\n\n` +
+      `(An idle-blocked agent is invisible unless something explicitly surfaces it — see silent-fallback-hazards.md.)`;
 
     const args = ['issue', 'create', '--repo', repo, '--title', title, '--body', body];
     try {

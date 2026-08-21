@@ -2167,7 +2167,7 @@ trust:
 
       expect(mintCalled).toBe(false);
       expect(result.ca.resolve.status).toBe('failed');
-      expect(result.ca.resolve.reason).toMatch(/honest-unknown/);
+      expect(result.ca.resolve.reason).toMatch(/never treated as confirmed-present/);
     });
 
     it('no age recipients -> the CA mint is refused BEFORE it ever runs (mirrors the per-agent §D5 pre-flight)', async () => {
@@ -3740,7 +3740,7 @@ trust:
       if (result.agents[0]?.identity.status === 'failed') {
         expect(result.agents[0].identity.reason).toContain('--identity-key');
         expect(result.agents[0].identity.reason).toContain('CREATE path');
-        expect(result.agents[0].identity.reason).toContain('macf#989');
+        expect(result.agents[0].identity.reason).toContain('never read-modify-written');
       }
       // Nothing else pending this run (CA reused, agent refused pre-gate,
       // runner-ops equally refused by the SAME pre-flight) -> settleVault
@@ -3765,7 +3765,7 @@ trust:
       expect(result.runnerOps.status).toBe('failed');
       if (result.runnerOps.status === 'failed') {
         expect(result.runnerOps.reason).toContain('--identity-key');
-        expect(result.runnerOps.reason).toContain('macf#989');
+        expect(result.runnerOps.reason).toContain('never read-modify-written');
       }
       expect(result.vault.status).toBe('skipped');
     });
@@ -4205,7 +4205,7 @@ trust:
       // fleet-wide note shared across roles. Per-role scoping is the whole
       // point (`assert-the-wrong-path.md`) — a single-agent fleet couldn't
       // distinguish "per role" from "per fleet."
-      expect(codeReason).toContain('groundnuty/macf#1016');
+      expect(codeReason).toContain('was ALSO not verified this run');
       expect(codeReason).toContain('demo-fleet-code-agent');
       expect(codeReason).toContain('demo-org/demo-org-registry');
       expect(codeReason).toContain('--vault');
@@ -4227,7 +4227,7 @@ trust:
       // AC: "--json carries the unverified state" — asserted against the
       // ACTUAL serialized render, not inferred from reading `redactIdentity`.
       const json = JSON.stringify(fleetApplyResultToJson(result));
-      expect(json).toContain('groundnuty/macf#1016');
+      expect(json).toContain('was ALSO not verified this run');
       expect(json).toContain('demo-fleet-code-agent');
       expect(json).toContain('demo-fleet-science-agent');
     });

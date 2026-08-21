@@ -78,7 +78,7 @@ export async function resolveTargetVersion(
     return {
       kind: 'no-opinion',
       message:
-        'the manifest declares no versions.macf — nothing to reconcile (DR-043 Amendment L2.4: absent means ' +
+        'the manifest declares no versions.macf — nothing to reconcile (absent means ' +
         '"no opinion", not "latest"). Pass --target to roll explicitly, or declare versions.macf in fleet.yaml.',
     };
   }

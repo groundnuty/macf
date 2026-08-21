@@ -223,7 +223,7 @@ function defaultCloneUrl(repo: string): string {
 }
 
 function defaultCommitMessage(repo: string): string {
-  return `chore(routing): macf repo-init — agent-router.yml + agent-config.json (DR-043 bootstrap apply, ${repo})`;
+  return `chore(routing): macf repo-init — agent-router.yml + agent-config.json (${repo})`;
 }
 
 export type RepoInitStepOutcome =
@@ -316,7 +316,7 @@ export async function applyRepoInitForAgent(
         status: 'failed',
         reason:
           `${labelReason} (workflow/config were still ${pushResult === 'pushed' ? 'pushed' : 'unchanged'} to "${agent.repo}") — ` +
-          'a fleet missing its role/status labels cannot route (groundnuty/macf#920).',
+          'a fleet missing its role/status labels cannot route.',
       };
     }
 
@@ -497,7 +497,7 @@ export async function ensureAgentRepo(
           role: agent.role,
           status: 'archived',
           reason:
-            `"${agent.repo}" is ARCHIVED (DR-043 Amendment G — a deliberate, reversible \`macf fleet archive\` ` +
+            `"${agent.repo}" is ARCHIVED (a deliberate, reversible \`macf fleet archive\` ` +
             'state). Revival is free but NOT automatic: re-run with confirmation (the plan-approve-once "yes" ' +
             'that authorizes this apply run) to un-archive + resume normal reconcile.',
         };

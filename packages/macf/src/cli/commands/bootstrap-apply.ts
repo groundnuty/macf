@@ -380,7 +380,7 @@ export function formatPlannedAppCreations(creations: readonly PlannedAppCreation
     // design (see `apply-runner-ops.ts::RUNNER_OPS_PERMISSIONS`'s
     // doc); labeling it "(DR-019)" here would misrepresent it as the derived
     // agent set.
-    const permsLabel = c.role === RUNNER_OPS_ROLE ? 'permissions (runner-ops, ONE-WAY RATCHET — never widen)' : 'permissions (DR-019)';
+    const permsLabel = c.role === RUNNER_OPS_ROLE ? 'permissions (runner-ops, ONE-WAY RATCHET — never widen)' : 'permissions';
     parts.push(`      ${permsLabel}: ${perms}`);
     parts.push(`      events: ${c.manifest.default_events.join(', ')}`);
     parts.push(`      public: ${String(c.manifest.public)}   webhook active: ${String(c.manifest.hook_attributes.active)}`);
@@ -466,7 +466,7 @@ export async function resolveVaultAgentPems(
     const reason = err instanceof Error ? err.message : String(err);
     log(
       `Vault-aware confirm UNAVAILABLE this run — ${reason} — falling back to the vault-free confirm-before-create ` +
-        'guard (DR-043 Amendment A: this is NOT evidence any App is absent, only that the vault could not be read).',
+        'guard (this is NOT evidence any App is absent, only that the vault could not be read).',
     );
     return undefined;
   }
@@ -597,7 +597,7 @@ function formatIdentityDecisionLine(role: string, decision: CreateGuardDecision)
 /** Human render of the vault-aware confirm-before-create preview (macf#913) — never a credential value. */
 export function formatIdentityPreview(decisions: ReadonlyMap<string, CreateGuardDecision>): string {
   return [
-    'Vault-aware identity confirm (DR-043 Amendment A) — which path each agent would take:',
+    'Vault-aware identity confirm — which path each agent would take:',
     ...[...decisions.entries()].map(([role, decision]) => formatIdentityDecisionLine(role, decision)),
   ].join('\n');
 }
@@ -1170,7 +1170,7 @@ function deployPhaseSummaryLines(deployPhase: DeployPhaseRenderInput): string[] 
   }
   const results = deployPhase.results ?? [];
   if (results.length === 0) return [];
-  const lines: string[] = ['', 'Deploy phase (macf#1013 — runs after the GitHub phase above):'];
+  const lines: string[] = ['', 'Deploy phase (runs after the GitHub phase above):'];
   for (const r of results) {
     lines.push(
       r.outcome.status === 'deployed'
@@ -1249,7 +1249,7 @@ function formatControlRepoLine(result: FleetApplyResult): string {
     case 'reused':
       return `REUSED "${cr.repo}" (checkout: ${cr.localDir})`;
     case 'revived':
-      return `REVIVED "${cr.repo}" (was archived — DR-043 Amendment G; checkout: ${cr.localDir})`;
+      return `REVIVED "${cr.repo}" (was archived; checkout: ${cr.localDir})`;
     case 'foreign':
       return `⚠ ABORTED — "${cr.repo}" exists but is not this fleet's control repo: ${cr.reason}`;
     case 'archived':
@@ -1528,7 +1528,7 @@ export function formatApplyResult(
     parts.push(
       '',
       `⚠ apply did NOT action ${String(unimplemented.length)} planned item(s) below — these are NOT IMPLEMENTED ` +
-        'yet, this is not "nothing to do" (macf#854):',
+        'yet, this is not "nothing to do":',
       ...formatUnimplementedLines(unimplemented),
     );
   }
@@ -1559,9 +1559,8 @@ export function formatApplyResult(
  */
 function formatVersionReconcileLine(versionPhase: ApplyVersionPhaseResult): string {
   const target = versionPhase.target ?? '?';
-  const cite = 'DR-043 Amendment L, macf#1045';
   if (versionPhase.halted === true) {
-    return `Version reconcile: HALTED — a bad release stopped the roll toward macf@${target} (see log above; ${cite}).`;
+    return `Version reconcile: HALTED — a bad release stopped the roll toward macf@${target} (see log above).`;
   }
   const rolled = versionPhase.rolledAgents ?? [];
   const breakdown = versionPhase.skipBreakdown ?? [];
@@ -1577,7 +1576,7 @@ function formatVersionReconcileLine(versionPhase: ApplyVersionPhaseResult): stri
     // rolled" looking like peers); parens make clear the second clause is
     // subordinate to the first.
     const notRolledNote = breakdown.length > 0 ? ` (${breakdown.join(', ')} not rolled)` : '';
-    return `Version reconcile: rolled ${String(rolled.length)} agent(s) to macf@${target} — ${rolled.join(', ')}${notRolledNote} (${cite}).`;
+    return `Version reconcile: rolled ${String(rolled.length)} agent(s) to macf@${target} — ${rolled.join(', ')}${notRolledNote}.`;
   }
   // Zero rolled — say so explicitly, with a reason, per macf#1053's
   // requirement 3 ("a no-op must not read as a completed roll"). The
@@ -1589,7 +1588,7 @@ function formatVersionReconcileLine(versionPhase: ApplyVersionPhaseResult): stri
   if (versionPhase.unreachable === true) {
     return (
       `Version reconcile: could not attempt toward macf@${target} — no locally-discoverable workspace for this ` +
-      `fleet on this host (driver-unresolved).${flaglessNote} (${cite}).`
+      `fleet on this host (driver-unresolved).${flaglessNote}`
     );
   }
   const total = versionPhase.totalMembers ?? 0;
@@ -1598,7 +1597,7 @@ function formatVersionReconcileLine(versionPhase: ApplyVersionPhaseResult): stri
   // fewer than the manifest's full agent list when only some workspaces are
   // reachable from here; naming it "declared" would overclaim.
   const reason = breakdown.length > 0 ? breakdown.join(', ') : total > 0 ? 'none behind target' : 'no fleet members discovered locally';
-  return `Version reconcile: 0 of ${String(total)} discovered member(s) rolled toward macf@${target} — ${reason}.${flaglessNote} (${cite}).`;
+  return `Version reconcile: 0 of ${String(total)} discovered member(s) rolled toward macf@${target} — ${reason}.${flaglessNote}`;
 }
 
 /**
@@ -1908,7 +1907,7 @@ export function findAvailableRecoveryArtifacts(
 /** Pure text builder for {@link findAvailableRecoveryArtifacts}'s result — shared by the `--dry-run` render and the real pre-approval render so the wording never drifts between the two. */
 export function formatRecoveryArtifactNotice(roles: readonly string[]): string {
   return (
-    `⚠ Durable recovery artifact(s) found for: ${roles.join(', ')} (DR-043 Amendment B, macf#988) — a prior run's ` +
+    `⚠ Durable recovery artifact(s) found for: ${roles.join(', ')} — a prior run's ` +
     'App creation reached the vault-durability step but that run did not complete. Supply --identity-key (and ' +
     '--vault) to this apply and it will be consumed automatically — the recovered credential folds into the vault ' +
     'instead of a new App being created. Without --identity-key, this run treats the role the same as before this ' +

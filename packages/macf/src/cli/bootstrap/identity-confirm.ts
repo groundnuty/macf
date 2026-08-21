@@ -476,7 +476,7 @@ export async function waitForAppInstallation(opts: WaitForAppInstallationOptions
     throw new Error(
       'waitForAppInstallation: `expected` must carry at least one of appSlug/accountLogin. An empty ' +
         'ExpectedIdentity ({}) would otherwise let the FIRST poll silently trust whatever install GitHub ' +
-        'returns first — the exact false-consent hazard `expected` exists to prevent (macf#846 review 3a/3c). ' +
+        'returns first — the exact false-consent hazard `expected` exists to prevent. ' +
         "Supply the fleet owner's accountLogin at minimum.",
     );
   }

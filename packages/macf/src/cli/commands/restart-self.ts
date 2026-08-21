@@ -526,7 +526,7 @@ function renderPlanText(plan: RestartSelfPlan, dirty: boolean): string {
   if (plan.workspace_dir_conflict) {
     lines.push(
       `  ⚠ CONFLICT: --dir wins over MACF_WORKSPACE_DIR=${plan.workspace_dir_conflict} — ` +
-        'without this, restart-self would silently target the CALLER, not the named workspace (macf#888).',
+        'without this, restart-self would silently target the CALLER, not the named workspace.',
     );
   }
   lines.push(
@@ -564,7 +564,7 @@ export async function runRestartSelf(
   if (opts.workspaceDirConflict) {
     console.error(
       `macf restart-self: --dir wins over MACF_WORKSPACE_DIR=${opts.workspaceDirConflict} ` +
-        `— targeting ${opts.workspaceDir} (macf#888: without this, restart-self would ` +
+        `— targeting ${opts.workspaceDir} (without this, restart-self would ` +
         'silently target the CALLER, not the named workspace).',
     );
   }
@@ -656,7 +656,7 @@ export async function runRestartSelf(
       'macf restart-self: refusing — uncommitted config-surface changes ' +
         '(claude.sh, .claude/rules/**, .claude/scripts/**, .claude/settings.json, ' +
         'the managed .claude/.macf/env.* + host-prelude.sh, CLAUDE.md, ' +
-        'env.local.* — the DR-040 Decision 6 union, macf#698) would be stashed ' +
+        'env.local.*) would be stashed ' +
         'by a restart. Commit them first, or pass --force / set ' +
         'MACF_RESTART_STASH_CONFIG=1 to proceed anyway.',
     );

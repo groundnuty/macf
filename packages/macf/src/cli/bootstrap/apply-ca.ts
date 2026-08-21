@@ -227,8 +227,8 @@ export async function resolveCaCert(
       reason:
         `fleet.lock records a previously-minted CA key, but the registry var "${varName}" is not confirmable ` +
         `present (observed: ${registryPresence}) — refusing to mint a REPLACEMENT (would orphan the already` +
-        '-vaulted key, the #799 failure class). Re-materializing the cert from the vaulted key needs a vault ' +
-        'read (DR-043 Amendment D phase 3+), not a fresh mint. Investigate manually.',
+        '-vaulted key). Re-materializing the cert from the vaulted key needs a vault ' +
+        'read, not a fresh mint. Investigate manually.',
     };
   }
 
@@ -244,8 +244,8 @@ export async function resolveCaCert(
       status: 'failed',
       reason:
         `could not confirm whether registry var "${varName}" already exists (auth / network / rate-limit) — ` +
-        'refusing to mint a possibly-duplicate CA. Re-run once the read can complete (DR-043 Amendment A4 ' +
-        'honest-unknown-over-false-present).',
+        'refusing to mint a possibly-duplicate CA. Re-run once the read can complete (an unknown state is ' +
+        'never treated as confirmed-present).',
     };
   }
 
@@ -255,7 +255,7 @@ export async function resolveCaCert(
       status: 'failed',
       reason:
         'no CA exists yet for this fleet, but transport.age_recipients is empty — a freshly-minted CA key could ' +
-        'NEVER be made durable (DR-043 §D5). Refusing to mint. Mint an age recipient and add it to ' +
+        'NEVER be made durable. Refusing to mint. Mint an age recipient and add it to ' +
         'transport.age_recipients in fleet.yaml, then re-run.',
     };
   }

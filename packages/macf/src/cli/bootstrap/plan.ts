@@ -356,7 +356,7 @@ export interface FleetPlan {
  * this change, not deferred) — `collaborators` is the sole remaining member.
  */
 export const SKIPPED_SECTION_REASONS = {
-  collaborators: 'reconcile not implemented in v1 — see #838 follow-ups',
+  collaborators: 'reconcile not implemented in v1',
 } as const;
 
 /**
@@ -449,8 +449,7 @@ export interface UnimplementedApplyItem {
  */
 export const APPLY_UNIMPLEMENTED_REASONS = {
   routing:
-    'apply writes MACF_TRUSTED_ACTORS when the variable is ABSENT (create-only, macf#838 Amendment D phase 2, ' +
-    'corrected to the router\'s actually-read variable by macf#922) but does NOT overwrite a PRESENT-but-' +
+    'apply writes MACF_TRUSTED_ACTORS when the variable is ABSENT (create-only) but does NOT overwrite a PRESENT-but-' +
     'diverging value — the task\'s create-only posture ("never silently overwrite") leaves this specific update ' +
     'un-actioned. Set the repo variable manually to the declared value, or re-run apply once a future increment ' +
     'adds confirmed per-item updates; nothing above was changed for this item.',
@@ -463,9 +462,9 @@ export const APPLY_UNIMPLEMENTED_REASONS = {
   // below flips to 'implemented'.
   runnerWarm:
     'apply provisions identity/repo/CA/routing wiring; it does not yet call the runner-provisioning contract ' +
-    '(repo/labels/warm) that would act on a declared warm posture (groundnuty/macf#943, blocked). warm is ' +
+    '(repo/labels/warm) that would act on a declared warm posture yet. warm is ' +
     'recorded in the manifest and in this plan, but nothing enforces it yet — a dormant fleet (warm: 0) still ' +
-    'has its runner kept warm until #943 wires the contract call; nothing above was changed for this item.',
+    'has its runner kept warm until that contract call is wired; nothing above was changed for this item.',
 } as const;
 
 /**
@@ -680,7 +679,7 @@ export const UNKNOWN_REASONS = {
   // invocation may not have opted into.
   identity:
     'not confirmable at plan time (no App JWT — the PEM lives in the vault). `macf bootstrap apply` confirms ' +
-    'it live ONLY when invoked with BOTH --vault and --identity-key (DR-043 Amendment A) — pass both to avoid ' +
+    'it live ONLY when invoked with BOTH --vault and --identity-key — pass both to avoid ' +
     'apply colliding with an existing App name; without them, apply treats this the same way plan does here',
   repo: 'could not be read (auth / network / insufficient scope) — existence unconfirmed',
   variable: 'could not be read (auth / network / insufficient scope) — existence unconfirmed',
@@ -802,8 +801,8 @@ function runnerOpsItem(fleetName: string, lockHasEntry: boolean): PlanItem {
     verb,
     reason:
       `Runner-ops GitHub App "${handle}" ${reasonSuffix} — a SECOND, minimal App per fleet ` +
-      '(administration:write / actions:read / metadata:read; DR-019 has no administration permission and ' +
-      'was not widened — groundnuty/macf#943). Provisioning it costs 2 operator consent-gate clicks (App-manifest ' +
+      '(administration:write / actions:read / metadata:read; the main agent App\'s permission set has no ' +
+      'administration rights and is deliberately not widened to add them). Provisioning it costs 2 operator consent-gate clicks (App-manifest ' +
       'creation + install), same shape as a coordination agent App.',
     confirm_required: false,
   };
@@ -937,7 +936,7 @@ function routingClientItem(repo: string, presence: Presence): PlanItem {
  */
 const RUNNER_TOKEN_PLAN_NOTE =
   ` \`macf bootstrap apply\` additionally requires ${RUNNER_TOKEN_FLAG} (or ${RUNNER_TOKEN_ENV_VAR}) before it will ` +
-  'attempt this write at all — macf#932.';
+  'attempt this write at all.';
 
 /**
  * groundnuty/macf#993 — the operator's ruling, stated plainly BEFORE the
@@ -958,7 +957,7 @@ const RUNNER_TOKEN_PLAN_NOTE =
  */
 const RUNNER_REQUIRED_FAILURE_PLAN_NOTE =
   ' A declared routing.runner is REQUIRED: if no usable runner is confirmed when `apply` runs, `apply` FAILS ' +
-  '(non-zero exit) rather than silently falling back to a metered hosted runner — groundnuty/macf#993.';
+  '(non-zero exit) rather than silently falling back to a metered hosted runner.';
 
 /**
  * The runner-CLASS half of {@link routingItem}'s reason (macf#922 — the plan
@@ -1100,7 +1099,7 @@ function runnerWarmItem(fleetName: string, desiredWarm: number): PlanItem {
     kind: 'runner_warm',
     target: `routing:${fleetName}:runner:warm`,
     verb: 'create',
-    reason: `warm: ${String(desiredWarm)} declared (DR-009 §7.4)${dormantNote} — not yet observable or enforced by apply; see the apply-coverage note below.`,
+    reason: `warm: ${String(desiredWarm)} declared${dormantNote} — not yet observable or enforced by apply; see the apply-coverage note below.`,
     confirm_required: false,
   };
 }
@@ -1120,7 +1119,7 @@ function runnerWarmItem(fleetName: string, desiredWarm: number): PlanItem {
  * it never reads as an error.
  */
 export const CONTROL_REPO_ARCHIVED_REASON =
-  'control repo is ARCHIVED (DR-043 Amendment G) — a DELIBERATE, reversible fleet state set by a prior ' +
+  'control repo is ARCHIVED — a DELIBERATE, reversible fleet state set by a prior ' +
   '`macf fleet archive`, NOT drift. Approving this plan authorizes `apply` to un-archive it (one API PATCH, ' +
   'zero browser consent clicks) and resume normal reconcile.';
 
@@ -1149,7 +1148,7 @@ function controlRepoItem(presence: Presence, archived: boolean | undefined): Pla
  * counted.
  */
 export const AGENT_REPO_ARCHIVED_REASON = (repo: string): string =>
-  `repo "${repo}" is ARCHIVED (DR-043 Amendment G) — a DELIBERATE, reversible fleet state set by a prior ` +
+  `repo "${repo}" is ARCHIVED — a DELIBERATE, reversible fleet state set by a prior ` +
   '`macf fleet archive`, NOT drift. Approving this plan authorizes `apply` to un-archive it (one API PATCH, ' +
   'zero browser consent clicks) and resume normal reconcile.';
 
@@ -1232,7 +1231,7 @@ function vaultRecipientsItem(desiredCount: number, obs: VaultRecipientsObservati
       reason:
         `vault is encrypted to ${String(obs.stanzaCount)} recipient(s), DEFINITELY fewer than the ${String(desiredCount)} ` +
         'declared in transport.age_recipients — run "macf bootstrap apply --vault <path> --identity-key <path>" to ' +
-        're-encrypt to the full declared set (decrypt-then-whole-rewrite, DR-043 Amendment D).',
+        're-encrypt to the full declared set (decrypt-then-whole-rewrite).',
       confirm_required: true,
     };
   }
@@ -1302,8 +1301,8 @@ function macfVersionItem(agent: FleetAgent, desired: string, obs: ObservedAgentS
     verb: 'update',
     reason:
       `deployed macf version observed "${observed}" but manifest declares "${desired}" — ` +
-      'apply reconciles this by calling the "macf fleet upgrade" roll during this run (DR-043 Amendment L; ' +
-      'DR-037 verify-green gated, §D4) — this restarts the agent',
+      'apply reconciles this by calling the "macf fleet upgrade" roll during this run ' +
+      '(gated on a green post-restart health check) — this restarts the agent',
     confirm_required: true,
   };
 }
@@ -1700,7 +1699,7 @@ export function formatOperatorInteractionLine(budget: OperatorInteractionBudget)
   const ceilingNote =
     bound === 'maximum'
       ? ' This is a ceiling, not a promise — `macf bootstrap apply --vault <path> --identity-key <path>` may ' +
-        'confirm some of these already exist and skip their gates (macf#913/#915).'
+        'confirm some of these already exist and skip their gates.'
       : '';
   if (gate1Clicks === gate2Flows) {
     const n = gate1Clicks;
@@ -1773,7 +1772,7 @@ export function formatPlanText(plan: FleetPlan): string {
     parts.push(
       '',
       `⚠ apply cannot action ${String(plan.unimplementedByApply.length)} item(s) below yet — approving this plan ` +
-        'will NOT create or update them; they are NOT implemented, this is not "nothing to do" (macf#854):',
+        'will NOT create or update them; they are NOT implemented, this is not "nothing to do":',
       ...unimplementedLines,
     );
   }
@@ -1860,6 +1859,6 @@ export function checkVaultFlagsComplete(vaultPath: string | undefined, identityK
     message:
       '--vault and --identity-key must be given TOGETHER or not at all — ' +
       `only ${vaultPath !== undefined ? '--vault' : '--identity-key'} was given. Supply both for a ` +
-      'vault-aware run (DR-043 Amendment D phase 3), or neither for the vault-free default.',
+      'vault-aware run, or neither for the vault-free default.',
   };
 }

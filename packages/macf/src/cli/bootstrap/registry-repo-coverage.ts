@@ -291,8 +291,8 @@ export function registryRepoNotInstalledReason(appHandle: string, owner: string,
     `Applications → ${appHandle} → Configure → Repository access → add the repo), or (b) ${owner}/${repo} itself ` +
     'does not exist or was renamed (fix: correct owner.registry in fleet.yaml, or create the repo). Either way, ' +
     "this agent would otherwise provision successfully and then be unable to read/write its own registry entry, " +
-    `discovered only when it first tries (groundnuty/macf#999's exact failure mode, now guarded for ` +
-    'registry.type: repo per #1012). Resolve one of the two causes above, then re-run apply.'
+    `discovered only when it first tries (a known failure mode, now guarded for ` +
+    'registry.type: repo). Resolve one of the two causes above, then re-run apply.'
   );
 }
 
@@ -324,8 +324,8 @@ export function registryRepoCoverageUnknownWarning(appHandle: string, owner: str
   return (
     `WARNING: could not confirm whether App "${appHandle}"'s installation includes the registry repo ` +
     `${owner}/${repo} (GET /repos/${owner}/${repo}/installation could not be read — JWT mint failure / network / ` +
-    'an unexpected HTTP status). This is UNKNOWN, never treated as confirmed-missing (DR-043 Amendment A) — but it ' +
-    "also means #1012's guard could not verify this App. Check manually: GitHub → Settings → Applications → " +
+    'an unexpected HTTP status). This is UNKNOWN, never treated as confirmed-missing — but it ' +
+    "also means this run's guard could not verify this App. Check manually: GitHub → Settings → Applications → " +
     `${appHandle} → Configure → Repository access.`
   );
 }
@@ -348,7 +348,7 @@ export function registryRepoCoverageUnknownWarning(appHandle: string, owner: str
  */
 export function registryRepoCoverageUnverifiedOnSkipNote(appHandle: string, owner: string, repo: string): string {
   return (
-    `Registry-repo coverage for ${owner}/${repo} was ALSO not verified this run (groundnuty/macf#1016) — App ` +
+    `Registry-repo coverage for ${owner}/${repo} was ALSO not verified this run — App ` +
     `"${appHandle}"'s installation was never live-checked against ${owner}/${repo} because this run has no ` +
     'vault-aware confirm wired (no --vault/--identity-key given). Re-run with "macf bootstrap apply --vault ' +
     '<path> --identity-key <path>" to verify it.'

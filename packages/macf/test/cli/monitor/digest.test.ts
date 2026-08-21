@@ -205,7 +205,7 @@ describe('buildDigest', () => {
     expect(md).toContain('Project-tier rules present: 0');
 
     // Read-only / gated note is present (reporting, not proposing)
-    expect(md).toContain('DR-026 G1');
+    expect(md).toContain('a separate, ratification-gated step');
     expect(md).toContain('No issues were created, commented on, closed, or merged');
   });
 

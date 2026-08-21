@@ -138,7 +138,7 @@ export async function recordDeployedVersionCore(
 
   await deps.commitAndPush(
     localDir,
-    `chore(bootstrap): record deployed_version ${version} for "${agentRole}" (DR-043 §D6, macf#907)`,
+    `chore(bootstrap): record deployed_version ${version} for "${agentRole}"`,
   );
 }
 

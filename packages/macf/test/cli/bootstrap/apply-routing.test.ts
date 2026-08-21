@@ -707,7 +707,7 @@ describe('runnerPermissionDeniedReason (groundnuty/macf#1054)', () => {
     };
     const reason = runnerPermissionDeniedReason('groundnuty/x', usability);
     expect(reason).toContain('403');
-    expect(reason).toContain('DR-044');
+    expect(reason).toContain('FLEET authority, not agent authority');
     expect(reason).toMatch(/fleet/i);
     expect(reason).toContain('MACF_TRUSTED_ACTORS was NOT written');
     // Never the runnerTokenPollExhaustedReason-style elapsed-time claim
@@ -756,7 +756,7 @@ describe('publishTrustedActorsGated — permissionDenied fail-fast (groundnuty/m
     expect(result['a/b']?.status).toBe('failed');
     const reason = (result['a/b'] as { reason: string }).reason;
     expect(reason).toContain('403');
-    expect(reason).toContain('DR-044');
+    expect(reason).toContain('FLEET authority, not agent authority');
     expect(reason).not.toMatch(/\d+s poll window/); // never the exhausted-poll elapsed-time claim — no wait happened
     expect(checkCalls).toBe(1);
     expect(sleepCalls).toBe(0);
@@ -802,7 +802,7 @@ describe('publishTrustedActorsGated — permissionDenied fail-fast (groundnuty/m
     expect(result['a/b']?.status).toBe('failed');
     const reason = (result['a/b'] as { reason: string }).reason;
     expect(reason).toContain('403');
-    expect(reason).toContain('DR-044');
+    expect(reason).toContain('FLEET authority, not agent authority');
     // NOT the justCreatedRepos generic "created during THIS run" framing —
     // the permission cause is more specific and wins.
     expect(reason).not.toContain('created during THIS run');

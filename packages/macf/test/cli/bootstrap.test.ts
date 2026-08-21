@@ -147,7 +147,7 @@ describe('runBootstrapPlan', () => {
     expect(json.summary.creates).toBeGreaterThan(0);
     // collaborators is declared + non-empty in the fixture → must be SKIPPED, not silently dropped.
     expect(json.skipped_sections).toEqual([
-      { section: 'collaborators', reason: 'reconcile not implemented in v1 — see #838 follow-ups' },
+      { section: 'collaborators', reason: 'reconcile not implemented in v1' },
     ]);
     // macf#838 Amendment D phase 2: CA is fully implemented now — a fresh
     // fleet with no `routing:` declared has NOTHING unimplemented.
@@ -182,7 +182,7 @@ describe('runBootstrapPlan', () => {
     const out = logSpy.mock.calls.flat().join('\n');
     expect(out).toContain('macf bootstrap plan — icsoc-2026');
     expect(out).toContain('CREATE');
-    expect(out).toContain('collaborators: SKIPPED (reconcile not implemented in v1 — see #838 follow-ups)');
+    expect(out).toContain('collaborators: SKIPPED (reconcile not implemented in v1)');
     // macf#838 Amendment D phase 2: CA is fully implemented now and this
     // fixture declares no `routing:` — nothing is unimplemented.
     expect(out).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
@@ -355,7 +355,7 @@ describe('runBootstrapPlan — operator interaction budget (groundnuty/macf#880)
     expect(out).toContain('2 "Create GitHub App" clicks');
     expect(out).toContain('2 install flows');
     expect(out).toContain('macf bootstrap apply --vault');
-    expect(out).toContain('macf#913/#915');
+    expect(out).toContain('may confirm some of these already exist and skip their gates');
   });
 
   it('fresh fleet, --json: carries operator_interaction with the same maximum + bound: "maximum"', async () => {

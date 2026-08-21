@@ -506,7 +506,7 @@ describe('runRestartSelf — macf#888 identity-source + conflict surfacing', () 
     expect(workspaceLine).not.toContain('/my/caller/workspace');
     expect(out).toContain('(from --dir)');
     expect(out).toContain('CONFLICT');
-    expect(out).toContain('macf#888');
+    expect(out).toContain('would silently target the CALLER, not the named workspace');
     // Loud on stderr too — visible even to an operator scanning past stdout.
     const err = errSpy.mock.calls.flat().join('\n');
     expect(err).toContain('/my/caller/workspace');

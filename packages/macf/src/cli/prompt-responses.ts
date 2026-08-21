@@ -42,10 +42,10 @@ export function workspacePromptResponsesPath(workspaceDir: string): string {
  * operator-tunable + live-verify-only nature.
  */
 const SEED_COMMENT =
-  'Interactive-prompt auto-responder allowlist (DR-033 / groundnuty/macf#645). ' +
+  'Interactive-prompt auto-responder allowlist. ' +
   'ONLY vetted ceremony prompts are auto-answered; unknown prompt-like frames are ' +
-  'alerted, never answered (Inv 1). Entries whose signature contains delete/overwrite/trust ' +
-  'are hard-refused at load; (y/n)/allow/permission/grant are loud-warned (Inv 2). ' +
+  'alerted, never answered. Entries whose signature contains delete/overwrite/trust ' +
+  'are hard-refused at load; (y/n)/allow/permission/grant are loud-warned. ' +
   'The exact prompt text can only be confirmed by an operator live-launch (the prompts do ' +
   'not render in `claude -p`), so tune frame_contains/option_text against the real pane — ' +
   'an imperfect signature fails SAFE (falls through to an unknown-prompt alert, never a ' +

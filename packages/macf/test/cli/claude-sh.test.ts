@@ -503,10 +503,10 @@ describe('generateClaudeSh', () => {
     it('aborts LOUDLY (exit 1) both on re-mint failure and on a still-bad re-minted value', () => {
       const output = generateClaudeSh(sampleConfig);
       expect(output).toContain(
-        'FATAL (macf#821): GH_TOKEN re-mint failed at the launch boundary —',
+        'FATAL: GH_TOKEN re-mint failed at the launch boundary —',
       );
       expect(output).toContain(
-        'FATAL (macf#821): freshly re-minted GH_TOKEN STILL does not match',
+        'FATAL: freshly re-minted GH_TOKEN STILL does not match',
       );
       const start = output.indexOf('Launch-boundary GH_TOKEN validation (macf#821)');
       const end = output.indexOf('if [ -n "${MACF_TEST:-}" ]; then');
@@ -556,7 +556,7 @@ describe('generateClaudeSh', () => {
         );
         // No App creds exist in local-mode to re-mint from.
         expect(output).not.toContain('--app-id "$APP_ID"');
-        expect(output).not.toContain('FATAL (macf#821): GH_TOKEN re-mint failed');
+        expect(output).not.toContain('FATAL: GH_TOKEN re-mint failed');
       });
 
       it('clears (does not abort on) a malformed-but-present GH_TOKEN', () => {

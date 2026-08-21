@@ -177,7 +177,7 @@ describe('GATE 2 — dry-run by default; --file is create-only', () => {
     expect(input.repo).toBe('groundnuty/macf');
     expect(input.title).toContain('auditor-proposal:');
     expect(input.labels).toContain('auditor-proposal');
-    expect(input.body).toContain('Auditor proposal (DR-026 G1)');
+    expect(input.body).toContain('Auditor proposal.');
     expect(input.body).toContain('code-agent, science-agent'); // corroboration list
     expect(res.report).toContain('--file (artifacts opened)');
   });

@@ -118,14 +118,14 @@ export function checkRegistryScopePreflight(owner: FleetOwner): RegistryScopeCon
 export function registryScopeUnsatisfiableReason(org: string): string {
   return (
     `registry: { type: org, org: "${org}" } is unsatisfiable with this tool's current provisioning: every ` +
-    'ordinary agent App\'s manifest derives its permissions solely from MACF_REQUIRED_PERMISSIONS (DR-019, ' +
+    'ordinary agent App\'s manifest derives its permissions solely from MACF_REQUIRED_PERMISSIONS (see ' +
     'packages/macf/src/cli/commands/doctor.ts), which contains no organization-scoped permission — so no App ' +
     '`macf bootstrap` provisions can read GET /orgs/{org}/actions/variables/{name}, independent of install scope. ' +
-    'registry: { type: profile, user: <account> } works today (DR-006) — the substrate fleet uses it. For an ' +
+    'registry: { type: profile, user: <account> } works today — the substrate fleet uses it. For an ' +
     'org-owned fleet specifically, registry: { type: repo, owner: <org>, repo: <org-owned-repo> } is ALSO ' +
-    "supported today (groundnuty/macf#1012) — apply verifies live, per App, that every agent's installation " +
+    "supported today — apply verifies live, per App, that every agent's installation " +
     'actually covers that repo. The resolution for `type: org` itself (widening the permission set, or declaring ' +
-    'org scope unsupported outright) is open — see groundnuty/macf#999. Refusing before any consent gate opens; ' +
+    'org scope unsupported outright) is not yet decided. Refusing before any consent gate opens; ' +
     'nothing on GitHub was touched.'
   );
 }
@@ -168,10 +168,10 @@ export function registryRepoScopeNoticeText(owner: string, repo: string): string
   return (
     `registry: { type: repo, owner: "${owner}", repo: "${repo}" } requires EVERY declared agent App's ` +
     `installation to include ${owner}/${repo} — an App installed with "Only select repositories" that omits it ` +
-    "would provision successfully and then be unable to read/write its own registry entry (groundnuty/macf#999's " +
-    "exact failure mode). `macf bootstrap apply` verifies this live, per App, right after each App's install is " +
-    'confirmed (consent gate 2) — and refuses, naming the App and the repo, if any App is missing it ' +
-    '(groundnuty/macf#1012). Nothing to do here except be aware: when the install page opens for each agent, make ' +
+    "would provision successfully and then be unable to read/write its own registry entry. " +
+    "`macf bootstrap apply` verifies this live, per App, right after each App's install is " +
+    'confirmed (consent gate 2) — and refuses, naming the App and the repo, if any App is missing it. ' +
+    'Nothing to do here except be aware: when the install page opens for each agent, make ' +
     `sure the repo list you select includes ${owner}/${repo}.`
   );
 }
