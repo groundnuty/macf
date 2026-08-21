@@ -665,6 +665,21 @@ export interface IdentityRequest {
    * already tolerates the way it tolerates any other repo list.
    */
   readonly installRepos?: readonly string[];
+  /**
+   * Overrides the derived App handle (groundnuty/macf#1082) — `undefined`
+   * (every agent, `runner-ops`, and the router App's PER-FLEET scope) keeps
+   * `deriveAppHandle(manifest.metadata.name, role)`, byte-identical to
+   * before this field existed. The router App's SHARED scope is the one
+   * caller that supplies this: its handle must NOT be fleet-prefixed (a
+   * fixed, cross-fleet-recognizable name is the whole point of "shared" —
+   * see `apply-router-app.ts`'s module doc), and `deriveAppHandle` cannot
+   * produce that (it always prepends `manifest.metadata.name`). Threaded
+   * into every place `applyIdentity` would otherwise derive the handle
+   * itself: the confirm-before-create guard's `expected.appSlug`, the
+   * App-name-collision pre-flight, the submitted manifest's `name`
+   * (`buildAppManifest`'s `nameOverride`), and every install/settings URL.
+   */
+  readonly handleOverride?: string;
 }
 
 /**
@@ -721,7 +736,11 @@ export async function applyIdentity(
   deps: AgentApplyDeps,
 ): Promise<AgentApplyOutcome> {
   const role = request.role;
-  const handle = deriveAppHandle(manifest.metadata.name, role);
+  // groundnuty/macf#1082 — `request.handleOverride` wins outright when
+  // supplied (the router App's SHARED scope; see `IdentityRequest.
+  // handleOverride`'s doc). Every other caller keeps the derived handle,
+  // byte-identical to before this field existed.
+  const handle = request.handleOverride ?? deriveAppHandle(manifest.metadata.name, role);
   // Best-known slug for a PRE-EXISTING App is the derived handle — a prior
   // successful gate 1 submitted `buildAppManifest`'s `name` field, which IS
   // deriveAppHandle's output (barring a rare GitHub collision-suffix — the
@@ -894,6 +913,7 @@ export async function applyIdentity(
           homepageUrl: request.homepageUrl,
           permissions: request.permissions,
           events: request.events,
+          nameOverride: request.handleOverride,
         }),
       formAction: manifestFormAction(manifest.owner),
       timeoutMs: deps.gateTimeoutMs,

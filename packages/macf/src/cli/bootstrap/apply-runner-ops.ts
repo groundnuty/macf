@@ -180,13 +180,21 @@ export type AppNameLengthCheck = { readonly ok: true } | { readonly ok: false; r
  * top-of-function refusal — see `checkAppNameLengths`'s doc for why BOTH
  * exist) derive it from one place, never two independently hand-rolled
  * lists that could drift.
+ *
+ * groundnuty/macf#1082 — the router handle now depends on
+ * `manifest.transport.router_app_scope`: `'shared'` (default, including a
+ * hand-built manifest that predates this field) resolves to the fixed
+ * `SHARED_ROUTER_APP_HANDLE`, always well under the 34-char cap;
+ * `'per-fleet'` keeps the pre-#1082 fleet-derived handle this check was
+ * originally built for.
  */
 export function plannedAppNames(manifest: FleetManifest): readonly string[] {
   const fleetName = manifest.metadata.name;
+  const routerScope = manifest.transport.router_app_scope === 'per-fleet' ? 'per-fleet' : 'shared';
   return [
     ...manifest.agents.map((a: FleetAgent) => deriveAppHandle(fleetName, a.role)),
     deriveRunnerOpsHandle(fleetName),
-    deriveRouterAppHandle(fleetName),
+    deriveRouterAppHandle(fleetName, routerScope),
   ];
 }
 

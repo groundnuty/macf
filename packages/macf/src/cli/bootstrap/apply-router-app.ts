@@ -1,46 +1,61 @@
 /**
- * The routing App — a THIRD, minimal GitHub App per fleet (alongside the
- * per-agent Apps and `runner-ops`) whose only job is minting a
- * registry-read token for `macf-actions`' `agent-router.yml` reusable
- * workflow (groundnuty/macf#1074, "the fleet's routing capability is
- * blocked").
+ * The routing App — a minimal GitHub App (alongside the per-agent Apps and
+ * `runner-ops`) whose only job is minting a registry-read token for
+ * `macf-actions`' `agent-router.yml` reusable workflow (groundnuty/macf#1074,
+ * "the fleet's routing capability is blocked").
  *
- * **Why a THIRD App, not a widened agent App or `runner-ops` reuse
- * (`@macf-science-agent[bot]`'s ruling on #1074, re-affirmed after checking
- * this exact question against the DR-035 `tools/macf-bootstrap` skill —
- * the working reference implementation for a fleet that actually routes).**
- * DR-044's own framing: the router acts on behalf of the FLEET, not of one
- * agent — and in the fleet's own control repo there is no agent whose
- * identity it could plausibly borrow. Reusing `runner-ops` is worse than it
- * looks: its ceiling is `administration: write` (repo deletion), and this
- * App's key is EXPORT-CLASS — it leaves the vault into repo secrets on
- * EVERY router-carrying repo (`apply-control-repo-init.ts::deriveRouterCarryingRepos`),
- * so reusing `runner-ops` would put repo-deletion capability behind every
- * repo secret in the fleet. So: a second (from this App's own perspective,
- * effectively a third alongside the per-agent Apps) minimal per-fleet App,
- * built the exact same SHAPE `apply-runner-ops.ts` already established for
- * the identical "narrow, export-class, one-purpose" problem — this module
- * intentionally mirrors that one's structure line-for-line where the
- * reasoning transfers.
+ * **Scope reversed by groundnuty/macf#1082 — SHARED across fleets is now the
+ * DEFAULT; per-fleet is a retained opt-in.** #1074's ruling built a dedicated
+ * App minted fresh for EVERY fleet, on the reasoning that per-fleet naming
+ * (globally unique by construction) dissolves the collision hazard the DR-035
+ * `tools/macf-bootstrap` skill's account-wide detect-or-reuse dance exists to
+ * dodge. That reasoning was sound about COLLISION but silent about COST: the
+ * operator's own framing (fleets are small by design, six-to-eight agents at
+ * most; a routing App is a FIXED overhead that never amortises at that scale)
+ * showed the per-fleet default spent one more App-creation click-pair per
+ * fleet, forever, for a capability a single read-only App already provides.
+ * `@macf-science-agent[bot]`'s reversal on #1082 names the exact error: two
+ * independent axes — PURPOSE (not an agent's App, not `runner-ops`) and
+ * INSTANCE COUNT (one per fleet vs. one per account) — were collapsed into a
+ * single "dedicated" reading. **Dedicated in purpose, shared in instance**
+ * satisfies both of #1074's original rejections and is what this module now
+ * builds by default, porting the DR-035 skill's detect-or-reuse mechanism
+ * (the reference implementation `apply-agent.ts::confirmBeforeCreateGuard`'s
+ * `fleet.lock`-keyed reuse story was never built to answer — see
+ * {@link resolveSharedRouterAppReuse}'s doc for the ported mechanism itself).
  *
- * **Dedicated PER-FLEET, not the account-wide SHARED App the manual
- * `tools/macf-bootstrap` skill / DR-035 workflow builds.** The skill
- * detects-and-reuses ONE `macf-routing` App across every fleet on an
- * account (`SKILL.md`: "SHARED (one per registry/account, NOT per
- * project): REUSE the existing one if present... App names are GLOBALLY
- * unique, so a duplicate `macf-routing` create silently *fails*"). That
- * detect-or-create dance exists SPECIFICALLY to dodge GitHub's global
- * App-name-uniqueness collision on a fixed name (`macf-routing`) reused
- * across many fleets. Per-fleet naming (`deriveAppHandle(fleetName,
- * ROUTER_APP_ROLE)` → `<fleet>-router`, globally unique BY CONSTRUCTION —
- * same guarantee every agent App and `runner-ops` already rely on)
- * dissolves that collision hazard entirely: there is no "does this already
- * exist under some other fleet" question to ask, because no two fleets ever
- * derive the same handle. The skill's reuse machinery therefore has no
- * analogue to build here — `apply-agent.ts::confirmBeforeCreateGuard`'s
- * EXISTING "read `fleet.lock` first, only create if this FLEET has never
- * minted one" guard is the correct (and only needed) reuse story, exactly
- * as it already is for every agent App and `runner-ops`.
+ * **The two scopes, both real, both tested:**
+ *   - **`'shared'` (default)** — one App per account, detected via the
+ *     vault first (operator-supplied credentials, Amendment C's pattern —
+ *     see {@link resolveSharedRouterAppReuse}) and via a live GitHub
+ *     name-presence check second; minted fresh only on the account's
+ *     first-ever fleet. Fixed handle ({@link SHARED_ROUTER_APP_HANDLE}),
+ *     never fleet-prefixed.
+ *   - **`'per-fleet'` (opt-in, `transport.router_app_scope: per-fleet` in
+ *     `fleet.yaml`)** — #1074's original mechanism, byte-identical: a fresh
+ *     App minted for THIS fleet alone, `deriveAppHandle(fleetName,
+ *     ROUTER_APP_ROLE)`, reused only via THIS fleet's own `fleet.lock`.
+ *     Retained for an operator who wants per-fleet blast-radius isolation
+ *     over the one extra click-pair it costs — a real choice someone else
+ *     may make differently, not preserved-for-compatibility ceremony.
+ *
+ * **The security trade that makes sharing acceptable — stated once, here,
+ * because it is the fact that justifies everything below.** This App's
+ * permission ceiling is `{actions_variables: read, metadata: read}` —
+ * read-only, over registry variables holding agent `host:port` entries and a
+ * CA certificate (public material; the CA *key* is never there). Sharing an
+ * App instance across fleets is acceptable ONLY when its ceiling is
+ * read-only over non-secret data like this — `runner-ops`
+ * (`administration: write`) and every agent App (`contents`/`issues` write,
+ * identity is the point) must NEVER be shared; this module's narrow
+ * permission set is what makes it the one exception.
+ *
+ * **The availability coupling this trade buys, recorded once here rather
+ * than discovered during an outage:** one App behind every fleet means a
+ * deletion or key rotation on GitHub breaks EVERY fleet's routing
+ * simultaneously, not just one. Per-fleet scope trades the click-pair back
+ * for isolation from exactly this failure mode — the retained opt-in above
+ * is how an operator who wants that trade gets it.
  *
  * **Permission derivation — read from what the router workflow actually
  * calls, per DR-044 Decision 3's binding contract for any NEW credential.**
@@ -88,6 +103,8 @@ import type { GitHubAppManifest } from './app-manifest.js';
 import { buildAppManifest } from './app-manifest.js';
 import type { ConfirmedInstall } from './identity-confirm.js';
 import type { AgentApplyOutcome, IdentityRequest } from './apply-agent.js';
+import type { Presence } from './plan.js';
+import { appSettingsAdvancedUrl } from './app-identity-removal.js';
 
 /**
  * The reserved `role` this App is derived + recorded under — never declared
@@ -140,9 +157,31 @@ export const ROUTER_APP_PERMISSIONS: Readonly<Record<string, string>> = {
  */
 export const ROUTER_APP_EVENTS: readonly string[] = [];
 
-/** `deriveAppHandle(fleetName, ROUTER_APP_ROLE)` — the ONLY place this App's handle is computed (mirrors `deriveRunnerOpsHandle`'s "handle derivation, never declaration" discipline; macf#791). */
-export function deriveRouterAppHandle(fleetName: string): string {
-  return deriveAppHandle(fleetName, ROUTER_APP_ROLE);
+/** `transport.router_app_scope`'s parsed shape (`fleet-manifest.ts::FleetTransportSchema`) — re-exported here so callers that only need the scope type don't have to import the whole manifest module. */
+export type RouterAppScope = 'shared' | 'per-fleet';
+
+/**
+ * The routing App's SHARED handle (groundnuty/macf#1082) — fixed, never
+ * fleet-prefixed, matching the DR-035 `tools/macf-bootstrap` skill's
+ * `macf-routing` name exactly. Deliberate interop: an operator who
+ * provisioned a fleet via the skill and one via `macf bootstrap apply`
+ * should find the SAME App on GitHub either way — a different constant here
+ * would silently fork the ecosystem into two "shared" Apps that don't share.
+ */
+export const SHARED_ROUTER_APP_HANDLE = 'macf-routing';
+
+/**
+ * The router App's handle for THIS run's scope (groundnuty/macf#1082).
+ * `'shared'` (default) is the fixed {@link SHARED_ROUTER_APP_HANDLE},
+ * unconditionally — `fleetName` is intentionally unused on that branch (a
+ * shared name cannot be fleet-derived; that is the entire point of
+ * "shared"). `'per-fleet'` is `deriveAppHandle(fleetName, ROUTER_APP_ROLE)`,
+ * BYTE-IDENTICAL to this function's pre-#1082 sole behavior — the ONLY place
+ * this App's per-fleet handle is computed (mirrors `deriveRunnerOpsHandle`'s
+ * "handle derivation, never declaration" discipline; macf#791).
+ */
+export function deriveRouterAppHandle(fleetName: string, scope: RouterAppScope): string {
+  return scope === 'per-fleet' ? deriveAppHandle(fleetName, ROUTER_APP_ROLE) : SHARED_ROUTER_APP_HANDLE;
 }
 
 /**
@@ -154,14 +193,23 @@ export function deriveRouterAppHandle(fleetName: string): string {
  * — an explicit `installRepos` override, since this App's correct install
  * target is the fleet's REGISTRY, not any agent's repo; see
  * `routerAppInstallRepos`/`IdentityRequest.installRepos`'s doc).
+ *
+ * `handleOverride` (groundnuty/macf#1082): `undefined` when omitted — every
+ * pre-#1082 caller (and the `'per-fleet'` scope) keeps `applyIdentity`'s own
+ * derived handle, byte-identical. Callers taking the `'shared'`-scope CREATE
+ * path (only reachable through {@link resolveSharedRouterAppReuse} returning
+ * `'create'`) pass {@link SHARED_ROUTER_APP_HANDLE} here so the App GitHub
+ * actually creates carries the fixed, cross-fleet-recognizable name, not a
+ * fleet-prefixed one.
  */
-export function routerAppIdentityRequest(installRepos: readonly string[], homepageUrl?: string): IdentityRequest {
+export function routerAppIdentityRequest(installRepos: readonly string[], homepageUrl?: string, handleOverride?: string): IdentityRequest {
   return {
     role: ROUTER_APP_ROLE,
     homepageUrl,
     permissions: ROUTER_APP_PERMISSIONS,
     events: ROUTER_APP_EVENTS,
     installRepos,
+    handleOverride,
   };
 }
 
@@ -170,15 +218,23 @@ export function routerAppIdentityRequest(installRepos: readonly string[], homepa
  * router App — reuses `app-manifest.ts::buildAppManifest`'s existing
  * parameterization, same as `apply-runner-ops.ts::buildRunnerOpsManifest`.
  * Used by `commands/bootstrap-apply.ts`'s dry-run "Apps that would be
- * created" render.
+ * created" render (today: NOT yet wired there — the router App is a known,
+ * separately-tracked dry-run preview gap, unrelated to #1082's scope
+ * reversal; see #1074's own closing comment).
+ *
+ * `scope` defaults to `'per-fleet'` (groundnuty/macf#1082) — BYTE-IDENTICAL
+ * to this function's pre-#1082 sole behavior for every existing caller.
+ * Passing `'shared'` submits {@link SHARED_ROUTER_APP_HANDLE} as `name`
+ * instead of the fleet-derived one.
  */
-export function buildRouterAppManifest(fleetName: string, redirectUrl: string, homepageUrl?: string): GitHubAppManifest {
+export function buildRouterAppManifest(fleetName: string, redirectUrl: string, homepageUrl?: string, scope: RouterAppScope = 'per-fleet'): GitHubAppManifest {
   return buildAppManifest({
     fleetName,
     role: ROUTER_APP_ROLE,
     redirectUrl,
     homepageUrl,
     permissions: ROUTER_APP_PERMISSIONS,
+    nameOverride: scope === 'shared' ? SHARED_ROUTER_APP_HANDLE : undefined,
     events: ROUTER_APP_EVENTS,
   });
 }
@@ -241,6 +297,117 @@ export function validateRouterAppInstall(install: ConfirmedInstall): string | un
   );
 }
 
+// --- Shared-scope reuse decision (groundnuty/macf#1082) ---
+//
+// The mode is INPUT-implied, not flag-selected: what the OPERATOR put in the
+// vault ahead of this run decides reuse-vs-create, mirroring
+// `apply-ca.ts::resolveCaCert`'s mint-or-reuse-or-refuse shape (three
+// outcomes, never throws, every failure degrades to the next-most-honest
+// state) and Amendment C's operator-provided-never-tool-minted contract.
+// Ported from the DR-035 `tools/macf-bootstrap` skill's detect-or-reuse
+// dance (module doc) — this is the code-driven analogue of `gh api
+// /apps/<slug>`-then-vault-lookup the skill runs by hand.
+
+/** The minimal deps {@link resolveSharedRouterAppReuse} needs — both optional, both "vault-aware / collision-aware confirm is NOT engaged this run" when omitted (the same opt-in contract every other vault-restore/collision-check seam in this codebase already establishes). */
+export interface SharedRouterAppReuseDeps {
+  /** Same contract as {@link RouterAppVaultRestoreDeps.readVaultRouterApp} — NEVER throws, NEVER logs. */
+  readonly readVaultRouterApp?: () => Promise<{ readonly appId: string; readonly appKeyPem: string } | undefined>;
+  /**
+   * Same SEAM `apply-agent.ts::AgentApplyDeps.checkAppNameCollision` wires
+   * to `app-presence.ts::resolveAppPresenceStatus` in production — reused
+   * here (via `apply-fleet.ts` passing the already-built `AgentApplyDeps`'s
+   * OWN `checkAppNameCollision` through unchanged), not re-implemented, so
+   * "does this App name already exist" has exactly one live answer in this
+   * codebase. `owner`'s type matches `AgentApplyDeps.checkAppNameCollision`'s
+   * exactly (`FleetManifest['owner']`, not a narrower structural type) so
+   * that reuse is a straight pass-through with no wrapper needed.
+   */
+  readonly checkAppNameCollision?: (owner: FleetManifest['owner'], appSlug: string) => Promise<Presence>;
+}
+
+/**
+ * The three-way decision {@link resolveSharedRouterAppReuse} returns — pure
+ * data, no I/O of its own (the caller's injected deps did the I/O). Mirrors
+ * `apply-ca.ts::CaResolveOutcome`'s three-state shape.
+ */
+export type SharedRouterAppReuseDecision =
+  /** The vault already carries this App's id/key — publish those values, mint NOTHING. `appId` is non-secret (safe to log); the key stays inside the vault-restore closure, never threaded through this decision. */
+  | { readonly kind: 'reuse'; readonly appId: string }
+  /** No vault credentials, but the shared name is confirmably taken on GitHub — refuse with an instruction, never a silent failure and never a guessed create. */
+  | { readonly kind: 'name-taken'; readonly reason: string }
+  /** No vault credentials, name confirmed free (or unconfirmable — see doc) — proceed to the normal create ceremony. */
+  | { readonly kind: 'create' };
+
+/**
+ * The router App's SHARED-scope instruction text (groundnuty/macf#1082) —
+ * pure text builder, exported so tests assert against it directly without
+ * re-deriving the wording (mirrors `app-presence.ts::appNameCollisionRefusalMessage`'s
+ * precedent, which this message deliberately does NOT reuse verbatim: that
+ * generic message's two remedies — delete the App, or re-run with
+ * --vault/--identity-key — omit the router App's genuine THIRD option, minting
+ * an isolated per-fleet App instead of fighting over the shared name).
+ *
+ * Names two explicit operator next steps, neither of them something this run
+ * does automatically — "never mint a key the operator did not ask for" rules
+ * out a silent fallback to per-fleet scope within the same run.
+ */
+export function routerAppNameCollisionMessage(appSlug: string, settingsUrl: string): string {
+  return (
+    `App "${appSlug}" already exists but is not in this fleet's vault, so its ownership cannot be proven and its ` +
+    `private key cannot be recovered (GitHub has no API for that — regeneration is GUI-only; see ${settingsUrl}). ` +
+    'Either put its id/key into this fleet\'s vault as MACF_ROUTING_APP_ID/MACF_ROUTING_APP_KEY_B64 and re-run ' +
+    'with --vault/--identity-key so apply can reuse it, or set transport.router_app_scope: per-fleet in fleet.yaml ' +
+    'so apply mints a dedicated App for this fleet alone instead of contending for the shared name.'
+  );
+}
+
+/**
+ * Decide reuse-vs-name-taken-vs-create for the SHARED router-App scope
+ * (groundnuty/macf#1082) — called BEFORE `applyIdentity` is ever reached, so
+ * a `'reuse'` decision means the mint/manifest-flow seam is invoked ZERO
+ * times this run (the decisive property the vault-reuse path exists for).
+ * NEVER throws — both injected deps degrade to the next state on failure,
+ * same posture as every other vault-restore/collision-check closure here.
+ *
+ * Order matters: vault FIRST (an operator who already supplied credentials
+ * should never pay for a network round-trip to confirm what they already
+ * told us), name-collision SECOND (only spent when there is genuinely a
+ * decision left to make).
+ */
+export async function resolveSharedRouterAppReuse(
+  owner: FleetManifest['owner'],
+  handle: string,
+  deps: SharedRouterAppReuseDeps,
+): Promise<SharedRouterAppReuseDecision> {
+  if (deps.readVaultRouterApp !== undefined) {
+    let restored: { readonly appId: string; readonly appKeyPem: string } | undefined;
+    try {
+      restored = await deps.readVaultRouterApp();
+    } catch {
+      restored = undefined;
+    }
+    if (restored !== undefined) {
+      return { kind: 'reuse', appId: restored.appId };
+    }
+  }
+
+  if (deps.checkAppNameCollision !== undefined) {
+    let collision: Presence;
+    try {
+      collision = await deps.checkAppNameCollision(owner, handle);
+    } catch {
+      // Fail-open, same posture every honest-unknown read in this package
+      // takes — a throwing dep is inconclusive, never a refusal.
+      collision = 'unknown';
+    }
+    if (collision === 'present') {
+      return { kind: 'name-taken', reason: routerAppNameCollisionMessage(handle, appSettingsAdvancedUrl(owner, handle)) };
+    }
+  }
+
+  return { kind: 'create' };
+}
+
 // --- Publish-time resolution (groundnuty/macf#1074) ---
 //
 // Mirrors `apply-routing-client.ts`'s mint/vault-restore split for the
@@ -277,10 +444,32 @@ export type RouterAppSecretsForPublish =
   | { readonly status: 'unavailable'; readonly reason: string };
 
 /**
+ * The router App's identity outcome for THIS run — widens
+ * {@link AgentApplyOutcome} with the ONE status that ceremony can never
+ * produce (groundnuty/macf#1082): `'vault-reused'`, when
+ * {@link resolveSharedRouterAppReuse} resolved `'reuse'` and the whole
+ * `applyIdentity` ceremony was skipped outright (zero App-creation
+ * attempts). Deliberately NOT folded into {@link AgentApplyOutcome} itself —
+ * that union is shared by every agent + `runner-ops`, none of which have a
+ * cross-fleet vault-reuse concept; widening it there would force every
+ * OTHER exhaustive switch over `AgentApplyOutcome` in this codebase to
+ * handle a status it can never actually see. `FleetApplyResult.routerApp`
+ * is this type specifically, not `AgentApplyOutcome` — see `apply-fleet.ts`.
+ *
+ * No `installId` field, unlike `'reused'`/`'resumed-install'` — a
+ * vault-reused App was never live-reconfirmed via GitHub this run, so there
+ * is no confirmed install to record. `apply-fleet.ts` deliberately does NOT
+ * write a `fleet.lock` entry for this status (see that module's call site) —
+ * the vault, not the lock, is this scope's source of truth for reuse.
+ */
+export type RouterAppApplyOutcome = AgentApplyOutcome | { readonly role: string; readonly status: 'vault-reused'; readonly appId: string };
+
+/**
  * Resolve the router App's id/key for THIS run's publish attempt from
- * `identity` (this run's `AgentApplyOutcome` for role `router`) — never
- * calls a mint/create seam (there is none here; App creation is
- * `applyIdentity`'s job, already run before this).
+ * `identity` (this run's {@link RouterAppApplyOutcome} for role `router`) —
+ * never calls a mint/create seam (there is none here; App creation is
+ * `applyIdentity`'s job, already run before this, or skipped entirely on
+ * the `'vault-reused'` path).
  *
  * - `'created'` THIS run: the credential is in process memory
  *   (`identity.credentials.pem`) — available UNLESS `vaultWritten` is
@@ -292,15 +481,20 @@ export type RouterAppSecretsForPublish =
  *   never recorded in `fleet.lock` (the recovery artifact softens but does
  *   not eliminate this — see `apply-agent.ts`'s "gate-1→gate-2 window" doc
  *   for why the SAME discipline applies there too).
- * - `'reused'`/`'resumed-install'`: no PEM in process memory — tries
- *   `deps.readVaultRouterApp` (wired only when both `--vault`/
- *   `--identity-key` were supplied); degrades to `'unavailable'` with an
- *   honest reason otherwise.
+ * - `'reused'`/`'resumed-install'`/`'vault-reused'` (groundnuty/macf#1082):
+ *   no PEM in process memory — tries `deps.readVaultRouterApp` (wired only
+ *   when both `--vault`/`--identity-key` were supplied); degrades to
+ *   `'unavailable'` with an honest reason otherwise. `'vault-reused'` took
+ *   the SAME vault read once already, in {@link resolveSharedRouterAppReuse}
+ *   — re-reading it here (rather than threading the key through
+ *   `FleetApplyResult`) keeps the private-key material out of the
+ *   render-facing outcome type, the same posture `apply-ca.ts::resolveCaCert`
+ *   already establishes for the CA key.
  * - `'skipped-unverified'`/`'drift'`/`'failed'`: unresolved this run —
  *   `'unavailable'`, carrying the identity outcome's own reason.
  */
 export async function resolveRouterAppSecretsForPublish(
-  identity: AgentApplyOutcome,
+  identity: RouterAppApplyOutcome,
   vaultWritten: boolean,
   deps: RouterAppVaultRestoreDeps,
 ): Promise<RouterAppSecretsForPublish> {
@@ -316,7 +510,7 @@ export async function resolveRouterAppSecretsForPublish(
     }
     return { status: 'available', appId: identity.appId, appKeyPem: identity.credentials.pem };
   }
-  if (identity.status === 'reused' || identity.status === 'resumed-install') {
+  if (identity.status === 'reused' || identity.status === 'resumed-install' || identity.status === 'vault-reused') {
     if (deps.readVaultRouterApp !== undefined) {
       let restored: { readonly appId: string; readonly appKeyPem: string } | undefined;
       try {

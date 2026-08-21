@@ -73,6 +73,18 @@ export interface BuildAppManifestOptions {
    * never coordinates. Every ordinary agent App omits this.
    */
   readonly events?: readonly string[];
+  /**
+   * Override the derived `name` (groundnuty/macf#1082) — the ONLY caller
+   * that supplies this is the router App's SHARED-scope path
+   * (`apply-router-app.ts::routerAppIdentityRequest`), whose whole point is
+   * a name that is NOT fleet-prefixed (`deriveAppHandle` always prepends
+   * `fleetName`, which can never produce the fixed, cross-fleet-recognizable
+   * `SHARED_ROUTER_APP_HANDLE`). `undefined` (every other caller — every
+   * ordinary agent App, runner-ops, and the router App's own PER-FLEET
+   * scope) keeps the derived `deriveAppHandle(fleetName, role)` name,
+   * byte-identical to before this field existed.
+   */
+  readonly nameOverride?: string;
 }
 
 /**
@@ -80,11 +92,13 @@ export interface BuildAppManifestOptions {
  * randomness — so the exact document that will be submitted is renderable by
  * `apply --dry-run` before any consent gate is opened.
  *
- * The App `name` is `deriveAppHandle(fleetName, role)` (`<fleet>-<role>`), the
- * single derivation point for handles (macf#791 double-prefix trap). Webhooks
- * are created INACTIVE: MACF routing is pull/dispatch-based via the router
- * workflow, not an inbound webhook receiver, so an active hook would point at a
- * placeholder URL and generate delivery failures.
+ * The App `name` is `opts.nameOverride ?? deriveAppHandle(fleetName, role)` —
+ * `deriveAppHandle` is still the single derivation point for every FLEET-
+ * SCOPED handle (macf#791 double-prefix trap); `nameOverride` exists only for
+ * an identity whose name must NOT be fleet-scoped (see that field's doc).
+ * Webhooks are created INACTIVE: MACF routing is pull/dispatch-based via the
+ * router workflow, not an inbound webhook receiver, so an active hook would
+ * point at a placeholder URL and generate delivery failures.
  */
 export function buildAppManifest(opts: BuildAppManifestOptions): GitHubAppManifest {
   const permissions: Record<string, string> = {};
@@ -96,7 +110,7 @@ export function buildAppManifest(opts: BuildAppManifestOptions): GitHubAppManife
     }
   }
   return {
-    name: deriveAppHandle(opts.fleetName, opts.role),
+    name: opts.nameOverride ?? deriveAppHandle(opts.fleetName, opts.role),
     url: opts.homepageUrl ?? 'https://github.com/groundnuty/macf',
     hook_attributes: { url: 'https://example.com/webhook', active: false },
     redirect_url: opts.redirectUrl,
