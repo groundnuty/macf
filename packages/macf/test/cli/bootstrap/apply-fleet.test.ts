@@ -1161,6 +1161,8 @@ trust:
         agentRepoDeps: agentRepoDepsFor(),
         trustDeps: trustDepsFor(),
         routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
+        routingSecretsDeps: NOOP_ROUTING_SECRETS_DEPS,
+        routerAppVaultDeps: NOOP_ROUTER_APP_VAULT_DEPS,
         controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
         // macf#988 — this test reaches `status: 'created'` with NO
         // `recoveryRootDir` override would default to the REAL operator's
@@ -1414,6 +1416,8 @@ trust:
       agentRepoDeps,
       trustDeps,
       routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
+      routingSecretsDeps: NOOP_ROUTING_SECRETS_DEPS,
+      routerAppVaultDeps: NOOP_ROUTER_APP_VAULT_DEPS,
       controlRepoOptions: { makeScratchDir: () => join(manifestPath, '..') },
       // macf#988 — see the "REAL age binary" test's identical comment above.
       recoveryRootDir: join(manifestPath, '..'),
@@ -1865,6 +1869,8 @@ trust:
       agentRepoDeps: agentRepoDepsFor(),
       trustDeps: trustDepsFor(),
       routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
+      routingSecretsDeps: NOOP_ROUTING_SECRETS_DEPS,
+      routerAppVaultDeps: NOOP_ROUTER_APP_VAULT_DEPS,
       controlRepoOptions: { makeScratchDir: () => controlDir },
       // macf#988 — defense-in-depth (this test's empty `age_recipients: []`
       // fixture means no recovery write is actually reachable here, but see
@@ -2891,11 +2897,14 @@ trust:
         { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
         { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
         { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-runner-ops' },
+        // groundnuty/macf#1074 — the router App gets the SAME REUSED
+        // treatment as runner-ops immediately above.
+        { role: 'router', app_id: 'app-router', install_id: 'install-router' },
       ],
       fingerprints: { ca_key: 'sha256:deadbeef', routing_client_key: 'sha256:cafef00d' },
     };
 
-    /** Every agent (both roles + runner-ops) takes the REUSED path — dispatch by appId, same technique as the "reused / resumed-install" test above. */
+    /** Every agent (both roles + runner-ops + router) takes the REUSED path — dispatch by appId, same technique as the "reused / resumed-install" test above. */
     function reusedAgentDeps(): AgentApplyDeps {
       return {
         startManifestFlow: async () => { throw new Error('must not be called — every role has a prior lock entry'); },
@@ -2903,7 +2912,8 @@ trust:
         exchangeManifestCode: async () => { throw new Error('must not be called'); },
         resolveKeyPath: () => '/fake.pem',
         confirmAppInstallation: async (appId) => {
-          const installId = appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : 'install-runner-ops';
+          const installId =
+            appId === 'app-code-agent' ? 'install-1' : appId === 'app-science-agent' ? 'install-2' : appId === 'app-runner-ops' ? 'install-runner-ops' : 'install-router';
           return { status: 'confirmed', install: { appId, installId, appSlug: `demo-fleet-${appId}`, accountLogin: 'groundnuty' } };
         },
         waitForAppInstallation: async () => { throw new Error('must not be called'); },
@@ -2937,12 +2947,20 @@ trust:
         },
         routingSecretsDeps: routingSecretsDepsFor({
           // code-agent's repo already has it (from the ORIGINAL apply run);
-          // science-agent's repo is the one just added — missing it.
+          // science-agent's repo is the one just added — missing it. This
+          // test's FOCUS is ROUTING_CLIENT_CERT/KEY specifically, so the
+          // router App's OWN two secrets are kept out of the way via
+          // `routerAppVaultDeps` below (vault-restored, always available)
+          // rather than via this presence stub.
           checkRepoSecretPresence: async (repo) => (repo === 'groundnuty/demo-code' ? 'present' : 'absent'),
           setRepoSecret: async (repo, name, value) => {
             setSecretCalls.push({ repo, name, value });
           },
         }),
+        // groundnuty/macf#1074 — the router App is REUSED (PRIOR_LOCK_TWO_AGENTS
+        // has a `router` entry); its MACF_ROUTING_APP_ID/KEY publish must not
+        // contaminate THIS test's routing-CLIENT-focused assertions below.
+        routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '997', appKeyPem: 'ROUTER-APP-VAULT-PEM' }) },
       };
 
       const result = await applyFleet(manifest, manifestPath, PRIOR_LOCK_TWO_AGENTS, deps);
@@ -3035,6 +3053,9 @@ trust:
         agents: [
           { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
           { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-runner-ops' },
+          // groundnuty/macf#1074 — the router App gets the SAME REUSED
+          // treatment as runner-ops immediately above.
+          { role: 'router', app_id: 'app-router', install_id: 'install-router' },
         ],
         fingerprints: { routing_client_key: 'sha256:cafef00d' },
       };
@@ -4051,6 +4072,8 @@ trust:
           agentRepoDeps: agentRepoDepsFor(),
           trustDeps: reuseTrustDeps(), // CA already minted in step 1 -> reused here, keeps the vault diff isolated to the agents
           routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
+          routingSecretsDeps: NOOP_ROUTING_SECRETS_DEPS,
+          routerAppVaultDeps: NOOP_ROUTER_APP_VAULT_DEPS,
           controlRepoOptions: { makeScratchDir: () => dir }, // SAME checkout dir as step 1
           now: () => new Date('2026-08-11T00:00:00.000Z'),
           log: () => {},
