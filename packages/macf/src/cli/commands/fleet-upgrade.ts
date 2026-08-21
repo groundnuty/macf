@@ -354,9 +354,13 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
     case 'branch-skip':
       // The FIRST pre-flight gate (macf#755): nothing was touched — the
       // workspace isn't on its canonical branch (or is detached/unresolvable).
+      // `workspace` names the on-disk location actually inspected, so a
+      // misattributed resolution (routing-label collision across fleets) is
+      // visible right here rather than requiring separate investigation.
       log(
         `   ${ev.agent}: BRANCH — OBJECTING (on ${ev.current ?? 'detached HEAD'}, expected ` +
-        `${ev.canonical}; no upgrade/restart run; switch branch or --force)`,
+        `${ev.canonical}; workspace: ${ev.workspace ?? 'UNRESOLVED'}; no upgrade/restart run; ` +
+        `switch branch or --force)`,
       );
       break;
     case 'config-auto-resolved':

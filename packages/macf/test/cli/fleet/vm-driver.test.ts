@@ -25,6 +25,8 @@ import {
   resolveTarget,
   childEnvForTarget,
   ORCHESTRATOR_IDENTITY_ENV_KEYS,
+  WORKSPACE_INSPECTION_FAILED,
+  WORKSPACE_UNRESOLVED,
   type VmDriverOptions,
   type VmDriverSeams,
   type WorkspaceIdentity,
@@ -162,7 +164,7 @@ function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder
   return { seams, rec };
 }
 
-const OPTS = { workspaceDir: '/w/macf', busyWindowMs: 1500 };
+const OPTS = { workspaceDir: '/w/macf', project: 'macf', busyWindowMs: 1500 };
 
 // --- resolveTarget ----------------------------------------------------------
 
@@ -195,6 +197,57 @@ describe('resolveTarget', () => {
   it('yields a null session when the workspace config has no project', () => {
     const { seams } = fakeSeams({ config: () => ({ routingLabel: 'code-agent' }) });
     expect(resolveTarget(seams, 'code-agent')).toEqual({ workspace: '/w/macf', session: null });
+  });
+});
+
+// --- resolveTarget project-scoping (macf#1101) -------------------------------
+//
+// Routing labels are NOT globally unique across fleets — two different
+// projects can each name their implementer "code-agent". These pin the
+// scoping fix directly against that collision shape, independent of any
+// `createVmDriver`-level gate behavior (that's the decisive-pair suite
+// further below).
+
+describe('resolveTarget — scopeProject (macf#1101)', () => {
+  const ORCH_OWN = {
+    agent: 'code-agent',
+    workspace: '/w/orchestrator-own-macf',
+    registry: 'groundnuty',
+    project: 'macf',
+    versionPin: '0.2.41',
+  };
+  const TARGET_FLEET = {
+    agent: 'code-agent',
+    workspace: '/w/macf-experiment',
+    registry: 'groundnuty',
+    project: 'macf-experiment',
+    versionPin: '0.2.56',
+  };
+
+  it('matches ONLY the record whose project equals scopeProject, regardless of discovery order', () => {
+    const { seams } = fakeSeams({ workspaces: [ORCH_OWN, TARGET_FLEET] });
+    expect(resolveTarget(seams, 'code-agent', 'macf-experiment')?.workspace).toBe('/w/macf-experiment');
+    expect(resolveTarget(seams, 'code-agent', 'macf')?.workspace).toBe('/w/orchestrator-own-macf');
+  });
+
+  it('order-independence: the SAME scoped result whichever record sorts first', () => {
+    const { seams: firstOrch } = fakeSeams({ workspaces: [ORCH_OWN, TARGET_FLEET] });
+    const { seams: firstTarget } = fakeSeams({ workspaces: [TARGET_FLEET, ORCH_OWN] });
+    expect(resolveTarget(firstOrch, 'code-agent', 'macf-experiment')?.workspace).toBe('/w/macf-experiment');
+    expect(resolveTarget(firstTarget, 'code-agent', 'macf-experiment')?.workspace).toBe('/w/macf-experiment');
+  });
+
+  it('returns null when the routing label exists ONLY under a DIFFERENT project — never falls back cross-project', () => {
+    const { seams } = fakeSeams({ workspaces: [ORCH_OWN] });
+    expect(resolveTarget(seams, 'code-agent', 'macf-experiment')).toBeNull();
+  });
+
+  it('omitting scopeProject preserves the OLD unscoped first-match behavior (documents the pre-fix hazard shape)', () => {
+    const { seams } = fakeSeams({ workspaces: [ORCH_OWN, TARGET_FLEET] });
+    // No 3rd arg — this is the shape `resolveTarget`'s OWN low-level callers
+    // (and its pre-#1101 unit tests) use; `createVmDriver` never calls it
+    // this way once bound to a project (see the decisive-pair suite below).
+    expect(resolveTarget(seams, 'code-agent')?.workspace).toBe('/w/orchestrator-own-macf');
   });
 });
 
@@ -369,9 +422,9 @@ describe('isConfigDirty', () => {
     expect(await createVmDriver(OPTS, seams).isConfigDirty('code-agent')).toBe(false);
   });
 
-  it('is clean (false) when the agent is unknown — nothing to check', async () => {
+  it('fails CLOSED (dirty) when the agent is unknown — "could not verify" must never read as "clean" (macf#1101)', async () => {
     const { seams } = fakeSeams({ configDirtyWorkspaces: new Set(['/w/macf']) });
-    expect(await createVmDriver(OPTS, seams).isConfigDirty('ghost')).toBe(false);
+    expect(await createVmDriver(OPTS, seams).isConfigDirty('ghost')).toBe(true);
   });
 
   it('checks the RESOLVED agent workspace, not the driver`s own workspace', async () => {
@@ -397,9 +450,9 @@ describe('listDirtyConfig', () => {
     expect(await createVmDriver(OPTS, seams).listDirtyConfig('code-agent')).toEqual([]);
   });
 
-  it('returns an empty list when the agent is unknown — nothing to check', async () => {
+  it('returns the WORKSPACE_UNRESOLVED sentinel when the agent is unknown — never an empty (= clean) list (macf#1101)', async () => {
     const { seams } = fakeSeams({ dirtyConfigFiles: new Map([['/w/macf', ['CLAUDE.md']]]) });
-    expect(await createVmDriver(OPTS, seams).listDirtyConfig('ghost')).toEqual([]);
+    expect(await createVmDriver(OPTS, seams).listDirtyConfig('ghost')).toEqual([WORKSPACE_UNRESOLVED]);
   });
 
   it('checks the RESOLVED agent workspace, not the driver`s own workspace', async () => {
@@ -512,6 +565,171 @@ describe('canonicalBranch', () => {
   });
 });
 
+// --- createVmDriver — cross-project routing-label collision, decisive pair --
+// (macf#1101)
+//
+// Reproduces the reported incident directly at the `createVmDriver` level:
+// TWO projects each name their implementer "code-agent" — the orchestrator's
+// OWN workspace (project 'macf') and the TARGET fleet being rolled (project
+// 'macf-experiment'). The driver under test is bound to the TARGET fleet,
+// exactly as `createVmDriverFromConfig` binds it in production.
+//
+// Per assert-the-wrong-path.md: a test that only checks ONE direction passes
+// against the broken (unscoped) implementation whenever the fixture happens
+// to put the right record first in `discover()`'s output. Both directions
+// below use the SAME discovery order (orchestrator's own record first) —
+// the pre-fix `resolveTarget` would return the ORCHESTRATOR's workspace for
+// BOTH tests, so the first test would wrongly see the orchestrator's dirty
+// files (blocking a roll that should proceed) and the second would wrongly
+// see the orchestrator's CLEAN state (silently passing a roll that should
+// block on the target's real dirt) — exactly the false-block/false-pass
+// pair reported in the issue.
+describe('createVmDriver — cross-project routing-label collision, decisive pair (macf#1101)', () => {
+  const ORCH_OWN_WORKSPACE = '/w/orchestrator-own-macf';
+  const TARGET_WORKSPACE = '/w/macf-experiment';
+  const orchOwnRecord: WorkspaceRecord = {
+    agent: 'code-agent',
+    workspace: ORCH_OWN_WORKSPACE,
+    registry: 'groundnuty',
+    project: 'macf',
+    versionPin: '0.2.41',
+  };
+  const targetRecord: WorkspaceRecord = {
+    agent: 'code-agent',
+    workspace: TARGET_WORKSPACE,
+    registry: 'groundnuty',
+    project: 'macf-experiment',
+    versionPin: '0.2.56',
+  };
+
+  // --- config-dirty gate direction 1: orchestrator dirty, target clean → ROLLS
+  it('orchestrator-own workspace DIRTY + target workspace CLEAN → the target-bound driver reports CLEAN (no false-block)', async () => {
+    const { seams } = fakeSeams({
+      workspaces: [orchOwnRecord, targetRecord], // orchestrator's own sorts FIRST
+      configDirtyWorkspaces: new Set([ORCH_OWN_WORKSPACE]),
+      dirtyConfigFiles: new Map([
+        [ORCH_OWN_WORKSPACE, ['CLAUDE.md', '.claude/scripts/check-gh-token.sh']],
+      ]),
+    });
+    const driver = createVmDriver({ workspaceDir: TARGET_WORKSPACE, project: 'macf-experiment' }, seams);
+    expect(await driver.listDirtyConfig('code-agent')).toEqual([]);
+    expect(await driver.isConfigDirty('code-agent')).toBe(false);
+  });
+
+  // --- config-dirty gate direction 2: orchestrator clean, target dirty → BLOCKS on the TARGET's own files
+  it('orchestrator-own workspace CLEAN + target workspace DIRTY → the target-bound driver reports the TARGET`s own files (no false-pass)', async () => {
+    const { seams } = fakeSeams({
+      workspaces: [orchOwnRecord, targetRecord],
+      configDirtyWorkspaces: new Set([TARGET_WORKSPACE]),
+      dirtyConfigFiles: new Map([
+        [TARGET_WORKSPACE, ['.claude/rules/pr-discipline.md', '.claude/settings.json']],
+      ]),
+    });
+    const driver = createVmDriver({ workspaceDir: TARGET_WORKSPACE, project: 'macf-experiment' }, seams);
+    expect(await driver.listDirtyConfig('code-agent')).toEqual([
+      '.claude/rules/pr-discipline.md',
+      '.claude/settings.json',
+    ]);
+    expect(await driver.isConfigDirty('code-agent')).toBe(true);
+  });
+
+  // --- branch gate direction 1: orchestrator on a foreign branch, target canonical → ROLLS
+  it('orchestrator-own workspace on a FOREIGN branch + target on canonical → the target-bound driver reports the TARGET`s branch', async () => {
+    const { seams } = fakeSeams({
+      workspaces: [orchOwnRecord, targetRecord],
+      branches: new Map([
+        [ORCH_OWN_WORKSPACE, 'fix/check-gh-token-v3-widen'],
+        [TARGET_WORKSPACE, 'main'],
+      ]),
+    });
+    const driver = createVmDriver({ workspaceDir: TARGET_WORKSPACE, project: 'macf-experiment' }, seams);
+    expect(await driver.currentBranch('code-agent')).toBe('main');
+  });
+
+  // --- branch gate direction 2: orchestrator on main, target on a foreign branch → BLOCKS on the TARGET's own branch
+  it('orchestrator-own workspace on main + target on a FOREIGN branch → the target-bound driver reports the TARGET`s foreign branch', async () => {
+    const { seams } = fakeSeams({
+      workspaces: [orchOwnRecord, targetRecord],
+      branches: new Map([
+        [ORCH_OWN_WORKSPACE, 'main'],
+        [TARGET_WORKSPACE, 'feat/exp-writing-agent-wip'],
+      ]),
+    });
+    const driver = createVmDriver({ workspaceDir: TARGET_WORKSPACE, project: 'macf-experiment' }, seams);
+    expect(await driver.currentBranch('code-agent')).toBe('feat/exp-writing-agent-wip');
+  });
+
+  it('resolveWorkspace names the TARGET`s own path, never the orchestrator`s, regardless of discovery order', async () => {
+    const { seams } = fakeSeams({ workspaces: [orchOwnRecord, targetRecord] });
+    const driver = createVmDriver({ workspaceDir: TARGET_WORKSPACE, project: 'macf-experiment' }, seams);
+    expect(await driver.resolveWorkspace?.('code-agent')).toBe(TARGET_WORKSPACE);
+  });
+
+  it('resolveWorkspace returns null when the routing label has no record under the bound project', async () => {
+    const { seams } = fakeSeams({ workspaces: [orchOwnRecord] });
+    const driver = createVmDriver({ workspaceDir: TARGET_WORKSPACE, project: 'macf-experiment' }, seams);
+    expect(await driver.resolveWorkspace?.('code-agent')).toBeNull();
+  });
+
+  // THE BLOCKER CASE (macf#1101): the project-scoping fix means a
+  // same-routing-label-different-project record no longer silently
+  // substitutes — `resolveTarget` now correctly returns null. That is only
+  // a real fix if the GATE `rollFleet` actually calls (`classifyDirtyConfig`)
+  // treats null as "object", not as its pre-fix "nothing dirty" default. If
+  // this test used the pre-#1101 `classifyDirtyConfig` body (`!target →
+  // {[],[]}`), it would PASS even against code that still silently lets an
+  // unresolvable target roll clean — proving nothing about the fix. The
+  // assertion below is the one that actually distinguishes them.
+  it('classifyDirtyConfig OBJECTS (never silently clean) when NO record exists under the bound project at all', async () => {
+    const { seams } = fakeSeams({ workspaces: [orchOwnRecord] }); // no macf-experiment record present
+    const driver = createVmDriver({ workspaceDir: TARGET_WORKSPACE, project: 'macf-experiment' }, seams);
+    const result = await driver.classifyDirtyConfig('code-agent');
+    expect(result.genuineDelta.length).toBeGreaterThan(0);
+    expect(result).toEqual({ alreadyCanonical: [], genuineDelta: [WORKSPACE_UNRESOLVED] });
+  });
+});
+
+// --- createVmExecSeams — discover() scan-root binding (macf#1101) -----------
+//
+// The residual caller-cwd-dependence: `discoverWorkspaces()` (no `cwd`)
+// derives its scan roots from `process.cwd()` at CALL time — the
+// ORCHESTRATOR's cwd, not this driver's own bound workspace. Real fs, real
+// `discoverWorkspaces` (no fake seam) — proves `createVmExecSeams(dir)`
+// anchors discovery to `dir`'s OWN ancestor tree.
+
+describe('createVmExecSeams — discover() scan-root binding (macf#1101)', () => {
+  it('finds a workspace under the BOUND workspaceDir`s own tree — independent of the test-runner`s ambient cwd', () => {
+    const priorRoot = process.env['MACF_WORKSPACE_ROOT'];
+    delete process.env['MACF_WORKSPACE_ROOT']; // isolate from any CI-configured root
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'macf-vmdriver-discover-root-'));
+    const repoDir = join(tmpRoot, 'someowner', 'somerepo');
+    mkdirSync(join(repoDir, '.macf'), { recursive: true });
+    writeFileSync(
+      join(repoDir, '.macf', 'macf-agent.json'),
+      JSON.stringify({
+        project: 'macf-discover-root-probe',
+        agent_name: 'probe-agent',
+        agent_role: 'code-agent',
+        agent_type: 'permanent',
+        registry: { type: 'repo', owner: 'o', repo: 'r' },
+      }),
+    );
+    try {
+      // NOT under the test-runner's own cwd (the monorepo checkout) or
+      // $HOME/repos — the only way `discover()` can find this record at all
+      // is by anchoring its scan root to `repoDir` itself, exactly what
+      // `discover: () => discoverWorkspaces({ cwd: workspaceDir })` does.
+      const seams = createVmExecSeams(repoDir);
+      const found = seams.discover().find((r) => r.project === 'macf-discover-root-probe');
+      expect(found?.agent).toBe('probe-agent');
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+      if (priorRoot === undefined) delete process.env['MACF_WORKSPACE_ROOT'];
+      else process.env['MACF_WORKSPACE_ROOT'] = priorRoot;
+    }
+  });
+});
+
 // --- classifyDirtyConfig / autoResolveCanonical (DR-040 Decision 3, macf#698 R1) ---
 //
 // Dispatch-level coverage with FAKE seams (no real fs) — the TRUE positive
@@ -524,10 +742,10 @@ describe('canonicalBranch', () => {
 // seam (or no-ops on an unknown agent / empty file list).
 
 describe('classifyDirtyConfig', () => {
-  it('returns both tiers empty when the agent is unknown — never calls readFullConfig', async () => {
+  it('OBJECTS with the WORKSPACE_UNRESOLVED sentinel when the agent is unknown — never a silent "nothing dirty" (macf#1101)', async () => {
     const { seams } = fakeSeams({ dirtyConfigFiles: new Map([['/w/macf', ['CLAUDE.md']]]) });
     const result = await createVmDriver(OPTS, seams).classifyDirtyConfig('ghost');
-    expect(result).toEqual({ alreadyCanonical: [], genuineDelta: [] });
+    expect(result).toEqual({ alreadyCanonical: [], genuineDelta: [WORKSPACE_UNRESOLVED] });
   });
 
   it('returns both tiers empty when nothing is dirty', async () => {
@@ -1118,6 +1336,31 @@ describe('createVmExecSeams — real git (macf#698, DR-040 Decision 6)', () => {
     expect(seams.isConfigDirty(repo)).toBe(false);
     expect(seams.listDirtyConfig(repo)).toEqual([]);
   });
+
+  // --- inspection-failure fail-CLOSED (macf#1101) ---------------------------
+  //
+  // `git status` itself failing (missing dir, not a git repo, permission
+  // error) must NOT read as "clean" — that is the false-pass half of the
+  // reported hazard, distinct from the routing-label-collision half covered
+  // by the decisive-pair suite above. A directory that plainly is not a git
+  // repository reproduces the failure without needing to break `git` itself.
+  it('a workspace that is not a git repository fails CLOSED (dirty), never silently clean', () => {
+    const notARepo = mkdtempSync(join(tmpdir(), 'macf-vmdriver-notarepo-'));
+    try {
+      const seams = createVmExecSeams(notARepo);
+      expect(seams.isConfigDirty(notARepo)).toBe(true);
+      expect(seams.listDirtyConfig(notARepo)).toEqual([WORKSPACE_INSPECTION_FAILED]);
+    } finally {
+      rmSync(notARepo, { recursive: true, force: true });
+    }
+  });
+
+  it('a workspace directory that does not exist on disk fails CLOSED (dirty), never silently clean', () => {
+    const missing = join(tmpdir(), 'macf-vmdriver-does-not-exist-' + Date.now().toString());
+    const seams = createVmExecSeams(missing);
+    expect(seams.isConfigDirty(missing)).toBe(true);
+    expect(seams.listDirtyConfig(missing)).toEqual([WORKSPACE_INSPECTION_FAILED]);
+  });
 });
 
 // --- createVmExecSeams.currentBranch — real git (macf#755) ------------------
@@ -1268,7 +1511,7 @@ describe('createVmDriver — classifyDirtyConfig / autoResolveCanonical, real gi
         { agent: 'code-agent', workspace: repoDir, registry: 'macf', project: 'macf', versionPin: null },
       ],
     };
-    return createVmDriver({ workspaceDir: repoDir }, seams);
+    return createVmDriver({ workspaceDir: repoDir, project: 'macf' }, seams);
   }
 
   it('a dirty rule file whose content EQUALS the real canonical coordination.md → classified already-canonical', async () => {

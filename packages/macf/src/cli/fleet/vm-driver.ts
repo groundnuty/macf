@@ -60,6 +60,38 @@ import {
 /** Default `capture-pane` content-diff window for the busy gate (ms). */
 export const DEFAULT_BUSY_WINDOW_MS = 2000;
 
+/**
+ * Sentinel `listDirtyConfig` entry (macf#1101) for an INSPECTION failure —
+ * `git status` itself could not run (workspace missing, unreadable,
+ * permission error, git unavailable, or not a git repository at all) —
+ * DISTINCT from a genuinely clean workspace (empty array). Never a real
+ * repo-relative path, so `classifyDirtyFile` cannot match it to any managed
+ * file and always falls safe to `genuine-delta` — the config-dirty gate
+ * OBJECTS with this sentinel named in the file list, rather than silently
+ * treating "couldn't verify" the same as "verified clean". This is the
+ * fail-CLOSED fix for the false-pass hazard: an unresolvable/unreadable
+ * workspace must never read as a pass.
+ */
+export const WORKSPACE_INSPECTION_FAILED =
+  '<git status failed — workspace missing, unreadable, or not a git repository; verify manually>';
+
+/**
+ * Sentinel `listDirtyConfig`/`classifyDirtyConfig` entry (macf#1101) for the
+ * DIFFERENT failure shape: `resolveTarget` itself found NO workspace at all
+ * matching this agent under this driver's bound project (an agent that
+ * `discoverWorkspaces()` returned as a fleet member moments earlier, at
+ * `upgradeFleets`'s `members` computation, yet a fresh re-resolution can no
+ * longer find — a transient host-discovery inconsistency, a workspace
+ * removed mid-run, or a same-routing-label ambiguity within the SAME
+ * project). Distinct from `WORKSPACE_INSPECTION_FAILED` (a real, resolved
+ * directory that `git status` couldn't read) — this fires BEFORE any git
+ * call is even attempted, because there is no directory to `cwd` into.
+ * Same fail-CLOSED contract: an unresolvable workspace must never read as a
+ * pass.
+ */
+export const WORKSPACE_UNRESOLVED =
+  '<no workspace could be resolved for this agent under this fleet; verify manually>';
+
 /** The identity a target workspace's config yields for session derivation. */
 export interface WorkspaceIdentity {
   readonly project?: string;
@@ -182,6 +214,21 @@ export interface VmDriverOptions {
    * `<workspaceDir>/.claude/scripts/tmux-send-to-claude.sh`.
    */
   readonly workspaceDir: string;
+  /**
+   * The PROJECT (fleet) this driver is bound to (macf#1101) — REQUIRED so
+   * every verb resolves `agent` (a routing label) to a workspace ONLY
+   * within this project, never across projects that happen to reuse the
+   * same routing label (e.g. two fleets each naming their implementer
+   * `code-agent`). Without this scoping, `resolveTarget`'s bare
+   * `.find((r) => r.agent === agent)` can silently match a DIFFERENT
+   * project's — or the orchestrator's OWN — workspace, and WHICH one it
+   * picks depends on host-discovery scan order (itself dependent on the
+   * caller's cwd via `discoverWorkspaces`'s default root resolution) — the
+   * exact mechanism behind the false-block/false-pass pair reported in
+   * `groundnuty/macf#1101`. `createVmDriverFromConfig` always supplies this
+   * from the bound workspace's own `macf-agent.json` `project` field.
+   */
+  readonly project: string;
   /** `capture-pane` content-diff window for the busy gate (default `DEFAULT_BUSY_WINDOW_MS`). */
   readonly busyWindowMs?: number;
   /** The `macf` binary name/path (default `'macf'`, resolved on PATH). */
@@ -232,13 +279,33 @@ function toFleetState(
 
 /**
  * Resolve `agent` → workspace + `<project>@<routing-label>` session using the
- * discovery scan + a per-workspace config read. Returns `null` when no discovered
- * workspace matches the routing label. The session is `null` when the workspace
- * config carries no `project` (can't derive the canonical name) — callers that
- * need the session treat that as a hard error.
+ * discovery scan + a per-workspace config read. Returns `null` when no
+ * discovered workspace matches the routing label. The session is `null` when
+ * the workspace config carries no `project` (can't derive the canonical
+ * name) — callers that need the session treat that as a hard error.
+ *
+ * `scopeProject` (macf#1101) — when given, ONLY a record whose OWN
+ * `WorkspaceRecord.project` equals `scopeProject` is eligible: routing
+ * labels are NOT globally unique across fleets (two projects can each name
+ * their implementer `code-agent`), so an unscoped `.find()` can silently
+ * match a DIFFERENT project's — or the caller's OWN — workspace, and WHICH
+ * one it lands on depends on host-discovery scan order (order depends on
+ * `discoverWorkspaces`'s default cwd-derived roots) — the exact
+ * false-block/false-pass mechanism reported in `groundnuty/macf#1101`.
+ * Omitted (`undefined`) preserves the OLD unscoped-match behavior — kept
+ * only so this function's OWN low-level unit tests (which exercise the
+ * plain agent→workspace derivation, not fleet-scoping) don't need a project
+ * fixture; `createVmDriver`'s internal call sites ALWAYS pass their bound
+ * `opts.project` — see `VmDriverOptions.project`'s doc.
  */
-export function resolveTarget(seams: VmDriverSeams, agent: string): ResolvedTarget | null {
-  const record = seams.discover().find((r) => r.agent === agent);
+export function resolveTarget(
+  seams: VmDriverSeams,
+  agent: string,
+  scopeProject?: string,
+): ResolvedTarget | null {
+  const record = seams
+    .discover()
+    .find((r) => r.agent === agent && (scopeProject === undefined || r.project === scopeProject));
   if (!record) return null;
   const id = seams.readConfig(record.workspace);
   const project = id?.project;
@@ -304,12 +371,20 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
   // contract's `$MAINT_LOCK_DIR/<agent>.lock` shape exactly.
   const lockConfig = opts.maintenanceLock ?? resolveMaintenanceLockConfig();
 
-  /** Resolve or throw a `FleetDriverError` naming the unresolvable agent. */
+  /**
+   * Resolve or throw a `FleetDriverError` naming the unresolvable agent.
+   * Scoped to `opts.project` (macf#1101) — routing labels are not unique
+   * across fleets, so this driver only ever matches a workspace belonging
+   * to its OWN bound project; the error text says so plainly (no internal
+   * citation — this is user-facing output).
+   */
   function requireTarget(agent: string): ResolvedTarget {
-    const t = resolveTarget(seams, agent);
+    const t = resolveTarget(seams, agent, opts.project);
     if (!t) {
       throw new FleetDriverError(
-        `unknown agent '${agent}' — no discovered workspace on this host`,
+        `unknown agent '${agent}' — no discovered workspace on this host for project '${opts.project}' ` +
+          `(a workspace with this routing label may exist under a DIFFERENT project — this driver only ` +
+          `matches workspaces belonging to its own bound project)`,
       );
     }
     return t;
@@ -333,7 +408,7 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
   }
 
   async function isBusy(agent: string): Promise<boolean> {
-    const target = resolveTarget(seams, agent);
+    const target = resolveTarget(seams, agent, opts.project);
     // No workspace, no derivable session, or no live session → dead/absent → not busy.
     if (!target?.session || !seams.hasSession(target.session)) return false;
 
@@ -348,7 +423,7 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
   }
 
   async function capturePane(agent: string): Promise<string | null> {
-    const target = resolveTarget(seams, agent);
+    const target = resolveTarget(seams, agent, opts.project);
     // No workspace, no derivable session, or no live session → gone/unreadable →
     // null (the resume decision layer skips it — reconcile launches a dead agent).
     if (!target?.session || !seams.hasSession(target.session)) return null;
@@ -356,16 +431,25 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
   }
 
   async function isConfigDirty(agent: string): Promise<boolean> {
-    const target = resolveTarget(seams, agent);
-    // Unknown agent → nothing to check (mirrors isBusy's dead/unknown → false).
-    if (!target) return false;
+    const target = resolveTarget(seams, agent, opts.project);
+    // macf#1101 — fail CLOSED (dirty), NOT `isBusy`'s dead/unknown → false.
+    // `isBusy`'s "false" is about SESSION liveness on an agent whose
+    // workspace genuinely resolved; here `!target` means no workspace could
+    // be resolved AT ALL under this driver's bound project — "couldn't
+    // verify" must never read as "verified clean" (the false-pass hazard
+    // this issue codifies). A downstream `upgrade()`/`restart()` on the
+    // SAME unresolvable agent already throws (`requireTarget`); this keeps
+    // the pre-flight gate consistent with that same conservative posture.
+    if (!target) return true;
     return seams.isConfigDirty(target.workspace);
   }
 
   async function listDirtyConfig(agent: string): Promise<readonly string[]> {
-    const target = resolveTarget(seams, agent);
-    // Unknown agent → nothing to check (mirrors isConfigDirty's unknown → false).
-    if (!target) return [];
+    const target = resolveTarget(seams, agent, opts.project);
+    // macf#1101 — same fail-CLOSED rationale as isConfigDirty above; see
+    // `WORKSPACE_UNRESOLVED`'s doc for why this is a DISTINCT sentinel from
+    // `WORKSPACE_INSPECTION_FAILED` (no directory to even `cwd` into here).
+    if (!target) return [WORKSPACE_UNRESOLVED];
     return seams.listDirtyConfig(target.workspace);
   }
 
@@ -375,9 +459,20 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
    * the branch-gate — both are "never a safe mutate+relaunch target").
    */
   async function currentBranch(agent: string): Promise<string | null> {
-    const target = resolveTarget(seams, agent);
+    const target = resolveTarget(seams, agent, opts.project);
     if (!target) return null;
     return seams.currentBranch(target.workspace);
+  }
+
+  /**
+   * Diagnostic-only: the resolved absolute workspace directory for `agent`,
+   * scoped to `opts.project` exactly like every other verb (macf#1101).
+   * `null` when unresolvable. Never used for decision-branching — only to
+   * let `rollFleet`'s pre-flight OBJECT messages name the location they
+   * inspected, so a resolution mismatch is visible instead of silent.
+   */
+  async function resolveWorkspace(agent: string): Promise<string | null> {
+    return resolveTarget(seams, agent, opts.project)?.workspace ?? null;
   }
 
   /**
@@ -385,9 +480,22 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
    * `resolveCanonicalBranch` against the agent's own `macf-agent.json` (env
    * override still applies even for an unresolvable agent / missing config;
    * only the per-workspace `canonicalBranch` field needs a readable config).
+   *
+   * Audited for macf#1101's "caller-ambient-context" question and left
+   * UNCHANGED on purpose: `process.env` here reads the ORCHESTRATOR
+   * process's own environment for `MACF_CANONICAL_BRANCH`, but that is a
+   * documented, deliberate operator escape hatch (see `FleetDriver
+   * .canonicalBranch`'s doc + the `MACF_CANONICAL_BRANCH`-overrides test in
+   * `vm-driver.test.ts`) — the same class as `--force` / `MACF_SKIP_*`,
+   * meant to apply uniformly to whatever the invoking process touches. It
+   * is NOT an identity leak of the `#763` shape (that bug was a SPECIFIC
+   * session's `MACF_WORKSPACE_DIR`/`MACF_ROUTING_LABEL`/etc. silently
+   * overriding a DIFFERENT target's identity); an operator setting
+   * `MACF_CANONICAL_BRANCH` before running `macf fleet upgrade` is asking
+   * for exactly this effect.
    */
   async function canonicalBranch(agent: string): Promise<string> {
-    const target = resolveTarget(seams, agent);
+    const target = resolveTarget(seams, agent, opts.project);
     const config = target ? seams.readFullConfig(target.workspace) : null;
     return resolveCanonicalBranch(config, process.env);
   }
@@ -398,13 +506,17 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
    * EACH path via the canonical-compute primitive (`classifyDirtyFile`).
    * Unknown agent / unresolvable config → everything classifies as
    * genuine-delta (fail-safe — never auto-resolve without a config to
-   * compute canonical content against).
+   * compute canonical content against). This is THE gate `rollFleet` calls
+   * pre-flight (macf#725/DR-040 Decision 3), so its fail-safe direction is
+   * load-bearing: an unresolvable agent (macf#1101 — no workspace matches
+   * this routing label under this driver's bound project) must OBJECT via
+   * `WORKSPACE_UNRESOLVED`, never silently return "nothing dirty."
    */
   async function classifyDirtyConfig(
     agent: string,
   ): Promise<{ readonly alreadyCanonical: readonly string[]; readonly genuineDelta: readonly string[] }> {
-    const target = resolveTarget(seams, agent);
-    if (!target) return { alreadyCanonical: [], genuineDelta: [] };
+    const target = resolveTarget(seams, agent, opts.project);
+    if (!target) return { alreadyCanonical: [], genuineDelta: [WORKSPACE_UNRESOLVED] };
 
     const dirty = seams.listDirtyConfig(target.workspace);
     if (dirty.length === 0) return { alreadyCanonical: [], genuineDelta: [] };
@@ -431,13 +543,13 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
    */
   async function autoResolveCanonical(agent: string, files: readonly string[]): Promise<void> {
     if (files.length === 0) return;
-    const target = resolveTarget(seams, agent);
+    const target = resolveTarget(seams, agent, opts.project);
     if (!target) return;
     seams.commitCanonicalFiles(target.workspace, files);
   }
 
   async function listModifiedFiles(agent: string): Promise<readonly string[]> {
-    const target = resolveTarget(seams, agent);
+    const target = resolveTarget(seams, agent, opts.project);
     if (!target) return [];
     return seams.listModifiedFiles(target.workspace);
   }
@@ -450,7 +562,7 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
    * agent handling — never throws).
    */
   async function readVersionPin(agent: string): Promise<string | null> {
-    const target = resolveTarget(seams, agent);
+    const target = resolveTarget(seams, agent, opts.project);
     if (!target) return null;
     return seams.readLaunchPin(target.workspace);
   }
@@ -505,6 +617,17 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
   // agent's routing label, matching the bash contract exactly. Real fs I/O
   // lives in `maintenance-lock.ts` (interop-verified against the bash
   // reference); this is just the driver-level glue.
+  //
+  // AUDITED for macf#1101 and DELIBERATELY NOT changed here: the lock path
+  // is `${MACF_MAINT_LOCK_DIR}/<agent>.lock` — HOST-WIDE, keyed purely on
+  // the routing label, with NO project namespace. Two fleets that both name
+  // their implementer `code-agent` (exactly the collision behind this
+  // issue) share ONE lock file. Project-scoping this path would fix a real
+  // gap, but the on-disk format is interop-verified against a BASH
+  // reference implementation in a separate repo (macf-devops-toolkit) —
+  // changing it here without a matching bash-side change breaks that
+  // interop contract. Out of scope for this fix; flagged for a follow-up
+  // issue rather than a same-PR change to a cross-repo format.
 
   async function acquireLock(agent: string, targetVersion: string): Promise<void> {
     acquireMaintenanceLock(lockConfig.dir, agent, targetVersion);
@@ -526,6 +649,7 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     listDirtyConfig,
     currentBranch,
     canonicalBranch,
+    resolveWorkspace,
     classifyDirtyConfig,
     autoResolveCanonical,
     capturePane,
@@ -586,7 +710,18 @@ export function createVmExecSeams(
   | 'readLaunchPin'
 > {
   return {
-    discover: () => discoverWorkspaces(),
+    // macf#1101 — anchor the host-discovery SCAN ROOTS to this driver's OWN
+    // bound `workspaceDir`, never to `discoverWorkspaces()`'s ambient-cwd
+    // default. Without `cwd`, `resolveWorkspaceRoots` derives its roots from
+    // `process.cwd()` — the ORCHESTRATOR's cwd at the moment `macf fleet
+    // upgrade` was invoked, not this driver's own project. That made the
+    // discovered record ORDER (and therefore which same-routing-label record
+    // `resolveTarget` could land on before the project-scoping fix above)
+    // depend on wherever the operator happened to be standing when they ran
+    // the command — the caller-cwd-dependence half of the reported bug.
+    // Binding to `workspaceDir` makes discovery deterministic per-driver,
+    // independent of the invoking process's cwd.
+    discover: () => discoverWorkspaces({ cwd: workspaceDir }),
     isConfigDirty: (dir: string): boolean => {
       try {
         // Tracked-only (macf#722 Fix B): untracked config files are not yet an
@@ -607,10 +742,14 @@ export function createVmExecSeams(
         );
         return out.trim().length > 0;
       } catch {
-        // Not a git repo / git unavailable / any other failure → fail-open
-        // (never block a roll on an inspection failure; mirrors capturePane's
-        // fail-to-null posture for infra-failure cases).
-        return false;
+        // macf#1101 — Not a git repo / git unavailable / workspace missing /
+        // any other inspection failure → fail CLOSED (dirty), NOT fail-open.
+        // "Couldn't verify" must never read as "verified clean" — that is
+        // the exact false-pass hazard this issue codifies: a workspace this
+        // gate could not actually inspect must OBJECT, not silently let
+        // `macf update` proceed against a directory nobody could confirm was
+        // safe to touch.
+        return true;
       }
     },
     listDirtyConfig: (dir: string): readonly string[] => {
@@ -630,8 +769,12 @@ export function createVmExecSeams(
         );
         return parsePorcelainPaths(out);
       } catch {
-        // Fail-open (empty == clean), matching isConfigDirty's fail-open posture.
-        return [];
+        // macf#1101 — fail CLOSED, same rationale as isConfigDirty above.
+        // The sentinel is never a real path, so `classifyDirtyConfig` always
+        // classifies it `genuine-delta` (never auto-resolved) and the gate
+        // OBJECTS naming WHY nothing could be verified, instead of an empty
+        // (= clean) list silently letting the roll proceed.
+        return [WORKSPACE_INSPECTION_FAILED];
       }
     },
     listModifiedFiles: (dir: string): readonly string[] => {
@@ -785,5 +928,8 @@ export async function createVmDriverFromConfig(
     probeHealth,
     ...createVmExecSeams(projectDir),
   };
-  return createVmDriver({ workspaceDir: projectDir, ...opts }, seams);
+  // macf#1101 — `project` defaults to THIS workspace's own config (the
+  // ground truth for what fleet this driver is bound to); `opts.project`,
+  // when a caller explicitly supplies one, still wins (test injection).
+  return createVmDriver({ workspaceDir: projectDir, project: config.project, ...opts }, seams);
 }

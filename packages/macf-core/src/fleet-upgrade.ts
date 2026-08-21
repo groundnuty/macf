@@ -408,9 +408,19 @@ export type UpgradeEvent =
    * BEFORE the config-dirty tiering / auto-resolve / busy-gate even run for
    * this agent. `current` is the agent's actual branch (`null` on detached
    * HEAD / an unresolvable branch); `canonical` is the resolved expected
-   * branch. Fired INSTEAD of any mutation — nothing was touched.
+   * branch. `workspace` (macf#1101) is the on-disk location the branch check
+   * actually inspected (`driver.resolveWorkspace(agent)`, `null` when the
+   * driver can't report one or the agent is unresolvable) — surfaced so a
+   * misattributed resolution is VISIBLE in the objection rather than silent.
+   * Fired INSTEAD of any mutation — nothing was touched.
    */
-  | { readonly kind: 'branch-skip'; readonly agent: string; readonly current: string | null; readonly canonical: string }
+  | {
+      readonly kind: 'branch-skip';
+      readonly agent: string;
+      readonly current: string | null;
+      readonly canonical: string;
+      readonly workspace: string | null;
+    }
   /**
    * The pre-flight AUTO-RESOLVE (DR-040 Decision 3 / macf#698 R1) — `files`
    * were dirty but their content already equalled canonical, so they were
@@ -427,11 +437,21 @@ export type UpgradeEvent =
    * auto-resolved above and are never part of this list). `files` is the
    * exact genuine-delta uncommitted-path list; `message` is the
    * ready-to-forward, agent-directed text (inspect + commit / delete /
-   * gitignore, then re-run). Fired INSTEAD of any mutation — nothing on this
-   * agent's genuine-delta files was touched (though the already-canonical
-   * subset, if any, WAS committed by the preceding `config-auto-resolved`).
+   * gitignore, then re-run) and, per macf#1101, NAMES the workspace the
+   * check actually inspected so a misattributed resolution is visible
+   * rather than silent. `workspace` carries the same location as a
+   * separate structured field for programmatic consumers. Fired INSTEAD of
+   * any mutation — nothing on this agent's genuine-delta files was touched
+   * (though the already-canonical subset, if any, WAS committed by the
+   * preceding `config-auto-resolved`).
    */
-  | { readonly kind: 'config-dirty-skip'; readonly agent: string; readonly files: readonly string[]; readonly message: string }
+  | {
+      readonly kind: 'config-dirty-skip';
+      readonly agent: string;
+      readonly files: readonly string[];
+      readonly message: string;
+      readonly workspace: string | null;
+    }
   | { readonly kind: 'busy-skip'; readonly agent: string; readonly waited: boolean }
   /**
    * The post-upgrade modified-files report (macf#725) — fired once an agent is
@@ -691,13 +711,35 @@ async function classifyHalt(
 }
 
 /**
- * Build the agent-directed OBJECT message for a config-dirty pre-flight skip
- * (macf#725). Pure — exported for CLI-rendering reuse / tests.
+ * Render the inspected-workspace clause shared by both pre-flight OBJECT
+ * messages (macf#1101) — `null` reads as an explicit UNRESOLVED diagnostic,
+ * never a blank/omitted clause, so a caller can't mistake "the driver didn't
+ * report a workspace" for "this gate has nothing to say about location."
+ * Pure — exported for CLI-rendering reuse / tests.
  */
-export function buildConfigDirtyMessage(agent: string, files: readonly string[]): string {
+export function describeInspectedWorkspace(workspace: string | null): string {
+  return workspace ?? 'UNRESOLVED — no workspace could be matched to this agent for this fleet';
+}
+
+/**
+ * Build the agent-directed OBJECT message for a config-dirty pre-flight skip
+ * (macf#725). `workspace` (macf#1101) names the on-disk location the check
+ * actually inspected — the fix for the class of bug where a routing-label
+ * collision (or a caller-cwd-dependent resolution) silently attributed a
+ * DIFFERENT agent's — or the orchestrator's OWN — dirty files to `agent`;
+ * naming the inspected path makes that misattribution visible in the
+ * objection itself rather than requiring separate investigation. Pure —
+ * exported for CLI-rendering reuse / tests.
+ */
+export function buildConfigDirtyMessage(
+  agent: string,
+  files: readonly string[],
+  workspace: string | null = null,
+): string {
   return (
     `Fleet upgrade skipped ${agent} — these files have uncommitted changes ` +
-    `\`macf update\` would overwrite: ${files.join(', ')}. Inspect each and ` +
+    `\`macf update\` would overwrite: ${files.join(', ')} ` +
+    `(inspected workspace: ${describeInspectedWorkspace(workspace)}). Inspect each and ` +
     `commit, delete, or .gitignore it, then re-run the upgrade.`
   );
 }
@@ -723,17 +765,23 @@ export function buildModifiedFilesMessage(agent: string, files: readonly string[
 
 /**
  * Build the agent-directed OBJECT message for the branch-gate pre-flight skip
- * (macf#755). Pure — exported for CLI-rendering reuse / tests.
+ * (macf#755). `workspace` (macf#1101) names the on-disk location the branch
+ * check actually inspected — see `buildConfigDirtyMessage`'s doc for why this
+ * matters (the same routing-label-collision / caller-cwd-dependent
+ * misattribution class applies to the branch check too). Pure — exported for
+ * CLI-rendering reuse / tests.
  */
 export function buildBranchSkipMessage(
   agent: string,
   current: string | null,
   canonical: string,
+  workspace: string | null = null,
 ): string {
   const branchDesc =
     current === null ? 'a detached HEAD (or an unresolvable branch)' : `branch \`${current}\``;
   return (
-    `Fleet upgrade skipped ${agent} — on ${branchDesc}, expected \`${canonical}\`. ` +
+    `Fleet upgrade skipped ${agent} — on ${branchDesc}, expected \`${canonical}\` ` +
+    `(inspected workspace: ${describeInspectedWorkspace(workspace)}). ` +
     `A mutation (macf update / an auto-resolve commit) or a relaunch would land on the ` +
     `wrong branch. Switch the workspace to \`${canonical}\` (or set canonicalBranch / ` +
     `MACF_CANONICAL_BRANCH if this is a legitimate fork), then re-run the upgrade, or ` +
@@ -812,6 +860,16 @@ export async function rollFleet(
     if (plan.disposition !== 'behind') continue;
     const agent = plan.agent;
 
+    // macf#1101 — resolve the on-disk location the pre-flight gates below
+    // are ABOUT to inspect, ONCE per agent, so both OBJECT messages can name
+    // it (a misattribution — e.g. a routing-label collision resolving to a
+    // DIFFERENT project's, or the orchestrator's OWN, workspace — becomes
+    // visible in the objection instead of silent). `null` when the driver
+    // doesn't implement `resolveWorkspace` (optional) or can't resolve
+    // `agent` at all. Skipped entirely under `--force`, which bypasses both
+    // gates below and never inspects anything.
+    const workspace = opts.force ? null : ((await deps.driver.resolveWorkspace?.(agent)) ?? null);
+
     // PRE-FLIGHT branch-gate (macf#755) — the FIRST gate, before config-dirty
     // or busy. Detached HEAD / unresolvable (`current === null`) is ALWAYS
     // non-canonical.
@@ -820,9 +878,9 @@ export async function rollFleet(
       const current = await deps.driver.currentBranch(agent);
       if (current === null || current !== canonical) {
         branchSkipped += 1;
-        const message = buildBranchSkipMessage(agent, current, canonical);
+        const message = buildBranchSkipMessage(agent, current, canonical, workspace);
         results.push({ agent, outcome: 'branch-skipped', detail: message });
-        deps.onEvent?.({ kind: 'branch-skip', agent, current, canonical });
+        deps.onEvent?.({ kind: 'branch-skip', agent, current, canonical, workspace });
         continue;
       }
     }
@@ -849,14 +907,14 @@ export async function rollFleet(
 
       if (genuineDelta.length > 0) {
         configDirtySkipped += 1;
-        const message = buildConfigDirtyMessage(agent, genuineDelta);
+        const message = buildConfigDirtyMessage(agent, genuineDelta, workspace);
         results.push({
           agent,
           outcome: 'config-dirty-skipped',
           detail: message,
           ...(autoResolvedFiles ? { autoResolvedFiles } : {}),
         });
-        deps.onEvent?.({ kind: 'config-dirty-skip', agent, files: genuineDelta, message });
+        deps.onEvent?.({ kind: 'config-dirty-skip', agent, files: genuineDelta, message, workspace });
         continue;
       }
       // genuineDelta is empty (nothing dirty at all, or everything dirty WAS
