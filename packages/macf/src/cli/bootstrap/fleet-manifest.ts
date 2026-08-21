@@ -274,7 +274,7 @@ export const FleetManifestSchema = z
           code: 'custom',
           message:
             `agents[${String(index)}].role "${agent.role}" starts with the fleet name prefix "${rolePrefix}" — ` +
-            'this is the macf#791 / DR-032 double-prefix trap: deriveAppHandle would compound it into ' +
+            'this is a double-prefix trap: deriveAppHandle would compound it into ' +
             `"${manifest.metadata.name}-${agent.role}". role is the bare <bare-role> shape (deriveAppHandle ` +
             'prepends the fleet name); never write the already-prefixed App handle here.',
           path: ['agents', index, 'role'],
@@ -333,7 +333,7 @@ export const FleetManifestSchema = z
             'A runner provisioned with these labels would never be dispatched a routed job — every job would ' +
             'queue to timeout while the plan looks clean. Declare routing.runner.labels as a superset of ' +
             `[${ROUTER_EMITTED_LABELS.join(', ')}] (extra labels are fine), or omit the field entirely and let ` +
-            'the convention apply (macf#934).',
+            'the convention apply.',
           path: ['routing', 'runner', 'labels'],
         });
       }
