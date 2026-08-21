@@ -1299,7 +1299,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // Names the supported alternative plainly (task requirement 2) —
       // without asserting a resolution (#999 requirement 2 stays open).
       expect(errs.join('\n')).toContain('type: profile');
-      expect(errs.join('\n')).toContain('groundnuty/macf#999');
+      expect(errs.join('\n')).toContain('is not yet decided');
       // Nothing mutated.
       const dir = join(file, '..');
       expect(existsSync(join(dir, 'fleet.lock'))).toBe(false);
@@ -1412,7 +1412,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     // the PlanItem itself (plan.items[].reason, via runnerWarmItem), which
     // this apply-result JSON does not carry (only `unimplemented_by_apply`
     // does) — pinned instead in plan.test.ts's dedicated runner_warm block.
-    expect(warmItem?.reason).toContain('#943');
+    expect(warmItem?.reason).toContain('until that contract call is wired');
     // ca is fully implemented now (macf#838 Amendment D phase 2); repo has
     // been since macf#857 — neither appears here.
     expect(parsed.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(false);
@@ -1550,7 +1550,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const routingLeg = parsed.routing['groundnuty/demo-code'];
     expect(routingLeg?.status).toBe('failed');
     expect(routingLeg?.reason).toContain('403');
-    expect(routingLeg?.reason).toContain('DR-044');
+    expect(routingLeg?.reason).toContain('FLEET authority, not agent authority');
     // DECISIVE — the version-reconcile phase STILL attempted + reported,
     // despite the routing gate having failed. Before this issue's fix this
     // would have been reached only after a 600s poll; the sleepFn assertion
@@ -2161,7 +2161,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(out).toMatch(/Operator interaction: up to 3 Apps to create/);
       expect(out).toContain('3 "Create GitHub App" clicks');
       expect(out).toContain('3 install flows');
-      expect(out).toContain('macf#913/#915');
+      expect(out).toContain('may confirm some of these already exist and skip their gates');
     });
 
     it('DECISIVE — fresh 2-agent fleet, --dry-run --json: operator_interaction carries gate1_clicks/gate2_flows both = 3 (2 declared agents + the unconditional runner-ops), bound "maximum"', async () => {
@@ -2931,7 +2931,7 @@ describe('findAvailableRecoveryArtifacts / formatRecoveryArtifactNotice — macf
   it('formatRecoveryArtifactNotice names the roles + macf#988 + the --identity-key remedy', () => {
     const text = formatRecoveryArtifactNotice(['code-agent', 'runner-ops']);
     expect(text).toContain('code-agent, runner-ops');
-    expect(text).toContain('macf#988');
+    expect(text).toContain("a prior run's App creation reached the vault-durability step");
     expect(text).toContain('--identity-key');
   });
 });
@@ -3503,7 +3503,7 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     const versionPhase: ApplyVersionPhaseResult = { attempted: true, target: '0.2.57', halted: true };
     const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, versionPhase);
     expect(text).toMatch(
-      /Version reconcile: HALTED — a bad release stopped the roll toward macf@0\.2\.57 \(see log above; DR-043 Amendment L, macf#1045\)\.$/m,
+      /Version reconcile: HALTED — a bad release stopped the roll toward macf@0\.2\.57 \(see log above\)\.$/m,
     );
   });
 
