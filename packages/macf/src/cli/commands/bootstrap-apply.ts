@@ -1923,7 +1923,11 @@ export function applyExitCode(
   // fleet-level identity every one of the six routing secrets ultimately
   // depends on (MACF_ROUTING_APP_ID/KEY come directly from it), so an
   // unresolved identity here needs operator attention exactly like an
-  // unresolved runner-ops does.
+  // unresolved runner-ops does. groundnuty/macf#1082 — `'vault-reused'`
+  // (the shared-scope zero-creation success path) is deliberately NOT in
+  // this list: it is a resolved, healthy outcome, not one needing operator
+  // attention — only `RouterAppApplyOutcome`'s `AgentApplyOutcome`-inherited
+  // statuses can be bad.
   const routerAppBad =
     result.routerApp.status === 'failed' ||
     result.routerApp.status === 'drift' ||

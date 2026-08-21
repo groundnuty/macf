@@ -129,6 +129,34 @@ export const FleetTransportSchema = z
      * declaration with a refuse-before-gate-1 contract.
      */
     tailscale_oauth_required: z.boolean().optional().default(false),
+    /**
+     * groundnuty/macf#1082 — the routing App's SCOPE: one App shared across
+     * every fleet on the account (`'shared'`, the DEFAULT), or a dedicated
+     * App minted fresh for THIS fleet alone (`'per-fleet'`, #1081's shipped
+     * behavior, retained as an explicit opt-in). Mode is otherwise
+     * INPUT-implied (does the vault carry `MACF_ROUTING_APP_ID`/
+     * `MACF_ROUTING_APP_KEY_B64`?) rather than flag-implied — this field is
+     * the one exception, because "isolate this fleet's router from every
+     * other fleet's" is a standing preference an operator states once, not
+     * a per-run fact the vault's contents can express (see
+     * `apply-router-app.ts`'s module doc for the full reversal narrative).
+     *
+     * **`transport`, not `shared`** (`FleetSharedSchema`, below). `shared`
+     * is `.strict()` and requires BOTH `routing_app` AND `ts_oauth` —
+     * consuming just the scope concept from it would force an operator to
+     * additionally supply a `ts_oauth` reference this codebase still has no
+     * consumer for, the exact "operator believes X, tool does Y" trap that
+     * field's own doc warns about. `transport.age_recipients` /
+     * `tailscale_oauth_required` are the precedent this field actually
+     * matches: a flat, purpose-built, operator-facing declaration.
+     *
+     * **`transport` (required), not `shared` (optional), also matters for
+     * where the zod default resolves.** `.optional().default('shared')`
+     * inside a REQUIRED parent object always fills in a value post-parse;
+     * inside an optional parent, an omitted `shared:` block would leave
+     * this field unreachable rather than defaulted.
+     */
+    router_app_scope: z.enum(['shared', 'per-fleet']).optional().default('shared'),
   })
   .strict();
 
@@ -243,20 +271,23 @@ export const FleetCollaboratorSchema = z
  * `ts_oauth` is a REFERENCE (an out-of-band-supplied credential name), never
  * a stored value — the manifest stays secret-free.
  *
- * **STALE as of groundnuty/macf#1074 — parsed but UNCONSUMED, same status
- * as `collaborators` below.** #1074's ruling (re-affirmed after checking
- * this exact field against `tools/macf-bootstrap`'s reference
- * implementation) is a DEDICATED PER-FLEET routing App, not this field's
- * account-wide detect-and-reuse model — per-fleet naming
- * (`deriveAppHandle(fleetName, 'router')`) dissolves the global-App-name-
- * uniqueness hazard this field's "shared, reused" design exists to dodge,
- * so there is no analogous reuse question for a per-fleet App to answer.
- * See `apply-router-app.ts` for what #1074 actually built, and
- * `FleetTransportSchema.tailscale_oauth_required` (above) for where the
- * Tailscale-declaration concern landed instead. Left here unconsumed
- * (not removed) pending an explicit future reconciliation of whether an
- * account-wide shared App is ever worth building on top of the per-fleet
- * one — a design question, not a #1074 concern.
+ * **STILL unconsumed as of groundnuty/macf#1082, same status as
+ * `collaborators` below — but for a NARROWER reason than the #1074 doc this
+ * replaces.** #1074 shipped a dedicated PER-FLEET routing App and dismissed
+ * this field's account-wide model outright; #1082 reversed that instance
+ * count and built the shared/reused App this field's OWN doc describes
+ * (`apply-router-app.ts`'s `resolveSharedRouterAppReuse` + the fixed
+ * `SHARED_ROUTER_APP_HANDLE` name) — so the underlying DESIGN this field
+ * anticipated is now real. It stays unconsumed anyway: this field is
+ * `.strict()` and requires BOTH `routing_app` AND `ts_oauth` together, so
+ * wiring just the scope concept from it would force an operator to also
+ * supply a `ts_oauth` reference this codebase still has no consumer for —
+ * the same "operator believes X, tool does Y" trap `tailscale_oauth_required`'s
+ * own doc warns about. `FleetTransportSchema.router_app_scope` (above) is
+ * the field that actually carries #1082's shared-vs-per-fleet choice; this
+ * one is left here unconsumed pending an explicit future reconciliation of
+ * whether an operator-NAMED shared App (vs. the fixed name #1082 uses) is
+ * ever worth building.
  */
 export const FleetSharedSchema = z
   .object({

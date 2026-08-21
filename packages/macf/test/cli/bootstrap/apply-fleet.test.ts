@@ -32,6 +32,7 @@ import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-ro
 import type { RoutingSecretsPublishDeps } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import { toBase64ForSecret } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RouterAppVaultRestoreDeps } from '../../../src/cli/bootstrap/apply-router-app.js';
+import { SHARED_ROUTER_APP_HANDLE } from '../../../src/cli/bootstrap/apply-router-app.js';
 import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
 import { operatorRecoveryArtifactPath, writeAgentRecoveryArtifact, writeVault } from '../../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext } from '../../../src/cli/bootstrap/vault-read.js';
@@ -53,7 +54,13 @@ function manifestWith(agents: readonly FleetAgent[], ageRecipients: readonly str
     versions: { macf: '0.2.56', actions: 'v3.4.1' },
     owner: { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } },
     network: { advertise_host: 'example.ts.net' },
-    transport: { age_recipients: ageRecipients },
+    // groundnuty/macf#1082 — `router_app_scope: 'per-fleet'` pins EVERY
+    // test in this file to #1074's original ceremony (unchanged handle,
+    // unchanged confirm-before-create/create behavior) so this file's ~30
+    // existing router-App scenarios stay byte-identical under the new
+    // 'shared' default. The dedicated `router-app-scope.test.ts` covers
+    // 'shared' scope (the default) on its own manifests.
+    transport: { age_recipients: ageRecipients, router_app_scope: 'per-fleet' },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents,
     trust: { ca: 'per-project', federated_cas: [] },
@@ -4730,6 +4737,187 @@ trust:
       const result = await applyFleet(manifest, manifestPath, priorLock, deps);
 
       expect(result.actionsPin).toEqual({ attempted: false, results: [] });
+    });
+  });
+
+  // --- groundnuty/macf#1082 — the router App's SHARED-scope reuse, through
+  // applyFleet itself (the orchestrator where the mint seam actually lives —
+  // a unit test of resolveSharedRouterAppReuse alone cannot prove the
+  // CALLER honors the decision). ---
+  describe('router App — SHARED scope (groundnuty/macf#1082 default)', () => {
+    /** `manifestWith(...)` now pins EVERY OTHER test in this file to `'per-fleet'` — these tests need the real (shared) default, so they override it back explicitly. */
+    function sharedScopeManifest(agents: readonly FleetAgent[], ageRecipients: readonly string[] = ['age1operator', 'age1vm']): FleetManifest {
+      return { ...manifestWith(agents, ageRecipients), transport: { age_recipients: ageRecipients, router_app_scope: 'shared' } };
+    }
+
+    it('THE DECISIVE TEST: vault carries router App id+key -> the mint/manifest-flow seam is NEVER invoked (throwing fake, not a call-count) — and the existing MACF_ROUTING_APP_ID/KEY_B64 vault entries survive the compose BYTE-IDENTICAL (never overwritten)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = sharedScopeManifest([CODE_AGENT]);
+      const EXISTING_ROUTER_APP_ID = '9001';
+      const EXISTING_ROUTER_APP_KEY_B64 = Buffer.from('EXISTING-SHARED-ROUTER-PEM').toString('base64');
+      const existingVaultRaw =
+        `MACF_ROUTING_APP_ID='${EXISTING_ROUTER_APP_ID}'\n` +
+        `MACF_ROUTING_APP_KEY_B64='${EXISTING_ROUTER_APP_KEY_B64}'\n` +
+        "MACF_AGENT_DEMO_FLEET_SCIENCE_AGENT_APP_ID='app-science-agent'\n";
+      let capturedFinalPlaintext = '';
+
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: () => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          startManifestFlow: async (opts) => {
+            if (opts.role === 'router') {
+              throw new Error('must not be called — the router App resolved via vault-reuse; zero App-creation attempts this run');
+            }
+            return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
+          },
+          exchangeManifestCode: async () => creds('code-agent'),
+        }),
+        vaultDeps: { exists: () => true, encrypt: async (_pt, _r, outPath) => writeFileSync(outPath, 'FAKE-CIPHERTEXT') },
+        identityKeyPath: '/fake/operator-key.txt',
+        vaultComposeDeps: {
+          exists: () => true,
+          assertIdentityReadable: () => {},
+          decrypt: async () => existingVaultRaw,
+          encrypt: async (plaintext) => {
+            capturedFinalPlaintext = plaintext;
+          },
+          rename: () => {},
+          unlink: () => {},
+        },
+        routerAppVaultDeps: {
+          readVaultRouterApp: async () => ({ appId: EXISTING_ROUTER_APP_ID, appKeyPem: 'EXISTING-SHARED-ROUTER-PEM' }),
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routerApp).toEqual({ role: 'router', status: 'vault-reused', appId: EXISTING_ROUTER_APP_ID });
+      // No fleet.lock entry for 'router' — the vault, not the lock, is this
+      // scope's source of truth for reuse (nothing NEW was resolved this run).
+      expect(existsSync(result.lockPath)).toBe(true);
+      const lock: FleetLock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
+      expect(lock.agents.some((a) => a.role === 'router')).toBe(false);
+
+      // THE byte-identity assertion (assert-the-wrong-path.md: "byte-identity
+      // of untouched state") — the SAME two lines, character-for-character,
+      // not merely "a value is still present."
+      expect(result.vault.status).toBe('written');
+      const finalRaw = parseVaultPlaintext(capturedFinalPlaintext);
+      expect(finalRaw['MACF_ROUTING_APP_ID']).toBe(EXISTING_ROUTER_APP_ID);
+      expect(finalRaw['MACF_ROUTING_APP_KEY_B64']).toBe(EXISTING_ROUTER_APP_KEY_B64);
+    });
+
+    it('empty vault (no readVaultRouterApp) + shared name confirmed FREE -> STILL creates (the non-regression: reuse is not the only path)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = sharedScopeManifest([CODE_AGENT]);
+      let routerGate1Called = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: () => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          startManifestFlow: async (opts) => {
+            if (opts.role === 'router') routerGate1Called = true;
+            return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
+          },
+          exchangeManifestCode: async () => creds('router'),
+          checkAppNameCollision: async () => 'absent',
+          // `validateRouterAppInstall` fails CLOSED on a missing
+          // `repositorySelection` (apply-router-app.ts's doc) — the base
+          // fixture's canned `waitForAppInstallation` omits it entirely, so
+          // the router App's own gate 2 needs the explicit 'selected' shape
+          // every other install-validated test in this file already supplies.
+          waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: 'install-router', appSlug: opts.expected.appSlug ?? '', accountLogin: 'groundnuty', repositorySelection: 'selected' }),
+        }),
+        routerAppVaultDeps: {}, // vault-aware restore NOT engaged
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(routerGate1Called).toBe(true);
+      expect(result.routerApp.status).toBe('created');
+      if (result.routerApp.status === 'created') {
+        // The manifest actually submitted to GitHub carries the FIXED
+        // shared handle, never a fleet-prefixed one.
+        expect(result.routerApp.appId).toBeDefined();
+      }
+    });
+
+    it('empty vault + shared name confirmed TAKEN -> refuses with the instruction, NEVER a silent failure and NEVER a per-fleet fallback the operator did not ask for', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = sharedScopeManifest([CODE_AGENT]);
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: () => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          startManifestFlow: async (opts) => {
+            if (opts.role === 'router') throw new Error('must not be called — a confirmed name-collision refuses before gate 1');
+            return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
+          },
+          exchangeManifestCode: async () => creds('code-agent'),
+          checkAppNameCollision: async () => 'present',
+        }),
+        routerAppVaultDeps: {},
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routerApp.status).toBe('failed');
+      if (result.routerApp.status === 'failed') {
+        expect(result.routerApp.reason).toMatch(/MACF_ROUTING_APP_ID/);
+        expect(result.routerApp.reason).toMatch(/router_app_scope: per-fleet/);
+      }
+      // The instruction never leaks a credential value.
+      expect(result.routerApp.status === 'failed' ? result.routerApp.reason : '').not.toMatch(/BEGIN.*PRIVATE KEY/);
+    });
+  });
+
+  describe('router App — per-fleet scope opt-in (groundnuty/macf#1082) still works, unchanged', () => {
+    it('transport.router_app_scope: per-fleet bypasses the new shared-reuse decision entirely — a fresh fleet still CREATEs its own dedicated App even with an unrelated shared App already confirmed taken', async () => {
+      const manifestPath = manifestPathIn();
+      // manifestWith(...) already sets router_app_scope: 'per-fleet' — this
+      // test names the property explicitly rather than relying on it silently.
+      const manifest = manifestWith([CODE_AGENT]);
+      expect(manifest.transport.router_app_scope).toBe('per-fleet');
+      let routerGate1Called = false;
+      let readVaultRouterAppCalls = 0;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: () => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          startManifestFlow: async (opts) => {
+            if (opts.role === 'router') routerGate1Called = true;
+            return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
+          },
+          exchangeManifestCode: async () => creds('router'),
+          waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: 'install-router', appSlug: opts.expected.appSlug ?? '', accountLogin: 'groundnuty', repositorySelection: 'selected' }),
+          // The SHARED name reads "present" (taken); the PER-FLEET handle
+          // reads "absent" (free) — discriminated by the slug actually
+          // queried, not the role, because `applyIdentity`'s OWN generic
+          // collision pre-flight (apply-agent.ts) uses this SAME hook for
+          // EVERY role including per-fleet-scope's router App. If per-fleet
+          // scope silently queried the shared name instead of its own
+          // fleet-derived one, this fake would refuse it — proving the
+          // isolation, not just asserting it.
+          checkAppNameCollision: async (_owner, appSlug) => (appSlug === SHARED_ROUTER_APP_HANDLE ? 'present' : 'absent'),
+        }),
+        // A vault carrying SHARED credentials must NOT be consulted either —
+        // per-fleet scope has its own identity, never the shared one.
+        routerAppVaultDeps: {
+          readVaultRouterApp: async () => {
+            readVaultRouterAppCalls += 1;
+            return { appId: 'someone-elses-shared-app', appKeyPem: 'SHOULD-NEVER-BE-USED' };
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(routerGate1Called).toBe(true);
+      expect(result.routerApp.status).toBe('created');
+      // Per-fleet scope never runs resolveSharedRouterAppReuse at all —
+      // the shared-scope vault-check seam is untouched.
+      expect(readVaultRouterAppCalls).toBe(0);
     });
   });
 });
