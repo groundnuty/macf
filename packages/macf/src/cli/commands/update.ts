@@ -180,7 +180,7 @@ function pluginDirNeedsRepair(dir: string): boolean {
 function reportPluginMcpServersStrip(projectDir: string, targetDir: string): void {
   const result = stripPluginMcpServers(projectDir, { targetDir });
   if (result.status === 'stripped') {
-    console.log(`Stripped mcpServers from ${result.path} (DR-022 Amendment P)`);
+    console.log(`Stripped mcpServers from ${result.path}`);
   } else if (result.status === 'refused') {
     console.warn(`Warning: mcpServers not stripped from ${result.path}: ${result.reason}`);
   }
@@ -416,7 +416,7 @@ export async function update(
       if (migration.migrated) {
         console.log(
           `Migrated monolithic claude.sh → thin source-loop template + ` +
-            `per-concern env files (macf#342)`,
+            `per-concern env files`,
         );
       } else if (migration.reason === 'unrecognized-template') {
         // A claude.sh that carries the managed-header but matches neither the
@@ -476,7 +476,7 @@ export async function update(
     console.error(
       `Warning: cannot determine which plugin dir claude.sh mounts (${pluginTarget.detail}). ` +
         `Refusing to guess — skipping ALL plugin-dir updates (repair-fetch, version pin, dist-link) ` +
-        `this run rather than risk silently updating a manifest nobody mounts (macf#889). Fix ` +
+        `this run rather than risk silently updating a manifest nobody mounts. Fix ` +
         `claude.sh's --plugin-dir flag (see \`macf doctor\`), then re-run \`macf update\`.`,
     );
   } else if (pluginTarget.divergesFromDefault) {
@@ -484,7 +484,7 @@ export async function update(
     const defaultState = existsSync(defaultDir) ? 'present on disk, unmounted' : 'absent';
     console.warn(
       `Warning: claude.sh mounts ${pluginTarget.dir} — that is what this run updates. NOT ` +
-        `touching the conventional default ${defaultDir} (${defaultState}) — see macf#889 / macf#641.`,
+        `touching the conventional default ${defaultDir} (${defaultState}).`,
     );
   }
 
@@ -718,7 +718,7 @@ export async function update(
     } else {
       console.error(
         `Warning: versions.plugin advanced to v${newVersions.plugin} in macf-agent.json, but the ` +
-          `mounted plugin dir is undeterminable — NO on-disk manifest was updated to match (macf#889).`,
+          `mounted plugin dir is undeterminable — NO on-disk manifest was updated to match.`,
       );
     }
   }
@@ -761,7 +761,7 @@ export async function update(
     console.error(
       `FATAL: post-update verification failed — .mcp.json pins the channel-server at ` +
         `@${actualMcpPin}, not the target @${newVersions.cli}. The write above did not reach ` +
-        `the file actually being upgraded (macf#889's failure shape, repointed). Inspect ` +
+        `the file actually being upgraded. Inspect ` +
         `${join(projectDir, '.mcp.json')}.`,
     );
   }
