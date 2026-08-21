@@ -127,7 +127,7 @@ export async function mintRoutingClient(
       reason:
         'a routing-client cert was already minted for this fleet in a PRIOR apply run (fleet.lock records a ' +
         'routing_client_key fingerprint) — its private key is not in process memory this run. Never re-minted ' +
-        '(groundnuty/macf#986: minting is fleet-scoped, so this is the expected steady state, not a problem) — ' +
+        '(minting is fleet-scoped, so this is the expected steady state, not a problem) — ' +
         'publishing the already-minted cert/key to any repo this run confirms is handled SEPARATELY by ' +
         '`resolveRoutingClientSecretsForPublish`, which reads it back from the vault when `--vault`/`--identity-key` ' +
         'were both supplied.',
@@ -138,7 +138,7 @@ export async function mintRoutingClient(
       status: 'skipped',
       reason:
         'no routing-client cert has been minted for this fleet yet, but this run\'s CA was not freshly minted ' +
-        '(either it was REUSED — its private key is not in process memory, DR-043 Amendment D phase 3+ scope — or ' +
+        '(either it was REUSED — its private key is not in process memory — or ' +
         'CA resolution failed) — minting a routing-client cert requires the CA private key to sign it. Run apply ' +
         'once against a brand-new fleet (fresh CA + fresh routing-client mint together), or extend a future ' +
         'vault-aware apply increment.',
