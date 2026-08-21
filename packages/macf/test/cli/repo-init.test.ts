@@ -1034,6 +1034,38 @@ describe('repoInit integration', () => {
     expect(wf).toContain('secrets: inherit');
   });
 
+  // groundnuty/macf#1109 — the "Next steps" secrets-audit: AGENT_SSH_KEY is
+  // OBSOLETE for a v3+ pin (agent-router.yml's own doc: "may remain in the
+  // file but are unread under v3"), and the Tailscale pair must state the
+  // routing consequence rather than reading as a bland tidy-up item.
+  it('omits AGENT_SSH_KEY for a v3+ pin and states the TS_OAUTH consequence (macf#1109)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await repoInit(dir, { repo: 'owner/test-repo', actionsVersion: 'v3.4.1', force: false });
+      const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(printed).not.toContain('AGENT_SSH_KEY');
+      expect(printed).toContain('TS_OAUTH_CLIENT_ID');
+      expect(printed).toContain('TS_OAUTH_SECRET');
+      expect(printed).toMatch(/TS_OAUTH_CLIENT_ID.*REQUIRED/);
+      expect(printed).toMatch(/routing will not function/i);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it('keeps AGENT_SSH_KEY for a v1.x pin — still genuinely consumed by Stage-2 SSH+tmux routing (macf#1109)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await repoInit(dir, { repo: 'owner/test-repo', actionsVersion: 'v1', force: false });
+      const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(printed).toContain('AGENT_SSH_KEY');
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it('skips existing files without --force', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
 

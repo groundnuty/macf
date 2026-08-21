@@ -840,7 +840,7 @@ export async function repoInit(
     process.stderr.write(`Warning: could not generate token (${reason}). Skipping label creation.\n`);
     const labels: LabelsOutcome = { status: 'skipped', reason };
     printResults(workflowResult, configResult, labels);
-    printNextSteps(configResult, agentList);
+    printNextSteps(configResult, agentList, opts.actionsVersion);
     return { workflow: workflowResult, config: configResult, labels };
   }
 
@@ -863,7 +863,7 @@ export async function repoInit(
   const labels: LabelsOutcome = failed.length === 0 ? { status: 'ok', created, existed } : { status: 'partial-failure', created, existed, failed };
 
   printResults(workflowResult, configResult, labels);
-  printNextSteps(configResult, agentList);
+  printNextSteps(configResult, agentList, opts.actionsVersion);
   return { workflow: workflowResult, config: configResult, labels };
 }
 
@@ -881,9 +881,33 @@ function printResults(
   if (labels.status === 'partial-failure') console.error(`✗ Failed to create labels: ${labels.failed.join(', ')}`);
 }
 
+/**
+ * groundnuty/macf#1109 — audited every secret this block used to list
+ * unconditionally, one verdict each:
+ *
+ *   - `AGENT_SSH_KEY` — OBSOLETE for a v3+ pin. `agent-router.yml`'s own
+ *     module doc (fetched off `main`) says so explicitly: "Legacy fields
+ *     carried over from v1.x / v2.x consumers (`host`, `port`,
+ *     `tmux_session`, `tmux_bin`, `ssh_user`, `ssh_key_secret`) may remain
+ *     in the file but are unread under v3." Gated on
+ *     `isV3PlusActionsVersion` below — still genuinely needed for a v1.x/
+ *     v2.x pin (Stage-2 SSH+tmux routing), so it stays for THAT caller.
+ *   - `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` — genuinely
+ *     operator-supplied for a v3+ pin (Amendment C: never tool-minted), but
+ *     NOT "one of several tidy-up items" the way this text used to read —
+ *     `agent-router.yml@v3.4.2` declares both `required: true`
+ *     unconditionally, so the routing plane will not function without
+ *     them. Wording below states that consequence explicitly rather than
+ *     reading as bland housekeeping. (`macf bootstrap apply` publishes
+ *     these from the operator's vault automatically when present — see
+ *     `apply-fleet.ts` — this manual instruction is what's left for a
+ *     standalone `macf repo-init` run with no vault, or an apply run whose
+ *     vault genuinely didn't have them.)
+ */
 function printNextSteps(
   configResult: 'created' | 'updated' | 'skipped',
   agentList: readonly string[],
+  actionsVersion: string,
 ): void {
   console.log('\nNext steps:\n');
   if (configResult === 'created' && agentList.length === 0) {
@@ -894,9 +918,11 @@ function printNextSteps(
     console.log('  1. Review .github/agent-config.json — existing entries preserved, only tmux fields updated');
   }
   console.log('  2. Set repo secrets (Settings → Secrets and variables → Actions):');
-  console.log('       - AGENT_SSH_KEY: SSH private key for connecting to agent hosts');
-  console.log('       - TS_OAUTH_CLIENT_ID: Tailscale OAuth client ID');
-  console.log('       - TS_OAUTH_SECRET: Tailscale OAuth secret');
+  if (!isV3PlusActionsVersion(actionsVersion)) {
+    console.log('       - AGENT_SSH_KEY: SSH private key for connecting to agent hosts');
+  }
+  console.log('       - TS_OAUTH_CLIENT_ID: Tailscale OAuth client ID — REQUIRED: routing will not function until this is set (agent-router.yml declares it mandatory; the GitHub-hosted runner cannot reach agent VMs without joining the tailnet through it)');
+  console.log('       - TS_OAUTH_SECRET: Tailscale OAuth secret — REQUIRED, same as above');
   console.log('  3. Install your agent GitHub Apps on this repo');
   console.log('  4. Commit and push: git add .github/ && git commit -m "chore: bootstrap MACF routing"');
 }
