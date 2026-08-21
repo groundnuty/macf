@@ -159,7 +159,7 @@ export async function checkRepoVariablePresence(repo: string, name: string): Pro
  * 200 here returns only `{name, created_at, updated_at}` metadata, NEVER the
  * value) so this is the ONLY presence signal available — unlike a variable,
  * there is no create-endpoint 409 to lean on for a create-only guarantee
- * (`apply-routing-client.ts::publishRoutingClientSecrets`'s doc explains how
+ * (`apply-routing-secrets.ts::publishRoutingSecrets`'s doc explains how
  * that module still stays create-only via a presence-check-BEFORE-write,
  * non-atomic but sufficient for an operator-driven, non-concurrent bootstrap
  * tool). A `gh`-reported 404 is a confident `'absent'`; any other failure

@@ -648,6 +648,23 @@ export interface IdentityRequest {
   readonly permissions?: Readonly<Record<string, string>>;
   /** Overrides `buildAppManifest`'s default coordination events. `undefined` (every agent) keeps the default set. */
   readonly events?: readonly string[];
+  /**
+   * Overrides {@link installReposForIdentity}'s derived install-repo list
+   * (groundnuty/macf#1074). `undefined` (every agent, and `runner-ops`)
+   * keeps the derived behavior byte-identical — this field exists for the
+   * router App specifically, whose correct install target is the fleet's
+   * REGISTRY (`apply-router-app.ts::routerAppInstallRepos`), not any
+   * agent's repo; `installReposForIdentity`'s generic "no declared-agent
+   * match → every agent repo" fallback would be wrong for it (and, for a
+   * `profile`-scoped registry, would miss the actual target entirely — the
+   * registry can live at a repo that is none of the fleet's agents' repos).
+   * An empty array is a valid, honest override (e.g. `registry.type ===
+   * 'local'`, which has no GitHub App surface at all) — `applyIdentity`
+   * does not special-case it further than gate 2's interstitial listing
+   * zero repos, which the confirm-before-create/install-flow machinery
+   * already tolerates the way it tolerates any other repo list.
+   */
+  readonly installRepos?: readonly string[];
 }
 
 /**
@@ -713,8 +730,10 @@ export async function applyIdentity(
   const guardExpected: ExpectedIdentity = { appSlug: handle, accountLogin: manifest.owner.account };
   // groundnuty/macf#952 — computed ONCE, valid on EITHER gate-2 path (create
   // or resume-install): both derive from `request`/`manifest`, neither from
-  // anything gate 1 produces.
-  const repos = installReposForIdentity(role, manifest);
+  // anything gate 1 produces. groundnuty/macf#1074 —
+  // `request.installRepos`, when supplied, wins outright (see
+  // `IdentityRequest.installRepos`'s doc for why the router App needs this).
+  const repos = request.installRepos ?? installReposForIdentity(role, manifest);
   const whyText = installWhyText(request.permissions);
 
   let decision: CreateGuardDecision;

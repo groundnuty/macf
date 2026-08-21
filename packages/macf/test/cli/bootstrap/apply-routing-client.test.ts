@@ -1,14 +1,17 @@
 /**
  * Tests for `apply-routing-client.ts` — the routing-client mTLS identity
  * ceremony, DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920 gap 2).
- * Fully offline: `mintRoutingClient` / `publishRoutingClientSecrets` /
- * `skippedRoutingClientPublish` are pure over injected deps — no real `gh`,
- * no real crypto. `buildSetSecretArgs` is pinned as a literal argv array
- * (mirrors `variable-write.test.ts`'s `buildCreateVariableArgs` convention)
- * so the "the value never touches argv" property is verifiable without
- * spawning a real `gh` process — `realSetRepoSecret` itself is a thin
- * `spawn` I/O leaf, untested directly (same posture as `vault-write.ts`'s
- * `ageEncryptToFile`).
+ * Fully offline: `mintRoutingClient` / `resolveRoutingClientSecretsForPublish`
+ * are pure over injected deps — no real `gh`, no real crypto.
+ * `buildSetSecretArgs` is pinned as a literal argv array (mirrors
+ * `variable-write.test.ts`'s `buildCreateVariableArgs` convention) so the
+ * "the value never touches argv" property is verifiable without spawning a
+ * real `gh` process — `realSetRepoSecret` itself is a thin `spawn` I/O leaf,
+ * untested directly (same posture as `vault-write.ts`'s `ageEncryptToFile`).
+ *
+ * **The publish half moved to `apply-routing-secrets.test.ts` (groundnuty/
+ * macf#1074)** — see this file's own inline note where `publishRoutingClientSecrets`
+ * used to be tested.
  */
 import { describe, it, expect } from 'vitest';
 import {
@@ -16,29 +19,13 @@ import {
   ROUTING_CLIENT_KEY_SECRET_NAME,
   buildSetSecretArgs,
   mintRoutingClient,
-  publishRoutingClientSecrets,
   resolveRoutingClientSecretsForPublish,
-  skippedRoutingClientPublish,
 } from '../../../src/cli/bootstrap/apply-routing-client.js';
-import type {
-  RoutingClientMintDeps,
-  RoutingClientMintOutcome,
-  RoutingClientPublishDeps,
-  RoutingClientSecretsForPublish,
-  RoutingClientVaultRestoreDeps,
-} from '../../../src/cli/bootstrap/apply-routing-client.js';
+import type { RoutingClientMintDeps, RoutingClientMintOutcome, RoutingClientVaultRestoreDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
 
 function mintDepsWith(overrides: Partial<RoutingClientMintDeps> = {}): RoutingClientMintDeps {
   return {
     mint: async () => ({ certPem: 'FRESH-ROUTING-CLIENT-CERT-PEM', keyPem: 'FRESH-ROUTING-CLIENT-KEY-PEM' }),
-    ...overrides,
-  };
-}
-
-function publishDepsWith(overrides: Partial<RoutingClientPublishDeps> = {}): RoutingClientPublishDeps {
-  return {
-    checkRepoSecretPresence: async () => 'absent',
-    setRepoSecret: async () => {},
     ...overrides,
   };
 }
@@ -171,126 +158,14 @@ describe('mintRoutingClient — mint-or-skip decision table', () => {
   });
 });
 
-describe('publishRoutingClientSecrets — create-only per-repo deploy', () => {
-  const SECRETS: RoutingClientSecretsForPublish = { status: 'available', certPem: 'CERT-PEM-VALUE', keyPem: 'KEY-PEM-VALUE' };
-
-  it('publishes BOTH cert and key to every given repo, using the correct secret names', async () => {
-    const calls: { repo: string; name: string; value: string }[] = [];
-    const result = await publishRoutingClientSecrets(SECRETS, ['o/repo-a', 'o/repo-b'], publishDepsWith({ setRepoSecret: async (repo, name, value) => { calls.push({ repo, name, value }); } }));
-
-    expect(result.certLegs).toEqual({ 'o/repo-a': { status: 'created' }, 'o/repo-b': { status: 'created' } });
-    expect(result.keyLegs).toEqual({ 'o/repo-a': { status: 'created' }, 'o/repo-b': { status: 'created' } });
-    expect(calls).toContainEqual({ repo: 'o/repo-a', name: 'ROUTING_CLIENT_CERT', value: 'CERT-PEM-VALUE' });
-    expect(calls).toContainEqual({ repo: 'o/repo-a', name: 'ROUTING_CLIENT_KEY', value: 'KEY-PEM-VALUE' });
-    expect(calls).toContainEqual({ repo: 'o/repo-b', name: 'ROUTING_CLIENT_CERT', value: 'CERT-PEM-VALUE' });
-    expect(calls).toContainEqual({ repo: 'o/repo-b', name: 'ROUTING_CLIENT_KEY', value: 'KEY-PEM-VALUE' });
-  });
-
-  it('create-only: a repo where the secret is ALREADY PRESENT is left untouched — setRepoSecret is NEVER called for it', async () => {
-    const calls: { repo: string; name: string }[] = [];
-    const result = await publishRoutingClientSecrets(
-      SECRETS,
-      ['o/already-has-it'],
-      publishDepsWith({
-        checkRepoSecretPresence: async () => 'present',
-        setRepoSecret: async (repo, name) => {
-          calls.push({ repo, name });
-        },
-      }),
-    );
-    expect(result.certLegs['o/already-has-it']).toEqual({ status: 'already-present' });
-    expect(result.keyLegs['o/already-has-it']).toEqual({ status: 'already-present' });
-    expect(calls).toEqual([]);
-  });
-
-  it('a setRepoSecret failure resolves that ONE leg to failed, never throws, never blocks the other leg/repo', async () => {
-    const result = await publishRoutingClientSecrets(
-      SECRETS,
-      ['o/repo'],
-      publishDepsWith({
-        setRepoSecret: async (_repo, name) => {
-          if (name === ROUTING_CLIENT_KEY_SECRET_NAME) throw new Error('permission denied');
-        },
-      }),
-    );
-    expect(result.certLegs['o/repo']).toEqual({ status: 'created' });
-    expect(result.keyLegs['o/repo']?.status).toBe('failed');
-  });
-
-  it('NEVER includes the raw cert/key value anywhere in the result — only status/reason strings', async () => {
-    const result = await publishRoutingClientSecrets(SECRETS, ['o/repo'], publishDepsWith());
-    const serialized = JSON.stringify(result);
-    expect(serialized).not.toContain('CERT-PEM-VALUE');
-    expect(serialized).not.toContain('KEY-PEM-VALUE');
-  });
-
-  it('empty repo list -> empty legs, no calls', async () => {
-    let called = false;
-    const result = await publishRoutingClientSecrets(SECRETS, [], publishDepsWith({ setRepoSecret: async () => { called = true; } }));
-    expect(result).toEqual({ certLegs: {}, keyLegs: {} });
-    expect(called).toBe(false);
-  });
-
-  // --- groundnuty/macf#986 — the loop runs REGARDLESS of secrets.status ---
-
-  const UNAVAILABLE: RoutingClientSecretsForPublish = { status: 'unavailable', reason: 'no vault, no fresh mint' };
-
-  it('secrets UNAVAILABLE + repo already has it -> already-present, setRepoSecret NEVER called (idempotent presence check runs independent of secret availability)', async () => {
-    const calls: { repo: string; name: string }[] = [];
-    const result = await publishRoutingClientSecrets(
-      UNAVAILABLE,
-      ['o/already-has-it'],
-      publishDepsWith({
-        checkRepoSecretPresence: async () => 'present',
-        setRepoSecret: async (repo, name) => {
-          calls.push({ repo, name });
-        },
-      }),
-    );
-    expect(result.certLegs['o/already-has-it']).toEqual({ status: 'already-present' });
-    expect(result.keyLegs['o/already-has-it']).toEqual({ status: 'already-present' });
-    expect(calls).toEqual([]);
-  });
-
-  it('secrets UNAVAILABLE + repo is MISSING it -> a LOUD "failed" leg carrying the reason, never a silent "skipped"', async () => {
-    const result = await publishRoutingClientSecrets(UNAVAILABLE, ['o/missing-it'], publishDepsWith());
-    expect(result.certLegs['o/missing-it']?.status).toBe('failed');
-    expect(result.keyLegs['o/missing-it']?.status).toBe('failed');
-    if (result.certLegs['o/missing-it']?.status === 'failed') expect(result.certLegs['o/missing-it'].reason).toContain('no vault, no fresh mint');
-    if (result.keyLegs['o/missing-it']?.status === 'failed') expect(result.keyLegs['o/missing-it'].reason).toContain('no vault, no fresh mint');
-  });
-
-  it('secrets UNAVAILABLE, mixed repos -> already-present for the one that has it, failed for the one that does not — never a blanket outcome', async () => {
-    const result = await publishRoutingClientSecrets(
-      UNAVAILABLE,
-      ['o/has-it', 'o/missing-it'],
-      publishDepsWith({ checkRepoSecretPresence: async (repo) => (repo === 'o/has-it' ? 'present' : 'absent') }),
-    );
-    expect(result.certLegs['o/has-it']).toEqual({ status: 'already-present' });
-    expect(result.certLegs['o/missing-it']?.status).toBe('failed');
-    if (result.certLegs['o/missing-it']?.status === 'failed') expect(result.certLegs['o/missing-it'].reason).toContain('no vault, no fresh mint');
-  });
-
-  // groundnuty/macf#986 review — a DELIBERATE choice, not an accidental
-  // side-effect: `checkRepoSecretPresence` returning `'unknown'` (auth /
-  // network / rate-limit — `observer.ts::checkRepoSecretPresence` NEVER
-  // throws, it degrades to `'unknown'` on any non-404 error) is treated
-  // IDENTICALLY to `'absent'` when `secrets` is `'unavailable'` — both fall
-  // through to `create()`, which throws, which `ensureVariableCreated`
-  // folds into `'failed'`. This is the SAME Amendment A4 honest-unknown
-  // floor `apply-ca.ts::resolveCaCert` already applies (never treat an
-  // unconfirmable read as evidence of "already there"): a transient
-  // presence-check blip on a repo that in fact already has the secret is
-  // indistinguishable, from here, from a repo that genuinely lacks it AND
-  // has no material to fix it with — so it fails loud rather than silently
-  // passing. Pinned here so this is a documented, tested choice, not
-  // something a future refactor discovers by accident.
-  it('secrets UNAVAILABLE + presence UNKNOWN (unconfirmable, e.g. rate-limited) -> "failed", same as "absent" — a DELIBERATE Amendment A4 choice, pinned here', async () => {
-    const result = await publishRoutingClientSecrets(UNAVAILABLE, ['o/unconfirmable'], publishDepsWith({ checkRepoSecretPresence: async () => 'unknown' }));
-    expect(result.certLegs['o/unconfirmable']?.status).toBe('failed');
-    expect(result.keyLegs['o/unconfirmable']?.status).toBe('failed');
-  });
-});
+// `publishRoutingClientSecrets`/`skippedRoutingClientPublish` — RETIRED
+// (groundnuty/macf#1074). This module's publish half moved to
+// `apply-routing-secrets.ts::publishRoutingSecrets` (unified six-secret
+// publisher — see that module's doc for the full rationale, including a
+// live base64-encoding bug this move fixed). The test coverage that used
+// to live here (create-only per-repo deploy, the #986 "never blanket-skip"
+// discipline, the Amendment A4 unknown-presence choice) now lives in
+// `apply-routing-secrets.test.ts`, generalized from 2 secret names to 6.
 
 describe('resolveRoutingClientSecretsForPublish (groundnuty/macf#986)', () => {
   const SKIPPED_PRIOR_MINT: Extract<RoutingClientMintOutcome, { status: 'skipped' }> = {
@@ -366,19 +241,5 @@ describe('resolveRoutingClientSecretsForPublish (groundnuty/macf#986)', () => {
     if (result.status === 'unavailable') {
       expect(result.reason).not.toMatch(/-----BEGIN/);
     }
-  });
-});
-
-describe('skippedRoutingClientPublish (pure)', () => {
-  it('produces a uniform skipped leg for every repo, both cert and key, carrying the given reason', () => {
-    const result = skippedRoutingClientPublish(['o/a', 'o/b'], 'CA was reused; no key in memory');
-    expect(result).toEqual({
-      certLegs: { 'o/a': { status: 'skipped', reason: 'CA was reused; no key in memory' }, 'o/b': { status: 'skipped', reason: 'CA was reused; no key in memory' } },
-      keyLegs: { 'o/a': { status: 'skipped', reason: 'CA was reused; no key in memory' }, 'o/b': { status: 'skipped', reason: 'CA was reused; no key in memory' } },
-    });
-  });
-
-  it('empty repo list -> empty legs', () => {
-    expect(skippedRoutingClientPublish([], 'x')).toEqual({ certLegs: {}, keyLegs: {} });
   });
 });

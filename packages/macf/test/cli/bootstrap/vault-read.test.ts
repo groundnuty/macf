@@ -43,6 +43,10 @@ import {
   readRecoveryArtifact,
   vaultRoutingClientCertPem,
   vaultRoutingClientKeyPem,
+  vaultRouterAppId,
+  vaultRouterAppKeyPem,
+  vaultTsOauthClientId,
+  vaultTsOauthSecret,
   vaultRunnerOpsPrivateKeyPem,
   type VaultAgentObservation,
   type VaultCaObservation,
@@ -526,6 +530,44 @@ describe('vaultRoutingClientCertPem / vaultRoutingClientKeyPem — the routing-c
     const partial = { ROUTING_CLIENT_CERT_B64: Buffer.from('CERT-ONLY', 'utf-8').toString('base64') };
     expect(vaultRoutingClientCertPem(partial)).toBe('CERT-ONLY');
     expect(vaultRoutingClientKeyPem(partial)).toBeUndefined();
+  });
+});
+
+describe('vaultRouterAppId / vaultRouterAppKeyPem / vaultTsOauthClientId / vaultTsOauthSecret — the router-App publish-restore queries (groundnuty/macf#1074)', () => {
+  const raw = parseVaultPlaintext(buildVaultPlaintext(PAYLOAD));
+
+  it('returns the exact original router App ID — a raw field, not base64', () => {
+    expect(vaultRouterAppId(raw)).toBe(PAYLOAD.routing?.appId);
+  });
+
+  it('returns the exact original router App KEY PEM — round-trips through the base64 storage form', () => {
+    expect(vaultRouterAppKeyPem(raw)).toBe(PAYLOAD.routing?.appKeyPem);
+  });
+
+  it('returns the exact original Tailscale OAuth client ID', () => {
+    expect(vaultTsOauthClientId(raw)).toBe(PAYLOAD.routing?.tsOauthClientId);
+  });
+
+  it('returns the exact original Tailscale OAuth secret', () => {
+    expect(vaultTsOauthSecret(raw)).toBe(PAYLOAD.routing?.tsOauthSecret);
+  });
+
+  it('each query is field-specific — never cross-returns a sibling field\'s value', () => {
+    expect(vaultRouterAppId(raw)).not.toBe(PAYLOAD.routing?.appKeyPem);
+    expect(vaultTsOauthClientId(raw)).not.toBe(PAYLOAD.routing?.tsOauthSecret);
+  });
+
+  it('all four return undefined against an empty vault map — never fabricate a value', () => {
+    expect(vaultRouterAppId({})).toBeUndefined();
+    expect(vaultRouterAppKeyPem({})).toBeUndefined();
+    expect(vaultTsOauthClientId({})).toBeUndefined();
+    expect(vaultTsOauthSecret({})).toBeUndefined();
+  });
+
+  it('never appear in a JSON-serialized presence/observation render — same redaction discipline as the routing-client queries', () => {
+    const serialized = JSON.stringify({ presence: queryVaultRoutingPresence(raw) });
+    expect(serialized).not.toContain(PAYLOAD.routing?.appKeyPem);
+    expect(serialized).not.toContain(PAYLOAD.routing?.tsOauthSecret);
   });
 });
 

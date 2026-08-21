@@ -170,12 +170,15 @@ describe('apply real-deps wiring (macf#857 — the seam a unit test cannot see)'
     expect(deps.routingClientDeps.mint).toBe(realMintRoutingClient);
   });
 
-  it('wires the routing-client secret presence-check to observer.ts (the SAME read apply\'s publish step + a future plan-time observer would use)', () => {
-    expect(deps.routingClientDeps.checkRepoSecretPresence).toBe(checkRepoSecretPresence);
+  // groundnuty/macf#1074 — the publish half (checkRepoSecretPresence/
+  // setRepoSecret) moved from `routingClientDeps` to `routingSecretsDeps`
+  // (the unified six-secret publisher's deps), same concrete primitives.
+  it('wires the routing-secrets presence-check to observer.ts (the SAME read apply\'s publish step + a future plan-time observer would use)', () => {
+    expect(deps.routingSecretsDeps.checkRepoSecretPresence).toBe(checkRepoSecretPresence);
   });
 
-  it('wires the routing-client secret CREATE to the real gh-secret-set-via-stdin primitive', () => {
-    expect(deps.routingClientDeps.setRepoSecret).toBe(realSetRepoSecret);
+  it('wires the routing-secrets CREATE to the real gh-secret-set-via-stdin primitive', () => {
+    expect(deps.routingSecretsDeps.setRepoSecret).toBe(realSetRepoSecret);
   });
 
   // --- groundnuty/macf#920 gap 1 — repo-init's tokenSource wiring exists (no npm dep added; asserted for completeness) ---

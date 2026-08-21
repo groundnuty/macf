@@ -221,7 +221,15 @@ import type { ControlRepoInitOutcome } from './apply-control-repo-init.js';
 import { applyControlRepoInit, deriveRouterCarryingRepos } from './apply-control-repo-init.js';
 import type { FleetLockAgentUpdate, FleetLockIdentityChange } from './fleet-lock.js';
 import { composeFleetLock, readFleetLockFile, writeFleetLock } from './fleet-lock.js';
-import type { VaultAgentSecrets, VaultCaSecrets, VaultEncryptFn, VaultRoutingClientSecrets, VaultRunnerOpsSecrets, WriteVaultDeps } from './vault-write.js';
+import type {
+  VaultAgentSecrets,
+  VaultCaSecrets,
+  VaultEncryptFn,
+  VaultRoutingAppSecrets,
+  VaultRoutingClientSecrets,
+  VaultRunnerOpsSecrets,
+  WriteVaultDeps,
+} from './vault-write.js';
 import {
   VaultError,
   ageEncryptToFile,
@@ -243,18 +251,25 @@ import {
   runnerOpsIdentityRequest,
   validateRunnerOpsInstall,
 } from './apply-runner-ops.js';
+import type { RouterAppSecretsForPublish, RouterAppVaultRestoreDeps } from './apply-router-app.js';
+import { ROUTER_APP_ROLE, resolveRouterAppSecretsForPublish, routerAppIdentityRequest, routerAppInstallRepos, validateRouterAppInstall } from './apply-router-app.js';
 import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } from './apply-ca.js';
 import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import type { RunnerRegistrationDeps, RunnerTokenPollOptions } from './apply-routing.js';
 import { formatRunnerPollProgress, publishTrustedActorsGated } from './apply-routing.js';
-import type {
-  RoutingClientApplyDeps,
-  RoutingClientMintOutcome,
-  RoutingClientPublishResult,
-  RoutingClientSecretsForPublish,
-} from './apply-routing-client.js';
-import { mintRoutingClient, publishRoutingClientSecrets, resolveRoutingClientSecretsForPublish, skippedRoutingClientPublish } from './apply-routing-client.js';
+import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientSecretsForPublish } from './apply-routing-client.js';
+import { ROUTING_CLIENT_CERT_SECRET_NAME, ROUTING_CLIENT_KEY_SECRET_NAME, mintRoutingClient, resolveRoutingClientSecretsForPublish } from './apply-routing-client.js';
+import type { RoutingSecretResolution, RoutingSecretsForPublish, RoutingSecretsPublishDeps, RoutingSecretsPublishResult } from './apply-routing-secrets.js';
+import {
+  ROUTING_APP_ID_SECRET_NAME,
+  ROUTING_APP_KEY_SECRET_NAME,
+  TS_OAUTH_CLIENT_ID_SECRET_NAME,
+  TS_OAUTH_SECRET_SECRET_NAME,
+  publishRoutingSecrets,
+  skippedRoutingSecretsPublish,
+  toBase64ForSecret,
+} from './apply-routing-secrets.js';
 import type { ComposeAndWriteVaultDeps, VaultRecipientCountResult } from './vault-read.js';
 import { composeAndWriteVault, readRecoveryArtifact, readVaultRecipientCount, reencryptVault } from './vault-read.js';
 
@@ -304,15 +319,35 @@ export interface FleetApplyDeps {
   readonly trustDeps: CaApplyDeps & RunnerRegistrationDeps;
   /**
    * DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — the
-   * mint-or-skip + create-only per-repo secret-deploy deps for the
-   * macf-actions router's mTLS client identity. A SEPARATE field from
-   * `trustDeps` (unlike `apply-routing.ts`'s `RoutingApplyDeps`, which really
-   * is a `Pick` of the SAME shape) — this ceremony writes GitHub Actions
-   * SECRETS via a wholly different API surface (`gh secret set`, no 409, no
-   * registry leg) than `trustDeps`' variable-write primitives, so sharing one
-   * dep object would blur two independently-testable seams together.
+   * mint-or-skip + vault-restore deps for the macf-actions router's mTLS
+   * client identity. **Publish moved out of this bag (groundnuty/
+   * macf#1074)** — `RoutingClientApplyDeps` no longer includes
+   * `checkRepoSecretPresence`/`setRepoSecret` (those live on
+   * `routingSecretsDeps` below, the unified six-secret publisher's deps);
+   * this field is now MINT/RESTORE only.
    */
   readonly routingClientDeps: RoutingClientApplyDeps;
+  /**
+   * groundnuty/macf#1074 — the unified six-secret routing publish's deps:
+   * the `checkRepoSecretPresence`/`setRepoSecret` primitives (SAME concrete
+   * functions the retired `routingClientDeps` publish half used — a wholly
+   * different API surface than `trustDeps`' variable-write primitives, no
+   * 409, no registry leg, see `apply-routing-secrets.ts`'s doc) PLUS
+   * `readVaultTsOauth` — the operator-supplied Tailscale OAuth vault-restore
+   * closure (Amendment C: `apply` only ever READS this, never mints it).
+   * Combined into ONE bag because both are consumed at the SAME call site
+   * (`publishRoutingSecrets`'s single per-repo emission).
+   */
+  readonly routingSecretsDeps: RoutingSecretsPublishDeps & { readonly readVaultTsOauth?: () => Promise<{ readonly clientId: string; readonly secret: string } | undefined> };
+  /**
+   * groundnuty/macf#1074 — the dedicated per-fleet router App's
+   * vault-restore deps (its IDENTITY ceremony reuses `buildAgentDepsWithRecovery`
+   * like every other App — this field is ONLY for reading its id/key back
+   * from the vault on a `'reused'`/`'resumed-install'` run, mirroring
+   * `routingClientDeps`'s own vault-restore half). See
+   * `apply-router-app.ts::RouterAppVaultRestoreDeps`'s doc.
+   */
+  readonly routerAppVaultDeps: RouterAppVaultRestoreDeps;
   /**
    * The `--runner-token`/`MACF_BOOTSTRAP_RUNNER_TOKEN` value (macf#929) —
    * `undefined`/empty means "no token supplied." Threaded verbatim into
@@ -600,6 +635,15 @@ export interface FleetApplyResult {
    * always-present-even-on-abort discipline below.
    */
   readonly runnerOps: AgentApplyOutcome;
+  /**
+   * The dedicated per-fleet router App's identity outcome (groundnuty/
+   * macf#1074) — a SEPARATE field from `agents`/`runnerOps`, same reasoning
+   * as `runnerOps`'s own doc above: this is a fleet-level identity never
+   * declared in `manifest.agents[]`. See `apply-router-app.ts`'s module doc
+   * for why this App exists. ALWAYS present — a control-repo abort reports
+   * it as `'failed'`, mirroring `runnerOps`'s own always-present discipline.
+   */
+  readonly routerApp: AgentApplyOutcome;
   readonly vault: VaultApplyOutcome;
   /** Accumulated across every incremental `composeFleetLock` call this run — DR-043 Amendment A §A2 "never silently resolve" drift. */
   readonly identityChanges: readonly FleetLockIdentityChange[];
@@ -618,8 +662,18 @@ export interface FleetApplyResult {
    * `runnerJustCreatedRepoReason` for the reason text.
    */
   readonly routing: Readonly<Record<string, EnsureVariableOutcome>>;
-  /** DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — see {@link RoutingClientApplyResult}'s doc. ALWAYS present — a fleet with no confirmed agent repos this run still reports `mint.status`. */
+  /** DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — see {@link RoutingClientApplyResult}'s doc. ALWAYS present — a fleet with no confirmed agent repos this run still reports `mint.status`. `certLegs`/`keyLegs` are a PROJECTION of `routingSecrets` below (groundnuty/macf#1074) — kept for backward compat, not a second publish call. */
   readonly routingClient: RoutingClientApplyResult;
+  /**
+   * The unified six-secret routing publish result (groundnuty/macf#1074) —
+   * `MACF_ROUTING_APP_ID`/`MACF_ROUTING_APP_KEY`/`ROUTING_CLIENT_CERT`/
+   * `ROUTING_CLIENT_KEY`/`TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`, each keyed
+   * by repo. See `apply-routing-secrets.ts::publishRoutingSecrets`'s doc.
+   * This is the field the decisive "all six secret names landed" test
+   * asserts against — never `routingClient` alone, which only ever knew
+   * about two of the six.
+   */
+  readonly routingSecrets: RoutingSecretsPublishResult;
   /**
    * DR-043 Amendment L extended to `versions.actions` (groundnuty/macf#1072)
    * — see {@link ActionsPinReport}'s doc. The REAL `applyFleet` return ALWAYS
@@ -858,6 +912,7 @@ function abortedFleetApplyResult(manifestPath: string, priorLock: FleetLock | nu
     finalLock: priorLock,
     agents: [],
     runnerOps: { role: RUNNER_OPS_ROLE, status: 'failed', reason: `${reason} — see controlRepo above.` },
+    routerApp: { role: ROUTER_APP_ROLE, status: 'failed', reason: `${reason} — see controlRepo above.` },
     vault: { status: 'skipped' },
     identityChanges: [],
     ca: {
@@ -871,6 +926,7 @@ function abortedFleetApplyResult(manifestPath: string, priorLock: FleetLock | nu
       certLegs: {},
       keyLegs: {},
     },
+    routingSecrets: skippedRoutingSecretsPublish([], `${reason} — see controlRepo above.`),
     // groundnuty/macf#1072 — the control repo aborted before step 0.5 (its
     // own repo-init) ever ran, so no repo was even examined for this run —
     // `attempted: false`, same as the "versions: never declared" gate.
@@ -1244,8 +1300,8 @@ export async function applyFleet(
   }
 
   // groundnuty/macf#1071 — the publish target set for anything the router
-  // job itself needs (today: ONLY the routing-client mTLS secrets — see the
-  // routing-client publish section below). See
+  // job itself needs (today: all six routing secrets — see the unified
+  // publish section below). See
   // `apply-control-repo-init.ts::deriveRouterCarryingRepos`'s doc for the
   // fix's decisive derivation logic.
   const routerCarryingRepos: readonly string[] = deriveRouterCarryingRepos(confirmedRepos, controlRepo, controlRepoInit);
@@ -1340,6 +1396,67 @@ export async function applyFleet(
   // field's doc for why: `agents` is 1:1 with `manifest.agents[]` throughout
   // this module, and this App is never declared there).
 
+  // --- groundnuty/macf#1074: the routing App — a THIRD fleet-level identity
+  // (alongside the per-agent Apps and runner-ops), same confirm-before-create
+  // → gate 1 → gate 2 primitive, same "runs after the per-agent loop, before
+  // settleVault" ordering as runner-ops immediately above. See
+  // `apply-router-app.ts`'s module doc for why this is a DEDICATED per-fleet
+  // App rather than a widened agent App or a reused runner-ops.
+  //
+  // `installRepos`: THIS App's correct install target is the fleet's
+  // REGISTRY, never an agent's repo (`routerAppInstallRepos`'s doc) — an
+  // empty result (org/local registry) is passed through unchanged rather
+  // than guessed at; `applyIdentity`'s gate-2 interstitial simply lists zero
+  // repos in that case (registry.type === 'org' is unreachable in practice —
+  // `registry-scope-preflight.ts` already refuses it before ANY consent gate
+  // opens).
+  const routerAppPrior = currentLock?.agents.find((a) => a.role === ROUTER_APP_ROLE);
+  const routerAppDeps: AgentApplyDeps = {
+    ...buildAgentDepsWithRecovery(recoveryRootDir, manifest.metadata.name, recipients, {
+      ...deps,
+      log: (line: string): void => {
+        deps.log(`[router] ${line}`);
+      },
+    }),
+    validateInstall: validateRouterAppInstall,
+  };
+  const routerAppIdentity: AgentApplyOutcome = wouldCreateWithNoRecipient(routerAppPrior, recipients)
+    ? noRecipientPreflightFailure(ROUTER_APP_ROLE)
+    : wouldCreateWithUnreadableVault(routerAppPrior, vaultAlreadyExists, deps.identityKeyPath)
+      ? noVaultAccessPreflightFailure(ROUTER_APP_ROLE, vaultOutPath)
+      : await applyIdentity(
+          routerAppIdentityRequest(routerAppInstallRepos(manifest), repoHomepageUrl(controlRepo.repo)),
+          manifest,
+          routerAppPrior,
+          routerAppDeps,
+        );
+
+  let pendingRoutingAppVaultSecrets: VaultRoutingAppSecrets | undefined;
+  if (routerAppIdentity.status === 'reused' || routerAppIdentity.status === 'resumed-install') {
+    writeIncrementalLock(ROUTER_APP_ROLE, { appId: routerAppIdentity.appId, installId: routerAppIdentity.installId });
+  } else if (routerAppIdentity.status === 'created') {
+    pendingRoutingAppVaultSecrets = { appId: routerAppIdentity.appId, appKeyPem: routerAppIdentity.credentials.pem };
+    pendingCreatedUpdates[ROUTER_APP_ROLE] = {
+      appId: routerAppIdentity.appId,
+      installId: routerAppIdentity.installId,
+      secrets: { app_private_key: routerAppIdentity.credentials.pem },
+    };
+  }
+  // skipped-unverified / drift / failed: no lock write this run — same
+  // "unresolved this run" posture the runner-ops block above applies to its
+  // own identical statuses.
+  deps.log(
+    `Router App: ${routerAppIdentity.status.toUpperCase()}` +
+      (routerAppIdentity.status === 'failed' ||
+      routerAppIdentity.status === 'drift' ||
+      routerAppIdentity.status === 'skipped-unverified'
+        ? ` — ${routerAppIdentity.reason}`
+        : '.'),
+  );
+  // `routerAppIdentity` is threaded straight onto `FleetApplyResult.routerApp`
+  // at the end of this function — a SEPARATE field from `agents`/`runnerOps`,
+  // same reasoning as `runnerOpsIdentity` above.
+
   // --- DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) ---
   //
   // Mint-or-reuse decision FIRST (fleet-level, independent of any one
@@ -1399,27 +1516,33 @@ export async function applyFleet(
     caSecretsForVault,
     routingClientSecretsForVault,
     pendingRunnerOpsVaultSecrets,
+    pendingRoutingAppVaultSecrets,
     deps,
   );
   if (
     vault.status === 'written' &&
-    (Object.keys(pendingCreatedUpdates).length > 0 || caSecretsForVault !== undefined || routingClientSecretsForVault !== undefined)
+    (Object.keys(pendingCreatedUpdates).length > 0 ||
+      caSecretsForVault !== undefined ||
+      routingClientSecretsForVault !== undefined ||
+      pendingRoutingAppVaultSecrets !== undefined)
   ) {
     // Batched, not per-role: `writeVault` just persisted EVERY `created`
     // agent's secret (+ the CA key, when freshly minted, + the routing-client
-    // key, when freshly minted) in ONE `age` invocation, so their lock
-    // entries become durable together too — see the module doc's ordering
-    // rationale. `fleetSecrets` is the CA-key / routing-client fingerprints
-    // ONLY — this is the SOLE place `fingerprints.ca_key`/
-    // `fingerprints.routing_client_key` are ever written (never an
-    // incremental per-agent write), matching `pendingCreatedUpdates`'s
-    // existing batched-only discipline.
+    // key, when freshly minted, + the router App's key, when freshly created
+    // — groundnuty/macf#1074) in ONE `age` invocation, so their lock entries
+    // become durable together too — see the module doc's ordering rationale.
+    // `fleetSecrets` is the CA-key / routing-client / router-App-key
+    // fingerprints ONLY — this is the SOLE place `fingerprints.ca_key`/
+    // `fingerprints.routing_client_key`/`fingerprints.routing_app_key` are
+    // ever written (never an incremental per-agent write), matching
+    // `pendingCreatedUpdates`'s existing batched-only discipline.
     const fleetSecrets =
-      caSecretsForVault !== undefined || routingClientSecretsForVault !== undefined
+      caSecretsForVault !== undefined || routingClientSecretsForVault !== undefined || pendingRoutingAppVaultSecrets !== undefined
         ? vaultFleetSecretsForFingerprint({
             agents: [],
             ...(caSecretsForVault !== undefined ? { ca: caSecretsForVault } : {}),
             ...(routingClientSecretsForVault !== undefined ? { routingClient: routingClientSecretsForVault } : {}),
+            ...(pendingRoutingAppVaultSecrets !== undefined ? { routingApp: pendingRoutingAppVaultSecrets } : {}),
           })
         : undefined;
     const composed = composeFleetLock({
@@ -1482,77 +1605,121 @@ export async function applyFleet(
     deps.log(`CA repo leg (${repo}): ${leg.status}` + (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'));
   }
 
-  // Per-repo routing-client secret deploy (DR-043 §D5 "routing-client
-  // re-mint," groundnuty/macf#920 gap 2; per-repo publish groundnuty/macf#986)
-  // — three cases, deliberately kept as three DISTINCT branches rather than
-  // one blanket "always run the loop" so the two byte-identical-with-pre-#986
-  // cases stay verifiably untouched:
+  // --- groundnuty/macf#1074: the unified six-secret routing publish ---
   //
-  //   1. A cert freshly minted THIS run whose key isn't confirmed durable
-  //      yet (`vault.status !== 'written'`) publishes NOTHING — same
-  //      ordering-safety rule as the CA cert above (deploying an unvaulted
-  //      key would recreate the #799 orphan-cert class). fleet.lock never
-  //      recorded a fingerprint for this run's key, so a retry safely
-  //      re-mints; nothing is orphaned. UNCHANGED from pre-#986.
-  //   2. A cert freshly minted THIS run with its key durable -> publish the
-  //      in-memory material directly, exactly as before (just re-expressed
-  //      through the same `RoutingClientSecretsForPublish` shape case 3
-  //      below uses). UNCHANGED from pre-#986.
-  //   3. Mint was SKIPPED because `lockHasRoutingClientKey` — a PRIOR run
-  //      already minted this fleet's routing-client cert (the ONLY case
-  //      `mintRoutingClient` can return 'skipped' for when this boolean is
-  //      true). THIS is the case #986 is about: a repo added to the fleet
-  //      AFTER that prior mint needs the cert/key published to it, not a
-  //      re-mint. `resolveRoutingClientSecretsForPublish` tries a
-  //      vault-restore (only when `--vault`/`--identity-key` were both
-  //      supplied) before degrading to an honest 'unavailable';
-  //      `publishRoutingClientSecrets` THEN always runs its per-repo
-  //      idempotent loop — `'already-present'` for a repo that already has
-  //      the secret, a loud `'failed'` (never a silent `'skipped'`) for one
-  //      that's missing it and has no material to create it with.
-  //
-  // Every OTHER skip/failure shape — mint skipped because CA was reused and
-  // NOTHING has ever been minted for this fleet (`!lockHasRoutingClientKey`),
-  // or a genuine mint EXCEPTION (groundnuty/macf#954; only reachable when
-  // `!lockHasRoutingClientKey` too, since `mintRoutingClient` only calls
-  // `deps.mint` on that branch) — has NOTHING recoverable from the vault
-  // either way (nothing was ever minted to restore), so it stays the
-  // ORIGINAL blanket `skippedRoutingClientPublish`, byte-identical to
-  // pre-#986 behaviour. Verified against `apply-fleet.test.ts`'s existing
-  // CA-restore fixture (macf#978), which reuses this exact shape
-  // (`lockHasRoutingClientKey === false`, CA restored not minted) and must
-  // NOT start failing `apply`'s exit code over an orthogonal CA concern.
-  let routingClientPublish: RoutingClientPublishResult;
+  // Resolve all six `RoutingSecretResolution`s, THEN call
+  // `apply-routing-secrets.ts::publishRoutingSecrets` exactly ONCE — the
+  // task's explicit "not a second publisher" constraint, and the shape that
+  // makes the decisive test possible (assert the exact 6-name set landed,
+  // never an aggregation of two separate publish calls).
+
+  // ROUTING_CLIENT_CERT / ROUTING_CLIENT_KEY — SAME 3-case resolution
+  // `apply-routing-client.ts` has carried since #920/#986 (mint gating +
+  // vault-restore), now producing `RoutingSecretResolution`s instead of
+  // calling a routing-client-specific publisher. Base64-encoded HERE
+  // (`toBase64ForSecret`) — the fix for the live encoding bug this issue's
+  // implementation found: `agent-router.yml`'s router job base64-DECODES
+  // these two secrets by hand (`echo "$X" | base64 -d`), but the retired
+  // `publishRoutingClientSecrets` passed raw PEM text unencoded (see
+  // `apply-routing-secrets.ts`'s module doc for the full incident) — every
+  // repo #1073 published to got a value the router job's own
+  // `set -euo pipefail` would choke on.
+  let routingClientCert: RoutingSecretResolution;
+  let routingClientKey: RoutingSecretResolution;
   if (routingClientMint.status === 'minted' && vault.status !== 'written') {
-    routingClientPublish = skippedRoutingClientPublish(
-      routerCarryingRepos,
+    const reason =
       'routing-client cert was freshly minted this run but the batched vault write did not succeed — refusing to ' +
-        'deploy the private key to any repo until it is durable. Re-run apply once the vault issue is ' +
-        "fixed. The retry re-mints (fleet.lock never recorded a routing_client_key fingerprint), which is harmless: " +
-        "this run's key was never made durable and was never deployed, so nothing is orphaned.",
-    );
-  } else if (routingClientMint.status === 'minted') {
-    const secretsForPublish: RoutingClientSecretsForPublish = { status: 'available', certPem: routingClientMint.certPem, keyPem: routingClientMint.keyPem };
-    routingClientPublish = await publishRoutingClientSecrets(secretsForPublish, routerCarryingRepos, deps.routingClientDeps);
-  } else if (lockHasRoutingClientKey) {
-    const secretsForPublish = await resolveRoutingClientSecretsForPublish(routingClientMint, true, deps.routingClientDeps);
-    routingClientPublish = await publishRoutingClientSecrets(secretsForPublish, routerCarryingRepos, deps.routingClientDeps);
+      'deploy the private key to any repo until it is durable. Re-run apply once the vault issue is ' +
+      "fixed. The retry re-mints (fleet.lock never recorded a routing_client_key fingerprint), which is harmless: " +
+      "this run's key was never made durable and was never deployed, so nothing is orphaned.";
+    routingClientCert = { status: 'unavailable', reason };
+    routingClientKey = { status: 'unavailable', reason };
   } else {
-    routingClientPublish = skippedRoutingClientPublish(routerCarryingRepos, routingClientMint.reason);
+    const secretsForPublish: RoutingClientSecretsForPublish =
+      routingClientMint.status === 'minted'
+        ? { status: 'available', certPem: routingClientMint.certPem, keyPem: routingClientMint.keyPem }
+        : await resolveRoutingClientSecretsForPublish(routingClientMint, lockHasRoutingClientKey, deps.routingClientDeps);
+    routingClientCert =
+      secretsForPublish.status === 'available'
+        ? { status: 'available', value: toBase64ForSecret(secretsForPublish.certPem) }
+        : { status: 'unavailable', reason: secretsForPublish.reason };
+    routingClientKey =
+      secretsForPublish.status === 'available'
+        ? { status: 'available', value: toBase64ForSecret(secretsForPublish.keyPem) }
+        : { status: 'unavailable', reason: secretsForPublish.reason };
   }
-  deps.log(
-    `Routing-client cert legs: ${String(Object.values(routingClientPublish.certLegs).filter((l) => l.status === 'created').length)} created, ` +
-      `${String(Object.values(routingClientPublish.certLegs).filter((l) => l.status === 'already-present').length)} already-present of ` +
-      `${String(routerCarryingRepos.length)} confirmed repo(s).`,
+
+  // MACF_ROUTING_APP_ID / MACF_ROUTING_APP_KEY — the dedicated router App's
+  // own credentials, resolved from THIS run's identity outcome (created) or
+  // vault-restored (reused/resumed-install) — see
+  // `apply-router-app.ts::resolveRouterAppSecretsForPublish`'s doc for the
+  // full case table (mirrors the routing-client resolution's shape).
+  // `MACF_ROUTING_APP_KEY` is RAW PEM (NOT base64) per `SKILL.md`'s
+  // documented asymmetry + `actions/create-github-app-token`'s own
+  // consumption — never passed through `toBase64ForSecret`.
+  const routerAppSecrets: RouterAppSecretsForPublish = await resolveRouterAppSecretsForPublish(
+    routerAppIdentity,
+    vault.status === 'written',
+    deps.routerAppVaultDeps,
   );
-  for (const [repo, leg] of Object.entries(routingClientPublish.certLegs)) {
-    if (leg.status === 'failed' || leg.status === 'skipped') {
-      deps.log(`Routing-client cert leg (${repo}): ${leg.status} — ${leg.reason}`);
-    }
+  const routingAppId: RoutingSecretResolution =
+    routerAppSecrets.status === 'available' ? { status: 'available', value: routerAppSecrets.appId } : { status: 'unavailable', reason: routerAppSecrets.reason };
+  const routingAppKey: RoutingSecretResolution =
+    routerAppSecrets.status === 'available'
+      ? { status: 'available', value: routerAppSecrets.appKeyPem }
+      : { status: 'unavailable', reason: routerAppSecrets.reason };
+
+  // TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET — ALWAYS operator-supplied via the
+  // vault (Amendment C), NEVER minted by `apply` — read-only, independent
+  // of `vault.status` (this run never WRITES these, so their durability
+  // never depends on THIS run's write succeeding). Gated on
+  // `transport.tailscale_oauth_required`: undeclared means the operator
+  // hasn't set up Tailscale for this fleet yet — an honest, non-refusing
+  // gap (`checkTailscaleOauthPreflight` in `commands/bootstrap-apply.ts`
+  // already refused BEFORE gate 1 if it WAS declared and the vault lacked
+  // values, so reaching here with `tailscale_oauth_required: true` means
+  // the values were already confirmed present at that earlier check).
+  let tsOauthClientId: RoutingSecretResolution;
+  let tsOauthSecret: RoutingSecretResolution;
+  if (!manifest.transport.tailscale_oauth_required) {
+    // 'not-required', NOT 'unavailable' — an undeclared fleet is an honest
+    // "not ready yet," and must never fail the run the way a genuinely
+    // missing DECLARED secret does (see `RoutingSecretResolution`'s doc for
+    // why the two are distinct states, and the incident that motivated the
+    // split: without it, every fleet that hasn't set up Tailscale yet
+    // would fail `apply` outright over an unrelated presence check).
+    const reason = 'transport.tailscale_oauth_required is not declared in fleet.yaml — Tailscale OAuth was never requested for this fleet.';
+    tsOauthClientId = { status: 'not-required', reason };
+    tsOauthSecret = { status: 'not-required', reason };
+  } else {
+    const restored = deps.routingSecretsDeps.readVaultTsOauth !== undefined ? await deps.routingSecretsDeps.readVaultTsOauth() : undefined;
+    const reason =
+      'transport.tailscale_oauth_required is declared but the vault did not yield TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET ' +
+      'this run — supply both --vault and --identity-key to `macf bootstrap apply` so the operator-supplied values ' +
+      'can be read back and published.';
+    tsOauthClientId = restored !== undefined ? { status: 'available', value: restored.clientId } : { status: 'unavailable', reason };
+    tsOauthSecret = restored !== undefined ? { status: 'available', value: restored.secret } : { status: 'unavailable', reason };
   }
-  for (const [repo, leg] of Object.entries(routingClientPublish.keyLegs)) {
-    if (leg.status === 'failed' || leg.status === 'skipped') {
-      deps.log(`Routing-client key leg (${repo}): ${leg.status} — ${leg.reason}`);
+
+  const routingSecretsForPublish: RoutingSecretsForPublish = {
+    [ROUTING_APP_ID_SECRET_NAME]: routingAppId,
+    [ROUTING_APP_KEY_SECRET_NAME]: routingAppKey,
+    [ROUTING_CLIENT_CERT_SECRET_NAME]: routingClientCert,
+    [ROUTING_CLIENT_KEY_SECRET_NAME]: routingClientKey,
+    [TS_OAUTH_CLIENT_ID_SECRET_NAME]: tsOauthClientId,
+    [TS_OAUTH_SECRET_SECRET_NAME]: tsOauthSecret,
+  };
+  const routingSecretsPublish: RoutingSecretsPublishResult = await publishRoutingSecrets(routingSecretsForPublish, routerCarryingRepos, deps.routingSecretsDeps);
+
+  for (const name of Object.keys(routingSecretsForPublish) as (keyof RoutingSecretsForPublish)[]) {
+    const legs = routingSecretsPublish[name];
+    const created = Object.values(legs).filter((l) => l.status === 'created').length;
+    const alreadyPresent = Object.values(legs).filter((l) => l.status === 'already-present').length;
+    deps.log(`Routing secret "${name}" legs: ${String(created)} created, ${String(alreadyPresent)} already-present of ${String(routerCarryingRepos.length)} confirmed repo(s).`);
+    for (const [repo, leg] of Object.entries(legs)) {
+      if (leg.status === 'failed' || leg.status === 'skipped') {
+        deps.log(`Routing secret "${name}" leg (${repo}): ${leg.status} — ${leg.reason}`);
+      }
     }
   }
 
@@ -1684,10 +1851,16 @@ export async function applyFleet(
   }
 
   const ca: CaApplyResult = { resolve: redactCaResolve(caResolve), registryLeg: caPublish.registryLeg, repoLegs: caPublish.repoLegs };
+  // groundnuty/macf#1074 — `certLegs`/`keyLegs` are now a PROJECTION of the
+  // unified six-secret publish result (`routingSecretsPublish`, below),
+  // never a second publish call — kept as a field for backward-compat with
+  // every existing `applyExitCode`/`formatApplyResult`/test consumer of
+  // `result.routingClient.{cert,key}Legs`. `result.routingSecrets` (below)
+  // is the NEW authoritative full-six view.
   const routingClient: RoutingClientApplyResult = {
     mint: redactRoutingClientMint(routingClientMint),
-    certLegs: routingClientPublish.certLegs,
-    keyLegs: routingClientPublish.keyLegs,
+    certLegs: routingSecretsPublish[ROUTING_CLIENT_CERT_SECRET_NAME],
+    keyLegs: routingSecretsPublish[ROUTING_CLIENT_KEY_SECRET_NAME],
   };
   return {
     controlRepo,
@@ -1697,11 +1870,13 @@ export async function applyFleet(
     finalLock: currentLock,
     agents: records,
     runnerOps: runnerOpsIdentity,
+    routerApp: routerAppIdentity,
     vault,
     identityChanges,
     ca,
     routing,
     routingClient,
+    routingSecrets: routingSecretsPublish,
     actionsPin: manifest.versions
       ? { attempted: true, target: manifest.versions.actions, results: actionsPinResults }
       : { attempted: false, results: [] },
@@ -1850,13 +2025,15 @@ async function settleVault(
   caSecrets: VaultCaSecrets | undefined,
   routingClientSecrets: VaultRoutingClientSecrets | undefined,
   runnerOpsSecrets: VaultRunnerOpsSecrets | undefined,
+  routingAppSecrets: VaultRoutingAppSecrets | undefined,
   deps: FleetApplyDeps,
 ): Promise<VaultApplyOutcome> {
   if (
     pendingVaultAgents.length === 0 &&
     caSecrets === undefined &&
     routingClientSecrets === undefined &&
-    runnerOpsSecrets === undefined
+    runnerOpsSecrets === undefined &&
+    routingAppSecrets === undefined
   ) {
     // groundnuty/macf#957 — "nothing NEW to mint this run" does not mean
     // "nothing to do": a recipient added/removed from transport.age_recipients
@@ -1905,6 +2082,7 @@ async function settleVault(
       ...(caSecrets !== undefined ? { ca: caSecrets } : {}),
       ...(routingClientSecrets !== undefined ? { routingClient: routingClientSecrets } : {}),
       ...(runnerOpsSecrets !== undefined ? { runnerOps: runnerOpsSecrets } : {}),
+      ...(routingAppSecrets !== undefined ? { routingApp: routingAppSecrets } : {}),
     });
 
     // DR-043 Amendment D (groundnuty/macf#989) — a vault that ALREADY has

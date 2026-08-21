@@ -97,6 +97,38 @@ export const FleetNetworkSchema = z
 export const FleetTransportSchema = z
   .object({
     age_recipients: z.array(z.string().min(1)),
+    /**
+     * groundnuty/macf#1074 — declares that this fleet's router NEEDS
+     * Tailscale OAuth credentials (`TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`,
+     * two of the six secrets `macf-actions`' `agent-router.yml` declares as
+     * REQUIRED `workflow_call` secrets — see `apply-routing-secrets.ts`'s
+     * module doc). Same shape as `age_recipients`'s own contract: an
+     * operator-provided, never-tool-minted credential (Amendment C) whose
+     * ABSENCE, when declared, refuses BEFORE consent gate 1 rather than
+     * wasting a browser click on a fleet that cannot route
+     * (`checkTailscaleOauthPreflight` in `commands/bootstrap-apply.ts`).
+     *
+     * **Optional, default `false` — undeclared is NOT an error.** A fleet
+     * that hasn't set up Tailscale yet (or is mid-provisioning) simply gets
+     * no refusal and no TS_OAUTH publish attempt this run; the other four
+     * routing secrets (router-App id/key, routing-client cert/key) still
+     * get provisioned/published independently — see
+     * `apply-routing-secrets.ts`'s per-secret resolution.
+     *
+     * **Deliberately NOT `shared.ts_oauth`** (`FleetSharedSchema`, below).
+     * `shared` models a DIFFERENT, unbuilt design — an account-level App
+     * DETECTED AND REUSED across fleets (its own doc: "detected + reused,
+     * never re-created") — and requires a companion `routing_app` string
+     * this codebase has no consumer for. #1074's ruling is a DEDICATED
+     * PER-FLEET routing App (see `apply-router-app.ts`), so overloading
+     * `shared`'s presence as the Tailscale-declared signal would force an
+     * operator to supply a `routing_app` name that gets silently ignored —
+     * exactly the "operator believes X, tool does Y" class this whole issue
+     * is about. `transport.age_recipients` is the precedent this field
+     * actually matches: a flat, purpose-built, operator-supplied-credential
+     * declaration with a refuse-before-gate-1 contract.
+     */
+    tailscale_oauth_required: z.boolean().optional().default(false),
   })
   .strict();
 
@@ -210,6 +242,21 @@ export const FleetCollaboratorSchema = z
  * (the `macf-routing` App silent-duplicate-create hazard DR-035 documented).
  * `ts_oauth` is a REFERENCE (an out-of-band-supplied credential name), never
  * a stored value — the manifest stays secret-free.
+ *
+ * **STALE as of groundnuty/macf#1074 — parsed but UNCONSUMED, same status
+ * as `collaborators` below.** #1074's ruling (re-affirmed after checking
+ * this exact field against `tools/macf-bootstrap`'s reference
+ * implementation) is a DEDICATED PER-FLEET routing App, not this field's
+ * account-wide detect-and-reuse model — per-fleet naming
+ * (`deriveAppHandle(fleetName, 'router')`) dissolves the global-App-name-
+ * uniqueness hazard this field's "shared, reused" design exists to dodge,
+ * so there is no analogous reuse question for a per-fleet App to answer.
+ * See `apply-router-app.ts` for what #1074 actually built, and
+ * `FleetTransportSchema.tailscale_oauth_required` (above) for where the
+ * Tailscale-declaration concern landed instead. Left here unconsumed
+ * (not removed) pending an explicit future reconciliation of whether an
+ * account-wide shared App is ever worth building on top of the per-fleet
+ * one — a design question, not a #1074 concern.
  */
 export const FleetSharedSchema = z
   .object({
@@ -393,8 +440,13 @@ export const FleetLockSchema = z
     fleet: z.string().min(1),
     agents: z.array(FleetLockAgentSchema),
     versions: FleetVersionsSchema.partial().strict().optional(),
-    // Fleet-level fingerprints not tied to one agent (CA key, the shared
-    // macf-routing App creds, TS OAuth, ...).
+    // Fleet-level fingerprints not tied to one agent (CA key, routing-client
+    // cert/key, ...). NOT "the shared macf-routing App" (stale as of
+    // groundnuty/macf#1074 — the routing App is now a DEDICATED per-fleet
+    // identity, recorded like any other role in `agents[]` above, role
+    // `'router'` — see `apply-router-app.ts`). TS OAuth is operator-provided
+    // and lives only in the vault (Amendment C) — `apply` never fingerprints
+    // a value it never mints.
     fingerprints: z.record(z.string(), z.string()).optional(),
   })
   .strict();

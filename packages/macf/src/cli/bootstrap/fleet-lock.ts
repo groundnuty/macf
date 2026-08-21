@@ -110,9 +110,12 @@ export interface ComposeFleetLockInput {
   readonly agentUpdates: Readonly<Record<string, FleetLockAgentUpdate>>;
   /**
    * Fleet-level secrets established/reconfirmed THIS run (the CA key, the
-   * shared `macf-routing` App creds, TS OAuth, the routing-client cert/key,
-   * ...) — name → RAW value, fingerprinted + merged over
-   * `previous.fingerprints` the same way per-agent secrets are.
+   * dedicated per-fleet router App's key, the routing-client cert/key, ...)
+   * — name → RAW value, fingerprinted + merged over `previous.fingerprints`
+   * the same way per-agent secrets are. NOT Tailscale OAuth — that
+   * credential is operator-supplied and read-only from `apply`'s
+   * perspective (Amendment C); `apply` never establishes or fingerprints a
+   * value it never mints.
    */
   readonly fleetSecrets?: Readonly<Record<string, string>>;
   /** `versions:` observed THIS run (§D6 GitOps steering), merged over `previous.versions` field-by-field. */

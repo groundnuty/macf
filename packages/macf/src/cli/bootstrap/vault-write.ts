@@ -121,7 +121,23 @@ export interface VaultAgentSecrets {
   readonly pem: string;
 }
 
-/** The shared `macf-routing` App + the 6 routing secrets (per `macf-consumer-onboarding.md`), fleet-level (one per fleet, not per agent). */
+/**
+ * The 6 routing secrets (per `macf-consumer-onboarding.md`), fleet-level
+ * (one per fleet, not per agent).
+ *
+ * **STALE as of groundnuty/macf#1074 — UNCONSUMED, kept for the same
+ * "parsed but not reconciled" reason `fleet-manifest.ts::FleetSharedSchema`
+ * is.** This type originally modeled a SHARED `macf-routing` App reused
+ * across fleets; #1074's ruling built a DEDICATED PER-FLEET App instead
+ * (`apply-router-app.ts`), whose 2 credential fields
+ * ({@link VaultRoutingAppSecrets}, below) are written through a narrower,
+ * conflict-free type — see that type's doc for why splitting rather than
+ * repurposing this one was the surgical choice. `buildVaultPlaintext`'s
+ * `payload.routing` branch (below) is therefore DEAD CODE today — nothing
+ * in `apply-fleet.ts` populates it — kept only because a future
+ * account-wide-shared-App design (if ever built) would have a natural home
+ * to return to.
+ */
 export interface VaultRoutingSecrets {
   readonly appId: string;
   readonly appKeyPem: string;
@@ -156,6 +172,32 @@ export interface VaultRoutingClientSecrets {
 }
 
 /**
+ * The dedicated per-fleet router App's credentials (groundnuty/macf#1074),
+ * when freshly created THIS run — see `apply-router-app.ts`'s module doc
+ * for why this App exists as a THIRD identity alongside the per-agent Apps
+ * and `runner-ops`. Deliberately narrow (2 fields, not
+ * {@link VaultRoutingSecrets}'s 6) and a SEPARATE type rather than a reuse
+ * of that one: `VaultRoutingSecrets` bundles the routing-client cert/key
+ * together with the App id/key, and this fleet's routing-client cert/key
+ * are ALREADY written independently via {@link VaultRoutingClientSecrets}
+ * (a working, tested ceremony this issue does not touch) — reusing
+ * `VaultRoutingSecrets` here would force populating all 6 fields just to
+ * satisfy the type, duplicating data `payload.routingClient` already owns
+ * and re-triggering {@link buildVaultPlaintext}'s existing
+ * `vault_conflicting_routing_client` guard. Targets the SAME flat
+ * `MACF_ROUTING_APP_ID`/`MACF_ROUTING_APP_KEY_B64` vault keys
+ * {@link VaultRoutingSecrets} already used (see `vault-read.ts`'s
+ * `vaultRouterAppId`/`vaultRouterAppKeyPem` — the read-side consumers) —
+ * one vault.age per fleet makes the flat naming unambiguous regardless of
+ * which writer type produced it.
+ */
+export interface VaultRoutingAppSecrets {
+  readonly appId: string;
+  /** RAW PEM text (not base64 yet — {@link buildVaultPlaintext} encodes it). Secret — never log. */
+  readonly appKeyPem: string;
+}
+
+/**
  * The runner-ops App's credentials (groundnuty/macf#943) — deliberately
  * a SEPARATE type from {@link VaultAgentSecrets}, even though the field shape
  * is identical, because it emits into a DIFFERENT vault namespace (see
@@ -185,6 +227,8 @@ export interface VaultPayload {
   readonly routingClient?: VaultRoutingClientSecrets;
   /** The runner-ops App's credentials (groundnuty/macf#943), when freshly minted this run — see {@link VaultRunnerOpsSecrets}'s doc for why this is its own field, not folded into `agents`. */
   readonly runnerOps?: VaultRunnerOpsSecrets;
+  /** The dedicated per-fleet router App's credentials (groundnuty/macf#1074), when freshly created THIS run — see {@link VaultRoutingAppSecrets}'s doc for why this is its own field, disjoint from `routing`/`routingClient`. */
+  readonly routingApp?: VaultRoutingAppSecrets;
 }
 
 const SHELL_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -346,6 +390,25 @@ export function buildVaultPlaintext(payload: VaultPayload): string {
     emitLine(lines, 'ROUTING_CLIENT_KEY_B64', toBase64(payload.routingClient.clientKeyPem));
   }
 
+  if (payload.routingApp !== undefined) {
+    if (payload.routing !== undefined) {
+      // Same defense-in-depth shape as the `routingClient`-vs-`routing`
+      // guard immediately above (groundnuty/macf#1074): both fields target
+      // the SAME `MACF_ROUTING_APP_ID`/`MACF_ROUTING_APP_KEY_B64` vault
+      // keys (see `VaultRoutingAppSecrets`'s doc); nothing in this codebase
+      // populates BOTH today (`payload.routing` is dead code — see that
+      // type's doc), but a silent double-emit would have `vault.sh`'s
+      // no-eval parse take whichever line landed LAST — never ambiguous.
+      throw new VaultError(
+        'vault_conflicting_routing_app',
+        'buildVaultPlaintext: both payload.routing and payload.routingApp were given — they write the same ' +
+          'MACF_ROUTING_APP_ID/MACF_ROUTING_APP_KEY_B64 vault keys. Supply at most one.',
+      );
+    }
+    emitLine(lines, 'MACF_ROUTING_APP_ID', payload.routingApp.appId);
+    emitLine(lines, 'MACF_ROUTING_APP_KEY_B64', toBase64(payload.routingApp.appKeyPem));
+  }
+
   if (lines.length === 0) {
     throw new VaultError(
       'vault_empty_payload',
@@ -447,6 +510,15 @@ export function vaultFleetSecretsForFingerprint(payload: VaultPayload): Record<s
     // call, never both populated).
     out.routing_client_cert = payload.routingClient.clientCertPem;
     out.routing_client_key = payload.routingClient.clientKeyPem;
+  }
+  if (payload.routingApp !== undefined) {
+    // Same fingerprint field name `payload.routing` would have used for the
+    // App key (groundnuty/macf#1074) — mutually exclusive per
+    // `buildVaultPlaintext`'s `vault_conflicting_routing_app` guard, never
+    // both populated. `appId` is an opaque PUBLIC identifier, not a secret
+    // — no fingerprint needed, same posture `payload.routing`'s comment
+    // above already documents for its own `appId`.
+    out.routing_app_key = payload.routingApp.appKeyPem;
   }
   return out;
 }

@@ -152,9 +152,14 @@ describe('plannedAppNames / checkAppNameLengths — the 34-char pre-flight (grou
     expect(GITHUB_APP_NAME_MAX_LENGTH).toBe(34);
   });
 
-  it('plannedAppNames includes every agent handle PLUS the runner-ops handle, in that order', () => {
+  it('plannedAppNames includes every agent handle PLUS the runner-ops handle PLUS the router handle (groundnuty/macf#1074), in that order', () => {
     const manifest = manifestWithRoles('demo-fleet', ['code-agent', 'science-agent']);
-    expect(plannedAppNames(manifest)).toEqual(['demo-fleet-code-agent', 'demo-fleet-science-agent', 'demo-fleet-runner-ops']);
+    expect(plannedAppNames(manifest)).toEqual([
+      'demo-fleet-code-agent',
+      'demo-fleet-science-agent',
+      'demo-fleet-runner-ops',
+      'demo-fleet-router',
+    ]);
   });
 
   it('checkAppNameLengths: ok when every derived name is <= 34 chars (the documented live-fleet example)', () => {

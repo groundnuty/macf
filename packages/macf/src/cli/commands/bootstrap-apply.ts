@@ -69,6 +69,8 @@ import { realCreateRegistryVariable, realCreateRepoVariable, realMintCa } from '
 import type { EnsureVariableOutcome } from '../bootstrap/ensure-variable.js';
 import type { RoutingClientApplyDeps } from '../bootstrap/apply-routing-client.js';
 import { realMintRoutingClient, realSetRepoSecret } from '../bootstrap/apply-routing-client.js';
+import type { RoutingSecretsPublishDeps } from '../bootstrap/apply-routing-secrets.js';
+import { checkTailscaleOauthPreflight } from '../bootstrap/apply-routing-secrets.js';
 import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
 import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
 import {
@@ -77,12 +79,17 @@ import {
   vaultCaCertPem,
   vaultRoutingClientCertPem,
   vaultRoutingClientKeyPem,
+  vaultRouterAppId,
+  vaultRouterAppKeyPem,
+  vaultTsOauthClientId,
+  vaultTsOauthSecret,
   vaultRunnerOpsPrivateKeyPem,
 } from '../bootstrap/vault-read.js';
 import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
 import type { AppNameLengthCheck } from '../bootstrap/apply-runner-ops.js';
 import { RUNNER_OPS_ROLE, buildRunnerOpsManifest, checkAppNameLengths, deriveRunnerOpsHandle } from '../bootstrap/apply-runner-ops.js';
+import { ROUTER_APP_ROLE } from '../bootstrap/apply-router-app.js';
 import { defaultOperatorRecoveryRootDir, operatorRecoveryArtifactPath } from '../bootstrap/vault-write.js';
 import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflight.js';
 import type { RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
@@ -483,6 +490,19 @@ export async function resolveVaultAgentPems(
   // `pendingCreatedUpdates` lookups on for this role.
   const runnerOpsPem = vaultRunnerOpsPrivateKeyPem(raw, manifest.metadata.name);
   if (runnerOpsPem !== undefined) pems.set(RUNNER_OPS_ROLE, runnerOpsPem);
+  // groundnuty/macf#1074 — the SAME gap #954 closed for runner-ops,
+  // reopened for the router App: `manifest.agents[]` never contains
+  // `ROUTER_APP_ROLE` either (`apply-router-app.ts`'s module doc), so
+  // without this explicit lookup a vault-confirmable router App (a
+  // `'reused'`/`'resumed-install'` outcome with both --vault/--identity-key
+  // supplied) would fall all the way to `skip-unverified` even with a
+  // decryptable key sitting right there — unlike `vaultRunnerOpsPrivateKeyPem`
+  // (which is fleet-name-segmented, since a runner-ops key lives under
+  // `MACF_RUNNER_OPS_<seg>_*`), `vaultRouterAppKeyPem` reads a FLAT key
+  // (`MACF_ROUTING_APP_KEY_B64`, unsegmented — see that function's own doc)
+  // so it takes no `manifest.metadata.name` argument.
+  const routerAppPem = vaultRouterAppKeyPem(raw);
+  if (routerAppPem !== undefined) pems.set(ROUTER_APP_ROLE, routerAppPem);
   return pems;
 }
 
@@ -804,16 +824,28 @@ const REAL_TRUST_DEPS: CaApplyDeps & RunnerRegistrationDeps = {
 
 /**
  * DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920 gap 2) — the real
- * mint-or-skip + create-only per-repo secret-deploy deps. `checkRepoSecretPresence`
- * is the SAME read `plan`'s (future) routing-client observation would use
- * (`observer.ts`, matching `REAL_TRUST_DEPS`'s own "plan and apply agree by
- * construction" discipline); `setRepoSecret`/`mint` are the real `gh secret
- * set`-via-stdin + `certs.ts::mintRoutingClientCert` primitives.
+ * mint-or-skip deps. `mint` is the real `certs.ts::mintRoutingClientCert`
+ * primitive. **Publish moved out (groundnuty/macf#1074)** — see
+ * `REAL_ROUTING_SECRETS_DEPS` below for the (now unified, six-secret)
+ * publish deps `checkRepoSecretPresence`/`setRepoSecret` live on instead.
  */
 const REAL_ROUTING_CLIENT_DEPS: RoutingClientApplyDeps = {
+  mint: realMintRoutingClient,
+};
+
+/**
+ * groundnuty/macf#1074 — the real unified six-secret routing publish deps.
+ * `checkRepoSecretPresence`/`setRepoSecret` are the SAME concrete functions
+ * `REAL_ROUTING_CLIENT_DEPS`'s publish half used to carry (`observer.ts`'s
+ * read, `apply-routing-client.ts::realSetRepoSecret`'s `gh secret set`-via-
+ * stdin write — both reused verbatim, never a second implementation).
+ * `readVaultTsOauth` is wired by `resolveMutateDeps` below (opt-in on
+ * `--vault`/`--identity-key`, same both-or-neither contract every other
+ * vault-restore closure in this file already follows).
+ */
+const REAL_ROUTING_SECRETS_PUBLISH_DEPS: RoutingSecretsPublishDeps = {
   checkRepoSecretPresence,
   setRepoSecret: realSetRepoSecret,
-  mint: realMintRoutingClient,
 };
 
 /**
@@ -955,6 +987,59 @@ export function resolveMutateDeps(
         }
       : undefined;
 
+  // groundnuty/macf#1074 — the router App's vault-restore fallback
+  // (`apply-router-app.ts::RouterAppVaultRestoreDeps.readVaultRouterApp`).
+  // Same both-or-neither / never-throws / never-logs-a-value contract as
+  // `readVaultRoutingClient` immediately above, and the same "re-decrypt
+  // independently, not a hot path" reasoning (invoked at most once per run —
+  // only on a `'reused'`/`'resumed-install'` router App outcome).
+  const readVaultRouterApp =
+    vaultPath !== undefined && identityKeyPath !== undefined
+      ? async (): Promise<{ readonly appId: string; readonly appKeyPem: string } | undefined> => {
+          try {
+            const raw = await readVault({ vaultPath, identityPath: identityKeyPath });
+            const appId = vaultRouterAppId(raw);
+            const appKeyPem = vaultRouterAppKeyPem(raw);
+            if (appId === undefined || appKeyPem === undefined) return undefined;
+            return { appId, appKeyPem };
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            process.stderr.write(
+              `Router-App vault-restore UNAVAILABLE this run — ${reason} — falling back to the existing ` +
+                'honest-unavailable reason (this is NOT evidence the router App key is actually gone, only that ' +
+                'the vault could not be read).\n',
+            );
+            return undefined;
+          }
+        }
+      : undefined;
+
+  // groundnuty/macf#1074 — the Tailscale OAuth vault-read (Amendment C:
+  // operator-provided, `apply` never mints it, so this is READ-ONLY — there
+  // is no mint/create counterpart the way the router App or routing-client
+  // cert have one). Same both-or-neither / never-throws / never-logs-a-value
+  // contract as every other vault-restore closure in this function.
+  const readVaultTsOauth =
+    vaultPath !== undefined && identityKeyPath !== undefined
+      ? async (): Promise<{ readonly clientId: string; readonly secret: string } | undefined> => {
+          try {
+            const raw = await readVault({ vaultPath, identityPath: identityKeyPath });
+            const clientId = vaultTsOauthClientId(raw);
+            const secret = vaultTsOauthSecret(raw);
+            if (clientId === undefined || secret === undefined) return undefined;
+            return { clientId, secret };
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            process.stderr.write(
+              `Tailscale-OAuth vault-read UNAVAILABLE this run — ${reason} — falling back to the existing ` +
+                'honest-unavailable reason (this is NOT evidence the operator never supplied it, only that the ' +
+                'vault could not be read).\n',
+            );
+            return undefined;
+          }
+        }
+      : undefined;
+
   // macf#913 — the vault-aware confirm-before-create guard's key resolver.
   // ONE scratch dir for the WHOLE run (not one per role), created lazily on
   // first use so a vault-free run (the common case) never touches the
@@ -1031,6 +1116,8 @@ export function resolveMutateDeps(
     agentRepoOptions: { confirmUnarchive: true },
     trustDeps: { ...REAL_TRUST_DEPS, ...(readVaultCaCert !== undefined ? { readVaultCaCert } : {}) },
     routingClientDeps: { ...REAL_ROUTING_CLIENT_DEPS, ...(readVaultRoutingClient !== undefined ? { readVaultRoutingClient } : {}) },
+    routingSecretsDeps: { ...REAL_ROUTING_SECRETS_PUBLISH_DEPS, ...(readVaultTsOauth !== undefined ? { readVaultTsOauth } : {}) },
+    routerAppVaultDeps: { ...(readVaultRouterApp !== undefined ? { readVaultRouterApp } : {}) },
     now: () => new Date(),
     log: (line: string) => {
       process.stderr.write(`${line}\n`);
@@ -1818,6 +1905,15 @@ export function applyExitCode(
     result.runnerOps.status === 'failed' ||
     result.runnerOps.status === 'drift' ||
     result.runnerOps.status === 'skipped-unverified';
+  // groundnuty/macf#1074 — same bar as runnerOpsBad: the router App is a
+  // fleet-level identity every one of the six routing secrets ultimately
+  // depends on (MACF_ROUTING_APP_ID/KEY come directly from it), so an
+  // unresolved identity here needs operator attention exactly like an
+  // unresolved runner-ops does.
+  const routerAppBad =
+    result.routerApp.status === 'failed' ||
+    result.routerApp.status === 'drift' ||
+    result.routerApp.status === 'skipped-unverified';
   // DR-043 Amendment D phase 2 (macf#838) — a CA resolve failure or ANY
   // publish-leg failure needs operator attention, same bar as an agent
   // failure. A 'skipped' leg does NOT independently fail the run here — it
@@ -1858,6 +1954,13 @@ export function applyExitCode(
     result.routingClient.mint.status === 'failed' ||
     Object.values(result.routingClient.certLegs).some((leg) => leg.status === 'failed') ||
     Object.values(result.routingClient.keyLegs).some((leg) => leg.status === 'failed');
+  // groundnuty/macf#1074 — the decisive check: a `'failed'` leg on ANY of
+  // the six routing secrets, on ANY repo, fails the run. `routingClientBad`
+  // above already covers two of the six (kept for its own mint-status
+  // check); this covers the OTHER four (MACF_ROUTING_APP_ID/KEY,
+  // TS_OAUTH_CLIENT_ID/SECRET) — the exact gap that let a two-of-six fleet
+  // exit 0 while genuinely unable to route.
+  const routingSecretsBad = Object.values(result.routingSecrets).some((legs) => Object.values(legs).some((leg) => leg.status === 'failed'));
   // groundnuty/macf#1072 — a 'could-not-attempt' router-pin reconcile needs
   // operator attention, same bar as an agent identity failure (`agentBad`
   // above already covers "identity unresolved" independently; this covers
@@ -1868,10 +1971,12 @@ export function applyExitCode(
     controlRepoInitBad ||
     agentBad ||
     runnerOpsBad ||
+    routerAppBad ||
     result.vault.status === 'failed' ||
     caBad ||
     routingBad ||
     routingClientBad ||
+    routingSecretsBad ||
     anyDeployFailed(deployResults) ||
     versionPhase?.halted === true ||
     actionsPinBad
@@ -2011,6 +2116,22 @@ export async function runBootstrapApply(
     const runnerTokenFailure = checkRunnerTokenPreflight(manifest.routing, resolvedRunnerToken);
     if (runnerTokenFailure !== undefined) {
       return renderFailure(runnerTokenFailure, opts);
+    }
+
+    // groundnuty/macf#1074 — the Tailscale-declared refuse-before-gate-1
+    // preflight (Amendment C precedent, same placement + `--dry-run`-skip
+    // posture as `checkRunnerTokenPreflight` immediately above: a dry run
+    // never opens a gate to begin with, and its own plan render carries no
+    // equivalent note today the way `RUNNER_TOKEN_PLAN_NOTE` does for the
+    // runner-token case — flagged as a follow-up, not required for THIS
+    // refusal to be correct). Needs a vault read (unlike the pure
+    // `checkAppNameLengths`/`checkRegistryScopePreflight` checks above), so
+    // it is the ONE async pre-flight in this block.
+    const tailscaleFailure = await checkTailscaleOauthPreflight(manifest.transport.tailscale_oauth_required, opts.vaultPath, opts.identityKeyPath, {
+      readVault: deps?.readVault ?? readVault,
+    });
+    if (tailscaleFailure !== undefined) {
+      return renderFailure(tailscaleFailure, opts);
     }
   }
 

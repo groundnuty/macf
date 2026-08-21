@@ -34,6 +34,7 @@ import type { GitHubAppManifest } from './app-manifest.js';
 import { buildAppManifest } from './app-manifest.js';
 import type { ConfirmedInstall } from './identity-confirm.js';
 import type { IdentityRequest } from './apply-agent.js';
+import { deriveRouterAppHandle } from './apply-router-app.js';
 
 /** The reserved `role` this App is derived + recorded under — never declared in `fleet.yaml`'s `agents[]` (that array is coordination agents only; `FleetManifestSchema` has no knowledge of this role at all). */
 export const RUNNER_OPS_ROLE = 'runner-ops';
@@ -173,15 +174,20 @@ export type AppNameLengthCheck = { readonly ok: true } | { readonly ok: false; r
 
 /**
  * Every App name THIS run would need — every declared agent's derived handle
- * PLUS the runner-ops's. Pure; zero I/O. Exported so both call sites
- * that need the identical list (`commands/bootstrap-apply.ts`'s CLI-level
- * refusal, `apply-fleet.ts`'s own top-of-function refusal — see
- * `checkAppNameLengths`'s doc for why BOTH exist) derive it from one place,
- * never two independently hand-rolled lists that could drift.
+ * PLUS the runner-ops's PLUS the router App's (groundnuty/macf#1074).
+ * Pure; zero I/O. Exported so both call sites that need the identical list
+ * (`commands/bootstrap-apply.ts`'s CLI-level refusal, `apply-fleet.ts`'s own
+ * top-of-function refusal — see `checkAppNameLengths`'s doc for why BOTH
+ * exist) derive it from one place, never two independently hand-rolled
+ * lists that could drift.
  */
 export function plannedAppNames(manifest: FleetManifest): readonly string[] {
   const fleetName = manifest.metadata.name;
-  return [...manifest.agents.map((a: FleetAgent) => deriveAppHandle(fleetName, a.role)), deriveRunnerOpsHandle(fleetName)];
+  return [
+    ...manifest.agents.map((a: FleetAgent) => deriveAppHandle(fleetName, a.role)),
+    deriveRunnerOpsHandle(fleetName),
+    deriveRouterAppHandle(fleetName),
+  ];
 }
 
 /**

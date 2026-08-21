@@ -672,7 +672,16 @@ export interface VaultRoutingPresence {
   readonly tsOauthSecret: VaultFieldPresence;
 }
 
-/** The shared `macf-routing` App + 6-secret routing block's presence — fleet-level, not per-agent (matches `VaultRoutingSecrets` in `vault-write.ts`). */
+/**
+ * The 6-secret routing block's presence — fleet-level, not per-agent
+ * (matches `VaultRoutingSecrets` in `vault-write.ts`). **Naming is STALE as
+ * of groundnuty/macf#1074**: "shared `macf-routing` App" described an
+ * unbuilt, account-wide-reuse design (`VaultRoutingSecrets`'s own doc); the
+ * fields this function checks presence for are now populated by a
+ * DEDICATED PER-FLEET router App instead (`apply-router-app.ts`) — see this
+ * file's "Router App + Tailscale OAuth value decoders" section for the
+ * actual read-side consumers.
+ */
 export function queryVaultRoutingPresence(raw: Readonly<Record<string, string>>): VaultRoutingPresence {
   return {
     appId: fieldPresence(raw, 'MACF_ROUTING_APP_ID', false),
@@ -732,6 +741,85 @@ export function vaultRoutingClientKeyPem(raw: Readonly<Record<string, string>>):
   const b64 = raw['ROUTING_CLIENT_KEY_B64'];
   if (b64 === undefined || b64.length === 0) return undefined;
   return Buffer.from(b64, 'base64').toString('utf-8');
+}
+
+// --- Router App + Tailscale OAuth value decoders (groundnuty/macf#1074) ---
+//
+// These read the SAME flat `MACF_ROUTING_APP_*`/`TS_OAUTH_*` vault keys
+// {@link queryVaultRoutingPresence} already checks presence for (that
+// function + `VaultRoutingSecrets` in `vault-write.ts` predate #1074 and
+// modeled an unbuilt, account-wide SHARED App — see that type's doc for why
+// it's stale). #1074's dedicated PER-FLEET router App reuses these SAME key
+// names: one vault.age file per fleet means a flat (non-fleet-segmented)
+// name is unambiguous within it, exactly like `ROUTING_CLIENT_CERT_B64`
+// above already is for the fleet-wide routing-client cert.
+
+/**
+ * Decode the router App's ID out of an already-decrypted vault raw map — the
+ * router-App sibling of {@link vaultRoutingClientCertPem}. Public-ish (a
+ * numeric App ID, not secret material) but returned via the same
+ * never-fabricate contract as every other query in this module: `undefined`
+ * when absent or empty, never a fabricated value.
+ */
+export function vaultRouterAppId(raw: Readonly<Record<string, string>>): string | undefined {
+  const value = raw['MACF_ROUTING_APP_ID'];
+  if (value === undefined || value.length === 0) return undefined;
+  return value;
+}
+
+/**
+ * Decode the router App's PRIVATE KEY PEM out of an already-decrypted vault
+ * raw map (groundnuty/macf#1074) — the router-App sibling of
+ * {@link vaultRunnerOpsPrivateKeyPem}. Exists for the identical reason: a
+ * re-run against a fleet whose router App was created in a PRIOR run has no
+ * PEM in process memory (only a fresh gate-1 exchange ever does), so
+ * `commands/bootstrap-apply.ts`'s `resolveVaultAgentPems` needs an EXPLICIT
+ * `'router'` lookup alongside its `manifest.agents` loop, mirroring
+ * `RUNNER_OPS_ROLE`'s own explicit entry — `manifest.agents[]` never
+ * contains this role either (`apply-router-app.ts`'s module doc).
+ *
+ * **Caller obligation — same as {@link vaultAgentPrivateKeyPem}/
+ * {@link vaultRunnerOpsPrivateKeyPem}.** The returned string MUST NOT be
+ * logged, printed, or embedded in an error/exception message.
+ *
+ * Returns `undefined` when the field is absent or empty — never fabricates
+ * a key.
+ */
+export function vaultRouterAppKeyPem(raw: Readonly<Record<string, string>>): string | undefined {
+  const b64 = raw['MACF_ROUTING_APP_KEY_B64'];
+  if (b64 === undefined || b64.length === 0) return undefined;
+  return Buffer.from(b64, 'base64').toString('utf-8');
+}
+
+/**
+ * Decode the operator-supplied Tailscale OAuth client ID out of an
+ * already-decrypted vault raw map (groundnuty/macf#1074, Amendment C:
+ * operator-provided, never tool-minted — `apply` only ever READS this
+ * field, never writes it). RAW value, never base64 (`buildVaultPlaintext`'s
+ * `payload.routing` branch emits it with a bare `emitLine`, not
+ * `toBase64`). Returns `undefined` when absent or empty — never fabricates
+ * a value.
+ */
+export function vaultTsOauthClientId(raw: Readonly<Record<string, string>>): string | undefined {
+  const value = raw['TS_OAUTH_CLIENT_ID'];
+  if (value === undefined || value.length === 0) return undefined;
+  return value;
+}
+
+/**
+ * Decode the operator-supplied Tailscale OAuth secret out of an
+ * already-decrypted vault raw map — the sibling of
+ * {@link vaultTsOauthClientId}, same RAW (non-base64) encoding, same
+ * never-write / read-only contract, same never-fabricate return shape.
+ *
+ * **Caller obligation.** This IS secret material (unlike the client ID,
+ * which GitHub/Tailscale treat as a public-ish identifier) — MUST NOT be
+ * logged, printed, or embedded in an error/exception message.
+ */
+export function vaultTsOauthSecret(raw: Readonly<Record<string, string>>): string | undefined {
+  const value = raw['TS_OAUTH_SECRET'];
+  if (value === undefined || value.length === 0) return undefined;
+  return value;
 }
 
 export interface VaultPresenceCount {
