@@ -868,6 +868,28 @@ export type VaultCaObservation =
   | { readonly status: 'confirmed'; readonly presence: VaultCaPresence }
   | { readonly status: 'unknown'; readonly reason: string };
 
+/**
+ * Fleet-level sibling of {@link VaultCaObservation}, for the router App's
+ * presence in THIS fleet's own vault (groundnuty/macf#1105) — a single
+ * boolean, not a multi-field tally like the agent/CA siblings above, because
+ * there is exactly one fact `plan.ts::routerAppItem` needs from the vault:
+ * would `apply-router-app.ts::resolveSharedRouterAppReuse` find a credential
+ * to reuse here, without spending a live GitHub call. `present` reflects
+ * `MACF_ROUTING_APP_ID` only (`vaultRouterAppId`) — the same field the real
+ * reuse decision reads first, before any live name-collision check.
+ *
+ * `'confirmed', present: false` is a genuine, DEFINITE absence — unlike the
+ * GitHub-App-JWT case Amendment A4 forbids proving absent, a successfully
+ * DECRYPTED vault either has `MACF_ROUTING_APP_ID` or it doesn't; there is no
+ * live-API ambiguity here. `'unknown'` is reserved for "the vault itself
+ * could not be read this run" (missing file, bad identity key, wrong key,
+ * malformed content) — the same Amendment A4 floor {@link VaultCaObservation}
+ * already establishes.
+ */
+export type VaultRouterAppObservation =
+  | { readonly status: 'confirmed'; readonly present: boolean }
+  | { readonly status: 'unknown'; readonly reason: string };
+
 // --- Recipient-set reconciliation — DR-043 §D5 (groundnuty/macf#957) ---
 //
 // The gap this closes: an operator adds a second `age_recipients` entry

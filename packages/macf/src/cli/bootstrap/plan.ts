@@ -61,7 +61,7 @@ import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
 import { buildTrustedActorsValue, deriveAppHandle, routerCarryingRepos } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
-import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation } from './vault-read.js';
+import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation, VaultRouterAppObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
 // macf#932 — reuse the SAME flag/env-var name constants `apply`'s own
 // pre-flight refusal names, rather than re-typing them here (this is a
@@ -71,6 +71,13 @@ import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
 // checkRunnerTokenPreflight`'s doc).
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from './apply-routing.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle, runnerOpsNeeded } from './apply-runner-ops.js';
+// groundnuty/macf#1105 — same one-directional-runtime-dependency shape as
+// the `apply-runner-ops.js` import immediately above (that module ITSELF
+// value-imports `deriveRouterAppHandle` from here, so the chain already
+// exists and compiles); `apply-router-app.ts` only ever `import type`s
+// `Presence` from `plan.js`, never a value, so this stays acyclic at runtime.
+import type { RouterAppScope } from './apply-router-app.js';
+import { ROUTER_APP_ROLE, deriveRouterAppHandle } from './apply-router-app.js';
 // groundnuty/macf#999 — the SAME pure pre-flight `commands/bootstrap-apply.ts`
 // refuses `apply` on; `plan` never refuses (it is read-only end to end — see
 // this module's own `checkVaultFlagsComplete` doc for the contrast), it
@@ -274,6 +281,17 @@ export interface ObservedState {
    * into one signal" posture `actionsPin` already establishes).
    */
   readonly controlRepoActionsPin?: string;
+  /**
+   * groundnuty/macf#1105 — the router App's presence in THIS fleet's own
+   * vault. `undefined` when this run had no vault access at all (the
+   * vault-free default; NOT evidence the vault lacks the router App, just
+   * "not asked this run"), same convention as {@link vaultCa}/
+   * {@link vaultRecipients} above. Populated by `observer.ts::vaultAwareObserver`;
+   * `githubRegistryObserver` never sets it. See `routerAppItem`'s doc for why
+   * this field — not just `lock` — drives the router-App plan item's
+   * presence: a SHARED-scope vault-reuse never writes a `fleet.lock` entry.
+   */
+  readonly vaultRouterApp?: VaultRouterAppObservation;
 }
 
 /** Produces an `ObservedState` for a manifest. Implemented by `observer.ts`'s `githubRegistryObserver`; faked in tests. */
@@ -298,7 +316,9 @@ export type PlanItemKind =
   | 'labels'
   | 'routing_client'
   | 'runner_ops'
-  | 'vault_recipients';
+  | 'vault_recipients'
+  /** groundnuty/macf#1105 — the routing App (`apply-router-app.ts`), a fleet-level identity like `'runner_ops'`, but UNCONDITIONAL: `apply-fleet.ts` reaches its ceremony for every fleet (`routerAppScope === 'shared'` is the schema default). See {@link routerAppItem}'s doc. */
+  | 'router_app';
 export type PlanVerb = 'create' | 'update' | 'noop' | 'report-extra';
 
 export interface PlanItem {
@@ -605,6 +625,15 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // (a real, intentional apply behavior — never a silent skip) rather
       // than falling through un-actioned.
       return 'implemented';
+    case 'router_app':
+      // groundnuty/macf#1105 — `apply-fleet.ts` ALREADY drives this identity
+      // through the exact same `applyIdentity` gate1/gate2 primitive as an
+      // 'app'/'runner_ops' item (via `resolveSharedRouterAppReuse` for
+      // shared scope, or directly for per-fleet scope) — this issue is a
+      // DISCLOSURE fix (plan didn't render the item apply already creates),
+      // never a behavior change on apply's side. Produced by `presenceVerb`,
+      // same 'create'-or-'noop'-only shape as 'ca'/'runner_ops' above.
+      return 'implemented';
   }
 }
 
@@ -628,6 +657,7 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'vault_recipients':
     case 'version':
     case 'actions_pin':
+    case 'router_app':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
@@ -636,7 +666,8 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
       // 'routing_client' in groundnuty/macf#920, 'runner_ops' in
       // groundnuty/macf#943, 'vault_recipients' in groundnuty/macf#957,
       // 'version' in macf#1045 / DR-043 Amendment L, 'actions_pin' in
-      // macf#1072 / DR-043 Amendment L extended).
+      // macf#1072 / DR-043 Amendment L extended, 'router_app' in
+      // groundnuty/macf#1105).
       // Kept exhaustive so a NEW `PlanItemKind` added
       // later is a compile error here, not a silent "apply covers
       // everything" false-negative.
@@ -841,6 +872,99 @@ function runnerOpsItem(fleetName: string, lockHasEntry: boolean, needed: boolean
       '(administration:write / actions:read / metadata:read; the main agent App\'s permission set has no ' +
       'administration rights and is deliberately not widened to add them). Provisioning it costs 2 operator consent-gate clicks (App-manifest ' +
       'creation + install), same shape as a coordination agent App.',
+    confirm_required: false,
+  };
+}
+
+/**
+ * The router-App plan item (groundnuty/macf#1105) — ONE item per fleet, the
+ * fleet-level sibling of {@link runnerOpsItem} for `apply-router-app.ts`'s
+ * routing App (mints the registry-read token `agent-router.yml` needs).
+ * **Unconditional**, unlike `runnerOpsItem`'s `needed` gate: `apply-fleet.ts`
+ * reaches this identity's ceremony for EVERY fleet regardless of manifest
+ * content (`routerAppScope === 'shared'` is the schema default, per
+ * macf#1082) — verified against the real call site (`apply-fleet.ts`
+ * ~line 1493 onward): no `registry.type` guard exists there today, despite
+ * `apply-router-app.ts::routerAppInstallRepos`'s doc describing an
+ * "apply-fleet.ts is expected to skip this App's identity ceremony entirely
+ * for a local registry" behavior that is NOT actually implemented — a
+ * separate, pre-existing gap this issue's own audit surfaces but does not
+ * fix (fixing it would be an APPLY behavior change, out of scope for a
+ * disclosure-only fix). Plan renders what apply ACTUALLY does, not what a
+ * sibling doc aspires to.
+ *
+ * Silence here was the exact defect groundnuty/macf#1105 reported:
+ * `apply-fleet.ts` carries the full router-App machinery
+ * (`routerAppIdentityRequest`/`resolveSharedRouterAppReuse`/
+ * `RouterAppApplyOutcome`) and reaches it on every ordinary fleet, but
+ * `plan.ts` never rendered it — the operator's click-ceiling read one
+ * consent gate short of what `apply` actually opens.
+ *
+ * **Presence resolution — two sources, lock first, matching
+ * `resolveSharedRouterAppReuse`'s own vault-then-live-check order, but
+ * through data this Mac-side, offline-safe function can actually read (no
+ * live GitHub call, no App JWT — Amendment A's honest-unknown floor):**
+ *   - `lockHasEntry` — this fleet's OWN `fleet.lock` carries a `role:
+ *     'router'` entry whenever THIS fleet did the original create/reuse
+ *     ceremony, for BOTH scopes (the only status that skips the lock write
+ *     is `'vault-reused'` — see `apply-router-app.ts::RouterAppApplyOutcome`'s
+ *     doc). Same "no lock entry reads as `unknown`" convention `appItem`
+ *     already uses.
+ *   - `vaultRouterApp` — THIS fleet's own vault (`--vault`/`--identity-key`,
+ *     the SAME credentials `resolveSharedRouterAppReuse` itself reads at
+ *     apply time) carrying `MACF_ROUTING_APP_ID`. This is the ONLY way a
+ *     `'vault-reused'` outcome (shared-scope reuse of an App a DIFFERENT
+ *     fleet originally created) is ever visible to a read-only tool, since
+ *     that outcome deliberately never touches THIS fleet's lock — without
+ *     this second source, a fleet using genuine cross-fleet shared reuse
+ *     would read "create" on every single `plan` run, forever, even though
+ *     `apply` mints nothing and reuses everything.
+ * `lockHasEntry` wins when both are available (a lock entry is a STRONGER
+ * fact — it means THIS run's own prior `apply` already confirmed the App
+ * live); the vault is the fallback that makes shared-reuse visible at all;
+ * neither present degrades to `'unknown'` (LOW CONFIDENCE create), the same
+ * floor every other identity item in this file uses.
+ *
+ * **The reason text names the shared-scope refusal possibility, not just
+ * "would create"** — vault-confirmed-absent in SHARED scope has TWO real
+ * apply outcomes (mint, or `routerAppNameCollisionMessage`'s refusal on a
+ * live name collision) that plan cannot distinguish without a live GitHub
+ * call; `bound: 'maximum'` already carries this honestly at the budget
+ * level, but the per-item reason should not read as a promise apply will
+ * always mint.
+ */
+function routerAppItem(
+  fleetName: string,
+  ownerAccount: string,
+  scope: RouterAppScope,
+  lockHasEntry: boolean,
+  vaultRouterApp: VaultRouterAppObservation | undefined,
+): PlanItem {
+  const handle = deriveRouterAppHandle(fleetName, ownerAccount, scope);
+  const presence: Presence = lockHasEntry
+    ? 'present'
+    : vaultRouterApp?.status === 'confirmed'
+      ? vaultRouterApp.present
+        ? 'present'
+        : 'absent'
+      : 'unknown';
+  const { verb, reasonSuffix } = presenceVerb(presence, UNKNOWN_REASONS.identity);
+  const scopeNote =
+    scope === 'shared'
+      ? `a SHARED App reused across every fleet owned by "${ownerAccount}" (transport.router_app_scope: shared, ` +
+        'the default). If no vault credentials for it are supplied and the name is confirmably taken on GitHub ' +
+        'at apply time, apply REFUSES with a two-option instruction rather than minting a duplicate or falling ' +
+        'back to per-fleet scope silently.'
+      : 'a dedicated App for this fleet alone (transport.router_app_scope: per-fleet).';
+  return {
+    kind: 'router_app',
+    target: `router_app:app:${handle}`,
+    verb,
+    reason:
+      `Routing GitHub App "${handle}" ${reasonSuffix} — ${scopeNote} Mints the registry-read token ` +
+      '"agent-router.yml" needs to route; without it the routing plane is fully wired (workflow + client-cert ' +
+      'secrets) but structurally incapable of routing. Provisioning costs 2 operator consent-gate clicks ' +
+      '(App-manifest creation + install), same shape as a coordination agent App.',
     confirm_required: false,
   };
 }
@@ -1411,10 +1535,13 @@ function actionsVersionItem(repo: string, desired: string, observed: string | un
  * The pure §D3 three-verb reconcile. Deterministic ordering: the
  * control-repo-archived item FIRST when applicable (DR-043 Amendment G —
  * mirrors `apply-fleet.ts`'s own "control repo is step 0, before any
- * per-agent processing" ordering), then per-agent items (app, repo, an
- * agent-repo-archived item right after `repo` when applicable — macf#1034,
- * the per-agent sibling of the control-repo-archived item above — install,
- * secret_fingerprint) in manifest `agents[]` order, then the CA items
+ * per-agent processing" ordering), then the two fleet-level identities —
+ * `runner_ops` (conditional on `routing.runner.runs_on: self-hosted`,
+ * macf#943/#1083) then `router_app` (UNCONDITIONAL, macf#1105) — then
+ * per-agent items (app, repo, an agent-repo-archived item right after `repo`
+ * when applicable — macf#1034, the per-agent sibling of the
+ * control-repo-archived item above — install, secret_fingerprint) in
+ * manifest `agents[]` order, then the CA items
  * (registry, then one per agent repo in manifest order — a MACF fleet
  * always needs a CA, so these are UNCONDITIONAL as of macf#839 review nit 5,
  * not gated on `trust:` being declared), then the routing item (only when
@@ -1442,6 +1569,16 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
   const runnerOpsHasLockEntry = observed.lock?.agents.some((a) => a.role === RUNNER_OPS_ROLE) ?? false;
   const runnerOps = runnerOpsItem(fleetName, runnerOpsHasLockEntry, runnerOpsNeeded(manifest));
   if (runnerOps !== undefined) items.push(runnerOps);
+
+  // groundnuty/macf#1105 — fleet-level, ordered right after `runnerOps`
+  // (both are "before any per-agent processing" fleet-level identities) —
+  // UNCONDITIONAL, unlike `runnerOps` above: `apply-fleet.ts` reaches this
+  // App's ceremony for every fleet (see `routerAppItem`'s doc). `owner.account`
+  // (never the operator's own account) is what the 'shared' scope keys on,
+  // per macf#1088 — see `deriveRouterAppHandle`'s doc.
+  const routerAppScope: RouterAppScope = manifest.transport.router_app_scope === 'per-fleet' ? 'per-fleet' : 'shared';
+  const routerAppHasLockEntry = observed.lock?.agents.some((a) => a.role === ROUTER_APP_ROLE) ?? false;
+  items.push(routerAppItem(fleetName, manifest.owner.account, routerAppScope, routerAppHasLockEntry, observed.vaultRouterApp));
 
   for (const agent of manifest.agents) {
     const obs = observed.agents[agent.role];
@@ -1663,13 +1800,14 @@ export function formatRegistryRepoScopeLines(notices: readonly RegistryRepoScope
 // preview shape, left for a future increment rather than folded in here.
 
 /**
- * How many App-identity creations (coordination agents + the runner-ops)
- * this plan's items call for — gate-1 driver in the common case where every
- * counted role also needs gate 2 (the `plan`-only vantage point: it never
- * live-confirms, so it cannot distinguish a `'resume-install'`-shaped role
- * from a plain create-candidate — see {@link operatorInteractionBudget}'s
- * doc for the richer apply-side count that CAN). Pure; zero I/O. Callers
- * that already filtered/refined a plan's items for a richer reason (e.g.
+ * How many App-identity creations (coordination agents + the runner-ops +
+ * the router App, groundnuty/macf#1105) this plan's items call for —
+ * gate-1 driver in the common case where every counted role also needs
+ * gate 2 (the `plan`-only vantage point: it never live-confirms, so it
+ * cannot distinguish a `'resume-install'`-shaped role from a plain
+ * create-candidate — see {@link operatorInteractionBudget}'s doc for the
+ * richer apply-side count that CAN). Pure; zero I/O. Callers that already
+ * filtered/refined a plan's items for a richer reason (e.g.
  * `commands/bootstrap-apply.ts`'s vault-aware `displayCreations`, which can
  * be LOWER than this count when a prior `fleet.lock` entry lets `apply`
  * confirm-and-reuse — macf#913/#915) should pass THEIR OWN count into
@@ -1678,7 +1816,7 @@ export function formatRegistryRepoScopeLines(notices: readonly RegistryRepoScope
  * `macf bootstrap plan` renders.
  */
 export function countAppsToCreate(items: readonly PlanItem[]): number {
-  return items.filter((i) => (i.kind === 'app' || i.kind === 'runner_ops') && i.verb === 'create').length;
+  return items.filter((i) => (i.kind === 'app' || i.kind === 'runner_ops' || i.kind === 'router_app') && i.verb === 'create').length;
 }
 
 /**

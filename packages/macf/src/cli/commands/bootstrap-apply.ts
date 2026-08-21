@@ -89,7 +89,7 @@ import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
 import type { AppNameLengthCheck, RunnerOpsApplyOutcome } from '../bootstrap/apply-runner-ops.js';
 import { RUNNER_OPS_ROLE, buildRunnerOpsManifest, checkAppNameLengths, deriveRunnerOpsHandle } from '../bootstrap/apply-runner-ops.js';
-import { ROUTER_APP_ROLE } from '../bootstrap/apply-router-app.js';
+import { ROUTER_APP_ROLE, buildRouterAppManifest, deriveRouterAppHandle, routerAppInstallRepos } from '../bootstrap/apply-router-app.js';
 import { defaultOperatorRecoveryRootDir, operatorRecoveryArtifactPath } from '../bootstrap/vault-write.js';
 import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflight.js';
 import type { RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
@@ -345,6 +345,35 @@ export function plannedAppCreations(
     });
   }
 
+  // groundnuty/macf#1105 — the router App, a fleet-level `create` candidate
+  // (`plan.ts::routerAppItem`), rendered here so the operator sees the exact
+  // manifest + install target BEFORE spending its 2 consent-gate clicks —
+  // the SAME disclosure `runnerOpsCreating` above already gives runner-ops.
+  // `apply-router-app.ts::buildRouterAppManifest`'s doc used to call this
+  // render "NOT yet wired there" — this is that wiring. `repo: ''` — this
+  // App also has no home repo (its install target is the fleet's REGISTRY,
+  // never an agent repo — `routerAppInstallRepos`'s doc); rendered the same
+  // way `formatPlannedAppCreations` already renders runner-ops.
+  const routerAppCreating = plan.items.some((i) => i.kind === 'router_app' && i.verb === 'create');
+  if (routerAppCreating) {
+    const routerAppScope = manifest.transport.router_app_scope === 'per-fleet' ? 'per-fleet' : 'shared';
+    const routerAppHandle = deriveRouterAppHandle(manifest.metadata.name, manifest.owner.account, routerAppScope);
+    // Same homepage derivation the runner-ops block above uses (this App
+    // also has no home repo of its own).
+    const routerHomepage = repoHomepageUrl(`${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`);
+    const routerManifest = buildRouterAppManifest(manifest.metadata.name, manifest.owner.account, redirectUrl, routerHomepage, routerAppScope);
+    out.push({
+      role: ROUTER_APP_ROLE,
+      repo: '',
+      manifest: routerManifest,
+      installUrl: appInstallationUrl(routerAppHandle),
+      // `routerAppInstallRepos` — the fleet's registry target, never an
+      // agent repo (see that function's doc) — NOT `installReposForIdentity`
+      // (which has no concept of this identity's real install target).
+      installRepos: routerAppInstallRepos(manifest),
+    });
+  }
+
   return out;
 }
 
@@ -384,19 +413,25 @@ export function formatPlannedAppCreations(creations: readonly PlannedAppCreation
       .map(([k, v]) => `${k}:${v}`)
       .join(', ');
     // groundnuty/macf#943 — the runner-ops's set is DR-019-DISJOINT by
-    // design (see `apply-runner-ops.ts::RUNNER_OPS_PERMISSIONS`'s
-    // doc); labeling it "(DR-019)" here would misrepresent it as the derived
-    // agent set.
-    const permsLabel = c.role === RUNNER_OPS_ROLE ? 'permissions (runner-ops, ONE-WAY RATCHET — never widen)' : 'permissions';
+    // design (see `apply-runner-ops.ts::RUNNER_OPS_PERMISSIONS`'s doc);
+    // groundnuty/macf#1105 — the router App's set is ALSO DR-019-DISJOINT +
+    // ONE-WAY-RATCHET, for the identical export-class-key reason (see
+    // `apply-router-app.ts::ROUTER_APP_PERMISSIONS`'s doc); labeling either
+    // "(DR-019)" here would misrepresent it as the derived agent set.
+    const permsLabel =
+      c.role === RUNNER_OPS_ROLE || c.role === ROUTER_APP_ROLE ? 'permissions (ONE-WAY RATCHET — never widen)' : 'permissions';
     parts.push(`      ${permsLabel}: ${perms}`);
     parts.push(`      events: ${c.manifest.default_events.join(', ')}`);
     parts.push(`      public: ${String(c.manifest.public)}   webhook active: ${String(c.manifest.hook_attributes.active)}`);
     parts.push(`      consent gate 2 (install, after gate 1 creates the App): ${c.installUrl}`);
-    if (c.role === RUNNER_OPS_ROLE) {
+    if (c.role === RUNNER_OPS_ROLE || c.role === ROUTER_APP_ROLE) {
       // groundnuty/macf#952 — the literal repo names, never "this fleet's
       // repos": a class description isn't actionable at GitHub's repo-picker
-      // dropdown. `c.installRepos` is the SAME `installReposForIdentity`
-      // derivation the live gate-2 interstitial renders.
+      // dropdown. `c.installRepos` is the SAME derivation the live gate-2
+      // interstitial renders (`installReposForIdentity` for runner-ops;
+      // `routerAppInstallRepos` for the router App — groundnuty/macf#1105,
+      // same narrow-install discipline `validateRouterAppInstall` enforces
+      // post-gate-2).
       parts.push(
         `      ⚠ on the install page: choose "Only select repositories" and select exactly: ` +
           `${c.installRepos.join(', ')} — NEVER "All repositories".`,
