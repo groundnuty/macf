@@ -1711,7 +1711,7 @@ trust:
       expect(result.controlRepoInit.status).toBe('written');
     });
 
-    it('DECISIVE (real GitHub label API) — the control repo receives a label POST for all three agents + the 4 status labels; idempotent re-run reports "existed", never a duplicate "created", and does not rewrite the workflow file', async () => {
+    it('DECISIVE (real GitHub label API) — the control repo receives a label POST for all three agents + the 5 status labels; idempotent re-run reports "existed", never a duplicate "created", and does not rewrite the workflow file', async () => {
       // Same shape as "the decisive routability test" above (macf#920) —
       // real repoInit()'s createLabel() hits a stubbed `fetch`, so this
       // observes the ACTUAL label POSTs the control repo receives, not a
@@ -1757,7 +1757,7 @@ trust:
           });
         }
         expect(controlLabelPosts.map((p) => p.name).sort()).toEqual([
-          'agent-offline', 'blocked', 'code-agent', 'in-progress', 'in-review', 'science-agent', 'writing-agent',
+          'agent-offline', 'backlog', 'blocked', 'code-agent', 'in-progress', 'in-review', 'science-agent', 'writing-agent',
         ]);
         for (const post of controlLabelPosts) expect(post.auth).toBe('Bearer ghs_control-repo-labels-test-token');
         const workflowAfterFirst = readFileSync(workflowPath, 'utf-8');
@@ -1777,7 +1777,7 @@ trust:
         // attempts the create call), but every one now maps to 'existed',
         // never a second 'created' — the idempotency guarantee.
         expect(controlLabelPosts.map((p) => p.name).sort()).toEqual([
-          'agent-offline', 'blocked', 'code-agent', 'in-progress', 'in-review', 'science-agent', 'writing-agent',
+          'agent-offline', 'backlog', 'blocked', 'code-agent', 'in-progress', 'in-review', 'science-agent', 'writing-agent',
         ]);
         // The workflow file itself is untouched byte-for-byte on the
         // re-run — writeFileSafe skips an existing file without --force
@@ -2766,9 +2766,9 @@ trust:
       const agentLabelPosts = labelPosts.filter((p) => p.url.includes('/repos/groundnuty/demo-code/'));
       const controlLabelPosts = labelPosts.filter((p) => p.url.includes('/repos/groundnuty/demo-fleet-control/'));
       const postedLabelNames = agentLabelPosts.map((p) => (p.body as { name: string }).name).sort();
-      expect(postedLabelNames).toEqual(['agent-offline', 'blocked', 'code-agent', 'in-progress', 'in-review']);
+      expect(postedLabelNames).toEqual(['agent-offline', 'backlog', 'blocked', 'code-agent', 'in-progress', 'in-review']);
       const controlLabelNames = controlLabelPosts.map((p) => (p.body as { name: string }).name).sort();
-      expect(controlLabelNames).toEqual(['agent-offline', 'blocked', 'code-agent', 'in-progress', 'in-review']);
+      expect(controlLabelNames).toEqual(['agent-offline', 'backlog', 'blocked', 'code-agent', 'in-progress', 'in-review']);
       expect(result.controlRepoInit.status).toBe('written');
       if (result.controlRepoInit.status === 'written') expect(result.controlRepoInit.labels.status).toBe('ok');
       // Every label POST (agent AND control repo) authenticated with the
