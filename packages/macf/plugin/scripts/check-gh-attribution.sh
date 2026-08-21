@@ -31,7 +31,11 @@
 #
 # Refs: groundnuty/macf#489 (this hook); silent-fallback-hazards.md
 #       Instance 12; coordination.md §Token & Git Hygiene (the attribution
-#       trap); #140 / #244+#272 / #270 / #431 (sister Path-2 hooks).
+#       trap); #140 / #244+#272 / #270 / #431 (sister Path-2 hooks);
+#       groundnuty/macf#938 (routes the author lookup through a credential-
+#       refresh wrapper — see query_author() below; this hook's fail-open
+#       posture is unchanged, since PostToolUse cannot block a write that
+#       already happened — the fix is visibility, not enforcement).
 set -uo pipefail
 
 # Cheap exit on operator override — no stdin read, no parsing.
@@ -116,18 +120,48 @@ else
   API_PATH="/repos/${OWNER}/${REPO}/issues/${NUM}"
 fi
 
+# shellcheck source=./hook-gh-token.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hook-gh-token.sh"
+
 # ── Query the author (short timeout; one brief retry for API consistency) ─
 # The resource was JUST created, so a first read can occasionally race the
 # write through GitHub's read replicas. One `sleep 1` retry handles that
 # without materially delaying the turn. gh failure / empty → fail open.
+#
+# groundnuty/macf#938: routed through macf_hook_gh (hook-gh-token.sh) so a
+# merely-EXPIRED ambient token (this PostToolUse hook, like its siblings,
+# inherits the session's 1-hour installation token) gets one refresh-and-
+# retry before falling back to this hook's pre-existing fail-open posture.
+# That posture is UNCHANGED here — this hook cannot block (the write it's
+# checking already happened), so "could not verify" and "verified fine"
+# both end in exit 0 either way. What changes is visibility: on an
+# unrefreshable auth failure, a diagnostic now goes to stderr instead of
+# silently doing nothing, so "the check never actually ran this time" is
+# distinguishable from "the check ran and found no mismatch" in the log.
 query_author() {
-  GH_PAGER= gh api "$API_PATH" --jq '{login: .user.login, type: .user.type}' 2>/dev/null
+  local resp rc=0
+  resp="$(GH_PAGER= macf_hook_gh api "$API_PATH" --jq '{login: .user.login, type: .user.type}')" || rc=$?
+  printf '%s' "$resp"
+  return "$rc"
 }
-RESP="$(query_author || true)"
-if [[ -z "$RESP" ]]; then
+RC=0
+RESP="$(query_author)" || RC=$?
+if [[ "$RC" -eq 2 ]]; then
+  # other_failed (network / 404 / read-replica lag on a just-created
+  # resource, etc.) — retry once after a short pause, unchanged from
+  # before this fix. Skipped for auth_failed (RC=1): macf_hook_gh already
+  # attempted a refresh + retry internally, so an immediate second attempt
+  # here would just repeat the same failed dance.
   sleep 1
-  RESP="$(query_author || true)"
+  RC=0
+  RESP="$(query_author)" || RC=$?
 fi
+
+if [[ "$RC" -eq 1 ]]; then
+  echo "MACF attribution-result check: could not verify this write's author — ${RESP:-no diagnostic available}. This check did not run (exit code is unaffected — this hook cannot block a write that already happened)." >&2
+  exit 0
+fi
+
 [[ -z "$RESP" ]] && exit 0
 
 ACTUAL_LOGIN="$(jq -r '.login // ""' <<<"$RESP" 2>/dev/null || echo "")"

@@ -35,7 +35,12 @@
 #       rule, distributed via `macf rules refresh`); DR-023 amendment
 #       (bash-form decision rule); macf#262 / PR #263 (LGTM rule
 #       codification); PR #275 / macf#244+#272 (empirical pattern);
-#       groundnuty/macf#822 (operator-login sanction-comment path).
+#       groundnuty/macf#822 (operator-login sanction-comment path);
+#       groundnuty/macf#938 (credential-refresh + auth-failure-fails-
+#       closed — the ambient $GH_TOKEN is a 1-hour installation token,
+#       so a long session's `gh pr view` call below can hit an
+#       authentication failure that is unrelated to whether a review
+#       exists; see the `macf_hook_gh` call below).
 set -euo pipefail
 
 # Cheap exit on operator override — no stdin read, no parsing.
@@ -194,21 +199,80 @@ elif [[ "$COMMAND" =~ (^|[[:space:]])-R[[:space:]]+([^[:space:]]+) ]]; then
   REPO_FLAG="--repo ${BASH_REMATCH[2]}"
 fi
 
+# shellcheck source=./hook-gh-token.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hook-gh-token.sh"
+
 # Query PR author + reviews + comments. Use one `gh pr view --json
 # author,reviews,comments` call rather than separate `gh api` round-trips
 # — gh handles repo detection if --repo was on the original command.
 # `comments` feeds the (c) operator-login sanction-comment path below
 # (macf#822 Part 2); it's always requested (single round-trip) even when
 # MACF_OPERATOR_LOGIN is unset — the extra field is simply unused in that
-# case. Defense-in-depth: any failure (gh missing, network, 404, auth) →
-# fail-open. Same posture as check-gh-token.sh.
+# case.
+#
+# groundnuty/macf#938: the ambient $GH_TOKEN this hook inherits at launch
+# is a 1-hour installation token. Past the first hour of any session, a
+# call here can 401 for a reason that has NOTHING to do with whether an
+# approval exists — the credential died, not the review. Routing the call
+# through macf_hook_gh (hook-gh-token.sh) means a merely-EXPIRED token gets
+# one refresh-and-retry before we give up, so the common case (a long
+# session, a live App key) still gets a real answer instead of a
+# false "could not verify".
+#
+# Posture past that retry (macf#938's actual decision point): the ORIGINAL
+# "any failure (gh missing, network, 404, auth) → fail-open" blanket is now
+# split in two —
+#   - other_failed (gh missing / network down / 404 / malformed args):
+#     UNCHANGED — still fails open. A hook that blocks every merge because
+#     GitHub itself is unreachable would be its own outage, and `gh pr
+#     merge` needs that same connectivity to succeed anyway, so failing
+#     open here doesn't let a merge through GitHub couldn't also perform.
+#   - auth_failed (the credential is expired/invalid AND a refresh attempt
+#     also failed to fix it): fails CLOSED instead. This is NOT "GitHub is
+#     unreachable" — it is "this workspace's credential is broken", which
+#     is a locally fixable condition, not an outage. A merge gate that
+#     cannot ask GitHub whether an approval exists must not read that
+#     silence as an approval — see silent-fallback-hazards.md Instance 1
+#     (the expiry sub-case this closes for the hook family) and the
+#     amended fail-open paragraph in pr-discipline.md.
 #
 # Strip surrounding quotes from REPO_FLAG's value if quoted.
 PR_JSON=""
+GH_RC=0
 # shellcheck disable=SC2086
-if ! PR_JSON="$(gh pr view "$PR_NUMBER" $REPO_FLAG --json author,reviews,comments 2>/dev/null)"; then
+PR_JSON="$(macf_hook_gh pr view "$PR_NUMBER" $REPO_FLAG --json author,reviews,comments)" || GH_RC=$?
+
+if [[ "$GH_RC" -eq 1 ]]; then
+  cat >&2 <<ERR
+BLOCKED by MACF lgtm-gate hook: could not verify PR #${PR_NUMBER}'s review
+state. ${PR_JSON}
+
+This is NOT "no approval exists" — it is "the check could not ask GitHub".
+The credential this hook needs to verify a merge is expired or invalid, and
+refreshing it did not fix it. A merge gate that cannot verify must not
+silently allow the merge through.
+
+Likely causes: this workspace's APP_ID / INSTALL_ID / KEY_PATH are wrong,
+the App's private key was rotated without updating this workspace, or
+GitHub's own auth service is down (rare).
+
+Fix the credential, then retry the merge:
+  GH_TOKEN=\$("\$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" \\
+    --app-id "\$APP_ID" --install-id "\$INSTALL_ID" --key "\$KEY_PATH") || exit 1
+  export GH_TOKEN
+
+Override (ONLY for a reporter-sanctioned exception, same escape hatch as a
+missing-LGTM block) is launch-time / operator only: MACF_SKIP_LGTM_CHECK=1, set
+before ./claude.sh launches.
+ERR
+  exit 2
+elif [[ "$GH_RC" -ne 0 ]]; then
+  # other_failed — unchanged posture: a genuine infrastructure failure
+  # (network down, gh missing, malformed args, a real 404) still fails
+  # open, exactly as before this fix.
   exit 0
 fi
+
 if [[ -z "$PR_JSON" ]]; then
   exit 0
 fi
