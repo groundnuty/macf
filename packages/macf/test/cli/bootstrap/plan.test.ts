@@ -83,8 +83,11 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
     // no runner-ops App (groundnuty/macf#1083; see the dedicated describe
     // block for the conditional-creation behavior itself). +1 `router_app`
     // item — UNCONDITIONAL regardless of `routing:` (groundnuty/macf#1105;
-    // see the dedicated describe block below).
-    expect(plan.items).toHaveLength(16);
+    // see the dedicated describe block below). +1 `ts_oauth` item — ALSO
+    // UNCONDITIONAL (groundnuty/macf#1109); no `observed.vaultTsOauth` this
+    // run degrades to the low-confidence 'create' branch, same as every
+    // other unknown-presence item here.
+    expect(plan.items).toHaveLength(17);
     for (const item of plan.items) {
       expect(item.verb).toBe('create');
       expect(item.confirm_required).toBe(false);
@@ -219,22 +222,23 @@ describe('computePlan — all-match observed state → all noops', () => {
     // 2 caRepo + routing + runner_warm (macf#942) + 2 routing_client + the
     // fleet-level runner_ops item (groundnuty/macf#943; control_repo item
     // absent — not archived) + the fleet-level router_app item
-    // (groundnuty/macf#1105, UNCONDITIONAL).
-    expect(plan.items).toHaveLength(19);
+    // (groundnuty/macf#1105, UNCONDITIONAL) + the fleet-level ts_oauth item
+    // (groundnuty/macf#1109, UNCONDITIONAL).
+    expect(plan.items).toHaveLength(20);
     for (const item of plan.items) {
       // `labels` is a structural exception: it has NO plan-time observed
       // read at all (see `labelsItem`'s doc — a per-label API read is out of
       // scope), so it ALWAYS degrades to a LOW-CONFIDENCE `create`-candidate
       // regardless of how "matched" everything else is. `runner_ops`/
-      // `router_app` are the SAME shape here (groundnuty/macf#943,
-      // groundnuty/macf#1105) — this test's `observed.lock` is `null`
-      // (never simulated) and `vaultRouterApp` is unset, so their presence
-      // can only degrade to `unknown` → `create`, same as `labels`.
-      // `runner_warm` (macf#942) is ALWAYS `create` too — there is no
-      // live-observable "already at this warm posture" signal to compare
-      // against (see `runnerWarmItem`'s doc). Every other kind genuinely
-      // observed-matches here.
-      if (item.kind === 'labels' || item.kind === 'runner_ops' || item.kind === 'runner_warm' || item.kind === 'router_app') {
+      // `router_app`/`ts_oauth` are the SAME shape here (groundnuty/macf#943,
+      // groundnuty/macf#1105, groundnuty/macf#1109) — this test's
+      // `observed.lock` is `null` (never simulated) and `vaultRouterApp`/
+      // `vaultTsOauth` are unset, so their presence can only degrade to
+      // `unknown` → `create`, same as `labels`. `runner_warm` (macf#942) is
+      // ALWAYS `create` too — there is no live-observable "already at this
+      // warm posture" signal to compare against (see `runnerWarmItem`'s
+      // doc). Every other kind genuinely observed-matches here.
+      if (item.kind === 'labels' || item.kind === 'runner_ops' || item.kind === 'runner_warm' || item.kind === 'router_app' || item.kind === 'ts_oauth') {
         expect(item.verb).toBe('create');
       } else {
         expect(item.verb).toBe('noop');
@@ -611,10 +615,12 @@ describe('computePlan — deterministic ordering', () => {
     // FIRST (right after the control-repo item, when present; absent here —
     // `EMPTY_OBSERVED.controlRepoPresence` is `'absent'`), then the
     // fleet-level `router_app` item (groundnuty/macf#1105, UNCONDITIONAL),
-    // before any per-agent item.
-    expect(kinds.slice(0, 12)).toEqual([
+    // then the fleet-level `ts_oauth` item (groundnuty/macf#1109,
+    // UNCONDITIONAL), before any per-agent item.
+    expect(kinds.slice(0, 13)).toEqual([
       'runner_ops',
       'router_app',
+      'ts_oauth',
       'app', 'repo', 'install', 'secret_fingerprint', 'labels', // science-agent
       'app', 'repo', 'install', 'secret_fingerprint', 'labels', // code-agent
     ]);
@@ -713,9 +719,10 @@ describe('summarizePlan', () => {
     // 10 per-agent creates (app/repo/install/secret_fingerprint/labels × 2) +
     // 3 CA creates (registry + 2 agent repos) + 2 routing_client creates +
     // 1 runner_ops create (groundnuty/macf#943) + 1 router_app create
-    // (groundnuty/macf#1105, UNCONDITIONAL) + 1 runner_warm create
+    // (groundnuty/macf#1105, UNCONDITIONAL) + 1 ts_oauth create
+    // (groundnuty/macf#1109, UNCONDITIONAL) + 1 runner_warm create
     // (macf#942) + 1 routing update.
-    expect(summary).toEqual({ creates: 18, updates: 1, noops: 0, extras: 0 });
+    expect(summary).toEqual({ creates: 19, updates: 1, noops: 0, extras: 0 });
   });
 });
 
@@ -1522,6 +1529,75 @@ describe('computePlan — router App item (groundnuty/macf#1105)', () => {
     const plan = computePlan(baseManifest(), observed);
     const extraAgentItems = plan.items.filter((i) => i.kind === 'agent' && i.verb === 'report-extra');
     expect(extraAgentItems.map((i) => i.target)).not.toContain('agent:router');
+  });
+});
+
+// --- groundnuty/macf#1109 — `apply` silently asked the operator to
+// hand-type TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET even when its OWN vault
+// already carried them, because the read was gated on
+// `transport.tailscale_oauth_required`. This item discloses the vault state
+// at PLAN time so the gap is visible before approval, not from a trailing
+// note. These tests pin `tsOauthItem`'s presence resolution + the "vault
+// presence is checked regardless of the declared flag" invariant the
+// `apply-fleet.ts` fix shares.
+describe('computePlan — Tailscale OAuth item (groundnuty/macf#1109)', () => {
+  it('is UNCONDITIONAL — present regardless of transport.tailscale_oauth_required, same as router_app', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED); // tailscale_oauth_required not declared
+    expect(plan.items.some((i) => i.kind === 'ts_oauth')).toBe(true);
+  });
+
+  it('no vault access this run (vaultTsOauth undefined) -> LOW-CONFIDENCE create, same floor every other identity item uses', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const item = plan.items.find((i) => i.kind === 'ts_oauth');
+    expect(item?.verb).toBe('create');
+    expect(item?.reason).toContain('could not be confirmed');
+  });
+
+  it('vault CONFIRMED present (both fields) -> create, states apply WILL publish, regardless of the undeclared flag', () => {
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultTsOauth: { status: 'confirmed', present: true } };
+    const plan = computePlan(baseManifest(), observed); // tailscale_oauth_required NOT declared
+    const item = plan.items.find((i) => i.kind === 'ts_oauth');
+    expect(item?.verb).toBe('create');
+    expect(item?.reason).toContain('WILL publish');
+    expect(item?.reason).toContain('NOT declared'); // names the flag mismatch honestly
+  });
+
+  it('vault CONFIRMED absent + tailscale_oauth_required NOT declared -> noop, but the reason states the real routing consequence, not a bland tidy-up note', () => {
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultTsOauth: { status: 'confirmed', present: false } };
+    const plan = computePlan(baseManifest(), observed);
+    const item = plan.items.find((i) => i.kind === 'ts_oauth');
+    expect(item?.verb).toBe('noop');
+    expect(item?.reason).toMatch(/routing will not function/i);
+  });
+
+  it('vault CONFIRMED absent + tailscale_oauth_required DECLARED true -> noop (apply writes nothing this run), reason names the refuse-before-gate-1 consequence', () => {
+    const manifest = baseManifest({ transport: { age_recipients: [], tailscale_oauth_required: true } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultTsOauth: { status: 'confirmed', present: false } };
+    const plan = computePlan(manifest, observed);
+    const item = plan.items.find((i) => i.kind === 'ts_oauth');
+    expect(item?.verb).toBe('noop');
+    expect(item?.reason).toMatch(/REFUSE THE ENTIRE RUN/);
+  });
+
+  it('vault status "unknown" (unreadable this run) degrades to the SAME low-confidence create — never a false "absent"', () => {
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultTsOauth: { status: 'unknown', reason: 'vault file not found' } };
+    const plan = computePlan(baseManifest(), observed);
+    const item = plan.items.find((i) => i.kind === 'ts_oauth');
+    expect(item?.verb).toBe('create');
+    expect(item?.reason).toContain('vault file not found');
+  });
+
+  it('planItemApplyCoverage reports IMPLEMENTED for every verb this item can emit — apply always has a code path (publish, or an honest skip/refuse)', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const item = plan.items.find((i) => i.kind === 'ts_oauth');
+    expect(item).toBeDefined();
+    if (item) expect(planItemApplyCoverage(item)).toBe('implemented');
+    expect(plan.unimplementedByApply.some((i) => i.kind === 'ts_oauth')).toBe(false);
+  });
+
+  it('confirm_required is always false — a pure disclosure item, never the confirm-then-update path', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.items.find((i) => i.kind === 'ts_oauth')?.confirm_required).toBe(false);
   });
 });
 

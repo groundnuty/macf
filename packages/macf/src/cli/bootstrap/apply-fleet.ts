@@ -1803,33 +1803,62 @@ export async function applyFleet(
   // TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET — ALWAYS operator-supplied via the
   // vault (Amendment C), NEVER minted by `apply` — read-only, independent
   // of `vault.status` (this run never WRITES these, so their durability
-  // never depends on THIS run's write succeeding). Gated on
-  // `transport.tailscale_oauth_required`: undeclared means the operator
-  // hasn't set up Tailscale for this fleet yet — an honest, non-refusing
-  // gap (`checkTailscaleOauthPreflight` in `commands/bootstrap-apply.ts`
-  // already refused BEFORE gate 1 if it WAS declared and the vault lacked
-  // values, so reaching here with `tailscale_oauth_required: true` means
-  // the values were already confirmed present at that earlier check).
+  // never depends on THIS run's write succeeding).
+  //
+  // groundnuty/macf#1109 — the vault read is now UNCONDITIONAL, never gated
+  // on `transport.tailscale_oauth_required`. The PRIOR shape gated the read
+  // itself on the manifest flag: an undeclared fleet never even called
+  // `readVaultTsOauth`, so a vault that DID carry the pair (the operator
+  // supplied `--vault`/`--identity-key` with real values) was silently
+  // ignored, and `apply` fell through to the "next steps: set these by
+  // hand" instruction for a value it had just read off disk — the live
+  // defect this issue reports (`agent-router.yml` requires both secrets
+  // UNCONDITIONALLY, regardless of what this fleet's manifest declares
+  // about them). The manifest flag now governs ONLY how the ABSENT case is
+  // scored (refusal-worthy `'unavailable'` vs. an honest not-ready-yet
+  // `'not-required'` skip) — it never gates whether a PRESENT value gets
+  // used. `checkTailscaleOauthPreflight` in `commands/bootstrap-apply.ts`
+  // still refuses BEFORE gate 1 whenever the flag IS declared and the vault
+  // lacks the values, so a `tailscale_oauth_required: true` fleet reaching
+  // this line always has `restored !== undefined` already confirmed once —
+  // this is a second, independent read of the same vault (the "each concern
+  // gets its own decrypt" convention this codebase already follows for
+  // CA/routing-client restores), not a second source of truth.
   let tsOauthClientId: RoutingSecretResolution;
   let tsOauthSecret: RoutingSecretResolution;
-  if (!manifest.transport.tailscale_oauth_required) {
-    // 'not-required', NOT 'unavailable' — an undeclared fleet is an honest
-    // "not ready yet," and must never fail the run the way a genuinely
-    // missing DECLARED secret does (see `RoutingSecretResolution`'s doc for
-    // why the two are distinct states, and the incident that motivated the
-    // split: without it, every fleet that hasn't set up Tailscale yet
-    // would fail `apply` outright over an unrelated presence check).
-    const reason = 'transport.tailscale_oauth_required is not declared in fleet.yaml — Tailscale OAuth was never requested for this fleet.';
-    tsOauthClientId = { status: 'not-required', reason };
-    tsOauthSecret = { status: 'not-required', reason };
-  } else {
-    const restored = deps.routingSecretsDeps.readVaultTsOauth !== undefined ? await deps.routingSecretsDeps.readVaultTsOauth() : undefined;
+  const restoredTsOauth = deps.routingSecretsDeps.readVaultTsOauth !== undefined ? await deps.routingSecretsDeps.readVaultTsOauth() : undefined;
+  if (restoredTsOauth !== undefined) {
+    tsOauthClientId = { status: 'available', value: restoredTsOauth.clientId };
+    tsOauthSecret = { status: 'available', value: restoredTsOauth.secret };
+  } else if (manifest.transport.tailscale_oauth_required) {
+    // Declared but the vault didn't yield it THIS run — a genuine gap:
+    // LOUD `'unavailable'` (never a silent `'skipped'`), same "declared
+    // requirement, missing value" bar every other 6-secret leg uses.
     const reason =
       'transport.tailscale_oauth_required is declared but the vault did not yield TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET ' +
       'this run — supply both --vault and --identity-key to `macf bootstrap apply` so the operator-supplied values ' +
-      'can be read back and published.';
-    tsOauthClientId = restored !== undefined ? { status: 'available', value: restored.clientId } : { status: 'unavailable', reason };
-    tsOauthSecret = restored !== undefined ? { status: 'available', value: restored.secret } : { status: 'unavailable', reason };
+      'can be read back and published. Routing will NOT function on this fleet until both secrets are set: ' +
+      'agent-router.yml requires them unconditionally, and the GitHub-hosted runner cannot reach agent VMs without ' +
+      'joining the tailnet through them.';
+    tsOauthClientId = { status: 'unavailable', reason };
+    tsOauthSecret = { status: 'unavailable', reason };
+  } else {
+    // Not declared AND no vault value found (or no vault supplied at all)
+    // — 'not-required', NOT 'unavailable': an undeclared fleet with nothing
+    // in the vault is an honest "not ready yet," and must never fail the
+    // run the way a genuinely missing DECLARED secret does (see
+    // `RoutingSecretResolution`'s doc for why the two are distinct states).
+    // Still names the real consequence (groundnuty/macf#1109) rather than
+    // reading as a harmless, optional tidy-up item: agent-router.yml
+    // requires this pair UNCONDITIONALLY, so this fleet's routing plane
+    // will not function until it is supplied, declared or not.
+    const reason =
+      'transport.tailscale_oauth_required is not declared in fleet.yaml, and no TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET ' +
+      'values were found in the supplied vault (or no vault was supplied) — this run will not publish these ' +
+      'secrets. Routing will NOT function on this fleet until they are supplied: agent-router.yml requires this ' +
+      'pair unconditionally regardless of the manifest declaration.';
+    tsOauthClientId = { status: 'not-required', reason };
+    tsOauthSecret = { status: 'not-required', reason };
   }
 
   const routingSecretsForPublish: RoutingSecretsForPublish = {

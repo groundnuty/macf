@@ -209,6 +209,59 @@ describe('vaultAwareObserver — DR-043 Amendment D phase 3 (injected deps, no r
     }
   });
 
+  // groundnuty/macf#1109 — the fleet-level `vaultTsOauth` observation
+  // (`tsOauthItem`'s disclosure input at plan time), fleet-level sibling of
+  // `vaultCa`/`vaultRouterApp` above, computed by the SAME `raw !== undefined`
+  // gate from the SAME decrypted vault.
+  it('a SUCCESSFUL vault read carrying BOTH TS_OAUTH fields -> confirmed, present: true', async () => {
+    const raw = { TS_OAUTH_CLIENT_ID: 'ts-client-id', TS_OAUTH_SECRET: 'ts-secret' };
+    const observed = await vaultAwareObserver(
+      manifest,
+      '/fake/fleet.yaml',
+      { vaultPath: '/fake/secrets/vault.age', identityPath: '/fake/key.txt' },
+      { observe: async () => BASE_OBSERVED, readVault: async () => raw },
+    );
+    expect(observed.vaultTsOauth).toEqual({ status: 'confirmed', present: true });
+  });
+
+  it('a SUCCESSFUL vault read missing the pair -> confirmed, present: false (a decrypted-but-empty vault is a DEFINITE absence, not unknown)', async () => {
+    const observed = await vaultAwareObserver(
+      manifest,
+      '/fake/fleet.yaml',
+      { vaultPath: '/fake/secrets/vault.age', identityPath: '/fake/key.txt' },
+      { observe: async () => BASE_OBSERVED, readVault: async () => ({}) },
+    );
+    expect(observed.vaultTsOauth).toEqual({ status: 'confirmed', present: false });
+  });
+
+  it('carrying only ONE of the two fields -> present: false — a half-pair is not usable, never a false all-clear', async () => {
+    const observed = await vaultAwareObserver(
+      manifest,
+      '/fake/fleet.yaml',
+      { vaultPath: '/fake/secrets/vault.age', identityPath: '/fake/key.txt' },
+      { observe: async () => BASE_OBSERVED, readVault: async () => ({ TS_OAUTH_CLIENT_ID: 'ts-client-id' }) },
+    );
+    expect(observed.vaultTsOauth).toEqual({ status: 'confirmed', present: false });
+  });
+
+  it('a FAILED vault read degrades vaultTsOauth to `unknown` too — NEVER `absent` (Amendment A4 floor)', async () => {
+    const observed = await vaultAwareObserver(
+      manifest,
+      '/fake/fleet.yaml',
+      { vaultPath: '/fake/secrets/vault.age', identityPath: '/fake/key.txt' },
+      {
+        observe: async () => BASE_OBSERVED,
+        readVault: async () => {
+          throw new VaultError('vault_not_found', 'vault file not found at "/fake/secrets/vault.age" — nothing to decrypt.');
+        },
+      },
+    );
+    expect(observed.vaultTsOauth?.status).toBe('unknown');
+    if (observed.vaultTsOauth?.status === 'unknown') {
+      expect(observed.vaultTsOauth.reason).toContain('vault file not found');
+    }
+  });
+
   it('the `unknown` reason NEVER leaks secret material — it is always the scrubbed VaultError message, never a raw value', async () => {
     const observed = await vaultAwareObserver(
       manifest,

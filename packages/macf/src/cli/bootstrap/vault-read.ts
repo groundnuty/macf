@@ -890,6 +890,25 @@ export type VaultRouterAppObservation =
   | { readonly status: 'confirmed'; readonly present: boolean }
   | { readonly status: 'unknown'; readonly reason: string };
 
+/**
+ * Fleet-level sibling of {@link VaultRouterAppObservation}, for the
+ * operator-supplied Tailscale OAuth pair's presence in THIS fleet's own
+ * vault (groundnuty/macf#1109) — surfaced at PLAN time so the operator
+ * learns whether `apply` will actually publish `TS_OAUTH_CLIENT_ID`/
+ * `TS_OAUTH_SECRET` BEFORE approving the run, rather than from a trailing
+ * "next steps" note after `apply` already read (or failed to find) the
+ * values. `present` reflects BOTH fields (`vaultTsOauthClientId` AND
+ * `vaultTsOauthSecret`) — the pair is published as a single
+ * `RoutingSecretResolution` each (`apply-fleet.ts`'s doc), so a plan
+ * reporting "one of two present" as `present: true` would be a false
+ * all-clear. Same Amendment A4 floor as {@link VaultRouterAppObservation}:
+ * `'unknown'` is reserved for "the vault itself could not be read this
+ * run," never a false "absent."
+ */
+export type VaultTsOauthObservation =
+  | { readonly status: 'confirmed'; readonly present: boolean }
+  | { readonly status: 'unknown'; readonly reason: string };
+
 // --- Recipient-set reconciliation — DR-043 §D5 (groundnuty/macf#957) ---
 //
 // The gap this closes: an operator adds a second `age_recipients` entry

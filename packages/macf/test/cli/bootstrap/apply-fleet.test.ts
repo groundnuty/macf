@@ -30,7 +30,7 @@ import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchang
 import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
 import type { RoutingSecretsPublishDeps } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
-import { toBase64ForSecret } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
+import { toBase64ForSecret, ALL_ROUTING_SECRET_NAMES } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RouterAppVaultRestoreDeps } from '../../../src/cli/bootstrap/apply-router-app.js';
 import { deriveRouterAppHandle } from '../../../src/cli/bootstrap/apply-router-app.js';
 import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
@@ -3173,6 +3173,157 @@ trust:
       // run — never a silent green exit (groundnuty/macf#1074's core
       // requirement).
       expect(applyExitCode(result)).toBe(1);
+    });
+  });
+
+  // --- groundnuty/macf#1109 — the decisive set-membership proof. `apply`
+  // published 4 of the 6 router secrets and asked the operator to hand-type
+  // TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET even though its OWN vault already
+  // carried them — the read was gated on `transport.tailscale_oauth_required`,
+  // so a vault that genuinely had the pair was never even consulted when the
+  // manifest left that flag undeclared (the common case: an operator setting
+  // up a fleet for the first time has no reason to know this flag exists).
+  //
+  // Per the issue's own decisive-test requirement: assert by SET MEMBERSHIP
+  // of the PUBLISHED name set (`created`/`already-present`), never by a
+  // count and never by "the publisher was called" — a count of six passes
+  // even if the wrong pair got published twice; a call-happened assertion
+  // passes even if only four of the six actually landed.
+  describe('the unified six-secret publish — decisive set-membership proof (groundnuty/macf#1109)', () => {
+    /** code-agent + the router App both take the REUSED path (prior lock entries) — same dispatch-by-appId technique the #986 describe block above uses, trimmed to the two roles this single-agent fixture needs. */
+    function reusedIdentityDeps(): AgentApplyDeps {
+      return {
+        startManifestFlow: async () => { throw new Error('must not be called — every role has a prior lock entry'); },
+        startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+        exchangeManifestCode: async () => { throw new Error('must not be called'); },
+        resolveKeyPath: () => '/fake.pem',
+        confirmAppInstallation: async (appId) => {
+          const installId = appId === 'app-code-agent' ? 'install-1' : 'install-router';
+          return { status: 'confirmed', install: { appId, installId, appSlug: `demo-fleet-${appId}`, accountLogin: 'groundnuty' } };
+        },
+        waitForAppInstallation: async () => { throw new Error('must not be called'); },
+        openUrl: async () => {},
+        log: () => {},
+        writeRecoveryArtifact: async () => {},
+      };
+    }
+
+    it('a vault carrying the Tailscale pair, with transport.tailscale_oauth_required left UNDECLARED (the exact live-defect shape) — yields all SIX secret names PUBLISHED on every router-carrying repo, and TS_OAUTH is not a second path', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]); // tailscale_oauth_required NOT declared — matches the reported live run
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [
+          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+          { role: 'router', app_id: 'app-router', install_id: 'install-router' },
+        ],
+        fingerprints: { routing_client_key: 'sha256:cafef00d' },
+      };
+      const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      let readVaultTsOauthCalls = 0;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedIdentityDeps(), manifestPath),
+        trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
+        routingClientDeps: {
+          mint: async () => { throw new Error('must not be called — a routing_client_key fingerprint is already recorded'); },
+          readVaultRoutingClient: async () => ({ certPem: 'VAULT-CLIENT-CERT-PEM', keyPem: 'VAULT-CLIENT-KEY-PEM' }),
+        },
+        routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '997', appKeyPem: 'ROUTER-APP-VAULT-PEM' }) },
+        routingSecretsDeps: {
+          // Steady empty state — every repo genuinely lacks every secret —
+          // the cleanest possible decisive assertion: every one of the six
+          // legs on every repo must show 'created', nothing pre-seeded.
+          checkRepoSecretPresence: async () => 'absent',
+          setRepoSecret: async (repo, name, value) => {
+            setSecretCalls.push({ repo, name, value });
+          },
+          readVaultTsOauth: async () => {
+            readVaultTsOauthCalls += 1;
+            return { clientId: 'ts-client-id', secret: 'ts-secret' };
+          },
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      // The vault WAS actually consulted — this is the exact defect: the
+      // OLD gate never even called `readVaultTsOauth` when the flag was
+      // undeclared.
+      expect(readVaultTsOauthCalls).toBeGreaterThan(0);
+
+      const routerCarryingRepos = ['groundnuty/demo-code', 'groundnuty/demo-fleet-control'];
+      for (const repo of routerCarryingRepos) {
+        const publishedNames = new Set(
+          (Object.entries(result.routingSecrets) as [string, Record<string, { readonly status: string }>][])
+            .filter(([, legs]) => legs[repo]?.status === 'created' || legs[repo]?.status === 'already-present')
+            .map(([name]) => name),
+        );
+        expect(publishedNames).toEqual(new Set(ALL_ROUTING_SECRET_NAMES));
+      }
+
+      // Never a second publisher: every `setRepoSecret` call is accounted
+      // for by the SAME per-(repo,name) legs asserted above — no stray call
+      // for a name outside the six, and TS_OAUTH's two calls are ordinary
+      // entries in that one list, not a side channel.
+      expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'ts-client-id')).toHaveLength(routerCarryingRepos.length);
+      expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'ts-secret')).toHaveLength(routerCarryingRepos.length);
+
+      // A fully-routable fleet is a green exit.
+      expect(applyExitCode(result)).toBe(0);
+
+      // No secret VALUE ever reaches a human/log/--json render surface.
+      const rendered = JSON.stringify(fleetApplyResultToJson(result, []));
+      expect(rendered).not.toContain('ts-client-id');
+      expect(rendered).not.toContain('ts-secret');
+      const humanText = formatApplyResult(result, []);
+      expect(humanText).not.toContain('ts-client-id');
+      expect(humanText).not.toContain('ts-secret');
+    });
+
+    it('a vault WITHOUT the Tailscale pair publishes only the other four, and the TS_OAUTH reason states the routing consequence rather than reading as a tidy-up item', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]); // tailscale_oauth_required NOT declared
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [
+          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+          { role: 'router', app_id: 'app-router', install_id: 'install-router' },
+        ],
+        fingerprints: { routing_client_key: 'sha256:cafef00d' },
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedIdentityDeps(), manifestPath),
+        trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
+        routingClientDeps: {
+          mint: async () => { throw new Error('must not be called — a routing_client_key fingerprint is already recorded'); },
+          readVaultRoutingClient: async () => ({ certPem: 'VAULT-CLIENT-CERT-PEM', keyPem: 'VAULT-CLIENT-KEY-PEM' }),
+        },
+        routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '997', appKeyPem: 'ROUTER-APP-VAULT-PEM' }) },
+        routingSecretsDeps: {
+          checkRepoSecretPresence: async () => 'absent',
+          setRepoSecret: async () => {},
+          readVaultTsOauth: async () => undefined, // vault genuinely doesn't have it
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      for (const repo of ['groundnuty/demo-code', 'groundnuty/demo-fleet-control']) {
+        expect(result.routingSecrets['TS_OAUTH_CLIENT_ID']?.[repo]?.status).toBe('skipped');
+        expect(result.routingSecrets['TS_OAUTH_SECRET']?.[repo]?.status).toBe('skipped');
+        // The other four ARE published — the absent pair never blocks them.
+        expect(result.routingSecrets['MACF_ROUTING_APP_ID']?.[repo]?.status).toBe('created');
+        expect(result.routingSecrets['ROUTING_CLIENT_CERT']?.[repo]?.status).toBe('created');
+      }
+      const clientIdLeg = result.routingSecrets['TS_OAUTH_CLIENT_ID']?.['groundnuty/demo-code'];
+      expect(clientIdLeg?.status).toBe('skipped');
+      if (clientIdLeg?.status === 'skipped') {
+        expect(clientIdLeg.reason).toMatch(/routing will not function/i);
+      }
+      // An undeclared-and-absent pair is an honest skip, never a run-failing gap.
+      expect(applyExitCode(result)).toBe(0);
     });
   });
 
