@@ -311,10 +311,10 @@ export function formatGuestTable(statuses: readonly GuestStatus[], now: number):
 export function formatGuestBlock(statuses: readonly GuestStatus[], now: number): string {
   if (statuses.length === 0) return '';
   return [
-    'GUEST / external collaborators (DR-036 — visible, NOT supervised):',
+    'GUEST / external collaborators (visible, NOT supervised):',
     formatGuestTable(statuses, now),
     'Note: guests are external agents this fleet DEPENDS on but does NOT supervise —',
-    '      DR-031 liveness/restart/prune NEVER apply. A local-mode (operator-relay)',
+    '      liveness/restart/prune NEVER apply. A local-mode (operator-relay)',
     '      guest shows home-fleet-observable state only and is NEVER reported "down".',
   ].join('\n');
 }

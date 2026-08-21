@@ -267,7 +267,7 @@ export async function update(
         `  source HEAD: ${stale.currentCommit.slice(0, 7)}\n` +
         `  Features merged after ${stale.buildCommit.slice(0, 7)} will not apply.\n` +
         `  Fix: run \`macf self-update\` (or \`cd ${cliPackageRoot} && npm run build\`).\n` +
-        `  Note: stale-dist detection only fires for CLI versions >= 0.1.1 (#144).\n`,
+        `  Note: stale-dist detection only fires for CLI versions >= 0.1.1.\n`,
     );
   } else {
     const unknown = detectUnknownFreshness(cliPackageRoot);

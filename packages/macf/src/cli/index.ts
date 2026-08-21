@@ -911,7 +911,7 @@ certs
 
 certs
   .command('issue-routing-client')
-  .description('Mint a CA-signed client cert (CN=routing-action) for the routing Action (macf-actions#8)')
+  .description('Mint a CA-signed client cert (CN=routing-action) for the routing Action')
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .option('--out-dir <path>', 'Write cert/key files here instead of printing to stdout')
   .option('--validity-days <n>', 'Cert validity in days (default 365; warns above 730)')

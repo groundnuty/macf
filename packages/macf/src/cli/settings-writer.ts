@@ -1537,7 +1537,7 @@ export function installGhTokenHook(workspaceDir: string): void {
   if (!delivery.canDeliver && hasDeferredMigratedHookEntry(settings)) {
     console.warn(
       "macf: deferring hook-strip: effective plugin can't deliver the load-bearing set — " +
-        'keeping hand-wired copies; fix the launcher to load the full .macf/plugin, see DR-039 ' +
+        'keeping hand-wired copies; fix the launcher to load the full .macf/plugin ' +
         `(${delivery.detail}).`,
     );
   }

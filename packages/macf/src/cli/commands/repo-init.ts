@@ -297,7 +297,7 @@ export function generateWorkflow(
     '          # unchanged — see the job-level comment above.',
     '          if [ "$ACTION" != "opened" ] && [ "$ACTOR" = "dependabot[bot]" ]; then',
     '            echo "should-route=false" >> "$GITHUB_OUTPUT"',
-    '            echo "skip: dependabot[bot] actor on a non-opened pull_request action (#872)"',
+    '            echo "skip: dependabot[bot] actor on a non-opened pull_request action"',
     '            exit 0',
     '          fi',
     '',
@@ -671,13 +671,13 @@ export async function repoInit(
     if (resolved) {
       pinnedVersion = resolved;
       process.stderr.write(
-        `✓ Pinned router to immutable ${resolved} (resolved from floating "${opts.actionsVersion}"; macf#797).\n`,
+        `✓ Pinned router to immutable ${resolved} (resolved from floating "${opts.actionsVersion}").\n`,
       );
     } else {
       process.stderr.write(
         `Warning: could not resolve "${opts.actionsVersion}" to an immutable full tag ` +
           `(GitHub unreachable or no matching vX.Y.Z). The router will pin the FLOATING ref ` +
-          `"${opts.actionsVersion}", which can silently receive behavioral changes (macf#797). ` +
+          `"${opts.actionsVersion}", which can silently receive behavioral changes. ` +
           `Re-run with --actions-version vX.Y.Z to pin immutably.\n`,
       );
     }

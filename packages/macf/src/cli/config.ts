@@ -61,7 +61,7 @@ export function tokenSourceFromConfig(
     throw new Error(
       'tokenSourceFromConfig called on a config without a `github_app` block ' +
         '(local-registry mode). Callers must dispatch on registry.type before ' +
-        'reaching this helper. See DR-024.',
+        'reaching this helper.',
     );
   }
   return {
