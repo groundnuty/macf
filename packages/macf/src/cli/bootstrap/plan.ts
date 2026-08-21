@@ -70,7 +70,7 @@ import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
 // a one-directional runtime dependency — see `apply-routing.ts::
 // checkRunnerTokenPreflight`'s doc).
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from './apply-routing.js';
-import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle } from './apply-runner-ops.js';
+import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle, runnerOpsNeeded } from './apply-runner-ops.js';
 // groundnuty/macf#999 — the SAME pure pre-flight `commands/bootstrap-apply.ts`
 // refuses `apply` on; `plan` never refuses (it is read-only end to end — see
 // this module's own `checkVaultFlagsComplete` doc for the contrast), it
@@ -774,26 +774,63 @@ function labelsItem(agent: FleetAgent): PlanItem {
 }
 
 /**
- * The runner-ops App plan item (groundnuty/macf#943) — ONE item per
- * fleet (not per agent; this App is never declared in `manifest.agents[]`),
- * so the operator sees "the extra App and its two clicks" (task brief)
- * called out explicitly rather than folded silently into the per-agent `app`
- * items above. Presence is read directly off `observed.lock.agents` (no
- * `ObservedState` field addition needed — the same `fleet.lock` this
- * function's caller already threads through) since `githubRegistryObserver`
- * only ever populates `ObservedState.agents` from `manifest.agents` (never
- * from lock-only roles), so there is no risk of this role being
- * double-counted as a `report-extra` `agent` item at the bottom of
- * `computePlan` — see that function's doc.
+ * The runner-ops App plan item (groundnuty/macf#943, conditioned per
+ * groundnuty/macf#1083) — ONE item per fleet (not per agent; this App is
+ * never declared in `manifest.agents[]`), so the operator sees "the extra
+ * App and its two clicks" (task brief) called out explicitly rather than
+ * folded silently into the per-agent `app` items above. Presence is read
+ * directly off `observed.lock.agents` (no `ObservedState` field addition
+ * needed — the same `fleet.lock` this function's caller already threads
+ * through) since `githubRegistryObserver` only ever populates
+ * `ObservedState.agents` from `manifest.agents` (never from lock-only
+ * roles), so there is no risk of this role being double-counted as a
+ * `report-extra` `agent` item at the bottom of `computePlan` — see that
+ * function's doc.
  *
  * `absent`-vs-`unknown` mirrors `appItem`'s own convention exactly: no lock
  * entry reads as `unknown` (Amendment A4 — the lock is a HINT, never
  * authoritative for "does the App exist on GitHub"; only a live JWT check
  * could confirm `absent`, which this Mac-side, offline-safe function never
  * attempts), never a false `absent`.
+ *
+ * **`needed` (groundnuty/macf#1083) — this App's sole purpose is minting
+ * self-hosted-runner registration tokens, so a fleet that never declares
+ * `routing.runner.runs_on: self-hosted` (`runnerOpsNeeded`'s doc, the SAME
+ * predicate `apply-fleet.ts` gates its own create-or-reuse ceremony on —
+ * one predicate, never two that could drift) has nothing for it to do:**
+ *
+ *   - `!needed && !lockHasEntry` — the common hosted-runner case. Returns
+ *     `undefined` (no item emitted at all) — the SAME "nothing was
+ *     promised, so nothing is said" convention `computePlan`'s
+ *     `routing`/`runner_warm` items already use when `routing.runner` isn't
+ *     declared. This is what drops `runner_ops` out of the App-creation SET
+ *     entirely (never merely out of a count) and is what lets
+ *     {@link countAppsToCreate}'s click ceiling read lower for a
+ *     hosted-runner fleet without any special-casing there.
+ *   - `!needed && lockHasEntry` — an ORPHAN: a prior run created this App
+ *     while the manifest DID declare self-hosted, and a later edit dropped
+ *     that declaration. `verb: 'noop'` (apply never deletes an App — §D3
+ *     Design invariant 4) but the reason says so EXPLICITLY, never silently
+ *     dropped from the plan — the "do not silently ignore it" half of
+ *     #1083's requirement.
+ *   - `needed` — unchanged from #943's original behavior.
  */
-function runnerOpsItem(fleetName: string, lockHasEntry: boolean): PlanItem {
+function runnerOpsItem(fleetName: string, lockHasEntry: boolean, needed: boolean): PlanItem | undefined {
   const handle = deriveRunnerOpsHandle(fleetName);
+  if (!needed) {
+    if (!lockHasEntry) return undefined;
+    return {
+      kind: 'runner_ops',
+      target: `runner_ops:app:${handle}`,
+      verb: 'noop',
+      reason:
+        `Runner-ops GitHub App "${handle}" is recorded in fleet.lock from a prior run, but ` +
+        'routing.runner.runs_on is no longer "self-hosted" — it is an ORPHAN, no longer needed by this ' +
+        'manifest. apply never deletes an App (teardown is a separate, deliberate operator action); it is ' +
+        'left exactly as recorded. Archive or remove it manually on GitHub if it is no longer wanted.',
+      confirm_required: false,
+    };
+  }
   const { verb, reasonSuffix } = presenceVerb(lockHasEntry ? 'present' : 'unknown', UNKNOWN_REASONS.identity);
   return {
     kind: 'runner_ops',
@@ -1399,9 +1436,12 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
   // groundnuty/macf#943 — fleet-level, ordered right after the control-repo
   // item (both are "before any per-agent processing" fleet-scoped facts) and
   // before the per-agent app/repo/install items so the operator sees it near
-  // the top of the plan, not buried after every agent.
+  // the top of the plan, not buried after every agent. groundnuty/macf#1083
+  // — `runnerOpsItem` returns `undefined` (no item, no click) for a
+  // hosted-runner fleet with no prior lock entry; see that function's doc.
   const runnerOpsHasLockEntry = observed.lock?.agents.some((a) => a.role === RUNNER_OPS_ROLE) ?? false;
-  items.push(runnerOpsItem(fleetName, runnerOpsHasLockEntry));
+  const runnerOps = runnerOpsItem(fleetName, runnerOpsHasLockEntry, runnerOpsNeeded(manifest));
+  if (runnerOps !== undefined) items.push(runnerOps);
 
   for (const agent of manifest.agents) {
     const obs = observed.agents[agent.role];
@@ -1590,8 +1630,10 @@ export function formatRegistryRepoScopeLines(notices: readonly RegistryRepoScope
 //
 // gate1 (App creation) and gate2 (install) are counted SEPARATELY, not as
 // one number doubled — they are NOT always equal. Every `'app'`-kind create
-// item (or the unconditional `'runner_ops'`-kind one, macf#943) is ONE
-// gate-1-then-gate-2 pair — the common case `countAppsToCreate` covers. But
+// item (or the `'runner_ops'`-kind one, macf#943 — CONDITIONAL as of
+// macf#1083; `runnerOpsItem` emits no item at all, so no count, for a
+// hosted-runner fleet with no prior lock entry) is ONE gate-1-then-gate-2
+// pair — the common case `countAppsToCreate` covers. But
 // `apply-agent.ts`'s vault-aware confirm-before-create guard can ALSO
 // produce a `'resume-install'` decision (an App exists, confirmed live, with
 // ZERO installs) — gate 1 is SKIPPED for that role, but gate 2 still runs

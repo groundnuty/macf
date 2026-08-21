@@ -33,11 +33,49 @@ import { deriveAppHandle } from './fleet-manifest.js';
 import type { GitHubAppManifest } from './app-manifest.js';
 import { buildAppManifest } from './app-manifest.js';
 import type { ConfirmedInstall } from './identity-confirm.js';
-import type { IdentityRequest } from './apply-agent.js';
+import type { AgentApplyOutcome, IdentityRequest } from './apply-agent.js';
 import { deriveRouterAppHandle } from './apply-router-app.js';
 
 /** The reserved `role` this App is derived + recorded under — never declared in `fleet.yaml`'s `agents[]` (that array is coordination agents only; `FleetManifestSchema` has no knowledge of this role at all). */
 export const RUNNER_OPS_ROLE = 'runner-ops';
+
+/**
+ * Whether THIS fleet actually needs a runner-ops App (groundnuty/macf#1083).
+ * Its sole purpose is minting self-hosted-runner registration tokens — a
+ * fleet that never declares `routing.runner.runs_on: self-hosted` has
+ * nothing for it to do, so minting one anyway is an unrequested
+ * `administration:write` credential (DR-019 quarantines that permission from
+ * every agent App for exactly this reason) plus 2 spent operator
+ * consent-gate clicks nobody asked for.
+ *
+ * Mirrors the EXACT condition `apply-fleet.ts`'s `routing`-var-write gate
+ * (macf#922) and `plan.ts`'s `routingItem` already use for "does this
+ * fleet's runner class require the self-hosted machinery" — one predicate,
+ * reused at both call sites, never a second hand-rolled copy that could
+ * drift from it. An undeclared `routing:` section and a declared-but-not-
+ * `"self-hosted"` one are the SAME "no" answer here (`FleetRoutingSchema`'s
+ * `runner.runs_on` is a free string in v0 — anything other than the literal
+ * `"self-hosted"`, including a future non-self-hosted value, means "no
+ * runner-ops needed").
+ */
+export function runnerOpsNeeded(manifest: FleetManifest): boolean {
+  return manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted';
+}
+
+/**
+ * The runner-ops App's apply-time / plan-time outcome — {@link
+ * AgentApplyOutcome} extended with ONE status only this credential can reach:
+ * `'not-needed'` (groundnuty/macf#1083). Every OTHER identity (coordination
+ * agents, the router App — `apply-router-app.ts`) always attempts creation
+ * because its capability is unconditionally required by the fleet that
+ * declared it; runner-ops is the first CONDITIONALLY-required identity, so
+ * its outcome type is the one place a "correctly, deliberately never
+ * attempted" status belongs. Widening the shared `AgentApplyOutcome` union
+ * instead would force every OTHER identity's exhaustive `switch` (routing
+ * agents, the router App, `apply-agent.ts` itself) to account for a status
+ * they can never reach.
+ */
+export type RunnerOpsApplyOutcome = AgentApplyOutcome | { readonly role: string; readonly status: 'not-needed'; readonly reason: string };
 
 /**
  * **EXPORT-CLASS credential, ONE-WAY-RATCHET permission set (groundnuty/

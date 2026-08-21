@@ -250,17 +250,19 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
       unimplemented_by_apply: ReadonlyArray<{ kind: string }>;
     };
     expect(parsed.dry_run).toBe(true);
-    // groundnuty/macf#943 — the runner-ops's own planned creation is
-    // ALWAYS last (`plannedAppCreations` appends it after every agent's).
+    // groundnuty/macf#1083 — `FLEET_YAML` declares no self-hosted routing,
+    // so the runner-ops App is NOT NEEDED and is absent from the planned
+    // creation set entirely (never appended, unlike the pre-#1083
+    // unconditional shape — see the dedicated `plannedAppCreations` describe
+    // block above, whose manifest DOES declare self-hosted routing, for the
+    // "runner-ops IS appended last" case).
     expect(parsed.planned_app_creations.map((c) => c.manifest.name)).toEqual([
       'demo-fleet-code-agent',
       'demo-fleet-science-agent',
-      'demo-fleet-runner-ops',
     ]);
     expect(parsed.planned_app_creations.map((c) => c.installUrl)).toEqual([
       'https://github.com/apps/demo-fleet-code-agent/installations/new',
       'https://github.com/apps/demo-fleet-science-agent/installations/new',
-      'https://github.com/apps/demo-fleet-runner-ops/installations/new',
     ]);
     // Inherited automatically from fleetPlanToJson(plan) — no separate wiring
     // needed. macf#838 Amendment D phase 2: `ca` is now fully implemented
@@ -292,7 +294,13 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
 });
 
 describe('plannedAppCreations (pure)', () => {
-  const manifest = parseFleetManifest(FLEET_YAML);
+  // groundnuty/macf#1083 — self-hosted DECLARED (`FLEET_YAML_WITH_ROUTING`,
+  // not the bare `FLEET_YAML`) so the runner-ops App stays a create-candidate
+  // in every test below — this describe block's whole point is exercising
+  // ITS OWN preview/install-repos machinery, which only fires when the App
+  // is actually needed. See the dedicated #1083 describe block further down
+  // for the conditional-creation (hosted-fleet) behavior itself.
+  const manifest = parseFleetManifest(FLEET_YAML_WITH_ROUTING);
 
   it('includes an agent whose app item is create', () => {
     const plan = computePlan(manifest, EMPTY_OBSERVED);
@@ -662,10 +670,11 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const out = logs.join('\n');
     expect(out).toMatch(/code-agent: CREATED/);
     expect(out).toMatch(/science-agent: CREATED/);
-    // groundnuty/macf#943 — the runner-ops App ALSO creates cleanly on
-    // this fleet's first apply (the shared `fakeAgentDeps` fixture's
-    // `repositorySelection: 'selected'` satisfies its own gate-2 check).
-    expect(out).toMatch(/Runner-ops App:\s*\n\s*runner-ops: CREATED/);
+    // groundnuty/macf#1083 — `FLEET_YAML` (this test's default fixture)
+    // declares no self-hosted routing, so the runner-ops App is correctly
+    // NOT NEEDED and no lock entry is created for it — see the dedicated
+    // "the runner-ops App" describe block for the self-hosted CREATE path.
+    expect(out).toMatch(/Runner-ops App:\s*\n\s*runner-ops: NOT NEEDED/);
     expect(out).toMatch(/Vault: written to/);
     // DR-043 Amendment D phase 2 (macf#838) — the CA ceremony ran too: a
     // fresh mint (no prior lock, no prior registry var — the default
@@ -676,7 +685,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const dir = join(file, '..');
     expect(existsSync(join(dir, 'fleet.lock'))).toBe(true);
     const lock = parseFleetLock(readFileSync(join(dir, 'fleet.lock'), 'utf-8'));
-    expect(lock.agents.map((a) => a.role).sort()).toEqual(['code-agent', 'router', 'runner-ops', 'science-agent']);
+    expect(lock.agents.map((a) => a.role).sort()).toEqual(['code-agent', 'router', 'science-agent']);
     // The CA key's fingerprint lands in fleet.lock's FLEET-level
     // `fingerprints.ca_key` — the SOLE place it is ever written (see
     // apply-fleet.ts's module doc) — never the raw key value.
@@ -1966,7 +1975,13 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const out = logs.join('\n');
     expect(out).toMatch(/code-agent: REUSED/);
     expect(out).toMatch(/science-agent: REUSED/);
-    expect(out).toMatch(/runner-ops: REUSED/);
+    // groundnuty/macf#1083 — `FLEET_YAML` declares no self-hosted routing, so
+    // the runner-ops entry in `priorLock` is an ORPHAN: apply's identity
+    // ceremony is skipped entirely for it (never confirmed, never reused —
+    // consistent with `startManifestFlowCalled` staying false for EVERY role,
+    // asserted above, which this orphan path satisfies even more directly
+    // than a genuine reuse would).
+    expect(out).toMatch(/runner-ops: NOT NEEDED/);
     expect(out).not.toMatch(/runner-ops: SKIPPED/);
   });
 
@@ -2371,9 +2386,26 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(out).toContain('1 already-created App still needs its install flow');
     });
 
-    it('DECISIVE — fresh 2-agent fleet, --dry-run, no vault flags: 3 Apps to create (2 agents + runner-ops) -> honest maximum of 6 total consent-gate clicks (3 gate-1 + 3 gate-2)', async () => {
+    it('DECISIVE — fresh 2-agent HOSTED-runner fleet (FLEET_YAML declares no routing:), --dry-run, no vault flags: just 2 Apps to create, NO runner-ops (groundnuty/macf#1083) -> honest maximum of 4 total consent-gate clicks (2 gate-1 + 2 gate-2)', async () => {
       const file = writeManifest();
       const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+      expect(code).toBe(0);
+      const out = logs.join('\n');
+      expect(out).toMatch(/Operator interaction: up to 2 Apps to create/);
+      expect(out).toContain('2 "Create GitHub App" clicks');
+      expect(out).toContain('2 install flows');
+      expect(out).toContain('may confirm some of these already exist and skip their gates');
+      // Set membership, not just arithmetic — the App-creation set genuinely
+      // excludes runner-ops, never merely happens to count to 2.
+      expect(out).not.toMatch(/runner-ops/);
+    });
+
+    it('DECISIVE non-regression — the SAME fresh 2-agent fleet, but SELF-HOSTED declared (FLEET_YAML_WITH_ROUTING): 3 Apps to create (2 agents + runner-ops) -> honest maximum of 6 total consent-gate clicks (3 gate-1 + 3 gate-2)', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply(
+        { file, dryRun: true, runnerToken: SENTINEL_RUNNER_TOKEN },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+      );
       expect(code).toBe(0);
       const out = logs.join('\n');
       expect(out).toMatch(/Operator interaction: up to 3 Apps to create/);
@@ -2382,9 +2414,22 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(out).toContain('may confirm some of these already exist and skip their gates');
     });
 
-    it('DECISIVE — fresh 2-agent fleet, --dry-run --json: operator_interaction carries gate1_clicks/gate2_flows both = 3 (2 declared agents + the unconditional runner-ops), bound "maximum"', async () => {
+    it('DECISIVE — fresh 2-agent HOSTED-runner fleet, --dry-run --json: operator_interaction carries gate1_clicks/gate2_flows both = 2 (no runner-ops, groundnuty/macf#1083), bound "maximum"', async () => {
       const file = writeManifest();
       const code = await runBootstrapApply({ file, dryRun: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+      expect(code).toBe(0);
+      const json = JSON.parse(logs.join('')) as {
+        operator_interaction: { gate1_clicks: number; gate2_flows: number; bound: string };
+      };
+      expect(json.operator_interaction).toEqual({ gate1_clicks: 2, gate2_flows: 2, bound: 'maximum' });
+    });
+
+    it('DECISIVE non-regression — the SAME fresh fleet, but SELF-HOSTED declared, --dry-run --json: operator_interaction carries gate1_clicks/gate2_flows both = 3 (2 declared agents + the now-needed runner-ops), bound "maximum"', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply(
+        { file, dryRun: true, json: true, runnerToken: SENTINEL_RUNNER_TOKEN },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+      );
       expect(code).toBe(0);
       const json = JSON.parse(logs.join('')) as {
         operator_interaction: { gate1_clicks: number; gate2_flows: number; bound: string };
@@ -2589,7 +2634,9 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         writeSpy.mockRestore();
       }
       expect(code).toBe(0);
-      expect(rawWrites.join('')).toMatch(/Operator interaction: up to 3 Apps to create/);
+      // groundnuty/macf#1083 — `FLEET_YAML` declares no self-hosted routing:
+      // 2 Apps to create, not 3 (no runner-ops).
+      expect(rawWrites.join('')).toMatch(/Operator interaction: up to 2 Apps to create/);
     });
   });
 });
