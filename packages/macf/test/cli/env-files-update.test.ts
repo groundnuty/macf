@@ -212,10 +212,10 @@ describe('refreshEnvFiles', () => {
 
     expect(result.refreshed).toContain('env.identity');
     expect(result.warnedHandEdits).toContain('env.identity');
-    // Stderr warning should cite macf#342
+    // Stderr warning should explain the overwrite, plainly
     const stderrCalls = stderrSpy.mock.calls.flat().join('\n');
     expect(stderrCalls).toMatch(/hand-edited macf-managed/);
-    expect(stderrCalls).toMatch(/macf#342/);
+    expect(stderrCalls).toMatch(/canonical generator output/);
     // File content reflects fresh generator
     const after = readFileSync(path, 'utf-8');
     expect(after).toBe(generateEnvIdentity(baseConfig));
@@ -456,11 +456,11 @@ describe('formatDeprecationWarning', () => {
     expect(formatDeprecationWarning([])).toBe('');
   });
 
-  it('renders one line per key + cites macf#342', () => {
+  it('renders one line per key + names where they moved to', () => {
     const out = formatDeprecationWarning(['MACF_AGENT_NAME', 'OTEL_RESOURCE_ATTRIBUTES']);
     expect(out).toContain('env.MACF_AGENT_NAME');
     expect(out).toContain('env.OTEL_RESOURCE_ATTRIBUTES');
-    expect(out).toContain('macf#342');
+    expect(out).toContain('.claude/.macf/env.*');
     expect(out).toContain('settings.local.json');
   });
 });
