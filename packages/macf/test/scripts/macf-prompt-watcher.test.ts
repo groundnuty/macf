@@ -338,12 +338,75 @@ describe('macf-prompt-watcher.sh — input-box vs menu-cursor misclassification 
 });
 
 /**
+ * Build a virtual-clock shim pair (`date` + `sleep`) backed by a
+ * monotonic, test-controlled millisecond counter at `clockFile` (starts
+ * at "0"). Used by `spawnWatcherAsync({ virtualClock: true })` — see the
+ * macf#1103 comment on the DECISIVE test below for why this exists.
+ *
+ * The split is deliberate: `date` becomes a PURE READ of the counter;
+ * `sleep` is the ONLY thing that ADVANCES it. The watcher calls
+ * `date +%s` once or twice per poll iteration depending on which branch
+ * fires (the while-condition check, plus `_extend_deadline` when the
+ * frame is matched or prompt-like) — an auto-incrementing `date` shim
+ * would advance the clock a different amount per iteration depending on
+ * which branch ran, which is its own source of nondeterminism. Routing
+ * all advancement through `sleep` (called exactly once per iteration in
+ * the main loop, plus the fixed 0.4/1s settle/verify sleeps inside
+ * `_handle_match`) means virtual time always advances by exactly the
+ * duration the SCRIPT asked to sleep for — zero contribution from how
+ * long the surrounding subprocess forks (tmux stub, grep, awk, cksum)
+ * actually took on the real CPU. That is what makes the deadline math
+ * immune to real scheduling jitter.
+ *
+ * `date` responds to the exact `+%s` form (the only one the watcher's
+ * deadline math uses) from the virtual counter; any other invocation
+ * (`_log`'s `-u +%Y-%m-%dT%H:%M:%SZ` timestamp) passes through to the
+ * REAL `date` via `command -p` (looks up the standard system PATH,
+ * bypassing this shim) — log timestamps are cosmetic and untouched.
+ * `sleep` still performs a tiny REAL sleep (20ms) after recording the
+ * virtual advance, so the loop yields the event loop / doesn't spin a
+ * CPU core, without that duration being logically meaningful.
+ */
+function makeVirtualClockDir(clockFile: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-clock-'));
+  const dateShim = `#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${1:-}" = "+%s" ]; then
+  ms=0
+  [ -f "${clockFile}" ] && ms="$(cat "${clockFile}")"
+  echo $(( ms / 1000 ))
+else
+  command -p date "$@"
+fi
+`;
+  const sleepShim = `#!/usr/bin/env bash
+set -euo pipefail
+arg="\${1:-0}"
+add_ms="$(awk -v s="$arg" 'BEGIN { printf "%d", (s*1000)+0.5 }')"
+ms=0
+[ -f "${clockFile}" ] && ms="$(cat "${clockFile}")"
+echo $(( ms + add_ms )) > "${clockFile}"
+command -p sleep 0.02
+`;
+  writeFileSync(join(dir, 'date'), dateShim);
+  chmodSync(join(dir, 'date'), 0o755);
+  writeFileSync(join(dir, 'sleep'), sleepShim);
+  chmodSync(join(dir, 'sleep'), 0o755);
+  return dir;
+}
+
+/**
  * The macf#1041 deadline-extension + total-cap fix. Unlike `runWatcher`
  * above (blocking `spawnSync`, fixed run-to-completion), these tests need to
  * mutate the virtual pane WHILE the watcher is still running — the whole
  * point being to prove a prompt that appears only after the original
  * fixed-window deadline would have elapsed is still caught. `spawn` (async)
  * + an `exited` promise gives the test control over timing.
+ *
+ * `virtualClock` (macf#1103): when true, `date`/`sleep` inside the watcher
+ * are backed by `makeVirtualClockDir` instead of the real system clock —
+ * see that function's doc comment. `virtualMs()`/`logContents()` are only
+ * meaningful when this is set.
  */
 function spawnWatcherAsync(opts: {
   readonly initialFrame: string;
@@ -351,10 +414,13 @@ function spawnWatcherAsync(opts: {
   readonly intervalSecs: number;
   readonly totalCapSecs: number;
   readonly config?: string;
+  readonly virtualClock?: boolean;
 }): {
   readonly setPane: (frame: string) => void;
   readonly sendsExist: () => boolean;
   readonly sendsContents: () => string;
+  readonly virtualMs: () => number;
+  readonly logContents: () => string;
   readonly exited: Promise<{ readonly code: number | null; readonly elapsedMs: number }>;
   readonly cleanup: () => void;
 } {
@@ -367,13 +433,30 @@ function spawnWatcherAsync(opts: {
   const configPath = join(configDir, 'prompt-responses.json');
   mkdirSync(configDir, { recursive: true });
   writeFileSync(configPath, opts.config ?? MINIMAL_CONFIG);
+  const macfLogPath = join(stateDir, 'channel.log');
+  // The watcher only uses MACF_LOG_PATH to derive a DIRECTORY — the actual
+  // log file is always `<that dir>/prompt-watcher.log` (see
+  // macf-prompt-watcher.sh's `LOG_FILE="$LOG_DIR/prompt-watcher.log"`), not
+  // `channel.log` itself. `logContents()` below must read THIS path.
+  const watcherLogPath = join(stateDir, 'prompt-watcher.log');
+
+  let clockDir: string | undefined;
+  let clockFile: string | undefined;
+  let pathPrefix = tmuxDir;
+  if (opts.virtualClock) {
+    clockFile = join(workDir, 'clock-ms.txt');
+    writeFileSync(clockFile, '0');
+    clockDir = makeVirtualClockDir(clockFile);
+    // clockDir first: it must win over the real `date`/`sleep` on PATH.
+    pathPrefix = `${clockDir}:${tmuxDir}`;
+  }
 
   const start = Date.now();
   const child = spawn('bash', ['-c', `"$0" "%99" 2>>"${paneFile}"`, WATCHER_SCRIPT], {
     env: {
-      PATH: `${tmuxDir}:${process.env['PATH'] ?? ''}`,
+      PATH: `${pathPrefix}:${process.env['PATH'] ?? ''}`,
       MACF_PROMPT_RESPONSES_PATH: configPath,
-      MACF_LOG_PATH: join(stateDir, 'channel.log'),
+      MACF_LOG_PATH: macfLogPath,
       MACF_PROMPT_WATCH_WINDOW_SECS: String(opts.windowSecs),
       MACF_PROMPT_WATCH_INTERVAL_SECS: String(opts.intervalSecs),
       MACF_PROMPT_WATCH_TOTAL_CAP_SECS: String(opts.totalCapSecs),
@@ -389,11 +472,14 @@ function spawnWatcherAsync(opts: {
     sendsExist: () => existsSync(`${paneFile}.sends`),
     sendsContents: () =>
       existsSync(`${paneFile}.sends`) ? readFileSync(`${paneFile}.sends`, 'utf-8') : '',
+    virtualMs: () => (clockFile && existsSync(clockFile) ? Number(readFileSync(clockFile, 'utf-8').trim()) : 0),
+    logContents: () => (existsSync(watcherLogPath) ? readFileSync(watcherLogPath, 'utf-8') : ''),
     exited,
     cleanup: () => {
       rmSync(stateDir, { recursive: true, force: true });
       rmSync(workDir, { recursive: true, force: true });
       rmSync(tmuxDir, { recursive: true, force: true });
+      if (clockDir) rmSync(clockDir, { recursive: true, force: true });
     },
   };
 }
@@ -414,6 +500,55 @@ async function waitForCondition(
   }
 }
 
+/**
+ * TEST-FAILURE DISCRIMINATOR (groundnuty/macf#1103) — read this before
+ * reaching for a wider `--testTimeout` on a red in this describe block.
+ *
+ * A red here can look like one of two very different things, and the
+ * error TEXT — not the color — is what tells them apart:
+ *
+ *   - `Test timed out in Nms`, reproducing only UNDER CONTENTION (parallel
+ *     test files, a loaded CI runner), is an ENVIRONMENT claim. This
+ *     repo's separately-documented flake class — `test/cli/certs.test.ts`,
+ *     `test/cli/init-local.test.ts`, `test/bootstrap/bootstrap-cleanup.test.ts`
+ *     — is exactly this shape: they miss vitest's 5s default under load
+ *     and go green at `--testTimeout=30000`. Raising the timeout is the
+ *     correct fix for THAT shape.
+ *   - An `AssertionError` (e.g. `expected false to be true`), reproducing
+ *     IN ISOLATION, WITH a raised timeout already in effect, is a claim
+ *     about the SYSTEM — the test's model of the behaviour and the
+ *     behaviour itself disagree. Raising `--testTimeout` does nothing for
+ *     this shape (the test isn't slow — it's racing something), and
+ *     reaching for it anyway just buries the disagreement instead of
+ *     resolving it.
+ *
+ * macf#1103 was the second shape: the DECISIVE test below intermittently
+ * (~1-in-3, isolation) asserted `h.sendsExist()` false when it should have
+ * been true — an `AssertionError` at a fixed line, not a timeout — and
+ * reproduced ONLY under artificial CPU contention, never on an idle
+ * machine. Root cause, confirmed (not guessed) by re-running under a
+ * deliberate CPU-burner load until red, then reading the failing line's
+ * stack trace: `date +%s` truncates to whole seconds, and
+ * `_extend_deadline` (macf-prompt-watcher.sh) computes
+ * `deadline = floor(now) + WINDOW`. With this test's compressed
+ * `WINDOW=2s` / `INTERVAL=1s`, the loop has only ~1s of real slack per
+ * poll iteration before an unlucky second-boundary truncation lets the
+ * `while` condition go false one iteration early — normally invisible
+ * (the loop body is fast), but crossable once the surrounding subprocess
+ * forks (the stub `tmux` + several `grep`/`awk`/`cksum` children) pick up
+ * ~100ms of scheduling delay under contention. Production's real defaults
+ * (WINDOW=90s/INTERVAL=1s) have 89s of margin and are not at risk — this
+ * was a test-compression artifact, not a defect in the shipped watcher
+ * (the same conclusion groundnuty/macf#1041's live pre/post-fix pane
+ * comparison already established for the *behaviour*; this defect was in
+ * how *this test* modeled real elapsed time on top of that behaviour).
+ *
+ * Fix: `spawnWatcherAsync({ virtualClock: true })` — see
+ * `makeVirtualClockDir`'s doc comment above. Widening the margin instead
+ * was considered and rejected: it would still be probabilistic (only
+ * pushes the same race to a lower rate), whereas faking the clock removes
+ * real elapsed time from the deadline decision entirely.
+ */
 describe('macf-prompt-watcher.sh — deadline extension + total lifetime cap (macf#1041)', () => {
   it(
     'DECISIVE: a prompt that becomes answerable only AFTER the original fixed window has already elapsed is still answered',
@@ -429,18 +564,31 @@ describe('macf-prompt-watcher.sh — deadline extension + total lifetime cap (ma
         windowSecs,
         intervalSecs: 1,
         totalCapSecs,
+        // macf#1103 — see the discriminator comment above this describe
+        // block. Deterministic virtual time, immune to real subprocess
+        // scheduling jitter, replaces a real `setTimeout` wait below.
+        virtualClock: true,
       });
       try {
-        // Wait past the ORIGINAL fixed launch+WINDOW deadline (2s) while the
-        // unanswerable frame is still showing. A pre-#1041 watcher would
-        // already have exited by this point — this is the exact elapsed
-        // time that produced the bug.
-        await new Promise((r) => setTimeout(r, (windowSecs + 2) * 1000));
+        // Wait past the ORIGINAL fixed launch+WINDOW deadline (2s) in
+        // VIRTUAL time while the unanswerable frame is still showing — a
+        // pre-#1041 watcher would already have exited by this point. This
+        // polls the watcher's own virtual clock (advanced only by its
+        // shimmed `sleep` calls, never by real wall-clock elapsed time),
+        // so it is exact regardless of how slow the surrounding
+        // subprocess forks are on whatever machine runs this.
+        await waitForCondition(() => h.virtualMs() > windowSecs * 1000, 10_000, 20);
         // assert-the-wrong-path (packages/macf/plugin/rules/assert-the-wrong-path.md):
         // nothing should have fired yet — proves the send below (once it
         // happens) is caused by the NEWLY-appeared frame, not by the
         // unanswerable one somehow being misclassified as a match.
         expect(h.sendsExist()).toBe(false);
+        // Positive proof of WHY it survived past the original window, not
+        // merely THAT nothing fired yet — guards against a regression
+        // where `_extend_deadline` is silently gutted but this assertion
+        // would still pass by coincidence (e.g. if TOTAL_CAP alone kept
+        // the loop alive for unrelated reasons).
+        expect(h.logContents()).toContain('deadline extended past the base window');
 
         // The operator finally clears the trust dialog; the seeded
         // dev-channels prompt appears right after (the exact #1041/#994
@@ -571,6 +719,17 @@ describe('macf-prompt-watcher.sh — deadline extension + total lifetime cap (ma
       // Persistently unanswerable — under per-activity extension alone
       // (no cap) this would never spontaneously go idle within any bounded
       // wait. Proves the cap, not idle-timeout, is what stops it.
+      //
+      // NOT virtualized (macf#1103): the property under test IS "how much
+      // REAL wall-clock time did the process actually run for", measured
+      // via `elapsedMs` below — that dependence is irreducible for this
+      // specific test (virtualizing the watcher's own clock while still
+      // measuring real Node-side elapsed time would decouple the two and
+      // make the assertion meaningless). The margins below (`+3s`) are
+      // sized for poll-cadence + process-startup overhead, not tuned to a
+      // single passing run — see the DECISIVE test's discriminator comment
+      // above this describe block for the shape of race this file DOES
+      // fix, which does not apply here.
       const unanswerableFrame = '❯ 1. Some unrecognized ceremony option\n  2. Another option\n';
       const h = spawnWatcherAsync({
         initialFrame: unanswerableFrame,
@@ -603,6 +762,11 @@ describe('macf-prompt-watcher.sh — deadline extension + total lifetime cap (ma
       const windowSecs = 2;
       // A cap far larger than the base window — an idle pane must not be
       // held alive anywhere near it (idle watchers must still exit).
+      //
+      // NOT virtualized (macf#1103): same reasoning as the total-lifetime-
+      // cap test just above — `elapsedMs` here measures REAL time, so
+      // faking the watcher's internal clock would make the assertion
+      // meaningless rather than deterministic.
       const totalCapSecs = 60;
       const idleFrame = 'Normal assistant output streaming — nothing prompt-like here.\n';
       const h = spawnWatcherAsync({
