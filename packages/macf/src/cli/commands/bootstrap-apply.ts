@@ -47,7 +47,7 @@ import { buildAppManifest, repoHomepageUrl } from '../bootstrap/app-manifest.js'
 import { appInstallationUrl, confirmAppInstallation as realConfirmAppInstallation } from '../bootstrap/identity-confirm.js';
 import type { ExpectedIdentity, IdentityConfirmation } from '../bootstrap/identity-confirm.js';
 import { confirmBeforeCreateGuard, installReposForIdentity, realAgentApplyDeps } from '../bootstrap/apply-agent.js';
-import type { AgentApplyOutcome, CreateGuardDecision, CreateGuardDeps } from '../bootstrap/apply-agent.js';
+import type { CreateGuardDecision, CreateGuardDeps } from '../bootstrap/apply-agent.js';
 import { realCloneRepo, realCommitAndPush } from '../bootstrap/apply-repo-init.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
 import { applyFleet } from '../bootstrap/apply-fleet.js';
@@ -87,7 +87,7 @@ import {
 } from '../bootstrap/vault-read.js';
 import type { VaultReadOptions } from '../bootstrap/vault-read.js';
 import type { LabelsOutcome } from './repo-init.js';
-import type { AppNameLengthCheck } from '../bootstrap/apply-runner-ops.js';
+import type { AppNameLengthCheck, RunnerOpsApplyOutcome } from '../bootstrap/apply-runner-ops.js';
 import { RUNNER_OPS_ROLE, buildRunnerOpsManifest, checkAppNameLengths, deriveRunnerOpsHandle } from '../bootstrap/apply-runner-ops.js';
 import { ROUTER_APP_ROLE } from '../bootstrap/apply-router-app.js';
 import { defaultOperatorRecoveryRootDir, operatorRecoveryArtifactPath } from '../bootstrap/vault-write.js';
@@ -1392,11 +1392,15 @@ function formatControlRepoSyncLine(sync: ControlRepoSyncOutcome): string {
 /**
  * One identity's status line — shared by `agentSummaryLines` (below, per
  * declared coordination agent) and `runnerOpsSummaryLines` (groundnuty/
- * macf#943, the fleet-level runner-ops App) since both render the
- * IDENTICAL `AgentApplyOutcome` union produced by the SAME `applyIdentity`
- * primitive. Extracted rather than duplicated (macf#943 task requirement).
+ * macf#943, the fleet-level runner-ops App) since both render the SAME
+ * status vocabulary. Typed over `RunnerOpsApplyOutcome` (`AgentApplyOutcome`
+ * widened with `'not-needed'`, groundnuty/macf#1083) rather than the bare
+ * `AgentApplyOutcome` — a strict superset, so every per-agent/router-App
+ * call site (whose outcome can never actually BE `'not-needed'`) keeps
+ * passing an `AgentApplyOutcome` value unchanged. Extracted rather than
+ * duplicated (macf#943 task requirement).
  */
-function formatIdentityLine(role: string, id: AgentApplyOutcome): string {
+function formatIdentityLine(role: string, id: RunnerOpsApplyOutcome): string {
   switch (id.status) {
     case 'created':
       return `  ${role}: CREATED (app_id ${id.appId}, install_id ${id.installId})`;
@@ -1410,6 +1414,11 @@ function formatIdentityLine(role: string, id: AgentApplyOutcome): string {
       return `  ${role}: DRIFT — ${id.reason}`;
     case 'failed':
       return `  ${role}: FAILED — ${id.reason}`;
+    // groundnuty/macf#1083 — only `result.runnerOps` can ever carry this
+    // status; every other call site's `AgentApplyOutcome` argument cannot
+    // reach it, so this arm is unreachable for them, never wrong for them.
+    case 'not-needed':
+      return `  ${role}: NOT NEEDED — ${id.reason}`;
   }
 }
 
@@ -1688,15 +1697,16 @@ function formatVersionReconcileLine(versionPhase: ApplyVersionPhaseResult): stri
 }
 
 /**
- * Redact an {@link AgentApplyOutcome} for JSON rendering. The `created`
- * variant carries the raw `AppCredentials` (PEM / client secret / webhook
- * secret) so `apply-fleet.ts` can assemble the vault payload — that object
- * must NEVER reach a log line or a `--json` envelope. Every other variant
- * carries no credential field to begin with; this still copies them
+ * Redact an {@link AgentApplyOutcome} (or, for `result.runnerOps` — groundnuty/
+ * macf#1083 — the widened {@link RunnerOpsApplyOutcome}) for JSON rendering.
+ * The `created` variant carries the raw `AppCredentials` (PEM / client secret
+ * / webhook secret) so `apply-fleet.ts` can assemble the vault payload — that
+ * object must NEVER reach a log line or a `--json` envelope. Every other
+ * variant carries no credential field to begin with; this still copies them
  * explicitly (rather than spreading) so a FUTURE variant that adds one is a
  * compile error here, not a silent leak.
  */
-function redactIdentity(identity: AgentApplyOutcome): unknown {
+function redactIdentity(identity: RunnerOpsApplyOutcome): unknown {
   switch (identity.status) {
     case 'created':
       return { role: identity.role, status: identity.status, appId: identity.appId, installId: identity.installId };
@@ -1708,6 +1718,10 @@ function redactIdentity(identity: AgentApplyOutcome): unknown {
     case 'drift':
       return { role: identity.role, status: identity.status, reason: identity.reason, installs: identity.installs };
     case 'failed':
+      return { role: identity.role, status: identity.status, reason: identity.reason };
+    // groundnuty/macf#1083 — only `result.runnerOps` can ever carry this
+    // status (see `RunnerOpsApplyOutcome`'s doc); no credential field to redact.
+    case 'not-needed':
       return { role: identity.role, status: identity.status, reason: identity.reason };
   }
 }

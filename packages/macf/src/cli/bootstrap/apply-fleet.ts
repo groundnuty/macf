@@ -243,12 +243,13 @@ import {
   writeAgentRecoveryArtifact,
   writeVault,
 } from './vault-write.js';
-import type { AppNameLengthCheck } from './apply-runner-ops.js';
+import type { AppNameLengthCheck, RunnerOpsApplyOutcome } from './apply-runner-ops.js';
 import {
   RUNNER_OPS_ROLE,
   checkAppNameLengths,
   deriveRunnerOpsHandle,
   runnerOpsIdentityRequest,
+  runnerOpsNeeded,
   validateRunnerOpsInstall,
 } from './apply-runner-ops.js';
 import type { RouterAppApplyOutcome, RouterAppSecretsForPublish, RouterAppVaultRestoreDeps, SharedRouterAppReuseDeps } from './apply-router-app.js';
@@ -646,8 +647,15 @@ export interface FleetApplyResult {
    * (see `controlRepo` above) reports it as `'failed'` with a reason
    * pointing at the abort, mirroring `ca`/`routingClient`'s own
    * always-present-even-on-abort discipline below.
+   *
+   * `RunnerOpsApplyOutcome` (groundnuty/macf#1083), not the bare
+   * `AgentApplyOutcome` every other identity field uses — this App is the
+   * first CONDITIONALLY-required identity (`runnerOpsNeeded`'s doc), so its
+   * outcome can additionally be `'not-needed'`: the fleet never declared
+   * `routing.runner.runs_on: self-hosted`, so no create-or-reuse ceremony
+   * was even attempted and zero consent-gate clicks were spent on it.
    */
-  readonly runnerOps: AgentApplyOutcome;
+  readonly runnerOps: RunnerOpsApplyOutcome;
   /**
    * The router App's identity outcome (groundnuty/macf#1074, groundnuty/
    * macf#1082) — a SEPARATE field from `agents`/`runnerOps`, same reasoning
@@ -1344,70 +1352,114 @@ export async function applyFleet(
   // every agent's — its role is folded into `pendingCreatedUpdates` alongside
   // the agents' for exactly that reason (see that branch's
   // `for (const role of Object.keys(pendingCreatedUpdates))` loop below).
+  //
+  // groundnuty/macf#1083 — but ONLY when `runnerOpsNeeded(manifest)` holds.
+  // Its sole purpose is minting self-hosted-runner registration tokens; a
+  // fleet that never declares `routing.runner.runs_on: self-hosted` has
+  // nothing for it to do, so the entire create-or-reuse ceremony below is
+  // SKIPPED ENTIRELY for that fleet — `runnerOpsDeps` is never even built —
+  // and the outcome is synthesized inline as `'not-needed'`. This is what
+  // makes a hosted-runner fleet spend ZERO consent-gate clicks on this
+  // identity. `plan.ts::runnerOpsItem` reads the SAME `runnerOpsNeeded`
+  // predicate so plan and apply can never disagree about whether this App is
+  // required.
   const runnerOpsPrior = currentLock?.agents.find((a) => a.role === RUNNER_OPS_ROLE);
-  // Same §D5 pre-flight the per-agent loop already applies above — an empty
-  // `transport.age_recipients` must refuse gate 1 for this identity too, not
-  // just for declared agents (a role absent from `pendingCreatedUpdates`
-  // never gets here on a re-run once a lock entry exists, mirroring the
-  // per-agent guard).
-  const runnerOpsDeps: AgentApplyDeps = {
-    ...buildAgentDepsWithRecovery(recoveryRootDir, manifest.metadata.name, recipients, {
-      ...deps,
-      log: (line: string): void => {
-        deps.log(`[runner-ops] ${line}`);
-      },
-    }),
-    // groundnuty/macf#943 — GitHub's App-manifest flow has no field to FORCE
-    // repository_selection at creation time (see
-    // `apply-runner-ops.ts::validateRunnerOpsInstall`'s doc); this
-    // is the verify-then-refuse enforcement point, checked right after gate 2
-    // confirms, before this identity is ever reported as created/resumed.
-    validateInstall: validateRunnerOpsInstall,
-  };
-  const runnerOpsIdentity: AgentApplyOutcome = wouldCreateWithNoRecipient(runnerOpsPrior, recipients)
-    ? noRecipientPreflightFailure(RUNNER_OPS_ROLE)
-    : wouldCreateWithUnreadableVault(runnerOpsPrior, vaultAlreadyExists, deps.identityKeyPath)
-      ? noVaultAccessPreflightFailure(RUNNER_OPS_ROLE, vaultOutPath)
-      : await applyIdentity(
-          // No home repo for this App — `controlRepo.repo` (the fleet's OWN
-          // control-plane repo, already confirmed to exist by Step 0 above) is
-          // the closest fleet-level homepage this tool has; a design choice,
-          // not a spec requirement (flagged in the implementation report).
-          runnerOpsIdentityRequest(repoHomepageUrl(controlRepo.repo)),
-          manifest,
-          runnerOpsPrior,
-          runnerOpsDeps,
-        );
-
   let pendingRunnerOpsVaultSecrets: VaultRunnerOpsSecrets | undefined;
-  if (runnerOpsIdentity.status === 'reused' || runnerOpsIdentity.status === 'resumed-install') {
-    writeIncrementalLock(RUNNER_OPS_ROLE, { appId: runnerOpsIdentity.appId, installId: runnerOpsIdentity.installId });
-  } else if (runnerOpsIdentity.status === 'created') {
-    const rrHandle = deriveRunnerOpsHandle(manifest.metadata.name);
-    const rrSecrets: VaultRunnerOpsSecrets = {
-      appHandle: rrHandle,
-      appId: runnerOpsIdentity.appId,
-      installId: runnerOpsIdentity.installId,
-      clientId: runnerOpsIdentity.credentials.clientId,
-      clientSecret: runnerOpsIdentity.credentials.clientSecret,
-      webhookSecret: runnerOpsIdentity.credentials.webhookSecret,
-      pem: runnerOpsIdentity.credentials.pem,
+  let runnerOpsIdentity: RunnerOpsApplyOutcome;
+  if (!runnerOpsNeeded(manifest)) {
+    // `runnerOpsPrior === undefined`: the common case — no App was ever
+    // created, none is created now, no clicks spent. `runnerOpsPrior !==
+    // undefined`: an ORPHAN — a prior run created this App while the
+    // manifest DID declare self-hosted, and a later edit dropped that
+    // declaration. §D3 Design invariant 4 (never prune) applies to
+    // identities exactly like it applies to plan items: apply never deletes
+    // an App, so the orphan is left exactly as recorded — skipping
+    // `writeIncrementalLock` below means the PRIOR lock entry survives this
+    // run's `composeFleetLock` completely unchanged (see that function's
+    // "any role NOT present in agentUpdates carries its entry here forward
+    // unchanged" doc). Reporting it as `'not-needed'` with an explicit
+    // orphan reason — rather than silently omitting it — is the load-bearing
+    // half of #1083's "do not silently ignore it": an operator reading this
+    // run's summary sees the orphan named, not a run that quietly stopped
+    // mentioning an App it once created.
+    runnerOpsIdentity = {
+      role: RUNNER_OPS_ROLE,
+      status: 'not-needed',
+      reason:
+        runnerOpsPrior === undefined
+          ? 'routing.runner.runs_on is not "self-hosted" (routing is either undeclared or declares a ' +
+            'different runner class) — this fleet needs no runner-ops App; none was created and no ' +
+            'consent-gate clicks were spent on it.'
+          : `runner-ops App "${deriveRunnerOpsHandle(manifest.metadata.name)}" is recorded in fleet.lock from ` +
+            'a prior run, but routing.runner.runs_on is no longer "self-hosted" — it is an ORPHAN. apply never ' +
+            'deletes an App (teardown is a separate, deliberate operator action); it is left exactly as recorded. ' +
+            'Archive or remove it manually on GitHub if it is no longer wanted.',
     };
-    pendingRunnerOpsVaultSecrets = rrSecrets;
-    pendingCreatedUpdates[RUNNER_OPS_ROLE] = {
-      appId: runnerOpsIdentity.appId,
-      installId: runnerOpsIdentity.installId,
-      secrets: vaultRunnerOpsSecretsForFingerprint(rrSecrets),
+  } else {
+    // Same §D5 pre-flight the per-agent loop already applies above — an empty
+    // `transport.age_recipients` must refuse gate 1 for this identity too, not
+    // just for declared agents (a role absent from `pendingCreatedUpdates`
+    // never gets here on a re-run once a lock entry exists, mirroring the
+    // per-agent guard).
+    const runnerOpsDeps: AgentApplyDeps = {
+      ...buildAgentDepsWithRecovery(recoveryRootDir, manifest.metadata.name, recipients, {
+        ...deps,
+        log: (line: string): void => {
+          deps.log(`[runner-ops] ${line}`);
+        },
+      }),
+      // groundnuty/macf#943 — GitHub's App-manifest flow has no field to FORCE
+      // repository_selection at creation time (see
+      // `apply-runner-ops.ts::validateRunnerOpsInstall`'s doc); this
+      // is the verify-then-refuse enforcement point, checked right after gate 2
+      // confirms, before this identity is ever reported as created/resumed.
+      validateInstall: validateRunnerOpsInstall,
     };
+    runnerOpsIdentity = wouldCreateWithNoRecipient(runnerOpsPrior, recipients)
+      ? noRecipientPreflightFailure(RUNNER_OPS_ROLE)
+      : wouldCreateWithUnreadableVault(runnerOpsPrior, vaultAlreadyExists, deps.identityKeyPath)
+        ? noVaultAccessPreflightFailure(RUNNER_OPS_ROLE, vaultOutPath)
+        : await applyIdentity(
+            // No home repo for this App — `controlRepo.repo` (the fleet's OWN
+            // control-plane repo, already confirmed to exist by Step 0 above) is
+            // the closest fleet-level homepage this tool has; a design choice,
+            // not a spec requirement (flagged in the implementation report).
+            runnerOpsIdentityRequest(repoHomepageUrl(controlRepo.repo)),
+            manifest,
+            runnerOpsPrior,
+            runnerOpsDeps,
+          );
+
+    if (runnerOpsIdentity.status === 'reused' || runnerOpsIdentity.status === 'resumed-install') {
+      writeIncrementalLock(RUNNER_OPS_ROLE, { appId: runnerOpsIdentity.appId, installId: runnerOpsIdentity.installId });
+    } else if (runnerOpsIdentity.status === 'created') {
+      const rrHandle = deriveRunnerOpsHandle(manifest.metadata.name);
+      const rrSecrets: VaultRunnerOpsSecrets = {
+        appHandle: rrHandle,
+        appId: runnerOpsIdentity.appId,
+        installId: runnerOpsIdentity.installId,
+        clientId: runnerOpsIdentity.credentials.clientId,
+        clientSecret: runnerOpsIdentity.credentials.clientSecret,
+        webhookSecret: runnerOpsIdentity.credentials.webhookSecret,
+        pem: runnerOpsIdentity.credentials.pem,
+      };
+      pendingRunnerOpsVaultSecrets = rrSecrets;
+      pendingCreatedUpdates[RUNNER_OPS_ROLE] = {
+        appId: runnerOpsIdentity.appId,
+        installId: runnerOpsIdentity.installId,
+        secrets: vaultRunnerOpsSecretsForFingerprint(rrSecrets),
+      };
+    }
+    // skipped-unverified / drift / failed: no lock write this run — same
+    // "unresolved this run" posture the per-agent loop already applies to its
+    // own identical statuses.
   }
-  // skipped-unverified / drift / failed: no lock write this run — same
-  // "unresolved this run" posture the per-agent loop already applies to its
-  // own identical statuses.
   deps.log(
     `Runner-ops App: ${runnerOpsIdentity.status.toUpperCase()}` +
       (runnerOpsIdentity.status === 'failed' ||
       runnerOpsIdentity.status === 'drift' ||
-      runnerOpsIdentity.status === 'skipped-unverified'
+      runnerOpsIdentity.status === 'skipped-unverified' ||
+      runnerOpsIdentity.status === 'not-needed'
         ? ` — ${runnerOpsIdentity.reason}`
         : '.'),
   );

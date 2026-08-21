@@ -698,7 +698,11 @@ describe('applyFleet', () => {
 
   it('a mix of created + already-present agents in one run: vault carries ONLY the created one, both get lock entries', async () => {
     const manifestPath = manifestPathIn();
-    const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+    // groundnuty/macf#1083 — self-hosted DECLARED so the runner-ops App is
+    // still needed and this test keeps exercising its recovery-artifact
+    // ordering alongside the router App's, per the comment on the
+    // `encryptCalls` assertion below.
+    const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
     const priorLock: FleetLock = {
       schema_version: 1,
       fleet: 'demo-fleet',
@@ -2011,7 +2015,12 @@ trust:
 
     it('deactivate-shaped state: lock has ca_key, registry ABSENT, vault has the cert -> RESTORES end-to-end (registry leg actually gets recreated, not just "vault was read"), never mints', async () => {
       const manifestPath = manifestPathIn();
-      const manifest = manifestWith([CODE_AGENT]);
+      // groundnuty/macf#1083 — self-hosted DECLARED so the runner-ops App
+      // stays a needed identity and takes the REUSED path below like the
+      // other two; without this the prior lock entry would be reported as
+      // an orphan ('not-needed'), which is correct #1083 behavior but
+      // irrelevant noise for a test whose focus is the CA machinery.
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       // The agent, the fleet-level runner-ops App, AND the router App
       // (groundnuty/macf#1074 — a third always-resolved identity on every
       // apply run) all get a PRIOR lock entry so all three take the REUSED
@@ -2702,12 +2711,13 @@ trust:
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT]);
       // groundnuty/macf#943 — this test's own focus is agent routability, not
-      // the runner-ops; the SAME shared `agentDepsFor` fixture also
-      // drives the runner-ops credential's gate 2 (it takes the identical no-prior-lock
-      // CREATE path). `repositorySelection: 'selected'` lets the runner-ops credential
-      // ALSO resolve cleanly instead of failing `validateRunnerOpsInstall`
-      // — an unrelated failure there must not spuriously flip THIS test's
-      // "green exit ⇒ routable" assertion below.
+      // the runner-ops. `manifestWith([CODE_AGENT])` declares no self-hosted
+      // routing, so as of groundnuty/macf#1083 the runner-ops App is
+      // `'not-needed'` and never even reaches gate 2 with this fixture — one
+      // fewer unrelated identity that could spuriously flip THIS test's
+      // "green exit ⇒ routable" assertion below. `repositorySelection:
+      // 'selected'` on `waitForAppInstallation` remains here for the
+      // code-agent's OWN gate 2.
       const codeAgentDeps: AgentApplyDeps = {
         ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
         waitForAppInstallation: async (opts) => ({
@@ -3171,7 +3181,10 @@ trust:
   describe('the runner-ops App (groundnuty/macf#943)', () => {
     it('creates it with EXACTLY the three permissions (asserts the manifest actually SENT, not just that a call happened)', async () => {
       const manifestPath = manifestPathIn();
-      const manifest = manifestWith([CODE_AGENT]);
+      // groundnuty/macf#1083 — runner-ops is CONDITIONAL as of this issue;
+      // every test in this describe block that exercises its create-or-reuse
+      // ceremony must declare self-hosted routing so `runnerOpsNeeded` holds.
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const capturedManifests: { name: string; permissions: Record<string, string>; events: readonly string[] }[] = [];
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
@@ -3212,7 +3225,8 @@ trust:
 
     it('repository_selection scoped to fleet repos — an "all"-scoped install is REFUSED, never silently accepted', async () => {
       const manifestPath = manifestPathIn();
-      const manifest = manifestWith([CODE_AGENT]);
+      // groundnuty/macf#1083 — declare self-hosted so runner-ops is needed.
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         buildAgentDeps: (log) => ({
@@ -3244,7 +3258,8 @@ trust:
 
     it('existing App (prior fleet.lock entry) → reused, NOT recreated — the create-gate (startManifestFlow) is NEVER invoked', async () => {
       const manifestPath = manifestPathIn();
-      const manifest = manifestWith([CODE_AGENT]);
+      // groundnuty/macf#1083 — declare self-hosted so runner-ops is needed.
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const priorLock: FleetLock = {
         schema_version: 1,
         fleet: 'demo-fleet',
@@ -3281,7 +3296,8 @@ trust:
 
     it('the private key NEVER appears in captured log lines, formatApplyResult text, or fleetApplyResultToJson output', async () => {
       const manifestPath = manifestPathIn();
-      const manifest = manifestWith([CODE_AGENT]);
+      // groundnuty/macf#1083 — declare self-hosted so runner-ops is needed.
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const logs: string[] = [];
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
@@ -3332,7 +3348,8 @@ trust:
 
     it('durable-before-gate-2 ordering preserved: its OWN recovery artifact is written BEFORE gate 2, deleted only after the batched vault write succeeds', async () => {
       const manifestPath = manifestPathIn();
-      const manifest = manifestWith([CODE_AGENT]);
+      // groundnuty/macf#1083 — declare self-hosted so runner-ops is needed.
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const events: string[] = [];
       // `agentDepsFor`'s shared `exchangeManifestCode` returns FIXED creds
       // regardless of caller — override it to return DIFFERENT creds per
@@ -3509,7 +3526,8 @@ trust:
       // for a role with no prior lock entry — it just authorizes create,
       // the honest-unknown-over-false-absent posture Amendment A4 requires.
       const manifestPath = manifestPathIn();
-      const manifest = manifestWith([CODE_AGENT]);
+      // groundnuty/macf#1083 — declare self-hosted so runner-ops is needed.
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         buildAgentDeps: (log) => ({
@@ -3843,7 +3861,11 @@ trust:
     it('same pre-flight applies to the runner-ops App (no prior lock entry, vault exists, no --identity-key)', async () => {
       const manifestPath = manifestPathIn();
       // No coordination agents at all — isolates the runner-ops's OWN pre-flight.
-      const manifest = manifestWith([]);
+      // groundnuty/macf#1083 — self-hosted DECLARED so runner-ops is needed
+      // and this pre-flight path is actually reached (an undeclared/hosted
+      // manifest would short-circuit to 'not-needed' before this pre-flight
+      // ever runs — see the dedicated #1083 describe block below for that).
+      const manifest: FleetManifest = { ...manifestWith([]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('runner-ops', 'created', 'app-runner-ops', 'install-1'), manifestPath),
         trustDeps: reuseTrustDeps(),
@@ -4169,16 +4191,13 @@ trust:
 
       const result = await applyFleet(manifest, manifestPath, priorLock, deps);
 
-      // `applyExitCode` is NOT asserted here — this fixture's shared
-      // `agentDepsFor('code-agent', ...)` object is ALSO handed to the
-      // runner-ops (this file's documented "one AgentApplyDeps per role via
-      // buildAgentDeps" convention), whose `waitForAppInstallation` fake
-      // therefore returns an install with no `repositorySelection`, which
-      // `validateRunnerOpsInstall` correctly rejects — an orthogonal,
-      // PRE-EXISTING fixture artifact unrelated to #1012 (the SAME shape
-      // every other `agentDepsFor('code-agent', 'reused', ...)` test in this
-      // file already has, none of which assert `applyExitCode` either). The
-      // load-bearing assertion for THIS test is `identity.status`.
+      // `applyExitCode` is deliberately not asserted here — see the
+      // load-bearing assertion note below. `manifest` declares no self-hosted
+      // routing, so as of groundnuty/macf#1083 the runner-ops App is
+      // `'not-needed'` and never even reaches `waitForAppInstallation`/
+      // `validateRunnerOpsInstall` with this fixture's shared
+      // `agentDepsFor('code-agent', ...)` object. The load-bearing assertion
+      // for THIS test is `identity.status`.
       expect(result.agents[0]?.identity.status).toBe('reused');
       // Verified on the REUSE path too (groundnuty/macf#1012's headline
       // gap — an already-provisioned role re-confirmed on a re-run): the
@@ -4205,9 +4224,8 @@ trust:
 
       // Honest-unknown never blocks (DR-043 Amendment A) — the role is
       // still reused. (`applyExitCode` not asserted — see the sibling
-      // "present" test above for why this fixture's shared `agentDepsFor`
-      // makes the runner-ops leg an orthogonal, pre-existing non-zero exit
-      // unrelated to this check.)
+      // "present" test above; no self-hosted routing declared, so the
+      // runner-ops App is `'not-needed'`, per groundnuty/macf#1083.)
       expect(result.agents[0]?.identity.status).toBe('reused');
       // But the run REPORTS it — a warning naming the App + repo reaches
       // the operator-visible log, not silently dropped:
@@ -4234,9 +4252,9 @@ trust:
 
       const result = await applyFleet(manifest, manifestPath, priorLock, deps);
 
-      // `applyExitCode` not asserted — see the "present" test above for why
-      // this fixture's shared `agentDepsFor` makes the runner-ops leg an
-      // orthogonal, pre-existing non-zero exit unrelated to this check.
+      // `applyExitCode` not asserted — see the "present" test above; no
+      // self-hosted routing declared, so the runner-ops App is
+      // `'not-needed'`, per groundnuty/macf#1083.
       expect(result.agents[0]?.identity.status).toBe('reused');
     });
 

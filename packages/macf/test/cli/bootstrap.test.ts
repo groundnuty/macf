@@ -248,11 +248,11 @@ describe('runBootstrapPlan', () => {
     // no plan-time observed read at all, so it ALWAYS degrades to a
     // LOW-CONFIDENCE create-candidate — this is not "unclean," it's a
     // documented limitation (see `labelsItem`'s doc). `runner_ops`
-    // (groundnuty/macf#943) is the SAME shape here: this fixture's
-    // `observed.lock` is `null`, so the fleet-level runner-ops credential item can only
-    // degrade to `unknown` -> `create`, alongside `labels`.
+    // (groundnuty/macf#943) is absent entirely here (groundnuty/macf#1083):
+    // `VALID_FLEET_YAML` declares no `routing:` section, so this fleet needs
+    // no runner-ops App — `labels` is the ONLY create-candidate.
     expect(json.summary.noops).toBe(7);
-    expect(json.summary.creates).toBe(2);
+    expect(json.summary.creates).toBe(1);
   });
 
   // DR-043 Amendment D phase 3 — proves the `--vault`/`--identity-key` CLI
@@ -328,13 +328,16 @@ describe('runBootstrapPlan', () => {
 
 // --- Operator interaction budget (groundnuty/macf#880) ---
 //
-// `VALID_FLEET_YAML` declares ONE agent (`code-agent`); a fresh `EMPTY_OBSERVED`
-// plan always carries the unconditional runner-ops item too (macf#943) — so
-// this fixture's honest maximum is 2 Apps (1 agent + runner-ops), not 1. The
-// arithmetic-decisive fresh-2-agent (→6) and add-one-agent (→2) cases live in
-// `plan.test.ts` against `baseManifest()`'s 2-agent fixture — this file only
-// proves the CLI wiring (text render + `--json`), not the counting itself
-// (the #1000 golden-path rule: one place derives the count, plan.ts).
+// `VALID_FLEET_YAML` declares ONE agent (`code-agent`) and no `routing:`
+// section — as of groundnuty/macf#1083 the runner-ops App is NOT NEEDED for
+// a fleet that never declares `routing.runner.runs_on: self-hosted`, so this
+// fixture's honest maximum is 1 App (the agent alone), not 2. The
+// arithmetic-decisive fresh-2-agent (→4 hosted / →6 self-hosted) and
+// add-one-agent (→2) cases, plus the runner-ops conditional-creation cases
+// themselves, live in `plan.test.ts` against `baseManifest()`'s 2-agent
+// fixture — this file only proves the CLI wiring (text render + `--json`),
+// not the counting itself (the #1000 golden-path rule: one place derives
+// the count, plan.ts).
 describe('runBootstrapPlan — operator interaction budget (groundnuty/macf#880)', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
   const dirs: string[] = [];
@@ -344,16 +347,16 @@ describe('runBootstrapPlan — operator interaction budget (groundnuty/macf#880)
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   });
 
-  it('fresh fleet, plain text: names the honest maximum (1 declared agent + runner-ops = 2) and points at --vault/--identity-key on apply', async () => {
+  it('fresh fleet, plain text: names the honest maximum (1 declared agent, no runner-ops — groundnuty/macf#1083) and points at --vault/--identity-key on apply', async () => {
     const { dir, file } = writeManifest(VALID_FLEET_YAML);
     dirs.push(dir);
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const code = await runBootstrapPlan({ file }, { observe: async () => EMPTY_OBSERVED });
     expect(code).toBe(0);
     const out = logSpy.mock.calls.flat().join('\n');
-    expect(out).toMatch(/Operator interaction: up to 2 Apps to create/);
-    expect(out).toContain('2 "Create GitHub App" clicks');
-    expect(out).toContain('2 install flows');
+    expect(out).toMatch(/Operator interaction: up to 1 App to create/);
+    expect(out).toContain('1 "Create GitHub App" click');
+    expect(out).toContain('1 install flow');
     expect(out).toContain('macf bootstrap apply --vault');
     expect(out).toContain('may confirm some of these already exist and skip their gates');
   });
@@ -367,10 +370,10 @@ describe('runBootstrapPlan — operator interaction budget (groundnuty/macf#880)
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
       operator_interaction: { gate1_clicks: number; gate2_flows: number; bound: string };
     };
-    expect(json.operator_interaction).toEqual({ gate1_clicks: 2, gate2_flows: 2, bound: 'maximum' });
+    expect(json.operator_interaction).toEqual({ gate1_clicks: 1, gate2_flows: 1, bound: 'maximum' });
   });
 
-  it('--vault/--identity-key on PLAN ITSELF never tightens this number (only apply\'s confirm-before-create guard can, macf#913) — the maximum stays 2', async () => {
+  it('--vault/--identity-key on PLAN ITSELF never tightens this number (only apply\'s confirm-before-create guard can, macf#913) — the maximum stays 1', async () => {
     const { dir, file } = writeManifest(VALID_FLEET_YAML);
     dirs.push(dir);
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -382,7 +385,7 @@ describe('runBootstrapPlan — operator interaction budget (groundnuty/macf#880)
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
       operator_interaction: { gate1_clicks: number; gate2_flows: number; bound: string };
     };
-    expect(json.operator_interaction).toEqual({ gate1_clicks: 2, gate2_flows: 2, bound: 'maximum' });
+    expect(json.operator_interaction).toEqual({ gate1_clicks: 1, gate2_flows: 1, bound: 'maximum' });
   });
 
   it('a fully-provisioned fleet (every app/runner-ops item already present): "none — no consent gates", bound: "exact", zero stated explicitly', async () => {
