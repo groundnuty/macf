@@ -314,7 +314,7 @@ export async function checkTailscaleOauthPreflight(
     message:
       `transport.tailscale_oauth_required is declared, but the vault did not yield ${TS_OAUTH_CLIENT_ID_SECRET_NAME}/` +
       `${TS_OAUTH_SECRET_SECRET_NAME} (${reason}). Refusing before consent gate 1 — spending consent clicks on a ` +
-      'fleet that cannot route is exactly the waste this refusal exists to prevent (DR-043 Amendment C precedent). ' +
+      'fleet that cannot route is exactly the waste this refusal exists to prevent. ' +
       'Supply the operator-provided values into the vault, then re-run apply.',
   });
 

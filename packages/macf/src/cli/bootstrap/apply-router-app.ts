@@ -310,7 +310,7 @@ export async function resolveRouterAppSecretsForPublish(
         status: 'unavailable',
         reason:
           'router App was freshly created this run but the batched vault write did not succeed — refusing to ' +
-          'deploy its private key to any repo until it is durable (DR-043 §D5). Re-run apply once the vault issue ' +
+          'deploy its private key to any repo until it is durable. Re-run apply once the vault issue ' +
           'is fixed; the App itself already exists on GitHub and is NOT re-created on retry.',
       };
     }
