@@ -698,3 +698,366 @@ describe('macf-prompt-watcher.sh — deadline extension + total lifetime cap (ma
     }
   });
 });
+
+/**
+ * groundnuty/macf#1066 (as retracted + narrowed — see the issue's own
+ * follow-up comment): NOT a self-triggering feedback loop (that claim was
+ * withdrawn; it was mis-read tmux line-wrapping). The real, narrower defect:
+ * `_maybe_alert_unknown` deduped on a hash of the WHOLE raw pane frame, so
+ * prompt-IRRELEVANT content elsewhere on screen (a footer/status line, the
+ * free-form input-box cursor changing as text is typed/queued elsewhere)
+ * changed the hash on every poll even while the unknown menu itself never
+ * moved — degenerating dedup to "alert once per poll" and burying the
+ * prompt an operator needed to answer under repeats of itself.
+ *
+ * The stub tmux below models exactly that: the SAME prompt line every call,
+ * plus a monotonically-incrementing "churn" line appended by the stub
+ * itself — standing in for whatever volatile element was really on screen,
+ * without needing to reproduce Claude Code's actual TUI. The prompt line
+ * never changes; the churn line always does. A dedup keyed on the whole
+ * frame flunks this by construction; a dedup keyed on the prompt's own
+ * signature does not.
+ */
+function makeChurnStubTmuxDir(promptFile: string, counterFile: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-tmux-churn-'));
+  const shim = `#!/usr/bin/env bash
+set -euo pipefail
+cmd="\${1:-}"
+case "$cmd" in
+  capture-pane)
+    n=0
+    if [ -f "${counterFile}" ]; then
+      n="$(cat "${counterFile}")"
+    fi
+    n=$((n + 1))
+    echo "$n" > "${counterFile}"
+    cat "${promptFile}" 2>/dev/null || true
+    echo "status: churn-$n (volatile footer content, unrelated to the prompt)"
+    ;;
+  send-keys)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`;
+  writeFileSync(join(dir, 'tmux'), shim);
+  chmodSync(join(dir, 'tmux'), 0o755);
+  return dir;
+}
+
+/**
+ * A stub tmux that serves `frameAFile` for the first `switchAfter`
+ * capture-pane calls, then unconditionally switches to `frameBFile`. Models
+ * two genuinely DIFFERENT unknown prompts appearing in sequence, so a fix
+ * that dedups on the prompt's signature can be checked for
+ * over-suppression: it must still alert again when the actual prompt
+ * content changes, not just when anything on screen changes.
+ */
+function makeSwitchingStubTmuxDir(
+  frameAFile: string,
+  frameBFile: string,
+  counterFile: string,
+  switchAfter: number,
+): string {
+  const dir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-tmux-switch-'));
+  const shim = `#!/usr/bin/env bash
+set -euo pipefail
+cmd="\${1:-}"
+case "$cmd" in
+  capture-pane)
+    n=0
+    if [ -f "${counterFile}" ]; then
+      n="$(cat "${counterFile}")"
+    fi
+    n=$((n + 1))
+    echo "$n" > "${counterFile}"
+    if [ "$n" -gt ${String(switchAfter)} ]; then
+      cat "${frameBFile}" 2>/dev/null || true
+    else
+      cat "${frameAFile}" 2>/dev/null || true
+    fi
+    ;;
+  send-keys)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`;
+  writeFileSync(join(dir, 'tmux'), shim);
+  chmodSync(join(dir, 'tmux'), 0o755);
+  return dir;
+}
+
+describe('macf-prompt-watcher.sh — alert dedup immune to volatile pane content (macf#1066)', () => {
+  it(
+    'DECISIVE: N polls over ONE persisting unknown frame (with unrelated churn elsewhere on screen) produce exactly ONE alert',
+    () => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-state-'));
+      const workDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-work-'));
+      const promptFile = join(workDir, 'prompt.txt');
+      const counterFile = join(workDir, 'counter.txt');
+      writeFileSync(promptFile, '❯ 1. Some unrecognized ceremony option\n  2. Another option\n');
+      const tmuxDir = makeChurnStubTmuxDir(promptFile, counterFile);
+      const configDir = join(workDir, '.macf');
+      const configPath = join(configDir, 'prompt-responses.json');
+      try {
+        mkdirSync(configDir, { recursive: true });
+        writeFileSync(configPath, MINIMAL_CONFIG);
+        const res = spawnSync('bash', [WATCHER_SCRIPT, '%99'], {
+          encoding: 'utf-8',
+          env: {
+            PATH: `${tmuxDir}:${process.env['PATH'] ?? ''}`,
+            MACF_PROMPT_RESPONSES_PATH: configPath,
+            MACF_LOG_PATH: join(stateDir, 'channel.log'),
+            MACF_PROMPT_WATCH_WINDOW_SECS: '5',
+            MACF_PROMPT_WATCH_INTERVAL_SECS: '1',
+            MACF_PROMPT_WATCH_TOTAL_CAP_SECS: '5',
+          },
+        });
+        expect(res.status).toBe(0);
+        // Prove the churn actually happened — several DISTINCT whole-frame
+        // captures occurred (the counter proves it), which is exactly the
+        // condition that would defeat a whole-frame-hash dedup.
+        const polls = Number(readFileSync(counterFile, 'utf-8').trim());
+        expect(polls).toBeGreaterThanOrEqual(3);
+        // Assert the COUNT, not merely that an alert fired — per
+        // assert-the-wrong-path.md, "an alert was emitted" cannot
+        // distinguish one from four hundred.
+        const alertCount = (res.stderr.match(/ALERT: UNKNOWN prompt-like frame/g) ?? []).length;
+        expect(alertCount).toBe(1);
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+        rmSync(workDir, { recursive: true, force: true });
+        rmSync(tmuxDir, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+
+  it(
+    'a genuinely NEW distinct unknown prompt still produces a NEW alert (dedup does not over-suppress)',
+    () => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-state-'));
+      const workDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-work-'));
+      const frameAFile = join(workDir, 'frameA.txt');
+      const frameBFile = join(workDir, 'frameB.txt');
+      const counterFile = join(workDir, 'counter.txt');
+      writeFileSync(frameAFile, '❯ 1. First unrecognized option\n  2. Skip\n');
+      writeFileSync(frameBFile, '❯ 1. Second, totally different option\n  2. Skip\n');
+      // Serve frame A for the first 2 polls (dedup should collapse those to
+      // one alert), then switch to frame B for the rest (a genuinely new
+      // signature — must produce a second, distinct alert).
+      const tmuxDir = makeSwitchingStubTmuxDir(frameAFile, frameBFile, counterFile, 2);
+      const configDir = join(workDir, '.macf');
+      const configPath = join(configDir, 'prompt-responses.json');
+      try {
+        mkdirSync(configDir, { recursive: true });
+        writeFileSync(configPath, MINIMAL_CONFIG);
+        const res = spawnSync('bash', [WATCHER_SCRIPT, '%99'], {
+          encoding: 'utf-8',
+          env: {
+            PATH: `${tmuxDir}:${process.env['PATH'] ?? ''}`,
+            MACF_PROMPT_RESPONSES_PATH: configPath,
+            MACF_LOG_PATH: join(stateDir, 'channel.log'),
+            MACF_PROMPT_WATCH_WINDOW_SECS: '6',
+            MACF_PROMPT_WATCH_INTERVAL_SECS: '1',
+            MACF_PROMPT_WATCH_TOTAL_CAP_SECS: '6',
+          },
+        });
+        expect(res.status).toBe(0);
+        const polls = Number(readFileSync(counterFile, 'utf-8').trim());
+        expect(polls).toBeGreaterThanOrEqual(4);
+        const alertCount = (res.stderr.match(/ALERT: UNKNOWN prompt-like frame/g) ?? []).length;
+        expect(alertCount).toBe(2);
+        expect(res.stderr).toContain('First unrecognized option');
+        expect(res.stderr).toContain('Second, totally different option');
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+        rmSync(workDir, { recursive: true, force: true });
+        rmSync(tmuxDir, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+});
+
+/**
+ * groundnuty/macf#891: the retry branch inside `_handle_match` used to send
+ * Enter unconditionally after re-sending the ordinal, unlike the first
+ * attempt, which always re-captures and re-checks `_entry_matches` before
+ * pressing Enter (some menus advance on the digit alone; a blind Enter then
+ * lands on whatever screen comes next — never vetted against the
+ * allowlist, Inv 1). This stub tmux tracks how many times the entry's
+ * ordinal has been sent (via the recorded sends log) and, starting from the
+ * SECOND ordinal send (the retry's), switches the pane to a completely
+ * different, non-matching "next screen" — modeling exactly the "menu
+ * advanced on the digit alone" hazard the guard exists to catch.
+ */
+function makeAdvancingStubTmuxDir(
+  originalFrameFile: string,
+  advancedFrameFile: string,
+  sendsFile: string,
+  ordinal: string,
+): string {
+  const dir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-tmux-advance-'));
+  const shim = `#!/usr/bin/env bash
+set -euo pipefail
+cmd="\${1:-}"
+case "$cmd" in
+  capture-pane)
+    n=0
+    if [ -f "${sendsFile}" ]; then
+      n=$(grep -c -- '-- ${ordinal}$' "${sendsFile}" 2>/dev/null || true)
+    fi
+    if [ "\${n:-0}" -ge 2 ]; then
+      cat "${advancedFrameFile}" 2>/dev/null || true
+    else
+      cat "${originalFrameFile}" 2>/dev/null || true
+    fi
+    ;;
+  send-keys)
+    echo "SEND: $*" >> "${sendsFile}"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`;
+  writeFileSync(join(dir, 'tmux'), shim);
+  chmodSync(join(dir, 'tmux'), 0o755);
+  return dir;
+}
+
+describe('macf-prompt-watcher.sh — retry path shares the pre-Enter guard with the first attempt (macf#891)', () => {
+  it(
+    'DECISIVE: when the menu advances on the retry\'s ordinal alone, the retry does NOT blindly press Enter',
+    () => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-state-'));
+      const workDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-work-'));
+      const originalFrameFile = join(workDir, 'original.txt');
+      const advancedFrameFile = join(workDir, 'advanced.txt');
+      const paneFile = join(workDir, 'pane.txt'); // unused by capture, but keeps `${paneFile}.sends` naming below intuitive
+      const sendsFile = `${paneFile}.sends`;
+      writeFileSync(originalFrameFile, '❯ 1. MARKER option\n  2. Skip\n');
+      // Deliberately shares NO substring with the entry's signature (not
+      // even the entry's name) — the guard must reject this on
+      // frame_contains alone, not rely on the option_text check as a
+      // second, coincidental line of defense.
+      writeFileSync(advancedFrameFile, 'A totally unrelated next screen appears here.\n');
+      const tmuxDir = makeAdvancingStubTmuxDir(originalFrameFile, advancedFrameFile, sendsFile, '1');
+      const configDir = join(workDir, '.macf');
+      const configPath = join(configDir, 'prompt-responses.json');
+      const config = JSON.stringify({
+        schema_version: '1',
+        entries: [
+          {
+            name: 'retry-guard-entry',
+            frame_contains: ['MARKER'],
+            option_text: 'MARKER option',
+            send: '1',
+            max_fires: 1,
+          },
+        ],
+      });
+      try {
+        mkdirSync(configDir, { recursive: true });
+        writeFileSync(configPath, config);
+        const res = spawnSync('bash', [WATCHER_SCRIPT, '%99'], {
+          encoding: 'utf-8',
+          env: {
+            PATH: `${tmuxDir}:${process.env['PATH'] ?? ''}`,
+            MACF_PROMPT_RESPONSES_PATH: configPath,
+            MACF_LOG_PATH: join(stateDir, 'channel.log'),
+            MACF_PROMPT_WATCH_WINDOW_SECS: '6',
+            MACF_PROMPT_WATCH_INTERVAL_SECS: '1',
+            MACF_PROMPT_WATCH_TOTAL_CAP_SECS: '10',
+          },
+        });
+        expect(res.status).toBe(0);
+        const sends = existsSync(sendsFile) ? readFileSync(sendsFile, 'utf-8') : '';
+        const ordinalSends = (sends.match(/-- 1$/gm) ?? []).length;
+        const enterSends = (sends.match(/ Enter$/gm) ?? []).length;
+        // The guard fired on BOTH attempts: first attempt's ordinal, then
+        // the retry's ordinal (2 total) — proving the retry branch was
+        // actually exercised, not skipped.
+        expect(ordinalSends).toBe(2);
+        // Enter was sent ONLY after the first attempt, whose post-ordinal
+        // frame still matched. The retry's post-ordinal frame is the
+        // ADVANCED (non-matching) screen, so the SAME guard that protected
+        // the first attempt must suppress the retry's Enter too. Pre-fix,
+        // the retry sent Enter unconditionally regardless of match state,
+        // so this would be 2.
+        expect(enterSends).toBe(1);
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+        rmSync(workDir, { recursive: true, force: true });
+        rmSync(tmuxDir, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+
+  it(
+    'the common case is unaffected: when the frame still matches after the retry\'s ordinal, Enter IS still sent',
+    () => {
+      // No "advance" at all — the pane never changes, so BOTH the first
+      // attempt's and the retry's post-ordinal frame still match. This
+      // pins "no behavior change in the common case" (macf#891 AC3):
+      // the guard must not turn into a NEW failure to answer when nothing
+      // actually advanced.
+      const stateDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-state-'));
+      const workDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-work-'));
+      const paneFile = join(workDir, 'pane.txt');
+      writeFileSync(paneFile, '❯ 1. MARKER option\n  2. Skip\n');
+      const tmuxDir = makeStubTmuxDir(paneFile);
+      const configDir = join(workDir, '.macf');
+      const configPath = join(configDir, 'prompt-responses.json');
+      const config = JSON.stringify({
+        schema_version: '1',
+        entries: [
+          {
+            name: 'retry-guard-entry-static',
+            frame_contains: ['MARKER'],
+            option_text: 'MARKER option',
+            send: '1',
+            max_fires: 1,
+          },
+        ],
+      });
+      try {
+        mkdirSync(configDir, { recursive: true });
+        writeFileSync(configPath, config);
+        const res = spawnSync('bash', [WATCHER_SCRIPT, '%99'], {
+          encoding: 'utf-8',
+          env: {
+            PATH: `${tmuxDir}:${process.env['PATH'] ?? ''}`,
+            MACF_PROMPT_RESPONSES_PATH: configPath,
+            MACF_LOG_PATH: join(stateDir, 'channel.log'),
+            MACF_PROMPT_WATCH_WINDOW_SECS: '6',
+            MACF_PROMPT_WATCH_INTERVAL_SECS: '1',
+            MACF_PROMPT_WATCH_TOTAL_CAP_SECS: '10',
+          },
+        });
+        expect(res.status).toBe(0);
+        const sendsFile = `${paneFile}.sends`;
+        const sends = existsSync(sendsFile) ? readFileSync(sendsFile, 'utf-8') : '';
+        const ordinalSends = (sends.match(/-- 1$/gm) ?? []).length;
+        const enterSends = (sends.match(/ Enter$/gm) ?? []).length;
+        // The static pane never clears (stub tmux never reacts to sends),
+        // so the watcher retries once (2 ordinal sends) and, because the
+        // frame still matches BOTH times, sends Enter both times too.
+        expect(ordinalSends).toBe(2);
+        expect(enterSends).toBe(2);
+      } finally {
+        rmSync(stateDir, { recursive: true, force: true });
+        rmSync(workDir, { recursive: true, force: true });
+        rmSync(tmuxDir, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+});

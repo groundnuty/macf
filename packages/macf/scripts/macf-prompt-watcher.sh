@@ -182,6 +182,16 @@ _classify() {
   echo ok
 }
 
+# Prompt-like detection regexes — the single source both _looks_prompt_like
+# (does this frame look like a prompt at all?) AND _prompt_signature (which
+# LINES are the actual signal, used for the alert dedup key + display excerpt
+# below) match against. Keeping one definition removes a class of bug: a
+# mismatch between the detection regex and a separately-written extraction
+# regex is exactly the shape of the macf#729 misclassification hazard this
+# comment already warns about, just at a different pair of call sites.
+readonly PROMPT_LIKE_MENU_RE='❯[[:space:]]*[0-9]+[.)]'
+readonly PROMPT_LIKE_YN_RE='\((y/n|y/N|Y/n)\)|\[(y/N|Y/n|y/n)\]'
+
 # _looks_prompt_like <frame> → 0 if the frame looks like an interactive prompt
 #
 # ❯ is overloaded (groundnuty/macf#729): it is BOTH the menu-selection cursor
@@ -193,8 +203,8 @@ _classify() {
 # NUMBERED OPTION line — that excludes the free-form input box (whose text
 # after `❯` is not `[0-9]+[.)]`) while still catching real numbered menus.
 _looks_prompt_like() {
-  printf '%s' "$1" | grep -qE '❯[[:space:]]*[0-9]+[.)]' && return 0
-  printf '%s' "$1" | grep -qE '\((y/n|y/N|Y/n)\)|\[(y/N|Y/n|y/n)\]' && return 0
+  printf '%s' "$1" | grep -qE "$PROMPT_LIKE_MENU_RE" && return 0
+  printf '%s' "$1" | grep -qE "$PROMPT_LIKE_YN_RE" && return 0
   return 1
 }
 
@@ -298,6 +308,29 @@ _capture() {
   _strip_own_output "$raw"
 }
 
+# _send_ordinal_and_maybe_enter <idx> → sends the entry's ordinal, re-captures,
+# and presses Enter ONLY if the frame still matches the entry afterward.
+#
+# groundnuty/macf#891: some menus advance on the digit alone, so a blind
+# Enter would land on whatever screen comes NEXT — hazardous, because that
+# next screen was never vetted against the allowlist (Inv 1). The first
+# attempt in _handle_match always re-checked before pressing Enter; the retry
+# branch used to skip the re-check and send Enter unconditionally, carrying
+# exactly the hazard the first attempt exists to avoid. Both call sites now
+# share this ONE guarded implementation, so the guard cannot silently apply
+# to only one of the two structurally identical send attempts again.
+_send_ordinal_and_maybe_enter() { # <idx>
+  local idx="$1" send="${ACC_SEND[$1]}"
+  tmux send-keys -t "$PANE" -- "$send" 2>/dev/null || return 1
+  sleep 0.4
+  local mid; mid="$(_capture)"
+  if _entry_matches "$mid" "$idx"; then
+    tmux send-keys -t "$PANE" Enter 2>/dev/null || true
+    sleep 1
+  fi
+  return 0
+}
+
 # --- handle a matched entry: settle → send → verify --------------------------
 _handle_match() { # <frame> <idx>
   local frame="$1" idx="$2"
@@ -309,15 +342,11 @@ _handle_match() { # <frame> <idx>
   local frame2; frame2="$(_capture)"
   _entry_matches "$frame2" "$idx" || { _log INFO "entry \"$name\" matched but frame not yet stable — deferring"; return 0; }
 
-  # Send the ordinal. Re-check before sending Enter: some menus advance on the
-  # digit alone, so a blind Enter would land on the NEXT screen (hazardous).
   _log INFO "auto-answering \"$name\": sending \"$send\" to pane $PANE"
-  tmux send-keys -t "$PANE" -- "$send" 2>/dev/null || { _alert "send-keys failed for \"$name\""; FIRED[$idx]=$((FIRED[idx] + 1)); return 0; }
-  sleep 0.4
-  local mid; mid="$(_capture)"
-  if _entry_matches "$mid" "$idx"; then
-    tmux send-keys -t "$PANE" Enter 2>/dev/null || true
-    sleep 1
+  if ! _send_ordinal_and_maybe_enter "$idx"; then
+    _alert "send-keys failed for \"$name\""
+    FIRED[$idx]=$((FIRED[idx] + 1))
+    return 0
   fi
 
   FIRED[$idx]=$((FIRED[idx] + 1))
@@ -326,12 +355,10 @@ _handle_match() { # <frame> <idx>
   # Verify the RIGHT outcome (DR-033). "Cleared" != "correctly answered".
   if _entry_matches "$after" "$idx"; then
     # Not cleared — typed-but-no-effect (RC "typed-no-Enter", silent-fallback
-    # Instance 3). One retry, then alert + stop (fire cap protects against loops).
+    # Instance 3). One retry, with the SAME re-check guard as the first
+    # attempt (macf#891), then alert + stop (fire cap protects against loops).
     _log WARN "\"$name\" still present after send — retrying once"
-    tmux send-keys -t "$PANE" -- "$send" 2>/dev/null || true
-    sleep 0.4
-    tmux send-keys -t "$PANE" Enter 2>/dev/null || true
-    sleep 1
+    _send_ordinal_and_maybe_enter "$idx" || true
     after="$(_capture)"
     if _entry_matches "$after" "$idx"; then
       _alert "\"$name\" did NOT clear after auto-answer (typed-no-Enter?) — will not retry further"
@@ -350,13 +377,37 @@ _handle_match() { # <frame> <idx>
   fi
 }
 
+# _prompt_signature <frame> → just the lines that make the frame look like a
+# prompt at all (the SAME regexes _looks_prompt_like uses), one per line.
+#
+# groundnuty/macf#1066: _maybe_alert_unknown used to dedup on a hash of the
+# WHOLE raw frame. That is wrong — an unknown prompt can sit unchanged on
+# screen for many polls while OTHER, prompt-irrelevant content elsewhere in
+# the same pane keeps moving (a status/footer line, a live counter, the
+# free-form input-box `❯` line itself changing as text is typed/queued
+# elsewhere — see the macf#729 comment above on that same overload). Any of
+# that changes the WHOLE-FRAME hash on every poll even though the unknown
+# menu itself never moved, so the pre-fix dedup silently degenerated to
+# "alert once per poll" — 2 real unknown prompts produced 321 alert lines
+# (23 distinct byte-variants) in one observed session, burying the one
+# prompt an operator needed to see under the noise.
+# Restricting both the dedup key AND the excerpt below to just the matched
+# prompt line(s) makes both immune to everything else on screen: the key
+# changes only when the ACTUAL prompt content changes.
+_prompt_signature() {
+  printf '%s' "$1" | grep -E "$PROMPT_LIKE_MENU_RE" || true
+  printf '%s' "$1" | grep -E "$PROMPT_LIKE_YN_RE" || true
+}
+
 # --- unknown-prompt alert (dedup per distinct frame) -------------------------
 LAST_UNKNOWN=""
 _maybe_alert_unknown() { # <frame>
-  local h; h="$(printf '%s' "$1" | cksum 2>/dev/null | awk '{print $1}' || echo x)"
+  local sig h
+  sig="$(_prompt_signature "$1")"
+  h="$(printf '%s' "$sig" | cksum 2>/dev/null | awk '{print $1}' || echo x)"
   [ "$h" = "$LAST_UNKNOWN" ] && return 0
   LAST_UNKNOWN="$h"
-  _alert "UNKNOWN prompt-like frame on pane $PANE not on the allowlist — NOT answering (Inv 1). First line: $(printf '%s' "$1" | grep -m1 -E '❯|\(y/n\)' | sed 's/^[[:space:]]*//' | cut -c1-120)"
+  _alert "UNKNOWN prompt-like frame on pane $PANE not on the allowlist — NOT answering (Inv 1). First line: $(printf '%s' "$sig" | head -n1 | sed 's/^[[:space:]]*//' | cut -c1-120)"
 }
 
 # --- deadline extension (macf#1041) -------------------------------------
