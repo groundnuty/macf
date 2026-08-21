@@ -678,15 +678,20 @@ describe('check-lgtm-gate.sh (hook)', () => {
   });
 
   describe('defense-in-depth — fail-open on infrastructure errors', () => {
-    it('allows merge when gh pr view exits non-zero (404 / network / auth)', () => {
+    it('allows merge when gh pr view exits non-zero for a non-auth reason (404 / network)', () => {
       // Simulated gh failure — the stub returns null for PR 600, which
-      // triggers `exit 1` in the stub gh.
+      // triggers `exit 1` in the stub gh with a generic (non-auth-shaped)
+      // stderr message. groundnuty/macf#938 split this test's old title —
+      // "404 / network / auth" — in two: a non-auth failure like this one
+      // is UNCHANGED (still fails open); an auth-shaped failure now fails
+      // CLOSED instead — see the "credential-refresh" describe block below.
       const r = runHook({
         command: 'gh pr merge 600 --repo owner/repo --squash',
         stubGh: { '600': null },
       });
-      // Defense-in-depth: gh failure → fail-open. Operator discipline +
-      // canonical rule remain primary defenses; the hook closes residual.
+      // Defense-in-depth: non-auth gh failure → fail-open, unchanged.
+      // Operator discipline + canonical rule remain primary defenses; the
+      // hook closes residual.
       expect(r.status).toBe(0);
     });
 
@@ -741,6 +746,189 @@ describe('check-lgtm-gate.sh (hook)', () => {
         encoding: 'utf-8',
       });
       expect(r.status).toBe(0);
+    });
+  });
+
+  describe('credential-refresh (groundnuty/macf#938)', () => {
+    // The ambient GH_TOKEN this hook inherits is a launch-time, 1-hour
+    // installation token. These tests exercise the fix directly: a merely
+    // stale-but-refreshable token should recover transparently; a token
+    // that CANNOT be refreshed must BLOCK the merge, never silently allow
+    // it — that silent-allow was the bug (macf#938).
+    const EXPIRED = 'ghs_expired0000000000000000000000000AAAA';
+    const FRESH = 'ghs_freshlyminted00000000000000000000AAAA';
+
+    /**
+     * A `gh pr merge`-style stub that answers `gh pr view <N> ...` based on
+     * the CALLER's ambient $GH_TOKEN: the expired sentinel 401s (both the
+     * REST-shaped and GraphQL-shaped stderr gh actually emits — verified
+     * live against gh 2.95.0), the fresh sentinel succeeds with the given
+     * PR JSON, and any other token also succeeds (the "already valid, used
+     * as-is" case).
+     */
+    function makeTokenAwareStubGhDir(pr: StubPr): string {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-lgtm-tokenaware-gh-'));
+      const json = JSON.stringify({
+        author: { login: pr.authorLogin },
+        reviews: pr.reviews.map((r) => ({ author: { login: r.authorLogin }, state: r.state })),
+        comments: (pr.comments ?? []).map((c) => ({ author: { login: c.authorLogin }, body: c.body })),
+      });
+      const stubScript = `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" != "pr" || "\${2:-}" != "view" ]]; then
+  echo "stub gh: unexpected subcommand \$*" >&2
+  exit 64
+fi
+if [[ "\${GH_TOKEN:-}" == "${EXPIRED}" ]]; then
+  echo "gh: Bad credentials (HTTP 401)" >&2
+  echo "HTTP 401: Bad credentials (https://api.github.com/graphql)" >&2
+  exit 1
+fi
+cat <<'JSON_EOF'
+${json}
+JSON_EOF
+`;
+      const ghPath = join(dir, 'gh');
+      writeFileSync(ghPath, stubScript);
+      chmodSync(ghPath, 0o755);
+      return dir;
+    }
+
+    /**
+     * A workspace carrying `.claude/scripts/macf-gh-token.sh` — the
+     * refresh helper macf_hook_gh shells out to. `succeeds: true` echoes
+     * the FRESH sentinel (as the real helper would print a newly-minted
+     * token); `succeeds: false` exits non-zero with no stdout (as the real
+     * helper does on a bad key / clock drift / wrong App ID).
+     */
+    function makeWorkspace(opts: { readonly succeeds: boolean }): string {
+      const ws = mkdtempSync(join(tmpdir(), 'macf-lgtm-ws-'));
+      mkdirSync(join(ws, '.claude', 'scripts'), { recursive: true });
+      const helperPath = join(ws, '.claude', 'scripts', 'macf-gh-token.sh');
+      const helperScript = opts.succeeds
+        ? `#!/usr/bin/env bash\necho "${FRESH}"\n`
+        : `#!/usr/bin/env bash\necho "stub helper: refresh failed (bad key)" >&2\nexit 1\n`;
+      writeFileSync(helperPath, helperScript);
+      chmodSync(helperPath, 0o755);
+      return ws;
+    }
+
+    function runTokenAwareHook(opts: {
+      readonly ambientToken: string;
+      readonly workspace?: string;
+      readonly pr: StubPr;
+    }): ReturnType<typeof spawnSync> {
+      const stubDir = makeTokenAwareStubGhDir(opts.pr);
+      const basePath = process.env['PATH'] ?? '';
+      const env: Record<string, string> = {
+        PATH: `${stubDir}:${basePath}`,
+        GH_TOKEN: opts.ambientToken,
+      };
+      if (opts.workspace) {
+        env['MACF_WORKSPACE_DIR'] = opts.workspace;
+        env['APP_ID'] = 'test-app-id';
+        env['INSTALL_ID'] = 'test-install-id';
+        env['KEY_PATH'] = '/irrelevant-to-the-stub.pem';
+      }
+      try {
+        return spawnSync('bash', [HOOK_SCRIPT], {
+          input: JSON.stringify({
+            session_id: 'test',
+            tool_name: 'Bash',
+            tool_input: { command: 'gh pr merge 900 --repo owner/repo --squash' },
+          }),
+          env,
+          encoding: 'utf-8',
+        });
+      } finally {
+        rmSync(stubDir, { recursive: true, force: true });
+      }
+    }
+
+    const NO_REVIEWS: StubPr = { authorLogin: 'app/macf-code-agent', reviews: [] };
+    const WITH_APPROVAL: StubPr = {
+      authorLogin: 'app/macf-code-agent',
+      reviews: [{ authorLogin: 'macf-science-agent', state: 'APPROVED' }],
+    };
+
+    it('DECISIVE: an expired token that CANNOT be refreshed BLOCKS the merge — not a silent allow', () => {
+      // This is the exact bug: no workspace configured, so the refresh
+      // helper is unreachable and macf_hook_gh's retry also fails
+      // authentication. Before this fix, this fell into the same
+      // `exit 0` as every other gh failure — the gate silently stopped
+      // enforcing "no LGTM = no merge". Assert the actually-changed
+      // outcome (BLOCKED, exit 2, a specific message) — asserting only
+      // "exit is non-zero" or "exit is not 0" would not distinguish a
+      // real fix from a hook that now blocks for the WRONG reason.
+      const r = runTokenAwareHook({ ambientToken: EXPIRED, pr: WITH_APPROVAL });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/could not verify/i);
+      expect(r.stderr).toMatch(/NOT "no approval exists"/);
+      expect(r.stderr).not.toMatch(/no non-author APPROVED/i); // wrong-reason guard
+    });
+
+    it('the refresh helper\'s own failure is handled and surfaced (broken key, not just "missing")', () => {
+      // Distinct from the no-workspace case above: here a workspace EXISTS
+      // and macf-gh-token.sh is reachable, but the helper itself fails
+      // (simulating a bad key / clock drift / wrong App ID) — the failure
+      // must still be caught and reported, not crash the hook or hang.
+      const ws = makeWorkspace({ succeeds: false });
+      try {
+        const r = runTokenAwareHook({ ambientToken: EXPIRED, workspace: ws, pr: WITH_APPROVAL });
+        expect(r.status).toBe(2);
+        expect(r.stderr).toMatch(/could not verify/i);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('an expired token WITH a working refresh recovers the real check (blocks correctly on no reviews)', () => {
+      const ws = makeWorkspace({ succeeds: true });
+      try {
+        const r = runTokenAwareHook({ ambientToken: EXPIRED, workspace: ws, pr: NO_REVIEWS });
+        // The refreshed token let the check actually run — it correctly
+        // found NO approval and blocks for the ORDINARY reason, not the
+        // credential-failure reason.
+        expect(r.status).toBe(2);
+        expect(r.stderr).toMatch(/no non-author APPROVED/i);
+        expect(r.stderr).not.toMatch(/could not verify/i);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('an expired token WITH a working refresh recovers the real check (allows correctly on real approval)', () => {
+      const ws = makeWorkspace({ succeeds: true });
+      try {
+        const r = runTokenAwareHook({ ambientToken: EXPIRED, workspace: ws, pr: WITH_APPROVAL });
+        expect(r.status).toBe(0);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('a valid ambient token is used as-is — no refresh attempted', () => {
+      // No workspace configured (refresh would fail if attempted) — the
+      // stub gh succeeds for ANY token other than the expired sentinel, so
+      // if the hook needlessly tried to refresh first, this would still
+      // pass by accident. The real assertion is the negative case above
+      // (DECISIVE test) succeeding only when EXPIRED is used — this test
+      // just pins that an ordinary live token round-trips with no drama.
+      const r = runTokenAwareHook({ ambientToken: 'ghs_live0000000000000000000000000000AAAA', pr: WITH_APPROVAL });
+      expect(r.status).toBe(0);
+    });
+
+    it('never prints the fresh or expired token value to stdout or stderr', () => {
+      const ws = makeWorkspace({ succeeds: true });
+      try {
+        const r = runTokenAwareHook({ ambientToken: EXPIRED, workspace: ws, pr: NO_REVIEWS });
+        expect(r.stdout ?? '').not.toContain(FRESH);
+        expect(r.stderr ?? '').not.toContain(FRESH);
+        expect(r.stdout ?? '').not.toContain(EXPIRED);
+        expect(r.stderr ?? '').not.toContain(EXPIRED);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
     });
   });
 

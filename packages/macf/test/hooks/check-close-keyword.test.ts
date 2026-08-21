@@ -19,7 +19,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
@@ -378,6 +378,138 @@ describe('check-close-keyword.sh (hook)', () => {
         env: { MACF_SKIP_CLOSE_CHECK: '1' },
       });
       expect(r.status).toBe(0);
+    });
+  });
+
+  describe('credential-refresh (groundnuty/macf#938)', () => {
+    // This hook already fails CLOSED (APIERROR → BLOCKED) on any
+    // unresolved authorship lookup, auth-related or not — that posture is
+    // UNCHANGED by macf#938. What's new is: a merely-EXPIRED ambient token
+    // now gets one refresh-and-retry via macf_hook_gh before falling into
+    // that same conservative path, so a long session doesn't start
+    // false-blocking every legitimate self-close on token staleness alone.
+    const EXPIRED = 'ghs_expired0000000000000000000000000AAAA';
+    const FRESH = 'ghs_freshlyminted00000000000000000000AAAA';
+
+    /**
+     * A `gh api repos/O/R/issues/N`-style stub that answers based on the
+     * CALLER's ambient $GH_TOKEN: the expired sentinel 401s (the REST-
+     * endpoint shape `resolve_issue()` actually hits), any other token
+     * (including the fresh sentinel) succeeds with the given issue author.
+     */
+    function makeTokenAwareStubGhDir(issueAuthor: string): string {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-close-tokenaware-gh-'));
+      const body = JSON.stringify({ number: 9, user: { login: issueAuthor }, pull_request: null });
+      const stubScript = `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" != "api" ]]; then
+  echo "stub gh: unexpected subcommand \$*" >&2
+  exit 64
+fi
+if [[ "\${GH_TOKEN:-}" == "${EXPIRED}" ]]; then
+  echo "gh: Bad credentials (HTTP 401)" >&2
+  exit 1
+fi
+echo '${body}'
+`;
+      const ghPath = join(dir, 'gh');
+      writeFileSync(ghPath, stubScript);
+      chmodSync(ghPath, 0o755);
+      return dir;
+    }
+
+    /** Mirrors check-lgtm-gate.test.ts's workspace-with-stub-helper builder. */
+    function makeWorkspace(opts: { readonly succeeds: boolean }): string {
+      const ws = mkdtempSync(join(tmpdir(), 'macf-close-ws-'));
+      const scriptsDir = join(ws, '.claude', 'scripts');
+      mkdirSync(scriptsDir, { recursive: true });
+      const helperPath = join(scriptsDir, 'macf-gh-token.sh');
+      const helperScript = opts.succeeds
+        ? `#!/usr/bin/env bash\necho "${FRESH}"\n`
+        : `#!/usr/bin/env bash\necho "stub helper: refresh failed" >&2\nexit 1\n`;
+      writeFileSync(helperPath, helperScript);
+      chmodSync(helperPath, 0o755);
+      return ws;
+    }
+
+    function runTokenAwareHook(opts: {
+      readonly ambientToken: string;
+      readonly workspace?: string;
+      readonly issueAuthor: string;
+      readonly command: string;
+    }): ReturnType<typeof spawnSync> {
+      const stubDir = makeTokenAwareStubGhDir(opts.issueAuthor);
+      const basePath = process.env['PATH'] ?? '';
+      const env: Record<string, string> = {
+        PATH: `${stubDir}:${basePath}`,
+        GH_TOKEN: opts.ambientToken,
+        MACF_AGENT_NAME: ACTING,
+      };
+      if (opts.workspace) {
+        env['MACF_WORKSPACE_DIR'] = opts.workspace;
+        env['APP_ID'] = 'test-app-id';
+        env['INSTALL_ID'] = 'test-install-id';
+        env['KEY_PATH'] = '/irrelevant-to-the-stub.pem';
+      }
+      try {
+        return spawnSync('bash', [HOOK_SCRIPT], {
+          input: JSON.stringify({ session_id: 'test', tool_name: 'Bash', tool_input: { command: opts.command } }),
+          env,
+          encoding: 'utf-8',
+        });
+      } finally {
+        rmSync(stubDir, { recursive: true, force: true });
+      }
+    }
+
+    const CLOSES_PEER_ISSUE = 'gh pr create --repo groundnuty/macf --title x --body "closes #9"';
+
+    it('DECISIVE: an expired token that CANNOT be refreshed still BLOCKS (unchanged fail-closed posture)', () => {
+      // No workspace configured — refresh is unreachable, so macf_hook_gh's
+      // retry also fails authentication. This hook was ALREADY fail-closed
+      // on any unresolved lookup, so the exit code doesn't change — what
+      // this proves is that routing through macf_hook_gh doesn't
+      // accidentally loosen that posture into an allow.
+      const r = runTokenAwareHook({ ambientToken: EXPIRED, issueAuthor: PEER, command: CLOSES_PEER_ISSUE });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/BLOCKED/);
+      expect(r.stderr).toMatch(/could not verify/i);
+    });
+
+    it('an expired token WITH a working refresh recovers the real authorship check', () => {
+      const ws = makeWorkspace({ succeeds: true });
+      try {
+        // Issue #9 is authored by SELF here — a working refresh should let
+        // the hook correctly resolve that and ALLOW (self-filed close is
+        // legitimate), rather than falling into the conservative
+        // could-not-verify block a broken credential would produce.
+        const r = runTokenAwareHook({ ambientToken: EXPIRED, workspace: ws, issueAuthor: SELF, command: CLOSES_PEER_ISSUE });
+        expect(r.status).toBe(0);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('a valid ambient token is used as-is — no refresh attempted', () => {
+      const r = runTokenAwareHook({
+        ambientToken: 'ghs_live0000000000000000000000000000AAAA',
+        issueAuthor: SELF,
+        command: CLOSES_PEER_ISSUE,
+      });
+      expect(r.status).toBe(0);
+    });
+
+    it('never prints the fresh or expired token value to stdout or stderr', () => {
+      const ws = makeWorkspace({ succeeds: true });
+      try {
+        const r = runTokenAwareHook({ ambientToken: EXPIRED, workspace: ws, issueAuthor: PEER, command: CLOSES_PEER_ISSUE });
+        expect(r.stdout ?? '').not.toContain(FRESH);
+        expect(r.stderr ?? '').not.toContain(FRESH);
+        expect(r.stdout ?? '').not.toContain(EXPIRED);
+        expect(r.stderr ?? '').not.toContain(EXPIRED);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
     });
   });
 });
