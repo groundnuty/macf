@@ -19,7 +19,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
@@ -509,6 +509,56 @@ echo '${body}'
         expect(r.stderr ?? '').not.toContain(EXPIRED);
       } finally {
         rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('a missing hook-gh-token.sh sibling degrades gracefully AND preserves the 404-vs-APIERROR split', () => {
+      // The degraded-mode fallback must capture gh's stderr (not discard
+      // it), or resolve_issue()'s `grep -qiE '404|not found'` classifier
+      // can never match in degraded mode — narrowing this hook's fail-open
+      // NOTFOUND path into an always-block, which is stricter than
+      // pre-fix behavior for a workspace that's merely missing the new
+      // sibling file. Copy ONLY check-close-keyword.sh into an isolated
+      // directory and confirm a 404 (nonexistent issue) still ALLOWS.
+      const isolatedDir = mkdtempSync(join(tmpdir(), 'macf-close-isolated-'));
+      const isolatedHook = join(isolatedDir, 'check-close-keyword.sh');
+      copyFileSync(HOOK_SCRIPT, isolatedHook);
+      chmodSync(isolatedHook, 0o755);
+      const stubDir = mkdtempSync(join(tmpdir(), 'macf-close-isolated-stub-'));
+      try {
+        writeFileSync(
+          join(stubDir, 'gh'),
+          `#!/usr/bin/env bash
+if [[ "\${1:-}" == "repo" && "\${2:-}" == "view" ]]; then
+  echo 'groundnuty/macf'
+  exit 0
+fi
+if [[ "\${1:-}" == "api" ]]; then
+  echo "gh: Not Found (HTTP 404)" >&2
+  exit 1
+fi
+echo "stub gh: unexpected subcommand: $*" >&2
+exit 1
+`
+        );
+        chmodSync(join(stubDir, 'gh'), 0o755);
+        const r = spawnSync('bash', [isolatedHook], {
+          input: JSON.stringify({
+            session_id: 'test',
+            tool_name: 'Bash',
+            tool_input: { command: 'gh pr create --repo groundnuty/macf --title x --body "closes #999999"' },
+          }),
+          env: { PATH: `${stubDir}:${process.env['PATH'] ?? ''}`, MACF_AGENT_NAME: ACTING },
+          encoding: 'utf-8',
+        });
+        expect(r.stderr).toMatch(/missing from this workspace/i);
+        // The decisive assertion: a 404 (no such issue → nothing to
+        // auto-close) still ALLOWS in degraded mode, same as with the
+        // library present — proving the fallback's stderr capture works.
+        expect(r.status).toBe(0);
+      } finally {
+        rmSync(stubDir, { recursive: true, force: true });
+        rmSync(isolatedDir, { recursive: true, force: true });
       }
     });
   });

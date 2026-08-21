@@ -134,10 +134,16 @@ if [[ -r "$HOOK_GH_TOKEN_LIB" ]]; then
 else
   echo "MACF attribution-result check: the credential-refresh helper library is missing from this workspace's scripts — running without token refresh. Update this workspace to pick up the missing file." >&2
   macf_hook_gh() {
-    local out rc=0
-    out="$(gh "$@" 2>/dev/null)" || rc=$?
-    printf '%s' "$out"
-    [[ "$rc" -eq 0 ]] && return 0
+    local out err errfile rc=0
+    errfile="$(mktemp 2>/dev/null)" || { printf 'could not allocate a temp file'; return 2; }
+    out="$(gh "$@" 2>"$errfile")" || rc=$?
+    err="$(cat "$errfile" 2>/dev/null || true)"
+    rm -f "$errfile"
+    if [[ "$rc" -eq 0 ]]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    printf '%s' "$err"
     return 2
   }
 fi
