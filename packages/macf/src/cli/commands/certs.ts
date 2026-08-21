@@ -72,11 +72,11 @@ function printCaRotationBlastRadiusWarning(project: string): void {
   const seg = toVariableSegment(project);
   console.log('');
   console.log('================================================================');
-  console.log('⚠️  CA (re-)issued — OUT-OF-BAND blast radius (macf#800)');
+  console.log('⚠️  CA (re-)issued — OUT-OF-BAND blast radius');
   console.log('================================================================');
   console.log('This command re-issued the CA + in-workspace agent cert, but it CANNOT');
   console.log("reach artifacts that live out-of-band as GitHub Actions secrets/variables");
-  console.log("on your caller/agent repos (agents can't write GitHub secrets — DR-019).");
+  console.log("on your caller/agent repos (agents can't write GitHub secrets).");
   console.log('Those artifacts may now be silently ORPHANED (signed by / naming the OLD');
   console.log('CA) — see silent-fallback-hazards.md Instance 16. On EVERY caller/agent');
   console.log("repo in this project's App install-set:");
@@ -89,7 +89,7 @@ function printCaRotationBlastRadiusWarning(project: string): void {
   console.log('       gh secret set ROUTING_CLIENT_KEY  --repo <owner>/<repo> < <dir>/routing-action-key.pem');
   console.log('');
   console.log(`  2. ${seg}_CA_CERT (a GitHub Actions repo VARIABLE, not the registry) —`);
-  console.log("     the v3 router's CA trust anchor (macf#806). Re-set:");
+  console.log("     the v3 router's CA trust anchor. Re-set:");
   console.log(`       gh variable set ${seg}_CA_CERT --repo <owner>/<repo> < <path-to-new-ca-cert.pem>`);
   console.log('');
   console.log("This command cannot enumerate your exact caller-repo list — check the");
