@@ -136,6 +136,55 @@ Practically: read the surrounding lines, not the matching one; confirm the subje
 
 ---
 
+## 5c. "Assert the result" requires identifying which observable IS the result
+
+§1 and §5b tell you to check evidence rather than narrate it. Neither tells you **which observable to check** — and a verification can apply this rule perfectly in spirit while asserting a **downstream consequence of the result instead of the result**.
+
+**The question to ask before writing any verification: is this observable the operation's result, or something the result eventually causes?**
+
+### The worked example
+
+A release step verified an `npm publish` by polling `npm view <pkg> version` until the new version appeared. Correct discipline — assert the outcome, not the exit code — and the **wrong observable**. npm's own output says why:
+
+    npm notice publish  Signed provenance statement ... transparency log: logIndex=...
+    npm notice Your package is being processed and may take a few minutes to become available.
+
+**Acceptance is immediate and authoritative. Availability is eventually-consistent and explicitly unbounded** — the registry declines to state how long. So the check raced a window nobody controls, and *"retry more"* is the same defect with a longer fuse.
+
+### Why picking the wrong observable is worse than it sounds
+
+The availability check returned **`404` after N retries** for two states at once:
+
+| | what it means | correct response |
+|---|---|---|
+| accepted, not yet propagated | benign, wait | **do nothing** |
+| never published | a real partial publish | **stop and investigate** |
+
+**A check whose output is identical for the benign and the catastrophic case has no discriminating power for either** — and here the catastrophic branch's canonical recovery is *destructive* (bump the version and republish), so the ambiguity does not merely delay: **it invites burning a version over a package that had already published.**
+
+### How to find the right observable
+
+- **The result is what the operation itself reports on success** — an acceptance record, a signed statement, a returned id, a commit SHA. It is available the moment the operation finishes.
+- **A consequence is what the result later causes** — propagation, indexing, a cache warming, a downstream sync. Its timing belongs to a system you do not control.
+- **When both matter, check both — as separate checks with separate severities.** Acceptance blocks; availability is a *later* alarm that must never be reported as a failure of the operation that already succeeded. Collapsing them is what produced the incident above.
+
+**The tell:** if a verification needs a retry budget, ask whether it is waiting for the result or for a consequence. Results do not need retries.
+
+## 5d. An empty result is not evidence of absence unless the instrument would have shown presence
+
+§5c chooses the observable; this one governs **reading it**. Before treating "nothing came back" as "nothing is there", ask: **would this instrument have returned something if the thing existed?**
+
+Four instruments, one failure shape, all observed in a single day:
+
+- **A `404` on a private resource** means *not entitled to see it*, never *does not exist* — and for a peer read under a partial-visibility identity, that is the **common** case, not the edge case. Acting on it produced a confident, specific, wrong diagnosis: *"has no committed routing workflow"* about a workflow that was present.
+- **A permission error read as a negative.** `gh pr checks` returned `Resource not accessible by integration`; the available reading was *"no checks are configured"*. The correct reading was *"I cannot see the checks"*, and a different query answered it.
+- **An empty output byte-identical to a clean pass.** A guard that found no log directory exited `0` and printed nothing — exactly what it prints when everything is fine. The fix asserts **non-empty output**, because `exit 0` could not distinguish *checked-and-clean* from *never-checked*.
+- **A truncated listing.** A `cut`/`head` on a set turns an exhaustive read into a partial one **with no signal**, and a partial read cannot support *"X is not in S"*.
+
+**The operational form: when the claim is a negative about a set, the command must not truncate.** Use a count, a length, or an explicit limit that exceeds the set — never a pipeline that silently drops the tail.
+
+**And when two of your own reads disagree, the method is wrong, not the artifact.** That contradiction is the cheapest available signal that an instrument is answering a different question than the one being asked.
+
 ## 6. When mis-attribution is discovered mid-thread
 
 If you post a comment and later realize it was attributed to the wrong identity (typically: chat-fallback to user because GH_TOKEN was the string "null"), **do not delete-and-repost**. Downstream references — @mentions to you, PR thread anchors, peer agents quoting the comment — break when the original is deleted.

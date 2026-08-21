@@ -71,4 +71,4 @@ This rule is a **technique**, not a hazard. It is specifically the antidote to t
 - **Modify:** never in workspace copies — edit the canonical file and re-distribute.
 - **Disagree?** Open an issue with the incident that showed the rule was wrong.
 
-Cross-references: `verify-before-claim.md` §5b (the same question about evidence rather than assertions) · `silent-fallback-hazards.md` (operations that succeed while their semantic outcome is wrong — the runtime analogue).
+Cross-references: `verify-before-claim.md` §5b (the same question about evidence rather than assertions) · **§5c** (choosing WHICH observable is the result — the sibling error to asserting the wrong property) · **§5d** (an empty result is not evidence of absence unless the instrument would have shown presence — the read-side companion to this rule) · `silent-fallback-hazards.md` (operations that succeed while their semantic outcome is wrong — the runtime analogue).
