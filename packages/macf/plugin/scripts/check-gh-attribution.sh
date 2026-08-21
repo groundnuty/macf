@@ -120,8 +120,27 @@ else
   API_PATH="/repos/${OWNER}/${REPO}/issues/${NUM}"
 fi
 
-# shellcheck source=./hook-gh-token.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hook-gh-token.sh"
+# hook-gh-token.sh is copied alongside this file by every distribution path,
+# so it should always be right here — but a `source` of a missing file would
+# leave macf_hook_gh undefined and the call below would fail confusingly.
+# Guard it: if the sibling is somehow missing (a stale or partial
+# distribution), degrade to a plain, non-refreshing gh call instead — this
+# hook's fail-open posture is unaffected either way, it's already the
+# terminal outcome of every failure branch here.
+HOOK_GH_TOKEN_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hook-gh-token.sh"
+if [[ -r "$HOOK_GH_TOKEN_LIB" ]]; then
+  # shellcheck source=./hook-gh-token.sh
+  source "$HOOK_GH_TOKEN_LIB"
+else
+  echo "MACF attribution-result check: the credential-refresh helper library is missing from this workspace's scripts — running without token refresh. Update this workspace to pick up the missing file." >&2
+  macf_hook_gh() {
+    local out rc=0
+    out="$(gh "$@" 2>/dev/null)" || rc=$?
+    printf '%s' "$out"
+    [[ "$rc" -eq 0 ]] && return 0
+    return 2
+  }
+fi
 
 # ── Query the author (short timeout; one brief retry for API consistency) ─
 # The resource was JUST created, so a first read can occasionally race the

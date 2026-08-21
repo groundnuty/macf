@@ -26,7 +26,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, copyFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
@@ -907,15 +907,30 @@ JSON_EOF
       }
     });
 
-    it('a valid ambient token is used as-is — no refresh attempted', () => {
-      // No workspace configured (refresh would fail if attempted) — the
-      // stub gh succeeds for ANY token other than the expired sentinel, so
-      // if the hook needlessly tried to refresh first, this would still
-      // pass by accident. The real assertion is the negative case above
-      // (DECISIVE test) succeeding only when EXPIRED is used — this test
-      // just pins that an ordinary live token round-trips with no drama.
-      const r = runTokenAwareHook({ ambientToken: 'ghs_live0000000000000000000000000000AAAA', pr: WITH_APPROVAL });
-      expect(r.status).toBe(0);
+    it('a valid ambient token is used as-is — no refresh attempted (helper never invoked)', () => {
+      // Strengthened per assert-the-wrong-path.md: a bare exit-code
+      // assertion here would pass even if the hook needlessly refreshed
+      // first (the stub gh succeeds for any non-expired token either way).
+      // Configure a workspace whose helper WOULD leave a marker file if
+      // invoked, and assert that marker is absent — proving the refresh
+      // path was never entered, not just that the end result was fine.
+      const ws = mkdtempSync(join(tmpdir(), 'macf-lgtm-ws-'));
+      const marker = join(ws, 'helper-was-called.marker');
+      mkdirSync(join(ws, '.claude', 'scripts'), { recursive: true });
+      const helperPath = join(ws, '.claude', 'scripts', 'macf-gh-token.sh');
+      writeFileSync(helperPath, `#!/usr/bin/env bash\ntouch '${marker}'\necho "${FRESH}"\n`);
+      chmodSync(helperPath, 0o755);
+      try {
+        const r = runTokenAwareHook({
+          ambientToken: 'ghs_live0000000000000000000000000000AAAA',
+          workspace: ws,
+          pr: WITH_APPROVAL,
+        });
+        expect(r.status).toBe(0);
+        expect(existsSync(marker)).toBe(false);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
     });
 
     it('never prints the fresh or expired token value to stdout or stderr', () => {
@@ -928,6 +943,67 @@ JSON_EOF
         expect(r.stderr ?? '').not.toContain(EXPIRED);
       } finally {
         rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('a missing hook-gh-token.sh sibling degrades gracefully instead of crashing the hook', () => {
+      // Simulates a stale/partial distribution: this hook script exists
+      // (updated), but its sibling library does not (e.g. an out-of-sync
+      // workspace). Copy ONLY check-lgtm-gate.sh into an isolated
+      // directory — no hook-gh-token.sh next to it — and confirm the
+      // `[[ -r ... ]]` guard's fallback kicks in rather than the `source`
+      // aborting the script under `set -e` (which would be a NEW, worse
+      // failure mode than the one this fix closes).
+      const isolatedDir = mkdtempSync(join(tmpdir(), 'macf-lgtm-isolated-'));
+      const isolatedHook = join(isolatedDir, 'check-lgtm-gate.sh');
+      copyFileSync(HOOK_SCRIPT, isolatedHook);
+      chmodSync(isolatedHook, 0o755);
+      try {
+        const r = runHook({
+          command: 'gh pr merge 950 --repo owner/repo --squash',
+          stubGh: {
+            '950': {
+              authorLogin: 'app/macf-code-agent',
+              reviews: [{ authorLogin: 'macf-science-agent', state: 'APPROVED' }],
+            },
+          },
+        });
+        // Sanity: with the library present, this passes.
+        expect(r.status).toBe(0);
+
+        // Now run the ISOLATED copy (no sibling library) against the same
+        // scenario — must degrade, not crash. Reuse the same stub-gh dir
+        // mechanics by invoking spawnSync directly against isolatedHook.
+        const stubDir = mkdtempSync(join(tmpdir(), 'macf-lgtm-isolated-stub-'));
+        try {
+          const stubScript = `#!/usr/bin/env bash
+if [[ "\${1:-}" == "pr" && "\${2:-}" == "view" ]]; then
+  cat <<'JSON_EOF'
+{"author":{"login":"app/macf-code-agent"},"reviews":[{"author":{"login":"macf-science-agent"},"state":"APPROVED"}],"comments":[]}
+JSON_EOF
+  exit 0
+fi
+exit 64
+`;
+          writeFileSync(join(stubDir, 'gh'), stubScript);
+          chmodSync(join(stubDir, 'gh'), 0o755);
+          const isolatedResult = spawnSync('bash', [isolatedHook], {
+            input: JSON.stringify({
+              session_id: 'test',
+              tool_name: 'Bash',
+              tool_input: { command: 'gh pr merge 951 --repo owner/repo --squash' },
+            }),
+            env: { PATH: `${stubDir}:${process.env['PATH'] ?? ''}` },
+            encoding: 'utf-8',
+          });
+          // Degrades to the pre-fix behavior for a real approval: allow.
+          expect(isolatedResult.status).toBe(0);
+          expect(isolatedResult.stderr).toMatch(/missing from this workspace/i);
+        } finally {
+          rmSync(stubDir, { recursive: true, force: true });
+        }
+      } finally {
+        rmSync(isolatedDir, { recursive: true, force: true });
       }
     });
   });
