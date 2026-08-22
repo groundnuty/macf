@@ -63,15 +63,23 @@ const ONES = [
 ];
 const TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
 
+function at(table: readonly string[], index: number): string {
+  const value = table[index];
+  if (value === undefined) {
+    throw new Error(`numberToWords: table index ${index} out of range`);
+  }
+  return value;
+}
+
 export function numberToWords(n: number): string {
   if (!Number.isInteger(n) || n < 1 || n > 999) {
     throw new Error(`numberToWords: unsupported value ${n}`);
   }
-  if (n < 20) return ONES[n];
+  if (n < 20) return at(ONES, n);
   if (n < 100) {
-    const tens = TENS[Math.floor(n / 10)];
+    const tens = at(TENS, Math.floor(n / 10));
     const ones = n % 10;
-    return ones === 0 ? tens : `${tens}-${ONES[ones]}`;
+    return ones === 0 ? tens : `${tens}-${at(ONES, ones)}`;
   }
   throw new Error(`numberToWords: unsupported value ${n} (3-digit growth not expected for this catalog)`);
 }
