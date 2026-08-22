@@ -15,14 +15,32 @@ description: >-
   curl-503-from-artifacts.nixos.org signature.
   A genuine persistent failure (bad version pin, checksum mismatch, a real
   extended outage) still fails the job LOUD after all attempts are
-  exhausted — see the final attempt (no continue-on-error) and the
-  "Verify devbox is present" step below, which asserts the actual
-  result-invariant rather than trusting the wrapped action's exit code.
-  Silent-fallback-hazards.md Instance 11 is the canonical write-up of this
-  shape (a third-party retry-wrapping action can exhaust its own retries
-  and still exit 0) — this action's verify step is that instance's
-  Pattern-A defense, applied here proactively rather than after an
-  incident.
+  exhausted — see the final attempt (no continue-on-error), the
+  "Verify devbox is present" step (asserts the actual result-invariant
+  rather than trusting the wrapped action's exit code), and the
+  "devbox install exhausted all attempts" step (fires only on exhaustion,
+  since the verify step above it is skipped once the job has already
+  failed — a step gated on `if: failure()` is required to say anything
+  at all on that path). Silent-fallback-hazards.md Instance 11 is the
+  canonical write-up of the exit-0-despite-exhausted-retries shape; the
+  verify step is that instance's Pattern-A defense, applied here
+  proactively rather than after an incident.
+
+  Scope of what retrying recovers: all 3 confirmed real-world failures
+  (PR #875 x2, PR #876 x1) happened at the SAME point — the curl fetch of
+  the Nix installer itself, before Nix ever lands — so a from-scratch
+  retry is clean in the observed failure mode. This action does NOT pass
+  `--force` to the wrapped Nix installer, so a hypothetical failure
+  *after* Nix is successfully installed within the same attempt (e.g. a
+  cache.nixos.org hiccup during package installation) is a different,
+  unverified scenario: nix-installer's own `--force` flag description
+  ("forcibly recreate files it finds existing") implies a plain re-run
+  against an existing `/nix` may error rather than cleanly retry. Not
+  fixed here — the observed failure class doesn't exercise that path, and
+  adding `--force` unconditionally has its own blast-radius questions this
+  issue didn't ask to solve. If a future failure IS observed past the
+  Nix-installer step, revisit this scope note before assuming the retry
+  still helps.
 
 inputs:
   devbox-version:
@@ -99,3 +117,31 @@ runs:
         fi
         echo "devbox on PATH: $(command -v devbox)"
         devbox version
+
+    # Runs ONLY on exhaustion (`if: failure()` fires regardless of the
+    # normal skip-on-prior-failure semantics that would otherwise skip
+    # every remaining step once attempt 3 fails without
+    # continue-on-error). This is the step the AC "distinguish transient
+    # from persistent in what the operator sees" actually depends on —
+    # the "verify devbox is present" step above never runs in this
+    # scenario, so without this step the operator sees nothing but the
+    # wrapped action's own 3x-repeated misleading hint below.
+    - name: devbox install exhausted all attempts
+      if: failure()
+      shell: bash
+      run: |
+        echo "::error::devbox-install-action failed on ALL 3 attempts."
+        echo "::error::IGNORE the 'nix has shipped a backwards incompatible change ..."
+        echo "::error::delete the cache' hint printed above once per failed attempt --"
+        echo "::error::that diagnosis is almost always wrong (see macf#879) and the"
+        echo "::error::cache is very likely fine; deleting it costs every later run a"
+        echo "::error::cold rebuild for no benefit."
+        echo "::error::Scroll up to each attempt's OWN curl/exit-code line for the real"
+        echo "::error::failure. The same 503 from https://artifacts.nixos.org (or"
+        echo "::error::releases.jetify.com) on all 3, spread over ~20s of backoff,"
+        echo "::error::usually means a short-lived upstream outage -- re-run the job in"
+        echo "::error::a few minutes. A different failure shape on a later attempt (non-503"
+        echo "::error::HTTP status, checksum mismatch, 'version not found') is likely"
+        echo "::error::persistent, not transient -- re-running the job won't help; fix the"
+        echo "::error::underlying cause (see this action's header comment on retry scope)."
+        exit 1
