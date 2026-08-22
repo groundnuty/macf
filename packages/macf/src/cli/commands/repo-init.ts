@@ -9,6 +9,7 @@ import { resolveActionsRefToFullTag, isImmutableActionsTag } from '../version-re
 import { detectStaleDist } from '../build-info.js';
 import { findCliPackageRoot } from '../rules.js';
 import { assertRouterWorkflowWellFormed } from './repo-init-router-guard.js';
+import { ROUTING_BUNDLE_SECRET_NAME } from '../bootstrap/apply-routing-secrets.js';
 
 export interface RepoInitOptions {
   readonly repo?: string;
@@ -80,6 +81,50 @@ export function isV3PlusActionsVersion(version: string): boolean {
   if (version === 'main') return true;
   const major = parseActionsMajor(version);
   return major !== null && major >= 3;
+}
+
+/**
+ * Parse a FULLY-PINNED `vMAJOR.MINOR.PATCH` tag into its numeric parts.
+ * Returns `null` for anything else (a floating `v3`/`v3.4` ref, `main`, a
+ * branch name) — {@link isBundleCapableActionsVersion} treats all of those
+ * as NOT bundle-capable rather than guessing (see that function's doc).
+ */
+function parseActionsVersionTuple(version: string): readonly [number, number, number] | null {
+  const match = /^v(\d+)\.(\d+)\.(\d+)$/.exec(version);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/**
+ * The full-tag threshold at which `agent-router.yml` accepts the single
+ * bundled routing secret (`MACF_ROUTING_BUNDLE`, groundnuty/macf#1112)
+ * instead of requiring `secrets: inherit` to cross the caller/callee
+ * GitHub scope boundary. Bump this alongside the macf-actions release that
+ * actually ships the bundle-unpacking "Resolve routing secrets" step in
+ * every `route-by-*` job — this constant is the ONE place that pairing is
+ * recorded, so a future minor bump only needs its number updated here.
+ */
+export const MIN_BUNDLE_CAPABLE_ACTIONS_VERSION = 'v3.5.0';
+
+/**
+ * True only for a FULLY-PINNED immutable tag at/above
+ * {@link MIN_BUNDLE_CAPABLE_ACTIONS_VERSION}, or `main` (the macf-actions
+ * dev branch — treated as always-current, same convention
+ * `isV3PlusActionsVersion` already uses). A floating major/minor ref
+ * (`v3`, `v3.5`) that failed to resolve to an immutable tag (see
+ * `resolveActionsRefToFullTag`) is deliberately treated as NOT
+ * bundle-capable: `secrets: inherit` already works unconditionally for a
+ * same-scope caller, so the safe fallback on an unresolved ref is the
+ * existing default, never a guess about a version this code cannot
+ * confirm.
+ */
+export function isBundleCapableActionsVersion(version: string): boolean {
+  if (version === 'main') return true;
+  const tuple = parseActionsVersionTuple(version);
+  if (!tuple) return false;
+  const [major, minor] = tuple;
+  const [minMajor, minMinor] = parseActionsVersionTuple(MIN_BUNDLE_CAPABLE_ACTIONS_VERSION)!;
+  return major > minMajor || (major === minMajor && minor >= minMinor);
 }
 
 /**
@@ -349,7 +394,21 @@ export function generateWorkflow(
     lines.push(`      project: ${v3Inputs.project}`);
     lines.push(`      registry-api-path: ${v3Inputs.registryApiPath}`);
   }
-  lines.push('    secrets: inherit');
+  // groundnuty/macf#1112: `secrets: inherit` does not cross a GitHub org/
+  // enterprise scope boundary (confirmed live on macf#1111 — an org-owned
+  // fleet's caller failed at secret evaluation before any step ran). A
+  // bundle-capable pin gets the single `MACF_ROUTING_BUNDLE` secret
+  // instead — the caller's interface then never depends on the callee's
+  // secret set, so a future secret addition on the callee side can't break
+  // an already-generated caller the way explicit-six passing would. Every
+  // other pin (pre-bundle v3.x, or legacy v1.x/v2.x) keeps the existing
+  // `secrets: inherit` form unchanged — additive, not a replacement.
+  if (isBundleCapableActionsVersion(actionsVersion)) {
+    lines.push('    secrets:');
+    lines.push(`      ${ROUTING_BUNDLE_SECRET_NAME}: \${{ secrets.${ROUTING_BUNDLE_SECRET_NAME} }}`);
+  } else {
+    lines.push('    secrets: inherit');
+  }
   lines.push('');
   return lines.join('\n');
 }

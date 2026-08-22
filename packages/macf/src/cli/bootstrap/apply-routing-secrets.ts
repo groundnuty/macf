@@ -230,6 +230,176 @@ export function skippedRoutingSecretsPublish(repos: readonly string[], reason: s
   return result;
 }
 
+// --- The single bundled routing secret (groundnuty/macf#1112) ---
+//
+// `secrets: inherit` does not cross a GitHub org/enterprise scope boundary
+// (GitHub's own docs: inherit only carries "in the same organization or
+// enterprise" as the caller) — confirmed live on groundnuty/macf#1111: an
+// org-owned fleet's caller failed at secret evaluation before any step ran.
+// A caller in a dedicated org (the operator's stated future direction —
+// "we will be creating fleets and dedicated organizations") cannot inherit
+// macf-actions' secrets, and re-listing all six explicit names in every
+// generated caller just defers the problem: a caller generated today lists
+// six names, and a router that later needs a seventh fails on that STALE
+// caller with the exact same error. The bundle removes the coupling rather
+// than restating it — the caller's interface stops depending on the
+// callee's secret set.
+//
+// `MACF_ROUTING_BUNDLE` is `base64(JSON)` of the same six values
+// `publishRoutingSecrets` already resolves, keyed by their own secret
+// names — single-line, opaque, and shell-safe (no embedded newlines or
+// shell metacharacters at the top level; base64's own alphabet is safe
+// for any downstream `${{ }}`/shell context), matching the encoding idiom
+// `toBase64ForSecret` already uses for the routing-client cert/key pair.
+
+/** The one secret name a bundle-capable generated caller passes, permanently — see `repo-init.ts::isBundleCapableActionsVersion` for the version gate that decides when a caller emits this form instead of `secrets: inherit`. */
+export const ROUTING_BUNDLE_SECRET_NAME = 'MACF_ROUTING_BUNDLE';
+
+/**
+ * Pack all six resolved values into the bundle's wire form:
+ * `base64(JSON.stringify({ <name>: <value>, ... }))`. Each value is passed
+ * through UNCHANGED — `ROUTING_CLIENT_CERT`/`ROUTING_CLIENT_KEY` stay
+ * base64-of-PEM (the per-field encoding table `apply-routing-secrets.ts`'s
+ * module doc documents), `MACF_ROUTING_APP_KEY` stays raw multi-line PEM.
+ * The JSON layer is a CONTAINER, never a re-encoding of the leaf values —
+ * so `agent-router.yml`'s existing `echo "$ROUTING_CLIENT_CERT" | base64 -d`
+ * consumption needs no change once a value is unpacked out of the bundle.
+ */
+export function packRoutingBundle(values: Readonly<Record<RoutingSecretName, string>>): string {
+  const ordered: Record<string, string> = {};
+  for (const name of ALL_ROUTING_SECRET_NAMES) ordered[name] = values[name];
+  return Buffer.from(JSON.stringify(ordered), 'utf-8').toString('base64');
+}
+
+/**
+ * Inverse of {@link packRoutingBundle} — decode + parse + validate every one
+ * of the six keys is present as a non-empty string. Throws (never returns a
+ * partial result) on malformed base64, malformed JSON, or ANY missing/empty
+ * key, naming exactly which — the same "fail LOUD naming the missing one"
+ * bar the reusable workflow's own bundle-unpack step (macf-actions#1112)
+ * holds itself to, so a bug here can't silently regress into the "bundle
+ * present but missing a key" trap the design was reviewed against.
+ */
+export function unpackRoutingBundle(bundle: string): Record<RoutingSecretName, string> {
+  let json: string;
+  try {
+    json = Buffer.from(bundle, 'base64').toString('utf-8');
+  } catch (err) {
+    throw new Error(`${ROUTING_BUNDLE_SECRET_NAME} is not valid base64: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch (err) {
+    throw new Error(`${ROUTING_BUNDLE_SECRET_NAME} decoded but is not valid JSON: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new Error(`${ROUTING_BUNDLE_SECRET_NAME} JSON is not an object`);
+  }
+  const record = parsed as Record<string, unknown>;
+  const missing: string[] = [];
+  const result = {} as Record<RoutingSecretName, string>;
+  for (const name of ALL_ROUTING_SECRET_NAMES) {
+    const value = record[name];
+    if (typeof value !== 'string' || value.length === 0) {
+      missing.push(name);
+      continue;
+    }
+    result[name] = value;
+  }
+  if (missing.length > 0) {
+    throw new Error(`${ROUTING_BUNDLE_SECRET_NAME} is missing required key(s): ${missing.join(', ')}`);
+  }
+  return result;
+}
+
+/**
+ * Compose + create-only publish the ONE bundled routing secret, alongside
+ * (never instead of) the six individual secrets `publishRoutingSecrets`
+ * already handles — additive, per the design's hard requirement: existing
+ * callers on `secrets: inherit` or explicit-six keep working untouched, and
+ * a repo simply carries BOTH forms so either a legacy or a bundle-capable
+ * caller finds what it needs.
+ *
+ * The bundle can only be correctly composed when ALL SIX resolutions are
+ * `'available'` this run — Amendment D's whole-payload-writable contract
+ * (never partial-write a value whose gap is unrecoverable once written).
+ * Mirrors {@link RoutingSecretResolution}'s own two-state "no value in
+ * hand" distinction, lifted to the aggregate — but the presence check
+ * ALWAYS runs first, per repo, exactly like `publishRoutingSecrets`'s own
+ * per-name loop (groundnuty/macf#986's "never blanket-skip" discipline,
+ * lifted to the aggregate too): a repo that already HAS the bundle is
+ * `'already-present'` regardless of whether THIS run could recompute it —
+ * composability only decides the ABSENT-repo outcome:
+ *
+ *   - repo already has `MACF_ROUTING_BUNDLE` → `'already-present'`,
+ *     UNCONDITIONALLY (never overwritten — same NOOP-on-present limitation
+ *     the six individual secrets already accept; see this module's doc
+ *     for why a value-correctness fix doesn't retroactively repair an
+ *     already-written secret).
+ *   - repo is absent it AND any leg `'unavailable'` → `'failed'` (a real
+ *     gap this run should have been able to fill — never a silent skip).
+ *   - repo is absent it, no leg `'unavailable'`, but at least one
+ *     `'not-required'` (e.g. Tailscale not yet declared) → `'skipped'`
+ *     (honest not-ready-yet, same bar the individual leg itself uses).
+ *   - repo is absent it, all six `'available'` → compose + create.
+ */
+export async function publishRoutingBundle(
+  secrets: RoutingSecretsForPublish,
+  repos: readonly string[],
+  deps: RoutingSecretsPublishDeps,
+): Promise<Readonly<Record<string, EnsureVariableOutcome>>> {
+  const unavailable = ALL_ROUTING_SECRET_NAMES.filter((name) => secrets[name].status === 'unavailable');
+  const notRequired = ALL_ROUTING_SECRET_NAMES.filter((name) => secrets[name].status === 'not-required');
+
+  // Compose the value ONLY when every leg is actually available — never
+  // eagerly build a partial bundle just because we might not need it.
+  let bundleValue: string | undefined;
+  if (unavailable.length === 0 && notRequired.length === 0) {
+    const values = {} as Record<RoutingSecretName, string>;
+    for (const name of ALL_ROUTING_SECRET_NAMES) {
+      values[name] = (secrets[name] as { readonly status: 'available'; readonly value: string }).value;
+    }
+    bundleValue = packRoutingBundle(values);
+  }
+
+  const result: Record<string, EnsureVariableOutcome> = {};
+  for (const repo of repos) {
+    if (bundleValue !== undefined) {
+      const legDeps: EnsureVariableDeps = {
+        checkPresence: () => deps.checkRepoSecretPresence(repo, ROUTING_BUNDLE_SECRET_NAME),
+        create: async () => {
+          await deps.setRepoSecret(repo, ROUTING_BUNDLE_SECRET_NAME, bundleValue);
+          return 'created';
+        },
+      };
+      result[repo] = await ensureVariableCreated(legDeps, `routing secret "${ROUTING_BUNDLE_SECRET_NAME}" on "${repo}"`);
+      continue;
+    }
+    // Not composable this run — but ALWAYS check presence first: a repo
+    // that already carries a bundle from an earlier run is untouched
+    // regardless of whether THIS run could recompute one.
+    const presence = await deps.checkRepoSecretPresence(repo, ROUTING_BUNDLE_SECRET_NAME);
+    if (presence === 'present') {
+      result[repo] = { status: 'already-present' };
+      continue;
+    }
+    if (unavailable.length > 0) {
+      const reasons = unavailable.map((name) => `${name}: ${(secrets[name] as { readonly reason: string }).reason}`).join('; ');
+      result[repo] = { status: 'failed', reason: `cannot compose ${ROUTING_BUNDLE_SECRET_NAME} — ${reasons}` };
+    } else {
+      const reasons = notRequired.map((name) => `${name}: ${(secrets[name] as { readonly reason: string }).reason}`).join('; ');
+      result[repo] = { status: 'skipped', reason: `cannot compose ${ROUTING_BUNDLE_SECRET_NAME} yet — ${reasons}` };
+    }
+  }
+  return result;
+}
+
+/** The bundle-publish sibling of {@link skippedRoutingSecretsPublish} — same "never attempted this run" shape, single-secret-name form. */
+export function skippedRoutingBundlePublish(repos: readonly string[], reason: string): Readonly<Record<string, EnsureVariableOutcome>> {
+  return skippedOutcomesFor(repos, reason);
+}
+
 // --- Tailscale-declared refuse-before-gate-1 preflight (groundnuty/macf#1074) ---
 
 export const TAILSCALE_OAUTH_MISSING_CODE = 'tailscale_oauth_missing';

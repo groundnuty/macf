@@ -37,9 +37,12 @@
  *     whole block fails the reusable-workflow call at composition
  *     (`startup_failure`, the icsoc-2026 outage); dropping `checks: read`
  *     alone 403s just the CI-completion job.
- *   - the `uses:` reference to the reusable workflow itself, and
- *     `secrets: inherit` on that job — without either, the `route:` job
- *     cannot invoke the reusable workflow with the repo secrets it needs.
+ *   - the `uses:` reference to the reusable workflow itself, and a way to
+ *     get it the repo secrets it needs — `secrets: inherit` OR the
+ *     `MACF_ROUTING_BUNDLE` single-secret form (groundnuty/macf#1112,
+ *     needed once caller and callee live in different GitHub org/
+ *     enterprise scopes) — without either, the `route:` job cannot invoke
+ *     the reusable workflow with the repo secrets it needs.
  *
  * Deliberately scoped to the VERSION-INDEPENDENT baseline `generateWorkflow`
  * always emits. The v3-only `with: { project, registry-api-path }` block is
@@ -48,6 +51,8 @@
  * a v1 pin", etc.); folding it into this guard would false-positive on a
  * correct v1/v2 emission that intentionally has no `with:` block.
  */
+
+import { ROUTING_BUNDLE_SECRET_NAME } from '../bootstrap/apply-routing-secrets.js';
 
 export interface RouterWorkflowRequirement {
   readonly name: string;
@@ -118,9 +123,20 @@ export const ROUTER_WORKFLOW_REQUIREMENTS: readonly RouterWorkflowRequirement[] 
     fixHint: 'the `route:` job must call `uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@<version>` — without it nothing routes at all.',
   },
   {
-    name: 'secrets: inherit',
-    check: (c) => c.includes('secrets: inherit'),
-    fixHint: 'add `secrets: inherit` to the `route:` job — without it the reusable workflow has no repo secrets to route with.',
+    // A bundle-capable pin emits `secrets: { MACF_ROUTING_BUNDLE: ... }`
+    // instead of `secrets: inherit` — either is a valid "the callee gets
+    // its secrets" mechanism, so this requirement accepts BOTH forms
+    // rather than hard-coding the older literal. Same "deliberately
+    // scoped to the version-independent baseline" posture this module's
+    // doc already states for the `with:` block — checking for exactly ONE
+    // literal string here would false-positive on a correct bundle-form
+    // emission.
+    name: 'secrets propagation (secrets: inherit OR MACF_ROUTING_BUNDLE)',
+    check: (c) => c.includes('secrets: inherit') || c.includes(`${ROUTING_BUNDLE_SECRET_NAME}:`),
+    fixHint:
+      'add `secrets: inherit` (same-GitHub-scope caller) or the `secrets: { MACF_ROUTING_BUNDLE: ... }` bundle form ' +
+      '(safe across a GitHub org/enterprise scope boundary) to the `route:` job — without one of these the ' +
+      'reusable workflow has no repo secrets to route with.',
   },
 ];
 
