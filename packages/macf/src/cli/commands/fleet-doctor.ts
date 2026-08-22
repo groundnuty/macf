@@ -48,6 +48,12 @@ import {
 } from '@groundnuty/macf-core';
 import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
 import { formatTable } from './ps.js';
+import { discoverWorkspaces } from '../discovery.js';
+import {
+  detectRoutingLabelDriftFromManifestFile,
+  hasRoutingLabelDrift,
+} from '../bootstrap/routing-label-drift.js';
+import type { RoutingLabelDriftEntry } from '../bootstrap/routing-label-drift.js';
 import {
   postInjectNotify,
   pollLastProcessedToken,
@@ -430,7 +436,7 @@ export const FLEET_DOCTOR_JSON_SCHEMA_VERSION = 1;
 export function fleetDoctorToJson(
   results: readonly FleetDoctorResult[],
   project?: string,
-  opts: { readonly inject?: boolean } = {},
+  opts: { readonly inject?: boolean; readonly routingLabelDrift?: RoutingLabelDriftCheck } = {},
 ): unknown {
   return {
     schema_version: FLEET_DOCTOR_JSON_SCHEMA_VERSION,
@@ -444,6 +450,26 @@ export function fleetDoctorToJson(
             woke: injectableCount(results),
             processed: results.filter((r) => r.processedInject === true).length,
           },
+        }
+      : {}),
+    // Additive-optional (no schema bump — same policy as `inject` above):
+    // present ONLY when `--manifest` was given (macf#1059). `ok: false`
+    // surfaces a manifest that couldn't be loaded/parsed; `ok: true` carries
+    // one entry PER manifest agent, never collapsed into a single verdict.
+    ...(opts.routingLabelDrift
+      ? {
+          routing_label_drift: opts.routingLabelDrift.ok
+            ? {
+                manifest: opts.routingLabelDrift.manifestPath,
+                agents: opts.routingLabelDrift.entries.map((e) => ({
+                  role: e.role,
+                  status: e.status,
+                  recorded_label: e.recordedLabel,
+                  config_source: e.configSource,
+                  reason: e.reason ?? null,
+                })),
+              }
+            : { manifest: opts.routingLabelDrift.manifestPath, error: opts.routingLabelDrift.error },
         }
       : {}),
     summary: {
@@ -473,6 +499,65 @@ export function fleetDoctorToJson(
     })),
     disclaimer: HONESTY_DISCLAIMER,
   };
+}
+
+/**
+ * The result of the OPTIONAL `--manifest`-gated routing-label-drift check
+ * (macf#1059). Absent the flag entirely (no `manifest` option given), this
+ * check never runs — `runFleetDoctor` never reaches for a `fleet.yaml` on
+ * its own. `ok: false` covers a bad path / malformed manifest — an optional,
+ * additive check must not crash the surrounding `fleet doctor` run just
+ * because the operator-supplied manifest path was wrong.
+ */
+export type RoutingLabelDriftCheck =
+  | { readonly ok: true; readonly manifestPath: string; readonly entries: readonly RoutingLabelDriftEntry[] }
+  | { readonly ok: false; readonly manifestPath: string; readonly error: string };
+
+/**
+ * Run the manifest-vs-workspace routing-label drift check when a manifest
+ * path is given (`--manifest`). Never throws: `detectRoutingLabelDriftFromManifestFile`
+ * can throw on a malformed `fleet.yaml` (mirrors `parseFleetManifest`'s own
+ * contract) — caught here into `{ ok: false }` so a bad path degrades this
+ * ONE optional section, not the whole `fleet doctor` run.
+ */
+function runRoutingLabelDriftCheck(manifestPath: string | undefined): RoutingLabelDriftCheck | undefined {
+  if (!manifestPath) return undefined;
+  try {
+    const entries = detectRoutingLabelDriftFromManifestFile(manifestPath, {
+      readManifestText: (p) => readFileSync(p, 'utf-8'),
+      discover: discoverWorkspaces,
+      readConfig: readAgentConfig,
+    });
+    return { ok: true, manifestPath, entries };
+  } catch (err) {
+    return { ok: false, manifestPath, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * `true` when the drift check ran (`--manifest` given) and EITHER found real
+ * drift OR failed to run at all — both fold into `fleet doctor`'s non-zero
+ * exit convention (see `runFleetDoctor`'s doc): an operator who asked for the
+ * check gets a non-zero exit for "the check found a problem" AND for "the
+ * check itself couldn't run", never a silent 0 for either.
+ */
+function routingLabelDriftIsBad(check: RoutingLabelDriftCheck | undefined): boolean {
+  if (!check) return false;
+  return !check.ok || hasRoutingLabelDrift(check.entries);
+}
+
+/** Plain-text rendering of {@link RoutingLabelDriftCheck} for the interactive `fleet doctor` output. */
+function formatRoutingLabelDriftSection(check: RoutingLabelDriftCheck): string {
+  if (!check.ok) {
+    return `Routing-label drift check FAILED for manifest "${check.manifestPath}": ${check.error}`;
+  }
+  const lines = [`Routing-label drift vs manifest "${check.manifestPath}":`];
+  for (const entry of check.entries) {
+    const glyph = entry.status === 'clean' ? '✓' : entry.status === 'drift' ? '✗' : '?';
+    const detail = entry.status === 'clean' ? `label "${entry.recordedLabel ?? ''}" matches` : (entry.reason ?? entry.status);
+    lines.push(`  ${glyph} ${entry.role}: ${detail}`);
+  }
+  return lines.join('\n');
 }
 
 /**
@@ -637,6 +722,15 @@ export interface RunFleetDoctorOptions {
   readonly inject?: boolean;
   /** Inject poll budget (seconds) → derives maxPolls at a fixed ~4s interval. */
   readonly injectTimeoutSec?: number;
+  /**
+   * Optional `fleet.yaml` path (macf#1059). When given, ALSO reports
+   * manifest-role vs config-`routing_label` drift for every agent the
+   * manifest declares, resolved against workspaces discovered on THIS host
+   * (`discoverWorkspaces()`). Omitted by default — the check never runs
+   * uninvited, and it is independent of the registry-based mesh check above
+   * (no manifest needed for REACHABLE/ACCEPTED).
+   */
+  readonly manifest?: string;
 }
 
 /** Injectable seam so tests drive the command without touching the registry/network. */
@@ -653,6 +747,14 @@ export interface FleetDoctorDeps {
   /** Inject run-id generator + sleep override (tests pass deterministic fakes). */
   readonly injectGenRunId?: () => string;
   readonly injectSleep?: (ms: number) => Promise<void>;
+  /**
+   * Override for the `--manifest`-gated routing-label-drift check (macf#1059).
+   * Production leaves this unset — `runFleetDoctor` falls back to the real
+   * {@link runRoutingLabelDriftCheck} (real fs + `discoverWorkspaces()`).
+   * Tests inject a fake so the drift check can be exercised without touching
+   * a real filesystem, same seam shape as `injectPost`/`injectPoll` above.
+   */
+  readonly routingLabelDriftCheck?: (manifestPath: string | undefined) => RoutingLabelDriftCheck | undefined;
 }
 
 /**
@@ -800,15 +902,29 @@ export async function runFleetDoctor(
 
     const results = await gatherFleetDoctor(peers, resolved.probe, resolved.diagnose, resolved.genToken, inject);
 
+    // Independent of the registry-based mesh check above — a host-filesystem
+    // scan against a manifest, not a registry query (macf#1059). Runs (and
+    // can fail the exit code) even when zero peers are registered, so it is
+    // computed BEFORE the "no agents registered" early-return below.
+    const routingLabelDrift = (resolved.routingLabelDriftCheck ?? runRoutingLabelDriftCheck)(opts.manifest);
+    const exitCode = (): number =>
+      meshVerdict(results) === 'DEGRADED' || routingLabelDriftIsBad(routingLabelDrift) ? 1 : 0;
+
     if (opts.json) {
-      console.log(JSON.stringify(fleetDoctorToJson(results, resolved.project, { inject: !!inject }), null, 2));
-      return meshVerdict(results) === 'DEGRADED' ? 1 : 0;
+      console.log(
+        JSON.stringify(fleetDoctorToJson(results, resolved.project, { inject: !!inject, routingLabelDrift }), null, 2),
+      );
+      return exitCode();
     }
 
     const header = `macf fleet doctor${resolved.project ? ` — ${resolved.project}` : ''}`;
     if (results.length === 0) {
       console.log(`${header}\n\nNo agents registered in the registry.`);
-      return 0;
+      if (routingLabelDrift) {
+        console.log('');
+        console.log(formatRoutingLabelDriftSection(routingLabelDrift));
+      }
+      return exitCode();
     }
 
     console.log(`${header}\n`);
@@ -827,9 +943,14 @@ export async function runFleetDoctor(
       console.log('');
       console.log(INJECT_LEGEND);
     }
+    if (routingLabelDrift) {
+      console.log('');
+      console.log(formatRoutingLabelDriftSection(routingLabelDrift));
+    }
     // The Processed tier does NOT fold into the verdict/exit code: an UNCONFIRMED
-    // is "possibly busy," not "broken." Exit stays driven by Reachable+Accepted.
-    return meshVerdict(results) === 'DEGRADED' ? 1 : 0;
+    // is "possibly busy," not "broken." Exit stays driven by Reachable+Accepted
+    // (+ the routing-label drift check, when --manifest was given).
+    return exitCode();
   } catch (err) {
     // Belt-and-braces (macf#830 AC2, "probe error" / "unresolvable registry"):
     // any throw we didn't anticipate (a rejected listPeers/probe call, a
