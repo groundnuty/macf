@@ -42,6 +42,7 @@ import {
   type FleetDoctorResult,
   type FleetInjectConfig,
   type FleetProbeFn,
+  type RoutingLabelDriftCheck,
 } from '../../src/cli/commands/fleet-doctor.js';
 
 function info(host: string, port: number): AgentInfo {
@@ -318,6 +319,147 @@ describe('runFleetDoctor (injected deps)', () => {
     const code = await runFleetDoctor('/unused', {}, deps([], async () => null, echoingDiagnostic));
     expect(code).toBe(0);
     expect(logSpy.mock.calls.flat().join('\n')).toMatch(/No agents registered/);
+  });
+});
+
+// --- --manifest routing-label-drift check (groundnuty/macf#1059) ---
+//
+// `runFleetDoctor`'s own drift check reads a real `fleet.yaml` + scans the
+// real filesystem (`detectRoutingLabelDriftFromManifestFile`, already
+// covered end-to-end by `test/cli/bootstrap/routing-label-drift.test.ts`).
+// Here the injected `routingLabelDriftCheck` seam on `FleetDoctorDeps`
+// exercises ONLY the wiring — option threading, JSON rendering, exit-code
+// folding, text-mode section — without touching a real fs.
+describe('runFleetDoctor --manifest (routing-label drift wiring, macf#1059)', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  afterEach(() => {
+    logSpy?.mockRestore();
+  });
+
+  const healthyMeshDeps = (
+    routingLabelDriftCheck: (manifestPath: string | undefined) => RoutingLabelDriftCheck | undefined,
+  ): FleetDoctorDeps => ({
+    project: 'icsoc-2026',
+    listPeers: async () => [{ name: 'SCIENCE_AGENT', info: info('127.0.0.1', 4100) }],
+    probe: async () => ONLINE,
+    diagnose: echoingDiagnostic,
+    routingLabelDriftCheck,
+  });
+
+  it('is never invoked with a manifest path, and contributes nothing, when --manifest is omitted', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const check = vi.fn((manifestPath: string | undefined) => {
+      expect(manifestPath).toBeUndefined();
+      return undefined;
+    });
+    const code = await runFleetDoctor('/unused', {}, healthyMeshDeps(check));
+    expect(code).toBe(0);
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(logSpy.mock.calls.flat().join('\n')).not.toContain('Routing-label drift');
+  });
+
+  it('DECISIVE: a drift entry names BOTH the declared role and the recorded label in text output, and flips exit to non-zero', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const check = (manifestPath: string | undefined): RoutingLabelDriftCheck => {
+      expect(manifestPath).toBe('fleet.yaml');
+      return {
+        ok: true,
+        manifestPath: 'fleet.yaml',
+        entries: [
+          {
+            role: 'science-agent',
+            manifestSource: 'fleet.yaml',
+            status: 'drift',
+            recordedLabel: 'sci',
+            configSource: '/ws/science-agent',
+            reason: 'role "science-agent" declared in fleet.yaml vs routing label "sci" recorded in /ws/science-agent',
+          },
+        ],
+      };
+    };
+
+    const code = await runFleetDoctor('/unused', { manifest: 'fleet.yaml' }, healthyMeshDeps(check));
+
+    expect(code).toBe(1); // mesh itself is healthy — drift alone flips the exit code
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('role "science-agent"');
+    expect(out).toContain('routing label "sci"');
+  });
+
+  it('a fully clean drift report does not affect exit code, and renders per-role clean markers', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const check = (): RoutingLabelDriftCheck => ({
+      ok: true,
+      manifestPath: 'fleet.yaml',
+      entries: [
+        {
+          role: 'science-agent',
+          manifestSource: 'fleet.yaml',
+          status: 'clean',
+          recordedLabel: 'science-agent',
+          configSource: '/ws/science-agent',
+        },
+      ],
+    });
+
+    const code = await runFleetDoctor('/unused', { manifest: 'fleet.yaml' }, healthyMeshDeps(check));
+
+    expect(code).toBe(0);
+    expect(logSpy.mock.calls.flat().join('\n')).toContain('science-agent');
+  });
+
+  it('a check that FAILED to load the manifest also flips exit to non-zero and surfaces the error', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const check = (): RoutingLabelDriftCheck => ({
+      ok: false,
+      manifestPath: 'bad.yaml',
+      error: 'ENOENT: no such file',
+    });
+
+    const code = await runFleetDoctor('/unused', { manifest: 'bad.yaml' }, healthyMeshDeps(check));
+
+    expect(code).toBe(1);
+    expect(logSpy.mock.calls.flat().join('\n')).toContain('FAILED');
+  });
+
+  it('under --json, adds the additive routing_label_drift field without touching schema_version', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const check = (): RoutingLabelDriftCheck => ({
+      ok: true,
+      manifestPath: 'fleet.yaml',
+      entries: [
+        {
+          role: 'science-agent',
+          manifestSource: 'fleet.yaml',
+          status: 'unknown',
+          recordedLabel: null,
+          configSource: null,
+          reason: 'no locally discovered workspace',
+        },
+      ],
+    });
+
+    const code = await runFleetDoctor('/unused', { json: true, manifest: 'fleet.yaml' }, healthyMeshDeps(check));
+
+    expect(code).toBe(0); // unknown is neither clean nor drift — does not flip the exit code
+    const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
+    expect(parsed.schema_version).toBe(FLEET_DOCTOR_JSON_SCHEMA_VERSION);
+    expect(parsed.routing_label_drift).toMatchObject({
+      manifest: 'fleet.yaml',
+      agents: [{ role: 'science-agent', status: 'unknown', recorded_label: null }],
+    });
+  });
+
+  it('omits routing_label_drift entirely under --json when --manifest was not given (no schema shift)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runFleetDoctor(
+      '/unused',
+      { json: true },
+      healthyMeshDeps(() => undefined),
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
+    expect(parsed.routing_label_drift).toBeUndefined();
   });
 });
 

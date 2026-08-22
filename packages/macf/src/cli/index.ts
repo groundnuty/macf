@@ -312,6 +312,12 @@ fleet
       'other `fleet` subcommands, resolution failure here never calls process.exit() directly — ' +
       'under --json it always emits a valid, non-empty JSON {error} object on stdout + a nonzero exit.',
   )
+  .option(
+    '--manifest <path>',
+    'Also check each manifest agent’s declared role against the workspace routing label ' +
+      'discovered on this host, per agent — never a single collapsed verdict. Reports unknown ' +
+      '(not clean) when a workspace cannot be found or read. Omit to skip this check entirely.',
+  )
   .action(async (opts) => {
     // NOTE: unlike the other `fleet` subcommands (which call resolveProjectDir()
     // here and process.exit(1) on failure BEFORE json-handling even runs), `fleet
@@ -322,6 +328,7 @@ fleet
       json: opts.json,
       inject: opts.inject,
       injectTimeoutSec: opts.injectTimeout,
+      manifest: opts.manifest,
     });
     process.exitCode = code;
   });
