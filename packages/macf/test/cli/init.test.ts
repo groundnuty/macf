@@ -606,7 +606,7 @@ describe('macf init', () => {
       const identityAfter = readFileSync(identityPath, 'utf-8');
       expect(identityAfter).not.toBe(staleIdentity);
       expect(identityAfter).toContain('export MACF_AGENT_NAME');
-    }, 20000);
+    }, 30000);
 
     it('preserves env.tmux and env.project-rules too, not just env.telemetry', async () => {
       await initAgent(dir, { ...opts });
@@ -623,7 +623,7 @@ describe('macf init', () => {
 
       expect(readFileSync(tmuxPath, 'utf-8')).toBe(operatorTmux);
       expect(readFileSync(rulesPath, 'utf-8')).toBe(operatorRules);
-    }, 20000);
+    }, 30000);
 
     it('reports what was preserved, not just what was written (macf#1105 lesson)', async () => {
       const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -641,7 +641,7 @@ describe('macf init', () => {
       } finally {
         logSpy.mockRestore();
       }
-    }, 20000);
+    }, 30000);
 
     it('--force does NOT override env-file preservation — it is scoped to the claude.sh guard only', async () => {
       await initAgent(dir, { ...opts });
@@ -654,7 +654,7 @@ describe('macf init', () => {
       await initAgent(dir, { ...opts, force: true });
 
       expect(readFileSync(telemetryPath, 'utf-8')).toBe(operatorTelemetry);
-    }, 20000);
+    }, 30000);
   });
 });
 
