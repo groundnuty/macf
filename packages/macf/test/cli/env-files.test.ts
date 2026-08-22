@@ -883,12 +883,12 @@ describe('writeEnvFiles', () => {
     }
   });
 
-  it('skipped[] is empty in PR-B (PR-C wires preserve-existing logic)', () => {
+  it('skipped[] is empty on a fresh workspace (nothing pre-existing to preserve)', () => {
     const { skipped } = writeEnvFiles(tmpRoot, baseConfig);
     expect(skipped).toEqual([]);
   });
 
-  it('overwrites existing env files (init contract — PR-C handles preserve)', () => {
+  it('overwrites existing MACF-MANAGED env files unconditionally (env.identity)', () => {
     const { writeFileSync, mkdirSync } = require('node:fs');
     mkdirSync(join(tmpRoot, '.claude', '.macf'), { recursive: true });
     const stalePath = join(tmpRoot, '.claude', '.macf', 'env.identity');
@@ -899,6 +899,107 @@ describe('writeEnvFiles', () => {
     const after = readFileSync(stalePath, 'utf-8');
     expect(after).not.toContain('stale operator edits');
     expect(after).toContain('export MACF_PROJECT="TEST"');
+  });
+
+  // ---------------------------------------------------------------------
+  // Preserve-existing for operator-managed files (macf#1116)
+  // ---------------------------------------------------------------------
+  //
+  // Before this fix, writeEnvFiles overwrote env.telemetry / env.tmux /
+  // env.project-rules unconditionally on every `macf init` run, silently
+  // discarding operator edits on a second init — despite the multi-file
+  // env layout's own docs saying these three are "operator-managed,
+  // preserved unconditionally". `refreshEnvFiles` (update's counterpart)
+  // already had this right; writeEnvFiles never got the equivalent.
+
+  it('preserves an existing env.telemetry with operator content (macf#1116)', () => {
+    const { writeFileSync, mkdirSync } = require('node:fs');
+    mkdirSync(join(tmpRoot, '.claude', '.macf'), { recursive: true });
+    const path = join(tmpRoot, '.claude', '.macf', 'env.telemetry');
+    const operatorContent =
+      '# Operator-edited\nexport OTEL_EXPORTER_OTLP_ENDPOINT="http://my-collector:4318"\n';
+    writeFileSync(path, operatorContent);
+
+    const result = writeEnvFiles(tmpRoot, baseConfig);
+
+    // Both halves (assert-the-wrong-path.md): the file is untouched...
+    expect(readFileSync(path, 'utf-8')).toBe(operatorContent);
+    // ...AND writeEnvFiles actually recognized + reported the skip, rather
+    // than e.g. crashing before reaching this file or silently omitting it
+    // from both lists.
+    expect(result.skipped).toContain(path);
+    expect(result.written).not.toContain(path);
+  });
+
+  it('preserves an existing env.tmux with operator content (macf#1116)', () => {
+    const { writeFileSync, mkdirSync } = require('node:fs');
+    mkdirSync(join(tmpRoot, '.claude', '.macf'), { recursive: true });
+    const path = join(tmpRoot, '.claude', '.macf', 'env.tmux');
+    const operatorContent = '# Operator-edited\nexport MACF_TMUX_SESSION="my-session"\n';
+    writeFileSync(path, operatorContent);
+
+    const result = writeEnvFiles(tmpRoot, baseConfig);
+
+    expect(readFileSync(path, 'utf-8')).toBe(operatorContent);
+    expect(result.skipped).toContain(path);
+  });
+
+  it('preserves an existing env.project-rules with operator content (macf#1116, macf#501)', () => {
+    const { writeFileSync, mkdirSync } = require('node:fs');
+    mkdirSync(join(tmpRoot, '.claude', '.macf'), { recursive: true });
+    const path = join(tmpRoot, '.claude', '.macf', 'env.project-rules');
+    const operatorContent =
+      '# Operator-edited\nexport MACF_PROJECT_RULES_SOURCE="my-org/coord//project-rules"\n';
+    writeFileSync(path, operatorContent);
+
+    const result = writeEnvFiles(tmpRoot, baseConfig);
+
+    expect(readFileSync(path, 'utf-8')).toBe(operatorContent);
+    expect(result.skipped).toContain(path);
+  });
+
+  it('DECISIVE: preserves env.telemetry byte-identically WHILE env.identity is regenerated in the same call (macf#1116)', () => {
+    // Both halves per assert-the-wrong-path.md: a writeEnvFiles that wrote
+    // NOTHING at all would also pass a preserve-only assertion — that
+    // would be a far worse regression (init that silently does nothing)
+    // than the bug this fixes. Assert the regenerate half too.
+    const { writeFileSync, mkdirSync } = require('node:fs');
+    mkdirSync(join(tmpRoot, '.claude', '.macf'), { recursive: true });
+    const telemetryPath = join(tmpRoot, '.claude', '.macf', 'env.telemetry');
+    const identityPath = join(tmpRoot, '.claude', '.macf', 'env.identity');
+    const operatorTelemetry =
+      '# Operator hand-tuned OTLP endpoint\nexport OTEL_EXPORTER_OTLP_ENDPOINT="http://operator-host:4318"\n';
+    const staleIdentity = '# stale content a fresh run must overwrite\n';
+    writeFileSync(telemetryPath, operatorTelemetry);
+    writeFileSync(identityPath, staleIdentity);
+
+    const result = writeEnvFiles(tmpRoot, baseConfig);
+
+    // Preserved half — byte-identical, not just "still exists".
+    expect(readFileSync(telemetryPath, 'utf-8')).toBe(operatorTelemetry);
+    expect(result.skipped).toContain(telemetryPath);
+
+    // Regenerated half — proves the run wasn't a silent no-op.
+    const identityAfter = readFileSync(identityPath, 'utf-8');
+    expect(identityAfter).not.toBe(staleIdentity);
+    expect(identityAfter).toBe(generateEnvIdentity(baseConfig));
+    expect(result.written).toContain(identityPath);
+  });
+
+  it('bootstrap-writes operator-managed files when absent, even on a re-run against an existing dir', () => {
+    // First call writes everything (fresh). Delete just env.tmux, then
+    // re-run: env.tmux should be bootstrap-written again (absent → write),
+    // not skipped (it isn't present to preserve).
+    writeEnvFiles(tmpRoot, baseConfig);
+    const { unlinkSync } = require('node:fs');
+    const tmuxPath = join(tmpRoot, '.claude', '.macf', 'env.tmux');
+    unlinkSync(tmuxPath);
+
+    const result = writeEnvFiles(tmpRoot, baseConfig);
+
+    expect(existsSync(tmuxPath)).toBe(true);
+    expect(result.written).toContain(tmuxPath);
+    expect(result.skipped).not.toContain(tmuxPath);
   });
 
   it('env._helpers content matches generateEnvHelpers()', () => {

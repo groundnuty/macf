@@ -37,7 +37,7 @@
  * comment near the top so PR-C's migration tool (and any future bumps) can
  * detect the format version without parsing.
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { MacfAgentConfig } from './config.js';
 
@@ -748,17 +748,78 @@ export function generateEnvProjectRules(_config: MacfAgentConfig): string {
 }
 
 // ---------------------------------------------------------------------------
-// writeEnvFiles — orchestrator (PR-B / macf#342)
+// File classification — THE single discriminator for macf-managed vs
+// operator-managed env files (macf#1116)
+// ---------------------------------------------------------------------------
+
+/** One per-concern env-file entry: its basename + its pure generator. */
+export interface EnvFileSpec {
+  readonly name: string;
+  readonly generate: (config: MacfAgentConfig) => string;
+}
+
+/**
+ * Macf-managed files — always (re)generated from the canonical generator
+ * output; no preserve-existing semantics. `writeEnvFiles` (this file, used
+ * by `init`) fresh-writes these unconditionally on every run; `update`'s
+ * `refreshEnvFiles` (env-files-update.ts) overwrites + warns once on
+ * hand-edit drift. Order matches the canonical source-loop expansion in
+ * claude.sh: env._helpers FIRST (underscore prefix sorts before letters so
+ * its functions are defined before any caller), then alphabetical.
+ *
+ * **Exported as the single source of truth (macf#1116).** Before this,
+ * `env-files-update.ts` carried an independent copy of this exact
+ * classification; `writeEnvFiles` below carried none (it fresh-wrote every
+ * file, macf-managed or not). Two classifications of the same file set
+ * drift silently the moment a 9th env file is added to one but not the
+ * other — `env-files-update.ts` now imports this array instead of
+ * re-declaring it.
+ */
+export const MANAGED_ENV_FILES: readonly EnvFileSpec[] = [
+  { name: 'env._helpers', generate: () => generateEnvHelpers() },
+  { name: 'env.identity', generate: generateEnvIdentity },
+  { name: 'env.github', generate: generateEnvGitHub },
+  { name: 'env.certs', generate: generateEnvCerts },
+  { name: 'env.registry', generate: generateEnvRegistry },
+];
+
+/**
+ * Operator-managed files — bootstrap-write ONLY when absent; preserved
+ * unconditionally once they exist, in BOTH `init` (`writeEnvFiles` below)
+ * and `update` (`refreshEnvFiles`, env-files-update.ts).
+ *
+ * **macf#1116**: `writeEnvFiles` previously overwrote these three
+ * unconditionally on every `macf init` (fresh OR re-init), even though the
+ * multi-file env layout has documented `env.telemetry`/`env.tmux` as
+ * "operator-managed, preserved unconditionally" everywhere except in this
+ * function's own (until-now-unfixed) implementation — the doc comment
+ * below `writeEnvFiles` used to record the gap outright: "PR-C hasn't added
+ * the preserve-existing logic yet." PR-C landed for `update` and never came
+ * back for `init`. `env.project-rules` carries the exact same
+ * operator-set-per-deployment shape (macf#501) and had the identical bug,
+ * though the issue that prompted this fix named only the first two —
+ * reusing this shared list (rather than re-deriving "which 2 files does
+ * init need to preserve") is what surfaced the third.
+ */
+export const OPERATOR_ENV_FILES: readonly EnvFileSpec[] = [
+  { name: 'env.telemetry', generate: generateEnvTelemetry },
+  { name: 'env.tmux', generate: generateEnvTmux },
+  { name: 'env.project-rules', generate: generateEnvProjectRules },
+];
+
+// ---------------------------------------------------------------------------
+// writeEnvFiles — orchestrator (PR-B / macf#342; preserve-existing fix macf#1116)
 // ---------------------------------------------------------------------------
 
 /**
- * Result of `writeEnvFiles` — lists of file paths that were written and
- * (currently empty; reserved for PR-C migration logic that may skip
- * operator-managed files when they already exist) skipped.
+ * Result of `writeEnvFiles` — absolute paths of files that were (re)written
+ * fresh, and absolute paths of operator-managed files left untouched
+ * because they already existed (macf#1116).
  *
- * Returned so callers (init.ts, update.ts in PR-C) can log a summary
- * line ("Wrote 7 env files to .claude/.macf/") without re-deriving the
- * file list from an external mapping.
+ * Returned so callers (init.ts) can log a summary line naming both counts
+ * — silently skipping a file without telling the operator is its own
+ * hazard (macf#1105's lesson: an action nobody was shown is one nobody can
+ * verify) — without re-deriving the file list from an external mapping.
  */
 export interface WriteEnvFilesResult {
   readonly written: readonly string[];
@@ -768,38 +829,56 @@ export interface WriteEnvFilesResult {
 /**
  * Write all 8 per-concern env files into `<projectDir>/.claude/.macf/`.
  *
- *   env._helpers       — library file (sourced first per alphabetical order)
- *   env.certs          — cert + log paths
- *   env.github         — App creds + GH_TOKEN mint (empty-comment in local-mode)
- *   env.identity       — MACF_PROJECT / MACF_AGENT_NAME / ROLE / TYPE / WORKSPACE_DIR
- *   env.project-rules  — MACF_PROJECT_RULES_SOURCE (operator-managed; macf#501)
- *   env.registry       — MACF_REGISTRY_TYPE + per-type vars
- *   env.telemetry      — OTel gates + endpoint (operator-managed)
- *   env.tmux           — MACF_TMUX_SESSION / MACF_TMUX_WINDOW (operator-managed)
+ *   env._helpers       — macf-managed   — library file (sourced first per alphabetical order)
+ *   env.certs          — macf-managed   — cert + log paths
+ *   env.github         — macf-managed   — App creds + GH_TOKEN mint (empty-comment in local-mode)
+ *   env.identity       — macf-managed   — MACF_PROJECT / MACF_AGENT_NAME / ROLE / TYPE / WORKSPACE_DIR
+ *   env.registry       — macf-managed   — MACF_REGISTRY_TYPE + per-type vars
+ *   env.telemetry      — operator-managed — OTel gates + endpoint
+ *   env.tmux           — operator-managed — MACF_TMUX_SESSION / MACF_TMUX_WINDOW
+ *   env.project-rules  — operator-managed — MACF_PROJECT_RULES_SOURCE (macf#501)
  *
- * **Always emits all 8 files** — even when the concern is empty (e.g.,
- * env.tmux with no tmux_session set, env.github in local-mode). The
- * generators emit a header + comment explaining the empty case. This
- * keeps the on-disk layout uniform across configs, so claude.sh's
- * source-loop pattern (`for f in env.*; do source "$f"; done`) is
- * deterministic — no "did the file get skipped" branching for the
+ * **Always emits all 8 files on a fresh workspace** — even when the concern
+ * is empty (e.g., env.tmux with no tmux_session set, env.github in
+ * local-mode). The generators emit a header + comment explaining the empty
+ * case. This keeps the on-disk layout uniform across configs, so
+ * claude.sh's source-loop pattern (`for f in env.*; do source "$f"; done`)
+ * is deterministic — no "did the file get skipped" branching for the
  * sourcing script to consider.
  *
  * **Mode 0644** — these are sourced, not executed; no execute bit needed.
  *
- * **Overwrites unconditionally** — macf-managed files have a managed
- * header warning operators not to edit. Operator-managed files
- * (env.telemetry, env.tmux) get overwritten too in PR-B because PR-C
- * hasn't added the preserve-existing logic yet. Init's contract is
- * "fresh write"; update's preserve-existing contract lands in PR-C.
+ * **Macf-managed files overwrite unconditionally** — they carry a managed
+ * header warning operators not to edit; init's contract for these 5 is
+ * "fresh write" every run, same as it always was.
+ *
+ * **Operator-managed files are bootstrap-write-if-absent, preserve
+ * otherwise (macf#1116)** — matching `update`'s `refreshEnvFiles` exactly
+ * (both consume the same `OPERATOR_ENV_FILES` list, so the two can't drift
+ * apart). Before this fix, `init` overwrote `env.telemetry` / `env.tmux` /
+ * `env.project-rules` unconditionally on every run, silently discarding
+ * host-specific operator configuration (OTLP endpoints, tmux targets,
+ * project-rules sources) on a second `macf init` — exactly the files the
+ * multi-file env layout's own documentation says are preserved. There is
+ * no `--force` override for this preservation (see `init.ts`'s
+ * `InitOptions.force` doc): `--force` gates a categorically different
+ * decision (whether to clobber a wholly hand-authored, non-macf
+ * `claude.sh`), and `update`'s `refreshEnvFiles` has no override flag
+ * either — conflating the two under one flag would just be a second,
+ * silently-diverging "which files does force touch" discriminator, the
+ * exact hazard this fix is closing. An operator who wants a fresh
+ * operator-managed file back to canonical defaults deletes it and re-runs
+ * `macf init` / `macf update` — the same recovery path `refreshEnvFiles`
+ * already established.
  *
  * **Creates `.claude/.macf/`** with mkdir -p semantics. The directory
  * may not exist on a fresh init (the `.claude/` parent often does
  * because of `settings.json` / `rules/`, but `.macf/` under it is new
  * to PR-B).
  *
- * @returns Lists of absolute file paths for caller logging. `skipped`
- *   is reserved for PR-C and currently always empty.
+ * @returns Absolute paths: `written` for files (re)written this run (all 5
+ *   macf-managed + any operator-managed files that were absent), `skipped`
+ *   for operator-managed files left untouched because they already existed.
  */
 export function writeEnvFiles(
   projectDir: string,
@@ -809,27 +888,31 @@ export function writeEnvFiles(
   const envDir = join(absDir, '.claude', '.macf');
   mkdirSync(envDir, { recursive: true });
 
-  // Order in this list is purely for `written` array stability — the
-  // on-disk filesystem order is what claude.sh's `for f in env.*` glob
-  // sees, and shell glob sorts lexicographically (env._helpers first
-  // because `_` < lowercase letters in ASCII).
-  const files: ReadonlyArray<{ name: string; content: string }> = [
-    { name: 'env._helpers', content: generateEnvHelpers() },
-    { name: 'env.identity', content: generateEnvIdentity(config) },
-    { name: 'env.github', content: generateEnvGitHub(config) },
-    { name: 'env.certs', content: generateEnvCerts(config) },
-    { name: 'env.registry', content: generateEnvRegistry(config) },
-    { name: 'env.telemetry', content: generateEnvTelemetry(config) },
-    { name: 'env.tmux', content: generateEnvTmux(config) },
-    { name: 'env.project-rules', content: generateEnvProjectRules(config) },
-  ];
-
   const written: string[] = [];
-  for (const { name, content } of files) {
+  const skipped: string[] = [];
+
+  // Macf-managed files: always fresh-write. Order matches the on-disk
+  // filesystem order claude.sh's `for f in env.*` glob sees (shell glob
+  // sorts lexicographically; env._helpers first because `_` < lowercase
+  // letters in ASCII).
+  for (const { name, generate } of MANAGED_ENV_FILES) {
     const path = join(envDir, name);
-    writeFileSync(path, content, { mode: 0o644 });
+    writeFileSync(path, generate(config), { mode: 0o644 });
     written.push(path);
   }
 
-  return { written, skipped: [] };
+  // Operator-managed files: bootstrap-write ONLY when absent; preserve
+  // unconditionally when they already exist (macf#1116 — see the doc
+  // comment above for why there's no --force override here).
+  for (const { name, generate } of OPERATOR_ENV_FILES) {
+    const path = join(envDir, name);
+    if (existsSync(path)) {
+      skipped.push(path);
+      continue;
+    }
+    writeFileSync(path, generate(config), { mode: 0o644 });
+    written.push(path);
+  }
+
+  return { written, skipped };
 }

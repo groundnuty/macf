@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync, chmodSync, copyFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import {
   projectMacfDir, writeAgentConfig, addToAgentsIndex,
   agentCertPath, agentKeyPath,
@@ -142,6 +142,14 @@ export interface InitOptions {
    * Defaults to `false` (refuse-by-default on a genuine hand-authored
    * file) — this is the one behavior change from pre-#897: previously
    * `initAgent` clobbered a hand-authored `claude.sh` unconditionally.
+   *
+   * **Scoped to `claude.sh` only — does NOT extend to the operator-managed
+   * env files (macf#1116).** `writeEnvFiles` (env-files.ts) preserves an
+   * existing `env.telemetry` / `env.tmux` / `env.project-rules` regardless
+   * of this flag. The two gates answer different questions (refuse-to-touch
+   * a file this tool didn't author, vs preserve-an-existing-value in a file
+   * it did) and deliberately don't share a knob — see `writeEnvFiles`'s doc
+   * comment for the full reasoning.
    */
   readonly force?: boolean;
 }
@@ -572,6 +580,17 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // telemetry / tmux env exports are all silently absent.
   const envFilesResult = writeEnvFiles(absDir, config);
   console.log(`  Env: wrote ${envFilesResult.written.length} env file(s) to .claude/.macf/`);
+  // Tell the operator what was preserved, not just what was written — a
+  // silently-skipped write is a hazard of its own (macf#1105's lesson: an
+  // action nobody was shown is one nobody can verify). Only fires on a
+  // re-init that finds pre-existing operator-managed files (env.telemetry /
+  // env.tmux / env.project-rules); a fresh workspace has nothing to skip.
+  if (envFilesResult.skipped.length > 0) {
+    const preservedNames = envFilesResult.skipped.map((p) => basename(p)).join(', ');
+    console.log(
+      `  Env: preserved ${envFilesResult.skipped.length} existing operator-managed file(s): ${preservedNames}`,
+    );
+  }
 
   // Host-toolchain bootstrap (DR-031 piece 4). Detect the toolchain backend
   // (devbox / brew / none) on the host and write .claude/.macf/host-prelude.sh,
