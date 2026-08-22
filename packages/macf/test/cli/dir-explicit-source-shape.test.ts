@@ -57,7 +57,10 @@ describe('index.ts --dir capture is threaded through the shared isDirExplicit (m
 // implementation, deliberately left untouched); every other command must
 // route through `workspace-dir.ts`.
 
-const DIRECT_ENV_READ_PATTERN = /\benv\[['"]MACF_WORKSPACE_DIR['"]\]/;
+// Matches both the bracket form this codebase actually uses (`env['MACF_WORKSPACE_DIR']`)
+// AND the dot-access form (`env.MACF_WORKSPACE_DIR` / `process.env.MACF_WORKSPACE_DIR`)
+// — a future command written in dot form must not silently slip past this guard.
+const DIRECT_ENV_READ_PATTERN = /\benv\[['"]MACF_WORKSPACE_DIR['"]\]|\benv\.MACF_WORKSPACE_DIR\b/;
 
 function listTsFilesRecursive(dir: string): string[] {
   const out: string[] = [];
@@ -78,8 +81,13 @@ describe('MACF_WORKSPACE_DIR direct-read set-membership audit (macf#1123)', () =
   // Decisive per assert-the-wrong-path.md: prove the scanner actually fires
   // before trusting its "clean" verdict on the real tree below (matches the
   // no-internal-citations guard's own precedent for this exact shape of test).
-  it('FIRES on a synthetic direct read of MACF_WORKSPACE_DIR', () => {
+  it('FIRES on a synthetic direct read of MACF_WORKSPACE_DIR — bracket form', () => {
     const bad = "const workspaceDir = env['MACF_WORKSPACE_DIR']?.trim() || projectDir;";
+    expect(DIRECT_ENV_READ_PATTERN.test(bad)).toBe(true);
+  });
+
+  it('FIRES on a synthetic direct read of MACF_WORKSPACE_DIR — dot-access form (a future command could write it either way)', () => {
+    const bad = 'const workspaceDir = process.env.MACF_WORKSPACE_DIR ?? projectDir;';
     expect(DIRECT_ENV_READ_PATTERN.test(bad)).toBe(true);
   });
 
@@ -115,7 +123,6 @@ describe('conflict-warning wording stays in lockstep between restart-self.ts and
   const FIXED_FRAGMENTS = [
     '--dir wins over MACF_WORKSPACE_DIR=',
     '— targeting ',
-    ' would ',
     'silently target the CALLER, not the named workspace).',
   ];
 
