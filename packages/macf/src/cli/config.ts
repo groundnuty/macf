@@ -264,7 +264,24 @@ function ensureDir(filePath: string): void {
 export function readAgentConfig(projectDir: string): MacfAgentConfig | null {
   const path = agentConfigPath(projectDir);
   if (!existsSync(path)) return null;
-  const raw = JSON.parse(readFileSync(path, 'utf-8'));
+  // macf#894 — a PRESENT-but-unparsable config (corrupt JSON) used to throw
+  // an uncaught SyntaxError straight out of this shared function, crashing
+  // every `--dir`-taking command that reads config through it (restart-self,
+  // fleet doctor, status, peers, certs, monitor, ...) instead of degrading
+  // the same way a schema-invalid config already does below. Malformed JSON
+  // and a schema mismatch are both "present but unreadable" from every
+  // caller's point of view — treat them alike: warn on stderr, return null,
+  // never throw.
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf-8'));
+  } catch (err) {
+    process.stderr.write(
+      `Warning: ${path} is not valid JSON (run \`macf init --force\` to regenerate): ` +
+        `${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    return null;
+  }
   const result = MacfAgentConfigSchema.safeParse(raw);
   if (!result.success) {
     // Previously returned null silently on schema mismatch. That's a
