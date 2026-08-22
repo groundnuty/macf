@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Run /macf-status to see your identity and peers, then /macf-issues to check pending work.'",
+            "command": "w=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; [ -f \"$w/.git\" ] && grep -q '^gitdir: ' \"$w/.git\" 2>/dev/null && exit 0; echo 'Run /macf-status to see your identity and peers, then /macf-issues to check pending work.'",
             "timeout": 5
           }
         ]

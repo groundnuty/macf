@@ -60,7 +60,7 @@
 # and reached at least one MACF-orchestrated worker/subagent session
 # (operator-witnessed live, groundnuty/macf#930 comments), which cannot
 # distinguish an ambient framework injection from a genuine task from its
-# principal. Two independent, deliberately non-bypassable checks below:
+# principal. Independent, deliberately non-bypassable checks below:
 #   - `source` must be exactly `startup` (registration also carries
 #     `matcher: "startup"` as defense-in-depth, but the script-side check is
 #     the one that actually gates the payload — Claude Code evaluates a
@@ -77,18 +77,42 @@
 #     signal (deliberately NOT `agent_type` too — see the inline comment at
 #     the check itself for why that field would false-positive on a
 #     legitimate `--agent`-launched top-level session). This is a
-#     BEST-EFFORT check, not a verified fix for the operator-witnessed
-#     incident: a MACF-orchestrated worktree/background worker plausibly
-# Tracked as groundnuty/macf#1042 (spawn-side fix: the spawner sets
-#   MACF_NO_STARTUP_PICKUP=1 on the child; the spawned session cannot know what it is).
-#     presents as a genuine `source: startup` session with `agent_id` unset
-#     (it is not Claude Code's own Task-tool subagent, which per the docs
-#     doesn't fire SessionStart at all), so this check cannot see it.
-#     Shipped anyway — ambient framework instructions must never reach a
-#     scoped worker; see the fix's issue thread for the residual + the
-#     proposed real fix
-#     (the spawning mechanism setting `MACF_NO_STARTUP_PICKUP=1` on the
-#     child — no new mechanism needed, the override already exists below).
+#     BEST-EFFORT check: a MACF-orchestrated worktree/background worker
+#     plausibly presents as a genuine `source: startup` session with
+#     `agent_id` unset (it is not Claude Code's own Task-tool subagent,
+#     which per the docs doesn't fire SessionStart at all), so this check
+#     alone cannot see it. See the LINKED-WORKTREE check below (#1042) for
+#     the fix that closes that residual.
+#   - LINKED-WORKTREE check (groundnuty/macf#1042): closes the residual the
+#     two checks above admit. A worktree/background-worker session spawned
+#     via `git worktree add` (Agent-tool `isolation: "worktree"`; this
+#     repo's own `agent-identity.md` "Parallel Issue Execution with Teams"
+#     pattern) is a genuine separate `claude` process — it DOES fire
+#     SessionStart — but empirically (live side-by-side comparison,
+#     groundnuty/macf#1042) it inherits its parent's FULL environment
+#     verbatim: `MACF_AGENT_TYPE`, `CLAUDE_CODE_CHILD_SESSION`, `$TMUX` (even
+#     the exact tmux session name) all matched byte-for-byte between a live
+#     worker and its spawning top-level session. None of those can
+#     discriminate — the spawner forks inheriting the parent's env, so every
+#     ambient variable describes the PARENT, not the child. `.git` is not
+#     ambient env: it is a property of the checkout git itself is looking
+#     at, so it cannot be inherited by a fork. Git writes a FILE (a
+#     `gitdir:` pointer) for a linked worktree and a real DIRECTORY for the
+#     primary checkout — a fact verified live against a genuine worker
+#     (linked worktree) and a genuine permanent fleet agent (primary
+#     checkout), not assumed. THE ASSUMPTION THIS RESTS ON: a permanent
+#     macf agent's registered workspace is always the primary clone —
+#     `macf init` / `claude.sh` never operate against a linked worktree, and
+#     there is no supported pattern anywhere in this repo for a permanent
+#     agent to live in one. If that ever changes, this check breaks and
+#     needs revisiting alongside whatever introduces the exception.
+#     Honest-unknown floor: only a CONFIRMED linked-worktree marker (`.git`
+#     is a file whose content matches `^gitdir: `) suppresses. `.git`
+#     absent, a directory, unreadable, or any other shape falls through to
+#     genuine-startup behavior UNCHANGED (inject) — noise (one avoidable
+#     pickup in a worker this check fails to catch) is recoverable; silence
+#     (suppressing pickup for a genuine permanent agent because this check
+#     misfired) is not, so ambiguity here resolves to inject, not skip.
 #
 # Both checks fail the SAME way (`exit 0`, no stdout) but for a DIFFERENT
 # reason than the error-handling `trap` above — two distinct axes:
@@ -213,6 +237,15 @@ AGENT_ID="$(printf '%s' "$INPUT_JSON" | sed -n 's/.*"agent_id":"\([^"]*\)".*/\1/
 
 WORKSPACE="${CLAUDE_PROJECT_DIR:-${PWD:-}}"
 [[ -n "$WORKSPACE" ]] || exit 0
+
+# 3.5. Linked-git-worktree no-op (groundnuty/macf#1042) — see the file
+#      header "LINKED-WORKTREE check" section for the full rationale +
+#      the assumption it rests on. Only a CONFIRMED `gitdir:` pointer file
+#      suppresses; `.git` absent/a directory/unreadable/any other shape
+#      falls through unchanged (honest-unknown floor: inject, not skip).
+if [[ -f "$WORKSPACE/.git" ]] && grep -q '^gitdir: ' "$WORKSPACE/.git" 2>/dev/null; then
+  exit 0
+fi
 
 # 4. Locate the mounted plugin's CLI. `.macf/plugin` is the canonical mount
 #    point for BOTH macf-init'd consumer workspaces

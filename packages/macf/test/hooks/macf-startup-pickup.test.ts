@@ -152,8 +152,33 @@ function runHook(opts: {
   readonly agentId?: string;
   /** SessionStart payload `agent_type` field (groundnuty/macf#930 subagent no-op). Omitted by default. */
   readonly agentType?: string;
+  /**
+   * Simulates the on-disk `.git` shape at the workspace root (groundnuty/macf#1042
+   * linked-worktree no-op). Omitted (default) = no `.git` at all — the shape
+   * every OTHER test in this file already exercises; per the gate's
+   * honest-unknown floor this is indeterminate and falls through unchanged
+   * (inject), so none of those tests needed to change for this fix.
+   *   - `'worktree'`  → `.git` is a FILE containing a `gitdir: ...` pointer
+   *                     (the real shape `git worktree add` produces) → suppress.
+   *   - `'primary'`   → `.git` is a real DIRECTORY (the real shape a primary
+   *                     checkout has) → no suppression (genuine permanent shape).
+   *   - `'malformed'` → `.git` is a FILE but does NOT match `^gitdir: ` → falls
+   *                     through unchanged (indeterminate, not a confirmed marker).
+   */
+  readonly gitDotShape?: 'worktree' | 'primary' | 'malformed';
 }): RunResult {
   const workspace = mkdtempSync(join(tmpdir(), 'macf-startup-pickup-ws-'));
+
+  // groundnuty/macf#1042 linked-worktree no-op — see `gitDotShape`'s own doc
+  // comment. Omitted entirely (the default) leaves NO `.git` at the
+  // workspace root, matching every other test in this file.
+  if (opts.gitDotShape === 'worktree') {
+    writeFileSync(join(workspace, '.git'), 'gitdir: /some/other/repo/.git/worktrees/agent-x\n');
+  } else if (opts.gitDotShape === 'primary') {
+    mkdirSync(join(workspace, '.git'), { recursive: true });
+  } else if (opts.gitDotShape === 'malformed') {
+    writeFileSync(join(workspace, '.git'), 'not a gitdir pointer\n');
+  }
 
   if (opts.pluginOutput !== undefined) {
     const pluginBinDir = join(workspace, '.macf', 'plugin', 'dist', 'plugin', 'bin');
@@ -389,6 +414,95 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
         env: { MACF_AGENT_ROLE: 'code-agent' },
         source: 'compact',
         agentId: 'sub-1',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe('');
+      expect(r.submitInvocation).toBeNull();
+    });
+  });
+
+  describe('(b.6) linked-worktree no-op (groundnuty/macf#1042) — a worktree/background-worker session inherits its parent env verbatim, so `.git` shape (not MACF_*/CLAUDE_CODE_CHILD_SESSION/$TMUX, all empirically inherited) is the discriminator', () => {
+    // DECISIVE PAIR (assert-the-wrong-path.md): a worker session that produces
+    // empty stdout could mean "the new gate correctly fired" OR "the hook is
+    // broken outright" — the two are indistinguishable from the worker
+    // assertion alone. The permanent-shape test below rules out the second:
+    // same setup, same PENDING_OUTPUT, only the `.git` shape differs, and it
+    // DOES inject — proving the pipeline isn't globally broken and the empty
+    // result in the worker case is specifically this gate, not a crash.
+    it('WORKER (`.git` is a `gitdir:` pointer file — a real `git worktree add` shape) + pending work → does NOT inject, even though role/source/tmux all look like a genuine startup', () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        pluginOnelineOutput: '#1: fix the thing; #2: write the docs',
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: 'startup',
+        gitDotShape: 'worktree',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe('');
+      expect(r.submitInvocation).toBeNull();
+    });
+
+    it('PERMANENT (`.git` is a real directory — a primary-checkout shape) + pending work → DOES inject (the decisive pair\'s other half — the pipeline is not globally broken)', () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        pluginOnelineOutput: '#1: fix the thing; #2: write the docs',
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: 'startup',
+        gitDotShape: 'primary',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('pending issue(s):');
+      expect(r.submitInvocation).not.toBeNull();
+    });
+
+    it('indeterminate: `.git` is a file but NOT a `gitdir:` pointer (malformed/unexpected shape) → falls through unchanged, still injects (honest-unknown floor: ambiguity resolves to inject, not skip)', () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        pluginOnelineOutput: '#1: fix the thing',
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: 'startup',
+        gitDotShape: 'malformed',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('pending issue(s):');
+      expect(r.submitInvocation).not.toBeNull();
+    });
+
+    it('indeterminate: `.git` absent entirely (documented default every other test in this file uses) → falls through unchanged, still injects', () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        pluginOnelineOutput: '#1: fix the thing',
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: 'startup',
+        // gitDotShape omitted — no .git at all.
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('pending issue(s):');
+      expect(r.submitInvocation).not.toBeNull();
+    });
+
+    it('WORKER shape + a role that would otherwise auto-nudge + a subagent-shaped payload too → still just exits 0, no double-fault', () => {
+      // Belt-and-suspenders: the linked-worktree gate and the #930 agent_id
+      // gate are independent checks (either alone suffices); confirm they
+      // don't interact badly when both fire on the same payload.
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: 'startup',
+        agentId: 'sub-1',
+        gitDotShape: 'worktree',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe('');
+      expect(r.submitInvocation).toBeNull();
+    });
+
+    it('WORKER shape + role=auditor → still a full no-op (gates are independent, none conflict)', () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        env: { MACF_AGENT_ROLE: 'auditor' },
+        source: 'startup',
+        gitDotShape: 'worktree',
       });
       expect(r.status).toBe(0);
       expect(r.stdout).toBe('');
