@@ -708,10 +708,18 @@ async function evaluateAgentRow(
   const inLocalConfig = entry !== undefined;
 
   // FLEET-scoped: freshness from the registry entry + the live /health probe.
+  // The probe is isolated (macf#959, mirrors `fleet.ts`'s `safeProbe` /
+  // macf#609): a REJECTED probe (a transient network fault — the same
+  // TOCTOU-style rejection `safeProbe` guards against) must degrade ONLY
+  // this agent's row to unreachable, never escape `evaluateAgentRow` and
+  // abort the whole per-agent loop in `gatherRoutingDoctor` below. Before
+  // this fix, that rejection propagated all the way out of `runRoutingDoctor`
+  // uncaught — the exact "Error: fetch failed", no table, no per-agent
+  // verdict" symptom macf#959 reported for `macf routing doctor`.
   let freshness: FreshnessState = 'unregistered';
   let healthInstanceId: string | null | undefined;
   if (info) {
-    const health = await deps.probe(info.host, info.port);
+    const health = await deps.probe(info.host, info.port).catch(() => null);
     freshness = classifyFreshness(info, health, now, DEFAULT_REGISTRY_TTL_MS);
     healthInstanceId = health?.instance_id ?? null;
   }
@@ -1358,10 +1366,43 @@ export interface RunRoutingDoctorOptions {
  * `macf doctor` "non-zero on problem"). The `--json` body prints regardless; the
  * watchdog reads `summary.verdict`. `deps` is injected by tests.
  */
+/**
+ * `macf routing doctor` entry point — a thin belt-and-braces wrapper
+ * (macf#959, mirrors `fleet-doctor.ts`'s macf#830 fix) around the actual
+ * work in `runRoutingDoctorInner`. Before this fix, `runRoutingDoctor` had
+ * NO top-level catch at all: an unexpected throw ANYWHERE in
+ * `gatherRoutingDoctor` (not just a rejected `/health` probe — the
+ * per-agent isolation for that is `evaluateAgentRow`'s own `.catch`, above
+ * — but e.g. a `listRepos`/`listRegistry` hiccup) propagated uncaught all
+ * the way out of the command, printing a raw stack trace instead of the
+ * per-agent table, and leaving a `--json` caller with EMPTY stdout (no
+ * error envelope at all). This wrapper guarantees a one-line diagnosis on
+ * stderr and, under `--json`, a non-empty JSON error envelope, matching the
+ * `fleetDoctorFailureToJson` contract's "never empty stdout" discipline.
+ */
 export async function runRoutingDoctor(
   projectDir: string,
   opts: RunRoutingDoctorOptions = {},
   deps?: RoutingDoctorDeps,
+): Promise<number> {
+  try {
+    return await runRoutingDoctorInner(projectDir, opts, deps);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`macf routing doctor: ${message}`);
+    if (opts.json) {
+      console.log(
+        JSON.stringify({ schema_version: ROUTING_DOCTOR_JSON_SCHEMA_VERSION, error: message }, null, 2),
+      );
+    }
+    return 1;
+  }
+}
+
+async function runRoutingDoctorInner(
+  projectDir: string,
+  opts: RunRoutingDoctorOptions,
+  deps: RoutingDoctorDeps | undefined,
 ): Promise<number> {
   let resolved = deps;
   if (!resolved) {

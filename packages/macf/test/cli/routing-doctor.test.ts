@@ -369,6 +369,32 @@ describe('gatherRoutingDoctor — the all-green baseline', () => {
   });
 });
 
+describe('gatherRoutingDoctor — a REJECTED probe degrades ONE agent, never aborts the join (macf#959)', () => {
+  it('the other agent still gets a full row when one probe rejects', async () => {
+    // Before this fix, `evaluateAgentRow`'s `await deps.probe(...)` had no
+    // isolation — a rejected probe (the same transient TOCTOU-style fault
+    // `fleet.ts`'s `safeProbe` guards against, macf#609) propagated straight
+    // through `gatherRoutingDoctor`'s per-agent loop and out of
+    // `runRoutingDoctor` UNCAUGHT (no top-level catch existed at all). That
+    // is the exact "Error: fetch failed, no table, no per-agent verdict"
+    // symptom macf#959 reported for `macf routing doctor`.
+    const rejecting = deps({
+      probe: async (_h, port) => {
+        if (port === 4200) throw new Error('fetch failed');
+        return health('inst-code');
+      },
+    });
+    const report = await gatherRoutingDoctor(rejecting);
+    expect(report.agents).toHaveLength(2); // the join still resolves with BOTH agents
+    const code = report.agents.find((a) => a.label === 'code-agent');
+    const science = report.agents.find((a) => a.label === 'science-agent');
+    expect(code?.freshness).toBe('fresh'); // unaffected peer renders normally
+    // The rejected peer degrades to the SAME shape a genuine `null` /health
+    // produces (classifyFreshness treats null the same way) — never a throw.
+    expect(science?.freshness === 'unreachable' || science?.freshness === 'stale').toBe(true);
+  });
+});
+
 describe('check 1 — divergent caller-pin is flagged', () => {
   it('one repo on v1.3.4 while the rest are v3.3.0 → DEGRADED + that repo inconsistent', async () => {
     const report = await gatherRoutingDoctor(
@@ -1451,5 +1477,54 @@ describe('runRoutingDoctor (injected deps)', () => {
     const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
     expect(parsed.summary.expected_pin).toBe('v3.3.0');
     expect(parsed.summary.pins_consistent).toBe(false);
+  });
+});
+
+describe('runRoutingDoctor — belt-and-braces top-level catch (macf#959, mirrors fleet-doctor.ts macf#830)', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  afterEach(() => {
+    logSpy?.mockRestore();
+    errSpy?.mockRestore();
+  });
+
+  it('an unexpected throw ANYWHERE in the gather never crashes uncaught — exits 1 with a one-line diagnosis', async () => {
+    // Before this fix, `runRoutingDoctor` had NO top-level try/catch at all
+    // (unlike `fleet-doctor.ts`'s macf#830 belt-and-braces). ANY unexpected
+    // throw — not just a rejected /health probe, which `evaluateAgentRow`'s
+    // own isolation now handles — propagated uncaught out of the command.
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const code = await runRoutingDoctor(
+      '/unused',
+      {},
+      deps({
+        listRepos: async () => {
+          throw new Error('unexpected GitHub API failure');
+        },
+      }),
+    );
+    expect(code).toBe(1);
+    expect(errSpy.mock.calls.flat().join('\n')).toContain('unexpected GitHub API failure');
+  });
+
+  it('under --json, the same failure still emits a NON-EMPTY JSON envelope (never empty stdout)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const code = await runRoutingDoctor(
+      '/unused',
+      { json: true },
+      deps({
+        listRepos: async () => {
+          throw new Error('unexpected GitHub API failure');
+        },
+      }),
+    );
+    expect(code).toBe(1);
+    const printed = logSpy.mock.calls.flat().join('');
+    expect(printed.length).toBeGreaterThan(0); // never empty stdout under --json
+    const parsed = JSON.parse(printed);
+    expect(parsed.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION);
+    expect(parsed.error).toContain('unexpected GitHub API failure');
   });
 });

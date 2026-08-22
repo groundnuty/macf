@@ -244,41 +244,67 @@ export async function runProcessedInject(
 }
 
 /**
- * Run the ladder per peer: probe `/health`, then (only if reachable) POST the
- * diagnostic `/notify`. When `inject` is supplied (`--inject`), ALSO run the
- * INVASIVE Processed-now tier on each reachable agent (routes a real prompt +
- * wakes the agent). PURE w.r.t. `probe`/`diagnose`/`genToken`/`inject` — tests
- * inject fakes so nothing hits the network.
+ * The "unreachable" result shape — used both for a genuine Tier-1 `null`
+ * (the probe answered "no") AND for a REJECTED probe/diagnose/inject call
+ * (macf#959 §gatherFleetDoctor fix, below) — the two are indistinguishable
+ * from this ladder's perspective: either way, nothing past Tier 1 was
+ * attempted for this peer.
  */
-export async function gatherFleetDoctor(
-  peers: readonly { readonly name: string; readonly info: AgentInfo }[],
+function unreachableResult(
+  peer: { readonly name: string; readonly info: AgentInfo },
+  inject: FleetInjectConfig | undefined,
+): FleetDoctorResult {
+  return {
+    name: peer.name,
+    host: peer.info.host,
+    port: peer.info.port,
+    reachable: false,
+    accepted: null,
+    processedInject: inject ? null : undefined,
+  };
+}
+
+/**
+ * Run one peer's ladder, isolated: a REJECTED `probe`/`diagnose`/inject call
+ * (a transient network fault — the exact TOCTOU-style rejection `fleet.ts`'s
+ * `safeProbe` guards against, macf#609) must degrade ONLY this peer, never
+ * escape and abort the whole `gatherFleetDoctor` join. Before this fix, an
+ * uncaught rejection here propagated through the `for`-loop below all the
+ * way to `runFleetDoctor`'s command-level belt-and-braces `catch`
+ * (macf#830) — losing the per-agent table entirely and printing a single
+ * bare error line. That is the EXACT symptom macf#959 reported for
+ * `macf fleet doctor` ("Error: fetch failed", no table, no per-agent
+ * verdict) on a single unreachable peer.
+ *
+ * Isolated at TWO distinct points, not one blanket try/catch, so a Tier-1
+ * success is never demoted to `reachable: false` just because a LATER tier
+ * threw — that would be its own small silent-fallback (a peer that DID
+ * answer `/health` misreported as unreachable). A rejected `probe` still
+ * means Tier 1 itself failed (genuinely indistinguishable from a `null`
+ * resolution); a rejected `diagnose`/inject after a successful probe means
+ * Tier 1 held — only Accepted degrades, with the rejection's message
+ * carried in `acceptError` same as any other not-accepted reason.
+ */
+async function runPeerLadder(
+  peer: { readonly name: string; readonly info: AgentInfo },
   probe: FleetProbeFn,
   diagnose: FleetDiagnosticFn,
-  genToken: () => string = randomUUID,
-  inject?: FleetInjectConfig,
-): Promise<readonly FleetDoctorResult[]> {
-  const out: FleetDoctorResult[] = [];
-  for (const peer of peers) {
-    const { host, port } = peer.info;
-    const health = await probe(host, port);
-    if (health === null) {
-      // Tier 1 failed → ladder stops; Accepted + Processed are N/A (not attempted).
-      out.push({
-        name: peer.name,
-        host,
-        port,
-        reachable: false,
-        accepted: null,
-        processedInject: inject ? null : undefined,
-      });
-      continue;
-    }
+  genToken: () => string,
+  inject: FleetInjectConfig | undefined,
+): Promise<FleetDoctorResult> {
+  const { host, port } = peer.info;
+  const health = await probe(host, port).catch(() => null);
+  if (health === null) {
+    // Tier 1 failed (or rejected) → ladder stops; Accepted + Processed are N/A.
+    return unreachableResult(peer, inject);
+  }
+  try {
     const token = genToken();
     const ack = await diagnose(host, port, token);
     const accepted = isAccepted(token, ack);
     const ackAgent = ack.body?.agent;
     const proc = inject ? await runProcessedInject(peer, ackAgent, inject) : undefined;
-    out.push({
+    return {
       name: peer.name,
       host,
       port,
@@ -290,7 +316,40 @@ export async function gatherFleetDoctor(
       processedInject: proc ? proc.processedInject : undefined,
       injectRunId: proc?.injectRunId,
       injectError: proc?.injectError,
-    });
+    };
+  } catch (err) {
+    // Tier 1 (probe) succeeded — this peer IS reachable; only the LATER tier
+    // threw. Report it as a not-accepted reason, not a demoted unreachable.
+    return {
+      name: peer.name,
+      host,
+      port,
+      reachable: true,
+      accepted: false,
+      acceptError: err instanceof Error ? err.message : String(err),
+      processedInject: inject ? null : undefined,
+    };
+  }
+}
+
+/**
+ * Run the ladder per peer: probe `/health`, then (only if reachable) POST the
+ * diagnostic `/notify`. When `inject` is supplied (`--inject`), ALSO run the
+ * INVASIVE Processed-now tier on each reachable agent (routes a real prompt +
+ * wakes the agent). PURE w.r.t. `probe`/`diagnose`/`genToken`/`inject` — tests
+ * inject fakes so nothing hits the network. Each peer's ladder is isolated
+ * (`runPeerLadder`) — see its doc comment for why (macf#609, macf#959).
+ */
+export async function gatherFleetDoctor(
+  peers: readonly { readonly name: string; readonly info: AgentInfo }[],
+  probe: FleetProbeFn,
+  diagnose: FleetDiagnosticFn,
+  genToken: () => string = randomUUID,
+  inject?: FleetInjectConfig,
+): Promise<readonly FleetDoctorResult[]> {
+  const out: FleetDoctorResult[] = [];
+  for (const peer of peers) {
+    out.push(await runPeerLadder(peer, probe, diagnose, genToken, inject));
   }
   return out;
 }
