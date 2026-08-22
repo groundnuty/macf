@@ -38,6 +38,11 @@ import {
   type ReconcileStateStore,
 } from '@groundnuty/macf-core';
 import { createVmDriverFromConfig } from '../fleet/vm-driver.js';
+import {
+  resolveWorkspaceDir,
+  formatWorkspaceDirConflictWarning,
+  type ResolvedWorkspaceDir,
+} from '../workspace-dir.js';
 
 /** `--json` watchdog-contract schema version (mirrors fleet doctor / restart-self). */
 export const FLEET_RECONCILE_JSON_SCHEMA_VERSION = 1;
@@ -240,10 +245,36 @@ export interface FleetReconcileCliOptions {
   readonly heartbeatFile?: string;
   readonly json?: boolean;
   readonly dir?: string;
+  /**
+   * True iff the caller passed `--dir` on argv (macf#1123, threading
+   * `restart-self`'s macf#888 `dirExplicit` pattern via the shared
+   * `isDirExplicit`/`resolveWorkspaceDir` in `../workspace-dir.js`). Without
+   * this, an explicit `--dir <other-workspace>` silently loses to the
+   * caller's own ambient `MACF_WORKSPACE_DIR` below.
+   */
+  readonly dirExplicit?: boolean;
 }
 
-/** Render the `--json` watchdog-contract object. */
-function toJson(result: ReconcileResult, source: string, execute: boolean): string {
+/**
+ * Render the `--json` watchdog-contract object.
+ *
+ * `workspace_dir` / `identity_source` / `workspace_dir_conflict` (macf#1123)
+ * reuse `restart-self.ts`'s exact field names on its `RestartSelfPlan` —
+ * additive, same shape, no `schema_version` bump (matching the precedent:
+ * `restart-self`'s own macf#888/#893 added these same three fields to an
+ * already-shipped schema-version-1 payload). Without them, a `--json`
+ * automation consumer (the watchdog / cron log parser) sees a clean
+ * successful sweep with no signal that its target was silently retargeted —
+ * the same class of blind spot the unconditional stderr warning above
+ * already closes for a human reading the log, but `--json` consumers don't
+ * read stderr.
+ */
+export function toJson(
+  result: ReconcileResult,
+  source: string,
+  execute: boolean,
+  resolved: ResolvedWorkspaceDir,
+): string {
   return JSON.stringify(
     {
       schema_version: FLEET_RECONCILE_JSON_SCHEMA_VERSION,
@@ -251,6 +282,9 @@ function toJson(result: ReconcileResult, source: string, execute: boolean): stri
       desired_source: source,
       rc: result.rc,
       agents: result.rows,
+      workspace_dir: resolved.workspaceDir,
+      identity_source: resolved.source,
+      workspace_dir_conflict: resolved.workspaceDirConflict,
     },
     null,
     2,
@@ -266,7 +300,11 @@ export async function runFleetReconcileCommand(
   projectDir: string,
   cliOpts: FleetReconcileCliOptions,
 ): Promise<number> {
-  const workspaceDir = process.env['MACF_WORKSPACE_DIR']?.trim() || projectDir;
+  const resolved = resolveWorkspaceDir(projectDir, cliOpts.dirExplicit === true);
+  const conflictWarning = formatWorkspaceDirConflictWarning('fleet reconcile', resolved);
+  if (conflictWarning) console.error(conflictWarning);
+  const workspaceDir = resolved.workspaceDir;
+
   const driver = await createVmDriverFromConfig(workspaceDir);
   if (!driver) return 2; // createVmDriverFromConfig already logged the reason
 
@@ -301,7 +339,7 @@ export async function runFleetReconcileCommand(
 
   if (!cliOpts.json) console.log(`reconcile desired from: ${source}\n`);
   const result = await reconcileFleet(desired, deps, config);
-  if (cliOpts.json) console.log(toJson(result, source, config.execute));
+  if (cliOpts.json) console.log(toJson(result, source, config.execute, resolved));
   return result.rc;
 }
 
