@@ -42,6 +42,21 @@ description: >-
   Nix-installer step, revisit this scope note before assuming the retry
   still helps.
 
+  On the retry mechanism itself: `continue-on-error` + `if:
+  failure()`/`steps.<id>.outcome`/`.conclusion` referencing across a
+  composite action's OWN step list (as used below) is officially
+  documented, not just schema-accepted by actionlint — see GitHub's
+  `runs.steps[*].continue-on-error` reference ("Prevents the action from
+  failing when a step fails... allow the action to pass when this step
+  fails") and its `runs.steps[*].if` example, which shows exactly this
+  uses-step-then-failure()-gated-followup-step shape. Actionlint passing
+  only proves the YAML shape is schema-valid, not that a runner honors
+  it at execution time — this was checked against GitHub's authoritative
+  reference specifically because the whole retry is inert if that
+  assumption is wrong (attempt 1 would fail the composite immediately,
+  attempts 2/3 would never run, and the fix would look green on every
+  ordinary run precisely because attempt 1 usually succeeds).
+
 inputs:
   devbox-version:
     description: 'devbox CLI version to pin to (forwarded verbatim to jetify-com/devbox-install-action)'
