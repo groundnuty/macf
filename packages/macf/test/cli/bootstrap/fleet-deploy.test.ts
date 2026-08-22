@@ -438,6 +438,14 @@ describe('deployAgent — offline (injected readVault/cloneRepo/initAgent)', () 
       actionsVersion: 'v3.4.1',
       registryType: 'profile',
       registryUser: 'groundnuty',
+      // #897: `deployAgent` MUST pass force:true — it owns claude.sh
+      // convergence for its managed workspaces (the interactive-operator
+      // hand-authored-claude.sh refusal init now has doesn't apply to this
+      // automated re-deploy loop). Pinned here, not just "doesn't break" —
+      // if a future edit drops this field, a re-deploy over a workspace
+      // whose claude.sh got hand-edited would abort the whole run with
+      // nothing catching it.
+      force: true,
     });
   });
 

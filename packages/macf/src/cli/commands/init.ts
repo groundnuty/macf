@@ -18,7 +18,7 @@ import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermiss
 import { deriveBotLogin, fetchAppSlug } from './doctor.js';
 import { fetchPluginToWorkspace, stripPluginMcpServers, linkPluginCliDist } from '../plugin-fetcher.js';
 import { writeMcpJsonChannelServer } from '../mcp-json.js';
-import { writeClaudeSh } from '../claude-sh.js';
+import { writeClaudeSh, hasManagedHeader } from '../claude-sh.js';
 import { writeEnvFiles } from '../env-files.js';
 import { writeHostPrelude } from '../host-prelude.js';
 import {
@@ -119,6 +119,31 @@ export interface InitOptions {
    * violation of the same shape this option exists to close).
    */
   readonly skipCertIfPresent?: boolean;
+  /**
+   * Explicit opt-in to overwrite an existing HAND-AUTHORED `claude.sh`
+   * (one that exists but lacks the macf managed-file header) — #897.
+   * Without this, `initAgent` refuses (throws) before any workspace
+   * state is written when it finds such a file, rather than silently
+   * clobbering an operator's customized launcher on a second `init`
+   * invocation. Mirrors two existing precedents: `update.ts`'s
+   * `hasManagedHeader` preserve-and-warn guard (same discriminator,
+   * same header sentinel — {@link hasManagedHeader}), and `repo-init`'s
+   * `--force` ("use --force to overwrite" on an existing file).
+   *
+   * Does NOT gate:
+   *   - A workspace with NO existing `claude.sh` (fresh init — nothing
+   *     to protect).
+   *   - A workspace whose `claude.sh` already carries the managed
+   *     header (a normal macf-managed re-init/repair run — this is the
+   *     historical unconditional-overwrite behavior every other
+   *     `macf init` remediation message in this codebase depends on,
+   *     e.g. `config.ts`'s legacy-schema warning).
+   *
+   * Defaults to `false` (refuse-by-default on a genuine hand-authored
+   * file) — this is the one behavior change from pre-#897: previously
+   * `initAgent` clobbered a hand-authored `claude.sh` unconditionally.
+   */
+  readonly force?: boolean;
 }
 
 /**
@@ -371,12 +396,51 @@ function localCaKeyPath(registryPath: string, project: string): string {
 }
 
 /**
+ * Refuse to clobber a HAND-AUTHORED `claude.sh` on a second `macf init`
+ * invocation, unless `--force` was passed (#897).
+ *
+ * `initAgent` unconditionally called `writeClaudeSh` regardless of what was
+ * already on disk — a workspace whose `claude.sh` was hand-authored (no
+ * macf managed-file header) got silently overwritten by re-running `init`,
+ * with no opt-in and no way to decline. This mirrors the exact discriminator
+ * `update.ts` already uses to decide preserve-vs-regenerate
+ * ({@link hasManagedHeader}) — same sentinel, so a launcher `update`
+ * considers hand-authored is treated identically here.
+ *
+ * Deliberately does NOT gate:
+ *   - No existing `claude.sh` (fresh workspace) — nothing to protect.
+ *   - An existing `claude.sh` that already carries the managed header — a
+ *     normal macf-managed re-init/repair run. This keeps every existing
+ *     `macf init` remediation message in this codebase (e.g. `config.ts`'s
+ *     legacy-schema warning, `doctor.ts`'s missing-hooks fix line) working
+ *     exactly as documented: those scenarios never involve a hand-authored
+ *     launcher, so they never hit this refusal.
+ *
+ * Runs BEFORE any workspace state is written (mirrors `validateInitOpts`'s
+ * own "fail before any mkdir/writeFile" contract — see the `init.test.ts`
+ * "rejects before writing any workspace state" test) so a refusal never
+ * leaves a half-reinitialized workspace behind.
+ */
+function refuseUnmanagedClaudeShWithoutForce(absDir: string, force: boolean): void {
+  if (force) return;
+  const claudeShPath = join(absDir, 'claude.sh');
+  if (!existsSync(claudeShPath)) return;
+  const existing = readFileSync(claudeShPath, 'utf-8');
+  if (hasManagedHeader(existing)) return;
+  throw new Error(
+    `${claudeShPath} exists and is not macf-managed (no managed-file header) — ` +
+      `refusing to overwrite a hand-authored launcher. Pass --force to overwrite it anyway.`,
+  );
+}
+
+/**
  * Set up a project directory for an agent.
  */
 export async function initAgent(projectDir: string, opts: InitOptions): Promise<void> {
   validateInitOpts(opts);
 
   const absDir = resolve(projectDir);
+  refuseUnmanagedClaudeShWithoutForce(absDir, opts.force ?? false);
   const macfDir = projectMacfDir(absDir);
   const agentName = opts.name ?? opts.role;
 

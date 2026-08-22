@@ -1170,6 +1170,18 @@ export async function deployAgent(
       keyPath,
       advertiseHost: manifest.network.advertise_host,
       skipCertIfPresent: true,
+      // #897: `initAgent` now refuses (by default) to overwrite a
+      // `claude.sh` that exists but lacks the macf managed-file header,
+      // treating it as hand-authored and operator-owned. `fleet deploy`
+      // is the fleet-management convergence loop, not an interactive
+      // one-off — it is meant to be idempotent + safe to re-run, and a
+      // fleet-deployed workspace's `claude.sh` is ALWAYS macf-owned by
+      // this tool's contract (never an operator hand-edit the tool
+      // should defer to). `force: true` here keeps re-deploys converging
+      // rather than aborting the whole run on a stale/edited launcher —
+      // the protection this option exists for is for a human re-running
+      // `macf init` directly, not for this automated path.
+      force: true,
       ...(manifest.versions?.macf !== undefined ? { cliVersion: manifest.versions.macf } : {}),
       ...(manifest.versions?.actions !== undefined ? { actionsVersion: manifest.versions.actions } : {}),
       ...registryOpts,

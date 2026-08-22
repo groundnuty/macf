@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { join, resolve } from 'node:path';
-import { mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { initAgent } from '../../src/cli/commands/init.js';
 import { readAgentConfig, agentCertPath, caCertPath, caKeyPath, caDir, readAgentsIndex, writeAgentsIndex } from '../../src/cli/config.js';
+import { hasManagedHeader } from '../../src/cli/claude-sh.js';
 import { createCA } from '@groundnuty/macf-core';
 
 function tempDir(): string {
@@ -465,6 +466,85 @@ describe('macf init', () => {
       const config = readAgentConfig(dir);
       expect(config!.github_app).toBeUndefined();
     });
+  });
+
+  // --- --force / hand-authored claude.sh guard (#897) ---
+  //
+  // `initAgent` used to call `writeClaudeSh` unconditionally — a workspace
+  // whose `claude.sh` was hand-authored (no macf managed-file header) got
+  // silently clobbered by re-running `macf init`, with no opt-in and no way
+  // to decline. `--force` is now required to overwrite such a file; a fresh
+  // workspace (no `claude.sh` yet) or an already macf-managed one still
+  // needs no flag at all — the historical unconditional-overwrite behavior
+  // every other `macf init` remediation message in this codebase depends on.
+  describe('--force / hand-authored claude.sh guard (#897)', () => {
+    const HAND_AUTHORED = '#!/usr/bin/env bash\necho "hand-authored launcher, not macf-managed"\n';
+
+    const opts = {
+      project: 'TEST',
+      role: 'code-agent',
+      appId: '12345',
+      installId: '67890',
+      keyPath: 'app.key.pem',
+      registryType: 'repo',
+      registryRepo: 'owner/repo',
+      // Pin all three so `resolveVersions` skips its network fetch —
+      // these tests are about the claude.sh guard, not version resolution.
+      cliVersion: '0.1.0',
+      pluginVersion: '0.1.0',
+      actionsVersion: 'v1',
+    } as const;
+
+    it('refuses + touches NOTHING when claude.sh exists and is hand-authored, without --force', async () => {
+      const claudeShPath = join(dir, 'claude.sh');
+      writeFileSync(claudeShPath, HAND_AUTHORED);
+
+      await expect(initAgent(dir, { ...opts })).rejects.toThrow(/--force/);
+
+      // Byte-identity of the untouched file (assert-the-wrong-path.md: a
+      // refusal that had already written something still "refuses" and
+      // passes a weaker check) — the hand-authored file must be BYTE-FOR-BYTE
+      // unchanged, not merely still present.
+      expect(readFileSync(claudeShPath, 'utf-8')).toBe(HAND_AUTHORED);
+      // Zero-effect: no other workspace state was written either — the
+      // refusal runs before any mkdir/writeFile, same contract the
+      // "rejects before writing any workspace state" test above pins for
+      // opts-validation failures.
+      expect(existsSync(join(dir, '.macf'))).toBe(false);
+    });
+
+    it('--force overwrites the hand-authored claude.sh with the macf-managed template', async () => {
+      const claudeShPath = join(dir, 'claude.sh');
+      writeFileSync(claudeShPath, HAND_AUTHORED);
+
+      await expect(initAgent(dir, { ...opts, force: true })).resolves.not.toThrow();
+
+      const written = readFileSync(claudeShPath, 'utf-8');
+      expect(written).not.toBe(HAND_AUTHORED);
+      expect(hasManagedHeader(written)).toBe(true);
+      expect(existsSync(join(dir, '.macf'))).toBe(true);
+    });
+
+    it('does not require --force on a fresh workspace (no claude.sh yet)', async () => {
+      expect(existsSync(join(dir, 'claude.sh'))).toBe(false);
+
+      await expect(initAgent(dir, { ...opts })).resolves.not.toThrow();
+
+      expect(hasManagedHeader(readFileSync(join(dir, 'claude.sh'), 'utf-8'))).toBe(true);
+    });
+
+    it('does not require --force to refresh an already macf-managed claude.sh (re-init)', async () => {
+      // First run with no pre-existing claude.sh — writes the managed template.
+      await initAgent(dir, { ...opts });
+      const claudeShPath = join(dir, 'claude.sh');
+      expect(hasManagedHeader(readFileSync(claudeShPath, 'utf-8'))).toBe(true);
+
+      // Second `macf init` run over the SAME already-managed workspace,
+      // still with no --force — must NOT refuse (the file it's about to
+      // overwrite already carries macf's own header).
+      await expect(initAgent(dir, { ...opts })).resolves.not.toThrow();
+      expect(hasManagedHeader(readFileSync(claudeShPath, 'utf-8'))).toBe(true);
+    }, 20000);
   });
 });
 
