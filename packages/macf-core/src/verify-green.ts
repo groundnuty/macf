@@ -61,6 +61,24 @@ export interface VerifyGreenDeps {
  *   that never converges (bad pin / stuck old process).
  * - `ok: false` + `reason: 'unreachable'` — the agent was NEVER reachable within
  *   the budget (every probe returned `null`). The dead / never-relaunched case.
+ *
+ * `lastInstanceId` (NEW, follow-up to macf#899) DELIBERATELY does NOT mirror
+ * `lastVersion`'s "last-ever-seen, latched forever" semantics — it is the
+ * instance_id from the MOST RECENT probe ONLY, cleared to `undefined` the
+ * moment any later probe comes back unreachable. A caller uses this to prove
+ * the SAME pre-restart process is STILL CURRENTLY answering `/health` (DR-037
+ * Decision 5 mints a fresh `instance_id` on every relaunch, so an unchanged
+ * one is positive proof the relaunch hasn't taken over serving yet) — that
+ * claim requires CONTINUOUS reachability, not merely "reachable at some point
+ * during the budget." Latching it like `lastVersion` would let a genuinely
+ * bad release hide: old process answers once, dies; a FRESH crash-looping
+ * process then answers nothing for the rest of the budget; a latched
+ * `lastInstanceId` would still equal the pre-restart id and a caller would
+ * misread "the old process is still there" when it is actually gone and
+ * replaced by something broken. Also `undefined` (never coerced to `null`)
+ * when a reachable probe never carried the field at all (older
+ * channel-server release), so a caller never mistakes "we don't have this
+ * data" for "confirmed unchanged."
  */
 export type VerifyGreenResult =
   | { readonly ok: true; readonly version: string }
@@ -68,6 +86,7 @@ export type VerifyGreenResult =
       readonly ok: false;
       readonly reason: 'wrong-version' | 'unreachable';
       readonly lastVersion: string | null;
+      readonly lastInstanceId?: string | null;
     };
 
 /**
@@ -87,15 +106,28 @@ export async function verifyGreen(
   const start = deps.now();
   let reachedOnce = false;
   let lastVersion: string | null = null;
+  // NEW (follow-up to macf#899) — CLEARED on every unreachable probe (the
+  // `else` branch below), unlike `lastVersion` above which intentionally
+  // latches. See the type doc for why: this field's whole job is proving
+  // CONTINUOUS identity, not "reachable at some point."
+  let lastInstanceId: string | null | undefined;
 
   for (;;) {
     const health = await deps.probe(opts.agent);
     if (health) {
       reachedOnce = true;
       lastVersion = health.version ?? null;
+      lastInstanceId = health.instance_id;
       if (lastVersion !== null && compareSemver(lastVersion, opts.targetVersion) === 0) {
         return { ok: true, version: lastVersion };
       }
+    } else {
+      // Unreachable THIS probe — whatever instance answered earlier is no
+      // longer provably still there. `lastVersion` deliberately keeps its
+      // stale value (documented "last version seen" contract, unchanged);
+      // `lastInstanceId` must NOT, or a died-then-replaced process would
+      // wrongly read as "the same old process is still live."
+      lastInstanceId = undefined;
     }
 
     if (deps.now() - start >= opts.timeoutMs) {
@@ -103,6 +135,7 @@ export async function verifyGreen(
         ok: false,
         reason: reachedOnce ? 'wrong-version' : 'unreachable',
         lastVersion,
+        lastInstanceId,
       };
     }
     await deps.sleep(intervalMs);
