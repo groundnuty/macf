@@ -118,6 +118,14 @@ program
   .option('--plugin-version <semver>', 'Pin macf-agent plugin version (e.g., 0.1.0)')
   .option('--actions-version <tag>', 'Pin macf-actions version (e.g., v1, v1.0.0)')
   .option('--dir <path>', 'Project directory (defaults to current working directory)')
+  .option(
+    '--force',
+    'Overwrite an existing hand-authored claude.sh (one with no macf managed-file header). ' +
+      'Without this, init refuses when it finds one rather than silently clobbering it. ' +
+      'Does not affect a fresh workspace or an already macf-managed claude.sh — those are ' +
+      'always written/refreshed regardless.',
+    false,
+  )
   .action(async (opts) => {
     const projectDir = opts.dir ? resolve(opts.dir) : process.cwd();
     // `--local` is the discoverable shorthand for `--registry-type local`
@@ -147,6 +155,7 @@ program
       cliVersion: opts.cliVersion,
       pluginVersion: opts.pluginVersion,
       actionsVersion: opts.actionsVersion,
+      force: opts.force,
     });
   });
 
