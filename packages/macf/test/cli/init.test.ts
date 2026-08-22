@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { join, resolve } from 'node:path';
 import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -544,6 +544,116 @@ describe('macf init', () => {
       // overwrite already carries macf's own header).
       await expect(initAgent(dir, { ...opts })).resolves.not.toThrow();
       expect(hasManagedHeader(readFileSync(claudeShPath, 'utf-8'))).toBe(true);
+    }, 20000);
+  });
+
+  // --- init preserves operator-managed env files across re-init (macf#1116) ---
+  //
+  // `writeEnvFiles` used to overwrite env.telemetry / env.tmux /
+  // env.project-rules unconditionally on every `macf init` run — the exact
+  // three files the multi-file env layout's own docs call "operator-managed,
+  // preserved unconditionally" (a contract `update`'s `refreshEnvFiles`
+  // already honored). These tests pin the fixed contract at the CLI level.
+  describe('env-file preservation across re-init (macf#1116)', () => {
+    const opts = {
+      project: 'TEST',
+      role: 'code-agent',
+      appId: '12345',
+      installId: '67890',
+      keyPath: 'app.key.pem',
+      registryType: 'repo',
+      registryRepo: 'owner/repo',
+      cliVersion: '0.1.0',
+      pluginVersion: '0.1.0',
+      actionsVersion: 'v1',
+    } as const;
+
+    it('creates all 8 env files on a fresh workspace (nothing to preserve yet)', async () => {
+      await initAgent(dir, { ...opts });
+      for (const name of [
+        'env._helpers',
+        'env.identity',
+        'env.github',
+        'env.certs',
+        'env.registry',
+        'env.telemetry',
+        'env.tmux',
+        'env.project-rules',
+      ]) {
+        expect(existsSync(join(dir, '.claude', '.macf', name)), name).toBe(true);
+      }
+    });
+
+    it('DECISIVE: env.telemetry survives a second `macf init` byte-identically, WHILE env.identity is regenerated in the same run', async () => {
+      // Both halves per assert-the-wrong-path.md: an init that silently
+      // wrote nothing on the second run would also pass a preserve-only
+      // assertion — a far worse regression than the bug this fixes.
+      await initAgent(dir, { ...opts });
+
+      const telemetryPath = join(dir, '.claude', '.macf', 'env.telemetry');
+      const identityPath = join(dir, '.claude', '.macf', 'env.identity');
+      const operatorTelemetry =
+        '# Operator hand-tuned OTLP endpoint\nexport OTEL_EXPORTER_OTLP_ENDPOINT="http://operator-host:4318"\n';
+      const staleIdentity = '# stale content a fresh init run must overwrite\n';
+      writeFileSync(telemetryPath, operatorTelemetry);
+      writeFileSync(identityPath, staleIdentity);
+
+      await initAgent(dir, { ...opts });
+
+      // Preserved half — byte-identical, not just "still exists".
+      expect(readFileSync(telemetryPath, 'utf-8')).toBe(operatorTelemetry);
+      // Regenerated half — proves the second run wasn't a silent no-op.
+      const identityAfter = readFileSync(identityPath, 'utf-8');
+      expect(identityAfter).not.toBe(staleIdentity);
+      expect(identityAfter).toContain('export MACF_AGENT_NAME');
+    }, 20000);
+
+    it('preserves env.tmux and env.project-rules too, not just env.telemetry', async () => {
+      await initAgent(dir, { ...opts });
+
+      const tmuxPath = join(dir, '.claude', '.macf', 'env.tmux');
+      const rulesPath = join(dir, '.claude', '.macf', 'env.project-rules');
+      const operatorTmux = '# Operator-edited\nexport MACF_TMUX_SESSION="my-session"\n';
+      const operatorRules =
+        '# Operator-edited\nexport MACF_PROJECT_RULES_SOURCE="my-org/coord//project-rules"\n';
+      writeFileSync(tmuxPath, operatorTmux);
+      writeFileSync(rulesPath, operatorRules);
+
+      await initAgent(dir, { ...opts });
+
+      expect(readFileSync(tmuxPath, 'utf-8')).toBe(operatorTmux);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(operatorRules);
+    }, 20000);
+
+    it('reports what was preserved, not just what was written (macf#1105 lesson)', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        await initAgent(dir, { ...opts });
+        const telemetryPath = join(dir, '.claude', '.macf', 'env.telemetry');
+        writeFileSync(telemetryPath, '# operator content\n');
+        logSpy.mockClear();
+
+        await initAgent(dir, { ...opts });
+
+        const logged = logSpy.mock.calls.flat().join('\n');
+        expect(logged).toMatch(/preserved/i);
+        expect(logged).toContain('env.telemetry');
+      } finally {
+        logSpy.mockRestore();
+      }
+    }, 20000);
+
+    it('--force does NOT override env-file preservation — it is scoped to the claude.sh guard only', async () => {
+      await initAgent(dir, { ...opts });
+
+      const telemetryPath = join(dir, '.claude', '.macf', 'env.telemetry');
+      const operatorTelemetry =
+        '# Operator hand-tuned OTLP endpoint\nexport OTEL_EXPORTER_OTLP_ENDPOINT="http://operator-host:4318"\n';
+      writeFileSync(telemetryPath, operatorTelemetry);
+
+      await initAgent(dir, { ...opts, force: true });
+
+      expect(readFileSync(telemetryPath, 'utf-8')).toBe(operatorTelemetry);
     }, 20000);
   });
 });

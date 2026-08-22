@@ -30,8 +30,8 @@
  *
  * **Invariant**: this module never deletes operator state. Macf-managed
  * files are overwritten only with the (single source of truth)
- * generator output; operator-managed files (env.telemetry, env.tmux)
- * are preserved unconditionally once they exist; settings.local.json
+ * generator output; operator-managed files (env.telemetry, env.tmux,
+ * env.project-rules) are preserved unconditionally once they exist; settings.local.json
  * is read-only here (the deprecation warning surfaces them, but no
  * automatic JSON-key migration in this PR — the risk surface is too
  * broad for one change. Operators see the warning and migrate by hand).
@@ -272,6 +272,18 @@ export function migrateMonolithicClaudeSh(
   }
 
   // Monolithic detected. Migrate.
+  //
+  // writeEnvFiles now preserves a pre-existing operator-managed file
+  // (env.telemetry / env.tmux / env.project-rules) instead of overwriting
+  // it (macf#1116). A monolithic→thin migration is, by construction, a
+  // workspace's FIRST transition to the multi-file `.claude/.macf/env.*`
+  // layout — no env.* file exists yet in the normal case, so this branch
+  // is unreachable in practice (confirmed: no migration test pre-seeds one).
+  // In the atypical case where a partial/prior migration left an
+  // operator-managed file on disk already, preserving it is the safer
+  // outcome anyway — an operator's OTLP endpoint / tmux target / project-
+  // rules source surviving a migration is no less correct than a fresh
+  // bake, and is what every OTHER call site of writeEnvFiles now does.
   writeEnvFiles(absDir, config);
   writeClaudeSh(absDir, config);
   return { migrated: true };
