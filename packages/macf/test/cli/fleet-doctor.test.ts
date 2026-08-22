@@ -170,6 +170,46 @@ describe('gatherFleetDoctor — two-tier ladder', () => {
     );
     expect(results[0]).toMatchObject({ reachable: true, accepted: false, acceptError: 'timeout' });
   });
+
+  it('degrades a peer whose probe REJECTS instead of aborting the whole join (macf#959, mirrors fleet.ts #609)', async () => {
+    // Before the fix, `gatherFleetDoctor`'s per-peer loop called `await
+    // probe(...)` with NO try/catch — a rejected probe (the same transient
+    // TOCTOU-style fault `fleet.ts`'s `safeProbe` guards against) propagated
+    // all the way out, through `runFleetDoctor`'s command-level catch, losing
+    // the per-agent table entirely. This is the exact "Error: fetch failed,
+    // no table" symptom macf#959 reported for `macf fleet doctor`.
+    const rejecting: FleetProbeFn = async (_h, port) => {
+      if (port === 4200) throw new Error('fetch failed');
+      return port === 4100 ? ONLINE : null;
+    };
+    const results = await gatherFleetDoctor(peers, rejecting, diagnose);
+    expect(results).toHaveLength(3); // the join still resolves with ALL THREE peers
+    expect(results[0]).toMatchObject({ name: 'CODE_AGENT', reachable: true });
+    // The peer whose probe rejected degrades to unreachable, same shape as a
+    // genuine Tier-1 `null` — never propagated as a throw.
+    expect(results[1]).toMatchObject({ name: 'SCIENCE_AGENT', reachable: false, accepted: null });
+    expect(results[2]).toMatchObject({ name: 'DEVOPS_AGENT', reachable: false, accepted: null });
+  });
+
+  it('a REJECTED diagnose after a successful probe stays "reachable: true" — only Accepted degrades', async () => {
+    // A peer that DID answer /health must never misreport as unreachable
+    // just because a LATER tier threw (its own small silent-fallback shape).
+    const rejectingDiagnose: FleetDiagnosticFn = async () => {
+      throw new Error('connection reset');
+    };
+    const results = await gatherFleetDoctor(
+      [{ name: 'CODE_AGENT', info: info('127.0.0.1', 4100) }],
+      async () => ONLINE,
+      rejectingDiagnose,
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      name: 'CODE_AGENT',
+      reachable: true, // Tier 1 held
+      accepted: false,
+      acceptError: 'connection reset',
+    });
+  });
 });
 
 describe('buildDoctorRows / formatDoctorTable', () => {

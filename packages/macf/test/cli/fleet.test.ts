@@ -147,8 +147,44 @@ describe('gatherFleetStatus', () => {
 
     const statuses = await gatherFleetStatus(peers, probe);
     expect(statuses).toHaveLength(2);
-    expect(statuses[0]).toMatchObject({ name: 'CODE_AGENT', online: true, health });
-    expect(statuses[1]).toMatchObject({ name: 'SCIENCE_AGENT', online: false, health: null });
+    expect(statuses[0]).toMatchObject({ name: 'CODE_AGENT', online: true, health, liveness: 'online' });
+    // No `probeSession` seam supplied → honest-unknown floor, not 'dead' (macf#959).
+    expect(statuses[1]).toMatchObject({ name: 'SCIENCE_AGENT', online: false, health: null, liveness: 'unknown' });
+  });
+
+  it('DECISIVE PAIR (macf#959): a dead peer reads "dead"; a busy-but-alive peer reads "degraded", never "dead"', async () => {
+    const peers = [
+      { name: 'DEAD_AGENT', info: info('100.64.0.5', 4500) },
+      { name: 'SCIENCE_AGENT', info: info('100.64.0.2', 4200) },
+    ];
+    // Both peers' native /health is unreachable — the ONLY signal that
+    // distinguishes them is the local tmux session check.
+    const probe: FleetProbeFn = async () => null;
+    const probeSession = async (peerName: string) =>
+      peerName === 'DEAD_AGENT'
+        ? { existence: 'absent' as const, busy: null } // genuinely gone
+        : { existence: 'present' as const, busy: true }; // producing output — alive
+
+    const statuses = await gatherFleetStatus(peers, probe, probeSession);
+    expect(statuses[0]).toMatchObject({ name: 'DEAD_AGENT', online: false, liveness: 'dead' });
+    expect(statuses[1]).toMatchObject({ name: 'SCIENCE_AGENT', online: false, liveness: 'degraded' });
+    expect(statuses[1]!.liveness).not.toBe('dead'); // the busy-but-alive half — the one that matters
+  });
+
+  it('isolates a probeSession seam that REJECTS — that peer reads "unknown", never aborts the join', async () => {
+    const peers = [
+      { name: 'CODE_AGENT', info: info('127.0.0.1', 4100) },
+      { name: 'SCIENCE_AGENT', info: info('100.64.0.2', 4200) },
+    ];
+    const probe: FleetProbeFn = async () => null; // both offline
+    const probeSession = async (): Promise<never> => {
+      throw new Error('tmux ENOENT'); // e.g. tmux not installed on this host
+    };
+
+    const statuses = await gatherFleetStatus(peers, probe, probeSession);
+    expect(statuses).toHaveLength(2); // the join still resolves with both peers
+    expect(statuses[0]).toMatchObject({ name: 'CODE_AGENT', liveness: 'unknown' });
+    expect(statuses[1]).toMatchObject({ name: 'SCIENCE_AGENT', liveness: 'unknown' });
   });
 
   it('degrades a peer whose probe REJECTS instead of aborting the join (#609)', async () => {
@@ -186,6 +222,7 @@ describe('buildFleetRows / formatFleetTable', () => {
         otel: { endpoint_reachable: true },
         cert_expiry: isoInDays(5), // crit
       }),
+      liveness: 'online',
     },
     {
       name: 'SCIENCE_AGENT',
@@ -193,6 +230,7 @@ describe('buildFleetRows / formatFleetTable', () => {
       port: 4200,
       online: false,
       health: null,
+      liveness: 'degraded', // macf#959 — native down, local session alive
     },
   ];
 
@@ -208,6 +246,7 @@ describe('buildFleetRows / formatFleetTable', () => {
       'reachable',
       'inst-aaaa',
       '5d ✗',
+      '—', // LIVENESS: redundant with STATUS=online, not shown
     ]);
   });
 
@@ -223,6 +262,7 @@ describe('buildFleetRows / formatFleetTable', () => {
       '—',
       '—',
       '—',
+      'degraded', // LIVENESS (macf#959): native down, local session alive
     ]);
   });
 
@@ -281,6 +321,16 @@ describe('fleetStatusToJson', () => {
     // Online agent → its /health.version; offline → null (nothing to report).
     expect(json.agents[0]!.version).toBe('0.2.38');
     expect(json.agents[1]!.version).toBeNull();
+  });
+
+  it('carries `liveness` as an ADDITIVE field — `status` keeps its existing online/offline meaning (macf#959)', () => {
+    const json = fleetStatusToJson([
+      { name: 'CODE_AGENT', host: '127.0.0.1', port: 4100, online: true, health: onlineHealth(), liveness: 'online' },
+      { name: 'SCIENCE_AGENT', host: '100.64.0.2', port: 4200, online: false, health: null, liveness: 'degraded' },
+    ]) as { agents: ReadonlyArray<Record<string, unknown>> };
+
+    expect(json.agents[0]).toMatchObject({ status: 'online', liveness: 'online' });
+    expect(json.agents[1]).toMatchObject({ status: 'offline', liveness: 'degraded' });
   });
 });
 
@@ -348,6 +398,23 @@ describe('runFleetStatus (injected deps)', () => {
     expect(out).toContain('online');
     expect(out).toContain('SCIENCE_AGENT');
     expect(out).toContain('offline'); // the rejected peer renders as unreachable
+  });
+
+  it('--json wiring end-to-end: an offline peer with a live local session reads "degraded" (macf#959)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const peers = [{ name: 'SCIENCE_AGENT', info: info('100.64.0.2', 4200) }];
+    const fleetDeps: FleetStatusDeps = {
+      project: 'macf',
+      listPeers: async () => peers,
+      probe: async () => null, // native /health unreachable
+      probeSession: async () => ({ existence: 'present', busy: true }), // tmux session alive
+    };
+
+    const code = await runFleetStatus('/unused', { json: true, now: NOW }, fleetDeps);
+    expect(code).toBe(0);
+    const parsed = JSON.parse(logSpy.mock.calls.flat().join(''));
+    expect(parsed.agents[0].status).toBe('offline'); // unchanged native-probe meaning
+    expect(parsed.agents[0].liveness).toBe('degraded'); // NOT 'dead' — the busy-but-alive half
   });
 
   it('reports an empty registry cleanly', async () => {

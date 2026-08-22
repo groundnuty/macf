@@ -20,6 +20,16 @@
  * implement the diagnostic / `--inject` / Accepted→Processed delivery checks —
  * those are later DR-030 increments.
  *
+ * LIVENESS column (macf#959): a peer whose `/health` is unreachable is NOT
+ * automatically "dead" — its channel server can be down while its tmux
+ * session (and the tmux-wake delivery fallback) is still alive. For any
+ * offline peer, `probeSession` (when wired — see `peer-liveness.ts`) checks
+ * that peer's LOCAL tmux session and classifies 'degraded' (session alive,
+ * channel down), 'dead' (no session), or 'unknown' (no local visibility —
+ * NEVER silently reported as either of the other two). Same-host topology
+ * only; see `peer-liveness.ts`'s scope note for what this deliberately does
+ * NOT cover.
+ *
  * Reuses the building blocks of `macf status` / `macf registry prune`: the mTLS
  * `/health` ping (`pingAgentHealth`), the registry list
  * (`createRegistryFromConfig`), the CA-cert read (`createClientFromConfig`), and
@@ -53,6 +63,13 @@ import {
 } from './fleet-guests.js';
 import { rawField, formatUptime, formatRunState, formatOtel } from './health-fields.js';
 import type { AgentRunState, AgentOtelReport } from './health-fields.js';
+import {
+  classifyPeerLiveness,
+  createLocalSessionSeams,
+  peerSessionName,
+  probeLocalSession,
+} from './peer-liveness.js';
+import type { LocalSessionSnapshot, PeerLiveness } from './peer-liveness.js';
 
 // Re-exported so existing `from './fleet.js'` imports (incl. tests) keep
 // working unchanged after the DR-030 `/health` field renderers moved to
@@ -74,10 +91,26 @@ export interface FleetAgentStatus {
   readonly online: boolean;
   /** Raw `/health` body (incl. any defensively-read `state`/`otel`), or null when offline. */
   readonly health: HealthResponse | null;
+  /**
+   * Honest liveness verdict (macf#959) — 'online' when `/health` answered;
+   * otherwise the LOCAL tmux-session check's verdict ('degraded' | 'dead' |
+   * 'unknown'). 'unknown' when no local-session seam was supplied, or the
+   * seam itself could not determine session existence — see peer-liveness.ts.
+   */
+  readonly liveness: PeerLiveness;
 }
 
 /** Probe a single endpoint's `/health`; null on any failure. Injectable for tests. */
 export type FleetProbeFn = (host: string, port: number) => Promise<HealthResponse | null>;
+
+/**
+ * Probe a peer's LOCAL tmux session (macf#959) — only meaningful for a peer
+ * whose native `/health` is unreachable. Returns `null` when local
+ * visibility could not be established at all (distinct from a session
+ * confirmed absent — see peer-liveness.ts's `SessionExistence`). Injectable
+ * for tests; production wiring is `resolveDepsFromRegistry` below.
+ */
+export type FleetSessionProbeFn = (peerName: string) => Promise<LocalSessionSnapshot | null>;
 
 /**
  * Probe one peer, treating a REJECTED probe the SAME as a `null` resolution.
@@ -101,32 +134,64 @@ async function safeProbe(
 }
 
 /**
+ * Probe one peer's local session, isolated the same way `safeProbe` isolates
+ * the native `/health` probe: a seam that throws (or was never wired) must
+ * never abort the roster — it degrades ONLY this peer's liveness detail to
+ * `null` (→ 'unknown' at classification, never 'dead' — the honest-unknown
+ * floor, macf#959).
+ */
+async function safeSessionProbe(
+  probeSession: FleetSessionProbeFn | undefined,
+  peerName: string,
+): Promise<LocalSessionSnapshot | null> {
+  if (!probeSession) return null;
+  try {
+    return await probeSession(peerName);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Probe every peer once and collect roster + reachability + raw body. PURE
  * w.r.t. `probe` — tests inject a fake so nothing hits the network. Each peer's
  * probe is isolated (`safeProbe`): a single rejected/timed-out `/health` probe
  * degrades that one peer to offline and the join still resolves with the full
  * roster — it does NOT reject and abort the command (macf#609).
+ *
+ * When a peer is offline, `probeSession` (if supplied) additionally checks
+ * that peer's LOCAL tmux session to distinguish 'degraded' (down channel,
+ * live session — macf#959's incident shape) from 'dead' (no session) from
+ * 'unknown' (no local visibility) — see peer-liveness.ts. Omitted entirely
+ * when `probeSession` is not supplied (every offline peer classifies
+ * 'unknown', preserving today's behavior for callers that don't wire it).
  */
 export async function gatherFleetStatus(
   peers: readonly { readonly name: string; readonly info: AgentInfo }[],
   probe: FleetProbeFn,
+  probeSession?: FleetSessionProbeFn,
 ): Promise<readonly FleetAgentStatus[]> {
   const settled = await Promise.allSettled(
     peers.map((peer) => safeProbe(probe, peer.info.host, peer.info.port)),
   );
-  return peers.map((peer, i) => {
-    const r = settled[i]!;
-    // safeProbe never rejects, so `rejected` is a belt-and-braces guard: any
-    // future probe-path that throws still degrades to offline, never aborts.
-    const health = r.status === 'fulfilled' ? r.value : null;
-    return {
-      name: peer.name,
-      host: peer.info.host,
-      port: peer.info.port,
-      online: health !== null,
-      health,
-    };
-  });
+  return Promise.all(
+    peers.map(async (peer, i) => {
+      const r = settled[i]!;
+      // safeProbe never rejects, so `rejected` is a belt-and-braces guard: any
+      // future probe-path that throws still degrades to offline, never aborts.
+      const health = r.status === 'fulfilled' ? r.value : null;
+      const online = health !== null;
+      const session = online ? null : await safeSessionProbe(probeSession, peer.name);
+      return {
+        name: peer.name,
+        host: peer.info.host,
+        port: peer.info.port,
+        online,
+        health,
+        liveness: classifyPeerLiveness(online, session),
+      };
+    }),
+  );
 }
 
 /** Whole days from `now` (ms) until an ISO timestamp; negative when past. */
@@ -170,7 +235,19 @@ const HEADERS = [
   'OTEL',
   'INSTANCE',
   'CERT-EXPIRY',
+  'LIVENESS',
 ] as const;
+
+/**
+ * Render the LIVENESS column (macf#959) — '—' when the native channel is
+ * up (redundant with STATUS='online'; nothing to add); the classified
+ * verdict ('degraded' | 'dead' | 'unknown') otherwise. Never 'online' here
+ * outside the '—' case — `classifyPeerLiveness` only returns 'online' when
+ * `online` is true, which this function maps to '—'.
+ */
+export function formatLiveness(online: boolean, liveness: PeerLiveness): string {
+  return online ? '—' : liveness;
+}
 
 /** Build one display row per agent (pure — exported for tests). */
 export function buildFleetRows(
@@ -179,8 +256,9 @@ export function buildFleetRows(
 ): readonly (readonly string[])[] {
   return statuses.map((s) => {
     const where = `${s.host}:${s.port}`;
+    const liveness = formatLiveness(s.online, s.liveness);
     if (!s.online || !s.health) {
-      return [s.name, where, 'offline', '—', '—', '—', '—', '—', '—'];
+      return [s.name, where, 'offline', '—', '—', '—', '—', '—', '—', liveness];
     }
     const h = s.health;
     return [
@@ -193,6 +271,7 @@ export function buildFleetRows(
       formatOtel(rawField(h, 'otel')),
       h.instance_id ?? '—',
       formatCertExpiry(h.cert_expiry, now),
+      liveness,
     ];
   });
 }
@@ -225,6 +304,9 @@ export function fleetStatusToJson(
         host: s.host,
         port: s.port,
         status: s.online ? 'online' : 'offline',
+        // Additive field (macf#959) — never changes the meaning of `status`
+        // above. See peer-liveness.ts for the four-state contract.
+        liveness: s.liveness,
         version: typeof version === 'string' && version.length > 0 ? version : null,
         health: s.health,
       };
@@ -256,6 +338,15 @@ export interface FleetStatusDeps {
   readonly resolveGuest?: GuestResolveFn;
   /** mTLS `/health` probe for a `route` guest (reuses the members probe by default). */
   readonly guestProbe?: GuestProbeFn;
+  /**
+   * LOCAL tmux-session check for an offline peer (macf#959). Optional —
+   * omitted, every offline peer's `liveness` reads 'unknown' (today's
+   * behavior, unchanged). Production wiring (`resolveDepsFromRegistry`)
+   * supplies a real `tmux has-session`/`capture-pane` seam, scoped to
+   * peers whose session would live on THIS host (same-host topology only
+   * — see peer-liveness.ts's scope note).
+   */
+  readonly probeSession?: FleetSessionProbeFn;
 }
 
 /** Wire the registry + mTLS probe from a project's config. */
@@ -310,12 +401,22 @@ async function resolveDepsFromRegistry(
     return pingAgentHealth({ host, port, caCertPem: guestCaCertPem, certPath, keyPath });
   };
 
+  // Real host tmux seams (macf#959) — same-host topology only (this is the
+  // substrate's actual layout: one host, one tmux session per agent, keyed
+  // on routing label per coordination.md). A peer on a DIFFERENT host has no
+  // local session here; `probeLocalSession`'s tri-state `hasSession` honestly
+  // reports that as 'unknown' (never 'dead') — see peer-liveness.ts.
+  const localSessionSeams = createLocalSessionSeams();
+  const probeSession: FleetSessionProbeFn = (peerName) =>
+    probeLocalSession(peerSessionName(config.project, peerName), localSessionSeams);
+
   return {
     ok: true,
     deps: {
       project: config.project,
       listPeers: () => registry.list(''),
       probe,
+      probeSession,
       loadGuests: () => loadGuestBindings(projectDir),
       // Resolve a guest cross-project within the SAME registry scope (DR-006
       // profile scope; macf#621 cross-scope) by keying a registry on the guest's
@@ -345,7 +446,7 @@ export async function runFleetStatus(
   }
 
   const peers = await resolved.listPeers();
-  const statuses = await gatherFleetStatus(peers, resolved.probe);
+  const statuses = await gatherFleetStatus(peers, resolved.probe, resolved.probeSession);
   const now = opts.now ?? Date.now();
 
   // Guests (DR-036 Amendment A) — external, unsupervised collaborators the
