@@ -64,6 +64,54 @@
 # the checks below when the workspace shows INDEPENDENT evidence of being a
 # MANAGED workspace (a `.macf/` directory exists, OR `.claude/settings.json`
 # exists) — a workspace with neither marker is skipped entirely, silently.
+#
+# WORKTREE FALSE-ALARM GUARD (groundnuty/macf#1114): a `git worktree add`
+# linked worktree — the shape `Agent(isolation: "worktree")` workers use
+# (`agent-identity.md` "Parallel Issue Execution with Teams") — is ANOTHER
+# legitimately-never-had-the-surface case, distinct from the bare-checkout
+# case above but the same NOT-damage shape. `.macf/` (the plugin mount +
+# `macf-agent.json`) is workspace-local + gitignored (see this repo's own
+# `.gitignore`), so it exists ONLY in the primary checkout — a linked
+# worktree's working directory never receives it, by design, regardless of
+# whether the worktree also happens to check out tracked files (like this
+# repo's own committed `.claude/settings.json` + `.claude/scripts/check-*.sh`
+# — groundnuty/macf dogfoods itself, so those two ARE tracked here even
+# though the file-header WHY above documents them as untracked in a generic
+# `macf init`'d consumer repo). Concretely: EVERY worker spawned during the
+# #1114 investigation session reported `.macf/plugin/` + `macf-agent.json`
+# missing — a surface that was never damaged, just never present in that
+# checkout.
+#
+# DISCRIMINATOR: reused verbatim from groundnuty/macf#1042 / #1113
+# (`macf-startup-pickup.sh`'s own linked-worktree no-op), not re-derived —
+# two independent implementations of "am I a worker" would drift silently.
+# `.git` is a property of the CHECKOUT, not the environment: git writes a
+# FILE (a `gitdir: ...` pointer) for a linked worktree and a real DIRECTORY
+# for the primary checkout. Unlike `MACF_AGENT_TYPE`, `CLAUDE_CODE_CHILD_
+# SESSION`, or `$TMUX` — all three verified (in #1042) to be inherited
+# byte-for-byte into a worker, because the spawner forks the parent's full
+# environment — `.git`'s shape cannot be inherited across a fork; it is
+# read fresh from whatever directory the check runs in. THE PREMISE THIS
+# RESTS ON (stated explicitly, as #1113 did): a permanent agent's registered
+# workspace is ALWAYS the primary clone — no supported pattern in this repo
+# runs a permanent fleet agent out of a linked worktree. If that ever stops
+# being true, this check breaks and needs revisiting alongside whatever
+# introduces the exception.
+#
+# FAIL-OPEN DIRECTION IS INVERTED FROM #1042 — same discriminator, OPPOSITE
+# conclusion, and it must be reasoned here, not inherited: #1042's hook
+# guards a QUEUE-INJECTION nudge, where a wrong guess means a fleet silently
+# stops picking up work, so ambiguity there resolves to INJECT (act). THIS
+# hook guards a SECURITY-relevant DAMAGE ALARM, where a wrong guess means
+# missing a genuine sweep (the #814 incident this hook exists to catch), so
+# ambiguity here resolves to ALARM (warn) — the opposite default. Concretely:
+# ONLY a CONFIRMED worker shape (`.git` is a file whose content matches
+# `^gitdir: `) suppresses the checks below. `.git` absent, a directory,
+# unreadable, or any other unrecognized shape is INDETERMINATE and falls
+# through to the checks below UNCHANGED — they still run, and still alarm
+# if the surface is genuinely missing. A missed suppression is recoverable
+# noise (one worker prints a warning it didn't need to); a wrongly-suppressed
+# alarm on a genuinely swept primary checkout is not.
 set -euo pipefail
 
 # Operator override first — cheapest exit, no stdin read needed.
@@ -77,6 +125,18 @@ cat >/dev/null 2>&1 || true
 # Resolve the workspace directory the same way the sibling check-*.sh hooks do.
 WORKSPACE="${CLAUDE_PROJECT_DIR:-${PWD:-}}"
 [ -n "$WORKSPACE" ] || exit 0
+
+# ── Linked-git-worktree no-op (groundnuty/macf#1114) ─────────────────────
+# See the file header "WORKTREE FALSE-ALARM GUARD" section for the full
+# rationale, the reused-not-re-derived discriminator, the premise it rests
+# on, and why the fail-open direction here is the OPPOSITE of #1042's.
+# Only a CONFIRMED `gitdir:` pointer file suppresses; `.git` absent, a
+# directory, unreadable, or any other shape falls through to the checks
+# below UNCHANGED (honest-unknown floor: ambiguity resolves to alarm, not
+# skip — inverted from #1042's inject-on-ambiguity).
+if [ -f "$WORKSPACE/.git" ] && grep -q '^gitdir: ' "$WORKSPACE/.git" 2>/dev/null; then
+  exit 0
+fi
 
 # ── Managed-workspace guard ──────────────────────────────────────────────
 # Only a workspace with independent evidence of having been `macf init`'d is

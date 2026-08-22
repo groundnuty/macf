@@ -32,6 +32,25 @@ interface WorkspaceSpec {
   readonly settingsJson?: boolean;
   /** Names of `.claude/scripts/check-*.sh` files to create. Default one entry. */
   readonly checkScripts?: readonly string[];
+  /**
+   * Simulates the on-disk `.git` shape at the workspace root
+   * (groundnuty/macf#1114 linked-worktree no-op — discriminator reused
+   * verbatim from groundnuty/macf#1042 / #1113's `macf-startup-pickup.sh`).
+   * Omitted (default) = no `.git` at all — indeterminate, falls through
+   * unchanged (still evaluates + can still alarm).
+   *   - `'worktree'`  → `.git` is a FILE containing a `gitdir: ...` pointer
+   *                     (the real shape `git worktree add` produces) →
+   *                     CONFIRMED worker → full no-op, no evaluation at all.
+   *   - `'primary'`   → `.git` is a real DIRECTORY (the real shape a primary
+   *                     checkout has) → indeterminate-by-shape but the
+   *                     GENUINE non-worker case → evaluates normally.
+   *   - `'malformed'` → `.git` is a FILE but does NOT match `^gitdir: ` →
+   *                     indeterminate → falls through unchanged (still
+   *                     evaluates + can still alarm — the fail-open-toward-
+   *                     alarming floor, inverted from #1042's fail-open-
+   *                     toward-inject).
+   */
+  readonly gitDotShape?: 'worktree' | 'primary' | 'malformed';
 }
 
 function buildWorkspace(spec: WorkspaceSpec): string {
@@ -42,9 +61,21 @@ function buildWorkspace(spec: WorkspaceSpec): string {
     agentConfig = true,
     settingsJson = true,
     checkScripts = ['check-gh-token.sh'],
+    gitDotShape,
   } = spec;
 
   const workspace = mkdtempSync(join(tmpdir(), 'macf-fwsurf-ws-'));
+
+  // groundnuty/macf#1114 linked-worktree no-op — see `gitDotShape`'s own doc
+  // comment. Omitted entirely (the default) leaves NO `.git` at the
+  // workspace root, matching every other test in this file pre-dating #1114.
+  if (gitDotShape === 'worktree') {
+    writeFileSync(join(workspace, '.git'), 'gitdir: /some/other/repo/.git/worktrees/agent-x\n');
+  } else if (gitDotShape === 'primary') {
+    mkdirSync(join(workspace, '.git'), { recursive: true });
+  } else if (gitDotShape === 'malformed') {
+    writeFileSync(join(workspace, '.git'), 'not a gitdir pointer\n');
+  }
 
   if (macfDir) {
     mkdirSync(join(workspace, '.macf'), { recursive: true });
@@ -229,6 +260,90 @@ describe('check-framework-surface.sh (hook)', () => {
     });
   });
 
+  describe('linked-worktree no-op (groundnuty/macf#1114) — a worktree-spawned worker legitimately lacks `.macf/plugin` + `macf-agent.json` (gitignored, workspace-local); discriminator reused verbatim from groundnuty/macf#1042/#1113, fail-open direction INVERTED (alarm on ambiguity, not inject)', () => {
+    // DECISIVE PAIR (assert-the-wrong-path.md): a worker workspace producing
+    // empty stdout could mean "the new guard correctly suppressed" OR "the
+    // hook is broken outright" — indistinguishable from the worker assertion
+    // alone (a broken hook would satisfy (1) trivially and would be STRICTLY
+    // WORSE than the false alarm being fixed, since it would silently disable
+    // sweep-damage detection fleet-wide). The primary-checkout test below
+    // rules that out: same damaged-surface fixture, only the `.git` shape
+    // differs, and it STILL alarms — proving the detection pipeline isn't
+    // globally broken and the empty result in the worker case is specifically
+    // this guard, not a crash.
+    it('(1) WORKER (`.git` is a `gitdir:` pointer file) + legitimately-absent surface (the real worktree shape — `.macf/plugin` + `macf-agent.json` gitignored/workspace-local) → does NOT alarm', () => {
+      const ws = buildWorkspace({ gitDotShape: 'worktree', pluginDir: false, agentConfig: false });
+      try {
+        const r = runHook({ workspace: ws });
+        expect(r.status).toBe(0);
+        expect(r.stdout).toBe('');
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('(2) PRIMARY checkout (`.git` is a real directory) + the SAME genuinely-damaged surface → still alarms (decisive pair\'s other half — sweep-damage detection is not weakened)', () => {
+      const ws = buildWorkspace({ gitDotShape: 'primary', pluginDir: false, agentConfig: false });
+      try {
+        const r = runHook({ workspace: ws });
+        expect(r.status).toBe(0);
+        expect(r.stdout).toContain('MACF FRAMEWORK SURFACE IS DAMAGED');
+        expect(r.stdout).toContain('.macf/plugin/');
+        expect(r.stdout).toContain('macf-agent.json');
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('indeterminate: `.git` is a file but NOT a `gitdir:` pointer (malformed/unexpected shape) → falls through unchanged, still alarms on a genuinely-damaged surface (fail-open toward alarming, not skip)', () => {
+      const ws = buildWorkspace({ gitDotShape: 'malformed', pluginDir: false, agentConfig: false });
+      try {
+        const r = runHook({ workspace: ws });
+        expect(r.status).toBe(0);
+        expect(r.stdout).toContain('MACF FRAMEWORK SURFACE IS DAMAGED');
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('indeterminate: `.git` absent entirely (documented default every pre-#1114 test in this file uses) → falls through unchanged, still alarms on a genuinely-damaged surface', () => {
+      const ws = buildWorkspace({ pluginDir: false, agentConfig: false });
+      // gitDotShape omitted — no .git at all.
+      try {
+        const r = runHook({ workspace: ws });
+        expect(r.status).toBe(0);
+        expect(r.stdout).toContain('MACF FRAMEWORK SURFACE IS DAMAGED');
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('WORKER shape + a healthy-looking surface → also stays silent (no evaluation at all, not merely no missing entries)', () => {
+      const ws = buildWorkspace({ gitDotShape: 'worktree' });
+      try {
+        const r = runHook({ workspace: ws });
+        expect(r.status).toBe(0);
+        expect(r.stdout).toBe('');
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('WORKER shape suppresses ALL sub-checks uniformly, not just the headline verdict — check-*.sh absence (Check C) also produces no UNGUARDED warning', () => {
+      // Guards against a fix that only gates the top-level MISSING-array
+      // verdict while leaving an individual sub-check's false signal intact.
+      const ws = buildWorkspace({ gitDotShape: 'worktree', pluginDir: false, agentConfig: false, checkScripts: [] });
+      try {
+        const r = runHook({ workspace: ws });
+        expect(r.status).toBe(0);
+        expect(r.stdout).toBe('');
+        expect(r.stdout).not.toContain('UNGUARDED');
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe('override', () => {
     it('MACF_SKIP_FRAMEWORK_CHECK=1 silences even a fully damaged workspace', () => {
       const ws = buildWorkspace({ pluginDir: false, agentConfig: false, checkScripts: [] });
@@ -251,6 +366,21 @@ describe('check-framework-surface.sh (hook)', () => {
         encoding: 'utf-8',
       });
       expect(res.status).toBe(0);
+    });
+
+    it('exits 0 on malformed (non-JSON) stdin against a damaged managed workspace — the hook never parses stdin, so garbage input must not change the verdict', () => {
+      const ws = buildWorkspace({ pluginDir: false, agentConfig: false });
+      try {
+        const res = spawnSync('bash', [HOOK_SCRIPT], {
+          input: 'not json at all {{{',
+          env: { PATH: process.env['PATH'] ?? '', CLAUDE_PROJECT_DIR: ws },
+          encoding: 'utf-8',
+        });
+        expect(res.status).toBe(0);
+        expect(res.stdout).toContain('MACF FRAMEWORK SURFACE IS DAMAGED');
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
     });
   });
 });
