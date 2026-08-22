@@ -34,8 +34,8 @@ interface WorkspaceSpec {
   readonly checkScripts?: readonly string[];
   /**
    * Simulates the on-disk `.git` shape at the workspace root
-   * (groundnuty/macf#1114 linked-worktree no-op — discriminator reused
-   * verbatim from groundnuty/macf#1042 / #1113's `macf-startup-pickup.sh`).
+   * (groundnuty/macf#1114 linked-worktree no-op — same discriminator
+   * predicate as groundnuty/macf#1042 / #1113's `macf-startup-pickup.sh`).
    * Omitted (default) = no `.git` at all — indeterminate, falls through
    * unchanged (still evaluates + can still alarm).
    *   - `'worktree'`  → `.git` is a FILE containing a `gitdir: ...` pointer
