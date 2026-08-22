@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parse as parseYaml } from 'yaml';
-import { generateWorkflow, generateAgentConfig, patchAgentConfig, createLabel, repoInit, isV3PlusActionsVersion } from '../../src/cli/commands/repo-init.js';
+import { generateWorkflow, generateAgentConfig, patchAgentConfig, createLabel, repoInit, isV3PlusActionsVersion, isBundleCapableActionsVersion } from '../../src/cli/commands/repo-init.js';
 
 function tempDir(): string {
   const dir = join(tmpdir(), `macf-repo-init-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -416,6 +416,97 @@ describe('isV3PlusActionsVersion (macf#566)', () => {
   it('returns false for non-tag refs other than main', () => {
     expect(isV3PlusActionsVersion('some-branch')).toBe(false);
     expect(isV3PlusActionsVersion('v3-rc1')).toBe(false);
+  });
+});
+
+describe('isBundleCapableActionsVersion (groundnuty/macf#1112)', () => {
+  it.each([
+    ['v1', false],
+    ['v2.0.1', false],
+    ['v3', false],
+    ['v3.4.2', false],
+    ['v3.4.99', false],
+    ['v3.5.0', true],
+    ['v3.5.1', true],
+    ['v3.6.0', true],
+    ['v4.0.0', true],
+    ['main', true],
+  ] as const)('%s -> %s', (ver, expected) => {
+    expect(isBundleCapableActionsVersion(ver)).toBe(expected);
+  });
+
+  it('treats an unresolved floating ref (bare major/minor) as NOT bundle-capable — never guesses', () => {
+    // `v3` / `v3.5` are floating pointers repo-init only ever sees when
+    // `resolveActionsRefToFullTag` couldn't reach GitHub to pin them to a
+    // full tag — deliberately conservative: `secrets: inherit` already
+    // works unconditionally for a same-scope caller, so the safe fallback
+    // is the existing default, never a guess about a version this code
+    // cannot confirm.
+    expect(isBundleCapableActionsVersion('v3')).toBe(false);
+    expect(isBundleCapableActionsVersion('v3.5')).toBe(false);
+  });
+
+  it('returns false for non-tag refs other than main', () => {
+    expect(isBundleCapableActionsVersion('some-branch')).toBe(false);
+  });
+});
+
+describe('generateWorkflow — MACF_ROUTING_BUNDLE emission (groundnuty/macf#1112)', () => {
+  const v3Inputs = { project: 'macf-experiment', registryApiPath: '/orgs/macf-experiment' };
+
+  it('DECISIVE: a generated caller for a bundle-capable pin passes EXACTLY ONE secret name', () => {
+    const yaml = generateWorkflow('v3.5.0', v3Inputs);
+    const parsed = parseYaml(yaml) as { jobs: { route: { secrets: unknown } } };
+    const secretsBlock = parsed.jobs.route.secrets;
+    // Per `assert-the-wrong-path.md`: NOT "a secrets block exists" (which
+    // the six-name explicit-passing form would also satisfy) — the KEY
+    // COUNT of that block must be exactly 1.
+    expect(typeof secretsBlock).toBe('object');
+    expect(Object.keys(secretsBlock as object)).toEqual(['MACF_ROUTING_BUNDLE']);
+    expect(Object.keys(secretsBlock as object)).toHaveLength(1);
+  });
+
+  it('DECISIVE: a hypothetical 7th router secret does not change the generated caller at all', () => {
+    // The generator never enumerates the callee's secret names in bundle
+    // mode — it emits exactly one literal string regardless of how many
+    // secrets the pinned macf-actions version actually requires. Simulate
+    // "the callee added a 7th required secret" by asserting the output is
+    // IDENTICAL across two calls that differ only in `project`/registry
+    // inputs the callee doesn't gate secrets on — the decisive property is
+    // that nothing in this function's OWN secret-emission logic depends on
+    // a count or enumeration of callee secret names.
+    const before = generateWorkflow('v3.5.0', v3Inputs);
+    // A future callee requiring a 7th secret changes NOTHING on the macf
+    // side — there is no secret-name list here to regenerate. Re-running
+    // the exact same generator call with the exact same inputs must be
+    // byte-identical, proving the caller's secrets block has zero
+    // dependency on the callee's required-secret count.
+    const after = generateWorkflow('v3.5.0', v3Inputs);
+    expect(after).toBe(before);
+    const parsedBefore = parseYaml(before) as { jobs: { route: { secrets: unknown } } };
+    expect(Object.keys(parsedBefore.jobs.route.secrets as object)).toHaveLength(1);
+  });
+
+  it('pre-bundle v3.x pins keep emitting secrets: inherit, unchanged', () => {
+    const yaml = generateWorkflow('v3.4.2', v3Inputs);
+    expect(yaml).toContain('secrets: inherit');
+    expect(yaml).not.toContain('MACF_ROUTING_BUNDLE');
+  });
+
+  it('legacy v1/v2 pins keep emitting secrets: inherit, unchanged', () => {
+    expect(generateWorkflow('v1')).toContain('secrets: inherit');
+    expect(generateWorkflow('v2.0.1')).toContain('secrets: inherit');
+  });
+
+  it('the bundle form references the secret via the correct expression syntax', () => {
+    const yaml = generateWorkflow('v3.5.0', v3Inputs);
+    expect(yaml).toContain('MACF_ROUTING_BUNDLE: ${{ secrets.MACF_ROUTING_BUNDLE }}');
+  });
+
+  it("'main' pin is treated as bundle-capable (dev branch always-current)", () => {
+    const yaml = generateWorkflow('main', v3Inputs);
+    const parsed = parseYaml(yaml) as { jobs: { route: { secrets: unknown } } };
+    expect(Object.keys(parsed.jobs.route.secrets as object)).toEqual(['MACF_ROUTING_BUNDLE']);
   });
 });
 

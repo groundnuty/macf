@@ -3199,6 +3199,10 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
       TS_OAUTH_CLIENT_ID: {},
       TS_OAUTH_SECRET: {},
     },
+    // groundnuty/macf#1112 — the bundle publish result's own NEUTRAL
+    // default, same "no repos, nothing attempted" reasoning as
+    // `routingSecrets` immediately above.
+    routingBundle: {},
     ...overrides,
   };
 }
@@ -3430,6 +3434,30 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
         }),
       ),
     ).toBe(0);
+  });
+
+  // --- groundnuty/macf#1112 — the single bundled routing secret's own
+  // exit-code gate, mirroring `routingSecretsBad`'s existing bar for the
+  // six individual secrets.
+
+  it('applyExitCode: 1 when the MACF_ROUTING_BUNDLE leg failed', () => {
+    expect(applyExitCode(resultWith({ routingBundle: { 'x/y': { status: 'failed', reason: 'cannot compose MACF_ROUTING_BUNDLE — TS_OAUTH_SECRET: vault restore came up empty' } } }))).toBe(1);
+  });
+
+  it('applyExitCode: 0 when MACF_ROUTING_BUNDLE legs are created/already-present', () => {
+    expect(
+      applyExitCode(resultWith({ routingBundle: { 'x/y': { status: 'created' }, 'x/z': { status: 'already-present' } } })),
+    ).toBe(0);
+  });
+
+  it('applyExitCode: 0 when MACF_ROUTING_BUNDLE is honestly skipped (not yet composable — e.g. Tailscale undeclared)', () => {
+    expect(
+      applyExitCode(resultWith({ routingBundle: { 'x/y': { status: 'skipped', reason: 'cannot compose MACF_ROUTING_BUNDLE yet — TS_OAUTH_CLIENT_ID: not declared' } } })),
+    ).toBe(0);
+  });
+
+  it('applyExitCode: 0 with the default (empty) routingBundle fixture — the neutral no-repos-to-publish-to steady state', () => {
+    expect(applyExitCode(resultWith({}))).toBe(0);
   });
 
   it('--json (fleetApplyResultToJson) distinguishes all three routing-client mint statuses verbatim — minted / skipped / failed (macf#954)', () => {

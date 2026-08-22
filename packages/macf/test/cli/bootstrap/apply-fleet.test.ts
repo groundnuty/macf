@@ -30,7 +30,7 @@ import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchang
 import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
 import type { RoutingSecretsPublishDeps } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
-import { toBase64ForSecret, ALL_ROUTING_SECRET_NAMES } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
+import { toBase64ForSecret, ALL_ROUTING_SECRET_NAMES, unpackRoutingBundle } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RouterAppVaultRestoreDeps } from '../../../src/cli/bootstrap/apply-router-app.js';
 import { deriveRouterAppHandle } from '../../../src/cli/bootstrap/apply-router-app.js';
 import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
@@ -3269,6 +3269,21 @@ trust:
       expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'ts-client-id')).toHaveLength(routerCarryingRepos.length);
       expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'ts-secret')).toHaveLength(routerCarryingRepos.length);
 
+      // groundnuty/macf#1112 — the single bundled secret is published
+      // ALONGSIDE the six above (never instead of), and unpacks to the
+      // SAME six values `setSecretCalls` recorded for the individual form.
+      for (const repo of routerCarryingRepos) {
+        expect(result.routingBundle[repo]?.status).toBe('created');
+      }
+      const bundleCall = setSecretCalls.find((c) => c.name === 'MACF_ROUTING_BUNDLE');
+      expect(bundleCall).toBeDefined();
+      const unpackedBundle = unpackRoutingBundle(bundleCall!.value);
+      for (const name of ALL_ROUTING_SECRET_NAMES) {
+        const individualCall = setSecretCalls.find((c) => c.repo === bundleCall!.repo && c.name === name);
+        expect(individualCall).toBeDefined();
+        expect(unpackedBundle[name]).toBe(individualCall!.value);
+      }
+
       // A fully-routable fleet is a green exit.
       expect(applyExitCode(result)).toBe(0);
 
@@ -3321,6 +3336,13 @@ trust:
       expect(clientIdLeg?.status).toBe('skipped');
       if (clientIdLeg?.status === 'skipped') {
         expect(clientIdLeg.reason).toMatch(/routing will not function/i);
+      }
+      // groundnuty/macf#1112 — the bundle can't be composed while one of
+      // the six is `'not-required'` (never all-six-available this run) —
+      // an honest `'skipped'`, same bar the individual TS_OAUTH pair uses,
+      // NOT a partial/broken bundle written with a hole in it.
+      for (const repo of ['groundnuty/demo-code', 'groundnuty/demo-fleet-control']) {
+        expect(result.routingBundle[repo]?.status).toBe('skipped');
       }
       // An undeclared-and-absent pair is an honest skip, never a run-failing gap.
       expect(applyExitCode(result)).toBe(0);

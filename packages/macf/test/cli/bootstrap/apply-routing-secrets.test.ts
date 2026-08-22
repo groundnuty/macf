@@ -11,13 +11,18 @@ import {
   ALL_ROUTING_SECRET_NAMES,
   ROUTING_APP_ID_SECRET_NAME,
   ROUTING_APP_KEY_SECRET_NAME,
+  ROUTING_BUNDLE_SECRET_NAME,
   TAILSCALE_OAUTH_MISSING_CODE,
   TS_OAUTH_CLIENT_ID_SECRET_NAME,
   TS_OAUTH_SECRET_SECRET_NAME,
   checkTailscaleOauthPreflight,
+  packRoutingBundle,
+  publishRoutingBundle,
   publishRoutingSecrets,
+  skippedRoutingBundlePublish,
   skippedRoutingSecretsPublish,
   toBase64ForSecret,
+  unpackRoutingBundle,
 } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RoutingSecretsForPublish, RoutingSecretsPublishDeps } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import { ROUTING_CLIENT_CERT_SECRET_NAME, ROUTING_CLIENT_KEY_SECRET_NAME } from '../../../src/cli/bootstrap/apply-routing-client.js';
@@ -340,5 +345,234 @@ describe('checkTailscaleOauthPreflight — refuse before gate 1 when declared-an
     });
     expect(result?.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
     expect(result?.message).not.toContain('ts-client-id');
+  });
+});
+
+// --- groundnuty/macf#1112: the single bundled routing secret ---
+
+const BUNDLE_VALUES: Readonly<Record<(typeof ALL_ROUTING_SECRET_NAMES)[number], string>> = {
+  [ROUTING_APP_ID_SECRET_NAME]: 'APP-ID-VALUE',
+  [ROUTING_APP_KEY_SECRET_NAME]: '-----BEGIN PRIVATE KEY-----\nMULTILINE\nPEM\n-----END PRIVATE KEY-----\n',
+  [ROUTING_CLIENT_CERT_SECRET_NAME]: 'CLIENT-CERT-B64-VALUE',
+  [ROUTING_CLIENT_KEY_SECRET_NAME]: 'CLIENT-KEY-B64-VALUE',
+  [TS_OAUTH_CLIENT_ID_SECRET_NAME]: 'TS-CLIENT-ID-VALUE',
+  [TS_OAUTH_SECRET_SECRET_NAME]: 'TS-SECRET-VALUE',
+};
+
+describe('packRoutingBundle / unpackRoutingBundle — the bundle wire-format round-trip (groundnuty/macf#1112)', () => {
+  it('DECISIVE: pack six, unpack six, all values recovered byte-for-byte — including a multi-line PEM', () => {
+    const bundle = packRoutingBundle(BUNDLE_VALUES);
+    const unpacked = unpackRoutingBundle(bundle);
+    for (const name of ALL_ROUTING_SECRET_NAMES) {
+      expect(unpacked[name]).toBe(BUNDLE_VALUES[name]);
+    }
+    expect(Object.keys(unpacked).sort()).toEqual([...ALL_ROUTING_SECRET_NAMES].sort());
+  });
+
+  it('the wire form is single-line base64 of JSON — opaque, shell-safe, no embedded newlines', () => {
+    const bundle = packRoutingBundle(BUNDLE_VALUES);
+    expect(bundle).not.toContain('\n');
+    // Standard base64 alphabet only (+/=A-Za-z0-9) — safe inside a GitHub
+    // Actions secret value and a shell `${{ }}`/env-var context.
+    expect(bundle).toMatch(/^[A-Za-z0-9+/]+=*$/);
+    const decodedJson = Buffer.from(bundle, 'base64').toString('utf-8');
+    expect(() => JSON.parse(decodedJson)).not.toThrow();
+  });
+
+  it('unpack THROWS naming the missing key(s) when the bundle is missing one', () => {
+    const partial = { ...BUNDLE_VALUES };
+    // @ts-expect-error deliberately building a malformed bundle for the test
+    delete partial[TS_OAUTH_SECRET_SECRET_NAME];
+    const json = JSON.stringify(partial);
+    const bundle = Buffer.from(json, 'utf-8').toString('base64');
+    expect(() => unpackRoutingBundle(bundle)).toThrow(/missing required key\(s\).*TS_OAUTH_SECRET/);
+  });
+
+  it('unpack THROWS naming ALL SIX when given an empty JSON object', () => {
+    const bundle = Buffer.from('{}', 'utf-8').toString('base64');
+    let thrown: unknown;
+    try {
+      unpackRoutingBundle(bundle);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    for (const name of ALL_ROUTING_SECRET_NAMES) {
+      expect((thrown as Error).message).toContain(name);
+    }
+  });
+
+  it('unpack THROWS on malformed base64, never silently returns a partial/garbage result', () => {
+    expect(() => unpackRoutingBundle('not-valid-base64-!!!' + ' ')).toThrow();
+  });
+
+  it('unpack THROWS on base64 that decodes to non-JSON', () => {
+    const bundle = Buffer.from('this is not json', 'utf-8').toString('base64');
+    expect(() => unpackRoutingBundle(bundle)).toThrow(/not valid JSON/);
+  });
+
+  it('unpack THROWS when a key holds an empty string (empty is treated the same as missing)', () => {
+    const withEmpty = { ...BUNDLE_VALUES, [TS_OAUTH_CLIENT_ID_SECRET_NAME]: '' };
+    const bundle = Buffer.from(JSON.stringify(withEmpty), 'utf-8').toString('base64');
+    expect(() => unpackRoutingBundle(bundle)).toThrow(/TS_OAUTH_CLIENT_ID/);
+  });
+});
+
+describe('publishRoutingBundle — additive alongside the six individual secrets (groundnuty/macf#1112)', () => {
+  it('all six available -> composes + publishes MACF_ROUTING_BUNDLE, and it round-trips to the SAME six values publishRoutingSecrets would have used', async () => {
+    const calls: { repo: string; name: string; value: string }[] = [];
+    const result = await publishRoutingBundle(
+      ALL_AVAILABLE,
+      ['o/repo-a', 'o/repo-b'],
+      depsWith({ setRepoSecret: async (repo, name, value) => { calls.push({ repo, name, value }); } }),
+    );
+    expect(result['o/repo-a']).toEqual({ status: 'created' });
+    expect(result['o/repo-b']).toEqual({ status: 'created' });
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.name).toBe(ROUTING_BUNDLE_SECRET_NAME);
+      const unpacked = unpackRoutingBundle(call.value);
+      expect(unpacked[ROUTING_APP_ID_SECRET_NAME]).toBe('APP-ID-VALUE');
+      expect(unpacked[ROUTING_CLIENT_CERT_SECRET_NAME]).toBe('CLIENT-CERT-B64-VALUE');
+      expect(unpacked[TS_OAUTH_SECRET_SECRET_NAME]).toBe('TS-SECRET-VALUE');
+    }
+  });
+
+  it('create-only: a repo that already has MACF_ROUTING_BUNDLE is left untouched', async () => {
+    const calls: string[] = [];
+    const result = await publishRoutingBundle(
+      ALL_AVAILABLE,
+      ['o/already-has-it'],
+      depsWith({ checkRepoSecretPresence: async () => 'present', setRepoSecret: async (_r, name) => { calls.push(name); } }),
+    );
+    expect(result['o/already-has-it']).toEqual({ status: 'already-present' });
+    expect(calls).toEqual([]);
+  });
+
+  it('ANY leg unavailable -> the WHOLE bundle is "failed" for every repo (never a partial/broken bundle written)', async () => {
+    const oneMissing: RoutingSecretsForPublish = {
+      ...ALL_AVAILABLE,
+      [TS_OAUTH_SECRET_SECRET_NAME]: { status: 'unavailable', reason: 'vault restore came up empty' },
+    };
+    const calls: string[] = [];
+    const result = await publishRoutingBundle(
+      oneMissing,
+      ['o/repo-a', 'o/repo-b'],
+      depsWith({ setRepoSecret: async (_r, name) => { calls.push(name); } }),
+    );
+    expect(result['o/repo-a']?.status).toBe('failed');
+    expect(result['o/repo-b']?.status).toBe('failed');
+    if (result['o/repo-a']?.status === 'failed') {
+      expect(result['o/repo-a'].reason).toContain('TS_OAUTH_SECRET');
+      expect(result['o/repo-a'].reason).toContain('vault restore came up empty');
+    }
+    // Never attempts a partial write:
+    expect(calls).toEqual([]);
+  });
+
+  it('ANY leg not-required (and none unavailable) -> "skipped" for every repo, never attempts a write', async () => {
+    const notRequired: RoutingSecretsForPublish = {
+      ...ALL_AVAILABLE,
+      [TS_OAUTH_CLIENT_ID_SECRET_NAME]: { status: 'not-required', reason: 'Tailscale not declared for this fleet yet' },
+    };
+    const calls: string[] = [];
+    const result = await publishRoutingBundle(
+      notRequired,
+      ['o/repo'],
+      depsWith({ setRepoSecret: async (_r, name) => { calls.push(name); } }),
+    );
+    expect(result['o/repo']?.status).toBe('skipped');
+    if (result['o/repo']?.status === 'skipped') {
+      expect(result['o/repo'].reason).toContain('TS_OAUTH_CLIENT_ID');
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it('presence-check-first, EVEN when not composable this run: a repo that already has the bundle is "already-present", never "failed"/"skipped" (the #986 discipline, lifted to the aggregate)', async () => {
+    // Decisive regression case: an early version of this function checked
+    // "is every leg available?" BEFORE ever calling checkRepoSecretPresence,
+    // so a repo that already held the bundle from an EARLIER run (when the
+    // routing-client cert genuinely wasn't minted this run — a normal,
+    // frequent shape per `apply-routing-client.ts`'s reuse path) got a
+    // spurious 'failed', flipping `applyExitCode` to 1 on an otherwise
+    // healthy, idempotent re-run.
+    const oneUnavailable: RoutingSecretsForPublish = {
+      ...ALL_AVAILABLE,
+      [TS_OAUTH_SECRET_SECRET_NAME]: { status: 'unavailable', reason: 'not minted this run' },
+    };
+    const calls: string[] = [];
+    const result = await publishRoutingBundle(
+      oneUnavailable,
+      ['o/already-has-it'],
+      depsWith({ checkRepoSecretPresence: async () => 'present', setRepoSecret: async (_r, name) => { calls.push(name); } }),
+    );
+    expect(result['o/already-has-it']).toEqual({ status: 'already-present' });
+    expect(calls).toEqual([]);
+
+    // Same proof for the not-required shape:
+    const oneNotRequired: RoutingSecretsForPublish = {
+      ...ALL_AVAILABLE,
+      [TS_OAUTH_CLIENT_ID_SECRET_NAME]: { status: 'not-required', reason: 'Tailscale not declared yet' },
+    };
+    const result2 = await publishRoutingBundle(
+      oneNotRequired,
+      ['o/already-has-it'],
+      depsWith({ checkRepoSecretPresence: async () => 'present' }),
+    );
+    expect(result2['o/already-has-it']).toEqual({ status: 'already-present' });
+  });
+
+  it('NEVER includes a raw secret value anywhere in the result — only status/reason strings (the base64 bundle itself never appears in the RESULT, only via setRepoSecret)', async () => {
+    const result = await publishRoutingBundle(ALL_AVAILABLE, ['o/repo'], depsWith());
+    const serialized = JSON.stringify(result);
+    for (const value of ['APP-ID-VALUE', 'APP-KEY-PEM-VALUE', 'CLIENT-CERT-B64-VALUE', 'CLIENT-KEY-B64-VALUE', 'TS-CLIENT-ID-VALUE', 'TS-SECRET-VALUE']) {
+      expect(serialized).not.toContain(value);
+    }
+  });
+
+  it('empty repo list -> empty result, no calls', async () => {
+    let called = false;
+    const result = await publishRoutingBundle(ALL_AVAILABLE, [], depsWith({ setRepoSecret: async () => { called = true; } }));
+    expect(result).toEqual({});
+    expect(called).toBe(false);
+  });
+});
+
+describe('skippedRoutingBundlePublish (pure)', () => {
+  it('produces a uniform skipped leg for every given repo, carrying the given reason', () => {
+    const result = skippedRoutingBundlePublish(['o/a', 'o/b'], 'control repo aborted before step 0.5');
+    expect(result).toEqual({
+      'o/a': { status: 'skipped', reason: 'control repo aborted before step 0.5' },
+      'o/b': { status: 'skipped', reason: 'control repo aborted before step 0.5' },
+    });
+  });
+
+  it('empty repo list -> empty result', () => {
+    expect(skippedRoutingBundlePublish([], 'x')).toEqual({});
+  });
+});
+
+describe('legacy six-secret path still works — additive proof (groundnuty/macf#1112)', () => {
+  it('publishRoutingSecrets (the six-secret publisher) is UNCHANGED by the bundle addition: same result shape, same six keys, for a caller still on secrets: inherit / explicit-six', async () => {
+    const result = await publishRoutingSecrets(ALL_AVAILABLE, ['o/repo'], depsWith());
+    expect(Object.keys(result).sort()).toEqual([...ALL_ROUTING_SECRET_NAMES].sort());
+    for (const name of ALL_ROUTING_SECRET_NAMES) {
+      expect(result[name]['o/repo']).toEqual({ status: 'created' });
+    }
+  });
+
+  it('a fleet that publishes BOTH the six AND the bundle in the same run gets consistent values in both forms', async () => {
+    const sixCalls: { name: string; value: string }[] = [];
+    const bundleCalls: { name: string; value: string }[] = [];
+    await publishRoutingSecrets(ALL_AVAILABLE, ['o/repo'], depsWith({ setRepoSecret: async (_r, name, value) => { sixCalls.push({ name, value }); } }));
+    await publishRoutingBundle(ALL_AVAILABLE, ['o/repo'], depsWith({ setRepoSecret: async (_r, name, value) => { bundleCalls.push({ name, value }); } }));
+
+    const sixByName = Object.fromEntries(sixCalls.map((c) => [c.name, c.value]));
+    const bundleValue = bundleCalls.find((c) => c.name === ROUTING_BUNDLE_SECRET_NAME)?.value;
+    expect(bundleValue).toBeDefined();
+    const unpacked = unpackRoutingBundle(bundleValue!);
+    for (const name of ALL_ROUTING_SECRET_NAMES) {
+      expect(unpacked[name]).toBe(sixByName[name]);
+    }
   });
 });

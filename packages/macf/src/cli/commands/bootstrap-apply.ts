@@ -2014,6 +2014,13 @@ export function applyExitCode(
   // TS_OAUTH_CLIENT_ID/SECRET) — the exact gap that let a two-of-six fleet
   // exit 0 while genuinely unable to route.
   const routingSecretsBad = Object.values(result.routingSecrets).some((legs) => Object.values(legs).some((leg) => leg.status === 'failed'));
+  // groundnuty/macf#1112 — same bar as `routingSecretsBad` immediately
+  // above, applied to the single bundled secret: a `'failed'` leg means
+  // this run genuinely SHOULD have been able to compose the bundle (all
+  // six resolved to `'available'`) but the repo-level `gh secret set`
+  // itself failed — a real gap needing operator attention, not the
+  // honest `'skipped'` that a not-yet-composable bundle reports.
+  const routingBundleBad = Object.values(result.routingBundle).some((leg) => leg.status === 'failed');
   // groundnuty/macf#1072 — a 'could-not-attempt' router-pin reconcile needs
   // operator attention, same bar as an agent identity failure (`agentBad`
   // above already covers "identity unresolved" independently; this covers
@@ -2030,6 +2037,7 @@ export function applyExitCode(
     routingBad ||
     routingClientBad ||
     routingSecretsBad ||
+    routingBundleBad ||
     anyDeployFailed(deployResults) ||
     versionPhase?.halted === true ||
     actionsPinBad

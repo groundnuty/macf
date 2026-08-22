@@ -50,6 +50,14 @@ describe('assertRouterWorkflowWellFormed / findMissingRouterWorkflowRequirements
     expect(() => assertRouterWorkflowWellFormed(GOOD_V1)).not.toThrow();
   });
 
+  it('does NOT throw on a bundle-capable pin that emits MACF_ROUTING_BUNDLE instead of secrets: inherit (macf#1112)', () => {
+    const bundleForm = generateWorkflow('v3.5.0', { project: 'macf', registryApiPath: '/repos/groundnuty/groundnuty' });
+    expect(bundleForm).not.toContain('secrets: inherit');
+    expect(bundleForm).toContain('MACF_ROUTING_BUNDLE');
+    expect(() => assertRouterWorkflowWellFormed(bundleForm)).not.toThrow();
+    expect(findMissingRouterWorkflowRequirements(bundleForm)).toEqual([]);
+  });
+
   // --- Decisive: each required element is individually detected -----------
   // Table-driven — one corruption per requirement, isolated so exactly one
   // requirement fails per case (verified by the `missing.length === 1` +
@@ -71,7 +79,7 @@ describe('assertRouterWorkflowWellFormed / findMissingRouterWorkflowRequirements
     { name: 'permissions.pull-requests: read', corrupt: (y) => y.replace('  pull-requests: read\n', '') },
     { name: 'permissions.checks: read', corrupt: (y) => y.replace('  checks: read\n', '') },
     { name: 'reusable workflow reference (uses:)', corrupt: (y) => y.replace(/uses: groundnuty\/macf-actions[^\n]*\n/, '\n') },
-    { name: 'secrets: inherit', corrupt: (y) => y.replace('    secrets: inherit\n', '') },
+    { name: 'secrets propagation (secrets: inherit OR MACF_ROUTING_BUNDLE)', corrupt: (y) => y.replace('    secrets: inherit\n', '') },
   ];
 
   it('the corruption table covers every declared requirement exactly once', () => {

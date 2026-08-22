@@ -275,7 +275,9 @@ import {
   ROUTING_APP_KEY_SECRET_NAME,
   TS_OAUTH_CLIENT_ID_SECRET_NAME,
   TS_OAUTH_SECRET_SECRET_NAME,
+  publishRoutingBundle,
   publishRoutingSecrets,
+  skippedRoutingBundlePublish,
   skippedRoutingSecretsPublish,
   toBase64ForSecret,
 } from './apply-routing-secrets.js';
@@ -703,6 +705,16 @@ export interface FleetApplyResult {
    */
   readonly routingSecrets: RoutingSecretsPublishResult;
   /**
+   * The single bundled routing secret publish result (groundnuty/macf#1112)
+   * — `MACF_ROUTING_BUNDLE`, keyed by repo. Published ALONGSIDE (never
+   * instead of) `routingSecrets` above — additive, so a bundle-capable
+   * generated caller finds `MACF_ROUTING_BUNDLE` present the same run a
+   * legacy caller finds the six individual secrets present. See
+   * `apply-routing-secrets.ts::publishRoutingBundle`'s doc for the
+   * all-six-available-or-refuse composition rule.
+   */
+  readonly routingBundle: Readonly<Record<string, EnsureVariableOutcome>>;
+  /**
    * DR-043 Amendment L extended to `versions.actions` (groundnuty/macf#1072)
    * — see {@link ActionsPinReport}'s doc. The REAL `applyFleet` return ALWAYS
    * sets this (`attempted: false` when `versions:` was never declared this
@@ -955,6 +967,7 @@ function abortedFleetApplyResult(manifestPath: string, priorLock: FleetLock | nu
       keyLegs: {},
     },
     routingSecrets: skippedRoutingSecretsPublish([], `${reason} — see controlRepo above.`),
+    routingBundle: skippedRoutingBundlePublish([], `${reason} — see controlRepo above.`),
     // groundnuty/macf#1072 — the control repo aborted before step 0.5 (its
     // own repo-init) ever ran, so no repo was even examined for this run —
     // `attempted: false`, same as the "versions: never declared" gate.
@@ -1883,6 +1896,23 @@ export async function applyFleet(
     }
   }
 
+  // groundnuty/macf#1112 — the single bundled routing secret, published
+  // ALONGSIDE (never instead of) the six above, from the SAME resolved
+  // `routingSecretsForPublish` bag (never a second resolution pass — see
+  // `apply-routing-secrets.ts::publishRoutingBundle`'s doc for why this
+  // must compose from every-six-available or refuse).
+  const routingBundlePublish = await publishRoutingBundle(routingSecretsForPublish, routerCarryingRepos, deps.routingSecretsDeps);
+  {
+    const created = Object.values(routingBundlePublish).filter((l) => l.status === 'created').length;
+    const alreadyPresent = Object.values(routingBundlePublish).filter((l) => l.status === 'already-present').length;
+    deps.log(`Routing secret "MACF_ROUTING_BUNDLE" legs: ${String(created)} created, ${String(alreadyPresent)} already-present of ${String(routerCarryingRepos.length)} confirmed repo(s).`);
+    for (const [repo, leg] of Object.entries(routingBundlePublish)) {
+      if (leg.status === 'failed' || leg.status === 'skipped') {
+        deps.log(`Routing secret "MACF_ROUTING_BUNDLE" leg (${repo}): ${leg.status} — ${leg.reason}`);
+      }
+    }
+  }
+
   // `MACF_TRUSTED_ACTORS` (§D1, macf#922) — independent of the CA outcome;
   // every caller repo is a confirmed agent repo, never the control repo (see
   // `apply-routing.ts`'s doc). `v0` supports exactly one opt-in `runs_on`
@@ -2037,6 +2067,7 @@ export async function applyFleet(
     routing,
     routingClient,
     routingSecrets: routingSecretsPublish,
+    routingBundle: routingBundlePublish,
     actionsPin: manifest.versions
       ? { attempted: true, target: manifest.versions.actions, results: actionsPinResults }
       : { attempted: false, results: [] },
