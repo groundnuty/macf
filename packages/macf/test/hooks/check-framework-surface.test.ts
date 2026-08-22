@@ -12,7 +12,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
@@ -260,7 +260,7 @@ describe('check-framework-surface.sh (hook)', () => {
     });
   });
 
-  describe('linked-worktree no-op (groundnuty/macf#1114) — a worktree-spawned worker legitimately lacks `.macf/plugin` + `macf-agent.json` (gitignored, workspace-local); discriminator reused verbatim from groundnuty/macf#1042/#1113, fail-open direction INVERTED (alarm on ambiguity, not inject)', () => {
+  describe('linked-worktree no-op (groundnuty/macf#1114) — a worktree-spawned worker legitimately lacks `.macf/plugin` + `macf-agent.json` (gitignored, workspace-local); discriminator is the SAME predicate as groundnuty/macf#1042/#1113 (adapted to this file\'s single-bracket style), fail-open direction INVERTED (alarm on ambiguity, not inject)', () => {
     // DECISIVE PAIR (assert-the-wrong-path.md): a worker workspace producing
     // empty stdout could mean "the new guard correctly suppressed" OR "the
     // hook is broken outright" — indistinguishable from the worker assertion
@@ -271,8 +271,17 @@ describe('check-framework-surface.sh (hook)', () => {
     // differs, and it STILL alarms — proving the detection pipeline isn't
     // globally broken and the empty result in the worker case is specifically
     // this guard, not a crash.
-    it('(1) WORKER (`.git` is a `gitdir:` pointer file) + legitimately-absent surface (the real worktree shape — `.macf/plugin` + `macf-agent.json` gitignored/workspace-local) → does NOT alarm', () => {
-      const ws = buildWorkspace({ gitDotShape: 'worktree', pluginDir: false, agentConfig: false });
+    it('(1) WORKER (`.git` is a `gitdir:` pointer file) + legitimately-absent surface (the ACTUAL worktree shape — `.macf/` entirely absent because it is gitignored/workspace-local, while `.claude/settings.json` + `.claude/scripts/check-*.sh` ARE present because THIS repo tracks them) → does NOT alarm', () => {
+      // macfDir: false (not just pluginDir/agentConfig false) is the real
+      // incident shape: a fresh `git worktree add` checkout never creates
+      // `.macf/` at all (nothing to gitignore INTO — the directory itself
+      // doesn't exist), while settings.json + the check-*.sh scripts are
+      // tracked in THIS repo and so ARE checked out into the worktree. This
+      // is also the shape where the managed-workspace guard passes on
+      // `.claude/settings.json` alone (not on a `.macf/` dir that isn't
+      // there) — the real mechanism behind the #1114 incident, not just an
+      // equivalent-looking fixture.
+      const ws = buildWorkspace({ gitDotShape: 'worktree', macfDir: false });
       try {
         const r = runHook({ workspace: ws });
         expect(r.status).toBe(0);
@@ -329,10 +338,15 @@ describe('check-framework-surface.sh (hook)', () => {
       }
     });
 
-    it('WORKER shape suppresses ALL sub-checks uniformly, not just the headline verdict — check-*.sh absence (Check C) also produces no UNGUARDED warning', () => {
+    it('WORKER shape suppresses ALL sub-checks uniformly, not just the headline verdict — check-*.sh absence (Check C) also produces no UNGUARDED warning, using the ACTUAL worktree shape (`.macf/` entirely absent + zero check-*.sh)', () => {
       // Guards against a fix that only gates the top-level MISSING-array
       // verdict while leaving an individual sub-check's false signal intact.
-      const ws = buildWorkspace({ gitDotShape: 'worktree', pluginDir: false, agentConfig: false, checkScripts: [] });
+      // macfDir: false (not pluginDir/agentConfig false) matches test (1)'s
+      // real-worktree-shape correction; checkScripts: [] additionally
+      // exercises Check C specifically (a worker without ANY tracked
+      // check-*.sh — e.g. a consumer's macf-init'd repo, where those scripts
+      // are untracked per the file-header WHY, unlike this self-hosting repo).
+      const ws = buildWorkspace({ gitDotShape: 'worktree', macfDir: false, checkScripts: [] });
       try {
         const r = runHook({ workspace: ws });
         expect(r.status).toBe(0);
@@ -341,6 +355,28 @@ describe('check-framework-surface.sh (hook)', () => {
       } finally {
         rmSync(ws, { recursive: true, force: true });
       }
+    });
+
+    it('shares the identical `.git`-shape discriminator with macf-startup-pickup.sh (groundnuty/macf#1042/#1113) — pins both scripts to the same predicate so a future edit to one cannot silently drift from the other', () => {
+      // Bash can't import bash across the plugin/scripts vs scripts
+      // distribution boundary (same reason macf-startup-pickup.sh's own
+      // header cites for its TS role-gate being hand-duplicated, not
+      // sourced) — so this is a static source-shape lockstep test, the same
+      // shape as role-settings-model.test.ts's "the script re-implements the
+      // identical policy" auditor-sentinel pin.
+      const thisScript = readFileSync(HOOK_SCRIPT, 'utf-8');
+      const siblingScript = readFileSync(join(findCliPackageRoot(), 'scripts', 'macf-startup-pickup.sh'), 'utf-8');
+      // Same two-part predicate in both: a `.git` FILE-existence check
+      // immediately followed by the identical `gitdir: ` grep pattern.
+      // Bracket style intentionally differs ([ ] here vs [[ ]] there — see
+      // this file's own header comment) so the pin targets the substantive
+      // predicate, not the bracket form.
+      const FILE_CHECK = /-f "\$WORKSPACE\/\.git"/;
+      const GITDIR_GREP = /grep -q '\^gitdir: '/;
+      expect(thisScript).toMatch(FILE_CHECK);
+      expect(thisScript).toMatch(GITDIR_GREP);
+      expect(siblingScript).toMatch(FILE_CHECK);
+      expect(siblingScript).toMatch(GITDIR_GREP);
     });
   });
 

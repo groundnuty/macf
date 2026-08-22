@@ -82,21 +82,27 @@
 # missing — a surface that was never damaged, just never present in that
 # checkout.
 #
-# DISCRIMINATOR: reused verbatim from groundnuty/macf#1042 / #1113
-# (`macf-startup-pickup.sh`'s own linked-worktree no-op), not re-derived —
-# two independent implementations of "am I a worker" would drift silently.
-# `.git` is a property of the CHECKOUT, not the environment: git writes a
-# FILE (a `gitdir: ...` pointer) for a linked worktree and a real DIRECTORY
-# for the primary checkout. Unlike `MACF_AGENT_TYPE`, `CLAUDE_CODE_CHILD_
-# SESSION`, or `$TMUX` — all three verified (in #1042) to be inherited
-# byte-for-byte into a worker, because the spawner forks the parent's full
-# environment — `.git`'s shape cannot be inherited across a fork; it is
-# read fresh from whatever directory the check runs in. THE PREMISE THIS
-# RESTS ON (stated explicitly, as #1113 did): a permanent agent's registered
-# workspace is ALWAYS the primary clone — no supported pattern in this repo
-# runs a permanent fleet agent out of a linked worktree. If that ever stops
-# being true, this check breaks and needs revisiting alongside whatever
-# introduces the exception.
+# DISCRIMINATOR: the SAME predicate as groundnuty/macf#1042 / #1113
+# (`macf-startup-pickup.sh`'s own linked-worktree no-op) — adapted to this
+# file's single-bracket `[ ]` style (vs. that script's `[[ ]]`), but not
+# re-derived: two independent implementations of "am I a worker" would
+# drift silently. `.git` is a property of the CHECKOUT, not the
+# environment: git writes a FILE (a `gitdir: ...` pointer) for a linked
+# worktree and a real DIRECTORY for the primary checkout. Unlike
+# `MACF_AGENT_TYPE`, `CLAUDE_CODE_CHILD_SESSION`, or `$TMUX` — all three
+# verified (in #1042) to be inherited byte-for-byte into a worker, because
+# the spawner forks the parent's full environment — `.git`'s shape cannot
+# be inherited across a fork; it is read fresh from whatever directory the
+# check runs in. THE PREMISE THIS RESTS ON (stated explicitly, as #1113
+# did): a permanent agent's registered workspace is ALWAYS the primary
+# clone — no supported pattern in this repo runs a permanent fleet agent
+# out of a linked worktree. If that ever stops being true, this check
+# breaks and needs revisiting alongside whatever introduces the exception.
+# (A git SUBMODULE's `.git` is also a `gitdir: ...` pointer file — a third
+# shape matching this marker, neither a linked worktree nor a primary
+# clone. #1113 carries the identical exposure; noting it here rather than
+# changing behavior, since no supported pattern runs a permanent agent out
+# of a submodule checkout either.)
 #
 # FAIL-OPEN DIRECTION IS INVERTED FROM #1042 — same discriminator, OPPOSITE
 # conclusion, and it must be reasoned here, not inherited: #1042's hook
