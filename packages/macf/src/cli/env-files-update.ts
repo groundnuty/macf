@@ -30,8 +30,8 @@
  *
  * **Invariant**: this module never deletes operator state. Macf-managed
  * files are overwritten only with the (single source of truth)
- * generator output; operator-managed files (env.telemetry, env.tmux)
- * are preserved unconditionally once they exist; settings.local.json
+ * generator output; operator-managed files (env.telemetry, env.tmux,
+ * env.project-rules) are preserved unconditionally once they exist; settings.local.json
  * is read-only here (the deprecation warning surfaces them, but no
  * automatic JSON-key migration in this PR — the risk surface is too
  * broad for one change. Operators see the warning and migrate by hand).
@@ -39,14 +39,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import {
-  generateEnvCerts,
-  generateEnvGitHub,
-  generateEnvHelpers,
-  generateEnvIdentity,
-  generateEnvProjectRules,
-  generateEnvRegistry,
-  generateEnvTelemetry,
-  generateEnvTmux,
+  MANAGED_ENV_FILES,
+  OPERATOR_ENV_FILES,
   writeEnvFiles,
 } from './env-files.js';
 import { writeClaudeSh } from './claude-sh.js';
@@ -55,29 +49,14 @@ import type { MacfAgentConfig } from './config.js';
 // ---------------------------------------------------------------------------
 // File classification
 // ---------------------------------------------------------------------------
-
-/**
- * The set of macf-managed env files. These are overwritten on every
- * `macf update` to match the single source of truth in env-files.ts.
- * Hand-edits are detected (content drift vs fresh generator output),
- * warned about, and replaced.
- *
- * Order matches the canonical source-loop expansion in claude.sh:
- * env._helpers FIRST (underscore prefix sorts before letters so its
- * functions are defined before any caller), then alphabetical.
- */
-type ManagedEnvFile = {
-  readonly name: string;
-  readonly generate: (config: MacfAgentConfig) => string;
-};
-
-const MANAGED_ENV_FILES: readonly ManagedEnvFile[] = [
-  { name: 'env._helpers', generate: () => generateEnvHelpers() },
-  { name: 'env.identity', generate: generateEnvIdentity },
-  { name: 'env.github', generate: generateEnvGitHub },
-  { name: 'env.certs', generate: generateEnvCerts },
-  { name: 'env.registry', generate: generateEnvRegistry },
-];
+//
+// `MANAGED_ENV_FILES` + `OPERATOR_ENV_FILES` are defined ONCE in
+// env-files.ts and imported here (macf#1116) — this module used to carry
+// its own copy of the exact same classification, and `writeEnvFiles`
+// (init's counterpart, also in env-files.ts) carried none at all. Two
+// independent classifications of the same 8-file set drift silently the
+// moment a 9th env file is added to one but not the other; importing the
+// shared arrays makes that structurally impossible.
 
 /**
  * Compute what `refreshEnvFiles` WOULD write for one of the 5 macf-managed
@@ -95,21 +74,6 @@ export function computeCanonicalEnvFileContent(name: string, config: MacfAgentCo
   const entry = MANAGED_ENV_FILES.find((f) => f.name === name);
   return entry ? entry.generate(config) : null;
 }
-
-/**
- * The set of operator-managed env files. Bootstrap-write on first
- * `macf update` if absent, then preserved unconditionally on subsequent
- * runs — operator's edits are theirs to own. The `generate` function
- * is only called when the file doesn't exist yet.
- */
-const OPERATOR_ENV_FILES: readonly ManagedEnvFile[] = [
-  { name: 'env.telemetry', generate: generateEnvTelemetry },
-  { name: 'env.tmux', generate: generateEnvTmux },
-  // env.project-rules carries MACF_PROJECT_RULES_SOURCE (macf#501) — an
-  // operator-set per-deployment config. Bootstrap-write once, then preserve:
-  // `macf update` must NOT clobber an operator's source value.
-  { name: 'env.project-rules', generate: generateEnvProjectRules },
-];
 
 // ---------------------------------------------------------------------------
 // refreshEnvFiles — primary update-time refresh routine
@@ -308,6 +272,18 @@ export function migrateMonolithicClaudeSh(
   }
 
   // Monolithic detected. Migrate.
+  //
+  // writeEnvFiles now preserves a pre-existing operator-managed file
+  // (env.telemetry / env.tmux / env.project-rules) instead of overwriting
+  // it (macf#1116). A monolithic→thin migration is, by construction, a
+  // workspace's FIRST transition to the multi-file `.claude/.macf/env.*`
+  // layout — no env.* file exists yet in the normal case, so this branch
+  // is unreachable in practice (confirmed: no migration test pre-seeds one).
+  // In the atypical case where a partial/prior migration left an
+  // operator-managed file on disk already, preserving it is the safer
+  // outcome anyway — an operator's OTLP endpoint / tmux target / project-
+  // rules source surviving a migration is no less correct than a fresh
+  // bake, and is what every OTHER call site of writeEnvFiles now does.
   writeEnvFiles(absDir, config);
   writeClaudeSh(absDir, config);
   return { migrated: true };
