@@ -69,7 +69,14 @@ describe('ROLL_TOUCHED_CONFIG_PATTERNS (DR-040 Decision 6, macf#698)', () => {
 
 // --- fixtures ---------------------------------------------------------------
 
-function mkHealth(version: string): HealthResponse {
+/**
+ * `instanceId` is OPTIONAL + omitted-not-null when absent (follow-up to
+ * macf#899) — matches the real `HealthResponse` schema's
+ * `.nullable().optional()` `instance_id`, and lets every EXISTING test in
+ * this suite (none of which pass one) keep exercising the "no instance-id
+ * data" fallback path unchanged.
+ */
+function mkHealth(version: string, instanceId?: string): HealthResponse {
   return {
     agent: 'a',
     status: 'online',
@@ -78,19 +85,20 @@ function mkHealth(version: string): HealthResponse {
     current_issue: null,
     version,
     last_notification: null,
+    ...(instanceId !== undefined ? { instance_id: instanceId } : {}),
   };
 }
 
-/** Build a `FleetState` from `[name, version|null, online?]` tuples. */
-function mkState(rows: readonly [string, string | null, boolean?][]): FleetState {
+/** Build a `FleetState` from `[name, version|null, online?, instanceId?]` tuples. */
+function mkState(rows: readonly [string, string | null, boolean?, string?][]): FleetState {
   return {
-    agents: rows.map(([name, version, online = true]) => ({
+    agents: rows.map(([name, version, online = true, instanceId]) => ({
       name,
       host: 'h',
       port: 1,
       online,
       version,
-      health: online && version ? mkHealth(version) : null,
+      health: online && version ? mkHealth(version, instanceId) : null,
     })),
   };
 }
@@ -1103,6 +1111,138 @@ describe('rollFleet', () => {
     });
   });
 
+  describe('not-yet-serving discrimination (follow-up to macf#899 — a live 0.2.58 roll: an agent parked at an unanswered launch prompt reported "bad-release CONFIRMED" though nothing was broken)', () => {
+    // Both agents carry a PRE-restart instance_id (mkState's new 4th tuple
+    // slot) — this is what lets `classifyHalt` prove whether the SAME
+    // process is still answering /health after the roll's own restart().
+    const twoBehindWithInstances = planFleetUpgrade(
+      [mkWs('a1', 'g', '0.2.40'), mkWs('a2', 'g', '0.2.40')],
+      mkState([
+        ['a1', '0.2.40', true, 'inst-a1-old'],
+        ['a2', '0.2.40', true, 'inst-a2-old'],
+      ]),
+      '0.2.41',
+    );
+
+    it('DECISIVE (agent-not-yet-serving): SAME instance_id before/after restart — NOT bad-release, NOT halted, a2 still rolls, pin never consulted', async () => {
+      const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
+      const { verifyGreen, seen } = makeVerify({
+        // The exact live-incident shape: reachable the whole verify-green
+        // budget, still reporting the OLD version — but the instance_id
+        // PROVES it's the SAME pre-restart process, not a fresh one.
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40', lastInstanceId: 'inst-a1-old' },
+        // a2 rolls clean (default `{ ok: true }`).
+      });
+      const events: UpgradeEvent[] = [];
+      const res = await rollFleet(twoBehindWithInstances, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+        onEvent: (ev) => events.push(ev),
+      });
+      // NOT halted — the roll must proceed past a1 to a2 (mirrors stale-pin's
+      // non-halting shape, but for a different cause).
+      expect(res.halted).toBe(false);
+      expect(calls.upgrade).toEqual(['a1', 'a2']);
+      expect(seen).toEqual(['a1', 'a2']);
+      // The not-yet-serving gate fires BEFORE the pin-check — the pin is
+      // never even read for a1.
+      expect(calls.readVersionPin).toEqual([]);
+      expect(res.notYetServingSkipped).toBe(1);
+      expect(res.upgraded).toBe(1); // a2
+      expect(res.results).toHaveLength(2);
+      expect(res.results[0]).toMatchObject({
+        agent: 'a1',
+        outcome: 'not-yet-serving-skipped',
+        reason: 'not-yet-serving',
+      });
+      expect(res.results[0]!.detail).toContain('not-yet-serving');
+      expect(res.results[0]!.detail).toContain('inst-a1-old');
+      // The whole point of this issue: CONFIRMED is reserved for states
+      // actually confirmed — this is an honest unknown.
+      expect(res.results[0]!.detail).not.toContain('CONFIRMED');
+      expect(res.results[1]).toMatchObject({ agent: 'a2', outcome: 'upgraded' });
+      // Same lock posture as stale-pin-skipped: heartbeat stops, lock is NOT
+      // released for a1 (not confirmed clean); a2's clean roll DOES release.
+      expect(calls.stopHeartbeat).toEqual(['a1', 'a2']);
+      expect(calls.releaseLock).toEqual(['a2']);
+      const skipEvent = events.find((e) => e.kind === 'not-yet-serving-skip');
+      expect(skipEvent).toMatchObject({ kind: 'not-yet-serving-skip', agent: 'a1', instanceId: 'inst-a1-old' });
+    });
+
+    it('DECISIVE (genuinely-wrong-version-after-serving): DIFFERENT instance_id after restart, still old version — STILL bad-release, STILL halts (per assert-the-wrong-path.md, the one-directional control)', async () => {
+      // A FRESH post-restart process (proven by a DIFFERENT instance_id) is
+      // ALSO reporting the old version — a real anomaly, not the pre-restart
+      // process lingering. The not-yet-serving gate must NOT swallow this;
+      // it must fall through to the EXISTING pin-check and HALT exactly as
+      // macf#899 already did. Without this control, a broken implementation
+      // that skips ANY agent carrying instance_id data (rather than checking
+      // for EQUALITY) would pass the sibling test above too.
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        launchPin: (agent) => (agent === 'a1' ? '0.2.41' : null),
+      });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40', lastInstanceId: 'inst-a1-NEW' },
+      });
+      const res = await rollFleet(twoBehindWithInstances, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.halted).toBe(true);
+      expect(calls.upgrade).toEqual(['a1']); // a2 never reached
+      expect(calls.readVersionPin).toEqual(['a1']); // the pin-check DID run
+      expect(res.notYetServingSkipped).toBe(0);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted', reason: 'bad-release' });
+      expect(res.results[0]!.detail).toContain('bad-release');
+      expect(res.results[0]!.detail).toContain('CONFIRMED');
+      expect(calls.releaseLock).toEqual([]);
+    });
+
+    it('instance_id data unavailable on the post-restart side falls through to the pin-check UNCHANGED (older/mixed-version fleet, backward-compat)', async () => {
+      // The plan HAS a pre-restart instance_id, but verify-green's failure
+      // carries none (an older channel-server on the relaunched side, or a
+      // body that predates the field) — must fall through exactly as before
+      // this follow-up existed, never a false not-yet-serving positive from
+      // partial data.
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        launchPin: (agent) => (agent === 'a1' ? '0.2.41' : null),
+      });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40' }, // no lastInstanceId
+      });
+      const res = await rollFleet(twoBehindWithInstances, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.halted).toBe(true);
+      expect(calls.readVersionPin).toEqual(['a1']);
+      expect(res.notYetServingSkipped).toBe(0);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted', reason: 'bad-release' });
+      expect(res.results[0]!.detail).toContain('CONFIRMED');
+    });
+
+    it('relaunch-unconfirmed does NOT consult instance_id at all — the discriminator only applies to the CONFIRMED-old-version precondition', async () => {
+      const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'unreachable', lastVersion: null, lastInstanceId: 'inst-a1-old' },
+      });
+      const res = await rollFleet(twoBehindWithInstances, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.halted).toBe(true);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted', reason: 'relaunch-unconfirmed' });
+      expect(calls.readVersionPin).toEqual([]);
+    });
+  });
+
   it('HALTS with reason relaunch-unconfirmed when verify-green times out unreachable (down the whole grace) — later agents are NOT touched', async () => {
     const { driver, calls } = makeDriver({ state: mkState([]), workspaces: [] });
     const { verifyGreen, seen } = makeVerify({
@@ -1586,6 +1726,45 @@ describe('upgradeFleets', () => {
     expect(calls.upgrade).toEqual(['a']); // fleet-2's 'b' never rolled
     expect(resolveCount).toBe(1); // resolveDriver called for fleet-1 only
     expect(report.fleets).toHaveLength(1); // fleet-2 report absent (loop broke)
+  });
+
+  it('a not-yet-serving skip in fleet-1 does NOT stop the run — fleet-2 STILL starts (follow-up to macf#899)', async () => {
+    // The exact AC this issue adds: not-yet-serving must not halt LATER
+    // fleets, unlike a genuine bad-release above. fleet-1's 'a' carries a
+    // pre-restart instance_id that verify-green's failure echoes back
+    // unchanged — proof the SAME process is still answering, not a fresh
+    // one running broken code.
+    const stateWithInstance = mkState([
+      ['a', '0.2.40', true, 'inst-a-old'],
+      ['b', '0.2.40'],
+    ]);
+    const { driver, calls } = makeDriver({ state: stateWithInstance, workspaces });
+    let resolveCount = 0;
+    const report = await upgradeFleets(
+      ['fleet-1', 'fleet-2'],
+      { execute: true, targetVersion: '0.2.41', verifyTimeoutMs: 1000 },
+      deps(driver, {
+        resolveDriver: async () => {
+          resolveCount += 1;
+          return driver;
+        },
+        verifyGreen: async (o) =>
+          o.agent === 'a'
+            ? { ok: false, reason: 'wrong-version', lastVersion: '0.2.40', lastInstanceId: 'inst-a-old' }
+            : { ok: true, version: o.targetVersion },
+      }),
+    );
+    expect(report.halted).toBe(false);
+    expect(calls.upgrade).toEqual(['a', 'b']); // fleet-2's 'b' STILL rolled
+    expect(resolveCount).toBe(2); // resolveDriver called for BOTH fleets
+    expect(report.fleets).toHaveLength(2);
+    expect(report.fleets[0]!.rolled).toMatchObject({ halted: false, notYetServingSkipped: 1 });
+    expect(report.fleets[0]!.rolled!.results[0]).toMatchObject({
+      agent: 'a',
+      outcome: 'not-yet-serving-skipped',
+      reason: 'not-yet-serving',
+    });
+    expect(report.fleets[1]!.rolled).toMatchObject({ halted: false, upgraded: 1 });
   });
 
   it('skips + reports an unresolvable fleet WITHOUT halting the run', async () => {

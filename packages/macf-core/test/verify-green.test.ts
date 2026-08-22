@@ -21,6 +21,11 @@ function mkHealth(version: string): HealthResponse {
   };
 }
 
+/** Same as `mkHealth`, plus `instance_id` (follow-up to macf#899 — DR-037 Decision 5). */
+function mkHealthWithInstance(version: string, instanceId: string): HealthResponse {
+  return { ...mkHealth(version), instance_id: instanceId };
+}
+
 /**
  * Build deps with a queued probe sequence + a virtual clock. Each `probe()`
  * shifts the next value off `sequence` (repeating the LAST value once drained so
@@ -128,5 +133,72 @@ describe('verifyGreen', () => {
       deps,
     );
     expect(r).toEqual({ ok: false, reason: 'wrong-version', lastVersion: '' });
+  });
+
+  // --- lastInstanceId (follow-up to macf#899) -------------------------------
+
+  it('carries the LAST reachable instance_id through on a wrong-version failure', async () => {
+    const { deps } = makeDeps([mkHealthWithInstance('0.2.40', 'inst-A')]);
+    const r = await verifyGreen(
+      { agent: 'code-agent', targetVersion: '0.2.41', timeoutMs: 100, intervalMs: 50 },
+      deps,
+    );
+    expect(r).toEqual({
+      ok: false,
+      reason: 'wrong-version',
+      lastVersion: '0.2.40',
+      lastInstanceId: 'inst-A',
+    });
+  });
+
+  it('DECISIVE: lastInstanceId is CLEARED (not latched) once a later probe goes unreachable — an old process answering once then dying must NOT read as "still there"', async () => {
+    // The advisor-caught inversion this pins: old process answers probe 1
+    // (about to be killed), then goes silent — a FRESH process could have
+    // started and crash-looped before ever answering /health, which is a
+    // genuine bad release, not "the old process is still around." If
+    // `lastInstanceId` latched the way `lastVersion` deliberately does, a
+    // caller comparing it against the pre-restart id would wrongly conclude
+    // "same process, not-yet-serving" for what is actually a crash-on-start
+    // release — the exact silent-fallback this issue exists to prevent.
+    const { deps, probeCalls } = makeDeps([mkHealthWithInstance('0.2.40', 'inst-A'), null]);
+    const r = await verifyGreen(
+      { agent: 'code-agent', targetVersion: '0.2.41', timeoutMs: 60, intervalMs: 50 },
+      deps,
+    );
+    // `lastVersion` DOES still latch (documented, unchanged contract) —
+    // reason is 'wrong-version' (reachedOnce stays true), and the stale old
+    // version is still reported. `lastInstanceId`, by contrast, must be gone.
+    expect(r).toEqual({ ok: false, reason: 'wrong-version', lastVersion: '0.2.40' });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.lastInstanceId).toBeUndefined();
+    expect(probeCalls()).toBeGreaterThan(1); // proves the unreachable probe(s) actually ran
+  });
+
+  it('lastInstanceId is absent (not a false null) when no reachable probe ever carried instance_id', async () => {
+    // No existing test in this file populates `instance_id` — this pins that
+    // the field is genuinely OMITTED (not coerced to `null`) for a body that
+    // predates it, distinct from `health.instance_id === null` ("field
+    // present, explicitly no value"). The 5 pre-existing `toEqual` assertions
+    // above (none of which include `lastInstanceId`) already depend on this.
+    const { deps } = makeDeps([mkHealth('0.2.40')]);
+    const r = await verifyGreen(
+      { agent: 'code-agent', targetVersion: '0.2.41', timeoutMs: 100, intervalMs: 50 },
+      deps,
+    );
+    // `toEqual` treats an `undefined`-valued property as equivalent to
+    // absent — this is the SAME assertion shape the 5 pre-existing tests
+    // above (none of which populate `instance_id`) already depend on.
+    expect(r).toEqual({ ok: false, reason: 'wrong-version', lastVersion: '0.2.40' });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.lastInstanceId).toBeUndefined();
+  });
+
+  it('unreachable-the-whole-time never populates lastInstanceId', async () => {
+    const { deps } = makeDeps([null]);
+    const r = await verifyGreen(
+      { agent: 'code-agent', targetVersion: '0.2.41', timeoutMs: 100, intervalMs: 50 },
+      deps,
+    );
+    expect(r).toEqual({ ok: false, reason: 'unreachable', lastVersion: null });
   });
 });

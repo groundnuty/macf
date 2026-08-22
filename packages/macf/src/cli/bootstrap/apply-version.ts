@@ -127,9 +127,10 @@ export interface ApplyVersionPhaseResult {
   readonly totalMembers?: number;
   /**
    * groundnuty/macf#1053 — non-zero pre-flight skip-category counts
-   * (off-canonical-branch / config-dirty / busy / stale-pin) explaining WHY
-   * a member that WAS behind target still didn't roll, in priority order.
-   * Empty when nothing was behind target at all (see {@link totalMembers}).
+   * (off-canonical-branch / config-dirty / busy / not-yet-serving / stale-pin)
+   * explaining WHY a member that WAS behind target still didn't roll, in
+   * priority order. Empty when nothing was behind target at all (see
+   * {@link totalMembers}).
    */
   readonly skipBreakdown?: readonly string[];
   /**
@@ -149,9 +150,10 @@ export interface ApplyVersionPhaseResult {
  * groundnuty/macf#1053 — non-zero pre-flight skip-category counts from one
  * fleet's EXECUTE-mode roll result, in priority order (mirrors the gate
  * ORDER `rollFleet` itself applies: branch, then config-dirty, then busy,
- * then stale-pin). Pure; only counts a member once (each `behind` plan
- * produces exactly one `AgentRollResult`, `rollFleet`'s own invariant), so
- * the parts never double-count.
+ * then — POST-flight, once verify-green fails — not-yet-serving before
+ * stale-pin, matching `classifyHalt`'s own check order). Pure; only counts a
+ * member once (each `behind` plan produces exactly one `AgentRollResult`,
+ * `rollFleet`'s own invariant), so the parts never double-count.
  */
 export function versionRollSkipBreakdown(rolled: FleetRollResult): readonly string[] {
   const parts: string[] = [];
@@ -159,6 +161,7 @@ export function versionRollSkipBreakdown(rolled: FleetRollResult): readonly stri
   if (rolled.configDirtySkipped > 0) parts.push(`${String(rolled.configDirtySkipped)} config-dirty`);
   if (rolled.busySkipped > 0) parts.push(`${String(rolled.busySkipped)} busy`);
   if (rolled.stalePinSkipped > 0) parts.push(`${String(rolled.stalePinSkipped)} stale-pin`);
+  if (rolled.notYetServingSkipped > 0) parts.push(`${String(rolled.notYetServingSkipped)} not-yet-serving`);
   return parts;
 }
 
@@ -274,6 +277,8 @@ export function formatVersionRollEvent(ev: UpgradeEvent): string {
       return `${ev.agent}: HALT — verify-green ${ev.reason} (last=${ev.lastVersion ?? 'down'})`;
     case 'stale-pin-skip':
       return `${ev.agent}: STALE-PIN — skip + CONTINUE (launch pin @${ev.pin} != target @${ev.target})`;
+    case 'not-yet-serving-skip':
+      return `${ev.agent}: NOT-YET-SERVING — skip + CONTINUE (same instance ${ev.instanceId} still answering)`;
     case 'lock-write-failed':
       return `${ev.agent}: fleet.lock deployed_version write FAILED (non-fatal) — ${ev.error}`;
   }

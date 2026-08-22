@@ -214,6 +214,7 @@ describe('formatPlanTable', () => {
       agent: state.agents[i]!.name,
       fleet: 'g',
       runningVersion: state.agents[i]!.version,
+      runningInstanceId: null,
       pinnedVersion: '0.2.40',
       disposition: (['behind', 'at-target', 'offline'] as const)[i]!,
     }));

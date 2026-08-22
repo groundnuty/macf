@@ -219,7 +219,11 @@ export function formatFleetReport(report: FleetPlanReport, target: string, log: 
             // macf#899 — POST-mutation but still safe-to-continue (unlike
             // 'halted' below): a stale launch pin explains the old-version
             // state without implicating the release.
-            r.outcome === 'stale-pin-skipped'
+            r.outcome === 'stale-pin-skipped' ||
+            // Follow-up to macf#899 — same posture: the SAME pre-restart
+            // process instance is still answering /health (relaunch hasn't
+            // taken over yet), not a bad release.
+            r.outcome === 'not-yet-serving-skipped'
           ? '•'
           : '✗';
     log(`    ${mark} ${r.agent} — ${r.outcome}${r.detail ? ` (${r.detail})` : ''}`);
@@ -394,6 +398,16 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
       log(
         `   ${ev.agent}: STALE-PIN — skip + CONTINUE (launch pin @${ev.pin} != target ` +
         `@${ev.target}; fix ${ev.agent}'s launch pin, not the release)`,
+      );
+      break;
+    case 'not-yet-serving-skip':
+      // Follow-up to macf#899 — the agent WAS mutated but the SAME
+      // pre-restart process instance is still answering /health: its
+      // relaunch simply hasn't taken over serving yet, not a bad release.
+      // Skip it and CONTINUE (distinct from HALT above).
+      log(
+        `   ${ev.agent}: NOT-YET-SERVING — skip + CONTINUE (same instance ${ev.instanceId} still ` +
+        `answering; clear ${ev.agent}'s launch prompt if one is pending, then re-run the upgrade)`,
       );
       break;
     case 'fleet-skipped':

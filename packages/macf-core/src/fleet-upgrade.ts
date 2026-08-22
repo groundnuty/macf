@@ -112,6 +112,16 @@ export interface AgentUpgradePlan {
   readonly fleet: string;
   /** The agent's live self-reported `/health.version`, or `null` when offline/version-less. */
   readonly runningVersion: string | null;
+  /**
+   * The agent's live self-reported `/health.instance_id` (DR-030 phase-1 mesh
+   * self-report; DR-037 Decision 5 mints a NEW one on every relaunch), or
+   * `null` when offline or reporting a body that predates the field. Captured
+   * at PLAN time so `classifyHalt` can later tell "the SAME process is still
+   * answering /health after the restart" (an honest not-yet-serving unknown)
+   * apart from "a genuinely NEW process is serving the wrong version" (a
+   * confirmed bad release) — see `classifyHalt`'s doc.
+   */
+  readonly runningInstanceId: string | null;
   /** The workspace's on-disk version pin (legible even when the agent is dead). */
   readonly pinnedVersion: string | null;
   /** The version-only disposition (see `UpgradeDisposition`). */
@@ -146,6 +156,18 @@ export interface AgentUpgradePlan {
  *                             ran) but its stale-old-pin state endangers no
  *                             OTHER agent, so `rollFleet` skips it and moves
  *                             on to the next agent in the SAME fleet.
+ * - `not-yet-serving-skipped` — (NEW, follow-up to macf#899) verify-green
+ *                             confirmed the agent REACHABLE at its OLD
+ *                             version, but the responder is PROVEN to be the
+ *                             SAME pre-restart process instance (not a fresh
+ *                             one) — `reason: 'not-yet-serving'` (see
+ *                             `HaltReason`). The agent's own relaunch simply
+ *                             hasn't taken over serving yet (a common cause
+ *                             is an unanswered interactive launch prompt);
+ *                             this is an honest UNKNOWN, not a confirmed bad
+ *                             release, and — like `stale-pin-skipped` —
+ *                             endangers no OTHER agent, so `rollFleet` skips
+ *                             it and continues.
  * - `halted`                — verify-green did NOT confirm the target version,
  *                             and the cause is either a confirmed/unverifiable
  *                             bad release or a genuinely unconfirmed relaunch;
@@ -154,14 +176,15 @@ export interface AgentUpgradePlan {
  *
  * The three pre-flight skip outcomes (`busy-skipped` / `config-dirty-skipped`
  * / `branch-skipped`) are safe to continue past because the agent was NEVER
- * mutated. `stale-pin-skipped` (macf#899) IS safe to continue past DESPITE the
- * agent having been mutated, because the specific cause (a stale LAUNCH pin)
- * is a property of this one workspace's launch config, not of the release —
- * see `HaltReason`'s `stale-pin` doc for the full reasoning. `halted` is
- * always terminal because the agent WAS rolled and its post-restart state is
- * either confirmed-bad, unverifiable, or unconfirmed — none of those three are
- * safe to leave behind while moving on to the next agent (macf#722 Fix A,
- * extended by macf#899).
+ * mutated. `stale-pin-skipped` (macf#899) and `not-yet-serving-skipped` ARE
+ * safe to continue past DESPITE the agent having been mutated, because each
+ * specific cause (a stale LAUNCH pin; a not-yet-superseded pre-restart
+ * process) is a property of THIS one workspace, not of the release — see
+ * `HaltReason`'s `stale-pin` / `not-yet-serving` docs for the full reasoning.
+ * `halted` is always terminal because the agent WAS rolled and its
+ * post-restart state is either confirmed-bad, unverifiable, or unconfirmed —
+ * none of those three are safe to leave behind while moving on to the next
+ * agent (macf#722 Fix A, extended by macf#899).
  */
 export type RollOutcome =
   | 'upgraded'
@@ -169,13 +192,17 @@ export type RollOutcome =
   | 'config-dirty-skipped'
   | 'branch-skipped'
   | 'stale-pin-skipped'
+  | 'not-yet-serving-skipped'
   | 'halted';
 
 /**
  * WHY a roll's verify-green did not confirm the target version:
  * - `bad-release`           — verify-green confirmed the agent came back up
- *                             REACHABLE at its OLD (pre-upgrade) version, AND
- *                             (macf#899) its own launch pin either already
+ *                             REACHABLE at its OLD (pre-upgrade) version, the
+ *                             responder is NOT provably the lingering
+ *                             pre-restart process (see `not-yet-serving`
+ *                             below — ruled out FIRST, `classifyHalt`'s doc),
+ *                             AND (macf#899) its own launch pin either already
  *                             matches the target (a genuine crash-loop /
  *                             stuck-old-process release) or could not be
  *                             read at all (honest-unknown, treated
@@ -205,8 +232,36 @@ export type RollOutcome =
  *                             because a stale launch pin on one workspace says
  *                             nothing about the release quality and endangers
  *                             no other agent.
+ * - `not-yet-serving`       — (NEW, follow-up to macf#899) verify-green
+ *                             confirmed the agent REACHABLE at its OLD
+ *                             version, AND the exact same `instance_id` is
+ *                             still answering `/health` as answered BEFORE
+ *                             this roll's own `restart()` call (DR-037
+ *                             Decision 5 mints a fresh `instance_id` per
+ *                             relaunch, so an unchanged one PROVES the
+ *                             pre-restart process was never superseded) — the
+ *                             agent's relaunch simply hasn't taken over
+ *                             serving yet. A common cause is an unanswered
+ *                             interactive launch prompt (Claude Code's trust
+ *                             dialog or the dev-channels confirmation), but
+ *                             this decision layer never touches tmux/
+ *                             capture-pane (DR-037), so it reports the STATE
+ *                             observed (same instance still live), not a
+ *                             confirmed CAUSE. Honest UNKNOWN, never
+ *                             `CONFIRMED` bad-release wording — same floor as
+ *                             `bad-release`'s pin-unreadable case. NOT
+ *                             terminal; `outcome: 'not-yet-serving-skipped'`
+ *                             — `rollFleet` skips this ONE agent and
+ *                             CONTINUES: a slow-to-take-over relaunch on one
+ *                             workspace endangers no other agent, and later
+ *                             fleets are never halted for it. Only reachable
+ *                             when BOTH the pre-restart and post-restart
+ *                             `/health` bodies carry an `instance_id` — an
+ *                             older/mixed-version fleet without that field
+ *                             falls straight through to the `bad-release` /
+ *                             `stale-pin` pin-check below, UNCHANGED.
  */
-export type HaltReason = 'bad-release' | 'relaunch-unconfirmed' | 'stale-pin';
+export type HaltReason = 'bad-release' | 'relaunch-unconfirmed' | 'stale-pin' | 'not-yet-serving';
 
 /** The per-agent EXECUTE result. `detail` carries a human-readable summary. */
 export interface AgentRollResult {
@@ -214,7 +269,8 @@ export interface AgentRollResult {
   readonly outcome: RollOutcome;
   /**
    * Set when `outcome === 'halted'` OR `outcome === 'stale-pin-skipped'`
-   * (macf#899 added the latter) — see `HaltReason`.
+   * (macf#899 added the latter) OR `outcome === 'not-yet-serving-skipped'`
+   * (NEW, follow-up to macf#899) — see `HaltReason`.
    */
   readonly reason?: HaltReason;
   readonly detail?: string;
@@ -396,6 +452,15 @@ export interface FleetRollResult {
    * skip counters above, but still safe to continue past — see `HaltReason`.
    */
   readonly stalePinSkipped: number;
+  /**
+   * Count of agents skipped because verify-green confirmed them REACHABLE
+   * at their OLD version but the responder was PROVEN to be the SAME
+   * pre-restart process instance (`reason: 'not-yet-serving'`, NEW —
+   * follow-up to macf#899) — POST-flight, like `stalePinSkipped`, but the
+   * agent's relaunch simply hasn't taken over serving yet rather than
+   * anything about its launch pin.
+   */
+  readonly notYetServingSkipped: number;
 }
 
 /** Progress events for CLI rendering (the RESULT objects are what tests assert on). */
@@ -473,6 +538,16 @@ export type UpgradeEvent =
    */
   | { readonly kind: 'stale-pin-skip'; readonly agent: string; readonly pin: string; readonly target: string }
   /**
+   * The POST-restart NOT-YET-SERVING skip (NEW, follow-up to macf#899) —
+   * verify-green confirmed the agent reachable at its OLD version, but the
+   * SAME `instanceId` answered before AND after this roll's own `restart()`
+   * call — the relaunch hasn't taken over serving yet, so `rollFleet` skips
+   * this agent (NOT a halt) and continues to the next one. Distinct from
+   * `stale-pin-skip`: the cause here is a not-yet-superseded process, never
+   * the launch pin (which is never even consulted on this path).
+   */
+  | { readonly kind: 'not-yet-serving-skip'; readonly agent: string; readonly instanceId: string }
+  /**
    * DR-043 §D6 write-back (macf#907) — `deps.recordDeployedVersion` (the
    * confirmed-green `fleet.lock` write) rejected. NON-FATAL: `outcome` for
    * this agent is still `'upgraded'` (the roll's job — mutate + confirm
@@ -497,6 +572,12 @@ export function planFleetUpgrade(
   return members.map((m) => {
     const live = byName.get(m.agent);
     const runningVersion = live?.online ? (live.version ?? null) : null;
+    // NEW (follow-up to macf#899) — captured alongside `runningVersion` so
+    // `classifyHalt` can later tell "the SAME process is still answering
+    // /health post-restart" (not-yet-serving) apart from "a genuinely NEW
+    // process is serving the wrong version" (bad-release). `null` when
+    // offline or the `/health` body predates the field.
+    const runningInstanceId = live?.online ? (live.health?.instance_id ?? null) : null;
     let disposition: UpgradeDisposition;
     if (runningVersion === null) {
       disposition = 'offline';
@@ -509,6 +590,7 @@ export function planFleetUpgrade(
       agent: m.agent,
       fleet: m.project,
       runningVersion,
+      runningInstanceId,
       pinnedVersion: m.versionPin,
       disposition,
     };
@@ -601,7 +683,8 @@ async function waitForIdle(agent: string, opts: RollFleetOptions, deps: RollFlee
 type HaltClassification =
   | { readonly reason: 'relaunch-unconfirmed'; readonly detail: string }
   | { readonly reason: 'bad-release'; readonly detail: string; readonly pin: string | null }
-  | { readonly reason: 'stale-pin'; readonly detail: string; readonly pin: string };
+  | { readonly reason: 'stale-pin'; readonly detail: string; readonly pin: string }
+  | { readonly reason: 'not-yet-serving'; readonly detail: string; readonly instanceId: string };
 
 /**
  * Classify a failed verify-green against the agent's PRE-upgrade running
@@ -651,10 +734,37 @@ type HaltClassification =
  *   be read, so the reason string alone is never mistaken for a positively
  *   confirmed diagnosis, and the operator's remedy is "check the launch
  *   pin/mount," not "assume the release is broken."
+ *
+ * ## The not-yet-serving discriminator (NEW, follow-up to macf#899)
+ *
+ * The 0.2.58 roll incident this follow-up is grounded in showed the
+ * `pin === targetVersion` branch ABOVE still overstates: it fires unconditional
+ * `CONFIRMED` wording even when the agent simply hasn't finished relaunching
+ * (e.g. sitting at an unanswered interactive launch prompt) — the SAME
+ * pre-restart process was still the one answering `/health` for the whole
+ * verify-green budget, which looks IDENTICAL to a genuine crash-loop from the
+ * version comparison alone. `restart-self` mints a NEW `instance_id` on every
+ * relaunch (DR-037 Decision 5) precisely so this is checkable: if the
+ * `instance_id` verify-green saw on its MOST RECENT probe — `lastInstanceId`
+ * is cleared on any unreachable probe, never latched like `lastVersion`, see
+ * `verify-green.ts` — is the EXACT SAME one recorded before this roll's own
+ * `restart()` call, the responder is PROVEN to be STILL CONTINUOUSLY the
+ * lingering pre-restart process — not a fresh one running broken code. That
+ * is `not-yet-serving`: an honest UNKNOWN (this decision layer never touches
+ * tmux/capture-pane, so it cannot confirm WHY the relaunch stalled, only
+ * THAT it has), reported and skipped, never a `CONFIRMED` bad-release. Ruled
+ * out FIRST, before the pin-check, because a not-yet-superseded process makes
+ * the pin question moot — the pin can only describe what the process WILL
+ * request once it actually restarts. Only fires when a same-non-null
+ * `instance_id` is available on BOTH sides; an older/mixed-version fleet
+ * without the field falls straight through to the pin-check UNCHANGED — this
+ * is strictly additive, never a behavior change for a fleet that lacks the
+ * data.
  */
 async function classifyHalt(
   green: VerifyGreenResult & { readonly ok: false },
   oldVersion: string | null,
+  oldInstanceId: string | null,
   targetVersion: string,
   agent: string,
   driver: FleetDriver,
@@ -670,8 +780,31 @@ async function classifyHalt(
     return { reason: 'relaunch-unconfirmed', detail: `relaunch-unconfirmed: ${base}` };
   }
 
-  // macf#899 — POSITIVELY confirmed reachable-at-OLD-version. Read the
-  // agent's own launch pin before naming this a bad release.
+  // NEW (follow-up to macf#899) — before implicating the release at all,
+  // rule out the simplest honest explanation: the SAME pre-restart process
+  // instance is still the one answering /health, i.e. this agent's relaunch
+  // has not taken over serving yet. Only possible when BOTH sides carry an
+  // `instance_id` — see this function's doc.
+  const lastInstanceId = green.lastInstanceId ?? null;
+  if (oldInstanceId !== null && lastInstanceId !== null && lastInstanceId === oldInstanceId) {
+    return {
+      reason: 'not-yet-serving',
+      detail:
+        `not-yet-serving: ${base} — the SAME pre-restart instance (${oldInstanceId}) is still ` +
+        `the one answering ${agent}'s /health; its relaunch has not taken over serving yet. ` +
+        `This is an honest UNKNOWN, not a confirmed bad release — a common cause is an ` +
+        `unanswered interactive launch prompt (Claude Code's trust dialog or the dev-channels ` +
+        `confirmation); attach to ${agent}'s session, clear any pending prompt, then re-run the ` +
+        `upgrade to pick it up. NOT halting the roll — a slow-to-take-over relaunch on one ` +
+        `workspace endangers no other agent.`,
+      instanceId: oldInstanceId,
+    };
+  }
+
+  // macf#899 — POSITIVELY confirmed reachable-at-OLD-version (and, whenever
+  // instance-id data was available above, confirmed NOT to be the lingering
+  // pre-restart process). Read the agent's own launch pin before naming this
+  // a bad release.
   const pin = await driver.readVersionPin(agent);
 
   if (pin === null) {
@@ -855,6 +988,7 @@ export async function rollFleet(
   let configAutoResolved = 0;
   let branchSkipped = 0;
   let stalePinSkipped = 0;
+  let notYetServingSkipped = 0;
 
   for (const plan of plans) {
     if (plan.disposition !== 'behind') continue;
@@ -1001,8 +1135,38 @@ export async function rollFleet(
       continue;
     }
 
-    const classification = await classifyHalt(green, plan.runningVersion, opts.targetVersion, agent, deps.driver);
+    const classification = await classifyHalt(
+      green,
+      plan.runningVersion,
+      plan.runningInstanceId,
+      opts.targetVersion,
+      agent,
+      deps.driver,
+    );
     const { reason, detail } = classification;
+
+    if (reason === 'not-yet-serving') {
+      // NEW (follow-up to macf#899) — SAFE TO CONTINUE despite the agent
+      // having been mutated: the post-restart old-version state is explained
+      // by the SAME pre-restart process instance still answering /health
+      // (its relaunch hasn't taken over yet), not a bad release, and a
+      // slow-to-take-over relaunch on ONE workspace endangers no OTHER
+      // agent. Leave the maintenance lock in place (DR-040 Decision 3 —
+      // "release ONLY on confirmed clean success"; this agent is NOT
+      // confirmed clean): same posture as `stale-pin`. Only the heartbeat
+      // stops here; the lock self-clears via MAINT_LOCK_TTL.
+      notYetServingSkipped += 1;
+      results.push({
+        agent,
+        outcome: 'not-yet-serving-skipped',
+        reason,
+        detail,
+        ...(autoResolvedFiles ? { autoResolvedFiles } : {}),
+      });
+      deps.onEvent?.({ kind: 'not-yet-serving-skip', agent, instanceId: classification.instanceId });
+      stopHeartbeat();
+      continue;
+    }
 
     if (reason === 'stale-pin') {
       // macf#899 — SAFE TO CONTINUE despite the agent having been mutated
@@ -1054,6 +1218,7 @@ export async function rollFleet(
       configAutoResolved,
       branchSkipped,
       stalePinSkipped,
+      notYetServingSkipped,
     };
   }
 
@@ -1066,6 +1231,7 @@ export async function rollFleet(
     configAutoResolved,
     branchSkipped,
     stalePinSkipped,
+    notYetServingSkipped,
   };
 }
 
