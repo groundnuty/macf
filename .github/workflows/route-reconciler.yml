@@ -98,7 +98,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: jetify-com/devbox-install-action@v0.15.0
+      # Retrying wrapper around jetify-com/devbox-install-action@v0.15.0 —
+      # its unconditional Nix-installer download 503s intermittently
+      # against an upstream unrelated to the devbox-version pin below
+      # (this is a DIFFERENT flakiness cause than the DNS/routing-clash
+      # 502 noted below re: Tailscale ordering — same download, two
+      # independently-observed failure triggers). See
+      # .github/actions/devbox-install/action.yml + macf#879.
+      - uses: ./.github/actions/devbox-install
         with:
           devbox-version: '0.16.0'  # pin: 0.17.x ships a require()-in-ESM helper that crashes in our "type":"module" repo (no-floating-tags directive)
 

@@ -81,7 +81,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: jetify-com/devbox-install-action@v0.15.0
+      # Retrying wrapper around jetify-com/devbox-install-action@v0.15.0 —
+      # its unconditional Nix-installer download 503s intermittently
+      # against an upstream unrelated to the devbox-version pin below.
+      # See .github/actions/devbox-install/action.yml + macf#879.
+      - uses: ./.github/actions/devbox-install
         with:
           devbox-version: '0.16.0'  # pin: 0.17.x ships a require()-in-ESM helper that crashes in our "type":"module" repo (no-floating-tags directive)
 
@@ -331,7 +335,11 @@ jobs:
           path: packages/macf-channel-server/node_modules/.cache/a2a-python-venv
           key: python-venv-${{ steps.sdk_version.outputs.version }}-${{ steps.sdk_version.outputs.depset }}-${{ runner.os }}
 
-      - uses: jetify-com/devbox-install-action@v0.15.0
+      # Retrying wrapper around jetify-com/devbox-install-action@v0.15.0 —
+      # its unconditional Nix-installer download 503s intermittently
+      # against an upstream unrelated to the devbox-version pin below.
+      # See .github/actions/devbox-install/action.yml + macf#879.
+      - uses: ./.github/actions/devbox-install
         if: steps.gate.outputs.should_run == 'true'
         with:
           devbox-version: '0.16.0'  # pin: 0.17.x ships a require()-in-ESM helper that crashes in our "type":"module" repo (no-floating-tags directive)

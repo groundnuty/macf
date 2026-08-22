@@ -1,0 +1,101 @@
+name: 'devbox install (retrying)'
+description: >-
+  Wraps jetify-com/devbox-install-action with a bounded, backed-off retry.
+  The wrapped action's own "Get devbox version" step is a no-op network-wise
+  once devbox-version is pinned (it just echoes the pin, no curl) — but its
+  LATER "Download and install experimental Nix installer" step is
+  unconditional every run and fetches
+  https://artifacts.nixos.org/experimental-installer with no retry of its
+  own. That fetch periodically 503s (macf#879), killing the job ~8-10s in
+  before any build/test step runs, on a cause unrelated to the devbox
+  version pin. Retrying the *whole* composite step is cheap on the happy
+  path (a cache-hit devbox-cli restore, ~1s) because a transient upstream
+  outage recovers within a run or two — confirmed empirically: PR #875
+  needed 3 attempts, PR #876 needed 2, both against the exact same
+  curl-503-from-artifacts.nixos.org signature.
+  A genuine persistent failure (bad version pin, checksum mismatch, a real
+  extended outage) still fails the job LOUD after all attempts are
+  exhausted — see the final attempt (no continue-on-error) and the
+  "Verify devbox is present" step below, which asserts the actual
+  result-invariant rather than trusting the wrapped action's exit code.
+  Silent-fallback-hazards.md Instance 11 is the canonical write-up of this
+  shape (a third-party retry-wrapping action can exhaust its own retries
+  and still exit 0) — this action's verify step is that instance's
+  Pattern-A defense, applied here proactively rather than after an
+  incident.
+
+inputs:
+  devbox-version:
+    description: 'devbox CLI version to pin to (forwarded verbatim to jetify-com/devbox-install-action)'
+    required: true
+  project-path:
+    description: 'Project path to devbox.json (forwarded verbatim)'
+    required: false
+    default: '.'
+
+runs:
+  using: composite
+  steps:
+    - name: devbox install attempt 1/3
+      id: attempt1
+      uses: jetify-com/devbox-install-action@v0.15.0
+      continue-on-error: true
+      with:
+        devbox-version: ${{ inputs.devbox-version }}
+        project-path: ${{ inputs.project-path }}
+
+    - name: back off before attempt 2/3
+      if: steps.attempt1.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::warning::devbox-install-action attempt 1/3 failed (see the failed step's log above for the actual error) — retrying after a 5s backoff."
+        sleep 5
+
+    - name: devbox install attempt 2/3
+      id: attempt2
+      if: steps.attempt1.outcome == 'failure'
+      uses: jetify-com/devbox-install-action@v0.15.0
+      continue-on-error: true
+      with:
+        devbox-version: ${{ inputs.devbox-version }}
+        project-path: ${{ inputs.project-path }}
+
+    - name: back off before attempt 3/3
+      if: steps.attempt1.outcome == 'failure' && steps.attempt2.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::warning::devbox-install-action attempt 2/3 failed (see the failed step's log above for the actual error) — retrying after a 15s backoff."
+        sleep 15
+
+    # No continue-on-error here: exhausting all 3 attempts must fail the
+    # job LOUD, never silently skip the caller's next step (macf#879 AC).
+    - name: devbox install attempt 3/3
+      id: attempt3
+      if: steps.attempt1.outcome == 'failure' && steps.attempt2.outcome == 'failure'
+      uses: jetify-com/devbox-install-action@v0.15.0
+      with:
+        devbox-version: ${{ inputs.devbox-version }}
+        project-path: ${{ inputs.project-path }}
+
+    # Result-invariant assert (Pattern A, silent-fallback-hazards.md
+    # Instance 11): a third-party action reporting outcome=success is not
+    # proof devbox is actually usable. Cheap and never previously observed
+    # to fail here, but the whole point of Instance 11 is that "never
+    # observed to fail (yet)" is not the same as "can't happen" — assert
+    # the thing the install step was supposed to establish, don't just
+    # trust its exit code.
+    - name: verify devbox is present and runnable
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v devbox >/dev/null 2>&1; then
+          echo "::error::devbox is not on PATH after the install step(s) above reported success."
+          echo "::error::This is the silent-fallback-hazards.md Instance 11 shape: a third-party"
+          echo "::error::action can exhaust its own retries and still exit 0. Check the attempt"
+          echo "::error::logs above for the literal failure (curl exit code / HTTP status) to tell"
+          echo "::error::a transient upstream outage from a persistent one (bad version pin,"
+          echo "::error::checksum mismatch, action regression). See macf#879."
+          exit 1
+        fi
+        echo "devbox on PATH: $(command -v devbox)"
+        devbox version
