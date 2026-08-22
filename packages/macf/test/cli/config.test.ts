@@ -57,6 +57,19 @@ describe('CLI config', () => {
       writeFileSync(path, '{"invalid": true}');
       expect(readAgentConfig(dir)).toBeNull();
     });
+
+    it('returns null (never throws) for a present-but-malformed-JSON config (macf#894)', () => {
+      // A present-but-unparsable config used to throw an uncaught SyntaxError
+      // straight out of readAgentConfig, crashing every --dir-taking command
+      // that reads config through this shared function. It must degrade the
+      // same way a schema-invalid config already does above: warn, return
+      // null, never throw.
+      const path = agentConfigPath(dir);
+      mkdirSync(join(dir, '.macf'), { recursive: true });
+      writeFileSync(path, '{ this is not json at all');
+      expect(() => readAgentConfig(dir)).not.toThrow();
+      expect(readAgentConfig(dir)).toBeNull();
+    });
   });
 
   describe('agents index', () => {

@@ -27,10 +27,10 @@
  * deps via `createRealDeps`.
  */
 import { spawn, execFileSync } from 'node:child_process';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { ROLL_TOUCHED_CONFIG_PATTERNS } from '@groundnuty/macf-core';
-import { readAgentConfig, resolveCanonicalBranch } from '../config.js';
+import { readAgentConfig, resolveCanonicalBranch, agentConfigPath } from '../config.js';
 import {
   backupSessionTranscript,
   createRealTranscriptDeps,
@@ -182,6 +182,20 @@ export interface RunRestartSelfOptions {
    * `--dir` was never passed).
    */
   readonly workspaceDirConflict: string | null;
+  /**
+   * Set ONLY on the `dirExplicit` path (macf#894), when the target's
+   * `.macf/macf-agent.json` could not be sourced: `'missing'` (no such file)
+   * or `'unreadable'` (present but failed to parse/validate — corrupt JSON
+   * or a schema mismatch; `readAgentConfig` already warned on stderr for
+   * that case). `null` on the auto-discovery/env path (unchanged — that
+   * path's config-optional resolution is what keeps the #763-scrubbed roll
+   * path working) and whenever an explicit `--dir` target's config WAS read
+   * successfully. `runRestartSelf` refuses immediately on this field —
+   * `project`/`agentName`/`routingLabel` must never flow onward as
+   * `undefined` toward `resolveSession`'s generic "cannot resolve session"
+   * miss when the REAL cause is nameable.
+   */
+  readonly configError: 'missing' | 'unreadable' | null;
 }
 
 /** The `--json` state-record (mirrors `fleet doctor`'s versioned shape). */
@@ -569,6 +583,31 @@ export async function runRestartSelf(
     );
   }
 
+  // macf#894 — an explicit --dir whose target has no readable
+  // .macf/macf-agent.json must refuse HERE, naming the cause, rather than
+  // let `project`/`agentName`/`routingLabel` flow onward as `undefined`
+  // toward `resolveSession`'s generic "cannot resolve the tmux session
+  // name" miss below. That degrades SAFELY on its own (`undefined` can
+  // never resolve to the CALLER's own session, so this was never a
+  // wrong-target-restart hazard) — but it hides a knowable cause behind a
+  // confusing downstream nothing-happened. No env fallback is reintroduced
+  // here: `opts.configError` is only ever set on the `dirExplicit` path,
+  // which (macf#888/#893) already sources identity from the target's config
+  // ONLY — this is strictly an earlier, clearer refusal on that same path,
+  // not a new lookup.
+  if (opts.configError) {
+    const configPath = agentConfigPath(opts.workspaceDir);
+    const cause =
+      opts.configError === 'missing'
+        ? `no ${configPath}`
+        : `${configPath} (present but not a valid agent config — see the warning above)`;
+    console.error(
+      `macf restart-self: --dir ${opts.workspaceDir} has ${cause} — cannot resolve the ` +
+        'target agent identity. Refusing to act.',
+    );
+    return 1;
+  }
+
   const session = resolveSession(opts);
   if (!session) {
     console.error(
@@ -908,6 +947,8 @@ export interface ResolvedIdentity {
   readonly project?: string;
   readonly agentName?: string;
   readonly routingLabel?: string;
+  /** macf#894 — see `RunRestartSelfOptions.configError`. */
+  readonly configError: 'missing' | 'unreadable' | null;
 }
 
 /**
@@ -932,6 +973,14 @@ export interface ResolvedIdentity {
  * `projectDir` == the validated `--dir` path) — no env fallback: if the
  * target's config lacks `project`/`agent_name`, `resolveSession` correctly
  * refuses (exit 1) rather than silently borrowing the caller's identity.
+ *
+ * macf#894 — on THIS branch only, also distinguish WHY a missing field is
+ * missing: no config file at all (`'missing'`) vs. a config file that
+ * exists but `readAgentConfig` could not read as valid (`'unreadable'` —
+ * corrupt JSON or a schema mismatch; either way `readAgentConfig` already
+ * warned on stderr with the specifics). `runRestartSelf` refuses on
+ * `configError` before ever reaching `resolveSession`, so the caller sees
+ * the real cause instead of a generic "cannot resolve session" miss.
  */
 export function resolveIdentity(
   projectDir: string,
@@ -942,6 +991,11 @@ export function resolveIdentity(
   const envWorkspaceDir = env['MACF_WORKSPACE_DIR']?.trim();
 
   if (dirExplicit) {
+    const configError: 'missing' | 'unreadable' | null = config
+      ? null
+      : existsSync(agentConfigPath(projectDir))
+        ? 'unreadable'
+        : 'missing';
     return {
       workspaceDir: projectDir,
       identitySource: 'dir-flag',
@@ -950,6 +1004,7 @@ export function resolveIdentity(
       project: config?.project,
       agentName: config?.agent_name,
       routingLabel: config?.routing_label || config?.agent_name,
+      configError,
     };
   }
 
@@ -963,6 +1018,7 @@ export function resolveIdentity(
     project,
     agentName,
     routingLabel,
+    configError: null,
   };
 }
 
@@ -971,11 +1027,14 @@ export async function runRestartSelfCommand(
   projectDir: string,
   cliOpts: RestartSelfCliOptions,
 ): Promise<number> {
-  const { workspaceDir, identitySource, workspaceDirConflict, project, agentName, routingLabel } =
+  const { workspaceDir, identitySource, workspaceDirConflict, project, agentName, routingLabel, configError } =
     resolveIdentity(projectDir, process.env, cliOpts.dirExplicit === true);
   // macf#755 — resolve the canonical-branch guard's expected branch from the
   // SAME `projectDir` config `resolveIdentity` reads (env override still
-  // applies regardless of whether a config is found).
+  // applies regardless of whether a config is found). Safe to call even when
+  // `configError` is set (macf#894): `readAgentConfig` never throws — a
+  // missing/unreadable config just yields `null` here, and `runRestartSelf`
+  // refuses on `configError` before this value is ever used.
   const canonicalBranch = resolveCanonicalBranch(readAgentConfig(projectDir));
   const deps = createRealDeps(workspaceDir);
   return runRestartSelf(
@@ -987,6 +1046,7 @@ export async function runRestartSelfCommand(
       agentName,
       routingLabel,
       canonicalBranch,
+      configError,
       reason: coerceReason(cliOpts.reason),
       confirm: cliOpts.confirm === true,
       dryRun: cliOpts.dryRun === true,

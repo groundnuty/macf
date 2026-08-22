@@ -18,7 +18,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
@@ -35,7 +35,7 @@ import {
   type RunRestartSelfOptions,
   type StashResult,
 } from '../../src/cli/commands/restart-self.js';
-import { writeAgentConfig, type MacfAgentConfig } from '../../src/cli/config.js';
+import { writeAgentConfig, agentConfigPath, type MacfAgentConfig } from '../../src/cli/config.js';
 
 /** A scratch workspace dir with a REAL `.macf/macf-agent.json` (macf#888 identity-source tests). */
 function tempWorkspace(config: Partial<MacfAgentConfig> = {}): string {
@@ -138,6 +138,9 @@ function baseOpts(over: Partial<RunRestartSelfOptions> = {}): RunRestartSelfOpti
     // exercise the identity-source / conflict-surfacing behavior directly.
     identitySource: 'cwd-discovery',
     workspaceDirConflict: null,
+    // macf#894 — neutral default for tests that don't exercise the
+    // missing/unreadable-config refusal directly.
+    configError: null,
     ...over,
   };
 }
@@ -444,6 +447,85 @@ describe('runRestartSelf — confirm path', () => {
     errSpy.mockRestore();
   });
 
+  describe('macf#894 — configError refusal (explicit --dir, target config missing/unreadable)', () => {
+    it('refuses (exit 1, NO stash/write/spawn/kill) on configError:"missing", naming the target path', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps();
+      const code = await runRestartSelf(
+        baseOpts({
+          confirm: true,
+          workspaceDir: '/no/such/workspace',
+          identitySource: 'dir-flag',
+          configError: 'missing',
+        }),
+        deps,
+      );
+      expect(code).toBe(1);
+      // Assert the WRONG PATH was never entered, not merely a nonzero exit —
+      // a broken guard that let this fall through to `resolveSession`'s
+      // generic miss would ALSO exit 1 with rec.order empty (project is a
+      // real value here in baseOpts), so the wrong-path assertion is the
+      // stderr content below, not the exit code / empty-order pair alone.
+      expect(rec.order).toEqual([]);
+      expect(rec.killed).toEqual([]);
+      expect(rec.spawned).toEqual([]);
+      const err = errSpy.mock.calls.flat().join('\n');
+      expect(err).toContain('/no/such/workspace');
+      expect(err).toContain('.macf/macf-agent.json');
+      expect(err).toContain('no /no/such/workspace');
+      // The OLD generic miss must NOT be what actually fired — this refusal
+      // is more specific and must win.
+      expect(err).not.toContain('cannot resolve the tmux session');
+      errSpy.mockRestore();
+    });
+
+    it('refuses with DIFFERENT wording on configError:"unreadable" (present but invalid) — distinguishable from "missing"', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps();
+      const code = await runRestartSelf(
+        baseOpts({
+          confirm: true,
+          workspaceDir: '/some/workspace',
+          identitySource: 'dir-flag',
+          configError: 'unreadable',
+        }),
+        deps,
+      );
+      expect(code).toBe(1);
+      expect(rec.order).toEqual([]);
+      const err = errSpy.mock.calls.flat().join('\n');
+      expect(err).toContain('/some/workspace');
+      expect(err).toContain('present but not a valid agent config');
+      expect(err).not.toContain('no /some/workspace/.macf/macf-agent.json —');
+      errSpy.mockRestore();
+    });
+
+    it('fires even in DRY-RUN mode (no --confirm) — the refusal precedes the plan print entirely', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps();
+      const code = await runRestartSelf(
+        baseOpts({ confirm: false, workspaceDir: '/no/such/workspace', configError: 'missing' }),
+        deps,
+      );
+      expect(code).toBe(1);
+      expect(rec.order).toEqual([]);
+      expect(logSpy.mock.calls).toHaveLength(0); // no plan ever printed — zero-effect assertion
+      errSpy.mockRestore();
+      logSpy.mockRestore();
+    });
+
+    it('configError:null (the ordinary/unaffected case) proceeds normally — the decisive pair\'s second half', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps, rec } = fakeDeps();
+      const code = await runRestartSelf(baseOpts({ confirm: true, configError: null }), deps);
+      expect(code).toBe(0);
+      expect(rec.order).toEqual(['stash', 'backup', 'write', 'write', 'spawn', 'kill']);
+      expect(rec.killed).toEqual(['macf@code-agent']);
+      logSpy.mockRestore();
+    });
+  });
+
   it('emits the versioned JSON state-record under --json', async () => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const { deps } = fakeDeps();
@@ -706,6 +788,7 @@ describe('resolveIdentity', () => {
         project: 'envproj',
         agentName: 'envagent',
         routingLabel: 'envagent',
+        configError: null,
       });
     });
 
@@ -795,6 +878,48 @@ describe('resolveIdentity', () => {
       const id = resolveIdentity(dir, { MACF_WORKSPACE_DIR: dir } as NodeJS.ProcessEnv, true);
       expect(id.workspaceDirConflict).toBeNull();
       expect(id.identitySource).toBe('dir-flag');
+    });
+
+    describe('macf#894 — configError: distinguish missing from unreadable, never silent undefined', () => {
+      it('no .macf/macf-agent.json at all: configError is "missing" (not silently undefined)', () => {
+        dir = join(
+          tmpdir(),
+          `macf-restart-self-test-nocfg-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        );
+        mkdirSync(dir, { recursive: true }); // deliberately NO .macf dir at all
+        const id = resolveIdentity(dir, {} as NodeJS.ProcessEnv, true);
+        expect(id.configError).toBe('missing');
+        expect(id.project).toBeUndefined();
+        expect(id.agentName).toBeUndefined();
+        expect(id.routingLabel).toBeUndefined();
+      });
+
+      it('.macf/macf-agent.json present but not valid JSON: configError is "unreadable"', () => {
+        dir = tempWorkspace();
+        writeFileSync(agentConfigPath(dir), '{ this is not json', 'utf-8');
+        const id = resolveIdentity(dir, {} as NodeJS.ProcessEnv, true);
+        expect(id.configError).toBe('unreadable');
+        expect(id.project).toBeUndefined();
+      });
+
+      it('.macf/macf-agent.json present, valid JSON, but fails the config schema: configError is "unreadable" too (same cause bucket as malformed JSON)', () => {
+        dir = join(
+          tmpdir(),
+          `macf-restart-self-test-badschema-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        );
+        mkdirSync(join(dir, '.macf'), { recursive: true });
+        writeFileSync(agentConfigPath(dir), JSON.stringify({ invalid: true }), 'utf-8');
+        const id = resolveIdentity(dir, {} as NodeJS.ProcessEnv, true);
+        expect(id.configError).toBe('unreadable');
+      });
+
+      it('a valid config: configError is null — the ordinary case is unaffected (decisive pair, first half)', () => {
+        dir = tempWorkspace();
+        const id = resolveIdentity(dir, {} as NodeJS.ProcessEnv, true);
+        expect(id.configError).toBeNull();
+        expect(id.project).toBe('target-proj');
+        expect(id.agentName).toBe('target-agent');
+      });
     });
   });
 });
