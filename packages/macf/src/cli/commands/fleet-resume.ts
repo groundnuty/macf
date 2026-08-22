@@ -60,6 +60,7 @@ import {
 import { readAgentConfig, tokenSourceFromConfig } from '../config.js';
 import { createVmDriverFromConfig } from '../fleet/vm-driver.js';
 import { loadStallSignaturesFromWorkspace } from '../stall-signatures.js';
+import { resolveWorkspaceDir, formatWorkspaceDirConflictWarning } from '../workspace-dir.js';
 
 /** Raised on a genuine resume-wiring failure (fail-loud, never silent). */
 export class FleetResumeError extends MacfError {
@@ -387,6 +388,14 @@ export function createRealResumeDeps(projectDir: string, driver: FleetDriver): F
 /** CLI options passed from commander. */
 export interface FleetResumeCliOptions {
   readonly execute?: boolean;
+  /**
+   * True iff the caller passed `--dir` on argv (macf#1123, threading
+   * `restart-self`'s macf#888 `dirExplicit` pattern via the shared
+   * `isDirExplicit`/`resolveWorkspaceDir` in `../workspace-dir.js`). Without
+   * this, an explicit `--dir <other-workspace>` silently loses to the
+   * caller's own ambient `MACF_WORKSPACE_DIR` below.
+   */
+  readonly dirExplicit?: boolean;
 }
 
 /** `macf fleet resume` entry point — resolves the workspace, wires the real driver + deps. */
@@ -394,9 +403,12 @@ export async function runFleetResumeCommand(
   projectDir: string,
   cliOpts: FleetResumeCliOptions,
 ): Promise<number> {
-  const workspaceDir = process.env['MACF_WORKSPACE_DIR']?.trim() || projectDir;
-  const driver = await createVmDriverFromConfig(workspaceDir);
+  const resolved = resolveWorkspaceDir(projectDir, cliOpts.dirExplicit === true);
+  const conflictWarning = formatWorkspaceDirConflictWarning('fleet resume', resolved);
+  if (conflictWarning) console.error(conflictWarning);
+
+  const driver = await createVmDriverFromConfig(resolved.workspaceDir);
   if (!driver) return 1; // createVmDriverFromConfig already printed the diagnostic.
-  const deps = createRealResumeDeps(workspaceDir, driver);
+  const deps = createRealResumeDeps(resolved.workspaceDir, driver);
   return runFleetResume({ execute: Boolean(cliOpts.execute) }, deps);
 }

@@ -36,6 +36,7 @@ import { selfUpdate } from './commands/self-update.js';
 import { findProjectRoot } from './config.js';
 import { findCliPackageRoot } from './rules.js';
 import { packageVersionDisplay } from '../package-version.js';
+import { isDirExplicit } from './workspace-dir.js';
 
 /**
  * Resolve the project directory for project-scoped commands.
@@ -358,8 +359,12 @@ fleet
   .option('--prelude <path>', 'Override the host-prelude path sourced before reconcile')
   .option('--log <path>', 'Override the watchdog log path')
   .option('--yes', 'Skip the confirmation prompt (non-interactive)', false)
-  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd). An explicit --dir WINS over MACF_WORKSPACE_DIR — pass it to target a workspace other than your own.')
   .action(async (opts) => {
+    // macf#1123 — same capture as restart-self's (macf#888), threaded via the
+    // shared isDirExplicit rather than re-derived: without it, MACF_WORKSPACE_DIR
+    // unconditionally overrides an explicit --dir inside the command below.
+    const dirExplicit = isDirExplicit(opts);
     const code = await runFleetInstallCronCommand(resolveProjectDir(opts.dir), {
       schedule: opts.schedule,
       execute: opts.execute,
@@ -372,6 +377,7 @@ fleet
       prelude: opts.prelude,
       log: opts.log,
       yes: opts.yes,
+      dirExplicit,
     });
     process.exitCode = code;
   });
@@ -399,8 +405,10 @@ fleet
   .option('--paused-dir <dir>', 'Paused-sentinel dir (default: $HOME/.macf/paused)')
   .option('--heartbeat-file <path>', 'Watchdog self-heartbeat file (default: $HOME/.macf/watchdog-heartbeat)')
   .option('--json', 'Emit the structured sweep result as JSON (for scripting/automation)', false)
-  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd). An explicit --dir WINS over MACF_WORKSPACE_DIR — pass it to target a workspace other than your own.')
   .action(async (opts) => {
+    // macf#1123 — see the install-cron action above for why this capture exists.
+    const dirExplicit = isDirExplicit(opts);
     process.exitCode = await runFleetReconcileCommand(resolveProjectDir(opts.dir), {
       execute: opts.execute,
       allowRestart: opts.allowRestart,
@@ -411,6 +419,7 @@ fleet
       pausedDir: opts.pausedDir,
       heartbeatFile: opts.heartbeatFile,
       json: opts.json,
+      dirExplicit,
     });
   });
 
@@ -430,10 +439,13 @@ fleet
     'the plan; --execute nudges / raises alerts.',
   )
   .option('--execute', 'ACTUALLY nudge / raise alerts (else dry-run: print the plan)', false)
-  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd). An explicit --dir WINS over MACF_WORKSPACE_DIR — pass it to target a workspace other than your own.')
   .action(async (opts) => {
+    // macf#1123 — see the install-cron action above for why this capture exists.
+    const dirExplicit = isDirExplicit(opts);
     const code = await runFleetResumeCommand(resolveProjectDir(opts.dir), {
       execute: Boolean(opts.execute),
+      dirExplicit,
     });
     process.exitCode = code;
   });
@@ -883,8 +895,10 @@ program
     // shape. `--dir <path>` above has no commander default (3rd arg), so
     // `opts.dir` is `undefined` exactly when the flag is absent — that's the
     // only reliable "explicit" signal (macf#347: a resolved path is truthy
-    // either way and can't be used to infer this).
-    const dirExplicit = opts.dir !== undefined;
+    // either way and can't be used to infer this). Threaded via the shared
+    // `isDirExplicit` (macf#1123) so the other three `--dir`-taking fleet
+    // commands below reuse the identical predicate rather than re-deriving it.
+    const dirExplicit = isDirExplicit(opts);
     const code = await runRestartSelfCommand(resolveProjectDir(opts.dir), {
       reason: opts.reason,
       confirm: opts.confirm,

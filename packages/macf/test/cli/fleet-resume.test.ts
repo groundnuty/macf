@@ -17,7 +17,7 @@
  *   - verify-resumed: still stuck      → back off (counter stays incremented).
  *   - dry-run                          → plans without acting (no inject/alert/write).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type {
   FleetDriver,
   FleetState,
@@ -27,10 +27,21 @@ import type {
 } from '@groundnuty/macf-core';
 import {
   runFleetResume,
+  runFleetResumeCommand,
   formatResumeLine,
   type FleetResumeDeps,
   type ResumeAlertInput,
 } from '../../src/cli/commands/fleet-resume.js';
+
+// macf#1123 — `createVmDriverFromConfig` is the seam `runFleetResumeCommand`
+// binds its resolved workspaceDir into. Mocking it (rather than the whole
+// fleet driver) keeps every OTHER test in this file, which only exercises
+// the pure `runFleetResume(opts, deps)` decision layer, completely
+// unaffected — none of them import or call `createVmDriverFromConfig`.
+vi.mock('../../src/cli/fleet/vm-driver.js', () => ({
+  createVmDriverFromConfig: vi.fn(),
+}));
+import { createVmDriverFromConfig } from '../../src/cli/fleet/vm-driver.js';
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -277,5 +288,59 @@ describe('formatResumeLine', () => {
     expect(line.split(/\s+/)[0]).toBe('code-agent');
     expect(line).toContain('stalled');
     expect(line).toContain('NUDGE');
+  });
+});
+
+describe('runFleetResumeCommand — --dir vs ambient MACF_WORKSPACE_DIR (macf#1123)', () => {
+  const ORIGINAL_ENV = process.env['MACF_WORKSPACE_DIR'];
+  let errSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.mocked(createVmDriverFromConfig).mockReset();
+    vi.mocked(createVmDriverFromConfig).mockResolvedValue(null); // short-circuits before any real I/O
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    errSpy.mockRestore();
+    if (ORIGINAL_ENV === undefined) delete process.env['MACF_WORKSPACE_DIR'];
+    else process.env['MACF_WORKSPACE_DIR'] = ORIGINAL_ENV;
+  });
+
+  // Decisive per assert-the-wrong-path.md: asserted by the ARGUMENT the
+  // driver-binding seam actually received, not by the return code — a
+  // broken implementation (env unconditionally wins) still returns 1 here
+  // too, since the mock resolves to null either way. Only the bound
+  // workspaceDir tells the two apart.
+  it('THE REGRESSION: --dir <B> with MACF_WORKSPACE_DIR=<A> set binds the driver to B, not A', async () => {
+    process.env['MACF_WORKSPACE_DIR'] = '/caller-a';
+    await runFleetResumeCommand('/target-b', { execute: false, dirExplicit: true });
+    expect(vi.mocked(createVmDriverFromConfig).mock.calls[0]?.[0]).toBe('/target-b');
+  });
+
+  it('the --dir vs env disagreement is REPORTED, not swallowed', async () => {
+    process.env['MACF_WORKSPACE_DIR'] = '/caller-a';
+    await runFleetResumeCommand('/target-b', { execute: false, dirExplicit: true });
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('/caller-a'));
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('/target-b'));
+  });
+
+  it('no --dir: the ambient MACF_WORKSPACE_DIR default still applies (ordinary in-session case unbroken)', async () => {
+    process.env['MACF_WORKSPACE_DIR'] = '/caller-a';
+    await runFleetResumeCommand('/auto-discovered', { execute: false });
+    expect(vi.mocked(createVmDriverFromConfig).mock.calls[0]?.[0]).toBe('/caller-a');
+    expect(errSpy).not.toHaveBeenCalled(); // no --dir → nothing to conflict with
+  });
+
+  it('no --dir, no env: falls back to the auto-discovered projectDir', async () => {
+    delete process.env['MACF_WORKSPACE_DIR'];
+    await runFleetResumeCommand('/auto-discovered', { execute: false });
+    expect(vi.mocked(createVmDriverFromConfig).mock.calls[0]?.[0]).toBe('/auto-discovered');
+  });
+
+  it('--dir with no conflicting env: binds to --dir, no warning (env unset)', async () => {
+    delete process.env['MACF_WORKSPACE_DIR'];
+    await runFleetResumeCommand('/target-b', { execute: false, dirExplicit: true });
+    expect(vi.mocked(createVmDriverFromConfig).mock.calls[0]?.[0]).toBe('/target-b');
+    expect(errSpy).not.toHaveBeenCalled();
   });
 });

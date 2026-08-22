@@ -42,6 +42,7 @@ import { existsSync, readFileSync, accessSync, constants as fsConstants } from '
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { MacfError } from '@groundnuty/macf-core';
+import { resolveWorkspaceDir, formatWorkspaceDirConflictWarning } from '../workspace-dir.js';
 
 /** Raised on a genuine crontab-write failure (fail-loud, never silent). */
 export class FleetInstallCronError extends MacfError {
@@ -439,6 +440,14 @@ export interface FleetInstallCronCliOptions {
   readonly yes?: boolean;
   readonly prelude?: string;
   readonly log?: string;
+  /**
+   * True iff the caller passed `--dir` on argv (macf#1123, threading
+   * `restart-self`'s macf#888 `dirExplicit` pattern via the shared
+   * `isDirExplicit`/`resolveWorkspaceDir` in `../workspace-dir.js`). Without
+   * this, an explicit `--dir <other-workspace>` silently loses to the
+   * caller's own ambient `MACF_WORKSPACE_DIR` below.
+   */
+  readonly dirExplicit?: boolean;
 }
 
 /** `macf fleet install-cron` entry point — resolves the workspace, wires real deps. */
@@ -446,7 +455,11 @@ export async function runFleetInstallCronCommand(
   projectDir: string,
   cliOpts: FleetInstallCronCliOptions,
 ): Promise<number> {
-  const workspaceDir = process.env['MACF_WORKSPACE_DIR']?.trim() || projectDir;
+  const resolved = resolveWorkspaceDir(projectDir, cliOpts.dirExplicit === true);
+  const conflictWarning = formatWorkspaceDirConflictWarning('fleet install-cron', resolved);
+  if (conflictWarning) console.error(conflictWarning);
+  const workspaceDir = resolved.workspaceDir;
+
   const deps = createRealDeps(workspaceDir);
   return runFleetInstallCron(
     {

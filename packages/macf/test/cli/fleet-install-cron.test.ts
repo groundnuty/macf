@@ -13,8 +13,12 @@
  *   - report-only DEFAULT (no --execute → the cron runs reconcile dry-run).
  *   - confirm gate (declined → no write) + --print (preview, no write).
  *   - crontab unavailable → exit 2, no write.
+ *   - macf#1123: --dir vs ambient MACF_WORKSPACE_DIR precedence in
+ *     runFleetInstallCronCommand (the CLI-facing wiring, distinct from the
+ *     `runFleetInstallCron` orchestrator above — a bug in the WIRING is
+ *     invisible to every test that only calls the orchestrator directly).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   buildReconcileFlags,
   buildTokenPrefix,
@@ -23,6 +27,7 @@ import {
   computeInstalledCrontab,
   computeUninstalledCrontab,
   runFleetInstallCron,
+  runFleetInstallCronCommand,
   WATCHDOG_MARKER,
   DEFAULT_SCHEDULE,
   RECONCILE_INVOCATION,
@@ -30,6 +35,29 @@ import {
   type RunFleetInstallCronOptions,
   type AppCreds,
 } from '../../src/cli/commands/fleet-install-cron.js';
+
+// macf#1123 — `runFleetInstallCronCommand` shells out to `crontab` via
+// `createRealDeps`'s `crontabAvailable`/`readCrontab`. Mock `execFileSync`
+// so the wiring test below never touches this host's real crontab (or fails
+// on a host with none installed) — `command -v crontab` succeeds; anything
+// else throws, which `readCrontab`'s own try/catch already treats as
+// "no crontab" (existing, pre-#1123 behavior), so this changes nothing
+// about what's under test. Preserve every OTHER real export (`importOriginal`)
+// — `@groundnuty/macf-core`'s `token.ts` imports `execFile` from this same
+// module, and a from-scratch mock factory drops it, breaking unrelated tests
+// transitively importing macf-core in this same file/worker.
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    execFileSync: vi.fn((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'command' && args?.[0] === '-v' && args?.[1] === 'crontab') {
+        return Buffer.from('/usr/bin/crontab\n');
+      }
+      throw new Error(`ENOENT (mocked node:child_process): ${cmd} ${JSON.stringify(args ?? [])}`);
+    }),
+  };
+});
 
 const WS = '/ws';
 const FULL_CREDS: AppCreds = { appId: '123', installId: '456', keyPath: '.github-app-key.pem' };
@@ -333,5 +361,70 @@ describe('runFleetInstallCron — uninstall', () => {
     const code = await runFleetInstallCron(baseOpts({ uninstall: true, yes: false }), deps);
     expect(code).toBe(0);
     expect(rec.writes).toHaveLength(0);
+  });
+});
+
+describe('runFleetInstallCronCommand — --dir vs ambient MACF_WORKSPACE_DIR (macf#1123)', () => {
+  const ORIGINAL_ENV = process.env['MACF_WORKSPACE_DIR'];
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logSpy.mockRestore();
+    errSpy.mockRestore();
+    if (ORIGINAL_ENV === undefined) delete process.env['MACF_WORKSPACE_DIR'];
+    else process.env['MACF_WORKSPACE_DIR'] = ORIGINAL_ENV;
+  });
+
+  /**
+   * The decisive marker: `--print` echoes the generated cron line, which
+   * embeds the resolved workspaceDir in its host-prelude path
+   * (`<workspaceDir>/.claude/.macf/host-prelude.sh`, the default when
+   * `--prelude` is not passed). `--no-token` skips the app-creds lookup
+   * entirely, so this needs no real files on disk — the printed line is the
+   * ONLY signal, and per assert-the-wrong-path.md it's the target the code
+   * actually bound, not merely "the command returned 0" (a broken
+   * implementation returns 0 here too, having printed the WRONG line).
+   */
+  it('THE REGRESSION: --dir <B> with MACF_WORKSPACE_DIR=<A> set prints a line scoped to B, not A', async () => {
+    process.env['MACF_WORKSPACE_DIR'] = '/caller-a';
+    const code = await runFleetInstallCronCommand('/target-b', {
+      print: true,
+      token: false,
+      dirExplicit: true,
+    });
+    expect(code).toBe(0);
+    const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(printed).toContain('/target-b/.claude/.macf/host-prelude.sh');
+    expect(printed).not.toContain('/caller-a');
+  });
+
+  it('the --dir vs env disagreement is REPORTED, not swallowed', async () => {
+    process.env['MACF_WORKSPACE_DIR'] = '/caller-a';
+    await runFleetInstallCronCommand('/target-b', { print: true, token: false, dirExplicit: true });
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('/caller-a'));
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('/target-b'));
+  });
+
+  it('no --dir: the ambient MACF_WORKSPACE_DIR default still applies (ordinary in-session case unbroken)', async () => {
+    process.env['MACF_WORKSPACE_DIR'] = '/caller-a';
+    const code = await runFleetInstallCronCommand('/auto-discovered', { print: true, token: false });
+    expect(code).toBe(0);
+    const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(printed).toContain('/caller-a/.claude/.macf/host-prelude.sh');
+    expect(printed).not.toContain('/auto-discovered');
+    expect(errSpy).not.toHaveBeenCalled();
+  });
+
+  it('no --dir, no env: falls back to the auto-discovered projectDir', async () => {
+    delete process.env['MACF_WORKSPACE_DIR'];
+    const code = await runFleetInstallCronCommand('/auto-discovered', { print: true, token: false });
+    expect(code).toBe(0);
+    const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(printed).toContain('/auto-discovered/.claude/.macf/host-prelude.sh');
   });
 });
