@@ -118,16 +118,26 @@ runs:
         echo "devbox on PATH: $(command -v devbox)"
         devbox version
 
-    # Runs ONLY on exhaustion (`if: failure()` fires regardless of the
-    # normal skip-on-prior-failure semantics that would otherwise skip
-    # every remaining step once attempt 3 fails without
-    # continue-on-error). This is the step the AC "distinguish transient
-    # from persistent in what the operator sees" actually depends on —
-    # the "verify devbox is present" step above never runs in this
-    # scenario, so without this step the operator sees nothing but the
-    # wrapped action's own 3x-repeated misleading hint below.
+    # Runs ONLY on genuine install exhaustion. `if: failure()` fires
+    # regardless of the normal skip-on-prior-failure semantics that would
+    # otherwise skip every remaining step once attempt 3 fails without
+    # continue-on-error — that part IS needed, since without it this step
+    # never runs at all (the "verify devbox is present" step above is
+    # skipped once the job has failed, so *something* gated on failure()
+    # is required to say anything on this path). But `failure()` alone is
+    # too broad: it also goes true if the "verify devbox is present" step
+    # ABOVE fails on its own (attempt 1 succeeded, devbox still absent —
+    # the actual Instance-11 shape) — that step already prints its own
+    # accurate diagnosis, and this step firing too would wrongly claim
+    # "ALL 3 attempts failed" when only attempt 1 ran. The extra conjunct
+    # scopes this step to the one case its message is actually true for:
+    # attempt 3 itself failed (checked via .conclusion, not .outcome, per
+    # GitHub's own canonical `failure() && steps.<id>.conclusion == ...`
+    # pattern for this exact "failure with conditions" case — attempt3 has
+    # no continue-on-error so outcome and conclusion agree here regardless,
+    # but conclusion is the documented-correct property to check).
     - name: devbox install exhausted all attempts
-      if: failure()
+      if: failure() && steps.attempt3.conclusion == 'failure'
       shell: bash
       run: |
         echo "::error::devbox-install-action failed on ALL 3 attempts."
