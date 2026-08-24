@@ -17,6 +17,15 @@
  *                              (#614): a pinned repo declares itself non-fleet here so
  *                              it is excluded from `pins_consistent`. Self-declaration
  *                              that lives WITH the repo — no central allowlist.
+ *   - `readFleetManifestYaml` — a repo's committed `fleet.yaml` raw text (macf#872),
+ *                              read off whichever repo the caller has already
+ *                              identified as the fleet's control repo (DR-043
+ *                              Amendment F). Same raw-content-media-type shape as
+ *                              `bootstrap/control-repo.ts::realReadControlManifestFile`,
+ *                              but token-scoped to the MINTED registry token (not
+ *                              ambient `GH_TOKEN`) for DI/testability consistency
+ *                              with every other reader in this file — deliberately
+ *                              NOT a re-export of that function.
  *
  * The token is forwarded as `GH_TOKEN` in the subprocess env (the house auth
  * posture); none of these has a write path.
@@ -143,6 +152,33 @@ export function createFleetMarkerReader(
       const parsed = JSON.parse(decodeGhContent(stdout)) as FleetMarker;
       if (!parsed || typeof parsed !== 'object') return null;
       return parsed;
+    } catch {
+      return null;
+    }
+  };
+}
+
+/**
+ * Read `fleet.yaml`'s raw text off a given repo's default branch (macf#872), via
+ * the GitHub raw-content media type (no base64 decode needed — same wire shape as
+ * `bootstrap/control-repo.ts::realReadControlManifestFile`). The caller (routing-
+ * doctor-pin-correctness.ts) supplies the repo — this function does NOT derive or
+ * discover which repo is the fleet's control repo, keeping the gh-shell-out leaf
+ * ignorant of DR-043 naming conventions. `null` on ANY failure (missing file — the
+ * overwhelmingly common case for a fleet with no control repo yet, or one not
+ * bootstrapped via `macf bootstrap apply` at all — private-repo-without-content-
+ * scope, network). NEVER throws.
+ */
+export function createFleetManifestReader(token: string): (repo: string) => Promise<string | null> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo: string): Promise<string | null> => {
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['api', `repos/${repo}/contents/fleet.yaml`, '-H', 'Accept: application/vnd.github.raw'],
+        { encoding: 'utf-8', env, maxBuffer: 1 * 1024 * 1024 },
+      );
+      return stdout;
     } catch {
       return null;
     }

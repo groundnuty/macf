@@ -16,7 +16,20 @@
  *     `uses: groundnuty/macf-actions/...@<pin>` is on the SAME version. A mixed
  *     `@v1.3.x` / `@v3.3.0` set = an incomplete cutover — *this would have caught
  *     the outage*. Repo-set source (DR-030 Q3): the App INSTALL-SET, not a new
- *     config file.
+ *     config file. Extended macf#872 with a SECOND, independent axis — pin
+ *     CORRECTNESS: consistency alone measures modal agreement, so a fleet that
+ *     drifted to the SAME stale pin on every repo reports `consistent: true` —
+ *     green precisely when the problem is worst. `routing-doctor-pin-
+ *     correctness.ts`'s `classifyPinState` compares each repo's pin against the
+ *     fleet manifest's declared `versions.actions` (an operator-supplied
+ *     `--manifest <path>`, else control-repo auto-discovery off the SAME
+ *     install-set, else the honest `unknown` floor — never a pass) and crosses
+ *     it with consistency into `inconsistent` / `consistent-and-correct` /
+ *     `consistent-but-wrong` / `unknown`. Warn-never-fail: `consistent-but-wrong`
+ *     does NOT flip the HEALTHY/DEGRADED verdict (a deliberate older pin is
+ *     legitimate; the harm is SILENT staleness), but it DOES replace "pins
+ *     consistent" in `summaryLine`'s own clause — never a separate footnote a
+ *     reader can miss.
  *  2. The #538 split — TWO independent checks per agent:
  *     (a) ROUTABILITY — each routing label has a `MACF_AGENT_<LABEL>` key in the
  *         registry (the router resolves BY LABEL; a bot-name key is silently
@@ -91,7 +104,16 @@ import {
   createCallerPinReader,
   createRoutingConfigGhReader,
   createFleetMarkerReader,
+  createFleetManifestReader,
 } from './routing-doctor-gh.js';
+import {
+  classifyPinState,
+  evaluatePinCorrectness,
+  pinClauseText,
+  pinCorrectnessLine,
+  resolveDesiredActionsPin,
+  type PinCorrectnessState,
+} from './routing-doctor-pin-correctness.js';
 
 // --- Shared types (also consumed by routing-doctor-gh.ts) ---
 
@@ -532,6 +554,16 @@ export interface RepoPinRow {
    * opted-out callers — both excluded from the verdict.
    */
   readonly consistent: boolean | null;
+  /**
+   * Pin CORRECTNESS vs the fleet manifest's declared `versions.actions` (macf#872)
+   * — an axis INDEPENDENT of `consistent`. Same exclusion scope as `consistent`
+   * (`null` for non-members/non-callers); among participants, `evaluatePinCorrectness`'s
+   * tri-state — `correct`/`incorrect` when an authoritative desired pin was resolved
+   * this run, `unknown` when none was (no `--manifest`, no discoverable control repo,
+   * or its `fleet.yaml` was unreadable — honest-not-asserted, NEVER a pass). See
+   * `routing-doctor-pin-correctness.ts` for the full design rationale.
+   */
+  readonly correctness: PinCorrectnessState | null;
 }
 
 export interface AgentRow {
@@ -609,6 +641,16 @@ export interface RoutingDoctorReport {
   readonly project: string;
   readonly repoPins: readonly RepoPinRow[];
   readonly expectedPin: string | null;
+  /**
+   * The AUTHORITATIVE desired `macf-actions` pin (macf#872) — the fleet manifest's
+   * `versions.actions`, resolved via `--manifest` override or control-repo
+   * auto-discovery (see `resolveDesiredActionsPin`). Distinct from `expectedPin`,
+   * which is the MODAL pin among the repos themselves (a proxy for agreement, not
+   * for correctness) or an `--expected-pin` CLI override — a separate, pre-existing
+   * escape hatch this field does not replace. `null` — honest unknown, never a pass
+   * — when no authoritative source was reachable this run.
+   */
+  readonly desiredActionsPin: string | null;
   readonly hasRoutingConfig: boolean;
   readonly agents: readonly AgentRow[];
   readonly ca: CaCheckResult;
@@ -654,6 +696,16 @@ export interface RoutingDoctorDeps {
   readonly botLogins?: Readonly<Record<string, string>>;
   /** Explicit expected caller-pin (else the modal pin). */
   readonly expectedPin?: string;
+  /**
+   * Resolve the AUTHORITATIVE desired `macf-actions` pin for the pin-CORRECTNESS
+   * check (macf#872) — takes the ALREADY-FETCHED install-set (the same list
+   * `listRepos()` returned this run) so control-repo auto-discovery costs no extra
+   * `gh api` round-trip. Omit (or resolve to `null`) to render `correctness` as
+   * `unknown` for every participating repo — the honest default for any fleet with
+   * no reachable `fleet.yaml` (most of today's substrate predates `macf bootstrap
+   * apply` entirely). NEVER throws.
+   */
+  readonly desiredActionsPin?: (repos: readonly string[]) => Promise<string | null>;
   /** Clock for the heartbeat-TTL staleness math (defaults to `Date.now()`). */
   readonly now?: number;
 }
@@ -663,11 +715,16 @@ export interface RoutingDoctorDeps {
  * list. The modal/expected pin AND each `consistent` flag are scoped to FLEET-MEMBER
  * pinned repos only — a non-member's divergent pin neither pulls the modal nor flips
  * the verdict. Non-callers AND opted-out callers both get `consistent: null` (excluded).
+ *
+ * `desiredPin` (macf#872) drives the INDEPENDENT `correctness` axis — same member
+ * scoping as `consistent`, but compared against the AUTHORITATIVE manifest value
+ * (or `null`/unknown) rather than the modal.
  */
 async function resolveRepoPins(
   pinResults: readonly CallerPinResult[],
   readFleetMarker: (repo: string) => Promise<FleetMarker | null>,
-  expectedPinOverride?: string,
+  expectedPinOverride: string | undefined,
+  desiredPin: string | null,
 ): Promise<{ readonly repoPins: RepoPinRow[]; readonly expectedPin: string | null }> {
   const memberByRepo = new Map<string, boolean>();
   for (const r of pinResults) {
@@ -685,6 +742,7 @@ async function resolveRepoPins(
       status: r.status,
       fleetMember: member,
       consistent: member ? r.pin === expectedPin : null,
+      correctness: member ? evaluatePinCorrectness(r.pin, desiredPin) : null,
     };
   });
   return { repoPins, expectedPin };
@@ -762,7 +820,17 @@ export async function gatherRoutingDoctor(deps: RoutingDoctorDeps): Promise<Rout
   const repos = await deps.listRepos();
   const pinResults: CallerPinResult[] = [];
   for (const repo of repos) pinResults.push(await deps.readCallerPin(repo));
-  const { repoPins, expectedPin } = await resolveRepoPins(pinResults, deps.readFleetMarker, deps.expectedPin);
+  // macf#872: the AUTHORITATIVE desired pin (fleet manifest `versions.actions`) —
+  // resolved from the SAME install-set just fetched, so control-repo auto-discovery
+  // costs no extra round-trip. `null` (no dep injected, or none resolved) → every
+  // participating repo's `correctness` reads `unknown`, never a pass.
+  const desiredActionsPin = (await deps.desiredActionsPin?.(repos)) ?? null;
+  const { repoPins, expectedPin } = await resolveRepoPins(
+    pinResults,
+    deps.readFleetMarker,
+    deps.expectedPin,
+    desiredActionsPin,
+  );
 
   // Registry index (routability + freshness).
   const registry = await deps.listRegistry();
@@ -815,7 +883,16 @@ export async function gatherRoutingDoctor(deps: RoutingDoctorDeps): Promise<Rout
     currentCaFp,
   );
 
-  return { project: deps.project, repoPins, expectedPin, hasRoutingConfig, agents, ca, routingClientCert };
+  return {
+    project: deps.project,
+    repoPins,
+    expectedPin,
+    desiredActionsPin,
+    hasRoutingConfig,
+    agents,
+    ca,
+    routingClientCert,
+  };
 }
 
 // --- Verdict ---
@@ -924,14 +1001,25 @@ export function caMismatchCauseLine(report: RoutingDoctorReport): string | null 
   );
 }
 
-/** `4 fleet repos (pins consistent); 3 agents (2 routing-OK); CA ✓; routing-client cert ✓; routing plane: HEALTHY`. */
+/**
+ * `4 fleet repos (pins consistent + current ("v3.4.2")); 3 agents (2 routing-OK);
+ * CA ✓; routing-client cert ✓; routing plane: HEALTHY`.
+ *
+ * macf#872: the pin clause's parenthetical is driven by `classifyPinState` — NOT a
+ * plain `pinsOk` boolean — so `consistent-but-wrong` and `unknown` replace "pins
+ * consistent" IN PLACE rather than being appended as a separate line a reader could
+ * miss. This is the fix for the composite-verdict-overstatement half of #872: the
+ * exit code / HEALTHY-DEGRADED literal is untouched (warn-never-fail — see
+ * `routing-doctor-pin-correctness.ts`), but the text a human actually reads can no
+ * longer claim "pins consistent" while the fleet is uniformly stale or the manifest
+ * was unreachable.
+ */
 export function summaryLine(report: RoutingDoctorReport): string {
   const participating = report.repoPins.filter((r) => r.consistent !== null);
-  const pinsOk = participating.length > 0 && participating.every((r) => r.consistent);
   const agentOk = report.agents.filter(agentRoutingOk).length;
   const pinClause =
     participating.length > 0
-      ? `${participating.length} routing repo(s) (${pinsOk ? 'pins consistent' : 'PIN DIVERGENCE'})`
+      ? `${participating.length} routing repo(s) (${pinClauseText(classifyPinState(report), report.desiredActionsPin)})`
       : 'no routing-caller repos discovered';
   return (
     `${pinClause}; ${agentOk}/${report.agents.length} agents routing-OK; ` +
@@ -943,8 +1031,11 @@ export function summaryLine(report: RoutingDoctorReport): string {
 /**
  * Non-verdict-driving observations the watchdog should still SEE (DR-032 #610).
  * Currently: the session-name drift (`warn`) — visible, but it does NOT flip the
- * verdict (the known-pending session-rename migration). Surfaced additively in the
- * JSON `warnings[]` and the text-render warnings block.
+ * verdict (the known-pending session-rename migration) — and (macf#872) a fleet
+ * that is UNIFORMLY stale against the manifest: `consistent-but-wrong` doesn't
+ * fail the verdict either (warn-never-fail), so it needs the same loud-but-
+ * non-fatal visibility. Surfaced additively in the JSON `warnings[]` and the
+ * text-render warnings block.
  */
 export function collectWarnings(report: RoutingDoctorReport): readonly string[] {
   const out: string[] = [];
@@ -956,6 +1047,12 @@ export function collectWarnings(report: RoutingDoctorReport): readonly string[] 
           : `agent "${a.label}": tmux_session drift (expected "${a.sessionExpected}")`,
       );
     }
+  }
+  if (classifyPinState(report) === 'consistent-but-wrong') {
+    out.push(
+      `pin CORRECTNESS: every routing repo is uniformly pinned to "${report.expectedPin}", but the fleet ` +
+        `manifest declares "${report.desiredActionsPin}" as current — the fleet is consistently STALE, not healthy.`,
+    );
   }
   return out;
 }
@@ -1106,6 +1203,13 @@ export const HONESTY_LEGEND = [
   'Legend: CALLER-PIN = the macf-actions @version each routing repo pins (must all match).',
   '        A repo opts OUT of the pin check via .github/macf-fleet.json {"routing_fleet":false}',
   '        (e.g. an intentional-Stage-2 test harness); absent marker = fleet member.',
+  '        PIN CORRECTNESS is a SECOND, independent axis: CALLER-PIN/CONSISTENT above only prove',
+  '        the repos agree with EACH OTHER — a fleet uniformly stale on the same wrong pin still',
+  '        reads consistent. PIN CORRECTNESS compares that shared pin against the fleet manifest\'s',
+  '        declared versions.actions (an operator --manifest, or auto-discovered from the control',
+  '        repo already in this run\'s install-set); ✓ current / ✗ STALE / ? unknown (no manifest',
+  '        reachable — never treated as a pass). WARN-not-FAIL: a STALE reading does not flip the',
+  '        verdict, but replaces "pins consistent" in the summary line so it cannot read as healthy.',
   '        ROUTABLE = a MACF_AGENT_<LABEL> registry key exists (router resolves by LABEL).',
   '        SELF-SKIP = agent-config.json app_name is the bot-LOGIN, not the bare label. ✓ = an',
   '        authoritative login confirmed it; ✗ = a definite fault (missing/bare-label/mismatch);',
@@ -1180,6 +1284,18 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       routing_repos: participating.length,
       pins_consistent: participating.length > 0 && participating.every((r) => r.consistent),
       expected_pin: report.expectedPin,
+      // Additive under schema_version:3, no further bump (macf#872 — new field, no
+      // existing field's meaning shifted): the fleet-level composite crossing
+      // CONSISTENCY with CORRECTNESS vs the manifest — see `classifyPinState`.
+      // `pins_consistent:true` alone can NOT distinguish `consistent-and-correct`
+      // from `consistent-but-wrong`; a consumer that cares about correctness (not
+      // just agreement) must read THIS field, not `pins_consistent`.
+      pin_state: classifyPinState(report),
+      // Additive under schema_version:3, no further bump (macf#872): the
+      // AUTHORITATIVE desired pin this run resolved (`--manifest` override or
+      // control-repo auto-discovery); `null` when none was reachable — the
+      // honest-unknown floor `pin_state:"unknown"` reflects.
+      desired_actions_pin: report.desiredActionsPin,
       agents_total: report.agents.length,
       agents_routing_ok: report.agents.filter(agentRoutingOk).length,
       // Semantic shift (schema_version:2, macf#873): also false on a definite
@@ -1202,6 +1318,11 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       // Additive (schema_version:1, #614): true = participates in pins_consistent.
       fleet_member: r.fleetMember,
       consistent: r.consistent,
+      // Additive under schema_version:3, no further bump (macf#872): correctness
+      // vs the manifest, INDEPENDENT of `consistent`. `null` for the same
+      // exclusions as `consistent`; among participants, `"unknown"` when no
+      // authoritative desired pin was reachable — never collapsed into a pass.
+      correctness: r.correctness,
     })),
     agents: report.agents.map((a) => ({
       label: a.label,
@@ -1277,6 +1398,7 @@ function readLocalRoutingConfig(projectDir: string): RoutingConfig | null {
 
 async function resolveDepsFromRegistry(
   projectDir: string,
+  manifestPathOverride?: string,
 ): Promise<{ readonly ok: true; readonly deps: RoutingDoctorDeps } | { readonly ok: false; readonly code: number }> {
   const config = readAgentConfig(projectDir);
   if (!config) {
@@ -1314,6 +1436,12 @@ async function resolveDepsFromRegistry(
   // + scope as CA material (DR-006) — written by `macf certs issue-routing-client`.
   const routingClientCertIssuerVarName = `${toVariableSegment(config.project)}_ROUTING_CLIENT_CERT_ISSUER`;
 
+  // macf#872: the pin-CORRECTNESS check's authoritative source — `--manifest`
+  // override, else control-repo auto-discovery off the install-set already fetched
+  // this run (readControlManifestYaml is only ever invoked if discovery finds a
+  // matching repo — see `resolveDesiredActionsPin`).
+  const readControlManifestYaml = createFleetManifestReader(token);
+
   return {
     ok: true,
     deps: {
@@ -1322,6 +1450,8 @@ async function resolveDepsFromRegistry(
       listRepos: createInstallRepoLister(token),
       readCallerPin: createCallerPinReader(token),
       readFleetMarker: createFleetMarkerReader(token),
+      desiredActionsPin: (repos) =>
+        resolveDesiredActionsPin(manifestPathOverride, repos, config.project, readControlManifestYaml),
       readRoutingConfig: async () => localRouting ?? (await ghRoutingReader(detectCurrentRepo(projectDir) ?? '')),
       listRegistry: () => registry.list(''),
       probe: (host, port) => pingAgentHealth({ host, port, caCertPem: caCertPem ?? '', certPath, keyPath }),
@@ -1358,6 +1488,12 @@ export interface RunRoutingDoctorOptions {
   readonly json?: boolean;
   /** Explicit expected caller-pin (else the modal pin across the fleet). */
   readonly expectedPin?: string;
+  /**
+   * Path to a local `fleet.yaml` manifest (macf#872) — supplies the AUTHORITATIVE
+   * desired `macf-actions` pin (`versions.actions`) for the pin-CORRECTNESS check.
+   * Omit to fall back to control-repo auto-discovery, else honest `unknown`.
+   */
+  readonly manifestPath?: string;
 }
 
 /**
@@ -1406,7 +1542,7 @@ async function runRoutingDoctorInner(
 ): Promise<number> {
   let resolved = deps;
   if (!resolved) {
-    const r = await resolveDepsFromRegistry(projectDir);
+    const r = await resolveDepsFromRegistry(projectDir, opts.manifestPath);
     if (!r.ok) return r.code;
     resolved = r.deps;
   }
@@ -1435,6 +1571,9 @@ async function runRoutingDoctorInner(
     console.log('Caller-pin consistency (App install-set):');
     console.log(formatRepoTable(report.repoPins));
     if (report.expectedPin) console.log(`Expected pin (modal): ${report.expectedPin}`);
+    // macf#872: a SECOND, independent line — the modal above is agreement-only;
+    // this is correctness against the fleet manifest's declared `versions.actions`.
+    console.log(pinCorrectnessLine(report));
     const nonFleet = collectNonFleetRepos(report);
     if (nonFleet.length > 0) {
       console.log(

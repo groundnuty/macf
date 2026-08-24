@@ -809,6 +809,14 @@ routing
   )
   .option('--json', 'Emit the structured per-check result as JSON (for scripting/automation)', false)
   .option('--expected-pin <pin>', 'Expected macf-actions caller-pin (else the modal pin across the fleet)')
+  .option(
+    '--manifest <path>',
+    'Path to a local fleet.yaml — supplies the AUTHORITATIVE desired macf-actions pin ' +
+      '(versions.actions) for the pin-CORRECTNESS check, distinct from the modal-agreement ' +
+      'consistency check above. Omit to auto-discover from the fleet\'s control repo (if any ' +
+      'is reachable in this run\'s install-set); absent either way renders correctness honest-' +
+      'unknown, never a pass.',
+  )
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .option('--e2e', 'Run the routing CAPABILITY probe instead of the static checks (requires --target-repo)', false)
   .option('--target-repo <owner/repo>', 'The --e2e probe target: files + labels the probe issue on THIS repo')
@@ -833,6 +841,7 @@ routing
     const code = await runRoutingDoctor(resolveProjectDir(opts.dir), {
       json: opts.json,
       expectedPin: opts.expectedPin,
+      manifestPath: opts.manifest,
     });
     process.exitCode = code;
   });
