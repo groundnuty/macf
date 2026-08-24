@@ -49,6 +49,7 @@ import {
   type RoutingDoctorDeps,
   type RoutingProbeFn,
 } from '../../src/cli/commands/routing-doctor.js';
+import { pinCorrectnessLine } from '../../src/cli/commands/routing-doctor-pin-correctness.js';
 
 function info(host: string, port: number, instanceId: string): AgentInfo {
   return { host, port, type: 'permanent', instance_id: instanceId, started: '2026-06-26T00:00:00Z' };
@@ -498,6 +499,83 @@ describe('check 1 (#614) — opt-out fleet membership scopes pins_consistent', (
     const report = await gatherRoutingDoctor(deps({ readFleetMarker: async () => ({ routing_fleet: true }) }));
     expect(report.repoPins.filter((r) => r.status === 'pinned').every((r) => r.fleetMember)).toBe(true);
     expect(collectNonFleetRepos(report)).toEqual([]);
+  });
+});
+
+describe('check 1 — pin CORRECTNESS vs the fleet manifest (macf#872): consistency-only reads a uniformly-stale fleet as healthy', () => {
+  it('DECISIVE CASE 1 — every repo matches the manifest → consistent-and-correct, HEALTHY, "current" in the rendered line', async () => {
+    const report = await gatherRoutingDoctor(deps({ desiredActionsPin: async () => 'v3.3.0' }));
+    expect(report.desiredActionsPin).toBe('v3.3.0');
+    expect(report.repoPins.every((r) => r.correctness === 'correct')).toBe(true);
+    const json = routingDoctorToJson(report) as {
+      summary: { pin_state: string; desired_actions_pin: string | null; verdict: string };
+    };
+    expect(json.summary.pin_state).toBe('consistent-and-correct');
+    expect(json.summary.desired_actions_pin).toBe('v3.3.0');
+    expect(routingVerdict(report)).toBe('HEALTHY');
+    expect(summaryLine(report)).toMatch(/current/);
+  });
+
+  it('DECISIVE CASE 2 (the macf#872 bug) — every repo drifted to the SAME wrong pin: a consistency-only check would read this identically to case 1', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        // Every repo agrees with the OTHERS (uniformly v3.4.1) — the pre-existing
+        // `consistent` check alone cannot tell this apart from a genuinely healthy fleet.
+        readCallerPin: async (repo) => ({ repo, pin: 'v3.4.1', status: 'pinned' }),
+        desiredActionsPin: async () => 'v3.4.2', // the manifest's current value
+      }),
+    );
+    expect(report.repoPins.every((r) => r.consistent === true)).toBe(true); // the OLD signal reads "healthy"
+    expect(report.repoPins.every((r) => r.correctness === 'incorrect')).toBe(true); // the NEW signal catches it
+    const json = routingDoctorToJson(report) as {
+      summary: { pin_state: string; verdict: string };
+    };
+    expect(json.summary.pin_state).toBe('consistent-but-wrong'); // distinct literal from case 1
+    expect(json.summary.pin_state).not.toBe('consistent-and-correct');
+    // Warn-never-fail: the exit-code-driving verdict is untouched by design.
+    expect(routingVerdict(report)).toBe('HEALTHY');
+    expect(json.summary.verdict).toBe('HEALTHY');
+    // The decisive assertion for the "composite verdict must not overstate" requirement:
+    // the rendered line a human reads must NOT still say "pins consistent" bare — it must
+    // say STALE, in the SAME clause, not a separate footnote.
+    const line = summaryLine(report);
+    expect(line).toMatch(/STALE/);
+    expect(line).not.toMatch(/pins consistent\)/);
+    // And it's loud (non-fatal warning), not silent.
+    expect(collectWarnings(report).some((w) => /STALE/.test(w))).toBe(true);
+  });
+
+  it('DECISIVE CASE 3 — repos pinned to DIFFERENT versions → inconsistent, distinguishable from case 2, DEGRADED unchanged', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        readCallerPin: async (repo) =>
+          repo === 'groundnuty/macf-science-agent'
+            ? { repo, pin: 'v3.4.1', status: 'pinned' }
+            : { repo, pin: 'v3.4.2', status: 'pinned' },
+        desiredActionsPin: async () => 'v3.4.2',
+      }),
+    );
+    const json = routingDoctorToJson(report) as { summary: { pin_state: string; verdict: string } };
+    expect(json.summary.pin_state).toBe('inconsistent');
+    expect(json.summary.pin_state).not.toBe('consistent-but-wrong'); // the two failure modes stay distinguishable
+    expect(routingVerdict(report)).toBe('DEGRADED'); // pre-existing behavior, untouched
+  });
+
+  it('no manifest reachable this run → unknown, never a pass — the honest floor', async () => {
+    const report = await gatherRoutingDoctor(deps()); // no desiredActionsPin dep injected
+    expect(report.desiredActionsPin).toBeNull();
+    expect(report.repoPins.every((r) => r.correctness === 'unknown')).toBe(true);
+    const json = routingDoctorToJson(report) as { summary: { pin_state: string } };
+    expect(json.summary.pin_state).toBe('unknown');
+    expect(summaryLine(report)).toMatch(/UNKNOWN/);
+    expect(pinCorrectnessLine(report)).toMatch(/unknown/i);
+    expect(routingVerdict(report)).toBe('HEALTHY'); // consistency alone still governs the untouched verdict
+  });
+
+  it('desiredActionsPin omitted from RoutingDoctorDeps entirely (no dep at all) also renders unknown, not a throw', async () => {
+    const { desiredActionsPin: _omit, ...withoutDep } = deps();
+    const report = await gatherRoutingDoctor(withoutDep as RoutingDoctorDeps);
+    expect(report.desiredActionsPin).toBeNull();
   });
 });
 
@@ -1086,8 +1164,22 @@ describe('rendering — tables + glyphs', () => {
   });
   it('buildRepoRows + formatRepoTable render REPO / CALLER-PIN / CONSISTENT', () => {
     const rows = [
-      { repo: 'groundnuty/macf', pin: 'v3.3.0', status: 'pinned' as const, fleetMember: true, consistent: true },
-      { repo: 'groundnuty/x', pin: 'v1.3.4', status: 'pinned' as const, fleetMember: true, consistent: false },
+      {
+        repo: 'groundnuty/macf',
+        pin: 'v3.3.0',
+        status: 'pinned' as const,
+        fleetMember: true,
+        consistent: true,
+        correctness: 'unknown' as const,
+      },
+      {
+        repo: 'groundnuty/x',
+        pin: 'v1.3.4',
+        status: 'pinned' as const,
+        fleetMember: true,
+        consistent: false,
+        correctness: 'unknown' as const,
+      },
     ];
     expect(buildRepoRows(rows)).toEqual([
       ['groundnuty/macf', 'v3.3.0', '✓'],
