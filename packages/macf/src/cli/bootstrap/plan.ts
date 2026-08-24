@@ -900,7 +900,7 @@ function labelsItem(agent: FleetAgent): PlanItem {
     reason:
       `role + status labels on "${agent.repo}" are not observable at plan time (no per-label API read wired) — ` +
       'apply attempts label creation unconditionally on every repo-init run, whether or not the labels already ' +
-      'exist; this item cannot distinguish "missing" from "already present" (groundnuty/macf#926).',
+      'exist; this item cannot distinguish "missing" from "already present".',
     confirm_required: false,
   };
 }
@@ -2157,12 +2157,12 @@ export function buildPlanRows(items: readonly PlanItem[]): readonly (readonly st
   return items.map((i) => [i.kind, i.target, i.verb.toUpperCase(), i.confirm_required ? 'yes' : 'no', i.reason]);
 }
 
-/** `4 create, 1 update (confirm-required), 3 noop, 1 report-extra (never deleted), 2 write-always (not comparable to reality — groundnuty/macf#926)`. */
+/** `4 create, 1 update (confirm-required), 3 noop, 1 report-extra (never deleted), 2 write-always (not comparable to observed state)` (groundnuty/macf#926, comment only — the string itself never cites an issue number). */
 export function summaryLine(summary: PlanSummary): string {
   return (
     `${String(summary.creates)} create, ${String(summary.updates)} update (confirm-required), ` +
     `${String(summary.noops)} noop, ${String(summary.extras)} report-extra (never deleted), ` +
-    `${String(summary.writeAlways)} write-always (not comparable to reality — groundnuty/macf#926)`
+    `${String(summary.writeAlways)} write-always (not comparable to observed state)`
   );
 }
 
