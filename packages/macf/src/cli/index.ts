@@ -127,6 +127,20 @@ program
       'always written/refreshed regardless.',
     false,
   )
+  // Commander's `--no-<flag>` convention auto-defaults `opts.agentsIndex` to
+  // `true` (registered) — deliberately NO explicit 3rd-arg default here.
+  // An explicit `false` 3rd arg on a `--no-` option conflicts with
+  // commander's own convention and pins the value regardless of whether
+  // the flag was passed (macf#347 — reproduced + fixed for
+  // --no-migrate-env-files; same shape, same fix).
+  .option(
+    '--no-agents-index',
+    'Skip registering this workspace in the global cross-project agents ' +
+      'index (~/.macf/agents.json). For a scoped/ephemeral init — a CI ' +
+      'harness check, a scratch validation workspace — that should not ' +
+      'become discoverable via `macf status`/`macf peers`/`macf list` on ' +
+      'this host. Ordinary invocations register as before.',
+  )
   .action(async (opts) => {
     const projectDir = opts.dir ? resolve(opts.dir) : process.cwd();
     // `--local` is the discoverable shorthand for `--registry-type local`
@@ -157,6 +171,7 @@ program
       pluginVersion: opts.pluginVersion,
       actionsVersion: opts.actionsVersion,
       force: opts.force,
+      agentsIndex: opts.agentsIndex,
     });
   });
 

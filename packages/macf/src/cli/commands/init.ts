@@ -152,6 +152,30 @@ export interface InitOptions {
    * comment for the full reasoning.
    */
   readonly force?: boolean;
+  /**
+   * Whether this run registers in the global cross-project agents index
+   * (~/.macf/agents.json) — macf#1135. Defaults to `true` (unset ≡
+   * register, the historical, UNCHANGED behavior for every existing
+   * caller). Set to `false` (`--no-agents-index`) for a scoped/ephemeral
+   * `macf init` invocation that should not become globally discoverable
+   * via `macf status`/`macf peers`/`macf list` on this host — e.g. a
+   * release-time harness-check materializing a scratch workspace purely
+   * to validate generator output (release.sh's `cmd_harness_check`).
+   *
+   * Deliberately mode-independent (works for `--local` AND
+   * repo/org/profile registries) and independent of the local-registry
+   * `--path` flag: `--path`'s own documented purpose is PERMANENT
+   * relocation of the registry file (a separate disk, an encrypted home,
+   * ...), which is the opposite intent of "this run is ephemeral" — tying
+   * the skip to `--path` would silently drop an operator's deliberately-
+   * relocated agent out of the global index, with only a log line as the
+   * signal. A dedicated flag keeps the two questions ("where does the
+   * registry file live" vs "should this workspace be globally
+   * discoverable") independently answerable, and covers the GitHub-mode /
+   * CI-scratch-dir shape `--path`-only gating could never reach (`--path`
+   * only exists for `--local`).
+   */
+  readonly agentsIndex?: boolean;
 }
 
 /**
@@ -606,8 +630,66 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // Add .macf/ to .gitignore
   updateGitignore(absDir);
 
-  // Register in global index
-  addToAgentsIndex(absDir);
+  // Register in global index (macf#1135). `addToAgentsIndex` writes to
+  // ~/.macf/agents.json unconditionally — a location this function has
+  // never derived from `absDir`/`--dir`, in EITHER registry mode. Two
+  // independent problems, two independent fixes below:
+  //
+  //  1. WHICH runs get indexed. `opts.agentsIndex === false`
+  //     (`--no-agents-index`) is an explicit, mode-independent opt-out for
+  //     a scoped/ephemeral run that should not become globally
+  //     discoverable via `macf status`/`macf peers`/`macf list` on this
+  //     host — release.sh's cmd_harness_check is exactly this shape: a
+  //     scratch, throwaway workspace materialized to validate generator
+  //     output. Skipping is never silent — see the console.log below.
+  //     Two alternatives considered and rejected:
+  //       - Tying the skip to the local-registry `--path` flag instead of
+  //         a dedicated flag. Rejected: `--path`'s own documented purpose
+  //         is PERMANENT relocation of the registry file (a separate
+  //         disk, an encrypted home, ...) — the OPPOSITE intent of "this
+  //         run is ephemeral". Coupling the two would silently drop an
+  //         operator's deliberately-relocated `--local` agent out of the
+  //         global index. It would also only ever cover `--local`
+  //         invocations, leaving a GitHub-mode CI/scratch-dir `macf init`
+  //         (repo/org/profile registry, no `--path` involved at all)
+  //         exposed to the exact same bug this fix closes.
+  //       - "Write the index entry under the target path." Rejected:
+  //         every reader (`readAgentsIndex`/`loadAllAgents`, which drive
+  //         `macf status`/`macf peers`/`macf list`) only ever reads the
+  //         ONE global path, so a per-workspace copy would never be read
+  //         by anything — not a redirect, a silent no-op with extra steps.
+  //     An ordinary run — `agentsIndex` unset/`true`, the default for
+  //     every existing caller — is UNCHANGED: it still registers, exactly
+  //     as before this fix.
+  //  2. WHAT HAPPENS when the write itself fails (e.g. EROFS on a read-only
+  //     $HOME). The global index is a cross-project discovery convenience —
+  //     nothing about THIS workspace's own operation (its cert, its
+  //     claude.sh, its .claude/settings.json written below) depends on it.
+  //     A write failure here is therefore NOT fatal to `init`'s purpose:
+  //     caught, reported, and init proceeds. Before this fix the call was
+  //     unguarded, so an EROFS here aborted init before `.claude/settings.json`
+  //     (or anything written after this line) ever landed — the visible
+  //     symptom was "settings file missing", not "could not write your
+  //     home directory".
+  if (opts.agentsIndex === false) {
+    console.log(
+      '  Index: skipped the global agents index (--no-agents-index) — ' +
+        'this run is scoped/ephemeral. Omit the flag to register this ' +
+        'workspace normally.',
+    );
+  } else {
+    try {
+      addToAgentsIndex(absDir);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`  Warning: could not update the global agents index: ${msg}`);
+      console.warn(
+        `    ${absDir} is still fully initialized; ` +
+          '`macf status`/`macf peers`/`macf list` will not discover it ' +
+          'automatically until this is resolved.',
+      );
+    }
+  }
 
   // Copy canonical coordination rules into <workspace>/.claude/rules/
   // (single source of truth shipped with the CLI; refreshed by `macf update`)

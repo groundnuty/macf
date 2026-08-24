@@ -3,7 +3,9 @@ import { join, resolve } from 'node:path';
 import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { initAgent } from '../../src/cli/commands/init.js';
-import { readAgentConfig, agentCertPath, caCertPath, caKeyPath, caDir, readAgentsIndex, writeAgentsIndex } from '../../src/cli/config.js';
+import {
+  readAgentConfig, agentCertPath, caCertPath, caKeyPath, caDir, readAgentsIndex, writeAgentsIndex,
+} from '../../src/cli/config.js';
 import { hasManagedHeader } from '../../src/cli/claude-sh.js';
 import { createCA } from '@groundnuty/macf-core';
 
@@ -655,6 +657,144 @@ describe('macf init', () => {
 
       expect(readFileSync(telemetryPath, 'utf-8')).toBe(operatorTelemetry);
     }, 30000);
+  });
+
+  // --- agents-index scoping via --no-agents-index (macf#1135) ---
+  //
+  // `addToAgentsIndex` writes ~/.macf/agents.json unconditionally — no
+  // `--dir` ever redirected it, in EITHER registry mode. `agentsIndex:
+  // false` (`--no-agents-index`) is a dedicated, mode-independent opt-out:
+  // NOT tied to the local-registry `--path` flag, whose own documented
+  // purpose is PERMANENT relocation of the registry file (opposite intent
+  // to "this run is ephemeral") and which only ever exists for `--local`
+  // anyway — a GitHub-mode CI/scratch-dir run has no `--path` to key off
+  // at all. See the `addToAgentsIndex` call site in `init.ts` for the full
+  // decision + rejected alternatives.
+  describe('agents-index scoping via --no-agents-index (macf#1135)', () => {
+    // AGENTS_INDEX_PATH is a SHARED file on this machine — every `macf
+    // init` run on this host, including any OTHER agent/process running
+    // concurrently, reads/writes the SAME path (it is a module-scope const
+    // resolved from `homedir()` at IMPORT time — see the comment on the
+    // `skipCertIfPresent` describe block below for why `vi.stubEnv('HOME',
+    // …)` can't redirect it). Assertions below are therefore CONTAINMENT
+    // checks on "did THIS run's own entry land", not whole-file
+    // byte-identity: byte-identity is exposed to false failures from any
+    // unrelated concurrent writer, and — worse — a naive snapshot/restore
+    // around it risks CLOBBERING that writer's legitimate entry.
+    //
+    // This is also why a genuine read-only-$HOME rehearsal isn't attempted
+    // in-process: the fix's mechanism (skip the write entirely) means a
+    // `--no-agents-index` run touches nothing under $HOME at all, which is
+    // exactly what the decisive test below proves.
+    it('DECISIVE: --no-agents-index never registers the workspace, corrupts nothing already there, and succeeds — equivalent to succeeding under a read-only $HOME, since nothing here is asked to write there', async () => {
+      const workspaceDir = join(dir, 'workspace');
+      // Snapshot what's already there so the "corrupts nothing" half of
+      // the assertion below isn't fooled by `readAgentsIndex()`'s own
+      // parse-failure fallback (`{ agents: [] }` on missing/malformed
+      // JSON) — a corrupted file would otherwise read as "contains
+      // nothing", which trivially (and wrongly) satisfies a pure
+      // not-toContain check. `arrayContaining` catches that: concurrent
+      // writers on this shared file only ever APPEND, so every entry
+      // present before this run must still be present after, in EITHER
+      // outcome (fixed or broken).
+      const beforeAgents = readAgentsIndex().agents;
+
+      await expect(initAgent(workspaceDir, {
+        project: `pathrun${Date.now()}${Math.floor(Math.random() * 1e6)}`,
+        role: 'code-agent',
+        registryType: 'local',
+        registryPath: join(dir, 'registry.json'), // scratch — inside this test's own tmp dir, never $HOME
+        agentsIndex: false,
+        cliVersion: '0.1.0',
+        pluginVersion: '0.1.0',
+        actionsVersion: 'v1',
+      })).resolves.not.toThrow();
+
+      // Per assert-the-wrong-path.md: a zero-effect containment assertion,
+      // not merely "the command exited 0" — today's code exits 0 WHILE
+      // registering this workspace, which is the bug this test pins.
+      const afterAgents = readAgentsIndex().agents;
+      expect(afterAgents).not.toContain(resolve(workspaceDir));
+      expect(afterAgents).toEqual(expect.arrayContaining(beforeAgents));
+    }, 20000);
+
+    it('is mode-independent: also skips for a GitHub-mode (repo) registry, not just --local', async () => {
+      const workspaceDir = join(dir, 'workspace-gh');
+
+      await initAgent(workspaceDir, {
+        project: 'TEST',
+        role: 'code-agent',
+        appId: '123',
+        installId: '456',
+        keyPath: '.key.pem',
+        registryType: 'repo',
+        registryRepo: 'owner/repo',
+        agentsIndex: false,
+        cliVersion: '0.1.0',
+        pluginVersion: '0.1.0',
+        actionsVersion: 'v1',
+      });
+
+      const index = readAgentsIndex();
+      expect(index.agents).not.toContain(resolve(workspaceDir));
+    }, 20000);
+
+    it('reports the skip, naming how to opt back in', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        const workspaceDir = join(dir, 'workspace2');
+
+        await initAgent(workspaceDir, {
+          project: `pathrun2${Date.now()}${Math.floor(Math.random() * 1e6)}`,
+          role: 'code-agent',
+          registryType: 'local',
+          registryPath: join(dir, 'registry2.json'),
+          agentsIndex: false,
+          cliVersion: '0.1.0',
+          pluginVersion: '0.1.0',
+          actionsVersion: 'v1',
+        });
+
+        const logged = logSpy.mock.calls.flat().join('\n');
+        expect(logged).toMatch(/skipped the global agents index/);
+      } finally {
+        logSpy.mockRestore();
+      }
+    }, 20000);
+
+    it('an ORDINARY run (agentsIndex unset) still updates the index — the fix does not silently disable it', async () => {
+      const workspaceDir = join(dir, 'workspace3');
+
+      await initAgent(workspaceDir, {
+        project: 'TEST',
+        role: 'code-agent',
+        appId: '123',
+        installId: '456',
+        keyPath: '.key.pem',
+        registryType: 'repo',
+        registryRepo: 'owner/repo',
+        cliVersion: '0.1.0',
+        pluginVersion: '0.1.0',
+        actionsVersion: 'v1',
+      });
+
+      const resolvedWorkspace = resolve(workspaceDir);
+      try {
+        const index = readAgentsIndex();
+        expect(index.agents).toContain(resolvedWorkspace);
+      } finally {
+        // Remove only OUR OWN entry via a read-modify-write, never a full
+        // restore. Still a narrower version of the SAME shared-file hazard
+        // this describe block's other tests avoid entirely: a concurrent
+        // writer that appends between this read and this write loses its
+        // entry. Accepted here (not eliminated) because addToAgentsIndex
+        // itself is a read-modify-write over the same file with the same
+        // exposure — this cleanup doesn't introduce a NEW hazard class,
+        // just narrows the existing one back down after the test.
+        const current = readAgentsIndex();
+        writeAgentsIndex({ agents: current.agents.filter((p) => p !== resolvedWorkspace) });
+      }
+    }, 20000);
   });
 });
 
