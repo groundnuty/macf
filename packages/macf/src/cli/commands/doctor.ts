@@ -18,6 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
+import { fromVariableSegment } from '@groundnuty/macf-core';
 import { readAgentConfig, resolveCanonicalBranch, tokenSourceFromConfig, writeAgentConfig } from '../config.js';
 import type { MacfAgentConfig } from '../config.js';
 import { defaultProcReader, scanMacfProcesses } from '../proc-scan.js';
@@ -580,6 +581,250 @@ export async function repairBotLogin(
     github_app: { ...config.github_app, bot_login: botLogin },
   });
   return botLogin;
+}
+
+/**
+ * One finding from the redundant-project-prefix identity check
+ * (groundnuty/macf#1009).
+ *
+ * `field` names which config key the redundant prefix was found on;
+ * `severity` distinguishes the confirmed load-bearing case (`routing_label`,
+ * or `agent_name` when `routing_label` is unset and `agent_name` is standing
+ * in for it) from the two INFO cases — cosmetic (`agent_name` alone,
+ * `routing_label` independently set and clean) and ambiguous (the prefix
+ * matches but the remainder doesn't match this workspace's declared role —
+ * see `classifyProjectPrefix`'s doc for why that's deliberately NOT WARN).
+ */
+export interface RoutingLabelPrefixFinding {
+  readonly field: 'routing_label' | 'agent_name';
+  readonly severity: 'WARN' | 'INFO';
+  readonly observed: string;
+  readonly expected: string;
+  readonly message: string;
+}
+
+/**
+ * Result of `checkRoutingLabelProjectPrefix`.
+ *
+ *   - `PASS` — no redundant project prefix found.
+ *   - `WARN` — the routing-breaking case: the EFFECTIVE routing label
+ *     (`routing_label`, or `agent_name` as its fallback) carries the prefix,
+ *     CONFIRMED against this workspace's own declared `agent_role`.
+ *   - `INFO` — either a cosmetic `agent_name`-only prefix (`routing_label`
+ *     independently set and clean), or an AMBIGUOUS prefix match that
+ *     couldn't be confirmed against `agent_role` — see `classifyProjectPrefix`.
+ *   - `UNKNOWN` — `config` was `null` (macf-agent.json absent or unreadable).
+ *     Never reported as `PASS` — see the module doc below.
+ */
+export type RoutingLabelPrefixStatus = 'PASS' | 'WARN' | 'INFO' | 'UNKNOWN';
+
+export interface RoutingLabelPrefixCheckResult {
+  readonly status: RoutingLabelPrefixStatus;
+  readonly findings: readonly RoutingLabelPrefixFinding[];
+}
+
+/** One of the three ways a label relates to `<project>-<agent_role>` — see `classifyProjectPrefix`. */
+type ProjectPrefixVerdict = 'clean' | 'confirmed' | 'ambiguous';
+
+/**
+ * Classify `label` against `project` + this workspace's own declared
+ * `agentRole` — the ONE stable, independent value already in the schema for
+ * exactly this kind of comparison. `routing-label-drift.ts`'s role-vs-label
+ * drift check established the precedent: `agent_role` is written once at
+ * init/deploy time and nothing routes on it, so it can stand in for "what
+ * the bare label SHOULD be" without being circular (the label under test
+ * can't be used to validate itself).
+ *
+ * A blind `<project>-` prefix strip (trying every value that merely STARTS
+ * WITH the project) was tried and rejected: `repo-init.ts`'s
+ * `normalizeDoublePrefixedKeys` documents the identical trap on the
+ * repo-side `agent-config.json` key — "a blind prefix strip over every
+ * existing key would risk false-positiving on a legitimately named agent
+ * that happens to start with the project's name." The same trap exists
+ * here: a workspace whose project genuinely happens to share a stem with
+ * its OWN role (project `devops`, role `devops-agent` → `routing_label`
+ * correctly `devops-agent`) would false-positive under a blind match — the
+ * "fix" that check would recommend (rename to `agent`) actively breaks a
+ * healthy workspace.
+ *
+ *   - `'clean'`     — `label` doesn't start with `<project>-` at all.
+ *   - `'confirmed'` — `label` normalises to EXACTLY `<project>-<agentRole>`.
+ *     This is the DR-032 double-prefix bug, confirmed against the
+ *     independent `agent_role` field, not inferred from string shape alone.
+ *   - `'ambiguous'` — `label` starts with `<project>-`, but what follows
+ *     does NOT match `agentRole`. Could be the same hazard under a
+ *     differently-shaped role, or could be a coincidental stem collision
+ *     (the `devops`/`devops-agent` case above), or an unrelated role/label
+ *     rename drift (a different, already-tracked class). Not enough
+ *     independent evidence to assert which — callers must not claim the
+ *     confirmed routing-breaking mechanism for this verdict.
+ */
+function classifyProjectPrefix(project: string, agentRole: string, label: string): ProjectPrefixVerdict {
+  if (project.length === 0) return 'clean';
+  const normProject = fromVariableSegment(project);
+  const normLabel = fromVariableSegment(label);
+  const prefix = `${normProject}-`;
+  if (normLabel.length <= prefix.length || !normLabel.startsWith(prefix)) return 'clean';
+  const normExpected = `${normProject}-${fromVariableSegment(agentRole)}`;
+  return normLabel === normExpected ? 'confirmed' : 'ambiguous';
+}
+
+/** Build the WARN (confirmed routing-breaking) finding message — names observed, expected, and the four consequences. */
+function buildConfirmedPrefixMessage(
+  project: string,
+  field: 'routing_label' | 'agent_name',
+  observed: string,
+  expected: string,
+): string {
+  return (
+    `${field} "${observed}" redundantly repeats the project "${project}" — this workspace's own ` +
+    `declared role is "${expected}", so ${field} should be the bare "${expected}", not the ` +
+    `project-prefixed form. This is not cosmetic: the registry variable this agent registers under ` +
+    `doubles the project segment, its tmux session name doubles the project segment, and a peer ` +
+    `addressing it across fleets gets a confusing slug. Worse, it fails silently: the router resolves ` +
+    `a plain "${expected}" GitHub label against the registry key this workspace registers under, and ` +
+    `the doubled prefix means that key never matches — issues routed to this agent are silently ` +
+    `dropped, with no error anywhere. Fix: set ${field} to "${expected}" — the registry key, the ` +
+    `certificate CN, and the tmux session all derive from it.`
+  );
+}
+
+/** Build the INFO (cosmetic) finding message for a confirmed-prefixed `agent_name` when `routing_label` is independently clean. */
+function buildCosmeticPrefixMessage(project: string, observed: string, expected: string): string {
+  return (
+    `agent_name "${observed}" redundantly repeats the project "${project}" — this workspace's own ` +
+    `declared role is "${expected}". Unlike routing_label, agent_name is the OTEL telemetry display ` +
+    `value — a prefix here is noise, not breakage, since routing_label is set independently and ` +
+    `already carries the routing identity. Still worth fixing so telemetry, labels, and @mentions ` +
+    `read as one family.`
+  );
+}
+
+/** Build the INFO (ambiguous match) finding message — hedged, names both values, does NOT assert the routing-breaking mechanism. */
+function buildAmbiguousPrefixMessage(
+  project: string,
+  field: 'routing_label' | 'agent_name',
+  observed: string,
+  declaredRole: string,
+): string {
+  return (
+    `${field} "${observed}" starts with the project "${project}" as a prefix, but what follows it ` +
+    `does not match this workspace's own declared role ("${declaredRole}"). This MAY be the same ` +
+    `double-registration hazard as a confirmed redundant prefix (registry variable, tmux session, and ` +
+    `cross-fleet slug all keying on a doubled project segment) under a role that was renamed without ` +
+    `updating ${field} — or it may be an unrelated, coincidental name overlap. Not enough independent ` +
+    `evidence here to say which; worth a manual check.`
+  );
+}
+
+/** Classify one field's value and, if it's not clean, push the matching finding onto `findings`. */
+function pushPrefixFinding(
+  findings: RoutingLabelPrefixFinding[],
+  field: 'routing_label' | 'agent_name',
+  project: string,
+  agentRole: string,
+  observed: string,
+  cosmeticNotConfirmed: boolean,
+): void {
+  const verdict = classifyProjectPrefix(project, agentRole, observed);
+  if (verdict === 'clean') return;
+  if (verdict === 'confirmed') {
+    findings.push({
+      field,
+      severity: cosmeticNotConfirmed ? 'INFO' : 'WARN',
+      observed,
+      expected: agentRole,
+      message: cosmeticNotConfirmed
+        ? buildCosmeticPrefixMessage(project, observed, agentRole)
+        : buildConfirmedPrefixMessage(project, field, observed, agentRole),
+    });
+    return;
+  }
+  findings.push({
+    field,
+    severity: 'INFO',
+    observed,
+    expected: agentRole,
+    message: buildAmbiguousPrefixMessage(project, field, observed, agentRole),
+  });
+}
+
+/**
+ * Detect a redundant `<project>-` prefix on this workspace's routing
+ * identity (groundnuty/macf#1009 — split from #791; the 2026-07-05 icsoc
+ * routing outage's root state, previously undetectable by any `macf doctor`
+ * check). `routing_label` is load-bearing well past this workspace: per
+ * DR-032, it is the field the registry variable, the mTLS cert CN, and the
+ * tmux session name are all derived from (`coordination.md` "Canonical tmux
+ * launch pattern"). A `<project>-` prefix baked into it — the mistake the
+ * pre-fix DR-035 bootstrap onboarding text invited — is not cosmetic: it
+ * doubles the project segment in the registry key AND the tmux session name,
+ * produces a confusing cross-fleet slug, and — the part that fails
+ * silently — makes the registry key this workspace registers under
+ * permanently unreachable from the plain `<role>-agent` GitHub label the
+ * router resolves against. Nothing errors; the issue is just never routed.
+ *
+ * Checks TWO fields, per DR-032's field-precision note (`agent_name`
+ * defaults into `routing_label` when the latter is unset, so a prefixed
+ * `agent_name` can ALSO be the thing that's actually breaking routing):
+ *
+ *   1. The EFFECTIVE routing label — `routing_label` if set, else
+ *      `agent_name` as its fallback (the SAME precedence `discovery.ts`,
+ *      `certs.ts`, `restart-self.ts`, and the routing-label-drift check all
+ *      use). A CONFIRMED redundant prefix here is `WARN` regardless of which
+ *      field it came from, because it is THE field routing derives from
+ *      today.
+ *   2. `agent_name` independently, ONLY when it wasn't already covered by
+ *      (1) — i.e. `routing_label` is set to something else. A CONFIRMED
+ *      prefix there is genuinely cosmetic (`INFO`, not `WARN`) — see AC #2
+ *      in the filed issue.
+ *
+ * Both checks route through `classifyProjectPrefix`, which requires the
+ * match to be CONFIRMED against this workspace's own `agent_role` before
+ * asserting the routing-breaking mechanism — an unconfirmed (`'ambiguous'`)
+ * prefix match is surfaced at `INFO` with a hedged message, never a `WARN`
+ * claiming certainty the check doesn't have.
+ *
+ * Deliberately NOT wired into `--fix`: unlike the settings-floor repairs
+ * `--fix` performs (idempotent, additive writes), renaming a LIVE
+ * `routing_label` is a cert-CN regen + registry-key change + router
+ * cutover — DR-032 treats exactly that class of change as a gated
+ * operational migration, not a settings write `--fix` can safely automate.
+ *
+ * Honest-unknown floor: `config === null` means macf-agent.json is absent OR
+ * unreadable (`readAgentConfig` already collapses both cases) — reported as
+ * `UNKNOWN`, never silently folded into `PASS`. Same tri-state discipline as
+ * `routing-label-drift.ts` / `peer-liveness.ts`.
+ *
+ * Detects the state AS IT EXISTS, not only at creation time — every call
+ * re-reads the config's current fields, so a workspace that drifted into
+ * this state long after `macf init` is caught exactly the same as one
+ * created wrong.
+ */
+export function checkRoutingLabelProjectPrefix(
+  config: MacfAgentConfig | null,
+): RoutingLabelPrefixCheckResult {
+  if (!config) {
+    return { status: 'UNKNOWN', findings: [] };
+  }
+
+  const findings: RoutingLabelPrefixFinding[] = [];
+  const routingLabelSet = config.routing_label !== undefined;
+  const effectiveField: 'routing_label' | 'agent_name' = routingLabelSet ? 'routing_label' : 'agent_name';
+  const effectiveLabel = config.routing_label ?? config.agent_name;
+
+  pushPrefixFinding(findings, effectiveField, config.project, config.agent_role, effectiveLabel, false);
+
+  // agent_name checked separately only when routing_label is set to a
+  // DIFFERENT value — avoids double-reporting the common case where
+  // routing_label === agent_name (already covered above).
+  if (routingLabelSet && config.agent_name !== effectiveLabel) {
+    pushPrefixFinding(findings, 'agent_name', config.project, config.agent_role, config.agent_name, true);
+  }
+
+  if (findings.length === 0) return { status: 'PASS', findings: [] };
+  const status: RoutingLabelPrefixStatus = findings.some((f) => f.severity === 'WARN') ? 'WARN' : 'INFO';
+  return { status, findings };
 }
 
 /**
@@ -1318,6 +1563,11 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   printCanonicalBranchSection(checkCanonicalBranch(config, readCurrentBranch(projectDir)));
 
   console.log('');
+  console.log('Routing identity');
+  console.log('──────────────────────────────────────────────────────────────');
+  printRoutingLabelPrefixSection(checkRoutingLabelProjectPrefix(config));
+
+  console.log('');
   console.log('Attribution identity');
   console.log('──────────────────────────────────────────────────────────────');
   let botLoginCheck = checkBotLogin(config);
@@ -1407,6 +1657,23 @@ function printCanonicalBranchSection(check: CanonicalBranchCheckResult): void {
   } else {
     console.log(`  ⚠ ${check.detail}  [WARN]`);
     console.log('    Fix: switch the workspace to its canonical branch, or set canonicalBranch in macf-agent.json.');
+  }
+}
+
+/** Print the groundnuty/macf#1009 routing-label/agent-name project-prefix report section for `check`. */
+function printRoutingLabelPrefixSection(check: RoutingLabelPrefixCheckResult): void {
+  if (check.status === 'UNKNOWN') {
+    console.log('  ? macf-agent.json could not be read — skipping the project-prefix check  [UNKNOWN]');
+    return;
+  }
+  if (check.status === 'PASS') {
+    console.log('  ✓ routing_label / agent_name carry no redundant project prefix  [PASS]');
+    return;
+  }
+  for (const f of check.findings) {
+    const symbol = f.severity === 'WARN' ? '⚠' : 'ℹ';
+    console.log(`  ${symbol} ${f.field}: observed "${f.observed}", expected "${f.expected}"  [${f.severity}]`);
+    console.log(`    ${f.message}`);
   }
 }
 
