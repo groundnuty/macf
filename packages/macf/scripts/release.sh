@@ -419,6 +419,13 @@ check_harness_compat() {
     # "Invalid settings" section's bullets (stops at the next ALL-CAPS-
     # initial section heading), so a LATER "N warning(s) found" section's
     # own "- " bullets are never mistaken for these.
+    # Substring match, not path-position match — the workspace path could
+    # in principle appear inside a bullet's DESCRIPTION rather than as the
+    # finding's own subject (e.g. an ancestor finding that happens to quote
+    # a workspace path in its text). A mktemp -d path is unique enough that
+    # this is remote, and real bullets consistently lead with the path, so
+    # this is "the workspace path appears in this finding," treated as
+    # good-enough proxy for "this finding is about the workspace."
     local in_scope_bullets
     in_scope_bullets="$(printf '%s\n' "$doctor_out" \
       | sed -n '/^Invalid settings$/,/^[A-Z]/{/^- /p}' \
@@ -482,7 +489,7 @@ check_harness_compat() {
     # permission-rule rejection as "rejected the launch invocation" and
     # never surface the actual offending rule.
     if ! printf '%s' "$p_out" | grep -q 'Error: Input must be provided'; then
-      log "Claude Code $cc_version did not reach the expected 'no prompt given' terminal state — reviewing raw output for a launch-time rejection (e.g. an unrecognized launcher flag):"
+      log "Claude Code $cc_version did not reach the expected 'no prompt given' terminal state — raw output follows:"
       log "$p_out"
       rc=1
     fi
