@@ -96,7 +96,7 @@ import type { RemainingDeployReport, RemainingDeployStep } from '../bootstrap/re
 import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
 import type { ApplyDeployPhaseDeps, DeployPhaseAgentResult } from '../bootstrap/apply-deploy.js';
 import { anyDeployFailed, runApplyDeployPhase } from '../bootstrap/apply-deploy.js';
-import { realAuthenticatedCloneRepo, realMintCloneToken } from '../bootstrap/fleet-deploy.js';
+import { realAuthenticatedCloneRepo, realMintCloneToken, deployAgent as realDeployAgent } from '../bootstrap/fleet-deploy.js';
 // DR-043 Amendment L (macf#1045) — the version-reconcile phase; production
 // deps mirror `commands/fleet-upgrade.ts::resolveDepsFromConfig`'s discover
 // + driver + npm-latest wiring, minus the `readAgentConfig(projectDir)`
@@ -1200,13 +1200,33 @@ export function resolveMutateDeps(
  * create preview above). Never invoked when `BootstrapApplyDeps.deployDeps`
  * was supplied (tests) — only the production CLI path (no `deps` argument
  * at all) reaches this.
+ *
+ * **`deployAgentFn: realDeployAgent` is wired EXPLICITLY here (groundnuty/macf#1024),
+ * not left to `apply-deploy.ts::runApplyDeployPhase`'s own `deps.deployAgentFn ??
+ * realDeployAgent` fallback.** Runtime behavior is unchanged either way — the
+ * `??` already resolved to the real function when this field was omitted —
+ * but an implicit default cannot be pinned by identity from a test:
+ * `apply-deps-wiring.test.ts`'s whole reason for existing (see its module
+ * doc, macf#857) is that every OTHER production seam is asserted
+ * `=== realFn` at this exact resolver boundary; leaving this ONE field
+ * un-set here meant a future edit could add `deployAgentFn: someWrapper`
+ * to this object with nothing catching it — the identical "defined, tested,
+ * never asserted" gap #862's postmortem named. Exported ONLY so
+ * `apply-deploy-seam-identity.test.ts` can assert the wiring by identity;
+ * pure — builds a plain object, no I/O until a field is invoked.
+ *
+ * **Same treatment applies to any future sequencer of this shape** (the
+ * issue's own AC3 — e.g. a `fleet up` composing deploy+version — the
+ * constraint is on the ROLE "a sequencer's default dependency IS the real
+ * golden-path function, provably," not on this one function).
  */
-function resolveApplyDeployDeps(): ApplyDeployPhaseDeps {
+export function resolveApplyDeployDeps(): ApplyDeployPhaseDeps {
   return {
     readVault,
     cloneRepo: realAuthenticatedCloneRepo,
     initAgent: realInitAgent,
     mintCloneToken: realMintCloneToken,
+    deployAgentFn: realDeployAgent,
   };
 }
 
