@@ -49,6 +49,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { proxyAwareFetch } from '@groundnuty/macf-core';
 
 const execFileAsync = promisify(execFile);
 
@@ -259,7 +260,7 @@ export async function confirmAppInstallation(
 
   let response: Response;
   try {
-    response = await fetch('https://api.github.com/app/installations?per_page=100', {
+    response = await proxyAwareFetch('https://api.github.com/app/installations?per_page=100', {
       headers: {
         Authorization: `Bearer ${jwt}`,
         Accept: 'application/vnd.github+json',

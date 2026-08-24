@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { generateToken } from '@groundnuty/macf-core';
+import { generateToken, proxyAwareFetch } from '@groundnuty/macf-core';
 import type { RegistryConfig, TokenSource } from '@groundnuty/macf-core';
 import { registryPathPrefix } from '../registry-helper.js';
 import { isValidProjectName } from '../config.js';
@@ -680,7 +680,7 @@ export async function createLabel(
   token: string,
   spec: LabelSpec,
 ): Promise<'created' | 'exists' | 'failed'> {
-  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/labels`, {
+  const res = await proxyAwareFetch(`https://api.github.com/repos/${owner}/${repo}/labels`, {
     method: 'POST',
     headers: {
       'Accept': 'application/vnd.github+json',

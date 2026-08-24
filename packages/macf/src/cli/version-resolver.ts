@@ -20,7 +20,7 @@
  */
 
 import { PACKAGE_VERSION } from '../package-version.js';
-import { compareSemver } from '@groundnuty/macf-core';
+import { compareSemver, proxyAwareFetch } from '@groundnuty/macf-core';
 
 // Re-exported for backward compatibility: `compareSemver` originated here, but
 // now lives in macf-core so the channel-server's collision check (groundnuty/
@@ -113,7 +113,7 @@ export function isValidActionsRef(v: string): boolean {
  */
 async function fetchHighestTag(repo: string): Promise<FetchResult> {
   try {
-    const res = await fetch(`https://api.github.com/repos/${repo}/tags`, {
+    const res = await proxyAwareFetch(`https://api.github.com/repos/${repo}/tags`, {
       headers: githubHeaders(),
     });
     if (!res.ok) return { status: classifyGithubError(res.status), value: null };
@@ -146,7 +146,7 @@ async function fetchHighestTag(repo: string): Promise<FetchResult> {
  */
 export async function fetchLatestCliVersion(): Promise<FetchResult> {
   try {
-    const res = await fetch('https://registry.npmjs.org/@groundnuty/macf', {
+    const res = await proxyAwareFetch('https://registry.npmjs.org/@groundnuty/macf', {
       headers: { 'Accept': 'application/json' },
     });
     if (res.status === 404) return { status: 'not_published', value: null };
@@ -171,7 +171,7 @@ export async function fetchLatestPluginVersion(): Promise<FetchResult> {
 
   // Try /releases/latest first
   try {
-    const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
+    const res = await proxyAwareFetch(`https://api.github.com/repos/${repo}/releases/latest`, {
       headers: githubHeaders(),
     });
     if (res.ok) {
@@ -205,7 +205,7 @@ export async function fetchLatestActionsVersion(): Promise<FetchResult> {
   const repo = 'groundnuty/macf-actions';
 
   try {
-    const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
+    const res = await proxyAwareFetch(`https://api.github.com/repos/${repo}/releases/latest`, {
       headers: githubHeaders(),
     });
     if (res.ok) {
@@ -261,7 +261,7 @@ export async function resolveActionsRefToFullTag(ref: string): Promise<string | 
   if (!m) return null; // 'main' or any non-`vMAJOR[.MINOR]` ref
   const prefix = m[2] !== undefined ? `v${m[1]}.${m[2]}.` : `v${m[1]}.`;
   try {
-    const res = await fetch('https://api.github.com/repos/groundnuty/macf-actions/tags', {
+    const res = await proxyAwareFetch('https://api.github.com/repos/groundnuty/macf-actions/tags', {
       headers: githubHeaders(),
     });
     if (!res.ok) return null;
