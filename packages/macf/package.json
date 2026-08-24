@@ -32,7 +32,8 @@
     "check": "tsc -b && eslint src/ && vitest run",
     "lint": "eslint src/",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:live-smoke": "vitest run --config vitest.live-smoke.config.ts"
   },
   "dependencies": {
     "@groundnuty/macf-core": "0.2.58",

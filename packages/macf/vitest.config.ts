@@ -20,7 +20,11 @@ export default defineConfig({
     globals: true,
     setupFiles: ['test/setup.ts'],
     include: ['test/**/*.test.ts'],
-    exclude: ['test/e2e/**'],
+    // `test/live-smoke/**` (groundnuty/macf#869) needs live GitHub
+    // credentials + mutates real (throwaway) state — opt-in via
+    // `npm run test:live-smoke` / `make -f dev.mk test-live-smoke`, same
+    // shape as macf-channel-server's `test/integration/**` exclusion.
+    exclude: ['test/e2e/**', 'test/live-smoke/**'],
     coverage: {
       provider: 'v8',
       include: ['src/**/*.ts'],

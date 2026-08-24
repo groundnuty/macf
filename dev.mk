@@ -1,4 +1,4 @@
-.PHONY: install check test lint typecheck build clean test-e2e test-integration install-hooks \
+.PHONY: install check test lint typecheck build clean test-e2e test-integration test-live-smoke install-hooks \
 	release-bump release-check release-harness-check release-marketplace release-cli release-verify \
 	release release-dry \
 	dr-citations-state dr-citations-diff
@@ -50,6 +50,20 @@ test-e2e:
 # shouldn't need.
 test-integration:
 	devbox run -- npm run test:integration --workspaces --if-present
+
+# DR-043 provisioning live-smoke (groundnuty/macf#869) — exercises the REAL
+# GitHub API for the contract-bearing calls the bootstrap tool depends on
+# (App-JWT -> GET /app/installations; Actions-variable create+delete at
+# repo AND org scope; a read-only repo-creation-from-template preflight).
+# Opt-in like `test-integration` above: needs `MACF_LIVE_SMOKE_*` env vars
+# (see `packages/macf/test/live-smoke/provisioning-live-smoke.test.ts`'s
+# module doc) AND an already-authenticated `gh`. With none of those set,
+# every check in the suite SKIPS cleanly (never fails) — this target is
+# always safe to run, it just does nothing useful without credentials.
+# Gated out of `make check` for the same reason `test-integration` is: it
+# needs external state this repo's ordinary CI run doesn't have.
+test-live-smoke:
+	devbox run -- npm run test:live-smoke --workspaces --if-present
 
 clean:
 	rm -rf packages/*/dist packages/*/coverage coverage
