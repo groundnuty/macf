@@ -84,17 +84,20 @@ describe('.githooks/commit-msg (#158)', () => {
       // commitlint, and loading commitlint's ESM module graph (cli, load,
       // lint, parse, rules, config-conventional, + their transitive deps —
       // ~18 @commitlint/* packages plus yargs/ajv/cosmiconfig et al.) costs
-      // ~1.3–2.7s per spawn on an IDLE box, confirmed via `node --prof` +
-      // `--prof-process`: the dominant cost is `ModuleWrap::New` + the
-      // filesystem stat/read calls ESM resolution makes walking that graph
-      // — not V8 compile time (NODE_COMPILE_CACHE made it slower, not
-      // faster, once measured). That's inherent to commitlint's package
-      // shape; nothing in this repo can cheaply shrink it without bundling
-      // commitlint itself, which is out of scope here (and fragile against
-      // upstream commitlint updates).
+      // ~1.4-1.8s per spawn on an idle box (measured, 5 runs), confirmed
+      // via `node --prof` + `--prof-process`: the dominant cost is
+      // `ModuleWrap::New` + the filesystem stat/read calls ESM resolution
+      // makes walking that graph, not V8 compile time (an attempt with
+      // NODE_COMPILE_CACHE showed no improvement — inconclusive given box
+      // noise between runs, but it rules out an easy win there). The cost
+      // is commitlint's module graph, not this hook: the hook itself adds
+      // only ~11ms (`git rev-parse --show-toplevel`) on top. Not cheaply
+      // reducible within this repo without bundling commitlint itself,
+      // which is out of scope here (and fragile against upstream
+      // commitlint updates).
       //
       // The old code ran all 13 as SEQUENTIAL `spawnSync` calls, so the
-      // test's own total cost was ~13× the per-spawn cost — 20–34s against
+      // test's own total cost was ~13× the per-spawn cost — 20-34s against
       // a 30s ceiling, i.e. sitting AT its budget on an idle box already,
       // before a single other test file added contention. The 30_000
       // number here was consequently not a real margin — it was a coin
@@ -106,15 +109,16 @@ describe('.githooks/commit-msg (#158)', () => {
       // below run as PARALLEL `spawn` calls (`runHookAsync` + `Promise.all`)
       // instead of a sequential loop, so the test's wall time is bounded by
       // the slowest single spawn plus scheduling overhead, not the sum of
-      // all 13. Measured on this box (16 cores): ~3.9-4.4s unconstrained,
-      // ~11.5s capped at 2 concurrent (`xargs -P2`, modeling a small CI
-      // runner), ~7.2s at 4, ~5.5s at 8 — vs. ~21s sequential regardless of
-      // core count. The 30s ceiling is kept as a genuine hang-detector: at
-      // the worst measured (2-core-capped) figure it now represents ~2.6×
-      // real margin, not ~1× budget-matching. Every commitlint type is
-      // still individually exercised through the real hook subprocess —
-      // no coverage was traded for speed (see #1103's "stabilise by
-      // checking less" caution).
+      // all 13. Under REAL full-suite contention (`vitest run` across all
+      // ~4500 tests in this package, 2 runs) this test measured
+      // 6547ms/6979ms against the 30s ceiling — ~4.3-4.6x real margin. A
+      // synthetic proxy for a smaller CI runner (`xargs -P2` over 13
+      // sequential bash invocations of the hook, NOT this Promise.all
+      // shape) measured ~11.5s, ~2.6x — a pessimistic model, not a
+      // measurement of this test, kept here as a lower-bound sanity check.
+      // Every commitlint type is still individually exercised through the
+      // real hook subprocess — no coverage was traded for speed (see
+      // #1103's "stabilise by checking less" caution).
       const validTypes = [
         'feat', 'fix', 'security', 'reliability', 'refactor',
         'perf', 'docs', 'test', 'chore', 'ci', 'revert', 'build', 'style',
