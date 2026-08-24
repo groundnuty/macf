@@ -53,7 +53,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { deriveControlRepoName, parseFleetManifest } from '../bootstrap/fleet-manifest.js';
-import type { RoutingDoctorReport } from './routing-doctor.js';
+import type { RepoPinRow, RoutingDoctorReport } from './routing-doctor.js';
 
 /**
  * Per-repo pin correctness against the manifest's declared `versions.actions`.
@@ -101,12 +101,35 @@ export type PinFleetState =
   | 'consistent-and-correct'
   | 'consistent-but-wrong';
 
+/**
+ * The pin value shared by every PARTICIPATING repo, independent of whether it
+ * matches `expectedPin`/`desiredActionsPin` — `null` when there are no
+ * participants, or they don't literally agree with EACH OTHER.
+ *
+ * Deliberately recomputed from the raw `pin` values rather than trusted from
+ * `consistent`: `consistent` is `r.pin === expectedPin`, and `expectedPin` can be
+ * an OPERATOR `--expected-pin` override rather than the modal (a separate,
+ * pre-existing escape hatch — see `RoutingDoctorReport.desiredActionsPin`'s doc).
+ * Under an override that doesn't match reality, every repo reads
+ * `consistent:false` even while they all agree with EACH OTHER on a value that
+ * simply isn't the asserted target — that fleet is self-agreeing, not
+ * "inconsistent" in the sense this module names (repos disagreeing with each
+ * other). Recomputing from raw pins keeps `classifyPinState` correct regardless
+ * of where `expectedPin` came from, without needing to track that provenance.
+ */
+function observedUniformPin(repoPins: readonly Pick<RepoPinRow, 'pin' | 'consistent'>[]): string | null {
+  const participating = repoPins.filter((r) => r.consistent !== null);
+  if (participating.length === 0) return null;
+  const first = participating[0]?.pin ?? null;
+  return participating.every((r) => r.pin === first) ? first : null;
+}
+
 export function classifyPinState(
   report: Pick<RoutingDoctorReport, 'repoPins' | 'desiredActionsPin'>,
 ): PinFleetState {
   const participating = report.repoPins.filter((r) => r.consistent !== null);
   if (participating.length === 0) return 'no-callers';
-  if (!participating.every((r) => r.consistent === true)) return 'inconsistent';
+  if (observedUniformPin(report.repoPins) === null) return 'inconsistent';
   if (report.desiredActionsPin === null) return 'unknown';
   return participating.every((r) => r.correctness === 'correct') ? 'consistent-and-correct' : 'consistent-but-wrong';
 }
@@ -137,9 +160,16 @@ export function pinClauseText(state: PinFleetState, desiredPin: string | null): 
  * `routing-doctor.ts`'s `caCertLine` / ROUTING-CLIENT-CERT-ISSUER line: a
  * standalone, explicitly-labeled statement of what THIS run knows (or does
  * not) about pin correctness, never folded silently into the repo table.
+ *
+ * The `inconsistent` branch does NOT throw away the per-repo `correctness`
+ * this module already computed (it's populated independent of `consistent` —
+ * see `resolveRepoPins`): when a desired pin IS known, it reports HOW MANY of
+ * the disagreeing repos already match the manifest, which is exactly the
+ * useful signal for a fleet mid-rollout (some repos updated, some not) rather
+ * than a bare "not evaluated."
  */
 export function pinCorrectnessLine(
-  report: Pick<RoutingDoctorReport, 'repoPins' | 'desiredActionsPin' | 'expectedPin'>,
+  report: Pick<RoutingDoctorReport, 'repoPins' | 'desiredActionsPin'>,
 ): string {
   const state = classifyPinState(report);
   switch (state) {
@@ -151,18 +181,51 @@ export function pinCorrectnessLine(
         '(no --manifest override, no discoverable control repo)'
       );
     case 'inconsistent':
-      return (
-        'PIN CORRECTNESS (vs fleet manifest): ? not evaluated — repos disagree with each ' +
-        'other first (see PIN DIVERGENCE above)'
-      );
+      return inconsistentPinCorrectnessLine(report);
     case 'consistent-but-wrong':
       return (
-        `PIN CORRECTNESS (vs fleet manifest): ✗ STALE — every repo reads "${report.expectedPin}", ` +
-        `manifest declares "${report.desiredActionsPin}"`
+        `PIN CORRECTNESS (vs fleet manifest): ✗ STALE — every repo reads ` +
+        `"${observedUniformPin(report.repoPins)}", manifest declares "${report.desiredActionsPin}"`
       );
     case 'consistent-and-correct':
       return `PIN CORRECTNESS (vs fleet manifest): ✓ current ("${report.desiredActionsPin}")`;
   }
+}
+
+function inconsistentPinCorrectnessLine(
+  report: Pick<RoutingDoctorReport, 'repoPins' | 'desiredActionsPin'>,
+): string {
+  if (report.desiredActionsPin === null) {
+    return (
+      'PIN CORRECTNESS (vs fleet manifest): ? not evaluated — repos disagree with each ' +
+      'other first (see PIN DIVERGENCE above), and no manifest is reachable to compare against'
+    );
+  }
+  const participating = report.repoPins.filter((r) => r.consistent !== null);
+  const matching = participating.filter((r) => r.correctness === 'correct').length;
+  return (
+    `PIN CORRECTNESS (vs fleet manifest): ${String(matching)}/${String(participating.length)} repos already ` +
+    `match "${report.desiredActionsPin}" (mid-rollout, or a genuine misconfiguration — see PIN DIVERGENCE above)`
+  );
+}
+
+/**
+ * The loud-but-non-fatal warning line for a `consistent-but-wrong` fleet
+ * (macf#872) — `null` when that state doesn't hold, so a caller can push it
+ * into `collectWarnings`' array unconditionally. Uses `observedUniformPin`,
+ * never `expectedPin`/`desiredActionsPin` alone, so the message stays correct
+ * even when an operator `--expected-pin` override is ALSO in play and
+ * disagrees with both the observed value and the manifest.
+ */
+export function pinCorrectnessWarning(
+  report: Pick<RoutingDoctorReport, 'repoPins' | 'desiredActionsPin'>,
+): string | null {
+  if (classifyPinState(report) !== 'consistent-but-wrong') return null;
+  const observed = observedUniformPin(report.repoPins);
+  return (
+    `pin CORRECTNESS: every routing repo is uniformly pinned to "${observed}", but the fleet manifest ` +
+    `declares "${report.desiredActionsPin}" as current — the fleet is consistently STALE, not healthy.`
+  );
 }
 
 /** Extract `versions.actions` from raw `fleet.yaml` text; `null` on ANY parse failure. */

@@ -111,6 +111,7 @@ import {
   evaluatePinCorrectness,
   pinClauseText,
   pinCorrectnessLine,
+  pinCorrectnessWarning,
   resolveDesiredActionsPin,
   type PinCorrectnessState,
 } from './routing-doctor-pin-correctness.js';
@@ -1048,12 +1049,8 @@ export function collectWarnings(report: RoutingDoctorReport): readonly string[] 
       );
     }
   }
-  if (classifyPinState(report) === 'consistent-but-wrong') {
-    out.push(
-      `pin CORRECTNESS: every routing repo is uniformly pinned to "${report.expectedPin}", but the fleet ` +
-        `manifest declares "${report.desiredActionsPin}" as current — the fleet is consistently STALE, not healthy.`,
-    );
-  }
+  const pinWarning = pinCorrectnessWarning(report);
+  if (pinWarning) out.push(pinWarning);
   return out;
 }
 

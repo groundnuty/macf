@@ -14,6 +14,7 @@ import {
   evaluatePinCorrectness,
   pinClauseText,
   pinCorrectnessLine,
+  pinCorrectnessWarning,
   resolveDesiredActionsPin,
 } from '../../src/cli/commands/routing-doctor-pin-correctness.js';
 import type { RepoPinRow, RoutingDoctorReport } from '../../src/cli/commands/routing-doctor.js';
@@ -171,6 +172,26 @@ describe('classifyPinState — the fleet-level composite (macf#872 "three states
     expect(state).toBe('inconsistent');
     expect(state).not.toBe('consistent-but-wrong');
   });
+
+  it('an --expected-pin override that misses reality does NOT read as inconsistent — the repos still agree with EACH OTHER', () => {
+    // Every repo pins v3.4.1 (they agree). An operator --expected-pin v3.4.9
+    // override (unrelated to reality) drives `consistent:false` for ALL of them
+    // — that is the override mechanism working as designed (routingVerdict still
+    // fails on it), but pin CORRECTNESS is a DIFFERENT question: do the repos
+    // agree with each other and with the MANIFEST, independent of the override.
+    const state = classifyPinState(
+      report({
+        repoPins: [
+          row({ pin: 'v3.4.1', consistent: false, correctness: 'unknown' }),
+          row({ pin: 'v3.4.1', consistent: false, correctness: 'unknown' }),
+        ],
+        expectedPin: 'v3.4.9', // the override, not what's actually deployed
+        desiredActionsPin: null, // no manifest in this scenario
+      }),
+    );
+    expect(state).not.toBe('inconsistent'); // the repos DO self-agree
+    expect(state).toBe('unknown'); // no manifest → honest unknown, not a false "inconsistent"
+  });
 });
 
 describe('pinClauseText — the summaryLine clause (macf#872: replaces "pins consistent" IN PLACE, never a footnote)', () => {
@@ -209,6 +230,70 @@ describe('pinCorrectnessLine — the dedicated text-render line', () => {
     expect(line).toMatch(/STALE/);
     expect(line).toContain('v3.4.1');
     expect(line).toContain('v3.4.2');
+  });
+
+  it('consistent-but-wrong names the OBSERVED pin, not a stale --expected-pin override', () => {
+    // expectedPin (an operator override) disagrees with what's actually deployed;
+    // the line must report what's REALLY there (v3.4.1), never the override value.
+    const r = report({
+      repoPins: [
+        row({ pin: 'v3.4.1', consistent: false, correctness: 'incorrect' }),
+        row({ pin: 'v3.4.1', consistent: false, correctness: 'incorrect' }),
+      ],
+      expectedPin: 'v3.4.9', // an override that matches nothing real
+      desiredActionsPin: 'v3.4.2',
+    });
+    const line = pinCorrectnessLine(r);
+    expect(line).toContain('v3.4.1'); // the real, observed value
+    expect(line).not.toContain('v3.4.9'); // never the unrelated override
+  });
+
+  it('inconsistent WITH a known manifest reports how many repos already match it — not a bare "not evaluated"', () => {
+    const r = report({
+      repoPins: [
+        row({ pin: 'v3.4.2', consistent: true, correctness: 'correct' }), // already current
+        row({ pin: 'v3.4.1', consistent: false, correctness: 'incorrect' }), // still behind
+      ],
+      expectedPin: 'v3.4.2',
+      desiredActionsPin: 'v3.4.2',
+    });
+    const line = pinCorrectnessLine(r);
+    expect(line).toContain('1/2');
+    expect(line).toContain('v3.4.2');
+    expect(line).not.toMatch(/not evaluated/); // the per-repo correctness data IS used
+  });
+
+  it('inconsistent with NO manifest reachable falls back to "not evaluated" (nothing to compare against)', () => {
+    const r = report({
+      repoPins: [
+        row({ pin: 'v3.4.2', consistent: true, correctness: 'unknown' }),
+        row({ pin: 'v3.4.1', consistent: false, correctness: 'unknown' }),
+      ],
+      desiredActionsPin: null,
+    });
+    expect(pinCorrectnessLine(r)).toMatch(/not evaluated/);
+  });
+});
+
+describe('pinCorrectnessWarning — the loud-but-non-fatal warning (macf#872)', () => {
+  it('null when the state is not consistent-but-wrong', () => {
+    expect(pinCorrectnessWarning(report({ desiredActionsPin: null }))).toBeNull();
+  });
+
+  it('fires on consistent-but-wrong, naming the OBSERVED pin (not a stale --expected-pin override)', () => {
+    const r = report({
+      repoPins: [
+        row({ pin: 'v3.4.1', consistent: false, correctness: 'incorrect' }),
+        row({ pin: 'v3.4.1', consistent: false, correctness: 'incorrect' }),
+      ],
+      expectedPin: 'v3.4.9', // unrelated override
+      desiredActionsPin: 'v3.4.2',
+    });
+    const warning = pinCorrectnessWarning(r);
+    expect(warning).toMatch(/STALE|uniformly pinned/i);
+    expect(warning).toContain('v3.4.1');
+    expect(warning).toContain('v3.4.2');
+    expect(warning).not.toContain('v3.4.9');
   });
 });
 
