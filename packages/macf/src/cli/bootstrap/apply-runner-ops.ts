@@ -18,8 +18,10 @@
  * three permissions that purpose needs.
  *
  * **This module supplies the PURE pieces** (permission set, manifest
- * builder, handle derivation, post-install validation, the name-length
- * pre-flight). The ORCHESTRATION — when in the run this App gets created,
+ * builder, handle derivation, the name-length pre-flight). Post-install
+ * `repository_selection` validation moved to the shared `install-scope.ts`
+ * (groundnuty/macf#1128 — every App type uses the SAME check now, not a
+ * runner-ops-specific copy). The ORCHESTRATION — when in the run this App gets created,
  * how its credential folds into the SAME batched vault write as the fleet's
  * agents, when its recovery artifact gets deleted — lives in `apply-fleet.ts`
  * (its own module doc's "Recovery-artifact lifecycle" section already
@@ -32,7 +34,6 @@ import type { FleetAgent, FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 import type { GitHubAppManifest } from './app-manifest.js';
 import { buildAppManifest } from './app-manifest.js';
-import type { ConfirmedInstall } from './identity-confirm.js';
 import type { AgentApplyOutcome, IdentityRequest } from './apply-agent.js';
 import { deriveRouterAppHandle } from './apply-router-app.js';
 
@@ -154,43 +155,18 @@ export function buildRunnerOpsManifest(fleetName: string, redirectUrl: string, h
 
 /**
  * Post-gate-2 verify-then-refuse for `repository_selection` (groundnuty/
- * macf#943). **GitHub's App-manifest JSON has no field to FORCE the
- * installed repo scope at creation time** — `repository_selection` is an
- * INSTALLATION-time choice the operator makes by clicking "Only select
- * repositories" (vs "All repositories") on the gate-2 install page; there is
- * no API parameter this tool can set ahead of that click. "Scope it at
- * creation; do not create broad-then-narrow" (the task brief) is therefore
- * honored the only way GitHub's API surface allows: the gate-2 announce
- * message (see `apply-fleet.ts`'s call site) tells the operator explicitly
- * to select "Only select repositories" and pick this fleet's repos, and THIS
- * function asserts the resulting fact and refuses the identity apply outright
- * if it doesn't hold — never silently accepting an `'all'`-scoped install as
- * if it were fine. Wired via `AgentApplyDeps.validateInstall`
- * (`apply-agent.ts`'s gate-2 runner calls it right after
- * `waitForAppInstallation` resolves, before reporting success).
- *
- * Rejects anything that ISN'T the exact string `'selected'` — not merely
- * "not `'all'`" — so a body that omits `repository_selection` entirely (which
- * real `GET /app/installations` responses do not do, but a malformed/future
- * API shape could) fails closed rather than silently passing.
- *
- * **What this does NOT verify:** that the *specific* repos selected are
- * exactly this fleet's declared set (vs. some OTHER subset). Confirming that
- * needs `GET /installation/repositories` under an installation token — a
- * second live call this increment does not make (flagged as a design
- * question in the implementation report, not decided here).
+ * macf#943; generalized to every App type by groundnuty/macf#1128) —
+ * **GitHub's App-manifest JSON has no field to FORCE the installed repo
+ * scope at creation time**, so this can only ever be enforced by checking
+ * the RESULT after the fact. The check itself, its message, and its
+ * `AgentApplyDeps.validateInstall` closure builder now live in
+ * `install-scope.ts` (`validateInstallRepositoryScope` /
+ * `buildInstallScopeValidator`) — this App was the ONLY one this refusal
+ * was wired to before #1128 generalized it to agent Apps and the router App
+ * too. `apply-fleet.ts` wires `buildInstallScopeValidator(deriveRunnerOpsHandle(...))`
+ * directly onto this identity's `validateInstall`; there is no
+ * runner-ops-specific function here anymore.
  */
-export function validateRunnerOpsInstall(install: ConfirmedInstall): string | undefined {
-  if (install.repositorySelection === 'selected') return undefined;
-  return (
-    'repository_selection must be "selected" (scoped to this fleet\'s repos only) — observed ' +
-    `"${install.repositorySelection ?? '(not reported by GitHub)'}" . GitHub's App-manifest flow has no field to ` +
-    'force this at creation time; the operator must open the install page, choose "Only select repositories," ' +
-    'and pick exactly this fleet\'s declared repos — never "All repositories" (administration:write on every ' +
-    "repo this App can see is blast-radius the fleet does not need). Correct the installation's repository " +
-    'access on GitHub, then re-run apply.'
-  );
-}
 
 // --- Name-length pre-flight (groundnuty/macf#943) ---
 

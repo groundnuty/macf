@@ -14,11 +14,9 @@ import {
   deriveRunnerOpsHandle,
   runnerOpsIdentityRequest,
   buildRunnerOpsManifest,
-  validateRunnerOpsInstall,
   plannedAppNames,
   checkAppNameLengths,
 } from '../../../src/cli/bootstrap/apply-runner-ops.js';
-import type { ConfirmedInstall } from '../../../src/cli/bootstrap/identity-confirm.js';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 
 /**
@@ -122,36 +120,12 @@ describe('runnerOpsIdentityRequest', () => {
   });
 });
 
-describe('validateRunnerOpsInstall — repository_selection scoped to fleet repos, NEVER "all"', () => {
-  const base: ConfirmedInstall = { appId: '1', installId: '2', appSlug: 'x-runner-ops', accountLogin: 'groundnuty' };
-
-  it('accepts "selected" — the only passing shape', () => {
-    expect(validateRunnerOpsInstall({ ...base, repositorySelection: 'selected' })).toBeUndefined();
-  });
-
-  it('REFUSES "all" — the exact hazard the task brief names', () => {
-    const reason = validateRunnerOpsInstall({ ...base, repositorySelection: 'all' });
-    expect(reason).toBeDefined();
-    expect(reason).toMatch(/repository_selection must be "selected"/);
-    expect(reason).toMatch(/"all"/);
-  });
-
-  it('REFUSES a missing repository_selection (fails CLOSED, not merely "not all")', () => {
-    const reason = validateRunnerOpsInstall(base);
-    expect(reason).toBeDefined();
-    expect(reason).toMatch(/not reported by GitHub/);
-  });
-
-  it('REFUSES any other unexpected value too', () => {
-    const reason = validateRunnerOpsInstall({ ...base, repositorySelection: 'weird-future-value' });
-    expect(reason).toBeDefined();
-  });
-
-  it('never mentions a credential — this function only ever sees a ConfirmedInstall, which carries none', () => {
-    const reason = validateRunnerOpsInstall({ ...base, repositorySelection: 'all' });
-    expect(reason).not.toMatch(/BEGIN.*PRIVATE KEY/);
-  });
-});
+// groundnuty/macf#1128 — `validateRunnerOpsInstall` (this App's own copy of
+// the repository_selection guard) is GONE. The shared implementation
+// (`install-scope.ts::validateInstallRepositoryScope` /
+// `buildInstallScopeValidator`) is tested once, in
+// `install-scope.test.ts` — see that file for the equivalent coverage this
+// describe block used to carry.
 
 describe('plannedAppNames / checkAppNameLengths — the 34-char pre-flight (groundnuty/macf#943)', () => {
   it('GITHUB_APP_NAME_MAX_LENGTH is 34', () => {

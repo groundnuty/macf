@@ -205,7 +205,38 @@ function agentDepsFor(role: string, outcome: 'reused' | 'resumed-install' | 'cre
     // groundnuty/macf#952 — consent gate 2's own locally-served interstitial.
     startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
     exchangeManifestCode: async () => creds(role),
-    waitForAppInstallation: async () => ({ appId, installId, appSlug: `demo-fleet-${role}`, accountLogin: 'groundnuty' }),
+    // groundnuty/macf#1128 — `repositorySelection: 'selected'` is the
+    // well-behaved-operator default this fixture represents: EVERY App
+    // type's install now runs through the shared `install-scope.ts` guard
+    // (`validateInstall`) — agent Apps, the router App, and runner-ops
+    // alike — so a fixture that omitted this field would fail that check
+    // for every identity that reaches consent gate 2 through it, not just
+    // the one role this call names.
+    //
+    // Deliberately UNCONDITIONAL (tried, then reverted, a role-scoped
+    // variant keyed on `opts.expected.appSlug`): on the CREATE path,
+    // `apply-agent.ts::finishGate2FromCredentials` builds `gate2Expected`
+    // from the JUST-EXCHANGED credential's OWN `.slug` — and THIS fixture's
+    // `exchangeManifestCode` returns `creds(role)` using the role captured
+    // in THIS closure regardless of which identity (agent, router,
+    // runner-ops) is actually calling it (`FleetApplyDeps.buildAgentDeps`
+    // hands every identity the IDENTICAL `AgentApplyDeps` object — see
+    // `baseDeps`'s doc). So `opts.expected.appSlug` is `demo-fleet-${role}`
+    // for EVERY identity's CREATE poll through this fixture, not just the
+    // named role — there is no signal inside `waitForAppInstallation`'s
+    // inputs that reliably discriminates "the role under test" from
+    // "the router/runner-ops App riding along on the same fixture." A
+    // role-scoped condition therefore either fires for every identity
+    // (as observed) or none — never selectively. Given that, this fixture
+    // now genuinely represents a fleet where EVERY App's install is
+    // correctly scoped — which also means the router App's + (when
+    // declared) runner-ops's OWN create-or-reuse ceremony now completes
+    // successfully through this SAME shared fixture where it used to fail
+    // silently (masked by nothing but this same missing field). Tests
+    // whose assertions assumed router/runner-ops failed silently were
+    // updated to account for their now-real success; tests that want the
+    // "all"-scoped refusal override `waitForAppInstallation` explicitly.
+    waitForAppInstallation: async () => ({ appId, installId, appSlug: `demo-fleet-${role}`, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
     confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
     openUrl: async () => {},
     log: () => {},
@@ -419,8 +450,17 @@ describe('applyFleet', () => {
 
     expect(existsSync(result.lockPath)).toBe(true);
     const lock: FleetLock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
-    expect(lock.agents).toEqual([{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1', fingerprints: expect.any(Object) }]);
-    expect(Object.keys(lock.agents[0]?.fingerprints ?? {}).sort()).toEqual(['app_private_key', 'client_secret', 'webhook_secret']);
+    // groundnuty/macf#1128 — the router App's create-or-reuse ceremony is
+    // UNCONDITIONAL every run (apply-fleet.ts's own doc); it now ALSO
+    // succeeds through this shared fixture (repository_selection is
+    // satisfied for every App type, not just 'code-agent') and gets its
+    // OWN lock entry alongside 'code-agent' — find the entry under test
+    // rather than asserting the whole array, so this test stays about
+    // ordering/fingerprints for the code-agent, not an incidental census
+    // of every identity a real `apply` run also provisions.
+    const codeAgentEntry = lock.agents.find((a) => a.role === 'code-agent');
+    expect(codeAgentEntry).toEqual({ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1', fingerprints: expect.any(Object) });
+    expect(Object.keys(codeAgentEntry?.fingerprints ?? {}).sort()).toEqual(['app_private_key', 'client_secret', 'webhook_secret']);
   });
 
   it('no age_recipients configured: the DR-043 §D5 pre-flight refuses gate 1 ENTIRELY — no App is ever created, no lock entry, no repo-init', async () => {
@@ -512,7 +552,16 @@ describe('applyFleet', () => {
         appId === 'app-code-agent'
           ? { status: 'confirmed', install: { appId, installId: 'install-1', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' } }
           : { status: 'app-no-install' },
-      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: 'install-2-resumed', appSlug: 'demo-fleet-science-agent', accountLogin: 'groundnuty' }),
+      // groundnuty/macf#1128 — `repositorySelection: 'selected'`: this
+      // agent's own resumed-install now runs through the shared
+      // `install-scope.ts` guard too.
+      waitForAppInstallation: async (opts) => ({
+        appId: opts.appId,
+        installId: 'install-2-resumed',
+        appSlug: 'demo-fleet-science-agent',
+        accountLogin: 'groundnuty',
+        repositorySelection: 'selected',
+      }),
       openUrl: async () => {},
       log: () => {},
       writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless — see agentDepsFor's comment
@@ -604,7 +653,14 @@ describe('applyFleet', () => {
         appId === 'app-code-agent'
           ? { status: 'confirmed', install: { appId, installId: 'install-1', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' } }
           : { status: 'app-no-install' },
-      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: 'install-2-resumed', appSlug: 'demo-fleet-science-agent', accountLogin: 'groundnuty' }),
+      // groundnuty/macf#1128 — `repositorySelection: 'selected'`.
+      waitForAppInstallation: async (opts) => ({
+        appId: opts.appId,
+        installId: 'install-2-resumed',
+        appSlug: 'demo-fleet-science-agent',
+        accountLogin: 'groundnuty',
+        repositorySelection: 'selected',
+      }),
       openUrl: async () => {},
       log: () => {},
       writeRecoveryArtifact: async () => {},
@@ -644,10 +700,18 @@ describe('applyFleet', () => {
   it('skipped-unverified / drift: no lock write, no repo-init', async () => {
     const manifestPath = manifestPathIn();
     const manifest = manifestWith([CODE_AGENT]);
+    // groundnuty/macf#1128 — a 'router' entry too (see `REUSE_PRIOR_LOCK`'s
+    // doc, same reasoning): without it, the router's OWN unconditional
+    // create-or-reuse ceremony reaches CREATE (no prior entry) and now
+    // genuinely succeeds through this shared fixture, minting something new
+    // and breaking this test's "vault stays skipped" claim.
     const priorLock: FleetLock = {
       schema_version: 1,
       fleet: 'demo-fleet',
-      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      agents: [
+        { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+        { role: 'router', app_id: 'app-router', install_id: 'install-r' },
+      ],
     };
     // No resolveKeyPath -> guard resolves skip-unverified. CA reported
     // ALREADY PRESENT (reuse path) for the same reason as the test above —
@@ -709,13 +773,36 @@ describe('applyFleet', () => {
       agents: [{ role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' }],
     };
     const encryptCalls: { plaintext: string; outPath: string }[] = [];
+    // groundnuty/macf#1128 — `exchangeManifestCode` here is role-blind
+    // (always `creds('code-agent')`, like every hand-rolled fixture in this
+    // file — see `agentDepsFor`'s doc for why), so `waitForAppInstallation`
+    // cannot discriminate "which identity is this poll for" from `opts`
+    // alone: `opts.expected.appSlug` is `demo-fleet-code-agent` for EVERY
+    // identity that reaches CREATE through this fixture (code-agent,
+    // runner-ops, router — apply-fleet.ts processes them in that fixed
+    // order). A CALL COUNTER is the only reliable discriminator available:
+    // the FIRST call is code-agent's own poll (must succeed, this test's
+    // whole point); the SECOND and THIRD are runner-ops's and the router
+    // App's (must still fail, so this test keeps exercising the
+    // recovery-artifact-on-gate-2-rejection path the comment below
+    // documents — the exact reason this fixture predates #1128 at all).
+    let installPollCount = 0;
     const agentDeps: AgentApplyDeps = {
       startManifestFlow: async () => ({ startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} }),
       startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
       exchangeManifestCode: async () => creds('code-agent'),
       resolveKeyPath: () => '/fake.pem',
       confirmAppInstallation: async () => ({ status: 'confirmed', install: { appId: 'app-science-agent', installId: 'install-2', appSlug: 'demo-fleet-science-agent', accountLogin: 'groundnuty' } }),
-      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: 'install-1', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
+      waitForAppInstallation: async (opts) => {
+        installPollCount += 1;
+        return {
+          appId: opts.appId,
+          installId: 'install-1',
+          appSlug: 'demo-fleet-code-agent',
+          accountLogin: 'groundnuty',
+          ...(installPollCount === 1 ? { repositorySelection: 'selected' } : {}),
+        };
+      },
       openUrl: async () => {},
       log: () => {},
       writeRecoveryArtifact: async () => {}, // overridden by applyFleet regardless — see agentDepsFor's comment
@@ -747,12 +834,13 @@ describe('applyFleet', () => {
     // runner-ops), THEN the batched final vault — asserted by ORDER, not
     // just presence, so this doesn't just infer the sequencing from the
     // loop structure. Both the runner-ops's AND the router App's OWN
-    // identities end up 'failed' (this fixture's `waitForAppInstallation`
-    // doesn't return `repositorySelection: 'selected'` —
-    // `validateRunnerOpsInstall`/`validateRouterAppInstall` reject it), so
-    // NEITHER contributes a lock/vault entry — only their recovery
-    // artifacts, exactly like a `created`-then-gate-2-failed agent would
-    // (see `apply-agent.ts`'s "gate 1→2 window" doc).
+    // identities end up 'failed' (`waitForAppInstallation` above only
+    // returns `repositorySelection: 'selected'` on its FIRST call —
+    // code-agent's own poll; the shared `install-scope.ts` guard rejects
+    // the second and third, groundnuty/macf#1128), so NEITHER contributes a
+    // lock/vault entry — only their recovery artifacts, exactly like a
+    // `created`-then-gate-2-failed agent would (see `apply-agent.ts`'s
+    // "gate 1→2 window" doc).
     expect(encryptCalls).toHaveLength(4);
     // macf#988: `encrypt` is called with a TEMP sibling for a recovery
     // write (atomic-write tail — see `writeAgentRecoveryArtifact`'s doc),
@@ -1355,7 +1443,13 @@ trust:
       waitForAppInstallation: async (opts) => {
         const role = (opts.expected.appSlug ?? '').replace(`${fleetName}-`, '');
         calls.push(`gate2:${role}`);
-        return { appId: opts.appId, installId: `install-${role}`, appSlug: opts.expected.appSlug ?? '', accountLogin: 'groundnuty' };
+        // groundnuty/macf#1128 — `repositorySelection: 'selected'`: unlike
+        // `agentDepsFor`'s shared fixture (see its doc), THIS fixture is
+        // genuinely role-aware (`opts.expected.appSlug` is the REAL
+        // per-identity handle, not a role-blind shared credential), so an
+        // unconditional 'selected' here is correct for every identity that
+        // reaches gate 2 through it — agents, router, runner-ops alike.
+        return { appId: opts.appId, installId: `install-${role}`, appSlug: opts.expected.appSlug ?? '', accountLogin: 'groundnuty', repositorySelection: 'selected' };
       },
       confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
       openUrl: async () => {},
@@ -3400,18 +3494,41 @@ trust:
       const manifestPath = manifestPathIn();
       // groundnuty/macf#1083 — declare self-hosted so runner-ops is needed.
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+      // groundnuty/macf#1128 — a CALL COUNTER, not `opts.expected.appSlug`:
+      // this fixture's `exchangeManifestCode` (inherited from
+      // `agentDepsFor('code-agent', ...)`'s base) always returns
+      // `creds('code-agent')` regardless of which identity is actually
+      // creating (see that fixture's own doc) — so
+      // `finishGate2FromCredentials`'s `gate2Expected.appSlug` (derived
+      // from the JUST-EXCHANGED credential's OWN `.slug`, not the caller's
+      // derived handle) is `demo-fleet-code-agent` for code-agent AND
+      // runner-ops AND the router App alike. `apply-fleet.ts` processes
+      // them in that fixed order (per-agent loop, then runner-ops, then
+      // router), so a call counter is the reliable way to give ONLY
+      // runner-ops's OWN poll (the 2nd) `repositorySelection: 'all'` —
+      // the code-agent's (1st) and the router's (3rd, unasserted here)
+      // both get 'selected'. Before #1128 generalized the shared
+      // repository_selection guard to every App type, a flat 'all' for
+      // EVERY caller still isolated the failure to runner-ops, because
+      // ordinary agent Apps had NO check at all — that is the exact gap
+      // this issue closes, so the fixture must now discriminate to keep
+      // testing runner-ops's OWN refusal in isolation from the agent's.
+      let installPollCount = 0;
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         buildAgentDeps: (log) => ({
           ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
           log,
-          waitForAppInstallation: async (opts) => ({
-            appId: opts.appId,
-            installId: 'install-x',
-            appSlug: opts.expected.appSlug ?? '',
-            accountLogin: 'groundnuty',
-            repositorySelection: 'all', // the hazard the task brief names
-          }),
+          waitForAppInstallation: async (opts) => {
+            installPollCount += 1;
+            return {
+              appId: opts.appId,
+              installId: 'install-x',
+              appSlug: opts.expected.appSlug ?? '',
+              accountLogin: 'groundnuty',
+              repositorySelection: installPollCount === 2 ? 'all' : 'selected', // the hazard the task brief names, scoped to runner-ops's OWN (2nd) poll
+            };
+          },
         }),
       };
 
@@ -3422,10 +3539,12 @@ trust:
         expect(result.runnerOps.reason).toMatch(/repository_selection must be "selected"/);
         expect(result.runnerOps.reason).toMatch(/"all"/);
       }
-      // The failure is scoped to the runner-ops credential — the CODE-AGENT still
-      // succeeds (this fixture's `waitForAppInstallation` returns
-      // `repositorySelection: 'all'` for EVERY caller, but the agent path
-      // never consults that field at all).
+      // The failure is scoped to the runner-ops credential — the CODE-AGENT
+      // still succeeds (its OWN poll gets `repositorySelection: 'selected'`
+      // from the fixture above; a SEPARATE decisive test —
+      // `install-scope.test.ts` / the "agent App repository_selection"
+      // describe block below — covers the agent's OWN "all"-scoped
+      // refusal).
       expect(result.agents[0]?.identity.status).toBe('created');
     });
 
@@ -3745,7 +3864,22 @@ trust:
     const REUSE_PRIOR_LOCK: FleetLock = {
       schema_version: 1,
       fleet: 'demo-fleet',
-      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      // groundnuty/macf#1128 — a 'router' entry keeps the router App on the
+      // SAME reuse-confirmed path as 'code-agent' (this shared fixture's
+      // `confirmAppInstallation`/`resolveKeyPath` are role-blind — see
+      // `agentDepsFor`'s doc — so a prior lock entry existing at all is what
+      // routes ANY role through 'reuse-confirmed', never CREATE). Without
+      // it, the router (never in the prior lock, and its own create-or-
+      // reuse ceremony is UNCONDITIONAL every run — `apply-fleet.ts`'s own
+      // doc) now genuinely succeeds a fresh CREATE through this fixture
+      // (`install-scope.ts`'s guard is satisfied), which mints something
+      // new and breaks EVERY test below's "NOTHING NEW is minted this run"
+      // precondition — not a repository_selection regression, a knock-on
+      // of the SAME fixture now working correctly for every App type.
+      agents: [
+        { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+        { role: 'router', app_id: 'app-code-agent', install_id: 'install-1' },
+      ],
     };
 
     it.skipIf(!HAS_AGE)(
@@ -3815,7 +3949,13 @@ trust:
         // `pendingCreatedUpdates`/caSecrets/routingClientSecrets check) must
         // NOT have fired even though `vault.status === 'written'`.
         const lockAfter = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
-        expect(lockAfter.agents).toEqual([{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }]);
+        // groundnuty/macf#1128 — `REUSE_PRIOR_LOCK` now carries a 'router'
+        // entry too (see that constant's doc); it survives untouched
+        // alongside 'code-agent', same "no NEW secret was minted" claim.
+        expect(lockAfter.agents).toEqual([
+          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+          { role: 'router', app_id: 'app-code-agent', install_id: 'install-1' },
+        ]);
         expect(lockAfter.fingerprints?.['ca_key']).toBeUndefined();
         expect(lockAfter.fingerprints?.['routing_client_key']).toBeUndefined();
 
@@ -4261,7 +4401,14 @@ trust:
             status: 'confirmed',
             install: { appId: 'app-science-agent', installId: 'install-science-agent', appSlug: 'demo-fleet-science-agent', accountLogin: 'groundnuty' },
           }),
-          waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: 'install-code-agent', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' }),
+          // groundnuty/macf#1128 — `repositorySelection: 'selected'`.
+          waitForAppInstallation: async (opts) => ({
+            appId: opts.appId,
+            installId: 'install-code-agent',
+            appSlug: 'demo-fleet-code-agent',
+            accountLogin: 'groundnuty',
+            repositorySelection: 'selected',
+          }),
           openUrl: async () => {},
           log: () => {},
           writeRecoveryArtifact: async () => {},
@@ -5093,6 +5240,116 @@ trust:
       // Per-fleet scope never runs resolveSharedRouterAppReuse at all —
       // the shared-scope vault-check seam is untouched.
       expect(readVaultRouterAppCalls).toBe(0);
+    });
+  });
+
+  // --- groundnuty/macf#1128 — the decisive pair: an ORDINARY agent App's
+  // OWN repository_selection is now checked too, not just runner-ops's/the
+  // router's. Two live fleets hit exactly this gap: a coordination agent
+  // App installed "All repositories," carrying DR-019's full permission set
+  // (including contents:write) onto every repo in the org.
+  describe('agent App repository_selection (groundnuty/macf#1128)', () => {
+    it('DECISIVE 1/2: an "all"-scoped install is REFUSED for an ORDINARY agent App — naming the App and the remediation, and later steps do NOT run for it', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      let repoInitCalled = false;
+      const repoInitDeps: RepoInitStepDeps = {
+        cloneRepo: async () => {
+          repoInitCalled = true;
+        },
+        commitAndPush: async () => 'pushed',
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps),
+        buildAgentDeps: (log) => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          log,
+          waitForAppInstallation: async (opts) => ({
+            appId: opts.appId,
+            installId: 'install-x',
+            appSlug: opts.expected.appSlug ?? '',
+            accountLogin: 'groundnuty',
+            repositorySelection: 'all', // the exact hazard reported live, twice
+          }),
+        }),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      // Refused — named, actionable, naming THIS App's own handle:
+      expect(result.agents[0]?.identity.status).toBe('failed');
+      const reason = result.agents[0]?.identity.status === 'failed' ? result.agents[0].identity.reason : undefined;
+      expect(reason).toContain('demo-fleet-code-agent'); // the App
+      expect(reason).toMatch(/repository_selection must be "selected"/);
+      expect(reason).toMatch(/"all"/); // the observed value
+      expect(reason).toMatch(/open the install page/); // the remediation
+      expect(reason).toMatch(/Only select repositories/);
+      expect(reason).toMatch(/re-run apply/);
+
+      // THE decisive assertion per assert-the-wrong-path.md: a check that
+      // rejects EVERY install (even a correctly-scoped one) would satisfy
+      // "refused" trivially. Prove the run did NOT proceed to the steps a
+      // successful create would have taken for this role — repo-init never
+      // ran, and no fleet.lock entry exists for it (the sibling positive
+      // case below proves the SAME assertions flip to true on 'selected').
+      expect(repoInitCalled).toBe(false);
+      expect(result.agents[0]?.repoInit).toBeUndefined();
+      expect(result.finalLock?.agents.some((a) => a.role === 'code-agent')).toBe(false);
+    });
+
+    it('DECISIVE 2/2: a "selected"-scoped install proceeds UNCHANGED — the sibling positive case proving (1) isn\'t just "refuse everything"', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      let repoInitCalled = false;
+      // `creds()`'s SENTINEL (non-parseable) pem makes the REAL `repoInit()`
+      // genuinely fail token-generation (macf#920) — irrelevant to THIS
+      // test (repository_selection, not label-wiring), so fake `repoInit`
+      // itself, same as the file's very first "a freshly-created agent"
+      // test does for the identical reason (see that test's own comment).
+      const repoInitDeps: RepoInitStepDeps = {
+        cloneRepo: async () => {
+          repoInitCalled = true;
+        },
+        commitAndPush: async () => 'pushed',
+        repoInit: (async () => ({
+          workflow: 'created',
+          config: 'created',
+          labels: { status: 'ok', created: ['code-agent'], existed: [] },
+        })) as never,
+      };
+      const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps);
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('created');
+      expect(repoInitCalled).toBe(true);
+      expect(result.agents[0]?.repoInit?.status).toBe('applied');
+      expect(result.finalLock?.agents.some((a) => a.role === 'code-agent')).toBe(true);
+    });
+
+    it('a repository_selection absent from the response fails CLOSED, not merely "not all" — validateInstallRepositoryScope\'s own contract, exercised through the full apply-fleet orchestration', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: (log) => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          log,
+          waitForAppInstallation: async (opts) => ({
+            appId: opts.appId,
+            installId: 'install-x',
+            appSlug: opts.expected.appSlug ?? '',
+            accountLogin: 'groundnuty',
+            // repositorySelection deliberately omitted — a malformed/future API shape
+          }),
+        }),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('failed');
+      const reason = result.agents[0]?.identity.status === 'failed' ? result.agents[0].identity.reason : undefined;
+      expect(reason).toMatch(/not reported by GitHub/);
     });
   });
 });

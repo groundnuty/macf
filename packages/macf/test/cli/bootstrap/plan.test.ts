@@ -11,6 +11,7 @@ import {
   computePlan,
   countAppsToCreate,
   fleetPlanToJson,
+  formatInstallScopeDriftLines,
   formatOperatorInteractionLine,
   formatPlanText,
   formatRegistryScopeLines,
@@ -21,6 +22,7 @@ import {
   planItemApplyCoverage,
   summarizePlan,
   UNKNOWN_REASONS,
+  type InstallScopeDrift,
   type ObservedState,
   type PlanItem,
   type PlanItemKind,
@@ -28,6 +30,7 @@ import {
 } from '../../../src/cli/bootstrap/plan.js';
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../../src/cli/bootstrap/apply-routing.js';
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../../src/cli/bootstrap/registry-scope-preflight.js';
+import { validateInstallRepositoryScope } from '../../../src/cli/bootstrap/install-scope.js';
 
 /** A minimal, valid, 2-agent manifest — no optional sections. */
 function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
@@ -1732,6 +1735,108 @@ describe('computePlan — registryScopeIssues (macf#999 requirement 3: "plan sta
     });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     expect(plan.registryRepoScopeNotices).toEqual([]);
+  });
+});
+
+// --- groundnuty/macf#1128 — already-provisioned-fleet install-scope drift ---
+//
+// `ObservedAgentState.installRepositorySelection` is populated ONLY by a
+// LIVE org-installations read (`observer.ts::listOrgInstallRepositorySelections`);
+// these tests hand-build it directly (offline, no `gh` — same convention
+// every other `computePlan` test in this file uses).
+describe('computePlan installScopeDrift — already-provisioned-fleet repository_selection drift (groundnuty/macf#1128)', () => {
+  it('is empty when no agent has an observed installRepositorySelection at all (org-listing unavailable, or a personal-account-owned fleet)', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.installScopeDrift).toEqual([]);
+  });
+
+  it('is empty when the observed value is "selected" — no drift, nothing to report', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, installRepositorySelection: 'selected' },
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, installRepositorySelection: 'selected' },
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.installScopeDrift).toEqual([]);
+  });
+
+  it('THE DECISIVE CASE: reports drift for an agent observed as "all"-scoped, naming the App handle, the observed value, and the exact remediation', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, installRepositorySelection: 'all' },
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, installRepositorySelection: 'selected' },
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.installScopeDrift).toHaveLength(1);
+    const drift = plan.installScopeDrift[0];
+    expect(drift?.role).toBe('science-agent');
+    expect(drift?.appHandle).toBe('icsoc-2026-science-agent');
+    expect(drift?.observed).toBe('all');
+    expect(drift?.message).toContain('icsoc-2026-science-agent');
+    expect(drift?.message).toMatch(/repository_selection must be "selected"/);
+    expect(drift?.message).toMatch(/"all"/);
+    expect(drift?.message).toMatch(/open the install page/);
+    expect(drift?.message).toMatch(/Only select repositories/);
+  });
+
+  it('reports MULTIPLE drift entries — one per mis-scoped agent, not capped at one like registryScopeIssues/registryRepoScopeNotices', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, installRepositorySelection: 'all' },
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, installRepositorySelection: 'all' },
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.installScopeDrift).toHaveLength(2);
+    expect(plan.installScopeDrift.map((d) => d.role).sort()).toEqual(['code-agent', 'science-agent']);
+  });
+
+  it('uses the SAME message-building function apply\'s post-gate-2 refusal uses (install-scope.ts::validateInstallRepositoryScope) — never a second copy', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: { 'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, installRepositorySelection: 'all' } },
+    };
+    const plan = computePlan({ ...baseManifest(), agents: [baseManifest().agents[0]!] }, observed);
+    expect(plan.installScopeDrift[0]?.message).toBe(validateInstallRepositoryScope('all', 'icsoc-2026-science-agent'));
+  });
+
+  it('formatPlanText carries an install-scope WARNING line (not NOTICE — this is a live observed fact about an EXISTING install)', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: { 'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, installRepositorySelection: 'all' } },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    const text = formatPlanText(plan);
+    expect(text).toContain('install-scope: WARNING');
+    expect(text).toMatch(/repository_selection must be "selected"/);
+  });
+
+  it('formatInstallScopeDriftLines — one line per entry, "install-scope: WARNING — <message>"', () => {
+    const drift: readonly InstallScopeDrift[] = [{ role: 'science-agent', appHandle: 'icsoc-2026-science-agent', observed: 'all', message: 'the refusal text' }];
+    expect(formatInstallScopeDriftLines(drift)).toEqual(['install-scope: WARNING — the refusal text']);
+  });
+
+  it('fleetPlanToJson OMITS install_scope_drift entirely when empty — byte-identical to pre-#1128 output', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const json = fleetPlanToJson(plan) as Record<string, unknown>;
+    expect('install_scope_drift' in json).toBe(false);
+  });
+
+  it('fleetPlanToJson carries the install_scope_drift key when non-empty', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: { 'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, installRepositorySelection: 'all' } },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    const json = fleetPlanToJson(plan) as Record<string, unknown>;
+    expect('install_scope_drift' in json).toBe(true);
+    expect(Array.isArray(json.install_scope_drift)).toBe(true);
+    expect((json.install_scope_drift as unknown[]).length).toBe(1);
   });
 });
 

@@ -86,6 +86,7 @@ import { ROUTER_APP_ROLE, deriveRouterAppHandle } from './apply-router-app.js';
 // hand-authored copies of the underlying fact that could drift.
 import type { RegistryRepoScopeNotice, RegistryScopeConflict } from './registry-scope-preflight.js';
 import { checkRegistryRepoScopeNotice, checkRegistryScopePreflight } from './registry-scope-preflight.js';
+import { validateInstallRepositoryScope } from './install-scope.js';
 
 // --- Observed state (the reconcile input; populated by an observer, consumed as data) ---
 
@@ -174,6 +175,27 @@ export interface ObservedAgentState {
    * which serves the unrelated CA/routing-client presence trio.
    */
   readonly archived?: boolean;
+  /**
+   * This agent App's OBSERVED `repository_selection` (groundnuty/macf#1128)
+   * — the already-provisioned-fleet sibling of `install-scope.ts`'s
+   * apply-time `validateInstall` refusal: that guard only fires for a role
+   * `apply` is CREATING or resuming right now; a fleet that reached the bad
+   * `"all"`-scoped state BEFORE #1128 shipped (or was provisioned by a run
+   * that skipped the gate some other way) would sit there undetected
+   * forever without a read that can observe an ALREADY-installed App's
+   * scope. Sourced from a live `GET /orgs/{org}/installations` read
+   * (`observer.ts::listOrgInstallRepositorySelections`) — org-owned fleets
+   * ONLY; `undefined` for a personal-account-owned fleet (no ambient-auth
+   * listing endpoint exists there — same limitation
+   * `app-presence.ts::resolveAppPresence`'s own predicted-slug fallback
+   * has for this exact field) AND whenever the listing call itself
+   * couldn't be read. `undefined` therefore means "not observable this
+   * way," NEVER "confirmed selected" — `computePlan`'s `installScopeDrift`
+   * only warns when this field IS populated and is NOT `'selected'`;
+   * `undefined` never producing a warning is the honest-unknown floor
+   * (Amendment A4), not a false-clean read.
+   */
+  readonly installRepositorySelection?: string;
 }
 
 /**
@@ -380,6 +402,34 @@ export interface FleetPlan {
    * that function's doc.
    */
   readonly registryRepoScopeNotices: readonly RegistryRepoScopeNotice[];
+  /**
+   * groundnuty/macf#1128 — already-provisioned-fleet install-scope drift:
+   * one entry per declared agent whose OBSERVED `repository_selection` is
+   * populated (a live org-installations read succeeded) AND is NOT
+   * `'selected'`. Zero-to-N entries (unlike `registryScopeIssues`/
+   * `registryRepoScopeNotices`, which cap at one — a fleet can have
+   * multiple agent Apps, each independently mis-scoped). ALWAYS present
+   * (empty array when nothing applies — same convention as
+   * {@link skippedSections} / {@link unimplementedByApply}); the `--json`
+   * serialization omits the key entirely when empty, matching
+   * `registryScopeIssues`'s own documented reason (byte-identical output
+   * for a fleet with nothing to report).
+   */
+  readonly installScopeDrift: readonly InstallScopeDrift[];
+}
+
+/**
+ * One already-provisioned agent App whose observed install scope is wrong
+ * (groundnuty/macf#1128). `message` is built from the SAME shared function
+ * `apply`'s post-gate-2 refusal uses (`install-scope.ts::
+ * validateInstallRepositoryScope`) — one wording, reused, never a second
+ * copy drafted for the plan-time surface.
+ */
+export interface InstallScopeDrift {
+  readonly role: string;
+  readonly appHandle: string;
+  readonly observed: string;
+  readonly message: string;
 }
 
 /**
@@ -1796,6 +1846,26 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
   // `registry-scope-preflight.ts::checkRegistryRepoScopeNotice`'s doc.
   const registryRepoScopeNotice = checkRegistryRepoScopeNotice(manifest.owner);
 
+  // groundnuty/macf#1128 — already-provisioned-fleet install-scope drift:
+  // for each declared agent whose OBSERVED `repository_selection` is
+  // populated (a live org-installations read succeeded this run) AND is
+  // NOT `'selected'`, report it. An `undefined` observation (org-listing
+  // unavailable, personal-account-owned fleet, or the App simply isn't
+  // installed on the org yet) produces NO entry — honest-unknown, never a
+  // false-clean or false-drift verdict (Amendment A4). Reuses the SAME
+  // `validateInstallRepositoryScope` `apply`'s post-gate-2 refusal builds
+  // its message from — one wording, never a second copy for the plan-time
+  // surface.
+  const installScopeDrift: InstallScopeDrift[] = [];
+  for (const agent of manifest.agents) {
+    const observedSelection = observed.agents[agent.role]?.installRepositorySelection;
+    if (observedSelection === undefined) continue;
+    const appHandle = deriveAppHandle(fleetName, agent.role);
+    const message = validateInstallRepositoryScope(observedSelection, appHandle);
+    if (message === undefined) continue;
+    installScopeDrift.push({ role: agent.role, appHandle, observed: observedSelection, message });
+  }
+
   return {
     fleet: fleetName,
     items,
@@ -1803,6 +1873,7 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
     unimplementedByApply: computeUnimplementedByApply(items),
     registryScopeIssues: registryScopeFailure !== undefined ? [registryScopeFailure] : [],
     registryRepoScopeNotices: registryRepoScopeNotice !== undefined ? [registryRepoScopeNotice] : [],
+    installScopeDrift,
   };
 }
 
@@ -1864,6 +1935,11 @@ export function formatRegistryScopeLines(issues: readonly RegistryScopeConflict[
  */
 export function formatRegistryRepoScopeLines(notices: readonly RegistryRepoScopeNotice[]): readonly string[] {
   return notices.map((n) => `registry: NOTICE — ${n.message}`);
+}
+
+/** groundnuty/macf#1128 — one line per already-provisioned agent App whose observed install scope is wrong. `WARNING`, not `NOTICE` (the sibling functions above): this is a LIVE observed fact about an EXISTING install, not a manifest-derived heads-up about a future one. */
+export function formatInstallScopeDriftLines(drift: readonly InstallScopeDrift[]): readonly string[] {
+  return drift.map((d) => `install-scope: WARNING — ${d.message}`);
 }
 
 // --- Operator interaction budget (groundnuty/macf#880, DR-044 Decision 6) ---
@@ -2076,6 +2152,10 @@ export function formatPlanText(plan: FleetPlan): string {
   if (registryRepoScopeLines.length > 0) {
     parts.push('', ...registryRepoScopeLines);
   }
+  const installScopeDriftLines = formatInstallScopeDriftLines(plan.installScopeDrift);
+  if (installScopeDriftLines.length > 0) {
+    parts.push('', ...installScopeDriftLines);
+  }
   return parts.join('\n');
 }
 
@@ -2091,7 +2171,12 @@ export function formatPlanText(plan: FleetPlan): string {
  * omit-when-empty convention, for the SAME reason — a `type: profile`/
  * `type: org`/`type: local` fleet's `--json` output must stay byte-identical
  * to its pre-#1012 shape. Included only when `plan.registryRepoScopeNotices`
- * is non-empty (`type: repo`, today, always).
+ * is non-empty (`type: repo`, today, always). `install_scope_drift`
+ * (groundnuty/macf#1128) follows the SAME convention for the SAME reason —
+ * a fleet with nothing observably mis-scoped (including every
+ * personal-account-owned fleet, where this is never observable at all —
+ * see `ObservedAgentState.installRepositorySelection`'s doc) keeps a
+ * byte-identical pre-#1128 shape.
  */
 export function fleetPlanToJson(plan: FleetPlan): unknown {
   return {
@@ -2107,6 +2192,10 @@ export function fleetPlanToJson(plan: FleetPlan): unknown {
     ...(plan.registryRepoScopeNotices.length > 0
       ? { registry_repo_scope_notice: plan.registryRepoScopeNotices.map((i) => ({ ...i })) }
       : {}),
+    // groundnuty/macf#1128 — omitted entirely when empty, same reason
+    // `registry_scope_issues`/`registry_repo_scope_notice` do: byte-identical
+    // `--json` output for a fleet with nothing to report.
+    ...(plan.installScopeDrift.length > 0 ? { install_scope_drift: plan.installScopeDrift.map((i) => ({ ...i })) } : {}),
   };
 }
 

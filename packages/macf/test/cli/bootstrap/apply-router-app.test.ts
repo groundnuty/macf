@@ -16,22 +16,20 @@ import {
   routerAppIdentityRequest,
   buildRouterAppManifest,
   routerAppInstallRepos,
-  validateRouterAppInstall,
   resolveSharedRouterAppReuse,
   routerAppNameCollisionMessage,
   resolveRouterAppSecretsForPublish,
 } from '../../../src/cli/bootstrap/apply-router-app.js';
 import type { SharedRouterAppReuseDeps } from '../../../src/cli/bootstrap/apply-router-app.js';
 import { plannedAppNames, checkAppNameLengths } from '../../../src/cli/bootstrap/apply-runner-ops.js';
-import type { ConfirmedInstall } from '../../../src/cli/bootstrap/identity-confirm.js';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { RegistryConfig } from '@groundnuty/macf-core';
 
 /**
  * `router_app_scope: 'per-fleet'` (groundnuty/macf#1082) pins every test in
  * THIS file that doesn't care about scope (routerAppInstallRepos,
- * validateRouterAppInstall, plannedAppNames/checkAppNameLengths) to the
- * pre-#1082 fleet-derived handle, so their existing assertions stay
+ * plannedAppNames/checkAppNameLengths) to the pre-#1082 fleet-derived
+ * handle, so their existing assertions stay
  * byte-identical under the new 'shared' default. The dedicated
  * `resolveSharedRouterAppReuse` / `deriveRouterAppHandle(..., 'shared')`
  * describe blocks below construct their own scope-specific manifests
@@ -199,31 +197,12 @@ describe('routerAppInstallRepos — the registry target, NEVER any agent repo', 
   });
 });
 
-describe('validateRouterAppInstall — repository_selection scoped to the registry repo, NEVER "all"', () => {
-  const base: ConfirmedInstall = { appId: '1', installId: '2', appSlug: 'x-router', accountLogin: 'groundnuty' };
-
-  it('accepts "selected" — the only passing shape', () => {
-    expect(validateRouterAppInstall({ ...base, repositorySelection: 'selected' })).toBeUndefined();
-  });
-
-  it('REFUSES "all"', () => {
-    const reason = validateRouterAppInstall({ ...base, repositorySelection: 'all' });
-    expect(reason).toBeDefined();
-    expect(reason).toMatch(/repository_selection must be "selected"/);
-    expect(reason).toMatch(/"all"/);
-  });
-
-  it('REFUSES a missing repository_selection (fails CLOSED, not merely "not all")', () => {
-    const reason = validateRouterAppInstall(base);
-    expect(reason).toBeDefined();
-    expect(reason).toMatch(/not reported by GitHub/);
-  });
-
-  it('never mentions a credential — this function only ever sees a ConfirmedInstall, which carries none', () => {
-    const reason = validateRouterAppInstall({ ...base, repositorySelection: 'all' });
-    expect(reason).not.toMatch(/BEGIN.*PRIVATE KEY/);
-  });
-});
+// groundnuty/macf#1128 — `validateRouterAppInstall` (this App's own copy of
+// the repository_selection guard) is GONE. The shared implementation
+// (`install-scope.ts::validateInstallRepositoryScope` /
+// `buildInstallScopeValidator`) is tested once, in
+// `install-scope.test.ts` — see that file for the equivalent coverage this
+// describe block used to carry.
 
 describe('plannedAppNames / checkAppNameLengths — router handle joins the SAME pre-flight the runner-ops handle uses (groundnuty/macf#1074)', () => {
   it('plannedAppNames includes the router handle alongside every agent + runner-ops handle', () => {

@@ -21,7 +21,7 @@ import { dirname, join } from 'node:path';
 import { toVariableSegment, AgentInfoSchema } from '@groundnuty/macf-core';
 import type { AgentInfo, RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
-import { deriveControlRepoName, ROUTER_EMITTED_LABELS } from './fleet-manifest.js';
+import { deriveAppHandle, deriveControlRepoName, ROUTER_EMITTED_LABELS } from './fleet-manifest.js';
 import type { FleetObserverFn, ObservedAgentState, ObservedState, Presence } from './plan.js';
 import { readFleetLockFile } from './fleet-lock.js';
 import { registryPathPrefix } from '../registry-helper.js';
@@ -71,6 +71,78 @@ export function getStderr(err: unknown): string {
     return typeof s === 'string' ? s : '';
   }
   return '';
+}
+
+// --- Already-provisioned-fleet install-scope drift detection (groundnuty/macf#1128) ---
+
+/** One org-installed App's `appSlug` + observed `repository_selection`, the ONLY two fields {@link listOrgInstallRepositorySelections} needs — a narrower shape than `app-presence.ts::OrgInstallationRecord` on purpose, see that function's doc for why this module doesn't import from `app-presence.ts` at all. */
+export interface OrgInstallScope {
+  readonly appSlug: string;
+  readonly repositorySelection?: string;
+}
+
+/**
+ * `GET /orgs/{org}/installations?per_page=100` — the SAME endpoint +
+ * ambient-`gh`-auth posture `app-presence.ts::listOrgAppInstallations`
+ * already established for org-owned-fleet App-presence detection
+ * (groundnuty/macf#967), reused here for a DIFFERENT fact: not "does the
+ * App exist" but "what `repository_selection` does its install carry."
+ *
+ * **Deliberately NOT imported from `app-presence.ts`** — that module
+ * imports {@link getStderr} FROM this one (`app-presence.ts`'s own import
+ * line), so importing anything back from it here would be a module cycle.
+ * This is the SAME "duplicate a small I/O leaf across a layer boundary
+ * rather than introduce a cycle" precedent `registry-repo-coverage.ts` /
+ * `identity-confirm.ts` / `doctor.ts` already establish for the sibling
+ * App-JWT mint step (three independent copies, by design — see
+ * `registry-repo-coverage.ts::mintAppJwt`'s doc).
+ *
+ * Org-owned fleets ONLY (see this function's caller): a personal-account
+ * fleet has no ambient-auth listing endpoint at all
+ * (`identity-confirm.ts`'s module doc: `/user/installations` 403s on both
+ * bot tokens AND the operator's own `gh auth login` token) — there is no
+ * fallback for `repository_selection` specifically the way
+ * `app-presence.ts::resolveAppPresence` has one for bare existence (a
+ * predicted-slug `GET /apps/{slug}` read cannot see this field for a
+ * private App either). `undefined` — never a thrown error, never a guess —
+ * on ANY failure (network, `gh` missing, permission-denied, malformed
+ * body); the caller degrades every agent's `installRepositorySelection` to
+ * `undefined` (honest "not observable this way"), never a false 'selected'.
+ */
+export async function listOrgInstallRepositorySelections(org: string): Promise<readonly OrgInstallScope[] | undefined> {
+  try {
+    const { stdout } = await execFileAsync('gh', ['api', `orgs/${org}/installations?per_page=100`], { encoding: 'utf-8' });
+    const parsed: unknown = JSON.parse(stdout);
+    if (typeof parsed !== 'object' || parsed === null || !('installations' in parsed)) return undefined;
+    const list = (parsed as { readonly installations?: unknown }).installations;
+    if (!Array.isArray(list)) return undefined;
+    const out: OrgInstallScope[] = [];
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
+      const { app_slug, repository_selection } = item as Record<string, unknown>;
+      if (typeof app_slug !== 'string' || app_slug.length === 0) continue;
+      out.push({
+        appSlug: app_slug,
+        ...(typeof repository_selection === 'string' ? { repositorySelection: repository_selection } : {}),
+      });
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Look up ONE App's observed `repository_selection` from an already-fetched
+ * org-installations listing. Pure; `undefined` when the listing itself is
+ * `undefined` (the org-listing call failed/was skipped) OR the App isn't in
+ * it (not installed on this org, or a fleet whose owner isn't an org at
+ * all) OR the matching entry's body didn't carry the field — every case
+ * collapses to "not observable this way," never a guess in either
+ * direction (Amendment A4's honest-unknown floor).
+ */
+export function findInstallRepositorySelection(listing: readonly OrgInstallScope[] | undefined, appSlug: string): string | undefined {
+  return listing?.find((i) => i.appSlug === appSlug)?.repositorySelection;
 }
 
 /**
@@ -1139,6 +1211,16 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   // publish step uses (`RoutingClientApplyDeps.checkRepoSecretPresence`), so
   // plan and apply agree on presence by construction.
   const routingClientRepos: Record<string, Presence> = {};
+  // groundnuty/macf#1128 — already-provisioned-fleet install-scope drift
+  // detection: ONE `GET /orgs/{org}/installations` call (never per-agent —
+  // the listing already enumerates every App on the org in one shot),
+  // reused by `findInstallRepositorySelection` per agent below AND, further
+  // down, for the router App. `undefined` for a personal-account-owned
+  // fleet (no ambient-auth listing endpoint exists there at all — see
+  // `listOrgInstallRepositorySelections`'s doc) — every agent's
+  // `installRepositorySelection` then honestly reads `undefined` too,
+  // never a guess.
+  const orgInstallScopes = manifest.owner.type === 'org' ? await listOrgInstallRepositorySelections(manifest.owner.account) : undefined;
 
   for (const agent of manifest.agents) {
     const lockEntry = lock?.agents.find((a) => a.role === agent.role);
@@ -1168,6 +1250,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       deployedVersion: lockEntry?.deployed_version,
       actionsPin,
       archived: repoArchivedMeta.archived,
+      installRepositorySelection: findInstallRepositorySelection(orgInstallScopes, deriveAppHandle(manifest.metadata.name, agent.role)),
     };
     caRepos[agent.repo] = repoState.caRepo;
     routingClientRepos[agent.repo] = repoState.routingClientRepo;

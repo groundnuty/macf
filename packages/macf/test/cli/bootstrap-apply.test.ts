@@ -351,6 +351,30 @@ describe('plannedAppCreations (pure)', () => {
     expect(out).toMatch(/Only select repositories/);
   });
 
+  // groundnuty/macf#1128 — before this issue, the "⚠ choose Only select
+  // repositories" warning above was shown ONLY for runner-ops/the router
+  // App (the only two identities `apply` actually refused an "all"-scoped
+  // install for). Ordinary agent Apps now get the SAME post-gate-2 refusal
+  // (`install-scope.ts`), so the dry-run preview — which exists precisely
+  // to tell the operator what to click BEFORE they get it wrong — must
+  // warn them for every planned creation, not a subset.
+  it('formatPlannedAppCreations shows the "Only select repositories" warning for an ORDINARY agent App too, naming its own single repo', () => {
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
+    const codeAgentIndex = creations.findIndex((c) => c.role === 'code-agent');
+    expect(codeAgentIndex).toBeGreaterThanOrEqual(0);
+    const out = formatPlannedAppCreations(creations);
+    const lines = out.split('\n');
+    // Find the "code-agent" bullet line, then assert the VERY NEXT ⚠ line
+    // (before the next bullet) names its own repo.
+    const bulletIndex = lines.findIndex((l) => l.includes('role: code-agent'));
+    expect(bulletIndex).toBeGreaterThanOrEqual(0);
+    const warningLine = lines.slice(bulletIndex, bulletIndex + 6).find((l) => l.includes('⚠ on the install page'));
+    expect(warningLine).toBeDefined();
+    expect(warningLine).toContain('select exactly: groundnuty/demo-code');
+    expect(warningLine).not.toContain('demo-science'); // NOT the other agent's repo
+  });
+
   it('EXCLUDES an agent whose App is already present (no re-create)', () => {
     const plan = computePlan(manifest, observedWithApp('code-agent'));
     const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);

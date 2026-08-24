@@ -207,10 +207,12 @@ import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { TokenSource } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetLockAgent, FleetManifest } from './fleet-manifest.js';
 import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName } from './fleet-manifest.js';
-import type { AgentApplyDeps, AgentApplyOutcome } from './apply-agent.js';
+import type { AgentApplyDeps, AgentApplyOutcome, InstallRejection } from './apply-agent.js';
 import { applyAgentIdentity, applyIdentity, cleanupScratchPem, writeScratchPem } from './apply-agent.js';
 import type { Presence } from './plan.js';
 import { buildRegistryRepoValidateInstall, registryRepoCoverageUnverifiedOnSkipNote } from './registry-repo-coverage.js';
+import { buildInstallScopeValidator } from './install-scope.js';
+import type { ConfirmedInstall } from './identity-confirm.js';
 import type { AppCredentials } from './manifest-exchange.js';
 import type { AgentRepoDeps, AgentRepoOptions, RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
 import { applyRepoInitForAgent, ensureAgentRepo, resolveActionsPinReconcile } from './apply-repo-init.js';
@@ -250,7 +252,6 @@ import {
   deriveRunnerOpsHandle,
   runnerOpsIdentityRequest,
   runnerOpsNeeded,
-  validateRunnerOpsInstall,
 } from './apply-runner-ops.js';
 import type { RouterAppApplyOutcome, RouterAppSecretsForPublish, RouterAppVaultRestoreDeps, SharedRouterAppReuseDeps } from './apply-router-app.js';
 import {
@@ -260,7 +261,6 @@ import {
   resolveSharedRouterAppReuse,
   routerAppIdentityRequest,
   routerAppInstallRepos,
-  validateRouterAppInstall,
 } from './apply-router-app.js';
 import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } from './apply-ca.js';
 import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
@@ -857,6 +857,33 @@ function buildAgentDepsWithRecovery(
 }
 
 /**
+ * Chains multiple `AgentApplyDeps.validateInstall`/`validateReuse`-shaped
+ * hooks into ONE closure (groundnuty/macf#1128) — the per-agent loop below
+ * needs BOTH the shared `repository_selection` scope guard
+ * (`install-scope.ts::buildInstallScopeValidator`, unconditional, every
+ * registry type) AND the registry-repo-coverage check
+ * (`registry-repo-coverage.ts::buildRegistryRepoValidateInstall`, only when
+ * `registry.type === 'repo'`) on the SAME `validateInstall` field —
+ * `AgentApplyDeps` has room for exactly one hook per field, not a list.
+ * Runs hooks IN ORDER and returns the FIRST rejection — the cheap, pure,
+ * no-I/O scope check runs before the live network coverage check, so a
+ * scope-only rejection never pays for a call that would have told the
+ * operator nothing new (an `"all"`-scoped install trivially "covers" any
+ * one repo, so the coverage check alone cannot see this failure at all).
+ */
+function composeValidateInstall(
+  ...hooks: readonly ((install: ConfirmedInstall, keyPath: string) => InstallRejection | undefined | Promise<InstallRejection | undefined>)[]
+): (install: ConfirmedInstall, keyPath: string) => Promise<InstallRejection | undefined> {
+  return async (install, keyPath) => {
+    for (const hook of hooks) {
+      const rejection = await hook(install, keyPath);
+      if (rejection !== undefined) return rejection;
+    }
+    return undefined;
+  };
+}
+
+/**
  * DR-043 §D5 pre-flight — see the module doc's "Recovery-artifact
  * lifecycle" section. `confirmBeforeCreateGuard` returns `{action:
  * 'create'}` UNCONDITIONALLY (zero I/O) whenever `prior === undefined` —
@@ -1185,30 +1212,49 @@ export async function applyFleet(
     // identical every call; rebuilding is cheap (no I/O until a field is
     // invoked).
     const agentDepsBase = buildAgentDepsWithRecovery(recoveryRootDir, manifest.metadata.name, recipients, { ...deps, log: scopedLog });
+    // groundnuty/macf#1128 — EVERY agent App's install is now checked
+    // against `repository_selection === 'selected'`, unconditionally (the
+    // runner-ops/router App already had this; ordinary agents had NOTHING —
+    // the exact gap two live fleets hit: a coordination agent App installed
+    // `"all"`-scoped, carrying DR-019's permission set onto every repo in
+    // the org). Wired onto `validateInstall` ONLY (the CREATE/resume-install
+    // path, via `runGate2`) — deliberately NOT onto `validateReuse` too:
+    // `apply-agent.ts`'s own doc on `validateReuse` already records that
+    // silently widening a validateInstall-only check onto reuse-confirmed
+    // is a behavior change for an EXISTING caller nobody asked for, and that
+    // doing exactly this for the registry-repo-coverage check below broke 6
+    // unrelated tests whose fixtures never populate `repositorySelection` on
+    // a reuse-confirmed install. The residual this leaves — an
+    // already-`reused` role whose install scope drifted (or was wrong from
+    // the start, on a fleet that predates this fix) — is what
+    // `plan.ts`'s `computePlan`-computed `FleetPlan.installScopeDrift`
+    // exists to catch for an ALREADY-provisioned fleet; see that field's
+    // doc.
+    const appHandle = deriveAppHandle(manifest.metadata.name, agent.role);
+    const installScopeValidate = buildInstallScopeValidator(appHandle);
     // groundnuty/macf#1012 — when the registry is repo-scoped, every
-    // ordinary agent's install must be live-verified to actually cover the
-    // registry repo (never the runner-ops, below — it never touches the
+    // ordinary agent's install must ALSO be live-verified to actually cover
+    // the registry repo (never the runner-ops, below — it never touches the
     // registry). Wired here (not in `apply-agent.ts::realAgentApplyDeps`)
     // because this check needs FLEET-level context
     // (`manifest.owner.registry`) `realAgentApplyDeps` doesn't have — same
     // reasoning `buildAgentDepsWithRecovery`'s own splice already
     // establishes for `writeRecoveryArtifact`/`findRecoveryArtifact`.
     const agentDeps: AgentApplyDeps = (() => {
-      if (registry.type !== 'repo') return agentDepsBase;
-      // Wired onto BOTH `validateInstall` (CREATE / resume-install, via
-      // `runGate2`) AND `validateReuse` (an already-provisioned role
+      if (registry.type !== 'repo') return { ...agentDepsBase, validateInstall: installScopeValidate };
+      // `registryRepoValidate` is wired onto BOTH `validateInstall` (CREATE
+      // / resume-install, via `runGate2`, composed with the scope check
+      // above) AND `validateReuse` (an already-provisioned role
       // re-confirmed on a re-run, via `applyIdentity`'s `reuse-confirmed`
       // branch — see that field's doc for why it's separate from
-      // `validateInstall`) — the SAME closure, so an agent's install is
-      // verified identically regardless of which path resolved it this run.
-      const registryRepoValidate = buildRegistryRepoValidateInstall(
-        registry.owner,
-        registry.repo,
-        deriveAppHandle(manifest.metadata.name, agent.role),
-        scopedLog,
-        deps.checkRegistryRepoCoverage,
-      );
-      return { ...agentDepsBase, validateInstall: registryRepoValidate, validateReuse: registryRepoValidate };
+      // `validateInstall`) — UNCHANGED from before this issue; only
+      // `validateInstall` gains the new scope check.
+      const registryRepoValidate = buildRegistryRepoValidateInstall(registry.owner, registry.repo, appHandle, scopedLog, deps.checkRegistryRepoCoverage);
+      return {
+        ...agentDepsBase,
+        validateInstall: composeValidateInstall(installScopeValidate, registryRepoValidate),
+        validateReuse: registryRepoValidate,
+      };
     })();
 
     // macf#857 — ensure the agent's OWN repo exists BEFORE either consent
@@ -1422,11 +1468,13 @@ export async function applyFleet(
         },
       }),
       // groundnuty/macf#943 — GitHub's App-manifest flow has no field to FORCE
-      // repository_selection at creation time (see
-      // `apply-runner-ops.ts::validateRunnerOpsInstall`'s doc); this
-      // is the verify-then-refuse enforcement point, checked right after gate 2
-      // confirms, before this identity is ever reported as created/resumed.
-      validateInstall: validateRunnerOpsInstall,
+      // repository_selection at creation time (see `install-scope.ts`'s
+      // doc); this is the verify-then-refuse enforcement point, checked
+      // right after gate 2 confirms, before this identity is ever reported
+      // as created/resumed. groundnuty/macf#1128 generalized the check
+      // itself out of this file — every App type (agents, router, this one)
+      // now builds its closure the SAME way, over its own handle.
+      validateInstall: buildInstallScopeValidator(deriveRunnerOpsHandle(manifest.metadata.name)),
     };
     runnerOpsIdentity = wouldCreateWithNoRecipient(runnerOpsPrior, recipients)
       ? noRecipientPreflightFailure(RUNNER_OPS_ROLE)
@@ -1516,7 +1564,9 @@ export async function applyFleet(
         deps.log(`[router] ${line}`);
       },
     }),
-    validateInstall: validateRouterAppInstall,
+    // groundnuty/macf#1128 — same shared repository_selection guard every
+    // App type uses now (`install-scope.ts`), over THIS App's own handle.
+    validateInstall: buildInstallScopeValidator(routerAppHandle),
   };
 
   // groundnuty/macf#1082 — SHARED scope only: resolve reuse-vs-instruct-vs-
