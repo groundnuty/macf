@@ -507,6 +507,15 @@ async function waitForCondition(
  * A red here can look like one of two very different things, and the
  * error TEXT — not the color — is what tells them apart:
  *
+ * (A third branch — a timeout that reproduces IN ISOLATION because the
+ * test's own measured cost is genuinely at its budget, not contention and
+ * not a wrong assertion — was added after commit-msg.test.ts's enum-sweep
+ * test was misdiagnosed as branch 1 for a full session, groundnuty/macf#1133.
+ * That branch doesn't apply to the two below — both are already isolation-
+ * clean here — but see the canonical `test-timeout-discriminator.md` for
+ * the full three-branch form; keep the two copies in sync when either
+ * evolves.)
+ *
  *   - `Test timed out in Nms`, reproducing only UNDER CONTENTION (parallel
  *     test files, a loaded CI runner), is an ENVIRONMENT claim. This
  *     repo's separately-documented flake class — `test/cli/certs.test.ts`,
