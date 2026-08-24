@@ -64,9 +64,15 @@ They are **complementary**: the role layer says *how this agent thinks about its
 *creation* and the App's *initial install* only to a human at a browser — no API does
 either, for anyone, ever. Everything else the old manual checklist below covers is
 automated. Expect **two browser clicks per agent App** (Create, then Install — in your
-own, already-logged-in browser; no debug-Chrome profile-copy dance, no MCP), plus the
-recurring GitHub auth gates (OAuth/sudo/2FA) that pause-and-resume regardless of how
-the run is driven.
+own, already-logged-in browser; no debug-Chrome profile-copy dance, no MCP), so **6
+for this 3-agent fleet**, plus the recurring GitHub auth gates (OAuth/sudo/2FA) that
+pause-and-resume regardless of how the run is driven. Two conditions can change that
+total (DR-043 Amendment O3): a **shared routing App** costs 2 more clicks only the
+*first* time any fleet in this GitHub account/org creates it — a fleet sharing an
+account with an existing MACF fleet reuses it for free; a **self-hosted-runner
+identity** (`routing.runner.runs_on: self-hosted`, not declared in the mapping table
+below) adds 2 more. This example fleet declares neither, so 6 is the expected total —
+but verify against `groundnuty` account state rather than assuming.
 
 **`fleet.yaml` field mapping for `icsoc-2026`** (schema:
 `packages/macf/src/cli/bootstrap/fleet-manifest.ts`; narrative + a full worked example:
@@ -349,7 +355,7 @@ These are the spots I most expect you to hit friction — please confirm or corr
 4. **`writer-agent` role label** — the macf plugin ships a `writing-agent` identity template, not `writer-agent`; here the identity comes from the `paper-latex` *template* profile instead, and `writer-agent` is just the routing label. Confirm that's what you want, or align the name.
 5. **Profile prerequisites** — Scholar Gateway connector (research/paper), LaTeX (`paper-latex`) — present on the host?
 6. **`--advertise-host`** — is `orzech-dev-agents.tail491af.ts.net` right for all three (same VM), and is `127.0.0.1` fine if you'll drive them locally without a cloud runner?
-7. **`macf bootstrap` dogfood (§2-bootstrap)** — this section was rewritten from the DR-043 CLI's source, not re-walked live end-to-end for this fleet; please report what worked / didn't on a real run: (a) did `macf bootstrap plan` render a plan you could actually reason about? (b) how many browser clicks total (2 per App expected — Create + Install — plus recurring auth gates), and did any of them need something this doc didn't warn you about? (c) did you catch the "Only select repositories" picker yourself, or did you learn the hard way (`groundnuty/macf#1128`)? (d) did `apply`'s default deploy phase behave as documented (local-host-only), or did it surprise you for a multi-host fleet like this one? (e) did `macf fleet deploy` on the VM work cleanly per agent? (f) anything the field-mapping table above got wrong against the actual `fleet.yaml` schema? Each friction point is an onboarding bug → we harden the CLI/docs (the recipe's own feedback loop, same as `macf#530`).
+7. **`macf bootstrap` dogfood (§2-bootstrap)** — this section was rewritten from the DR-043 CLI's source, not re-walked live end-to-end for this fleet; please report what worked / didn't on a real run: (a) did `macf bootstrap plan` render a plan you could actually reason about? (b) how many browser clicks total (6 expected for this fleet — 2 per agent App, no shared routing App or runner-ops cost if the account already has a MACF fleet — plus recurring auth gates), and did any of them need something this doc didn't warn you about? (c) did you catch the "Only select repositories" picker yourself, or did you learn the hard way (`groundnuty/macf#1128`)? (d) did `apply`'s default deploy phase behave as documented (local-host-only), or did it surprise you for a multi-host fleet like this one? (e) did `macf fleet deploy` on the VM work cleanly per agent? (f) anything the field-mapping table above got wrong against the actual `fleet.yaml` schema? Each friction point is an onboarding bug → we harden the CLI/docs (the recipe's own feedback loop, same as `macf#530`).
 
 ---
 

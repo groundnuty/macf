@@ -154,10 +154,28 @@ operator approval (interactive prompt, or `--yes` for automation), then runs
 end-to-end: control-repo provisioning (first, before any consent gate — a failure
 there aborts before anything else is touched) → per agent: ensure-repo →
 confirm-before-create → **consent gate 1** (App creation) → **consent gate 2** (App
-install) → `repo-init` → the routing (`runner-ops`) App's own gate 1/gate 2 → the
-single whole-payload vault write → `fleet.lock`. See
+install) → `repo-init` → the **routing App's** own gate 1/gate 2 (see below) → the
+**runner-ops App's** own gate 1/gate 2, only if needed (see below) → the single
+whole-payload vault write → `fleet.lock`. See
 `packages/macf/src/cli/bootstrap/apply-fleet.ts`'s module doc for the exact,
 tested sequence.
+
+**Two account/fleet-level Apps are distinct from the per-agent Apps above, and cost
+clicks differently:**
+
+- **The routing App** (`macf-routing`) — always attempted, but `apply` first checks
+  whether a **shared** routing App already exists for this account/org (the
+  `transport.router_app_scope: shared` default, DR-043 Amendment O) and **reuses**
+  it — zero clicks — rather than creating a new one. Only the account's *first ever*
+  MACF fleet actually spends the 2 clicks here; every fleet after that in the same
+  scope is free. `router_app_scope: per-fleet` opts a fleet out of sharing, at the
+  cost of its own 2 clicks every time.
+- **The `runner-ops` App** — a second, minimal App (`administration:write` /
+  `actions:read` / `metadata:read`, deliberately disjoint from the per-agent DR-019
+  permission set) for managing a self-hosted GitHub Actions runner. Created **only
+  when `routing.runner.runs_on: self-hosted` is declared** in `fleet.yaml`
+  (`runnerOpsNeeded`, `apply-runner-ops.ts`) — a fleet with no `routing.runner`
+  section, or one that stays on GitHub-hosted runners, never opens this gate at all.
 
 **The two consent gates are the whole of the operator's manual work, and they happen
 in the operator's own, already-logged-in browser** — no debug Chrome, no profile
@@ -177,10 +195,11 @@ copy, no Chrome DevTools MCP:
 > GitHub's install page defaults to nothing forced — choosing **"All repositories"**
 > by mistake silently grants that App DR-019's full permission set on *every* repo in
 > the account/org, not just this fleet's. `apply` already refuses this for the
-> dedicated routing (`runner-ops`) App (`apply-runner-ops.ts::validateRunnerOpsInstall`)
-> — as of this writing, the same post-gate-2 check is **not yet wired for ordinary
-> agent Apps** (that's #1128's ask). Until it lands, double-check the picker yourself
-> on every install click.
+> dedicated `runner-ops` App (`apply-runner-ops.ts::validateRunnerOpsInstall`) and
+> for the routing App (`apply-router-app.ts::validateRouterAppInstall`) — as of this
+> writing, the same post-gate-2 check is **not yet wired for ordinary agent Apps**
+> (that's #1128's ask). Until it lands, double-check the picker yourself on every
+> install click, especially for the per-agent Apps.
 
 Never silently creates a duplicate App (confirm-before-create guard) and never
 silently overwrites an existing vault (fails loud unless `MACF_BOOTSTRAP_VAULT_VERSION=1`
@@ -217,13 +236,19 @@ to `macf init` the same way the local deploy phase does. It does not launch the 
 ## The vault now lives in the fleet's own control repo, not an agent's
 
 `apply`'s first act (before any consent gate) is provisioning `<fleet-name>-control` —
-a dedicated, operator-owned repo with **no fleet agent granted write** at the
-platform-permission level believed originally (DR-043 Amendment F), corrected since
-to "**no agent write can land** on its protected branch" via branch protection
-(Amendment M — GitHub App permissions are per-App, not per-repo, so "installed but
-read-only" was never actually expressible; the guarantee now rests on a branch
-protection rule `apply` is designed to assert, though as of this writing that
-assertion is **not yet implemented** — Amendment M1 flags its own absence explicitly).
+a dedicated, operator-owned repo (DR-043 Amendment F). Amendment F originally stated
+the invariant as "no fleet agent granted write"; Amendment M **withdrew that as
+false** — GitHub App permissions are per-App, not per-repo, so "installed but
+read-only" was never actually expressible, and an agent's installation token *can*
+write to this repo. **The corrected invariant is narrower and enforced differently:
+no agent write can LAND on the repo's protected branch**, via GitHub branch
+protection (which an agent cannot disable — changing it needs `administration`,
+deliberately withheld from every agent App). Confidentiality of the vault still holds
+by encryption regardless (an agent can read the ciphertext but not decrypt it); this
+is specifically about the repo's *integrity*. **`apply` asserting that branch
+protection is actually in place is, as of this writing, not yet implemented** —
+Amendment M1 flags its own absence explicitly, so don't assume the guard is live
+without checking the control repo's branch-protection settings yourself.
 `fleet.yaml`, `fleet.lock`, and the age-encrypted `secrets/vault.age` all live there.
 There is **no `transport.vault_repo` field any more** — the location is derived, not
 configured, so it can't be pointed at an agent's own repo by mistake.
