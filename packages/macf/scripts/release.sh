@@ -357,7 +357,10 @@ cmd_check() {
 #      goes through the interactive trust dialog, deliberately) makes
 #      Claude Code ignore `permissions.allow` wholesale, so this pass
 #      validates `permissions.deny` grammar specifically; `allow`-rule
-#      structural validity is covered by `doctor` above instead.
+#      STRUCTURAL validity (JSON/wildcard-syntax shape) is covered by
+#      `doctor` above instead — `allow`-rule SEMANTIC drift (the #1067
+#      shape, on the allow side) is covered by NEITHER pass. Honest gap,
+#      not a full guarantee.
 #
 # Neither pass blocks on a WARNING — Claude Code itself distinguishes a
 # caveat (e.g. "glob patterns in sandbox permission rules are not fully
@@ -391,14 +394,43 @@ check_harness_compat() {
   cc_version="$(claude --version 2>/dev/null || true)"
   [ -n "$cc_version" ] || cc_version="<unknown>"
 
+  # Internal/test knobs (same shape as e.g. check-channels-enabled.sh's
+  # MACF_CHANNELS_POLL_ITERS) — let release.test.sh drive the timeout path
+  # deterministically in seconds rather than waiting out a real 30s hang.
+  local doctor_timeout="${MACF_HARNESS_CHECK_DOCTOR_TIMEOUT_SECS:-20}"
+  case "$doctor_timeout" in '' | *[!0-9]*) doctor_timeout=20 ;; esac
+  local p_timeout="${MACF_HARNESS_CHECK_P_TIMEOUT_SECS:-30}"
+  case "$p_timeout" in '' | *[!0-9]*) p_timeout=30 ;; esac
+
   # --- 1. claude doctor: structural validation. No trust prompt, no
   # session, no model call — just a settings/MCP-config shape check.
   local doctor_out
-  doctor_out="$(cd "$workspace_dir" && timeout 20 claude doctor 2>&1)" || true
+  doctor_out="$(cd "$workspace_dir" && timeout "$doctor_timeout" claude doctor 2>&1)" || true
   if printf '%s\n' "$doctor_out" | grep -qx 'Invalid settings'; then
-    log "Claude Code $cc_version (via 'claude doctor') rejects part of the release-generated settings:"
-    log "$doctor_out"
-    rc=1
+    # `claude doctor` walks up from cwd and can report findings about an
+    # ANCESTOR directory's .mcp.json/settings.json that have nothing to do
+    # with the scratch workspace this check just generated — verified
+    # empirically: run from inside a nested worktree, it additionally
+    # surfaced a finding about the PARENT checkout's unrelated .mcp.json.
+    # Every "Invalid settings" bullet names the absolute path of the
+    # offending file, so only fail on bullets whose path is actually
+    # inside workspace_dir; an ancestor/ambient finding is real but not
+    # this release's problem to block on. The sed range isolates just the
+    # "Invalid settings" section's bullets (stops at the next ALL-CAPS-
+    # initial section heading), so a LATER "N warning(s) found" section's
+    # own "- " bullets are never mistaken for these.
+    local in_scope_bullets
+    in_scope_bullets="$(printf '%s\n' "$doctor_out" \
+      | sed -n '/^Invalid settings$/,/^[A-Z]/{/^- /p}' \
+      | grep -F -- "$workspace_dir" || true)"
+    if [ -n "$in_scope_bullets" ]; then
+      log "Claude Code $cc_version (via 'claude doctor') rejects part of the release-generated settings:"
+      log "$doctor_out"
+      rc=1
+    else
+      log "NOTE (non-blocking): 'claude doctor' reported an 'Invalid settings' finding, but every reported path is OUTSIDE the scratch workspace (ambient/ancestor state) — not this release's problem:"
+      log "$doctor_out"
+    fi
   elif printf '%s\n' "$doctor_out" | grep -qE '^[0-9]+ warnings? found$'; then
     log "NOTE (non-blocking): 'claude doctor' found a caveat against Claude Code $cc_version — review, does not fail the release:"
     log "$doctor_out"
@@ -407,6 +439,13 @@ check_harness_compat() {
   # --- 2. claude -p, empty stdin, no prompt: session-load semantic
   # validation (catches the #1067 Write(path)-is-inert shape that `doctor`
   # above does not) + launcher dev-flag acceptance, folded into one call.
+  # NOTE: this pass validates `permissions.deny` grammar (deny rules apply
+  # regardless of the untrusted-workspace state below) plus whatever
+  # `doctor` already covers structurally for `allow`. It does NOT catch
+  # `allow`-rule SEMANTIC drift (the #1067 shape, on the allow side) —
+  # an untrusted scratch workspace makes Claude Code ignore
+  # `permissions.allow` wholesale, so there is no pass here that loads and
+  # semantically validates allow rules. Honest gap, not a full guarantee.
   local channels_args=()
   if [ -f "$workspace_dir/claude.sh" ]; then
     local flag_line=""
@@ -418,27 +457,40 @@ check_harness_compat() {
     fi
   fi
 
-  local p_out
-  p_out="$(cd "$workspace_dir" && printf '' | timeout 30 claude -p --output-format text "${channels_args[@]}" 2>&1)" || true
+  local p_out p_rc
+  if p_out="$(cd "$workspace_dir" && printf '' | timeout "$p_timeout" claude -p --output-format text "${channels_args[@]}" 2>&1)"; then
+    p_rc=0
+  else
+    p_rc=$?
+  fi
 
-  if ! printf '%s' "$p_out" | grep -q 'Error: Input must be provided'; then
-    # Never reached the expected "no prompt given" terminal state. Two
-    # readings: an inconclusive/timed-out run (p_out empty or truncated —
-    # carries no information about drift, so it's a NOTE, never a FATAL,
-    # per this file's own "never let a check itself become the flaky
-    # signal" stance) vs. an outright rejection before settings even
-    # loaded (e.g. "error: unknown option ..." on a renamed launcher flag).
-    if [ -z "$p_out" ]; then
-      log "NOTE (non-blocking): 'claude -p' produced no output (timed out?) — could not verify; not treated as a rejection."
-    else
-      log "Claude Code $cc_version rejected the release-generated launch invocation before reaching settings validation:"
+  if [ "$p_rc" = 124 ]; then
+    # `timeout`'s OWN exit code for "had to kill it" — checked explicitly
+    # rather than inferred from empty output. A killed process can still
+    # have written partial output (e.g. the trust-dialog line) before being
+    # killed, so "p_out is non-empty" is NOT a reliable timeout signal; a
+    # hang carries no information about drift either way, so this is
+    # always a NOTE, never a FATAL — the same "never let the check itself
+    # become the flaky signal" stance this file takes elsewhere.
+    log "NOTE (non-blocking): 'claude -p' timed out after ${p_timeout}s — could not verify; not treated as a rejection."
+  else
+    # Two independent checks (NOT if/elif) — both can legitimately fire on
+    # the SAME output: e.g. Claude Code prints the permission-rule
+    # rejection line and then exits some OTHER way than the expected
+    # "no prompt given" terminal state (a crash, an auth error, a future
+    # wording change). Reporting only the first would misdiagnose a real
+    # permission-rule rejection as "rejected the launch invocation" and
+    # never surface the actual offending rule.
+    if ! printf '%s' "$p_out" | grep -q 'Error: Input must be provided'; then
+      log "Claude Code $cc_version did not reach the expected 'no prompt given' terminal state — reviewing raw output for a launch-time rejection (e.g. an unrecognized launcher flag):"
       log "$p_out"
       rc=1
     fi
-  elif printf '%s' "$p_out" | grep -qE 'Permission (deny|allow) rule .*(is not matched by|was skipped)|Invalid permission rule'; then
-    log "Claude Code $cc_version (via 'claude -p') rejects a permission rule in the release-generated settings:"
-    log "$p_out"
-    rc=1
+    if printf '%s' "$p_out" | grep -qE 'Permission (deny|allow) rule .*(is not matched by|was skipped)|Invalid permission rule'; then
+      log "Claude Code $cc_version (via 'claude -p') rejects a permission rule in the release-generated settings:"
+      log "$p_out"
+      rc=1
+    fi
   fi
 
   return "$rc"

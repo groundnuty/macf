@@ -314,38 +314,131 @@ EOF
   fi
   assert_eq "harness-compat: accepted launcher flag + clean settings passes" "0" "$HC_FLAG_OK_RC"
 
-  # Sub-check B, negative direction (stubbed claude): a harness that no
-  # longer recognizes the channels flag must fail the gate.
+  # Sub-check B, negative direction, + the advisor-flagged edge cases below:
+  # a multi-mode stub `claude`, selected via $STUB_MODE, drives scenarios
+  # the REAL currently-installed binary cannot be driven into (it doesn't
+  # currently reject our flag, doesn't hang, and has no reproducible
+  # ancestor-.mcp.json defect to point at on demand).
   HC_STUB_DIR="$(mktemp -d)"
   CLEANUP_DIRS+=("$HC_STUB_DIR")
   cat >"$HC_STUB_DIR/claude" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
   --version) echo "99.0.0 (Claude Code, STUBBED for release.test.sh)"; exit 0 ;;
-  doctor) echo "No installation issues found."; exit 0 ;;
+  doctor)
+    case "${STUB_MODE:-}" in
+      doctor_ambient)
+        # An "Invalid settings" finding whose path is OUTSIDE the workspace
+        # under test — simulates `claude doctor` walking up from cwd and
+        # reporting on an unrelated ancestor .mcp.json/settings.json.
+        printf 'Invalid settings\n- %s/.mcp.json: MCP config is not a regular file or exceeds 2097152 bytes: %s/.mcp.json\n\nRemote Control\nControl this session from claude.ai/code or the Claude mobile app\n' \
+          "${STUB_AMBIENT_PATH:-/nowhere}" "${STUB_AMBIENT_PATH:-/nowhere}"
+        exit 0
+        ;;
+      doctor_inscope)
+        # An "Invalid settings" finding whose path IS inside the workspace
+        # under test — a genuine, in-scope structural rejection. (Plain
+        # colon separator here, not the real ">" glyph claude doctor uses —
+        # irrelevant to the substring-match logic under test.)
+        printf 'Invalid settings\n- %s/.claude/settings.json: permissions.allow: Invalid permission rule "mcp__*" was skipped: simulated for release.test.sh.\n\nRemote Control\nControl this session from claude.ai/code or the Claude mobile app\n' \
+          "${STUB_WORKSPACE_DIR:-/nowhere}"
+        exit 0
+        ;;
+      *) echo "No installation issues found."; exit 0 ;;
+    esac
+    ;;
   -p)
     shift
-    for a in "$@"; do
-      if [ "$a" = "--dangerously-load-development-channels" ]; then
-        echo "error: unknown option '--dangerously-load-development-channels'" >&2
+    case "${STUB_MODE:-}" in
+      flag_reject)
+        for a in "$@"; do
+          if [ "$a" = "--dangerously-load-development-channels" ]; then
+            echo "error: unknown option '--dangerously-load-development-channels'" >&2
+            exit 1
+          fi
+        done
+        echo "Error: Input must be provided either through stdin or as a prompt argument when using --print"
         exit 1
-      fi
-    done
-    echo "Error: Input must be provided either through stdin or as a prompt argument when using --print"
-    exit 1
+        ;;
+      both_defects)
+        # A permission-rule rejection line PLUS a non-terminal ending (a
+        # simulated crash) — the exact composite the elif-vs-independent-if
+        # fix targets: both signals must be reported, not just one.
+        echo "Permission deny rule (.claude/settings.json): Write(~/.ssh/**) is not matched by file permission checks — only Edit(path) rules are. Use Edit(~/.ssh/**) instead (Edit rules cover all file-editing tools)."
+        echo "simulated crash: unexpected internal error" >&2
+        exit 1
+        ;;
+      timeout)
+        # Outlives the short test-configured timeout — never reaches its
+        # own echo/exit; `timeout` kills it first.
+        sleep 5
+        echo "Error: Input must be provided either through stdin or as a prompt argument when using --print"
+        exit 1
+        ;;
+      *)
+        echo "Error: Input must be provided either through stdin or as a prompt argument when using --print"
+        exit 1
+        ;;
+    esac
     ;;
 esac
 exit 0
 STUB
   chmod +x "$HC_STUB_DIR/claude"
 
-  if HC_FLAG_REJECTED_OUT="$(PATH="$HC_STUB_DIR:$PATH" check_harness_compat "$HC_FIXTURE" 2>&1)"; then
+  if HC_FLAG_REJECTED_OUT="$(PATH="$HC_STUB_DIR:$PATH" STUB_MODE=flag_reject check_harness_compat "$HC_FIXTURE" 2>&1)"; then
     HC_FLAG_REJECTED_RC=0
   else
     HC_FLAG_REJECTED_RC=$?
   fi
   assert_true "harness-compat: a harness that rejects the launcher flag fails the gate" test "$HC_FLAG_REJECTED_RC" -ne 0
   assert_contains "harness-compat: rejected-flag diagnostic names the flag" "$HC_FLAG_REJECTED_OUT" "unknown option '--dangerously-load-development-channels'"
+
+  # --- Advisor-flagged edge case 1: BOTH defects present in one -p output
+  # must produce BOTH diagnoses (not just the first-matched one). Before
+  # the elif->independent-if fix, this scenario silently dropped the
+  # permission-rule diagnosis and misreported it as a launch-invocation
+  # rejection instead.
+  if HC_BOTH_OUT="$(PATH="$HC_STUB_DIR:$PATH" STUB_MODE=both_defects check_harness_compat "$HC_FIXTURE" 2>&1)"; then
+    HC_BOTH_RC=0
+  else
+    HC_BOTH_RC=$?
+  fi
+  assert_true "harness-compat: a composite (permission-rule + non-terminal exit) still fails the gate" test "$HC_BOTH_RC" -ne 0
+  assert_contains "harness-compat: composite case reports the permission-rule diagnosis" "$HC_BOTH_OUT" "Permission deny rule (.claude/settings.json): Write(~/.ssh/**) is not matched by file permission checks"
+  assert_contains "harness-compat: composite case ALSO reports the non-terminal-state diagnosis" "$HC_BOTH_OUT" "did not reach the expected 'no prompt given' terminal state"
+
+  # --- Advisor-flagged edge case 2: a genuine timeout is a NOTE, never a
+  # FATAL — checked via timeout's own exit code 124, not inferred from
+  # output emptiness (a killed process can still have written partial
+  # output first). MACF_HARNESS_CHECK_P_TIMEOUT_SECS=2 keeps this fast;
+  # the stub sleeps 5s so `timeout 2` genuinely kills it.
+  if HC_TIMEOUT_OUT="$(PATH="$HC_STUB_DIR:$PATH" STUB_MODE=timeout MACF_HARNESS_CHECK_P_TIMEOUT_SECS=2 check_harness_compat "$HC_FIXTURE" 2>&1)"; then
+    HC_TIMEOUT_RC=0
+  else
+    HC_TIMEOUT_RC=$?
+  fi
+  assert_eq "harness-compat: a genuine claude -p timeout does NOT fail the gate" "0" "$HC_TIMEOUT_RC"
+  assert_contains "harness-compat: timeout is reported as a non-blocking NOTE" "$HC_TIMEOUT_OUT" "NOTE (non-blocking): 'claude -p' timed out"
+
+  # --- Advisor-flagged edge case 3: `claude doctor` findings about a path
+  # OUTSIDE the workspace under test (ambient/ancestor state) must NOT fail
+  # the gate; findings INSIDE the workspace must.
+  if HC_DOCTOR_AMBIENT_OUT="$(PATH="$HC_STUB_DIR:$PATH" STUB_MODE=doctor_ambient STUB_AMBIENT_PATH="/some/unrelated/ancestor/dir" check_harness_compat "$HC_FIXTURE" 2>&1)"; then
+    HC_DOCTOR_AMBIENT_RC=0
+  else
+    HC_DOCTOR_AMBIENT_RC=$?
+  fi
+  assert_eq "harness-compat: an out-of-scope (ambient) doctor finding does NOT fail the gate" "0" "$HC_DOCTOR_AMBIENT_RC"
+  assert_contains "harness-compat: ambient finding is reported as a non-blocking NOTE" "$HC_DOCTOR_AMBIENT_OUT" "not this release's problem"
+
+  if HC_DOCTOR_INSCOPE_OUT="$(PATH="$HC_STUB_DIR:$PATH" STUB_MODE=doctor_inscope STUB_WORKSPACE_DIR="$HC_FIXTURE" check_harness_compat "$HC_FIXTURE" 2>&1)"; then
+    HC_DOCTOR_INSCOPE_RC=0
+  else
+    HC_DOCTOR_INSCOPE_RC=$?
+  fi
+  assert_true "harness-compat: an in-scope doctor finding DOES fail the gate" test "$HC_DOCTOR_INSCOPE_RC" -ne 0
+  assert_contains "harness-compat: in-scope finding names the workspace path" "$HC_DOCTOR_INSCOPE_OUT" "$HC_FIXTURE"
 
   echo ""
   echo "--- check_harness_compat: clean settings.json (expect no output, rc=0) ---"
@@ -354,6 +447,14 @@ STUB
   echo "$HC_DRIFT_OUT"
   echo "--- check_harness_compat: launcher flag rejected by a stubbed harness (expect rc!=0) ---"
   echo "$HC_FLAG_REJECTED_OUT"
+  echo "--- check_harness_compat: BOTH a permission-rule rejection AND a non-terminal exit (expect rc!=0, BOTH messages) ---"
+  echo "$HC_BOTH_OUT"
+  echo "--- check_harness_compat: claude -p genuinely times out (expect rc=0, NOTE only) ---"
+  echo "$HC_TIMEOUT_OUT"
+  echo "--- check_harness_compat: doctor finding OUTSIDE the workspace (expect rc=0, NOTE only) ---"
+  echo "$HC_DOCTOR_AMBIENT_OUT"
+  echo "--- check_harness_compat: doctor finding INSIDE the workspace (expect rc!=0) ---"
+  echo "$HC_DOCTOR_INSCOPE_OUT"
 else
   echo "SKIP: 'claude' not found on PATH — skipping check_harness_compat tests (nothing installed to verify against)" >&2
 fi
