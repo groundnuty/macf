@@ -167,7 +167,8 @@ describe('runBootstrapPlan', () => {
     expect(json.unimplemented_by_apply.length).toBe(2);
     expect(json.unimplemented_by_apply.map((i) => i.kind)).toEqual(['routing', 'runner_warm']);
     expect(json.unimplemented_by_apply[0]?.verb).toBe('update');
-    expect(json.unimplemented_by_apply[1]?.verb).toBe('create');
+    // groundnuty/macf#926 — runner_warm's verb is write-always, not create.
+    expect(json.unimplemented_by_apply[1]?.verb).toBe('write-always');
     expect(json.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(false);
   });
 
@@ -241,23 +242,25 @@ describe('runBootstrapPlan', () => {
     };
     const code = await runBootstrapPlan({ file, json: true }, deps);
     expect(code).toBe(0);
-    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { summary: { noops: number; creates: number } };
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { summary: { noops: number; creates: number; writeAlways: number } };
     // 4 per-agent (app, repo, install, secret_fingerprint) + 2 CA (registry +
     // the one agent repo) + 1 routing_client (observed-present) — all noop.
-    // `labels` is one structural exception (groundnuty/macf#920): it has
-    // no plan-time observed read at all, so it ALWAYS degrades to a
-    // LOW-CONFIDENCE create-candidate — this is not "unclean," it's a
-    // documented limitation (see `labelsItem`'s doc). `runner_ops`
-    // (groundnuty/macf#943) is absent entirely here (groundnuty/macf#1083):
-    // `VALID_FLEET_YAML` declares no `routing:` section, so this fleet needs
-    // no runner-ops App. `router_app` (groundnuty/macf#1105) IS present
-    // here though — UNCONDITIONAL, and this fixture's `lock: null` has no
-    // 'router' entry. `ts_oauth` (groundnuty/macf#1109) is ALSO
-    // UNCONDITIONAL, and `deps.observe`'s fixture above sets no
-    // `vaultTsOauth` — so `labels` + `router_app` + `ts_oauth` are the
-    // three create-candidates.
+    // `labels` is a write-always structural exception (groundnuty/macf#920,
+    // verb per groundnuty/macf#926): it has no plan-time observed read at
+    // all, so it ALWAYS emits `write-always` — this is not "unclean," it's
+    // a documented limitation (see `labelsItem`'s doc), and it's counted
+    // SEPARATELY from `creates` (a `write-always` item was never verified
+    // missing). `runner_ops` (groundnuty/macf#943) is absent entirely here
+    // (groundnuty/macf#1083): `VALID_FLEET_YAML` declares no `routing:`
+    // section, so this fleet needs no runner-ops App. `router_app`
+    // (groundnuty/macf#1105) IS present here though — UNCONDITIONAL, and
+    // this fixture's `lock: null` has no 'router' entry. `ts_oauth`
+    // (groundnuty/macf#1109) is ALSO UNCONDITIONAL, and `deps.observe`'s
+    // fixture above sets no `vaultTsOauth` — so `router_app` + `ts_oauth`
+    // are the two create-candidates; `labels` is the one write-always item.
     expect(json.summary.noops).toBe(7);
-    expect(json.summary.creates).toBe(3);
+    expect(json.summary.creates).toBe(2);
+    expect(json.summary.writeAlways).toBe(1);
   });
 
   // DR-043 Amendment D phase 3 — proves the `--vault`/`--identity-key` CLI
