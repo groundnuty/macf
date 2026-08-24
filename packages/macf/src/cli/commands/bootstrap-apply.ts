@@ -777,9 +777,19 @@ function blockingEnterPrompt(promptText: string): Promise<void> {
 /** Real y/N prompt on stderr (stdout stays clean for a `--json` render). */
 async function realConfirmPlan(plan: FleetPlan, creations: readonly PlannedAppCreation[]): Promise<boolean> {
   const summary = summarizePlan(plan.items);
+  // groundnuty/macf#926 — `write-always` items (labels/runner_warm) are
+  // deliberately EXCLUDED from `summary.creates` (a write-always item was
+  // never verified missing, unlike a genuine create — see `PlanSummary`'s
+  // doc). But apply DOES attempt them every run, so a banner silent about
+  // them would under-state what's about to happen on the operator's LAST
+  // read before typing "yes" — the exact failure this banner's own #854
+  // comment already guards against for unimplemented items. Named
+  // separately, never folded into "CREATE N," so the count keeps meaning
+  // "confirmed-or-plausibly missing."
+  const writeAlwaysNote = summary.writeAlways > 0 ? ` (plus ${String(summary.writeAlways)} write-always attempt(s), regardless of whether already present)` : '';
   process.stderr.write(
     `\nThis apply will CREATE ${String(summary.creates)} resource(s) (including ${String(creations.length)} GitHub ` +
-      `App(s) — ${String(creations.length * 2)} browser consent click(s): manifest-create + install, per App), ` +
+      `App(s) — ${String(creations.length * 2)} browser consent click(s): manifest-create + install, per App)${writeAlwaysNote}, ` +
       `${String(summary.updates)} update(s) requiring confirmation at the point they occur, and leave ` +
       `${String(summary.noops)} already-present resource(s) untouched. Nothing is deleted (§D3 no-prune).\n`,
   );

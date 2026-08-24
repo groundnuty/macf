@@ -353,14 +353,34 @@ export type PlanItemKind =
   | 'router_app'
   /** groundnuty/macf#1109 — the operator-supplied Tailscale OAuth pair (`TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`), a fleet-level, read-only-vault credential like `'router_app'`'s own App id/key, but never minted — see {@link tsOauthItem}'s doc. */
   | 'ts_oauth';
-export type PlanVerb = 'create' | 'update' | 'noop' | 'report-extra';
+/**
+ * `'write-always'` (groundnuty/macf#926) — a distinct verb from `'create'`
+ * for the two kinds (`labelsItem`/`runnerWarmItem`) that have NO live
+ * comparison against reality at all: they always emit the identical verb
+ * regardless of what `computePlan` observed, because nothing was ever read.
+ * `'create'` claims "checked, and it's missing" — a claim `'write-always'`
+ * does NOT make; it says only "apply attempts this write every run, whether
+ * or not it was needed." Conflating the two hides a real gap: a live
+ * fault-injection sweep (2026-08 fleet drift exercise) found `plan` caught a
+ * deleted `MACF_TRUSTED_ACTORS` var (`routing`, `noop → update`) and a
+ * downgraded router pin (`actions_pin`, `noop → update`) but MISSED a
+ * deleted repo label — because `labelsItem` was `'create'` unconditionally,
+ * so a `plan` run against a REPO WITH THE LABEL ALREADY DELETED reads
+ * identically to one against a repo that never had it. A plan-item kind
+ * whose verb never varies with reality carries zero signal while LOOKING
+ * covered. See `plan-item-write-always.test.ts` for the fixture-driven
+ * proof (both directions: `labels`/`runner_warm` never reach `'noop'` even
+ * under a fixture where everything ELSE reads `'noop'`; every other kind
+ * DOES reach both `'noop'` and a real action verb under some fixture).
+ */
+export type PlanVerb = 'create' | 'update' | 'noop' | 'report-extra' | 'write-always';
 
 export interface PlanItem {
   readonly kind: PlanItemKind;
   readonly target: string;
   readonly verb: PlanVerb;
   readonly reason: string;
-  /** `update` is ALWAYS `true` (§D3: confirm-then-update, never silent). Other verbs are always `false`. */
+  /** `update` is ALWAYS `true` (§D3: confirm-then-update, never silent). Other verbs (including `write-always`, groundnuty/macf#926 — an unconditional write is not a drift-confirmation, so it never gates on the confirm-then-update rail) are always `false`. */
   readonly confirm_required: boolean;
 }
 
@@ -862,16 +882,25 @@ function repoItem(agent: FleetAgent, obs: ObservedAgentState | undefined): PlanI
  * `apply-fleet.ts`'s loop) — this item exists purely so the operator sees
  * "labels" named explicitly in the pre-approval plan, not folded silently
  * into the `repo` item.
+ *
+ * `verb: 'write-always'`, NOT `'create'` (groundnuty/macf#926) — a live
+ * fault-injection sweep against a real fleet found `plan` caught a deleted
+ * `MACF_TRUSTED_ACTORS` var and a downgraded router pin as drift, but MISSED
+ * a deleted repo label, because this function has NO `obs` parameter at
+ * all — the verb could never legitimately vary with reality. `'create'`
+ * implicitly claims "checked, and it's missing"; that claim is false here
+ * on every run, whether or not the labels already exist. `'write-always'`
+ * states the honest alternative instead — see `PlanVerb`'s doc.
  */
 function labelsItem(agent: FleetAgent): PlanItem {
   return {
     kind: 'labels',
     target: `agent:${agent.role}:labels:${agent.repo}`,
-    verb: 'create',
+    verb: 'write-always',
     reason:
       `role + status labels on "${agent.repo}" are not observable at plan time (no per-label API read wired) — ` +
-      'treated as a create-candidate, LOW CONFIDENCE. `apply` attempts label creation unconditionally on every ' +
-      'repo-init run regardless of this item.',
+      'apply attempts label creation unconditionally on every repo-init run, whether or not the labels already ' +
+      'exist; this item cannot distinguish "missing" from "already present".',
     confirm_required: false,
   };
 }
@@ -1395,24 +1424,28 @@ function routingItem(
  * only when `routing.runner` is DECLARED (same "nothing was promised" gate
  * `computePlan` applies to `routingItem` itself; see the call site).
  *
- * Always `verb: 'create'`, unlike `routingItem`'s three-way compare: there is
- * no live-observable "is this runner already at the declared warm posture"
- * signal to compare against — the runner-provisioning contract that would
- * set it, and the only thing that could read it back, does not exist yet
- * (groundnuty/macf#943). `apply` has NO code path for this kind regardless
- * of verb (see {@link planItemApplyCoverage}'s `'runner_warm'` case +
- * `APPLY_UNIMPLEMENTED_REASONS.runnerWarm`) — this item exists so the
- * declared value is VISIBLE in the plan and loudly admitted as
- * not-yet-enforced (groundnuty/macf#861's coverage machinery), rather than
- * silently accepted-and-ignored — exactly the #957/#958 defect this issue's
- * thread named.
+ * Always `verb: 'write-always'` (groundnuty/macf#926 — was `'create'`),
+ * unlike `routingItem`'s three-way compare: there is no live-observable "is
+ * this runner already at the declared warm posture" signal to compare
+ * against — the runner-provisioning contract that would set it, and the
+ * only thing that could read it back, does not exist yet (groundnuty/macf#943).
+ * `'create'` implicitly claims "checked, and it's missing"; this function
+ * takes no observed-state input, so that claim can never be true or false —
+ * only ever asserted. `'write-always'` states the honest alternative:
+ * "declared, not comparable against reality." `apply` has NO code path for
+ * this kind regardless of verb (see {@link planItemApplyCoverage}'s
+ * `'runner_warm'` case + `APPLY_UNIMPLEMENTED_REASONS.runnerWarm`) — this
+ * item exists so the declared value is VISIBLE in the plan and loudly
+ * admitted as not-yet-enforced (groundnuty/macf#861's coverage machinery),
+ * rather than silently accepted-and-ignored — exactly the #957/#958 defect
+ * this issue's thread named.
  */
 function runnerWarmItem(fleetName: string, desiredWarm: number): PlanItem {
   const dormantNote = desiredWarm === 0 ? ' — this fleet is declared dormant' : '';
   return {
     kind: 'runner_warm',
     target: `routing:${fleetName}:runner:warm`,
-    verb: 'create',
+    verb: 'write-always',
     reason: `warm: ${String(desiredWarm)} declared${dormantNote} — not yet observable or enforced by apply; see the apply-coverage note below.`,
     confirm_required: false,
   };
@@ -1886,6 +1919,15 @@ export interface PlanSummary {
   readonly updates: number;
   readonly noops: number;
   readonly extras: number;
+  /**
+   * groundnuty/macf#926 — items whose verb is `'write-always'` (`labels`/
+   * `runner_warm`): apply attempts these on every run regardless of
+   * observed state, so they are counted SEPARATELY from `creates` rather
+   * than folded in — a `'write-always'` item was never verified missing,
+   * unlike a genuine `'create'`. Kept out of `creates` so that count keeps
+   * meaning "confirmed-or-plausibly missing," not "will be written."
+   */
+  readonly writeAlways: number;
 }
 
 export function summarizePlan(items: readonly PlanItem[]): PlanSummary {
@@ -1894,6 +1936,7 @@ export function summarizePlan(items: readonly PlanItem[]): PlanSummary {
     updates: items.filter((i) => i.verb === 'update').length,
     noops: items.filter((i) => i.verb === 'noop').length,
     extras: items.filter((i) => i.verb === 'report-extra').length,
+    writeAlways: items.filter((i) => i.verb === 'write-always').length,
   };
 }
 
@@ -2114,11 +2157,12 @@ export function buildPlanRows(items: readonly PlanItem[]): readonly (readonly st
   return items.map((i) => [i.kind, i.target, i.verb.toUpperCase(), i.confirm_required ? 'yes' : 'no', i.reason]);
 }
 
-/** `4 create, 1 update (confirm-required), 3 noop, 1 report-extra (never deleted)`. */
+/** `4 create, 1 update (confirm-required), 3 noop, 1 report-extra (never deleted), 2 write-always (not comparable to observed state)` (groundnuty/macf#926, comment only — the string itself never cites an issue number). */
 export function summaryLine(summary: PlanSummary): string {
   return (
     `${String(summary.creates)} create, ${String(summary.updates)} update (confirm-required), ` +
-    `${String(summary.noops)} noop, ${String(summary.extras)} report-extra (never deleted)`
+    `${String(summary.noops)} noop, ${String(summary.extras)} report-extra (never deleted), ` +
+    `${String(summary.writeAlways)} write-always (not comparable to observed state)`
   );
 }
 

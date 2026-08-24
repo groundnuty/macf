@@ -1562,7 +1562,8 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     // enforcement path yet — macf#942/#943) both do.
     expect(out).not.toMatch(/\bca:/);
     expect(out).toMatch(/\brouting:.*\(update\)/);
-    expect(out).toMatch(/\brunner_warm:.*\(create\)/);
+    // groundnuty/macf#926 — runner_warm's verb is write-always, not create.
+    expect(out).toMatch(/\brunner_warm:.*\(write-always\)/);
   });
 
   it('final summary (--yes, non-json) shows NO unimplemented block on a fresh fleet with no routing declared — CA is fully implemented (macf#838 Amendment D phase 2)', async () => {
@@ -1602,7 +1603,8 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     // explicitly in FLEET_YAML_WITH_ROUTING) and always shows up here
     // regardless of value, since apply has no enforcement path yet (#943).
     const warmItem = parsed.unimplemented_by_apply.find((i) => i.kind === 'runner_warm');
-    expect(warmItem?.verb).toBe('create');
+    // groundnuty/macf#926 — runner_warm's verb is write-always, not create.
+    expect(warmItem?.verb).toBe('write-always');
     // unimplemented_by_apply[].reason is the STATIC apply-coverage reason
     // (APPLY_UNIMPLEMENTED_REASONS.runnerWarm) — the same for every fleet,
     // not the per-item declared value. The declared "warm: 1" text lives on
