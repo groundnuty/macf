@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
-import { fromVariableSegment } from '@groundnuty/macf-core';
+import { fromVariableSegment, proxyAwareFetch } from '@groundnuty/macf-core';
 import { readAgentConfig, resolveCanonicalBranch, tokenSourceFromConfig, writeAgentConfig } from '../config.js';
 import type { MacfAgentConfig } from '../config.js';
 import { defaultProcReader, scanMacfProcesses } from '../proc-scan.js';
@@ -402,7 +402,7 @@ export async function fetchInstallationPermissions(
     throw new Error(describeNonJwtOutput(jwt));
   }
 
-  const response = await fetch(`https://api.github.com/app/installations/${installId}`, {
+  const response = await proxyAwareFetch(`https://api.github.com/app/installations/${installId}`, {
     headers: {
       Authorization: `Bearer ${jwt}`,
       Accept: 'application/vnd.github+json',
@@ -488,7 +488,7 @@ export async function fetchAppSlug(appId: string, keyPath: string): Promise<stri
     throw new Error(describeNonJwtOutput(jwt));
   }
 
-  const response = await fetch('https://api.github.com/app', {
+  const response = await proxyAwareFetch('https://api.github.com/app', {
     headers: {
       Authorization: `Bearer ${jwt}`,
       Accept: 'application/vnd.github+json',

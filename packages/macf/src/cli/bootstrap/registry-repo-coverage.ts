@@ -188,6 +188,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { proxyAwareFetch } from '@groundnuty/macf-core';
 import type { ConfirmedInstall } from './identity-confirm.js';
 import type { Presence } from './plan.js';
 import type { InstallRejection } from './apply-agent.js';
@@ -260,7 +261,7 @@ export async function checkRepoInAppInstallation(appId: string, keyPath: string,
 
   let response: Response;
   try {
-    response = await fetch(`https://api.github.com/repos/${owner}/${repo}/installation`, {
+    response = await proxyAwareFetch(`https://api.github.com/repos/${owner}/${repo}/installation`, {
       headers: {
         Authorization: `Bearer ${jwt}`,
         Accept: 'application/vnd.github+json',
