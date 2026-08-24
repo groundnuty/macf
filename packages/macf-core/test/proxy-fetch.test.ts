@@ -18,11 +18,11 @@
  *      object was constructed and handed to fetch() (construction alone
  *      doesn't prove undici's fetch actually consulted it).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import http from 'node:http';
 import net from 'node:net';
 import type { AddressInfo } from 'node:net';
-import { resolveProxyUrl, proxyAwareFetch } from '../src/proxy-fetch.js';
+import { resolveProxyUrl, resolveProxyDispatcher, proxyAwareFetch } from '../src/proxy-fetch.js';
 
 const UNROUTABLE_TARGET = 'http://definitely-does-not-resolve.invalid/probe';
 
@@ -180,5 +180,63 @@ describe('resolveProxyUrl', () => {
     // that the value is redacted. Callers must not log it either.
     const env = { HTTPS_PROXY: 'http://user:secret@proxy.example:1' };
     expect(resolveProxyUrl('https://api.github.com/x', env)).toBe('http://user:secret@proxy.example:1');
+  });
+
+  // A non-http(s) proxy scheme (macf#1144 review): undici's ProxyAgent only
+  // understands http:/https:. ALL_PROXY=socks5://... is a normal curl/gh
+  // convention (this repo's own dev boxes set it), and gh handles socks
+  // fine — so an unsupported scheme must degrade to "no proxy for this
+  // request" (unchanged direct-fetch behavior), never throw. Throwing here
+  // would invert the exact fetch-vs-gh asymmetry this issue is about: gh
+  // keeps working, our fetch wrapper would start hard-failing.
+  describe('unsupported proxy scheme (e.g. socks5)', () => {
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+      errorSpy.mockRestore();
+    });
+
+    it('falls back to undefined rather than throwing or returning a socks URL', () => {
+      const env = { ALL_PROXY: 'socks5://user:secret@proxy.example:1080' };
+      expect(resolveProxyUrl('https://api.github.com/x', env)).toBeUndefined();
+    });
+
+    it('warns loudly but never prints the proxy URL (credential-safety)', () => {
+      const env = { ALL_PROXY: 'socks5://user:secret@proxy.example:1080' };
+      resolveProxyUrl('https://api.github.com/x', env);
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const loggedText = errorSpy.mock.calls[0]?.join(' ') ?? '';
+      expect(loggedText).toContain('socks5:');
+      expect(loggedText).not.toContain('secret');
+      expect(loggedText).not.toContain('proxy.example');
+    });
+
+    it('an http(s)-scheme proxy alongside is still used normally (only the unsupported one is skipped)', () => {
+      const env = { HTTPS_PROXY: 'http://proxy.example:1', ALL_PROXY: 'socks5://other.example:1080' };
+      // HTTPS_PROXY wins by precedence before ALL_PROXY is ever consulted —
+      // this asserts the supported-scheme path is untouched by the guard.
+      expect(resolveProxyUrl('https://api.github.com/x', env)).toBe('http://proxy.example:1');
+    });
+  });
+});
+
+describe('resolveProxyDispatcher — caching (macf#1144 review: long-lived consumers)', () => {
+  it('returns the SAME dispatcher instance for the same resolved proxy URL', () => {
+    const env = { HTTPS_PROXY: 'http://cache-test-proxy.example:1' };
+    const first = resolveProxyDispatcher('https://api.github.com/a', env);
+    const second = resolveProxyDispatcher('https://api.github.com/b', env);
+    expect(first).toBeDefined();
+    expect(first).toBe(second);
+  });
+
+  it('returns a DIFFERENT dispatcher instance for a different proxy URL', () => {
+    const dispatcherA = resolveProxyDispatcher('https://api.github.com/a', { HTTPS_PROXY: 'http://proxy-a.example:1' });
+    const dispatcherB = resolveProxyDispatcher('https://api.github.com/a', { HTTPS_PROXY: 'http://proxy-b.example:1' });
+    expect(dispatcherA).not.toBe(dispatcherB);
   });
 });

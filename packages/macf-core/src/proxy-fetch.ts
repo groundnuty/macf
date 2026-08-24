@@ -30,7 +30,27 @@
  * this package targets (there is no ambient env-driven proxy support to
  * mutate into), so an env-var-poke approach has nothing to attach to below
  * Node 24 — an explicit dispatcher is the only lever that works on the
- * floor version.
+ * floor version. Empirically verified (not assumed): a script that set
+ * `process.env.NODE_USE_ENV_PROXY = '1'` and `process.env.HTTP_PROXY = …`
+ * mid-run, before a fetch() call, produced the IDENTICAL `ENOTFOUND` as a
+ * completely unconfigured run — the flag only took effect when present in
+ * the environment the process was LAUNCHED with (confirmed by the same
+ * script producing `ECONNREFUSED` instead, once `HTTP_PROXY` was passed at
+ * launch, proving the launch-time config path is live and the mid-run
+ * mutation path genuinely is not).
+ *
+ * Dispatchers are cached per resolved proxy URL (module-level, process
+ * lifetime): `@groundnuty/macf-channel-server`'s `refresh-aware-client.ts`
+ * wraps `createGitHubClient` — whose every call now flows through here —
+ * and that process is long-lived (a whole Claude session; see
+ * silent-fallback-hazards.md Instance 1's token-expiry sub-case, which
+ * exists precisely because this process outlives a short CLI run). Without
+ * caching, every registry heartbeat / `/sign` lookup would allocate a new
+ * `ProxyAgent` — its own keep-alive socket pool and timers — that's never
+ * closed. `@groundnuty/macf`'s own CLI invocations are short-lived
+ * (O(1)-O(30) calls total) and wouldn't have shown this, which is exactly
+ * why it needs stating rather than discovering later against the
+ * long-lived consumer.
  */
 import { ProxyAgent, type Dispatcher } from 'undici';
 
@@ -61,13 +81,33 @@ function isNoProxyMatch(hostname: string, noProxy: string): boolean {
 }
 
 /**
+ * `undici`'s `ProxyAgent` only understands `http:`/`https:` proxy URIs.
+ * A `socks5:`/`socks5h:` value in `ALL_PROXY` is a normal `curl`/`git`
+ * convention (this codebase's own dev boxes set `ALL_PROXY=socks5://…`
+ * alongside `HTTP_PROXY`/`HTTPS_PROXY`) — `gh` handles it fine via Go's
+ * proxy support, so treating it as a hard error here would invert the
+ * exact fetch-vs-gh asymmetry macf#1144 is about. Unsupported schemes
+ * degrade to "no proxy for this request" (the pre-fix, direct-fetch
+ * behavior) rather than throwing — never worse than before the fix.
+ */
+function isSupportedProxyScheme(candidate: string): boolean {
+  try {
+    const scheme = new URL(candidate).protocol;
+    return scheme === 'http:' || scheme === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Resolves the proxy URL (if any) that should carry a request to
  * `targetUrl`, honoring `HTTPS_PROXY`/`HTTP_PROXY` (protocol-matched),
  * `ALL_PROXY` as a catch-all, and `NO_PROXY` exclusions — the same
  * variables `gh` already reads natively. Returns `undefined` when no proxy
- * applies, which is the common case and leaves the caller's behavior
- * byte-for-byte unchanged (macf#1144 AC: no regression when there is no
- * proxy).
+ * applies (including an unsupported proxy scheme — see
+ * {@link isSupportedProxyScheme}), which is the common case and leaves the
+ * caller's behavior byte-for-byte unchanged (macf#1144 AC: no regression
+ * when there is no proxy).
  *
  * Deliberately never logged anywhere in this module or its callers — a
  * proxy URL frequently carries embedded credentials
@@ -87,21 +127,48 @@ export function resolveProxyUrl(
       ? firstNonEmpty(env['HTTPS_PROXY'], env['https_proxy'])
       : firstNonEmpty(env['HTTP_PROXY'], env['http_proxy']);
 
-  return firstNonEmpty(protocolSpecific, env['ALL_PROXY'], env['all_proxy']);
+  const candidate = firstNonEmpty(protocolSpecific, env['ALL_PROXY'], env['all_proxy']);
+  if (candidate === undefined) return undefined;
+  if (!isSupportedProxyScheme(candidate)) {
+    // Loud-but-proceeds (never silent-fallback, per this repo's own
+    // hazard catalog): tell the operator their proxy config for THIS
+    // host isn't being used for GitHub calls, without ever printing the
+    // (possibly credential-bearing) value itself — only its scheme.
+    const scheme = (() => { try { return new URL(candidate).protocol; } catch { return '<unparseable>'; } })();
+    console.error(
+      `proxy-fetch: a proxy env var resolved to scheme "${scheme}" for ${target.hostname} — ` +
+      'undici only supports http:/https: proxies; falling back to a direct (unproxied) connection.',
+    );
+    return undefined;
+  }
+  return candidate;
 }
 
+const dispatcherCache = new Map<string, Dispatcher>();
+
 /**
- * Builds the `undici` dispatcher for `targetUrl`, or `undefined` when no
- * proxy applies. Split out from {@link proxyAwareFetch} so a call site that
- * builds its own `RequestInit` in stages can still get a dispatcher without
- * going through the fetch wrapper.
+ * Builds (or reuses) the `undici` dispatcher for `targetUrl`, or
+ * `undefined` when no proxy applies. Cached per resolved proxy URL for the
+ * lifetime of the process — see module doc for why an uncached
+ * per-call `ProxyAgent` would leak in a long-lived consumer.
+ *
+ * Split out from {@link proxyAwareFetch} so a call site that builds its own
+ * `RequestInit` in stages can still get a dispatcher without going through
+ * the fetch wrapper.
  */
 export function resolveProxyDispatcher(
   targetUrl: string | URL,
   env: NodeJS.ProcessEnv = process.env,
 ): Dispatcher | undefined {
   const proxyUrl = resolveProxyUrl(targetUrl, env);
-  return proxyUrl === undefined ? undefined : new ProxyAgent(proxyUrl);
+  if (proxyUrl === undefined) return undefined;
+
+  const cached = dispatcherCache.get(proxyUrl);
+  if (cached !== undefined) return cached;
+
+  const dispatcher = new ProxyAgent(proxyUrl);
+  dispatcherCache.set(proxyUrl, dispatcher);
+  return dispatcher;
 }
 
 /**
