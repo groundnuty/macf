@@ -3,7 +3,9 @@ import { join, resolve } from 'node:path';
 import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { initAgent } from '../../src/cli/commands/init.js';
-import { readAgentConfig, agentCertPath, caCertPath, caKeyPath, caDir, readAgentsIndex, writeAgentsIndex } from '../../src/cli/config.js';
+import {
+  readAgentConfig, agentCertPath, caCertPath, caKeyPath, caDir, readAgentsIndex, writeAgentsIndex,
+} from '../../src/cli/config.js';
 import { hasManagedHeader } from '../../src/cli/claude-sh.js';
 import { createCA } from '@groundnuty/macf-core';
 
@@ -655,6 +657,110 @@ describe('macf init', () => {
 
       expect(readFileSync(telemetryPath, 'utf-8')).toBe(operatorTelemetry);
     }, 30000);
+  });
+
+  // --- agents-index scoping for an explicit --path run (macf#1135) ---
+  //
+  // `addToAgentsIndex` writes ~/.macf/agents.json unconditionally — no
+  // `--dir`/`--path` ever redirected it. `--path` (local-registry mode
+  // only) is the one flag whose whole purpose is relocating a run's state
+  // away from the operator's home-rooted defaults; an explicit `--path` now
+  // also skips the global cross-project registration. See the
+  // `addToAgentsIndex` call site in `init.ts` for the full decision +
+  // rejected alternatives.
+  describe('agents-index scoping for an explicit --path run (macf#1135)', () => {
+    // AGENTS_INDEX_PATH is a SHARED file on this machine — every `macf
+    // init` run on this host, including any OTHER agent/process running
+    // concurrently, reads/writes the SAME path (it is a module-scope const
+    // resolved from `homedir()` at IMPORT time — see the comment on the
+    // `skipCertIfPresent` describe block below for why `vi.stubEnv('HOME',
+    // …)` can't redirect it). Assertions below are therefore CONTAINMENT
+    // checks on "did THIS run's own entry land" rather than whole-file
+    // byte-identity: a byte-identity check is exposed to false failures
+    // from any unrelated concurrent writer, and — worse — a naive
+    // snapshot/restore around it risks CLOBBERING that writer's legitimate
+    // entry. Containment is still a fully decisive, zero-effect assertion
+    // per assert-the-wrong-path.md (it fails the moment this run's
+    // workspace appears in the index) without either hazard. Cleanup
+    // (the "ordinary run" test) is symmetric: remove only OUR OWN entry,
+    // never touch anyone else's.
+    //
+    // This is also why a genuine read-only-$HOME rehearsal isn't attempted
+    // in-process: the fix's mechanism (skip the write entirely for an
+    // explicit --path) means a --path run touches nothing under $HOME at
+    // all, which is exactly what the decisive test below proves.
+    it('DECISIVE: an explicit --path run never registers the workspace in ~/.macf/agents.json, and succeeds — equivalent to succeeding under a read-only $HOME, since nothing here is asked to write there', async () => {
+      const registryPath = join(dir, 'registry.json'); // scratch — inside this test's own tmp dir, never $HOME
+      const workspaceDir = join(dir, 'workspace');
+
+      await expect(initAgent(workspaceDir, {
+        project: `pathrun${Date.now()}${Math.floor(Math.random() * 1e6)}`,
+        role: 'code-agent',
+        registryType: 'local',
+        registryPath,
+        cliVersion: '0.1.0',
+        pluginVersion: '0.1.0',
+        actionsVersion: 'v1',
+      })).resolves.not.toThrow();
+
+      // Per assert-the-wrong-path.md: a zero-effect containment assertion,
+      // not merely "the command exited 0" — today's code exits 0 WHILE
+      // registering this workspace, which is the bug this test pins.
+      const index = readAgentsIndex();
+      expect(index.agents).not.toContain(resolve(workspaceDir));
+    }, 20000);
+
+    it('reports the skip, naming how to opt back in', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        const registryPath = join(dir, 'registry2.json');
+        const workspaceDir = join(dir, 'workspace2');
+
+        await initAgent(workspaceDir, {
+          project: `pathrun2${Date.now()}${Math.floor(Math.random() * 1e6)}`,
+          role: 'code-agent',
+          registryType: 'local',
+          registryPath,
+          cliVersion: '0.1.0',
+          pluginVersion: '0.1.0',
+          actionsVersion: 'v1',
+        });
+
+        const logged = logSpy.mock.calls.flat().join('\n');
+        expect(logged).toMatch(/skipped the global agents index/);
+      } finally {
+        logSpy.mockRestore();
+      }
+    }, 20000);
+
+    it('an ORDINARY run (no explicit --path) still updates the index — the fix does not silently disable it', async () => {
+      const workspaceDir = join(dir, 'workspace3');
+
+      await initAgent(workspaceDir, {
+        project: 'TEST',
+        role: 'code-agent',
+        appId: '123',
+        installId: '456',
+        keyPath: '.key.pem',
+        registryType: 'repo',
+        registryRepo: 'owner/repo',
+        cliVersion: '0.1.0',
+        pluginVersion: '0.1.0',
+        actionsVersion: 'v1',
+      });
+
+      const resolvedWorkspace = resolve(workspaceDir);
+      try {
+        const index = readAgentsIndex();
+        expect(index.agents).toContain(resolvedWorkspace);
+      } finally {
+        // Remove only OUR OWN entry — never a full restore, which would
+        // risk clobbering a concurrently-running process's real write to
+        // this SAME shared file (see the describe-block comment above).
+        const current = readAgentsIndex();
+        writeAgentsIndex({ agents: current.agents.filter((p) => p !== resolvedWorkspace) });
+      }
+    }, 20000);
   });
 });
 

@@ -70,6 +70,11 @@ export interface InitOptions {
    * `~/.macf/registry/<project>.json` when unset; the operator can
    * override for non-default placement (separate disk, encrypted home,
    * etc.). DR-024 §"Default `path`".
+   *
+   * Set (vs. left at its default) is ALSO the signal `initAgent` uses to
+   * skip registering this workspace in the global cross-project agents
+   * index (~/.macf/agents.json) — see the comment at the `addToAgentsIndex`
+   * call site in `initAgent` for the full rationale (macf#1135).
    */
   readonly registryPath?: string;
   /**
@@ -606,8 +611,66 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // Add .macf/ to .gitignore
   updateGitignore(absDir);
 
-  // Register in global index
-  addToAgentsIndex(absDir);
+  // Register in global index (macf#1135). `addToAgentsIndex` writes to
+  // ~/.macf/agents.json — a location this function has never derived from
+  // `absDir`/`--dir`, and one an explicit local-registry `--path` doesn't
+  // touch either, even though `--path` is the flag whose whole purpose is
+  // relocating this run's `--local` state away from the operator's
+  // conventional home-rooted defaults. Two independent problems, two
+  // independent fixes below:
+  //
+  //  1. WHICH runs get indexed. An explicit `--path` (only meaningful with
+  //     --local; validated as `regType === 'local'` above) is the caller's
+  //     deliberate signal that this run's local-registry state belongs
+  //     somewhere other than the conventional default
+  //     (~/.macf/registry/<project>.json) — release.sh's cmd_harness_check
+  //     is exactly this shape: a scratch, throwaway workspace materialized
+  //     to validate generator output, never meant to persist as a
+  //     discoverable agent. Extending that SAME signal to also skip
+  //     cross-project registration adds no new CLI surface and matches the
+  //     actual caller that surfaced the bug (macf#1069/#1134). Skipping is
+  //     never silent — see the console.log below, which names the un-skip
+  //     path so an operator who explicitly wants a custom --path AND
+  //     indexing isn't left guessing.
+  //     Two rejected alternatives, and why: "write the index entry under
+  //     the target path" — every reader (`readAgentsIndex`/`loadAllAgents`,
+  //     which drive `macf status`/`macf peers`/`macf list`) only ever reads
+  //     the ONE global path, so a per-workspace copy would never be read by
+  //     anything — not a redirect, a silent no-op with extra steps. A NEW
+  //     opt-out flag — rejected as unnecessary CLI surface when `--path`
+  //     already carries the exact "this run is scoped elsewhere" meaning.
+  //     An ordinary run — no `--path`, or a repo/org/profile registry where
+  //     `--path` isn't even read — is UNCHANGED: it still registers,
+  //     exactly as before this fix.
+  //  2. WHAT HAPPENS when the write itself fails (e.g. EROFS on a read-only
+  //     $HOME). The global index is a cross-project discovery convenience —
+  //     nothing about THIS workspace's own operation (its cert, its
+  //     claude.sh, its .claude/settings.json written below) depends on it.
+  //     A write failure here is therefore NOT fatal to `init`'s purpose:
+  //     caught, reported, and init proceeds. Before this fix the call was
+  //     unguarded, so an EROFS here aborted init before `.claude/settings.json`
+  //     (or anything written after this line) ever landed — the visible
+  //     symptom was "settings file missing", not "could not write your
+  //     home directory".
+  if (regType === 'local' && opts.registryPath !== undefined) {
+    console.log(
+      '  Index: skipped the global agents index — an explicit local-registry ' +
+        '--path targets a scoped/ephemeral run. Omit --path (use the default ' +
+        'registry location) to register this workspace normally.',
+    );
+  } else {
+    try {
+      addToAgentsIndex(absDir);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`  Warning: could not update the global agents index: ${msg}`);
+      console.warn(
+        `    ${absDir} is still fully initialized; ` +
+          '`macf status`/`macf peers`/`macf list` will not discover it ' +
+          'automatically until this is resolved.',
+      );
+    }
+  }
 
   // Copy canonical coordination rules into <workspace>/.claude/rules/
   // (single source of truth shipped with the CLI; refreshed by `macf update`)
