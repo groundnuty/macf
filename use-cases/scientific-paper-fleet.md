@@ -40,91 +40,98 @@ They are **complementary**: the role layer says *how this agent thinks about its
 
 ## 2. Prerequisites (operator, one-time)
 
-> **🤖 Recommended: automate this whole section + most of §3 with `macf-bootstrap`.** Rather than hand-doing the App creation (§2), repo creation (§3a), `macf init` prep, secrets, and the CA, the **`macf-bootstrap`** skill (DR-035) drives **your own logged-in Chrome + `gh` (as YOU)** to do all of it: create the per-agent Apps via the GitHub **manifest flow**, create the repos from the role template, install the Apps, set the routing secrets, generate the per-project CA, and produce an **age-encrypted vault** (committed to your science repo) + the **exact VM-side `macf init` commands** to run. Your only interaction: answer its intake, **approve one plan**, and satisfy the GitHub auth prompts as they pop. **Follow §2-bootstrap below.** The manual checklist (this §2 + §3a–3c) stays as the fallback **and** as the reference for *what* macf-bootstrap automates — read it to understand the moving parts even if you use the skill.
+> **Automate this whole section + most of §3 with `macf bootstrap` (DR-043).** The
+> per-agent App creation (§2), repo creation (§3a), `macf init` prep, secrets, and the
+> CA are all driven by a deterministic CLI core from a declarative `fleet.yaml`
+> manifest — no browser automation, no Chrome DevTools MCP. **Follow §2-bootstrap
+> below.** The manual checklist (this §2 + §3a–3c) stays as the fallback **and** as
+> the reference for *what* the CLI automates — read it to understand the moving parts
+> either way.
 
-### 2-bootstrap. Automated provisioning with `macf-bootstrap` (recommended) `[OPERATOR DOGFOOD]`
+### 2-bootstrap. Declarative provisioning with `macf bootstrap` (DR-043)
 
-> New (DR-035, 2026-06-29) — wants your real-world feedback (§6 hook).
+> **Repositioned 2026-08-11.** This section used to describe driving an
+> operator-privileged Claude Code skill (`macf-bootstrap`, DR-035) through your own
+> Chrome via the Chrome DevTools MCP. DR-043 moved the actual mechanism into a
+> deterministic CLI — `macf bootstrap plan|apply`, reading a `fleet.yaml` manifest —
+> and repositioned that skill as an **optional** conversational front-end to it (Q&A
+> → writes `fleet.yaml` → invokes the CLI; see
+> `tools/macf-bootstrap/.claude/skills/macf-bootstrap/SKILL.md`). You can use the
+> skill, or hand-author `fleet.yaml` and run the CLI directly — both produce the same
+> manifest-driven run.
 
-**`macf-bootstrap` is a separate product — its own repo, `groundnuty/macf-automated-github-setup`, which you clone directly.** It's a dedicated operator-privileged workspace that drives your Chrome + `gh` to provision *any* fleet's GitHub side (used for all use-cases, not created per project). The steps below clone that one repo — **nothing else needs to exist on your Mac first**, and you never touch the macf framework repo. (Maintainer note: the product repo is published from `groundnuty/macf:tools/macf-bootstrap/` — see the bootstrap README → **[Installing](../tools/macf-bootstrap/README.md#installing)** — but that's a one-time maintainer step, not something the operator following this recipe does.)
+**What's still genuinely manual, and why (DR-044 Decision 1):** GitHub exposes App
+*creation* and the App's *initial install* only to a human at a browser — no API does
+either, for anyone, ever. Everything else the old manual checklist below covers is
+automated. Expect **two browser clicks per agent App** (Create, then Install — in your
+own, already-logged-in browser; no debug-Chrome profile-copy dance, no MCP), so **6
+for this 3-agent fleet**, plus the recurring GitHub auth gates (OAuth/sudo/2FA) that
+pause-and-resume regardless of how the run is driven. Two conditions can change that
+total (DR-043 Amendment O3): a **shared routing App** costs 2 more clicks only the
+*first* time any fleet in this GitHub account/org creates it — a fleet sharing an
+account with an existing MACF fleet reuses it for free; a **self-hosted-runner
+identity** (`routing.runner.runs_on: self-hosted`, not declared in the mapping table
+below) adds 2 more. This example fleet declares neither, so 6 is the expected total —
+but verify against `groundnuty` account state rather than assuming.
 
-**Prerequisites on your Mac** (where Chrome + your GitHub login live): `macf` CLI ≥ 0.2.43 · `gh` authed **as you** (`gh auth status` → your user, not a `ghs_` bot) · `age` · `jq` · the Chrome DevTools MCP (auto-fetched by the workspace `.mcp.json`).
+**`fleet.yaml` field mapping for `icsoc-2026`** (schema:
+`packages/macf/src/cli/bootstrap/fleet-manifest.ts`; narrative + a full worked example:
+DR-043 §D1 — **the schema in code is authoritative over any example**, including
+DR-043's own, which still shows a `transport.vault_repo` field a later amendment
+removed):
 
-**Provision the `icsoc-2026` fleet — copy-paste:**
-
-```bash
-# 1. Start Chrome logged into GitHub, attached for the skill (macOS path; adjust for your OS):
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --remote-debugging-port=9222 >/dev/null 2>&1 &
-```
-
-```bash
-# 2. Clone the macf-bootstrap product repo + open Claude Code in it. That's the whole
-#    workspace — nothing else to set up, and you never touch the macf framework repo:
-git clone https://github.com/groundnuty/macf-automated-github-setup ~/macf-automated-github-setup
-cd ~/macf-automated-github-setup
-claude
-```
-
-```text
-# 3. In the Claude Code session, run the skill:
-/macf-bootstrap
-```
-
-The skill interviews you — give it **this fleet's spec** (the only project-specific input):
-
-| Intake prompt | Value for `icsoc-2026` |
+| `fleet.yaml` field | Value for `icsoc-2026` |
 |---|---|
-| project name | `icsoc-2026` |
-| science-agent | role `science-agent` · repo `groundnuty/icsoc-2026-science-agent` · VM path `/home/ubuntu/repos/agh/icsoc-2026-science-agent` |
-| code-agent | role `code-agent` · repo `groundnuty/icsoc-2026-experiment` · VM path `/home/ubuntu/repos/agh/icsoc-2026-experiment` |
-| writer-agent | role `writer-agent` · repo `groundnuty/icsoc-2026` · VM path `/home/ubuntu/repos/papers/icsoc-2026` |
-| registry scope | `profile` → `groundnuty` |
-| advertise-host | `orzech-dev-agents.tail491af.ts.net` |
-| science repo (vault target) | `groundnuty/icsoc-2026-science-agent` |
-| age recipient | your `age1…` public key — or let it mint a keypair + hand you the private key |
+| `metadata.name` | `icsoc-2026` |
+| `agents[].role` / `.profile` / `.repo` / `.deploy_path` (science) | `science-agent` / `research` / `groundnuty/icsoc-2026-science-agent` / `/home/ubuntu/repos/agh/icsoc-2026-science-agent` |
+| `agents[].role` / `.profile` / `.repo` / `.deploy_path` (code) | `code-agent` / `code` / `groundnuty/icsoc-2026-experiment` / `/home/ubuntu/repos/agh/icsoc-2026-experiment` |
+| `agents[].role` / `.profile` / `.repo` / `.deploy_path` (writer) | `writer-agent` / `paper-latex` / `groundnuty/icsoc-2026` / `/home/ubuntu/repos/papers/icsoc-2026` |
+| `owner.account` / `.type` / `.registry` | `groundnuty` / `user` / `{type: profile, user: groundnuty}` |
+| `network.advertise_host` | `orzech-dev-agents.tail491af.ts.net` |
+| `transport.age_recipients` | `[<your age1… public key>]` — **operator-run `age-keygen`, never tool-minted** (DR-043 Amendment C); `[]` makes `apply` refuse to open any consent gate |
 
-Then **approve the one plan** (it highlights blast-radius), and **satisfy the GitHub auth gates** as they pop (OAuth / sudo / 2FA — the only clicks; pause → you complete it → it resumes). **Outputs:** the age-encrypted vault committed to the science repo + a filled-in `macf init` command list + the verify commands.
+There is no longer a "science repo (vault target)" field — the vault is no longer
+committed into any agent's repo. `apply`'s first act provisions a dedicated
+`icsoc-2026-control` repo (derived from `metadata.name`, DR-043 Amendment F) that
+holds `fleet.yaml` + `fleet.lock` + the encrypted `secrets/vault.age`, with no fleet
+agent's App permitted write on its protected branch.
 
-**Finish on the VM — copy-paste** (using the skill's emitted output):
-
-The skill has now created all the repos on GitHub (from the role template) + committed the vault into the science repo. **Nothing is on the VM yet** — the next steps clone everything from GitHub and set it up from scratch.
-
-```bash
-# 4. Hand the age key to the VM out-of-band (the encrypted vault itself rides in via git).
-#    Target path = the default vault.sh reads (~/.config/macf/vault-age-key.txt):
-ssh magent 'mkdir -p ~/.config/macf'
-scp <age-key-path> magent:~/.config/macf/vault-age-key.txt
-```
+**The command surface — check `--help`, not this doc, for the exact current flags**
+(the CLI is under active amendment; `--help` always reflects what's actually wired):
 
 ```bash
-# 5. On the VM — clone every repo from GitHub, decrypt the vault, init + launch each agent.
-ssh magent          # then run the rest ON the VM:
-
-# 5a. Clone the science repo (it carries the age-encrypted vault) and unlock the vault:
-gh repo clone groundnuty/icsoc-2026-science-agent /home/ubuntu/repos/agh/icsoc-2026-science-agent
-cd /home/ubuntu/repos/agh/icsoc-2026-science-agent
-source secrets/vault.sh      # decrypts vault.age → exports creds + writes ~/.macf/keys/*.pem
-
-# 5b. Clone the other two agent repos to their home paths:
-gh repo clone groundnuty/icsoc-2026-experiment /home/ubuntu/repos/agh/icsoc-2026-experiment
-gh repo clone groundnuty/icsoc-2026            /home/ubuntu/repos/papers/icsoc-2026
+macf bootstrap plan  -f fleet.yaml --help
+macf bootstrap apply -f fleet.yaml --help
+macf fleet deploy --help      # materializes ONE agent's workspace from the vault
+macf fleet --help             # the teardown ladder: deactivate / archive / delete-apps / destroy
 ```
 
-```bash
-# 5c. Paste the macf init block the skill EMITTED (IDs + key paths pre-filled), then launch.
-#     It is a ready-to-run command per agent — shape:
-( cd /home/ubuntu/repos/agh/icsoc-2026-science-agent && macf init --project icsoc-2026 … && ./claude.sh )
-( cd /home/ubuntu/repos/agh/icsoc-2026-experiment    && macf init --project icsoc-2026 … && ./claude.sh )
-( cd /home/ubuntu/repos/papers/icsoc-2026            && macf init --project icsoc-2026 … && ./claude.sh )
-```
+At a high level: `macf bootstrap plan -f fleet.yaml` renders a read-only reconcile
+plan (create / confirm-then-update / report-only — never delete); `macf bootstrap
+apply -f fleet.yaml --vault <path> --identity-key <path>` takes one plan approval and
+then runs end-to-end, pausing only at the two per-App browser clicks above and the
+GitHub auth gates. By default `apply` also materializes each agent's workspace
+(clones `repo`, writes its key + the CA, delegates to `macf init`) — **but only on
+whatever host `apply` itself runs on** (`deploy_path` names a filesystem path, not a
+remote host). For a fleet like this one, where the Mac provisions and the VM runs the
+agents, run `apply --no-deploy` from the Mac for the GitHub-side work, then on the
+VM — after getting the vault (via the control repo) and the age key (out-of-band,
+e.g. `scp`) there — run `macf fleet deploy -f fleet.yaml --agent <role> --vault
+<path> --identity-key <path>` once per agent. That single idempotent command replaces
+the old hand-paste `git clone` + `macf init` block. It doesn't launch the agent
+(`./claude.sh`) — that's still your own step.
 
-```bash
-# 6. Verify the whole fleet is green (DR-030 — §3f):
-macf fleet status && macf routing doctor && macf fleet doctor
-```
+**Known rough edge — check the repository picker (`groundnuty/macf#1128`, open at
+time of writing).** On the App-install click, choose **"Only select repositories"**,
+never "All repositories." `apply` already refuses an "All repositories" install for
+the dedicated routing App; the same check is **not yet wired for ordinary agent
+Apps**, so a wrong click here isn't caught automatically yet — verify it yourself.
 
-If anything in these steps is unclear or breaks, that's the feedback we want (§6).
+**Verification status of this section:** rewritten from the current CLI source +
+DR-043 (2026-08-11, amended through 2026-08-21) — not re-walked live end-to-end for
+this exact fleet since the rewrite. A repeatable live-smoke
+(`groundnuty/macf#869`) is still open. If you hit friction running this, that's the
+onboarding-bug feedback loop §6 asks for.
 
 ---
 
@@ -348,13 +355,13 @@ These are the spots I most expect you to hit friction — please confirm or corr
 4. **`writer-agent` role label** — the macf plugin ships a `writing-agent` identity template, not `writer-agent`; here the identity comes from the `paper-latex` *template* profile instead, and `writer-agent` is just the routing label. Confirm that's what you want, or align the name.
 5. **Profile prerequisites** — Scholar Gateway connector (research/paper), LaTeX (`paper-latex`) — present on the host?
 6. **`--advertise-host`** — is `orzech-dev-agents.tail491af.ts.net` right for all three (same VM), and is `127.0.0.1` fine if you'll drive them locally without a cloud runner?
-7. **`macf-bootstrap` dogfood (§2-bootstrap) `[OPERATOR DOGFOOD]`** — the automated path is brand-new; please report what worked / didn't on a real run: (a) did the Chrome-debug attach work (step 2), or did the skill drive a fresh browser instead of your logged-in one? (b) did the manifest flow create + capture each App cleanly, or did a selector / redirect-`code` read fail? (c) how many auth-gate pauses, and were they handled gracefully? (d) did the vault land in the science repo + the age-key handoff make sense? (e) were the emitted `macf init` commands correct + complete? (f) anything that needed a click *other* than auth? Each friction point is an onboarding bug → we harden the skill (the recipe's own feedback loop, same as `macf#530`).
+7. **`macf bootstrap` dogfood (§2-bootstrap)** — this section was rewritten from the DR-043 CLI's source, not re-walked live end-to-end for this fleet; please report what worked / didn't on a real run: (a) did `macf bootstrap plan` render a plan you could actually reason about? (b) how many browser clicks total (6 expected for this fleet — 2 per agent App, no shared routing App or runner-ops cost if the account already has a MACF fleet — plus recurring auth gates), and did any of them need something this doc didn't warn you about? (c) did you catch the "Only select repositories" picker yourself, or did you learn the hard way (`groundnuty/macf#1128`)? (d) did `apply`'s default deploy phase behave as documented (local-host-only), or did it surprise you for a multi-host fleet like this one? (e) did `macf fleet deploy` on the VM work cleanly per agent? (f) anything the field-mapping table above got wrong against the actual `fleet.yaml` schema? Each friction point is an onboarding bug → we harden the CLI/docs (the recipe's own feedback loop, same as `macf#530`).
 
 ---
 
 ## 7. References
 
-- **DR-035** + `tools/macf-bootstrap/` — the `macf-bootstrap` automated-provisioning skill (§2-bootstrap).
+- **DR-043** — the current provisioning mechanism (`fleet.yaml`, `macf bootstrap plan|apply`, `macf fleet deploy`/teardown) driving §2-bootstrap; **DR-035** + `tools/macf-bootstrap/` — the optional conversational front-end skill DR-043 repositioned it as.
 
 - `design/macf-consumer-onboarding.md` — the generic bootstrap this recipe specialises.
 - `.claude/rules/coordination.md`, `.claude/rules/delegation-template.md` — the coordination discipline.
