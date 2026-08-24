@@ -48,6 +48,21 @@ describe('parseOrgInstallations (pure)', () => {
     const body = { installations: [{ app_id: 5 }] };
     expect(parseOrgInstallations(body)).toEqual([{ appId: '5', appSlug: '', accountLogin: '' }]);
   });
+
+  it('groundnuty/macf#1128 — extracts repository_selection when the body carries it', () => {
+    const body = {
+      installations: [{ id: 1, app_id: 4623756, app_slug: 'macf-experiment-devops-agent', account: { login: 'macf-experiment' }, repository_selection: 'all' }],
+    };
+    expect(parseOrgInstallations(body)).toEqual([
+      { appId: '4623756', appSlug: 'macf-experiment-devops-agent', accountLogin: 'macf-experiment', repositorySelection: 'all' },
+    ]);
+  });
+
+  it('groundnuty/macf#1128 — OMITS repositorySelection (not undefined-valued) when the body doesn\'t carry it — every pre-#1128 fixture above keeps passing unchanged', () => {
+    const body = { installations: [{ app_id: 1, app_slug: 'x', account: { login: 'org' } }] };
+    const [entry] = parseOrgInstallations(body);
+    expect(entry && 'repositorySelection' in entry).toBe(false);
+  });
 });
 
 describe('resolveAppPresence (org-owned fleet, listing succeeds)', () => {

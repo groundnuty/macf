@@ -424,19 +424,21 @@ export function formatPlannedAppCreations(creations: readonly PlannedAppCreation
     parts.push(`      events: ${c.manifest.default_events.join(', ')}`);
     parts.push(`      public: ${String(c.manifest.public)}   webhook active: ${String(c.manifest.hook_attributes.active)}`);
     parts.push(`      consent gate 2 (install, after gate 1 creates the App): ${c.installUrl}`);
-    if (c.role === RUNNER_OPS_ROLE || c.role === ROUTER_APP_ROLE) {
-      // groundnuty/macf#952 — the literal repo names, never "this fleet's
-      // repos": a class description isn't actionable at GitHub's repo-picker
-      // dropdown. `c.installRepos` is the SAME derivation the live gate-2
-      // interstitial renders (`installReposForIdentity` for runner-ops;
-      // `routerAppInstallRepos` for the router App — groundnuty/macf#1105,
-      // same narrow-install discipline `validateRouterAppInstall` enforces
-      // post-gate-2).
-      parts.push(
-        `      ⚠ on the install page: choose "Only select repositories" and select exactly: ` +
-          `${c.installRepos.join(', ')} — NEVER "All repositories".`,
-      );
-    }
+    // groundnuty/macf#952 — the literal repo names, never "this fleet's
+    // repos": a class description isn't actionable at GitHub's repo-picker
+    // dropdown. `c.installRepos` is the SAME derivation the live gate-2
+    // interstitial renders (`installReposForIdentity` for ordinary agents
+    // and runner-ops; `routerAppInstallRepos` for the router App —
+    // groundnuty/macf#1105), and `install-scope.ts` enforces the SAME
+    // post-gate-2 refusal for every one of them (groundnuty/macf#1128 —
+    // this warning used to be shown ONLY for runner-ops/the router App,
+    // because they were the only two types that check-with-refusal applied
+    // to; now that every App type does, the preview shows it for every
+    // planned creation, not a subset).
+    parts.push(
+      `      ⚠ on the install page: choose "Only select repositories" and select exactly: ` +
+        `${c.installRepos.join(', ')} — NEVER "All repositories".`,
+    );
   }
   parts.push('', budgetLine);
   return parts.join('\n');

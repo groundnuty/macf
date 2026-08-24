@@ -62,6 +62,19 @@ export interface OrgInstallationRecord {
   readonly appId: string;
   readonly appSlug: string;
   readonly accountLogin: string;
+  /**
+   * `.repository_selection` (`'all' | 'selected'`), when present in the body
+   * (groundnuty/macf#1128 — `plan.ts`'s already-provisioned-fleet drift
+   * detection needs this to catch a fleet that reached the bad state
+   * BEFORE this issue's `install-scope.ts` guard existed to refuse it going
+   * forward). **Omitted, not `undefined`-valued, when the source body
+   * doesn't carry the field** — same convention
+   * `identity-confirm.ts::ConfirmedInstall.repositorySelection` already
+   * establishes for the sibling `GET /app/installations` shape, for the
+   * same reason (every pre-#1128 `parseOrgInstallations` fixture predates
+   * this field).
+   */
+  readonly repositorySelection?: string;
 }
 
 /**
@@ -95,7 +108,7 @@ export function parseOrgInstallations(json: unknown): OrgInstallationRecord[] {
   const out: OrgInstallationRecord[] = [];
   for (const item of list) {
     if (!item || typeof item !== 'object') continue;
-    const { app_id, app_slug, account } = item as Record<string, unknown>;
+    const { app_id, app_slug, account, repository_selection } = item as Record<string, unknown>;
     if (app_id === undefined || app_id === null) continue;
     const appId = String(app_id);
     if (appId.length === 0) continue;
@@ -104,7 +117,12 @@ export function parseOrgInstallations(json: unknown): OrgInstallationRecord[] {
       account !== null && typeof account === 'object' && typeof (account as Record<string, unknown>).login === 'string'
         ? ((account as Record<string, unknown>).login as string)
         : '';
-    out.push({ appId, appSlug, accountLogin });
+    out.push({
+      appId,
+      appSlug,
+      accountLogin,
+      ...(typeof repository_selection === 'string' ? { repositorySelection: repository_selection } : {}),
+    });
   }
   return out;
 }

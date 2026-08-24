@@ -107,7 +107,6 @@ import type { FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle } from './fleet-manifest.js';
 import type { GitHubAppManifest } from './app-manifest.js';
 import { buildAppManifest } from './app-manifest.js';
-import type { ConfirmedInstall } from './identity-confirm.js';
 import type { AgentApplyOutcome, IdentityRequest } from './apply-agent.js';
 import type { Presence } from './plan.js';
 import { appSettingsAdvancedUrl } from './app-identity-removal.js';
@@ -298,28 +297,16 @@ export function routerAppInstallRepos(manifest: FleetManifest): readonly string[
 }
 
 /**
- * Post-gate-2 verify-then-refuse for `repository_selection` — same
- * blast-radius discipline `apply-runner-ops.ts::validateRunnerOpsInstall`
- * applies, for the same reason (groundnuty/macf#1074's ruling: "scope it
- * minimally BEFORE it is ever exported"). This App's own permission set is
- * already narrow (`actions_variables: read` only, no `administration`), so
- * an `'all'`-scoped install is a smaller blast radius than `runner-ops`'
- * equivalent slip would be — but it is still strictly more than this App
- * ever needs (exactly one repo: the registry target), and "narrow
- * permission, broad install" is still a needless widening for an
- * export-class key. Refuses on anything that isn't exactly `'selected'`,
- * same fail-closed posture as the runner-ops sibling.
+ * Post-gate-2 verify-then-refuse for `repository_selection` — used to be an
+ * independently-maintained copy of `apply-runner-ops.ts::validateRunnerOpsInstall`
+ * here (byte-different message, same shape). groundnuty/macf#1128 found that
+ * "no second copy" was already violated by the time it went looking for one,
+ * and generalized the check into `install-scope.ts`
+ * (`validateInstallRepositoryScope` / `buildInstallScopeValidator`) instead
+ * — this file no longer has its own version. `apply-fleet.ts` wires
+ * `buildInstallScopeValidator(routerAppHandle)` directly onto this
+ * identity's `validateInstall`.
  */
-export function validateRouterAppInstall(install: ConfirmedInstall): string | undefined {
-  if (install.repositorySelection === 'selected') return undefined;
-  return (
-    'repository_selection must be "selected" (scoped to just the registry-target repo) — observed ' +
-    `"${install.repositorySelection ?? '(not reported by GitHub)'}" . On the install page, choose "Only select ` +
-    'repositories" and pick exactly the registry-target repo — never "All repositories" (this App\'s key is ' +
-    'export-class; an unnecessarily broad install widens what every repo secret it is copied into can reach). ' +
-    "Correct the installation's repository access on GitHub, then re-run apply."
-  );
-}
 
 // --- Shared-scope reuse decision (groundnuty/macf#1082) ---
 //

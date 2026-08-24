@@ -48,12 +48,13 @@ import { join } from 'node:path';
 import {
   checkRunnerUsableByRepo,
   extractActionsPin,
+  findInstallRepositorySelection,
   isRunnerCapable,
   readFleetLock,
   resolveAgentRepoState,
   vaultAwareObserver,
 } from '../../../src/cli/bootstrap/observer.js';
-import type { AgentRepoStateDeps, OrgRunnerRecord, RunnerCapability, RunnerUsabilityDeps } from '../../../src/cli/bootstrap/observer.js';
+import type { AgentRepoStateDeps, OrgInstallScope, OrgRunnerRecord, RunnerCapability, RunnerUsabilityDeps } from '../../../src/cli/bootstrap/observer.js';
 import { ROUTER_EMITTED_LABELS } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { ObservedState } from '../../../src/cli/bootstrap/plan.js';
@@ -138,6 +139,37 @@ const BASE_OBSERVED: ObservedState = {
   caRegistry: 'unknown',
   caRepos: {},
 };
+
+// groundnuty/macf#1128 — already-provisioned-fleet install-scope drift
+// detection. `listOrgInstallRepositorySelections` is the real, untested
+// I/O leaf (same posture this file's module doc establishes for
+// `checkRepoExists`/`readRepoVariable` — a thin `execFile('gh', ...)`
+// wrapper); `findInstallRepositorySelection` is the pure lookup over its
+// output, fully unit-tested here.
+describe('findInstallRepositorySelection (groundnuty/macf#1128)', () => {
+  const listing: readonly OrgInstallScope[] = [
+    { appSlug: 'demo-fleet-code-agent', repositorySelection: 'selected' },
+    { appSlug: 'demo-fleet-devops-agent', repositorySelection: 'all' },
+    { appSlug: 'demo-fleet-science-agent' }, // repositorySelection omitted — a malformed/future API shape
+  ];
+
+  it('finds the matching entry\'s repositorySelection by appSlug', () => {
+    expect(findInstallRepositorySelection(listing, 'demo-fleet-code-agent')).toBe('selected');
+    expect(findInstallRepositorySelection(listing, 'demo-fleet-devops-agent')).toBe('all');
+  });
+
+  it('returns undefined when the matching entry never carried the field — never a guess', () => {
+    expect(findInstallRepositorySelection(listing, 'demo-fleet-science-agent')).toBeUndefined();
+  });
+
+  it('returns undefined when the App isn\'t in the listing at all (not installed on this org)', () => {
+    expect(findInstallRepositorySelection(listing, 'demo-fleet-writing-agent')).toBeUndefined();
+  });
+
+  it('returns undefined when the listing itself is undefined — the org-listing call failed or was never attempted (personal-account-owned fleet)', () => {
+    expect(findInstallRepositorySelection(undefined, 'demo-fleet-code-agent')).toBeUndefined();
+  });
+});
 
 describe('vaultAwareObserver — DR-043 Amendment D phase 3 (injected deps, no real gh/age)', () => {
   const manifest = baseManifest();
