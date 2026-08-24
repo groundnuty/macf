@@ -7,6 +7,21 @@ runs with no per-action prompts. Read this before doing anything in it.**
 This file is the workspace-rule form of DR-035 §2 (the safety contract). It is
 the standing brief loaded every session in the `macf-bootstrap` workspace.
 
+> **Positioning note (DR-043, 2026-08-11, `groundnuty/macf#877`).** The provisioning
+> *mechanism* moved to a deterministic CLI core (`macf bootstrap plan|apply`, driven
+> by a `fleet.yaml` manifest) that never drives a browser. This workspace's skill
+> (`.claude/skills/macf-bootstrap/SKILL.md`) is now an optional intake front-end to
+> that CLI. **The two structural rails below (§2) — and everything this file says
+> about the browser/MCP surface specifically — describe the PRE-DR-043 mechanism**,
+> where an LLM drove the operator's Chrome directly and needed a default-deny URL
+> fence for exactly that reason. Those rail files are still wired in this workspace
+> (`groundnuty/macf#877` scoped their removal separately) and still apply if the
+> workspace is ever used to drive a browser by hand again — but the current skill
+> procedure doesn't invoke `mcp__chrome-devtools__*` at all, so the browser/MCP rail
+> currently fences a surface nothing in the default flow reaches. The Bash/`gh` rail
+> (§2, §3) remains fully live — the CLI still shells out through this workspace's
+> `gh` under the same operator-privilege posture.
+
 ---
 
 ## 1. Why operator-privilege (the chicken-and-egg)

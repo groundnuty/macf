@@ -35,9 +35,9 @@ The label sets are already inconsistent across repos. That's the class of silent
 
 These are covered by `macf-consumer-onboarding.md` + `tools/macf-bootstrap/`. Do them once for the new agent; **don't duplicate the detail here** — follow those docs:
 
-1. **App identity** — create the agent's GitHub App, install it on the repos it works (see `secrets/INDEX.md` for the per-agent App-ID/install-ID convention). *(bootstrap Step 4b/4c automates this.)*
+1. **App identity** — create the agent's GitHub App, install it on the repos it works (see `secrets/INDEX.md` for the per-agent App-ID/install-ID convention). *(`macf bootstrap apply` automates this for a whole fleet — DR-043; see `tools/macf-bootstrap/` for adding one agent to an already-declared fleet.)*
 2. **`macf init`** in the agent's workspace — App creds, `claude.sh`, certs, registry entry. *(`macf-consumer-onboarding.md §2`.)*
-3. **Certs** — the agent's mTLS server cert from the project CA (`macf certs`). *(consumer-onboarding + bootstrap 4e.)*
+3. **Certs** — the agent's mTLS server cert from the project CA (`macf certs`). *(consumer-onboarding + `macf bootstrap apply`'s CA step.)*
 4. **Registry entry** — the channel-server self-registers on first launch. *(consumer-onboarding §4.)*
 5. **Router secrets** — the v3 routing secrets on the agent's own repo. *(consumer-onboarding; `secrets/INDEX.md`.)*
 6. **`macf doctor`** — the once-per-agent verification gate. *(consumer-onboarding §6.)*

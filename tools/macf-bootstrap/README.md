@@ -1,20 +1,34 @@
-# macf-bootstrap — operator-privileged GitHub-provisioning workspace
+# macf-bootstrap — operator-privileged fleet-provisioning workspace
 
 This directory is the **dev source** for `macf-bootstrap` (DR-035) — a **separate
 product**, delivered as the standalone `groundnuty/macf-automated-github-setup`
 repo (what users clone), developed here in the macf monorepo and published to that
-repo at each version (the `macf-actions` / `macf-marketplace` pattern). It is the
-operator-invoked tool that provisions a whole MACF fleet's GitHub side (the
-per-agent GitHub Apps, their keys, installs, repos, secrets, CA var, vault) that no
-CLI can create on its own.
+repo at each version (the `macf-actions` / `macf-marketplace` pattern).
 
-> **Scope.** This directory carries both the *workspace scaffold* + the two
-> structural safety rails (P1) **and** the provisioning **skill** itself (P2–P5):
-> the brains at `.claude/skills/macf-bootstrap/SKILL.md` (Q&A intake → manifest
-> flow → `gh` orchestration → vault → emitted commands) plus its deterministic
-> helper scripts (`.claude/scripts/bootstrap-*.sh`) and vault templates
-> (`templates/vault.{sh,template.txt}`). The scaffold is what makes the skill
-> safe to run with no per-action prompts.
+> **Repositioned by DR-043 (2026-08-11, operator-ratified).** The actual
+> provisioning *mechanism* — creating the per-agent GitHub Apps, their keys,
+> installs, repos, secrets, CA, and the age-encrypted vault — now lives in the
+> deterministic `macf bootstrap plan|apply` CLI, driven by a declarative
+> `fleet.yaml` manifest (`design/decisions/DR-043-declarative-fleet-provisioning.md`;
+> schema: `packages/macf/src/cli/bootstrap/fleet-manifest.ts`). **This workspace's
+> skill is now an optional conversational *front-end*** to that CLI — it turns a
+> Q&A interview into `fleet.yaml` and hands off, no more. It does not drive a
+> browser: see `.claude/skills/macf-bootstrap/SKILL.md` for what changed and why
+> most of the browser-rail detail below is now legacy (kept, per
+> `groundnuty/macf#877`, because the rail files themselves haven't been removed —
+> only the procedure that used to invoke them). If you'd rather hand-author
+> `fleet.yaml` directly, that's equally valid; the skill exists for operators who'd
+> rather answer questions.
+
+> **Scope.** This directory carries the *workspace scaffold* + the two structural
+> safety rails (P1) **and** the intake **skill** itself (P2–P5): the brains at
+> `.claude/skills/macf-bootstrap/SKILL.md` (Q&A intake → write `fleet.yaml` → invoke
+> `macf bootstrap plan`/`apply`) plus deterministic helper scripts
+> (`.claude/scripts/bootstrap-*.sh`) and vault templates
+> (`templates/vault.{sh,template.txt}`) inherited from the pre-DR-043 flow — some of
+> these (the browser-rail scripts, the manifest-exchange/vault-assembly helpers) are
+> no longer invoked by the current procedure but remain on disk. The scaffold is
+> what makes the skill safe to run with no per-action prompts.
 
 ## What this workspace is
 
@@ -41,7 +55,11 @@ rails** + one upfront plan approval:
    on `mcp__chrome-devtools__*`. A **default-deny** URL allowlist: only the App
    manifest-flow, App-install, and OAuth/sudo/2FA pages are reachable; the
    distinct destructive GitHub URLs (danger-zone / billing / delete / transfer /
-   revoke) are explicitly denied.
+   revoke) are explicitly denied. **Currently unexercised by the skill's own
+   procedure** (DR-043 moved App creation/install into the CLI's own `localhost`
+   redirect + JWT-poll, which never touches `mcp__chrome-devtools__*` — see the
+   skill file) — left wired rather than removed, so an operator who still drives
+   the browser by hand from this workspace keeps the fence.
 
 The fleet attribution-guard hooks (`check-gh-token.sh` et al.) are
 **deliberately omitted** here — this workspace is *supposed* to act as the
@@ -139,40 +157,59 @@ from.
 
 ## How the operator runs this workspace
 
-1. The operator clones the **product repo** to the Mac and works there:
+Two equally valid starting points — the skill exists only to save the operator from
+hand-authoring `fleet.yaml`:
+
+**With the intake skill (Q&A → `fleet.yaml` → CLI):**
+
+1. The operator clones the **product repo** to wherever `macf bootstrap` will run
+   (needs `gh` authenticated as the operator's **user**, `age`, and the `macf` CLI —
+   no Chrome, no browser-automation MCP):
    `git clone https://github.com/groundnuty/macf-automated-github-setup`
-   (NOT this `tools/macf-bootstrap/` dev-source subdir — see the note above; either consumes the
-   same skill).
-2. **Start Chrome with remote debugging** (this is what lets the MCP drive the
-   operator's *already-logged-in* session — the whole point of "no credential
-   handling"):
+   (NOT this `tools/macf-bootstrap/` dev-source subdir — see the note above; either
+   consumes the same skill).
+2. Open Claude Code in this directory.
+3. Run the **`macf-bootstrap`** skill (`.claude/skills/macf-bootstrap/SKILL.md`) and
+   follow its Q&A intake → `fleet.yaml` → `macf bootstrap plan` → `macf bootstrap
+   apply` loop. It validates the environment first (`bootstrap-validate-env.sh`), so
+   non-user `gh` / missing `age` / an incompatible `macf` version stops loud before
+   any provisioning. (The script's Chrome-reachability line is a leftover
+   best-effort check from the pre-DR-043 flow — it never blocks the run; ignore it.)
 
-   ```bash
-   # macOS — quit Chrome first, then:
-   /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-     --remote-debugging-port=9222
-   # verify it's listening:
-   curl -s http://127.0.0.1:9222/json/version
-   ```
+**Without the skill (hand-authored `fleet.yaml`):** write the manifest directly per
+`packages/macf/src/cli/bootstrap/fleet-manifest.ts` / DR-043 §D1, then run
+`macf bootstrap plan -f fleet.yaml` and `macf bootstrap apply -f fleet.yaml` — no
+Claude Code session in this workspace is needed for this path at all.
 
-   `.mcp.json` already points the MCP at this with
-   `--browser-url=http://127.0.0.1:9222`, so the MCP **attaches** to that Chrome
-   rather than launching a fresh, logged-out instance. Make sure `gh` is
-   authenticated as the operator's **user** (`gh auth status`) — this workspace
-   deliberately uses user auth, not a bot token. (Override the debug URL for the
-   env-validation probe with `MACF_BOOTSTRAP_CHROME_URL`.)
-3. Open Claude Code in this directory and approve the project MCP server when
-   prompted.
-4. Run the **`macf-bootstrap`** skill (`.claude/skills/macf-bootstrap/SKILL.md`)
-   and follow its Q&A intake → plan approval → run loop. It validates the
-   environment first (`bootstrap-validate-env.sh`), so a missing Chrome / non-user
-   `gh` / missing `age` stops loud before any provisioning.
+### Legacy: driving a browser from this workspace (pre-DR-043 mechanism, no longer needed for the default flow)
 
-See the upstream chrome-devtools-mcp README
+The Chrome DevTools MCP wiring below (`.mcp.json`, the URL-allowlist rail) predates
+DR-043 and is **not exercised by the current skill procedure** — App creation and
+install now happen via the CLI's own `localhost` redirect + JWT polling, in whichever
+browser the operator already has open, with no MCP involved. It is kept here (not
+deleted) because the rail scripts themselves haven't been removed
+(`groundnuty/macf#877` scoped that separately) and because it documents a real,
+previously-hit first-run trap if this workspace is ever used to drive a browser by
+hand again. Skip this section for a normal run.
+
+Starting a debug Chrome, if you genuinely need one:
+
+```bash
+# macOS — quit Chrome first, then:
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222
+# verify it's listening:
+curl -s http://127.0.0.1:9222/json/version
+```
+
+`.mcp.json` points the Chrome DevTools MCP at `--browser-url=http://127.0.0.1:9222`,
+so it **attaches** to that Chrome rather than launching a fresh, logged-out instance.
+(Override the debug URL for the env-validation probe with
+`MACF_BOOTSTRAP_CHROME_URL`.) See the upstream chrome-devtools-mcp README
 (<https://github.com/ChromeDevTools/chrome-devtools-mcp>) for `--browser-url` /
 `--channel` / profile options if the operator's Chrome setup differs.
 
-### Getting a *logged-in* debug Chrome (first-run finding, `macf-automated-github-setup#1`)
+#### Getting a *logged-in* debug Chrome (first-run finding, `macf-automated-github-setup#1`)
 
 The naive `--remote-debugging-port=9222` launch above only works if **no Chrome is
 already running**. In practice it usually is, and the result is the single most
@@ -246,19 +283,19 @@ tools/macf-bootstrap/
 │   ├── settings.json                          ← operator-privilege allow + dual-surface deny + the 2 PreToolUse rails
 │   ├── skills/
 │   │   └── macf-bootstrap/
-│   │       └── SKILL.md                        ← the orchestration skill (intake → manifest flow → gh → vault → emit)
+│   │       └── SKILL.md                        ← intake front-end (Q&A → fleet.yaml → `macf bootstrap plan`/`apply`; DR-043)
 │   ├── rules/
-│   │   └── macf-bootstrap-safety.md            ← the DR-035 §2 safety contract, workspace-rule form
+│   │   └── macf-bootstrap-safety.md            ← the DR-035 §2 safety contract, workspace-rule form (browser-rail part now legacy — see its own top note)
 │   └── scripts/
-│       ├── check-bootstrap-url-allowlist.sh    ← browser/MCP rail (default-deny URL allowlist)
+│       ├── check-bootstrap-url-allowlist.sh    ← browser/MCP rail (default-deny URL allowlist) — unexercised by the current procedure, kept wired
 │       ├── bootstrap-rail-selftest.sh          ← on-request proof the URL rail BLOCKS destructive nav (exit 2) + ALLOWs provisioning
 │       ├── check-bootstrap-gh-guard.sh         ← Bash/gh rail (destructive-deny + create-only secret set)
-│       ├── bootstrap-validate-env.sh           ← start-of-run env validation (gh-user / age / jq / rails / chrome)
-│       ├── bootstrap-exchange-manifest.sh      ← redeem the manifest `code` → app_id + private-key PEM + secrets
-│       ├── bootstrap-build-vault.sh            ← age-encrypt the assembled creds (plaintext piped on STDIN) → vault.age
-│       ├── bootstrap-commit-vault.sh           ← commit vault.age to the science repo (fail-if-exists, never --force)
-│       ├── bootstrap-cleanup.sh                ← wipe the .bootstrap-work/ scratch dir (always; success + abort)
-│       └── bootstrap-emit-commands.sh          ← render the VM-side macf init + verification commands
+│       ├── bootstrap-validate-env.sh           ← start-of-run env validation (gh-user / age / jq / rails; the chrome check is a legacy no-op)
+│       ├── bootstrap-exchange-manifest.sh      ← pre-DR-043: redeem the manifest `code` via a page read — superseded by the CLI's own localhost exchange, unused by the current procedure
+│       ├── bootstrap-build-vault.sh            ← pre-DR-043 vault assembly — superseded by the CLI's `vault-write.ts`, unused by the current procedure
+│       ├── bootstrap-commit-vault.sh           ← pre-DR-043: commit vault.age to an agent's science repo — superseded by the CLI's control-repo commit (DR-043 Amendment F), unused by the current procedure
+│       ├── bootstrap-cleanup.sh                ← wipe the .bootstrap-work/ scratch dir (always; success + abort) — still useful if the skill's own scratch files are used
+│       └── bootstrap-emit-commands.sh          ← pre-DR-043: render the VM-side macf init commands — superseded by `macf fleet deploy`, unused by the current procedure
 ├── .gitignore                                  ← keep scratch secrets out of git (.bootstrap-work/, *.app.json, vault*.age, age key)
 ├── .mcp.json                                   ← Chrome DevTools MCP server, --browser-url to the operator's Chrome
 ├── templates/
@@ -279,6 +316,9 @@ tools/macf-bootstrap/
 
 ## References
 
-- `design/decisions/DR-035-macf-bootstrap-github-provisioning-skill.md` — the full design; §2 is what this scaffold implements.
+- `design/decisions/DR-043-declarative-fleet-provisioning.md` — the current provisioning mechanism (`fleet.yaml`, `macf bootstrap plan|apply`, the reconcile model); this skill is now that DR's §D2 "optional conversational front-end."
+- `design/decisions/DR-035-macf-bootstrap-github-provisioning-skill.md` — the original design + its 2026-08-11 amendment recording the DR-043 repositioning; §2 is what this scaffold still implements (the workspace safety contract).
+- `design/decisions/DR-044-fleet-authority.md` — why App creation/install can never be fully automated (Decision 1) and who may run a fleet-wide command.
+- `packages/macf/src/cli/bootstrap/fleet-manifest.ts` — the live `fleet.yaml` schema (authoritative over any example in a design doc).
 - `.claude/rules/macf-bootstrap-safety.md` — the standing safety brief.
 - `packages/macf/templates/macf-app-manifest.json` — canonical source of the bundled DR-019 manifest.

@@ -1,35 +1,43 @@
 ---
 name: macf-bootstrap
-description: Provision a whole MACF fleet's GitHub side (per-agent GitHub Apps + keys + installs, repos from the role template, routing secrets, per-project CA, and the age-encrypted vault) by driving the operator's own logged-in Chrome + gh AS the operator. Invoke to onboard a new MACF fleet (any project, any number of agents) — it does everything except the VM-side git clone / macf init, which it emits as a command list. Operator-privileged; run only in the dedicated macf-bootstrap workspace (DR-035).
-allowed-tools: Bash, Read, Write, Edit, Glob, Grep, mcp__chrome-devtools__navigate_page, mcp__chrome-devtools__new_page, mcp__chrome-devtools__list_pages, mcp__chrome-devtools__take_snapshot, mcp__chrome-devtools__take_screenshot, mcp__chrome-devtools__click, mcp__chrome-devtools__fill, mcp__chrome-devtools__evaluate_script
+description: Optional conversational front-end for provisioning a MACF fleet (DR-035, repositioned by DR-043). Gathers the fleet's spec by Q&A, writes it as fleet.yaml, and invokes the deterministic macf bootstrap plan|apply CLI to provision it — per-agent GitHub Apps, repos, routing secrets, per-project CA, and the age-encrypted vault. Invoke to onboard a new MACF fleet (any project, any number of agents) when you'd rather answer questions than hand-author fleet.yaml. The CLI never drives a browser; App creation and the initial App install still need two clicks per App in the operator's OWN browser (GitHub has no API for either — see DR-044 Decision 1). Operator-privileged; run only in the dedicated macf-bootstrap workspace.
+allowed-tools: Bash, Read, Write, Edit, Glob, Grep
 ---
 
-# macf-bootstrap — provision a MACF fleet's GitHub side
+# macf-bootstrap — the conversational front-end to `macf bootstrap plan|apply`
 
 You are running in the **operator-privileged `macf-bootstrap` workspace** (DR-035).
 You act **AS the operator's GitHub account** — the deliberate inverse of the fleet
-attribution discipline — because creating GitHub Apps is a chicken-and-egg a
-scoped bot App cannot do. Read `.claude/rules/macf-bootstrap-safety.md` first; the
-two structural rails (Bash/gh deny + browser URL allowlist) and the plan-approve-once
-gate are what make running with **no per-action prompts** safe.
+attribution discipline — because two GitHub steps are chicken-and-egg: a scoped bot
+App cannot create the App that would let it act as itself. Read
+`.claude/rules/macf-bootstrap-safety.md` first for the workspace's operator-privilege
+posture; **its browser-driving rail description is legacy** (see the note at its top)
+— read on below for what actually still needs a browser.
 
-> **Helper scripts** live at `$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-*.sh`.
-> The deterministic work (manifest exchange, vault build/commit, command emit, env
-> validation) is in those scripts — call them; don't re-implement them inline.
+> **What changed, and why this file is short now (DR-043, 2026-08-11, operator-ratified).**
+> The provisioning *mechanism* moved to a deterministic CLI core —
+> `macf bootstrap plan|apply`, driven by a declarative `fleet.yaml` manifest
+> (schema: `packages/macf/src/cli/bootstrap/fleet-manifest.ts`; narrative:
+> `design/decisions/DR-043-declarative-fleet-provisioning.md` §D1–§D3). **This skill
+> is repositioned as an optional conversational front-end** (DR-043 §D2): it exists
+> only to turn a Q&A interview into a `fleet.yaml` file and then hand off to the CLI.
+> It no longer drives a browser itself — no Chrome DevTools MCP, no debug-Chrome
+> profile-copy dance, no URL-allowlist rail to police a browser it isn't driving. The
+> CLI opens the operator's **own, ordinary** browser to a `localhost` redirect for the
+> two GitHub steps that remain human-only (App creation, App install) and polls the
+> result via the App's own JWT — see DR-043 §D2 and DR-035's 2026-08-11 amendment
+> ("Amendment (2026-08-11, DR-043) — CLI-core repositioning") for the full narrative.
+> If you'd rather hand-author `fleet.yaml` directly and skip this Q&A entirely, that
+> is equally valid — the CLI doesn't care which produced the file.
+
+> **A constitutional floor this whole flow respects (DR-044 Decision 1):**
+> *creating and installing a GitHub App is a capability no credential can hold* —
+> GitHub exposes it only to a human at a browser, and no amount of automation ever
+> removes that. A fleet cannot be created unattended, ever, by construction. Nothing
+> below tries to route around that; it collapses everything else that *can* be
+> automated so those two clicks per App are the operator's only manual work.
 
 Follow this procedure **in order**.
-
-> **⚠ PREREQ — `$CLAUDE_PROJECT_DIR` must be set.** Every helper below is invoked
-> as `"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-*.sh"`. If `CLAUDE_PROJECT_DIR`
-> is **unset** the path collapses to `/.claude/scripts/...` and the very first
-> command dies with **exit 127** (first-run finding,
-> `macf-automated-github-setup#1`). Claude Code normally exports it, but if you
-> launched outside the harness (or `list_pages`/a hook reports it empty), export it
-> first:
->
-> ```bash
-> export CLAUDE_PROJECT_DIR="$(pwd)"   # the macf-bootstrap workspace root
-> ```
 
 ---
 
@@ -39,500 +47,250 @@ Follow this procedure **in order**.
 "$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-validate-env.sh"
 ```
 
-This checks: `gh` authenticated as a **USER** token (NOT a `ghs_` bot — this
-workspace must act as the operator); `age` + `age-keygen` present (the vault is
-age-encrypted); `jq` present; both deny-rails present. A non-zero exit is a
-CRITICAL gap — **stop and report it to the operator**; do not proceed. A Chrome
-remote-debugging warning is best-effort (the MCP connection is verified when you
-first drive the browser in Step 4) — note it but continue.
+This checks `gh` authenticated as a **USER** token (NOT a `ghs_` bot — the CLI runs
+Mac-side, operator-privileged, per DR-043 §D4) plus `age`/`age-keygen`/`jq`. **Ignore
+its Chrome-DevTools-reachability line** — that check predates the CLI-core move and is
+a best-effort warning either way (it never blocks the run); this skill no longer needs
+a debug Chrome at all. A non-zero exit is still a CRITICAL gap on the checks that do
+matter (`gh` as a user, `age` present) — stop and report it to the operator.
 
-Also confirm the chrome-devtools MCP is connected by listing open pages:
+> **`$CLAUDE_PROJECT_DIR` must be set.** If it's empty (launched outside the harness),
+> `export CLAUDE_PROJECT_DIR="$(pwd)"` first — the macf-bootstrap workspace root.
 
-- `mcp__chrome-devtools__list_pages` — if it errors, the MCP isn't attached.
-  Tell the operator to start Chrome with `--remote-debugging-port=9222` and that
-  `.mcp.json` points the MCP at `--browser-url=http://127.0.0.1:9222` (see README).
-
-> **Getting a *logged-in* debug Chrome is non-obvious** (first-run finding,
-> `macf-automated-github-setup#1`): a running Chrome **ignores**
-> `--remote-debugging-port` (it's a singleton — a second launch just focuses the
-> existing window), you can't enable the port on a live instance, and launching a
-> fresh `--user-data-dir` gives a **logged-out** profile — defeating the whole
-> "act as the already-logged-in operator" premise. The working path is to **copy
-> the operator's logged-in Chrome profile** into an isolated `--user-data-dir` and
-> launch the debug instance off the copy (real session untouched, copy logged-in).
-> The exact rsync recipe is in **README.md → "Getting a logged-in debug Chrome"**.
-> (`claude-in-chrome` is *not* a substitute — it drives Chrome outside the
-> `check-bootstrap-url-allowlist.sh` rail.)
+Also confirm `macf --version` satisfies this workspace's declared
+`compatibility.macf` range (`.claude-plugin/plugin.json`) — `bootstrap-validate-env.sh`
+enforces this too; a too-old CLI is refused rather than silently emitting broken
+`fleet.yaml`/output.
 
 ---
 
-## Step 2 — Q&A intake (gather the project spec)
+## Step 2 — Q&A intake (gather the fleet's spec)
 
-The skill is **generic** — any project, any N agents. Ask the operator
-**interactively** for the spec it cannot infer. These are spec-gathering
-questions, **not** per-action approvals:
+Ask the operator **interactively** for the spec `fleet.yaml` needs. These are
+spec-gathering questions, **not** per-action approvals. Each maps directly onto a
+`FleetManifestSchema` field (`packages/macf/src/cli/bootstrap/fleet-manifest.ts`):
 
-1. **Project name** (e.g. `icsoc-2026`). Derive `<PROJECT_SEG>` = uppercased,
-   hyphens→underscores (used for the `<PROJECT_SEG>_CA_CERT` variable + registry keys).
-2. **For each agent** (repeat until the operator says done). **Per DR-032, TWO names are distinct — conflating them is the #1 provisioning trap (macf#791):**
-   - **name = routing label** — the bare `<role>-agent`, e.g. `code-agent` (**CLEAN, no project prefix**). This one value is the agent's `macf init --name`, its `routing_label`, its cert **CN**, its registry-var segment, its tmux session, **and its `agent-config.json` key**. It must be `<role>-agent` and nothing else.
-   - **GitHub App handle** — `<project>-<role>-agent`, e.g. `icsoc-2026-code-agent`. GitHub App names are globally unique, so **only the App** carries the `<project>-` prefix. Derive it as `<project>-<name>`; use it **only** for the App (Step 4b) and its key file. **Never feed it back as the agent `name`.**
-   - GitHub repo (`owner/repo`) — created from the template
-   - VM deploy path (where the operator will `git clone` + `macf init` + `macf repo-init` on the VM)
+1. **Fleet / project name** (e.g. `icsoc-2026`) → `metadata.name` — lowercase
+   kebab-case; this also derives the fleet's dedicated control-plane repo,
+   `<name>-control` (DR-043 Amendment F — see the vault note below).
+2. **For each agent** (repeat until the operator says done):
+   - **`role`** — the bare `<role>-agent` routing label (e.g. `code-agent`), **never**
+     the project-prefixed App handle. Per DR-032/DR-043's Amendment-F-preceding lesson
+     (macf#791 — the icsoc routing outage), the App handle `<project>-<role>` is
+     *derived*, never written — and as of DR-043 the schema makes the old #1
+     provisioning trap **structurally unrepresentable**: `role` starting with the
+     fleet-name prefix is a rejected manifest, not an operator discipline point
+     (`FleetManifestSchema`'s `superRefine`, same file).
+   - **`profile`** — the role template's profile (`research` / `code` / `paper-latex`
+     / …), applied VM-side.
+   - **`repo`** (`owner/repo`) — created from `defaults.role_template` unless
+     `provenance: mirror` (an existing dir, e.g. an Overleaf-backed paper repo, that
+     `apply` remote-adds + pushes to instead of cloning).
+   - **`deploy_path`** — the filesystem path that will run the agent. **Implicitly the
+     LOCAL host** (DR-037 Amendment D, macf#1018) — the manifest has no field naming
+     *which* host, so a multi-host fleet still runs the materialize step separately on
+     each remote host (Step 5 below), not via a single `apply` invocation from the Mac.
+3. **Owner** — `owner.account` + `owner.type` (`user`|`org`) + `owner.registry` (a
+   `RegistryConfigSchema` value: `{type: profile, user: …}` / `{type: org, org: …}` /
+   `{type: repo, owner: …, repo: …}`).
+4. **Advertise host** — `network.advertise_host`, the tailnet FQDN the channel servers
+   advertise (or `127.0.0.1` for same-host-only).
+5. **Age recipient(s)** — `transport.age_recipients`. **Operator-provided, never
+   tool-minted** (DR-043 Amendment C — this is the fleet's master secret; the tool
+   must never generate or print it). `[]` is valid syntactically but means "refuse to
+   create" — `apply` hard-refuses opening any consent gate with no recipient
+   (Amendment C's `wouldCreateWithNoRecipient` pre-flight). The operator runs
+   `age-keygen` out-of-band and gives you the **public** recipient(s) only; a VM
+   recipient joins later, when that host exists (Amendment C's first-run note).
+6. **Tailscale OAuth** (optional) — if this fleet's routing needs it,
+   `transport.tailscale_oauth_required: true` makes `apply` refuse *before* gate 1 on
+   a fleet that can't route, rather than spending a browser click on one that can't
+   (macf#1074). The credential itself is never stored in the manifest.
+7. **Runner** (only if this fleet uses a self-hosted GitHub Actions runner) —
+   `routing.runner.runs_on` / `.labels` / `.warm`. Declaring `runs_on: self-hosted`
+   is what makes a missing `--runner-token` a refusal at apply time (DR-043 Amendment
+   H). **`warm` is recorded but not yet enforced** — `apply` doesn't act on it yet
+   (`plan` surfaces this honestly as `NOT IMPLEMENTED BY APPLY`, never silently).
 
-   > **⚠ Why this is load-bearing (verified 2026-07-05 — the icsoc routing outage, macf#791/#805/#806):** the previous form said the agent name *was* the App name (`icsoc-2026-code-agent`). That double-prefix silently breaks routing: the registry var becomes `<PROJECT_SEG>_AGENT_<PROJECT_SEG>_CODE_AGENT`, the tmux session doubles, and — the silent killer — `agent-config.json`'s key stops matching the issue's `<role>-agent` label, so `route-by-label` skips with `exit 0` ("not an agent label") and **nothing routes, with no error anywhere**. Keep `name` = bare `<role>-agent`. See DR-032 (+ its consumer-fleet-naming amendment) for the canonical rule.
-3. **Registry** — scope (`profile` / `org` / `repo`) + target (the profile user,
-   org name, or `owner/repo`).
-4. **Advertise host** — the tailnet FQDN the channel servers advertise (e.g.
-   `orzech-dev-agents.tail491af.ts.net`), or `127.0.0.1` for same-host-only.
-5. **Science / coordination repo** — the repo the vault is committed into (the
-   secure Mac→VM transport, DR-035 §6). Usually one of the agent repos.
-6. **age recipient** (optional) — an existing `age1...` public key to encrypt the
-   vault to. If none, the skill mints a fresh keypair and hands you the private
-   key to scp to the VM.
-
-Record the answers as a spec JSON shaped like
-`templates/bootstrap-spec.example.json` (you fill in the `app_id`/`install_id`
-fields as you create each App in Step 4). Write it to a working file, e.g.
-`./.bootstrap-work/spec.json`.
-
----
-
-## Step 3 — Plan-approve-once (blast-radius highlighted)
-
-Compute the **full** provisioning plan from the spec and present it to the
-operator **once**, with the blast-radius items called out. Get **one** approval.
-After it, run end-to-end with **no further prompts except GitHub auth gates**.
-
-Present a plan like:
-
-```
-macf-bootstrap plan for project <PROJECT>:
-
-REPOS (create from groundnuty/agentic-repo-template, private):
-  - <repo>  (role profile: <research|code|paper-latex>)   ×N
-
-GITHUB APPS (per-agent: create via manifest flow + install):
-  - <name>  → install on <repo> + <registry target>        ×N
-  - macf-routing  → SHARED (one per registry/account, NOT per project): REUSE the
-    existing one if present (it usually is, from a prior fleet); create only on the
-    first-ever fleet. (variables:read only; already installed on <registry target>)
-
-SECRETS / VARIABLES (create-only; never overwrite):
-  - per repo: MACF_ROUTING_APP_ID/KEY, ROUTING_CLIENT_CERT/KEY,
-    TS_OAUTH_CLIENT_ID/SECRET                              ⚠ touches repo secrets
-  - <PROJECT_SEG>_CA_CERT variable on <registry target>    ⚠ touches org/profile settings
-
-CA:  generate the per-project CA Mac-side (macf certs init) → CA key into the vault.
-
-VAULT:  age-encrypt every cred → commit secrets/vault.age to <science repo>
-        ⚠ commits to your science repo (a normal push, never --force; fail-if-exists)
-
-⚠ BLAST RADIUS: this acts AS YOUR GitHub account, creates N Apps + N repos,
-  sets the secrets above, and pushes a commit to <science repo>. Destructive ops
-  are fenced (deny rails). Approve to run end-to-end (auth gates will still pause).
-```
-
-Wait for the explicit approval before Step 4.
+Write the answers to a `fleet.yaml` file (e.g. `./.bootstrap-work/fleet.yaml`) matching
+the schema. There's no bundled example file — cite the live schema
+(`packages/macf/src/cli/bootstrap/fleet-manifest.ts`) or DR-043 §D1's worked example
+for the shape; **the schema's `superRefine`/`.strict()` validation is authoritative
+over any example**, including DR-043 §D1's own (that section still shows a
+`transport.vault_repo` field the schema no longer has — Amendment F removed it; the
+vault now always lives in the fleet's own `<name>-control` repo, never an agent's).
 
 ---
 
-## Step 4 — Execute (gh-first hybrid; browser ONLY for App creation + auth gates)
-
-Run autonomously after the plan approval. The **only** interactive pauses are
-GitHub auth gates (OAuth consent / sudo-mode re-auth / 2FA) — these recur every
-few hours; **pause → let the operator satisfy the gate → resume** is a first-class,
-expected loop, not an error. Don't try to type the operator's password/2FA.
-
-### 4a. Create the repos from the role template (`gh`, no browser)
-
-For each agent:
+## Step 3 — Preview: `macf bootstrap plan`
 
 ```bash
-gh repo create <owner>/<repo> --template groundnuty/agentic-repo-template --private
+macf bootstrap plan -f ./.bootstrap-work/fleet.yaml
 ```
 
-Note: the **role profile** (`research`/`code`/`paper-latex`) is applied VM-side
-by the template's `./.claude/init.sh <profile>` (it needs `jq` + the profile's
-prerequisites on the VM) — the emitted command list (Step 5) reminds the operator,
-since profile-apply runs in the cloned workspace, not here. (Confirm the template
-repo name/slug with the operator if `agentic-repo-template` 404s.)
-
-### 4b. Create each App via the manifest flow (browser — chrome-devtools MCP)
-
-This is the **one genuinely GUI-only step** (no `gh app create` exists). Repeat
-for every agent App. The manifest to submit is
-`$CLAUDE_PROJECT_DIR/templates/macf-app-manifest.json` (the DR-019 permission set).
-
-> **`macf-routing` is SHARED — reuse, don't create.** It's one routing App per
-> registry/account (the channel servers' registry reader), NOT per project, so the
-> operator almost always already has it from a prior fleet. App names are GLOBALLY
-> unique, so a duplicate `macf-routing` create silently *fails* — GitHub bounces to
-> `/settings/apps` with **no `?code=`** (looks like a successful click). Detect it
-> FIRST with `gh api /apps/<slug>` — which DOES work, contrary to this doc's
-> earlier claim that it "404s for every private App" (measured 2026-08-13,
-> both auth types, both directions — macf#910):
->
-> | auth | App EXISTS | App ABSENT |
-> |---|---|---|
-> | operator `gh` login | `200` + slug | `404` |
-> | bot installation token | `403` "Resource not accessible by integration" | `404` |
->
-> **An existing App never 404s.** So read it strictly: **only a `404` means the
-> name is free**; a `403` is the positive signal that the name is TAKEN (easy to
-> skim past as permission noise) and anything else is taken-or-unknown — never
-> treat a non-404 as free. For certainty independent of auth context, mint a JWT
-> against the known `app_id` (`confirmAppInstallation`, macf#841) or read
-> `https://github.com/settings/apps`. If it
-> exists, reuse its `app_id` + existing private key (the operator supplies the key)
-> and just confirm it's installed on the registry target. Only run the manifest flow
-> for `macf-routing` on a brand-new account that has never hosted a MACF fleet.
-
-The GitHub create-from-manifest flow + how to capture the redirect `code`:
-
-1. **Build the manifest parameter** — read the manifest template, set its `name`
-   (e.g. the agent name), and a `redirect_url` you can read back (the value is not
-   load-bearing — you read the redirect URL off the page, no callback server). The
-   manifest is submitted as a form POST; the simplest robust approach is a tiny
-   self-submitting HTML form posted to the manifest-create endpoint:
-   - **Personal account:** `https://github.com/settings/apps/new`
-   - **Org:** `https://github.com/organizations/<org>/settings/apps/new`
-
-2. **Navigate + submit** (chrome-devtools MCP):
-   - `mcp__chrome-devtools__navigate_page` with `url` = the manifest-create page
-     (the URL allowlist permits `…/settings/apps/new`). To pass the manifest, you
-     can `mcp__chrome-devtools__evaluate_script` a function that injects a
-     `<form method="post" action="…/settings/apps/new">` with a hidden
-     `manifest` input set to the JSON string, then submits it. (GitHub renders the
-     pre-filled "Create GitHub App" confirmation page.)
-   - `mcp__chrome-devtools__take_snapshot` to find the **"Create GitHub App"**
-     button's `uid`, then `mcp__chrome-devtools__click` it.
-
-3. **Capture the redirect `code`** — after Create, GitHub redirects to the
-   manifest `redirect_url` carrying `?code=<temp>`. Read the **current page URL**
-   directly (no callback server):
-   - `mcp__chrome-devtools__evaluate_script` with
-     `function = "() => window.location.href"` → parse the `code` query param; **or**
-   - `mcp__chrome-devtools__list_pages` → read the active page's `url` field.
-
-4. **Redeem the code** for the App's creds (this also returns the **private key**
-   — no manual download):
-
-   ```bash
-   "$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-exchange-manifest.sh" <code> \
-     --out ./.bootstrap-work/<name>.app.json
-   ```
-
-   The JSON has `app_id, name, slug, client_id, client_secret, webhook_secret,
-   pem`. Record `app_id` into the spec; keep the `*.app.json` for the vault.
-
-If an auth/sudo/2FA gate appears (`/login`, `/sessions/two-factor`, `/sudo`),
-**pause and ask the operator to complete it**, then continue.
-
-### 4c. Install each App on its repos + registry (browser — the install flow)
-
-After exchange, install each App on its agent repo(s) **and** on the registry
-target (so the agent can self-register its host:port into the registry variables).
-
-> **The INITIAL install is browser-only — there is NO REST API to create it.**
-> (`PUT /user/installations/{id}/repositories/{id}` only *adds repos to an existing
-> installation*; it cannot do the first install, and the user-token install
-> endpoints need a `read:user` scope the bootstrap token lacks → 403.) So drive the
-> install flow with the chrome-devtools MCP: navigate to
-> `https://github.com/settings/apps/<slug>/installations` (allowlisted) → **Install**
-> → on the permissions page choose **"Only select repositories"** → add the agent
-> repo **and** the registry target → **Install**. GitHub redirects to
-> `…/settings/installations/<install_id>` — read `install_id` from that URL into the
-> spec. (The repo picker filters async; set its value via a React-style `input`
-> event, then click the filtered item.) Verify each install with the App's own JWT:
-> mint an installation token and `GET /installation/repositories`.
-
-### 4d. Set routing secrets + CA var + org settings (`gh secret/variable set`)
-
-Set the 6 routing secrets **per agent repo**. Their VALUE FORMATS (per the
-`macf-actions/agent-router.yml` consumer) matter — wrong format fails routing
-*silently*:
-
-| secret | value |
-|---|---|
-| `MACF_ROUTING_APP_ID` | the `macf-routing` App id (raw) |
-| `MACF_ROUTING_APP_KEY` | **raw PEM** of the macf-routing key (fed to `actions/create-github-app-token`) |
-| `ROUTING_CLIENT_CERT` | **base64** of `routing-action-cert.pem` |
-| `ROUTING_CLIENT_KEY` | **base64** of `routing-action-key.pem` |
-| `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET` | operator-supplied Tailscale OAuth (raw) |
-
-Watch the asymmetry: the **vault** stores the app key + client cert/key base64'd
-(the `*_B64` vars), but the **repo secret** `MACF_ROUTING_APP_KEY` is **raw PEM** —
-only the two `ROUTING_CLIENT_*` repo secrets are base64. The gh guard
-enforces **create-only** — an existing name is blocked (overwrite ≠ delete); an
-intended overwrite is opt-in via `MACF_BOOTSTRAP_ALLOW_OVERWRITE=1`.
-
-**⚠ The CA cert goes in TWO places — both required (macf#806).** `macf certs init`
-(Step 4e) uploads `<PROJECT_SEG>_CA_CERT` to the **registry target** (CA backup +
-discovery). But the v3 router reads the CA it trusts for the mTLS `route-by-label`
-POST from a **repo variable on each agent's OWN repo** (`vars[<PROJECT_SEG>_CA_CERT]`),
-NOT from the registry. So after Step 4e, ALSO set `<PROJECT_SEG>_CA_CERT` as a **repo
-variable on every agent repo** — it is a public cert, so a variable, NOT a secret:
-
-    gh variable set <PROJECT_SEG>_CA_CERT --repo <owner>/<agent-repo> < <ca-cert.pem>
-
-Skipping this is invisible until an issue is routed: `route-by-label` then fails
-`CA-cert var empty — check <PROJECT>_CA_CERT is set` (hard exit 1) or silently
-no-delivers. This was the second half of the icsoc-2026 outage. (The durable fix —
-the router reading the CA from the registry so no per-repo copy is needed — is
-macf-actions#66; until it lands, the repo var is required on every agent repo.)
-
-### 4e. Generate the per-project CA + routing-client cert (Mac-side)
-
-`macf certs init` / `issue-routing-client` auto-discover the project from a wired
-`macf-agent.json` — which a fresh bootstrap does NOT have on the Mac. So first write
-a **minimal CA workspace** at `./.bootstrap-work/ca-workspace/.macf/macf-agent.json`
-pointing `macf` at one already-created agent App (for the registry-write token). The
-field names match the `MacfAgentConfigSchema` (`agent_name`/`agent_role`, NOT
-`name`/`role`); include a `versions` stub so the CLI doesn't warn "legacy config":
-
-```jsonc
-{
-  "project": "<project>",
-  "agent_name": "<any agent name>", "agent_role": "<its role>",
-  "agent_type": "permanent",
-  "registry": { "type": "profile", "user": "<user>" },   // must match the spec's registry
-  "github_app": { "app_id": "<an agent app_id>", "install_id": "<its install_id>",
-                  "key_path": "<that agent's .pem, beside this file>" },
-  "advertise_host": "<advertise_host>",
-  "versions": { "cli": "*", "plugin": "*", "actions": "*" }  // stub: silences the legacy-config warning
-}
-```
-
-(For an `org` registry use `{ "type": "org", "org": "<org>" }`; for `repo`,
-`{ "type": "repo", "owner": "<owner>", "repo": "<repo>" }` — see the CLI's
-`RegistryConfigSchema`.) Then, with `--dir` at that workspace:
-
-```bash
-# CA: writes ~/.macf/certs/<project>/ca-{cert,key}.pem + uploads <PROJECT_SEG>_CA_CERT.
-# certs init prompts for a passphrase to back the key up to the registry (encrypted);
-# pipe empty to SKIP it — the vault is the durable CA-key store (DR-035). NOTE: skipping
-# the encrypted registry backup means `macf certs recover` won't work for this project.
-echo "" | macf certs init --dir ./.bootstrap-work/ca-workspace
-
-# Routing client cert -> ROUTING_CLIENT_CERT/KEY (Step 4d). --out-dir writes the PEMs;
-# stdout ALSO prints the key, so redirect stdout to /dev/null to keep it off-transcript.
-macf certs issue-routing-client --dir ./.bootstrap-work/ca-workspace \
-  --out-dir ./.bootstrap-work/routing-client >/dev/null
-```
-
-Put the **CA key + cert** (base64) into the vault (Step 4f); the CA cert variable
-upload is part of `macf certs init` — verify it landed (`gh variable list`). Do NOT
-run `macf certs init` on the VM later (it would mint a new CA + clobber the
-variable) — `vault.sh` materializes the CA there and agents `macf certs rotate`.
-
-### 4f. Build + commit the vault
-
-Assemble the plaintext per `templates/vault.template.txt` from every
-`./.bootstrap-work/<name>.app.json`, the `macf-routing` creds, the 6 routing
-secrets, and the CA key (base64-encode PEMs/certs/keys), and **PIPE it straight
-into `bootstrap-build-vault.sh` on STDIN — do NOT write a `vault.plain` file.**
-The script streams STDIN into `age`, so the plaintext is never materialized on
-disk (secure-by-construction). The per-agent `*.app.json` files are the only
-plaintext that touches disk in this flow; they are `.gitignore`d and wiped by
-`bootstrap-cleanup.sh` (Step 7).
-
-```bash
-# Assemble the vault plaintext and PIPE it to build-vault on STDIN (no vault.plain).
-# This brace-group is illustrative — fill in INSTALL_ID (from spec.json), the
-# macf-routing creds, the 6 routing secrets, and the base64 CA key/cert the same
-# way, matching templates/vault.template.txt.
-{
-  for f in ./.bootstrap-work/*.app.json; do
-    name="$(jq -r .name "$f" | tr 'a-z-' 'A-Z_')"
-    printf 'MACF_AGENT_%s_APP_ID="%s"\n'          "$name" "$(jq -r .app_id "$f")"
-    printf 'MACF_AGENT_%s_CLIENT_ID="%s"\n'       "$name" "$(jq -r .client_id "$f")"
-    printf 'MACF_AGENT_%s_CLIENT_SECRET="%s"\n'   "$name" "$(jq -r .client_secret "$f")"
-    printf 'MACF_AGENT_%s_WEBHOOK_SECRET="%s"\n'  "$name" "$(jq -r .webhook_secret "$f")"
-    printf 'MACF_AGENT_%s_PRIVATE_KEY_B64="%s"\n' "$name" "$(jq -r .pem "$f" | base64 | tr -d '\n')"
-  done
-  # + MACF_AGENT_<name>_INSTALL_ID per agent (from spec.json)
-  # + MACF_ROUTING_APP_ID / MACF_ROUTING_APP_KEY_B64
-  # + the 6 routing secrets + MACF_<PROJECT>_CA_KEY_B64 / _CA_CERT_B64
-} | "$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-build-vault.sh" \
-      --out ./.bootstrap-work/vault.age \
-      --key-out ./.bootstrap-work/vault-age-key.txt   # omit --recipient → fresh keypair
-
-# Commit into the science repo (fail-if-exists; never --force; wipes the /tmp clone):
-"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-commit-vault.sh" \
-  --repo <science-repo> \
-  --vault ./.bootstrap-work/vault.age \
-  --accessor "$CLAUDE_PROJECT_DIR/templates/vault.sh" \
-  --template "$CLAUDE_PROJECT_DIR/templates/vault.template.txt"
-```
-
-The age private-key handoff + scratch-dir wipe are Steps 6 and 7 (after the
-outputs are emitted) — the key must survive until the operator confirms the scp,
-then it is shredded.
+Read-only end to end: parses the manifest, observes current GitHub-side state, and
+renders the reconcile plan (create / confirm-then-update / report-extra — **never**
+delete; DR-043 §D3). Without `--vault --identity-key`, App/install existence is
+observed from `fleet.lock` only and reads **honest-`unknown`**, never a guessed
+`present`/`absent` (DR-043 Amendment A's epistemic floor — the identity plane can
+confirm *present*, never prove *absent*). Narrate the plan to the operator; nothing
+is mutated by this step.
 
 ---
 
-## Step 5 — Emit the outputs (definition-of-done)
+## Step 4 — Approve + apply: `macf bootstrap apply`
 
 ```bash
-"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-emit-commands.sh" \
-  --spec ./.bootstrap-work/spec.json
+macf bootstrap apply -f ./.bootstrap-work/fleet.yaml \
+  [--vault <path> --identity-key <path>] \
+  [--runner-token <token>]     # only if routing.runner.runs_on: self-hosted
 ```
 
-This prints **output #2** (the VM-side per-agent setup — `git clone` + `macf init`
-+ `macf certs rotate` + **`macf repo-init`** (the routing plane) + the
-**`<PROJECT_SEG>_CA_CERT` repo-variable set**, IDs substituted) and **output #3**
-(the verification commands: `macf fleet status` / `macf routing doctor` /
-`macf fleet doctor --inject`, plus setup asserts that the Apps exist + are
-installed and the secrets are present). Output #1 (the vault) was committed in
-Step 4f.
+`--dry-run` renders the plan plus the exact App manifests that would be submitted,
+mutating nothing — useful as a last check before spending a browser click.
 
-> **The routing plane MUST be `macf repo-init`, not hand-authored (macf#797/#805/#806).**
-> The bootstrap-generated `agent-router.yml` + `agent-config.json` were the source
-> of every consumer-fleet routing outage this class produced, so the emit runs
-> `macf repo-init --project <P> --agents <FULL-FLEET> --actions-version v3 …` in
-> each repo, generating them **born-correct**:
->
-> - **router** — the full `permissions:` block (missing it = `startup_failure`,
->   nothing routes) + an **immutable `@vX.Y.Z` pin** (repo-init resolves `v3` to
->   the latest full tag; no silent behavioral drift) — macf#797/#804.
-> - **`agent-config.json`** — the **whole fleet** (every agent, so
->   `route-by-mention` / `route-by-pr-review-state` resolve any of them, not just
->   the local agent), **keyed by the routing label** (`code-agent`), each entry's
->   **`app_name` = the App handle `<project>-<role>-agent`** (e.g.
->   `icsoc-2026-code-agent`) **without** a `[bot]` suffix (the router appends it; a
->   baked-in `[bot]` double-bots and breaks resolution) — macf#805/#806.
-> - **CA repo-var** — the v3 router reads the CA it trusts for the mTLS POST from
->   `vars[<PROJECT_SEG>_CA_CERT]` on the caller repo, NOT the registry, so the emit
->   sets it per agent repo from the vault-materialized CA cert — macf#806.
->
-> `--agents` is the **full comma-joined fleet** passed to repo-init in EVERY repo,
-> so every repo's config lists the whole fleet.
+Without `--dry-run`, `apply` shows the same plan-approve-once artifact, takes **one**
+operator approval (interactive prompt, or `--yes` for automation), then runs
+end-to-end: control-repo provisioning (first, before any consent gate — a failure
+there aborts before anything else is touched) → per agent: ensure-repo →
+confirm-before-create → **consent gate 1** (App creation) → **consent gate 2** (App
+install) → `repo-init` → the routing (`runner-ops`) App's own gate 1/gate 2 → the
+single whole-payload vault write → `fleet.lock`. See
+`packages/macf/src/cli/bootstrap/apply-fleet.ts`'s module doc for the exact,
+tested sequence.
 
-Hand the operator: (a) the emitted command list, (b) the age key path to scp
-(handed off + shredded in Step 6), and (c) a one-line summary (N Apps created, N
-repos, vault committed to <science repo>).
+**The two consent gates are the whole of the operator's manual work, and they happen
+in the operator's own, already-logged-in browser** — no debug Chrome, no profile
+copy, no Chrome DevTools MCP:
+
+1. **App creation** — the CLI serves a self-submitting manifest form on `localhost`,
+   opens the browser there; the operator clicks **Create**; GitHub redirects to
+   `localhost` with a temporary `code`; the CLI exchanges it directly
+   (`POST /app-manifests/{code}/conversions`) for `app_id` + the private-key PEM —
+   no manual key download, ever.
+2. **App install** — the CLI opens the install page; the operator picks
+   **"Only select repositories"** (never "All repositories") and clicks **Install**;
+   the CLI confirms the result by polling `GET /app/installations` with the App's own
+   JWT — no reading a redirect URL off a page.
+
+> **Watch the repository picker (`groundnuty/macf#1128`, open at time of writing).**
+> GitHub's install page defaults to nothing forced — choosing **"All repositories"**
+> by mistake silently grants that App DR-019's full permission set on *every* repo in
+> the account/org, not just this fleet's. `apply` already refuses this for the
+> dedicated routing (`runner-ops`) App (`apply-runner-ops.ts::validateRunnerOpsInstall`)
+> — as of this writing, the same post-gate-2 check is **not yet wired for ordinary
+> agent Apps** (that's #1128's ask). Until it lands, double-check the picker yourself
+> on every install click.
+
+Never silently creates a duplicate App (confirm-before-create guard) and never
+silently overwrites an existing vault (fails loud unless `MACF_BOOTSTRAP_VAULT_VERSION=1`
+— the operator's explicit opt-in to an intended version bump).
 
 ---
 
-## Step 6 — Hand off the age private key, then shred it
+## Step 5 — Materialize each agent's workspace: `apply`'s deploy phase, or `macf fleet deploy`
 
-The vault rides to the VM via `git` (encrypted — safe in a private repo); its
-**age decryption key goes out-of-band**. Do NOT leave the key in the scratch dir.
+`apply` runs a **default deploy phase** after the GitHub-side work above, when given
+`--vault --identity-key` — for each agent it decrypts the vault, clones `repo` into
+`deploy_path` (or reuses it if present), writes the agent's App key + the per-project
+CA, and delegates to the real `macf init` (never reimplemented). `--no-deploy` skips
+it; without `--vault --identity-key` it's skipped anyway, loudly, not silently.
 
-1. Surface the key path to the operator and ask them to copy it to the VM:
+**This only reaches hosts local to wherever `apply` itself ran** — `deploy_path` names
+a filesystem path, not a remote host (DR-037 Amendment D). For a fleet where the
+operator's Mac provisions but the agents run on a different machine (the common
+shape — see `use-cases/scientific-paper-fleet.md`), run the equivalent command
+**on each target host** after getting the vault + age key there:
 
-   ```
-   age decryption key:  ./.bootstrap-work/vault-age-key.txt
-   scp it to the VM out-of-band, e.g.:
-     scp ./.bootstrap-work/vault-age-key.txt <vm>:~/.macf/<project>-vault-age-key.txt
-   Tell me once the key is on the VM and I'll shred it from this workspace.
-   ```
+```bash
+# On the target host, after the vault (via the control repo) + the age key (out-of-band, e.g. scp) are present:
+macf fleet deploy -f fleet.yaml --agent <role> --vault <path/to/secrets/vault.age> --identity-key <path/to/age-key>
+```
 
-2. **Wait for the operator to confirm the handoff.** This is one of the few
-   expected interactive pauses (like the auth gates) — not a per-action approval.
-
-3. Once confirmed, the key is removed by the Step 7 scratch-dir wipe (it lives in
-   `./.bootstrap-work/`). Run Step 7 now — that shreds the key along with the rest.
+This is the modern equivalent of the old "`git clone` the science repo, hand-paste a
+filled-in `macf init` command" hand-off — one idempotent command per agent, delegating
+to `macf init` the same way the local deploy phase does. It does not launch the agent
+(`./claude.sh`) — that's still the operator's own step, same as always.
 
 ---
 
-## Step 7 — Always wipe the scratch dir (success AND abort)
+## The vault now lives in the fleet's own control repo, not an agent's
 
-```bash
-"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-cleanup.sh"
-```
-
-This shred-removes the **entire** `./.bootstrap-work/` — every `*.app.json` PEM,
-any `vault.plain`, `vault.age`, the `vault-age-key.txt`, and `spec.json`. It is
-idempotent and safe to call repeatedly.
-
-**Run it ALWAYS** — on the success path (after the Step 6 key handoff is
-confirmed) AND on any abort/error. If you orchestrate the run inside a single
-long Bash block, register it as an EXIT trap up front so an interrupt still
-cleans up:
-
-```bash
-trap '"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-cleanup.sh"' EXIT
-```
-
-> **Accurate at-rest note (do not overclaim).** `shred` is best-effort and a
-> **no-op on macOS/APFS** (copy-on-write never overwrites in place). The real
-> at-rest protection on the operator's Mac is **FileVault**. What this tool
-> guarantees structurally is: the plaintext vault is never written to disk (Step
-> 4f pipes it on STDIN), nothing secret is ever committed (`.gitignore`), and the
-> scratch dir is wiped on both success and abort (this step). Those are the
-> load-bearing protections — not shred.
+`apply`'s first act (before any consent gate) is provisioning `<fleet-name>-control` —
+a dedicated, operator-owned repo with **no fleet agent granted write** at the
+platform-permission level believed originally (DR-043 Amendment F), corrected since
+to "**no agent write can land** on its protected branch" via branch protection
+(Amendment M — GitHub App permissions are per-App, not per-repo, so "installed but
+read-only" was never actually expressible; the guarantee now rests on a branch
+protection rule `apply` is designed to assert, though as of this writing that
+assertion is **not yet implemented** — Amendment M1 flags its own absence explicitly).
+`fleet.yaml`, `fleet.lock`, and the age-encrypted `secrets/vault.age` all live there.
+There is **no `transport.vault_repo` field any more** — the location is derived, not
+configured, so it can't be pointed at an agent's own repo by mistake.
 
 ---
 
-## Optional — rail self-test (prove the URL guard actually fires)
+## Retiring or reviving a fleet
 
-When the operator asks for **live proof** that the browser rail blocks destructive
-navigation (or before a first run on a new machine), run the one-shot self-test. It
-feeds the `check-bootstrap-url-allowlist.sh` hook synthetic PreToolUse payloads and
-asserts it **BLOCKS (exit 2)** a denylisted URL and **ALLOWS (exit 0)** a
-provisioning URL — positive evidence the guard works, **without** weakening it and
-**without** driving the real browser:
+Not this skill's job to walk through in detail — the CLI carries a four-rung teardown
+ladder (`macf fleet deactivate` / `archive` / `delete-apps` / `destroy`, DR-043
+Amendment G), each rung named by what reviving it costs the operator in browser
+clicks, down to zero for the first two rungs (the vault + surviving Apps make revival
+pure reconciliation). See `macf fleet --help` and DR-043 Amendment G for the current
+detail — it, too, has moved since this file was last synced with it.
 
-```bash
-"$CLAUDE_PROJECT_DIR/.claude/scripts/bootstrap-rail-selftest.sh"
-# → ✓ BLOCKED  /settings/apps/<slug>/advanced (revoke/delete/transfer)
-# → ✓ BLOCKED  …/billing
-# → ✓ ALLOWED  …/settings/apps/new (manifest create)
-# exit 0 = rail healthy; non-zero = a case behaved wrong (STOP — the rail is broken).
-```
-
-**Live variant** (the strongest proof, when a debug Chrome is attached): attempt to
-navigate the MCP to a denylisted page — the PreToolUse hook intercepts the
-`mcp__chrome-devtools__navigate_page` call and blocks it before Chrome moves:
-
-```text
-mcp__chrome-devtools__navigate_page url=https://github.com/<owner>/<repo>/settings#danger-zone
-→ BLOCKED by macf-bootstrap URL guard: destructive GitHub surface.
-```
-
-Either way you get a concrete BLOCKED line in the transcript. Do **not** set
-`MACF_BOOTSTRAP_SKIP_URL_GUARD=1` during the self-test — that would bypass the very
-rail you're proving.
+---
 
 ## Gotcha — `ssh -n` silently discards a heredoc
 
-If you (or the operator) hand-write a remote VM step that pipes a heredoc into ssh
-— e.g. running the emitted command list remotely — **do NOT use `ssh -n`**. The
+If you (or the operator) hand-write a remote step piping a heredoc into `ssh` — e.g.
+running `macf fleet deploy` on a remote host over SSH — **do NOT use `ssh -n`**. The
 `-n` flag redirects stdin from `/dev/null`, so the heredoc body is **silently
-discarded**: the remote `bash -s` reads EOF immediately, runs nothing, and ssh
-exits **0** (a clean-looking no-op — a first-run-class silent failure). Canonical
-form omits `-n`:
+discarded**: the remote shell reads EOF immediately, runs nothing, and `ssh` exits
+**0** (a clean-looking no-op). Canonical form omits `-n`:
 
 ```bash
 # WRONG — -n discards the heredoc; remote runs nothing, exits 0 (looks fine):
 ssh -n <vm> 'bash -s' <<'REMOTE'
-  source ~/secrets/vault.sh
+  macf fleet deploy -f fleet.yaml --agent code-agent --vault ... --identity-key ...
 REMOTE
 
 # RIGHT — no -n; the heredoc reaches the remote shell's stdin:
 ssh <vm> 'bash -s' <<'REMOTE'
-  source ~/secrets/vault.sh
+  macf fleet deploy -f fleet.yaml --agent code-agent --vault ... --identity-key ...
 REMOTE
 ```
+
+---
+
+## What this file does NOT cover any more, and why
+
+The pre-DR-043 version of this file drove the operator's Chrome directly (via the
+Chrome DevTools MCP) through the App-manifest form and the install flow, read the
+post-redirect URL off the page to capture the exchange `code`, and hand-assembled the
+vault plaintext via inline shell before piping it to `bootstrap-build-vault.sh`. All
+of that mechanism moved into the CLI (`manifest-flow-server.ts` serves the
+`localhost` redirect; `identity-confirm.ts` polls the JWT; `vault-write.ts` is the one
+writer) — this file no longer needs to narrate it, and doing so would just be a
+second, driftable copy of what the code already does. The workspace's browser-rail
+scripts (`check-bootstrap-url-allowlist.sh`, `bootstrap-rail-selftest.sh`,
+`.mcp.json`'s Chrome DevTools MCP entry) are **left in place, unused by this
+procedure** — `groundnuty/macf#877` scoped their removal separately from this
+rewrite.
+
+**This rewrite has not been walked live end-to-end** — DR-043 continues under active
+amendment (through Amendment O as of 2026-08-21) and a repeatable live-smoke
+(`groundnuty/macf#869`) is still open. Expect rough edges on a first real run, and
+report them the same way the pre-DR-043 dogfood loop asked for.
 
 ---
 
 ## Reminders
 
-- **No per-command approval.** `Bash(*)` is pre-approved; the only interactive
-  points are the single plan approval (Step 3), the GitHub auth gates (Step 4),
-  and the age-key handoff confirmation (Step 6). The deny-rails — not prompts —
-  fence the destructive surface. Do not ask the operator to approve individual
-  `gh`/MCP calls.
-- **Never** run a destructive GitHub op (delete/transfer/rename repo, delete
-  secret, `gh api … DELETE`, force-push) — the rails block them; don't try to
-  route around them. An intended exception is the operator's call via the documented
-  override env var.
-- **No plaintext vault on disk by construction.** The assembled plaintext is
-  piped to `bootstrap-build-vault.sh` on STDIN — never written as `vault.plain`.
-  The per-agent `*.app.json` PEMs are the only plaintext on disk; they are
-  `.gitignore`d and wiped by `bootstrap-cleanup.sh` (Step 7), which runs on
-  success AND abort. `shred` is best-effort (no-op on macOS/APFS); FileVault is
-  the real at-rest protection.
+- **No per-command approval** beyond the two consent gates + the single plan approval
+  — `apply` itself owns that flow now; this skill narrates, it doesn't re-implement
+  the gate.
+- **Never** attempt a destructive GitHub op outside the teardown ladder above.
+- **No plaintext vault on disk by construction** — the CLI's vault writer never
+  materializes plaintext to a file; only the fleet-scoped operator key can decrypt
+  `secrets/vault.age` (DR-043 §D4/§D5, Amendment D's read-only-decryptable model).
