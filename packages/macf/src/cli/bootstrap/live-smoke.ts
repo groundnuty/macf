@@ -136,9 +136,18 @@ export async function checkInstallationsContract(
  * make a `'created'` result ambiguous with a stale leftover from a prior
  * run. Exported so a test can assert the shape without relying on real
  * timing.
+ *
+ * Deliberately prefixed `PROVISIONING_LIVE_SMOKE_`, NOT `MACF_...` — this
+ * repo's registry/reconcile code never enumerates Actions variables by a
+ * `MACF_` prefix today (checked: every read here is a targeted GET by
+ * exact name), but a throwaway probe variable has no reason to share a
+ * namespace with the real fleet variables at all. A leftover from a failed
+ * cleanup (see `runVariableRoundTrip`'s doc) staying structurally
+ * unmistakable for fleet state is free insurance against a future
+ * enumeration this module can't see coming.
  */
 export function buildLiveSmokeVariableName(now: number, rand: string): string {
-  return `MACF_LIVE_SMOKE_${String(now)}_${rand}`.toUpperCase();
+  return `PROVISIONING_LIVE_SMOKE_${String(now)}_${rand}`.toUpperCase();
 }
 
 /**

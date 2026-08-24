@@ -11,6 +11,7 @@ import { describe, it, expect } from 'vitest';
 import {
   describeMissingChecks,
   resolveLiveSmokeConfig,
+  totalLiveSmokeChecks,
 } from '../../live-smoke/live-smoke-gate.js';
 
 describe('resolveLiveSmokeConfig (pure)', () => {
@@ -49,9 +50,17 @@ describe('resolveLiveSmokeConfig (pure)', () => {
 });
 
 describe('describeMissingChecks (pure)', () => {
-  it('DECISIVE: names all 4 checks missing from an empty config — a stub returning [] would fail this', () => {
+  it('DECISIVE: names EVERY check missing from an empty config — a stub returning [] would fail this', () => {
     const missing = describeMissingChecks({});
-    expect(missing).toHaveLength(4);
+    expect(missing).toHaveLength(totalLiveSmokeChecks());
+  });
+
+  it('totalLiveSmokeChecks and the empty-config missing count always agree (single source of truth)', () => {
+    // The decisive property this pins: the banner's "N of TOTAL" can never
+    // drift, because TOTAL is derived from the SAME list `describeMissingChecks`
+    // filters — there is no second hand-maintained count to fall out of sync.
+    expect(describeMissingChecks({})).toHaveLength(totalLiveSmokeChecks());
+    expect(totalLiveSmokeChecks()).toBeGreaterThan(0);
   });
 
   it('names ZERO checks missing when every field is configured', () => {

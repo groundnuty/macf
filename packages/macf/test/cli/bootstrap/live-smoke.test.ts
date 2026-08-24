@@ -145,7 +145,7 @@ describe('runVariableRoundTrip (pure orchestration — fakes only, no network)',
     const result = await runVariableRoundTrip('repos/o/r', createFn, deleteFn);
     expect(result.ok).toBe(false);
     expect(result.detail).toContain('manual removal');
-    expect(result.detail).toContain('MACF_LIVE_SMOKE_');
+    expect(result.detail).toContain('PROVISIONING_LIVE_SMOKE_');
   });
 
   it('FAILS when create returns "exists" for a freshly-generated name (a bare truthy check would miss this)', async () => {

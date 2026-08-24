@@ -61,22 +61,43 @@ export function resolveLiveSmokeConfig(env: NodeJS.ProcessEnv = process.env): Li
   };
 }
 
+/**
+ * One entry per live check — a single source of truth for both "is this
+ * check configured" and "how many checks exist total", so the summary
+ * banner's count can never drift out of sync with the branches below the
+ * way a hand-maintained `${missing.length} of 4` literal could the moment a
+ * 5th check is added and this constant isn't updated alongside it.
+ */
+const CHECKS: readonly {
+  readonly configured: (config: LiveSmokeConfig) => boolean;
+  readonly describe: () => string;
+}[] = [
+  {
+    configured: (c) => Boolean(c.appId) && Boolean(c.appKey),
+    describe: () => `${ENV_KEYS.appId} + ${ENV_KEYS.appKey} (App-JWT -> GET /app/installations contract check)`,
+  },
+  {
+    configured: (c) => Boolean(c.variableRepo),
+    describe: () => `${ENV_KEYS.variableRepo} (repo-scope Actions-variable create+delete round trip)`,
+  },
+  {
+    configured: (c) => Boolean(c.variableOrg),
+    describe: () => `${ENV_KEYS.variableOrg} (org-scope Actions-variable create+delete round trip)`,
+  },
+  {
+    configured: (c) => Boolean(c.templateRepo),
+    describe: () => `${ENV_KEYS.templateRepo} (repo-creation-from-template read-only preflight)`,
+  },
+];
+
 /** One line per unconfigured check, naming the env var(s) it needs — pure, exported for testing. */
 export function describeMissingChecks(config: LiveSmokeConfig): readonly string[] {
-  const missing: string[] = [];
-  if (!config.appId || !config.appKey) {
-    missing.push(`${ENV_KEYS.appId} + ${ENV_KEYS.appKey} (App-JWT -> GET /app/installations contract check)`);
-  }
-  if (!config.variableRepo) {
-    missing.push(`${ENV_KEYS.variableRepo} (repo-scope Actions-variable create+delete round trip)`);
-  }
-  if (!config.variableOrg) {
-    missing.push(`${ENV_KEYS.variableOrg} (org-scope Actions-variable create+delete round trip)`);
-  }
-  if (!config.templateRepo) {
-    missing.push(`${ENV_KEYS.templateRepo} (repo-creation-from-template read-only preflight)`);
-  }
-  return missing;
+  return CHECKS.filter((c) => !c.configured(config)).map((c) => c.describe());
+}
+
+/** Total number of independently-gated live checks — exported so the banner (and tests) never hardcode it separately from {@link CHECKS}. */
+export function totalLiveSmokeChecks(): number {
+  return CHECKS.length;
 }
 
 let warnedThisProcess = false;
@@ -92,7 +113,7 @@ export function warnOnceIfUnconfigured(config: LiveSmokeConfig): void {
   if (missing.length === 0) return;
   warnedThisProcess = true;
   const lines = [
-    `[live-smoke-gate] provisioning live-smoke: ${String(missing.length)} of 4 check(s) SKIPPED — no live credentials configured.`,
+    `[live-smoke-gate] provisioning live-smoke: ${String(missing.length)} of ${String(totalLiveSmokeChecks())} check(s) SKIPPED — no live credentials configured.`,
     ...missing.map((m) => `  - ${m}`),
     '  These checks exercise the real GitHub API and cannot be faked; set the env vars above (see the ' +
       'module doc in test/live-smoke/provisioning-live-smoke.test.ts) to run them.',
