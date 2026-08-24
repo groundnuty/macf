@@ -18,6 +18,7 @@ import {
   checkCanonicalBranch,
   checkLoadBearingHooks,
   checkPermissionsAllow,
+  checkRoutingLabelProjectPrefix,
   checkSandboxFdAllowRead,
   deriveBotLogin,
   describeNonAppSlugOutput,
@@ -600,6 +601,160 @@ describe('checkCanonicalBranch (macf#755 — branch-guard DETECT half, Pattern A
   it('resolves the default (main) when config is null (unresolvable workspace)', () => {
     expect(checkCanonicalBranch(null, 'main').status).toBe('PASS');
     expect(checkCanonicalBranch(null, 'other').status).toBe('WARN');
+  });
+});
+
+describe('checkRoutingLabelProjectPrefix (macf#1009 — DR-032 redundant-project-prefix identity lint)', () => {
+  function baseConfig(overrides: Partial<MacfAgentConfig> = {}): MacfAgentConfig {
+    return {
+      project: 'icsoc-2026',
+      agent_name: 'code-agent',
+      agent_role: 'code-agent',
+      agent_type: 'permanent',
+      registry: { type: 'repo', owner: 'o', repo: 'r' },
+      ...overrides,
+    };
+  }
+
+  // --- Decisive pair (assert-the-wrong-path.md): a prefixed label must be
+  // flagged BY VALUE (observed + expected named), and a correct label must
+  // NOT be flagged — proving the check isn't a lint that fires on everything.
+
+  it('WARNs when routing_label redundantly repeats the project, naming observed + expected', () => {
+    const result = checkRoutingLabelProjectPrefix(baseConfig({
+      routing_label: 'icsoc-2026-code-agent',
+      agent_name: 'code-agent',
+    }));
+    expect(result.status).toBe('WARN');
+    expect(result.findings).toHaveLength(1);
+    const finding = result.findings[0];
+    expect(finding?.field).toBe('routing_label');
+    expect(finding?.severity).toBe('WARN');
+    expect(finding?.observed).toBe('icsoc-2026-code-agent');
+    expect(finding?.expected).toBe('code-agent');
+    // Message must name the consequences, not just say "bad label".
+    expect(finding?.message).toContain('icsoc-2026-code-agent');
+    expect(finding?.message).toContain('code-agent');
+    expect(finding?.message).toMatch(/registry variable/i);
+    expect(finding?.message).toMatch(/tmux session/i);
+    expect(finding?.message).toMatch(/silently dropped/i);
+  });
+
+  it('does NOT flag a bare (correct) routing_label', () => {
+    const result = checkRoutingLabelProjectPrefix(baseConfig({
+      routing_label: 'code-agent',
+      agent_name: 'code-agent',
+    }));
+    expect(result.status).toBe('PASS');
+    expect(result.findings).toEqual([]);
+  });
+
+  // --- agent_name at lower severity (AC #2) ---------------------------------
+
+  it('flags a prefixed agent_name at INFO (not WARN) when routing_label is independently set and clean', () => {
+    const result = checkRoutingLabelProjectPrefix(baseConfig({
+      routing_label: 'code-agent',
+      agent_name: 'icsoc-2026-code-agent',
+    }));
+    expect(result.status).toBe('INFO');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.field).toBe('agent_name');
+    expect(result.findings[0]?.severity).toBe('INFO');
+    expect(result.findings[0]?.observed).toBe('icsoc-2026-code-agent');
+    expect(result.findings[0]?.expected).toBe('code-agent');
+  });
+
+  it('elevates a prefixed agent_name to WARN when routing_label is UNSET (agent_name IS the effective routing label)', () => {
+    const { routing_label: _unused, ...rest } = baseConfig({ agent_name: 'icsoc-2026-code-agent' });
+    const result = checkRoutingLabelProjectPrefix(rest as MacfAgentConfig);
+    expect(result.status).toBe('WARN');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.field).toBe('agent_name');
+    expect(result.findings[0]?.severity).toBe('WARN');
+  });
+
+  it('does NOT double-report when routing_label === agent_name and both are prefixed', () => {
+    const result = checkRoutingLabelProjectPrefix(baseConfig({
+      routing_label: 'icsoc-2026-code-agent',
+      agent_name: 'icsoc-2026-code-agent',
+    }));
+    expect(result.status).toBe('WARN');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.field).toBe('routing_label');
+  });
+
+  // --- Independent-discriminator false-positive guard (the collision case a
+  // blind `<project>-` string-prefix match would wrongly flag — see
+  // `classifyProjectPrefix`'s doc for why `agent_role` is required here).
+  // repo-init.ts's `normalizeDoublePrefixedKeys` documents the identical
+  // trap on the repo-side agent-config.json key.
+
+  it('does NOT confirm-WARN when the project coincidentally shares a stem with a CORRECT bare label', () => {
+    // project "devops" + role "devops-agent" is a healthy, conventional
+    // config — routing_label "devops-agent" is the bare form, not a doubled
+    // prefix. A blind string-prefix match ("devops-agent".startsWith("devops-"))
+    // would wrongly flag this and recommend renaming to "agent" — breaking a
+    // working workspace. The check must not assert the confirmed,
+    // routing-breaking claim here.
+    const result = checkRoutingLabelProjectPrefix(baseConfig({
+      project: 'devops',
+      agent_role: 'devops-agent',
+      routing_label: 'devops-agent',
+      agent_name: 'devops-agent',
+    }));
+    expect(result.status).not.toBe('WARN');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.severity).toBe('INFO');
+    // Must NOT assert the confirmed routing-breaking mechanism it can't prove.
+    expect(result.findings[0]?.message).not.toMatch(/silently dropped/i);
+  });
+
+  // --- Segment normalisation -------------------------------------------------
+
+  it('flags a redundant prefix case/segment-insensitively (project stored SCREAMING_SNAKE)', () => {
+    const result = checkRoutingLabelProjectPrefix(baseConfig({
+      project: 'ICSOC_2026',
+      routing_label: 'icsoc-2026-code-agent',
+      agent_name: 'code-agent',
+    }));
+    expect(result.status).toBe('WARN');
+    expect(result.findings[0]?.observed).toBe('icsoc-2026-code-agent');
+    expect(result.findings[0]?.expected).toBe('code-agent');
+  });
+
+  it('derives "expected" from the canonical agent_role, not a raw slice of a SCREAMING_SNAKE label', () => {
+    // Regression guard: an earlier implementation sliced the RAW observed
+    // label to compute "expected", which produced a non-canonical
+    // "CODE_AGENT" for a SCREAMING_SNAKE-cased routing_label. Deriving
+    // "expected" from agent_role instead always yields the canonical kebab
+    // form regardless of how the observed value happens to be cased.
+    const result = checkRoutingLabelProjectPrefix(baseConfig({
+      project: 'icsoc-2026',
+      agent_role: 'code-agent',
+      routing_label: 'ICSOC_2026_CODE_AGENT',
+      agent_name: 'code-agent',
+    }));
+    expect(result.status).toBe('WARN');
+    expect(result.findings[0]?.expected).toBe('code-agent');
+  });
+
+  // --- Degenerate edge: nothing left after the prefix — not a "redundant
+  // prefix" finding (a different check's territory, if this ever occurs).
+
+  it('does NOT flag a label that is exactly "<project>-" with nothing after it', () => {
+    const result = checkRoutingLabelProjectPrefix(baseConfig({
+      routing_label: 'icsoc-2026-',
+      agent_name: 'code-agent',
+    }));
+    expect(result.status).toBe('PASS');
+  });
+
+  // --- Honest-unknown floor (house standard — macf#1078, #1096, #1117) -----
+
+  it('reports UNKNOWN (never PASS) when config is null — macf-agent.json absent or unreadable', () => {
+    const result = checkRoutingLabelProjectPrefix(null);
+    expect(result.status).toBe('UNKNOWN');
+    expect(result.findings).toEqual([]);
   });
 });
 
