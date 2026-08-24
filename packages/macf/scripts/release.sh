@@ -15,6 +15,18 @@
 #                         top of CHANGELOG.md (release notes are authored,
 #                         not generated); commit locally.
 #   check VERSION        make -f dev.mk check (reuse).
+#   harness-check VERSION  Build dist; materialize a scratch canonical
+#                         workspace via the just-built CLI's own
+#                         `init --local`; exercise its .claude/settings.json
+#                         + .mcp.json + launcher channels-flag against the
+#                         currently-installed Claude Code (`claude doctor`
+#                         + a settings-load-only `claude -p`); FATAL if
+#                         Claude Code rejects/skips any of it (the
+#                         groundnuty/macf#1067 class — a rule ships that the
+#                         harness silently ignores). VERSION is ignored.
+#                         Runs identically under --dry-run (no dependency on
+#                         any earlier step's real mutation, unlike `cli`
+#                         below).
 #   marketplace VERSION  make -f dev.mk build; clone macf-marketplace
 #                         (HTTPS+token); conditional-sync the plugin tree
 #                         (`sync-marketplace-plugin.mjs --check`, sync only
@@ -43,9 +55,9 @@
 #                         result-invariant check `npm view` for all three
 #                         packages == <version> (per verify-before-claim.md
 #                         — green CI is not proof the registry updated).
-#   all VERSION           bump -> check -> marketplace -> cli -> verify,
-#                         halting loudly (via `set -e` + explicit `die`) on
-#                         the first failing step.
+#   all VERSION           bump -> check -> harness-check -> marketplace ->
+#                         cli -> verify, halting loudly (via `set -e` +
+#                         explicit `die`) on the first failing step.
 #
 # --dry-run (or MACF_RELEASE_DRY_RUN=1): every subcommand becomes FULLY
 # side-effect-free — no file writes, no `npm install`, no `git commit`, no
@@ -128,12 +140,17 @@ Subcommands:
   bump VERSION          Bump 3 package.json + inter-dep + lockfile; require
                          a CHANGELOG.md heading; commit locally.
   check VERSION         make -f dev.mk check.
+  harness-check VERSION  Exercise the release-generated .claude/settings.json
+                         + .mcp.json + launcher flags against the currently-
+                         installed Claude Code; fail if any rule/flag is
+                         rejected. VERSION is ignored.
   marketplace VERSION   Conditional-sync + bump + tag the macf-marketplace
                          plugin.
   cli VERSION           Push the bump commit to main + tag v<version>
                          (triggers publish.yml).
   verify VERSION        Poll publish.yml + verify npm registry versions.
-  all VERSION           bump -> check -> marketplace -> cli -> verify.
+  all VERSION           bump -> check -> harness-check -> marketplace -> cli
+                         -> verify.
 
 Flags:
   --dry-run             Print every step; mutate NOTHING (no writes, no
@@ -291,6 +308,207 @@ cmd_check() {
     return 0
   fi
   (cd "$REPO_ROOT" && make -f dev.mk check)
+}
+
+# ---------------------------------------------------------------------------
+# Harness-compat checking (groundnuty/macf#1069)
+# ---------------------------------------------------------------------------
+#
+# "Harness-compatibility drift" here means: the currently-installed Claude
+# Code binary silently REJECTS or downgrades a config artifact this repo's
+# generators ship in `.claude/settings.json` / `.mcp.json` — a permission
+# rule, a deny rule, an MCP config shape, or a launcher dev-flag — the same
+# class as groundnuty/macf#1067 (19 dead `Write(path)` deny rules that
+# warned on every agent launch, unnoticed for months, because the harness's
+# own diagnostic scrolled past in a pane nobody read). It does NOT cover
+# every "assumption that moved" instance #1069 cites as motivation: the MCP
+# mount-form regression (#1002) is an MCP-CONNECTION outcome, not a
+# settings-validation diagnostic (already covered by the runtime
+# `check-channels-enabled.sh` detector — silent-fallback-hazards.md
+# Instance 15); the SessionStart payload-gating bug (#1039) was a semantic
+# misreading of VALID data, not a rejected rule; and the GitHub v3
+# installation-token format change is a GitHub API/token-shape concern with
+# nothing to do with Claude Code's settings grammar (already hardened
+# separately — see `ensure_gh_token`'s full-shape `ghs_[A-Za-z0-9._-]+`
+# predicate, widened for the v3 format by #825/#829). Scope, precisely:
+# does Claude Code accept the rule/flag we ship — verified two ways, both
+# confirmed empirically against a real Claude Code install while building
+# this check:
+#
+#   1. `claude doctor` — structural validation (JSON shape, unsupported
+#      wildcard tool-name syntax, malformed MCP config). No trust prompt,
+#      no session, no model call. Prints an "Invalid settings" section
+#      (each rejected item + Claude Code's own suggested fix) when
+#      something was skipped, or "No installation issues found." Does NOT
+#      catch semantically-dead-but-syntactically-valid rules — see next.
+#   2. `claude -p` (print/non-interactive mode) with EMPTY stdin and no
+#      prompt argument — this loads + validates settings for a real
+#      session (the deeper pass `doctor` doesn't do) and prints the exact
+#      per-rule diagnostic a human would otherwise see scroll past on every
+#      launch (e.g. "Permission deny rule ...: Write(<path>) is not
+#      matched by file permission checks ... Use Edit(<path>) instead" —
+#      verbatim the #1067 shape), THEN exits 1 on "Input must be provided
+#      ... when using --print" because no prompt was given. That expected
+#      failure costs NO model API call — the diagnostics print during
+#      settings load, before Claude Code would otherwise reach out to
+#      Anthropic's API (verified: the same "Permission deny rule" line
+#      appears with ANTHROPIC auth entirely absent from the invocation). An
+#      untrusted scratch workspace (which this always is — nothing here
+#      goes through the interactive trust dialog, deliberately) makes
+#      Claude Code ignore `permissions.allow` wholesale, so this pass
+#      validates `permissions.deny` grammar specifically; `allow`-rule
+#      structural validity is covered by `doctor` above instead.
+#
+# Neither pass blocks on a WARNING — Claude Code itself distinguishes a
+# caveat (e.g. "glob patterns in sandbox permission rules are not fully
+# supported on Linux": the rule still applies via the higher-level
+# permission checker, just not via the sandbox's own enforcement layer)
+# from a REJECTION ("Invalid settings" / "is not matched by" / "was
+# skipped"). Only the latter fails the release — see cmd_harness_check's
+# doc comment for why a rejection blocks rather than warns.
+
+# check_harness_compat WORKSPACE_DIR — the testable core (release.test.sh
+# exercises this directly against hand-built fixtures; no `macf init` or
+# network dependency here). WORKSPACE_DIR must contain a
+# `.claude/settings.json`; a `claude.sh` there (optional) is grepped for the
+# channels dev-flag literal so the launcher-flag check folds into the SAME
+# `claude -p` invocation below, rather than duplicating the flag string in
+# this file — single source of truth stays whatever claude-sh.ts just
+# generated. Prints diagnostics via log(); returns 0 when nothing was
+# rejected (a NOTE may still print for a non-fatal caveat or an
+# inconclusive/timed-out pass), 1 when Claude Code explicitly rejected
+# something.
+check_harness_compat() {
+  local workspace_dir="$1"
+  local rc=0
+
+  if ! command -v claude >/dev/null 2>&1; then
+    log "NOTE: 'claude' binary not found on PATH — skipping the harness-compat check (nothing installed to verify against)."
+    return 0
+  fi
+
+  local cc_version
+  cc_version="$(claude --version 2>/dev/null || true)"
+  [ -n "$cc_version" ] || cc_version="<unknown>"
+
+  # --- 1. claude doctor: structural validation. No trust prompt, no
+  # session, no model call — just a settings/MCP-config shape check.
+  local doctor_out
+  doctor_out="$(cd "$workspace_dir" && timeout 20 claude doctor 2>&1)" || true
+  if printf '%s\n' "$doctor_out" | grep -qx 'Invalid settings'; then
+    log "Claude Code $cc_version (via 'claude doctor') rejects part of the release-generated settings:"
+    log "$doctor_out"
+    rc=1
+  elif printf '%s\n' "$doctor_out" | grep -qE '^[0-9]+ warnings? found$'; then
+    log "NOTE (non-blocking): 'claude doctor' found a caveat against Claude Code $cc_version — review, does not fail the release:"
+    log "$doctor_out"
+  fi
+
+  # --- 2. claude -p, empty stdin, no prompt: session-load semantic
+  # validation (catches the #1067 Write(path)-is-inert shape that `doctor`
+  # above does not) + launcher dev-flag acceptance, folded into one call.
+  local channels_args=()
+  if [ -f "$workspace_dir/claude.sh" ]; then
+    local flag_line=""
+    flag_line="$(grep -oE -- '--dangerously-load-development-channels [^[:space:]"]+' "$workspace_dir/claude.sh" 2>/dev/null | head -n1 || true)"
+    if [ -n "$flag_line" ]; then
+      local flag_name="" flag_value=""
+      read -r flag_name flag_value <<<"$flag_line"
+      channels_args=("$flag_name" "$flag_value")
+    fi
+  fi
+
+  local p_out
+  p_out="$(cd "$workspace_dir" && printf '' | timeout 30 claude -p --output-format text "${channels_args[@]}" 2>&1)" || true
+
+  if ! printf '%s' "$p_out" | grep -q 'Error: Input must be provided'; then
+    # Never reached the expected "no prompt given" terminal state. Two
+    # readings: an inconclusive/timed-out run (p_out empty or truncated —
+    # carries no information about drift, so it's a NOTE, never a FATAL,
+    # per this file's own "never let a check itself become the flaky
+    # signal" stance) vs. an outright rejection before settings even
+    # loaded (e.g. "error: unknown option ..." on a renamed launcher flag).
+    if [ -z "$p_out" ]; then
+      log "NOTE (non-blocking): 'claude -p' produced no output (timed out?) — could not verify; not treated as a rejection."
+    else
+      log "Claude Code $cc_version rejected the release-generated launch invocation before reaching settings validation:"
+      log "$p_out"
+      rc=1
+    fi
+  elif printf '%s' "$p_out" | grep -qE 'Permission (deny|allow) rule .*(is not matched by|was skipped)|Invalid permission rule'; then
+    log "Claude Code $cc_version (via 'claude -p') rejects a permission rule in the release-generated settings:"
+    log "$p_out"
+    rc=1
+  fi
+
+  return "$rc"
+}
+
+# cmd_harness_check VERSION — the release-time orchestrator. Builds dist
+# (idempotent — `tsc -b` is incremental), materializes a REAL canonical
+# workspace via the just-built CLI's own `init --local` (the actual
+# generator, not a hand-reconstructed shape) into an ephemeral scratch dir,
+# then hands it to check_harness_compat. VERSION is accepted-but-unused,
+# for CLI-signature uniformity with the other subcommands (see `check`).
+#
+# Runs IDENTICALLY under --dry-run and the real path — unlike `cli`'s
+# preconditions (groundnuty/macf#1099), this check has NO dependency on any
+# earlier step's REAL mutation (bump's commit, marketplace's tag): it only
+# needs this source tree's current generator code + the currently-installed
+# Claude Code, both of which are present regardless of DRY_RUN. So
+# `release-dry` runs the REAL diagnostic here, not an advisory preview —
+# deliberately: the whole point of a pre-publish preview is to build
+# confidence before committing to a push, and this check exists
+# specifically to catch what nothing else in the release pipeline looks
+# for. The scratch workspace, its local-registry CA (via `--path`), AND
+# `macf init`'s own cross-project state (via `HOME=`, see the comment
+# below) are all confined under a single `mktemp -d` (registered in
+# CLEANUP_DIRS, same as every other scratch dir this script creates) —
+# nothing here is ever written to the operator's real `~/.macf/`. A
+# `git clone`-free, read-only `GET` for the pinned plugin version is the
+# only network call `macf init` makes here; it degrades gracefully to
+# defaults when rate-limited (no GH_TOKEN is passed — this check doesn't
+# need one).
+cmd_harness_check() {
+  (cd "$REPO_ROOT" && make -f dev.mk build)
+
+  local cli_dist="$REPO_ROOT/packages/macf/dist/cli/index.js"
+  [ -f "$cli_dist" ] || die "dist not built — $cli_dist missing after 'make build'"
+
+  local scratch
+  scratch="$(mktemp -d)"
+  CLEANUP_DIRS+=("$scratch")
+
+  # `macf init` writes to a few paths derived from $HOME beyond what --path
+  # redirects — most importantly the cross-project agents index at
+  # ~/.macf/agents.json (`addToAgentsIndex`, unconditional, no opt-out).
+  # `--path` only redirects the local-registry JSON + its CA; without also
+  # containing $HOME, every harness-check run — including under
+  # --dry-run — would permanently register a throwaway
+  # "macf-release-harness-check" entry into the OPERATOR'S real, persistent
+  # global agents index. Point $HOME at a scratch subdirectory for this one
+  # subprocess call so EVERY ~/.macf/* write it makes lands inside the same
+  # `mktemp -d` this function already tears down — verified empirically
+  # while building this check (the unredirected form left stray entries
+  # behind). Scoped to just this line — check_harness_compat below runs
+  # with the REAL ambient $HOME, since Claude Code itself needs real
+  # user-level config/credentials to run at all.
+  local init_out
+  if ! init_out="$(HOME="$scratch/home" node "$cli_dist" init \
+    --project "macf-release-harness-check" \
+    --role code-agent \
+    --local \
+    --path "$scratch/registry/macf-release-harness-check.json" \
+    --dir "$scratch/workspace" 2>&1)"; then
+    log "$init_out"
+    die "could not materialize a scratch canonical workspace via 'macf init --local' — cannot run the harness-compat check"
+  fi
+
+  if check_harness_compat "$scratch/workspace"; then
+    log "harness-compat check passed — the currently-installed Claude Code accepts the release-generated settings/launcher config"
+  else
+    die "harness-compat check FAILED — see the diagnostics above. The currently-installed Claude Code rejected part of the release-generated .claude/settings.json / .mcp.json / launcher flags. Fix the generator (packages/macf/src/cli/settings-writer.ts, claude-sh.ts, or mcp-json.ts) before releasing."
+  fi
 }
 
 cmd_marketplace() {
@@ -531,6 +749,7 @@ cmd_all() {
   [ -n "$version" ] || die "all requires <version>"
   cmd_bump "$version"
   cmd_check
+  cmd_harness_check
   cmd_marketplace "$version"
   cmd_cli "$version"
   cmd_verify "$version"
@@ -558,6 +777,7 @@ main() {
   case "$sub" in
     bump) cmd_bump "$version" ;;
     check) cmd_check ;;
+    harness-check) cmd_harness_check ;;
     marketplace) cmd_marketplace "$version" ;;
     cli) cmd_cli "$version" ;;
     verify) cmd_verify "$version" ;;
