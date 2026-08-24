@@ -110,7 +110,7 @@ program
   .option('--registry-user <user>', 'User name (for profile registry)')
   .option('--registry-repo <repo>', 'owner/repo (for repo registry)')
   .option('--local', 'Shorthand for --registry-type local. Bootstraps a single-host project without GitHub Apps; auto-generates a local CA at ~/.macf/registry/<project>.ca.{crt,key} on first invocation.')
-  .option('--path <path>', 'Absolute path to the local-registry JSON file (only with --local / --registry-type=local). Defaults to ~/.macf/registry/<project>.json. Passing this explicitly also skips registering the workspace in the global cross-project agents index (~/.macf/agents.json) — omit --path to register normally.')
+  .option('--path <path>', 'Absolute path to the local-registry JSON file (only with --local / --registry-type=local). Defaults to ~/.macf/registry/<project>.json.')
   .option('--migrate-from <path>', 'One-shot migrate from a local-registry JSON file into the new GitHub-backed registry (one-way; the old file is left untouched). Rejected with --local.')
   .option('--advertise-host <host>', 'Host the channel server advertises in its registry entry + includes in its cert SAN (e.g., Tailscale IP). Defaults to 127.0.0.1 when unset.')
   .option('--tmux-session <name>', 'Tmux session name for on-notify wake. When set, channel server\'s /notify handler injects the prompt into this tmux session via tmux-send-to-claude.sh after the MCP push. If unset, auto-detects from $TMUX.')
@@ -126,6 +126,20 @@ program
       'Does not affect a fresh workspace or an already macf-managed claude.sh — those are ' +
       'always written/refreshed regardless.',
     false,
+  )
+  // Commander's `--no-<flag>` convention auto-defaults `opts.agentsIndex` to
+  // `true` (registered) — deliberately NO explicit 3rd-arg default here.
+  // An explicit `false` 3rd arg on a `--no-` option conflicts with
+  // commander's own convention and pins the value regardless of whether
+  // the flag was passed (macf#347 — reproduced + fixed for
+  // --no-migrate-env-files; same shape, same fix).
+  .option(
+    '--no-agents-index',
+    'Skip registering this workspace in the global cross-project agents ' +
+      'index (~/.macf/agents.json). For a scoped/ephemeral init — a CI ' +
+      'harness check, a scratch validation workspace — that should not ' +
+      'become discoverable via `macf status`/`macf peers`/`macf list` on ' +
+      'this host. Ordinary invocations register as before.',
   )
   .action(async (opts) => {
     const projectDir = opts.dir ? resolve(opts.dir) : process.cwd();
@@ -157,6 +171,7 @@ program
       pluginVersion: opts.pluginVersion,
       actionsVersion: opts.actionsVersion,
       force: opts.force,
+      agentsIndex: opts.agentsIndex,
     });
   });
 
