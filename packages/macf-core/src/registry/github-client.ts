@@ -1,5 +1,6 @@
 import type { GitHubVariablesClient } from './types.js';
 import { MacfError } from '../errors.js';
+import { proxyAwareFetch } from '../proxy-fetch.js';
 
 export class GitHubApiError extends MacfError {
   readonly status: number;
@@ -35,6 +36,24 @@ function headers(token: string): Record<string, string> {
  * existing status-comparisons (e.g. macf-channel-server's
  * refresh-aware-client checking `err.status === 401`) safely fall through
  * instead of misreading a network outage as an auth failure.
+ *
+ * WHY proxyAwareFetch, not the bare global fetch (macf#1144): Node's fetch
+ * does not honor HTTP_PROXY/HTTPS_PROXY, unlike `gh` — an operator behind
+ * a forward proxy saw every `gh` call succeed while this exact function's
+ * fetch failed, which made the failure look host-specific rather than
+ * proxy-specific. See proxy-fetch.ts's module doc for the full story.
+ *
+ * WHY `err.cause` rather than `err.message` for the diagnostic text
+ * (macf#1144): undici's `TypeError: fetch failed` message is always the
+ * literal string "fetch failed" — worthless on its own. The actual reason
+ * (DNS failure, connection refused, timeout, proxy auth failure, ...) is
+ * nested in `err.cause` as a Node system-error-ish object with `.code`
+ * (e.g. `EAI_AGAIN`, `ENETUNREACH`, `ECONNREFUSED`). Surfacing that code
+ * verbatim, rather than wrapping it in an asserted diagnosis like "network
+ * error", lets the caller (or the human reading the message) tell "no
+ * route at all" apart from "route exists but proxy wasn't honored" apart
+ * from "a real remote outage" — this function cannot itself distinguish
+ * those, so it must not claim to.
  */
 async function fetchOrThrow(
   url: string,
@@ -42,10 +61,14 @@ async function fetchOrThrow(
   operation: string,
 ): Promise<Response> {
   try {
-    return await fetch(url, init);
+    return await proxyAwareFetch(url, init);
   } catch (err) {
-    const cause = err instanceof Error ? err.message : String(err);
-    throw new GitHubApiError(0, `unreachable — could not ${operation} (network error: ${cause})`);
+    const error = err instanceof Error ? err : new Error(String(err));
+    const cause = error.cause as { code?: unknown; message?: unknown } | undefined;
+    const causeCode = typeof cause?.code === 'string' ? cause.code : undefined;
+    const causeMessage = typeof cause?.message === 'string' ? cause.message : undefined;
+    const detail = causeCode ?? causeMessage ?? error.message;
+    throw new GitHubApiError(0, `unreachable — could not ${operation}: ${detail}`);
   }
 }
 

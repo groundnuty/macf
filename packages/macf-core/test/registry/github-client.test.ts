@@ -154,6 +154,36 @@ describe('createGitHubClient', () => {
         expect(message).not.toContain('ghs_super_secret_token_value');
       }
     });
+
+    // macf#1144: the previous message wrapped `err.message` (always the
+    // literal "fetch failed" — worthless) inside an asserted "(network
+    // error: ...)" diagnosis, which conflated "no route at all" with
+    // "proxy not honored" with "a real outage". Surface the underlying
+    // `err.cause.code` (the real signal undici attaches — EAI_AGAIN,
+    // ENETUNREACH, ECONNREFUSED, ...) verbatim instead, and don't claim a
+    // diagnosis the wrapper cannot back up.
+    it('surfaces the underlying err.cause.code, not a generic "network error" label', async () => {
+      const dnsFailure = new TypeError('fetch failed');
+      (dnsFailure as { cause?: unknown }).cause = { code: 'EAI_AGAIN', message: 'getaddrinfo EAI_AGAIN api.github.com' };
+      mockFetch.mockRejectedValueOnce(dnsFailure);
+
+      try {
+        await client.listVariables();
+        expect.unreachable('expected listVariables to throw');
+      } catch (err) {
+        const message = (err as Error).message;
+        expect(message).toContain('EAI_AGAIN');
+        expect(message).not.toContain('network error');
+      }
+    });
+
+    it('falls back to err.cause.message when there is no err.cause.code', async () => {
+      const err2 = new TypeError('fetch failed');
+      (err2 as { cause?: unknown }).cause = { message: 'some other undici-wrapped failure' };
+      mockFetch.mockRejectedValueOnce(err2);
+
+      await expect(client.listVariables()).rejects.toThrow(/some other undici-wrapped failure/);
+    });
   });
 
   describe('listVariables', () => {

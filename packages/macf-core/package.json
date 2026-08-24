@@ -33,6 +33,7 @@
     "@peculiar/x509": "^2.0.0",
     "proper-lockfile": "^4.1.2",
     "reflect-metadata": "^0.2.2",
+    "undici": "^7.29.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
