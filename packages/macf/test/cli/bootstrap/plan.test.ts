@@ -92,7 +92,15 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
     // other unknown-presence item here.
     expect(plan.items).toHaveLength(17);
     for (const item of plan.items) {
-      expect(item.verb).toBe('create');
+      // `labels` is `'write-always'`, not `'create'` (groundnuty/macf#926) —
+      // `labelsItem` has no observed-state input, so it can never carry the
+      // "checked, and it's missing" claim `'create'` implies. See
+      // `plan-item-write-always.test.ts` for the dedicated coverage proof.
+      if (item.kind === 'labels') {
+        expect(item.verb).toBe('write-always');
+      } else {
+        expect(item.verb).toBe('create');
+      }
       expect(item.confirm_required).toBe(false);
     }
   });
@@ -229,19 +237,27 @@ describe('computePlan — all-match observed state → all noops', () => {
     // (groundnuty/macf#1109, UNCONDITIONAL).
     expect(plan.items).toHaveLength(20);
     for (const item of plan.items) {
-      // `labels` is a structural exception: it has NO plan-time observed
-      // read at all (see `labelsItem`'s doc — a per-label API read is out of
-      // scope), so it ALWAYS degrades to a LOW-CONFIDENCE `create`-candidate
-      // regardless of how "matched" everything else is. `runner_ops`/
-      // `router_app`/`ts_oauth` are the SAME shape here (groundnuty/macf#943,
-      // groundnuty/macf#1105, groundnuty/macf#1109) — this test's
-      // `observed.lock` is `null` (never simulated) and `vaultRouterApp`/
-      // `vaultTsOauth` are unset, so their presence can only degrade to
-      // `unknown` → `create`, same as `labels`. `runner_warm` (macf#942) is
-      // ALWAYS `create` too — there is no live-observable "already at this
-      // warm posture" signal to compare against (see `runnerWarmItem`'s
-      // doc). Every other kind genuinely observed-matches here.
-      if (item.kind === 'labels' || item.kind === 'runner_ops' || item.kind === 'runner_warm' || item.kind === 'router_app' || item.kind === 'ts_oauth') {
+      // `labels`/`runner_warm` are `'write-always'` (groundnuty/macf#926,
+      // was `'create'`): they have NO plan-time observed read at all (see
+      // `labelsItem`'s/`runnerWarmItem`'s docs), so they can NEVER carry the
+      // "checked, and it's missing" claim `'create'` implies — not even
+      // here, where every OTHER kind genuinely observed-matches. This is
+      // the exact property `plan-item-write-always.test.ts` proves
+      // exhaustively: these two kinds are IMPOSSIBLE to make quiet by any
+      // fixture, which is what earns them the distinct verb rather than a
+      // "low confidence create."
+      //
+      // `runner_ops`/`router_app`/`ts_oauth` are a DIFFERENT shape — they
+      // DO branch on real observed state (a `fleet.lock` entry / vault
+      // confirmation), they just can't reach `noop` from THIS PARTICULAR
+      // fixture: `observed.lock` is `null` (never simulated) and
+      // `vaultRouterApp`/`vaultTsOauth` are unset, so their presence
+      // degrades to `unknown` → `create` here. See the dedicated describe
+      // blocks below (and `plan-item-write-always.test.ts`) for fixtures
+      // that DO drive them to `noop`.
+      if (item.kind === 'labels' || item.kind === 'runner_warm') {
+        expect(item.verb).toBe('write-always');
+      } else if (item.kind === 'runner_ops' || item.kind === 'router_app' || item.kind === 'ts_oauth') {
         expect(item.verb).toBe('create');
       } else {
         expect(item.verb).toBe('noop');
@@ -494,11 +510,11 @@ describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#
     expect(warmItem(plan.items)).toBeUndefined();
   });
 
-  it('is present as a create item, naming the declared default (1), when routing.runner is declared', () => {
+  it('is present as a write-always item (groundnuty/macf#926, was create), naming the declared default (1), when routing.runner is declared', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const item = warmItem(plan.items);
-    expect(item?.verb).toBe('create');
+    expect(item?.verb).toBe('write-always');
     expect(item?.confirm_required).toBe(false);
     expect(item?.reason).toContain('warm: 1');
     expect(item?.reason).toContain('not yet observable or enforced by apply');
@@ -514,13 +530,13 @@ describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 0 } } });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const item = warmItem(plan.items);
-    expect(item?.verb).toBe('create');
+    expect(item?.verb).toBe('write-always');
     expect(item?.reason).toContain('warm: 0');
     expect(item?.reason).toContain('this fleet is declared dormant');
     const unimplemented = plan.unimplementedByApply.find((i) => i.kind === 'runner_warm');
     expect(unimplemented).toBeDefined();
     expect(unimplemented?.target).toBe('routing:icsoc-2026:runner:warm');
-    expect(unimplemented?.verb).toBe('create');
+    expect(unimplemented?.verb).toBe('write-always');
     expect(unimplemented?.reason).toBe(APPLY_UNIMPLEMENTED_REASONS.runnerWarm);
     expect(unimplemented?.reason).toContain('until that contract call is wired');
   });
@@ -528,6 +544,8 @@ describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#
   it('is NEVER implemented by apply — planItemApplyCoverage always returns not_implemented, regardless of verb (whole-kind gap, same shape as version/actions_pin)', () => {
     expect(planItemApplyCoverage(fakeItem('runner_warm', 'create'))).toBe('not_implemented');
     expect(planItemApplyCoverage(fakeItem('runner_warm', 'update'))).toBe('not_implemented');
+    // groundnuty/macf#926 — the verb `runnerWarmItem` ACTUALLY emits.
+    expect(planItemApplyCoverage(fakeItem('runner_warm', 'write-always'))).toBe('not_implemented');
   });
 
   it('noop/report-extra are still trivially implemented for runner_warm — nothing calls for action', () => {
@@ -581,7 +599,7 @@ describe('computePlan — an observed extra agent → report-extra, NEVER delete
     const plan = computePlan(manifest, observed);
     const verbsSeen = new Set(plan.items.map((i) => i.verb));
     for (const v of verbsSeen) {
-      expect(['create', 'update', 'noop', 'report-extra']).toContain(v);
+      expect(['create', 'update', 'noop', 'report-extra', 'write-always']).toContain(v);
     }
     expect(plan.items.some((i) => (i.verb as string) === 'delete')).toBe(false);
     expect(plan.items.some((i) => (i.verb as string) === 'prune')).toBe(false);
@@ -719,13 +737,15 @@ describe('summarizePlan', () => {
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
     const plan = computePlan(manifest, observed);
     const summary = summarizePlan(plan.items);
-    // 10 per-agent creates (app/repo/install/secret_fingerprint/labels × 2) +
-    // 3 CA creates (registry + 2 agent repos) + 2 routing_client creates +
-    // 1 runner_ops create (groundnuty/macf#943) + 1 router_app create
+    // 8 per-agent creates (app/repo/install/secret_fingerprint × 2) + 3 CA
+    // creates (registry + 2 agent repos) + 2 routing_client creates + 1
+    // runner_ops create (groundnuty/macf#943) + 1 router_app create
     // (groundnuty/macf#1105, UNCONDITIONAL) + 1 ts_oauth create
-    // (groundnuty/macf#1109, UNCONDITIONAL) + 1 runner_warm create
-    // (macf#942) + 1 routing update.
-    expect(summary).toEqual({ creates: 19, updates: 1, noops: 0, extras: 0 });
+    // (groundnuty/macf#1109, UNCONDITIONAL) = 16 creates. + 1 routing
+    // update. `labels` (× 2 agents) + `runner_warm` (macf#942) are
+    // `'write-always'`, NOT `'create'` (groundnuty/macf#926 — see
+    // `plan-item-write-always.test.ts`), so they count separately: 3.
+    expect(summary).toEqual({ creates: 16, updates: 1, noops: 0, extras: 0, writeAlways: 3 });
   });
 });
 
@@ -803,13 +823,13 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
     expect(plan.unimplementedByApply).toEqual([]);
   });
 
-  it('flags a diverging routing value (update) AND the runner_warm posture (create, macf#942) — CA never appears', () => {
+  it('flags a diverging routing value (update) AND the runner_warm posture (write-always, groundnuty/macf#926) — CA never appears', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
     const plan = computePlan(manifest, observed);
     expect(plan.unimplementedByApply.map((i) => i.kind)).toEqual(['routing', 'runner_warm']);
     expect(plan.unimplementedByApply[0]?.verb).toBe('update');
-    expect(plan.unimplementedByApply[1]?.verb).toBe('create');
+    expect(plan.unimplementedByApply[1]?.verb).toBe('write-always');
     for (const item of plan.unimplementedByApply) {
       expect(item.reason.length).toBeGreaterThan(0);
       expect(item.reason).not.toBe(plan.items.find((p) => p.target === item.target)?.reason);
@@ -909,7 +929,8 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
     const lines = formatUnimplementedLines(plan.unimplementedByApply);
     expect(lines.length).toBe(2);
     expect(lines[0]).toMatch(/^routing:.* \(update\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
-    expect(lines[1]).toMatch(/^runner_warm:.* \(create\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
+    // groundnuty/macf#926 — `runner_warm`'s verb is `write-always`, not `create`.
+    expect(lines[1]).toMatch(/^runner_warm:.* \(write-always\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
     for (const line of lines) {
       expect(line).not.toContain('SKIPPED');
     }
