@@ -1000,6 +1000,220 @@ describe('publishTrustedActorsGated — neverRegistered fail-fast (groundnuty/ma
   });
 });
 
+// --- groundnuty/macf#943 — suppressNeverRegisteredFastExit / justProvisionedRepos.
+//
+// Without this suppression, wiring the runner-provisioning contract call
+// into `apply` would be NEUTRALIZED by the neverRegistered fast-exit above:
+// a repo `apply` JUST told the contract to provision reads confirmed-zero at
+// t=0 (the platform's own documented ~15s registration lag), which is
+// EXACTLY the shape the fast-exit above treats as "permanently empty."
+// Without suppression, every successful provision would still fail
+// immediately, defeating the entire point of the contract call.
+
+describe('pollForUsableRunner — suppressNeverRegisteredFastExit disables the neverRegistered fast-exit (groundnuty/macf#943)', () => {
+  it('DECISIVE: a confirmed-zero read does NOT fast-exit when suppressed — sleepFn IS called, and the poll proceeds to genuinely wait', async () => {
+    let checkCalls = 0;
+    let clock = 0;
+    const sleeps: number[] = [];
+    const usability = await pollForUsableRunner(
+      'groundnuty/x',
+      async () => {
+        checkCalls += 1;
+        return { presence: 'absent', neverRegistered: true };
+      },
+      {
+        timeoutMs: 20_000,
+        pollIntervalMs: 5_000,
+        now: () => clock,
+        sleepFn: async (ms) => {
+          sleeps.push(ms);
+          clock += ms;
+        },
+        suppressNeverRegisteredFastExit: true,
+      },
+    );
+    expect(usability.neverRegistered).toBe(true); // still confirmed-zero at exhaustion — the READ is unchanged
+    expect(checkCalls).toBeGreaterThan(1); // genuinely retried, not a single check
+    expect(sleeps.length).toBeGreaterThan(0); // the budget was actually consumed, not skipped
+  });
+
+  it('a runner that registers mid-poll (after suppression let it wait) still resolves present — proves the suppression actually buys usable wait time, not just a longer failure', async () => {
+    let checkCalls = 0;
+    let clock = 0;
+    const usability = await pollForUsableRunner(
+      'groundnuty/x',
+      async () => {
+        checkCalls += 1;
+        // First two checks: the platform's documented registration lag —
+        // confirmed-zero. Third check: the runner has landed.
+        return checkCalls < 3 ? { presence: 'absent', neverRegistered: true } : { presence: 'present' };
+      },
+      {
+        timeoutMs: 60_000,
+        pollIntervalMs: 5_000,
+        now: () => clock,
+        sleepFn: async (ms) => {
+          clock += ms;
+        },
+        suppressNeverRegisteredFastExit: true,
+      },
+    );
+    expect(usability).toEqual({ presence: 'present' });
+    expect(checkCalls).toBe(3);
+  });
+
+  it('NON-REGRESSION: suppression does NOT touch permissionDenied — a confirmed 403 still fails fast regardless of the flag', async () => {
+    let checkCalls = 0;
+    let sleepCalls = 0;
+    const usability = await pollForUsableRunner(
+      'groundnuty/x',
+      async () => {
+        checkCalls += 1;
+        return { presence: 'unknown', permissionDenied: true };
+      },
+      {
+        sleepFn: async (ms) => {
+          sleepCalls += 1;
+          throw new Error(`sleepFn must never be called on a confirmed 403 (asked to sleep ${String(ms)}ms)`);
+        },
+        suppressNeverRegisteredFastExit: true,
+      },
+    );
+    expect(usability.permissionDenied).toBe(true);
+    expect(checkCalls).toBe(1);
+    expect(sleepCalls).toBe(0);
+  });
+
+  it('NON-REGRESSION: `suppressNeverRegisteredFastExit` unset/false behaves EXACTLY as before this option existed — the fast-exit fires', async () => {
+    let checkCalls = 0;
+    let sleepCalls = 0;
+    const usability = await pollForUsableRunner(
+      'groundnuty/x',
+      async () => {
+        checkCalls += 1;
+        return { presence: 'absent', neverRegistered: true };
+      },
+      {
+        sleepFn: async () => {
+          sleepCalls += 1;
+        },
+        // suppressNeverRegisteredFastExit deliberately omitted.
+      },
+    );
+    expect(usability.neverRegistered).toBe(true);
+    expect(checkCalls).toBe(1);
+    expect(sleepCalls).toBe(0);
+  });
+});
+
+describe('publishTrustedActorsGated — justProvisionedRepos disables neverRegistered fast-exit per-repo (groundnuty/macf#943)', () => {
+  it('DECISIVE: a repo in justProvisionedRepos genuinely waits (sleepFn called) and, on eventual exhaustion, reports the POLL-EXHAUSTED reason — never the never-registered wording, since a real wait happened', async () => {
+    let checkCalls = 0;
+    let clock = 0;
+    const sleeps: number[] = [];
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return { presence: 'absent', neverRegistered: true };
+      },
+    });
+    const result = await publishTrustedActorsGated(
+      'self-hosted',
+      ['a/b'],
+      deps,
+      'ghr-sentinel-token',
+      {
+        timeoutMs: 20_000,
+        pollIntervalMs: 5_000,
+        now: () => clock,
+        sleepFn: async (ms) => {
+          sleeps.push(ms);
+          clock += ms;
+        },
+      },
+      undefined, // justCreatedRepos
+      new Set(['a/b']), // justProvisionedRepos — THIS run's provisionRunner call reported 'ok' for it
+    );
+    expect(result['a/b']?.status).toBe('failed');
+    const reason = (result['a/b'] as { reason: string }).reason;
+    expect(reason).toMatch(/poll window/); // the honest "we waited" framing
+    expect(reason).not.toMatch(/does not provision/); // NOT the never-registered wording — apply just tried
+    expect(checkCalls).toBeGreaterThan(1);
+    expect(sleeps.length).toBeGreaterThan(0);
+  });
+
+  it('a repo in justProvisionedRepos that registers mid-poll writes the var — the suppression buys real usable wait time end-to-end', async () => {
+    let checkCalls = 0;
+    let clock = 0;
+    let createCalled = false;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return checkCalls < 2 ? { presence: 'absent', neverRegistered: true } : { presence: 'present' };
+      },
+      createRepoVariable: async () => {
+        createCalled = true;
+        return 'created';
+      },
+    });
+    const result = await publishTrustedActorsGated(
+      'self-hosted',
+      ['a/b'],
+      deps,
+      'ghr-sentinel-token',
+      { timeoutMs: 60_000, pollIntervalMs: 5_000, now: () => clock, sleepFn: async (ms) => { clock += ms; } },
+      undefined,
+      new Set(['a/b']),
+    );
+    expect(result['a/b']?.status).toBe('created');
+    expect(createCalled).toBe(true);
+  });
+
+  it('NON-REGRESSION: a repo NOT in justProvisionedRepos keeps the ORIGINAL fast-exit — sleepFn never called, never-registered reason', async () => {
+    let checkCalls = 0;
+    let sleepCalls = 0;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return { presence: 'absent', neverRegistered: true };
+      },
+    });
+    const result = await publishTrustedActorsGated(
+      'self-hosted',
+      ['a/b'],
+      deps,
+      'ghr-sentinel-token',
+      {
+        sleepFn: async (ms) => {
+          sleepCalls += 1;
+          throw new Error(`sleepFn must never be called (asked to sleep ${String(ms)}ms)`);
+        },
+      },
+      undefined,
+      new Set(['some-other/repo']), // 'a/b' is NOT in this set
+    );
+    expect(result['a/b']?.status).toBe('failed');
+    const reason = (result['a/b'] as { reason: string }).reason;
+    expect(reason).toMatch(/does not provision/);
+    expect(checkCalls).toBe(1);
+    expect(sleepCalls).toBe(0);
+  });
+
+  it('NON-REGRESSION: justProvisionedRepos omitted entirely — every pre-#943 caller — behaves EXACTLY as before', async () => {
+    let sleepCalls = 0;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => ({ presence: 'absent', neverRegistered: true }),
+    });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, 'ghr-sentinel-token', {
+      sleepFn: async () => {
+        sleepCalls += 1;
+      },
+    });
+    expect(result['a/b']?.status).toBe('failed');
+    expect(sleepCalls).toBe(0);
+  });
+});
+
 describe('formatRunnerPollProgress (macf#972)', () => {
   it('names the repo + rounds elapsed/total to whole seconds + the "nothing for you to do" clause', () => {
     const line = formatRunnerPollProgress('groundnuty/x', 120_000, 600_000);

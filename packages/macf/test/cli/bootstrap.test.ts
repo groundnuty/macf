@@ -56,8 +56,10 @@ const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, caRegistry: 'unk
  * present-but-diverging value) for the tests that specifically exercise that
  * render. **Since groundnuty/macf#942** (DR-043 Amendment I), declaring
  * `routing.runner` ALSO always emits a `runner_warm` item (the `warm` field
- * it defaults to has no enforcement path yet, groundnuty/macf#943) — so these
- * fixtures now exercise TWO honest gaps, not one.
+ * it defaults to) — but `runner_warm` is fully IMPLEMENTED as of groundnuty/
+ * macf#943 (apply calls the runner-provisioning contract), so it never
+ * surfaces under `unimplemented_by_apply`; only the diverging `routing`
+ * value does.
  */
 const VALID_FLEET_YAML_WITH_ROUTING = VALID_FLEET_YAML.replace(
   'agents:\n',
@@ -154,7 +156,7 @@ describe('runBootstrapPlan', () => {
     expect(json.unimplemented_by_apply).toEqual([]);
   });
 
-  it('--json ALSO carries a diverging routing value + the runner_warm posture under unimplemented_by_apply — the two remaining honest gaps (macf#838 Amendment D phase 2 + macf#942)', async () => {
+  it('--json carries ONLY a diverging routing value under unimplemented_by_apply — the remaining honest gap (macf#838 Amendment D phase 2); runner_warm is fully implemented as of groundnuty/macf#943', async () => {
     const { dir, file } = writeManifest(VALID_FLEET_YAML_WITH_ROUTING);
     dirs.push(dir);
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -164,12 +166,11 @@ describe('runBootstrapPlan', () => {
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
       unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
     };
-    expect(json.unimplemented_by_apply.length).toBe(2);
-    expect(json.unimplemented_by_apply.map((i) => i.kind)).toEqual(['routing', 'runner_warm']);
+    expect(json.unimplemented_by_apply.length).toBe(1);
+    expect(json.unimplemented_by_apply.map((i) => i.kind)).toEqual(['routing']);
     expect(json.unimplemented_by_apply[0]?.verb).toBe('update');
-    // groundnuty/macf#926 — runner_warm's verb is write-always, not create.
-    expect(json.unimplemented_by_apply[1]?.verb).toBe('write-always');
     expect(json.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(false);
+    expect(json.unimplemented_by_apply.some((i) => i.kind === 'runner_warm')).toBe(false);
   });
 
   it('plain-text mode renders the human table + the skipped-section loud line', async () => {

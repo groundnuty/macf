@@ -88,12 +88,12 @@
  * the actual enforcement point — this is a pre-flight, not a relocation.
  *
  * **A poll's duration must be justified by an expectation, not a constant
- * (macf#972).** A repo CREATED THIS RUN cannot yet have a runner registered
- * to it by anything `apply` itself does — nothing provisions one in-band
- * (macf#943, the runner-provisioning call, is unbuilt) — so polling the full
- * deploy window for it waits on a step nobody was asked to perform: two live
- * provisions both polled 600s and then reported the same honest skip they
- * would have reported immediately. {@link publishTrustedActorsGated}'s
+ * (macf#972).** Originally: a repo CREATED THIS RUN cannot yet have a runner
+ * registered to it by anything `apply` itself does — nothing provisioned one
+ * in-band (macf#943's runner-provisioning call was unbuilt at the time) — so
+ * polling the full deploy window for it waited on a step nobody was asked to
+ * perform: two live provisions both polled 600s and then reported the same
+ * honest skip they would have reported immediately. {@link publishTrustedActorsGated}'s
  * OPTIONAL `justCreatedRepos` param (DR-043 Amendment I2) marks exactly
  * those repos; for one, it performs ONE immediate `checkRunnerUsableByRepo`
  * call — never the retry-with-sleep loop {@link pollForUsableRunner} owns —
@@ -102,11 +102,20 @@
  * gets its var written, but an absent runner is reported at once with the
  * SAME {@link runnerTokenPollExhaustedReason} text `apply` has always shown,
  * just without the wait. A repo that PRE-EXISTED this run keeps polling
- * exactly as before — a runner may legitimately be registering to it. This
- * is the interim behaviour the issue asks for independently of macf#943,
- * which removes the operator from the loop entirely by having `apply` make
- * the provisioning call itself (at which point a fresh repo's poll becomes
- * justified again — see {@link publishTrustedActorsGated}'s doc).
+ * exactly as before — a runner may legitimately be registering to it.
+ *
+ * **`macf#943` landed the provisioning call, and `apply-fleet.ts` corrects
+ * `justCreatedRepos` accordingly, right at its call site.** A repo that is
+ * BOTH created this run AND successfully told to provision (the contract
+ * returned `'ok'`) is removed from the set passed in here — it rejoins the
+ * full poll, because a runner may genuinely be mid-registration for it now.
+ * Only a repo that is created this run AND never successfully provisioned
+ * (endpoint unconfigured, unreachable, contract/cluster error) keeps the
+ * fast single-check path THIS function still owns — the premise "nothing in
+ * this run provisions one" no longer holds unconditionally, but it still
+ * holds for exactly that narrower case, which is what `justCreatedRepos`
+ * continues to mean from this function's point of view: "no provisioning
+ * attempt this caller knows succeeded for this repo."
  * {@link RunnerTokenPollOptions}'s new `onProgress`/`now`/`sleepFn` fields
  * (all optional, defaulting to today's un-instrumented real-clock behavior)
  * let a long poll narrate itself — macf#972 requirement 3: silence after a
@@ -589,6 +598,19 @@ export interface RunnerTokenPollOptions {
   readonly now?: () => number;
   /** Injectable wait primitive — default a real `setTimeout`-based sleep. Test-only; production never overrides this. */
   readonly sleepFn?: (ms: number) => Promise<void>;
+  /**
+   * groundnuty/macf#943 — suppresses {@link pollForUsableRunner}'s
+   * `neverRegistered` fast-exit for ONE call. Set (per-repo, by
+   * `publishTrustedActorsGated`'s new `justProvisionedRepos` param) when
+   * THIS run's `provisionRunner` call for this repo returned `'ok'` — a
+   * confirmed-zero read at t=0 is then EXPECTED (the contract's own
+   * documented ~15s registration lag), not evidence the repo will never have
+   * a runner. `permissionDenied`'s fast-exit is UNCHANGED by this flag — a
+   * 403 is an authorization fact, orthogonal to provisioning timing. Default
+   * `false`/unset (every pre-existing caller): the fast-exit fires exactly
+   * as before this option existed.
+   */
+  readonly suppressNeverRegisteredFastExit?: boolean;
 }
 
 /** Default poll budget for a single repo when {@link publishTrustedActorsGated} doesn't override it — see {@link RunnerTokenPollOptions}'s doc. */
@@ -658,15 +680,29 @@ export function formatRunnerPollProgress(repo: string, elapsedMs: number, totalM
  * circuits.
  *
  * **groundnuty/macf#943 — fails FAST on a confirmed zero-runners-anywhere
- * read too, the SAME shape one gate over.** A `usability.neverRegistered
- * === true` result (see `observer.ts::RunnerUsability.neverRegistered`'s
- * doc) exits the loop on THIS SAME check, before `sleepFn`, for the SAME
- * reason `permissionDenied` does: a confirmed-empty runner registry cannot
- * populate itself by being polled again on the SAME cadence this tool
- * controls — nothing `apply` does provisions a runner in-band. A repo with
- * SOMETHING registered (found-but-not-yet-online, found-but-excluded-from-
- * a-visible-group) never sets `neverRegistered` and keeps polling exactly
- * as before — only the TRUE-zero shape short-circuits.
+ * read too, the SAME shape one gate over — UNLESS this run just told the
+ * runner-provisioning contract to provision one for this repo.** A
+ * `usability.neverRegistered === true` result (see `observer.ts::
+ * RunnerUsability.neverRegistered`'s doc) exits the loop on THIS SAME check,
+ * before `sleepFn`, for the SAME reason `permissionDenied` does: a
+ * confirmed-empty runner registry cannot populate itself by being polled
+ * again on the SAME cadence this tool controls — ordinarily, nothing `apply`
+ * does provisions a runner in-band.
+ *
+ * **That premise is conditionally false as of `#943`'s provisioning call.**
+ * `opts.suppressNeverRegisteredFastExit` (set by `publishTrustedActorsGated`
+ * when THIS repo's `provisionRunner` call returned `'ok'` THIS run) disables
+ * the fast-exit for that ONE call: a confirmed-zero read immediately after a
+ * successful provision is the EXPECTED shape (the contract's own documented
+ * ~15s Kubernetes-to-GitHub registration lag), not evidence of a permanently
+ * empty repo, so the poll falls through to the ordinary retry-with-sleep
+ * path instead — giving that lag genuine time to resolve. A repo this run
+ * did NOT successfully provision (endpoint unconfigured, unreachable,
+ * contract/cluster error, or a pre-existing repo whose confirmed-zero read
+ * really does mean "nothing is coming") keeps the UNCHANGED fast-exit. A
+ * repo with SOMETHING registered (found-but-not-yet-online, found-but-
+ * excluded-from-a-visible-group) never sets `neverRegistered` and keeps
+ * polling exactly as before, independent of this flag.
  */
 export async function pollForUsableRunner(
   repo: string,
@@ -688,16 +724,23 @@ export async function pollForUsableRunner(
     // "not there yet." Return on the FIRST check; never reaches `sleepFn`.
     if (usability.permissionDenied === true) return usability;
     // groundnuty/macf#943 — a CONFIRMED zero-runners-anywhere read is not
-    // "not there yet" either; it is "nothing here, and nothing in `apply`
-    // creates one" (runner provisioning is unbuilt). Same fail-fast shape as
-    // `permissionDenied` immediately above, on the SAME first check, before
-    // `sleepFn` — a confirmed-empty registry cannot populate itself between
-    // one poll tick and the next by the mere act of asking again. A repo
-    // that HAS something registered (offline, still registering, excluded
-    // from a group) never sets this flag — see `RunnerUsability.
-    // neverRegistered`'s doc — so that case is UNCHANGED and keeps polling
-    // to the full budget exactly as before this fix.
-    if (usability.neverRegistered === true) return usability;
+    // "not there yet" either, ORDINARILY; it is "nothing here, and nothing
+    // in `apply` creates one." Same fail-fast shape as `permissionDenied`
+    // immediately above, on the SAME first check, before `sleepFn` — a
+    // confirmed-empty registry cannot populate itself between one poll tick
+    // and the next by the mere act of asking again. A repo that HAS
+    // something registered (offline, still registering, excluded from a
+    // group) never sets this flag — see `RunnerUsability.neverRegistered`'s
+    // doc — so that case is UNCHANGED and keeps polling to the full budget
+    // exactly as before this fix.
+    //
+    // `suppressNeverRegisteredFastExit` (see that option's doc) disables
+    // exactly this exit for a repo THIS run's provisioning call reported
+    // `'ok'` for — "nothing in apply creates one" is conditionally false now,
+    // and a confirmed-zero read moments after a successful provision is the
+    // ~15s registration lag the contract itself documents, not a permanent
+    // fact.
+    if (usability.neverRegistered === true && opts.suppressNeverRegisteredFastExit !== true) return usability;
     const elapsedNow = nowFn();
     const remaining = deadline - elapsedNow;
     if (remaining <= 0) return usability;
@@ -759,6 +802,23 @@ export async function pollForUsableRunner(
  * `apply-fleet.ts`'s call site for how `justCreatedRepos` is populated
  * (`ensureAgentRepo`'s per-repo `status === 'created'`).
  *
+ * **`justProvisionedRepos` (groundnuty/macf#943, DR-043 Amendment I2) —
+ * disables `pollForUsableRunner`'s `neverRegistered` fast-exit for a repo
+ * THIS run's `runner-platform.ts::provisionRunner` call reported `'ok'`
+ * for.** Independent of `justCreatedRepos` above (a repo can be BOTH
+ * pre-existing and freshly provisioned, or newly created and freshly
+ * provisioned — the two sets are not required to be disjoint or related):
+ * whichever repos land in the poll path (`!justCreatedRepos.has(repo)`), a
+ * confirmed-zero read on the very first check would otherwise fast-exit
+ * before the runner platform's own documented ~15s Kubernetes-to-GitHub
+ * registration lag has any chance to resolve — turning a successful
+ * provision into an immediate, guaranteed failure. See
+ * {@link RunnerTokenPollOptions.suppressNeverRegisteredFastExit}'s doc for
+ * the mechanism. `undefined` (every pre-#943 caller) behaves identically to
+ * before — the fast-exit fires unconditionally, matching macf#943's OWN
+ * original (now-corrected) behavior for a poll this option didn't exist to
+ * qualify.
+ *
  * NEVER throws.
  */
 export async function publishTrustedActorsGated(
@@ -768,6 +828,7 @@ export async function publishTrustedActorsGated(
   runnerToken: string | undefined,
   pollOptions: RunnerTokenPollOptions = {},
   justCreatedRepos?: ReadonlySet<string>,
+  justProvisionedRepos?: ReadonlySet<string>,
 ): Promise<Readonly<Record<string, EnsureVariableOutcome>>> {
   if (runnerToken === undefined || runnerToken.length === 0) {
     return failedOutcomesFor(repos, noRunnerTokenReason());
@@ -782,12 +843,14 @@ export async function publishTrustedActorsGated(
   for (const repo of repos) {
     const remaining = Math.max(0, deadline - nowFn());
     // macf#972 — "poll only when a runner is plausibly imminent": a repo
-    // CREATED THIS RUN cannot yet have a runner registered by anything
-    // `apply` itself does (macf#943, the provisioning call, is unbuilt), so
-    // waiting the full deploy window for one waits on a step nobody was
-    // asked to perform. A repo that PRE-EXISTED this run may legitimately be
+    // CREATED THIS RUN and NOT successfully provisioned THIS RUN cannot
+    // plausibly have a runner registered yet, so waiting the full deploy
+    // window for one waits on a step nobody was asked to perform. A repo
+    // that PRE-EXISTED this run, OR was successfully provisioned THIS run
+    // (macf#943 — see `justProvisionedRepos`'s doc), may legitimately be
     // mid-registration — it still gets the real poll.
     const pollJustified = justCreatedRepos?.has(repo) !== true;
+    const justProvisioned = justProvisionedRepos?.has(repo) === true;
     let usability: RunnerUsability;
     try {
       usability = pollJustified
@@ -798,6 +861,7 @@ export async function publishTrustedActorsGated(
             onProgress: pollOptions.onProgress,
             now: pollOptions.now,
             sleepFn: pollOptions.sleepFn,
+            suppressNeverRegisteredFastExit: justProvisioned,
           })
         : await deps.checkRunnerUsableByRepo(repo);
     } catch (err) {
@@ -823,23 +887,31 @@ export async function publishTrustedActorsGated(
       // cause explicitly on EITHER path.
       //
       // groundnuty/macf#943 — `neverRegistered` wins over the ORDINARY
-      // poll-exhausted branch ONLY (`pollJustified === true`): on that path
-      // `pollForUsableRunner` also exits on the FIRST check for this flag
-      // (see its doc), so `runnerTokenPollExhaustedReason`'s "within the Ns
-      // poll window" claim would be dishonest — no wait happened. The
-      // `justCreatedRepos` fast path (`!pollJustified`) deliberately keeps
-      // its OWN `runnerJustCreatedRepoReason` even when `neverRegistered` is
-      // ALSO true (it almost always is, for a repo this run itself created)
-      // — that text already explains WHY zero is expected ("created during
-      // THIS run") more precisely than the generic never-registered wording
-      // would, and downgrading it would lose that specificity for no gain.
+      // poll-exhausted branch ONLY when `pollJustified === true` AND this
+      // repo was NOT `justProvisioned`: on that combination
+      // `pollForUsableRunner` exits on the FIRST check for this flag (see
+      // its doc), so `runnerTokenPollExhaustedReason`'s "within the Ns poll
+      // window" claim would be dishonest — no wait happened. A `justProvisioned`
+      // repo took the OPPOSITE path (`suppressNeverRegisteredFastExit`
+      // disabled the fast-exit, so a `neverRegistered` result here means the
+      // poll genuinely WAITED the full budget and the runner still never
+      // registered) — `runnerTokenPollExhaustedReason` is the HONEST framing
+      // for that case, not `runnerNeverRegisteredReason` (whose "this tool
+      // does not provision one for you yet" clause would be false: it just
+      // tried). The `justCreatedRepos` fast path (`!pollJustified`)
+      // deliberately keeps its OWN `runnerJustCreatedRepoReason` even when
+      // `neverRegistered` is ALSO true (it almost always is, for a repo this
+      // run itself created and never successfully provisioned) — that text
+      // already explains WHY zero is expected ("created during THIS run")
+      // more precisely than the generic never-registered wording would, and
+      // downgrading it would lose that specificity for no gain.
       out[repo] = {
         status: 'failed',
         reason:
           usability.permissionDenied === true
             ? runnerPermissionDeniedReason(repo, usability)
             : pollJustified
-              ? usability.neverRegistered === true
+              ? usability.neverRegistered === true && !justProvisioned
                 ? runnerNeverRegisteredReason(repo, usability)
                 : runnerTokenPollExhaustedReason(repo, usability, timeoutMs)
               : runnerJustCreatedRepoReason(repo, usability),

@@ -517,35 +517,33 @@ describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#
     expect(item?.verb).toBe('write-always');
     expect(item?.confirm_required).toBe(false);
     expect(item?.reason).toContain('warm: 1');
-    expect(item?.reason).toContain('not yet observable or enforced by apply');
+    // groundnuty/macf#943 — apply now calls the runner-provisioning contract
+    // with this value; "not yet observable" still holds (no live warm/dormant
+    // signal to compare against), "not yet enforced" no longer does.
+    expect(item?.reason).toContain('not yet observable');
+    expect(item?.reason).toContain('apply sends it on every runner-provisioning-contract call');
   });
 
-  // groundnuty/macf#942 §"The decisive test" — a manifest declaring
-  // `warm: 0` (a fleet explicitly declared dormant) must produce a plan
-  // whose un-actioned surface says so. This is the load-bearing case: apply
-  // does NOT yet enforce warm regardless of value, so a dormant fleet's
-  // runner stays warm until #943 wires the contract call — the plan must
-  // name that gap explicitly, not just parse the value silently.
-  it('DECISIVE: warm: 0 (a dormant fleet) still emits the item, naming the dormant state in the reason, AND surfaces in unimplementedByApply', () => {
+  it('DECISIVE (corrected by groundnuty/macf#943): warm: 0 (a dormant fleet) still emits the item, naming the dormant state in the reason, and NO LONGER surfaces in unimplementedByApply — apply wires the contract call now', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 0 } } });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const item = warmItem(plan.items);
     expect(item?.verb).toBe('write-always');
     expect(item?.reason).toContain('warm: 0');
     expect(item?.reason).toContain('this fleet is declared dormant');
+    // groundnuty/macf#943 — `runner_warm` joined the always-`'implemented'`
+    // group (planItemApplyCoverage); it must NOT appear in
+    // unimplementedByApply anymore, matching 'version'/'actions_pin''s own
+    // history (see APPLY_UNIMPLEMENTED_REASONS's doc, "ALSO GONE").
     const unimplemented = plan.unimplementedByApply.find((i) => i.kind === 'runner_warm');
-    expect(unimplemented).toBeDefined();
-    expect(unimplemented?.target).toBe('routing:icsoc-2026:runner:warm');
-    expect(unimplemented?.verb).toBe('write-always');
-    expect(unimplemented?.reason).toBe(APPLY_UNIMPLEMENTED_REASONS.runnerWarm);
-    expect(unimplemented?.reason).toContain('until that contract call is wired');
+    expect(unimplemented).toBeUndefined();
   });
 
-  it('is NEVER implemented by apply — planItemApplyCoverage always returns not_implemented, regardless of verb (whole-kind gap, same shape as version/actions_pin)', () => {
-    expect(planItemApplyCoverage(fakeItem('runner_warm', 'create'))).toBe('not_implemented');
-    expect(planItemApplyCoverage(fakeItem('runner_warm', 'update'))).toBe('not_implemented');
+  it('is now IMPLEMENTED by apply for every verb it can emit (groundnuty/macf#943 — apply calls the runner-provisioning contract)', () => {
+    expect(planItemApplyCoverage(fakeItem('runner_warm', 'create'))).toBe('implemented');
+    expect(planItemApplyCoverage(fakeItem('runner_warm', 'update'))).toBe('implemented');
     // groundnuty/macf#926 — the verb `runnerWarmItem` ACTUALLY emits.
-    expect(planItemApplyCoverage(fakeItem('runner_warm', 'write-always'))).toBe('not_implemented');
+    expect(planItemApplyCoverage(fakeItem('runner_warm', 'write-always'))).toBe('implemented');
   });
 
   it('noop/report-extra are still trivially implemented for runner_warm — nothing calls for action', () => {
@@ -553,9 +551,8 @@ describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#
     expect(planItemApplyCoverage(fakeItem('runner_warm', 'report-extra'))).toBe('implemented');
   });
 
-  it('the un-actioned reason names #943 as what will wire it, and never claims anything above was changed', () => {
-    expect(APPLY_UNIMPLEMENTED_REASONS.runnerWarm).toContain('until that contract call is wired');
-    expect(APPLY_UNIMPLEMENTED_REASONS.runnerWarm).toContain('nothing above was changed');
+  it('APPLY_UNIMPLEMENTED_REASONS no longer carries a runnerWarm entry (groundnuty/macf#943 — the gap it described is closed)', () => {
+    expect(Object.keys(APPLY_UNIMPLEMENTED_REASONS)).toEqual(['routing']);
   });
 
   it('is present in EVERY plan that declares routing.runner — a fleet-level item, not per-agent', () => {
@@ -823,28 +820,27 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
     expect(plan.unimplementedByApply).toEqual([]);
   });
 
-  it('flags a diverging routing value (update) AND the runner_warm posture (write-always, groundnuty/macf#926) — CA never appears', () => {
+  it('flags a diverging routing value (update) — CA never appears, and runner_warm no longer appears either (groundnuty/macf#943 — apply now calls the runner-provisioning contract)', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
     const plan = computePlan(manifest, observed);
-    expect(plan.unimplementedByApply.map((i) => i.kind)).toEqual(['routing', 'runner_warm']);
+    expect(plan.unimplementedByApply.map((i) => i.kind)).toEqual(['routing']);
     expect(plan.unimplementedByApply[0]?.verb).toBe('update');
-    expect(plan.unimplementedByApply[1]?.verb).toBe('write-always');
     for (const item of plan.unimplementedByApply) {
       expect(item.reason.length).toBeGreaterThan(0);
       expect(item.reason).not.toBe(plan.items.find((p) => p.target === item.target)?.reason);
     }
   });
 
-  it('does NOT flag routing when it matches (noop) or is absent (create) — runner_warm still appears regardless (macf#942: no enforcement path yet, independent of routing drift)', () => {
+  it('does NOT flag routing when it matches (noop) or is absent (create) — runner_warm no longer appears either way (groundnuty/macf#943)', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const matching: ObservedState = {
       ...EMPTY_OBSERVED,
       routingTrustedActors: 'icsoc-2026-science-agent[bot] icsoc-2026-code-agent[bot]',
     };
-    expect(computePlan(manifest, matching).unimplementedByApply.map((i) => i.kind)).toEqual(['runner_warm']);
+    expect(computePlan(manifest, matching).unimplementedByApply.map((i) => i.kind)).toEqual([]);
     const absent: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: undefined };
-    expect(computePlan(manifest, absent).unimplementedByApply.map((i) => i.kind)).toEqual(['runner_warm']);
+    expect(computePlan(manifest, absent).unimplementedByApply.map((i) => i.kind)).toEqual([]);
   });
 
   it('NEVER flags repo — neither repo:create nor repo:noop (macf#857: ensureAgentRepo actions it)', () => {
@@ -878,7 +874,7 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
     expect(computePlan(baseManifest(), observedCaPresent).unimplementedByApply.some((i) => i.kind === 'ca')).toBe(false);
   });
 
-  it('ONLY carries runner_warm (macf#942, no enforcement path yet) when every OTHER item is noop/report-extra (fully-provisioned fleet, incl. routing)', () => {
+  it('is EMPTY on a fully-provisioned self-hosted fleet (routing matches, runner_warm implemented since groundnuty/macf#943) — every item is noop/report-extra/implemented', () => {
     const manifest = baseManifest({
       routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
       trust: { ca: 'per-project', federated_cas: [] },
@@ -912,25 +908,23 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
       controlRepoPresence: 'absent',
     };
     const plan = computePlan(manifest, observed);
-    // macf#942 (DR-043 Amendment I) — runner_warm is a whole-kind gap
-    // (planItemApplyCoverage's 'runner_warm' case), so it stays un-actioned
-    // even when routing itself fully matches (noop) — every OTHER kind here
-    // is genuinely implemented-or-noop.
-    expect(plan.unimplementedByApply.map((i) => i.kind)).toEqual(['runner_warm']);
+    // groundnuty/macf#943 — `runner_warm` joined the always-`'implemented'`
+    // group (planItemApplyCoverage), so a fully-provisioned self-hosted
+    // fleet's unimplementedByApply is now EMPTY, matching the no-routing
+    // fresh-fleet case above.
+    expect(plan.unimplementedByApply).toEqual([]);
   });
 
   it('formatUnimplementedLines renders the exact loud-line shape, distinct wording from SKIPPED', () => {
-    // macf#838 Amendment D phase 2 + macf#942: CA is fully implemented now —
-    // the two remaining unimplemented cases are a diverging routing value and
-    // the not-yet-enforced runner_warm posture.
+    // macf#838 Amendment D phase 2 + macf#943: CA and runner_warm are both
+    // fully implemented now — the remaining unimplemented case is a
+    // diverging routing value.
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
     const plan = computePlan(manifest, observed);
     const lines = formatUnimplementedLines(plan.unimplementedByApply);
-    expect(lines.length).toBe(2);
+    expect(lines.length).toBe(1);
     expect(lines[0]).toMatch(/^routing:.* \(update\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
-    // groundnuty/macf#926 — `runner_warm`'s verb is `write-always`, not `create`.
-    expect(lines[1]).toMatch(/^runner_warm:.* \(write-always\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
     for (const line of lines) {
       expect(line).not.toContain('SKIPPED');
     }

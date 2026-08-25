@@ -231,15 +231,17 @@ export const FleetRoutingRunnerSchema = z
      * **1**. `0` is meaningful only for a fleet explicitly declared
      * dormant.
      *
-     * **Not yet enforced.** `apply` does not yet call the runner-
-     * provisioning contract (`repo`/`labels`/`warm`) that would act on this
-     * value — that wiring is groundnuty/macf#943, still blocked. Declaring
-     * `warm` here only RECORDS the posture; `plan.ts`'s
-     * `planItemApplyCoverage` (groundnuty/macf#861's honest-state
-     * mechanism) surfaces this loudly as NOT IMPLEMENTED BY APPLY on every
-     * `macf bootstrap plan` run, rather than silently accepting a value
-     * nothing acts on — see `plan.ts`'s `runnerWarmItem` +
-     * `APPLY_UNIMPLEMENTED_REASONS.runnerWarm`.
+     * **Enforced as of groundnuty/macf#943.** `apply-fleet.ts` calls the
+     * runner-provisioning contract (`runner-platform.ts::provisionRunner`,
+     * `repo`/`labels`/`warm`) for every confirmed self-hosted-runner repo,
+     * every run — non-fatally (Amendment I2): a contract failure is reported
+     * via `FleetApplyResult.runnerProvision`, never silently, but never fails
+     * the run either. "Enforced" means "apply sends it on every call," not
+     * "the contract is guaranteed to obey it" — `plan.ts`'s
+     * `planItemApplyCoverage` still classifies this `'write-always'` (no
+     * live-observable warm/dormant signal to compare a declared value
+     * against), but the kind itself moved OUT of `NOT IMPLEMENTED BY APPLY`
+     * — see `plan.ts`'s `runnerWarmItem`.
      */
     warm: z.number().int().nonnegative().default(1),
   })
