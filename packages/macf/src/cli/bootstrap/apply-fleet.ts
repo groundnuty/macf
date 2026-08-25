@@ -212,7 +212,7 @@ import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName } from 
 import type { AgentApplyDeps, AgentApplyOutcome, InstallRejection } from './apply-agent.js';
 import { applyAgentIdentity, applyIdentity, cleanupScratchPem, writeScratchPem } from './apply-agent.js';
 import type { Presence } from './plan.js';
-import { buildRegistryRepoValidateInstall, registryRepoCoverageUnverifiedOnSkipNote } from './registry-repo-coverage.js';
+import { buildRegistryRepoValidateInstall, registryRepoCoverageUnverifiedOnSkipNote, requiredRegistryRepoCoverage } from './registry-repo-coverage.js';
 import { buildInstallScopeValidator } from './install-scope.js';
 import type { ConfirmedInstall } from './identity-confirm.js';
 import type { AppCredentials } from './manifest-exchange.js';
@@ -1273,8 +1273,14 @@ export async function applyFleet(
   // `registry.type === 'repo'` is the only registry shape this run needs to
   // live-verify install coverage for. `type: profile`/`org`/`local` never
   // reach `buildRegistryRepoValidateInstall` at all — byte-identical
-  // behavior to pre-#1012 (requirement 5).
-  const registry = manifest.owner.registry;
+  // behavior to pre-#1012 (requirement 5). groundnuty/macf#1156 — reads
+  // `requiredRegistryRepoCoverage(manifest)` (the SAME function
+  // `apply-agent.ts::installReposForIdentity` calls to fold the control repo
+  // into the gate-2 instruction/`--dry-run` preview) instead of a local
+  // `registry.owner`/`registry.repo` field read, so the CHECK wired below
+  // and the INSTRUCTION the operator reads can never independently drift —
+  // see that function's own doc for the incident this closes.
+  const registryCoverage = requiredRegistryRepoCoverage(manifest);
 
   const totalAgents = manifest.agents.length;
   for (const [agentIndex, agent] of manifest.agents.entries()) {
@@ -1323,7 +1329,7 @@ export async function applyFleet(
     // reasoning `buildAgentDepsWithRecovery`'s own splice already
     // establishes for `writeRecoveryArtifact`/`findRecoveryArtifact`.
     const agentDeps: AgentApplyDeps = (() => {
-      if (registry.type !== 'repo') return { ...agentDepsBase, validateInstall: installScopeValidate };
+      if (registryCoverage === undefined) return { ...agentDepsBase, validateInstall: installScopeValidate };
       // `registryRepoValidate` is wired onto BOTH `validateInstall` (CREATE
       // / resume-install, via `runGate2`, composed with the scope check
       // above) AND `validateReuse` (an already-provisioned role
@@ -1331,7 +1337,7 @@ export async function applyFleet(
       // branch — see that field's doc for why it's separate from
       // `validateInstall`) — UNCHANGED from before this issue; only
       // `validateInstall` gains the new scope check.
-      const registryRepoValidate = buildRegistryRepoValidateInstall(registry.owner, registry.repo, appHandle, scopedLog, deps.checkRegistryRepoCoverage);
+      const registryRepoValidate = buildRegistryRepoValidateInstall(registryCoverage.owner, registryCoverage.repo, appHandle, scopedLog, deps.checkRegistryRepoCoverage);
       return {
         ...agentDepsBase,
         validateInstall: composeValidateInstall(installScopeValidate, registryRepoValidate),
@@ -1403,10 +1409,10 @@ export async function applyFleet(
     // text, so both gaps are named in one string (Amendment A: unverified is
     // `unknown`, never silently `ok`).
     const identity: AgentApplyOutcome =
-      registry.type === 'repo' && rawIdentity.status === 'skipped-unverified' && agentDeps.resolveKeyPath === undefined
+      registryCoverage !== undefined && rawIdentity.status === 'skipped-unverified' && agentDeps.resolveKeyPath === undefined
         ? {
             ...rawIdentity,
-            reason: `${rawIdentity.reason} ${registryRepoCoverageUnverifiedOnSkipNote(deriveAppHandle(manifest.metadata.name, agent.role), registry.owner, registry.repo)}`,
+            reason: `${rawIdentity.reason} ${registryRepoCoverageUnverifiedOnSkipNote(deriveAppHandle(manifest.metadata.name, agent.role), registryCoverage.owner, registryCoverage.repo)}`,
           }
         : rawIdentity;
 

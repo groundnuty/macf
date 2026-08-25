@@ -192,8 +192,39 @@ import { proxyAwareFetch } from '@groundnuty/macf-core';
 import type { ConfirmedInstall } from './identity-confirm.js';
 import type { Presence } from './plan.js';
 import type { InstallRejection } from './apply-agent.js';
+import type { FleetManifest } from './fleet-manifest.js';
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * The `owner`/`repo` this fleet's registry lives at, when — and only when —
+ * `registry.type === 'repo'` (`#999`'s supported org-owned-fleet shape).
+ * `undefined` for every other registry type (`org`/`profile`/`local`) — none
+ * of them name a specific GitHub repo an App install needs to cover.
+ *
+ * **The one function this module's own live CHECK and the consent-gate 2
+ * INSTRUCTION both call (groundnuty/macf#1156).** Before this issue, the
+ * check (`apply-fleet.ts`'s per-agent loop, wiring
+ * {@link buildRegistryRepoValidateInstall} below off `manifest.owner.registry.
+ * {owner,repo}`) and the instruction (`apply-agent.ts::installReposForIdentity`,
+ * which drives BOTH the live gate-2 interstitial text an operator reads AND
+ * the `--dry-run`/pre-approval preview) were computed independently — the
+ * instruction never consulted `registry` at all. An operator who followed
+ * the instruction exactly produced an install this check then correctly
+ * refused (`groundnuty/macf#1156`'s own incident: `macf-fresh-science-agent`
+ * installed on exactly the ONE repo the interstitial named, then rejected by
+ * this module's `checkRepoInAppInstallation` for missing the control repo).
+ * `#1136` deleted two independently-drifted copies of a validator for the
+ * identical hazard shape — this is the same fix, applied between an
+ * instruction and its check rather than between two checks. Exporting this
+ * as the single derivation both sides import means a future change to what
+ * "the required repo" means (e.g. a second control-repo-shaped field) is a
+ * one-function edit, not a two-site hunt.
+ */
+export function requiredRegistryRepoCoverage(manifest: FleetManifest): { readonly owner: string; readonly repo: string } | undefined {
+  const registry = manifest.owner.registry;
+  return registry.type === 'repo' ? { owner: registry.owner, repo: registry.repo } : undefined;
+}
 
 /**
  * Bound, same rationale + same values as `identity-confirm.ts`'s own
