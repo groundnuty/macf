@@ -10,14 +10,48 @@
 import { describe, it, expect } from 'vitest';
 import type { ConfirmedInstall } from '../../../src/cli/bootstrap/identity-confirm.js';
 import type { Presence } from '../../../src/cli/bootstrap/plan.js';
+import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import {
   buildRegistryRepoValidateInstall,
   mapRepoInstallationStatus,
   registryRepoCoverageUnknownWarning,
   registryRepoNotInstalledReason,
+  requiredRegistryRepoCoverage,
 } from '../../../src/cli/bootstrap/registry-repo-coverage.js';
 
 const INSTALL: ConfirmedInstall = { appId: '9001', installId: '5555', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty' };
+
+/** Minimal manifest shape, module-scoped for the `requiredRegistryRepoCoverage` describe block below. */
+function manifestWithRegistry(registry: FleetManifest['owner']['registry']): FleetManifest {
+  return {
+    apiVersion: 'macf/v0',
+    kind: 'Fleet',
+    metadata: { name: 'demo-fleet' },
+    owner: { account: 'demo-org', type: 'org', registry },
+    network: { advertise_host: 'example.ts.net' },
+    transport: { age_recipients: ['age1operator'] },
+    defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
+    agents: [{ role: 'code-agent', profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/x' }],
+    trust: { ca: 'per-project', federated_cas: [] },
+  };
+}
+
+describe('requiredRegistryRepoCoverage (pure, groundnuty/macf#1156) — the SAME derivation both the check (this module) and the gate-2 instruction (apply-agent.ts::installReposForIdentity) read', () => {
+  it('registry.type === "repo" -> { owner, repo } read straight from the manifest', () => {
+    expect(requiredRegistryRepoCoverage(manifestWithRegistry({ type: 'repo', owner: 'demo-org', repo: 'demo-org-registry' }))).toEqual({
+      owner: 'demo-org',
+      repo: 'demo-org-registry',
+    });
+  });
+
+  it.each([
+    ['profile', { type: 'profile', user: 'demo-org' }] as const,
+    ['org', { type: 'org', org: 'demo-org' }] as const,
+    ['local', { type: 'local', path: '/tmp/registry.json' }] as const,
+  ])('registry.type === "%s" -> undefined (no specific repo an install needs to cover)', (_label, registry) => {
+    expect(requiredRegistryRepoCoverage(manifestWithRegistry(registry))).toBeUndefined();
+  });
+});
 
 describe('mapRepoInstallationStatus — GET /repos/{owner}/{repo}/installation status→Presence (macf#1012 AC)', () => {
   it('200 -> present', () => {

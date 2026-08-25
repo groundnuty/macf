@@ -831,6 +831,15 @@ describe('applyAgentIdentity — non-create outcomes short-circuit before any ga
 const SCI_AGENT: FleetAgent = { role: 'science-agent', profile: 'research', repo: 'groundnuty/demo-science', deploy_path: '/y' };
 const MULTI_AGENT_MANIFEST: FleetManifest = { ...MANIFEST, agents: [AGENT, SCI_AGENT] };
 
+// groundnuty/macf#1156 — a repo-scoped registry, module-scoped so both the
+// `installReposForIdentity` and `installWhyText` describe blocks below (and
+// any future sibling) share the identical fixture rather than each hand-
+// typing their own `owner`/`repo` literals.
+const REGISTRY_REPO_MANIFEST: FleetManifest = {
+  ...MULTI_AGENT_MANIFEST,
+  owner: { account: 'demo-org', type: 'org', registry: { type: 'repo', owner: 'demo-org', repo: 'demo-org-control' } },
+};
+
 describe('installReposForIdentity (pure, groundnuty/macf#952)', () => {
   it('a role matching a declared agent gets EXACTLY its own home repo', () => {
     expect(installReposForIdentity('code-agent', MULTI_AGENT_MANIFEST)).toEqual(['groundnuty/demo-code']);
@@ -846,6 +855,40 @@ describe('installReposForIdentity (pure, groundnuty/macf#952)', () => {
 
   it('single-agent manifest: the matching role still gets just its own repo (not the whole array coincidentally)', () => {
     expect(installReposForIdentity('code-agent', MANIFEST)).toEqual(['groundnuty/demo-code']);
+  });
+
+  // groundnuty/macf#1156 — the control-repo fold-in this issue adds.
+  describe('groundnuty/macf#1156 — registry.type === "repo" folds the control repo in', () => {
+    it('a role matching a declared agent gets its own repo PLUS the control repo', () => {
+      expect(installReposForIdentity('code-agent', REGISTRY_REPO_MANIFEST)).toEqual([
+        'groundnuty/demo-code',
+        'demo-org/demo-org-control',
+      ]);
+      expect(installReposForIdentity('science-agent', REGISTRY_REPO_MANIFEST)).toEqual([
+        'groundnuty/demo-science',
+        'demo-org/demo-org-control',
+      ]);
+    });
+
+    it('the runner-ops fallback (no declared-agent match) is UNCHANGED — every agent repo, control repo NOT added (it never touches the registry)', () => {
+      expect(installReposForIdentity('runner-ops', REGISTRY_REPO_MANIFEST)).toEqual([
+        'groundnuty/demo-code',
+        'groundnuty/demo-science',
+      ]);
+    });
+
+    it('a non-repo-scoped registry (profile scope) gets the agent repo ONLY — no spurious control-repo entry', () => {
+      // MULTI_AGENT_MANIFEST inherits MANIFEST's default `registry: { type: 'profile', ... }`.
+      expect(installReposForIdentity('code-agent', MULTI_AGENT_MANIFEST)).toEqual(['groundnuty/demo-code']);
+    });
+
+    it('a role whose OWN home repo IS the control repo gets it listed once, not twice', () => {
+      const selfHostingManifest: FleetManifest = {
+        ...MULTI_AGENT_MANIFEST,
+        owner: { account: 'demo-org', type: 'org', registry: { type: 'repo', owner: 'groundnuty', repo: 'demo-code' } },
+      };
+      expect(installReposForIdentity('code-agent', selfHostingManifest)).toEqual(['groundnuty/demo-code']);
+    });
   });
 });
 
@@ -865,6 +908,19 @@ describe('installWhyText (pure, groundnuty/macf#952)', () => {
 
   it('a non-write administration level (defense-in-depth — never issued today) does NOT get the blast-radius framing', () => {
     expect(installWhyText({ administration: 'read' })).not.toMatch(/blast radius/);
+  });
+
+  // groundnuty/macf#1156 — the one-clause registry-control-repo reason.
+  it('registryControlRepo, when given, appends a one-clause reason naming it — "an operator who understands why will not mis-fix it later"', () => {
+    const text = installWhyText(undefined, 'demo-org/demo-org-control');
+    expect(text).toMatch(/only needs access to the repo\(s\) listed above/); // base reason still present
+    expect(text).toContain('demo-org/demo-org-control');
+    expect(text).toMatch(/this App must read the fleet registry/);
+  });
+
+  it('registryControlRepo omitted (every pre-#1156 call site) leaves the text byte-identical to before this parameter existed', () => {
+    expect(installWhyText(undefined)).not.toMatch(/fleet registry/);
+    expect(installWhyText({ administration: 'write' })).not.toMatch(/fleet registry/);
   });
 });
 
