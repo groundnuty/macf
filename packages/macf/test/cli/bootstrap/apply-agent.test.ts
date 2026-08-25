@@ -2239,3 +2239,49 @@ describe('the new page buttons are also covered by #1174\'s one-message-source d
     expect(mentionLine).toBeUndefined();
   });
 });
+
+// --- groundnuty/macf#1179 — pollForInstallFix actually calls updateContent
+// with the CLASSIFIED diagnosis, not just any narrowed text. gate2-diagnosis
+// .test.ts already proves the classifier itself is correct in isolation;
+// this proves the poll loop actually WIRES it, end to end.
+
+describe('pollForInstallFix narrows the served page via the classifier (groundnuty/macf#1179)', () => {
+  it('a coverage-short rejection (scope selected, missingRepos present) narrows updateContent to the classified coverage-short lines, not the scope-wrong ones', async () => {
+    const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
+    const REUSE_INSTALL: ConfirmedInstall = { appId: '9001', installId: '5555', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty', repositorySelection: 'selected' };
+    const updateCalls: { readonly messageLines: readonly string[]; readonly repoNames: readonly string[] }[] = [];
+    let validateReuseCalls = 0;
+    const deps = baseDeps({
+      startInstallInterstitial: async () => ({
+        startUrl: FAKE_INTERSTITIAL_URL,
+        close: () => Promise.resolve(),
+        updateContent: (messageLines, repoNames) => { updateCalls.push({ messageLines, repoNames }); },
+      }),
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      gateTimeoutMs: 200,
+      pollIntervalMs: 10,
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        // Rejects on call 1 (the pre-flight, OUTSIDE pollForInstallFix —
+        // decides whether gate 2 opens at all) AND call 2 (the poll's own
+        // FIRST tick, INSIDE pollForInstallFix — this is the one that must
+        // reach `updateContent`); accepts on call 3, so the poll's SECOND
+        // tick is what resolves the run.
+        return validateReuseCalls <= 2
+          ? { message: 'registry repo not installed', retryInstruction: 'add groundnuty/demo-fresh-control under Repository access, then Save.', missingRepos: ['groundnuty/demo-fresh-control'] }
+          : undefined;
+      },
+    });
+
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+
+    expect(updateCalls.length).toBeGreaterThan(0);
+    const first = updateCalls[0]!;
+    // Classified as coverage-short (not scope-wrong, not honest-unknown):
+    // the "still missing repository access:" prefix and the repo name.
+    expect(first.messageLines.join('\n')).toContain('still missing repository access:');
+    expect(first.messageLines.join('\n')).not.toContain('still wrong (repository scope)');
+    expect(first.repoNames).toEqual(['demo-fresh-control']); // bare name, per bareRepoNames
+  });
+});
