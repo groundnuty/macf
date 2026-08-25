@@ -23,6 +23,7 @@ import { runBootstrapPlan } from './commands/bootstrap.js';
 import { runBootstrapApply } from './commands/bootstrap-apply.js';
 import { runBootstrapStatus } from './commands/bootstrap-status.js';
 import { runBootstrapControlRepoInit } from './commands/bootstrap-control-repo-init.js';
+import { runManifestScaffold } from './commands/bootstrap-manifest-scaffold.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRoutingE2e } from './commands/routing-e2e.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
@@ -823,6 +824,52 @@ bootstrapControlRepo
   .option('--json', 'Emit the structured result as JSON', false)
   .action(async (opts) => {
     const code = await runBootstrapControlRepoInit({ file: opts.file, json: opts.json });
+    process.exitCode = code;
+  });
+
+const bootstrapManifest = bootstrap
+  .command('manifest')
+  .description('Draft a fleet.yaml from live GitHub state, for a fleet that predates the manifest.');
+
+bootstrapManifest
+  .command('scaffold')
+  .description(
+    'READ-ONLY: draft a fleet.yaml from live GitHub state via the SAME observer `bootstrap plan` diffs a ' +
+    'manifest against. Every field it could not confirm is an explicit TODO (an omitted key plus a comment), ' +
+    'never a guess — versions and transport.age_recipients are ALWAYS TODO by design (declaring either would ' +
+    'convert today\'s observation into tomorrow\'s enforced intent, or falsely claim "no key yet" for an ' +
+    'already-provisioned fleet). A clean parse of the output proves well-formedness only, never correctness — ' +
+    'a scaffold checked against the same observation it was built from agrees with itself by construction. ' +
+    'Never writes to a repo: stdout, or --out to a LOCAL file only.',
+  )
+  .requiredOption('--owner <account>', 'The GitHub org or user login that owns the fleet')
+  .requiredOption('--fleet <name>', 'The fleet name (metadata.name) — lowercase kebab-case')
+  .option(
+    '--agent <role=owner/repo>',
+    'One declared agent: role=owner/repo. Repeatable; at least one required. Role<->repo binding cannot be ' +
+      'discovered live (it needs an install token this credential-free tool never holds) — supply it.',
+    (value: string, previous: readonly string[]) => [...previous, value],
+    [] as readonly string[],
+  )
+  .option('--json', 'Emit the structured draft as JSON', false)
+  .option('--out <path>', 'Also write the draft to this LOCAL file path (never a repo — committing is `bootstrap control-repo init`\'s job)')
+  .option(
+    '--vault <path>',
+    'Path to the fleet\'s secrets/vault.age — with --identity-key, lifts transport.tailscale_oauth_required into ' +
+      'the derived tier and reports the vault\'s recipient-stanza COUNT (never the recipient identities ' +
+      'themselves) in the age_recipients TODO comment. Operator-privileged use only; omit for the vault-free default.',
+  )
+  .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
+  .action(async (opts) => {
+    const code = await runManifestScaffold({
+      owner: opts.owner,
+      fleet: opts.fleet,
+      agent: opts.agent,
+      json: opts.json,
+      out: opts.out,
+      vaultPath: opts.vault,
+      identityKeyPath: opts.identityKey,
+    });
     process.exitCode = code;
   });
 
