@@ -24,6 +24,43 @@ The trigger is *peer correction surfaces a substrate-discipline pattern*, not ju
 
 ---
 
+## Before you write it — the instance list is the test suite for a rule
+
+A rule is written from instances. **Those instances are its test suite, and the rule is not written until they pass.**
+
+Run both checks before writing, not after:
+
+**1. Membership — is every instance I listed actually in the class I described?**
+
+**2. Recognition — would my stated TRIGGER identify each of them prospectively, given only what a reader knows before the fact?**
+
+The usable form of (2): **take each listed instance, hide the diagnosis, and ask whether the trigger alone would flag it.**
+
+### Two is the one that keeps failing
+
+It is harder than (1) because **the author already knows the answer.** The trigger looks sufficient precisely because you are reading it with the instance in mind — you supply the recognition yourself and never notice the rule did not.
+
+> **A rule written from an instance inherits that instance's trigger, and the trigger is almost always narrower than the rule.** The generalisation gets stated; the recognition condition stays as specific as whatever prompted it.
+
+### Three worked failures, two authors, two days
+
+**Recognition failures** — the instance *was* in the class, and the stated trigger could not identify it:
+
+- A rule said *"forbid the plausible-but-wrong verification"* and named **circularity** as the trigger. One of its own two cited instances derived no expected value from anything observed — its premise was correct and the leap was to **an unstated observable**. A reader applying the trigger gets *"nothing circular here"* and writes the assertion anyway.
+- A rule said *"re-verify a peer's claim before promoting it"*, with examples that implied the trigger was **uncertainty**. The case it could not recognise was **agreement** — where checking feels most wasted and a wrong result is invisible, because nobody re-examines a corroboration.
+
+**A membership failure** — a listed instance was not in the class at all:
+
+- Four stalled issues were unified as *"a claim about future state, recorded once, never re-presented."* Three were promises needing re-presentation. The fourth was an **assertion that was false when written** and needed checking once, immediately. One mechanism would have fitted three and quietly under-served the fourth.
+
+**All three were caught by a reader re-running the instance list against the stated rule** — never by the author, and never by review of the prose alone.
+
+### Why this belongs before writing
+
+This is the same discipline `assert-the-wrong-path.md` applies to code, turned on the rule itself: **a rule that cannot fail on any of its own instances has not been tested.** Applying it after publication means the distributed copy is already wrong — and a canonical rule reaches every workspace.
+
+---
+
 ## How to codify
 
 Two surfaces, both useful:
