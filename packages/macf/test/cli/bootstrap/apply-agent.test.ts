@@ -19,7 +19,8 @@ import {
 import type { FleetAgent, FleetLockAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import type { ConfirmedInstall, IdentityConfirmation } from '../../../src/cli/bootstrap/identity-confirm.js';
-import type { InstallInterstitialHandles, ManifestFlowHandles } from '../../../src/cli/bootstrap/manifest-flow-server.js';
+import { escapeHtmlAttribute, renderInstallInterstitial } from '../../../src/cli/bootstrap/manifest-flow-server.js';
+import type { InstallInterstitialHandles, InstallInterstitialOptions, ManifestFlowHandles } from '../../../src/cli/bootstrap/manifest-flow-server.js';
 import { appNameCollisionRefusalMessage, resolveAppPresenceStatus } from '../../../src/cli/bootstrap/app-presence.js';
 import { registryRepoNotInstalledReason, registryRepoRetryInstruction } from '../../../src/cli/bootstrap/registry-repo-coverage.js';
 
@@ -871,6 +872,118 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
     const joined = logs.join('\n');
     expect(joined).toContain(realRetryInstruction);
     expect(joined).not.toContain(FULL_SELECT_EXACTLY_LINE);
+  });
+
+  // --- groundnuty/macf#1173 — the decisive cross-surface tests -----------
+  //
+  // Everything above proves the TERMINAL narrows on a resumed gate. It says
+  // nothing about the served interstitial — and before #1173, the page had
+  // ZERO delta-awareness: `renderInstallInterstitial` built its own text
+  // straight from `repos`/`whyText`, ignoring whatever `instructionLines`
+  // the terminal was given. That gap is the operator-witnessed incident
+  // #1173 reports (terminal said "missing access to macf-fresh-control";
+  // the page still listed the full original set).
+  //
+  // Per the issue's own testing mandate, these tests assert the two
+  // surfaces against EACH OTHER — the terminal's `logs` array and the
+  // interstitial's captured `opts.messageLines` / rendered HTML — never
+  // against a second, independently-typed literal. Two literals can both
+  // "look right" while drifting (that is exactly how this reached four
+  // instances); comparing captured outputs to each other cannot.
+
+  it('DECISIVE: on a resumed gate, every line the terminal prints for gate 2 is present, verbatim, in the served interstitial — asserted against each other, never against a literal', async () => {
+    const logs: string[] = [];
+    let seenOpts: InstallInterstitialOptions | undefined;
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      startInstallInterstitial: async (opts) => {
+        seenOpts = opts;
+        return fakeInterstitialHandles();
+      },
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
+      findRecoveryArtifact: async () => RECOVERED,
+      validateInstall: () => ({ message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION }),
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
+    });
+
+    await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+
+    expect(seenOpts).toBeDefined();
+    const messageLines = seenOpts!.messageLines;
+    expect(messageLines.length).toBeGreaterThan(0);
+
+    // Surface 1 (terminal): every messageLines entry was actually logged,
+    // in the SAME `Role "<role>": <line>` form `announceAndOpenGate` uses.
+    for (const line of messageLines) {
+      expect(logs).toContain(`Role "code-agent": ${line}`);
+    }
+
+    // Surface 2 (browser): render the ACTUAL captured opts (not a re-typed
+    // fixture) and confirm every rendered <li> is exactly one escaped
+    // messageLines entry, in order — nothing the page adds, nothing it
+    // drops.
+    const html = renderInstallInterstitial(seenOpts!);
+    const items = Array.from(html.matchAll(/<li>([\s\S]*?)<\/li>/g)).map((m) => m[1]);
+    expect(items).toEqual(messageLines.map((line) => escapeHtmlAttribute(line)));
+
+    // And it IS the resumed-gate delta (groundnuty/macf#1160's own fix),
+    // now proven present on BOTH surfaces — not the stale full-list
+    // restatement #1173 reports the page as showing.
+    expect(messageLines).toContain(SENTINEL_RETRY_INSTRUCTION);
+    expect(messageLines.join('\n')).not.toContain(FULL_SELECT_EXACTLY_LINE);
+  });
+
+  it('DECISIVE: on a FIRST (non-resumed) gate, the terminal and the served interstitial ALSO agree — both show the full "select exactly" set', async () => {
+    const logs: string[] = [];
+    let seenOpts: InstallInterstitialOptions | undefined;
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      startInstallInterstitial: async (opts) => {
+        seenOpts = opts;
+        return fakeInterstitialHandles();
+      },
+    }); // no findRecoveryArtifact — the ordinary fresh-create path
+
+    const outcome = await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+    expect(outcome.status).toBe('created');
+
+    expect(seenOpts).toBeDefined();
+    const messageLines = seenOpts!.messageLines;
+    for (const line of messageLines) {
+      expect(logs).toContain(`Role "code-agent": ${line}`);
+    }
+    const html = renderInstallInterstitial(seenOpts!);
+    const items = Array.from(html.matchAll(/<li>([\s\S]*?)<\/li>/g)).map((m) => m[1]);
+    expect(items).toEqual(messageLines.map((line) => escapeHtmlAttribute(line)));
+    expect(messageLines.join('\n')).toContain(FULL_SELECT_EXACTLY_LINE);
+  });
+
+  it('groundnuty/macf#1173 — HTML escaping survives the shared-source refactor: a messageLines entry with `<`/`&`/`"` renders raw in the terminal but escaped (inert) on the served page', async () => {
+    const logs: string[] = [];
+    let seenOpts: InstallInterstitialOptions | undefined;
+    const DANGEROUS_RETRY_INSTRUCTION = 'add "groundnuty/<script>evil()</script>" & retry';
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      startInstallInterstitial: async (opts) => {
+        seenOpts = opts;
+        return fakeInterstitialHandles();
+      },
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
+      findRecoveryArtifact: async () => RECOVERED,
+      validateInstall: () => ({ message: 'technical detail, terminal/--json only', retryInstruction: DANGEROUS_RETRY_INSTRUCTION }),
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
+    });
+
+    await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+
+    // The terminal is a human-read log — raw text, no escaping needed.
+    expect(logs.join('\n')).toContain(DANGEROUS_RETRY_INSTRUCTION);
+    // The served page is HTML — the SAME text must never appear un-escaped,
+    // proving the shared-source refactor did not drop the boundary escape.
+    expect(seenOpts).toBeDefined();
+    const html = renderInstallInterstitial(seenOpts!);
+    expect(html).not.toContain('<script>evil()</script>');
+    expect(html).toContain(escapeHtmlAttribute(DANGEROUS_RETRY_INSTRUCTION));
   });
 });
 
