@@ -561,6 +561,169 @@ describe('applyAgentIdentity — recovery-artifact consume path (create path onl
   });
 });
 
+// --- groundnuty/macf#1137 — pre-gate-2 observation on the recovery path ---
+
+describe('applyAgentIdentity — pre-gate-2 install observation on the recovery path (groundnuty/macf#1137)', () => {
+  const RECOVERED: AppCredentials = {
+    appId: 'recovered-app-id',
+    name: 'demo-fleet-code-agent',
+    slug: 'demo-fleet-code-agent',
+    clientId: 'Iv1.recovered',
+    clientSecret: 'SENTINEL-RECOVERED-CLIENT-SECRET',
+    webhookSecret: 'SENTINEL-RECOVERED-WEBHOOK-SECRET',
+    pem: '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-RECOVERED-PEM\n-----END RSA PRIVATE KEY-----\n',
+  };
+  const CONFIRMED_INSTALL: ConfirmedInstall = {
+    appId: RECOVERED.appId,
+    installId: '9999',
+    appSlug: RECOVERED.slug,
+    accountLogin: 'groundnuty',
+    repositorySelection: 'selected',
+  };
+
+  // Decisive pair, case 1: an install that EXISTS on GitHub but is ABSENT
+  // from the vault (the exact shape macf#1137 reported: a recovered
+  // credential whose fleet.lock/vault never recorded the role). Per
+  // assert-the-wrong-path.md, asserting only `outcome.status === 'created'`
+  // would still pass against the OLD (broken) code — that code also reports
+  // 'created' once the operator eventually clicks through the gate. The
+  // decisive assertion is that the gate NEVER opened: zero interstitial/
+  // openUrl calls.
+  it('decisive pair (1): install already exists + is correctly scoped -> NO gate opened, work proceeds, the mismatch is reported', async () => {
+    const startInstallInterstitial = vi.fn();
+    const openUrl = vi.fn(async () => {});
+    const logs: string[] = [];
+    const confirmAppInstallation = vi.fn(async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation);
+    const deps = baseDeps({
+      startInstallInterstitial,
+      openUrl,
+      log: (l) => logs.push(l),
+      confirmAppInstallation,
+      findRecoveryArtifact: async () => RECOVERED,
+      // Mirrors apply-fleet.ts's real wiring (buildInstallScopeValidator) —
+      // a validateInstall hook IS present in production; the check above
+      // must be honored by it too, not bypassed.
+      validateInstall: (install) => (install.repositorySelection === 'selected' ? undefined : 'wrong scope'),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    // The decisive assertion — the gate's OWN seams were never invoked.
+    expect(startInstallInterstitial).not.toHaveBeenCalled();
+    expect(openUrl).not.toHaveBeenCalled();
+
+    expect(outcome.status).toBe('created');
+    if (outcome.status === 'created') {
+      expect(outcome.appId).toBe(RECOVERED.appId);
+      expect(outcome.installId).toBe('9999');
+      expect(outcome.credentials).toEqual(RECOVERED);
+    }
+
+    // Reused the existing install-confirm primitive, on the recovered
+    // App's real id + the recovered PEM (never a second implementation).
+    expect(confirmAppInstallation).toHaveBeenCalledTimes(1);
+    expect(confirmAppInstallation.mock.calls[0]?.[0]).toBe(RECOVERED.appId);
+
+    // The vault/GitHub mismatch is reported, not silently absorbed.
+    const joined = logs.join('\n');
+    expect(joined).toMatch(/vault.*never recorded|drift/i);
+
+    // Never logs a secret value on the skip-gate path either (the hard
+    // constraint applies here too, not only on the normal gate-2 path the
+    // pre-existing "NEVER logs a secret value" test already covers).
+    expect(joined).not.toContain('SENTINEL-RECOVERED-CLIENT-SECRET');
+    expect(joined).not.toContain('SENTINEL-RECOVERED-WEBHOOK-SECRET');
+    expect(joined).not.toContain('SENTINEL-RECOVERED-PEM');
+  });
+
+  // Decisive pair, case 2: an install that genuinely does NOT exist ->
+  // gate opens, exactly as today.
+  it('decisive pair (2): install genuinely does not exist -> gate opens as today', async () => {
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const deps = baseDeps({
+      startInstallInterstitial,
+      confirmAppInstallation: async () => ({ status: 'app-no-install' }),
+      findRecoveryArtifact: async () => RECOVERED,
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '7001', appSlug: RECOVERED.slug, accountLogin: 'groundnuty' }),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
+    expect(outcome.status).toBe('created');
+    if (outcome.status === 'created') expect(outcome.installId).toBe('7001');
+  });
+
+  // Honest-unknown floor: a credential that CANNOT observe installs ->
+  // gate opens, AND the log states why (never silently gated).
+  it('a credential that cannot observe installs (unconfirmable) -> gate opens, and the log states why', async () => {
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const logs: string[] = [];
+    const deps = baseDeps({
+      startInstallInterstitial,
+      log: (l) => logs.push(l),
+      confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
+      findRecoveryArtifact: async () => RECOVERED,
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '7002', appSlug: RECOVERED.slug, accountLogin: 'groundnuty' }),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1); // the gate opened
+    expect(outcome.status).toBe('created');
+    // ...AND the operator is told why the shortcut wasn't taken.
+    expect(logs.join('\n')).toMatch(/could not confirm whether the install already exists/);
+  });
+
+  it('a THROWING confirmAppInstallation is fail-open (inconclusive, never a silent skip) -> gate opens, log states why', async () => {
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const logs: string[] = [];
+    const deps = baseDeps({
+      startInstallInterstitial,
+      log: (l) => logs.push(l),
+      confirmAppInstallation: async () => {
+        throw new Error('gh api unreachable');
+      },
+      findRecoveryArtifact: async () => RECOVERED,
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '7003', appSlug: RECOVERED.slug, accountLogin: 'groundnuty' }),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
+    expect(outcome.status).toBe('created');
+    expect(logs.join('\n')).toMatch(/pre-gate-2 install check threw/);
+  });
+
+  it('confirmed but validateInstall REJECTS (wrong scope) -> does NOT weaken the install-scope refusal — falls through to the normal gate-2 flow, never silently accepted', async () => {
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const badScopeInstall: ConfirmedInstall = { ...CONFIRMED_INSTALL, repositorySelection: 'all' };
+    const deps = baseDeps({
+      startInstallInterstitial,
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: badScopeInstall }),
+      validateInstall: (install) => (install.repositorySelection === 'selected' ? undefined : 'wrong scope'),
+      findRecoveryArtifact: async () => RECOVERED,
+      // Once the gate re-opens, the SAME (bad-scope) install is what a
+      // real waitForAppInstallation would observe again.
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'all' }),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    // The gate was NOT silently skipped for a mis-scoped install.
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
+    expect(outcome.status).toBe('failed');
+  });
+
+  it('is a no-op on the FRESH-mint (viaRecovery: false) path — confirmAppInstallation is never called for a just-created App', async () => {
+    const confirmAppInstallation = vi.fn(async () => ({ status: 'unconfirmable' }) as IdentityConfirmation);
+    const deps = baseDeps({ confirmAppInstallation }); // no findRecoveryArtifact — ordinary create path
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('created');
+    expect(confirmAppInstallation).not.toHaveBeenCalled();
+  });
+});
+
 describe('applyAgentIdentity — non-create outcomes short-circuit before any gate', () => {
   const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
 

@@ -20,7 +20,12 @@
  *      exactly the shape a gate-1-succeeded/gate-2-interrupted prior run
  *      leaves behind, so resuming here rather than re-creating is what makes
  *      that class of partial failure recoverable, module doc §"the gate
- *      1→2 window" below).
+ *      1→2 window" below). A credential recovered from a durable artifact
+ *      (macf#988) is checked live BEFORE this gate opens
+ *      ({@link skipGate2IfAlreadyInstalled}, groundnuty/macf#1137) — the
+ *      install itself may already be confirmed from the prior run even
+ *      though THIS run's vault never recorded it, and gate 2 is skipped
+ *      entirely when so.
  *
  * Both gates share one UX sequence ({@link announceAndOpenGate}): print the
  * URL, best-effort-open it in the operator's browser, then log what's being
@@ -965,6 +970,96 @@ export async function applyIdentity(
 }
 
 /**
+ * groundnuty/macf#1137 — the pre-gate-2 observation for a RECOVERED
+ * credential ({@link finishGate2FromCredentials}'s `viaRecovery: true`
+ * caller only — see that function's call site). A credential recovered
+ * from a durable artifact resumes a PRIOR run's gate 1; by construction
+ * THIS run's `fleet.lock`/vault never recorded the role (that absence is
+ * exactly why `applyIdentity`'s `findRecoveryArtifact` branch fired at
+ * all), but the INSTALL itself may already be confirmed on GitHub from
+ * that prior run. Opening gate 2 to ask the operator to click "Install"
+ * for an App that is already installed spends the tool's most expensive
+ * ask (DR-044) on work that is already done — the only work actually
+ * remaining is the vault write `apply-fleet.ts` performs with this
+ * function's returned `credentials`.
+ *
+ * Reuses `deps.confirmAppInstallation` — the SAME install-confirm
+ * primitive `confirmBeforeCreateGuard` above already calls for a role WITH
+ * a prior `fleet.lock` entry — rather than adding a second implementation
+ * of "does this App already have a confirmed install" (the drift class
+ * `install-scope.ts`'s module doc catalogs: independently-maintained
+ * copies of the same GitHub-observation drifting apart). Unlike the
+ * org-owner-scoped `GET /orgs/{org}/installations` listing
+ * (`app-presence.ts`/`observer.ts`'s `listOrgInstallRepositorySelections`,
+ * used by `plan`'s fleet-wide drift scan), this primitive mints a JWT from
+ * the App's OWN key and asks `GET /app/installations` — authoritative for
+ * "is THIS App installed" regardless of org ownership, and it already
+ * carries `repositorySelection` for {@link AgentApplyDeps.validateInstall}
+ * to re-check, so one call answers both "does it exist" and "is it
+ * correctly scoped."
+ *
+ * Returns the short-circuit `AgentApplyOutcome` (skip gate 2 entirely) ONLY
+ * when GitHub confirms the install exists AND `deps.validateInstall`
+ * accepts it; `undefined` (fall through to the normal gate-2 flow)
+ * otherwise:
+ *
+ *   - `app-no-install` / `installed-unexpected-target` — the install
+ *     genuinely isn't there (yet, or not where expected). Gate opens,
+ *     exactly as before this fix.
+ *   - `unconfirmable` — the credential could not observe the install THIS
+ *     TIME (JWT-mint failure, 401, network, timeout). DR-043 Amendment A's
+ *     honest-unknown floor: never read as "absent," so the gate still
+ *     opens — but `deps.log` states WHY it couldn't skip, rather than
+ *     silently gating with no explanation.
+ *   - `confirmed` but `deps.validateInstall` rejects (wrong repo scope,
+ *     unreachable registry repo) — never silently accepted as "already
+ *     done" (this must not weaken the `install-scope.ts` refusal). The
+ *     normal gate-2 flow re-observes the SAME confirmed install almost
+ *     immediately (the poll's first check) and reports the identical
+ *     rejection through the established `allowInstallRetry` reopen loop —
+ *     no new failure handling invented here.
+ *   - A throwing `deps.confirmAppInstallation` is fail-open (inconclusive,
+ *     never a silent skip) — same posture `checkAppNameCollision`'s own
+ *     catch takes just above in {@link applyIdentity}.
+ */
+async function skipGate2IfAlreadyInstalled(
+  role: string,
+  creds: AppCredentials,
+  expected: ExpectedIdentity,
+  pemPath: string,
+  deps: AgentApplyDeps,
+): Promise<AgentApplyOutcome | undefined> {
+  let confirmation: IdentityConfirmation;
+  try {
+    confirmation = await deps.confirmAppInstallation(creds.appId, pemPath, expected);
+  } catch (err) {
+    deps.log(
+      `Role "${role}": pre-gate-2 install check threw (${errMessage(err)}) — cannot confirm whether the install ` +
+        'already exists; opening consent gate 2 to be safe.',
+    );
+    return undefined;
+  }
+  if (confirmation.status === 'unconfirmable') {
+    deps.log(
+      `Role "${role}": could not confirm whether the install already exists (GitHub was never successfully asked — ` +
+        'JWT mint failure, 401, network, or timeout) — opening consent gate 2 to be safe.',
+    );
+    return undefined;
+  }
+  if (confirmation.status !== 'confirmed') return undefined; // app-no-install / installed-unexpected-target — genuinely needs the gate.
+
+  const rejection = await deps.validateInstall?.(confirmation.install, pemPath);
+  if (rejection !== undefined) return undefined; // exists, but scope/coverage is wrong — real work remains; let the normal gate-2 flow handle it.
+
+  deps.log(
+    `Role "${role}": install already confirmed on GitHub (install_id ${confirmation.install.installId}) — skipping ` +
+      "consent gate 2. This fleet's vault never recorded this role's install (that mismatch is why the recovery " +
+      'path resumed here) — a vault/GitHub drift worth reconciling.',
+  );
+  return { role, status: 'created', appId: creds.appId, installId: confirmation.install.installId, credentials: creds };
+}
+
+/**
  * Run (or resume) consent gate 2 for a role whose credential is ALREADY
  * known — either freshly minted via gate 1 moments ago, or recovered from a
  * durable artifact a PRIOR run's gate 1 left behind before it crashed
@@ -972,9 +1067,12 @@ export async function applyIdentity(
  * {@link applyIdentity}'s `deps.findRecoveryArtifact` call site). Both
  * paths report the IDENTICAL `status: 'created'` shape — `apply-fleet.ts`'s
  * vault-fold logic only cares that credentials exist to fold in, never
- * which path produced them. `viaRecovery` changes only the wording of a
+ * which path produced them. `viaRecovery` changes the wording of a
  * gate-2-failure reason (naming the credential's origin for an operator
- * reading the transcript), never the control flow.
+ * reading the transcript) AND, per groundnuty/macf#1137, runs
+ * {@link skipGate2IfAlreadyInstalled} FIRST — the fresh-mint path
+ * (`viaRecovery: false`) never does, since an App gate 1 just created
+ * cannot already have an install.
  *
  * **Why the recovered path does NOT call `deps.writeRecoveryArtifact`
  * again:** `AgentApplyDeps.writeRecoveryArtifact`'s own doc says "called
@@ -1001,6 +1099,10 @@ async function finishGate2FromCredentials(
   const gate2Expected: ExpectedIdentity = { appSlug: creds.slug, accountLogin: manifest.owner.account };
   const pemPath = writeScratchPem(role, creds.pem);
   try {
+    if (viaRecovery) {
+      const skip = await skipGate2IfAlreadyInstalled(role, creds, gate2Expected, pemPath, deps);
+      if (skip !== undefined) return skip;
+    }
     const firstAttempt = await runGate2WithInterstitial(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, {});
     // groundnuty/macf#1063 — the SAME recoverable-rejection retry the
     // resume-install path gets (see that call site's doc); a no-op unless
