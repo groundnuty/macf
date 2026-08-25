@@ -3476,6 +3476,79 @@ trust:
       expect(applyExitCode(result)).toBe(1);
     });
 
+    // --- groundnuty/macf#1162 — the fleet-level aggregate fact, exercised
+    // through the REAL publish pipeline (not hand-built results) — this is
+    // what actually proves the `ensureVariableCreated` label-stripping fix
+    // (`apply-routing-secrets.ts::stripRepoLegLabel`) works end to end, not
+    // just at the pure-function level: every repo's failure reason for the
+    // SAME cause is prefixed with THAT repo's own name by
+    // `ensureVariableCreated`'s label, and only the strip lets the
+    // aggregator see through that to the shared root cause. ---
+    it('DECISIVE: every router-carrying repo fails for the SAME underlying cause -> ONE "Fleet-level: ... CANNOT route" log line, additive to (not instead of) the per-repo detail', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const logs: string[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedAgentDeps(), manifestPath),
+        trustDeps: reuseCaTrustDeps(),
+        log: (l) => logs.push(l),
+        routingClientDeps: {
+          mint: async () => { throw new Error('must not be called — a routing_client_key fingerprint is already recorded'); },
+          readVaultRoutingClient: async () => ({ certPem: 'CERT-PEM', keyPem: 'KEY-PEM' }),
+        },
+        routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '997', appKeyPem: 'ROUTER-APP-VAULT-PEM' }) },
+        routingSecretsDeps: routingSecretsDepsFor({
+          checkRepoSecretPresence: async () => 'absent',
+          setRepoSecret: async () => { throw new Error('simulated total routing outage'); },
+        }),
+      };
+
+      await applyFleet(manifest, manifestPath, PRIOR_LOCK_TWO_AGENTS, deps);
+
+      const fleetLines = logs.filter((l) => l.startsWith('Fleet-level:'));
+      expect(fleetLines).toHaveLength(1);
+      expect(fleetLines[0]).toContain('CANNOT route');
+      // Names the ONE shared cause, not a per-repo-mangled variant of it —
+      // proves the label-stripping fix, not just that SOME line fired.
+      expect(fleetLines[0]).toContain('simulated total routing outage');
+      // Additive, not a replacement — the per-repo detail is STILL there:
+      const detailLines = logs.filter((l) => l.includes('" leg (') && l.includes('failed'));
+      expect(detailLines.length).toBeGreaterThan(0);
+    });
+
+    it('one router-carrying repo already has every secret (untouched); another genuinely fails -> NO "Fleet-level:" line — the negative half that gives the positive half meaning', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const logs: string[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedAgentDeps(), manifestPath),
+        trustDeps: reuseCaTrustDeps(),
+        log: (l) => logs.push(l),
+        routingClientDeps: {
+          mint: async () => { throw new Error('must not be called — a routing_client_key fingerprint is already recorded'); },
+          readVaultRoutingClient: async () => ({ certPem: 'CERT-PEM', keyPem: 'KEY-PEM' }),
+        },
+        routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '997', appKeyPem: 'ROUTER-APP-VAULT-PEM' }) },
+        routingSecretsDeps: routingSecretsDepsFor({
+          // groundnuty/demo-code ALREADY has every secret (present, no
+          // create attempt, no failure); groundnuty/demo-science is absent
+          // and genuinely fails to create — a MIXED result, not uniform.
+          checkRepoSecretPresence: async (repo) => (repo === 'groundnuty/demo-code' ? 'present' : 'absent'),
+          setRepoSecret: async () => { throw new Error('simulated partial outage'); },
+        }),
+      };
+
+      await applyFleet(manifest, manifestPath, PRIOR_LOCK_TWO_AGENTS, deps);
+
+      // THE assertion this test exists for: no false "always emit" pass —
+      // a mixed result must NOT read as a fleet-level fact.
+      expect(logs.some((l) => l.startsWith('Fleet-level:'))).toBe(false);
+      // "No fleet claim" does not mean "no detail" — the failing repo's
+      // OWN row is still reported (per-agent detail stays, per the issue's
+      // own requirement).
+      expect(logs.some((l) => l.includes('groundnuty/demo-science') && l.includes('failed'))).toBe(true);
+    });
+
     it('groundnuty/macf#1071 — idempotent re-run: a control repo that ALREADY holds the routing-client secrets reports "already-present" for both, never re-minted, never re-written', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT]);

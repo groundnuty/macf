@@ -279,6 +279,7 @@ import {
   ROUTING_APP_KEY_SECRET_NAME,
   TS_OAUTH_CLIENT_ID_SECRET_NAME,
   TS_OAUTH_SECRET_SECRET_NAME,
+  determineFleetRoutingFact,
   publishRoutingBundle,
   publishRoutingSecrets,
   skippedRoutingBundlePublish,
@@ -2131,6 +2132,25 @@ export async function applyFleet(
     [TS_OAUTH_SECRET_SECRET_NAME]: tsOauthSecret,
   };
   const routingSecretsPublish: RoutingSecretsPublishResult = await publishRoutingSecrets(routingSecretsForPublish, routerCarryingRepos, deps.routingSecretsDeps);
+
+  // groundnuty/macf#1162 — the FLEET-LEVEL fact the per-repo/per-secret
+  // rows below jointly determine but never state on their own (the exact
+  // gap #1132 also found in `routing doctor`'s per-repo-consistency
+  // report). Rendered BEFORE the per-secret detail so the operator reads
+  // the headline first; the per-secret rows are UNCHANGED below — this is
+  // additive, never a replacement for the diagnostic detail.
+  const routingFact = determineFleetRoutingFact(routingSecretsPublish, routerCarryingRepos);
+  if (routingFact.kind === 'all-failed') {
+    deps.log(
+      `Fleet-level: this fleet CANNOT route — every router-carrying repo (${String(routerCarryingRepos.length)}) ` +
+        `failed at least one routing secret (${routingFact.reason}).`,
+    );
+  } else if (routingFact.kind === 'unknown') {
+    deps.log('Fleet-level: routing status could not be determined this run — no router-carrying repos were observed.');
+  }
+  // 'no-claim' (some repos failed, others didn't, or none did): deliberately
+  // SILENT here — no fleet-wide statement is honest for a partial result;
+  // the per-repo rows below are where that detail lives.
 
   for (const name of Object.keys(routingSecretsForPublish) as (keyof RoutingSecretsForPublish)[]) {
     const legs = routingSecretsPublish[name];
