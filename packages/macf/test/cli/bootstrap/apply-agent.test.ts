@@ -19,7 +19,7 @@ import {
 import type { FleetAgent, FleetLockAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import type { ConfirmedInstall, IdentityConfirmation } from '../../../src/cli/bootstrap/identity-confirm.js';
-import { escapeHtmlAttribute, renderInstallInterstitial, startInstallInterstitial as realStartInstallInterstitial } from '../../../src/cli/bootstrap/manifest-flow-server.js';
+import { CANCEL_LABEL, CHECK_AGAIN_LABEL, escapeHtmlAttribute, renderInstallInterstitial, startInstallInterstitial as realStartInstallInterstitial } from '../../../src/cli/bootstrap/manifest-flow-server.js';
 import type { InstallInterstitialHandles, InstallInterstitialOptions, ManifestFlowHandles } from '../../../src/cli/bootstrap/manifest-flow-server.js';
 import { appNameCollisionRefusalMessage, resolveAppPresenceStatus } from '../../../src/cli/bootstrap/app-presence.js';
 import { registryRepoNotInstalledReason, registryRepoRetryInstruction } from '../../../src/cli/bootstrap/registry-repo-coverage.js';
@@ -71,11 +71,15 @@ function fakeInterstitialHandles(): InstallInterstitialHandles {
  * groundnuty/macf#1176 — extracts the `<pre>` content under the named `<h2>`
  * heading, split into lines. Superseded the `<li>`-per-`messageLines`-entry
  * shape #1173 pinned (`renderInstallInterstitial` now renders two distinct
- * `<pre>` blocks — see that function's own doc).
+ * `<pre>` blocks — see that function's own doc). The `<pre[^>]*>` form
+ * (groundnuty/macf#1179) tolerates the `class="macf-repos"`/`class=
+ * "macf-instructions"` attribute the CSS-class split added — this helper
+ * extracts CONTENT, the class-split's own tests assert the classes
+ * themselves (`manifest-flow-server.test.ts`).
  */
 function extractPreBlock(html: string, heading: string): readonly string[] {
   const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`<h2>${escapedHeading}<\\/h2>\\n<pre>([\\s\\S]*?)<\\/pre>`);
+  const re = new RegExp(`<h2>${escapedHeading}<\\/h2>\\n<pre[^>]*>([\\s\\S]*?)<\\/pre>`);
   const match = re.exec(html);
   return match ? match[1]!.split('\n') : [];
 }
@@ -1583,6 +1587,64 @@ describe('instruction-before-navigation ordering (the decisive test, groundnuty/
   });
 });
 
+// --- groundnuty/macf#1179 — the ANNOUNCE line precedes the instructions,
+// which precede the page opening — asserted in EMITTED ORDER, not merely
+// "both present somewhere". The operator's own model: (1) announce a window
+// will open, (2) print the instructions, (3) the browser shows them too,
+// (4) state waiting and block. A test that only checked the announce
+// sentence EXISTS would pass even if it were logged after the instructions
+// or after the browser already opened — exactly the ordering bug #952/#971
+// already fixed once for the instructions-vs-open pair; this pins the THIRD
+// event into the same chain.
+
+describe('announce-before-instructions-before-open ordering (the decisive test, groundnuty/macf#1179)', () => {
+  it('gate 1: the announce line ("a window will open") is logged BEFORE any instruction line, which is logged BEFORE openUrl', async () => {
+    const events: string[] = [];
+    const deps = baseDeps({
+      log: (line: string) => { events.push(`log:${line}`); },
+      openUrl: async (url: string) => { events.push(`open:${url}`); },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    const announceIndex = events.findIndex((e) => e.startsWith('log:') && /window will open/i.test(e));
+    const firstInstructionIndex = events.findIndex((e) => e.startsWith('log:') && /creating GitHub App/i.test(e));
+    const openIndex = events.findIndex((e) => e === 'open:http://127.0.0.1:9/');
+
+    expect(announceIndex).toBeGreaterThanOrEqual(0);
+    expect(firstInstructionIndex).toBeGreaterThanOrEqual(0);
+    expect(openIndex).toBeGreaterThanOrEqual(0);
+    expect(announceIndex).toBeLessThan(firstInstructionIndex);
+    expect(firstInstructionIndex).toBeLessThan(openIndex);
+  });
+
+  it('gate 2: the announce line ALSO precedes the "Only select repositories" instruction, which precedes openUrl(interstitial.startUrl)', async () => {
+    const events: string[] = [];
+    const deps = baseDeps({
+      log: (line: string) => { events.push(`log:${line}`); },
+      openUrl: async (url: string) => { events.push(`open:${url}`); },
+      startInstallInterstitial: async () => fakeInterstitialHandles(),
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    const instructionIndex = events.findIndex((e) => e.startsWith('log:') && e.includes('Only select repositories'));
+    const gate2OpenIndex = events.findIndex((e) => e === `open:${FAKE_INTERSTITIAL_URL}`);
+
+    // At least one announce line exists before gate 2's open — narrow to the
+    // LAST announce line before that open (gate 1's own announce fired
+    // earlier in the same run; this asserts gate 2's, not gate 1's).
+    const announceIndicesBeforeOpen = events
+      .map((e, i) => ({ e, i }))
+      .filter(({ e, i }) => e.startsWith('log:') && /window will open/i.test(e) && i < gate2OpenIndex);
+    expect(announceIndicesBeforeOpen.length).toBeGreaterThan(0);
+    const lastAnnounceBeforeGate2Open = announceIndicesBeforeOpen[announceIndicesBeforeOpen.length - 1]!.i;
+
+    expect(instructionIndex).toBeGreaterThanOrEqual(0);
+    expect(gate2OpenIndex).toBeGreaterThanOrEqual(0);
+    expect(lastAnnounceBeforeGate2Open).toBeLessThan(instructionIndex);
+    expect(instructionIndex).toBeLessThan(gate2OpenIndex);
+  });
+});
+
 // --- groundnuty/macf#952 follow-up — the operator-beat happens AFTER the
 // instructions are logged and BEFORE the browser opens ---
 //
@@ -1999,5 +2061,227 @@ describe('groundnuty/macf#1063 — recoverable consent-gate-2 rejection re-opens
     const issueRefPattern = /#\d+|DR-\d+/i;
     expect(logs.join('\n')).not.toMatch(issueRefPattern);
     if (outcome.status === 'failed') expect(outcome.reason).not.toMatch(issueRefPattern);
+  });
+});
+
+// --- groundnuty/macf#1179 — "check again" wakes the resumed-gate poll ------
+//
+// `pollForInstallFix`'s ordinary tick cadence is a TIMER (15s default,
+// `pollIntervalMs` here). These tests set that timer to something the test's
+// own timeout could never survive (10 minutes) — if "check again" were NOT
+// wired to interrupt the sleep, the run would still be waiting on the timer
+// when the test itself times out, and the assertion below would never even
+// run. That is the negative trigger: it is not "the run eventually succeeds"
+// (true even without this feature, given enough wall-clock time) but "the
+// run succeeds FAST, inside a budget that only makes sense if the click
+// short-circuited the wait."
+
+describe('"check again" continues the SAME invocation (groundnuty/macf#1179)', () => {
+  const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
+  const REUSE_INSTALL: ConfirmedInstall = { appId: '9001', installId: '5555', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty', repositorySelection: 'selected' };
+  const MISSING_REPO_REASON = registryRepoNotInstalledReason('demo-fleet-code-agent', 'groundnuty', 'demo-fleet-control');
+  const TEN_MINUTES_MS = 10 * 60 * 1000;
+
+  it('DECISIVE: a click resolves waitForCheckAgain(), the poll re-checks immediately, validate now accepts, and applyAgentIdentity resolves — all inside one invocation, well under the 10-minute poll interval', async () => {
+    let checkAgainResolve: (() => void) | undefined;
+    const checkAgainPromise = new Promise<void>((res) => { checkAgainResolve = res; });
+    let validateReuseCalls = 0;
+    const deps = baseDeps({
+      startInstallInterstitial: async () => ({
+        startUrl: FAKE_INTERSTITIAL_URL,
+        close: () => Promise.resolve(),
+        waitForCheckAgain: () => checkAgainPromise,
+        updateContent: () => {},
+      }),
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      gateTimeoutMs: TEN_MINUTES_MS,
+      pollIntervalMs: TEN_MINUTES_MS,
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        return validateReuseCalls === 1 ? MISSING_REPO_REASON : undefined;
+      },
+    });
+
+    const outcomePromise = applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    // Give the poll's FIRST (immediate) tick a moment to run and observe the
+    // rejection, then simulate the operator's click.
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    checkAgainResolve?.();
+
+    const outcome = await outcomePromise;
+    expect(validateReuseCalls).toBe(2); // the pre-flight check, then the check-again-triggered re-check
+    expect(outcome).toEqual({ role: 'code-agent', status: 'reused', appId: '9001', installId: '5555' });
+  }, 5000);
+
+  it('NEGATIVE — with the SAME 10-minute interval and NO click ever arriving, the run is still in flight after a short window (proves the fast path above is not just "polling is fast anyway")', async () => {
+    const deps = baseDeps({
+      startInstallInterstitial: async () => fakeInterstitialHandles(), // waitForCheckAgain omitted -> never fires
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      gateTimeoutMs: TEN_MINUTES_MS,
+      pollIntervalMs: TEN_MINUTES_MS,
+      validateReuse: async () => MISSING_REPO_REASON, // never fixed
+    });
+
+    const outcomePromise = applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    const stillPending = Symbol('still-pending');
+    const race = await Promise.race([
+      outcomePromise,
+      new Promise((resolve) => { setTimeout(() => resolve(stillPending), 100); }),
+    ]);
+    expect(race).toBe(stillPending);
+  });
+});
+
+// --- groundnuty/macf#1179 — "cancel this identity" ends ONE gate-2 wait ----
+
+describe('"cancel this identity" (groundnuty/macf#1179)', () => {
+  it('DECISIVE: cancel ends the wait immediately with a cancel-specific reason — never the "orphaned App, finish manually" wording a genuine failure gets', async () => {
+    const deps = baseDeps({
+      startInstallInterstitial: async () => ({
+        startUrl: FAKE_INTERSTITIAL_URL,
+        close: () => Promise.resolve(),
+        waitForCancel: () => Promise.resolve(), // "already clicked" by the time the wait starts
+      }),
+      // Never resolves on its own — ONLY the cancel race can end this wait.
+      waitForAppInstallation: () => new Promise(() => { /* hangs forever */ }),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).toContain('cancelled by the operator');
+      expect(outcome.reason).not.toContain('orphaned');
+      expect(outcome.reason).not.toContain('finish the install manually');
+    }
+  }, 5000);
+
+  it('NEGATIVE — a genuine gate-2 failure (cancel never fires) gets the "App WAS created... finish manually" framing, and NEVER the cancel wording — the two failure shapes stay textually distinguishable', async () => {
+    const deps = baseDeps({
+      startInstallInterstitial: async () => fakeInterstitialHandles(), // waitForCancel omitted -> never fires
+      waitForAppInstallation: async () => { throw new Error('simulated poll failure — not a cancel'); },
+    });
+
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).not.toContain('cancelled by the operator');
+      expect(outcome.reason).toContain('the App WAS created on GitHub');
+    }
+  });
+
+  it('a cancel is never treated as `recoverable` — #1063\'s reopen loop must not retry a deliberate cancel even when allowInstallRetry is set', async () => {
+    const startInstallInterstitial = vi.fn(async () => ({
+      startUrl: FAKE_INTERSTITIAL_URL,
+      close: () => Promise.resolve(),
+      waitForCancel: () => Promise.resolve(),
+    }));
+    const deps = baseDeps({
+      startInstallInterstitial,
+      allowInstallRetry: true,
+      waitForOperatorFix: async () => {},
+      waitForAppInstallation: () => new Promise(() => { /* hangs forever */ }),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('failed');
+    // Exactly ONE page open — a reopen would mean the cancel was mistaken
+    // for a recoverable rejection and re-tried.
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
+  }, 5000);
+});
+
+// --- groundnuty/macf#1179 — #1174's "one message source" extended to the
+// new page buttons: the terminal's mention of them must use the EXACT same
+// two label strings the page's own buttons render — imported from
+// `manifest-flow-server.ts` on both sides of this assertion, never
+// independently re-typed on either.
+
+describe('the new page buttons are also covered by #1174\'s one-message-source discipline (groundnuty/macf#1179)', () => {
+  it('DECISIVE: the terminal line naming the two buttons uses CHECK_AGAIN_LABEL/CANCEL_LABEL verbatim — the SAME constants the served page renders its buttons with', async () => {
+    const logs: string[] = [];
+    let seenOpts: InstallInterstitialOptions | undefined;
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      startInstallInterstitial: async (opts) => {
+        seenOpts = opts;
+        return fakeInterstitialHandles();
+      },
+    });
+
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    // Surface 1 (terminal): the mention line exists and carries BOTH labels
+    // verbatim — not a paraphrase ("you can also cancel", "click check
+    // again again to re-check") that could drift from the page's own text.
+    const mentionLine = logs.find((l) => l.includes(CHECK_AGAIN_LABEL) && l.includes(CANCEL_LABEL));
+    expect(mentionLine).toBeDefined();
+
+    // Surface 2 (browser): render the ACTUAL captured opts and confirm the
+    // page's own buttons carry the SAME two strings.
+    expect(seenOpts).toBeDefined();
+    const html = renderInstallInterstitial(seenOpts!);
+    expect(html).toContain(CHECK_AGAIN_LABEL);
+    expect(html).toContain(CANCEL_LABEL);
+  });
+
+  it('NEGATIVE — when NO real local page exists (the bind-failure fallback to GitHub\'s install URL directly), the terminal never mentions the buttons — they don\'t exist there', async () => {
+    const logs: string[] = [];
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      startInstallInterstitial: async () => { throw new Error('EADDRINUSE'); },
+    });
+
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    const mentionLine = logs.find((l) => l.includes(CHECK_AGAIN_LABEL) || l.includes(CANCEL_LABEL));
+    expect(mentionLine).toBeUndefined();
+  });
+});
+
+// --- groundnuty/macf#1179 — pollForInstallFix actually calls updateContent
+// with the CLASSIFIED diagnosis, not just any narrowed text. gate2-diagnosis
+// .test.ts already proves the classifier itself is correct in isolation;
+// this proves the poll loop actually WIRES it, end to end.
+
+describe('pollForInstallFix narrows the served page via the classifier (groundnuty/macf#1179)', () => {
+  it('a coverage-short rejection (scope selected, missingRepos present) narrows updateContent to the classified coverage-short lines, not the scope-wrong ones', async () => {
+    const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
+    const REUSE_INSTALL: ConfirmedInstall = { appId: '9001', installId: '5555', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty', repositorySelection: 'selected' };
+    const updateCalls: { readonly messageLines: readonly string[]; readonly repoNames: readonly string[] }[] = [];
+    let validateReuseCalls = 0;
+    const deps = baseDeps({
+      startInstallInterstitial: async () => ({
+        startUrl: FAKE_INTERSTITIAL_URL,
+        close: () => Promise.resolve(),
+        updateContent: (messageLines, repoNames) => { updateCalls.push({ messageLines, repoNames }); },
+      }),
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      gateTimeoutMs: 200,
+      pollIntervalMs: 10,
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        // Rejects on call 1 (the pre-flight, OUTSIDE pollForInstallFix —
+        // decides whether gate 2 opens at all) AND call 2 (the poll's own
+        // FIRST tick, INSIDE pollForInstallFix — this is the one that must
+        // reach `updateContent`); accepts on call 3, so the poll's SECOND
+        // tick is what resolves the run.
+        return validateReuseCalls <= 2
+          ? { message: 'registry repo not installed', retryInstruction: 'add groundnuty/demo-fresh-control under Repository access, then Save.', missingRepos: ['groundnuty/demo-fresh-control'] }
+          : undefined;
+      },
+    });
+
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+
+    expect(updateCalls.length).toBeGreaterThan(0);
+    const first = updateCalls[0]!;
+    // Classified as coverage-short (not scope-wrong, not honest-unknown):
+    // the "still missing repository access:" prefix and the repo name.
+    expect(first.messageLines.join('\n')).toContain('still missing repository access:');
+    expect(first.messageLines.join('\n')).not.toContain('still wrong (repository scope)');
+    expect(first.repoNames).toEqual(['demo-fresh-control']); // bare name, per bareRepoNames
   });
 });

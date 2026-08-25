@@ -5963,4 +5963,78 @@ trust:
       expect(reason).toMatch(/not reported by GitHub/);
     });
   });
+
+  // --- groundnuty/macf#1179 — cancelling ONE identity's gate-2 wait never
+  // discards ITS OWN recovery artifact, and never stops the REST of the
+  // fleet. This is the property apply-agent.test.ts's own cancel tests
+  // cannot pin on their own — the recovery artifact's deletion happens in
+  // apply-fleet.ts, gated on `identity.status === 'created'` folding into
+  // `pendingCreatedUpdates` (see this file's "THE DECISIVE ASSERTION" test
+  // above, same shape, different trigger). A cancelled identity's status is
+  // `'failed'`, never `'created'` — so it structurally can never reach that
+  // deletion path; this test proves it with a REAL file on disk, not an
+  // inference from the type.
+  describe('cancelling one identity preserves its recovery artifact and does not affect other agents (groundnuty/macf#1179)', () => {
+    it('code-agent is CANCELLED mid-gate-2 (its own recovery artifact still exists afterward); science-agent completes normally in the SAME run', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const recoveryRootDir = mkdtempSync(join(tmpdir(), 'macf-1179-cancel-recovery-'));
+      dirs.push(recoveryRootDir);
+
+      const agentDeps: AgentApplyDeps = {
+        // `waitForCode` resolves to `opts.role` itself, and `exchangeManifestCode`
+        // treats the "code" as the role — the only way this fixture can hand
+        // back a role-SCOPED credential (`creds(role)`, distinct slug per
+        // role) despite `exchangeManifestCode`'s real signature carrying no
+        // role parameter of its own.
+        startManifestFlow: async (opts) => ({
+          startUrl: `http://x/${opts.role}`, redirectUrl: 'http://x/callback', waitForCode: async () => opts.role, close: async () => {},
+        }),
+        exchangeManifestCode: async (code) => creds(code),
+        confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
+        openUrl: async () => {},
+        log: () => {},
+        writeRecoveryArtifact: async () => {}, // overridden for real by applyFleet regardless — see baseDeps's doc
+        startInstallInterstitial: async (opts) => ({
+          startUrl: `http://x/install/${opts.role}`,
+          close: async () => {},
+          // Cancel fires ONLY for code-agent — science-agent's page is never
+          // clicked "cancel" on, so its own gate 2 must complete normally.
+          waitForCancel: opts.role === 'code-agent' ? (): Promise<void> => Promise.resolve() : undefined,
+        }),
+        waitForAppInstallation: async (opts) => {
+          if (opts.expected.appSlug?.includes('code-agent') === true) {
+            // Never resolves on its own — ONLY the cancel race (above) can
+            // end code-agent's wait. If cancel were NOT wired, this test
+            // would time out instead of asserting anything.
+            return new Promise(() => { /* hangs forever */ });
+          }
+          return { appId: opts.appId, installId: 'install-science', appSlug: opts.expected.appSlug ?? '', accountLogin: 'groundnuty', repositorySelection: 'selected' };
+        },
+      };
+
+      const deps: FleetApplyDeps = { ...baseDeps(agentDeps, manifestPath), recoveryRootDir };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      const codeAgentIdentity = result.agents.find((a) => a.role === 'code-agent')?.identity;
+      const sciAgentIdentity = result.agents.find((a) => a.role === 'science-agent')?.identity;
+
+      // code-agent: cancelled, not a generic failure — and NEVER 'created'
+      // (the type-level property `pendingCreatedUpdates`'s gate depends on).
+      expect(codeAgentIdentity?.status).toBe('failed');
+      if (codeAgentIdentity?.status === 'failed') {
+        expect(codeAgentIdentity.reason).toContain('cancelled by the operator');
+      }
+
+      // science-agent: unaffected — the fleet loop continued past code-agent's cancel.
+      expect(sciAgentIdentity?.status).toBe('created');
+
+      // THE DECISIVE ASSERTION — code-agent's recovery artifact (written
+      // BEFORE gate 2 ever opened, immediately after gate 1's credential
+      // exchange) still exists on disk. Cancelling gate 2 must never reach
+      // for it.
+      const codeAgentRecoveryPath = operatorRecoveryArtifactPath(recoveryRootDir, 'demo-fleet', 'code-agent');
+      expect(existsSync(codeAgentRecoveryPath)).toBe(true);
+    });
+  });
 });
