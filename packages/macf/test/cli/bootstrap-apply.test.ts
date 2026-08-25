@@ -3951,17 +3951,139 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
   });
 
   // groundnuty/macf#1053 hard constraint — "do not change what the version
-  // phase DOES, this is reporting only." `applyExitCode` reads ONLY
-  // `versionPhase?.halted`, never any of the new discriminator fields — so a
-  // no-op / unreachable reconcile exits exactly as it did before this issue
-  // (0, same as a genuine roll); only HALTED still forces non-zero.
+  // phase DOES, this is reporting only." An `unreachable` phase (no
+  // locally-discoverable workspace AT ALL) is a distinct, honest
+  // could-not-attempt state — `skipBreakdown` is always empty for it (see
+  // `apply-version.ts::summarizeVersionRoll`'s doc), so it exits 0 exactly
+  // as before groundnuty/macf#1151, same as a genuine roll.
   it('applyExitCode: an unreachable/no-op version phase does NOT force a non-zero exit (reporting only, unchanged)', () => {
     expect(applyExitCode(resultWith({}), [], VERSION_UNREACHABLE)).toBe(0);
-    expect(applyExitCode(resultWith({}), [], { attempted: true, target: '0.2.57', halted: false, rolledAgents: [], unreachable: false, totalMembers: 2, skipBreakdown: ['1 busy', '1 config-dirty'] })).toBe(0);
+  });
+
+  // groundnuty/macf#1151 — the sibling of the unreachable case above: a
+  // phase that ATTEMPTED and rolled EVERY discovered member (empty
+  // `skipBreakdown`) is also fully green, not merely "not halted".
+  it('applyExitCode: a version phase that rolled every discovered member (empty skipBreakdown) does NOT force a non-zero exit', () => {
+    expect(applyExitCode(resultWith({}), [], VERSION_ROLLED)).toBe(0);
   });
 
   it('applyExitCode: HALTED still forces a non-zero exit, exactly as before #1053', () => {
     expect(applyExitCode(resultWith({}), [], { attempted: true, target: '0.2.57', halted: true })).toBe(1);
+  });
+});
+
+// --- groundnuty/macf#1151 — a version-reconcile phase that left SOME but
+// not ALL discovered fleet members un-rolled must be DISTINGUISHABLE, by
+// exit code, from a fully-green apply. Before this fix, `applyExitCode`
+// read only `versionPhase?.halted`, never `skipBreakdown` — the exact
+// defect this block pins down. Shape mirrors
+// `commands/fleet-upgrade.test.ts`'s "one skip cause at a time" +
+// "DECISIVE" pattern for the identical question at the `fleet upgrade`
+// layer (groundnuty/macf#1146/#1150).
+describe('applyExitCode — version-reconcile PARTIAL roll (groundnuty/macf#1151)', () => {
+  function partialPhase(skipBreakdown: readonly string[]): ApplyVersionPhaseResult {
+    return {
+      attempted: true,
+      target: '0.2.57',
+      halted: false,
+      rolledAgents: [],
+      unreachable: false,
+      totalMembers: 2,
+      skipBreakdown,
+    };
+  }
+
+  // Local fixture (this describe block is a sibling of, not nested inside,
+  // the "formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)"
+  // block that owns its own `VERSION_ROLLED`/`VERSION_UNREACHABLE`
+  // block-scoped consts) — same shape as that block's `VERSION_ROLLED`:
+  // attempted, not halted, every discovered member rolled, empty
+  // `skipBreakdown`.
+  const FULLY_ROLLED: ApplyVersionPhaseResult = {
+    attempted: true,
+    target: '0.2.57',
+    halted: false,
+    rolledAgents: ['code-agent', 'science-agent'],
+    unreachable: false,
+    totalMembers: 2,
+    skipBreakdown: [],
+  };
+
+  // One test per skip cause `apply-version.ts::versionRollSkipBreakdown`
+  // can produce — `applyExitCode` itself only checks `.length > 0`, but
+  // covering each cause string separately pins that EVERY cause (not just
+  // "busy") reaches the new branch, defending against a future refactor
+  // that special-cases one of them.
+  it.each([
+    ['1 off-canonical-branch'],
+    ['1 config-dirty'],
+    ['1 busy'],
+    ['1 stale-pin'],
+    ['1 not-yet-serving'],
+  ])('skipBreakdown = [%s], not halted → 2 (PARTIAL)', (cause) => {
+    expect(applyExitCode(resultWith({}), [], partialPhase([cause]))).toBe(2);
+  });
+
+  it('multiple skip causes at once, not halted → 2 (PARTIAL)', () => {
+    expect(applyExitCode(resultWith({}), [], partialPhase(['1 busy', '1 config-dirty']))).toBe(2);
+  });
+
+  it('DECISIVE (1/2) — a version phase with one skipped agent, no halt → non-zero AND distinguishable from a hard failure (exactly 2, not 1)', () => {
+    const code = applyExitCode(resultWith({}), [], partialPhase(['1 busy']));
+    expect(code).toBe(2);
+    expect(code).not.toBe(1);
+    expect(code).not.toBe(0);
+  });
+
+  it('DECISIVE (2/2) — a fully-green apply (clean result, version phase fully rolled) → 0', () => {
+    expect(applyExitCode(resultWith({}), [], FULLY_ROLLED)).toBe(0);
+  });
+
+  // The priority-ordering test #1150 established for `fleetUpgradeExitCode`
+  // ("halt takes priority over mixed"), copied here: a HALTED phase that
+  // ALSO left other agents skipped for unrelated reasons must still report
+  // `1`, never `2` — halt is checked as part of `hardFailure` BEFORE the
+  // partial branch is ever reached, so this is not an accident of
+  // evaluation order left untested.
+  it('halted AND skipBreakdown non-empty → 1, not 2 (halt takes priority over partial)', () => {
+    const halted: ApplyVersionPhaseResult = {
+      attempted: true,
+      target: '0.2.57',
+      halted: true,
+      rolledAgents: [],
+      unreachable: false,
+      totalMembers: 2,
+      skipBreakdown: ['1 busy'],
+    };
+    expect(applyExitCode(resultWith({}), [], halted)).toBe(1);
+  });
+
+  // A DIFFERENT hard failure (not the version phase's own halt) must ALSO
+  // outrank a partial version roll — proves `hardFailure` short-circuits
+  // BEFORE the version-partial branch regardless of which of the many
+  // hard-failure predicates fired, not just `halted`.
+  it('a hard failure elsewhere (agent failed) AND skipBreakdown non-empty, not halted → 1, not 2', () => {
+    const result = resultWith({
+      agents: [{ role: 'a', identity: { role: 'a', status: 'failed', reason: 'boom' } }],
+    });
+    expect(applyExitCode(result, [], partialPhase(['1 config-dirty']))).toBe(1);
+  });
+
+  // groundnuty/macf#1151 — the honest-unknown deploy case (a `deploy_path`
+  // that belongs to another host in a multi-host fleet, reported via
+  // `remaining-deploy.ts`'s `presence: 'unknown'`) must NEVER become a
+  // spurious non-zero/partial exit. `applyExitCode`'s signature has no
+  // `remainingDeploy` parameter at all (see this function's own doc) — it
+  // is structurally impossible for that report to influence this return
+  // value. This pins the property directly (a clean apply with a
+  // fully-rolled version phase still exits 0, independent of whatever
+  // remaining-deploy state existed) and end-to-end coverage lives in
+  // `runBootstrapApply — remaining-deploy honest completion (macf#1014)`'s
+  // "a deploy_path not resolvable locally ... UNKNOWN ..." + "exit code is
+  // UNCHANGED by deploy presence" tests above, which exercise the real
+  // `computeRemainingDeploy` path through the full command and still see 0.
+  it('a legitimately-UNKNOWN deploy elsewhere in the run does not produce a false partial (remainingDeploy is not even a parameter)', () => {
+    expect(applyExitCode(resultWith({}), [], FULLY_ROLLED)).toBe(0);
   });
 });
 
