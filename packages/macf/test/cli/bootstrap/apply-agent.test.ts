@@ -724,6 +724,156 @@ describe('applyAgentIdentity — pre-gate-2 install observation on the recovery 
   });
 });
 
+// --- groundnuty/macf#1160 — resumed gate names only the missing repo ---
+//
+// A live incident: the operator selected ONE of two required repos on gate
+// 2's install page, the registry-repo-coverage check correctly refused, and
+// on RE-RUN the instruction restated BOTH repos as if nothing had been
+// done — discarding the exact single-repo observation the refusal had just
+// computed. `finishGate2FromCredentials`'s `viaRecovery` path (the SAME
+// gate-1-succeeded/gate-2-rejected shape macf#988's recovery-artifact
+// consume side resumes into) is where that observation used to be thrown
+// away — see `skipGate2IfAlreadyInstalled`/`resumeGate2Preflight`'s own doc.
+describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight rejection, never restates the full set (groundnuty/macf#1160)', () => {
+  const MANIFEST_TWO_REPOS: FleetManifest = {
+    ...MANIFEST,
+    owner: { ...MANIFEST.owner, registry: { type: 'repo', owner: 'groundnuty', repo: 'demo-fresh-control' } },
+  };
+  const AGENT_TWO_REPOS: FleetAgent = MANIFEST_TWO_REPOS.agents[0]!;
+  const FULL_SELECT_EXACTLY_LINE = 'select exactly: groundnuty/demo-code, groundnuty/demo-fresh-control';
+
+  const RECOVERED: AppCredentials = {
+    appId: 'recovered-app-id',
+    name: 'demo-fleet-code-agent',
+    slug: 'demo-fleet-code-agent',
+    clientId: 'Iv1.recovered',
+    clientSecret: 'SENTINEL-RECOVERED-CLIENT-SECRET',
+    webhookSecret: 'SENTINEL-RECOVERED-WEBHOOK-SECRET',
+    pem: '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-RECOVERED-PEM\n-----END RSA PRIVATE KEY-----\n',
+  };
+  const CONFIRMED_INSTALL: ConfirmedInstall = {
+    appId: RECOVERED.appId,
+    installId: '9999',
+    appSlug: RECOVERED.slug,
+    accountLogin: 'groundnuty',
+    repositorySelection: 'selected',
+  };
+
+  // Sentinel strings — deliberately NOT produced via `gate2ResumedInstructionLines`
+  // or any other production helper (assert-the-wrong-path.md trigger 1: a
+  // test that builds its expectation with the same helper that builds the
+  // instruction can never fail). The fixture's `validateInstall` return
+  // value IS "the same observation the refusal used" per the issue's own
+  // requirement; the test only has to prove that value survives into the
+  // printed instruction verbatim, so a literal, unrelated string is the
+  // right fixture.
+  const SENTINEL_TECHNICAL_REASON = 'SENTINEL-TECHNICAL: control repo not reachable under this App JWT.';
+  const SENTINEL_RETRY_INSTRUCTION = 'SENTINEL-RETRY: add groundnuty/demo-fresh-control under Repository access, then Save.';
+
+  // Decisive pair, item 1: a resumed gate whose install already covers one
+  // of the two required repos -> the instruction names ONLY the missing
+  // one (verbatim, from the SAME rejection already computed) and never
+  // restates the full required set.
+  it('decisive (1): resumed gate, one of two required repos already covered -> instruction names only the missing repo, never the full "select exactly" restatement', async () => {
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const logs: string[] = [];
+    const deps = baseDeps({
+      startInstallInterstitial,
+      log: (l) => logs.push(l),
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
+      findRecoveryArtifact: async () => RECOVERED,
+      validateInstall: () => ({ message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION }),
+      // The reopened gate-2 poll re-observes the SAME (still-insufficient) install.
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+
+    // The resumed gate DID open — the coverage gap is real, never silently accepted.
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
+    expect(outcome.status).toBe('failed');
+
+    const joined = logs.join('\n');
+    // The delta — verbatim from the pre-flight's OWN already-computed rejection.
+    expect(joined).toContain(SENTINEL_RETRY_INSTRUCTION);
+    // The resumed framing — an install already exists; this is not a from-scratch ask.
+    expect(joined).toContain("this App's install already exists from an earlier run");
+    // The decisive negative: the old full-list restatement must be GONE.
+    expect(joined).not.toContain(FULL_SELECT_EXACTLY_LINE);
+    expect(joined).not.toContain('select exactly:');
+  });
+
+  // Decisive pair, item 2: a genuinely FIRST gate (fresh create) is
+  // UNCHANGED — the full set is correct there, nothing is known satisfied.
+  it('decisive (2): a first gate (fresh create, viaRecovery: false) -> unchanged full "select exactly" instruction', async () => {
+    const logs: string[] = [];
+    const deps = baseDeps({ log: (l) => logs.push(l) }); // no findRecoveryArtifact — the ordinary fresh-create path
+    const outcome = await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+    expect(outcome.status).toBe('created');
+    expect(logs.join('\n')).toContain(FULL_SELECT_EXACTLY_LINE);
+  });
+
+  it('honest-unknown: recovered credential but ZERO installs (app-no-install) -> full set, same as a first gate — nothing is known satisfied', async () => {
+    const logs: string[] = [];
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      confirmAppInstallation: async () => ({ status: 'app-no-install' }),
+      findRecoveryArtifact: async () => RECOVERED,
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '7001', appSlug: RECOVERED.slug, accountLogin: 'groundnuty' }),
+    });
+    await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+    expect(logs.join('\n')).toContain(FULL_SELECT_EXACTLY_LINE);
+  });
+
+  it('honest-unknown: current selection cannot be observed (unconfirmable) -> full set, NEVER a guessed delta', async () => {
+    const logs: string[] = [];
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      confirmAppInstallation: async () => ({ status: 'unconfirmable' }),
+      findRecoveryArtifact: async () => RECOVERED,
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '7002', appSlug: RECOVERED.slug, accountLogin: 'groundnuty' }),
+    });
+    await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+    expect(logs.join('\n')).toContain(FULL_SELECT_EXACTLY_LINE);
+  });
+
+  it('a bare-string rejection (e.g. a scope-only check, no single "missing repo" to name) falls back to its own message text on a resumed gate — still never the full-list restatement', async () => {
+    const logs: string[] = [];
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
+      findRecoveryArtifact: async () => RECOVERED,
+      validateInstall: () => 'SENTINEL-BARE: repository_selection must be selected.',
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'all' }),
+    });
+    await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+    const joined = logs.join('\n');
+    expect(joined).toContain('SENTINEL-BARE: repository_selection must be selected.');
+    expect(joined).not.toContain(FULL_SELECT_EXACTLY_LINE);
+  });
+
+  // Real production shape, end-to-end: the ACTUAL registry-repo-coverage
+  // rejection text (not a sentinel) still lands on a resumed gate, and the
+  // check + the instruction still share ONE derivation (never re-derived —
+  // groundnuty/macf#1156 must not be weakened by this fix).
+  it('wired to the REAL registry-repo-coverage rejection text -> that exact text appears on the resumed gate, and the full-list line does not', async () => {
+    const logs: string[] = [];
+    const realRetryInstruction = registryRepoRetryInstruction('demo-fleet-code-agent', 'groundnuty', 'demo-fresh-control');
+    const realMessage = registryRepoNotInstalledReason('demo-fleet-code-agent', 'groundnuty', 'demo-fresh-control');
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
+      findRecoveryArtifact: async () => RECOVERED,
+      validateInstall: () => ({ message: realMessage, retryInstruction: realRetryInstruction }),
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
+    });
+    await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+    const joined = logs.join('\n');
+    expect(joined).toContain(realRetryInstruction);
+    expect(joined).not.toContain(FULL_SELECT_EXACTLY_LINE);
+  });
+});
+
 describe('applyAgentIdentity — non-create outcomes short-circuit before any gate', () => {
   const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
 
