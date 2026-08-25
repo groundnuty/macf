@@ -179,6 +179,24 @@ function repoScopedManifest(agents: readonly FleetAgent[] = [CODE_AGENT]): Fleet
   };
 }
 
+/**
+ * groundnuty/macf#1173 — `InstallInterstitialOptions` no longer carries a
+ * separate `repos` field; the ONLY repo list an operator ever sees is
+ * whatever `messageLines` line starts with `select exactly: ` (or the
+ * honest-empty "(no repos declared...)" text — see
+ * `apply-agent.ts::gate2DefaultInstructionLines`). Parses that SAME line
+ * back into a `readonly string[]` so the #1156 decisive tests below can go
+ * on asserting "the repo list the operator was shown" against the live
+ * coverage check, reading it from the actual served content instead of an
+ * internal field.
+ */
+function parseSelectExactlyRepos(messageLines: readonly string[]): readonly string[] {
+  const line = messageLines.find((l) => l.startsWith('select exactly: '));
+  if (line === undefined) return [];
+  const rest = line.slice('select exactly: '.length);
+  return rest.startsWith('(') ? [] : rest.split(', ');
+}
+
 function creds(seed: string): AppCredentials {
   return {
     appId: `app-${seed}`,
@@ -5017,7 +5035,7 @@ trust:
           // target is the registry alone (`routerAppInstallRepos`), a
           // different — and separately correct — list this test isn't
           // about.
-          if (opts.role === 'code-agent') seenInstructionRepos = opts.repos;
+          if (opts.role === 'code-agent') seenInstructionRepos = parseSelectExactlyRepos(opts.messageLines);
           return { startUrl: 'http://x/install', close: async () => {} };
         },
       };
@@ -5055,7 +5073,7 @@ trust:
       const agentDeps: AgentApplyDeps = {
         ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
         startInstallInterstitial: async (opts) => {
-          if (opts.role === 'code-agent') seenInstructionRepos = opts.repos;
+          if (opts.role === 'code-agent') seenInstructionRepos = parseSelectExactlyRepos(opts.messageLines);
           return { startUrl: 'http://x/install', close: async () => {} };
         },
       };

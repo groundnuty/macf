@@ -34,6 +34,11 @@
  * `decision.action === 'resume-install'` — has no gate-1 listener to reuse at
  * all, since gate 1 never ran that turn) — sharing the bind/close CODE is
  * what "reuse it" means here.
+ *
+ * **groundnuty/macf#1173 — gate 2's served page renders NO prose of its
+ * own.** {@link InstallInterstitialOptions.messageLines} is the SAME array
+ * the terminal prints; this file only escapes + wraps it in `<li>`s. See
+ * {@link renderInstallInterstitial}'s own doc for the incident this closes.
  */
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
@@ -271,23 +276,23 @@ export interface InstallInterstitialOptions {
   /** GitHub's real install page — what the page's button links to. NEVER opened directly by the caller; this page is. */
   readonly installUrl: string;
   /**
-   * The EXACT repos to select on GitHub's page — literal names, never a
-   * class description (groundnuty/macf#952: "'this fleet's repos' is not
-   * actionable at a dropdown"). Rendered in `owner/repo` form (unambiguous)
-   * with the bare repo name — the form GitHub's own per-account repo picker
-   * uses — called out first.
+   * groundnuty/macf#1173 — THE canonical instruction body, one entry per
+   * sentence, escaped and rendered verbatim as this page's ONLY prose.
+   * This is the EXACT SAME array `apply-agent.ts::runGate2WithInterstitial`
+   * hands to `announceAndOpenGate`'s `instructionLines` for the terminal —
+   * computed ONCE by the caller, threaded to both surfaces, never
+   * re-derived here. Before #1173, this page built its own independent
+   * text from `repos`/`whyText` fields — the fourth confirmed instance of
+   * the SAME "one instruction, two texts" drift this repo had already
+   * fixed three times (#1156, #1164, #1168) at other sites. There is now
+   * exactly one text; this field IS it. An empty array renders nothing —
+   * every real caller supplies at least the repo-selection line, so an
+   * empty array would itself be a bug upstream, not a case this function
+   * papers over.
    */
-  readonly repos: readonly string[];
-  /** One sentence on why "Only select repositories" matters for THIS identity (varies by permission set — see `apply-agent.ts::installWhyText`). */
-  readonly whyText: string;
+  readonly messageLines: readonly string[];
   readonly gateNumber: number;
   readonly gateTotal: number;
-}
-
-/** `owner/repo` -> `repo` (the form GitHub's own per-account repository picker lists repos in). Falls back to the full string when there's no `/`. */
-function repoShortName(fullName: string): string {
-  const i = fullName.lastIndexOf('/');
-  return i === -1 ? fullName : fullName.slice(i + 1);
 }
 
 /**
@@ -295,22 +300,32 @@ function repoShortName(fullName: string): string {
  * reaches GitHub's install page. Pure — exported for testing.
  *
  * **Never renders a secret.** {@link InstallInterstitialOptions} carries no
- * credential field at all (role/appName/installUrl/repos/whyText are all
+ * credential field at all (role/appName/installUrl/messageLines are all
  * plan-level facts, not secrets) — structurally, not just by convention.
+ *
+ * **groundnuty/macf#1173 — formatting regresses on purpose.** Before this
+ * issue, this function hand-built its own bullet list (short repo name in
+ * bold + full `owner/repo` in a dim span) and a separately-styled "why" box
+ * — content nowhere else, so it could (and did) drift from what the
+ * terminal told the SAME operator during the SAME gate. The operator's own
+ * ruling: *"It can have a little bit worse formatting, but at the moment we
+ * are managing two different sets of user messages."* Every sentence below
+ * is `opts.messageLines`, escaped and wrapped one-per-`<li>` — no sentence
+ * this function adds on its own, none it drops. The remaining markup
+ * (heading, the "Installing GitHub App" label, the button) is structural
+ * identifying context, not prose — the same split gate 1's page already
+ * settled on (groundnuty/macf#971).
  */
 export function renderInstallInterstitial(opts: InstallInterstitialOptions): string {
   const roleEsc = escapeHtmlAttribute(opts.role);
   const appNameEsc = escapeHtmlAttribute(opts.appName);
   const installUrlEsc = escapeHtmlAttribute(opts.installUrl);
-  const repoItems = opts.repos.length > 0
-    ? opts.repos.map((r) => `  <li><strong>${escapeHtmlAttribute(repoShortName(r))}</strong> <span class="dim">(${escapeHtmlAttribute(r)})</span></li>`).join('\n')
-    : '  <li><em>(no repos declared in the fleet manifest — verify before installing)</em></li>';
+  const messageItems = opts.messageLines.map((line) => `  <li>${escapeHtmlAttribute(line)}</li>`).join('\n');
   return `<!doctype html>
 <html><head><meta charset="utf-8"><title>Consent gate ${String(opts.gateNumber)} of ${String(opts.gateTotal)} — installing ${appNameEsc}</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
   .dim { color: #666; }
-  .why { background: #fff3cd; border: 1px solid #d0a02e; border-radius: 4px; padding: 0.75rem 1rem; }
   .button { display: inline-block; margin-top: 1rem; padding: 0.6rem 1.2rem; background: #1f6feb; color: #fff;
             text-decoration: none; border-radius: 6px; font-weight: 600; }
 </style>
@@ -318,15 +333,9 @@ export function renderInstallInterstitial(opts: InstallInterstitialOptions): str
 <body>
 <h1>Consent gate ${String(opts.gateNumber)} of ${String(opts.gateTotal)} — role "${roleEsc}"</h1>
 <p>Installing GitHub App: <strong>${appNameEsc}</strong></p>
-<p>On the page this button opens, GitHub will ask which repositories to install this App on. You MUST choose:</p>
 <ul>
-  <li><strong>&ldquo;Only select repositories&rdquo;</strong> — NOT &ldquo;All repositories&rdquo;</li>
+${messageItems}
 </ul>
-<p>Then select exactly:</p>
-<ul>
-${repoItems}
-</ul>
-<p class="why">${escapeHtmlAttribute(opts.whyText)}</p>
 <p><a class="button" href="${installUrlEsc}">Continue to GitHub to install</a></p>
 <p class="dim">If the button doesn't work, open this URL yourself: ${installUrlEsc}</p>
 </body></html>`;

@@ -391,14 +391,21 @@ describe('plannedAppCreations (pure)', () => {
     expect(codeAgentIndex).toBeGreaterThanOrEqual(0);
     const out = formatPlannedAppCreations(creations);
     const lines = out.split('\n');
-    // Find the "code-agent" bullet line, then assert the VERY NEXT ⚠ line
-    // (before the next bullet) names its own repo.
+    // Find the "code-agent" bullet line, then assert the block up to (but
+    // not including) the next bullet names its own repo. A block-join
+    // (groundnuty/macf#1173) rather than a single-line `.find` — the
+    // warning is now TWO lines (`gate2RepoSelectionInstructionLines`,
+    // verbatim from the live gate — see that function's own doc), not one.
     const bulletIndex = lines.findIndex((l) => l.includes('role: code-agent'));
     expect(bulletIndex).toBeGreaterThanOrEqual(0);
-    const warningLine = lines.slice(bulletIndex, bulletIndex + 6).find((l) => l.includes('⚠ on the install page'));
-    expect(warningLine).toBeDefined();
-    expect(warningLine).toContain('select exactly: groundnuty/demo-code');
-    expect(warningLine).not.toContain('demo-science'); // NOT the other agent's repo
+    // Exactly this agent's own block (bullet + permissions + events +
+    // public/webhook + gate-2 URL + the 2-line warning = 7 lines) — sized
+    // to stop BEFORE the next bullet, so a false pass/fail can't come from
+    // bleeding into the next agent's block.
+    const block = lines.slice(bulletIndex, bulletIndex + 7).join('\n');
+    expect(block).toMatch(/Only select repositories/);
+    expect(block).toContain('select exactly: groundnuty/demo-code');
+    expect(block).not.toContain('demo-science'); // NOT the other agent's repo
   });
 
   it('EXCLUDES an agent whose App is already present (no re-create)', () => {
@@ -446,13 +453,15 @@ describe('plannedAppCreations (pure)', () => {
     expect(sciAgent?.installRepos).toEqual(['groundnuty/demo-science', 'demo-org/demo-org-control']);
 
     // The formatted preview text shows the SAME list for code-agent's own
-    // warning line — never dropped, never a class description.
+    // warning block — never dropped, never a class description. Block-join
+    // (groundnuty/macf#1173), not a single-line `.find` — see the sibling
+    // test above for why.
     const out = formatPlannedAppCreations(creations);
     const lines = out.split('\n');
     const bulletIndex = lines.findIndex((l) => l.includes('role: code-agent'));
     expect(bulletIndex).toBeGreaterThanOrEqual(0);
-    const warningLine = lines.slice(bulletIndex, bulletIndex + 6).find((l) => l.includes('⚠ on the install page'));
-    expect(warningLine).toContain('select exactly: groundnuty/demo-code, demo-org/demo-org-control');
+    const block = lines.slice(bulletIndex, bulletIndex + 7).join('\n');
+    expect(block).toContain('select exactly: groundnuty/demo-code, demo-org/demo-org-control');
   });
 
   it('groundnuty/macf#1156: registry.type === "profile" (this describe block\'s own default fixture) -> installRepos is UNCHANGED — agent repo only, never the control repo', () => {
