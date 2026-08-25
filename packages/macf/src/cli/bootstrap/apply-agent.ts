@@ -1455,12 +1455,46 @@ async function startInterstitialOrFallback(deps: AgentApplyDeps, role: string, o
 }
 
 /**
+ * The default, first-gate instruction body (groundnuty/macf#952) — every
+ * pre-#1063 call site (no `opts.instructionLines` override) gets exactly
+ * this, byte-identical to before that field existed. Pulled out to a named
+ * function (groundnuty/macf#1173) purely so {@link runGate2WithInterstitial}
+ * can compute it ONCE, before either consumer (the terminal's
+ * `instructionLines` and the interstitial's `messageLines`) reads it — see
+ * that function's own doc for why "compute once, thread twice" is the whole
+ * fix.
+ */
+function gate2DefaultInstructionLines(repos: readonly string[], whyText: string, installUrl: string): readonly string[] {
+  return [
+    'on the page that opens, choose "Only select repositories" — NOT "All repositories".',
+    `select exactly: ${repos.length > 0 ? repos.join(', ') : '(no repos declared in the fleet manifest — verify before installing)'}`,
+    whyText,
+    `GitHub's install page: ${installUrl}`,
+  ];
+}
+
+/**
  * `opts.instructionLines`/`waitLabel`/`gateLabelSuffix` (groundnuty/macf#1063)
  * let {@link retryRecoverableGate2Rejection} drive a REOPEN of this exact
  * function with retry-specific wording, without a second gate
- * implementation — every pre-#1063 call site omits all three and gets the
- * original hard-coded "choose Only select repositories" instructions,
- * `'Install'` wait-label, and un-suffixed gate label, byte-identical.
+ * implementation — every pre-#1063 call site omits all three and gets
+ * {@link gate2DefaultInstructionLines}'s "choose Only select repositories"
+ * instructions, `'Install'` wait-label, and un-suffixed gate label,
+ * byte-identical.
+ *
+ * **groundnuty/macf#1173 — `messageLines` is computed ONCE, right here, and
+ * handed to BOTH the terminal (`announceAndOpenGate`'s `instructionLines`)
+ * and the served interstitial (`InstallInterstitialOptions.messageLines`).**
+ * Before this fix, the interstitial (`manifest-flow-server.ts::
+ * renderInstallInterstitial`) built its OWN text from `repos`/`whyText`,
+ * independently of whatever `opts.instructionLines` this function was
+ * given — so a resumed gate's narrowed terminal instruction
+ * (`gate2ResumedInstructionLines`) or a retry's
+ * (`gate2RetryInstructionLines`) never reached the page the operator was
+ * actually looking at, which kept showing the full original repo list. The
+ * operator's own ruling: same words, not "consistent" words — so this
+ * function no longer derives two texts from the same facts; it derives ONE
+ * text and renders it twice.
  */
 async function runGate2WithInterstitial(
   role: string,
@@ -1495,12 +1529,17 @@ async function runGate2WithInterstitial(
   },
   validate?: ValidateInstallHook,
 ): Promise<Gate2Outcome> {
+  // groundnuty/macf#1173 — computed ONCE, before either consumer below
+  // reads it. `opts.instructionLines` (set by the resumed-gate preflight or
+  // a retry reopen) wins when supplied; the ordinary first-attempt default
+  // otherwise. Whichever it is, this exact array is what BOTH the terminal
+  // and the served page show — see this function's own doc.
+  const messageLines = opts.instructionLines ?? gate2DefaultInstructionLines(repos, whyText, installUrl);
   const page = await startInterstitialOrFallback(deps, role, {
     role,
     appName: appSlug,
     installUrl,
-    repos,
-    whyText,
+    messageLines,
     // The install page is always the SECOND (and last) of the two gates —
     // literal `2`, not derived from `GATE_TOTAL` (which happens to equal 2
     // today but means "how many gates total," not "which gate this is").
@@ -1517,12 +1556,7 @@ async function runGate2WithInterstitial(
       {
         fatal: false,
         caveat: opts.caveat,
-        instructionLines: opts.instructionLines ?? [
-          'on the page that opens, choose "Only select repositories" — NOT "All repositories".',
-          `select exactly: ${repos.length > 0 ? repos.join(', ') : '(no repos declared in the fleet manifest — verify before installing)'}`,
-          whyText,
-          `GitHub's install page: ${installUrl}`,
-        ],
+        instructionLines: messageLines,
       },
     );
     await opts.postOpenWait?.();

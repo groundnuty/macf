@@ -1074,9 +1074,14 @@ describe('installWhyText (pure, groundnuty/macf#952)', () => {
   });
 });
 
-describe('gate 2 receives the derived repos/whyText (integration, groundnuty/macf#952)', () => {
-  it('create path: startInstallInterstitial is called with the role, the real exchanged slug, the derived repos, and the why-text', async () => {
-    const seen: { role: string; appName: string; repos: readonly string[]; whyText: string; gateNumber: number; gateTotal: number }[] = [];
+// groundnuty/macf#1173 — `InstallInterstitialOptions` no longer carries
+// separate `repos`/`whyText` fields; `messageLines` is the ONE canonical
+// instruction body (the SAME array the terminal prints — see the decisive
+// cross-surface tests below). These tests now assert the derived repos/
+// why-text landed INSIDE that shared array, not on their own fields.
+describe('gate 2 receives the derived repos/whyText, folded into messageLines (integration, groundnuty/macf#952 + #1173)', () => {
+  it('create path: startInstallInterstitial is called with the role, the real exchanged slug, and messageLines carrying the derived repos + why-text', async () => {
+    const seen: { role: string; appName: string; messageLines: readonly string[]; gateNumber: number; gateTotal: number }[] = [];
     const deps = baseDeps({
       startInstallInterstitial: async (opts) => {
         seen.push(opts);
@@ -1088,15 +1093,16 @@ describe('gate 2 receives the derived repos/whyText (integration, groundnuty/mac
     expect(seen[0]).toMatchObject({
       role: 'code-agent',
       appName: CREDS.slug, // the REAL exchanged slug, not the derived handle
-      repos: ['groundnuty/demo-code'],
       gateNumber: 2,
       gateTotal: 2,
     });
-    expect(seen[0]?.whyText).toMatch(/only needs access to the repo\(s\) listed above/);
+    const joined = seen[0]?.messageLines.join('\n') ?? '';
+    expect(joined).toContain('groundnuty/demo-code');
+    expect(joined).toMatch(/only needs access to the repo\(s\) listed above/);
   });
 
-  it('resume-install path: startInstallInterstitial ALSO gets the derived repos/why-text', async () => {
-    const seen: { role: string; repos: readonly string[] }[] = [];
+  it('resume-install path: startInstallInterstitial ALSO gets messageLines carrying the derived repos', async () => {
+    const seen: { role: string; messageLines: readonly string[] }[] = [];
     const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
     const deps = baseDeps({
       startInstallInterstitial: async (opts) => {
@@ -1109,11 +1115,11 @@ describe('gate 2 receives the derived repos/whyText (integration, groundnuty/mac
     });
     await applyAgentIdentity(AGENT, MULTI_AGENT_MANIFEST, PRIOR, deps);
     expect(seen).toHaveLength(1);
-    expect(seen[0]?.repos).toEqual(['groundnuty/demo-code']);
+    expect(seen[0]?.messageLines.join('\n')).toContain('groundnuty/demo-code');
   });
 
-  it('a role with no matching agent (runner-ops shape) gets every declared repo + the admin-write why-text', async () => {
-    const seen: { role: string; repos: readonly string[]; whyText: string }[] = [];
+  it('a role with no matching agent (runner-ops shape) gets every declared repo + the admin-write why-text, folded into messageLines', async () => {
+    const seen: { role: string; messageLines: readonly string[] }[] = [];
     const deps = baseDeps({
       startInstallInterstitial: async (opts) => {
         seen.push(opts);
@@ -1127,8 +1133,10 @@ describe('gate 2 receives the derived repos/whyText (integration, groundnuty/mac
       deps,
     );
     expect(seen).toHaveLength(1);
-    expect(seen[0]?.repos).toEqual(['groundnuty/demo-code', 'groundnuty/demo-science']);
-    expect(seen[0]?.whyText).toMatch(/blast radius/);
+    const joined = seen[0]?.messageLines.join('\n') ?? '';
+    expect(joined).toContain('groundnuty/demo-code');
+    expect(joined).toContain('groundnuty/demo-science');
+    expect(joined).toMatch(/blast radius/);
   });
 });
 

@@ -35,18 +35,45 @@ const FULL = {
   pem: '-----BEGIN RSA PRIVATE KEY-----\nMII...\n-----END RSA PRIVATE KEY-----\n',
 };
 
+/** Shared "why" sentence fixture — one of {@link RUNNER_OPS_MESSAGE_LINES}, and asserted for individually below (the escaping test). */
+const RUNNER_OPS_WHY_TEXT =
+  'Why: this App holds administration:write; granting it every repository in the account is blast radius ' +
+  'the fleet does not need, and apply will refuse an "all" install.';
+const RUNNER_OPS_INSTALL_URL = 'https://github.com/apps/demo-fleet-runner-ops/installations/new';
+
 /**
- * groundnuty/macf#971 — gate 2's exact rendered output, captured from
- * `renderInstallInterstitial` on `main` BEFORE this issue's change (which
- * touches gate 1 only). Gate 2 must come out of this issue byte-identical;
- * see the "gate 2's rendered HTML is BYTE-IDENTICAL" test below.
+ * groundnuty/macf#1173 — the CANONICAL instruction body a live gate-2 run
+ * would compute (`apply-agent.ts::gate2DefaultInstructionLines`) for this
+ * fixture's repos/why-text. This is the ONLY content
+ * {@link renderInstallInterstitial} renders as prose — see that function's
+ * own doc for why it no longer derives its own text from `repos`/`whyText`.
+ */
+const RUNNER_OPS_MESSAGE_LINES = [
+  'on the page that opens, choose "Only select repositories" — NOT "All repositories".',
+  'select exactly: groundnuty/exp-science-agent, groundnuty/exp-code-agent',
+  RUNNER_OPS_WHY_TEXT,
+  `GitHub's install page: ${RUNNER_OPS_INSTALL_URL}`,
+];
+
+/**
+ * groundnuty/macf#1173 — gate 2's exact rendered output, superseding the
+ * pre-#1173 pin (which locked a hand-built repo-list + styled "why" box —
+ * exactly the SEPARATE-FROM-THE-TERMINAL text this issue closes). This
+ * fixture is captured by RUNNING `renderInstallInterstitial` against
+ * `RUNNER_OPS_MESSAGE_LINES` above (see the render-vs-terminal decisive
+ * test in `apply-agent.test.ts` for the assertion that this array is what
+ * a live run's terminal ALSO prints — this file only proves the render
+ * shape, not the cross-surface identity). A deliberate future change to
+ * gate 2's markup updates this constant along with the code; that is the
+ * point of a pin, not a bug in this test. Formatting is intentionally
+ * plainer than before #1173 (the operator's own trade: "a little bit worse
+ * formatting" for "exactly the same text output").
  */
 const GATE2_GOLDEN_HTML = `<!doctype html>
 <html><head><meta charset="utf-8"><title>Consent gate 2 of 2 — installing demo-fleet-runner-ops</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
   .dim { color: #666; }
-  .why { background: #fff3cd; border: 1px solid #d0a02e; border-radius: 4px; padding: 0.75rem 1rem; }
   .button { display: inline-block; margin-top: 1rem; padding: 0.6rem 1.2rem; background: #1f6feb; color: #fff;
             text-decoration: none; border-radius: 6px; font-weight: 600; }
 </style>
@@ -54,16 +81,12 @@ const GATE2_GOLDEN_HTML = `<!doctype html>
 <body>
 <h1>Consent gate 2 of 2 — role "runner-ops"</h1>
 <p>Installing GitHub App: <strong>demo-fleet-runner-ops</strong></p>
-<p>On the page this button opens, GitHub will ask which repositories to install this App on. You MUST choose:</p>
 <ul>
-  <li><strong>&ldquo;Only select repositories&rdquo;</strong> — NOT &ldquo;All repositories&rdquo;</li>
+  <li>on the page that opens, choose &quot;Only select repositories&quot; — NOT &quot;All repositories&quot;.</li>
+  <li>select exactly: groundnuty/exp-science-agent, groundnuty/exp-code-agent</li>
+  <li>Why: this App holds administration:write; granting it every repository in the account is blast radius the fleet does not need, and apply will refuse an &quot;all&quot; install.</li>
+  <li>GitHub&#39;s install page: https://github.com/apps/demo-fleet-runner-ops/installations/new</li>
 </ul>
-<p>Then select exactly:</p>
-<ul>
-  <li><strong>exp-science-agent</strong> <span class="dim">(groundnuty/exp-science-agent)</span></li>
-  <li><strong>exp-code-agent</strong> <span class="dim">(groundnuty/exp-code-agent)</span></li>
-</ul>
-<p class="why">Why: this App holds administration:write; granting it every repository in the account is blast radius the fleet does not need, and apply will refuse an &quot;all&quot; install.</p>
 <p><a class="button" href="https://github.com/apps/demo-fleet-runner-ops/installations/new">Continue to GitHub to install</a></p>
 <p class="dim">If the button doesn't work, open this URL yourself: https://github.com/apps/demo-fleet-runner-ops/installations/new</p>
 </body></html>`;
@@ -189,20 +212,17 @@ describe('manifest-flow-server (pure parts)', () => {
   });
 });
 
-describe('renderInstallInterstitial (groundnuty/macf#952 — pure)', () => {
+describe('renderInstallInterstitial (groundnuty/macf#952 — pure; content shape per groundnuty/macf#1173)', () => {
   const OPTS = {
     role: 'runner-ops',
     appName: 'demo-fleet-runner-ops',
-    installUrl: 'https://github.com/apps/demo-fleet-runner-ops/installations/new',
-    repos: ['groundnuty/exp-science-agent', 'groundnuty/exp-code-agent'],
-    whyText:
-      'Why: this App holds administration:write; granting it every repository in the account is blast radius ' +
-      'the fleet does not need, and apply will refuse an "all" install.',
+    installUrl: RUNNER_OPS_INSTALL_URL,
+    messageLines: RUNNER_OPS_MESSAGE_LINES,
     gateNumber: 2,
     gateTotal: 2,
   };
 
-  it('names the literal repositories from the manifest (bare name AND owner/repo)', () => {
+  it('names the literal repositories from the manifest', () => {
     const html = renderInstallInterstitial(OPTS);
     expect(html).toContain('exp-science-agent');
     expect(html).toContain('exp-code-agent');
@@ -227,11 +247,19 @@ describe('renderInstallInterstitial (groundnuty/macf#952 — pure)', () => {
   });
 
   it('carries the why-text (HTML-attribute-escaped — the source `"`s become `&quot;`)', () => {
-    expect(renderInstallInterstitial(OPTS)).toContain(escapeHtmlAttribute(OPTS.whyText));
+    expect(renderInstallInterstitial(OPTS)).toContain(escapeHtmlAttribute(RUNNER_OPS_WHY_TEXT));
   });
 
-  it('handles an empty repo list honestly rather than rendering nothing', () => {
-    const html = renderInstallInterstitial({ ...OPTS, repos: [] });
+  it('handles an empty repo list honestly rather than rendering nothing (groundnuty/macf#1173: the "no repos declared" wording is now ONE of messageLines, computed upstream by gate2DefaultInstructionLines — this test only proves the page renders whatever line it is given)', () => {
+    const html = renderInstallInterstitial({
+      ...OPTS,
+      messageLines: [
+        RUNNER_OPS_MESSAGE_LINES[0]!,
+        'select exactly: (no repos declared in the fleet manifest — verify before installing)',
+        RUNNER_OPS_WHY_TEXT,
+        `GitHub's install page: ${RUNNER_OPS_INSTALL_URL}`,
+      ],
+    });
     expect(html).toMatch(/no repos declared/i);
   });
 
@@ -242,16 +270,26 @@ describe('renderInstallInterstitial (groundnuty/macf#952 — pure)', () => {
     }
   });
 
-  // groundnuty/macf#971 — gate 2 is EXPLICITLY unchanged by this issue (it
-  // does not auto-submit, and is where a real choice — "Only select
-  // repositories" + which repos — actually gets made). Pinned byte-for-byte
-  // against a captured-before-this-change fixture so a future edit to THIS
-  // page cannot silently degrade the one page in the flow the operator
-  // actually reads. A deliberate future change to gate 2 updates this
-  // constant along with the code; that is the point of a pin, not a bug in
-  // this test.
-  it('gate 2\'s rendered HTML is BYTE-IDENTICAL to its pre-#971 fixture (pinned regression guard)', () => {
+  /**
+   * groundnuty/macf#1173 — supersedes the pre-#1173 "byte-identical to its
+   * pre-#971 fixture" pin. That pin locked a hand-built repo-list + a
+   * separately-styled "why" box, rendered from `repos`/`whyText` fields
+   * this function no longer reads — exactly the drift-prone shape #1173
+   * closes (two independently-authored texts for the SAME instruction).
+   * This pin locks the NEW shape: `messageLines`, escaped and wrapped
+   * `<li>`-per-line, with no page-authored prose sentence of its own. A
+   * deliberate future change to gate 2's markup updates this constant
+   * along with the code; that is the point of a pin, not a bug in this
+   * test.
+   */
+  it("gate 2's rendered HTML is BYTE-IDENTICAL to its post-#1173 fixture (pinned regression guard)", () => {
     expect(renderInstallInterstitial(OPTS)).toBe(GATE2_GOLDEN_HTML);
+  });
+
+  it('groundnuty/macf#1173 — renders NO sentence beyond messageLines: every <li> is exactly one escaped messageLines entry, in order, nothing added or dropped', () => {
+    const html = renderInstallInterstitial(OPTS);
+    const items = Array.from(html.matchAll(/<li>([\s\S]*?)<\/li>/g)).map((m) => m[1]);
+    expect(items).toEqual(OPTS.messageLines.map((line) => escapeHtmlAttribute(line)));
   });
 });
 
@@ -260,8 +298,12 @@ describe('startInstallInterstitial (live loopback server, groundnuty/macf#952)',
     role: 'code-agent',
     appName: 'demo-fleet-code-agent',
     installUrl: 'https://github.com/apps/demo-fleet-code-agent/installations/new',
-    repos: ['groundnuty/demo-code'],
-    whyText: 'Why: this App only needs access to the repo(s) listed above.',
+    messageLines: [
+      'on the page that opens, choose "Only select repositories" — NOT "All repositories".',
+      'select exactly: groundnuty/demo-code',
+      'Why: this App only needs access to the repo(s) listed above.',
+      "GitHub's install page: https://github.com/apps/demo-fleet-code-agent/installations/new",
+    ],
     gateNumber: 2,
     gateTotal: 2,
   };
