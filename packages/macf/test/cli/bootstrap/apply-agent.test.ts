@@ -2063,3 +2063,131 @@ describe('groundnuty/macf#1063 — recoverable consent-gate-2 rejection re-opens
     if (outcome.status === 'failed') expect(outcome.reason).not.toMatch(issueRefPattern);
   });
 });
+
+// --- groundnuty/macf#1179 — "check again" wakes the resumed-gate poll ------
+//
+// `pollForInstallFix`'s ordinary tick cadence is a TIMER (15s default,
+// `pollIntervalMs` here). These tests set that timer to something the test's
+// own timeout could never survive (10 minutes) — if "check again" were NOT
+// wired to interrupt the sleep, the run would still be waiting on the timer
+// when the test itself times out, and the assertion below would never even
+// run. That is the negative trigger: it is not "the run eventually succeeds"
+// (true even without this feature, given enough wall-clock time) but "the
+// run succeeds FAST, inside a budget that only makes sense if the click
+// short-circuited the wait."
+
+describe('"check again" continues the SAME invocation (groundnuty/macf#1179)', () => {
+  const PRIOR: FleetLockAgent = { role: 'code-agent', app_id: '9001', install_id: '5555' };
+  const REUSE_INSTALL: ConfirmedInstall = { appId: '9001', installId: '5555', appSlug: 'demo-fleet-code-agent', accountLogin: 'groundnuty', repositorySelection: 'selected' };
+  const MISSING_REPO_REASON = registryRepoNotInstalledReason('demo-fleet-code-agent', 'groundnuty', 'demo-fleet-control');
+  const TEN_MINUTES_MS = 10 * 60 * 1000;
+
+  it('DECISIVE: a click resolves waitForCheckAgain(), the poll re-checks immediately, validate now accepts, and applyAgentIdentity resolves — all inside one invocation, well under the 10-minute poll interval', async () => {
+    let checkAgainResolve: (() => void) | undefined;
+    const checkAgainPromise = new Promise<void>((res) => { checkAgainResolve = res; });
+    let validateReuseCalls = 0;
+    const deps = baseDeps({
+      startInstallInterstitial: async () => ({
+        startUrl: FAKE_INTERSTITIAL_URL,
+        close: () => Promise.resolve(),
+        waitForCheckAgain: () => checkAgainPromise,
+        updateContent: () => {},
+      }),
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      gateTimeoutMs: TEN_MINUTES_MS,
+      pollIntervalMs: TEN_MINUTES_MS,
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        return validateReuseCalls === 1 ? MISSING_REPO_REASON : undefined;
+      },
+    });
+
+    const outcomePromise = applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    // Give the poll's FIRST (immediate) tick a moment to run and observe the
+    // rejection, then simulate the operator's click.
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    checkAgainResolve?.();
+
+    const outcome = await outcomePromise;
+    expect(validateReuseCalls).toBe(2); // the pre-flight check, then the check-again-triggered re-check
+    expect(outcome).toEqual({ role: 'code-agent', status: 'reused', appId: '9001', installId: '5555' });
+  }, 5000);
+
+  it('NEGATIVE — with the SAME 10-minute interval and NO click ever arriving, the run is still in flight after a short window (proves the fast path above is not just "polling is fast anyway")', async () => {
+    const deps = baseDeps({
+      startInstallInterstitial: async () => fakeInterstitialHandles(), // waitForCheckAgain omitted -> never fires
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      gateTimeoutMs: TEN_MINUTES_MS,
+      pollIntervalMs: TEN_MINUTES_MS,
+      validateReuse: async () => MISSING_REPO_REASON, // never fixed
+    });
+
+    const outcomePromise = applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    const stillPending = Symbol('still-pending');
+    const race = await Promise.race([
+      outcomePromise,
+      new Promise((resolve) => { setTimeout(() => resolve(stillPending), 100); }),
+    ]);
+    expect(race).toBe(stillPending);
+  });
+});
+
+// --- groundnuty/macf#1179 — "cancel this identity" ends ONE gate-2 wait ----
+
+describe('"cancel this identity" (groundnuty/macf#1179)', () => {
+  it('DECISIVE: cancel ends the wait immediately with a cancel-specific reason — never the "orphaned App, finish manually" wording a genuine failure gets', async () => {
+    const deps = baseDeps({
+      startInstallInterstitial: async () => ({
+        startUrl: FAKE_INTERSTITIAL_URL,
+        close: () => Promise.resolve(),
+        waitForCancel: () => Promise.resolve(), // "already clicked" by the time the wait starts
+      }),
+      // Never resolves on its own — ONLY the cancel race can end this wait.
+      waitForAppInstallation: () => new Promise(() => { /* hangs forever */ }),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).toContain('cancelled by the operator');
+      expect(outcome.reason).not.toContain('orphaned');
+      expect(outcome.reason).not.toContain('finish the install manually');
+    }
+  }, 5000);
+
+  it('NEGATIVE — a genuine gate-2 failure (cancel never fires) gets the "App WAS created... finish manually" framing, and NEVER the cancel wording — the two failure shapes stay textually distinguishable', async () => {
+    const deps = baseDeps({
+      startInstallInterstitial: async () => fakeInterstitialHandles(), // waitForCancel omitted -> never fires
+      waitForAppInstallation: async () => { throw new Error('simulated poll failure — not a cancel'); },
+    });
+
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).not.toContain('cancelled by the operator');
+      expect(outcome.reason).toContain('the App WAS created on GitHub');
+    }
+  });
+
+  it('a cancel is never treated as `recoverable` — #1063\'s reopen loop must not retry a deliberate cancel even when allowInstallRetry is set', async () => {
+    const startInstallInterstitial = vi.fn(async () => ({
+      startUrl: FAKE_INTERSTITIAL_URL,
+      close: () => Promise.resolve(),
+      waitForCancel: () => Promise.resolve(),
+    }));
+    const deps = baseDeps({
+      startInstallInterstitial,
+      allowInstallRetry: true,
+      waitForOperatorFix: async () => {},
+      waitForAppInstallation: () => new Promise(() => { /* hangs forever */ }),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(outcome.status).toBe('failed');
+    // Exactly ONE page open — a reopen would mean the cancel was mistaken
+    // for a recoverable rejection and re-tried.
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
+  }, 5000);
+});
