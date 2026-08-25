@@ -620,6 +620,13 @@ describe('DECISIVE — the preview never claims a repo the live gate does not (g
     const logs: string[] = [];
     const deps = baseDeps({
       log: (l) => logs.push(l),
+      // groundnuty/macf#1178 — this fixture's validateInstall never
+      // accepts, so the resumed gate's auto-poll (pollForInstallFix) runs
+      // to its OWN timeout; keep the budget tiny so this test (which only
+      // cares about what got LOGGED, not the final outcome) doesn't wait
+      // out the real 10-minute default.
+      gateTimeoutMs: 30,
+      pollIntervalMs: 10,
       confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
       findRecoveryArtifact: async () => RECOVERED,
       validateInstall: () => ({

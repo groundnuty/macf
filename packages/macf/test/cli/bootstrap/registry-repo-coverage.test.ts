@@ -97,10 +97,21 @@ describe('registryRepoCoverageUnknownWarning — names the App + repo, states UN
   });
 });
 
+// groundnuty/macf#1178 — the SHARED offline fake for `existsCheckFn`
+// (`buildRegistryRepoValidateInstall`'s 6th param). `checkRegistryRepoExists`
+// defaults to a REAL unauthenticated `fetch` — every pre-existing test that
+// drives the closure to `presence === 'absent'` must inject a fake here, or
+// it silently makes a real network call (this file's own module doc:
+// "Fully offline"). `'unknown'` mirrors the pre-#1178 behavior exactly —
+// cause (b) is neither ruled in nor out, so `registryRepoNotInstalledReason`
+// takes its `causeBRuledOut: false` branch, same text every pre-#1178 test
+// already asserted against.
+const FAKE_EXISTS_UNKNOWN = async (): Promise<Presence> => 'unknown';
+
 describe('buildRegistryRepoValidateInstall — the AgentApplyDeps.validateInstall/validateReuse closure', () => {
   it('DECISIVE: presence "absent" -> rejects, the rejection names the App and the repo', async () => {
     const checkFn = async (): Promise<Presence> => 'absent';
-    const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn);
+    const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn, FAKE_EXISTS_UNKNOWN);
     const rejection = await validate(INSTALL, '/fake/key.pem');
     expect(rejection).toBeDefined();
     // groundnuty/macf#1063 widened the rejection to `{ message, retryInstruction }`
@@ -116,7 +127,7 @@ describe('buildRegistryRepoValidateInstall — the AgentApplyDeps.validateInstal
 
   it('groundnuty/macf#1063: the "absent" rejection ALSO carries a plain-language retryInstruction — no HTTP verbs, no issue numbers — for the interactive retry dialogue', async () => {
     const checkFn = async (): Promise<Presence> => 'absent';
-    const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn);
+    const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn, FAKE_EXISTS_UNKNOWN);
     const rejection = await validate(INSTALL, '/fake/key.pem');
     if (typeof rejection !== 'object' || rejection.retryInstruction === undefined) {
       throw new Error('expected a retryInstruction on the structured rejection');
@@ -129,12 +140,61 @@ describe('buildRegistryRepoValidateInstall — the AgentApplyDeps.validateInstal
 
   it('groundnuty/macf#1176: the "absent" rejection ALSO carries the specific owner/repo as a structured missingRepos list — not just prose', async () => {
     const checkFn = async (): Promise<Presence> => 'absent';
-    const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn);
+    const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn, FAKE_EXISTS_UNKNOWN);
     const rejection = await validate(INSTALL, '/fake/key.pem');
     if (typeof rejection !== 'object') {
       throw new Error('expected the structured { message, retryInstruction, missingRepos } rejection shape');
     }
     expect(rejection.missingRepos).toEqual(['demo-org/demo-org-registry']);
+  });
+
+  // groundnuty/macf#1178 — cause (b) ("the repo does not exist or was
+  // renamed") is CHECKABLE: when the repo is independently confirmed to
+  // exist, the rejection names ONLY cause (a) — never presents an
+  // already-ruled-out possibility as a coequal guess.
+  it('groundnuty/macf#1178: existsCheckFn "present" -> the rejection rules out cause (b), names only cause (a)', async () => {
+    const checkFn = async (): Promise<Presence> => 'absent';
+    const existsCheckFn = async (): Promise<Presence> => 'present';
+    const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn, existsCheckFn);
+    const rejection = await validate(INSTALL, '/fake/key.pem');
+    if (typeof rejection !== 'object') throw new Error('expected the structured rejection shape');
+    expect(rejection.message).toMatch(/confirmed to exist/);
+    expect(rejection.message).not.toMatch(/does not exist or was renamed/);
+  });
+
+  // The honest-unknown counterpart: `existsCheckFn` returning anything
+  // other than `'present'` (its own honest-unknown floor — see that
+  // function's doc: it can only ever RULE OUT cause (b), never confirm it)
+  // means the cause stays unresolved — framed AS an unknown between two
+  // possibilities, never as two confident coequal guesses.
+  it.each(['unknown', 'absent'] as const)('groundnuty/macf#1178: existsCheckFn "%s" -> the rejection frames the cause as unknown, never two coequal guesses', async (existsPresence) => {
+    const checkFn = async (): Promise<Presence> => 'absent';
+    const existsCheckFn = async (): Promise<Presence> => existsPresence;
+    const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn, existsCheckFn);
+    const rejection = await validate(INSTALL, '/fake/key.pem');
+    if (typeof rejection !== 'object') throw new Error('expected the structured rejection shape');
+    expect(rejection.message).toMatch(/cause is unknown between two possibilities/);
+    expect(rejection.message).not.toMatch(/either \(a\).*or \(b\)/);
+  });
+
+  // groundnuty/macf#1178 — `existsCheckFn`'s answer is memoized: the
+  // closure returned by `buildRegistryRepoValidateInstall` is invoked
+  // repeatedly (once per poll tick, per `pollForInstallFix`), and a repo's
+  // EXISTENCE cannot change mid-run — re-probing it on every tick would
+  // both waste calls and risk the unauthenticated probe's own rate limit
+  // silently flipping an already-ruled-out cause back to unknown.
+  it('groundnuty/macf#1178: existsCheckFn is called AT MOST ONCE across repeated invocations of the returned closure', async () => {
+    const checkFn = async (): Promise<Presence> => 'absent';
+    let existsCalls = 0;
+    const existsCheckFn = async (): Promise<Presence> => {
+      existsCalls += 1;
+      return 'present';
+    };
+    const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn, existsCheckFn);
+    await validate(INSTALL, '/fake/key.pem');
+    await validate(INSTALL, '/fake/key.pem');
+    await validate(INSTALL, '/fake/key.pem');
+    expect(existsCalls).toBe(1);
   });
 
   it('presence "present" -> accepts (undefined), no churn, no warning logged', async () => {

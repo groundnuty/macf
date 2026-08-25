@@ -4888,6 +4888,11 @@ trust:
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         checkRegistryRepoCoverage: async () => 'absent',
+        // groundnuty/macf#1178 — an 'absent' presence now ALSO triggers the
+        // independent existence probe; inject a fake so this test never
+        // makes a real unauthenticated `fetch` call. 'unknown' preserves
+        // this test's pre-#1178 assertions (cause (b) not ruled out).
+        checkRegistryRepoExists: async () => 'unknown',
       };
 
       const result = await applyFleet(manifest, manifestPath, null, deps);
