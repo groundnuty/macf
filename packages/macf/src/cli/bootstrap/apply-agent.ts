@@ -1051,37 +1051,61 @@ export async function applyIdentity(
  * to re-check, so one call answers both "does it exist" and "is it
  * correctly scoped."
  *
- * Returns the short-circuit `AgentApplyOutcome` (skip gate 2 entirely) ONLY
- * when GitHub confirms the install exists AND `deps.validateInstall`
- * accepts it; `undefined` (fall through to the normal gate-2 flow)
+ * Returns `{ action: 'skip-gate-2' }` (skip gate 2 entirely) ONLY when
+ * GitHub confirms the install exists AND `deps.validateInstall` accepts it;
+ * `{ action: 'open-gate-2' }` (fall through to the normal gate-2 flow)
  * otherwise:
  *
  *   - `app-no-install` / `installed-unexpected-target` — the install
  *     genuinely isn't there (yet, or not where expected). Gate opens,
- *     exactly as before this fix.
+ *     exactly as before this fix, with `rejection: undefined` — nothing was
+ *     learned about which repos are covered, so there is nothing to derive
+ *     a resumed-gate instruction from (honest-unknown floor, groundnuty/
+ *     macf#1160).
  *   - `unconfirmable` — the credential could not observe the install THIS
  *     TIME (JWT-mint failure, 401, network, timeout). DR-043 Amendment A's
  *     honest-unknown floor: never read as "absent," so the gate still
- *     opens — but `deps.log` states WHY it couldn't skip, rather than
- *     silently gating with no explanation.
+ *     opens (`rejection: undefined`, same reasoning as above) — but
+ *     `deps.log` states WHY it couldn't skip, rather than silently gating
+ *     with no explanation.
  *   - `confirmed` but `deps.validateInstall` rejects (wrong repo scope,
  *     unreachable registry repo) — never silently accepted as "already
  *     done" (this must not weaken the `install-scope.ts` refusal). The
  *     normal gate-2 flow re-observes the SAME confirmed install almost
  *     immediately (the poll's first check) and reports the identical
  *     rejection through the established `allowInstallRetry` reopen loop —
- *     no new failure handling invented here.
+ *     no new failure handling invented here. **groundnuty/macf#1160:** the
+ *     REJECTION itself is now returned (`{ action: 'open-gate-2', rejection
+ *     }`) rather than discarded — this is the "resumed" gate's own
+ *     already-computed observation of what's missing (never a second
+ *     query); {@link finishGate2FromCredentials} uses it to instruct the
+ *     operator to add only what this check found missing, instead of
+ *     restating the FULL required set as if nothing had been done yet.
  *   - A throwing `deps.confirmAppInstallation` is fail-open (inconclusive,
  *     never a silent skip) — same posture `checkAppNameCollision`'s own
- *     catch takes just above in {@link applyIdentity}.
+ *     catch takes just above in {@link applyIdentity}. `rejection:
+ *     undefined` — the throw means nothing was observed.
  */
+type Gate2PreflightResult =
+  | { readonly action: 'skip-gate-2'; readonly outcome: AgentApplyOutcome }
+  /**
+   * `rejection` (groundnuty/macf#1160) carries whatever
+   * `deps.validateInstall` ALREADY returned during this pre-flight, when it
+   * did — `undefined` when the confirmed-install check never ran at all
+   * (no confirmed install to check, or the confirm itself threw/couldn't
+   * observe). {@link finishGate2FromCredentials} is the ONLY consumer; it
+   * never re-queries to fill this in — the honest-unknown floor for this
+   * field is "no resumed-gate instruction," not "guess one."
+   */
+  | { readonly action: 'open-gate-2'; readonly rejection: InstallRejection | undefined };
+
 async function skipGate2IfAlreadyInstalled(
   role: string,
   creds: AppCredentials,
   expected: ExpectedIdentity,
   pemPath: string,
   deps: AgentApplyDeps,
-): Promise<AgentApplyOutcome | undefined> {
+): Promise<Gate2PreflightResult> {
   let confirmation: IdentityConfirmation;
   try {
     confirmation = await deps.confirmAppInstallation(creds.appId, pemPath, expected);
@@ -1090,26 +1114,92 @@ async function skipGate2IfAlreadyInstalled(
       `Role "${role}": pre-gate-2 install check threw (${errMessage(err)}) — cannot confirm whether the install ` +
         'already exists; opening consent gate 2 to be safe.',
     );
-    return undefined;
+    return { action: 'open-gate-2', rejection: undefined };
   }
   if (confirmation.status === 'unconfirmable') {
     deps.log(
       `Role "${role}": could not confirm whether the install already exists (GitHub was never successfully asked — ` +
         'JWT mint failure, 401, network, or timeout) — opening consent gate 2 to be safe.',
     );
-    return undefined;
+    return { action: 'open-gate-2', rejection: undefined };
   }
-  if (confirmation.status !== 'confirmed') return undefined; // app-no-install / installed-unexpected-target — genuinely needs the gate.
+  // app-no-install / installed-unexpected-target — genuinely needs the gate; nothing about repo coverage was learned.
+  if (confirmation.status !== 'confirmed') return { action: 'open-gate-2', rejection: undefined };
 
   const rejection = await deps.validateInstall?.(confirmation.install, pemPath);
-  if (rejection !== undefined) return undefined; // exists, but scope/coverage is wrong — real work remains; let the normal gate-2 flow handle it.
+  // exists, but scope/coverage is wrong — real work remains; let the normal
+  // gate-2 flow handle it, carrying the rejection forward (groundnuty/macf#1160)
+  // instead of discarding what this check just learned.
+  if (rejection !== undefined) return { action: 'open-gate-2', rejection };
 
   deps.log(
     `Role "${role}": install already confirmed on GitHub (install_id ${confirmation.install.installId}) — skipping ` +
       "consent gate 2. This fleet's vault never recorded this role's install (that mismatch is why the recovery " +
       'path resumed here) — a vault/GitHub drift worth reconciling.',
   );
-  return { role, status: 'created', appId: creds.appId, installId: confirmation.install.installId, credentials: creds };
+  return {
+    action: 'skip-gate-2',
+    outcome: { role, status: 'created', appId: creds.appId, installId: confirmation.install.installId, credentials: creds },
+  };
+}
+
+/**
+ * The RESUMED-gate instruction (groundnuty/macf#1160) — an install for this
+ * App already exists (confirmed live by {@link skipGate2IfAlreadyInstalled}
+ * just above), but the SAME pre-gate-2 check found it insufficient. Reuses
+ * that check's OWN `message`/`retryInstruction` — never re-derives the
+ * required set from the manifest, never issues a second query — so the
+ * operator is told to add only what THIS check found missing, instead of
+ * `runGate2WithInterstitial`'s default "select exactly: <every required
+ * repo>" (which restates repos the operator may already have selected on an
+ * earlier run — the live incident this issue reports). A bare-string
+ * rejection (no `retryInstruction` — e.g. `install-scope.ts`'s scope-only
+ * check, which has no single "missing repo" to name) falls back to its own
+ * `message`; still strictly better than the prior full-list text, which
+ * never mentioned the scope problem at all.
+ */
+function gate2ResumedInstructionLines(rejection: InstallRejection): readonly string[] {
+  const { message, retryInstruction } = rejectionParts(rejection);
+  return [
+    "this App's install already exists from an earlier run — resuming, not starting over.",
+    retryInstruction ?? message,
+  ];
+}
+
+/**
+ * groundnuty/macf#1160 — the `viaRecovery` half of {@link finishGate2FromCredentials},
+ * split out purely to keep that function's own body scannable (same
+ * reasoning `runGate2` was already extracted for). `viaRecovery: false`
+ * (the fresh-mint path) never even calls {@link skipGate2IfAlreadyInstalled}
+ * — same as before this issue — and always resolves `{ opts: {} }`, the
+ * ordinary full-list first attempt.
+ *
+ * On `viaRecovery: true`, resolves ONE of two shapes:
+ *   - `earlyOutcome` set — the pre-flight found an already-good install;
+ *     `finishGate2FromCredentials` returns it, skipping gate 2 entirely
+ *     (unchanged from groundnuty/macf#1137).
+ *   - `earlyOutcome` unset, `opts.instructionLines` set ONLY when the
+ *     pre-flight's `validateInstall` call rejected — the RESUMED-gate
+ *     instruction (see {@link gate2ResumedInstructionLines}), naming only
+ *     what that ALREADY-COMPUTED rejection found missing. `opts` is `{}`
+ *     (the ordinary full-list attempt) whenever the pre-flight learned
+ *     nothing — no confirmed install to check, or the confirm itself
+ *     couldn't observe one — the honest-unknown floor: no observation,
+ *     no delta claim.
+ */
+async function resumeGate2Preflight(
+  viaRecovery: boolean,
+  role: string,
+  creds: AppCredentials,
+  expected: ExpectedIdentity,
+  pemPath: string,
+  deps: AgentApplyDeps,
+): Promise<{ readonly earlyOutcome?: AgentApplyOutcome; readonly opts: { readonly instructionLines?: readonly string[] } }> {
+  if (!viaRecovery) return { opts: {} };
+  const preflight = await skipGate2IfAlreadyInstalled(role, creds, expected, pemPath, deps);
+  if (preflight.action === 'skip-gate-2') return { earlyOutcome: preflight.outcome, opts: {} };
+  if (preflight.rejection === undefined) return { opts: {} };
+  return { opts: { instructionLines: gate2ResumedInstructionLines(preflight.rejection) } };
 }
 
 /**
@@ -1123,9 +1213,9 @@ async function skipGate2IfAlreadyInstalled(
  * which path produced them. `viaRecovery` changes the wording of a
  * gate-2-failure reason (naming the credential's origin for an operator
  * reading the transcript) AND, per groundnuty/macf#1137, runs
- * {@link skipGate2IfAlreadyInstalled} FIRST — the fresh-mint path
- * (`viaRecovery: false`) never does, since an App gate 1 just created
- * cannot already have an install.
+ * {@link skipGate2IfAlreadyInstalled} FIRST (through {@link resumeGate2Preflight},
+ * groundnuty/macf#1160) — the fresh-mint path (`viaRecovery: false`) never
+ * does, since an App gate 1 just created cannot already have an install.
  *
  * **Why the recovered path does NOT call `deps.writeRecoveryArtifact`
  * again:** `AgentApplyDeps.writeRecoveryArtifact`'s own doc says "called
@@ -1152,11 +1242,9 @@ async function finishGate2FromCredentials(
   const gate2Expected: ExpectedIdentity = { appSlug: creds.slug, accountLogin: manifest.owner.account };
   const pemPath = writeScratchPem(role, creds.pem);
   try {
-    if (viaRecovery) {
-      const skip = await skipGate2IfAlreadyInstalled(role, creds, gate2Expected, pemPath, deps);
-      if (skip !== undefined) return skip;
-    }
-    const firstAttempt = await runGate2WithInterstitial(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, {});
+    const preflight = await resumeGate2Preflight(viaRecovery, role, creds, gate2Expected, pemPath, deps);
+    if (preflight.earlyOutcome !== undefined) return preflight.earlyOutcome;
+    const firstAttempt = await runGate2WithInterstitial(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, preflight.opts);
     // groundnuty/macf#1063 — the SAME recoverable-rejection retry the
     // resume-install path gets (see that call site's doc); a no-op unless
     // `firstAttempt` is a recoverable `validateInstall` rejection AND
