@@ -157,6 +157,34 @@ export const FleetTransportSchema = z
      * this field unreachable rather than defaulted.
      */
     router_app_scope: z.enum(['shared', 'per-fleet']).optional().default('shared'),
+    /**
+     * groundnuty/macf#1162 — the ORIGIN fleet of a `'shared'`-scope router
+     * App credential this fleet holds via the (out-of-scope, operator-only)
+     * interim cross-fleet vault copy: `#1094` made the router App
+     * owner-scoped so a second fleet REUSES it, but GitHub has no API to
+     * re-read an App's private key, so the operator manually copies the
+     * FIRST fleet's vault entry into every OTHER fleet's vault
+     * (Amendment C/D: only the operator-privileged CLI decrypts/writes a
+     * vault, never `apply`). Declaring the source fleet HERE is what lets
+     * `apply`'s `fleet.lock` marker (`fleet-lock.ts`'s `scope_credentials`
+     * doc) and `plan`'s standing notice (`plan.ts`'s `scopeCredentialNotice`
+     * doc) name it, rather than leaving N locally-held copies with no
+     * recorded source (the drift surface Amendment N warns about — rotation
+     * has nowhere to enumerate without this).
+     *
+     * Optional; only meaningful when this run's router App resolves the
+     * cross-fleet `'vault-reused'` outcome (`router_app_scope: shared`,
+     * `apply-router-app.ts::RouterAppApplyOutcome`'s doc) — a `'per-fleet'`
+     * scope fleet, or a `'shared'`-scope fleet that is ITSELF the
+     * originating fleet (created/reused its own App this run or a prior
+     * one), genuinely owns its credential and never writes this marker
+     * regardless of whether this field is set. Undeclared is honest
+     * "operator has not named a source yet," never an error — `plan`
+     * still surfaces the marker (sourced from `fleet.lock` if `apply` has
+     * already run) with an explicit "origin not declared" note rather than
+     * silently omitting it.
+     */
+    router_app_origin_fleet: z.string().min(1).optional(),
   })
   .strict();
 
@@ -468,6 +496,48 @@ export const FleetLockAgentSchema = z
   })
   .strict();
 
+/**
+ * groundnuty/macf#1162 — provenance-only marker for a credential this fleet
+ * holds a LOCAL COPY of rather than one it minted/confirmed itself (today:
+ * only the router App's `'vault-reused'` cross-fleet-shared-scope outcome —
+ * `apply-router-app.ts::RouterAppApplyOutcome`'s doc). Deliberately NOT an
+ * `agents[]` entry: that array's `install_id` is a REQUIRED, GitHub-confirmed
+ * installation id, and a vault-reused credential was never live-reconfirmed
+ * THIS run (no install to record) — see this schema's `install_id` field
+ * and `apply-router-app.ts`'s doc for why `apply-fleet.ts` cannot produce
+ * one here even if it wanted to.
+ *
+ * The four literal fields spell out, IN THE RAW JSON, exactly what the
+ * interim state is — `scope-level · held locally · origin_fleet ·
+ * pending: scope-store` — so a future reader (human or the eventual
+ * `#1084` scope-store migration) does not need to consult this schema's
+ * docstring to understand what they are looking at; the marker is
+ * self-describing on disk. `origin_fleet` is OPTIONAL (not a sentinel
+ * string like `"unknown"` — a real fleet could be named that) because an
+ * operator who performs the interim cross-fleet vault copy without also
+ * declaring `transport.router_app_origin_fleet` in `fleet.yaml` still gets
+ * a marker (never silently indistinguishable from genuine ownership) — just
+ * one that honestly omits a source it was never told.
+ *
+ * Provenance ONLY — nothing in this codebase reads this field to change
+ * behaviour (`composeFleetLock`'s own module doc); it exists so a reader
+ * can tell "this is the interim workaround" from "this is the design," and
+ * so rotation has a known source to enumerate rather than N equally
+ * plausible, unattributed local copies (the drift class the originating
+ * Amendment warns about).
+ */
+export const ScopeCredentialMarkerSchema = z
+  .object({
+    role: z.string().min(1),
+    scope: z.literal('scope-level'),
+    held: z.literal('locally'),
+    origin_fleet: z.string().min(1).optional(),
+    pending: z.literal('scope-store'),
+  })
+  .strict();
+
+export type ScopeCredentialMarker = z.infer<typeof ScopeCredentialMarkerSchema>;
+
 export const FleetLockSchema = z
   .object({
     schema_version: z.literal(FLEET_LOCK_SCHEMA_VERSION),
@@ -482,6 +552,13 @@ export const FleetLockSchema = z
     // and lives only in the vault (Amendment C) — `apply` never fingerprints
     // a value it never mints.
     fingerprints: z.record(z.string(), z.string()).optional(),
+    // groundnuty/macf#1162 — see `ScopeCredentialMarkerSchema`'s doc. Added
+    // as a NEW optional field, no `FLEET_LOCK_SCHEMA_VERSION` bump: an
+    // additive optional key doesn't change any EXISTING field's meaning
+    // (the version-bump contract this schema's callers rely on) — the same
+    // precedent `deployed_version` itself set when it was added after this
+    // schema's introduction without bumping the version either.
+    scope_credentials: z.array(ScopeCredentialMarkerSchema).optional(),
   })
   .strict();
 
