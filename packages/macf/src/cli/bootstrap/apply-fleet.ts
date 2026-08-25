@@ -1269,6 +1269,24 @@ export async function applyFleet(
     identityChanges.push(...composed.identityChanges);
   };
 
+  // groundnuty/macf#1162 — the sibling of `writeIncrementalLock` for a
+  // credential this run did NOT mint/confirm itself (today: only the
+  // router App's cross-fleet `'vault-reused'` outcome — see
+  // `fleet-lock.ts::ScopeCredentialUpdate`'s doc for why this can never be
+  // an `agentUpdates` entry). `agentUpdates: {}` — this write touches NO
+  // agent; every prior agent entry carries forward verbatim through
+  // `composeFleetLock`'s own no-prune contract.
+  const writeScopeCredentialMarker = (role: string, originFleet: string | undefined): void => {
+    const composed = composeFleetLock({
+      fleet: manifest.metadata.name,
+      previous: currentLock,
+      agentUpdates: {},
+      scopeCredentials: [{ role, ...(originFleet !== undefined ? { originFleet } : {}) }],
+    });
+    writeFleetLock(lockPath, composed.lock);
+    currentLock = composed.lock;
+  };
+
   // groundnuty/macf#1012 — computed ONCE (fleet-level, not per-agent):
   // `registry.type === 'repo'` is the only registry shape this run needs to
   // live-verify install coverage for. `type: profile`/`org`/`local` never
@@ -1748,13 +1766,19 @@ export async function applyFleet(
   if (sharedReuseDecision?.kind === 'reuse') {
     // groundnuty/macf#1082 — the vault already carries this App's id/key
     // (an EXISTING App the operator supplied, possibly minted by a
-    // different fleet entirely). Publish those values, mint NOTHING — no
-    // fleet.lock write (this fleet resolved nothing NEW this run; the
-    // vault, not the lock, is this scope's source of truth for reuse) and
-    // no `pendingRoutingAppVaultSecrets` (re-writing what was just read
-    // back would be pointless at best and, since the value is unchanged,
+    // different fleet entirely). Publish those values, mint NOTHING — NO
+    // `agents[]` fleet.lock entry (this fleet resolved no NEW install this
+    // run, and `install_id` is required there — see
+    // `fleet-lock.ts::ScopeCredentialUpdate`'s doc) and no
+    // `pendingRoutingAppVaultSecrets` (re-writing what was just read back
+    // would be pointless at best and, since the value is unchanged,
     // harmless — but the "never overwrite" discipline is simplest to keep
     // exactly by never touching the vault payload on this path at all).
+    // groundnuty/macf#1162 — corrected: this run DOES still write to
+    // fleet.lock below (a `scope_credentials` provenance marker, never an
+    // `agents[]` entry) — "the vault, not the lock, is this scope's source
+    // of truth for reuse" is still true for WHERE the credential VALUE
+    // lives, but no longer true for "nothing is written to the lock."
     routerAppIdentity = { role: ROUTER_APP_ROLE, status: 'vault-reused', appId: sharedReuseDecision.appId };
   } else if (sharedReuseDecision?.kind === 'name-taken') {
     // groundnuty/macf#1082 — no vault credentials, but the shared name is
@@ -1794,8 +1818,20 @@ export async function applyFleet(
       installId: routerAppIdentity.installId,
       secrets: { app_private_key: routerAppIdentity.credentials.pem },
     };
+  } else if (routerAppIdentity.status === 'vault-reused') {
+    // groundnuty/macf#1162 — record the interim as an interim, not
+    // silently indistinguishable from genuine ownership (see
+    // `fleet-manifest.ts::ScopeCredentialMarkerSchema`'s doc). Written
+    // UNCONDITIONALLY on this outcome, whether or not
+    // `transport.router_app_origin_fleet` is declared — an undeclared
+    // origin still gets a marker (just one honestly omitting a source it
+    // was never told), because the alternative (no marker at all) is
+    // exactly the silent-workaround-looks-like-ownership shape this issue
+    // exists to close.
+    writeScopeCredentialMarker(ROUTER_APP_ROLE, manifest.transport.router_app_origin_fleet);
   }
-  // vault-reused: no lock write (see the branch above). skipped-unverified /
+  // vault-reused: writes the scope_credentials marker above, never an
+  // agents[] entry (see that branch's comment). skipped-unverified /
   // drift / failed: no lock write this run either — same "unresolved this
   // run" posture the runner-ops block above applies to its own identical
   // statuses.

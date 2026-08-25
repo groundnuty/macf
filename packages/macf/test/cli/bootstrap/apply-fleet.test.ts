@@ -5523,11 +5523,17 @@ trust:
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
       expect(result.routerApp).toEqual({ role: 'router', status: 'vault-reused', appId: EXISTING_ROUTER_APP_ID });
-      // No fleet.lock entry for 'router' — the vault, not the lock, is this
-      // scope's source of truth for reuse (nothing NEW was resolved this run).
+      // No agents[] entry for 'router' — the vault, not the lock, is this
+      // scope's source of truth for the credential VALUE (nothing NEW was
+      // resolved this run, no install to confirm).
       expect(existsSync(result.lockPath)).toBe(true);
       const lock: FleetLock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
       expect(lock.agents.some((a) => a.role === 'router')).toBe(false);
+      // groundnuty/macf#1162 — but a PROVENANCE marker IS written (this
+      // manifest declares no `router_app_origin_fleet`, so it honestly
+      // omits `origin_fleet` rather than a fabricated sentinel — the
+      // "origin declared" case is covered by the DECISIVE pair below).
+      expect(lock.scope_credentials).toEqual([{ role: 'router', scope: 'scope-level', held: 'locally', pending: 'scope-store' }]);
 
       // THE byte-identity assertion (assert-the-wrong-path.md: "byte-identity
       // of untouched state") — the SAME two lines, character-for-character,
@@ -5650,6 +5656,105 @@ trust:
       // Per-fleet scope never runs resolveSharedRouterAppReuse at all —
       // the shared-scope vault-check seam is untouched.
       expect(readVaultRouterAppCalls).toBe(0);
+    });
+  });
+
+  // --- groundnuty/macf#1162 — the DECISIVE PAIR for the scope-credential
+  // provenance marker: a fleet holding a scope-level (cross-fleet-copied)
+  // router credential gets a marker naming its origin; a fleet that
+  // genuinely owns its router App (never resolved 'vault-reused') gets
+  // NONE — otherwise the marker means nothing (per assert-the-wrong-path.md,
+  // the negative half is what gives the positive half meaning). ---
+  describe('router App — scope-credential provenance marker (groundnuty/macf#1162)', () => {
+    function sharedScopeManifestWithOrigin(originFleet: string | undefined): FleetManifest {
+      const base = manifestWith([CODE_AGENT]);
+      return {
+        ...base,
+        transport: {
+          age_recipients: base.transport.age_recipients,
+          router_app_scope: 'shared',
+          ...(originFleet !== undefined ? { router_app_origin_fleet: originFleet } : {}),
+        },
+      };
+    }
+
+    it('DECISIVE 1/2: router key present-but-scope-level, origin DECLARED -> fleet.lock carries the marker naming the origin fleet', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = sharedScopeManifestWithOrigin('macf-fresh-1');
+      const ROUTER_PEM = 'EXISTING-SHARED-ROUTER-PEM-FOR-1162';
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: () => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          startManifestFlow: async (opts) => {
+            if (opts.role === 'router') throw new Error('must not be called — the router App resolved via vault-reuse');
+            return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
+          },
+          exchangeManifestCode: async () => creds('code-agent'),
+        }),
+        vaultDeps: { exists: () => true, encrypt: async (_pt, _r, outPath) => writeFileSync(outPath, 'FAKE-CIPHERTEXT') },
+        identityKeyPath: '/fake/operator-key.txt',
+        vaultComposeDeps: {
+          exists: () => true,
+          assertIdentityReadable: () => {},
+          decrypt: async () => `MACF_ROUTING_APP_ID='9001'\nMACF_ROUTING_APP_KEY_B64='${Buffer.from(ROUTER_PEM).toString('base64')}'\n`,
+          encrypt: async () => {},
+          rename: () => {},
+          unlink: () => {},
+        },
+        routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '9001', appKeyPem: ROUTER_PEM }) },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routerApp).toEqual({ role: 'router', status: 'vault-reused', appId: '9001' });
+      const rawLockText = readFileSync(result.lockPath, 'utf-8');
+      const lock: FleetLock = parseFleetLock(rawLockText);
+      // Still no agents[] entry (no install was confirmed this run) — the
+      // marker is additive, not a substitute for that existing contract.
+      expect(lock.agents.some((a) => a.role === 'router')).toBe(false);
+      expect(lock.scope_credentials).toEqual([
+        { role: 'router', scope: 'scope-level', held: 'locally', origin_fleet: 'macf-fresh-1', pending: 'scope-store' },
+      ]);
+      // The marker never carries key material — assert against the
+      // SERIALIZED STRING (what's actually on disk), not the parsed object.
+      expect(rawLockText).not.toContain(ROUTER_PEM);
+      expect(rawLockText).not.toContain('BEGIN');
+      expect(rawLockText).not.toContain('PRIVATE KEY');
+    });
+
+    it('DECISIVE 2/2: a fleet whose router it genuinely owns (per-fleet scope, freshly created this run) -> NO marker', async () => {
+      const manifestPath = manifestPathIn();
+      // manifestWith(...) defaults to router_app_scope: 'per-fleet' — this
+      // fleet mints its OWN dedicated App; 'vault-reused' is unreachable.
+      const manifest = manifestWith([CODE_AGENT]);
+      expect(manifest.transport.router_app_scope).toBe('per-fleet');
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: () => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          exchangeManifestCode: async () => creds('router'),
+          waitForAppInstallation: async (opts) => ({
+            appId: opts.appId,
+            installId: 'install-router',
+            appSlug: opts.expected.appSlug ?? '',
+            accountLogin: 'groundnuty',
+            repositorySelection: 'selected',
+          }),
+        }),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routerApp.status).toBe('created');
+      const lock: FleetLock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
+      expect(lock.agents.some((a) => a.role === 'router')).toBe(true);
+      // THE negative assertion: the key that would prove "genuinely owns"
+      // is that the marker's absence is a full key-absence, not an empty
+      // array — `composeFleetLock` omits the key entirely when nothing
+      // qualifies (see fleet-lock.ts's `mergeScopeCredentials` doc).
+      expect(lock.scope_credentials).toBeUndefined();
+      expect(Object.hasOwn(lock, 'scope_credentials')).toBe(false);
     });
   });
 
