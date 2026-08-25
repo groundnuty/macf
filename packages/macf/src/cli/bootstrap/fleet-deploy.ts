@@ -82,7 +82,7 @@ import type { VaultReadOptions } from './vault-read.js';
 import { queryVaultAgentPresence, queryVaultCaPresence } from './vault-read.js';
 import { secretFingerprint } from './fleet-lock.js';
 import type { InitOptions } from '../commands/init.js';
-import { defaultAgentKeyPath } from '../commands/init.js';
+import { defaultAgentKeyPath, legacyAgentKeyPath } from '../commands/init.js';
 import { caCertPath, caKeyPath, agentCertPath, agentKeyPath } from '../config.js';
 
 const execFileAsync = promisify(execFile);
@@ -724,12 +724,19 @@ export interface FleetDeployDeps {
   readonly mintCloneToken: (source: TokenSource) => Promise<string>;
   /**
    * Resolves the destination App-key path for a role. Defaults to
-   * `defaultAgentKeyPath` (the conventional `~/.macf/keys/<role>.pem`,
-   * matching `bootstrap-emit-commands.sh`'s emitted `--app-key` path AND
+   * {@link resolveDefaultKeyPath} — the fleet-scoped conventional
+   * `~/.macf/keys/<fleet>/<role>.pem` (macf#1157; matches
+   * `bootstrap-emit-commands.sh`'s emitted `--app-key` path AND
    * `initAgent`'s own internal default when `--key-path` is omitted — see
-   * `commands/init.ts::ingestAndResolveKeyPath`). **Tests MUST override this
-   * to a scratch directory** — the default resolves under the REAL
-   * operator's home directory, which may hold a real, live fleet's key.
+   * `commands/init.ts::ingestAndResolveKeyPath`), falling back to the
+   * pre-#1157 flat `~/.macf/keys/<role>.pem` ONLY when a key already lives
+   * there AND its fingerprint matches this role's vault entry (see
+   * {@link resolveDefaultKeyPath}'s own doc for the full "read-old-write-new"
+   * rule). **Tests MUST override this to a scratch directory** — the
+   * default resolves under the REAL operator's home directory, which may
+   * hold a real, live fleet's key (and skips the legacy-path fallback
+   * entirely — that fallback only ever runs for the unoverridden default,
+   * see {@link deployAgent}'s call site).
    */
   readonly keyPathFor?: (role: string) => string;
   /**
@@ -933,6 +940,53 @@ function detectKeyStatus(role: string, keyPath: string, vaultPem: string): KeyDe
 }
 
 /**
+ * Resolve the DEFAULT (no `deps.keyPathFor` override) on-disk App-key path
+ * for a role, applying the macf#1157 "read-old-write-new" back-compat rule.
+ *
+ * The fleet-scoped conventional path ({@link defaultAgentKeyPath} —
+ * `~/.macf/keys/<fleet>/<role>.pem`) wins whenever anything already lives
+ * there. Otherwise, a pre-#1157 FLAT legacy key
+ * ({@link legacyAgentKeyPath} — `~/.macf/keys/<role>.pem`, no fleet
+ * segment) is reused IN PLACE when — and only when — its fingerprint
+ * matches THIS role's vault entry, via the SAME {@link detectKeyStatus}
+ * comparison every other key-trust decision in this module already makes.
+ * No new trust primitive, no weakening of the mismatch refusal: this is
+ * strictly an additional CANDIDATE path, checked with the identical rigor
+ * as the conventional one.
+ *
+ * A legacy key that does NOT match is simply irrelevant to this fleet —
+ * most likely a DIFFERENT fleet's key that happens to share this role name
+ * (the exact collision macf#1157 reports). It is silently ignored, never
+ * compared against for a refusal, and the fleet-scoped path materializes
+ * fresh from the vault exactly as if no legacy file existed. A legacy file
+ * that fails to PARSE at all is treated the same way (ignored, not
+ * refused) — an unparseable stranger file at the flat path is not this
+ * fleet's problem to diagnose; {@link detectKeyStatus} still refuses loud
+ * the moment something actually needs the CONVENTIONAL path's own content.
+ *
+ * Only ever called when `deps.keyPathFor` is undefined (the production
+ * default) — see {@link deployAgent}'s call site. A caller-supplied
+ * override takes full control of path resolution and never reaches this
+ * function, so it never falls back to a real `homedir()`-rooted path
+ * either.
+ */
+function resolveDefaultKeyPath(fleetName: string, role: string, vaultPem: string): string {
+  const conventional = defaultAgentKeyPath(fleetName, role);
+  if (existsSync(conventional)) return conventional;
+  const legacy = legacyAgentKeyPath(role);
+  if (existsSync(legacy)) {
+    try {
+      if (detectKeyStatus(role, legacy, vaultPem).kind === 'match') return legacy;
+    } catch {
+      // Unparseable legacy file — not this fleet's concern; fall through
+      // to fresh materialization at the fleet-scoped path below, exactly
+      // as if the legacy file didn't exist.
+    }
+  }
+  return conventional;
+}
+
+/**
  * Resolve `keyPath`'s materialization state against the vault's credential,
  * per macf#975: an ABSENT key is written fresh (unchanged from before this
  * fix). A PRESENT key is trusted only when its PUBLIC-KEY fingerprint
@@ -1093,7 +1147,11 @@ export async function deployAgent(
       caCertPathFor: deps.caCertPathFor ?? caCertPath,
       caKeyPathFor: deps.caKeyPathFor ?? caKeyPath,
     };
-    const keyPath = (deps.keyPathFor ?? defaultAgentKeyPath)(role);
+    // macf#1157: the fleet-scoped default (with legacy-path back-compat)
+    // ONLY applies when the caller hasn't overridden resolution — an
+    // override (always used in tests, per `keyPathFor`'s own doc) fully
+    // owns path resolution and never sees the legacy fallback either.
+    const keyPath = deps.keyPathFor ? deps.keyPathFor(role) : resolveDefaultKeyPath(manifest.metadata.name, role, creds.privateKeyPem);
 
     // Combined-stale pre-check (macf#982) — see this function's own doc
     // "Both the CA and the App key are PEEKED AT" section. Read-only: ONLY
