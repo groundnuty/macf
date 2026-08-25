@@ -1587,6 +1587,64 @@ describe('instruction-before-navigation ordering (the decisive test, groundnuty/
   });
 });
 
+// --- groundnuty/macf#1179 — the ANNOUNCE line precedes the instructions,
+// which precede the page opening — asserted in EMITTED ORDER, not merely
+// "both present somewhere". The operator's own model: (1) announce a window
+// will open, (2) print the instructions, (3) the browser shows them too,
+// (4) state waiting and block. A test that only checked the announce
+// sentence EXISTS would pass even if it were logged after the instructions
+// or after the browser already opened — exactly the ordering bug #952/#971
+// already fixed once for the instructions-vs-open pair; this pins the THIRD
+// event into the same chain.
+
+describe('announce-before-instructions-before-open ordering (the decisive test, groundnuty/macf#1179)', () => {
+  it('gate 1: the announce line ("a window will open") is logged BEFORE any instruction line, which is logged BEFORE openUrl', async () => {
+    const events: string[] = [];
+    const deps = baseDeps({
+      log: (line: string) => { events.push(`log:${line}`); },
+      openUrl: async (url: string) => { events.push(`open:${url}`); },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    const announceIndex = events.findIndex((e) => e.startsWith('log:') && /window will open/i.test(e));
+    const firstInstructionIndex = events.findIndex((e) => e.startsWith('log:') && /creating GitHub App/i.test(e));
+    const openIndex = events.findIndex((e) => e === 'open:http://127.0.0.1:9/');
+
+    expect(announceIndex).toBeGreaterThanOrEqual(0);
+    expect(firstInstructionIndex).toBeGreaterThanOrEqual(0);
+    expect(openIndex).toBeGreaterThanOrEqual(0);
+    expect(announceIndex).toBeLessThan(firstInstructionIndex);
+    expect(firstInstructionIndex).toBeLessThan(openIndex);
+  });
+
+  it('gate 2: the announce line ALSO precedes the "Only select repositories" instruction, which precedes openUrl(interstitial.startUrl)', async () => {
+    const events: string[] = [];
+    const deps = baseDeps({
+      log: (line: string) => { events.push(`log:${line}`); },
+      openUrl: async (url: string) => { events.push(`open:${url}`); },
+      startInstallInterstitial: async () => fakeInterstitialHandles(),
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    const instructionIndex = events.findIndex((e) => e.startsWith('log:') && e.includes('Only select repositories'));
+    const gate2OpenIndex = events.findIndex((e) => e === `open:${FAKE_INTERSTITIAL_URL}`);
+
+    // At least one announce line exists before gate 2's open — narrow to the
+    // LAST announce line before that open (gate 1's own announce fired
+    // earlier in the same run; this asserts gate 2's, not gate 1's).
+    const announceIndicesBeforeOpen = events
+      .map((e, i) => ({ e, i }))
+      .filter(({ e, i }) => e.startsWith('log:') && /window will open/i.test(e) && i < gate2OpenIndex);
+    expect(announceIndicesBeforeOpen.length).toBeGreaterThan(0);
+    const lastAnnounceBeforeGate2Open = announceIndicesBeforeOpen[announceIndicesBeforeOpen.length - 1]!.i;
+
+    expect(instructionIndex).toBeGreaterThanOrEqual(0);
+    expect(gate2OpenIndex).toBeGreaterThanOrEqual(0);
+    expect(lastAnnounceBeforeGate2Open).toBeLessThan(instructionIndex);
+    expect(instructionIndex).toBeLessThan(gate2OpenIndex);
+  });
+});
+
 // --- groundnuty/macf#952 follow-up — the operator-beat happens AFTER the
 // instructions are logged and BEFORE the browser opens ---
 //

@@ -280,8 +280,15 @@ export async function confirmBeforeCreateGuard(
  */
 export type InstallRejection = string | { readonly message: string; readonly retryInstruction?: string; readonly missingRepos?: readonly string[] };
 
-/** Normalizes an {@link InstallRejection} to its logical parts — the ONE place `runGate2`, `applyIdentity`'s reuse-confirmed branch, and `resumeGate2Preflight` extract `message`/`retryInstruction`/`missingRepos`, so none of the three drift on how a bare string degrades. */
-function rejectionParts(rejection: InstallRejection): { readonly message: string; readonly retryInstruction?: string; readonly missingRepos?: readonly string[] } {
+/**
+ * Normalizes an {@link InstallRejection} to its logical parts — the ONE place
+ * `runGate2`, `applyIdentity`'s reuse-confirmed branch, and
+ * `resumeGate2Preflight` extract `message`/`retryInstruction`/`missingRepos`,
+ * so none of the three drift on how a bare string degrades. Exported
+ * (groundnuty/macf#1179) so `gate2-diagnosis.ts`'s classifier reads the SAME
+ * normalization — a FOURTH consumer via import, not a re-derived copy.
+ */
+export function rejectionParts(rejection: InstallRejection): { readonly message: string; readonly retryInstruction?: string; readonly missingRepos?: readonly string[] } {
   return typeof rejection === 'string' ? { message: rejection } : rejection;
 }
 
@@ -617,6 +624,20 @@ export function cleanupScratchPem(pemPath: string): void {
  * text exists in the transcript" to "the operator had a beat to read it
  * before the browser took focus." See that field's own doc on `AgentApplyDeps`
  * for why the production wiring never blocks a headless run.
+ *
+ * **groundnuty/macf#1179 — the ANNOUNCE line is now its own, separate first
+ * step, ahead of `instructionLines`.** The operator's own model: (1) announce
+ * a window WILL open, (2) print the instructions, (3) the browser shows the
+ * same instructions, (4) state waiting and block. Before this issue, the
+ * "opening this URL…" sentence below did double duty as both the announce
+ * AND the open-trigger line, printed AFTER every instruction — so an
+ * operator's first signal that a browser was about to take focus arrived
+ * only once the instructions had already scrolled past. Announcing FIRST
+ * matters independent of whether the auto-open even succeeds (module doc,
+ * `manifest-flow-server.ts` and this file's own module doc both already
+ * record that `openUrl()` can return successfully with no tab ever
+ * appearing) — the operator now knows to go look BEFORE reading what to do
+ * once they get there, not after.
  */
 async function announceAndOpenGate(
   deps: Pick<AgentApplyDeps, 'log' | 'openUrl' | 'waitForOperatorBeat'>,
@@ -627,6 +648,11 @@ async function announceAndOpenGate(
   opts: { readonly fatal: boolean; readonly caveat?: string; readonly instructionLines?: readonly string[]; readonly repoNames?: readonly string[] },
 ): Promise<void> {
   const caveatSuffix = opts.caveat !== undefined ? ` ${opts.caveat}` : '';
+  // groundnuty/macf#1179 — step 1 of the model: announce BEFORE anything
+  // else, including the instructions that follow. Recoverable even when the
+  // auto-open below silently fails (the URL is already printed by the time
+  // any failure could occur).
+  deps.log(`Role "${role}": ${gateLabel} — a window will open in your browser now; go look for it.`);
   for (const line of opts.instructionLines ?? []) {
     deps.log(`Role "${role}": ${line}`);
   }
