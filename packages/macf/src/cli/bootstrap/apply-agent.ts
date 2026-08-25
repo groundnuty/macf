@@ -1455,6 +1455,26 @@ async function startInterstitialOrFallback(deps: AgentApplyDeps, role: string, o
 }
 
 /**
+ * The two repo-selection sentences — "choose Only select repositories" +
+ * "select exactly: <repos>" — exported (groundnuty/macf#1173) so this is
+ * the ONE authored copy for every surface that says it, not just the live
+ * gate 2 pair: `gate2DefaultInstructionLines` below (terminal + served
+ * interstitial) AND `bootstrap-apply.ts`'s `--dry-run`/pre-approval preview,
+ * which — before this export existed — hand-typed its OWN one-line
+ * paraphrase of the same two facts ("NEVER" instead of "NOT", combined into
+ * a single sentence). That preview line was a fifth independently-authored
+ * copy of this exact instruction, found during this issue's own
+ * enumeration requirement; it now renders these two lines verbatim instead
+ * of restating them.
+ */
+export function gate2RepoSelectionInstructionLines(repos: readonly string[]): readonly [string, string] {
+  return [
+    'on the page that opens, choose "Only select repositories" — NOT "All repositories".',
+    `select exactly: ${repos.length > 0 ? repos.join(', ') : '(no repos declared in the fleet manifest — verify before installing)'}`,
+  ];
+}
+
+/**
  * The default, first-gate instruction body (groundnuty/macf#952) — every
  * pre-#1063 call site (no `opts.instructionLines` override) gets exactly
  * this, byte-identical to before that field existed. Pulled out to a named
@@ -1466,8 +1486,7 @@ async function startInterstitialOrFallback(deps: AgentApplyDeps, role: string, o
  */
 function gate2DefaultInstructionLines(repos: readonly string[], whyText: string, installUrl: string): readonly string[] {
   return [
-    'on the page that opens, choose "Only select repositories" — NOT "All repositories".',
-    `select exactly: ${repos.length > 0 ? repos.join(', ') : '(no repos declared in the fleet manifest — verify before installing)'}`,
+    ...gate2RepoSelectionInstructionLines(repos),
     whyText,
     `GitHub's install page: ${installUrl}`,
   ];

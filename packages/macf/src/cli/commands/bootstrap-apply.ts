@@ -46,7 +46,7 @@ import type { GitHubAppManifest } from '../bootstrap/app-manifest.js';
 import { buildAppManifest, repoHomepageUrl } from '../bootstrap/app-manifest.js';
 import { appInstallationUrl, confirmAppInstallation as realConfirmAppInstallation } from '../bootstrap/identity-confirm.js';
 import type { ExpectedIdentity, IdentityConfirmation } from '../bootstrap/identity-confirm.js';
-import { confirmBeforeCreateGuard, installReposForIdentity, realAgentApplyDeps } from '../bootstrap/apply-agent.js';
+import { confirmBeforeCreateGuard, gate2RepoSelectionInstructionLines, installReposForIdentity, realAgentApplyDeps } from '../bootstrap/apply-agent.js';
 import type { CreateGuardDecision, CreateGuardDeps } from '../bootstrap/apply-agent.js';
 import { realCloneRepo, realCommitAndPush } from '../bootstrap/apply-repo-init.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
@@ -484,10 +484,17 @@ export function formatPlannedAppCreations(
     // because they were the only two types that check-with-refusal applied
     // to; now that every App type does, the preview shows it for every
     // planned creation, not a subset).
-    parts.push(
-      `      ⚠ on the install page: choose "Only select repositories" and select exactly: ` +
-        `${c.installRepos.join(', ')} — NEVER "All repositories".`,
-    );
+    //
+    // groundnuty/macf#1173 — the two lines below are `gate2RepoSelectionInstructionLines`
+    // VERBATIM (the exact wording the live gate-2 terminal + served
+    // interstitial also print), not this preview's own paraphrase. Before
+    // this fix the paraphrase ("NEVER" vs "NOT", one sentence vs two) was a
+    // fifth independently-authored copy of this instruction — found during
+    // this issue's own enumeration requirement, alongside the four sites
+    // #1156/#1164/#1168 already closed.
+    for (const line of gate2RepoSelectionInstructionLines(c.installRepos)) {
+      parts.push(`      ⚠ ${line}`);
+    }
   }
   parts.push('', budgetLine);
   return parts.join('\n');
