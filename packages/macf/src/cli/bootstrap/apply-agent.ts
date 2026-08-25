@@ -264,11 +264,23 @@ export async function confirmBeforeCreateGuard(
  * a bare-string rejection) falls back to `message` for the dialogue too —
  * preserves every pre-#1063 caller's behavior exactly (see
  * {@link rejectionParts}).
+ *
+ * `missingRepos` (groundnuty/macf#1176) lets a rejecting hook name the
+ * SPECIFIC `owner/repo`(s) it found missing, structurally — a bare
+ * `retryInstruction` sentence names the repo in PROSE ("add
+ * groundnuty/demo-fresh-control under Repository access…"), which is fine
+ * for reading but not something a caller can safely re-derive a copyable
+ * repo list from (parsing prose is fragile). Only
+ * `registry-repo-coverage.ts::buildRegistryRepoValidateInstall` supplies it
+ * today — the one rejecting hook with an actual specific repo in hand;
+ * every other rejection (a bare string, or `{message}` with no
+ * `missingRepos`) omits it, and callers fall back to the identity's FULL
+ * required set (see `runGate2WithInterstitial`'s doc) rather than guessing.
  */
-export type InstallRejection = string | { readonly message: string; readonly retryInstruction?: string };
+export type InstallRejection = string | { readonly message: string; readonly retryInstruction?: string; readonly missingRepos?: readonly string[] };
 
-/** Normalizes an {@link InstallRejection} to its two logical parts — the ONE place both `runGate2` and `applyIdentity`'s reuse-confirmed branch extract `message`/`retryInstruction`, so the two never drift on how a bare string degrades. */
-function rejectionParts(rejection: InstallRejection): { readonly message: string; readonly retryInstruction?: string } {
+/** Normalizes an {@link InstallRejection} to its logical parts — the ONE place `runGate2`, `applyIdentity`'s reuse-confirmed branch, and `resumeGate2Preflight` extract `message`/`retryInstruction`/`missingRepos`, so none of the three drift on how a bare string degrades. */
+function rejectionParts(rejection: InstallRejection): { readonly message: string; readonly retryInstruction?: string; readonly missingRepos?: readonly string[] } {
   return typeof rejection === 'string' ? { message: rejection } : rejection;
 }
 
@@ -611,11 +623,24 @@ async function announceAndOpenGate(
   gateLabel: string,
   url: string,
   waitLabel: string,
-  opts: { readonly fatal: boolean; readonly caveat?: string; readonly instructionLines?: readonly string[] },
+  opts: { readonly fatal: boolean; readonly caveat?: string; readonly instructionLines?: readonly string[]; readonly repoNames?: readonly string[] },
 ): Promise<void> {
   const caveatSuffix = opts.caveat !== undefined ? ` ${opts.caveat}` : '';
   for (const line of opts.instructionLines ?? []) {
     deps.log(`Role "${role}": ${line}`);
+  }
+  // groundnuty/macf#1176 — the copyable payload, printed as its OWN block:
+  // a lead-in sentence (prefixed like every other instruction line) then
+  // the bare names UNPREFIXED and indented — "nothing but the names,
+  // directly copyable, nothing to trim" holds for the indented lines
+  // themselves, not for the sentence introducing them. Mirrors
+  // `manifest-flow-server.ts::renderCopyableRepoBlock`'s browser rendering
+  // — same content, different wrapper (indentation vs `<pre>`).
+  if (opts.repoNames !== undefined && opts.repoNames.length > 0) {
+    deps.log(`Role "${role}": repositories to select (copy exactly, one per line):`);
+    for (const name of opts.repoNames) {
+      deps.log(`    ${name}`);
+    }
   }
   deps.log(
     `Role "${role}": ${gateLabel} — opening this URL in your browser now (if it didn't open, open it yourself): ` +
@@ -831,7 +856,7 @@ export async function applyIdentity(
     // touching `runGate2` again.
     const rejection = await deps.validateReuse?.(decision.install, decision.keyPath);
     if (rejection !== undefined) {
-      const { message, retryInstruction } = rejectionParts(rejection);
+      const { message, retryInstruction, missingRepos } = rejectionParts(rejection);
       deps.log(`Role "${role}": REFUSED on reuse — ${message}`);
       // groundnuty/macf#1063 — the ONE edge back to the gate this issue adds.
       // Pre-#1063 this branch `return`ed here unconditionally (the module
@@ -861,6 +886,7 @@ export async function applyIdentity(
           reason: `existing install re-verification rejected: ${message}`,
           recoverable: true,
           ...(retryInstruction !== undefined ? { retryInstruction } : {}),
+          ...(missingRepos !== undefined ? { missingRepos } : {}),
         },
         deps.validateReuse,
       );
@@ -1157,6 +1183,11 @@ async function skipGate2IfAlreadyInstalled(
  * check, which has no single "missing repo" to name) falls back to its own
  * `message`; still strictly better than the prior full-list text, which
  * never mentioned the scope problem at all.
+ * Also used (groundnuty/macf#1175) as the terminal-only explanation printed
+ * directly by {@link resumeGate2Preflight} when the resumed gate refuses
+ * WITHOUT opening a page — see that function's doc for why the same two
+ * sentences now reach the operator via `deps.log` rather than via
+ * `runGate2WithInterstitial`'s `instructionLines`.
  */
 function gate2ResumedInstructionLines(rejection: InstallRejection): readonly string[] {
   const { message, retryInstruction } = rejectionParts(rejection);
@@ -1171,21 +1202,62 @@ function gate2ResumedInstructionLines(rejection: InstallRejection): readonly str
  * split out purely to keep that function's own body scannable (same
  * reasoning `runGate2` was already extracted for). `viaRecovery: false`
  * (the fresh-mint path) never even calls {@link skipGate2IfAlreadyInstalled}
- * — same as before this issue — and always resolves `{ opts: {} }`, the
- * ordinary full-list first attempt.
+ * — same as before this issue — and always resolves `{}`, the ordinary
+ * full-list first attempt.
  *
- * On `viaRecovery: true`, resolves ONE of two shapes:
+ * On `viaRecovery: true`, resolves ONE of three shapes:
  *   - `earlyOutcome` set — the pre-flight found an already-good install;
  *     `finishGate2FromCredentials` returns it, skipping gate 2 entirely
  *     (unchanged from groundnuty/macf#1137).
- *   - `earlyOutcome` unset, `opts.instructionLines` set ONLY when the
- *     pre-flight's `validateInstall` call rejected — the RESUMED-gate
- *     instruction (see {@link gate2ResumedInstructionLines}), naming only
- *     what that ALREADY-COMPUTED rejection found missing. `opts` is `{}`
- *     (the ordinary full-list attempt) whenever the pre-flight learned
- *     nothing — no confirmed install to check, or the confirm itself
- *     couldn't observe one — the honest-unknown floor: no observation,
- *     no delta claim.
+ *   - `reopenRecoverable` set — groundnuty/macf#1175: the pre-flight found
+ *     an install that already exists but is INSUFFICIENT (the SAME
+ *     already-computed rejection {@link gate2ResumedInstructionLines} used
+ *     to narrate). **This is the fix for #1175's live bug.** The pre-#1175
+ *     code passed this case to `runGate2WithInterstitial` as an ordinary
+ *     "first attempt" — which opens a page, prints "waiting for you to
+ *     click Install," and then polls `waitForAppInstallation`. But that
+ *     poll checks immediately and returns on the FIRST call once ANY
+ *     confirmed install exists on the expected target
+ *     (`identity-confirm.ts::waitForAppInstallation`) — repo-scope is a
+ *     SEPARATE check this function's caller runs after. Since the install
+ *     already exists (that is WHY the pre-flight ran at all), the poll
+ *     resolves instantly, `validateInstall` re-runs against the SAME
+ *     unchanged install, and rejects again — all before the operator could
+ *     read the page, let alone act on it (three live reproductions; see
+ *     the issue). There is no new event for a wait to be waiting FOR: the
+ *     install won't change until the operator edits it, and nothing this
+ *     process does can make that happen sooner.
+ *
+ *     Two honest responses existed: (a) poll installation CONTENTS for a
+ *     CHANGE instead of mere existence, or (b) admit there is nothing to
+ *     wait for right now and ask the operator to fix it outside this run.
+ *     (a) needs its own timeout budget and risks an unattended run hanging
+ *     on a fix that may never come; (b) cannot hang, is exactly as
+ *     actionable (the fix instruction is identical either way), and is the
+ *     SAME shape this module already uses for the `reuse-confirmed` +
+ *     `validateReuse`-rejects path (`applyIdentity`'s `decision.action ===
+ *     'reuse-confirmed'` branch, just above `runGate2WithInterstitial`'s
+ *     own doc) — that branch ALSO builds a `recoverable: true` outcome by
+ *     hand and hands it straight to {@link retryRecoverableGate2Rejection}
+ *     WITHOUT a first "blind" gate-2 attempt. This function takes (b), for
+ *     consistency with that established pattern: `finishGate2FromCredentials`
+ *     feeds `reopenRecoverable` straight into
+ *     {@link retryRecoverableGate2Rejection} as the STARTING outcome,
+ *     skipping `runGate2WithInterstitial`'s "first attempt" entirely. In
+ *     the default (unattended / `--yes`) posture — `deps.allowInstallRetry`
+ *     unset — that retry loop is itself a no-op (its own doc), so NO page
+ *     opens and NO "waiting for you to click" is ever printed for a wait
+ *     that cannot happen: the operator gets an immediate, honest refusal
+ *     naming what to fix, via `deps.log` (mirrored below) AND the final
+ *     `AgentApplyOutcome.reason`. When an operator HAS opted into
+ *     interactive retries (`allowInstallRetry` + `waitForOperatorFix`), the
+ *     SAME retry loop reopens the page with a genuine post-open wait — the
+ *     tool this module already has for "let the operator act, then
+ *     re-check," reused rather than duplicated.
+ *   - neither set — the pre-flight learned nothing (no confirmed install to
+ *     check, or the confirm itself couldn't observe one) — the ordinary
+ *     full-list attempt, honest-unknown floor: no observation, no delta
+ *     claim.
  */
 async function resumeGate2Preflight(
   viaRecovery: boolean,
@@ -1194,12 +1266,44 @@ async function resumeGate2Preflight(
   expected: ExpectedIdentity,
   pemPath: string,
   deps: AgentApplyDeps,
-): Promise<{ readonly earlyOutcome?: AgentApplyOutcome; readonly opts: { readonly instructionLines?: readonly string[] } }> {
-  if (!viaRecovery) return { opts: {} };
+): Promise<{ readonly earlyOutcome?: AgentApplyOutcome; readonly reopenRecoverable?: Gate2Outcome }> {
+  if (!viaRecovery) return {};
   const preflight = await skipGate2IfAlreadyInstalled(role, creds, expected, pemPath, deps);
-  if (preflight.action === 'skip-gate-2') return { earlyOutcome: preflight.outcome, opts: {} };
-  if (preflight.rejection === undefined) return { opts: {} };
-  return { opts: { instructionLines: gate2ResumedInstructionLines(preflight.rejection) } };
+  if (preflight.action === 'skip-gate-2') return { earlyOutcome: preflight.outcome };
+  if (preflight.rejection === undefined) return {};
+
+  const { message, retryInstruction, missingRepos } = rejectionParts(preflight.rejection);
+  for (const line of gate2ResumedInstructionLines(preflight.rejection)) {
+    deps.log(`Role "${role}": ${line}`);
+  }
+  // groundnuty/macf#1175 — gated on `allowInstallRetry`, NOT unconditional.
+  // When the operator has opted into interactive retries,
+  // `retryRecoverableGate2Rejection` (fed `reopenRecoverable` below) DOES
+  // reopen the page with a genuine `postOpenWait` — printing "not opening a
+  // wait page … re-run apply" here unconditionally would then contradict
+  // that page's own "Reopening the install page … I will re-check
+  // automatically once you do" a few lines later in the SAME transcript
+  // (the exact same-transcript-contradiction class groundnuty/macf#1165/
+  // #1168 already fixed twice, applied to a new pair of lines). Only the
+  // unattended (`allowInstallRetry` unset) posture is honest to say "not
+  // waiting" — that is the ONLY posture where nothing further waits.
+  if (deps.allowInstallRetry !== true) {
+    deps.log(
+      `Role "${role}": not opening a wait page for this — the install already exists, so a page claiming to ` +
+        'wait would resolve on its very first check against the SAME insufficient install, before you could ' +
+        `act on it. Make the change on GitHub (${appInstallationUrl(creds.slug)}), then re-run apply.`,
+    );
+  }
+  return {
+    reopenRecoverable: {
+      role,
+      status: 'failed',
+      reason: `consent gate 2 (install) rejected: ${message}`,
+      recoverable: true,
+      ...(retryInstruction !== undefined ? { retryInstruction } : {}),
+      ...(missingRepos !== undefined ? { missingRepos } : {}),
+    },
+  };
 }
 
 /**
@@ -1244,7 +1348,15 @@ async function finishGate2FromCredentials(
   try {
     const preflight = await resumeGate2Preflight(viaRecovery, role, creds, gate2Expected, pemPath, deps);
     if (preflight.earlyOutcome !== undefined) return preflight.earlyOutcome;
-    const firstAttempt = await runGate2WithInterstitial(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, preflight.opts);
+    // groundnuty/macf#1175 — `reopenRecoverable`, when set, is a
+    // pre-flight-detected confirmed-but-insufficient install: skip the
+    // "blind" first `runGate2WithInterstitial` attempt entirely (see
+    // `resumeGate2Preflight`'s doc for why that attempt's wait cannot ever
+    // actually wait here) and feed it straight to the SAME recoverable-
+    // rejection retry every other path gets, below.
+    const firstAttempt =
+      preflight.reopenRecoverable ??
+      (await runGate2WithInterstitial(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, {}));
     // groundnuty/macf#1063 — the SAME recoverable-rejection retry the
     // resume-install path gets (see that call site's doc); a no-op unless
     // `firstAttempt` is a recoverable `validateInstall` rejection AND
@@ -1331,6 +1443,8 @@ type Gate2Outcome =
       readonly recoverable?: boolean;
       /** The plain-language dialogue text (groundnuty/macf#1063) — see {@link InstallRejection}'s doc. Present only when the rejecting hook supplied one; the retry dialogue falls back to `reason` otherwise. */
       readonly retryInstruction?: string;
+      /** The specific `owner/repo`(s) the rejecting hook found missing (groundnuty/macf#1176) — see {@link InstallRejection}'s doc. Present only when the rejecting hook supplied one; a retry-reopen's copyable repo block falls back to the identity's full required set otherwise. */
+      readonly missingRepos?: readonly string[];
     };
 
 /** The hook shape shared by `validateInstall`/`validateReuse` — {@link runGate2}'s `validate` param is typed against this rather than either field name so it can stand in for either. */
@@ -1385,13 +1499,14 @@ async function runGate2(
       // key, and a live install are already confirmed good by this point;
       // what's wrong is scoped to install SCOPE, fixable by revisiting the
       // SAME page (see `AgentApplyDeps.allowInstallRetry`'s doc).
-      const { message, retryInstruction } = rejectionParts(rejection);
+      const { message, retryInstruction, missingRepos } = rejectionParts(rejection);
       return {
         role,
         status: 'failed',
         reason: `consent gate 2 (install) rejected: ${message}`,
         recoverable: true,
         ...(retryInstruction !== undefined ? { retryInstruction } : {}),
+        ...(missingRepos !== undefined ? { missingRepos } : {}),
       };
     }
     deps.log(`Role "${role}": install confirmed (install_id ${install.installId}).`);
@@ -1475,6 +1590,35 @@ export function gate2RepoSelectionInstructionLines(repos: readonly string[]): re
 }
 
 /**
+ * The bare repository name GitHub's OWN "Only select repositories" picker
+ * expects typed into its search box (groundnuty/macf#1176) — NOT
+ * `owner/repo`. The account is already fixed by the point this picker
+ * appears (the operator chose it, or it's implied by the App), so the
+ * picker searches by name alone within that account; typing `owner/repo`
+ * there would not match. Verified against GitHub's own docs ("you type the
+ * name of each repository you'd like to give the app access to") + this
+ * codebase's own already-confirmed precedent for the same shape
+ * (`observer.ts::listRunnerGroupsVisibleToRepo`'s `visible_to_repository`
+ * query param — "bare repo name, no `owner/` prefix — the org is already
+ * the path segment"). **Not verified against the live install page itself**
+ * — no browser is available in this environment to confirm the picker's
+ * exact filter behavior; if a future live gate shows this wrong, the
+ * account name is ALSO stated once in `gate2RepoSelectionInstructionLines`'s
+ * prose (a `messageLines` entry, so both surfaces carry it) as a
+ * lower-cost mitigation than getting the bare-vs-qualified call wrong
+ * silently.
+ */
+export function bareRepoName(fullName: string): string {
+  const slash = fullName.lastIndexOf('/');
+  return slash === -1 ? fullName : fullName.slice(slash + 1);
+}
+
+/** {@link bareRepoName} applied to a whole list — the copyable-block payload (groundnuty/macf#1176). */
+export function bareRepoNames(repos: readonly string[]): readonly string[] {
+  return repos.map(bareRepoName);
+}
+
+/**
  * The default, first-gate instruction body (groundnuty/macf#952) — every
  * pre-#1063 call site (no `opts.instructionLines` override) gets exactly
  * this, byte-identical to before that field existed. Pulled out to a named
@@ -1545,6 +1689,16 @@ async function runGate2WithInterstitial(
      * `AgentApplyDeps.waitForOperatorFix`'s doc for the production wiring.
      */
     readonly postOpenWait?: () => Promise<void>;
+    /**
+     * groundnuty/macf#1176 — the copyable-block repo set, ALREADY `owner/repo`
+     * form (bared just below, alongside `repos`' own default). Omitted by
+     * every call site except {@link retryRecoverableGate2Rejection}'s
+     * reopen, which passes `current.missingRepos` when the rejecting hook
+     * supplied one (narrows the block to only what's still missing) —
+     * falling back to the full `repos` set otherwise, same as every other
+     * call site. Never invented by parsing `instructionLines`' prose.
+     */
+    readonly repoNamesOverride?: readonly string[];
   },
   validate?: ValidateInstallHook,
 ): Promise<Gate2Outcome> {
@@ -1554,11 +1708,17 @@ async function runGate2WithInterstitial(
   // otherwise. Whichever it is, this exact array is what BOTH the terminal
   // and the served page show — see this function's own doc.
   const messageLines = opts.instructionLines ?? gate2DefaultInstructionLines(repos, whyText, installUrl);
+  // groundnuty/macf#1176 — the copyable payload, computed ONCE alongside
+  // `messageLines` for the SAME reason (one array, two renderers, never
+  // re-derived per surface). `bareRepoNames` because the picker itself
+  // takes bare names — see that function's doc.
+  const repoNames = bareRepoNames(opts.repoNamesOverride ?? repos);
   const page = await startInterstitialOrFallback(deps, role, {
     role,
     appName: appSlug,
     installUrl,
     messageLines,
+    repoNames,
     // The install page is always the SECOND (and last) of the two gates —
     // literal `2`, not derived from `GATE_TOTAL` (which happens to equal 2
     // today but means "how many gates total," not "which gate this is").
@@ -1576,6 +1736,7 @@ async function runGate2WithInterstitial(
         fatal: false,
         caveat: opts.caveat,
         instructionLines: messageLines,
+        repoNames,
       },
     );
     await opts.postOpenWait?.();
@@ -1690,6 +1851,13 @@ async function retryRecoverableGate2Rejection(
         waitLabel: 'Save',
         gateLabelSuffix: ` — reopened after a rejection, attempt ${String(attempt)} of ${String(MAX_GATE2_REOPEN_ATTEMPTS)}`,
         instructionLines: gate2RetryInstructionLines(current.reason, current.retryInstruction),
+        // groundnuty/macf#1176 — narrows the copyable block to only what
+        // THIS rejection found missing, when the rejecting hook supplied a
+        // structured `missingRepos` (today: `registry-repo-coverage.ts`'s
+        // check). `undefined` falls back to the full `repos` set — the same
+        // honest-fallback floor `messageLines`' own `retryInstruction ??
+        // reason` already uses just above.
+        repoNamesOverride: current.missingRepos,
         // groundnuty/macf#1063 — the operator's genuine window to act (see
         // `AgentApplyDeps.waitForOperatorFix`'s doc). `undefined` when
         // `waitForFix` is unset — `runGate2WithInterstitial`'s

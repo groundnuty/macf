@@ -696,7 +696,7 @@ describe('applyAgentIdentity — pre-gate-2 install observation on the recovery 
     expect(logs.join('\n')).toMatch(/pre-gate-2 install check threw/);
   });
 
-  it('confirmed but validateInstall REJECTS (wrong scope) -> does NOT weaken the install-scope refusal — falls through to the normal gate-2 flow, never silently accepted', async () => {
+  it('confirmed but validateInstall REJECTS (wrong scope) -> does NOT weaken the install-scope refusal, and (groundnuty/macf#1175) does NOT open a page claiming to wait for a install-content change that cannot happen on its own', async () => {
     const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
     const badScopeInstall: ConfirmedInstall = { ...CONFIRMED_INSTALL, repositorySelection: 'all' };
     const deps = baseDeps({
@@ -711,9 +711,16 @@ describe('applyAgentIdentity — pre-gate-2 install observation on the recovery 
 
     const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
 
-    // The gate was NOT silently skipped for a mis-scoped install.
-    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
+    // groundnuty/macf#1175 — the install already exists (confirmed) but is
+    // insufficient; `waitForAppInstallation` would resolve on its very
+    // first poll against the SAME insufficient install, so no page opens
+    // and no "waiting for you to click Install" claim is ever printed
+    // (allowInstallRetry is unset in this test's deps — the default,
+    // unattended posture). The refusal was NOT silently accepted either —
+    // the failure is still reported.
+    expect(startInstallInterstitial).not.toHaveBeenCalled();
     expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') expect(outcome.reason).toContain('wrong scope');
   });
 
   it('is a no-op on the FRESH-mint (viaRecovery: false) path — confirmAppInstallation is never called for a just-created App', async () => {
@@ -790,8 +797,11 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
 
     const outcome = await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
 
-    // The resumed gate DID open — the coverage gap is real, never silently accepted.
-    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
+    // groundnuty/macf#1175 — the install already exists (confirmed), so a
+    // page here would claim to wait for something that cannot happen on
+    // its own (waitForAppInstallation resolves on the very first poll
+    // against this SAME insufficient install). No page opens.
+    expect(startInstallInterstitial).not.toHaveBeenCalled();
     expect(outcome.status).toBe('failed');
 
     const joined = logs.join('\n');
@@ -802,6 +812,136 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
     // The decisive negative: the old full-list restatement must be GONE.
     expect(joined).not.toContain(FULL_SELECT_EXACTLY_LINE);
     expect(joined).not.toContain('select exactly:');
+    // groundnuty/macf#1175's own decisive check: never claim a wait that
+    // does not happen. The pre-#1175 code printed this exact line
+    // (`announceAndOpenGate`'s unconditional close) even though the poll
+    // beneath it resolved instantly.
+    expect(joined).not.toContain('waiting for you to click');
+  });
+
+  // groundnuty/macf#1175 — the live bug: a resumed gate whose install
+  // already exists (but fails validation) used to open a page, print
+  // "waiting for you to click Install", and then fail almost instantly —
+  // because `waitForAppInstallation` resolves on its very FIRST poll once
+  // ANY confirmed install exists on the expected target, and this one
+  // already does. Every fetch of the page during that "wait" returned 0
+  // bytes live, three times, because the server was already gone.
+  it('groundnuty/macf#1175 — a resumed gate whose install already exists never claims to be "waiting" for a poll that cannot wait; it refuses immediately and says to fix + re-run', async () => {
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const openUrl = vi.fn(async () => {});
+    const logs: string[] = [];
+    const deps = baseDeps({
+      startInstallInterstitial,
+      openUrl,
+      log: (l) => logs.push(l),
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
+      findRecoveryArtifact: async () => RECOVERED,
+      validateInstall: () => ({ message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION }),
+      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+
+    // No page, no browser launch — nothing was opened for the operator to
+    // (uselessly) look at.
+    expect(startInstallInterstitial).not.toHaveBeenCalled();
+    expect(openUrl).not.toHaveBeenCalled();
+    // Decisive per #1175's own required test: the message never claims a
+    // wait this run does not perform.
+    const joined = logs.join('\n');
+    expect(joined).not.toMatch(/waiting for you to click/);
+    // It says the honest thing instead: fix it on GitHub, then re-run.
+    expect(joined).toContain('not opening a wait page for this');
+    expect(joined).toMatch(/re-run apply/);
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).toContain(SENTINEL_TECHNICAL_REASON);
+      expect(outcome.reason).toMatch(/re-run/);
+    }
+  });
+
+  // groundnuty/macf#1175 companion — when the operator HAS opted into
+  // interactive retries, the SAME confirmed-but-invalid resumed gate takes
+  // the OTHER honest path: it reopens the page with a genuine post-open
+  // wait (the retry machinery this module already has), rather than
+  // refusing immediately. Decisive against the contradiction a first draft
+  // of this fix had: printing "not opening a wait page … re-run apply" AND
+  // THEN reopening a page anyway, in the same transcript, would be the same
+  // same-transcript-contradiction class groundnuty/macf#1165/#1168 already
+  // fixed twice — this asserts that text is ABSENT here, not merely that
+  // the interactive path also works.
+  it('groundnuty/macf#1175 companion: with allowInstallRetry set, the SAME confirmed-but-invalid resumed gate reopens with a genuine wait — and never prints the unattended-path refusal text', async () => {
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const callOrder: string[] = [];
+    let validateCalls = 0;
+    const logs: string[] = [];
+    const deps = baseDeps({
+      startInstallInterstitial,
+      log: (l) => logs.push(l),
+      allowInstallRetry: true,
+      waitForOperatorFix: async () => {
+        callOrder.push('wait-for-fix');
+      },
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
+      findRecoveryArtifact: async () => RECOVERED,
+      validateInstall: () => {
+        validateCalls += 1;
+        callOrder.push(`validate-${String(validateCalls)}`);
+        return validateCalls === 1 ? { message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION } : undefined;
+      },
+      waitForAppInstallation: async (opts) => {
+        callOrder.push('poll');
+        return { appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' };
+      },
+    });
+
+    const outcome = await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+
+    // The page DID reopen this time — the operator opted into it.
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
+    // The genuine wait ran BEFORE the re-check, not merely was wired.
+    expect(callOrder).toEqual(['wait-for-fix', 'poll', 'validate-2']);
+    expect(outcome.status).toBe('resumed-install');
+    // Decisive negative: the unattended-path refusal text must NEVER
+    // appear here — that text specifically claims nothing further waits,
+    // which would be false on this path (something further DOES wait).
+    const joined = logs.join('\n');
+    expect(joined).not.toContain('not opening a wait page for this');
+    expect(joined).not.toMatch(/re-run apply\./);
+  });
+
+  // groundnuty/macf#1175's own required audit, as a decisive PAIRING test:
+  // "waiting for you to click" must print exactly when the poll it
+  // describes can actually block — never when the poll would resolve on
+  // its very first check. Asserting this as an equality across two runs
+  // (rather than two separate one-sided assertions) is what makes the
+  // check unable to pass by accident: a version of the code that always
+  // prints (or never prints) the line would fail this, even though each
+  // half in isolation might coincidentally look right.
+  it('groundnuty/macf#1175 decisive pairing: "waiting for you to click" prints iff the poll beneath it can actually wait', async () => {
+    async function run(confirmAppInstallation: AgentApplyDeps['confirmAppInstallation']): Promise<boolean> {
+      const logs: string[] = [];
+      const deps = baseDeps({
+        log: (l) => logs.push(l),
+        confirmAppInstallation,
+        findRecoveryArtifact: async () => RECOVERED,
+        validateInstall: () => ({ message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION }),
+        waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
+      });
+      await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+      return logs.join('\n').includes('waiting for you to click');
+    }
+
+    // Run A — genuinely nothing installed yet: the poll below MUST block
+    // until the operator installs, so the "waiting" claim is true.
+    const waitingPrintedA = await run(async () => ({ status: 'app-no-install' }));
+    // Run B — an install already exists (just insufficient): the poll
+    // resolves on its very first check against that SAME install, so
+    // nothing actually waits.
+    const waitingPrintedB = await run(async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }));
+
+    expect(waitingPrintedA).toBe(true);
+    expect(waitingPrintedB).toBe(false);
   });
 
   // Decisive pair, item 2: a genuinely FIRST gate (fresh create) is
