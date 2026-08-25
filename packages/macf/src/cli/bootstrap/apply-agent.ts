@@ -151,6 +151,7 @@ import { appSettingsAdvancedUrl } from './app-identity-removal.js';
 import { appNameCollisionRefusalMessage, resolveAppPresenceStatus } from './app-presence.js';
 import type { Presence } from './plan.js';
 import { requiredRegistryRepoCoverage } from './registry-repo-coverage.js';
+import { diagnoseGate2Rejection, gate2DiagnosisMessageLines, gate2DiagnosisRepoNames } from './gate2-diagnosis.js';
 
 // --- Confirm-before-create guard ---
 
@@ -1358,6 +1359,17 @@ async function finishGate2FromCredentials(
         ? firstAttempt
         : await retryRecoverableGate2Rejection(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, firstAttempt);
     if (outcome.status === 'failed') {
+      // groundnuty/macf#1179 — checked BEFORE the waitStrategy branch below:
+      // a cancel can happen on EITHER path (the ordinary create-path
+      // `runGate2` wait, or the resumed-gate `pollForInstallFix` wait), and
+      // in both cases it gets its OWN reason (already complete — see
+      // `gate2CancelReason`), never the "App WAS created… orphaned, finish
+      // manually" framing below. A cancel is a deliberate operator choice,
+      // not something gone wrong — the App and its credential (already
+      // durable via `writeRecoveryArtifact`, above) are untouched.
+      if (outcome.cancelled === true) {
+        return { role, status: 'failed', reason: outcome.reason };
+      }
       // groundnuty/macf#1178 — a failure that already went through
       // `pollForInstallFix` carries its OWN complete, actionable reason
       // (states the poll bound, leads with the action, ends with a
@@ -1449,19 +1461,95 @@ type Gate2Outcome =
       readonly retryInstruction?: string;
       /** The specific `owner/repo`(s) the rejecting hook found missing (groundnuty/macf#1176) — see {@link InstallRejection}'s doc. Present only when the rejecting hook supplied one; a retry-reopen's copyable repo block falls back to the identity's full required set otherwise. */
       readonly missingRepos?: readonly string[];
+      /**
+       * groundnuty/macf#1179 — set ONLY when this failure is an OPERATOR
+       * CANCEL (the page's "cancel this identity" button), never a timeout
+       * or a genuine error. Distinguishes cancel's framing (deliberate,
+       * nothing wrong, App + credential untouched) from every other failed
+       * shape — see {@link gate2CancelReason} and `finishGate2FromCredentials`'s
+       * cancel branch, which must NOT apply the "orphaned App, finish
+       * manually" wording a real failure gets. Never `true` alongside
+       * `recoverable: true` — a cancel is not something #1063's reopen loop
+       * should retry.
+       */
+      readonly cancelled?: boolean;
     };
 
 /** The hook shape shared by `validateInstall`/`validateReuse` — {@link runGate2}'s `validate` param is typed against this rather than either field name so it can stand in for either. */
 type ValidateInstallHook = (install: ConfirmedInstall, keyPath: string) => InstallRejection | undefined | Promise<InstallRejection | undefined>;
 
 /**
+ * groundnuty/macf#1179 — the ALWAYS-CALLABLE interactive-signal set for a
+ * gate-2 wait loop, built ONCE per gate-2 open by {@link startInterstitialOrFallback}
+ * from whatever the (possibly test-fake, possibly older) `InstallInterstitialHandles`
+ * actually offers. `runGate2`/`pollForInstallFix` never optional-chain these
+ * — a missing capability (an `InstallInterstitialHandles` literal that omits
+ * the new #1179 fields, e.g. every pre-#1179 test fixture) is normalized to
+ * "never fires" by {@link normalizeInteractive}, so `Promise.race` degrades
+ * to exactly the pre-#1179 blind-timed-poll behavior. `undefined` (the whole
+ * `Gate2Interactive`, not a field on it) means "no local page at all" — the
+ * `startInstallInterstitial` bind failed and gate 2 fell back to GitHub's
+ * install URL directly; there is no page for a click to ever arrive from.
+ */
+interface Gate2Interactive {
+  readonly waitForCheckAgain: () => Promise<void>;
+  readonly waitForCancel: () => Promise<void>;
+  readonly updateContent: (messageLines: readonly string[], repoNames: readonly string[]) => void;
+}
+
+/** A promise that never resolves — {@link normalizeInteractive}'s degrade-to-inert default for a missing hook. Never rejects either; `Promise.race` simply never picks this arm. */
+function neverResolves(): Promise<never> {
+  return new Promise<never>(() => { /* intentionally never settles */ });
+}
+
+/** Builds a {@link Gate2Interactive} from whatever `handles` actually offers — see that interface's own doc for why every field degrades independently rather than all-or-nothing. */
+function normalizeInteractive(handles: InstallInterstitialHandles): Gate2Interactive {
+  return {
+    waitForCheckAgain: handles.waitForCheckAgain ?? neverResolves,
+    waitForCancel: handles.waitForCancel ?? neverResolves,
+    updateContent: handles.updateContent ?? (() => { /* no page to update */ }),
+  };
+}
+
+/** Thrown internally to unwind a cancelled `Promise.race` in {@link runGate2} — never escapes this module; caught immediately alongside every other gate-2 failure. */
+class Gate2CancelledError extends Error {}
+
+/**
+ * groundnuty/macf#1179 — the reason string for an operator-cancelled gate-2
+ * wait (the page's "cancel this identity" button). Deliberately NEVER the
+ * "the App WAS created… finish manually" framing `finishGate2FromCredentials`
+ * builds for a genuine failure/timeout: a cancel is not something gone
+ * wrong, it's a deliberate operator choice, and the App + its already-durable
+ * credential (DR-043 Amendment B — written to the recovery artifact BEFORE
+ * gate 2 ever opened, on the create path) are untouched either way.
+ */
+function gate2CancelReason(appId: string): string {
+  return (
+    `cancelled by the operator (the install page's "cancel this identity" button). The App (app_id ${appId}) and ` +
+    'its credential remain durable exactly as they were — re-run apply whenever you want to finish this identity; ' +
+    'nothing else in the fleet is affected by cancelling one.'
+  );
+}
+
+/**
  * groundnuty/macf#1178 — the pluggable "how do we wait" step
  * {@link runGate2WithInterstitial} runs after the page opens. Exactly
  * `runGate2`'s own signature, so {@link pollForInstallFix} is a drop-in
  * swap for it — every existing call site that omits `waitStrategy` gets
- * `runGate2` (byte-identical to before this field existed).
+ * `runGate2` (byte-identical to before this field existed). `interactive`
+ * (groundnuty/macf#1179) is a trailing optional param for the SAME reason
+ * — every pre-#1179 caller omits it and both implementations degrade to
+ * their pre-#1179 behavior (see {@link Gate2Interactive}'s doc).
  */
-type WaitStrategy = (role: string, appId: string, keyPath: string, expected: ExpectedIdentity, deps: AgentApplyDeps, validate: ValidateInstallHook | undefined) => Promise<Gate2Outcome>;
+type WaitStrategy = (
+  role: string,
+  appId: string,
+  keyPath: string,
+  expected: ExpectedIdentity,
+  deps: AgentApplyDeps,
+  validate: ValidateInstallHook | undefined,
+  interactive?: Gate2Interactive,
+) => Promise<Gate2Outcome>;
 
 /**
  * Runs the gate-2 poll. Cleanup of `keyPath` (when it's a scratch file this
@@ -1482,9 +1570,10 @@ async function runGate2(
   expected: ExpectedIdentity,
   deps: AgentApplyDeps,
   validate: ValidateInstallHook | undefined = deps.validateInstall,
+  interactive?: Gate2Interactive,
 ): Promise<Gate2Outcome> {
   try {
-    const install = await deps.waitForAppInstallation({
+    const waitPromise = deps.waitForAppInstallation({
       appId,
       keyPath,
       expected,
@@ -1498,6 +1587,16 @@ async function runGate2(
         );
       },
     });
+    // groundnuty/macf#1179 — race the ordinary wait against a cancel signal
+    // rather than modifying `identity-confirm.ts::waitForAppInstallation`'s
+    // own poll loop. Never awaited when `interactive` is `undefined` (no
+    // local page exists to cancel from) — identical to the pre-#1179 call.
+    const install = interactive === undefined
+      ? await waitPromise
+      : await Promise.race([
+          waitPromise,
+          interactive.waitForCancel().then((): never => { throw new Gate2CancelledError(); }),
+        ]);
     // groundnuty/macf#943 — post-gate-2 install validation (see
     // `AgentApplyDeps.validateInstall`'s doc). Checked BEFORE reporting
     // success: a rejection here means gate 2 technically completed but the
@@ -1525,6 +1624,13 @@ async function runGate2(
     deps.log(`Role "${role}": install confirmed (install_id ${install.installId}).`);
     return { role, status: 'resumed-install', appId, installId: install.installId };
   } catch (err) {
+    // groundnuty/macf#1179 — a cancel unwinds through this SAME catch (the
+    // race above throws `Gate2CancelledError` to get there) but gets its
+    // OWN reason + `cancelled: true`, never the generic "(install) failed:
+    // <err.message>" wording a real error gets.
+    if (err instanceof Gate2CancelledError) {
+      return { role, status: 'failed', reason: gate2CancelReason(appId), cancelled: true };
+    }
     return { role, status: 'failed', reason: `consent gate 2 (install) failed: ${errMessage(err)}` };
   }
 }
@@ -1581,6 +1687,20 @@ const RESUMED_GATE_POLL_INTERVAL_MS = 15_000;
  * it, an omitted `validate` would silently mean "accept anything," and
  * every confirmed install would resolve the poll instantly regardless of
  * whether it's actually fixed.
+ *
+ * **groundnuty/macf#1179 — `interactive`, when given, does two things.**
+ * (1) On every tick that observes a rejection, this function classifies it
+ * (`gate2-diagnosis.ts::diagnoseGate2Rejection`) and calls
+ * `interactive.updateContent(...)` so a GET that lands between ticks shows
+ * the CURRENT diagnosis, not whatever was true when the page first opened —
+ * "check again ... on failure re-renders narrowed" from the issue's own
+ * test list. (2) The sleep between ticks races against
+ * `interactive.waitForCheckAgain()` (wakes early, loops back to the top —
+ * "check again re-runs the same validation") and `interactive.waitForCancel()`
+ * (ends the wait for THIS identity, `cancelled: true` — never treated as
+ * `recoverable`, so #1063's reopen loop never retries a deliberate cancel).
+ * `undefined` (every pre-#1179 caller/test) preserves the exact blind-timed-
+ * poll behavior — no race, no page update, byte-identical.
  */
 async function pollForInstallFix(
   role: string,
@@ -1589,6 +1709,7 @@ async function pollForInstallFix(
   expected: ExpectedIdentity,
   deps: AgentApplyDeps,
   validate: ValidateInstallHook | undefined = deps.validateInstall,
+  interactive?: Gate2Interactive,
 ): Promise<Gate2Outcome> {
   const timeoutMs = deps.gateTimeoutMs ?? RESUMED_GATE_POLL_TIMEOUT_MS;
   const pollIntervalMs = deps.pollIntervalMs ?? RESUMED_GATE_POLL_INTERVAL_MS;
@@ -1604,6 +1725,13 @@ async function pollForInstallFix(
         return { role, status: 'resumed-install', appId, installId: confirmation.install.installId };
       }
       last = rejectionParts(rejection);
+      if (interactive !== undefined) {
+        // groundnuty/macf#1179 — the SAME text a "check again" click would
+        // otherwise only find out about on the NEXT scheduled tick; narrows
+        // the served page the moment this tick observes it.
+        const diagnosis = diagnoseGate2Rejection(confirmation.install, rejection);
+        interactive.updateContent(gate2DiagnosisMessageLines(diagnosis), bareRepoNames(gate2DiagnosisRepoNames(diagnosis)));
+      }
     } else {
       // The install this poll was opened for is no longer confirmed at all
       // (e.g. removed mid-wait) — still worth polling (it's still "the
@@ -1623,7 +1751,23 @@ async function pollForInstallFix(
         ...(last?.missingRepos !== undefined ? { missingRepos: last.missingRepos } : {}),
       };
     }
-    await sleep(Math.min(pollIntervalMs, remaining));
+
+    if (interactive === undefined) {
+      await sleep(Math.min(pollIntervalMs, remaining));
+      continue;
+    }
+    // groundnuty/macf#1179 — race the tick's own sleep against the two page
+    // signals. A "check again" click OR the ordinary tick both just loop
+    // back to the top (an immediate re-check IS "check again"); only cancel
+    // ends the loop.
+    const wake = await Promise.race([
+      sleep(Math.min(pollIntervalMs, remaining)).then((): 'tick' => 'tick'),
+      interactive.waitForCheckAgain().then((): 'check-again' => 'check-again'),
+      interactive.waitForCancel().then((): 'cancel' => 'cancel'),
+    ]);
+    if (wake === 'cancel') {
+      return { role, status: 'failed', reason: gate2CancelReason(appId), cancelled: true };
+    }
   }
 }
 
@@ -1694,6 +1838,14 @@ interface Gate2Page {
   /** What to `openUrl` — the interstitial's own URL on success, GitHub's real install URL on a bind failure. */
   readonly url: string;
   readonly close: () => Promise<void>;
+  /**
+   * groundnuty/macf#1179 — present ONLY when a real local interstitial is
+   * serving (the try-branch below). `undefined` on the bind-failure
+   * fallback: there is no page for "check again"/"cancel" to ever POST
+   * from, so `runGate2`/`pollForInstallFix` degrade to the pre-#1179 blind
+   * poll exactly as they already do for every other missing capability.
+   */
+  readonly interactive?: Gate2Interactive;
 }
 
 /**
@@ -1705,7 +1857,7 @@ interface Gate2Page {
 async function startInterstitialOrFallback(deps: AgentApplyDeps, role: string, opts: InstallInterstitialOptions): Promise<Gate2Page> {
   try {
     const handles = await deps.startInstallInterstitial(opts);
-    return { url: handles.startUrl, close: handles.close };
+    return { url: handles.startUrl, close: handles.close, interactive: normalizeInteractive(handles) };
   } catch (err) {
     deps.log(
       `Role "${role}": could not start the local install-instruction page (${errMessage(err)}) — falling back to ` +
@@ -1896,7 +2048,13 @@ async function runGate2WithInterstitial(
     );
     await opts.postOpenWait?.();
     const wait = opts.waitStrategy ?? runGate2;
-    return await wait(role, appId, keyPath, expected, deps, validate);
+    // groundnuty/macf#1179 — `page.interactive` is `undefined` on the
+    // bind-failure fallback (no local page exists); every `WaitStrategy`
+    // treats that identically to an omitted argument (see `Gate2Interactive`'s
+    // doc), so this ONE call site is what wires check-again/cancel into
+    // BOTH `runGate2` and `pollForInstallFix`, for all three callers of this
+    // function (create/first-attempt, resume-install, reuse-confirmed retry).
+    return await wait(role, appId, keyPath, expected, deps, validate, page.interactive);
   } finally {
     try {
       await page.close();

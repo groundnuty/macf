@@ -36,6 +36,7 @@
  */
 import type { ConfirmedInstall } from './identity-confirm.js';
 import { rejectionParts, type InstallRejection } from './apply-agent.js';
+import { validateInstallRepositoryScope } from './install-scope.js';
 
 export type Gate2Diagnosis =
   | { readonly kind: 'scope-wrong'; readonly message: string }
@@ -48,6 +49,17 @@ export type Gate2Diagnosis =
  * a caller with just that field (no full `ConfirmedInstall` in hand) doesn't
  * need to fabricate one, same reasoning `install-scope.ts::
  * validateInstallRepositoryScope`'s own signature already applies.
+ *
+ * **groundnuty/macf#1128's structural guard applies here too.** The
+ * "is scope wrong" decision below goes through `install-scope.ts::
+ * validateInstallRepositoryScope` itself — never a re-derived
+ * `repositorySelection === 'selected'` comparison — because
+ * `install-scope-source-shape.test.ts` statically scans this package for
+ * exactly that duplication and fails the build if it reappears anywhere
+ * outside `install-scope.ts`. The `appHandle` argument only shapes that
+ * function's OWN message text (discarded here — this module has its own
+ * message, `shown`, from the rejection that already fired); the DECISION
+ * (`=== undefined` vs not) is what this module actually reads.
  */
 export function diagnoseGate2Rejection(
   install: Pick<ConfirmedInstall, 'repositorySelection'>,
@@ -60,7 +72,7 @@ export function diagnoseGate2Rejection(
   // This module classifies; it does not re-author.
   const shown = retryInstruction ?? message;
 
-  if (install.repositorySelection !== 'selected') {
+  if (validateInstallRepositoryScope(install.repositorySelection, '(diagnosis)') !== undefined) {
     return { kind: 'scope-wrong', message: shown };
   }
   if (missingRepos !== undefined && missingRepos.length > 0) {
