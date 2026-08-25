@@ -93,6 +93,19 @@ const FLEET_YAML_WITH_ORG_REGISTRY = FLEET_YAML.replace('type: user', 'type: org
   'registry: { type: org, org: demo-org }',
 );
 
+/**
+ * groundnuty/macf#1156 — same fixture as {@link FLEET_YAML}, `owner.type` +
+ * `owner.registry` swapped to the repo-scoped shape (`#999`'s supported
+ * org-owned-fleet shape; mirrors {@link FLEET_YAML_WITH_ORG_REGISTRY}'s own
+ * pattern for `type: org`). Used ONLY by the `--dry-run`-preview test in the
+ * `plannedAppCreations` describe block below — every other test in this
+ * file keeps the `type: profile` {@link FLEET_YAML} default.
+ */
+const FLEET_YAML_WITH_REPO_REGISTRY = FLEET_YAML.replace('type: user', 'type: org').replace(
+  'registry: { type: profile, user: groundnuty }',
+  'registry: { type: repo, owner: demo-org, repo: demo-org-control }',
+);
+
 /** groundnuty/macf#1074 — same fixture as {@link FLEET_YAML}, `transport.tailscale_oauth_required: true` declared. Used ONLY by the Tailscale-preflight describe block below. */
 const FLEET_YAML_WITH_TAILSCALE = FLEET_YAML.replace(
   'age_recipients: [age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]',
@@ -390,6 +403,52 @@ describe('plannedAppCreations (pure)', () => {
 
   it('formats an empty creation set without claiming work', () => {
     expect(formatPlannedAppCreations([])).toMatch(/No GitHub Apps would be created/);
+  });
+
+  // groundnuty/macf#1156 — `--dry-run` must show the operator the SAME repo
+  // list the live gate-2 interstitial will (issue requirement 3). Both this
+  // preview's `installRepos` field AND the live interstitial's `repos` field
+  // are `installReposForIdentity`'s return value — this test observes the
+  // PREVIEW side of that shared derivation (the live-interstitial side is
+  // covered by apply-fleet.test.ts's #1156 DECISIVE integration test), using
+  // its OWN repo-scoped manifest so it doesn't disturb this describe block's
+  // shared `manifest` const (`type: profile`, used by every other test
+  // above).
+  //
+  // NOT covered here: the one-clause "why" (`installWhyText`'s new
+  // `registryControlRepo` param). `formatPlannedAppCreations` never renders
+  // `whyText` at all (pre-#1156, unchanged by this issue) — the reason
+  // clause reaches only the LIVE gate-2 surfaces (the interstitial's
+  // `<p class="why">` + the terminal `instructionLines`, both covered by
+  // `apply-agent.test.ts`'s `installWhyText` tests), never the `--dry-run`
+  // preview. This asymmetry is pre-existing (whyText was already preview-
+  // absent) and out of `bootstrap-apply.ts`'s file-scope for this issue —
+  // named here so the test title doesn't overclaim what it verifies.
+  it('groundnuty/macf#1156: registry.type === "repo" -> the preview\'s installRepos for an ordinary agent ALSO includes the control repo; the formatted warning line names both', () => {
+    const repoRegistryManifest = parseFleetManifest(FLEET_YAML_WITH_REPO_REGISTRY);
+    const plan = computePlan(repoRegistryManifest, EMPTY_OBSERVED);
+    const creations = plannedAppCreations(repoRegistryManifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
+
+    const codeAgent = creations.find((c) => c.role === 'code-agent');
+    expect(codeAgent?.installRepos).toEqual(['groundnuty/demo-code', 'demo-org/demo-org-control']);
+    const sciAgent = creations.find((c) => c.role === 'science-agent');
+    expect(sciAgent?.installRepos).toEqual(['groundnuty/demo-science', 'demo-org/demo-org-control']);
+
+    // The formatted preview text shows the SAME list for code-agent's own
+    // warning line — never dropped, never a class description.
+    const out = formatPlannedAppCreations(creations);
+    const lines = out.split('\n');
+    const bulletIndex = lines.findIndex((l) => l.includes('role: code-agent'));
+    expect(bulletIndex).toBeGreaterThanOrEqual(0);
+    const warningLine = lines.slice(bulletIndex, bulletIndex + 6).find((l) => l.includes('⚠ on the install page'));
+    expect(warningLine).toContain('select exactly: groundnuty/demo-code, demo-org/demo-org-control');
+  });
+
+  it('groundnuty/macf#1156: registry.type === "profile" (this describe block\'s own default fixture) -> installRepos is UNCHANGED — agent repo only, never the control repo', () => {
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
+    const codeAgent = creations.find((c) => c.role === 'code-agent');
+    expect(codeAgent?.installRepos).toEqual(['groundnuty/demo-code']);
   });
 });
 
