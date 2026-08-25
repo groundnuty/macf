@@ -37,8 +37,11 @@
  *
  * **groundnuty/macf#1173 — gate 2's served page renders NO prose of its
  * own.** {@link InstallInterstitialOptions.messageLines} is the SAME array
- * the terminal prints; this file only escapes + wraps it in `<li>`s. See
- * {@link renderInstallInterstitial}'s own doc for the incident this closes.
+ * the terminal prints; this file only escapes it into a verbatim block (see
+ * {@link renderVerbatimInstructionBlock}). See {@link renderInstallInterstitial}'s
+ * own doc for the incident this closes, and its groundnuty/macf#1176 note
+ * for the copyable repo-names block ({@link renderCopyableRepoBlock}) added
+ * alongside it.
  */
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
@@ -315,7 +318,7 @@ export interface InstallInterstitialOptions {
  * back out of the full page. One repo name per line, nothing else — no
  * bullets, no surrounding prose inside the block itself.
  */
-function renderCopyableRepoBlock(repoNames: readonly string[]): string {
+export function renderCopyableRepoBlock(repoNames: readonly string[]): string {
   if (repoNames.length === 0) return '';
   const body = repoNames.map((name) => escapeHtmlAttribute(name)).join('\n');
   return `<h2>Repositories to select — copy exactly</h2>\n<pre>${body}</pre>`;
@@ -333,7 +336,7 @@ function renderCopyableRepoBlock(repoNames: readonly string[]): string {
  * this block cannot claim to be the terminal's ENTIRE output for this gate
  * — only the instruction body both surfaces share.
  */
-function renderVerbatimInstructionBlock(role: string, messageLines: readonly string[]): string {
+export function renderVerbatimInstructionBlock(role: string, messageLines: readonly string[]): string {
   if (messageLines.length === 0) return '';
   const roleEsc = escapeHtmlAttribute(role);
   const body = messageLines.map((line) => `Role "${roleEsc}": ${escapeHtmlAttribute(line)}`).join('\n');

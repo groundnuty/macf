@@ -17,8 +17,10 @@ import {
   escapeHtmlAttribute,
   manifestFormAction,
   renderCallbackPage,
+  renderCopyableRepoBlock,
   renderInstallInterstitial,
   renderManifestForm,
+  renderVerbatimInstructionBlock,
   startInstallInterstitial,
   startManifestFlow,
 } from '../../../src/cli/bootstrap/manifest-flow-server.js';
@@ -55,41 +57,23 @@ const RUNNER_OPS_MESSAGE_LINES = [
   `GitHub's install page: ${RUNNER_OPS_INSTALL_URL}`,
 ];
 
+/** groundnuty/macf#1176 — the bare-name copyable payload for the fixture above (`installReposForIdentity`-shaped `owner/repo` entries, bared). */
+const RUNNER_OPS_REPO_NAMES = ['exp-science-agent', 'exp-code-agent'];
+
 /**
- * groundnuty/macf#1173 — gate 2's exact rendered output, superseding the
- * pre-#1173 pin (which locked a hand-built repo-list + styled "why" box —
- * exactly the SEPARATE-FROM-THE-TERMINAL text this issue closes). This
- * fixture is captured by RUNNING `renderInstallInterstitial` against
- * `RUNNER_OPS_MESSAGE_LINES` above (see the render-vs-terminal decisive
- * test in `apply-agent.test.ts` for the assertion that this array is what
- * a live run's terminal ALSO prints — this file only proves the render
- * shape, not the cross-surface identity). A deliberate future change to
- * gate 2's markup updates this constant along with the code; that is the
- * point of a pin, not a bug in this test. Formatting is intentionally
- * plainer than before #1173 (the operator's own trade: "a little bit worse
- * formatting" for "exactly the same text output").
+ * groundnuty/macf#1176 — extracts the `<pre>` content of the named `<h2>`
+ * block, split into lines. Used to assert the copyable-repo block and the
+ * verbatim-instruction block WITHOUT re-parsing `<li>` markup that no
+ * longer exists (superseded by #1173's own `<li>`-per-`messageLines`-entry
+ * shape, which #1176 replaces with two distinct `<pre>` blocks — see
+ * `manifest-flow-server.ts::renderInstallInterstitial`'s doc).
  */
-const GATE2_GOLDEN_HTML = `<!doctype html>
-<html><head><meta charset="utf-8"><title>Consent gate 2 of 2 — installing demo-fleet-runner-ops</title>
-<style>
-  body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
-  .dim { color: #666; }
-  .button { display: inline-block; margin-top: 1rem; padding: 0.6rem 1.2rem; background: #1f6feb; color: #fff;
-            text-decoration: none; border-radius: 6px; font-weight: 600; }
-</style>
-</head>
-<body>
-<h1>Consent gate 2 of 2 — role "runner-ops"</h1>
-<p>Installing GitHub App: <strong>demo-fleet-runner-ops</strong></p>
-<ul>
-  <li>on the page that opens, choose &quot;Only select repositories&quot; — NOT &quot;All repositories&quot;.</li>
-  <li>select exactly: groundnuty/exp-science-agent, groundnuty/exp-code-agent</li>
-  <li>Why: this App holds administration:write; granting it every repository in the account is blast radius the fleet does not need, and apply will refuse an &quot;all&quot; install.</li>
-  <li>GitHub&#39;s install page: https://github.com/apps/demo-fleet-runner-ops/installations/new</li>
-</ul>
-<p><a class="button" href="https://github.com/apps/demo-fleet-runner-ops/installations/new">Continue to GitHub to install</a></p>
-<p class="dim">If the button doesn't work, open this URL yourself: https://github.com/apps/demo-fleet-runner-ops/installations/new</p>
-</body></html>`;
+function preBlockLines(html: string, heading: string): readonly string[] {
+  const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`<h2>${escapedHeading}<\\/h2>\\n<pre>([\\s\\S]*?)<\\/pre>`);
+  const match = re.exec(html);
+  return match ? match[1]!.split('\n') : [];
+}
 
 describe('normalizeConversionResponse (ported guards)', () => {
   it('normalizes the full response, stringifying the numeric id', () => {
@@ -212,12 +196,42 @@ describe('manifest-flow-server (pure parts)', () => {
   });
 });
 
-describe('renderInstallInterstitial (groundnuty/macf#952 — pure; content shape per groundnuty/macf#1173)', () => {
+describe('renderCopyableRepoBlock (groundnuty/macf#1176 — pure; the copyable payload in isolation)', () => {
+  it('is EXACTLY the repo names, one per line, nothing else — no bullets, no prose', () => {
+    expect(renderCopyableRepoBlock(RUNNER_OPS_REPO_NAMES)).toBe(
+      '<h2>Repositories to select — copy exactly</h2>\n<pre>exp-science-agent\nexp-code-agent</pre>',
+    );
+  });
+
+  it('escapes a repo name that carries HTML-relevant characters', () => {
+    expect(renderCopyableRepoBlock(['<script>evil</script>'])).toContain('&lt;script&gt;evil&lt;/script&gt;');
+    expect(renderCopyableRepoBlock(['<script>evil</script>'])).not.toContain('<script>evil</script>');
+  });
+
+  it('renders nothing for an empty list (a caller bug upstream, not a case this function papers over)', () => {
+    expect(renderCopyableRepoBlock([])).toBe('');
+  });
+});
+
+describe('renderVerbatimInstructionBlock (groundnuty/macf#1176 — pure; the terminal-fidelity block in isolation)', () => {
+  it('is EXACTLY messageLines, each prefixed `Role "<role>": ` and escaped — the SAME form announceAndOpenGate prints', () => {
+    expect(renderVerbatimInstructionBlock('runner-ops', ['line one', 'line two'])).toBe(
+      '<h2>The instruction, as printed</h2>\n<pre>Role "runner-ops": line one\nRole "runner-ops": line two</pre>',
+    );
+  });
+
+  it('renders nothing for an empty messageLines (mirrors renderCopyableRepoBlock\'s empty-list posture)', () => {
+    expect(renderVerbatimInstructionBlock('runner-ops', [])).toBe('');
+  });
+});
+
+describe('renderInstallInterstitial (groundnuty/macf#952 — pure; content shape per groundnuty/macf#1173 + #1176)', () => {
   const OPTS = {
     role: 'runner-ops',
     appName: 'demo-fleet-runner-ops',
     installUrl: RUNNER_OPS_INSTALL_URL,
     messageLines: RUNNER_OPS_MESSAGE_LINES,
+    repoNames: RUNNER_OPS_REPO_NAMES,
     gateNumber: 2,
     gateTotal: 2,
   };
@@ -270,26 +284,45 @@ describe('renderInstallInterstitial (groundnuty/macf#952 — pure; content shape
     }
   });
 
-  /**
-   * groundnuty/macf#1173 — supersedes the pre-#1173 "byte-identical to its
-   * pre-#971 fixture" pin. That pin locked a hand-built repo-list + a
-   * separately-styled "why" box, rendered from `repos`/`whyText` fields
-   * this function no longer reads — exactly the drift-prone shape #1173
-   * closes (two independently-authored texts for the SAME instruction).
-   * This pin locks the NEW shape: `messageLines`, escaped and wrapped
-   * `<li>`-per-line, with no page-authored prose sentence of its own. A
-   * deliberate future change to gate 2's markup updates this constant
-   * along with the code; that is the point of a pin, not a bug in this
-   * test.
-   */
-  it("gate 2's rendered HTML is BYTE-IDENTICAL to its post-#1173 fixture (pinned regression guard)", () => {
-    expect(renderInstallInterstitial(OPTS)).toBe(GATE2_GOLDEN_HTML);
+  // groundnuty/macf#1176 — decisive: the copyable block contains the repo
+  // names AND NOTHING ELSE (no bullets, no prose, no trailing punctuation),
+  // and it is the SAME set `messageLines`' own "select exactly:" sentence
+  // names — compared against each other (per #1168's own precedent), never
+  // against a hand-typed literal on both sides.
+  it('DECISIVE: the copyable repo block is exactly the repo names — nothing else — and matches the set messageLines names', () => {
+    const html = renderInstallInterstitial(OPTS);
+    const blockLines = preBlockLines(html, 'Repositories to select — copy exactly');
+    expect(blockLines).toEqual(OPTS.repoNames);
+    // Nothing but bare names in the block — no bullet markers, no trailing
+    // punctuation, no owner/ prefix (that lives in messageLines' prose).
+    for (const line of blockLines) {
+      expect(line).not.toMatch(/^[-*•]/);
+      expect(line).not.toMatch(/[.,;]$/);
+      expect(line).not.toContain('/');
+    }
+    // Cross-referenced against the OTHER surface's own repo mention —
+    // messageLines' "select exactly: owner/repo, owner/repo" sentence —
+    // every bare name in the block is a substring of that sentence.
+    const selectExactlyLine = OPTS.messageLines.find((l) => l.startsWith('select exactly:'));
+    expect(selectExactlyLine).toBeDefined();
+    for (const bareName of blockLines) {
+      expect(selectExactlyLine).toContain(bareName);
+    }
   });
 
-  it('groundnuty/macf#1173 — renders NO sentence beyond messageLines: every <li> is exactly one escaped messageLines entry, in order, nothing added or dropped', () => {
+  it('groundnuty/macf#1176 — the copyable repo block appears BEFORE the verbatim instruction block (most prominent element first)', () => {
     const html = renderInstallInterstitial(OPTS);
-    const items = Array.from(html.matchAll(/<li>([\s\S]*?)<\/li>/g)).map((m) => m[1]);
-    expect(items).toEqual(OPTS.messageLines.map((line) => escapeHtmlAttribute(line)));
+    const repoHeadingIndex = html.indexOf('Repositories to select — copy exactly');
+    const instructionHeadingIndex = html.indexOf('The instruction, as printed');
+    expect(repoHeadingIndex).toBeGreaterThan(-1);
+    expect(instructionHeadingIndex).toBeGreaterThan(-1);
+    expect(repoHeadingIndex).toBeLessThan(instructionHeadingIndex);
+  });
+
+  it('groundnuty/macf#1176 — the verbatim instruction block is exactly messageLines, escaped + role-prefixed, in order, nothing added or dropped (supersedes the pre-#1176 `<li>`-per-line shape)', () => {
+    const html = renderInstallInterstitial(OPTS);
+    const items = preBlockLines(html, 'The instruction, as printed');
+    expect(items).toEqual(OPTS.messageLines.map((line) => `Role "${OPTS.role}": ${escapeHtmlAttribute(line)}`));
   });
 });
 
@@ -304,6 +337,7 @@ describe('startInstallInterstitial (live loopback server, groundnuty/macf#952)',
       'Why: this App only needs access to the repo(s) listed above.',
       "GitHub's install page: https://github.com/apps/demo-fleet-code-agent/installations/new",
     ],
+    repoNames: ['demo-code'],
     gateNumber: 2,
     gateTotal: 2,
   };

@@ -67,6 +67,19 @@ function fakeInterstitialHandles(): InstallInterstitialHandles {
   };
 }
 
+/**
+ * groundnuty/macf#1176 — extracts the `<pre>` content under the named `<h2>`
+ * heading, split into lines. Superseded the `<li>`-per-`messageLines`-entry
+ * shape #1173 pinned (`renderInstallInterstitial` now renders two distinct
+ * `<pre>` blocks — see that function's own doc).
+ */
+function extractPreBlock(html: string, heading: string): readonly string[] {
+  const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`<h2>${escapedHeading}<\\/h2>\\n<pre>([\\s\\S]*?)<\\/pre>`);
+  const match = re.exec(html);
+  return match ? match[1]!.split('\n') : [];
+}
+
 function baseDeps(overrides: Partial<AgentApplyDeps> = {}): AgentApplyDeps {
   const logs: string[] = [];
   return {
@@ -1031,11 +1044,20 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
   // "look right" while drifting (that is exactly how this reached four
   // instances); comparing captured outputs to each other cannot.
 
-  it('DECISIVE: on a resumed gate, every line the terminal prints for gate 2 is present, verbatim, in the served interstitial — asserted against each other, never against a literal', async () => {
+  it('DECISIVE: on a resumed gate (WITH allowInstallRetry — the only posture that still opens a page here per groundnuty/macf#1175), every line the terminal prints for gate 2 is present, verbatim, in the served interstitial — asserted against each other, never against a literal', async () => {
     const logs: string[] = [];
     let seenOpts: InstallInterstitialOptions | undefined;
     const deps = baseDeps({
       log: (l) => logs.push(l),
+      // groundnuty/macf#1175 — on the DEFAULT (allowInstallRetry unset)
+      // posture, this exact fixture (confirmed-but-invalid resumed install)
+      // now refuses immediately and never opens a page at all — see the
+      // #1175 describe block above. `allowInstallRetry: true` exercises the
+      // ONE remaining path that still reopens a page for this shape (the
+      // genuine-wait retry loop), which is what this cross-surface
+      // agreement test needs to observe a served page at all.
+      allowInstallRetry: true,
+      waitForOperatorFix: async () => {},
       startInstallInterstitial: async (opts) => {
         seenOpts = opts;
         return fakeInterstitialHandles();
@@ -1059,14 +1081,16 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
     }
 
     // Surface 2 (browser): render the ACTUAL captured opts (not a re-typed
-    // fixture) and confirm every rendered <li> is exactly one escaped
-    // messageLines entry, in order — nothing the page adds, nothing it
-    // drops.
+    // fixture) and confirm the verbatim-instruction block is exactly one
+    // escaped, role-prefixed messageLines entry per line, in order —
+    // nothing the page adds, nothing it drops (groundnuty/macf#1176
+    // supersedes the pre-#1176 `<li>`-per-line shape).
     const html = renderInstallInterstitial(seenOpts!);
-    const items = Array.from(html.matchAll(/<li>([\s\S]*?)<\/li>/g)).map((m) => m[1]);
-    expect(items).toEqual(messageLines.map((line) => escapeHtmlAttribute(line)));
+    const items = extractPreBlock(html, 'The instruction, as printed');
+    expect(items).toEqual(messageLines.map((line) => `Role "code-agent": ${escapeHtmlAttribute(line)}`));
 
-    // And it IS the resumed-gate delta (groundnuty/macf#1160's own fix),
+    // And it IS the resumed-gate delta (groundnuty/macf#1160's own fix,
+    // reached here via the retry-reopen's `gate2RetryInstructionLines`),
     // now proven present on BOTH surfaces — not the stale full-list
     // restatement #1173 reports the page as showing.
     expect(messageLines).toContain(SENTINEL_RETRY_INSTRUCTION);
@@ -1093,8 +1117,8 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
       expect(logs).toContain(`Role "code-agent": ${line}`);
     }
     const html = renderInstallInterstitial(seenOpts!);
-    const items = Array.from(html.matchAll(/<li>([\s\S]*?)<\/li>/g)).map((m) => m[1]);
-    expect(items).toEqual(messageLines.map((line) => escapeHtmlAttribute(line)));
+    const items = extractPreBlock(html, 'The instruction, as printed');
+    expect(items).toEqual(messageLines.map((line) => `Role "code-agent": ${escapeHtmlAttribute(line)}`));
     expect(messageLines.join('\n')).toContain(FULL_SELECT_EXACTLY_LINE);
   });
 
@@ -1104,6 +1128,11 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
     const DANGEROUS_RETRY_INSTRUCTION = 'add "groundnuty/<script>evil()</script>" & retry';
     const deps = baseDeps({
       log: (l) => logs.push(l),
+      // groundnuty/macf#1175 — see the cross-surface agreement test above:
+      // this exact fixture no longer opens a page by default; the retry
+      // path is what still does.
+      allowInstallRetry: true,
+      waitForOperatorFix: async () => {},
       startInstallInterstitial: async (opts) => {
         seenOpts = opts;
         return fakeInterstitialHandles();
