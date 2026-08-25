@@ -66,13 +66,14 @@ const RUNNER_OPS_REPO_NAMES = ['exp-science-agent', 'exp-code-agent'];
  * verbatim-instruction block WITHOUT re-parsing `<li>` markup that no
  * longer exists (superseded by #1173's own `<li>`-per-`messageLines`-entry
  * shape, which #1176 replaces with two distinct `<pre>` blocks — see
- * `manifest-flow-server.ts::renderInstallInterstitial`'s doc).
+ * `manifest-flow-server.ts::renderInstallInterstitial`'s doc). The
+ * `<pre[^>]*>` form (groundnuty/macf#1179) tolerates the `class=
+ * "macf-repos"`/`class="macf-instructions"` attribute the CSS-class split
+ * added — this helper extracts CONTENT; the class split's own tests
+ * (`manifest-flow-server.test.ts`) assert the classes themselves.
  */
 function preBlockLines(html: string, heading: string): readonly string[] {
   const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // groundnuty/macf#1179 — the copyable block carries `class="copy"` so the
-  // PAYLOAD keeps full size while instruction prose shrinks. Tolerate the
-  // attribute; keep asserting the CONTENT exactly.
   const re = new RegExp(`<h2>${escapedHeading}<\\/h2>\\n<pre[^>]*>([\\s\\S]*?)<\\/pre>`);
   const match = re.exec(html);
   return match ? match[1]!.split('\n') : [];
@@ -202,7 +203,7 @@ describe('manifest-flow-server (pure parts)', () => {
 describe('renderCopyableRepoBlock (groundnuty/macf#1176 — pure; the copyable payload in isolation)', () => {
   it('is EXACTLY the repo names, one per line, nothing else — no bullets, no prose', () => {
     expect(renderCopyableRepoBlock(RUNNER_OPS_REPO_NAMES)).toBe(
-      '<h2>Repositories to select — copy exactly</h2>\n<pre class="copy">exp-science-agent\nexp-code-agent</pre>',
+      '<h2>Repositories to select — copy exactly</h2>\n<pre class="macf-repos">exp-science-agent\nexp-code-agent</pre>',
     );
   });
 
@@ -219,7 +220,7 @@ describe('renderCopyableRepoBlock (groundnuty/macf#1176 — pure; the copyable p
 describe('renderVerbatimInstructionBlock (groundnuty/macf#1176 — pure; the terminal-fidelity block in isolation)', () => {
   it('is EXACTLY messageLines, each prefixed `Role "<role>": ` and escaped — the SAME form announceAndOpenGate prints', () => {
     expect(renderVerbatimInstructionBlock('runner-ops', ['line one', 'line two'])).toBe(
-      '<h2>The instruction, as printed</h2>\n<pre>Role "runner-ops": line one\nRole "runner-ops": line two</pre>',
+      '<h2>The instruction, as printed</h2>\n<pre class="macf-instructions">Role "runner-ops": line one\nRole "runner-ops": line two</pre>',
     );
   });
 

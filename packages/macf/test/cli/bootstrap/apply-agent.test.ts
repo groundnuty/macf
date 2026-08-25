@@ -71,11 +71,15 @@ function fakeInterstitialHandles(): InstallInterstitialHandles {
  * groundnuty/macf#1176 — extracts the `<pre>` content under the named `<h2>`
  * heading, split into lines. Superseded the `<li>`-per-`messageLines`-entry
  * shape #1173 pinned (`renderInstallInterstitial` now renders two distinct
- * `<pre>` blocks — see that function's own doc).
+ * `<pre>` blocks — see that function's own doc). The `<pre[^>]*>` form
+ * (groundnuty/macf#1179) tolerates the `class="macf-repos"`/`class=
+ * "macf-instructions"` attribute the CSS-class split added — this helper
+ * extracts CONTENT, the class-split's own tests assert the classes
+ * themselves (`manifest-flow-server.test.ts`).
  */
 function extractPreBlock(html: string, heading: string): readonly string[] {
   const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`<h2>${escapedHeading}<\\/h2>\\n<pre>([\\s\\S]*?)<\\/pre>`);
+  const re = new RegExp(`<h2>${escapedHeading}<\\/h2>\\n<pre[^>]*>([\\s\\S]*?)<\\/pre>`);
   const match = re.exec(html);
   return match ? match[1]!.split('\n') : [];
 }

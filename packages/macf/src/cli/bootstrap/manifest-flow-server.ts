@@ -42,6 +42,19 @@
  * own doc for the incident this closes, and its groundnuty/macf#1176 note
  * for the copyable repo-names block ({@link renderCopyableRepoBlock}) added
  * alongside it.
+ *
+ * **groundnuty/macf#1179 — the consent-gate interaction model.** Gate 2's
+ * page grew two affordances, both because the operator's attention is IN
+ * THE BROWSER at the moment they'd want them, not at the terminal: **"I've
+ * updated the install — check again"** (re-run the SAME validation without
+ * waiting for the next scheduled poll tick) and **"cancel this identity"**
+ * (stop waiting on THIS identity only — see `apply-agent.ts`'s
+ * `Gate2Interactive` doc for the CLI-side wiring). {@link startInstallInterstitial}
+ * therefore stopped being purely static: it now serves the SAME bound port
+ * dynamically (`current` is mutable, updated via {@link
+ * InstallInterstitialHandles.updateContent} on every poll tick that observes
+ * a rejection) and answers two new POST routes. Never a THIRD "close the tab
+ * means cancel" affordance — see {@link renderGate2Controls}'s doc for why.
  */
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
@@ -321,12 +334,14 @@ export interface InstallInterstitialOptions {
 export function renderCopyableRepoBlock(repoNames: readonly string[]): string {
   if (repoNames.length === 0) return '';
   const body = repoNames.map((name) => escapeHtmlAttribute(name)).join('\n');
-  // WHY (groundnuty/macf#1179): `pre.copy` keeps the PAYLOAD at full size while
-  // the instruction prose shrinks. Styling the bare `pre` selector would shrink
-  // both — and the repo names are the operator's stated reason for this page.
-  // Wrapping is safe here: CSS wrapping is visual and inserts no characters
-  // into a copied selection, so a wrapped owner/repo still pastes clean.
-  return `<h2>Repositories to select — copy exactly</h2>\n<pre class="copy">${body}</pre>`;
+  // groundnuty/macf#1179 — `macf-repos` (distinct from `macf-instructions`
+  // below): the operator's report was specifically about the PROSE block's
+  // font/wrap, not this one. This block is the payload (#1176) — it must
+  // stay prominent and one-name-per-line, so its styling is UNCHANGED from
+  // before this issue. A shared `pre` selector restyle would have shrunk
+  // this block right along with the prose fix; see `renderInstallInterstitial`'s
+  // CSS block for the two rules this class name resolves to.
+  return `<h2>Repositories to select — copy exactly</h2>\n<pre class="macf-repos">${body}</pre>`;
 }
 
 /**
@@ -345,7 +360,14 @@ export function renderVerbatimInstructionBlock(role: string, messageLines: reado
   if (messageLines.length === 0) return '';
   const roleEsc = escapeHtmlAttribute(role);
   const body = messageLines.map((line) => `Role "${roleEsc}": ${escapeHtmlAttribute(line)}`).join('\n');
-  return `<h2>The instruction, as printed</h2>\n<pre>${body}</pre>`;
+  // groundnuty/macf#1179 — `macf-instructions` (distinct from `macf-repos`
+  // above). Operator-reported live: "the font is a little bit too big, and
+  // it has a horizontal scroller which makes it impossible to see it in one
+  // pass" — this is PROSE, not a payload to copy verbatim, so it gets a
+  // smaller font + wraps instead of scrolling. Wrapping is visual only (no
+  // characters inserted), so it does not touch the copyable block's own
+  // "nothing to trim" property — that block keeps its OWN class, unaffected.
+  return `<h2>The instruction, as printed</h2>\n<pre class="macf-instructions">${body}</pre>`;
 }
 
 /**
@@ -374,6 +396,39 @@ export function renderVerbatimInstructionBlock(role: string, messageLines: reado
  * {@link renderVerbatimInstructionBlock}) is context around it, never a
  * peer to it — same ordering + prominence intent, applied structurally.
  */
+/**
+ * groundnuty/macf#1179 — the two operator-facing controls, present on every
+ * gate-2 render. **"I've updated the install — check again"** POSTs to
+ * `/check-again`: wakes the CLI's wait loop (`apply-agent.ts::
+ * pollForInstallFix`) immediately instead of waiting for its next scheduled
+ * tick, and re-runs the SAME validation. **"cancel this identity"** POSTs to
+ * `/cancel`: ends the wait for THIS identity only (`apply-agent.ts::
+ * Gate2Interactive` — every gate-2 wait strategy races it against its own
+ * poll, never just the resumed-fix one) — the App and its already-durable
+ * credential are untouched either way (DR-043 Amendment B).
+ *
+ * **Why there is no THIRD "closing this tab cancels" affordance.** Proposed
+ * during this issue's own review, then withdrawn once the form action above
+ * was re-checked: it has no `target="_blank"`, so the operator's own click on
+ * "Continue to GitHub to install" NAVIGATES AWAY from this page — the normal,
+ * successful case. A close/unload event cannot tell that apart from actually
+ * giving up (or the browser discarding/restoring the tab, or the operator
+ * finishing and tidying up afterward) — "close-as-cancel" would fire on the
+ * happy path. The explicit button above is the only honest fast-path signal;
+ * the overall gate timeout remains the (slower, but never-wrong) fallback for
+ * a genuine walk-away. Do not re-add a `beforeunload`/`visibilitychange`
+ * cancel hook here — this is a considered omission, not a gap.
+ */
+function renderGate2Controls(): string {
+  return `<h2>While you wait</h2>
+<form method="post" action="/check-again" style="display:inline-block">
+  <button type="submit">I've updated the install — check again</button>
+</form>
+<form method="post" action="/cancel" style="display:inline-block; margin-left: 0.75rem">
+  <button type="submit" class="secondary">Cancel this identity</button>
+</form>`;
+}
+
 export function renderInstallInterstitial(opts: InstallInterstitialOptions): string {
   const roleEsc = escapeHtmlAttribute(opts.role);
   const appNameEsc = escapeHtmlAttribute(opts.appName);
@@ -383,18 +438,27 @@ export function renderInstallInterstitial(opts: InstallInterstitialOptions): str
   return `<!doctype html>
 <html><head><meta charset="utf-8"><title>Consent gate ${String(opts.gateNumber)} of ${String(opts.gateTotal)} — installing ${appNameEsc}</title>
 <style>
-  /* WHY (groundnuty/macf#1179): the page is READ, not skimmed. A 42rem prose
-     column forced long lines (a full API path, an owner/repo pair) into a
-     horizontal scroller, so the instruction could not be taken in at once.
-     Wider container + wrap-instead-of-scroll; the copyable block keeps its
-     own size because it is the payload, not prose. */
+  /* WHY (groundnuty/macf#1181): the operator's own diagnosis — a 42rem prose
+     column was the root cause of the horizontal scroller, not the font. A
+     full API path or an owner/repo pair does not fit in ~672px. */
   body { font-family: system-ui, sans-serif; max-width: 68rem; margin: 2rem auto; padding: 0 1.5rem; }
-  pre { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: 0.75rem 1rem;
-        white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: visible; font-size: 0.9rem; }
-  pre.copy { font-size: 1.05rem; font-weight: 600; }
+  pre { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: 0.75rem 1rem; }
+  /* groundnuty/macf#1179 — DISTINCT classes, not a shared pre-tag restyle.
+     Operator's live report: "the font is a little bit too big, and it has a
+     horizontal scroller which makes it impossible to see it in one pass" —
+     about the PROSE block only. Restyling the bare pre selector would have
+     shrunk the copyable repo block (the payload, #1176) right along with it. */
+  /* WHY (groundnuty/macf#1181): the PAYLOAD wraps too — a scroller here is the
+     same unreadability one element over. Wrapping is safe for copying: CSS
+     wrapping is visual and inserts no characters into a selection. Larger +
+     bolder than the prose because it is what the operator came for. */
+  .macf-repos { font-size: 1.05rem; font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .macf-instructions { font-size: 0.85rem; white-space: pre-wrap; overflow-wrap: anywhere; }
   .dim { color: #666; }
   .button { display: inline-block; margin-top: 1rem; padding: 0.6rem 1.2rem; background: #1f6feb; color: #fff;
             text-decoration: none; border-radius: 6px; font-weight: 600; }
+  button[type="submit"] { padding: 0.5rem 1rem; border-radius: 6px; font-weight: 600; cursor: pointer; }
+  button.secondary { background: #fff; color: #57606a; border: 1px solid #d0d7de; }
 </style>
 </head>
 <body>
@@ -404,6 +468,27 @@ ${repoBlock}
 ${instructionBlock}
 <p><a class="button" href="${installUrlEsc}">Continue to GitHub to install</a></p>
 <p class="dim">If the button doesn't work, open this URL yourself: ${installUrlEsc}</p>
+${renderGate2Controls()}
+</body></html>`;
+}
+
+/** groundnuty/macf#1179 — the page returned by a successful `/check-again` POST. Never claims the fix is confirmed (the CLI's own re-check, running independently, decides that) — only that the request was received. */
+function renderCheckAgainAckPage(role: string): string {
+  const roleEsc = escapeHtmlAttribute(role);
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Checking again</title>
+<meta http-equiv="refresh" content="2;url=/"></head>
+<body><h1>Checking again</h1>
+<p>Role "${roleEsc}": apply will re-check the install now. This page refreshes itself in a couple of seconds —
+if the install is fixed, you're done; if not, this page will name what's still missing.</p></body></html>`;
+}
+
+/** groundnuty/macf#1179 — the page returned by `/cancel`. Terminal — no refresh, nothing left to wait for on THIS identity. */
+function renderCancelledPage(role: string): string {
+  const roleEsc = escapeHtmlAttribute(role);
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Cancelled</title></head>
+<body><h1>Cancelled</h1>
+<p>Role "${roleEsc}": this identity's install was cancelled. The App and its credential remain saved exactly as
+they were — nothing else in the fleet is affected. Close this tab; re-run apply whenever you want to finish it.</p>
 </body></html>`;
 }
 
@@ -412,23 +497,104 @@ export interface InstallInterstitialHandles {
   readonly startUrl: string;
   /** Idempotent shutdown. Always call (e.g. in a `finally`). */
   close: () => Promise<void>;
+  /**
+   * groundnuty/macf#1179 — resolves the next time the operator POSTs
+   * `/check-again`. Re-armed immediately after each resolution (an internal
+   * generation counter, not a promise identity) so a click that arrives
+   * BEFORE anything is awaiting it is never lost, and a caller can await it
+   * again for the NEXT click. Optional so a fake/older `InstallInterstitialHandles`
+   * literal (every pre-#1179 test) omits it — `apply-agent.ts`'s
+   * `Gate2Interactive` normalizes a missing hook to "never fires," which
+   * reproduces exactly the pre-#1179 blind-timed-poll behavior.
+   */
+  readonly waitForCheckAgain?: () => Promise<void>;
+  /** groundnuty/macf#1179 — resolves once the operator POSTs `/cancel`, and stays resolved (repeat calls resolve immediately). Optional for the same reason as {@link waitForCheckAgain}. */
+  readonly waitForCancel?: () => Promise<void>;
+  /**
+   * groundnuty/macf#1179 — re-render the served page's message body for
+   * subsequent GETs, WITHOUT re-opening a new listener. `apply-agent.ts::
+   * pollForInstallFix` calls this on every tick that observes a rejection,
+   * passing the SAME `messageLines`/`repoNames` it would otherwise log — the
+   * #1173/#1174 "one message source" discipline extended from "computed once
+   * at gate-open" to "recomputed once per tick, still never re-derived on
+   * this page's own." Optional for the same reason as {@link waitForCheckAgain}.
+   */
+  readonly updateContent?: (messageLines: readonly string[], repoNames: readonly string[]) => void;
 }
 
 /**
- * Start the single-shot gate-2 interstitial listener on an ephemeral
- * 127.0.0.1 port — the SAME {@link bindEphemeralListener} primitive
- * {@link startManifestFlow} uses (see module doc). Unlike gate 1, this page
- * needs no callback: gate 2's completion is observed by polling
- * `GET /app/installations` (`identity-confirm.ts::waitForAppInstallation`),
- * not by a redirect this listener would need to catch — so the served
- * content is static for the listener's whole lifetime, no per-request state.
+ * Start the gate-2 interstitial listener on an ephemeral 127.0.0.1 port — the
+ * SAME {@link bindEphemeralListener} primitive {@link startManifestFlow} uses
+ * (see module doc). Unlike gate 1, this page needs no redirect callback:
+ * gate 2's completion is observed by polling `GET /app/installations`
+ * (`identity-confirm.ts::waitForAppInstallation`) — but as of groundnuty/
+ * macf#1179 the served content is no longer static for the listener's WHOLE
+ * lifetime: `current` is a mutable snapshot re-read on every GET, so a
+ * `/check-again`-triggered re-check that still fails can narrow the page
+ * without tearing the listener down and standing up a new one.
  */
 export async function startInstallInterstitial(opts: InstallInterstitialOptions): Promise<InstallInterstitialHandles> {
   const { server, baseUrl, close } = await bindEphemeralListener();
-  const html = renderInstallInterstitial(opts);
-  server.on('request', (_req: IncomingMessage, res: ServerResponse) => {
+  let current = opts;
+
+  // groundnuty/macf#1179 — generation counter, not a single re-usable
+  // Promise object. A single Promise that gets reassigned on every POST has
+  // a lost-wakeup hazard: a click that lands BEFORE anything is awaiting
+  // `waitForCheckAgain()` would resolve a promise nobody is holding, and the
+  // NEXT `waitForCheckAgain()` call would then hand back a freshly-armed,
+  // still-pending promise — silently dropping the click. Comparing against a
+  // monotonic counter means "has the operator clicked since I last checked"
+  // is answered correctly regardless of ordering.
+  let checkAgainGeneration = 0;
+  let lastObservedGeneration = 0;
+  let checkAgainWaiters: (() => void)[] = [];
+  const waitForCheckAgain = (): Promise<void> => {
+    if (checkAgainGeneration > lastObservedGeneration) {
+      lastObservedGeneration = checkAgainGeneration;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      checkAgainWaiters.push(() => {
+        lastObservedGeneration = checkAgainGeneration;
+        resolve();
+      });
+    });
+  };
+
+  // Cancel is one-shot and never un-fires — a single Promise is the right
+  // primitive here (no lost-wakeup hazard: once resolved, every subsequent
+  // `await` on it resolves immediately, which is exactly "stays cancelled").
+  let resolveCancel: (() => void) | undefined;
+  const cancelPromise = new Promise<void>((resolve) => { resolveCancel = resolve; });
+
+  server.on('request', (req: IncomingMessage, res: ServerResponse) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    if (req.method === 'POST' && url.pathname === '/check-again') {
+      checkAgainGeneration += 1;
+      const waiters = checkAgainWaiters;
+      checkAgainWaiters = [];
+      for (const w of waiters) w();
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderCheckAgainAckPage(current.role));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/cancel') {
+      resolveCancel?.();
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderCancelledPage(current.role));
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(html);
+    res.end(renderInstallInterstitial(current));
   });
-  return { startUrl: `${baseUrl}/`, close };
+
+  return {
+    startUrl: `${baseUrl}/`,
+    close,
+    waitForCheckAgain,
+    waitForCancel: () => cancelPromise,
+    updateContent: (messageLines, repoNames) => {
+      current = { ...current, messageLines, repoNames };
+    },
+  };
 }
