@@ -35,7 +35,7 @@
  */
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import type { FleetLock, FleetLockAgent, FleetVersions } from './fleet-manifest.js';
+import type { FleetLock, FleetLockAgent, FleetVersions, ScopeCredentialMarker } from './fleet-manifest.js';
 import { FLEET_LOCK_SCHEMA_VERSION, FleetLockSchema, parseFleetLock } from './fleet-manifest.js';
 
 /**
@@ -120,6 +120,31 @@ export interface ComposeFleetLockInput {
   readonly fleetSecrets?: Readonly<Record<string, string>>;
   /** `versions:` observed THIS run (§D6 GitOps steering), merged over `previous.versions` field-by-field. */
   readonly versions?: Partial<FleetVersions>;
+  /**
+   * groundnuty/macf#1162 — scope-level credential markers THIS run resolved
+   * (today: only the router App's `'vault-reused'` cross-fleet-shared-scope
+   * outcome — see `ScopeCredentialMarkerSchema`'s doc). Merged over
+   * `previous.scope_credentials` BY ROLE, fresh always winning (same
+   * "fresh wins, previous carries forward" shape {@link mergeFingerprints}
+   * already establishes) — never folded into `agentUpdates`/`agents[]`
+   * because that array's `install_id` is required and a vault-reused
+   * credential has none to record.
+   */
+  readonly scopeCredentials?: readonly ScopeCredentialUpdate[];
+}
+
+/**
+ * One scope-credential marker update — the camelCase "what apply resolved"
+ * shape {@link composeFleetLock} turns into a full {@link ScopeCredentialMarker}
+ * (adding the fixed `scope`/`held`/`pending` vocabulary). `originFleet`
+ * mirrors `ScopeCredentialMarkerSchema.origin_fleet`'s optionality exactly:
+ * omitted means the operator has not declared a source yet — the marker is
+ * still written (never silently indistinguishable from ownership), just
+ * without a name to give the source.
+ */
+export interface ScopeCredentialUpdate {
+  readonly role: string;
+  readonly originFleet?: string;
 }
 
 export interface ComposeFleetLockResult {
@@ -179,6 +204,37 @@ function mergeVersions(
 }
 
 /**
+ * Merge fresh {@link ScopeCredentialUpdate}s into previously-recorded
+ * {@link ScopeCredentialMarker}s, BY ROLE (never pruned — same "untouched
+ * carries forward" contract every other merge in this module keeps). A
+ * role present in `fresh` ALWAYS wins and is rebuilt with the fixed
+ * `scope: 'scope-level'` / `held: 'locally'` / `pending: 'scope-store'`
+ * vocabulary — this function is the ONLY place that vocabulary is written,
+ * so a future caller can never construct a differently-worded marker.
+ * Sorted by role for {@link serializeFleetLock}'s determinism contract.
+ * Returns `undefined` (never `[]`) when the merged result is empty, same
+ * "omit rather than write a vacuous array" convention {@link mergeFingerprints}
+ * already establishes.
+ */
+function mergeScopeCredentials(
+  previous: readonly ScopeCredentialMarker[] | undefined,
+  fresh: readonly ScopeCredentialUpdate[] | undefined,
+): ScopeCredentialMarker[] | undefined {
+  const byRole = new Map<string, ScopeCredentialMarker>((previous ?? []).map((m) => [m.role, m]));
+  for (const update of fresh ?? []) {
+    byRole.set(update.role, {
+      role: update.role,
+      scope: 'scope-level',
+      held: 'locally',
+      ...(update.originFleet !== undefined ? { origin_fleet: update.originFleet } : {}),
+      pending: 'scope-store',
+    });
+  }
+  const merged = [...byRole.values()].sort((a, b) => a.role.localeCompare(b.role));
+  return merged.length > 0 ? merged : undefined;
+}
+
+/**
  * Compose a `fleet.lock` from a previously-observed lock (or none) plus what
  * THIS apply run established. Pure — no I/O, no clock, no randomness — and
  * always re-validated via `FleetLockSchema.parse()` before returning: "fail
@@ -225,6 +281,7 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
 
   const fingerprints = mergeFingerprints(input.previous?.fingerprints, input.fleetSecrets);
   const versions = mergeVersions(input.previous?.versions, input.versions);
+  const scopeCredentials = mergeScopeCredentials(input.previous?.scope_credentials, input.scopeCredentials);
 
   const composed: FleetLock = {
     schema_version: FLEET_LOCK_SCHEMA_VERSION,
@@ -232,6 +289,7 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
     agents,
     ...(versions !== undefined ? { versions } : {}),
     ...(fingerprints !== undefined ? { fingerprints } : {}),
+    ...(scopeCredentials !== undefined ? { scope_credentials: scopeCredentials } : {}),
   };
 
   return { lock: FleetLockSchema.parse(composed), identityChanges };
@@ -260,6 +318,25 @@ function orderedAgent(agent: FleetLockAgent): FleetLockAgent {
 }
 
 /**
+ * `ScopeCredentialMarker` with its fields in `ScopeCredentialMarkerSchema`'s
+ * declared order (`role, scope, held, origin_fleet, pending`) — same
+ * defensive re-ordering `orderedAgent` applies, in case a caller hand-built
+ * one out of order. Uses inline conditional spread (not post-hoc
+ * assignment) specifically because the optional field sits BETWEEN two
+ * required ones in the declared order — an assign-after-the-fact would put
+ * `origin_fleet` last regardless of the schema's declared position.
+ */
+function orderedScopeCredential(marker: ScopeCredentialMarker): ScopeCredentialMarker {
+  return {
+    role: marker.role,
+    scope: marker.scope,
+    held: marker.held,
+    ...(marker.origin_fleet !== undefined ? { origin_fleet: marker.origin_fleet } : {}),
+    pending: marker.pending,
+  };
+}
+
+/**
  * Serialize a `FleetLock` deterministically — stable key order (matching
  * `FleetLockSchema`'s declared field order top-to-bottom, `agents[]` sorted
  * by `role`, every fingerprint map sorted by secret name) + a trailing
@@ -284,6 +361,7 @@ export function serializeFleetLock(lock: FleetLock): string {
     agents: FleetLockAgent[];
     versions?: Partial<FleetVersions>;
     fingerprints?: Record<string, string>;
+    scope_credentials?: ScopeCredentialMarker[];
   } = {
     schema_version: validated.schema_version,
     fleet: validated.fleet,
@@ -291,6 +369,9 @@ export function serializeFleetLock(lock: FleetLock): string {
   };
   if (validated.versions !== undefined) ordered.versions = validated.versions;
   if (validated.fingerprints !== undefined) ordered.fingerprints = sortRecord(validated.fingerprints);
+  if (validated.scope_credentials !== undefined) {
+    ordered.scope_credentials = [...validated.scope_credentials].sort((a, b) => a.role.localeCompare(b.role)).map(orderedScopeCredential);
+  }
   return `${JSON.stringify(ordered, null, 2)}\n`;
 }
 
