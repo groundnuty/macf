@@ -912,9 +912,18 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
 
     // The page DID reopen this time — the operator opted into it.
     expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
-    // The genuine wait ran BEFORE the re-check, not merely was wired.
-    expect(callOrder).toEqual(['wait-for-fix', 'poll', 'validate-2']);
-    expect(outcome.status).toBe('resumed-install');
+    // validate-1 is the pre-flight check (`skipGate2IfAlreadyInstalled`,
+    // no page open — same as the unattended posture up to this point).
+    // Then: reopen -> wait-for-fix (the operator's genuine window) -> poll
+    // -> validate-2. Without the wait step, poll/validate-2 would
+    // immediately follow validate-1 with nothing giving the operator a
+    // chance to act — this ordering assertion is what catches that.
+    expect(callOrder).toEqual(['validate-1', 'wait-for-fix', 'poll', 'validate-2']);
+    // 'created', not 'resumed-install' — this is the recovery-artifact
+    // (`viaRecovery: true`) path; `finishGate2FromCredentials` reports a
+    // successful gate 2 as 'created' (it carries `credentials`), same as
+    // the ordinary create path — see that function's own doc.
+    expect(outcome.status).toBe('created');
     // Decisive negative: the unattended-path refusal text must NEVER
     // appear here — that text specifically claims nothing further waits,
     // which would be false on this path (something further DOES wait).
@@ -1739,6 +1748,60 @@ describe('groundnuty/macf#1063 — recoverable consent-gate-2 rejection re-opens
     // create goes through it regardless of #1063) + once more for the retry.
     expect(startInstallInterstitial).toHaveBeenCalledTimes(2);
     expect(outcome).toEqual({ role: 'code-agent', status: 'created', appId: '9001', installId: '5555', credentials: CREDS });
+  });
+
+  // groundnuty/macf#1176 — the retry-reopen's copyable repo block narrows
+  // to the SPECIFIC repo the rejecting hook found missing (`missingRepos`),
+  // never the full required set — mirroring `messageLines`' own
+  // `retryInstruction` narrowing, structurally instead of by parsing prose.
+  it('groundnuty/macf#1176: the reopened page narrows the copyable repo block to missingRepos, not the full required set', async () => {
+    let seenOpts: InstallInterstitialOptions | undefined;
+    let validateReuseCalls = 0;
+    const deps = baseDeps({
+      startInstallInterstitial: async (opts) => {
+        // Only capture the REOPEN's opts — the reopen is the second call.
+        if (validateReuseCalls >= 1) seenOpts = opts;
+        return fakeInterstitialHandles();
+      },
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      waitForAppInstallation: async () => REUSE_INSTALL,
+      allowInstallRetry: true,
+      waitForOperatorFix: async () => {},
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        return validateReuseCalls === 1
+          ? { message: MISSING_REPO_REASON, retryInstruction: 'add it, then Save', missingRepos: ['groundnuty/demo-fleet-control'] }
+          : undefined;
+      },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    expect(seenOpts).toBeDefined();
+    // Bare name — the picker's own format (`apply-agent.ts::bareRepoName`).
+    expect(seenOpts!.repoNames).toEqual(['demo-fleet-control']);
+  });
+
+  it('groundnuty/macf#1176: WITHOUT a structured missingRepos on the rejection, the reopened page falls back to the full required set — never omits the block', async () => {
+    let seenOpts: InstallInterstitialOptions | undefined;
+    let validateInstallCalls = 0;
+    const deps = baseDeps({
+      startInstallInterstitial: async (opts) => {
+        if (validateInstallCalls >= 1) seenOpts = opts;
+        return fakeInterstitialHandles();
+      },
+      allowInstallRetry: true,
+      waitForOperatorFix: async () => {},
+      waitForAppInstallation: async () => ({ appId: CREDS.appId, installId: '5555', appSlug: CREDS.slug, accountLogin: 'groundnuty' }),
+      validateInstall: async () => {
+        validateInstallCalls += 1;
+        // A bare-string rejection — no missingRepos (e.g. apply-runner-ops.ts's shape).
+        return validateInstallCalls === 1 ? MISSING_REPO_REASON : undefined;
+      },
+    });
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+    expect(seenOpts).toBeDefined();
+    // Falls back to the identity's own full required set (AGENT's one repo).
+    expect(seenOpts!.repoNames).toEqual(['demo-code']);
   });
 
   it('bounds the retries: after the configured number of attempts it still fails, with the full explanation (assert the count)', async () => {

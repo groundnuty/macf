@@ -127,6 +127,16 @@ describe('buildRegistryRepoValidateInstall — the AgentApplyDeps.validateInstal
     expect(retryInstruction).not.toMatch(/GET \/repos|HTTP|404|#\d+/);
   });
 
+  it('groundnuty/macf#1176: the "absent" rejection ALSO carries the specific owner/repo as a structured missingRepos list — not just prose', async () => {
+    const checkFn = async (): Promise<Presence> => 'absent';
+    const validate = buildRegistryRepoValidateInstall('demo-org', 'demo-org-registry', 'demo-fleet-code-agent', () => {}, checkFn);
+    const rejection = await validate(INSTALL, '/fake/key.pem');
+    if (typeof rejection !== 'object') {
+      throw new Error('expected the structured { message, retryInstruction, missingRepos } rejection shape');
+    }
+    expect(rejection.missingRepos).toEqual(['demo-org/demo-org-registry']);
+  });
+
   it('presence "present" -> accepts (undefined), no churn, no warning logged', async () => {
     const checkFn = async (): Promise<Presence> => 'present';
     const logs: string[] = [];
