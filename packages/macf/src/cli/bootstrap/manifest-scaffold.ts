@@ -84,7 +84,7 @@
  * | agents[].role                       | input                   | `--agent role=repo` |
  * | agents[].repo                       | input                   | `--agent role=repo` — genuinely undiscoverable otherwise: enumerating an App installation's repos needs `GET /installation/repositories`, which authenticates AS the installation and needs an install access token this credential-free, JWT-less tool structurally never holds (Amendment A) |
  * | agents[].profile                    | unconfirmable           | provably NOT a function of `role` — real fixtures show `science-agent`→`research` and `runner-ops`→`code`, so no derivation rule exists |
- * | agents[].deploy_path                | observable (conditional) | live content-read of the repo's own committed `.github/agent-config.json`, `agents[<role>].workspace_dir`; TODO if the file/entry is absent or unreadable |
+ * | agents[].deploy_path                | unconfirmable (always)  | `.github/agent-config.json`'s `workspace_dir` is live-readable, but it is documented (`repo-init.ts`) as the Stage-2 SSH-router SEND-TARGET, explicitly vestigial on v3+ — NOT necessarily the same fact as where `fleet deploy` puts a v3 agent's workspace. They coincide in practice today, but "what a vestigial field once recorded" and "what deploy_path should declare" can legitimately diverge — the same reasoning `versions:` gets, applied here. The observed `workspace_dir` is surfaced as a comment, never declared. |
  * | agents[].provenance                 | omitted (optional)      | no live signal distinguishes template-clone vs mirror-remote provenance after the fact |
  * | routing.*                           | omitted (optional)      | declarative routing-target/label/hibernation policy; no live signal drives any of the three sub-fields |
  * | collaborators                       | omitted (optional)      | cross-fleet federation membership has no live discovery path implemented (day-2 per its own schema doc) |
@@ -97,6 +97,22 @@
  * reviews the draft; it does not attempt a `template_repository`-field
  * guess even though one theoretically exists on GitHub's repo API,
  * because "report it, don't decide it" was explicit.
+ *
+ * **Disclosed limitation: `schemaIssuePaths` can only ever report MISSING
+ * REQUIRED FIELDS, never the manifest's cross-field checks.**
+ * `FleetManifestSchema`'s `.superRefine()` (the duplicate-role check, the
+ * double-prefix trap, the `routing.runner.labels` superset check) does NOT
+ * run when base object validation already produced issues — verified
+ * empirically while writing this module (zod v4: a `.strict()` object with
+ * a missing required field never reaches its own `superRefine`). Because
+ * `defaults.role_template` / `defaults.app_manifest` /
+ * `transport.age_recipients` / every `agents[N].profile` /
+ * `agents[N].deploy_path` are ALWAYS missing in v0 (see above), `.superRefine`
+ * NEVER runs on a scaffolded draft — so `schemaIssuePaths` reports "these
+ * required fields are still empty," never "these two agents share a role"
+ * or "this role is double-prefixed." A human reviewing the draft still has
+ * to catch those by reading it, same as the round-trip's well-formedness-
+ * only ceiling the module doc already states.
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -167,7 +183,11 @@ export const MANIFEST_SCAFFOLD_AUDIT_TABLE: readonly ScaffoldAuditRow[] = [
   { field: 'agents[].role', verdict: 'input', note: '--agent role=repo' },
   { field: 'agents[].repo', verdict: 'input', note: '--agent role=repo; undiscoverable without an install token' },
   { field: 'agents[].profile', verdict: 'unconfirmable', note: 'provably not a function of role (science-agent -> research, runner-ops -> code)' },
-  { field: 'agents[].deploy_path', verdict: 'observable', note: 'live .github/agent-config.json workspace_dir read; TODO if absent' },
+  {
+    field: 'agents[].deploy_path',
+    verdict: 'unconfirmable',
+    note: 'observed workspace_dir is a Stage-2 SSH-router send-target (vestigial on v3+), not provably the same fact — surfaced as a comment, never declared',
+  },
   { field: 'agents[].provenance', verdict: 'derivable', note: 'omitted (optional); no live signal' },
   { field: 'routing.*', verdict: 'derivable', note: 'omitted (optional); no live signal' },
   { field: 'collaborators', verdict: 'derivable', note: 'omitted (optional); day-2, no discovery path' },
@@ -385,9 +405,11 @@ async function resolveVaultFacts(vault: ManifestScaffoldVaultInput | undefined, 
 
 /**
  * Renders one `agents:` list entry's YAML lines, plus its own TODO entries.
- * `role`/`repo` are ALWAYS present (operator input). `profile` is ALWAYS
- * OMITTED (see audit table — unconditionally unconfirmable); `deploy_path`
- * is omitted only when the `.github/agent-config.json` read failed. Neither
+ * `role`/`repo` are ALWAYS present (operator input). `profile` and
+ * `deploy_path` are ALWAYS OMITTED (see audit table — both unconditionally
+ * unconfirmable; `deploy_path`'s observed `workspace_dir`, when readable, is
+ * surfaced as a comment ONLY — it is a Stage-2 SSH-router send-target, not
+ * provably the same fact as where `fleet deploy` puts a v3 workspace). No
  * omitted field is ever rendered as a placeholder VALUE — see the module
  * doc's "no field is ever a placeholder string VALUE" note.
  */
@@ -412,13 +434,16 @@ function renderAgentBlock(obs: AgentObservation, index: number): { readonly line
 
   lines.push(`    repo: ${yamlScalar(agent.repo)}`);
 
-  if (obs.deployPath !== undefined) {
-    lines.push(`    deploy_path: ${yamlScalar(obs.deployPath)} # observed via .github/agent-config.json`);
-  } else {
-    const deployTodo = `agents[${String(index)}].deploy_path ("${agent.role}"): .github/agent-config.json on "${agent.repo}" has no readable workspace_dir entry for this role.`;
-    todos.push(deployTodo);
-    lines.push(`    # TODO ${deployTodo} (key omitted below — fill in "deploy_path: <path>")`);
-  }
+  const workspaceDirNote =
+    obs.deployPath !== undefined
+      ? `observed .github/agent-config.json workspace_dir: "${obs.deployPath}"`
+      : `.github/agent-config.json on "${agent.repo}" has no readable workspace_dir entry for this role`;
+  const deployTodo =
+    `agents[${String(index)}].deploy_path ("${agent.role}"): ${workspaceDirNote} — that field is a Stage-2 SSH-router ` +
+    'send-target, documented as vestigial on v3+, NOT provably the same fact as the v3 fleet-deploy workspace path. ' +
+    'They coincide in practice today but are not guaranteed to; confirm before declaring.';
+  todos.push(deployTodo);
+  lines.push(`    # TODO ${deployTodo} (key omitted below — fill in "deploy_path: <path>")`);
 
   return { lines, todos };
 }

@@ -86,6 +86,11 @@ function renderText(yaml: string, todoCount: number, schemaIssuePaths: readonly 
       `This draft does NOT yet validate against FleetManifestSchema — ${String(schemaIssuePaths.length)} required ` +
         `field(s) still need a human decision: ${schemaIssuePaths.join(', ')}`,
     );
+    console.log(
+      'This list is ONLY the required fields still missing — cross-field checks (a duplicate role between two ' +
+        'agents, a role already carrying the fleet-name prefix, a routing label mismatch) do not run while any ' +
+        'required field is still empty, so they are not covered by this list. Read the draft, not just this count.',
+    );
   } else {
     console.log('This draft validates against FleetManifestSchema as written — well-formedness only, review every field before committing.');
   }

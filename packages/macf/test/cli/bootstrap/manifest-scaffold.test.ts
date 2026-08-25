@@ -49,9 +49,15 @@ function fullyObservableDeps(): ManifestScaffoldDeps {
   };
 }
 
-const IRREDUCIBLE_SCHEMA_ISSUE_PATHS = ['defaults.role_template', 'defaults.app_manifest', 'transport.age_recipients', '0.profile', '1.profile'].map(
-  (p) => (p.endsWith('.profile') ? `agents.${p}` : p),
-);
+const IRREDUCIBLE_SCHEMA_ISSUE_PATHS = [
+  'defaults.role_template',
+  'defaults.app_manifest',
+  'transport.age_recipients',
+  'agents.0.profile',
+  'agents.0.deploy_path',
+  'agents.1.profile',
+  'agents.1.deploy_path',
+];
 
 describe('scaffoldManifest — decisive pair', () => {
   it('test 1: a fully-observable fleet gets exactly the irreducible TODO/schema-issue set, nothing more', async () => {
@@ -70,7 +76,12 @@ describe('scaffoldManifest — decisive pair', () => {
     const agents = parsed['agents'] as readonly Record<string, unknown>[];
     expect(agents).toHaveLength(2);
     expect(agents[0]?.['repo']).toBe('groundnuty/macf-code-agent');
-    expect(agents[0]?.['deploy_path']).toBe('/home/ubuntu/repos/groundnuty/macf-code-agent');
+    // deploy_path is NEVER declared, even when workspace_dir is observed —
+    // it is a Stage-2 SSH-router send-target (vestigial on v3+), not
+    // provably the deploy-target path a v3 `fleet deploy` would use. The
+    // observed value is surfaced as a comment only.
+    expect(agents[0]?.['deploy_path']).toBeUndefined();
+    expect(result.yaml).toContain('observed .github/agent-config.json workspace_dir: "/home/ubuntu/repos/groundnuty/macf-code-agent"');
     expect(agents[0]?.['profile']).toBeUndefined();
 
     // versions is optional at the schema level, so it never appears in
@@ -98,6 +109,29 @@ describe('scaffoldManifest — decisive pair', () => {
     // and fine (transparency, not a guess accepted as fact).
     expect(result.yaml).not.toMatch(/^ {2}registry:/m);
     expect(owner['type']).toBe('org'); // owner.type itself is unaffected by this flip
+  });
+});
+
+describe('scaffoldManifest — disclosed limitation: cross-field checks never run on a scaffolded draft', () => {
+  it('a duplicate role across two --agent entries produces NO duplicate-role issue in schemaIssuePaths (zod never reaches superRefine while required fields are missing)', async () => {
+    const duplicateRoleInput: ManifestScaffoldInput = {
+      owner: 'groundnuty',
+      fleetName: 'macf',
+      agents: [
+        { role: 'code-agent', repo: 'groundnuty/macf-code-agent' },
+        { role: 'code-agent', repo: 'groundnuty/macf-code-agent-2' },
+      ],
+    };
+    const result = await scaffoldManifest(duplicateRoleInput, fullyObservableDeps());
+
+    // Verified empirically (zod v4) while writing this module: a `.strict()`
+    // object with a missing required field never reaches its own
+    // `.superRefine()`. So the duplicate-role custom issue this schema's
+    // own superRefine WOULD raise on a hand-written manifest is silently
+    // absent here — schemaIssuePaths reports only the SAME irreducible
+    // missing-required-field set, never anything ABOUT the duplication.
+    expect(result.schemaIssuePaths.slice().sort()).toEqual(IRREDUCIBLE_SCHEMA_ISSUE_PATHS.slice().sort());
+    expect(result.schemaIssuePaths.some((p) => /duplicate/i.test(p))).toBe(false);
   });
 });
 
