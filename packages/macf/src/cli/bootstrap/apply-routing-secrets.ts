@@ -400,6 +400,119 @@ export function skippedRoutingBundlePublish(repos: readonly string[], reason: st
   return skippedOutcomesFor(repos, reason);
 }
 
+// --- Fleet-level aggregate fact (groundnuty/macf#1162) ---
+//
+// `apply`'s per-repo/per-secret render (`apply-fleet.ts`'s routing-secret
+// legs loop) reports every ROW but never the PROPERTY the rows jointly
+// determine — witnessed live on `macf-fresh`: all three router-carrying
+// repos failed their routing-secret legs, `apply` reported per-agent leg
+// failures inside a long run, and "this fleet cannot route" was never
+// stated as its own fact. Two pieces below: a GENERIC aggregator (entity-
+// agnostic — "given N per-entity pass/fail observations, can a fleet-wide
+// statement be made honestly") and a routing-specific adapter over
+// {@link RoutingSecretsPublishResult}. Deliberately entity-agnostic so a
+// FUTURE per-repo/per-agent aggregate fact (not just routing) can reuse the
+// aggregator rather than re-deriving the same three-way honest-unknown
+// logic — but deliberately does NOT extend to the `MACF_ROUTING_BUNDLE`
+// leg (`publishRoutingBundle`'s result): the issue's acceptance criteria
+// name "routing-secret leg" specifically, and extending the boundary
+// without an accompanying decisive test would be an untested code path.
+
+/** One entity's (a repo, in the routing case) contribution to a fleet-level aggregate — `reason` only meaningful when `failed`. */
+export interface FleetLevelEntityOutcome {
+  readonly failed: boolean;
+  readonly reason?: string;
+}
+
+export type FleetLevelFact =
+  /**
+   * Every entity failed. `reason` is the single shared cause when every
+   * failure names the EXACT same one; otherwise a summary naming how many
+   * DISTINCT causes were observed — never a fabricated single cause. The
+   * property "every entity failed" is honestly known either way; only the
+   * CAUSE attribution differs — gating emission on cause-uniformity would
+   * recreate the exact defect this issue reports (three repos fail for two
+   * reasons -> still rows, no fact).
+   */
+  | { readonly kind: 'all-failed'; readonly reason: string }
+  /** Some entities failed, others didn't (or none did) — no fleet-wide statement is honest; per-entity detail is what's actionable. Per the honest-unknown floor: this is NOT 'unknown' — it IS determined (partial), just not summarizable as one fact. */
+  | { readonly kind: 'no-claim' }
+  /** Nothing to determine from (zero entities) — genuinely indeterminate, never assumed either way. */
+  | { readonly kind: 'unknown' };
+
+/**
+ * Determine whether a fleet-level statement can be made HONESTLY from N
+ * per-entity pass/fail observations — the generic form of "this fleet
+ * cannot route" (Amendment A4's honest-unknown floor, applied to
+ * fleet-wide aggregate facts generally). Pure; no I/O; entity-agnostic —
+ * see this section's module doc for why it lives here despite the name
+ * "routing-secrets" on this file, and {@link determineFleetRoutingFact} for
+ * the routing-specific adapter that actually calls it.
+ */
+export function determineFleetLevelFact(entities: readonly FleetLevelEntityOutcome[]): FleetLevelFact {
+  if (entities.length === 0) return { kind: 'unknown' };
+  const failed = entities.filter((e) => e.failed);
+  if (failed.length === 0 || failed.length < entities.length) return { kind: 'no-claim' };
+  const reasons = [...new Set(failed.map((e) => e.reason ?? 'unspecified cause'))].sort();
+  const reason = reasons.length === 1 ? reasons[0]! : `${String(reasons.length)} distinct causes observed — ${reasons.join(' | ')}`;
+  return { kind: 'all-failed', reason };
+}
+
+/**
+ * `ensureVariableCreated` (`ensure-variable.ts`) prefixes EVERY failure
+ * reason with its caller-supplied `label` — here always
+ * `routing secret "<name>" on "<repo>"` (`publishRoutingSecrets`'s own call
+ * site) — so a repo-independent root cause (e.g. "router App identity is
+ * unresolved this run", the SAME `RoutingSecretResolution.reason` for
+ * every repo) still comes back as a BYTE-DIFFERENT `.reason` string per
+ * repo purely because the label embeds that repo's name. Left un-stripped,
+ * {@link determineFleetLevelFact}'s same-cause check would see every
+ * repo-embedding label as its own distinct cause and NEVER collapse a
+ * genuinely shared root cause into one fact — recreating, inside the fix,
+ * the exact "N rows, no single fact" gap this issue reports. Stripping the
+ * KNOWN, exact label prefix (never a heuristic substring match) recovers
+ * the underlying resolution-level reason for comparison.
+ */
+function stripRepoLegLabel(name: string, repo: string, reason: string): string {
+  const prefix = `routing secret "${name}" on "${repo}": `;
+  return reason.startsWith(prefix) ? reason.slice(prefix.length) : reason;
+}
+
+/**
+ * Reduce a {@link RoutingSecretsPublishResult} to ONE outcome per repo —
+ * `failed: true` iff ANY of the six legs failed for that repo, carrying
+ * EVERY distinct (label-stripped, see {@link stripRepoLegLabel}) failure
+ * reason observed for it (deduped, joined) so {@link determineFleetLevelFact}'s
+ * own same-cause-across-repos check operates on the true per-repo cause
+ * set, not one arbitrarily-chosen leg and not a label artifact.
+ * `'skipped'`/`'already-present'`/`'created'` legs are NOT failures — a
+ * repo whose Tailscale pair is `'not-required'` (undeclared) is not, on
+ * its own, evidence this fleet cannot route; only a genuine `'failed'`
+ * leg is.
+ */
+export function perRepoRoutingOutcome(
+  result: RoutingSecretsPublishResult,
+  repos: readonly string[],
+): readonly { readonly repo: string; readonly failed: boolean; readonly reason?: string }[] {
+  return repos.map((repo) => {
+    const reasons = new Set<string>();
+    for (const name of ALL_ROUTING_SECRET_NAMES) {
+      const leg = result[name][repo];
+      if (leg?.status === 'failed') reasons.add(stripRepoLegLabel(name, repo, leg.reason));
+    }
+    return reasons.size === 0 ? { repo, failed: false } : { repo, failed: true, reason: [...reasons].sort().join(' | ') };
+  });
+}
+
+/**
+ * The routing-specific convenience wrapper `apply-fleet.ts` calls at its
+ * render site — composes {@link perRepoRoutingOutcome} + {@link determineFleetLevelFact}
+ * so the caller never has to know the generic aggregator exists.
+ */
+export function determineFleetRoutingFact(result: RoutingSecretsPublishResult, repos: readonly string[]): FleetLevelFact {
+  return determineFleetLevelFact(perRepoRoutingOutcome(result, repos));
+}
+
 // --- Tailscale-declared refuse-before-gate-1 preflight (groundnuty/macf#1074) ---
 
 export const TAILSCALE_OAUTH_MISSING_CODE = 'tailscale_oauth_missing';

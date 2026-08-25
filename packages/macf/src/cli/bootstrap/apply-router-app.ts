@@ -470,8 +470,18 @@ export type RouterAppSecretsForPublish =
  * No `installId` field, unlike `'reused'`/`'resumed-install'` — a
  * vault-reused App was never live-reconfirmed via GitHub this run, so there
  * is no confirmed install to record. `apply-fleet.ts` deliberately does NOT
- * write a `fleet.lock` entry for this status (see that module's call site) —
- * the vault, not the lock, is this scope's source of truth for reuse.
+ * write an `agents[]` fleet.lock entry for this status (see that module's
+ * call site) — the vault, not the lock, is this scope's source of truth
+ * for the credential VALUE.
+ *
+ * **Updated, groundnuty/macf#1162:** `apply-fleet.ts` DOES now write to
+ * `fleet.lock` on this status — a `scope_credentials` PROVENANCE marker
+ * (`fleet-manifest.ts::ScopeCredentialMarkerSchema`), never an `agents[]`
+ * entry (still true; still no confirmed install to record). The marker
+ * carries no secret material and changes no behaviour — it exists so a
+ * reader (and `plan`) can tell "this fleet holds a local copy of a
+ * scope-level credential" from "this fleet owns it," which a total absence
+ * of any lock entry could not distinguish.
  */
 export type RouterAppApplyOutcome = AgentApplyOutcome | { readonly role: string; readonly status: 'vault-reused'; readonly appId: string };
 

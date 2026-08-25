@@ -3476,6 +3476,79 @@ trust:
       expect(applyExitCode(result)).toBe(1);
     });
 
+    // --- groundnuty/macf#1162 — the fleet-level aggregate fact, exercised
+    // through the REAL publish pipeline (not hand-built results) — this is
+    // what actually proves the `ensureVariableCreated` label-stripping fix
+    // (`apply-routing-secrets.ts::stripRepoLegLabel`) works end to end, not
+    // just at the pure-function level: every repo's failure reason for the
+    // SAME cause is prefixed with THAT repo's own name by
+    // `ensureVariableCreated`'s label, and only the strip lets the
+    // aggregator see through that to the shared root cause. ---
+    it('DECISIVE: every router-carrying repo fails for the SAME underlying cause -> ONE "Fleet-level: ... CANNOT route" log line, additive to (not instead of) the per-repo detail', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const logs: string[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedAgentDeps(), manifestPath),
+        trustDeps: reuseCaTrustDeps(),
+        log: (l) => logs.push(l),
+        routingClientDeps: {
+          mint: async () => { throw new Error('must not be called — a routing_client_key fingerprint is already recorded'); },
+          readVaultRoutingClient: async () => ({ certPem: 'CERT-PEM', keyPem: 'KEY-PEM' }),
+        },
+        routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '997', appKeyPem: 'ROUTER-APP-VAULT-PEM' }) },
+        routingSecretsDeps: routingSecretsDepsFor({
+          checkRepoSecretPresence: async () => 'absent',
+          setRepoSecret: async () => { throw new Error('simulated total routing outage'); },
+        }),
+      };
+
+      await applyFleet(manifest, manifestPath, PRIOR_LOCK_TWO_AGENTS, deps);
+
+      const fleetLines = logs.filter((l) => l.startsWith('Fleet-level:'));
+      expect(fleetLines).toHaveLength(1);
+      expect(fleetLines[0]).toContain('CANNOT route');
+      // Names the ONE shared cause, not a per-repo-mangled variant of it —
+      // proves the label-stripping fix, not just that SOME line fired.
+      expect(fleetLines[0]).toContain('simulated total routing outage');
+      // Additive, not a replacement — the per-repo detail is STILL there:
+      const detailLines = logs.filter((l) => l.includes('" leg (') && l.includes('failed'));
+      expect(detailLines.length).toBeGreaterThan(0);
+    });
+
+    it('one router-carrying repo already has every secret (untouched); another genuinely fails -> NO "Fleet-level:" line — the negative half that gives the positive half meaning', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const logs: string[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedAgentDeps(), manifestPath),
+        trustDeps: reuseCaTrustDeps(),
+        log: (l) => logs.push(l),
+        routingClientDeps: {
+          mint: async () => { throw new Error('must not be called — a routing_client_key fingerprint is already recorded'); },
+          readVaultRoutingClient: async () => ({ certPem: 'CERT-PEM', keyPem: 'KEY-PEM' }),
+        },
+        routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '997', appKeyPem: 'ROUTER-APP-VAULT-PEM' }) },
+        routingSecretsDeps: routingSecretsDepsFor({
+          // groundnuty/demo-code ALREADY has every secret (present, no
+          // create attempt, no failure); groundnuty/demo-science is absent
+          // and genuinely fails to create — a MIXED result, not uniform.
+          checkRepoSecretPresence: async (repo) => (repo === 'groundnuty/demo-code' ? 'present' : 'absent'),
+          setRepoSecret: async () => { throw new Error('simulated partial outage'); },
+        }),
+      };
+
+      await applyFleet(manifest, manifestPath, PRIOR_LOCK_TWO_AGENTS, deps);
+
+      // THE assertion this test exists for: no false "always emit" pass —
+      // a mixed result must NOT read as a fleet-level fact.
+      expect(logs.some((l) => l.startsWith('Fleet-level:'))).toBe(false);
+      // "No fleet claim" does not mean "no detail" — the failing repo's
+      // OWN row is still reported (per-agent detail stays, per the issue's
+      // own requirement).
+      expect(logs.some((l) => l.includes('groundnuty/demo-science') && l.includes('failed'))).toBe(true);
+    });
+
     it('groundnuty/macf#1071 — idempotent re-run: a control repo that ALREADY holds the routing-client secrets reports "already-present" for both, never re-minted, never re-written', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT]);
@@ -5523,11 +5596,17 @@ trust:
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
       expect(result.routerApp).toEqual({ role: 'router', status: 'vault-reused', appId: EXISTING_ROUTER_APP_ID });
-      // No fleet.lock entry for 'router' — the vault, not the lock, is this
-      // scope's source of truth for reuse (nothing NEW was resolved this run).
+      // No agents[] entry for 'router' — the vault, not the lock, is this
+      // scope's source of truth for the credential VALUE (nothing NEW was
+      // resolved this run, no install to confirm).
       expect(existsSync(result.lockPath)).toBe(true);
       const lock: FleetLock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
       expect(lock.agents.some((a) => a.role === 'router')).toBe(false);
+      // groundnuty/macf#1162 — but a PROVENANCE marker IS written (this
+      // manifest declares no `router_app_origin_fleet`, so it honestly
+      // omits `origin_fleet` rather than a fabricated sentinel — the
+      // "origin declared" case is covered by the DECISIVE pair below).
+      expect(lock.scope_credentials).toEqual([{ role: 'router', scope: 'scope-level', held: 'locally', pending: 'scope-store' }]);
 
       // THE byte-identity assertion (assert-the-wrong-path.md: "byte-identity
       // of untouched state") — the SAME two lines, character-for-character,
@@ -5650,6 +5729,105 @@ trust:
       // Per-fleet scope never runs resolveSharedRouterAppReuse at all —
       // the shared-scope vault-check seam is untouched.
       expect(readVaultRouterAppCalls).toBe(0);
+    });
+  });
+
+  // --- groundnuty/macf#1162 — the DECISIVE PAIR for the scope-credential
+  // provenance marker: a fleet holding a scope-level (cross-fleet-copied)
+  // router credential gets a marker naming its origin; a fleet that
+  // genuinely owns its router App (never resolved 'vault-reused') gets
+  // NONE — otherwise the marker means nothing (per assert-the-wrong-path.md,
+  // the negative half is what gives the positive half meaning). ---
+  describe('router App — scope-credential provenance marker (groundnuty/macf#1162)', () => {
+    function sharedScopeManifestWithOrigin(originFleet: string | undefined): FleetManifest {
+      const base = manifestWith([CODE_AGENT]);
+      return {
+        ...base,
+        transport: {
+          age_recipients: base.transport.age_recipients,
+          router_app_scope: 'shared',
+          ...(originFleet !== undefined ? { router_app_origin_fleet: originFleet } : {}),
+        },
+      };
+    }
+
+    it('DECISIVE 1/2: router key present-but-scope-level, origin DECLARED -> fleet.lock carries the marker naming the origin fleet', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = sharedScopeManifestWithOrigin('macf-fresh-1');
+      const ROUTER_PEM = 'EXISTING-SHARED-ROUTER-PEM-FOR-1162';
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: () => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          startManifestFlow: async (opts) => {
+            if (opts.role === 'router') throw new Error('must not be called — the router App resolved via vault-reuse');
+            return { startUrl: 'http://x/', redirectUrl: 'http://x/callback', waitForCode: async () => 'code', close: async () => {} };
+          },
+          exchangeManifestCode: async () => creds('code-agent'),
+        }),
+        vaultDeps: { exists: () => true, encrypt: async (_pt, _r, outPath) => writeFileSync(outPath, 'FAKE-CIPHERTEXT') },
+        identityKeyPath: '/fake/operator-key.txt',
+        vaultComposeDeps: {
+          exists: () => true,
+          assertIdentityReadable: () => {},
+          decrypt: async () => `MACF_ROUTING_APP_ID='9001'\nMACF_ROUTING_APP_KEY_B64='${Buffer.from(ROUTER_PEM).toString('base64')}'\n`,
+          encrypt: async () => {},
+          rename: () => {},
+          unlink: () => {},
+        },
+        routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '9001', appKeyPem: ROUTER_PEM }) },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routerApp).toEqual({ role: 'router', status: 'vault-reused', appId: '9001' });
+      const rawLockText = readFileSync(result.lockPath, 'utf-8');
+      const lock: FleetLock = parseFleetLock(rawLockText);
+      // Still no agents[] entry (no install was confirmed this run) — the
+      // marker is additive, not a substitute for that existing contract.
+      expect(lock.agents.some((a) => a.role === 'router')).toBe(false);
+      expect(lock.scope_credentials).toEqual([
+        { role: 'router', scope: 'scope-level', held: 'locally', origin_fleet: 'macf-fresh-1', pending: 'scope-store' },
+      ]);
+      // The marker never carries key material — assert against the
+      // SERIALIZED STRING (what's actually on disk), not the parsed object.
+      expect(rawLockText).not.toContain(ROUTER_PEM);
+      expect(rawLockText).not.toContain('BEGIN');
+      expect(rawLockText).not.toContain('PRIVATE KEY');
+    });
+
+    it('DECISIVE 2/2: a fleet whose router it genuinely owns (per-fleet scope, freshly created this run) -> NO marker', async () => {
+      const manifestPath = manifestPathIn();
+      // manifestWith(...) defaults to router_app_scope: 'per-fleet' — this
+      // fleet mints its OWN dedicated App; 'vault-reused' is unreachable.
+      const manifest = manifestWith([CODE_AGENT]);
+      expect(manifest.transport.router_app_scope).toBe('per-fleet');
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        buildAgentDeps: () => ({
+          ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+          exchangeManifestCode: async () => creds('router'),
+          waitForAppInstallation: async (opts) => ({
+            appId: opts.appId,
+            installId: 'install-router',
+            appSlug: opts.expected.appSlug ?? '',
+            accountLogin: 'groundnuty',
+            repositorySelection: 'selected',
+          }),
+        }),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.routerApp.status).toBe('created');
+      const lock: FleetLock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
+      expect(lock.agents.some((a) => a.role === 'router')).toBe(true);
+      // THE negative assertion: the key that would prove "genuinely owns"
+      // is that the marker's absence is a full key-absence, not an empty
+      // array — `composeFleetLock` omits the key entirely when nothing
+      // qualifies (see fleet-lock.ts's `mergeScopeCredentials` doc).
+      expect(lock.scope_credentials).toBeUndefined();
+      expect(Object.hasOwn(lock, 'scope_credentials')).toBe(false);
     });
   });
 

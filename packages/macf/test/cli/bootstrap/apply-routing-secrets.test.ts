@@ -16,7 +16,10 @@ import {
   TS_OAUTH_CLIENT_ID_SECRET_NAME,
   TS_OAUTH_SECRET_SECRET_NAME,
   checkTailscaleOauthPreflight,
+  determineFleetLevelFact,
+  determineFleetRoutingFact,
   packRoutingBundle,
+  perRepoRoutingOutcome,
   publishRoutingBundle,
   publishRoutingSecrets,
   skippedRoutingBundlePublish,
@@ -24,7 +27,7 @@ import {
   toBase64ForSecret,
   unpackRoutingBundle,
 } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
-import type { RoutingSecretsForPublish, RoutingSecretsPublishDeps } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
+import type { RoutingSecretsForPublish, RoutingSecretsPublishDeps, RoutingSecretsPublishResult } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import { ROUTING_CLIENT_CERT_SECRET_NAME, ROUTING_CLIENT_KEY_SECRET_NAME } from '../../../src/cli/bootstrap/apply-routing-client.js';
 
 function depsWith(overrides: Partial<RoutingSecretsPublishDeps> = {}): RoutingSecretsPublishDeps {
@@ -574,5 +577,142 @@ describe('legacy six-secret path still works — additive proof (groundnuty/macf
     for (const name of ALL_ROUTING_SECRET_NAMES) {
       expect(unpacked[name]).toBe(sixByName[name]);
     }
+  });
+});
+
+// --- groundnuty/macf#1162 — the fleet-level aggregate fact. Hand-built
+// `RoutingSecretsPublishResult` fixtures (one status per name/repo cell) —
+// pure-function tests, no `publishRoutingSecrets` I/O involved. ---
+
+/** Every one of the six legs 'created' for every repo, except any repo listed in `failing` (all six legs 'failed' with the given reason for that repo). */
+function resultWith(repos: readonly string[], failing: Readonly<Record<string, string>> = {}): RoutingSecretsPublishResult {
+  const result = {} as Record<string, Record<string, { status: string; reason?: string }>>;
+  for (const name of ALL_ROUTING_SECRET_NAMES) {
+    result[name] = {};
+    for (const repo of repos) {
+      const reason = failing[repo];
+      result[name][repo] = reason !== undefined ? { status: 'failed', reason } : { status: 'created' };
+    }
+  }
+  return result as RoutingSecretsPublishResult;
+}
+
+describe('determineFleetLevelFact (pure, entity-agnostic)', () => {
+  it('zero entities -> unknown (nothing to determine from — never assumed either way)', () => {
+    expect(determineFleetLevelFact([])).toEqual({ kind: 'unknown' });
+  });
+
+  it('DECISIVE 1/2: every entity failed, SAME cause -> all-failed, naming that ONE cause', () => {
+    const result = determineFleetLevelFact([
+      { failed: true, reason: 'router App identity is unresolved this run' },
+      { failed: true, reason: 'router App identity is unresolved this run' },
+      { failed: true, reason: 'router App identity is unresolved this run' },
+    ]);
+    expect(result).toEqual({ kind: 'all-failed', reason: 'router App identity is unresolved this run' });
+  });
+
+  it('DECISIVE 2/2: only SOME entities failed -> no-claim, and this is NOT satisfied by "always emit" (partial failure must NOT read as all-failed)', () => {
+    const result = determineFleetLevelFact([{ failed: true, reason: 'x' }, { failed: false }, { failed: false }]);
+    expect(result).toEqual({ kind: 'no-claim' });
+  });
+
+  it('no entity failed -> no-claim (not all-failed, not unknown — a clean run makes no fleet-wide claim either)', () => {
+    expect(determineFleetLevelFact([{ failed: false }, { failed: false }])).toEqual({ kind: 'no-claim' });
+  });
+
+  it('every entity failed, DIFFERENT causes -> STILL all-failed (the property is determined; only the cause differs) — reason names the count, never fabricates a single cause', () => {
+    const result = determineFleetLevelFact([
+      { failed: true, reason: 'cause A' },
+      { failed: true, reason: 'cause B' },
+    ]);
+    expect(result.kind).toBe('all-failed');
+    expect(result.kind === 'all-failed' ? result.reason : '').toContain('2 distinct causes');
+    expect(result.kind === 'all-failed' ? result.reason : '').toContain('cause A');
+    expect(result.kind === 'all-failed' ? result.reason : '').toContain('cause B');
+  });
+
+  it('a failed entity with no reason still counts as failed — reason defaults to an honest placeholder, never crashes', () => {
+    const result = determineFleetLevelFact([{ failed: true }, { failed: true }]);
+    expect(result).toEqual({ kind: 'all-failed', reason: 'unspecified cause' });
+  });
+});
+
+describe('perRepoRoutingOutcome (pure)', () => {
+  it('a repo with zero failed legs -> failed: false, no reason', () => {
+    const result = resultWith(['o/a', 'o/b']);
+    expect(perRepoRoutingOutcome(result, ['o/a', 'o/b'])).toEqual([
+      { repo: 'o/a', failed: false },
+      { repo: 'o/b', failed: false },
+    ]);
+  });
+
+  it('a repo with a failed leg -> failed: true, carrying the reason', () => {
+    const result = resultWith(['o/a'], { 'o/a': 'boom' });
+    expect(perRepoRoutingOutcome(result, ['o/a'])).toEqual([{ repo: 'o/a', failed: true, reason: 'boom' }]);
+  });
+
+  it('a repo with MULTIPLE distinct failure reasons across its six legs -> joins them (deduped, sorted), not just the first one seen', () => {
+    const result = resultWith(['o/a']);
+    result[ROUTING_APP_ID_SECRET_NAME]!['o/a'] = { status: 'failed', reason: 'reason-z' };
+    result[ROUTING_APP_KEY_SECRET_NAME]!['o/a'] = { status: 'failed', reason: 'reason-a' };
+    expect(perRepoRoutingOutcome(result, ['o/a'])).toEqual([{ repo: 'o/a', failed: true, reason: 'reason-a | reason-z' }]);
+  });
+
+  it('a "skipped" leg (e.g. Tailscale not-required) does NOT count as failed on its own', () => {
+    const result = resultWith(['o/a']);
+    result[TS_OAUTH_CLIENT_ID_SECRET_NAME]!['o/a'] = { status: 'skipped', reason: 'not declared yet' };
+    expect(perRepoRoutingOutcome(result, ['o/a'])).toEqual([{ repo: 'o/a', failed: false }]);
+  });
+
+  it('DECISIVE: label-prefixed reasons (the REAL shape ensureVariableCreated produces — "routing secret \\"NAME\\" on \\"REPO\\": <cause>") for the SAME underlying cause on DIFFERENT repos still collapse to ONE reason after stripping — the fix for a real bug found while writing this suite: without stripping, the repo-embedding label makes every repo\'s reason byte-different even when the cause is identical', () => {
+    const cause = 'router App identity is unresolved this run (failed: name collision refused)';
+    const result = resultWith(['o/a', 'o/b']);
+    result[ROUTING_APP_ID_SECRET_NAME]!['o/a'] = { status: 'failed', reason: `routing secret "${ROUTING_APP_ID_SECRET_NAME}" on "o/a": ${cause}` };
+    result[ROUTING_APP_ID_SECRET_NAME]!['o/b'] = { status: 'failed', reason: `routing secret "${ROUTING_APP_ID_SECRET_NAME}" on "o/b": ${cause}` };
+
+    const outcome = perRepoRoutingOutcome(result, ['o/a', 'o/b']);
+    expect(outcome).toEqual([
+      { repo: 'o/a', failed: true, reason: cause },
+      { repo: 'o/b', failed: true, reason: cause },
+    ]);
+    // And the fleet-level aggregate correctly collapses to ONE shared cause
+    // — this is the assertion that would have failed before the fix (it
+    // would have reported "2 distinct causes" for a genuinely single one).
+    expect(determineFleetLevelFact(outcome)).toEqual({ kind: 'all-failed', reason: cause });
+  });
+
+  it('a reason that does NOT carry the exact label prefix is left untouched (defensive — never a heuristic substring strip)', () => {
+    const result = resultWith(['o/a']);
+    result[ROUTING_APP_ID_SECRET_NAME]!['o/a'] = { status: 'failed', reason: 'some other kind of failure entirely, no label here' };
+    expect(perRepoRoutingOutcome(result, ['o/a'])).toEqual([{ repo: 'o/a', failed: true, reason: 'some other kind of failure entirely, no label here' }]);
+  });
+});
+
+describe('determineFleetRoutingFact — the routing-specific composition of perRepoRoutingOutcome + determineFleetLevelFact (groundnuty/macf#1162)', () => {
+  it('THE macf-fresh SHAPE: every router-carrying repo fails, same underlying cause -> ONE fleet-level "all-failed" fact', () => {
+    const result = resultWith(['o/code-agent', 'o/science-agent', 'o/writing-agent'], {
+      'o/code-agent': 'router App identity is unresolved this run',
+      'o/science-agent': 'router App identity is unresolved this run',
+      'o/writing-agent': 'router App identity is unresolved this run',
+    });
+    const fact = determineFleetRoutingFact(result, ['o/code-agent', 'o/science-agent', 'o/writing-agent']);
+    expect(fact).toEqual({ kind: 'all-failed', reason: 'router App identity is unresolved this run' });
+  });
+
+  it('one repo fails, two others succeed -> no-claim (per-agent detail only, no fleet-level line)', () => {
+    const result = resultWith(['o/code-agent', 'o/science-agent', 'o/writing-agent'], {
+      'o/code-agent': 'transient network error',
+    });
+    const fact = determineFleetRoutingFact(result, ['o/code-agent', 'o/science-agent', 'o/writing-agent']);
+    expect(fact).toEqual({ kind: 'no-claim' });
+  });
+
+  it('zero router-carrying repos -> unknown', () => {
+    expect(determineFleetRoutingFact(resultWith([]), [])).toEqual({ kind: 'unknown' });
+  });
+
+  it('an all-succeeding fleet -> no-claim (never a false "can-route" claim — this aggregator only ever asserts failure or silence)', () => {
+    const result = resultWith(['o/a', 'o/b']);
+    expect(determineFleetRoutingFact(result, ['o/a', 'o/b'])).toEqual({ kind: 'no-claim' });
   });
 });
