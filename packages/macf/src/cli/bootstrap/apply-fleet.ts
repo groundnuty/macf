@@ -40,6 +40,8 @@
  * gate 1 → gate 2 → repo-init → (loop) → the runner-ops App (its OWN
  * confirm-before-create guard → gate 1 → gate 2, fleet-level — DR-043
  * groundnuty/macf#943, see the "runner-ops" section below) → the
+ * runner-provisioning-contract call, per confirmed repo (`runner-
+ * platform.ts::provisionRunner`, non-fatal — see that module's doc) → the
  * batched vault write → a final control-repo commit+push.**
  *
  * ## The runner-ops App (groundnuty/macf#943)
@@ -267,6 +269,8 @@ import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } f
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import type { RunnerRegistrationDeps, RunnerTokenPollOptions } from './apply-routing.js';
 import { formatRunnerPollProgress, publishTrustedActorsGated } from './apply-routing.js';
+import type { RunnerPlatformResult } from './runner-platform.js';
+import { provisionRunner, resolveRunnerPlatformEndpoint, runnerPlatformCredentialsFromOutcome } from './runner-platform.js';
 import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientSecretsForPublish } from './apply-routing-client.js';
 import { ROUTING_CLIENT_CERT_SECRET_NAME, ROUTING_CLIENT_KEY_SECRET_NAME, mintRoutingClient, resolveRoutingClientSecretsForPublish } from './apply-routing-client.js';
 import type { RoutingSecretResolution, RoutingSecretsForPublish, RoutingSecretsPublishDeps, RoutingSecretsPublishResult } from './apply-routing-secrets.js';
@@ -468,6 +472,18 @@ export interface FleetApplyDeps {
     readonly agents: Readonly<Record<string, string | undefined>>;
     readonly controlRepo: string | undefined;
   };
+  /**
+   * groundnuty/macf#943 (DR-043 Amendment I2) — the runner-provisioning
+   * contract's tailnet-only base URL. `undefined` (production —
+   * `commands/bootstrap-apply.ts` never sets this) means "resolve from
+   * `MACF_RUNNER_PLATFORM_ENDPOINT`" — see `runner-platform.ts::
+   * resolveRunnerPlatformEndpoint`'s doc for why this is env-only, no CLI
+   * flag, no baked-in default. Tests set this explicitly so the suite never
+   * reads `process.env`.
+   */
+  readonly runnerPlatformEndpoint?: string;
+  /** Test-only override for the runner-platform HTTP call (groundnuty/macf#943) — production leaves this unset, taking the real global `fetch`. */
+  readonly runnerPlatformFetch?: typeof fetch;
 }
 
 /**
@@ -692,6 +708,20 @@ export interface FleetApplyResult {
    * `runnerJustCreatedRepoReason` for the reason text.
    */
   readonly routing: Readonly<Record<string, EnsureVariableOutcome>>;
+  /**
+   * groundnuty/macf#943 (DR-043 Amendment I2) — the runner-provisioning
+   * contract's `POST /runners` outcome per confirmed agent repo. Empty `{}`
+   * when `routing.runner` is not declared OR `runs_on` isn't `"self-hosted"`
+   * (same condition as `routing` above — no call is even attempted for a
+   * hosted-runner fleet). **Never fails the run** — every value is a
+   * {@link RunnerPlatformResult}, including `'unreachable'`/`'not-configured'`;
+   * this field records what was ATTEMPTED, not whether the runner is usable.
+   * `usability` (whether the poll below actually found a runner) is reported
+   * separately, unchanged, via `routing`'s own `EnsureVariableOutcome`
+   * values — see `apply-routing.ts`'s doc for why the two are deliberately
+   * separate facts.
+   */
+  readonly runnerProvision: Readonly<Record<string, RunnerPlatformResult>>;
   /** DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — see {@link RoutingClientApplyResult}'s doc. ALWAYS present — a fleet with no confirmed agent repos this run still reports `mint.status`. `certLegs`/`keyLegs` are a PROJECTION of `routingSecrets` below (groundnuty/macf#1074) — kept for backward compat, not a second publish call. */
   readonly routingClient: RoutingClientApplyResult;
   /**
@@ -988,6 +1018,7 @@ function abortedFleetApplyResult(manifestPath: string, priorLock: FleetLock | nu
       repoLegs: {},
     },
     routing: {},
+    runnerProvision: {},
     routingClient: {
       mint: { status: 'skipped', reason: `${reason} — see controlRepo above.` },
       certLegs: {},
@@ -1172,12 +1203,16 @@ export async function applyFleet(
   // write below — neither can target a repo that doesn't exist.
   const confirmedRepos: string[] = [];
   // macf#972 — the SUBSET of `confirmedRepos` whose `ensureAgentRepo` outcome
-  // was `'created'` (not `'present'`) this run — fed to
+  // was `'created'` (not `'present'`) this run — the base set fed to
   // `apply-routing.ts::publishTrustedActorsGated`'s `justCreatedRepos` param
-  // so it skips the 600s poll for a repo that, by construction, cannot yet
-  // have a runner registered to it (nothing in this run provisions one —
-  // macf#943 is unbuilt). A repo already present before this run keeps
-  // polling — a runner may legitimately be mid-registration for it.
+  // so it skips the 600s poll for a repo that has no reason yet to have a
+  // runner registered. Corrected by macf#943: this run MAY now provision one
+  // in-band (the runner-platform-contract call, below) — see
+  // `justCreatedReposStillFast`, computed right before `publishTrustedActorsGated`'s
+  // call site, for the set actually passed through (this raw set minus any
+  // repo the provisioning call reported `'ok'` for). A repo already present
+  // before this run keeps polling regardless — a runner may legitimately be
+  // mid-registration for it independent of anything this run does.
   const justCreatedRepos = new Set<string>();
 
   const writeIncrementalLock = (role: string, update: FleetLockAgentUpdate): void => {
@@ -1528,6 +1563,66 @@ export async function applyFleet(
   // at the end of this function — a SEPARATE field from `agents` (see that
   // field's doc for why: `agents` is 1:1 with `manifest.agents[]` throughout
   // this module, and this App is never declared there).
+
+  // --- groundnuty/macf#943 (DR-043 Amendment I2): call the runner-
+  // provisioning contract for every confirmed repo, non-fatally. Placed
+  // immediately after the runner-ops App block (not later, near the
+  // register-before-route poll) because it is the FIRST point this run has
+  // both `confirmedRepos` (built during the per-agent loop above) AND
+  // `runnerOpsIdentity` (the credential source, just resolved) in hand — and
+  // because provisioning should happen as early as possible so a freshly
+  // created runner has the most time to register before the poll below runs
+  // out its budget.
+  //
+  // Same guard `publishTrustedActorsGated`'s own call site (below) uses —
+  // `routing.runner` undeclared or not "self-hosted" means NO call is
+  // attempted at all, matching `routing`'s own empty-`{}`-when-not-declared
+  // convention (see `FleetApplyResult.runnerProvision`'s doc).
+  const runnerProvisionResults: Record<string, RunnerPlatformResult> = {};
+  // A repo this run successfully told the contract to provision — excluded
+  // from `justCreatedRepos`'s fast single-check path below (macf#972's own
+  // doc predicted this: "at which point a fresh repo's poll becomes
+  // justified again"). Without this exclusion, a brand-new fleet would POST
+  // successfully, then fast-fail the register-before-route gate at t=0 —
+  // ~15s before GitHub registration could possibly land — turning the
+  // "new fleet for a new project" path (the actual point of this contract)
+  // into a guaranteed first-run failure.
+  const provisionedNowRepos = new Set<string>();
+  if (manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted') {
+    const runnerPlatformDeps = {
+      endpoint: resolveRunnerPlatformEndpoint(deps.runnerPlatformEndpoint),
+      fetchImpl: deps.runnerPlatformFetch,
+    };
+    // Only available when the runner-ops App was freshly minted THIS run —
+    // see `runnerPlatformCredentialsFromOutcome`'s doc for why a
+    // `'reused'`/`'resumed-install'` outcome cannot supply it without a
+    // full-vault-decrypt mechanism this module does not have.
+    const runnerOpsCredentials = runnerPlatformCredentialsFromOutcome(runnerOpsIdentity);
+    if (runnerOpsCredentials === undefined) {
+      deps.log(
+        `Runner platform: no runner-ops credential in memory this run (${runnerOpsIdentity.status}) — provisioning ` +
+          "call(s) below omit `credentials`, so the contract falls back to its OWN App, which only works for the " +
+          'owner it happens to be installed on. Re-supplying a REUSED credential on every run needs a decrypted-' +
+          'vault read this module does not perform yet (see runner-platform.ts\'s doc).',
+      );
+    }
+    const declaredLabels = manifest.routing.runner.labels;
+    const warm = manifest.routing.runner.warm;
+    for (const repo of confirmedRepos) {
+      const result = await provisionRunner(runnerPlatformDeps, {
+        repo,
+        ...(declaredLabels !== undefined ? { labels: declaredLabels } : {}),
+        warm,
+        fleet: manifest.metadata.name,
+        ...(runnerOpsCredentials !== undefined ? { credentials: runnerOpsCredentials } : {}),
+      });
+      runnerProvisionResults[repo] = result;
+      deps.log(
+        `Runner platform (${repo}): ${result.status}` + (result.status === 'ok' ? '.' : ` — ${result.reason}`),
+      );
+      if (result.status === 'ok') provisionedNowRepos.add(repo);
+    }
+  }
 
   // --- groundnuty/macf#1074 + groundnuty/macf#1082: the routing App —
   // a fleet-level identity (alongside the per-agent Apps and runner-ops),
@@ -1985,6 +2080,15 @@ export async function applyFleet(
         deps.log(formatRunnerPollProgress(repo, elapsedMs, totalMs));
       }),
   };
+  // groundnuty/macf#943 — a repo created THIS run but ALSO successfully
+  // provisioned THIS run (`provisionedNowRepos`, above) rejoins the full
+  // poll: a runner may genuinely be mid-registration for it now, unlike
+  // macf#972's original premise ("nothing in this run provisions one
+  // in-band") which no longer holds once the call above is wired. Only a
+  // repo that is BOTH newly created AND never successfully told to
+  // provision keeps the fast single-check path — set-difference, not a
+  // second flag threaded through the loop above.
+  const justCreatedReposStillFast = new Set([...justCreatedRepos].filter((repo) => !provisionedNowRepos.has(repo)));
   const routing =
     manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted'
       ? await publishTrustedActorsGated(
@@ -1996,9 +2100,16 @@ export async function applyFleet(
           // usable runner. `publishTrustedActorsGated` owns that contract.
           deps.runnerToken,
           routingPollOptions,
-          // macf#972 — repos created THIS RUN skip the poll (see
-          // `justCreatedRepos`'s doc above).
-          justCreatedRepos,
+          // macf#972 (corrected by macf#943 — see `justCreatedReposStillFast`
+          // above): repos created THIS run AND never provisioned THIS run
+          // skip the full poll.
+          justCreatedReposStillFast,
+          // macf#943 — repos THIS run successfully told the contract to
+          // provision (`status: 'ok'`) get the `neverRegistered` fast-exit
+          // suppressed for their poll, so the platform's ~15s registration
+          // lag has genuine time to resolve instead of failing at t=0. See
+          // `publishTrustedActorsGated`'s `justProvisionedRepos` doc.
+          provisionedNowRepos,
         )
       : {};
   for (const [repo, leg] of Object.entries<EnsureVariableOutcome>(routing)) {
@@ -2115,6 +2226,7 @@ export async function applyFleet(
     identityChanges,
     ca,
     routing,
+    runnerProvision: runnerProvisionResults,
     routingClient,
     routingSecrets: routingSecretsPublish,
     routingBundle: routingBundlePublish,

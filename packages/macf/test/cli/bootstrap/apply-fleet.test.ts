@@ -2531,6 +2531,147 @@ trust:
       expect(rendered).toContain('runner-groups/7');
     });
 
+    // --- groundnuty/macf#943 (DR-043 Amendment I2) — the runner-provisioning
+    // contract call. The decisive pair `assert-the-wrong-path.md` requires:
+    // (1) the call fails -> apply continues AND the call was actually made
+    // (not merely "apply survived", which a version that never calls the
+    // contract would ALSO satisfy); (2) the call succeeds -> the gate can
+    // proceed, and the request carries the shape the contract documents.
+
+    describe('runner-provisioning contract (groundnuty/macf#943)', () => {
+      it('DECISIVE 1/2: the contract is UNREACHABLE -> apply CONTINUES (does not throw, returns a full result) AND the call was genuinely attempted — asserted via the captured request, not merely "apply survived"', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        const calls: { url: string; method: string | undefined }[] = [];
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+          trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+          runnerTokenPollOptions: { timeoutMs: 0 },
+          runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+          runnerPlatformFetch: (async (url: string | URL, init?: RequestInit) => {
+            calls.push({ url: String(url), method: init?.method });
+            throw Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+          }) as typeof fetch,
+        };
+
+        const result = await applyFleet(manifest, manifestPath, null, deps);
+
+        // The call was ACTUALLY made — this is the assertion a version that
+        // never calls the contract at all would fail (assert-the-wrong-path.md:
+        // "apply survived" alone is satisfied by never calling it).
+        expect(calls).toHaveLength(1);
+        expect(calls[0]?.method).toBe('POST');
+        expect(calls[0]?.url).toBe('http://fake-runner-platform:8088/runners');
+        // Non-fatal: apply completed the WHOLE run (control repo synced,
+        // vault written) despite the contract being unreachable.
+        expect(result.controlRepoSync.status).toBe('pushed');
+        expect(result.vault.status).toBe('written');
+        // Reported, honestly, as unreachable — never silently "no runners
+        // needed" and never conflated with "ok".
+        expect(result.runnerProvision['groundnuty/demo-code']).toEqual({
+          status: 'unreachable',
+          reason: expect.stringContaining('ECONNREFUSED') as unknown as string,
+        });
+      });
+
+      it('DECISIVE 2/2: the contract SUCCEEDS -> reported ok, the request carries repo/labels-default/warm/fleet, AND includes this run\'s freshly-minted runner-ops credential', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        let capturedBody: unknown;
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+          trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'present' }) }),
+          runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+          runnerPlatformFetch: (async (_url: string | URL, init?: RequestInit) => {
+            capturedBody = JSON.parse(String(init?.body));
+            return new Response(JSON.stringify({ ok: true, applied: ['RunnerDeployment'] }), { status: 200 });
+          }) as typeof fetch,
+        };
+
+        const result = await applyFleet(manifest, manifestPath, null, deps);
+
+        expect(result.runnerProvision['groundnuty/demo-code']).toEqual({ status: 'ok', applied: ['RunnerDeployment'] });
+        // No `labels` declared on this fixture's routing.runner -> omitted
+        // from the body entirely (the contract applies its own default,
+        // which matches ROUTER_EMITTED_LABELS — see runner-platform.ts's doc).
+        expect(capturedBody).toEqual({
+          repo: 'groundnuty/demo-code',
+          warm: 1,
+          fleet: 'demo-fleet',
+          // agentDepsFor('code-agent', 'created', ...) makes the runner-ops
+          // App's OWN create-or-reuse ceremony ALSO resolve 'created' this
+          // run (same shared AgentApplyDeps fixture — see baseDeps's doc),
+          // so its freshly-exchanged credential is in memory and gets sent.
+          credentials: { app_id: 'app-code-agent', installation_id: 'install-1', private_key: 'SENTINEL-PEM-code-agent' },
+        });
+        // 200 is NOT "usable" on its own (Amendment I2) — the SEPARATE
+        // register-before-route gate (deps.trustDeps.checkRunnerUsableByRepo,
+        // faked 'present' above) is still what decides the routing write.
+        expect(result.routing['groundnuty/demo-code']?.status).toBe('created');
+      });
+
+      it('the call is attempted regardless of whether --runner-token was supplied — provisioning and the routing-var policy gate are independent (Amendment I2)', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        let fetchCalled = false;
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+          runnerToken: undefined, // the routing-var POLICY gate refuses outright
+          runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+          runnerPlatformFetch: (async () => {
+            fetchCalled = true;
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }) as typeof fetch,
+        };
+
+        const result = await applyFleet(manifest, manifestPath, null, deps);
+
+        expect(fetchCalled).toBe(true); // provisioning still attempted
+        expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('ok');
+        expect(result.routing['groundnuty/demo-code']?.status).toBe('failed'); // the UNRELATED policy gate refused, as it always does without a token
+      });
+
+      it('routing.runner NOT declared (hosted-runner fleet) -> the contract is NEVER called, and runnerProvision is empty', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest = manifestWith([CODE_AGENT]); // no routing: section at all
+        let fetchCalled = false;
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+          runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+          runnerPlatformFetch: (async () => {
+            fetchCalled = true;
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }) as typeof fetch,
+        };
+
+        const result = await applyFleet(manifest, manifestPath, null, deps);
+
+        expect(fetchCalled).toBe(false);
+        expect(result.runnerProvision).toEqual({});
+      });
+
+      it('endpoint NOT configured (production default) -> not-configured, non-fatal, apply still completes', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+          trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+          runnerTokenPollOptions: { timeoutMs: 0 },
+          // runnerPlatformEndpoint / runnerPlatformFetch deliberately unset —
+          // this test asserts the honest production default (no env var set
+          // in this process either, per the top-of-file GH_TOKEN-class env
+          // neutralization — MACF_RUNNER_PLATFORM_ENDPOINT is never touched
+          // by that guard, so assert it is genuinely unset first).
+        };
+        expect(process.env['MACF_RUNNER_PLATFORM_ENDPOINT']).toBeUndefined();
+
+        const result = await applyFleet(manifest, manifestPath, null, deps);
+
+        expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('not-configured');
+        expect(result.controlRepoSync.status).toBe('pushed'); // non-fatal — the whole run still completed
+      });
+    });
+
     it('CA + routing legs are skipped for an agent whose repo-ensure FAILED this run — nothing is written to a repo that does not exist', async () => {
       const manifestPath = manifestPathIn();
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };

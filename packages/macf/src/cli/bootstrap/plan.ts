@@ -548,6 +548,15 @@ export interface UnimplementedApplyItem {
  * FRESHLY-CREATED repo's workflow, never a second writer. `'actions_pin'`
  * moved into {@link planItemApplyCoverage}'s always-`'implemented'` group
  * too — no reason string remains here for it.
+ *
+ * `runner_warm` is ALSO GONE (groundnuty/macf#943, DR-043 Amendment I2) —
+ * `apply-fleet.ts` now calls the runner-provisioning contract
+ * (`runner-platform.ts::provisionRunner`) with `repo`/`labels`/`warm` for
+ * every confirmed self-hosted-runner repo, every run, non-fatally. `'runner_warm'`
+ * moved into {@link planItemApplyCoverage}'s always-`'implemented'` group —
+ * same "the code path exists" meaning `'version'`/`'actions_pin'` above
+ * already established, not a guarantee the live call succeeds (a contract
+ * failure is reported via `FleetApplyResult.runnerProvision`, non-fatally).
  */
 export const APPLY_UNIMPLEMENTED_REASONS = {
   routing:
@@ -555,18 +564,6 @@ export const APPLY_UNIMPLEMENTED_REASONS = {
     'diverging value — the task\'s create-only posture ("never silently overwrite") leaves this specific update ' +
     'un-actioned. Set the repo variable manually to the declared value, or re-run apply once a future increment ' +
     'adds confirmed per-item updates; nothing above was changed for this item.',
-  // groundnuty/macf#942 (DR-043 Amendment I) — `warm` is declared + recorded
-  // (FleetRoutingRunnerSchema, DR-009 §7.4) but `apply` does not yet call the
-  // runner-provisioning contract (repo/labels/warm) that would establish it
-  // on a live runner — that wiring is groundnuty/macf#943, still blocked.
-  // This warning is expected to disappear on its own, with no second code
-  // path, once #943 lands and `planItemApplyCoverage`'s 'runner_warm' arm
-  // below flips to 'implemented'.
-  runnerWarm:
-    'apply provisions identity/repo/CA/routing wiring; it does not yet call the runner-provisioning contract ' +
-    '(repo/labels/warm) that would act on a declared warm posture yet. warm is ' +
-    'recorded in the manifest and in this plan, but nothing enforces it yet — a dormant fleet (warm: 0) still ' +
-    'has its runner kept warm until that contract call is wired; nothing above was changed for this item.',
 } as const;
 
 /**
@@ -650,15 +647,20 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // `apply-routing.ts`'s doc.)
       return item.verb === 'create' ? 'implemented' : 'not_implemented';
     case 'runner_warm':
-      // groundnuty/macf#942 (DR-043 Amendment I) — a genuinely NEW field with
-      // NO enforcement path yet: `apply` does not call the runner-
-      // provisioning contract (repo/labels/warm) that would act on it — that
-      // wiring is groundnuty/macf#943, still blocked. `runnerWarmItem` below
-      // only ever emits 'create' (there is no live-observable "is this
-      // runner already warm/dormant" signal to compare against), but this
-      // stays a whole-kind gap regardless of verb, same shape as
-      // 'version'/'actions_pin' above.
-      return 'not_implemented';
+      // groundnuty/macf#942 (DR-043 Amendment I) declared the field;
+      // groundnuty/macf#943 wired the enforcement — `apply-fleet.ts` now
+      // calls the runner-provisioning contract (`runner-platform.ts::
+      // provisionRunner`) with `repo`/`labels`/`warm` for every confirmed
+      // self-hosted-runner repo, unconditionally, every run (the contract's
+      // own idempotency promise — see that module's doc). "Implemented" here
+      // means "apply has a real code path that acts on this," the SAME
+      // meaning `'version'`/`'actions_pin'` above already established for
+      // this group — not "the contract is guaranteed to honor it" (a
+      // `'cluster-problem'`/`'unreachable'` outcome is reported loudly but
+      // non-fatally by `runnerProvision`, mirroring `'ca'`'s own "a create
+      // verb here IS actioned" framing regardless of whether the live call
+      // ultimately succeeds).
+      return 'implemented';
     case 'control_repo':
       // DR-043 Amendment G (macf#867): the ONLY verb `controlRepoItem` ever
       // emits is `update` (fired only when archived === true), and
@@ -732,8 +734,6 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
   switch (kind) {
     case 'routing':
       return APPLY_UNIMPLEMENTED_REASONS.routing;
-    case 'runner_warm':
-      return APPLY_UNIMPLEMENTED_REASONS.runnerWarm;
     case 'app':
     case 'install':
     case 'secret_fingerprint':
@@ -745,6 +745,7 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'labels':
     case 'routing_client':
     case 'runner_ops':
+    case 'runner_warm':
     case 'vault_recipients':
     case 'version':
     case 'actions_pin':
@@ -759,7 +760,9 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
       // groundnuty/macf#943, 'vault_recipients' in groundnuty/macf#957,
       // 'version' in macf#1045 / DR-043 Amendment L, 'actions_pin' in
       // macf#1072 / DR-043 Amendment L extended, 'router_app' in
-      // groundnuty/macf#1105, 'ts_oauth' in groundnuty/macf#1109).
+      // groundnuty/macf#1105, 'ts_oauth' in groundnuty/macf#1109, 'runner_warm'
+      // ALSO joined this group in groundnuty/macf#943 — see
+      // `planItemApplyCoverage`'s 'runner_warm' arm for the wiring).
       // Kept exhaustive so a NEW `PlanItemKind` added
       // later is a compile error here, not a silent "apply covers
       // everything" false-negative.
@@ -1446,7 +1449,11 @@ function runnerWarmItem(fleetName: string, desiredWarm: number): PlanItem {
     kind: 'runner_warm',
     target: `routing:${fleetName}:runner:warm`,
     verb: 'write-always',
-    reason: `warm: ${String(desiredWarm)} declared${dormantNote} — not yet observable or enforced by apply; see the apply-coverage note below.`,
+    // groundnuty/macf#943 — "not yet observable" still holds (there is no
+    // live read of whether a runner IS warm/dormant to compare against, so
+    // this stays write-always, never create/update); "not yet enforced" does
+    // NOT — apply now sends this value on every provisioning call.
+    reason: `warm: ${String(desiredWarm)} declared${dormantNote} — not yet observable (no live warm/dormant signal to compare against); apply sends it on every runner-provisioning-contract call.`,
     confirm_required: false,
   };
 }
