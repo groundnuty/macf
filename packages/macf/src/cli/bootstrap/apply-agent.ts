@@ -132,6 +132,8 @@ import type { FleetAgent, FleetLockAgent, FleetManifest } from './fleet-manifest
 import { deriveAppHandle } from './fleet-manifest.js';
 import { buildAppManifest, repoHomepageUrl } from './app-manifest.js';
 import {
+  CANCEL_LABEL,
+  CHECK_AGAIN_LABEL,
   GATE_TOTAL,
   manifestFormAction,
   startInstallInterstitial as realStartInstallInterstitial,
@@ -2046,6 +2048,16 @@ async function runGate2WithInterstitial(
         repoNames,
       },
     );
+    // groundnuty/macf#1179 — #1174's "one message source" extended to the
+    // new page controls: `CHECK_AGAIN_LABEL`/`CANCEL_LABEL` are the EXACT
+    // strings the page's own buttons render (`manifest-flow-server.ts::
+    // renderGate2Controls`) — never a paraphrase. Gated on a REAL local
+    // page existing (`page.interactive !== undefined`): the bind-failure
+    // fallback opens GitHub's install URL directly, where these buttons
+    // don't exist at all, so mentioning them there would be a lie.
+    if (page.interactive !== undefined) {
+      deps.log(`Role "${role}": that page also has two buttons — "${CHECK_AGAIN_LABEL}" and "${CANCEL_LABEL}".`);
+    }
     await opts.postOpenWait?.();
     const wait = opts.waitStrategy ?? runGate2;
     // groundnuty/macf#1179 — `page.interactive` is `undefined` on the

@@ -19,7 +19,7 @@ import {
 import type { FleetAgent, FleetLockAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import type { ConfirmedInstall, IdentityConfirmation } from '../../../src/cli/bootstrap/identity-confirm.js';
-import { escapeHtmlAttribute, renderInstallInterstitial, startInstallInterstitial as realStartInstallInterstitial } from '../../../src/cli/bootstrap/manifest-flow-server.js';
+import { CANCEL_LABEL, CHECK_AGAIN_LABEL, escapeHtmlAttribute, renderInstallInterstitial, startInstallInterstitial as realStartInstallInterstitial } from '../../../src/cli/bootstrap/manifest-flow-server.js';
 import type { InstallInterstitialHandles, InstallInterstitialOptions, ManifestFlowHandles } from '../../../src/cli/bootstrap/manifest-flow-server.js';
 import { appNameCollisionRefusalMessage, resolveAppPresenceStatus } from '../../../src/cli/bootstrap/app-presence.js';
 import { registryRepoNotInstalledReason, registryRepoRetryInstruction } from '../../../src/cli/bootstrap/registry-repo-coverage.js';
@@ -2190,4 +2190,52 @@ describe('"cancel this identity" (groundnuty/macf#1179)', () => {
     // for a recoverable rejection and re-tried.
     expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
   }, 5000);
+});
+
+// --- groundnuty/macf#1179 — #1174's "one message source" extended to the
+// new page buttons: the terminal's mention of them must use the EXACT same
+// two label strings the page's own buttons render — imported from
+// `manifest-flow-server.ts` on both sides of this assertion, never
+// independently re-typed on either.
+
+describe('the new page buttons are also covered by #1174\'s one-message-source discipline (groundnuty/macf#1179)', () => {
+  it('DECISIVE: the terminal line naming the two buttons uses CHECK_AGAIN_LABEL/CANCEL_LABEL verbatim — the SAME constants the served page renders its buttons with', async () => {
+    const logs: string[] = [];
+    let seenOpts: InstallInterstitialOptions | undefined;
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      startInstallInterstitial: async (opts) => {
+        seenOpts = opts;
+        return fakeInterstitialHandles();
+      },
+    });
+
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    // Surface 1 (terminal): the mention line exists and carries BOTH labels
+    // verbatim — not a paraphrase ("you can also cancel", "click check
+    // again again to re-check") that could drift from the page's own text.
+    const mentionLine = logs.find((l) => l.includes(CHECK_AGAIN_LABEL) && l.includes(CANCEL_LABEL));
+    expect(mentionLine).toBeDefined();
+
+    // Surface 2 (browser): render the ACTUAL captured opts and confirm the
+    // page's own buttons carry the SAME two strings.
+    expect(seenOpts).toBeDefined();
+    const html = renderInstallInterstitial(seenOpts!);
+    expect(html).toContain(CHECK_AGAIN_LABEL);
+    expect(html).toContain(CANCEL_LABEL);
+  });
+
+  it('NEGATIVE — when NO real local page exists (the bind-failure fallback to GitHub\'s install URL directly), the terminal never mentions the buttons — they don\'t exist there', async () => {
+    const logs: string[] = [];
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      startInstallInterstitial: async () => { throw new Error('EADDRINUSE'); },
+    });
+
+    await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
+
+    const mentionLine = logs.find((l) => l.includes(CHECK_AGAIN_LABEL) || l.includes(CANCEL_LABEL));
+    expect(mentionLine).toBeUndefined();
+  });
 });

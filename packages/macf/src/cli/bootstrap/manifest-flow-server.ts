@@ -418,14 +418,23 @@ export function renderVerbatimInstructionBlock(role: string, messageLines: reado
  * the overall gate timeout remains the (slower, but never-wrong) fallback for
  * a genuine walk-away. Do not re-add a `beforeunload`/`visibilitychange`
  * cancel hook here — this is a considered omission, not a gap.
+ *
+ * **groundnuty/macf#1174's "one message source" now covers these labels
+ * too.** {@link CHECK_AGAIN_LABEL}/{@link CANCEL_LABEL} are exported so
+ * `apply-agent.ts::runGate2WithInterstitial` prints the SAME two strings to
+ * the terminal (once, right after the page opens) — never a paraphrase a
+ * future edit could drift from what the button itself says.
  */
+export const CHECK_AGAIN_LABEL = "I've updated the install — check again";
+export const CANCEL_LABEL = 'Cancel this identity';
+
 function renderGate2Controls(): string {
   return `<h2>While you wait</h2>
 <form method="post" action="/check-again" style="display:inline-block">
-  <button type="submit">I've updated the install — check again</button>
+  <button type="submit">${CHECK_AGAIN_LABEL}</button>
 </form>
 <form method="post" action="/cancel" style="display:inline-block; margin-left: 0.75rem">
-  <button type="submit" class="secondary">Cancel this identity</button>
+  <button type="submit" class="secondary">${CANCEL_LABEL}</button>
 </form>`;
 }
 
