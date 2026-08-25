@@ -59,6 +59,40 @@ Every example above passes the gate trivially, which is the sign it is set at th
 
 ---
 
+## The negative form — forbid the wrong assertion, don't merely omit it
+
+Everything above says which assertion to **add**. Sometimes the necessary move is to say which assertion must **not be written at all**.
+
+Acceptance criteria almost always enumerate what must hold. That is sufficient while the wrong verification is *unattractive* — nobody writes it, so nothing needs to forbid it. It stops being sufficient the moment **the wrong verification is the intuitive one**:
+
+> **When a plausible-but-wrong verification exists, the criteria must FORBID it — not merely leave it out.** Omitting it leaves it available; forbidding it makes writing it a spec violation.
+
+### The shape that demands this: a check whose reference value comes from what it checks
+
+The clearest trigger is **circularity** — a verification whose expected value is derived from the same source as the observed value. It cannot fail, so it reports agreement and reads as correctness.
+
+- A manifest **scaffolded from live state**, then validated by diffing it **against live state**. The diff is empty by construction. *"Scaffold it, then run plan and see it clean"* is what a careful person writes unprompted — and it proves self-agreement, not correctness.
+- A pin check that takes the **modal** value among repos as the expected value. A uniformly-stale fleet agrees with itself perfectly and reads healthy, while a normal mid-upgrade fleet reads broken.
+- Any assertion where the fixture and the expectation are built by the same helper.
+
+### Why omission is not enough
+
+**A defect-as-contract test gets written by someone being careful, not careless.** They write the assertion that seems obviously right, it passes, and it enters the suite green — with a comment explaining the reasoning, which is what makes it durable. Later readers see coverage.
+
+Two found in this repo after the fact: a `stale-pin` test whose assertion **literally equated "not halted" with "exit 0"** — the exact bug it should have caught, sitting green with an explanatory comment; and a health check that measured self-agreement among repos and rendered it as `pins consistent`.
+
+Both would have been prevented by one forbidding line in the spec. Neither was prevented by omission, because omission is silent and the intuitive assertion is loud.
+
+### How to write one
+
+Name the assertion and why it cannot discriminate:
+
+> **No test may assert "scaffolded manifest ⇒ empty plan."** The plan's reference value is derived from the same observation that produced the manifest, so it passes for a manifest that is entirely wrong.
+
+And put the limit **in the tool's own output**, not only in the spec — the spec is read once, at implementation; the output is read every time anyone runs it.
+
+---
+
 ## Relationship to the failure shapes
 
 This rule is a **technique**, not a hazard. It is specifically the antidote to the *wrong-target* failure — a test asserting something real that is not the property that broke. The hazard side (a suite that cannot see a defect: wrong target · defect-as-contract · defect-proof world) is catalogued separately; **this is what to write, not what to fear.**
