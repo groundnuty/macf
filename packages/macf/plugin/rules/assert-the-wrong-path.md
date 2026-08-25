@@ -67,13 +67,31 @@ Acceptance criteria almost always enumerate what must hold. That is sufficient w
 
 > **When a plausible-but-wrong verification exists, the criteria must FORBID it — not merely leave it out.** Omitting it leaves it available; forbidding it makes writing it a spec violation.
 
-### The shape that demands this: a check whose reference value comes from what it checks
+### Two triggers, two different remedies
 
-The clearest trigger is **circularity** — a verification whose expected value is derived from the same source as the observed value. It cannot fail, so it reports agreement and reads as correctness.
+**Trigger 1 — circularity: the reference value comes from what it checks.** The verification cannot fail, so it reports agreement and reads as correctness.
 
-- A manifest **scaffolded from live state**, then validated by diffing it **against live state**. The diff is empty by construction. *"Scaffold it, then run plan and see it clean"* is what a careful person writes unprompted — and it proves self-agreement, not correctness.
-- A pin check that takes the **modal** value among repos as the expected value. A uniformly-stale fleet agrees with itself perfectly and reads healthy, while a normal mid-upgrade fleet reads broken.
+- A manifest **scaffolded from live state**, then validated by diffing it **against live state**. Empty by construction. *"Scaffold it, then run plan and see it clean"* is what a careful person writes unprompted — and it proves self-agreement, not correctness.
+- A pin check taking the **modal** value among repos as expected. A uniformly-stale fleet agrees with itself perfectly and reads healthy, while a normal mid-upgrade fleet reads broken.
 - Any assertion where the fixture and the expectation are built by the same helper.
+
+**Remedy: forbid the assertion.** There is no right version of it — the shape is the defect.
+
+**Trigger 2 — the spec classifies a state without specifying its observable consequence.** Nothing is circular; the premise is correct, and the leap is to an observable nobody specified.
+
+The worked case:
+
+```ts
+expect(code).toBe(0); // stale-pin is a skip, not a halt
+```
+
+**The comment is true.** Stale-pin *is* a skip rather than a halt. The spec said what the state **is** and never said what it should **exit** — so the test invented `0`, and the exact bug entered the suite green with correct reasoning attached.
+
+> **A spec that classifies a state without specifying its observable consequence invites the test to invent one.**
+
+**Remedy: specify the consequence — do NOT merely forbid the assertion.** Forbidding `toBe(0)` leaves the right value unstated and the next person guesses again. The fix is the spec sentence *"a roll that leaves any agent behind exits `2`"*, which makes the wrong assertion unwritable rather than merely disallowed.
+
+**Distinguishing them:** ask whether your expected value came from **the population under test** (trigger 1) or from **your own inference about an unstated observable** (trigger 2). A reader who only knows trigger 1 gets *"no, nothing circular here"* on the second case and writes the assertion anyway — which is how this section's own first draft failed to recognise one of the two cases it cited.
 
 ### Why omission is not enough
 
