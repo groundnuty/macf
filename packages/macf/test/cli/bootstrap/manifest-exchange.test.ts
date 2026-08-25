@@ -70,7 +70,10 @@ const RUNNER_OPS_REPO_NAMES = ['exp-science-agent', 'exp-code-agent'];
  */
 function preBlockLines(html: string, heading: string): readonly string[] {
   const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`<h2>${escapedHeading}<\\/h2>\\n<pre>([\\s\\S]*?)<\\/pre>`);
+  // groundnuty/macf#1179 — the copyable block carries `class="copy"` so the
+  // PAYLOAD keeps full size while instruction prose shrinks. Tolerate the
+  // attribute; keep asserting the CONTENT exactly.
+  const re = new RegExp(`<h2>${escapedHeading}<\\/h2>\\n<pre[^>]*>([\\s\\S]*?)<\\/pre>`);
   const match = re.exec(html);
   return match ? match[1]!.split('\n') : [];
 }
@@ -199,7 +202,7 @@ describe('manifest-flow-server (pure parts)', () => {
 describe('renderCopyableRepoBlock (groundnuty/macf#1176 — pure; the copyable payload in isolation)', () => {
   it('is EXACTLY the repo names, one per line, nothing else — no bullets, no prose', () => {
     expect(renderCopyableRepoBlock(RUNNER_OPS_REPO_NAMES)).toBe(
-      '<h2>Repositories to select — copy exactly</h2>\n<pre>exp-science-agent\nexp-code-agent</pre>',
+      '<h2>Repositories to select — copy exactly</h2>\n<pre class="copy">exp-science-agent\nexp-code-agent</pre>',
     );
   });
 

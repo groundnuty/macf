@@ -321,7 +321,12 @@ export interface InstallInterstitialOptions {
 export function renderCopyableRepoBlock(repoNames: readonly string[]): string {
   if (repoNames.length === 0) return '';
   const body = repoNames.map((name) => escapeHtmlAttribute(name)).join('\n');
-  return `<h2>Repositories to select — copy exactly</h2>\n<pre>${body}</pre>`;
+  // WHY (groundnuty/macf#1179): `pre.copy` keeps the PAYLOAD at full size while
+  // the instruction prose shrinks. Styling the bare `pre` selector would shrink
+  // both — and the repo names are the operator's stated reason for this page.
+  // Wrapping is safe here: CSS wrapping is visual and inserts no characters
+  // into a copied selection, so a wrapped owner/repo still pastes clean.
+  return `<h2>Repositories to select — copy exactly</h2>\n<pre class="copy">${body}</pre>`;
 }
 
 /**
@@ -378,9 +383,15 @@ export function renderInstallInterstitial(opts: InstallInterstitialOptions): str
   return `<!doctype html>
 <html><head><meta charset="utf-8"><title>Consent gate ${String(opts.gateNumber)} of ${String(opts.gateTotal)} — installing ${appNameEsc}</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
-  pre { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: 0.75rem 1rem; overflow-x: auto;
-        font-size: 1rem; }
+  /* WHY (groundnuty/macf#1179): the page is READ, not skimmed. A 42rem prose
+     column forced long lines (a full API path, an owner/repo pair) into a
+     horizontal scroller, so the instruction could not be taken in at once.
+     Wider container + wrap-instead-of-scroll; the copyable block keeps its
+     own size because it is the payload, not prose. */
+  body { font-family: system-ui, sans-serif; max-width: 68rem; margin: 2rem auto; padding: 0 1.5rem; }
+  pre { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: 0.75rem 1rem;
+        white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: visible; font-size: 0.9rem; }
+  pre.copy { font-size: 1.05rem; font-weight: 600; }
   .dim { color: #666; }
   .button { display: inline-block; margin-top: 1rem; padding: 0.6rem 1.2rem; background: #1f6feb; color: #fff;
             text-decoration: none; border-radius: 6px; font-weight: 600; }
