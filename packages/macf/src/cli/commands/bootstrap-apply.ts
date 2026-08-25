@@ -1938,24 +1938,92 @@ export function fleetApplyResultToJson(
 }
 
 /**
- * Non-zero when: the control repo could not be provisioned this run
- * (`foreign`/`failed`/`archived` — DR-043 Amendment G added `archived`
- * alongside macf#857's `foreign`/`failed`; the entire run aborted in all
- * three cases), OR the final control-repo sync failed (durable-locally-but-
- * not-pushed is still an operator-attention state), OR the control-repo
- * repo-init step genuinely failed (groundnuty/macf#1057 — e.g. a
- * local-registry misconfiguration; NOT the ordinary "no token this run"
- * label-skip, which stays `'written'` — see `applyControlRepoInit`'s doc),
- * OR ANY agent needs
- * operator attention (failed/drift/skipped-unverified/repo-init-failed), OR
- * the runner-ops App needs operator attention (groundnuty/macf#943 —
- * same failed/drift/skipped-unverified bar as an agent), OR the vault write
- * failed, OR ANY agent's deploy-phase attempt failed (macf#1013 requirement
- * 4 — "partial failure exits non-zero"; `deployResults` defaults to `[]`,
- * matching "the deploy phase was never attempted" — see
- * `anyDeployFailed`'s own doc), OR the version-reconcile phase HALTED (DR-043
- * Amendment L, macf#1045 — a bad release during the roll; `versionPhase`
- * defaults to `undefined`, matching "the phase was never attempted").
+ * Three-valued (groundnuty/macf#1151), mirroring the 0/1/2 contract
+ * `commands/fleet-upgrade.ts::fleetUpgradeExitCode` established for the
+ * IDENTICAL "did a version roll leave someone behind" question
+ * (macf#1146/#1150) — reused here rather than invented fresh, same as
+ * `@groundnuty/macf-core`'s `fleet-reconcile.ts` 0/1/2 precedent that
+ * function itself cites. Caller audit (macf#1151): `applyExitCode` has
+ * exactly ONE production call site (`cli/index.ts`'s `bootstrap apply`
+ * action, `process.exitCode = code` — a plain pass-through, no branch on the
+ * specific value), so introducing `2` changes no existing caller's
+ * behavior beyond the fix itself — same finding #1150 made for
+ * `fleetUpgradeExitCode`'s own sole caller.
+ *
+ * - **`1`** — a HARD failure needing operator attention. The control repo
+ *   could not be provisioned this run (`foreign`/`failed`/`archived` —
+ *   DR-043 Amendment G added `archived` alongside macf#857's
+ *   `foreign`/`failed`; the entire run aborted in all three cases), OR the
+ *   final control-repo sync failed (durable-locally-but-not-pushed is still
+ *   an operator-attention state), OR the control-repo repo-init step
+ *   genuinely failed (groundnuty/macf#1057 — e.g. a local-registry
+ *   misconfiguration; NOT the ordinary "no token this run" label-skip,
+ *   which stays `'written'` — see `applyControlRepoInit`'s doc), OR ANY
+ *   agent needs operator attention (failed/drift/skipped-unverified/
+ *   repo-init-failed), OR the runner-ops App needs operator attention
+ *   (groundnuty/macf#943 — same failed/drift/skipped-unverified bar as an
+ *   agent), OR the vault write failed, OR ANY agent's deploy-phase attempt
+ *   failed (macf#1013 requirement 4 — "partial failure exits non-zero";
+ *   `deployResults` defaults to `[]`, matching "the deploy phase was never
+ *   attempted" — see `anyDeployFailed`'s own doc), OR the version-reconcile
+ *   phase HALTED (DR-043 Amendment L, macf#1045 — a bad release during the
+ *   roll; `versionPhase` defaults to `undefined`, matching "the phase was
+ *   never attempted"). Checked FIRST, same ordering rationale
+ *   `fleetUpgradeExitCode` documents for its own `halted` check: a halted
+ *   version phase always reports `1` even when it ALSO left other agents
+ *   skipped for unrelated reasons (busy/config-dirty/etc.) — halt is a
+ *   strictly worse signal than partial, so it must win, never be masked by
+ *   the `2` branch below.
+ * - **`2`** — NEW (macf#1151). Not a hard failure, but the version-reconcile
+ *   phase left at least one discovered fleet member un-rolled
+ *   (`versionPhase.skipBreakdown.length > 0` — busy / config-dirty /
+ *   off-canonical-branch / stale-pin / not-yet-serving; see
+ *   `apply-version.ts::versionRollSkipBreakdown`). This is the EXACT defect
+ *   #1151 reports: `formatVersionReconcileLine` (macf#1053) already narrates
+ *   this as "rolled N agent(s) … (M busy not rolled)" in the human-readable
+ *   summary, but the exit code never read `skipBreakdown` at all — a 2-of-3
+ *   partial roll exited `0`, indistinguishable from a fully-green apply to
+ *   any script checking `$?`. Reusing `versionPhase.skipBreakdown` directly
+ *   (never re-deriving it) keeps this exit code consistent with the summary
+ *   line by construction — one decision, read twice, never two decisions
+ *   that could drift. An `unreachable` phase (no locally-discoverable
+ *   workspace at all) reports an EMPTY `skipBreakdown`
+ *   (`apply-version.ts::summarizeVersionRoll`'s own doc — "could not
+ *   attempt" is a distinct, honest-unknown state, not a partial roll), so
+ *   this branch never fires for it — matches `fleetUpgradeExitCode`'s own
+ *   "driver-unresolved is still `isMixedVersionRoll`" choice being
+ *   deliberately NOT mirrored here: apply's `unreachable` is reporting-only
+ *   (DR-043 Amendment L2's "reporting only" floor for this whole phase, per
+ *   the pre-existing #1053 test this file keeps), while `fleet upgrade`'s
+ *   own whole-fleet-`skipped` shape is a stronger signal at that command's
+ *   own layer.
+ * - **`0`** — every hard-failure predicate is false AND the version phase
+ *   left no one behind (not attempted at all, attempted-and-fully-rolled,
+ *   or attempted-and-honestly-unreachable).
+ *
+ * **Audited other inputs for the same "partial success, not surfaced"
+ * shape (macf#1151) — none needed a change:**
+ * - `deployResults` (the attempted-this-run deploy phase): `FleetDeployOutcome.status`
+ *   is a strict two-value union, `'deployed' | 'failed'` (see that type's own
+ *   doc) — no per-agent "attempted, partially done" state exists at this
+ *   layer to miss; `anyDeployFailed` already catches the only bad shape.
+ * - `remainingDeploy` / the honest-`'unknown'`-presence report
+ *   (`remaining-deploy.ts` — e.g. a `deploy_path` that belongs to another
+ *   host in a multi-host fleet): NEVER reaches this function at all — it is
+ *   not one of this function's parameters, by design (see the "Never
+ *   changes `applyExitCode` below (requirement 3)" comment at this
+ *   function's call site) — an honest "I can't tell from here" must not
+ *   become a spurious non-zero, and structurally cannot, since it is never
+ *   read here.
+ * - `result`'s own `'skipped'`-shaped legs (CA / routing-client /
+ *   routing-secrets / routing-bundle / control-repo-init labels): every one
+ *   is already either (a) a symptom of a DIFFERENT already-`'failed'` state
+ *   this function independently catches (e.g. a skipped CA repo-leg when
+ *   `ca.resolve.status === 'failed'`), or (b) a genuinely benign steady
+ *   state with nothing left to do (CA reused, mint already vaulted, no
+ *   token minted this run so labels are 'skipped') — never a "some work
+ *   remains, no failure occurred" gap the way `skipBreakdown` was. No new
+ *   discriminator needed for any of them.
  */
 export function applyExitCode(
   result: FleetApplyResult,
@@ -2058,7 +2126,8 @@ export function applyExitCode(
   // above already covers "identity unresolved" independently; this covers
   // the repo-init-itself-failed sub-case of 'could-not-attempt').
   const actionsPinBad = result.actionsPin?.results.some((r) => r.status === 'could-not-attempt') ?? false;
-  return controlRepoBad ||
+  const hardFailure =
+    controlRepoBad ||
     controlRepoSyncBad ||
     controlRepoInitBad ||
     agentBad ||
@@ -2072,9 +2141,23 @@ export function applyExitCode(
     routingBundleBad ||
     anyDeployFailed(deployResults) ||
     versionPhase?.halted === true ||
-    actionsPinBad
-    ? 1
-    : 0;
+    actionsPinBad;
+  if (hardFailure) return 1;
+
+  // groundnuty/macf#1151 — the defect this function existed to fix: a
+  // version-reconcile phase that rolled SOME but not all discovered fleet
+  // members (`skipBreakdown` non-empty — busy/config-dirty/off-branch/
+  // stale-pin/not-yet-serving) is NOT a hard failure (checked above, no bad
+  // release, no halt) but it is also not a fully-green apply — reuses the
+  // SAME `skipBreakdown` `formatVersionReconcileLine` (macf#1053) already
+  // narrates in the human-readable summary, never re-derives it, so the
+  // exit code and the printed summary can never silently disagree. `halted`
+  // is excluded here on purpose: it was already checked above as part of
+  // `hardFailure` and returns `1` before this line is ever reached, so halt
+  // always outranks partial even when a halted roll ALSO left other agents
+  // skipped for unrelated reasons.
+  const versionPartial = versionPhase?.attempted === true && (versionPhase.skipBreakdown?.length ?? 0) > 0;
+  return versionPartial ? 2 : 0;
 }
 
 // --- Recovery-artifact presence notice (macf#988, DR-043 Amendment B requirement 4) ---
