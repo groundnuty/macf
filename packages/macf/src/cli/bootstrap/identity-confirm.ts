@@ -374,7 +374,15 @@ export interface WaitForAppInstallationOptions {
   readonly onUnexpectedTarget?: (installs: readonly ConfirmedInstall[]) => void;
 }
 
-function sleep(ms: number): Promise<void> {
+/**
+ * Exported (groundnuty/macf#1178) so `apply-agent.ts::pollForInstallFix` —
+ * a SIBLING poll loop with the same interval-then-check shape as
+ * {@link waitForAppInstallation} just below, but polling for a
+ * `validateInstall`/`validateReuse` ACCEPT rather than mere install
+ * existence — reuses this exact primitive instead of a second
+ * `setTimeout` wrapper.
+ */
+export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });

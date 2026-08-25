@@ -64,7 +64,7 @@
  * token-minting beyond what `apply` already does for consent-gate
  * confirmation.
  *
- * ## A 404 collapses two distinct causes — name both (waitForInstallTimeoutMessage's own lesson)
+ * ## A 404 collapses two distinct causes — name only what's checkable (waitForInstallTimeoutMessage's own lesson)
  *
  * `identity-confirm.ts`'s `waitForInstallTimeoutMessage` warns that "a
  * diagnostic that names the wrong cause is a small lie compounding with
@@ -74,9 +74,19 @@
  * The registry repo is, notably, NEVER `ensureAgentRepo`'d anywhere in
  * `apply-fleet.ts`'s per-agent loop (that only confirms each agent's OWN
  * home repo exists) — so "the registry repo doesn't exist" is a genuinely
- * reachable cause here, not a theoretical one. {@link registryRepoNotInstalledReason}
- * names BOTH branches and BOTH fixes in one message rather than asserting
- * only the installation-scope cause.
+ * reachable cause here, not a theoretical one.
+ *
+ * **groundnuty/macf#1178 — the second cause is partially checkable.**
+ * {@link checkRegistryRepoExists} independently probes whether `owner/repo`
+ * exists at all (an unauthenticated `GET /repos/{owner}/{repo}` — a 200
+ * proves existence; a 404 is ambiguous, since GitHub hides a private repo's
+ * existence from an anonymous caller identically to a nonexistent one).
+ * {@link registryRepoNotInstalledReason} uses this asymmetric result: when
+ * existence is CONFIRMED, the message names only the installation-scope
+ * cause, never an already-ruled-out possibility as a coequal guess; when it
+ * cannot be confirmed either way, the message says so explicitly — "unknown
+ * between two possibilities" — rather than presenting both as confident
+ * branches.
  *
  * ## Honest-unknown (DR-043 Amendment A)
  *
@@ -307,24 +317,67 @@ export async function checkRepoInAppInstallation(appId: string, keyPath: string,
 }
 
 /**
+ * groundnuty/macf#1178 — is `owner/repo` independently confirmable to
+ * EXIST, regardless of whether THIS App's installation covers it? An
+ * unauthenticated `GET /repos/{owner}/{repo}` returns 200 for a PUBLIC repo
+ * (existence proven, no auth needed) — but 404 for BOTH "doesn't exist" AND
+ * "exists but is private" (GitHub hides private-repo existence from
+ * anonymous callers by design), so a 404 here is genuinely ambiguous.
+ * {@link registryRepoNotInstalledReason}'s own "a 404 collapses two
+ * distinct causes" doc names exactly this ambiguity — this function is the
+ * honest, ASYMMETRIC check for it: it can only ever RULE OUT cause (b) (a
+ * 200 proves the repo exists), never CONFIRM it. Mirrors Amendment A's
+ * honest-unknown floor applied to a third, narrower question — `'absent'`
+ * is never returned by this function; only `'present'` (existence proven)
+ * or `'unknown'` (not proven either way).
+ */
+export async function checkRegistryRepoExists(owner: string, repo: string): Promise<Presence> {
+  try {
+    const response = await proxyAwareFetch(`https://api.github.com/repos/${owner}/${repo}`, {
+      headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
+      signal: AbortSignal.timeout(REPO_COVERAGE_FETCH_TIMEOUT_MS),
+    });
+    return response.status === 200 ? 'present' : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
  * The `apply` refusal text (#1012 requirement 1/2 — names the App AND the
  * repo, "so the fix is one installation edit rather than a search," quoted
- * verbatim from the acceptance criterion). Names BOTH causes a 404 collapses
- * (module doc's "A 404 collapses two distinct causes" section) rather than
- * asserting only one. `appHandle` is the bare handle (`deriveAppHandle`
- * output, no `[bot]` suffix — matches `fleet-manifest.ts::
- * buildTrustedActorsValue`'s convention of appending `[bot]` at the point of
- * use, not baking it into the handle).
+ * verbatim from the acceptance criterion).
+ *
+ * **Leads with the action** (groundnuty/macf#1178 — the operator's own
+ * ruling: a refusal that buries "add this repo" inside a wall of diagnosis
+ * is unusable even when every fact in it is correct). The repo itself is
+ * NOT restated on its own line here — that's {@link bareRepoNames}' /
+ * `announceAndOpenGate`'s copyable-block job (groundnuty/macf#1176); a
+ * second, differently-formatted copy of the same fact in THIS string would
+ * be exactly the drift #1176 was written to prevent.
+ *
+ * `causeBRuledOut` (groundnuty/macf#1178) — a 404 from `GET
+ * /repos/.../installation` collapses two distinct causes (module doc's own
+ * section on this). Before this issue, both were asserted as coequal
+ * "either (a)…or (b)…" options even though (b) is often CHECKABLE
+ * ({@link checkRegistryRepoExists}). `true` (the repo is independently
+ * confirmed to exist — checkable) names ONLY cause (a); anything else is
+ * framed explicitly AS an unresolved unknown between the two, never as two
+ * confident coequal branches — "if it cannot be distinguished, say
+ * `unknown`" is the operator's own acceptance criterion.
  */
-export function registryRepoNotInstalledReason(appHandle: string, owner: string, repo: string): string {
+export function registryRepoNotInstalledReason(appHandle: string, owner: string, repo: string, causeBRuledOut = false): string {
+  const cause = causeBRuledOut
+    ? `this App's installation does not include ${owner}/${repo} — confirmed to exist independently of this App's install.`
+    : `the cause is unknown between two possibilities: either this App's installation does not include ${owner}/${repo}, or ` +
+      `${owner}/${repo} itself does not exist or was renamed. A 404 here cannot distinguish the two, and ${owner}/${repo}'s own ` +
+      "existence could not be independently confirmed either way — expected when it's a private repo, since GitHub hides a " +
+      'private repo\'s existence from an unauthenticated check the same way it hides a nonexistent one.';
   return (
-    `App "${appHandle}" is installed, but GET /repos/${owner}/${repo}/installation returned 404 under this App's ` +
-    `own JWT — either (a) this App's installation does not include ${owner}/${repo} (fix: GitHub → Settings → ` +
-    `Applications → ${appHandle} → Configure → Repository access → add the repo), or (b) ${owner}/${repo} itself ` +
-    'does not exist or was renamed (fix: correct owner.registry in fleet.yaml, or create the repo). Either way, ' +
-    "this agent would otherwise provision successfully and then be unable to read/write its own registry entry, " +
-    `discovered only when it first tries (a known failure mode, now guarded for ` +
-    'registry.type: repo). Resolve one of the two causes above, then re-run apply.'
+    `Add ${owner}/${repo} under "Repository access" on the App's install page, then click "Save" — apply will detect the ` +
+    `change automatically. App "${appHandle}" is installed, but GET /repos/${owner}/${repo}/installation returned 404 under ` +
+    `this App's own JWT: ${cause} Left uncovered, this agent would otherwise provision successfully and then be unable to ` +
+    'read/write its own registry entry, discovered only when it first tries (a known failure mode, now guarded for registry.type: repo).'
   );
 }
 
@@ -404,7 +457,23 @@ export function registryRepoCoverageUnverifiedOnSkipNote(appHandle: string, owne
  *
  * `checkFn` defaults to the real {@link checkRepoInAppInstallation} — tests
  * inject a fake so the suite never makes a real `gh`/`fetch` call, mirroring
- * every other injectable-I/O-seam convention in this package.
+ * every other injectable-I/O-seam convention in this package. `existsCheckFn`
+ * (groundnuty/macf#1178) defaults to the real {@link checkRegistryRepoExists}
+ * — same injectable-seam convention, and same reasoning for defaulting.
+ *
+ * **`existsCheckFn`'s result is memoized across calls to the RETURNED
+ * closure (groundnuty/macf#1178).** `apply-agent.ts::pollForInstallFix`
+ * invokes this closure repeatedly — once per poll tick, for as long as the
+ * repo stays uncovered — and `owner/repo`'s EXISTENCE cannot change during
+ * a single `apply` run (unlike installation coverage, which is exactly
+ * what the operator is being asked to change). Re-probing it on every tick
+ * would not just waste calls: unauthenticated GitHub is rate-limited per
+ * IP (60 req/hr) far below the authenticated JWT budget this closure
+ * otherwise uses, so a long poll would eventually push the existence probe
+ * itself into `'unknown'` — silently flipping an already-ruled-out cause
+ * (b) back to "can't tell" mid-run, for a fact that never changed. Caching
+ * the first answer for the closure's lifetime is a correctness fix, not
+ * merely an optimization.
  */
 export function buildRegistryRepoValidateInstall(
   registryOwner: string,
@@ -412,16 +481,20 @@ export function buildRegistryRepoValidateInstall(
   appHandle: string,
   log: (line: string) => void,
   checkFn: (appId: string, keyPath: string, owner: string, repo: string) => Promise<Presence> = checkRepoInAppInstallation,
+  existsCheckFn: (owner: string, repo: string) => Promise<Presence> = checkRegistryRepoExists,
 ): (install: ConfirmedInstall, keyPath: string) => Promise<InstallRejection | undefined> {
+  let cachedExists: Presence | undefined;
   return async (install, keyPath) => {
     const presence = await checkFn(install.appId, keyPath, registryOwner, registryRepo);
     if (presence === 'absent') {
+      cachedExists ??= await existsCheckFn(registryOwner, registryRepo);
+      const causeBRuledOut = cachedExists === 'present';
       // groundnuty/macf#1063 — structured rejection: `message` keeps
       // #1012's own technical text (unchanged) for `AgentApplyOutcome.reason`;
       // `retryInstruction` is the plain-language companion the interactive
       // retry dialogue shows instead (see that field's own doc).
       return {
-        message: registryRepoNotInstalledReason(appHandle, registryOwner, registryRepo),
+        message: registryRepoNotInstalledReason(appHandle, registryOwner, registryRepo, causeBRuledOut),
         retryInstruction: registryRepoRetryInstruction(appHandle, registryOwner, registryRepo),
         // groundnuty/macf#1176 — the ONE specific repo this check knows is
         // missing, structurally (not parsed back out of the prose above).
