@@ -11,13 +11,15 @@
  * issue's own body is nine days old at that point, and the contract had
  * grown in ways worth recording explicitly:
  *
- *   - **A `credentials` field, marked "usually" required.** A private GitHub
- *     App can only be installed on the account that owns it (a GitHub
+ *   - **A `credentials` field, marked "usually" required — and the contract
+ *     says to send it on EVERY provision, not just the first.** A private
+ *     GitHub App can only be installed on the account that owns it (a GitHub
  *     structural rule, not a permissions setting), so the platform's OWN App
  *     "only works for one account." The issue's "three fields" framing
- *     predates this; `credentials` is a fourth. This module wires it for the
- *     ONE case `apply-fleet.ts` can supply it without inventing a new
- *     mechanism — see {@link runnerPlatformCredentialsFromOutcome}'s doc.
+ *     predates this; `credentials` is a fourth. This module wires it for
+ *     BOTH shapes `apply-fleet.ts` can supply it in — a freshly-minted
+ *     credential (in memory) or a vault-resolved one (a reused App) — see
+ *     {@link runnerPlatformCredentialsFromOutcome}'s doc.
  *   - **Two more endpoints** (`GET /runners?fleet=X` list, `GET /healthz`)
  *     — neither consumed here; #943's scope is the two verbs `apply`/
  *     teardown actually need.
@@ -256,25 +258,42 @@ export function deprovisionRunner(deps: RunnerPlatformDeps, repo: string): Promi
 }
 
 /**
- * The runner-ops App's credential, in the ONE shape `apply-fleet.ts` can
- * supply it without inventing a new mechanism: freshly minted THIS RUN
- * (`status === 'created'`), where the private-key PEM is already in process
- * memory (`AgentApplyOutcome`'s `created` variant carries `credentials.pem`
- * directly — no vault decrypt needed). `'reused'`/`'resumed-install'` (the
- * App already existed from a prior run) carry only `appId`/`installId` — no
- * PEM in memory, because `apply-fleet.ts` never performs a full-vault
- * decrypt for arbitrary credential re-reads (confirmed: its import list has
- * no `vault-read.ts::readVault`; only per-role RECOVERY-ARTIFACT reads,
- * which are for a role's OWN interrupted-run insurance, not a general
- * "fetch any past role's key" primitive). Re-supplying this credential on a
- * REUSED run would need that mechanism — DR-043 called it the phase-3
- * "vault read" increment, and it is out of THIS issue's scope; see the
- * report filed alongside this change for the explicit open question this
- * leaves (does a credential-less `POST` on an already-provisioned repo
- * touch the stored credential at all, per `GET /`'s "cannot read them back"
- * property, or only the object spec?).
+ * The runner-ops App's credential — TWO sources, because `GET /`'s own doc
+ * is unambiguous that omitting one is not a neutral choice: *"Send it on
+ * every provision... this service can write credentials and deliberately
+ * cannot read them back... so it cannot tell you whether one is already
+ * stored."* A credential-less `POST` therefore is NOT "same as before" on a
+ * REUSED run — it is the contract falling back to its OWN App, "which only
+ * works for one account" (almost never the fleet's). This was the run-2
+ * regression an earlier increment of this module left as an open question
+ * (does a credential-less POST touch the stored credential at all?) instead
+ * of resolving — the doc above answers it: don't find out, always send one
+ * when this run has ANY way to.
+ *
+ *   1. **Freshly minted THIS run** (`status === 'created'`) — the
+ *      private-key PEM is already in process memory (`AgentApplyOutcome`'s
+ *      `created` variant carries `credentials.pem` directly). No I/O.
+ *   2. **`'reused'`/`'resumed-install'`** (the App already existed from a
+ *      prior run) — `outcome` itself carries only `appId`/`installId`, but
+ *      `apply-fleet.ts::resolveRunnerOpsVaultPem` can supply the PEM as an
+ *      optional second argument here, sourced from the SAME vault-backed
+ *      `AgentApplyDeps.resolveKeyPath` closure that already confirmed this
+ *      reuse is real (only present when the operator supplied
+ *      `--vault`/`--identity-key` THIS run AND the vault actually holds this
+ *      role's key — see that function's doc for the full fallback chain).
+ *
+ * Every OTHER shape (`'skipped-unverified'`/`'drift'`/`'failed'`/
+ * `'not-needed'`, or a `'reused'`/`'resumed-install'` outcome with no vault
+ * PEM available) yields `undefined`, honestly — the caller (`apply-fleet.ts`)
+ * logs WHY and the provisioning call proceeds credential-less rather than
+ * refusing (Amendment I2: non-fatal).
  */
-export function runnerPlatformCredentialsFromOutcome(outcome: RunnerOpsApplyOutcome): RunnerPlatformCredentials | undefined {
-  if (outcome.status !== 'created') return undefined;
-  return { app_id: outcome.appId, installation_id: outcome.installId, private_key: outcome.credentials.pem };
+export function runnerPlatformCredentialsFromOutcome(outcome: RunnerOpsApplyOutcome, vaultPem?: string): RunnerPlatformCredentials | undefined {
+  if (outcome.status === 'created') {
+    return { app_id: outcome.appId, installation_id: outcome.installId, private_key: outcome.credentials.pem };
+  }
+  if ((outcome.status === 'reused' || outcome.status === 'resumed-install') && vaultPem !== undefined) {
+    return { app_id: outcome.appId, installation_id: outcome.installId, private_key: vaultPem };
+  }
+  return undefined;
 }

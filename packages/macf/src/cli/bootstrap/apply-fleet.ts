@@ -203,7 +203,7 @@
  * after that function's call for the retain-and-say-so behavior on anything
  * else (`'failed'` or `'nothing-to-commit'`).
  */
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { TokenSource } from '@groundnuty/macf-core';
@@ -792,6 +792,53 @@ async function applyRepoInitForCreatedAgent(
     return await applyRepoInitForAgent(agent, manifest, deps, { tokenSource });
   } finally {
     cleanupScratchPem(keyPath);
+  }
+}
+
+/**
+ * The run-2 credential-less-POST fix (groundnuty/macf#943 follow-up) —
+ * resolves the runner-ops App's private-key PEM for a `'reused'`/
+ * `'resumed-install'` outcome, the ONE shape {@link runnerPlatformCredentialsFromOutcome}'s
+ * in-memory path cannot cover (no PEM was exchanged THIS run). Reuses
+ * `AgentApplyDeps.resolveKeyPath` — the SAME vault-backed closure
+ * `confirmBeforeCreateGuard` already called, with the SAME `(role,
+ * priorAppId)` pair, to confirm THIS reuse is real in the first place (see
+ * `apply-agent.ts::confirmBeforeCreateGuard`). Calling it again is safe: the
+ * closure is idempotent (it writes a deterministic per-role scratch-file
+ * path and returns it; a second call re-writes the SAME path), and its
+ * scratch directory is cleaned up ONCE, at the very end of the whole run, by
+ * `runBootstrapApply`'s own `cleanupVaultScratch` obligation — never by this
+ * function.
+ *
+ * `undefined` in EVERY one of these cases, honestly, never a thrown error
+ * propagating out of the non-fatal runner-provisioning block that calls
+ * this: the outcome isn't `'reused'`/`'resumed-install'` (nothing to
+ * resolve); `resolveKeyPath` itself is unset (no `--vault`/`--identity-key`
+ * were supplied this run — the vault-aware guard was never wired at all);
+ * `resolveKeyPath` returns `undefined` (the vault doesn't hold this role's
+ * key — `vaultRunnerOpsPrivateKeyPem`'s own absent case); or the resolved
+ * path can't be read (a transient fs error). Every branch logs WHY, via
+ * `log`, except the vault-derived-and-readable success path (silence is the
+ * expected case there — the caller's own "credential resolved" framing
+ * covers it).
+ */
+function resolveRunnerOpsVaultPem(outcome: RunnerOpsApplyOutcome, resolveKeyPath: AgentApplyDeps['resolveKeyPath'], log: (line: string) => void): string | undefined {
+  if (outcome.status !== 'reused' && outcome.status !== 'resumed-install') return undefined;
+  if (resolveKeyPath === undefined) {
+    log('Runner platform: no --vault/--identity-key were supplied this run — cannot attempt a vault-derived credential for the reused runner-ops App.');
+    return undefined;
+  }
+  const keyPath = resolveKeyPath(RUNNER_OPS_ROLE, outcome.appId);
+  if (keyPath === undefined) {
+    log('Runner platform: --vault/--identity-key were supplied, but the vault does not (yet) hold the runner-ops role\'s key — cannot resolve a credential for this call.');
+    return undefined;
+  }
+  try {
+    return readFileSync(keyPath, 'utf-8');
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    log(`Runner platform: vault-derived runner-ops key at "${keyPath}" could not be read (${reason}) — continuing without credentials for this provisioning call.`);
+    return undefined;
   }
 }
 
@@ -1460,6 +1507,15 @@ export async function applyFleet(
   const runnerOpsPrior = currentLock?.agents.find((a) => a.role === RUNNER_OPS_ROLE);
   let pendingRunnerOpsVaultSecrets: VaultRunnerOpsSecrets | undefined;
   let runnerOpsIdentity: RunnerOpsApplyOutcome;
+  // groundnuty/macf#943 follow-up (the run-2 credential-less-POST fix) —
+  // captured ONLY inside the `runnerOpsNeeded` branch below (the same place
+  // `runnerOpsDeps` itself is built), so the runner-provisioning block
+  // further down can re-resolve THIS SAME vault-backed key path for a
+  // 'reused'/'resumed-install' outcome without inventing a second lookup
+  // mechanism. See `resolveRunnerOpsVaultPem`'s doc for why re-calling it is
+  // safe (idempotent — the SAME scratch path `confirmBeforeCreateGuard`
+  // already resolved, and wrote, while confirming this reuse).
+  let runnerOpsResolveKeyPath: AgentApplyDeps['resolveKeyPath'];
   if (!runnerOpsNeeded(manifest)) {
     // `runnerOpsPrior === undefined`: the common case — no App was ever
     // created, none is created now, no clicks spent. `runnerOpsPrior !==
@@ -1511,6 +1567,9 @@ export async function applyFleet(
       // now builds its closure the SAME way, over its own handle.
       validateInstall: buildInstallScopeValidator(deriveRunnerOpsHandle(manifest.metadata.name)),
     };
+    // Captured for the runner-provisioning block further down — see this
+    // variable's declaration above `runnerOpsPrior` for why.
+    runnerOpsResolveKeyPath = runnerOpsDeps.resolveKeyPath;
     runnerOpsIdentity = wouldCreateWithNoRecipient(runnerOpsPrior, recipients)
       ? noRecipientPreflightFailure(RUNNER_OPS_ROLE)
       : wouldCreateWithUnreadableVault(runnerOpsPrior, vaultAlreadyExists, deps.identityKeyPath)
@@ -1593,17 +1652,19 @@ export async function applyFleet(
       endpoint: resolveRunnerPlatformEndpoint(deps.runnerPlatformEndpoint),
       fetchImpl: deps.runnerPlatformFetch,
     };
-    // Only available when the runner-ops App was freshly minted THIS run —
-    // see `runnerPlatformCredentialsFromOutcome`'s doc for why a
-    // `'reused'`/`'resumed-install'` outcome cannot supply it without a
-    // full-vault-decrypt mechanism this module does not have.
-    const runnerOpsCredentials = runnerPlatformCredentialsFromOutcome(runnerOpsIdentity);
+    // Freshly minted THIS run (`status === 'created'`) supplies the PEM
+    // in-memory, no I/O needed. A `'reused'`/`'resumed-install'` outcome
+    // falls back to `resolveRunnerOpsVaultPem` — the run-2 fix (groundnuty/
+    // macf#943 follow-up): the SAME vault-backed `resolveKeyPath` closure
+    // that already confirmed this reuse is real, re-consulted for the PEM
+    // itself. See both functions' docs for the full "why."
+    const runnerOpsCredentials = runnerPlatformCredentialsFromOutcome(runnerOpsIdentity, resolveRunnerOpsVaultPem(runnerOpsIdentity, runnerOpsResolveKeyPath, deps.log));
     if (runnerOpsCredentials === undefined) {
       deps.log(
-        `Runner platform: no runner-ops credential in memory this run (${runnerOpsIdentity.status}) — provisioning ` +
+        `Runner platform: no runner-ops credential available this run (${runnerOpsIdentity.status}) — provisioning ` +
           "call(s) below omit `credentials`, so the contract falls back to its OWN App, which only works for the " +
-          'owner it happens to be installed on. Re-supplying a REUSED credential on every run needs a decrypted-' +
-          'vault read this module does not perform yet (see runner-platform.ts\'s doc).',
+          'owner it happens to be installed on. This means either no --vault/--identity-key were supplied this ' +
+          'run, or the vault does not (yet) hold this role\'s key — see the log lines above for which.',
       );
     }
     const declaredLabels = manifest.routing.runner.labels;

@@ -210,20 +210,57 @@ describe('runnerPlatformCredentialsFromOutcome (groundnuty/macf#943)', () => {
     });
   });
 
-  it('a reused (from a prior run) outcome yields undefined — no PEM is in memory this run', () => {
+  it('a reused (from a prior run) outcome, with NO vaultPem supplied, yields undefined — no PEM is in memory this run and nothing was resolved from the vault either', () => {
     const outcome: RunnerOpsApplyOutcome = { role: 'runner-ops', status: 'reused', appId: '4616819', installId: '154246953' };
     expect(runnerPlatformCredentialsFromOutcome(outcome)).toBeUndefined();
   });
 
-  it('a resumed-install outcome ALSO yields undefined, same reason as reused', () => {
+  it('a resumed-install outcome, with NO vaultPem supplied, ALSO yields undefined, same reason as reused', () => {
     const outcome: RunnerOpsApplyOutcome = { role: 'runner-ops', status: 'resumed-install', appId: '4616819', installId: '154246953' };
     expect(runnerPlatformCredentialsFromOutcome(outcome)).toBeUndefined();
   });
 
-  it('not-needed / failed / drift / skipped-unverified outcomes all yield undefined — no App identity to build a credential from', () => {
-    expect(runnerPlatformCredentialsFromOutcome({ role: 'runner-ops', status: 'not-needed', reason: 'x' })).toBeUndefined();
-    expect(runnerPlatformCredentialsFromOutcome({ role: 'runner-ops', status: 'failed', reason: 'x' })).toBeUndefined();
-    expect(runnerPlatformCredentialsFromOutcome({ role: 'runner-ops', status: 'drift', reason: 'x', installs: [] })).toBeUndefined();
-    expect(runnerPlatformCredentialsFromOutcome({ role: 'runner-ops', status: 'skipped-unverified', appId: 'a', reason: 'x' })).toBeUndefined();
+  // --- groundnuty/macf#943 follow-up (the run-2 credential-less-POST fix) —
+  // the vaultPem fallback second argument, sourced by apply-fleet.ts's
+  // `resolveRunnerOpsVaultPem` from `AgentApplyDeps.resolveKeyPath`.
+
+  it('DECISIVE: a reused outcome WITH a vaultPem supplied yields the credential, appId/installId from the outcome + the PEM from the vault', () => {
+    const outcome: RunnerOpsApplyOutcome = { role: 'runner-ops', status: 'reused', appId: '4616819', installId: '154246953' };
+    expect(runnerPlatformCredentialsFromOutcome(outcome, 'SENTINEL-VAULT-PEM')).toEqual({
+      app_id: '4616819',
+      installation_id: '154246953',
+      private_key: 'SENTINEL-VAULT-PEM',
+    });
+  });
+
+  it('a resumed-install outcome WITH a vaultPem supplied ALSO yields the credential, same shape as reused', () => {
+    const outcome: RunnerOpsApplyOutcome = { role: 'runner-ops', status: 'resumed-install', appId: '4616819', installId: '154246953' };
+    expect(runnerPlatformCredentialsFromOutcome(outcome, 'SENTINEL-VAULT-PEM')).toEqual({
+      app_id: '4616819',
+      installation_id: '154246953',
+      private_key: 'SENTINEL-VAULT-PEM',
+    });
+  });
+
+  it('a `created` outcome ignores a supplied vaultPem entirely — the in-memory PEM always wins, never overridden by a stale vault read', () => {
+    const outcome: RunnerOpsApplyOutcome = {
+      role: 'runner-ops',
+      status: 'created',
+      appId: '4616819',
+      installId: '154246953',
+      credentials: { appId: '4616819', name: 'x', slug: 'x', clientId: 'c', clientSecret: 's', webhookSecret: 'w', pem: 'IN-MEMORY-PEM' },
+    };
+    expect(runnerPlatformCredentialsFromOutcome(outcome, 'STALE-VAULT-PEM')).toEqual({
+      app_id: '4616819',
+      installation_id: '154246953',
+      private_key: 'IN-MEMORY-PEM',
+    });
+  });
+
+  it('not-needed / failed / drift / skipped-unverified outcomes all yield undefined regardless of vaultPem — no App identity to build a credential from', () => {
+    expect(runnerPlatformCredentialsFromOutcome({ role: 'runner-ops', status: 'not-needed', reason: 'x' }, 'SENTINEL-VAULT-PEM')).toBeUndefined();
+    expect(runnerPlatformCredentialsFromOutcome({ role: 'runner-ops', status: 'failed', reason: 'x' }, 'SENTINEL-VAULT-PEM')).toBeUndefined();
+    expect(runnerPlatformCredentialsFromOutcome({ role: 'runner-ops', status: 'drift', reason: 'x', installs: [] }, 'SENTINEL-VAULT-PEM')).toBeUndefined();
+    expect(runnerPlatformCredentialsFromOutcome({ role: 'runner-ops', status: 'skipped-unverified', appId: 'a', reason: 'x' }, 'SENTINEL-VAULT-PEM')).toBeUndefined();
   });
 });

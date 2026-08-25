@@ -2610,6 +2610,186 @@ trust:
         expect(result.routing['groundnuty/demo-code']?.status).toBe('created');
       });
 
+      it('DECISIVE run-2: a REUSED runner-ops outcome still POSTs WITH credentials, sourced from the vault-backed resolveKeyPath fallback (groundnuty/macf#943 follow-up — the run-2 credential-less-POST regression)', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        // Every identity apply-fleet.ts always resolves (agent, runner-ops,
+        // router — groundnuty/macf#1074) gets a PRIOR lock entry, so ALL
+        // THREE take the REUSED path — this test is about the runner-ops
+        // credential fallback specifically, not gate-1/gate-2 noise from an
+        // unrelated identity. Mirrors the "deactivate-shaped state" test's
+        // dispatch-by-appId shape above.
+        const priorLock: FleetLock = {
+          schema_version: 1,
+          fleet: 'demo-fleet',
+          agents: [
+            { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+            { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-runner-ops' },
+            { role: 'router', app_id: 'app-router', install_id: 'install-router' },
+          ],
+          fingerprints: { ca_key: 'sha256:deadbeef' },
+        };
+        const INSTALL_IDS: Record<string, string> = {
+          'app-code-agent': 'install-1',
+          'app-runner-ops': 'install-runner-ops',
+          'app-router': 'install-router',
+        };
+        // The vault-backed key: a REAL file on disk (not the '/fake.pem'
+        // sentinel other REUSED fixtures in this file use), because THIS
+        // test asserts the fix actually READS it and threads its content
+        // into the request body — a fixture that never wrote a real file
+        // would pass even if `readFileSync` were never called.
+        const pemDir = mkdtempSync(join(tmpdir(), 'macf-runner-ops-vault-pem-'));
+        dirs.push(pemDir);
+        const vaultPemPath = join(pemDir, 'runner-ops.pem');
+        writeFileSync(vaultPemPath, 'SENTINEL-VAULT-RUNNER-OPS-PEM', 'utf-8');
+        const agentDeps: AgentApplyDeps = {
+          startManifestFlow: async () => {
+            throw new Error('must not be called — every role has a prior entry');
+          },
+          startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+          exchangeManifestCode: async () => {
+            throw new Error('must not be called');
+          },
+          // Every role's resolveKeyPath resolves to the SAME vault file in
+          // this fixture (only runner-ops's content is asserted below) —
+          // mirrors `agentDepsFor`'s reused-path convention of one shared
+          // resolver across every identity riding the same fixture.
+          resolveKeyPath: () => vaultPemPath,
+          confirmAppInstallation: async (appId) => ({
+            status: 'confirmed',
+            install: { appId, installId: INSTALL_IDS[appId] ?? 'install-unexpected', appSlug: `demo-fleet-${appId}`, accountLogin: 'groundnuty' },
+          }),
+          waitForAppInstallation: async () => {
+            throw new Error('must not be called');
+          },
+          openUrl: async () => {},
+          log: () => {},
+          writeRecoveryArtifact: async () => {},
+        };
+        let capturedBody: unknown;
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDeps, manifestPath),
+          trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'present' }) }),
+          runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+          runnerPlatformFetch: (async (_url: string | URL, init?: RequestInit) => {
+            capturedBody = JSON.parse(String(init?.body));
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }) as typeof fetch,
+        };
+
+        const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+        expect(result.runnerOps.status).toBe('reused');
+        expect(result.runnerProvision['groundnuty/demo-code']).toEqual({ status: 'ok' });
+        // The decisive assertion: the BODY actually sent carries credentials
+        // sourced from the vault-resolved PEM — not merely "the call
+        // happened" (a version that still omits credentials on reuse would
+        // ALSO satisfy that weaker assertion).
+        expect(capturedBody).toEqual({
+          repo: 'groundnuty/demo-code',
+          warm: 1,
+          fleet: 'demo-fleet',
+          credentials: { app_id: 'app-runner-ops', installation_id: 'install-runner-ops', private_key: 'SENTINEL-VAULT-RUNNER-OPS-PEM' },
+        });
+      });
+
+      it('run-2, resolveKeyPath resolves to an unreadable path: credentials stay honestly omitted, never a thrown error (readFileSync-throws branch)', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        const priorLock: FleetLock = {
+          schema_version: 1,
+          fleet: 'demo-fleet',
+          agents: [
+            { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+            { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-runner-ops' },
+          ],
+          fingerprints: { ca_key: 'sha256:deadbeef' },
+        };
+        // `agentDepsFor('reused', ...)` sets `resolveKeyPath: () => '/fake.pem'`
+        // — this run DOES have a resolveKeyPath (unlike a run with no
+        // --vault/--identity-key at all, where the closure is unset entirely
+        // — see `runner-platform.test.ts` for that shape at the pure-function
+        // level), but the path it resolves to does not exist, exercising the
+        // `readFileSync`-throws branch specifically.
+        let capturedBody: unknown;
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('runner-ops', 'reused', 'app-runner-ops', 'install-runner-ops'), manifestPath),
+          trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'present' }) }),
+          runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+          runnerPlatformFetch: (async (_url: string | URL, init?: RequestInit) => {
+            capturedBody = JSON.parse(String(init?.body));
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }) as typeof fetch,
+        };
+
+        const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+        expect(result.runnerOps.status).toBe('reused');
+        expect(result.runnerProvision['groundnuty/demo-code']).toEqual({ status: 'ok' });
+        expect(capturedBody).toEqual({ repo: 'groundnuty/demo-code', warm: 1, fleet: 'demo-fleet' }); // no `credentials` key at all
+      });
+
+      it('the vault-derived runner-ops PEM is NEVER logged, across the whole run-2 provisioning flow', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        const priorLock: FleetLock = {
+          schema_version: 1,
+          fleet: 'demo-fleet',
+          agents: [
+            { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+            { role: 'runner-ops', app_id: 'app-runner-ops', install_id: 'install-runner-ops' },
+            { role: 'router', app_id: 'app-router', install_id: 'install-router' },
+          ],
+          fingerprints: { ca_key: 'sha256:deadbeef' },
+        };
+        const INSTALL_IDS: Record<string, string> = {
+          'app-code-agent': 'install-1',
+          'app-runner-ops': 'install-runner-ops',
+          'app-router': 'install-router',
+        };
+        const pemDir = mkdtempSync(join(tmpdir(), 'macf-runner-ops-vault-pem-log-'));
+        dirs.push(pemDir);
+        const vaultPemPath = join(pemDir, 'runner-ops.pem');
+        const SENTINEL_SECRET = 'SENTINEL-VAULT-RUNNER-OPS-PEM-NEVER-LOGGED';
+        writeFileSync(vaultPemPath, SENTINEL_SECRET, 'utf-8');
+        const logs: string[] = [];
+        const agentDeps: AgentApplyDeps = {
+          startManifestFlow: async () => {
+            throw new Error('must not be called — every role has a prior entry');
+          },
+          startInstallInterstitial: async () => ({ startUrl: 'http://x/install', close: async () => {} }),
+          exchangeManifestCode: async () => {
+            throw new Error('must not be called');
+          },
+          resolveKeyPath: () => vaultPemPath,
+          confirmAppInstallation: async (appId) => ({
+            status: 'confirmed',
+            install: { appId, installId: INSTALL_IDS[appId] ?? 'install-unexpected', appSlug: `demo-fleet-${appId}`, accountLogin: 'groundnuty' },
+          }),
+          waitForAppInstallation: async () => {
+            throw new Error('must not be called');
+          },
+          openUrl: async () => {},
+          log: () => {},
+          writeRecoveryArtifact: async () => {},
+        };
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDeps, manifestPath),
+          buildAgentDeps: (log) => ({ ...agentDeps, log }),
+          trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'present' }) }),
+          runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+          runnerPlatformFetch: (async () => new Response(JSON.stringify({ ok: true }), { status: 200 })) as typeof fetch,
+          log: (l) => logs.push(l),
+        };
+
+        const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+        expect(result.runnerOps.status).toBe('reused');
+        expect(result.runnerProvision['groundnuty/demo-code']).toEqual({ status: 'ok' });
+        expect(logs.join('\n')).not.toContain(SENTINEL_SECRET);
+      });
+
       it('the call is attempted regardless of whether --runner-token was supplied — provisioning and the routing-var policy gate are independent (Amendment I2)', async () => {
         const manifestPath = manifestPathIn();
         const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
