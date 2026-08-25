@@ -22,6 +22,7 @@ import { runFleetDeploy } from './commands/fleet-deploy.js';
 import { runBootstrapPlan } from './commands/bootstrap.js';
 import { runBootstrapApply } from './commands/bootstrap-apply.js';
 import { runBootstrapStatus } from './commands/bootstrap-status.js';
+import { runBootstrapControlRepoInit } from './commands/bootstrap-control-repo-init.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRoutingE2e } from './commands/routing-e2e.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
@@ -800,6 +801,28 @@ bootstrap
       runnerToken: opts.runnerToken,
       deploy: opts.deploy,
     });
+    process.exitCode = code;
+  });
+
+const bootstrapControlRepo = bootstrap
+  .command('control-repo')
+  .description('Scoped operations against a fleet\'s per-fleet control-plane repo, independent of the per-agent identity plane.');
+
+bootstrapControlRepo
+  .command('init')
+  .description(
+    'Create-or-reuse ONLY the fleet\'s control-plane repo and commit fleet.yaml as its first act — the ' +
+    'migration path for a fleet that was provisioned before the control-plane-repo layout existed (no ' +
+    '`fleet.lock`, no committed manifest, Apps/repos already real on GitHub). Runs the SAME step this repo ' +
+    'always runs first, in isolation: never opens a consent gate, never touches an agent\'s App, install, ' +
+    'repo, or fleet.lock, never touches the vault. Idempotent — a fleet whose control repo already matches ' +
+    'this manifest is reported as already-migrated with no changes made. An existing-but-archived control ' +
+    'repo is refused, not silently revived.',
+  )
+  .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
+  .option('--json', 'Emit the structured result as JSON', false)
+  .action(async (opts) => {
+    const code = await runBootstrapControlRepoInit({ file: opts.file, json: opts.json });
     process.exitCode = code;
   });
 
