@@ -37,8 +37,11 @@
  *
  * **groundnuty/macf#1173 — gate 2's served page renders NO prose of its
  * own.** {@link InstallInterstitialOptions.messageLines} is the SAME array
- * the terminal prints; this file only escapes + wraps it in `<li>`s. See
- * {@link renderInstallInterstitial}'s own doc for the incident this closes.
+ * the terminal prints; this file only escapes it into a verbatim block (see
+ * {@link renderVerbatimInstructionBlock}). See {@link renderInstallInterstitial}'s
+ * own doc for the incident this closes, and its groundnuty/macf#1176 note
+ * for the copyable repo-names block ({@link renderCopyableRepoBlock}) added
+ * alongside it.
  */
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
@@ -291,8 +294,53 @@ export interface InstallInterstitialOptions {
    * papers over.
    */
   readonly messageLines: readonly string[];
+  /**
+   * groundnuty/macf#1176 — the bare repo names (see `apply-agent.ts::
+   * bareRepoName`'s doc for why bare, not `owner/repo`) the operator pastes
+   * into GitHub's own repository picker. THE payload of this whole page —
+   * rendered as its own prominent, copy-with-nothing-to-trim block, distinct
+   * from `messageLines`' prose (which explains what to do; this is what to
+   * paste). Computed ONCE by the caller (`apply-agent.ts::
+   * runGate2WithInterstitial`) from the SAME `repos`/`missingRepos` value
+   * that built `messageLines`' own repo-selection sentence, so the two can
+   * never name a different set. Empty renders no block — same "an empty
+   * array is a caller bug, not a case this function papers over" posture as
+   * `messageLines`.
+   */
+  readonly repoNames: readonly string[];
   readonly gateNumber: number;
   readonly gateTotal: number;
+}
+
+/**
+ * groundnuty/macf#1176 — the copyable payload, its own small function so it
+ * can be asserted directly ("names and nothing else") without parsing it
+ * back out of the full page. One repo name per line, nothing else — no
+ * bullets, no surrounding prose inside the block itself.
+ */
+export function renderCopyableRepoBlock(repoNames: readonly string[]): string {
+  if (repoNames.length === 0) return '';
+  const body = repoNames.map((name) => escapeHtmlAttribute(name)).join('\n');
+  return `<h2>Repositories to select — copy exactly</h2>\n<pre>${body}</pre>`;
+}
+
+/**
+ * groundnuty/macf#1176 — `messageLines`, verbatim, formatted exactly as
+ * `apply-agent.ts::announceAndOpenGate` prints them to the terminal (the
+ * SAME `Role "<role>": ` prefix per line) — never a re-render, never a
+ * paraphrase. Labeled "the instruction, as printed" rather than "what the
+ * terminal printed": `announceAndOpenGate` also prints a gate-label/URL
+ * line, the repo block, and the final "waiting for you to click" line
+ * AFTER this page's HTML is already built (this page's content is static
+ * for its whole lifetime — see {@link startInstallInterstitial}'s doc), so
+ * this block cannot claim to be the terminal's ENTIRE output for this gate
+ * — only the instruction body both surfaces share.
+ */
+export function renderVerbatimInstructionBlock(role: string, messageLines: readonly string[]): string {
+  if (messageLines.length === 0) return '';
+  const roleEsc = escapeHtmlAttribute(role);
+  const body = messageLines.map((line) => `Role "${roleEsc}": ${escapeHtmlAttribute(line)}`).join('\n');
+  return `<h2>The instruction, as printed</h2>\n<pre>${body}</pre>`;
 }
 
 /**
@@ -300,8 +348,9 @@ export interface InstallInterstitialOptions {
  * reaches GitHub's install page. Pure — exported for testing.
  *
  * **Never renders a secret.** {@link InstallInterstitialOptions} carries no
- * credential field at all (role/appName/installUrl/messageLines are all
- * plan-level facts, not secrets) — structurally, not just by convention.
+ * credential field at all (role/appName/installUrl/messageLines/repoNames
+ * are all plan-level facts, not secrets) — structurally, not just by
+ * convention.
  *
  * **groundnuty/macf#1173 — formatting regresses on purpose.** Before this
  * issue, this function hand-built its own bullet list (short repo name in
@@ -309,22 +358,29 @@ export interface InstallInterstitialOptions {
  * — content nowhere else, so it could (and did) drift from what the
  * terminal told the SAME operator during the SAME gate. The operator's own
  * ruling: *"It can have a little bit worse formatting, but at the moment we
- * are managing two different sets of user messages."* Every sentence below
- * is `opts.messageLines`, escaped and wrapped one-per-`<li>` — no sentence
- * this function adds on its own, none it drops. The remaining markup
- * (heading, the "Installing GitHub App" label, the button) is structural
- * identifying context, not prose — the same split gate 1's page already
- * settled on (groundnuty/macf#971).
+ * are managing two different sets of user messages."* Every sentence in the
+ * verbatim-instruction block below is `opts.messageLines` — no sentence
+ * this function adds on its own, none it drops.
+ *
+ * **groundnuty/macf#1176 — the copyable repo block comes FIRST and is the
+ * most visually prominent element.** The operator's own words: *"what
+ * should I copy… I usually copy the name of the repositories I have to
+ * add."* {@link renderCopyableRepoBlock} renders it; the prose (via
+ * {@link renderVerbatimInstructionBlock}) is context around it, never a
+ * peer to it — same ordering + prominence intent, applied structurally.
  */
 export function renderInstallInterstitial(opts: InstallInterstitialOptions): string {
   const roleEsc = escapeHtmlAttribute(opts.role);
   const appNameEsc = escapeHtmlAttribute(opts.appName);
   const installUrlEsc = escapeHtmlAttribute(opts.installUrl);
-  const messageItems = opts.messageLines.map((line) => `  <li>${escapeHtmlAttribute(line)}</li>`).join('\n');
+  const repoBlock = renderCopyableRepoBlock(opts.repoNames);
+  const instructionBlock = renderVerbatimInstructionBlock(opts.role, opts.messageLines);
   return `<!doctype html>
 <html><head><meta charset="utf-8"><title>Consent gate ${String(opts.gateNumber)} of ${String(opts.gateTotal)} — installing ${appNameEsc}</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+  pre { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: 0.75rem 1rem; overflow-x: auto;
+        font-size: 1rem; }
   .dim { color: #666; }
   .button { display: inline-block; margin-top: 1rem; padding: 0.6rem 1.2rem; background: #1f6feb; color: #fff;
             text-decoration: none; border-radius: 6px; font-weight: 600; }
@@ -333,9 +389,8 @@ export function renderInstallInterstitial(opts: InstallInterstitialOptions): str
 <body>
 <h1>Consent gate ${String(opts.gateNumber)} of ${String(opts.gateTotal)} — role "${roleEsc}"</h1>
 <p>Installing GitHub App: <strong>${appNameEsc}</strong></p>
-<ul>
-${messageItems}
-</ul>
+${repoBlock}
+${instructionBlock}
 <p><a class="button" href="${installUrlEsc}">Continue to GitHub to install</a></p>
 <p class="dim">If the button doesn't work, open this URL yourself: ${installUrlEsc}</p>
 </body></html>`;

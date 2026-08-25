@@ -423,6 +423,9 @@ export function buildRegistryRepoValidateInstall(
       return {
         message: registryRepoNotInstalledReason(appHandle, registryOwner, registryRepo),
         retryInstruction: registryRepoRetryInstruction(appHandle, registryOwner, registryRepo),
+        // groundnuty/macf#1176 — the ONE specific repo this check knows is
+        // missing, structurally (not parsed back out of the prose above).
+        missingRepos: [`${registryOwner}/${registryRepo}`],
       };
     }
     if (presence === 'unknown') {
