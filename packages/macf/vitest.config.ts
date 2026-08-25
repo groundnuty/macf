@@ -17,6 +17,13 @@ export default defineConfig({
     },
   },
   test: {
+    // WHY (groundnuty/macf#1133 class, at the package level): vitest's 5000ms
+    // default sits below what several suites here need under parallel load —
+    // measured worst case ~2s standalone, but CI runs 191 files concurrently and
+    // `make check` passes no --testTimeout, so main itself went red at the default.
+    // A package-level default keeps the CLI flag able to override it, unlike the
+    // inline `{ timeout: N }` form that #1133 found silently outranks the flag.
+    testTimeout: 20000,
     globals: true,
     setupFiles: ['test/setup.ts'],
     include: ['test/**/*.test.ts'],
