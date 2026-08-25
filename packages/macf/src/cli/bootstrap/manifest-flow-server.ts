@@ -457,11 +457,11 @@ export function renderInstallInterstitial(opts: InstallInterstitialOptions): str
      horizontal scroller which makes it impossible to see it in one pass" —
      about the PROSE block only. Restyling the bare pre selector would have
      shrunk the copyable repo block (the payload, #1176) right along with it. */
-  /* WHY (groundnuty/macf#1181): the PAYLOAD wraps too — a scroller here is the
-     same unreadability one element over. Wrapping is safe for copying: CSS
-     wrapping is visual and inserts no characters into a selection. Larger +
-     bolder than the prose because it is what the operator came for. */
-  .macf-repos { font-size: 1.05rem; font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* WHY (groundnuty/macf#1179 + #1181): the payload does NOT wrap, deliberately.
+     A wrapped long repo name would visually read as TWO repo names on separate
+     lines — one-per-line unambiguity matters more here than on prose. Its
+     overflow-x is a safety net that the wider #1181 body should never trigger. */
+  .macf-repos { font-size: 1rem; overflow-x: auto; white-space: pre; }
   .macf-instructions { font-size: 0.85rem; white-space: pre-wrap; overflow-wrap: anywhere; }
   .dim { color: #666; }
   .button { display: inline-block; margin-top: 1rem; padding: 0.6rem 1.2rem; background: #1f6feb; color: #fff;
