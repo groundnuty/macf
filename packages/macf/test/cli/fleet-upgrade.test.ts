@@ -12,12 +12,18 @@ import type {
   FleetState,
   WorkspaceRecord,
   HealthResponse,
+  FleetPlanReport,
+  FleetRollResult,
+  FleetUpgradeReport,
 } from '@groundnuty/macf-core';
 import {
   runFleetUpgrade,
   resolveTargetVersion,
   selectFleets,
   formatPlanTable,
+  fleetUpgradeExitCode,
+  isMixedVersionRoll,
+  rollLeftAgentBehind,
   type FleetUpgradeDeps,
 } from '../../src/cli/commands/fleet-upgrade.js';
 import { NO_MANIFEST_VERSION } from '../../src/cli/bootstrap/version-target.js';
@@ -77,6 +83,8 @@ function makeDriver(
      * `bad-release` classification for tests that don't configure a pin.
      */
     launchPin?: (agent: string) => string | null;
+    /** Busy-gate override (macf#1146's decisive pair); defaults to never-busy. */
+    isBusy?: (agent: string) => Promise<boolean>;
   },
 ): { driver: FleetDriver; calls: Calls; workspaces: readonly WorkspaceRecord[] } {
   const calls: Calls = { upgrade: [], restart: [] };
@@ -87,7 +95,7 @@ function makeDriver(
     probe: async () =>
       mkState(agents.map((a) => [a.name, flip && restarted.has(a.name) ? opts.target : opts.base])),
     discoverWorkspaces: () => workspaces,
-    isBusy: async () => false,
+    isBusy: opts.isBusy ?? (async () => false),
     isConfigDirty: async () => false,
     listDirtyConfig: async () => [],
     currentBranch: async () => 'main',
@@ -394,11 +402,15 @@ describe('runFleetUpgrade', () => {
     expect(calls.upgrade).toEqual(['a']); // fleet-2's 'b' never rolled
   });
 
-  it('stale-pin (macf#899): agent comes back OLD but its own launch pin never asked for the target — SKIPS, does NOT halt (exit 0)', async () => {
+  it('stale-pin (macf#899): agent comes back OLD but its own launch pin never asked for the target — SKIPS, does NOT halt, is MIXED (exit 2, macf#1146)', async () => {
     // Same shape as the 0.2.56-roll incident this issue fixes: the process
     // is reachable at the old version, but the LAUNCHER's own pin still
     // asks for the OLD version too — the release itself was never asked to
     // roll on this workspace, so it must not be blamed / halted for it.
+    // Pre-macf#1146 this asserted `code === 0` — "not a halt" was conflated
+    // with "success"; the agent above is verifiably still on the old pin,
+    // which is exactly the mixed-version state #1146 reports as silently
+    // green. It is a skip, not a halt, so it is `2` (MIXED), not `1`.
     const { driver, calls, workspaces } = makeDriver([AGENTS[0]!], {
       base: '0.2.40',
       target: '0.2.41',
@@ -411,7 +423,7 @@ describe('runFleetUpgrade', () => {
       resolveDriver: async () => driver,
     });
     const code = await runFleetUpgrade('/proj', { execute: true, verifyTimeoutSec: 0 }, deps);
-    expect(code).toBe(0); // stale-pin is a skip, not a halt
+    expect(code).toBe(2); // stale-pin is a skip, not a halt, but IS mixed (macf#1146)
     expect(calls.upgrade).toEqual(['a']);
     expect(calls.restart).toEqual(['a']);
   });
@@ -624,5 +636,153 @@ describe('DR-043 Amendment L — manifest-authoritative target, end-to-end throu
     const code = await runFleetUpgrade('/proj', { execute: true }, deps);
     expect(code).toBe(0);
     expect(calls.upgrade).toEqual(['a']);
+  });
+});
+
+// --- Mixed-version roll exit code + banner (macf#1146) ----------------------
+//
+// Before this fix, `renderReport` looked ONLY at `report.halted` — every one
+// of the 5 per-agent skip outcomes (`busy-skipped` / `config-dirty-skipped` /
+// `branch-skipped` / `stale-pin-skipped` / `not-yet-serving-skipped`) AND a
+// whole fleet's driver-unresolved skip rendered success-shaped lines and
+// still returned exit 0. Per `assert-the-wrong-path.md`, a single "one
+// skipped agent → non-zero" assertion is satisfied by a command that always
+// returns non-zero — so each cause is asserted SEPARATELY below, plus the
+// decisive pair (mixed vs. fully-green) end-to-end through `runFleetUpgrade`
+// with real driver fixtures so the rendered banner text is proven too, not
+// just the numeric code.
+
+/** A fully-green `FleetRollResult` (every counter zero, not halted). Override to model one specific outcome. */
+function mkRolled(over: Partial<FleetRollResult> = {}): FleetRollResult {
+  return {
+    results: [],
+    halted: false,
+    upgraded: 1,
+    busySkipped: 0,
+    configDirtySkipped: 0,
+    configAutoResolved: 0,
+    branchSkipped: 0,
+    stalePinSkipped: 0,
+    notYetServingSkipped: 0,
+    ...over,
+  };
+}
+
+function mkFleetReport(over: Partial<FleetPlanReport> = {}): FleetPlanReport {
+  return { fleet: 'g', plans: [], ...over };
+}
+
+function mkReport(fleets: readonly FleetPlanReport[], halted = false): FleetUpgradeReport {
+  return { target: '0.2.99', fleets, halted };
+}
+
+describe('fleetUpgradeExitCode / isMixedVersionRoll (macf#1146) — pure decision, one skip cause at a time', () => {
+  it('fully green (no skips, not halted) → 0', () => {
+    const report = mkReport([mkFleetReport({ rolled: mkRolled() })]);
+    expect(isMixedVersionRoll(report)).toBe(false);
+    expect(fleetUpgradeExitCode(report)).toBe(0);
+  });
+
+  it('halted → 1 (UNCHANGED pre-#1146 meaning), regardless of skip counts on the SAME fleet', () => {
+    const report = mkReport(
+      [mkFleetReport({ rolled: mkRolled({ halted: true, busySkipped: 3 }) })],
+      true,
+    );
+    expect(fleetUpgradeExitCode(report)).toBe(1);
+  });
+
+  it('busySkipped > 0, not halted → 2 (MIXED)', () => {
+    const report = mkReport([mkFleetReport({ rolled: mkRolled({ busySkipped: 1 }) })]);
+    expect(rollLeftAgentBehind(mkRolled({ busySkipped: 1 }))).toBe(true);
+    expect(isMixedVersionRoll(report)).toBe(true);
+    expect(fleetUpgradeExitCode(report)).toBe(2);
+  });
+
+  it('configDirtySkipped > 0, not halted → 2 (MIXED)', () => {
+    const report = mkReport([mkFleetReport({ rolled: mkRolled({ configDirtySkipped: 1 }) })]);
+    expect(rollLeftAgentBehind(mkRolled({ configDirtySkipped: 1 }))).toBe(true);
+    expect(isMixedVersionRoll(report)).toBe(true);
+    expect(fleetUpgradeExitCode(report)).toBe(2);
+  });
+
+  it('branchSkipped > 0, not halted → 2 (MIXED)', () => {
+    const report = mkReport([mkFleetReport({ rolled: mkRolled({ branchSkipped: 1 }) })]);
+    expect(rollLeftAgentBehind(mkRolled({ branchSkipped: 1 }))).toBe(true);
+    expect(isMixedVersionRoll(report)).toBe(true);
+    expect(fleetUpgradeExitCode(report)).toBe(2);
+  });
+
+  it('stalePinSkipped > 0, not halted → 2 (MIXED)', () => {
+    const report = mkReport([mkFleetReport({ rolled: mkRolled({ stalePinSkipped: 1 }) })]);
+    expect(rollLeftAgentBehind(mkRolled({ stalePinSkipped: 1 }))).toBe(true);
+    expect(isMixedVersionRoll(report)).toBe(true);
+    expect(fleetUpgradeExitCode(report)).toBe(2);
+  });
+
+  it('notYetServingSkipped > 0, not halted → 2 (MIXED)', () => {
+    const report = mkReport([mkFleetReport({ rolled: mkRolled({ notYetServingSkipped: 1 }) })]);
+    expect(rollLeftAgentBehind(mkRolled({ notYetServingSkipped: 1 }))).toBe(true);
+    expect(isMixedVersionRoll(report)).toBe(true);
+    expect(fleetUpgradeExitCode(report)).toBe(2);
+  });
+
+  it('configAutoResolved alone (no other skip) → 0 — an auto-resolved file is NOT a left-behind agent', () => {
+    const report = mkReport([mkFleetReport({ rolled: mkRolled({ configAutoResolved: 2 }) })]);
+    expect(rollLeftAgentBehind(mkRolled({ configAutoResolved: 2 }))).toBe(false);
+    expect(isMixedVersionRoll(report)).toBe(false);
+    expect(fleetUpgradeExitCode(report)).toBe(0);
+  });
+
+  it('a whole fleet SKIPPED (driver-unresolved, no rolled result at all) → 2 (MIXED)', () => {
+    const report = mkReport([mkFleetReport({ skipped: 'driver-unresolved' })]);
+    expect(isMixedVersionRoll(report)).toBe(true);
+    expect(fleetUpgradeExitCode(report)).toBe(2);
+  });
+
+  it('DECISIVE — one fleet HALTED + a SEPARATE fleet merely skipped → 1, not 2 (halt takes priority over mixed)', () => {
+    const report = mkReport(
+      [
+        mkFleetReport({ fleet: 'a', rolled: mkRolled({ halted: true }) }),
+        mkFleetReport({ fleet: 'b', rolled: mkRolled({ busySkipped: 1 }) }),
+      ],
+      true,
+    );
+    expect(fleetUpgradeExitCode(report)).toBe(1);
+  });
+});
+
+describe('runFleetUpgrade — the decisive pair (macf#1146): mixed vs. fully-green, end-to-end through real driver fixtures', () => {
+  const AGENTS = [{ name: 'a', registry: 'fleet-1' }] as const;
+
+  it('DECISIVE (1/2) — one busy-skipped agent, no halt → non-zero exit AND the banner names the mixed state', async () => {
+    const { driver, calls, workspaces } = makeDriver(AGENTS, {
+      base: '0.2.40',
+      target: '0.2.41',
+      isBusy: async () => true,
+    });
+    const { deps, lines } = makeDeps({
+      discover: () => workspaces,
+      defaultFleet: 'fleet-1',
+      resolveDriver: async () => driver,
+    });
+    const code = await runFleetUpgrade('/proj', { execute: true }, deps);
+    expect(code).toBe(2);
+    expect(calls.upgrade).toEqual([]); // busy-gated — never even entered the transaction
+    const out = lines.join('\n');
+    expect(out).toContain('MIXED VERSION FLEET');
+    expect(out).toContain('busy-skipped');
+  });
+
+  it('DECISIVE (2/2) — a fully-green roll → exit 0, no MIXED banner', async () => {
+    const { driver, calls, workspaces } = makeDriver(AGENTS, { base: '0.2.40', target: '0.2.41' });
+    const { deps, lines } = makeDeps({
+      discover: () => workspaces,
+      defaultFleet: 'fleet-1',
+      resolveDriver: async () => driver,
+    });
+    const code = await runFleetUpgrade('/proj', { execute: true }, deps);
+    expect(code).toBe(0);
+    expect(calls.upgrade).toEqual(['a']);
+    expect(lines.join('\n')).not.toContain('MIXED VERSION FLEET');
   });
 });

@@ -27,6 +27,7 @@ import {
   type FleetDriver,
   type FleetUpgradeReport,
   type FleetPlanReport,
+  type FleetRollResult,
   type AgentUpgradePlan,
   type UpgradeEvent,
   type WorkspaceRecord,
@@ -239,7 +240,96 @@ export function formatFleetReport(report: FleetPlanReport, target: string, log: 
   }
 }
 
-/** Render the full run report + return the shell exit code (halt ⇒ non-zero). */
+/**
+ * True when a fleet's EXECUTE-mode roll left at least one member un-upgraded
+ * for a reason OTHER than a halt — a pre-flight gate (branch / config-dirty /
+ * busy) or a post-restart skip (stale-pin / not-yet-serving). Deliberately
+ * excludes `configAutoResolved`: an auto-resolved file is committed
+ * automatically and the agent still proceeds to `'upgraded'` — it never left
+ * anyone behind. Pure — exported for tests (macf#1146).
+ */
+export function rollLeftAgentBehind(rolled: FleetRollResult): boolean {
+  return (
+    rolled.busySkipped > 0 ||
+    rolled.configDirtySkipped > 0 ||
+    rolled.branchSkipped > 0 ||
+    rolled.stalePinSkipped > 0 ||
+    rolled.notYetServingSkipped > 0
+  );
+}
+
+/**
+ * True when `report` (an EXECUTE-mode {@link FleetUpgradeReport}) is a MIXED
+ * VERSION roll: it did not HALT, but it also did not finish every agent at
+ * target. Two distinct shapes both count (macf#1146):
+ *
+ * - a per-agent skip inside a rolled fleet ({@link rollLeftAgentBehind});
+ * - a WHOLE fleet whose driver never resolved (`FleetPlanReport.skipped`,
+ *   e.g. `'driver-unresolved'`) — none of ITS members were even examined,
+ *   which is at least as much "left un-upgraded" as a single skipped agent.
+ *
+ * Before macf#1146, `renderReport` looked ONLY at `report.halted` — every
+ * one of the shapes here rendered success-shaped lines in the log AND
+ * returned exit 0 in the same breath. Pure — exported for tests.
+ */
+export function isMixedVersionRoll(report: FleetUpgradeReport): boolean {
+  return report.fleets.some((f) => f.skipped !== undefined || (f.rolled !== undefined && rollLeftAgentBehind(f.rolled)));
+}
+
+/**
+ * The EXECUTE-mode exit code for `report` (macf#1146). Three-valued,
+ * mirroring the THIRD-VALUE shape `fleet reconcile` already established
+ * (`@groundnuty/macf-core`'s `fleet-reconcile.ts`: `rc` 0/1/2 on a different
+ * severity axis — 0 nothing-to-do, 1 action-taken-or-needed, 2
+ * precondition/probe failure) rather than inventing a new convention here:
+ *
+ * - `0` — every fleet finished fully green: no halt, no fleet-level skip, no
+ *   per-agent skip.
+ * - `1` — UNCHANGED: at least one fleet HALTED (a confirmed or unconfirmable
+ *   bad release). This was already the sole non-zero code pre-macf#1146, so
+ *   a caller already treating `1` as "a release is broken, stop and
+ *   intervene" sees that signal unchanged. Checked FIRST — a halted fleet
+ *   always reports `1` even if a DIFFERENT fleet in the same report also has
+ *   a plain skip (multi-fleet halts stop the run before later fleets are
+ *   even attempted, so this ordering is mostly defensive).
+ * - `2` — NEW: not halted, but {@link isMixedVersionRoll}. Reusing `1` here
+ *   would conflate "a release is broken" with "routine follow-up needed
+ *   (wait for idle / commit dirt / switch branch / fix a pin / retry an
+ *   unreachable driver), then re-run" — two different operator responses a
+ *   single non-zero code can't tell apart. No caller in this repo branches
+ *   on the SPECIFIC value of `runFleetUpgrade`'s return (`index.ts`'s
+ *   action handler just forwards it via `process.exitCode`; nothing else
+ *   calls `runFleetUpgrade` at all — `bootstrap/apply-version.ts` calls
+ *   `upgradeFleets` directly, never this function), so introducing `2` does
+ *   not change any existing caller's behavior beyond the fix itself: a
+ *   caller doing the common `[ $? -ne 0 ]` check (the exact cron-wrapper gap
+ *   macf#1146 reports) now correctly sees non-zero for a mixed roll too.
+ *
+ * Pure — exported for tests.
+ */
+export function fleetUpgradeExitCode(report: FleetUpgradeReport): number {
+  if (report.halted) return 1;
+  return isMixedVersionRoll(report) ? 2 : 0;
+}
+
+/**
+ * The MIXED VERSION banner (macf#1146) — as loud as the exit code it
+ * accompanies. An operator scanning scrollback for "did this finish" must
+ * not have to count `•`/`SKIPPED` lines themselves to notice the fleet is
+ * still on mixed versions. User-facing text: no internal issue/DR
+ * references (structural guard, `no-internal-citations-in-user-facing-
+ * output.test.ts`).
+ */
+function logMixedVersionBanner(log: (s: string) => void): void {
+  log(
+    '\n⚠ MIXED VERSION FLEET — this roll did not halt, but it also did not finish every agent ' +
+      'at target (see the per-agent detail and any whole-fleet SKIPPED lines above). Re-run once ' +
+      'the flagged agents are idle, clean, on their canonical branch, and correctly pinned, or ' +
+      'once an unreachable fleet driver resolves.',
+  );
+}
+
+/** Render the full run report + return the shell exit code (halt or mixed ⇒ non-zero). */
 function renderReport(report: FleetUpgradeReport, execute: boolean, log: (s: string) => void): number {
   log(`Rolling fleet-upgrade — target macf@${report.target}  [${execute ? 'EXECUTE' : 'dry-run'}]`);
   for (const fleet of report.fleets) {
@@ -255,8 +345,9 @@ function renderReport(report: FleetUpgradeReport, execute: boolean, log: (s: str
     );
     return 0;
   }
-  if (report.halted) return 1;
-  return 0;
+  const code = fleetUpgradeExitCode(report);
+  if (code === 2) logMixedVersionBanner(log);
+  return code;
 }
 
 /**
