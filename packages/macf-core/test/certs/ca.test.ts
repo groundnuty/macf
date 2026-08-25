@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 import { mkdirSync, rmSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { pbkdf2Sync, createCipheriv, randomBytes } from 'node:crypto';
 import {
   createCA, encryptCAKey, decryptCAKey, loadCA, backupCAKey, recoverCAKey,
   isLikelyPemPrivateKey, encryptCAKeyV1Legacy, caCertFingerprint,
@@ -14,6 +15,32 @@ function tempDir(): string {
   const dir = join(tmpdir(), `macf-ca-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+// #1140: hand-build a v2 envelope at an arbitrary PBKDF2 iteration count,
+// mirroring `encryptCAKey`'s wire format WITHOUT paying the production
+// 600_000-iteration cost. Used only by the wrong-passphrase throw-rate
+// test below. The property under test there — that AES-CBC-decrypt-with-
+// wrong-key plus the PEM-shape check (#94) together reject every wrong
+// passphrase — is a statistical property of the block cipher, its padding
+// scheme, and `isLikelyPemPrivateKey`; it does not depend on how many
+// PBKDF2 rounds derived the (wrong) key material, only on the derived
+// bytes looking like uniformly random key/IV material either way.
+// Empirically verified before relying on this (packages/macf-core, #1140
+// investigation): 0/4300 combined trials slipped past both checks across
+// iters in {1, 1000, 600000} — same ~100% catch rate at every iter count.
+// Production correctness of the REAL 600k-iter path is covered elsewhere
+// in this file ("writes v2 JSON envelope with iter=600000", "round-trips
+// a realistic PEM body through encrypt/decrypt").
+function encryptCAKeyAtItersForTest(keyPem: string, passphrase: string, iters: number): string {
+  const salt = randomBytes(8);
+  const keyIv = pbkdf2Sync(passphrase, salt, iters, 48, 'sha256');
+  const key = keyIv.subarray(0, 32);
+  const iv = keyIv.subarray(32, 48);
+  const cipher = createCipheriv('aes-256-cbc', key, iv);
+  const encrypted = Buffer.concat([cipher.update(keyPem, 'utf-8'), cipher.final()]);
+  const payload = Buffer.concat([Buffer.from('Salted__'), salt, encrypted]).toString('base64');
+  return JSON.stringify({ v: 2, iter: iters, payload });
 }
 
 function mockClient(): GitHubVariablesClient {
@@ -139,20 +166,36 @@ describe('CA management', () => {
       // #99 added a PEM-shape check that closes the gap: wrong-passphrase
       // output never has both BEGIN+END markers, so throw rate is 100%.
       //
-      // At the post-#115 600k iter count, each PBKDF2 run is ~100× slower
-      // than the old 10k pre-#115 baseline; we use N=10 here (was 100 in
-      // the #99 test). The point is "all N throw", not "100 specifically."
-      // 10 iterations gives ~10^-12 confidence the gap hasn't reopened.
+      // #1140: this loop used to build its envelope via the REAL 600k-iter
+      // `encryptCAKey`, so N=10 wrong-passphrase decrypts (each paying a
+      // full pbkdf2Sync at 600_000 rounds) measured ~14-16s total — a
+      // 1.83x margin against the inline `{ timeout: 30_000 }` this test
+      // used to carry, below #1133's 2x bar. The property under test here
+      // — "all N throw" — doesn't depend on the PBKDF2 round count (see
+      // `encryptCAKeyAtItersForTest`'s comment above for why, plus an
+      // empirical cross-check across iters in {1, 1000, 600000}), so the
+      // envelope is now hand-built at a much lower iteration count instead
+      // of raising the timeout. N stays at 10 (unchanged) — the point is
+      // "all N throw", not "10 specifically" — and no inline timeout
+      // override is needed any more (measured well under the package
+      // default; see #1140 report for the numbers).
       const pem =
         '-----BEGIN PRIVATE KEY-----\n' +
         'MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQ' +
         'C7VJTUt9Us8cKjMzEfYyjiWA4R4/M2bS1GB4t7NXp98C3SC6dV\n' +
         '-----END PRIVATE KEY-----\n';
-      const encrypted = encryptCAKey(pem, 'correct-password');
+      const encrypted = encryptCAKeyAtItersForTest(pem, 'correct-password', 1000);
+      // Positive control (#1140): pins the hand-built envelope as genuinely
+      // decryptable with the correct passphrase, so the N throws below are
+      // attributable to the wrong passphrase specifically — not to a
+      // malformed fixture from `encryptCAKeyAtItersForTest` (which would
+      // otherwise make every assertion in this test vacuously true, since
+      // `decryptCAKey` also throws CaError on a bad envelope/format).
+      expect(decryptCAKey(encrypted, 'correct-password')).toBe(pem);
       for (let i = 0; i < 10; i++) {
         expect(() => decryptCAKey(encrypted, `wrong-${i}`)).toThrow(CaError);
       }
-    }, 30000);
+    });
 
     it('fails with wrong passphrase on v1-shaped legacy input (#115 — dual-read)', () => {
       // Same property on the v1 code path (fast: 10k iter) so we can
@@ -196,6 +239,12 @@ describe('CA management', () => {
     });
 
     it('fails with corrupted ciphertext (bit-flip) — #94 complement, v2 envelope (#115)', () => {
+      // #1140: dropped this test's inline `{ timeout: 15000 }` — it's now
+      // redundant with (and smaller than) the package-level `testTimeout`
+      // in vitest.config.ts, and the canonical `test-timeout-discriminator.md`
+      // corollary flags inline overrides as their own hazard (they silently
+      // defeat `--testTimeout` from the CLI). One real 600k-iter PBKDF2 call
+      // (encrypt) here, well inside the package default.
       const pem =
         '-----BEGIN PRIVATE KEY-----\n' +
         'MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQ' +
@@ -213,7 +262,7 @@ describe('CA management', () => {
         payload: bytes.toString('base64'),
       });
       expect(() => decryptCAKey(corrupted, 'pass')).toThrow(CaError);
-    }, 15000);
+    });
 
     it('rejects malformed v2 envelope (#115)', () => {
       // v2 JSON shape but missing required fields — must throw, not
