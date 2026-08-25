@@ -436,6 +436,40 @@ export interface FleetPlan {
    * for a fleet with nothing to report).
    */
   readonly installScopeDrift: readonly InstallScopeDrift[];
+  /**
+   * groundnuty/macf#1162 — the STANDING notice for a scope-level (owner-
+   * account-shared) credential this fleet holds a LOCAL COPY of rather
+   * than one it minted itself (today: only the router App's cross-fleet
+   * `'vault-reused'` outcome — see `fleet-manifest.ts::ScopeCredentialMarkerSchema`'s
+   * doc). Zero-to-N entries; today effectively 0-or-1 (one router role),
+   * same "cap follows the underlying fact, not an arbitrary limit" shape
+   * `installScopeDrift` already establishes. ALWAYS present on the TYPE
+   * (empty array when nothing applies); `--json` omits the key when empty,
+   * same convention every sibling notice array above follows.
+   *
+   * **Sourced from the MANIFEST declaration union the LOCK marker, not the
+   * lock alone** (`scopeCredentialNotices`'s doc) — this is what makes
+   * "surfaced on every run" true by construction: a fleet that has
+   * DECLARED `transport.router_app_origin_fleet` but hasn't `apply`'d yet
+   * (or applied without `--vault`, so `apply` never reached the
+   * `'vault-reused'` branch) still sees the notice, rather than reading
+   * silent until the marker happens to land in `fleet.lock`.
+   */
+  readonly scopeCredentials: readonly ScopeCredentialNotice[];
+}
+
+/**
+ * One scope-credential notice (groundnuty/macf#1162) — `message` is built
+ * ONCE here (not re-derived per renderer) so `formatScopeCredentialLines`
+ * and `fleetPlanToJson` never drift into two independently-worded copies
+ * of the same fact, same "one wording, reused" discipline
+ * `InstallScopeDrift.message` already establishes.
+ */
+export interface ScopeCredentialNotice {
+  readonly role: string;
+  /** `undefined` when neither the manifest nor `fleet.lock` names a source — the marker still renders, honestly incomplete, never silently absent. */
+  readonly originFleet?: string;
+  readonly message: string;
 }
 
 /**
@@ -977,6 +1011,36 @@ function runnerOpsItem(fleetName: string, lockHasEntry: boolean, needed: boolean
       'administration rights and is deliberately not widened to add them). Provisioning it costs 2 operator consent-gate clicks (App-manifest ' +
       'creation + install), same shape as a coordination agent App.',
     confirm_required: false,
+  };
+}
+
+/**
+ * groundnuty/macf#1162 — construct ONE {@link ScopeCredentialNotice} from a
+ * role + an optional origin-fleet name. Exported so `computePlan`'s
+ * manifest-∪-lock union (its call site, right after the `router_app` item
+ * push) and any future direct caller build the EXACT same wording — one
+ * function, never two independently-drafted copies of the same fact (same
+ * discipline {@link InstallScopeDrift}'s shared `validateInstallRepositoryScope`
+ * message-builder already establishes for its own surface).
+ *
+ * `originFleet: undefined` renders an HONEST "not declared" note rather
+ * than omitting the notice — the marker's whole point (per
+ * `fleet-manifest.ts::ScopeCredentialMarkerSchema`'s doc) is that it must
+ * never read as silently indistinguishable from genuine ownership, and
+ * that holds whether or not an origin was ever named.
+ */
+export function scopeCredentialNotice(role: string, originFleet: string | undefined): ScopeCredentialNotice {
+  const origin =
+    originFleet !== undefined
+      ? `fleet "${originFleet}"`
+      : 'an undeclared origin fleet (declare transport.router_app_origin_fleet in fleet.yaml to name it)';
+  return {
+    role,
+    ...(originFleet !== undefined ? { originFleet } : {}),
+    message:
+      `"${role}" App credential is scope-level and held LOCALLY on this fleet, not minted here — copied from ` +
+      `${origin}, pending a future shared-credential store. No action needed; this notice stays visible every run ` +
+      'until that store exists.',
   };
 }
 
@@ -1782,6 +1846,31 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
   // `tsOauthItem`'s doc).
   items.push(tsOauthItem(fleetName, manifest.transport.tailscale_oauth_required, observed.vaultTsOauth));
 
+  // groundnuty/macf#1162 — the scope-credential provenance notice, sourced
+  // from the MANIFEST declaration UNION the LOCK marker (never lock alone
+  // — see `FleetPlan.scopeCredentials`'s doc for why: a fleet that has
+  // declared `transport.router_app_origin_fleet` but hasn't `apply`'d yet,
+  // or applied without `--vault`, must still see the notice). Keyed by
+  // role (today only ever `router`) so a future non-router scope
+  // credential reuses this same union without a second copy of it.
+  const scopeCredentialOrigins = new Map<string, string | undefined>();
+  for (const marker of observed.lock?.scope_credentials ?? []) {
+    scopeCredentialOrigins.set(marker.role, marker.origin_fleet);
+  }
+  if (routerAppScope !== 'per-fleet' && manifest.transport.router_app_origin_fleet !== undefined) {
+    // The manifest's declared origin is the freshest operator statement —
+    // wins over whatever a PAST apply run happened to record in the lock
+    // (e.g. a fleet.yaml correction after the origin was misnamed). A
+    // `per-fleet`-scope fleet never gets a manifest-sourced notice here —
+    // that scope genuinely mints its own dedicated App, so a stray
+    // `router_app_origin_fleet` declaration on it would be a manifest
+    // inconsistency this function does not amplify into a false notice.
+    scopeCredentialOrigins.set(ROUTER_APP_ROLE, manifest.transport.router_app_origin_fleet);
+  }
+  const scopeCredentials: ScopeCredentialNotice[] = [...scopeCredentialOrigins.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([role, originFleet]) => scopeCredentialNotice(role, originFleet));
+
   for (const agent of manifest.agents) {
     const obs = observed.agents[agent.role];
     items.push(appItem(fleetName, agent, obs));
@@ -1914,6 +2003,7 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
     registryScopeIssues: registryScopeFailure !== undefined ? [registryScopeFailure] : [],
     registryRepoScopeNotices: registryRepoScopeNotice !== undefined ? [registryRepoScopeNotice] : [],
     installScopeDrift,
+    scopeCredentials,
   };
 }
 
@@ -1990,6 +2080,16 @@ export function formatRegistryRepoScopeLines(notices: readonly RegistryRepoScope
 /** groundnuty/macf#1128 — one line per already-provisioned agent App whose observed install scope is wrong. `WARNING`, not `NOTICE` (the sibling functions above): this is a LIVE observed fact about an EXISTING install, not a manifest-derived heads-up about a future one. */
 export function formatInstallScopeDriftLines(drift: readonly InstallScopeDrift[]): readonly string[] {
   return drift.map((d) => `install-scope: WARNING — ${d.message}`);
+}
+
+/**
+ * groundnuty/macf#1162 — one line per {@link ScopeCredentialNotice}. `NOTICE`
+ * (not `WARNING`) — this is a standing, expected-during-the-interim state,
+ * never a problem to fix; the whole point of surfacing it every run is
+ * visibility, not urgency (see `FleetPlan.scopeCredentials`'s doc).
+ */
+export function formatScopeCredentialLines(notices: readonly ScopeCredentialNotice[]): readonly string[] {
+  return notices.map((n) => `scope_credential: NOTICE — ${n.message}`);
 }
 
 // --- Operator interaction budget (groundnuty/macf#880, DR-044 Decision 6) ---
@@ -2207,6 +2307,10 @@ export function formatPlanText(plan: FleetPlan): string {
   if (installScopeDriftLines.length > 0) {
     parts.push('', ...installScopeDriftLines);
   }
+  const scopeCredentialLines = formatScopeCredentialLines(plan.scopeCredentials);
+  if (scopeCredentialLines.length > 0) {
+    parts.push('', ...scopeCredentialLines);
+  }
   return parts.join('\n');
 }
 
@@ -2247,6 +2351,8 @@ export function fleetPlanToJson(plan: FleetPlan): unknown {
     // `registry_scope_issues`/`registry_repo_scope_notice` do: byte-identical
     // `--json` output for a fleet with nothing to report.
     ...(plan.installScopeDrift.length > 0 ? { install_scope_drift: plan.installScopeDrift.map((i) => ({ ...i })) } : {}),
+    // groundnuty/macf#1162 — SAME omitted-when-empty convention, same reason.
+    ...(plan.scopeCredentials.length > 0 ? { scope_credentials: plan.scopeCredentials.map((i) => ({ ...i })) } : {}),
   };
 }
 

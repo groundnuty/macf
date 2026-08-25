@@ -5,7 +5,7 @@
  * separately).
  */
 import { describe, it, expect } from 'vitest';
-import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
+import type { FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import {
   APPLY_UNIMPLEMENTED_REASONS,
   computePlan,
@@ -15,11 +15,13 @@ import {
   formatOperatorInteractionLine,
   formatPlanText,
   formatRegistryScopeLines,
+  formatScopeCredentialLines,
   formatSkippedLines,
   formatUnimplementedLines,
   operatorInteractionBudget,
   operatorInteractionToJson,
   planItemApplyCoverage,
+  scopeCredentialNotice,
   summarizePlan,
   UNKNOWN_REASONS,
   type InstallScopeDrift,
@@ -1852,6 +1854,85 @@ describe('computePlan installScopeDrift — already-provisioned-fleet repository
     expect('install_scope_drift' in json).toBe(true);
     expect(Array.isArray(json.install_scope_drift)).toBe(true);
     expect((json.install_scope_drift as unknown[]).length).toBe(1);
+  });
+});
+
+// --- groundnuty/macf#1162 — the scope-credential provenance notice, the
+// DECISIVE PAIR: a fleet holding a scope-level (cross-fleet-copied) router
+// credential gets a standing notice naming its origin; a fleet whose router
+// it genuinely owns gets NONE — otherwise the notice means nothing (per
+// assert-the-wrong-path.md, the negative half is what gives the positive
+// half meaning). ---
+describe('computePlan scopeCredentials — router App scope-level provenance notice (groundnuty/macf#1162)', () => {
+  it('is empty (and the key omitted from --json) when nothing is declared and fleet.lock carries no marker', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.scopeCredentials).toEqual([]);
+    const json = fleetPlanToJson(plan) as Record<string, unknown>;
+    expect('scope_credentials' in json).toBe(false);
+    expect(formatPlanText(plan)).not.toContain('scope_credential:');
+  });
+
+  it('DECISIVE 1/2: transport.router_app_origin_fleet DECLARED (no apply run yet — lock is null) -> the notice still appears, naming the origin', () => {
+    const manifest = baseManifest({ transport: { age_recipients: [], router_app_origin_fleet: 'macf-fresh-1' } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(plan.scopeCredentials).toEqual([
+      { role: 'router', originFleet: 'macf-fresh-1', message: expect.stringContaining('macf-fresh-1') as unknown as string },
+    ]);
+    expect(plan.scopeCredentials[0]?.message).toContain('scope-level');
+    expect(plan.scopeCredentials[0]?.message).toContain('held LOCALLY');
+    const text = formatPlanText(plan);
+    expect(text).toContain('scope_credential: NOTICE');
+    expect(text).toContain('macf-fresh-1');
+  });
+
+  it('the marker in fleet.lock (declared origin at apply time) ALSO surfaces, even without a manifest declaration THIS run', () => {
+    const lock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      scope_credentials: [{ role: 'router', scope: 'scope-level', held: 'locally', origin_fleet: 'macf-fresh-1', pending: 'scope-store' }],
+    };
+    const observed: ObservedState = { ...EMPTY_OBSERVED, lock };
+    // No transport.router_app_origin_fleet declared THIS run — the lock
+    // marker is the ONLY source, and it must still surface (union, not
+    // lock-alone would ALSO pass this, but lock-alone alone must too).
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.scopeCredentials).toEqual([{ role: 'router', originFleet: 'macf-fresh-1', message: expect.any(String) as unknown as string }]);
+  });
+
+  it('undeclared origin (neither manifest nor lock names one) still renders — never silently indistinguishable from ownership', () => {
+    const lock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      scope_credentials: [{ role: 'router', scope: 'scope-level', held: 'locally', pending: 'scope-store' }],
+    };
+    const observed: ObservedState = { ...EMPTY_OBSERVED, lock };
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.scopeCredentials).toHaveLength(1);
+    expect(plan.scopeCredentials[0]?.originFleet).toBeUndefined();
+    expect(plan.scopeCredentials[0]?.message).toMatch(/undeclared origin fleet/);
+  });
+
+  it('DECISIVE 2/2: router_app_scope: per-fleet (genuine ownership) -> NO notice, even if router_app_origin_fleet is stray-declared', () => {
+    const manifest = baseManifest({
+      transport: { age_recipients: [], router_app_scope: 'per-fleet', router_app_origin_fleet: 'macf-fresh-1' },
+    });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(plan.scopeCredentials).toEqual([]);
+    expect(formatPlanText(plan)).not.toContain('scope_credential:');
+  });
+
+  it('formatScopeCredentialLines — one line per entry, "scope_credential: NOTICE — <message>"', () => {
+    expect(formatScopeCredentialLines([{ role: 'router', originFleet: 'x', message: 'the provenance text' }])).toEqual(['scope_credential: NOTICE — the provenance text']);
+  });
+
+  it('scopeCredentialNotice — declared origin vs undeclared render DIFFERENT wording, not the same fallback text', () => {
+    const declared = scopeCredentialNotice('router', 'origin-fleet');
+    const undeclared = scopeCredentialNotice('router', undefined);
+    expect(declared.message).not.toBe(undeclared.message);
+    expect(declared.originFleet).toBe('origin-fleet');
+    expect(undeclared.originFleet).toBeUndefined();
   });
 });
 
