@@ -42,8 +42,8 @@ describe('macf init --app-key ingestion (macf#530)', () => {
     warnSpy.mockRestore();
   });
 
-  it('defaultAgentKeyPath returns ~/.macf/keys/<agent>.pem', () => {
-    expect(defaultAgentKeyPath('auditor')).toBe(join(homedir(), '.macf', 'keys', 'auditor.pem'));
+  it('defaultAgentKeyPath returns ~/.macf/keys/<project>/<agent>.pem', () => {
+    expect(defaultAgentKeyPath('TEST', 'auditor')).toBe(join(homedir(), '.macf', 'keys', 'TEST', 'auditor.pem'));
   });
 
   it('ingests --app-key into --key-path with 0600 perms', async () => {
@@ -89,14 +89,14 @@ describe('macf init --app-key ingestion (macf#530)', () => {
     expect(msg).toMatch(/--app-key/);
   });
 
-  it('defaults key_path to ~/.macf/keys/<agent>.pem when --key-path omitted', async () => {
+  it('defaults key_path to ~/.macf/keys/<project>/<agent>.pem when --key-path omitted', async () => {
     // Unique agent name → the real-home path certainly does not exist, and with
     // no --app-key nothing is written there.
     const agent = `eph-${Math.random().toString(36).slice(2)}`;
 
     await initAgent(dir, { ...baseOpts, name: agent });
 
-    expect(readAgentConfig(dir)!.github_app!.key_path).toBe(defaultAgentKeyPath(agent));
+    expect(readAgentConfig(dir)!.github_app!.key_path).toBe(defaultAgentKeyPath(baseOpts.project, agent));
     expect(warnSpy).toHaveBeenCalled();
   });
 });

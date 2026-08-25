@@ -53,8 +53,9 @@ export interface InitOptions {
   readonly keyPath?: string;
   /**
    * Source path of the downloaded App private key (.pem) to INGEST into the
-   * conventional destination (`--key-path`, default `~/.macf/keys/<agent>.pem`)
-   * with `0600` perms at init time. Closes the macf#530 "pointer set without
+   * conventional destination (`--key-path`, default
+   * `~/.macf/keys/<project>/<agent>.pem` — macf#1157) with `0600` perms at
+   * init time. Closes the macf#530 "pointer set without
    * the thing it points to" papercut — without ingestion the operator must
    * hand-`cp` the key and a wrong path/perm surfaces later as a cryptic
    * `gh` 401, not at init.
@@ -338,11 +339,44 @@ export function defaultLocalRegistryPath(project: string): string {
 }
 
 /**
- * Conventional per-agent App-key destination: `~/.macf/keys/<agent>.pem`
- * (macf#530). Absolute (homedir-rooted) so the token helper resolves it from
- * any cwd — same cross-repo-cwd discipline as the registry path.
+ * Conventional per-agent App-key destination: `~/.macf/keys/<project>/<agent>.pem`
+ * (macf#530; fleet/project-scoped as of macf#1157). Absolute (homedir-rooted)
+ * so the token helper resolves it from any cwd — same cross-repo-cwd
+ * discipline as the registry path.
+ *
+ * **Scoped by `project` since macf#1157** — the pre-#1157 shape was bare
+ * `~/.macf/keys/<agent>.pem` (no project/fleet segment), which let two
+ * fleets on the SAME host that happen to share a role name (e.g.
+ * `code-agent`) collide on ONE on-disk key: whichever fleet deployed second
+ * would either overwrite the first fleet's key or (with the fingerprint
+ * guard from macf#975 in place) refuse loud, since the on-disk key's
+ * identity never matches the second fleet's vault entry. `project` here IS
+ * "fleet" in `macf bootstrap`/`macf fleet deploy` terms —
+ * `bootstrap/fleet-deploy.ts::deployAgent` passes `manifest.metadata.name`
+ * straight through as `InitOptions.project` — so this brings the key path
+ * into line with the SAME scoping unit {@link defaultLocalRegistryPath} and
+ * `config.ts::caDir` already use for the registry file and the per-project
+ * CA (`caDir`'s own doc: "One subdirectory per project prevents collisions
+ * when multiple MACF projects share a machine" — the identical rationale,
+ * applied here to keys for the first time).
  */
-export function defaultAgentKeyPath(agentName: string): string {
+export function defaultAgentKeyPath(project: string, agentName: string): string {
+  return join(homedir(), '.macf', 'keys', project, `${agentName}.pem`);
+}
+
+/**
+ * The pre-#1157 FLAT (unscoped) key path: `~/.macf/keys/<agent>.pem` — no
+ * project/fleet segment. Kept as a READ-ONLY back-compat fallback (macf#1157
+ * "read-old-write-new" decision — see the issue + `defaultAgentKeyPath`'s
+ * own doc): an operator's pre-existing single-fleet key at this location
+ * keeps resolving without a forced migration. Nothing in this codebase ever
+ * WRITES here anymore — every fresh materialization lands at the
+ * project-scoped {@link defaultAgentKeyPath}. Exported so
+ * `bootstrap/fleet-deploy.ts` can apply the SAME fallback (there, gated on
+ * a vault fingerprint match — see that module's `resolveDefaultKeyPath`) as
+ * `ingestAndResolveKeyPath` below does for a direct `macf init` run.
+ */
+export function legacyAgentKeyPath(agentName: string): string {
   return join(homedir(), '.macf', 'keys', `${agentName}.pem`);
 }
 
@@ -361,10 +395,27 @@ export function defaultAgentKeyPath(agentName: string): string {
  * (key rotation is a deliberate op, not an init side effect).
  *
  * Returns the path to record in `agent_config.github_app.key_path` (the
- * conventional `~/.macf/keys/<agent>.pem` unless `--key-path` overrides).
+ * conventional `~/.macf/keys/<project>/<agent>.pem` unless `--key-path`
+ * overrides, or a pre-#1157 legacy key is found in place — see the
+ * macf#1157 "read-old-write-new" comment inline below).
  */
 function ingestAndResolveKeyPath(opts: InitOptions, agentName: string, absDir: string): string {
-  const keyPathForConfig = opts.keyPath ?? defaultAgentKeyPath(agentName);
+  const conventionalKeyPath = defaultAgentKeyPath(opts.project, agentName);
+  // macf#1157 "read-old-write-new": when the operator hasn't pinned
+  // --key-path AND isn't ingesting FRESH key material (--app-key), fall
+  // back to the pre-#1157 flat legacy path IF a key already lives there —
+  // an existing single-fleet workspace's key keeps resolving with no
+  // forced migration. A fresh --app-key ingest NEVER falls back here: it
+  // always lands at the (project-scoped) conventional path, so a brand-new
+  // SECOND project reusing a role name never mistakes an unrelated
+  // project's legacy key for its own (the exact collision #1157 reports —
+  // there is no vault to fingerprint-check against here, unlike
+  // `fleet-deploy.ts`'s `resolveDefaultKeyPath`, so the fresh-ingest case
+  // must never even consider the legacy path).
+  const noFreshIngest = opts.appKey === undefined || opts.appKey === '';
+  const usesLegacyPath =
+    opts.keyPath === undefined && noFreshIngest && !existsSync(conventionalKeyPath) && existsSync(legacyAgentKeyPath(agentName));
+  const keyPathForConfig = opts.keyPath ?? (usesLegacyPath ? legacyAgentKeyPath(agentName) : conventionalKeyPath);
   const destAbs = isAbsolute(keyPathForConfig)
     ? keyPathForConfig
     : resolve(absDir, keyPathForConfig);
