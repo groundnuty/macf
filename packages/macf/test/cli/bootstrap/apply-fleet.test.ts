@@ -4911,6 +4911,95 @@ trust:
     // just re-assert what that test already covers.
   });
 
+  // groundnuty/macf#1156 — the gate-2 instruction an operator reads and the
+  // live coverage check that verifies what they did with it must derive
+  // from the SAME runtime value. Before this fix, `installReposForIdentity`
+  // (which drives the interstitial/terminal instruction AND the `--dry-run`
+  // preview) never consulted `registry` at all — an operator who followed
+  // the instruction exactly (select exactly the ONE repo named) produced an
+  // install `registry-repo-coverage.ts`'s live check then correctly
+  // REFUSED, because the instruction never named the control repo the check
+  // requires. See `apply-agent.ts::installReposForIdentity` + this issue's
+  // own body for the live `macf-fresh-science-agent` incident this closes.
+  describe('groundnuty/macf#1156 — the gate-2 instruction and its coverage check must not independently drift', () => {
+    it('DECISIVE: the interstitial repo list and the coverage check\'s owner/repo are asserted against EACH OTHER — neither side against a hand-typed literal', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = repoScopedManifest();
+      // Both values below are captured from the REAL runtime call — never
+      // recomputed by re-invoking `installReposForIdentity` or
+      // `requiredRegistryRepoCoverage` a second time inside this test. A
+      // test that rebuilt "the expected repo" by calling the SAME helper
+      // the production code calls would pass even if some OTHER caller
+      // bypassed that helper entirely (assert-the-wrong-path.md trigger 1)
+      // — the only assertion that actually exercises the #1156 hazard is
+      // "what the interstitial showed" vs. "what the check verified",
+      // cross-referenced against each other.
+      let seenInstructionRepos: readonly string[] | undefined;
+      const agentDeps: AgentApplyDeps = {
+        ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+        startInstallInterstitial: async (opts) => {
+          // Filtered to the agent under test — this fixture's fleet ALSO
+          // creates the router App through the same shared `AgentApplyDeps`
+          // object (`baseDeps`'s own doc), and the router App's install
+          // target is the registry alone (`routerAppInstallRepos`), a
+          // different — and separately correct — list this test isn't
+          // about.
+          if (opts.role === 'code-agent') seenInstructionRepos = opts.repos;
+          return { startUrl: 'http://x/install', close: async () => {} };
+        },
+      };
+      let seenCheckOwner: string | undefined;
+      let seenCheckRepo: string | undefined;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDeps, manifestPath),
+        checkRegistryRepoCoverage: async (_appId, _keyPath, owner, repo) => {
+          seenCheckOwner = owner;
+          seenCheckRepo = repo;
+          return 'present';
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('created');
+      expect(seenCheckOwner).toBeDefined();
+      expect(seenCheckRepo).toBeDefined();
+      expect(seenInstructionRepos).toBeDefined();
+      // THE decisive assertion: the repo the live check verified is a
+      // member of the list the instruction told the operator to select —
+      // both sides read from the actual apply run, not from a literal
+      // either side of this test typed out by hand.
+      expect(seenInstructionRepos).toContain(`${seenCheckOwner}/${seenCheckRepo}`);
+      // And the agent's own home repo is STILL there — #1156 folds the
+      // control repo IN, it does not replace the agent's own repo.
+      expect(seenInstructionRepos).toContain('groundnuty/demo-code');
+    });
+
+    it('a non-repo-scoped registry (profile scope): the instruction lists the agent repo ONLY — no spurious control-repo entry', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]); // default owner.registry.type === 'profile'
+      let seenInstructionRepos: readonly string[] | undefined;
+      const agentDeps: AgentApplyDeps = {
+        ...agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'),
+        startInstallInterstitial: async (opts) => {
+          if (opts.role === 'code-agent') seenInstructionRepos = opts.repos;
+          return { startUrl: 'http://x/install', close: async () => {} };
+        },
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDeps, manifestPath),
+        checkRegistryRepoCoverage: async () => {
+          throw new Error('must not be called — registry.type is "profile", not "repo"');
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('created');
+      expect(seenInstructionRepos).toEqual(['groundnuty/demo-code']);
+    });
+  });
+
   // groundnuty/macf#1016 — #1012/#1015's registry-repo coverage check can
   // only fire once `confirmBeforeCreateGuard` reaches `reuse-confirmed`/
   // `resume-install`, which needs `AgentApplyDeps.resolveKeyPath` wired

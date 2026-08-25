@@ -149,6 +149,7 @@ import type { ConfirmedInstall, ExpectedIdentity, IdentityConfirmation, WaitForA
 import { appSettingsAdvancedUrl } from './app-identity-removal.js';
 import { appNameCollisionRefusalMessage, resolveAppPresenceStatus } from './app-presence.js';
 import type { Presence } from './plan.js';
+import { requiredRegistryRepoCoverage } from './registry-repo-coverage.js';
 
 // --- Confirm-before-create guard ---
 
@@ -688,21 +689,61 @@ export interface IdentityRequest {
 }
 
 /**
+ * Which declared-agent identities the registry-repo-coverage requirement
+ * applies to (groundnuty/macf#1156) — `role` matches a declared
+ * `manifest.agents[].role` (every ordinary coordination agent). The
+ * runner-ops fallback (`role` with no match) is deliberately EXCLUDED: it
+ * never touches the registry (`apply-fleet.ts`'s own per-agent-loop doc:
+ * "never the runner-ops, below — it never touches the registry"), so
+ * folding the control repo into ITS install list would grant access this
+ * identity structurally never uses — the same over-broad-scope reasoning
+ * `installWhyText` already applies to `administration: write`.
+ */
+function registryControlRepoFor(role: string, manifest: FleetManifest): string | undefined {
+  const isOrdinaryAgent = manifest.agents.some((a) => a.role === role);
+  if (!isOrdinaryAgent) return undefined;
+  const coverage = requiredRegistryRepoCoverage(manifest);
+  return coverage === undefined ? undefined : `${coverage.owner}/${coverage.repo}`;
+}
+
+/**
  * The EXACT repos consent gate 2's interstitial names for this identity
  * (groundnuty/macf#952) — derived from the manifest, never a hand-maintained
  * parallel list. A `role` that matches a declared `manifest.agents[].role`
- * (every ordinary coordination agent) is scoped to just its OWN home repo —
+ * (every ordinary coordination agent) is scoped to its OWN home repo —
  * `FleetAgentSchema` already enforces one repo per role (`fleet-manifest.ts`'s
- * "every agent needs its own home repo" uniqueness check), so that repo is
- * the entire, unambiguous answer. A `role` with NO match (today, only the
- * runner-ops — `RUNNER_OPS_ROLE` is deliberately never declared in
- * `fleet.yaml`'s `agents[]`, per `apply-runner-ops.ts`'s doc) needs to mint
- * runner-registration tokens for ANY of the fleet's repos, so every declared
- * agent's repo is listed.
+ * "every agent needs its own home repo" uniqueness check) — PLUS the fleet's
+ * control repo when `registry.type === 'repo'` (groundnuty/macf#1156, below).
+ * A `role` with NO match (today, only the runner-ops — `RUNNER_OPS_ROLE` is
+ * deliberately never declared in `fleet.yaml`'s `agents[]`, per
+ * `apply-runner-ops.ts`'s doc) needs to mint runner-registration tokens for
+ * ANY of the fleet's repos, so every declared agent's repo is listed — this
+ * branch is UNCHANGED by #1156 (see {@link registryControlRepoFor}'s doc for
+ * why the runner-ops is excluded from the control-repo addition).
+ *
+ * **groundnuty/macf#1156 — the control-repo fold-in.** `#1012`/`#1015`
+ * require every ordinary agent App's installation to ALSO cover the
+ * registry repo when `registry.type === 'repo'` — a LIVE fact
+ * `registry-repo-coverage.ts`'s `buildRegistryRepoValidateInstall` verifies
+ * post-gate-2 and REFUSES on. Before this fix, this function never
+ * consulted `registry` at all: the gate-2 instruction (and the
+ * `--dry-run`/pre-approval preview, `bootstrap-apply.ts::plannedAppCreations`
+ * — which calls this SAME function) told the operator to select exactly one
+ * repo, the operator did, and the coverage check then correctly refused the
+ * result — the live incident this issue reports. `requiredRegistryRepoCoverage`
+ * (`registry-repo-coverage.ts`) is the SAME derivation `apply-fleet.ts`'s
+ * per-agent loop reads to build the live check itself — one function, so
+ * the instruction an operator follows and the check that verifies it cannot
+ * independently drift (the `#1136` precedent this issue cites). `own.includes`
+ * guards the pathological case where an agent's home repo IS the control
+ * repo — no duplicate entry.
  */
 export function installReposForIdentity(role: string, manifest: FleetManifest): readonly string[] {
   const match = manifest.agents.find((a) => a.role === role);
-  return match !== undefined ? [match.repo] : manifest.agents.map((a) => a.repo);
+  if (match === undefined) return manifest.agents.map((a) => a.repo);
+  const own = [match.repo];
+  const controlRepo = registryControlRepoFor(role, manifest);
+  return controlRepo === undefined || own.includes(controlRepo) ? own : [...own, controlRepo];
 }
 
 /**
@@ -715,18 +756,24 @@ export function installReposForIdentity(role: string, manifest: FleetManifest): 
  * function). Every other identity (DR-019's set — no `administration` at
  * all) gets a generic but still concrete reason: broader access is unused
  * capability, not a convenience.
+ *
+ * `registryControlRepo` (groundnuty/macf#1156), when given, appends a
+ * ONE-CLAUSE reason for the extra repo `installReposForIdentity` folded in —
+ * "an operator who understands *why* will not mis-fix it later" (the
+ * issue's own acceptance criterion). `undefined` (every call site except
+ * `applyIdentity`'s ordinary-agent branch when the registry is repo-scoped)
+ * keeps this function's return byte-identical to before this parameter
+ * existed.
  */
-export function installWhyText(permissions: Readonly<Record<string, string>> | undefined): string {
-  if (permissions?.['administration'] === 'write') {
-    return (
-      'Why: this App holds administration:write; granting it every repository in the account is blast radius ' +
-      'the fleet does not need, and apply will refuse an "all" install.'
-    );
-  }
-  return (
-    'Why: this App only needs access to the repo(s) listed above — granting every repository in the account is ' +
-    'broader access than this identity uses.'
-  );
+export function installWhyText(permissions: Readonly<Record<string, string>> | undefined, registryControlRepo?: string): string {
+  const base =
+    permissions?.['administration'] === 'write'
+      ? 'Why: this App holds administration:write; granting it every repository in the account is blast radius ' +
+        'the fleet does not need, and apply will refuse an "all" install.'
+      : 'Why: this App only needs access to the repo(s) listed above — granting every repository in the account is ' +
+        'broader access than this identity uses.';
+  if (registryControlRepo === undefined) return base;
+  return `${base} ${registryControlRepo} is included because this App must read the fleet registry.`;
 }
 
 /**
@@ -758,7 +805,13 @@ export async function applyIdentity(
   // `request.installRepos`, when supplied, wins outright (see
   // `IdentityRequest.installRepos`'s doc for why the router App needs this).
   const repos = request.installRepos ?? installReposForIdentity(role, manifest);
-  const whyText = installWhyText(request.permissions);
+  // groundnuty/macf#1156 — the one-clause "why" for the control repo ONLY
+  // when `installReposForIdentity`'s OWN derivation (not an
+  // `installRepos` override — the router App's override already targets
+  // the registry directly, for a different reason `installWhyText`'s doc
+  // doesn't need to restate) actually folded it in.
+  const registryControlRepo = request.installRepos === undefined ? registryControlRepoFor(role, manifest) : undefined;
+  const whyText = installWhyText(request.permissions, registryControlRepo);
 
   let decision: CreateGuardDecision;
   try {
