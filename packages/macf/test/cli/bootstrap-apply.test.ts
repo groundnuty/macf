@@ -13,7 +13,7 @@
  * bypassing it for automation.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -22,6 +22,8 @@ import {
   resolveVaultAgentPems,
   plannedAppCreations,
   formatPlannedAppCreations,
+  formatAppCreationsHeader,
+  recoveryResumableRoles,
   formatApplyResult,
   fleetApplyResultToJson,
   applyExitCode,
@@ -39,8 +41,11 @@ import { parseFleetLock } from '../../src/cli/bootstrap/fleet-manifest.js';
 import { computePlan } from '../../src/cli/bootstrap/plan.js';
 import type { ObservedState, UnimplementedApplyItem } from '../../src/cli/bootstrap/plan.js';
 import type { FleetApplyResult } from '../../src/cli/bootstrap/apply-fleet.js';
+import { applyAgentIdentity } from '../../src/cli/bootstrap/apply-agent.js';
 import type { AgentApplyDeps } from '../../src/cli/bootstrap/apply-agent.js';
+import { registryRepoNotInstalledReason, registryRepoRetryInstruction } from '../../src/cli/bootstrap/registry-repo-coverage.js';
 import type { AppCredentials } from '../../src/cli/bootstrap/manifest-exchange.js';
+import type { ConfirmedInstall, IdentityConfirmation } from '../../src/cli/bootstrap/identity-confirm.js';
 import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../src/cli/bootstrap/apply-routing-client.js';
 import type { RoutingSecretsPublishDeps } from '../../src/cli/bootstrap/apply-routing-secrets.js';
@@ -48,7 +53,13 @@ import { TAILSCALE_OAUTH_MISSING_CODE } from '../../src/cli/bootstrap/apply-rout
 import type { RunnerRegistrationDeps } from '../../src/cli/bootstrap/apply-routing.js';
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../src/cli/bootstrap/apply-routing.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle } from '../../src/cli/bootstrap/apply-runner-ops.js';
-import { VaultError, buildVaultPlaintext, type VaultAgentSecrets, type VaultRunnerOpsSecrets } from '../../src/cli/bootstrap/vault-write.js';
+import {
+  VaultError,
+  buildVaultPlaintext,
+  operatorRecoveryArtifactPath,
+  type VaultAgentSecrets,
+  type VaultRunnerOpsSecrets,
+} from '../../src/cli/bootstrap/vault-write.js';
 import { parseVaultPlaintext, vaultRouterAppId, vaultRouterAppKeyPem } from '../../src/cli/bootstrap/vault-read.js';
 import { ROUTER_APP_ROLE } from '../../src/cli/bootstrap/apply-router-app.js';
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../src/cli/bootstrap/registry-scope-preflight.js';
@@ -449,6 +460,280 @@ describe('plannedAppCreations (pure)', () => {
     const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
     const codeAgent = creations.find((c) => c.role === 'code-agent');
     expect(codeAgent?.installRepos).toEqual(['groundnuty/demo-code']);
+  });
+});
+
+// --- groundnuty/macf#1165 — the preview must not contradict a resumed gate ---
+
+describe('recoveryResumableRoles (pure) — groundnuty/macf#1165', () => {
+  const manifest = parseFleetManifest(FLEET_YAML_WITH_ROUTING);
+  const plan = computePlan(manifest, EMPTY_OBSERVED);
+  const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER); // code-agent, science-agent, runner-ops, router
+
+  it('returns [] when identityKeyPath is undefined, even when roles overlap — an artifact cannot be decrypted without --identity-key', () => {
+    expect(recoveryResumableRoles(creations, ['code-agent'], undefined)).toEqual([]);
+  });
+
+  it('returns [] when no recovery artifacts are available at all', () => {
+    expect(recoveryResumableRoles(creations, [], '/fake/identity.txt')).toEqual([]);
+  });
+
+  it('intersects the creations roles with availableRecoveryRoles when identityKeyPath IS supplied', () => {
+    expect(recoveryResumableRoles(creations, ['code-agent', 'runner-ops'], '/fake/identity.txt')).toEqual(['code-agent', 'runner-ops']);
+  });
+
+  it('ignores an available-recovery role that is NOT among creations (e.g. an unrelated stale .age file)', () => {
+    expect(recoveryResumableRoles(creations, ['science-agent', 'not-a-declared-role'], '/fake/identity.txt')).toEqual(['science-agent']);
+  });
+});
+
+describe('formatAppCreationsHeader (pure) — groundnuty/macf#1165', () => {
+  it("bound 'exact' -> plain count, never the ceiling framing (unreachable in practice — operatorInteractionBudget's own contract guarantees 'maximum' whenever count > 0 — but the header derives from the field rather than assuming it, so this stays independently correct)", () => {
+    const out = formatAppCreationsHeader(2, 'exact', []);
+    expect(out).toContain('GitHub Apps that would be created (2)');
+    expect(out).not.toContain('Up to');
+    expect(out).not.toContain('ceiling');
+  });
+
+  it("bound 'maximum' -> 'Up to N' + explicit ceiling framing naming the live gate as authoritative", () => {
+    const out = formatAppCreationsHeader(3, 'maximum', []);
+    expect(out).toContain('Up to 3 GitHub Apps may be created');
+    expect(out).toContain('ceiling, not a promise');
+    expect(out).toContain('live gate is authoritative');
+  });
+
+  it('names excluded recovery-resumable roles explicitly rather than silently dropping them from the count', () => {
+    const out = formatAppCreationsHeader(1, 'maximum', ['code-agent', 'science-agent']);
+    expect(out).toContain('Not counted here');
+    expect(out).toContain('code-agent, science-agent');
+    expect(out).toMatch(/recovery artifact/);
+  });
+
+  it('singular phrasing when count is 1', () => {
+    expect(formatAppCreationsHeader(1, 'maximum', [])).toContain('Up to 1 GitHub App may be created');
+  });
+});
+
+describe('formatPlannedAppCreations — excludedRecoveryRoles threading (groundnuty/macf#1165)', () => {
+  const manifest = parseFleetManifest(FLEET_YAML_WITH_ROUTING);
+  const plan = computePlan(manifest, EMPTY_OBSERVED);
+  const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
+
+  it('names the excluded role in the header, and the role NOT passed in `creations` gets no bullet at all — while a REMAINING role\'s own "select exactly" bullet is untouched (groundnuty/macf#952/#1128/#1156 must survive)', () => {
+    // Caller-side filtering, mirroring exactly what `runBootstrapApply` now
+    // does: `creations` here is ALREADY the post-exclusion list (this
+    // function never re-derives the exclusion itself — see its own doc).
+    const filtered = creations.filter((c) => c.role !== 'code-agent');
+    const out = formatPlannedAppCreations(filtered, 0, ['code-agent']);
+    expect(out).toContain('Not counted here');
+    expect(out).toContain('code-agent');
+    expect(out).not.toMatch(/role: code-agent/);
+    // science-agent is unaffected — the EXACT pre-existing bullet text.
+    expect(out).toContain('select exactly: groundnuty/demo-science');
+  });
+
+  it('the zero-creations branch also names an excluded recovery-resumable role, rather than reading as "nothing to do at all"', () => {
+    const out = formatPlannedAppCreations([], 0, ['code-agent']);
+    expect(out).toMatch(/No GitHub Apps would be created/);
+    expect(out).toContain('code-agent');
+    expect(out).toMatch(/recovery artifact/);
+  });
+
+  it('excludedRecoveryRoles defaults to [] — every pre-#1165 2-arg call site stays byte-identical', () => {
+    const out = formatPlannedAppCreations(creations, 0);
+    expect(out).not.toContain('Not counted here');
+  });
+});
+
+describe('DECISIVE — the preview never claims a repo the live gate does not (groundnuty/macf#1165)', () => {
+  // groundnuty/macf#1156's own repo-registry fixture — code-agent's full
+  // required set is its own repo PLUS the control repo, the exact two-repo
+  // shape #1164's resumed-gate fix narrows down to a delta of one.
+  const repoRegistryManifest = parseFleetManifest(FLEET_YAML_WITH_REPO_REGISTRY);
+  const codeAgentFixture = repoRegistryManifest.agents.find((a) => a.role === 'code-agent')!;
+  const CANDIDATE_REPOS = ['groundnuty/demo-code', 'demo-org/demo-org-control'];
+
+  /**
+   * Test-LOCAL probe — never calls `installReposForIdentity` or any other
+   * production derivation to build the candidate set (assert-the-wrong-path.md
+   * trigger 1: a test whose expectation is built by the SAME helper as the
+   * code under test can never fail). `CANDIDATE_REPOS` is a plain literal
+   * matching this describe block's own hand-typed fixture.
+   */
+  function reposNamedIn(text: string): string[] {
+    return CANDIDATE_REPOS.filter((r) => text.includes(r));
+  }
+
+  const RECOVERED: AppCredentials = {
+    appId: 'recovered-app-id',
+    name: 'demo-org-code-agent',
+    slug: 'demo-org-code-agent',
+    clientId: 'Iv1.recovered',
+    clientSecret: 'SENTINEL-RECOVERED-CLIENT-SECRET',
+    webhookSecret: 'SENTINEL-RECOVERED-WEBHOOK-SECRET',
+    pem: '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-RECOVERED-PEM\n-----END RSA PRIVATE KEY-----\n',
+  };
+  const CONFIRMED_INSTALL: ConfirmedInstall = {
+    appId: RECOVERED.appId,
+    installId: '9999',
+    appSlug: RECOVERED.slug,
+    accountLogin: 'demo-org',
+    repositorySelection: 'selected',
+  };
+
+  function baseDeps(overrides: Partial<AgentApplyDeps> = {}): AgentApplyDeps {
+    return {
+      startManifestFlow: async () => ({
+        startUrl: 'http://127.0.0.1:9/',
+        redirectUrl: 'http://127.0.0.1:9/callback',
+        waitForCode: async () => 'the-code',
+        close: async () => {},
+      }),
+      startInstallInterstitial: async () => ({ startUrl: 'http://127.0.0.1:9/interstitial', close: async () => {} }),
+      exchangeManifestCode: async () => RECOVERED,
+      waitForAppInstallation: async (opts) => ({
+        appId: opts.appId,
+        installId: '9999',
+        appSlug: RECOVERED.slug,
+        accountLogin: 'demo-org',
+        repositorySelection: 'selected',
+      }),
+      confirmAppInstallation: async () => ({ status: 'unconfirmable' }) as IdentityConfirmation,
+      openUrl: async () => {},
+      log: () => {},
+      writeRecoveryArtifact: async () => {},
+      ...overrides,
+    };
+  }
+
+  it('for a resumed agent (recovery artifact + confirmed-but-insufficient install): the preview never names a repo the gate does not', async () => {
+    // Drive the REAL gate — the SAME production path groundnuty/macf#1164 fixed.
+    const logs: string[] = [];
+    const deps = baseDeps({
+      log: (l) => logs.push(l),
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
+      findRecoveryArtifact: async () => RECOVERED,
+      validateInstall: () => ({
+        message: registryRepoNotInstalledReason('demo-org-code-agent', 'demo-org', 'demo-org-control'),
+        retryInstruction: registryRepoRetryInstruction('demo-org-code-agent', 'demo-org', 'demo-org-control'),
+      }),
+    });
+    await applyAgentIdentity(codeAgentFixture, repoRegistryManifest, undefined, deps);
+    const gateRepos = reposNamedIn(logs.join('\n'));
+    // Sanity: the fixture genuinely exercises #1164's resumed-delta path —
+    // ONLY the missing repo, never the already-covered one.
+    expect(gateRepos).toEqual(['demo-org/demo-org-control']);
+
+    // Drive the FIXED preview for the SAME role, with THIS issue's own
+    // exclusion applied (a recovery artifact is available for this role,
+    // and --identity-key was supplied this run).
+    const plan = computePlan(repoRegistryManifest, EMPTY_OBSERVED);
+    const creations = plannedAppCreations(repoRegistryManifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
+    const excluded = recoveryResumableRoles(creations, ['code-agent'], '/fake/identity.txt');
+    const previewCreations = creations.filter((c) => !excluded.includes(c.role));
+    const previewText = formatPlannedAppCreations(previewCreations, 0, excluded);
+    const previewRepos = reposNamedIn(previewText);
+
+    // THE decisive assertion — compared against the gate's OWN real output,
+    // never against a hand-typed literal on either side.
+    expect(previewRepos.filter((r) => !gateRepos.includes(r))).toEqual([]);
+  });
+
+  it('pre-fix regression proof: the UNFILTERED preview (no exclusion applied) WOULD have claimed a repo the gate does not — this is the live incident', () => {
+    const plan = computePlan(repoRegistryManifest, EMPTY_OBSERVED);
+    const creations = plannedAppCreations(repoRegistryManifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
+    // The pre-#1165 call shape: no exclusion applied at all.
+    const unfilteredRepos = reposNamedIn(formatPlannedAppCreations(creations));
+    // The naive full-list preview claims BOTH repos for code-agent...
+    expect(unfilteredRepos).toEqual(CANDIDATE_REPOS);
+    // ...but the resumed gate (proven above, same fixture) only ever asks
+    // for the control repo. The naive preview's claim on `demo-code` is
+    // exactly the disagreement this issue reports.
+    expect(unfilteredRepos).toContain('groundnuty/demo-code');
+  });
+
+  it('first-run case (nothing to resume): preview and gate name the SAME full set — both obtained by running real code, neither typed as a literal', async () => {
+    const logs: string[] = [];
+    // No findRecoveryArtifact, no prior confirm -> the ordinary fresh-create
+    // path; `runGate2WithInterstitial`'s DEFAULT instructionLines uses the
+    // SAME `installReposForIdentity`-derived `repos` the preview's own
+    // `installRepos` field does (see `apply-agent.ts::applyIdentity`).
+    const deps = baseDeps({ log: (l) => logs.push(l) });
+    const outcome = await applyAgentIdentity(codeAgentFixture, repoRegistryManifest, undefined, deps);
+    expect(outcome.status).toBe('created');
+    const gateRepos = reposNamedIn(logs.join('\n'));
+
+    const plan = computePlan(repoRegistryManifest, EMPTY_OBSERVED);
+    const creations = plannedAppCreations(repoRegistryManifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
+    const previewRepos = reposNamedIn(formatPlannedAppCreations(creations));
+
+    expect(gateRepos).toEqual(CANDIDATE_REPOS); // sanity: the fixture exercises the full two-repo set
+    expect(previewRepos).toEqual(gateRepos);
+  });
+});
+
+describe('runBootstrapApply --dry-run — recovery-resumable exclusion end-to-end (groundnuty/macf#1165)', () => {
+  const dirs: string[] = [];
+  let logs: string[];
+
+  beforeEach(() => {
+    logs = [];
+    vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => logs.push(a.join(' ')));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function writeManifest(body = FLEET_YAML): string {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-apply-1165-test-'));
+    dirs.push(dir);
+    const p = join(dir, 'fleet.yaml');
+    writeFileSync(p, body);
+    return p;
+  }
+
+  function stubRecoveryArtifact(fleetName: string, role: string): void {
+    const recoveryDir = mkdtempSync(join(tmpdir(), 'macf-apply-1165-recovery-'));
+    dirs.push(recoveryDir);
+    const artifactPath = operatorRecoveryArtifactPath(recoveryDir, fleetName, role);
+    mkdirSync(join(artifactPath, '..'), { recursive: true });
+    writeFileSync(artifactPath, 'SENTINEL-RECOVERY-ARTIFACT-BYTES');
+    vi.stubEnv('MACF_RECOVERY_DIR', recoveryDir);
+  }
+
+  it('WITH --identity-key: a role with an available recovery artifact is excluded from "would be created", named in the header, and folded into the gate-2 budget', async () => {
+    const file = writeManifest();
+    stubRecoveryArtifact('demo-fleet', 'code-agent');
+    const code = await runBootstrapApply(
+      { file, dryRun: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), readVault: async () => ({}) },
+    );
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    // code-agent's own bullet is gone — the live incident's exact shape.
+    expect(out).not.toMatch(/demo-fleet-code-agent\s+\(role: code-agent/);
+    // science-agent, with no recovery artifact, remains a genuine create-candidate.
+    expect(out).toMatch(/demo-fleet-science-agent\s+\(role: science-agent/);
+    // Named, not silently vanished from the count.
+    expect(out).toContain('Not counted here');
+    expect(out).toContain('code-agent');
+  });
+
+  it('WITHOUT --identity-key: the SAME available artifact does NOT exclude the role — findRecoveryArtifact cannot decrypt it this run, so it genuinely still creates (honest-unknown floor cuts both ways)', async () => {
+    const file = writeManifest();
+    stubRecoveryArtifact('demo-fleet', 'code-agent');
+    const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    expect(out).toMatch(/demo-fleet-code-agent\s+\(role: code-agent/);
+    expect(out).not.toContain('Not counted here');
+    // The pre-existing, separate recovery-artifact notice still fires (macf#988) —
+    // unaffected by this issue.
+    expect(out).toMatch(/Durable recovery artifact\(s\) found for: code-agent/);
   });
 });
 
