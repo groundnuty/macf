@@ -144,6 +144,7 @@ import {
   appInstallationUrl,
   confirmAppInstallation as realConfirmAppInstallation,
   waitForAppInstallation as realWaitForAppInstallation,
+  sleep,
 } from './identity-confirm.js';
 import type { ConfirmedInstall, ExpectedIdentity, IdentityConfirmation, WaitForAppInstallationOptions } from './identity-confirm.js';
 import { appSettingsAdvancedUrl } from './app-identity-removal.js';
@@ -856,21 +857,21 @@ export async function applyIdentity(
     // touching `runGate2` again.
     const rejection = await deps.validateReuse?.(decision.install, decision.keyPath);
     if (rejection !== undefined) {
-      const { message, retryInstruction, missingRepos } = rejectionParts(rejection);
+      const { message, missingRepos } = rejectionParts(rejection);
       deps.log(`Role "${role}": REFUSED on reuse — ${message}`);
-      // groundnuty/macf#1063 — the ONE edge back to the gate this issue adds.
-      // Pre-#1063 this branch `return`ed here unconditionally (the module
-      // doc's own words: "never touching `runGate2` again") — a role that
-      // was ALREADY provisioned, re-confirmed live on THIS run, but whose
-      // install scope has drifted (or was wrong from the start) had no path
-      // back to consent gate 2 short of a full manual re-provision. Retrying
-      // re-runs the SAME gate-2 UX (`runGate2WithInterstitial`, never a
-      // second gate path) with `deps.validateReuse` itself as the
-      // re-check — not `validateInstall` — so a caller that wires the two
-      // hooks differently (today none do; `apply-fleet.ts` wires both to the
-      // SAME closure) still gets re-verified against the check that
-      // actually rejected it.
-      const retried = await retryRecoverableGate2Rejection(
+      // groundnuty/macf#1178 — auto-open the SAME gate-2 install page (the
+      // operator's own ruling: a tool precise enough to name the fix can
+      // open the page instead of a menu-walk) and auto-POLL for the fix
+      // (`pollForInstallFix` — never a manual "press Enter once you've
+      // fixed it," which is exactly the click the ruling removes). This
+      // REPLACES #1063's reopen-then-manual-recheck loop for this branch —
+      // an already-provisioned role re-confirmed on a re-run, whose
+      // install scope has drifted (or was wrong from the start), used to
+      // have no path back to consent gate 2 short of a full manual
+      // re-provision (module doc's own words: "never touching `runGate2`
+      // again"); this is that path, made unconditional rather than
+      // interactive-only.
+      const retried = await runGate2WithInterstitial(
         role,
         decision.install.appId,
         decision.keyPath,
@@ -881,12 +882,13 @@ export async function applyIdentity(
         whyText,
         deps,
         {
-          role,
-          status: 'failed',
-          reason: `existing install re-verification rejected: ${message}`,
-          recoverable: true,
-          ...(retryInstruction !== undefined ? { retryInstruction } : {}),
-          ...(missingRepos !== undefined ? { missingRepos } : {}),
+          instructionLines: gate2ResumedInstructionLines(rejection),
+          ...(missingRepos !== undefined ? { repoNamesOverride: missingRepos } : {}),
+          waitStrategy: pollForInstallFix,
+          // groundnuty/macf#1178 — the App is ALREADY installed on this
+          // path; the button the operator actually clicks is "Save" (adding
+          // a repo under Repository access), never "Install" again.
+          waitLabel: 'Save',
         },
         deps.validateReuse,
       );
@@ -1183,11 +1185,13 @@ async function skipGate2IfAlreadyInstalled(
  * check, which has no single "missing repo" to name) falls back to its own
  * `message`; still strictly better than the prior full-list text, which
  * never mentioned the scope problem at all.
- * Also used (groundnuty/macf#1175) as the terminal-only explanation printed
- * directly by {@link resumeGate2Preflight} when the resumed gate refuses
- * WITHOUT opening a page — see that function's doc for why the same two
- * sentences now reach the operator via `deps.log` rather than via
- * `runGate2WithInterstitial`'s `instructionLines`.
+ * Also used (groundnuty/macf#1178) as {@link runGate2WithInterstitial}'s
+ * `opts.instructionLines` for BOTH resumed-gate entry points
+ * ({@link resumeGate2Preflight}'s pre-flight-detected rejection, and
+ * `applyIdentity`'s `reuse-confirmed` branch) — printed on the terminal AND
+ * the served page (the SAME `messageLines` single source #1174
+ * established), immediately before the page auto-opens and
+ * {@link pollForInstallFix} starts polling.
  */
 function gate2ResumedInstructionLines(rejection: InstallRejection): readonly string[] {
   const { message, retryInstruction } = rejectionParts(rejection);
@@ -1202,58 +1206,34 @@ function gate2ResumedInstructionLines(rejection: InstallRejection): readonly str
  * split out purely to keep that function's own body scannable (same
  * reasoning `runGate2` was already extracted for). `viaRecovery: false`
  * (the fresh-mint path) never even calls {@link skipGate2IfAlreadyInstalled}
- * — same as before this issue — and always resolves `{}`, the ordinary
- * full-list first attempt.
+ * — same as before this issue — and always resolves `{ opts: {} }`, the
+ * ordinary full-list first attempt.
  *
  * On `viaRecovery: true`, resolves ONE of three shapes:
  *   - `earlyOutcome` set — the pre-flight found an already-good install;
  *     `finishGate2FromCredentials` returns it, skipping gate 2 entirely
  *     (unchanged from groundnuty/macf#1137).
- *   - `reopenRecoverable` set — groundnuty/macf#1175: the pre-flight found
+ *   - `opts.waitStrategy` set — groundnuty/macf#1178: the pre-flight found
  *     an install that already exists but is INSUFFICIENT (the SAME
  *     already-computed rejection {@link gate2ResumedInstructionLines} used
- *     to narrate). **This is the fix for #1175's live bug.** The pre-#1175
- *     code passed this case to `runGate2WithInterstitial` as an ordinary
- *     "first attempt" — which opens a page, prints "waiting for you to
- *     click Install," and then polls `waitForAppInstallation`. But that
- *     poll checks immediately and returns on the FIRST call once ANY
- *     confirmed install exists on the expected target
- *     (`identity-confirm.ts::waitForAppInstallation`) — repo-scope is a
- *     SEPARATE check this function's caller runs after. Since the install
- *     already exists (that is WHY the pre-flight ran at all), the poll
- *     resolves instantly, `validateInstall` re-runs against the SAME
- *     unchanged install, and rejects again — all before the operator could
- *     read the page, let alone act on it (three live reproductions; see
- *     the issue). There is no new event for a wait to be waiting FOR: the
- *     install won't change until the operator edits it, and nothing this
- *     process does can make that happen sooner.
- *
- *     Two honest responses existed: (a) poll installation CONTENTS for a
- *     CHANGE instead of mere existence, or (b) admit there is nothing to
- *     wait for right now and ask the operator to fix it outside this run.
- *     (a) needs its own timeout budget and risks an unattended run hanging
- *     on a fix that may never come; (b) cannot hang, is exactly as
- *     actionable (the fix instruction is identical either way), and is the
- *     SAME shape this module already uses for the `reuse-confirmed` +
- *     `validateReuse`-rejects path (`applyIdentity`'s `decision.action ===
- *     'reuse-confirmed'` branch, just above `runGate2WithInterstitial`'s
- *     own doc) — that branch ALSO builds a `recoverable: true` outcome by
- *     hand and hands it straight to {@link retryRecoverableGate2Rejection}
- *     WITHOUT a first "blind" gate-2 attempt. This function takes (b), for
- *     consistency with that established pattern: `finishGate2FromCredentials`
- *     feeds `reopenRecoverable` straight into
- *     {@link retryRecoverableGate2Rejection} as the STARTING outcome,
- *     skipping `runGate2WithInterstitial`'s "first attempt" entirely. In
- *     the default (unattended / `--yes`) posture — `deps.allowInstallRetry`
- *     unset — that retry loop is itself a no-op (its own doc), so NO page
- *     opens and NO "waiting for you to click" is ever printed for a wait
- *     that cannot happen: the operator gets an immediate, honest refusal
- *     naming what to fix, via `deps.log` (mirrored below) AND the final
- *     `AgentApplyOutcome.reason`. When an operator HAS opted into
- *     interactive retries (`allowInstallRetry` + `waitForOperatorFix`), the
- *     SAME retry loop reopens the page with a genuine post-open wait — the
- *     tool this module already has for "let the operator act, then
- *     re-check," reused rather than duplicated.
+ *     to narrate). **This is the operator's own reversal of #1175's
+ *     choice.** #1175 found the live bug here: opening a page and printing
+ *     "waiting for you to click Install" was a LIE, because
+ *     `waitForAppInstallation` (the DEFAULT wait strategy) resolves on the
+ *     very FIRST poll once ANY confirmed install exists on the expected
+ *     target — repo-scope is a SEPARATE check `validateInstall` runs
+ *     after, so the "wait" never actually waits (three live
+ *     reproductions — the served page was gone before it could even be
+ *     fetched). #1175's OWN fix chose to stop claiming a wait at all:
+ *     refuse immediately, unconditionally under `--yes`, with a menu-walk
+ *     to fix it "outside the run." The operator overruled that: *"a tool
+ *     that can detect the problem precisely enough to describe the remedy
+ *     in six menu steps can open the page instead."* {@link pollForInstallFix}
+ *     is the honest version of the wait #1175 gave up on — it polls the
+ *     installation's CONTENTS (re-running `validateInstall` on every tick,
+ *     not merely re-confirming existence), bounded, unconditionally (never
+ *     gated on `allowInstallRetry`/a manual "press Enter" — the operator's
+ *     own words: *"do not expect me to click anything manually"*).
  *   - neither set — the pre-flight learned nothing (no confirmed install to
  *     check, or the confirm itself couldn't observe one) — the ordinary
  *     full-list attempt, honest-unknown floor: no observation, no delta
@@ -1266,42 +1246,30 @@ async function resumeGate2Preflight(
   expected: ExpectedIdentity,
   pemPath: string,
   deps: AgentApplyDeps,
-): Promise<{ readonly earlyOutcome?: AgentApplyOutcome; readonly reopenRecoverable?: Gate2Outcome }> {
-  if (!viaRecovery) return {};
+): Promise<{
+  readonly earlyOutcome?: AgentApplyOutcome;
+  readonly opts: {
+    readonly instructionLines?: readonly string[];
+    readonly repoNamesOverride?: readonly string[];
+    readonly waitStrategy?: WaitStrategy;
+    readonly waitLabel?: string;
+  };
+}> {
+  if (!viaRecovery) return { opts: {} };
   const preflight = await skipGate2IfAlreadyInstalled(role, creds, expected, pemPath, deps);
-  if (preflight.action === 'skip-gate-2') return { earlyOutcome: preflight.outcome };
-  if (preflight.rejection === undefined) return {};
+  if (preflight.action === 'skip-gate-2') return { earlyOutcome: preflight.outcome, opts: {} };
+  if (preflight.rejection === undefined) return { opts: {} };
 
-  const { message, retryInstruction, missingRepos } = rejectionParts(preflight.rejection);
-  for (const line of gate2ResumedInstructionLines(preflight.rejection)) {
-    deps.log(`Role "${role}": ${line}`);
-  }
-  // groundnuty/macf#1175 — gated on `allowInstallRetry`, NOT unconditional.
-  // When the operator has opted into interactive retries,
-  // `retryRecoverableGate2Rejection` (fed `reopenRecoverable` below) DOES
-  // reopen the page with a genuine `postOpenWait` — printing "not opening a
-  // wait page … re-run apply" here unconditionally would then contradict
-  // that page's own "Reopening the install page … I will re-check
-  // automatically once you do" a few lines later in the SAME transcript
-  // (the exact same-transcript-contradiction class groundnuty/macf#1165/
-  // #1168 already fixed twice, applied to a new pair of lines). Only the
-  // unattended (`allowInstallRetry` unset) posture is honest to say "not
-  // waiting" — that is the ONLY posture where nothing further waits.
-  if (deps.allowInstallRetry !== true) {
-    deps.log(
-      `Role "${role}": not opening a wait page for this — the install already exists, so a page claiming to ` +
-        'wait would resolve on its very first check against the SAME insufficient install, before you could ' +
-        `act on it. Make the change on GitHub (${appInstallationUrl(creds.slug)}), then re-run apply.`,
-    );
-  }
+  const { missingRepos } = rejectionParts(preflight.rejection);
   return {
-    reopenRecoverable: {
-      role,
-      status: 'failed',
-      reason: `consent gate 2 (install) rejected: ${message}`,
-      recoverable: true,
-      ...(retryInstruction !== undefined ? { retryInstruction } : {}),
-      ...(missingRepos !== undefined ? { missingRepos } : {}),
+    opts: {
+      instructionLines: gate2ResumedInstructionLines(preflight.rejection),
+      ...(missingRepos !== undefined ? { repoNamesOverride: missingRepos } : {}),
+      waitStrategy: pollForInstallFix,
+      // groundnuty/macf#1178 — the App is ALREADY installed on this path;
+      // the button the operator actually clicks is "Save," never "Install"
+      // again.
+      waitLabel: 'Save',
     },
   };
 }
@@ -1348,23 +1316,33 @@ async function finishGate2FromCredentials(
   try {
     const preflight = await resumeGate2Preflight(viaRecovery, role, creds, gate2Expected, pemPath, deps);
     if (preflight.earlyOutcome !== undefined) return preflight.earlyOutcome;
-    // groundnuty/macf#1175 — `reopenRecoverable`, when set, is a
-    // pre-flight-detected confirmed-but-insufficient install: skip the
-    // "blind" first `runGate2WithInterstitial` attempt entirely (see
-    // `resumeGate2Preflight`'s doc for why that attempt's wait cannot ever
-    // actually wait here) and feed it straight to the SAME recoverable-
-    // rejection retry every other path gets, below.
-    const firstAttempt =
-      preflight.reopenRecoverable ??
-      (await runGate2WithInterstitial(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, {}));
-    // groundnuty/macf#1063 — the SAME recoverable-rejection retry the
-    // resume-install path gets (see that call site's doc); a no-op unless
-    // `firstAttempt` is a recoverable `validateInstall` rejection AND
-    // `deps.allowInstallRetry` is set. `pemPath` stays alive across every
-    // retry — it's cleaned up once, in this function's own `finally`, only
-    // after the LAST attempt returns.
-    const outcome = await retryRecoverableGate2Rejection(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, firstAttempt);
+    const firstAttempt = await runGate2WithInterstitial(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, preflight.opts);
+    // groundnuty/macf#1178 — when the pre-flight already detected a
+    // confirmed-but-insufficient install, `preflight.opts.waitStrategy` was
+    // set and `firstAttempt` already came from `pollForInstallFix`, which
+    // polled for the run's ENTIRE gate budget on its own (unconditionally —
+    // never gated on `allowInstallRetry`). Feeding that outcome into
+    // `retryRecoverableGate2Rejection`'s manual reopen-and-press-Enter loop
+    // would just repeat the same wait a second time behind a flag the
+    // operator's ruling removed the need for. Run the #1063 retry loop
+    // ONLY for the ordinary create-path first attempt, unchanged from
+    // before this issue.
+    const outcome =
+      preflight.opts.waitStrategy !== undefined
+        ? firstAttempt
+        : await retryRecoverableGate2Rejection(role, creds.appId, pemPath, gate2Expected, creds.slug, appInstallationUrl(creds.slug), repos, whyText, deps, firstAttempt);
     if (outcome.status === 'failed') {
+      // groundnuty/macf#1178 — a failure that already went through
+      // `pollForInstallFix` carries its OWN complete, actionable reason
+      // (states the poll bound, leads with the action, ends with a
+      // clearly-marked last-resort). The "App WAS created… orphaned"
+      // framing below is accurate ONLY for a install that genuinely never
+      // completed (a `waitForAppInstallation` timeout) — reusing it here
+      // would call a fully-installed App "orphaned" over a repo-scope gap,
+      // which is factually wrong and was never what this wrapper meant.
+      if (preflight.opts.waitStrategy !== undefined) {
+        return { role, status: 'failed', reason: outcome.reason };
+      }
       // Gate 1 succeeded but gate 2 didn't — see the module doc's "gate
       // 1→2 window" section. The App EXISTS on GitHub; give the operator a
       // direct, actionable recovery path rather than just "it failed."
@@ -1451,6 +1429,15 @@ type Gate2Outcome =
 type ValidateInstallHook = (install: ConfirmedInstall, keyPath: string) => InstallRejection | undefined | Promise<InstallRejection | undefined>;
 
 /**
+ * groundnuty/macf#1178 — the pluggable "how do we wait" step
+ * {@link runGate2WithInterstitial} runs after the page opens. Exactly
+ * `runGate2`'s own signature, so {@link pollForInstallFix} is a drop-in
+ * swap for it — every existing call site that omits `waitStrategy` gets
+ * `runGate2` (byte-identical to before this field existed).
+ */
+type WaitStrategy = (role: string, appId: string, keyPath: string, expected: ExpectedIdentity, deps: AgentApplyDeps, validate: ValidateInstallHook | undefined) => Promise<Gate2Outcome>;
+
+/**
  * Runs the gate-2 poll. Cleanup of `keyPath` (when it's a scratch file this
  * module owns) is the CALLER's job — see call sites.
  *
@@ -1514,6 +1501,139 @@ async function runGate2(
   } catch (err) {
     return { role, status: 'failed', reason: `consent gate 2 (install) failed: ${errMessage(err)}` };
   }
+}
+
+/**
+ * Overall budget for {@link pollForInstallFix} — matches
+ * `identity-confirm.ts::waitForAppInstallation`'s own default (10 min, "one
+ * operator round trip," not a network-flake retry budget), reused here for
+ * the SAME reason: a gate-2 wait's budget is an operator-timescale
+ * quantity, not a request-timescale one. Overridable via `deps.gateTimeoutMs`
+ * (the SAME "overall budget for EACH gate" field every other gate-2 wait
+ * already reads).
+ */
+const RESUMED_GATE_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Poll interval for {@link pollForInstallFix} — deliberately LONGER than
+ * `identity-confirm.ts::waitForAppInstallation`'s 3s default. Every tick
+ * here costs at least ONE live GitHub read (`deps.confirmAppInstallation`,
+ * itself a `gh token generate` subprocess + a fetch) PLUS whatever
+ * `validate` does (for the registry-repo-coverage hook: a SECOND JWT mint +
+ * fetch) — double the per-tick cost of the existence-only poll this
+ * mirrors. The operator also needs real navigation time (open GitHub, find
+ * the picker, type the name, click Save) that a 3s cadence has no chance of
+ * beating; a slower cadence trades imperceptible latency for a meaningfully
+ * smaller request budget over a multi-minute wait.
+ */
+const RESUMED_GATE_POLL_INTERVAL_MS = 15_000;
+
+/**
+ * groundnuty/macf#1178 — poll for the install's CONTENTS to change, not
+ * merely for an install to exist. This is the fix for the defect #1175
+ * found and then sidestepped: `waitForAppInstallation` (the DEFAULT
+ * {@link WaitStrategy}) resolves the instant ANY confirmed install exists
+ * on the expected target, so on a resumed gate (where an install already
+ * exists — that's WHY this strategy is used instead) it never actually
+ * waits for anything. This function re-confirms the install AND re-runs
+ * `validate` on EVERY tick — the SAME check that rejected in the first
+ * place — so the loop keeps polling until `validate` actually accepts, or
+ * the budget runs out. **Never gated on `AgentApplyDeps.allowInstallRetry`
+ * / `waitForOperatorFix`** — those are the manual "press Enter once you've
+ * fixed it" primitive the operator's own ruling removes the need for: "do
+ * not expect me to click anything manually … apply should detect problems
+ * and display automatic pop-ups for me to click." This poll IS the
+ * automatic detection; no keypress confirms it.
+ *
+ * Exactly `runGate2`'s signature (a drop-in {@link WaitStrategy}) — reuses
+ * `deps.confirmAppInstallation`, the SAME primitive
+ * `confirmBeforeCreateGuard`/`skipGate2IfAlreadyInstalled` already use,
+ * rather than a second "is it installed" implementation. `validate`
+ * carries the SAME default `runGate2` itself carries
+ * (`deps.validateInstall`) — `runGate2WithInterstitial`'s resumed-gate call
+ * sites never pass a `validate` argument, relying on this default; without
+ * it, an omitted `validate` would silently mean "accept anything," and
+ * every confirmed install would resolve the poll instantly regardless of
+ * whether it's actually fixed.
+ */
+async function pollForInstallFix(
+  role: string,
+  appId: string,
+  keyPath: string,
+  expected: ExpectedIdentity,
+  deps: AgentApplyDeps,
+  validate: ValidateInstallHook | undefined = deps.validateInstall,
+): Promise<Gate2Outcome> {
+  const timeoutMs = deps.gateTimeoutMs ?? RESUMED_GATE_POLL_TIMEOUT_MS;
+  const pollIntervalMs = deps.pollIntervalMs ?? RESUMED_GATE_POLL_INTERVAL_MS;
+  const deadline = Date.now() + timeoutMs;
+  let last: { readonly message: string; readonly retryInstruction?: string; readonly missingRepos?: readonly string[] } | undefined;
+
+  for (;;) {
+    const confirmation = await deps.confirmAppInstallation(appId, keyPath, expected);
+    if (confirmation.status === 'confirmed') {
+      const rejection = await validate?.(confirmation.install, keyPath);
+      if (rejection === undefined) {
+        deps.log(`Role "${role}": install corrected (install_id ${confirmation.install.installId}) — apply detected it automatically.`);
+        return { role, status: 'resumed-install', appId, installId: confirmation.install.installId };
+      }
+      last = rejectionParts(rejection);
+    } else {
+      // The install this poll was opened for is no longer confirmed at all
+      // (e.g. removed mid-wait) — still worth polling (it's still "the
+      // install changing," just not toward success yet); log so this isn't
+      // silently indistinguishable from an unchanging rejection.
+      deps.log(`Role "${role}": WARNING — the install is no longer confirmed while waiting for a fix (${confirmation.status}) — still polling.`);
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return {
+        role,
+        status: 'failed',
+        reason: resumedGateTimeoutMessage(timeoutMs, last),
+        recoverable: true,
+        ...(last?.retryInstruction !== undefined ? { retryInstruction: last.retryInstruction } : {}),
+        ...(last?.missingRepos !== undefined ? { missingRepos: last.missingRepos } : {}),
+      };
+    }
+    await sleep(Math.min(pollIntervalMs, remaining));
+  }
+}
+
+/**
+ * The timeout `reason` {@link pollForInstallFix} builds when its budget
+ * runs out (groundnuty/macf#1178). **Leads with the action** (`last`'s own
+ * `retryInstruction`/`message` — already phrased action-first, see
+ * `registryRepoNotInstalledReason`'s doc), states the bound **in seconds**
+ * (mirrors `identity-confirm.ts::waitForInstallTimeoutMessage`'s own
+ * `${Math.round(timeoutMs/1000)}s` — a rounded-to-minutes bound would print
+ * a false "1 minute" for a sub-minute test/operator-configured budget,
+ * exactly the "a diagnostic that names the wrong cause is a small lie"
+ * class that function's own doc warns about), and puts the destructive
+ * option LAST, explicitly marked as a last resort — never adjacent to the
+ * routine fix (the operator's standing rule: removal must never be easy).
+ * `last === undefined` (the poll never observed even one rejection — should
+ * not happen for how this is wired, but defensive) falls back to a generic
+ * sentence rather than crashing on a field read.
+ *
+ * `timeoutMs < 1000` prints milliseconds instead of a rounded-to-`0s`
+ * value — `Math.round(timeoutMs/1000)` would print the LITERAL FALSE
+ * "polled for 0s" for any sub-second budget (an artificially small
+ * `gateTimeoutMs`, whether test-injected or operator-configured for a
+ * fast-iterate debug run) — the exact "a diagnostic that names the wrong
+ * cause is a small lie" class this function's own doc already avoids for
+ * the minutes-vs-seconds choice.
+ */
+function resumedGateTimeoutMessage(timeoutMs: number, last: { readonly message: string; readonly retryInstruction?: string } | undefined): string {
+  const bound = timeoutMs < 1000 ? `${String(timeoutMs)}ms` : `${String(Math.round(timeoutMs / 1000))}s`;
+  const action = last?.retryInstruction ?? last?.message ?? 'Fix the install on GitHub, then re-run apply.';
+  return (
+    `${action} Apply already opened the install page and polled for ${bound} without seeing the change land, so ` +
+    'this run is giving up — re-run apply once it is saved; no manual confirmation step is needed, apply will ' +
+    'detect it automatically. Last resort (destructive — avoid unless the App itself, not just its scope, is ' +
+    'wrong): delete the App on GitHub and retry.'
+  );
 }
 
 /**
@@ -1699,6 +1819,15 @@ async function runGate2WithInterstitial(
      * call site. Never invented by parsing `instructionLines`' prose.
      */
     readonly repoNamesOverride?: readonly string[];
+    /**
+     * groundnuty/macf#1178 — which {@link WaitStrategy} runs after the page
+     * opens. Omitted (every pre-#1178 call site) defaults to `runGate2`,
+     * byte-identical to before this field existed.
+     * `resumeGate2Preflight`/`applyIdentity`'s `reuse-confirmed` branch pass
+     * {@link pollForInstallFix} instead — the SAME page-open machinery, a
+     * DIFFERENT wait underneath it.
+     */
+    readonly waitStrategy?: WaitStrategy;
   },
   validate?: ValidateInstallHook,
 ): Promise<Gate2Outcome> {
@@ -1740,7 +1869,8 @@ async function runGate2WithInterstitial(
       },
     );
     await opts.postOpenWait?.();
-    return await runGate2(role, appId, keyPath, expected, deps, validate);
+    const wait = opts.waitStrategy ?? runGate2;
+    return await wait(role, appId, keyPath, expected, deps, validate);
   } finally {
     try {
       await page.close();

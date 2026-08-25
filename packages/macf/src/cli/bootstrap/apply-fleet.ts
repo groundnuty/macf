@@ -452,6 +452,15 @@ export interface FleetApplyDeps {
    */
   readonly checkRegistryRepoCoverage?: (appId: string, keyPath: string, owner: string, repo: string) => Promise<Presence>;
   /**
+   * Injectable seam for the registry-repo EXISTENCE probe (groundnuty/
+   * macf#1178 — `registry-repo-coverage.ts::buildRegistryRepoValidateInstall`'s
+   * 6th param) — real default (when `undefined`) is
+   * `registry-repo-coverage.ts::checkRegistryRepoExists`, an unauthenticated
+   * `fetch`. Same reasoning as {@link checkRegistryRepoCoverage}'s own doc:
+   * tests inject a fake so the suite never makes a real network call.
+   */
+  readonly checkRegistryRepoExists?: (owner: string, repo: string) => Promise<Presence>;
+  /**
    * groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
    * — the ALREADY-OBSERVED macf-actions router pin per repo
    * (`ObservedState.agents[role].actionsPin` / `.controlRepoActionsPin`),
@@ -1356,7 +1365,14 @@ export async function applyFleet(
       // branch — see that field's doc for why it's separate from
       // `validateInstall`) — UNCHANGED from before this issue; only
       // `validateInstall` gains the new scope check.
-      const registryRepoValidate = buildRegistryRepoValidateInstall(registryCoverage.owner, registryCoverage.repo, appHandle, scopedLog, deps.checkRegistryRepoCoverage);
+      const registryRepoValidate = buildRegistryRepoValidateInstall(
+        registryCoverage.owner,
+        registryCoverage.repo,
+        appHandle,
+        scopedLog,
+        deps.checkRegistryRepoCoverage,
+        deps.checkRegistryRepoExists,
+      );
       return {
         ...agentDepsBase,
         validateInstall: composeValidateInstall(installScopeValidate, registryRepoValidate),

@@ -19,7 +19,7 @@ import {
 import type { FleetAgent, FleetLockAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import type { ConfirmedInstall, IdentityConfirmation } from '../../../src/cli/bootstrap/identity-confirm.js';
-import { escapeHtmlAttribute, renderInstallInterstitial } from '../../../src/cli/bootstrap/manifest-flow-server.js';
+import { escapeHtmlAttribute, renderInstallInterstitial, startInstallInterstitial as realStartInstallInterstitial } from '../../../src/cli/bootstrap/manifest-flow-server.js';
 import type { InstallInterstitialHandles, InstallInterstitialOptions, ManifestFlowHandles } from '../../../src/cli/bootstrap/manifest-flow-server.js';
 import { appNameCollisionRefusalMessage, resolveAppPresenceStatus } from '../../../src/cli/bootstrap/app-presence.js';
 import { registryRepoNotInstalledReason, registryRepoRetryInstruction } from '../../../src/cli/bootstrap/registry-repo-coverage.js';
@@ -709,29 +709,29 @@ describe('applyAgentIdentity — pre-gate-2 install observation on the recovery 
     expect(logs.join('\n')).toMatch(/pre-gate-2 install check threw/);
   });
 
-  it('confirmed but validateInstall REJECTS (wrong scope) -> does NOT weaken the install-scope refusal, and (groundnuty/macf#1175) does NOT open a page claiming to wait for a install-content change that cannot happen on its own', async () => {
+  it('confirmed but validateInstall REJECTS (wrong scope) -> does NOT weaken the install-scope refusal, and (groundnuty/macf#1178) auto-opens the page + polls rather than a menu-walk refusal', async () => {
     const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
     const badScopeInstall: ConfirmedInstall = { ...CONFIRMED_INSTALL, repositorySelection: 'all' };
     const deps = baseDeps({
       startInstallInterstitial,
+      // groundnuty/macf#1178 — never fixed in this fixture, so
+      // pollForInstallFix runs to its OWN timeout; keep the budget tiny so
+      // the test does not actually wait the real 10-minute default.
+      gateTimeoutMs: 30,
+      pollIntervalMs: 10,
       confirmAppInstallation: async () => ({ status: 'confirmed', install: badScopeInstall }),
       validateInstall: (install) => (install.repositorySelection === 'selected' ? undefined : 'wrong scope'),
       findRecoveryArtifact: async () => RECOVERED,
-      // Once the gate re-opens, the SAME (bad-scope) install is what a
-      // real waitForAppInstallation would observe again.
-      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'all' }),
     });
 
     const outcome = await applyAgentIdentity(AGENT, MANIFEST, undefined, deps);
 
-    // groundnuty/macf#1175 — the install already exists (confirmed) but is
-    // insufficient; `waitForAppInstallation` would resolve on its very
-    // first poll against the SAME insufficient install, so no page opens
-    // and no "waiting for you to click Install" claim is ever printed
-    // (allowInstallRetry is unset in this test's deps — the default,
-    // unattended posture). The refusal was NOT silently accepted either —
-    // the failure is still reported.
-    expect(startInstallInterstitial).not.toHaveBeenCalled();
+    // groundnuty/macf#1178 — the operator's own ruling reverses #1175's
+    // refusal-without-opening choice: a confirmed-but-insufficient install
+    // now auto-opens the SAME gate-2 page (never a menu-walk) and polls for
+    // the fix. The refusal was NOT silently accepted either — the failure
+    // is still reported once the (tiny, test-only) poll budget runs out.
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
     expect(outcome.status).toBe('failed');
     if (outcome.status === 'failed') expect(outcome.reason).toContain('wrong scope');
   });
@@ -798,24 +798,30 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
   it('decisive (1): resumed gate, one of two required repos already covered -> instruction names only the missing repo, never the full "select exactly" restatement', async () => {
     const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
     const logs: string[] = [];
+    let calls = 0;
     const deps = baseDeps({
       startInstallInterstitial,
       log: (l) => logs.push(l),
+      gateTimeoutMs: 200,
+      pollIntervalMs: 10,
       confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
       findRecoveryArtifact: async () => RECOVERED,
-      validateInstall: () => ({ message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION }),
-      // The reopened gate-2 poll re-observes the SAME (still-insufficient) install.
-      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
+      // Rejects the pre-flight check (call 1), then the poll's first tick
+      // (call 2) observes the fix — proves the poll re-checks rather than
+      // trusting its own pre-flight observation forever.
+      validateInstall: () => {
+        calls += 1;
+        return calls === 1 ? { message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION } : undefined;
+      },
     });
 
     const outcome = await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
 
-    // groundnuty/macf#1175 — the install already exists (confirmed), so a
-    // page here would claim to wait for something that cannot happen on
-    // its own (waitForAppInstallation resolves on the very first poll
-    // against this SAME insufficient install). No page opens.
-    expect(startInstallInterstitial).not.toHaveBeenCalled();
-    expect(outcome.status).toBe('failed');
+    // groundnuty/macf#1178 — the operator's ruling: a resumed,
+    // confirmed-but-insufficient install auto-opens the SAME gate-2 page
+    // (never a menu-walk refusal).
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
+    expect(outcome.status).toBe('created');
 
     const joined = logs.join('\n');
     // The delta — verbatim from the pre-flight's OWN already-computed rejection.
@@ -825,145 +831,146 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
     // The decisive negative: the old full-list restatement must be GONE.
     expect(joined).not.toContain(FULL_SELECT_EXACTLY_LINE);
     expect(joined).not.toContain('select exactly:');
-    // groundnuty/macf#1175's own decisive check: never claim a wait that
-    // does not happen. The pre-#1175 code printed this exact line
-    // (`announceAndOpenGate`'s unconditional close) even though the poll
-    // beneath it resolved instantly.
-    expect(joined).not.toContain('waiting for you to click');
+    // groundnuty/macf#1178 — the App is already installed on this path;
+    // the button to click is "Save," never "Install" again.
+    expect(joined).toContain('waiting for you to click "Save"');
+    expect(joined).not.toContain('waiting for you to click "Install"');
   });
 
-  // groundnuty/macf#1175 — the live bug: a resumed gate whose install
-  // already exists (but fails validation) used to open a page, print
-  // "waiting for you to click Install", and then fail almost instantly —
-  // because `waitForAppInstallation` resolves on its very FIRST poll once
-  // ANY confirmed install exists on the expected target, and this one
-  // already does. Every fetch of the page during that "wait" returned 0
-  // bytes live, three times, because the server was already gone.
-  it('groundnuty/macf#1175 — a resumed gate whose install already exists never claims to be "waiting" for a poll that cannot wait; it refuses immediately and says to fix + re-run', async () => {
+  // groundnuty/macf#1178 — the operator's ruling reverses #1175's own fix:
+  // a resumed gate whose install already exists but fails validation now
+  // auto-opens the page (never a six-step menu-walk refusal) and polls the
+  // installation's CONTENTS — re-running `validate` on every tick — rather
+  // than merely re-confirming the install still exists (which would
+  // resolve instantly and prove nothing changed).
+  it('groundnuty/macf#1178 — a resumed gate whose install already exists auto-opens the page and polls for the fix, never a menu-walk refusal', async () => {
     const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
     const openUrl = vi.fn(async () => {});
     const logs: string[] = [];
+    let validateCalls = 0;
     const deps = baseDeps({
       startInstallInterstitial,
       openUrl,
       log: (l) => logs.push(l),
-      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
-      findRecoveryArtifact: async () => RECOVERED,
-      validateInstall: () => ({ message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION }),
-      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
-    });
-
-    const outcome = await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
-
-    // No page, no browser launch — nothing was opened for the operator to
-    // (uselessly) look at.
-    expect(startInstallInterstitial).not.toHaveBeenCalled();
-    expect(openUrl).not.toHaveBeenCalled();
-    // Decisive per #1175's own required test: the message never claims a
-    // wait this run does not perform.
-    const joined = logs.join('\n');
-    expect(joined).not.toMatch(/waiting for you to click/);
-    // It says the honest thing instead: fix it on GitHub, then re-run.
-    expect(joined).toContain('not opening a wait page for this');
-    expect(joined).toMatch(/re-run apply/);
-    expect(outcome.status).toBe('failed');
-    if (outcome.status === 'failed') {
-      expect(outcome.reason).toContain(SENTINEL_TECHNICAL_REASON);
-      expect(outcome.reason).toMatch(/re-run/);
-    }
-  });
-
-  // groundnuty/macf#1175 companion — when the operator HAS opted into
-  // interactive retries, the SAME confirmed-but-invalid resumed gate takes
-  // the OTHER honest path: it reopens the page with a genuine post-open
-  // wait (the retry machinery this module already has), rather than
-  // refusing immediately. Decisive against the contradiction a first draft
-  // of this fix had: printing "not opening a wait page … re-run apply" AND
-  // THEN reopening a page anyway, in the same transcript, would be the same
-  // same-transcript-contradiction class groundnuty/macf#1165/#1168 already
-  // fixed twice — this asserts that text is ABSENT here, not merely that
-  // the interactive path also works.
-  it('groundnuty/macf#1175 companion: with allowInstallRetry set, the SAME confirmed-but-invalid resumed gate reopens with a genuine wait — and never prints the unattended-path refusal text', async () => {
-    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
-    const callOrder: string[] = [];
-    let validateCalls = 0;
-    const logs: string[] = [];
-    const deps = baseDeps({
-      startInstallInterstitial,
-      log: (l) => logs.push(l),
-      allowInstallRetry: true,
-      waitForOperatorFix: async () => {
-        callOrder.push('wait-for-fix');
-      },
+      gateTimeoutMs: 200,
+      pollIntervalMs: 10,
       confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
       findRecoveryArtifact: async () => RECOVERED,
       validateInstall: () => {
         validateCalls += 1;
-        callOrder.push(`validate-${String(validateCalls)}`);
-        return validateCalls === 1 ? { message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION } : undefined;
-      },
-      waitForAppInstallation: async (opts) => {
-        callOrder.push('poll');
-        return { appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' };
+        // Rejects the pre-flight (call 1) AND the poll's first tick (call
+        // 2) — accepts on the third, simulating the operator saving the
+        // fix mid-poll.
+        return validateCalls <= 2 ? { message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION } : undefined;
       },
     });
 
     const outcome = await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
 
-    // The page DID reopen this time — the operator opted into it.
+    // The page opened, and the browser launch was attempted — nothing left
+    // for the operator to walk a settings menu for.
     expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
-    // validate-1 is the pre-flight check (`skipGate2IfAlreadyInstalled`,
-    // no page open — same as the unattended posture up to this point).
-    // Then: reopen -> wait-for-fix (the operator's genuine window) -> poll
-    // -> validate-2. Without the wait step, poll/validate-2 would
-    // immediately follow validate-1 with nothing giving the operator a
-    // chance to act — this ordering assertion is what catches that.
-    expect(callOrder).toEqual(['validate-1', 'wait-for-fix', 'poll', 'validate-2']);
-    // 'created', not 'resumed-install' — this is the recovery-artifact
-    // (`viaRecovery: true`) path; `finishGate2FromCredentials` reports a
-    // successful gate 2 as 'created' (it carries `credentials`), same as
-    // the ordinary create path — see that function's own doc.
+    expect(openUrl).toHaveBeenCalledTimes(1);
+    // Decisive per assert-the-wrong-path.md: "it eventually succeeded"
+    // alone cannot tell a genuine poll-then-fix apart from a fake that
+    // always accepted — the call count is what distinguishes them.
+    expect(validateCalls).toBe(3);
     expect(outcome.status).toBe('created');
-    // Decisive negative: the unattended-path refusal text must NEVER
-    // appear here — that text specifically claims nothing further waits,
-    // which would be false on this path (something further DOES wait).
     const joined = logs.join('\n');
-    expect(joined).not.toContain('not opening a wait page for this');
-    expect(joined).not.toMatch(/re-run apply\./);
+    expect(joined).toContain('waiting for you to click "Save"');
+    expect(joined).toContain('apply detected it automatically');
   });
 
-  // groundnuty/macf#1175's own required audit, as a decisive PAIRING test:
-  // "waiting for you to click" must print exactly when the poll it
-  // describes can actually block — never when the poll would resolve on
-  // its very first check. Asserting this as an equality across two runs
-  // (rather than two separate one-sided assertions) is what makes the
-  // check unable to pass by accident: a version of the code that always
-  // prints (or never prints) the line would fail this, even though each
-  // half in isolation might coincidentally look right.
-  it('groundnuty/macf#1175 decisive pairing: "waiting for you to click" prints iff the poll beneath it can actually wait', async () => {
-    async function run(confirmAppInstallation: AgentApplyDeps['confirmAppInstallation']): Promise<boolean> {
-      const logs: string[] = [];
-      const deps = baseDeps({
-        log: (l) => logs.push(l),
-        confirmAppInstallation,
-        findRecoveryArtifact: async () => RECOVERED,
-        validateInstall: () => ({ message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION }),
-        waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
-      });
-      await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
-      return logs.join('\n').includes('waiting for you to click');
+  // groundnuty/macf#1178 — the SAME shape, but the fix never lands: the
+  // poll must terminate on its OWN timeout (bounded via gateTimeoutMs in
+  // this test, never the real 10-minute default) rather than hang, and the
+  // failure message must state the bound it actually waited.
+  it('groundnuty/macf#1178 — an unattended run on a resumed gate terminates on timeout rather than hanging, and states the bound it waited', async () => {
+    const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
+    const deps = baseDeps({
+      startInstallInterstitial,
+      gateTimeoutMs: 30,
+      pollIntervalMs: 10,
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
+      findRecoveryArtifact: async () => RECOVERED,
+      // Never fixed — the operator never gets to it in this run.
+      validateInstall: () => ({ message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION }),
+    });
+
+    const outcome = await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1); // opened once — no reopen loop, one continuous poll
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      // Leads with the action (the retryInstruction), states the bound in
+      // SECONDS (never a rounded-to-minutes false claim on a sub-minute
+      // test budget — identity-confirm.ts::waitForInstallTimeoutMessage's
+      // own lesson), and never claims to hang.
+      expect(outcome.reason).toContain(SENTINEL_RETRY_INSTRUCTION);
+      expect(outcome.reason).toMatch(/polled for \d+ms|polled for \d+s/);
     }
+  });
 
-    // Run A — genuinely nothing installed yet: the poll below MUST block
-    // until the operator installs, so the "waiting" claim is true.
-    const waitingPrintedA = await run(async () => ({ status: 'app-no-install' }));
-    // Run B — an install already exists (just insufficient): the poll
-    // resolves on its very first check against that SAME install, so
-    // nothing actually waits.
-    const waitingPrintedB = await run(async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }));
+  // groundnuty/macf#1178 — THE decisive test. Per assert-the-wrong-path.md
+  // (two triggers) and the authoring check codify-at-correction-time.md
+  // added: a test that fakes `startInstallInterstitial` and asserts "the
+  // fake was called" cannot reproduce the live failure #1175 found — the
+  // page opened, but was gone before it could be fetched, three times,
+  // live. That failure is invisible to a mock; it is only visible to a
+  // REAL HTTP server. This test uses the REAL `startInstallInterstitial`
+  // (binds a real ephemeral 127.0.0.1 listener) and fakes only `openUrl`
+  // (to capture the URL instead of actually launching a browser) and the
+  // GitHub reads. The decisive assertion runs FROM INSIDE `validateInstall`
+  // — i.e. WHILE `pollForInstallFix` is still polling, mid-run, not after
+  // the outcome resolves — and does a REAL `fetch` of the captured URL.
+  it('groundnuty/macf#1178 DECISIVE: on a confirmed-but-insufficient install, a REAL page is opened AND a REAL fetch of it succeeds WHILE the run is still polling', async () => {
+    let capturedUrl: string | undefined;
+    let fetchedWhileWaiting: string | undefined;
+    let validateCalls = 0;
+    const confirmCalls: number[] = [];
+    const deps = baseDeps({
+      startInstallInterstitial: realStartInstallInterstitial, // the REAL listener — no fake
+      openUrl: async (url) => {
+        capturedUrl = url;
+      },
+      gateTimeoutMs: 2000,
+      pollIntervalMs: 10,
+      confirmAppInstallation: async () => {
+        confirmCalls.push(Date.now());
+        return { status: 'confirmed', install: CONFIRMED_INSTALL } as IdentityConfirmation;
+      },
+      findRecoveryArtifact: async () => RECOVERED,
+      validateInstall: async () => {
+        validateCalls += 1;
+        // On the poll's first internal tick (call 2 — call 1 is the
+        // pre-flight's own check, before any page exists), the page is
+        // open and `capturedUrl` is set: fetch it FOR REAL, right now,
+        // while apply is still waiting on THIS call to resolve. This is
+        // exactly the moment the live incident found the server already
+        // gone — a fake `startInstallInterstitial` cannot fail this way.
+        if (validateCalls === 2 && capturedUrl !== undefined) {
+          const response = await fetch(capturedUrl);
+          fetchedWhileWaiting = await response.text();
+        }
+        // Accept on the 3rd call — lets the poll (and the test) terminate.
+        return validateCalls < 3 ? { message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION } : undefined;
+      },
+    });
 
-    expect(waitingPrintedA).toBe(true);
-    expect(waitingPrintedB).toBe(false);
+    const outcome = await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
+
+    expect(outcome.status).toBe('created');
+    expect(capturedUrl).toBeDefined();
+    // The decisive check: the fetch, issued mid-poll, actually returned
+    // real page content — not 0 bytes, not a connection failure. This is
+    // the check that failed three times live.
+    expect(fetchedWhileWaiting).toBeDefined();
+    expect(fetchedWhileWaiting!.length).toBeGreaterThan(0);
+    expect(fetchedWhileWaiting).toContain(SENTINEL_RETRY_INSTRUCTION);
+    // Distinguishes "polls contents" from "re-reads the install it was
+    // handed": confirmAppInstallation was called MORE THAN ONCE — a fresh
+    // read on every tick, not a cached observation from the pre-flight.
+    expect(confirmCalls.length).toBeGreaterThan(1);
   });
 
   // Decisive pair, item 2: a genuinely FIRST gate (fresh create) is
@@ -1004,10 +1011,14 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
     const logs: string[] = [];
     const deps = baseDeps({
       log: (l) => logs.push(l),
+      // groundnuty/macf#1178 — this fixture's validateInstall never
+      // accepts, so pollForInstallFix runs to its OWN timeout; keep the
+      // budget tiny so the test doesn't wait the real 10-minute default.
+      gateTimeoutMs: 30,
+      pollIntervalMs: 10,
       confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
       findRecoveryArtifact: async () => RECOVERED,
       validateInstall: () => 'SENTINEL-BARE: repository_selection must be selected.',
-      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'all' }),
     });
     await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
     const joined = logs.join('\n');
@@ -1025,10 +1036,11 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
     const realMessage = registryRepoNotInstalledReason('demo-fleet-code-agent', 'groundnuty', 'demo-fresh-control');
     const deps = baseDeps({
       log: (l) => logs.push(l),
+      gateTimeoutMs: 30,
+      pollIntervalMs: 10,
       confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
       findRecoveryArtifact: async () => RECOVERED,
       validateInstall: () => ({ message: realMessage, retryInstruction: realRetryInstruction }),
-      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
     });
     await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
     const joined = logs.join('\n');
@@ -1053,20 +1065,18 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
   // "look right" while drifting (that is exactly how this reached four
   // instances); comparing captured outputs to each other cannot.
 
-  it('DECISIVE: on a resumed gate (WITH allowInstallRetry — the only posture that still opens a page here per groundnuty/macf#1175), every line the terminal prints for gate 2 is present, verbatim, in the served interstitial — asserted against each other, never against a literal', async () => {
+  it('DECISIVE: on a resumed gate, every line the terminal prints for gate 2 is present, verbatim, in the served interstitial — asserted against each other, never against a literal', async () => {
     const logs: string[] = [];
     let seenOpts: InstallInterstitialOptions | undefined;
     const deps = baseDeps({
       log: (l) => logs.push(l),
-      // groundnuty/macf#1175 — on the DEFAULT (allowInstallRetry unset)
-      // posture, this exact fixture (confirmed-but-invalid resumed install)
-      // now refuses immediately and never opens a page at all — see the
-      // #1175 describe block above. `allowInstallRetry: true` exercises the
-      // ONE remaining path that still reopens a page for this shape (the
-      // genuine-wait retry loop), which is what this cross-surface
-      // agreement test needs to observe a served page at all.
-      allowInstallRetry: true,
-      waitForOperatorFix: async () => {},
+      // groundnuty/macf#1178 — the page now ALWAYS opens for a resumed,
+      // confirmed-but-insufficient install (never gated on
+      // allowInstallRetry). This fixture's validateInstall never accepts,
+      // so pollForInstallFix runs to its own timeout — kept tiny so this
+      // cross-surface test doesn't wait the real 10-minute default.
+      gateTimeoutMs: 30,
+      pollIntervalMs: 10,
       startInstallInterstitial: async (opts) => {
         seenOpts = opts;
         return fakeInterstitialHandles();
@@ -1074,7 +1084,6 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
       confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
       findRecoveryArtifact: async () => RECOVERED,
       validateInstall: () => ({ message: SENTINEL_TECHNICAL_REASON, retryInstruction: SENTINEL_RETRY_INSTRUCTION }),
-      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
     });
 
     await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
@@ -1137,11 +1146,11 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
     const DANGEROUS_RETRY_INSTRUCTION = 'add "groundnuty/<script>evil()</script>" & retry';
     const deps = baseDeps({
       log: (l) => logs.push(l),
-      // groundnuty/macf#1175 — see the cross-surface agreement test above:
-      // this exact fixture no longer opens a page by default; the retry
-      // path is what still does.
-      allowInstallRetry: true,
-      waitForOperatorFix: async () => {},
+      // groundnuty/macf#1178 — see the cross-surface agreement test above:
+      // the page always opens now; this fixture's validateInstall never
+      // accepts, so keep the poll budget tiny.
+      gateTimeoutMs: 30,
+      pollIntervalMs: 10,
       startInstallInterstitial: async (opts) => {
         seenOpts = opts;
         return fakeInterstitialHandles();
@@ -1149,7 +1158,6 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
       confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }) as IdentityConfirmation,
       findRecoveryArtifact: async () => RECOVERED,
       validateInstall: () => ({ message: 'technical detail, terminal/--json only', retryInstruction: DANGEROUS_RETRY_INSTRUCTION }),
-      waitForAppInstallation: async (opts) => ({ appId: opts.appId, installId: '9999', appSlug: RECOVERED.slug, accountLogin: 'groundnuty', repositorySelection: 'selected' }),
     });
 
     await applyAgentIdentity(AGENT_TWO_REPOS, MANIFEST_TWO_REPOS, undefined, deps);
@@ -1804,104 +1812,105 @@ describe('groundnuty/macf#1063 — recoverable consent-gate-2 rejection re-opens
     expect(seenOpts!.repoNames).toEqual(['demo-code']);
   });
 
-  it('bounds the retries: after the configured number of attempts it still fails, with the full explanation (assert the count)', async () => {
+  // groundnuty/macf#1178 — reverses the old #1063 "reopen N times, bounded
+  // by attempt-count" shape for this branch. A never-fixed rejection now
+  // exhausts a single continuous poll's TIME budget instead — bounded via
+  // gateTimeoutMs in this test (never the real 10-minute default).
+  it('groundnuty/macf#1178 — a never-fixed reuse rejection terminates on the poll TIMEOUT, not an attempt count; the page opens exactly once', async () => {
     let validateReuseCalls = 0;
     const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
     const deps = baseDeps({
       startInstallInterstitial,
+      gateTimeoutMs: 30,
+      pollIntervalMs: 10,
       resolveKeyPath: () => '/fake/key.pem',
       confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
-      waitForAppInstallation: async () => REUSE_INSTALL,
-      allowInstallRetry: true,
       validateReuse: async () => {
         validateReuseCalls += 1;
         return MISSING_REPO_REASON; // NEVER fixed — the operator never gets it right
       },
     });
     const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
-    // 1 initial check + N reopen-and-recheck retries — a small, FIXED bound,
-    // not an unbounded loop. Pinned here as a literal so a future change to
-    // the bound is a deliberate, reviewed test edit, not a silent drift.
-    expect(validateReuseCalls).toBe(3);
-    expect(startInstallInterstitial).toHaveBeenCalledTimes(2);
+    // Multiple ticks happened (a REAL poll, not a single check) — the exact
+    // count depends on timer precision, so this asserts "more than one,"
+    // not a pinned literal.
+    expect(validateReuseCalls).toBeGreaterThanOrEqual(2);
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1); // ONE continuous poll — no reopen loop
     expect(outcome.status).toBe('failed');
     if (outcome.status === 'failed') {
       expect(outcome.reason).toContain(MISSING_REPO_REASON);
-      expect(outcome.reason).toMatch(/gave up after 2 attempt/i);
+      expect(outcome.reason).toMatch(/polled for \d+ms|polled for \d+s/);
     }
   });
 
-  it('--yes / unattended (allowInstallRetry omitted) never re-opens the gate — verifies once, refuses, exits, exactly as before #1063; the prompt/open seam is never reached', async () => {
+  // groundnuty/macf#1178 — the operator's own ruling reverses this test's
+  // pre-#1178 name ("--yes / unattended never re-opens the gate"): the page
+  // now ALWAYS opens, `allowInstallRetry` given or not, because opening it
+  // costs nothing manual (auto-poll, never a manual press-Enter wait).
+  it('groundnuty/macf#1178 — unattended (allowInstallRetry omitted) STILL auto-opens the page and polls, never a menu-walk refusal', async () => {
     let validateReuseCalls = 0;
     const startInstallInterstitial = vi.fn(async () => fakeInterstitialHandles());
     const openUrl = vi.fn(async () => {});
-    const waitForOperatorBeat = vi.fn(async () => {});
     const deps = baseDeps({
       startInstallInterstitial,
       openUrl,
-      waitForOperatorBeat,
+      gateTimeoutMs: 200,
+      pollIntervalMs: 10,
       resolveKeyPath: () => '/fake/key.pem',
       confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
-      // allowInstallRetry deliberately OMITTED — this is bootstrap-apply.ts's
-      // real `--yes` wiring (`assumeYes !== true` -> false).
+      // allowInstallRetry deliberately OMITTED — bootstrap-apply.ts's real
+      // `--yes` wiring (`assumeYes !== true` -> false). No longer changes
+      // whether the page opens (see #1178) — only the OLD manual-retry
+      // loop (now removed for this branch) depended on it.
       validateReuse: async () => {
         validateReuseCalls += 1;
-        return MISSING_REPO_REASON;
-      },
-    });
-    const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
-    expect(validateReuseCalls).toBe(1); // one check, no retry
-    expect(startInstallInterstitial).not.toHaveBeenCalled();
-    expect(openUrl).not.toHaveBeenCalled();
-    expect(waitForOperatorBeat).not.toHaveBeenCalled(); // the prompt seam is UNREACHED, not merely a no-op
-    expect(outcome).toEqual({
-      role: 'code-agent',
-      status: 'failed',
-      reason: `existing install re-verification rejected: ${MISSING_REPO_REASON}`,
-    });
-  });
-
-  it('DECISIVE: the operator gets a genuine post-open wait before each re-check — waitForOperatorFix runs BEFORE the poll/re-validate, not merely wired', async () => {
-    const callOrder: string[] = [];
-    let validateReuseCalls = 0;
-    const deps = baseDeps({
-      startInstallInterstitial: async () => fakeInterstitialHandles(),
-      resolveKeyPath: () => '/fake/key.pem',
-      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
-      waitForAppInstallation: async () => {
-        callOrder.push('poll');
-        return REUSE_INSTALL;
-      },
-      allowInstallRetry: true,
-      waitForOperatorFix: async () => {
-        callOrder.push('wait-for-fix');
-      },
-      validateReuse: async () => {
-        validateReuseCalls += 1;
-        callOrder.push(`validate-${String(validateReuseCalls)}`);
         return validateReuseCalls === 1 ? MISSING_REPO_REASON : undefined;
       },
     });
-    await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
-    // validate-1 is the instant reuse check (no page open, pre-#1063
-    // behavior). Then: reopen -> wait-for-fix (the operator's genuine
-    // window) -> poll -> validate-2. Without the wait step, poll/validate-2
-    // would immediately follow validate-1 with nothing giving the operator
-    // a chance to act — this ordering assertion is what catches that.
-    expect(callOrder).toEqual(['validate-1', 'wait-for-fix', 'poll', 'validate-2']);
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    expect(validateReuseCalls).toBe(2); // the pre-flight check, then the poll's first tick — both live
+    expect(startInstallInterstitial).toHaveBeenCalledTimes(1);
+    expect(openUrl).toHaveBeenCalledTimes(1);
+    expect(outcome).toEqual({ role: 'code-agent', status: 'reused', appId: '9001', installId: '5555' });
   });
 
-  it('the retry dialogue shows the CLEAN retryInstruction, never the technical message (its GET/HTTP/issue-number detail), when the rejecting hook supplies one', async () => {
+  // groundnuty/macf#1178 — the operator's own words: "do not expect me to
+  // click anything manually." The poll re-checks automatically, on its own
+  // interval — no `waitForOperatorFix`/press-Enter primitive is invoked
+  // for this branch anymore.
+  it('groundnuty/macf#1178 — the poll re-checks automatically; no manual "press Enter" wait is invoked', async () => {
+    const waitForOperatorFix = vi.fn(async () => {});
+    let validateReuseCalls = 0;
+    const deps = baseDeps({
+      startInstallInterstitial: async () => fakeInterstitialHandles(),
+      gateTimeoutMs: 200,
+      pollIntervalMs: 10,
+      resolveKeyPath: () => '/fake/key.pem',
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
+      allowInstallRetry: true, // even opted-in, this hook must never fire for this branch now
+      waitForOperatorFix,
+      validateReuse: async () => {
+        validateReuseCalls += 1;
+        return validateReuseCalls <= 2 ? MISSING_REPO_REASON : undefined;
+      },
+    });
+    const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
+    expect(validateReuseCalls).toBe(3);
+    expect(waitForOperatorFix).not.toHaveBeenCalled();
+    expect(outcome.status).toBe('reused');
+  });
+
+  it('the resumed-gate dialogue shows the CLEAN retryInstruction, never the technical message (its GET/HTTP/issue-number detail), on the terminal lines it owns', async () => {
     const logs: string[] = [];
     let validateReuseCalls = 0;
     const cleanInstruction = registryRepoRetryInstruction('demo-fleet-code-agent', 'groundnuty', 'demo-fleet-control');
     const deps = baseDeps({
       startInstallInterstitial: async () => fakeInterstitialHandles(),
       log: (l) => logs.push(l),
+      gateTimeoutMs: 200,
+      pollIntervalMs: 10,
       resolveKeyPath: () => '/fake/key.pem',
       confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
-      waitForAppInstallation: async () => REUSE_INSTALL,
-      allowInstallRetry: true,
       validateReuse: async () => {
         validateReuseCalls += 1;
         if (validateReuseCalls === 1) return { message: MISSING_REPO_REASON, retryInstruction: cleanInstruction };
@@ -1909,17 +1918,17 @@ describe('groundnuty/macf#1063 — recoverable consent-gate-2 rejection re-opens
       },
     });
     await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
-    // The clean sentence IS shown, as its own printed line (the retry
-    // dialogue's instructionLines are logged one-per-line).
+    // The clean sentence IS shown, as its own printed line (the resumed
+    // gate's instructionLines are logged one-per-line).
     expect(logs).toContain(`Role "code-agent": ${cleanInstruction}`);
     // The technical `message` (its GET/HTTP-status/issue-number detail)
-    // reaches the ONE pre-existing diagnostic line ("REFUSED on reuse — …",
-    // unchanged from before #1063) — but the interactive dialogue's OWN
-    // lines (everything logged as part of reopening the gate: from the
-    // "reopened after a rejection" gate label onward) must never repeat it.
-    const reopenIndex = logs.findIndex((l) => l.includes('reopened after a rejection'));
-    expect(reopenIndex).toBeGreaterThanOrEqual(0);
-    const dialogueLines = logs.slice(reopenIndex);
+    // reaches the ONE pre-existing diagnostic line ("REFUSED on reuse — …")
+    // — but the resumed-gate dialogue's OWN lines (from the "install
+    // already exists from an earlier run" framing sentence onward) must
+    // never repeat it.
+    const dialogueIndex = logs.findIndex((l) => l.includes("install already exists from an earlier run"));
+    expect(dialogueIndex).toBeGreaterThanOrEqual(0);
+    const dialogueLines = logs.slice(dialogueIndex);
     expect(dialogueLines.some((l) => l.includes('GET /repos'))).toBe(false);
     expect(dialogueLines.some((l) => l.includes('#999') || l.includes('#1012'))).toBe(false);
   });
@@ -1963,30 +1972,30 @@ describe('groundnuty/macf#1063 — recoverable consent-gate-2 rejection re-opens
     expect(joined).toContain('demo-fleet-code-agent'); // the App handle, same message
   });
 
-  it('no internal issue/PR references leak into any of the NEW #1063 text (the retry instruction + the "gave up" explanation) — comments may cite them freely, output may not', async () => {
+  it('no internal issue/PR references leak into any of the NEW #1178 text (the resumed-gate dialogue + the poll-timeout explanation) — comments may cite them freely, output may not', async () => {
     // A rejection reason with NO issue references of its own (unlike the
     // real `registryRepoNotInstalledReason`, which — pre-existing, #1012's
     // own shipped text — cites `groundnuty/macf#999`/`#1012` by design; that
     // choice belongs to #1012, not this issue, so re-litigating it here
     // would test the wrong code). Isolating the reason this way means every
-    // reference this assertion could catch is one #1063 itself introduced.
+    // reference this assertion could catch is one #1178 itself introduced.
     const NO_REF_REASON = 'App is installed, but its install does not cover the required repository.';
     const logs: string[] = [];
     let validateReuseCalls = 0;
     const deps = baseDeps({
       startInstallInterstitial: async () => fakeInterstitialHandles(),
       log: (l) => logs.push(l),
+      gateTimeoutMs: 30,
+      pollIntervalMs: 10,
       resolveKeyPath: () => '/fake/key.pem',
       confirmAppInstallation: async () => ({ status: 'confirmed', install: REUSE_INSTALL }),
-      waitForAppInstallation: async () => REUSE_INSTALL,
-      allowInstallRetry: true,
       validateReuse: async () => {
         validateReuseCalls += 1;
-        return NO_REF_REASON; // never fixed -> exhausts retries -> the "gave up" message also gets checked
+        return NO_REF_REASON; // never fixed -> the poll exhausts its timeout -> the "gave up" text also gets checked
       },
     });
     const outcome = await applyAgentIdentity(AGENT, MANIFEST, PRIOR, deps);
-    expect(validateReuseCalls).toBe(3); // sanity: the retry path (and its "gave up" text) actually ran
+    expect(validateReuseCalls).toBeGreaterThanOrEqual(2); // sanity: the poll actually ran more than once
     const issueRefPattern = /#\d+|DR-\d+/i;
     expect(logs.join('\n')).not.toMatch(issueRefPattern);
     if (outcome.status === 'failed') expect(outcome.reason).not.toMatch(issueRefPattern);
