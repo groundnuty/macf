@@ -28,7 +28,7 @@ import { createInterface } from 'node:readline';
 import { join, resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
 import { deriveAppHandle, deriveControlRepoName, parseFleetManifest } from '../bootstrap/fleet-manifest.js';
-import type { FleetObserverFn, FleetPlan, FleetPlanFailure, ObservedState, UnimplementedApplyItem } from '../bootstrap/plan.js';
+import type { FleetObserverFn, FleetPlan, FleetPlanFailure, ObservedState, OperatorInteractionBound, UnimplementedApplyItem } from '../bootstrap/plan.js';
 import {
   checkVaultFlagsComplete,
   computePlan,
@@ -378,6 +378,42 @@ export function plannedAppCreations(
 }
 
 /**
+ * The section header for {@link formatPlannedAppCreations} (pure, exported
+ * for tests) — extracted to keep that function under this codebase's
+ * function-length convention. `bound` is `operatorInteractionBudget`'s OWN
+ * `'exact'`/`'maximum'` distinction — the SAME source
+ * {@link formatOperatorInteractionLine}'s own trailing budget line already
+ * derives its ceiling framing from (groundnuty/macf#1165's "derive from one
+ * source" requirement: this header must not invent a SEPARATE condition for
+ * whether it is overstating). `'exact'` cannot occur while `count > 0`
+ * (`operatorInteractionBudget`'s own contract: zero on both counts is the
+ * only exact case), but branching on the field — rather than hardcoding the
+ * ceiling framing — means a future change to that contract cannot silently
+ * leave this header overstating without also failing loudly here.
+ *
+ * `excludedRoles` names any role dropped from `creations` because a
+ * recovery artifact for it already exists (see
+ * {@link recoveryResumableRoles}) — named explicitly rather than silently
+ * vanished from the count, so an operator counting agents against the
+ * header total is never left one short with no explanation.
+ */
+export function formatAppCreationsHeader(count: number, bound: OperatorInteractionBound, excludedRoles: readonly string[]): string {
+  const plural = count === 1 ? '' : 's';
+  const excludedNote =
+    excludedRoles.length === 0
+      ? ''
+      : ` Not counted here (each already has a recovery artifact — its App exists; apply resumes its install rather than creating it): ${excludedRoles.join(', ')}.`;
+  if (bound === 'exact') {
+    return `GitHub App${plural} that would be created (${String(count)}) — consent gate 1 (§D2), one operator click each:${excludedNote}`;
+  }
+  return (
+    `Up to ${String(count)} GitHub App${plural} may be created — consent gate 1 (§D2), one operator click each. This is a ceiling, ` +
+    'not a promise: an App this preview could not confirm already exists still counts here, and the live gate is authoritative on ' +
+    `which repos (if any) are still needed.${excludedNote}`
+  );
+}
+
+/**
  * Human render of the would-be App creations (pure — exported for tests).
  * `gate2InstallOnly` (groundnuty/macf#880) is the count of roles the
  * vault-aware preview confirmed `'resume-install'` for — an App exists
@@ -388,8 +424,19 @@ export function plannedAppCreations(
  * ALONE would silently drop their gate-2 cost; this parameter recovers it.
  * Defaults to 0 (no preview ran, or nothing resume-eligible) — every
  * pre-#880-preview call site stays byte-identical.
+ *
+ * `excludedRecoveryRoles` (groundnuty/macf#1165, defaults to `[]` — every
+ * pre-this-issue call site stays byte-identical) names roles the CALLER
+ * already dropped from `creations` via {@link recoveryResumableRoles} —
+ * this function never re-derives the exclusion itself, only renders the
+ * caller's own decision (this issue's "derive from one source"
+ * requirement).
  */
-export function formatPlannedAppCreations(creations: readonly PlannedAppCreation[], gate2InstallOnly = 0): string {
+export function formatPlannedAppCreations(
+  creations: readonly PlannedAppCreation[],
+  gate2InstallOnly = 0,
+  excludedRecoveryRoles: readonly string[] = [],
+): string {
   // groundnuty/macf#880 — the operator's consent-click budget, projected
   // from `creations` itself (already the vault-aware-filtered list when a
   // preview ran — see `filterCreationsByPreview`'s doc) plus any
@@ -398,14 +445,16 @@ export function formatPlannedAppCreations(creations: readonly PlannedAppCreation
   // Appended to BOTH branches so it shows up identically on `--dry-run` and
   // the real pre-approval render (both call this same function — see the
   // call sites below).
-  const budgetLine = formatOperatorInteractionLine(operatorInteractionBudget(creations.length, creations.length + gate2InstallOnly));
+  const budget = operatorInteractionBudget(creations.length, creations.length + gate2InstallOnly);
+  const budgetLine = formatOperatorInteractionLine(budget);
   if (creations.length === 0) {
-    return `No GitHub Apps would be created (every declared agent already has one, or presence is confirmed).\n${budgetLine}`;
+    const excludedNote =
+      excludedRecoveryRoles.length === 0
+        ? ''
+        : ` (${excludedRecoveryRoles.join(', ')} excluded — each already has a recovery artifact; apply resumes rather than creates.)`;
+    return `No GitHub Apps would be created (every declared agent already has one, or presence is confirmed).${excludedNote}\n${budgetLine}`;
   }
-  const parts: string[] = [
-    `GitHub Apps that would be created (${String(creations.length)}) — consent gate 1 (§D2), one operator click each:`,
-    '',
-  ];
+  const parts: string[] = [formatAppCreationsHeader(creations.length, budget.bound, excludedRecoveryRoles), ''];
   for (const c of creations) {
     // groundnuty/macf#943 — the runner-ops has no home repo (`c.repo === ''`).
     parts.push(`  • ${c.manifest.name}   (role: ${c.role}, home repo: ${c.repo === '' ? '(fleet-level, no home repo)' : c.repo})`);
@@ -2196,6 +2245,47 @@ export function formatRecoveryArtifactNotice(roles: readonly string[]): string {
   );
 }
 
+/**
+ * Roles among `creations` whose "would be created" preview line is
+ * misleading — a recovery artifact for them ALREADY exists, so gate 1 (App
+ * creation) will be SKIPPED and apply resumes their install instead
+ * (groundnuty/macf#1165 — the live incident that issue quotes: a preview
+ * claiming "GitHub Apps that would be created (5)" while 4 already existed;
+ * the live gate correctly resumed them and named only the still-missing
+ * repo, contradicting this SAME preview's own "select exactly: A, B" line
+ * for the identical role).
+ *
+ * `identityKeyPath === undefined` returns `[]` unconditionally —
+ * `findAvailableRecoveryArtifacts` is existence-only (a bare
+ * `fs.existsSync`, per that function's own doc); WITHOUT `--identity-key`,
+ * `AgentApplyDeps.findRecoveryArtifact` cannot DECRYPT the artifact this
+ * run (`formatRecoveryArtifactNotice`'s own text: "Without --identity-key,
+ * this run treats the role the same as before this fix"), so the role
+ * genuinely goes through gate 1 as an ordinary create — excluding it here
+ * would UNDER-report a click that will actually happen. The honest-unknown
+ * floor cuts both ways: never claim a create that will not happen, and
+ * never hide one that will.
+ *
+ * Pure — only intersects two ALREADY-computed lists (`creations`'s own
+ * roles, `availableRecoveryRoles` from `findAvailableRecoveryArtifacts`)
+ * and invents no new observation, per this issue's "derive from one
+ * source" requirement: `#1156` merged because an instruction and a check
+ * were computed independently and drifted; `#1164` fixed the live gate by
+ * reusing the refusal's own observation; this function is the preview
+ * side of the SAME fix, reusing `findAvailableRecoveryArtifacts`'s
+ * existing existence check rather than adding a fourth, independent
+ * computation of "will this role actually create."
+ */
+export function recoveryResumableRoles(
+  creations: readonly PlannedAppCreation[],
+  availableRecoveryRoles: readonly string[],
+  identityKeyPath: string | undefined,
+): readonly string[] {
+  if (identityKeyPath === undefined || availableRecoveryRoles.length === 0) return [];
+  const available = new Set(availableRecoveryRoles);
+  return creations.filter((c) => available.has(c.role)).map((c) => c.role);
+}
+
 // --- Entry point ---
 
 /**
@@ -2348,6 +2438,25 @@ export async function runBootstrapApply(
     // learns recovery is available before spending a browser click,
     // regardless of whether `--identity-key` was supplied this run.
     const availableRecoveryRoles = findAvailableRecoveryArtifacts(manifest);
+    // groundnuty/macf#1165 — a role in `displayCreations` with an available,
+    // this-run-consumable recovery artifact will NOT go through gate 1 at
+    // all (see `recoveryResumableRoles`'s doc for the full mechanism + the
+    // live incident this closes). Filtered ONCE, here, into `finalCreations`
+    // — every render below (both `--dry-run` branches, the real
+    // pre-approval stderr render, AND `mutate.confirmPlan`'s own count, the
+    // fourth independent computation of this fact this issue's own "derive
+    // from one source" requirement calls out) reads `finalCreations`, never
+    // the unfiltered `displayCreations`, so there is no second site left to
+    // drift from the first.
+    const recoveryResumable = recoveryResumableRoles(displayCreations, availableRecoveryRoles, opts.identityKeyPath);
+    const finalCreations =
+      recoveryResumable.length === 0 ? displayCreations : displayCreations.filter((c) => !recoveryResumable.includes(c.role));
+    // An excluded role still costs a gate-2 flow (only gate 1 — App
+    // creation — is skipped; its install still needs a click) — folded into
+    // the SAME `gate2InstallOnly` accumulator `formatPlannedAppCreations`
+    // already uses for the identical shape (a `'resume-install'` role,
+    // groundnuty/macf#880), not a second, differently-named counter.
+    const finalGate2InstallOnly = gate2InstallOnly + recoveryResumable.length;
 
     if (opts.dryRun === true) {
       if (opts.json) {
@@ -2356,18 +2465,24 @@ export async function runBootstrapApply(
             {
               ...(fleetPlanToJson(plan) as Record<string, unknown>),
               dry_run: true,
-              planned_app_creations: displayCreations.map((c) => ({ ...c })),
-              // groundnuty/macf#880 — from `displayCreations.length`/
-              // `gate2InstallOnly`, NOT `plan.items` (see
-              // `plan.ts::countAppsToCreate`'s doc): `displayCreations` is
-              // the vault-aware-filtered list, so gate1 is the tighter of
-              // the two counts whenever a preview ran; `gate2InstallOnly`
-              // folds back in any `'resume-install'` role's gate-2-only cost
-              // `displayCreations.length` alone would silently drop.
+              planned_app_creations: finalCreations.map((c) => ({ ...c })),
+              // groundnuty/macf#880 — from `finalCreations.length`/
+              // `finalGate2InstallOnly`, NOT `plan.items` (see
+              // `plan.ts::countAppsToCreate`'s doc): `finalCreations` is
+              // the vault-aware- AND recovery-artifact-filtered list, so
+              // gate1 is the tighter of the two counts whenever a preview
+              // ran; `finalGate2InstallOnly` folds back in any
+              // `'resume-install'`/recovery-resumable role's gate-2-only
+              // cost `finalCreations.length` alone would silently drop.
               operator_interaction: operatorInteractionToJson(
-                operatorInteractionBudget(displayCreations.length, displayCreations.length + gate2InstallOnly),
+                operatorInteractionBudget(finalCreations.length, finalCreations.length + finalGate2InstallOnly),
               ),
               ...(preview !== undefined ? { vault_identity_preview: identityPreviewToJson(preview) } : {}),
+              // groundnuty/macf#1165 — same JSON-parity precedent
+              // `vault_identity_preview` above sets: surfaced only when
+              // non-empty, so every pre-this-issue `--json` consumer's
+              // shape is unaffected.
+              ...(recoveryResumable.length > 0 ? { recovery_resumable_creations: recoveryResumable } : {}),
             },
             null,
             2,
@@ -2376,7 +2491,7 @@ export async function runBootstrapApply(
       } else {
         console.log(formatPlanText(plan));
         console.log('');
-        console.log(formatPlannedAppCreations(displayCreations, gate2InstallOnly));
+        console.log(formatPlannedAppCreations(finalCreations, finalGate2InstallOnly, recoveryResumable));
         if (preview !== undefined) {
           console.log('');
           console.log(formatIdentityPreview(preview));
@@ -2398,7 +2513,7 @@ export async function runBootstrapApply(
     // clean; keeping it uniform (not conditional on opts.json) means a human
     // running without --json sees the identical preview a script would have
     // to skip past on stderr, rather than two different code paths.
-    process.stderr.write(`${formatPlanText(plan)}\n\n${formatPlannedAppCreations(displayCreations, gate2InstallOnly)}\n`);
+    process.stderr.write(`${formatPlanText(plan)}\n\n${formatPlannedAppCreations(finalCreations, finalGate2InstallOnly, recoveryResumable)}\n`);
     if (preview !== undefined) {
       process.stderr.write(`\n${formatIdentityPreview(preview)}\n`);
     }
@@ -2427,7 +2542,7 @@ export async function runBootstrapApply(
       observedActionsPins: mutateDeps?.observedActionsPins ?? actionsPinsFromObserved(manifest, observed),
     };
     try {
-      const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, displayCreations);
+      const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, finalCreations);
       if (!approved) {
         console.error('Aborted by operator — nothing was created, changed, or submitted.');
         return 1;
