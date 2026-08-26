@@ -15,7 +15,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   runBootstrapApply,
   resolveMutateDeps,
@@ -54,9 +54,11 @@ import {
   TAILSCALE_OAUTH_MISSING_CODE,
   TS_OAUTH_CLIENT_ID_ENV_VAR,
   TS_OAUTH_CLIENT_ID_FLAG,
+  TS_OAUTH_CLIENT_ID_SECRET_NAME,
   TS_OAUTH_FLAGS_INCOMPLETE_CODE,
   TS_OAUTH_SECRET_ENV_VAR,
   TS_OAUTH_SECRET_FLAG,
+  TS_OAUTH_SECRET_SECRET_NAME,
 } from '../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RunnerRegistrationDeps } from '../../src/cli/bootstrap/apply-routing.js';
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../src/cli/bootstrap/apply-routing.js';
@@ -2150,6 +2152,182 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       const all = [...logs, ...errs].join('\n');
       expect(all).not.toContain(TS_OAUTH_CLIENT_ID_SECRET);
       expect(all).not.toContain(TS_OAUTH_SECRET_SECRET);
+    });
+  });
+
+  // --- groundnuty/macf#1197 — the operator secrets file: widens the
+  // ts-oauth resolution above to a 4-tier flag -> per-fleet file ->
+  // per-scope file -> env chain. The decisive pair per the issue: (1) all
+  // required keys present in the file -> apply proceeds with NO secret
+  // flags on the command line, and the VALUES that were actually published
+  // came FROM the file (not "ignored the file and got them elsewhere" —
+  // `assert-the-wrong-path.md` trigger 1); (2) a required key missing ->
+  // fails before the first gate, naming every missing key.
+  describe('groundnuty/macf#1197 — operator secrets file (--secrets-file / --scope-secrets-file)', () => {
+    function writeSecretsFile(dir: string, contents: string, name = 'secrets.env'): string {
+      const path = join(dir, name);
+      writeFileSync(path, contents);
+      return path;
+    }
+
+    it('DECISIVE 1: every required key present in the per-fleet file -> apply proceeds with NO secret flags, publishing the FILE-sourced values', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      const secretsFile = writeSecretsFile(
+        dirname(file),
+        'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=file-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=file-secret\n',
+      );
+      const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      const code = await runBootstrapApply(
+        { file, yes: true, deploy: false, secretsFilePath: secretsFile }, // NO tsOauthClientId/tsOauthSecret flags
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file, {
+          resolvedTsOauth: { clientId: 'file-client-id', secret: 'file-secret' },
+          routingSecretsDeps: fakeRoutingSecretsDeps({
+            checkRepoSecretPresence: async () => 'absent',
+            setRepoSecret: async (repo, name, value) => {
+              setSecretCalls.push({ repo, name, value });
+            },
+          }),
+        }),
+      );
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(TAILSCALE_OAUTH_MISSING_CODE);
+      // The decisive assertion: the FILE's values were published — proves
+      // the file was actually consulted, not merely that SOME value
+      // (e.g. from env) satisfied the pre-flight.
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'file-client-id')).toBe(true);
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'file-secret')).toBe(true);
+    });
+
+    it('DECISIVE 2: a required key missing from the file -> refuses BEFORE the first gate, naming every missing key together', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      // A file that supplies neither key at all — same as "no file given"
+      // for this pair, but exercises the read path rather than the
+      // undefined-path skip.
+      const secretsFile = writeSecretsFile(dirname(file), '# nothing relevant in here\nSOME_UNRELATED_KEY=whatever\n');
+      let observeCalls = 0;
+      const code = await runBootstrapApply(
+        { file, yes: true, secretsFilePath: secretsFile }, // no flags, no env
+        {
+          observe: () => {
+            observeCalls += 1;
+            return Promise.resolve(EMPTY_OBSERVED);
+          },
+        },
+      );
+      expect(code).toBe(1);
+      expect(observeCalls).toBe(0); // never reached a gate
+      const message = errs.join('\n');
+      expect(message).toContain(TS_OAUTH_CLIENT_ID_SECRET_NAME);
+      expect(message).toContain(TS_OAUTH_SECRET_SECRET_NAME);
+    });
+
+    it('flag beats the per-fleet file on conflict', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      const secretsFile = writeSecretsFile(
+        dirname(file),
+        'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=file-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=file-secret\n',
+      );
+      const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      const code = await runBootstrapApply(
+        { file, yes: true, deploy: false, secretsFilePath: secretsFile, tsOauthClientId: 'flag-client-id', tsOauthSecret: 'flag-secret' },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file, {
+          resolvedTsOauth: { clientId: 'flag-client-id', secret: 'flag-secret' },
+          routingSecretsDeps: fakeRoutingSecretsDeps({
+            checkRepoSecretPresence: async () => 'absent',
+            setRepoSecret: async (repo, name, value) => {
+              setSecretCalls.push({ repo, name, value });
+            },
+          }),
+        }),
+      );
+      expect(code).toBe(0);
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'flag-client-id')).toBe(true);
+      expect(setSecretCalls.some((c) => c.value === 'file-client-id')).toBe(false);
+    });
+
+    // groundnuty/macf#1197's operator ruling: "a fleet supplying one
+    // override must not lose every other scope-level value." Fleet file
+    // overrides the client ID only; the secret comes from the SCOPE file.
+    it('per-KEY override end-to-end: a fleet file overriding one key still inherits the OTHER key from the scope file', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      const dir = dirname(file);
+      const fleetFile = writeSecretsFile(dir, 'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=fleet-client-id\n', 'fleet-secrets.env');
+      const scopeFile = writeSecretsFile(
+        dir,
+        'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=scope-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=scope-secret\n',
+        'scope-secrets.env',
+      );
+      const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      const code = await runBootstrapApply(
+        { file, yes: true, deploy: false, secretsFilePath: fleetFile, scopeSecretsFilePath: scopeFile },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file, {
+          resolvedTsOauth: { clientId: 'fleet-client-id', secret: 'scope-secret' },
+          routingSecretsDeps: fakeRoutingSecretsDeps({
+            checkRepoSecretPresence: async () => 'absent',
+            setRepoSecret: async (repo, name, value) => {
+              setSecretCalls.push({ repo, name, value });
+            },
+          }),
+        }),
+      );
+      expect(code).toBe(0);
+      // Whole-file shadowing would have EITHER dropped the scope file
+      // entirely (client-id resolves, secret never does -> refusal) OR
+      // ignored the fleet override. Both keys resolving, from their
+      // DIFFERENT declared tiers, is the decisive per-KEY proof.
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'fleet-client-id')).toBe(true);
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'scope-secret')).toBe(true);
+    });
+
+    it('a --secrets-file path that does not exist refuses loud, before the manifest is even parsed', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      const code = await runBootstrapApply(
+        { file, yes: true, secretsFilePath: join(dirname(file), 'does-not-exist.env') },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+      );
+      expect(code).toBe(1);
+      expect(errs.join('\n')).toContain('does-not-exist.env');
+    });
+
+    it('a file with unknown extra keys is tolerated, not fatal', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      const secretsFile = writeSecretsFile(
+        dirname(file),
+        'SOME_UNKNOWN_FUTURE_KEY=whatever\nMACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=file-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=file-secret\n',
+      );
+      const code = await runBootstrapApply(
+        { file, yes: true, deploy: false, secretsFilePath: secretsFile },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file, {
+          resolvedTsOauth: { clientId: 'file-client-id', secret: 'file-secret' },
+          routingSecretsDeps: fakeRoutingSecretsDeps({ checkRepoSecretPresence: async () => 'absent', setRepoSecret: async () => {} }),
+        }),
+      );
+      expect(code).toBe(0);
+    });
+
+    it('NEVER logs a secret-file-sourced value anywhere in stdout/stderr (text AND --json)', async () => {
+      const SENTINEL_CLIENT_ID = 'SENTINEL-1197-FILE-CLIENT-ID-MUST-NEVER-LEAK';
+      const SENTINEL_SECRET = 'SENTINEL-1197-FILE-SECRET-MUST-NEVER-LEAK';
+      for (const json of [false, true]) {
+        const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+        const secretsFile = writeSecretsFile(dirname(file), `MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=${SENTINEL_CLIENT_ID}\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=${SENTINEL_SECRET}\n`);
+        const code = await runBootstrapApply(
+          { file, yes: true, json, deploy: false, secretsFilePath: secretsFile },
+          { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+          fakeMutateDeps(file, {
+            resolvedTsOauth: { clientId: SENTINEL_CLIENT_ID, secret: SENTINEL_SECRET },
+            routingSecretsDeps: fakeRoutingSecretsDeps({ checkRepoSecretPresence: async () => 'absent', setRepoSecret: async () => {} }),
+          }),
+        );
+        expect(code).toBe(0);
+      }
+      const all = [...logs, ...errs].join('\n');
+      expect(all).not.toContain(SENTINEL_CLIENT_ID);
+      expect(all).not.toContain(SENTINEL_SECRET);
     });
   });
 
