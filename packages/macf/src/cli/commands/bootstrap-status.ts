@@ -20,6 +20,8 @@ import { checkVaultFlagsComplete, fleetPlanFailureToJson } from '../bootstrap/pl
 import type { AgentRegistryObservation } from '../bootstrap/observer.js';
 import { githubRegistryObserver, readAgentRegistryInfo, vaultAwareObserver } from '../bootstrap/observer.js';
 import { bootstrapStatusToJson, computeBootstrapStatus, formatBootstrapStatusText } from '../bootstrap/status.js';
+import type { Presence } from '../bootstrap/plan.js';
+import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
 
 export interface RunBootstrapStatusOptions {
   readonly file: string;
@@ -115,10 +117,47 @@ export async function runBootstrapStatus(
 
     const view = computeBootstrapStatus(manifest, observed, registry);
 
+    // groundnuty/macf#1220 — SAME section, SAME vault gate, as
+    // `commands/bootstrap.ts::runBootstrapPlan`'s own wiring (see that
+    // function's comment for the full rationale). Appended beside `view`
+    // rather than threaded through `computeBootstrapStatus`/`FleetStatusView`
+    // — unlike `advertiseHostDrift` (threaded through `AgentStatusView`,
+    // a pure per-agent comparison with no I/O of its own), THIS check is
+    // its OWN live, credentialed vault-read + JWT probe; folding it into
+    // `computeBootstrapStatus` would make that function impure. Keeping it
+    // a standalone append is the SAME shape `bootstrap.ts`'s plan command
+    // already uses for this identical check.
+    const installScopeCoverage =
+      opts.vaultPath !== undefined && opts.identityKeyPath !== undefined
+        ? await computeInstallScopeCoverage(
+            manifest,
+            observed.lock,
+            Object.fromEntries(Object.entries(observed.agents).map(([role, a]) => [role, a.repo])) as Readonly<Record<string, Presence>>,
+            observed.controlRepoPresence,
+            { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath },
+          )
+        : {};
+    const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
+
     if (opts.json) {
-      console.log(JSON.stringify(bootstrapStatusToJson(view), null, 2));
+      console.log(
+        JSON.stringify(
+          {
+            ...(bootstrapStatusToJson(view) as Record<string, unknown>),
+            ...(Object.keys(installScopeCoverage).length > 0
+              ? { install_scope_coverage: Object.values(installScopeCoverage).map(installScopeCoverageEntryToJson) }
+              : {}),
+          },
+          null,
+          2,
+        ),
+      );
     } else {
       console.log(formatBootstrapStatusText(view));
+      if (installScopeCoverageLines.length > 0) {
+        console.log('');
+        console.log(installScopeCoverageLines.join('\n'));
+      }
     }
     return 0;
   } catch (err) {

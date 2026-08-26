@@ -700,6 +700,13 @@ export function formatBootstrapStatusText(view: FleetStatusView): string {
 // consumer sees one more key it did not ask about; nothing it already reads
 // changes shape or meaning. Two independent changes landed in one cycle: the
 // version is 2 because of #1202 alone.
+//
+// groundnuty/macf#1220 — deliberately NOT bumped either, same #1203 rule
+// applied to a second new top-level key: `install_scope_coverage`
+// (`commands/bootstrap-status.ts`, appended beside this function's own
+// output — see that command's own comment for why it's NOT threaded
+// through `FleetStatusView`) is a brand-new name, changes no EXISTING
+// field's meaning, and feeds no aggregate this JSON already has.
 export const BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION = 2;
 
 /** Structured `--json` shape — carries the SAME facts the text render shows, never a summary of them. */

@@ -193,6 +193,38 @@ describe('runBootstrapStatus', () => {
     expect(code).toBe(1);
     expect(errSpy.mock.calls.flat().join(' ')).not.toContain('fleet manifest not found');
   });
+
+  // groundnuty/macf#1220 — same shape as `bootstrap.test.ts`'s pair for
+  // `runBootstrapPlan`: proves `install_scope_coverage` reaches the REAL
+  // `computeInstallScopeCoverage` (not mocked out — only `observe` is
+  // faked here, exactly as this file already fakes it for every other
+  // test) when both flags are given, and is omitted entirely otherwise.
+  it('--vault + --identity-key: `install_scope_coverage` is populated (unknown, for a nonexistent vault)', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const vaultPath = join(dir, 'does-not-exist', 'vault.age');
+    const identityKeyPath = join(dir, 'does-not-exist', 'identity.txt');
+    const deps: BootstrapStatusDeps = { observe: async () => EMPTY_OBSERVED, readAgentRegistry: async () => ({ status: 'unknown', reason: 'not queried in this test' }) };
+    const code = await runBootstrapStatus({ file, json: true, vaultPath, identityKeyPath }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      install_scope_coverage?: ReadonlyArray<{ role: string; status: string; message?: string }>;
+    };
+    expect(json.install_scope_coverage).toHaveLength(1);
+    expect(json.install_scope_coverage?.[0]?.status).toBe('unknown');
+  });
+
+  it('WITHOUT --vault/--identity-key, `install_scope_coverage` is omitted entirely', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const deps: BootstrapStatusDeps = { observe: async () => EMPTY_OBSERVED, readAgentRegistry: async () => ({ status: 'unknown', reason: 'not queried in this test' }) };
+    const code = await runBootstrapStatus({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as Record<string, unknown>;
+    expect('install_scope_coverage' in json).toBe(false);
+  });
 });
 
 describe('runBootstrapStatus — no-mutation guarantee (static import-shape assertion)', () => {
@@ -217,6 +249,7 @@ describe('runBootstrapStatus — no-mutation guarantee (static import-shape asse
     './vault-read.js',
     './advertise-host-drift.js', // pure comparison only (groundnuty/macf#1203) — no gh/network, see that module's doc
     '../commands/ps.js',
+    '../bootstrap/install-scope-coverage.js', // groundnuty/macf#1220 — read-only: GET /repos/.../installation under an App JWT + a vault DECRYPT (read), no GitHub write; writeScratchPem/cleanupScratchPem are a LOCAL fs scratch file, never a mutation
   ]);
 
   function importSpecifiers(source: string): readonly string[] {
