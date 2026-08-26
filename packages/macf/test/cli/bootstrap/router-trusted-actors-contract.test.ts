@@ -162,3 +162,114 @@ describe("ROUTER_EMITTED_LABELS matches the router's actual self-hosted labels l
     expect(found).toEqual(ROUTER_EMITTED_LABELS);
   });
 });
+
+// --- groundnuty/macf#1194 — the pick-runner hosted exemption, asserted BY NAME ---
+
+/**
+ * `pick-runner` is the ONE job `agent-router.yml` hosts by design (a tiny
+ * dispatcher — see this file's `EXPECTED_ROUTER_VARS_VARS` doc). The
+ * invariant a self-hosted fleet needs is not "no hosted runner runs" — it
+ * is "no hosted runner does the WORK." Asserting the exemption BY NAME
+ * (string equality against this one literal, never "the first job" or
+ * "any job whose id contains 'pick'") is what makes a future job unable to
+ * inherit the exemption by accident: a differently-named job that hardcodes
+ * `runs-on: ubuntu-latest` fails this test.
+ */
+const PICK_RUNNER_EXEMPT_JOB_ID = 'pick-runner';
+
+/** The exact literal EVERY non-exempt job's `runs-on:` must read — data-driven from `pick-runner`'s own output, never a second hardcoded value. */
+const DATA_DRIVEN_RUNS_ON = '${{ fromJSON(needs.pick-runner.outputs.labels) }}';
+
+/**
+ * Extracts every top-level job's `runs-on:` value, keyed by job id.
+ * `jobs:` entries are 2-space indented (`  <job-id>:`); a job's own keys
+ * (including `runs-on:`) are 4-space indented directly under it. Comment
+ * lines that happen to mention "runs-on:" inside a `steps:` block sit at
+ * 6+ spaces of indent and never match the 4-space-exact pattern below.
+ */
+function extractJobRunsOn(workflowText: string): ReadonlyMap<string, string> {
+  const result = new Map<string, string>();
+  let currentJob: string | undefined;
+  for (const line of workflowText.split('\n')) {
+    const jobMatch = /^ {2}([a-zA-Z0-9_-]+):\s*$/.exec(line);
+    if (jobMatch?.[1] !== undefined) {
+      currentJob = jobMatch[1];
+      continue;
+    }
+    if (currentJob === undefined) continue;
+    const runsOnMatch = /^ {4}runs-on:\s*(.+)$/.exec(line);
+    if (runsOnMatch?.[1] !== undefined) result.set(currentJob, runsOnMatch[1].trim());
+  }
+  return result;
+}
+
+describe('extractJobRunsOn (self-test of the parser used below)', () => {
+  it('maps each job id to its runs-on value, ignoring deeper-indented lines that mention runs-on in prose', () => {
+    const text = [
+      'jobs:',
+      '  pick-runner:',
+      '    runs-on: ubuntu-latest',
+      '    steps:',
+      '      - run: echo hi # not a runs-on: line, deeper indent',
+      '  config:',
+      '    needs: pick-runner',
+      '    runs-on: ${{ fromJSON(needs.pick-runner.outputs.labels) }}',
+    ].join('\n');
+    expect(extractJobRunsOn(text)).toEqual(
+      new Map([
+        ['pick-runner', 'ubuntu-latest'],
+        ['config', '${{ fromJSON(needs.pick-runner.outputs.labels) }}'],
+      ]),
+    );
+  });
+});
+
+/**
+ * The pinned literal — every job id + its `runs-on:` value, verified
+ * 2026-08-13 against `groundnuty/macf-actions` `v3.4.2` (`8e2aa48`) via
+ * `grep -n '^  [a-zA-Z0-9_-]*:$\|runs-on:' .github/workflows/agent-router.yml`:
+ * seven jobs total, exactly ONE (`pick-runner`) hardcodes `ubuntu-latest`;
+ * every other job reads the literal `${{ fromJSON(needs.pick-runner.outputs.labels) }}`.
+ */
+const EXPECTED_JOB_RUNS_ON = new Map([
+  ['pick-runner', 'ubuntu-latest'],
+  ['config', DATA_DRIVEN_RUNS_ON],
+  ['route-by-label', DATA_DRIVEN_RUNS_ON],
+  ['route-by-mention', DATA_DRIVEN_RUNS_ON],
+  ['route-by-ci-completion', DATA_DRIVEN_RUNS_ON],
+  ['route-by-pr-review-state', DATA_DRIVEN_RUNS_ON],
+  ['cleanup-labels', DATA_DRIVEN_RUNS_ON],
+]);
+
+describe('pick-runner is the ONLY hosted job (macf#1194 — the decisive exemption test)', () => {
+  it('the pinned literal names exactly one hosted job, by id, and it is pick-runner', () => {
+    const hostedJobs = [...EXPECTED_JOB_RUNS_ON.entries()].filter(([, runsOn]) => runsOn === 'ubuntu-latest').map(([id]) => id);
+    expect(hostedJobs).toEqual([PICK_RUNNER_EXEMPT_JOB_ID]);
+  });
+
+  it('every OTHER pinned job resolves via pick-runner\'s own output, never a second hardcoded value', () => {
+    for (const [jobId, runsOn] of EXPECTED_JOB_RUNS_ON) {
+      if (jobId === PICK_RUNNER_EXEMPT_JOB_ID) continue;
+      expect(runsOn).toBe(DATA_DRIVEN_RUNS_ON);
+    }
+  });
+
+  // Same best-effort LIVE parse posture as the vars.MACF_*/labels tests above.
+  it('LIVE PARSE (skips when no macf-actions checkout is present): every job\'s runs-on matches the pinned literal, and only pick-runner is hosted', () => {
+    const checkoutRoot = process.env['MACF_ACTIONS_CHECKOUT'] ?? '/home/ubuntu/repos/groundnuty/macf-actions';
+    const workflowPath = `${checkoutRoot}/.github/workflows/agent-router.yml`;
+    if (!existsSync(workflowPath)) {
+      console.warn(
+        `SKIP (router-trusted-actors-contract pick-runner exemption): no macf-actions checkout found at ` +
+          `"${workflowPath}" — the live parse did not run this pass. The literal pin above (EXPECTED_JOB_RUNS_ON) ` +
+          'still guards drift. Set MACF_ACTIONS_CHECKOUT to exercise the live parse.',
+      );
+      return;
+    }
+    const text = readFileSync(workflowPath, 'utf-8');
+    const found = extractJobRunsOn(text);
+    expect(found).toEqual(EXPECTED_JOB_RUNS_ON);
+    const hostedJobs = [...found.entries()].filter(([, runsOn]) => runsOn === 'ubuntu-latest').map(([id]) => id);
+    expect(hostedJobs).toEqual([PICK_RUNNER_EXEMPT_JOB_ID]);
+  });
+});
