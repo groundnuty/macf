@@ -82,16 +82,19 @@ import {
   checkTailscaleOauthPreflight,
   checkTsOauthFlagsComplete,
   resolvedTsOauthPair,
+  ROUTING_APP_ID_SECRET_NAME,
   TS_OAUTH_CLIENT_ID_ENV_VAR,
   TS_OAUTH_SECRET_ENV_VAR,
 } from '../bootstrap/apply-routing-secrets.js';
 import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
 import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
-import type { FleetVerdict } from '../bootstrap/fleet-verdict.js';
+import type { FleetVerdict, OrgSecretsListResult } from '../bootstrap/fleet-verdict.js';
 import {
   determineFleetVerdict,
   fleetVerdictToJson,
   formatFleetVerdictLines,
+  realListOrgSecretsVisibleToRepo,
+  resolveOrgSecretVisibility,
   routingVerdictComponent,
   runnerVerdictComponent,
   workspaceVerdictComponent,
@@ -243,6 +246,20 @@ export interface RunBootstrapApplyOptions {
 
 export interface BootstrapApplyDeps {
   readonly observe: FleetObserverFn;
+  /**
+   * Injectable seam for tests (groundnuty/macf#1241) — real default is
+   * `fleet-verdict.ts::realListOrgSecretsVisibleToRepo` (a live
+   * `gh api --paginate .../actions/organization-secrets` read). Threaded
+   * through `resolveOrgSecretVisibility` at the ONE live call site inside
+   * `runBootstrapApply` (never called at all when every routing-secret leg
+   * is already satisfied — see that function's own cost-optimization doc).
+   * Tests exercising a scenario with an unsatisfied leg MUST override this
+   * to a hermetic fake — same "tests MUST override" posture this
+   * interface's other live-network seams already establish (`readVault`,
+   * `confirmAppInstallation`) — otherwise the real `gh` CLI runs during the
+   * test.
+   */
+  readonly listOrgSecretsVisibleToRepo?: (repo: string) => Promise<OrgSecretsListResult>;
   /**
    * Injectable seam for tests (macf#913) — real default is
    * `vault-read.ts::readVault`. Never invoked unless BOTH `opts.vaultPath`
@@ -2018,10 +2035,24 @@ function actionsPinStatusLabel(status: ActionsPinRepoStatus): string {
  * about which components were checked or what each one concluded — one
  * decision, read twice.
  */
-function buildFleetVerdict(result: FleetApplyResult, remainingDeploy: RemainingDeployReport): FleetVerdict {
+/**
+ * `orgSecretVisibility` (groundnuty/macf#1241) defaults to `{}` — a repo
+ * absent from the map is treated by `routingVerdictComponent` as "org-level
+ * visibility never checked this run," which renders BYTE-IDENTICALLY to
+ * this function's pre-#1241 behavior. Every existing call site (including
+ * every test) keeps compiling and rendering unchanged; only the ONE live
+ * call site below (the `--json`/human-render branch inside
+ * `runBootstrapApply`) resolves the map via `resolveOrgSecretVisibility` and
+ * passes it through.
+ */
+function buildFleetVerdict(
+  result: FleetApplyResult,
+  remainingDeploy: RemainingDeployReport,
+  orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {},
+): FleetVerdict {
   const runnerComponent = runnerVerdictComponent(result.routing);
   return determineFleetVerdict([
-    routingVerdictComponent(result.routingSecrets),
+    routingVerdictComponent(result.routingSecrets, orgSecretVisibility),
     ...(runnerComponent !== undefined ? [runnerComponent] : []),
     workspaceVerdictComponent(remainingDeploy),
   ]);
@@ -2034,6 +2065,7 @@ export function formatApplyResult(
   deployPhase?: DeployPhaseRenderInput,
   versionPhase?: ApplyVersionPhaseResult,
   statusNextStep?: { readonly manifestPath: string; readonly flags: DeployFlagsEcho },
+  orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {},
 ): string {
   const parts: string[] = [
     `Control repo: ${formatControlRepoLine(result)}`,
@@ -2102,7 +2134,7 @@ export function formatApplyResult(
   // it happens; this is the end-of-run summary restating it "as plainly as
   // NOT running" per the issue's own requirement. Two streams, one
   // decision (`buildFleetVerdict` is the single computation both read).
-  const verdictLines = formatFleetVerdictLines(buildFleetVerdict(result, remainingDeploy));
+  const verdictLines = formatFleetVerdictLines(buildFleetVerdict(result, remainingDeploy, orgSecretVisibility));
   if (verdictLines.length > 0) parts.push('', ...verdictLines);
   return parts.join('\n');
 }
@@ -2272,6 +2304,7 @@ export function fleetApplyResultToJson(
   remainingDeploy: RemainingDeployReport = { steps: [] },
   deployPhase?: DeployPhaseRenderInput,
   versionPhase?: ApplyVersionPhaseResult,
+  orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {},
 ): unknown {
   return {
     schema_version: FLEET_APPLY_JSON_SCHEMA_VERSION,
@@ -2350,7 +2383,7 @@ export function fleetApplyResultToJson(
     // additive/no-bump decision. `fleetVerdictToJson` returns `undefined`
     // (key omitted) when nothing was checked at all.
     ...((): Record<string, unknown> => {
-      const json = fleetVerdictToJson(buildFleetVerdict(result, remainingDeploy));
+      const json = fleetVerdictToJson(buildFleetVerdict(result, remainingDeploy, orgSecretVisibility));
       return json === undefined ? {} : { fleet_verdict: json };
     })(),
   };
@@ -3308,11 +3341,30 @@ export async function runBootstrapApply(
           : {};
       const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
 
+      // groundnuty/macf#1241 — resolve org-inherited routing-secret
+      // visibility ONLY for the repos `routingVerdictComponent` would
+      // otherwise report as missing a secret, so a fully-satisfied fleet
+      // costs zero extra `gh api` calls. Live-verified state, not a
+      // re-derivation of `result.routingSecrets` — see
+      // `fleet-verdict.ts::resolveOrgSecretVisibility`'s own doc.
+      const orgSecretVisibility = await resolveOrgSecretVisibility(
+        result.routingSecrets,
+        Object.keys(result.routingSecrets[ROUTING_APP_ID_SECRET_NAME] ?? {}),
+        { listOrgSecretsVisibleToRepo: deps?.listOrgSecretsVisibleToRepo ?? realListOrgSecretsVisibleToRepo },
+      );
+
       if (opts.json) {
         console.log(
           JSON.stringify(
             {
-              ...(fleetApplyResultToJson(result, plan.unimplementedByApply, remainingDeploy, deployPhase, versionResult) as Record<string, unknown>),
+              ...(fleetApplyResultToJson(
+                result,
+                plan.unimplementedByApply,
+                remainingDeploy,
+                deployPhase,
+                versionResult,
+                orgSecretVisibility,
+              ) as Record<string, unknown>),
               ...(Object.keys(installScopeCoverage).length > 0
                 ? { install_scope_coverage: Object.values(installScopeCoverage).map(installScopeCoverageEntryToJson) }
                 : {}),
@@ -3324,10 +3376,15 @@ export async function runBootstrapApply(
       } else {
         console.log('');
         console.log(
-          formatApplyResult(result, plan.unimplementedByApply, remainingDeploy, deployPhase, versionResult, {
-            manifestPath,
-            flags: opts,
-          }),
+          formatApplyResult(
+            result,
+            plan.unimplementedByApply,
+            remainingDeploy,
+            deployPhase,
+            versionResult,
+            { manifestPath, flags: opts },
+            orgSecretVisibility,
+          ),
         );
         // groundnuty/macf#1220 — printed LAST, after the rest of the result
         // (never buried mid-render). `installScopeCoverage` above already
