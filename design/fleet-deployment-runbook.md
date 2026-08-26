@@ -526,12 +526,25 @@ outright if the declared requirement isn't satisfiable — same posture as
 the age-recipient refusal in §1: a declared intent the tool cannot honor is
 refused, never silently skipped and never silently proceeded-with.
 
-**If you leave `tailscale_oauth_required` at its default `false`** (the
-common case today, since nothing currently writes this credential into a
-vault automatically): no refusal fires, but `TS_OAUTH_CLIENT_ID`/
-`TS_OAUTH_SECRET` are simply never resolved this run either — the two
-routing-secret legs report an honest `'skipped'`, not `'failed'`. §4 row 4
-is exactly this check, live-reproduced on `macf-trial`.
+**The flag only controls the loudness of the ABSENT case — it never gates
+whether a PRESENT value gets used.** Confirmed directly against
+`plan.ts::tsOauthItem`'s own comment: *"Vault presence is checked
+UNCONDITIONALLY, regardless of `transport.tailscale_oauth_required` … the
+manifest flag only changes how loudly `apply` treats an ABSENT vault; it
+never gates whether a PRESENT vault value gets used."* Concretely:
+
+- **declared `true`, vault has it →** published, same as always.
+- **declared `true`, vault absent it →** refused before gate 1 (above).
+- **left at the default `false`, vault happens to have it** (e.g. copied in
+  by hand, or inherited from an earlier run) **→** still published — the
+  flag never suppresses a value that's already there.
+- **left at the default `false`, vault absent it →** an honest `'skipped'`
+  leg, not `'failed'` — no refusal, but routing still won't work. §4 row 4
+  is exactly this case, live-reproduced on `macf-trial`.
+
+`agent-router.yml` needs this pair **unconditionally** to route, regardless
+of what the manifest declares — the flag is purely about how the tool talks
+to you about a gap, never about whether the gap matters.
 
 ### 7.5 A registry pointed at `{ type: org }` — refused
 
