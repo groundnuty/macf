@@ -119,6 +119,7 @@
  * has (macf#920) is the existing mechanism this fix threads further, not a
  * new one.
  */
+import { existsSync } from 'node:fs';
 import type { TokenSource } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
 import type { LabelsOutcome } from '../commands/repo-init.js';
@@ -246,13 +247,28 @@ function controlRepoLabelsGoodEnough(labels: LabelsOutcome, tokenSourceGiven: bo
  * this fleet) or `resolveKeyPath` returning `undefined` for every role (no
  * `--vault`/`--identity-key` this run, or the vault doesn't hold any
  * declared role's key) both resolve to `undefined` — an honest "nothing to
- * try," not a failure. Pure aside from the (idempotent, already-tolerated)
- * `resolveKeyPath` call itself — no new I/O primitive.
+ * try," not a failure.
+ *
+ * **A returned `keyPath` that doesn't exist on disk is not a credential.**
+ * The real `resolveKeyPath` implementation `writeFileSync`s the decrypted
+ * PEM and only THEN returns its path — a genuine resolution always has a
+ * readable file waiting at that path. A path to nothing (a test double
+ * that fakes a non-empty return without ever writing content, or any other
+ * caller that violates that contract) must not be treated as usable — it
+ * would reach `generateToken()` and attempt a REAL `gh token generate`
+ * subprocess against a key that was never actually written, producing a
+ * confusing failure instead of the honest "nothing to try" this function
+ * returns for every other absent-credential shape. `exists` defaults to
+ * the real `existsSync`; tests inject a fake so this stays a plain,
+ * synchronous, no-network check — same convention as
+ * `bootstrap-apply.ts::findAvailableRecoveryArtifacts`'s own injectable
+ * `exists` parameter.
  */
 export function resolveControlRepoLabelTokenSource(
   manifest: FleetManifest,
   priorLock: FleetLock | null,
   resolveKeyPath: ((role: string, priorAppId: string) => string | undefined) | undefined,
+  exists: (path: string) => boolean = existsSync,
 ): TokenSource | undefined {
   if (priorLock === null || resolveKeyPath === undefined) return undefined;
   for (const agent of manifest.agents) {
@@ -260,6 +276,7 @@ export function resolveControlRepoLabelTokenSource(
     if (prior === undefined) continue;
     const keyPath = resolveKeyPath(agent.role, prior.app_id);
     if (keyPath === undefined) continue;
+    if (!exists(keyPath)) continue;
     return { appId: prior.app_id, installId: prior.install_id, keyPath };
   }
   return undefined;

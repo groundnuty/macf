@@ -3957,6 +3957,8 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
       agents: ['code-agent'],
       labels: { status: 'ok', created: [], existed: ['code-agent', 'in-progress', 'in-review', 'blocked', 'agent-offline'] },
       workflowAndConfigAllowlisted: false,
+      // groundnuty/macf#1221: trivially true — `labels.status === 'ok'` above.
+      labelsGoodEnough: true,
     },
     lockPath: '/x/fleet.lock',
     finalLock: null,
@@ -4101,7 +4103,14 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     ).toBe(1);
   });
 
-  it('applyExitCode: 0 when control-repo repo-init wrote successfully but labels were SKIPPED (no token this run — the expected steady state, not a failure)', () => {
+  // groundnuty/macf#1221 SUPERSEDES the pre-#1221 expectation this test used
+  // to pin (`toBe(0)`, comment: "the expected steady state, not a failure").
+  // That was the exact defect the issue reports: a fleet whose control repo
+  // never got its labels created was indistinguishable, by exit code, from a
+  // fully green apply. `2` is NOT a hard failure (no other leg is touched,
+  // nothing aborts) but IS the honest "not fully green" signal, same 2-slot
+  // `#1151` already established for a partial version roll.
+  it('applyExitCode: 2 (not 0, not 1) when control-repo repo-init wrote successfully but labels were SKIPPED with no credential ever resolvable this run (groundnuty/macf#1221)', () => {
     expect(
       applyExitCode(
         resultWith({
@@ -4111,10 +4120,28 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
             agents: ['code-agent'],
             labels: { status: 'skipped', reason: 'no GH_TOKEN/APP_ID this run' },
             workflowAndConfigAllowlisted: false,
+            labelsGoodEnough: true,
           },
         }),
       ),
-    ).toBe(0);
+    ).toBe(2);
+  });
+
+  it('applyExitCode: 1 (not 2) when control-repo repo-init labels FAILED after a legitimate tokenSource was supplied this run (groundnuty/macf#1221)', () => {
+    expect(
+      applyExitCode(
+        resultWith({
+          controlRepoInit: {
+            status: 'written',
+            repo: 'groundnuty/demo-fleet-control',
+            agents: ['code-agent'],
+            labels: { status: 'skipped', reason: 'GitHub API 401 — revoked key' },
+            workflowAndConfigAllowlisted: false,
+            labelsGoodEnough: false,
+          },
+        }),
+      ),
+    ).toBe(1);
   });
 
   it('applyExitCode: 0 when control repo is reused + sync is nothing-to-commit (steady-state re-run)', () => {

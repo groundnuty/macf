@@ -2167,9 +2167,24 @@ export function fleetApplyResultToJson(
  *   the pre-existing #1053 test this file keeps), while `fleet upgrade`'s
  *   own whole-fleet-`skipped` shape is a stronger signal at that command's
  *   own layer.
+ * - **`2`, second trigger (groundnuty/macf#1221).** A control-repo
+ *   `repo-init` outcome of `'written'` whose `labels.status !== 'ok'` AND
+ *   `labelsGoodEnough === true` — i.e. no legitimate credential was ever
+ *   resolvable this run for the label-creation mint (the honest
+ *   "nothing to try" gap; `hardFailure` above already claims the OTHER,
+ *   genuine-failure half of a non-good-enough outcome — a credential WAS
+ *   supplied and still didn't fully land). Before this fix, THIS shape
+ *   reported `0` — the exact defect the issue reports: "a warning that
+ *   leaves the fleet in a state where a queue can never return work is not
+ *   a warning — it is a failure that chose not to say so." Reuses this
+ *   SAME `2` slot rather than inventing a third vocabulary for "not a hard
+ *   failure, but not fully green either."
  * - **`0`** — every hard-failure predicate is false AND the version phase
  *   left no one behind (not attempted at all, attempted-and-fully-rolled,
- *   or attempted-and-honestly-unreachable).
+ *   or attempted-and-honestly-unreachable) AND the control-repo label
+ *   outcome is either `'ok'` or not yet applicable (`'skipped'`/`'failed'`
+ *   control-repo-init outcomes are governed by the checks above, not this
+ *   one).
  *
  * **Audited other inputs for the same "partial success, not surfaced"
  * shape (macf#1151) — none needed a change:**
@@ -2340,7 +2355,18 @@ export function applyExitCode(
   // always outranks partial even when a halted roll ALSO left other agents
   // skipped for unrelated reasons.
   const versionPartial = versionPhase?.attempted === true && (versionPhase.skipBreakdown?.length ?? 0) > 0;
-  return versionPartial ? 2 : 0;
+  // groundnuty/macf#1221 — a `'written'` outcome whose labels are not `'ok'`
+  // AND `labelsGoodEnough` (no legitimate credential was ever resolvable
+  // this run — `hardFailure` above already caught the OTHER, genuine-failure
+  // half of `!labelsGoodEnough`) is not a hard failure, but it is also not
+  // fully green: the issue's own closure condition is that a fleet whose
+  // control repo lacks an agent label must not report success. Reuses the
+  // SAME 2-slot `formatVersionReconcileLine`/#1151 established for "not a
+  // hard failure, but not fully green either" — never a THIRD bespoke
+  // vocabulary for the same shape.
+  const controlRepoLabelsPending =
+    result.controlRepoInit.status === 'written' && result.controlRepoInit.labels.status !== 'ok' && result.controlRepoInit.labelsGoodEnough;
+  return versionPartial || controlRepoLabelsPending ? 2 : 0;
 }
 
 // --- Recovery-artifact presence notice (macf#988, DR-043 Amendment B requirement 4) ---

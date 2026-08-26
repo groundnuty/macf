@@ -12,7 +12,7 @@
  * one" (a bug that ships only one label would still pass a weaker test).
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -412,10 +412,15 @@ describe('resolveControlRepoLabelTokenSource (groundnuty/macf#1221) — pure', (
       ],
     };
     const seenRoles: string[] = [];
-    const result = resolveControlRepoLabelTokenSource(MANIFEST, priorLock, (role, appId) => {
-      seenRoles.push(role);
-      return `/vault/${appId}.pem`;
-    });
+    const result = resolveControlRepoLabelTokenSource(
+      MANIFEST,
+      priorLock,
+      (role, appId) => {
+        seenRoles.push(role);
+        return `/vault/${appId}.pem`;
+      },
+      () => true,
+    );
     expect(result).toEqual({ appId: 'app-code-agent', installId: 'install-1', keyPath: '/vault/app-code-agent.pem' });
     expect(seenRoles).toEqual(['code-agent']);
   });
@@ -429,8 +434,11 @@ describe('resolveControlRepoLabelTokenSource (groundnuty/macf#1221) — pure', (
         { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
       ],
     };
-    const result = resolveControlRepoLabelTokenSource(MANIFEST, priorLock, (role) =>
-      role === 'science-agent' ? '/vault/science-agent.pem' : undefined,
+    const result = resolveControlRepoLabelTokenSource(
+      MANIFEST,
+      priorLock,
+      (role) => (role === 'science-agent' ? '/vault/science-agent.pem' : undefined),
+      () => true,
     );
     expect(result).toEqual({ appId: 'app-science-agent', installId: 'install-2', keyPath: '/vault/science-agent.pem' });
   });
@@ -442,6 +450,36 @@ describe('resolveControlRepoLabelTokenSource (groundnuty/macf#1221) — pure', (
       agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
     };
     expect(resolveControlRepoLabelTokenSource(MANIFEST, priorLock, () => undefined)).toBeUndefined();
+  });
+
+  it('REGRESSION — a resolved keyPath that does not exist on disk is NOT a credential (default real existsSync, no fake exists injected)', () => {
+    // No `exists` override here — this exercises the REAL `existsSync`
+    // default, proving the guard fires for a path that genuinely isn't on
+    // disk, not merely for a fake that always says "no."
+    const priorLock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+    };
+    const result = resolveControlRepoLabelTokenSource(MANIFEST, priorLock, () => '/definitely/does/not/exist/x.pem');
+    expect(result).toBeUndefined();
+  });
+
+  it('a resolved keyPath that DOES exist on disk (real file, real existsSync) IS a usable credential', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-control-repo-token-exists-test-'));
+    try {
+      const keyPath = join(dir, 'code-agent.pem');
+      writeFileSync(keyPath, 'not a real PEM, just needs to exist for this check', 'utf-8');
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      const result = resolveControlRepoLabelTokenSource(MANIFEST, priorLock, () => keyPath);
+      expect(result).toEqual({ appId: 'app-code-agent', installId: 'install-1', keyPath });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
