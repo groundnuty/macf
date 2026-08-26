@@ -8,8 +8,9 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveDeps, runBootstrapPlan, type BootstrapPlanDeps } from '../../src/cli/commands/bootstrap.js';
+import { operatorInputProvenance, resolveDeps, runBootstrapPlan, type BootstrapPlanDeps } from '../../src/cli/commands/bootstrap.js';
 import type { ObservedState } from '../../src/cli/bootstrap/plan.js';
+import { parseFleetManifest } from '../../src/cli/bootstrap/fleet-manifest.js';
 
 const VALID_FLEET_YAML = `
 apiVersion: macf/v0
@@ -66,6 +67,9 @@ const VALID_FLEET_YAML_WITH_ROUTING = VALID_FLEET_YAML.replace(
   'routing:\n  runner:\n    runs_on: self-hosted\nagents:\n',
 );
 const OBSERVED_ROUTING_DRIFT: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
+
+/** groundnuty/macf#1197 — same fixture as {@link VALID_FLEET_YAML}, `transport.tailscale_oauth_required: true` declared. Used ONLY by the operator-inputs-provenance describe block below. */
+const VALID_FLEET_YAML_WITH_TAILSCALE = VALID_FLEET_YAML.replace('age_recipients: []', 'age_recipients: []\n  tailscale_oauth_required: true');
 
 describe('runBootstrapPlan', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -569,5 +573,78 @@ describe('runBootstrapPlan — advertise-host drift (groundnuty/macf#1203)', () 
     };
     expect(json.plan.some((i) => i.kind === 'advertise_host')).toBe(false);
     expect(json.unimplemented_by_apply.some((i) => i.kind === 'advertise_host')).toBe(false);
+  });
+});
+
+describe('operatorInputProvenance (pure) — groundnuty/macf#1197: "plan states which keys it will need... the resolved source of each key is reportable"', () => {
+  it('a manifest declaring NOTHING relevant reports zero keys', () => {
+    const manifest = parseFleetManifest(VALID_FLEET_YAML);
+    expect(operatorInputProvenance(manifest, undefined, undefined)).toEqual([]);
+  });
+
+  it('a manifest declaring tailscale_oauth_required reports BOTH keys — "not supplied" when neither file/env has them', () => {
+    const manifest = parseFleetManifest(VALID_FLEET_YAML_WITH_TAILSCALE);
+    const report = operatorInputProvenance(manifest, undefined, undefined);
+    expect(report).toEqual([
+      { key: 'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID', source: 'none' },
+      { key: 'MACF_BOOTSTRAP_TS_OAUTH_SECRET', source: 'none' },
+    ]);
+  });
+
+  it('reports the resolved SOURCE (never the value) once a file supplies a key', () => {
+    const manifest = parseFleetManifest(VALID_FLEET_YAML_WITH_TAILSCALE);
+    const report = operatorInputProvenance(
+      manifest,
+      { MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID: 'SENTINEL-PLAN-VALUE' },
+      { MACF_BOOTSTRAP_TS_OAUTH_SECRET: 'SENTINEL-PLAN-SCOPE-VALUE' },
+    );
+    expect(report).toEqual([
+      { key: 'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID', source: 'fleet-file' },
+      { key: 'MACF_BOOTSTRAP_TS_OAUTH_SECRET', source: 'scope-file' },
+    ]);
+  });
+
+  it('a manifest declaring routing.runner (self-hosted) reports the runner token AND the platform endpoint', () => {
+    const manifest = parseFleetManifest(VALID_FLEET_YAML_WITH_ROUTING);
+    const report = operatorInputProvenance(manifest, undefined, undefined);
+    expect(report.map((r) => r.key)).toEqual(['MACF_RUNNER_PLATFORM_ENDPOINT', 'MACF_BOOTSTRAP_RUNNER_TOKEN']);
+  });
+});
+
+describe('runBootstrapPlan — operator secrets file (groundnuty/macf#1197)', () => {
+  const dirs: string[] = [];
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: ReturnType<typeof vi.spyOn>;
+
+  afterEach(() => {
+    logSpy?.mockRestore();
+    errSpy?.mockRestore();
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  it('--json output carries an operator_inputs section, never a value — only key + source', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML_WITH_TAILSCALE);
+    dirs.push(dir);
+    const secretsPath = join(dir, 'secrets.env');
+    writeFileSync(secretsPath, 'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=SENTINEL-PLAN-JSON-VALUE\n');
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapPlan({ file, json: true, secretsFilePath: secretsPath }, { observe: async () => EMPTY_OBSERVED });
+    expect(code).toBe(0);
+    const rendered = logSpy.mock.calls.flat().join('');
+    expect(rendered).not.toContain('SENTINEL-PLAN-JSON-VALUE');
+    const json = JSON.parse(rendered) as { operator_inputs: ReadonlyArray<{ key: string; source: string }> };
+    expect(json.operator_inputs).toEqual([
+      { key: 'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID', source: 'fleet-file' },
+      { key: 'MACF_BOOTSTRAP_TS_OAUTH_SECRET', source: 'none' },
+    ]);
+  });
+
+  it('a --secrets-file path that does not exist refuses loud, before the manifest is even parsed', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const code = await runBootstrapPlan({ file, secretsFilePath: join(dir, 'does-not-exist.env') });
+    expect(code).toBe(1);
+    expect(errSpy.mock.calls.flat().join('\n')).toContain('does-not-exist.env');
   });
 });
