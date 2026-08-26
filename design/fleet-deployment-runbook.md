@@ -401,6 +401,25 @@ credential (the router App) via a cross-fleet vault copy — its absence on a
 `'shared'`-scope fleet whose vault genuinely lacks that credential is
 itself informative (§7.3).
 
+### 6.8 Flags that must be given together, or not at all
+
+Checked directly across every command's option definitions in
+`packages/macf/src/cli/index.ts` — these are the flag pairs/groups where
+giving one without the other is either rejected outright or silently
+changes what the command does, not merely a documentation nicety:
+
+| Command(s) | Constraint | What happens if you violate it |
+|---|---|---|
+| `bootstrap plan`, `bootstrap status`, `bootstrap apply`, `bootstrap manifest scaffold`, `fleet deploy` | `--vault <path>` and `--identity-key <path>` are **together-or-neither** | Enforced (`checkVaultFlagsComplete` / the same check inlined for `fleet deploy`): giving exactly one without the other is a refusal, not a silent degrade to the vault-free default — this is deliberate: a half-given pair usually means the operator forgot the second flag, not that they intended vault-free operation. |
+| `fleet destroy` | `--age-identity <path>` is **required when** `--shred-age-key` is given (not required otherwise) | `--shred-age-key` alone doesn't refuse at the flag level, but the shred step has nothing to act on without a path — always pass both together. |
+| `fleet destroy` | `--destroy-repositories`, the interactive fleet-name confirmation, **and** `MACF_I_UNDERSTAND_THIS_DELETES_REPOSITORIES=1` are **all three required** | Missing any one refuses the run — none of the three is optional or implied by either of the others (§9). |
+| `bootstrap apply` | `--runner-token <token>` (or `MACF_BOOTSTRAP_RUNNER_TOKEN`) is **required when** the manifest declares `routing.runner.runs_on: self-hosted` | A manifest-conditioned requirement, not a flag-to-flag one: the flag is optional on a fleet with no self-hosted runner declared, and a hard pre-flight refusal (before gate 1) on one that has it (§7.1, §6.5). |
+| `bootstrap manifest scaffold` | `--owner`, `--fleet`, and at least one `--agent role=owner/repo` are all `requiredOption`s; `--vault`/`--identity-key` follow the same together-or-neither rule as the row above | The three required options have no defaults at all (commander refuses to run without them); the vault pair is optional but paired. |
+
+No other command in `packages/macf/src/cli/index.ts`'s `bootstrap`/`fleet`
+families was found to have a cross-flag requirement beyond these five rows
+— every other flag on every other command is independently optional.
+
 ---
 
 ## 7. Non-happy paths — what you actually hit, and why
