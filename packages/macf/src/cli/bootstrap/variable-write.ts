@@ -113,7 +113,23 @@ export type CreateVariableFn = (pathPrefix: string, name: string, value: string)
 // non-throwing outcome from stderr) so the two write directions stay
 // side-by-side and easy to audit together.
 
-export type DeleteVariableResult = 'deleted' | 'already-absent';
+/**
+ * `groundnuty/macf#1206` — three-way, honest-unknown classification of a
+ * variable-delete attempt. `'deregistered'` — the DELETE succeeded, i.e. the
+ * variable EXISTED and is now gone. `'absent'` — the API reported a 404:
+ * there was NOTHING to remove (either never written, or a previous teardown
+ * already took it). `'unknown'` — the delete attempt did not return a
+ * definitive success or 404 (auth, network, rate-limit, malformed registry
+ * config) — presence/outcome could NOT be confirmed, and this is NEVER
+ * collapsed into `'absent'` (that would misreport "nothing was there" when
+ * the truth is "we couldn't tell"). Mirrors `app-identity-removal.ts`'s
+ * `AppDeletionOutcome.status` three-way split (`'already-absent'` /
+ * `'unknown'` / everything-else, groundnuty/macf#917 + #967) and
+ * `observer.ts::checkRegistryVariablePresence`'s own `Presence` return
+ * (`'present'|'absent'|'unknown'`) — same honest-unknown-floor shape,
+ * applied to a DELETE response instead of a GET.
+ */
+export type DeleteVariableResult = 'deregistered' | 'absent' | 'unknown';
 
 /** Pure — the exact `gh api` argv for a variable delete. Same leading-`/`-stripping convention as {@link buildCreateVariableArgs}. */
 export function buildDeleteVariableArgs(pathPrefix: string, name: string): readonly string[] {
@@ -122,32 +138,59 @@ export function buildDeleteVariableArgs(pathPrefix: string, name: string): reado
 }
 
 /**
- * Real delete. `'already-absent'` means the API reported a 404 — GitHub's
- * own delete-variable contract treats "already gone" as an acceptable
- * outcome (`@groundnuty/macf-core`'s `github-client.ts::deleteVariable`
- * treats 204/404 identically), and DR-043 Amendment G's `deactivate` is
- * explicitly idempotent-on-rerun, so a 404 here is NOT a failure — it is
- * the expected steady state for e.g. `<SEG>_FEDERATED_CAS`, which nothing
- * writes yet in this codebase (day-2 federation is out of Slice-1a scope).
- * Any OTHER failure (auth, network, insufficient scope) throws — never
- * silently swallowed, so the caller's "report what could not be done" rail
- * has something concrete to report.
+ * Real delete. `'absent'` means the API reported a 404 — GitHub's own
+ * delete-variable contract treats "already gone" as an acceptable outcome
+ * (`@groundnuty/macf-core`'s `github-client.ts::deleteVariable` treats
+ * 204/404 identically), and DR-043 Amendment G's `deactivate` is explicitly
+ * idempotent-on-rerun, so a 404 here is NOT a failure — it is the expected
+ * steady state for e.g. `<SEG>_FEDERATED_CAS`, which nothing writes yet in
+ * this codebase (day-2 federation is out of Slice-1a scope).
+ *
+ * **`groundnuty/macf#1206` — never throws.** Any OTHER outcome (auth,
+ * network, insufficient scope, rate-limit) used to throw; it now classifies
+ * to `'unknown'` instead — the SAME honest-unknown-floor posture
+ * `checkRegistryVariablePresence` already applies to its own GET. A thrown
+ * exception collapsed "we don't know what happened" into whatever the
+ * caller's catch-block chose to call it (previously always `'failed'`,
+ * indistinguishable from a confirmed operational failure); returning
+ * `'unknown'` as DATA lets the caller (`teardown.ts::executeDeactivate`)
+ * report the distinction honestly instead of guessing at it one layer up.
  */
 export async function realDeleteVariable(pathPrefix: string, name: string): Promise<DeleteVariableResult> {
   try {
     await execFileAsync('gh', [...buildDeleteVariableArgs(pathPrefix, name)], { encoding: 'utf-8' });
-    return 'deleted';
+    return 'deregistered';
   } catch (err) {
     const stderr = getStderr(err);
-    if (/HTTP 404|Not Found/i.test(stderr)) return 'already-absent';
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`gh api delete-variable failed for "${name}" at "${pathPrefix}": ${stderr || msg}`, { cause: err });
+    if (/HTTP 404|Not Found/i.test(stderr)) return 'absent';
+    return 'unknown';
   }
 }
 
 export type DeleteVariableFn = (pathPrefix: string, name: string) => Promise<DeleteVariableResult>;
 
-/** Real registry-scope delete — `registryPathPrefix` + {@link realDeleteVariable}, mirroring `apply-ca.ts::realCreateRegistryVariable`'s create-side wrapper. The ONLY delete primitive DR-043 Amendment G's `deactivate` uses — its target set (`teardown.ts::computeDeactivateTargets`) is registry-scope ONLY by construction (never `repos/<agent-repo>` — see that module's doc for why repo-scoped variables are explicitly out of `deactivate`'s blast radius). */
+/**
+ * Real registry-scope delete — `registryPathPrefix` + {@link realDeleteVariable},
+ * mirroring `apply-ca.ts::realCreateRegistryVariable`'s create-side wrapper.
+ * The ONLY delete primitive DR-043 Amendment G's `deactivate` uses — its
+ * target set (`teardown.ts::computeDeactivateTargets`) is registry-scope
+ * ONLY by construction (never `repos/<agent-repo>` — see that module's doc
+ * for why repo-scoped variables are explicitly out of `deactivate`'s blast
+ * radius).
+ *
+ * `registryPathPrefix` degrades to `'unknown'` on a synchronous throw
+ * (`registry.type === 'local'` — DR-024 mode, out of scope for a DR-043
+ * fleet's registry but defensively guarded here) rather than letting the
+ * exception escape uncaught — the SAME defensive shape
+ * `observer.ts::checkRegistryVariablePresence` already applies around the
+ * identical call (groundnuty/macf#1206's honest-unknown floor).
+ */
 export async function realDeleteRegistryVariable(registry: RegistryConfig, name: string): Promise<DeleteVariableResult> {
-  return realDeleteVariable(registryPathPrefix(registry), name);
+  let pathPrefix: string;
+  try {
+    pathPrefix = registryPathPrefix(registry);
+  } catch {
+    return 'unknown';
+  }
+  return realDeleteVariable(pathPrefix, name);
 }

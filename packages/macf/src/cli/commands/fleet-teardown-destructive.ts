@@ -71,7 +71,17 @@ const AGENT_STOP_OUT_OF_SCOPE_SHIM: TeardownAgentDeps = {
 
 const execFileAsync = promisify(execFile);
 
-export const FLEET_TEARDOWN_DESTRUCTIVE_JSON_SCHEMA_VERSION = 1;
+/**
+ * `groundnuty/macf#1206` bumped this 1 -> 2: `registry_outcomes[].status`
+ * (reused, unchanged, from `teardown.ts::VariableTeardownOutcome` via
+ * `executeDeactivate`) carries the SAME literal-value change
+ * `fleet-teardown.ts`'s own `FLEET_TEARDOWN_JSON_SCHEMA_VERSION` bump
+ * documents (`'deleted'`/`'already-absent'` -> `'deregistered'`/`'absent'`,
+ * plus a new `'unknown'` value) — this command's `--json` output is a
+ * SEPARATE schema namespace, so it needs its OWN bump for the identical
+ * reason, per the `routing-doctor.ts` schema_version precedent (3->4, 4->5).
+ */
+export const FLEET_TEARDOWN_DESTRUCTIVE_JSON_SCHEMA_VERSION = 2;
 
 /** The env-acknowledgment `destroy` requires — a dedicated var name, never reused from any other MACF env flag, so it can never be set "by accident" via an unrelated `MACF_*=1` export. */
 export const DESTROY_ENV_ACK_VAR = 'MACF_I_UNDERSTAND_THIS_DELETES_REPOSITORIES';
@@ -352,7 +362,14 @@ function deleteAppsResultToJson(result: DeleteAppsResult): unknown {
  */
 function deleteAppsExitCode(result: DeleteAppsResult): number {
   if (!result.gate.allowed) return 1;
-  if (result.registryOutcomes.some((o) => o.status === 'failed')) return 1;
+  // groundnuty/macf#1206 — 'unknown' forces non-zero, same reasoning as
+  // fleet-teardown.ts's deactivateExitCode: an unconfirmed delete outcome
+  // is "could not be done," never a quiet green. In PRACTICE this line is
+  // currently redundant with `appOutcomes.length > 0` below (always true
+  // for any real fleet), but the contract should be honest independent of
+  // that — a future change to the App-identity rung must not silently
+  // re-open this gap.
+  if (result.registryOutcomes.some((o) => o.status === 'failed' || o.status === 'unknown')) return 1;
   if (result.repoOutcomes.some((o) => o.status === 'failed')) return 1;
   if (result.appOutcomes.length > 0) return 1;
   return 0;
@@ -531,7 +548,8 @@ function destroyResultToJson(result: DestroyResult): unknown {
 function destroyExitCode(result: DestroyResult): number {
   if (!result.gate.allowed) return 1;
   if (result.acknowledgmentsMissing.length > 0) return 1;
-  if (result.registryOutcomes.some((o) => o.status === 'failed')) return 1;
+  // groundnuty/macf#1206 — see the identical comment in deleteAppsExitCode.
+  if (result.registryOutcomes.some((o) => o.status === 'failed' || o.status === 'unknown')) return 1;
   if (result.repoOutcomes.some((o) => o.status === 'failed')) return 1;
   if (result.appOutcomes.length > 0) return 1;
   if (result.shredRequested && !result.shredPerformed) return 1;

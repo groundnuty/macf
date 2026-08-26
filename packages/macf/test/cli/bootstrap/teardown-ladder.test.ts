@@ -107,12 +107,12 @@ function makeStatefulFakeBackend() {
     repoArchived.set(repo, true);
   };
 
-  const deleteRegistryVariable = async (_registry: unknown, name: string): Promise<'deleted' | 'already-absent'> => {
+  const deleteRegistryVariable = async (_registry: unknown, name: string): Promise<'deregistered' | 'absent'> => {
     if (registryVars.has(name)) {
       registryVars.delete(name);
-      return 'deleted';
+      return 'deregistered';
     }
-    return 'already-absent';
+    return 'absent';
   };
 
   // groundnuty/macf#1033 — this ladder test predates the graceful-stop state
@@ -137,7 +137,7 @@ describe('the full ladder — deactivate -> archive -> delete-apps — runs clea
     const deactivatePlan = await buildDeactivatePlan(MANIFEST, { ...controlRepoDeps, checkRegistryPresence: async () => 'present' });
     expect(deactivatePlan.gate.allowed).toBe(true);
     const deactivateOutcomes = await executeDeactivate(MANIFEST, deactivatePlan.targets, backend);
-    expect(deactivateOutcomes.every((o) => o.status === 'deleted')).toBe(true);
+    expect(deactivateOutcomes.every((o) => o.status === 'deregistered')).toBe(true);
     expect(backend.registryVars.size).toBe(0); // every registry key genuinely gone now
 
     // --- Rung 2: archive (re-runs deactivate's registry deletion internally, per the CLI layer, PLUS archives repos) ---
@@ -147,7 +147,7 @@ describe('the full ladder — deactivate -> archive -> delete-apps — runs clea
     // Registry keys are ALREADY gone from rung 1 — re-running must be a
     // faithful no-op, not a failure (the deactivate idempotency this ladder
     // also depends on).
-    expect(archiveRegistryOutcomes.every((o) => o.status === 'already-absent')).toBe(true);
+    expect(archiveRegistryOutcomes.every((o) => o.status === 'absent')).toBe(true);
     const archiveRepoOutcomes = await executeArchiveRepos(archivePlan.repoTargets, backend);
     expect(archiveRepoOutcomes.every((o) => o.status === 'archived')).toBe(true);
     expect([...backend.repoArchived.values()].every((v) => v === true)).toBe(true); // every repo genuinely archived now
@@ -168,7 +168,7 @@ describe('the full ladder — deactivate -> archive -> delete-apps — runs clea
 
     // The registry re-run inside delete-apps is ALSO idempotent (rung 1 + 2
     // already cleared everything).
-    expect(deleteAppsResult.registryOutcomes.every((o) => o.status === 'already-absent')).toBe(true);
+    expect(deleteAppsResult.registryOutcomes.every((o) => o.status === 'absent')).toBe(true);
 
     // The App-identity rung is unaffected by any of the above — it always
     // reports (no live check wired in this test), never claims deletion.
@@ -183,7 +183,7 @@ describe('the full ladder — deactivate -> archive -> delete-apps — runs clea
     const deactivatePlan = await buildDeactivatePlan(MANIFEST, { ...controlRepoDeps, checkRegistryPresence: async () => 'present' });
     await executeDeactivate(MANIFEST, deactivatePlan.targets, backend);
     const secondDeactivate = await executeDeactivate(MANIFEST, deactivatePlan.targets, backend);
-    expect(secondDeactivate.every((o) => o.status === 'already-absent')).toBe(true);
+    expect(secondDeactivate.every((o) => o.status === 'absent')).toBe(true);
 
     const archivePlan = await buildArchivePlan(MANIFEST, { ...controlRepoDeps, checkRegistryPresence: async () => 'absent' });
     await executeArchiveRepos(archivePlan.repoTargets, backend);
@@ -196,7 +196,7 @@ describe('the full ladder — deactivate -> archive -> delete-apps — runs clea
     const deleteAppsPlan = await buildDeleteAppsPlan(MANIFEST, { ...controlRepoDeps, checkRegistryPresence: async () => 'absent' });
     await executeDeleteApps(MANIFEST, deleteAppsPlan, () => {}, backend);
     const secondDeleteApps = await executeDeleteApps(MANIFEST, deleteAppsPlan, () => {}, backend);
-    expect(secondDeleteApps.registryOutcomes.every((o) => o.status === 'already-absent')).toBe(true);
+    expect(secondDeleteApps.registryOutcomes.every((o) => o.status === 'absent')).toBe(true);
     expect(secondDeleteApps.repoOutcomes.every((o) => o.status === 'already-archived')).toBe(true);
   });
 });

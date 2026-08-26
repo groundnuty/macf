@@ -124,7 +124,7 @@ describe('runVariableRoundTrip (pure orchestration — fakes only, no network)',
     const createFn: CreateVariableFn = async () => {
       throw new Error('gh api create-variable failed for "X" at "orgs/o": HTTP 422: object is missing required key: visibility');
     };
-    const deleteFn: DeleteVariableFn = async () => 'deleted';
+    const deleteFn: DeleteVariableFn = async () => 'deregistered';
     const result = await runVariableRoundTrip('orgs/o', createFn, deleteFn);
     expect(result.ok).toBe(false);
     expect(result.detail).toContain('visibility');
@@ -132,7 +132,7 @@ describe('runVariableRoundTrip (pure orchestration — fakes only, no network)',
 
   it('reports success on a clean create+delete round trip', async () => {
     const createFn: CreateVariableFn = async () => 'created';
-    const deleteFn: DeleteVariableFn = async () => 'deleted';
+    const deleteFn: DeleteVariableFn = async () => 'deregistered';
     const result = await runVariableRoundTrip('repos/o/r', createFn, deleteFn);
     expect(result.ok).toBe(true);
   });
@@ -150,16 +150,24 @@ describe('runVariableRoundTrip (pure orchestration — fakes only, no network)',
 
   it('FAILS when create returns "exists" for a freshly-generated name (a bare truthy check would miss this)', async () => {
     const createFn: CreateVariableFn = async () => 'exists';
-    const deleteFn: DeleteVariableFn = async () => 'deleted';
+    const deleteFn: DeleteVariableFn = async () => 'deregistered';
     const result = await runVariableRoundTrip('repos/o/r', createFn, deleteFn);
     expect(result.ok).toBe(false);
   });
 
-  it('FAILS when the cleanup delete returns "already-absent" instead of "deleted" (create silently no-opped)', async () => {
+  it('FAILS when the cleanup delete returns "absent" instead of "deregistered" (create silently no-opped)', async () => {
     const createFn: CreateVariableFn = async () => 'created';
-    const deleteFn: DeleteVariableFn = async () => 'already-absent';
+    const deleteFn: DeleteVariableFn = async () => 'absent';
     const result = await runVariableRoundTrip('repos/o/r', createFn, deleteFn);
     expect(result.ok).toBe(false);
+  });
+
+  it('FAILS when the cleanup delete returns "unknown" instead of "deregistered" (groundnuty/macf#1206 — never treated as a confirmed cleanup)', async () => {
+    const createFn: CreateVariableFn = async () => 'created';
+    const deleteFn: DeleteVariableFn = async () => 'unknown';
+    const result = await runVariableRoundTrip('repos/o/r', createFn, deleteFn);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('unknown');
   });
 
   it('passes the SAME name to createFn and deleteFn (round trip on one variable, not two)', async () => {
@@ -170,7 +178,7 @@ describe('runVariableRoundTrip (pure orchestration — fakes only, no network)',
     };
     const deleteFn: DeleteVariableFn = async (_prefix, name) => {
       seen.deleted = name;
-      return 'deleted';
+      return 'deregistered';
     };
     await runVariableRoundTrip('repos/o/r', createFn, deleteFn);
     expect(seen.created).toBeDefined();

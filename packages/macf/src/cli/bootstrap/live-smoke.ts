@@ -191,10 +191,16 @@ export async function runVariableRoundTrip(
 
   try {
     const deleted = await deleteFn(pathPrefix, name);
-    if (deleted !== 'deleted') {
+    // groundnuty/macf#1206 — `DeleteVariableResult` is now three-way
+    // (`'deregistered'`/`'absent'`/`'unknown'`, never throws); a freshly
+    // created name that comes back anything OTHER than `'deregistered'`
+    // (including the new `'unknown'`) is still exactly as suspicious as it
+    // was when a non-'deleted' result meant a genuine anomaly — the
+    // inequality check below needs no further branching.
+    if (deleted !== 'deregistered') {
       return {
         ok: false,
-        detail: `create at "${pathPrefix}" succeeded but the immediate cleanup delete returned "${deleted}" (expected "deleted") for "${name}".`,
+        detail: `create at "${pathPrefix}" succeeded but the immediate cleanup delete returned "${deleted}" (expected "deregistered") for "${name}".`,
       };
     }
   } catch (err) {

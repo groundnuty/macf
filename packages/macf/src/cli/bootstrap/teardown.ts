@@ -100,10 +100,14 @@
  *   idempotent, and `deactivate` on an archived fleet is a legitimate,
  *   order-independent step of the ladder.
  * - **Report what could not be done, never exit green** — every outcome
- *   (`deleted` / `already-absent` / `failed` for variables; `archived` /
+ *   (`deregistered` / `absent` / `unknown` / `failed` for variables —
+ *   groundnuty/macf#1206's honest-unknown floor, extending groundnuty/macf#917's
+ *   original two-way `deleted`/`already-absent` split; `archived` /
  *   `already-archived` / `failed` for repos — groundnuty/macf#917) is
- *   returned, never swallowed; the CLI layer's exit
- *   code is non-zero on ANY `failed` entry.
+ *   returned, never swallowed; the CLI layer's exit code is non-zero on ANY
+ *   `failed` OR `unknown` entry — an unconfirmed delete outcome is exactly
+ *   the "could not be done" case this rail exists to surface, never a quiet
+ *   green.
  */
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { RegistryConfig } from '@groundnuty/macf-core';
@@ -142,7 +146,27 @@ function agentRegistrationVariableName(fleetName: string, role: string): string 
   return `${toVariableSegment(fleetName)}_AGENT_${toVariableSegment(role)}`;
 }
 
-/** `<SEG>_FEDERATED_CAS` — DR-041 Amendment B's UNION-target variable. Nothing in this codebase writes it yet (federation reconcile is day-2 / `plan.ts`'s `skippedSections`), so this target is expected to read `already-absent` on every fleet today — see `variable-write.ts::realDeleteVariable`'s doc for why that is NOT a failure. */
+/**
+ * `<SEG>_FEDERATED_CAS` — DR-041 Amendment B's UNION-target variable.
+ * Nothing in this codebase writes it yet (federation reconcile is day-2 /
+ * `plan.ts`'s `skippedSections`), so this target is expected to read
+ * `'absent'` on every fleet today — see `variable-write.ts::realDeleteVariable`'s
+ * doc for why that is NOT a failure.
+ *
+ * **`groundnuty/macf#1206`** — this target is the ONE that surfaced the
+ * defect this rung now fixes: a teardown run against a fleet that never
+ * wrote this variable used to be reported with the SAME status literal
+ * (`'already-absent'`, formerly `'deleted'`'s sibling) it would have gotten
+ * for any OTHER "confirmed nothing to remove" outcome — which was already
+ * distinguishable from a genuine delete, just under vocabulary that didn't
+ * match this codebase's `present`/`absent`/`unknown` convention elsewhere
+ * (`plan.ts::Presence`, `app-identity-removal.ts::AppDeletionOutcome`). The
+ * NAMED defect was reporting-vocabulary drift, not a missing distinction —
+ * this target keeps its slot (never deleted — a future #810 federated-CA
+ * variable would reuse the SAME name) and now reports through the SAME
+ * three-way `deregistered`/`absent`/`unknown` vocabulary every other rung in
+ * this file uses.
+ */
 function federatedCasVariableName(fleetName: string): string {
   return `${toVariableSegment(fleetName)}_FEDERATED_CAS`;
 }
@@ -308,7 +332,21 @@ export type AgentStopCategory = 'stopped-self-deregistered' | 'deregistered-dire
 
 export interface VariableTeardownOutcome {
   readonly target: DeactivateTarget;
-  readonly status: 'deleted' | 'already-absent' | 'failed' | 'self-deregistered' | 'unreachable';
+  /**
+   * `groundnuty/macf#1206` — `'deregistered'` / `'absent'` / `'unknown'` are
+   * the direct-delete classification from {@link DeleteVariableResult}
+   * (`variable-write.ts`); NEITHER `'deregistered'` NOR `'absent'` is a
+   * failure (deactivate is idempotent-on-rerun — module doc's "report what
+   * could not be done, never exit green" rail). `'unknown'` means the
+   * delete attempt could not confirm what happened — NEVER collapsed into
+   * `'absent'`, which would misreport "confirmed nothing to remove" for a
+   * genuinely indeterminate outcome. `'self-deregistered'` /
+   * `'unreachable'` are the #1033 agent-stop-state-machine's OWN outcomes
+   * (a different axis — agent liveness, not variable presence); `'failed'`
+   * remains for a genuine operational failure (e.g. the agent-stop poll
+   * timing out — see {@link deactivateAgentTarget}).
+   */
+  readonly status: 'deregistered' | 'absent' | 'unknown' | 'failed' | 'self-deregistered' | 'unreachable';
   readonly reason?: string;
   /** Present ONLY for `target.kind === 'agent_registration'` — see {@link AgentStopCategory}. */
   readonly agentStopCategory?: AgentStopCategory;
@@ -316,6 +354,23 @@ export interface VariableTeardownOutcome {
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * `groundnuty/macf#1206` — the honest-unknown-floor reason text for a
+ * `deleteRegistryVariable` outcome of `'unknown'`. Kept in ONE place (both
+ * call sites below — {@link executeDeactivate}'s generic branch AND
+ * {@link deactivateAgentTarget}'s `'dead'` branch — use it) so the wording
+ * cannot drift between the two paths that can reach it. No underlying
+ * `gh`/HTTP detail is threaded through from `variable-write.ts` here — same
+ * posture as `plan.ts::Presence`'s bare `'unknown'` (no message field at
+ * all): the codebase's convention for an indeterminate presence read is a
+ * plain status, not a per-failure-cause reason string.
+ */
+function unknownDeleteReason(): string {
+  return 'could not confirm whether this registry key was removed — the delete attempt did not return a definitive ' +
+    'success or not-found response (auth, network, or rate-limit). Never assumed absent — verify manually before ' +
+    'treating this key as gone.';
 }
 
 /**
@@ -435,8 +490,18 @@ async function deactivateAgentTarget(
   if (reachability === 'dead') {
     try {
       const status = await deps.deleteRegistryVariable(manifest.owner.registry, target.name);
-      return { target, status, agentStopCategory: 'deregistered-directly' };
+      // groundnuty/macf#1206 — `deleteRegistryVariable` no longer throws for
+      // an indeterminate outcome (it returns `'unknown'` — see
+      // `variable-write.ts::realDeleteVariable`'s doc); attach the honest
+      // reason here so `'unknown'` renders with the SAME diagnostic detail
+      // `'failed'` outcomes already carry, rather than a bare status.
+      const reason = status === 'unknown' ? unknownDeleteReason() : undefined;
+      return { target, status, reason, agentStopCategory: 'deregistered-directly' };
     } catch (err) {
+      // Defensive belt only — production `deleteRegistryVariable` never
+      // throws post-#1206 (see above), but a test/alternate dep fake is
+      // free to model an unexpected contract violation; a genuine throw
+      // here is a real operational failure, distinct from `'unknown'`.
       return { target, status: 'failed', reason: errMessage(err), agentStopCategory: 'deregistered-directly' };
     }
   }
@@ -506,8 +571,13 @@ export async function executeDeactivate(
     }
     try {
       const status = await deps.deleteRegistryVariable(manifest.owner.registry, target.name);
-      out.push({ target, status });
+      // groundnuty/macf#1206 — see the identical comment in
+      // `deactivateAgentTarget`'s `'dead'` branch above: attach the honest
+      // reason for an `'unknown'` outcome rather than a bare status.
+      const reason = status === 'unknown' ? unknownDeleteReason() : undefined;
+      out.push({ target, status, reason });
     } catch (err) {
+      // Defensive belt only — see the identical comment above.
       out.push({ target, status: 'failed', reason: errMessage(err) });
     }
   }
