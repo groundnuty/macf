@@ -718,7 +718,7 @@ bootstrap
   .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
   .option(
     '--secrets-file <path>',
-    'Path to a per-FLEET operator secrets file (plain KEY=value, groundnuty/macf#1197) — reports which source ' +
+    'Path to a per-FLEET operator secrets file (plain KEY=value) — reports which source ' +
       'will supply each key `apply` will need, before any gate opens. Optional.',
   )
   .option('--scope-secrets-file <path>', 'Path to a per-SCOPE operator secrets file, shared across a fleet\'s org/account. Lower precedence than --secrets-file.')
@@ -846,7 +846,7 @@ bootstrap
 const bootstrapSecrets = bootstrap
   .command('secrets')
   .description(
-    'The operator secrets file (groundnuty/macf#1197) — one plain KEY=value file instead of a flag per ' +
+    'The operator secrets file — one plain KEY=value file instead of a flag per ' +
       'credential, passed to `bootstrap apply`/`plan` via --secrets-file (per-fleet) and/or ' +
       '--scope-secrets-file (per-scope, shared across a fleet\'s org/account).',
   );
