@@ -75,7 +75,7 @@ where that is the reason for `not reported`, the row says so.
 | 13 | `transport.router_app_origin_fleet` | **WRITE-ONCE** | not reported (`FleetStatusView`, `status.ts:149-160`, has no `scope_credentials` member) | `apply-fleet.ts:1870` `writeScopeCredentialMarker(ROUTER_APP_ROLE, manifest.transport.router_app_origin_fleet)` records it into `fleet.lock`'s `scope_credentials`; `plan.ts:1896` surfaces it. Recorded, never verified — the named fleet could be renamed, deleted, or never have been the real source. The schema's own doc is honest about this (`fleet-manifest.ts:522-527`: "Provenance ONLY — nothing in this codebase reads this field to change behaviour"). |
 | 14 | `defaults.role_template` | **WRITE-ONCE** | not reported | `apply-repo-init.ts:463` — `const template = agent.provenance === 'mirror' ? undefined : manifest.defaults.role_template` — feeds `repo-create.ts::ensureAgentRepo`'s `gh repo create --template`. Consulted **only when the repo is created**; for a `reused` repo the value is never looked at again. See §2.2 for the invisible drift. |
 | 15 | `defaults.app_manifest` | **INERT** | not reported | Zero reads. Only occurrences outside the schema (`fleet-manifest.ts:194`) are in `manifest-scaffold.ts`'s own prose. See §2. |
-| 16 | `agents[].role` | **RECONCILED** | reported | Derives the per-agent App handle (`fleet-manifest.ts:590`), compared against the live App slug at `identity-confirm.ts:225` via `apply-agent.ts:856`. Keys `observed.agents` (`observer.ts:1250`) and `fleet.lock`'s `agents[]`. Charset + uniqueness + the double-prefix trap are enforced at parse (`fleet-manifest.ts:380-418`). Observed-but-undeclared roles are surfaced as `report-extra` and never pruned (`plan.ts:2010`-region; `status.ts:219` `extraLockAgents`) — deliberate no-prune, so that direction is *surfaced* rather than converged. |
+| 16 | `agents[].role` | **RECONCILED** | reported | Derives the per-agent App handle (`fleet-manifest.ts:590`), compared against the live App slug at `identity-confirm.ts:225` via `apply-agent.ts:856`. Keys `observed.agents` (`observer.ts:1250`) and `fleet.lock`'s `agents[]`. Charset + uniqueness + the double-prefix trap are enforced at parse (`fleet-manifest.ts:380-418`). Observed-but-undeclared roles are surfaced as `report-extra` and never pruned (`plan.ts:1986`; `status.ts:219` `extraLockAgents`) — deliberate no-prune, so that direction is *surfaced* rather than converged. |
 | 17 | `agents[].profile` | **INERT** | not reported | Zero reads. See §2. |
 | 18 | `agents[].repo` | **RECONCILED** | reported | `plan.ts:901` `repoItem` reads live presence (`obs?.repo`, from `observer.ts`); `apply-fleet.ts` converges via `ensureAgentRepo` (create) and the archived-repo path (`plan.ts:1601` `agentRepoArchivedItem` + `agentRepoOptions:{confirmUnarchive:true}` at `commands/bootstrap-apply.ts`'s `resolveMutateDeps`). Uniqueness enforced at parse (`fleet-manifest.ts:410`). Status renders `repoPresence` (`status.ts:178`). |
 | 19 | `agents[].deploy_path` | **RECONCILED** (host-local, conditional) | not reported — host-filesystem fact, outside `status`'s GitHub plane | `apply-deploy.ts:95` `resolvePath(agent.deploy_path)` → `deployAgent` materializes the workspace there; `remaining-deploy.ts:157-171` observes `existsSync(deployPath)` **and its parent** to report what is still undeployed and to distinguish "not deployed" from "belongs to another host". Conditional: the deploy phase only runs when both `--vault` and `--identity-key` were supplied, and only converges paths on the host running `apply`. |
@@ -182,7 +182,7 @@ different trustworthiness**, and the asymmetry is the finding.
   and `:1487` force-rewrite the workflow whenever the pin differs —
   including when the live pin is *newer* than the declaration.
 - **Honest floor.** An unreadable pin degrades to a low-confidence `create`
-  (`plan.ts:1783`-region), never to `noop`; the write is still attempted.
+  (`plan.ts:1785`-region), never to `noop`; the write is still attempted.
 
 This is the shape the rest of the manifest is measured against.
 
@@ -350,15 +350,29 @@ Stated as unknowns rather than guessed.
 
 ## 6. Verification
 
-Docs-only change. Commands run from the worktree at `1b52117`:
+Docs-only change — `git diff --stat origin/main` reports exactly one file
+changed, this one. Commands run from the worktree at `1b52117`:
 
 ```
 $ make -f dev.mk lint
+✖ 1 problem (0 errors, 1 warning)
+  apply-deploy.ts 96:5  warning  Unused eslint-disable directive
+
 $ devbox run -- npx vitest run --root packages/macf
+ Test Files  193 passed (193)
+      Tests  4847 passed | 2 skipped (4849)
 ```
 
-Results recorded in the reporting comment for this audit rather than
-transcribed here, so this document does not carry a claim that ages.
+The single lint warning is pre-existing on `main` and is in a file this
+change does not touch.
+
+**One environment note worth recording**, since it presented as a code
+failure and is not one: a freshly-created worktree that has not run
+`make -f dev.mk install` fails **106 of 193 test files at import** with
+`Cannot find package 'undici' imported from packages/macf-core/src/proxy-fetch.ts`.
+`undici` is a declared dependency (`packages/macf-core/package.json:36`)
+that is simply absent until `npm ci` runs. The suite-level failures are
+collection errors, not assertions — the run above is after `install`.
 
 ---
 
