@@ -438,6 +438,143 @@ describe('runBootstrapStatus — advertise-host drift SEAM (groundnuty/macf#1203
   });
 });
 
+/**
+ * groundnuty/macf#1203, science-agent's "option 4" ruling on the issue
+ * thread: the pure comparison (`advertise-host-drift.ts`) and its rendering
+ * through `computeBootstrapStatus` are already fixture-tested exhaustively
+ * (`status.test.ts`'s "computeBootstrapStatus — advertise-host drift"
+ * describe block covers the decisive pair, the honest-unknown floor, and
+ * the port ruling against a HAND-BUILT registry map). What neither of those
+ * files can prove is that `runBootstrapStatus` — the actual command
+ * entrypoint — reaches that comparison AT ALL: `resolveDeps` wires
+ * `readAgentRegistry: readAgentRegistryInfo` (the REAL, unmocked function,
+ * `observer.ts`'s `gh`-shelling registry read) directly, and this suite
+ * cannot invoke that function without a live registry — so instead it
+ * proves the SEAM: the same `AgentRegistryObservation` shapes
+ * `readAgentRegistryInfo` can produce, fed through the identical
+ * `deps.readAgentRegistry` seam production code calls, surface correctly in
+ * `runBootstrapStatus`'s own output.
+ *
+ * `PRESENT_REGISTRY` (top of this file, already used by three pre-existing
+ * tests above) is exactly this "REAL_CALL_SHAPE" — the same idiom
+ * `runner-platform.test.ts`'s `REAL_CALL_SHAPE` constant establishes for
+ * groundnuty/macf#1238/#1244: a literal object typed against the REAL
+ * production type (`AgentRegistryObservation`'s `'confirmed'`/`'present'`
+ * member, which is exactly what `readAgentRegistryInfo` returns for a
+ * successfully-parsed `AgentInfo`), not an invented shape a broken
+ * implementation might accept but the real function never produces. Its
+ * `host: '100.64.0.1'` already diverges from `VALID_FLEET_YAML`'s declared
+ * `advertise_host: example.ts.net` — a mismatch shape was sitting in this
+ * file's own fixture, unasserted, before this block existed (see the
+ * "carries registry facts" test above, which checks `registry` but never
+ * `advertiseHostDrift`).
+ */
+describe('runBootstrapStatus — advertise-host drift SEAM (groundnuty/macf#1203)', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    logSpy?.mockRestore();
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  it('DECISIVE 1 — a real-shaped registry read diverging from declared advertise_host reaches the render as a mismatch (--json AND text)', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    const deps: BootstrapStatusDeps = { observe: async () => EMPTY_OBSERVED, readAgentRegistry: async () => PRESENT_REGISTRY };
+
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const jsonCode = await runBootstrapStatus({ file, json: true }, deps);
+    expect(jsonCode).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      agents: ReadonlyArray<{ advertiseHostDrift: { status: string; declaredHost: string; registeredHost?: string } }>;
+    };
+    expect(json.agents[0]?.advertiseHostDrift.status).toBe('mismatch');
+    expect(json.agents[0]?.advertiseHostDrift.declaredHost).toBe('example.ts.net');
+    expect(json.agents[0]?.advertiseHostDrift.registeredHost).toBe('100.64.0.1');
+
+    logSpy.mockRestore();
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const textCode = await runBootstrapStatus({ file }, deps);
+    expect(textCode).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('ADVERTISE-HOST');
+    expect(out).toContain('MISMATCH');
+  });
+
+  it('DECISIVE 2 — a real-shaped registry read MATCHING declared advertise_host reaches the render as a match, never a mismatch (proves the seam is not "always mismatch")', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    const matchingRegistry: AgentRegistryObservation = {
+      ...PRESENT_REGISTRY,
+      info: { ...PRESENT_REGISTRY.info, host: 'example.ts.net' },
+    };
+    const deps: BootstrapStatusDeps = { observe: async () => EMPTY_OBSERVED, readAgentRegistry: async () => matchingRegistry };
+
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapStatus({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { agents: ReadonlyArray<{ advertiseHostDrift: { status: string } }> };
+    expect(json.agents[0]?.advertiseHostDrift.status).toBe('match');
+    expect(json.agents[0]?.advertiseHostDrift.status).not.toBe('mismatch');
+
+    logSpy.mockRestore();
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const textCode = await runBootstrapStatus({ file }, deps);
+    expect(textCode).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('ADVERTISE-HOST');
+    expect(out).not.toContain('MISMATCH');
+  });
+
+  it('same host, different live port -> still a match at the seam — the port ruling (advertise-host-drift.ts\'s module doc) must hold through the REAL entrypoint, not only the pure comparison', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    const samehostDifferentPort: AgentRegistryObservation = {
+      ...PRESENT_REGISTRY,
+      info: { ...PRESENT_REGISTRY.info, host: 'example.ts.net', port: 51999 },
+    };
+    const deps: BootstrapStatusDeps = { observe: async () => EMPTY_OBSERVED, readAgentRegistry: async () => samehostDifferentPort };
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapStatus({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { agents: ReadonlyArray<{ advertiseHostDrift: { status: string } }> };
+    expect(json.agents[0]?.advertiseHostDrift.status).toBe('match');
+  });
+
+  it('never-registered reaches the seam as unknown, never mismatch — the honest-unknown floor holds through the REAL entrypoint too', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    const deps: BootstrapStatusDeps = { observe: async () => EMPTY_OBSERVED, readAgentRegistry: async () => ({ status: 'confirmed', presence: 'absent' }) };
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapStatus({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      agents: ReadonlyArray<{ advertiseHostDrift: { status: string; unknownKind?: string } }>;
+    };
+    expect(json.agents[0]?.advertiseHostDrift.status).toBe('unknown');
+    expect(json.agents[0]?.advertiseHostDrift.status).not.toBe('mismatch');
+    expect(json.agents[0]?.advertiseHostDrift.unknownKind).toBe('never-registered');
+  });
+
+  it('a registry-read FAILURE (status: unknown) reaches the seam as unknown, never mismatch — distinct unknownKind from never-registered', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    const deps: BootstrapStatusDeps = {
+      observe: async () => EMPTY_OBSERVED,
+      readAgentRegistry: async () => ({ status: 'unknown', reason: 'registry variable could not be read (network/auth/gh failure)' }),
+    };
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapStatus({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      agents: ReadonlyArray<{ advertiseHostDrift: { status: string; unknownKind?: string } }>;
+    };
+    expect(json.agents[0]?.advertiseHostDrift.status).toBe('unknown');
+    expect(json.agents[0]?.advertiseHostDrift.unknownKind).toBe('read-failed');
+  });
+});
+
 describe('runBootstrapStatus — no-mutation guarantee (static import-shape assertion)', () => {
   // The cheapest durable form of "reading state must not mutate anything":
   // assert the two new modules import ONLY from a read-only allowlist —
