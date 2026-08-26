@@ -25,6 +25,7 @@ import { parseFleetLock, parseFleetManifest } from '../../../src/cli/bootstrap/f
 import type { AgentApplyDeps } from '../../../src/cli/bootstrap/apply-agent.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../../../src/cli/bootstrap/apply-repo-init.js';
 import { repoInit as realRepoInit } from '../../../src/cli/commands/repo-init.js';
+import type { RepoInitOptions } from '../../../src/cli/commands/repo-init.js';
 import type { ControlRepoDeps } from '../../../src/cli/bootstrap/control-repo.js';
 import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchange.js';
 import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
@@ -2039,6 +2040,148 @@ agents:
     // the prior — the confirm-before-create guard only reaches 'reused' when
     // `prior !== undefined` for this role.
     expect(result.agents[0]?.identity.status).toBe('reused');
+  });
+
+  /**
+   * groundnuty/macf#1221 (the "still broken after #1224" follow-up) — #1224
+   * threaded `resolveControlRepoLabelTokenSource` into Step 0.5, but that
+   * resolver ONLY ever looks at `priorLock` + a wired `resolveKeyPath`
+   * (`--vault`/`--identity-key`) — both are ABSENT on a genuinely first-ever
+   * fleet provision, which is exactly what a `'created'` identity means.
+   * Before this fix, that exact scenario reproduced the pre-#1224 warning
+   * byte-for-byte (verified live on `macf-trial`, macf#1221's comment
+   * thread). These tests assert at the SAME call site #1224's own
+   * `apply-control-repo-init.test.ts` tests already asserted at (the
+   * options object the injected `repoInit` fake receives) — but for the
+   * NEW retry call this fix adds, not the threading `applyControlRepoInit`
+   * already had covered.
+   */
+  describe('control-repo label retry with a JUST-CREATED agent credential (groundnuty/macf#1221 follow-up)', () => {
+    it('DECISIVE (1/2) — no priorLock, no vault: control-repo labels still land OK via a retry using the freshly-created agent\'s own credential', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const controlRepoCalls: { tokenSource: RepoInitOptions['tokenSource']; keyContentAtCallTime?: string }[] = [];
+      const repoInitDeps: RepoInitStepDeps = {
+        cloneRepo: async () => {},
+        commitAndPush: async () => 'pushed',
+        repoInit: async (_dir, opts) => {
+          if (opts.repo !== 'groundnuty/demo-fleet-control') {
+            // the agent's own repo — not this test's concern; succeed plainly.
+            return { workflow: 'created', config: 'created', labels: { status: 'ok', created: ['code-agent'], existed: [] } };
+          }
+          // Read the tokenSource's keyPath NOW, inside the call — the retry
+          // caller cleans its scratch PEM up in a `finally` right after this
+          // call returns, so reading it later (after `applyFleet` resolves)
+          // would see a deleted file.
+          controlRepoCalls.push({
+            tokenSource: opts.tokenSource,
+            keyContentAtCallTime: opts.tokenSource ? readFileSync(opts.tokenSource.keyPath, 'utf-8') : undefined,
+          });
+          return opts.tokenSource === undefined
+            ? { workflow: 'created', config: 'created', labels: { status: 'skipped', reason: 'No GH_TOKEN, no TokenSource provided, and missing APP_ID/INSTALL_ID/KEY_PATH env vars' } }
+            : { workflow: 'created', config: 'created', labels: { status: 'ok', created: ['code-agent'], existed: [] } };
+        },
+      };
+      const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps);
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('created');
+
+      // Step 0.5 attempted with no credential, THEN a retry with one — never
+      // just one call (either the retry never fires, or it silently
+      // replaced the first attempt instead of following it).
+      expect(controlRepoCalls).toHaveLength(2);
+      expect(controlRepoCalls[0]?.tokenSource).toBeUndefined();
+      expect(controlRepoCalls[1]?.tokenSource).toEqual({ appId: 'app-code-agent', installId: 'install-1', keyPath: expect.any(String) });
+      // The retry's scratch key carried the SAME PEM the per-agent loop just
+      // exchanged for this role (`creds('code-agent').pem`) — proves the
+      // retry used the freshly-minted in-process credential, not an
+      // arbitrary placeholder.
+      expect(controlRepoCalls[1]?.keyContentAtCallTime).toBe('SENTINEL-PEM-code-agent');
+
+      expect(result.controlRepoInit.status).toBe('written');
+      if (result.controlRepoInit.status === 'written') {
+        expect(result.controlRepoInit.labels).toEqual({ status: 'ok', created: ['code-agent'], existed: [] });
+        expect(result.controlRepoInit.labelsGoodEnough).toBe(true);
+      }
+      expect(applyExitCode(result)).toBe(0);
+    });
+
+    it('DECISIVE (2/2) — no created agent this run (all reused, no working vault key): control-repo labels stay unattempted and the run reports incomplete (exit 2), never 0', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      const controlRepoCalls: RepoInitOptions[] = [];
+      const repoInitDeps: RepoInitStepDeps = {
+        cloneRepo: async () => {},
+        commitAndPush: async () => 'pushed',
+        repoInit: async (_dir, opts) => {
+          if (opts.repo === 'groundnuty/demo-fleet-control') controlRepoCalls.push(opts);
+          return opts.tokenSource === undefined
+            ? { workflow: 'created', config: 'created', labels: { status: 'skipped', reason: 'No GH_TOKEN, no TokenSource provided, and missing APP_ID/INSTALL_ID/KEY_PATH env vars' } }
+            : { workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: ['code-agent'] } };
+        },
+      };
+      // 'reused' fixture's `resolveKeyPath` points at '/fake.pem', which does
+      // NOT exist on disk — #1224's own keyPath-is-not-a-credential guard
+      // filters it, so `resolveControlRepoLabelTokenSource` still returns
+      // `undefined` even though a `priorLock` entry + a wired `resolveKeyPath`
+      // both exist. No agent is CREATED this run for the retry to use either.
+      const deps = baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps);
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('reused');
+      // Exactly ONE control-repo repoInit call — Step 0.5's own attempt,
+      // never retried (nothing new became available to retry with).
+      expect(controlRepoCalls).toHaveLength(1);
+      expect(controlRepoCalls[0]?.tokenSource).toBeUndefined();
+
+      expect(result.controlRepoInit.status).toBe('written');
+      if (result.controlRepoInit.status === 'written') {
+        expect(result.controlRepoInit.labels.status).toBe('skipped');
+        // Honest "nothing to try" — not a hard failure — but per the
+        // issue's own Required list ("either it succeeds, or the run
+        // reports the fleet as incomplete"), this must NOT read as exit 0.
+        expect(result.controlRepoInit.labelsGoodEnough).toBe(true);
+      }
+      expect(applyExitCode(result)).toBe(2);
+    });
+
+    it('REGRESSION — the retry does not fire when Step 0.5 already landed labels OK, even with a created agent available (no wasted extra repoInit call)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const controlRepoCalls: RepoInitOptions[] = [];
+      const repoInitDeps: RepoInitStepDeps = {
+        cloneRepo: async () => {},
+        commitAndPush: async () => 'pushed',
+        repoInit: async (_dir, opts) => {
+          if (opts.repo === 'groundnuty/demo-fleet-control') controlRepoCalls.push(opts);
+          // Always 'ok', regardless of tokenSource — Step 0.5 itself
+          // already succeeds (a resolvable priorLock+vault credential, or a
+          // local-registry mode that never needed one — this fixture
+          // doesn't care which; the point is `labels.status === 'ok'` on
+          // the FIRST call).
+          return { workflow: 'created', config: 'created', labels: { status: 'ok', created: ['code-agent'], existed: [] } };
+        },
+      };
+      const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps);
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('created');
+      // Exactly one control-repo call — the retry-guard's `labels.status
+      // !== 'ok'` check short-circuits before ever looking for a created
+      // agent to retry with.
+      expect(controlRepoCalls).toHaveLength(1);
+      expect(result.controlRepoInit.status).toBe('written');
+      if (result.controlRepoInit.status === 'written') expect(result.controlRepoInit.labels.status).toBe('ok');
+    });
   });
 
   // --- DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) ---
