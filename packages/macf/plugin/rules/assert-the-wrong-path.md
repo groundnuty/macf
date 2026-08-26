@@ -108,6 +108,8 @@ The first is a fixture; the second is an entire test environment. **The exclusio
 
 For the vault fix the answer was *reused roles*, and it was. For the fleet e2e it was *a cold scope*, and it was.
 
+**The prospective form — when a prior repair has removed the failure, restore it before testing the fix.** The retrospective question (*what case did this population exclude?*) diagnoses; the prospective act makes the population able to fail again. Worked case: a label defect was hand-repaired mid-incident, so every later verification run would have printed "labels ok" for labels that were already there — proving nothing about the fix. Deleting one label first gave the run something only it could create, and turned "the fix merged" into "the fix works." A fixture that cannot exhibit the failure validates nothing, however green it runs.
+
 **And its cheap companion — mutation as habit:** break the fix, re-run, confirm a test notices. **A test that passes with the fix removed is testing something else.** One fix shipped merged-and-green while its emitting call site stayed broken, because its tests asserted the mechanism in general rather than at the site; its replacement was proven load-bearing by disabling it and watching the assertion fail. **The cost is a single deliberately-broken run.**
 
 **Distinguishing them:** ask whether your expected value came from **the population under test** (trigger 1) or from **your own inference about an unstated observable** (trigger 2). A reader who only knows trigger 1 gets *"no, nothing circular here"* on the second case and writes the assertion anyway — which is how this section's own first draft failed to recognise one of the two cases it cited.
