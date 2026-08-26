@@ -66,15 +66,16 @@
  * (register, THEN re-run apply once it shows up). `publishTrustedActorsGated`
  * (the NEW production entrypoint `apply-fleet.ts` actually calls) splits the
  * gate: a `--runner-token`/`MACF_BOOTSTRAP_RUNNER_TOKEN` value is a POLICY
- * precondition — declaring `routing.runner` self-hosted with no token
- * supplied REFUSES outright, `'failed'`, before any live check, same posture
- * as an unconfigured `transport.age_recipients` refusing before consent
- * gate 1 (Amendment C). A supplied token does NOT license the write by
- * itself — detection is untouched, still `checkRunnerUsableByRepo` exactly
- * as macf#927 left it — it licenses `apply` to POLL for usability across a
- * bounded deploy window instead of checking once, so the common "register a
- * runner, then apply" case is one command. See
- * {@link publishTrustedActorsGated}'s doc for the full mechanics.
+ * precondition on WAITING, never on USING what is already there — declaring
+ * `routing.runner` self-hosted with no token supplied does NOT refuse
+ * outright before any live check (see the groundnuty/macf#1195 paragraph
+ * below — that was this function's ORIGINAL, now-corrected shape). A
+ * supplied token does NOT license the write by itself — detection is
+ * untouched, still `checkRunnerUsableByRepo` exactly as macf#927 left it —
+ * it licenses `apply` to POLL for usability across a bounded deploy window
+ * instead of checking once, so the common "register a runner, then apply"
+ * case is one command. See {@link publishTrustedActorsGated}'s doc for the
+ * full mechanics.
  *
  * **The policy half moves earlier (macf#932).** Through macf#929,
  * `publishTrustedActorsGated`'s refusal was the ONLY place the missing-token
@@ -216,9 +217,43 @@
  * entirely. A retry-budget for this ONE case would reintroduce exactly the
  * "wait for something that might not be worth waiting for" shape this issue
  * exists to remove, for a race this narrow.
+ *
+ * **The missing-token refusal must OBSERVE before it refuses
+ * (groundnuty/macf#1195).** Through #1195, {@link publishTrustedActorsGated}'s
+ * missing-token branch was a BLANKET refusal — `runnerToken === undefined`
+ * short-circuited straight to `failedOutcomesFor(repos, noRunnerTokenReason())`
+ * with `checkRunnerUsableByRepo` never called at all, even though
+ * `RoutingApplyDeps` has carried that exact live-observation seam since
+ * macf#922. Live-verified regression: a fleet (`macf-trial`) whose runners
+ * were confirmed registered and available (`GET /runners/... → ok=true,
+ * available=1`, moments earlier, via `#943`'s own provisioning call) still
+ * had `MACF_TRUSTED_ACTORS` refused on every repo, purely because
+ * `--runner-token` was absent — the operator's own framing: "the runners
+ * exist. Nothing looked." The token was never load-bearing for USE, only
+ * for REGISTRATION (macf#929's "token = POLICY, detection = TIMING" split
+ * already said this in words; the code didn't act on it for the
+ * runner-ALREADY-usable case).
+ *
+ * **The fix:** the missing-token branch now performs exactly ONE
+ * `checkRunnerUsableByRepo` read per repo — the SAME seam every other path
+ * in this module already uses, never a second query path — and writes the
+ * var for any repo confirmed `presence: 'present'`. A repo NOT confirmed
+ * present still refuses (`'failed'`, macf#993's bar unchanged), but the
+ * refusal reason now names the OBSERVED cause (confirmed-absent /
+ * could-not-confirm / created-this-run-so-none-could-have-registered — see
+ * {@link noUsableRunnerWithoutTokenReason}) rather than the flag alone.
+ * Deliberately NO poll in this branch even for a repo that IS usable-soon:
+ * {@link pollForUsableRunner}'s retry loop exists to give a runner time to
+ * finish REGISTERING, and only a supplied token licenses `apply` to wait for
+ * that (macf#929) — a single immediate read is the honest amount of work to
+ * do when nothing authorized a wait. `justCreatedRepos` is threaded into the
+ * message choice ONLY (never into a retry decision) — see
+ * `apply-fleet.ts`'s call site, which passes the SAME
+ * `justCreatedReposStillFast` set regardless of whether a token was
+ * resolved.
  */
 import type { EnsureVariableOutcome } from './ensure-variable.js';
-import { ensureVariableCreated, failedOutcomesFor } from './ensure-variable.js';
+import { ensureVariableCreated } from './ensure-variable.js';
 import type { CaApplyDeps } from './apply-ca.js';
 import type { RunnerUsability } from './observer.js';
 import type { FleetRouting } from './fleet-manifest.js';
@@ -336,30 +371,38 @@ export const RUNNER_TOKEN_FLAG = '--runner-token';
 export const RUNNER_TOKEN_ENV_VAR = 'MACF_BOOTSTRAP_RUNNER_TOKEN';
 
 /**
- * The refusal `apply` shows when `manifest.routing.runner` is declared
+ * The EARLY WARNING {@link checkRunnerTokenPreflight} shows — before ANY
+ * live check is even possible (it fires before `apply` has observed a
+ * single repo) — when `manifest.routing.runner` is declared
  * `runs_on: "self-hosted"` (DR-043 Amendment H) but no runner-registration
  * token was supplied via {@link RUNNER_TOKEN_FLAG} / {@link RUNNER_TOKEN_ENV_VAR}
  * (macf#929). ONE reason for every repo — same shape as
  * `apply-ca.ts::skippedCaPublish`'s single-reason-for-all-legs precedent —
- * because the refusal is a manifest-level policy gate, not a per-repo
- * detection result. Never names a repo (nothing repo-specific to say) and
+ * because this is a manifest-level heads-up, not a per-repo detection
+ * result. Never names a repo (nothing repo-specific to say this early) and
  * never echoes the token value (there is none to echo — this fires
  * precisely because the token is ABSENT).
  *
- * `'failed'`, not `'skipped'` (see `ensure-variable.ts::failedOutcomesFor`'s
- * doc): this is a REFUSAL the operator must act on, same posture as
- * `apply-fleet.ts::noRecipientPreflightFailure`'s unconfigured-age-recipient
- * pre-flight — both fire BEFORE any live check, both fail the run
- * (`commands/bootstrap-apply.ts::applyExitCode`'s `routingBad` only counts
- * `'failed'` legs), unlike an ordinary "checked and not yet usable" skip.
+ * **Does NOT claim the write will actually be refused (corrected
+ * groundnuty/macf#1195).** Through #1195, this text doubled as
+ * {@link publishTrustedActorsGated}'s own unconditional no-token refusal, so
+ * "refusing to write... to any repo" was accurate for every caller. Now that
+ * the write-time gate consults live presence first (a repo with an
+ * ALREADY-usable runner proceeds without a token — see
+ * {@link noUsableRunnerWithoutTokenReason}), a token-absent manifest is only
+ * a REQUIREMENT-FOR-REGISTERING-A-NEW-RUNNER, not a guaranteed refusal —
+ * this text is worded to say exactly that, since the actual per-repo
+ * outcome isn't knowable yet at this point in the flow (before `observe`
+ * has even run).
  */
 export function noRunnerTokenReason(): string {
   return (
     'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration ' +
-    'token was supplied — refusing to write MACF_TRUSTED_ACTORS to any repo before a runner can be confirmed ' +
-    '(same posture as an unconfigured transport.age_recipients refusing before consent gate 1: writing trust ' +
-    'ahead of a confirmable runner would route jobs at a self-hosted queue nothing may ever service). Supply ' +
-    `one via ${RUNNER_TOKEN_FLAG} <token> (or the ${RUNNER_TOKEN_ENV_VAR} env var). Obtain a fresh registration ` +
+    'token was supplied — apply cannot REGISTER a new runner without one. A repo whose runner is ALREADY ' +
+    'confirmed usable still proceeds without a token; a repo with no usable runner yet will have its ' +
+    'MACF_TRUSTED_ACTORS write refused until a runner is registered directly (no token needed for that) or a ' +
+    'token is supplied so this run can confirm/wait for one. Supply one via ' +
+    `${RUNNER_TOKEN_FLAG} <token> (or the ${RUNNER_TOKEN_ENV_VAR} env var). Obtain a fresh registration ` +
     'token with: gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token'
   );
 }
@@ -428,10 +471,14 @@ export interface RunnerTokenPreflightFailure {
  * `apply-fleet.ts`'s own `manifest.routing?.runner.runs_on === 'self-hosted'`
  * gate for whether the write is even attempted — this function must never
  * drift from that condition), OR a non-empty `runnerToken` was resolved.
- * Reuses {@link noRunnerTokenReason}'s message VERBATIM — same refusal text
- * the late gate has always shown, only fired earlier — so an operator who's
- * seen this message before recognizes it instantly, and there is exactly one
- * place its wording is authored.
+ * Reuses {@link noRunnerTokenReason}'s message VERBATIM — exactly ONE place
+ * this early-warning text is authored, so an operator who's seen it before
+ * recognizes it instantly. **Not, post-groundnuty/macf#1195, the SAME text
+ * the late gate's own refusal shows** — the late gate
+ * ({@link publishTrustedActorsGated}) now speaks per-repo, evidenced by a
+ * live check ({@link noUsableRunnerWithoutTokenReason} /
+ * {@link runnerTokenPollExhaustedReason} / sibling reason functions), because
+ * by the time it runs it KNOWS what this pre-flight cannot yet know.
  *
  * Takes the ALREADY-RESOLVED `runnerToken` value (CLI flag wins over
  * {@link RUNNER_TOKEN_ENV_VAR}, resolved by the caller) rather than reading
@@ -583,6 +630,56 @@ export function runnerTokenPollExhaustedReason(repo: string, usability: RunnerUs
     `${String(Math.round(timeoutMs / 1000))}s poll window — MACF_TRUSTED_ACTORS was NOT written; this repo ` +
     'routes on hosted runners (billed on private repos) until a runner is confirmed. Re-run `macf bootstrap ' +
     `apply\` once it is registered.${detailSuffix}${handoverSuffix}`
+  );
+}
+
+/**
+ * The reason text for the groundnuty/macf#1195 NO-TOKEN branch of
+ * {@link publishTrustedActorsGated} — `repo` was checked exactly ONCE (never
+ * polled: no token means nothing licenses a wait, see this module's
+ * top-level #1195 paragraph) and the read did NOT confirm a usable runner.
+ *
+ * Three distinct causes, each worded differently so the operator never reads
+ * more confidence than `apply` actually has:
+ *
+ * - `usability.presence === 'unknown'` — the read itself failed (auth /
+ *   network / insufficient scope); same "could not confirm" framing every
+ *   other reason function in this module uses for the identical state.
+ * - `justCreated === true` (this repo is in the caller's `justCreatedRepos`
+ *   set) — a repo minted THIS run cannot have a runner registered to it by
+ *   anything that happened before this run (`apply-routing.ts:91-93`,
+ *   macf#972) — that is NOT evidence the fleet has no runner, only that
+ *   THIS repo is too new to have one yet, so the wording says exactly that
+ *   rather than the plain "confirmed absent" claim.
+ * - otherwise — an ordinary confirmed-absent read on a pre-existing repo.
+ *
+ * Every branch names {@link RUNNER_TOKEN_FLAG} / {@link RUNNER_TOKEN_ENV_VAR}
+ * / the `gh api` registration-token command (same remedy
+ * {@link noRunnerTokenReason} already names) ALONGSIDE the direct-register
+ * remedy — a repo with no usable runner and no token has two honest paths
+ * forward: register a runner and re-run with no token needed, or supply a
+ * token now so THIS run can confirm/wait for one. Never claims a poll
+ * happened (no "within the Ns poll window" language) — that would describe
+ * work this branch did not do, the same dishonesty
+ * {@link runnerJustCreatedRepoReason}'s doc names for the sibling
+ * fast-path case.
+ */
+export function noUsableRunnerWithoutTokenReason(repo: string, usability: RunnerUsability, justCreated: boolean): string {
+  const cause =
+    usability.presence === 'unknown'
+      ? 'could not confirm whether a self-hosted runner is registered (auth / network / insufficient scope)'
+      : justCreated
+        ? 'no self-hosted runner is registered yet — this repo was created during THIS run, so none can have registered on its own'
+        : 'no self-hosted runner is confirmed registered';
+  const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
+  const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
+  return (
+    `role/repo "${repo}": no runner registration token was supplied and ${cause} — MACF_TRUSTED_ACTORS was NOT ` +
+    'written; this repo continues routing on ubuntu-latest (billed on private repos). Register a self-hosted ' +
+    'runner for this repo (or the organization) and re-run `macf bootstrap apply` — no token is needed once a ' +
+    `runner is visible — or supply one now via ${RUNNER_TOKEN_FLAG} <token> (or the ${RUNNER_TOKEN_ENV_VAR} env ` +
+    'var) so this run can confirm/wait for it. Obtain a fresh registration token with: gh api -X POST ' +
+    `/orgs/<org>/actions/runners/registration-token --jq .token.${detailSuffix}${handoverSuffix}`
   );
 }
 
@@ -771,21 +868,77 @@ export async function pollForUsableRunner(
 }
 
 /**
+ * The groundnuty/macf#1195 no-token branch of {@link publishTrustedActorsGated}
+ * — extracted so the token-supplied poll path above stays exactly the shape
+ * macf#929 left it (no branching added to that loop), and so this function's
+ * own single-check contract is independently readable/testable.
+ *
+ * Per repo: ONE `checkRunnerUsableByRepo` read, never
+ * {@link pollForUsableRunner} — no token means nothing licenses a wait (see
+ * this module's top-level #1195 paragraph for the full "why"). `'present'`
+ * writes the var via {@link writeTrustedActorsVar}, the SAME write primitive
+ * every other caller in this module uses. Anything else is `'failed'` with
+ * {@link noUsableRunnerWithoutTokenReason} — `justCreatedRepos` is consulted
+ * ONLY to pick accurate wording (a repo minted this run isn't "confirmed
+ * absent" evidence, macf#972), never to change WHETHER this function checks
+ * or waits — every repo in `repos` gets the identical single-check
+ * treatment regardless of that set's membership.
+ *
+ * A throwing `checkRunnerUsableByRepo` is `'failed'` (a wiring bug), isolated
+ * to that repo's entry — mirrors {@link publishTrustedActors} and the
+ * token-supplied path's own per-repo try/catch.
+ *
+ * NEVER throws.
+ */
+async function publishTrustedActorsWithoutToken(
+  value: string,
+  repos: readonly string[],
+  deps: RoutingApplyDeps,
+  justCreatedRepos: ReadonlySet<string> | undefined,
+): Promise<Readonly<Record<string, EnsureVariableOutcome>>> {
+  const out: Record<string, EnsureVariableOutcome> = {};
+  for (const repo of repos) {
+    let usability: RunnerUsability;
+    try {
+      usability = await deps.checkRunnerUsableByRepo(repo);
+    } catch (err) {
+      out[repo] = { status: 'failed', reason: `runner-usability check threw for "${repo}" — ${errMessage(err)}` };
+      continue;
+    }
+    if (usability.presence === 'present') {
+      out[repo] = await writeTrustedActorsVar(repo, value, deps);
+      continue;
+    }
+    out[repo] = {
+      status: 'failed',
+      reason: noUsableRunnerWithoutTokenReason(repo, usability, justCreatedRepos?.has(repo) === true),
+    };
+  }
+  return out;
+}
+
+/**
  * The macf#929 production entrypoint — `apply-fleet.ts`'s ACTUAL call site
  * (supersedes `publishTrustedActors`, see that function's doc). Splits the
  * register-before-route gate into a POLICY half and a TIMING half:
  *
- * - **POLICY (`runnerToken`):** `undefined`/empty → refuse EVERY repo in
- *   `repos` outright, `'failed'`, ZERO I/O (`checkRunnerUsableByRepo` is
- *   never called — see {@link noRunnerTokenReason}'s doc for why this is
- *   unconditional: a supplied token is required whenever `routing.runner`
- *   is declared self-hosted, independent of whether a runner ALREADY
- *   happens to be usable this instant — same "declared intent requires the
- *   matching precondition, regardless of current state" posture Amendment C
- *   applies to `age_recipients`). The token itself is NEVER read past this
- *   presence check — it licenses ATTEMPTING detection, never substitutes
- *   for it (macf#929 requirement 4: "detection stays exactly as macf#927
- *   left it").
+ * - **POLICY (`runnerToken`):** `undefined`/empty → **does NOT refuse
+ *   outright** (corrected groundnuty/macf#1195 — see this module's
+ *   top-level #1195 paragraph for the live-observed regression this fixes).
+ *   Each repo gets exactly ONE `checkRunnerUsableByRepo` read (never a
+ *   poll — see below); `presence: 'present'` writes the var exactly as the
+ *   token-supplied path does, because a token was never needed to USE an
+ *   already-usable runner, only to REGISTER a new one (macf#929's "token =
+ *   POLICY, detection = TIMING" split, taken to its actual conclusion). A
+ *   repo NOT confirmed present still refuses, `'failed'`
+ *   ({@link noUsableRunnerWithoutTokenReason}, distinguishing confirmed-
+ *   absent / could-not-confirm / created-this-run so the message never
+ *   overclaims). The token itself is NEVER read past this per-repo check
+ *   when present — it licenses WAITING (the poll below), never USING,
+ *   which is why its absence no longer forecloses a repo whose runner is
+ *   already there (macf#929 requirement 4: "detection stays exactly as
+ *   macf#927 left it" — this fix is exactly that promise, finally applied
+ *   to the no-token branch too).
  * - **TIMING (poll):** token present → bound ONE shared deadline across ALL
  *   of `repos` (computed once, `Math.max(0, deadline - now)` threaded into
  *   each repo's {@link pollForUsableRunner} call) rather than a fresh full
@@ -849,7 +1002,10 @@ export async function publishTrustedActorsGated(
   justProvisionedRepos?: ReadonlySet<string>,
 ): Promise<Readonly<Record<string, EnsureVariableOutcome>>> {
   if (runnerToken === undefined || runnerToken.length === 0) {
-    return failedOutcomesFor(repos, noRunnerTokenReason());
+    // groundnuty/macf#1195 — no token no longer means "refuse without
+    // looking." See `publishTrustedActorsWithoutToken`'s doc + this
+    // function's own #1195 POLICY bullet above.
+    return publishTrustedActorsWithoutToken(value, repos, deps, justCreatedRepos);
   }
 
   const timeoutMs = pollOptions.timeoutMs ?? DEFAULT_RUNNER_POLL_TIMEOUT_MS;
