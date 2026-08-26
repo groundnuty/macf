@@ -212,12 +212,21 @@ export function missingRequiredOperatorInputs(entries: readonly OperatorInputReq
 
 export const MISSING_OPERATOR_INPUTS_CODE = 'operator_inputs_missing';
 
-/** One aggregate, value-free message naming every missing key. */
+/**
+ * One aggregate, value-free message naming every missing key. Also names
+ * `--vault`/`--identity-key` as the alternative way to satisfy a declared
+ * requirement — a value already living in the vault never needs to be
+ * repeated into this file at all, and a caller that gates this check on
+ * "vault flags absent" (the only regime it can safely fire in — see
+ * `bootstrap-apply.ts`'s wiring) owes the operator that pointer.
+ */
 export function formatMissingOperatorInputsMessage(missingKeys: readonly string[]): string {
   return (
     `missing required operator input${missingKeys.length === 1 ? '' : 's'}: ${missingKeys.join(', ')}. ` +
     'Supply each via a CLI flag, the per-fleet secrets file, the per-scope secrets file, or its environment ' +
-    "variable fallback — run `macf bootstrap secrets template` for what each key is for and how to obtain it."
+    "variable fallback — run `macf bootstrap secrets template` for what each key is for and how to obtain it. " +
+    'Already have these in a vault instead? Supply --vault/--identity-key and this check is skipped in favor ' +
+    'of confirming the vaulted values directly.'
   );
 }
 

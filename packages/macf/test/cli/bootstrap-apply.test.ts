@@ -50,6 +50,7 @@ import type { ConfirmedInstall, IdentityConfirmation } from '../../src/cli/boots
 import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../src/cli/bootstrap/apply-routing-client.js';
 import type { RoutingSecretsPublishDeps } from '../../src/cli/bootstrap/apply-routing-secrets.js';
+import { MISSING_OPERATOR_INPUTS_CODE } from '../../src/cli/bootstrap/operator-secrets-file.js';
 import {
   TAILSCALE_OAUTH_MISSING_CODE,
   TS_OAUTH_CLIENT_ID_ENV_VAR,
@@ -1962,7 +1963,13 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(code).toBe(1);
       expect(logs.length).toBeGreaterThan(0);
       const parsed = JSON.parse(logs.join('\n')) as { error: { code: string; message: string } };
-      expect(parsed.error.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
+      // groundnuty/macf#1197 — the operator-secrets-file aggregate check
+      // now fires FIRST for the vault-absent case (this test supplies no
+      // vault flags), superseding `checkTailscaleOauthPreflight`'s own
+      // `TAILSCALE_OAUTH_MISSING_CODE` for this scenario; that code is
+      // still reachable when vault flags ARE given (see the sibling
+      // "vault lacks the values" test below).
+      expect(parsed.error.code).toBe(MISSING_OPERATOR_INPUTS_CODE);
     });
 
     it('NOT declared at all -> unaffected: proceeds with no vault flags and no refusal (a fleet that has not set up Tailscale yet is not broken)', async () => {
@@ -2113,11 +2120,11 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(parsed.error.code).toBe(TS_OAUTH_FLAGS_INCOMPLETE_CODE);
     });
 
-    it('declared + no vault + NEITHER flag/env supplied -> STILL refuses before gate 1, and the refusal names the flag as an alternative to the vault', async () => {
+    it('declared + no vault + NEITHER flag/env supplied -> STILL refuses before gate 1 — naming both keys via the aggregate operator-inputs message (groundnuty/macf#1197)', async () => {
       const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
       let startManifestFlowCalls = 0;
       const code = await runBootstrapApply(
-        { file, yes: true }, // no vault flags, no ts-oauth flags, no env
+        { file, yes: true }, // no vault flags, no ts-oauth flags, no env, no secrets file
         { observe: () => Promise.resolve(EMPTY_OBSERVED) },
         fakeMutateDeps(file, {
           buildAgentDeps: () =>
@@ -2131,7 +2138,13 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       );
       expect(code).toBe(1);
       expect(startManifestFlowCalls).toBe(0);
-      expect(errs.join('\n')).toContain(TS_OAUTH_CLIENT_ID_FLAG);
+      // groundnuty/macf#1197 — since the operator secrets file's aggregate
+      // check now runs before `checkTailscaleOauthPreflight`, the refusal
+      // names the env-var-style keys the file understands (exactly what
+      // the operator would put IN the file), not the flag literal.
+      const message = errs.join('\n');
+      expect(message).toContain(TS_OAUTH_CLIENT_ID_ENV_VAR);
+      expect(message).toContain(TS_OAUTH_SECRET_ENV_VAR);
     });
 
     it('NEVER logs the supplied secret value anywhere in stdout/stderr across a full run (text AND --json) — only the flag/env NAMES may appear', async () => {
@@ -2199,7 +2212,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'file-secret')).toBe(true);
     });
 
-    it('DECISIVE 2: a required key missing from the file -> refuses BEFORE the first gate, naming every missing key together', async () => {
+    it('DECISIVE 2: a required key missing from the file -> refuses BEFORE the first gate, naming every missing key together, via the FILE\'s own aggregate mechanism', async () => {
       const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
       // A file that supplies neither key at all — same as "no file given"
       // for this pair, but exercises the read path rather than the
@@ -2207,7 +2220,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       const secretsFile = writeSecretsFile(dirname(file), '# nothing relevant in here\nSOME_UNRELATED_KEY=whatever\n');
       let observeCalls = 0;
       const code = await runBootstrapApply(
-        { file, yes: true, secretsFilePath: secretsFile }, // no flags, no env
+        { file, yes: true, json: true, secretsFilePath: secretsFile }, // no flags, no env
         {
           observe: () => {
             observeCalls += 1;
@@ -2217,9 +2230,13 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       );
       expect(code).toBe(1);
       expect(observeCalls).toBe(0); // never reached a gate
-      const message = errs.join('\n');
-      expect(message).toContain(TS_OAUTH_CLIENT_ID_SECRET_NAME);
-      expect(message).toContain(TS_OAUTH_SECRET_SECRET_NAME);
+      // Decisive: the CODE proves this is the file's OWN aggregate
+      // mechanism firing — not merely `checkTailscaleOauthPreflight`'s
+      // pre-existing pair-shaped message happening to name two keys.
+      const parsed = JSON.parse(logs.join('\n')) as { error: { code: string; message: string } };
+      expect(parsed.error.code).toBe(MISSING_OPERATOR_INPUTS_CODE);
+      expect(parsed.error.message).toContain(TS_OAUTH_CLIENT_ID_ENV_VAR);
+      expect(parsed.error.message).toContain(TS_OAUTH_SECRET_ENV_VAR);
     });
 
     it('flag beats the per-fleet file on conflict', async () => {

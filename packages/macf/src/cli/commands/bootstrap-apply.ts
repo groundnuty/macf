@@ -92,7 +92,14 @@ import {
 // flag/env resolution below to a 4-tier flag -> per-fleet file -> per-scope
 // file -> env chain, per KEY, without restructuring the preflights that
 // already consume the resolved values.
-import { applyOperatorSecretsFileToProcessEnv, readOperatorSecretsFile, resolveOperatorInput } from '../bootstrap/operator-secrets-file.js';
+import {
+  applyOperatorSecretsFileToProcessEnv,
+  formatMissingOperatorInputsMessage,
+  MISSING_OPERATOR_INPUTS_CODE,
+  missingRequiredOperatorInputs,
+  readOperatorSecretsFile,
+  resolveOperatorInput,
+} from '../bootstrap/operator-secrets-file.js';
 import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR } from '../bootstrap/runner-platform.js';
 import {
   readVault,
@@ -2630,6 +2637,32 @@ export async function runBootstrapApply(
   }
 
   if (opts.dryRun !== true) {
+    // groundnuty/macf#1197 — the aggregate-fail-loud check (Pattern D,
+    // silent-fallback-hazards.md): every REQUIRED operator-secrets-file key
+    // this manifest declares a need for, checked TOGETHER and named
+    // TOGETHER in ONE message — not one-at-a-time discovery across gates.
+    // Same `--dry-run`-skip posture as `checkRunnerTokenPreflight`/
+    // `checkTailscaleOauthPreflight` immediately below (a dry run never
+    // opens a gate to begin with). Gated on the vault flags being ABSENT
+    // (the XOR check above already guarantees they are both-or-neither): a
+    // vaulted value can still satisfy the requirement, and only
+    // `checkTailscaleOauthPreflight` below (which decrypts to check) can
+    // tell — this check would otherwise false-negative a fleet whose vault
+    // already has the pair. The vault-absent case is this issue's own
+    // motivating scenario: a fresh org has no vault to read from at all.
+    // Deliberately covers ONLY the ts-oauth pair, not the runner token —
+    // `#1209` made a missing runner token WARN, not refuse (some legs never
+    // need it), and this check must not reintroduce that regression.
+    if (opts.vaultPath === undefined && opts.identityKeyPath === undefined) {
+      const missingOperatorInputs = missingRequiredOperatorInputs([
+        { key: TS_OAUTH_CLIENT_ID_ENV_VAR, required: manifest.transport.tailscale_oauth_required, value: resolvedTsOauthClientId },
+        { key: TS_OAUTH_SECRET_ENV_VAR, required: manifest.transport.tailscale_oauth_required, value: resolvedTsOauthSecretRaw },
+      ]);
+      if (missingOperatorInputs.length > 0) {
+        return renderFailure({ code: MISSING_OPERATOR_INPUTS_CODE, message: formatMissingOperatorInputsMessage(missingOperatorInputs) }, opts);
+      }
+    }
+
     const runnerTokenFailure = checkRunnerTokenPreflight(manifest.routing, resolvedRunnerToken);
     if (runnerTokenFailure !== undefined) {
       // groundnuty/macf#1209 — WARN, don't abort: see the block comment
