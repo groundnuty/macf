@@ -13,6 +13,16 @@
  *                              `uses: groundnuty/macf-actions/...@<pin>` line.
  *   - `readRoutingConfigGh`  — a repo's `.github/agent-config.json` (the router's
  *                              per-label config), via the GitHub contents API.
+ *                              `createRoutingConfigGhReaderDetailed` (macf#1193)
+ *                              is the primary implementation — a discriminated
+ *                              `RoutingConfigReadResult` distinguishing absent
+ *                              / malformed / read-failed, consumed by the
+ *                              per-repo artifact sweep (`readRoutingConfigForRepo`);
+ *                              `createRoutingConfigGhReader` is a thin wrapper
+ *                              collapsing that back to `RoutingConfig | null`
+ *                              for the two callers (the current-repo fallback,
+ *                              `routing-e2e.ts`) that never needed the
+ *                              distinction.
  *   - `readFleetMarker`      — a repo's `.github/macf-fleet.json` opt-OUT marker
  *                              (#614): a pinned repo declares itself non-fleet here so
  *                              it is excluded from `pins_consistent`. Self-declaration
@@ -49,7 +59,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { CallerPinResult, FleetMarker, RoutingConfig } from './routing-doctor.js';
+import type { CallerPinResult, FleetMarker, RoutingConfig, RoutingConfigReadResult } from './routing-doctor.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -60,6 +70,23 @@ const ACTIONS_USES_RE =
 /** Decode a GitHub contents-API `.content` base64 blob (newline-wrapped). */
 function decodeGhContent(b64: string): string {
   return Buffer.from(b64.replace(/\s+/g, ''), 'base64').toString('utf-8');
+}
+
+/**
+ * Best-effort extraction of a caught `execFile` error's captured stderr — the
+ * SAME 404-vs-other-failure discrimination `bootstrap/control-repo.ts::checkControlRepoMeta`
+ * uses (macf#1193), duplicated locally rather than imported across the
+ * `commands/` / `bootstrap/` subsystem boundary: a tiny pure helper, kept
+ * per-subsystem, is the SAME precedent `bootstrap/manifest-exchange.ts` already
+ * sets for this exact function (it has its own private copy rather than
+ * importing `bootstrap/observer.ts`'s exported one).
+ */
+function getStderr(err: unknown): string {
+  if (err && typeof err === 'object' && 'stderr' in err) {
+    const s = (err as { readonly stderr?: unknown }).stderr;
+    if (typeof s === 'string') return s;
+  }
+  return '';
 }
 
 /**
@@ -124,27 +151,79 @@ export function createCallerPinReader(token: string): (repo: string) => Promise<
 }
 
 /**
- * Read one repo's `.github/agent-config.json` (the router's per-label config) via
- * the GitHub contents API. Returns the parsed config or `null` (absent / unreadable
- * / malformed). NEVER throws.
+ * Read one repo's `.github/agent-config.json` (the router's per-label config)
+ * via the GitHub contents API, discriminating WHY a read didn't yield a
+ * usable config (macf#1193). See `RoutingConfigReadResult`'s doc in
+ * `routing-doctor.ts` for the full rationale behind the four states; in
+ * short: `absent` (a confident 404 on this ALREADY known-visible repo) is
+ * silently skipped by the caller, `malformed` (present but broken) is a
+ * confirmed defect, `read-failed` (network/rate-limit/transient) is a
+ * genuine unknown. NEVER throws.
+ *
+ * The `read-failed` / `malformed` `reason` is a SHORT FIXED phrase, never the
+ * raw `gh` stderr — that text can be multi-line, and interpolating arbitrary
+ * subprocess output into a `reason` that lands in a rendered table AND a
+ * `--json` payload is exactly the kind of thing the "never log credential
+ * material" discipline exists to keep out of user-facing surfaces, even
+ * though a 404/network error is not itself expected to carry secrets.
+ */
+export function createRoutingConfigGhReaderDetailed(
+  token: string,
+): (repo: string) => Promise<RoutingConfigReadResult> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo: string): Promise<RoutingConfigReadResult> => {
+    let stdout: string;
+    try {
+      ({ stdout } = await execFileAsync(
+        'gh',
+        ['api', `repos/${repo}/contents/.github/agent-config.json`, '--jq', '.content'],
+        { encoding: 'utf-8', env, maxBuffer: 8 * 1024 * 1024 },
+      ));
+    } catch (err) {
+      const stderr = getStderr(err);
+      // WHY (macf#1193): `repo` here is always drawn from THIS run's App
+      // install-set — already known-visible to this caller — so a confident
+      // 404 unambiguously means "no such file," not "can't see this repo."
+      // See `RoutingConfigReadResult`'s `absent` doc for the full argument.
+      if (/HTTP 404|Not Found/i.test(stderr)) {
+        return { status: 'absent' };
+      }
+      return { status: 'read-failed', reason: 'network, rate-limit, or a transient gh api failure' };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(decodeGhContent(stdout));
+    } catch {
+      return { status: 'malformed', reason: 'content is not valid JSON' };
+    }
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      typeof (parsed as RoutingConfig).agents !== 'object' ||
+      (parsed as RoutingConfig).agents === null
+    ) {
+      return { status: 'malformed', reason: 'missing or invalid "agents" object' };
+    }
+    return { status: 'present', config: parsed as RoutingConfig };
+  };
+}
+
+/**
+ * Back-compat collapse of {@link createRoutingConfigGhReaderDetailed} to the
+ * plain `RoutingConfig | null` contract `readRoutingConfig` (the CURRENT-repo
+ * fallback, see `resolveDepsFromRegistry`) and `routing-e2e.ts` rely on —
+ * neither of those callers needed the absent/malformed/read-failed
+ * distinction macf#1193 introduced specifically for the artifact sweep
+ * (`readRoutingConfigForRepo`); for them, all three collapse to "no usable
+ * config," same as before.
  */
 export function createRoutingConfigGhReader(
   token: string,
 ): (repo: string) => Promise<RoutingConfig | null> {
-  const env = { ...process.env, GH_TOKEN: token };
+  const detailed = createRoutingConfigGhReaderDetailed(token);
   return async (repo: string): Promise<RoutingConfig | null> => {
-    try {
-      const { stdout } = await execFileAsync(
-        'gh',
-        ['api', `repos/${repo}/contents/.github/agent-config.json`, '--jq', '.content'],
-        { encoding: 'utf-8', env, maxBuffer: 8 * 1024 * 1024 },
-      );
-      const parsed = JSON.parse(decodeGhContent(stdout)) as RoutingConfig;
-      if (!parsed || typeof parsed !== 'object' || typeof parsed.agents !== 'object') return null;
-      return parsed;
-    } catch {
-      return null;
-    }
+    const result = await detailed(repo);
+    return result.status === 'present' ? result.config : null;
   };
 }
 
