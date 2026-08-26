@@ -2208,6 +2208,123 @@ async function retryRecoverableGate2Rejection(
   return current;
 }
 
+// --- Install-scope-coverage gate (groundnuty/macf#1220 — the ACT half) ---
+
+/**
+ * `openInstallScopeCoverageGate` — reopens consent gate 2's install page for
+ * a FLEET-LEVEL App (`runner-ops`/router) that is already installed but
+ * whose `selected` repo set is stale against what the fleet manifest
+ * currently declares (`install-scope-coverage.ts`'s drift). This is the SAME
+ * machinery {@link applyIdentity}'s `reuse-confirmed` branch already uses
+ * for a single agent's own drifted install (#1012/#1178:
+ * `runGate2WithInterstitial` + {@link pollForInstallFix}, `waitLabel:
+ * 'Save'`) — generalized to a caller with no `IdentityRequest`/`FleetAgent`
+ * to derive one from (a fleet-level App has neither), never a second gate
+ * implementation.
+ *
+ * `opts.message` is passed through to `runGate2WithInterstitial`'s
+ * `instructionLines` UNCHANGED — the caller (`install-scope-coverage.ts`)
+ * already authored this exact sentence for the terminal's WARNING line
+ * (`installScopeCoverageDriftMessage`); reusing it here (rather than
+ * composing a second, differently-worded instruction) is what makes the
+ * terminal report and this gate's own terminal+page text the SAME words,
+ * the #1174 "one message source" discipline. `whyText` is passed as `''` to
+ * the underlying `runGate2WithInterstitial` call — safe ONLY because
+ * `opts.instructionLines` is ALWAYS supplied here, which short-circuits
+ * `gate2DefaultInstructionLines`'s own use of `whyText` entirely; if a
+ * future change ever made `instructionLines` optional on this path, `''`
+ * would leak as an empty instruction line and would need a real value.
+ *
+ * `opts.expected` intentionally carries `accountLogin` ONLY, never
+ * `appSlug`. The App handle passed in (`opts.appSlug`) is a NAMING-
+ * CONVENTION PREDICTION (`deriveRunnerOpsHandle`/`deriveRouterAppHandle`),
+ * not a GitHub-confirmed slug — `identity-confirm.ts::appInstallationUrl`'s
+ * own doc already flags that GitHub may append a disambiguating suffix on
+ * creation. Filtering `pollForInstallFix`'s `confirmAppInstallation` calls
+ * on a WRONG predicted slug would make every tick read
+ * `installed-unexpected-target` and the gate would burn its whole budget
+ * unable to ever resolve, even though the correct install exists — a gate
+ * that "waits" but structurally cannot succeed. `GET /app/installations`
+ * is already scoped to the App identified by the minted JWT (this
+ * function's own `appId`, resolved from `fleet.lock`/vault by the caller),
+ * so `accountLogin` alone is sufficient discrimination — matching
+ * `identity-confirm.ts`'s own A4 doc on why that endpoint has no partial-
+ * visibility concern to guard against. The derived handle is still used for
+ * the install URL itself, with the SAME "no GitHub-confirmed slug" caveat
+ * text `resume-install` already carries (`applyAgentIdentity`'s
+ * `resumeCaveat`), reused verbatim rather than re-authored.
+ *
+ * `opts.recheck` re-runs the CALLER's own coverage definition
+ * (`evaluateInstallScopeCoverage` against a fresh probe) on every poll tick
+ * — this function only knows how to open/poll a gate, never what "covered"
+ * means for install-scope-coverage specifically; that stays owned by
+ * `install-scope-coverage.ts`.
+ *
+ * `opts.deps` is `Omit<AgentApplyDeps, 'writeRecoveryArtifact'>` —
+ * `MutateApplyDeps.buildAgentDeps`'s own return type — because this path
+ * NEVER reaches gate 1 / the CREATE branch that calls it (the App + its
+ * install already exist; that is the definition of drift here). The
+ * `writeRecoveryArtifact` stub below is unreachable code, not a real no-op
+ * dependency this path relies on — narrowing `runGate2WithInterstitial`'s
+ * own (unexported, internal) parameter type instead was considered and
+ * rejected: several internal helpers thread `deps: AgentApplyDeps` through
+ * unchanged, and narrowing all of them is a materially larger, riskier diff
+ * for the same outcome.
+ */
+export interface InstallScopeGateOptions {
+  readonly role: string;
+  readonly appId: string;
+  readonly keyPath: string;
+  readonly appSlug: string;
+  readonly accountLogin: string;
+  /** The already-authored drift message — see this function's own doc. */
+  readonly message: string;
+  /** `owner/repo` form — this target's currently-missing set. Bared internally for the copyable block, same as every other `runGate2WithInterstitial` caller. */
+  readonly missingRepos: readonly string[];
+  readonly recheck: () => Promise<{ readonly covered: boolean; readonly missingRepos: readonly string[]; readonly message: string }>;
+  readonly deps: Omit<AgentApplyDeps, 'writeRecoveryArtifact'>;
+}
+
+export type InstallScopeGateOutcome = { readonly status: 'covered' } | { readonly status: 'drift'; readonly reason: string };
+
+export async function openInstallScopeCoverageGate(opts: InstallScopeGateOptions): Promise<InstallScopeGateOutcome> {
+  const expected: ExpectedIdentity = { accountLogin: opts.accountLogin };
+  const deps: AgentApplyDeps = {
+    ...opts.deps,
+    // Never called on this path — see this function's own doc.
+    writeRecoveryArtifact: () => Promise.resolve(),
+  };
+  const validate: ValidateInstallHook = async () => {
+    const result = await opts.recheck();
+    return result.covered ? undefined : { message: result.message, missingRepos: result.missingRepos };
+  };
+  const outcome = await runGate2WithInterstitial(
+    opts.role,
+    opts.appId,
+    opts.keyPath,
+    expected,
+    opts.appSlug,
+    appInstallationUrl(opts.appSlug),
+    opts.missingRepos,
+    '',
+    deps,
+    {
+      caveat:
+        '(URL predicted from the fleet/role naming convention — no GitHub-confirmed slug is available on this ' +
+        'path; if it 404s, find the App via Settings → Developer settings → GitHub Apps instead.)',
+      instructionLines: [opts.message],
+      waitStrategy: pollForInstallFix,
+      // This App is ALREADY installed — the operator adds repos under
+      // "Repository access" and clicks "Save," never "Install" again (same
+      // reasoning as the `reuse-confirmed` retry branch above).
+      waitLabel: 'Save',
+      gateLabelSuffix: ' — widening install scope',
+    },
+    validate,
+  );
+  return outcome.status === 'resumed-install' ? { status: 'covered' } : { status: 'drift', reason: outcome.reason };
+}
+
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }

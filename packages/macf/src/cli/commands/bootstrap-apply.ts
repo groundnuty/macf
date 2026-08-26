@@ -30,6 +30,7 @@ import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
 import { deriveAppHandle, deriveControlRepoName, parseFleetManifest } from '../bootstrap/fleet-manifest.js';
 import type { FleetObserverFn, FleetPlan, FleetPlanFailure, ObservedState, OperatorInteractionBound, Presence, UnimplementedApplyItem } from '../bootstrap/plan.js';
 import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, hasInstallScopeCoverageDrift, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
+import type { InstallScopeCoverageEntry, InstallScopeCoverageTarget } from '../bootstrap/install-scope-coverage.js';
 import {
   checkVaultFlagsComplete,
   computePlan,
@@ -47,7 +48,13 @@ import type { GitHubAppManifest } from '../bootstrap/app-manifest.js';
 import { buildAppManifest, repoHomepageUrl } from '../bootstrap/app-manifest.js';
 import { appInstallationUrl, confirmAppInstallation as realConfirmAppInstallation } from '../bootstrap/identity-confirm.js';
 import type { ExpectedIdentity, IdentityConfirmation } from '../bootstrap/identity-confirm.js';
-import { confirmBeforeCreateGuard, gate2RepoSelectionInstructionLines, installReposForIdentity, realAgentApplyDeps } from '../bootstrap/apply-agent.js';
+import {
+  confirmBeforeCreateGuard,
+  gate2RepoSelectionInstructionLines,
+  installReposForIdentity,
+  openInstallScopeCoverageGate,
+  realAgentApplyDeps,
+} from '../bootstrap/apply-agent.js';
 import type { CreateGuardDecision, CreateGuardDeps } from '../bootstrap/apply-agent.js';
 import { realCloneRepo, realCommitAndPush } from '../bootstrap/apply-repo-init.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
@@ -2310,18 +2317,25 @@ export function fleetApplyResultToJson(
  * - `installScopeCoverage` (groundnuty/macf#1220 — a previously-installed
  *   fleet-level App, `runner-ops`/router, whose `selected` repo set is
  *   stale against the manifest THIS run just grew): deliberately NEVER
- *   read here, same reasoning as `remainingDeploy` above. This check
- *   reports on an App's install state — a fact GitHub owns, and one this
- *   run has NO code path to change (widening a `selected` install is a
- *   consent action only the operator can perform on GitHub's install
- *   page; there is no "fix" this function could gate a retry on the way
- *   it gates `controlRepoBad`/`agentBad` on states apply itself produced).
- *   Failing the run over a fact it cannot act on would not prompt a
- *   different operator action than the loud text/JSON report already
- *   does — it would only turn an otherwise-successful provision into a
- *   red exit code for a condition that may have predated this run
- *   entirely. Reported loud (see this function's call site), never
- *   silent — but never a spurious non-zero either.
+ *   read here, same reasoning as `remainingDeploy` above. **As of #1220
+ *   `apply` DOES attempt to fix this live** — a confirmed `'drift'` entry
+ *   reopens consent gate 2 (`onInstallScopeDrift`, the call site below) and
+ *   the operator is presented the exact same browser gate a fresh install
+ *   would show. Still never read here: widening a `selected` install still
+ *   requires an operator's own click on GitHub's page — the gate can
+ *   PRESENT that action, never perform it unattended — so a still-`'drift'`
+ *   entry after the gate closes (declined, timed out, or cancelled) means
+ *   the operator was already given the chance and either took it or
+ *   didn't, exactly the same "already offered the action, nothing more
+ *   this function could gate a retry on" shape `controlRepoBad`/`agentBad`
+ *   themselves rely on for states apply DOES fully own — the difference is
+ *   ownership of the LAST step, which is unavoidably the operator's here.
+ *   Failing the run over a fact whose remaining fix is an operator click,
+ *   already offered, would not prompt a DIFFERENT operator action than the
+ *   loud text/JSON report already does — it would only turn an otherwise-
+ *   successful provision into a red exit code. Reported loud (see this
+ *   function's call site), never silent — but never a spurious non-zero
+ *   either.
  */
 export function applyExitCode(
   result: FleetApplyResult,
@@ -3059,6 +3073,50 @@ export async function runBootstrapApply(
       // "post-run" reasoning applied to credential resolution — a
       // runner-ops/router App THIS run just created has its entry there,
       // never in the pre-run `observed.lock`.
+      //
+      // groundnuty/macf#1220 — the ACT half. `onInstallScopeDrift` below is
+      // `apply`'s OWN `onDrift` wiring — `status`'s call site
+      // (`bootstrap-status.ts`) never passes one, so this stays inert
+      // there. Each drifted App gets ONE reopened consent-gate-2 (never one
+      // per missing repo — `openInstallScopeCoverageGate` names the whole
+      // missing set in a single gate, same as gate 2's own "Only select
+      // repositories" picker handles a multi-repo selection in one visit),
+      // via the EXACT same gate machinery `apply-agent.ts`'s
+      // `reuse-confirmed` retry branch already uses for a single agent's
+      // own drifted install — never a second gate implementation. Reuses
+      // `mutate.buildAgentDeps` — the SAME deps factory every per-agent
+      // gate in `applyFleet` above already used — so this gate's browser-
+      // open / interstitial / operator-beat wiring is identical to every
+      // other gate this run may have already shown the operator.
+      const onInstallScopeDrift = async (
+        target: InstallScopeCoverageTarget,
+        entry: InstallScopeCoverageEntry,
+        credential: { readonly appId: string; readonly keyPath: string },
+        recheck: () => Promise<InstallScopeCoverageEntry>,
+      ): Promise<InstallScopeCoverageEntry> => {
+        const outcome = await openInstallScopeCoverageGate({
+          role: target.role,
+          appId: credential.appId,
+          keyPath: credential.keyPath,
+          appSlug: target.appHandle,
+          accountLogin: manifest.owner.account,
+          // `entry.message` IS `installScopeCoverageDriftMessage`'s output
+          // — the SAME sentence `formatInstallScopeCoverageLines` would
+          // otherwise print as this target's WARNING line. Passed through
+          // unchanged (never re-composed) so the terminal report, this
+          // gate's terminal instructionLines, AND the served interstitial
+          // all carry the identical string (#1174's single-message-source
+          // discipline).
+          message: entry.message ?? '',
+          missingRepos: entry.missingRepos,
+          recheck: async () => {
+            const reevaluated = await recheck();
+            return { covered: reevaluated.status === 'covered', missingRepos: reevaluated.missingRepos, message: reevaluated.message ?? '' };
+          },
+          deps: mutate.buildAgentDeps(stderrLog),
+        });
+        return outcome.status === 'covered' ? { ...target, status: 'covered', missingRepos: [], unverifiedRepos: [] } : entry;
+      };
       const installScopeCoverage =
         opts.vaultPath !== undefined && opts.identityKeyPath !== undefined
           ? await computeInstallScopeCoverage(
@@ -3069,6 +3127,7 @@ export async function runBootstrapApply(
               >,
               controlRepoAborted ? observed.controlRepoPresence : 'present',
               { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath },
+              { onDrift: onInstallScopeDrift },
             )
           : {};
       const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
@@ -3095,20 +3154,25 @@ export async function runBootstrapApply(
           }),
         );
         // groundnuty/macf#1220 — printed LAST, after the rest of the result
-        // (never buried mid-render) — report-vs-act, decided: this run
-        // NEVER widens an installation itself (that is a consent action
-        // only the operator can perform on GitHub's install page — see
-        // `install-scope-coverage.ts`'s module doc), and drift here does
-        // NOT change `applyExitCode` below (see that function's own
-        // "Audited other inputs" section for the parallel ruling + why —
-        // this check reports on an App this run did not itself mutate,
-        // the same "informational, never a spurious non-zero" floor that
-        // section already applies to `remainingDeploy`). The loud heading
-        // is the chosen middle ground between silence and a code change:
-        // an operator running WITHOUT --json still sees, in the one place
-        // a script-free run reads its result, that the fleet is not
-        // actually complete yet — never buried as a same-weight preview
-        // line beside a routine "noop" item.
+        // (never buried mid-render). `installScopeCoverage` above already
+        // reflects the POST-gate state: `onInstallScopeDrift` reopened
+        // consent gate 2 for every target this run confirmed drifted, so a
+        // successful widen already turned that entry `'covered'` before
+        // this render ever runs — a clean fleet prints NOTHING here, same
+        // as before #1220. A `'drift'` entry surviving to this point means
+        // the gate was already opened and offered (declined, timed out, or
+        // cancelled), not that apply never tried — this run still cannot
+        // FORCE a widen without the operator's own click on GitHub's page.
+        // Drift here does NOT change `applyExitCode` below (see that
+        // function's own "Audited other inputs" section for the full
+        // ruling + why — an already-offered, unattended-unfixable fact
+        // stays informational, the same floor that section already applies
+        // to `remainingDeploy`). The loud heading is the chosen middle
+        // ground between silence and a code change: an operator running
+        // WITHOUT --json still sees, in the one place a script-free run
+        // reads its result, that the fleet is not actually complete yet —
+        // never buried as a same-weight preview line beside a routine
+        // "noop" item.
         if (installScopeCoverageLines.length > 0) {
           console.log('');
           console.log(

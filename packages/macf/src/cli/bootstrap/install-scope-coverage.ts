@@ -233,6 +233,29 @@ export async function probeInstallScopeCoverage(
 export interface InstallScopeCoverageDeps {
   readonly probeFn?: (appId: string, keyPath: string, owner: string, repo: string) => Promise<Presence>;
   readonly readVaultFn?: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>;
+  /**
+   * groundnuty/macf#1220 — the ACT half. Called for a target's entry
+   * EXACTLY when this run's own probe just evaluated it `'drift'` (never
+   * for `'covered'`/`'unknown'` — the honest-unknown floor: a target this
+   * run could not confirm either way never opens a gate for a maybe-
+   * problem). Given the credential this function ALREADY resolved (so the
+   * caller mints no second JWT / re-reads no vault) and a `recheck` closure
+   * that re-runs this SAME probe-then-evaluate pair on demand (so the
+   * caller never re-implements what "covered" means here), the result
+   * REPLACES the entry — typically `'covered'` after a successful gate, or
+   * the original `'drift'` entry unchanged after a decline/timeout/
+   * cancel. `undefined` (every `status`/`plan` caller, and `apply` itself
+   * before this issue) preserves the pre-#1220 report-only behavior
+   * exactly — `status` MUST NOT pass this (opening a browser from a
+   * read-only command would be its own hazard), so only `apply`'s call
+   * site wires it.
+   */
+  readonly onDrift?: (
+    target: InstallScopeCoverageTarget,
+    entry: InstallScopeCoverageEntry,
+    credential: { readonly appId: string; readonly keyPath: string },
+    recheck: () => Promise<InstallScopeCoverageEntry>,
+  ) => Promise<InstallScopeCoverageEntry>;
 }
 
 /**
@@ -322,7 +345,29 @@ export async function computeInstallScopeCoverage(
     try {
       const probed = await probeInstallScopeCoverage(credential.appId, keyPath, target.expectedRepos, probeFn);
       const existence = (repo: string): Presence => repoExistencePresence(manifest, agentRepoPresence, controlRepoPresence, repo);
-      out[target.role] = evaluateInstallScopeCoverage(target, existence, probed);
+      let result = evaluateInstallScopeCoverage(target, existence, probed);
+      // groundnuty/macf#1220 — the ACT half, gated on this run's OWN
+      // just-confirmed 'drift' (never 'covered'/'unknown' — see
+      // `InstallScopeCoverageDeps.onDrift`'s doc). `recheck` closes over
+      // the SAME `probeFn`/`existence`/`target` this evaluation just used,
+      // so a caller's poll loop re-runs literally the same check, never a
+      // second implementation of "covered."
+      if (result.status === 'drift' && deps?.onDrift !== undefined) {
+        const recheck = async (): Promise<InstallScopeCoverageEntry> => {
+          const reprobed = await probeInstallScopeCoverage(credential.appId, keyPath, target.expectedRepos, probeFn);
+          return evaluateInstallScopeCoverage(target, existence, reprobed);
+        };
+        try {
+          result = await deps.onDrift(target, result, { appId: credential.appId, keyPath }, recheck);
+        } catch (err) {
+          // Never let a gate failure escape this function's own
+          // never-throws contract (mirrors the vault-read catch above) —
+          // degrade to the original, honest 'drift' entry.
+          const reason = err instanceof Error ? err.message : String(err);
+          result = { ...result, message: `${result.message ?? ''} (the consent gate for this could not run: ${reason})` };
+        }
+      }
+      out[target.role] = result;
     } finally {
       cleanupScratchPem(keyPath);
     }
