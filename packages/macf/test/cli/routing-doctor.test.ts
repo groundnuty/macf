@@ -1142,6 +1142,23 @@ describe('gatherRoutingArtifacts — the per-repo sweep (macf#1191)', () => {
     expect(results[0]?.status).not.toBe('config-malformed');
     expect(results[0]?.status).not.toBe('not-visible');
   });
+
+  it('NEVER THROWS: a `present` result whose config carries `agents: null` degrades to empty, it does not reject (macf#1193)', async () => {
+    // `createRoutingConfigGhReaderDetailed` classifies `agents: null` as
+    // `malformed` before it ever reaches `present` — but this function must
+    // stay safe against a DIFFERENTLY-backed `readRoutingConfigForRepo` (a
+    // test fake, or a future reader) that reports `present` anyway. Without
+    // the `?? {}` guard, `Object.keys(null)` throws — which would escape
+    // `runRoutingDoctor`'s top-level catch and produce "no table, one error
+    // line" instead of a diagnosis, in the exact class this issue closes.
+    await expect(
+      gatherRoutingArtifacts(
+        ['groundnuty/macf-science-agent'],
+        async () => ({ status: 'present', config: { agents: null as unknown as Record<string, never> } }),
+        [LABEL_CHECK(async () => ['code-agent'])],
+      ),
+    ).resolves.toEqual([]);
+  });
 });
 
 describe('gatherRoutingDoctor — routing-table artifact checks (macf#1191)', () => {
@@ -1294,6 +1311,14 @@ describe('gatherRoutingDoctor — malformed vs absent vs read-failed routing-con
     // not unreadable) — fully_covered stays true.
     expect(json.summary.routing_artifacts_fully_covered).toBe(true);
     expect(json.summary.routing_artifacts_config_malformed).toBe(1);
+
+    // The human-readable line must say so too — a self-contradicting
+    // "routing-table artifacts ✓" alongside a DEGRADED verdict is exactly
+    // the bug class this issue is about (see the THIRD CASE test above for
+    // the same discipline applied to the pre-existing not-visible case).
+    const line = summaryLine(report);
+    expect(line).toMatch(/config malformed/);
+    expect(line).not.toMatch(/routing-table artifacts ✓/);
   });
 
   it('ABSENT: a confident 404 on an already-visible repo — silently skipped, verdict AND coverage unaffected', async () => {
@@ -1348,6 +1373,11 @@ describe('gatherRoutingDoctor — malformed vs absent vs read-failed routing-con
     // but fully_covered goes false, unlike the malformed case.
     expect(json.summary.routing_artifacts_fully_covered).toBe(false);
     expect(json.summary.routing_artifacts_config_read_failed).toBe(1);
+
+    // Same "the line must not overclaim" discipline as the malformed case.
+    const line = summaryLine(report);
+    expect(line).toMatch(/config unreadable/);
+    expect(line).not.toMatch(/routing-table artifacts ✓/);
   });
 
   it('the negative half: a well-formed config on the SAME fixture produces NO config-level row', async () => {
