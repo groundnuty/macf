@@ -3853,6 +3853,92 @@ trust:
       // An undeclared-and-absent pair is an honest skip, never a run-failing gap.
       expect(applyExitCode(result)).toBe(0);
     });
+
+    // --- groundnuty/macf#1186 — CONVERGENCE: an already-provisioned fleet
+    // (every identity reused, vault genuinely lacks TS_OAUTH) supplies the
+    // pair via `deps.resolvedTsOauth` (the `--ts-oauth-client-id`/
+    // `--ts-oauth-secret` flag/env pair) and gets it published to every
+    // agent repo — Amendment L's convergence property (`apply` reconciles
+    // TOWARD the manifest) applied to a credential the vault never had.
+    // Reuses the EXACT `reusedIdentityDeps()`/`priorLock`/mint-throws-if-
+    // called harness the sibling tests above already use for "every
+    // identity reused" — the decisive negative half here is that NOTHING
+    // about that harness needs to change: no new App, no re-minted CA, no
+    // vault write, just the routing-secret publish picking up a value from
+    // a different source than usual.
+    it('CONVERGENCE — resolvedTsOauth (flag/env) supplies the pair for an already-provisioned fleet whose vault lacks it: published to every repo, nothing else touched', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [
+          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+          { role: 'router', app_id: 'app-router', install_id: 'install-router' },
+        ],
+        fingerprints: { routing_client_key: 'sha256:cafef00d' },
+      };
+      const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      let readVaultTsOauthCalls = 0;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(reusedIdentityDeps(), manifestPath),
+        trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
+        routingClientDeps: {
+          mint: async () => {
+            throw new Error('must not be called — a routing_client_key fingerprint is already recorded (no new mint on convergence)');
+          },
+          readVaultRoutingClient: async () => ({ certPem: 'VAULT-CLIENT-CERT-PEM', keyPem: 'VAULT-CLIENT-KEY-PEM' }),
+        },
+        routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '997', appKeyPem: 'ROUTER-APP-VAULT-PEM' }) },
+        // The macf-trial shape: identities + CA + routing-client already
+        // provisioned, but the vault genuinely has no TS_OAUTH entry (it
+        // was never written there — #1109's dead `payload.routing` field).
+        routingSecretsDeps: {
+          checkRepoSecretPresence: async () => 'absent',
+          setRepoSecret: async (repo, name, value) => {
+            setSecretCalls.push({ repo, name, value });
+          },
+          readVaultTsOauth: async () => {
+            readVaultTsOauthCalls += 1;
+            return undefined;
+          },
+        },
+        // The flag/env-resolved pair — the ONLY source this run has for it.
+        resolvedTsOauth: { clientId: 'flag-client-id', secret: 'flag-secret' },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      // The vault WAS still consulted (each concern gets its own decrypt —
+      // this is not a shortcut around the existing read), but came up empty;
+      // `resolvedTsOauth` is what actually supplied the value.
+      expect(readVaultTsOauthCalls).toBeGreaterThan(0);
+
+      const routerCarryingRepos = ['groundnuty/demo-code', 'groundnuty/demo-fleet-control'];
+      expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'flag-client-id')).toHaveLength(routerCarryingRepos.length);
+      expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'flag-secret')).toHaveLength(routerCarryingRepos.length);
+      for (const repo of routerCarryingRepos) {
+        expect(result.routingSecrets['TS_OAUTH_CLIENT_ID']?.[repo]?.status).toBe('created');
+        expect(result.routingSecrets['TS_OAUTH_SECRET']?.[repo]?.status).toBe('created');
+      }
+
+      // The decisive negative half: NOTHING else changed. No new vault
+      // write (every identity was reused; `mint`/`startManifestFlow`
+      // throwing above already proves no fresh App/routing-client — this
+      // additionally proves the vault-write step itself never fires for
+      // this run, not merely that its inputs happened to be empty).
+      expect(result.vault.status).toBe('skipped');
+
+      expect(applyExitCode(result)).toBe(0);
+
+      // The flag-supplied secret value never reaches a render surface.
+      const rendered = JSON.stringify(fleetApplyResultToJson(result, []));
+      expect(rendered).not.toContain('flag-client-id');
+      expect(rendered).not.toContain('flag-secret');
+      const humanText = formatApplyResult(result, []);
+      expect(humanText).not.toContain('flag-client-id');
+      expect(humanText).not.toContain('flag-secret');
+    });
   });
 
   // --- The runner-ops App (groundnuty/macf#943) ---
