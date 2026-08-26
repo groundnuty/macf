@@ -102,11 +102,15 @@ export interface RepoInitStepOptions {
    * `cleanupScratchPem`) — a Mac-side `macf bootstrap apply` run has no
    * ambient `GH_TOKEN`/`APP_ID` env for the just-minted bot, so without this
    * `repoInit`'s own `generateToken()` call always degrades to
-   * `labels: {status:'skipped'}` (macf#920's actual repro). Omitted for the
-   * `reused`/`resumed-install` identity paths, which have no PEM in process
-   * memory this run — see this module's doc + `applyRepoInitForAgent`'s
-   * doc for how that case is scored (leniently — this run supplied nothing,
-   * so nothing new is asserted about it).
+   * `labels: {status:'skipped'}` (macf#920's actual repro). For the
+   * `reused`/`resumed-install` identity paths (no PEM in process memory this
+   * run), groundnuty/macf#1240 threads this too — resolved from that role's
+   * OWN vault-stored credential via `resolveAgentRepoInitTokenSource`, when
+   * one is available (`--vault`/`--identity-key` supplied AND the vault
+   * holds this role's key). Genuinely omitted only when no such credential
+   * resolves — see this module's doc + `applyRepoInitForAgent`'s doc for how
+   * THAT case is scored (leniently — nothing was supplied, so nothing new is
+   * asserted about it).
    */
   readonly tokenSource?: TokenSource;
   /**
@@ -289,13 +293,20 @@ export type RepoInitStepOutcome =
  * `opts.tokenSource` was given — i.e. this run supplied everything
  * `repoInit` needed to succeed, so anything short of `'ok'` is a genuine
  * regression apply must not paper over ("green exit must not mean
- * unroutable fleet"). When no `tokenSource` was given (the `reused`/
- * `resumed-install` identity paths, which have no PEM in memory this run),
- * a non-'ok' outcome is the PRE-EXISTING, already-acknowledged gap this
- * increment does not close — see this module's + `apply-fleet.ts`'s doc.
- * Scoring it as a failure there would regress every already-provisioned
- * fleet's ordinary re-run apply, which is worse than the gap it would
- * "fix."
+ * unroutable fleet"). The `reused`/`resumed-install` identity paths (no PEM
+ * in memory this run) now ALSO reach this HARD-FAILURE branch whenever
+ * groundnuty/macf#1240's `resolveAgentRepoInitTokenSource` resolves a
+ * `tokenSource` from that role's own vault-stored credential — a genuine
+ * mint failure against a resolvable credential (revoked key, stale vault
+ * PEM, transient 401) is exactly the "supplied everything, still not 'ok'"
+ * case this function exists to catch, same bar as the `created` path
+ * already had. Only when NO `tokenSource` resolves (no `--vault`/
+ * `--identity-key` this run, or the vault doesn't hold this role's key) does
+ * a non-'ok' outcome stay the honest, lenient "nothing to try" this
+ * function scores as good-enough — see this module's + `apply-fleet.ts`'s
+ * doc. Scoring THAT case as a failure would regress every already-
+ * provisioned, vault-less fleet's ordinary re-run apply, which is worse
+ * than the gap it would "fix."
  */
 function labelsAreGoodEnough(labels: LabelsOutcome, tokenSourceGiven: boolean): boolean {
   if (labels.status === 'ok') return true;

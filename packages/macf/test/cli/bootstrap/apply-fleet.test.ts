@@ -2515,6 +2515,54 @@ agents:
       }
       expect(applyExitCode(result)).toBe(2);
     });
+
+    it('a resolved credential + a genuine mint failure: NOW a hard failure (exit 1) — the newly-reachable escalation this fix introduces, distinct from the honest no-credential case above', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+
+      const vaultKeyDir = mkdtempSync(join(tmpdir(), 'macf-apply-fleet-agentrepo-badmint-'));
+      dirs.push(vaultKeyDir);
+      const vaultKeyPath = join(vaultKeyDir, 'code-agent.pem');
+      writeFileSync(vaultKeyPath, 'SENTINEL-VAULT-PEM-code-agent', { mode: 0o600 });
+
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+
+      const agentRepoCalls: RepoInitOptions[] = [];
+      const repoInitDeps: RepoInitStepDeps = {
+        cloneRepo: async () => {},
+        commitAndPush: async () => 'pushed',
+        repoInit: async (_dir, opts) => {
+          if (opts.repo === 'groundnuty/demo-fleet-control') {
+            return { workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } };
+          }
+          agentRepoCalls.push(opts);
+          // A resolvable credential WAS supplied (`opts.tokenSource` is
+          // defined below) but the mint itself genuinely failed — a revoked
+          // key, a stale vault PEM, a transient 401. `labelsAreGoodEnough`
+          // now scores this as a HARD failure, same bar the `created` path
+          // already had (groundnuty/macf#920) — before this fix, the
+          // `reused`/`resumed-install` branch never supplied a tokenSource
+          // at all, so this exact shape could never even be reached for it.
+          return { workflow: 'created', config: 'created', labels: { status: 'partial-failure', created: [], existed: [], failed: ['in-progress'] } };
+        },
+      };
+
+      const agentDeps: AgentApplyDeps = { ...agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), resolveKeyPath: () => vaultKeyPath };
+      const deps = baseDeps(agentDeps, manifestPath, repoInitDeps);
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('reused');
+      expect(agentRepoCalls).toHaveLength(1);
+      expect(agentRepoCalls[0]?.tokenSource).toEqual({ appId: 'app-code-agent', installId: 'install-1', keyPath: vaultKeyPath });
+
+      expect(result.agents[0]?.repoInit?.status).toBe('failed');
+      expect(applyExitCode(result)).toBe(1);
+    });
   });
 
   // --- DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) ---
