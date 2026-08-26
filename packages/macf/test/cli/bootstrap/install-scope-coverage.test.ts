@@ -14,10 +14,12 @@ import {
   computeInstallScopeCoverage,
   evaluateInstallScopeCoverage,
   hasInstallScopeCoverageDrift,
+  installScopeCoverageDriftMessage,
   installScopeCoverageEntryToJson,
   installScopeCoverageTargets,
   probeInstallScopeCoverage,
   repoExistencePresence,
+  type InstallScopeCoverageEntry,
   type InstallScopeCoverageTarget,
 } from '../../../src/cli/bootstrap/install-scope-coverage.js';
 import { RUNNER_OPS_ROLE } from '../../../src/cli/bootstrap/apply-runner-ops.js';
@@ -249,6 +251,116 @@ describe('computeInstallScopeCoverage — honest-unknown BEFORE any I/O, and the
     expect(hasInstallScopeCoverageDrift(result)).toBe(true);
     // The router target has no vault credential in this fixture -> unknown, not drift.
     expect(result[ROUTER_APP_ROLE]?.status).toBe('unknown');
+  });
+});
+
+// --- onDrift wiring (groundnuty/macf#1220 — the ACT half) ---
+
+describe('computeInstallScopeCoverage — onDrift wiring (groundnuty/macf#1220 required test)', () => {
+  const RUNNER_OPS_LOCK: FleetLock = {
+    schema_version: 1,
+    fleet: 'trial',
+    agents: [{ role: RUNNER_OPS_ROLE, app_id: '9001', install_id: '5555' }],
+  };
+  const PEM_B64 = Buffer.from('FAKE PEM CONTENT').toString('base64');
+  const RUNNER_OPS_VAULT = { MACF_RUNNER_OPS_TRIAL_RUNNER_OPS_PRIVATE_KEY_B64: PEM_B64 };
+  const BOTH_VAULT = { ...RUNNER_OPS_VAULT, MACF_ROUTING_APP_ID: '7001', MACF_ROUTING_APP_KEY_B64: PEM_B64 };
+  const AGENT_REPO_PRESENCE: Readonly<Record<string, Presence>> = { 'code-agent': 'present', 'science-agent': 'present', 'writing-agent': 'present' };
+
+  it('1. drift detected -> onDrift is called exactly once for that target, naming the exact missing-repo set (this run WAITS on its result before returning)', async () => {
+    const probeFn = async (_appId: string, _keyPath: string, _owner: string, repo: string): Promise<Presence> => (repo === 'trial-writing-agent' ? 'absent' : 'present');
+    const readVaultFn = async () => RUNNER_OPS_VAULT;
+    let resolvedAfterAwait = false;
+    const onDrift = vi.fn(async (_target: InstallScopeCoverageTarget, entry: InstallScopeCoverageEntry) => {
+      // Simulate a gate that hasn't been fixed yet — resolving keeps
+      // `computeInstallScopeCoverage` waiting on this promise, never
+      // racing ahead of it (asserted below via `resolvedAfterAwait`).
+      await Promise.resolve();
+      resolvedAfterAwait = true;
+      return entry;
+    });
+    const result = await computeInstallScopeCoverage(fleet(), RUNNER_OPS_LOCK, AGENT_REPO_PRESENCE, 'present', { vaultPath: '/v', identityPath: '/k' }, { probeFn, readVaultFn, onDrift });
+
+    expect(onDrift).toHaveBeenCalledTimes(1);
+    expect(resolvedAfterAwait).toBe(true);
+    const [target, entry] = onDrift.mock.calls[0]!;
+    expect(target.role).toBe(RUNNER_OPS_ROLE);
+    expect(entry.missingRepos).toEqual(['macf-experiment/trial-writing-agent']);
+    expect(result[RUNNER_OPS_ROLE]?.status).toBe('drift');
+  });
+
+  it('2. no drift -> onDrift NEVER called, output unchanged ((1) alone would pass an implementation that always opens a gate)', async () => {
+    const probeFn = async (): Promise<Presence> => 'present';
+    const readVaultFn = async () => RUNNER_OPS_VAULT;
+    const onDrift = vi.fn(async (_t: InstallScopeCoverageTarget, e: InstallScopeCoverageEntry) => e);
+    const result = await computeInstallScopeCoverage(fleet(), RUNNER_OPS_LOCK, AGENT_REPO_PRESENCE, 'present', { vaultPath: '/v', identityPath: '/k' }, { probeFn, readVaultFn, onDrift });
+
+    expect(onDrift).not.toHaveBeenCalled();
+    expect(result[RUNNER_OPS_ROLE]?.status).toBe('covered');
+  });
+
+  it('coverage unknown (no resolvable credential) -> onDrift NEVER called — honest-unknown never opens a gate for a maybe-problem', async () => {
+    const probeFn = vi.fn(async (): Promise<Presence> => {
+      throw new Error('probeFn must not be called with no resolvable credential');
+    });
+    const onDrift = vi.fn(async (_t: InstallScopeCoverageTarget, e: InstallScopeCoverageEntry) => e);
+    const result = await computeInstallScopeCoverage(fleet(), EMPTY_LOCK, {}, 'present', { vaultPath: '/v', identityPath: '/k' }, { probeFn, readVaultFn: async () => ({}), onDrift });
+
+    expect(onDrift).not.toHaveBeenCalled();
+    expect(Object.values(result).every((e) => e.status === 'unknown')).toBe(true);
+  });
+
+  it('two Apps drifting -> two onDrift calls, one per App, each naming its OWN disjoint missing-repo set (never one gate per missing repo)', async () => {
+    const probeFn = async (_appId: string, _keyPath: string, _owner: string, repo: string): Promise<Presence> => (repo === 'trial-writing-agent' || repo === 'trial-control' ? 'absent' : 'present');
+    const readVaultFn = async () => BOTH_VAULT;
+    const onDrift = vi.fn(async (_t: InstallScopeCoverageTarget, e: InstallScopeCoverageEntry) => e);
+    const result = await computeInstallScopeCoverage(fleet(), RUNNER_OPS_LOCK, AGENT_REPO_PRESENCE, 'present', { vaultPath: '/v', identityPath: '/k' }, { probeFn, readVaultFn, onDrift });
+
+    expect(onDrift).toHaveBeenCalledTimes(2);
+    const byRole = new Map(onDrift.mock.calls.map(([target, entry]) => [target.role, entry.missingRepos]));
+    expect(byRole.get(RUNNER_OPS_ROLE)).toEqual(['macf-experiment/trial-writing-agent']);
+    expect(byRole.get(ROUTER_APP_ROLE)).toEqual(['macf-experiment/trial-control']);
+    expect(hasInstallScopeCoverageDrift(result)).toBe(true);
+  });
+
+  it('the entry handed to onDrift carries the EXACT same message the terminal report would print (#1174 single-message-source, never a second authored text)', async () => {
+    const probeFn = async (_appId: string, _keyPath: string, _owner: string, repo: string): Promise<Presence> => (repo === 'trial-writing-agent' ? 'absent' : 'present');
+    const readVaultFn = async () => RUNNER_OPS_VAULT;
+    const onDrift = vi.fn(async (_t: InstallScopeCoverageTarget, e: InstallScopeCoverageEntry) => e);
+    await computeInstallScopeCoverage(fleet(), RUNNER_OPS_LOCK, AGENT_REPO_PRESENCE, 'present', { vaultPath: '/v', identityPath: '/k' }, { probeFn, readVaultFn, onDrift });
+
+    const [target, entry] = onDrift.mock.calls[0]!;
+    expect(entry.message).toBe(installScopeCoverageDriftMessage(target.appHandle, entry.missingRepos));
+  });
+
+  it('a successful gate REPLACES the entry with covered — the final report prints nothing for this target', async () => {
+    const probeFn = async (_appId: string, _keyPath: string, _owner: string, repo: string): Promise<Presence> => (repo === 'trial-writing-agent' ? 'absent' : 'present');
+    const readVaultFn = async () => RUNNER_OPS_VAULT;
+    const onDrift = async (target: InstallScopeCoverageTarget): Promise<InstallScopeCoverageEntry> => ({ ...target, status: 'covered', missingRepos: [], unverifiedRepos: [] });
+    const result = await computeInstallScopeCoverage(fleet(), RUNNER_OPS_LOCK, AGENT_REPO_PRESENCE, 'present', { vaultPath: '/v', identityPath: '/k' }, { probeFn, readVaultFn, onDrift });
+
+    expect(result[RUNNER_OPS_ROLE]?.status).toBe('covered');
+    expect(result[RUNNER_OPS_ROLE]?.message).toBeUndefined();
+  });
+
+  it('onDrift throwing degrades to the original drift entry — never escapes computeInstallScopeCoverage\'s own never-throws contract', async () => {
+    const probeFn = async (_appId: string, _keyPath: string, _owner: string, repo: string): Promise<Presence> => (repo === 'trial-writing-agent' ? 'absent' : 'present');
+    const readVaultFn = async () => RUNNER_OPS_VAULT;
+    const onDrift = async (): Promise<InstallScopeCoverageEntry> => {
+      throw new Error('gate blew up');
+    };
+    const result = await computeInstallScopeCoverage(fleet(), RUNNER_OPS_LOCK, AGENT_REPO_PRESENCE, 'present', { vaultPath: '/v', identityPath: '/k' }, { probeFn, readVaultFn, onDrift });
+
+    expect(result[RUNNER_OPS_ROLE]?.status).toBe('drift');
+    expect(result[RUNNER_OPS_ROLE]?.missingRepos).toEqual(['macf-experiment/trial-writing-agent']);
+  });
+
+  it('status/plan-style callers that omit onDrift entirely stay inert — byte-identical to pre-#1220 behavior', async () => {
+    const probeFn = async (_appId: string, _keyPath: string, _owner: string, repo: string): Promise<Presence> => (repo === 'trial-writing-agent' ? 'absent' : 'present');
+    const readVaultFn = async () => RUNNER_OPS_VAULT;
+    const result = await computeInstallScopeCoverage(fleet(), RUNNER_OPS_LOCK, AGENT_REPO_PRESENCE, 'present', { vaultPath: '/v', identityPath: '/k' }, { probeFn, readVaultFn });
+
+    expect(result[RUNNER_OPS_ROLE]?.status).toBe('drift');
   });
 });
 
