@@ -88,6 +88,19 @@ import {
   runnerVerdictComponent,
   workspaceVerdictComponent,
 } from '../bootstrap/fleet-verdict.js';
+// groundnuty/macf#1197 — the operator secrets file: widens the existing
+// flag/env resolution below to a 4-tier flag -> per-fleet file -> per-scope
+// file -> env chain, per KEY, without restructuring the preflights that
+// already consume the resolved values.
+import {
+  applyOperatorSecretsFileToProcessEnv,
+  formatMissingOperatorInputsMessage,
+  MISSING_OPERATOR_INPUTS_CODE,
+  missingRequiredOperatorInputs,
+  readOperatorSecretsFile,
+  resolveOperatorInput,
+} from '../bootstrap/operator-secrets-file.js';
+import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR } from '../bootstrap/runner-platform.js';
 import {
   readVault,
   vaultAgentPrivateKeyPem,
@@ -183,6 +196,25 @@ export interface RunBootstrapApplyOptions {
   readonly tsOauthClientId?: string;
   /** The pair to {@link tsOauthClientId} — same resolution/XOR/never-logged contract. Falls back to {@link TS_OAUTH_SECRET_ENV_VAR}. */
   readonly tsOauthSecret?: string;
+  /**
+   * `--secrets-file` (groundnuty/macf#1197) — path to a per-FLEET plain
+   * `KEY=value` operator secrets file. Slots into the resolution chain
+   * between a CLI flag and {@link scopeSecretsFilePath}: flag wins over
+   * this, this wins over the scope file, the scope file wins over env. A
+   * per-fleet file is optional — its absence is the normal case, not a
+   * warning (see `operator-secrets-file.ts`'s module doc).
+   */
+  readonly secretsFilePath?: string;
+  /**
+   * `--scope-secrets-file` (groundnuty/macf#1197) — path to a per-SCOPE
+   * plain `KEY=value` operator secrets file, shared across every fleet on
+   * the same GitHub org/account. Lowest-but-flag/env tier: a value here is
+   * used only when neither a CLI flag nor {@link secretsFilePath} supplied
+   * it. This is the tier the operator's own ruling expects to carry the
+   * common case — "the second fleet in an org needs no new secrets at
+   * all."
+   */
+  readonly scopeSecretsFilePath?: string;
   /**
    * `--no-deploy` (macf#1013) — commander's `--no-<flag>` convention: the
    * CLI registration carries NO explicit 3rd-arg default (macf#347 — a
@@ -2474,15 +2506,38 @@ export async function runBootstrapApply(
     return renderFailure(vaultFlagsFailure, opts);
   }
 
-  // groundnuty/macf#1186 — CLI flag wins on conflict; the MACF_BOOTSTRAP_TS_OAUTH_*
-  // env vars are the fallback (same "flag, then env" precedence
-  // `resolvedRunnerToken` below already establishes). Resolved here,
-  // unconditionally and before the manifest is even parsed — same placement
-  // + rationale as `vaultFlagsFailure` immediately above: a half-given pair
-  // is an argument-boundary mistake, not a manifest error, and should never
+  // groundnuty/macf#1197 — load the operator secrets file tiers BEFORE any
+  // resolution below reads them. `undefined` opts.*SecretsFilePath (the
+  // common case) is not an error (see `readOperatorSecretsFile`'s doc); a
+  // GIVEN path that fails to read IS one, and refuses here — same
+  // argument-boundary placement as `vaultFlagsFailure` immediately above,
+  // before the manifest is even parsed.
+  const fleetSecretsRead = readOperatorSecretsFile(opts.secretsFilePath);
+  if (fleetSecretsRead !== undefined && !fleetSecretsRead.ok) {
+    return renderFailure({ code: 'operator_secrets_file_unreadable', message: fleetSecretsRead.message }, opts);
+  }
+  const scopeSecretsRead = readOperatorSecretsFile(opts.scopeSecretsFilePath);
+  if (scopeSecretsRead !== undefined && !scopeSecretsRead.ok) {
+    return renderFailure({ code: 'operator_secrets_file_unreadable', message: scopeSecretsRead.message }, opts);
+  }
+  const fleetSecretsValues = fleetSecretsRead?.ok === true ? fleetSecretsRead.values : undefined;
+  const scopeSecretsValues = scopeSecretsRead?.ok === true ? scopeSecretsRead.values : undefined;
+  // The one key whose EXISTING resolution reads `process.env` directly with
+  // no flag/file plumbing of its own (`runner-platform.ts`'s own chain) —
+  // see `applyOperatorSecretsFileToProcessEnv`'s doc for why this is the
+  // simplest safe way to widen ITS resolution too, without touching that
+  // module or `apply-fleet.ts`/`observer.ts`.
+  applyOperatorSecretsFileToProcessEnv(fleetSecretsValues, scopeSecretsValues, [RUNNER_PLATFORM_ENDPOINT_ENV_VAR]);
+
+  // groundnuty/macf#1186 (widened by #1197) — CLI flag wins on conflict,
+  // then the per-fleet secrets file, then the per-scope secrets file, then
+  // the MACF_BOOTSTRAP_TS_OAUTH_* env vars — resolved here, unconditionally
+  // and before the manifest is even parsed — same placement + rationale as
+  // `vaultFlagsFailure` immediately above: a half-given pair is an
+  // argument-boundary mistake, not a manifest error, and should never
   // depend on what this fleet's manifest happens to declare.
-  const resolvedTsOauthClientId = resolveTsOauthFlagOrEnv(opts.tsOauthClientId, process.env[TS_OAUTH_CLIENT_ID_ENV_VAR]);
-  const resolvedTsOauthSecretRaw = resolveTsOauthFlagOrEnv(opts.tsOauthSecret, process.env[TS_OAUTH_SECRET_ENV_VAR]);
+  const resolvedTsOauthClientId = resolveOperatorInput(TS_OAUTH_CLIENT_ID_ENV_VAR, opts.tsOauthClientId, fleetSecretsValues, scopeSecretsValues).value;
+  const resolvedTsOauthSecretRaw = resolveOperatorInput(TS_OAUTH_SECRET_ENV_VAR, opts.tsOauthSecret, fleetSecretsValues, scopeSecretsValues).value;
   const tsOauthFlagsFailure = checkTsOauthFlagsComplete(resolvedTsOauthClientId, resolvedTsOauthSecretRaw);
   if (tsOauthFlagsFailure !== undefined) {
     return renderFailure(tsOauthFlagsFailure, opts);
@@ -2514,7 +2569,9 @@ export async function runBootstrapApply(
   // BOTH the pre-flight refusal below AND the real mutating wiring further
   // down read the exact same resolved value; there is exactly one place this
   // precedence is computed.
-  const resolvedRunnerToken = opts.runnerToken ?? process.env[RUNNER_TOKEN_ENV_VAR];
+  // groundnuty/macf#1197 — widened to the same 4-tier chain as the ts-oauth
+  // pair above: flag -> per-fleet file -> per-scope file -> env.
+  const resolvedRunnerToken = resolveOperatorInput(RUNNER_TOKEN_ENV_VAR, opts.runnerToken, fleetSecretsValues, scopeSecretsValues).value;
 
   // macf#932 — WARN (not refuse) as early as possible, before consent gate 1
   // ever opens — an operator who forgot the flag sees this before spending a
@@ -2580,6 +2637,32 @@ export async function runBootstrapApply(
   }
 
   if (opts.dryRun !== true) {
+    // groundnuty/macf#1197 — the aggregate-fail-loud check (Pattern D,
+    // silent-fallback-hazards.md): every REQUIRED operator-secrets-file key
+    // this manifest declares a need for, checked TOGETHER and named
+    // TOGETHER in ONE message — not one-at-a-time discovery across gates.
+    // Same `--dry-run`-skip posture as `checkRunnerTokenPreflight`/
+    // `checkTailscaleOauthPreflight` immediately below (a dry run never
+    // opens a gate to begin with). Gated on the vault flags being ABSENT
+    // (the XOR check above already guarantees they are both-or-neither): a
+    // vaulted value can still satisfy the requirement, and only
+    // `checkTailscaleOauthPreflight` below (which decrypts to check) can
+    // tell — this check would otherwise false-negative a fleet whose vault
+    // already has the pair. The vault-absent case is this issue's own
+    // motivating scenario: a fresh org has no vault to read from at all.
+    // Deliberately covers ONLY the ts-oauth pair, not the runner token —
+    // `#1209` made a missing runner token WARN, not refuse (some legs never
+    // need it), and this check must not reintroduce that regression.
+    if (opts.vaultPath === undefined && opts.identityKeyPath === undefined) {
+      const missingOperatorInputs = missingRequiredOperatorInputs([
+        { key: TS_OAUTH_CLIENT_ID_ENV_VAR, required: manifest.transport.tailscale_oauth_required, value: resolvedTsOauthClientId },
+        { key: TS_OAUTH_SECRET_ENV_VAR, required: manifest.transport.tailscale_oauth_required, value: resolvedTsOauthSecretRaw },
+      ]);
+      if (missingOperatorInputs.length > 0) {
+        return renderFailure({ code: MISSING_OPERATOR_INPUTS_CODE, message: formatMissingOperatorInputsMessage(missingOperatorInputs) }, opts);
+      }
+    }
+
     const runnerTokenFailure = checkRunnerTokenPreflight(manifest.routing, resolvedRunnerToken);
     if (runnerTokenFailure !== undefined) {
       // groundnuty/macf#1209 — WARN, don't abort: see the block comment

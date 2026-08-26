@@ -30,6 +30,16 @@ import {
 import type { AgentRegistryObservation } from '../bootstrap/observer.js';
 import { githubRegistryObserver, readAgentRegistryInfo, vaultAwareObserver } from '../bootstrap/observer.js';
 import { advertiseHostDriftEntryToJson, detectAdvertiseHostDrift, formatAdvertiseHostDriftLines } from '../bootstrap/advertise-host-drift.js';
+// groundnuty/macf#1197 — the operator secrets file: `plan` reports which
+// source will supply each operator-input key it knows about, so a friend
+// filling in the file can see the resolution BEFORE any gate opens. Loaded
+// the same way `apply` does (see `bootstrap-apply.ts`'s own doc); `plan`
+// has no credential flags of its own, so only the file/env tiers apply.
+import { TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_SECRET_ENV_VAR } from '../bootstrap/apply-routing-secrets.js';
+import { RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
+import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR } from '../bootstrap/runner-platform.js';
+import type { OperatorInputSource } from '../bootstrap/operator-secrets-file.js';
+import { formatOperatorInputProvenanceLine, readOperatorSecretsFile, resolveOperatorInput } from '../bootstrap/operator-secrets-file.js';
 
 export interface RunBootstrapPlanOptions {
   readonly file: string;
@@ -45,6 +55,10 @@ export interface RunBootstrapPlanOptions {
    */
   readonly vaultPath?: string;
   readonly identityKeyPath?: string;
+  /** `--secrets-file` (groundnuty/macf#1197) — per-fleet operator secrets file; see `operator-secrets-file.ts`'s module doc. Optional; absence is normal. */
+  readonly secretsFilePath?: string;
+  /** `--scope-secrets-file` (groundnuty/macf#1197) — per-scope operator secrets file, shared across a fleet's org/account. Lower precedence than {@link secretsFilePath}. */
+  readonly scopeSecretsFilePath?: string;
 }
 
 /** Injectable seam so tests drive the command without touching `gh` / the filesystem lock read. */
@@ -84,6 +98,48 @@ export function resolveDeps(manifestPath: string, vaultPath?: string, identityKe
   return { observe: (manifest: FleetManifest) => githubRegistryObserver(manifest, manifestPath), readAgentRegistry: readAgentRegistryInfo };
 }
 
+/**
+ * groundnuty/macf#1197 — which operator-secrets-file keys are RELEVANT to
+ * this manifest (not every key in {@link OPERATOR_SECRETS_FILE_KEYS}
+ * applies to every fleet — e.g. the Tailscale pair only matters when
+ * `transport.tailscale_oauth_required` is declared). Mirrors the SAME
+ * manifest predicates `checkTailscaleOauthPreflight`/
+ * `checkRunnerTokenPreflight` already use, kept local to this file rather
+ * than exported from `operator-secrets-file.ts` so that module stays
+ * manifest-type-free (see its own doc — it is deliberately generic).
+ */
+function relevantOperatorInputKeys(manifest: FleetManifest): readonly string[] {
+  const keys: string[] = [];
+  if (manifest.transport.tailscale_oauth_required) {
+    keys.push(TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_SECRET_ENV_VAR);
+  }
+  if (manifest.routing?.runner !== undefined) {
+    keys.push(RUNNER_PLATFORM_ENDPOINT_ENV_VAR);
+    if (manifest.routing.runner.runs_on === 'self-hosted') keys.push(RUNNER_TOKEN_ENV_VAR);
+  }
+  return keys;
+}
+
+/**
+ * groundnuty/macf#1197 — "plan states which keys it will need... the
+ * resolved source of each key is reportable." `plan` has no credential
+ * flags of its own (only `--vault`/`--identity-key`), so only the
+ * file/env tiers can resolve here — a `plan`-only "not supplied" for a key
+ * that `apply --ts-oauth-client-id ...` would go on to satisfy is expected,
+ * not a bug. Never touches a value, only `key`/`source` — safe to print
+ * unconditionally (text AND `--json`).
+ */
+export function operatorInputProvenance(
+  manifest: FleetManifest,
+  fleetValues: Readonly<Record<string, string>> | undefined,
+  scopeValues: Readonly<Record<string, string>> | undefined,
+): readonly { readonly key: string; readonly source: OperatorInputSource }[] {
+  return relevantOperatorInputKeys(manifest).map((key) => {
+    const { source } = resolveOperatorInput(key, undefined, fleetValues, scopeValues);
+    return { key, source };
+  });
+}
+
 function renderFailure(failure: FleetPlanFailure, opts: RunBootstrapPlanOptions): number {
   // macf#830 lesson: the plain-text message ALWAYS goes to stderr; under
   // --json we ALSO print a valid, non-empty JSON {error} object to stdout —
@@ -119,6 +175,21 @@ export async function runBootstrapPlan(
   if (vaultFlagsFailure !== undefined) {
     return renderFailure(vaultFlagsFailure, opts);
   }
+
+  // groundnuty/macf#1197 — same argument-boundary placement as the vault
+  // check immediately above: a GIVEN --secrets-file/--scope-secrets-file
+  // path that cannot be read refuses here, before the manifest is even
+  // parsed. `undefined` (the common case) is not an error.
+  const fleetSecretsRead = readOperatorSecretsFile(opts.secretsFilePath);
+  if (fleetSecretsRead !== undefined && !fleetSecretsRead.ok) {
+    return renderFailure({ code: 'operator_secrets_file_unreadable', message: fleetSecretsRead.message }, opts);
+  }
+  const scopeSecretsRead = readOperatorSecretsFile(opts.scopeSecretsFilePath);
+  if (scopeSecretsRead !== undefined && !scopeSecretsRead.ok) {
+    return renderFailure({ code: 'operator_secrets_file_unreadable', message: scopeSecretsRead.message }, opts);
+  }
+  const fleetSecretsValues = fleetSecretsRead?.ok === true ? fleetSecretsRead.values : undefined;
+  const scopeSecretsValues = scopeSecretsRead?.ok === true ? scopeSecretsRead.values : undefined;
 
   const manifestPath = resolvePath(opts.file);
 
@@ -175,6 +246,12 @@ export async function runBootstrapPlan(
       manifest.agents.map((a) => a.role),
     );
 
+    // groundnuty/macf#1197 — "plan states which keys it will need... the
+    // resolved source of each key is reportable." Appended as its OWN
+    // section, never interleaved with the plan-item/drift computations
+    // above.
+    const operatorInputs = operatorInputProvenance(manifest, fleetSecretsValues, scopeSecretsValues);
+
     if (opts.json) {
       console.log(
         JSON.stringify(
@@ -182,6 +259,7 @@ export async function runBootstrapPlan(
             ...(fleetPlanToJson(plan) as Record<string, unknown>),
             operator_interaction: operatorInteractionToJson(budget),
             advertise_host_drift: advertiseHostDrift.map(advertiseHostDriftEntryToJson),
+            operator_inputs: operatorInputs,
           },
           null,
           2,
@@ -193,6 +271,13 @@ export async function runBootstrapPlan(
       console.log(formatOperatorInteractionLine(budget));
       console.log('');
       console.log(formatAdvertiseHostDriftLines(advertiseHostDrift).join('\n'));
+      if (operatorInputs.length > 0) {
+        console.log('');
+        console.log('Operator inputs:');
+        for (const { key, source } of operatorInputs) {
+          console.log(`  ${formatOperatorInputProvenanceLine(key, source)}`);
+        }
+      }
     }
     return 0;
   } catch (err) {

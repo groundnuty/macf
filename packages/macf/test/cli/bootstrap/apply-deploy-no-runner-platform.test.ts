@@ -71,6 +71,14 @@ describe('deploy keeps nothing of the runner half (groundnuty/macf#943, DR-043 A
     // at PLAN time, BEFORE apply ever runs — this is the provisioning
     // phase's OWN read-only reporting surface, not the deploy phase.
     //
+    // groundnuty/macf#1197 — `operator-secrets-file.ts` imports ONLY
+    // `RUNNER_PLATFORM_ENDPOINT_ENV_VAR` (the constant, never
+    // `provisionRunner`/`deprovisionRunner`), so its key registry can name
+    // + populate that key from the operator-secrets file. Consumed
+    // exclusively by `commands/bootstrap-apply.ts` and `commands/
+    // bootstrap.ts` — both provisioning-phase entry points, never the
+    // deploy path.
+    //
     // The invariant this test actually defends (per its own title: "never
     // from any deploy-path file") is a SET EXCLUSION, not a fixed importer
     // count — asserting an exact prior count would have made this test
@@ -99,8 +107,9 @@ describe('deploy keeps nothing of the runner half (groundnuty/macf#943, DR-043 A
     const knownProvisioningPhaseImporters = [
       join(BOOTSTRAP_DIR, 'apply-fleet.ts'),
       join(BOOTSTRAP_DIR, 'apply-routing.ts'),
-      join(BOOTSTRAP_DIR, 'plan.ts'),
       join(BOOTSTRAP_DIR, 'observer.ts'),
+      join(BOOTSTRAP_DIR, 'operator-secrets-file.ts'),
+      join(BOOTSTRAP_DIR, 'plan.ts'),
     ];
     expect([...importers].sort()).toEqual([...knownProvisioningPhaseImporters].sort());
   });
