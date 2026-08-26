@@ -89,8 +89,11 @@
  * | routing.*                           | omitted (optional)      | declarative routing-target/label/hibernation policy; no live signal drives any of the three sub-fields |
  * | collaborators                       | omitted (optional)      | cross-fleet federation membership has no live discovery path implemented (day-2 per its own schema doc) |
  * | shared                              | omitted (optional)      | unconsumed field per its own schema doc |
- * | trust.ca                            | derivable               | v0 supports exactly one mode (`'per-project'`) — a schema enum literal, not an observation |
- * | trust.federated_cas                 | omitted (defaulted)     | no live discovery path; schema default `[]` applies, representing "no federation declared" rather than a confirmed absence |
+ *
+ * `trust.ca` / `trust.federated_cas` are gone from this table because they
+ * are gone from the schema (groundnuty/macf#1201 — see `fleet-manifest.ts`'s
+ * `rejectDeclaredTrust` doc for why, and `#810` for the still-open
+ * fleet-federation design they anticipated).
  *
  * **`defaults.role_template` is flagged, never decided, per explicit
  * instruction** — this module reports it as a judgment call for whoever
@@ -192,8 +195,6 @@ export const MANIFEST_SCAFFOLD_AUDIT_TABLE: readonly ScaffoldAuditRow[] = [
   { field: 'routing.*', verdict: 'derivable', note: 'omitted (optional); no live signal' },
   { field: 'collaborators', verdict: 'derivable', note: 'omitted (optional); day-2, no discovery path' },
   { field: 'shared', verdict: 'derivable', note: 'omitted (optional); unconsumed field' },
-  { field: 'trust.ca', verdict: 'derivable', note: "v0's only mode ('per-project')" },
-  { field: 'trust.federated_cas', verdict: 'derivable', note: 'omitted; schema default [] applies' },
 ];
 
 // --- New primitives (not duplicates of anything observer.ts already reads) ---
@@ -560,7 +561,7 @@ export async function scaffoldManifest(
     todos.push(...agentTodos);
   }
   lines.push('');
-  lines.push('# routing / collaborators / shared / trust: omitted — see the module doc audit table for why each is safe to omit');
+  lines.push('# routing / collaborators / shared: omitted — see the module doc audit table for why each is safe to omit');
 
   const yaml = lines.join('\n') + '\n';
   const schemaIssuePaths = computeSchemaIssuePaths(yaml);

@@ -128,7 +128,6 @@ function baseManifest(): FleetManifest {
     agents: [
       { role: 'code-agent', profile: 'code', repo: 'groundnuty/demo-fleet-experiment', deploy_path: '/deploy/code-agent' },
     ],
-    trust: { ca: 'per-project', federated_cas: [] },
   };
 }
 

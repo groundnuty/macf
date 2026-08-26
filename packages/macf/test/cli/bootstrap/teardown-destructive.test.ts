@@ -29,7 +29,6 @@ const MANIFEST: FleetManifest = {
     { role: 'code-agent', profile: 'code', repo: 'groundnuty/macf-experiment-code', deploy_path: '/x' },
     { role: 'science-agent', profile: 'research', repo: 'groundnuty/macf-experiment-science', deploy_path: '/y' },
   ],
-  trust: { ca: 'per-project', federated_cas: [] },
 };
 
 const SAME_FLEET_YAML = `apiVersion: macf/v0
@@ -56,9 +55,6 @@ agents:
     profile: research
     repo: groundnuty/macf-experiment-science
     deploy_path: /y
-trust:
-  ca: per-project
-  federated_cas: []
 `;
 
 // groundnuty/macf#953 — a fleet.lock that records the runner-ops App, which

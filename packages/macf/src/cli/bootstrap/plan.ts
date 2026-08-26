@@ -1829,8 +1829,9 @@ function actionsVersionItem(repo: string, desired: string, observed: string | un
  * control-repo-archived item above — install, secret_fingerprint) in
  * manifest `agents[]` order, then the CA items
  * (registry, then one per agent repo in manifest order — a MACF fleet
- * always needs a CA, so these are UNCONDITIONAL as of macf#839 review nit 5,
- * not gated on `trust:` being declared), then the routing item (only when
+ * always needs a CA, so these are UNCONDITIONAL as of macf#839 review nit 5;
+ * there is no `trust:` field to gate them on — it was removed, having never
+ * been consulted, groundnuty/macf#1201), then the routing item (only when
  * `routing.runner` is declared), then the §D6 version-steering items (only
  * when `versions:` is declared — one `version` + one `actions_pin` item per
  * agent, in manifest order), then report-extra items for any observed agent

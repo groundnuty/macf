@@ -66,7 +66,6 @@ function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
         deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-experiment',
       },
     ],
-    trust: { ca: 'per-project', federated_cas: [] },
     ...overrides,
   };
 }

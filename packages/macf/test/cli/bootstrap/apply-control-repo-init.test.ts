@@ -47,7 +47,6 @@ function manifestWith(agents: readonly FleetAgent[]): FleetManifest {
     transport: { age_recipients: ['age1operator'] },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents,
-    trust: { ca: 'per-project', federated_cas: [] },
   };
 }
 

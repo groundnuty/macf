@@ -305,8 +305,7 @@ silently-dropped typo.
 | `routing.runner` | optional (whole `routing:` block) | **omitted → `MACF_TRUSTED_ACTORS` is never written, at all** | §7.1 — this is the trap. See §6.5 for the sub-fields. |
 | `collaborators[]` | optional | omitted → no cross-fleet federation | DR-036/DR-041 cross-fleet guest trust. **Parsed but not reconciled** by `apply` today (day-2, per DR-043's use-case catalog) |
 | `shared` | optional | omitted | `.strict()`, requires **both** `routing_app` and `ts_oauth` together. **Currently unconsumed** anywhere in the codebase — `transport.router_app_scope` is the field that actually carries the shared-vs-per-fleet choice (§6.5); this field predates that decision and is not wired to anything |
-| `trust.ca` | optional | `'per-project'` | v0 supports exactly one mode; the field is an enum literal, not a live choice |
-| `trust.federated_cas[]` | optional | `[]` | union-never-override reconcile (DR-041 Amendment B) |
+| `trust.ca` / `trust.federated_cas[]` | **removed** (groundnuty/macf#1201) | — | these two parsed but were never read by anything — the sharpest of the schema's inert fields, since their own doc comment described a CA-plan gating relationship that never existed. **A `fleet.yaml` that still declares a `trust:` section gets a targeted refusal at parse time**, naming the field and telling the operator to remove it — not a bare `.strict()` "unrecognized key." Fleet-level CA/federation trust is still an open design (`#810`); it is not re-added here ahead of that design's enforcement. A fleet gets its own CA unconditionally either way — nothing about CA provisioning depended on this section. |
 
 ### 6.2 `owner.registry` — the four forms
 

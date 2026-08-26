@@ -26,7 +26,6 @@ const ORG_MANIFEST: FleetManifest = {
     { role: 'code-agent', profile: 'code', repo: 'groundnuty/macf-experiment-code', deploy_path: '/x' },
     { role: 'science-agent', profile: 'research', repo: 'groundnuty/macf-experiment-science', deploy_path: '/y' },
   ],
-  trust: { ca: 'per-project', federated_cas: [] },
 };
 
 const USER_MANIFEST: FleetManifest = {
