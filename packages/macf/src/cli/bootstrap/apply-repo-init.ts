@@ -42,6 +42,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RegistryConfig, TokenSource } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetManifest } from './fleet-manifest.js';
+import { isSelfHostedCapableActionsVersion, MIN_SELF_HOSTED_CAPABLE_ACTIONS_VERSION } from './fleet-manifest.js';
 import type { LabelsOutcome, RepoInitOptions } from '../commands/repo-init.js';
 import { repoInit as realRepoInit } from '../commands/repo-init.js';
 import type { CreateRepoFn } from './repo-create.js';
@@ -281,16 +282,39 @@ export async function applyRepoInitForAgent(
       return { repo: agent.repo, role: agent.role, status: 'failed', reason: errMessage(err) };
     }
 
+    // groundnuty/macf#1072 — `opts.actionsVersion`/`opts.force` are the
+    // caller's already-computed `resolveActionsPinReconcile` decision;
+    // omitted (both undefined) preserves the exact pre-#1072 fallback
+    // (`manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION`, always
+    // `force: false`) for every caller that doesn't pass them.
+    const actionsVersion = opts?.actionsVersion ?? manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION;
+
+    // groundnuty/macf#1194 — this is the value that will ACTUALLY be
+    // written into the generated `agent-router.yml`'s `uses:@<pin>` line
+    // (the run-time counterpart to `fleet-manifest.ts`'s parse-time
+    // superRefine cross-check, which only sees the DECLARED string —
+    // `opts.actionsVersion` can carry an already-observed pin that never
+    // went through that check at all, per `resolveActionsPinReconcile`'s
+    // doc). Refuse BEFORE the clone/push — never generate a workflow file
+    // that declares self-hosted routing against a pin that can't honor it.
+    if (manifest.routing?.runner.runs_on === 'self-hosted' && !isSelfHostedCapableActionsVersion(actionsVersion)) {
+      return {
+        repo: agent.repo,
+        role: agent.role,
+        status: 'failed',
+        reason:
+          `routing.runner.runs_on is "self-hosted" but the macf-actions pin this repo would be generated with, ` +
+          `"${actionsVersion}", cannot read MACF_TRUSTED_ACTORS (needs at least ` +
+          `${MIN_SELF_HOSTED_CAPABLE_ACTIONS_VERSION}) — every job in that pin hardcodes a GitHub-hosted runner. ` +
+          'Refusing to generate a workflow that could never honor the declaration; nothing was cloned or pushed.',
+      };
+    }
+
     await deps.cloneRepo(cloneUrl(agent.repo), dir);
 
     const result = await runRepoInit(dir, {
       repo: agent.repo,
-      // groundnuty/macf#1072 — `opts.actionsVersion`/`opts.force` are the
-      // caller's already-computed `resolveActionsPinReconcile` decision;
-      // omitted (both undefined) preserves the exact pre-#1072 fallback
-      // (`manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION`, always
-      // `force: false`) for every caller that doesn't pass them.
-      actionsVersion: opts?.actionsVersion ?? manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION,
+      actionsVersion,
       // repo/role are unique-per-manifest (FleetManifestSchema's superRefine
       // rejects duplicate agents[].repo) — one agent per repo in v0, so the
       // routing config for THIS repo names exactly this agent's role.

@@ -155,6 +155,52 @@ describe('applyRepoInitForAgent', () => {
     expect(cloneRepo).not.toHaveBeenCalled();
   });
 
+  // --- groundnuty/macf#1194 — self-hosted declared against an actions pin that can't read MACF_TRUSTED_ACTORS ---
+
+  it('DECISIVE 1: self-hosted declared + an actionsVersion pin below the self-hosted-capable threshold -> failed, cloneRepo NEVER invoked', async () => {
+    const cloneRepo = vi.fn();
+    const selfHostedManifest: FleetManifest = { ...MANIFEST, routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+    const deps: RepoInitStepDeps = { cloneRepo, commitAndPush: vi.fn() };
+    const outcome = await applyRepoInitForAgent(AGENT, selfHostedManifest, deps, { actionsVersion: 'v3.3.0' });
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).toContain('v3.3.0');
+      expect(outcome.reason).toMatch(/self-hosted/);
+      expect(outcome.reason).toMatch(/cannot read MACF_TRUSTED_ACTORS/);
+      // citation guard — user-facing text carries no internal issue numbers or DR names.
+      expect(outcome.reason).not.toMatch(/#\d+/);
+      expect(outcome.reason).not.toMatch(/DR-\d+/);
+      expect(outcome.reason).not.toMatch(/Amendment/i);
+    }
+    expect(cloneRepo).not.toHaveBeenCalled();
+  });
+
+  it('DECISIVE 2: the SAME incapable actionsVersion pin, but routing.runner is NOT declared self-hosted -> proceeds, cloneRepo IS invoked', async () => {
+    const cloneRepo = fakeCloneRepo();
+    const deps: RepoInitStepDeps = { cloneRepo, commitAndPush: async () => 'nothing-to-commit' };
+    // MANIFEST has no `routing` section at all.
+    const outcome = await applyRepoInitForAgent(AGENT, MANIFEST, deps, { actionsVersion: 'v3.3.0' });
+    expect(outcome.status).not.toBe('failed');
+    expect(createdDirs).toHaveLength(1);
+  });
+
+  it('self-hosted declared + a CAPABLE actionsVersion pin -> proceeds unaffected', async () => {
+    const cloneRepo = fakeCloneRepo();
+    const selfHostedManifest: FleetManifest = { ...MANIFEST, routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+    const deps: RepoInitStepDeps = { cloneRepo, commitAndPush: async () => 'nothing-to-commit' };
+    const outcome = await applyRepoInitForAgent(AGENT, selfHostedManifest, deps, { actionsVersion: 'v3.4.1' });
+    expect(outcome.status).not.toBe('failed');
+    expect(createdDirs).toHaveLength(1);
+  });
+
+  it('self-hosted declared + actionsVersion falls back to MANIFEST.versions.actions (already v3.4.1, capable) when opts.actionsVersion is omitted', async () => {
+    const cloneRepo = fakeCloneRepo();
+    const selfHostedManifest: FleetManifest = { ...MANIFEST, routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+    const deps: RepoInitStepDeps = { cloneRepo, commitAndPush: async () => 'nothing-to-commit' };
+    const outcome = await applyRepoInitForAgent(AGENT, selfHostedManifest, deps);
+    expect(outcome.status).not.toBe('failed');
+  });
+
   it('clone failure (repo does not exist yet — out of scope for this increment, see module doc) -> status failed, loud reason', async () => {
     const deps: RepoInitStepDeps = {
       cloneRepo: async () => {
