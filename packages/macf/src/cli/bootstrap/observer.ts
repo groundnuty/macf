@@ -768,8 +768,16 @@ export const REAL_RUNNER_USABILITY_DEPS: RunnerUsabilityDeps = {
   listOrgRunners: realListOrgRunners,
 };
 
-/** Splits `"owner/repo"` into its two parts; `undefined` on any unexpected shape — defensive (schema only enforces `min(1)`, no `owner/repo` regex), and this function must NEVER throw. */
-function splitOwnerRepo(repo: string): { readonly owner: string; readonly name: string } | undefined {
+/**
+ * Splits `"owner/repo"` into its two parts; `undefined` on any unexpected
+ * shape — defensive (schema only enforces `min(1)`, no `owner/repo` regex),
+ * and this function must NEVER throw. Exported (groundnuty/macf#1220) so
+ * `install-scope-coverage.ts`'s per-repo JWT probe reuses this SAME split
+ * rather than a second hand-rolled copy — same "no second copy" discipline
+ * `writeScratchPem`/`cleanupScratchPem` already established for the
+ * scratch-PEM primitive.
+ */
+export function splitOwnerRepo(repo: string): { readonly owner: string; readonly name: string } | undefined {
   const idx = repo.indexOf('/');
   if (idx <= 0 || idx === repo.length - 1) return undefined;
   return { owner: repo.slice(0, idx), name: repo.slice(idx + 1) };
