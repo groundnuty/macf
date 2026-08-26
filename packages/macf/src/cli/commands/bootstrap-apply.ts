@@ -1375,6 +1375,98 @@ export function resolveApplyDeployDeps(): ApplyDeployPhaseDeps {
   };
 }
 
+/**
+ * The roles THIS "macf bootstrap apply" run minted a fresh GitHub App
+ * identity for (groundnuty/macf#1183) — `AgentApplyOutcome.status ===
+ * 'created'`, read straight off `applyFleet`'s own result, never
+ * re-derived. Threaded into `fleet-deploy.ts::FleetDeployDeps
+ * .rolesProvisionedThisApplyRun` so a role whose credential this run just
+ * composed, but whose deploy attempt still can't find it, gets the
+ * provisioned-this-run refusal message instead of being told to "confirm
+ * this agent was actually provisioned" when it demonstrably was — see
+ * `fleet-deploy.ts::extractAgentVaultCredentials`'s own doc for the
+ * honest-unknown floor this depends on. Pure — reads `result.agents` only.
+ */
+export function provisionedThisRunRoles(result: FleetApplyResult): ReadonlySet<string> {
+  return new Set(result.agents.filter((rec) => rec.identity.status === 'created').map((rec) => rec.role));
+}
+
+/**
+ * Which vault the deploy phase should actually READ from THIS run
+ * (groundnuty/macf#1183 — the better fix, not merely a rephrased failure).
+ *
+ * **The problem this closes.** Pre-#1183, the deploy phase unconditionally
+ * re-decrypted the OPERATOR'S `--vault` INPUT path — a snapshot taken
+ * before this run started. A role `applyFleet` creates DURING this same
+ * run is legitimately absent from that snapshot; deploying it one command
+ * later told the operator to "confirm this agent was actually provisioned"
+ * when it demonstrably had been, seconds earlier, in the SAME process.
+ *
+ * **Why a fresh read is available at all.** `applyFleet`'s own `settleVault`
+ * step (DR-043 Amendment D) composes EVERY role's credential — prior AND
+ * new — into ONE whole-payload write, landing at `result.vault.path` when
+ * `result.vault.status === 'written'`. That path lives inside the per-run
+ * control-repo scratch checkout (`control-repo.ts::provisionControlRepo`'s
+ * `localDir`), which nothing in this codebase proactively deletes mid-run —
+ * it is still on disk, unchanged, by the time this function runs immediately
+ * after `applyFleet` returns. `syncControlRepo` has ALSO already pushed that
+ * same content to the control repo on GitHub by then (it runs INSIDE
+ * `applyFleet`, before `applyFleet` returns) — reading `result.vault.path`
+ * here is not a race against durability, only a read of what is already
+ * durable, from the exact file that write produced.
+ *
+ * **Why this function ACTUALLY DECRYPTS before committing to the fresh
+ * path, rather than trusting `status === 'written'` alone.** `settleVault`'s
+ * compose step re-encrypts the WHOLE payload to `manifest.transport
+ * .age_recipients` AS DECLARED THIS RUN — not necessarily the same actual
+ * recipient set the vault the operator can already open was encrypted to.
+ * `apply-fleet.ts::reconcileVaultRecipients`'s own doc flags the gap
+ * directly: an unchanged recipient COUNT is "not a claim the sets are
+ * cryptographically confirmed identical" — an operator who rotates their
+ * OWN age identity (removed from `age_recipients`, a new one added, same
+ * total count) in the SAME run that also creates an agent would have a
+ * freshly-written vault their OLD `--identity-key` can no longer open, even
+ * though it could open the PRE-run vault seconds earlier. A path-only
+ * decision (`status === 'written' ? result.vault.path : operatorVaultPath`)
+ * would silently convert a working deploy into a failing one for exactly
+ * that operator. Attempting the real decrypt and falling back on failure
+ * means this function can never make things WORSE than the pre-#1183
+ * default — only better, when the fresh vault is actually usable.
+ *
+ * **Never silent either way** — logs which vault deploy is about to read,
+ * every branch, so an operator staring at the exact `apply` output #1183
+ * quoted can tell whether this fix engaged (`assert-the-wrong-path.md`'s
+ * "put the limit in the tool's own output, not only the spec").
+ *
+ * `doReadVault` is a seam (production: `readVault` from `vault-read.ts`,
+ * already imported above) so tests never touch a real `age` binary.
+ */
+export async function resolveDeployVaultPath(
+  result: FleetApplyResult,
+  operatorVaultPath: string,
+  identityKeyPath: string,
+  doReadVault: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>,
+  log: (line: string) => void,
+): Promise<string> {
+  if (result.vault.status !== 'written') {
+    const why = result.vault.status === 'failed' ? 'this run\'s own vault write FAILED — see "Vault: FAILED" above' : "this run's vault write made no change";
+    log(`Deploy phase: reading the --vault path you supplied (${operatorVaultPath}) — ${why}, so it is the most current vault available.`);
+    return operatorVaultPath;
+  }
+  try {
+    await doReadVault({ vaultPath: result.vault.path, identityPath: identityKeyPath });
+    log(`Deploy phase: reading the vault this run just wrote (${result.vault.path}) — includes every role provisioned this run.`);
+    return result.vault.path;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    log(
+      `Deploy phase: could not decrypt the vault this run just wrote (${reason}) — falling back to the --vault ` +
+        `path you supplied (${operatorVaultPath}), which may predate this run's changes.`,
+    );
+    return operatorVaultPath;
+  }
+}
+
 // --- Version-reconcile phase (DR-043 Amendment L, macf#1045) — production deps ---
 
 /**
@@ -1566,6 +1658,20 @@ function launchNextStepLines(deployPhase: DeployPhaseRenderInput): string[] {
  * function's own output. Same #1203 rule `status.ts::BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION`'s
  * sibling comment states in full: a brand-new name, no existing field's
  * meaning changes, no aggregate here for a new condition to silently feed.
+ *
+ * **groundnuty/macf#1183 deliberately did NOT bump this again.** That fix
+ * changes the free-text `deploy_phase.results[].reason` STRING a `--json`
+ * consumer would see for one specific failure shape (a role provisioned
+ * this same run, still missing from whatever vault deploy read) — but
+ * `reason`'s TYPE stays `string`, no field is added or removed, and no
+ * enum gains or narrows a value the way `routing[repo].status` did above.
+ * Every precedent bump on this constant (and `routing-doctor.ts`'s #1192/
+ * #1199) was a SHAPE change a consumer's switch/enum-check would need to
+ * account for; a `reason` string's wording is documentation, not a shape a
+ * conformant consumer parses structurally. (The old text remains, verbatim
+ * and unbumped, for the genuinely-unprovisioned case — only the NEW,
+ * additional case's wording differs from what a pre-#1183 consumer had
+ * never seen at all.)
  */
 export const FLEET_APPLY_JSON_SCHEMA_VERSION = 2;
 
@@ -2993,10 +3099,32 @@ export async function runBootstrapApply(
             '--vault + --identity-key (this apply run was invoked without them). Supply both to deploy ' +
             'automatically next run, or run the per-agent `macf fleet deploy` command(s) named below.';
         } else {
-          const deployDeps: ApplyDeployPhaseDeps = resolved.deployDeps ?? { ...resolveApplyDeployDeps(), log: stderrLog };
+          // groundnuty/macf#1183 — `rolesProvisionedThisApplyRun` (so a
+          // same-run credential gap gets the right refusal wording) is
+          // wired ONLY on the production default, matching this call
+          // site's pre-existing "test override is a TOTAL override, never
+          // merged" contract for every other field here.
+          const deployDeps: ApplyDeployPhaseDeps =
+            resolved.deployDeps ?? { ...resolveApplyDeployDeps(), log: stderrLog, rolesProvisionedThisApplyRun: provisionedThisRunRoles(result) };
+          // groundnuty/macf#1183 — read the vault THIS run actually wrote
+          // when it wrote one, instead of unconditionally re-decrypting the
+          // operator's pre-run `--vault` snapshot; see
+          // `resolveDeployVaultPath`'s own doc for the full reasoning
+          // (including why it verifies decryptability before committing).
+          // Reuses `deployDeps.readVault` — whichever function the deploy
+          // phase itself is about to read with, test override or real —
+          // so the staleness check and the real read never disagree about
+          // which `readVault` is in effect.
+          const vaultPathForDeploy = await resolveDeployVaultPath(
+            result,
+            resolvePath(opts.vaultPath),
+            resolvePath(opts.identityKeyPath),
+            deployDeps.readVault,
+            stderrLog,
+          );
           deployResults = await runApplyDeployPhase(
             manifest,
-            { vaultPath: resolvePath(opts.vaultPath), identityPath: resolvePath(opts.identityKeyPath) },
+            { vaultPath: vaultPathForDeploy, identityPath: resolvePath(opts.identityKeyPath) },
             deployDeps,
           );
         }

@@ -111,6 +111,53 @@ export interface AgentVaultCredentials {
 }
 
 /**
+ * The refusal message for a role that was PROVISIONED BY THIS SAME "macf
+ * bootstrap apply" run but whose credential is still absent from whatever
+ * vault THIS deploy attempt is reading (groundnuty/macf#1183). Deliberately
+ * does NOT assert which of the two live causes applies — "the fresh write
+ * hasn't reached the vault you pointed `--vault` at" (a pre-run snapshot;
+ * see `commands/bootstrap-apply.ts::resolveDeployVaultPath`, the fix that
+ * makes THIS message unreachable on apply's own happy path) or "the write
+ * itself failed this run" (still genuinely missing everywhere) — because
+ * BOTH remain reachable and naming the wrong one would be its own
+ * silent-fallback-shaped lie. Keeps the ORIGINAL refusal clause verbatim
+ * ("refusing to deploy a partially-materialized workspace") per #1183's own
+ * "do not weaken the refusal" requirement — only the diagnosed CAUSE
+ * differs from {@link vaultEntryMissingMessage}'s genuinely-unprovisioned
+ * case, never the refusal itself. Exported so tests can assert its exact
+ * shape without duplicating the prose inline, mirroring this file's own
+ * `keyFingerprintMismatchMessage`/`caFingerprintMismatchMessage` convention.
+ */
+export function vaultEntryMissingProvisionedThisRunMessage(missing: readonly string[], role: string, fleetName: string): string {
+  return (
+    `vault has no ${missing.join('/')} for role "${role}" (fleet "${fleetName}") — refusing to deploy a ` +
+    'partially-materialized workspace (that refusal stands; only the cause is different here). ' +
+    `Role "${role}" WAS provisioned by this same "macf bootstrap apply" run — its GitHub identity was created ` +
+    "and its credential was composed into a vault this run wrote — but the vault THIS deploy attempt is " +
+    'reading still does not have it: either that write has not reached the vault you pointed --vault at, or ' +
+    'the write itself failed (check the "Vault:" line earlier in this run\'s own output). Re-run ' +
+    '`macf bootstrap apply` — its own deploy phase reads the vault it just composed — or run ' +
+    `\`macf fleet deploy --agent ${role} ...\` once you have a local, decryptable copy of that vault.`
+  );
+}
+
+/**
+ * The refusal message for a role that has NO vault entry at all — the
+ * genuine "never provisioned, or the vault the operator pointed at simply
+ * doesn't hold it" case, unchanged since before #1183. Extracted (not
+ * inlined) so {@link extractAgentVaultCredentials} chooses between this and
+ * {@link vaultEntryMissingProvisionedThisRunMessage} without duplicating
+ * either string.
+ */
+export function vaultEntryMissingMessage(missing: readonly string[], role: string, fleetName: string): string {
+  return (
+    `vault has no ${missing.join('/')} for role "${role}" (fleet "${fleetName}") — refusing to deploy a ` +
+    'partially-materialized workspace. Confirm this agent was actually provisioned by `macf bootstrap apply` ' +
+    'and its identity landed in this vault.'
+  );
+}
+
+/**
  * Extract ONE agent's app_id/install_id/private-key PEM from an
  * already-decrypted vault raw map (`vault-read.ts::readVault`'s return
  * value). Reuses {@link queryVaultAgentPresence} for the missing-field
@@ -120,11 +167,21 @@ export interface AgentVaultCredentials {
  * ANY of the three required fields is absent; the message names WHICH
  * field(s) are missing, never a value (vault KEY names are never secret,
  * per `vault-read.ts`'s own posture — only the corresponding VALUE is).
+ *
+ * `provisionedThisRun` (groundnuty/macf#1183) is the ONLY discriminator
+ * between {@link vaultEntryMissingProvisionedThisRunMessage} and
+ * {@link vaultEntryMissingMessage} — defaults to `false`, the honest-unknown
+ * floor: a caller with no "was this created THIS run" signal (the standalone
+ * `macf fleet deploy` command; any pre-#1183 call site) gets the ORIGINAL,
+ * unchanged wording, never a guess. Only `apply`'s own embedded deploy phase
+ * (`commands/bootstrap-apply.ts`, which tracks `AgentApplyOutcome.status ===
+ * 'created'` per role from THIS run's `applyFleet` result) ever passes `true`.
  */
 export function extractAgentVaultCredentials(
   raw: Readonly<Record<string, string>>,
   fleetName: string,
   role: string,
+  provisionedThisRun = false,
 ): AgentVaultCredentials {
   const presence = queryVaultAgentPresence(raw, fleetName, role);
   const missing: string[] = [];
@@ -134,9 +191,9 @@ export function extractAgentVaultCredentials(
   if (missing.length > 0) {
     throw new FleetDeployError(
       'vault_entry_missing_for_role',
-      `vault has no ${missing.join('/')} for role "${role}" (fleet "${fleetName}") — refusing to deploy a ` +
-        'partially-materialized workspace. Confirm this agent was actually provisioned by `macf bootstrap apply` ' +
-        'and its identity landed in this vault.',
+      provisionedThisRun
+        ? vaultEntryMissingProvisionedThisRunMessage(missing, role, fleetName)
+        : vaultEntryMissingMessage(missing, role, fleetName),
     );
   }
 
@@ -790,6 +847,19 @@ export interface FleetDeployDeps {
    * through to {@link materializeProjectCa}'s `forceCa` parameter.
    */
   readonly forceCa?: boolean;
+  /**
+   * Roles this SAME "macf bootstrap apply" run minted a fresh GitHub App
+   * identity for (groundnuty/macf#1183) — `AgentApplyOutcome.status ===
+   * 'created'` per role, per `applyFleet`'s own result. `undefined` for
+   * every caller with no "this run" concept at all (the standalone
+   * `macf fleet deploy` CLI command — `commands/fleet-deploy.ts::resolveDeps`
+   * never sets this field), which is exactly the honest-unknown floor
+   * {@link extractAgentVaultCredentials}'s `provisionedThisRun` default
+   * relies on: no signal in, no guess out, original wording. Only
+   * `commands/bootstrap-apply.ts`'s embedded deploy phase ever populates
+   * this, via `provisionedThisRunRoles(result)`.
+   */
+  readonly rolesProvisionedThisApplyRun?: ReadonlySet<string>;
 }
 
 export type FleetDeployOutcome =
@@ -1139,7 +1209,13 @@ export async function deployAgent(
 
   try {
     const raw = await deps.readVault(vaultOpts);
-    const creds = extractAgentVaultCredentials(raw, manifest.metadata.name, role);
+    // groundnuty/macf#1183 — `false` (never `undefined`) for every caller
+    // that never set `deps.rolesProvisionedThisApplyRun` at all: `?.has`
+    // short-circuits to `undefined` on a missing Set, and `?? false`
+    // normalizes that to the same honest-unknown default
+    // `extractAgentVaultCredentials`'s own 4th parameter already assumes.
+    const provisionedThisRun = deps.rolesProvisionedThisApplyRun?.has(role) ?? false;
+    const creds = extractAgentVaultCredentials(raw, manifest.metadata.name, role, provisionedThisRun);
 
     const registryOpts = initRegistryOptionsFor(manifest.owner.registry);
 
