@@ -2991,7 +2991,12 @@ agents:
           const manifestPath = manifestPathIn();
           const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
           const logs: string[] = [];
-          let capturedUrl: string | undefined;
+          // groundnuty/macf#1212 — a successful POST now triggers an
+          // unconditional wait that ALSO calls through `runnerPlatformFetch`
+          // (checkRunnerPlatformStatus's GET) — capture every call rather
+          // than a single mutable `capturedUrl`, so this test asserts on the
+          // PROVISIONING call specifically, not whichever call happened last.
+          const calls: { url: string; method: string | undefined }[] = [];
           const deps: FleetApplyDeps = {
             ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
             trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
@@ -2999,8 +3004,8 @@ agents:
             log: (l) => logs.push(l),
             // flag/env deliberately unset — this is the scope-only case.
             observedRunnerPlatformEndpointScope: 'http://scope-runner-platform:8088',
-            runnerPlatformFetch: (async (url: string | URL) => {
-              capturedUrl = String(url);
+            runnerPlatformFetch: (async (url: string | URL, init?: RequestInit) => {
+              calls.push({ url: String(url), method: init?.method });
               return new Response(JSON.stringify({ ok: true }), { status: 200 });
             }) as typeof fetch,
           };
@@ -3008,7 +3013,8 @@ agents:
 
           const result = await applyFleet(manifest, manifestPath, null, deps);
 
-          expect(capturedUrl).toBe('http://scope-runner-platform:8088/runners');
+          const provisionCall = calls.find((c) => c.method === 'POST');
+          expect(provisionCall?.url).toBe('http://scope-runner-platform:8088/runners');
           expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('ok');
           const provenanceLine = logs.find((l) => l.includes('Runner platform endpoint:'));
           expect(provenanceLine).toMatch(/scope/i);
@@ -3024,15 +3030,18 @@ agents:
             routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
           };
           const logs: string[] = [];
-          let capturedUrl: string | undefined;
+          // groundnuty/macf#1212 — see the scope-tier test's own comment
+          // immediately above for why every call is captured, not just the
+          // last one.
+          const calls: { url: string; method: string | undefined }[] = [];
           const deps: FleetApplyDeps = {
             ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
             trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
             runnerTokenPollOptions: { timeoutMs: 0 },
             log: (l) => logs.push(l),
             // flag/env/scope deliberately unset.
-            runnerPlatformFetch: (async (url: string | URL) => {
-              capturedUrl = String(url);
+            runnerPlatformFetch: (async (url: string | URL, init?: RequestInit) => {
+              calls.push({ url: String(url), method: init?.method });
               return new Response(JSON.stringify({ ok: true }), { status: 200 });
             }) as typeof fetch,
           };
@@ -3040,7 +3049,8 @@ agents:
 
           const result = await applyFleet(manifest, manifestPath, null, deps);
 
-          expect(capturedUrl).toBe('http://manifest-runner-platform:8088/runners');
+          const provisionCall = calls.find((c) => c.method === 'POST');
+          expect(provisionCall?.url).toBe('http://manifest-runner-platform:8088/runners');
           expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('ok');
           const provenanceLine = logs.find((l) => l.includes('Runner platform endpoint:'));
           expect(provenanceLine).toContain('transport.runner_platform_endpoint');
@@ -3054,22 +3064,25 @@ agents:
             transport: { ...base.transport, runner_platform_endpoint: 'http://manifest-runner-platform:8088' },
             routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
           };
-          let capturedUrl: string | undefined;
+          // groundnuty/macf#1212 — see the scope-tier test's own comment
+          // above for why every call is captured, not just the last one.
+          const calls: { url: string; method: string | undefined }[] = [];
           const deps: FleetApplyDeps = {
             ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
             trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
             runnerTokenPollOptions: { timeoutMs: 0 },
             runnerPlatformEndpoint: 'http://flag-runner-platform:8088',
             observedRunnerPlatformEndpointScope: 'http://scope-runner-platform:8088',
-            runnerPlatformFetch: (async (url: string | URL) => {
-              capturedUrl = String(url);
+            runnerPlatformFetch: (async (url: string | URL, init?: RequestInit) => {
+              calls.push({ url: String(url), method: init?.method });
               return new Response(JSON.stringify({ ok: true }), { status: 200 });
             }) as typeof fetch,
           };
 
           await applyFleet(manifest, manifestPath, null, deps);
 
-          expect(capturedUrl).toBe('http://flag-runner-platform:8088/runners');
+          const provisionCall = calls.find((c) => c.method === 'POST');
+          expect(provisionCall?.url).toBe('http://flag-runner-platform:8088/runners');
         });
 
         it("the resolved endpoint is never masked in apply's own log line — it is a variable, not a secret", async () => {
