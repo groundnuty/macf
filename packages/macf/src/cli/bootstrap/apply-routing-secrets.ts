@@ -480,15 +480,33 @@ function stripRepoLegLabel(name: string, repo: string, reason: string): string {
 
 /**
  * Reduce a {@link RoutingSecretsPublishResult} to ONE outcome per repo —
- * `failed: true` iff ANY of the six legs failed for that repo, carrying
- * EVERY distinct (label-stripped, see {@link stripRepoLegLabel}) failure
- * reason observed for it (deduped, joined) so {@link determineFleetLevelFact}'s
- * own same-cause-across-repos check operates on the true per-repo cause
- * set, not one arbitrarily-chosen leg and not a label artifact.
- * `'skipped'`/`'already-present'`/`'created'` legs are NOT failures — a
- * repo whose Tailscale pair is `'not-required'` (undeclared) is not, on
- * its own, evidence this fleet cannot route; only a genuine `'failed'`
- * leg is.
+ * `failed: true` iff ANY of the six legs is `'failed'` OR `'skipped'` for
+ * that repo, carrying EVERY distinct (label-stripped, see
+ * {@link stripRepoLegLabel}) reason observed for it (deduped, joined) so
+ * {@link determineFleetLevelFact}'s own same-cause-across-repos check
+ * operates on the true per-repo cause set, not one arbitrarily-chosen leg
+ * and not a label artifact. `'already-present'`/`'created'` legs are NOT
+ * failures — the repo genuinely HAS that secret.
+ *
+ * **groundnuty/macf#1184 — `'skipped'` now counts too, reversing this
+ * function's original #1162 stance.** The prior doc read: "a repo whose
+ * Tailscale pair is `'not-required'` (undeclared) is not, on its own,
+ * evidence this fleet cannot route." That was wrong in the way that
+ * matters operationally: `'skipped'` means the repo secret is GENUINELY
+ * ABSENT this run (`publishRoutingSecrets`'s `'not-required'` branch only
+ * emits `'skipped'` when `checkRepoSecretPresence` confirms `'absent'` —
+ * an already-present repo reports `'already-present'` regardless of
+ * requirement status), so a `'skipped'` `TS_OAUTH_*` leg leaves the repo
+ * exactly as unable to route as a `'failed'` `MACF_ROUTING_APP_ID` leg
+ * does — `agent-router.yml` requires both unconditionally. Verified live
+ * on `macf-trial` (#1184's reporter): the whole-bag ordering-safety skip
+ * (`skippedRoutingSecretsPublish`, used when a router App/routing-client
+ * cert was freshly minted THIS run but the vault write hasn't landed yet)
+ * marks EVERY one of the six legs `'skipped'` with a SHARED reason — the
+ * exact "0 created, 0 already-present of 3 confirmed repo(s)" signature
+ * the operator read as silence. Without this widening, that whole-fleet
+ * skip NEVER reaches `determineFleetLevelFact`'s `'all-failed'` branch,
+ * because zero legs are literally `'failed'`.
  */
 export function perRepoRoutingOutcome(
   result: RoutingSecretsPublishResult,
@@ -498,7 +516,7 @@ export function perRepoRoutingOutcome(
     const reasons = new Set<string>();
     for (const name of ALL_ROUTING_SECRET_NAMES) {
       const leg = result[name][repo];
-      if (leg?.status === 'failed') reasons.add(stripRepoLegLabel(name, repo, leg.reason));
+      if (leg?.status === 'failed' || leg?.status === 'skipped') reasons.add(stripRepoLegLabel(name, repo, leg.reason));
     }
     return reasons.size === 0 ? { repo, failed: false } : { repo, failed: true, reason: [...reasons].sort().join(' | ') };
   });
