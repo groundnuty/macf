@@ -69,8 +69,14 @@ import { realCreateRegistryVariable, realCreateRepoVariable, realMintCa } from '
 import type { EnsureVariableOutcome } from '../bootstrap/ensure-variable.js';
 import type { RoutingClientApplyDeps } from '../bootstrap/apply-routing-client.js';
 import { realMintRoutingClient, realSetRepoSecret } from '../bootstrap/apply-routing-client.js';
-import type { RoutingSecretsPublishDeps } from '../bootstrap/apply-routing-secrets.js';
-import { checkTailscaleOauthPreflight } from '../bootstrap/apply-routing-secrets.js';
+import type { ResolvedTsOauth, RoutingSecretsPublishDeps } from '../bootstrap/apply-routing-secrets.js';
+import {
+  checkTailscaleOauthPreflight,
+  checkTsOauthFlagsComplete,
+  resolvedTsOauthPair,
+  TS_OAUTH_CLIENT_ID_ENV_VAR,
+  TS_OAUTH_SECRET_ENV_VAR,
+} from '../bootstrap/apply-routing-secrets.js';
 import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
 import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
 import {
@@ -154,6 +160,20 @@ export interface RunBootstrapApplyOptions {
    * own doc).
    */
   readonly runnerToken?: string;
+  /**
+   * `--ts-oauth-client-id` (groundnuty/macf#1186) — the CLI-flag form of a
+   * SECOND operator-supplied source for `TS_OAUTH_CLIENT_ID`, alongside the
+   * vault (`#1109`). `undefined` here does NOT necessarily mean "not
+   * supplied": `runBootstrapApply` falls back to {@link TS_OAUTH_CLIENT_ID_ENV_VAR}
+   * when this is unset (CLI flag wins on conflict) — same resolution shape
+   * `runnerToken`'s own doc establishes. Must be given TOGETHER with
+   * `tsOauthSecret` (or neither) — see `checkTsOauthFlagsComplete`. NEVER
+   * logged, NEVER written to `fleet.yaml` or `vault.age`, NEVER copied onto
+   * any rendered result.
+   */
+  readonly tsOauthClientId?: string;
+  /** The pair to {@link tsOauthClientId} — same resolution/XOR/never-logged contract. Falls back to {@link TS_OAUTH_SECRET_ENV_VAR}. */
+  readonly tsOauthSecret?: string;
   /**
    * `--no-deploy` (macf#1013) — commander's `--no-<flag>` convention: the
    * CLI registration carries NO explicit 3rd-arg default (macf#347 — a
@@ -1010,6 +1030,14 @@ export function resolveMutateDeps(
   // (interactive) below — matching `RunBootstrapApplyOptions.yes?: boolean`'s
   // own "undefined means the interactive default" contract one layer up.
   assumeYes?: boolean,
+  // groundnuty/macf#1186 — `resolvedTsOauth` (the flag-then-env-resolved
+  // `--ts-oauth-client-id`/`--ts-oauth-secret` pair), appended as the LAST
+  // parameter for the SAME reason `vaultPath`/`assumeYes` were (macf#978's
+  // comment above): every pre-existing positional call site keeps compiling
+  // and behaving byte-identically. Threaded verbatim onto
+  // `FleetApplyDeps.resolvedTsOauth`, never read anywhere else in this
+  // function.
+  resolvedTsOauth?: ResolvedTsOauth,
 ): MutateApplyDeps {
   const repoInitDeps: RepoInitStepDeps = { cloneRepo: realCloneRepo, commitAndPush: realCommitAndPush };
 
@@ -1230,6 +1258,8 @@ export function resolveMutateDeps(
     // doc); `runnerTokenPollOptions` is deliberately left unset here, taking
     // that function's real 10min/3s deploy-window defaults.
     runnerToken,
+    // groundnuty/macf#1186 — see `FleetApplyDeps.resolvedTsOauth`'s doc.
+    resolvedTsOauth,
     // macf#957 — `vaultRecipientDeps` deliberately left unset here, taking
     // `apply-fleet.ts::reconcileVaultRecipients`'s real `vault-read.ts`
     // defaults (`readVaultRecipientCount`/`reencryptVault`).
@@ -2293,6 +2323,21 @@ export function recoveryResumableRoles(
   return creations.filter((c) => available.has(c.role)).map((c) => c.role);
 }
 
+/**
+ * groundnuty/macf#1186 — the `--ts-oauth-client-id`/`--ts-oauth-secret`
+ * flag-then-env precedence, pulled out as its OWN pure function (unlike
+ * `--runner-token`'s equivalent inline `opts.runnerToken ?? process.env[...]`
+ * expression) specifically so "the CLI flag wins over the env var" is
+ * directly, non-circularly testable. `runBootstrapApply`'s CLI-integration
+ * surface has no way to discriminate WHICH source produced a resolved
+ * value once it clears the pre-flight (both a flag-sourced and an
+ * env-sourced value satisfy the SAME presence check identically); this
+ * function is what let the precedence rule itself be unit-tested.
+ */
+export function resolveTsOauthFlagOrEnv(flagValue: string | undefined, envValue: string | undefined): string | undefined {
+  return flagValue ?? envValue;
+}
+
 // --- Entry point ---
 
 /**
@@ -2315,6 +2360,21 @@ export async function runBootstrapApply(
   if (vaultFlagsFailure !== undefined) {
     return renderFailure(vaultFlagsFailure, opts);
   }
+
+  // groundnuty/macf#1186 — CLI flag wins on conflict; the MACF_BOOTSTRAP_TS_OAUTH_*
+  // env vars are the fallback (same "flag, then env" precedence
+  // `resolvedRunnerToken` below already establishes). Resolved here,
+  // unconditionally and before the manifest is even parsed — same placement
+  // + rationale as `vaultFlagsFailure` immediately above: a half-given pair
+  // is an argument-boundary mistake, not a manifest error, and should never
+  // depend on what this fleet's manifest happens to declare.
+  const resolvedTsOauthClientId = resolveTsOauthFlagOrEnv(opts.tsOauthClientId, process.env[TS_OAUTH_CLIENT_ID_ENV_VAR]);
+  const resolvedTsOauthSecretRaw = resolveTsOauthFlagOrEnv(opts.tsOauthSecret, process.env[TS_OAUTH_SECRET_ENV_VAR]);
+  const tsOauthFlagsFailure = checkTsOauthFlagsComplete(resolvedTsOauthClientId, resolvedTsOauthSecretRaw);
+  if (tsOauthFlagsFailure !== undefined) {
+    return renderFailure(tsOauthFlagsFailure, opts);
+  }
+  const resolvedTsOauth = resolvedTsOauthPair(resolvedTsOauthClientId, resolvedTsOauthSecretRaw);
 
   const manifestPath = resolvePath(opts.file);
   if (!existsSync(manifestPath)) {
@@ -2400,7 +2460,7 @@ export async function runBootstrapApply(
     // refusal to be correct). Needs a vault read (unlike the pure
     // `checkAppNameLengths`/`checkRegistryScopePreflight` checks above), so
     // it is the ONE async pre-flight in this block.
-    const tailscaleFailure = await checkTailscaleOauthPreflight(manifest.transport.tailscale_oauth_required, opts.vaultPath, opts.identityKeyPath, {
+    const tailscaleFailure = await checkTailscaleOauthPreflight(manifest.transport.tailscale_oauth_required, opts.vaultPath, opts.identityKeyPath, resolvedTsOauth, {
       readVault: deps?.readVault ?? readVault,
     });
     if (tailscaleFailure !== undefined) {
@@ -2545,7 +2605,7 @@ export async function runBootstrapApply(
     // untouched, same "tests MUST override or it safely no-ops" posture
     // `deployDeps`/`versionDeps` already establish elsewhere in this file.
     const mutate: MutateApplyDeps = {
-      ...(mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath, opts.vaultPath, opts.yes)),
+      ...(mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath, opts.vaultPath, opts.yes, resolvedTsOauth)),
       observedActionsPins: mutateDeps?.observedActionsPins ?? actionsPinsFromObserved(manifest, observed),
     };
     try {

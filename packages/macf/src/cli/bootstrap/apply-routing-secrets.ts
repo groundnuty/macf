@@ -513,6 +513,85 @@ export function determineFleetRoutingFact(result: RoutingSecretsPublishResult, r
   return determineFleetLevelFact(perRepoRoutingOutcome(result, repos));
 }
 
+// --- `--ts-oauth-client-id`/`--ts-oauth-secret` (groundnuty/macf#1186) ---
+
+/**
+ * A fresh org has no vault to read `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`
+ * FROM (groundnuty/macf#1186) — the vault-restore path above
+ * ({@link TailscaleOauthPreflightDeps.readVault}) requires a PRE-EXISTING
+ * `vault.age`, and nothing in this codebase ever WRITES this pair into one
+ * (`vault-write.ts`'s `payload.routing` branch is dead code — see that
+ * file's module doc). Every warm-org e2e run to date silently inherited the
+ * pair from repo-level secrets set by an earlier, undocumented flow; a
+ * fleet provisioned into an empty organisation had NO supported way to
+ * supply it at all.
+ *
+ * These two flags mirror `apply-routing.ts`'s `--runner-token`/
+ * `MACF_BOOTSTRAP_RUNNER_TOKEN` shape EXACTLY: one flag + one env fallback
+ * per value, resolved ONCE in `commands/bootstrap-apply.ts::runBootstrapApply`
+ * (CLI flag wins over env — same precedence rule `--runner-token` already
+ * establishes), never written to `fleet.yaml` (Amendment F: committed
+ * manifest content is sealed-or-public ONLY — a secret-bearing manifest
+ * field would be a new credential-leak path) and never written to
+ * `vault.age` either (this module's publish step reads the resolved pair
+ * and hands it straight to {@link publishRoutingSecrets} as a per-run input,
+ * the same "transient POLICY input, never persisted" contract
+ * `--runner-token` itself has — see that flag's own doc for why a token is
+ * never stored anywhere). A vault that DOES carry the pair (from some other
+ * flow) is still honored exactly as `#1109` left it; this is an ADDITIONAL
+ * source, not a replacement.
+ */
+export const TS_OAUTH_CLIENT_ID_FLAG = '--ts-oauth-client-id';
+/** Env-var form, matching this CLI's `MACF_BOOTSTRAP_<THING>` convention (`RUNNER_TOKEN_ENV_VAR`'s own precedent). */
+export const TS_OAUTH_CLIENT_ID_ENV_VAR = 'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID';
+export const TS_OAUTH_SECRET_FLAG = '--ts-oauth-secret';
+export const TS_OAUTH_SECRET_ENV_VAR = 'MACF_BOOTSTRAP_TS_OAUTH_SECRET';
+
+/** The resolved, ready-to-use pair — same shape `readVaultTsOauth`'s vault-restore closure already returns, so a caller downstream of resolution (`apply-fleet.ts`) treats "resolved via flag/env" and "restored from vault" identically. */
+export interface ResolvedTsOauth {
+  readonly clientId: string;
+  readonly secret: string;
+}
+
+export const TS_OAUTH_FLAGS_INCOMPLETE_CODE = 'ts_oauth_flags_incomplete';
+
+/**
+ * The `--ts-oauth-client-id`/`--ts-oauth-secret` XOR precondition — same
+ * shape + placement contract as `plan.ts::checkVaultFlagsComplete`'s
+ * `--vault`/`--identity-key` pair: `undefined` (no refusal) when BOTH or
+ * NEITHER resolved to a non-empty value, a refusal when exactly one did.
+ * Takes the ALREADY-flag-then-env-resolved values (mirrors
+ * `checkRunnerTokenPreflight`'s own "takes the resolved value, never reads
+ * `process.env` itself" contract) — an empty string is treated as "not
+ * given" (same `.length > 0` gate `checkRunnerTokenPreflight` applies to
+ * its own single token value), so `--ts-oauth-client-id ''` does not count
+ * as half a pair.
+ */
+export function checkTsOauthFlagsComplete(clientId: string | undefined, secret: string | undefined): TailscaleOauthPreflightFailure | undefined {
+  const hasClientId = clientId !== undefined && clientId.length > 0;
+  const hasSecret = secret !== undefined && secret.length > 0;
+  if (hasClientId === hasSecret) return undefined;
+  return {
+    code: TS_OAUTH_FLAGS_INCOMPLETE_CODE,
+    message:
+      `${TS_OAUTH_CLIENT_ID_FLAG} and ${TS_OAUTH_SECRET_FLAG} (or their ${TS_OAUTH_CLIENT_ID_ENV_VAR}/` +
+      `${TS_OAUTH_SECRET_ENV_VAR} env fallbacks) must be given TOGETHER or not at all — only ` +
+      `${hasClientId ? TS_OAUTH_CLIENT_ID_FLAG : TS_OAUTH_SECRET_FLAG} resolved to a value. Supply both, or neither.`,
+  };
+}
+
+/**
+ * Builds the {@link ResolvedTsOauth} pair from the flag-then-env-resolved
+ * values, or `undefined` when either is missing/empty. Callers that already
+ * ran {@link checkTsOauthFlagsComplete} and got `undefined` back know this
+ * never returns a half-built pair — the two functions share the exact same
+ * "non-empty string" predicate on purpose.
+ */
+export function resolvedTsOauthPair(clientId: string | undefined, secret: string | undefined): ResolvedTsOauth | undefined {
+  if (clientId === undefined || clientId.length === 0 || secret === undefined || secret.length === 0) return undefined;
+  return { clientId, secret };
+}
+
 // --- Tailscale-declared refuse-before-gate-1 preflight (groundnuty/macf#1074) ---
 
 export const TAILSCALE_OAUTH_MISSING_CODE = 'tailscale_oauth_missing';
@@ -548,19 +627,26 @@ export interface TailscaleOauthPreflightDeps {
  * work — an operator who forgot to supply Tailscale OAuth never spends a
  * browser click and never even costs a read-only `gh` call.
  *
- * Three cases:
+ * Four cases (groundnuty/macf#1186 added the 0th — every other case is
+ * UNCHANGED from `#1074`):
+ *   0. **`resolvedTsOauth` given** (`--ts-oauth-client-id`/`--ts-oauth-secret`
+ *      or their env fallbacks, resolved by the caller) — `undefined`
+ *      immediately, before any vault flag is even inspected. This is what
+ *      lets a fresh org with NO pre-existing vault satisfy the requirement:
+ *      the flag pair is a complete, self-sufficient answer, never merely a
+ *      hint that a vault read would still be attempted.
  *   1. **Not declared** (`transport.tailscale_oauth_required` is `false`,
  *      the default) — `undefined`. Undeclared is honest "not ready yet,"
  *      never an error (see `apply-routing-secrets.ts`'s module doc).
- *   2. **Declared, but `vaultPath`/`identityPath` not BOTH supplied** —
- *      REFUSE. There is no way to verify presence without decrypting, and
- *      per Amendment C's precedent an unverifiable declared-requirement
- *      refuses rather than silently proceeding on a fleet that might not
- *      be able to route.
- *   3. **Declared, both supplied** — decrypt + check
- *      `vaultTsOauthClientId`/`vaultTsOauthSecret` presence. Either
- *      missing (or the decrypt itself fails) — REFUSE. Both present —
- *      `undefined` (proceed; the publish-time resolution in
+ *   2. **Declared, no `resolvedTsOauth`, but `vaultPath`/`identityPath` not
+ *      BOTH supplied** — REFUSE. There is no way to verify presence without
+ *      decrypting, and per Amendment C's precedent an unverifiable
+ *      declared-requirement refuses rather than silently proceeding on a
+ *      fleet that might not be able to route.
+ *   3. **Declared, no `resolvedTsOauth`, both vault flags supplied** —
+ *      decrypt + check `vaultTsOauthClientId`/`vaultTsOauthSecret`
+ *      presence. Either missing (or the decrypt itself fails) — REFUSE.
+ *      Both present — `undefined` (proceed; the publish-time resolution in
  *      `apply-fleet.ts` reads the SAME fields again independently, per
  *      this codebase's "each concern gets its own decrypt, not a hot
  *      path" convention already established for CA/routing-client
@@ -576,9 +662,11 @@ export async function checkTailscaleOauthPreflight(
   tailscaleOauthRequired: boolean,
   vaultPath: string | undefined,
   identityKeyPath: string | undefined,
+  resolvedTsOauth: ResolvedTsOauth | undefined,
   deps: TailscaleOauthPreflightDeps,
 ): Promise<TailscaleOauthPreflightFailure | undefined> {
   if (!tailscaleOauthRequired) return undefined;
+  if (resolvedTsOauth !== undefined) return undefined;
 
   if (vaultPath === undefined || identityKeyPath === undefined) {
     return {
@@ -587,8 +675,10 @@ export async function checkTailscaleOauthPreflight(
         'transport.tailscale_oauth_required is declared, but --vault/--identity-key were not both supplied, so ' +
         `${TS_OAUTH_CLIENT_ID_SECRET_NAME}/${TS_OAUTH_SECRET_SECRET_NAME} cannot be verified present in the vault. ` +
         'Refusing before consent gate 1 — supply both flags so the operator-supplied Tailscale OAuth credentials ' +
-        'can be confirmed, or unset transport.tailscale_oauth_required if this fleet genuinely does not need ' +
-        'Tailscale routing yet.',
+        `can be confirmed, or supply ${TS_OAUTH_CLIENT_ID_FLAG}/${TS_OAUTH_SECRET_FLAG} (or their ` +
+        `${TS_OAUTH_CLIENT_ID_ENV_VAR}/${TS_OAUTH_SECRET_ENV_VAR} env fallbacks) directly — no vault required for ` +
+        'that path — or unset transport.tailscale_oauth_required if this fleet genuinely does not need Tailscale ' +
+        'routing yet.',
     };
   }
 
@@ -598,7 +688,8 @@ export async function checkTailscaleOauthPreflight(
       `transport.tailscale_oauth_required is declared, but the vault did not yield ${TS_OAUTH_CLIENT_ID_SECRET_NAME}/` +
       `${TS_OAUTH_SECRET_SECRET_NAME} (${reason}). Refusing before consent gate 1 — spending consent clicks on a ` +
       'fleet that cannot route is exactly the waste this refusal exists to prevent. ' +
-      'Supply the operator-provided values into the vault, then re-run apply.',
+      `Supply the operator-provided values into the vault, or pass ${TS_OAUTH_CLIENT_ID_FLAG}/${TS_OAUTH_SECRET_FLAG} ` +
+      '(or their env fallbacks) directly, then re-run apply.',
   });
 
   try {

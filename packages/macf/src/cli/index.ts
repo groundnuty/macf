@@ -785,6 +785,18 @@ bootstrap
       'when unset. Get one with: gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token',
   )
   .option(
+    '--ts-oauth-client-id <id>',
+    'Tailscale OAuth client ID — required together with --ts-oauth-secret when transport.tailscale_oauth_required ' +
+      'is declared and neither flag/env value nor an already-vaulted value is available. A fresh org has no vault ' +
+      'to read this from at all; this flag supplies it directly, no --vault/--identity-key needed. Falls back to ' +
+      'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID when unset. Never written to fleet.yaml or vault.age.',
+  )
+  .option(
+    '--ts-oauth-secret <secret>',
+    'Tailscale OAuth client secret — the pair to --ts-oauth-client-id; both or neither. Falls back to ' +
+      'MACF_BOOTSTRAP_TS_OAUTH_SECRET when unset. Never logged, never echoed in --json output.',
+  )
+  .option(
     '--no-deploy',
     'Skip the default per-agent deploy phase that otherwise runs after the GitHub phase above ' +
       '(needs --vault + --identity-key; without them the deploy phase is skipped anyway, loudly). Restores ' +
@@ -800,6 +812,8 @@ bootstrap
       vaultPath: opts.vault,
       identityKeyPath: opts.identityKey,
       runnerToken: opts.runnerToken,
+      tsOauthClientId: opts.tsOauthClientId,
+      tsOauthSecret: opts.tsOauthSecret,
       deploy: opts.deploy,
     });
     process.exitCode = code;
