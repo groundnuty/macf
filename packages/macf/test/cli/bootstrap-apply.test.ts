@@ -1533,18 +1533,26 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
   // proceed to completion instead of being discarded by this early abort.
 
   describe('macf#932 (narrowed by groundnuty/macf#1209) — early WARNING before consent gate 1, run proceeds regardless', () => {
-    it('declared routing.runner self-hosted + NO token resolvable -> WARNS before consent gate 1 but the run PROCEEDS: observe/confirmPlan/buildAgentDeps/openUrl/startManifestFlow/confirmAppInstallation ALL fire, unlike pre-#1209', async () => {
+    it('declared routing.runner self-hosted + NO token resolvable -> WARNS before consent gate 1 but the run PROCEEDS: observe/buildAgentDeps/openUrl/startManifestFlow ALL fire, unlike pre-#1209', async () => {
       vi.stubEnv(RUNNER_TOKEN_ENV_VAR, ''); // pin: this test's verdict must not depend on the ambient shell env
       const file = writeManifest(FLEET_YAML_WITH_ROUTING);
       let observeCalls = 0;
-      let confirmPlanCalls = 0;
       let buildAgentDepsCalls = 0;
       let openUrlCalls = 0;
       let startManifestFlowCalls = 0;
-      let confirmAppInstallationCalls = 0;
       let checkRunnerUsableCalls = 0;
 
       const code = await runBootstrapApply(
+        // `yes: true` bypasses `confirmPlan` entirely by design (see
+        // `runBootstrapApply`'s own `opts.yes === true ? true :
+        // await mutate.confirmPlan(...)`) — so `confirmPlan` staying at ZERO
+        // calls here is unrelated to this test's point and is NOT asserted;
+        // the seams below (observe/buildAgentDeps/openUrl/startManifestFlow)
+        // are what prove the run reached past the pre-flight into
+        // `applyFleet`. `confirmAppInstallation` is NOT one of them —
+        // `waitForAppInstallation`'s default `repositorySelection: 'selected'`
+        // fixture never reaches it in this happy-ish path (unrelated to this
+        // fix), so it is not a reliable "did the run proceed" signal here.
         { file, yes: true }, // no opts.runnerToken
         {
           observe: () => {
@@ -1554,10 +1562,6 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         },
         fakeMutateDeps(file, {
           runnerToken: undefined,
-          confirmPlan: async () => {
-            confirmPlanCalls += 1;
-            return true;
-          },
           buildAgentDeps: () => {
             buildAgentDepsCalls += 1;
             return fakeAgentDeps({
@@ -1572,10 +1576,6 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
                   waitForCode: async () => 'the-code',
                   close: async () => {},
                 };
-              },
-              confirmAppInstallation: async () => {
-                confirmAppInstallationCalls += 1;
-                return { status: 'unconfirmable' };
               },
             });
           },
@@ -1593,11 +1593,9 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // ruling), but it is NOT a total abort any more: every seam below fired.
       expect(code).toBe(1);
       expect(observeCalls).toBeGreaterThan(0);
-      expect(confirmPlanCalls).toBeGreaterThan(0);
       expect(buildAgentDepsCalls).toBeGreaterThan(0);
       expect(openUrlCalls).toBeGreaterThan(0);
       expect(startManifestFlowCalls).toBeGreaterThan(0);
-      expect(confirmAppInstallationCalls).toBeGreaterThan(0);
       // The runner-token refusal itself is STILL zero-I/O (macf#929's "token
       // is POLICY, missing token means detection is never even ATTEMPTED"
       // contract, unchanged by #1209) — `publishTrustedActorsGated`
@@ -1713,7 +1711,14 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
       const file = writeManifest(FLEET_YAML_WITH_ROUTING);
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
-      let createRepoVariableCalls = 0;
+      // `trustDeps.createRepoVariable` is SHARED — `apply-ca.ts`'s per-repo
+      // `DEMO_FLEET_CA_CERT` writes go through the SAME primitive as
+      // `MACF_TRUSTED_ACTORS`. A raw call-count of zero would be the WRONG
+      // assertion (CA legs are expected to write here, since CA doesn't
+      // depend on the runner token either) — capture the variable NAME per
+      // call so the negative-half assertion below can single out
+      // `MACF_TRUSTED_ACTORS` specifically.
+      const createRepoVariableCalls: { repo: string; name: string }[] = [];
       let checkRunnerUsableCalls = 0;
 
       const code = await runBootstrapApply(
@@ -1728,8 +1733,8 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
             },
           }),
           trustDeps: fakeTrustDeps({
-            createRepoVariable: async () => {
-              createRepoVariableCalls += 1;
+            createRepoVariable: async (repo, name) => {
+              createRepoVariableCalls.push({ repo, name });
               return 'created';
             },
             checkRunnerUsableByRepo: async () => {
@@ -1765,11 +1770,16 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // Negative half (the actual point, per assert-the-wrong-path.md) —
       // MACF_TRUSTED_ACTORS was genuinely WITHHELD, not silently written
       // anyway despite the exit code being non-zero for some OTHER reason.
-      // Zero calls into the write primitive at all (macf#929's "token is
-      // policy, missing token means detection+write are never even
-      // ATTEMPTED" contract) — a passing "code is non-zero" assertion alone
-      // would NOT catch a regression that quietly dropped the refusal.
-      expect(createRepoVariableCalls).toBe(0);
+      // `createRepoVariable` DOES get called — for the CA legs, which don't
+      // depend on the runner token either and are expected to succeed (proof
+      // CA proceeded too) — so the assertion is on the VARIABLE NAME, not the
+      // raw call count: no call ever named `MACF_TRUSTED_ACTORS`. Zero calls
+      // into the runner-usability check at all (macf#929's "token is policy,
+      // missing token means detection+write are never even ATTEMPTED"
+      // contract) — a passing "code is non-zero" assertion alone would NOT
+      // catch a regression that quietly dropped the refusal.
+      expect(createRepoVariableCalls.some((c) => c.name === 'MACF_TRUSTED_ACTORS')).toBe(false);
+      expect(createRepoVariableCalls.some((c) => c.name === 'DEMO_FLEET_CA_CERT')).toBe(true);
       expect(checkRunnerUsableCalls).toBe(0);
 
       const parsed = JSON.parse(logs.join('\n')) as { routing: Record<string, { status: string; reason?: string }> };
