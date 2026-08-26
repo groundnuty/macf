@@ -1233,7 +1233,15 @@ export async function applyFleet(
     priorLock,
     deps.buildAgentDeps(deps.log).resolveKeyPath,
   );
-  const controlRepoInit = await applyControlRepoInit(
+  // `let`, not `const` — groundnuty/macf#1221 (the "still broken after
+  // #1224" follow-up): this initial attempt runs before ANY agent identity
+  // exists this run, so on a genuinely first-ever fleet provision (no
+  // `priorLock` match, or no `--vault`/`--identity-key`) it is STRUCTURALLY
+  // unable to find a credential — `resolveControlRepoLabelTokenSource`
+  // returns `undefined` by construction, every time, for that (the MOST
+  // COMMON) case. See the retry below, right after the per-agent loop,
+  // which reassigns this variable.
+  let controlRepoInit = await applyControlRepoInit(
     controlDir,
     manifest,
     { repoInit: deps.repoInitDeps.repoInit },
@@ -1593,6 +1601,57 @@ export async function applyFleet(
     }
 
     records.push({ role: agent.role, identity, repoInit: repoInitOutcome });
+  }
+
+  // groundnuty/macf#1221 (the "still broken after #1224" follow-up) — retry
+  // control-repo label creation using a JUST-CREATED agent's freshly-minted
+  // (in-process, never vaulted) credential, when the Step-0.5 attempt above
+  // never had one to try. This is the gap `resolveControlRepoLabelTokenSource`
+  // structurally cannot close on its own: it only ever looks at `priorLock`
+  // (an ALREADY-EXISTING agent from a PRIOR run), and Step 0.5 runs before
+  // THIS run's per-agent loop has created anything — so a genuinely
+  // first-ever fleet provision (the common case, and the one macf-trial
+  // reproduced) NEVER has a credential at Step 0.5, no matter what. The
+  // per-agent loop above is the FIRST point in this run where one exists —
+  // `identity.credentials.pem` for a `'created'` role, the SAME in-memory
+  // PEM `applyRepoInitForCreatedAgent` already uses for that agent's OWN
+  // repo (groundnuty/macf#920) — so reuse it here for the control repo too.
+  // Only fires when Step 0.5's own labels are not already `'ok'` (nothing to
+  // retry otherwise) and only ONCE, with the FIRST `'created'` role in
+  // manifest order — deterministic, same convention
+  // `resolveControlRepoLabelTokenSource` already established for its own
+  // prior-lock scan. `writeScratchPem`/`cleanupScratchPem` (macf#920's own
+  // 0600-scratch-file primitive) bracket the ONE retried `repoInit()` call,
+  // exactly like `applyRepoInitForCreatedAgent` does for an agent's own
+  // repo.
+  if (controlRepoInit.status === 'written' && controlRepoInit.labels.status !== 'ok') {
+    const createdRecord = records.find(
+      (r): r is AgentApplyRecord & { readonly identity: Extract<AgentApplyOutcome, { status: 'created' }> } => r.identity.status === 'created',
+    );
+    if (createdRecord !== undefined) {
+      const { identity: createdIdentity, role: createdRole } = createdRecord;
+      const retryKeyPath = writeScratchPem(createdRole, createdIdentity.credentials.pem);
+      try {
+        const retryTokenSource: TokenSource = { appId: createdIdentity.appId, installId: createdIdentity.installId, keyPath: retryKeyPath };
+        const retried = await applyControlRepoInit(
+          controlDir,
+          manifest,
+          { repoInit: deps.repoInitDeps.repoInit },
+          { actionsVersion: controlPinReconcile.actionsVersion, force: controlPinReconcile.force, tokenSource: retryTokenSource },
+        );
+        if (retried.status === 'written') {
+          deps.log(
+            `Control repo "${controlRepo.repo}" repo-init: retried label creation using role "${createdRole}"'s ` +
+              `freshly-minted credential (Step 0.5 had none) — labels ${retried.labels.status}.`,
+          );
+          controlRepoInit = retried;
+        } else {
+          deps.log(`Control repo "${controlRepo.repo}" repo-init: retry using role "${createdRole}"'s freshly-minted credential FAILED — ${retried.reason}`);
+        }
+      } finally {
+        cleanupScratchPem(retryKeyPath);
+      }
+    }
   }
 
   // groundnuty/macf#1071 — the publish target set for anything the router
