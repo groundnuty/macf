@@ -79,6 +79,15 @@ import {
 } from '../bootstrap/apply-routing-secrets.js';
 import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
 import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
+import type { FleetVerdict } from '../bootstrap/fleet-verdict.js';
+import {
+  determineFleetVerdict,
+  fleetVerdictToJson,
+  formatFleetVerdictLines,
+  routingVerdictComponent,
+  runnerVerdictComponent,
+  workspaceVerdictComponent,
+} from '../bootstrap/fleet-verdict.js';
 import {
   readVault,
   vaultAgentPrivateKeyPem,
@@ -1781,6 +1790,23 @@ function actionsPinStatusLabel(status: ActionsPinRepoStatus): string {
  * function's own doc for the full ordering rationale — status confirms,
  * deploy acts, and confirming-before-acting is the point).
  */
+/**
+ * The three fleet-verdict components (groundnuty/macf#1184), composed from
+ * fields `FleetApplyResult`/`RemainingDeployReport` already carry — no new
+ * probe. Shared by {@link formatApplyResult} and {@link fleetApplyResultToJson}
+ * so the human render and the `--json` render can never silently disagree
+ * about which components were checked or what each one concluded — one
+ * decision, read twice.
+ */
+function buildFleetVerdict(result: FleetApplyResult, remainingDeploy: RemainingDeployReport): FleetVerdict {
+  const runnerComponent = runnerVerdictComponent(result.routing);
+  return determineFleetVerdict([
+    routingVerdictComponent(result.routingSecrets),
+    ...(runnerComponent !== undefined ? [runnerComponent] : []),
+    workspaceVerdictComponent(remainingDeploy),
+  ]);
+}
+
 export function formatApplyResult(
   result: FleetApplyResult,
   unimplemented: readonly UnimplementedApplyItem[] = [],
@@ -1846,6 +1872,18 @@ export function formatApplyResult(
   if (versionPhase?.attempted === true) {
     parts.push('', formatVersionReconcileLine(versionPhase));
   }
+  // groundnuty/macf#1184 — the fleet-level VERDICT, LAST (requirement 5's
+  // own "the end of the output is the operator's next step" ordering,
+  // extended: the verdict IS the operator's next-step signal — a fleet the
+  // verdict calls not-confirmed needs attention before "cd && ./claude.sh"
+  // means anything). Deliberately a SECOND surfacing of the routing fact,
+  // not the only one — `apply-fleet.ts`'s in-run "Fleet-level: ... CANNOT
+  // route" log line (deps.log, stderr, mid-run) already states it once as
+  // it happens; this is the end-of-run summary restating it "as plainly as
+  // NOT running" per the issue's own requirement. Two streams, one
+  // decision (`buildFleetVerdict` is the single computation both read).
+  const verdictLines = formatFleetVerdictLines(buildFleetVerdict(result, remainingDeploy));
+  if (verdictLines.length > 0) parts.push('', ...verdictLines);
   return parts.join('\n');
 }
 
@@ -1988,6 +2026,20 @@ function deployPhaseToJson(deployPhase: DeployPhaseRenderInput | undefined): unk
  * fleet's `--json` output must stay byte-identical to its pre-#1014 shape,
  * which an unconditional new key would not be.
  *
+ * **`fleet_verdict` (groundnuty/macf#1184) — additive, NO `schema_version`
+ * bump.** This key is NEW, never previously present under any name — the
+ * precedent this file already sets (`remaining_deploy`/`deploy_phase`/
+ * `version_phase`/`actions_pin` were each added without a bump) is that a
+ * bump is for an EXISTING field's MEANING changing under a consumer's feet
+ * (the #1212 doc comment on `FLEET_APPLY_JSON_SCHEMA_VERSION` above is the
+ * worked example — `routing[repo].status` gained a `'pending'` arm AND
+ * narrowed what `'failed'` meant for the SAME field), not for a wholly new
+ * key a pre-#1184 consumer's exhaustive-switch code could never have had an
+ * opinion about. Omitted only when nothing was checked at all
+ * (`verdict.components.length === 0` — see `formatFleetVerdictLines`'s own
+ * doc for when that happens), matching `remaining_deploy`'s own
+ * omit-when-empty convention.
+ *
  * `deployPhase` (macf#1013) defaults to `undefined` — `deploy_phase` is
  * OMITTED ENTIRELY (never present-but-empty) whenever the deploy phase was
  * never attempted at all (`--no-deploy`, or the control repo aborted), same
@@ -2074,6 +2126,13 @@ export function fleetApplyResultToJson(
           },
         }
       : {}),
+    // groundnuty/macf#1184 — see this function's own doc for the
+    // additive/no-bump decision. `fleetVerdictToJson` returns `undefined`
+    // (key omitted) when nothing was checked at all.
+    ...((): Record<string, unknown> => {
+      const json = fleetVerdictToJson(buildFleetVerdict(result, remainingDeploy));
+      return json === undefined ? {} : { fleet_verdict: json };
+    })(),
   };
 }
 

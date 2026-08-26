@@ -5037,3 +5037,63 @@ describe('formatApplyResult — macf#994 first-launch guidance (deploy phase)', 
     expect(text).not.toContain('Do you trust this folder');
   });
 });
+
+// --- groundnuty/macf#1184 — the fleet-level verdict, wired through the
+// PUBLIC entrypoints (formatApplyResult / fleetApplyResultToJson), not just
+// the standalone fleet-verdict.ts unit (see that file's own test for the
+// component-level decisive pair). Proves `buildFleetVerdict`'s private
+// wiring actually reaches both renders using the SAME real
+// `FleetApplyResult` shape `resultWith` builds for every other test in this
+// file. ---
+describe('the #1184 fleet verdict, wired through formatApplyResult / fleetApplyResultToJson', () => {
+  const ALL_SIX_LEGS = ['MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY', 'TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'] as const;
+
+  function sixLegsWith(repos: readonly string[], leg: { status: string; reason?: string }): FleetApplyResult['routingSecrets'] {
+    const out = {} as Record<string, Record<string, { status: string; reason?: string }>>;
+    for (const name of ALL_SIX_LEGS) out[name] = Object.fromEntries(repos.map((r) => [r, leg]));
+    return out as FleetApplyResult['routingSecrets'];
+  }
+
+  it('the exact macf-trial signature (whole-bag skip + zero runners + no workspace) never renders "is provisioned" as a positive claim, and names all three gaps', () => {
+    const result = resultWith({
+      routingSecrets: sixLegsWith(['groundnuty/trial-code', 'groundnuty/trial-science'], {
+        status: 'skipped',
+        reason: 'router App/routing-client cert freshly minted this run; vault write not yet confirmed',
+      }),
+      routing: {
+        'groundnuty/trial-code': { status: 'failed', reason: 'no usable runner registered' },
+        'groundnuty/trial-science': { status: 'failed', reason: 'no usable runner registered' },
+      },
+    });
+    const remainingDeploy = {
+      steps: [
+        { role: 'code-agent', deployPath: '/x/code-agent', presence: 'not-deployed' as const, command: 'macf fleet deploy --agent code-agent' },
+        { role: 'science-agent', deployPath: '/x/science-agent', presence: 'not-deployed' as const, command: 'macf fleet deploy --agent science-agent' },
+      ],
+    };
+
+    const text = formatApplyResult(result, [], remainingDeploy);
+    expect(text).not.toMatch(/\bis provisioned\b/);
+    expect(text).toContain('Fleet verdict');
+    expect(text).toContain('routing');
+    expect(text).toContain('runners');
+    expect(text).toContain('workspaces');
+
+    const json = fleetApplyResultToJson(result, [], remainingDeploy) as { fleet_verdict: { confirmed: boolean; components: readonly { name: string; state: string }[] } };
+    expect(json.fleet_verdict.confirmed).toBe(false);
+    expect(json.fleet_verdict.components.map((c) => c.name).sort()).toEqual(['routing', 'runners', 'workspaces']);
+  });
+
+  it('the positive twin: everything confirmed -> a success verdict line, no "NOT confirmed" anywhere', () => {
+    const result = resultWith({
+      routingSecrets: sixLegsWith(['groundnuty/trial-code'], { status: 'created' }),
+      routing: { 'groundnuty/trial-code': { status: 'created' } },
+    });
+    const text = formatApplyResult(result, [], { steps: [] });
+    expect(text).toContain('Fleet verdict');
+    expect(text).not.toContain('NOT confirmed');
+
+    const json = fleetApplyResultToJson(result, [], { steps: [] }) as { fleet_verdict: { confirmed: boolean } };
+    expect(json.fleet_verdict.confirmed).toBe(true);
+  });
+});
