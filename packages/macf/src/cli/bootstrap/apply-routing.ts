@@ -257,6 +257,7 @@ import { ensureVariableCreated } from './ensure-variable.js';
 import type { CaApplyDeps } from './apply-ca.js';
 import type { RunnerUsability } from './observer.js';
 import type { FleetRouting } from './fleet-manifest.js';
+import type { RunnerPlatformStatusResult } from './runner-platform.js';
 
 /** The GitHub Actions variable name the v3 router reads (`agent-router.yml`'s `pick-runner` job) — matches `observer.ts`'s read of the same name (macf#922). */
 export const TRUSTED_ACTORS_VAR = 'MACF_TRUSTED_ACTORS';
@@ -707,8 +708,15 @@ export interface RunnerTokenPollOptions {
    * called for the immediate single-check fast path (nothing to narrate — it
    * never waits). `undefined` (the default) narrates nothing, matching
    * every poll's behavior before macf#972.
+   *
+   * A 4th, OPTIONAL `platformStatus` param (groundnuty/macf#1212) is passed
+   * ONLY by `publishTrustedActorsForProvisioned` — the runner-platform's own
+   * advisory status read for the SAME progress tick (see that function's
+   * doc). {@link pollForUsableRunner}'s own call sites never pass it
+   * (they have no platform-status seam); a caller that ignores the 4th arg
+   * — every pre-#1212 implementation — is unaffected.
    */
-  readonly onProgress?: (repo: string, elapsedMs: number, totalMs: number) => void;
+  readonly onProgress?: (repo: string, elapsedMs: number, totalMs: number, platformStatus?: RunnerPlatformStatusResult) => void;
   /** Injectable clock — default `Date.now`. Test-only; production never overrides this. */
   readonly now?: () => number;
   /** Injectable wait primitive — default a real `setTimeout`-based sleep. Test-only; production never overrides this. */
@@ -1093,6 +1101,186 @@ export async function publishTrustedActorsGated(
       continue;
     }
     out[repo] = await writeTrustedActorsVar(repo, value, deps);
+  }
+  return out;
+}
+
+// --- groundnuty/macf#1212 — apply requested this runner; it waits ---
+//
+// **Operator ruling, overriding #929/#1195's "token licenses waiting"
+// split for exactly this case.** #1195 (immediately above) is unchanged and
+// correct for a repo `apply` did NOT provision this run — no token still
+// means one honest immediate check, never a wait, because nothing this run
+// did licenses one. A repo THIS run successfully told `runner-platform.ts::
+// provisionRunner` to create is different: `apply` itself is the reason a
+// runner may be mid-registration, so whether `--runner-token` was ALSO
+// supplied is irrelevant to whether `apply` waits for something it itself
+// asked for. `apply-fleet.ts`'s call site routes exactly this set of repos
+// here — and ONLY this set; every other repo still goes through
+// {@link publishTrustedActorsGated} untouched, so the #929/#1195 dispatch
+// for the ordinary (not-provisioned-this-run) case is byte-unchanged.
+//
+// **Readiness stays GitHub-side, deliberately** — this function polls
+// `deps.checkRunnerUsableByRepo` (the SAME `observer.ts` seam every other
+// path in this module already uses) to decide when to write the var, never
+// the runner-platform's own `available` count. `runner-platform.ts`'s own
+// header warns why: "a pod can be running while GitHub has no usable runner
+// registered... confirm against GitHub before you route." The platform's
+// `GET /runners/{owner}/{repo}` read (`checkRunnerPlatformStatus`, injected
+// optionally) is consulted ONLY for (a) progress narration content — the
+// operator's own ruling: "the runner's actual state... GET /runners/…
+// returns available; show it" — and (b) a narrow terminal fast-exit when
+// the platform reports a confirmed, non-recoverable failure
+// (`RunnerPlatformStatusResult.status === 'failed'`, e.g.
+// `FailedUpdateRegistrationToken` — "this is not a startup delay; polling
+// will not clear it"). Any OTHER platform read (unreachable/not-configured/
+// unparseable, surfaced as `'unknown'`, or a `'starting'`/`'ready'` read
+// that simply hasn't caught up with GitHub yet) never ends the wait early —
+// an unrecognized or advisory-only shape can only ever cost a bounded wait
+// and an honest `'pending'`, never fabricate a `'failed'` the GitHub-side
+// check didn't itself confirm.
+//
+// **`'pending'`, never `'failed'`, on timeout — the heart of the ruling.**
+// The operator's own words: "we cannot report an error... because it
+// sounds like the user's problem." A repo whose runner this run legitimately
+// requested and is still converging is NOT the same fact as macf#993's "a
+// declared runner is REQUIRED and none was ever registered" — so this
+// function's timeout branch produces `EnsureVariableOutcome`'s NEW
+// `'pending'` status (see that type's doc), which `applyExitCode`
+// (`bootstrap-apply.ts`) does not treat as a run-failing outcome, matching
+// `#1210`'s "gates only runner-dependent work" scoping: nothing about a
+// pending routing-var write aborts CA/routing-secrets/repo-init/vault legs,
+// and nothing about it fails the run outright either — only the ONE write
+// this repo's runner licenses stays undone, honestly reported.
+//
+// **One shared deadline across every repo passed in**, same pattern
+// {@link publishTrustedActorsGated}'s token-supplied branch already
+// established: `repos.length` repos share ONE bounded budget, not
+// `repos.length` independent windows — a multi-agent fleet's worst case
+// stays one wait, not N.
+
+/** The text {@link publishTrustedActorsForProvisioned} shows while it waits — the operator's own requirement ("the runner's actual state... GET /runners/… returns available; show it"), not a content-free elapsed-time-only line. `platformStatus === undefined` (endpoint not configured, or the injected check wasn't supplied) degrades to naming that honestly rather than inventing a number. */
+export function formatProvisionedRunnerWaitProgress(repo: string, elapsedMs: number, totalMs: number, platformStatus?: RunnerPlatformStatusResult): string {
+  const state =
+    platformStatus === undefined
+      ? 'no runner-platform status available'
+      : platformStatus.status === 'ready' || platformStatus.status === 'starting'
+        ? `runner platform reports ${String(platformStatus.available)} available`
+        : platformStatus.status === 'failed'
+          ? `runner platform reports a failure: ${platformStatus.reason}`
+          : `runner platform status unknown — ${platformStatus.reason}`;
+  return (
+    `waiting for the runner requested THIS run to become usable for "${repo}" … ` +
+    `${String(Math.round(elapsedMs / 1000))}s/${String(Math.round(totalMs / 1000))}s elapsed; ${state}`
+  );
+}
+
+/** The `'pending'` reason text for a repo `apply` provisioned this run whose bounded wait expired before GitHub confirmed a usable runner — honest incomplete, not a failure (see this section's doc, "the heart of the ruling"). States the elapsed/budget the operator's requirement calls for ("on timeout... report pending with the elapsed budget and what to do"). */
+export function runnerStillProvisioningReason(repo: string, elapsedMs: number, timeoutMs: number): string {
+  return (
+    `role/repo "${repo}": a self-hosted runner was requested for this repo THIS run and has not yet become ` +
+    `usable to GitHub within the ${String(Math.round(elapsedMs / 1000))}s this run waited (budget ` +
+    `${String(Math.round(timeoutMs / 1000))}s) — MACF_TRUSTED_ACTORS was NOT written; this repo continues ` +
+    'routing on ubuntu-latest (billed on private repos) in the meantime. This is expected provisioning ' +
+    'latency, not a failure — re-run `macf bootstrap apply` once the runner is up, or `macf bootstrap status` ' +
+    'to check progress without re-provisioning anything.'
+  );
+}
+
+/** The `'failed'` reason text for a repo whose runner-platform status read confirmed a TERMINAL failure (`RunnerPlatformStatusResult.status === 'failed'`) during the wait — a genuine problem, distinct from `'pending'` (see this section's doc). Never claims a wait ran the full budget: this path exits on the FIRST platform read that confirms the failure. */
+export function runnerProvisioningTerminalFailureReason(repo: string, failure: { readonly reason: string; readonly message: string }): string {
+  return (
+    `role/repo "${repo}": the runner-provisioning platform reports a TERMINAL failure for this repo's runner — ` +
+    `${failure.reason} (${failure.message}). This is not a startup delay; polling will not clear it. ` +
+    'MACF_TRUSTED_ACTORS was NOT written; this repo continues routing on ubuntu-latest (billed on private ' +
+    'repos) until the underlying provisioning problem is fixed (commonly: the fleet\'s GitHub App is not ' +
+    'installed on the repo owner, so no registration token can be minted) and `macf bootstrap apply` is re-run.'
+  );
+}
+
+/** {@link publishTrustedActorsForProvisioned}'s deps — the SAME `RoutingApplyDeps` write/readiness seam every other publisher in this module uses, plus the OPTIONAL, advisory-only platform-status read (see this section's doc for why it's optional and never the readiness gate). */
+export type ProvisionedRunnerWaitDeps = RoutingApplyDeps & {
+  readonly checkRunnerPlatformStatus?: (repo: string) => Promise<RunnerPlatformStatusResult>;
+};
+
+/**
+ * The macf#1212 production entrypoint for repos `apply` successfully told
+ * `runner-platform.ts::provisionRunner` to create THIS run — see this
+ * section's top-of-block doc for the full "why unconditional, why
+ * GitHub-side readiness, why `'pending'` not `'failed'`" narrative.
+ * `apply-fleet.ts`'s call site passes ONLY `provisionedNowRepos`; every
+ * other confirmed repo goes through {@link publishTrustedActorsGated}
+ * unchanged, so the two functions never poll the SAME repo twice.
+ *
+ * Per repo, in order, sharing ONE deadline across `repos`:
+ *   1. `deps.checkRunnerUsableByRepo(repo)` — `'present'` writes the var via
+ *      {@link writeTrustedActorsVar} and moves to the next repo with ZERO
+ *      sleep (the macf#1212 decisive-pair case 2: a runner already usable
+ *      on entry, whether a genuinely fresh run or a re-run observing a
+ *      PRIOR run's provisioning having since landed, waits not at all —
+ *      indistinguishable in code from case 1, which IS the resume property
+ *      the issue names as the point of the whole exercise).
+ *   2. `deps.checkRunnerPlatformStatus?.(repo)` (if supplied) — a
+ *      `'failed'` result exits immediately with
+ *      {@link runnerProvisioningTerminalFailureReason}, NEVER waiting out
+ *      the remaining budget for a state the platform itself says polling
+ *      cannot clear. Any other result is advisory-only (progress content).
+ *   3. Budget exhausted → {@link runnerStillProvisioningReason}, status
+ *      `'pending'`.
+ *   4. Otherwise sleep `pollIntervalMs` (capped by remaining budget) and
+ *      repeat.
+ *
+ * A throwing `checkRunnerUsableByRepo`/`checkRunnerPlatformStatus` is
+ * `'failed'` (a wiring bug, isolated to that repo's entry) — mirrors every
+ * other publisher in this module. NEVER throws.
+ */
+export async function publishTrustedActorsForProvisioned(
+  value: string,
+  repos: readonly string[],
+  deps: ProvisionedRunnerWaitDeps,
+  pollOptions: RunnerTokenPollOptions = {},
+): Promise<Readonly<Record<string, EnsureVariableOutcome>>> {
+  const timeoutMs = pollOptions.timeoutMs ?? DEFAULT_RUNNER_POLL_TIMEOUT_MS;
+  const pollIntervalMs = pollOptions.pollIntervalMs ?? DEFAULT_RUNNER_POLL_INTERVAL_MS;
+  const progressIntervalMs = pollOptions.progressIntervalMs ?? DEFAULT_PROGRESS_INTERVAL_MS;
+  const nowFn = pollOptions.now ?? Date.now;
+  const sleepFn = pollOptions.sleepFn ?? sleep;
+  const deadline = nowFn() + timeoutMs;
+
+  const out: Record<string, EnsureVariableOutcome> = {};
+  for (const repo of repos) {
+    const start = nowFn();
+    let lastProgressAt = start;
+    try {
+      for (;;) {
+        const usability = await deps.checkRunnerUsableByRepo(repo);
+        if (usability.presence === 'present') {
+          out[repo] = await writeTrustedActorsVar(repo, value, deps);
+          break;
+        }
+        let platformStatus: RunnerPlatformStatusResult | undefined;
+        if (deps.checkRunnerPlatformStatus !== undefined) {
+          platformStatus = await deps.checkRunnerPlatformStatus(repo);
+          if (platformStatus.status === 'failed') {
+            out[repo] = { status: 'failed', reason: runnerProvisioningTerminalFailureReason(repo, platformStatus) };
+            break;
+          }
+        }
+        const elapsedNow = nowFn();
+        const remaining = deadline - elapsedNow;
+        if (remaining <= 0) {
+          out[repo] = { status: 'pending', reason: runnerStillProvisioningReason(repo, elapsedNow - start, timeoutMs) };
+          break;
+        }
+        if (pollOptions.onProgress !== undefined && elapsedNow - lastProgressAt >= progressIntervalMs) {
+          pollOptions.onProgress(repo, elapsedNow - start, timeoutMs, platformStatus);
+          lastProgressAt = elapsedNow;
+        }
+        await sleepFn(Math.min(pollIntervalMs, remaining));
+      }
+    } catch (err) {
+      out[repo] = { status: 'failed', reason: `runner-usability/platform-status check threw for "${repo}" — ${errMessage(err)}` };
+    }
   }
   return out;
 }

@@ -257,6 +257,119 @@ export function deprovisionRunner(deps: RunnerPlatformDeps, repo: string): Promi
   return callRunnerPlatform(deps, 'DELETE', `/runners/${repo}`);
 }
 
+// --- groundnuty/macf#1212: GET /runners/{owner}/{repo} — "is it up?" ---
+//
+// The operator's ruling on #1212 requires `apply` to WAIT for a runner it
+// just told this contract to provision, unconditionally (no longer gated on
+// `--runner-token`). A bounded wait needs two things this module's existing
+// two verbs (POST/DELETE) don't provide: a live readiness read, AND a way to
+// tell "still starting" apart from "will never start" — the issue's own
+// measured example ("NOT starting: FailedUpdateRegistrationToken... this is
+// not a startup delay — polling will not clear it") is a state no amount of
+// re-polling resolves.
+//
+// **Verified live, not guessed** (2026-08-26, same tailnet host this
+// module's header cites) — three real response shapes:
+//
+//   GET /runners/{owner}/{repo}  (ready)
+//     200 { "ok": true, "repo": "...", "name": "...", "available": 1,
+//           "note": "cluster-side only — confirm usability via GET
+//           /repos/.../actions/runners before routing to it" }
+//
+//   GET /runners/{owner}/{repo}  (provisioned, not yet up, no failure logged)
+//     404 { "ok": false, "repo": "...", "name": "...", "available": 0,
+//           "note": "..." }                              -- NO `failure` key
+//
+//   GET /runners/{owner}/{repo}  (a genuinely terminal state)
+//     404 { "ok": false, "repo": "...", "name": "...", "available": 0,
+//           "note": "NOT starting: FailedUpdateRegistrationToken. This is
+//           not a startup delay — polling will not clear it. ...",
+//           "failure": { "reason": "FailedUpdateRegistrationToken",
+//                         "message": "Updating registration token failed",
+//                         "at": "2026-08-26T11:35:47Z", "count": 13916 } }
+//
+//   GET /runners/{owner}/{repo}  (never provisioned at all)
+//     404 { "ok": false, "repo": "...", "error": "not provisioned" }
+//
+// The discriminator between "still starting" and "terminal" is the
+// PRESENCE of the `failure` object, not the HTTP status (both non-ready
+// shapes are 404 — this contract's status-code table only documents
+// 200/400/404/502, deliberately coarser than the body). A response that
+// carries `failure` is terminal; one that doesn't (whether or not `name`/
+// `available` are present) is an honest "not yet" — this function never
+// invents a THIRD bucket for "never provisioned at all" vs. "provisioned,
+// not up yet": both are equally "nothing to wait past" from THIS
+// function's point of view, and the caller (this run itself, having just
+// POSTed) already knows which one it is.
+//
+// **Advisory only — this is deliberately NOT the readiness gate that
+// licenses writing `MACF_TRUSTED_ACTORS`.** That gate stays
+// `observer.ts::checkRunnerUsableByRepo` (GitHub's own runner list) exactly
+// as macf#922/#1195 left it — this module's own header doc already warns
+// "a pod can be running while GitHub has no usable runner registered...
+// confirm against GitHub before you route anything to it." This function
+// feeds a wait loop's progress narration and its terminal fast-exit only;
+// an unparseable/unreachable/unconfigured response degrades to `'unknown'`
+// (never a fabricated `'ready'` or `'failed'`) and the wait loop simply
+// keeps trusting the GitHub-side check on its own schedule.
+export type RunnerPlatformStatusResult =
+  | { readonly status: 'ready'; readonly available: number }
+  | { readonly status: 'starting'; readonly available: number }
+  | { readonly status: 'failed'; readonly reason: string; readonly message: string }
+  | { readonly status: 'unknown'; readonly reason: string };
+
+function extractNumber(parsed: unknown, key: string): number | undefined {
+  if (parsed === null || typeof parsed !== 'object') return undefined;
+  const value = (parsed as Record<string, unknown>)[key];
+  return typeof value === 'number' ? value : undefined;
+}
+
+function extractFailure(parsed: unknown): { readonly reason: string; readonly message: string } | undefined {
+  if (parsed === null || typeof parsed !== 'object') return undefined;
+  const failure = (parsed as { failure?: unknown }).failure;
+  if (failure === null || typeof failure !== 'object') return undefined;
+  const reason = (failure as Record<string, unknown>).reason;
+  const message = (failure as Record<string, unknown>).message;
+  if (typeof reason !== 'string' || reason.length === 0) return undefined;
+  return { reason, message: typeof message === 'string' && message.length > 0 ? message : reason };
+}
+
+/**
+ * `GET /runners/{owner}/{repo}` — see this section's doc above for the
+ * verified shapes. NEVER throws (same "non-fatal by contract" discipline
+ * {@link callRunnerPlatform} already carries) — every failure path
+ * (endpoint unset, network error, an unparseable/unexpected body) degrades
+ * to `'unknown'` rather than a fabricated ready/starting/failed verdict, per
+ * this module's honest-unknown floor (Amendment A4).
+ */
+export async function checkRunnerPlatformStatus(deps: RunnerPlatformDeps, repo: string): Promise<RunnerPlatformStatusResult> {
+  if (deps.endpoint === undefined) {
+    return { status: 'unknown', reason: `${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} is not set — no platform-side status to report.` };
+  }
+  const fetchFn = deps.fetchImpl ?? fetch;
+  const url = `${deps.endpoint}/runners/${repo}`;
+  let res: Response;
+  try {
+    res = await fetchFn(url, { method: 'GET', signal: AbortSignal.timeout(deps.timeoutMs ?? 15_000) });
+  } catch (err) {
+    return { status: 'unknown', reason: `GET ${url} unreachable — ${fetchFailureDetail(err)}.` };
+  }
+  let parsed: unknown;
+  try {
+    parsed = await res.json();
+  } catch {
+    return { status: 'unknown', reason: `GET ${url} returned a non-JSON body (HTTP ${String(res.status)}).` };
+  }
+  const available = extractNumber(parsed, 'available') ?? 0;
+  if (res.status === 200) return { status: 'ready', available };
+  if (res.status === 404) {
+    const failure = extractFailure(parsed);
+    if (failure !== undefined) return { status: 'failed', ...failure };
+    return { status: 'starting', available };
+  }
+  return { status: 'unknown', reason: `GET ${url} returned HTTP ${String(res.status)} (unexpected for a status read).` };
+}
+
 /**
  * The runner-ops App's credential — TWO sources, because `GET /`'s own doc
  * is unambiguous that omitting one is not a neutral choice: *"Send it on

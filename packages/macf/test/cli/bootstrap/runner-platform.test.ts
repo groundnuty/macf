@@ -12,6 +12,7 @@ import {
   resolveRunnerPlatformEndpoint,
   provisionRunner,
   deprovisionRunner,
+  checkRunnerPlatformStatus,
   runnerPlatformCredentialsFromOutcome,
 } from '../../../src/cli/bootstrap/runner-platform.js';
 import type { RunnerOpsApplyOutcome } from '../../../src/cli/bootstrap/apply-runner-ops.js';
@@ -191,6 +192,105 @@ describe('deprovisionRunner (groundnuty/macf#943 — no caller yet, see runner-p
   it('not-configured, same honest-unknown floor as provisionRunner, when the endpoint is unset', async () => {
     const result = await deprovisionRunner({ endpoint: undefined }, 'groundnuty/x');
     expect(result.status).toBe('not-configured');
+  });
+});
+
+describe('checkRunnerPlatformStatus (groundnuty/macf#1212)', () => {
+  // Shapes below are VERIFIED live against the runner-platform's own
+  // `GET /runners/{owner}/{repo}` on the tailnet host `runner-platform.ts`'s
+  // module header cites, 2026-08-26 — not guessed. See this issue's own
+  // module-doc comment (right above `checkRunnerPlatformStatus`) for the
+  // full four-shape catalog these tests pin.
+
+  it('DECISIVE: 200 ok:true -> ready, carrying the real available count', async () => {
+    const result = await checkRunnerPlatformStatus(
+      { endpoint: 'http://platform:8088', fetchImpl: (async () => jsonResponse(200, { ok: true, repo: 'x/y', name: 'x-y', available: 1 })) as typeof fetch },
+      'x/y',
+    );
+    expect(result).toEqual({ status: 'ready', available: 1 });
+  });
+
+  it('404 ok:false with NO failure object -> starting (still converging, not a verdict either way)', async () => {
+    const result = await checkRunnerPlatformStatus(
+      {
+        endpoint: 'http://platform:8088',
+        fetchImpl: (async () => jsonResponse(404, { ok: false, repo: 'x/y', name: 'x-y', available: 0, note: 'cluster-side only' })) as typeof fetch,
+      },
+      'x/y',
+    );
+    expect(result).toEqual({ status: 'starting', available: 0 });
+  });
+
+  it('404 ok:false with NO name/available/note at all (never provisioned) still -> starting, never a fabricated verdict', async () => {
+    const result = await checkRunnerPlatformStatus(
+      { endpoint: 'http://platform:8088', fetchImpl: (async () => jsonResponse(404, { ok: false, repo: 'x/y', error: 'not provisioned' })) as typeof fetch },
+      'x/y',
+    );
+    expect(result).toEqual({ status: 'starting', available: 0 });
+  });
+
+  it('DECISIVE: 404 ok:false WITH a failure object -> failed, carrying reason+message verbatim (the live FailedUpdateRegistrationToken shape)', async () => {
+    const result = await checkRunnerPlatformStatus(
+      {
+        endpoint: 'http://platform:8088',
+        fetchImpl: (async () =>
+          jsonResponse(404, {
+            ok: false,
+            repo: 'macf-experiment/exp-code-agent',
+            name: 'macf-experiment-exp-code-agent',
+            available: 0,
+            note: 'NOT starting: FailedUpdateRegistrationToken. This is not a startup delay — polling will not clear it.',
+            failure: { reason: 'FailedUpdateRegistrationToken', message: 'Updating registration token failed', at: '2026-08-26T11:35:47Z', count: 13916 },
+          })) as typeof fetch,
+      },
+      'macf-experiment/exp-code-agent',
+    );
+    expect(result).toEqual({ status: 'failed', reason: 'FailedUpdateRegistrationToken', message: 'Updating registration token failed' });
+  });
+
+  it('a failure object with an empty/missing reason is NOT treated as a confirmed failure — degrades to starting rather than fabricating a verdict', async () => {
+    const result = await checkRunnerPlatformStatus(
+      { endpoint: 'http://platform:8088', fetchImpl: (async () => jsonResponse(404, { ok: false, available: 0, failure: {} })) as typeof fetch },
+      'x/y',
+    );
+    expect(result).toEqual({ status: 'starting', available: 0 });
+  });
+
+  it('not-configured when the endpoint is undefined — no network call attempted', async () => {
+    let fetchCalled = false;
+    const result = await checkRunnerPlatformStatus(
+      { endpoint: undefined, fetchImpl: (async () => { fetchCalled = true; return jsonResponse(200, { ok: true }); }) as typeof fetch },
+      'x/y',
+    );
+    expect(result.status).toBe('unknown');
+    expect(fetchCalled).toBe(false);
+  });
+
+  it('DECISIVE (honest-unknown floor): a network failure -> unknown, NEVER a fabricated ready/starting/failed verdict', async () => {
+    const err = new Error('fetch failed');
+    (err as Error & { cause?: unknown }).cause = { code: 'ECONNREFUSED' };
+    const result = await checkRunnerPlatformStatus(
+      { endpoint: 'http://platform:8088', fetchImpl: (async () => { throw err; }) as unknown as typeof fetch },
+      'x/y',
+    );
+    expect(result.status).toBe('unknown');
+    expect(result.status === 'unknown' && result.reason).toContain('ECONNREFUSED');
+  });
+
+  it('a non-JSON body -> unknown, never throws', async () => {
+    const result = await checkRunnerPlatformStatus(
+      { endpoint: 'http://platform:8088', fetchImpl: (async () => new Response('not json', { status: 200 })) as typeof fetch },
+      'x/y',
+    );
+    expect(result.status).toBe('unknown');
+  });
+
+  it('an unexpected HTTP status (e.g. 502) -> unknown, advisory-only, never a fabricated verdict', async () => {
+    const result = await checkRunnerPlatformStatus(
+      { endpoint: 'http://platform:8088', fetchImpl: (async () => jsonResponse(502, {})) as typeof fetch },
+      'x/y',
+    );
+    expect(result.status).toBe('unknown');
   });
 });
 

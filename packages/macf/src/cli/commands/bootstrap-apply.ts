@@ -98,7 +98,7 @@ import { RUNNER_OPS_ROLE, buildRunnerOpsManifest, checkAppNameLengths, deriveRun
 import { ROUTER_APP_ROLE, buildRouterAppManifest, deriveRouterAppHandle, routerAppInstallRepos } from '../bootstrap/apply-router-app.js';
 import { defaultOperatorRecoveryRootDir, operatorRecoveryArtifactPath } from '../bootstrap/vault-write.js';
 import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflight.js';
-import type { RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
+import type { DeployFlagsEcho, RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
 import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
 import type { ApplyDeployPhaseDeps, DeployPhaseAgentResult } from '../bootstrap/apply-deploy.js';
 import { anyDeployFailed, runApplyDeployPhase } from '../bootstrap/apply-deploy.js';
@@ -1422,6 +1422,37 @@ function deployPhaseSummaryLines(deployPhase: DeployPhaseRenderInput): string[] 
 }
 
 /**
+ * groundnuty/macf#1212 — the operator's ruling, verbatim: "after the apply
+ * and before the deployment... I should be encouraged to run the status to
+ * see that everything is green." Positioned in {@link formatApplyResult}
+ * BEFORE {@link formatRemainingDeployLines}'s deploy commands — status is
+ * the CONFIRMATION that apply reconciled; deploy is the next ACTION, and
+ * printing deploy first would invite skipping the check (the operator's own
+ * framing for why the order matters).
+ *
+ * ALWAYS rendered, never gated on `remainingDeploy.steps` or on whether the
+ * deploy phase ran — a read-only "is everything green" check is useful
+ * after every apply, not only when something is visibly incomplete.
+ * `bootstrap status` accepts `-f`/`--json`/`--vault`/`--identity-key`
+ * (verified against `index.ts`'s own command registration — no
+ * `--runner-token`, unlike `apply`, since status never provisions
+ * anything); echoes ONLY the flags THIS apply run itself received, same
+ * "echo what was actually supplied" discipline
+ * `remaining-deploy.ts::buildDeployCommand` already uses for the deploy
+ * commands below it. Unlike those commands, this one is a pure GitHub read
+ * — it runs correctly from ANY host, so it is NEVER suppressed for the
+ * host-resolvability reason `remaining-deploy.ts`'s `'unknown'` presence
+ * branch exists for (that caveat applies only to the deploy commands,
+ * which touch a local filesystem path).
+ */
+function bootstrapStatusNextStepLines(manifestPath: string, flags: DeployFlagsEcho): string[] {
+  const parts = ['macf', 'bootstrap', 'status', '-f', manifestPath];
+  if (flags.vaultPath !== undefined) parts.push('--vault', flags.vaultPath);
+  if (flags.identityKeyPath !== undefined) parts.push('--identity-key', flags.identityKeyPath);
+  return ['', 'Next step — confirm the fleet is green:', `  ${parts.join(' ')}`];
+}
+
+/**
  * The operator's concrete next step (macf#1013 requirement 5 — "the end of
  * the output is the operator's next step... for a fully-deployed local
  * fleet that is the `./claude.sh` launch command per agent, not a `fleet
@@ -1470,7 +1501,18 @@ function launchNextStepLines(deployPhase: DeployPhaseRenderInput): string[] {
 
 // --- Apply-result rendering (never a credential value) ---
 
-export const FLEET_APPLY_JSON_SCHEMA_VERSION = 1;
+/**
+ * groundnuty/macf#1212 bumped this 1 → 2: `result.routing[repo].status` can
+ * now be `'pending'` (a NEW enum value a `--json` consumer's exhaustive
+ * switch must add an arm for) AND, for the SAME repos, what previously
+ * meant "no usable runner confirmed, for any reason" under `'failed'` now
+ * narrows to "confirmed dead" — a timeout on a repo `apply` itself just
+ * provisioned no longer renders as `'failed'` at all. Same class of change
+ * as `routing-doctor.ts`'s #1192 (3→4) and #1199 (4→5) bumps: a
+ * previously-collapsed status gains a new, narrower meaning a script
+ * consuming `--json` would silently misread without the version signal.
+ */
+export const FLEET_APPLY_JSON_SCHEMA_VERSION = 2;
 
 /**
  * The control-repo status line — ALWAYS rendered first (macf#857), so a
@@ -1616,9 +1658,9 @@ function formatLabelsLine(labels: LabelsOutcome): string {
   }
 }
 
-/** One `<label>: <status>` line, appending `— <reason>` for `failed`/`skipped` — the shared render shape for `EnsureVariableOutcome` (macf#838 Amendment D phase 2). NEVER a value — the type carries none. */
+/** One `<label>: <status>` line, appending `— <reason>` for `failed`/`skipped`/`pending` — the shared render shape for `EnsureVariableOutcome` (macf#838 Amendment D phase 2; `'pending'` added groundnuty/macf#1212 — see that status's own doc in `ensure-variable.ts`). NEVER a value — the type carries none. */
 function formatVariableLegLine(label: string, leg: EnsureVariableOutcome): string {
-  const suffix = leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.';
+  const suffix = leg.status === 'failed' || leg.status === 'skipped' || leg.status === 'pending' ? ` — ${leg.reason}` : '.';
   return `  ${label}: ${leg.status.toUpperCase()}${suffix}`;
 }
 
@@ -1730,6 +1772,14 @@ function actionsPinStatusLabel(status: ActionsPinRepoStatus): string {
  * just did" ({@link deployPhaseSummaryLines}), then "what to do now"
  * ({@link launchNextStepLines}) — deliberately AFTER `remainingDeploy`
  * (requirement 5: "the end of the output is the operator's next step").
+ *
+ * `statusNextStep` (groundnuty/macf#1212) is `undefined` by default — no
+ * status-command line renders — so every existing 5-arg-or-fewer call site
+ * keeps compiling and rendering BYTE-IDENTICALLY. When given
+ * `{ manifestPath, flags }`, {@link bootstrapStatusNextStepLines} renders
+ * immediately before `remainingDeploy`'s deploy commands (see that
+ * function's own doc for the full ordering rationale — status confirms,
+ * deploy acts, and confirming-before-acting is the point).
  */
 export function formatApplyResult(
   result: FleetApplyResult,
@@ -1737,6 +1787,7 @@ export function formatApplyResult(
   remainingDeploy: RemainingDeployReport = { steps: [] },
   deployPhase?: DeployPhaseRenderInput,
   versionPhase?: ApplyVersionPhaseResult,
+  statusNextStep?: { readonly manifestPath: string; readonly flags: DeployFlagsEcho },
 ): string {
   const parts: string[] = [
     `Control repo: ${formatControlRepoLine(result)}`,
@@ -1780,6 +1831,9 @@ export function formatApplyResult(
         'yet, this is not "nothing to do":',
       ...formatUnimplementedLines(unimplemented),
     );
+  }
+  if (statusNextStep !== undefined) {
+    parts.push(...bootstrapStatusNextStepLines(statusNextStep.manifestPath, statusNextStep.flags));
   }
   const remainingDeployLines = formatRemainingDeployLines(remainingDeploy);
   if (remainingDeployLines.length > 0) {
@@ -2753,7 +2807,12 @@ export async function runBootstrapApply(
         );
       } else {
         console.log('');
-        console.log(formatApplyResult(result, plan.unimplementedByApply, remainingDeploy, deployPhase, versionResult));
+        console.log(
+          formatApplyResult(result, plan.unimplementedByApply, remainingDeploy, deployPhase, versionResult, {
+            manifestPath,
+            flags: opts,
+          }),
+        );
       }
       return applyExitCode(result, deployResults, versionResult);
     } finally {
