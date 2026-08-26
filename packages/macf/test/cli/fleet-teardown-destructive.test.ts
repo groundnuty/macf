@@ -193,7 +193,7 @@ describe('runFleetDeleteApps', () => {
             sawInventoryBeforeConfirm = cap.errs.join('\n').includes('demo-fleet-code-agent');
             return true;
           },
-          deleteRegistryVariable: async () => 'deleted',
+          deleteRegistryVariable: async () => 'deregistered',
           archiveRepo: async () => {},
         }),
       );
@@ -207,7 +207,7 @@ describe('runFleetDeleteApps', () => {
     const file = writeManifest();
     const cap = captureConsole();
     try {
-      await runFleetDeleteApps({ file, yes: true }, deleteAppsDepsFor({ deleteRegistryVariable: async () => 'deleted', archiveRepo: async () => {} }));
+      await runFleetDeleteApps({ file, yes: true }, deleteAppsDepsFor({ deleteRegistryVariable: async () => 'deregistered', archiveRepo: async () => {} }));
       const text = cap.errs.join('\n');
       expect(text).toMatch(/RECOVERABLE/);
       expect(text).toMatch(/ARCHIVED \(reversible via `apply`\)/);
@@ -228,7 +228,7 @@ describe('runFleetDeleteApps', () => {
         deleteAppsDepsFor({
           deleteRegistryVariable: async (_r, name) => {
             deleted.push(name);
-            return 'deleted';
+            return 'deregistered';
           },
           archiveRepo: async (repo) => {
             archived.push(repo);
@@ -251,7 +251,7 @@ describe('runFleetDeleteApps', () => {
     try {
       const code = await runFleetDeleteApps(
         { file, yes: true },
-        deleteAppsDepsFor({ deleteRegistryVariable: async () => 'deleted', archiveRepo: async () => {} }),
+        deleteAppsDepsFor({ deleteRegistryVariable: async () => 'deregistered', archiveRepo: async () => {} }),
       );
       expect(code).toBe(1);
       const out = cap.logs.join('\n') + cap.errs.join('\n');
@@ -309,7 +309,7 @@ describe('runFleetDeleteApps', () => {
       const code = await runFleetDeleteApps(
         { file, yes: true },
         deleteAppsDepsFor({
-          deleteRegistryVariable: async () => 'deleted',
+          deleteRegistryVariable: async () => 'deregistered',
           archiveRepo: async () => {},
           checkAppPresence: async () => 'absent',
         }),
@@ -333,7 +333,7 @@ describe('runFleetDeleteApps', () => {
       const code = await runFleetDeleteApps(
         { file, yes: true },
         deleteAppsDepsFor({
-          deleteRegistryVariable: async () => 'deleted',
+          deleteRegistryVariable: async () => 'deregistered',
           archiveRepo: async () => {},
           checkAppPresence: async () => 'unknown',
         }),
@@ -354,11 +354,11 @@ describe('runFleetDeleteApps', () => {
     try {
       const code = await runFleetDeleteApps(
         { file, yes: true, json: true },
-        deleteAppsDepsFor({ deleteRegistryVariable: async () => 'deleted', archiveRepo: async () => {} }),
+        deleteAppsDepsFor({ deleteRegistryVariable: async () => 'deregistered', archiveRepo: async () => {} }),
       );
       expect(code).toBe(1);
       const parsed = JSON.parse(cap.logs.join('\n')) as { schema_version: number; mode: string; app_outcomes: { status: string }[] };
-      expect(parsed.schema_version).toBe(1);
+      expect(parsed.schema_version).toBe(2);
       expect(parsed.mode).toBe('delete-apps');
       expect(parsed.app_outcomes).toHaveLength(1);
       expect(parsed.app_outcomes[0]?.status).toBe('manual-action-required');
@@ -374,7 +374,7 @@ describe('runFleetDeleteApps', () => {
       const code = await runFleetDeleteApps({ file, yes: true, json: true }, deleteAppsDepsFor({ checkMeta: async () => ({ presence: 'absent' }) }));
       expect(code).toBe(1);
       const parsed = JSON.parse(cap.logs.join('\n')) as { schema_version: number; gate: { allowed: boolean } };
-      expect(parsed.schema_version).toBe(1);
+      expect(parsed.schema_version).toBe(2);
       expect(parsed.gate.allowed).toBe(false);
     } finally {
       cap.restore();
@@ -473,7 +473,7 @@ describe('runFleetDestroy', () => {
             sawInventoryBeforeConfirm = cap.errs.join('\n').includes('NO UNDO, EVER') && cap.errs.join('\n').includes('groundnuty/demo-code');
             return 'demo-fleet';
           },
-          deleteRegistryVariable: async () => 'deleted',
+          deleteRegistryVariable: async () => 'deregistered',
           deleteRepo: async () => 'deleted',
         }),
       );
@@ -489,7 +489,7 @@ describe('runFleetDestroy', () => {
     try {
       await runFleetDestroy(
         { file, ...ALL_ACKS },
-        allAcksDeps({ confirmFleetName: async () => 'demo-fleet', deleteRegistryVariable: async () => 'deleted', deleteRepo: async () => 'deleted' }),
+        allAcksDeps({ confirmFleetName: async () => 'demo-fleet', deleteRegistryVariable: async () => 'deregistered', deleteRepo: async () => 'deleted' }),
       );
       const text = cap.errs.join('\n');
       const recoverableIdx = text.indexOf('RECOVERABLE');
@@ -516,7 +516,7 @@ describe('runFleetDestroy', () => {
           confirmFleetName: async () => 'demo-fleet',
           deleteRegistryVariable: async (_r, name) => {
             deletedVars.push(name);
-            return 'deleted';
+            return 'deregistered';
           },
           deleteRepo: async (repo) => {
             deletedRepos.push(repo);
@@ -544,7 +544,7 @@ describe('runFleetDestroy', () => {
         { file, ...ALL_ACKS },
         allAcksDeps({
           confirmFleetName: async () => 'demo-fleet',
-          deleteRegistryVariable: async () => 'deleted',
+          deleteRegistryVariable: async () => 'deregistered',
           deleteRepo: async (repo) => {
             deletionOrder.push(repo);
             return 'deleted';
@@ -565,7 +565,7 @@ describe('runFleetDestroy', () => {
         { file, ...ALL_ACKS },
         allAcksDeps({
           confirmFleetName: async () => 'demo-fleet',
-          deleteRegistryVariable: async () => 'deleted',
+          deleteRegistryVariable: async () => 'deregistered',
           deleteRepo: async (repo) => {
             if (repo.endsWith('-control')) throw new Error('required check blocks delete');
             return 'deleted';
@@ -590,7 +590,7 @@ describe('runFleetDestroy', () => {
         { file, ...ALL_ACKS },
         allAcksDeps({
           confirmFleetName: async () => 'demo-fleet',
-          deleteRegistryVariable: async () => 'deleted',
+          deleteRegistryVariable: async () => 'deregistered',
           deleteRepo: async () => 'deleted',
           shredAgeIdentity: async () => {
             shredCalled = true;
@@ -652,7 +652,7 @@ describe('runFleetDestroy', () => {
         { file, ...ALL_ACKS, shredAgeKey: true, ageIdentity: '/home/op/.age/identity.txt' },
         allAcksDeps({
           confirmFleetName: async () => 'demo-fleet',
-          deleteRegistryVariable: async () => 'deleted',
+          deleteRegistryVariable: async () => 'deregistered',
           deleteRepo: async () => {
             repoDeleteCalled = true;
             return 'deleted';
@@ -684,7 +684,7 @@ describe('runFleetDestroy', () => {
         { file, ...ALL_ACKS, shredAgeKey: true, ageIdentity: '/home/op/.age/identity.txt' },
         allAcksDeps({
           confirmFleetName: async () => 'demo-fleet',
-          deleteRegistryVariable: async () => 'deleted',
+          deleteRegistryVariable: async () => 'deregistered',
           deleteRepo: async (repo) => {
             order.push(`delete-repo:${repo}`);
             return 'deleted';
@@ -714,7 +714,7 @@ describe('runFleetDestroy', () => {
       const code = await runFleetDestroy({ file, destroyRepositories: false, json: true }, destroyDepsFor());
       expect(code).toBe(1);
       const parsed = JSON.parse(cap.logs.join('\n')) as { schema_version: number; mode: string; acknowledgments_missing: string[] };
-      expect(parsed.schema_version).toBe(1);
+      expect(parsed.schema_version).toBe(2);
       expect(parsed.mode).toBe('destroy');
       expect(parsed.acknowledgments_missing.length).toBeGreaterThan(0);
     } finally {
@@ -732,7 +732,7 @@ describe('runFleetDestroy', () => {
       );
       expect(code).toBe(1);
       const parsed = JSON.parse(cap.logs.join('\n')) as { schema_version: number; gate: { allowed: boolean } };
-      expect(parsed.schema_version).toBe(1);
+      expect(parsed.schema_version).toBe(2);
       expect(parsed.gate.allowed).toBe(false);
     } finally {
       cap.restore();

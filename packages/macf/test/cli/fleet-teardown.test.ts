@@ -65,7 +65,7 @@ function depsFor(overrides: Partial<FleetTeardownDeps> = {}): FleetTeardownDeps 
     checkMeta: async () => ({ presence: 'present', archived: false }),
     readManifestFile: async () => FLEET_YAML,
     checkRegistryPresence: async () => 'present',
-    deleteRegistryVariable: async () => 'deleted',
+    deleteRegistryVariable: async () => 'deregistered',
     archiveRepo: async () => {
       throw new Error('must not be called — this test did not override archiveRepo');
     },
@@ -142,7 +142,7 @@ describe('runFleetDeactivate', () => {
           readManifestFile: async () => FLEET_YAML.replace('name: demo-fleet', 'name: some-other-fleet'),
           deleteRegistryVariable: async () => {
             deleteCalled = true;
-            return 'deleted';
+            return 'deregistered';
           },
           confirm: async () => {
             confirmCalled = true;
@@ -169,7 +169,7 @@ describe('runFleetDeactivate', () => {
         depsFor({
           deleteRegistryVariable: async () => {
             deleteCalled = true;
-            return 'deleted';
+            return 'deregistered';
           },
           confirm: async () => false,
         }),
@@ -191,7 +191,7 @@ describe('runFleetDeactivate', () => {
         depsFor({
           deleteRegistryVariable: async (_registry, name) => {
             deleted.push(name);
-            return 'deleted';
+            return 'deregistered';
           },
         }),
       );
@@ -223,12 +223,40 @@ describe('runFleetDeactivate', () => {
     }
   });
 
-  it('already-absent targets do NOT fail the run — deactivate is idempotent-on-rerun (e.g. federated_cas, which nothing writes yet)', async () => {
+  it('absent targets do NOT fail the run — deactivate is idempotent-on-rerun (e.g. federated_cas, which nothing writes yet)', async () => {
     const file = writeManifest();
     const cap = captureConsole();
     try {
-      const code = await runFleetDeactivate({ file, yes: true }, depsFor({ deleteRegistryVariable: async () => 'already-absent' }));
+      const code = await runFleetDeactivate({ file, yes: true }, depsFor({ deleteRegistryVariable: async () => 'absent' }));
       expect(code).toBe(0);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  // --- groundnuty/macf#1206 — the honest-unknown floor at the CLI layer ---
+
+  it('unknown outcomes force a non-zero exit, distinct from a clean absent/deregistered run', async () => {
+    const file = writeManifest();
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeactivate({ file, yes: true }, depsFor({ deleteRegistryVariable: async () => 'unknown' }));
+      expect(code).toBe(1);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('--json renders unknown outcomes distinctly from absent, with a diagnostic reason', async () => {
+    const file = writeManifest();
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeactivate({ file, yes: true, json: true }, depsFor({ deleteRegistryVariable: async () => 'unknown' }));
+      expect(code).toBe(1);
+      const parsed = JSON.parse(cap.logs.join('\n')) as { outcomes: { status: string; reason?: string }[] };
+      expect(parsed.outcomes.every((o) => o.status === 'unknown')).toBe(true);
+      expect(parsed.outcomes.some((o) => o.status === 'absent')).toBe(false);
+      expect(parsed.outcomes.every((o) => typeof o.reason === 'string' && o.reason.length > 0)).toBe(true);
     } finally {
       cap.restore();
     }
@@ -241,7 +269,7 @@ describe('runFleetDeactivate', () => {
       const code = await runFleetDeactivate({ file, yes: true, json: true }, depsFor());
       expect(code).toBe(0);
       const parsed = JSON.parse(cap.logs.join('\n')) as { schema_version: number; mode: string; fleet: string; outcomes: unknown[] };
-      expect(parsed.schema_version).toBe(1);
+      expect(parsed.schema_version).toBe(2);
       expect(parsed.mode).toBe('deactivate');
       expect(parsed.fleet).toBe('demo-fleet');
       expect(parsed.outcomes).toHaveLength(3);
@@ -260,7 +288,7 @@ describe('runFleetDeactivate', () => {
       );
       expect(code).toBe(1);
       const parsed = JSON.parse(cap.logs.join('\n')) as { schema_version: number; gate: { allowed: boolean } };
-      expect(parsed.schema_version).toBe(1);
+      expect(parsed.schema_version).toBe(2);
       expect(parsed.gate.allowed).toBe(false);
     } finally {
       cap.restore();
@@ -289,7 +317,7 @@ describe('runFleetDeactivate', () => {
           },
           deleteRegistryVariable: async (_registry, name) => {
             deletedNames.push(name);
-            return 'deleted';
+            return 'deregistered';
           },
         }),
       );
@@ -313,7 +341,7 @@ describe('runFleetDeactivate', () => {
           checkAgentReachability: async () => 'unknown',
           deleteRegistryVariable: async (_registry, name) => {
             if (name === 'DEMO_FLEET_AGENT_CODE_AGENT') throw new Error('must not be called for an unreachable agent');
-            return 'deleted';
+            return 'deregistered';
           },
         }),
       );
@@ -338,7 +366,7 @@ describe('runFleetDeactivate', () => {
           checkRegistryPresence: async () => 'present', // never confirms
           deleteRegistryVariable: async (_registry, name) => {
             deletedNames.push(name);
-            return 'deleted';
+            return 'deregistered';
           },
         }),
       );
@@ -414,7 +442,7 @@ describe('runFleetArchive', () => {
         depsFor({
           deleteRegistryVariable: async (_registry, name) => {
             deleted.push(name);
-            return 'deleted';
+            return 'deregistered';
           },
           archiveRepo: async (repo) => {
             archived.push(repo);
@@ -442,7 +470,7 @@ describe('runFleetArchive', () => {
           readManifestFile: async () => undefined,
           deleteRegistryVariable: async () => {
             deleteCalled = true;
-            return 'deleted';
+            return 'deregistered';
           },
           archiveRepo: async () => {
             archiveCalled = true;

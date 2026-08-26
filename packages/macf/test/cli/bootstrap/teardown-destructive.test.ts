@@ -242,7 +242,7 @@ agents:
     const plan = await buildDeleteAppsPlan(MANIFEST, { ...ownDeps(), readFleetLock: async () => LOCK_YAML_WITH_RUNNER_OPS });
     const logs: string[] = [];
     const result = await executeDeleteApps(MANIFEST, plan, (l) => logs.push(l), {
-      deleteRegistryVariable: async () => 'deleted',
+      deleteRegistryVariable: async () => 'deregistered',
       checkMeta: async () => ({ presence: 'present', archived: false }),
       archiveRepo: async () => {},
     });
@@ -260,7 +260,7 @@ agents:
     const plan = await buildDestroyPlan(MANIFEST, { ...ownDeps(), readFleetLock: async () => LOCK_YAML_WITH_RUNNER_OPS });
     const logs: string[] = [];
     const result = await executeDestroy(MANIFEST, plan, (l) => logs.push(l), {
-      deleteRegistryVariable: async () => 'deleted',
+      deleteRegistryVariable: async () => 'deregistered',
       deleteRepo: async () => 'deleted',
     });
     expect(result.appOutcomes).toHaveLength(3);
@@ -351,7 +351,7 @@ describe('executeDeleteApps', () => {
     const result = await executeDeleteApps(MANIFEST, plan, (l) => logs.push(l), {
       deleteRegistryVariable: async (_r, name) => {
         deletedNames.push(name);
-        return 'deleted';
+        return 'deregistered';
       },
       // groundnuty/macf#1033 — `delete-apps` is explicitly OUT OF SCOPE for
       // the graceful-stop feature; 'dead' keeps every agent_registration
@@ -377,7 +377,7 @@ describe('executeDeleteApps', () => {
     // implementation ever reached for one, this would be a TYPE error, not
     // just a runtime one. This test documents that structural guarantee.
     const result = await executeDeleteApps(MANIFEST, plan, () => {}, {
-      deleteRegistryVariable: async () => 'deleted',
+      deleteRegistryVariable: async () => 'deregistered',
       checkMeta: async () => ({ presence: 'present', archived: false }),
       archiveRepo: async () => {},
     });
@@ -527,7 +527,7 @@ describe('executeDestroy', () => {
     const result = await executeDestroy(MANIFEST, plan, () => {}, {
       deleteRegistryVariable: async (_r, name) => {
         deletedVars.push(name);
-        return 'deleted';
+        return 'deregistered';
       },
       // groundnuty/macf#1033 — `destroy` is explicitly OUT OF SCOPE for the
       // graceful-stop feature; 'dead' keeps every agent_registration target

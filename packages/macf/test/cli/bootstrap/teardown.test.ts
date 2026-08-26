@@ -317,13 +317,13 @@ describe('executeDeactivate', () => {
     const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
       deleteRegistryVariable: async (registry, name) => {
         calls.push({ registry, name });
-        return 'deleted';
+        return 'deregistered';
       },
       checkRegistryPresence: async () => 'absent',
       ...agentStopDeps(),
     };
     const outcomes = await executeDeactivate(MANIFEST, targets, deps);
-    expect(outcomes.every((o) => o.status === 'deleted')).toBe(true);
+    expect(outcomes.every((o) => o.status === 'deregistered')).toBe(true);
     expect(calls.map((c) => c.name).sort()).toEqual(targets.map((t) => t.name).sort());
   });
 
@@ -343,7 +343,7 @@ describe('executeDeactivate', () => {
     const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
       deleteRegistryVariable: async (_registry, name) => {
         touchedNames.push(name);
-        return 'deleted';
+        return 'deregistered';
       },
       checkRegistryPresence: async () => 'absent',
       ...agentStopDeps(),
@@ -357,15 +357,85 @@ describe('executeDeactivate', () => {
     expect(touchedNames).toHaveLength(4);
   });
 
-  it('already-absent (404) is reported faithfully, NOT as a failure — deactivate is idempotent-on-rerun', async () => {
+  it('absent (404) is reported faithfully, NOT as a failure — deactivate is idempotent-on-rerun', async () => {
     const targets = computeDeactivateTargets(MANIFEST);
     const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
-      deleteRegistryVariable: async () => 'already-absent',
+      deleteRegistryVariable: async () => 'absent',
       checkRegistryPresence: async () => 'absent',
       ...agentStopDeps(),
     };
     const outcomes = await executeDeactivate(MANIFEST, targets, deps);
-    expect(outcomes.every((o) => o.status === 'already-absent')).toBe(true);
+    expect(outcomes.every((o) => o.status === 'absent')).toBe(true);
+    expect(outcomes.every((o) => o.reason === undefined)).toBe(true);
+  });
+
+  // --- groundnuty/macf#1206 — the decisive deregistered/absent/unknown pair ---
+  //
+  // A rung that always reports the SAME status regardless of what actually
+  // happened would satisfy "exists -> deregistered" trivially (a rung that
+  // always claims deregistered "passes" too) — the decisive proof is that
+  // the THREE inputs below produce THREE DIFFERENT, non-failure(-except-
+  // where-genuinely-indeterminate) statuses, per `assert-the-wrong-path.md`.
+
+  it('DECISIVE 1/3: the variable EXISTS (delete succeeds) -> reported deregistered', async () => {
+    const targets = computeDeactivateTargets(MANIFEST);
+    const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
+      deleteRegistryVariable: async () => 'deregistered',
+      checkRegistryPresence: async () => 'absent',
+      ...agentStopDeps(),
+    };
+    const outcomes = await executeDeactivate(MANIFEST, targets, deps);
+    expect(outcomes.every((o) => o.status === 'deregistered')).toBe(true);
+    expect(outcomes.every((o) => o.reason === undefined)).toBe(true);
+  });
+
+  it('DECISIVE 2/3: the variable does NOT exist (404) -> reported absent, and the rung does NOT fail', async () => {
+    const targets = computeDeactivateTargets(MANIFEST);
+    const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
+      deleteRegistryVariable: async () => 'absent',
+      checkRegistryPresence: async () => 'absent',
+      ...agentStopDeps(),
+    };
+    const outcomes = await executeDeactivate(MANIFEST, targets, deps);
+    expect(outcomes.every((o) => o.status === 'absent')).toBe(true);
+    // "the rung does not fail" — no outcome reads 'failed', and every
+    // outcome is free of a reason (an 'absent' outcome has nothing to
+    // diagnose; a 'failed' one would carry one).
+    expect(outcomes.some((o) => o.status === 'failed')).toBe(false);
+    expect(outcomes.every((o) => o.reason === undefined)).toBe(true);
+  });
+
+  it('DECISIVE 3/3: presence is INDETERMINATE (delete attempt inconclusive) -> reported unknown, distinct from absent, carrying a reason', async () => {
+    const targets = computeDeactivateTargets(MANIFEST);
+    const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
+      deleteRegistryVariable: async () => 'unknown',
+      checkRegistryPresence: async () => 'absent',
+      ...agentStopDeps(),
+    };
+    const outcomes = await executeDeactivate(MANIFEST, targets, deps);
+    expect(outcomes.every((o) => o.status === 'unknown')).toBe(true);
+    // Distinct from 'absent' in BOTH the status literal AND the reason text
+    // — an 'unknown' outcome is NEVER textually indistinguishable from a
+    // confirmed-absent one (honest-unknown floor).
+    expect(outcomes.some((o) => o.status === 'absent')).toBe(false);
+    expect(outcomes.every((o) => o.reason !== undefined && o.reason.length > 0)).toBe(true);
+    expect(outcomes.every((o) => /could not confirm/i.test(o.reason ?? ''))).toBe(true);
+  });
+
+  it('an unknown outcome for an agent_registration target (the "dead" direct-delete path) ALSO carries a reason, not just the fleet-scope targets', async () => {
+    const targets = computeDeactivateTargets(MANIFEST);
+    const codeAgentTarget = targets.find((t) => t.kind === 'agent_registration' && t.role === 'code-agent');
+    if (!codeAgentTarget) throw new Error('fixture invariant broken');
+    const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
+      deleteRegistryVariable: async () => 'unknown',
+      checkRegistryPresence: async () => 'absent',
+      ...agentStopDeps({ checkAgentReachability: async () => 'dead' }),
+    };
+    const outcomes = await executeDeactivate(MANIFEST, targets, deps);
+    const codeOutcome = outcomes.find((o) => o.target.name === codeAgentTarget.name);
+    expect(codeOutcome?.status).toBe('unknown');
+    expect(codeOutcome?.agentStopCategory).toBe('deregistered-directly');
+    expect(codeOutcome?.reason).toMatch(/could not confirm/i);
   });
 
   it('one target failing does NOT abort the rest — every target is attempted, failures isolated per-target', async () => {
@@ -375,7 +445,7 @@ describe('executeDeactivate', () => {
       deleteRegistryVariable: async (_registry, name) => {
         calls += 1;
         if (name === targets[1]?.name) throw new Error('rate limited');
-        return 'deleted';
+        return 'deregistered';
       },
       checkRegistryPresence: async () => 'absent',
       ...agentStopDeps(),
@@ -385,7 +455,7 @@ describe('executeDeactivate', () => {
     const failed = outcomes.filter((o) => o.status === 'failed');
     expect(failed).toHaveLength(1);
     expect(failed[0]?.reason).toMatch(/rate limited/);
-    expect(outcomes.filter((o) => o.status === 'deleted')).toHaveLength(targets.length - 1);
+    expect(outcomes.filter((o) => o.status === 'deregistered')).toHaveLength(targets.length - 1);
   });
 
   it('every deleteRegistryVariable call carries manifest.owner.registry — structurally, this module cannot reach a repo-scoped path (no repo parameter exists on the interface)', async () => {
@@ -394,7 +464,7 @@ describe('executeDeactivate', () => {
     const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
       deleteRegistryVariable: async (registry) => {
         registriesSeen.push(registry);
-        return 'deleted';
+        return 'deregistered';
       },
       checkRegistryPresence: async () => 'absent',
       ...agentStopDeps(),
@@ -417,7 +487,7 @@ describe('executeDeactivate', () => {
     const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
       deleteRegistryVariable: async (_registry, name) => {
         deleteCalledFor.push(name);
-        return 'deleted';
+        return 'deregistered';
       },
       checkRegistryPresence: async (_registry, name) => {
         if (name !== codeAgentTarget.name) return 'absent';
@@ -452,7 +522,7 @@ describe('executeDeactivate', () => {
     const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
       deleteRegistryVariable: async (_registry, name) => {
         deleteCalledFor.push(name);
-        return 'deleted';
+        return 'deregistered';
       },
       checkRegistryPresence: async () => 'present',
       ...agentStopDeps({ checkAgentReachability: async () => 'dead' }),
@@ -462,7 +532,7 @@ describe('executeDeactivate', () => {
     const codeOutcome = outcomes.find((o) => o.target.name === codeAgentTarget.name);
 
     expect(deleteCalledFor).toContain(codeAgentTarget.name);
-    expect(codeOutcome?.status).toBe('deleted');
+    expect(codeOutcome?.status).toBe('deregistered');
     expect(codeOutcome?.agentStopCategory).toBe('deregistered-directly');
   });
 
@@ -495,7 +565,7 @@ describe('executeDeactivate', () => {
     const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
       deleteRegistryVariable: async (_registry, name) => {
         deleteCalledFor.push(name);
-        return 'deleted';
+        return 'deregistered';
       },
       // Always present — the agent never confirms self-deregister.
       checkRegistryPresence: async () => 'present',
@@ -519,7 +589,7 @@ describe('executeDeactivate', () => {
     const deps: Pick<TeardownVariableDeps, 'deleteRegistryVariable' | 'checkRegistryPresence'> & TeardownAgentDeps = {
       deleteRegistryVariable: async (_registry, name) => {
         deletedNames.push(name);
-        return 'deleted';
+        return 'deregistered';
       },
       // Every agent target's slot reads absent on the FIRST poll (immediate
       // self-deregister); the fleet-scope targets (ca_registry/federated_cas)
