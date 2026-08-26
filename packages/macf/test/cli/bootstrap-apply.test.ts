@@ -3475,6 +3475,24 @@ describe('runBootstrapApply — remaining-deploy honest completion (macf#1014)',
     expect(out).toContain('git pull');
   });
 
+  it('groundnuty/macf#1212 — the real runBootstrapApply entrypoint (not just the pure formatApplyResult unit) prints "confirm the fleet is green" BEFORE the per-agent deploy commands, echoing the SAME -f path apply itself was invoked with', async () => {
+    const file = writeManifest();
+    const checkDeployPathExists = (p: string): boolean => p === DEMO_REPOS_PARENT;
+    const code = await runBootstrapApply(
+      { file, yes: true },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists },
+      fakeMutateDeps(file),
+    );
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    expect(out).toContain(`macf bootstrap status -f ${file}`);
+    const statusIdx = out.indexOf('confirm the fleet is green');
+    const deployIdx = out.indexOf('macf fleet deploy --agent code-agent');
+    expect(statusIdx).toBeGreaterThan(-1);
+    expect(deployIdx).toBeGreaterThan(-1);
+    expect(statusIdx).toBeLessThan(deployIdx);
+  });
+
   it('echoes the --vault/--identity-key flags apply was ITSELF invoked with into every deploy command, and OMITS the vault-location note', async () => {
     const file = writeManifest();
     const checkDeployPathExists = (p: string): boolean => p === DEMO_REPOS_PARENT;
@@ -4145,6 +4163,10 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(applyExitCode(result)).toBe(0);
   });
 
+  it('applyExitCode: 0 when a routing leg is PENDING — an honest incomplete for a runner apply itself just provisioned, NOT a failure (groundnuty/macf#1212 operator ruling: "we cannot report an error... it sounds like the user\'s problem")', () => {
+    expect(applyExitCode(resultWith({ routing: { 'x/y': { status: 'pending', reason: 'still provisioning' } } }))).toBe(0);
+  });
+
   it('applyExitCode: 1 when a routing leg failed', () => {
     expect(applyExitCode(resultWith({ routing: { 'x/y': { status: 'failed', reason: 'boom' } } }))).toBe(1);
   });
@@ -4308,6 +4330,16 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     );
     expect(text).toMatch(/groundnuty\/x: FAILED — no self-hosted runner is confirmed registered/);
     expect(text).not.toMatch(/groundnuty\/x: SKIPPED/);
+  });
+
+  it('formatApplyResult renders a PENDING routing leg with its reason, distinct from FAILED — groundnuty/macf#1212', () => {
+    const text = formatApplyResult(
+      resultWith({
+        routing: { 'groundnuty/x': { status: 'pending', reason: 'still provisioning, 30s/600s elapsed' } },
+      }),
+    );
+    expect(text).toMatch(/groundnuty\/x: PENDING — still provisioning, 30s\/600s elapsed/);
+    expect(text).not.toMatch(/groundnuty\/x: FAILED/);
   });
 
   it('fleetApplyResultToJson never includes a CA cert/key value and carries ca + routing verbatim otherwise', () => {
@@ -4670,6 +4702,80 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
 
   it('applyExitCode: HALTED still forces a non-zero exit, exactly as before #1053', () => {
     expect(applyExitCode(resultWith({}), [], { attempted: true, target: '0.2.57', halted: true })).toBe(1);
+  });
+});
+
+// --- groundnuty/macf#1212 — the operator's ruling on the CLOSING output:
+// "after the apply and before the deployment... I should be encouraged to
+// run the status to see that everything is green." Status confirms; deploy
+// acts; the order matters (printing deploy first invites skipping the
+// check). `formatApplyResult`'s 6th param is `undefined` by default, so
+// every pre-#1212 call site above keeps rendering byte-identically —
+// pinned by the ABSENCE of the status line in every test that doesn't pass
+// it.
+describe('formatApplyResult — the "confirm the fleet is green" next-step line (groundnuty/macf#1212)', () => {
+  it('renders nothing when statusNextStep is omitted — every pre-#1212 call site is unaffected', () => {
+    const text = formatApplyResult(resultWith({}));
+    expect(text).not.toMatch(/confirm the fleet is green/i);
+    expect(text).not.toMatch(/bootstrap status/);
+  });
+
+  it('renders the exact copy-pasteable command, echoing ONLY the flags apply itself received (no vault/identity-key supplied)', () => {
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, undefined, {
+      manifestPath: '/home/op/fleet.yaml',
+      flags: {},
+    });
+    expect(text).toContain('Next step — confirm the fleet is green:');
+    expect(text).toContain('macf bootstrap status -f /home/op/fleet.yaml');
+    expect(text).not.toContain('--vault');
+    expect(text).not.toContain('--identity-key');
+  });
+
+  it('echoes --vault/--identity-key VERBATIM when apply itself was invoked with them', () => {
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, undefined, {
+      manifestPath: '/home/op/fleet.yaml',
+      flags: { vaultPath: '/home/op/secrets/vault.age', identityKeyPath: '/home/op/.age/identity.key' },
+    });
+    expect(text).toContain('macf bootstrap status -f /home/op/fleet.yaml --vault /home/op/secrets/vault.age --identity-key /home/op/.age/identity.key');
+  });
+
+  it('DECISIVE ordering: the status line appears BEFORE the per-agent fleet-deploy commands, never after', () => {
+    const text = formatApplyResult(
+      resultWith({}),
+      [],
+      {
+        steps: [
+          { role: 'code-agent', deployPath: '/x/code-agent', presence: 'not-deployed', command: 'macf fleet deploy --agent code-agent -f /home/op/fleet.yaml' },
+        ],
+      },
+      undefined,
+      undefined,
+      { manifestPath: '/home/op/fleet.yaml', flags: {} },
+    );
+    const statusIdx = text.indexOf('confirm the fleet is green');
+    const deployIdx = text.indexOf('macf fleet deploy --agent code-agent');
+    expect(statusIdx).toBeGreaterThan(-1);
+    expect(deployIdx).toBeGreaterThan(-1);
+    expect(statusIdx).toBeLessThan(deployIdx);
+  });
+
+  it('DECISIVE: N declared agents produce N deploy commands (groundnuty/macf#1014, unaffected by #1212 — pinning the pre-existing per-agent behavior the ordering test above builds on)', () => {
+    const text = formatApplyResult(resultWith({}), [], {
+      steps: [
+        { role: 'code-agent', deployPath: '/x/code-agent', presence: 'not-deployed', command: 'macf fleet deploy --agent code-agent -f /home/op/fleet.yaml' },
+        { role: 'science-agent', deployPath: '/x/science-agent', presence: 'not-deployed', command: 'macf fleet deploy --agent science-agent -f /home/op/fleet.yaml' },
+      ],
+    });
+    expect(text).toContain('macf fleet deploy --agent code-agent');
+    expect(text).toContain('macf fleet deploy --agent science-agent');
+  });
+
+  it('renders even when remainingDeploy has zero steps — the status check is unconditional, not gated on "something is incomplete"', () => {
+    const text = formatApplyResult(resultWith({}), [], { steps: [] }, undefined, undefined, {
+      manifestPath: '/home/op/fleet.yaml',
+      flags: {},
+    });
+    expect(text).toContain('confirm the fleet is green');
   });
 });
 
