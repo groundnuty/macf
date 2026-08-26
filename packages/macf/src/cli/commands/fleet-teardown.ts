@@ -38,7 +38,17 @@ import type {
 } from '../bootstrap/teardown.js';
 import { buildArchivePlan, buildDeactivatePlan, executeArchiveRepos, executeDeactivate } from '../bootstrap/teardown.js';
 
-export const FLEET_TEARDOWN_JSON_SCHEMA_VERSION = 1;
+/**
+ * `groundnuty/macf#1206` bumped this 1 -> 2: `outcomes[].status`'s literal
+ * values changed (`'deleted'`/`'already-absent'` -> `'deregistered'`/
+ * `'absent'`, plus a new `'unknown'` value) — a same-name field changing
+ * meaning, per the precedent `routing-doctor.ts`'s `schema_version` set
+ * (3->4 for #1192's new artifact-check status, 4->5 for #1199's new
+ * config-read statuses): adding/renaming literals an existing consumer
+ * might match against IS a breaking change to the field's contract, even
+ * though the field's NAME and the JSON shape around it are unchanged.
+ */
+export const FLEET_TEARDOWN_JSON_SCHEMA_VERSION = 2;
 
 export interface RunFleetTeardownOptions {
   readonly file: string;
@@ -306,9 +316,17 @@ function deactivateResultToJson(result: DeactivateResult): unknown {
   };
 }
 
+/**
+ * `groundnuty/macf#1206` — `'unknown'` forces non-zero exit, same as
+ * `'failed'`. `'deregistered'`/`'absent'` are confirmed outcomes (idempotent
+ * rerun rail — module doc) and stay green; `'unknown'` means the delete
+ * attempt could not confirm what happened, which is exactly "could not be
+ * done" (`teardown.ts`'s own "report what could not be done, never exit
+ * green" rail) — an unconfirmed outcome must not read as a clean run.
+ */
 function deactivateExitCode(result: DeactivateResult): number {
   if (!result.gate.allowed) return 1;
-  return result.outcomes.some((o) => o.status === 'failed') ? 1 : 0;
+  return result.outcomes.some((o) => o.status === 'failed' || o.status === 'unknown') ? 1 : 0;
 }
 
 /**
