@@ -131,12 +131,15 @@ const SENTINEL_CA_KEY_PEM = 'SENTINEL-CA-KEY-PEM';
 const SENTINEL_CA_CERT_PEM = 'SENTINEL-CA-CERT-PEM';
 /**
  * macf#929 — `baseDeps`'s default `runnerToken`. `trustDepsFor()`'s own
- * default already reports `checkRunnerUsableByRepo` as `'present'`, so this
- * sentinel exists ONLY to satisfy the NEW POLICY precondition
- * (`publishTrustedActorsGated` refuses outright with no token, independent of
- * live usability) — every pre-existing "routing var gets written" fixture in
- * this file keeps exercising the write path unchanged. The dedicated
- * no-token-refuses test below overrides this to `undefined` explicitly.
+ * default already reports `checkRunnerUsableByRepo` as `'present'`, so a
+ * write would succeed with or without this sentinel post-groundnuty/macf#1195
+ * (a token no longer gates USE, only WAITING — see `apply-routing.ts`'s
+ * top-level #1195 paragraph). Kept as the default anyway so every
+ * pre-existing "routing var gets written" fixture in this file stays
+ * unambiguous about which code path it exercises (token-supplied poll path,
+ * not the separate no-token single-check path) without needing to reason
+ * about the newer branch. The dedicated no-token tests below override this
+ * to `undefined` explicitly.
  */
 const SENTINEL_RUNNER_TOKEN = 'SENTINEL-RUNNER-TOKEN';
 /**
@@ -2804,13 +2807,19 @@ agents:
         expect(logs.join('\n')).not.toContain(SENTINEL_SECRET);
       });
 
-      it('the call is attempted regardless of whether --runner-token was supplied — provisioning and the routing-var policy gate are independent (Amendment I2)', async () => {
+      it('the call is attempted regardless of whether --runner-token was supplied — provisioning and the routing-var live-check are independent seams (Amendment I2, corrected groundnuty/macf#1195)', async () => {
         const manifestPath = manifestPathIn();
         const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
         let fetchCalled = false;
         const deps: FleetApplyDeps = {
           ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
-          runnerToken: undefined, // the routing-var POLICY gate refuses outright
+          runnerToken: undefined,
+          // Decoupled from the mocked provisioning-ok fetch below —
+          // demonstrates the routing outcome is governed by ITS OWN
+          // observation (checkRunnerUsableByRepo), never by whether
+          // provisioning happened to report 'ok' this run.
+          trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+          runnerTokenPollOptions: { timeoutMs: 0 },
           runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
           runnerPlatformFetch: (async () => {
             fetchCalled = true;
@@ -2820,9 +2829,15 @@ agents:
 
         const result = await applyFleet(manifest, manifestPath, null, deps);
 
-        expect(fetchCalled).toBe(true); // provisioning still attempted
+        expect(fetchCalled).toBe(true); // provisioning still attempted, no token needed for that either
         expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('ok');
-        expect(result.routing['groundnuty/demo-code']?.status).toBe('failed'); // the UNRELATED policy gate refused, as it always does without a token
+        // groundnuty/macf#1195 — the routing gate no longer refuses on the
+        // ABSENCE of a token alone; it refuses here because THIS repo's own
+        // live check reported 'absent', independent of provisioning's
+        // separately-mocked 'ok' outcome.
+        expect(result.routing['groundnuty/demo-code']?.status).toBe('failed');
+        const reason = (result.routing['groundnuty/demo-code'] as { reason: string }).reason;
+        expect(reason).toContain('--runner-token');
       });
 
       it('routing.runner NOT declared (hosted-runner fleet) -> the contract is NEVER called, and runnerProvision is empty', async () => {
@@ -2890,13 +2905,45 @@ agents:
 
     // --- macf#929 — the runner-token gate itself, wired end-to-end through applyFleet ---
 
-    it('macf#929: no runner-token supplied -> refuses EVERY confirmed repo outright ("failed", not "skipped") BEFORE any live runner check', async () => {
+    it('groundnuty/macf#1195 DECISIVE: no runner-token supplied but a runner IS confirmed usable -> proceeds and WRITES MACF_TRUSTED_ACTORS for every confirmed repo', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+      let checkRunnerCalled = 0;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRunnerUsableByRepo: async () => {
+            checkRunnerCalled += 1;
+            return { presence: 'present' };
+          },
+        }),
+        runnerToken: undefined,
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      // This is the case the OLD flag-only refusal got wrong: a live,
+      // confirmed-usable runner, no token supplied — a token is for
+      // REGISTERING a runner, never for USING one that already exists.
+      expect(result.routing['groundnuty/demo-code']).toEqual({ status: 'created' });
+      expect(result.routing['groundnuty/demo-science']).toEqual({ status: 'created' });
+      // Consults the EXISTING observation seam once per repo — never zero
+      // (the old, now-corrected shape), never a poll (nothing licenses
+      // waiting without a token).
+      expect(checkRunnerCalled).toBe(2);
+    });
+
+    it('macf#929: no runner-token supplied AND no runner confirmed usable -> refuses EVERY confirmed repo ("failed", not "skipped"), naming --runner-token, ONLY AFTER a live check', async () => {
       const manifestPath = manifestPathIn();
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       let checkRunnerCalled = false;
       const deps: FleetApplyDeps = {
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
-        trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => { checkRunnerCalled = true; return { presence: 'present' }; } }),
+        trustDeps: trustDepsFor({
+          checkRunnerUsableByRepo: async () => {
+            checkRunnerCalled = true;
+            return { presence: 'absent' };
+          },
+        }),
         runnerToken: undefined,
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
@@ -2908,11 +2955,10 @@ agents:
       expect(reason).toContain('--runner-token');
       expect(reason).toContain('MACF_BOOTSTRAP_RUNNER_TOKEN');
       expect(reason).toContain('gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token');
-      // ZERO I/O — the POLICY gate fires before any live runner-usability
-      // check is ever attempted (macf#929: "the token licenses ATTEMPTING
-      // detection, never substitutes for it" — but absence of a token means
-      // detection is never even reached).
-      expect(checkRunnerCalled).toBe(false);
+      // groundnuty/macf#1195 — the check IS attempted (that is the fix); the
+      // refusal is now EVIDENCED by a live read, never assumed from the
+      // flag alone.
+      expect(checkRunnerCalled).toBe(true);
     });
 
     it('macf#929: token supplied but the runner never appears within the poll window -> a SEPARATE, more specific reason than the no-token refusal, and the write seam is never invoked', async () => {
