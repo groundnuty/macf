@@ -2686,6 +2686,11 @@ export async function runBootstrapApply(
     const mutate: MutateApplyDeps = {
       ...(mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath, opts.vaultPath, opts.yes, resolvedTsOauth)),
       observedActionsPins: mutateDeps?.observedActionsPins ?? actionsPinsFromObserved(manifest, observed),
+      // groundnuty/macf#1211 — same "merged on TOP, never through
+      // resolveMutateDeps's own param list" precedent as observedActionsPins
+      // immediately above: the RAW scope-variable value, already read once
+      // by `observed` above, threaded so `applyFleet` never re-reads it.
+      observedRunnerPlatformEndpointScope: mutateDeps?.observedRunnerPlatformEndpointScope ?? observed.runnerPlatformScopeVariable,
     };
     try {
       const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, finalCreations);

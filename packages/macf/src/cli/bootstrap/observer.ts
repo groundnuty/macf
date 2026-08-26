@@ -44,6 +44,7 @@ import {
   vaultTsOauthClientId,
   vaultTsOauthSecret,
 } from './vault-read.js';
+import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR, resolveRunnerPlatformEndpointWithProvenance } from './runner-platform.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -1285,6 +1286,26 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   // doc for why this is a NEW field, not folded into `routingRunnerHandover`.
   const routingRunnerDetail = routingRunnerUsability?.detail;
 
+  // groundnuty/macf#1211 — the runner-provisioning contract's endpoint,
+  // resolved at PLAN time so an unresolvable one is surfaced BEFORE the
+  // operator approves `apply`, not discovered in apply's own non-fatal log
+  // line. Gated the SAME way `apply-fleet.ts` gates the actual provisioning
+  // call (`routing.runner` declared AND `runs_on === 'self-hosted'`) — a
+  // hosted-runner fleet has nothing to resolve, and reading a scope variable
+  // it will never use would be a needless live call. `readRegistryVariable`
+  // is the SAME credential path (and the same `gh api .../actions/variables`
+  // shape) `caRegistry`'s own read above already uses — no new auth path.
+  const runnerPlatformScopeVariable =
+    manifest.routing?.runner?.runs_on === 'self-hosted' ? await readRegistryVariable(manifest.owner.registry, RUNNER_PLATFORM_ENDPOINT_ENV_VAR) : undefined;
+  const runnerPlatformEndpoint =
+    manifest.routing?.runner?.runs_on === 'self-hosted'
+      ? resolveRunnerPlatformEndpointWithProvenance({
+          explicit: undefined, // no per-run override concept at plan time — see `runner-platform.ts`'s doc, tier 1
+          manifestValue: manifest.transport.runner_platform_endpoint,
+          scopeValue: runnerPlatformScopeVariable,
+        })
+      : undefined;
+
   // DR-043 Amendment G — same derived name `control-repo.ts::controlRepoFullName`
   // computes; see this function's doc for why it's re-derived here rather
   // than imported.
@@ -1307,6 +1328,8 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     routingRunnerRegistered,
     routingRunnerHandover,
     routingRunnerDetail,
+    runnerPlatformScopeVariable,
+    runnerPlatformEndpoint,
     controlRepoPresence: controlRepoMeta.presence,
     controlRepoArchived: controlRepoMeta.archived,
     controlRepoActionsPin,

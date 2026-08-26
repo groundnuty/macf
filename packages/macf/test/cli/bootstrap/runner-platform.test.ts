@@ -10,6 +10,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import {
   RUNNER_PLATFORM_ENDPOINT_ENV_VAR,
   resolveRunnerPlatformEndpoint,
+  resolveRunnerPlatformEndpointWithProvenance,
+  describeRunnerPlatformEndpointResolution,
   provisionRunner,
   deprovisionRunner,
   checkRunnerPlatformStatus,
@@ -51,6 +53,93 @@ describe('resolveRunnerPlatformEndpoint (groundnuty/macf#943)', () => {
   it('strips trailing slashes so path-joining never double-slashes', () => {
     expect(resolveRunnerPlatformEndpoint('http://x:8088/')).toBe('http://x:8088');
     expect(resolveRunnerPlatformEndpoint('http://x:8088///')).toBe('http://x:8088');
+  });
+});
+
+describe('resolveRunnerPlatformEndpointWithProvenance (groundnuty/macf#1211)', () => {
+  const savedEnv = process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    else process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR] = savedEnv;
+  });
+
+  it('most explicit wins: flag beats env beats scope beats manifest', () => {
+    process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR] = 'http://env:8088';
+    expect(
+      resolveRunnerPlatformEndpointWithProvenance({ explicit: 'http://flag:8088', manifestValue: 'http://manifest:8088', scopeValue: 'http://scope:8088' }),
+    ).toEqual({ value: 'http://flag:8088', source: 'flag' });
+  });
+
+  it('env wins over scope and manifest when flag is absent', () => {
+    process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR] = 'http://env:8088';
+    expect(resolveRunnerPlatformEndpointWithProvenance({ explicit: undefined, manifestValue: 'http://manifest:8088', scopeValue: 'http://scope:8088' })).toEqual(
+      { value: 'http://env:8088', source: 'env' },
+    );
+  });
+
+  it('scope wins over manifest when flag and env are both absent', () => {
+    delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    expect(resolveRunnerPlatformEndpointWithProvenance({ explicit: undefined, manifestValue: 'http://manifest:8088', scopeValue: 'http://scope:8088' })).toEqual(
+      { value: 'http://scope:8088', source: 'scope' },
+    );
+  });
+
+  it('manifest is the last resort when flag/env/scope are all absent', () => {
+    delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    expect(resolveRunnerPlatformEndpointWithProvenance({ explicit: undefined, manifestValue: 'http://manifest:8088', scopeValue: undefined })).toEqual({
+      value: 'http://manifest:8088',
+      source: 'manifest',
+    });
+  });
+
+  it('DECISIVE: resolves to none — not a guessed default — when nothing supplies a value', () => {
+    delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    expect(resolveRunnerPlatformEndpointWithProvenance({ explicit: undefined, manifestValue: undefined, scopeValue: undefined })).toEqual({
+      value: undefined,
+      source: 'none',
+    });
+  });
+
+  it('empty-string and whitespace-only candidates at every tier are treated as absent, not a valid value', () => {
+    process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR] = '   ';
+    expect(resolveRunnerPlatformEndpointWithProvenance({ explicit: '', manifestValue: '  ', scopeValue: '' })).toEqual({
+      value: undefined,
+      source: 'none',
+    });
+  });
+
+  it('trailing slashes are stripped at every tier, same as the original two-tier resolver', () => {
+    delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    expect(resolveRunnerPlatformEndpointWithProvenance({ explicit: undefined, manifestValue: undefined, scopeValue: 'http://scope:8088///' })).toEqual({
+      value: 'http://scope:8088',
+      source: 'scope',
+    });
+  });
+});
+
+describe('describeRunnerPlatformEndpointResolution (groundnuty/macf#1211)', () => {
+  it('names each source distinctly — flag/env/scope/manifest are never described identically', () => {
+    const descriptions = (['flag', 'env', 'scope', 'manifest'] as const).map((source) =>
+      describeRunnerPlatformEndpointResolution({ value: 'http://x:8088', source }),
+    );
+    expect(new Set(descriptions).size).toBe(4);
+  });
+
+  it('DECISIVE — the resolved value is a URL, never a secret: it is printed VERBATIM, never masked/redacted', () => {
+    const sentinel = 'http://orzech-dev-agents-monitoring.tail491af.ts.net:8088';
+    for (const source of ['flag', 'env', 'scope', 'manifest'] as const) {
+      const text = describeRunnerPlatformEndpointResolution({ value: sentinel, source });
+      expect(text).toContain(sentinel);
+      expect(text).not.toMatch(/\*{3,}|REDACTED|\[hidden\]/i);
+    }
+  });
+
+  it('the "none" description names every tier that was checked, and never fabricates a value', () => {
+    const text = describeRunnerPlatformEndpointResolution({ value: undefined, source: 'none' });
+    expect(text).toContain(RUNNER_PLATFORM_ENDPOINT_ENV_VAR);
+    expect(text).toMatch(/scope/i);
+    expect(text).toContain('transport.runner_platform_endpoint');
+    expect(text).not.toMatch(/https?:\/\//);
   });
 });
 

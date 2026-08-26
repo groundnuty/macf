@@ -34,6 +34,7 @@ import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../../src/cli/bootst
 import { TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_FLAG } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../../src/cli/bootstrap/registry-scope-preflight.js';
 import { validateInstallRepositoryScope } from '../../../src/cli/bootstrap/install-scope.js';
+import type { RunnerPlatformEndpointSource } from '../../../src/cli/bootstrap/runner-platform.js';
 
 /** A minimal, valid, 2-agent manifest — no optional sections. */
 function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
@@ -227,12 +228,13 @@ describe('computePlan — all-match observed state → all noops', () => {
 
     const plan = computePlan(manifest, observed);
     // 5 × 2 agents (app/repo/install/secret_fingerprint/labels) + caRegistry +
-    // 2 caRepo + routing + runner_warm (macf#942) + 2 routing_client + the
-    // fleet-level runner_ops item (groundnuty/macf#943; control_repo item
-    // absent — not archived) + the fleet-level router_app item
+    // 2 caRepo + routing + runner_warm (macf#942) + runner_platform
+    // (groundnuty/macf#1211 — runs_on is self-hosted here) + 2 routing_client
+    // + the fleet-level runner_ops item (groundnuty/macf#943; control_repo
+    // item absent — not archived) + the fleet-level router_app item
     // (groundnuty/macf#1105, UNCONDITIONAL) + the fleet-level ts_oauth item
     // (groundnuty/macf#1109, UNCONDITIONAL).
-    expect(plan.items).toHaveLength(20);
+    expect(plan.items).toHaveLength(21);
     for (const item of plan.items) {
       // `labels`/`runner_warm` are `'write-always'` (groundnuty/macf#926,
       // was `'create'`): they have NO plan-time observed read at all (see
@@ -252,7 +254,7 @@ describe('computePlan — all-match observed state → all noops', () => {
       // degrades to `unknown` → `create` here. See the dedicated describe
       // blocks below (and `plan-item-write-always.test.ts`) for fixtures
       // that DO drive them to `noop`.
-      if (item.kind === 'labels' || item.kind === 'runner_warm') {
+      if (item.kind === 'labels' || item.kind === 'runner_warm' || item.kind === 'runner_platform') {
         expect(item.verb).toBe('write-always');
       } else if (item.kind === 'runner_ops' || item.kind === 'router_app' || item.kind === 'ts_oauth') {
         expect(item.verb).toBe('create');
@@ -576,6 +578,94 @@ describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#
   });
 });
 
+describe('computePlan — runner_platform item (groundnuty/macf#1211)', () => {
+  function platformItem(items: readonly PlanItem[]): PlanItem | undefined {
+    return itemFor(items, 'runner_platform', 'routing:icsoc-2026:runner:platform_endpoint');
+  }
+
+  it('is ABSENT entirely when routing.runner is not declared — same "nothing was promised" gate as routingItem/runnerWarmItem', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(platformItem(plan.items)).toBeUndefined();
+  });
+
+  it('is ABSENT when routing.runner IS declared but runs_on is NOT self-hosted — narrower gate than runnerWarmItem, matching apply-fleet.ts\'s own condition for attempting the provisioning call', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'ubuntu-latest', warm: 1 } } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(platformItem(plan.items)).toBeUndefined();
+    // Sanity: the SIBLING item (runnerWarmItem) is NOT gated this narrowly —
+    // it still fires, proving the two items' gates are genuinely different,
+    // not an accidental byproduct of a shared condition.
+    expect(itemFor(plan.items, 'runner_warm', 'routing:icsoc-2026:runner:warm')).toBeDefined();
+  });
+
+  // --- Decisive pair (assert-the-wrong-path.md — two triggers) ---
+
+  it('DECISIVE 1/2: routing.runner declared + self-hosted + nothing resolves -> plan states runner provisioning will be SKIPPED, non-fatal', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED); // no runnerPlatformEndpoint set
+    const item = platformItem(plan.items);
+    expect(item?.verb).toBe('write-always');
+    expect(item?.confirm_required).toBe(false);
+    expect(item?.reason).toMatch(/not resolved/i);
+    expect(item?.reason).toMatch(/skipped/i);
+    expect(item?.reason).toMatch(/non-fatal/i);
+  });
+
+  it('DECISIVE 2/2: routing.runner declared + self-hosted + endpoint resolves -> NO skip notice — proves the notice is conditional, not unconditional', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, runnerPlatformEndpoint: { value: 'http://runner-platform.example.ts.net:8088', source: 'scope' } };
+    const plan = computePlan(manifest, observed);
+    const item = platformItem(plan.items);
+    expect(item?.verb).toBe('write-always');
+    expect(item?.reason).toMatch(/resolved via/i);
+    expect(item?.reason).not.toMatch(/skipped/i);
+  });
+
+  // --- Provenance — "plan names which source supplied it" ---
+
+  it.each<[RunnerPlatformEndpointSource, RegExp]>([
+    ['flag', /explicit override/i],
+    ['env', /MACF_RUNNER_PLATFORM_ENDPOINT/],
+    ['scope', /scope/i],
+    ['manifest', /transport\.runner_platform_endpoint/],
+  ])('names the "%s" source distinctly in the reason text', (source, expectedPattern) => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, runnerPlatformEndpoint: { value: 'http://x:8088', source } };
+    const plan = computePlan(manifest, observed);
+    expect(platformItem(plan.items)?.reason).toMatch(expectedPattern);
+  });
+
+  it('DECISIVE — the resolved endpoint is a URL, never a secret: it appears VERBATIM in the plan reason, never masked', () => {
+    const sentinel = 'http://orzech-dev-agents-monitoring.tail491af.ts.net:8088';
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, runnerPlatformEndpoint: { value: sentinel, source: 'scope' } };
+    const plan = computePlan(manifest, observed);
+    const reason = platformItem(plan.items)?.reason ?? '';
+    expect(reason).toContain(sentinel);
+    expect(reason).not.toMatch(/\*{3,}|REDACTED|\[hidden\]/i);
+    // The whole PLAN — not just this one item — must never redact it either;
+    // formatPlanText / fleetPlanToJson both pass PlanItem.reason straight
+    // through with no scrubbing step (there is none to scrub a variable).
+    expect(formatPlanText(plan)).toContain(sentinel);
+  });
+
+  it('is exactly ONE item per fleet, not one per agent', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(plan.items.filter((i) => i.kind === 'runner_platform')).toHaveLength(1);
+  });
+
+  it('is IMPLEMENTED by apply for the only verb it can emit (write-always) — apply genuinely resolves + uses this value', () => {
+    expect(planItemApplyCoverage(fakeItem('runner_platform', 'write-always'))).toBe('implemented');
+  });
+
+  it('is never present in unimplementedByApply', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(plan.unimplementedByApply.find((i) => i.kind === 'runner_platform')).toBeUndefined();
+  });
+});
+
 describe('computePlan — an observed extra agent → report-extra, NEVER delete', () => {
   it('emits a report-extra item for an agent in observed but not in the manifest', () => {
     const manifest = baseManifest(); // science-agent + code-agent only
@@ -664,8 +754,10 @@ describe('computePlan — deterministic ordering', () => {
     const kinds = plan.items.map((i) => i.kind);
     // 10 per-agent items, then 3 CA items (registry + 2 agent repos), then
     // 2 routing_client items (one per agent repo), then routing, then
-    // runner_warm (macf#942 — pushed right after routingItem).
-    expect(kinds.slice(-7)).toEqual(['ca', 'ca', 'ca', 'routing_client', 'routing_client', 'routing', 'runner_warm']);
+    // runner_warm (macf#942 — pushed right after routingItem), then
+    // runner_platform (groundnuty/macf#1211 — pushed right after runner_warm,
+    // gated on runs_on === 'self-hosted', true for this fixture).
+    expect(kinds.slice(-8)).toEqual(['ca', 'ca', 'ca', 'routing_client', 'routing_client', 'routing', 'runner_warm', 'runner_platform']);
     const caTargets = plan.items.filter((i) => i.kind === 'ca').map((i) => i.target);
     expect(caTargets).toEqual([
       'ca:registry:ICSOC_2026_CA_CERT',
@@ -750,10 +842,11 @@ describe('summarizePlan', () => {
     // runner_ops create (groundnuty/macf#943) + 1 router_app create
     // (groundnuty/macf#1105, UNCONDITIONAL) + 1 ts_oauth create
     // (groundnuty/macf#1109, UNCONDITIONAL) = 16 creates. + 1 routing
-    // update. `labels` (× 2 agents) + `runner_warm` (macf#942) are
+    // update. `labels` (× 2 agents) + `runner_warm` (macf#942) + `runner_platform`
+    // (groundnuty/macf#1211 — runs_on is self-hosted here) are
     // `'write-always'`, NOT `'create'` (groundnuty/macf#926 — see
-    // `plan-item-write-always.test.ts`), so they count separately: 3.
-    expect(summary).toEqual({ creates: 16, updates: 1, noops: 0, extras: 0, writeAlways: 3 });
+    // `plan-item-write-always.test.ts`), so they count separately: 4.
+    expect(summary).toEqual({ creates: 16, updates: 1, noops: 0, extras: 0, writeAlways: 4 });
   });
 });
 

@@ -185,6 +185,28 @@ export const FleetTransportSchema = z
      * silently omitting it.
      */
     router_app_origin_fleet: z.string().min(1).optional(),
+    /**
+     * groundnuty/macf#1211 — the LOWEST-precedence, narrowest tier of the
+     * runner-provisioning contract's endpoint resolution (see
+     * `runner-platform.ts::resolveRunnerPlatformEndpointWithProvenance` for
+     * the full chain: an explicit per-run override, then
+     * `MACF_RUNNER_PLATFORM_ENDPOINT` (env), then the fleet's `owner.registry`
+     * scope's shared Actions variable — the operator-ruled NORMAL case, set
+     * once per scope, every fleet on it inherits for free — then this field,
+     * then unconfigured).
+     *
+     * **An escape hatch for the unusual fleet, not the intended common
+     * path.** A fleet only needs this when it genuinely wants a DIFFERENT
+     * runner-provisioning platform than its scope's shared one, or as a
+     * fallback while the scope variable has not been set yet. Optional;
+     * undeclared is the expected steady state once a scope variable exists.
+     *
+     * **A variable, never a secret** (the operator's own ruling) — a tailnet
+     * address's access control is reachability, not obscurity. Committing
+     * this to `fleet.yaml` is intentional and safe; do not "harden" it into
+     * the vault later.
+     */
+    runner_platform_endpoint: z.string().min(1).optional(),
   })
   .strict();
 

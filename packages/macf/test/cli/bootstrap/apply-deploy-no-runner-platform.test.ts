@@ -47,7 +47,7 @@ describe('deploy keeps nothing of the runner half (groundnuty/macf#943, DR-043 A
     expect(source).not.toMatch(/\bdeprovisionRunner\b/);
   });
 
-  it('DECISIVE: the runner-provisioning contract client is imported ONLY from apply-fleet.ts + apply-routing.ts (groundnuty/macf#1212 added the second, advisory-only, TYPE-only import) — never from any deploy-path file', () => {
+  it('DECISIVE: the runner-provisioning contract client is imported ONLY by provisioning-phase files — never by any deploy-path file', () => {
     // Grep every .ts source file under bootstrap/ + commands/ (excluding
     // runner-platform.ts itself and its own test file) for an import of it.
     // A future deploy-path file added without reading this test would still
@@ -61,16 +61,47 @@ describe('deploy keeps nothing of the runner half (groundnuty/macf#943, DR-043 A
     // GitHub-side `checkRunnerUsableByRepo` readiness gate this module
     // already used. This is `import type { RunnerPlatformStatusResult }`
     // ONLY — no runtime dependency, no `provisionRunner`/`deprovisionRunner`
-    // call — but it does widen this invariant from "exactly one importer" to
-    // "exactly these two," both of which are production runner-provisioning
-    // call sites, neither a deploy-path file (the it.each loop above still
-    // proves that half independently).
+    // call.
+    //
+    // groundnuty/macf#1211 widened the legitimate importer set further:
+    // `plan.ts`/`observer.ts` now import
+    // `describeRunnerPlatformEndpointResolution`/
+    // `resolveRunnerPlatformEndpointWithProvenance`/
+    // `RUNNER_PLATFORM_ENDPOINT_ENV_VAR` to surface the endpoint resolution
+    // at PLAN time, BEFORE apply ever runs — this is the provisioning
+    // phase's OWN read-only reporting surface, not the deploy phase.
+    //
+    // The invariant this test actually defends (per its own title: "never
+    // from any deploy-path file") is a SET EXCLUSION, not a fixed importer
+    // count — asserting an exact prior count would have made this test
+    // itself the "wrong-path" assertion `assert-the-wrong-path.md` warns
+    // against: a literal count pin breaks on any legitimate NEW
+    // provisioning-phase importer (#1211 and #1212 landing concurrently and
+    // EACH adding one is exactly that scenario), for a reason that has
+    // nothing to do with the deploy-path leak this test exists to catch.
     const grepOutput = execFileSync(
       'grep',
       ['-rl', '--include=*.ts', "from './runner-platform.js'", BOOTSTRAP_DIR, COMMANDS_DIR],
       { encoding: 'utf-8' },
     ).trim();
-    const importers = grepOutput.length > 0 ? grepOutput.split('\n').map((p) => p.trim()).sort() : [];
-    expect(importers).toEqual([join(BOOTSTRAP_DIR, 'apply-fleet.ts'), join(BOOTSTRAP_DIR, 'apply-routing.ts')].sort());
+    const importers = grepOutput.length > 0 ? grepOutput.split('\n').map((p) => p.trim()) : [];
+    // The real invariant: NONE of the importers is a deploy-path file.
+    for (const deployFile of DEPLOY_PATH_FILES) {
+      expect(importers).not.toContain(deployFile);
+    }
+    // The known-good provisioning-phase importers, named explicitly so a
+    // genuinely NEW (and possibly wrong) importer is still caught — this
+    // list grows only when a provisioning-phase file gains a real reason to
+    // read the runner-provisioning contract's shape, same discipline as the
+    // deploy-path list above. `apply-routing.ts` (type-only, #1212) and
+    // `plan.ts`/`observer.ts` (value imports, #1211) landed in the same
+    // cycle, independently of each other.
+    const knownProvisioningPhaseImporters = [
+      join(BOOTSTRAP_DIR, 'apply-fleet.ts'),
+      join(BOOTSTRAP_DIR, 'apply-routing.ts'),
+      join(BOOTSTRAP_DIR, 'plan.ts'),
+      join(BOOTSTRAP_DIR, 'observer.ts'),
+    ];
+    expect([...importers].sort()).toEqual([...knownProvisioningPhaseImporters].sort());
   });
 });

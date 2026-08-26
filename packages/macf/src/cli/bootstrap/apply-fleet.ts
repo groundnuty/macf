@@ -270,7 +270,13 @@ import type { EnsureVariableOutcome } from './ensure-variable.js';
 import type { RunnerRegistrationDeps, RunnerTokenPollOptions } from './apply-routing.js';
 import { formatProvisionedRunnerWaitProgress, formatRunnerPollProgress, publishTrustedActorsForProvisioned, publishTrustedActorsGated } from './apply-routing.js';
 import type { RunnerPlatformResult, RunnerPlatformStatusResult } from './runner-platform.js';
-import { checkRunnerPlatformStatus, provisionRunner, resolveRunnerPlatformEndpoint, runnerPlatformCredentialsFromOutcome } from './runner-platform.js';
+import {
+  checkRunnerPlatformStatus,
+  describeRunnerPlatformEndpointResolution,
+  provisionRunner,
+  resolveRunnerPlatformEndpointWithProvenance,
+  runnerPlatformCredentialsFromOutcome,
+} from './runner-platform.js';
 import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientSecretsForPublish } from './apply-routing-client.js';
 import { ROUTING_CLIENT_CERT_SECRET_NAME, ROUTING_CLIENT_KEY_SECRET_NAME, mintRoutingClient, resolveRoutingClientSecretsForPublish } from './apply-routing-client.js';
 import type { ResolvedTsOauth, RoutingSecretResolution, RoutingSecretsForPublish, RoutingSecretsPublishDeps, RoutingSecretsPublishResult } from './apply-routing-secrets.js';
@@ -505,15 +511,35 @@ export interface FleetApplyDeps {
     readonly controlRepo: string | undefined;
   };
   /**
-   * groundnuty/macf#943 (DR-043 Amendment I2) — the runner-provisioning
-   * contract's tailnet-only base URL. `undefined` (production —
-   * `commands/bootstrap-apply.ts` never sets this) means "resolve from
-   * `MACF_RUNNER_PLATFORM_ENDPOINT`" — see `runner-platform.ts::
-   * resolveRunnerPlatformEndpoint`'s doc for why this is env-only, no CLI
-   * flag, no baked-in default. Tests set this explicitly so the suite never
-   * reads `process.env`.
+   * groundnuty/macf#943 (DR-043 Amendment I2) — the TOP (`'flag'`) tier of
+   * the runner-provisioning contract's endpoint precedence (groundnuty/
+   * macf#1211 widened this from a bare env-fallback to the full flag/env/
+   * scope/manifest chain — see `runner-platform.ts::
+   * resolveRunnerPlatformEndpointWithProvenance`'s doc). `undefined`
+   * (production — `commands/bootstrap-apply.ts` never sets this; there is
+   * still no CLI flag, see that module's doc for why) falls through to env,
+   * then {@link observedRunnerPlatformEndpointScope}, then the manifest's
+   * own `transport.runner_platform_endpoint`. Tests set this explicitly so
+   * the suite never reads `process.env`.
    */
   readonly runnerPlatformEndpoint?: string;
+  /**
+   * groundnuty/macf#1211 — the RAW registry-scope-variable value, threaded
+   * in from `commands/bootstrap-apply.ts` (where `observed` — via
+   * `observer.ts::githubRegistryObserver` — is computed once, before
+   * `applyFleet` is ever called, the SAME `observedActionsPins` precedent
+   * this field mirrors). `undefined` (the default — every existing test/
+   * caller that doesn't set it) means "no observed scope value available
+   * this run," which resolves identically to a genuinely-absent scope
+   * variable — never a false "resolved." Deliberately the RAW value, not
+   * plan-time's already-fully-resolved one: `apply` re-applies its OWN
+   * flag/env-first precedence against this raw candidate, so a plan-time
+   * resolution that happened to come from ENV doesn't get mis-reported as
+   * `'scope'` in apply's own log line (see `plan.ts`'s `ObservedState.
+   * runnerPlatformScopeVariable` doc for the full "why separate fields"
+   * reasoning).
+   */
+  readonly observedRunnerPlatformEndpointScope?: string;
   /** Test-only override for the runner-platform HTTP call (groundnuty/macf#943) — production leaves this unset, taking the real global `fetch`. */
   readonly runnerPlatformFetch?: typeof fetch;
 }
@@ -1717,11 +1743,34 @@ export async function applyFleet(
   // resolved it. Resolves to `undefined` (not-configured) when
   // `routing.runner` isn't declared self-hosted at all — the wait below is
   // then a no-op anyway (`provisionedNowRepos` stays empty), so this never
-  // does unnecessary env/flag resolution work for an undeclared fleet.
-  const runnerPlatformEndpointForWait =
+  // does unnecessary env/flag/scope/manifest resolution work for an
+  // undeclared fleet.
+  //
+  // groundnuty/macf#1211 — resolved ONCE, here, via the full flag/env/
+  // scope/manifest precedence chain (not just the original flag/env pair),
+  // and reused by BOTH consumers below: the provisioning POST loop inside
+  // the `if` immediately following, AND #1212's unconditional wait further
+  // down (`runnerPlatformStatusCheck`). Resolving (and logging) it a SECOND
+  // time inside the `if` would have let the two consumers silently observe
+  // different values if `deps.observedRunnerPlatformEndpointScope` or
+  // `process.env` changed mid-run — sharing one resolution makes that
+  // structurally impossible. `observedRunnerPlatformEndpointScope` is the
+  // RAW scope-variable value `commands/bootstrap-apply.ts` already threaded
+  // in from its own plan-time `githubRegistryObserver` call (see that
+  // field's doc); `manifest.transport.runner_platform_endpoint` is read
+  // directly since `applyFleet` already has the parsed manifest.
+  const runnerPlatformEndpointResolution =
     manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted'
-      ? resolveRunnerPlatformEndpoint(deps.runnerPlatformEndpoint)
+      ? resolveRunnerPlatformEndpointWithProvenance({
+          explicit: deps.runnerPlatformEndpoint,
+          manifestValue: manifest.transport.runner_platform_endpoint,
+          scopeValue: deps.observedRunnerPlatformEndpointScope,
+        })
       : undefined;
+  if (runnerPlatformEndpointResolution !== undefined) {
+    deps.log(`Runner platform endpoint: ${describeRunnerPlatformEndpointResolution(runnerPlatformEndpointResolution)}.`);
+  }
+  const runnerPlatformEndpointForWait = runnerPlatformEndpointResolution?.value;
   if (manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted') {
     const runnerPlatformDeps = {
       endpoint: runnerPlatformEndpointForWait,

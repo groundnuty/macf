@@ -205,6 +205,27 @@ describe('parseFleetManifest — transport.age_recipients (macf#852: list, not a
   });
 });
 
+describe('parseFleetManifest — transport.runner_platform_endpoint (groundnuty/macf#1211)', () => {
+  it('is undefined when omitted — the expected steady state once a scope variable exists', () => {
+    const manifest = parseFleetManifest(VALID_FLEET_YAML);
+    expect(manifest.transport.runner_platform_endpoint).toBeUndefined();
+  });
+
+  it('accepts a declared value — the narrow per-fleet escape hatch', () => {
+    const withField = VALID_FLEET_YAML.replace(
+      'transport:\n  age_recipients: []',
+      'transport:\n  age_recipients: []\n  runner_platform_endpoint: http://orzech-dev-agents-monitoring.tail491af.ts.net:8088',
+    );
+    const manifest = parseFleetManifest(withField);
+    expect(manifest.transport.runner_platform_endpoint).toBe('http://orzech-dev-agents-monitoring.tail491af.ts.net:8088');
+  });
+
+  it('rejects an empty-string value (`.min(1)`, same discipline as every other operator-supplied string field)', () => {
+    const bad = VALID_FLEET_YAML.replace('transport:\n  age_recipients: []', "transport:\n  age_recipients: []\n  runner_platform_endpoint: ''");
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+});
+
 describe('parseFleetManifest — transport.vault_repo REMOVED (macf#857, DR-043 Amendment F)', () => {
   // Amendment F: "transport.vault_repo is REMOVED; the vault always lives in
   // the control repo ... Make the bad state unrepresentable — the vault
