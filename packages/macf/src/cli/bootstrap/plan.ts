@@ -2154,6 +2154,13 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
 
 // --- Formatting (human table + --json) ---
 
+// groundnuty/macf#1220 — `commands/bootstrap.ts` appends a top-level
+// `install_scope_coverage` key beside `fleetPlanToJson`'s own output
+// (same shape `advertise_host_drift` already used there, unbumped) —
+// deliberately NOT bumped: a brand-new name, no existing field's meaning
+// changes, no aggregate here for a new condition to silently feed. See
+// `status.ts::BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION`'s sibling comment for
+// the full rule (groundnuty/macf#1203).
 export const FLEET_PLAN_JSON_SCHEMA_VERSION = 1;
 
 export interface PlanSummary {
