@@ -1196,6 +1196,27 @@ export async function applyFleet(
   deps.log(`Control repo "${controlRepo.repo}": ${controlRepo.status.toUpperCase()} (checkout: ${controlRepo.localDir}).`);
 
   const controlDir = controlRepo.localDir;
+  // Self-heal (macf#857), READ EARLY (groundnuty/macf#1221 third attempt —
+  // the "still broken after #1224 AND #1234" follow-up). A REUSE clone
+  // brings back whatever the PRIOR apply already committed to
+  // `<fleet>-control`'s `fleet.lock` — every declared role's app_id/
+  // install_id, since `writeIncrementalLock` below records BOTH 'reused'
+  // AND 'created' outcomes, not just 'created'. Reading it HERE (right
+  // after the checkout is confirmed, before Step 0.5) instead of at its
+  // pre-third-attempt position (immediately before the per-agent loop) is
+  // the fix: Step 0.5's control-repo label token resolution runs BEFORE the
+  // per-agent loop and previously saw only the raw, caller-supplied
+  // `priorLock` — which `resolveMutateDeps`'s own doc says reads from the
+  // OPERATOR's LOCAL manifest directory, not the control repo. On a
+  // scratch/tmp `apply` run against an ALREADY-ESTABLISHED fleet (the exact
+  // shape of the live `macf-trial` re-run this fix is verified against),
+  // that local directory has no lock at all — `priorLock` is `null` — even
+  // though the checkout JUST cloned above already carries one. `currentLock`
+  // prefers the checkout's own lock whenever it has one; a fresh CREATE (or
+  // any test's no-op fake clone) never has one yet, so this degrades to
+  // `priorLock` there, unchanged.
+  const lockPath = join(controlDir, 'fleet.lock');
+  let currentLock = readFleetLockFile(lockPath) ?? priorLock;
   // groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
   // — one entry per router-carrying repo (`fleet-manifest.ts::routerCarryingRepos`)
   // this run had an opinion about; stays empty when `manifest.versions` is
@@ -1220,27 +1241,36 @@ export async function applyFleet(
   // repo's ALREADY-OBSERVED pin (`deps.observedActionsPins?.controlRepo`,
   // never a second live read here — #1000 golden path).
   const controlPinReconcile = resolveActionsPinReconcile(manifest.versions?.actions, deps.observedActionsPins?.controlRepo);
-  // groundnuty/macf#1221 — the credential-path fix: no agent identity is
-  // minted yet this early in the run, so the only legitimate tokenSource
-  // for control-repo label creation is an ALREADY-EXISTING agent's
-  // vault-stored credential (`priorLock` + the SAME `resolveKeyPath`
-  // primitive `resolveRunnerOpsVaultPem` already uses below). `undefined`
-  // here (a genuinely first-ever provision, or no `--vault`/`--identity-key`
-  // this run) is an honest "nothing to try" — see
-  // `resolveControlRepoLabelTokenSource`'s own doc for how that's reported.
+  // groundnuty/macf#1221 — the credential-path fix, THIRD attempt. No agent
+  // identity is minted yet this early in the run, so the only legitimate
+  // tokenSource for control-repo label creation is an ALREADY-EXISTING
+  // agent's vault-stored credential — resolved against `currentLock` (the
+  // self-healed lock read right after the checkout, above), NOT the raw
+  // `priorLock` parameter. The first attempt (#1224) passed `priorLock`
+  // directly here; verified live on `macf-trial` (an ALREADY-ESTABLISHED
+  // fleet, re-applied from a scratch/tmp directory) that this reproduced
+  // the pre-#1224 warning byte-for-byte — `priorLock` was `null` (the
+  // operator's local manifest directory, empty on that run) even though
+  // the JUST-CLONED control-repo checkout already carried every agent's
+  // app_id/install_id from a PRIOR apply. `currentLock` closes exactly that
+  // gap. `undefined` here (a genuinely first-ever provision with no
+  // committed lock anywhere, or no `--vault`/`--identity-key` this run) is
+  // an honest "nothing to try" — see `resolveControlRepoLabelTokenSource`'s
+  // own doc for how that's reported.
   const controlRepoLabelTokenSource = resolveControlRepoLabelTokenSource(
     manifest,
-    priorLock,
+    currentLock,
     deps.buildAgentDeps(deps.log).resolveKeyPath,
   );
   // `let`, not `const` — groundnuty/macf#1221 (the "still broken after
-  // #1224" follow-up): this initial attempt runs before ANY agent identity
-  // exists this run, so on a genuinely first-ever fleet provision (no
-  // `priorLock` match, or no `--vault`/`--identity-key`) it is STRUCTURALLY
-  // unable to find a credential — `resolveControlRepoLabelTokenSource`
-  // returns `undefined` by construction, every time, for that (the MOST
-  // COMMON) case. See the retry below, right after the per-agent loop,
-  // which reassigns this variable.
+  // #1224 AND #1234" follow-up): even with the `currentLock` self-heal
+  // above, a GENUINELY first-ever fleet provision has no committed lock
+  // anywhere (not the operator's local directory, not the control repo —
+  // nothing has ever been created for this fleet), so
+  // `resolveControlRepoLabelTokenSource` is STRUCTURALLY unable to find a
+  // credential for that case. See the retry below, right after the
+  // per-agent loop, which reassigns this variable using a JUST-CREATED
+  // agent's freshly-minted credential instead.
   let controlRepoInit = await applyControlRepoInit(
     controlDir,
     manifest,
@@ -1301,7 +1331,6 @@ export async function applyFleet(
     );
   }
 
-  const lockPath = join(controlDir, 'fleet.lock');
   const secretsDir = join(controlDir, 'secrets');
   const vaultOutPath = join(secretsDir, 'vault.age');
   const recipients = ageRecipients(manifest);
@@ -1335,14 +1364,10 @@ export async function applyFleet(
   // process, exactly the location this fix moves the artifact AWAY from.
   const recoveryRootDir = deps.recoveryRootDir ?? defaultOperatorRecoveryRootDir();
 
-  // Self-heal (macf#857): a REUSE clone brings back whatever the PRIOR apply
-  // already committed. Prefer that over the caller-supplied `priorLock`
-  // (which today still reads from the OPERATOR's local manifest directory —
-  // a residual pre-Amendment-F read path, see the module doc) whenever the
-  // checkout actually has one; a fresh CREATE never has one yet, so this
-  // degrades to `priorLock` there (and in every existing test's no-op fake
-  // clone, which never populates the checkout).
-  let currentLock = readFleetLockFile(lockPath) ?? priorLock;
+  // `currentLock` (self-heal, macf#857) was already read above, right after
+  // the checkout was confirmed — groundnuty/macf#1221 third attempt moved
+  // that read earlier so Step 0.5's control-repo label token resolution can
+  // see it too. See that read site's own comment for the full rationale.
 
   const records: AgentApplyRecord[] = [];
   const pendingVaultAgents: VaultAgentSecrets[] = [];
