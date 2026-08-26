@@ -233,7 +233,8 @@ The [`docs/`](docs/) directory is the first-user surface — 7 docs covering qui
 - **[Phase specs (7)](design/phases/)** — P1 channel server → P7 agent templates. Each phase maps to a concrete implementation slice.
 - **[Research corpus (16)](research/)** — literature reviews, empirical analysis, comparison to prior multi-agent work.
 - **[`coordination.md`](packages/macf/plugin/rules/coordination.md)** — canonical cross-cutting rules distributed to every agent workspace. Single source of truth; `macf rules refresh` propagates updates.
-- **[`design/macf-consumer-onboarding.md`](design/macf-consumer-onboarding.md)** — full consumer-bootstrap reference (deeper than quickstart).
+- **[`design/macf-consumer-onboarding.md`](design/macf-consumer-onboarding.md)** — full consumer-bootstrap reference (deeper than quickstart), for bringing up **one** agent workspace by hand.
+- **[`design/fleet-deployment-runbook.md`](design/fleet-deployment-runbook.md)** — operator reference for `macf bootstrap` / `macf fleet` (DR-043): declaring a **whole fleet** in one `fleet.yaml` and provisioning it end-to-end, plus the full manifest/flag/exit-code reference and the non-happy paths. See [DR-043](design/decisions/DR-043-declarative-fleet-provisioning.md) for the design rationale.
 - **[`CHANGELOG.md`](CHANGELOG.md)** — per-release notes. Keep-a-Changelog format.
 
 ## Related repositories
