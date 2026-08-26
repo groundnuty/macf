@@ -268,9 +268,9 @@ import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } f
 import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import type { RunnerRegistrationDeps, RunnerTokenPollOptions } from './apply-routing.js';
-import { formatRunnerPollProgress, publishTrustedActorsGated } from './apply-routing.js';
-import type { RunnerPlatformResult } from './runner-platform.js';
-import { provisionRunner, resolveRunnerPlatformEndpoint, runnerPlatformCredentialsFromOutcome } from './runner-platform.js';
+import { formatProvisionedRunnerWaitProgress, formatRunnerPollProgress, publishTrustedActorsForProvisioned, publishTrustedActorsGated } from './apply-routing.js';
+import type { RunnerPlatformResult, RunnerPlatformStatusResult } from './runner-platform.js';
+import { checkRunnerPlatformStatus, provisionRunner, resolveRunnerPlatformEndpoint, runnerPlatformCredentialsFromOutcome } from './runner-platform.js';
 import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientSecretsForPublish } from './apply-routing-client.js';
 import { ROUTING_CLIENT_CERT_SECRET_NAME, ROUTING_CLIENT_KEY_SECRET_NAME, mintRoutingClient, resolveRoutingClientSecretsForPublish } from './apply-routing-client.js';
 import type { ResolvedTsOauth, RoutingSecretResolution, RoutingSecretsForPublish, RoutingSecretsPublishDeps, RoutingSecretsPublishResult } from './apply-routing-secrets.js';
@@ -1710,9 +1710,21 @@ export async function applyFleet(
   // "new fleet for a new project" path (the actual point of this contract)
   // into a guaranteed first-run failure.
   const provisionedNowRepos = new Set<string>();
+  // groundnuty/macf#1212 — hoisted OUT of the `if` below (unlike the
+  // pre-#1212 shape, where this was scoped inside it) so the unconditional
+  // wait immediately following this block can build the SAME advisory
+  // `checkRunnerPlatformStatus` read from it, regardless of which branch
+  // resolved it. Resolves to `undefined` (not-configured) when
+  // `routing.runner` isn't declared self-hosted at all — the wait below is
+  // then a no-op anyway (`provisionedNowRepos` stays empty), so this never
+  // does unnecessary env/flag resolution work for an undeclared fleet.
+  const runnerPlatformEndpointForWait =
+    manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted'
+      ? resolveRunnerPlatformEndpoint(deps.runnerPlatformEndpoint)
+      : undefined;
   if (manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted') {
     const runnerPlatformDeps = {
-      endpoint: resolveRunnerPlatformEndpoint(deps.runnerPlatformEndpoint),
+      endpoint: runnerPlatformEndpointForWait,
       fetchImpl: deps.runnerPlatformFetch,
     };
     // Freshly minted THIS run (`status === 'created'`) supplies the PEM
@@ -1746,6 +1758,67 @@ export async function applyFleet(
       );
       if (result.status === 'ok') provisionedNowRepos.add(repo);
     }
+  }
+
+  // groundnuty/macf#1212 — operator ruling: "apply requested the runner...
+  // whether a --runner-token was supplied is irrelevant to whether the tool
+  // should wait for something it itself asked for." Every repo THIS run
+  // successfully told the contract to provision (`provisionedNowRepos`,
+  // above) gets an UNCONDITIONAL bounded wait for GitHub to confirm it
+  // usable — see `apply-routing.ts::publishTrustedActorsForProvisioned`'s
+  // doc for the full "why here, why unconditional, why pending-not-failed"
+  // narrative. Placed immediately after the POST loop (not at the later
+  // register-before-route call site) for the SAME "as early as possible"
+  // reason that block's own doc already gives the provisioning call itself
+  // — maximizing the window before this run ends.
+  //
+  // `runnerPlatformStatusCheck` is OPTIONAL and advisory-only (see that
+  // function's doc) — `undefined` when the endpoint was never configured,
+  // so a fleet with no runner-platform reachable still gets the correct
+  // GitHub-side wait, just without the platform's own progress content.
+  const runnerPlatformStatusCheck =
+    runnerPlatformEndpointForWait !== undefined ? (repo: string): Promise<RunnerPlatformStatusResult> => checkRunnerPlatformStatus({ endpoint: runnerPlatformEndpointForWait, fetchImpl: deps.runnerPlatformFetch }, repo) : undefined;
+  const provisionedWaitPollOptions: RunnerTokenPollOptions = {
+    ...deps.runnerTokenPollOptions,
+    onProgress:
+      deps.runnerTokenPollOptions?.onProgress ??
+      ((repo: string, elapsedMs: number, totalMs: number, platformStatus?: RunnerPlatformStatusResult): void => {
+        deps.log(formatProvisionedRunnerWaitProgress(repo, elapsedMs, totalMs, platformStatus));
+      }),
+  };
+  // groundnuty/macf#1212 (coordinator UX addendum) — "so each time I can
+  // see how much time it took." A per-repo tick already narrates via
+  // `provisionedWaitPollOptions.onProgress` above; this ONE line closes the
+  // loop with the number that matters most once the wait is over — the
+  // real, measured total, not the budget.
+  const provisionedWaitStartedAt = (provisionedWaitPollOptions.now ?? Date.now)();
+  const routingProvisioned: Readonly<Record<string, EnsureVariableOutcome>> =
+    provisionedNowRepos.size > 0
+      ? await publishTrustedActorsForProvisioned(
+          buildTrustedActorsValue(manifest.metadata.name, manifest.agents),
+          [...provisionedNowRepos],
+          {
+            ...deps.trustDeps,
+            ...(runnerPlatformStatusCheck !== undefined ? { checkRunnerPlatformStatus: runnerPlatformStatusCheck } : {}),
+          },
+          provisionedWaitPollOptions,
+        )
+      : {};
+  if (provisionedNowRepos.size > 0) {
+    const elapsedTotalS = Math.round(((provisionedWaitPollOptions.now ?? Date.now)() - provisionedWaitStartedAt) / 1000);
+    const ready = Object.values(routingProvisioned).filter((leg) => leg.status === 'created' || leg.status === 'already-present').length;
+    const pending = Object.values(routingProvisioned).filter((leg) => leg.status === 'pending').length;
+    const failed = Object.values(routingProvisioned).filter((leg) => leg.status === 'failed').length;
+    deps.log(
+      `Runner wait: ${String(provisionedNowRepos.size)} repo(s) resolved in ${String(elapsedTotalS)}s — ` +
+        `${String(ready)} ready, ${String(pending)} still pending, ${String(failed)} failed.`,
+    );
+  }
+  for (const [repo, leg] of Object.entries(routingProvisioned)) {
+    deps.log(
+      `Routing var (${repo}): ${leg.status}` +
+        (leg.status === 'failed' || leg.status === 'skipped' || leg.status === 'pending' ? ` — ${leg.reason}` : '.'),
+    );
   }
 
   // --- groundnuty/macf#1074 + groundnuty/macf#1082: the routing App —
@@ -2257,39 +2330,50 @@ export async function applyFleet(
       }),
   };
   // groundnuty/macf#943 — a repo created THIS run but ALSO successfully
-  // provisioned THIS run (`provisionedNowRepos`, above) rejoins the full
-  // poll: a runner may genuinely be mid-registration for it now, unlike
-  // macf#972's original premise ("nothing in this run provisions one
-  // in-band") which no longer holds once the call above is wired. Only a
-  // repo that is BOTH newly created AND never successfully told to
-  // provision keeps the fast single-check path — set-difference, not a
-  // second flag threaded through the loop above.
+  // provisioned THIS run (`provisionedNowRepos`, above) is no longer routed
+  // through the fast-path/poll dispatch below AT ALL as of groundnuty/
+  // macf#1212 (see the very next comment) — this set-difference now exists
+  // ONLY to keep a repo created-but-never-provisioned on its pre-#1212 fast
+  // single-check path, unchanged.
   const justCreatedReposStillFast = new Set([...justCreatedRepos].filter((repo) => !provisionedNowRepos.has(repo)));
-  const routing =
+  // groundnuty/macf#1212 — every repo THIS run successfully told the
+  // platform to provision already went through its OWN unconditional wait
+  // immediately after the POST loop above (`routingProvisioned`) — polling
+  // it a SECOND time here (this call's own token-gated poll, on a SEPARATE
+  // deadline) would double an already-bounded wait for no reason, so those
+  // repos are excluded from `repos` entirely. `publishTrustedActorsGated`'s
+  // dispatch for every OTHER repo (never provisioned this run) is therefore
+  // byte-unchanged from its pre-#1212 shape — including its own
+  // `justProvisionedRepos` parameter, which is correctly left unpassed here
+  // (no repo in `nonProvisionedRepos` can ever be a member of that set by
+  // construction).
+  const nonProvisionedRepos = confirmedRepos.filter((repo) => !provisionedNowRepos.has(repo));
+  const routingRest =
     manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted'
       ? await publishTrustedActorsGated(
           buildTrustedActorsValue(manifest.metadata.name, manifest.agents),
-          confirmedRepos,
+          nonProvisionedRepos,
           deps.trustDeps,
           // POLICY only (macf#929): the token gates whether we ATTEMPT the
           // detection-and-write at all; it never substitutes for confirming a
           // usable runner. `publishTrustedActorsGated` owns that contract.
           deps.runnerToken,
           routingPollOptions,
-          // macf#972 (corrected by macf#943 — see `justCreatedReposStillFast`
-          // above): repos created THIS run AND never provisioned THIS run
+          // macf#972: repos created THIS run AND never provisioned THIS run
           // skip the full poll.
           justCreatedReposStillFast,
-          // macf#943 — repos THIS run successfully told the contract to
-          // provision (`status: 'ok'`) get the `neverRegistered` fast-exit
-          // suppressed for their poll, so the platform's ~15s registration
-          // lag has genuine time to resolve instead of failing at t=0. See
-          // `publishTrustedActorsGated`'s `justProvisionedRepos` doc.
-          provisionedNowRepos,
         )
       : {};
-  for (const [repo, leg] of Object.entries<EnsureVariableOutcome>(routing)) {
-    deps.log(`Routing var (${repo}): ${leg.status}` + (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'));
+  // groundnuty/macf#1212 — `routingProvisioned` (built right after the POST
+  // loop, above) and `routingRest` (just above) are keyed on DISJOINT repo
+  // sets by construction (`provisionedNowRepos` vs. its complement), so the
+  // merge below can never silently drop or overwrite an entry.
+  const routing: Readonly<Record<string, EnsureVariableOutcome>> = { ...routingProvisioned, ...routingRest };
+  for (const [repo, leg] of Object.entries<EnsureVariableOutcome>(routingRest)) {
+    deps.log(
+      `Routing var (${repo}): ${leg.status}` +
+        (leg.status === 'failed' || leg.status === 'skipped' || leg.status === 'pending' ? ` — ${leg.reason}` : '.'),
+    );
   }
 
   // Final sync (macf#857) — the LAST thing this run does: push whatever

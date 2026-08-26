@@ -10,22 +10,26 @@
 import { describe, it, expect } from 'vitest';
 import {
   checkRunnerTokenPreflight,
+  formatProvisionedRunnerWaitProgress,
   formatRunnerPollProgress,
   noRunnerRegisteredReason,
   noRunnerTokenReason,
   noUsableRunnerWithoutTokenReason,
   pollForUsableRunner,
   publishTrustedActors,
+  publishTrustedActorsForProvisioned,
   publishTrustedActorsGated,
   runnerNeverRegisteredReason,
   runnerPermissionDeniedReason,
+  runnerProvisioningTerminalFailureReason,
+  runnerStillProvisioningReason,
   runnerTokenPollExhaustedReason,
   RUNNER_TOKEN_ENV_VAR,
   RUNNER_TOKEN_FLAG,
   RUNNER_TOKEN_MISSING_CODE,
   TRUSTED_ACTORS_VAR,
 } from '../../../src/cli/bootstrap/apply-routing.js';
-import type { RoutingApplyDeps } from '../../../src/cli/bootstrap/apply-routing.js';
+import type { ProvisionedRunnerWaitDeps, RoutingApplyDeps } from '../../../src/cli/bootstrap/apply-routing.js';
 import type { RunnerUsability } from '../../../src/cli/bootstrap/observer.js';
 
 function depsWith(overrides: Partial<RoutingApplyDeps> = {}): RoutingApplyDeps {
@@ -35,6 +39,11 @@ function depsWith(overrides: Partial<RoutingApplyDeps> = {}): RoutingApplyDeps {
     checkRunnerUsableByRepo: async () => ({ presence: 'present' }),
     ...overrides,
   };
+}
+
+/** {@link depsWith}, widened with the OPTIONAL advisory `checkRunnerPlatformStatus` seam `publishTrustedActorsForProvisioned` (groundnuty/macf#1212) alone consumes. */
+function provisionedDepsWith(overrides: Partial<ProvisionedRunnerWaitDeps> = {}): ProvisionedRunnerWaitDeps {
+  return { ...depsWith(overrides), ...overrides };
 }
 
 describe('TRUSTED_ACTORS_VAR', () => {
@@ -1353,6 +1362,218 @@ describe('publishTrustedActorsGated — justProvisionedRepos disables neverRegis
     });
     expect(result['a/b']?.status).toBe('failed');
     expect(sleepCalls).toBe(0);
+  });
+});
+
+describe('publishTrustedActorsForProvisioned (groundnuty/macf#1212)', () => {
+  // The operator ruling's decisive triple. Per assert-the-wrong-path.md
+  // (two triggers): (1) alone is satisfied by always sleeping; (2) proves
+  // the wait is conditional on OBSERVED state, and is ALSO the resume case
+  // (a re-run must not need to know it was interrupted — it asks the same
+  // question and gets a different answer); (3) is what stops a permanent
+  // hang on an unrecoverable platform state.
+
+  it('DECISIVE case 1: runner not yet ready -> WAITS, reports progress, proceeds once ready', async () => {
+    let checkCalls = 0;
+    let clock = 0;
+    const progressCalls: Array<{ repo: string; elapsedMs: number; totalMs: number }> = [];
+    const writes: Array<{ repo: string; value: string }> = [];
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return checkCalls < 4 ? { presence: 'absent' } : { presence: 'present' };
+      },
+      createRepoVariable: async (repo, _name, value) => {
+        writes.push({ repo, value });
+        return 'created';
+      },
+    });
+    const result = await publishTrustedActorsForProvisioned('self-hosted', ['a/b'], deps, {
+      timeoutMs: 60_000,
+      pollIntervalMs: 5_000,
+      progressIntervalMs: 5_000,
+      now: () => clock,
+      sleepFn: async (ms) => {
+        clock += ms;
+      },
+      onProgress: (repo, elapsedMs, totalMs) => {
+        progressCalls.push({ repo, elapsedMs, totalMs });
+      },
+    });
+    expect(result['a/b']).toEqual({ status: 'created' });
+    expect(checkCalls).toBeGreaterThan(1); // genuinely retried, not a single check
+    expect(progressCalls.length).toBeGreaterThan(0); // "visible progress... not silence"
+    expect(writes).toEqual([{ repo: 'a/b', value: 'self-hosted' }]);
+  });
+
+  it('DECISIVE case 2 (the resume case): runner ALREADY ready on entry -> does NOT wait at all — sleepFn never invoked, exactly ONE usability check', async () => {
+    let checkCalls = 0;
+    let sleepCalls = 0;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return { presence: 'present' };
+      },
+    });
+    const result = await publishTrustedActorsForProvisioned(
+      'self-hosted',
+      ['a/b'],
+      deps,
+      // timeoutMs deliberately UNSET — the real 10-minute production
+      // default. If this resolved by luck rather than by NEVER entering the
+      // wait loop, a hang here would prove it.
+      {
+        sleepFn: async () => {
+          sleepCalls += 1;
+        },
+      },
+    );
+    expect(result['a/b']).toEqual({ status: 'created' });
+    expect(checkCalls).toBe(1); // no wait means one check, period — indistinguishable from a fresh run
+    expect(sleepCalls).toBe(0);
+  });
+
+  it('DECISIVE case 3: a TERMINAL platform failure is NOT polled through — fails immediately, sleepFn never invoked, checkRunnerUsableByRepo consulted exactly once', async () => {
+    let usabilityCalls = 0;
+    let platformCalls = 0;
+    let sleepCalls = 0;
+    const deps = provisionedDepsWith({
+      checkRunnerUsableByRepo: async () => {
+        usabilityCalls += 1;
+        return { presence: 'absent' };
+      },
+      checkRunnerPlatformStatus: async (_repo: string) => {
+        platformCalls += 1;
+        return { status: 'failed' as const, reason: 'FailedUpdateRegistrationToken', message: 'Updating registration token failed' };
+      },
+    });
+    const result = await publishTrustedActorsForProvisioned('self-hosted', ['a/b'], deps, {
+      sleepFn: async () => {
+        sleepCalls += 1;
+      },
+    });
+    expect(result['a/b']?.status).toBe('failed');
+    expect(result['a/b']?.status === 'failed' && result['a/b'].reason).toContain('FailedUpdateRegistrationToken');
+    expect(result['a/b']?.status === 'failed' && result['a/b'].reason).toContain('not a startup delay');
+    expect(usabilityCalls).toBe(1);
+    expect(platformCalls).toBe(1);
+    expect(sleepCalls).toBe(0); // NEVER waited out the budget on a state polling cannot clear
+  });
+
+  it('on timeout, reports PENDING (not failed) with the elapsed budget stated — the heart of the operator ruling', async () => {
+    let clock = 0;
+    const deps = depsWith({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) });
+    const result = await publishTrustedActorsForProvisioned('self-hosted', ['a/b'], deps, {
+      timeoutMs: 30_000,
+      pollIntervalMs: 10_000,
+      now: () => clock,
+      sleepFn: async (ms) => {
+        clock += ms;
+      },
+    });
+    expect(result['a/b']?.status).toBe('pending');
+    expect(result['a/b']?.status === 'pending' && result['a/b'].reason).toContain('30s');
+    expect(result['a/b']?.status === 'pending' && result['a/b'].reason).not.toMatch(/\bfailed\b/i);
+  });
+
+  it('an advisory platform status that is NOT a confirmed failure (e.g. "starting", or "unknown" from an unreachable endpoint) never ends the wait early — only a confirmed "failed" does', async () => {
+    let checkCalls = 0;
+    let sleepCalls = 0;
+    const deps = provisionedDepsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return checkCalls < 3 ? { presence: 'absent' } : { presence: 'present' };
+      },
+      checkRunnerPlatformStatus: async () => ({ status: 'unknown' as const, reason: 'endpoint unreachable' }),
+    });
+    const result = await publishTrustedActorsForProvisioned('self-hosted', ['a/b'], deps, {
+      timeoutMs: 60_000,
+      pollIntervalMs: 1_000,
+      sleepFn: async () => {
+        sleepCalls += 1;
+      },
+    });
+    expect(result['a/b']).toEqual({ status: 'created' });
+    expect(sleepCalls).toBeGreaterThan(0); // genuinely waited through the advisory-only reads
+  });
+
+  it('checkRunnerPlatformStatus is OPTIONAL — omitting it entirely still waits and resolves correctly using GitHub-side readiness alone', async () => {
+    let checkCalls = 0;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalls += 1;
+        return checkCalls < 2 ? { presence: 'absent' } : { presence: 'present' };
+      },
+    });
+    const result = await publishTrustedActorsForProvisioned('self-hosted', ['a/b'], deps, {
+      timeoutMs: 60_000,
+      pollIntervalMs: 1_000,
+      sleepFn: async () => undefined,
+    });
+    expect(result['a/b']).toEqual({ status: 'created' });
+  });
+
+  it('a repo where the var is ALREADY PRESENT (already-present, not created) is left untouched, matching every other publisher in this module', async () => {
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => ({ presence: 'present' }),
+      checkRepoPresence: async () => 'present',
+    });
+    const result = await publishTrustedActorsForProvisioned('self-hosted', ['a/b'], deps);
+    expect(result['a/b']).toEqual({ status: 'already-present' });
+  });
+
+  it('one repo failing does not block another — per-repo isolation, same discipline as every other publisher in this module', async () => {
+    const deps = provisionedDepsWith({
+      checkRunnerUsableByRepo: async (repo: string) => (repo === 'a/b' ? { presence: 'present' } : { presence: 'absent' }),
+      checkRunnerPlatformStatus: async (_repo: string) => ({ status: 'failed' as const, reason: 'FailedUpdateRegistrationToken', message: 'x' }),
+    });
+    const result = await publishTrustedActorsForProvisioned('self-hosted', ['a/b', 'c/d'], deps);
+    expect(result['a/b']).toEqual({ status: 'created' });
+    expect(result['c/d']?.status).toBe('failed');
+  });
+
+  it('a THROWING checkRunnerUsableByRepo is "failed" (a wiring bug), isolated to that repo', async () => {
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        throw new Error('boom');
+      },
+    });
+    const result = await publishTrustedActorsForProvisioned('self-hosted', ['a/b'], deps);
+    expect(result['a/b']?.status).toBe('failed');
+    expect(result['a/b']?.status === 'failed' && result['a/b'].reason).toContain('boom');
+  });
+
+});
+
+describe('runnerStillProvisioningReason / runnerProvisioningTerminalFailureReason (groundnuty/macf#1212)', () => {
+  it('runnerStillProvisioningReason names the repo, the elapsed+budget, and reads as an honest incomplete, never a failure', () => {
+    const reason = runnerStillProvisioningReason('groundnuty/x', 30_000, 600_000);
+    expect(reason).toContain('groundnuty/x');
+    expect(reason).toContain('30s');
+    expect(reason).toContain('600s');
+    expect(reason.toLowerCase()).toContain('not a failure'); // explicit reassurance, not just absence of the word
+  });
+
+  it('runnerProvisioningTerminalFailureReason names the repo, the confirmed reason+message, and the "not a startup delay" framing', () => {
+    const reason = runnerProvisioningTerminalFailureReason('groundnuty/x', { reason: 'FailedUpdateRegistrationToken', message: 'Updating registration token failed' });
+    expect(reason).toContain('groundnuty/x');
+    expect(reason).toContain('FailedUpdateRegistrationToken');
+    expect(reason).toContain('Updating registration token failed');
+    expect(reason).toContain('not a startup delay');
+  });
+});
+
+describe('formatProvisionedRunnerWaitProgress (groundnuty/macf#1212)', () => {
+  it('shows the runner platform\'s available count when a status is supplied — "the runner\'s actual state", per the operator ruling', () => {
+    const line = formatProvisionedRunnerWaitProgress('groundnuty/x', 30_000, 600_000, { status: 'starting', available: 0 });
+    expect(line).toContain('groundnuty/x');
+    expect(line).toContain('30s/600s elapsed');
+    expect(line).toContain('0 available');
+  });
+
+  it('degrades honestly when no platform status was supplied, rather than inventing a number', () => {
+    const line = formatProvisionedRunnerWaitProgress('groundnuty/x', 30_000, 600_000);
+    expect(line).toContain('no runner-platform status available');
   });
 });
 

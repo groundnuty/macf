@@ -30,7 +30,22 @@ export type EnsureVariableOutcome =
   | { readonly status: 'already-present' }
   /** The value to write was never determined this run (e.g. an upstream CA resolve failed) — nothing was attempted. */
   | { readonly status: 'skipped'; readonly reason: string }
-  | { readonly status: 'failed'; readonly reason: string };
+  | { readonly status: 'failed'; readonly reason: string }
+  /**
+   * groundnuty/macf#1212 — an honest incomplete, distinct from `'failed'`:
+   * the precondition this write depends on (today, only a self-hosted
+   * runner `apply` itself just told the runner-provisioning contract to
+   * create) has neither confirmed nor been confirmed dead within this run's
+   * bounded wait. The ONLY producer is `apply-routing.ts::
+   * publishTrustedActorsForProvisioned` — every other `ensureVariableCreated`
+   * consumer (CA legs, routing secrets, the token-gated/#1195 routing-var
+   * paths) never constructs this variant, so this addition is a pure
+   * widening: existing switches over the OTHER four variants are unaffected
+   * by TypeScript's structural typing, but an exhaustive `switch` over this
+   * union (e.g. a render function) DOES need a new arm — see
+   * `bootstrap-apply.ts::formatVariableLegLine`'s `'pending'` branch.
+   */
+  | { readonly status: 'pending'; readonly reason: string };
 
 export interface EnsureVariableDeps {
   readonly checkPresence: () => Promise<Presence>;
