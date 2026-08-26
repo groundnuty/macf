@@ -2807,7 +2807,7 @@ agents:
         expect(logs.join('\n')).not.toContain(SENTINEL_SECRET);
       });
 
-      it('the call is attempted regardless of whether --runner-token was supplied — provisioning and the routing-var live-check are independent seams (Amendment I2, corrected groundnuty/macf#1195)', async () => {
+      it('the call is attempted regardless of whether --runner-token was supplied, AND — groundnuty/macf#1212 — a repo THIS run successfully provisioned waits unconditionally, reporting PENDING (never failed) on the bounded wait\'s timeout, with no --runner-token involved at all', async () => {
         const manifestPath = manifestPathIn();
         const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
         let fetchCalled = false;
@@ -2831,13 +2831,119 @@ agents:
 
         expect(fetchCalled).toBe(true); // provisioning still attempted, no token needed for that either
         expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('ok');
-        // groundnuty/macf#1195 — the routing gate no longer refuses on the
-        // ABSENCE of a token alone; it refuses here because THIS repo's own
-        // live check reported 'absent', independent of provisioning's
-        // separately-mocked 'ok' outcome.
-        expect(result.routing['groundnuty/demo-code']?.status).toBe('failed');
+        // groundnuty/macf#1212 (operator ruling, overriding #929/#1195's
+        // token-licenses-waiting split for exactly this case): apply itself
+        // requested this runner, so it waits regardless of --runner-token —
+        // here the wait's own budget (timeoutMs: 0, via
+        // runnerTokenPollOptions above) is exhausted before GitHub confirms
+        // it, which is an honest 'pending', NEVER 'failed'. No --runner-token
+        // wording appears anywhere in the reason, because none was consulted.
+        expect(result.routing['groundnuty/demo-code']?.status).toBe('pending');
         const reason = (result.routing['groundnuty/demo-code'] as { reason: string }).reason;
-        expect(reason).toContain('--runner-token');
+        expect(reason).not.toContain('--runner-token');
+        expect(reason).toContain('0s'); // the elapsed/budget the ruling requires stating
+      });
+
+      describe('groundnuty/macf#1212 — the unconditional provisioned-runner wait, end-to-end through applyFleet', () => {
+        it('DECISIVE (the resume case): a repo THIS run provisioned, whose runner is ALREADY usable on entry, writes MACF_TRUSTED_ACTORS with NO wait at all — indistinguishable from a fresh run, no --runner-token needed', async () => {
+          const manifestPath = manifestPathIn();
+          const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+          let usabilityCalls = 0;
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+            runnerToken: undefined,
+            trustDeps: trustDepsFor({
+              checkRunnerUsableByRepo: async () => {
+                usabilityCalls += 1;
+                return { presence: 'present' };
+              },
+            }),
+            runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+            // Serves BOTH the POST /runners provisioning call and (were it
+            // ever consulted) a GET /runners/{owner}/{repo} status read
+            // identically — it never needs to be, since
+            // checkRunnerUsableByRepo already reports 'present' on the
+            // FIRST check, so the wait resolves before the advisory
+            // platform-status read is ever reached.
+            runnerPlatformFetch: (async () => new Response(JSON.stringify({ ok: true }), { status: 200 })) as typeof fetch,
+          };
+
+          const result = await applyFleet(manifest, manifestPath, null, deps);
+
+          expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('ok');
+          expect(result.routing['groundnuty/demo-code']).toEqual({ status: 'created' });
+          expect(usabilityCalls).toBe(1); // one live check, no retry loop entered
+        });
+
+        it('a terminal runner-platform failure (FailedUpdateRegistrationToken) surfaces as a genuine FAILED routing leg, not pending, and not polled through', async () => {
+          const manifestPath = manifestPathIn();
+          const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+            runnerToken: undefined,
+            trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+            runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+            runnerPlatformFetch: (async (_url: string | URL, init?: RequestInit) => {
+              // POST /runners (the provisioning call) always succeeds; the
+              // LATER GET /runners/{owner}/{repo} (the status read the wait
+              // consults) is what reports the terminal failure — mirrors the
+              // real contract, where a controller-side credential gap lets
+              // the POST accept the object but the runner never registers.
+              if (init?.method === 'GET' || init === undefined) {
+                return new Response(
+                  JSON.stringify({
+                    ok: false,
+                    repo: 'groundnuty/demo-code',
+                    available: 0,
+                    note: 'NOT starting: FailedUpdateRegistrationToken. This is not a startup delay — polling will not clear it.',
+                    failure: { reason: 'FailedUpdateRegistrationToken', message: 'Updating registration token failed' },
+                  }),
+                  { status: 404 },
+                );
+              }
+              return new Response(JSON.stringify({ ok: true }), { status: 200 });
+            }) as typeof fetch,
+          };
+
+          const result = await applyFleet(manifest, manifestPath, null, deps);
+
+          expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('ok');
+          expect(result.routing['groundnuty/demo-code']?.status).toBe('failed');
+          const reason = (result.routing['groundnuty/demo-code'] as { reason: string }).reason;
+          expect(reason).toContain('FailedUpdateRegistrationToken');
+          expect(reason).toContain('not a startup delay');
+        });
+
+        it('a repo NOT provisioned this run (POST unreachable) keeps the pre-#1212 #1195 single-check path UNCHANGED — no token, one check, refuses honestly, never enters the new wait', async () => {
+          const manifestPath = manifestPathIn();
+          const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+          let usabilityCalls = 0;
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+            runnerToken: undefined,
+            trustDeps: trustDepsFor({
+              checkRunnerUsableByRepo: async () => {
+                usabilityCalls += 1;
+                return { presence: 'absent' };
+              },
+            }),
+            runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+            runnerPlatformFetch: (async () => {
+              throw Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+            }) as typeof fetch,
+          };
+
+          const result = await applyFleet(manifest, manifestPath, null, deps);
+
+          // Provisioning itself failed (unreachable) -> this repo never
+          // enters provisionedNowRepos -> the ORIGINAL #1195 no-token,
+          // single-check path handles it, byte-unchanged.
+          expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('unreachable');
+          expect(result.routing['groundnuty/demo-code']?.status).toBe('failed');
+          const reason = (result.routing['groundnuty/demo-code'] as { reason: string }).reason;
+          expect(reason).toContain('--runner-token'); // the #1195 no-token wording, NOT the #1212 pending wording
+          expect(usabilityCalls).toBe(1); // exactly one check — never a retry loop
+        });
       });
 
       it('routing.runner NOT declared (hosted-runner fleet) -> the contract is NEVER called, and runnerProvision is empty', async () => {
