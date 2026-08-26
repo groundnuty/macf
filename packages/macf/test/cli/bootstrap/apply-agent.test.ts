@@ -13,6 +13,7 @@ import {
   confirmBeforeCreateGuard,
   installReposForIdentity,
   installWhyText,
+  openInstallScopeCoverageGate,
   realAgentApplyDeps,
   type AgentApplyDeps,
 } from '../../../src/cli/bootstrap/apply-agent.js';
@@ -2282,5 +2283,179 @@ describe('pollForInstallFix narrows the served page via the classifier (groundnu
     expect(first.messageLines.join('\n')).toContain('still missing repository access:');
     expect(first.messageLines.join('\n')).not.toContain('still wrong (repository scope)');
     expect(first.repoNames).toEqual(['demo-fresh-control']); // bare name, per bareRepoNames
+  });
+});
+
+// --- openInstallScopeCoverageGate (groundnuty/macf#1220 — the ACT half) ---
+
+describe('openInstallScopeCoverageGate — reopens gate 2 for a FLEET-LEVEL App widening its install (groundnuty/macf#1220)', () => {
+  const CONFIRMED_INSTALL: ConfirmedInstall = { appId: '9001', installId: '5555', appSlug: 'trial-runner-ops', accountLogin: 'macf-experiment' };
+
+  /** `Omit<AgentApplyDeps, 'writeRecoveryArtifact'>` — mirrors `MutateApplyDeps.buildAgentDeps`'s own return shape, which is what this function's real caller (`bootstrap-apply.ts`) actually hands it. */
+  function gateDeps(overrides: Partial<AgentApplyDeps> = {}): Omit<AgentApplyDeps, 'writeRecoveryArtifact'> {
+    const { writeRecoveryArtifact: _drop, ...base } = baseDeps(overrides);
+    return base;
+  }
+
+  it('opens the SAME interstitial gate 2 uses: instructionLines === [opts.message] (single message source, never a second authored text) and repoNames are the BARED missingRepos', async () => {
+    const seen: { messageLines: readonly string[]; repoNames: readonly string[] }[] = [];
+    const deps = gateDeps({
+      startInstallInterstitial: async (o: InstallInterstitialOptions) => {
+        seen.push({ messageLines: o.messageLines, repoNames: o.repoNames });
+        return fakeInterstitialHandles();
+      },
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }),
+      gateTimeoutMs: 200,
+      pollIntervalMs: 5,
+    });
+
+    const outcome = await openInstallScopeCoverageGate({
+      role: 'runner-ops',
+      appId: '9001',
+      keyPath: '/tmp/key.pem',
+      appSlug: 'trial-runner-ops',
+      accountLogin: 'macf-experiment',
+      message: 'App "trial-runner-ops" is missing repository access to macf-experiment/trial-writing-agent — add exactly this repo under "Repository access" on the App\'s install page (never "All repositories"), then click "Save."',
+      missingRepos: ['macf-experiment/trial-writing-agent'],
+      recheck: async () => ({ covered: true, missingRepos: [], message: '' }),
+      deps,
+    });
+
+    expect(outcome.status).toBe('covered');
+    expect(seen[0]?.messageLines).toEqual([
+      'App "trial-runner-ops" is missing repository access to macf-experiment/trial-writing-agent — add exactly this repo under "Repository access" on the App\'s install page (never "All repositories"), then click "Save."',
+    ]);
+    expect(seen[0]?.repoNames).toEqual(['trial-writing-agent']); // bared, per bareRepoNames
+  });
+
+  it('ONE gate per App even when several repos are missing — the whole missing set is named in one opening, never one per repo', async () => {
+    const seen: { repoNames: readonly string[] }[] = [];
+    const deps = gateDeps({
+      startInstallInterstitial: async (o: InstallInterstitialOptions) => {
+        seen.push({ repoNames: o.repoNames });
+        return fakeInterstitialHandles();
+      },
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }),
+      gateTimeoutMs: 200,
+      pollIntervalMs: 5,
+    });
+
+    await openInstallScopeCoverageGate({
+      role: 'runner-ops',
+      appId: '9001',
+      keyPath: '/tmp/key.pem',
+      appSlug: 'trial-runner-ops',
+      accountLogin: 'macf-experiment',
+      message: 'two repos missing',
+      missingRepos: ['macf-experiment/trial-writing-agent', 'macf-experiment/trial-science-agent'],
+      recheck: async () => ({ covered: true, missingRepos: [], message: '' }),
+      deps,
+    });
+
+    expect(seen).toHaveLength(1); // ONE interstitial open, not two
+    expect(seen[0]?.repoNames).toEqual(['trial-writing-agent', 'trial-science-agent']);
+  });
+
+  it('really waits: a recheck rejecting on tick 1 and accepting on tick 2 only resolves covered AFTER the second poll actually runs', async () => {
+    let ticks = 0;
+    const deps = gateDeps({
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }),
+      gateTimeoutMs: 5_000,
+      pollIntervalMs: 5,
+    });
+
+    const outcome = await openInstallScopeCoverageGate({
+      role: 'runner-ops',
+      appId: '9001',
+      keyPath: '/tmp/key.pem',
+      appSlug: 'trial-runner-ops',
+      accountLogin: 'macf-experiment',
+      message: 'still missing',
+      missingRepos: ['macf-experiment/trial-writing-agent'],
+      recheck: async () => {
+        ticks += 1;
+        return ticks < 2
+          ? { covered: false, missingRepos: ['macf-experiment/trial-writing-agent'], message: 'still missing' }
+          : { covered: true, missingRepos: [], message: '' };
+      },
+      deps,
+    });
+
+    expect(outcome.status).toBe('covered');
+    expect(ticks).toBeGreaterThanOrEqual(2); // proves it actually polled again, never resolved on the first check
+  });
+
+  it('a recheck that never covers times out to drift, never hangs past gateTimeoutMs', async () => {
+    const deps = gateDeps({
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }),
+      gateTimeoutMs: 20,
+      pollIntervalMs: 5,
+    });
+
+    const outcome = await openInstallScopeCoverageGate({
+      role: 'runner-ops',
+      appId: '9001',
+      keyPath: '/tmp/key.pem',
+      appSlug: 'trial-runner-ops',
+      accountLogin: 'macf-experiment',
+      message: 'still missing',
+      missingRepos: ['macf-experiment/trial-writing-agent'],
+      recheck: async () => ({ covered: false, missingRepos: ['macf-experiment/trial-writing-agent'], message: 'still missing' }),
+      deps,
+    });
+
+    expect(outcome.status).toBe('drift');
+    expect(outcome.status === 'drift' ? outcome.reason : '').toContain('polled for');
+  });
+
+  it('expected identity carries accountLogin ONLY, never the predicted appSlug — a wrong prediction must not make the gate structurally unable to resolve', async () => {
+    let seenExpected: unknown;
+    const deps = gateDeps({
+      confirmAppInstallation: async (_appId: string, _keyPath: string, expected?: unknown) => {
+        seenExpected = expected;
+        return { status: 'confirmed', install: CONFIRMED_INSTALL };
+      },
+      gateTimeoutMs: 200,
+      pollIntervalMs: 5,
+    });
+
+    await openInstallScopeCoverageGate({
+      role: 'runner-ops',
+      appId: '9001',
+      keyPath: '/tmp/key.pem',
+      appSlug: 'a-predicted-handle-that-may-not-be-the-real-slug',
+      accountLogin: 'macf-experiment',
+      message: 'x',
+      missingRepos: ['macf-experiment/trial-writing-agent'],
+      recheck: async () => ({ covered: true, missingRepos: [], message: '' }),
+      deps,
+    });
+
+    expect(seenExpected).toEqual({ accountLogin: 'macf-experiment' });
+  });
+
+  it('waitLabel is "Save" (adding to an existing install), never "Install" — this App already exists', async () => {
+    const logs: string[] = [];
+    const deps = gateDeps({
+      confirmAppInstallation: async () => ({ status: 'confirmed', install: CONFIRMED_INSTALL }),
+      log: (line: string) => logs.push(line),
+      gateTimeoutMs: 200,
+      pollIntervalMs: 5,
+    });
+
+    await openInstallScopeCoverageGate({
+      role: 'runner-ops',
+      appId: '9001',
+      keyPath: '/tmp/key.pem',
+      appSlug: 'trial-runner-ops',
+      accountLogin: 'macf-experiment',
+      message: 'x',
+      missingRepos: ['macf-experiment/trial-writing-agent'],
+      recheck: async () => ({ covered: true, missingRepos: [], message: '' }),
+      deps,
+    });
+
+    expect(logs.some((l) => l.includes('waiting for you to click "Save"'))).toBe(true);
+    expect(logs.some((l) => l.includes('waiting for you to click "Install"'))).toBe(false);
   });
 });
