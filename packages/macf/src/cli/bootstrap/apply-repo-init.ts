@@ -262,8 +262,11 @@ function labelsAreGoodEnough(labels: LabelsOutcome, tokenSourceGiven: boolean): 
  * workflow/config files are independently useful even when labels didn't
  * fully land), but the overall step outcome is `status: 'failed'` — never
  * silently `'applied'` — whenever {@link labelsAreGoodEnough} says the label
- * outcome doesn't meet this run's own bar. NEVER throws — every failure
- * resolves to `status: 'failed'`.
+ * outcome doesn't meet this run's own bar. Also refuses BEFORE cloning
+ * anything when `manifest.routing.runner.runs_on` is `'self-hosted'` and
+ * the actions pin about to be used cannot read `MACF_TRUSTED_ACTORS`
+ * (groundnuty/macf#1194 — see `isSelfHostedCapableActionsVersion`). NEVER
+ * throws — every failure resolves to `status: 'failed'`.
  */
 export async function applyRepoInitForAgent(
   agent: FleetAgent,
