@@ -461,7 +461,10 @@ the exact App and telling you to reopen its install page and pick
 
 **Why it's enforced, not merely advised:** a broader install grants that
 App's entire permission set (including `contents: write`) on every repo it
-can see — including repos outside this fleet. Two live fleets hit exactly
+can see — including repos outside this fleet. **Picking "Only select
+repositories" correctly is necessary but not sufficient** — §7.9 covers the
+sibling refusal when the *right kind* of install still misses one specific
+repo. Two live fleets hit exactly
 this before the check was generalized to every App type.
 
 ### 7.3 A second fleet in the same owner scope reusing the shared router — cannot route
@@ -600,6 +603,42 @@ stale-pin, or not-yet-serving are all distinct, named skip reasons. This is
 neither success nor a hard failure; see §8 for the exact exit-code (`2`)
 this produces and why conflating it with either `0` or `1` was itself a
 shipped defect (macf#1146/#1151) fixed by giving it its own code.
+
+### 7.9 A properly-scoped install that's still missing the registry repo — refused
+
+**What you did:** on the install page, correctly chose "Only select
+repositories" (§7.2's check is satisfied) — but the repo set you picked
+doesn't include the registry repo (only meaningful when `owner.registry`
+is `{ type: repo, ... }`, §6.2).
+
+**What happens:** this is a *different*, later check from §7.2's —
+`registry-repo-coverage.ts`'s `buildRegistryRepoValidateInstall`, which asks
+a narrower, live question: does *this specific App's* installation actually
+cover the *one* repo it will need to read/write its own registry entry on?
+This can only be checked once the App exists and is installed (an App JWT,
+`GET /repos/{owner}/{repo}/installation`) — there is no manifest-only proxy
+for it the way §7.5's org-registry refusal has. On a `404`, the refusal
+names the exact missing `owner/repo` and tells you to add it under
+"Repository access" on the App's install page and click Save — `apply`
+detects the change automatically on retry, no full re-run needed.
+
+**Why a `404` here doesn't over-claim a single cause:** GitHub returns the
+identical `404` whether the repo exists but isn't in this App's selected
+set, *or* the repo itself doesn't exist / was renamed. The registry repo is
+never auto-created by `apply` (only each agent's own home repo is) — so
+"the registry repo doesn't exist" is a genuinely reachable cause, not a
+theoretical one. Where the tool can independently confirm the repo exists
+(an unauthenticated `GET /repos/{owner}/{repo}` — a `200` proves existence;
+a private repo's `404` is indistinguishable from "doesn't exist" to an
+anonymous caller), the message narrows to the install-scope cause alone;
+otherwise it says so honestly rather than presenting both as equally
+likely.
+
+**This check runs on every path that resolves a live install** — a fresh
+create, a resumed install (§7.6), *and* a re-confirmed already-provisioned
+role on a re-run — not only on first creation. A fleet that looked fully
+provisioned on every previous run can still surface this the first time
+something tries to actually read the registry through it.
 
 ---
 
