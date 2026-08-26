@@ -60,6 +60,20 @@ const DRAINED_ONLY_OUTPUT = [
   'Coordination sweep (coordination.md §Communication 5) — run before considering yourself idle:',
 ].join('\n');
 
+// groundnuty/macf#1170: the reporter-stall section's wording is deliberately
+// disjoint from both auto-submit-gate substrings ("pending issue(s):" /
+// "inbox message(s) drained on startup:") — see format.ts's
+// formatReporterStallSweep. This fixture proves it end-to-end through the
+// hook's OWN step-6 grep, not just via a unit assertion on the string.
+const REPORTER_STALL_ONLY_OUTPUT = [
+  'No pending issues.',
+  '',
+  '1 issue(s) you filed are open and quiet — re-read before assuming still blocked:',
+  '  groundnuty/macf#999: verification nobody acted on (quiet 6d) — re-read its stated conditions before assuming it\'s still blocked',
+  '',
+  'Coordination sweep (coordination.md §Communication 5) — run before considering yourself idle:',
+].join('\n');
+
 interface RunResult {
   readonly status: number | null;
   readonly stdout: string;
@@ -317,6 +331,18 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
       });
       expect(r.status).toBe(0);
       expect(r.stdout).toContain('No pending issues.');
+      expect(r.submitInvocation).toBeNull();
+    });
+
+    it('a reporter-stall-only startup (macf#1170) prints the stall section but does NOT auto-submit — it is a closure decision to re-read, not work to pick up', () => {
+      const r = runHook({
+        pluginOutput: REPORTER_STALL_ONLY_OUTPUT,
+        pluginOnelineOutput: '',
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('groundnuty/macf#999');
+      expect(r.stdout).toContain('issue(s) you filed are open and quiet');
       expect(r.submitInvocation).toBeNull();
     });
   });
