@@ -89,6 +89,7 @@ removed):
 | `owner.account` / `.type` / `.registry` | `groundnuty` / `user` / `{type: profile, user: groundnuty}` |
 | `network.advertise_host` | `orzech-dev-agents.tail491af.ts.net` |
 | `transport.age_recipients` | `[<your age1… public key>]` — **operator-run `age-keygen`, never tool-minted** (DR-043 Amendment C); `[]` makes `apply` refuse to open any consent gate |
+| `routing.runner` | **Omit entirely for GitHub-hosted-only routing.** If this fleet routes through a self-hosted runner, this block is *not optional in effect* even though the schema marks it optional: omitting it means `MACF_TRUSTED_ACTORS` is never written, at all, with no warning printed — see `design/fleet-deployment-runbook.md` §7.1 for the live-reproduced failure this produces and the full field shape (`runs_on`/`labels`/`warm`). |
 
 There is no longer a "science repo (vault target)" field — the vault is no longer
 committed into any agent's repo. `apply`'s first act provisions a dedicated
