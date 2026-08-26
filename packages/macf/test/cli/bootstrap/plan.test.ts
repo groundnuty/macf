@@ -31,6 +31,7 @@ import {
   type PlanVerb,
 } from '../../../src/cli/bootstrap/plan.js';
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../../src/cli/bootstrap/apply-routing.js';
+import { TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_FLAG } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../../src/cli/bootstrap/registry-scope-preflight.js';
 import { validateInstallRepositoryScope } from '../../../src/cli/bootstrap/install-scope.js';
 
@@ -1618,6 +1619,44 @@ describe('computePlan — Tailscale OAuth item (groundnuty/macf#1109)', () => {
   it('confirm_required is always false — a pure disclosure item, never the confirm-then-update path', () => {
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
     expect(plan.items.find((i) => i.kind === 'ts_oauth')?.confirm_required).toBe(false);
+  });
+});
+
+// --- groundnuty/macf#1186 — the decisive cold-start-vs-warm-scope pair.
+//
+// A fresh org has NO vault to read TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET from
+// at all (nothing in this codebase ever WRITES the pair into one) — the
+// COLD-START half below proves `plan` names the flag/env alternative before
+// any gate opens. But an implementation that appends that note to EVERY
+// branch unconditionally would pass the cold-start assertion too (it always
+// lists everything) while training the operator to ignore the note once a
+// fleet's vault genuinely already has the pair — the exact
+// `assert-the-wrong-path.md` "always listing everything" trap the task
+// calls out. The WARM-SCOPE half is what gives the cold-start assertion
+// meaning: it proves the note is CONDITIONAL on absence, not decoration
+// present regardless of outcome.
+describe('computePlan — Tailscale OAuth cold-start flag/env note (groundnuty/macf#1186)', () => {
+  it('cold start (no --vault/--identity-key given this run) — the ts_oauth item names the flag/env alternative BEFORE any gate opens', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED); // vaultTsOauth undefined — no vault flags given
+    const item = plan.items.find((i) => i.kind === 'ts_oauth');
+    expect(item?.reason).toContain(TS_OAUTH_CLIENT_ID_FLAG);
+    expect(item?.reason).toContain(TS_OAUTH_SECRET_FLAG);
+  });
+
+  it('cold start, declared required — still names the flag/env alternative (the refuse-before-gate-1 case is exactly where an operator needs the escape named)', () => {
+    const manifest = baseManifest({ transport: { age_recipients: [], tailscale_oauth_required: true } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultTsOauth: { status: 'confirmed', present: false } };
+    const plan = computePlan(manifest, observed);
+    const item = plan.items.find((i) => i.kind === 'ts_oauth');
+    expect(item?.reason).toContain(TS_OAUTH_CLIENT_ID_FLAG);
+  });
+
+  it('warm scope (vault CONFIRMED present) — the note is ABSENT, not merely unread: the credential is already satisfied and has nothing left to name', () => {
+    const observed: ObservedState = { ...EMPTY_OBSERVED, vaultTsOauth: { status: 'confirmed', present: true } };
+    const plan = computePlan(baseManifest(), observed);
+    const item = plan.items.find((i) => i.kind === 'ts_oauth');
+    expect(item?.reason).not.toContain(TS_OAUTH_CLIENT_ID_FLAG);
+    expect(item?.reason).not.toContain(TS_OAUTH_SECRET_FLAG);
   });
 });
 
