@@ -256,6 +256,76 @@ export const FleetAgentSchema = z
  */
 export const ROUTER_EMITTED_LABELS: readonly string[] = ['self-hosted', 'macf-vm'];
 
+/**
+ * The lowest `macf-actions` router version that carries `pick-runner` /
+ * `MACF_TRUSTED_ACTORS` at all (groundnuty/macf#1194) — verified against
+ * `groundnuty/macf-actions` git history: the origin-routing commit
+ * (`3be993d`, "origin-route the runner by trigger trust") first ships in
+ * tag `v3.4.0` (confirmed via `git tag --contains 3be993d`); every tag
+ * `v3.0.0`–`v3.3.0` hardcodes `runs-on: ubuntu-latest` on EVERY job
+ * (confirmed via `git show v3.3.0:.github/workflows/agent-router.yml |
+ * grep runs-on` — six matches, all literal `ubuntu-latest`, zero
+ * `pick-runner` job). A fleet pinned below this version has NO mechanism
+ * that could ever read `MACF_TRUSTED_ACTORS` — `apply` writing it would be
+ * silently inert, the exact "declaration and generated workflow disagree"
+ * class this constant exists to catch (see {@link isSelfHostedCapableActionsVersion}'s
+ * cross-check in `FleetManifestSchema`'s `superRefine`, below).
+ */
+export const MIN_SELF_HOSTED_CAPABLE_ACTIONS_VERSION = 'v3.4.0';
+
+/**
+ * Parses `vMAJOR`, `vMAJOR.MINOR`, or `vMAJOR.MINOR.PATCH` into `[major,
+ * minor]` — patch never affects capability (semver: no new features in a
+ * patch release), so it is deliberately not extracted. `minor` is `null`
+ * for a bare `vMAJOR` ref (`v3`) — a floating major-only tag whose minor
+ * cannot be known without a live GitHub lookup, which this pure schema
+ * check deliberately never performs (see {@link isSelfHostedCapableActionsVersion}'s
+ * doc for how that ambiguity is resolved). `null` (the whole tuple) for
+ * anything that isn't a `vN...` ref at all (a branch name, `main`, empty).
+ */
+function parseActionsMajorMinor(version: string): readonly [number, number | null] | null {
+  const match = /^v(\d+)(?:\.(\d+))?(?:\.\d+)?$/.exec(version);
+  if (!match?.[1]) return null;
+  const minorStr = match[2];
+  return [Number(match[1]), minorStr !== undefined ? Number(minorStr) : null];
+}
+
+/**
+ * Whether `version` (a `versions.actions` pin, e.g. `v3.4.1`, `v3.3`,
+ * `v3`, `main`) is a `macf-actions` version that could ACTUALLY read
+ * `MACF_TRUSTED_ACTORS` — the capability half of groundnuty/macf#1194's
+ * "declaration and generated workflow must not disagree" requirement.
+ *
+ * **The safe direction is INVERTED from this file's neighbor pattern
+ * (`repo-init.ts::isBundleCapableActionsVersion`) — deliberately.** There,
+ * an unresolved/ambiguous floating ref is treated as NOT capable, because
+ * the fallback for "not capable" is `secrets: inherit`, which works
+ * regardless of version — a conservative "no" costs nothing. Here, "not
+ * capable" means REFUSE the whole manifest, so a conservative "no" on an
+ * ordinary `v3`-pinned fleet (verified live: the `v3` floating tag
+ * currently resolves to `v3.4.2`, self-hosted-capable) would wrongly block
+ * every fleet that pins the common, correct floating major ref. So a bare
+ * `vMAJOR` ref (minor unknown) is trusted forward — same convention
+ * `isV3PlusActionsVersion` already uses for "a v3+ major floating ref
+ * tracks current" — while a FULLY DETERMINATE `vMAJOR.MINOR[.PATCH]` ref
+ * is checked exactly (a floating MINOR tag like `v3.3` never crosses into
+ * `v3.4.x` — it is permanently below this threshold, not merely
+ * ambiguous). `main` is always capable (the dev branch, always current).
+ * A ref that doesn't parse as `vN...` at all is NOT capable — genuinely
+ * unconfirmable, and unconfirmable must refuse here, not proceed.
+ */
+export function isSelfHostedCapableActionsVersion(version: string): boolean {
+  if (version === 'main') return true;
+  const parsed = parseActionsMajorMinor(version);
+  if (!parsed) return false;
+  const [major, minor] = parsed;
+  if (minor === null) return major >= 3;
+  // MIN_SELF_HOSTED_CAPABLE_ACTIONS_VERSION is a fixed, fully-pinned
+  // vMAJOR.MINOR.PATCH literal above — its minor is always determinate.
+  const [minMajor, minMinor] = parseActionsMajorMinor(MIN_SELF_HOSTED_CAPABLE_ACTIONS_VERSION)!;
+  return major > minMajor || (major === minMajor && minor >= minMinor!);
+}
+
 export const FleetRoutingRunnerSchema = z
   .object({
     runs_on: z.string().min(1),
@@ -450,6 +520,35 @@ export const FleetManifestSchema = z
             `[${ROUTER_EMITTED_LABELS.join(', ')}] (extra labels are fine), or omit the field entirely and let ` +
             'the convention apply.',
           path: ['routing', 'runner', 'labels'],
+        });
+      }
+    }
+
+    // groundnuty/macf#1194 — a declared runs_on: self-hosted alongside a
+    // versions.actions pin the router CANNOT read MACF_TRUSTED_ACTORS on is
+    // a self-contradicting manifest: apply would write the variable, but
+    // the pinned workflow would never look at it, and every job would
+    // silently keep billing on a hosted runner forever with no signal at
+    // any layer. Reject at parse time — before any GitHub call, before
+    // either consent gate — same "catch it before the operator spends a
+    // round-trip on it" reasoning as the labels cross-check above. Only
+    // fires when BOTH fields are explicitly declared (an omitted
+    // versions.actions defaults to the current floating major tag, always
+    // capable; an omitted/non-self-hosted routing.runner has nothing to
+    // contradict).
+    if (manifest.routing?.runner.runs_on === 'self-hosted' && manifest.versions?.actions !== undefined) {
+      const declaredActions = manifest.versions.actions;
+      if (!isSelfHostedCapableActionsVersion(declaredActions)) {
+        ctx.addIssue({
+          code: 'custom',
+          message:
+            `routing.runner.runs_on is "self-hosted" but versions.actions "${declaredActions}" is a macf-actions ` +
+            `pin that cannot read MACF_TRUSTED_ACTORS at all (needs at least ${MIN_SELF_HOSTED_CAPABLE_ACTIONS_VERSION} ` +
+            '— every job in an older pin hardcodes a GitHub-hosted runner). apply would write the variable but the ' +
+            'pinned workflow would never read it, so every job would keep routing to a hosted runner indefinitely ' +
+            'with no signal that anything is wrong. Bump versions.actions, or remove it and let the current ' +
+            'floating major tag apply.',
+          path: ['versions', 'actions'],
         });
       }
     }

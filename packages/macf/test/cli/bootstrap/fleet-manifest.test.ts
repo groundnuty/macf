@@ -16,6 +16,8 @@ import {
   deriveControlRepoName,
   parseFleetLock,
   parseFleetManifest,
+  isSelfHostedCapableActionsVersion,
+  MIN_SELF_HOSTED_CAPABLE_ACTIONS_VERSION,
   FLEET_LOCK_SCHEMA_VERSION,
 } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { FleetAgent } from '../../../src/cli/bootstrap/fleet-manifest.js';
@@ -279,6 +281,108 @@ describe('parseFleetManifest — routing.runner.labels cross-check against ROUTE
       'routing:\n  runner:\n    runs_on: self-hosted\n    labels: [arc-runner]',
     );
     expect(() => parseFleetManifest(withLabels)).toThrow(/missing: \[self-hosted, macf-vm\]/);
+  });
+});
+
+describe('isSelfHostedCapableActionsVersion (pure, macf#1194)', () => {
+  it('MIN_SELF_HOSTED_CAPABLE_ACTIONS_VERSION is v3.4.0 — the origin-routing threshold', () => {
+    expect(MIN_SELF_HOSTED_CAPABLE_ACTIONS_VERSION).toBe('v3.4.0');
+  });
+
+  it('"main" is always capable', () => {
+    expect(isSelfHostedCapableActionsVersion('main')).toBe(true);
+  });
+
+  it('a bare major floating ref ("v3") is trusted forward, even though its minor is unknown', () => {
+    expect(isSelfHostedCapableActionsVersion('v3')).toBe(true);
+  });
+
+  it('a bare major ref below v3 ("v1", "v2") is NOT capable', () => {
+    expect(isSelfHostedCapableActionsVersion('v1')).toBe(false);
+    expect(isSelfHostedCapableActionsVersion('v2')).toBe(false);
+  });
+
+  it('a fully-pinned tag AT the threshold is capable', () => {
+    expect(isSelfHostedCapableActionsVersion('v3.4.0')).toBe(true);
+  });
+
+  it('a fully-pinned tag ABOVE the threshold (minor and patch) is capable', () => {
+    expect(isSelfHostedCapableActionsVersion('v3.4.1')).toBe(true);
+    expect(isSelfHostedCapableActionsVersion('v3.5.0')).toBe(true);
+  });
+
+  it('DECISIVE: a fully-pinned tag BELOW the threshold is NOT capable, even at the same major', () => {
+    expect(isSelfHostedCapableActionsVersion('v3.3.0')).toBe(false);
+    expect(isSelfHostedCapableActionsVersion('v3.0.0')).toBe(false);
+  });
+
+  it('a floating MINOR ref below the threshold ("v3.3") is NOT capable — it never crosses into v3.4.x', () => {
+    expect(isSelfHostedCapableActionsVersion('v3.3')).toBe(false);
+  });
+
+  it('a floating MINOR ref AT/above the threshold ("v3.4") is capable', () => {
+    expect(isSelfHostedCapableActionsVersion('v3.4')).toBe(true);
+  });
+
+  it('a pre-v3 fully-pinned tag (v1.x, v2.x) is NOT capable', () => {
+    expect(isSelfHostedCapableActionsVersion('v1.3.5')).toBe(false);
+    expect(isSelfHostedCapableActionsVersion('v2.0.1')).toBe(false);
+  });
+
+  it('an unparseable ref (a branch name) is NOT capable — genuinely unconfirmable refuses here, never proceeds', () => {
+    expect(isSelfHostedCapableActionsVersion('some-feature-branch')).toBe(false);
+  });
+});
+
+describe('parseFleetManifest — self-hosted + versions.actions capability cross-check (macf#1194)', () => {
+  it('DECISIVE 1: self-hosted declared + an INCAPABLE fully-pinned actions version -> REJECTED at parse time', () => {
+    const bad = VALID_FLEET_YAML.replace('actions: v3.4.1', 'actions: v3.3.0');
+    expect(() => parseFleetManifest(bad)).toThrow(/cannot read MACF_TRUSTED_ACTORS/);
+  });
+
+  it('DECISIVE 2: the SAME incapable actions version, but routing.runner is NOT declared self-hosted -> parses clean, unaffected', () => {
+    const stillOld = VALID_FLEET_YAML.replace('actions: v3.4.1', 'actions: v3.3.0').replace(
+      'routing:\n  runner:\n    runs_on: self-hosted\n\n',
+      '',
+    );
+    const manifest = parseFleetManifest(stillOld);
+    expect(manifest.versions?.actions).toBe('v3.3.0');
+    expect(manifest.routing).toBeUndefined();
+  });
+
+  it('self-hosted declared + a CAPABLE actions version parses clean (the VALID_FLEET_YAML baseline)', () => {
+    const manifest = parseFleetManifest(VALID_FLEET_YAML);
+    expect(manifest.versions?.actions).toBe('v3.4.1');
+    expect(manifest.routing?.runner.runs_on).toBe('self-hosted');
+  });
+
+  it('self-hosted declared + versions.actions OMITTED entirely -> parses clean (defaults to the current floating major tag, always capable)', () => {
+    const noVersions = VALID_FLEET_YAML.replace('versions:\n  macf: 0.2.44\n  actions: v3.4.1\n\n', '');
+    const manifest = parseFleetManifest(noVersions);
+    expect(manifest.versions).toBeUndefined();
+    expect(manifest.routing?.runner.runs_on).toBe('self-hosted');
+  });
+
+  it('self-hosted declared + a floating major ref ("v3") for actions -> parses clean (trusted forward)', () => {
+    const floating = VALID_FLEET_YAML.replace('actions: v3.4.1', 'actions: v3');
+    const manifest = parseFleetManifest(floating);
+    expect(manifest.versions?.actions).toBe('v3');
+  });
+
+  it('names the declared pin, the threshold, and the actual consequence — no internal issue numbers or DR names (citation guard)', () => {
+    const bad = VALID_FLEET_YAML.replace('actions: v3.4.1', 'actions: v3.3.0');
+    let message = '';
+    try {
+      parseFleetManifest(bad);
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).toContain('v3.3.0');
+    expect(message).toContain('v3.4.0');
+    expect(message).toMatch(/versions\.actions/);
+    expect(message).not.toMatch(/#\d+/);
+    expect(message).not.toMatch(/DR-\d+/);
+    expect(message).not.toMatch(/Amendment/i);
   });
 });
 
