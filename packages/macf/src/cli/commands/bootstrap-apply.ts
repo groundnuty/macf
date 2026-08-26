@@ -2323,6 +2323,21 @@ export function recoveryResumableRoles(
   return creations.filter((c) => available.has(c.role)).map((c) => c.role);
 }
 
+/**
+ * groundnuty/macf#1186 — the `--ts-oauth-client-id`/`--ts-oauth-secret`
+ * flag-then-env precedence, pulled out as its OWN pure function (unlike
+ * `--runner-token`'s equivalent inline `opts.runnerToken ?? process.env[...]`
+ * expression) specifically so "the CLI flag wins over the env var" is
+ * directly, non-circularly testable. `runBootstrapApply`'s CLI-integration
+ * surface has no way to discriminate WHICH source produced a resolved
+ * value once it clears the pre-flight (both a flag-sourced and an
+ * env-sourced value satisfy the SAME presence check identically); this
+ * function is what let the precedence rule itself be unit-tested.
+ */
+export function resolveTsOauthFlagOrEnv(flagValue: string | undefined, envValue: string | undefined): string | undefined {
+  return flagValue ?? envValue;
+}
+
 // --- Entry point ---
 
 /**
@@ -2353,8 +2368,8 @@ export async function runBootstrapApply(
   // + rationale as `vaultFlagsFailure` immediately above: a half-given pair
   // is an argument-boundary mistake, not a manifest error, and should never
   // depend on what this fleet's manifest happens to declare.
-  const resolvedTsOauthClientId = opts.tsOauthClientId ?? process.env[TS_OAUTH_CLIENT_ID_ENV_VAR];
-  const resolvedTsOauthSecretRaw = opts.tsOauthSecret ?? process.env[TS_OAUTH_SECRET_ENV_VAR];
+  const resolvedTsOauthClientId = resolveTsOauthFlagOrEnv(opts.tsOauthClientId, process.env[TS_OAUTH_CLIENT_ID_ENV_VAR]);
+  const resolvedTsOauthSecretRaw = resolveTsOauthFlagOrEnv(opts.tsOauthSecret, process.env[TS_OAUTH_SECRET_ENV_VAR]);
   const tsOauthFlagsFailure = checkTsOauthFlagsComplete(resolvedTsOauthClientId, resolvedTsOauthSecretRaw);
   if (tsOauthFlagsFailure !== undefined) {
     return renderFailure(tsOauthFlagsFailure, opts);

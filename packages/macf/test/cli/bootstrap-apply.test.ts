@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import {
   runBootstrapApply,
   resolveMutateDeps,
+  resolveTsOauthFlagOrEnv,
   resolveVaultAgentPems,
   plannedAppCreations,
   formatPlannedAppCreations,
@@ -49,7 +50,14 @@ import type { ConfirmedInstall, IdentityConfirmation } from '../../src/cli/boots
 import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../src/cli/bootstrap/apply-routing-client.js';
 import type { RoutingSecretsPublishDeps } from '../../src/cli/bootstrap/apply-routing-secrets.js';
-import { TAILSCALE_OAUTH_MISSING_CODE } from '../../src/cli/bootstrap/apply-routing-secrets.js';
+import {
+  TAILSCALE_OAUTH_MISSING_CODE,
+  TS_OAUTH_CLIENT_ID_ENV_VAR,
+  TS_OAUTH_CLIENT_ID_FLAG,
+  TS_OAUTH_FLAGS_INCOMPLETE_CODE,
+  TS_OAUTH_SECRET_ENV_VAR,
+  TS_OAUTH_SECRET_FLAG,
+} from '../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RunnerRegistrationDeps } from '../../src/cli/bootstrap/apply-routing.js';
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../src/cli/bootstrap/apply-routing.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle } from '../../src/cli/bootstrap/apply-runner-ops.js';
@@ -1793,6 +1801,154 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     });
   });
 
+  // --- groundnuty/macf#1186 — `--ts-oauth-client-id`/`--ts-oauth-secret`:
+  // a fresh org has NO vault to read TS_OAUTH from at all (nothing ever
+  // WRITES the pair into one), so the tests immediately above this block
+  // (all requiring --vault/--identity-key) do not cover the cold-start
+  // case. These tests cover the flag/env resolution path that bypasses the
+  // vault requirement entirely.
+  describe('groundnuty/macf#1186 — --ts-oauth-client-id/--ts-oauth-secret (flag/env, no vault required)', () => {
+    it('flag alone (no vault flags at all) satisfies a declared requirement — proceeds past the pre-flight, publishes the flag values', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      const code = await runBootstrapApply(
+        { file, yes: true, deploy: false, tsOauthClientId: 'flag-client-id', tsOauthSecret: 'flag-secret' }, // no vaultPath/identityKeyPath
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        // `mutateDeps` is EXPLICITLY given here, so `runBootstrapApply` never
+        // calls `resolveMutateDeps` (which is where the CLI-resolved
+        // opts.tsOauthClientId/tsOauthSecret would otherwise land on
+        // `FleetApplyDeps.resolvedTsOauth`) — `resolvedTsOauth` must ALSO be
+        // set directly here, mirroring `runnerToken`'s own identical
+        // "opts.X must ALSO be set" contract for the same reason.
+        fakeMutateDeps(file, {
+          resolvedTsOauth: { clientId: 'flag-client-id', secret: 'flag-secret' },
+          routingSecretsDeps: fakeRoutingSecretsDeps({
+            checkRepoSecretPresence: async () => 'absent',
+            setRepoSecret: async (repo, name, value) => {
+              setSecretCalls.push({ repo, name, value });
+            },
+          }),
+        }),
+      );
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(TAILSCALE_OAUTH_MISSING_CODE);
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'flag-client-id')).toBe(true);
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'flag-secret')).toBe(true);
+    });
+
+    it('env fallback alone (MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID/_SECRET, no flags) also satisfies the pre-flight — the env-var half is exercised, not just the flag half', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      vi.stubEnv(TS_OAUTH_CLIENT_ID_ENV_VAR, 'env-client-id');
+      vi.stubEnv(TS_OAUTH_SECRET_ENV_VAR, 'env-secret');
+      const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      const code = await runBootstrapApply(
+        { file, yes: true, deploy: false }, // no opts.tsOauthClientId/tsOauthSecret — only the env vars
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        // `mutateDeps` bypasses `resolveMutateDeps` (see the doc on the
+        // sibling test above) — `resolvedTsOauth` here matches what the env
+        // vars resolve to; the DECISIVE assertion for env-fallback itself is
+        // `errs` not containing TAILSCALE_OAUTH_MISSING_CODE below (governed
+        // entirely by `runBootstrapApply`'s own opts/env resolution, which
+        // this override cannot influence).
+        fakeMutateDeps(file, {
+          resolvedTsOauth: { clientId: 'env-client-id', secret: 'env-secret' },
+          routingSecretsDeps: fakeRoutingSecretsDeps({
+            checkRepoSecretPresence: async () => 'absent',
+            setRepoSecret: async (repo, name, value) => {
+              setSecretCalls.push({ repo, name, value });
+            },
+          }),
+        }),
+      );
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(TAILSCALE_OAUTH_MISSING_CODE);
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'env-client-id')).toBe(true);
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'env-secret')).toBe(true);
+    });
+
+    // groundnuty/macf#1186 — "CLI flag wins over env" cannot be observed
+    // decisively through the full `runBootstrapApply` integration surface:
+    // once EITHER source clears the pre-flight, a flag-sourced and an
+    // env-sourced value satisfy the exact same presence check identically,
+    // and the only way to see which one "won" downstream is via
+    // `mutateDeps.resolvedTsOauth` — which a test would have to hand-set to
+    // the expected winner itself, making the assertion circular (per
+    // `assert-the-wrong-path.md` trigger 1: the reference value would come
+    // from what it checks). `resolveTsOauthFlagOrEnv` is tested directly,
+    // non-circularly, in `bootstrap-apply.test.ts`'s own describe block
+    // below instead.
+    it('half a pair (only --ts-oauth-client-id, no secret and no env fallback) refuses BEFORE the manifest is even parsed — zero gate calls, naming what to supply', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      vi.stubEnv(TS_OAUTH_CLIENT_ID_ENV_VAR, '');
+      vi.stubEnv(TS_OAUTH_SECRET_ENV_VAR, '');
+      let observeCalls = 0;
+      const code = await runBootstrapApply(
+        { file, yes: true, tsOauthClientId: 'flag-client-id-only' }, // no tsOauthSecret
+        {
+          observe: () => {
+            observeCalls += 1;
+            return Promise.resolve(EMPTY_OBSERVED);
+          },
+        },
+      );
+      expect(code).toBe(1);
+      expect(observeCalls).toBe(0);
+      expect(errs.join('\n')).toContain(TS_OAUTH_CLIENT_ID_FLAG);
+      expect(errs.join('\n')).toContain(TS_OAUTH_SECRET_FLAG);
+      // The half-given VALUE that WAS supplied must never leak either.
+      expect(errs.join('\n')).not.toContain('flag-client-id-only');
+    });
+
+    it('the flags-incomplete refusal is visible under --json too, with the dedicated error code', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      const code = await runBootstrapApply({ file, yes: true, json: true, tsOauthSecret: 'flag-secret-only' }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+      expect(code).toBe(1);
+      const parsed = JSON.parse(logs.join('\n')) as { error: { code: string; message: string } };
+      expect(parsed.error.code).toBe(TS_OAUTH_FLAGS_INCOMPLETE_CODE);
+    });
+
+    it('declared + no vault + NEITHER flag/env supplied -> STILL refuses before gate 1, and the refusal names the flag as an alternative to the vault', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      let startManifestFlowCalls = 0;
+      const code = await runBootstrapApply(
+        { file, yes: true }, // no vault flags, no ts-oauth flags, no env
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file, {
+          buildAgentDeps: () =>
+            fakeAgentDeps({
+              startManifestFlow: async () => {
+                startManifestFlowCalls += 1;
+                throw new Error('must not be called — the pre-flight must refuse before this seam is ever reached');
+              },
+            }),
+        }),
+      );
+      expect(code).toBe(1);
+      expect(startManifestFlowCalls).toBe(0);
+      expect(errs.join('\n')).toContain(TS_OAUTH_CLIENT_ID_FLAG);
+    });
+
+    it('NEVER logs the supplied secret value anywhere in stdout/stderr across a full run (text AND --json) — only the flag/env NAMES may appear', async () => {
+      const TS_OAUTH_CLIENT_ID_SECRET = 'SENTINEL-1186-CLIENT-ID-MUST-NEVER-LEAK';
+      const TS_OAUTH_SECRET_SECRET = 'SENTINEL-1186-SECRET-MUST-NEVER-LEAK';
+      for (const json of [false, true]) {
+        const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+        const code = await runBootstrapApply(
+          { file, yes: true, json, deploy: false, tsOauthClientId: TS_OAUTH_CLIENT_ID_SECRET, tsOauthSecret: TS_OAUTH_SECRET_SECRET },
+          { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+          fakeMutateDeps(file, {
+            resolvedTsOauth: { clientId: TS_OAUTH_CLIENT_ID_SECRET, secret: TS_OAUTH_SECRET_SECRET },
+            routingSecretsDeps: fakeRoutingSecretsDeps({ checkRepoSecretPresence: async () => 'absent', setRepoSecret: async () => {} }),
+          }),
+        );
+        expect(code).toBe(0);
+      }
+      const all = [...logs, ...errs].join('\n');
+      expect(all).not.toContain(TS_OAUTH_CLIENT_ID_SECRET);
+      expect(all).not.toContain(TS_OAUTH_SECRET_SECRET);
+    });
+  });
+
   // --- macf#999 — `registry: { type: org }` is unsatisfiable with this
   // tool's current provisioning (no organization-scoped permission anywhere
   // in the manifest-building path); refuses BEFORE consent gate 1, same
@@ -3349,6 +3505,26 @@ describe('resolveMutateDeps — vault-aware resolveKeyPath + cleanupVaultScratch
     expect(deps.vaultRecipientDeps).toBeUndefined();
   });
 
+  // --- resolvedTsOauth threading (groundnuty/macf#1186) ---
+
+  it('resolvedTsOauth is undefined on FleetApplyDeps when not supplied — byte-identical to pre-#1186 wiring', () => {
+    const deps = resolveMutateDeps('/tmp/nonexistent/fleet.yaml', new Map(), SENTINEL_RUNNER_TOKEN);
+    expect(deps.resolvedTsOauth).toBeUndefined();
+  });
+
+  it('resolvedTsOauth is threaded verbatim onto FleetApplyDeps when supplied — the SAME flag/env-resolved pair runBootstrapApply computed', () => {
+    const deps = resolveMutateDeps(
+      '/tmp/nonexistent/fleet.yaml',
+      new Map(),
+      SENTINEL_RUNNER_TOKEN,
+      undefined,
+      undefined,
+      undefined,
+      { clientId: 'resolved-client-id', secret: 'resolved-secret' },
+    );
+    expect(deps.resolvedTsOauth).toEqual({ clientId: 'resolved-client-id', secret: 'resolved-secret' });
+  });
+
   // --- trustDeps.readVaultCaCert threading (DR-043 Amendment D phase 3, groundnuty/macf#978) ---
 
   it('trustDeps.readVaultCaCert is undefined when NEITHER vaultPath nor identityKeyPath is supplied — byte-identical to pre-#978 wiring', () => {
@@ -3434,6 +3610,26 @@ describe('resolveMutateDeps — vault-aware resolveKeyPath + cleanupVaultScratch
     } finally {
       stderrSpy.mockRestore();
     }
+  });
+});
+
+// --- resolveTsOauthFlagOrEnv — the CLI-flag-wins-over-env precedence
+// (groundnuty/macf#1186), tested directly + non-circularly. Cannot be
+// decisively tested through the full runBootstrapApply integration surface
+// (see the comment at that describe block's own "flag wins" test site) —
+// once either source clears the pre-flight, a flag-sourced and an
+// env-sourced value satisfy the exact same presence check identically.
+describe('resolveTsOauthFlagOrEnv — CLI flag wins over env (groundnuty/macf#1186)', () => {
+  it('the flag value wins when both are given', () => {
+    expect(resolveTsOauthFlagOrEnv('flag-val', 'env-val')).toBe('flag-val');
+  });
+
+  it('falls back to the env value when the flag is undefined', () => {
+    expect(resolveTsOauthFlagOrEnv(undefined, 'env-val')).toBe('env-val');
+  });
+
+  it('undefined when neither is given', () => {
+    expect(resolveTsOauthFlagOrEnv(undefined, undefined)).toBeUndefined();
   });
 });
 

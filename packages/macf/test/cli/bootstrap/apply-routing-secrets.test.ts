@@ -289,14 +289,14 @@ describe('toBase64ForSecret — the fix for the live encoding bug #1074 found', 
 
 describe('checkTailscaleOauthPreflight — refuse before gate 1 when declared-and-absent (groundnuty/macf#1074)', () => {
   it('NOT declared -> undefined (proceed), regardless of vault flags', async () => {
-    const result = await checkTailscaleOauthPreflight(false, undefined, undefined, {
+    const result = await checkTailscaleOauthPreflight(false, undefined, undefined, undefined, {
       readVault: async () => { throw new Error('must not be called — not declared'); },
     });
     expect(result).toBeUndefined();
   });
 
   it('declared, but --vault/--identity-key NOT both supplied -> REFUSES (cannot verify presence without decrypting)', async () => {
-    const result = await checkTailscaleOauthPreflight(true, undefined, undefined, {
+    const result = await checkTailscaleOauthPreflight(true, undefined, undefined, undefined, {
       readVault: async () => { throw new Error('must not be called — no vault path supplied'); },
     });
     expect(result).toBeDefined();
@@ -305,37 +305,37 @@ describe('checkTailscaleOauthPreflight — refuse before gate 1 when declared-an
   });
 
   it('declared, only ONE of --vault/--identity-key supplied -> STILL refuses (both-or-neither, same as every other vault-restore closure)', async () => {
-    const onlyVault = await checkTailscaleOauthPreflight(true, '/fake/vault.age', undefined, { readVault: async () => { throw new Error('must not be called'); } });
+    const onlyVault = await checkTailscaleOauthPreflight(true, '/fake/vault.age', undefined, undefined, { readVault: async () => { throw new Error('must not be called'); } });
     expect(onlyVault?.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
-    const onlyIdentity = await checkTailscaleOauthPreflight(true, undefined, '/fake/identity.txt', { readVault: async () => { throw new Error('must not be called'); } });
+    const onlyIdentity = await checkTailscaleOauthPreflight(true, undefined, '/fake/identity.txt', undefined, { readVault: async () => { throw new Error('must not be called'); } });
     expect(onlyIdentity?.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
   });
 
   it('declared, both supplied, vault yields BOTH values -> undefined (proceed)', async () => {
-    const result = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', {
+    const result = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', undefined, {
       readVault: async () => ({ [TS_OAUTH_CLIENT_ID_SECRET_NAME]: 'ts-client-id', [TS_OAUTH_SECRET_SECRET_NAME]: 'ts-secret' }),
     });
     expect(result).toBeUndefined();
   });
 
   it('declared, both supplied, vault yields NEITHER value -> REFUSES', async () => {
-    const result = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', { readVault: async () => ({}) });
+    const result = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', undefined, { readVault: async () => ({}) });
     expect(result?.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
   });
 
   it('declared, both supplied, vault yields only ONE of the two values -> STILL refuses (both-or-nothing)', async () => {
-    const onlyClientId = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', {
+    const onlyClientId = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', undefined, {
       readVault: async () => ({ [TS_OAUTH_CLIENT_ID_SECRET_NAME]: 'ts-client-id' }),
     });
     expect(onlyClientId?.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
-    const onlySecret = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', {
+    const onlySecret = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', undefined, {
       readVault: async () => ({ [TS_OAUTH_SECRET_SECRET_NAME]: 'ts-secret' }),
     });
     expect(onlySecret?.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
   });
 
   it('a decrypt failure (bad --identity-key) folds into the SAME refusal, never throws, never propagates a secret', async () => {
-    const result = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', {
+    const result = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', undefined, {
       readVault: async () => { throw new Error('age: error: no identity matched any of the recipients'); },
     });
     expect(result?.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
@@ -343,11 +343,39 @@ describe('checkTailscaleOauthPreflight — refuse before gate 1 when declared-an
   });
 
   it('NEVER includes a secret value in the refusal message, even when the vault partially yields one', async () => {
-    const result = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', {
+    const result = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', undefined, {
       readVault: async () => ({ [TS_OAUTH_CLIENT_ID_SECRET_NAME]: 'ts-client-id', [TS_OAUTH_SECRET_SECRET_NAME]: '' }),
     });
     expect(result?.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
     expect(result?.message).not.toContain('ts-client-id');
+  });
+});
+
+// --- groundnuty/macf#1186 — `resolvedTsOauth` (the `--ts-oauth-client-id`/
+// `--ts-oauth-secret` flag/env pair) bypasses the vault requirement
+// entirely: a fresh org has no pre-existing vault to read the pair from at
+// all, so the flag/env pair must be a COMPLETE, self-sufficient answer —
+// never merely a hint that a vault read is still attempted.
+describe('checkTailscaleOauthPreflight — resolvedTsOauth bypass (groundnuty/macf#1186)', () => {
+  it('resolvedTsOauth given + NO vault flags at all -> undefined (proceed) — the cold-start case this issue exists for', async () => {
+    const result = await checkTailscaleOauthPreflight(true, undefined, undefined, { clientId: 'flag-client-id', secret: 'flag-secret' }, {
+      readVault: async () => { throw new Error('must not be called — resolvedTsOauth already answers the requirement'); },
+    });
+    expect(result).toBeUndefined();
+  });
+
+  it('resolvedTsOauth given + vault flags ALSO given -> STILL undefined, and the vault is never even read (resolvedTsOauth is checked FIRST)', async () => {
+    const result = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', { clientId: 'flag-client-id', secret: 'flag-secret' }, {
+      readVault: async () => { throw new Error('must not be called — resolvedTsOauth short-circuits before any vault read'); },
+    });
+    expect(result).toBeUndefined();
+  });
+
+  it('resolvedTsOauth NOT given + no vault -> unchanged REFUSAL (the bypass is additive, never a silent relaxation of the existing gate)', async () => {
+    const result = await checkTailscaleOauthPreflight(true, undefined, undefined, undefined, {
+      readVault: async () => { throw new Error('must not be called'); },
+    });
+    expect(result?.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
   });
 });
 
