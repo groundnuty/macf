@@ -2403,19 +2403,40 @@ export async function runBootstrapApply(
   // precedence is computed.
   const resolvedRunnerToken = opts.runnerToken ?? process.env[RUNNER_TOKEN_ENV_VAR];
 
-  // macf#932 — refuse BEFORE consent gate 1 ever opens, not merely before
-  // the LATE gate deep inside `applyFleet`'s routing block
-  // (`apply-routing.ts::publishTrustedActorsGated`, UNCHANGED, still the
-  // actual enforcement point — see `checkRunnerTokenPreflight`'s doc for the
-  // full "why move this earlier" rationale + why the late gate stays
-  // authoritative). Fires immediately after the manifest is parsed, before
-  // ANY observe/plan-render/consent-gate work — an operator who forgot the
-  // flag never spends a browser click and never even costs a read-only `gh`
-  // call. Skipped for `--dry-run`: a dry run never opens a gate to begin
-  // with, and its own plan render already carries the SAME requirement note
-  // unconditionally (`plan.ts::runnerClassReason`'s `RUNNER_TOKEN_PLAN_NOTE`,
-  // macf#932 requirement 3) — nothing is hidden from a `--dry-run` operator
-  // either.
+  // macf#932 — WARN (not refuse) as early as possible, before consent gate 1
+  // ever opens — an operator who forgot the flag sees this before spending a
+  // browser click. Skipped for `--dry-run`: a dry run never opens a gate to
+  // begin with, and its own plan render already carries the SAME requirement
+  // note unconditionally (`plan.ts::runnerClassReason`'s
+  // `RUNNER_TOKEN_PLAN_NOTE`, macf#932 requirement 3) — nothing is hidden
+  // from a `--dry-run` operator either.
+  //
+  // **groundnuty/macf#1209 — no longer aborts the run.** Through #1209, a
+  // missing token turned this into a run-aborting `return renderFailure(...)`
+  // — one line, exit 1, nothing else attempted — even though routing
+  // secrets, CA legs, repo-init, and vault composition never read
+  // `resolvedRunnerToken` at all. Observed live on `macf-trial`: the router
+  // credential had just been merged into the vault (an operator-authorised
+  // one-time decrypt), and this refusal discarded that entire run before
+  // ever publishing it — a leg with zero dependency on the runner token.
+  // `checkVaultFlagsComplete`/`checkTailscaleOauthPreflight` (this function's
+  // OTHER pre-flights) are deliberately NOT changed alongside this one: a
+  // half-given `--vault`/`--identity-key` pair (or a declared-but-
+  // unverifiable Tailscale OAuth pair) is an unsatisfiable ARGUMENT, not a
+  // "one optional feature is unavailable" fact — see groundnuty/macf#1209's
+  // own audit for the distinction (Tailscale's ACTUAL enforcement, unlike
+  // the vault-flags XOR, has the SAME narrow-leg shape as the runner token
+  // and is flagged there as a candidate follow-up, out of this fix's scope).
+  //
+  // The ACTUAL enforcement point is UNCHANGED — exactly where macf#929 put
+  // it: `apply-routing.ts::publishTrustedActorsGated`, called from
+  // `applyFleet` below, independently refuses ONLY the `MACF_TRUSTED_ACTORS`
+  // write (never any other leg) with this SAME message, per confirmed repo,
+  // `'failed'` (never `'skipped'` — macf#993, so `applyExitCode`'s existing
+  // `routingBad` check still fails the run overall — see that function's doc;
+  // no new exit code is introduced here). This block now only WARNS to
+  // stderr and falls through — never `--json` output (that would corrupt the
+  // single JSON object `--json` mode emits at the end of a real run).
   // groundnuty/macf#943 — the name-length pre-flight, run as early as
   // possible (right after the manifest parses, before ANY observe/plan/
   // consent-gate work — including `--dry-run`, which would otherwise render
@@ -2448,7 +2469,11 @@ export async function runBootstrapApply(
   if (opts.dryRun !== true) {
     const runnerTokenFailure = checkRunnerTokenPreflight(manifest.routing, resolvedRunnerToken);
     if (runnerTokenFailure !== undefined) {
-      return renderFailure(runnerTokenFailure, opts);
+      // groundnuty/macf#1209 — WARN, don't abort: see the block comment
+      // above for why. `applyFleet` below still runs every leg that doesn't
+      // depend on this token; `publishTrustedActorsGated` still refuses the
+      // ONE leg that does, with this SAME message, per confirmed repo.
+      console.error(runnerTokenFailure.message);
     }
 
     // groundnuty/macf#1074 — the Tailscale-declared refuse-before-gate-1

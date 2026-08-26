@@ -1523,12 +1523,17 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     });
   });
 
-  // --- macf#932 — the pre-flight fires BEFORE consent gate 1, not merely
-  // before the late gate deep inside applyFleet's routing block. The
-  // decisive case: zero gate invocations, not merely a non-zero exit code.
+  // --- macf#932 (narrowed by groundnuty/macf#1209) — the pre-flight fires
+  // BEFORE consent gate 1, but no longer ABORTS the run. It WARNS (still at
+  // the same early point — before observe/plan/consent-gate work) and falls
+  // through into `applyFleet`, which independently refuses ONLY the
+  // `MACF_TRUSTED_ACTORS` write via `publishTrustedActorsGated` (UNCHANGED,
+  // macf#929). See the `groundnuty/macf#1209` describe block below for the
+  // decisive test proving legs that don't depend on the runner token now
+  // proceed to completion instead of being discarded by this early abort.
 
-  describe('macf#932 — pre-flight refusal before consent gate 1', () => {
-    it('declared routing.runner self-hosted + NO token resolvable -> refuses BEFORE consent gate 1: observe/confirmPlan/buildAgentDeps/openUrl/startManifestFlow/confirmAppInstallation are ALL zero calls', async () => {
+  describe('macf#932 (narrowed by groundnuty/macf#1209) — early WARNING before consent gate 1, run proceeds regardless', () => {
+    it('declared routing.runner self-hosted + NO token resolvable -> WARNS before consent gate 1 but the run PROCEEDS: observe/confirmPlan/buildAgentDeps/openUrl/startManifestFlow/confirmAppInstallation ALL fire, unlike pre-#1209', async () => {
       vi.stubEnv(RUNNER_TOKEN_ENV_VAR, ''); // pin: this test's verdict must not depend on the ambient shell env
       const file = writeManifest(FLEET_YAML_WITH_ROUTING);
       let observeCalls = 0;
@@ -1537,6 +1542,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       let openUrlCalls = 0;
       let startManifestFlowCalls = 0;
       let confirmAppInstallationCalls = 0;
+      let checkRunnerUsableCalls = 0;
 
       const code = await runBootstrapApply(
         { file, yes: true }, // no opts.runnerToken
@@ -1560,7 +1566,12 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
               },
               startManifestFlow: async () => {
                 startManifestFlowCalls += 1;
-                throw new Error('must not be called — the pre-flight must refuse before this seam is ever reached');
+                return {
+                  startUrl: 'http://127.0.0.1:9/',
+                  redirectUrl: 'http://127.0.0.1:9/callback',
+                  waitForCode: async () => 'the-code',
+                  close: async () => {},
+                };
               },
               confirmAppInstallation: async () => {
                 confirmAppInstallationCalls += 1;
@@ -1568,43 +1579,62 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
               },
             });
           },
+          trustDeps: fakeTrustDeps({
+            checkRunnerUsableByRepo: async () => {
+              checkRunnerUsableCalls += 1;
+              return { presence: 'present' };
+            },
+          }),
         }),
       );
 
+      // groundnuty/macf#1209 — the run still FAILS overall (a declared
+      // self-hosted runner with no confirmable token stays non-zero, macf#993's
+      // ruling), but it is NOT a total abort any more: every seam below fired.
       expect(code).toBe(1);
-      // The whole point: NOT "exited non-zero" but "never even asked the
-      // operator to approve, never even read GitHub state, never opened a
-      // browser." Each of these is a DISTINCT seam any one of which firing
-      // would mean the refusal arrived too late.
-      expect(observeCalls).toBe(0);
-      expect(confirmPlanCalls).toBe(0);
-      expect(buildAgentDepsCalls).toBe(0);
-      expect(openUrlCalls).toBe(0);
-      expect(startManifestFlowCalls).toBe(0);
-      expect(confirmAppInstallationCalls).toBe(0);
+      expect(observeCalls).toBeGreaterThan(0);
+      expect(confirmPlanCalls).toBeGreaterThan(0);
+      expect(buildAgentDepsCalls).toBeGreaterThan(0);
+      expect(openUrlCalls).toBeGreaterThan(0);
+      expect(startManifestFlowCalls).toBeGreaterThan(0);
+      expect(confirmAppInstallationCalls).toBeGreaterThan(0);
+      // The runner-token refusal itself is STILL zero-I/O (macf#929's "token
+      // is POLICY, missing token means detection is never even ATTEMPTED"
+      // contract, unchanged by #1209) — `publishTrustedActorsGated`
+      // short-circuits before ever calling this, even though everything ELSE
+      // above now runs for real.
+      expect(checkRunnerUsableCalls).toBe(0);
 
       expect(errs.join('\n')).toContain(RUNNER_TOKEN_FLAG);
       expect(errs.join('\n')).toContain(RUNNER_TOKEN_ENV_VAR);
-      // Nothing mutated — same result-invariant the "operator declines"
-      // test above asserts.
-      const dir = join(file, '..');
-      expect(existsSync(join(dir, 'fleet.lock'))).toBe(false);
-      expect(existsSync(join(dir, 'secrets', 'vault.age'))).toBe(false);
     });
 
-    it('the refusal is visible under --json too, never empty stdout (macf#830 lesson), and the token flag/env-var names appear but no token VALUE ever could (there is none — this fires precisely because it is absent)', async () => {
+    it('the failure is visible under --json too (never empty stdout, macf#830 lesson) — as a FULL apply-result, not an early-abort error object: routing shows the FAILED leg, other sections show their own real outcomes', async () => {
       vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
       const file = writeManifest(FLEET_YAML_WITH_ROUTING);
       const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file, { runnerToken: undefined }));
       expect(code).toBe(1);
       expect(logs.length).toBeGreaterThan(0);
-      const parsed = JSON.parse(logs.join('\n')) as { error: { code: string; message: string } };
-      expect(parsed.error.code).toBe('runner_token_missing');
-      expect(parsed.error.message).toContain(RUNNER_TOKEN_FLAG);
-      expect(parsed.error.message).toContain(RUNNER_TOKEN_ENV_VAR);
+      const parsed = JSON.parse(logs.join('\n')) as {
+        routing: Record<string, { status: string; reason?: string }>;
+        control_repo: { status: string };
+      };
+      // groundnuty/macf#1209 — NOT `{ error: { code: 'runner_token_missing' } }`
+      // any more (that shape meant "nothing else was even attempted"). This is
+      // the real, full `fleetApplyResultToJson` shape — proof the run reached
+      // the point of having a `control_repo` outcome at all, which the
+      // pre-#1209 early-abort object never carried.
+      expect(parsed.control_repo).toBeDefined();
+      const routingLeg = parsed.routing['groundnuty/demo-code'];
+      expect(routingLeg?.status).toBe('failed');
+      expect(routingLeg?.reason).toContain(RUNNER_TOKEN_FLAG);
+      expect(routingLeg?.reason).toContain(RUNNER_TOKEN_ENV_VAR);
+      // The early WARNING still fires, on stderr — never mixed into the
+      // single JSON object `--json` mode emits on stdout.
+      expect(errs.join('\n')).toContain(RUNNER_TOKEN_FLAG);
     });
 
-    it('an empty-string --runner-token is treated the same as no token — still refuses before gate 1', async () => {
+    it('an empty-string --runner-token is treated the same as no token — still WARNS before gate 1, still lets the run proceed', async () => {
       vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
       const file = writeManifest(FLEET_YAML_WITH_ROUTING);
       const code = await runBootstrapApply(
@@ -1614,6 +1644,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       );
       expect(code).toBe(1);
       expect(errs.join('\n')).toContain(RUNNER_TOKEN_FLAG);
+      expect(logs.join('\n') + errs.join('\n')).toMatch(/Routing \(MACF_TRUSTED_ACTORS\):/);
     });
 
     it('a token supplied via --runner-token proceeds as today — the pre-flight is not a NEW obstacle for the already-satisfied case', async () => {
@@ -1662,6 +1693,119 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // plan.test.ts's dedicated coverage for this note's unconditional
       // presence; this test only pins that --dry-run does not ALSO refuse.
       expect(out).toContain(RUNNER_TOKEN_FLAG);
+    });
+  });
+
+  // --- groundnuty/macf#1209 — the refusal narrows to runner-dependent work
+  // only. THE decisive test this issue exists for: a preflight that aborts
+  // the run must gate only what actually depends on the missing input.
+  // Observed live on `macf-trial` — a router credential had just been merged
+  // into the vault (an operator-authorised one-time decrypt) and was never
+  // published, because the runner-token refusal aborted the ENTIRE run
+  // before ever reaching the routing-secrets publish, discarding that
+  // irreversible operator action's whole purpose. Per
+  // `assert-the-wrong-path.md`: asserting ONLY "the run still fails" is
+  // satisfied by removing the refusal outright, so this test ALSO asserts
+  // the negative half — MACF_TRUSTED_ACTORS was genuinely WITHHELD, not
+  // silently written anyway.
+  describe('groundnuty/macf#1209 — the runner-token refusal gates only runner-dependent work', () => {
+    it('DECISIVE: self-hosted declared, no runner token, router credential available -> routing secrets ARE published, MACF_TRUSTED_ACTORS is NOT, run exits non-zero naming the skip', async () => {
+      vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      let createRepoVariableCalls = 0;
+      let checkRunnerUsableCalls = 0;
+
+      const code = await runBootstrapApply(
+        { file, yes: true, json: true }, // no opts.runnerToken
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file, {
+          runnerToken: undefined,
+          routingSecretsDeps: fakeRoutingSecretsDeps({
+            checkRepoSecretPresence: async () => 'absent',
+            setRepoSecret: async (repo, name, value) => {
+              setSecretCalls.push({ repo, name, value });
+            },
+          }),
+          trustDeps: fakeTrustDeps({
+            createRepoVariable: async () => {
+              createRepoVariableCalls += 1;
+              return 'created';
+            },
+            checkRunnerUsableByRepo: async () => {
+              checkRunnerUsableCalls += 1;
+              return { presence: 'present' };
+            },
+          }),
+        }),
+      );
+
+      // The run still fails overall — NOT a downgrade to a warning. Uses
+      // #1151's EXISTING 0/1/2 exit-code vocabulary (`applyExitCode`'s
+      // pre-existing `routingBad` check, unchanged by this fix) rather than
+      // inventing a new code — a declared-and-unconfirmable self-hosted
+      // runner is a HARD failure (macf#993's ruling), not a partial-roll `2`
+      // (that code is reserved for the version-reconcile phase leaving fleet
+      // members un-rolled — see `applyExitCode`'s own doc — a different axis
+      // entirely from fleet PROVISIONING completeness).
+      expect(code).toBe(1);
+
+      // Positive half — legs that do NOT depend on the runner token
+      // proceeded and actually published. `MACF_ROUTING_APP_ID`/`_KEY` come
+      // from the freshly-created router App this run; `ROUTING_CLIENT_CERT`/
+      // `_KEY` come from the fresh routing-client mint — neither reads
+      // `resolvedRunnerToken` at any point (`apply-fleet.ts`'s per-name
+      // `RoutingSecretResolution` bag, `apply-routing-secrets.ts`'s module
+      // doc).
+      expect(setSecretCalls.some((c) => c.name === 'MACF_ROUTING_APP_ID')).toBe(true);
+      expect(setSecretCalls.some((c) => c.name === 'MACF_ROUTING_APP_KEY')).toBe(true);
+      expect(setSecretCalls.some((c) => c.name === 'ROUTING_CLIENT_CERT')).toBe(true);
+      expect(setSecretCalls.some((c) => c.name === 'ROUTING_CLIENT_KEY')).toBe(true);
+
+      // Negative half (the actual point, per assert-the-wrong-path.md) —
+      // MACF_TRUSTED_ACTORS was genuinely WITHHELD, not silently written
+      // anyway despite the exit code being non-zero for some OTHER reason.
+      // Zero calls into the write primitive at all (macf#929's "token is
+      // policy, missing token means detection+write are never even
+      // ATTEMPTED" contract) — a passing "code is non-zero" assertion alone
+      // would NOT catch a regression that quietly dropped the refusal.
+      expect(createRepoVariableCalls).toBe(0);
+      expect(checkRunnerUsableCalls).toBe(0);
+
+      const parsed = JSON.parse(logs.join('\n')) as { routing: Record<string, { status: string; reason?: string }> };
+      const routingLeg = parsed.routing['groundnuty/demo-code'];
+      expect(routingLeg?.status).toBe('failed');
+      expect(routingLeg?.reason).toContain('no runner registration token was supplied');
+      // The summary distinguishes skipped-because-dependent (both agent
+      // repos' routing legs, whose reason NAMES the missing token — "the
+      // summary names what was skipped and why") from a genuine unrelated
+      // failure: no OTHER section of this run's result carries a 'failed'
+      // status anywhere (the setSecretCalls assertions above already prove
+      // routing secrets succeeded; a genuinely-broken run would show BOTH
+      // 'failed').
+      expect(parsed.routing['groundnuty/demo-science']?.status).toBe('failed');
+    });
+
+    it('everything supplied -> unchanged (this decisive pair\'s control case)', async () => {
+      vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const setSecretCalls: { repo: string; name: string; value: string }[] = [];
+      const code = await runBootstrapApply(
+        { file, yes: true, json: true, runnerToken: SENTINEL_RUNNER_TOKEN },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        fakeMutateDeps(file, {
+          routingSecretsDeps: fakeRoutingSecretsDeps({
+            checkRepoSecretPresence: async () => 'absent',
+            setRepoSecret: async (repo, name, value) => {
+              setSecretCalls.push({ repo, name, value });
+            },
+          }),
+        }),
+      );
+      expect(code).toBe(0);
+      expect(setSecretCalls.some((c) => c.name === 'MACF_ROUTING_APP_ID')).toBe(true);
+      const parsed = JSON.parse(logs.join('\n')) as { routing: Record<string, { status: string }> };
+      expect(parsed.routing['groundnuty/demo-code']?.status).toBe('created');
     });
   });
 

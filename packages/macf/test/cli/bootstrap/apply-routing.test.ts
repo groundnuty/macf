@@ -1223,7 +1223,13 @@ describe('formatRunnerPollProgress (macf#972)', () => {
   });
 });
 
-// --- macf#932 — the CLI-level pre-flight, fired BEFORE consent gate 1 ---
+// --- macf#932 — the CLI-level pre-flight, fired BEFORE consent gate 1.
+// groundnuty/macf#1209: this PURE function's shape is unchanged (it still
+// reports the same "refusal" object for the same inputs) — only its CALLER
+// (`runBootstrapApply`) changed, from aborting the whole run on a non-
+// `undefined` result to printing it as a warning and proceeding. See
+// `bootstrap-apply.test.ts`'s "macf#932 (narrowed by groundnuty/macf#1209)"
+// + "groundnuty/macf#1209" describe blocks for the caller-level coverage. ---
 
 describe('checkRunnerTokenPreflight (macf#932)', () => {
   it('undefined (proceeds) when routing.runner is not declared at all', () => {
