@@ -305,6 +305,7 @@ export async function runBootstrapPlan(
         for (const { key, source } of operatorInputs) {
           console.log(`  ${formatOperatorInputProvenanceLine(key, source)}`);
         }
+      }
       if (installScopeCoverageLines.length > 0) {
         console.log('');
         console.log(installScopeCoverageLines.join('\n'));

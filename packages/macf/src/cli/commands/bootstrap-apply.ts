@@ -28,7 +28,8 @@ import { createInterface } from 'node:readline';
 import { join, resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
 import { deriveAppHandle, deriveControlRepoName, parseFleetManifest } from '../bootstrap/fleet-manifest.js';
-import type { FleetObserverFn, FleetPlan, FleetPlanFailure, ObservedState, OperatorInteractionBound, UnimplementedApplyItem } from '../bootstrap/plan.js';
+import type { FleetObserverFn, FleetPlan, FleetPlanFailure, ObservedState, OperatorInteractionBound, Presence, UnimplementedApplyItem } from '../bootstrap/plan.js';
+import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, hasInstallScopeCoverageDrift, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
 import {
   checkVaultFlagsComplete,
   computePlan,
@@ -1552,6 +1553,12 @@ function launchNextStepLines(deployPhase: DeployPhaseRenderInput): string[] {
  * as `routing-doctor.ts`'s #1192 (3→4) and #1199 (4→5) bumps: a
  * previously-collapsed status gains a new, narrower meaning a script
  * consuming `--json` would silently misread without the version signal.
+ *
+ * groundnuty/macf#1220 — deliberately NOT bumped for the `install_scope_coverage`
+ * top-level key this file's `runBootstrapApply` now appends beside this
+ * function's own output. Same #1203 rule `status.ts::BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION`'s
+ * sibling comment states in full: a brand-new name, no existing field's
+ * meaning changes, no aggregate here for a new condition to silently feed.
  */
 export const FLEET_APPLY_JSON_SCHEMA_VERSION = 2;
 
@@ -2255,6 +2262,21 @@ export function fleetApplyResultToJson(
  *   token minted this run so labels are 'skipped') — never a "some work
  *   remains, no failure occurred" gap the way `skipBreakdown` was. No new
  *   discriminator needed for any of them.
+ * - `installScopeCoverage` (groundnuty/macf#1220 — a previously-installed
+ *   fleet-level App, `runner-ops`/router, whose `selected` repo set is
+ *   stale against the manifest THIS run just grew): deliberately NEVER
+ *   read here, same reasoning as `remainingDeploy` above. This check
+ *   reports on an App's install state — a fact GitHub owns, and one this
+ *   run has NO code path to change (widening a `selected` install is a
+ *   consent action only the operator can perform on GitHub's install
+ *   page; there is no "fix" this function could gate a retry on the way
+ *   it gates `controlRepoBad`/`agentBad` on states apply itself produced).
+ *   Failing the run over a fact it cannot act on would not prompt a
+ *   different operator action than the loud text/JSON report already
+ *   does — it would only turn an otherwise-successful provision into a
+ *   red exit code for a condition that may have predated this run
+ *   entirely. Reported loud (see this function's call site), never
+ *   silent — but never a spurious non-zero either.
  */
 export function applyExitCode(
   result: FleetApplyResult,
@@ -2948,9 +2970,52 @@ export async function runBootstrapApply(
               project: manifest.metadata.name,
             };
 
+      // groundnuty/macf#1220 — fleet-level (runner-ops/router) App
+      // installation-SCOPE-MEMBERSHIP drift, probed LAST (after `applyFleet`
+      // above has finished creating/confirming repos and identities) —
+      // never at the top of this run. Probing early would read this run's
+      // OWN just-created repo as absent (it did not exist yet) and its
+      // OWN just-minted App credential as unresolvable (not yet in the
+      // vault this run itself writes), manufacturing false drift against
+      // the very state this run is establishing. `agentRepoPresence`/
+      // `controlRepoPresence` are therefore built from `result` (what THIS
+      // run just confirmed), never `observed` (what was true before it
+      // ran) — `ensureAgentRepo`'s own contract (`apply-fleet.ts`'s
+      // per-agent loop: a `'failed'` identity is the ONLY outcome that can
+      // follow a repo-ensure failure; every other identity status implies
+      // the repo was already confirmed present/created/revived earlier in
+      // that same iteration) is what licenses `identity.status !==
+      // 'failed' -> 'present'` below, not a fresh existence read of its
+      // own. `result.finalLock` (not `observed.lock`) is the SAME
+      // "post-run" reasoning applied to credential resolution — a
+      // runner-ops/router App THIS run just created has its entry there,
+      // never in the pre-run `observed.lock`.
+      const installScopeCoverage =
+        opts.vaultPath !== undefined && opts.identityKeyPath !== undefined
+          ? await computeInstallScopeCoverage(
+              manifest,
+              result.finalLock,
+              Object.fromEntries(result.agents.map((rec) => [rec.role, rec.identity.status === 'failed' ? 'unknown' : 'present'])) as Readonly<
+                Record<string, Presence>
+              >,
+              controlRepoAborted ? observed.controlRepoPresence : 'present',
+              { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath },
+            )
+          : {};
+      const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
+
       if (opts.json) {
         console.log(
-          JSON.stringify(fleetApplyResultToJson(result, plan.unimplementedByApply, remainingDeploy, deployPhase, versionResult), null, 2),
+          JSON.stringify(
+            {
+              ...(fleetApplyResultToJson(result, plan.unimplementedByApply, remainingDeploy, deployPhase, versionResult) as Record<string, unknown>),
+              ...(Object.keys(installScopeCoverage).length > 0
+                ? { install_scope_coverage: Object.values(installScopeCoverage).map(installScopeCoverageEntryToJson) }
+                : {}),
+            },
+            null,
+            2,
+          ),
         );
       } else {
         console.log('');
@@ -2960,6 +3025,30 @@ export async function runBootstrapApply(
             flags: opts,
           }),
         );
+        // groundnuty/macf#1220 — printed LAST, after the rest of the result
+        // (never buried mid-render) — report-vs-act, decided: this run
+        // NEVER widens an installation itself (that is a consent action
+        // only the operator can perform on GitHub's install page — see
+        // `install-scope-coverage.ts`'s module doc), and drift here does
+        // NOT change `applyExitCode` below (see that function's own
+        // "Audited other inputs" section for the parallel ruling + why —
+        // this check reports on an App this run did not itself mutate,
+        // the same "informational, never a spurious non-zero" floor that
+        // section already applies to `remainingDeploy`). The loud heading
+        // is the chosen middle ground between silence and a code change:
+        // an operator running WITHOUT --json still sees, in the one place
+        // a script-free run reads its result, that the fleet is not
+        // actually complete yet — never buried as a same-weight preview
+        // line beside a routine "noop" item.
+        if (installScopeCoverageLines.length > 0) {
+          console.log('');
+          console.log(
+            hasInstallScopeCoverageDrift(installScopeCoverage)
+              ? '⚠ FLEET INCOMPLETE — a previously-installed App does not yet cover every repo this manifest declares:'
+              : 'Install-scope coverage (unable to confirm this run):',
+          );
+          console.log(installScopeCoverageLines.join('\n'));
+        }
       }
       return applyExitCode(result, deployResults, versionResult);
     } finally {

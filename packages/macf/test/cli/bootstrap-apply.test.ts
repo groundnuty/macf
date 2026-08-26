@@ -1154,6 +1154,46 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(parsed.vault.status).toBe('written');
   });
 
+  // groundnuty/macf#1220 — same nonexistent-vault-path trick
+  // `bootstrap.test.ts`/`bootstrap-status.test.ts` already use for their own
+  // install-scope-coverage wiring tests: proves `install_scope_coverage`
+  // reaches the REAL `computeInstallScopeCoverage` through `runBootstrapApply`
+  // (never mocked out) when both flags are given, exits 0 even though the
+  // vault read fails (this check is reporting-only — see `applyExitCode`'s
+  // own "Audited other inputs" doc), and is omitted entirely otherwise.
+  it('--vault + --identity-key: `install_scope_coverage` is populated (unknown, for a nonexistent vault) and does not change the exit code', async () => {
+    const file = writeManifest();
+    const dir = join(file, '..');
+    const vaultPath = join(dir, 'does-not-exist', 'vault.age');
+    const identityKeyPath = join(dir, 'does-not-exist', 'identity.txt');
+    // `deploy: false` — this test is about install-scope-coverage ONLY;
+    // `--vault`/`--identity-key` also (correctly, separately) activate the
+    // deploy + version-reconcile phases, which `fakeMutateDeps` was never
+    // built to drive (its `deployDeps`/`versionDeps` are the REAL,
+    // network-touching defaults absent an explicit override) — skipping
+    // both keeps this test isolated to the ONE behavior it exists to pin.
+    const code = await runBootstrapApply(
+      { file, yes: true, json: true, vaultPath, identityKeyPath, deploy: false },
+      { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+      fakeMutateDeps(file),
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(logs.join('\n')) as { install_scope_coverage?: ReadonlyArray<{ role: string; status: string; message?: string }> };
+    // FLEET_YAML declares no `routing:` (no runner-ops needed) but a
+    // `profile`-type registry, so the router App is the one unconditional
+    // target — same fixture shape `bootstrap.test.ts`'s sibling test uses.
+    expect(parsed.install_scope_coverage).toHaveLength(1);
+    expect(parsed.install_scope_coverage?.[0]?.status).toBe('unknown');
+  });
+
+  it('WITHOUT --vault/--identity-key, `install_scope_coverage` is omitted entirely from a successful apply', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+    expect(code).toBe(0);
+    const parsed = JSON.parse(logs.join('\n')) as Record<string, unknown>;
+    expect('install_scope_coverage' in parsed).toBe(false);
+  });
+
   it('control repo FOREIGN end-to-end (unreadable fleet.yaml): exit 1, NO agent App/repo/install is ever touched, no fleet.lock/vault.age written', async () => {
     const file = writeManifest();
     let agentDepsBuilt = false;
