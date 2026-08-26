@@ -2379,6 +2379,192 @@ agents:
     });
   });
 
+  /**
+   * groundnuty/macf#1240 — the residual `#1221` split out so that issue did
+   * not stretch a fourth time. `#1237` (the describe block right above)
+   * fixed the CONTROL repo's own label-creation token resolution; the
+   * PER-AGENT repo-init call (an agent's OWN repo) still ran with NO
+   * `tokenSource` at all for `reused`/`resumed-install` identities,
+   * unconditionally degrading to the ambient-env fallback — verified live on
+   * the SAME run that closed `#1221` (CLI at `4ba3596`): the control repo's
+   * labels landed via `#1237`, but every agent repo still printed "could not
+   * generate token... Skipping label creation." These tests assert at the
+   * SAME call site `#1237`'s own tests assert at (the options object the
+   * injected `repoInit` fake receives) but for the agent's OWN repo, never
+   * the control repo — a fixture-level `if (opts.repo === ...control)`
+   * branch keeps the two concerns from being conflated in one assertion.
+   */
+  describe('per-agent repo-init resolves its OWN vault-backed token (groundnuty/macf#1240)', () => {
+    it('DECISIVE (1/2) — reused agent, no local lock, a vault-backed credential supplied: agent-repo labels land via the per-agent repoInit call', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+
+      // A REAL PEM file on disk — `resolveAgentRepoInitTokenSource`'s
+      // `exists()` guard rejects a resolved-but-absent path, so a fixture
+      // using a placeholder like '/fake.pem' (as `agentDepsFor`'s 'reused'
+      // shape does) would not actually prove this fix.
+      const vaultKeyDir = mkdtempSync(join(tmpdir(), 'macf-apply-fleet-agentrepo-vaultkey-'));
+      dirs.push(vaultKeyDir);
+      const vaultKeyPath = join(vaultKeyDir, 'code-agent.pem');
+      writeFileSync(vaultKeyPath, 'SENTINEL-VAULT-PEM-code-agent', { mode: 0o600 });
+
+      // No LOCAL lock — this run's ONLY source for the reused decision is
+      // the caller-supplied `priorLock` below (kept simple; #1237's own
+      // self-heal path is orthogonal to this fix and already covered).
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+
+      const agentRepoCalls: RepoInitOptions[] = [];
+      const repoInitDeps: RepoInitStepDeps = {
+        cloneRepo: async () => {},
+        commitAndPush: async () => 'pushed',
+        repoInit: async (_dir, opts) => {
+          if (opts.repo === 'groundnuty/demo-fleet-control') {
+            // the control repo — #1237's own concern, not this test's.
+            return { workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } };
+          }
+          agentRepoCalls.push(opts);
+          return opts.tokenSource === undefined
+            ? { workflow: 'created', config: 'created', labels: { status: 'skipped', reason: 'No GH_TOKEN, no TokenSource provided, and missing APP_ID/INSTALL_ID/KEY_PATH env vars' } }
+            : { workflow: 'created', config: 'created', labels: { status: 'ok', created: ['code-agent'], existed: [] } };
+        },
+      };
+
+      // The vault-backed key resolver — same shape `resolveMutateDeps` wires
+      // under --vault/--identity-key, pointed at the REAL file above instead
+      // of the fixture's usual '/fake.pem' placeholder.
+      const agentDeps: AgentApplyDeps = { ...agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), resolveKeyPath: () => vaultKeyPath };
+      const deps = baseDeps(agentDeps, manifestPath, repoInitDeps);
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('reused');
+
+      // Exactly ONE agent-repo repoInit call, carrying the resolved
+      // tokenSource — never the credential-less shape this issue reports.
+      expect(agentRepoCalls).toHaveLength(1);
+      expect(agentRepoCalls[0]?.tokenSource).toEqual({ appId: 'app-code-agent', installId: 'install-1', keyPath: vaultKeyPath });
+
+      expect(result.agents[0]?.repoInit?.status).toBe('applied');
+      if (result.agents[0]?.repoInit?.status === 'applied') {
+        expect(result.agents[0].repoInit.labels).toEqual({ status: 'ok', created: ['code-agent'], existed: [] });
+      }
+      expect(applyExitCode(result)).toBe(0);
+    });
+
+    it('DECISIVE (2/2) — no credential anywhere for this role: tokenSource stays honestly omitted (never a fabricated/nonexistent one), and this agent-repo gap alone does not fail the run', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+
+      const agentRepoCalls: RepoInitOptions[] = [];
+      const repoInitDeps: RepoInitStepDeps = {
+        cloneRepo: async () => {},
+        commitAndPush: async () => 'pushed',
+        repoInit: async (_dir, opts) => {
+          if (opts.repo === 'groundnuty/demo-fleet-control') {
+            return opts.tokenSource === undefined
+              ? { workflow: 'created', config: 'created', labels: { status: 'skipped', reason: 'No GH_TOKEN, no TokenSource provided, and missing APP_ID/INSTALL_ID/KEY_PATH env vars' } }
+              : { workflow: 'created', config: 'created', labels: { status: 'ok', created: ['code-agent'], existed: [] } };
+          }
+          agentRepoCalls.push(opts);
+          return opts.tokenSource === undefined
+            ? { workflow: 'created', config: 'created', labels: { status: 'skipped', reason: 'No GH_TOKEN, no TokenSource provided, and missing APP_ID/INSTALL_ID/KEY_PATH env vars' } }
+            : { workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: ['code-agent'] } };
+        },
+      };
+
+      // 'reused' fixture's `resolveKeyPath` points at '/fake.pem', which
+      // does NOT exist on disk — `resolveAgentRepoInitTokenSource`'s
+      // keyPath-is-not-a-credential guard filters it, so this run has NO
+      // credential anywhere for this role (and, by the SAME fixture, none
+      // for the control repo either).
+      const deps = baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps);
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('reused');
+      expect(agentRepoCalls).toHaveLength(1);
+      // The honest "nothing to try" — never a garbage/nonexistent-path
+      // tokenSource fabricated from the unresolved '/fake.pem'.
+      expect(agentRepoCalls[0]?.tokenSource).toBeUndefined();
+
+      // Not a hard failure on the AGENT-repo side — must not fail unrelated
+      // legs (groundnuty/macf#1210). `applyRepoInitForAgent`'s own
+      // `labelsAreGoodEnough` scores a credential-less 'skipped' outcome as
+      // 'applied', unchanged by this fix.
+      expect(result.agents[0]?.repoInit?.status).toBe('applied');
+      // The run as a WHOLE still reports incomplete (exit 2, never 0) — but
+      // that comes from the CONTROL repo's own pre-existing #1237 signal
+      // (`controlRepoLabelsPending`), which this fixture's identical
+      // no-working-vault-key shape ALSO leaves unconfirmed. This fix must
+      // not weaken that signal (per the issue's own "do not weaken #1237"
+      // requirement) — it is asserted here, unchanged, alongside the new
+      // agent-repo behavior above.
+      expect(result.controlRepoInit.status).toBe('written');
+      if (result.controlRepoInit.status === 'written') {
+        expect(result.controlRepoInit.labels.status).toBe('skipped');
+        expect(result.controlRepoInit.labelsGoodEnough).toBe(true);
+      }
+      expect(applyExitCode(result)).toBe(2);
+    });
+
+    it('a resolved credential + a genuine mint failure: NOW a hard failure (exit 1) — the newly-reachable escalation this fix introduces, distinct from the honest no-credential case above', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+
+      const vaultKeyDir = mkdtempSync(join(tmpdir(), 'macf-apply-fleet-agentrepo-badmint-'));
+      dirs.push(vaultKeyDir);
+      const vaultKeyPath = join(vaultKeyDir, 'code-agent.pem');
+      writeFileSync(vaultKeyPath, 'SENTINEL-VAULT-PEM-code-agent', { mode: 0o600 });
+
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+
+      const agentRepoCalls: RepoInitOptions[] = [];
+      const repoInitDeps: RepoInitStepDeps = {
+        cloneRepo: async () => {},
+        commitAndPush: async () => 'pushed',
+        repoInit: async (_dir, opts) => {
+          if (opts.repo === 'groundnuty/demo-fleet-control') {
+            return { workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } };
+          }
+          agentRepoCalls.push(opts);
+          // A resolvable credential WAS supplied (`opts.tokenSource` is
+          // defined below) but the mint itself genuinely failed — a revoked
+          // key, a stale vault PEM, a transient 401. `labelsAreGoodEnough`
+          // now scores this as a HARD failure, same bar the `created` path
+          // already had (groundnuty/macf#920) — before this fix, the
+          // `reused`/`resumed-install` branch never supplied a tokenSource
+          // at all, so this exact shape could never even be reached for it.
+          return { workflow: 'created', config: 'created', labels: { status: 'partial-failure', created: [], existed: [], failed: ['in-progress'] } };
+        },
+      };
+
+      const agentDeps: AgentApplyDeps = { ...agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), resolveKeyPath: () => vaultKeyPath };
+      const deps = baseDeps(agentDeps, manifestPath, repoInitDeps);
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(result.agents[0]?.identity.status).toBe('reused');
+      expect(agentRepoCalls).toHaveLength(1);
+      expect(agentRepoCalls[0]?.tokenSource).toEqual({ appId: 'app-code-agent', installId: 'install-1', keyPath: vaultKeyPath });
+
+      expect(result.agents[0]?.repoInit?.status).toBe('failed');
+      expect(applyExitCode(result)).toBe(1);
+    });
+  });
+
   // --- DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) ---
 
   describe('CA ceremony + two-place publish + MACF_TRUSTED_ACTORS (macf#922 — was MACF_ROUTING_RUNS_ON)', () => {

@@ -37,7 +37,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RegistryConfig, TokenSource } from '@groundnuty/macf-core';
@@ -102,11 +102,15 @@ export interface RepoInitStepOptions {
    * `cleanupScratchPem`) — a Mac-side `macf bootstrap apply` run has no
    * ambient `GH_TOKEN`/`APP_ID` env for the just-minted bot, so without this
    * `repoInit`'s own `generateToken()` call always degrades to
-   * `labels: {status:'skipped'}` (macf#920's actual repro). Omitted for the
-   * `reused`/`resumed-install` identity paths, which have no PEM in process
-   * memory this run — see this module's doc + `applyRepoInitForAgent`'s
-   * doc for how that case is scored (leniently — this run supplied nothing,
-   * so nothing new is asserted about it).
+   * `labels: {status:'skipped'}` (macf#920's actual repro). For the
+   * `reused`/`resumed-install` identity paths (no PEM in process memory this
+   * run), groundnuty/macf#1240 threads this too — resolved from that role's
+   * OWN vault-stored credential via `resolveAgentRepoInitTokenSource`, when
+   * one is available (`--vault`/`--identity-key` supplied AND the vault
+   * holds this role's key). Genuinely omitted only when no such credential
+   * resolves — see this module's doc + `applyRepoInitForAgent`'s doc for how
+   * THAT case is scored (leniently — nothing was supplied, so nothing new is
+   * asserted about it).
    */
   readonly tokenSource?: TokenSource;
   /**
@@ -178,6 +182,57 @@ export function resolveActionsPinReconcile(
   return { actionsVersion: observedPin ?? DEFAULT_ACTIONS_VERSION, force: false };
 }
 
+/**
+ * Resolve a legitimate `TokenSource` for a REUSED/`resumed-install` agent's
+ * OWN repo-init label-creation mint (groundnuty/macf#1240 — the residual
+ * `#1221` split out so that issue did not stretch a fourth time). Mirrors
+ * `apply-fleet.ts::resolveRunnerOpsVaultPem`'s SINGLE-ROLE resolution
+ * (`resolveKeyPath(role, priorAppId)`, wired only under `--vault`/
+ * `--identity-key`) — deliberately NOT
+ * `apply-control-repo-init.ts::resolveControlRepoLabelTokenSource`'s
+ * cross-role scan. That scan is legitimate ONLY for the control repo,
+ * because every declared agent's App install already reaches it
+ * (`apply-control-repo-init.ts`'s own doc, "Why the control repo, not
+ * peer-repo access"). An ordinary agent's App install is scoped to its OWN
+ * home repo ONLY (`apply-agent.ts::installReposForIdentity` — a sibling
+ * role's install never covers this repo), so the ONLY legitimate source for
+ * THIS repo's label-creation mint is `role`'s own credential — borrowing
+ * another role's would be attempting a mint that role's App has no access
+ * to.
+ *
+ * `resolveKeyPath === undefined` (no `--vault`/`--identity-key` this run) or
+ * a resolved path this role's key doesn't cover both return `undefined` — an
+ * honest "nothing to try," not a failure. `applyRepoInitForAgent` then
+ * degrades exactly as it did before this fix: `opts.tokenSource` stays
+ * omitted, labels are reported `'skipped'`, and that is NOT scored as a hard
+ * failure — see `labelsAreGoodEnough`'s doc, which this function's callers
+ * rely on unchanged.
+ *
+ * **A returned `keyPath` that doesn't exist on disk is not a credential** —
+ * same contract as `resolveControlRepoLabelTokenSource`'s own doc: the real
+ * `resolveKeyPath` implementation `writeFileSync`s the decrypted PEM and
+ * only THEN returns its path, so a genuine resolution always has a readable
+ * file waiting there. A path to nothing (e.g. a test double that fakes a
+ * non-empty return without ever writing content) must not be treated as
+ * usable — it would reach `generateToken()` and attempt a REAL `gh token
+ * generate` subprocess against a key that was never actually written.
+ * `exists` defaults to the real `existsSync`; tests inject a fake so this
+ * stays a plain, synchronous, no-network check.
+ */
+export function resolveAgentRepoInitTokenSource(
+  role: string,
+  priorAppId: string,
+  priorInstallId: string,
+  resolveKeyPath: ((role: string, priorAppId: string) => string | undefined) | undefined,
+  exists: (path: string) => boolean = existsSync,
+): TokenSource | undefined {
+  if (resolveKeyPath === undefined) return undefined;
+  const keyPath = resolveKeyPath(role, priorAppId);
+  if (keyPath === undefined) return undefined;
+  if (!exists(keyPath)) return undefined;
+  return { appId: priorAppId, installId: priorInstallId, keyPath };
+}
+
 export interface RepoInitStepDeps {
   readonly cloneRepo: (url: string, destDir: string) => Promise<void>;
   readonly commitAndPush: (dir: string, message: string) => Promise<'pushed' | 'nothing-to-commit'>;
@@ -238,13 +293,20 @@ export type RepoInitStepOutcome =
  * `opts.tokenSource` was given — i.e. this run supplied everything
  * `repoInit` needed to succeed, so anything short of `'ok'` is a genuine
  * regression apply must not paper over ("green exit must not mean
- * unroutable fleet"). When no `tokenSource` was given (the `reused`/
- * `resumed-install` identity paths, which have no PEM in memory this run),
- * a non-'ok' outcome is the PRE-EXISTING, already-acknowledged gap this
- * increment does not close — see this module's + `apply-fleet.ts`'s doc.
- * Scoring it as a failure there would regress every already-provisioned
- * fleet's ordinary re-run apply, which is worse than the gap it would
- * "fix."
+ * unroutable fleet"). The `reused`/`resumed-install` identity paths (no PEM
+ * in memory this run) now ALSO reach this HARD-FAILURE branch whenever
+ * groundnuty/macf#1240's `resolveAgentRepoInitTokenSource` resolves a
+ * `tokenSource` from that role's own vault-stored credential — a genuine
+ * mint failure against a resolvable credential (revoked key, stale vault
+ * PEM, transient 401) is exactly the "supplied everything, still not 'ok'"
+ * case this function exists to catch, same bar as the `created` path
+ * already had. Only when NO `tokenSource` resolves (no `--vault`/
+ * `--identity-key` this run, or the vault doesn't hold this role's key) does
+ * a non-'ok' outcome stay the honest, lenient "nothing to try" this
+ * function scores as good-enough — see this module's + `apply-fleet.ts`'s
+ * doc. Scoring THAT case as a failure would regress every already-
+ * provisioned, vault-less fleet's ordinary re-run apply, which is worse
+ * than the gap it would "fix."
  */
 function labelsAreGoodEnough(labels: LabelsOutcome, tokenSourceGiven: boolean): boolean {
   if (labels.status === 'ok') return true;

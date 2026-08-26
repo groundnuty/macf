@@ -217,7 +217,7 @@ import { buildInstallScopeValidator } from './install-scope.js';
 import type { ConfirmedInstall } from './identity-confirm.js';
 import type { AppCredentials } from './manifest-exchange.js';
 import type { AgentRepoDeps, AgentRepoOptions, RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
-import { applyRepoInitForAgent, ensureAgentRepo, resolveActionsPinReconcile } from './apply-repo-init.js';
+import { applyRepoInitForAgent, ensureAgentRepo, resolveActionsPinReconcile, resolveAgentRepoInitTokenSource } from './apply-repo-init.js';
 import { repoHomepageUrl } from './app-manifest.js';
 import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './control-repo.js';
 import { provisionControlRepo } from './control-repo.js';
@@ -1585,14 +1585,25 @@ export async function applyFleet(
 
     if (identity.status === 'reused' || identity.status === 'resumed-install') {
       writeIncrementalLock(agent.role, { appId: identity.appId, installId: identity.installId });
-      // No PEM in process memory this run for `reused`/`resumed-install` (no
-      // vault-decrypt seam wired into repo-init yet — see
-      // `RepoInitStepOptions.tokenSource`'s doc) — pre-existing, acknowledged
-      // gap; groundnuty/macf#920 closes ONLY the `created` path below, which
-      // is where apply-fleet.ts already holds a freshly-exchanged credential.
+      // groundnuty/macf#1240 (the residual `#1221` split out) — no PEM is in
+      // process memory this run for `reused`/`resumed-install` (unlike the
+      // `created` path below), but a vault-backed `resolveKeyPath` MAY still
+      // resolve THIS role's own durable credential — the SAME closure
+      // `confirmBeforeCreateGuard` already called to confirm this reuse is
+      // real in the first place. `resolveAgentRepoInitTokenSource` is the
+      // single-role counterpart of `resolveControlRepoLabelTokenSource`
+      // (that resolver's cross-role scan is legitimate ONLY for the control
+      // repo — see its own doc; an ordinary agent's App install never
+      // reaches a sibling's repo). `undefined` (no `--vault`/
+      // `--identity-key` this run, or the vault doesn't hold this role's
+      // key) degrades exactly as before this fix — `tokenSource` stays
+      // omitted and label creation is honestly reported `'skipped'`, never
+      // scored as a failure (`labelsAreGoodEnough`'s doc).
+      const repoInitTokenSource = resolveAgentRepoInitTokenSource(agent.role, identity.appId, identity.installId, agentDeps.resolveKeyPath);
       repoInitOutcome = await applyRepoInitForAgent(agent, manifest, deps.repoInitDeps, {
         actionsVersion: pinReconcile.actionsVersion,
         force: pinReconcile.force,
+        ...(repoInitTokenSource !== undefined ? { tokenSource: repoInitTokenSource } : {}),
       });
       if (manifest.versions) actionsPinResults.push(actionsPinResultFor(agent.repo, pinReconcile.force, repoInitOutcome));
     } else if (identity.status === 'created') {
