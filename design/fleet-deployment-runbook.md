@@ -669,7 +669,58 @@ fleet) instead of refusing.
 
 ---
 
-## 10. Cross-references
+## 10. `fleet` health/supervision commands — not provisioning, but part of the same command family
+
+These operate on an **already-deployed** fleet (post row-6 of §4) rather
+than bringing one up, so they're out of this runbook's main flow — but
+"every flag on every `bootstrap`/`fleet` command" includes them, so here is
+the complete flag list for each, current as of `packages/macf/src/cli/index.ts`.
+Run the bracketed `--help` for the living version.
+
+**`macf fleet status`** [`--help`] — roster + live health for every
+registered agent (mTLS `/health`, uptime, cert-expiry warnings, idle/busy).
+Flags: `--json` (structured output), `--dir <path>` (project dir; default:
+auto-discovery from cwd).
+
+**`macf fleet doctor`** [`--help`] — mesh-interconnect test. Default is
+non-invasive (Reachable + Accepted); `--inject` additionally routes a real
+marker-bearing `/notify` to prove full deliver→process (invasive — wakes
+the agent). Flags: `--json`, `--inject`, `--inject-timeout <sec>` (default
+24), `--dir <path>`, `--manifest <path>` (cross-checks each manifest agent's
+declared role against the discovered workspace routing label).
+
+**`macf fleet install-cron`** [`--help`] — installs a host crontab entry
+that periodically runs `fleet reconcile`. Flags: `--schedule <cron>`,
+`--execute` (installs an ACTING line; default is report-only),
+`--allow-restart`, `--with-routing`, `--manifest <path>`, `--no-token`
+(don't bake a `GH_TOKEN` mint into the cron line), `--uninstall`, `--print`
+(preview without touching crontab), `--prelude <path>`, `--log <path>`,
+`--yes`, `--dir <path>`.
+
+**`macf fleet reconcile`** [`--help`] — the desired-state watchdog: probes
+actual `/health` against a desired set and launches/heals/skips accordingly.
+Dry-run by default. Flags: `--execute`, `--allow-restart` (enables Tier-2
+graceful-restart), `--with-routing`, `--manifest <path>`, `--state-dir
+<dir>`, `--last-exit-dir <dir>`, `--paused-dir <dir>`, `--heartbeat-file
+<path>`, `--json`, `--dir <path>`.
+
+**`macf fleet resume`** [`--help`] — nudges a stalled idle agent or reports
+a blocked one (never auto-answers a permission/trust prompt). Dry-run by
+default. Flags: `--execute`, `--dir <path>`.
+
+**`macf fleet upgrade`** [`--help`] — the rolling framework-version upgrade
+described in §8's exit-code table. Flags: `--target <version>` (default:
+npm-latest of `@groundnuty/macf`), `--fleet <names>` / `--registry <ids>`
+(comma-lists, same selector space — `--registry` is the historical name),
+`--execute`, `--wait` (poll for idle instead of skipping a busy agent),
+`--verify-timeout <sec>` (default 120), `--force` (bypass the config-dirty
+pre-flight gate — the agent's own dirt still isn't stashed), `--dir <path>`,
+`-f, --file <path>` (a confirmed verify-green then records `deployed_version`
+into that fleet's `fleet.lock`; omitted = unchanged).
+
+---
+
+## 11. Cross-references
 
 - **[`DR-043`](decisions/DR-043-declarative-fleet-provisioning.md)** — the
   design record this runbook is the operator-facing companion to. Read it
