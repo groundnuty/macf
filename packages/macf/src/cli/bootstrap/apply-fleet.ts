@@ -1272,10 +1272,13 @@ export async function applyFleet(
     // mint/attempt itself never got a confirmed answer) — the honest-
     // unknown floor: say UNCONFIRMED, never assert absence or presence
     // without having actually read the state.
+    const labels = controlRepoInit.labels;
     const detail =
-      controlRepoInit.labels.status === 'skipped'
-        ? `label state is UNCONFIRMED — ${controlRepoInit.labels.reason}`
-        : `label creation FAILED for: ${controlRepoInit.labels.failed.join(', ')}`;
+      labels.status === 'skipped'
+        ? `label state is UNCONFIRMED — ${labels.reason}`
+        : labels.status === 'partial-failure'
+          ? `label creation FAILED for: ${labels.failed.join(', ')}`
+          : 'label state is UNCONFIRMED';
     deps.log(
       `Control repo "${controlRepo.repo}" repo-init: ⚠ ${detail} (${controlRepoInit.agents.join(', ')}) — ` +
         'a resolved credential was available this run, so this is not the ordinary "no token yet" gap. ' +
