@@ -736,10 +736,16 @@ describe('perRepoRoutingOutcome (pure)', () => {
     expect(perRepoRoutingOutcome(result, ['o/a'])).toEqual([{ repo: 'o/a', failed: true, reason: 'reason-a | reason-z' }]);
   });
 
-  it('a "skipped" leg (e.g. Tailscale not-required) does NOT count as failed on its own', () => {
+  // groundnuty/macf#1184 — reversed from the pre-#1184 expectation ("a
+  // skipped leg does NOT count as failed on its own"). A `'skipped'` leg
+  // means the repo secret is genuinely ABSENT this run (see this function's
+  // own doc for why `publishRoutingSecrets` only ever emits `'skipped'` on
+  // confirmed-absent, never on present-but-unneeded) — the operator cannot
+  // route through that repo any more than through a `'failed'` one.
+  it('a "skipped" leg (e.g. Tailscale not-required) DOES count as failed — the repo genuinely lacks the secret (groundnuty/macf#1184)', () => {
     const result = resultWith(['o/a']);
     result[TS_OAUTH_CLIENT_ID_SECRET_NAME]!['o/a'] = { status: 'skipped', reason: 'not declared yet' };
-    expect(perRepoRoutingOutcome(result, ['o/a'])).toEqual([{ repo: 'o/a', failed: false }]);
+    expect(perRepoRoutingOutcome(result, ['o/a'])).toEqual([{ repo: 'o/a', failed: true, reason: 'not declared yet' }]);
   });
 
   it('DECISIVE: label-prefixed reasons (the REAL shape ensureVariableCreated produces — "routing secret \\"NAME\\" on \\"REPO\\": <cause>") for the SAME underlying cause on DIFFERENT repos still collapse to ONE reason after stripping — the fix for a real bug found while writing this suite: without stripping, the repo-embedding label makes every repo\'s reason byte-different even when the cause is identical', () => {

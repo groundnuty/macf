@@ -193,10 +193,16 @@ export function computeRemainingDeploy(
  */
 export function formatRemainingDeployLines(report: RemainingDeployReport): readonly string[] {
   if (report.steps.length === 0) return [];
+  // groundnuty/macf#1184 — dropped the bare "the fleet is provisioned" claim
+  // (the operator's own correction: "I wouldn't be so bold to say that the
+  // fleet is provisioned. The fleet is defined on GitHub and not yet
+  // functional.") "apply succeeded at its own job" is UNCHANGED — #1184
+  // explicitly protects that phrase; only the umbrella word next to it was
+  // the over-reach.
   const lines: string[] = [
-    `⚠ ${String(report.steps.length)} declared agent(s) have no local workspace yet — the fleet is provisioned but ` +
-      'NOT running. apply ' +
-      'succeeded at its own job; deploy each agent to bring the fleet up:',
+    `⚠ ${String(report.steps.length)} declared agent(s) have no local workspace yet — this fleet's GitHub-side ` +
+      'resources are defined, but it is NOT running. apply succeeded at its own job; deploy each agent to bring ' +
+      'the fleet up:',
   ];
   if (report.vaultLocationNote !== undefined) {
     lines.push(`  ⚠ ${report.vaultLocationNote}`);
