@@ -26,9 +26,26 @@
  *                              ambient `GH_TOKEN`) for DI/testability consistency
  *                              with every other reader in this file — deliberately
  *                              NOT a re-export of that function.
+ *   - `listRepoLabels`       — a repo's label names (macf#1191's assignment-label
+ *                              routing-artifact check): `gh api repos/<repo>/labels`.
+ *                              `null` on ANY failure. Deliberately does NOT try to
+ *                              tell "this caller cannot see the repo" apart from
+ *                              "the repo genuinely has none" — GitHub returns the
+ *                              same 404 whether a repo is private-and-uninstalled,
+ *                              nonexistent, or misnamed (private repos are not
+ *                              enumerable, by design), so there is no status-code
+ *                              or other discriminator to build here. The caller
+ *                              (`routing-doctor.ts::evaluateRoutingArtifact`) reports
+ *                              any `null` as `not-visible`, never as a confirmed
+ *                              `missing` — collapsing them would reproduce, one
+ *                              level down, the exact false-negative macf#1191 exists
+ *                              to eliminate.
  *
  * The token is forwarded as `GH_TOKEN` in the subprocess env (the house auth
- * posture); none of these has a write path.
+ * posture); none of these has a write path. `listRepoLabels` in particular is
+ * READ-ONLY by design and must stay that way — see the WHY-comment on
+ * `buildArtifactChecks` in `routing-doctor.ts` for why this command must never
+ * gain a label-creation path.
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -179,6 +196,40 @@ export function createFleetManifestReader(token: string): (repo: string) => Prom
         { encoding: 'utf-8', env, maxBuffer: 1 * 1024 * 1024 },
       );
       return stdout;
+    } catch {
+      return null;
+    }
+  };
+}
+
+/**
+ * List a repo's label names (macf#1191's assignment-label routing-artifact
+ * check). `null` on ANY read failure — inaccessible, deleted, network, or
+ * anything else. This is a DELIBERATE non-decision: GitHub's API returns the
+ * identical 404 whether a repo doesn't exist, is private with this caller's
+ * App not installed there, or was simply misnamed (private repos must not be
+ * enumerable, so the API cannot afford to distinguish "forbidden" from
+ * "not found" without leaking existence) — there is no reliable signal here
+ * to build a finer-grained discriminator on, and guessing one back in would
+ * silently misreport a "cannot see" as a confirmed "missing," which is
+ * exactly the false-negative macf#1191 exists to eliminate. An empty array
+ * IS a meaningful, distinct result (the repo was read successfully and
+ * genuinely has zero labels) — only a thrown/rejected read collapses to
+ * `null`. NEVER throws.
+ */
+export function createRepoLabelLister(token: string): (repo: string) => Promise<readonly string[] | null> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo: string): Promise<readonly string[] | null> => {
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['api', '--paginate', `repos/${repo}/labels`, '--jq', '.[].name'],
+        { encoding: 'utf-8', env, maxBuffer: 8 * 1024 * 1024 },
+      );
+      return stdout
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
     } catch {
       return null;
     }
