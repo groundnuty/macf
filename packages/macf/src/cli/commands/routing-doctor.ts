@@ -98,6 +98,21 @@
  *     clean run. This command NEVER creates the missing artifact — see the
  *     WHY-comment on `buildArtifactChecks`.
  *
+ *     macf#1193 refines the repo-config read itself: the original `if
+ *     (!config) continue` collapsed absent / malformed / read-failed into
+ *     the SAME "not a routing participant" free pass a `no-workflow` repo
+ *     gets from the caller-pin sweep — but a repo with a CORRUPT config IS a
+ *     participant whose routing is genuinely broken, which is the exact
+ *     "skip indistinguishable from a pass" shape #1191 itself exists to
+ *     eliminate, surviving inside its own fix. `readRoutingConfigForRepo`
+ *     now returns a `RoutingConfigReadResult` distinguishing `absent` (a
+ *     confident 404 on an already known-visible repo — silently skipped,
+ *     unchanged) from `malformed` (a confirmed defect — fails the verdict
+ *     via a `config-malformed` entry) from `read-failed` (network/rate-
+ *     limit — inconclusive, lowers coverage via a `config-read-failed`
+ *     entry, never fails the verdict). See `RoutingConfigReadResult` and
+ *     `gatherRoutingArtifacts` for the full rationale.
+ *
  * Every GitHub read (install-set, caller-pins, agent-config, repo labels), the
  * registry list, the mTLS `/health` probe, and the CA-var read are INJECTABLE
  * (`RoutingDoctorDeps`) so tests run fully offline. The `gh` shell-outs live in
@@ -129,6 +144,7 @@ import {
   createInstallRepoLister,
   createCallerPinReader,
   createRoutingConfigGhReader,
+  createRoutingConfigGhReaderDetailed,
   createFleetMarkerReader,
   createFleetManifestReader,
   createRepoLabelLister,
@@ -602,8 +618,74 @@ export function evaluateRoutingClientCertIssuer(
  * false-negative this check exists to eliminate: "same audit, same table,
  * different answers depending on who runs it" is exactly the failure mode
  * a `missing` verdict built on an inconclusive read would create.
+ *
+ * `config-malformed` / `config-read-failed` (macf#1193) are the REPO-LEVEL
+ * siblings of `missing` / `not-visible` — not about a specific named agent,
+ * but about whether the repo's OWN `.github/agent-config.json` was even
+ * readable as a trustworthy routing table in the first place:
+ *  - `config-malformed`   — the read succeeded but the content is broken
+ *                           (bad JSON, or no usable `agents` object). A
+ *                           CONFIRMED defect on a CONFIRMED participant,
+ *                           same "genuinely broken, not merely unproven"
+ *                           weight as `missing` — fails the verdict.
+ *  - `config-read-failed` — the read failed for a transient reason
+ *                           (network, rate-limit). Genuinely inconclusive,
+ *                           same weight as `not-visible` — lowers coverage,
+ *                           never fails the verdict.
+ * Kept as DISTINCT literals rather than reusing `missing`/`not-visible`
+ * outright: a config that is present-but-broken is a different KIND of
+ * finding from a per-agent label gap, and this file has twice before
+ * renamed a status literal specifically to stop a forced-proxy or an
+ * unresolved-heuristic value from rendering indistinguishably from a
+ * genuine pass (`routing_client_cert`'s `ok`→`presumed-ok`, macf#874) —
+ * collapsing "the config is broken" into the same string as "this repo
+ * names an agent with no matching label" would be the same mistake in the
+ * opposite direction: a real defect rendering as a familiar, differently-
+ * caused one. See `CONFIRMED_DEFECT_STATUSES` / `INCONCLUSIVE_STATUSES` for
+ * how the verdict/coverage predicates group these WITHOUT caring which
+ * literal fired.
  */
-export type RoutingArtifactStatus = 'present' | 'missing' | 'not-visible';
+export type RoutingArtifactStatus =
+  | 'present'
+  | 'missing'
+  | 'not-visible'
+  | 'config-malformed'
+  | 'config-read-failed';
+
+/**
+ * Statuses that are a CONFIRMED defect — they fail the routing-plane verdict.
+ * Grouped by INTENT rather than enumerated inline at each call site so a
+ * future status joins the right bucket by construction instead of requiring
+ * every `.status === 'missing'`-style predicate to be found and updated by
+ * hand (the exact class of silent gap macf#1193 itself is about).
+ */
+const CONFIRMED_DEFECT_STATUSES: ReadonlySet<RoutingArtifactStatus> = new Set([
+  'missing',
+  'config-malformed',
+]);
+
+/**
+ * Statuses that are an INCONCLUSIVE read — they lower coverage but never fail
+ * the verdict. Sibling grouping to `CONFIRMED_DEFECT_STATUSES`, above.
+ */
+const INCONCLUSIVE_STATUSES: ReadonlySet<RoutingArtifactStatus> = new Set([
+  'not-visible',
+  'config-read-failed',
+]);
+
+/**
+ * Sentinel `agent` value for a config-level defect row (macf#1193) — NOT a
+ * real routing label. A `config-malformed` / `config-read-failed` entry is
+ * about the repo's OWN `.github/agent-config.json` as a whole, not about any
+ * one named agent, so there is no real label to put here; the `status` field
+ * (not this value) is what a consumer should branch on.
+ */
+const CONFIG_DEFECT_AGENT = '(config)';
+
+/** Artifact name for a config-level defect row (macf#1193) — distinct from
+ * `buildArtifactChecks`' per-agent artifact names (e.g. "assignment-label")
+ * so a consumer can immediately tell these rows apart by `artifact` alone. */
+const CONFIG_DEFECT_ARTIFACT = 'routing-config';
 
 export interface RoutingArtifactResult {
   readonly repo: string;
@@ -671,25 +753,76 @@ export function evaluateRoutingArtifact(
  * needs its artifacts present IN R — not in the repo this command happens to
  * run from — for R's queue to be reachable at all.
  *
- * A repo whose config can't be read contributes NOTHING here (same
- * "not a routing participant" treatment the caller-pin sweep gives a
- * `no-workflow` repo) — a DIFFERENT question from the `not-visible` artifact
- * status above. This is "does R have a routing table to audit at all";
- * `not-visible` is "R's table names agent A, but the ARTIFACT read for A
- * itself failed." Conflating the two would make a ordinary non-fleet repo
- * (no agent-config.json — the overwhelming common case) show up as a
- * coverage gap it isn't.
+ * `readRoutingConfigForRepo` (macf#1193) discriminates FOUR outcomes, and
+ * this function treats each differently:
+ *
+ *  - `absent`      — R genuinely has no `.github/agent-config.json` (a
+ *                    confident 404 on an already known-visible repo — see
+ *                    `RoutingConfigReadResult`'s doc). Contributes NOTHING —
+ *                    same "not a routing participant" treatment the
+ *                    caller-pin sweep gives a `no-workflow` repo. A
+ *                    DIFFERENT question from the `not-visible` per-agent
+ *                    artifact status: this is "does R have a routing table
+ *                    to audit at all"; `not-visible` is "R's table names
+ *                    agent A, but the ARTIFACT read for A itself failed."
+ *                    Conflating the two would make an ordinary non-fleet
+ *                    repo (the overwhelming common case) show up as a
+ *                    coverage gap it isn't.
+ *  - `malformed`   — R's config exists but is broken (bad JSON, or no usable
+ *                    `agents`). Unlike `absent`, this is a CONFIRMED defect
+ *                    on a CONFIRMED participant — #1191's own `if (!config)
+ *                    continue` gave this the SAME free pass an `absent` repo
+ *                    gets, which is the exact gap macf#1193 closes. Emits
+ *                    ONE `config-malformed` row for the repo (no per-agent
+ *                    rows — a broken config names no agents to iterate).
+ *  - `read-failed` — the read itself failed for a transient reason
+ *                    (network, rate-limit). Genuinely inconclusive — emits
+ *                    ONE `config-read-failed` row, the repo-level sibling of
+ *                    a per-agent `not-visible` row: it lowers coverage
+ *                    (`routing_artifacts_fully_covered`) but never fails the
+ *                    verdict, and is NEVER silently dropped like `absent`.
+ *  - `present`     — the pre-existing per-agent sweep (macf#1191), unchanged.
  */
 export async function gatherRoutingArtifacts(
   repos: readonly string[],
-  readRoutingConfigForRepo: (repo: string) => Promise<RoutingConfig | null>,
+  readRoutingConfigForRepo: (repo: string) => Promise<RoutingConfigReadResult>,
   checks: readonly RoutingArtifactCheck[],
 ): Promise<readonly RoutingArtifactResult[]> {
   const results: RoutingArtifactResult[] = [];
   for (const repo of repos) {
-    const config = await readRoutingConfigForRepo(repo);
-    if (!config) continue;
-    const agents = Object.keys(config.agents);
+    const read = await readRoutingConfigForRepo(repo);
+
+    if (read.status === 'absent') continue;
+
+    if (read.status === 'malformed') {
+      results.push({
+        repo,
+        agent: CONFIG_DEFECT_AGENT,
+        artifact: CONFIG_DEFECT_ARTIFACT,
+        status: 'config-malformed',
+        reason: `"${repo}"'s .github/agent-config.json is malformed (${read.reason}) — a confirmed defect on a confirmed routing participant, not an absent routing table`,
+      });
+      continue;
+    }
+
+    if (read.status === 'read-failed') {
+      results.push({
+        repo,
+        agent: CONFIG_DEFECT_AGENT,
+        artifact: CONFIG_DEFECT_ARTIFACT,
+        status: 'config-read-failed',
+        reason: `could not read "${repo}"'s .github/agent-config.json this run (${read.reason})`,
+      });
+      continue;
+    }
+
+    // read.status === 'present'. Defensive `?? {}` (macf#1193): a config
+    // that cleared the `malformed` shape-check (which itself already
+    // rejects `agents: null`) should never reach here with a non-object
+    // `agents`, but a differently-backed `readRoutingConfigForRepo`
+    // implementation (a test fake, or a future production reader) could —
+    // and `Object.keys(null)` throws, which this command must never do.
+    const agents = Object.keys(read.config.agents ?? {});
     if (agents.length === 0) continue;
     for (const check of checks) {
       const repoState = await check.fetchRepoState(repo);
@@ -922,13 +1055,21 @@ export interface RoutingDoctorDeps {
    * Read ANY visible repo's `.github/agent-config.json` (macf#1191) — unlike
    * `readRoutingConfig` (the CURRENT project only), this is called once per
    * repo in the install-set so the artifact sweep can audit repos this
-   * command is not running from. `null` = no readable routing table there
-   * (absent file, or a read failure) — the SAME "not a routing participant"
-   * treatment the caller-pin sweep gives a `no-workflow` repo, NOT the
-   * `not-visible` artifact status (that applies to the ARTIFACT read, e.g.
-   * `listRepoLabels`, never to this config read).
+   * command is not running from. A discriminated `RoutingConfigReadResult`
+   * (macf#1193), NOT a plain `RoutingConfig | null`: `absent` (a confident
+   * 404 on this ALREADY known-visible repo) is the SAME "not a routing
+   * participant" treatment the caller-pin sweep gives a `no-workflow` repo —
+   * silently skipped by `gatherRoutingArtifacts`; `malformed` is a CONFIRMED
+   * defect on a CONFIRMED participant (fails the verdict); `read-failed`
+   * (network/rate-limit/transient) is a genuine unknown (lowers coverage,
+   * never fails the verdict). All three are DIFFERENT from the `not-visible`
+   * artifact status (that applies to the per-agent ARTIFACT read, e.g.
+   * `listRepoLabels`, never to this config read itself). See
+   * `RoutingConfigReadResult`'s doc for the full rationale — the prior
+   * `RoutingConfig | null` contract collapsed all three into one, which was
+   * the exact gap #1193 closes.
    */
-  readonly readRoutingConfigForRepo: (repo: string) => Promise<RoutingConfig | null>;
+  readonly readRoutingConfigForRepo: (repo: string) => Promise<RoutingConfigReadResult>;
   /**
    * List a repo's label names (macf#1191's assignment-label artifact check).
    * `null` on ANY read failure — this command does not attempt to
@@ -1219,36 +1360,43 @@ function caCheckOk(ca: CaCheckResult): boolean {
 }
 
 /**
- * Whether the routing-table artifact sweep FAILS the verdict (macf#1191).
- * Only a CONFIRMED `missing` fails — `not-visible` does NOT, deliberately:
- * an App legitimately installed on a subset of fleet repos is normal, and
- * failing the verdict on every repo this caller merely couldn't see would
- * make the check permanently red for any narrow-scoped caller, which gets
- * ignored — reproducing the exact "always red, so nobody reads it" failure
- * mode this whole command exists to avoid. `not-visible` is still surfaced
- * (never silently dropped) via `reposVisible` + the dedicated summary
- * clause / JSON fields — see `artifactSummaryClause`.
+ * Whether the routing-table artifact sweep FAILS the verdict (macf#1191,
+ * extended macf#1193). Only a CONFIRMED defect fails —
+ * `CONFIRMED_DEFECT_STATUSES` (`missing` + `config-malformed`) — an
+ * INCONCLUSIVE read never does: an App legitimately installed on a subset of
+ * fleet repos is normal, and failing the verdict on every repo this caller
+ * merely couldn't see (or whose config read merely timed out) would make the
+ * check permanently red for any narrow-scoped caller, which gets ignored —
+ * reproducing the exact "always red, so nobody reads it" failure mode this
+ * whole command exists to avoid. Inconclusive entries are still surfaced
+ * (never silently dropped) via `reposVisible` + the dedicated summary clause
+ * / JSON fields — see `artifactSummaryClause`.
  */
 function routingArtifactsFail(results: readonly RoutingArtifactResult[]): boolean {
-  return results.some((r) => r.status === 'missing');
+  return results.some((r) => CONFIRMED_DEFECT_STATUSES.has(r.status));
 }
 
-/** `false` only on a CONFIRMED `missing` — mirrors `routingArtifactsFail`, exposed as JSON `summary.routing_artifacts_ok`. */
+/** `false` only on a CONFIRMED defect — mirrors `routingArtifactsFail`, exposed as JSON `summary.routing_artifacts_ok`. */
 function routingArtifactsOk(results: readonly RoutingArtifactResult[]): boolean {
   return !routingArtifactsFail(results);
 }
 
 /**
- * `false` when ANY (repo, agent, artifact) entry could not be read this run
- * (macf#1191). Distinct from `routingArtifactsOk`: a run can be `ok` (no
- * CONFIRMED missing artifact) while NOT `fully_covered` (some repo's data
- * this caller simply couldn't read) — that combination is exactly the
- * "clean but narrow" case a consumer must not collapse into an unqualified
- * pass. See `artifactSummaryClause` for the human-readable rendering of the
- * same distinction.
+ * `false` when ANY entry's read was INCONCLUSIVE this run (macf#1191,
+ * extended macf#1193 — `INCONCLUSIVE_STATUSES`: `not-visible` +
+ * `config-read-failed`). Distinct from `routingArtifactsOk`: a run can be
+ * `ok` (no CONFIRMED defect) while NOT `fully_covered` (some repo's data, or
+ * some repo's own config, this caller simply couldn't read) — that
+ * combination is exactly the "clean but narrow" case a consumer must not
+ * collapse into an unqualified pass. See `artifactSummaryClause` for the
+ * human-readable rendering of the same distinction. A `config-malformed`
+ * entry does NOT lower this — the read SUCCEEDED (the config is present and
+ * broken, not unread), so it stays a pure `routingArtifactsOk` failure with
+ * coverage unaffected; that is what keeps the malformed and read-failed
+ * cases mutually distinguishable on this axis too.
  */
 function routingArtifactsFullyCovered(results: readonly RoutingArtifactResult[]): boolean {
-  return !results.some((r) => r.status === 'not-visible');
+  return !results.some((r) => INCONCLUSIVE_STATUSES.has(r.status));
 }
 
 export function routingVerdict(report: RoutingDoctorReport): RoutingVerdict {
@@ -1309,25 +1457,32 @@ export function caMismatchCauseLine(report: RoutingDoctorReport): string | null 
 }
 
 /**
- * The routing-table-artifact clause (macf#1191). ALWAYS carries the coverage
- * figure (`reposVisible`) — on a fully clean run too — so "0 missing" can
- * never be misread as "checked the whole fleet." A repo this caller could
- * not read contributes to a `not-visible` count that is surfaced here as
- * well, distinct from `missing`: it does NOT fail the verdict (see
- * `routingArtifactsFail`'s doc), but it must never read like "all clear"
- * either — this is the "a clean run with narrow coverage must not read like
- * a clean run with full coverage" requirement made concrete.
+ * The routing-table-artifact clause (macf#1191, extended macf#1193). ALWAYS
+ * carries the coverage figure (`reposVisible`) — on a fully clean run too —
+ * so "0 missing" can never be misread as "checked the whole fleet." A repo
+ * this caller could not read contributes to a `not visible` count that is
+ * surfaced here as well, distinct from `missing`: it does NOT fail the
+ * verdict (see `routingArtifactsFail`'s doc), but it must never read like
+ * "all clear" either. `config malformed` / `config unreadable` (macf#1193)
+ * are the repo-level siblings of those two, called out with their OWN words
+ * rather than folded into `missing`/`not visible` silently — a reader must
+ * be able to tell "a repo names an agent with no matching label" apart from
+ * "a repo's OWN routing table is broken/unreadable" from this line alone.
  */
 function artifactSummaryClause(report: RoutingDoctorReport): string {
   const missing = report.artifactChecks.filter((r) => r.status === 'missing').length;
   const notVisible = report.artifactChecks.filter((r) => r.status === 'not-visible').length;
+  const configMalformed = report.artifactChecks.filter((r) => r.status === 'config-malformed').length;
+  const configReadFailed = report.artifactChecks.filter((r) => r.status === 'config-read-failed').length;
   const coverage = `${report.reposVisible} repo(s) visible to this caller`;
-  if (missing === 0 && notVisible === 0) {
+  if (missing === 0 && notVisible === 0 && configMalformed === 0 && configReadFailed === 0) {
     return `routing-table artifacts ✓ (${coverage})`;
   }
   const parts: string[] = [];
   if (missing > 0) parts.push(`${missing} missing`);
+  if (configMalformed > 0) parts.push(`${configMalformed} config malformed`);
   if (notVisible > 0) parts.push(`${notVisible} not visible`);
+  if (configReadFailed > 0) parts.push(`${configReadFailed} config unreadable`);
   return `routing-table artifacts ✗ ${parts.join(', ')} (of ${coverage})`;
 }
 
@@ -1527,6 +1682,31 @@ export function formatAgentTable(rows: readonly AgentRow[]): string {
 const ARTIFACT_HEADERS = ['REPO', 'AGENT', 'ARTIFACT', 'STATUS', 'REASON'] as const;
 
 /**
+ * Glyph per `RoutingArtifactStatus` (macf#1191, extended macf#1193). Written
+ * as an EXHAUSTIVE switch (not a ternary) deliberately: a ternary over two
+ * literals silently renders any FUTURE status as whichever branch it falls
+ * into, with no compiler signal — the exact "a new status joins silently"
+ * gap `CONFIRMED_DEFECT_STATUSES`/`INCONCLUSIVE_STATUSES` already close for
+ * the verdict/coverage predicates. A switch missing a case fails to compile
+ * once `RoutingArtifactStatus` gains another literal, so this render surface
+ * gets the same "can't forget a branch" guarantee.
+ */
+function artifactStatusGlyph(status: RoutingArtifactStatus): string {
+  switch (status) {
+    case 'present':
+      return '✓';
+    case 'missing':
+      return '✗ missing';
+    case 'not-visible':
+      return '? not-visible';
+    case 'config-malformed':
+      return '✗ malformed';
+    case 'config-read-failed':
+      return '? unreadable';
+  }
+}
+
+/**
  * Only non-`present` rows (macf#1191) — mirrors `collectWarnings`' "only show
  * if any" shape: a fully-satisfied sweep renders NOTHING here (the coverage
  * figure still appears in `summaryLine`/JSON regardless), so a real gap is
@@ -1535,13 +1715,7 @@ const ARTIFACT_HEADERS = ['REPO', 'AGENT', 'ARTIFACT', 'STATUS', 'REASON'] as co
 export function buildArtifactRows(results: readonly RoutingArtifactResult[]): readonly (readonly string[])[] {
   return results
     .filter((r) => r.status !== 'present')
-    .map((r) => [
-      r.repo,
-      r.agent,
-      r.artifact,
-      r.status === 'missing' ? '✗ missing' : '? not-visible',
-      r.reason ?? '',
-    ]);
+    .map((r) => [r.repo, r.agent, r.artifact, artifactStatusGlyph(r.status), r.reason ?? '']);
 }
 
 export function formatArtifactTable(results: readonly RoutingArtifactResult[]): string {
@@ -1594,6 +1768,13 @@ export const HONESTY_LEGEND = [
   '        from here) and does NOT fail the verdict, but is never silently dropped either. The',
   '        coverage count is how many repos THIS caller could see this run — not a claim about the',
   '        total fleet size; a narrow-coverage clean run is reported as narrow, not as "all clear."',
+  '        A repo\'s OWN agent-config.json can also be present but BROKEN: "config malformed" is a',
+  '        confirmed defect (bad JSON, or no usable agents object) on a confirmed participant and',
+  '        FAILS the verdict, same as a missing label — the read succeeded, so coverage is unaffected.',
+  '        "config unreadable" means the read itself failed this run (network, rate-limit) — the same',
+  '        inconclusive weight as "not visible": it lowers the coverage count but does NOT fail the',
+  '        verdict, and is never silently dropped. A repo with NO agent-config.json at all is simply',
+  '        not a routing participant and is not shown here.',
   '        This check is READ-ONLY — it never creates a missing label.',
   'NOTE: these are STATIC GitHub-plane checks — they prove the routing PLUMBING is wired right,',
   '      NOT that a message was delivered end-to-end (that is `macf routing doctor --e2e`, a',
@@ -1644,8 +1825,39 @@ const HONESTY_DISCLAIMER =
  * schema_version:3 means these N specific checks all passed" needs to know
  * a caller-pin-fresh CA-and-cert-clean run can still be DEGRADED now, not
  * just that new fields were added alongside an unchanged verdict formula.
+ *
+ * Bumped 4→5 for macf#1193, applying the SAME test #1191 used for its own
+ * 3→4 bump — a new failure mode feeding the EXISTING `summary.verdict` — to
+ * a gap inside #1191's own fix: a MALFORMED `.github/agent-config.json` on a
+ * fleet repo previously collapsed to the identical "not a routing
+ * participant, contributes nothing" free pass an ABSENT one gets. Three
+ * same-name-or-adjacent shifts:
+ *  - `summary.routing_artifacts_ok`: now ALSO `false` when any repo's OWN
+ *    config is `config-malformed` — a run that was schema_version:4-HEALTHY
+ *    under a fleet repo with a broken routing table can now compute
+ *    DEGRADED, a condition schema_version:4 never checked for.
+ *  - `summary.routing_artifacts_fully_covered`: now ALSO `false` when any
+ *    repo's OWN config read was `config-read-failed` — additive in spirit
+ *    (a schema_version:4 consumer already treated this field as
+ *    non-verdict-failing coverage information), but the SET of things that
+ *    can lower it grew, so it is called out here rather than left implicit.
+ *  - `routing_artifacts[].status` gains two new literals (`config-malformed`,
+ *    `config-read-failed`) a consumer switching on the string must know
+ *    about — the SAME "a consumer string-matching on the literal needs to
+ *    know it changed" reasoning the 2→3 bump used for
+ *    `routing_client_cert.state`'s `"ok"` → `"presumed-ok"` rename.
+ * Two NEW additive-only count fields (`routing_artifacts_config_malformed`,
+ * `routing_artifacts_config_read_failed`) are added alongside the bump —
+ * additive fields don't force a bump on their own, but they ride with this
+ * one since it's already happening for the reasons above. Deliberately NOT
+ * folded into the EXISTING `routing_artifacts_missing` / `_not_visible`
+ * counts: doing so would keep the field NAMES stable but silently widen
+ * what each one MEANS (a consumer reading `routing_artifacts_missing` today
+ * expects "a per-agent label gap count," not "a per-agent label gap PLUS an
+ * unrelated repo-level defect count") — the strongest reading of "do not
+ * weaken #1192/#1191's existing counts."
  */
-export const ROUTING_DOCTOR_JSON_SCHEMA_VERSION = 4;
+export const ROUTING_DOCTOR_JSON_SCHEMA_VERSION = 5;
 
 export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
   const participating = report.repoPins.filter((r) => r.consistent !== null);
@@ -1679,7 +1891,8 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       routing_client_cert_ok: !routingClientCertFails(report.routingClientCert),
       // New (schema_version:4, macf#1191): `false` only on a CONFIRMED `missing`
       // artifact — see `routingArtifactsFail`'s doc for why `not-visible` alone
-      // does not flip this.
+      // does not flip this. Extended macf#1193 (schema_version:5): also `false`
+      // on a `config-malformed` entry — see `CONFIRMED_DEFECT_STATUSES`.
       routing_artifacts_ok: routingArtifactsOk(report.artifactChecks),
       // New (schema_version:4, macf#1191): the coverage figure — how many repos
       // THIS run's install-set enumerated. ALWAYS present, even when
@@ -1689,11 +1902,27 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       routing_artifacts_repos_visible: report.reposVisible,
       routing_artifacts_missing: report.artifactChecks.filter((r) => r.status === 'missing').length,
       routing_artifacts_not_visible: report.artifactChecks.filter((r) => r.status === 'not-visible').length,
+      // New (schema_version:5, macf#1193): a repo's OWN `.github/agent-config.json`
+      // being present-but-broken — a CONFIRMED defect, distinct from
+      // `routing_artifacts_missing` (a per-agent label gap on an otherwise-usable
+      // config). Folds into `routing_artifacts_ok` (see `CONFIRMED_DEFECT_STATUSES`),
+      // but kept as its OWN count rather than added into `_missing` so that
+      // field's literal meaning ("a per-agent label gap") does not silently widen.
+      routing_artifacts_config_malformed: report.artifactChecks.filter((r) => r.status === 'config-malformed').length,
+      // New (schema_version:5, macf#1193): the repo-level analogue of
+      // `routing_artifacts_not_visible` — a repo whose OWN config this run could
+      // not read for any OTHER reason (network, rate-limit, a transient error).
+      // Folds into `routing_artifacts_fully_covered` (see `INCONCLUSIVE_STATUSES`),
+      // kept as its own count for the same reason `_config_malformed` is above.
+      routing_artifacts_config_read_failed: report.artifactChecks.filter((r) => r.status === 'config-read-failed')
+        .length,
       // New (schema_version:4, macf#1191): `false` whenever ANY repo's artifact
       // data could not be read this run — independent of `routing_artifacts_ok`,
       // which only reflects CONFIRMED failures. A consumer that only checks
       // `routing_artifacts_ok` can miss a narrow-coverage run; this field is the
       // one that must be read alongside it for the "not all clear" guarantee.
+      // Extended macf#1193 (schema_version:5) to also go `false` on a
+      // `config-read-failed` entry — see the schema_version doc.
       routing_artifacts_fully_covered: routingArtifactsFullyCovered(report.artifactChecks),
     },
     // Additive (schema_version:1, DR-032 #610): non-verdict-driving observations the
@@ -1705,8 +1934,11 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
     // New (schema_version:4, macf#1191): one entry per (repo, agent, artifact)
     // across every repo visible in this run's install-set — the full detail
     // behind the `routing_artifacts_*` summary counts above. `status` is one of
-    // "present" / "missing" / "not-visible"; see `RoutingArtifactStatus`'s doc
-    // for why "not-visible" is never collapsed into "missing".
+    // "present" / "missing" / "not-visible" / "config-malformed" /
+    // "config-read-failed" (the last two added schema_version:5, macf#1193 —
+    // repo-level rows, `agent`/`artifact` carry the sentinel documented on
+    // `CONFIG_DEFECT_AGENT`/`CONFIG_DEFECT_ARTIFACT`); see `RoutingArtifactStatus`'s
+    // doc for why none of these five are ever collapsed into another.
     routing_artifacts: report.artifactChecks.map((r) => ({
       repo: r.repo,
       agent: r.agent,
@@ -1833,6 +2065,14 @@ async function resolveDepsFromRegistry(
   // The GitHub reader fallback for the routing config: prefer the local file (we
   // are usually IN the project repo), else read the current repo via gh.
   const ghRoutingReader = createRoutingConfigGhReader(token);
+  // macf#1193: a SEPARATE reader instance for the per-repo artifact sweep —
+  // `readRoutingConfigForRepo` needs the discriminated absent/malformed/
+  // read-failed result; `ghRoutingReader` above (backing `readRoutingConfig`)
+  // deliberately keeps the collapsed `RoutingConfig | null` contract, since
+  // the current-repo fallback never needed the distinction. Both share the
+  // SAME underlying `gh` read via `createRoutingConfigGhReaderDetailed` — see
+  // `routing-doctor-gh.ts`.
+  const ghRoutingReaderDetailed = createRoutingConfigGhReaderDetailed(token);
   const localRouting = readLocalRoutingConfig(projectDir);
 
   // #800: the routing-client cert issuer registry variable, same GitHubVariablesClient
@@ -1862,7 +2102,7 @@ async function resolveDepsFromRegistry(
       // running from — always via GitHub, never the local-file shortcut
       // `readRoutingConfig` takes for the CURRENT repo, since the point of this
       // check is to assert against each repo's committed truth.
-      readRoutingConfigForRepo: ghRoutingReader,
+      readRoutingConfigForRepo: ghRoutingReaderDetailed,
       listRepoLabels: createRepoLabelLister(token),
       listRegistry: () => registry.list(''),
       probe: (host, port) => pingAgentHealth({ host, port, caCertPem: caCertPem ?? '', certPath, keyPath }),
