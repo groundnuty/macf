@@ -40,6 +40,8 @@ import { RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
 import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR } from '../bootstrap/runner-platform.js';
 import type { OperatorInputSource } from '../bootstrap/operator-secrets-file.js';
 import { formatOperatorInputProvenanceLine, readOperatorSecretsFile, resolveOperatorInput } from '../bootstrap/operator-secrets-file.js';
+import type { Presence } from '../bootstrap/plan.js';
+import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
 
 export interface RunBootstrapPlanOptions {
   readonly file: string;
@@ -251,6 +253,29 @@ export async function runBootstrapPlan(
     // section, never interleaved with the plan-item/drift computations
     // above.
     const operatorInputs = operatorInputProvenance(manifest, fleetSecretsValues, scopeSecretsValues);
+    // groundnuty/macf#1220 — fleet-level (runner-ops/router) App
+    // installation-SCOPE-MEMBERSHIP drift: is a `selected` install's actual
+    // repo set still current now that the manifest may have grown since it
+    // was set? Needs an App JWT (see `install-scope-coverage.ts`'s module
+    // doc), so — same gate `resolveDeps` above already applies for
+    // `vaultAwareObserver` — this ONLY runs when BOTH `--vault` and
+    // `--identity-key` are given; without them the section is simply
+    // omitted (not rendered as a wall of "unknown" — that would be noise on
+    // the common vault-free `plan` run, and nothing here degrades silently:
+    // `computeInstallScopeCoverage` itself still reports honest-`'unknown'`
+    // for anyone who calls it without a vault, this command just chooses
+    // not to on the common path).
+    const installScopeCoverage =
+      opts.vaultPath !== undefined && opts.identityKeyPath !== undefined
+        ? await computeInstallScopeCoverage(
+            manifest,
+            observed.lock,
+            Object.fromEntries(Object.entries(observed.agents).map(([role, a]) => [role, a.repo])) as Readonly<Record<string, Presence>>,
+            observed.controlRepoPresence,
+            { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath },
+          )
+        : {};
+    const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
 
     if (opts.json) {
       console.log(
@@ -260,6 +285,9 @@ export async function runBootstrapPlan(
             operator_interaction: operatorInteractionToJson(budget),
             advertise_host_drift: advertiseHostDrift.map(advertiseHostDriftEntryToJson),
             operator_inputs: operatorInputs,
+            ...(Object.keys(installScopeCoverage).length > 0
+              ? { install_scope_coverage: Object.values(installScopeCoverage).map(installScopeCoverageEntryToJson) }
+              : {}),
           },
           null,
           2,
@@ -277,6 +305,9 @@ export async function runBootstrapPlan(
         for (const { key, source } of operatorInputs) {
           console.log(`  ${formatOperatorInputProvenanceLine(key, source)}`);
         }
+      if (installScopeCoverageLines.length > 0) {
+        console.log('');
+        console.log(installScopeCoverageLines.join('\n'));
       }
     }
     return 0;

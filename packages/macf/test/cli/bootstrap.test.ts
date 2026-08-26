@@ -311,6 +311,45 @@ describe('runBootstrapPlan', () => {
     expect(agentSecrets?.reason).toContain('vault file not found');
   });
 
+  // groundnuty/macf#1220 — the SAME nonexistent-vault-path trick as the test
+  // immediately above, now proving `install_scope_coverage` reaches the
+  // REAL `computeInstallScopeCoverage` (never a hand-rebuilt fake). This is
+  // the honest-unknown-BEFORE-any-network-I/O floor, not the decisive
+  // drift/covered pair (that pair is `install-scope-coverage.test.ts`'s
+  // job against the pure function directly) — here the point is only "the
+  // CLI wiring reaches it and doesn't crash or silently drop it."
+  it('--vault + --identity-key: `install_scope_coverage` is populated (unknown, for a nonexistent vault) — never silently omitted once the flags are given', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const vaultPath = join(dir, 'does-not-exist', 'vault.age');
+    const identityKeyPath = join(dir, 'does-not-exist', 'identity.txt');
+    const real = resolveDeps(file, vaultPath, identityKeyPath);
+    const deps: BootstrapPlanDeps = { ...real, readAgentRegistry: async () => ({ status: 'unknown', reason: 'not queried in this test' }) };
+    const code = await runBootstrapPlan({ file, json: true, vaultPath, identityKeyPath }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      install_scope_coverage?: ReadonlyArray<{ role: string; status: string; message?: string }>;
+    };
+    // VALID_FLEET_YAML declares no `routing:` (no runner-ops needed) but a
+    // `profile`-type registry, so the router App IS an unconditional target
+    // (`routerAppItem`'s own doc) — exactly one entry, `'unknown'`.
+    expect(json.install_scope_coverage).toHaveLength(1);
+    expect(json.install_scope_coverage?.[0]?.status).toBe('unknown');
+    expect(json.install_scope_coverage?.[0]?.message).toContain('vault could not be read');
+  });
+
+  it('WITHOUT --vault/--identity-key, `install_scope_coverage` is omitted entirely (not a noisy wall of "unknown" on the common vault-free run)', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const deps: BootstrapPlanDeps = { observe: async () => EMPTY_OBSERVED };
+    const code = await runBootstrapPlan({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as Record<string, unknown>;
+    expect('install_scope_coverage' in json).toBe(false);
+  });
+
   it('--vault WITHOUT --identity-key: refused loud (vault_flags_incomplete), never silently vault-free', async () => {
     errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
