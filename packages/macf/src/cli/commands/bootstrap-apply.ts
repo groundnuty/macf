@@ -1548,6 +1548,16 @@ function formatControlRepoLine(result: FleetApplyResult): string {
  * Explains outcomes in plain language rather than citing an internal
  * tracker reference (operator ruling: user-facing output should stand on
  * its own).
+ *
+ * groundnuty/macf#1221 — the `'written'` branch now distinguishes THREE
+ * outcomes, not two: labels present; labels not-ok but no credential was
+ * ever available this run (soft, unchanged pre-#1221 framing, "will
+ * retry"); labels not-ok despite a resolved credential (loud — a genuine
+ * failure, per `ControlRepoInitOutcome.labelsGoodEnough`). The loud branch
+ * never claims labels are "missing" for a `'skipped'` outcome — that would
+ * assert an absence the run never actually observed (the mint/attempt
+ * itself never got a confirmed answer) — it says label state is
+ * UNCONFIRMED instead.
  */
 function formatControlRepoInitLine(init: FleetApplyResult['controlRepoInit']): string {
   switch (init.status) {
@@ -1556,16 +1566,36 @@ function formatControlRepoInitLine(init: FleetApplyResult['controlRepoInit']): s
     case 'failed':
       return `⚠ FAILED — ${init.reason}`;
     case 'written': {
-      const labelNote =
-        init.labels.status === 'skipped'
-          ? `labels not created this run (${init.labels.reason}) — will retry on the next apply`
-          : init.labels.status === 'partial-failure'
-            ? `some labels failed: ${init.labels.failed.join(', ')}`
-            : 'labels present for every declared agent';
       const workflowNote = init.workflowAndConfigAllowlisted
         ? ''
         : ' The router workflow file is not yet included in what gets pushed to this repo — cross-agent GitHub Actions routing is not live until that is addressed.';
-      return `${labelNote} (${init.agents.join(', ')}).${workflowNote}`;
+      if (init.labels.status === 'ok') {
+        return `labels present for every declared agent (${init.agents.join(', ')}).${workflowNote}`;
+      }
+      if (init.labelsGoodEnough) {
+        // groundnuty/macf#1221 — no legitimate credential was resolvable
+        // this run (the honest, non-fatal "nothing was ever attempted"
+        // gap — unchanged pre-#1221 behavior).
+        const labelNote =
+          init.labels.status === 'skipped'
+            ? `labels not created this run (${init.labels.reason}) — will retry on the next apply`
+            : `some labels failed: ${init.labels.failed.join(', ')} — will retry on the next apply`;
+        return `${labelNote} (${init.agents.join(', ')}).${workflowNote}`;
+      }
+      // groundnuty/macf#1221 — a legitimate credential WAS resolved this
+      // run and labels still did not fully land: a genuine problem, loud.
+      // Honest-unknown floor: `'skipped'` means the mint/attempt itself
+      // never got a confirmed answer, so this says label state is
+      // UNCONFIRMED — never that labels are "missing" (which would assert
+      // an absence never actually observed).
+      const detail =
+        init.labels.status === 'skipped'
+          ? `label state is UNCONFIRMED — ${init.labels.reason}`
+          : `label creation FAILED for: ${init.labels.failed.join(', ')}`;
+      return (
+        `⚠ ${detail} (${init.agents.join(', ')}) — a resolved credential was available this run, so this is not ` +
+        `the ordinary "no token yet" gap. This fleet cannot be confirmed routable until labels are verified.${workflowNote}`
+      );
     }
   }
 }
@@ -2179,10 +2209,23 @@ export function applyExitCode(
   // created": `controlRepoInit.status` stays `'written'` even when
   // `labels.status === 'skipped'` (no token minted this run — see
   // `apply-control-repo-init.ts`'s "Token sourcing" doc; the common,
-  // EXPECTED case for a Mac-side apply run today) — that skip is a known,
-  // reported gap, not a run-level failure, and must not flip every ordinary
-  // apply to a non-zero exit over it.
-  const controlRepoInitBad = result.controlRepoInit.status === 'failed';
+  // EXPECTED case for a Mac-side apply run before groundnuty/macf#1221) —
+  // that skip is a known, reported gap, not a run-level failure, and must
+  // not flip every ordinary apply to a non-zero exit over it.
+  //
+  // groundnuty/macf#1221 — but a `'written'` outcome CAN now also carry
+  // `labelsGoodEnough === false`: a legitimate `tokenSource` WAS resolved
+  // this run (`resolveControlRepoLabelTokenSource`) and labels still did
+  // not fully land — mirroring exactly how `agentBad` below already treats
+  // a per-agent `repoInit?.status === 'failed'` as operator-attention-worthy
+  // regardless of whether the workflow/config files themselves were
+  // written. Per groundnuty/macf#1210's rule (a missing/failed input gates
+  // only its dependents), this flips the run's overall completeness signal
+  // — it does NOT abort or skip any other leg; every other leg of this run
+  // already ran to completion before this function is ever called.
+  const controlRepoInitBad =
+    result.controlRepoInit.status === 'failed' ||
+    (result.controlRepoInit.status === 'written' && !result.controlRepoInit.labelsGoodEnough);
   const agentBad = result.agents.some(
     (rec) =>
       rec.identity.status === 'failed' ||
