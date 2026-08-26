@@ -215,6 +215,7 @@ describe('runBootstrapStatus — no-mutation guarantee (static import-shape asse
     './observer.js',
     './apply-runner-ops.js', // pure derivation only (RUNNER_OPS_ROLE / deriveRunnerOpsHandle) — see status.ts's import
     './vault-read.js',
+    './advertise-host-drift.js', // pure comparison only (groundnuty/macf#1203) — no gh/network, see that module's doc
     '../commands/ps.js',
   ]);
 

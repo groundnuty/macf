@@ -675,3 +675,127 @@ describe('computeBootstrapStatus — extra lock agents (§D3 no-prune, rendering
     expect(view.runnerOps.presence).toBe('present');
   });
 });
+
+describe('computeBootstrapStatus — advertise-host drift (groundnuty/macf#1203)', () => {
+  it('DECISIVE 1 — a registered host that diverges from declared network.advertise_host is reported as a mismatch', () => {
+    // FULLY_PROVISIONED_REGISTRY registers science-agent/code-agent at
+    // 100.64.0.1/.2; baseManifest() declares advertise_host: example.ts.net
+    // — both diverge from the declared value.
+    const view = computeBootstrapStatus(baseManifest(), FULLY_PROVISIONED_OBSERVED, FULLY_PROVISIONED_REGISTRY);
+    const sci = view.agents.find((a) => a.role === 'science-agent');
+    expect(sci?.advertiseHostDrift.status).toBe('mismatch');
+    expect(sci?.advertiseHostDrift.declaredHost).toBe('example.ts.net');
+    expect(sci?.advertiseHostDrift.registeredHost).toBe('100.64.0.1');
+  });
+
+  it('DECISIVE 2 — a registered host that MATCHES declared network.advertise_host is NOT reported as a mismatch', () => {
+    const registry: Readonly<Record<string, AgentRegistryObservation>> = {
+      'science-agent': { status: 'confirmed', presence: 'present', info: { ...AGENT_INFO_SCIENCE, host: 'example.ts.net' } },
+      'code-agent': { status: 'confirmed', presence: 'present', info: { ...AGENT_INFO_SCIENCE, host: 'example.ts.net', instance_id: 'code-instance-1' } },
+    };
+    const view = computeBootstrapStatus(baseManifest(), FULLY_PROVISIONED_OBSERVED, registry);
+    for (const a of view.agents) {
+      expect(a.advertiseHostDrift.status).toBe('match');
+      expect(a.advertiseHostDrift.status).not.toBe('mismatch');
+    }
+  });
+
+  it('never-registered (partially-provisioned fleet) reports unknown, never mismatch — the honest-unknown floor', () => {
+    const PARTIAL_REGISTRY: Readonly<Record<string, AgentRegistryObservation>> = {
+      'science-agent': { status: 'confirmed', presence: 'present', info: AGENT_INFO_SCIENCE },
+    };
+    const view = computeBootstrapStatus(baseManifest(), EMPTY_OBSERVED, PARTIAL_REGISTRY);
+    const code = view.agents.find((a) => a.role === 'code-agent');
+    expect(code?.advertiseHostDrift.status).toBe('unknown');
+    expect(code?.advertiseHostDrift.status).not.toBe('mismatch');
+  });
+
+  it('the text render surfaces the mismatch (ADVERTISE-HOST section) and never cites an internal issue/DR reference', () => {
+    const view = computeBootstrapStatus(baseManifest(), FULLY_PROVISIONED_OBSERVED, FULLY_PROVISIONED_REGISTRY);
+    const text = formatBootstrapStatusText(view);
+    expect(text).toContain('ADVERTISE-HOST');
+    expect(text).toContain('example.ts.net');
+    expect(text).toContain('MISMATCH');
+    expect(text).not.toMatch(/\bmacf#\d+\b|\bDR-0\d{2}\b/);
+  });
+
+  it('a clean fleet (declared === registered for every agent) still renders the section, with no MISMATCH', () => {
+    const registry: Readonly<Record<string, AgentRegistryObservation>> = {
+      'science-agent': { status: 'confirmed', presence: 'present', info: { ...AGENT_INFO_SCIENCE, host: 'example.ts.net' } },
+      'code-agent': { status: 'confirmed', presence: 'present', info: { ...AGENT_INFO_SCIENCE, host: 'example.ts.net', instance_id: 'code-instance-1' } },
+    };
+    const view = computeBootstrapStatus(baseManifest(), FULLY_PROVISIONED_OBSERVED, registry);
+    const text = formatBootstrapStatusText(view);
+    expect(text).toContain('ADVERTISE-HOST');
+    expect(text).not.toContain('MISMATCH');
+  });
+
+  it('the JSON render carries advertiseHostDrift per agent, same camelCase convention the rest of AgentStatusView already uses', () => {
+    const view = computeBootstrapStatus(baseManifest(), FULLY_PROVISIONED_OBSERVED, FULLY_PROVISIONED_REGISTRY);
+    const json = bootstrapStatusToJson(view) as {
+      schema_version: number;
+      agents: ReadonlyArray<{ role: string; advertiseHostDrift?: { status: string; declaredHost: string; registeredHost?: string } }>;
+    };
+    // groundnuty/macf#1203 — additive-only field, schema_version NOT bumped
+    // (see status.ts's doc comment on BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION).
+    expect(json.schema_version).toBe(BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION);
+    const sci = json.agents.find((a) => a.role === 'science-agent');
+    expect(sci?.advertiseHostDrift?.status).toBe('mismatch');
+    expect(sci?.advertiseHostDrift?.declaredHost).toBe('example.ts.net');
+    expect(sci?.advertiseHostDrift?.registeredHost).toBe('100.64.0.1');
+  });
+
+  it('DECISIVE — the UNION of advertiseHostDrift keys seen across match/mismatch/unknown in --json is exactly the documented public fields (no internal rendering flag leaks via the spread)', () => {
+    // `bootstrapStatusToJson` builds `agents` via `{ ...a }` — a whole-object
+    // spread of AgentStatusView, NOT a whitelist. Each status branch sets a
+    // DIFFERENT subset of AdvertiseHostDriftEntry's fields by design (e.g.
+    // 'match' has no `reason`; 'unknown' has no `registeredHost`) — so this
+    // pins the UNION across all three statuses, not one entry's exact set,
+    // which is what would actually catch a future addition to
+    // AdvertiseHostDriftEntry (e.g. a rendering-only implementation detail,
+    // not a fact worth publishing) riding the spread into a versioned
+    // public contract.
+    const matchRegistry: Readonly<Record<string, AgentRegistryObservation>> = {
+      'science-agent': { status: 'confirmed', presence: 'present', info: { ...AGENT_INFO_SCIENCE, host: 'example.ts.net' } },
+    };
+    const mismatchRegistry: Readonly<Record<string, AgentRegistryObservation>> = {
+      'science-agent': { status: 'confirmed', presence: 'present', info: AGENT_INFO_SCIENCE },
+    };
+    const unknownReadFailedRegistry: Readonly<Record<string, AgentRegistryObservation>> = {
+      'science-agent': { status: 'unknown', reason: 'registry variable could not be read (network/auth/gh failure)' },
+    };
+    const oneAgentManifest = baseManifest({ agents: [baseManifest().agents[0]!] });
+    const keysFor = (registry: Readonly<Record<string, AgentRegistryObservation>>): readonly string[] => {
+      const json = bootstrapStatusToJson(computeBootstrapStatus(oneAgentManifest, EMPTY_OBSERVED, registry)) as {
+        agents: ReadonlyArray<{ advertiseHostDrift: Record<string, unknown> }>;
+      };
+      return Object.keys(json.agents[0]?.advertiseHostDrift ?? {});
+    };
+    const union = new Set<string>([
+      ...keysFor(matchRegistry),
+      ...keysFor(mismatchRegistry),
+      ...keysFor(unknownReadFailedRegistry),
+    ]);
+    expect([...union].sort()).toEqual(['declaredHost', 'reason', 'registeredHost', 'role', 'status', 'unknownKind'].sort());
+  });
+
+  it('never-registered reports unknownKind: "never-registered" in --json — a genuine per-agent fact, not a rendering-only flag', () => {
+    const registry: Readonly<Record<string, AgentRegistryObservation>> = {
+      'science-agent': { status: 'confirmed', presence: 'absent' },
+    };
+    const view = computeBootstrapStatus(baseManifest({ agents: [baseManifest().agents[0]!] }), EMPTY_OBSERVED, registry);
+    const json = bootstrapStatusToJson(view) as { agents: ReadonlyArray<{ role: string; advertiseHostDrift: { unknownKind?: string } }> };
+    expect(json.agents[0]?.advertiseHostDrift.unknownKind).toBe('never-registered');
+  });
+
+  it('port is never compared — same host, different port still matches', () => {
+    const registry: Readonly<Record<string, AgentRegistryObservation>> = {
+      'science-agent': { status: 'confirmed', presence: 'present', info: { ...AGENT_INFO_SCIENCE, host: 'example.ts.net', port: 51999 } },
+      'code-agent': { status: 'confirmed', presence: 'present', info: { ...AGENT_INFO_SCIENCE, host: 'example.ts.net', port: 8443, instance_id: 'code-instance-1' } },
+    };
+    const view = computeBootstrapStatus(baseManifest(), FULLY_PROVISIONED_OBSERVED, registry);
+    for (const a of view.agents) {
+      expect(a.advertiseHostDrift.status).toBe('match');
+    }
+  });
+});
