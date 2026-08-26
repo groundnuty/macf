@@ -68,38 +68,59 @@
  * live GitHub API call inside `repoInit()`, entirely independent of
  * git-committed content.
  *
- * **Token sourcing (no new grant, per this issue's hard constraint).** This
- * step passes NO explicit `tokenSource` — same posture `apply-repo-init.ts`
- * already accepts for its `reused`/`resumed-install` agent paths (see that
- * module's doc): a Mac-side `apply` run has no ambient bot credentials, so
- * `repoInit()`'s own `generateToken()` degrades to `labels: {status:
- * 'skipped'}` rather than throwing. Minting a token here would mean either
- * inventing a NEW control-repo-scoped credential (a new grant — exactly what
- * this design avoids) or reusing one agent's App opportunistically (an
- * assumption this codebase does not currently guarantee — no code path
- * installs every declared agent's App onto the control repo; it happens to
- * hold today only because the operator's own gate-2 install click included
- * it).
+ * **Token sourcing (groundnuty/macf#1221 — the "future increment" the
+ * paragraph below promised).** This step's `tokenSource` is OPTIONAL —
+ * `apply-fleet.ts` supplies one when {@link resolveControlRepoLabelTokenSource}
+ * can find a legitimate credential, and omits it otherwise (the pre-#1221
+ * degrade below still applies verbatim in that case). No NEW grant is
+ * minted here: at Step 0.5 (control-repo-init runs BEFORE the per-agent
+ * loop — no agent identity is created THIS run yet) the only legitimate
+ * source is an ALREADY-EXISTING agent's vault-stored credential — the SAME
+ * `resolveKeyPath(role, priorAppId)` primitive `apply-fleet.ts`'s
+ * `resolveRunnerOpsVaultPem` already uses for the runner-ops App's reused
+ * case, applied here across every DECLARED agent role instead of the single
+ * runner-ops role (this module's doc, "Why the control repo, not peer-repo
+ * access" — ANY declared agent's App install already reaches the control
+ * repo). `undefined` (no `--vault`/`--identity-key` this run, or a
+ * genuinely first-ever provision with no prior lock entry for any role) is
+ * an honest "nothing to try," not an error — see
+ * {@link resolveControlRepoLabelTokenSource}'s own doc.
  *
- * **The sharper shape of the gap.** Every OTHER control-repo operation this
- * run performs — `gh repo create`, `gh api repos/…`, the clone, the final
- * push — runs on the OPERATOR's own `gh` auth (`control-repo.ts`'s I/O
- * leaves all shell out to `gh`), which already has admin on a repo the
- * operator owns. `createLabel` (`commands/repo-init.ts`) is the ONE
- * operation in this whole step that goes through a raw `fetch` + Bearer
- * App-installation token instead — so the one authority that should
- * naturally govern operator-owned ground (the operator's own `gh` session)
- * is structurally unreachable from that specific code path. Labels
- * therefore can't work here today without EITHER a legitimate token source
- * (the gap this doc's first paragraph describes) OR a second,
- * `gh`-auth-based label-creation primitive — and the latter is exactly the
- * duplicate mechanism `#1000`'s golden path (and this thread's own
- * correction of a near-duplicate label path) rules out. Label creation
- * therefore degrades gracefully today; a future increment that threads a
- * legitimate token source can tighten this the same way macf#920 tightened
- * the per-agent `created` path.
+ * **What changes when a `tokenSource` IS supplied.** `repoInit()`'s
+ * `generateToken()` now has a real credential to mint from, so `labels`
+ * should ordinarily land `'ok'`. When it does NOT — the mint itself throws,
+ * or some individual label POST fails — that is no longer the benign
+ * "nothing was ever attempted" gap: a real credential was available and the
+ * attempt still didn't fully succeed, which needs operator attention.
+ * {@link controlRepoLabelsGoodEnough} (mirroring
+ * `apply-repo-init.ts::labelsAreGoodEnough` exactly) captures this
+ * distinction as `ControlRepoInitOutcome`'s `labelsGoodEnough` field;
+ * `bootstrap-apply.ts::applyExitCode` reads it to report the fleet
+ * incomplete WITHOUT aborting any other leg of the run (per
+ * groundnuty/macf#1210's rule: a missing/failed input gates only its
+ * dependents — here, whether routing can be confirmed usable — never the
+ * whole run).
+ *
+ * **The sharper shape of the (now-narrowed) gap.** Every OTHER control-repo
+ * operation this run performs — `gh repo create`, `gh api repos/…`, the
+ * clone, the final push — runs on the OPERATOR's own `gh` auth
+ * (`control-repo.ts`'s I/O leaves all shell out to `gh`), which already has
+ * admin on a repo the operator owns. `createLabel` (`commands/repo-init.ts`)
+ * is the ONE operation in this whole step that goes through a raw `fetch` +
+ * Bearer App-installation token instead. This is deliberately NOT "fixed" by
+ * reaching for the operator's own `gh` auth here too (e.g. `gh auth token`)
+ * — that would be a NEW credential-resolution mechanism for this ONE call
+ * site, diverging from `commands/repo-init.ts::repoInit()`'s single existing
+ * `generateToken(tokenSource)` path that every other caller (agent repo-init,
+ * a plain `macf repo-init` run) already goes through, and it would make
+ * `repoInit()`'s label-creation identity depend on ambient `gh` login state
+ * — a footgun for its non-bootstrap callers this issue does not license
+ * introducing. The `TokenSource` plumbing `commands/repo-init.ts` already
+ * has (macf#920) is the existing mechanism this fix threads further, not a
+ * new one.
  */
-import type { FleetManifest } from './fleet-manifest.js';
+import type { TokenSource } from '@groundnuty/macf-core';
+import type { FleetLock, FleetManifest } from './fleet-manifest.js';
 import type { LabelsOutcome } from '../commands/repo-init.js';
 import { repoInit as realRepoInit } from '../commands/repo-init.js';
 import { DEFAULT_ACTIONS_VERSION, repoInitRegistryOptions } from './apply-repo-init.js';
@@ -148,6 +169,17 @@ export interface ControlRepoInitDeps {
 export interface ControlRepoInitOptions {
   readonly actionsVersion?: string;
   readonly force?: boolean;
+  /**
+   * groundnuty/macf#1221 — threaded straight into `repoInit`'s own
+   * `tokenSource` option (macf#920's existing plumbing), exactly the way
+   * `apply-repo-init.ts::applyRepoInitForAgent` already does for the
+   * per-agent path. Callers resolve this via
+   * {@link resolveControlRepoLabelTokenSource} — never invented here.
+   * Omitted (the default) preserves the exact pre-#1221 degrade:
+   * `repoInit()`'s own `generateToken()` falls through to ambient env vars
+   * and, finding none, reports `labels: {status: 'skipped'}`.
+   */
+  readonly tokenSource?: TokenSource;
 }
 
 export type ControlRepoInitOutcome =
@@ -159,6 +191,18 @@ export type ControlRepoInitOutcome =
       readonly labels: LabelsOutcome;
       /** See {@link controlRepoWorkflowAllowlisted}'s doc. `false` today — a known, reported gap, not a silent drop. */
       readonly workflowAndConfigAllowlisted: boolean;
+      /**
+       * groundnuty/macf#1221 — mirrors `apply-repo-init.ts`'s
+       * `labelsAreGoodEnough` result exactly (see
+       * {@link controlRepoLabelsGoodEnough}): `true` when `labels.status`
+       * is `'ok'`, OR when no `tokenSource` was supplied this call (the
+       * honest "nothing was ever attempted" gap — unchanged pre-#1221
+       * behavior). `false` ONLY when a legitimate `tokenSource` WAS
+       * supplied and labels still did not fully land — a genuine failure
+       * that needs operator attention (`bootstrap-apply.ts::applyExitCode`
+       * reads this field), distinct from the credential-unavailable case.
+       */
+      readonly labelsGoodEnough: boolean;
     }
   | {
       readonly repo: string;
@@ -166,6 +210,60 @@ export type ControlRepoInitOutcome =
       readonly status: 'failed';
       readonly reason: string;
     };
+
+/**
+ * Whether the control-repo label outcome is good enough to NOT need
+ * operator attention — groundnuty/macf#1221, mirroring
+ * `apply-repo-init.ts::labelsAreGoodEnough` exactly (same two-argument
+ * shape, same rule): `'ok'` always is; a non-`'ok'` outcome is only a
+ * genuine problem when `tokenSourceGiven` — a caller that supplied a
+ * legitimate credential and still got a non-`'ok'` result hit a real
+ * failure (API rejection, revoked key, network) that needs surfacing,
+ * never silently absorbed into the same "labels will retry next run"
+ * framing the credential-less case uses.
+ */
+function controlRepoLabelsGoodEnough(labels: LabelsOutcome, tokenSourceGiven: boolean): boolean {
+  if (labels.status === 'ok') return true;
+  return !tokenSourceGiven;
+}
+
+/**
+ * Resolve a legitimate `TokenSource` for the control-repo label-creation
+ * mint, from an ALREADY-EXISTING agent's vault-stored credential — never a
+ * newly-minted one (none exist yet at Step 0.5, before `apply-fleet.ts`'s
+ * per-agent loop runs). Mirrors `apply-fleet.ts::resolveRunnerOpsVaultPem`'s
+ * exact mechanism (`resolveKeyPath(role, priorAppId)`, wired only under
+ * `--vault`/`--identity-key`) applied across every DECLARED agent role
+ * instead of the single runner-ops role — legitimate because ANY declared
+ * agent's App install already reaches the control repo (this module's doc,
+ * "Why the control repo, not peer-repo access"). Returns the FIRST role
+ * that resolves, in `manifest.agents` declaration order, so the result is
+ * deterministic for a given manifest + prior lock.
+ *
+ * `priorLock` is the run's ALREADY-READ prior lock (never a fresh read
+ * here — the #1000 golden path: one reader per fact). A role absent from
+ * it (a genuinely first-ever provision — no agent has ever been created for
+ * this fleet) or `resolveKeyPath` returning `undefined` for every role (no
+ * `--vault`/`--identity-key` this run, or the vault doesn't hold any
+ * declared role's key) both resolve to `undefined` — an honest "nothing to
+ * try," not a failure. Pure aside from the (idempotent, already-tolerated)
+ * `resolveKeyPath` call itself — no new I/O primitive.
+ */
+export function resolveControlRepoLabelTokenSource(
+  manifest: FleetManifest,
+  priorLock: FleetLock | null,
+  resolveKeyPath: ((role: string, priorAppId: string) => string | undefined) | undefined,
+): TokenSource | undefined {
+  if (priorLock === null || resolveKeyPath === undefined) return undefined;
+  for (const agent of manifest.agents) {
+    const prior = priorLock.agents.find((a) => a.role === agent.role);
+    if (prior === undefined) continue;
+    const keyPath = resolveKeyPath(agent.role, prior.app_id);
+    if (keyPath === undefined) continue;
+    return { appId: prior.app_id, installId: prior.install_id, keyPath };
+  }
+  return undefined;
+}
 
 /**
  * Whether the control repo, as of THIS run's `applyControlRepoInit` outcome,
@@ -255,6 +353,11 @@ export async function applyControlRepoInit(
       agents: agents.join(','),
       force: opts?.force ?? false,
       project: manifest.metadata.name,
+      // groundnuty/macf#1221 — threaded straight into `repoInit`'s own
+      // `tokenSource` option (macf#920's plumbing); omitted entirely when
+      // the caller resolved none, so `generateToken()`'s pre-#1221 fallback
+      // chain is unchanged for that case.
+      ...(opts?.tokenSource !== undefined ? { tokenSource: opts.tokenSource } : {}),
       ...registryOpts,
     });
     return {
@@ -263,6 +366,7 @@ export async function applyControlRepoInit(
       status: 'written',
       labels: result.labels,
       workflowAndConfigAllowlisted: controlRepoWorkflowAllowlisted(),
+      labelsGoodEnough: controlRepoLabelsGoodEnough(result.labels, opts?.tokenSource !== undefined),
     };
   } catch (err) {
     return { repo, agents, status: 'failed', reason: err instanceof Error ? err.message : String(err) };
