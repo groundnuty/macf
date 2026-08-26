@@ -297,6 +297,33 @@ function agentDepsFor(role: string, outcome: 'reused' | 'resumed-install' | 'cre
 const NOOP_REPO_INIT: RepoInitStepDeps = { cloneRepo: async () => {}, commitAndPush: async () => 'pushed' };
 
 /**
+ * groundnuty/macf#1221 — a repoInitDeps fixture for tests whose FOCUS is
+ * something other than control-repo label creation (CA ceremony,
+ * routing-client publish, the six-secret publish) but that use a
+ * `reusedAgentDeps()`/`reusedIdentityDeps()`-shaped fixture with a
+ * `resolveKeyPath: () => '/fake.pem'` that ALSO happens to satisfy
+ * `resolveControlRepoLabelTokenSource`'s role-matching (a prior lock entry
+ * for a role the manifest declares). Before #1221 that fixture's fake
+ * keyPath was inert for THIS concern (nothing ever tried to mint from it
+ * for the control repo); after #1221 it would reach a REAL `repoInit()`
+ * label-creation attempt via the resolved (but nonexistent-on-disk, so
+ * filtered by `resolveControlRepoLabelTokenSource`'s `exists` guard)
+ * tokenSource, landing `labels: {status:'skipped'}` and flipping
+ * `applyExitCode` to `2` for tests that never cared about labels at all —
+ * exactly the SAME "keep an unrelated concern out of the way" pattern this
+ * file already uses for `routingSecretsDepsFor({checkRepoSecretPresence:
+ * async () => 'present'})` on the CA-focused test above. Reports every
+ * label as already `'ok'` unconditionally, for every repo (agent or
+ * control) — a plain, doesn't-care neutral default, never a per-repo
+ * discriminator these tests don't need.
+ */
+const OK_LABELS_REPO_INIT: RepoInitStepDeps = {
+  cloneRepo: async () => {},
+  commitAndPush: async () => 'pushed',
+  repoInit: async () => ({ workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } }),
+};
+
+/**
  * DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920 gap 2) fakes.
  * `mint` returns SENTINEL cert/key PEM strings (distinct from
  * `SENTINEL_CA_*`/`creds()`'s sentinels so a leak test can tell them apart);
@@ -2172,7 +2199,7 @@ agents:
       let mintCalled = false;
       const registryWrites: string[] = [];
       const deps: FleetApplyDeps = {
-        ...baseDeps(agentDeps, manifestPath),
+        ...baseDeps(agentDeps, manifestPath, OK_LABELS_REPO_INIT),
         trustDeps: trustDepsFor({
           checkRegistryPresence: async () => 'absent', // exactly what `deactivate` leaves behind
           readVaultCaCert: async () => 'VAULT-RESTORED-CA-CERT-PEM',
@@ -3653,7 +3680,7 @@ agents:
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
       const logs: string[] = [];
       const deps: FleetApplyDeps = {
-        ...baseDeps(reusedAgentDeps(), manifestPath),
+        ...baseDeps(reusedAgentDeps(), manifestPath, OK_LABELS_REPO_INIT),
         trustDeps: reuseCaTrustDeps(),
         log: (l) => logs.push(l),
         routingClientDeps: {
@@ -3853,7 +3880,7 @@ agents:
       let mintCalled = false;
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
       const deps: FleetApplyDeps = {
-        ...baseDeps(reusedAgentDeps(), manifestPath),
+        ...baseDeps(reusedAgentDeps(), manifestPath, OK_LABELS_REPO_INIT),
         trustDeps: reuseCaTrustDeps(),
         routingClientDeps: {
           mint: async () => {
@@ -3997,7 +4024,7 @@ agents:
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
       let readVaultTsOauthCalls = 0;
       const deps: FleetApplyDeps = {
-        ...baseDeps(reusedIdentityDeps(), manifestPath),
+        ...baseDeps(reusedIdentityDeps(), manifestPath, OK_LABELS_REPO_INIT),
         trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
         routingClientDeps: {
           mint: async () => { throw new Error('must not be called — a routing_client_key fingerprint is already recorded'); },
@@ -4083,7 +4110,7 @@ agents:
         fingerprints: { routing_client_key: 'sha256:cafef00d' },
       };
       const deps: FleetApplyDeps = {
-        ...baseDeps(reusedIdentityDeps(), manifestPath),
+        ...baseDeps(reusedIdentityDeps(), manifestPath, OK_LABELS_REPO_INIT),
         trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
         routingClientDeps: {
           mint: async () => { throw new Error('must not be called — a routing_client_key fingerprint is already recorded'); },
@@ -4149,7 +4176,7 @@ agents:
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
       let readVaultTsOauthCalls = 0;
       const deps: FleetApplyDeps = {
-        ...baseDeps(reusedIdentityDeps(), manifestPath),
+        ...baseDeps(reusedIdentityDeps(), manifestPath, OK_LABELS_REPO_INIT),
         trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
         routingClientDeps: {
           mint: async () => {

@@ -222,7 +222,7 @@ import { repoHomepageUrl } from './app-manifest.js';
 import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './control-repo.js';
 import { provisionControlRepo } from './control-repo.js';
 import type { ControlRepoInitOutcome } from './apply-control-repo-init.js';
-import { applyControlRepoInit, deriveRouterCarryingRepos } from './apply-control-repo-init.js';
+import { applyControlRepoInit, deriveRouterCarryingRepos, resolveControlRepoLabelTokenSource } from './apply-control-repo-init.js';
 import type { FleetLockAgentUpdate, FleetLockIdentityChange } from './fleet-lock.js';
 import { composeFleetLock, readFleetLockFile, writeFleetLock } from './fleet-lock.js';
 import type {
@@ -1220,11 +1220,28 @@ export async function applyFleet(
   // repo's ALREADY-OBSERVED pin (`deps.observedActionsPins?.controlRepo`,
   // never a second live read here — #1000 golden path).
   const controlPinReconcile = resolveActionsPinReconcile(manifest.versions?.actions, deps.observedActionsPins?.controlRepo);
+  // groundnuty/macf#1221 — the credential-path fix: no agent identity is
+  // minted yet this early in the run, so the only legitimate tokenSource
+  // for control-repo label creation is an ALREADY-EXISTING agent's
+  // vault-stored credential (`priorLock` + the SAME `resolveKeyPath`
+  // primitive `resolveRunnerOpsVaultPem` already uses below). `undefined`
+  // here (a genuinely first-ever provision, or no `--vault`/`--identity-key`
+  // this run) is an honest "nothing to try" — see
+  // `resolveControlRepoLabelTokenSource`'s own doc for how that's reported.
+  const controlRepoLabelTokenSource = resolveControlRepoLabelTokenSource(
+    manifest,
+    priorLock,
+    deps.buildAgentDeps(deps.log).resolveKeyPath,
+  );
   const controlRepoInit = await applyControlRepoInit(
     controlDir,
     manifest,
     { repoInit: deps.repoInitDeps.repoInit },
-    { actionsVersion: controlPinReconcile.actionsVersion, force: controlPinReconcile.force },
+    {
+      actionsVersion: controlPinReconcile.actionsVersion,
+      force: controlPinReconcile.force,
+      ...(controlRepoLabelTokenSource !== undefined ? { tokenSource: controlRepoLabelTokenSource } : {}),
+    },
   );
   if (manifest.versions) {
     // Unlike the per-agent case, the control repo's write here is NOT
@@ -1246,6 +1263,27 @@ export async function applyFleet(
   }
   if (controlRepoInit.status === 'failed') {
     deps.log(`Control repo "${controlRepo.repo}" repo-init: FAILED — ${controlRepoInit.reason}`);
+  } else if (!controlRepoInit.labelsGoodEnough) {
+    // groundnuty/macf#1221 — a legitimate tokenSource WAS supplied this run
+    // (see the resolveControlRepoLabelTokenSource call above) and labels
+    // still did not fully land: a genuine problem, not the honest
+    // credential-unavailable gap the `else` branch below narrates. Never
+    // claims labels are "missing" when the outcome is `'skipped'` (the
+    // mint/attempt itself never got a confirmed answer) — the honest-
+    // unknown floor: say UNCONFIRMED, never assert absence or presence
+    // without having actually read the state.
+    const labels = controlRepoInit.labels;
+    const detail =
+      labels.status === 'skipped'
+        ? `label state is UNCONFIRMED — ${labels.reason}`
+        : labels.status === 'partial-failure'
+          ? `label creation FAILED for: ${labels.failed.join(', ')}`
+          : 'label state is UNCONFIRMED';
+    deps.log(
+      `Control repo "${controlRepo.repo}" repo-init: ⚠ ${detail} (${controlRepoInit.agents.join(', ')}) — ` +
+        'a resolved credential was available this run, so this is not the ordinary "no token yet" gap. ' +
+        'This fleet cannot be confirmed routable until labels are verified.',
+    );
   } else {
     deps.log(
       `Control repo "${controlRepo.repo}" repo-init: labels ${controlRepoInit.labels.status} for [${controlRepoInit.agents.join(', ')}]` +

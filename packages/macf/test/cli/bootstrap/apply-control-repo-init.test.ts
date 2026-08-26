@@ -12,7 +12,7 @@
  * one" (a bug that ships only one label would still pass a weaker test).
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -20,12 +20,13 @@ import {
   controlRepoCarriesRouter,
   controlRepoWorkflowAllowlisted,
   deriveRouterCarryingRepos,
+  resolveControlRepoLabelTokenSource,
   CONTROL_REPO_AGENT_CONFIG_RELATIVE_PATH,
   CONTROL_REPO_WORKFLOW_RELATIVE_PATH,
 } from '../../../src/cli/bootstrap/apply-control-repo-init.js';
 import type { ControlRepoInitOutcome } from '../../../src/cli/bootstrap/apply-control-repo-init.js';
 import type { RepoInitOptions, RepoInitResult } from '../../../src/cli/commands/repo-init.js';
-import type { FleetAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
+import type { FleetAgent, FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { CONTROL_REPO_COMMIT_ALLOWLIST } from '../../../src/cli/bootstrap/control-repo.js';
 
 const THREE_AGENTS: readonly FleetAgent[] = [
@@ -71,6 +72,7 @@ describe('controlRepoCarriesRouter (groundnuty/macf#1071)', () => {
       status: 'written',
       labels: { status: 'ok', created: [], existed: [] },
       workflowAndConfigAllowlisted: true,
+      labelsGoodEnough: true,
     };
     expect(controlRepoCarriesRouter(outcome)).toBe(true);
   });
@@ -82,6 +84,7 @@ describe('controlRepoCarriesRouter (groundnuty/macf#1071)', () => {
       status: 'written',
       labels: { status: 'ok', created: [], existed: [] },
       workflowAndConfigAllowlisted: false,
+      labelsGoodEnough: true,
     };
     expect(controlRepoCarriesRouter(outcome)).toBe(false);
   });
@@ -104,6 +107,7 @@ describe('deriveRouterCarryingRepos (groundnuty/macf#1071) — the decisive targ
     status: 'written',
     labels: { status: 'ok', created: [], existed: [] },
     workflowAndConfigAllowlisted: true,
+    labelsGoodEnough: true,
   };
 
   // Per `assert-the-wrong-path.md`: asserting the RETURNED LIST's exact
@@ -199,6 +203,11 @@ describe('applyControlRepoInit', () => {
     expect(outcome.labels).toEqual({ status: 'skipped', reason: expect.stringContaining('APP_ID') });
     // Reflects the CURRENT allowlist gap (see the `controlRepoWorkflowAllowlisted` describe block above).
     expect(outcome.workflowAndConfigAllowlisted).toBe(true);
+    // groundnuty/macf#1221 — no tokenSource was supplied (nor resolvable —
+    // this call passes no `opts` at all), so this is the honest "nothing
+    // was ever attempted" gap, not a genuine failure: `labelsGoodEnough`
+    // stays `true` even though `labels.status` is `'skipped'`.
+    expect(outcome.labelsGoodEnough).toBe(true);
   });
 
   it('DECISIVE (fake repoInit) — the agents option string passed to repoInit is a comma-join of ALL three roles', async () => {
@@ -265,6 +274,212 @@ describe('applyControlRepoInit', () => {
     });
     expect(outcome.status).toBe('failed');
     if (outcome.status === 'failed') expect(outcome.reason).toBe('disk full');
+  });
+
+  // --- groundnuty/macf#1221: tokenSource threading + labelsGoodEnough ---
+
+  it('REGRESSION (the credential path itself) — a supplied tokenSource reaches repoInit unchanged (appId/installId/keyPath), not silently dropped', async () => {
+    // This is the test that would have caught the original bug: apply-fleet.ts
+    // resolved a tokenSource but apply-control-repo-init.ts never threaded it
+    // into the repoInit() call. Asserts the SEAM the fix actually touches —
+    // the options object the injected repoInit fake receives — not a proxy
+    // for it.
+    const dir = scratchDir();
+    const manifest = manifestWith(THREE_AGENTS);
+    const seenOptions: RepoInitOptions[] = [];
+    const tokenSource = { appId: 'app-code-agent', installId: 'install-1', keyPath: '/vault/code-agent.pem' };
+    await applyControlRepoInit(
+      dir,
+      manifest,
+      {
+        repoInit: async (_dir, opts) => {
+          seenOptions.push(opts);
+          return { workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } };
+        },
+      },
+      { tokenSource },
+    );
+    expect(seenOptions).toHaveLength(1);
+    expect(seenOptions[0]?.tokenSource).toEqual(tokenSource);
+  });
+
+  it('no tokenSource supplied -> repoInit receives no tokenSource field at all (unchanged pre-#1221 shape)', async () => {
+    const dir = scratchDir();
+    const manifest = manifestWith(THREE_AGENTS);
+    const seenOptions: RepoInitOptions[] = [];
+    await applyControlRepoInit(dir, manifest, {
+      repoInit: async (_dir, opts) => {
+        seenOptions.push(opts);
+        return { workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } };
+      },
+    });
+    expect(seenOptions[0]?.tokenSource).toBeUndefined();
+  });
+
+  it('DECISIVE PAIR (1/2) — a tokenSource was supplied and labels still did not fully land -> labelsGoodEnough: false (a genuine failure, not the honest gap)', async () => {
+    const dir = scratchDir();
+    const manifest = manifestWith(THREE_AGENTS);
+    const outcome = await applyControlRepoInit(
+      dir,
+      manifest,
+      {
+        repoInit: async () => ({
+          workflow: 'created',
+          config: 'created',
+          labels: { status: 'skipped', reason: 'GitHub API 401 — revoked key' },
+        }),
+      },
+      { tokenSource: { appId: 'a', installId: 'i', keyPath: '/k.pem' } },
+    );
+    expect(outcome.status).toBe('written');
+    if (outcome.status !== 'written') return;
+    expect(outcome.labelsGoodEnough).toBe(false);
+  });
+
+  it('DECISIVE PAIR (2/2) — a tokenSource was supplied and labels landed ok -> labelsGoodEnough: true, run unaffected', async () => {
+    const dir = scratchDir();
+    const manifest = manifestWith(THREE_AGENTS);
+    const outcome = await applyControlRepoInit(
+      dir,
+      manifest,
+      {
+        repoInit: async () => ({ workflow: 'created', config: 'created', labels: { status: 'ok', created: ['code-agent'], existed: [] } }),
+      },
+      { tokenSource: { appId: 'a', installId: 'i', keyPath: '/k.pem' } },
+    );
+    expect(outcome.status).toBe('written');
+    if (outcome.status !== 'written') return;
+    expect(outcome.labelsGoodEnough).toBe(true);
+  });
+
+  it('a partial-failure with a tokenSource supplied is ALSO not good enough (not just a skipped mint)', async () => {
+    const dir = scratchDir();
+    const manifest = manifestWith(THREE_AGENTS);
+    const outcome = await applyControlRepoInit(
+      dir,
+      manifest,
+      {
+        repoInit: async () => ({
+          workflow: 'created',
+          config: 'created',
+          labels: { status: 'partial-failure', created: ['code-agent'], existed: [], failed: ['science-agent'] },
+        }),
+      },
+      { tokenSource: { appId: 'a', installId: 'i', keyPath: '/k.pem' } },
+    );
+    expect(outcome.status).toBe('written');
+    if (outcome.status !== 'written') return;
+    expect(outcome.labelsGoodEnough).toBe(false);
+  });
+});
+
+describe('resolveControlRepoLabelTokenSource (groundnuty/macf#1221) — pure', () => {
+  const MANIFEST = manifestWith(THREE_AGENTS);
+
+  it('priorLock is null (a genuinely first-ever provision) -> undefined, resolveKeyPath never consulted', () => {
+    let called = false;
+    const result = resolveControlRepoLabelTokenSource(MANIFEST, null, () => {
+      called = true;
+      return '/x.pem';
+    });
+    expect(result).toBeUndefined();
+    expect(called).toBe(false);
+  });
+
+  it('resolveKeyPath is undefined (no --vault/--identity-key this run) -> undefined', () => {
+    const priorLock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+    };
+    expect(resolveControlRepoLabelTokenSource(MANIFEST, priorLock, undefined)).toBeUndefined();
+  });
+
+  it('no declared role has a prior lock entry -> undefined', () => {
+    const priorLock: FleetLock = { schema_version: 1, fleet: 'demo-fleet', agents: [] };
+    expect(resolveControlRepoLabelTokenSource(MANIFEST, priorLock, () => '/x.pem')).toBeUndefined();
+  });
+
+  it('the first declared role that resolves wins, in manifest declaration order — not necessarily priorLock array order', () => {
+    // priorLock lists writing-agent first, but the manifest declares
+    // code-agent first — the returned credential must be code-agent's.
+    const priorLock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [
+        { role: 'writing-agent', app_id: 'app-writing-agent', install_id: 'install-3' },
+        { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+      ],
+    };
+    const seenRoles: string[] = [];
+    const result = resolveControlRepoLabelTokenSource(
+      MANIFEST,
+      priorLock,
+      (role, appId) => {
+        seenRoles.push(role);
+        return `/vault/${appId}.pem`;
+      },
+      () => true,
+    );
+    expect(result).toEqual({ appId: 'app-code-agent', installId: 'install-1', keyPath: '/vault/app-code-agent.pem' });
+    expect(seenRoles).toEqual(['code-agent']);
+  });
+
+  it('skips a role whose resolveKeyPath returns undefined (present in priorLock, but not in the vault) and tries the next declared role', () => {
+    const priorLock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [
+        { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+        { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
+      ],
+    };
+    const result = resolveControlRepoLabelTokenSource(
+      MANIFEST,
+      priorLock,
+      (role) => (role === 'science-agent' ? '/vault/science-agent.pem' : undefined),
+      () => true,
+    );
+    expect(result).toEqual({ appId: 'app-science-agent', installId: 'install-2', keyPath: '/vault/science-agent.pem' });
+  });
+
+  it('every declared role fails to resolve -> undefined (honest "nothing to try", not a thrown error)', () => {
+    const priorLock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+    };
+    expect(resolveControlRepoLabelTokenSource(MANIFEST, priorLock, () => undefined)).toBeUndefined();
+  });
+
+  it('REGRESSION — a resolved keyPath that does not exist on disk is NOT a credential (default real existsSync, no fake exists injected)', () => {
+    // No `exists` override here — this exercises the REAL `existsSync`
+    // default, proving the guard fires for a path that genuinely isn't on
+    // disk, not merely for a fake that always says "no."
+    const priorLock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+    };
+    const result = resolveControlRepoLabelTokenSource(MANIFEST, priorLock, () => '/definitely/does/not/exist/x.pem');
+    expect(result).toBeUndefined();
+  });
+
+  it('a resolved keyPath that DOES exist on disk (real file, real existsSync) IS a usable credential', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-control-repo-token-exists-test-'));
+    try {
+      const keyPath = join(dir, 'code-agent.pem');
+      writeFileSync(keyPath, 'not a real PEM, just needs to exist for this check', 'utf-8');
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      const result = resolveControlRepoLabelTokenSource(MANIFEST, priorLock, () => keyPath);
+      expect(result).toEqual({ appId: 'app-code-agent', installId: 'install-1', keyPath });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
