@@ -23,7 +23,10 @@
 import { describe, it, expect } from 'vitest';
 import { provisionedThisRunRoles, resolveDeployVaultPath } from '../../src/cli/commands/bootstrap-apply.js';
 import type { FleetApplyResult, AgentApplyRecord } from '../../src/cli/bootstrap/apply-fleet.js';
+import type { FleetAgent, FleetManifest } from '../../src/cli/bootstrap/fleet-manifest.js';
+import { deriveAppHandle } from '../../src/cli/bootstrap/fleet-manifest.js';
 import type { VaultReadOptions } from '../../src/cli/bootstrap/vault-read.js';
+import { toVariableSegment } from '@groundnuty/macf-core';
 
 /** Minimal, neutral `FleetApplyResult` — every field filled with a steady-state value; only `agents`/`vault` vary per test. Mirrors `bootstrap-apply.test.ts::resultWith`'s own neutral-default convention (kept local, not imported, per this file's own "avoid touching a file being concurrently edited" doc). */
 function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult {
@@ -99,6 +102,27 @@ describe('provisionedThisRunRoles (groundnuty/macf#1183)', () => {
 const OPERATOR_VAULT = '/home/op/secrets/vault.age';
 const IDENTITY_KEY = '/home/op/.age/identity.txt';
 const FRESH_VAULT = '/tmp/macf-bootstrap-control-XXXXXX/secrets/vault.age';
+const FLEET = 'demo-fleet';
+
+function agentFor(role: string): FleetAgent {
+  return { role, profile: 'code', repo: `groundnuty/demo-${role}`, deploy_path: `/unused/${role}` };
+}
+
+function manifestWith(roles: readonly string[]): Pick<FleetManifest, 'metadata' | 'agents'> {
+  return { metadata: { name: FLEET }, agents: roles.map(agentFor) };
+}
+
+/** A vault raw map that FULLY covers `role` — the exact `MACF_AGENT_<seg>_*` field set `queryVaultAgentPresence` checks (mirrors `fleet-deploy.test.ts::vaultRawFor`, kept local per this file's own "avoid a file being concurrently edited" doc). */
+function vaultRawCovering(...roles: readonly string[]): Readonly<Record<string, string>> {
+  const raw: Record<string, string> = {};
+  for (const role of roles) {
+    const seg = toVariableSegment(deriveAppHandle(FLEET, role));
+    raw[`MACF_AGENT_${seg}_APP_ID`] = '111';
+    raw[`MACF_AGENT_${seg}_INSTALL_ID`] = '222';
+    raw[`MACF_AGENT_${seg}_PRIVATE_KEY_B64`] = Buffer.from('FAKE-PEM', 'utf-8').toString('base64');
+  }
+  return raw;
+}
 
 function readVaultMustNotBeCalled(): (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>> {
   return async () => {
@@ -110,7 +134,9 @@ describe('resolveDeployVaultPath (groundnuty/macf#1183)', () => {
   it('vault.status !== "written" (skipped) -> returns the operator-supplied path WITHOUT attempting a decrypt', async () => {
     const result = resultWith({ vault: { status: 'skipped' } });
     const logs: string[] = [];
-    const path = await resolveDeployVaultPath(result, OPERATOR_VAULT, IDENTITY_KEY, readVaultMustNotBeCalled(), (l) => logs.push(l));
+    const path = await resolveDeployVaultPath(result, manifestWith(['auditor-agent']), OPERATOR_VAULT, IDENTITY_KEY, readVaultMustNotBeCalled(), (l) =>
+      logs.push(l),
+    );
     expect(path).toBe(OPERATOR_VAULT);
     expect(logs.join('\n')).toContain(OPERATOR_VAULT);
   });
@@ -118,20 +144,22 @@ describe('resolveDeployVaultPath (groundnuty/macf#1183)', () => {
   it('vault.status === "failed" -> returns the operator-supplied path, logs that the write failed', async () => {
     const result = resultWith({ vault: { status: 'failed', reason: 'age encrypt exited 1' } });
     const logs: string[] = [];
-    const path = await resolveDeployVaultPath(result, OPERATOR_VAULT, IDENTITY_KEY, readVaultMustNotBeCalled(), (l) => logs.push(l));
+    const path = await resolveDeployVaultPath(result, manifestWith(['auditor-agent']), OPERATOR_VAULT, IDENTITY_KEY, readVaultMustNotBeCalled(), (l) =>
+      logs.push(l),
+    );
     expect(path).toBe(OPERATOR_VAULT);
     expect(logs.join('\n')).toMatch(/vault write FAILED/);
   });
 
-  it('vault.status === "written" AND the fresh path decrypts -> returns the FRESH path, not the operator one', async () => {
+  it('vault.status === "written", decrypts, AND covers every declared role -> returns the FRESH path, not the operator one', async () => {
     const result = resultWith({ vault: { status: 'written', path: FRESH_VAULT, versioned: false } });
     let calledWith: VaultReadOptions | undefined;
     const doReadVault = async (opts: VaultReadOptions): Promise<Readonly<Record<string, string>>> => {
       calledWith = opts;
-      return { SOME_KEY: 'value' };
+      return vaultRawCovering('auditor-agent');
     };
     const logs: string[] = [];
-    const path = await resolveDeployVaultPath(result, OPERATOR_VAULT, IDENTITY_KEY, doReadVault, (l) => logs.push(l));
+    const path = await resolveDeployVaultPath(result, manifestWith(['auditor-agent']), OPERATOR_VAULT, IDENTITY_KEY, doReadVault, (l) => logs.push(l));
     expect(path).toBe(FRESH_VAULT);
     expect(calledWith).toEqual({ vaultPath: FRESH_VAULT, identityPath: IDENTITY_KEY });
     expect(logs.join('\n')).toContain(FRESH_VAULT);
@@ -143,9 +171,32 @@ describe('resolveDeployVaultPath (groundnuty/macf#1183)', () => {
       throw new Error('age: no identity matched any of the recipients');
     };
     const logs: string[] = [];
-    const path = await resolveDeployVaultPath(result, OPERATOR_VAULT, IDENTITY_KEY, doReadVault, (l) => logs.push(l));
+    const path = await resolveDeployVaultPath(result, manifestWith(['auditor-agent']), OPERATOR_VAULT, IDENTITY_KEY, doReadVault, (l) => logs.push(l));
     expect(path).toBe(OPERATOR_VAULT);
     expect(logs.join('\n')).toContain('could not decrypt the vault this run just wrote');
+    expect(logs.join('\n')).toContain(OPERATOR_VAULT);
+  });
+
+  it('DISCRIMINATING: vault.status === "written" AND decrypts, but a REUSED role is absent from it (first-write, mixed created+reused run) -> falls back to the operator path, never silently mis-serves the reused role', async () => {
+    // The exact shape the advisor's review flagged: settleVault's
+    // FIRST-WRITE branch (no vault existed in the freshly-cloned control
+    // repo) writes ONLY roles with identity.status === 'created' this run.
+    // A fleet with 1 created role + 1 reused role produces a fresh vault
+    // covering ONLY the created one.
+    const result = resultWith({ vault: { status: 'written', path: FRESH_VAULT, versioned: false } });
+    const doReadVault = async (): Promise<Readonly<Record<string, string>>> => vaultRawCovering('auditor-agent'); // covers ONLY the created role
+    const logs: string[] = [];
+    const path = await resolveDeployVaultPath(
+      result,
+      manifestWith(['auditor-agent', 'code-agent']), // code-agent is declared but NOT in the fresh vault
+      OPERATOR_VAULT,
+      IDENTITY_KEY,
+      doReadVault,
+      (l) => logs.push(l),
+    );
+    expect(path).toBe(OPERATOR_VAULT);
+    expect(logs.join('\n')).toContain('does not (yet) cover every declared role');
+    expect(logs.join('\n')).toContain('code-agent');
     expect(logs.join('\n')).toContain(OPERATOR_VAULT);
   });
 });

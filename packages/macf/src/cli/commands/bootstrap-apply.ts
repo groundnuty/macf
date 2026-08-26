@@ -111,6 +111,7 @@ import {
 import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR } from '../bootstrap/runner-platform.js';
 import {
   readVault,
+  queryVaultAgentPresence,
   vaultAgentPrivateKeyPem,
   vaultCaCertPem,
   vaultRoutingClientCertPem,
@@ -1403,8 +1404,7 @@ export function provisionedThisRunRoles(result: FleetApplyResult): ReadonlySet<s
  * when it demonstrably had been, seconds earlier, in the SAME process.
  *
  * **Why a fresh read is available at all.** `applyFleet`'s own `settleVault`
- * step (DR-043 Amendment D) composes EVERY role's credential — prior AND
- * new — into ONE whole-payload write, landing at `result.vault.path` when
+ * step (DR-043 Amendment D) writes to `result.vault.path` when
  * `result.vault.status === 'written'`. That path lives inside the per-run
  * control-repo scratch checkout (`control-repo.ts::provisionControlRepo`'s
  * `localDir`), which nothing in this codebase proactively deletes mid-run —
@@ -1415,23 +1415,45 @@ export function provisionedThisRunRoles(result: FleetApplyResult): ReadonlySet<s
  * here is not a race against durability, only a read of what is already
  * durable, from the exact file that write produced.
  *
+ * **Why "decrypts successfully" is NOT sufficient on its own — role
+ * COVERAGE is the real invariant.** `settleVault` has two write shapes, and
+ * only one of them is guaranteed complete:
+ * - the COMPOSE path (a vault already existed in the freshly-cloned control
+ *   repo) decrypts that prior content and folds THIS run's new secrets in —
+ *   the result is a strict superset of what existed before, so it always
+ *   covers every role the operator's own `--vault` already covered.
+ * - the FIRST-WRITE path (no vault existed yet — a brand-new fleet's first
+ *   apply, a recreated control repo, or a prior run whose push never
+ *   landed) writes ONLY `pendingVaultAgents` — which `applyFleet`'s loop
+ *   populates ONLY from roles with `identity.status === 'created'` THIS
+ *   run. A REUSED role (an App that already existed on GitHub) contributes
+ *   NOTHING to that payload. A mixed run — 1 role created, 4 reused — would
+ *   produce a fresh vault holding exactly 1 credential; blindly preferring
+ *   it over the operator's own (possibly-complete) vault would turn the 4
+ *   reused roles' deploys into NEW, wrongly-attributed #1183 failures in
+ *   the exact process meant to fix the class. So before trusting the fresh
+ *   path, this function checks that it actually covers every role `manifest
+ *   .agents` declares ({@link queryVaultAgentPresence} — the SAME presence
+ *   primitive `fleet-deploy.ts::extractAgentVaultCredentials` itself
+ *   checks, reused rather than re-derived) — not merely that it decrypts.
+ *
  * **Why this function ACTUALLY DECRYPTS before committing to the fresh
  * path, rather than trusting `status === 'written'` alone.** `settleVault`'s
- * compose step re-encrypts the WHOLE payload to `manifest.transport
- * .age_recipients` AS DECLARED THIS RUN — not necessarily the same actual
- * recipient set the vault the operator can already open was encrypted to.
- * `apply-fleet.ts::reconcileVaultRecipients`'s own doc flags the gap
- * directly: an unchanged recipient COUNT is "not a claim the sets are
- * cryptographically confirmed identical" — an operator who rotates their
- * OWN age identity (removed from `age_recipients`, a new one added, same
- * total count) in the SAME run that also creates an agent would have a
- * freshly-written vault their OLD `--identity-key` can no longer open, even
- * though it could open the PRE-run vault seconds earlier. A path-only
- * decision (`status === 'written' ? result.vault.path : operatorVaultPath`)
- * would silently convert a working deploy into a failing one for exactly
- * that operator. Attempting the real decrypt and falling back on failure
- * means this function can never make things WORSE than the pre-#1183
- * default — only better, when the fresh vault is actually usable.
+ * write re-encrypts to `manifest.transport.age_recipients` AS DECLARED THIS
+ * RUN — not necessarily the same actual recipient set the vault the
+ * operator can already open was encrypted to. `apply-fleet.ts
+ * ::reconcileVaultRecipients`'s own doc flags the gap directly: an
+ * unchanged recipient COUNT is "not a claim the sets are cryptographically
+ * confirmed identical" — an operator who rotates their OWN age identity
+ * (removed from `age_recipients`, a new one added, same total count) in
+ * the SAME run that also creates an agent would have a freshly-written
+ * vault their OLD `--identity-key` can no longer open, even though it
+ * could open the PRE-run vault seconds earlier.
+ *
+ * Combined, the decrypt check AND the coverage check are what make this
+ * function unable to make things WORSE than the pre-#1183 default — only
+ * better, and only when the fresh vault is BOTH openable AND complete for
+ * this run's declared roles.
  *
  * **Never silent either way** — logs which vault deploy is about to read,
  * every branch, so an operator staring at the exact `apply` output #1183
@@ -1443,6 +1465,7 @@ export function provisionedThisRunRoles(result: FleetApplyResult): ReadonlySet<s
  */
 export async function resolveDeployVaultPath(
   result: FleetApplyResult,
+  manifest: Pick<FleetManifest, 'metadata' | 'agents'>,
   operatorVaultPath: string,
   identityKeyPath: string,
   doReadVault: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>,
@@ -1453,10 +1476,9 @@ export async function resolveDeployVaultPath(
     log(`Deploy phase: reading the --vault path you supplied (${operatorVaultPath}) — ${why}, so it is the most current vault available.`);
     return operatorVaultPath;
   }
+  let fresh: Readonly<Record<string, string>>;
   try {
-    await doReadVault({ vaultPath: result.vault.path, identityPath: identityKeyPath });
-    log(`Deploy phase: reading the vault this run just wrote (${result.vault.path}) — includes every role provisioned this run.`);
-    return result.vault.path;
+    fresh = await doReadVault({ vaultPath: result.vault.path, identityPath: identityKeyPath });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     log(
@@ -1465,6 +1487,23 @@ export async function resolveDeployVaultPath(
     );
     return operatorVaultPath;
   }
+  const uncovered = manifest.agents
+    .map((a) => a.role)
+    .filter((role) => {
+      const presence = queryVaultAgentPresence(fresh, manifest.metadata.name, role);
+      return !(presence.appId.present && presence.installId.present && presence.privateKey.present);
+    });
+  if (uncovered.length > 0) {
+    log(
+      `Deploy phase: the vault this run just wrote does not (yet) cover every declared role (missing: ` +
+        `${uncovered.join(', ')}) — this run's vault write only carries roles CREATED this run (see this ` +
+        `function's own doc). Falling back to the --vault path you supplied (${operatorVaultPath}), which may ` +
+        'already hold the reused roles the fresh write omits.',
+    );
+    return operatorVaultPath;
+  }
+  log(`Deploy phase: reading the vault this run just wrote (${result.vault.path}) — covers every declared role.`);
+  return result.vault.path;
 }
 
 // --- Version-reconcile phase (DR-043 Amendment L, macf#1045) — production deps ---
@@ -3107,16 +3146,19 @@ export async function runBootstrapApply(
           const deployDeps: ApplyDeployPhaseDeps =
             resolved.deployDeps ?? { ...resolveApplyDeployDeps(), log: stderrLog, rolesProvisionedThisApplyRun: provisionedThisRunRoles(result) };
           // groundnuty/macf#1183 — read the vault THIS run actually wrote
-          // when it wrote one, instead of unconditionally re-decrypting the
-          // operator's pre-run `--vault` snapshot; see
-          // `resolveDeployVaultPath`'s own doc for the full reasoning
-          // (including why it verifies decryptability before committing).
+          // when it wrote one AND that write covers every declared role,
+          // instead of unconditionally re-decrypting the operator's pre-run
+          // `--vault` snapshot; see `resolveDeployVaultPath`'s own doc for
+          // the full reasoning (decryptability AND role coverage, not
+          // decryptability alone — a mixed created/reused first-write run
+          // would otherwise fall back silently wrong for the reused roles).
           // Reuses `deployDeps.readVault` — whichever function the deploy
           // phase itself is about to read with, test override or real —
           // so the staleness check and the real read never disagree about
           // which `readVault` is in effect.
           const vaultPathForDeploy = await resolveDeployVaultPath(
             result,
+            manifest,
             resolvePath(opts.vaultPath),
             resolvePath(opts.identityKeyPath),
             deployDeps.readVault,
