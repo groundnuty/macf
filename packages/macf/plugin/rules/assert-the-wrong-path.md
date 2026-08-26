@@ -67,7 +67,7 @@ Acceptance criteria almost always enumerate what must hold. That is sufficient w
 
 > **When a plausible-but-wrong verification exists, the criteria must FORBID it — not merely leave it out.** Omitting it leaves it available; forbidding it makes writing it a spec violation.
 
-### Two triggers, two different remedies
+### Three triggers, three different remedies
 
 **Trigger 1 — circularity: the reference value comes from what it checks.** The verification cannot fail, so it reports agreement and reads as correctness.
 
@@ -90,6 +90,25 @@ expect(code).toBe(0); // stale-pin is a skip, not a halt
 > **A spec that classifies a state without specifying its observable consequence invites the test to invent one.**
 
 **Remedy: specify the consequence — do NOT merely forbid the assertion.** Forbidding `toBe(0)` leaves the right value unstated and the next person guesses again. The fix is the spec sentence *"a roll that leaves any agent behind exits `2`"*, which makes the wrong assertion unwritable rather than merely disallowed.
+
+**Trigger 3 — the population under test excludes the failing case by construction.** Nothing is circular and the consequence is specified; the assertion is correct for every case it can see. **The case it cannot see is the one the code gets wrong.**
+
+Two instances, at different scales — which is what makes this a trigger rather than an anecdote:
+
+| | population | the case it excluded |
+|---|---|---|
+| a same-run vault fix | fixtures with **all-created** agents | **mixed created+reused** — the fix misdiagnosed reused roles, and every all-created run passed |
+| every fleet e2e ever run | the **warm** `macf-experiment` org | **a cold scope** — shared Apps were reused-not-created and credentials pre-existed, so cold-start was never exercised |
+
+The first is a fixture; the second is an entire test environment. **The exclusion can live anywhere the population is chosen**, and a green suite proves only that the chosen population passes.
+
+**Remedy: ask the population question before trusting the result.**
+
+> **What case cannot appear in this population, and is that the case the code is most likely to get wrong?**
+
+For the vault fix the answer was *reused roles*, and it was. For the fleet e2e it was *a cold scope*, and it was.
+
+**And its cheap companion — mutation as habit:** break the fix, re-run, confirm a test notices. **A test that passes with the fix removed is testing something else.** One fix shipped merged-and-green while its emitting call site stayed broken, because its tests asserted the mechanism in general rather than at the site; its replacement was proven load-bearing by disabling it and watching the assertion fail. **The cost is a single deliberately-broken run.**
 
 **Distinguishing them:** ask whether your expected value came from **the population under test** (trigger 1) or from **your own inference about an unstated observable** (trigger 2). A reader who only knows trigger 1 gets *"no, nothing circular here"* on the second case and writes the assertion anyway — which is how this section's own first draft failed to recognise one of the two cases it cited.
 
