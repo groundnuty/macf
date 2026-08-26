@@ -3827,7 +3827,18 @@ describe('runBootstrapApply — remaining-deploy honest completion (macf#1014)',
     const file = writeManifest();
     const code = await runBootstrapApply(
       { file, yes: true },
-      { observe: () => Promise.resolve(EMPTY_OBSERVED), checkDeployPathExists: () => true },
+      {
+        observe: () => Promise.resolve(EMPTY_OBSERVED),
+        checkDeployPathExists: () => true,
+        // groundnuty/macf#1241 — this fixture's TS_OAUTH pair is genuinely
+        // unsatisfied (no vault/--ts-oauth-* given), so the routing verdict
+        // would otherwise attempt a LIVE `gh api .../organization-secrets`
+        // read via the real default. A hermetic "confirmed absent at org
+        // level too" fake keeps this test's routing verdict at its
+        // pre-#1241 'not-confirmed' baseline (this test asserts nothing
+        // about routing) instead of a network-dependent 'unknown'.
+        listOrgSecretsVisibleToRepo: () => Promise.resolve({ status: 'ok', names: [] }),
+      },
       fakeMutateDeps(file),
     );
     expect(code).toBe(0);

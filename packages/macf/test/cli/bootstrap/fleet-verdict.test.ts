@@ -13,16 +13,19 @@
  * has a (2)-shaped sibling proving the render can actually say NOT
  * confirmed.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   determineFleetVerdict,
   fleetVerdictToJson,
   formatFleetVerdictLines,
+  resolveOrgSecretVisibility,
   routingVerdictComponent,
   runnerVerdictComponent,
+  unsatisfiedRoutingSecretNames,
+  widenRepoRoutingVerdict,
   workspaceVerdictComponent,
 } from '../../../src/cli/bootstrap/fleet-verdict.js';
-import type { FleetVerdictComponent } from '../../../src/cli/bootstrap/fleet-verdict.js';
+import type { FleetVerdictComponent, OrgSecretsListResult, RoutingVerdictOrgSecretsDeps } from '../../../src/cli/bootstrap/fleet-verdict.js';
 import { ALL_ROUTING_SECRET_NAMES } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RoutingSecretsPublishResult } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { EnsureVariableOutcome } from '../../../src/cli/bootstrap/ensure-variable.js';
@@ -98,6 +101,164 @@ describe('routingVerdictComponent', () => {
     const c = routingVerdictComponent(routingResultWith(['o/a'], { status: 'failed', reason: 'router App identity unresolved' }));
     expect(c.status.state).toBe('not-confirmed');
     expect(c.status.detail).toContain('router App identity unresolved');
+  });
+});
+
+// --- Org-inherited routing-secret widening (groundnuty/macf#1241) ---
+//
+// Live false negative this section closes: `macf-trial`'s TS_OAUTH pair
+// moved to an org secret (`visibility: all`), so every repo's REPO-level
+// leg reads absent ('skipped') even though the org-level secret is visible
+// to every repo and routing genuinely works. The decisive pair, per the
+// issue's own requirement (assert-the-wrong-path.md: (1) alone is
+// satisfied by a widening that counts EVERYTHING as present):
+//
+//   1. absent repo-level, present org-level with covering visibility -> present, verdict confirms
+//   2. absent at BOTH levels -> missing, named per repo per secret
+//
+// Plus: org-listing call unavailable/failing -> unknown, distinct from
+// both, never "missing" from a call that could not have shown it.
+
+/** One repo's six legs: TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET 'skipped' (not-required-and-absent, the #1184 widened-skip shape), the other four 'created' — the exact live `macf-trial` signature the issue reports. */
+function tsOauthSkippedResult(repo: string): RoutingSecretsPublishResult {
+  const result = {} as Record<string, Record<string, EnsureVariableOutcome>>;
+  for (const name of ALL_ROUTING_SECRET_NAMES) {
+    result[name] = {
+      [repo]:
+        name === 'TS_OAUTH_CLIENT_ID' || name === 'TS_OAUTH_SECRET' ? { status: 'skipped', reason: 'transport.tailscale_oauth_required not declared' } : { status: 'created' },
+    };
+  }
+  return result as RoutingSecretsPublishResult;
+}
+
+describe('routingVerdictComponent — org-inherited secret widening (groundnuty/macf#1241)', () => {
+  it('DECISIVE 1/2: absent repo-level, present org-level with covering visibility -> CONFIRMED (the macf-trial false negative)', () => {
+    const secrets = tsOauthSkippedResult('org/repo-a');
+    const orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {
+      'org/repo-a': { status: 'ok', names: ['TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'] },
+    };
+    const c = routingVerdictComponent(secrets, orgSecretVisibility);
+    expect(c.status.state).toBe('confirmed');
+  });
+
+  it('DECISIVE 2/2: absent at BOTH levels -> NOT confirmed, naming the repo AND the secret (never a bare count)', () => {
+    const secrets = tsOauthSkippedResult('org/repo-a');
+    const orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {
+      // Org listing succeeded but does not carry either name — genuinely absent at both levels.
+      'org/repo-a': { status: 'ok', names: ['SOME_OTHER_ORG_SECRET'] },
+    };
+    const c = routingVerdictComponent(secrets, orgSecretVisibility);
+    expect(c.status.state).toBe('not-confirmed');
+    expect(c.status.detail).toContain('org/repo-a');
+    expect(c.status.detail).toContain('TS_OAUTH_CLIENT_ID');
+    expect(c.status.detail).toContain('TS_OAUTH_SECRET');
+  });
+
+  it('org-listing call unavailable/failing -> UNKNOWN, distinct from both, never "missing"', () => {
+    const secrets = tsOauthSkippedResult('org/repo-a');
+    const orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {
+      'org/repo-a': { status: 'unknown', reason: 'gh api repos/org/repo-a/actions/organization-secrets failed: HTTP 403' },
+    };
+    const c = routingVerdictComponent(secrets, orgSecretVisibility);
+    expect(c.status.state).toBe('unknown');
+    expect(c.status.state).not.toBe('not-confirmed');
+    expect(c.status.detail).toContain('org/repo-a');
+    expect(c.status.detail).toContain('TS_OAUTH_CLIENT_ID');
+    expect(c.status.detail).toContain('TS_OAUTH_SECRET');
+    expect(c.status.detail).not.toMatch(/missing at least one required routing secret/);
+  });
+
+  it('omitting the org-visibility parameter entirely preserves the pre-#1241 NOT-confirmed outcome (byte-identical-when-omitted contract)', () => {
+    const secrets = tsOauthSkippedResult('org/repo-a');
+    const withoutOrgData = routingVerdictComponent(secrets);
+    expect(withoutOrgData.status.state).toBe('not-confirmed');
+  });
+
+  it('a repo with NOTHING unsatisfied is confirmed regardless of what the org map says (widening never re-litigates an already-satisfied repo)', () => {
+    const secrets = routingResultWith(['org/repo-a'], { status: 'created' });
+    const c = routingVerdictComponent(secrets, { 'org/repo-a': { status: 'unknown', reason: 'irrelevant — never even needed to be checked' } });
+    expect(c.status.state).toBe('confirmed');
+  });
+
+  it('a mix: one repo satisfied by org-widening, one repo still missing -> overall NOT confirmed, only the failing repo named as missing', () => {
+    const a = tsOauthSkippedResult('org/repo-a');
+    const b = tsOauthSkippedResult('org/repo-b');
+    const secrets = {} as Record<string, Record<string, EnsureVariableOutcome>>;
+    for (const name of ALL_ROUTING_SECRET_NAMES) secrets[name] = { ...a[name], ...b[name] };
+    const orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {
+      'org/repo-a': { status: 'ok', names: ['TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'] },
+      'org/repo-b': { status: 'ok', names: [] },
+    };
+    const c = routingVerdictComponent(secrets as RoutingSecretsPublishResult, orgSecretVisibility);
+    expect(c.status.state).toBe('not-confirmed');
+    expect(c.status.detail).toContain('org/repo-b');
+    expect(c.status.detail).not.toContain('org/repo-a:');
+  });
+});
+
+describe('unsatisfiedRoutingSecretNames (pure)', () => {
+  it('every leg satisfied -> empty', () => {
+    expect(unsatisfiedRoutingSecretNames(routingResultWith(['o/a'], { status: 'already-present' }), 'o/a')).toEqual([]);
+  });
+
+  it('names exactly the failed/skipped legs, never the satisfied ones', () => {
+    const secrets = tsOauthSkippedResult('o/a');
+    expect(unsatisfiedRoutingSecretNames(secrets, 'o/a').sort()).toEqual(['TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'].sort());
+  });
+});
+
+describe('widenRepoRoutingVerdict (pure)', () => {
+  const secrets = tsOauthSkippedResult('o/a');
+
+  it('no org listing attempted (undefined) -> missing, unchanged from pre-widening', () => {
+    const r = widenRepoRoutingVerdict(secrets, 'o/a', undefined);
+    expect(r.state).toBe('not-confirmed');
+    expect(r.missing.sort()).toEqual(['TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'].sort());
+    expect(r.unknownOrgSecrets).toEqual([]);
+  });
+
+  it('org listing ok, covers everything unsatisfied -> confirmed', () => {
+    const r = widenRepoRoutingVerdict(secrets, 'o/a', { status: 'ok', names: ['TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'] });
+    expect(r.state).toBe('confirmed');
+    expect(r.missing).toEqual([]);
+  });
+
+  it('org listing ok, covers ONE of two -> still not-confirmed, naming only the uncovered one', () => {
+    const r = widenRepoRoutingVerdict(secrets, 'o/a', { status: 'ok', names: ['TS_OAUTH_CLIENT_ID'] });
+    expect(r.state).toBe('not-confirmed');
+    expect(r.missing).toEqual(['TS_OAUTH_SECRET']);
+  });
+
+  it('org listing unknown -> unknown, every unsatisfied name honest-unknown, none in `missing`', () => {
+    const r = widenRepoRoutingVerdict(secrets, 'o/a', { status: 'unknown', reason: 'auth failure' });
+    expect(r.state).toBe('unknown');
+    expect(r.missing).toEqual([]);
+    expect(r.unknownOrgSecrets.sort()).toEqual(['TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'].sort());
+  });
+
+  it('nothing unsatisfied -> confirmed regardless of orgListing', () => {
+    const clean = routingResultWith(['o/b'], { status: 'created' });
+    expect(widenRepoRoutingVerdict(clean, 'o/b', { status: 'unknown', reason: 'irrelevant' }).state).toBe('confirmed');
+  });
+});
+
+describe('resolveOrgSecretVisibility (I/O boundary, dependency-injected)', () => {
+  it('cost optimization: a repo with zero unsatisfied secrets is NEVER probed', async () => {
+    const listOrgSecretsVisibleToRepo = vi.fn<RoutingVerdictOrgSecretsDeps['listOrgSecretsVisibleToRepo']>();
+    const secrets = routingResultWith(['o/clean'], { status: 'already-present' });
+    const result = await resolveOrgSecretVisibility(secrets, ['o/clean'], { listOrgSecretsVisibleToRepo });
+    expect(listOrgSecretsVisibleToRepo).not.toHaveBeenCalled();
+    expect(result).toEqual({});
+  });
+
+  it('a repo with an unsatisfied secret IS probed exactly once, and its result is carried through', async () => {
+    const listOrgSecretsVisibleToRepo = vi
+      .fn<RoutingVerdictOrgSecretsDeps['listOrgSecretsVisibleToRepo']>()
+      .mockResolvedValue({ status: 'ok', names: ['TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'] });
+    const secrets = tsOauthSkippedResult('o/needs-check');
+    const result = await resolveOrgSecretVisibility(secrets, ['o/needs-check'], { listOrgSecretsVisibleToRepo });
+    expect(listOrgSecretsVisibleToRepo).toHaveBeenCalledExactlyOnceWith('o/needs-check');
+    expect(result).toEqual({ 'o/needs-check': { status: 'ok', names: ['TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'] } });
   });
 });
 
