@@ -72,10 +72,36 @@
  *     the #872 completeness audit): the deployed secret itself is unreadable, so
  *     a match is a comparison of the one proxy value available, never a
  *     verification of the cert.
+ *  7. ROUTING-TABLE ARTIFACTS (macf#1191) — for EVERY repo visible in this run's
+ *     install-set (not just the repo this command happens to run from), does
+ *     that repo's OWN `.github/agent-config.json` name an agent it has no
+ *     matching GitHub LABEL for? `macf-science-agent` named `devops-agent` in
+ *     its routing table with no `devops-agent` label at all — that queue could
+ *     never have returned anything, and a plain per-repo audit would have read
+ *     it as a healthy empty queue rather than a structurally dead one
+ *     (`coordination.md §5d`: an empty result is not evidence of absence unless
+ *     the instrument would have shown presence). `routing-doctor-gh.ts`'s
+ *     `createRepoLabelLister` is the artifact-EXISTENCE leaf; `evaluateRoutingArtifact`
+ *     / `gatherRoutingArtifacts` / `buildArtifactChecks` below are the
+ *     artifact-GENERAL sweep — a future implied artifact is a NEW ENTRY in
+ *     `buildArtifactChecks`, never a new command. A repo this caller cannot
+ *     read is reported `not-visible`, never `missing` (GitHub returns the
+ *     identical 404 for "doesn't exist," "private and not installed," and
+ *     "misnamed" — there is no discriminator to build, so this command does
+ *     not pretend to have one); `not-visible` does NOT fail the verdict (an
+ *     App legitimately installed on a subset of repos is normal, and failing
+ *     on that would make the check permanently red for every narrow-scoped
+ *     caller, reproducing the exact "always red, so ignored" failure mode),
+ *     but it is never silently dropped either — `reposVisible` (the coverage
+ *     figure) is carried in the summary line and JSON on EVERY run, clean or
+ *     not, so a narrow-coverage clean run can never be misread as a full-fleet
+ *     clean run. This command NEVER creates the missing artifact — see the
+ *     WHY-comment on `buildArtifactChecks`.
  *
- * Every GitHub read (install-set, caller-pins, agent-config), the registry list,
- * the mTLS `/health` probe, and the CA-var read are INJECTABLE (`RoutingDoctorDeps`)
- * so tests run fully offline. The `gh` shell-outs live in `routing-doctor-gh.ts`.
+ * Every GitHub read (install-set, caller-pins, agent-config, repo labels), the
+ * registry list, the mTLS `/health` probe, and the CA-var read are INJECTABLE
+ * (`RoutingDoctorDeps`) so tests run fully offline. The `gh` shell-outs live in
+ * `routing-doctor-gh.ts`.
  */
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -105,6 +131,7 @@ import {
   createRoutingConfigGhReader,
   createFleetMarkerReader,
   createFleetManifestReader,
+  createRepoLabelLister,
 } from './routing-doctor-gh.js';
 import {
   classifyPinState,
@@ -509,6 +536,162 @@ export function evaluateRoutingClientCertIssuer(
   };
 }
 
+// --- Routing-table artifact checks (macf#1191) ---
+
+/**
+ * Per-(repo, agent, artifact) verdict for a GitHub-plane artifact a repo's OWN
+ * routing table (`.github/agent-config.json`) structurally REQUIRES to exist,
+ * IN THAT SAME REPO, for the queue it implies to be reachable at all
+ * (macf#1191 — `macf-science-agent` named `devops-agent` in its own routing
+ * table with no `devops-agent` LABEL; that queue could never have returned
+ * anything, and an empty result read as "nothing pending," not "structurally
+ * incapable").
+ *
+ * `not-visible` is NOT a synonym for "probably missing" or a weaker flavor of
+ * it. GitHub returns the identical 404 whether a repo doesn't exist, is
+ * private with this caller's App not installed there, or was simply
+ * misnamed — there is no status-code (or any other) discriminator between
+ * "absent" and "cannot see," so this command does not attempt one. ANY
+ * failure to read the artifact-existence data for a repo collapses to
+ * `not-visible`, never to `missing` — reporting an unreadable repo as a
+ * confirmed absence would reproduce, one level down, the exact
+ * false-negative this check exists to eliminate: "same audit, same table,
+ * different answers depending on who runs it" is exactly the failure mode
+ * a `missing` verdict built on an inconclusive read would create.
+ */
+export type RoutingArtifactStatus = 'present' | 'missing' | 'not-visible';
+
+export interface RoutingArtifactResult {
+  readonly repo: string;
+  readonly agent: string;
+  readonly artifact: string;
+  readonly status: RoutingArtifactStatus;
+  readonly reason?: string;
+}
+
+/**
+ * A GitHub-plane artifact a routing-table entry structurally REQUIRES to
+ * exist, IN THE SAME REPO that names it, for the queue it implies to be
+ * reachable (macf#1191). The assignment label is the FIRST instance —
+ * extend by appending a NEW ENTRY to `buildArtifactChecks` below, never by
+ * adding a new command or a parallel sweep (the issue's own acceptance
+ * criterion: "a new implied artifact is a new assertion in one place").
+ */
+export interface RoutingArtifactCheck {
+  /** Stable name surfaced in reports, e.g. "assignment-label". */
+  readonly artifact: string;
+  /**
+   * Fetch the repo-level existence-data ONCE per repo (e.g. the repo's label
+   * names). `null` means the read FAILED for ANY reason — inaccessible,
+   * deleted, network, anything — and is reported `not-visible` for every
+   * agent this repo's table names, NEVER `missing`.
+   */
+  readonly fetchRepoState: (repo: string) => Promise<readonly string[] | null>;
+  /** Whether `agent`'s artifact is present, given the fetched repo state. */
+  readonly isPresent: (agent: string, repoState: readonly string[]) => boolean;
+}
+
+/** Pure per-(repo,agent) evaluator — the join `gatherRoutingArtifacts` drives. */
+export function evaluateRoutingArtifact(
+  repo: string,
+  agent: string,
+  check: RoutingArtifactCheck,
+  repoState: readonly string[] | null,
+): RoutingArtifactResult {
+  if (repoState === null) {
+    return {
+      repo,
+      agent,
+      artifact: check.artifact,
+      status: 'not-visible',
+      reason: 'not visible to this caller — could be absent, private, or misnamed',
+    };
+  }
+  if (check.isPresent(agent, repoState)) {
+    return { repo, agent, artifact: check.artifact, status: 'present' };
+  }
+  return {
+    repo,
+    agent,
+    artifact: check.artifact,
+    status: 'missing',
+    reason: `"${repo}" names "${agent}" in its routing table but has no matching ${check.artifact} — that queue is structurally unable to return work`,
+  };
+}
+
+/**
+ * Sweep EVERY repo visible in THIS run's install-set (the SAME `repos` list
+ * the caller-pin check already fetched — no new repo-discovery mechanism)
+ * against its OWN routing table (macf#1191). Repo R's own
+ * `.github/agent-config.json` names the agents R routes to; each named agent
+ * needs its artifacts present IN R — not in the repo this command happens to
+ * run from — for R's queue to be reachable at all.
+ *
+ * A repo whose config can't be read contributes NOTHING here (same
+ * "not a routing participant" treatment the caller-pin sweep gives a
+ * `no-workflow` repo) — a DIFFERENT question from the `not-visible` artifact
+ * status above. This is "does R have a routing table to audit at all";
+ * `not-visible` is "R's table names agent A, but the ARTIFACT read for A
+ * itself failed." Conflating the two would make a ordinary non-fleet repo
+ * (no agent-config.json — the overwhelming common case) show up as a
+ * coverage gap it isn't.
+ */
+export async function gatherRoutingArtifacts(
+  repos: readonly string[],
+  readRoutingConfigForRepo: (repo: string) => Promise<RoutingConfig | null>,
+  checks: readonly RoutingArtifactCheck[],
+): Promise<readonly RoutingArtifactResult[]> {
+  const results: RoutingArtifactResult[] = [];
+  for (const repo of repos) {
+    const config = await readRoutingConfigForRepo(repo);
+    if (!config) continue;
+    const agents = Object.keys(config.agents);
+    if (agents.length === 0) continue;
+    for (const check of checks) {
+      const repoState = await check.fetchRepoState(repo);
+      for (const agent of agents) {
+        results.push(evaluateRoutingArtifact(repo, agent, check, repoState));
+      }
+    }
+  }
+  return results;
+}
+
+/**
+ * The artifact checks this run applies to every visible fleet repo's routing
+ * table (macf#1191). The assignment label is the ONLY entry today — labels
+ * are the CURRENT dependency a routing table has; a FUTURE implied artifact
+ * (a required workflow file, a required team, anything else a routing entry
+ * comes to depend on) is a NEW ENTRY appended HERE, never a new command or a
+ * parallel sweep — this is the "artifact-general, not label-specific" shape
+ * the issue's acceptance criteria require.
+ *
+ * WHY-COMMENT (do not remove, do not "improve" this into an auto-fix): this
+ * check NEVER creates the missing artifact. It is report-only, by design,
+ * permanently. Auto-creating a missing label would make it possible to
+ * label OLD, CONCLUDED work, which then routes as though it were new —
+ * `macf-science-agent#43` is the concrete precedent: a label applied
+ * retroactively, ~8 weeks after the referenced work concluded and its
+ * parent issue closed, caused it to route as fresh. Report the gap; let a
+ * human decide whether to create the label; if they do, a SEPARATE
+ * labelling pass should check the two cheap signals (months of silence, a
+ * closed parent) before treating the newly-labelled issue as live — neither
+ * of which this read-only audit is positioned to evaluate on its own. A
+ * future patch that adds write access here must re-litigate this decision
+ * explicitly, not slide it in as a "nice to have while we're in here."
+ */
+function buildArtifactChecks(deps: RoutingDoctorDeps): readonly RoutingArtifactCheck[] {
+  return [
+    {
+      artifact: 'assignment-label',
+      fetchRepoState: deps.listRepoLabels,
+      isPresent: (agent, labels) => labels.includes(agent),
+    },
+    // Add a NEW entry HERE to extend to a future implied artifact (macf#1191) —
+    // never a new command, never a parallel sweep.
+  ];
+}
+
 export type FreshnessState = 'fresh' | 'stale' | 'unreachable' | 'unknown' | 'unregistered';
 
 /**
@@ -657,6 +840,22 @@ export interface RoutingDoctorReport {
   readonly ca: CaCheckResult;
   /** #800 — routing-client cert issuer-vs-current-CA staleness check. */
   readonly routingClientCert: RoutingClientCertCheckResult;
+  /**
+   * Routing-table artifact checks (macf#1191) — one entry per (repo, agent,
+   * artifact) across EVERY repo visible in this run's install-set, not just
+   * the repo this command happens to run from. See `gatherRoutingArtifacts`.
+   */
+  readonly artifactChecks: readonly RoutingArtifactResult[];
+  /**
+   * How many repos THIS run's install-set enumerated (macf#1191) — the
+   * coverage figure for the artifact-check sweep. NOT a claim about the
+   * total fleet size: an App installed on a handful of repos sees a
+   * handful; a differently-scoped caller sees a different number. A
+   * `0 missing` reading from `artifactChecks` must always be read alongside
+   * this number, which is why it is carried in the summary line and JSON on
+   * every run — clean or not.
+   */
+  readonly reposVisible: number;
 }
 
 // --- Orchestration ---
@@ -675,6 +874,25 @@ export interface RoutingDoctorDeps {
   readonly readFleetMarker: (repo: string) => Promise<FleetMarker | null>;
   /** The CURRENT project's routing config (`.github/agent-config.json`). */
   readonly readRoutingConfig: () => Promise<RoutingConfig | null>;
+  /**
+   * Read ANY visible repo's `.github/agent-config.json` (macf#1191) — unlike
+   * `readRoutingConfig` (the CURRENT project only), this is called once per
+   * repo in the install-set so the artifact sweep can audit repos this
+   * command is not running from. `null` = no readable routing table there
+   * (absent file, or a read failure) — the SAME "not a routing participant"
+   * treatment the caller-pin sweep gives a `no-workflow` repo, NOT the
+   * `not-visible` artifact status (that applies to the ARTIFACT read, e.g.
+   * `listRepoLabels`, never to this config read).
+   */
+  readonly readRoutingConfigForRepo: (repo: string) => Promise<RoutingConfig | null>;
+  /**
+   * List a repo's label names (macf#1191's assignment-label artifact check).
+   * `null` on ANY read failure — this command does not attempt to
+   * distinguish "repo inaccessible to this caller" from "repo doesn't
+   * exist" from "some other error" (GitHub's API does not either — see
+   * `RoutingArtifactStatus`'s doc). Reported `not-visible`, never `missing`.
+   */
+  readonly listRepoLabels: (repo: string) => Promise<readonly string[] | null>;
   /** Registry agents (for routability + freshness). */
   readonly listRegistry: () => Promise<readonly { readonly name: string; readonly info: AgentInfo }[]>;
   /** mTLS `/health` probe (freshness). */
@@ -884,6 +1102,14 @@ export async function gatherRoutingDoctor(deps: RoutingDoctorDeps): Promise<Rout
     currentCaFp,
   );
 
+  // 7. Routing-table artifact checks (macf#1191) — over the SAME install-set
+  // `repos` already fetched for check 1, no extra repo-discovery round-trip.
+  const artifactChecks = await gatherRoutingArtifacts(
+    repos,
+    deps.readRoutingConfigForRepo,
+    buildArtifactChecks(deps),
+  );
+
   return {
     project: deps.project,
     repoPins,
@@ -893,6 +1119,8 @@ export async function gatherRoutingDoctor(deps: RoutingDoctorDeps): Promise<Rout
     agents,
     ca,
     routingClientCert,
+    artifactChecks,
+    reposVisible: repos.length,
   };
 }
 
@@ -946,6 +1174,39 @@ function caCheckOk(ca: CaCheckResult): boolean {
   return ca.present && ca.valid && ca.matchesCurrentCa !== false;
 }
 
+/**
+ * Whether the routing-table artifact sweep FAILS the verdict (macf#1191).
+ * Only a CONFIRMED `missing` fails — `not-visible` does NOT, deliberately:
+ * an App legitimately installed on a subset of fleet repos is normal, and
+ * failing the verdict on every repo this caller merely couldn't see would
+ * make the check permanently red for any narrow-scoped caller, which gets
+ * ignored — reproducing the exact "always red, so nobody reads it" failure
+ * mode this whole command exists to avoid. `not-visible` is still surfaced
+ * (never silently dropped) via `reposVisible` + the dedicated summary
+ * clause / JSON fields — see `artifactSummaryClause`.
+ */
+function routingArtifactsFail(results: readonly RoutingArtifactResult[]): boolean {
+  return results.some((r) => r.status === 'missing');
+}
+
+/** `false` only on a CONFIRMED `missing` — mirrors `routingArtifactsFail`, exposed as JSON `summary.routing_artifacts_ok`. */
+function routingArtifactsOk(results: readonly RoutingArtifactResult[]): boolean {
+  return !routingArtifactsFail(results);
+}
+
+/**
+ * `false` when ANY (repo, agent, artifact) entry could not be read this run
+ * (macf#1191). Distinct from `routingArtifactsOk`: a run can be `ok` (no
+ * CONFIRMED missing artifact) while NOT `fully_covered` (some repo's data
+ * this caller simply couldn't read) — that combination is exactly the
+ * "clean but narrow" case a consumer must not collapse into an unqualified
+ * pass. See `artifactSummaryClause` for the human-readable rendering of the
+ * same distinction.
+ */
+function routingArtifactsFullyCovered(results: readonly RoutingArtifactResult[]): boolean {
+  return !results.some((r) => r.status === 'not-visible');
+}
+
 export function routingVerdict(report: RoutingDoctorReport): RoutingVerdict {
   if (report.repoPins.length === 0 && report.agents.length === 0) return 'EMPTY';
   const participating = report.repoPins.filter((r) => r.consistent !== null);
@@ -953,7 +1214,8 @@ export function routingVerdict(report: RoutingDoctorReport): RoutingVerdict {
   const agentFail = report.agents.some((a) => !agentRoutingOk(a));
   const caFail = !caCheckOk(report.ca);
   const routingClientCertFail = routingClientCertFails(report.routingClientCert);
-  return pinFail || agentFail || caFail || routingClientCertFail ? 'DEGRADED' : 'HEALTHY';
+  const artifactFail = routingArtifactsFail(report.artifactChecks);
+  return pinFail || agentFail || caFail || routingClientCertFail || artifactFail ? 'DEGRADED' : 'HEALTHY';
 }
 
 /**
@@ -1003,8 +1265,32 @@ export function caMismatchCauseLine(report: RoutingDoctorReport): string | null 
 }
 
 /**
+ * The routing-table-artifact clause (macf#1191). ALWAYS carries the coverage
+ * figure (`reposVisible`) — on a fully clean run too — so "0 missing" can
+ * never be misread as "checked the whole fleet." A repo this caller could
+ * not read contributes to a `not-visible` count that is surfaced here as
+ * well, distinct from `missing`: it does NOT fail the verdict (see
+ * `routingArtifactsFail`'s doc), but it must never read like "all clear"
+ * either — this is the "a clean run with narrow coverage must not read like
+ * a clean run with full coverage" requirement made concrete.
+ */
+function artifactSummaryClause(report: RoutingDoctorReport): string {
+  const missing = report.artifactChecks.filter((r) => r.status === 'missing').length;
+  const notVisible = report.artifactChecks.filter((r) => r.status === 'not-visible').length;
+  const coverage = `${report.reposVisible} repo(s) visible to this caller`;
+  if (missing === 0 && notVisible === 0) {
+    return `routing-table artifacts ✓ (${coverage})`;
+  }
+  const parts: string[] = [];
+  if (missing > 0) parts.push(`${missing} missing`);
+  if (notVisible > 0) parts.push(`${notVisible} not visible`);
+  return `routing-table artifacts ✗ ${parts.join(', ')} (of ${coverage})`;
+}
+
+/**
  * `4 fleet repos (pins consistent + current ("v3.4.2")); 3 agents (2 routing-OK);
- * CA ✓; routing-client cert ✓; routing plane: HEALTHY`.
+ * CA ✓; routing-client cert ✓; routing-table artifacts ✓ (4 repo(s) visible to
+ * this caller); routing plane: HEALTHY`.
  *
  * macf#872: the pin clause's parenthetical is driven by `classifyPinState` — NOT a
  * plain `pinsOk` boolean — so `consistent-but-wrong` and `unknown` replace "pins
@@ -1013,7 +1299,9 @@ export function caMismatchCauseLine(report: RoutingDoctorReport): string | null 
  * exit code / HEALTHY-DEGRADED literal is untouched (warn-never-fail — see
  * `routing-doctor-pin-correctness.ts`), but the text a human actually reads can no
  * longer claim "pins consistent" while the fleet is uniformly stale or the manifest
- * was unreachable.
+ * was unreachable. macf#1191 extends the same "the text must not overclaim"
+ * discipline to the artifact-coverage clause: `artifactSummaryClause` always
+ * carries the coverage count, never just a bare pass/fail.
  */
 export function summaryLine(report: RoutingDoctorReport): string {
   const participating = report.repoPins.filter((r) => r.consistent !== null);
@@ -1025,6 +1313,7 @@ export function summaryLine(report: RoutingDoctorReport): string {
   return (
     `${pinClause}; ${agentOk}/${report.agents.length} agents routing-OK; ` +
     `CA ${caCheckOk(report.ca) ? '✓' : '✗'}; routing-client cert ${routingClientCertGlyph(report.routingClientCert.state)}; ` +
+    `${artifactSummaryClause(report)}; ` +
     `routing plane: ${routingVerdict(report)}`
   );
 }
@@ -1191,6 +1480,30 @@ export function formatAgentTable(rows: readonly AgentRow[]): string {
   return formatTable(AGENT_HEADERS, buildAgentRows(rows));
 }
 
+const ARTIFACT_HEADERS = ['REPO', 'AGENT', 'ARTIFACT', 'STATUS', 'REASON'] as const;
+
+/**
+ * Only non-`present` rows (macf#1191) — mirrors `collectWarnings`' "only show
+ * if any" shape: a fully-satisfied sweep renders NOTHING here (the coverage
+ * figure still appears in `summaryLine`/JSON regardless), so a real gap is
+ * never buried in a wall of green rows for a large fleet.
+ */
+export function buildArtifactRows(results: readonly RoutingArtifactResult[]): readonly (readonly string[])[] {
+  return results
+    .filter((r) => r.status !== 'present')
+    .map((r) => [
+      r.repo,
+      r.agent,
+      r.artifact,
+      r.status === 'missing' ? '✗ missing' : '? not-visible',
+      r.reason ?? '',
+    ]);
+}
+
+export function formatArtifactTable(results: readonly RoutingArtifactResult[]): string {
+  return formatTable(ARTIFACT_HEADERS, buildArtifactRows(results));
+}
+
 /**
  * The honesty legend — these are STATIC GitHub-plane checks: they prove the
  * routing PLUMBING is wired right, NOT that a message was delivered (that is
@@ -1229,6 +1542,15 @@ export const HONESTY_LEGEND = [
   '        is a write-only secret this command cannot read, so ✓ presumed = the recorded issuer',
   '        matches, NOT an independent verification of the deployed cert. ✗ orphaned = signed by a',
   '        rotated-out CA (re-mint + re-set the secret); — n/a = never minted, informational only.',
+  '        ROUTING-TABLE ARTIFACTS = for every repo visible in this run (not only the repo this',
+  '        command runs from), does that repo\'s OWN agent-config.json name an agent it has no',
+  '        matching GitHub label for? A repo naming an agent with no such label has a queue that',
+  '        can never return work — ✗ missing fails the verdict. "not visible" means this caller',
+  '        could not read that repo\'s data at all (absent, private, or misnamed are indistinguishable',
+  '        from here) and does NOT fail the verdict, but is never silently dropped either. The',
+  '        coverage count is how many repos THIS caller could see this run — not a claim about the',
+  '        total fleet size; a narrow-coverage clean run is reported as narrow, not as "all clear."',
+  '        This check is READ-ONLY — it never creates a missing label.',
   'NOTE: these are STATIC GitHub-plane checks — they prove the routing PLUMBING is wired right,',
   '      NOT that a message was delivered end-to-end (that is `macf routing doctor --e2e`, a',
   '      later increment). Mesh delivery is `macf fleet doctor`.',
@@ -1268,8 +1590,18 @@ const HONESTY_DISCLAIMER =
  *    cannot read, so the old `"ok"` literal read as a verification it never
  *    was. A consumer string-matching `state === "ok"` needs to know the
  *    literal changed, not just that the underlying check got stricter.
+ *
+ * Bumped 3→4 for macf#1191: unlike the earlier additive checks (#800's
+ * routing-client cert, DR-032's session drift), the routing-table artifact
+ * sweep is a NEW failure mode that feeds the EXISTING `summary.verdict`
+ * field — a run that previously computed HEALTHY can now compute DEGRADED
+ * under a condition no prior schema version checked for (a repo naming an
+ * agent it has no matching label for). A consumer trusting "HEALTHY under
+ * schema_version:3 means these N specific checks all passed" needs to know
+ * a caller-pin-fresh CA-and-cert-clean run can still be DEGRADED now, not
+ * just that new fields were added alongside an unchanged verdict formula.
  */
-export const ROUTING_DOCTOR_JSON_SCHEMA_VERSION = 3;
+export const ROUTING_DOCTOR_JSON_SCHEMA_VERSION = 4;
 
 export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
   const participating = report.repoPins.filter((r) => r.consistent !== null);
@@ -1301,6 +1633,24 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
       // Additive (schema_version:1, #800): false only for the verdict-failing
       // `orphaned` state; `absent` (never minted) counts as true (not a fault).
       routing_client_cert_ok: !routingClientCertFails(report.routingClientCert),
+      // New (schema_version:4, macf#1191): `false` only on a CONFIRMED `missing`
+      // artifact — see `routingArtifactsFail`'s doc for why `not-visible` alone
+      // does not flip this.
+      routing_artifacts_ok: routingArtifactsOk(report.artifactChecks),
+      // New (schema_version:4, macf#1191): the coverage figure — how many repos
+      // THIS run's install-set enumerated. ALWAYS present, even when
+      // `routing_artifacts_ok` is true, so a consumer can never read a clean
+      // `true` as "the whole fleet was checked" without also seeing the count
+      // it was checked against.
+      routing_artifacts_repos_visible: report.reposVisible,
+      routing_artifacts_missing: report.artifactChecks.filter((r) => r.status === 'missing').length,
+      routing_artifacts_not_visible: report.artifactChecks.filter((r) => r.status === 'not-visible').length,
+      // New (schema_version:4, macf#1191): `false` whenever ANY repo's artifact
+      // data could not be read this run — independent of `routing_artifacts_ok`,
+      // which only reflects CONFIRMED failures. A consumer that only checks
+      // `routing_artifacts_ok` can miss a narrow-coverage run; this field is the
+      // one that must be read alongside it for the "not all clear" guarantee.
+      routing_artifacts_fully_covered: routingArtifactsFullyCovered(report.artifactChecks),
     },
     // Additive (schema_version:1, DR-032 #610): non-verdict-driving observations the
     // watchdog should still SEE — currently the session-name drift (WARN-not-FAIL).
@@ -1308,6 +1658,18 @@ export function routingDoctorToJson(report: RoutingDoctorReport): unknown {
     // Additive (schema_version:1, #614): pinned repos that opted OUT of the fleet via
     // `.github/macf-fleet.json` routing_fleet:false (excluded from pins_consistent).
     non_fleet_repos: collectNonFleetRepos(report),
+    // New (schema_version:4, macf#1191): one entry per (repo, agent, artifact)
+    // across every repo visible in this run's install-set — the full detail
+    // behind the `routing_artifacts_*` summary counts above. `status` is one of
+    // "present" / "missing" / "not-visible"; see `RoutingArtifactStatus`'s doc
+    // for why "not-visible" is never collapsed into "missing".
+    routing_artifacts: report.artifactChecks.map((r) => ({
+      repo: r.repo,
+      agent: r.agent,
+      artifact: r.artifact,
+      status: r.status,
+      reason: r.reason ?? null,
+    })),
     caller_pins: report.repoPins.map((r) => ({
       repo: r.repo,
       pin: r.pin,
@@ -1450,6 +1812,14 @@ async function resolveDepsFromRegistry(
       desiredActionsPin: (repos) =>
         resolveDesiredActionsPin(manifestPathOverride, repos, config.project, readControlManifestYaml),
       readRoutingConfig: async () => localRouting ?? (await ghRoutingReader(detectCurrentRepo(projectDir) ?? '')),
+      // macf#1191: the SAME gh-content reader as the current-repo fallback above,
+      // but called for EVERY repo in the install-set (not just the current
+      // project) so the artifact sweep can audit repos this command isn't
+      // running from — always via GitHub, never the local-file shortcut
+      // `readRoutingConfig` takes for the CURRENT repo, since the point of this
+      // check is to assert against each repo's committed truth.
+      readRoutingConfigForRepo: ghRoutingReader,
+      listRepoLabels: createRepoLabelLister(token),
       listRegistry: () => registry.list(''),
       probe: (host, port) => pingAgentHealth({ host, port, caCertPem: caCertPem ?? '', certPath, keyPath }),
       readCaCert: async () => caCertPem,
@@ -1595,6 +1965,22 @@ async function runRoutingDoctorInner(
   } else {
     console.log('Per-agent routing checks: no registered fleet agents and no .github/agent-config.json found.\n');
   }
+
+  // Routing-table artifact checks (macf#1191): only non-"present" rows render (a
+  // fully-satisfied sweep prints nothing here, matching `collectWarnings`' "only
+  // show if any" shape) — but the coverage figure is ALWAYS stated, so a clean
+  // sweep over a narrow install-set is never mistaken for a clean sweep over the
+  // whole fleet.
+  console.log(
+    `Routing-table artifact checks (${report.reposVisible} repo(s) visible to this caller):`,
+  );
+  const artifactRows = buildArtifactRows(report.artifactChecks);
+  if (artifactRows.length > 0) {
+    console.log(formatArtifactTable(report.artifactChecks));
+  } else {
+    console.log('No missing or unverifiable routing-table artifacts among the visible repos.');
+  }
+  console.log('');
 
   const warnings = collectWarnings(report);
   if (warnings.length > 0) {
