@@ -167,6 +167,50 @@ export interface RoutingConfig {
 }
 
 /**
+ * Discriminated read result for a repo's OWN `.github/agent-config.json`
+ * (macf#1193, refining macf#1191's `readRoutingConfigForRepo:
+ * (repo) => Promise<RoutingConfig | null>`). The prior `null` collapsed THREE
+ * distinct outcomes — absent, malformed, and a plain read failure — into the
+ * SAME "not a routing participant, contributes nothing" treatment
+ * `gatherRoutingArtifacts` gave them all. A repo with a corrupt config IS a
+ * routing participant whose routing is genuinely broken; reading it as "not a
+ * participant" reproduced, one level down, the exact "skip indistinguishable
+ * from a pass" shape #1191 itself exists to eliminate — surviving inside its
+ * own fix.
+ *
+ *  - `present`     — read + parsed + shape-checked OK (`{ agents: {...} }`);
+ *                    `config` carries the parsed value.
+ *  - `absent`      — a CONFIDENT 404. Every repo `readRoutingConfigForRepo` is
+ *                    called for comes from THIS run's App INSTALL-SET
+ *                    enumeration (`RoutingDoctorDeps.listRepos`) — already
+ *                    KNOWN-VISIBLE to this caller — so a 404 on ITS OWN
+ *                    config is unambiguous: the file genuinely doesn't exist,
+ *                    not "can't see this repo." The invisibility ambiguity
+ *                    that motivated #1191's `not-visible` artifact status
+ *                    (GitHub returns the identical 404 for absent / private /
+ *                    misnamed) CANNOT arise for this specific read — that is
+ *                    what makes silently skipping `absent` safe, unlike the
+ *                    other two states below.
+ *  - `malformed`   — the read succeeded (a 200) but the content isn't valid
+ *                    JSON, or lacks the expected `{ agents: {...} }` shape
+ *                    (including `agents: null` — `typeof null === 'object'`
+ *                    would otherwise slip past a naive shape check). A
+ *                    CONFIRMED defect on a CONFIRMED participant: this repo
+ *                    committed a routing table, and it's broken.
+ *  - `read-failed` — the read failed for any OTHER reason (network,
+ *                    rate-limit, a transient 5xx, an auth hiccup). Genuinely
+ *                    inconclusive — the SAME epistemic status `not-visible`
+ *                    already carries elsewhere in this sweep (e.g.
+ *                    `listRepoLabels`), never collapsed into a confident
+ *                    absence OR a confirmed defect.
+ */
+export type RoutingConfigReadResult =
+  | { readonly status: 'present'; readonly config: RoutingConfig }
+  | { readonly status: 'absent' }
+  | { readonly status: 'malformed'; readonly reason: string }
+  | { readonly status: 'read-failed'; readonly reason: string };
+
+/**
  * A pinned repo's `.github/macf-fleet.json` opt-OUT marker (#614). A repo that is
  * an agent-router caller still participates in the `pins_consistent` verdict UNLESS
  * it declares itself non-fleet here (`{ "routing_fleet": false }`). Lives WITH the
