@@ -47,7 +47,6 @@ const MANIFEST: FleetManifest = {
     { role: 'code-agent', profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/x' },
     { role: 'science-agent', profile: 'research', repo: 'groundnuty/demo-science', deploy_path: '/y' },
   ],
-  trust: { ca: 'per-project', federated_cas: [] },
 };
 
 const SAME_FLEET_YAML = `apiVersion: macf/v0
@@ -74,9 +73,6 @@ agents:
     profile: research
     repo: groundnuty/demo-science
     deploy_path: /y
-trust:
-  ca: per-project
-  federated_cas: []
 `;
 
 const PRIOR_LOCK: FleetLock = {

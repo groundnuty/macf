@@ -182,7 +182,6 @@ function manifestWith(registry: FleetManifest['owner']['registry'] = { type: 'pr
     transport: { age_recipients: ['age1operator'] },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents: [AGENT],
-    trust: { ca: 'per-project', federated_cas: [] },
   };
 }
 

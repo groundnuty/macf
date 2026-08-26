@@ -34,7 +34,6 @@ const MANIFEST: FleetManifest = {
   transport: { age_recipients: ['age1operator'] },
   defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
   agents: [{ role: 'code-agent', profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/x' }],
-  trust: { ca: 'per-project', federated_cas: [] },
 };
 const AGENT: FleetAgent = MANIFEST.agents[0]!;
 

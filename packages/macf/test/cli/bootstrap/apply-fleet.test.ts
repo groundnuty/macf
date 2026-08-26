@@ -63,7 +63,6 @@ function manifestWith(agents: readonly FleetAgent[], ageRecipients: readonly str
     transport: { age_recipients: ageRecipients, router_app_scope: 'per-fleet' },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents,
-    trust: { ca: 'per-project', federated_cas: [] },
   };
 }
 
@@ -1263,9 +1262,6 @@ agents:
     profile: code
     repo: groundnuty/demo-code
     deploy_path: /x
-trust:
-  ca: per-project
-  federated_cas: []
 `;
       const manifest = parseFleetManifest(fleetYaml);
       expect(manifest.transport.age_recipients).toEqual([operatorKey.publicKey, vmKey.publicKey]);
@@ -5352,9 +5348,6 @@ agents:
     profile: code
     repo: groundnuty/demo-code
     deploy_path: /x
-trust:
-  ca: per-project
-  federated_cas: []
 `;
 
     /**

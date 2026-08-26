@@ -35,9 +35,6 @@ agents:
     profile: code
     repo: groundnuty/demo-code
     deploy_path: /x
-trust:
-  ca: per-project
-  federated_cas: []
 `;
 
 function writeManifest(text: string): { dir: string; file: string } {

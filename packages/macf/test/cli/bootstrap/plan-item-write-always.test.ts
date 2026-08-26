@@ -70,7 +70,6 @@ function manifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
     transport: { age_recipients: [] },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents: [{ role: 'code-agent', profile: 'code', repo: REPO, deploy_path: '/home/ubuntu/repos/agh/coverage-fleet-code-agent' }],
-    trust: { ca: 'per-project', federated_cas: [] },
     ...overrides,
   };
 }

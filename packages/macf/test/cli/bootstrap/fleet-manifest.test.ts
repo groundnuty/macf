@@ -1,9 +1,15 @@
 /**
  * Tests for the `fleet.yaml` / `fleet.lock` schema (DR-043 §D1, Slice 1a,
  * groundnuty/macf#838). The valid fixture mirrors the DR's own `icsoc-2026`
- * worked example verbatim.
+ * worked example, less the fields the schema has since dropped (already true
+ * for `transport.vault_repo`, Amendment F; as of groundnuty/macf#1201, also
+ * true for `trust:` — see the dedicated describe block below for that
+ * removal's own coverage).
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   buildTrustedActorsValue,
   deriveAppHandle,
@@ -67,10 +73,6 @@ collaborators:
 shared:
   routing_app: macf-routing
   ts_oauth: operator-supplied
-
-trust:
-  ca: per-project
-  federated_cas: []
 `;
 
 describe('parseFleetManifest — valid DR-043 §D1 worked example', () => {
@@ -121,14 +123,13 @@ describe('parseFleetManifest — valid DR-043 §D1 worked example', () => {
     });
   });
 
-  it('parses routing, shared, and trust', () => {
+  it('parses routing and shared', () => {
     const manifest = parseFleetManifest(VALID_FLEET_YAML);
     // macf#942 (DR-043 Amendment I) — `warm` defaults to 1 even though the
     // worked example above never declares it; see the dedicated "warm"
     // describe block below for the full default/range/coverage story.
     expect(manifest.routing).toEqual({ runner: { runs_on: 'self-hosted', warm: 1 } });
     expect(manifest.shared).toEqual({ routing_app: 'macf-routing', ts_oauth: 'operator-supplied' });
-    expect(manifest.trust).toEqual({ ca: 'per-project', federated_cas: [] });
   });
 
   it('parses a minimal manifest that omits every optional section', () => {
@@ -159,11 +160,6 @@ agents:
     expect(manifest.routing).toBeUndefined();
     expect(manifest.collaborators).toBeUndefined();
     expect(manifest.shared).toBeUndefined();
-    // trust is optional-with-default (macf#839 review nit 5) — a MACF fleet
-    // always needs a CA, so an omitted `trust:` section defaults rather than
-    // staying undefined (a manifest.trust?.-gate would silently skip the CA
-    // plan items — see plan.test.ts's "always emits CA items" coverage).
-    expect(manifest.trust).toEqual({ ca: 'per-project', federated_cas: [] });
   });
 });
 
@@ -433,13 +429,54 @@ describe('parseFleetManifest — role/repo/name hygiene (macf#839 review [BLOCKI
     expect(() => parseFleetManifest(bad)).toThrow(/metadata\.name/);
   });
 
-  it('rejects a non-enum trust.ca value', () => {
-    const bad = VALID_FLEET_YAML.replace('ca: per-project', 'ca: shared-org-wide');
-    expect(() => parseFleetManifest(bad)).toThrow();
+  it('a well-formed manifest (unique kebab roles/repos, kebab name) still parses clean', () => {
+    expect(() => parseFleetManifest(VALID_FLEET_YAML)).not.toThrow();
+  });
+});
+
+describe('parseFleetManifest — trust: is removed (groundnuty/macf#1201)', () => {
+  // The decisive pair (assert-the-wrong-path.md): asserting ONLY that a
+  // manifest WITHOUT `trust:` still parses (below) would also pass if this
+  // PR had deleted far more than intended — e.g. the whole CA-plan-item
+  // guarantee, or `FleetManifestSchema` itself. Only the "WITH trust: gets a
+  // specific, non-generic refusal" half proves the trust-specific removal
+  // behaves as decided, not merely that unrelated behaviour survived.
+
+  it('refuses a manifest that still declares a trust: section, with a targeted explanation — not a bare .strict() unrecognized-key error', () => {
+    // Uses the OLD valid shape (`ca: per-project`, `federated_cas: []`) —
+    // proves the refusal fires on the KEY's mere presence, independent of
+    // whether its (former) contents would themselves have validated.
+    const stillDeclaresTrust = `${VALID_FLEET_YAML}\ntrust:\n  ca: per-project\n  federated_cas: []\n`;
+    expect(() => parseFleetManifest(stillDeclaresTrust)).toThrow(/trust/i);
+    try {
+      parseFleetManifest(stillDeclaresTrust);
+      expect.unreachable('parseFleetManifest should have thrown');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // NOT the generic zod `.strict()` message — a targeted explanation.
+      expect(message).not.toMatch(/unrecognized key/i);
+      // Says it was never enforced (not merely "unsupported" or "unknown").
+      expect(message).toMatch(/never (read|enforced)|no code path/i);
+      // States the safe action.
+      expect(message).toMatch(/remove/i);
+    }
   });
 
-  it('a well-formed manifest (unique kebab roles/repos, kebab name, per-project ca) still parses clean', () => {
+  it('a manifest without a trust: section parses exactly as before — unaffected by the removal', () => {
     expect(() => parseFleetManifest(VALID_FLEET_YAML)).not.toThrow();
+    const manifest = parseFleetManifest(VALID_FLEET_YAML);
+    expect(manifest).not.toHaveProperty('trust');
+  });
+
+  it('the refusal message names the field but carries no internal issue/DR citation (user-facing text, macf#1061)', () => {
+    const stillDeclaresTrust = `${VALID_FLEET_YAML}\ntrust:\n  ca: per-project\n  federated_cas: []\n`;
+    try {
+      parseFleetManifest(stillDeclaresTrust);
+      expect.unreachable('parseFleetManifest should have thrown');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      expect(message).not.toMatch(/\bmacf#\d+\b|\bgroundnuty\/macf#\d+\b|\bDR-0\d{2}\b|#\d+/);
+    }
   });
 });
 
@@ -552,5 +589,75 @@ agents: []
     const lock = parseFleetLock(minimal);
     expect(lock.agents).toEqual([]);
     expect(lock.fingerprints).toBeUndefined();
+  });
+});
+
+/**
+ * Regression guard, in the shape groundnuty/macf#1192's read-only WHY-guard
+ * used: a source scan over production code, so a future contributor cannot
+ * quietly re-add a `trust`-field consumer without this test noticing — the
+ * exact "declared but inert" trap groundnuty/macf#1201 removed `trust.ca` /
+ * `trust.federated_cas` to close. Deliberately narrower than "the word
+ * trust" (which appears constantly for MACF_TRUSTED_ACTORS / trust bundles /
+ * DR-041 federation — an unrelated, actively-consumed concept, see
+ * `trust-bundle.ts`): this pattern targets only the REMOVED schema's own
+ * identifiers and property-access shape.
+ */
+describe('trust: leaves no code-path consumer behind (groundnuty/macf#1201 source-scan regression)', () => {
+  const BANNED_TRUST_CONSUMER_PATTERN = /\bFleetTrustSchema\b|\bFleetTrust\b|\bmanifest\.trust\b|\.trust\.(ca|federated_cas)\b/;
+
+  function isCommentLine(trimmed: string): boolean {
+    return trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*');
+  }
+
+  /** Lines matching the banned pattern, outside comments — a "hit" means a live code path, not prose explaining the removal. */
+  function scanForTrustConsumer(source: string): readonly string[] {
+    return source.split('\n').filter((line) => BANNED_TRUST_CONSUMER_PATTERN.test(line) && !isCommentLine(line.trim()));
+  }
+
+  function listTsFilesRecursive(dir: string): string[] {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        out.push(...listTsFilesRecursive(full));
+      } else if (entry.isFile() && entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts')) {
+        out.push(full);
+      }
+    }
+    return out;
+  }
+
+  // --- Decisive: prove the scanner actually fires (assert-the-wrong-path.md) ---
+  it('FIRES on a deliberately-reintroduced trust-field consumer', () => {
+    const bad = 'if (manifest.trust !== undefined) { doSomething(manifest.trust.federated_cas); }';
+    expect(scanForTrustConsumer(bad).length).toBeGreaterThan(0);
+  });
+
+  it('does NOT fire on a comment mentioning the removed field for historical context', () => {
+    const ok = '// trust.ca / trust.federated_cas were removed, groundnuty/macf#1201 — see FleetTrust in git history.';
+    expect(scanForTrustConsumer(ok)).toEqual([]);
+  });
+
+  it('does NOT fire on the presence-only refusal check — it tests for the KEY, never reads a value', () => {
+    // The literal shape `rejectDeclaredTrust` uses: no `.trust` property
+    // access anywhere, so this must NOT be flagged as a "consumer".
+    const ok = "if (typeof raw !== 'object' || raw === null || !('trust' in raw)) return;";
+    expect(scanForTrustConsumer(ok)).toEqual([]);
+  });
+
+  // --- The real guard: the actual source tree carries no consumer --------
+  it('the real packages/macf/src tree carries no trust-field consumer outside comments', () => {
+    const srcDir = fileURLToPath(new URL('../../../src', import.meta.url));
+    const files = listTsFilesRecursive(srcDir);
+    expect(files.length).toBeGreaterThan(50); // sanity: the walker found the tree, not an empty dir
+
+    const violations: string[] = [];
+    for (const file of files) {
+      const source = readFileSync(file, 'utf-8');
+      const hits = scanForTrustConsumer(source);
+      if (hits.length > 0) violations.push(`${file}:\n  ${hits.join('\n  ')}`);
+    }
+    expect(violations).toEqual([]);
   });
 });

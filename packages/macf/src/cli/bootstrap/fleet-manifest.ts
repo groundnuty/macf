@@ -327,17 +327,6 @@ export const FleetSharedSchema = z
   })
   .strict();
 
-/**
- * v0 supports exactly one CA mode (macf#839 review nit 5) — `.strict()`'s
- * typos-fail-loud rationale argues for an enum over a free string here too.
- */
-export const FleetTrustSchema = z
-  .object({
-    ca: z.enum(['per-project']).default('per-project'),
-    federated_cas: z.array(z.string().min(1)),
-  })
-  .strict();
-
 export const FLEET_MANIFEST_API_VERSION = 'macf/v0';
 
 /**
@@ -361,11 +350,6 @@ export const FleetManifestSchema = z
     routing: FleetRoutingSchema.optional(),
     collaborators: z.array(FleetCollaboratorSchema).optional(),
     shared: FleetSharedSchema.optional(),
-    // Optional-with-default (macf#839 review nit 5): a MACF fleet always
-    // needs a CA, so an omitted `trust:` section must NOT gate the CA plan
-    // items off — it defaults to the only v0 mode, per-project, with no
-    // federation declared.
-    trust: FleetTrustSchema.optional().default({ ca: 'per-project', federated_cas: [] }),
   })
   .strict()
   .superRefine((manifest, ctx) => {
@@ -460,17 +444,53 @@ export type FleetRoutingRunner = z.infer<typeof FleetRoutingRunnerSchema>;
 export type FleetRouting = z.infer<typeof FleetRoutingSchema>;
 export type FleetCollaborator = z.infer<typeof FleetCollaboratorSchema>;
 export type FleetShared = z.infer<typeof FleetSharedSchema>;
-export type FleetTrust = z.infer<typeof FleetTrustSchema>;
 export type FleetManifest = z.infer<typeof FleetManifestSchema>;
 
 /**
+ * groundnuty/macf#1201 — `trust.ca` / `trust.federated_cas` were removed
+ * from {@link FleetManifestSchema}: `FleetTrust` had zero consumers
+ * anywhere in this codebase (the #1200 reconciliation audit,
+ * `design/manifest-reconciliation-audit.md` rows 30-31) — the sharpest of
+ * that audit's nine inert fields, because the doc comment that used to sit
+ * on the removed `trust:` field described a CA-plan gating relationship
+ * that never existed. Fleet-level CA/federation trust is `#810`'s still-
+ * open design; a schema field landing ahead of that design's enforcement
+ * is exactly what produced this problem, so it is not quietly re-added
+ * here — read `#810` before reintroducing either sub-field.
+ *
+ * This check runs BEFORE `FleetManifestSchema.parse` deliberately: a bare
+ * `.strict()` "Unrecognized key: trust" is true but useless to an operator
+ * holding an old `fleet.yaml`, and — verified empirically — zod's
+ * `superRefine` never runs once the object-level strict check has already
+ * raised an unrecognized-key issue (the same base-validation-first
+ * ordering `manifest-scaffold.ts`'s module doc documents for a missing
+ * required field), so a refusal added there would never even execute.
+ * Intercepting the raw parsed value here, ahead of `.parse`, is what makes
+ * a targeted explanation possible instead.
+ */
+function rejectDeclaredTrust(raw: unknown): void {
+  if (typeof raw !== 'object' || raw === null || !('trust' in raw)) return;
+  throw new Error(
+    'fleet.yaml declares a "trust:" section (trust.ca / trust.federated_cas). Nothing in this version of ' +
+      'macf reads that section — an earlier schema parsed it, but no code path ever enforced it, so declaring ' +
+      'it changed nothing. Fleet-level CA/federation trust is an unsettled design; until it lands, remove the ' +
+      '"trust:" section from this fleet.yaml. This does not weaken anything you already have: every fleet gets ' +
+      'its own CA unconditionally, with or without a "trust:" section.',
+  );
+}
+
+/**
  * Parse + validate a `fleet.yaml` document from its raw text. Throws a
- * `ZodError` (via `.parse`) on any schema violation — callers at the CLI
- * boundary (`commands/bootstrap.ts`) catch + render it into the `--json`-
- * never-empty failure envelope (macf#830 lesson).
+ * `ZodError` (via `.parse`) on any schema violation, or a plain `Error` with
+ * a dedicated explanation when the manifest declares a removed field (today:
+ * a declared `trust:` section — see {@link rejectDeclaredTrust}). Callers at
+ * the CLI boundary (`commands/bootstrap.ts`) catch + render EITHER kind's
+ * `.message` into the `--json`-never-empty failure envelope (macf#830
+ * lesson), so no caller needs to discriminate the two.
  */
 export function parseFleetManifest(yamlText: string): FleetManifest {
   const raw: unknown = parseYaml(yamlText);
+  rejectDeclaredTrust(raw);
   return FleetManifestSchema.parse(raw);
 }
 

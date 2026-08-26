@@ -61,9 +61,6 @@ agents:
     profile: code
     repo: groundnuty/demo-code
     deploy_path: /unused-in-tests
-trust:
-  ca: per-project
-  federated_cas: []
 `;
 
 const dirs: string[] = [];

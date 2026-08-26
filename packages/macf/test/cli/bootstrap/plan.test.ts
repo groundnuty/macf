@@ -59,11 +59,6 @@ function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
         deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-experiment',
       },
     ],
-    // `trust` is required in the `FleetManifest` type (optional-with-default
-    // at the schema level, macf#839 review nit 5) — a hand-built fixture
-    // needs to supply it explicitly, unlike a `parseFleetManifest`-derived
-    // one where the schema default fills it in.
-    trust: { ca: 'per-project', federated_cas: [] },
     ...overrides,
   };
 }
@@ -109,11 +104,11 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
   });
 
   it('always emits CA items (registry + one per agent repo) — unconditional, macf#839 review nit 5', () => {
-    // computePlan never consults `manifest.trust`'s VALUE (there is only one
-    // v0 enum member) — the CA items are unconditional on fleet identity +
-    // agent repos alone. The "omitted `trust:` still gets a CA" guarantee is
-    // schema-level and covered in fleet-manifest.test.ts ("trust is
-    // optional-with-default"); this test covers the plan-level consequence.
+    // computePlan never consulted `manifest.trust` — there is no such field
+    // any more (removed, groundnuty/macf#1201, since nothing ever read it).
+    // The CA items are unconditional on fleet identity + agent repos alone,
+    // with or without a `trust:` section ever having existed; this test
+    // covers the plan-level consequence.
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
     const caItems = plan.items.filter((i) => i.kind === 'ca');
     expect(caItems.map((i) => i.target)).toEqual([
@@ -192,7 +187,6 @@ describe('computePlan — all-match observed state → all noops', () => {
   it('every per-agent resource + CA (registry + per-repo) + routing is noop when fully observed-matching', () => {
     const manifest = baseManifest({
       routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
-      trust: { ca: 'per-project', federated_cas: [] },
     });
     const observed: ObservedState = {
       lock: null,
@@ -650,7 +644,6 @@ describe('computePlan — deterministic ordering', () => {
   it('CA items (registry, then one per agent repo in manifest order), then routing_client per agent repo, precede routing, then runner_warm, all after per-agent items', () => {
     const manifest = baseManifest({
       routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
-      trust: { ca: 'per-project', federated_cas: [] },
     });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const kinds = plan.items.map((i) => i.kind);
@@ -880,7 +873,6 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
   it('is EMPTY on a fully-provisioned self-hosted fleet (routing matches, runner_warm implemented since groundnuty/macf#943) — every item is noop/report-extra/implemented', () => {
     const manifest = baseManifest({
       routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
-      trust: { ca: 'per-project', federated_cas: [] },
     });
     const observed: ObservedState = {
       lock: null,

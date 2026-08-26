@@ -35,7 +35,6 @@ function manifestWithRoles(fleetName: string, roles: readonly string[]): FleetMa
     transport: { age_recipients: ['age1operator'], router_app_scope: 'per-fleet' },
     defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
     agents: roles.map((role) => ({ role, profile: 'x', repo: `groundnuty/${fleetName}-${role}`, deploy_path: '/x' })),
-    trust: { ca: 'per-project', federated_cas: [] },
   };
 }
 
