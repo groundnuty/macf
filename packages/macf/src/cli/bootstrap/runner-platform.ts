@@ -94,6 +94,13 @@
  *   2. **env** — `MACF_RUNNER_PLATFORM_ENDPOINT`, read directly from
  *      `process.env` (never injected — matches this module's original,
  *      still-live convention).
+ *   2.5. **fleet-file / scope-file** (groundnuty/macf#1238) — the
+ *      operator-secrets-file tiers, registered via
+ *      {@link registerRunnerPlatformEndpointFileTier} rather than a THIRD
+ *      `process.env` mutation — see that function's doc for why a typed
+ *      registration replaced the original env-planting mechanism
+ *      (`operator-secrets-file.ts`'s now-retired
+ *      `applyOperatorSecretsFileToProcessEnv`).
  *   3. **scope** — the fleet's `owner.registry` scope's shared Actions
  *      variable, same name (`MACF_RUNNER_PLATFORM_ENDPOINT`). **This is a
  *      VARIABLE, never a secret** — the operator's own ruling: a tailnet
@@ -214,8 +221,19 @@ export function resolveRunnerPlatformEndpoint(explicit: string | undefined): str
  * {@link resolveRunnerPlatformEndpointWithProvenance}) — an operator reading
  * a plan/apply log line needs to know WHICH of the two to go change, not
  * just that "an override" won.
+ *
+ * `'fleet-file'`/`'scope-file'` (groundnuty/macf#1238) — the operator-
+ * secrets-file tiers, reported distinctly from `'env'` for the same reason:
+ * before #1238, the file-planted value was indistinguishable from a
+ * genuinely-exported environment variable because
+ * `operator-secrets-file.ts::applyOperatorSecretsFileToProcessEnv` planted
+ * it directly into `process.env` — `plan`'s operator-inputs section named
+ * the file correctly while `apply`'s own log line, reading the SAME
+ * (file-mutated) `process.env`, claimed "environment variable" for the
+ * identical value. See {@link registerRunnerPlatformEndpointFileTier}'s doc
+ * for the replacement mechanism.
  */
-export type RunnerPlatformEndpointSource = 'flag' | 'env' | 'scope' | 'manifest' | 'none';
+export type RunnerPlatformEndpointSource = 'flag' | 'env' | 'fleet-file' | 'scope-file' | 'scope' | 'manifest' | 'none';
 
 /** The resolved value (if any) paired with the tier that supplied it — never a secret shape (see this module's doc); safe to print verbatim in plan/apply output. */
 export interface RunnerPlatformEndpointResolution {
@@ -223,17 +241,92 @@ export interface RunnerPlatformEndpointResolution {
   readonly source: RunnerPlatformEndpointSource;
 }
 
+type RunnerPlatformEndpointFileSource = 'fleet-file' | 'scope-file';
+
+let registeredFileTierValue: string | undefined;
+let registeredFileTierSource: RunnerPlatformEndpointFileSource | undefined;
+
+/**
+ * Registers THIS run's operator-secrets-file candidate for
+ * {@link RUNNER_PLATFORM_ENDPOINT_ENV_VAR} — the groundnuty/macf#1238
+ * replacement for `operator-secrets-file.ts`'s retired
+ * `applyOperatorSecretsFileToProcessEnv`, which planted the file value
+ * directly into `process.env`. That plant worked functionally (the
+ * downstream `env` check in {@link resolveRunnerPlatformEndpointWithProvenance}
+ * picked it up), but it destroyed provenance: a file-sourced value and a
+ * genuinely-exported one became bit-for-bit indistinguishable once
+ * `process.env` held either, so `apply`'s log line always claimed
+ * "environment variable" even when the value came from a secrets file —
+ * while `plan`'s SEPARATE operator-inputs section (computed straight off
+ * the file dicts, never touching `process.env`) correctly said
+ * "fleet-file"/"scope-file" for the identical key. Two reporters, one
+ * value, two answers — exactly the "two observation paths for one fact"
+ * shape groundnuty/macf#1202 named.
+ *
+ * A typed, module-scoped registration (rather than a second `process.env`
+ * mutation) because the SOURCE now travels WITH the value:
+ * {@link resolveRunnerPlatformEndpointWithProvenance} is the only reader,
+ * so there is no second place the label can drift out of sync with what
+ * actually supplied it. `bootstrap-apply.ts`/`bootstrap.ts` call this ONCE,
+ * unconditionally, before `apply-fleet.ts`/`observer.ts` ever resolve the
+ * endpoint (both call sites are UNCHANGED by #1238 — they call
+ * {@link resolveRunnerPlatformEndpointWithProvenance} exactly as before;
+ * this registration is consulted INSIDE that function's body, so the fix
+ * reaches both call sites without editing either). Passing
+ * `(undefined, undefined)` — the common case, and every run where neither
+ * tier supplies a value — CLEARS any state a prior call left, so a run
+ * never inherits a stale registration from an earlier one in the same
+ * process (relevant for the test suite, which exercises many runs per
+ * process; a real CLI invocation is one run per process either way).
+ *
+ * Precedence: per-fleet file beats per-scope file, same rule
+ * `operator-secrets-file.ts::resolveOperatorInput` already establishes for
+ * every other operator-secrets-file key. Ranked BELOW the real environment
+ * variable inside {@link resolveRunnerPlatformEndpointWithProvenance} —
+ * deliberately NOT matching `resolveOperatorInput`'s generic
+ * flag > fleet-file > scope-file > env ordering — because that is the
+ * ordering the retired `applyOperatorSecretsFileToProcessEnv` actually had
+ * (it only planted a file value when `process.env` did NOT already carry
+ * one; see that function's retired doc, "never overwrites a value the real
+ * environment already set"). #1238 is a labeling fix, not a precedence
+ * change — folding this key into the generic ordering is a separate,
+ * loudly-declared decision this change does not make.
+ */
+export function registerRunnerPlatformEndpointFileTier(fleetFileValue: string | undefined, scopeFileValue: string | undefined): void {
+  const fleet = normalizeEndpointValue(fleetFileValue);
+  if (fleet !== undefined) {
+    registeredFileTierValue = fleet;
+    registeredFileTierSource = 'fleet-file';
+    return;
+  }
+  const scope = normalizeEndpointValue(scopeFileValue);
+  if (scope !== undefined) {
+    registeredFileTierValue = scope;
+    registeredFileTierSource = 'scope-file';
+    return;
+  }
+  registeredFileTierValue = undefined;
+  registeredFileTierSource = undefined;
+}
+
 /**
  * The full groundnuty/macf#1211 precedence chain — flag/deps-override, then
- * `MACF_RUNNER_PLATFORM_ENDPOINT` (env), then the fleet's registry-scope
- * shared Actions variable, then `transport.runner_platform_endpoint` in
- * `fleet.yaml`, then `'none'`. PURE — every candidate is already resolved by
- * the caller (an async scope-variable read, `process.env`, the parsed
+ * `MACF_RUNNER_PLATFORM_ENDPOINT` (env), then the groundnuty/macf#1238
+ * operator-secrets-file registration (see
+ * {@link registerRunnerPlatformEndpointFileTier}), then the fleet's
+ * registry-scope shared Actions variable, then
+ * `transport.runner_platform_endpoint` in `fleet.yaml`, then `'none'`. PURE
+ * with respect to its OWN parameters — every candidate in `candidates` is
+ * already resolved by the caller (an async scope-variable read, the parsed
  * manifest) and handed in as a plain string; this function does no I/O
  * itself, matching `plan.ts::computePlan`'s own "pure, no I/O" discipline so
  * both `observer.ts` (plan-time) and `apply-fleet.ts` (apply-time) can share
  * ONE precedence rule without either duplicating it or forcing the other to
- * mock a network call it doesn't need.
+ * mock a network call it doesn't need. The `process.env` read and the file
+ * registration are the two EXCEPTIONS to that purity (both are ambient,
+ * module-level reads) — same posture the pre-#1238 `env` tier already had;
+ * see {@link registerRunnerPlatformEndpointFileTier}'s doc for why the file
+ * tier is a typed registration rather than a THIRD `process.env` mutation.
  */
 export function resolveRunnerPlatformEndpointWithProvenance(candidates: {
   readonly explicit: string | undefined;
@@ -244,6 +337,9 @@ export function resolveRunnerPlatformEndpointWithProvenance(candidates: {
   if (flag !== undefined) return { value: flag, source: 'flag' };
   const env = normalizeEndpointValue(process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR]);
   if (env !== undefined) return { value: env, source: 'env' };
+  if (registeredFileTierValue !== undefined && registeredFileTierSource !== undefined) {
+    return { value: registeredFileTierValue, source: registeredFileTierSource };
+  }
   const scope = normalizeEndpointValue(candidates.scopeValue);
   if (scope !== undefined) return { value: scope, source: 'scope' };
   const manifest = normalizeEndpointValue(candidates.manifestValue);
@@ -254,6 +350,8 @@ export function resolveRunnerPlatformEndpointWithProvenance(candidates: {
 const RUNNER_PLATFORM_ENDPOINT_SOURCE_LABEL: Readonly<Record<Exclude<RunnerPlatformEndpointSource, 'none'>, string>> = {
   flag: 'an explicit override supplied for this run',
   env: `the ${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} environment variable`,
+  'fleet-file': 'the per-fleet operator secrets file',
+  'scope-file': 'the per-scope operator secrets file',
   scope: "the scope's shared fleet variable (an org/account Actions variable — not a secret)",
   manifest: 'transport.runner_platform_endpoint in fleet.yaml',
 };
@@ -270,8 +368,8 @@ export function describeRunnerPlatformEndpointResolution(resolution: RunnerPlatf
   if (resolution.source === 'none') {
     return (
       'not resolved — none of an explicit override, the ' +
-      `${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} environment variable, the scope's shared fleet variable, or ` +
-      'transport.runner_platform_endpoint in fleet.yaml is set'
+      `${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} environment variable, the operator secrets file (fleet or scope), ` +
+      "the scope's shared fleet variable, or transport.runner_platform_endpoint in fleet.yaml is set"
     );
   }
   return `resolved via ${RUNNER_PLATFORM_ENDPOINT_SOURCE_LABEL[resolution.source]}: ${resolution.value ?? ''}`;

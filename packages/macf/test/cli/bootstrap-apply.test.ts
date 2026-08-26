@@ -51,6 +51,7 @@ import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../src/cli/bootstrap/apply-routing-client.js';
 import type { RoutingSecretsPublishDeps } from '../../src/cli/bootstrap/apply-routing-secrets.js';
 import { MISSING_OPERATOR_INPUTS_CODE } from '../../src/cli/bootstrap/operator-secrets-file.js';
+import { resolveRunnerPlatformEndpointWithProvenance } from '../../src/cli/bootstrap/runner-platform.js';
 import {
   TAILSCALE_OAUTH_MISSING_CODE,
   TS_OAUTH_CLIENT_ID_ENV_VAR,
@@ -2385,6 +2386,60 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       const all = [...logs, ...errs].join('\n');
       expect(all).not.toContain(SENTINEL_CLIENT_ID);
       expect(all).not.toContain(SENTINEL_SECRET);
+    });
+  });
+
+  // groundnuty/macf#1238 — `applyOperatorSecretsFileToProcessEnv` (retired)
+  // planted the secrets-file value into `process.env`, so the SAME plan
+  // preview `apply` renders before the gate (`computePlan` off the SAME
+  // `observed` this test's injected `observe` returns) reported a
+  // file-sourced runner-platform endpoint as "environment variable" — the
+  // exact defect. `--dry-run` exercises the preview render with zero
+  // mutation and zero `fakeMutateDeps` plumbing needed. The injected
+  // `observe` calls the REAL `resolveRunnerPlatformEndpointWithProvenance`
+  // with the SAME candidate shape `observer.ts` actually passes, proving
+  // `runBootstrapApply` registered the file tier before `observe` ran.
+  describe('groundnuty/macf#1238 — runner-platform-endpoint provenance (secrets file vs. real env)', () => {
+    it('DECISIVE 1/2: endpoint supplied ONLY via the secrets file -> the plan item names the file, not "environment variable"', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      writeFileSync(join(dirname(file), 'secrets.env'), 'MACF_RUNNER_PLATFORM_ENDPOINT=http://apply-secrets-host:8088\n');
+      const code = await runBootstrapApply(
+        { file, dryRun: true, json: true, secretsFilePath: join(dirname(file), 'secrets.env') },
+        {
+          observe: () =>
+            Promise.resolve({
+              ...EMPTY_OBSERVED,
+              runnerPlatformEndpoint: resolveRunnerPlatformEndpointWithProvenance({ explicit: undefined, manifestValue: undefined, scopeValue: undefined }),
+            }),
+        },
+      );
+      expect(code).toBe(0);
+      const parsed = JSON.parse(logs.join('\n')) as { plan: ReadonlyArray<{ kind: string; reason: string }> };
+      const item = parsed.plan.find((i) => i.kind === 'runner_platform');
+      expect(item?.reason).toContain('http://apply-secrets-host:8088');
+      expect(item?.reason).toMatch(/per-fleet operator secrets file/i);
+      expect(item?.reason).not.toMatch(/environment variable/i);
+    });
+
+    it('DECISIVE 2/2: endpoint supplied via the REAL environment -> the plan item names the env var, unchanged', async () => {
+      vi.stubEnv('MACF_RUNNER_PLATFORM_ENDPOINT', 'http://real-env-host:8088');
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply(
+        { file, dryRun: true, json: true },
+        {
+          observe: () =>
+            Promise.resolve({
+              ...EMPTY_OBSERVED,
+              runnerPlatformEndpoint: resolveRunnerPlatformEndpointWithProvenance({ explicit: undefined, manifestValue: undefined, scopeValue: undefined }),
+            }),
+        },
+      );
+      expect(code).toBe(0);
+      const parsed = JSON.parse(logs.join('\n')) as { plan: ReadonlyArray<{ kind: string; reason: string }> };
+      const item = parsed.plan.find((i) => i.kind === 'runner_platform');
+      expect(item?.reason).toContain('http://real-env-host:8088');
+      expect(item?.reason).toMatch(/environment variable/i);
+      vi.unstubAllEnvs();
     });
   });
 

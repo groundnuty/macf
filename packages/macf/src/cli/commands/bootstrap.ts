@@ -37,7 +37,7 @@ import { advertiseHostDriftEntryToJson, detectAdvertiseHostDrift, formatAdvertis
 // has no credential flags of its own, so only the file/env tiers apply.
 import { TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_SECRET_ENV_VAR } from '../bootstrap/apply-routing-secrets.js';
 import { RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
-import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR } from '../bootstrap/runner-platform.js';
+import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR, registerRunnerPlatformEndpointFileTier } from '../bootstrap/runner-platform.js';
 import type { OperatorInputSource } from '../bootstrap/operator-secrets-file.js';
 import { formatOperatorInputProvenanceLine, readOperatorSecretsFile, resolveOperatorInput } from '../bootstrap/operator-secrets-file.js';
 import type { Presence } from '../bootstrap/plan.js';
@@ -192,6 +192,20 @@ export async function runBootstrapPlan(
   }
   const fleetSecretsValues = fleetSecretsRead?.ok === true ? fleetSecretsRead.values : undefined;
   const scopeSecretsValues = scopeSecretsRead?.ok === true ? scopeSecretsRead.values : undefined;
+  // groundnuty/macf#1238 — register the runner-platform-endpoint file-tier
+  // candidate BEFORE `resolved.observe(manifest)` below runs (that call
+  // reaches `observer.ts::resolveRunnerPlatformEndpointWithProvenance`,
+  // unchanged, via `githubRegistryObserver`/`vaultAwareObserver`), so a
+  // file-only-sourced endpoint resolves to `source: 'fleet-file'`/
+  // `'scope-file'` there too — matching `operatorInputProvenance` below,
+  // instead of the pre-#1238 "not resolved" (observer.ts never saw the
+  // file at all) or a `bootstrap-apply`-only mislabel as "environment
+  // variable" (this command never planted `process.env`, so plan alone
+  // never showed the wrong-source bug — but it DID show a disagreeing
+  // "not resolved" against its own correct operator-inputs line; this
+  // registration closes that gap too). See
+  // `runner-platform.ts::registerRunnerPlatformEndpointFileTier`'s doc.
+  registerRunnerPlatformEndpointFileTier(fleetSecretsValues?.[RUNNER_PLATFORM_ENDPOINT_ENV_VAR], scopeSecretsValues?.[RUNNER_PLATFORM_ENDPOINT_ENV_VAR]);
 
   const manifestPath = resolvePath(opts.file);
 

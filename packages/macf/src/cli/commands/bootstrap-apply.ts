@@ -101,14 +101,13 @@ import {
 // file -> env chain, per KEY, without restructuring the preflights that
 // already consume the resolved values.
 import {
-  applyOperatorSecretsFileToProcessEnv,
   formatMissingOperatorInputsMessage,
   MISSING_OPERATOR_INPUTS_CODE,
   missingRequiredOperatorInputs,
   readOperatorSecretsFile,
   resolveOperatorInput,
 } from '../bootstrap/operator-secrets-file.js';
-import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR } from '../bootstrap/runner-platform.js';
+import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR, registerRunnerPlatformEndpointFileTier } from '../bootstrap/runner-platform.js';
 import {
   readVault,
   queryVaultAgentPresence,
@@ -2773,11 +2772,18 @@ export async function runBootstrapApply(
   const fleetSecretsValues = fleetSecretsRead?.ok === true ? fleetSecretsRead.values : undefined;
   const scopeSecretsValues = scopeSecretsRead?.ok === true ? scopeSecretsRead.values : undefined;
   // The one key whose EXISTING resolution reads `process.env` directly with
-  // no flag/file plumbing of its own (`runner-platform.ts`'s own chain) —
-  // see `applyOperatorSecretsFileToProcessEnv`'s doc for why this is the
-  // simplest safe way to widen ITS resolution too, without touching that
-  // module or `apply-fleet.ts`/`observer.ts`.
-  applyOperatorSecretsFileToProcessEnv(fleetSecretsValues, scopeSecretsValues, [RUNNER_PLATFORM_ENDPOINT_ENV_VAR]);
+  // no flag/file plumbing of its own (`runner-platform.ts`'s own chain).
+  // groundnuty/macf#1238 — registers THIS run's file-tier candidate with a
+  // typed, source-carrying registration instead of planting the value into
+  // `process.env` (the retired `applyOperatorSecretsFileToProcessEnv`
+  // mechanism, which made a file-sourced value indistinguishable from a
+  // genuinely-exported one once `process.env` held it — `apply`'s own log
+  // line then claimed "environment variable" for a value `plan`'s
+  // operator-inputs section correctly named as the secrets file). See
+  // `registerRunnerPlatformEndpointFileTier`'s doc for the full mechanism;
+  // this is called unconditionally so a run with neither tier set clears
+  // any registration a prior run in this process left behind.
+  registerRunnerPlatformEndpointFileTier(fleetSecretsValues?.[RUNNER_PLATFORM_ENDPOINT_ENV_VAR], scopeSecretsValues?.[RUNNER_PLATFORM_ENDPOINT_ENV_VAR]);
 
   // groundnuty/macf#1186 (widened by #1197) — CLI flag wins on conflict,
   // then the per-fleet secrets file, then the per-scope secrets file, then

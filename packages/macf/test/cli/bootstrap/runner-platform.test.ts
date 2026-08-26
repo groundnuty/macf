@@ -12,6 +12,7 @@ import {
   resolveRunnerPlatformEndpoint,
   resolveRunnerPlatformEndpointWithProvenance,
   describeRunnerPlatformEndpointResolution,
+  registerRunnerPlatformEndpointFileTier,
   provisionRunner,
   deprovisionRunner,
   checkRunnerPlatformStatus,
@@ -117,17 +118,106 @@ describe('resolveRunnerPlatformEndpointWithProvenance (groundnuty/macf#1211)', (
   });
 });
 
+describe('registerRunnerPlatformEndpointFileTier (groundnuty/macf#1238)', () => {
+  // Same candidate shape `apply-fleet.ts`/`observer.ts` ACTUALLY pass —
+  // proves the fix reaches the real surface without either file being
+  // touched (both call sites are unchanged by #1238; the registration is
+  // consulted INSIDE `resolveRunnerPlatformEndpointWithProvenance`'s own
+  // body).
+  const REAL_CALL_SHAPE = { explicit: undefined, manifestValue: undefined, scopeValue: undefined };
+
+  const savedEnv = process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+  afterEach(() => {
+    registerRunnerPlatformEndpointFileTier(undefined, undefined); // module state is shared within this file — reset every test
+    if (savedEnv === undefined) delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    else process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR] = savedEnv;
+  });
+
+  // --- Decisive pair (assert-the-wrong-path.md): (1) alone is satisfied by
+  // always naming the file; (2) alone is satisfied by never wiring the file
+  // tier in at all. Both must pass for the fix to be real. ---
+
+  it('DECISIVE 1/2: endpoint supplied ONLY via the secrets file -> provenance names the file, not the environment variable', () => {
+    delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    registerRunnerPlatformEndpointFileTier('http://fleet-file-host:8088', undefined);
+    const resolution = resolveRunnerPlatformEndpointWithProvenance(REAL_CALL_SHAPE);
+    expect(resolution).toEqual({ value: 'http://fleet-file-host:8088', source: 'fleet-file' });
+    expect(describeRunnerPlatformEndpointResolution(resolution)).toContain('per-fleet operator secrets file');
+    expect(describeRunnerPlatformEndpointResolution(resolution)).not.toMatch(/environment variable/i);
+  });
+
+  it('DECISIVE 2/2: endpoint supplied via the REAL environment (no file registered) -> names the env var, unchanged', () => {
+    process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR] = 'http://real-env-host:8088';
+    registerRunnerPlatformEndpointFileTier(undefined, undefined);
+    const resolution = resolveRunnerPlatformEndpointWithProvenance(REAL_CALL_SHAPE);
+    expect(resolution).toEqual({ value: 'http://real-env-host:8088', source: 'env' });
+    expect(describeRunnerPlatformEndpointResolution(resolution)).toContain(RUNNER_PLATFORM_ENDPOINT_ENV_VAR);
+  });
+
+  it('scope-file resolves distinctly from fleet-file', () => {
+    delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    registerRunnerPlatformEndpointFileTier(undefined, 'http://scope-file-host:8088');
+    expect(resolveRunnerPlatformEndpointWithProvenance(REAL_CALL_SHAPE)).toEqual({ value: 'http://scope-file-host:8088', source: 'scope-file' });
+  });
+
+  it('fleet-file beats scope-file when both are registered (same rule as every other operator-secrets-file key)', () => {
+    delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    registerRunnerPlatformEndpointFileTier('http://fleet-file-host:8088', 'http://scope-file-host:8088');
+    expect(resolveRunnerPlatformEndpointWithProvenance(REAL_CALL_SHAPE)).toEqual({ value: 'http://fleet-file-host:8088', source: 'fleet-file' });
+  });
+
+  it('a REAL env var still wins over a registered file tier — behavior-preserving: the retired env-planting mechanism never overwrote a value the real environment already set', () => {
+    process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR] = 'http://real-env-host:8088';
+    registerRunnerPlatformEndpointFileTier('http://fleet-file-host:8088', undefined);
+    expect(resolveRunnerPlatformEndpointWithProvenance(REAL_CALL_SHAPE)).toEqual({ value: 'http://real-env-host:8088', source: 'env' });
+  });
+
+  it('a registered file tier beats the scope (registry variable) and manifest candidates', () => {
+    delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    registerRunnerPlatformEndpointFileTier('http://fleet-file-host:8088', undefined);
+    expect(
+      resolveRunnerPlatformEndpointWithProvenance({ explicit: undefined, manifestValue: 'http://manifest:8088', scopeValue: 'http://scope:8088' }),
+    ).toEqual({ value: 'http://fleet-file-host:8088', source: 'fleet-file' });
+  });
+
+  it('an explicit flag still beats a registered file tier', () => {
+    delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    registerRunnerPlatformEndpointFileTier('http://fleet-file-host:8088', undefined);
+    expect(resolveRunnerPlatformEndpointWithProvenance({ explicit: 'http://flag:8088', manifestValue: undefined, scopeValue: undefined })).toEqual({
+      value: 'http://flag:8088',
+      source: 'flag',
+    });
+  });
+
+  it('registering with (undefined, undefined) clears a prior registration — a run with neither tier set never inherits a previous run\'s state', () => {
+    delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    registerRunnerPlatformEndpointFileTier('http://stale-fleet-file:8088', undefined);
+    registerRunnerPlatformEndpointFileTier(undefined, undefined);
+    expect(resolveRunnerPlatformEndpointWithProvenance(REAL_CALL_SHAPE)).toEqual({ value: undefined, source: 'none' });
+  });
+
+  it('empty-string/whitespace-only file candidates are treated as absent, not a valid value', () => {
+    delete process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+    registerRunnerPlatformEndpointFileTier('   ', '');
+    expect(resolveRunnerPlatformEndpointWithProvenance(REAL_CALL_SHAPE)).toEqual({ value: undefined, source: 'none' });
+  });
+});
+
 describe('describeRunnerPlatformEndpointResolution (groundnuty/macf#1211)', () => {
-  it('names each source distinctly — flag/env/scope/manifest are never described identically', () => {
-    const descriptions = (['flag', 'env', 'scope', 'manifest'] as const).map((source) =>
+  it('names each source distinctly — flag/env/fleet-file/scope-file/scope/manifest are never described identically', () => {
+    const descriptions = (['flag', 'env', 'fleet-file', 'scope-file', 'scope', 'manifest'] as const).map((source) =>
       describeRunnerPlatformEndpointResolution({ value: 'http://x:8088', source }),
     );
-    expect(new Set(descriptions).size).toBe(4);
+    expect(new Set(descriptions).size).toBe(6);
+    // groundnuty/macf#1238's own bug, pinned directly: 'env' and 'fleet-file'
+    // (nor 'scope-file') must never render as the same sentence.
+    expect(descriptions[1]).not.toBe(descriptions[2]);
+    expect(descriptions[1]).not.toBe(descriptions[3]);
   });
 
   it('DECISIVE — the resolved value is a URL, never a secret: it is printed VERBATIM, never masked/redacted', () => {
     const sentinel = 'http://orzech-dev-agents-monitoring.tail491af.ts.net:8088';
-    for (const source of ['flag', 'env', 'scope', 'manifest'] as const) {
+    for (const source of ['flag', 'env', 'fleet-file', 'scope-file', 'scope', 'manifest'] as const) {
       const text = describeRunnerPlatformEndpointResolution({ value: sentinel, source });
       expect(text).toContain(sentinel);
       expect(text).not.toMatch(/\*{3,}|REDACTED|\[hidden\]/i);
@@ -138,6 +228,7 @@ describe('describeRunnerPlatformEndpointResolution (groundnuty/macf#1211)', () =
     const text = describeRunnerPlatformEndpointResolution({ value: undefined, source: 'none' });
     expect(text).toContain(RUNNER_PLATFORM_ENDPOINT_ENV_VAR);
     expect(text).toMatch(/scope/i);
+    expect(text).toMatch(/operator secrets file/i);
     expect(text).toContain('transport.runner_platform_endpoint');
     expect(text).not.toMatch(/https?:\/\//);
   });
