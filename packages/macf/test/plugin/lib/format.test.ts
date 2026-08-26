@@ -7,10 +7,12 @@ import {
   formatIssuesOneline,
   formatSweepInstruction,
   formatStartupReconcile,
+  formatReporterStallSweep,
 } from '../../../src/plugin/lib/format.js';
 import type { HealthResponse } from '@groundnuty/macf-core';
 import type { OwnRegistration } from '../../../src/plugin/lib/registry.js';
 import type { AgentInfo } from '@groundnuty/macf-core';
+import type { ReporterStallResult } from '../../../src/plugin/lib/reporter-stall.js';
 
 const sampleHealth: HealthResponse = {
   agent: 'code-agent',
@@ -262,5 +264,115 @@ describe('formatStartupReconcile — extended SessionStart startup_check (DR-038
     const issues = [{ number: 42, title: 'test issue' }];
     const output = formatStartupReconcile(issues, []);
     expect(output.startsWith(formatIssues(issues))).toBe(true);
+  });
+
+  it('composes the reporter-stall section when passed (macf#1170), without changing pre-existing output when omitted', () => {
+    const reporterStalls: ReporterStallResult = {
+      stalls: [
+        {
+          repo: 'org/repo',
+          number: 7,
+          title: 'a stale one',
+          updatedAt: '2026-08-01T00:00:00Z',
+          daysQuiet: 8.2,
+        },
+      ],
+      unreadableRepos: [],
+      enumerationFailed: false,
+    };
+    const withStalls = formatStartupReconcile([], [], reporterStalls);
+    const withoutStalls = formatStartupReconcile([], []);
+
+    expect(withStalls).toContain('org/repo#7');
+    expect(withoutStalls).not.toContain('org/repo#7');
+    // Back-compat: omitting the 3rd arg reproduces the pre-#1170 output.
+    expect(withoutStalls).toBe(formatStartupReconcile([], [], undefined));
+  });
+
+  it('omits the reporter-stall section entirely on a clean sweep (no noise)', () => {
+    const clean: ReporterStallResult = { stalls: [], unreadableRepos: [], enumerationFailed: false };
+    const output = formatStartupReconcile([{ number: 1, title: 'x' }], [], clean);
+    expect(output).not.toContain('Reporter-side');
+    expect(output).not.toContain('issue(s) you filed');
+  });
+});
+
+describe('formatReporterStallSweep (groundnuty/macf#1170)', () => {
+  it('returns empty string on a clean sweep (all repos reachable, zero stalls) — no noise', () => {
+    const result: ReporterStallResult = { stalls: [], unreadableRepos: [], enumerationFailed: false };
+    expect(formatReporterStallSweep(result)).toBe('');
+  });
+
+  it('renders the honest-unknown floor when the top-level enumeration failed — never looks like a clean sweep', () => {
+    const result: ReporterStallResult = { stalls: [], unreadableRepos: [], enumerationFailed: true };
+    const output = formatReporterStallSweep(result);
+    expect(output).not.toBe('');
+    expect(output.toLowerCase()).toContain('could not enumerate');
+    expect(output.toLowerCase()).toContain('unknown');
+  });
+
+  it('renders unreadable repos even when there are zero stalls (never silently omitted as "clean")', () => {
+    const result: ReporterStallResult = {
+      stalls: [],
+      unreadableRepos: ['org/broken'],
+      enumerationFailed: false,
+    };
+    const output = formatReporterStallSweep(result);
+    expect(output).toContain('org/broken');
+    expect(output.toLowerCase()).toContain('could not check');
+  });
+
+  it('renders a plain reminder line for a stall with no cleared deferral reference', () => {
+    const result: ReporterStallResult = {
+      stalls: [
+        { repo: 'groundnuty/macf', number: 999, title: 'verification nobody acted on', updatedAt: '', daysQuiet: 6.4 },
+      ],
+      unreadableRepos: [],
+      enumerationFailed: false,
+    };
+    const output = formatReporterStallSweep(result);
+    expect(output).toContain('groundnuty/macf#999');
+    expect(output).toContain('verification nobody acted on');
+    expect(output).toContain('6d');
+    expect(output.toLowerCase()).toContain('re-read');
+    expect(output).not.toContain('CLOSED');
+  });
+
+  it('renders an upgraded verdict line for a stall with a cleared deferral reference', () => {
+    const result: ReporterStallResult = {
+      stalls: [
+        {
+          repo: 'groundnuty/macf',
+          number: 855,
+          title: 'deferral condition cleared',
+          updatedAt: '',
+          daysQuiet: 8.0,
+          clearedRef: { ref: '#932', closedAt: '2026-08-17T00:00:00Z' },
+        },
+      ],
+      unreadableRepos: [],
+      enumerationFailed: false,
+    };
+    const output = formatReporterStallSweep(result);
+    expect(output).toContain('#932');
+    expect(output).toContain('CLOSED');
+    expect(output).toContain('2026-08-17');
+  });
+
+  it('never renders text matching the hook\'s auto-submit gate regex (pending issue(s): / inbox message(s) drained on startup:)', () => {
+    const result: ReporterStallResult = {
+      stalls: [
+        { repo: 'org/repo', number: 1, title: 'x', updatedAt: '', daysQuiet: 10 },
+      ],
+      unreadableRepos: ['org/other'],
+      enumerationFailed: false,
+    };
+    const output = formatReporterStallSweep(result);
+    expect(output).not.toMatch(/pending issue\(s\):/);
+    expect(output).not.toMatch(/inbox message\(s\) drained on startup:/);
+
+    const failed = formatReporterStallSweep({ stalls: [], unreadableRepos: [], enumerationFailed: true });
+    expect(failed).not.toMatch(/pending issue\(s\):/);
+    expect(failed).not.toMatch(/inbox message\(s\) drained on startup:/);
   });
 });

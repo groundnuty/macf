@@ -55,3 +55,46 @@ describe('macf-plugin-cli issues — generic work-discovery wiring (#816)', () =
     expect(onelineBranch).not.toContain('getInboxStore');
   });
 });
+
+/**
+ * Source-shape regression guard for the groundnuty/macf#1170 reporter-side
+ * stall sweep wiring. The actual query/classification logic is unit tested
+ * in `test/plugin/lib/reporter-stall.test.ts` and the render logic in
+ * `test/plugin/lib/format.test.ts`; this file pins that `issues` actually
+ * wires `checkReporterStalls` in, and — the load-bearing decision this
+ * class of test exists to pin — that it is NEVER threaded into the
+ * `--oneline` branch (which feeds the startup hook's auto-submit prompt; a
+ * reporter-side stall is a closure decision to re-read, not work to
+ * auto-pick-up).
+ */
+describe('macf-plugin-cli issues — reporter-stall sweep wiring (macf#1170)', () => {
+  it('imports checkReporterStalls from reporter-stall.js', () => {
+    expect(cliSrc).toContain("from '../lib/reporter-stall.js'");
+    expect(cliSrc).toContain('checkReporterStalls');
+  });
+
+  it('the issues case passes reporterStalls into formatStartupReconcile as a 3rd argument', () => {
+    const issuesCase = issuesCaseSource();
+    expect(issuesCase).toMatch(/formatStartupReconcile\(issues,\s*drained,\s*reporterStalls\)/);
+  });
+
+  it('the --oneline branch never computes or references reporterStalls (excluded from the auto-submit source)', () => {
+    const issuesCase = issuesCaseSource();
+    const onelineBranchStart = issuesCase.indexOf("'--oneline'");
+    const onelineBranchEnd = issuesCase.indexOf('break;', onelineBranchStart);
+    const onelineBranch = issuesCase.slice(onelineBranchStart, onelineBranchEnd);
+    expect(onelineBranch).not.toContain('checkReporterStalls');
+    expect(onelineBranch).not.toContain('reporterStalls');
+  });
+
+  it('respects MACF_SKIP_REPORTER_SWEEP, joining the established MACF_SKIP_* override family', () => {
+    const issuesCase = issuesCaseSource();
+    expect(issuesCase).toContain('MACF_SKIP_REPORTER_SWEEP');
+  });
+
+  it('reads MACF_REPORTER_STALL_DAYS / MACF_REPORTER_STALL_LIMIT tunables, matching the shell hook\'s MACF_STARTUP_PICKUP_* env-override convention', () => {
+    const issuesCase = issuesCaseSource();
+    expect(issuesCase).toContain('MACF_REPORTER_STALL_DAYS');
+    expect(issuesCase).toContain('MACF_REPORTER_STALL_LIMIT');
+  });
+});

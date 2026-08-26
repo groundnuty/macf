@@ -19,6 +19,7 @@ import { buildDashboardHealth } from '../lib/build-dashboard-health.js';
 import { getRegistryConfig } from '../lib/registry-config.js';
 import { mintFreshGitHubToken } from '../lib/fresh-github-token.js';
 import { checkAllPendingWork, resolveSelfLogin } from '../lib/work.js';
+import { checkReporterStalls } from '../lib/reporter-stall.js';
 import { getInboxStore } from '../lib/inbox-store.js';
 import { drainInbox } from '../lib/inbox-drain.js';
 import { buildSharedVarsClient } from '../lib/shared-vars-client.js';
@@ -43,6 +44,21 @@ import {
 } from '../../cli/commands/fleet-guests.js';
 
 const command = process.argv[2];
+
+/**
+ * Parse a positive-integer env override, falling back to `undefined` (the
+ * callee's own default applies) on anything absent/non-numeric/non-positive
+ * — never propagates a `NaN` into a comparison, which would silently make
+ * every staleness check false rather than erroring loudly. Mirrors the
+ * shell hook's `${VAR:-default}` tunable convention
+ * (`MACF_STARTUP_PICKUP_READY_TIMEOUT_SECS` et al.) for the TS side.
+ */
+function envPositiveInt(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
 
 /** No-op logger for guest-probe trust-bundle resolution — a misconfigured
  * federated project degrades that ONE guest to offline (`probePeerHealth`
@@ -277,9 +293,31 @@ async function main(): Promise<void> {
       // `inbox-store.ts`) — real cross-process durability is pending
       // devops's disk-backed driver (DR-008).
       const inboxStore = getInboxStore();
-      const drained = await drainInbox(inboxStore);
 
-      console.log(formatStartupReconcile(issues, drained));
+      // groundnuty/macf#1170 — the OUTBOUND-facing sibling of the §5
+      // sweep instruction above: issues THIS agent filed, still open,
+      // quiet past a stale threshold (see reporter-stall.ts module doc).
+      // Run concurrently with the inbox drain (independent queries).
+      // MACF_SKIP_REPORTER_SWEEP=1 joins the established MACF_SKIP_*
+      // family (coordination.md Token & Git Hygiene 7, mention-routing-
+      // hygiene.md §7, pr-discipline.md's LGTM gate, ...).
+      // Deliberately NOT threaded into `--oneline` above: that path feeds
+      // the hook's SUBMIT prompt ("Pick up pending issues: ..."), and a
+      // reporter-side stall is a closure decision for the agent to
+      // re-read, not work to auto-pick-up in that sense.
+      const skipReporterSweep = process.env['MACF_SKIP_REPORTER_SWEEP'] === '1';
+      const [drained, reporterStalls] = await Promise.all([
+        drainInbox(inboxStore),
+        skipReporterSweep
+          ? Promise.resolve(undefined)
+          : checkReporterStalls({
+              token,
+              staleDays: envPositiveInt('MACF_REPORTER_STALL_DAYS'),
+              limit: envPositiveInt('MACF_REPORTER_STALL_LIMIT'),
+            }),
+      ]);
+
+      console.log(formatStartupReconcile(issues, drained, reporterStalls));
       break;
     }
 
