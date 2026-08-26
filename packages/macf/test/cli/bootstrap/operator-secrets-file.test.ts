@@ -9,7 +9,6 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  applyOperatorSecretsFileToProcessEnv,
   describeOperatorInputSource,
   ensureOperatorSecretsGitignore,
   formatMissingOperatorInputsMessage,
@@ -151,32 +150,6 @@ describe('resolveOperatorInput — the #1197 operator ruling: per KEY, most-expl
       value: 'scope-value',
       source: 'scope-file',
     });
-  });
-});
-
-describe('applyOperatorSecretsFileToProcessEnv — the ONE key with no flag/file plumbing of its own (RUNNER_PLATFORM_ENDPOINT)', () => {
-  const KEY = 'MACF_RUNNER_PLATFORM_ENDPOINT';
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
-
-  it('populates process.env from the fleet file when the real env does not already carry it', () => {
-    vi.stubEnv(KEY, '');
-    applyOperatorSecretsFileToProcessEnv({ [KEY]: 'http://fleet-file-host:8088' }, undefined, [KEY]);
-    expect(process.env[KEY]).toBe('http://fleet-file-host:8088');
-  });
-
-  it('fleet file wins over scope file', () => {
-    vi.stubEnv(KEY, '');
-    applyOperatorSecretsFileToProcessEnv({ [KEY]: 'http://fleet-host:8088' }, { [KEY]: 'http://scope-host:8088' }, [KEY]);
-    expect(process.env[KEY]).toBe('http://fleet-host:8088');
-  });
-
-  it('never overwrites a value the real environment already set', () => {
-    vi.stubEnv(KEY, 'http://real-env-host:8088');
-    applyOperatorSecretsFileToProcessEnv({ [KEY]: 'http://fleet-file-host:8088' }, undefined, [KEY]);
-    expect(process.env[KEY]).toBe('http://real-env-host:8088');
   });
 });
 

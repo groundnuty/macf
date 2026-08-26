@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { operatorInputProvenance, resolveDeps, runBootstrapPlan, type BootstrapPlanDeps } from '../../src/cli/commands/bootstrap.js';
 import type { ObservedState } from '../../src/cli/bootstrap/plan.js';
 import { parseFleetManifest } from '../../src/cli/bootstrap/fleet-manifest.js';
+import { resolveRunnerPlatformEndpointWithProvenance } from '../../src/cli/bootstrap/runner-platform.js';
 
 const VALID_FLEET_YAML = `
 apiVersion: macf/v0
@@ -685,5 +686,35 @@ describe('runBootstrapPlan — operator secrets file (groundnuty/macf#1197)', ()
     const code = await runBootstrapPlan({ file, secretsFilePath: join(dir, 'does-not-exist.env') });
     expect(code).toBe(1);
     expect(errSpy.mock.calls.flat().join('\n')).toContain('does-not-exist.env');
+  });
+
+  // groundnuty/macf#1238 — the `runner_platform` plan ITEM (rendered inside
+  // `plan.items`, via `observer.ts::githubRegistryObserver` UNCHANGED) must
+  // name the secrets file too, not just the separate `operator_inputs`
+  // section above. The injected `observe` below calls the REAL
+  // `resolveRunnerPlatformEndpointWithProvenance` with the SAME candidate
+  // shape `observer.ts` actually passes — proving `runBootstrapPlan`
+  // registered the file tier BEFORE `observe` ran, without re-implementing
+  // `observer.ts`'s own gh-api reads.
+  it('DECISIVE: a runner-platform endpoint supplied ONLY via the secrets file names the file in the plan ITEM too — not "not resolved", not "environment variable"', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML_WITH_ROUTING);
+    dirs.push(dir);
+    const secretsPath = join(dir, 'secrets.env');
+    writeFileSync(secretsPath, 'MACF_RUNNER_PLATFORM_ENDPOINT=http://plan-secrets-host:8088\n');
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const deps: BootstrapPlanDeps = {
+      observe: async () => ({
+        ...EMPTY_OBSERVED,
+        runnerPlatformEndpoint: resolveRunnerPlatformEndpointWithProvenance({ explicit: undefined, manifestValue: undefined, scopeValue: undefined }),
+      }),
+    };
+    const code = await runBootstrapPlan({ file, json: true, secretsFilePath: secretsPath }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { plan: ReadonlyArray<{ kind: string; reason: string }> };
+    const item = json.plan.find((i) => i.kind === 'runner_platform');
+    expect(item?.reason).toContain('http://plan-secrets-host:8088');
+    expect(item?.reason).toMatch(/per-fleet operator secrets file/i);
+    expect(item?.reason).not.toMatch(/environment variable/i);
+    expect(item?.reason).not.toMatch(/not resolved/i);
   });
 });

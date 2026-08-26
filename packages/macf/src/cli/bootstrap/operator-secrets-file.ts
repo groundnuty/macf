@@ -143,34 +143,6 @@ export function resolveOperatorInput(
   return { value: undefined, source: 'none' };
 }
 
-/**
- * For keys whose EXISTING resolution reads `process.env` directly with no
- * CLI-flag tier of its own (today: only {@link RUNNER_PLATFORM_ENDPOINT_ENV_VAR}
- * — `runner-platform.ts`'s own multi-tier chain already covers flag/env/
- * scope-var/manifest, but has no file tier). Populates `process.env` for a
- * key the real environment does not already carry, the same way a `.env`
- * loader always does — so the pre-existing `process.env[KEY]` read further
- * down the call stack picks it up transparently, without this module
- * having to thread a new parameter through `runner-platform.ts`/
- * `apply-fleet.ts`/`observer.ts`. Never overwrites a value the real
- * environment already set (a real env var is a more deliberate operator
- * act than a file line, so it still wins) and only touches the KEYS the
- * caller explicitly names — it never re-decides a key
- * {@link resolveOperatorInput} already owns.
- */
-export function applyOperatorSecretsFileToProcessEnv(
-  fleetFileValues: Readonly<Record<string, string>> | undefined,
-  scopeFileValues: Readonly<Record<string, string>> | undefined,
-  keys: readonly string[],
-): void {
-  for (const key of keys) {
-    const current = process.env[key];
-    if (current !== undefined && current.length > 0) continue;
-    const value = fleetFileValues?.[key] ?? scopeFileValues?.[key];
-    if (value !== undefined && value.length > 0) process.env[key] = value;
-  }
-}
-
 // --- Provenance reporting (value-free, by construction) ---
 
 const OPERATOR_INPUT_SOURCE_LABEL: Readonly<Record<Exclude<OperatorInputSource, 'none'>, string>> = {
