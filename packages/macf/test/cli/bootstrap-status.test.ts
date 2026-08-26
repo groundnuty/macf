@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { runBootstrapStatus, type BootstrapStatusDeps } from '../../src/cli/commands/bootstrap-status.js';
 import type { ObservedState } from '../../src/cli/bootstrap/plan.js';
 import type { AgentRegistryObservation } from '../../src/cli/bootstrap/observer.js';
+import { BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION } from '../../src/cli/bootstrap/status.js';
 
 const VALID_FLEET_YAML = `
 apiVersion: macf/v0
@@ -128,7 +129,7 @@ describe('runBootstrapStatus', () => {
       fleet: string;
       agents: ReadonlyArray<{ role: string; appId?: string; registry: unknown }>;
     };
-    expect(json.schema_version).toBe(1);
+    expect(json.schema_version).toBe(BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION);
     expect(json.fleet).toBe('icsoc-2026');
     expect(json.agents).toHaveLength(1);
     expect(json.agents[0]?.role).toBe('code-agent');

@@ -57,9 +57,57 @@
  * `AgentStatusView`/`AgentRegistryObservation` fields directly, never the
  * footnote-bearing table-cell strings, so structured consumers still get
  * the reason per-field.
+ *
+ * **groundnuty/macf#1202 — a lock-derived value must not render as an
+ * observation.** `AgentStatusView.deployedVersion` (`versions.macf`) is
+ * sourced from `fleet.lock` ONLY — see `ObservedAgentState.deployedVersion`'s
+ * doc — this plane structurally has no mTLS route to a LIVE `/health.version`
+ * read (Amendment A's honest-unknown floor forbids adding one just to make
+ * this column "true"; the fix is disclosure, not new privilege). A bare
+ * `"0.2.60"` cell is indistinguishable from `actionsPin` (`versions.actions`),
+ * which genuinely IS re-read live every run (`observer.ts::readCallerActionsPin`)
+ * — exactly the disclosure gap #1202 flags. Every lock-derived render
+ * therefore carries an explicit `(from lock)` qualifier (`lockVersionCell`);
+ * the live sibling (`liveVersionCell`) renders unlabeled, so the two
+ * columns' provenance is visually distinguishable, not merely documented.
+ * `--json` carries the SAME distinction structurally, not just in prose —
+ * `deployedVersionSource`/`actionsPinSource` name the provenance per field.
+ *
+ * This also covers an offline agent's stale entry (#1202 requirement 3):
+ * `(from lock)` is the honest caveat that the value may have aged, since
+ * this plane cannot refresh it — `macf fleet upgrade` skips an offline
+ * agent's roll entirely (`@groundnuty/macf-core`'s
+ * `fleet-upgrade.ts::planFleetUpgrade`, the `'offline'` disposition), so a
+ * long-offline agent's `deployed_version` can silently age indefinitely
+ * with nothing here to detect that. `(from lock)` never claims freshness —
+ * it names the source, and the source's own staleness is the reader's to
+ * judge, honestly, rather than this plane fabricating a claim it cannot
+ * verify. Applies uniformly to `extraLockAgents` too (§D3's "reported,
+ * never pruned" agents are, if anything, MORE likely to be stale than a
+ * still-declared one).
+ *
+ * **Convergence ruling (#1202 requirement 4), stated once for both
+ * `versions.*` fields:** manifest-authoritative. DR-043 Amendment L makes
+ * `versions:` authoritative and `apply` converges the fleet TOWARD it —
+ * "toward" is not one-directional, so a host recorded NEWER than declared
+ * is DRIFT here, the same as older, never silently "at target". This
+ * matches how `plan.ts`'s `macfVersionItem`/`actionsVersionItem` ALREADY
+ * treat any difference (either direction) as `update`+`confirm_required` —
+ * both `versions.*` fields are already consistent with this ruling at the
+ * PLANNING layer, and this module's `lockVersionCell`/`liveVersionCell`
+ * apply the identical rule for STATUS's own DRIFT note. The one place this
+ * ruling does NOT reach is `@groundnuty/macf-core`'s LIVE roll classifier
+ * (`fleet-upgrade.ts::planFleetUpgrade`, `compareSemver(running, target) >= 0
+ * ⇒ 'at-target'`) — a deliberate, SEPARATE operational safety choice for
+ * `macf fleet upgrade` itself (never restart/downgrade an agent already
+ * ahead of the declared target). That live-roll asymmetry is intentionally
+ * left UNCHANGED here: #1202 explicitly permits a reporting-only fix when
+ * changing convergence itself is out of scope, and this module's own
+ * "never calls computePlan" contract (above) makes touching a live
+ * production roll's disposition logic doubly out of place here.
  */
 import { toVariableSegment } from '@groundnuty/macf-core';
-import type { FleetAgent, FleetManifest } from './fleet-manifest.js';
+import type { FleetAgent, FleetManifest, FleetVersions } from './fleet-manifest.js';
 import { deriveAppHandle, deriveControlRepoName } from './fleet-manifest.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle } from './apply-runner-ops.js';
 import { formatTable } from '../commands/ps.js';
@@ -93,8 +141,19 @@ export interface AgentStatusView {
    */
   readonly repoVisibilityReason?: string;
   readonly fingerprintCount: number;
+  /** `versions.macf`, sourced from `fleet.lock` ONLY — see this module's doc "groundnuty/macf#1202" paragraph. `undefined` iff never recorded. */
   readonly deployedVersion?: string;
+  /**
+   * `'lock'` whenever {@link deployedVersion} is defined — the ONLY
+   * provenance this plane can ever produce for it (no mTLS route to a live
+   * `/health.version` read, Amendment A). `undefined` iff `deployedVersion`
+   * is `undefined` (nothing to qualify) — never a free-standing claim.
+   */
+  readonly deployedVersionSource?: 'lock';
+  /** `versions.actions` — genuinely LIVE every run (`observer.ts::readCallerActionsPin`), unlike {@link deployedVersion}. */
   readonly actionsPin?: string;
+  /** `'live'` whenever {@link actionsPin} is defined — see {@link deployedVersionSource}'s doc for the contrast this exists to make explicit. */
+  readonly actionsPinSource?: 'live';
   /** `undefined` = vault not consulted this run (no `--vault`/`--identity-key`) — never a claim about vault contents. */
   readonly vault?: VaultAgentObservation;
   readonly registry: AgentRegistryObservation;
@@ -106,6 +165,8 @@ export interface ExtraLockAgentView {
   readonly appId: string;
   readonly installId: string;
   readonly deployedVersion?: string;
+  /** Same "always 'lock', only when {@link deployedVersion} is defined" contract as {@link AgentStatusView.deployedVersionSource} — an extra-lock agent's version is, if anything, MORE likely to be stale (§D3, never touched by a roll once dropped from the manifest). */
+  readonly deployedVersionSource?: 'lock';
 }
 
 /** The fleet-level runner-ops App (never in `manifest.agents[]` — macf#943). */
@@ -157,6 +218,14 @@ export interface FleetStatusView {
   /** `undefined` when `routing.runner` isn't declared — same "nothing was promised" gate `plan.ts` uses. */
   readonly routing?: RoutingView;
   readonly vaultRecipients: VaultRecipientsView;
+  /**
+   * The manifest's declared `versions:` block, verbatim — the comparison
+   * target for {@link lockVersionCell}/{@link liveVersionCell}'s DRIFT note
+   * (groundnuty/macf#1202). `undefined` when the manifest doesn't declare
+   * `versions:` at all (nothing to compare against — the honest-unknown
+   * floor applies to the comparison itself, not only to the observed side).
+   */
+  readonly declaredVersions?: FleetVersions;
 }
 
 // --- Compute (pure — no I/O; `registry` is pre-fetched by the caller) ---
@@ -181,8 +250,15 @@ function buildAgentView(
     routingClientRepo: observed.routingClientRepos?.[agent.repo] ?? 'unknown',
     repoVisibilityReason: obs?.repoVisibilityReason,
     fingerprintCount: Object.keys(obs?.fingerprints ?? {}).length,
+    // groundnuty/macf#1202 — the source qualifier is a PURE function of
+    // whether the value exists, never a separate observation: this plane
+    // can only ever populate `deployedVersion` from `fleet.lock`, and can
+    // only ever populate `actionsPin` from a live `gh api` read (see this
+    // module's doc). No branch here can produce the opposite pairing.
     deployedVersion: obs?.deployedVersion,
+    deployedVersionSource: obs?.deployedVersion !== undefined ? 'lock' : undefined,
     actionsPin: obs?.actionsPin,
+    actionsPinSource: obs?.actionsPin !== undefined ? 'live' : undefined,
     vault: obs?.vault,
     registry: registry[agent.role] ?? { status: 'unknown', reason: 'registry not queried this run' },
   };
@@ -220,7 +296,15 @@ export function computeBootstrapStatus(
   const manifestRoles = new Set(manifest.agents.map((a) => a.role));
   const extraLockAgents: ExtraLockAgentView[] = (observed.lock?.agents ?? [])
     .filter((a) => a.role !== RUNNER_OPS_ROLE && !manifestRoles.has(a.role))
-    .map((a) => ({ role: a.role, appId: a.app_id, installId: a.install_id, deployedVersion: a.deployed_version }));
+    .map((a) => ({
+      role: a.role,
+      appId: a.app_id,
+      installId: a.install_id,
+      deployedVersion: a.deployed_version,
+      // groundnuty/macf#1202 — same "lock is the only possible source"
+      // reasoning as `buildAgentView`'s `deployedVersionSource` above.
+      deployedVersionSource: a.deployed_version !== undefined ? 'lock' : undefined,
+    }));
 
   const runnerOpsLockEntry = observed.lock?.agents.find((a) => a.role === RUNNER_OPS_ROLE);
   const runnerOps: RunnerOpsView = {
@@ -269,6 +353,7 @@ export function computeBootstrapStatus(
     extraLockAgents,
     routing,
     vaultRecipients,
+    declaredVersions: manifest.versions,
   };
 }
 
@@ -276,6 +361,20 @@ export function computeBootstrapStatus(
 
 const RUNTIME_UNOBSERVABLE_NOTE =
   'unknown — not observable from this plane (run `macf fleet status` from a deployed agent workspace for live health)';
+
+/**
+ * groundnuty/macf#1202's closure condition, verbatim: "an operator reading
+ * `status` can tell whether a version was observed or recalled." The
+ * `(from lock)` qualifier on individual VERSION cells satisfies that at the
+ * per-cell level, but a reader still has to notice a qualifier's PRESENCE
+ * on one column and ABSENCE on its neighbor and already know what that
+ * means. Naming both columns' provenance ONCE, next to the table itself
+ * (same placement `RUNTIME_UNOBSERVABLE_NOTE` already uses for the RUNTIME
+ * table's own liveness caveat), makes the distinction legible without
+ * requiring that inference.
+ */
+const PROVISIONING_VERSION_PROVENANCE_NOTE =
+  "VERSION is fleet.lock's last-recorded value, never a live read this run; ACTIONS-PIN is read live from the repo every run";
 
 /** Exported for tests — column-width assertions (groundnuty/macf#1030) need the same header list `formatTable` renders against. */
 export const PROVISIONING_HEADERS = [
@@ -367,15 +466,49 @@ function formatVaultCaCell(vault: VaultCaObservation | undefined): string {
 }
 
 /**
+ * VERSION cell renderer — groundnuty/macf#1202. `value` is `deployedVersion`,
+ * lock-derived ONLY (see this module's doc "groundnuty/macf#1202" paragraph
+ * for the full disclosure + drift rationale). Always carries the explicit
+ * `(from lock)` qualifier when a value exists, so it never renders
+ * indistinguishably from a genuine observation — the exact disclosure gap
+ * this issue closes. `declared` is the manifest's `versions.macf`, when
+ * known; any difference (either direction — a host newer than declared is
+ * DRIFT here, not "at target") is called out, never silently accepted.
+ */
+function lockVersionCell(value: string | undefined, declared: string | undefined): string {
+  if (value === undefined) return 'unknown';
+  const base = `${value} (from lock)`;
+  if (declared === undefined || declared === value) return base;
+  return `${base}, declared ${declared} — DRIFT`;
+}
+
+/**
+ * ACTIONS-PIN cell renderer — the live-observed sibling of
+ * {@link lockVersionCell}. `value` is `actionsPin`, genuinely re-read every
+ * run (`observer.ts::readCallerActionsPin`), so it renders UNLABELED —
+ * that contrast with {@link lockVersionCell}'s qualifier is what proves the
+ * two columns' provenance is actually distinguished, not blanket-suppressed.
+ * Same DRIFT rule as {@link lockVersionCell} — see this module's doc.
+ */
+function liveVersionCell(value: string | undefined, declared: string | undefined): string {
+  if (value === undefined) return 'unknown';
+  if (declared === undefined || declared === value) return value;
+  return `${value}, declared ${declared} — DRIFT`;
+}
+
+/**
  * Build one PROVISIONING row per agent (pure — exported for tests).
  * `footnotes` defaults to a fresh, throwaway registry so ad-hoc callers
  * (tests checking presence/shape, not footnote text) don't need to thread
  * one through; `formatBootstrapStatusText` passes its own so it can print
  * the accumulated footnote list right after the table (groundnuty/macf#1030).
+ * `declaredVersions` defaults to `undefined` (no comparison target) for the
+ * same ad-hoc-caller convenience — see groundnuty/macf#1202.
  */
 export function buildProvisioningRows(
   agents: readonly AgentStatusView[],
   footnotes: FootnoteRegistry = new FootnoteRegistry(),
+  declaredVersions?: FleetVersions,
 ): readonly (readonly string[])[] {
   return agents.map((a) => [
     a.role,
@@ -385,8 +518,8 @@ export function buildProvisioningRows(
     repoScopedCell(a.caRepo, a.repoVisibilityReason, footnotes),
     repoScopedCell(a.routingClientRepo, a.repoVisibilityReason, footnotes),
     a.fingerprintCount > 0 ? `${String(a.fingerprintCount)} fingerprint(s)` : 'none recorded',
-    a.deployedVersion ?? 'unknown',
-    a.actionsPin ?? 'unknown',
+    lockVersionCell(a.deployedVersion, declaredVersions?.macf),
+    liveVersionCell(a.actionsPin, declaredVersions?.actions),
     formatVaultAgentCell(a.vault, footnotes),
   ]);
 }
@@ -475,7 +608,7 @@ function formatRoutingBlock(view: RoutingView): readonly string[] {
  */
 export function formatBootstrapStatusText(view: FleetStatusView): string {
   const provisioningFootnotes = new FootnoteRegistry();
-  const provisioningRows = buildProvisioningRows(view.agents, provisioningFootnotes);
+  const provisioningRows = buildProvisioningRows(view.agents, provisioningFootnotes, view.declaredVersions);
   const runtimeFootnotes = new FootnoteRegistry();
   const runtimeRows = buildRuntimeRows(view.agents, runtimeFootnotes);
 
@@ -486,7 +619,7 @@ export function formatBootstrapStatusText(view: FleetStatusView): string {
     formatControlRepoLine(view.controlRepo),
     formatRunnerOpsLine(view.runnerOps),
     '',
-    'PROVISIONING',
+    `PROVISIONING (${PROVISIONING_VERSION_PROVENANCE_NOTE})`,
     formatTable(PROVISIONING_HEADERS, provisioningRows),
     ...formatFootnotes(provisioningFootnotes),
     '',
@@ -508,14 +641,28 @@ export function formatBootstrapStatusText(view: FleetStatusView): string {
   if (view.extraLockAgents.length > 0) {
     parts.push('', 'EXTRA (recorded in fleet.lock, not declared in fleet.yaml — never pruned, §D3):');
     for (const e of view.extraLockAgents) {
-      parts.push(`  - role=${e.role} app_id=${e.appId} install_id=${e.installId} deployed_version=${e.deployedVersion ?? 'unknown'}`);
+      // groundnuty/macf#1202 — same `(from lock)` disclosure as the
+      // PROVISIONING table's VERSION column (`lockVersionCell`); an extra
+      // agent is no longer touched by ANY roll, so its recorded version is
+      // at least as likely to be stale as a still-declared agent's.
+      const version = e.deployedVersion !== undefined ? `${e.deployedVersion} (from lock)` : 'unknown';
+      parts.push(`  - role=${e.role} app_id=${e.appId} install_id=${e.installId} deployed_version=${version}`);
     }
   }
 
   return parts.join('\n');
 }
 
-export const BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION = 1;
+// groundnuty/macf#1202 — bumped 1 → 2. `agents[].deployedVersion` is a
+// SAME-NAME field gaining a source qualifier: pre-#1202, a consumer reading
+// a bare `deployedVersion` string had no structural way to tell it apart
+// from a genuine observation (`actionsPin` carried no such distinction
+// either). Post-#1202, `deployedVersionSource`/`actionsPinSource` +
+// `declared_versions` change what the SAME fields mean to a consumer that
+// was already parsing them — the same "a new fact feeding an existing
+// value is breaking" precedent this codebase already applies (see
+// `routing-doctor.ts`'s schema_version 3→4 / 4→5 history).
+export const BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION = 2;
 
 /** Structured `--json` shape — carries the SAME facts the text render shows, never a summary of them. */
 export function bootstrapStatusToJson(view: FleetStatusView): unknown {
@@ -530,5 +677,10 @@ export function bootstrapStatusToJson(view: FleetStatusView): unknown {
     extra_lock_agents: view.extraLockAgents.map((e) => ({ ...e })),
     ...(view.routing !== undefined ? { routing: { ...view.routing } } : {}),
     vault_recipients: { ...view.vaultRecipients },
+    // groundnuty/macf#1202 — the comparison target `agents[].deployedVersion`/
+    // `agents[].actionsPin` are judged against for their DRIFT note (text
+    // render: `lockVersionCell`/`liveVersionCell`); `undefined` when the
+    // manifest doesn't declare `versions:` (nothing to compare against).
+    ...(view.declaredVersions !== undefined ? { declared_versions: { ...view.declaredVersions } } : {}),
   };
 }
