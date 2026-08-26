@@ -13,6 +13,7 @@ import {
   formatRunnerPollProgress,
   noRunnerRegisteredReason,
   noRunnerTokenReason,
+  noUsableRunnerWithoutTokenReason,
   pollForUsableRunner,
   publishTrustedActors,
   publishTrustedActorsGated,
@@ -255,34 +256,173 @@ describe('runnerTokenPollExhaustedReason', () => {
   });
 });
 
-describe('publishTrustedActorsGated (macf#929)', () => {
-  it('no token supplied -> refuses EVERY repo outright ("failed"), ZERO I/O — the token gate fires before any live check', async () => {
-    let checkCalled = false;
-    let createCalled = false;
+describe('publishTrustedActorsGated — no-token branch consults live presence (groundnuty/macf#1195)', () => {
+  // The decisive triple (assert-the-wrong-path.md): case 2 alone is
+  // satisfied by the OLD flag-only refusal; case 1 is what proves the
+  // change actually observes reality, and case 3 is what stops
+  // "cannot see" collapsing into "absent."
+
+  it('DECISIVE (case 1): no token, runner PRESENT -> PROCEEDS and WRITES MACF_TRUSTED_ACTORS — a token is for REGISTERING a runner, never for USING one that already exists', async () => {
+    let checkCalled = 0;
+    const writes: Array<{ repo: string; name: string; value: string }> = [];
     const deps = depsWith({
       checkRunnerUsableByRepo: async () => {
-        checkCalled = true;
+        checkCalled += 1;
         return { presence: 'present' };
       },
+      createRepoVariable: async (repo, name, value) => {
+        writes.push({ repo, name, value });
+        return 'created';
+      },
+    });
+    const result = await publishTrustedActorsGated('a-code-agent[bot]', ['a/b'], deps, undefined);
+    expect(result).toEqual({ 'a/b': { status: 'created' } });
+    expect(writes).toEqual([{ repo: 'a/b', name: 'MACF_TRUSTED_ACTORS', value: 'a-code-agent[bot]' }]);
+    // Consults the EXISTING observation seam exactly once per repo — never a
+    // second query path, never a poll (nothing licenses a wait without a
+    // token).
+    expect(checkCalled).toBe(1);
+  });
+
+  it('case 2: no token, runner CONFIRMED ABSENT -> refuses ("failed"), naming --runner-token and how to get one', async () => {
+    let createCalled = false;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => ({ presence: 'absent' }),
       createRepoVariable: async () => {
         createCalled = true;
         return 'created';
       },
     });
-    const result = await publishTrustedActorsGated('self-hosted', ['a/b', 'c/d'], deps, undefined);
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, undefined);
     expect(result['a/b']?.status).toBe('failed');
-    expect(result['c/d']?.status).toBe('failed');
     const reason = (result['a/b'] as { reason: string }).reason;
+    expect(reason).toContain('a/b');
     expect(reason).toContain(RUNNER_TOKEN_FLAG);
     expect(reason).toContain(RUNNER_TOKEN_ENV_VAR);
     expect(reason).toContain('gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token');
-    expect(checkCalled).toBe(false);
+    expect(reason).not.toMatch(/could not confirm/);
     expect(createCalled).toBe(false);
   });
 
-  it('an empty-string token is treated the same as no token — refuses (an empty flag value is not a supplied token)', async () => {
-    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], depsWith(), '');
+  it('case 3: no token, presence INDETERMINATE (unknown) -> refuses, worded DIFFERENTLY from confirmed-absent', async () => {
+    const deps = depsWith({ checkRunnerUsableByRepo: async () => ({ presence: 'unknown' }) });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, undefined);
     expect(result['a/b']?.status).toBe('failed');
+    const reason = (result['a/b'] as { reason: string }).reason;
+    expect(reason).toMatch(/could not confirm whether a self-hosted runner is registered/);
+    expect(reason).toContain(RUNNER_TOKEN_FLAG);
+  });
+
+  it('a repo created THIS run is not counted as absence evidence — distinct wording from an ordinary confirmed-absent repo', async () => {
+    const deps = depsWith({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) });
+    const justCreatedRepos = new Set(['brand-new/repo']);
+    const result = await publishTrustedActorsGated('self-hosted', ['brand-new/repo', 'pre-existing/repo'], deps, undefined, {}, justCreatedRepos);
+    expect(result['brand-new/repo']?.status).toBe('failed');
+    expect(result['pre-existing/repo']?.status).toBe('failed');
+    const createdReason = (result['brand-new/repo'] as { reason: string }).reason;
+    const existingReason = (result['pre-existing/repo'] as { reason: string }).reason;
+    expect(createdReason).toMatch(/created during THIS run/);
+    expect(existingReason).not.toMatch(/created during THIS run/);
+  });
+
+  it('registration is checked PER REPO — one repo usable and one not both get their own correct outcome, no token supplied', async () => {
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async (repo) => ({ presence: repo === 'registered/x' ? 'present' : 'absent' }),
+    });
+    const result = await publishTrustedActorsGated('a-code-agent[bot]', ['registered/x', 'unregistered/y'], deps, undefined);
+    expect(result['registered/x']).toEqual({ status: 'created' });
+    expect(result['unregistered/y']?.status).toBe('failed');
+  });
+
+  it('never polls — no sleep, no wait, even though a pollOptions object is supplied (nothing licenses a wait without a token)', async () => {
+    let sleepCalls = 0;
+    const deps = depsWith({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, undefined, {
+      timeoutMs: 600_000,
+      sleepFn: async () => {
+        sleepCalls += 1;
+      },
+    });
+    expect(result['a/b']?.status).toBe('failed');
+    expect((result['a/b'] as { reason: string }).reason).not.toMatch(/poll window/);
+    expect(sleepCalls).toBe(0);
+  });
+
+  it('a THROWING checkRunnerUsableByRepo (no token) resolves to "failed" (a wiring bug), never silently treated as absent', async () => {
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        throw new Error('gh: rate limited');
+      },
+    });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, undefined);
+    expect(result['a/b']?.status).toBe('failed');
+    expect((result['a/b'] as { reason: string }).reason).toContain('rate limited');
+  });
+
+  it('a fleet NOT declaring self-hosted is unaffected — this module is only reachable when routing.runner.runs_on === "self-hosted" (asserted at the apply-fleet.ts call site, not this function; this test documents the contract this function upholds when it IS called)', async () => {
+    // publishTrustedActorsGated itself has no manifest-level gate (apply-fleet.ts
+    // only calls it when self-hosted is declared) — an empty repo list is the
+    // closest in-module proxy for "nothing to do."
+    expect(await publishTrustedActorsGated('self-hosted', [], depsWith(), undefined)).toEqual({});
+  });
+});
+
+describe('noUsableRunnerWithoutTokenReason (groundnuty/macf#1195)', () => {
+  it('names the repo, the flag, the env var, and the gh-api registration-token command', () => {
+    const reason = noUsableRunnerWithoutTokenReason('groundnuty/x', { presence: 'absent' }, false);
+    expect(reason).toContain('groundnuty/x');
+    expect(reason).toContain(RUNNER_TOKEN_FLAG);
+    expect(reason).toContain(RUNNER_TOKEN_ENV_VAR);
+    expect(reason).toContain('gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token');
+    expect(reason).toContain('billed on private repos');
+  });
+
+  it('distinguishes unknown / just-created / ordinary-absent with three different cause sentences', () => {
+    const unknown = noUsableRunnerWithoutTokenReason('x/y', { presence: 'unknown' }, false);
+    const justCreated = noUsableRunnerWithoutTokenReason('x/y', { presence: 'absent' }, true);
+    const ordinaryAbsent = noUsableRunnerWithoutTokenReason('x/y', { presence: 'absent' }, false);
+    expect(unknown).toMatch(/could not confirm whether a self-hosted runner is registered/);
+    expect(justCreated).toMatch(/created during THIS run/);
+    expect(ordinaryAbsent).toMatch(/no self-hosted runner is confirmed registered/);
+    expect(unknown).not.toBe(justCreated);
+    expect(justCreated).not.toBe(ordinaryAbsent);
+    expect(unknown).not.toBe(ordinaryAbsent);
+  });
+
+  it('never claims a poll happened — no "poll window" language (no wait ever occurs in this branch)', () => {
+    const reason = noUsableRunnerWithoutTokenReason('x/y', { presence: 'absent' }, false);
+    expect(reason).not.toMatch(/poll window/);
+  });
+
+  it('appends the org-admin handover + capability detail verbatim when present, same discipline as the sibling reason functions', () => {
+    const usability: RunnerUsability = {
+      presence: 'absent',
+      detail: 'a runner registered for "x/y" is offline (status="offline").',
+      handover: 'An org admin must add "x/y" at https://example.invalid/.',
+    };
+    const reason = noUsableRunnerWithoutTokenReason('x/y', usability, false);
+    expect(reason).toContain('is offline (status="offline")');
+    expect(reason).toContain('An org admin must add "x/y" at https://example.invalid/.');
+  });
+});
+
+describe('publishTrustedActorsGated (macf#929)', () => {
+  it('an empty-string token is treated the same as no token — consults live presence rather than refusing outright (groundnuty/macf#1195)', async () => {
+    let checkCalled = 0;
+    const deps = depsWith({
+      checkRunnerUsableByRepo: async () => {
+        checkCalled += 1;
+        return { presence: 'absent' };
+      },
+    });
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], deps, '');
+    expect(result['a/b']?.status).toBe('failed');
+    expect(checkCalled).toBe(1);
+  });
+
+  it('an empty-string token + a runner already PRESENT still writes — empty is "no token," not "no runner"', async () => {
+    const result = await publishTrustedActorsGated('self-hosted', ['a/b'], depsWith(), '');
+    expect(result['a/b']).toEqual({ status: 'created' });
   });
 
   it('an empty repo list with no token produces an empty map — no repos to refuse (mirrors publishTrustedActors\' own empty-list case)', async () => {
@@ -383,8 +523,10 @@ describe('publishTrustedActorsGated (macf#929)', () => {
 
   it('the token VALUE itself never appears anywhere in the returned outcome map — reasons name the FLAG/ENV-VAR NAMES, never the token', async () => {
     const SECRET = 'ghr-super-secret-should-never-leak';
-    const refused = await publishTrustedActorsGated('self-hosted', ['a/b'], depsWith(), undefined);
-    expect(JSON.stringify(refused)).not.toContain(SECRET);
+    // No token, deps default runner presence -> writes; the point here is
+    // simply that the (irrelevant) SECRET string never leaks either way.
+    const noToken = await publishTrustedActorsGated('self-hosted', ['a/b'], depsWith(), undefined);
+    expect(JSON.stringify(noToken)).not.toContain(SECRET);
 
     const exhausted = await publishTrustedActorsGated(
       'self-hosted',
@@ -1247,8 +1389,10 @@ describe('checkRunnerTokenPreflight (macf#932)', () => {
   it('refuses when self-hosted is declared and no token was resolved (undefined)', () => {
     const failure = checkRunnerTokenPreflight({ runner: { runs_on: 'self-hosted', warm: 1 } }, undefined);
     expect(failure?.code).toBe(RUNNER_TOKEN_MISSING_CODE);
-    // Reuses noRunnerTokenReason() VERBATIM — same message the late gate
-    // (publishTrustedActorsGated) has always shown, only fired earlier.
+    // Reuses noRunnerTokenReason() VERBATIM — exactly one place this
+    // early-warning text is authored (groundnuty/macf#1195: no longer the
+    // SAME text the late gate's own per-repo refusal shows — see that
+    // function's doc).
     expect(failure?.message).toBe(noRunnerTokenReason());
   });
 
