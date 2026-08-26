@@ -1,5 +1,6 @@
 import type { HealthResponse } from '@groundnuty/macf-core';
 import type { OwnRegistration, PeerEntry } from './registry.js';
+import type { ReporterStallResult } from './reporter-stall.js';
 
 function formatUptime(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -211,21 +212,79 @@ export function formatSweepInstruction(): string {
 }
 
 /**
- * DR-038 Decision 5 — the extended SessionStart startup_check. Composes
- * three sections: the existing issue-queue (`formatIssues`, unchanged),
- * any inbox messages drained on this startup (`inbox-drain.ts`'s
- * `drainInbox`, the "completeness half" — messages that arrived while the
- * agent was busy/relaunching or whose tmux-wake didn't land), and the
- * injected §5 sweep instruction.
+ * groundnuty/macf#1170 — the OUTBOUND-facing sibling of
+ * `formatSweepInstruction`. That instruction covers INBOUND disciplines
+ * (a review request addressed to you, a gate you're waiting on); this
+ * renders the computed result of `reporter-stall.ts`'s `checkReporterStalls`
+ * — issues THIS agent filed, still open, quiet past the stale threshold.
+ * See that module's doc for the full rationale (signal choice, scope,
+ * cross-repo coverage, honest-coverage floor, verdict-vs-reminder design).
  *
- * The drained-messages section is OMITTED entirely when nothing was
- * drained — an empty inbox must not add noise to an otherwise-normal
- * startup. The sweep instruction always renders (see
- * `formatSweepInstruction`).
+ * Returns `''` when there is nothing to say — a clean sweep (repos all
+ * reachable, zero stale issues) must not add noise, same posture as the
+ * drained-inbox section below. A FAILED sweep (`enumerationFailed`) or a
+ * PARTIAL one (some repos unreadable) always renders something, even with
+ * zero stalls — the honest-unknown floor: an empty sweep and a failed one
+ * must not look alike.
+ */
+export function formatReporterStallSweep(result: ReporterStallResult): string {
+  if (result.enumerationFailed) {
+    return 'Reporter-side stall sweep: could not enumerate the install-set repos this session — coverage is UNKNOWN, not confirmed clear.';
+  }
+  if (result.stalls.length === 0 && result.unreadableRepos.length === 0) {
+    return '';
+  }
+
+  const lines: string[] = [];
+  if (result.stalls.length > 0) {
+    lines.push(`${result.stalls.length} issue(s) you filed are open and quiet — re-read before assuming still blocked:`);
+    for (const s of result.stalls) {
+      const ref = `${s.repo}#${s.number}`;
+      const days = Math.floor(s.daysQuiet);
+      if (s.clearedRef) {
+        const closed = s.clearedRef.closedAt ? ` on ${s.clearedRef.closedAt.slice(0, 10)}` : '';
+        lines.push(
+          `  ${ref}: ${s.title} (quiet ${days}d) — references ${s.clearedRef.ref}, now CLOSED${closed}: its stated condition may be cleared`,
+        );
+      } else {
+        lines.push(
+          `  ${ref}: ${s.title} (quiet ${days}d) — re-read its stated conditions before assuming it's still blocked`,
+        );
+      }
+    }
+  }
+  if (result.unreadableRepos.length > 0) {
+    lines.push(
+      `Could not check ${result.unreadableRepos.length} install-set repo(s) for reporter-side stalls: ${result.unreadableRepos.join(', ')} — coverage is incomplete, not confirmed clear.`,
+    );
+  }
+  return lines.join('\n');
+}
+
+/**
+ * DR-038 Decision 5 — the extended SessionStart startup_check. Composes
+ * up to four sections: the existing issue-queue (`formatIssues`,
+ * unchanged), any inbox messages drained on this startup (`inbox-drain.ts`'s
+ * `drainInbox`, the "completeness half" — messages that arrived while the
+ * agent was busy/relaunching or whose tmux-wake didn't land), the
+ * groundnuty/macf#1170 reporter-side stall sweep, and the injected §5
+ * sweep instruction.
+ *
+ * The drained-messages and reporter-stall sections are OMITTED entirely
+ * when there's nothing to say (empty inbox / clean stall sweep) — noise
+ * must not accumulate on an otherwise-normal startup. The sweep
+ * instruction always renders (see `formatSweepInstruction`).
+ *
+ * `reporterStalls` is optional (back-compat: existing callers/tests that
+ * don't pass it get the pre-#1170 three-section output unchanged) and
+ * deliberately absent from `formatIssuesOneline`'s inputs — see
+ * `macf-plugin-cli.ts`'s `issues` case for why a reporter-side stall is
+ * never folded into the `--oneline` auto-submit prompt.
  */
 export function formatStartupReconcile(
   issues: ReadonlyArray<{ readonly number: number; readonly title: string }>,
   drained: ReadonlyArray<{ readonly id: string; readonly payload: unknown; readonly receivedAt: number }>,
+  reporterStalls?: ReporterStallResult,
 ): string {
   const sections: string[] = [formatIssues(issues)];
 
@@ -236,6 +295,13 @@ export function formatStartupReconcile(
       lines.push(`  ${entry.id} (received ${receivedIso}): ${JSON.stringify(entry.payload)}`);
     }
     sections.push(lines.join('\n'));
+  }
+
+  if (reporterStalls) {
+    const stallText = formatReporterStallSweep(reporterStalls);
+    if (stallText.length > 0) {
+      sections.push(stallText);
+    }
   }
 
   sections.push(formatSweepInstruction());
