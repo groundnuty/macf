@@ -202,14 +202,22 @@ if [[ -z "$ISSUE_NUMBER" ]]; then
   exit 0
 fi
 
-REPO_FLAG=""
+REPO_VALUE=""
 if [[ "$COMMAND" =~ --repo[[:space:]]+([^[:space:]]+) ]]; then
-  REPO_FLAG="--repo ${BASH_REMATCH[1]}"
+  REPO_VALUE="${BASH_REMATCH[1]}"
 elif [[ "$COMMAND" =~ --repo=([^[:space:]]+) ]]; then
-  REPO_FLAG="--repo ${BASH_REMATCH[1]}"
+  REPO_VALUE="${BASH_REMATCH[1]}"
 elif [[ "$COMMAND" =~ (^|[[:space:]])-R[[:space:]]+([^[:space:]]+) ]]; then
-  REPO_FLAG="--repo ${BASH_REMATCH[2]}"
+  REPO_VALUE="${BASH_REMATCH[2]}"
 fi
+# Strip trailing shell-wrapper punctuation that can end up glued to the
+# value when the whole `gh issue close ...` command is itself wrapped in
+# quotes or a subshell (`bash -c '... --repo owner/repo'`, `(... --repo
+# owner/repo)`) — the greedy `[^[:space:]]+` above has no way to know the
+# wrapper's own closing character isn't part of the repo spec.
+REPO_VALUE="$(sed -E "s/[\"');\`]+\$//" <<<"$REPO_VALUE" 2>/dev/null || echo "$REPO_VALUE")"
+REPO_FLAG=""
+[[ -n "$REPO_VALUE" ]] && REPO_FLAG="--repo $REPO_VALUE"
 
 # ── Fetch the issue body ──────────────────────────────────────────────────
 # `gh issue view` (not raw `gh api`) so gh's own --repo auto-detection
