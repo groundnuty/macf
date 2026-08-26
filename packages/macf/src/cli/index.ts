@@ -21,6 +21,7 @@ import { runFleetDeleteApps, runFleetDestroy, DESTROY_ENV_ACK_VAR } from './comm
 import { runFleetDeploy } from './commands/fleet-deploy.js';
 import { runBootstrapPlan } from './commands/bootstrap.js';
 import { runBootstrapApply } from './commands/bootstrap-apply.js';
+import { writeOperatorSecretsFileTemplate } from './bootstrap/operator-secrets-file.js';
 import { runBootstrapStatus } from './commands/bootstrap-status.js';
 import { runBootstrapControlRepoInit } from './commands/bootstrap-control-repo-init.js';
 import { runManifestScaffold } from './commands/bootstrap-manifest-scaffold.js';
@@ -715,12 +716,20 @@ bootstrap
       'vault-free default.',
   )
   .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
+  .option(
+    '--secrets-file <path>',
+    'Path to a per-FLEET operator secrets file (plain KEY=value, groundnuty/macf#1197) — reports which source ' +
+      'will supply each key `apply` will need, before any gate opens. Optional.',
+  )
+  .option('--scope-secrets-file <path>', 'Path to a per-SCOPE operator secrets file, shared across a fleet\'s org/account. Lower precedence than --secrets-file.')
   .action(async (opts) => {
     const code = await runBootstrapPlan({
       file: opts.file,
       json: opts.json,
       vaultPath: opts.vault,
       identityKeyPath: opts.identityKey,
+      secretsFilePath: opts.secretsFile,
+      scopeSecretsFilePath: opts.scopeSecretsFile,
     });
     process.exitCode = code;
   });
@@ -798,6 +807,18 @@ bootstrap
       'MACF_BOOTSTRAP_TS_OAUTH_SECRET when unset. Never logged, never echoed in --json output.',
   )
   .option(
+    '--secrets-file <path>',
+    'Path to a per-FLEET operator secrets file (plain KEY=value) — one file instead of a flag per credential. ' +
+      'Resolution per key: CLI flag > this file > --scope-secrets-file > env. Run `macf bootstrap secrets ' +
+      'template` for the list of keys it can carry. Optional — its absence is the normal case.',
+  )
+  .option(
+    '--scope-secrets-file <path>',
+    'Path to a per-SCOPE operator secrets file, shared across every fleet on the same org/account — the tier ' +
+      'meant to carry the common case (set once, every fleet inherits it). Lower precedence than ' +
+      '--secrets-file; still above env.',
+  )
+  .option(
     '--no-deploy',
     'Skip the default per-agent deploy phase that otherwise runs after the GitHub phase above ' +
       '(needs --vault + --identity-key; without them the deploy phase is skipped anyway, loudly). Restores ' +
@@ -815,9 +836,39 @@ bootstrap
       runnerToken: opts.runnerToken,
       tsOauthClientId: opts.tsOauthClientId,
       tsOauthSecret: opts.tsOauthSecret,
+      secretsFilePath: opts.secretsFile,
+      scopeSecretsFilePath: opts.scopeSecretsFile,
       deploy: opts.deploy,
     });
     process.exitCode = code;
+  });
+
+const bootstrapSecrets = bootstrap
+  .command('secrets')
+  .description(
+    'The operator secrets file (groundnuty/macf#1197) — one plain KEY=value file instead of a flag per ' +
+      'credential, passed to `bootstrap apply`/`plan` via --secrets-file (per-fleet) and/or ' +
+      '--scope-secrets-file (per-scope, shared across a fleet\'s org/account).',
+  );
+
+bootstrapSecrets
+  .command('template')
+  .description(
+    'Write the operator-secrets-file template: every key apply can consume, what each is for, and how to ' +
+      'obtain it — fill in the blanks and pass the result as --secrets-file or --scope-secrets-file. Refuses ' +
+      'to overwrite an existing file. Ensures the containing directory\'s .gitignore covers it, so the file ' +
+      'is never accidentally committed.',
+  )
+  .option('--out <path>', 'Where to write the template', 'secrets.env.template')
+  .action((opts) => {
+    const path = resolve(opts.out);
+    const result = writeOperatorSecretsFileTemplate(path);
+    if (result.created) {
+      console.log(`Wrote operator secrets template to ${path} (gitignored).`);
+    } else {
+      console.error(`Refusing to overwrite existing file: ${path}`);
+      process.exitCode = 1;
+    }
   });
 
 const bootstrapControlRepo = bootstrap
