@@ -53,35 +53,71 @@
  * but the CALLER's log line must say WHICH shape happened, because the
  * remediation differs (set the env var vs. wait for the cluster).
  *
- * ## The endpoint is tailnet-only infrastructure, not fleet state
+ * ## The endpoint is discoverable, never guessed (groundnuty/macf#1211)
  *
- * `RUNNER_PLATFORM_ENDPOINT_ENV_VAR` (`MACF_RUNNER_PLATFORM_ENDPOINT`) is an
- * env var, deliberately — the SAME shape `reconciler/run.ts`'s
- * `TEMPO_QUERY_ENDPOINT` already uses for the identical class of resource (an
- * operator's specific monitoring VM's Tailscale hostname). Two reasons this
- * is NOT a `fleet.yaml` field:
+ * `RUNNER_PLATFORM_ENDPOINT_ENV_VAR` (`MACF_RUNNER_PLATFORM_ENDPOINT`) started
+ * as an env-var-only resolution (the original shape of this module,
+ * mirroring `reconciler/run.ts`'s `TEMPO_QUERY_ENDPOINT` for the identical
+ * class of resource — an operator's specific monitoring VM's Tailscale
+ * hostname). That shape had a real gap: the value lived ONLY in whichever
+ * shell exported it, undeclared anywhere a second operator (or a future
+ * session) could discover it — the exact "an input that lives in someone's
+ * head" class `groundnuty/macf#1211` was filed against. Two facts from the
+ * original design still hold and motivate the resolution chain below:
  *
- *   1. **It is operator infrastructure, not desired fleet state.** `fleet.yaml`
- *      commits to git and describes WHAT a fleet should look like; which
- *      tailnet node runs the runner-provisioning API is a fact about THIS
- *      operator's cluster, unrelated to any one fleet's shape. A future
- *      operator standing up their own runner-platform instance would have to
- *      edit every fleet manifest, rather than one env var.
- *   2. **No baked-in hostname.** Unlike `api.github.com` (universal), this
- *      host is one operator's private tailnet address — hardcoding a default
- *      would silently point every consumer at THIS deployment's cluster. The
- *      resolver below has NO fallback: unset means `'not-configured'`, an
- *      honest non-fatal status, never a guessed default.
+ *   1. **It is operator infrastructure, not per-fleet desired state.**
+ *      Unlike almost everything else in `fleet.yaml`, which tailnet node
+ *      runs the runner-provisioning API is a fact about an operator's
+ *      SCOPE (an org or account), not about any one fleet's shape — every
+ *      fleet on that scope shares the same platform. That is why the
+ *      **scope-level GitHub Actions variable** (an org/account "shared
+ *      fleet information" variable, the SAME kind of storage the CA
+ *      certificate's registry leg already uses) is the tier the operator
+ *      ruled should carry the common case: set once per scope, every fleet
+ *      — including ones that don't exist yet — inherits it for free.
+ *   2. **No baked-in hostname, ever.** Unlike `api.github.com` (universal),
+ *      this host is one operator's private tailnet address — hardcoding a
+ *      default would silently point every consumer at THIS deployment's
+ *      cluster, producing a confident failure against someone else's
+ *      infrastructure. Every tier below can be absent; the resolver never
+ *      guesses one.
  *
- * `--runner-platform-endpoint` is NOT a CLI flag (unlike `--runner-token`)
- * — this module and its `apply-fleet.ts` caller both stay inside
- * `src/cli/bootstrap/**`; wiring a new flag would touch
- * `commands/bootstrap-apply.ts`, a much wider-blast-radius file under
- * concurrent edit by many other issues this same week. `FleetApplyDeps.
- * runnerPlatformEndpoint`/`runnerPlatformFetch` are both optional and
- * injectable so tests never read `process.env` or the network — production
- * simply leaves them unset, and {@link resolveRunnerPlatformEndpoint} falls
- * through to the env var.
+ * **The full precedence chain, most explicit wins** (see
+ * {@link resolveRunnerPlatformEndpointWithProvenance}):
+ *
+ *   1. **flag** — an explicit per-run override (`FleetApplyDeps.
+ *      runnerPlatformEndpoint`; a future `--runner-platform-endpoint` CLI
+ *      flag would land here, mirroring `--runner-token`'s own shape, but is
+ *      NOT built this round for the same reason the original doc gave:
+ *      wiring a new flag touches `commands/bootstrap-apply.ts`, a much
+ *      wider-blast-radius file under concurrent edit).
+ *   2. **env** — `MACF_RUNNER_PLATFORM_ENDPOINT`, read directly from
+ *      `process.env` (never injected — matches this module's original,
+ *      still-live convention).
+ *   3. **scope** — the fleet's `owner.registry` scope's shared Actions
+ *      variable, same name (`MACF_RUNNER_PLATFORM_ENDPOINT`). **This is a
+ *      VARIABLE, never a secret** — the operator's own ruling: a tailnet
+ *      address's access control is reachability, not obscurity, so it is
+ *      read with `observer.ts::readRegistryVariable` — the SAME credential
+ *      path (and the SAME `gh api .../actions/variables/<name>` call
+ *      shape) every other registry-scope variable read in this codebase
+ *      already uses. No new auth path.
+ *   4. **manifest** — `transport.runner_platform_endpoint` in `fleet.yaml`,
+ *      an optional per-fleet escape hatch for the unusual case a fleet
+ *      genuinely needs a DIFFERENT platform than its scope's shared one, or
+ *      the scope variable has not been set yet. Lowest tier deliberately:
+ *      the common path is zero per-fleet configuration once the scope
+ *      variable exists.
+ *   5. **none** — `'not-configured'`, honest and non-fatal (Amendment A4);
+ *      see {@link callRunnerPlatform}.
+ *
+ * `FleetApplyDeps.runnerPlatformEndpoint`/`runnerPlatformFetch`/
+ * `observedRunnerPlatformEndpointScope` are all optional and injectable so
+ * tests never read `process.env` or touch the network — production leaves
+ * `runnerPlatformFetch` unset (real global `fetch`) and threads the other
+ * two through from a live resolution `commands/bootstrap-apply.ts` already
+ * performed once (see that file's own doc for the `observedActionsPins`
+ * precedent this mirrors).
  *
  * ## Teardown — deliberately unwired (Amendment I3/I5)
  *
@@ -111,7 +147,7 @@
 
 import type { RunnerOpsApplyOutcome } from './apply-runner-ops.js';
 
-/** No baked-in default — see this module's doc, "The endpoint is tailnet-only infrastructure." */
+/** No baked-in default — see this module's doc, "The endpoint is discoverable, never guessed." */
 export const RUNNER_PLATFORM_ENDPOINT_ENV_VAR = 'MACF_RUNNER_PLATFORM_ENDPOINT';
 
 /** The credential shape `POST /runners` accepts, verbatim per `GET /`'s live doc (field names are the contract's own JSON keys, snake_case, NOT this codebase's camelCase convention — deliberately unconverted so a diff against the live contract stays legible). */
@@ -148,19 +184,100 @@ export type RunnerPlatformResult =
   | { readonly status: 'unreachable'; readonly reason: string }
   | { readonly status: 'not-configured'; readonly reason: string };
 
-/**
- * `explicit ?? process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR]`, trailing
- * slashes stripped — NO further fallback (see this module's doc). Exported
- * so `apply-fleet.ts` and tests share ONE resolution rule rather than two
- * independently-written env reads that could drift.
- */
-export function resolveRunnerPlatformEndpoint(explicit: string | undefined): string | undefined {
-  const raw = explicit ?? process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+/** Empty-or-whitespace collapses to `undefined`; trailing slashes stripped so path-joining in {@link callRunnerPlatform} never double-slashes. Shared by every tier below so "unset" means the same thing regardless of WHICH tier supplied the raw candidate. */
+function normalizeEndpointValue(raw: string | undefined): string | undefined {
   if (raw === undefined || raw.trim().length === 0) return undefined;
   return raw.replace(/\/+$/, '');
 }
 
-/** Injectable seam — production (`apply-fleet.ts`) leaves `fetchImpl` unset (real global `fetch`) and resolves `endpoint` via {@link resolveRunnerPlatformEndpoint}; tests always inject both, so the suite never touches the network or `process.env`. */
+/**
+ * `explicit ?? process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR]`, normalized —
+ * the ORIGINAL two-tier (flag/deps-override, then env) resolution this
+ * module shipped with. Still exported and still used internally by
+ * {@link resolveRunnerPlatformEndpointWithProvenance} (its top two tiers are
+ * exactly this function's own logic) — kept as its own named export because
+ * it is the simplest correct answer for a caller that only needs a VALUE,
+ * never needs to report WHICH tier supplied it, and has no scope/manifest
+ * candidate to offer (there is no other current caller of this narrower
+ * form; {@link resolveRunnerPlatformEndpointWithProvenance} is what
+ * `apply-fleet.ts`/`observer.ts` actually call as of groundnuty/macf#1211).
+ */
+export function resolveRunnerPlatformEndpoint(explicit: string | undefined): string | undefined {
+  return normalizeEndpointValue(explicit) ?? normalizeEndpointValue(process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR]);
+}
+
+/**
+ * Which precedence tier actually supplied the resolved value — groundnuty/
+ * macf#1211's "plan names which source supplied it" requirement. `'flag'`
+ * and `'env'` are reported distinctly even though they resolve through the
+ * SAME `resolveRunnerPlatformEndpoint` call internally (see
+ * {@link resolveRunnerPlatformEndpointWithProvenance}) — an operator reading
+ * a plan/apply log line needs to know WHICH of the two to go change, not
+ * just that "an override" won.
+ */
+export type RunnerPlatformEndpointSource = 'flag' | 'env' | 'scope' | 'manifest' | 'none';
+
+/** The resolved value (if any) paired with the tier that supplied it — never a secret shape (see this module's doc); safe to print verbatim in plan/apply output. */
+export interface RunnerPlatformEndpointResolution {
+  readonly value: string | undefined;
+  readonly source: RunnerPlatformEndpointSource;
+}
+
+/**
+ * The full groundnuty/macf#1211 precedence chain — flag/deps-override, then
+ * `MACF_RUNNER_PLATFORM_ENDPOINT` (env), then the fleet's registry-scope
+ * shared Actions variable, then `transport.runner_platform_endpoint` in
+ * `fleet.yaml`, then `'none'`. PURE — every candidate is already resolved by
+ * the caller (an async scope-variable read, `process.env`, the parsed
+ * manifest) and handed in as a plain string; this function does no I/O
+ * itself, matching `plan.ts::computePlan`'s own "pure, no I/O" discipline so
+ * both `observer.ts` (plan-time) and `apply-fleet.ts` (apply-time) can share
+ * ONE precedence rule without either duplicating it or forcing the other to
+ * mock a network call it doesn't need.
+ */
+export function resolveRunnerPlatformEndpointWithProvenance(candidates: {
+  readonly explicit: string | undefined;
+  readonly manifestValue: string | undefined;
+  readonly scopeValue: string | undefined;
+}): RunnerPlatformEndpointResolution {
+  const flag = normalizeEndpointValue(candidates.explicit);
+  if (flag !== undefined) return { value: flag, source: 'flag' };
+  const env = normalizeEndpointValue(process.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR]);
+  if (env !== undefined) return { value: env, source: 'env' };
+  const scope = normalizeEndpointValue(candidates.scopeValue);
+  if (scope !== undefined) return { value: scope, source: 'scope' };
+  const manifest = normalizeEndpointValue(candidates.manifestValue);
+  if (manifest !== undefined) return { value: manifest, source: 'manifest' };
+  return { value: undefined, source: 'none' };
+}
+
+const RUNNER_PLATFORM_ENDPOINT_SOURCE_LABEL: Readonly<Record<Exclude<RunnerPlatformEndpointSource, 'none'>, string>> = {
+  flag: 'an explicit override supplied for this run',
+  env: `the ${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} environment variable`,
+  scope: "the scope's shared fleet variable (an org/account Actions variable — not a secret)",
+  manifest: 'transport.runner_platform_endpoint in fleet.yaml',
+};
+
+/**
+ * Human-readable rendering of a {@link RunnerPlatformEndpointResolution} —
+ * shared by `apply-fleet.ts`'s log line and `plan.ts`'s plan item so the two
+ * surfaces never describe the same fact in two different sentences. The
+ * resolved VALUE (a tailnet URL) is printed verbatim, never redacted — the
+ * operator's own ruling on groundnuty/macf#1211 is that this is a variable,
+ * not a secret; reachability is the access control, not obscurity.
+ */
+export function describeRunnerPlatformEndpointResolution(resolution: RunnerPlatformEndpointResolution): string {
+  if (resolution.source === 'none') {
+    return (
+      'not resolved — none of an explicit override, the ' +
+      `${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} environment variable, the scope's shared fleet variable, or ` +
+      'transport.runner_platform_endpoint in fleet.yaml is set'
+    );
+  }
+  return `resolved via ${RUNNER_PLATFORM_ENDPOINT_SOURCE_LABEL[resolution.source]}: ${resolution.value ?? ''}`;
+}
+
+/** Injectable seam — production (`apply-fleet.ts`) leaves `fetchImpl` unset (real global `fetch`) and resolves `endpoint` via {@link resolveRunnerPlatformEndpointWithProvenance}'s `.value`; tests always inject both, so the suite never touches the network or `process.env`. */
 export interface RunnerPlatformDeps {
   readonly endpoint: string | undefined;
   readonly fetchImpl?: typeof fetch;

@@ -105,6 +105,10 @@ function classifyPlanItemKind(kind: PlanItemKind): Classification {
   switch (kind) {
     case 'labels':
     case 'runner_warm':
+    // groundnuty/macf#1211 — no live-observable "is the endpoint correctly
+    // pointed" signal to compare against, same reasoning `runner_warm`
+    // already established; see `plan.ts::runnerPlatformItem`'s doc.
+    case 'runner_platform':
       return 'write-always';
     case 'app':
     case 'repo':
@@ -134,6 +138,7 @@ const ALL_KINDS: readonly PlanItemKind[] = [
   'ca',
   'routing',
   'runner_warm',
+  'runner_platform',
   'agent',
   'control_repo',
   'agent_repo_archived',
@@ -155,13 +160,13 @@ describe('PlanItemKind coverage — every kind is classified exactly once (groun
     for (const kind of ALL_KINDS) {
       expect(['write-always', 'checkable']).toContain(classifyPlanItemKind(kind));
     }
-    // 18 kinds as of groundnuty/macf#926 (2 write-always + 16 checkable) —
+    // 19 kinds as of groundnuty/macf#1211 (3 write-always + 16 checkable) —
     // pins the count so a kind added to ALL_KINDS-but-not-the-switch (or
     // vice versa) is caught here even though both are hand-maintained lists
     // (the switch is compile-checked against the TYPE; this asserts the
     // array is compile-checked against the SWITCH's own domain by literally
     // exercising every member).
-    expect(ALL_KINDS).toHaveLength(18);
+    expect(ALL_KINDS).toHaveLength(19);
   });
 });
 
@@ -197,7 +202,7 @@ describe('write-always kinds NEVER reach noop, under ANY fixture (groundnuty/mac
     // quiet — otherwise "labels didn't go quiet either" would be
     // unsurprising rather than decisive.
     for (const kind of ALL_KINDS) {
-      if (kind === 'labels' || kind === 'runner_warm') continue;
+      if (kind === 'labels' || kind === 'runner_warm' || kind === 'runner_platform') continue;
       expect(isQuiet(plan, kind)).toBe(true);
     }
     const items = itemsOf(plan.items, 'labels');
@@ -227,6 +232,37 @@ describe('write-always kinds NEVER reach noop, under ANY fixture (groundnuty/mac
     };
     const quietPlan = computePlan(m, observed);
     expect(itemsOf(quietPlan.items, 'runner_warm').map((i) => i.verb)).toEqual(['write-always']);
+  });
+
+  // groundnuty/macf#1211 — same shape as `runner_warm` immediately above:
+  // proves the IMPOSSIBILITY of `runner_platform` reaching `noop`, both
+  // under the emptiest fixture AND under a fixture that drives every OTHER
+  // checkable kind quiet AND supplies a genuinely-resolved endpoint (the
+  // strongest case: even a fully-resolved value never earns 'noop', because
+  // there is nothing live to compare it against).
+  it('runner_platform: verb is write-always under the emptiest fixture AND under the all-else-quiet fixture, resolved or not', () => {
+    const emptyPlan = computePlan(manifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } }), EMPTY);
+    expect(itemsOf(emptyPlan.items, 'runner_platform').map((i) => i.verb)).toEqual(['write-always']);
+
+    const m = manifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const observed: ObservedState = {
+      lock: { schema_version: 1, fleet: FLEET, agents: [{ role: 'runner-ops', app_id: 'a', install_id: 'i' }] },
+      agents: {
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' } },
+      },
+      caRegistry: 'present',
+      caRepos: { [REPO]: 'present' },
+      routingClientRepos: { [REPO]: 'present' },
+      routingTrustedActors: `${FLEET}-code-agent[bot]`,
+      routingRunnerRegistered: 'present',
+      controlRepoPresence: 'present',
+      controlRepoArchived: false,
+      vaultRouterApp: { status: 'confirmed', present: true },
+      vaultTsOauth: { status: 'confirmed', present: false },
+      runnerPlatformEndpoint: { value: 'http://runner-platform.example.ts.net:8088', source: 'scope' },
+    };
+    const quietPlan = computePlan(m, observed);
+    expect(itemsOf(quietPlan.items, 'runner_platform').map((i) => i.verb)).toEqual(['write-always']);
   });
 });
 
@@ -464,9 +500,9 @@ describe('this check itself never silently passes an unclassified kind (groundnu
    * switch flips this assertion to fail — the set literal below is what
    * makes that a hard failure rather than a silently-widened exemption.
    */
-  it('the write-always set is EXACTLY {labels, runner_warm} — no more, no fewer', () => {
+  it('the write-always set is EXACTLY {labels, runner_warm, runner_platform} — no more, no fewer', () => {
     const writeAlwaysKinds = ALL_KINDS.filter((k) => classifyPlanItemKind(k) === 'write-always');
-    expect(new Set(writeAlwaysKinds)).toEqual(new Set<PlanItemKind>(['labels', 'runner_warm']));
+    expect(new Set(writeAlwaysKinds)).toEqual(new Set<PlanItemKind>(['labels', 'runner_warm', 'runner_platform']));
   });
 
   it('mutual exclusivity: no kind is classified write-always AND ALSO carries a COVERAGE_CASES row — the two describe blocks above must partition ALL_KINDS, not overlap', () => {

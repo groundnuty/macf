@@ -2985,6 +2985,113 @@ agents:
         expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('not-configured');
         expect(result.controlRepoSync.status).toBe('pushed'); // non-fatal — the whole run still completed
       });
+
+      describe('endpoint resolution precedence (groundnuty/macf#1211)', () => {
+        it('scope tier (observedRunnerPlatformEndpointScope) is honored when flag/env are absent, and provenance is logged', async () => {
+          const manifestPath = manifestPathIn();
+          const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+          const logs: string[] = [];
+          let capturedUrl: string | undefined;
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+            trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+            runnerTokenPollOptions: { timeoutMs: 0 },
+            log: (l) => logs.push(l),
+            // flag/env deliberately unset — this is the scope-only case.
+            observedRunnerPlatformEndpointScope: 'http://scope-runner-platform:8088',
+            runnerPlatformFetch: (async (url: string | URL) => {
+              capturedUrl = String(url);
+              return new Response(JSON.stringify({ ok: true }), { status: 200 });
+            }) as typeof fetch,
+          };
+          expect(process.env['MACF_RUNNER_PLATFORM_ENDPOINT']).toBeUndefined();
+
+          const result = await applyFleet(manifest, manifestPath, null, deps);
+
+          expect(capturedUrl).toBe('http://scope-runner-platform:8088/runners');
+          expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('ok');
+          const provenanceLine = logs.find((l) => l.includes('Runner platform endpoint:'));
+          expect(provenanceLine).toMatch(/scope/i);
+          expect(provenanceLine).toContain('http://scope-runner-platform:8088');
+        });
+
+        it('manifest tier (transport.runner_platform_endpoint) is honored when flag/env/scope are ALL absent — the last resort before none', async () => {
+          const manifestPath = manifestPathIn();
+          const base = manifestWith([CODE_AGENT]);
+          const manifest: FleetManifest = {
+            ...base,
+            transport: { ...base.transport, runner_platform_endpoint: 'http://manifest-runner-platform:8088' },
+            routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
+          };
+          const logs: string[] = [];
+          let capturedUrl: string | undefined;
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+            trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+            runnerTokenPollOptions: { timeoutMs: 0 },
+            log: (l) => logs.push(l),
+            // flag/env/scope deliberately unset.
+            runnerPlatformFetch: (async (url: string | URL) => {
+              capturedUrl = String(url);
+              return new Response(JSON.stringify({ ok: true }), { status: 200 });
+            }) as typeof fetch,
+          };
+          expect(process.env['MACF_RUNNER_PLATFORM_ENDPOINT']).toBeUndefined();
+
+          const result = await applyFleet(manifest, manifestPath, null, deps);
+
+          expect(capturedUrl).toBe('http://manifest-runner-platform:8088/runners');
+          expect(result.runnerProvision['groundnuty/demo-code']?.status).toBe('ok');
+          const provenanceLine = logs.find((l) => l.includes('Runner platform endpoint:'));
+          expect(provenanceLine).toContain('transport.runner_platform_endpoint');
+        });
+
+        it('DECISIVE: flag (deps.runnerPlatformEndpoint) wins over BOTH scope and manifest when all three are supplied — most-explicit-wins', async () => {
+          const manifestPath = manifestPathIn();
+          const base = manifestWith([CODE_AGENT]);
+          const manifest: FleetManifest = {
+            ...base,
+            transport: { ...base.transport, runner_platform_endpoint: 'http://manifest-runner-platform:8088' },
+            routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
+          };
+          let capturedUrl: string | undefined;
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+            trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+            runnerTokenPollOptions: { timeoutMs: 0 },
+            runnerPlatformEndpoint: 'http://flag-runner-platform:8088',
+            observedRunnerPlatformEndpointScope: 'http://scope-runner-platform:8088',
+            runnerPlatformFetch: (async (url: string | URL) => {
+              capturedUrl = String(url);
+              return new Response(JSON.stringify({ ok: true }), { status: 200 });
+            }) as typeof fetch,
+          };
+
+          await applyFleet(manifest, manifestPath, null, deps);
+
+          expect(capturedUrl).toBe('http://flag-runner-platform:8088/runners');
+        });
+
+        it("the resolved endpoint is never masked in apply's own log line — it is a variable, not a secret", async () => {
+          const manifestPath = manifestPathIn();
+          const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+          const logs: string[] = [];
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+            trustDeps: trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }),
+            runnerTokenPollOptions: { timeoutMs: 0 },
+            log: (l) => logs.push(l),
+            observedRunnerPlatformEndpointScope: 'http://orzech-dev-agents-monitoring.tail491af.ts.net:8088',
+            runnerPlatformFetch: (async () => new Response(JSON.stringify({ ok: true }), { status: 200 })) as typeof fetch,
+          };
+
+          await applyFleet(manifest, manifestPath, null, deps);
+
+          const joined = logs.join('\n');
+          expect(joined).toContain('http://orzech-dev-agents-monitoring.tail491af.ts.net:8088');
+          expect(joined).not.toMatch(/\*{3,}|REDACTED|\[hidden\]/i);
+        });
+      });
     });
 
     it('CA + routing legs are skipped for an agent whose repo-ensure FAILED this run — nothing is written to a repo that does not exist', async () => {

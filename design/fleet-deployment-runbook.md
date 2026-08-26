@@ -52,6 +52,7 @@ run `apply`, or the run refuses (by design, not by omission):
 | **Tailscale OAuth client ID + secret** | Only ever lives in the fleet's vault, written by hand or via a future vault-write path — **no `apply` flag accepts it directly today** | No vault has ever held it and GitHub Actions secrets are **write-only** — once it's on a repo, nothing (not even the operator) can read it back out. It cannot be *recovered*, only *supplied*, every time. |
 | **A GitHub Actions runner-registration token** | `--runner-token <token>` or `MACF_BOOTSTRAP_RUNNER_TOKEN` | It's a one-hour-lived, per-request token from `POST /orgs/<org>/actions/runners/registration-token` — nothing durable to store. Mint one right before you run `apply`. |
 | **The Tailscale OAuth pair** | `--ts-oauth-client-id <id>` + `--ts-oauth-secret <secret>`, or `MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID` / `MACF_BOOTSTRAP_TS_OAUTH_SECRET` | **Supply both or neither.** Required whenever `transport.tailscale_oauth_required: true` — routing cannot function without it. On a **fresh organisation there is nothing to inherit**: no vault holds it, and GitHub Actions secrets are write-only, so a value already set on a sibling repo cannot be read back. A flag/env value wins over one restored from a vault. |
+| **The runner-platform endpoint** (only if `routing.runner.runs_on: self-hosted`) | `MACF_RUNNER_PLATFORM_ENDPOINT` (env, per-run override) → the **scope's shared Actions variable** (the normal case, see below) → `transport.runner_platform_endpoint` in `fleet.yaml` (narrow per-fleet override) → unconfigured (non-fatal — see §6.5) | **A VARIABLE, not a secret** — a tailnet address; reachability is the access control, not obscurity. **Supply it once per scope, not once per fleet:** `gh variable set MACF_RUNNER_PLATFORM_ENDPOINT --org <org> --visibility all --body http://<host>:<port>` (or `--repo`/user-profile scope for a non-org fleet) makes every fleet on that scope — including ones that don't exist yet — inherit it for free. `plan` names which of the four sources actually supplied it before you approve `apply` (groundnuty/macf#1211). |
 
 **`age_recipients: []` is not "no key" — it is the literal instruction "no key
 exists yet, mint one."** Since Amendment C, the tool refuses that outright
@@ -299,6 +300,7 @@ silently-dropped typo.
 | `transport.tailscale_oauth_required` | optional | `false` | declares that this fleet's router needs `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`; when `true` and the vault doesn't hold them, `apply` refuses **before gate 1** rather than spend a click on a fleet that can't route (§7.4) |
 | `transport.router_app_scope` | optional | `'shared'` | `'shared'` (one router App per **owner scope**, reused across every fleet on that account) vs `'per-fleet'` (a dedicated router App for this fleet alone) — see §6.5, §7.3 |
 | `transport.router_app_origin_fleet` | optional | omitted | provenance-only: names which fleet's vault this fleet's copy of a shared router credential came from. Purely a marker — declaring it changes no behavior; see §7.3 |
+| `transport.runner_platform_endpoint` | optional | omitted | the LOWEST-precedence, narrowest tier of the runner-platform endpoint resolution — an escape hatch for a fleet that genuinely needs a different runner-provisioning platform than its scope's shared one, not the intended common path. A VARIABLE, never a secret — safe to commit to `fleet.yaml`. See §1 + §6.5 (groundnuty/macf#1211) |
 | `defaults.role_template` | required | — | the GitHub template repo new agent repos are cloned from |
 | `defaults.app_manifest` | required | — | **accepted by the schema but UNCONSUMED anywhere downstream today** (verified: zero non-schema, non-fixture references in source). Every real fleet uses the literal `dr-019` by convention; the DR-019 permission set is hardcoded in `app-manifest.ts` regardless of what this field says. Write `dr-019`; nothing currently reads it. |
 | `agents[]` | required, `.min(1)` | — | see §6.3 |
@@ -365,12 +367,15 @@ does not satisfy the other (§7.1's "silent cost" made concrete):**
    **only after** `apply` confirms a usable runner exists (register-before-
    route, DR-043 Amendment H.1) — gated by `--runner-token`
    (§7's flag reference) deciding whether `apply` even *attempts* detection.
-2. **The runner-provisioning contract** (`MACF_RUNNER_PLATFORM_ENDPOINT`,
-   DR-043 Amendment I) — a separate, non-fatal call `apply` makes to
+2. **The runner-provisioning contract** (its endpoint resolved per §1's
+   flag/env → scope-variable → manifest → none chain, DR-043 Amendment I,
+   groundnuty/macf#1211) — a separate, non-fatal call `apply` makes to
    actually create/update a runner pod for this repo, independent of the
-   token above. If this env var is unset, the call reports
-   `'not-configured'` and `apply` continues; nothing about that is fatal, but
-   it also means nothing provisioned a runner for you.
+   token above. If NOTHING in that chain resolves, `plan` says so before you
+   approve `apply`, and the call itself reports `'not-configured'`; nothing
+   about that is fatal, but it also means nothing provisioned a runner for
+   you via this path — a runner registered by other means still satisfies
+   mechanism 1 above.
 
 **The router App** (role `router`, never declared in `agents[]`) is a
 minimal, read-only-permissioned App (`actions_variables: read`,
@@ -388,7 +393,7 @@ the same scope.
 | `MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID` | `bootstrap apply` | Fallback for `--ts-oauth-client-id`. CLI flag wins on conflict. |
 | `MACF_BOOTSTRAP_TS_OAUTH_SECRET` | `bootstrap apply` | Fallback for `--ts-oauth-secret`. CLI flag wins on conflict. |
 | `MACF_BOOTSTRAP_VAULT_VERSION` (`=1`) | `bootstrap apply`, `vault-write.ts` | Changes an existing `secrets/vault.age` from fail-loud-on-clobber to version-aside-and-write (a timestamped sibling file, never an in-place overwrite). Default: fail loud. |
-| `MACF_RUNNER_PLATFORM_ENDPOINT` | `apply-fleet.ts`'s runner-provisioning call (Amendment I) | The `groundnuty/runner-platform` tailnet HTTP endpoint. Deliberately **not** a manifest field or a CLI flag — it's operator infrastructure (which cluster this operator runs), not fleet state, and has **no baked-in default** (unlike `api.github.com`) since it names one operator's private tailnet address. Unset → every provision call reports `'not-configured'`, non-fatally. |
+| `MACF_RUNNER_PLATFORM_ENDPOINT` | `apply-fleet.ts`'s runner-provisioning call, `macf bootstrap plan` (Amendment I, groundnuty/macf#1211) | The `groundnuty/runner-platform` tailnet HTTP endpoint — the TOP (env) tier of a four-tier resolution: this env var → the fleet's `owner.registry` scope's shared Actions variable of the SAME name (the normal case — see §1) → `transport.runner_platform_endpoint` in `fleet.yaml` → unconfigured. Has **no baked-in default** (unlike `api.github.com`) since it names one operator's private tailnet address — every tier can be absent; nothing is ever guessed. Nothing resolved → every provision call reports `'not-configured'`, non-fatally, and `plan` names the gap before you approve `apply`. |
 | `MACF_RECOVERY_DIR` | `vault-write.ts` | Overrides where per-agent recovery artifacts (Amendment B — the durable-before-gate-2 credential copy) are written. Default derives from `XDG_CONFIG_HOME`/home dir. |
 | `MACF_I_UNDERSTAND_THIS_DELETES_REPOSITORIES` (`=1`) | `fleet destroy` | One of three required acknowledgments for the terminal teardown rung (§9). Deliberately not a flag alone — friction is the design intent. |
 

@@ -93,6 +93,12 @@ import { ROUTER_APP_ROLE, deriveRouterAppHandle } from './apply-router-app.js';
 import type { RegistryRepoScopeNotice, RegistryScopeConflict } from './registry-scope-preflight.js';
 import { checkRegistryRepoScopeNotice, checkRegistryScopePreflight } from './registry-scope-preflight.js';
 import { validateInstallRepositoryScope } from './install-scope.js';
+// groundnuty/macf#1211 — `runner-platform.ts` has no import of THIS module
+// (`plan.js`) at all, so this is acyclic at runtime; `describeRunnerPlatformEndpointResolution`
+// is the ONE shared renderer `apply-fleet.ts`'s log line and this module's
+// `runnerPlatformItem` both call, so the two surfaces never describe the
+// same resolved value in two independently-drifting sentences.
+import { describeRunnerPlatformEndpointResolution, type RunnerPlatformEndpointResolution } from './runner-platform.js';
 
 // --- Observed state (the reconcile input; populated by an observer, consumed as data) ---
 
@@ -287,6 +293,33 @@ export interface ObservedState {
    */
   readonly routingRunnerDetail?: string;
   /**
+   * groundnuty/macf#1211 — the RAW registry-scope `MACF_RUNNER_PLATFORM_ENDPOINT`
+   * variable value (before precedence is applied against env/manifest),
+   * `undefined` when this run never attempted the read (a hosted-runner
+   * fleet, or `routing.runner` undeclared — see `observer.ts::githubRegistryObserver`'s
+   * gate). Exists as its OWN field, separate from {@link runnerPlatformEndpoint}
+   * below, so `commands/bootstrap-apply.ts` can thread the RAW scope value
+   * into `apply-fleet.ts`'s own resolution (`FleetApplyDeps.
+   * observedRunnerPlatformEndpointScope`) without `apply`'s precedence
+   * order being polluted by a value plan-time already resolved through a
+   * DIFFERENT tier (e.g. env) — see that field's own doc for why conflating
+   * the two would misreport provenance in `apply`'s log line.
+   */
+  readonly runnerPlatformScopeVariable?: string;
+  /**
+   * groundnuty/macf#1211 — the FULLY-RESOLVED runner-provisioning-contract
+   * endpoint (flag/env/scope/manifest precedence already applied), ready to
+   * render directly in {@link runnerPlatformItem}'s plan-item reason.
+   * `undefined` under the SAME gate {@link runnerPlatformScopeVariable} uses
+   * (never attempted this run) — `computePlan`'s call site treats an
+   * `undefined` here as `{ value: undefined, source: 'none' }`, the same
+   * honest "nothing resolved" state a live read that found nothing would
+   * also produce, so a caller that never populates this field (every
+   * pre-#1211 `ObservedState` test fixture) keeps compiling and reads as
+   * "not configured" — never a false "resolved."
+   */
+  readonly runnerPlatformEndpoint?: RunnerPlatformEndpointResolution;
+  /**
    * DR-043 Amendment G (groundnuty/macf#867) — the `<fleet>-control` repo's
    * own presence. REQUIRED, not optional: an unobservable read must render
    * as honest-`unknown` (Amendment A4), never silently default to "not
@@ -358,7 +391,9 @@ export type PlanItemKind =
   /** groundnuty/macf#1105 — the routing App (`apply-router-app.ts`), a fleet-level identity like `'runner_ops'`, but UNCONDITIONAL: `apply-fleet.ts` reaches its ceremony for every fleet (`routerAppScope === 'shared'` is the schema default). See {@link routerAppItem}'s doc. */
   | 'router_app'
   /** groundnuty/macf#1109 — the operator-supplied Tailscale OAuth pair (`TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`), a fleet-level, read-only-vault credential like `'router_app'`'s own App id/key, but never minted — see {@link tsOauthItem}'s doc. */
-  | 'ts_oauth';
+  | 'ts_oauth'
+  /** groundnuty/macf#1211 — the runner-provisioning contract's endpoint resolution (flag/env/scope/manifest precedence), a fleet-level notice like `'runner_warm'` but with its OWN gate (`runs_on === 'self-hosted'`, not merely `routing.runner` declared — see {@link runnerPlatformItem}'s doc). */
+  | 'runner_platform';
 /**
  * `'write-always'` (groundnuty/macf#926) — a distinct verb from `'create'`
  * for the two kinds (`labelsItem`/`runnerWarmItem`) that have NO live
@@ -767,6 +802,16 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // reflect exactly what `apply` does this run, so this is 'implemented'
       // unconditionally, same shape as 'router_app' immediately above.
       return 'implemented';
+    case 'runner_platform':
+      // groundnuty/macf#1211 — `apply-fleet.ts` resolves this endpoint and
+      // passes it straight into the SAME `provisionRunner` call
+      // `'runner_warm'` above already established as 'implemented' — this
+      // item's ONLY verb is `write-always` (see `runnerPlatformItem`'s doc:
+      // there is no live-observable "is the endpoint correctly pointed"
+      // signal to compare a resolved value against, only whether a value
+      // resolved this run), same "declared/resolved, not yet independently
+      // verifiable, but genuinely acted on" shape `'runner_warm'` uses.
+      return 'implemented';
   }
 }
 
@@ -791,6 +836,7 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'actions_pin':
     case 'router_app':
     case 'ts_oauth':
+    case 'runner_platform':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
@@ -802,7 +848,9 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
       // macf#1072 / DR-043 Amendment L extended, 'router_app' in
       // groundnuty/macf#1105, 'ts_oauth' in groundnuty/macf#1109, 'runner_warm'
       // ALSO joined this group in groundnuty/macf#943 — see
-      // `planItemApplyCoverage`'s 'runner_warm' arm for the wiring).
+      // `planItemApplyCoverage`'s 'runner_warm' arm for the wiring;
+      // 'runner_platform' joined it at birth in groundnuty/macf#1211, same
+      // reasoning `'runner_warm'` established).
       // Kept exhaustive so a NEW `PlanItemKind` added
       // later is a compile error here, not a silent "apply covers
       // everything" false-negative.
@@ -1564,6 +1612,51 @@ function runnerWarmItem(fleetName: string, desiredWarm: number): PlanItem {
 }
 
 /**
+ * groundnuty/macf#1211 — surfaces the runner-provisioning contract's
+ * endpoint resolution BEFORE the operator approves `apply`, naming which of
+ * flag/env/scope/manifest supplied it (or that none did). One item per
+ * fleet, same "fleet-level, not per-agent" shape {@link runnerWarmItem}
+ * already uses — but a NARROWER gate than that function's own: only emitted
+ * when `runs_on === 'self-hosted'` (the SAME condition
+ * `apply-fleet.ts` uses to decide whether to attempt the provisioning call
+ * at all — see the call site below), not merely `routing.runner` declared.
+ * A `runs_on: ubuntu-latest` fleet has nothing to resolve; reporting on it
+ * would name a fact apply never even looks at.
+ *
+ * **WARN, never REFUSE, when nothing resolves — the operator's own ruling on
+ * this issue's thread.** A declared `routing.runner` with an ALREADY
+ * confirmed-registered runner (groundnuty/macf#1195) needs no platform call
+ * at all — the register-before-route gate (`routingItem` above) is
+ * satisfied independently of this contract. A plan-time refusal here would
+ * therefore punish a fleet whose runner came from anywhere else, contradicting
+ * the very design #1195 established. `verb: 'write-always'` mirrors
+ * {@link runnerWarmItem}'s own reasoning: there is no live-observable "is the
+ * endpoint correctly pointed" signal to compare against, only whether a
+ * value resolved this run.
+ *
+ * `resolution` defaults to `{ value: undefined, source: 'none' }` at the
+ * call site when `observed.runnerPlatformEndpoint` is `undefined` — the
+ * SAME state a live read that found nothing would also produce, so a plan
+ * run against a fleet the observer never checked (every pre-#1211
+ * `ObservedState` test fixture) reads as honest "not configured," never a
+ * false "resolved."
+ */
+function runnerPlatformItem(fleetName: string, resolution: RunnerPlatformEndpointResolution): PlanItem {
+  const skipNote =
+    resolution.source === 'none'
+      ? ' Runner provisioning will be SKIPPED (non-fatal) when apply runs — no runner will be created via the ' +
+        'provisioning contract this way; a runner already registered by other means still satisfies routing.'
+      : '';
+  return {
+    kind: 'runner_platform',
+    target: `routing:${fleetName}:runner:platform_endpoint`,
+    verb: 'write-always',
+    reason: `Runner platform endpoint: ${describeRunnerPlatformEndpointResolution(resolution)}.${skipNote}`,
+    confirm_required: false,
+  };
+}
+
+/**
  * DR-043 Amendment G (groundnuty/macf#867) — surfaces an ARCHIVED control
  * repo as a DELIBERATE fleet state, not as drift. Fires ONLY when the repo
  * is observed present AND archived — the ordinary (non-archived, absent, or
@@ -1961,6 +2054,16 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
       ),
     );
     items.push(runnerWarmItem(fleetName, manifest.routing.runner.warm));
+    // groundnuty/macf#1211 — narrower gate than the two items above:
+    // `runs_on === 'self-hosted'` (not merely `routing.runner` declared),
+    // matching `apply-fleet.ts`'s own condition for attempting the
+    // provisioning call. `observed.runnerPlatformEndpoint` defaults to
+    // `{ value: undefined, source: 'none' }` when the observer never
+    // resolved it this run (see that field's own doc) — honest "not
+    // configured," never a false "resolved."
+    if (manifest.routing.runner.runs_on === 'self-hosted') {
+      items.push(runnerPlatformItem(fleetName, observed.runnerPlatformEndpoint ?? { value: undefined, source: 'none' }));
+    }
   }
 
   // DR-043 §D6 — only emitted when `versions:` is DECLARED (an omitted
