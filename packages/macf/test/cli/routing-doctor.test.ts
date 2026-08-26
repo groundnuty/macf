@@ -53,6 +53,7 @@ import {
   type CallerPinResult,
   type RoutingArtifactCheck,
   type RoutingConfig,
+  type RoutingConfigReadResult,
   type RoutingDoctorDeps,
   type RoutingProbeFn,
 } from '../../src/cli/commands/routing-doctor.js';
@@ -344,8 +345,9 @@ function deps(over: Partial<RoutingDoctorDeps> = {}): RoutingDoctorDeps {
     // macf#1191 defaults: every visible repo's OWN table names the same two
     // agents as HEALTHY_CONFIG, and both labels exist in every repo — so the
     // baseline fixture is clean for the artifact sweep too, unless a test
-    // deliberately diverges one repo's config or labels.
-    readRoutingConfigForRepo: async () => HEALTHY_CONFIG,
+    // deliberately diverges one repo's config or labels. macf#1193: the
+    // discriminated `present` result, not the bare config.
+    readRoutingConfigForRepo: async () => ({ status: 'present', config: HEALTHY_CONFIG }),
     listRepoLabels: async () => ['code-agent', 'science-agent'],
     listRegistry: async () => [
       { name: 'CODE_AGENT', info: info('100.64.0.1', 4100, 'inst-code') },
@@ -1057,7 +1059,7 @@ describe('gatherRoutingArtifacts — the per-repo sweep (macf#1191)', () => {
   it('a repo with no routing table at all contributes NOTHING (not "missing", not "not-visible")', async () => {
     const results = await gatherRoutingArtifacts(
       ['groundnuty/macf-actions'],
-      async () => null, // no .github/agent-config.json
+      async () => ({ status: 'absent' }), // no .github/agent-config.json
       [LABEL_CHECK(async () => [])],
     );
     expect(results).toEqual([]);
@@ -1066,7 +1068,7 @@ describe('gatherRoutingArtifacts — the per-repo sweep (macf#1191)', () => {
   it('a repo with an EMPTY agents map contributes nothing (nothing implied, nothing to check)', async () => {
     const results = await gatherRoutingArtifacts(
       ['groundnuty/some-repo'],
-      async () => ({ agents: {} }),
+      async () => ({ status: 'present', config: { agents: {} } }),
       [LABEL_CHECK(async () => [])],
     );
     expect(results).toEqual([]);
@@ -1076,10 +1078,13 @@ describe('gatherRoutingArtifacts — the per-repo sweep (macf#1191)', () => {
     const results = await gatherRoutingArtifacts(
       ['groundnuty/macf', 'groundnuty/macf-science-agent'],
       async (repo) => ({
-        agents:
-          repo === 'groundnuty/macf'
-            ? { 'code-agent': {} }
-            : { 'devops-agent': {} }, // the literal macf#1191 shape
+        status: 'present',
+        config: {
+          agents:
+            repo === 'groundnuty/macf'
+              ? { 'code-agent': {} }
+              : { 'devops-agent': {} }, // the literal macf#1191 shape
+        },
       }),
       [
         LABEL_CHECK(async (repo) =>
@@ -1098,6 +1103,45 @@ describe('gatherRoutingArtifacts — the per-repo sweep (macf#1191)', () => {
       },
     ]);
   });
+
+  // --- macf#1193: a repo's OWN config can be present-but-broken, or fail to
+  // read for a transient reason — both DISTINCT from the absent case above.
+
+  it('a MALFORMED config → one repo-level defect entry, DISTINCT from a per-agent "missing" row', async () => {
+    const results = await gatherRoutingArtifacts(
+      ['groundnuty/macf-science-agent'],
+      async () => ({ status: 'malformed', reason: 'content is not valid JSON' }),
+      [LABEL_CHECK(async () => ['code-agent'])],
+    );
+    expect(results).toEqual([
+      expect.objectContaining({
+        repo: 'groundnuty/macf-science-agent',
+        artifact: 'routing-config',
+        status: 'config-malformed',
+      }),
+    ]);
+    // DECISIVE: not the per-agent "missing" literal a broken assignment-label
+    // check would use — a consumer switching on `status` must be able to tell
+    // "the config itself is broken" apart from "an agent has no label."
+    expect(results[0]?.status).not.toBe('missing');
+  });
+
+  it('a READ-FAILED config → one repo-level inconclusive entry, DISTINCT from malformed AND from absent', async () => {
+    const results = await gatherRoutingArtifacts(
+      ['groundnuty/macf-science-agent'],
+      async () => ({ status: 'read-failed', reason: 'network, rate-limit, or a transient gh api failure' }),
+      [LABEL_CHECK(async () => ['code-agent'])],
+    );
+    expect(results).toEqual([
+      expect.objectContaining({
+        repo: 'groundnuty/macf-science-agent',
+        artifact: 'routing-config',
+        status: 'config-read-failed',
+      }),
+    ]);
+    expect(results[0]?.status).not.toBe('config-malformed');
+    expect(results[0]?.status).not.toBe('not-visible');
+  });
 });
 
 describe('gatherRoutingDoctor — routing-table artifact checks (macf#1191)', () => {
@@ -1113,8 +1157,8 @@ describe('gatherRoutingDoctor — routing-table artifact checks (macf#1191)', ()
         // literal macf#1191 incident shape) — but its labels don't include it.
         readRoutingConfigForRepo: async (repo) =>
           repo === 'groundnuty/macf-science-agent'
-            ? { agents: { 'devops-agent': { app_name: 'macf-devops-agent' } } }
-            : HEALTHY_CONFIG,
+            ? { status: 'present', config: { agents: { 'devops-agent': { app_name: 'macf-devops-agent' } } } }
+            : { status: 'present', config: HEALTHY_CONFIG },
         listRepoLabels: async (repo) =>
           repo === 'groundnuty/macf-science-agent' ? ['code-agent', 'science-agent'] : ['code-agent', 'science-agent'],
       }),
@@ -1175,7 +1219,7 @@ describe('gatherRoutingDoctor — routing-table artifact checks (macf#1191)', ()
     const report = await gatherRoutingDoctor(
       deps({
         listRepos: async () => ['groundnuty/macf', 'groundnuty/macf-science-agent'],
-        readRoutingConfigForRepo: async () => HEALTHY_CONFIG,
+        readRoutingConfigForRepo: async () => ({ status: 'present', config: HEALTHY_CONFIG }),
         // groundnuty/macf-science-agent's config read succeeded (we KNOW it
         // names code-agent + science-agent) but the label-list read for it
         // failed — indistinguishable from "private", "gone", or "misnamed".
@@ -1212,6 +1256,106 @@ describe('gatherRoutingDoctor — routing-table artifact checks (macf#1191)', ()
   });
 });
 
+describe('gatherRoutingDoctor — malformed vs absent vs read-failed routing-config (macf#1193)', () => {
+  // Refines macf#1191's `if (!config) continue`, which collapsed THREE
+  // distinct read outcomes into the SAME "not a routing participant" free
+  // pass. Each case below is asserted on independent coordinates — entry
+  // count/shape for that repo, `routing_artifacts_ok`, `fully_covered`, and
+  // the verdict — so no two cases can pass the same assertions (a check
+  // that only asserted "not skipped" would pass for BOTH malformed and
+  // read-failed; a check that only asserted "ok stays true" would pass for
+  // BOTH absent and read-failed).
+
+  it('MALFORMED: a confirmed defect on a confirmed participant — FAILS the verdict, but coverage is unaffected (the read succeeded)', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        listRepos: async () => ['groundnuty/macf', 'groundnuty/macf-science-agent'],
+        readRoutingConfigForRepo: async (repo) =>
+          repo === 'groundnuty/macf-science-agent'
+            ? { status: 'malformed', reason: 'content is not valid JSON' }
+            : { status: 'present', config: HEALTHY_CONFIG },
+      }),
+    );
+    const configRows = report.artifactChecks.filter((r) => r.artifact === 'routing-config');
+    expect(configRows).toEqual([
+      expect.objectContaining({ repo: 'groundnuty/macf-science-agent', status: 'config-malformed' }),
+    ]);
+    expect(routingVerdict(report)).toBe('DEGRADED');
+
+    const json = routingDoctorToJson(report) as {
+      summary: {
+        routing_artifacts_ok: boolean;
+        routing_artifacts_fully_covered: boolean;
+        routing_artifacts_config_malformed: number;
+      };
+    };
+    expect(json.summary.routing_artifacts_ok).toBe(false);
+    // DECISIVE vs read-failed below: the config READ SUCCEEDED (it's broken,
+    // not unreadable) — fully_covered stays true.
+    expect(json.summary.routing_artifacts_fully_covered).toBe(true);
+    expect(json.summary.routing_artifacts_config_malformed).toBe(1);
+  });
+
+  it('ABSENT: a confident 404 on an already-visible repo — silently skipped, verdict AND coverage unaffected', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        listRepos: async () => ['groundnuty/macf', 'groundnuty/macf-science-agent'],
+        readRoutingConfigForRepo: async (repo) =>
+          repo === 'groundnuty/macf-science-agent'
+            ? { status: 'absent' }
+            : { status: 'present', config: HEALTHY_CONFIG },
+      }),
+    );
+    // DECISIVE vs the other two: NO entry at all for the absent repo.
+    expect(report.artifactChecks.some((r) => r.repo === 'groundnuty/macf-science-agent')).toBe(false);
+    // The sweep genuinely ran (not vacuously clean) — the OTHER repo still
+    // produced ordinary present entries.
+    expect(report.artifactChecks.some((r) => r.repo === 'groundnuty/macf' && r.status === 'present')).toBe(true);
+    expect(routingVerdict(report)).toBe('HEALTHY');
+
+    const json = routingDoctorToJson(report) as {
+      summary: { routing_artifacts_ok: boolean; routing_artifacts_fully_covered: boolean };
+    };
+    expect(json.summary.routing_artifacts_ok).toBe(true);
+    expect(json.summary.routing_artifacts_fully_covered).toBe(true);
+  });
+
+  it('READ-FAILED: network/rate-limit — inconclusive, lowers coverage but does NOT fail the verdict, and is NEVER silently skipped', async () => {
+    const report = await gatherRoutingDoctor(
+      deps({
+        listRepos: async () => ['groundnuty/macf', 'groundnuty/macf-science-agent'],
+        readRoutingConfigForRepo: async (repo) =>
+          repo === 'groundnuty/macf-science-agent'
+            ? { status: 'read-failed', reason: 'network, rate-limit, or a transient gh api failure' }
+            : { status: 'present', config: HEALTHY_CONFIG },
+      }),
+    );
+    const configRows = report.artifactChecks.filter((r) => r.artifact === 'routing-config');
+    expect(configRows).toEqual([
+      expect.objectContaining({ repo: 'groundnuty/macf-science-agent', status: 'config-read-failed' }),
+    ]);
+    expect(routingVerdict(report)).toBe('HEALTHY');
+
+    const json = routingDoctorToJson(report) as {
+      summary: {
+        routing_artifacts_ok: boolean;
+        routing_artifacts_fully_covered: boolean;
+        routing_artifacts_config_read_failed: number;
+      };
+    };
+    expect(json.summary.routing_artifacts_ok).toBe(true);
+    // DECISIVE vs malformed above: NOT a confirmed defect, so ok stays true —
+    // but fully_covered goes false, unlike the malformed case.
+    expect(json.summary.routing_artifacts_fully_covered).toBe(false);
+    expect(json.summary.routing_artifacts_config_read_failed).toBe(1);
+  });
+
+  it('the negative half: a well-formed config on the SAME fixture produces NO config-level row', async () => {
+    const report = await gatherRoutingDoctor(deps());
+    expect(report.artifactChecks.some((r) => r.artifact === 'routing-config')).toBe(false);
+  });
+});
+
 describe('rendering — routing-table artifact table (macf#1191)', () => {
   it('buildArtifactRows only renders non-present rows (present rows are silent, matching collectWarnings shape)', () => {
     const rows = buildArtifactRows([
@@ -1234,6 +1378,32 @@ describe('rendering — routing-table artifact table (macf#1191)', () => {
     expect(rows).toHaveLength(2); // the 'present' row is silent
     expect(rows.some((r) => r.includes('✗ missing'))).toBe(true);
     expect(rows.some((r) => r.includes('? not-visible'))).toBe(true);
+  });
+
+  it('buildArtifactRows renders config-malformed/config-read-failed with THEIR OWN glyphs, distinct from missing/not-visible (macf#1193)', () => {
+    const rows = buildArtifactRows([
+      {
+        repo: 'groundnuty/macf-science-agent',
+        agent: '(config)',
+        artifact: 'routing-config',
+        status: 'config-malformed',
+        reason: 'malformed',
+      },
+      {
+        repo: 'groundnuty/macf-devops-toolkit',
+        agent: '(config)',
+        artifact: 'routing-config',
+        status: 'config-read-failed',
+        reason: 'read-failed',
+      },
+    ]);
+    expect(rows).toHaveLength(2);
+    expect(rows.some((r) => r.includes('✗ malformed'))).toBe(true);
+    expect(rows.some((r) => r.includes('? unreadable'))).toBe(true);
+    // DECISIVE: must not render as the per-agent literals — a reader must be
+    // able to tell "the config is broken" apart from "an agent has no label."
+    expect(rows.some((r) => r.includes('✗ missing'))).toBe(false);
+    expect(rows.some((r) => r.includes('? not-visible'))).toBe(false);
   });
 
   it('formatArtifactTable renders a header even with zero non-present rows', () => {
@@ -1497,7 +1667,7 @@ describe('routingDoctorToJson — DR-031 watchdog contract', () => {
       disclaimer: string;
     };
     expect(json.schema_version).toBe(ROUTING_DOCTOR_JSON_SCHEMA_VERSION);
-    expect(json.schema_version).toBe(4); // pinned literal: fails loud on an accidental bump (macf#1191)
+    expect(json.schema_version).toBe(5); // pinned literal: fails loud on an accidental bump (macf#1193)
     expect(json.project).toBe('macf');
     expect(json.summary.verdict).toBe('DEGRADED');
     expect(json.summary.pins_consistent).toBe(false);
