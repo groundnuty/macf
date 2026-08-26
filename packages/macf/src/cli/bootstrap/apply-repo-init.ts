@@ -37,7 +37,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RegistryConfig, TokenSource } from '@groundnuty/macf-core';
@@ -176,6 +176,57 @@ export function resolveActionsPinReconcile(
     return { actionsVersion: declaredActions, force: observedPin !== declaredActions };
   }
   return { actionsVersion: observedPin ?? DEFAULT_ACTIONS_VERSION, force: false };
+}
+
+/**
+ * Resolve a legitimate `TokenSource` for a REUSED/`resumed-install` agent's
+ * OWN repo-init label-creation mint (groundnuty/macf#1240 — the residual
+ * `#1221` split out so that issue did not stretch a fourth time). Mirrors
+ * `apply-fleet.ts::resolveRunnerOpsVaultPem`'s SINGLE-ROLE resolution
+ * (`resolveKeyPath(role, priorAppId)`, wired only under `--vault`/
+ * `--identity-key`) — deliberately NOT
+ * `apply-control-repo-init.ts::resolveControlRepoLabelTokenSource`'s
+ * cross-role scan. That scan is legitimate ONLY for the control repo,
+ * because every declared agent's App install already reaches it
+ * (`apply-control-repo-init.ts`'s own doc, "Why the control repo, not
+ * peer-repo access"). An ordinary agent's App install is scoped to its OWN
+ * home repo ONLY (`apply-agent.ts::installReposForIdentity` — a sibling
+ * role's install never covers this repo), so the ONLY legitimate source for
+ * THIS repo's label-creation mint is `role`'s own credential — borrowing
+ * another role's would be attempting a mint that role's App has no access
+ * to.
+ *
+ * `resolveKeyPath === undefined` (no `--vault`/`--identity-key` this run) or
+ * a resolved path this role's key doesn't cover both return `undefined` — an
+ * honest "nothing to try," not a failure. `applyRepoInitForAgent` then
+ * degrades exactly as it did before this fix: `opts.tokenSource` stays
+ * omitted, labels are reported `'skipped'`, and that is NOT scored as a hard
+ * failure — see `labelsAreGoodEnough`'s doc, which this function's callers
+ * rely on unchanged.
+ *
+ * **A returned `keyPath` that doesn't exist on disk is not a credential** —
+ * same contract as `resolveControlRepoLabelTokenSource`'s own doc: the real
+ * `resolveKeyPath` implementation `writeFileSync`s the decrypted PEM and
+ * only THEN returns its path, so a genuine resolution always has a readable
+ * file waiting there. A path to nothing (e.g. a test double that fakes a
+ * non-empty return without ever writing content) must not be treated as
+ * usable — it would reach `generateToken()` and attempt a REAL `gh token
+ * generate` subprocess against a key that was never actually written.
+ * `exists` defaults to the real `existsSync`; tests inject a fake so this
+ * stays a plain, synchronous, no-network check.
+ */
+export function resolveAgentRepoInitTokenSource(
+  role: string,
+  priorAppId: string,
+  priorInstallId: string,
+  resolveKeyPath: ((role: string, priorAppId: string) => string | undefined) | undefined,
+  exists: (path: string) => boolean = existsSync,
+): TokenSource | undefined {
+  if (resolveKeyPath === undefined) return undefined;
+  const keyPath = resolveKeyPath(role, priorAppId);
+  if (keyPath === undefined) return undefined;
+  if (!exists(keyPath)) return undefined;
+  return { appId: priorAppId, installId: priorInstallId, keyPath };
 }
 
 export interface RepoInitStepDeps {
