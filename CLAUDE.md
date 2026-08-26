@@ -59,7 +59,49 @@ test/             ← unit tests (default vitest run) + test/e2e/ (excluded)
 
 ## Implementation Status
 
-> **Current state (updated 2026-07-04).** **Live on npm through v0.2.53** (7 releases
+> **⭐ Current state (updated 2026-08-26) — DR-043 DECLARATIVE FLEET PROVISIONING is the active workstream.**
+> `macf bootstrap plan|apply` builds a fleet from a `fleet.yaml`: control repo → agent repos →
+> two GitHub consent gates per agent → CA → routing → vault → `fleet.lock`. **Three fleets live in
+> the `macf-experiment` org**: `macf-experiment` (4 agents, routing works), `macf-fresh` (5),
+> `macf-trial` (2 — **defined on GitHub but NOT functional**).
+>
+> **📖 READ `design/fleet-deployment-runbook.md` BEFORE reasoning about manifests, flags, or what
+> "provisioned" requires.** It is the single operator-facing reference: happy path §1–4, full
+> option reference §5–11, nine non-happy paths, every manifest field's default-when-omitted.
+> A design record (DR-043) explains *why*; the runbook says *what to do*.
+> `design/operator-docs-staleness-audit.md` carries a verdict per operator-facing doc.
+>
+> **🔴 The finding that most changes how to read past results: every end-to-end fleet test has run
+> against a WARM organisation.** A second fleet in an org that already hosts one silently inherits
+> a shared router App, a shared runner-ops App, and TS_OAUTH values sitting on sibling repos as
+> **write-only Actions secrets**. `macf-fresh` and `macf-trial` both looked like clean-room tests;
+> neither was. **A genuinely cold org has never been exercised.** For every resource a fleet
+> consumes, classify it: *created by the tool* / *supplied by the operator* / **silently inherited
+> from the scope** — the third is invisible by construction and is the bug class.
+>
+> **"Provisioned" is not "working."** A fleet needs six things: Apps+identities in the vault ·
+> control repo · CA+routing-client certs · **routing secrets** · **self-hosted runners** ·
+> **deployed workspaces**. `macf-trial` has three. `apply` succeeding at its own job says nothing
+> about the last three.
+>
+> **The consent gate (rebuilt 2026-08-25 from live operator testing, 14 defects):** announces
+> before opening a browser page · **one message source for terminal and browser** (#1174 — no
+> browser-only prose) · names **only the missing repo** on a resumed gate (#1164) · copyable repo
+> block (#1176) · **really waits**, polling installation *contents* for 10 min (#1180) ·
+> page-side check-again / cancel-this-identity (#1182). Every one of those defects came from
+> live use; none was reachable from a passing test suite.
+>
+> **Operator credentials the tool cannot mint:** the age key (Amendment C — `age_recipients: []`
+> is a REFUSAL, never a default) · the Tailscale OAuth pair (`--ts-oauth-client-id` /
+> `--ts-oauth-secret`, #1188) · a runner-registration token (`--runner-token`, one-hour TTL).
+> **`--vault` and `--identity-key` are together-or-neither** — a fresh fleet takes neither.
+>
+> **Open on this arc:** #1161 (the shared router's key has no per-fleet home — science's
+> Amendment N) · #1183 (deploy blames the operator for a same-run provision) · #1184 ("provisioned"
+> over-claims when routing or runners are absent) · #1189 (devops: a reusable runner-token path,
+> and what runner infrastructure already exists).
+>
+> **Prior (2026-07-04).** **Live on npm through v0.2.53** (7 releases
 > this stretch: v0.2.48→v0.2.53). **DR-040 (canonical/agent-evolution reconciliation on
 > fleet upgrade) RATIFIED + implemented**: Q1 hook-scripts→plugin (tamper-resistant
 > `${CLAUDE_PLUGIN_ROOT}/scripts/`, #749), Q2 config-dirty-guard narrowed off `.claude/**`
