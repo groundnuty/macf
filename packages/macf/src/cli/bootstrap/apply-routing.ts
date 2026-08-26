@@ -87,6 +87,13 @@
  * ever opens. `publishTrustedActorsGated` itself is UNCHANGED and remains
  * the actual enforcement point — this is a pre-flight, not a relocation.
  *
+ * **groundnuty/macf#1209 — the pre-flight no longer ABORTS.** It still fires
+ * at the same place, still WARNS with the same message, but the caller now
+ * falls through into `applyFleet` regardless — see
+ * {@link checkRunnerTokenPreflight}'s own doc for why "refuse before gate 1"
+ * and "abort the whole run" turned out to be two different things this
+ * function had conflated.
+ *
  * **A poll's duration must be justified by an expectation, not a constant
  * (macf#972).** Originally: a repo CREATED THIS RUN cannot yet have a runner
  * registered to it by anything `apply` itself does — nothing provisioned one
@@ -376,27 +383,38 @@ export interface RunnerTokenPreflightFailure {
 }
 
 /**
- * The macf#932 PRE-FLIGHT — refuses BEFORE consent gate 1 ever opens, not
- * merely before the LATE gate deep inside `applyFleet`'s routing block
- * ({@link publishTrustedActorsGated}, UNCHANGED — still the actual
- * enforcement point; see this module's doc, "token = POLICY, detection =
- * TIMING," macf#929). Prior to macf#932, `publishTrustedActorsGated`'s
- * refusal was the ONLY place this policy fired — reachable only after
- * `applyFleet` had already driven confirm-before-create, consent gate 1,
- * consent gate 2, and repo-init for EVERY agent in the fleet. On a 3-agent
- * fleet that is six browser clicks (two consent gates × 3 agents) spent
- * before an error knowable from the manifest alone — and gate 1 is not free
- * to retry (it creates a globally-unique-named GitHub App; a run that dies
- * past it can leave a squatted name needing `macf fleet delete-apps` to
- * clear).
+ * The macf#932 PRE-FLIGHT — WARNS as early as possible, before consent gate 1
+ * ever opens, not merely before the LATE gate deep inside `applyFleet`'s
+ * routing block ({@link publishTrustedActorsGated}, UNCHANGED — still the
+ * ONLY enforcement point; see this module's doc, "token = POLICY, detection =
+ * TIMING," macf#929).
+ *
+ * **groundnuty/macf#1209 — this function's CALLER no longer aborts the run
+ * on a non-`undefined` result.** Through #1209, `runBootstrapApply` treated
+ * this as a run-aborting refusal — reachable only after `applyFleet` had
+ * already driven confirm-before-create, consent gate 1, consent gate 2, and
+ * repo-init for EVERY agent in the fleet (on a 3-agent fleet, six browser
+ * clicks spent before an error knowable from the manifest alone), which
+ * sounds like a saving — except aborting BEFORE `applyFleet` runs at all
+ * ALSO discards every leg that never depended on this token: routing
+ * secrets, CA legs, repo-init, vault composition. Observed live on
+ * `macf-trial`: a router credential had just been merged into the vault
+ * (an operator-authorised one-time decrypt) and never got published, because
+ * this refusal aborted the entire run before ever reaching it. A preflight
+ * that aborts the run must gate only what actually depends on the missing
+ * input — this one now WARNS (`console.error`, this function's message
+ * VERBATIM) and lets `runBootstrapApply` fall through to `applyFleet`
+ * regardless.
  *
  * `commands/bootstrap-apply.ts::runBootstrapApply` calls this immediately
- * after parsing the manifest — mirrors `plan.ts::checkVaultFlagsComplete`'s
- * own "fires BEFORE [manifest parsing / anything else]" placement for its
- * sibling XOR refusal (same shape: refuse on an unsatisfiable configuration
- * before costing the operator anything) — before ANY observe/plan-render, so
- * an operator who forgot the flag never spends a browser click and never
- * even costs a read-only `gh` call.
+ * after parsing the manifest, before ANY observe/plan-render, so an operator
+ * who forgot the flag sees the warning before spending a browser click — the
+ * ONLY thing #1209 changes is that the run no longer stops there. (Contrast
+ * `plan.ts::checkVaultFlagsComplete`'s sibling XOR refusal, which DOES still
+ * abort the whole run — that check gates an unsatisfiable ARGUMENT PAIR with
+ * no narrower dependent subset to defer to, not a declared-but-absent
+ * optional credential with its own already-scoped late gate. See
+ * `runBootstrapApply`'s #1209 comment for the full audit.)
  *
  * **This ADDS an early check; it does not move the authority.** Detection
  * (is a runner actually usable?) still happens exactly where macf#927/#929
