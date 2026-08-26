@@ -201,6 +201,11 @@ describe('computeBootstrapStatus — VERSION column disclosure (groundnuty/macf#
     expect(row?.[8]).toBe('v3.4.1');
   });
 
+  it('the closure condition, verbatim: "an operator reading status can tell whether a version was observed or recalled" — a header note names BOTH columns\' provenance, not just per-cell qualifiers a reader has to notice by absence', () => {
+    const text = formatBootstrapStatusText(view);
+    expect(text).toContain("PROVISIONING (VERSION is fleet.lock's last-recorded value, never a live read this run; ACTIONS-PIN is read live from the repo every run)");
+  });
+
   it('the view + JSON carry the provenance discriminator structurally, not just in rendered prose', () => {
     const sci = view.agents.find((a) => a.role === 'science-agent');
     expect(sci?.deployedVersionSource).toBe('lock');
@@ -322,8 +327,12 @@ describe('computeBootstrapStatus — VERSION column disclosure (groundnuty/macf#
     const extra = view2.extraLockAgents.find((e) => e.role === 'long-offline-agent');
     expect(extra?.deployedVersionSource).toBe('lock');
     const text = formatBootstrapStatusText(view2);
-    expect(text).toContain('deployed_version=0.1.0 (from lock)');
-    expect(text).not.toContain('deployed_version=0.1.0)');
+    // Exact-line match, not a substring `toContain` — a substring check
+    // here could pass against EITHER the labeled OR the bare (regressed)
+    // render (assert-the-wrong-path.md trigger 1). Pinning the whole line
+    // fails if the `(from lock)` qualifier is ever dropped.
+    const line = text.split('\n').find((l) => l.includes('long-offline-agent'));
+    expect(line).toBe('  - role=long-offline-agent app_id=777 install_id=888 deployed_version=0.1.0 (from lock)');
   });
 });
 

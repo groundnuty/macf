@@ -362,6 +362,20 @@ export function computeBootstrapStatus(
 const RUNTIME_UNOBSERVABLE_NOTE =
   'unknown — not observable from this plane (run `macf fleet status` from a deployed agent workspace for live health)';
 
+/**
+ * groundnuty/macf#1202's closure condition, verbatim: "an operator reading
+ * `status` can tell whether a version was observed or recalled." The
+ * `(from lock)` qualifier on individual VERSION cells satisfies that at the
+ * per-cell level, but a reader still has to notice a qualifier's PRESENCE
+ * on one column and ABSENCE on its neighbor and already know what that
+ * means. Naming both columns' provenance ONCE, next to the table itself
+ * (same placement `RUNTIME_UNOBSERVABLE_NOTE` already uses for the RUNTIME
+ * table's own liveness caveat), makes the distinction legible without
+ * requiring that inference.
+ */
+const PROVISIONING_VERSION_PROVENANCE_NOTE =
+  "VERSION is fleet.lock's last-recorded value, never a live read this run; ACTIONS-PIN is read live from the repo every run";
+
 /** Exported for tests — column-width assertions (groundnuty/macf#1030) need the same header list `formatTable` renders against. */
 export const PROVISIONING_HEADERS = [
   'ROLE',
@@ -605,7 +619,7 @@ export function formatBootstrapStatusText(view: FleetStatusView): string {
     formatControlRepoLine(view.controlRepo),
     formatRunnerOpsLine(view.runnerOps),
     '',
-    'PROVISIONING',
+    `PROVISIONING (${PROVISIONING_VERSION_PROVENANCE_NOTE})`,
     formatTable(PROVISIONING_HEADERS, provisioningRows),
     ...formatFootnotes(provisioningFootnotes),
     '',
