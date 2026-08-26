@@ -26,6 +26,7 @@ import { runBootstrapControlRepoInit } from './commands/bootstrap-control-repo-i
 import { runManifestScaffold } from './commands/bootstrap-manifest-scaffold.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRoutingE2e } from './commands/routing-e2e.js';
+import { runRunnerAudit } from './commands/runner-audit.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { runRestartSelfCommand } from './commands/restart-self.js';
 import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './commands/certs.js';
@@ -942,6 +943,22 @@ routing
       expectedPin: opts.expectedPin,
       manifestPath: opts.manifest,
     });
+    process.exitCode = code;
+  });
+
+routing
+  .command('runner-audit')
+  .description(
+    'After-the-fact check: reads ACTUAL runner names/groups from each --repo\'s recent agent-router.yml ' +
+    'run history (never the requested labels) and reports any non-exempt job that landed on a metered ' +
+    'GitHub-hosted runner. pick-runner is the one named exemption (hosted by design). Exit code is ' +
+    'non-zero on ANY violation OR unreadable run/job history -- an honest-unknown never reads as clean.',
+  )
+  .option('--repo <owner/repo>', 'Repo to audit (repeatable)', (value, previous: string[]) => [...previous, value], [] as string[])
+  .option('--json', 'Emit the structured per-repo report as JSON', false)
+  .option('--max-runs <n>', 'How many of the most recent runs to check per repo (default 20)', (v) => Number(v))
+  .action(async (opts) => {
+    const code = await runRunnerAudit({ repos: opts.repo, json: opts.json, maxRuns: opts.maxRuns });
     process.exitCode = code;
   });
 
