@@ -115,6 +115,8 @@ import type { ObservedState, Presence } from './plan.js';
 import type { AgentRegistryObservation } from './observer.js';
 import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
+import type { AdvertiseHostDriftEntry } from './advertise-host-drift.js';
+import { detectAdvertiseHostDriftForAgent, formatAdvertiseHostDriftLines } from './advertise-host-drift.js';
 
 // --- View types (pure data — no verbs, no diff) ---
 
@@ -157,6 +159,14 @@ export interface AgentStatusView {
   /** `undefined` = vault not consulted this run (no `--vault`/`--identity-key`) — never a claim about vault contents. */
   readonly vault?: VaultAgentObservation;
   readonly registry: AgentRegistryObservation;
+  /**
+   * Declared `network.advertise_host` vs. this agent's OWN registered
+   * `host` (groundnuty/macf#1203) — derived from `registry` above, never a
+   * second read (see `advertise-host-drift.ts`'s module doc). `'unknown'`
+   * when `registry` itself has no live host to compare (never registered,
+   * or the read failed) — the honest-unknown floor, not a false mismatch.
+   */
+  readonly advertiseHostDrift: AdvertiseHostDriftEntry;
 }
 
 /** An agent `fleet.lock` remembers that `fleet.yaml` no longer declares — reported, never pruned (§D3). */
@@ -235,8 +245,10 @@ function buildAgentView(
   agent: FleetAgent,
   observed: ObservedState,
   registry: Readonly<Record<string, AgentRegistryObservation>>,
+  declaredAdvertiseHost: string,
 ): AgentStatusView {
   const obs = observed.agents[agent.role];
+  const agentRegistry = registry[agent.role] ?? { status: 'unknown' as const, reason: 'registry not queried this run' };
   return {
     role: agent.role,
     repo: agent.repo,
@@ -260,7 +272,8 @@ function buildAgentView(
     actionsPin: obs?.actionsPin,
     actionsPinSource: obs?.actionsPin !== undefined ? 'live' : undefined,
     vault: obs?.vault,
-    registry: registry[agent.role] ?? { status: 'unknown', reason: 'registry not queried this run' },
+    registry: agentRegistry,
+    advertiseHostDrift: detectAdvertiseHostDriftForAgent(agent.role, declaredAdvertiseHost, agentRegistry),
   };
 }
 
@@ -286,7 +299,9 @@ export function computeBootstrapStatus(
   const seg = toVariableSegment(fleetName);
   const caVarName = `${seg}_CA_CERT`;
 
-  const agents = manifest.agents.map((agent) => buildAgentView(fleetName, agent, observed, registry));
+  const agents = manifest.agents.map((agent) =>
+    buildAgentView(fleetName, agent, observed, registry, manifest.network.advertise_host),
+  );
 
   // §D3 no-prune, rendering flavor: an agent `fleet.lock` remembers that
   // `fleet.yaml` no longer declares is reported, never silently dropped.
@@ -635,8 +650,25 @@ export function formatBootstrapStatusText(view: FleetStatusView): string {
     '',
     'RUNTIME (registry-observed registration identity only — see header note; this plane cannot confirm liveness)',
     formatTable(RUNTIME_HEADERS, runtimeRows),
-    ...formatFootnotes(runtimeFootnotes),
   );
+
+  // groundnuty/macf#1203 — declared vs. registered advertise_host, its own
+  // section (same "cross-cutting fact beyond the per-column table" treatment
+  // formatRoutingBlock/formatVaultRecipientsLine already get above).
+  //
+  // Shares `runtimeFootnotes` with the RUNTIME table above (NOT its own
+  // registry) — an `advertiseHostDrift` entry's `'unknown'` reason is
+  // frequently the VERBATIM SAME `AgentRegistryObservation` reason RUNTIME
+  // just footnoted for that identical agent (both read off the identical
+  // registry read). Reusing the registry lets string-equality dedup collapse
+  // the two into ONE footnote instead of printing the same long reason text
+  // twice — see `advertise-host-drift.ts::formatAdvertiseHostDriftLines`'s
+  // doc. This is WHY the footnote LIST itself is printed once, below, AFTER
+  // this call has had a chance to register anything new — printing it
+  // earlier (immediately after the RUNTIME table, before this call runs)
+  // would silently drop any footnote this section is the FIRST to cite.
+  parts.push('', ...formatAdvertiseHostDriftLines(view.agents.map((a) => a.advertiseHostDrift), runtimeFootnotes));
+  parts.push(...formatFootnotes(runtimeFootnotes));
 
   if (view.extraLockAgents.length > 0) {
     parts.push('', 'EXTRA (recorded in fleet.lock, not declared in fleet.yaml — never pruned, §D3):');
@@ -653,15 +685,21 @@ export function formatBootstrapStatusText(view: FleetStatusView): string {
   return parts.join('\n');
 }
 
-// groundnuty/macf#1202 — bumped 1 → 2. `agents[].deployedVersion` is a
+// groundnuty/macf#1202 — bumped 1 -> 2. `agents[].deployedVersion` is a
 // SAME-NAME field gaining a source qualifier: pre-#1202, a consumer reading
 // a bare `deployedVersion` string had no structural way to tell it apart
-// from a genuine observation (`actionsPin` carried no such distinction
-// either). Post-#1202, `deployedVersionSource`/`actionsPinSource` +
-// `declared_versions` change what the SAME fields mean to a consumer that
-// was already parsing them — the same "a new fact feeding an existing
-// value is breaking" precedent this codebase already applies (see
-// `routing-doctor.ts`'s schema_version 3→4 / 4→5 history).
+// from a genuine observation. Post-#1202, `deployedVersionSource` /
+// `actionsPinSource` + `declared_versions` change what the SAME fields mean
+// to a consumer already parsing them — the "a new fact feeding an existing
+// value is breaking" precedent (`routing-doctor.ts` 3->4 / 4->5).
+//
+// groundnuty/macf#1203 — deliberately NOT bumped again. `advertiseHostDrift`
+// is a brand-new NAME that changes the meaning of no EXISTING field, and this
+// JSON has no aggregate `summary`/`verdict` for a new condition to silently
+// feed (which is exactly why `routing-doctor.ts`'s bumps WERE required). A
+// consumer sees one more key it did not ask about; nothing it already reads
+// changes shape or meaning. Two independent changes landed in one cycle: the
+// version is 2 because of #1202 alone.
 export const BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION = 2;
 
 /** Structured `--json` shape — carries the SAME facts the text render shows, never a summary of them. */

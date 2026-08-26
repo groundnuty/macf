@@ -8,7 +8,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runBootstrapPlan, type BootstrapPlanDeps } from '../../src/cli/commands/bootstrap.js';
+import { resolveDeps, runBootstrapPlan, type BootstrapPlanDeps } from '../../src/cli/commands/bootstrap.js';
 import type { ObservedState } from '../../src/cli/bootstrap/plan.js';
 
 const VALID_FLEET_YAML = `
@@ -266,22 +266,38 @@ describe('runBootstrapPlan', () => {
 
   // DR-043 Amendment D phase 3 — proves the `--vault`/`--identity-key` CLI
   // flags actually reach the REAL `vaultAwareObserver` → `readVault` chain
-  // (no injected `deps`, unlike every test above) rather than a fake this
-  // suite constructs. Points both flags at nonexistent paths — no `age`
+  // THROUGH `resolveDeps` (production wiring), not a fake this suite
+  // constructs by hand. Points both flags at nonexistent paths — no `age`
   // binary needed, no fake to get wrong — and asserts the resulting plan
   // carries an honest `[vault: unknown — ...]` fact, not a silently-vault-
   // free plan (which would mean the flags were plumbed nowhere) and not a
   // crash (which the observer's own degrade-to-unknown contract forbids).
-  it('--vault + --identity-key (no injected deps) reach the REAL vault-aware observer and surface an honest [vault: unknown] fact for a nonexistent vault', async () => {
+  //
+  // Calls `resolveDeps` DIRECTLY (exported only for this test) rather than
+  // rebuilding its vault branch inline — the discriminator that matters is
+  // "does breaking `resolveDeps`'s vault wiring fail this test," and only
+  // calling the real function preserves that; a hand-rebuilt `observe`
+  // would make this test pass even if `resolveDeps` itself were broken
+  // (`assert-the-wrong-path.md` Trigger 1 — circularity). ONLY
+  // `readAgentRegistry` is overridden on the result (groundnuty/macf#1203)
+  // — this test's assertions are entirely about the vault fact, never
+  // `advertise_host_drift`, and the REAL `readAgentRegistryInfo` makes its
+  // own live `gh api` calls per agent that this environment's network
+  // conditions can push past a 5s test timeout; faking just this one dep
+  // keeps the test fast and deterministic without weakening what it
+  // actually proves about `resolveDeps`'s vault branch.
+  it('--vault + --identity-key reach the REAL vault-aware observer THROUGH resolveDeps, surfacing an honest [vault: unknown] fact for a nonexistent vault', async () => {
     const { dir, file } = writeManifest(VALID_FLEET_YAML);
     dirs.push(dir);
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const code = await runBootstrapPlan({
-      file,
-      json: true,
-      vaultPath: join(dir, 'does-not-exist', 'vault.age'),
-      identityKeyPath: join(dir, 'does-not-exist', 'identity.txt'),
-    });
+    const vaultPath = join(dir, 'does-not-exist', 'vault.age');
+    const identityKeyPath = join(dir, 'does-not-exist', 'identity.txt');
+    const real = resolveDeps(file, vaultPath, identityKeyPath);
+    const deps: BootstrapPlanDeps = {
+      ...real,
+      readAgentRegistry: async () => ({ status: 'unknown', reason: 'not queried in this test' }),
+    };
+    const code = await runBootstrapPlan({ file, json: true, vaultPath, identityKeyPath }, deps);
     expect(code).toBe(0); // a vault-read failure degrades to unknown; it does NOT fail the plan
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
       plan: ReadonlyArray<{ kind: string; target: string; reason: string }>;
@@ -430,5 +446,128 @@ describe('runBootstrapPlan — operator interaction budget (groundnuty/macf#880)
     const textCode = await runBootstrapPlan({ file }, { observe: async () => observed });
     expect(textCode).toBe(0);
     expect(logSpy.mock.calls.flat().join('\n')).toContain('Operator interaction: none — no consent gates this run.');
+  });
+});
+
+describe('runBootstrapPlan — advertise-host drift (groundnuty/macf#1203)', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    logSpy?.mockRestore();
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  it('no readAgentRegistry injected (every pre-existing test\'s shape): reports unknown, never mismatch, and never throws', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const deps: BootstrapPlanDeps = { observe: async () => EMPTY_OBSERVED };
+    const code = await runBootstrapPlan({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      advertise_host_drift: ReadonlyArray<{ role: string; status: string; reason?: string }>;
+    };
+    expect(json.advertise_host_drift).toEqual([
+      {
+        role: 'code-agent',
+        declared_host: 'example.ts.net',
+        status: 'unknown',
+        registered_host: undefined,
+        reason: 'registry not queried this run',
+        unknown_kind: 'read-failed',
+      },
+    ]);
+  });
+
+  it('DECISIVE 1 — injected registry read diverging from declared advertise_host: reported as a mismatch, both --json and text', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    const deps: BootstrapPlanDeps = {
+      observe: async () => EMPTY_OBSERVED,
+      readAgentRegistry: async () => ({
+        status: 'confirmed',
+        presence: 'present',
+        info: { host: 'wrong-host.ts.net', port: 8443, type: 'permanent', instance_id: 'i1', started: '2026-08-10T00:00:00.000Z' },
+      }),
+    };
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const jsonCode = await runBootstrapPlan({ file, json: true }, deps);
+    expect(jsonCode).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      advertise_host_drift: ReadonlyArray<{ role: string; status: string; registered_host?: string }>;
+    };
+    expect(json.advertise_host_drift).toHaveLength(1);
+    expect(json.advertise_host_drift[0]?.status).toBe('mismatch');
+    expect(json.advertise_host_drift[0]?.registered_host).toBe('wrong-host.ts.net');
+
+    logSpy.mockRestore();
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const textCode = await runBootstrapPlan({ file }, deps);
+    expect(textCode).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('ADVERTISE-HOST');
+    expect(out).toContain('MISMATCH');
+    expect(out).not.toMatch(/\bmacf#\d+\b|\bDR-0\d{2}\b/);
+  });
+
+  it('DECISIVE 2 — injected registry read MATCHING declared advertise_host: not reported as a mismatch', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    const deps: BootstrapPlanDeps = {
+      observe: async () => EMPTY_OBSERVED,
+      readAgentRegistry: async () => ({
+        status: 'confirmed',
+        presence: 'present',
+        info: { host: 'example.ts.net', port: 8443, type: 'permanent', instance_id: 'i1', started: '2026-08-10T00:00:00.000Z' },
+      }),
+    };
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapPlan({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      advertise_host_drift: ReadonlyArray<{ status: string }>;
+    };
+    expect(json.advertise_host_drift[0]?.status).toBe('match');
+    expect(json.advertise_host_drift[0]?.status).not.toBe('mismatch');
+  });
+
+  it('never-registered (confirmed absent): reports unknown, never mismatch — the honest-unknown floor for a fresh, not-yet-deployed fleet', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    const deps: BootstrapPlanDeps = {
+      observe: async () => EMPTY_OBSERVED,
+      readAgentRegistry: async () => ({ status: 'confirmed', presence: 'absent' }),
+    };
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapPlan({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      advertise_host_drift: ReadonlyArray<{ status: string }>;
+    };
+    expect(json.advertise_host_drift[0]?.status).toBe('unknown');
+    expect(json.advertise_host_drift[0]?.status).not.toBe('mismatch');
+  });
+
+  it('this is a REPORT, not a plan item — the mismatch never appears among plan.items/summary (apply has no code path to converge it)', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    const deps: BootstrapPlanDeps = {
+      observe: async () => EMPTY_OBSERVED,
+      readAgentRegistry: async () => ({
+        status: 'confirmed',
+        presence: 'present',
+        info: { host: 'wrong-host.ts.net', port: 8443, type: 'permanent', instance_id: 'i1', started: '2026-08-10T00:00:00.000Z' },
+      }),
+    };
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const code = await runBootstrapPlan({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      plan: ReadonlyArray<{ kind: string }>;
+      unimplemented_by_apply: ReadonlyArray<{ kind: string }>;
+    };
+    expect(json.plan.some((i) => i.kind === 'advertise_host')).toBe(false);
+    expect(json.unimplemented_by_apply.some((i) => i.kind === 'advertise_host')).toBe(false);
   });
 });

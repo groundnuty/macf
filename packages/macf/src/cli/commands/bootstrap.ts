@@ -12,6 +12,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
+import type { RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
 import { parseFleetManifest } from '../bootstrap/fleet-manifest.js';
 import type { FleetObserverFn, FleetPlanFailure } from '../bootstrap/plan.js';
@@ -26,7 +27,9 @@ import {
   operatorInteractionBudget,
   operatorInteractionToJson,
 } from '../bootstrap/plan.js';
-import { githubRegistryObserver, vaultAwareObserver } from '../bootstrap/observer.js';
+import type { AgentRegistryObservation } from '../bootstrap/observer.js';
+import { githubRegistryObserver, readAgentRegistryInfo, vaultAwareObserver } from '../bootstrap/observer.js';
+import { advertiseHostDriftEntryToJson, detectAdvertiseHostDrift, formatAdvertiseHostDriftLines } from '../bootstrap/advertise-host-drift.js';
 
 export interface RunBootstrapPlanOptions {
   readonly file: string;
@@ -47,16 +50,38 @@ export interface RunBootstrapPlanOptions {
 /** Injectable seam so tests drive the command without touching `gh` / the filesystem lock read. */
 export interface BootstrapPlanDeps {
   readonly observe: FleetObserverFn;
+  /**
+   * groundnuty/macf#1203 — same signature as `observer.ts::readAgentRegistryInfo`
+   * (production wiring passes that function directly, mirroring
+   * `commands/bootstrap-status.ts::BootstrapStatusDeps`). OPTIONAL and
+   * deliberately so: every pre-existing test in `bootstrap.test.ts` builds a
+   * `BootstrapPlanDeps` literal without this field, and it must keep
+   * compiling + running fully offline. When omitted, `runBootstrapPlan`
+   * makes ZERO registry reads and every role's advertise-host comparison
+   * degrades to the honest-unknown "registry not queried this run" —
+   * `advertise-host-drift.ts::detectAdvertiseHostDrift`'s own fallback for a
+   * role missing from its registry map, never a network call.
+   */
+  readonly readAgentRegistry?: (registry: RegistryConfig, fleetName: string, role: string) => Promise<AgentRegistryObservation>;
 }
 
-function resolveDeps(manifestPath: string, vaultPath?: string, identityKeyPath?: string): BootstrapPlanDeps {
+/**
+ * Exported (only) for `bootstrap.test.ts`'s real-vault-observer test, which
+ * needs to exercise this function's ACTUAL wiring while overriding just the
+ * `readAgentRegistry` leg (groundnuty/macf#1203's per-agent `gh api` reads
+ * make that one test network-latency-sensitive; nothing else in this
+ * module's test suite calls this directly — every other test injects a
+ * full `BootstrapPlanDeps` and never reaches this function at all).
+ */
+export function resolveDeps(manifestPath: string, vaultPath?: string, identityKeyPath?: string): BootstrapPlanDeps {
   if (vaultPath !== undefined && identityKeyPath !== undefined) {
     return {
       observe: (manifest: FleetManifest) =>
         vaultAwareObserver(manifest, manifestPath, { vaultPath, identityPath: identityKeyPath }),
+      readAgentRegistry: readAgentRegistryInfo,
     };
   }
-  return { observe: (manifest: FleetManifest) => githubRegistryObserver(manifest, manifestPath) };
+  return { observe: (manifest: FleetManifest) => githubRegistryObserver(manifest, manifestPath), readAgentRegistry: readAgentRegistryInfo };
 }
 
 function renderFailure(failure: FleetPlanFailure, opts: RunBootstrapPlanOptions): number {
@@ -129,12 +154,45 @@ export async function runBootstrapPlan(
     // this number — only `apply`'s confirm-before-create guard can).
     const budget = operatorInteractionBudget(countAppsToCreate(plan.items));
 
+    // groundnuty/macf#1203 — declared `network.advertise_host` vs. each
+    // agent's OWN live registration, reported here as a section BESIDE
+    // `plan.items` rather than folded into them: `apply` has no code path
+    // that writes an agent's own registry entry (see
+    // `advertise-host-drift.ts`'s module doc), so modeling it as a
+    // create/update `PlanItem` would wrongly imply `apply` could converge
+    // it. Registry map built the SAME way `bootstrap status` already builds
+    // one (`commands/bootstrap-status.ts`) — one best-effort, never-throws
+    // read per declared agent.
+    const registry: Record<string, AgentRegistryObservation> = {};
+    if (resolved.readAgentRegistry !== undefined) {
+      for (const agent of manifest.agents) {
+        registry[agent.role] = await resolved.readAgentRegistry(manifest.owner.registry, manifest.metadata.name, agent.role);
+      }
+    }
+    const advertiseHostDrift = detectAdvertiseHostDrift(
+      manifest.network.advertise_host,
+      registry,
+      manifest.agents.map((a) => a.role),
+    );
+
     if (opts.json) {
-      console.log(JSON.stringify({ ...(fleetPlanToJson(plan) as Record<string, unknown>), operator_interaction: operatorInteractionToJson(budget) }, null, 2));
+      console.log(
+        JSON.stringify(
+          {
+            ...(fleetPlanToJson(plan) as Record<string, unknown>),
+            operator_interaction: operatorInteractionToJson(budget),
+            advertise_host_drift: advertiseHostDrift.map(advertiseHostDriftEntryToJson),
+          },
+          null,
+          2,
+        ),
+      );
     } else {
       console.log(formatPlanText(plan));
       console.log('');
       console.log(formatOperatorInteractionLine(budget));
+      console.log('');
+      console.log(formatAdvertiseHostDriftLines(advertiseHostDrift).join('\n'));
     }
     return 0;
   } catch (err) {
