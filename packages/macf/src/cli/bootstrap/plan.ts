@@ -1361,16 +1361,28 @@ function routingClientItem(repo: string, presence: Presence): PlanItem {
 }
 
 /**
- * macf#932 — an UNCONDITIONAL note (not a "you're missing it" detection):
- * `plan` takes no `--runner-token` flag of its own and never will (see this
- * note's call site's doc) — it cannot know whether the OPERATOR intends to
- * supply one directly to a future `apply` invocation without ever exporting
+ * macf#932 — a note (not a "you're missing it" detection): `plan` takes no
+ * `--runner-token` flag of its own and never will (see this note's call
+ * site's doc) — it cannot know whether the OPERATOR intends to supply one
+ * directly to a future `apply` invocation without ever exporting
  * {@link RUNNER_TOKEN_ENV_VAR}. Claiming "missing" here would be FALSE in
  * exactly that case. Naming the REQUIREMENT rather than guessing at its
  * satisfaction keeps this honest while still moving the fact "apply needs
- * this" earlier than `apply` itself shows it — see
+ * this to REGISTER a runner" earlier than `apply` itself shows it — see
  * `apply-routing.ts::checkRunnerTokenPreflight`'s doc for the actual
- * enforcement (which DOES know the resolved value, and DOES refuse).
+ * enforcement (which DOES know the resolved value, and DOES warn).
+ *
+ * **Conditional, not unconditional (corrected groundnuty/macf#1195).**
+ * Through #1195, `apply`'s missing-token gate refused every repo outright
+ * regardless of live runner state, so this note was true unconditionally —
+ * appended in BOTH {@link runnerClassReason} branches. That premise no
+ * longer holds: a runner ALREADY confirmed registered at plan time needs no
+ * token at all (`apply-routing.ts::publishTrustedActorsGated`'s no-token
+ * branch consults the SAME live check this function's `runnerRegistered`
+ * input comes from, and proceeds on `'present'`). Appending this note to
+ * the `'present'` branch would now assert a requirement that does not
+ * apply — see `runnerClassReason`'s doc for where it is (and is not)
+ * appended.
  */
 const RUNNER_TOKEN_PLAN_NOTE =
   ` \`macf bootstrap apply\` additionally requires ${RUNNER_TOKEN_FLAG} (or ${RUNNER_TOKEN_ENV_VAR}) before it will ` +
@@ -1382,16 +1394,16 @@ const RUNNER_TOKEN_PLAN_NOTE =
  * failure of our runner should be loud, and the lack of it being
  * provisioned at this stage should block everything else." A declared
  * `routing.runner` is a REQUIREMENT, not a preference — `apply` refuses to
- * fall back to a metered hosted runner. UNCONDITIONAL (appended in both
- * `runnerClassReason` branches, mirroring {@link RUNNER_TOKEN_PLAN_NOTE}'s
- * own unconditional design): even when a runner IS confirmed registered at
- * PLAN time, `apply` can still fail on it later (the runner going offline
- * between plan and apply, or {@link RUNNER_TOKEN_PLAN_NOTE}'s own missing-
- * token refusal) — so the requirement is named regardless of the currently-
- * observed registration state, not only in the "absent" branch. Additive —
- * appended alongside the existing sentences above it, never a rewrite of
- * them (see `apply-routing.ts::publishTrustedActorsGated`'s doc for the
- * actual enforcement this note describes).
+ * fall back to a metered hosted runner. UNCONDITIONAL (appended in BOTH
+ * `runnerClassReason` branches — unlike {@link RUNNER_TOKEN_PLAN_NOTE},
+ * which is now conditional post-groundnuty/macf#1195): even when a runner
+ * IS confirmed registered at PLAN time, `apply` can still fail on it later
+ * (the runner going offline between plan and apply) — so THIS requirement
+ * is named regardless of the currently-observed registration state, not
+ * only in the "absent" branch. Additive — appended alongside the existing
+ * sentences above it, never a rewrite of them (see
+ * `apply-routing.ts::publishTrustedActorsGated`'s doc for the actual
+ * enforcement this note describes).
  */
 const RUNNER_REQUIRED_FAILURE_PLAN_NOTE =
   ' A declared routing.runner is REQUIRED: if no usable runner is confirmed when `apply` runs, `apply` FAILS ' +
@@ -1413,13 +1425,17 @@ const RUNNER_REQUIRED_FAILURE_PLAN_NOTE =
  * rather than discovered only after apply silently skips the write. `detail`
  * (macf#934 — a runner WAS found but fails the capability check: offline,
  * missing a required label, or a permission-denied read) is likewise
- * appended verbatim when set, and macf#932 adds a further unconditional
- * suffix ({@link RUNNER_TOKEN_PLAN_NOTE}), followed by macf#993's own
- * unconditional suffix ({@link RUNNER_REQUIRED_FAILURE_PLAN_NOTE} — plan
- * states plainly, before approval, that `apply` will FAIL without a
- * confirmed runner). The original wording for the no-suffix branches is
- * preserved UNCHANGED (only the suffixes are new) so this stays a strict
- * extension — same "never rewrite" discipline as `handover`'s own addition.
+ * appended verbatim when set. macf#993's unconditional suffix
+ * ({@link RUNNER_REQUIRED_FAILURE_PLAN_NOTE} — plan states plainly, before
+ * approval, that `apply` will FAIL without a confirmed runner) appears in
+ * BOTH branches. macf#932's token-requirement suffix
+ * ({@link RUNNER_TOKEN_PLAN_NOTE}) appears ONLY in the non-present branch as
+ * of groundnuty/macf#1195 — a runner already confirmed present needs no
+ * token, so stating the requirement there would overclaim (see that
+ * constant's own doc). The original wording for the no-suffix branches is
+ * preserved UNCHANGED (only the suffixes are new/conditional) so this stays
+ * a strict extension — same "never rewrite" discipline as `handover`'s own
+ * addition.
  */
 function runnerClassReason(
   runnerRegistered: Presence | undefined,
@@ -1429,10 +1445,7 @@ function runnerClassReason(
 ): string {
   const repoLabel = representativeRepo ?? '(no agent repos declared)';
   if (runnerRegistered === 'present') {
-    return (
-      `Runner class: self-hosted (a runner is confirmed registered on "${repoLabel}").` +
-      `${RUNNER_TOKEN_PLAN_NOTE}${RUNNER_REQUIRED_FAILURE_PLAN_NOTE}`
-    );
+    return `Runner class: self-hosted (a runner is confirmed registered on "${repoLabel}").${RUNNER_REQUIRED_FAILURE_PLAN_NOTE}`;
   }
   const cause =
     runnerRegistered === 'absent'

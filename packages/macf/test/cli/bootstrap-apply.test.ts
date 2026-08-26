@@ -787,12 +787,15 @@ const SENTINEL_VAULT_PEM = '-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-VAULT-PEM-
 
 /**
  * macf#929 — `fakeMutateDeps`'s default `runnerToken`. `fakeTrustDeps`'s own
- * default already reports `checkRunnerUsableByRepo` as `'present'`, so this
- * sentinel exists ONLY to satisfy the new POLICY precondition
- * (`publishTrustedActorsGated` refuses outright with no token, independent of
- * live usability) — every pre-existing "routing var gets written" fixture in
- * this file keeps exercising the write path unchanged. Tests exercising the
- * no-token refusal itself override this to `undefined` explicitly.
+ * default already reports `checkRunnerUsableByRepo` as `'present'`, so a
+ * write would succeed with or without this sentinel post-groundnuty/macf#1195
+ * (a missing token no longer refuses outright — it now consults the SAME
+ * live `checkRunnerUsableByRepo` read this default already satisfies; see
+ * `apply-routing.ts`'s top-level #1195 paragraph). Kept as the default
+ * anyway so every pre-existing "routing var gets written" fixture in this
+ * file stays unambiguous about which code path it exercises (the
+ * token-supplied poll path). Tests exercising the no-token branch itself
+ * override this to `undefined` explicitly.
  *
  * **macf#932 note — this sentinel alone is NOT enough for a `FLEET_YAML_WITH_ROUTING`
  * mutating-apply test any more.** The macf#932 pre-flight
@@ -1501,6 +1504,30 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(parsed.routing['groundnuty/demo-code']?.status).toBe('created');
     });
 
+    it('groundnuty/macf#1195 DECISIVE at the CLI level: declared routing.runner self-hosted + NO token resolvable + a USABLE runner confirmed -> exit 0 (the early pre-flight still WARNS on stderr, but does not gate the outcome)', async () => {
+      vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
+      const file = writeManifest(FLEET_YAML_WITH_ROUTING);
+      const code = await runBootstrapApply(
+        { file, yes: true, json: true }, // no opts.runnerToken at all
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        // fakeTrustDeps' default checkRunnerUsableByRepo reports 'present' —
+        // this is the live-evidence case #1195 exists for: no token, but a
+        // runner is ALREADY there, so nothing needs registering.
+        fakeMutateDeps(file, { runnerToken: undefined }),
+      );
+      expect(code).toBe(0);
+      const parsed = JSON.parse(logs.join('\n')) as { routing: Record<string, { status: string }> };
+      expect(parsed.routing['groundnuty/demo-code']?.status).toBe('created');
+      // The early pre-flight (checkRunnerTokenPreflight, `apply-routing.ts`)
+      // still warns unconditionally at this point in the flow — it fires
+      // before any repo is observed, so it genuinely cannot know the
+      // outcome below will succeed. That is expected, not a bug: the
+      // warning names a REQUIREMENT ("apply cannot REGISTER a new runner
+      // without one"), never a guaranteed refusal — see
+      // `noRunnerTokenReason`'s doc.
+      expect(errs.join('\n')).toContain(RUNNER_TOKEN_FLAG);
+    });
+
     it('REGRESSION GUARD: routing.runner NOT declared at all -> exit 0 even though no usable runner would ever be confirmed — an undeclared fleet is structurally unreachable by this change', async () => {
       const file = writeManifest(); // base FLEET_YAML — no `routing:` section at all
       const code = await runBootstrapApply(
@@ -1579,29 +1606,35 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
               },
             });
           },
+          // groundnuty/macf#1195 — genuinely absent here (not 'present'):
+          // this test's OTHER point is that the run still correctly fails
+          // overall when nothing is actually there. See the sibling
+          // 'declared routing.runner self-hosted + a USABLE runner confirmed'
+          // test above for the #1195 case where NO token + a PRESENT runner
+          // proceeds and writes.
           trustDeps: fakeTrustDeps({
             checkRunnerUsableByRepo: async () => {
               checkRunnerUsableCalls += 1;
-              return { presence: 'present' };
+              return { presence: 'absent' };
             },
           }),
         }),
       );
 
       // groundnuty/macf#1209 — the run still FAILS overall (a declared
-      // self-hosted runner with no confirmable token stays non-zero, macf#993's
+      // self-hosted runner with no confirmed runner stays non-zero, macf#993's
       // ruling), but it is NOT a total abort any more: every seam below fired.
       expect(code).toBe(1);
       expect(observeCalls).toBeGreaterThan(0);
       expect(buildAgentDepsCalls).toBeGreaterThan(0);
       expect(openUrlCalls).toBeGreaterThan(0);
       expect(startManifestFlowCalls).toBeGreaterThan(0);
-      // The runner-token refusal itself is STILL zero-I/O (macf#929's "token
-      // is POLICY, missing token means detection is never even ATTEMPTED"
-      // contract, unchanged by #1209) — `publishTrustedActorsGated`
-      // short-circuits before ever calling this, even though everything ELSE
-      // above now runs for real.
-      expect(checkRunnerUsableCalls).toBe(0);
+      // groundnuty/macf#1195 — the runner-usability seam IS now consulted
+      // even with no token (that is the fix: absence of a token no longer
+      // forecloses a repo whose runner is already usable) — once PER
+      // CONFIRMED REPO (this manifest declares two agents), never a poll
+      // (nothing licenses a wait without a token).
+      expect(checkRunnerUsableCalls).toBeGreaterThan(0);
 
       expect(errs.join('\n')).toContain(RUNNER_TOKEN_FLAG);
       expect(errs.join('\n')).toContain(RUNNER_TOKEN_ENV_VAR);
@@ -1610,7 +1643,15 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     it('the failure is visible under --json too (never empty stdout, macf#830 lesson) — as a FULL apply-result, not an early-abort error object: routing shows the FAILED leg, other sections show their own real outcomes', async () => {
       vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
       const file = writeManifest(FLEET_YAML_WITH_ROUTING);
-      const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file, { runnerToken: undefined }));
+      const code = await runBootstrapApply(
+        { file, yes: true, json: true },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED) },
+        // groundnuty/macf#1195 — genuinely absent here: the point of THIS
+        // test is the failure's JSON SHAPE, which needs a real 'failed' leg
+        // to inspect. `fakeTrustDeps()`'s default now-live 'present' read
+        // would otherwise let the write succeed with no token at all.
+        fakeMutateDeps(file, { runnerToken: undefined, trustDeps: fakeTrustDeps({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }) }),
+      );
       expect(code).toBe(1);
       expect(logs.length).toBeGreaterThan(0);
       const parsed = JSON.parse(logs.join('\n')) as {
@@ -1638,7 +1679,9 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       const code = await runBootstrapApply(
         { file, yes: true, runnerToken: '' },
         { observe: () => Promise.resolve(EMPTY_OBSERVED) },
-        fakeMutateDeps(file, { runnerToken: undefined }),
+        // groundnuty/macf#1195 — genuinely absent here, same rationale as
+        // the sibling '--json too' test above.
+        fakeMutateDeps(file, { runnerToken: undefined, trustDeps: fakeTrustDeps({ checkRunnerUsableByRepo: async () => ({ presence: 'absent' }) }) }),
       );
       expect(code).toBe(1);
       expect(errs.join('\n')).toContain(RUNNER_TOKEN_FLAG);
@@ -1737,9 +1780,15 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
               createRepoVariableCalls.push({ repo, name });
               return 'created';
             },
+            // groundnuty/macf#1195 — genuinely absent here (not 'present'):
+            // this test's point is #1209's NARROW-SCOPE refusal (routing
+            // secrets + CA proceed, only MACF_TRUSTED_ACTORS is withheld),
+            // which needs the write to actually stay refused. See the
+            // dedicated #1195 tests elsewhere in this file/apply-fleet.test.ts
+            // for the case where NO token + a PRESENT runner proceeds.
             checkRunnerUsableByRepo: async () => {
               checkRunnerUsableCalls += 1;
-              return { presence: 'present' };
+              return { presence: 'absent' };
             },
           }),
         }),
@@ -1773,14 +1822,15 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // `createRepoVariable` DOES get called — for the CA legs, which don't
       // depend on the runner token either and are expected to succeed (proof
       // CA proceeded too) — so the assertion is on the VARIABLE NAME, not the
-      // raw call count: no call ever named `MACF_TRUSTED_ACTORS`. Zero calls
-      // into the runner-usability check at all (macf#929's "token is policy,
-      // missing token means detection+write are never even ATTEMPTED"
-      // contract) — a passing "code is non-zero" assertion alone would NOT
-      // catch a regression that quietly dropped the refusal.
+      // raw call count: no call ever named `MACF_TRUSTED_ACTORS`.
       expect(createRepoVariableCalls.some((c) => c.name === 'MACF_TRUSTED_ACTORS')).toBe(false);
       expect(createRepoVariableCalls.some((c) => c.name === 'DEMO_FLEET_CA_CERT')).toBe(true);
-      expect(checkRunnerUsableCalls).toBe(0);
+      // groundnuty/macf#1195 — the runner-usability check IS now consulted
+      // (that is the fix); the refusal above is EVIDENCED by a live read
+      // reporting 'absent', not assumed from the missing token alone. A
+      // passing "code is non-zero" assertion alone would not catch a
+      // regression that quietly dropped either half of this contract.
+      expect(checkRunnerUsableCalls).toBeGreaterThan(0);
 
       const parsed = JSON.parse(logs.join('\n')) as { routing: Record<string, { status: string; reason?: string }> };
       const routingLeg = parsed.routing['groundnuty/demo-code'];
