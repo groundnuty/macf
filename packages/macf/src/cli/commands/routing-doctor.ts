@@ -2024,7 +2024,21 @@ function readLocalRoutingConfig(projectDir: string): RoutingConfig | null {
   if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8')) as RoutingConfig;
-    if (!parsed || typeof parsed !== 'object' || typeof parsed.agents !== 'object') return null;
+    // WHY (groundnuty/macf#1193 follow-up): `typeof null === 'object'`, so the
+    // shape check alone admits `agents: null` and a consumer reaching
+    // `Object.keys(null)` throws. The REMOTE reader rejects that explicitly;
+    // this local one was safe only because its two callers happen to write
+    // `?? {}`. A safety that holds by coincidence across call sites breaks the
+    // day someone adds a third. Aligned with the remote guard so the invariant
+    // lives in ONE place — the reader — rather than in every consumer.
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      typeof parsed.agents !== 'object' ||
+      parsed.agents === null
+    ) {
+      return null;
+    }
     return parsed;
   } catch {
     return null;
