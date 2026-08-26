@@ -371,13 +371,14 @@ describe('computePlan — a version/config mismatch → update + confirm_require
   });
 
   // --- macf#932 — plan surfaces the --runner-token requirement too, so it's
-  // visible before approval rather than only discovered at apply time. This
-  // is an UNCONDITIONAL note (plan takes no --runner-token flag of its own
-  // and cannot know whether the operator already has one ready for a future
-  // `apply` invocation) — never a "missing" claim, always a "required" one.
+  // visible before approval rather than only discovered at apply time. Never
+  // a "missing" claim, always a "required" one — but conditional on
+  // registration status as of groundnuty/macf#1195: a runner already
+  // confirmed present needs no token, so the note is no longer
+  // unconditional (see `plan.ts::RUNNER_TOKEN_PLAN_NOTE`'s doc).
 
-  it('always names the flag + env var when self-hosted is declared, regardless of registration status', () => {
-    for (const registered of ['present', 'absent', 'unknown', undefined] as const) {
+  it('names the flag + env var when self-hosted is declared and NO usable runner is confirmed', () => {
+    for (const registered of ['absent', 'unknown', undefined] as const) {
       const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
       const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: registered };
       const plan = computePlan(manifest, observed);
@@ -387,7 +388,21 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     }
   });
 
-  it('also names the flag + env var on the observed-value-matches noop path (routingTrustedActors already correct)', () => {
+  it('groundnuty/macf#1195 — does NOT name the flag/env var when a usable runner IS already confirmed present — no token is needed to USE it', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: 'present' };
+    const plan = computePlan(manifest, observed);
+    const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
+    expect(routing?.reason).toMatch(/Runner class: self-hosted/);
+    expect(routing?.reason).not.toContain(RUNNER_TOKEN_FLAG);
+    expect(routing?.reason).not.toContain(RUNNER_TOKEN_ENV_VAR);
+    // The macf#993 "apply FAILS without a confirmed runner" note is still
+    // unconditional — a runner present NOW can still go offline before
+    // `apply` runs.
+    expect(routing?.reason).toMatch(/A declared routing\.runner is REQUIRED/);
+  });
+
+  it('also names the flag + env var on the observed-value-matches noop path (routingTrustedActors already correct) — registration is NOT observed here, so the non-present branch applies', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = {
       ...EMPTY_OBSERVED,
@@ -399,13 +414,13 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     expect(routing?.reason).toContain(RUNNER_TOKEN_FLAG);
   });
 
-  it('also names the flag + env var on the drifting-value update path', () => {
+  it('does NOT name the flag + env var on the drifting-value update path when a runner IS confirmed present (groundnuty/macf#1195)', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted', routingRunnerRegistered: 'present' };
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
     expect(routing?.verb).toBe('update');
-    expect(routing?.reason).toContain(RUNNER_TOKEN_FLAG);
+    expect(routing?.reason).not.toContain(RUNNER_TOKEN_FLAG);
   });
 
   it('never appears when runs_on is declared but is NOT "self-hosted" — no write is ever a candidate, so nothing to require', () => {
