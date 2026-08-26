@@ -13,15 +13,20 @@ import {
   ROUTING_APP_KEY_SECRET_NAME,
   ROUTING_BUNDLE_SECRET_NAME,
   TAILSCALE_OAUTH_MISSING_CODE,
+  TS_OAUTH_CLIENT_ID_FLAG,
   TS_OAUTH_CLIENT_ID_SECRET_NAME,
+  TS_OAUTH_FLAGS_INCOMPLETE_CODE,
+  TS_OAUTH_SECRET_FLAG,
   TS_OAUTH_SECRET_SECRET_NAME,
   checkTailscaleOauthPreflight,
+  checkTsOauthFlagsComplete,
   determineFleetLevelFact,
   determineFleetRoutingFact,
   packRoutingBundle,
   perRepoRoutingOutcome,
   publishRoutingBundle,
   publishRoutingSecrets,
+  resolvedTsOauthPair,
   skippedRoutingBundlePublish,
   skippedRoutingSecretsPublish,
   toBase64ForSecret,
@@ -376,6 +381,51 @@ describe('checkTailscaleOauthPreflight — resolvedTsOauth bypass (groundnuty/ma
       readVault: async () => { throw new Error('must not be called'); },
     });
     expect(result?.code).toBe(TAILSCALE_OAUTH_MISSING_CODE);
+  });
+});
+
+describe('checkTsOauthFlagsComplete — --ts-oauth-client-id/--ts-oauth-secret XOR precondition (groundnuty/macf#1186)', () => {
+  it('undefined (no refusal) when BOTH are given', () => {
+    expect(checkTsOauthFlagsComplete('a-client-id', 'a-secret')).toBeUndefined();
+  });
+
+  it('undefined (no refusal) when NEITHER is given', () => {
+    expect(checkTsOauthFlagsComplete(undefined, undefined)).toBeUndefined();
+  });
+
+  it('refuses when only the client ID is given, naming both flags', () => {
+    const result = checkTsOauthFlagsComplete('a-client-id', undefined);
+    expect(result?.code).toBe(TS_OAUTH_FLAGS_INCOMPLETE_CODE);
+    expect(result?.message).toContain(TS_OAUTH_CLIENT_ID_FLAG);
+    expect(result?.message).toContain(TS_OAUTH_SECRET_FLAG);
+  });
+
+  it('refuses when only the secret is given', () => {
+    const result = checkTsOauthFlagsComplete(undefined, 'a-secret');
+    expect(result?.code).toBe(TS_OAUTH_FLAGS_INCOMPLETE_CODE);
+  });
+
+  it('an empty string counts as "not given" — half a pair with an empty value still refuses', () => {
+    expect(checkTsOauthFlagsComplete('', 'a-secret')?.code).toBe(TS_OAUTH_FLAGS_INCOMPLETE_CODE);
+    expect(checkTsOauthFlagsComplete('a-client-id', '')?.code).toBe(TS_OAUTH_FLAGS_INCOMPLETE_CODE);
+  });
+
+  it('never echoes a supplied value in the refusal message — only the flag NAMES appear', () => {
+    const result = checkTsOauthFlagsComplete('SENTINEL-CLIENT-ID-VALUE', undefined);
+    expect(result?.message).not.toContain('SENTINEL-CLIENT-ID-VALUE');
+  });
+});
+
+describe('resolvedTsOauthPair — builds the pair only when both values are non-empty (groundnuty/macf#1186)', () => {
+  it('returns the pair when both are non-empty', () => {
+    expect(resolvedTsOauthPair('a-client-id', 'a-secret')).toEqual({ clientId: 'a-client-id', secret: 'a-secret' });
+  });
+
+  it('undefined when either is missing or empty', () => {
+    expect(resolvedTsOauthPair(undefined, 'a-secret')).toBeUndefined();
+    expect(resolvedTsOauthPair('a-client-id', undefined)).toBeUndefined();
+    expect(resolvedTsOauthPair('', 'a-secret')).toBeUndefined();
+    expect(resolvedTsOauthPair('a-client-id', '')).toBeUndefined();
   });
 });
 
