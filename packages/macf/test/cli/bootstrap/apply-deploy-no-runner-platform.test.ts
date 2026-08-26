@@ -47,18 +47,30 @@ describe('deploy keeps nothing of the runner half (groundnuty/macf#943, DR-043 A
     expect(source).not.toMatch(/\bdeprovisionRunner\b/);
   });
 
-  it('DECISIVE: the runner-provisioning contract client is imported from exactly ONE production call site — apply-fleet.ts — never from any deploy-path file', () => {
+  it('DECISIVE: the runner-provisioning contract client is imported ONLY from apply-fleet.ts + apply-routing.ts (groundnuty/macf#1212 added the second, advisory-only, TYPE-only import) — never from any deploy-path file', () => {
     // Grep every .ts source file under bootstrap/ + commands/ (excluding
     // runner-platform.ts itself and its own test file) for an import of it.
     // A future deploy-path file added without reading this test would still
     // be caught, unlike the file-by-file list above (which only covers
     // TODAY's deploy files by name).
+    //
+    // groundnuty/macf#1212 — `apply-routing.ts::publishTrustedActorsForProvisioned`
+    // consults the runner-platform's OWN `GET /runners/{owner}/{repo}` status
+    // as an OPTIONAL, advisory-only read (progress narration + a narrow
+    // terminal fast-exit — see that function's module doc) alongside the
+    // GitHub-side `checkRunnerUsableByRepo` readiness gate this module
+    // already used. This is `import type { RunnerPlatformStatusResult }`
+    // ONLY — no runtime dependency, no `provisionRunner`/`deprovisionRunner`
+    // call — but it does widen this invariant from "exactly one importer" to
+    // "exactly these two," both of which are production runner-provisioning
+    // call sites, neither a deploy-path file (the it.each loop above still
+    // proves that half independently).
     const grepOutput = execFileSync(
       'grep',
       ['-rl', '--include=*.ts', "from './runner-platform.js'", BOOTSTRAP_DIR, COMMANDS_DIR],
       { encoding: 'utf-8' },
     ).trim();
-    const importers = grepOutput.length > 0 ? grepOutput.split('\n').map((p) => p.trim()) : [];
-    expect(importers).toEqual([join(BOOTSTRAP_DIR, 'apply-fleet.ts')]);
+    const importers = grepOutput.length > 0 ? grepOutput.split('\n').map((p) => p.trim()).sort() : [];
+    expect(importers).toEqual([join(BOOTSTRAP_DIR, 'apply-fleet.ts'), join(BOOTSTRAP_DIR, 'apply-routing.ts')].sort());
   });
 });
