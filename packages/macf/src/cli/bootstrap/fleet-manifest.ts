@@ -700,6 +700,44 @@ export const FleetLockSchema = z
     // precedent `deployed_version` itself set when it was added after this
     // schema's introduction without bumping the version either.
     scope_credentials: z.array(ScopeCredentialMarkerSchema).optional(),
+    /**
+     * groundnuty/macf#1230 — the recipient set `apply` last successfully
+     * wrote the vault against. **This is the record-half of #1230 only** —
+     * nothing in this codebase yet REFUSES on this field (that is a
+     * separate, deliberately-not-yet-shipped change; see
+     * `age-recipients-narrowing.ts`'s eventual module doc). The defect this
+     * closes on its own: `transport.age_recipients` (the DECLARED set) is
+     * the only artifact recording who is *supposed* to have access, and
+     * nothing recorded who a vault was *actually* encrypted to — age's
+     * wrapped-key stanzas don't reveal recipient identities either
+     * (`vault-read.ts`'s module doc), so absent this field, "who can
+     * decrypt this vault?" was unanswerable from any artifact `apply`
+     * produces, for every fleet already provisioned.
+     *
+     * PUBLIC keys — safe to commit verbatim, unlike `fingerprints` (which
+     * hashes because ITS inputs are secret): an age recipient IS a public
+     * key by construction, same posture `fleet.yaml`'s own
+     * `transport.age_recipients` already takes.
+     *
+     * **`undefined` means UNKNOWN, never "zero recipients."** Two cases
+     * collapse to `undefined`: no lock exists yet, or a lock exists but
+     * PREDATES this field (any `apply` run from an older CLI never wrote
+     * it). Both are "nothing recorded to compare against," not "this fleet
+     * has no recipients" — that would be a real, comparable `[]`, written
+     * only when the manifest itself legitimately declares an empty set
+     * (`transport.age_recipients`'s own doc: `[]` before any key is
+     * minted). Reading an absent lock-side value as `[]` would be actively
+     * dangerous here — a future narrowing check comparing "recorded" vs.
+     * "desired" would see `[] \ desired = []` (no removal) and silently
+     * wave through a fleet whose actual recipient history is simply
+     * unknown. Order is PRESERVED, never sorted — position is real
+     * information for a multi-recipient vault (operator's key first, the
+     * VM's second — see `transport.age_recipients`'s own doc).
+     *
+     * Added as a NEW optional field, no `FLEET_LOCK_SCHEMA_VERSION` bump —
+     * same precedent `scope_credentials` immediately above already sets.
+     */
+    age_recipients: z.array(z.string().min(1)).optional(),
   })
   .strict();
 

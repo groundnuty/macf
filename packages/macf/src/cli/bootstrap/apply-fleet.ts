@@ -906,6 +906,24 @@ function ageRecipients(manifest: FleetManifest): readonly string[] {
 }
 
 /**
+ * groundnuty/macf#1230 — order-independent set equality, used ONLY to
+ * decide whether `fleet.lock`'s recorded `age_recipients` needs a fresh
+ * write this run (the batched-lock-write guard, below). Deliberately NOT
+ * the narrowing-detection predicate (`age-recipients-narrowing.ts`, not
+ * yet wired) — that check needs a DIRECTED set difference (which specific
+ * recipient was removed); this one only needs to know "did anything
+ * change at all," so a simple size+membership check is sufficient and a
+ * reorder-only manifest edit (no real change) correctly reports `false`.
+ */
+function sameAgeRecipientSet(a: readonly string[], b: readonly string[]): boolean {
+  const setA = new Set(a);
+  const setB = new Set(b);
+  if (setA.size !== setB.size) return false;
+  for (const r of setA) if (!setB.has(r)) return false;
+  return true;
+}
+
+/**
  * Splice the fleet-level `writeRecoveryArtifact` + `findRecoveryArtifact`
  * implementations onto the base `AgentApplyDeps` `deps.buildAgentDeps`
  * returns — see this module's doc's "Recovery-artifact lifecycle" section
@@ -2205,12 +2223,29 @@ export async function applyFleet(
     pendingRoutingAppVaultSecrets,
     deps,
   );
+  // groundnuty/macf#1230 — a THIRD reason (alongside "new agent secret" /
+  // "new fleet-level secret") this batched lock write must fire: a
+  // recipient-set change with NOTHING ELSE new to mint takes
+  // `settleVault`'s reencrypt-only branch (`reconcileVaultRecipients`,
+  // macf#957) — `vault.status === 'written'` there too, but pre-#1230 the
+  // guard below never even reached this call, so a fleet's OWN recipient
+  // change (the exact scenario the record exists to cover) left NOTHING
+  // recording who the vault was re-encrypted to. Compared against
+  // `currentLock` (this run's most-current known lock, reflecting any
+  // per-agent write already applied above in this same run), never the
+  // ORIGINAL `priorLock` param. Steady-state (recipients unchanged AND
+  // nothing else new) still writes nothing — `recipientsChanged` is
+  // `false` and every other term is `false` too, preserving #957's own
+  // no-churn contract (`apply-fleet.test.ts` "unchanged recipient set: no
+  // churn").
+  const recipientsChanged = currentLock?.age_recipients === undefined || !sameAgeRecipientSet(currentLock.age_recipients, recipients);
   if (
     vault.status === 'written' &&
     (Object.keys(pendingCreatedUpdates).length > 0 ||
       caSecretsForVault !== undefined ||
       routingClientSecretsForVault !== undefined ||
-      pendingRoutingAppVaultSecrets !== undefined)
+      pendingRoutingAppVaultSecrets !== undefined ||
+      recipientsChanged)
   ) {
     // Batched, not per-role: `writeVault` just persisted EVERY `created`
     // agent's secret (+ the CA key, when freshly minted, + the routing-client
@@ -2236,6 +2271,11 @@ export async function applyFleet(
       previous: currentLock,
       agentUpdates: pendingCreatedUpdates,
       ...(fleetSecrets !== undefined ? { fleetSecrets } : {}),
+      // groundnuty/macf#1230 — unconditional whenever this call fires: the
+      // vault was just written/reconciled against `recipients` (the
+      // manifest's CURRENT declared set), regardless of which OTHER term
+      // in the guard above triggered the write.
+      ageRecipients: recipients,
     });
     writeFleetLock(lockPath, composed.lock);
     currentLock = composed.lock;
