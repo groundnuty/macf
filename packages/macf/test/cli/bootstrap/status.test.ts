@@ -175,6 +175,158 @@ describe('computeBootstrapStatus — fully-provisioned fleet', () => {
   });
 });
 
+describe('computeBootstrapStatus — VERSION column disclosure (groundnuty/macf#1202)', () => {
+  // DECISIVE PAIR (per assert-the-wrong-path.md — trigger 1: "never show a
+  // version at all" would trivially satisfy the not-presented-as-observed
+  // half on its own, so the observed-case-still-renders half must ALSO be
+  // asserted with the SAME mechanism, not a separate one). `deployedVersion`
+  // (VERSION column) is lock-derived — this plane has no live route to it,
+  // ever. `actionsPin` (ACTIONS-PIN column) IS genuinely live-observed every
+  // run (`observer.ts::readCallerActionsPin`). Both are real fields on the
+  // SAME fixture, rendered by the SAME `buildProvisioningRows` call — so the
+  // contrast proves the mechanism actually discriminates by provenance
+  // rather than uniformly relabeling (or uniformly hiding) every version.
+  const view = computeBootstrapStatus(baseManifest(), FULLY_PROVISIONED_OBSERVED, FULLY_PROVISIONED_REGISTRY);
+  const row = buildProvisioningRows(view.agents).find((r) => r[0] === 'science-agent');
+
+  it('DECISIVE (1/2) — a lock-derived version (never read live this run) does NOT render as a bare observation', () => {
+    // VERSION is column index 7 per PROVISIONING_HEADERS.
+    expect(row?.[7]).toBe('0.2.60 (from lock)');
+    expect(row?.[7]).not.toBe('0.2.60');
+  });
+
+  it('DECISIVE (2/2) — a genuinely live-observed value (read fresh this run) STILL renders as a plain observation, unlabeled', () => {
+    // ACTIONS-PIN is column index 8. Proves the fix doesn't just blank/hide
+    // every version-shaped field — it discriminates on real provenance.
+    expect(row?.[8]).toBe('v3.4.1');
+  });
+
+  it('the view + JSON carry the provenance discriminator structurally, not just in rendered prose', () => {
+    const sci = view.agents.find((a) => a.role === 'science-agent');
+    expect(sci?.deployedVersionSource).toBe('lock');
+    expect(sci?.actionsPinSource).toBe('live');
+
+    const json = bootstrapStatusToJson(view) as {
+      agents: ReadonlyArray<{ role: string; deployedVersionSource?: string; actionsPinSource?: string }>;
+    };
+    const jsonSci = json.agents.find((a) => a.role === 'science-agent');
+    expect(jsonSci?.deployedVersionSource).toBe('lock');
+    expect(jsonSci?.actionsPinSource).toBe('live');
+  });
+
+  it('an agent with NO recorded version renders "unknown", never a source label on nothing', () => {
+    const empty = computeBootstrapStatus(baseManifest(), EMPTY_OBSERVED, {});
+    const emptyRow = buildProvisioningRows(empty.agents).find((r) => r[0] === 'science-agent');
+    expect(emptyRow?.[7]).toBe('unknown');
+    expect(emptyRow?.[8]).toBe('unknown');
+    const sci = empty.agents.find((a) => a.role === 'science-agent');
+    expect(sci?.deployedVersionSource).toBeUndefined();
+    expect(sci?.actionsPinSource).toBeUndefined();
+  });
+
+  describe('one-directional-convergence ruling: a host NEWER than declared is DRIFT, not "at target" (pinned)', () => {
+    const manifestWithVersions = baseManifest({ versions: { macf: '0.2.60', actions: 'v3.4.1' } });
+
+    it('PINNED — observed macf version NEWER than declared renders DRIFT, not silently accepted', () => {
+      const observed: ObservedState = {
+        ...FULLY_PROVISIONED_OBSERVED,
+        agents: {
+          ...FULLY_PROVISIONED_OBSERVED.agents,
+          'science-agent': { ...FULLY_PROVISIONED_OBSERVED.agents['science-agent']!, deployedVersion: '0.3.0' },
+        },
+      };
+      const v = computeBootstrapStatus(manifestWithVersions, observed, FULLY_PROVISIONED_REGISTRY);
+      const r = buildProvisioningRows(v.agents, undefined, v.declaredVersions).find((row) => row[0] === 'science-agent');
+      expect(r?.[7]).toBe('0.3.0 (from lock), declared 0.2.60 — DRIFT');
+    });
+
+    it('the SAME ruling applies to versions.actions (no asymmetry between the two version fields)', () => {
+      const observed: ObservedState = {
+        ...FULLY_PROVISIONED_OBSERVED,
+        agents: {
+          ...FULLY_PROVISIONED_OBSERVED.agents,
+          'science-agent': { ...FULLY_PROVISIONED_OBSERVED.agents['science-agent']!, actionsPin: 'v3.5.0' },
+        },
+      };
+      const v = computeBootstrapStatus(manifestWithVersions, observed, FULLY_PROVISIONED_REGISTRY);
+      const r = buildProvisioningRows(v.agents, undefined, v.declaredVersions).find((row) => row[0] === 'science-agent');
+      expect(r?.[8]).toBe('v3.5.0, declared v3.4.1 — DRIFT');
+    });
+
+    it('a host OLDER than declared ALSO renders DRIFT (symmetric — the ruling is not direction-sensitive)', () => {
+      const observed: ObservedState = {
+        ...FULLY_PROVISIONED_OBSERVED,
+        agents: {
+          ...FULLY_PROVISIONED_OBSERVED.agents,
+          'science-agent': { ...FULLY_PROVISIONED_OBSERVED.agents['science-agent']!, deployedVersion: '0.2.50' },
+        },
+      };
+      const v = computeBootstrapStatus(manifestWithVersions, observed, FULLY_PROVISIONED_REGISTRY);
+      const r = buildProvisioningRows(v.agents, undefined, v.declaredVersions).find((row) => row[0] === 'science-agent');
+      expect(r?.[7]).toBe('0.2.50 (from lock), declared 0.2.60 — DRIFT');
+    });
+
+    it('an EXACT match renders no DRIFT note', () => {
+      const v = computeBootstrapStatus(manifestWithVersions, FULLY_PROVISIONED_OBSERVED, FULLY_PROVISIONED_REGISTRY);
+      const r = buildProvisioningRows(v.agents, undefined, v.declaredVersions).find((row) => row[0] === 'science-agent');
+      expect(r?.[7]).toBe('0.2.60 (from lock)');
+      expect(r?.[7]).not.toContain('DRIFT');
+      expect(r?.[8]).toBe('v3.4.1');
+      expect(r?.[8]).not.toContain('DRIFT');
+    });
+
+    it('with no manifest.versions declared, no DRIFT comparison is attempted (nothing to compare against)', () => {
+      const v = computeBootstrapStatus(baseManifest(), FULLY_PROVISIONED_OBSERVED, FULLY_PROVISIONED_REGISTRY);
+      expect(v.declaredVersions).toBeUndefined();
+      const r = buildProvisioningRows(v.agents, undefined, v.declaredVersions).find((row) => row[0] === 'science-agent');
+      expect(r?.[7]).toBe('0.2.60 (from lock)');
+      expect(r?.[7]).not.toContain('DRIFT');
+    });
+
+    it('the full text render surfaces the DRIFT note (not just the pure row-builder)', () => {
+      const observed: ObservedState = {
+        ...FULLY_PROVISIONED_OBSERVED,
+        agents: {
+          ...FULLY_PROVISIONED_OBSERVED.agents,
+          'science-agent': { ...FULLY_PROVISIONED_OBSERVED.agents['science-agent']!, deployedVersion: '0.3.0' },
+        },
+      };
+      const v = computeBootstrapStatus(manifestWithVersions, observed, FULLY_PROVISIONED_REGISTRY);
+      const text = formatBootstrapStatusText(v);
+      expect(text).toContain('0.3.0 (from lock), declared 0.2.60 — DRIFT');
+    });
+
+    it('--json carries the declared_versions block the text render\'s DRIFT note is computed against', () => {
+      const v = computeBootstrapStatus(manifestWithVersions, FULLY_PROVISIONED_OBSERVED, FULLY_PROVISIONED_REGISTRY);
+      const json = bootstrapStatusToJson(v) as { declared_versions?: { macf: string; actions: string } };
+      expect(json.declared_versions).toEqual({ macf: '0.2.60', actions: 'v3.4.1' });
+    });
+  });
+
+  it('an offline/retired agent\'s stale EXTRA lock entry is not presented as current — labeled "(from lock)" same as a declared agent', () => {
+    // groundnuty/macf#1202 requirement 3: an agent no longer touched by any
+    // roll (dropped from the manifest, or perpetually offline so `macf
+    // fleet upgrade` skips it — `fleet-upgrade.ts::planFleetUpgrade`'s
+    // 'offline' disposition) must not have its recorded version presented
+    // as if it were current. The EXTRA-lock-agents view is the sharpest
+    // case: by definition nothing in THIS run touched it.
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      lock: {
+        schema_version: 1,
+        fleet: 'icsoc-2026',
+        agents: [{ role: 'long-offline-agent', app_id: '777', install_id: '888', deployed_version: '0.1.0' }],
+      },
+    };
+    const view2 = computeBootstrapStatus(baseManifest(), observed, {});
+    const extra = view2.extraLockAgents.find((e) => e.role === 'long-offline-agent');
+    expect(extra?.deployedVersionSource).toBe('lock');
+    const text = formatBootstrapStatusText(view2);
+    expect(text).toContain('deployed_version=0.1.0 (from lock)');
+    expect(text).not.toContain('deployed_version=0.1.0)');
+  });
+});
+
 describe('computeBootstrapStatus — partially-provisioned fleet (decisive case)', () => {
   // science-agent fully provisioned; code-agent has NOTHING observed at all
   // (no lock entry, no ObservedState.agents entry, no registry entry) —
@@ -498,7 +650,9 @@ describe('computeBootstrapStatus — extra lock agents (§D3 no-prune, rendering
       },
     };
     const view = computeBootstrapStatus(baseManifest(), observed, {});
-    expect(view.extraLockAgents).toEqual([{ role: 'retired-agent', appId: '999', installId: '888', deployedVersion: '0.2.50' }]);
+    expect(view.extraLockAgents).toEqual([
+      { role: 'retired-agent', appId: '999', installId: '888', deployedVersion: '0.2.50', deployedVersionSource: 'lock' },
+    ]);
     expect(formatBootstrapStatusText(view)).toContain('retired-agent');
   });
 
