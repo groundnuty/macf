@@ -70,6 +70,12 @@ import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
 // a one-directional runtime dependency — see `apply-routing.ts::
 // checkRunnerTokenPreflight`'s doc).
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from './apply-routing.js';
+// groundnuty/macf#1186 — same one-directional-runtime-dependency shape as
+// the `RUNNER_TOKEN_ENV_VAR`/`RUNNER_TOKEN_FLAG` import immediately above:
+// `apply-routing-secrets.ts` only ever `import type`s `Presence` from THIS
+// module, so a value import going the other way here creates no runtime
+// cycle (only a type-level one, which TS resolves fine).
+import { TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_ENV_VAR, TS_OAUTH_SECRET_FLAG } from './apply-routing-secrets.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle, runnerOpsNeeded } from './apply-runner-ops.js';
 // groundnuty/macf#1105 — same one-directional-runtime-dependency shape as
 // the `apply-runner-ops.js` import immediately above (that module ITSELF
@@ -1163,6 +1169,27 @@ function routerAppItem(
  * action, reason carries nuance" split `routingItem`'s non-self-hosted noop
  * branch already establishes.
  */
+/**
+ * groundnuty/macf#1186 — an UNCONDITIONAL note (not a "you're missing it"
+ * detection), same shape + rationale as `RUNNER_TOKEN_PLAN_NOTE` above:
+ * `plan` takes no `--ts-oauth-client-id`/`--ts-oauth-secret` flags of its
+ * own and never will (it cannot know whether the operator intends to
+ * supply them directly to a future `apply` invocation without ever
+ * exporting the env fallbacks) — so this names the ALTERNATIVE path rather
+ * than guessing at its satisfaction. Appended ONLY to `tsOauthItem`'s two
+ * ABSENT-from-vault branches (unconfirmable-at-plan-time and
+ * confirmed-absent) — the "present in the supplied vault" branch already
+ * has a satisfied answer and needs no alternative named. This is the fix
+ * for the defect #1186 reports: a fresh org's cold-start plan (no
+ * `--vault`/`--identity-key` given at all) previously said only "supply
+ * the operator-provided values into the vault," with no way in that didn't
+ * presuppose a vault already existing to write into.
+ */
+const TS_OAUTH_FLAG_PLAN_NOTE =
+  ` Alternatively, \`macf bootstrap apply\` accepts ${TS_OAUTH_CLIENT_ID_FLAG}/${TS_OAUTH_SECRET_FLAG} (or their ` +
+  `${TS_OAUTH_CLIENT_ID_ENV_VAR}/${TS_OAUTH_SECRET_ENV_VAR} env fallbacks) directly — no pre-existing vault needed ` +
+  'for that path.';
+
 function tsOauthItem(
   fleetName: string,
   tailscaleOauthRequired: boolean,
@@ -1184,7 +1211,7 @@ function tsOauthItem(
       reason:
         `Tailscale OAuth pair (TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET) presence could not be confirmed at plan time ` +
         `(${unknownReason}) — treated as a create-candidate.${requirementNote} Routing will not function without ` +
-        'this pair regardless of how apply ultimately resolves it.',
+        `this pair regardless of how apply ultimately resolves it.${TS_OAUTH_FLAG_PLAN_NOTE}`,
       confirm_required: false,
     };
   }
@@ -1205,15 +1232,16 @@ function tsOauthItem(
     kind: 'ts_oauth',
     target,
     verb: 'noop',
-    reason: tailscaleOauthRequired
-      ? 'Tailscale OAuth pair ABSENT from the supplied vault though transport.tailscale_oauth_required is ' +
-        'declared true — apply will REFUSE THE ENTIRE RUN before consent gate 1. Supply the operator-provided ' +
-        'values into the vault before running apply.'
-      : 'Tailscale OAuth pair ABSENT from the supplied vault (or no vault supplied) and ' +
-        'transport.tailscale_oauth_required is not declared — apply will NOT publish these secrets this run. ' +
-        'Routing will NOT function on this fleet until TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET are supplied — ' +
-        'agent-router.yml requires this pair unconditionally; the GitHub-hosted runner cannot reach agent VMs ' +
-        'without joining the tailnet through it.',
+    reason:
+      (tailscaleOauthRequired
+        ? 'Tailscale OAuth pair ABSENT from the supplied vault though transport.tailscale_oauth_required is ' +
+          'declared true — apply will REFUSE THE ENTIRE RUN before consent gate 1. Supply the operator-provided ' +
+          'values into the vault before running apply.'
+        : 'Tailscale OAuth pair ABSENT from the supplied vault (or no vault supplied) and ' +
+          'transport.tailscale_oauth_required is not declared — apply will NOT publish these secrets this run. ' +
+          'Routing will NOT function on this fleet until TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET are supplied — ' +
+          'agent-router.yml requires this pair unconditionally; the GitHub-hosted runner cannot reach agent VMs ' +
+          'without joining the tailnet through it.') + TS_OAUTH_FLAG_PLAN_NOTE,
     confirm_required: false,
   };
 }

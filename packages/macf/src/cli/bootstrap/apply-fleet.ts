@@ -273,7 +273,7 @@ import type { RunnerPlatformResult } from './runner-platform.js';
 import { provisionRunner, resolveRunnerPlatformEndpoint, runnerPlatformCredentialsFromOutcome } from './runner-platform.js';
 import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientSecretsForPublish } from './apply-routing-client.js';
 import { ROUTING_CLIENT_CERT_SECRET_NAME, ROUTING_CLIENT_KEY_SECRET_NAME, mintRoutingClient, resolveRoutingClientSecretsForPublish } from './apply-routing-client.js';
-import type { RoutingSecretResolution, RoutingSecretsForPublish, RoutingSecretsPublishDeps, RoutingSecretsPublishResult } from './apply-routing-secrets.js';
+import type { ResolvedTsOauth, RoutingSecretResolution, RoutingSecretsForPublish, RoutingSecretsPublishDeps, RoutingSecretsPublishResult } from './apply-routing-secrets.js';
 import {
   ROUTING_APP_ID_SECRET_NAME,
   ROUTING_APP_KEY_SECRET_NAME,
@@ -381,6 +381,28 @@ export interface FleetApplyDeps {
    * contract this field carries into that gate).
    */
   readonly runnerToken?: string;
+  /**
+   * The `--ts-oauth-client-id`/`--ts-oauth-secret` pair (or their
+   * `MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID`/`MACF_BOOTSTRAP_TS_OAUTH_SECRET` env
+   * fallbacks), already flag-then-env resolved by
+   * `commands/bootstrap-apply.ts::runBootstrapApply` (groundnuty/macf#1186)
+   * — a SECOND operator-supplied source for `TS_OAUTH_CLIENT_ID`/
+   * `TS_OAUTH_SECRET`, alongside `routingSecretsDeps.readVaultTsOauth`'s
+   * vault-restore path (`#1109`). The vault path requires a PRE-EXISTING
+   * `vault.age` to read from — nothing in this codebase ever WRITES this
+   * pair into one (`vault-write.ts`'s `payload.routing` is dead code), so a
+   * freshly-provisioned org had no way to supply it at all before this
+   * field existed. `undefined` means "not supplied via flag/env" — the
+   * resolution in this module then falls through to the vault-restore path
+   * exactly as `#1109` left it. When BOTH this field and a vault-restored
+   * value are present, THIS field wins (an explicit THIS-RUN operator
+   * instruction over a prior run's stored value — same "most explicit
+   * source wins" precedent `--runner-token`'s own CLI-flag-over-env
+   * resolution already establishes). Never written to the vault, never
+   * logged, never copied onto `FleetApplyResult` — same "transient POLICY
+   * input, never persisted" contract `runnerToken` above already has.
+   */
+  readonly resolvedTsOauth?: ResolvedTsOauth;
   /**
    * Test-only override for {@link RunnerTokenPollOptions} threaded into
    * `publishTrustedActorsGated`'s bounded poll (macf#929). Production
@@ -2078,10 +2100,10 @@ export async function applyFleet(
       ? { status: 'available', value: routerAppSecrets.appKeyPem }
       : { status: 'unavailable', reason: routerAppSecrets.reason };
 
-  // TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET — ALWAYS operator-supplied via the
-  // vault (Amendment C), NEVER minted by `apply` — read-only, independent
-  // of `vault.status` (this run never WRITES these, so their durability
-  // never depends on THIS run's write succeeding).
+  // TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET — ALWAYS operator-supplied, NEVER
+  // minted by `apply` — read-only, independent of `vault.status` (this run
+  // never WRITES these, so their durability never depends on THIS run's
+  // write succeeding).
   //
   // groundnuty/macf#1109 — the vault read is now UNCONDITIONAL, never gated
   // on `transport.tailscale_oauth_required`. The PRIOR shape gated the read
@@ -2096,28 +2118,42 @@ export async function applyFleet(
   // scored (refusal-worthy `'unavailable'` vs. an honest not-ready-yet
   // `'not-required'` skip) — it never gates whether a PRESENT value gets
   // used. `checkTailscaleOauthPreflight` in `commands/bootstrap-apply.ts`
-  // still refuses BEFORE gate 1 whenever the flag IS declared and the vault
-  // lacks the values, so a `tailscale_oauth_required: true` fleet reaching
-  // this line always has `restored !== undefined` already confirmed once —
-  // this is a second, independent read of the same vault (the "each concern
-  // gets its own decrypt" convention this codebase already follows for
-  // CA/routing-client restores), not a second source of truth.
+  // still refuses BEFORE gate 1 whenever the flag IS declared and NEITHER
+  // source (flag/env or vault) yields it, so a `tailscale_oauth_required:
+  // true` fleet reaching this line always has ONE of the two sources
+  // already confirmed once — this is a second, independent read/check
+  // (the "each concern gets its own decrypt" convention this codebase
+  // already follows for CA/routing-client restores), not a second source
+  // of truth.
+  //
+  // groundnuty/macf#1186 — `deps.resolvedTsOauth` (the `--ts-oauth-client-id`/
+  // `--ts-oauth-secret` flag/env pair) is a SECOND operator-supplied source,
+  // checked FIRST: the vault path requires a PRE-EXISTING vault.age to read
+  // from, which a freshly-provisioned org has none of. Wins over a
+  // vault-restored value when both resolve (see `FleetApplyDeps.resolvedTsOauth`'s
+  // doc for why THIS run's explicit flag/env input outranks a prior run's
+  // stored vault value) — the vault read below still runs unconditionally
+  // (cheap, and a test/caller may supply `readVaultTsOauth` without
+  // `resolvedTsOauth`), its result just loses the OR-fallthrough race when
+  // `deps.resolvedTsOauth` is already present.
   let tsOauthClientId: RoutingSecretResolution;
   let tsOauthSecret: RoutingSecretResolution;
   const restoredTsOauth = deps.routingSecretsDeps.readVaultTsOauth !== undefined ? await deps.routingSecretsDeps.readVaultTsOauth() : undefined;
-  if (restoredTsOauth !== undefined) {
-    tsOauthClientId = { status: 'available', value: restoredTsOauth.clientId };
-    tsOauthSecret = { status: 'available', value: restoredTsOauth.secret };
+  const suppliedTsOauth: ResolvedTsOauth | undefined = deps.resolvedTsOauth ?? restoredTsOauth;
+  if (suppliedTsOauth !== undefined) {
+    tsOauthClientId = { status: 'available', value: suppliedTsOauth.clientId };
+    tsOauthSecret = { status: 'available', value: suppliedTsOauth.secret };
   } else if (manifest.transport.tailscale_oauth_required) {
     // Declared but the vault didn't yield it THIS run — a genuine gap:
     // LOUD `'unavailable'` (never a silent `'skipped'`), same "declared
     // requirement, missing value" bar every other 6-secret leg uses.
     const reason =
-      'transport.tailscale_oauth_required is declared but the vault did not yield TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET ' +
-      'this run — supply both --vault and --identity-key to `macf bootstrap apply` so the operator-supplied values ' +
-      'can be read back and published. Routing will NOT function on this fleet until both secrets are set: ' +
-      'agent-router.yml requires them unconditionally, and the GitHub-hosted runner cannot reach agent VMs without ' +
-      'joining the tailnet through them.';
+      'transport.tailscale_oauth_required is declared but neither --ts-oauth-client-id/--ts-oauth-secret (or their ' +
+      'env fallbacks) nor the vault yielded TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET this run — supply the pair directly ' +
+      'via those flags, or supply both --vault and --identity-key so an already-vaulted value can be read back and ' +
+      'published. Routing will NOT function on this fleet until both secrets are set: agent-router.yml requires ' +
+      'them unconditionally, and the GitHub-hosted runner cannot reach agent VMs without joining the tailnet ' +
+      'through them.';
     tsOauthClientId = { status: 'unavailable', reason };
     tsOauthSecret = { status: 'unavailable', reason };
   } else {
@@ -2132,9 +2168,10 @@ export async function applyFleet(
     // will not function until it is supplied, declared or not.
     const reason =
       'transport.tailscale_oauth_required is not declared in fleet.yaml, and no TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET ' +
-      'values were found in the supplied vault (or no vault was supplied) — this run will not publish these ' +
-      'secrets. Routing will NOT function on this fleet until they are supplied: agent-router.yml requires this ' +
-      'pair unconditionally regardless of the manifest declaration.';
+      'values were resolved from --ts-oauth-client-id/--ts-oauth-secret (or their env fallbacks) or the supplied ' +
+      'vault (or no vault was supplied) — this run will not publish these secrets. Routing will NOT function on ' +
+      'this fleet until they are supplied: agent-router.yml requires this pair unconditionally regardless of the ' +
+      'manifest declaration.';
     tsOauthClientId = { status: 'not-required', reason };
     tsOauthSecret = { status: 'not-required', reason };
   }
