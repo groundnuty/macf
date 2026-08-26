@@ -326,7 +326,14 @@ export async function checkReporterStalls(config: {
       let issues: readonly RawOpenAuthoredIssue[];
       try {
         issues = await listOpenAuthored(repo, token);
-      } catch {
+      } catch (err) {
+        // Mirrors `checkIssues`'s stderr-warning convention (work.ts) —
+        // debuggable, and never includes the token: `err.message` here is
+        // whatever `gh` printed, and GH_TOKEN is passed via `env`, never
+        // as a CLI arg or in output the CLI echoes back.
+        process.stderr.write(
+          `Warning: reporter-stall sweep could not check ${repo}: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
         unreadableRepos.push(repo);
         return;
       }
