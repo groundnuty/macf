@@ -67,7 +67,7 @@ Acceptance criteria almost always enumerate what must hold. That is sufficient w
 
 > **When a plausible-but-wrong verification exists, the criteria must FORBID it — not merely leave it out.** Omitting it leaves it available; forbidding it makes writing it a spec violation.
 
-### Three triggers, three different remedies
+### Four triggers, four different remedies
 
 **Trigger 1 — circularity: the reference value comes from what it checks.** The verification cannot fail, so it reports agreement and reads as correctness.
 
@@ -116,6 +116,26 @@ For the vault fix the answer was *reused roles*, and it was. For the fleet e2e i
 - **Illegitimate** — lower a sweep's cap from 5 so the issue under test appears in its own output.
 
 **And its cheap companion — mutation as habit:** break the fix, re-run, confirm a test notices. **A test that passes with the fix removed is testing something else.** One fix shipped merged-and-green while its emitting call site stayed broken, because its tests asserted the mechanism in general rather than at the site; its replacement was proven load-bearing by disabling it and watching the assertion fail. **The cost is a single deliberately-broken run.**
+
+**Trigger 4 — an empty result from a search space that was empty.** The instrument reported nothing found, and nothing was searched. **The two outputs are identical and their meanings are opposite:**
+
+```
+grep -c X missing-file   →  0      ← searched nothing
+grep -c X real-file      →  0      ← X is genuinely absent
+```
+
+The cases this covers, and each is caught by the same one-second act: **a path that does not exist**, **a typo'd path**, **a glob the shell ate before the command saw it**, **a `--jq` filter on a key that is not there**. Two that nearly became claims: a `grep` against **an invented filename** returned `0` and would have asserted a design amendment was never written — it was, in a file one word different; and an unquoted `--include=*.ts` **eaten by the shell** returned empty output that read as *"nothing references this."*
+
+**Remedy: prove the search space is non-empty before believing an empty result.** `ls` the file. `wc -l` it. Count matches of something you know is there. **One extra command turns an uninformative zero into a real one.**
+
+**Two neighbours it does NOT cover — and applying this remedy to them certifies the mistake**, because `ls` passes and the reading is still wrong:
+
+- **Scope incompleteness** — the instrument reads a subset of where the answer lives. A repo-level variable listing exists and returns variables; the one you want is defined at the org level. **Remedy: enumerate the levels**, not the space.
+- **Currency** — the artifact read is real but is not the one anyone runs: a stale checkout, a local file behind `origin/main`. **Remedy: name the provenance** — `git show origin/main:<path>`, or query the API rather than the working tree.
+
+**Not trigger 3.** That one asks *what case can this population not produce* and is answered by **constructing** the missing case. This one asks *did I search anything at all* and is answered by **proving the space exists**. A trigger-3 population is real but narrow; a trigger-4 population is not there.
+
+**The inverse deserves the same suspicion:** a *non-empty* result from a failed call. `--jq .value` against a **404** returns the error body — and it was **uniform across every subject**, which is the tell. Identical results across subjects that should differ means the wrong thing is being measured; thirteen unrelated repos do not agree to the byte.
 
 **Distinguishing them:** ask whether your expected value came from **the population under test** (trigger 1) or from **your own inference about an unstated observable** (trigger 2). A reader who only knows trigger 1 gets *"no, nothing circular here"* on the second case and writes the assertion anyway — which is how this section's own first draft failed to recognise one of the two cases it cited.
 
