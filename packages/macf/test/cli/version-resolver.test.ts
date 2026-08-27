@@ -97,17 +97,34 @@ describe('fetchLatestCliVersion', () => {
 
   it('returns not_published on HTTP 404', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 404 }) as typeof fetch;
-    expect(await fetchLatestCliVersion()).toEqual({ status: 'not_published', value: null });
+    expect(await fetchLatestCliVersion()).toEqual({
+      status: 'not_published', value: null, detail: 'registry.npmjs.org',
+    });
   });
 
-  it('returns network_error on fetch rejection', async () => {
+  it('returns network_error on fetch rejection, WITH the host + err.message as detail (macf#777)', async () => {
     globalThis.fetch = vi.fn().mockRejectedValue(new Error('ECONNREFUSED')) as typeof fetch;
-    expect(await fetchLatestCliVersion()).toEqual({ status: 'network_error', value: null });
+    expect(await fetchLatestCliVersion()).toEqual({
+      status: 'network_error', value: null, detail: 'registry.npmjs.org: ECONNREFUSED',
+    });
+  });
+
+  it('prefers err.cause.code over err.message when both are present (macf#777)', async () => {
+    // undici's real TypeError: fetch failed always has message "fetch failed" (worthless
+    // alone) with the actual reason nested in .cause — assert the code wins, not the
+    // useless top-level message, so a real fetch() rejection produces a useful detail.
+    const fetchFailed = new TypeError('fetch failed', { cause: { code: 'ENOTFOUND', message: 'getaddrinfo ENOTFOUND registry.npmjs.org' } });
+    globalThis.fetch = vi.fn().mockRejectedValue(fetchFailed) as typeof fetch;
+    const result = await fetchLatestCliVersion();
+    expect(result.detail).toBe('registry.npmjs.org: ENOTFOUND');
+    expect(result.detail).not.toContain('fetch failed');
   });
 
   it('returns invalid_response for non-404 HTTP errors', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 500 }) as typeof fetch;
-    expect(await fetchLatestCliVersion()).toEqual({ status: 'invalid_response', value: null });
+    expect(await fetchLatestCliVersion()).toEqual({
+      status: 'invalid_response', value: null, detail: 'registry.npmjs.org',
+    });
   });
 
   it('returns invalid_response for malformed payload', async () => {
@@ -115,7 +132,9 @@ describe('fetchLatestCliVersion', () => {
       ok: true, status: 200,
       json: async () => ({ 'dist-tags': { latest: 'not-a-version' } }),
     }) as typeof fetch;
-    expect(await fetchLatestCliVersion()).toEqual({ status: 'invalid_response', value: null });
+    expect(await fetchLatestCliVersion()).toEqual({
+      status: 'invalid_response', value: null, detail: 'registry.npmjs.org',
+    });
   });
 });
 
@@ -147,7 +166,9 @@ describe('fetchLatestPluginVersion', () => {
 
   it('returns not_published when both /releases/latest and /tags are 404', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 404 }) as typeof fetch;
-    expect(await fetchLatestPluginVersion()).toEqual({ status: 'not_published', value: null });
+    expect(await fetchLatestPluginVersion()).toEqual({
+      status: 'not_published', value: null, detail: 'api.github.com',
+    });
   });
 
   it('returns not_published when /tags returns empty array', async () => {
@@ -157,12 +178,16 @@ describe('fetchLatestPluginVersion', () => {
       }
       return Promise.resolve({ ok: true, status: 200, json: async () => [] });
     }) as typeof fetch;
-    expect(await fetchLatestPluginVersion()).toEqual({ status: 'not_published', value: null });
+    expect(await fetchLatestPluginVersion()).toEqual({
+      status: 'not_published', value: null, detail: 'api.github.com',
+    });
   });
 
-  it('returns network_error on fetch rejection', async () => {
+  it('returns network_error on fetch rejection, WITH host + reason as detail (macf#777)', async () => {
     globalThis.fetch = vi.fn().mockRejectedValue(new Error('network')) as typeof fetch;
-    expect(await fetchLatestPluginVersion()).toEqual({ status: 'network_error', value: null });
+    expect(await fetchLatestPluginVersion()).toEqual({
+      status: 'network_error', value: null, detail: 'api.github.com: network',
+    });
   });
 });
 
@@ -197,12 +222,16 @@ describe('fetchLatestActionsVersion', () => {
 
   it('returns not_published when both endpoints 404', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 404 }) as typeof fetch;
-    expect(await fetchLatestActionsVersion()).toEqual({ status: 'not_published', value: null });
+    expect(await fetchLatestActionsVersion()).toEqual({
+      status: 'not_published', value: null, detail: 'api.github.com',
+    });
   });
 
-  it('returns network_error on fetch rejection', async () => {
+  it('returns network_error on fetch rejection, WITH host + reason as detail (macf#777)', async () => {
     globalThis.fetch = vi.fn().mockRejectedValue(new Error('ENOTFOUND')) as typeof fetch;
-    expect(await fetchLatestActionsVersion()).toEqual({ status: 'network_error', value: null });
+    expect(await fetchLatestActionsVersion()).toEqual({
+      status: 'network_error', value: null, detail: 'api.github.com: ENOTFOUND',
+    });
   });
 });
 
@@ -293,6 +322,53 @@ describe('statusMessage', () => {
   it('includes component name', () => {
     expect(statusMessage('actions', 'not_published')).toContain('actions');
   });
+
+  it('appends detail when given (macf#777); omits it when absent — additive, backward compatible', () => {
+    expect(statusMessage('cli', 'network_error')).toBe('cli: network fetch failed (using default)');
+    expect(statusMessage('cli', 'network_error', 'registry.npmjs.org: ENOTFOUND')).toBe(
+      'cli: network fetch failed (using default) — registry.npmjs.org: ENOTFOUND',
+    );
+  });
+
+  // DECISIVE PAIR (macf#777) — a genuine network failure and a genuine
+  // rate-limit/auth failure must produce DIFFERENT messages, each naming ITS
+  // OWN remedy. Satisfied only by discriminating; a version that always
+  // prints one generic "fetch failed" (or always prints both remedies)
+  // fails this pair — see the mutation-check note below.
+  it('DECISIVE — network failure names the host+cause, NOT the GH_TOKEN remedy', () => {
+    const msg = statusMessage('cli', 'network_error', 'registry.npmjs.org: ENOTFOUND');
+    expect(msg).toContain('registry.npmjs.org');
+    expect(msg).toContain('ENOTFOUND');
+    expect(msg).not.toContain('GH_TOKEN');
+  });
+
+  it('DECISIVE — rate-limit/auth failure names the GH_TOKEN remedy, NOT a DNS/connect cause', () => {
+    const msg = statusMessage('cli', 'rate_limited', 'api.github.com');
+    expect(msg).toContain('GH_TOKEN');
+    expect(msg).not.toContain('ENOTFOUND');
+    expect(msg).not.toContain('ECONNREFUSED');
+  });
+
+  it('DECISIVE — the two messages for the SAME component are distinct strings', () => {
+    const network = statusMessage('cli', 'network_error', 'registry.npmjs.org: ENOTFOUND');
+    const rateLimited = statusMessage('cli', 'rate_limited', 'registry.npmjs.org');
+    expect(network).not.toBe(rateLimited);
+  });
+
+  // MUTATION CHECK (assert-the-wrong-path.md): a version that collapsed both
+  // causes into ONE generic message (e.g. always returning
+  // `${component}: fetch failed (using default)` regardless of status, or
+  // unconditionally concatenating the GH_TOKEN remedy onto every non-ok
+  // status) satisfies the printed-in-the-body-somewhere check alone but
+  // FAILS the two DECISIVE tests above: the network-failure test would find
+  // "GH_TOKEN" present when it must be absent, and/or the rate-limit test
+  // would find no "GH_TOKEN" text. Confirmed empirically: temporarily
+  // hardcoding `return detail ? \`${component}: fetch failed\` : base;`
+  // (dropping the status-specific base message) makes 'DECISIVE — rate-limit
+  // ... NOT a DNS/connect cause' fail (no GH_TOKEN substring), and reverting
+  // `statusMessage` to its pre-macf#777 2-arg form (always ignoring detail)
+  // makes 'DECISIVE — network failure names the host+cause' fail (no
+  // 'registry.npmjs.org' / 'ENOTFOUND' substring).
 });
 
 describe('GitHub API auth (#186)', () => {
@@ -354,24 +430,32 @@ describe('GitHub API auth (#186)', () => {
   it('classifies 403 as rate_limited (plugin)', async () => {
     delete process.env['GH_TOKEN'];
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 403 }) as typeof fetch;
-    expect(await fetchLatestPluginVersion()).toEqual({ status: 'rate_limited', value: null });
+    expect(await fetchLatestPluginVersion()).toEqual({
+      status: 'rate_limited', value: null, detail: 'api.github.com',
+    });
   });
 
   it('classifies 429 as rate_limited (actions)', async () => {
     delete process.env['GH_TOKEN'];
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 429 }) as typeof fetch;
-    expect(await fetchLatestActionsVersion()).toEqual({ status: 'rate_limited', value: null });
+    expect(await fetchLatestActionsVersion()).toEqual({
+      status: 'rate_limited', value: null, detail: 'api.github.com',
+    });
   });
 
   it('classifies 401 as rate_limited (bad auth)', async () => {
     process.env['GH_TOKEN'] = 'bad';
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 401 }) as typeof fetch;
-    expect(await fetchLatestPluginVersion()).toEqual({ status: 'rate_limited', value: null });
+    expect(await fetchLatestPluginVersion()).toEqual({
+      status: 'rate_limited', value: null, detail: 'api.github.com',
+    });
   });
 
   it('keeps 500 classified as invalid_response (non-auth server error)', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 500 }) as typeof fetch;
-    expect(await fetchLatestPluginVersion()).toEqual({ status: 'invalid_response', value: null });
+    expect(await fetchLatestPluginVersion()).toEqual({
+      status: 'invalid_response', value: null, detail: 'api.github.com',
+    });
   });
 });
 
