@@ -152,6 +152,32 @@ export function overrideAcknowledged(override: string | undefined): boolean {
  * seam is never invoked" contract `checkAppNameLengths`/
  * `checkRegistryScopePreflight` establish.
  */
+/**
+ * groundnuty/macf#1230 — TRUE when this fleet's lock records no recipient set,
+ * so a narrowing CANNOT be detected. Distinct from "compared, nothing removed":
+ * the honest-unknown floor at this guard's boundary. An absent record is
+ * `unknown`, NOT `unchanged`, and must not silently permit a narrowing it
+ * cannot see. Refusing here would block every pre-#1252 fleet's next apply —
+ * worse than the exposure — so the caller PROCEEDS and says so.
+ */
+export function ageRecipientsRecordAbsent(priorLock: FleetLock | null): boolean {
+  const recorded = priorLock?.age_recipients;
+  return recorded === undefined || recorded.length === 0;
+}
+
+/**
+ * The advisory a caller emits when {@link ageRecipientsRecordAbsent} holds —
+ * names the gap and what closes it, rather than passing silently.
+ */
+export function ageRecipientsRecordAbsentNotice(): string {
+  return (
+    'transport.age_recipients cannot be checked for narrowing: this fleet\'s lock records no ' +
+    'recipient set, so there is nothing to compare against. Proceeding — but if this run REMOVES ' +
+    'a recipient, that removal is neither detected nor recorded, and re-encryption would not ' +
+    'revoke access to vault copies already held. The next apply records the set and closes the gap.'
+  );
+}
+
 export function checkAgeRecipientsNarrowing(
   desired: readonly string[],
   priorLock: FleetLock | null,

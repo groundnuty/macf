@@ -22,6 +22,8 @@ import {
   checkAgeRecipientsNarrowing,
   overrideAcknowledged,
   removedAgeRecipients,
+  ageRecipientsRecordAbsent,
+  ageRecipientsRecordAbsentNotice,
 } from '../../../src/cli/bootstrap/age-recipients-narrowing.js';
 import { AGE_RECIPIENTS_NARROWING_OVERRIDE_TEXT } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { FleetLock } from '../../../src/cli/bootstrap/fleet-manifest.js';
@@ -199,5 +201,30 @@ describe('overrideAcknowledged — the shared predicate `fleet-lock.ts`\'s ledge
 
   it('true on a whitespace-normalized (YAML-folded) match', () => {
     expect(overrideAcknowledged(AGE_RECIPIENTS_NARROWING_OVERRIDE_TEXT.replace(/ /g, '\n  '))).toBe(true);
+  });
+});
+
+describe('ageRecipientsRecordAbsent — the third state (groundnuty/macf#1230)', () => {
+  it('DECISIVE: no recorded set is UNKNOWN, distinguishable from "compared, nothing removed"', () => {
+    // The defect this closes: both cases returned [] from removedAgeRecipients
+    // and were indistinguishable at the call site.
+    expect(ageRecipientsRecordAbsent(lockWithRecipients(undefined))).toBe(true);
+    expect(ageRecipientsRecordAbsent(null)).toBe(true);
+  });
+
+  it('DECISIVE: a fleet WITH a recorded set is NOT absent, even when nothing is removed', () => {
+    expect(ageRecipientsRecordAbsent(lockWithRecipients(['age1aaa']))).toBe(false);
+    expect(removedAgeRecipients(['age1aaa'], lockWithRecipients(['age1aaa']))).toEqual([]);
+  });
+
+  it('an empty recorded array is absent — nothing to compare against', () => {
+    expect(ageRecipientsRecordAbsent(lockWithRecipients([]))).toBe(true);
+  });
+
+  it('the notice names the gap, says it proceeds, and says what closes it', () => {
+    const notice = ageRecipientsRecordAbsentNotice();
+    expect(notice).toContain('cannot be checked for narrowing');
+    expect(notice).toContain('Proceeding');
+    expect(notice).toContain('next apply records the set');
   });
 });

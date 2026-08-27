@@ -136,7 +136,7 @@ import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflig
 // contract `checkRegistryScopePreflight` above establishes; this one also
 // reads `fleet.lock` (a local file, never a GitHub call) via `readFleetLock`
 // (already imported above from `observer.js`) to compare against.
-import { checkAgeRecipientsNarrowing } from '../bootstrap/age-recipients-narrowing.js';
+import { ageRecipientsRecordAbsent, ageRecipientsRecordAbsentNotice, checkAgeRecipientsNarrowing } from '../bootstrap/age-recipients-narrowing.js';
 import type { DeployFlagsEcho, RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
 import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
 import type { ApplyDeployPhaseDeps, DeployPhaseAgentResult } from '../bootstrap/apply-deploy.js';
@@ -2966,6 +2966,16 @@ export async function runBootstrapApply(
   );
   if (ageRecipientsNarrowingFailure !== undefined) {
     return renderFailure(ageRecipientsNarrowingFailure, opts);
+  }
+  // groundnuty/macf#1230 — the THIRD state. An absent record is `unknown`, not
+  // `unchanged`: a fleet whose lock predates #1252 takes the same "nothing
+  // removed" path as one that genuinely removed nothing, and the two are
+  // indistinguishable from the return value alone. Refusing would block every
+  // pre-#1252 fleet's next apply — worse than the exposure — so proceed and
+  // SAY SO, which is the only thing that makes the gap visible during the one
+  // migration cycle in which every fleet is in it.
+  if (ageRecipientsRecordAbsent(readFleetLock(manifestPath))) {
+    process.stderr.write(`${ageRecipientsRecordAbsentNotice()}\n`);
   }
 
   if (opts.dryRun !== true) {
