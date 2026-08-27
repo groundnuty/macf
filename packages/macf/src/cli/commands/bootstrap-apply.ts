@@ -3427,15 +3427,15 @@ export async function runBootstrapApply(
       // reuse a pre-existing one" (`result.runnerOps.status`/
       // `result.routerApp.status`, both available here without a vault):
       // that signal exists, but a fresh fleet's first-ever `apply` — the
-      // documented norm for running WITHOUT `--vault`/`--identity-key` at
-      // all (`design/fleet-deployment-runbook.md` §5 — "together or
-      // neither") — would then suppress the notice on exactly the run
-      // where "no --vault" is expected and correct, trading this issue's
-      // silence for a different one. `installScopeCoverageTargets`
-      // (pure, manifest-only — "does this fleet need one of these Apps at
-      // all") is the distinction that's actually available without a
-      // vault; "did it pre-exist" is not, short of the vault read this
-      // branch exists to avoid requiring.
+      // runbook's own canonical §3.3 happy-path example is bare `macf
+      // bootstrap apply -f fleet.yaml`, no vault flags at all — would then
+      // suppress the notice on exactly the run where "no --vault" is
+      // expected and correct (§6.8: the pair is together-or-neither, never
+      // required), trading this issue's silence for a different one.
+      // `installScopeCoverageTargets` (pure, manifest-only — "does this
+      // fleet need one of these Apps at all") is the distinction that's
+      // actually available without a vault; "did it pre-exist" is not,
+      // short of the vault read this branch exists to avoid requiring.
       const vaultOpts =
         opts.vaultPath !== undefined && opts.identityKeyPath !== undefined
           ? { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath }
