@@ -430,6 +430,24 @@ families was found to have a cross-flag requirement beyond these five rows
 
 ---
 
+## 6a. Provisioning into a COLD scope — and the one rule for a scope kept cold deliberately
+
+A scope (an org or user account) is **warm** once it hosts a fleet: shared Apps exist, `TS_OAUTH_*` and other scope-level credentials are already in place, and fleet N+1 inherits them. A **cold** scope has none of that, and every scope-level credential must be supplied — which is what `macf bootstrap secrets template` and the operator-inputs file exist for (§1).
+
+**Warmth is per-credential and per-actor, not per-scope.** A scope can hold the shared router and no Tailscale OAuth; it can be fully warm for fleet Apps and completely cold for a third-party controller that has never been installed. Ask *which prerequisites does this scope satisfy for this actor*, never *is this scope warm*.
+
+### If you are standing up an organisation in order to MEASURE a cold start, do not prepare it
+
+Every end-to-end fleet test to date has run on a scope that already hosted a fleet — shared Apps reused rather than created, credentials already deployed. **A cold start has therefore never been measured**, and it cannot be measured twice on the same scope: the first provision warms it permanently.
+
+> **A cold-test scope's entire value is that it is untouched. Every convenience installed there "to make it work" destroys the measurement it exists to produce.**
+
+So, on a scope reserved for that measurement: **no controller App, no shared router, no pre-seeded `TS_OAUTH_*`, no org variables, nothing.** Run `bootstrap apply` against it exactly as a newcomer would, with only the manifest and the operator-inputs file.
+
+**If it fails for want of something, that is the finding — not an obstacle to clear before the real test.** Record what was missing, then supply it through the supported path and note the cost. The list of things a fresh scope turns out to need *is* the result.
+
+**This does not apply to a working scope.** On `macf-experiment` or any scope in ordinary use, install what you need and fix what is broken; the constraint is specific to a scope being held as a measurement instrument.
+
 ## 7. Non-happy paths — what you actually hit, and why
 
 Each of these was live-observed this month provisioning real fleets in the
