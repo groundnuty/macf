@@ -233,12 +233,47 @@ export async function runBootstrapPlan(
 
   try {
     const observed = await resolved.observe(manifest);
-    const plan = computePlan(manifest, observed);
+    // groundnuty/macf#1220 — fleet-level (runner-ops/router) App
+    // installation-SCOPE-MEMBERSHIP drift: is a `selected` install's actual
+    // repo set still current now that the manifest may have grown since it
+    // was set? Needs an App JWT (see `install-scope-coverage.ts`'s module
+    // doc), so — same gate `resolveDeps` above already applies for
+    // `vaultAwareObserver` — this ONLY runs when BOTH `--vault` and
+    // `--identity-key` are given; without them this reads `{}` and the
+    // section is simply omitted below (not rendered as a wall of "unknown"
+    // — that would be noise on the common vault-free `plan` run, and
+    // nothing here degrades silently: `computeInstallScopeCoverage` itself
+    // still reports honest-`'unknown'` for anyone who calls it without a
+    // vault, this command just chooses not to on the common path).
+    //
+    // Computed BEFORE `computePlan` (moved here from after it, groundnuty/
+    // macf#1129 / #1229 / DR-043 Amendment P2, row 3) so its entries can be
+    // folded into `plan.items` as genuine `PlanItem`s (verb `update` for a
+    // confirmed `'drift'`) rather than only ever rendered as a discarded
+    // coverage-warning line — see `plan.ts::installScopeCoverageItem`'s
+    // doc. `computePlan` itself stays I/O-free: the live per-repo JWT probe
+    // already happened in THIS await, above the call.
+    const installScopeCoverage =
+      opts.vaultPath !== undefined && opts.identityKeyPath !== undefined
+        ? await computeInstallScopeCoverage(
+            manifest,
+            observed.lock,
+            Object.fromEntries(Object.entries(observed.agents).map(([role, a]) => [role, a.repo])) as Readonly<Record<string, Presence>>,
+            observed.controlRepoPresence,
+            { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath },
+          )
+        : {};
+    const plan = computePlan(manifest, observed, Object.values(installScopeCoverage));
     // groundnuty/macf#880 — the operator's consent-click budget, projected
     // from the SAME `plan.items` this render already computed (no new
     // observation; see `plan.ts`'s "Operator interaction budget" section
     // doc for why `--vault`/`--identity-key` on `plan` itself never tightens
     // this number — only `apply`'s confirm-before-create guard can).
+    // Unaffected by the `'install_scope'` items just folded in above:
+    // `countAppsToCreate` filters on `kind ∈ {app, runner_ops, router_app}`,
+    // and `installScopeCoverageItem` never emits those kinds nor a `'create'`
+    // verb (drift → update, covered → noop, unknown → no item) — see that
+    // function's own doc.
     const budget = operatorInteractionBudget(countAppsToCreate(plan.items));
 
     // groundnuty/macf#1203 — declared `network.advertise_host` vs. each
@@ -267,28 +302,11 @@ export async function runBootstrapPlan(
     // section, never interleaved with the plan-item/drift computations
     // above.
     const operatorInputs = operatorInputProvenance(manifest, fleetSecretsValues, scopeSecretsValues);
-    // groundnuty/macf#1220 — fleet-level (runner-ops/router) App
-    // installation-SCOPE-MEMBERSHIP drift: is a `selected` install's actual
-    // repo set still current now that the manifest may have grown since it
-    // was set? Needs an App JWT (see `install-scope-coverage.ts`'s module
-    // doc), so — same gate `resolveDeps` above already applies for
-    // `vaultAwareObserver` — this ONLY runs when BOTH `--vault` and
-    // `--identity-key` are given; without them the section is simply
-    // omitted (not rendered as a wall of "unknown" — that would be noise on
-    // the common vault-free `plan` run, and nothing here degrades silently:
-    // `computeInstallScopeCoverage` itself still reports honest-`'unknown'`
-    // for anyone who calls it without a vault, this command just chooses
-    // not to on the common path).
-    const installScopeCoverage =
-      opts.vaultPath !== undefined && opts.identityKeyPath !== undefined
-        ? await computeInstallScopeCoverage(
-            manifest,
-            observed.lock,
-            Object.fromEntries(Object.entries(observed.agents).map(([role, a]) => [role, a.repo])) as Readonly<Record<string, Presence>>,
-            observed.controlRepoPresence,
-            { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath },
-          )
-        : {};
+    // `installScopeCoverage` is now computed above, before `computePlan` —
+    // this section's TEXT/JSON rendering is otherwise unchanged: a
+    // `status: 'unknown'` entry never became a `PlanItem` (honest-unknown —
+    // see `installScopeCoverageItem`'s doc), so this is still the ONLY
+    // surface naming its unverified repos.
     const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
 
     if (opts.json) {

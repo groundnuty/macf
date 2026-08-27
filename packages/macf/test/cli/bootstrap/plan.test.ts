@@ -35,6 +35,7 @@ import { TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_FLAG } from '../../../src/cli/
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../../src/cli/bootstrap/registry-scope-preflight.js';
 import { validateInstallRepositoryScope } from '../../../src/cli/bootstrap/install-scope.js';
 import type { RunnerPlatformEndpointSource } from '../../../src/cli/bootstrap/runner-platform.js';
+import { installScopeCoverageDriftMessage, type InstallScopeCoverageEntry } from '../../../src/cli/bootstrap/install-scope-coverage.js';
 
 /** A minimal, valid, 2-agent manifest — no optional sections. */
 function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
@@ -1993,6 +1994,134 @@ describe('computePlan installScopeDrift — already-provisioned-fleet repository
     expect('install_scope_drift' in json).toBe(true);
     expect(Array.isArray(json.install_scope_drift)).toBe(true);
     expect((json.install_scope_drift as unknown[]).length).toBe(1);
+  });
+});
+
+// --- groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — row 3 of
+// the reconciler verb matrix: `update` computed for a REUSED fleet-level App
+// whose `selected` install set no longer covers the manifest's declared
+// repos. DECISIVE PAIR (per assert-the-wrong-path.md — (1) alone is
+// satisfied by emitting `update` for every entry regardless of status):
+//   1. declared + present + DIFFERS (status 'drift') → PlanItem, verb
+//      'update', naming the difference.
+//   2. declared + present + MATCHES (status 'covered') → PlanItem, verb
+//      'noop' — NOT omitted (unlike `status: 'unknown'` below), because the
+//      coverage check DID run and DID confirm a match; the operator should
+//      see that confirmation, not silence.
+// Plus the honest-unknown floor: `status: 'unknown'` produces NO
+// `'install_scope'` item at all — neither 'update' (would claim a
+// confirmed diff that was never observed) nor 'noop' (would claim a
+// confirmed match that was never observed). ---
+describe('computePlan installScopeCoverage — row 3, update computed for a REUSED App whose install set no longer covers the manifest (groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2)', () => {
+  const DRIFT_ENTRY: InstallScopeCoverageEntry = {
+    role: 'runner-ops',
+    appHandle: 'icsoc-2026-runner-ops',
+    expectedRepos: ['groundnuty/icsoc-2026-science-agent', 'groundnuty/icsoc-2026-experiment'],
+    status: 'drift',
+    missingRepos: ['groundnuty/icsoc-2026-experiment'],
+    unverifiedRepos: [],
+    message: installScopeCoverageDriftMessage('icsoc-2026-runner-ops', ['groundnuty/icsoc-2026-experiment']),
+  };
+
+  const COVERED_ENTRY: InstallScopeCoverageEntry = {
+    role: 'runner-ops',
+    appHandle: 'icsoc-2026-runner-ops',
+    expectedRepos: ['groundnuty/icsoc-2026-science-agent', 'groundnuty/icsoc-2026-experiment'],
+    status: 'covered',
+    missingRepos: [],
+    unverifiedRepos: [],
+  };
+
+  const UNKNOWN_ENTRY: InstallScopeCoverageEntry = {
+    role: 'router',
+    appHandle: 'icsoc-2026-router',
+    expectedRepos: ['groundnuty/icsoc-2026-science-agent'],
+    status: 'unknown',
+    missingRepos: [],
+    unverifiedRepos: ['groundnuty/icsoc-2026-science-agent'],
+    message: 'could not confirm',
+  };
+
+  it('is empty when no coverage entries are passed (the common, vault-free `plan` run — the 3rd param defaults to [])', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.items.filter((i) => i.kind === 'install_scope')).toEqual([]);
+  });
+
+  it("THE DECISIVE CASE — status 'drift' produces a PlanItem with verb 'update', naming the difference, confirm_required true", () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED, [DRIFT_ENTRY]);
+    const items = plan.items.filter((i) => i.kind === 'install_scope');
+    expect(items).toHaveLength(1);
+    expect(items[0]?.verb).toBe('update');
+    expect(items[0]?.confirm_required).toBe(true);
+    expect(items[0]?.reason).toBe(DRIFT_ENTRY.message);
+    expect(items[0]?.reason).toContain('icsoc-2026-experiment');
+  });
+
+  it("status 'covered' produces a PlanItem with verb 'noop' — the check ran and confirmed a match, so it is NOT omitted", () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED, [COVERED_ENTRY]);
+    const items = plan.items.filter((i) => i.kind === 'install_scope');
+    expect(items).toHaveLength(1);
+    expect(items[0]?.verb).toBe('noop');
+    expect(items[0]?.confirm_required).toBe(false);
+  });
+
+  it("honest-unknown floor — status 'unknown' produces NO 'install_scope' item at all (neither 'update' nor 'noop')", () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED, [UNKNOWN_ENTRY]);
+    const items = plan.items.filter((i) => i.kind === 'install_scope');
+    expect(items).toEqual([]);
+  });
+
+  it('a resource created THIS run (an ordinary "app"/"install" item) keeps its own verb — install_scope items are additive, never replace the existence items', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED, [DRIFT_ENTRY]);
+    // The existence-only items (kind 'app'/'install') are computed from
+    // ObservedState exactly as before — completely independent of the new
+    // 3rd parameter.
+    const appItems = plan.items.filter((i) => i.kind === 'app');
+    expect(appItems.length).toBeGreaterThan(0);
+    for (const item of appItems) expect(item.verb).toBe('create');
+    const installScopeItems = plan.items.filter((i) => i.kind === 'install_scope');
+    expect(installScopeItems).toHaveLength(1);
+    expect(installScopeItems[0]?.verb).toBe('update');
+  });
+
+  it('multiple entries (runner-ops drifted, router covered) — one item per entry, independently verbed', () => {
+    const routerCovered: InstallScopeCoverageEntry = { ...COVERED_ENTRY, role: 'router', appHandle: 'icsoc-2026-router' };
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED, [DRIFT_ENTRY, routerCovered, UNKNOWN_ENTRY]);
+    const items = plan.items.filter((i) => i.kind === 'install_scope');
+    // DRIFT_ENTRY (runner-ops) -> update, routerCovered -> noop,
+    // UNKNOWN_ENTRY (also role 'router', but this fixture never mixes it
+    // with routerCovered in the same call) -> omitted.
+    expect(items).toHaveLength(2);
+    expect(items.map((i) => i.verb).sort()).toEqual(['noop', 'update']);
+  });
+
+  it('countAppsToCreate is unaffected by install_scope items — they never carry kind app/runner_ops/router_app nor verb create', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED, [DRIFT_ENTRY]);
+    const withoutCoverage = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(countAppsToCreate(plan.items)).toBe(countAppsToCreate(withoutCoverage.items));
+  });
+
+  it("planItemApplyCoverage — 'install_scope' is ALWAYS 'implemented' (the widen-gate #1232/#1233 IS apply's code path for this verb)", () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED, [DRIFT_ENTRY, COVERED_ENTRY]);
+    const items = plan.items.filter((i) => i.kind === 'install_scope');
+    for (const item of items) expect(planItemApplyCoverage(item)).toBe('implemented');
+    expect(plan.unimplementedByApply.filter((i) => i.kind === 'install_scope')).toEqual([]);
+  });
+
+  it('fleetPlanToJson carries install_scope items generically inside `plan[]` — no special-casing needed', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED, [DRIFT_ENTRY]);
+    const json = fleetPlanToJson(plan) as { plan: readonly PlanItem[] };
+    const items = json.plan.filter((i) => i.kind === 'install_scope');
+    expect(items).toHaveLength(1);
+    expect(items[0]?.verb).toBe('update');
+  });
+
+  it('summarizePlan counts a drift item toward `updates` and a covered item toward `noops`', () => {
+    const driftPlan = computePlan(baseManifest(), EMPTY_OBSERVED, [DRIFT_ENTRY]);
+    const coveredPlan = computePlan(baseManifest(), EMPTY_OBSERVED, [COVERED_ENTRY]);
+    const baseline = summarizePlan(computePlan(baseManifest(), EMPTY_OBSERVED).items);
+    expect(summarizePlan(driftPlan.items).updates).toBe(baseline.updates + 1);
+    expect(summarizePlan(coveredPlan.items).noops).toBe(baseline.noops + 1);
   });
 });
 

@@ -46,6 +46,7 @@
 import { describe, it, expect } from 'vitest';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { computePlan, type ObservedState, type PlanItem, type PlanItemKind, type PlanVerb } from '../../../src/cli/bootstrap/plan.js';
+import type { InstallScopeCoverageEntry } from '../../../src/cli/bootstrap/install-scope-coverage.js';
 
 // --- Minimal, self-contained fixtures ---
 //
@@ -126,6 +127,7 @@ function classifyPlanItemKind(kind: PlanItemKind): Classification {
     case 'vault_recipients':
     case 'router_app':
     case 'ts_oauth':
+    case 'install_scope':
       return 'checkable';
   }
 }
@@ -150,6 +152,7 @@ const ALL_KINDS: readonly PlanItemKind[] = [
   'vault_recipients',
   'router_app',
   'ts_oauth',
+  'install_scope',
 ];
 
 describe('PlanItemKind coverage — every kind is classified exactly once (groundnuty/macf#926)', () => {
@@ -160,13 +163,15 @@ describe('PlanItemKind coverage — every kind is classified exactly once (groun
     for (const kind of ALL_KINDS) {
       expect(['write-always', 'checkable']).toContain(classifyPlanItemKind(kind));
     }
-    // 19 kinds as of groundnuty/macf#1211 (3 write-always + 16 checkable) —
+    // 20 kinds as of groundnuty/macf#1220 (3 write-always + 17 checkable) —
     // pins the count so a kind added to ALL_KINDS-but-not-the-switch (or
     // vice versa) is caught here even though both are hand-maintained lists
     // (the switch is compile-checked against the TYPE; this asserts the
     // array is compile-checked against the SWITCH's own domain by literally
-    // exercising every member).
-    expect(ALL_KINDS).toHaveLength(19);
+    // exercising every member). 'install_scope' joined at groundnuty/macf#1220
+    // / #1129 / #1229 / DR-043 Amendment P2 (row 3 of the reconciler verb
+    // matrix); was 19 (3 + 16) before it.
+    expect(ALL_KINDS).toHaveLength(20);
   });
 });
 
@@ -301,6 +306,27 @@ const PRESENCE_QUIET_OBSERVED: ObservedState = {
 
 const PRESENCE_ACTIVE_MANIFEST = presenceQuietManifest();
 
+// groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — row 3's
+// quiet/active pair, named (not inlined) so the `InstallScopeCoverageEntry`
+// import is load-bearing rather than type-only-inferred away.
+const INSTALL_SCOPE_COVERED_ENTRY: InstallScopeCoverageEntry = {
+  role: 'runner-ops',
+  appHandle: 'coverage-fleet-runner-ops',
+  expectedRepos: [REPO],
+  status: 'covered',
+  missingRepos: [],
+  unverifiedRepos: [],
+};
+const INSTALL_SCOPE_DRIFT_ENTRY: InstallScopeCoverageEntry = {
+  role: 'runner-ops',
+  appHandle: 'coverage-fleet-runner-ops',
+  expectedRepos: [REPO],
+  status: 'drift',
+  missingRepos: [REPO],
+  unverifiedRepos: [],
+  message: 'missing repo access',
+};
+
 const COVERAGE_CASES: readonly CoverageCase[] = [
   {
     kind: 'app',
@@ -353,6 +379,17 @@ const COVERAGE_CASES: readonly CoverageCase[] = [
     // meaning "verified missing" here.
     quiet: () => computePlan(manifest(), { ...EMPTY, vaultTsOauth: { status: 'confirmed', present: false } }),
     active: () => computePlan(manifest(), { ...EMPTY, vaultTsOauth: { status: 'confirmed', present: true } }),
+  },
+  {
+    // groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — row 3.
+    // The 3rd `computePlan` parameter is independent of `manifest`/
+    // `observed`, so the quiet/active fixtures below hold everything else
+    // constant and vary only the passed-in `InstallScopeCoverageEntry`
+    // array — same "drive exactly ONE kind" discipline every other row in
+    // this table follows.
+    kind: 'install_scope',
+    quiet: () => computePlan(manifest(), EMPTY, [INSTALL_SCOPE_COVERED_ENTRY]),
+    active: () => computePlan(manifest(), EMPTY, [INSTALL_SCOPE_DRIFT_ENTRY]),
   },
   {
     kind: 'routing',
