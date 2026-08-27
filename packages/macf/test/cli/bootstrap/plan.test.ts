@@ -933,6 +933,19 @@ describe('computePlan — row 4 (DR-043 Amendment P3, groundnuty/macf#1229): neg
   });
 });
 
+// groundnuty/macf#1229 — `routingDroppedItem` carries its OWN copy of the
+// row-4 lock-membership safety property (`ownedByThisTool`), independent of
+// the `extraRoles` loop's `lockRoles` gate above (different resource,
+// different code path — the routing variable is fleet-level, not per-role).
+// Empirically mutation-verified the SAME way: mutating `routingDroppedItem`'s
+// `const ownedByThisTool = representativeRole !== undefined && (lock?.agents
+// .some(...) ?? false);` to `const ownedByThisTool = true;` and running just
+// this describe block fails EXACTLY "emits NOTHING when the representative
+// role is NOT recorded in fleet.lock" (1 of 3) — "emits NOTHING when the
+// variable presence is unconfirmed" still PASSES under that mutation,
+// confirming the two early-returns (`observedTrustedActors === undefined`
+// vs. `!ownedByThisTool`) are genuinely independent checks, not one guard
+// doing double duty. Mutation reverted after confirming.
 describe('computePlan — row 4, the MACF_TRUSTED_ACTORS worked example (groundnuty/macf#1229 original motivating case): routing.runner DROPPED from the manifest', () => {
   it('emits a delete item when the variable is observed present AND the representative role is recorded in fleet.lock', () => {
     const manifest = baseManifest(); // routing.runner NOT declared
