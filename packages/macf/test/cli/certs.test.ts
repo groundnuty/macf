@@ -86,9 +86,12 @@ function baseConfig(project: string): MacfAgentConfig {
   };
 }
 
+// macf#1277: caDir is now owner+project-scoped. Matches baseConfig's fixed
+// `registry: { type: 'repo', owner: 'owner', ... }` — every call site in
+// this file uses baseConfig, so 'owner' is the correct literal everywhere.
 function cleanup(project: string, projectDir: string): void {
   rmSync(projectDir, { recursive: true, force: true });
-  rmSync(caDir(project), { recursive: true, force: true });
+  rmSync(caDir('owner', project), { recursive: true, force: true });
 }
 
 describe('certsInit / certsRotate — macf#800 out-of-band blast-radius WARN', () => {

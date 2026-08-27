@@ -12,6 +12,7 @@
 import { chmodSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { MacfAgentConfig } from './config.js';
+import { ownerAccountFromRegistry } from './config.js';
 import { MCP_SERVER_NAME } from './mcp-json.js';
 
 // ---------------------------------------------------------------------------
@@ -686,10 +687,35 @@ export function githubAppEnvLines(cfg: MacfAgentConfig): string[] {
  * In local-registry mode (DR-024) the CA lives next to the registry
  * file (`~/.macf/registry/<project>.ca.{crt,key}`) — set at
  * `macf init --local` time. In GitHub mode it lives under
- * `~/.macf/certs/<project>/`. Both modes need MACF_CA_CERT /
- * MACF_CA_KEY exported so the channel-server can load the CA for
- * mTLS (and the GitHub-mode `/sign` endpoint, which doesn't fire in
- * local mode).
+ * `~/.macf/certs/<owner>/<project>/` (owner-scoped as of macf#1277).
+ * Both modes need MACF_CA_CERT / MACF_CA_KEY exported so the
+ * channel-server can load the CA for mTLS (and the GitHub-mode `/sign`
+ * endpoint, which doesn't fire in local mode).
+ *
+ * **GitHub mode: runtime shell resolution, NOT a Node-side `existsSync`
+ * check (macf#1277).** This function stays a PURE generator (no disk I/O —
+ * see this file's module doc + `env-files.ts`'s identical twin
+ * `generateEnvCerts`) by emitting a runtime `[ -f ... ]` fallback chain
+ * INTO the launcher itself, evaluated by the AGENT's shell at actual
+ * launch time rather than decided once at generation time:
+ *
+ *  1. the owner-scoped conventional path — used if a CA already lives
+ *     there (a fresh mint, or an already-migrated fleet)
+ *  2. the pre-#1277 project-scoped, owner-less legacy path — used ONLY
+ *     when tier 1 is absent AND tier 2 has a file (an EXISTING fleet
+ *     whose CA was materialized before this change; `macf-trial` at
+ *     the time #1277 was filed)
+ *  3. the owner-scoped conventional path again — the fallback-of-last-
+ *     resort when NEITHER tier has a file yet (nothing to point at but
+ *     the correct future location; the channel-server fails loud on a
+ *     missing CA rather than this launcher inventing or minting one)
+ *
+ * This is what makes "the generated launcher for a pre-#1277 fleet keeps
+ * resolving without a re-deploy" true regardless of WHEN or WHERE
+ * `macf update` regenerates the launcher relative to the CA materialize
+ * step — the decision is deferred to the machine that actually has the
+ * CA on disk, at the moment it actually matters (agent launch), not
+ * baked in at generation time.
  */
 export function caPathLines(cfg: MacfAgentConfig): string[] {
   if (isLocalMode(cfg)) {
@@ -704,9 +730,24 @@ export function caPathLines(cfg: MacfAgentConfig): string[] {
       `export MACF_CA_KEY="${registryDir}/${cfg.project}.ca.key"`,
     ];
   }
+  const owner = ownerAccountFromRegistry(cfg.registry);
+  const conventionalCert = `$HOME/.macf/certs/${owner}/${cfg.project}/ca-cert.pem`;
+  const conventionalKey = `$HOME/.macf/certs/${owner}/${cfg.project}/ca-key.pem`;
+  const legacyCert = `$HOME/.macf/certs/${cfg.project}/ca-cert.pem`;
+  const legacyKey = `$HOME/.macf/certs/${cfg.project}/ca-key.pem`;
   return [
-    `export MACF_CA_CERT="$HOME/.macf/certs/${cfg.project}/ca-cert.pem"`,
-    `export MACF_CA_KEY="$HOME/.macf/certs/${cfg.project}/ca-key.pem"`,
+    `if [ -f "${conventionalCert}" ]; then`,
+    `  export MACF_CA_CERT="${conventionalCert}"`,
+    `  export MACF_CA_KEY="${conventionalKey}"`,
+    `elif [ -f "${legacyCert}" ]; then`,
+    '  # macf#1277: pre-owner-scoping fleet — CA still lives at the legacy',
+    '  # project-scoped path. Read-old, never write/migrate here.',
+    `  export MACF_CA_CERT="${legacyCert}"`,
+    `  export MACF_CA_KEY="${legacyKey}"`,
+    'else',
+    `  export MACF_CA_CERT="${conventionalCert}"`,
+    `  export MACF_CA_KEY="${conventionalKey}"`,
+    'fi',
   ];
 }
 

@@ -93,9 +93,10 @@ async function setupWorkspace(project: string): Promise<{
   };
   writeAgentConfig(projectDir, config);
 
-  const caCertP = caCertPath(project);
-  const caKeyP = caKeyPath(project);
-  mkdirSync(caDir(project), { recursive: true, mode: 0o700 });
+  // Fixed config.registry above -> owner resolves to the literal 'owner'.
+  const caCertP = caCertPath('owner', project);
+  const caKeyP = caKeyPath('owner', project);
+  mkdirSync(caDir('owner', project), { recursive: true, mode: 0o700 });
   await createCA({ project, certPath: caCertP, keyPath: caKeyP });
 
   return { projectDir, caCertPath: caCertP, caKeyPath: caKeyP };
@@ -103,7 +104,7 @@ async function setupWorkspace(project: string): Promise<{
 
 function cleanup(project: string, projectDir: string): void {
   rmSync(projectDir, { recursive: true, force: true });
-  rmSync(caDir(project), { recursive: true, force: true });
+  rmSync(caDir('owner', project), { recursive: true, force: true });
 }
 
 describe('issueRoutingClient (#119)', () => {

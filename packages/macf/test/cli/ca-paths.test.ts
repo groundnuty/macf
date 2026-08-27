@@ -37,34 +37,50 @@ describe('isValidProjectName', () => {
   });
 });
 
+// macf#1277: caDir/caCertPath/caKeyPath are now owner+project-scoped
+// (`~/.macf/certs/<owner>/<project>/`). Owner-scoping-SPECIFIC coverage
+// (the decisive pair, the legacy fallback, resolveExistingCaPaths) lives
+// in the dedicated `ca-owner-scoping.test.ts`, mirroring the macf#1214
+// precedent's `fleet-deploy-owner-scoping.test.ts` split. This file keeps
+// its original PR #36 project-namespacing coverage, updated to pass a
+// fixed owner through every call.
 describe('caDir / caCertPath / caKeyPath', () => {
-  it('returns per-project subdirectory', () => {
-    expect(caDir('macf')).toBe(join(GLOBAL, 'certs', 'macf'));
-    expect(caDir('academic-resume')).toBe(join(GLOBAL, 'certs', 'academic-resume'));
+  it('returns per-owner, per-project subdirectory', () => {
+    expect(caDir('acme', 'macf')).toBe(join(GLOBAL, 'certs', 'acme', 'macf'));
+    expect(caDir('acme', 'academic-resume')).toBe(join(GLOBAL, 'certs', 'acme', 'academic-resume'));
   });
 
   it('different projects get different directories (no collision)', () => {
-    expect(caDir('proj-a')).not.toBe(caDir('proj-b'));
-    expect(caCertPath('proj-a')).not.toBe(caCertPath('proj-b'));
-    expect(caKeyPath('proj-a')).not.toBe(caKeyPath('proj-b'));
+    expect(caDir('acme', 'proj-a')).not.toBe(caDir('acme', 'proj-b'));
+    expect(caCertPath('acme', 'proj-a')).not.toBe(caCertPath('acme', 'proj-b'));
+    expect(caKeyPath('acme', 'proj-a')).not.toBe(caKeyPath('acme', 'proj-b'));
   });
 
-  it('caCertPath returns ca-cert.pem in project dir', () => {
-    expect(caCertPath('macf')).toBe(join(GLOBAL, 'certs', 'macf', 'ca-cert.pem'));
+  it('caCertPath returns ca-cert.pem in owner/project dir', () => {
+    expect(caCertPath('acme', 'macf')).toBe(join(GLOBAL, 'certs', 'acme', 'macf', 'ca-cert.pem'));
   });
 
-  it('caKeyPath returns ca-key.pem in project dir', () => {
-    expect(caKeyPath('macf')).toBe(join(GLOBAL, 'certs', 'macf', 'ca-key.pem'));
+  it('caKeyPath returns ca-key.pem in owner/project dir', () => {
+    expect(caKeyPath('acme', 'macf')).toBe(join(GLOBAL, 'certs', 'acme', 'macf', 'ca-key.pem'));
   });
 
   it('rejects invalid project names to prevent path traversal', () => {
-    expect(() => caDir('../escape')).toThrow('Invalid project name');
-    expect(() => caCertPath('../escape')).toThrow('Invalid project name');
-    expect(() => caKeyPath('../escape')).toThrow('Invalid project name');
-    expect(() => caDir('with/slash')).toThrow('Invalid project name');
+    expect(() => caDir('acme', '../escape')).toThrow('Invalid project name');
+    expect(() => caCertPath('acme', '../escape')).toThrow('Invalid project name');
+    expect(() => caKeyPath('acme', '../escape')).toThrow('Invalid project name');
+    expect(() => caDir('acme', 'with/slash')).toThrow('Invalid project name');
   });
 
   it('rejects empty project name', () => {
-    expect(() => caDir('')).toThrow('Invalid project name');
+    expect(() => caDir('acme', '')).toThrow('Invalid project name');
+  });
+
+  it('rejects invalid owner names to prevent path traversal', () => {
+    expect(() => caDir('../escape', 'macf')).toThrow('Invalid owner name');
+    expect(() => caDir('with/slash', 'macf')).toThrow('Invalid owner name');
+  });
+
+  it('rejects empty owner name', () => {
+    expect(() => caDir('', 'macf')).toThrow('Invalid owner name');
   });
 });

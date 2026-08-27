@@ -20,8 +20,9 @@
  * this seam could read a real key as "already present" or (worse) overwrite
  * one. The ONE exception is the "REAL `initAgent`, the decisive
  * seam-call-count proof" block near the end of this file: `commands/init.ts`'s
- * GitHub-mode cert-flow has NO path-override seam for the per-project CA
- * (`caCertPath(project)`/`caKeyPath(project)`, home-dir-rooted, always), so
+ * GitHub-mode cert-flow has NO path-override seam for the per-owner,
+ * per-project CA (`caCertPath(owner, project)`/`caKeyPath(owner, project)`,
+ * home-dir-rooted, always — owner-scoped as of macf#1277), so
  * proving the REAL integration doesn't double-issue a cert requires the CA
  * to actually live there. That block follows `certs.test.ts`'s own
  * established convention instead — a RANDOMIZED, per-test project name
@@ -134,6 +135,7 @@ function removeFromAgentsIndex(absDir: string): void {
 }
 
 const FLEET = 'demo-fleet';
+const OWNER = 'demo-owner';
 const ROLE = 'code-agent';
 const AGENT: FleetAgent = { role: ROLE, profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/unused-in-tests' };
 
@@ -1026,7 +1028,7 @@ function vaultRawWithCa(ca: { readonly certPem: string; readonly keyPem: string 
 
 describe('materializeProjectCa (unit-level)', () => {
   it('vault has no CA fields at all: "vault-absent", never touches the filesystem (caCertPathFor/caKeyPathFor are never called)', async () => {
-    const outcome = await materializeProjectCa(vaultRawFor('111', '222', PEM), FLEET, {
+    const outcome = await materializeProjectCa(vaultRawFor('111', '222', PEM), OWNER, FLEET, {
       caCertPathFor: () => {
         throw new Error('must not be called — vault has no CA to compare against');
       },
@@ -1043,7 +1045,7 @@ describe('materializeProjectCa (unit-level)', () => {
     const caCertFilePath = join(dir, 'ca-cert.pem');
     const caKeyFilePath = join(dir, 'ca-key.pem');
 
-    const outcome = await materializeProjectCa(vaultRawWithCa(ca), FLEET, {
+    const outcome = await materializeProjectCa(vaultRawWithCa(ca), OWNER, FLEET, {
       caCertPathFor: () => caCertFilePath,
       caKeyPathFor: () => caKeyFilePath,
     });
@@ -1065,7 +1067,7 @@ describe('materializeProjectCa (unit-level)', () => {
     const certMtimeBefore = statSync(caCertFilePath).mtimeMs;
     const keyMtimeBefore = statSync(caKeyFilePath).mtimeMs;
 
-    const outcome = await materializeProjectCa(vaultRawWithCa(ca), FLEET, {
+    const outcome = await materializeProjectCa(vaultRawWithCa(ca), OWNER, FLEET, {
       caCertPathFor: () => caCertFilePath,
       caKeyPathFor: () => caKeyFilePath,
     });
@@ -1088,7 +1090,7 @@ describe('materializeProjectCa (unit-level)', () => {
     const vaultFp = caCertFingerprint(vaultCa.certPem);
 
     try {
-      await materializeProjectCa(vaultRawWithCa(vaultCa), FLEET, {
+      await materializeProjectCa(vaultRawWithCa(vaultCa), OWNER, FLEET, {
         caCertPathFor: () => caCertFilePath,
         caKeyPathFor: () => caKeyFilePath,
       });
@@ -1116,7 +1118,7 @@ describe('materializeProjectCa (unit-level)', () => {
     const caKeyFilePath = join(dir, 'ca-key.pem');
     writeFileSync(caCertFilePath, 'SOME-ORPHANED-CERT-WITHOUT-A-KEY', { mode: 0o644 });
 
-    const outcome = await materializeProjectCa(vaultRawWithCa(ca), FLEET, {
+    const outcome = await materializeProjectCa(vaultRawWithCa(ca), OWNER, FLEET, {
       caCertPathFor: () => caCertFilePath,
       caKeyPathFor: () => caKeyFilePath,
     });
@@ -1137,6 +1139,7 @@ describe('materializeProjectCa (unit-level)', () => {
 
     const outcome = await materializeProjectCa(
       vaultRawWithCa(vaultCa),
+      OWNER,
       FLEET,
       { caCertPathFor: () => caCertFilePath, caKeyPathFor: () => caKeyFilePath },
       true, // forceCa
@@ -1165,7 +1168,7 @@ describe('materializeProjectCa (unit-level)', () => {
     writeFileSync(caKeyFilePath, localCa.keyPem, { mode: 0o600 });
 
     try {
-      await materializeProjectCa(vaultRawWithCa(vaultCa), FLEET, {
+      await materializeProjectCa(vaultRawWithCa(vaultCa), OWNER, FLEET, {
         caCertPathFor: () => caCertFilePath,
         caKeyPathFor: () => caKeyFilePath,
       });
@@ -1439,13 +1442,13 @@ describe('deployAgent — REAL `initAgent`, the decisive seam-call-count proof (
       // real crypto: a genuine, CA-signed cert landed at the conventional
       // path — not merely "some file got written."
       const issuedCertPem = readFileSync(agentCertPath(destDir), 'utf-8');
-      const caX509 = new X509Certificate(readFileSync(caCertPath(project), 'utf-8'));
+      const caX509 = new X509Certificate(readFileSync(caCertPath(manifest.owner.account, project), 'utf-8'));
       const issued = new X509Certificate(issuedCertPem);
       expect(issued.checkIssued(caX509)).toBe(true);
       expect(issued.verify(caX509.publicKey)).toBe(true);
       expect(issued.subject).toBe(`CN=${role}`);
     } finally {
-      rmSync(caDir(project), { recursive: true, force: true });
+      rmSync(caDir(manifest.owner.account, project), { recursive: true, force: true });
       removeFromAgentsIndex(destDir);
     }
   });

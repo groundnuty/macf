@@ -40,6 +40,7 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { MacfAgentConfig } from './config.js';
+import { ownerAccountFromRegistry } from './config.js';
 
 // ---------------------------------------------------------------------------
 // Headers
@@ -391,12 +392,28 @@ export function generateEnvGitHub(config: MacfAgentConfig): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Generate `.claude/.macf/env.certs` content.
+ * Generate `.claude/.macf/env.certs` content — the LIVE artifact
+ * `claude.sh` sources at every launch (post-macf#342; `claude-sh.ts`'s own
+ * `caPathLines` is a pre-#342 vestige kept for its exported-API shape, not
+ * called by anything — see that function's own doc for why it carries the
+ * identical fix).
  *
  * CA + agent cert paths + log path. Local-mode CAs live next to the
  * registry file (`~/.macf/registry/<project>.ca.{crt,key}`), GitHub-mode
- * CAs live under `~/.macf/certs/<project>/`. Both modes need
- * MACF_CA_CERT/MACF_CA_KEY exported for channel-server mTLS.
+ * CAs live under `~/.macf/certs/<owner>/<project>/` (owner-scoped as of
+ * macf#1277). Both modes need MACF_CA_CERT/MACF_CA_KEY exported for
+ * channel-server mTLS.
+ *
+ * **GitHub mode: runtime shell resolution, NOT a Node-side `existsSync`
+ * check.** This function stays a PURE generator (no disk I/O — see this
+ * file's own module doc: "Pure functions — no file I/O, no side effects")
+ * by emitting a runtime `[ -f ... ]` fallback chain into `env.certs`
+ * itself, evaluated by the agent's shell at actual launch time. See
+ * `claude-sh.ts::caPathLines`'s doc for the full 3-tier rationale (owner-
+ * scoped conventional → pre-#1277 project-scoped legacy → conventional
+ * fallback-of-last-resort) — duplicated here rather than imported, same as
+ * every other per-concern emitter this file already duplicates from
+ * `claude-sh.ts` (see this file's module doc).
  */
 export function generateEnvCerts(config: MacfAgentConfig): string {
   const lines: string[] = [
@@ -416,9 +433,24 @@ export function generateEnvCerts(config: MacfAgentConfig): string {
       `export MACF_CA_KEY="${registryDir}/${config.project}.ca.key"`,
     );
   } else {
+    const owner = ownerAccountFromRegistry(config.registry);
+    const conventionalCert = `$HOME/.macf/certs/${owner}/${config.project}/ca-cert.pem`;
+    const conventionalKey = `$HOME/.macf/certs/${owner}/${config.project}/ca-key.pem`;
+    const legacyCert = `$HOME/.macf/certs/${config.project}/ca-cert.pem`;
+    const legacyKey = `$HOME/.macf/certs/${config.project}/ca-key.pem`;
     lines.push(
-      `export MACF_CA_CERT="$HOME/.macf/certs/${config.project}/ca-cert.pem"`,
-      `export MACF_CA_KEY="$HOME/.macf/certs/${config.project}/ca-key.pem"`,
+      `if [ -f "${conventionalCert}" ]; then`,
+      `  export MACF_CA_CERT="${conventionalCert}"`,
+      `  export MACF_CA_KEY="${conventionalKey}"`,
+      `elif [ -f "${legacyCert}" ]; then`,
+      '  # macf#1277: pre-owner-scoping fleet — CA still lives at the legacy',
+      '  # project-scoped path. Read-old, never write/migrate here.',
+      `  export MACF_CA_CERT="${legacyCert}"`,
+      `  export MACF_CA_KEY="${legacyKey}"`,
+      'else',
+      `  export MACF_CA_CERT="${conventionalCert}"`,
+      `  export MACF_CA_KEY="${conventionalKey}"`,
+      'fi',
     );
   }
 
