@@ -442,7 +442,7 @@ install, or repo, nor the vault.
    |---|---|---|
    | `macf` | code→`groundnuty/macf`, science→`groundnuty/macf-science-agent`, devops→`groundnuty/macf-devops-toolkit`, auditor→`groundnuty/macf-auditor-agent` | this repo's own `.github/agent-config.json` |
    | `icsoc-2026` | science→`groundnuty/icsoc-2026-science-agent`, code→`groundnuty/icsoc-2026-code-agent`, paper→`groundnuty/icsoc-2026-paper` | repo names only (naming convention + macf#878's role list) — this pass did not independently read `icsoc-2026`'s own `agent-config.json` |
-   | `ppam-2026` | **unconfirmed** | the `groundnuty` org has exactly one `ppam-2026` repo, yet the registry records two permanent agents (code, science) — the per-role repo split either lives under a different owner or this fleet predates the one-repo-per-role convention; confirm before scaffolding, do not guess |
+   | `ppam-2026` | **out of scope — local-registry fleet** | Resolved (macf#1307, 2026-08-27): this is a **DR-024 local-registry fleet**, not a GitHub-routed one. `~/.macf/registry/ppam-2026.json` records **one** agent (`science-agent`, `repo=None`, `host=127.0.0.1`) — `repo=None` is correct for that mode, not a missing binding. The earlier "two permanent agents" reading came from `~/.macf/agents.json`, a 2-entry index spanning **all** fleets. The similarly-named `ppam-2026-mcp-onedata-replication-package` has no `.github/workflows` and is not a routing caller. **This procedure does not apply**: it assumes GitHub-hosted per-role agent repos, which this fleet has never had. Note `groundnuty` is a **User**, not an Organization, so `GET /orgs/groundnuty/...` returns 404 by construction — that 404 is not evidence about any fleet's registry. |
 
 2. **Draft a manifest from live state:**
 
