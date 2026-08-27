@@ -89,6 +89,15 @@ const execFileAsync = promisify(execFile);
  * links, and extracting every number would produce false "cleared"
  * verdicts. Only a number immediately following one of five deferral
  * phrases counts.
+ *
+ * CAP DISCLOSURE (amendment 3): the issue's required-list explicitly says
+ * "cap it and say what was capped" — a truncated list that renders
+ * identically to a complete one is its own false-by-omission (a reader
+ * seeing 5 items with no signal that 34 more exist reads the sweep as
+ * exhaustive). `totalStale` carries the pre-cap candidate count so
+ * `format.ts`'s `formatReporterStallSweep` can disclose "N of M" whenever
+ * `DEFAULT_REPORTER_STALL_LIMIT` actually bit. See that constant's doc for
+ * the measured population this bounds.
  */
 
 export interface ReporterStallDeferral {
