@@ -37,6 +37,7 @@ import {
   fleetPlanFailureToJson,
   fleetPlanToJson,
   formatOperatorInteractionLine,
+  formatOrphanLines,
   formatPlanText,
   formatUnimplementedLines,
   operatorInteractionBudget,
@@ -1023,6 +1024,23 @@ export function formatApprovalBanner(plan: FleetPlan, creations: readonly Planne
   } else {
     lines.push(headline);
     lines.push(...formatDeletionEnumerationLines(deletionActions));
+  }
+  // groundnuty/macf#1281 — the SAME loud orphan block `formatPlanText`
+  // (plan.ts) already renders, reused verbatim via {@link formatOrphanLines}
+  // rather than a second hand-authored copy of the wording. This is the
+  // "text appears on the apply surface too" half of the issue's AC: before
+  // #1281, an orphan item was invisible in THIS banner — the operator's
+  // last read before typing "yes" said nothing about it at all, even though
+  // `summary.orphans > 0` means at least one App/repo this tool made is
+  // being left behind, unremoved, un-mentioned here.
+  const orphanLines = formatOrphanLines(plan.items);
+  if (orphanLines.length > 0) {
+    lines.push(
+      `⚠ ${String(orphanLines.length)} resource(s) are ORPHAN — created by this tool, no longer declared, and ` +
+        'NEVER deleted by apply, under any flag. NOTHING IS DELETED for these; each line names how to remove ' +
+        'it yourself, by hand, if it should go away:',
+      ...orphanLines,
+    );
   }
   // macf#854 — the plan above already lists the NOT-IMPLEMENTED items loudly
   // (formatPlanText), but this is the LAST thing the operator reads before

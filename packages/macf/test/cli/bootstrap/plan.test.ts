@@ -13,6 +13,7 @@ import {
   fleetPlanToJson,
   formatInstallScopeDriftLines,
   formatOperatorInteractionLine,
+  formatOrphanLines,
   formatPlanText,
   formatRegistryScopeLines,
   formatScopeCredentialLines,
@@ -20,6 +21,7 @@ import {
   formatUnimplementedLines,
   operatorInteractionBudget,
   operatorInteractionToJson,
+  orphanResourceUrl,
   planItemApplyCoverage,
   scopeCredentialNotice,
   summarizePlan,
@@ -990,6 +992,126 @@ describe('computePlan — row 4, the MACF_TRUSTED_ACTORS worked example (groundn
     };
     const plan = computePlan(manifest, observed);
     expect(plan.items.some((i) => i.kind === 'routing')).toBe(false);
+  });
+});
+
+// --- groundnuty/macf#1281 — an orphan row says explicitly that nothing was
+// deleted, and carries a link to delete it by hand -------------------------
+
+describe('orphanResourceUrl (groundnuty/macf#1281) — the pure URL a row-4 orphan item points the operator at', () => {
+  it('app orphan, user(personal)-owned fleet → the personal-account Advanced-tab URL', () => {
+    const owner: FleetManifest['owner'] = { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } };
+    expect(orphanResourceUrl('app', 'icsoc-2026', 'dropped-agent', owner)).toBe('https://github.com/settings/apps/icsoc-2026-dropped-agent/advanced');
+  });
+
+  it('app orphan, org-owned fleet → the ORG Advanced-tab URL — a DIFFERENT path from the personal-account one', () => {
+    const owner: FleetManifest['owner'] = { account: 'demo-org', type: 'org', registry: { type: 'org', org: 'demo-org' } };
+    expect(orphanResourceUrl('app', 'icsoc-2026', 'dropped-agent', owner)).toBe(
+      'https://github.com/organizations/demo-org/settings/apps/icsoc-2026-dropped-agent/advanced',
+    );
+  });
+
+  it('repo orphan → ALWAYS "unknown", never a guessed link, regardless of owner type', () => {
+    const userOwner: FleetManifest['owner'] = { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } };
+    const orgOwner: FleetManifest['owner'] = { account: 'demo-org', type: 'org', registry: { type: 'org', org: 'demo-org' } };
+    // groundnuty/macf#1281's own AC text asks for a real `https://github.com/
+    // <owner>/<repo>/settings` link here — but `FleetLockAgentSchema` (see
+    // fleet-manifest.ts) carries NO `repo` field for any role, so a row-4
+    // "extra role" (by definition, one absent from `manifest.agents[]`) has
+    // no repo full name anywhere this tool can read. `apply-delete.ts`'s own
+    // module doc hit this identical wall for the `'secret_fingerprint'`
+    // delete-verb case and refused to guess (a guessed repo name would risk
+    // sending the operator to delete the WRONG repository — strictly worse
+    // than the App case's "wrong link" hazard the issue itself warns about).
+    // This test — and `orphanResourceUrl`'s own doc — is the flagged
+    // divergence: implemented as honest-`'unknown'`, not a literal filled-in
+    // URL, because the data to fill it in does not exist in this codebase.
+    expect(orphanResourceUrl('repo', 'icsoc-2026', 'dropped-agent', userOwner)).toBe('unknown');
+    expect(orphanResourceUrl('repo', 'icsoc-2026', 'dropped-agent', orgOwner)).toBe('unknown');
+  });
+});
+
+describe('orphan rows say "not deleted" + carry a link, on BOTH the plan and apply surfaces (groundnuty/macf#1281)', () => {
+  it('DECISIVE (1): a plan with an orphan item says nothing was deleted, and carries a class-correct URL', () => {
+    const manifest = baseManifest({ owner: { account: 'demo-org', type: 'org', registry: { type: 'org', org: 'demo-org' } } });
+    const observed: ObservedState = {
+      lock: lockWithRole('dropped-agent'),
+      agents: extraRoleObserved('dropped-agent'),
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+    const text = formatPlanText(plan);
+    expect(text).toMatch(/NOTHING (WAS|IS) DELETED/);
+    expect(text).toContain('https://github.com/organizations/demo-org/settings/apps/icsoc-2026-dropped-agent/advanced');
+  });
+
+  it('DECISIVE (2): a plan with NO orphan items renders no orphan notice at all — no noise', () => {
+    const manifest = baseManifest();
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(plan.items.some((i) => i.verb === 'orphan')).toBe(false);
+    expect(formatOrphanLines(plan.items)).toEqual([]);
+    expect(formatPlanText(plan)).not.toMatch(/ORPHAN/);
+  });
+
+  it('a repo orphan and an App orphan get class-correct URLs in the RENDERED plan reason — repo is "unknown", App is a real, resolvable link', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: lockWithRole('dropped-agent'),
+      agents: extraRoleObserved('dropped-agent'),
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+    const appItem = plan.items.find((i) => i.kind === 'app' && i.verb === 'orphan');
+    const repoItem = plan.items.find((i) => i.kind === 'repo' && i.verb === 'orphan');
+    expect(appItem?.reason).toContain('https://github.com/settings/apps/icsoc-2026-dropped-agent/advanced');
+    expect(repoItem?.reason).toContain('unknown');
+    // Never a guessed repo-settings link — a wrong link is worse than none.
+    expect(repoItem?.reason).not.toMatch(/https:\/\/github\.com\/\S+\/settings/);
+  });
+
+  it('org-owned vs user-owned App orphan resolves to a DIFFERENT, class-correct path each time, in the RENDERED reason', () => {
+    const observed: ObservedState = {
+      lock: lockWithRole('dropped-agent'),
+      agents: extraRoleObserved('dropped-agent'),
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const userPlan = computePlan(baseManifest(), observed);
+    const orgPlan = computePlan(baseManifest({ owner: { account: 'demo-org', type: 'org', registry: { type: 'org', org: 'demo-org' } } }), observed);
+    const userAppReason = userPlan.items.find((i) => i.kind === 'app' && i.verb === 'orphan')?.reason ?? '';
+    const orgAppReason = orgPlan.items.find((i) => i.kind === 'app' && i.verb === 'orphan')?.reason ?? '';
+    expect(userAppReason).toContain('https://github.com/settings/apps/icsoc-2026-dropped-agent/advanced');
+    expect(userAppReason).not.toContain('/organizations/');
+    expect(orgAppReason).toContain('https://github.com/organizations/demo-org/settings/apps/icsoc-2026-dropped-agent/advanced');
+  });
+
+  it('a `delete` item never renders orphan language — the two verbs must not blur, since one removes and the other does not', () => {
+    // Same fixture the routingDroppedItem describe block above uses: a
+    // DECLARED role's routing var observed present + no longer wanted →
+    // exactly ONE 'routing'-kind delete item, no app/repo orphan items in
+    // the same plan (row 4's per-role loop never even runs — `agents: {}`).
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: lockWithRole('science-agent'), // manifest.agents[0].role
+      agents: {},
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+      routingTrustedActors: 'icsoc-2026-science-agent[bot],icsoc-2026-code-agent[bot]',
+    };
+    const plan = computePlan(manifest, observed);
+    const deleteItems = plan.items.filter((i) => i.verb === 'delete');
+    expect(deleteItems.length).toBeGreaterThan(0);
+    for (const item of deleteItems) {
+      expect(item.reason.toLowerCase()).not.toContain('orphan');
+    }
+    expect(formatOrphanLines(plan.items)).toEqual([]);
+    expect(formatPlanText(plan)).not.toMatch(/ORPHAN/);
   });
 });
 
