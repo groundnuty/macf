@@ -131,6 +131,19 @@ export interface ComposeFleetLockInput {
    * credential has none to record.
    */
   readonly scopeCredentials?: readonly ScopeCredentialUpdate[];
+  /**
+   * groundnuty/macf#1230 — the recipient set `apply` is recording THIS
+   * run (the manifest's declared `transport.age_recipients`, verbatim,
+   * whenever the vault was actually written/reconciled against it this
+   * run). `undefined` when this run touched no vault recipient state at
+   * all — the untouched-carries-forward convention every other fleet-level
+   * field in this module already follows ({@link mergeVersions},
+   * {@link mergeFingerprints}). NEVER pass an empty array to mean "nothing
+   * to record" — that would collide with the real, distinct meaning `[]`
+   * carries here (the manifest legitimately declares zero recipients);
+   * omit the field entirely instead.
+   */
+  readonly ageRecipients?: readonly string[];
 }
 
 /**
@@ -235,6 +248,38 @@ function mergeScopeCredentials(
 }
 
 /**
+ * Merge `age_recipients` (groundnuty/macf#1230) — FRESH, when supplied,
+ * REPLACES the recorded set WHOLESALE; it is never merged/unioned with
+ * `previous`. This is deliberately different from {@link mergeFingerprints}
+ * (which grows a map across runs, one entry per DISTINCT secret name):
+ * `age_recipients` records a single authoritative fact — "the set apply
+ * last successfully wrote the vault against" — not an accumulating
+ * history. A caller that instead unioned fresh with previous would
+ * silently defeat the narrowing detection this field exists to feed
+ * (`age-recipients-narrowing.ts`, not yet wired): a removed recipient
+ * would keep reappearing in every subsequent lock forever, and "recorded
+ * minus desired" would never be non-empty again.
+ *
+ * `undefined` (never `[]`) when NEITHER `fresh` nor `previous` has a value
+ * — see {@link FleetLockSchema}'s own doc on this field for the
+ * absent-means-unknown / `[]`-means-a-real-empty-set distinction this
+ * preserves.
+ *
+ * Order is PRESERVED, never sorted, in both branches — `transport
+ * .age_recipients`'s own doc (`fleet-manifest.ts`) notes position carries
+ * real information (the operator's key first, the VM's second); sorting
+ * would erase that and make a future refusal message list recipients in
+ * an order the operator doesn't recognize from their own `fleet.yaml`.
+ */
+function mergeAgeRecipients(
+  previous: readonly string[] | undefined,
+  fresh: readonly string[] | undefined,
+): string[] | undefined {
+  if (fresh !== undefined) return [...fresh];
+  return previous !== undefined ? [...previous] : undefined;
+}
+
+/**
  * Compose a `fleet.lock` from a previously-observed lock (or none) plus what
  * THIS apply run established. Pure — no I/O, no clock, no randomness — and
  * always re-validated via `FleetLockSchema.parse()` before returning: "fail
@@ -282,6 +327,7 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
   const fingerprints = mergeFingerprints(input.previous?.fingerprints, input.fleetSecrets);
   const versions = mergeVersions(input.previous?.versions, input.versions);
   const scopeCredentials = mergeScopeCredentials(input.previous?.scope_credentials, input.scopeCredentials);
+  const ageRecipients = mergeAgeRecipients(input.previous?.age_recipients, input.ageRecipients);
 
   const composed: FleetLock = {
     schema_version: FLEET_LOCK_SCHEMA_VERSION,
@@ -290,6 +336,7 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
     ...(versions !== undefined ? { versions } : {}),
     ...(fingerprints !== undefined ? { fingerprints } : {}),
     ...(scopeCredentials !== undefined ? { scope_credentials: scopeCredentials } : {}),
+    ...(ageRecipients !== undefined ? { age_recipients: ageRecipients } : {}),
   };
 
   return { lock: FleetLockSchema.parse(composed), identityChanges };
@@ -362,6 +409,7 @@ export function serializeFleetLock(lock: FleetLock): string {
     versions?: Partial<FleetVersions>;
     fingerprints?: Record<string, string>;
     scope_credentials?: ScopeCredentialMarker[];
+    age_recipients?: string[];
   } = {
     schema_version: validated.schema_version,
     fleet: validated.fleet,
@@ -372,6 +420,10 @@ export function serializeFleetLock(lock: FleetLock): string {
   if (validated.scope_credentials !== undefined) {
     ordered.scope_credentials = [...validated.scope_credentials].sort((a, b) => a.role.localeCompare(b.role)).map(orderedScopeCredential);
   }
+  // groundnuty/macf#1230 — NOT sorted (unlike every other array field
+  // above): position is real information here (mergeAgeRecipients's own
+  // doc), so this is a verbatim copy, order preserved.
+  if (validated.age_recipients !== undefined) ordered.age_recipients = [...validated.age_recipients];
   return `${JSON.stringify(ordered, null, 2)}\n`;
 }
 

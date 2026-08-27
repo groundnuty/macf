@@ -247,6 +247,16 @@ export const OPERATOR_SECRETS_FILE_KEYS: readonly OperatorSecretsFileKeyInfo[] =
     storageClass: 'ephemeral-discard',
   },
   {
+    // groundnuty/macf#1238 — THIS KEY IS THE EXCEPTION TO THIS FILE'S ORDERING.
+    // `resolveOperatorInput` below resolves flag > fleet-file > scope-file > env.
+    // This one key does NOT use that chain: `runner-platform.ts` owns its
+    // resolution and ranks a REAL environment variable ABOVE both file tiers
+    // (flag > env > fleet-file > scope-file > scope-var > manifest), preserving
+    // the precedence the retired env-planting had. Two orderings coexist
+    // deliberately. If a third key ever needs the runner-platform treatment,
+    // harmonise them then — and read this note first, because the exception is
+    // documented at `runner-platform.ts`'s resolver and, until now, the norm
+    // said nothing about it.
     key: RUNNER_PLATFORM_ENDPOINT_ENV_VAR,
     purpose: 'The tailnet hostname of the runner-provisioning platform apply calls to warm self-hosted runners.',
     howToObtain: "The operator's own runner-platform deployment address, e.g. http://<tailnet-host>:8088 — ask whoever runs it.",
