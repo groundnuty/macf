@@ -54,7 +54,8 @@ export interface InitOptions {
   /**
    * Source path of the downloaded App private key (.pem) to INGEST into the
    * conventional destination (`--key-path`, default
-   * `~/.macf/keys/<project>/<agent>.pem` — macf#1157) with `0600` perms at
+   * `~/.macf/keys/<owner>/<project>/<agent>.pem` — macf#1157; owner-scoped
+   * as of macf#1214) with `0600` perms at
    * init time. Closes the macf#530 "pointer set without
    * the thing it points to" papercut — without ingestion the operator must
    * hand-`cp` the key and a wrong path/perm surfaces later as a cryptic
@@ -303,9 +304,9 @@ function validateInitOpts(opts: InitOptions): void {
     throw new Error('installId is required (--install-id; omit only when using --local)');
   }
   // keyPath is OPTIONAL (macf#530): when omitted it defaults to the
-  // conventional ~/.macf/keys/<agent>.pem in initAgent. Only its *shape* is
-  // validated here (when provided), since it embeds in the double-quoted
-  // claude.sh KEY_PATH export.
+  // conventional ~/.macf/keys/<owner>/<project>/<agent>.pem in initAgent.
+  // Only its *shape* is validated here (when provided), since it embeds in
+  // the double-quoted claude.sh KEY_PATH export.
   if (!/^\d+$/.test(opts.appId)) {
     throw new Error(
       `appId "${opts.appId}" must be numeric (GitHub App IDs are digits only)`,
@@ -339,10 +340,25 @@ export function defaultLocalRegistryPath(project: string): string {
 }
 
 /**
- * Conventional per-agent App-key destination: `~/.macf/keys/<project>/<agent>.pem`
- * (macf#530; fleet/project-scoped as of macf#1157). Absolute (homedir-rooted)
- * so the token helper resolves it from any cwd — same cross-repo-cwd
+ * Conventional per-agent App-key destination:
+ * `~/.macf/keys/<owner>/<project>/<agent>.pem` (macf#530; project-scoped as
+ * of macf#1157; owner-scoped as of macf#1214). Absolute (homedir-rooted) so
+ * the token helper resolves it from any cwd — same cross-repo-cwd
  * discipline as the registry path.
+ *
+ * **Scoped by `owner` since macf#1214** — a fleet's `<project>/<role>`
+ * identity is NOT globally unique: one host commonly provisions fleets from
+ * DIFFERENT GitHub owners (orgs/users), and two owners can each run a fleet
+ * of the same name (e.g. two `macf-trial` fleets, one per owner) with the
+ * SAME role set (`code-agent`, `science-agent`, …). Without the owner
+ * segment, the project-scoped path alone reintroduces the exact collision
+ * macf#1157 fixed for role-only paths, one level up. `owner` is a directory
+ * NESTING, not an invented encoding — the filesystem already has the
+ * separator `owner/fleet` needs (see macf#1214's ruling comment). It is the
+ * SAME account string `bootstrap/fleet-deploy.ts` reads as
+ * `manifest.owner.account`; `macf init`'s own equivalent is derived by
+ * `ownerAccountFromRegistry` below from whichever registry variant was
+ * resolved for this run.
  *
  * **Scoped by `project` since macf#1157** — the pre-#1157 shape was bare
  * `~/.macf/keys/<agent>.pem` (no project/fleet segment), which let two
@@ -360,7 +376,27 @@ export function defaultLocalRegistryPath(project: string): string {
  * when multiple MACF projects share a machine" — the identical rationale,
  * applied here to keys for the first time).
  */
-export function defaultAgentKeyPath(project: string, agentName: string): string {
+export function defaultAgentKeyPath(owner: string, project: string, agentName: string): string {
+  return join(homedir(), '.macf', 'keys', owner, project, `${agentName}.pem`);
+}
+
+/**
+ * The pre-#1214 project-scoped, OWNER-LESS key path:
+ * `~/.macf/keys/<project>/<agent>.pem` — macf#1157's shape, before macf#1214
+ * added the `<owner>` segment. Kept as a READ-ONLY back-compat fallback for
+ * the SAME reason {@link legacyAgentKeyPath} exists for the shape before
+ * it: an operator's pre-#1214 fleet key (deployed under a single-owner host
+ * where the collision never had a chance to surface) keeps resolving
+ * without a forced migration. Nothing in this codebase ever WRITES here
+ * anymore — every fresh materialization lands at the owner-scoped
+ * {@link defaultAgentKeyPath}. Exported so `bootstrap/fleet-deploy.ts` can
+ * apply the SAME fallback (there, gated on a vault fingerprint match — see
+ * that module's `resolveDefaultKeyPath`) as `ingestAndResolveKeyPath` below
+ * does for a direct `macf init` run. This is a SEPARATE tier from — and
+ * checked BEFORE — the older, flatter {@link legacyAgentKeyPath}: read-old-
+ * write-new stacks, it doesn't replace the prior generation's fallback.
+ */
+export function legacyProjectAgentKeyPath(project: string, agentName: string): string {
   return join(homedir(), '.macf', 'keys', project, `${agentName}.pem`);
 }
 
@@ -375,9 +411,46 @@ export function defaultAgentKeyPath(project: string, agentName: string): string 
  * `bootstrap/fleet-deploy.ts` can apply the SAME fallback (there, gated on
  * a vault fingerprint match — see that module's `resolveDefaultKeyPath`) as
  * `ingestAndResolveKeyPath` below does for a direct `macf init` run.
+ *
+ * **NOT the same shape as a project-PREFIXED filename**
+ * (`~/.macf/keys/<project>-<agent>.pem`, e.g. `icsoc-2026-code-agent.pem`).
+ * That shape is produced by the separate `tools/macf-bootstrap` DR-035
+ * operator tool (`bootstrap-emit-commands.sh`'s own `key_path` convention),
+ * never by this function or by anything in `packages/macf` — it is
+ * out of scope for the macf#1214 owner-scoping fallback chain, which only
+ * ever reads paths THIS codebase itself once wrote.
  */
 export function legacyAgentKeyPath(agentName: string): string {
   return join(homedir(), '.macf', 'keys', `${agentName}.pem`);
+}
+
+/**
+ * The GitHub-account namespace this project's registry lives in — the
+ * `<owner>` segment {@link defaultAgentKeyPath} needs (macf#1214). Derived
+ * from whichever registry variant `initAgent` already resolved for this
+ * run, never a separate `--owner` flag — the registry config already
+ * carries the account. Mirrors `bootstrap/fleet-deploy.ts`'s
+ * `manifest.owner.account` for the `macf fleet deploy`/`macf bootstrap
+ * apply` path; this is `macf init`'s own equivalent for a direct,
+ * standalone run.
+ *
+ * `local` registry mode never reaches this function — `initAgent` skips
+ * `ingestAndResolveKeyPath` entirely when `regType === 'local'` (no App key
+ * to resolve in local-registry mode at all). The throw below exists only
+ * to keep the switch exhaustive and to fail loud, never silently return a
+ * placeholder, if that invariant is ever broken by a future change.
+ */
+function ownerAccountFromRegistry(registry: MacfAgentConfig['registry']): string {
+  switch (registry.type) {
+    case 'org':
+      return registry.org;
+    case 'profile':
+      return registry.user;
+    case 'repo':
+      return registry.owner;
+    case 'local':
+      throw new Error('ownerAccountFromRegistry: local registry mode has no owner-account namespace to key on');
+  }
 }
 
 /**
@@ -395,27 +468,36 @@ export function legacyAgentKeyPath(agentName: string): string {
  * (key rotation is a deliberate op, not an init side effect).
  *
  * Returns the path to record in `agent_config.github_app.key_path` (the
- * conventional `~/.macf/keys/<project>/<agent>.pem` unless `--key-path`
- * overrides, or a pre-#1157 legacy key is found in place — see the
- * macf#1157 "read-old-write-new" comment inline below).
+ * conventional `~/.macf/keys/<owner>/<project>/<agent>.pem` unless
+ * `--key-path` overrides, or an older-generation legacy key is found in
+ * place — see the macf#1157 / macf#1214 "read-old-write-new" comment inline
+ * below).
  */
-function ingestAndResolveKeyPath(opts: InitOptions, agentName: string, absDir: string): string {
-  const conventionalKeyPath = defaultAgentKeyPath(opts.project, agentName);
-  // macf#1157 "read-old-write-new": when the operator hasn't pinned
-  // --key-path AND isn't ingesting FRESH key material (--app-key), fall
-  // back to the pre-#1157 flat legacy path IF a key already lives there —
-  // an existing single-fleet workspace's key keeps resolving with no
-  // forced migration. A fresh --app-key ingest NEVER falls back here: it
-  // always lands at the (project-scoped) conventional path, so a brand-new
-  // SECOND project reusing a role name never mistakes an unrelated
-  // project's legacy key for its own (the exact collision #1157 reports —
-  // there is no vault to fingerprint-check against here, unlike
-  // `fleet-deploy.ts`'s `resolveDefaultKeyPath`, so the fresh-ingest case
-  // must never even consider the legacy path).
+function ingestAndResolveKeyPath(opts: InitOptions, agentName: string, absDir: string, owner: string): string {
+  const conventionalKeyPath = defaultAgentKeyPath(owner, opts.project, agentName);
+  // macf#1157 / macf#1214 "read-old-write-new", now TWO legacy tiers deep:
+  // when the operator hasn't pinned --key-path AND isn't ingesting FRESH
+  // key material (--app-key), fall back to an OLDER-generation path IF a
+  // key already lives there — an existing fleet's key keeps resolving with
+  // no forced migration, however many generations back it was written.
+  // Checked in write-order (newest-legacy first): the pre-#1214 project-
+  // scoped, owner-less path, THEN the pre-#1157 flat path. A fresh
+  // --app-key ingest NEVER falls back to either: it always lands at the
+  // (owner+project-scoped) conventional path, so a brand-new SECOND
+  // project/owner reusing a role name never mistakes an unrelated fleet's
+  // legacy key for its own (the exact collision #1157 — and, one level up,
+  // #1214 — report). There is no vault to fingerprint-check against here,
+  // unlike `fleet-deploy.ts`'s `resolveDefaultKeyPath`, so the fresh-ingest
+  // case must never even consider either legacy tier — existence alone is
+  // the only signal a standalone `macf init` run has.
   const noFreshIngest = opts.appKey === undefined || opts.appKey === '';
-  const usesLegacyPath =
-    opts.keyPath === undefined && noFreshIngest && !existsSync(conventionalKeyPath) && existsSync(legacyAgentKeyPath(agentName));
-  const keyPathForConfig = opts.keyPath ?? (usesLegacyPath ? legacyAgentKeyPath(agentName) : conventionalKeyPath);
+  const legacyProjectPath = legacyProjectAgentKeyPath(opts.project, agentName);
+  const legacyFlatPath = legacyAgentKeyPath(agentName);
+  const canConsiderLegacy = opts.keyPath === undefined && noFreshIngest && !existsSync(conventionalKeyPath);
+  const usesLegacyProjectPath = canConsiderLegacy && existsSync(legacyProjectPath);
+  const usesLegacyFlatPath = canConsiderLegacy && !usesLegacyProjectPath && existsSync(legacyFlatPath);
+  const keyPathForConfig =
+    opts.keyPath ?? (usesLegacyProjectPath ? legacyProjectPath : usesLegacyFlatPath ? legacyFlatPath : conventionalKeyPath);
   const destAbs = isAbsolute(keyPathForConfig)
     ? keyPathForConfig
     : resolve(absDir, keyPathForConfig);
@@ -585,9 +667,11 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
 
   // Resolve the App-key destination and (when --app-key is given) ingest the
   // downloaded key there at 0600, failing loud on a missing key (macf#530).
-  // Local-registry mode mints no token, so it has no key.
+  // Local-registry mode mints no token, so it has no key — and has no
+  // owner-account namespace either (ownerAccountFromRegistry would throw),
+  // which is exactly why it's excluded from this call.
   const githubKeyPath =
-    regType === 'local' ? undefined : ingestAndResolveKeyPath(opts, agentName, absDir);
+    regType === 'local' ? undefined : ingestAndResolveKeyPath(opts, agentName, absDir, ownerAccountFromRegistry(registry));
 
   // Write agent config. `github_app` is omitted in local-registry mode
   // (DR-024) — the launcher does not mint a token, and the schema marks

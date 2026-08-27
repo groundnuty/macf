@@ -26,7 +26,7 @@ const baseOpts = {
   appId: '123',
   installId: '456',
   registryType: 'repo',
-  registryRepo: 'owner/repo',
+  registryRepo: 'the-owner/repo',
 } as const;
 
 describe('macf init --app-key ingestion (macf#530)', () => {
@@ -42,8 +42,10 @@ describe('macf init --app-key ingestion (macf#530)', () => {
     warnSpy.mockRestore();
   });
 
-  it('defaultAgentKeyPath returns ~/.macf/keys/<project>/<agent>.pem', () => {
-    expect(defaultAgentKeyPath('TEST', 'auditor')).toBe(join(homedir(), '.macf', 'keys', 'TEST', 'auditor.pem'));
+  it('defaultAgentKeyPath returns ~/.macf/keys/<owner>/<project>/<agent>.pem', () => {
+    expect(defaultAgentKeyPath('the-owner', 'TEST', 'auditor')).toBe(
+      join(homedir(), '.macf', 'keys', 'the-owner', 'TEST', 'auditor.pem'),
+    );
   });
 
   it('ingests --app-key into --key-path with 0600 perms', async () => {
@@ -89,14 +91,17 @@ describe('macf init --app-key ingestion (macf#530)', () => {
     expect(msg).toMatch(/--app-key/);
   });
 
-  it('defaults key_path to ~/.macf/keys/<project>/<agent>.pem when --key-path omitted', async () => {
+  it('defaults key_path to ~/.macf/keys/<owner>/<project>/<agent>.pem when --key-path omitted', async () => {
     // Unique agent name → the real-home path certainly does not exist, and with
     // no --app-key nothing is written there.
     const agent = `eph-${Math.random().toString(36).slice(2)}`;
 
     await initAgent(dir, { ...baseOpts, name: agent });
 
-    expect(readAgentConfig(dir)!.github_app!.key_path).toBe(defaultAgentKeyPath(baseOpts.project, agent));
+    // Owner is derived from the 'repo' registry variant's `owner/repo` —
+    // baseOpts.registryRepo is 'the-owner/repo', so the owner segment is
+    // 'the-owner' (macf#1214).
+    expect(readAgentConfig(dir)!.github_app!.key_path).toBe(defaultAgentKeyPath('the-owner', baseOpts.project, agent));
     expect(warnSpy).toHaveBeenCalled();
   });
 });
