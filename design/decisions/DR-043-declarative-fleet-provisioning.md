@@ -1007,7 +1007,25 @@ Amendment G measured the teardown ladder by **revival cost**. The same axis deci
 | repos | un-archive is 0 clicks; recreate loses history | **orphan** |
 | Apps | 2 clicks **and the key is emitted once, unrecoverable** | **orphan**, always |
 
-**Two plan verbs, not one.** `delete` is a statement of intent, covered by the existing plan consent. `orphan` — *we made this, the manifest no longer wants it, and I will not touch it* — is an **instruction to the operator**. Collapsing them either promises deletions the tool must not perform or hides the ones it will.
+**Two plan verbs, not one.** `delete` is a statement of intent — **and it is NOT covered by the existing plan consent** (corrected 2026-08-27, `#1272`; the original text claimed it was).
+
+> **The pre-approval text an operator reads before typing "yes" says, verbatim: *"Nothing is deleted (§D3 no-prune)."*** Wiring deletion under that consent would obtain it by a statement that had become false — **not a stale message, a false premise for consent.**
+
+**So:** `delete` is covered by plan consent **only once the approval text ENUMERATES deletions by name and class.** Until then it is not covered at all, and **no deletion path may be wired while the pre-approval text promises nothing is deleted** — whichever lands first must fix the other, and the enumeration must land **before or with** the execution, never after.
+
+**A count is not informed consent for destruction.** *"3 deletion(s)"* tells an operator nothing about what they are losing; the per-class policy already names each resource at plan time, so the information exists and simply is not carried into the approval.
+
+**Repositories are NEVER deletable — and the reason is a prohibition, not a cost estimate.** P3's table reaches `orphan` for repos on revival-cost grounds (*un-archive is 0 clicks; recreate loses history*). **That is an engineering argument, and engineering arguments invite recalculation** — someone could reasonably argue a repo with no history is cheap to recreate, and reopen a question that is not open.
+
+> **Operator directive, 2026-08-27 (relayed by `macf-code-agent`, awaiting the operator's own words on `#1272`):** *"it cannot remove repositories — this is too big and irreversible blast radius; everything else is ok, and is naturally part of the life cycle."*
+
+**Revival cost is now a supporting reason for repos, not the load-bearing one.** *(Recorded as relayed rather than as ratified, per `#1161`: a relay is sufficient authority to act on and not sufficient evidence to record as a ruling. The content is being acted on; the attribution upgrades when the operator confirms on the thread.)*
+
+**And *"naturally part of the life cycle"* settles more than the verb.** A manifest-removed **variable or secret** is **ordinary operation, not an exception path** — so it belongs under plan consent once enumerated, rather than behind a gate of its own. A deletion that needs its own ceremony every time teaches operators to click through ceremonies.
+
+**GitHub Apps stay `orphan`-only, and this one is the framework's call rather than the operator's.** Read literally, *"everything else is ok"* would include them. It should not: **an App's private key is emitted once and is unrecoverable** (Amendment N8, `#1086`), so deleting an App is irreversible in precisely the sense the directive excludes — the identity can be recreated, the credential cannot. **The conservative reading is `macf-code-agent`'s and is adopted here as design reasoning, not as a quotation.**
+
+**`orphan` is unaffected, and the asymmetry is load-bearing:** it removes nothing, so *"Nothing is deleted"* stays literally true for it. The two verbs landed together and are **not** interchangeable here — one needs new consent, the other is already correctly described. `orphan` — *we made this, the manifest no longer wants it, and I will not touch it* — is an **instruction to the operator**. Collapsing them either promises deletions the tool must not perform or hides the ones it will.
 
 ### P4 — write-only resources: reconcile on OUR inputs, not on the value
 
