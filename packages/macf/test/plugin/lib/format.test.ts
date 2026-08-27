@@ -279,6 +279,7 @@ describe('formatStartupReconcile — extended SessionStart startup_check (DR-038
       ],
       unreadableRepos: [],
       enumerationFailed: false,
+      totalStale: 1,
     };
     const withStalls = formatStartupReconcile([], [], reporterStalls);
     const withoutStalls = formatStartupReconcile([], []);
@@ -290,7 +291,7 @@ describe('formatStartupReconcile — extended SessionStart startup_check (DR-038
   });
 
   it('omits the reporter-stall section entirely on a clean sweep (no noise)', () => {
-    const clean: ReporterStallResult = { stalls: [], unreadableRepos: [], enumerationFailed: false };
+    const clean: ReporterStallResult = { stalls: [], unreadableRepos: [], enumerationFailed: false, totalStale: 0 };
     const output = formatStartupReconcile([{ number: 1, title: 'x' }], [], clean);
     expect(output).not.toContain('Reporter-side');
     expect(output).not.toContain('issue(s) you filed');
@@ -299,12 +300,12 @@ describe('formatStartupReconcile — extended SessionStart startup_check (DR-038
 
 describe('formatReporterStallSweep (groundnuty/macf#1170)', () => {
   it('returns empty string on a clean sweep (all repos reachable, zero stalls) — no noise', () => {
-    const result: ReporterStallResult = { stalls: [], unreadableRepos: [], enumerationFailed: false };
+    const result: ReporterStallResult = { stalls: [], unreadableRepos: [], enumerationFailed: false, totalStale: 0 };
     expect(formatReporterStallSweep(result)).toBe('');
   });
 
   it('renders the honest-unknown floor when the top-level enumeration failed — never looks like a clean sweep', () => {
-    const result: ReporterStallResult = { stalls: [], unreadableRepos: [], enumerationFailed: true };
+    const result: ReporterStallResult = { stalls: [], unreadableRepos: [], enumerationFailed: true, totalStale: 0 };
     const output = formatReporterStallSweep(result);
     expect(output).not.toBe('');
     expect(output.toLowerCase()).toContain('could not enumerate');
@@ -316,6 +317,7 @@ describe('formatReporterStallSweep (groundnuty/macf#1170)', () => {
       stalls: [],
       unreadableRepos: ['org/broken'],
       enumerationFailed: false,
+      totalStale: 0,
     };
     const output = formatReporterStallSweep(result);
     expect(output).toContain('org/broken');
@@ -329,6 +331,7 @@ describe('formatReporterStallSweep (groundnuty/macf#1170)', () => {
       ],
       unreadableRepos: [],
       enumerationFailed: false,
+      totalStale: 1,
     };
     const output = formatReporterStallSweep(result);
     expect(output).toContain('groundnuty/macf#999');
@@ -336,6 +339,8 @@ describe('formatReporterStallSweep (groundnuty/macf#1170)', () => {
     expect(output).toContain('6d');
     expect(output.toLowerCase()).toContain('re-read');
     expect(output).not.toContain('CLOSED');
+    // Not capped (totalStale === stalls.length) — no "N of M" disclosure noise.
+    expect(output).not.toContain('more not shown');
   });
 
   it('renders an upgraded verdict line for a stall with a cleared deferral reference', () => {
@@ -352,11 +357,42 @@ describe('formatReporterStallSweep (groundnuty/macf#1170)', () => {
       ],
       unreadableRepos: [],
       enumerationFailed: false,
+      totalStale: 1,
     };
     const output = formatReporterStallSweep(result);
     expect(output).toContain('#932');
     expect(output).toContain('CLOSED');
     expect(output).toContain('2026-08-17');
+  });
+
+  // The bounded-output requirement (macf#1170: "Cap it and say what was
+  // capped") — a truncated list must disclose the truncation, not render
+  // identically to a complete one.
+  it('discloses the cap as "N of M" when the candidate list was truncated', () => {
+    const result: ReporterStallResult = {
+      stalls: [
+        { repo: 'org/repo', number: 1, title: 'oldest', updatedAt: '', daysQuiet: 20 },
+      ],
+      unreadableRepos: [],
+      enumerationFailed: false,
+      totalStale: 4,
+    };
+    const output = formatReporterStallSweep(result);
+    expect(output).toContain('1 of 4');
+    expect(output).toContain('3 more not shown');
+  });
+
+  it('does NOT disclose a cap when nothing was truncated (totalStale === stalls.length)', () => {
+    const result: ReporterStallResult = {
+      stalls: [
+        { repo: 'org/repo', number: 1, title: 'only one', updatedAt: '', daysQuiet: 10 },
+      ],
+      unreadableRepos: [],
+      enumerationFailed: false,
+      totalStale: 1,
+    };
+    const output = formatReporterStallSweep(result);
+    expect(output).not.toContain('more not shown');
   });
 
   it('never renders text matching the hook\'s auto-submit gate regex (pending issue(s): / inbox message(s) drained on startup:)', () => {
@@ -366,12 +402,24 @@ describe('formatReporterStallSweep (groundnuty/macf#1170)', () => {
       ],
       unreadableRepos: ['org/other'],
       enumerationFailed: false,
+      totalStale: 1,
     };
     const output = formatReporterStallSweep(result);
     expect(output).not.toMatch(/pending issue\(s\):/);
     expect(output).not.toMatch(/inbox message\(s\) drained on startup:/);
 
-    const failed = formatReporterStallSweep({ stalls: [], unreadableRepos: [], enumerationFailed: true });
+    // The capped ("N of M") header is DIFFERENT text from the uncapped one
+    // above — it must be checked against the gate regex separately, since
+    // a header collision would make the pickup hook mis-fire an auto-submit.
+    const cappedResult: ReporterStallResult = {
+      ...result,
+      totalStale: 4,
+    };
+    const cappedOutput = formatReporterStallSweep(cappedResult);
+    expect(cappedOutput).not.toMatch(/pending issue\(s\):/);
+    expect(cappedOutput).not.toMatch(/inbox message\(s\) drained on startup:/);
+
+    const failed = formatReporterStallSweep({ stalls: [], unreadableRepos: [], enumerationFailed: true, totalStale: 0 });
     expect(failed).not.toMatch(/pending issue\(s\):/);
     expect(failed).not.toMatch(/inbox message\(s\) drained on startup:/);
   });

@@ -38,6 +38,7 @@ describe('checkReporterStalls (groundnuty/macf#1170)', () => {
     expect(result.stalls).toHaveLength(1);
     expect(result.stalls[0]).toMatchObject({ repo: 'org/repo', number: 1, title: 'stale one' });
     expect(result.stalls[0]!.daysQuiet).toBeGreaterThanOrEqual(6);
+    expect(result.totalStale).toBe(1);
   });
 
   // Decisive pair #2: an issue I filed, open, active yesterday does NOT appear.
@@ -90,6 +91,7 @@ describe('checkReporterStalls (groundnuty/macf#1170)', () => {
     expect(result.enumerationFailed).toBe(true);
     expect(result.stalls).toEqual([]);
     expect(result.unreadableRepos).toEqual([]);
+    expect(result.totalStale).toBe(0);
   });
 
   it('someone else\'s issue is never surfaced — the listing call itself is author-scoped, so the sweep result is exactly whatever listOpenAuthored returns', async () => {
@@ -126,6 +128,10 @@ describe('checkReporterStalls (groundnuty/macf#1170)', () => {
 
     expect(result.stalls).toHaveLength(2);
     expect(result.stalls.map((s) => s.number)).toEqual([2, 3]); // 20d, 10d — NOT 6d
+    // macf#1170 "cap it and say what was capped" — totalStale carries the
+    // pre-cap candidate count (all 3 qualified) so the render layer can
+    // disclose "2 of 3" rather than silently truncating.
+    expect(result.totalStale).toBe(3);
   });
 
   it('fail-soft: a broken repo does not blank the others (aggregates reachable, like the inbound sweep)', async () => {
