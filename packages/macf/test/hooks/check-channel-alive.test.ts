@@ -922,4 +922,106 @@ describe('check-channel-alive.sh (SessionStart + UserPromptSubmit guard)', () =>
       expect(r.curlUrls).toHaveLength(0);
     });
   });
+
+  describe('(j) macf#793 — MACF_LOG_PATH literally SET but its file does not exist yet (async-child startup race)', () => {
+    // #793's exact reported shape differs from describe(i)'s "MACF_LOG_PATH
+    // unset" coverage in one load-bearing way: claude.sh/env.certs export
+    // MACF_LOG_PATH UNCONDITIONALLY at launch — the failure trigger is a
+    // fresh relaunch where the channel-server (an async MCP stdio child)
+    // hasn't created ITS log file yet, so the exported path exists-as-a-
+    // string but `[ -r "$MACF_LOG_PATH" ]` is false. That is a DIFFERENT
+    // bash predicate outcome than "the var is unset" even though the code's
+    // `if`/`elif` happens to route both through the same branch — so this
+    // scenario needs its OWN pin, not an inference from the unset-case tests.
+    const BOGUS_LOG_PATH = join(tmpdir(), 'macf-chanalive-793-bogus', 'does-not-exist', 'channel.log');
+
+    it('DECISIVE (1/2): MACF_LOG_PATH set-but-absent + identity derivable + the reconstructed OWN log exists → probes THIS agent\'s own port, not the stale MACF_LOG_PATH', () => {
+      const r = runHook({
+        serverStarted: { port: 8899, host: '127.0.0.1' }, // written under testproj@test-agent (runHook's fixture dir)
+        identityEnv: { project: 'testproj', agentName: 'test-agent' },
+        curl: { httpCode: '200' },
+        env: { MACF_LOG_PATH: BOGUS_LOG_PATH }, // set, but unreadable — overrides runHook's default export
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('');
+      expect(r.curlUrls).toHaveLength(1);
+      expect(r.curlUrls[0]).toContain(':8899/health');
+    });
+
+    it('DECISIVE (2/2): MACF_LOG_PATH set-but-absent + own log genuinely not-yet-written + a FOREIGN agent\'s channel.log present → does NOT probe the foreign port, does NOT warn', () => {
+      // Satisfied by "never warns" ALONE would be a weak test (a script that
+      // always stays silent would trivially pass) — the load-bearing
+      // assertion is curlUrls.length === 0: proof the foreign log's port was
+      // never even READ, not merely that its content didn't trigger a DEAD
+      // banner. The peer's server intentionally FAILS every probe so that if
+      // the guard mis-resolved to the peer's log, this test would catch BOTH
+      // a false-positive probe attempt AND (if it somehow returned 2xx) a
+      // false green — either way the assertion below would fail.
+      const r = runHook({
+        // No serverStarted for THIS agent — own log genuinely absent (the
+        // async-child race: this session's channel-server hasn't logged yet).
+        identityEnv: { project: 'testproj', agentName: 'test-agent' },
+        peerChannelLogs: [{ dir: 'otherproj@busy-peer', spec: { port: 9950, host: '127.0.0.1' } }],
+        curl: { portOverrides: {} }, // logs every invocation regardless of port match
+        env: { MACF_LOG_PATH: BOGUS_LOG_PATH },
+      });
+      expect(r.status).toBe(0);
+      // Identity WAS known (unlike the describe(i) "could not identify"
+      // cases) — this is the startup-race shape, so the correct verdict is a
+      // SILENT fail-open, not the "could not identify" message.
+      expect(r.stdout.trim()).toBe('');
+      expect(r.curlUrls).toHaveLength(0);
+    });
+
+    it('MACF_LOG_PATH set-but-absent + identity ALSO undeterminable + a foreign log present → honest "could not identify", never probes the foreign port', () => {
+      const r = runHook({
+        peerChannelLogs: [{ dir: 'otherproj@busy-peer', spec: { port: 9951, host: '127.0.0.1' } }],
+        curl: { portOverrides: {} },
+        env: { MACF_LOG_PATH: BOGUS_LOG_PATH }, // set-but-absent, and no identityEnv at all
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("Could not identify this agent's own channel-server log");
+      expect(r.curlUrls).toHaveLength(0);
+    });
+
+    it('MACF_LOG_PATH set to an existing-but-EMPTY file (no server_started line at all) → silent fail-open, never falls back to a peer', () => {
+      const fakeHome = mkdtempSync(join(tmpdir(), 'macf-chanalive-793-empty-home-'));
+      const workspace = mkdtempSync(join(tmpdir(), 'macf-chanalive-793-empty-ws-'));
+      const ownLogPath = join(fakeHome, '.local', 'state', 'macf', 'testproj@test-agent', 'channel.log');
+      mkdirSync(join(fakeHome, '.local', 'state', 'macf', 'testproj@test-agent'), { recursive: true });
+      writeFileSync(ownLogPath, ''); // present + readable, but empty — no server_started line
+      const peerDir = join(fakeHome, '.local', 'state', 'macf', 'otherproj@busy-peer');
+      mkdirSync(peerDir, { recursive: true });
+      writeFileSync(
+        join(peerDir, 'channel.log'),
+        JSON.stringify({ ts: 'x', level: 'info', event: 'server_started', port: 9952, host: '127.0.0.1', pid: fakeChannelServerProcess.pid }) + '\n',
+      );
+      const res = spawnSync('bash', [HOOK_SCRIPT], {
+        input: JSON.stringify({ hook_event_name: 'SessionStart' }),
+        env: {
+          PATH: `/usr/bin:/bin:${process.env['PATH'] ?? ''}`,
+          HOME: fakeHome,
+          CLAUDE_PROJECT_DIR: workspace,
+          MACF_LOG_PATH: ownLogPath, // set + readable (empty file) — first `if` branch wins, no elif/glob involved
+        },
+        encoding: 'utf-8',
+      });
+      rmSync(fakeHome, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+      expect(res.status).toBe(0);
+      expect((res.stdout ?? '').trim()).toBe('');
+    });
+
+    it('MACF_SKIP_CHANNEL_ALIVE_CHECK=1 short-circuits the set-but-absent + foreign-log case too', () => {
+      const r = runHook({
+        identityEnv: { project: 'testproj', agentName: 'test-agent' },
+        peerChannelLogs: [{ dir: 'otherproj@busy-peer', spec: { port: 9953, host: '127.0.0.1' } }],
+        curl: { portOverrides: {} },
+        env: { MACF_LOG_PATH: BOGUS_LOG_PATH, MACF_SKIP_CHANNEL_ALIVE_CHECK: '1' },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.trim()).toBe('');
+      expect(r.curlUrls).toHaveLength(0);
+    });
+  });
 });
