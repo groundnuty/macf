@@ -28,13 +28,25 @@ The trigger is *peer correction surfaces a substrate-discipline pattern*, not ju
 
 A rule is written from instances. **Those instances are its test suite, and the rule is not written until they pass.**
 
-Run both checks before writing, not after:
+Run all three checks before writing, not after:
 
 **1. Membership — is every instance I listed actually in the class I described?**
 
 **2. Recognition — would my stated TRIGGER identify each of them prospectively, given only what a reader knows before the fact?**
 
 The usable form of (2): **take each listed instance, hide the diagnosis, and ask whether the trigger alone would flag it.**
+
+**3. Exclusion — name the NEAREST thing that is not an instance, and confirm the stated form rejects it.**
+
+Checks 1 and 2 both test **inclusion**: do the listed cases belong, and would the trigger find them. Neither asks whether the form admits things it should not.
+
+> **A form that recognises every candidate is not a trigger; it is a mood.**
+
+Without this, a rule's scope is set by whatever its author happened to list, and it widens silently — each new case that superficially fits gets added, until the remedy no longer fixes the cases the trigger names. **The end state is worse than vagueness: the rule certifies the mistakes it was written to catch**, because a reader applies its remedy to a case the remedy cannot fix.
+
+**The artifact is a PAIR, not a step** — an in-case, an out-case, and the one line that separates them. A trigger carrying its own boundary is checkable by someone who was not in the room; a trigger with only a list of instances is not.
+
+**And the nearest non-instance is the useful one.** Excluding something obviously unrelated proves nothing. The check's value is proportional to how nearly the excluded case qualified.
 
 ### Two is the one that keeps failing
 
@@ -52,6 +64,13 @@ It is harder than (1) because **the author already knows the answer.** The trigg
 **A membership failure** — a listed instance was not in the class at all:
 
 - Four stalled issues were unified as *"a claim about future state, recorded once, never re-presented."* Three were promises needing re-presentation. The fourth was an **assertion that was false when written** and needed checking once, immediately. One mechanism would have fitted three and quietly under-served the fourth.
+
+**Two exclusion pairs, both from `assert-the-wrong-path.md`:**
+
+- **Trigger 4** (*an empty result from a search space that was empty*) vs **a stale checkout**. Its first draft listed the stale checkout as an instance. **Applying the remedy — `ls` the file — PASSES on a stale checkout while the reading is still wrong**, so including it would have certified the mistake. The merged text now names it as a neighbour with a different remedy (*name the provenance*).
+- **A circular-precondition observation** (*the instrument runs only when the answer is negative*) vs **an advisory that fires when a record is absent**. The separating line: **does the condition DISABLE the instrument, or TRIGGER it?** The first is disabled by a broken credential; the second is triggered by a missing record. Opposite directions, so not an instance — though it was filed as *"the same neighbourhood"* until the test was applied.
+
+**And its own nearest non-instance:** *"does this rule have counterexamples?"* is **not** an exclusion check. That asks whether the rule is TRUE; exclusion asks whether the stated FORM discriminates. A rule can be perfectly true and still admit every neighbour.
 
 **All three were caught by a reader re-running the instance list against the stated rule** — never by the author, and never by review of the prose alone.
 
