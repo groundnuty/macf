@@ -1087,22 +1087,29 @@ function presenceVerb(
  * by hand" reason, per this issue's own AC ("read [the convention] first;
  * do not invent a second convention").
  *
- * **`'repo'` is NEVER resolvable — always `'unknown'`, and this is by
- * design, not a gap to fill later.** `FleetLockAgentSchema` carries no
- * `repo` field (only a manifest-DECLARED `FleetAgent.repo` does, and a row-4
- * role has no manifest entry — that is the entire premise of "extra role").
- * `apply-delete.ts`'s own module doc hit this identical wall for the
- * `'secret_fingerprint'` delete-verb case and refused to guess rather than
- * risk a wrong target; the same refusal applies here, more sharply, because
- * a WRONG link actively sends the operator to delete the wrong repository
- * (worse than no link at all — this issue's own framing). Guessing a name
- * by convention is also unsound on the merits: `templates/bootstrap-spec.example.json`'s
- * own worked example shows a repo name is operator-supplied free text, not
- * derived from `role` (`code-agent`'s repo is `icsoc-2026-experiment`, not
- * `icsoc-2026-code-agent`).
+ * **`'repo'` resolves iff `lockedRepo` is given — `'unknown'` otherwise, and
+ * BOTH are honest, not a gap to fill later.** Before groundnuty/macf#1296,
+ * `FleetLockAgentSchema` carried no `repo` field at all, so a row-4 role
+ * (by definition absent from `manifest.agents[]`) had no repo anywhere this
+ * tool could read — every repo orphan was unconditionally `'unknown'`. Now
+ * `fleet.lock.agents[].repo` (populated by `composeFleetLock` — see that
+ * schema field's own doc) carries the value FORWARD from when the role was
+ * still declared, so a lock written after this change can name it. **A lock
+ * written BEFORE this change predates the field — `lockedRepo` is
+ * `undefined` there, and this function returns `'unknown'`, exactly as
+ * before.** The honest-unknown path does not disappear; it stops being the
+ * only path. `lockedRepo` is `owner/repo` verbatim (`FleetAgent.repo`'s own
+ * shape — see `apply-delete.ts::realDeleteRepoVariable`'s identical
+ * `repos/${repo}` convention) — the URL is built by appending `/settings`
+ * directly, never by re-deriving a name from `role` (still unsound on the
+ * merits per `templates/bootstrap-spec.example.json`'s own worked example:
+ * a repo name is operator-supplied free text, not derived from `role` —
+ * `code-agent`'s repo is `icsoc-2026-experiment`, not
+ * `icsoc-2026-code-agent`). Guessing was never acceptable; reading a value
+ * this tool itself recorded is not a guess.
  */
-export function orphanResourceUrl(kind: 'app' | 'repo', fleetName: string, role: string, owner: FleetManifest['owner']): string {
-  if (kind === 'repo') return 'unknown';
+export function orphanResourceUrl(kind: 'app' | 'repo', fleetName: string, role: string, owner: FleetManifest['owner'], lockedRepo?: string): string {
+  if (kind === 'repo') return lockedRepo !== undefined ? `https://github.com/${lockedRepo}/settings` : 'unknown';
   return appSettingsAdvancedUrl(owner, deriveAppHandle(fleetName, role));
 }
 
@@ -2440,9 +2447,14 @@ export function computePlan(
   // behavior is preserved, not relaxed). A role PRESENT in the lock is
   // ours, no longer wanted, and decomposes per resource class (Amendment
   // G's revival-cost axis) instead of one coarse whole-agent notice.
-  const lockRoles = new Set((observed.lock?.agents ?? []).map((a) => a.role));
+  // groundnuty/macf#1296 — a Map (not the pre-existing `lockRoles` Set)
+  // because the repo-orphan branch below now needs the ENTRY, not just
+  // membership: `lockEntry.repo` is what makes the URL resolvable for a
+  // lock written after this change (`undefined` on any lock written before
+  // it — `FleetLockAgentSchema`'s own doc).
+  const lockAgentsByRole = new Map((observed.lock?.agents ?? []).map((a) => [a.role, a]));
   for (const role of extraRoles) {
-    if (!lockRoles.has(role)) {
+    if (!lockAgentsByRole.has(role)) {
       items.push({
         kind: 'agent',
         target: `agent:${role}`,
@@ -2474,7 +2486,21 @@ export function computePlan(
     }
     // Repos: orphan (un-archive is 0 clicks; recreate loses history).
     if (obs?.repo === 'present') {
-      const url = orphanResourceUrl('repo', fleetName, role, manifest.owner);
+      // groundnuty/macf#1296 — `lockEntry.repo` is `undefined` for any lock
+      // written before this change (the field didn't exist yet); `obs?.repo
+      // === 'present'` above is an independent Presence signal (observer.ts)
+      // and never implies the repo NAME is known — the two must not be
+      // conflated (`FleetLockAgentSchema`'s own doc: undefined is unknown,
+      // never a fact derived from something else being true).
+      const lockedRepo = lockAgentsByRole.get(role)?.repo;
+      const url = orphanResourceUrl('repo', fleetName, role, manifest.owner, lockedRepo);
+      const howToFind =
+        lockedRepo !== undefined
+          ? `If it should go away, archive or delete it yourself on its GitHub settings page: ${url}.`
+          : `If it should go away, archive or delete it yourself on its GitHub settings page: ${url} ` +
+            `(this tool cannot name that page — fleet.lock predates recording which repo a no-longer-declared ` +
+            `role used; search your GitHub ${manifest.owner.type === 'org' ? `organization "${manifest.owner.account}"` : 'account'}'s ` +
+            `repo list for one it created for role "${role}").`;
       items.push({
         kind: 'repo',
         target: `agent:${role}:repo`,
@@ -2482,10 +2508,7 @@ export function computePlan(
         reason:
           `The repo for "${role}" was provisioned by this tool (recorded in fleet.lock) but "${role}" is no ` +
           'longer declared. NOTHING WAS DELETED — apply never auto-removes it, under any flag (recreating a ' +
-          `repo loses its history; un-archiving is 0 clicks). If it should go away, archive or delete it ` +
-          `yourself on its GitHub settings page: ${url} (this tool cannot name that page — fleet.lock does not ` +
-          `record which repo a no-longer-declared role used; search your GitHub ${manifest.owner.type === 'org' ? `organization "${manifest.owner.account}"` : 'account'}'s ` +
-          `repo list for one it created for role "${role}").`,
+          `repo loses its history; un-archiving is 0 clicks). ${howToFind}`,
         confirm_required: false,
       });
     }

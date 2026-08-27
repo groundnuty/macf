@@ -667,12 +667,36 @@ export const FLEET_LOCK_SCHEMA_VERSION = 1;
  * written. The registry holds the SAME fingerprint (readable, for drift
  * detection); the vault holds the sealed value; the lock holds the mapping
  * between them.
+ *
+ * `repo` (groundnuty/macf#1296) — the `owner/repo` this role's identity was
+ * provisioned against, `FleetAgent.repo`'s value at the time `apply`
+ * established/reconfirmed this role. **OPTIONAL, and every existing fleet's
+ * lock predates it — `undefined` here means UNKNOWN, never "this role has
+ * no repo."** This is `#1252`'s exact lesson (`age_recipients`'s own doc
+ * makes the identical distinction): an absent field is "nothing recorded to
+ * compare against," not a fact about the role. Recorded specifically so a
+ * role can still be NAMED after it is orphaned (dropped from
+ * `manifest.agents[]`) — `manifest.agents[]` no longer carries an entry for
+ * it at that point, so `deriveRepoName`-style re-derivation is impossible;
+ * this field is the only way to know the repo later (`composeFleetLock`'s
+ * own doc, `#1296`). Read by `plan.ts`'s row-4 repo-orphan URL and
+ * `apply-delete.ts`'s `secret_fingerprint` delete-item resolution.
+ *
+ * This records "the repo `apply` last provisioned this role against" —
+ * NOT a drift signal. Unlike `app_id`/`install_id` (which feed
+ * {@link FleetLockIdentityChange} in `fleet-lock.ts` when a touched role's
+ * fresh value diverges from what was previously recorded), a changed `repo`
+ * is deliberately NOT surfaced as an identity change: `fleet.yaml`'s
+ * `agents[].repo` is operator-editable free text (an operator can legitimately
+ * rename/move an agent's repo), and `composeFleetLock` always records
+ * whatever THIS run's manifest declares — see that module's merge logic.
  */
 export const FleetLockAgentSchema = z
   .object({
     role: z.string().min(1),
     app_id: z.string().min(1),
     install_id: z.string().min(1),
+    repo: z.string().min(1).optional(),
     fingerprints: z.record(z.string(), z.string()).optional(),
     deployed_version: z.string().optional(),
   })

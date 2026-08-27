@@ -72,6 +72,17 @@ export interface FleetLockAgentUpdate {
   readonly appId: string;
   readonly installId: string;
   /**
+   * groundnuty/macf#1296 — `owner/repo` this role was provisioned against
+   * THIS run (`FleetAgent.repo`, verbatim). `undefined` for a fleet-level
+   * pseudo-role update (`RUNNER_OPS_ROLE`/`ROUTER_APP_ROLE` — neither has a
+   * per-manifest-agent repo) or for a caller that updates identity fields
+   * only (e.g. `fleet-lock-recorder.ts`'s `deployedVersion`-only write) —
+   * `composeFleetLock` carries `previous`'s recorded repo forward
+   * unconditionally when this is omitted, same "omitted ≠ clobber" contract
+   * {@link FleetLockAgentUpdate.deployedVersion} already establishes.
+   */
+  readonly repo?: string;
+  /**
    * Secret name → RAW value ESTABLISHED THIS RUN (e.g. `client_secret`,
    * `webhook_secret`, `app_private_key`). Never persisted as-is — hashed
    * immediately via {@link secretFingerprint} and merged over the agent's
@@ -356,10 +367,17 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
 
     const fingerprints = mergeFingerprints(prev?.fingerprints, update.secrets);
     const deployedVersion = update.deployedVersion ?? prev?.deployed_version;
+    // groundnuty/macf#1296 — same "fresh wins when supplied, else carry
+    // previous forward" shape `deployedVersion` immediately above already
+    // uses. NEVER an identity-change candidate (see `FleetLockAgentSchema`'s
+    // own doc) — `fleet.yaml`'s `repo` is operator-editable free text, so a
+    // changed value here is an intentional re-point, not drift.
+    const repo = update.repo ?? prev?.repo;
     agents.push({
       role,
       app_id: update.appId,
       install_id: update.installId,
+      ...(repo !== undefined ? { repo } : {}),
       ...(fingerprints !== undefined ? { fingerprints } : {}),
       ...(deployedVersion !== undefined ? { deployed_version: deployedVersion } : {}),
     });
@@ -403,9 +421,16 @@ function orderedAgent(agent: FleetLockAgent): FleetLockAgent {
     role: string;
     app_id: string;
     install_id: string;
+    repo?: string;
     fingerprints?: Record<string, string>;
     deployed_version?: string;
   } = { role: agent.role, app_id: agent.app_id, install_id: agent.install_id };
+  // groundnuty/macf#1296 — MUST be copied through explicitly: this function
+  // hand-builds from a field allowlist (`serializeFleetLock`'s module doc),
+  // and a field present on `FleetLockAgentSchema`/`composeFleetLock`'s
+  // output but absent from this allowlist is silently dropped before disk
+  // (the exact #1260 defect this issue's own AC calls out).
+  if (agent.repo !== undefined) ordered.repo = agent.repo;
   if (agent.fingerprints !== undefined) ordered.fingerprints = sortRecord(agent.fingerprints);
   if (agent.deployed_version !== undefined) ordered.deployed_version = agent.deployed_version;
   return ordered;

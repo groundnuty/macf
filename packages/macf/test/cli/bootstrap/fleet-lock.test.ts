@@ -87,6 +87,29 @@ describe('composeFleetLock — fresh fleet (previous = null)', () => {
     expect(lock.agents[0]?.deployed_version).toBe('0.2.56');
   });
 
+  // groundnuty/macf#1296 — a fleet.lock agent gains an optional `repo` field
+  // so a role can still be NAMED after it is dropped from `manifest.agents[]`
+  // (`#1281`'s repo-orphan URL) and a secret delete can resolve its target
+  // (`#1272`). See `fleet-manifest.ts::FleetLockAgentSchema`'s own doc.
+  it('carries repo through when given', () => {
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous: null,
+      agentUpdates: { 'code-agent': { appId: '111', installId: '222', repo: 'groundnuty/demo-code-agent' } },
+    });
+    expect(lock.agents[0]?.repo).toBe('groundnuty/demo-code-agent');
+  });
+
+  it('omits repo entirely (never a fabricated value) when no repo is given for a fresh agent', () => {
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous: null,
+      agentUpdates: { 'code-agent': { appId: '111', installId: '222' } },
+    });
+    expect(lock.agents[0]?.repo).toBeUndefined();
+    expect('repo' in (lock.agents[0] ?? {})).toBe(false);
+  });
+
   it('sorts agents by role for deterministic output regardless of input order', () => {
     const { lock } = composeFleetLock({
       fleet: 'demo-fleet',
@@ -116,6 +139,7 @@ describe('composeFleetLock — re-apply against a previous lock (no-prune, §D3 
         role: 'science-agent',
         app_id: '999',
         install_id: '888',
+        repo: 'groundnuty/demo-science-agent',
         fingerprints: { client_secret: secretFingerprint('old-secret') },
         deployed_version: '0.2.50',
       },
@@ -219,6 +243,38 @@ describe('composeFleetLock — re-apply against a previous lock (no-prune, §D3 
       agentUpdates: { 'science-agent': { appId: '999', installId: '888' } },
     });
     expect(lock.agents[0]?.deployed_version).toBe('0.2.50');
+  });
+
+  // groundnuty/macf#1296 — same "omitted update ≠ clobber" contract
+  // deployed_version already establishes above, extended to repo. This is
+  // the shape `fleet-lock-recorder.ts`'s deployedVersion-only write ACTUALLY
+  // sends (never a repo), so this pins that a version-recording run never
+  // wipes out a role's previously-recorded repo as a side effect.
+  it('a repo recorded on a PRIOR run is preserved when a re-touch update omits repo entirely', () => {
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: { 'science-agent': { appId: '999', installId: '888' } },
+    });
+    expect(lock.agents[0]?.repo).toBe('groundnuty/demo-science-agent');
+  });
+
+  it('a FRESH repo on a touched agent overrides the prior recorded repo', () => {
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: { 'science-agent': { appId: '999', installId: '888', repo: 'groundnuty/demo-science-agent-renamed' } },
+    });
+    expect(lock.agents[0]?.repo).toBe('groundnuty/demo-science-agent-renamed');
+  });
+
+  it('a changed repo is deliberately NOT surfaced as an identityChange — repo is operator-editable free text, not a drift signal', () => {
+    const { identityChanges } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: { 'science-agent': { appId: '999', installId: '888', repo: 'groundnuty/demo-science-agent-renamed' } },
+    });
+    expect(identityChanges).toEqual([]);
   });
 
   it('fleet-level fingerprints merge the same way: prior CA key fingerprint preserved, new fleet secret added', () => {
@@ -391,6 +447,24 @@ describe('serializeFleetLock', () => {
     expect(roundTripped.age_recipients).toEqual(['age1a']);
     expect(roundTripped.age_recipients_removed_by_override).toEqual(['age1b']);
   });
+
+  // groundnuty/macf#1296 — `orderedAgent` hand-builds from an explicit field
+  // allowlist, same shape `age_recipients_removed_by_override`'s regression
+  // pin above documents for the fleet-level allowlist. A composer-altitude
+  // assertion (checking `composeFleetLock`'s returned object) would NOT
+  // catch a field dropped from `orderedAgent` — `.parse()` inside
+  // `serializeFleetLock` does not strip a schema-valid field, only the
+  // hand-built `ordered` object can silently omit it. This test round-trips
+  // through `parseFleetLock`, so it fails if `orderedAgent` ever drops
+  // `repo` — the exact #1260 defect class.
+  it('agent repo round-trips through parseFleetLock unchanged (allowlist-drop regression pin)', () => {
+    const withRepo: FleetLock = {
+      ...lock,
+      agents: [{ role: 'code-agent', app_id: '1', install_id: '1', repo: 'groundnuty/demo-code-agent' }],
+    };
+    const roundTripped = parseFleetLock(serializeFleetLock(withRepo));
+    expect(roundTripped.agents[0]?.repo).toBe('groundnuty/demo-code-agent');
+  });
 });
 
 describe('writeFleetLock (thin I/O leaf)', () => {
@@ -407,6 +481,51 @@ describe('writeFleetLock (thin I/O leaf)', () => {
       const roundTripped = parseFleetLock(readFileSync(path, 'utf-8'));
       expect(roundTripped.fleet).toBe('demo-fleet');
       expect(roundTripped.agents).toEqual(lock.agents);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // groundnuty/macf#1296 DECISIVE — "the field survives to disk" per the
+  // issue's own AC ("a test must assert the field reaches the file, not
+  // that the composer produced it"). Reads the raw JSON bytes off disk
+  // directly (not through parseFleetLock's schema-tolerant re-validation),
+  // so this is the strongest possible pin against `orderedAgent` silently
+  // dropping `repo` before the write — the exact #1260 defect the issue
+  // cites. Mutation check performed manually: deleting the `ordered.repo =
+  // agent.repo;` line in `orderedAgent` (fleet-lock.ts) makes this test
+  // fail (raw parsed JSON has no "repo" key), confirming it is NOT
+  // satisfiable by a composer-altitude assertion alone.
+  it('DECISIVE: agent repo reaches the WRITTEN FILE on disk, readable as a raw "repo" key', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-fleet-lock-test-'));
+    try {
+      const path = join(dir, 'fleet.lock');
+      const { lock } = composeFleetLock({
+        fleet: 'demo-fleet',
+        previous: null,
+        agentUpdates: { 'code-agent': { appId: '1', installId: '2', repo: 'groundnuty/demo-code-agent' } },
+      });
+      writeFleetLock(path, lock);
+      const raw = JSON.parse(readFileSync(path, 'utf-8')) as { agents: { role: string; repo?: string }[] };
+      const codeAgent = raw.agents.find((a) => a.role === 'code-agent');
+      expect(codeAgent?.repo).toBe('groundnuty/demo-code-agent');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a lock predating the field writes NO "repo" key at all (never a fabricated empty string) — the pre-#1296 shape', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-fleet-lock-test-'));
+    try {
+      const path = join(dir, 'fleet.lock');
+      const { lock } = composeFleetLock({
+        fleet: 'demo-fleet',
+        previous: null,
+        agentUpdates: { 'code-agent': { appId: '1', installId: '2' } },
+      });
+      writeFleetLock(path, lock);
+      const raw = JSON.parse(readFileSync(path, 'utf-8')) as { agents: Record<string, unknown>[] };
+      expect('repo' in (raw.agents[0] ?? {})).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

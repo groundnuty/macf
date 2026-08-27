@@ -744,6 +744,33 @@ agents: []
     expect(lock.agents).toEqual([]);
     expect(lock.fingerprints).toBeUndefined();
   });
+
+  // groundnuty/macf#1296 — FleetLockAgentSchema gains an optional `repo`
+  // field so an orphaned role can still be NAMED (`#1281`'s orphan URL) and
+  // a secret delete can resolve its target (`#1272`).
+  describe('agents[].repo (groundnuty/macf#1296)', () => {
+    it('parses an agent with a declared repo', () => {
+      const withRepo = VALID_LOCK_YAML.replace('install_id: "22222222"', 'install_id: "22222222"\n    repo: groundnuty/icsoc-2026-science-agent');
+      const lock = parseFleetLock(withRepo);
+      expect(lock.agents[0]?.repo).toBe('groundnuty/icsoc-2026-science-agent');
+    });
+
+    // DECISIVE (backward-compat half): a lock written before this field
+    // existed — every fleet's lock, pre-#1296 — must parse with `repo`
+    // UNDEFINED, never a fabricated empty string or absent-therefore-known
+    // value. This is `#1252`'s exact lesson (see `FleetLockAgentSchema`'s
+    // own doc): undefined is unknown, not a fact.
+    it('DECISIVE: a pre-#1296 lock (no repo key at all) parses fine, with repo undefined — never a fact, never fabricated', () => {
+      const lock = parseFleetLock(VALID_LOCK_YAML);
+      expect(lock.agents[0]?.repo).toBeUndefined();
+      expect('repo' in (lock.agents[0] as object)).toBe(false);
+    });
+
+    it('rejects an empty-string repo (min(1), same discipline as role/app_id/install_id)', () => {
+      const bad = VALID_LOCK_YAML.replace('install_id: "22222222"', 'install_id: "22222222"\n    repo: ""');
+      expect(() => parseFleetLock(bad)).toThrow();
+    });
+  });
 });
 
 /**

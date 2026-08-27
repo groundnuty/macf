@@ -1663,7 +1663,13 @@ export async function applyFleet(
     const pinReconcile = resolveActionsPinReconcile(manifest.versions?.actions, deps.observedActionsPins?.agents[agent.role]);
 
     if (identity.status === 'reused' || identity.status === 'resumed-install') {
-      writeIncrementalLock(agent.role, { appId: identity.appId, installId: identity.installId });
+      // groundnuty/macf#1296 — `agent.repo` (this run's manifest-declared
+      // value) is recorded on EVERY reused/resumed-install touch, not only
+      // on a fresh `created` role — this is the steady-state write path
+      // (macf#1269's lesson: a fleet that mints nothing must still record),
+      // and it is what lets a LATER apply run (after the role is dropped
+      // from `fleet.yaml`) still name the repo for an orphaned role.
+      writeIncrementalLock(agent.role, { appId: identity.appId, installId: identity.installId, repo: agent.repo });
       // groundnuty/macf#1240 (the residual `#1221` split out) — no PEM is in
       // process memory this run for `reused`/`resumed-install` (unlike the
       // `created` path below), but a vault-backed `resolveKeyPath` MAY still
@@ -1688,9 +1694,11 @@ export async function applyFleet(
     } else if (identity.status === 'created') {
       const secrets = agentVaultSecrets(handle, identity);
       pendingVaultAgents.push(secrets);
+      // groundnuty/macf#1296 — same repo-recording as the reused/resumed-install branch above.
       pendingCreatedUpdates[agent.role] = {
         appId: identity.appId,
         installId: identity.installId,
+        repo: agent.repo,
         secrets: vaultAgentSecretsForFingerprint(secrets),
       };
       repoInitOutcome = await applyRepoInitForCreatedAgent(agent, manifest, identity, deps.repoInitDeps);
