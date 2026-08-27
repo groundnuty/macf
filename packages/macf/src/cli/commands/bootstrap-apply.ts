@@ -3038,6 +3038,17 @@ export async function runBootstrapApply(
 
   try {
     const observed = await resolved.observe(manifest);
+    // groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — this
+    // preview intentionally passes NO `installScopeCoverage` (the 3rd
+    // `computePlan` param, defaulting to `[]`), so it never shows an
+    // `'install_scope'` item: `computeInstallScopeCoverage` runs later in
+    // THIS run (below, with `InstallScopeCoverageDeps.onDrift` wired to the
+    // #1232/#1233 widen-gate) and MUTATES a confirmed `'drift'` entry as
+    // part of opening that gate — threading it into this earlier preview
+    // would mean reordering apply's own gate flow, out of scope for `plan`'s
+    // row-3 fix. Net effect: this preview can under-report an install-scope
+    // App-widen click the run is about to ask for; `macf bootstrap plan`
+    // (the read-only command) is where row 3 is visible ahead of a run.
     const plan = computePlan(manifest, observed);
     const creations = plannedAppCreations(manifest, plan, DRY_RUN_REDIRECT_PLACEHOLDER);
 
