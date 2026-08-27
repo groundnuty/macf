@@ -1208,6 +1208,20 @@ export async function readCallerActionsPin(repo: string): Promise<string | undef
  * {@link readCallerActionsPin} against `agent.repo` — same "per-repo, not
  * fleet-representative" posture the CA reads above already use, for the
  * same #806-class reason.
+ *
+ * `agents` also carries an entry for every `fleet.lock`-recorded role that
+ * is NOT in `manifest.agents` (groundnuty/macf#1271, disclosed by #1270's
+ * own body) — the input `plan.ts`'s row-4 `extraRoles` loop needs to ever
+ * emit a real orphan/delete verb. Bounded strictly to `lock.agents` (never
+ * an unbounded scan of the owner's Apps/repos); `app`/`install`/
+ * `fingerprints` are lock-sourced exactly like a declared agent's (no
+ * additional `gh api` call — `lock` is already an in-memory local-file
+ * read by the time this loop runs), and `repo` stays `'unknown'` forever
+ * (`FleetLockAgentSchema` records no repo name for ANY role, so there is
+ * nothing to check). `routingTrustedActors` is READ regardless of whether
+ * `manifest.routing?.runner` is declared (previously gated on it) — the
+ * row-4 trigger case (`routing.runner` DROPPED) is precisely when a stale
+ * value matters; see `routingTrustedActors`'s own inline comment below.
  */
 export async function githubRegistryObserver(manifest: FleetManifest, manifestPath: string): Promise<ObservedState> {
   const lock = readFleetLock(manifestPath);
@@ -1265,6 +1279,69 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     routingClientRepos[agent.repo] = repoState.routingClientRepo;
   }
 
+  // groundnuty/macf#1271 (disclosed by #1270's own body) — row 4 of the
+  // reconciler verb matrix (`plan.ts`'s `extraRoles` loop) can only ever act
+  // on a role that shows up as a KEY in `agents` above; until this change
+  // that map was built EXCLUSIVELY from `manifest.agents`, so
+  // `Object.keys(observed.agents)` could never contain a role outside the
+  // manifest — row 4's per-class verbs were correct and exhaustively
+  // tested, but no real `plan` run could ever reach them (`computePlan`'s
+  // OWN tests reproduce this only via a hand-built `ObservedState`, never
+  // through this function).
+  //
+  // Bounded STRICTLY to `lock.agents` — the fix is "give row 4 an
+  // observation," not "discover every role that might exist." `fleet.lock`
+  // is the only record of what THIS TOOL provisioned (§D3 no-prune
+  // invariant: `composeFleetLock` never prunes it), so it is the only set a
+  // negative diff can act on safely; anything present on GitHub but absent
+  // from BOTH the manifest AND the lock was never provably ours and stays
+  // `report-extra` by `plan.ts`'s own existing (unchanged) no-lock branch —
+  // which requires NO observation here at all, since `plan.ts`'s
+  // `extraRoles`/`report-extra` logic already handles "in observed.agents,
+  // not in the lock" correctly for whatever might reach it some OTHER way.
+  // Walking `lock.agents` (never `manifest.agents`, never a live
+  // enumeration of the owner's Apps/repos) is what keeps this bounded — no
+  // `gh api` call added for this loop, since `lock` was already read via
+  // `readFleetLock` above (a local file read).
+  //
+  // Per-field honesty, mirroring the manifest-agent branch above exactly:
+  // `app`/`install` trust the lock entry's mere existence (same "no JWT
+  // yet, so App/install existence comes from fleet.lock ONLY" floor this
+  // function's own module doc states for a manifest-declared role — a
+  // lock-recorded-but-undeclared role is no more/less confirmable live than
+  // a lock-recorded-and-declared one). `fingerprints` is a straight lock
+  // copy, same as the declared-agent branch. `repo` has NO lock-recorded
+  // source at all — `FleetLockAgentSchema` carries no `repo` field (only a
+  // manifest-declared `FleetAgent.repo` does, and this role has no manifest
+  // entry) — so there is no repo NAME to check, let alone a live read to
+  // attempt: it stays `'unknown'` for good, never a guessed `'absent'`
+  // (Amendment A's honest-unknown floor — an observation that cannot be
+  // made must never launder into a confident one).
+  const manifestRoles = new Set(manifest.agents.map((a) => a.role));
+  // Fleet-level pseudo-roles (`'runner-ops'` / `'router'`) are recorded in
+  // `fleet.lock.agents` by design (`apply-runner-ops.ts::RUNNER_OPS_ROLE` /
+  // `apply-router-app.ts::ROUTER_APP_ROLE`) but are never real per-manifest
+  // agent identities — `plan.ts`'s own `extraRoles` filter already excludes
+  // them via the same two literals. Inlined here (not imported) to avoid a
+  // module cycle: `apply-router-app.ts` imports `app-identity-removal.ts`,
+  // which imports THIS file's `getStderr` — importing back from
+  // `apply-router-app.ts` would cycle. Same "documented same-literal-string
+  // pair, not a cross-module import" convention `routingTrustedActors`
+  // below already uses for `'MACF_TRUSTED_ACTORS'`.
+  const fleetLevelPseudoRoles = new Set<string>(['runner-ops', 'router']);
+  for (const lockEntry of lock?.agents ?? []) {
+    if (manifestRoles.has(lockEntry.role) || fleetLevelPseudoRoles.has(lockEntry.role)) continue;
+    agents[lockEntry.role] = {
+      app: 'present',
+      appId: lockEntry.app_id,
+      install: 'present',
+      installId: lockEntry.install_id,
+      repo: 'unknown',
+      fingerprints: lockEntry.fingerprints ?? {},
+      deployedVersion: lockEntry.deployed_version,
+    };
+  }
+
   const caRegistry = await checkRegistryVariablePresence(manifest.owner.registry, caVarName);
 
   // macf#857 — representative caller repo; see this function's doc for why
@@ -1276,10 +1353,21 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   // convention of a documented same-literal-string pair rather than a
   // cross-module import (see apply-routing.ts's own doc: "matches
   // observer.ts's read of the same name").
+  //
+  // groundnuty/macf#1271 — gated ONLY on there being a representative repo
+  // to read from, NOT on `manifest.routing?.runner` being declared. The
+  // prior `manifest.routing?.runner &&` guard meant this read never even
+  // ran on the row-4 trigger fleet.yaml (`routing.runner` DROPPED from the
+  // manifest) — `plan.ts`'s `routingDroppedItem` exists precisely to catch
+  // a STILL-present `MACF_TRUSTED_ACTORS` in that exact shape (a stale
+  // variable this tool wrote and the manifest no longer wants), and its own
+  // doc says so explicitly: "not wired to any live read... `plan` will
+  // report no negative diff on a fleet that has one, and there is no signal
+  // distinguishing that from a fleet that does not." A `routing.runner`
+  // declared fleet keeps reading the SAME as before (this is a strict
+  // widening of the gate, not a behavior change on the declared side).
   const routingTrustedActors =
-    manifest.routing?.runner && representativeCallerRepo !== undefined
-      ? await readRepoVariable(representativeCallerRepo, 'MACF_TRUSTED_ACTORS')
-      : undefined;
+    representativeCallerRepo !== undefined ? await readRepoVariable(representativeCallerRepo, 'MACF_TRUSTED_ACTORS') : undefined;
   // macf#924 — checkRunnerUsableByRepo (not the repo-scoped-only
   // checkRunnerRegistered/checkRepoScopedRunner) so plan-time reporting sees
   // the SAME org-runner-aware resolution apply-time's per-repo gate uses
