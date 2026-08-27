@@ -1163,7 +1163,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
   // reaches the REAL `computeInstallScopeCoverage` through `runBootstrapApply`
   // (never mocked out) when both flags are given, exits 0 even though the
   // vault read fails (this check is reporting-only — see `applyExitCode`'s
-  // own "Audited other inputs" doc), and is omitted entirely otherwise.
+  // own "Audited other inputs" doc). Half of groundnuty/macf#1268's decisive
+  // pair: flags present -> `install_scope_coverage` behaves EXACTLY as
+  // before that fix (byte-identical AC) — the `message` assertion at the
+  // bottom pins that this is NOT the new "not checked" wording.
   it('--vault + --identity-key: `install_scope_coverage` is populated (unknown, for a nonexistent vault) and does not change the exit code', async () => {
     const file = writeManifest();
     const dir = join(file, '..');
@@ -1187,14 +1190,43 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     // target — same fixture shape `bootstrap.test.ts`'s sibling test uses.
     expect(parsed.install_scope_coverage).toHaveLength(1);
     expect(parsed.install_scope_coverage?.[0]?.status).toBe('unknown');
+    // NOT the groundnuty/macf#1268 "no --vault/--identity-key given" wording
+    // — this run gave both flags, so the ONLY reason it's still 'unknown'
+    // is the (deliberately) nonexistent vault path.
+    expect(parsed.install_scope_coverage?.[0]?.message).toContain('vault could not be read');
+    expect(parsed.install_scope_coverage?.[0]?.message).not.toContain('no --vault/--identity-key given');
   });
 
-  it('WITHOUT --vault/--identity-key, `install_scope_coverage` is omitted entirely from a successful apply', async () => {
+  // groundnuty/macf#1268 — the defect: this call site used to short-circuit
+  // to `{}` whenever EITHER flag was missing, discarding
+  // `computeInstallScopeCoverage`'s own honest-unknown output regardless of
+  // whether the fleet had anything to check. FLEET_YAML's router App target
+  // (see the sibling test above) means there IS something to check here, so
+  // post-fix this must be POPULATED — the opposite of the old test name.
+  // Other half of the decisive pair (per assert-the-wrong-path.md): (1)
+  // alone (this test) would be satisfied by an implementation that ALWAYS
+  // prints the notice regardless of the flags — the sibling "byte-identical
+  // when flags present" test above is what rules that out.
+  it('WITHOUT --vault/--identity-key, `install_scope_coverage` states the check was NOT run and names the flags to supply — --json', async () => {
     const file = writeManifest();
     const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
     expect(code).toBe(0);
-    const parsed = JSON.parse(logs.join('\n')) as Record<string, unknown>;
-    expect('install_scope_coverage' in parsed).toBe(false);
+    const parsed = JSON.parse(logs.join('\n')) as { install_scope_coverage?: ReadonlyArray<{ role: string; status: string; message?: string }> };
+    expect(parsed.install_scope_coverage).toHaveLength(1);
+    expect(parsed.install_scope_coverage?.[0]?.status).toBe('unknown');
+    expect(parsed.install_scope_coverage?.[0]?.message).toContain('--vault');
+    expect(parsed.install_scope_coverage?.[0]?.message).toContain('--identity-key');
+    expect(parsed.install_scope_coverage?.[0]?.message).toContain('not checked this run');
+  });
+
+  it('WITHOUT --vault/--identity-key, the SAME notice reaches the human (non-`--json`) render, naming both flags', async () => {
+    const file = writeManifest();
+    const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+    expect(code).toBe(0);
+    const out = logs.join('\n');
+    expect(out).toContain('install-scope coverage was not checked this run');
+    expect(out).toContain('--vault');
+    expect(out).toContain('--identity-key');
   });
 
   it('control repo FOREIGN end-to-end (unreadable fleet.yaml): exit 1, NO agent App/repo/install is ever touched, no fleet.lock/vault.age written', async () => {

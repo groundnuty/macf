@@ -1733,8 +1733,24 @@ function launchNextStepLines(deployPhase: DeployPhaseRenderInput): string[] {
  * and unbumped, for the genuinely-unprovisioned case — only the NEW,
  * additional case's wording differs from what a pre-#1183 consumer had
  * never seen at all.)
+ *
+ * **groundnuty/macf#1268 bumped this 2 → 3.** Unlike #1220 above (a
+ * brand-new key) or #1183 (a prose change on an existing string), this
+ * changes the KEY's OWN PRESENCE CONDITION — the shape #1212 bumped for.
+ * Before #1268, `install_scope_coverage` was present in `--json` output
+ * if and only if BOTH `--vault` and `--identity-key` were given; any other
+ * case (including a fleet that genuinely has fleet-level Apps to check)
+ * collapsed to key-absent, indistinguishable from "nothing to check." A
+ * `--json` consumer that gated any logic on `'install_scope_coverage' in
+ * json` as a proxy for "were the vault flags given" would now see that
+ * proxy break: the key can be present (with honest `'unknown'` entries
+ * naming the missing flags) on a vault-FREE run too, whenever the
+ * manifest declares a runner-ops or router-App target. `status`/`message`
+ * per entry were already `'unknown'`-capable before this bump (an
+ * in-vault credential-resolution or repo-existence gap already produced
+ * it) — only the KEY'S PRESENCE on a vault-free run is new.
  */
-export const FLEET_APPLY_JSON_SCHEMA_VERSION = 2;
+export const FLEET_APPLY_JSON_SCHEMA_VERSION = 3;
 
 /**
  * The control-repo status line — ALWAYS rendered first (macf#857), so a
@@ -3390,19 +3406,55 @@ export async function runBootstrapApply(
         });
         return outcome.status === 'covered' ? { ...target, status: 'covered', missingRepos: [], unverifiedRepos: [] } : entry;
       };
-      const installScopeCoverage =
+      // groundnuty/macf#1268 — ALWAYS call `computeInstallScopeCoverage`,
+      // never short-circuit to `{}` when `--vault`/`--identity-key` are
+      // absent. That function ALREADY implements the exact "only when
+      // meaningful, say why otherwise" contract this issue asks for —
+      // `targets.length === 0` (this manifest declares neither runner-ops
+      // nor a router App needing one) returns `{}` with ZERO I/O, so a
+      // fleet with nothing to check stays silent, same as before this fix.
+      // `targets.length > 0` with `vaultOpts === undefined` returns one
+      // honest `'unknown'` entry per target via its own `allUnverified`
+      // helper, message `"install-scope coverage was not checked this run
+      // — no --vault/--identity-key given."` — naming exactly what the
+      // operator would supply, in the same sentence as the gap. The
+      // pre-#1268 bug was ONLY this call site discarding that honest-
+      // unknown output via the ternary's `: {}` branch, regardless of
+      // whether `targets` was empty or not — never a missing capability in
+      // `install-scope-coverage.ts` itself.
+      //
+      // Deliberately NOT gated on "did this run just CREATE the App vs
+      // reuse a pre-existing one" (`result.runnerOps.status`/
+      // `result.routerApp.status`, both available here without a vault):
+      // that signal exists, but a fresh fleet's first-ever `apply` — the
+      // runbook's own canonical §3.3 happy-path example is bare `macf
+      // bootstrap apply -f fleet.yaml`, no vault flags at all — would then
+      // suppress the notice on exactly the run where "no --vault" is
+      // expected and correct (§6.8: the pair is together-or-neither, never
+      // required), trading this issue's silence for a different one.
+      // `installScopeCoverageTargets` (pure, manifest-only — "does this
+      // fleet need one of these Apps at all") is the distinction that's
+      // actually available without a vault; "did it pre-exist" is not,
+      // short of the vault read this branch exists to avoid requiring.
+      const vaultOpts =
         opts.vaultPath !== undefined && opts.identityKeyPath !== undefined
-          ? await computeInstallScopeCoverage(
-              manifest,
-              result.finalLock,
-              Object.fromEntries(result.agents.map((rec) => [rec.role, rec.identity.status === 'failed' ? 'unknown' : 'present'])) as Readonly<
-                Record<string, Presence>
-              >,
-              controlRepoAborted ? observed.controlRepoPresence : 'present',
-              { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath },
-              { onDrift: onInstallScopeDrift },
-            )
-          : {};
+          ? { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath }
+          : undefined;
+      const installScopeCoverage = await computeInstallScopeCoverage(
+        manifest,
+        result.finalLock,
+        Object.fromEntries(result.agents.map((rec) => [rec.role, rec.identity.status === 'failed' ? 'unknown' : 'present'])) as Readonly<
+          Record<string, Presence>
+        >,
+        controlRepoAborted ? observed.controlRepoPresence : 'present',
+        vaultOpts,
+        // `onDrift` is safe to wire UNCONDITIONALLY: `computeInstallScopeCoverage`
+        // only ever reaches a `'drift'` result (the sole trigger for calling
+        // it) via the live per-repo probe, which itself only runs when
+        // `vaultOpts !== undefined` — so this is inert on the vault-absent
+        // path, identical to the pre-#1268 behavior on that path.
+        { onDrift: onInstallScopeDrift },
+      );
       const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
 
       // groundnuty/macf#1241 — resolve org-inherited routing-secret
