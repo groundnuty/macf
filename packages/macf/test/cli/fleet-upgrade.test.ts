@@ -24,9 +24,11 @@ import {
   fleetUpgradeExitCode,
   isMixedVersionRoll,
   rollLeftAgentBehind,
+  buildCliFetchLatest,
   type FleetUpgradeDeps,
 } from '../../src/cli/commands/fleet-upgrade.js';
 import { NO_MANIFEST_VERSION } from '../../src/cli/bootstrap/version-target.js';
+import type { FetchResult } from '../../src/cli/version-resolver.js';
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -785,4 +787,77 @@ describe('runFleetUpgrade — the decisive pair (macf#1146): mixed vs. fully-gre
     expect(calls.upgrade).toEqual(['a']);
     expect(lines.join('\n')).not.toContain('MIXED VERSION FLEET');
   });
+});
+
+/**
+ * `buildCliFetchLatest` (macf#777) — the npm-latest lookup wired into
+ * `resolveTargetVersion`'s L2.5 no-manifest path. Before this build, a
+ * failed fetch collapsed EVERY cause (network outage, rate-limit, 404,
+ * malformed response) into the same generic downstream
+ * "could not resolve npm-latest target" — `fetchLatestCliVersion()` already
+ * discriminated the cause, but this call site discarded it. These tests
+ * assert the discrimination now reaches the operator via `log`, BEFORE
+ * `resolveTargetVersion`'s generic message, without changing the return
+ * value (`string | null` — control flow untouched, per "diagnosis and
+ * reporting, not changing what upgrade does on failure").
+ */
+describe('buildCliFetchLatest (macf#777)', () => {
+  it('a successful fetch returns the value and logs NOTHING — no diagnostic noise on the happy path', async () => {
+    const log = vi.fn();
+    const fetchLatest = buildCliFetchLatest(
+      async (): Promise<FetchResult> => ({ status: 'ok', value: '0.2.99' }),
+      log,
+    );
+    expect(await fetchLatest()).toBe('0.2.99');
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('DECISIVE — a genuine network failure logs the host+cause, names checking connectivity, NOT GH_TOKEN', async () => {
+    const log = vi.fn();
+    const fetchLatest = buildCliFetchLatest(
+      async (): Promise<FetchResult> => ({
+        status: 'network_error', value: null, detail: 'registry.npmjs.org: ENOTFOUND',
+      }),
+      log,
+    );
+    expect(await fetchLatest()).toBeNull();
+    expect(log).toHaveBeenCalledTimes(1);
+    const message = log.mock.calls[0]![0] as string;
+    expect(message).toContain('registry.npmjs.org');
+    expect(message).toContain('ENOTFOUND');
+    expect(message).not.toContain('GH_TOKEN');
+  });
+
+  it('DECISIVE — a rate-limit/auth failure logs the GH_TOKEN remedy, NOT a network cause', async () => {
+    const log = vi.fn();
+    const fetchLatest = buildCliFetchLatest(
+      async (): Promise<FetchResult> => ({
+        status: 'rate_limited', value: null, detail: 'registry.npmjs.org',
+      }),
+      log,
+    );
+    expect(await fetchLatest()).toBeNull();
+    expect(log).toHaveBeenCalledTimes(1);
+    const message = log.mock.calls[0]![0] as string;
+    expect(message).toContain('GH_TOKEN');
+    expect(message).not.toContain('ENOTFOUND');
+    expect(message).not.toContain('ECONNREFUSED');
+  });
+
+  it('DECISIVE — the two failure messages are genuinely different strings, not a shared generic one', async () => {
+    const networkLog = vi.fn();
+    await buildCliFetchLatest(
+      async (): Promise<FetchResult> => ({
+        status: 'network_error', value: null, detail: 'registry.npmjs.org: ENOTFOUND',
+      }),
+      networkLog,
+    )();
+    const rateLimitedLog = vi.fn();
+    await buildCliFetchLatest(
+      async (): Promise<FetchResult> => ({ status: 'rate_limited', value: null, detail: 'registry.npmjs.org' }),
+      rateLimitedLog,
+    )();
+    expect(networkLog.mock.calls[0]![0]).not.toBe(rateLimitedLog.mock.calls[0]![0]);
+  });
+
 });

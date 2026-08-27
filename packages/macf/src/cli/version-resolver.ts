@@ -17,6 +17,14 @@
  * The caller can produce clearer warnings than the old single "network
  * fetch failed" message. GitHub fetchers fall back from /releases/latest
  * to /tags so bare-tag versioning (no GitHub Release object) still works.
+ *
+ * `FetchResult.detail` (macf#777) carries the host + — for `network_error`
+ * specifically — the underlying `err.cause` reason, since undici's
+ * `TypeError: fetch failed` message is ALWAYS the literal string "fetch
+ * failed" and is worthless on its own; `statusMessage()`'s optional 3rd arg
+ * appends it. A caller that drops `.detail` (e.g. `resolveLatestVersions()`'s
+ * `sources` field, which is `FetchStatus`-only) is unaffected — additive,
+ * not a breaking change to the existing status classification.
  */
 
 import { PACKAGE_VERSION } from '../package-version.js';
@@ -67,6 +75,52 @@ function classifyGithubError(status: number): FetchStatus {
 export interface FetchResult {
   readonly status: FetchStatus;
   readonly value: string | null;
+  /**
+   * Diagnostic detail for a non-'ok' status (macf#777) — `<host>: <reason>`.
+   * `<reason>` is `err.cause.code` (a Node system-error code like `ENOTFOUND`
+   * / `ECONNREFUSED`) or `.message` when the fetch itself threw
+   * (`network_error` — undici's `TypeError: fetch failed` message is always
+   * the literal string "fetch failed", worthless without the nested cause);
+   * for a non-ok HTTP response (`not_published` / `rate_limited` /
+   * `invalid_response`) it is just the host, since the status code itself
+   * already carries the reason. `undefined` on 'ok' — nothing to report.
+   */
+  readonly detail?: string;
+}
+
+/**
+ * Extracts the target host from a fetch URL for diagnostic messages — never
+ * throws (an unparseable URL just echoes back unchanged).
+ */
+function fetchHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Turns a caught fetch() rejection into a `"<host>: <reason>"` diagnostic
+ * (macf#777). Node's global `fetch` (undici) throws a bare `TypeError: fetch
+ * failed` on any network-level failure — the message is ALWAYS the literal
+ * string "fetch failed"; the actual reason (DNS failure, connection refused,
+ * timeout, ...) is nested in `err.cause` as a Node system-error-ish object
+ * with `.code`. Surfacing that code verbatim (never wrapped in an asserted
+ * diagnosis) lets the reader distinguish "no route at all" from "a real
+ * remote outage" — this function cannot itself tell those apart, so it must
+ * not claim to. Same extraction `github-client.ts`'s `fetchOrThrow` already
+ * uses for the registry-write path; duplicated here (not imported) to keep
+ * this CLI-side module's only macf-core dependency the existing
+ * `proxyAwareFetch`, not a second cross-package coupling for one helper.
+ */
+function describeFetchFailure(url: string, err: unknown): string {
+  const error = err instanceof Error ? err : new Error(String(err));
+  const cause = error.cause as { code?: unknown; message?: unknown } | undefined;
+  const causeCode = typeof cause?.code === 'string' ? cause.code : undefined;
+  const causeMessage = typeof cause?.message === 'string' ? cause.message : undefined;
+  const reason = causeCode ?? causeMessage ?? error.message;
+  return `${fetchHost(url)}: ${reason}`;
 }
 
 export interface ResolvedVersions {
@@ -112,24 +166,23 @@ export function isValidActionsRef(v: string): boolean {
  * Returns the tag name (with leading 'v' if present) or null with reason.
  */
 async function fetchHighestTag(repo: string): Promise<FetchResult> {
+  const url = `https://api.github.com/repos/${repo}/tags`;
   try {
-    const res = await proxyAwareFetch(`https://api.github.com/repos/${repo}/tags`, {
-      headers: githubHeaders(),
-    });
-    if (!res.ok) return { status: classifyGithubError(res.status), value: null };
+    const res = await proxyAwareFetch(url, { headers: githubHeaders() });
+    if (!res.ok) return { status: classifyGithubError(res.status), value: null, detail: fetchHost(url) };
     const data = await res.json() as Array<{ name?: unknown }>;
-    if (!Array.isArray(data)) return { status: 'invalid_response', value: null };
+    if (!Array.isArray(data)) return { status: 'invalid_response', value: null, detail: fetchHost(url) };
 
     const semverTags = data
       .map(t => typeof t.name === 'string' ? t.name : null)
       .filter((n): n is string => n !== null && /^v?\d+\.\d+\.\d+$/.test(n));
 
-    if (semverTags.length === 0) return { status: 'not_published', value: null };
+    if (semverTags.length === 0) return { status: 'not_published', value: null, detail: fetchHost(url) };
 
     semverTags.sort((a, b) => compareSemver(b, a)); // descending
     return { status: 'ok', value: semverTags[0]! };
-  } catch {
-    return { status: 'network_error', value: null };
+  } catch (err) {
+    return { status: 'network_error', value: null, detail: describeFetchFailure(url, err) };
   }
 }
 
@@ -145,20 +198,19 @@ async function fetchHighestTag(repo: string): Promise<FetchResult> {
  * stale-pin state on 2026-05-01 cycle. Fix: use the correct package URL.
  */
 export async function fetchLatestCliVersion(): Promise<FetchResult> {
+  const url = 'https://registry.npmjs.org/@groundnuty/macf';
   try {
-    const res = await proxyAwareFetch('https://registry.npmjs.org/@groundnuty/macf', {
-      headers: { 'Accept': 'application/json' },
-    });
-    if (res.status === 404) return { status: 'not_published', value: null };
-    if (!res.ok) return { status: 'invalid_response', value: null };
+    const res = await proxyAwareFetch(url, { headers: { 'Accept': 'application/json' } });
+    if (res.status === 404) return { status: 'not_published', value: null, detail: fetchHost(url) };
+    if (!res.ok) return { status: 'invalid_response', value: null, detail: fetchHost(url) };
     const data = await res.json() as { 'dist-tags'?: { latest?: string } };
     const latest = data['dist-tags']?.latest;
     if (typeof latest !== 'string' || !isValidSemver(latest)) {
-      return { status: 'invalid_response', value: null };
+      return { status: 'invalid_response', value: null, detail: fetchHost(url) };
     }
     return { status: 'ok', value: latest };
-  } catch {
-    return { status: 'network_error', value: null };
+  } catch (err) {
+    return { status: 'network_error', value: null, detail: describeFetchFailure(url, err) };
   }
 }
 
@@ -168,12 +220,11 @@ export async function fetchLatestCliVersion(): Promise<FetchResult> {
  */
 export async function fetchLatestPluginVersion(): Promise<FetchResult> {
   const repo = 'groundnuty/macf-marketplace';
+  const url = `https://api.github.com/repos/${repo}/releases/latest`;
 
   // Try /releases/latest first
   try {
-    const res = await proxyAwareFetch(`https://api.github.com/repos/${repo}/releases/latest`, {
-      headers: githubHeaders(),
-    });
+    const res = await proxyAwareFetch(url, { headers: githubHeaders() });
     if (res.ok) {
       const data = await res.json() as { tag_name?: string };
       const tag = data.tag_name;
@@ -181,19 +232,19 @@ export async function fetchLatestPluginVersion(): Promise<FetchResult> {
         const semver = tag.replace(/^v/, '');
         if (isValidSemver(semver)) return { status: 'ok', value: semver };
       }
-      return { status: 'invalid_response', value: null };
+      return { status: 'invalid_response', value: null, detail: fetchHost(url) };
     }
-    if (res.status !== 404) return { status: classifyGithubError(res.status), value: null };
+    if (res.status !== 404) return { status: classifyGithubError(res.status), value: null, detail: fetchHost(url) };
     // fall through to /tags (404 = no Release object; marketplace uses bare tags)
-  } catch {
-    return { status: 'network_error', value: null };
+  } catch (err) {
+    return { status: 'network_error', value: null, detail: describeFetchFailure(url, err) };
   }
 
   // Fallback: /tags
   const tagsResult = await fetchHighestTag(repo);
   if (tagsResult.status !== 'ok' || !tagsResult.value) return tagsResult;
   const semver = tagsResult.value.replace(/^v/, '');
-  if (!isValidSemver(semver)) return { status: 'invalid_response', value: null };
+  if (!isValidSemver(semver)) return { status: 'invalid_response', value: null, detail: fetchHost(url) };
   return { status: 'ok', value: semver };
 }
 
@@ -203,11 +254,10 @@ export async function fetchLatestPluginVersion(): Promise<FetchResult> {
  */
 export async function fetchLatestActionsVersion(): Promise<FetchResult> {
   const repo = 'groundnuty/macf-actions';
+  const url = `https://api.github.com/repos/${repo}/releases/latest`;
 
   try {
-    const res = await proxyAwareFetch(`https://api.github.com/repos/${repo}/releases/latest`, {
-      headers: githubHeaders(),
-    });
+    const res = await proxyAwareFetch(url, { headers: githubHeaders() });
     if (res.ok) {
       const data = await res.json() as { tag_name?: string };
       const tag = data.tag_name;
@@ -215,18 +265,18 @@ export async function fetchLatestActionsVersion(): Promise<FetchResult> {
         const m = /^v(\d+)/.exec(tag);
         return { status: 'ok', value: m ? `v${m[1]}` : tag };
       }
-      return { status: 'invalid_response', value: null };
+      return { status: 'invalid_response', value: null, detail: fetchHost(url) };
     }
-    if (res.status !== 404) return { status: classifyGithubError(res.status), value: null };
-  } catch {
-    return { status: 'network_error', value: null };
+    if (res.status !== 404) return { status: classifyGithubError(res.status), value: null, detail: fetchHost(url) };
+  } catch (err) {
+    return { status: 'network_error', value: null, detail: describeFetchFailure(url, err) };
   }
 
   // Fallback: /tags
   const tagsResult = await fetchHighestTag(repo);
   if (tagsResult.status !== 'ok' || !tagsResult.value) return tagsResult;
   const m = /^v(\d+)/.exec(tagsResult.value);
-  if (!m) return { status: 'invalid_response', value: null };
+  if (!m) return { status: 'invalid_response', value: null, detail: fetchHost(url) };
   return { status: 'ok', value: `v${m[1]}` };
 }
 
@@ -306,13 +356,21 @@ export async function resolveLatestVersions(): Promise<ResolvedVersions> {
 /**
  * Human-readable message for a non-ok fetch status. Used by callers to
  * print actionable warnings instead of the generic "network fetch failed".
+ *
+ * `detail` (macf#777, optional — 3rd-arg addition, existing 2-arg call sites
+ * unaffected) is `FetchResult.detail`: the host + (for `network_error`) the
+ * underlying `err.cause` reason. Appended when present so the operator sees
+ * WHICH endpoint rejected the call and WHY, not just a status label.
  */
-export function statusMessage(component: string, status: FetchStatus): string {
-  switch (status) {
-    case 'ok': return `${component}: ok`;
-    case 'not_published': return `${component}: no published release found (using default)`;
-    case 'network_error': return `${component}: network fetch failed (using default)`;
-    case 'rate_limited': return `${component}: GitHub API rate-limited or unauthorized — set GH_TOKEN to raise the anon 60 req/h limit (using default)`;
-    case 'invalid_response': return `${component}: unexpected response format (using default)`;
-  }
+export function statusMessage(component: string, status: FetchStatus, detail?: string): string {
+  const base = ((): string => {
+    switch (status) {
+      case 'ok': return `${component}: ok`;
+      case 'not_published': return `${component}: no published release found (using default)`;
+      case 'network_error': return `${component}: network fetch failed (using default)`;
+      case 'rate_limited': return `${component}: GitHub API rate-limited or unauthorized — set GH_TOKEN to raise the anon 60 req/h limit (using default)`;
+      case 'invalid_response': return `${component}: unexpected response format (using default)`;
+    }
+  })();
+  return detail ? `${base} — ${detail}` : base;
 }
