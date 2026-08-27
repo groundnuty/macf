@@ -116,6 +116,119 @@ assert_true "heading present at top for current release" changelog_has_heading "
 assert_false "no heading at all for an unreleased version" changelog_has_heading "0.9.10"
 assert_false "heading exists but NOT at the top" changelog_has_heading "0.9.8"
 
+# --- wait_for_npm_version (groundnuty/macf#776 — npm registry lag) ---------
+# npm's registry CDN is eventually consistent: `npm view` can report the OLD
+# version for a while after `npm publish` already succeeded. Every scenario
+# below zeroes the backoff (MACF_RELEASE_NPM_VERIFY_BASE_SECS/_CAP_SECS=0) so
+# assertions run instantly and check ATTEMPT COUNTS, never wall-clock time —
+# `npm_view_version` is overridden (shell-function redefinition, same
+# technique the `gh` stub below uses) to avoid any real network call.
+#
+# Call counting is routed through a FILE, not a plain shell variable: each
+# `npm_view_version` invocation happens inside `wait_for_npm_version`'s
+# `live="$(npm_view_version "$pkg")"` — a command substitution, which bash
+# always runs in a SUBSHELL. A variable increment inside that subshell is
+# invisible to the caller the instant the subshell exits, so a plain
+# counter variable would silently read back as unchanged after every call
+# (caught empirically while writing these tests — see the mutation-check
+# note in the issue thread / PR description).
+export MACF_RELEASE_NPM_VERIFY_BASE_SECS=0
+export MACF_RELEASE_NPM_VERIFY_CAP_SECS=0
+NPM_CALL_COUNTER_FILE="$(mktemp)"
+CLEANUP_DIRS+=("$NPM_CALL_COUNTER_FILE")
+npm_call_reset() { printf '0' >"$NPM_CALL_COUNTER_FILE"; }
+npm_call_incr() {
+  local n
+  n=$(($(cat "$NPM_CALL_COUNTER_FILE") + 1))
+  printf '%s' "$n" >"$NPM_CALL_COUNTER_FILE"
+  printf '%s' "$n"
+}
+npm_call_count() { cat "$NPM_CALL_COUNTER_FILE"; }
+
+# Decisive pair, part 1: the version appears on the SECOND attempt. Must
+# PASS *and* say it retried — a stub that always returns 0 regardless of
+# retry logic would satisfy "passes" alone (assert-the-wrong-path.md), so
+# the "says it retried" + "stopped calling after the match" assertions are
+# what make this decisive.
+npm_view_version() {
+  local n
+  n="$(npm_call_incr)"
+  if [ "$n" -ge 2 ]; then
+    echo "1.2.3"
+  else
+    echo "1.2.2"
+  fi
+}
+npm_call_reset
+MACF_RELEASE_NPM_VERIFY_TRIES=5
+if WFN_OUT="$(wait_for_npm_version "@groundnuty/test-pkg" "1.2.3" 2>&1)"; then
+  WFN_RC=0
+else
+  WFN_RC=$?
+fi
+assert_eq "wait_for_npm_version: passes when version appears on 2nd attempt" "0" "$WFN_RC"
+assert_contains "wait_for_npm_version: success-after-retry says it retried" "$WFN_OUT" "after retrying"
+assert_contains "wait_for_npm_version: success-after-retry names the succeeding attempt" "$WFN_OUT" "succeeded on attempt 2/5"
+assert_eq "wait_for_npm_version: stops calling npm_view_version once matched (2 calls, not 5)" "2" "$(npm_call_count)"
+
+# Decisive pair, part 2: the version NEVER appears. Must FAIL after the
+# bound, and the TERMINAL line must name the attempt count and be worded
+# distinctly from the mid-retry "still retrying" line — the two must never
+# be confusable (one means wait, the other means genuine failure).
+npm_view_version() {
+  npm_call_incr >/dev/null
+  echo "0.0.0-never-published"
+}
+npm_call_reset
+MACF_RELEASE_NPM_VERIFY_TRIES=4
+if WFN_OUT="$(wait_for_npm_version "@groundnuty/test-pkg" "1.2.3" 2>&1)"; then
+  WFN_RC=0
+else
+  WFN_RC=$?
+fi
+WFN_LAST_LINE="$(printf '%s\n' "$WFN_OUT" | tail -n1)"
+assert_true "wait_for_npm_version: fails when version never appears" test "$WFN_RC" -ne 0
+assert_contains "wait_for_npm_version: terminal line is the MISMATCH line" "$WFN_LAST_LINE" "MISMATCH"
+assert_contains "wait_for_npm_version: terminal line names the attempt bound (4)" "$WFN_LAST_LINE" "still absent after 4 attempts"
+assert_not_contains "wait_for_npm_version: terminal MISMATCH line is NOT worded as a mid-retry line" "$WFN_LAST_LINE" "retrying"
+assert_eq "wait_for_npm_version: exactly 4 attempts made (the bound), not more" "4" "$(npm_call_count)"
+
+# Plus: first-attempt success -> no retry noise (the common happy path must
+# stay quiet).
+npm_view_version() {
+  npm_call_incr >/dev/null
+  echo "1.2.3"
+}
+npm_call_reset
+MACF_RELEASE_NPM_VERIFY_TRIES=8
+if WFN_OUT="$(wait_for_npm_version "@groundnuty/test-pkg" "1.2.3" 2>&1)"; then
+  WFN_RC=0
+else
+  WFN_RC=$?
+fi
+assert_eq "wait_for_npm_version: first-attempt match passes" "0" "$WFN_RC"
+assert_not_contains "wait_for_npm_version: first-attempt match has no retry noise" "$WFN_OUT" "retrying"
+assert_not_contains "wait_for_npm_version: first-attempt match does not claim it retried" "$WFN_OUT" "after retrying"
+assert_eq "wait_for_npm_version: exactly ONE npm_view_version call on first-attempt match" "1" "$(npm_call_count)"
+
+# Plus: the bound is respected — asserted via ELAPSED ATTEMPTS (a call
+# counter), never wall-clock. A never-matching stub must invoke
+# npm_view_version EXACTLY max_tries times, no more (an off-by-one or
+# unbounded loop would call it more; see the mutation-check note at the
+# bottom of this file for the "make it unbounded" direction, which this
+# same assertion is the one that would catch it).
+npm_view_version() {
+  npm_call_incr >/dev/null
+  echo "0.0.0-never-published"
+}
+npm_call_reset
+MACF_RELEASE_NPM_VERIFY_TRIES=6
+wait_for_npm_version "@groundnuty/test-pkg" "1.2.3" >/dev/null 2>&1 || true
+assert_eq "wait_for_npm_version: bound respected — exactly 6 attempts, not more" "6" "$(npm_call_count)"
+
+unset MACF_RELEASE_NPM_VERIFY_TRIES MACF_RELEASE_NPM_VERIFY_BASE_SECS MACF_RELEASE_NPM_VERIFY_CAP_SECS
+unset -f npm_view_version
+
 # --- cmd_cli --dry-run scoping (groundnuty/macf#1099) -----------------------
 # Fixture: a real (tiny) git repo standing in for the monorepo, on `main`,
 # with one commit at "current" version 0.2.1. Every scenario below then
@@ -231,6 +344,95 @@ STUB_TAG_EXISTS=0
 run_cmd_cli "$TEST_VER" 0
 assert_true "real cli path aborts on a dirty tree (nonzero exit)" test "$LAST_RC" -ne 0
 assert_contains "real cli path's abort message is unchanged" "$LAST_OUTPUT" "working tree not clean — commit or stash before release-cli"
+
+# --- cmd_verify wiring (groundnuty/macf#776) --------------------------------
+# End-to-end check that cmd_verify actually DELEGATES to wait_for_npm_version
+# (rather than the unit tests above exercising a function nothing calls) —
+# extends the existing `gh` stub with the run-polling URL shapes cmd_verify
+# needs (workflow-run lookup + status/conclusion), and reuses the
+# npm_view_version override technique for a package that lags by one
+# attempt. `make -f dev.mk release-verify` is a thin wrapper straight to
+# `release.sh verify` (see dev.mk's RELEASE_SH), so exercising cmd_verify
+# directly here IS exercising the make-target path — no separate Make-layer
+# test needed.
+gh() {
+  if [ "$1" = "api" ]; then
+    case "$2" in
+      */git/ref/tags/*)
+        [ "$STUB_TAG_EXISTS" = "1" ] && return 0 || return 1
+        ;;
+      *actions/workflows/publish.yml/runs*)
+        echo "${STUB_RUN_ID:-424242}"
+        return 0
+        ;;
+      *actions/runs/*)
+        case "$4" in
+          *.status*) echo "${STUB_RUN_STATUS:-completed}" ;;
+          *.conclusion*) echo "${STUB_RUN_CONCLUSION:-success}" ;;
+        esac
+        return 0
+        ;;
+    esac
+  fi
+  return 1
+}
+
+MACF_RELEASE_NPM_VERIFY_BASE_SECS=0
+MACF_RELEASE_NPM_VERIFY_CAP_SECS=0
+export MACF_RELEASE_NPM_VERIFY_BASE_SECS MACF_RELEASE_NPM_VERIFY_CAP_SECS
+
+# Happy path: publish run green, two packages live on the first check, the
+# third lags by one attempt — cmd_verify must still succeed overall AND
+# surface that one package needed a retry. Reuses the file-backed
+# npm_call_incr/npm_call_reset helpers defined above (a plain variable
+# would hit the same subshell-scoping trap documented there).
+npm_view_version() {
+  case "$1" in
+    "@groundnuty/macf-channel-server")
+      local n
+      n="$(npm_call_incr)"
+      if [ "$n" -ge 2 ]; then
+        echo "9.9.9"
+      else
+        echo "9.9.8"
+      fi
+      ;;
+    *) echo "9.9.9" ;;
+  esac
+}
+npm_call_reset
+if CV_OUT="$(cmd_verify "9.9.9" 2>&1)"; then
+  CV_RC=0
+else
+  CV_RC=$?
+fi
+assert_eq "cmd_verify: succeeds when publish is green and npm lag resolves within budget" "0" "$CV_RC"
+assert_contains "cmd_verify: reports the lagging package as retried" "$CV_OUT" "after retrying"
+assert_contains "cmd_verify: reports the two non-lagging packages OK on the first try" "$CV_OUT" "OK @groundnuty/macf@9.9.9 live on npm"
+assert_contains "cmd_verify: final success line unchanged" "$CV_OUT" "release v9.9.9 fully verified: publish run green + all 3 packages live on npm at 9.9.9"
+
+# Genuine failure: one package never appears even after the full retry
+# budget — cmd_verify must still die (non-zero), and the die message must
+# not claim the mismatch was mere registry lag.
+npm_view_version() {
+  case "$1" in
+    "@groundnuty/macf-channel-server") echo "0.0.0-orphaned" ;;
+    *) echo "9.9.9" ;;
+  esac
+}
+# shellcheck disable=SC2034  # consumed by wait_for_npm_version() in the sourced release.sh, not in this file
+MACF_RELEASE_NPM_VERIFY_TRIES=2
+if CV_FAIL_OUT="$(cmd_verify "9.9.9" 2>&1)"; then
+  CV_FAIL_RC=0
+else
+  CV_FAIL_RC=$?
+fi
+assert_true "cmd_verify: dies when a package never appears within the bound" test "$CV_FAIL_RC" -ne 0
+assert_contains "cmd_verify: die message names it a genuine miss, not lag" "$CV_FAIL_OUT" "not registry lag"
+assert_contains "cmd_verify: MISMATCH line names the still-missing package" "$CV_FAIL_OUT" "MISMATCH: @groundnuty/macf-channel-server"
+
+unset MACF_RELEASE_NPM_VERIFY_TRIES MACF_RELEASE_NPM_VERIFY_BASE_SECS MACF_RELEASE_NPM_VERIFY_CAP_SECS
+unset -f npm_view_version npm_call_reset npm_call_incr npm_call_count
 
 # --- check_harness_compat (groundnuty/macf#1069) ---------------------------
 # Decisive per assert-the-wrong-path.md: a tree WITH the drift must fail the
