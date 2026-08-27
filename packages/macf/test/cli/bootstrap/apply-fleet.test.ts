@@ -2042,6 +2042,163 @@ agents:
     expect(result.agents[0]?.identity.status).toBe('reused');
   });
 
+  // groundnuty/macf#1249 — apply OWNS the committed fleet.yaml on EVERY run,
+  // not just first-creation. `provisionControlRepo`'s own `ours` branch
+  // never re-commits (see `control-repo.ts`'s doc); the fix lives at THIS
+  // call site — `applyFleet` refreshes `controlDir/fleet.yaml` from the
+  // local manifest right before the final sync commit. These two tests are
+  // the write-path half of the decisive pair (`control-repo-manifest-drift.test.ts`
+  // covers the READ/report half).
+  describe('control-repo manifest sync on a reused checkout (groundnuty/macf#1249)', () => {
+    const STALE_COMMITTED_YAML = [
+      'apiVersion: macf/v0',
+      'kind: Fleet',
+      'metadata:',
+      '  name: demo-fleet',
+      'owner:',
+      '  account: groundnuty',
+      '  type: user',
+      '  registry: { type: profile, user: groundnuty }',
+      'network:',
+      '  advertise_host: STALE.ts.net',
+      'transport:',
+      '  age_recipients: []',
+      'defaults:',
+      '  role_template: groundnuty/agentic-repo-template',
+      '  app_manifest: dr-019',
+      'agents:',
+      '  - role: code-agent',
+      '    profile: code',
+      '    repo: groundnuty/demo-code',
+      '    deploy_path: /x',
+    ].join('\n');
+
+    function reuseControlRepoDeps(committedYaml: string, commitAndPushCalls: string[]): ControlRepoDeps {
+      return {
+        checkMeta: async () => ({ presence: 'present', archived: false }),
+        readManifestFile: async () => committedYaml,
+        createRepo: async () => {
+          throw new Error('must not be called — reuse never creates');
+        },
+        unarchiveRepo: async () => {
+          throw new Error('must not be called — this fixture is never ours-archived');
+        },
+        // The REAL clone would bring back whatever the control repo already
+        // has committed — simulate that by writing the SAME committed
+        // fleet.yaml into destDir (matching what `readManifestFile` above
+        // says is on the default branch).
+        cloneRepo: async (_url, destDir) => {
+          writeFileSync(join(destDir, 'fleet.yaml'), committedYaml, 'utf-8');
+        },
+        // Capture fleet.yaml's content at EVERY commitAndPush call — a
+        // 'reused' outcome never calls this from `provisionControlRepo`
+        // itself (see that function's doc), so the ONLY call this fixture
+        // ever sees is the final sync, at the very end of `applyFleet`.
+        commitAndPush: async (dir) => {
+          commitAndPushCalls.push(readFileSync(join(dir, 'fleet.yaml'), 'utf-8'));
+          return 'pushed';
+        },
+      };
+    }
+
+    it('a local manifest that DRIFTED from the committed one: the final sync commits THIS run\'s local bytes', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const localManifestYaml = [
+        'apiVersion: macf/v0',
+        'kind: Fleet',
+        'metadata:',
+        '  name: demo-fleet',
+        'owner:',
+        '  account: groundnuty',
+        '  type: user',
+        '  registry: { type: profile, user: groundnuty }',
+        'network:',
+        '  advertise_host: example.ts.net',
+        'transport:',
+        '  age_recipients: [age1operator, age1vm]',
+        '  router_app_scope: per-fleet',
+        'defaults:',
+        '  role_template: groundnuty/agentic-repo-template',
+        '  app_manifest: dr-019',
+        'agents:',
+        '  - role: code-agent',
+        '    profile: code',
+        '    repo: groundnuty/demo-code',
+        '    deploy_path: /x',
+      ].join('\n');
+      writeFileSync(manifestPath, localManifestYaml, 'utf-8');
+
+      const controlDir = mkdtempSync(join(tmpdir(), 'macf-apply-fleet-manifest-sync-'));
+      dirs.push(controlDir);
+      const commitAndPushCalls: string[] = [];
+
+      const deps: FleetApplyDeps = {
+        buildAgentDeps: () => agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'),
+        repoInitDeps: { cloneRepo: async () => {}, commitAndPush: async () => 'pushed' },
+        vaultDeps: { exists: () => false, encrypt: async () => {} },
+        controlRepoDeps: reuseControlRepoDeps(STALE_COMMITTED_YAML, commitAndPushCalls),
+        agentRepoDeps: agentRepoDepsFor(),
+        trustDeps: trustDepsFor(),
+        routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
+        routingSecretsDeps: NOOP_ROUTING_SECRETS_DEPS,
+        routerAppVaultDeps: NOOP_ROUTER_APP_VAULT_DEPS,
+        controlRepoOptions: { makeScratchDir: () => controlDir },
+        recoveryRootDir: controlDir,
+        now: () => new Date('2026-08-11T00:00:00.000Z'),
+        log: () => {},
+      };
+
+      await applyFleet(manifest, manifestPath, null, deps);
+
+      // Exactly ONE commitAndPush call for a 'reused' outcome (the final
+      // sync) — `provisionControlRepo` itself never calls it on reuse. If a
+      // future change makes 'reused' ALSO commit inside `provisionControlRepo`,
+      // this assertion (not just the content check below) would catch it.
+      expect(commitAndPushCalls).toHaveLength(1);
+      expect(commitAndPushCalls[0]).toBe(localManifestYaml);
+      expect(commitAndPushCalls[0]).not.toBe(STALE_COMMITTED_YAML);
+    });
+
+    it('an UNCHANGED local manifest (byte-identical to the committed one, comment and all): written byte-for-byte, never re-serialized through the parsed object', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      // The comment is the discriminator: `yaml.stringify(manifest)` (the
+      // in-memory-fallback re-serialization path) can NEVER reproduce it —
+      // an implementation that always re-serializes instead of reading the
+      // local file's raw bytes would silently strip it (and reformat
+      // everything else) on every single apply run.
+      const unchangedYaml = `${STALE_COMMITTED_YAML.replace('STALE.ts.net', 'example.ts.net')} # pinned — must survive a re-commit verbatim`;
+      writeFileSync(manifestPath, unchangedYaml, 'utf-8');
+
+      const controlDir = mkdtempSync(join(tmpdir(), 'macf-apply-fleet-manifest-sync-unchanged-'));
+      dirs.push(controlDir);
+      const commitAndPushCalls: string[] = [];
+
+      const deps: FleetApplyDeps = {
+        buildAgentDeps: () => agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'),
+        repoInitDeps: { cloneRepo: async () => {}, commitAndPush: async () => 'pushed' },
+        vaultDeps: { exists: () => false, encrypt: async () => {} },
+        controlRepoDeps: reuseControlRepoDeps(unchangedYaml, commitAndPushCalls),
+        agentRepoDeps: agentRepoDepsFor(),
+        trustDeps: trustDepsFor(),
+        routingClientDeps: NOOP_ROUTING_CLIENT_DEPS,
+        routingSecretsDeps: NOOP_ROUTING_SECRETS_DEPS,
+        routerAppVaultDeps: NOOP_ROUTER_APP_VAULT_DEPS,
+        controlRepoOptions: { makeScratchDir: () => controlDir },
+        recoveryRootDir: controlDir,
+        now: () => new Date('2026-08-11T00:00:00.000Z'),
+        log: () => {},
+      };
+
+      await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(commitAndPushCalls).toHaveLength(1);
+      expect(commitAndPushCalls[0]).toBe(unchangedYaml);
+      expect(commitAndPushCalls[0]).toContain('# pinned — must survive a re-commit verbatim');
+    });
+  });
+
   /**
    * groundnuty/macf#1221 (the "still broken after #1224" follow-up) — #1224
    * threaded `resolveControlRepoLabelTokenSource` into Step 0.5, but that

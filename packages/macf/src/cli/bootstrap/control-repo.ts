@@ -377,8 +377,14 @@ function defaultCommitMessage(repo: string): string {
  * `FleetManifest` objects directly rather than round-tripping them through a
  * file). Production always hits the byte-identical path — `manifestPath` was
  * literally the file `runBootstrapApply` just read.
+ *
+ * Exported (groundnuty/macf#1249) — `apply-fleet.ts` reuses this SAME
+ * byte-preserving read for its own manifest-sync write (see that module's
+ * "Final sync" section), so a `reused`/`revived` outcome's re-committed
+ * `fleet.yaml` gets the identical byte-preservation guarantee `created`
+ * already had, rather than a second, divergent re-serialization path.
  */
-function readManifestSourceOrFallback(manifest: FleetManifest, manifestPath: string): string {
+export function readManifestSourceOrFallback(manifest: FleetManifest, manifestPath: string): string {
   try {
     return readFileSync(manifestPath, 'utf-8');
   } catch {
@@ -402,10 +408,21 @@ function readManifestSourceOrFallback(manifest: FleetManifest, manifestPath: str
  *   is the GitOps record").
  * - `ours` → clone the EXISTING repo (brings back whatever a prior `apply`
  *   already committed — `fleet.lock`, `vault.age`, if this isn't the first
- *   run) → return `reused`. Does NOT re-commit `fleet.yaml` — day-2
- *   reconciliation of a changed local manifest against an already-live
- *   control repo is out of THIS increment's scope (Amendment D's phasing;
- *   see `apply-fleet.ts`'s module doc for the residual this leaves).
+ *   run) → return `reused`. This function itself does NOT re-commit
+ *   `fleet.yaml` on reuse — {@link provisionControlRepo} stays the narrow
+ *   "who owns this repo, and is the checkout available" primitive both
+ *   `apply-fleet.ts` AND the standalone `control-repo-init.ts` migration
+ *   verb share. **The day-2 residual this used to leave open (a changed
+ *   local manifest never reaching an already-live control repo) is CLOSED
+ *   at the `apply-fleet.ts` call-site layer, not here** (groundnuty/macf#1249):
+ *   `applyFleet` re-writes `controlDir/fleet.yaml` from THIS run's local
+ *   manifest right before its own final sync commit, so a `reused`/`revived`
+ *   outcome's checkout picks up any manifest drift alongside `fleet.lock`/
+ *   `vault.age` — see that module's "Final sync" section. `control-repo-init.ts`
+ *   deliberately does NOT get this behavior (it calls this function directly,
+ *   with no post-call sync step) — its own doc's "pure no-op on GitHub for
+ *   an already-migrated fleet" claim stays true precisely because this
+ *   function's OWN contract is unchanged.
  * - `ours-archived` (DR-043 Amendment G) → **never silently un-archived.**
  *   `opts.confirmUnarchive !== true` (the default) → return `status:
  *   'archived'` IMMEDIATELY, before touching `deps.unarchiveRepo`,

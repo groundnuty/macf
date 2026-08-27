@@ -203,7 +203,7 @@
  * after that function's call for the retain-and-say-so behavior on anything
  * else (`'failed'` or `'nothing-to-commit'`).
  */
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { TokenSource } from '@groundnuty/macf-core';
@@ -220,7 +220,7 @@ import type { AgentRepoDeps, AgentRepoOptions, RepoInitStepDeps, RepoInitStepOut
 import { applyRepoInitForAgent, ensureAgentRepo, resolveActionsPinReconcile, resolveAgentRepoInitTokenSource } from './apply-repo-init.js';
 import { repoHomepageUrl } from './app-manifest.js';
 import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './control-repo.js';
-import { provisionControlRepo } from './control-repo.js';
+import { provisionControlRepo, readManifestSourceOrFallback } from './control-repo.js';
 import type { ControlRepoInitOutcome } from './apply-control-repo-init.js';
 import { applyControlRepoInit, deriveRouterCarryingRepos, resolveControlRepoLabelTokenSource } from './apply-control-repo-init.js';
 import type { FleetLockAgentUpdate, FleetLockIdentityChange } from './fleet-lock.js';
@@ -2598,21 +2598,46 @@ export async function applyFleet(
     );
   }
 
+  // groundnuty/macf#1249 — apply OWNS the committed `fleet.yaml`, not just
+  // its FIRST commit. `provisionControlRepo`'s `absent` branch already
+  // writes+commits it as the control repo's first act (Amendment F); a
+  // `reused`/`revived` outcome only CLONES the checkout — its `fleet.yaml`
+  // is whatever a PRIOR run committed, and nothing overwrote it with THIS
+  // run's local manifest until now. Refreshing the checkout's `fleet.yaml`
+  // right here — immediately before the final sync commit below — means
+  // any drift between the operator's local file and the committed record
+  // (a scaled-up agent count, a `routing:` section, anything) rides the
+  // SAME commit as `fleet.lock`/`vault.age`, on every run that reaches this
+  // point (every non-aborted run — the control-repo-abort paths above
+  // return before this line). Byte-preserving (`readManifestSourceOrFallback`,
+  // same primitive `provisionControlRepo`'s own first-commit uses) — an
+  // unchanged local file produces an unchanged checkout file, so
+  // `commitAndPush`'s own `git diff --cached --quiet` no-op check (never a
+  // separate "did it change" test here) keeps a steady-state fleet's sync
+  // a true no-op rather than a comment-stripping reformat on every apply.
+  // `control-repo-init.ts`'s narrower migration verb calls
+  // `provisionControlRepo` directly, with no post-call sync step, so its
+  // documented "pure no-op on GitHub for an already-migrated fleet" claim
+  // is unaffected by this write living here rather than in that function.
+  writeFileSync(join(controlDir, 'fleet.yaml'), readManifestSourceOrFallback(manifest, manifestPath), 'utf-8');
+
   // Final sync (macf#857) — the LAST thing this run does: push whatever
   // changed in the control-repo checkout (fleet.lock from the incremental +
-  // batched writes above, and vault.age if written). Deliberately SELECTIVE
-  // — the real `commitAndPush` wired in here (`control-repo.ts`'s
-  // `realControlRepoCommitAndPush`) stages an explicit allowlist, NEVER
-  // `git add -A` (corrected 2026-08-12, #857 review — the prior framing
-  // here, "UNSELECTIVE is a deliberate Amendment-B durability win," was
-  // WRONG: committing a recovery artifact to permanent git history enlarges
-  // an age-key compromise's blast radius to every HISTORICAL artifact, not
-  // just current state, for a redundant second copy of secrets already in
-  // `vault.age`). Any `secrets/recovery/<role>.age` STILL present because
-  // the batched compose failed is left on LOCAL DISK ONLY, excluded by both
-  // the allowlist and a committed `.gitignore` — see the module doc's
-  // "Recovery-artifact lifecycle" section + `control-repo.ts`'s
-  // "git-committed content invariant" section.
+  // batched writes above, fleet.yaml if this run's local manifest drifted
+  // from the committed copy per groundnuty/macf#1249 above, and vault.age
+  // if written). Deliberately SELECTIVE — the real `commitAndPush` wired in
+  // here (`control-repo.ts`'s `realControlRepoCommitAndPush`) stages an
+  // explicit allowlist, NEVER `git add -A` (corrected 2026-08-12, #857
+  // review — the prior framing here, "UNSELECTIVE is a deliberate
+  // Amendment-B durability win," was WRONG: committing a recovery artifact
+  // to permanent git history enlarges an age-key compromise's blast radius
+  // to every HISTORICAL artifact, not just current state, for a redundant
+  // second copy of secrets already in `vault.age`). Any
+  // `secrets/recovery/<role>.age` STILL present because the batched compose
+  // failed is left on LOCAL DISK ONLY, excluded by both the allowlist and a
+  // committed `.gitignore` — see the module doc's "Recovery-artifact
+  // lifecycle" section + `control-repo.ts`'s "git-committed content
+  // invariant" section.
   const controlRepoSync = await syncControlRepo(controlDir, deps);
 
   // macf#992 (DR-043 Amendment B, the delete-timing fix) — recovery-artifact
@@ -2724,12 +2749,12 @@ export async function applyFleet(
  * caller can render it (the durable-artifacts-exist-but-aren't-pushed-yet
  * state is recoverable — re-running `apply` re-clones the SAME control repo
  * and pushes again — but must not be silent, since it means this run's
- * `fleet.lock`/`vault.age` changes exist ONLY on local disk).
+ * `fleet.lock`/`fleet.yaml`/`vault.age` changes exist ONLY on local disk).
  */
 async function syncControlRepo(controlDir: string, deps: FleetApplyDeps): Promise<ControlRepoSyncOutcome> {
   try {
     const result = await deps.controlRepoDeps.commitAndPush(controlDir, CONTROL_REPO_SYNC_COMMIT_MESSAGE);
-    deps.log(`Control repo: final sync — ${result === 'pushed' ? 'pushed fleet.lock/vault.age changes' : 'nothing new to push'}.`);
+    deps.log(`Control repo: final sync — ${result === 'pushed' ? 'pushed fleet.lock/fleet.yaml/vault.age changes' : 'nothing new to push'}.`);
     return { status: result };
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
