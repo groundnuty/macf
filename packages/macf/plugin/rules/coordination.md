@@ -280,7 +280,20 @@ The goal is correctness through dialogue, not compliance.
 
 ## Sandbox Configuration (Bash dev-loop unblocking)
 
-Claude Code 2.1.92+ has a seccomp regression on Linux ([anthropic/claude-code#43454](https://github.com/anthropics/claude-code/issues/43454)) that breaks Bash tool calls inside the sandbox during the spawned shell's own startup — zsh tries to read `/proc/self/fd/3` before any user-code runs and the regression denies that read. Even with `sandbox.filesystem.allowRead: ["/proc/self/fd"]` in place (per macf#208), the regression still bites because it hits before the allow-rule applies.
+Claude Code 2.1.92+ breaks Bash tool calls inside the sandbox on Linux. **Two distinct upstream bugs produce this, and they must not be conflated — verified against the GitHub API 2026-08-27:**
+
+| upstream | mechanism | state |
+|---|---|---|
+| [anthropic/claude-code#43454](https://github.com/anthropics/claude-code/issues/43454) | `apply-seccomp` **writes** `/proc/self/setgroups` before mapping UID; nested user-namespaces reject that without `CAP_SYS_ADMIN` | **open** — reproducing through 2.1.231 as of 2026-08-24 |
+| [anthropic/claude-code#52118](https://github.com/anthropics/claude-code/issues/52118) | the spawned shell **reads** `/proc/self/fd/3` at startup and is denied | **closed `not_planned`** 2026-05-27 — auto-closed as a suspected duplicate, then locked. **Never fixed; only "downgrade" was ever offered.** |
+
+**Which one you are hitting depends on the error string**, and it matters: `#43454` may yet be fixed upstream, while `#52118` will not be. **Do not read `#43454` closing as permission to retire the workaround** — the `/proc/self/fd/3` read is the other bug, and it is dead-closed.
+
+Even with `sandbox.filesystem.allowRead: ["/proc/self/fd"]` in place (per macf#208), the failure still bites because it hits before the allow-rule applies.
+
+**Treat this as indefinite, not provisional.** `apply-seccomp` was **introduced** in 2.1.92, and that introduction is the **only** mention of `seccomp`/`setgroups`/`self/fd` anywhere in Claude Code's 5930-line CHANGELOG — including every release through **2.1.247** (latest, 2026-08-26). So a sandbox that does not break Bash on Linux has not existed since 2.1.92: **this is not a fix we are waiting for, it is a capability that has been absent for four months.** Upgrading does not change that; date the capability, not the version.
+
+**It may not be Anthropic's to fix.** Across `#43454`'s 28 comments the root cause shifted four times — a missing `+x` bit, `socat` presence, bwrap's `setgroups=deny` inheritance, and **Ubuntu AppArmor's `unpriv_bwrap` profile denying the syscall**, which one commenter argues is a distro packaging bug rather than a Claude Code one. If that is right, no Claude Code release resolves it.
 
 **Workaround**: add common dev-loop commands to `sandbox.excludedCommands` so they run unsandboxed. The sandbox still gates anything not on the list; only the listed prefixes opt out. `macf init` / `macf update` / `macf rules refresh` install a canonical set per macf#211 — operator-authored entries are preserved on refresh.
 
