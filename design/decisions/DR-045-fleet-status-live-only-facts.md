@@ -116,3 +116,50 @@ And the direction that decides how strict to be:
 - **`status` gains no write path**, so it stays safe to run at any time, from any identity permitted to read (DR-044).
 - **Several facts we assumed needed recording turn out to be free**, most importantly *has routing ever delivered*.
 - **Some facts genuinely are unavailable**, and the DR requires saying so rather than inferring — which will make status *less* confident-looking than it is today, and correctly so.
+
+---
+
+## Amendment A (2026-08-27, `#1284`) — policy-prohibited deletion is a standing condition, and `status` reports it
+
+> **Operator directive, 2026-08-27 (relayed by `macf-code-agent`, awaiting the operator's own words):** *"if the reconciliation requires something to get deleted but our policy prohibits this, it should be reported — and the status field should keep that information, because this is a drift between manifest and the real state, which is acceptable by policy but has to be visible."*
+
+### A1 — `plan` reports the transition; `status` reports the condition
+
+**An `orphan` is not a one-time plan row. It is a persistent state of the fleet.** A fleet with orphaned resources sits in a **standing, policy-sanctioned divergence** between what its manifest declares and what exists — and it stays there, by design, because DR-043 P3 forbids the deletion that would resolve it.
+
+> **`plan` answers *what would change if I applied*. `status` answers *what is true now*.** An orphan is the second kind of fact, and reporting it only in `plan` means the only way to discover a standing divergence is to re-run a command about a change that already happened.
+
+### A2 — it is a tier-1 DERIVED fact, and that is what makes it cheap
+
+The orphan set is computable at read time from three inputs `status` already has:
+
+    manifest       what is declared
+    live GitHub    what exists
+    fleet.lock     what this tool created
+    → declared-absent + live-present + in-lock  =  orphaned, right now
+
+Under Decision 2's source order this is **tier 1, never tier 2** — which carries three consequences that are the reason to state it:
+
+- **No staleness class**, per Decision 1's guarantee, because it is recomputed every invocation.
+- **Nothing for `apply` to record**, so it **cannot inherit the `#1269` gate class** where a recorded fact depends on a write that may never run.
+- **It survives a tool reinstall**, since every input is on GitHub or in the repo.
+
+**This is the same computation DR-043 row 4 already performs** (`#1270`), so it is a reuse question, not new logic.
+
+### A3 — it is a STATE, not a warning, and must not render as one
+
+*"Acceptable by policy but has to be visible"* is the entire requirement, and it inverts the usual reporting instinct.
+
+> **This is not a problem to fix. It is a state to know.** A finding an operator cannot act on, rendered as a problem, is a finding they learn to skip — and the next one that *does* need action is skipped with it.
+
+So an orphan condition is reported **as a fact with a count and a list**, never as a failure, never as a degraded verdict, and it **must not** lower a composite verdict under Decision 8. A fleet with orphans is not unhealthy; it is a fleet whose operator declined a deletion the tool was never permitted to perform.
+
+### A4 — a standing orphan must be distinguishable from a new one
+
+**Row 4 recomputes `orphan` on every run, forever** — the resource stays declared-absent, live-present and in-lock indefinitely, because nothing ever deletes it. So without a distinction, **`plan` shows the same orphan rows on every invocation until the end of the fleet**, and a row that always appears stops being read (`#1099`).
+
+> **Report an orphan's AGE, not merely its existence.** *"Orphaned at manifest revision N"* separates *this change orphaned something* from *this fleet has carried an orphan for months* — and only the first is a transition anyone needs to act on.
+
+The age is derivable from Decision 4's **per-resource `observedGeneration`**: the manifest revision at which the resource became declared-absent. No new recording is required, which keeps A2's tier-1 property intact.
+
+**`plan` may continue to show standing orphans** — suppressing them would hide a real divergence — **but it must mark them as standing rather than presenting them as this run's consequence.**
