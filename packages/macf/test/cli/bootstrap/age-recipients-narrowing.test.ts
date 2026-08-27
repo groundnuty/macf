@@ -225,6 +225,20 @@ describe('ageRecipientsRecordAbsent — the third state (groundnuty/macf#1230)',
     const notice = ageRecipientsRecordAbsentNotice();
     expect(notice).toContain('cannot be checked for narrowing');
     expect(notice).toContain('Proceeding');
-    expect(notice).toContain('next apply records the set');
+    expect(notice).toContain('records the');
+  });
+
+  // groundnuty/macf#1269 — the notice used to promise "the next apply
+  // records the set," which is false for a steady-state fleet: `apply`
+  // mints nothing on such a fleet, `settleVault` never reaches
+  // `status: 'written'`, and the OLD batched-lock-write guard required
+  // exactly that status unconditionally — so "the next apply" (any apply,
+  // indefinitely) never actually recorded the set. The corrected text names
+  // the real mechanism (`shouldWriteBatchedFleetLock` in `apply-fleet.ts`)
+  // instead of a promise that depended on minting something.
+  it('DECISIVE (groundnuty/macf#1269): does NOT make the "next apply" promise the fix broke — it names a run that mints nothing', () => {
+    const notice = ageRecipientsRecordAbsentNotice();
+    expect(notice).not.toContain('next apply records the set');
+    expect(notice).toContain('mints no new credentials');
   });
 });
