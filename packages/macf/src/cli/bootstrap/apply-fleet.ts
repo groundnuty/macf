@@ -235,7 +235,7 @@ import { composeFleetLock, readFleetLockFile, writeFleetLock } from './fleet-loc
 // caller (a unit test, a future non-CLI entrypoint) bypasses that preflight
 // entirely, and the ledger's "acknowledged" claim must hold regardless of
 // caller.
-import { overrideAcknowledged, removedAgeRecipients } from './age-recipients-narrowing.js';
+import { checkAgeRecipientsNarrowing, overrideAcknowledged, removedAgeRecipients } from './age-recipients-narrowing.js';
 import type {
   VaultAgentSecrets,
   VaultCaSecrets,
@@ -1247,6 +1247,38 @@ export async function applyFleet(
   // `priorLock` there, unchanged.
   const lockPath = join(controlDir, 'fleet.lock');
   let currentLock = readFleetLockFile(lockPath) ?? priorLock;
+
+  // groundnuty/macf#1230 — RE-DERIVED age_recipients-narrowing refusal, same
+  // two-tier shape `checkAppNameLengths` establishes immediately above (its
+  // own comment: "this second call site exists so the refusal holds even
+  // for a caller that drives applyFleet directly ... so 'the gate seam is
+  // never invoked' is provable as a property of applyFleet itself, not just
+  // of the CLI wrapper"). `commands/bootstrap-apply.ts`'s preflight is a
+  // FAST PATH: it reads `fleet.lock` from the OPERATOR's local manifest
+  // directory (`observer.ts::readFleetLock`'s own doc: "reflects the
+  // control repo's latest commit only once that checkout is pulled") — the
+  // same best-effort staleness `deployedVersion` already lives with. THIS
+  // check runs against `currentLock`, which by now reflects the checkout
+  // {@link provisionControlRepo} JUST cloned above — the control repo's
+  // OWN true latest commit, regardless of whether the operator's local
+  // directory was stale, absent, or never existed. Without this second
+  // check, a stale/absent local lock would let the CLI preflight read
+  // "unknown, proceed" while the checkout's real lock still recorded the
+  // now-being-dropped recipient — the exact #1230 defect, silently
+  // unrefused, one level below the fast path. Placed AFTER the control-repo
+  // clone (needs `currentLock`) but BEFORE Step 0.5 / any consent gate /
+  // `settleVault`'s re-encrypt — refusing after the vault write would be
+  // too late.
+  const narrowingFailure = checkAgeRecipientsNarrowing(
+    ageRecipients(manifest),
+    currentLock,
+    manifest.transport.age_recipients_narrowing_override,
+  );
+  if (narrowingFailure !== undefined) {
+    deps.log(`ABORTING entire apply run before any consent gate — ${narrowingFailure.message}`);
+    return abortedFleetApplyResult(manifestPath, priorLock, controlRepo, `age_recipients narrowing refused — ${narrowingFailure.message}`);
+  }
+
   // groundnuty/macf#1072 (DR-043 Amendment L extended to `versions.actions`)
   // — one entry per router-carrying repo (`fleet-manifest.ts::routerCarryingRepos`)
   // this run had an opinion about; stays empty when `manifest.versions` is

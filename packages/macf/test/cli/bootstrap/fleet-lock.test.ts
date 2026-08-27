@@ -251,6 +251,76 @@ describe('composeFleetLock — re-apply against a previous lock (no-prune, §D3 
   });
 });
 
+describe('composeFleetLock — age_recipients_removed_by_override (groundnuty/macf#1230)', () => {
+  it('is undefined when neither previous nor fresh has ever recorded a removal', () => {
+    const { lock } = composeFleetLock({ fleet: 'demo-fleet', previous: null, agentUpdates: {} });
+    expect(lock.age_recipients_removed_by_override).toBeUndefined();
+  });
+
+  it('a first removal (previous has none) is recorded verbatim', () => {
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous: null,
+      agentUpdates: {},
+      ageRecipientsRemovedByOverride: ['age1b'],
+    });
+    expect(lock.age_recipients_removed_by_override).toEqual(['age1b']);
+  });
+
+  it('DECISIVE: UNIONS with previous, never replaces — an implementation that overwrote instead of unioned would pass every OTHER test in this file (all start from an empty ledger) but fail this one', () => {
+    const previous: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      age_recipients: ['age1a'],
+      age_recipients_removed_by_override: ['age1c'], // an EARLIER run's removal
+    };
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: {},
+      ageRecipientsRemovedByOverride: ['age1b'], // THIS run's removal
+    });
+    // Both survive — the append-only ledger contract (AC 4: "a later reader
+    // can tell a narrowed list from an original one") depends entirely on
+    // this NOT being a replace.
+    expect(lock.age_recipients_removed_by_override).toEqual(['age1b', 'age1c']);
+  });
+
+  it('deduplicates — the same recipient removed twice across two runs appears once', () => {
+    const previous: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      age_recipients_removed_by_override: ['age1b'],
+    };
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: {},
+      ageRecipientsRemovedByOverride: ['age1b'],
+    });
+    expect(lock.age_recipients_removed_by_override).toEqual(['age1b']);
+  });
+
+  it('carries the ledger forward UNCHANGED when a write touches nothing age_recipients-related — the writeIncrementalLock/writeScopeCredentialMarker shape (both omit this field on every call)', () => {
+    const previous: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      age_recipients_removed_by_override: ['age1b'],
+    };
+    // Mirrors an unrelated per-agent write: agentUpdates touches a role,
+    // but ageRecipientsRemovedByOverride is never passed at all.
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: { 'code-agent': { appId: '1', installId: '2' } },
+    });
+    expect(lock.age_recipients_removed_by_override).toEqual(['age1b']);
+  });
+});
+
 describe('serializeFleetLock', () => {
   const lock: FleetLock = {
     schema_version: 1,
@@ -304,6 +374,22 @@ describe('serializeFleetLock', () => {
   it('re-validates and throws on a hand-built, schema-invalid lock (never trusts an unvalidated shape onto disk)', () => {
     const bad = { schema_version: 1, fleet: 'x', agents: [], extra_unknown_key: 'nope' } as unknown as FleetLock;
     expect(() => serializeFleetLock(bad)).toThrow();
+  });
+
+  // groundnuty/macf#1230 — `serializeFleetLock` hand-builds its output
+  // object from an explicit field allowlist (`ordered`) rather than
+  // spreading `validated` — a real bug this exact test caught: the ledger
+  // field was correctly computed by `composeFleetLock` and correctly
+  // present on `validated` (post `.parse()`), but silently dropped before
+  // ever reaching disk because `ordered`'s allowlist hadn't been updated to
+  // include it. `.parse()` succeeding is NOT evidence the field survives —
+  // this is a `silent-fallback-hazards.md`-shaped trap at the serialization
+  // boundary, distinct from schema validation.
+  it('age_recipients_removed_by_override round-trips through parseFleetLock unchanged (regression pin for the allowlist-drop bug)', () => {
+    const withLedger: FleetLock = { ...lock, age_recipients: ['age1a'], age_recipients_removed_by_override: ['age1b'] };
+    const roundTripped = parseFleetLock(serializeFleetLock(withLedger));
+    expect(roundTripped.age_recipients).toEqual(['age1a']);
+    expect(roundTripped.age_recipients_removed_by_override).toEqual(['age1b']);
   });
 });
 
