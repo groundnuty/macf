@@ -54,7 +54,12 @@
 #                         (sigstore TLOG is append-only); on success,
 #                         result-invariant check `npm view` for all three
 #                         packages == <version> (per verify-before-claim.md
-#                         — green CI is not proof the registry updated).
+#                         — green CI is not proof the registry updated),
+#                         retrying each package with capped exponential
+#                         backoff (groundnuty/macf#776 — npm's registry CDN
+#                         can lag a successful publish by ~90s+; a single
+#                         unretried `npm view` false-negatives a release
+#                         that actually succeeded).
 #   all VERSION           bump -> check -> harness-check -> marketplace ->
 #                         cli -> verify, halting loudly (via `set -e` +
 #                         explicit `die`) on the first failing step.
@@ -148,7 +153,8 @@ Subcommands:
                          plugin.
   cli VERSION           Push the bump commit to main + tag v<version>
                          (triggers publish.yml).
-  verify VERSION        Poll publish.yml + verify npm registry versions.
+  verify VERSION        Poll publish.yml + verify npm registry versions
+                         (retries each package with backoff — #776).
   all VERSION           bump -> check -> harness-check -> marketplace -> cli
                          -> verify.
 
@@ -162,6 +168,12 @@ Env (token minting — see coordination.md "Token & Git Hygiene"):
   APP_ID, INSTALL_ID      Required to mint a fresh token when GH_TOKEN is
   KEY_PATH, MACF_WORKSPACE_DIR  absent/invalid. KEY_PATH may be relative to
                           MACF_WORKSPACE_DIR (default: repo root).
+
+Env (release-verify npm-lag retry — #776, all optional):
+  MACF_RELEASE_NPM_VERIFY_TRIES      Attempts per package before a genuine
+                                      MISMATCH (default 8).
+  MACF_RELEASE_NPM_VERIFY_BASE_SECS  Backoff base seconds (default 5).
+  MACF_RELEASE_NPM_VERIFY_CAP_SECS   Backoff cap seconds (default 60).
 USAGE
 }
 
@@ -201,6 +213,92 @@ changelog_has_heading() {
   local first
   first="$(grep -m1 -E '^## \[[0-9]' "$REPO_ROOT/CHANGELOG.md" 2>/dev/null || true)"
   [[ "$first" == "## [$version]"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# npm-registry-lag retry (groundnuty/macf#776)
+# ---------------------------------------------------------------------------
+#
+# npm's registry CDN is eventually consistent: `npm view` can return the OLD
+# version for up to ~2 minutes after `npm publish` has already accepted +
+# signed (for --provenance publishes) the new one. A single unretried
+# `npm view` therefore reports a genuinely successful publish as a MISMATCH
+# — the exact false-negative #776 was filed to fix. Witnessed empirically:
+# the v0.2.53 cut (2026-07-04, #776's original report) and the v0.2.58 cut
+# (2026-08-21 comment thread, ~90s observed lag on the third package).
+#
+# The fix here is a bounded retry with backoff — a mitigation, not the
+# acceptance-vs-availability redesign the #776 thread ultimately calls for
+# (that spans publish.yml's own "Verify provenance attestations" step, which
+# is a SEPARATE 5-retries-at-3s check outside this script and outside this
+# fix's scope). This still closes the concrete bug this function targets:
+# `cmd_verify`'s own single-shot `npm view` loop.
+
+# npm_view_version PKG — thin wrapper around `npm view <pkg> version`,
+# isolated as its own function so release.test.sh can override it (shell-
+# function redefinition, same technique the existing `gh` test-stub below
+# uses) without a real network call. Never errors — prints empty string when
+# the version can't be resolved (yet), which is the expected shape while the
+# registry CDN is still propagating a just-accepted publish.
+npm_view_version() {
+  npm view "$1" version 2>/dev/null || true
+}
+
+# npm_verify_backoff_secs ATTEMPT -> the delay before the retry that follows
+# a failed 1-indexed ATTEMPT: exponential (base * 2^(attempt-1)), capped.
+# Overridable via MACF_RELEASE_NPM_VERIFY_BASE_SECS (default 5) /
+# MACF_RELEASE_NPM_VERIFY_CAP_SECS (default 60) — release.test.sh sets both
+# to 0 so its retry-count assertions run instantly, asserting attempt counts
+# rather than faking wall-clock time.
+npm_verify_backoff_secs() {
+  local attempt="$1"
+  local base="${MACF_RELEASE_NPM_VERIFY_BASE_SECS:-5}"
+  local cap="${MACF_RELEASE_NPM_VERIFY_CAP_SECS:-60}"
+  local delay=$((base * (1 << (attempt - 1))))
+  if [ "$delay" -gt "$cap" ]; then
+    delay="$cap"
+  fi
+  printf '%s\n' "$delay"
+}
+
+# wait_for_npm_version PKG VERSION -> retries npm_view_version with capped
+# exponential backoff until it matches VERSION or the attempt budget
+# (MACF_RELEASE_NPM_VERIFY_TRIES, default 8) is exhausted. Default backoff
+# (5s/10s/20s/40s/60s-capped) sums to ~4m15s worst case per package — well
+# past the ~90s lag observed on #776, but still BOUNDED, so a genuine miss
+# fails instead of hanging. Prints its own OK / in-progress / MISMATCH
+# diagnostic (the caller doesn't re-derive attempt counts from a bare exit
+# code): a first-attempt match logs a plain OK with no retry noise; a match
+# after N>1 attempts says so explicitly ("after retrying"); exhausting the
+# budget logs MISMATCH naming the attempt count, worded to be unambiguous
+# against the mid-retry "not yet visible... retrying" line — the two must
+# never be confused, since one is "wait" and the other is "this genuinely
+# failed". Returns 0 on match, 1 on exhaustion.
+wait_for_npm_version() {
+  local pkg="$1" version="$2"
+  local max_tries="${MACF_RELEASE_NPM_VERIFY_TRIES:-8}"
+  local attempt=1 live="" delay
+
+  while [ "$attempt" -le "$max_tries" ]; do
+    live="$(npm_view_version "$pkg")"
+    if [ "$live" = "$version" ]; then
+      if [ "$attempt" -gt 1 ]; then
+        log "OK ${pkg}@${version} live on npm (after retrying — succeeded on attempt ${attempt}/${max_tries})"
+      else
+        log "OK ${pkg}@${version} live on npm"
+      fi
+      return 0
+    fi
+    if [ "$attempt" -lt "$max_tries" ]; then
+      delay="$(npm_verify_backoff_secs "$attempt")"
+      log "${pkg}@${version} not yet visible on npm (attempt ${attempt}/${max_tries}, saw '${live:-<none>}') — registry lag is expected right after a successful publish; retrying in ${delay}s..."
+      sleep "$delay"
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  log "MISMATCH: ${pkg} npm version=${live:-<none>}, expected ${version} (still absent after ${max_tries} attempts — a genuine failure, not lag)"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -740,7 +838,7 @@ cmd_verify() {
 
   if [ "$DRY_RUN" = "1" ]; then
     dry "would poll repos/${CLI_REPO}/actions/workflows/publish.yml runs for head_branch=v${version} to completion"
-    dry "would then require npm view @groundnuty/macf{,-core,-channel-server} version == ${version} for all three (result-invariant, not just green CI)"
+    dry "would then require npm view @groundnuty/macf{,-core,-channel-server} version == ${version} for all three (result-invariant, not just green CI), retrying each with backoff up to MACF_RELEASE_NPM_VERIFY_TRIES attempts (default 8) before declaring a genuine MISMATCH — npm's registry CDN can lag a successful publish (#776)"
     return 0
   fi
 
@@ -788,17 +886,11 @@ cmd_verify() {
   fi
 
   log "publish run $run_id succeeded — verifying npm registry (result-invariant per verify-before-claim.md)"
-  local pkg all_ok=1 live
+  local pkg all_ok=1
   for pkg in macf-core macf macf-channel-server; do
-    live="$(npm view "@groundnuty/${pkg}" version 2>/dev/null || true)"
-    if [ "$live" != "$version" ]; then
-      log "MISMATCH: @groundnuty/${pkg} npm version=${live:-<none>}, expected ${version}"
-      all_ok=0
-    else
-      log "OK @groundnuty/${pkg}@${version} live on npm"
-    fi
+    wait_for_npm_version "@groundnuty/${pkg}" "$version" || all_ok=0
   done
-  [ "$all_ok" = "1" ] || die "npm registry verification failed — see mismatches above"
+  [ "$all_ok" = "1" ] || die "npm registry verification failed — see MISMATCH line(s) above (a genuine miss, not registry lag — each package was already retried with backoff; see #776)"
 
   log "release v${version} fully verified: publish run green + all 3 packages live on npm at ${version}"
 }
