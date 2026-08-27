@@ -2817,6 +2817,21 @@ export function formatScopeCredentialLines(notices: readonly ScopeCredentialNoti
  * {@link operatorInteractionBudget} directly rather than recomputing from
  * `items` — this function is for the plain "as `computePlan` sees it" count
  * `macf bootstrap plan` renders.
+ *
+ * **This number is a CEILING, not a prediction** (groundnuty/macf#1129, and
+ * DR-043 Amendment A). An App's existence cannot be confirmed without an App
+ * JWT, so a `create` item means *"not confirmable from here"*, never *"proven
+ * absent"* — and `apply` may find the App already live and do nothing. A run
+ * that needs FEWER clicks than this has not falsified the count: a bound is
+ * falsified by being exceeded, never by coming in under. Observed live on the
+ * `macf-trial` 2→3 scale-up, where a `CREATE`-shaped preview resolved to
+ * "App + install already confirmed live" and the operator clicked twice
+ * rather than six times.
+ *
+ * So the operator-facing question is not *"did execution match the plan?"* but
+ * *"did execution stay within it?"* — which is checkable, where accuracy is
+ * not. `design/fleet-deployment-runbook.md` §4a states the same property for
+ * the add-an-agent click formula; keep the two in step.
  */
 export function countAppsToCreate(items: readonly PlanItem[]): number {
   return items.filter((i) => (i.kind === 'app' || i.kind === 'runner_ops' || i.kind === 'router_app') && i.verb === 'create').length;
