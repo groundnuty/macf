@@ -1007,7 +1007,15 @@ Amendment G measured the teardown ladder by **revival cost**. The same axis deci
 | repos | un-archive is 0 clicks; recreate loses history | **orphan** |
 | Apps | 2 clicks **and the key is emitted once, unrecoverable** | **orphan**, always |
 
-**Two plan verbs, not one.** `delete` is a statement of intent, covered by the existing plan consent. `orphan` — *we made this, the manifest no longer wants it, and I will not touch it* — is an **instruction to the operator**. Collapsing them either promises deletions the tool must not perform or hides the ones it will.
+**Two plan verbs, not one.** `delete` is a statement of intent — **and it is NOT covered by the existing plan consent** (corrected 2026-08-27, `#1272`; the original text claimed it was).
+
+> **The pre-approval text an operator reads before typing "yes" says, verbatim: *"Nothing is deleted (§D3 no-prune)."*** Wiring deletion under that consent would obtain it by a statement that had become false — **not a stale message, a false premise for consent.**
+
+**So:** `delete` is covered by plan consent **only once the approval text ENUMERATES deletions by name and class.** Until then it is not covered at all, and **no deletion path may be wired while the pre-approval text promises nothing is deleted** — whichever lands first must fix the other, and the enumeration must land **before or with** the execution, never after.
+
+**A count is not informed consent for destruction.** *"3 deletion(s)"* tells an operator nothing about what they are losing; the per-class policy already names each resource at plan time, so the information exists and simply is not carried into the approval.
+
+**`orphan` is unaffected, and the asymmetry is load-bearing:** it removes nothing, so *"Nothing is deleted"* stays literally true for it. The two verbs landed together and are **not** interchangeable here — one needs new consent, the other is already correctly described. `orphan` — *we made this, the manifest no longer wants it, and I will not touch it* — is an **instruction to the operator**. Collapsing them either promises deletions the tool must not perform or hides the ones it will.
 
 ### P4 — write-only resources: reconcile on OUR inputs, not on the value
 
