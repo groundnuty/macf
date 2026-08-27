@@ -285,16 +285,32 @@ describe('generateEnvGitHub', () => {
 // ---------------------------------------------------------------------------
 
 describe('generateEnvCerts', () => {
-  it('namespaces MACF_CA_CERT to the project under $HOME/.macf/certs/', () => {
-    expect(generateEnvCerts(baseConfig)).toContain(
-      'export MACF_CA_CERT="$HOME/.macf/certs/TEST/ca-cert.pem"',
-    );
+  // macf#1277: GitHub-mode CA resolution is now a runtime shell fallback
+  // (owner-scoped conventional -> pre-#1277 project-scoped legacy ->
+  // conventional again) rather than a single bare `export` line. The
+  // decisive generated-launcher-output tests (both literal-string AND
+  // real shell-execution) live in the dedicated `ca-owner-scoping.test.ts`
+  // — these two keep the narrow, single-property checks this describe
+  // block already established, updated for the new owner segment.
+  it('namespaces MACF_CA_CERT to owner+project under $HOME/.macf/certs/ (conventional tier)', () => {
+    const out = generateEnvCerts(baseConfig);
+    expect(out).toContain('export MACF_CA_CERT="$HOME/.macf/certs/o/TEST/ca-cert.pem"');
+    // NOT the bare pre-#1277 shape as the FIRST/conventional resolution —
+    // that string only legitimately appears in the legacy elif branch.
+    expect(out).toContain('if [ -f "$HOME/.macf/certs/o/TEST/ca-cert.pem" ]; then');
   });
 
   it('exports MACF_CA_KEY alongside MACF_CA_CERT (#103 R3)', () => {
     expect(generateEnvCerts(baseConfig)).toContain(
-      'export MACF_CA_KEY="$HOME/.macf/certs/TEST/ca-key.pem"',
+      'export MACF_CA_KEY="$HOME/.macf/certs/o/TEST/ca-key.pem"',
     );
+  });
+
+  it('falls back to the pre-#1277 project-scoped legacy path in an elif branch', () => {
+    const out = generateEnvCerts(baseConfig);
+    expect(out).toContain('elif [ -f "$HOME/.macf/certs/TEST/ca-cert.pem" ]; then');
+    expect(out).toContain('export MACF_CA_CERT="$HOME/.macf/certs/TEST/ca-cert.pem"');
+    expect(out).toContain('export MACF_CA_KEY="$HOME/.macf/certs/TEST/ca-key.pem"');
   });
 
   it('exports MACF_AGENT_CERT + MACF_AGENT_KEY under $SCRIPT_DIR/.macf/certs', () => {
