@@ -413,6 +413,126 @@ gh label list --repo <owner>/<fleet>-control --json name --jq '.[].name'
 
 ---
 
+## 4b. Migrating a pre-control-plane fleet (macf#878)
+
+**A third happy path, distinct from both §1–§4 and §4a — this one's Apps,
+repos, and routing are already real on GitHub, but there is no
+`<fleet>-control` repo, no committed `fleet.yaml`, and no `fleet.lock`.**
+Three fleets are in this state as of writing: `macf`, `icsoc-2026`, and
+`ppam-2026` — verified against the live registry, ruled in scope on
+macf#878 (2026-08-12).
+
+**`bootstrap apply` cannot be pointed at a fleet like this.** Its
+`confirmBeforeCreateGuard` authorizes `create` for any role with no prior
+`fleet.lock` entry — true of *every* role here — so it marches straight
+into gate 1 and dies on GitHub's globally-unique App-name collision (a real
+App already exists under that name). Loud, not silent, but the wrong tool.
+Use the two commands below instead, which touch neither an agent's App,
+install, or repo, nor the vault.
+
+### The procedure
+
+1. **Confirm each role's `owner/repo` binding.** Nothing in this tool can
+   discover it live (enumerating an App installation's repos needs an
+   install token this credential-free step never holds) — read it from the
+   fleet's own routing config or ask its science agent. For the three
+   fleets above, as directly observed on 2026-08-27:
+
+   | Fleet | Roles → repo | Source |
+   |---|---|---|
+   | `macf` | code→`groundnuty/macf`, science→`groundnuty/macf-science-agent`, devops→`groundnuty/macf-devops-toolkit`, auditor→`groundnuty/macf-auditor-agent` | this repo's own `.github/agent-config.json` |
+   | `icsoc-2026` | science→`groundnuty/icsoc-2026-science-agent`, code→`groundnuty/icsoc-2026-code-agent`, paper→`groundnuty/icsoc-2026-paper` | repo names only (naming convention + macf#878's role list) — this pass did not independently read `icsoc-2026`'s own `agent-config.json` |
+   | `ppam-2026` | **unconfirmed** | the `groundnuty` org has exactly one `ppam-2026` repo, yet the registry records two permanent agents (code, science) — the per-role repo split either lives under a different owner or this fleet predates the one-repo-per-role convention; confirm before scaffolding, do not guess |
+
+2. **Draft a manifest from live state:**
+
+   ```bash
+   macf bootstrap manifest scaffold --owner <org> --fleet <name> \
+     --agent code-agent=<owner>/<repo> --agent science-agent=<owner>/<repo> ... \
+     --out fleet.yaml
+   ```
+
+   Every field the tool cannot confirm is rendered as an explicit `# TODO`
+   comment with the key *omitted* — never a placeholder value. `versions:`
+   and `transport.age_recipients` are deliberately **never** scaffolded
+   (Amendment L: declaring either converts today's observed drift into
+   tomorrow's enforced intent, or falsely tells a future `apply` "no age key
+   exists yet, mint one" for a fleet that already has one).
+
+3. **Read the draft and fill every TODO by hand.** A clean YAML parse of the
+   scaffold proves only well-formedness, never correctness — its
+   observations come from the same `observer.ts` reads `bootstrap plan`
+   would diff it against, so a `plan` run against an unreviewed scaffold
+   agrees with itself by construction and proves nothing (this is
+   `assert-the-wrong-path.md`'s Trigger-1 circularity, named for this exact
+   scenario; no test in this codebase asserts "scaffold ⇒ empty plan," and
+   this runbook doesn't either). `defaults.role_template` in particular is a
+   project decision the scaffold refuses to guess at.
+
+4. **Give the fleet its control repo:**
+
+   ```bash
+   macf bootstrap control-repo init -f fleet.yaml --json
+   ```
+
+   Create-or-reuse `<fleet>-control` and commit `fleet.yaml` as its first
+   act — nothing else. Never opens a browser consent gate, never touches an
+   agent's App/install/repo/`fleet.lock`, never touches the vault (verify
+   against the command's own `--help` if this runbook and the CLI ever
+   disagree). Idempotent: re-running against an already-migrated fleet
+   makes no further GitHub writes (`status: "reused"`, `mutated: false`) —
+   see `bootstrap-control-repo-init.test.ts`'s two `DECISIVE` cases for the
+   proof. An existing-but-archived control repo, or a same-named repo that
+   isn't this fleet's, is refused outright — never silently adopted or
+   revived.
+
+5. **Move the vault — an operator step this repo does not automate.**
+   Per Amendment D, decrypting an existing vault is operator-privileged
+   only; no command in this codebase performs the decrypt→re-encrypt→commit
+   sequence, and this runbook does not invent one it hasn't verified. What
+   is established: the destination is `<fleet>-control`'s `secrets/vault.age`
+   (the only vault path `CONTROL_REPO_COMMIT_ALLOWLIST` permits, alongside
+   `fleet.yaml`/`fleet.lock`/`.gitignore` — never `secrets/recovery`), and
+   the re-encrypt should target the Amendment-B/C `age_recipients` list
+   rather than the legacy single-recipient key. Remove the old
+   `vault.age` from the fleet's agent repo via a normal, reviewed PR — never
+   a force-push — and say in that PR's body that the encrypted copy remains
+   in the repo's git history (acceptable by default; scrubbing it is a
+   separate, optional operator call).
+
+6. **Confirm the migrated layout parses:**
+
+   ```bash
+   macf bootstrap plan -f <fleet>-control/fleet.yaml --json
+   ```
+
+   Expect every role to read `create, LOW CONFIDENCE` — this migration path
+   deliberately defers lock-seeding/identity-plane adoption to a later
+   increment (macf#878 design point 4). A clean run here proves the
+   manifest parses and the control repo is reachable, not that the fleet's
+   identity plane has been "adopted."
+
+### Sequencing
+
+**Do `icsoc-2026` and `ppam-2026` first, `macf` last** — ruled on
+macf#878 (2026-08-25), not carried in DR-043 itself. The first two are
+lower-blast-radius rehearsals of the identical procedure; `macf` is the
+substrate the migrating agent itself runs in, so a mistaken manifest there
+converges the very machinery doing the converging. Scaffold `macf`'s
+manifest early — while the other two are in flight — so it gets the
+longest review exposure, but hold `control-repo init` for it until the
+other two are done.
+
+### Closure condition
+
+This migration is complete for a fleet only once **all three** hold: the
+control repo exists, its committed `fleet.yaml` has been reviewed
+(TODOs resolved, `versions:`/`age_recipients` deliberately still absent
+until an operator declares them), and the vault has moved. A repo existing
+with an unreviewed scaffold committed verbatim does not count — see step 3.
+
+---
+
 ## 5. Where `--help` beats this document
 
 The CLI is under active amendment. Before trusting a flag's behavior against
@@ -974,3 +1094,8 @@ into that fleet's `fleet.lock`; omitted = unchanged).
 - `use-cases/scientific-paper-fleet.md` — a worked, narrative walkthrough of
   one specific fleet shape (science + code + writer agents), cross-checked
   against this runbook's field reference while writing it.
+- **macf#878** (§4b) — the three-fleet migration to Amendment F control
+  repos this runbook's §4b procedure serves; its own issue thread carries
+  the fuller design-decision trail (why `manifest scaffold`/`control-repo
+  init` are separate verbs, the `versions:`/`age_recipients` exclusions,
+  the sequencing ruling) that this section only summarizes operationally.
