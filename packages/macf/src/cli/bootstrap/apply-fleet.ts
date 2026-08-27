@@ -225,6 +225,17 @@ import type { ControlRepoInitOutcome } from './apply-control-repo-init.js';
 import { applyControlRepoInit, deriveRouterCarryingRepos, resolveControlRepoLabelTokenSource } from './apply-control-repo-init.js';
 import type { FleetLockAgentUpdate, FleetLockIdentityChange } from './fleet-lock.js';
 import { composeFleetLock, readFleetLockFile, writeFleetLock } from './fleet-lock.js';
+// groundnuty/macf#1230 — the SAME directed set-difference + override-validity
+// predicates `commands/bootstrap-apply.ts`'s preflight refuses on, reused
+// here (never re-derived) to decide what — if anything — this run records
+// into `fleet.lock`'s `age_recipients_removed_by_override` ledger. See the
+// `composeFleetLock` call site below for why this module re-checks
+// `overrideAcknowledged` itself rather than trusting "we got this far, so
+// the preflight must have already validated it": a direct `applyFleet`
+// caller (a unit test, a future non-CLI entrypoint) bypasses that preflight
+// entirely, and the ledger's "acknowledged" claim must hold regardless of
+// caller.
+import { overrideAcknowledged, removedAgeRecipients } from './age-recipients-narrowing.js';
 import type {
   VaultAgentSecrets,
   VaultCaSecrets,
@@ -909,11 +920,12 @@ function ageRecipients(manifest: FleetManifest): readonly string[] {
  * groundnuty/macf#1230 — order-independent set equality, used ONLY to
  * decide whether `fleet.lock`'s recorded `age_recipients` needs a fresh
  * write this run (the batched-lock-write guard, below). Deliberately NOT
- * the narrowing-detection predicate (`age-recipients-narrowing.ts`, not
- * yet wired) — that check needs a DIRECTED set difference (which specific
- * recipient was removed); this one only needs to know "did anything
- * change at all," so a simple size+membership check is sufficient and a
- * reorder-only manifest edit (no real change) correctly reports `false`.
+ * the narrowing-detection predicate (`age-recipients-narrowing.ts::removedAgeRecipients`,
+ * called separately below to populate `age_recipients_removed_by_override`)
+ * — that check needs a DIRECTED set difference (which specific recipient
+ * was removed); this one only needs to know "did anything change at all,"
+ * so a simple size+membership check is sufficient and a reorder-only
+ * manifest edit (no real change) correctly reports `false`.
  */
 function sameAgeRecipientSet(a: readonly string[], b: readonly string[]): boolean {
   const setA = new Set(a);
@@ -2239,6 +2251,20 @@ export async function applyFleet(
   // no-churn contract (`apply-fleet.test.ts` "unchanged recipient set: no
   // churn").
   const recipientsChanged = currentLock?.age_recipients === undefined || !sameAgeRecipientSet(currentLock.age_recipients, recipients);
+  // groundnuty/macf#1230 — the SAME directed set-difference
+  // `commands/bootstrap-apply.ts`'s preflight refuses on, computed against
+  // `currentLock` (this run's most-current known lock — same "reflects any
+  // per-agent write already applied above in this same run" basis
+  // `recipientsChanged` immediately above uses), re-checked here so
+  // `fleet.lock`'s `age_recipients_removed_by_override` ledger records ONLY
+  // removals this run actually happened under an acknowledged override —
+  // never trusting "the CLI preflight must already have refused otherwise,"
+  // because a direct `applyFleet` caller (tests, a future non-CLI
+  // entrypoint) can reach this function without ever passing through that
+  // preflight.
+  const removedByOverride = removedAgeRecipients(recipients, currentLock);
+  const ageRecipientsRemovedByOverride =
+    removedByOverride.length > 0 && overrideAcknowledged(manifest.transport.age_recipients_narrowing_override) ? removedByOverride : undefined;
   if (
     vault.status === 'written' &&
     (Object.keys(pendingCreatedUpdates).length > 0 ||
@@ -2276,6 +2302,11 @@ export async function applyFleet(
       // manifest's CURRENT declared set), regardless of which OTHER term
       // in the guard above triggered the write.
       ageRecipients: recipients,
+      // groundnuty/macf#1230 AC 4 — `undefined` (omitted from the merge,
+      // carrying `previous`'s ledger forward unchanged) unless THIS run
+      // actually removed a recipient under an acknowledged override — see
+      // `removedByOverride`'s computation above.
+      ...(ageRecipientsRemovedByOverride !== undefined ? { ageRecipientsRemovedByOverride } : {}),
     });
     writeFleetLock(lockPath, composed.lock);
     currentLock = composed.lock;

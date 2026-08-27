@@ -144,6 +144,18 @@ export interface ComposeFleetLockInput {
    * omit the field entirely instead.
    */
   readonly ageRecipients?: readonly string[];
+  /**
+   * groundnuty/macf#1230 — recipient(s) removed THIS run via an
+   * ACKNOWLEDGED `transport.age_recipients_narrowing_override` (i.e. the
+   * caller already confirmed `age-recipients-narrowing.ts::overrideAcknowledged`
+   * held, on the SAME `removedAgeRecipients(...)` set this run's
+   * `ageRecipients` narrows against). `undefined` when nothing was removed
+   * via an acknowledged override this run — the untouched-carries-forward
+   * convention every other fleet-level field in this module follows.
+   * Unioned into `previous.age_recipients_removed_by_override` (never
+   * replaced, never pruned) — see {@link mergeAgeRecipientsRemovedByOverride}.
+   */
+  readonly ageRecipientsRemovedByOverride?: readonly string[];
 }
 
 /**
@@ -280,6 +292,36 @@ function mergeAgeRecipients(
 }
 
 /**
+ * Merge `age_recipients_removed_by_override` (groundnuty/macf#1230) —
+ * UNION with `previous`, never replaced, never pruned: this is an
+ * append-only ledger of every recipient EVER removed via an acknowledged
+ * override, not a snapshot of the current run (that's what
+ * {@link mergeAgeRecipients}'s wholesale-replace already records via
+ * `age_recipients` itself). A caller that replaced instead of unioned would
+ * lose the historical proof for a recipient removed in an EARLIER run the
+ * moment a LATER run recorded a different (or empty) `fresh` value.
+ *
+ * Deduplicated + sorted (localeCompare) — unlike {@link mergeAgeRecipients},
+ * position here carries no meaning (this is a historical SET of removed
+ * identities, not a currently-declared ordered list), so sorting is safe and
+ * gives deterministic output ({@link serializeFleetLock}'s determinism
+ * contract, same reason {@link mergeScopeCredentials} sorts by role).
+ *
+ * `undefined` (never `[]`) when the merged result is empty — same
+ * "omit rather than write a vacuous empty collection" convention every
+ * other merge in this module follows.
+ */
+function mergeAgeRecipientsRemovedByOverride(
+  previous: readonly string[] | undefined,
+  fresh: readonly string[] | undefined,
+): string[] | undefined {
+  const merged = new Set<string>(previous ?? []);
+  for (const r of fresh ?? []) merged.add(r);
+  const sorted = [...merged].sort((a, b) => a.localeCompare(b));
+  return sorted.length > 0 ? sorted : undefined;
+}
+
+/**
  * Compose a `fleet.lock` from a previously-observed lock (or none) plus what
  * THIS apply run established. Pure — no I/O, no clock, no randomness — and
  * always re-validated via `FleetLockSchema.parse()` before returning: "fail
@@ -328,6 +370,10 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
   const versions = mergeVersions(input.previous?.versions, input.versions);
   const scopeCredentials = mergeScopeCredentials(input.previous?.scope_credentials, input.scopeCredentials);
   const ageRecipients = mergeAgeRecipients(input.previous?.age_recipients, input.ageRecipients);
+  const ageRecipientsRemovedByOverride = mergeAgeRecipientsRemovedByOverride(
+    input.previous?.age_recipients_removed_by_override,
+    input.ageRecipientsRemovedByOverride,
+  );
 
   const composed: FleetLock = {
     schema_version: FLEET_LOCK_SCHEMA_VERSION,
@@ -337,6 +383,7 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
     ...(fingerprints !== undefined ? { fingerprints } : {}),
     ...(scopeCredentials !== undefined ? { scope_credentials: scopeCredentials } : {}),
     ...(ageRecipients !== undefined ? { age_recipients: ageRecipients } : {}),
+    ...(ageRecipientsRemovedByOverride !== undefined ? { age_recipients_removed_by_override: ageRecipientsRemovedByOverride } : {}),
   };
 
   return { lock: FleetLockSchema.parse(composed), identityChanges };

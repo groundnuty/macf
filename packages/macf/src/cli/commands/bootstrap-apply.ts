@@ -132,6 +132,11 @@ import { RUNNER_OPS_ROLE, buildRunnerOpsManifest, checkAppNameLengths, deriveRun
 import { ROUTER_APP_ROLE, buildRouterAppManifest, deriveRouterAppHandle, routerAppInstallRepos } from '../bootstrap/apply-router-app.js';
 import { defaultOperatorRecoveryRootDir, operatorRecoveryArtifactPath } from '../bootstrap/vault-write.js';
 import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflight.js';
+// groundnuty/macf#1230 — same "pure, manifest-derived-fact preflight"
+// contract `checkRegistryScopePreflight` above establishes; this one also
+// reads `fleet.lock` (a local file, never a GitHub call) via `readFleetLock`
+// (already imported above from `observer.js`) to compare against.
+import { checkAgeRecipientsNarrowing } from '../bootstrap/age-recipients-narrowing.js';
 import type { DeployFlagsEcho, RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
 import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
 import type { ApplyDeployPhaseDeps, DeployPhaseAgentResult } from '../bootstrap/apply-deploy.js';
@@ -2937,6 +2942,30 @@ export async function runBootstrapApply(
   const registryScopeFailure = checkRegistryScopePreflight(manifest.owner);
   if (registryScopeFailure !== undefined) {
     return renderFailure(registryScopeFailure, opts);
+  }
+
+  // groundnuty/macf#1230 — the age_recipients-narrowing pre-flight, same
+  // placement + unconditional (including `--dry-run`) posture as the two
+  // checks immediately above: a narrowing this run declares is refused
+  // regardless of what `apply` would otherwise go on to do, so a
+  // `--dry-run` operator learns about it before spending a browser click
+  // too. `readFleetLock` (already imported above from `observer.js`) is a
+  // local file read (never a GitHub call) — AC 1 requires this refusal
+  // fire "at plan time, before any GitHub call," and this call site is
+  // BEFORE `resolved.observe(manifest)` below (the first GitHub-touching
+  // step in this function) as well as before either consent gate. See
+  // `age-recipients-narrowing.ts`'s module doc for what this compares
+  // (the manifest's declared set against `fleet.lock`'s RECORDED set, never
+  // a live vault read) and why a fleet with nothing recorded yet (every
+  // fleet provisioned before groundnuty/macf#1252) is `undefined` (unknown)
+  // here and never refused.
+  const ageRecipientsNarrowingFailure = checkAgeRecipientsNarrowing(
+    manifest.transport.age_recipients,
+    readFleetLock(manifestPath),
+    manifest.transport.age_recipients_narrowing_override,
+  );
+  if (ageRecipientsNarrowingFailure !== undefined) {
+    return renderFailure(ageRecipientsNarrowingFailure, opts);
   }
 
   if (opts.dryRun !== true) {
