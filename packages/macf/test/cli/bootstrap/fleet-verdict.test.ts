@@ -15,17 +15,20 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import {
+  carveOutCapability,
   determineFleetVerdict,
   fleetVerdictToJson,
   formatFleetVerdictLines,
+  MIN_TAILNET_CARVEOUT_ACTIONS_VERSION,
   resolveOrgSecretVisibility,
+  ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED,
   routingVerdictComponent,
   runnerVerdictComponent,
   unsatisfiedRoutingSecretNames,
   widenRepoRoutingVerdict,
   workspaceVerdictComponent,
 } from '../../../src/cli/bootstrap/fleet-verdict.js';
-import type { FleetVerdictComponent, OrgSecretsListResult, RoutingVerdictOrgSecretsDeps } from '../../../src/cli/bootstrap/fleet-verdict.js';
+import type { FleetVerdictComponent, OrgSecretsListResult, RoutingVerdictOrgSecretsDeps, RoutingVerdictPinContext } from '../../../src/cli/bootstrap/fleet-verdict.js';
 import { ALL_ROUTING_SECRET_NAMES } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RoutingSecretsPublishResult } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { EnsureVariableOutcome } from '../../../src/cli/bootstrap/ensure-variable.js';
@@ -193,6 +196,152 @@ describe('routingVerdictComponent — org-inherited secret widening (groundnuty/
     expect(c.status.state).toBe('not-confirmed');
     expect(c.status.detail).toContain('org/repo-b');
     expect(c.status.detail).not.toContain('org/repo-a:');
+  });
+});
+
+// --- TAILNET_NEEDED carve-out (groundnuty/macf#1239) ---
+//
+// macf-actions#75 (merged) makes TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET
+// non-required for a self-hosted-runner fleet once its PINNED router
+// version carries the carve-out (MIN_TAILNET_CARVEOUT_ACTIONS_VERSION). Per
+// the issue's own decisive pair (assert-the-wrong-path.md: (1) alone is
+// satisfied by never requiring TS_OAUTH at all):
+//
+//   1. self-hosted fleet, carve-out-carrying pin, four secrets present, no
+//      TS_OAUTH -> routing CONFIRMED
+//   2. same fleet, pre-carve-out pin, no TS_OAUTH -> NOT confirmed (today's
+//      behavior preserved)
+//
+// Plus: hosted-touching fleet on a carve-out pin without TS_OAUTH -> NOT
+// confirmed; pin undeterminable -> unknown, distinct from both; the other
+// four stay required even under the carve-out.
+
+describe('carveOutCapability (pure)', () => {
+  it(`carries at exactly the threshold (${MIN_TAILNET_CARVEOUT_ACTIONS_VERSION})`, () => {
+    expect(carveOutCapability(MIN_TAILNET_CARVEOUT_ACTIONS_VERSION)).toBe('carries');
+  });
+
+  it('carries above the threshold (same major, higher minor)', () => {
+    expect(carveOutCapability('v3.6.0')).toBe('carries');
+  });
+
+  it('carries above the threshold (higher major)', () => {
+    expect(carveOutCapability('v4.0.0')).toBe('carries');
+  });
+
+  it('predates the threshold (same major, lower minor)', () => {
+    expect(carveOutCapability('v3.4.9')).toBe('predates');
+  });
+
+  it('predates the threshold (lower major)', () => {
+    expect(carveOutCapability('v2.9.9')).toBe('predates');
+  });
+
+  it('"main" always carries — the dev branch is always current', () => {
+    expect(carveOutCapability('main')).toBe('carries');
+  });
+
+  it('a bare floating major ref (e.g. "v3") is INDETERMINATE — never trusted forward', () => {
+    // Deliberately the INVERSE of fleet-manifest.ts::isSelfHostedCapableActionsVersion's
+    // bare-vMAJOR-trusted-forward convention — see carveOutCapability's own
+    // doc for why: `@v3` is a moving tag that resolves at workflow-run time,
+    // and at the time this was written no released macf-actions tag carries
+    // the carve-out yet, so the bare string "v3" cannot decide the question
+    // either way. A false "carries" here would silently mark a fleet that
+    // genuinely still needs all six secrets as CONFIRMED.
+    expect(carveOutCapability('v3')).toBe('indeterminate');
+  });
+
+  it('an unparseable ref is indeterminate, never assumed either way', () => {
+    expect(carveOutCapability('some-branch-name')).toBe('indeterminate');
+    expect(carveOutCapability('')).toBe('indeterminate');
+  });
+});
+
+describe('routingVerdictComponent — TAILNET_NEEDED carve-out (groundnuty/macf#1239)', () => {
+  /** Self-hosted fleet's `pinContext` for a given `versions.actions` pin. */
+  function selfHosted(actionsVersion: string | undefined): RoutingVerdictPinContext {
+    return { actionsVersion, selfHostedRunner: true };
+  }
+
+  it('DECISIVE 1/2: self-hosted fleet, carve-out-carrying pin, four secrets present, no TS_OAUTH -> routing CONFIRMED', () => {
+    const secrets = tsOauthSkippedResult('org/self-hosted-repo');
+    const c = routingVerdictComponent(secrets, {}, selfHosted(MIN_TAILNET_CARVEOUT_ACTIONS_VERSION));
+    expect(c.status.state).toBe('confirmed');
+  });
+
+  it("DECISIVE 2/2: same fleet, pre-carve-out pin, no TS_OAUTH -> NOT confirmed (today's behavior preserved)", () => {
+    const secrets = tsOauthSkippedResult('org/self-hosted-repo');
+    const c = routingVerdictComponent(secrets, {}, selfHosted('v3.4.0'));
+    expect(c.status.state).toBe('not-confirmed');
+    expect(c.status.detail).toContain('TS_OAUTH_CLIENT_ID');
+    expect(c.status.detail).toContain('TS_OAUTH_SECRET');
+  });
+
+  it('hosted-touching fleet on a carve-out pin without TS_OAUTH -> NOT confirmed (the carve-out never applies off self-hosted)', () => {
+    const secrets = tsOauthSkippedResult('org/hosted-repo');
+    const c = routingVerdictComponent(secrets, {}, { actionsVersion: MIN_TAILNET_CARVEOUT_ACTIONS_VERSION, selfHostedRunner: false });
+    expect(c.status.state).toBe('not-confirmed');
+    expect(c.status.detail).toContain('TS_OAUTH_CLIENT_ID');
+  });
+
+  it('pin undeterminable (versions.actions never declared) -> UNKNOWN, distinct from both confirmed and not-confirmed', () => {
+    const secrets = tsOauthSkippedResult('org/self-hosted-repo');
+    const c = routingVerdictComponent(secrets, {}, selfHosted(undefined));
+    expect(c.status.state).toBe('unknown');
+    expect(c.status.state).not.toBe('confirmed');
+    expect(c.status.state).not.toBe('not-confirmed');
+    expect(c.status.detail).toContain('TS_OAUTH_CLIENT_ID');
+  });
+
+  it('a bare floating "v3" pin also resolves to UNKNOWN (never assumed capable — see carveOutCapability)', () => {
+    const secrets = tsOauthSkippedResult('org/self-hosted-repo');
+    const c = routingVerdictComponent(secrets, {}, selfHosted('v3'));
+    expect(c.status.state).toBe('unknown');
+  });
+
+  it('GUARD: the other four routing secrets stay required even under a carve-out-carrying self-hosted pin — a genuinely missing non-Tailscale secret still fails the run', () => {
+    const secrets = tsOauthSkippedResult('org/self-hosted-repo');
+    // Additionally fail a non-Tailscale secret — the carve-out must never
+    // widen to cover it.
+    const withExtraGap = {
+      ...secrets,
+      ROUTING_CLIENT_CERT: { 'org/self-hosted-repo': { status: 'failed' as const, reason: 'router App identity unresolved' } },
+    } as RoutingSecretsPublishResult;
+    const c = routingVerdictComponent(withExtraGap, {}, selfHosted(MIN_TAILNET_CARVEOUT_ACTIONS_VERSION));
+    expect(c.status.state).toBe('not-confirmed');
+    expect(c.status.detail).toContain('ROUTING_CLIENT_CERT');
+    // TS_OAUTH_* was carved out — must NOT be named as a cause of the failure.
+    expect(c.status.detail).not.toContain('TS_OAUTH_CLIENT_ID');
+    expect(c.status.detail).not.toContain('TS_OAUTH_SECRET');
+  });
+
+  it('omitting pinContext entirely preserves the pre-#1239 NOT-confirmed outcome (byte-identical-when-omitted contract)', () => {
+    const secrets = tsOauthSkippedResult('org/self-hosted-repo');
+    const withDefault = routingVerdictComponent(secrets);
+    const withExplicitDefault = routingVerdictComponent(secrets, {}, ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED);
+    expect(withDefault.status.state).toBe('not-confirmed');
+    expect(withDefault).toEqual(withExplicitDefault);
+  });
+
+  it('the aggregate detail states WHICH requirement set applied and why, not just the bare secret names', () => {
+    const secrets = tsOauthSkippedResult('org/self-hosted-repo');
+    const carriesMsg = routingVerdictComponent(secrets, {}, selfHosted(MIN_TAILNET_CARVEOUT_ACTIONS_VERSION));
+    const predatesMsg = routingVerdictComponent(secrets, {}, selfHosted('v3.4.0'));
+    // The carve-out-carrying pin never even reaches "not-confirmed" for a
+    // TS_OAUTH-only gap (see DECISIVE 1/2) — force a companion gap so both
+    // branches produce non-empty detail to compare.
+    const withExtraGap = {
+      ...secrets,
+      ROUTING_CLIENT_CERT: { 'org/self-hosted-repo': { status: 'failed' as const, reason: 'router App identity unresolved' } },
+    } as RoutingSecretsPublishResult;
+    const carriesDetail = routingVerdictComponent(withExtraGap, {}, selfHosted(MIN_TAILNET_CARVEOUT_ACTIONS_VERSION)).status.detail;
+    expect(carriesDetail).toContain(MIN_TAILNET_CARVEOUT_ACTIONS_VERSION);
+    expect(carriesDetail.toLowerCase()).toContain('carve-out');
+    expect(predatesMsg.status.detail.toLowerCase()).toContain('carve-out');
+    // The rendered detail is the verdict's own output — no internal
+    // issue/PR reference leaks into it (this file's citation-guard convention).
+    expect(carriesDetail).not.toMatch(/#\d+/);
   });
 });
 
