@@ -99,6 +99,13 @@ import { validateInstallRepositoryScope } from './install-scope.js';
 // `runnerPlatformItem` both call, so the two surfaces never describe the
 // same resolved value in two independently-drifting sentences.
 import { describeRunnerPlatformEndpointResolution, type RunnerPlatformEndpointResolution } from './runner-platform.js';
+// groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — row 3 of the
+// reconciler verb matrix (`update` never COMPUTED for a REUSED resource).
+// `install-scope-coverage.ts` value-imports `type { Presence }` from THIS
+// module already; a type-only import back is acyclic at runtime — same
+// one-directional-runtime-dependency shape this file documents repeatedly
+// for `apply-routing.js`/`apply-router-app.js`/`runner-platform.js` above.
+import type { InstallScopeCoverageEntry } from './install-scope-coverage.js';
 
 // --- Observed state (the reconcile input; populated by an observer, consumed as data) ---
 
@@ -393,7 +400,24 @@ export type PlanItemKind =
   /** groundnuty/macf#1109 — the operator-supplied Tailscale OAuth pair (`TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`), a fleet-level, read-only-vault credential like `'router_app'`'s own App id/key, but never minted — see {@link tsOauthItem}'s doc. */
   | 'ts_oauth'
   /** groundnuty/macf#1211 — the runner-provisioning contract's endpoint resolution (flag/env/scope/manifest precedence), a fleet-level notice like `'runner_warm'` but with its OWN gate (`runs_on === 'self-hosted'`, not merely `routing.runner` declared — see {@link runnerPlatformItem}'s doc). */
-  | 'runner_platform';
+  | 'runner_platform'
+  /**
+   * groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — row 3 of
+   * the reconciler verb matrix: does a REUSED fleet-level App's (`runner_ops`
+   * / `router_app`) `selected` install set still COVER every repo the
+   * manifest currently declares? Distinct from `'install'` (existence only)
+   * and from `install-scope.ts`'s `installScopeDrift` (the install's MODE —
+   * `'selected'` vs `'all'` — a different question that module's own doc
+   * explicitly forbids conflating with this one). Produced ONLY by
+   * {@link installScopeCoverageItem} from already-computed
+   * `InstallScopeCoverageEntry` data (the live per-repo JWT probe happens in
+   * the CALLER — `commands/bootstrap.ts`, when `--vault`/`--identity-key`
+   * are given — before `computePlan` ever sees it; `computePlan` itself
+   * stays I/O-free). NEVER emitted by `computePlan`'s own per-agent/
+   * fleet-level item construction the way every other kind is — see
+   * `computePlan`'s `installScopeCoverage` parameter doc.
+   */
+  | 'install_scope';
 /**
  * `'write-always'` (groundnuty/macf#926) — a distinct verb from `'create'`
  * for the two kinds (`labelsItem`/`runnerWarmItem`) that have NO live
@@ -802,6 +826,18 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // reflect exactly what `apply` does this run, so this is 'implemented'
       // unconditionally, same shape as 'router_app' immediately above.
       return 'implemented';
+    case 'install_scope':
+      // groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2a — the
+      // widen-gate (`#1232`/`#1233`) IS apply's code path for this verb:
+      // `bootstrap-apply.ts` wires `InstallScopeCoverageDeps.onDrift` into
+      // its OWN `computeInstallScopeCoverage` call, which opens the install
+      // page, states the exact repo set, waits, and re-checks — verified
+      // live on `macf-trial` (a widened router install took a runner from
+      // `available=0` to `available=1`). This item's ONLY verbs are
+      // `'update'`/`'noop'` (`installScopeCoverageItem` never emits
+      // anything else — a `status: 'unknown'` entry emits no item at all),
+      // both real apply behavior, so this is 'implemented' unconditionally.
+      return 'implemented';
     case 'runner_platform':
       // groundnuty/macf#1211 — `apply-fleet.ts` resolves this endpoint and
       // passes it straight into the SAME `provisionRunner` call
@@ -837,6 +873,7 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
     case 'router_app':
     case 'ts_oauth':
     case 'runner_platform':
+    case 'install_scope':
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
@@ -850,7 +887,9 @@ function unimplementedReasonFor(kind: PlanItemKind): string {
       // ALSO joined this group in groundnuty/macf#943 — see
       // `planItemApplyCoverage`'s 'runner_warm' arm for the wiring;
       // 'runner_platform' joined it at birth in groundnuty/macf#1211, same
-      // reasoning `'runner_warm'` established).
+      // reasoning `'runner_warm'` established; 'install_scope' joined it at
+      // birth in groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2a
+      // — the widen-gate (`#1232`/`#1233`) is its code path).
       // Kept exhaustive so a NEW `PlanItemKind` added
       // later is a compile error here, not a silent "apply covers
       // everything" false-negative.
@@ -1304,6 +1343,64 @@ function installItem(fleetName: string, agent: FleetAgent, obs: ObservedAgentSta
     reason: `App install for "${handle}" on "${agent.repo}" ${reasonSuffix}`,
     confirm_required: false,
   };
+}
+
+/**
+ * groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — row 3 of the
+ * reconciler verb matrix: turns ONE already-computed
+ * `InstallScopeCoverageEntry` (`install-scope-coverage.ts::evaluateInstallScopeCoverage`)
+ * into a `PlanItem`. Before this function existed, `apply` already computed
+ * and printed the correct desired repo set for `runner_ops`/`router_app`
+ * (`#1225`) and already opened a widen-gate for a confirmed `'drift'`
+ * (`#1232`/`#1233`, verified live on `macf-trial`) — but `plan` only ever
+ * rendered the finding as a discarded coverage-warning LINE
+ * (`commands/bootstrap.ts`'s `installScopeCoverageLines`), never as a
+ * `PlanItem` with a `verb`. Amendment P2's framing: "the desired set is
+ * computed, printed into a consent preview, and discarded." This function is
+ * the fix — reusing the SAME `status`/`message` the coverage section's own
+ * text rendering builds from (`installScopeCoverageDriftMessage`/
+ * `installScopeCoverageUnknownMessage`), never a second copy.
+ *
+ * **Verb mapping — Amendment A's honest-unknown floor, same discipline
+ * `macfVersionItem`/`actionsVersionItem` already establish for a value-diff
+ * item, but resolved DIFFERENTLY for the unobservable case:**
+ *   - `status === 'drift'` → `update`, `confirm_required: true` (§D3).
+ *     `apply` DOES action this — the widen-gate IS its code path (see
+ *     {@link planItemApplyCoverage}'s `'install_scope'` arm).
+ *   - `status === 'covered'` → `noop` — the declared set is fully covered.
+ *   - `status === 'unknown'` → **no item at all** (`undefined`), NOT
+ *     `'create'`. Unlike `macfVersionItem`'s unobservable-degrade (where
+ *     `'create'` is defensible because the roll machinery genuinely attempts
+ *     something), `'create'` here would falsely claim "this App doesn't
+ *     exist" for an App the coverage probe only reached BECAUSE it exists —
+ *     and `'noop'` would falsely claim a confirmed match neither the tool
+ *     nor the operator has evidence for. There is no honest verb to spend on
+ *     "could not tell" in this specific case, so this function declines to
+ *     manufacture one; the existing `install_scope_coverage` section
+ *     (`bootstrap.ts`'s own render, unchanged by this function) still names
+ *     the unverified repos in prose.
+ */
+function installScopeCoverageItem(entry: InstallScopeCoverageEntry): PlanItem | undefined {
+  const target = `${entry.role}:install_scope:${entry.appHandle}`;
+  if (entry.status === 'drift') {
+    return {
+      kind: 'install_scope',
+      target,
+      verb: 'update',
+      reason: entry.message ?? `App "${entry.appHandle}" installation no longer covers every repo the manifest declares.`,
+      confirm_required: true,
+    };
+  }
+  if (entry.status === 'covered') {
+    return {
+      kind: 'install_scope',
+      target,
+      verb: 'noop',
+      reason: `App "${entry.appHandle}" installation covers every repo the manifest declares (${String(entry.expectedRepos.length)} expected, 0 missing).`,
+      confirm_required: false,
+    };
+  }
+  return undefined;
 }
 
 /**
@@ -1945,7 +2042,25 @@ function actionsVersionItem(repo: string, desired: string, observed: string | un
  *
  * NEVER emits a delete/prune verb (§D3 "play it safe" — Design invariant 4).
  */
-export function computePlan(manifest: FleetManifest, observed: ObservedState): FleetPlan {
+/**
+ * groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — the optional
+ * 3rd parameter carrying ALREADY-COMPUTED `InstallScopeCoverageEntry` data
+ * (`install-scope-coverage.ts::computeInstallScopeCoverage`), so
+ * `computePlan` can fold row 3 (reused-resource `update`) in without doing
+ * any I/O itself. Defaults to `[]` — every pre-existing call site
+ * (`commands/bootstrap-apply.ts`'s internal plan preview, and every test in
+ * this package) keeps compiling and behaving byte-identically; `[]` produces
+ * zero `'install_scope'` items, same as before this parameter existed.
+ * `commands/bootstrap.ts` is the ONLY caller that ever passes a non-empty
+ * array (only when `--vault`/`--identity-key` are BOTH given — the same
+ * gate `computeInstallScopeCoverage` itself already applies). See
+ * {@link installScopeCoverageItem}'s own doc for the verb mapping.
+ */
+export function computePlan(
+  manifest: FleetManifest,
+  observed: ObservedState,
+  installScopeCoverage: readonly InstallScopeCoverageEntry[] = [],
+): FleetPlan {
   const fleetName = manifest.metadata.name;
   const seg = toVariableSegment(fleetName);
   const items: PlanItem[] = [];
@@ -1972,6 +2087,17 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
   const routerAppScope: RouterAppScope = manifest.transport.router_app_scope === 'per-fleet' ? 'per-fleet' : 'shared';
   const routerAppHasLockEntry = observed.lock?.agents.some((a) => a.role === ROUTER_APP_ROLE) ?? false;
   items.push(routerAppItem(fleetName, manifest.owner.account, routerAppScope, routerAppHasLockEntry, observed.vaultRouterApp));
+
+  // groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — row 3,
+  // ordered right after the two fleet-level App-existence items
+  // (`runner_ops`/`router_app`) it is the scope-coverage FACET of. Zero
+  // entries on the common vault-free `plan` run (the caller's default) —
+  // see `installScopeCoverageItem`'s own doc for the verb mapping,
+  // including why a `status: 'unknown'` entry emits NO item.
+  for (const entry of installScopeCoverage) {
+    const coverageItem = installScopeCoverageItem(entry);
+    if (coverageItem !== undefined) items.push(coverageItem);
+  }
 
   // groundnuty/macf#1109 — fleet-level, ordered right after `router_app`
   // (both are the two routing secrets `apply-fleet.ts` resolves independently
@@ -2161,6 +2287,22 @@ export function computePlan(manifest: FleetManifest, observed: ObservedState): F
 // changes, no aggregate here for a new condition to silently feed. See
 // `status.ts::BOOTSTRAP_STATUS_JSON_SCHEMA_VERSION`'s sibling comment for
 // the full rule (groundnuty/macf#1203).
+//
+// groundnuty/macf#1129 / #1229 / DR-043 Amendment P2 — the `'install_scope'`
+// `PlanItemKind` added for row 3 is a NEW VALUE inside the EXISTING
+// `items[].kind` string field, never a new top-level key or a changed
+// field SHAPE. Also deliberately NOT bumped, for a reason verified against
+// this constant's own history: `'router_app'` (#1105), `'ts_oauth'`
+// (#1109), and `'runner_platform'` (#1211) all landed as new `PlanItemKind`
+// values without a bump, and no production consumer in this package
+// switches exhaustively on `items[].kind` (grepped: `PlanItemKind` is
+// imported nowhere outside `plan.ts` and its own tests) — a generic
+// `kind`/`verb`/`reason` consumer (dashboards, `--json` scripts) handles an
+// unrecognized-to-it `kind` string the same way it handles any of the other
+// 19. If a future consumer DOES start switching exhaustively on `kind`,
+// that consumer's own addition is the one that should introduce a version
+// contract for itself — this constant stays keyed to shape changes, not to
+// vocabulary growth within an already-open string field.
 export const FLEET_PLAN_JSON_SCHEMA_VERSION = 1;
 
 export interface PlanSummary {
