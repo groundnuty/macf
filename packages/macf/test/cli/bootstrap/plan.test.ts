@@ -872,17 +872,27 @@ describe('computePlan — row 4 (DR-043 Amendment P3, groundnuty/macf#1229): neg
 
   // --- Mutation check: break the lock-membership gate, name what fails ---
   //
-  // Per this task's own instruction: simulate removing the `lockRoles.has(role)`
-  // guard (treat every extra role as "ours") and confirm a SPECIFIC test
-  // fails. Rather than hand-editing plan.ts, this test constructs the
-  // UNSAFE-DIRECTION input the guard exists to reject (`lock: null` — no
-  // lock at all) and proves today's code does NOT decompose it. The
-  // sibling test above ("an extra role with NO fleet.lock produces
-  // report-extra and NOTHING else") is the one that would fail if the gate
-  // were removed (i.e. `if (!lockRoles.has(role))` deleted, or replaced
-  // with `if (false)`), because ALL extra roles would then decompose
-  // regardless of lock state.
-  it('MUTATION-CHECK TARGET: with the lock gate intact, an extra role with `lock: null` never decomposes (deleting the `if (!lockRoles.has(role))` branch in plan.ts would make this — and "an extra role with NO fleet.lock produces report-extra and NOTHING else" above — fail)', () => {
+  // The property under test: an extra role with NO `fleet.lock` entry never
+  // decomposes into orphan/delete items, however present it is observed.
+  // Empirically verified (not merely asserted) by mutating `plan.ts`'s
+  // `const lockRoles = new Set((observed.lock?.agents ?? []).map((a) =>
+  // a.role));` to `const lockRoles = new Set(Object.keys(observed.agents));`
+  // — the UNSAFE direction: membership always reads true for every extra
+  // role, regardless of what `fleet.lock` actually records — then running
+  // this suite. Result: 5 tests fail, most decisively THIS test (the
+  // `delete`/`orphan` assertion below flips from `false` to `true` — an
+  // orphan/delete item genuinely leaked in for an UNRECORDED role) and "an
+  // extra role with NO fleet.lock produces report-extra and NOTHING else"
+  // in the describe block above (its `toContain('orphan')` assertion is
+  // exactly what catches the leak there too). The other 3 failures
+  // (`emits a report-extra item…`, `report-extra items are sorted by
+  // role…`, the `plan-item-write-always.test.ts` `agent (report-extra)`
+  // case) are a SIDE EFFECT of the same mutation removing the coarse
+  // fallback item, not independent proof — this test and its sibling above
+  // are the ones that directly assert the safety property itself. The
+  // mutation was reverted after confirming the failures; this test is the
+  // durable regression guard for that same property going forward.
+  it('an extra role with NO fleet.lock entry never decomposes into orphan/delete, however present it is observed', () => {
     const manifest = baseManifest();
     const observed: ObservedState = {
       lock: null,
@@ -1186,6 +1196,14 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
       expect(item.reason.length).toBeGreaterThan(0);
       expect(item.reason).not.toBe(plan.items.find((p) => p.target === item.target)?.reason);
     }
+    // groundnuty/macf#1229 / DR-043 Amendment P3 — `unimplementedReasonFor`
+    // now checks `item.verb === 'delete'` BEFORE its per-kind switch (see
+    // that function's own doc); this pins that a `routing`/`update` item
+    // still resolves through the UNCHANGED per-kind switch to its
+    // pre-existing reason, not accidentally to `rowFourDelete` (verb here is
+    // `'update'`, not `'delete'` — the two checks are disjoint by verb, but
+    // worth asserting the VALUE, not just the shape).
+    expect(plan.unimplementedByApply[0]?.reason).toBe(APPLY_UNIMPLEMENTED_REASONS.routing);
   });
 
   it('does NOT flag routing when it matches (noop) or is absent (create) — runner_warm no longer appears either way (groundnuty/macf#943)', () => {
