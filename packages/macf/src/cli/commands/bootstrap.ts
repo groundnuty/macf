@@ -237,14 +237,30 @@ export async function runBootstrapPlan(
     // installation-SCOPE-MEMBERSHIP drift: is a `selected` install's actual
     // repo set still current now that the manifest may have grown since it
     // was set? Needs an App JWT (see `install-scope-coverage.ts`'s module
-    // doc), so — same gate `resolveDeps` above already applies for
-    // `vaultAwareObserver` — this ONLY runs when BOTH `--vault` and
-    // `--identity-key` are given; without them this reads `{}` and the
-    // section is simply omitted below (not rendered as a wall of "unknown"
-    // — that would be noise on the common vault-free `plan` run, and
-    // nothing here degrades silently: `computeInstallScopeCoverage` itself
-    // still reports honest-`'unknown'` for anyone who calls it without a
-    // vault, this command just chooses not to on the common path).
+    // doc) to actually PROBE, but — groundnuty/macf#1279 — `plan` calls
+    // `computeInstallScopeCoverage` UNCONDITIONALLY, exactly as `apply` does
+    // (macf#1268 / PR #1276) and for the identical reason: that function
+    // ALREADY implements the exact "only when meaningful, say why otherwise"
+    // contract this issue asks for. `installScopeCoverageTargets(manifest)`
+    // — pure, manifest-only — returns ZERO targets when this fleet declares
+    // neither a runner-ops App nor a router App needing one, so a fleet with
+    // nothing to check makes ZERO I/O and this reads `{}`, silent, exactly
+    // as before this fix. When targets ARE non-empty and `--vault`/
+    // `--identity-key` are absent, `computeInstallScopeCoverage` returns one
+    // honest `'unknown'` entry per target via its own `allUnverified` helper
+    // — message `"install-scope coverage was not checked this run —
+    // no --vault/--identity-key given."`, naming exactly what the operator
+    // would supply. The PRE-#1279 bug was ONLY this call site discarding
+    // that honest-unknown output via the ternary's `: {}` branch, regardless
+    // of whether `targets` was empty or not — never a missing capability in
+    // `install-scope-coverage.ts` itself (see PR #1276's identical rationale
+    // for the `apply` call site).
+    //
+    // `plan` deliberately passes NO `deps` (no `onDrift`) — `computeInstallScopeCoverage`
+    // is report-only here, same as `status`; only `apply`'s call site wires
+    // the ACT half (`InstallScopeCoverageDeps.onDrift`'s own doc: opening a
+    // browser consent gate from a read-only command would be its own
+    // hazard).
     //
     // Computed BEFORE `computePlan` (moved here from after it, groundnuty/
     // macf#1129 / #1229 / DR-043 Amendment P2, row 3) so its entries can be
@@ -252,17 +268,19 @@ export async function runBootstrapPlan(
     // confirmed `'drift'`) rather than only ever rendered as a discarded
     // coverage-warning line — see `plan.ts::installScopeCoverageItem`'s
     // doc. `computePlan` itself stays I/O-free: the live per-repo JWT probe
-    // already happened in THIS await, above the call.
-    const installScopeCoverage =
+    // (when a vault credential is available) already happened in THIS
+    // await, above the call.
+    const vaultOpts =
       opts.vaultPath !== undefined && opts.identityKeyPath !== undefined
-        ? await computeInstallScopeCoverage(
-            manifest,
-            observed.lock,
-            Object.fromEntries(Object.entries(observed.agents).map(([role, a]) => [role, a.repo])) as Readonly<Record<string, Presence>>,
-            observed.controlRepoPresence,
-            { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath },
-          )
-        : {};
+        ? { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath }
+        : undefined;
+    const installScopeCoverage = await computeInstallScopeCoverage(
+      manifest,
+      observed.lock,
+      Object.fromEntries(Object.entries(observed.agents).map(([role, a]) => [role, a.repo])) as Readonly<Record<string, Presence>>,
+      observed.controlRepoPresence,
+      vaultOpts,
+    );
     const plan = computePlan(manifest, observed, Object.values(installScopeCoverage));
     // groundnuty/macf#880 — the operator's consent-click budget, projected
     // from the SAME `plan.items` this render already computed (no new
@@ -303,10 +321,19 @@ export async function runBootstrapPlan(
     // above.
     const operatorInputs = operatorInputProvenance(manifest, fleetSecretsValues, scopeSecretsValues);
     // `installScopeCoverage` is now computed above, before `computePlan` —
-    // this section's TEXT/JSON rendering is otherwise unchanged: a
+    // this section's TEXT/JSON rendering is otherwise UNCHANGED code: a
     // `status: 'unknown'` entry never became a `PlanItem` (honest-unknown —
     // see `installScopeCoverageItem`'s doc), so this is still the ONLY
-    // surface naming its unverified repos.
+    // surface naming its unverified repos. What DID change (macf#1279): the
+    // flagless-run `'unknown'` entries this now unconditionally-called
+    // function returns reach these SAME two renders unmodified —
+    // `formatInstallScopeCoverageLines` already renders every non-`'covered'`
+    // entry (the `--vault`-genuinely-ambiguous case and the
+    // no-`--vault`-given "not checked this run" case share one code path,
+    // one label ("unknown"), never a second wording), and the `--json`
+    // `Object.keys(installScopeCoverage).length > 0` guard now goes true
+    // whenever the manifest declares a fleet-level App target, independent
+    // of whether the flags were given.
     const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
 
     if (opts.json) {

@@ -2534,11 +2534,33 @@ export function computePlan(
 // FIELDS (`deletes`/`orphans`, same "counted separately" shape `writeAlways`
 // already established for `summarizePlan`) — additive keys on an
 // already-open `summary` object, the same class of change `install_scope_coverage`'s
-// own top-level addition (two paragraphs up) was unbumped for. STAYS AT 1.
-// A future consumer that DOES start switching exhaustively on `verb` (or
-// asserting `Object.keys(summary)` closed) is the one that should introduce
-// its own version contract, per the SAME rule stated above for `kind`.
-export const FLEET_PLAN_JSON_SCHEMA_VERSION = 1;
+// own top-level addition (two paragraphs up) was unbumped for. Unbumped at
+// the time — see immediately below for why THIS SAME KEY later did bump.
+//
+// **groundnuty/macf#1279 bumped this 1 → 2.** Unlike #1220 two paragraphs up
+// (adding the brand-new `install_scope_coverage` key — unbumped, per the
+// "new key, no existing field's meaning changes" rule) or #1229 immediately
+// above (new `verb`/`kind` vocabulary inside an already-open string field —
+// also unbumped), #1279 changes that SAME key's OWN PRESENCE CONDITION —
+// the shape `FLEET_APPLY_JSON_SCHEMA_VERSION`'s own #1268 comment
+// (`bootstrap-apply.ts`) bumped 2 → 3 for, and the identical fix applied to
+// `plan`'s call site rather than `apply`'s. Before #1279,
+// `install_scope_coverage` was present in `plan --json` output if and only
+// if BOTH `--vault` and `--identity-key` were given; any other case
+// (including a fleet that genuinely has fleet-level Apps to check)
+// collapsed to key-absent, indistinguishable from "nothing to check." A
+// `--json` consumer that gated any logic on `'install_scope_coverage' in
+// json` as a proxy for "were the vault flags given" would now see that
+// proxy break: the key can be present (with honest `'unknown'` entries
+// naming the missing flags) on a vault-free `plan` run too, whenever the
+// manifest declares a runner-ops or router-App target. Per-entry
+// `status`/`message` were already `'unknown'`-capable before this bump (a
+// live-probe failure or an unconfirmed-existence repo already produced it)
+// — only the KEY'S PRESENCE on a vault-free run is new. `PlanSummary`'s
+// `deletes`/`orphans` fields immediately above stay a DIFFERENT, still-
+// unbumped case: those are new fields on an already-open object, never a
+// presence-condition change to an existing one.
+export const FLEET_PLAN_JSON_SCHEMA_VERSION = 2;
 
 export interface PlanSummary {
   readonly creates: number;
