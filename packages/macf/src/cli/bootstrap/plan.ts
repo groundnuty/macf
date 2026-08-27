@@ -15,11 +15,39 @@
  *                    `confirm_required: true` — `apply` must never silently
  *                    mutate (§D3).
  *   - **noop**     — observed matches desired.
- *   - **report-extra** — observed but NOT declared in the manifest (e.g. an
- *                    agent the lock remembers but the manifest dropped).
- *                    **There is no `delete` verb** — §D3 is explicit that
- *                    agent/resource deletion is out of scope; extras are
- *                    reported, never pruned.
+ *   - **report-extra** — observed but NOT declared in the manifest AND not
+ *                    recorded in `fleet.lock` — not ours to judge, so it is
+ *                    reported, never touched (§D3 "play it safe").
+ *   - **delete**   — observed but NOT declared in the manifest, AND `fleet.lock`
+ *                    records THIS TOOL as the one that provisioned it (DR-043
+ *                    Amendment P3, row 4, groundnuty/macf#1229): a negative
+ *                    diff on a CHEAP-TO-REVIVE resource class (variables,
+ *                    secrets). A statement of intent, covered by the SAME
+ *                    plan-approval consent `update` already uses
+ *                    (`confirm_required: true`) — but this change wires the
+ *                    COMPUTATION only; `apply` has no code path for `delete`
+ *                    yet (see `planItemApplyCoverage` + `unimplementedByApply`
+ *                    — deliberately unwired, a future increment's job).
+ *   - **orphan**    — the SAME "ours, no longer declared, recorded in
+ *                    fleet.lock" fact as `delete`, but on an EXPENSIVE-TO-REVIVE
+ *                    resource class (repos, Apps — un-archive/recreate loses
+ *                    history, or the App's key was emitted once and is
+ *                    unrecoverable). An INSTRUCTION TO THE OPERATOR — "we made
+ *                    this, the manifest no longer wants it, and I will not
+ *                    touch it" — never a statement of intent. `apply` MUST
+ *                    NEVER act on an `orphan` item, under any flag, ever (see
+ *                    `planItemApplyCoverage`'s `orphan` arm, which is
+ *                    `'implemented'` for exactly this reason: "apply
+ *                    correctly does nothing" IS the designed behavior, not a
+ *                    gap).
+ *
+ *                    Both verbs are gated on `fleet.lock` membership, which is
+ *                    the WHOLE safety property row 4 rests on: a resource NOT
+ *                    recorded in the lock might be anything on GitHub with a
+ *                    matching name — never provably ours — so it stays
+ *                    `report-extra`/untouched exactly as before this change
+ *                    (the no-prune decision `report-extra` already embodied is
+ *                    preserved exactly, not relaxed).
  *
  * `collaborators:` (§D3 day-2 catalog) is PARSED by the schema but its
  * reconcile logic is deferred past Slice 1a. To avoid the silent-fallback
@@ -437,15 +465,33 @@ export type PlanItemKind =
  * proof (both directions: `labels`/`runner_warm` never reach `'noop'` even
  * under a fixture where everything ELSE reads `'noop'`; every other kind
  * DOES reach both `'noop'` and a real action verb under some fixture).
+ *
+ * `'delete'` / `'orphan'` (groundnuty/macf#1229, DR-043 Amendment P3, row 4
+ * of the reconciler verb matrix) — see this module's own top-of-file doc for
+ * the full contract. In one line: both mean "not declared, but `fleet.lock`
+ * says this tool made it" — `'delete'` for cheap-to-revive classes
+ * (variables, secrets), `'orphan'` for expensive-to-revive ones (repos,
+ * Apps). `'orphan'` is NEVER actioned by `apply`, by design, under any flag —
+ * it is an instruction to the operator, not a statement of intent.
  */
-export type PlanVerb = 'create' | 'update' | 'noop' | 'report-extra' | 'write-always';
+export type PlanVerb = 'create' | 'update' | 'noop' | 'report-extra' | 'write-always' | 'delete' | 'orphan';
 
 export interface PlanItem {
   readonly kind: PlanItemKind;
   readonly target: string;
   readonly verb: PlanVerb;
   readonly reason: string;
-  /** `update` is ALWAYS `true` (§D3: confirm-then-update, never silent). Other verbs (including `write-always`, groundnuty/macf#926 — an unconditional write is not a drift-confirmation, so it never gates on the confirm-then-update rail) are always `false`. */
+  /**
+   * `update` is ALWAYS `true` (§D3: confirm-then-update, never silent).
+   * `delete` is ALSO always `true` (groundnuty/macf#1229 — a negative diff is
+   * at least as consequential as a divergent update; a silent-by-default
+   * delete-verb is not this change's decision to make quietly, and a future
+   * apply-side deletion increment inherits the confirm rail rather than
+   * having to add it). Every other verb — INCLUDING `orphan` (never actioned,
+   * nothing to confirm about an action `apply` will take) and `write-always`
+   * (groundnuty/macf#926 — an unconditional write is not a drift-confirmation)
+   * — is always `false`.
+   */
   readonly confirm_required: boolean;
 }
 
@@ -459,12 +505,15 @@ export interface FleetPlan {
   readonly items: readonly PlanItem[];
   readonly skippedSections: readonly SkippedSection[];
   /**
-   * The subset of `items` that call for action (`create`/`update`) but
-   * `apply` has no code path for yet — groundnuty/macf#854 ("plan emitted 7
-   * create items; apply delivered 3, failed 1 loudly, silently skipped 3").
-   * Computed via {@link planItemApplyCoverage}, the single source of truth
-   * for "does apply actually do this" — see that function's doc. ALWAYS
-   * present (empty array when apply can action everything the plan lists).
+   * The subset of `items` that call for action (`create`/`update`/`delete` —
+   * `delete` joined this set groundnuty/macf#1229, DR-043 Amendment P3 row 4;
+   * `orphan` deliberately does NOT, see `planItemApplyCoverage`'s `orphan`
+   * arm) but `apply` has no code path for yet — groundnuty/macf#854 ("plan
+   * emitted 7 create items; apply delivered 3, failed 1 loudly, silently
+   * skipped 3"). Computed via {@link planItemApplyCoverage}, the single
+   * source of truth for "does apply actually do this" — see that function's
+   * doc. ALWAYS present (empty array when apply can action everything the
+   * plan lists).
    */
   readonly unimplementedByApply: readonly UnimplementedApplyItem[];
   /**
@@ -663,6 +712,18 @@ export const APPLY_UNIMPLEMENTED_REASONS = {
     'diverging value — the task\'s create-only posture ("never silently overwrite") leaves this specific update ' +
     'un-actioned. Set the repo variable manually to the declared value, or re-run apply once a future increment ' +
     'adds confirmed per-item updates; nothing above was changed for this item.',
+  // groundnuty/macf#1229 / DR-043 Amendment P3 — row 4's `delete` verb, for
+  // EVERY kind it can appear on (variables via `routing`, secrets via
+  // `secret_fingerprint`): plan computes the negative diff, but this change
+  // deliberately does not wire apply's deletion path (plan-side computation
+  // only — see `planItemApplyCoverage`'s `delete` arm). One shared reason
+  // text, not one per kind, because the fact is verb-level ("apply doesn't
+  // delete yet"), not kind-level.
+  rowFourDelete:
+    'plan has computed this as a negative diff (fleet.lock records this tool as the one that provisioned it, and ' +
+    "it is no longer declared) but apply's deletion path is deliberately UNWIRED (DR-043 Amendment P3 scopes row 4 " +
+    'to plan-side computation only, groundnuty/macf#1229) — remove it by hand, or wait for a future increment that ' +
+    'wires confirmed per-item deletes; nothing above was changed for this item.',
 } as const;
 
 /**
@@ -676,7 +737,23 @@ export const APPLY_UNIMPLEMENTED_REASONS = {
  */
 export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
   // Nothing calls for action → nothing for apply to have a code path for.
-  if (item.verb === 'noop' || item.verb === 'report-extra') return 'implemented';
+  // `'orphan'` joins this group DELIBERATELY — not because apply lacks a
+  // code path for it, but because apply must NEVER have one (DR-043
+  // Amendment P3: "an instruction to the operator... I will not touch it").
+  // Reporting `'not_implemented'` here would render a false "NOT IMPLEMENTED
+  // BY APPLY" warning about a verb this tool is never meant to action.
+  if (item.verb === 'noop' || item.verb === 'report-extra' || item.verb === 'orphan') return 'implemented';
+
+  // groundnuty/macf#1229 / DR-043 Amendment P3 — row 4's OTHER verb,
+  // `'delete'`, DOES call for real action (a statement of intent under the
+  // existing plan-approval consent) but THIS change deliberately does not
+  // wire apply's execution path for it — plan-side computation only; an
+  // apply that starts deleting resources is a separate change with its own
+  // review. One line here, not scattered into individual `kind` arms below
+  // (which would require every present-and-future delete-eligible kind to
+  // remember to say so), so a future deletion-wiring increment flips exactly
+  // this line and nothing else.
+  if (item.verb === 'delete') return 'not_implemented';
   switch (item.kind) {
     case 'app':
     case 'install':
@@ -851,8 +928,18 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
   }
 }
 
-function unimplementedReasonFor(kind: PlanItemKind): string {
-  switch (kind) {
+/**
+ * Verb-first, THEN kind — `'delete'` (groundnuty/macf#1229, row 4) reaches
+ * `not_implemented` from {@link planItemApplyCoverage}'s single top-level
+ * check regardless of which kind carries it, so the reason is a VERB-level
+ * fact ("apply's deletion path is unwired"), checked before the per-kind
+ * switch below (which stays exactly as it was — an exhaustive proof that
+ * every OTHER not-yet-covered case is `'routing'`/`'update'`, never anything
+ * this function should have to special-case per delete-eligible kind).
+ */
+function unimplementedReasonFor(item: PlanItem): string {
+  if (item.verb === 'delete') return APPLY_UNIMPLEMENTED_REASONS.rowFourDelete;
+  switch (item.kind) {
     case 'routing':
       return APPLY_UNIMPLEMENTED_REASONS.routing;
     case 'app':
@@ -907,7 +994,7 @@ export function computeUnimplementedByApply(items: readonly PlanItem[]): readonl
   const out: UnimplementedApplyItem[] = [];
   for (const item of items) {
     if (planItemApplyCoverage(item) !== 'not_implemented') continue;
-    out.push({ kind: item.kind, target: item.target, verb: item.verb, reason: unimplementedReasonFor(item.kind) });
+    out.push({ kind: item.kind, target: item.target, verb: item.verb, reason: unimplementedReasonFor(item) });
   }
   return out;
 }
@@ -1669,6 +1756,58 @@ function routingItem(
 }
 
 /**
+ * DR-043 Amendment P3 row 4 (groundnuty/macf#1229) — `routing.runner` is
+ * UNDECLARED, but the variable {@link routingItem} would have written is
+ * STILL observed present. Gated on `fleet.lock`: only when the
+ * REPRESENTATIVE agent's role (the repo the variable lives on — same
+ * derivation `computePlan`'s own call site for `routingItem` already uses)
+ * is recorded in `fleet.lock.agents` — i.e. this tool provisioned that
+ * identity — is the variable "ours" to call a negative diff on; otherwise
+ * this stays silent (§D3 no-prune — an unrecorded fleet has no history this
+ * tool can act against, same discriminator the `extraRoles` loop above
+ * uses).
+ *
+ * `observedTrustedActors === undefined` produces NO item at all (Amendment
+ * A's honest-unknown floor: unobservable is not the same as confirmed
+ * present, so no delete claim is made) — this is what keeps a `plan` run
+ * against a fleet that genuinely never declared routing quiet, and matches
+ * `routingItem`'s OWN sibling honest-unknown handling for the
+ * declared-but-unobservable case.
+ *
+ * **Not wired to any live read as of this change** — `githubRegistryObserver`
+ * only reads `MACF_TRUSTED_ACTORS` when `routing.runner` IS declared (see
+ * that function's own gate), so `observed.routingTrustedActors` is always
+ * `undefined` here on a REAL `plan` run today. This function is pure and
+ * fully exercised by `computePlan`'s own tests; observing the leftover
+ * value live is a separate, follow-up wiring task — same "computePlan is
+ * pure, live wiring is a separate caller-side concern" shape row 3's
+ * `installScopeCoverage` parameter already established (see this module's
+ * own doc on that parameter).
+ */
+function routingDroppedItem(
+  fleetName: string,
+  representativeRepo: string | undefined,
+  representativeRole: string | undefined,
+  observedTrustedActors: string | undefined,
+  lock: FleetLock | null,
+): PlanItem | undefined {
+  if (observedTrustedActors === undefined) return undefined;
+  const ownedByThisTool = representativeRole !== undefined && (lock?.agents.some((a) => a.role === representativeRole) ?? false);
+  if (!ownedByThisTool) return undefined;
+  return {
+    kind: 'routing',
+    target: `routing:${fleetName}:runner`,
+    verb: 'delete',
+    reason:
+      `MACF_TRUSTED_ACTORS is observed present on "${representativeRepo ?? '(no agent repos declared)'}" but ` +
+      'routing.runner is no longer declared — this tool wrote it (recorded in fleet.lock for ' +
+      `"${representativeRole ?? '?'}") and it is a cheap-to-revive variable (a rewrite), so this plan calls for ` +
+      'removing it.',
+    confirm_required: true,
+  };
+}
+
+/**
  * DR-043 Amendment I / groundnuty/macf#942 — the runner-provisioning
  * contract's `warm` argument, declared per-fleet (DR-009 §7.4's warm-by-
  * default, hibernate-the-dormant policy). ONE item per fleet, not per agent
@@ -2190,6 +2329,17 @@ export function computePlan(
     if (manifest.routing.runner.runs_on === 'self-hosted') {
       items.push(runnerPlatformItem(fleetName, observed.runnerPlatformEndpoint ?? { value: undefined, source: 'none' }));
     }
+  } else {
+    // groundnuty/macf#1229 / DR-043 Amendment P3 row 4 — the concrete
+    // motivating case: `routing.runner` was DROPPED from the manifest.
+    // `routingDroppedItem` returns `undefined` (no item) unless BOTH the
+    // variable is observed present AND the representative role is recorded
+    // in `fleet.lock` — see that function's own doc for why (and why this
+    // never fires on a real `plan` run yet).
+    const representativeRepo = manifest.agents[0]?.repo;
+    const representativeRole = manifest.agents[0]?.role;
+    const droppedRouting = routingDroppedItem(fleetName, representativeRepo, representativeRole, observed.routingTrustedActors, observed.lock);
+    if (droppedRouting !== undefined) items.push(droppedRouting);
   }
 
   // DR-043 §D6 — only emitted when `versions:` is DECLARED (an omitted
@@ -2218,18 +2368,90 @@ export function computePlan(
     items.push(actionsVersionItem(routerCarryingRepos(manifest).at(-1)!, desiredActions, observed.controlRepoActionsPin));
   }
 
+  // groundnuty/macf#1229 / DR-043 Amendment P3 — row 4 of the reconciler
+  // verb matrix, for a role observed but NOT declared. Fleet-level pseudo
+  // roles (`runner-ops`/`router`, `RUNNER_OPS_ROLE`/`ROUTER_APP_ROLE`) live
+  // in `fleet.lock.agents` BY DESIGN (composeFleetLock records them the
+  // same way a real per-manifest-agent identity is recorded — see
+  // `runnerOpsItem`/`routerAppItem`'s own lock-membership checks above) but
+  // are never real agent roles an operator declares under `agents[]` or that
+  // `githubRegistryObserver` would ever populate into `observed.agents`
+  // (that map is built ONLY from `manifest.agents`). Excluding them here
+  // means a lock that legitimately carries those two roles can never
+  // misread as an "orphan agent" — they already have their own dedicated
+  // fleet-level plan items.
   const manifestRoles = new Set(manifest.agents.map((a) => a.role));
+  const fleetLevelPseudoRoles = new Set<string>([RUNNER_OPS_ROLE, ROUTER_APP_ROLE]);
   const extraRoles = Object.keys(observed.agents)
-    .filter((role) => !manifestRoles.has(role))
+    .filter((role) => !manifestRoles.has(role) && !fleetLevelPseudoRoles.has(role))
     .sort();
+  // The row-4 discriminator, and THE WHOLE SAFETY PROPERTY this row rests
+  // on: was THIS TOOL the one that provisioned `role`? `fleet.lock.agents`
+  // is exactly that record (composeFleetLock never prunes it — §D3 Design
+  // invariant 4). A role ABSENT from the lock might be anything on GitHub
+  // with a matching name — never provably ours, so it stays `report-extra`,
+  // untouched, exactly as before this change (the pre-existing no-prune
+  // behavior is preserved, not relaxed). A role PRESENT in the lock is
+  // ours, no longer wanted, and decomposes per resource class (Amendment
+  // G's revival-cost axis) instead of one coarse whole-agent notice.
+  const lockRoles = new Set((observed.lock?.agents ?? []).map((a) => a.role));
   for (const role of extraRoles) {
-    items.push({
-      kind: 'agent',
-      target: `agent:${role}`,
-      verb: 'report-extra',
-      reason: 'observed (fleet.lock / registry) but not declared in fleet.yaml — never deleted (§D3 no-prune)',
-      confirm_required: false,
-    });
+    if (!lockRoles.has(role)) {
+      items.push({
+        kind: 'agent',
+        target: `agent:${role}`,
+        verb: 'report-extra',
+        reason: 'observed (fleet.lock / registry) but not declared in fleet.yaml — never deleted (§D3 no-prune)',
+        confirm_required: false,
+      });
+      continue;
+    }
+    const obs = observed.agents[role];
+    // Apps: orphan, ALWAYS (Amendment P3 — 2 clicks AND the key is emitted
+    // once, unrecoverable). `obs?.app` may also be `'absent'` (nothing to
+    // orphan) or `'unknown'` (honest-unknown floor — Amendment A: the API
+    // can confirm present, never prove absent; an unconfirmed presence
+    // earns no claim in either direction here).
+    if (obs?.app === 'present') {
+      items.push({
+        kind: 'app',
+        target: `agent:${role}:app`,
+        verb: 'orphan',
+        reason:
+          `GitHub App for "${role}" was provisioned by this tool (recorded in fleet.lock) but "${role}" is no ` +
+          'longer declared — never auto-removed (2 clicks to recreate, but the private key is emitted once and ' +
+          'unrecoverable); un-install/delete it by hand if it should go away.',
+        confirm_required: false,
+      });
+    }
+    // Repos: orphan (un-archive is 0 clicks; recreate loses history).
+    if (obs?.repo === 'present') {
+      items.push({
+        kind: 'repo',
+        target: `agent:${role}:repo`,
+        verb: 'orphan',
+        reason:
+          `The repo for "${role}" was provisioned by this tool (recorded in fleet.lock) but "${role}" is no ` +
+          'longer declared — never auto-removed (recreating a repo loses its history; un-archiving is 0 clicks); ' +
+          'archive or delete it by hand if it should go away.',
+        confirm_required: false,
+      });
+    }
+    // Secrets: delete, with the value's source named at plan time (Amendment
+    // P3 — cheap to revive: a re-supply, ~0 cost if vault-held). One item
+    // per recorded fingerprint, sorted for deterministic ordering.
+    for (const name of Object.keys(obs?.fingerprints ?? {}).sort()) {
+      items.push({
+        kind: 'secret_fingerprint',
+        target: `agent:${role}:secret_fingerprint:${name}`,
+        verb: 'delete',
+        reason:
+          `Secret "${name}" for "${role}" was provisioned by this tool (recorded in fleet.lock, fingerprint only ` +
+          `— the value itself is never in this lock) but "${role}" is no longer declared — cheap to revive ` +
+          '(re-supply; ~0 cost if the value is vault-held), so this plan calls for removing it.',
+        confirm_required: true,
+      });
+    }
   }
 
   // groundnuty/macf#999 requirement 3 — "plan states it": the SAME pure
@@ -2303,6 +2525,19 @@ export function computePlan(
 // that consumer's own addition is the one that should introduce a version
 // contract for itself — this constant stays keyed to shape changes, not to
 // vocabulary growth within an already-open string field.
+//
+// groundnuty/macf#1229 / DR-043 Amendment P3 — the SAME reasoning applies to
+// `'delete'`/`'orphan'`, two NEW VALUES inside the EXISTING `items[].verb`
+// string field (never a new key, never a changed field shape). Verified
+// against this constant's own precedent immediately above: `'write-always'`
+// (macf#926) landed the same way, unbumped. `PlanSummary` gained two new
+// FIELDS (`deletes`/`orphans`, same "counted separately" shape `writeAlways`
+// already established for `summarizePlan`) — additive keys on an
+// already-open `summary` object, the same class of change `install_scope_coverage`'s
+// own top-level addition (two paragraphs up) was unbumped for. STAYS AT 1.
+// A future consumer that DOES start switching exhaustively on `verb` (or
+// asserting `Object.keys(summary)` closed) is the one that should introduce
+// its own version contract, per the SAME rule stated above for `kind`.
 export const FLEET_PLAN_JSON_SCHEMA_VERSION = 1;
 
 export interface PlanSummary {
@@ -2319,6 +2554,23 @@ export interface PlanSummary {
    * meaning "confirmed-or-plausibly missing," not "will be written."
    */
   readonly writeAlways: number;
+  /**
+   * groundnuty/macf#1229 / DR-043 Amendment P3 row 4 — items whose verb is
+   * `'delete'` (a cheap-to-revive resource this tool provisioned and the
+   * manifest no longer wants). Counted separately, same "don't fold a
+   * distinctly-meaning verb into an existing bucket" precedent
+   * `writeAlways` already set — a `delete` is neither a `create` nor an
+   * `update`, and folding it into either would misstate what this plan
+   * calls for.
+   */
+  readonly deletes: number;
+  /**
+   * groundnuty/macf#1229 / DR-043 Amendment P3 row 4 — items whose verb is
+   * `'orphan'` (an expensive-to-revive resource in the same "ours, no
+   * longer wanted" position as `deletes` above, but never actioned by
+   * `apply` — an instruction to the operator, not a statement of intent).
+   */
+  readonly orphans: number;
 }
 
 export function summarizePlan(items: readonly PlanItem[]): PlanSummary {
@@ -2328,6 +2580,8 @@ export function summarizePlan(items: readonly PlanItem[]): PlanSummary {
     noops: items.filter((i) => i.verb === 'noop').length,
     extras: items.filter((i) => i.verb === 'report-extra').length,
     writeAlways: items.filter((i) => i.verb === 'write-always').length,
+    deletes: items.filter((i) => i.verb === 'delete').length,
+    orphans: items.filter((i) => i.verb === 'orphan').length,
   };
 }
 
@@ -2558,11 +2812,20 @@ export function buildPlanRows(items: readonly PlanItem[]): readonly (readonly st
   return items.map((i) => [i.kind, i.target, i.verb.toUpperCase(), i.confirm_required ? 'yes' : 'no', i.reason]);
 }
 
-/** `4 create, 1 update (confirm-required), 3 noop, 1 report-extra (never deleted), 2 write-always (not comparable to observed state)` (groundnuty/macf#926, comment only — the string itself never cites an issue number). */
+/**
+ * `4 create, 1 update (confirm-required), 3 noop, 1 report-extra (never
+ * deleted), 1 delete (confirm-required, not yet actioned by apply), 1
+ * orphan (never actioned by apply), 2 write-always (not comparable to
+ * observed state)` (groundnuty/macf#926, comment only — the string itself
+ * never cites an issue number; `delete`/`orphan` phrasing added
+ * groundnuty/macf#1229, DR-043 Amendment P3 row 4).
+ */
 export function summaryLine(summary: PlanSummary): string {
   return (
     `${String(summary.creates)} create, ${String(summary.updates)} update (confirm-required), ` +
     `${String(summary.noops)} noop, ${String(summary.extras)} report-extra (never deleted), ` +
+    `${String(summary.deletes)} delete (confirm-required, not yet actioned by apply), ` +
+    `${String(summary.orphans)} orphan (never actioned by apply), ` +
     `${String(summary.writeAlways)} write-always (not comparable to observed state)`
   );
 }
@@ -2585,7 +2848,7 @@ export function formatPlanText(plan: FleetPlan): string {
     parts.push(
       '',
       `⚠ apply cannot action ${String(plan.unimplementedByApply.length)} item(s) below yet — approving this plan ` +
-        'will NOT create or update them; they are NOT implemented, this is not "nothing to do":',
+        'will NOT create, update, or delete them; they are NOT implemented, this is not "nothing to do":',
       ...unimplementedLines,
     );
   }
