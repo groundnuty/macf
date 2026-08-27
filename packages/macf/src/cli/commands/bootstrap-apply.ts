@@ -88,6 +88,13 @@ import {
 } from '../bootstrap/apply-routing-secrets.js';
 import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
 import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
+// groundnuty/macf#1272 (DR-043 Amendment P3 execution wiring, operator
+// ruling 2026-08-27) — the delete-verb execution phase. See
+// `apply-delete.ts`'s module doc for the full scope (only `'routing'` is
+// executable this increment; `'secret_fingerprint'` is honestly skipped,
+// never guessed).
+import type { ApplyDeleteDeps, DeletionAction, DeletionOutcome } from '../bootstrap/apply-delete.js';
+import { planDeletionActions, runDeletionPhase, REAL_APPLY_DELETE_DEPS } from '../bootstrap/apply-delete.js';
 import type { FleetVerdict, OrgSecretsListResult, RoutingVerdictPinContext } from '../bootstrap/fleet-verdict.js';
 import {
   determineFleetVerdict,
@@ -333,11 +340,29 @@ export interface BootstrapApplyDeps {
    * actually landed on disk regardless of which path produced it.
    */
   readonly checkAgentCertPresent?: (destDir: string) => boolean;
+  /**
+   * Injectable deletion-phase deps (groundnuty/macf#1272, DR-043 Amendment
+   * P3 execution wiring) — the SAME `ApplyDeleteDeps` shape
+   * `apply-delete.ts::runDeletionPhase` takes. `undefined` (the production
+   * default) resolves to {@link REAL_APPLY_DELETE_DEPS} — a real `gh api ...
+   * --method DELETE` against a repo variable. **Tests that reach the
+   * deletion phase (a `delete`-verb plan item present) MUST override this to
+   * a hermetic fake** — same "tests MUST override" posture `deployDeps`'s
+   * own doc establishes.
+   */
+  readonly deleteDeps?: ApplyDeleteDeps;
 }
 
 /** Extends `apply-fleet.ts`'s `FleetApplyDeps` with the three apply-CLI-level seams: the plan-approval prompt, the prior-lock read, and vault-scratch cleanup. */
 export interface MutateApplyDeps extends FleetApplyDeps {
-  readonly confirmPlan: (plan: FleetPlan, creations: readonly PlannedAppCreation[]) => Promise<boolean>;
+  /**
+   * `deletionActions` (groundnuty/macf#1272) — the SAME pre-computed
+   * {@link DeletionAction}`[]` `runBootstrapApply` also passes to
+   * `runDeletionPhase` after approval, never recomputed here: the approval
+   * text and what actually gets deleted must name the identical set, by
+   * construction, not by convention.
+   */
+  readonly confirmPlan: (plan: FleetPlan, creations: readonly PlannedAppCreation[], deletionActions: readonly DeletionAction[]) => Promise<boolean>;
   readonly readPriorLock: (manifestPath: string) => ReturnType<typeof readFleetLock>;
   /**
    * Cleanup for any vault-derived scratch PEM file(s) `resolveMutateDeps`'s
@@ -922,8 +947,59 @@ function blockingEnterPrompt(promptText: string): Promise<void> {
   });
 }
 
-/** Real y/N prompt on stderr (stdout stays clean for a `--json` render). */
-async function realConfirmPlan(plan: FleetPlan, creations: readonly PlannedAppCreation[]): Promise<boolean> {
+/**
+ * groundnuty/macf#1272 — the enumeration this file's own blocker required: a
+ * `delete`-verb plan item may no longer be summarized only as a count in the
+ * operator's last-read-before-"yes" text — the approval MUST name each one,
+ * by name and class, split into what THIS run will actually delete vs what
+ * was computed but will not be touched (see `apply-delete.ts`'s module doc
+ * for why `'secret_fingerprint'` items are always in the second group this
+ * increment). `'orphan'` items are NEVER in `actions` — the caller derives
+ * `actions` from `plan.items.filter(i => i.verb === 'delete')` only, so this
+ * function never needs to reference the orphan verb literal at all (keeps
+ * `row4-apply-untouched-source-shape.test.ts` green by construction, not by
+ * hand-applied care).
+ */
+export function formatDeletionEnumerationLines(actions: readonly DeletionAction[]): readonly string[] {
+  const executing = actions.filter((a): a is DeletionAction & { executable: true } => a.executable);
+  const skipped = actions.filter((a): a is DeletionAction & { executable: false } => !a.executable);
+  const lines: string[] = [];
+  if (executing.length > 0) {
+    lines.push(`This apply WILL DELETE ${String(executing.length)} resource(s) this run:`);
+    for (const a of executing) {
+      lines.push(`  • ${a.item.kind}: ${a.variableName} on "${a.repo}" (${a.item.target})`);
+    }
+  }
+  if (skipped.length > 0) {
+    lines.push(
+      `${String(skipped.length)} resource(s) were computed for deletion but will NOT be deleted this run ` +
+        '(apply cannot safely resolve where they live):',
+    );
+    for (const a of skipped) {
+      lines.push(`  • ${a.item.kind}: ${a.item.target} — ${a.reason}`);
+    }
+  }
+  return lines;
+}
+
+/**
+ * Pure — the exact banner text `realConfirmPlan` writes to stderr, extracted
+ * so the decisive tests for groundnuty/macf#1272 exercise the SAME function
+ * the real prompt renders (not a hand-assembled fragment that could drift
+ * from what an operator actually sees).
+ *
+ * **The false-premise fix, verbatim per the blocking issue:** the trailing
+ * `Nothing is deleted (§D3 no-prune).` clause is byte-identical to the
+ * pre-#1272 text and appears ONLY when `summary.deletes === 0` — a plan with
+ * zero `delete`-verb items (including one with only `orphan` items, which
+ * removes nothing) still gets the exact same honest sentence it always did.
+ * The moment even ONE `delete`-verb item exists, that clause is REPLACED
+ * (never appended alongside) by {@link formatDeletionEnumerationLines}'s
+ * enumeration — the two are mutually exclusive by construction, so this
+ * function can never emit both "nothing is deleted" and a list of things
+ * being deleted in the same render.
+ */
+export function formatApprovalBanner(plan: FleetPlan, creations: readonly PlannedAppCreation[], deletionActions: readonly DeletionAction[]): string {
   const summary = summarizePlan(plan.items);
   // groundnuty/macf#926 — `write-always` items (labels/runner_warm) are
   // deliberately EXCLUDED from `summary.creates` (a write-always item was
@@ -935,23 +1011,77 @@ async function realConfirmPlan(plan: FleetPlan, creations: readonly PlannedAppCr
   // separately, never folded into "CREATE N," so the count keeps meaning
   // "confirmed-or-plausibly missing."
   const writeAlwaysNote = summary.writeAlways > 0 ? ` (plus ${String(summary.writeAlways)} write-always attempt(s), regardless of whether already present)` : '';
-  process.stderr.write(
+  let headline =
     `\nThis apply will CREATE ${String(summary.creates)} resource(s) (including ${String(creations.length)} GitHub ` +
-      `App(s) — ${String(creations.length * 2)} browser consent click(s): manifest-create + install, per App)${writeAlwaysNote}, ` +
-      `${String(summary.updates)} update(s) requiring confirmation at the point they occur, and leave ` +
-      `${String(summary.noops)} already-present resource(s) untouched. Nothing is deleted (§D3 no-prune).\n`,
-  );
+    `App(s) — ${String(creations.length * 2)} browser consent click(s): manifest-create + install, per App)${writeAlwaysNote}, ` +
+    `${String(summary.updates)} update(s) requiring confirmation at the point they occur, and leave ` +
+    `${String(summary.noops)} already-present resource(s) untouched.`;
+  const lines: string[] = [];
+  if (summary.deletes === 0) {
+    headline += ' Nothing is deleted (§D3 no-prune).';
+    lines.push(headline);
+  } else {
+    lines.push(headline);
+    lines.push(...formatDeletionEnumerationLines(deletionActions));
+  }
   // macf#854 — the plan above already lists the NOT-IMPLEMENTED items loudly
   // (formatPlanText), but this is the LAST thing the operator reads before
   // typing "yes" — restate the count here so approving doesn't read as
   // approving work that will silently never happen.
-  if (plan.unimplementedByApply.length > 0) {
-    process.stderr.write(
-      `⚠ ${String(plan.unimplementedByApply.length)} item(s) in the plan above are NOT IMPLEMENTED by apply yet — ` +
-        'approving will NOT create or update them (see the ⚠ block in the plan above for which).\n',
+  //
+  // groundnuty/macf#1272 — `'routing'`-kind `delete` items are excluded from
+  // this count: `plan.ts`'s `unimplementedReasonFor` still marks EVERY
+  // `delete`-verb item `'not_implemented'` (a plan.ts-side fact this file
+  // cannot change — row 4 is not this file's to correct), but this file DOES
+  // now action `'routing'` deletes (see `formatDeletionEnumerationLines`
+  // above) — leaving them in this count would restate the SAME false-promise
+  // shape the #1272 blocker fixed, just about "not implemented" instead of
+  // "nothing is deleted." `'secret_fingerprint'` items stay counted here —
+  // this file genuinely does not implement them this increment (see
+  // `apply-delete.ts`'s module doc).
+  const stillUnimplemented = plan.unimplementedByApply.filter((u) => !(u.verb === 'delete' && u.kind === 'routing'));
+  if (stillUnimplemented.length > 0) {
+    lines.push(
+      `⚠ ${String(stillUnimplemented.length)} item(s) in the plan above are NOT IMPLEMENTED by apply yet — ` +
+        'approving will NOT create or update them (see the ⚠ block in the plan above for which).',
     );
   }
-  process.stderr.write('Type "yes" to proceed with this plan, anything else to abort: ');
+  lines.push('Type "yes" to proceed with this plan, anything else to abort: ');
+  return lines.join('\n');
+}
+
+/**
+ * groundnuty/macf#1272 — post-run render of what the deletion phase actually
+ * did, never a credential value (a variable NAME + a status, nothing else).
+ * Empty input renders no lines (a fleet with no `delete`-verb items prints
+ * nothing here, same "silent when nothing applies" convention
+ * `installScopeCoverageLines` already uses).
+ */
+export function formatDeletionResultLines(results: readonly DeletionOutcome[]): readonly string[] {
+  if (results.length === 0) return [];
+  const lines: string[] = ['Deletions this run (DR-043 Amendment P3, groundnuty/macf#1272):'];
+  for (const r of results) {
+    const statusText =
+      r.status === 'deleted'
+        ? 'DELETED'
+        : r.status === 'already-absent'
+          ? 'already absent (nothing to delete)'
+          : r.status === 'unknown'
+            ? 'UNKNOWN — could not confirm (auth/network/rate-limit); check by hand'
+            : `NOT deleted — ${r.reason ?? 'no target could be resolved'}`;
+    lines.push(`  • ${r.kind}: ${r.target} — ${statusText}`);
+  }
+  return lines;
+}
+
+/** `--json` render of one deletion outcome — never a credential value. */
+export function deletionOutcomeToJson(r: DeletionOutcome): unknown {
+  return { kind: r.kind, target: r.target, status: r.status, ...(r.reason !== undefined ? { reason: r.reason } : {}) };
+}
+
+/** Real y/N prompt on stderr (stdout stays clean for a `--json` render). */
+async function realConfirmPlan(plan: FleetPlan, creations: readonly PlannedAppCreation[], deletionActions: readonly DeletionAction[]): Promise<boolean> {
+  process.stderr.write(formatApprovalBanner(plan, creations, deletionActions));
   return new Promise((resolve) => {
     const rl = createInterface({ input: process.stdin, output: process.stderr });
     rl.question('', (answer) => {
@@ -3203,8 +3333,16 @@ export async function runBootstrapApply(
       // by `observed` above, threaded so `applyFleet` never re-reads it.
       observedRunnerPlatformEndpointScope: mutateDeps?.observedRunnerPlatformEndpointScope ?? observed.runnerPlatformScopeVariable,
     };
+    // groundnuty/macf#1272 — computed ONCE, BEFORE the approval prompt, and
+    // reused verbatim for execution below. This is the load-bearing property
+    // the issue's own blocker generalizes to: the approval text and what
+    // apply actually deletes must never be able to name different things,
+    // which is only guaranteed if they read the same array, not two
+    // separately-derived ones.
+    const deleteItems = plan.items.filter((i) => i.verb === 'delete');
+    const deletionActions = planDeletionActions(manifest, deleteItems);
     try {
-      const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, finalCreations);
+      const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, finalCreations, deletionActions);
       if (!approved) {
         console.error('Aborted by operator — nothing was created, changed, or submitted.');
         return 1;
@@ -3212,6 +3350,15 @@ export async function runBootstrapApply(
 
       const priorLock = mutate.readPriorLock(manifestPath);
       const result = await applyFleet(manifest, manifestPath, priorLock, mutate);
+
+      // groundnuty/macf#1272 (DR-043 Amendment P3 execution wiring) — runs
+      // right after the GitHub phase above (`applyFleet`), on the SAME
+      // `deletionActions` the approval banner already named. Only a
+      // `'routing'`-kind action is ever `executable` this increment (see
+      // `apply-delete.ts`'s module doc); every other action reports
+      // `'skipped'` with its reason — never silently dropped, never guessed.
+      const deletionResults: readonly DeletionOutcome[] =
+        deletionActions.length > 0 ? await runDeletionPhase(deletionActions, resolved.deleteDeps ?? REAL_APPLY_DELETE_DEPS) : [];
 
       // macf#1014 — computed AFTER applyFleet (so a fresh `created` agent's
       // just-materialized workspace, if any, is reflected too) but
@@ -3495,6 +3642,14 @@ export async function runBootstrapApply(
               ...(Object.keys(installScopeCoverage).length > 0
                 ? { install_scope_coverage: Object.values(installScopeCoverage).map(installScopeCoverageEntryToJson) }
                 : {}),
+              // groundnuty/macf#1272 — additive top-level key, same
+              // unbumped precedent `install_scope_coverage` above already
+              // set (#1220): a brand-new name, no existing field's shape or
+              // meaning changes, so `FLEET_APPLY_JSON_SCHEMA_VERSION` stays
+              // put. Omitted entirely (not an empty array) when this run had
+              // no `delete`-verb items — a fleet with nothing to report here
+              // renders byte-identically to a pre-#1272 apply.
+              ...(deletionResults.length > 0 ? { deletions: deletionResults.map(deletionOutcomeToJson) } : {}),
             },
             null,
             2,
@@ -3542,6 +3697,16 @@ export async function runBootstrapApply(
               : 'Install-scope coverage (unable to confirm this run):',
           );
           console.log(installScopeCoverageLines.join('\n'));
+        }
+        // groundnuty/macf#1272 — printed last, same "never buried" posture
+        // `installScopeCoverageLines` above already establishes. Silent
+        // (`formatDeletionResultLines` returns `[]`) when this run had no
+        // `delete`-verb items — a fleet with nothing to report here prints
+        // nothing here, same as before #1272.
+        const deletionResultLines = formatDeletionResultLines(deletionResults);
+        if (deletionResultLines.length > 0) {
+          console.log('');
+          console.log(deletionResultLines.join('\n'));
         }
       }
       return applyExitCode(result, deployResults, versionResult);
