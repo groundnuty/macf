@@ -72,6 +72,21 @@ const OBSERVED_ROUTING_DRIFT: ObservedState = { ...EMPTY_OBSERVED, routingTruste
 /** groundnuty/macf#1197 — same fixture as {@link VALID_FLEET_YAML}, `transport.tailscale_oauth_required: true` declared. Used ONLY by the operator-inputs-provenance describe block below. */
 const VALID_FLEET_YAML_WITH_TAILSCALE = VALID_FLEET_YAML.replace('age_recipients: []', 'age_recipients: []\n  tailscale_oauth_required: true');
 
+/**
+ * groundnuty/macf#1279 — same fixture as {@link VALID_FLEET_YAML} but with a
+ * `registry: { type: org }` (never a router-App target, per
+ * `apply-router-app.ts::routerAppInstallRepos`'s doc: empty for
+ * `registry.type: org|local`) and no `routing:` declared (never a
+ * runner-ops target either, per `runnerOpsNeeded`). Zero
+ * `installScopeCoverageTargets` — used ONLY by the "nothing to check"
+ * test below, to prove the unconditional call still makes ZERO I/O and
+ * renders NO notice for a fleet with no fleet-level App at all.
+ */
+const VALID_FLEET_YAML_NO_FLEET_APPS = VALID_FLEET_YAML.replace(
+  'registry: { type: profile, user: groundnuty }',
+  'registry: { type: org, org: groundnuty-org }',
+);
+
 describe('runBootstrapPlan', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
   let errSpy: ReturnType<typeof vi.spyOn>;
@@ -100,7 +115,10 @@ describe('runBootstrapPlan', () => {
     const printed = logSpy.mock.calls.flat().join('');
     expect(printed.length).toBeGreaterThan(0);
     const json = JSON.parse(printed) as { schema_version: number; error: { code: string; message: string } };
-    expect(json.schema_version).toBe(1);
+    // groundnuty/macf#1279 bumped FLEET_PLAN_JSON_SCHEMA_VERSION 1 -> 2 (the
+    // failure envelope shares the SAME constant as the success envelope —
+    // see fleetPlanFailureToJson's own doc).
+    expect(json.schema_version).toBe(2);
     expect(json.error.code).toBe('manifest_not_found');
   });
 
@@ -148,7 +166,8 @@ describe('runBootstrapPlan', () => {
       skipped_sections: ReadonlyArray<{ section: string; reason: string }>;
       unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
     };
-    expect(json.schema_version).toBe(1);
+    // groundnuty/macf#1279 bumped FLEET_PLAN_JSON_SCHEMA_VERSION 1 -> 2.
+    expect(json.schema_version).toBe(2);
     expect(json.fleet).toBe('icsoc-2026');
     expect(json.plan.length).toBeGreaterThan(0);
     expect(json.summary.creates).toBeGreaterThan(0);
@@ -318,7 +337,13 @@ describe('runBootstrapPlan', () => {
   // the honest-unknown-BEFORE-any-network-I/O floor, not the decisive
   // drift/covered pair (that pair is `install-scope-coverage.test.ts`'s
   // job against the pure function directly) — here the point is only "the
-  // CLI wiring reaches it and doesn't crash or silently drop it."
+  // CLI wiring reaches it and doesn't crash or silently drop it." Also half
+  // of groundnuty/macf#1279's decisive pair: flags present -> `plan`'s
+  // `install_scope_coverage` behaves EXACTLY as before that fix
+  // (byte-identical AC) — the `message` assertion at the bottom pins that
+  // this is NOT the new "not checked this run" wording (mirrors
+  // `bootstrap-apply.test.ts`'s sibling test for the SAME decisive pair,
+  // PR #1276).
   it('--vault + --identity-key: `install_scope_coverage` is populated (unknown, for a nonexistent vault) — never silently omitted once the flags are given', async () => {
     const { dir, file } = writeManifest(VALID_FLEET_YAML);
     dirs.push(dir);
@@ -338,17 +363,86 @@ describe('runBootstrapPlan', () => {
     expect(json.install_scope_coverage).toHaveLength(1);
     expect(json.install_scope_coverage?.[0]?.status).toBe('unknown');
     expect(json.install_scope_coverage?.[0]?.message).toContain('vault could not be read');
+    // NOT the groundnuty/macf#1279 "no --vault/--identity-key given" wording
+    // — this run gave both flags, so the ONLY reason it's still 'unknown'
+    // is the (deliberately) nonexistent vault path.
+    expect(json.install_scope_coverage?.[0]?.message).not.toContain('no --vault/--identity-key given');
   });
 
-  it('WITHOUT --vault/--identity-key, `install_scope_coverage` is omitted entirely (not a noisy wall of "unknown" on the common vault-free run)', async () => {
+  // groundnuty/macf#1279 — the defect: this call site used to short-circuit
+  // to `{}` whenever EITHER flag was missing, discarding
+  // `computeInstallScopeCoverage`'s own honest-unknown output regardless of
+  // whether the fleet had anything to check. `VALID_FLEET_YAML`'s router
+  // App target (see the sibling test above) means there IS something to
+  // check here, so post-fix this must be POPULATED — the opposite of the
+  // old test name. Other half of the decisive pair (per
+  // `assert-the-wrong-path.md`): (1) alone (this test) would be satisfied
+  // by an implementation that ALWAYS prints the notice regardless of the
+  // flags — the sibling "byte-identical when flags present" test above is
+  // what rules that out. Same wording `#1276` uses for the identical `apply`
+  // fix, so the two surfaces do not drift apart.
+  it('WITHOUT --vault/--identity-key, `install_scope_coverage` states the check was NOT run and names the flags to supply — --json', async () => {
     const { dir, file } = writeManifest(VALID_FLEET_YAML);
     dirs.push(dir);
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const deps: BootstrapPlanDeps = { observe: async () => EMPTY_OBSERVED };
     const code = await runBootstrapPlan({ file, json: true }, deps);
     expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      install_scope_coverage?: ReadonlyArray<{ role: string; status: string; message?: string }>;
+      plan: ReadonlyArray<{ kind: string }>;
+    };
+    expect(json.install_scope_coverage).toHaveLength(1);
+    expect(json.install_scope_coverage?.[0]?.status).toBe('unknown');
+    expect(json.install_scope_coverage?.[0]?.message).toContain('--vault');
+    expect(json.install_scope_coverage?.[0]?.message).toContain('--identity-key');
+    expect(json.install_scope_coverage?.[0]?.message).toContain('not checked this run');
+    // `unknown` must never render as a `PlanItem` verb (`installScopeCoverageItem`
+    // returns `undefined` for `'unknown'` — see its own doc). Regression
+    // guard: an `'unknown'` entry silently becoming a fabricated verb would
+    // be a WORSE bug than the one this issue fixes.
+    expect(json.plan.some((i) => i.kind === 'install_scope')).toBe(false);
+  });
+
+  // groundnuty/macf#1279 — the SAME notice, non-`--json` render. `plan`'s
+  // JSON path and text path both read from the SAME `installScopeCoverage`
+  // value (`commands/bootstrap.ts`'s single call site) via
+  // `formatInstallScopeCoverageLines`, so this pins that the human-readable
+  // surface never drifts from the `--json` one.
+  it('WITHOUT --vault/--identity-key, the SAME notice reaches the human (non-`--json`) render, naming both flags', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const deps: BootstrapPlanDeps = { observe: async () => EMPTY_OBSERVED };
+    const code = await runBootstrapPlan({ file }, deps);
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('install-scope coverage was not checked this run');
+    expect(out).toContain('--vault');
+    expect(out).toContain('--identity-key');
+  });
+
+  // groundnuty/macf#1279 — the OTHER honest-silent case: a fleet that
+  // declares NO fleet-level App at all (`registry.type: org`, no
+  // `routing.runner`) makes `installScopeCoverageTargets` return ZERO
+  // targets, so `computeInstallScopeCoverage` returns `{}` with ZERO I/O
+  // even though it is now called unconditionally — "unconditional call"
+  // must not mean "unconditional noise." Both `--json` and text stay silent
+  // on this surface, same as a fleet with nothing to report today.
+  it('a manifest declaring NO fleet-level App: `install_scope_coverage` stays silent — unconditional call is not unconditional noise', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML_NO_FLEET_APPS);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const deps: BootstrapPlanDeps = { observe: async () => EMPTY_OBSERVED };
+    const jsonCode = await runBootstrapPlan({ file, json: true }, deps);
+    expect(jsonCode).toBe(0);
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as Record<string, unknown>;
     expect('install_scope_coverage' in json).toBe(false);
+    logSpy.mockClear();
+    const textCode = await runBootstrapPlan({ file }, deps);
+    expect(textCode).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).not.toContain('install-scope-coverage');
   });
 
   it('--vault WITHOUT --identity-key: refused loud (vault_flags_incomplete), never silently vault-free', async () => {
