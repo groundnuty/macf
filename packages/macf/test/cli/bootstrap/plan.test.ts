@@ -25,10 +25,12 @@ import {
   summarizePlan,
   UNKNOWN_REASONS,
   type InstallScopeDrift,
+  type ObservedAgentState,
   type ObservedState,
   type PlanItem,
   type PlanItemKind,
   type PlanVerb,
+  type Presence,
 } from '../../../src/cli/bootstrap/plan.js';
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../../src/cli/bootstrap/apply-routing.js';
 import { TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_FLAG } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
@@ -36,6 +38,8 @@ import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../../src/cli/bootstrap/re
 import { validateInstallRepositoryScope } from '../../../src/cli/bootstrap/install-scope.js';
 import type { RunnerPlatformEndpointSource } from '../../../src/cli/bootstrap/runner-platform.js';
 import { installScopeCoverageDriftMessage, type InstallScopeCoverageEntry } from '../../../src/cli/bootstrap/install-scope-coverage.js';
+import { RUNNER_OPS_ROLE } from '../../../src/cli/bootstrap/apply-runner-ops.js';
+import { ROUTER_APP_ROLE } from '../../../src/cli/bootstrap/apply-router-app.js';
 
 /** A minimal, valid, 2-agent manifest — no optional sections. */
 function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
@@ -567,7 +571,12 @@ describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#
   });
 
   it('APPLY_UNIMPLEMENTED_REASONS no longer carries a runnerWarm entry (groundnuty/macf#943 — the gap it described is closed)', () => {
-    expect(Object.keys(APPLY_UNIMPLEMENTED_REASONS)).toEqual(['routing']);
+    // groundnuty/macf#1229 / DR-043 Amendment P3 row 4 — `rowFourDelete`
+    // joined this constant as the ONE shared reason for every kind that can
+    // now carry a `delete` verb (see `unimplementedReasonFor`'s doc: a
+    // verb-level fact, checked before the per-kind switch this test's own
+    // describe block otherwise exercises).
+    expect(Object.keys(APPLY_UNIMPLEMENTED_REASONS)).toEqual(['routing', 'rowFourDelete']);
   });
 
   it('is present in EVERY plan that declares routing.runner — a fleet-level item, not per-agent', () => {
@@ -667,7 +676,7 @@ describe('computePlan — runner_platform item (groundnuty/macf#1211)', () => {
   });
 });
 
-describe('computePlan — an observed extra agent → report-extra, NEVER delete', () => {
+describe('computePlan — an observed extra agent NOT in fleet.lock → report-extra, NEVER delete/orphan (row 5 of the matrix; row 4 has its own describe block below)', () => {
   it('emits a report-extra item for an agent in observed but not in the manifest', () => {
     const manifest = baseManifest(); // science-agent + code-agent only
     const observed: ObservedState = {
@@ -687,11 +696,21 @@ describe('computePlan — an observed extra agent → report-extra, NEVER delete
     expect(extra?.confirm_required).toBe(false);
   });
 
-  it('NO verb in the whole PlanVerb union is "delete" or "prune" — the type + every emitted item enforce it', () => {
+  // groundnuty/macf#1229 / DR-043 Amendment P3 — decisive pair, HALF 2:
+  // "undeclared + present + NOT in the lock → report-extra, and NOTHING
+  // ELSE." Retitled from the pre-#1229 claim ("no verb in the whole
+  // PlanVerb union is delete") which is now false AT THE TYPE LEVEL —
+  // `PlanVerb` DOES include `'delete'`/`'orphan'` since this change. What
+  // stays true, and is what this test actually pins, is narrower and
+  // still load-bearing: THIS fixture (`lock: null`) never produces either
+  // verb, because the role isn't recorded as ours. `'prune'` was never a
+  // real member of the union — that assertion stays meaningful as a
+  // "this string never sneaks in under a different name" guard.
+  it('an extra role with NO fleet.lock produces report-extra and NOTHING else — no delete, no orphan, no prune', () => {
     const manifest = baseManifest();
     const observed: ObservedState = {
       lock: null,
-      agents: { 'orphan-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} } },
+      agents: { 'orphan-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' } } },
       caRegistry: 'unknown',
       caRepos: {},
       controlRepoPresence: 'absent',
@@ -701,7 +720,13 @@ describe('computePlan — an observed extra agent → report-extra, NEVER delete
     for (const v of verbsSeen) {
       expect(['create', 'update', 'noop', 'report-extra', 'write-always']).toContain(v);
     }
-    expect(plan.items.some((i) => (i.verb as string) === 'delete')).toBe(false);
+    // The decisive assertion: not just "no item happens to be delete", but
+    // ZERO delete/orphan items exist anywhere in this plan — asserting on
+    // `verb === 'report-extra'` alone (as the pre-#1229 version of this
+    // test did) would still pass if a mutated row-4 gate added orphan/delete
+    // items ALONGSIDE the report-extra one; this is the assertion the
+    // mutation check below actually depends on.
+    expect(plan.items.filter((i) => i.verb === 'delete' || i.verb === 'orphan')).toEqual([]);
     expect(plan.items.some((i) => (i.verb as string) === 'prune')).toBe(false);
   });
 
@@ -720,6 +745,228 @@ describe('computePlan — an observed extra agent → report-extra, NEVER delete
     const plan = computePlan(manifest, observed);
     const extras = plan.items.filter((i) => i.kind === 'agent').map((i) => i.target);
     expect(extras).toEqual(['agent:aaa-agent', 'agent:zzz-agent']);
+  });
+});
+
+// --- Row 4 (DR-043 Amendment P3, groundnuty/macf#1229) — negative diff for
+// undeclared-but-locked resources -------------------------------------------
+
+/** A role observed present with App/repo/one secret — the shared shape row-4 fixtures below vary `lock` against. */
+function extraRoleObserved(role: string): Readonly<Record<string, ObservedAgentState>> {
+  return { [role]: { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' } } };
+}
+
+function lockWithRole(role: string): FleetLock {
+  return { schema_version: 1, fleet: 'icsoc-2026', agents: [{ role, app_id: 'a', install_id: 'i' }] };
+}
+
+describe('computePlan — row 4 (DR-043 Amendment P3, groundnuty/macf#1229): negative diff for undeclared-but-locked resources', () => {
+  // groundnuty/macf#1229 — decisive pair, HALF 1: "undeclared + present + IN
+  // the lock → delete/orphan per class, naming the resource." (HALF 2 —
+  // "NOT in the lock → report-extra, and nothing else" — is the retitled
+  // test in the describe block immediately above this one.)
+  it('an extra role recorded in fleet.lock decomposes into per-class orphan/delete items, each naming the resource', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: lockWithRole('dropped-agent'),
+      agents: extraRoleObserved('dropped-agent'),
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+
+    // No coarse whole-agent 'agent'/'report-extra' item — it decomposed.
+    expect(plan.items.find((i) => i.kind === 'agent' && i.target === 'agent:dropped-agent')).toBeUndefined();
+
+    const appItem = plan.items.find((i) => i.kind === 'app' && i.target === 'agent:dropped-agent:app');
+    expect(appItem?.verb).toBe('orphan');
+    expect(appItem?.reason).toContain('dropped-agent');
+    expect(appItem?.confirm_required).toBe(false);
+
+    const repoItem = plan.items.find((i) => i.kind === 'repo' && i.target === 'agent:dropped-agent:repo');
+    expect(repoItem?.verb).toBe('orphan');
+    expect(repoItem?.reason).toContain('dropped-agent');
+
+    const secretItem = plan.items.find((i) => i.kind === 'secret_fingerprint' && i.target === 'agent:dropped-agent:secret_fingerprint:app_private_key');
+    expect(secretItem?.verb).toBe('delete');
+    expect(secretItem?.reason).toContain('app_private_key');
+    expect(secretItem?.confirm_required).toBe(true);
+  });
+
+  // Table-driven: each resource class maps to its Amendment-G-revival-cost
+  // ratified verb (Amendment P3's table). Isolates ONE class at a time by
+  // only marking that ONE observed field 'present'.
+  it.each<{ label: string; obs: Partial<{ app: Presence; repo: Presence }>; fingerprints?: Readonly<Record<string, string>>; kind: string; verb: 'delete' | 'orphan' }>([
+    { label: 'App (identity)', obs: { app: 'present' }, kind: 'app', verb: 'orphan' },
+    { label: 'repo', obs: { repo: 'present' }, kind: 'repo', verb: 'orphan' },
+    { label: 'secret (fingerprint)', obs: {}, fingerprints: { webhook_secret: 'sha256:y' }, kind: 'secret_fingerprint', verb: 'delete' },
+  ])('$label maps to verb "$verb"', ({ obs, fingerprints, kind, verb }) => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: lockWithRole('classy-agent'),
+      agents: {
+        'classy-agent': { app: 'absent', install: 'unknown', repo: 'absent', fingerprints: fingerprints ?? {}, ...obs },
+      },
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+    const matches = plan.items.filter((i) => i.kind === kind && i.target.startsWith('agent:classy-agent:'));
+    expect(matches.length).toBeGreaterThan(0);
+    for (const m of matches) expect(m.verb).toBe(verb);
+  });
+
+  it('live presence unconfirmable ("unknown") → neither delete nor orphan — the honest-unknown floor (Amendment A)', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: lockWithRole('unsure-agent'),
+      agents: { 'unsure-agent': { app: 'unknown', install: 'unknown', repo: 'unknown', fingerprints: {} } },
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.items.some((i) => i.target.startsWith('agent:unsure-agent:'))).toBe(false);
+  });
+
+  it('a declared resource is untouched by row 4 — the extraRoles computation only ever considers roles NOT in the manifest', () => {
+    const manifest = baseManifest(); // declares 'science-agent' + 'code-agent'
+    const observed: ObservedState = {
+      // 'science-agent' recorded in the lock — if row 4 mistakenly ran
+      // against DECLARED roles too, this would misfire an orphan/delete for
+      // an agent the manifest still wants.
+      lock: lockWithRole('science-agent'),
+      agents: {
+        'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' } },
+        'code-agent': { app: 'absent', install: 'absent', repo: 'absent', fingerprints: {} },
+      },
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.items.some((i) => i.verb === 'delete' || i.verb === 'orphan')).toBe(false);
+  });
+
+  // groundnuty/macf#1229 — fleet-level pseudo-roles (`runner-ops`/`router`)
+  // live in `fleet.lock.agents` by design (their own dedicated plan items,
+  // `runnerOpsItem`/`routerAppItem`, check lock membership the SAME way).
+  // They must never be treated as "extra agent" roles even when a caller's
+  // `observed.agents` map (hypothetically, since the real observer never
+  // does this) happens to carry a matching key.
+  it.each([RUNNER_OPS_ROLE, ROUTER_APP_ROLE])('fleet-level pseudo-role "%s" is excluded from row 4 even when locked and observed', (role) => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: lockWithRole(role),
+      agents: extraRoleObserved(role),
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.items.some((i) => i.target.startsWith(`agent:${role}:`))).toBe(false);
+    expect(plan.items.some((i) => i.kind === 'agent' && i.target === `agent:${role}`)).toBe(false);
+  });
+
+  // --- Mutation check: break the lock-membership gate, name what fails ---
+  //
+  // Per this task's own instruction: simulate removing the `lockRoles.has(role)`
+  // guard (treat every extra role as "ours") and confirm a SPECIFIC test
+  // fails. Rather than hand-editing plan.ts, this test constructs the
+  // UNSAFE-DIRECTION input the guard exists to reject (`lock: null` — no
+  // lock at all) and proves today's code does NOT decompose it. The
+  // sibling test above ("an extra role with NO fleet.lock produces
+  // report-extra and NOTHING else") is the one that would fail if the gate
+  // were removed (i.e. `if (!lockRoles.has(role))` deleted, or replaced
+  // with `if (false)`), because ALL extra roles would then decompose
+  // regardless of lock state.
+  it('MUTATION-CHECK TARGET: with the lock gate intact, an extra role with `lock: null` never decomposes (deleting the `if (!lockRoles.has(role))` branch in plan.ts would make this — and "an extra role with NO fleet.lock produces report-extra and NOTHING else" above — fail)', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: null,
+      agents: extraRoleObserved('unrecorded-agent'),
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.items.some((i) => i.verb === 'delete' || i.verb === 'orphan')).toBe(false);
+    expect(plan.items.find((i) => i.kind === 'agent' && i.target === 'agent:unrecorded-agent')?.verb).toBe('report-extra');
+  });
+
+  it('orphan is ALWAYS planItemApplyCoverage "implemented" — apply correctly does nothing, never a reported gap', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: lockWithRole('gone-agent'),
+      agents: extraRoleObserved('gone-agent'),
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+    const orphanItems = plan.items.filter((i) => i.verb === 'orphan');
+    expect(orphanItems.length).toBeGreaterThan(0);
+    for (const item of orphanItems) {
+      expect(planItemApplyCoverage(item)).toBe('implemented');
+    }
+    // And 'delete' items DO surface as not_implemented — the deliberate
+    // "computation only, apply is unwired" contract for THIS change.
+    const deleteItems = plan.items.filter((i) => i.verb === 'delete');
+    expect(deleteItems.length).toBeGreaterThan(0);
+    for (const item of deleteItems) {
+      expect(planItemApplyCoverage(item)).toBe('not_implemented');
+    }
+    expect(plan.unimplementedByApply.some((i) => i.verb === 'delete')).toBe(true);
+    expect(plan.unimplementedByApply.some((i) => i.verb === 'orphan')).toBe(false);
+  });
+});
+
+describe('computePlan — row 4, the MACF_TRUSTED_ACTORS worked example (groundnuty/macf#1229 original motivating case): routing.runner DROPPED from the manifest', () => {
+  it('emits a delete item when the variable is observed present AND the representative role is recorded in fleet.lock', () => {
+    const manifest = baseManifest(); // routing.runner NOT declared
+    const observed: ObservedState = {
+      lock: lockWithRole('science-agent'), // manifest.agents[0].role
+      agents: {},
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+      routingTrustedActors: 'icsoc-2026-science-agent[bot],icsoc-2026-code-agent[bot]',
+    };
+    const plan = computePlan(manifest, observed);
+    const item = plan.items.find((i) => i.kind === 'routing');
+    expect(item?.verb).toBe('delete');
+    expect(item?.confirm_required).toBe(true);
+    expect(item?.reason).toContain('MACF_TRUSTED_ACTORS');
+  });
+
+  it('emits NOTHING when the representative role is NOT recorded in fleet.lock — not ours to judge (the same row-4 safety property)', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: null,
+      agents: {},
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+      routingTrustedActors: 'icsoc-2026-science-agent[bot],icsoc-2026-code-agent[bot]',
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.items.some((i) => i.kind === 'routing')).toBe(false);
+  });
+
+  it('emits NOTHING when the variable presence is unconfirmed ("undefined") — honest-unknown floor, even with a matching lock entry', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: lockWithRole('science-agent'),
+      agents: {},
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+      // routingTrustedActors deliberately omitted — undefined.
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.items.some((i) => i.kind === 'routing')).toBe(false);
   });
 });
 
@@ -847,7 +1094,11 @@ describe('summarizePlan', () => {
     // (groundnuty/macf#1211 — runs_on is self-hosted here) are
     // `'write-always'`, NOT `'create'` (groundnuty/macf#926 — see
     // `plan-item-write-always.test.ts`), so they count separately: 4.
-    expect(summary).toEqual({ creates: 16, updates: 1, noops: 0, extras: 0, writeAlways: 4 });
+    // `deletes`/`orphans` (groundnuty/macf#1229, DR-043 Amendment P3 row 4)
+    // are 0 here — this fixture declares no `fleet.lock` at all
+    // (`EMPTY_OBSERVED.lock` is `null`), so row 4 never fires (the whole
+    // safety property: not-in-the-lock stays untouched).
+    expect(summary).toEqual({ creates: 16, updates: 1, noops: 0, extras: 0, writeAlways: 4, deletes: 0, orphans: 0 });
   });
 });
 
