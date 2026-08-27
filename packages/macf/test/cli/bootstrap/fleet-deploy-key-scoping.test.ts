@@ -38,6 +38,26 @@
  * `defaultAgentKeyPath`/`legacyAgentKeyPath` themselves — building the
  * expectation with the same helper that produces the value under test
  * would make the assertion unable to fail.
+ *
+ * **macf#1214 update: an `<owner>` segment now sits ABOVE the fleet segment**
+ * (`~/.macf/keys/<owner>/<fleet>/<role>.pem`) — a fleet's `<fleet>/<role>`
+ * identity alone is not globally unique, since one host commonly serves
+ * fleets from different GitHub owners. `manifestFor` below fixes
+ * `owner.account` at `'groundnuty'`, so every literal expected path here
+ * gained that one extra segment; the FLEET-scoping behavior these four
+ * tests exist to pin is otherwise unchanged (still exercised one level
+ * further down the tree). The one test whose SEMANTICS — not just its
+ * literal path — changed is "a fingerprint mismatch AT the conventional
+ * path still refuses loud": the location it used to call "conventional"
+ * (`~/.macf/keys/<fleet>/<role>.pem`, no owner) is now merely the pre-#1214
+ * LEGACY tier, so a stale/mismatching file sitting there is no longer this
+ * fleet's problem to refuse over — it's ignored exactly like any other
+ * non-matching legacy candidate, and the fleet materializes fresh at its
+ * OWN owner-scoped path instead. The refusal-on-mismatch guarantee still
+ * holds, just at the location that is now actually conventional; the test
+ * was re-targeted accordingly rather than dropped. See
+ * `fleet-deploy-owner-scoping.test.ts` (macf#1214) for the sibling file
+ * dedicated to the owner-scoping decisive pair itself.
  */
 import { describe, it, expect, afterEach, afterAll, vi } from 'vitest';
 import { generateKeyPairSync } from 'node:crypto';
@@ -115,6 +135,10 @@ const PEM_2 = genRsaPemPkcs1();
 
 const ROLE = 'code-agent';
 const AGENT: FleetAgent = { role: ROLE, profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/unused-in-tests' };
+// The owner account every `manifestFor` fixture below fixes (macf#1214) —
+// pulled out as a named constant so the literal expected paths read as
+// "owner segment, then fleet segment" rather than a bare repeated string.
+const OWNER = 'groundnuty';
 
 function manifestFor(fleetName: string): FleetManifest {
   return {
@@ -174,8 +198,8 @@ describe('macf#1157 — deployAgent default key-path resolution is fleet-scoped'
     // Literal expected paths (assert-the-wrong-path.md trigger 1: never
     // built via defaultAgentKeyPath itself, or this assertion could not
     // fail against the pre-fix bare-role implementation).
-    const expectedPathA = join(FAKE_HOME, '.macf', 'keys', fleetA, `${ROLE}.pem`);
-    const expectedPathB = join(FAKE_HOME, '.macf', 'keys', fleetB, `${ROLE}.pem`);
+    const expectedPathA = join(FAKE_HOME, '.macf', 'keys', OWNER, fleetA, `${ROLE}.pem`);
+    const expectedPathB = join(FAKE_HOME, '.macf', 'keys', OWNER, fleetB, `${ROLE}.pem`);
     expect(outcomeA.keyPath).toBe(expectedPathA);
     expect(outcomeB.keyPath).toBe(expectedPathB);
     expect(outcomeA.keyPath).not.toBe(outcomeB.keyPath);
@@ -216,9 +240,9 @@ describe('macf#1157 — deployAgent default key-path resolution is fleet-scoped'
     expect(outcome.keyWrite).toBe('skipped-existing');
     expect(readFileSync(legacyPath, 'utf-8')).toBe(pemLegacy);
 
-    // The fleet-scoped conventional path was never even created — "read
-    // old" does not imply "also write new."
-    const conventionalPath = join(FAKE_HOME, '.macf', 'keys', fleetC, `${legacyRole}.pem`);
+    // The owner+fleet-scoped conventional path was never even created —
+    // "read old" does not imply "also write new."
+    const conventionalPath = join(FAKE_HOME, '.macf', 'keys', OWNER, fleetC, `${legacyRole}.pem`);
     expect(existsSync(conventionalPath)).toBe(false);
   });
 
@@ -247,7 +271,7 @@ describe('macf#1157 — deployAgent default key-path resolution is fleet-scoped'
     expect(outcome.status).toBe('deployed');
     if (outcome.status !== 'deployed') throw new Error('unreachable');
 
-    const conventionalPath = join(FAKE_HOME, '.macf', 'keys', fleetD, `${sharedRole}.pem`);
+    const conventionalPath = join(FAKE_HOME, '.macf', 'keys', OWNER, fleetD, `${sharedRole}.pem`);
     expect(outcome.keyPath).toBe(conventionalPath);
     expect(outcome.keyWrite).toBe('written');
     expect(readFileSync(conventionalPath, 'utf-8')).toBe(pemThisFleet);
@@ -255,13 +279,18 @@ describe('macf#1157 — deployAgent default key-path resolution is fleet-scoped'
     expect(readFileSync(legacyPath, 'utf-8')).toBe(pemOtherFleet);
   });
 
-  it('a fingerprint mismatch AT the fleet-scoped conventional path still refuses loud — fingerprints named, no key material leaked, unchanged strength', async () => {
+  it('a fingerprint mismatch AT the owner+fleet-scoped conventional path still refuses loud — fingerprints named, no key material leaked, unchanged strength', async () => {
     const fleetE = `fleet-e-${Date.now()}`;
     const pemStale = PEM_1; // e.g. left over from a destroyed-and-rebuilt fleet of the SAME name
     const pemVault = PEM_2; // the CURRENT vault's real key — deliberately different
 
-    const conventionalPath = join(FAKE_HOME, '.macf', 'keys', fleetE, `${ROLE}.pem`);
-    mkdirSync(join(FAKE_HOME, '.macf', 'keys', fleetE), { recursive: true });
+    // macf#1214: seeded at the TRUE conventional path (owner+fleet+role).
+    // Seeding at the pre-#1214 fleet-only path here would exercise the
+    // legacy-tier "ignored, not refused" branch instead (see
+    // `fleet-deploy-owner-scoping.test.ts` for that scenario) — this test
+    // is specifically about a mismatch AT the CURRENT conventional path.
+    const conventionalPath = join(FAKE_HOME, '.macf', 'keys', OWNER, fleetE, `${ROLE}.pem`);
+    mkdirSync(join(FAKE_HOME, '.macf', 'keys', OWNER, fleetE), { recursive: true });
     writeFileSync(conventionalPath, pemStale, { mode: 0o600 });
 
     const outcome = await deployAgent(AGENT, manifestFor(fleetE), scratchDir(), { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' }, {

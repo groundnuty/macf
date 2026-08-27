@@ -82,7 +82,7 @@ import type { VaultReadOptions } from './vault-read.js';
 import { queryVaultAgentPresence, queryVaultCaPresence } from './vault-read.js';
 import { secretFingerprint } from './fleet-lock.js';
 import type { InitOptions } from '../commands/init.js';
-import { defaultAgentKeyPath, legacyAgentKeyPath } from '../commands/init.js';
+import { defaultAgentKeyPath, legacyAgentKeyPath, legacyProjectAgentKeyPath } from '../commands/init.js';
 import { caCertPath, caKeyPath, agentCertPath, agentKeyPath } from '../config.js';
 
 const execFileAsync = promisify(execFile);
@@ -781,13 +781,15 @@ export interface FleetDeployDeps {
   readonly mintCloneToken: (source: TokenSource) => Promise<string>;
   /**
    * Resolves the destination App-key path for a role. Defaults to
-   * {@link resolveDefaultKeyPath} — the fleet-scoped conventional
-   * `~/.macf/keys/<fleet>/<role>.pem` (macf#1157; matches
-   * `bootstrap-emit-commands.sh`'s emitted `--app-key` path AND
-   * `initAgent`'s own internal default when `--key-path` is omitted — see
-   * `commands/init.ts::ingestAndResolveKeyPath`), falling back to the
-   * pre-#1157 flat `~/.macf/keys/<role>.pem` ONLY when a key already lives
-   * there AND its fingerprint matches this role's vault entry (see
+   * {@link resolveDefaultKeyPath} — the owner+fleet-scoped conventional
+   * `~/.macf/keys/<owner>/<fleet>/<role>.pem` (macf#1157 fleet-scoping;
+   * macf#1214 added the `<owner>` segment — matches `initAgent`'s own
+   * internal default when `--key-path` is omitted, see
+   * `commands/init.ts::ingestAndResolveKeyPath`), falling back through TWO
+   * older-generation candidates — the pre-#1214 fleet-scoped, owner-less
+   * `~/.macf/keys/<fleet>/<role>.pem`, then the pre-#1157 flat
+   * `~/.macf/keys/<role>.pem` — ONLY when a key already lives at that tier
+   * AND its fingerprint matches this role's vault entry (see
    * {@link resolveDefaultKeyPath}'s own doc for the full "read-old-write-new"
    * rule). **Tests MUST override this to a scratch directory** — the
    * default resolves under the REAL operator's home directory, which may
@@ -1011,28 +1013,44 @@ function detectKeyStatus(role: string, keyPath: string, vaultPem: string): KeyDe
 
 /**
  * Resolve the DEFAULT (no `deps.keyPathFor` override) on-disk App-key path
- * for a role, applying the macf#1157 "read-old-write-new" back-compat rule.
+ * for a role, applying the macf#1157 / macf#1214 "read-old-write-new"
+ * back-compat rule, now TWO legacy tiers deep.
  *
- * The fleet-scoped conventional path ({@link defaultAgentKeyPath} —
- * `~/.macf/keys/<fleet>/<role>.pem`) wins whenever anything already lives
- * there. Otherwise, a pre-#1157 FLAT legacy key
- * ({@link legacyAgentKeyPath} — `~/.macf/keys/<role>.pem`, no fleet
- * segment) is reused IN PLACE when — and only when — its fingerprint
- * matches THIS role's vault entry, via the SAME {@link detectKeyStatus}
- * comparison every other key-trust decision in this module already makes.
- * No new trust primitive, no weakening of the mismatch refusal: this is
- * strictly an additional CANDIDATE path, checked with the identical rigor
- * as the conventional one.
+ * The owner+fleet-scoped conventional path ({@link defaultAgentKeyPath} —
+ * `~/.macf/keys/<owner>/<fleet>/<role>.pem`, macf#1214) wins whenever
+ * anything already lives there. Otherwise, TWO older-generation candidates
+ * are tried in write-order (newest legacy first), each reused IN PLACE
+ * when — and only when — its fingerprint matches THIS role's vault entry,
+ * via the SAME {@link detectKeyStatus} comparison every other key-trust
+ * decision in this module already makes:
  *
- * A legacy key that does NOT match is simply irrelevant to this fleet —
- * most likely a DIFFERENT fleet's key that happens to share this role name
- * (the exact collision macf#1157 reports). It is silently ignored, never
- * compared against for a refusal, and the fleet-scoped path materializes
+ *  1. the pre-#1214 fleet-scoped, OWNER-LESS path
+ *     ({@link legacyProjectAgentKeyPath} — `~/.macf/keys/<fleet>/<role>.pem`,
+ *     macf#1157's shape, no owner segment)
+ *  2. the pre-#1157 FLAT path ({@link legacyAgentKeyPath} —
+ *     `~/.macf/keys/<role>.pem`, no fleet OR owner segment)
+ *
+ * No new trust primitive, no weakening of the mismatch refusal at either
+ * tier: each is strictly an additional CANDIDATE path, checked with the
+ * identical rigor as the conventional one, and — critically — ANCHORED to
+ * one exact, predictable location per tier, never a directory scan. A
+ * candidate this fleet doesn't own (wrong fingerprint) is simply never
+ * read as a source of truth; it is not a search over `~/.macf/keys/` that
+ * could accidentally surface an unrelated identity (e.g. a substrate
+ * agent's own flat-shaped key) — only the ONE path each tier's shape
+ * predicts is ever even opened.
+ *
+ * A legacy key at either tier that does NOT match is simply irrelevant to
+ * this fleet — most likely a DIFFERENT fleet's (or a different owner's)
+ * key that happens to share this role name (the exact collision macf#1157,
+ * and one level up, macf#1214, report). It is silently ignored, never
+ * compared against for a refusal, and the conventional path materializes
  * fresh from the vault exactly as if no legacy file existed. A legacy file
  * that fails to PARSE at all is treated the same way (ignored, not
- * refused) — an unparseable stranger file at the flat path is not this
- * fleet's problem to diagnose; {@link detectKeyStatus} still refuses loud
- * the moment something actually needs the CONVENTIONAL path's own content.
+ * refused) — an unparseable stranger file at an older-generation path is
+ * not this fleet's problem to diagnose; {@link detectKeyStatus} still
+ * refuses loud the moment something actually needs the CONVENTIONAL
+ * path's own content.
  *
  * Only ever called when `deps.keyPathFor` is undefined (the production
  * default) — see {@link deployAgent}'s call site. A caller-supplied
@@ -1040,19 +1058,31 @@ function detectKeyStatus(role: string, keyPath: string, vaultPem: string): KeyDe
  * function, so it never falls back to a real `homedir()`-rooted path
  * either.
  */
-function resolveDefaultKeyPath(fleetName: string, role: string, vaultPem: string): string {
-  const conventional = defaultAgentKeyPath(fleetName, role);
+function resolveDefaultKeyPath(owner: string, fleetName: string, role: string, vaultPem: string): string {
+  const conventional = defaultAgentKeyPath(owner, fleetName, role);
   if (existsSync(conventional)) return conventional;
-  const legacy = legacyAgentKeyPath(role);
-  if (existsSync(legacy)) {
+
+  const legacyProject = legacyProjectAgentKeyPath(fleetName, role);
+  if (existsSync(legacyProject)) {
     try {
-      if (detectKeyStatus(role, legacy, vaultPem).kind === 'match') return legacy;
+      if (detectKeyStatus(role, legacyProject, vaultPem).kind === 'match') return legacyProject;
     } catch {
       // Unparseable legacy file — not this fleet's concern; fall through
-      // to fresh materialization at the fleet-scoped path below, exactly
+      // to the next tier, exactly as if the legacy file didn't exist.
+    }
+  }
+
+  const legacyFlat = legacyAgentKeyPath(role);
+  if (existsSync(legacyFlat)) {
+    try {
+      if (detectKeyStatus(role, legacyFlat, vaultPem).kind === 'match') return legacyFlat;
+    } catch {
+      // Unparseable legacy file — not this fleet's concern; fall through
+      // to fresh materialization at the conventional path below, exactly
       // as if the legacy file didn't exist.
     }
   }
+
   return conventional;
 }
 
@@ -1223,11 +1253,14 @@ export async function deployAgent(
       caCertPathFor: deps.caCertPathFor ?? caCertPath,
       caKeyPathFor: deps.caKeyPathFor ?? caKeyPath,
     };
-    // macf#1157: the fleet-scoped default (with legacy-path back-compat)
-    // ONLY applies when the caller hasn't overridden resolution — an
-    // override (always used in tests, per `keyPathFor`'s own doc) fully
-    // owns path resolution and never sees the legacy fallback either.
-    const keyPath = deps.keyPathFor ? deps.keyPathFor(role) : resolveDefaultKeyPath(manifest.metadata.name, role, creds.privateKeyPem);
+    // macf#1157 / macf#1214: the owner+fleet-scoped default (with two-tier
+    // legacy-path back-compat) ONLY applies when the caller hasn't
+    // overridden resolution — an override (always used in tests, per
+    // `keyPathFor`'s own doc) fully owns path resolution and never sees
+    // the legacy fallback either.
+    const keyPath = deps.keyPathFor
+      ? deps.keyPathFor(role)
+      : resolveDefaultKeyPath(manifest.owner.account, manifest.metadata.name, role, creds.privateKeyPem);
 
     // Combined-stale pre-check (macf#982) — see this function's own doc
     // "Both the CA and the App key are PEEKED AT" section. Read-only: ONLY
