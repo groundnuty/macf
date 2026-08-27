@@ -88,13 +88,14 @@ import {
 } from '../bootstrap/apply-routing-secrets.js';
 import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
 import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
-import type { FleetVerdict, OrgSecretsListResult } from '../bootstrap/fleet-verdict.js';
+import type { FleetVerdict, OrgSecretsListResult, RoutingVerdictPinContext } from '../bootstrap/fleet-verdict.js';
 import {
   determineFleetVerdict,
   fleetVerdictToJson,
   formatFleetVerdictLines,
   realListOrgSecretsVisibleToRepo,
   resolveOrgSecretVisibility,
+  ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED,
   routingVerdictComponent,
   runnerVerdictComponent,
   workspaceVerdictComponent,
@@ -2044,15 +2045,26 @@ function actionsPinStatusLabel(status: ActionsPinRepoStatus): string {
  * call site below (the `--json`/human-render branch inside
  * `runBootstrapApply`) resolves the map via `resolveOrgSecretVisibility` and
  * passes it through.
+ *
+ * `pinContext` (groundnuty/macf#1239) defaults to
+ * `ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED` — `selfHostedRunner: false`, so
+ * the `TAILNET_NEEDED` carve-out question never even arises and every
+ * existing call site (including every pre-#1239 test) keeps rendering
+ * BYTE-IDENTICALLY. The ONE live call site below resolves it from the SAME
+ * `manifest` already in scope there (`manifest.versions?.actions` /
+ * `manifest.routing?.runner.runs_on === 'self-hosted'` — the same fact
+ * `FleetApplyResult.actionsPin.target` carries by construction, one fewer
+ * indirection since `manifest` is already at hand).
  */
 function buildFleetVerdict(
   result: FleetApplyResult,
   remainingDeploy: RemainingDeployReport,
   orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {},
+  pinContext: RoutingVerdictPinContext = ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED,
 ): FleetVerdict {
   const runnerComponent = runnerVerdictComponent(result.routing);
   return determineFleetVerdict([
-    routingVerdictComponent(result.routingSecrets, orgSecretVisibility),
+    routingVerdictComponent(result.routingSecrets, orgSecretVisibility, pinContext),
     ...(runnerComponent !== undefined ? [runnerComponent] : []),
     workspaceVerdictComponent(remainingDeploy),
   ]);
@@ -2066,6 +2078,7 @@ export function formatApplyResult(
   versionPhase?: ApplyVersionPhaseResult,
   statusNextStep?: { readonly manifestPath: string; readonly flags: DeployFlagsEcho },
   orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {},
+  pinContext: RoutingVerdictPinContext = ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED,
 ): string {
   const parts: string[] = [
     `Control repo: ${formatControlRepoLine(result)}`,
@@ -2134,7 +2147,7 @@ export function formatApplyResult(
   // it happens; this is the end-of-run summary restating it "as plainly as
   // NOT running" per the issue's own requirement. Two streams, one
   // decision (`buildFleetVerdict` is the single computation both read).
-  const verdictLines = formatFleetVerdictLines(buildFleetVerdict(result, remainingDeploy, orgSecretVisibility));
+  const verdictLines = formatFleetVerdictLines(buildFleetVerdict(result, remainingDeploy, orgSecretVisibility, pinContext));
   if (verdictLines.length > 0) parts.push('', ...verdictLines);
   return parts.join('\n');
 }
@@ -2305,6 +2318,7 @@ export function fleetApplyResultToJson(
   deployPhase?: DeployPhaseRenderInput,
   versionPhase?: ApplyVersionPhaseResult,
   orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {},
+  pinContext: RoutingVerdictPinContext = ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED,
 ): unknown {
   return {
     schema_version: FLEET_APPLY_JSON_SCHEMA_VERSION,
@@ -2383,7 +2397,7 @@ export function fleetApplyResultToJson(
     // additive/no-bump decision. `fleetVerdictToJson` returns `undefined`
     // (key omitted) when nothing was checked at all.
     ...((): Record<string, unknown> => {
-      const json = fleetVerdictToJson(buildFleetVerdict(result, remainingDeploy, orgSecretVisibility));
+      const json = fleetVerdictToJson(buildFleetVerdict(result, remainingDeploy, orgSecretVisibility, pinContext));
       return json === undefined ? {} : { fleet_verdict: json };
     })(),
   };
@@ -3353,6 +3367,16 @@ export async function runBootstrapApply(
         { listOrgSecretsVisibleToRepo: deps?.listOrgSecretsVisibleToRepo ?? realListOrgSecretsVisibleToRepo },
       );
 
+      // groundnuty/macf#1239 — the TAILNET_NEEDED carve-out context the
+      // routing verdict consults: both fields are single per-FLEET values
+      // read straight off `manifest` (already in scope here), never
+      // re-derived from `result.routing`'s per-repo shape — see
+      // `fleet-verdict.ts::RoutingVerdictPinContext`'s doc for why.
+      const pinContext: RoutingVerdictPinContext = {
+        actionsVersion: manifest.versions?.actions,
+        selfHostedRunner: manifest.routing?.runner.runs_on === 'self-hosted',
+      };
+
       if (opts.json) {
         console.log(
           JSON.stringify(
@@ -3364,6 +3388,7 @@ export async function runBootstrapApply(
                 deployPhase,
                 versionResult,
                 orgSecretVisibility,
+                pinContext,
               ) as Record<string, unknown>),
               ...(Object.keys(installScopeCoverage).length > 0
                 ? { install_scope_coverage: Object.values(installScopeCoverage).map(installScopeCoverageEntryToJson) }
@@ -3384,6 +3409,7 @@ export async function runBootstrapApply(
             versionResult,
             { manifestPath, flags: opts },
             orgSecretVisibility,
+            pinContext,
           ),
         );
         // groundnuty/macf#1220 — printed LAST, after the rest of the result
