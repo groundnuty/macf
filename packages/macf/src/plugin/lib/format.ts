@@ -226,6 +226,13 @@ export function formatSweepInstruction(): string {
  * PARTIAL one (some repos unreadable) always renders something, even with
  * zero stalls — the honest-unknown floor: an empty sweep and a failed one
  * must not look alike.
+ *
+ * When `DEFAULT_REPORTER_STALL_LIMIT` truncated the candidate list
+ * (`totalStale > stalls.length`), the header discloses "N of M" — a
+ * truncated list that looks identical to a complete one is its own
+ * false-by-omission (see `DEFAULT_REPORTER_STALL_LIMIT`'s doc). The
+ * disclosure is descriptive only — never a "close these" imperative; the
+ * sweep surfaces candidates, the reporter still decides.
  */
 export function formatReporterStallSweep(result: ReporterStallResult): string {
   if (result.enumerationFailed) {
@@ -237,7 +244,11 @@ export function formatReporterStallSweep(result: ReporterStallResult): string {
 
   const lines: string[] = [];
   if (result.stalls.length > 0) {
-    lines.push(`${result.stalls.length} issue(s) you filed are open and quiet — re-read before assuming still blocked:`);
+    const capped = result.totalStale > result.stalls.length;
+    const header = capped
+      ? `${result.stalls.length} of ${result.totalStale} issue(s) you filed are open and quiet — showing the ${result.stalls.length} oldest (${result.totalStale - result.stalls.length} more not shown) — re-read before assuming still blocked:`
+      : `${result.stalls.length} issue(s) you filed are open and quiet — re-read before assuming still blocked:`;
+    lines.push(header);
     for (const s of result.stalls) {
       const ref = `${s.repo}#${s.number}`;
       const days = Math.floor(s.daysQuiet);

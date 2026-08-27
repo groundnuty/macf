@@ -120,6 +120,16 @@ export interface ReporterStallResult {
   /** True when the top-level install-set enumeration returned nothing —
    * treated as a failure signal, not "nothing to sweep" (see module doc). */
   readonly enumerationFailed: boolean;
+  /** Total candidates crossing `staleDays`, BEFORE `limit` truncated the
+   * list down to `stalls`. Required (not optional) so every construction
+   * site — real or test — makes an explicit choice; an omitted field that
+   * silently defaulted to "nothing was capped" would be exactly the kind
+   * of false-by-omission the render layer exists to avoid (macf#1170,
+   * science-agent: "a reader who sees five items and does not know there
+   * are thirty-nine has been told something false by omission"). Always
+   * `0` when `enumerationFailed` is `true` — there is no candidate count
+   * to report when the enumeration itself never ran. */
+  readonly totalStale: number;
 }
 
 /**
@@ -148,6 +158,13 @@ export const DEFAULT_REPORTER_STALL_DAYS = 5;
  * a different N. The deep per-candidate fetch (`fetchBodyAndComments`,
  * used only for deferral-reference detection) is bounded to this same cap
  * — never run against the full candidate set inside a SessionStart hook.
+ *
+ * A cap that truncates silently is its own false-by-omission hazard — a
+ * reader seeing 5 items with no indication that 34 more exist reads the
+ * sweep as complete. `ReporterStallResult.totalStale` carries the pre-cap
+ * count so the render layer (`formatReporterStallSweep`) can say "N of M"
+ * whenever the cap actually bit, rather than rendering a bare list that
+ * looks identical whether it's everything or a fifth of everything.
  */
 export const DEFAULT_REPORTER_STALL_LIMIT = 5;
 
@@ -309,7 +326,7 @@ export async function checkReporterStalls(config: {
     // See module doc "HONEST-COVERAGE FLOOR" — a genuinely empty install
     // set does not happen for a live agent; this is the enumeration call
     // failing, reported as such rather than as a clean sweep.
-    return { stalls: [], unreadableRepos: [], enumerationFailed: true };
+    return { stalls: [], unreadableRepos: [], enumerationFailed: true, totalStale: 0 };
   }
 
   const unreadableRepos: string[] = [];
@@ -384,5 +401,5 @@ export async function checkReporterStalls(config: {
     }),
   );
 
-  return { stalls, unreadableRepos, enumerationFailed: false };
+  return { stalls, unreadableRepos, enumerationFailed: false, totalStale: candidates.length };
 }
