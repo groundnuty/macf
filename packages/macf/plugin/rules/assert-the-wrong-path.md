@@ -124,15 +124,18 @@ grep -c X missing-file   →  0      ← searched nothing
 grep -c X real-file      →  0      ← X is genuinely absent
 ```
 
-Same for a typo'd path, a stale checkout, a glob the shell ate before the command saw it, a `--jq` filter on a key that does not exist, and an API call scoped to the wrong level. **A zero reads exactly like a finding, and costs nothing to produce.**
-
-Five instances in one night across two agents. The two that nearly became claims: a `grep` against **an invented filename** returned `0` and would have asserted a design amendment was never written — it was, in a file one word different; and an unquoted `--include=*.ts` **eaten by the shell** returned empty output that read as *"nothing references this."* A third produced the inverse: `--jq .value` against a **404** returned the error body — non-empty, uniform across every subject, and read as *"the variable is set"* on thirteen repos where it was absent.
+The cases this covers, and each is caught by the same one-second act: **a path that does not exist**, **a typo'd path**, **a glob the shell ate before the command saw it**, **a `--jq` filter on a key that is not there**. Two that nearly became claims: a `grep` against **an invented filename** returned `0` and would have asserted a design amendment was never written — it was, in a file one word different; and an unquoted `--include=*.ts` **eaten by the shell** returned empty output that read as *"nothing references this."*
 
 **Remedy: prove the search space is non-empty before believing an empty result.** `ls` the file. `wc -l` it. Count matches of something you know is there. **One extra command turns an uninformative zero into a real one.**
 
-**Not trigger 3.** That one asks *what case can this population not produce* and is answered by **constructing** the missing case. This one asks *did I search anything at all* and is answered by **proving the space exists**. Distinct acts, distinct failures — a trigger-3 population is real but narrow; a trigger-4 population is not there.
+**Two neighbours it does NOT cover — and applying this remedy to them certifies the mistake**, because `ls` passes and the reading is still wrong:
 
-**And its tell is the same one that catches the inverse:** identical results across subjects that should differ. Thirteen unrelated repos do not agree to the byte, and a search that finds nothing everywhere is usually finding nowhere.
+- **Scope incompleteness** — the instrument reads a subset of where the answer lives. A repo-level variable listing exists and returns variables; the one you want is defined at the org level. **Remedy: enumerate the levels**, not the space.
+- **Currency** — the artifact read is real but is not the one anyone runs: a stale checkout, a local file behind `origin/main`. **Remedy: name the provenance** — `git show origin/main:<path>`, or query the API rather than the working tree.
+
+**Not trigger 3.** That one asks *what case can this population not produce* and is answered by **constructing** the missing case. This one asks *did I search anything at all* and is answered by **proving the space exists**. A trigger-3 population is real but narrow; a trigger-4 population is not there.
+
+**The inverse deserves the same suspicion:** a *non-empty* result from a failed call. `--jq .value` against a **404** returns the error body — and it was **uniform across every subject**, which is the tell. Identical results across subjects that should differ means the wrong thing is being measured; thirteen unrelated repos do not agree to the byte.
 
 **Distinguishing them:** ask whether your expected value came from **the population under test** (trigger 1) or from **your own inference about an unstated observable** (trigger 2). A reader who only knows trigger 1 gets *"no, nothing circular here"* on the second case and writes the assertion anyway — which is how this section's own first draft failed to recognise one of the two cases it cited.
 
