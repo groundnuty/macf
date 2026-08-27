@@ -107,8 +107,8 @@ program
   // rather than commander's generic missing-required message.
   .option('--app-id <id>', 'GitHub App ID (required for repo/org/profile registries)')
   .option('--install-id <id>', 'GitHub App Installation ID (required for repo/org/profile registries)')
-  .option('--key-path <path>', 'Destination the App private key lives at + what env.github points to (repo/org/profile registries). Defaults to ~/.macf/keys/<project>/<agent>.pem; pass --app-key to ingest the key here at init.')
-  .option('--app-key <path>', 'Source path of the downloaded App private key (.pem) to INGEST into --key-path (default ~/.macf/keys/<project>/<agent>.pem) at 0600. Onboarding: create the App -> download the .pem -> macf init --app-key <path> ....')
+  .option('--key-path <path>', 'Destination the App private key lives at + what env.github points to (repo/org/profile registries). Defaults to ~/.macf/keys/<owner>/<project>/<agent>.pem; pass --app-key to ingest the key here at init.')
+  .option('--app-key <path>', 'Source path of the downloaded App private key (.pem) to INGEST into --key-path (default ~/.macf/keys/<owner>/<project>/<agent>.pem) at 0600. Onboarding: create the App -> download the .pem -> macf init --app-key <path> ....')
   .option('--registry-type <type>', 'Registry: repo, org, profile, or local', 'repo')
   .option('--registry-org <org>', 'Org name (for org registry)')
   .option('--registry-user <user>', 'User name (for profile registry)')
@@ -643,7 +643,7 @@ fleet
     '`bootstrap apply` ("provisioned") and a running agent ("running"). Decrypts secrets/vault.age (operator-' +
     'privileged — the same custody boundary as `bootstrap plan --vault`), extracts this role\'s app_id/' +
     'install_id/private-key, clones its repo into --dir (or the manifest\'s deploy_path) if not already present, ' +
-    'atomically writes the App key at 0600 to the conventional ~/.macf/keys/<fleet>/<role>.pem (never overwritten once ' +
+    'atomically writes the App key at 0600 to the conventional ~/.macf/keys/<owner>/<fleet>/<role>.pem (never overwritten once ' +
     'present AND its fingerprint matches the vault\'s — a mismatch, e.g. a key left over from a destroyed-and-' +
     'rebuilt fleet, refuses loud instead of minting with it; see --force-key), and re-materializes the ' +
     'per-project CA the same way on a fingerprint mismatch (see --force-ca) — a rebuild rotates BOTH ' +

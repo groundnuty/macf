@@ -54,7 +54,8 @@ export interface InitOptions {
   /**
    * Source path of the downloaded App private key (.pem) to INGEST into the
    * conventional destination (`--key-path`, default
-   * `~/.macf/keys/<project>/<agent>.pem` — macf#1157) with `0600` perms at
+   * `~/.macf/keys/<owner>/<project>/<agent>.pem` — macf#1157; owner-scoped
+   * as of macf#1214) with `0600` perms at
    * init time. Closes the macf#530 "pointer set without
    * the thing it points to" papercut — without ingestion the operator must
    * hand-`cp` the key and a wrong path/perm surfaces later as a cryptic
@@ -303,9 +304,9 @@ function validateInitOpts(opts: InitOptions): void {
     throw new Error('installId is required (--install-id; omit only when using --local)');
   }
   // keyPath is OPTIONAL (macf#530): when omitted it defaults to the
-  // conventional ~/.macf/keys/<agent>.pem in initAgent. Only its *shape* is
-  // validated here (when provided), since it embeds in the double-quoted
-  // claude.sh KEY_PATH export.
+  // conventional ~/.macf/keys/<owner>/<project>/<agent>.pem in initAgent.
+  // Only its *shape* is validated here (when provided), since it embeds in
+  // the double-quoted claude.sh KEY_PATH export.
   if (!/^\d+$/.test(opts.appId)) {
     throw new Error(
       `appId "${opts.appId}" must be numeric (GitHub App IDs are digits only)`,
