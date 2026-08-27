@@ -1015,6 +1015,16 @@ Amendment G measured the teardown ladder by **revival cost**. The same axis deci
 
 **A count is not informed consent for destruction.** *"3 deletion(s)"* tells an operator nothing about what they are losing; the per-class policy already names each resource at plan time, so the information exists and simply is not carried into the approval.
 
+**`orphan` is not complete until it is RENDERED.** P3 defines the verb by what the tool will *not* do; that is only half of it. An `orphan` item exists to hand the operator an action, and:
+
+> **An instruction nobody can read is not an instruction.**
+
+So an `orphan` plan item must carry three things, not one: **an explicit statement that the resource was NOT deleted**, **the resource named**, and **a direct link the operator can follow to delete it themselves if they want to.** A row that merely omits the resource from the plan is indistinguishable from the tool having overlooked it.
+
+> **Operator directive, 2026-08-27 (relayed by `macf-code-agent`, awaiting the operator's own words):** *"if we are orphaning anything we should state it very clearly in the output that we are not deleting something, just orphaning it — and then give the user exact links to delete it manually if he wants."*
+
+**This is why the `orphan`/`delete` asymmetry does not simplify to "orphan is the safe default."** `delete` needs *consent it does not have* (above); `orphan` needs *rendering it does not have* — and an unrendered `orphan` is the `#1220` failure exactly: the tool computes the right answer and leaves the operator unable to act on it.
+
 **Repositories are NEVER deletable — and the reason is a prohibition, not a cost estimate.** P3's table reaches `orphan` for repos on revival-cost grounds (*un-archive is 0 clicks; recreate loses history*). **That is an engineering argument, and engineering arguments invite recalculation** — someone could reasonably argue a repo with no history is cheap to recreate, and reopen a question that is not open.
 
 > **Operator directive, 2026-08-27 (relayed by `macf-code-agent`, awaiting the operator's own words on `#1272`):** *"it cannot remove repositories — this is too big and irreversible blast radius; everything else is ok, and is naturally part of the life cycle."*
