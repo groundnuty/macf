@@ -931,3 +931,85 @@ DR-035's *"one routing App per registry/account"* was **correct when written**: 
 **That is not an error — it is an unrevisited assumption, and nothing in the system re-checks a premise when the world underneath it changes.** The practice it argues for: when prior art differs from a proposed design, do not only ask *why the prior art does that* — ask **what it assumed, and whether that still holds.** Prior art is right about the world it was written for and silent about the world it is being reused in.
 
 **References:** `#1089` (the consolidation) · `#1082` (the reversal) · `#1083` (`runner-ops`; the storage extension) · `#1088` (the owner boundary) · `#1086` (possession-based reuse) · DR-044 Decision 1.
+
+---
+
+## Amendment P (2026-08-27, #1129 + #1220 + #1229) — apply as a reconciler: the verb matrix, and what is deliberately not in it
+
+`apply` was specified as create-missing and grew a diff for some resources and not others. Five days of live evidence made the gap concrete, and the correction is smaller than the evidence suggested: **one row of a matrix is missing, and one verb that already exists is never computed.**
+
+### P1 — the verb matrix, keyed on THREE facts
+
+The tool's own record is the third fact, and it is what makes the hard rows decidable. `fleet.lock` records **what this tool created** — which separates *not ours* from *ours and no longer wanted*, a distinction no amount of reading GitHub can supply.
+
+| manifest | live | in `fleet.lock` | verb |
+|---|---|---|---|
+| declared | absent | — | **create** |
+| declared | present, matches | — | **noop** |
+| declared | present, **differs** | — | **update** |
+| not declared | present | **yes** | **delete** or **orphan**, per class (P3) |
+| not declared | present | **no** | **report-extra** — not ours, never touched |
+
+> **The no-prune decision is preserved exactly by row 5.** It was never about abandoning what we created; it was about not touching what we did not. Without the lock the two are indistinguishable, which is why the original three-verb design could only report.
+
+### P2 — row 3 is the live gap, and it is a computation fix rather than a design change
+
+`PlanVerb` already carries `update`. **It is never computed for a resource this run did not create.** A pre-existing App whose `selected` install set no longer covers the manifest's agents produces no plan item at all (`#1220`) — the desired set is computed, printed into a consent preview, and discarded.
+
+**The accurate statement is not "apply converges by creation."** It is:
+
+> **`update` is never computed for reused resources.** Everything else in the matrix already works.
+
+That distinction matters for scoping: row 3 is a diff over resources we skip today, not a new verb, not a new consent model.
+
+### P2a — an `update` the tool cannot perform resolves to a consent gate, not an API write
+
+Row 3 says *compute the diff*. It does not say *write it* — and for some resources the tool **cannot**: widening a GitHub App's installation is browser-only, permanently (DR-044 Decision 1).
+
+> **The verb is `update` in both cases. What differs is who satisfies it.** An API-writable resource is converged by `apply`; a browser-only one is converged by an operator click that `apply` presents, waits for, and re-checks.
+
+That is not an exception to the matrix — it is the same row with a different actuator, and it is already built (`#1232`/`#1233`): `apply` opens the install page, states the exact repo set, waits, re-checks, continues. **Verified live on `macf-trial`** — a widened router install took `trial-writing-agent`'s runner from `available=0` to `available=1`, and the following run reported no drift.
+
+**The operator's constraint is what makes the distinction load-bearing:** *"I refuse to click anything that doesn't follow the apply."* A browser-only `update` that merely reports its coordinates leaves the operator to act outside any tool run — untraceable, unrepeatable, and invisible to the next `apply`.
+
+### P3 — row 4 splits by revival cost, and needs two verbs
+
+Amendment G measured the teardown ladder by **revival cost**. The same axis decides what a negative diff may do:
+
+| class | revival cost | verb |
+|---|---|---|
+| variables | a rewrite — ~0 | **delete** |
+| secrets | re-supply; ~0 if vault-held | **delete**, value's source named at plan time |
+| repos | un-archive is 0 clicks; recreate loses history | **orphan** |
+| Apps | 2 clicks **and the key is emitted once, unrecoverable** | **orphan**, always |
+
+**Two plan verbs, not one.** `delete` is a statement of intent, covered by the existing plan consent. `orphan` — *we made this, the manifest no longer wants it, and I will not touch it* — is an **instruction to the operator**. Collapsing them either promises deletions the tool must not perform or hides the ones it will.
+
+### P4 — write-only resources: reconcile on OUR inputs, not on the value
+
+Some resources we own and cannot read: a GitHub secret's value is write-only by design. `write-always` exists for exactly these, and it is honest but noisy — it rewrites every run.
+
+**The value is unreadable; our inputs are not.** Record `{written_at, written_by_version}` in `fleet.lock` and rewrite when either input changed — the vault value, or the writer that composed it.
+
+> **Terraform reached the same shape** with `write-only` arguments and a companion `password_wo_version`: the value is never stored, and a version bump triggers the rewrite. **One delta, and it is deliberate.** There the practitioner bumps the version by hand. Here **the trigger belongs with whoever knows the value became wrong** — which is the tool, since it holds both the vault and its own build id. A human trigger would re-create the drift it exists to remove.
+
+**Third-party drift is separately observable.** GitHub exposes `updated_at` on secrets and variables. An `updated_at` newer than our recorded `written_at` means **someone other than this tool wrote it** — detectable without reading a value we are not permitted to read, and the only signal available for that case.
+
+**Over-reporting is acceptable here when the remedy is cheap.** A spurious rewrite of an idempotent secret costs one API call; a missed rewrite costs a fleet that cannot authenticate. Where the two err in opposite directions, err toward the write.
+
+### P5 — what this amendment deliberately does NOT cover
+
+Two failures were cited as reconciler evidence and are not:
+
+- **A resource declared and absent is row 1 — `create` — a verb `apply` already has.** `MACF_TRUSTED_ACTORS` missing from repos of a self-hosted-declaring fleet (`#1194`) is a **create-path failure**, not a missing verb. Designing for it here would ship a reconciler that does not fix it.
+- **Whether the committed manifest still describes the live fleet is CORRESPONDENCE, not convergence** (`#1249`). The matrix assumes the manifest states desired state. When the manifest is a fossil, every row is computed against the wrong desired state — a prior question, and a different mechanism.
+
+> **A reconciler converges live state toward a description. It cannot tell you the description is wrong**, and adding rows will not make it able to.
+
+### P6 — acceptance
+
+- a pre-existing App whose install set no longer covers the manifest's agents produces an **`update`** plan item (row 3)
+- a variable in `fleet.lock` and absent from the manifest produces **`delete`**; a repo in the same position produces **`orphan`** and names it (row 4)
+- a resource on GitHub and **not** in `fleet.lock` produces `report-extra` and is never written (row 5)
+- a write-only secret whose vault value and writer version are both unchanged produces **`noop`**, not `write-always` (P4)
+- `updated_at` newer than the recorded `written_at` is reported as third-party drift (P4)
