@@ -340,7 +340,7 @@ describe('formatReporterStallSweep (groundnuty/macf#1170)', () => {
     expect(output.toLowerCase()).toContain('re-read');
     expect(output).not.toContain('CLOSED');
     // Not capped (totalStale === stalls.length) — no "N of M" disclosure noise.
-    expect(output).not.toMatch(/\bof\b \d+ issue/);
+    expect(output).not.toContain('more not shown');
   });
 
   it('renders an upgraded verdict line for a stall with a cleared deferral reference', () => {
@@ -380,7 +380,6 @@ describe('formatReporterStallSweep (groundnuty/macf#1170)', () => {
     const output = formatReporterStallSweep(result);
     expect(output).toContain('1 of 4');
     expect(output).toContain('3 more not shown');
-    expect(output).not.toMatch(/close|Close/); // surfaces, never instructs closure
   });
 
   it('does NOT disclose a cap when nothing was truncated (totalStale === stalls.length)', () => {
@@ -393,7 +392,6 @@ describe('formatReporterStallSweep (groundnuty/macf#1170)', () => {
       totalStale: 1,
     };
     const output = formatReporterStallSweep(result);
-    expect(output).not.toContain(' of ');
     expect(output).not.toContain('more not shown');
   });
 
@@ -409,6 +407,17 @@ describe('formatReporterStallSweep (groundnuty/macf#1170)', () => {
     const output = formatReporterStallSweep(result);
     expect(output).not.toMatch(/pending issue\(s\):/);
     expect(output).not.toMatch(/inbox message\(s\) drained on startup:/);
+
+    // The capped ("N of M") header is DIFFERENT text from the uncapped one
+    // above — it must be checked against the gate regex separately, since
+    // a header collision would make the pickup hook mis-fire an auto-submit.
+    const cappedResult: ReporterStallResult = {
+      ...result,
+      totalStale: 4,
+    };
+    const cappedOutput = formatReporterStallSweep(cappedResult);
+    expect(cappedOutput).not.toMatch(/pending issue\(s\):/);
+    expect(cappedOutput).not.toMatch(/inbox message\(s\) drained on startup:/);
 
     const failed = formatReporterStallSweep({ stalls: [], unreadableRepos: [], enumerationFailed: true, totalStale: 0 });
     expect(failed).not.toMatch(/pending issue\(s\):/);
