@@ -67,7 +67,7 @@ Acceptance criteria almost always enumerate what must hold. That is sufficient w
 
 > **When a plausible-but-wrong verification exists, the criteria must FORBID it — not merely leave it out.** Omitting it leaves it available; forbidding it makes writing it a spec violation.
 
-### Three triggers, three different remedies
+### Four triggers, four different remedies
 
 **Trigger 1 — circularity: the reference value comes from what it checks.** The verification cannot fail, so it reports agreement and reads as correctness.
 
@@ -116,6 +116,23 @@ For the vault fix the answer was *reused roles*, and it was. For the fleet e2e i
 - **Illegitimate** — lower a sweep's cap from 5 so the issue under test appears in its own output.
 
 **And its cheap companion — mutation as habit:** break the fix, re-run, confirm a test notices. **A test that passes with the fix removed is testing something else.** One fix shipped merged-and-green while its emitting call site stayed broken, because its tests asserted the mechanism in general rather than at the site; its replacement was proven load-bearing by disabling it and watching the assertion fail. **The cost is a single deliberately-broken run.**
+
+**Trigger 4 — an empty result from a search space that was empty.** The instrument reported nothing found, and nothing was searched. **The two outputs are identical and their meanings are opposite:**
+
+```
+grep -c X missing-file   →  0      ← searched nothing
+grep -c X real-file      →  0      ← X is genuinely absent
+```
+
+Same for a typo'd path, a stale checkout, a glob the shell ate before the command saw it, a `--jq` filter on a key that does not exist, and an API call scoped to the wrong level. **A zero reads exactly like a finding, and costs nothing to produce.**
+
+Five instances in one night across two agents. The two that nearly became claims: a `grep` against **an invented filename** returned `0` and would have asserted a design amendment was never written — it was, in a file one word different; and an unquoted `--include=*.ts` **eaten by the shell** returned empty output that read as *"nothing references this."* A third produced the inverse: `--jq .value` against a **404** returned the error body — non-empty, uniform across every subject, and read as *"the variable is set"* on thirteen repos where it was absent.
+
+**Remedy: prove the search space is non-empty before believing an empty result.** `ls` the file. `wc -l` it. Count matches of something you know is there. **One extra command turns an uninformative zero into a real one.**
+
+**Not trigger 3.** That one asks *what case can this population not produce* and is answered by **constructing** the missing case. This one asks *did I search anything at all* and is answered by **proving the space exists**. Distinct acts, distinct failures — a trigger-3 population is real but narrow; a trigger-4 population is not there.
+
+**And its tell is the same one that catches the inverse:** identical results across subjects that should differ. Thirteen unrelated repos do not agree to the byte, and a search that finds nothing everywhere is usually finding nowhere.
 
 **Distinguishing them:** ask whether your expected value came from **the population under test** (trigger 1) or from **your own inference about an unstated observable** (trigger 2). A reader who only knows trigger 1 gets *"no, nothing circular here"* on the second case and writes the assertion anyway — which is how this section's own first draft failed to recognise one of the two cases it cited.
 
