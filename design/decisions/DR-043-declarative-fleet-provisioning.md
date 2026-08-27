@@ -962,6 +962,16 @@ The tool's own record is the third fact, and it is what makes the hard rows deci
 
 That distinction matters for scoping: row 3 is a diff over resources we skip today, not a new verb, not a new consent model.
 
+### P2a — an `update` the tool cannot perform resolves to a consent gate, not an API write
+
+Row 3 says *compute the diff*. It does not say *write it* — and for some resources the tool **cannot**: widening a GitHub App's installation is browser-only, permanently (DR-044 Decision 1).
+
+> **The verb is `update` in both cases. What differs is who satisfies it.** An API-writable resource is converged by `apply`; a browser-only one is converged by an operator click that `apply` presents, waits for, and re-checks.
+
+That is not an exception to the matrix — it is the same row with a different actuator, and it is already built (`#1232`/`#1233`): `apply` opens the install page, states the exact repo set, waits, re-checks, continues. **Verified live on `macf-trial`** — a widened router install took `trial-writing-agent`'s runner from `available=0` to `available=1`, and the following run reported no drift.
+
+**The operator's constraint is what makes the distinction load-bearing:** *"I refuse to click anything that doesn't follow the apply."* A browser-only `update` that merely reports its coordinates leaves the operator to act outside any tool run — untraceable, unrepeatable, and invisible to the next `apply`.
+
 ### P3 — row 4 splits by revival cost, and needs two verbs
 
 Amendment G measured the teardown ladder by **revival cost**. The same axis decides what a negative diff may do:
