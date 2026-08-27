@@ -575,6 +575,58 @@ describe('applyFleet', () => {
     expect(existsSync(result.lockPath)).toBe(true);
   });
 
+  it('groundnuty/macf#1230 — the checkout-derived lock (not the caller-supplied priorLock) is what the narrowing refusal fires on: a stale/absent priorLock does NOT bypass it', async () => {
+    // `commands/bootstrap-apply.ts`'s CLI-level preflight is a FAST PATH: it
+    // reads `fleet.lock` from the OPERATOR's local manifest directory, which
+    // only reflects the control repo's true state once that local checkout
+    // has been `git pull`ed (`observer.ts::readFleetLock`'s own doc). This
+    // test simulates the fast path MISSING a narrowing — `priorLock` (what
+    // the CLI-level read would have supplied) is `null` — while the control
+    // repo's OWN checkout (what `provisionControlRepo`'s clone brings back,
+    // written here directly at `dirname(manifestPath)` per this file's
+    // `controlRepoOptions.makeScratchDir` convention) still records the
+    // wider, TRUE set. `applyFleet`'s own re-derived check (mirrors
+    // `checkAppNameLengths`'s existing two-tier shape) must catch this
+    // regardless — proving the refusal doesn't depend on the caller having
+    // supplied an up-to-date `priorLock`.
+    const manifestPath = manifestPathIn();
+    const manifest = manifestWith([CODE_AGENT], ['age1operator']); // declares ONLY age1operator
+    const controlRepoLock: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      age_recipients: ['age1operator', 'age1vm'], // the checkout's TRUE recorded set — age1vm is about to be dropped
+    };
+    writeFileSync(join(manifestPath, '..', 'fleet.lock'), JSON.stringify(controlRepoLock), 'utf-8');
+
+    let gate1Called = false;
+    const agentDeps = agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1');
+    const deps = baseDeps(
+      {
+        ...agentDeps,
+        startManifestFlow: async (opts) => {
+          gate1Called = true;
+          return agentDeps.startManifestFlow(opts);
+        },
+      },
+      manifestPath,
+    );
+
+    const result = await applyFleet(manifest, manifestPath, /* priorLock */ null, deps);
+
+    expect(gate1Called).toBe(false);
+    expect(result.vault.status).toBe('skipped');
+    expect(result.agents).toEqual([]);
+    // The control repo itself was successfully provisioned before the
+    // abort — distinguishing this from the control-repo-failure abort
+    // branch immediately above it in `applyFleet`.
+    expect(result.controlRepo.status).toBe('created');
+    // The PRE-EXISTING checkout lock is untouched, not rewritten — this run
+    // never reached the batched write.
+    const onDisk = parseFleetLock(readFileSync(join(manifestPath, '..', 'fleet.lock'), 'utf-8'));
+    expect(onDisk.age_recipients).toEqual(['age1operator', 'age1vm']);
+  });
+
   it('reused / resumed-install: lock is written IMMEDIATELY, no vault write attempted for them', async () => {
     const manifestPath = manifestPathIn();
     const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);

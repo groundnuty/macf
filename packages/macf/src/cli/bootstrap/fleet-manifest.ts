@@ -207,8 +207,49 @@ export const FleetTransportSchema = z
      * the vault later.
      */
     runner_platform_endpoint: z.string().min(1).optional(),
+    /**
+     * groundnuty/macf#1230 — the explicit, operator-typed override for the
+     * "narrowing `age_recipients` is a revocation that does not revoke"
+     * refusal (see `age-recipients-narrowing.ts`'s module doc for the full
+     * mechanism). **Not a boolean.** A flag the operator flips silently
+     * re-invites the exact failure this field exists to prevent: an
+     * operator who narrows the list reasonably believes access was
+     * withdrawn, so the acknowledgment itself must restate — in the
+     * committed `fleet.yaml`, not just in a doc comment nobody reads at
+     * apply time — that re-encrypting to fewer recipients does NOT revoke
+     * the removed recipient's access to any vault copy already held (a
+     * backup, a checkout, a laptop). Copying
+     * {@link AGE_RECIPIENTS_NARROWING_OVERRIDE_TEXT} verbatim into this
+     * field is the mechanism; `checkAgeRecipientsNarrowing` compares
+     * whitespace-normalized (not byte-exact) so YAML's line-folding cannot
+     * turn a genuine, correctly-typed acknowledgment into a cryptic schema
+     * rejection — see that function's doc.
+     *
+     * Optional; undeclared is the ordinary case for every fleet that has
+     * never narrowed its recipient set. Presence alone does not silence the
+     * refusal — an operator who pastes the WRONG text (a stale copy, a
+     * paraphrase, `"true"`) still gets refused, with the exact required
+     * text printed so the fix is a copy-paste, not a guess.
+     */
+    age_recipients_narrowing_override: z.string().min(1).optional(),
   })
   .strict();
+
+/**
+ * groundnuty/macf#1230 — the exact acknowledgment text
+ * `transport.age_recipients_narrowing_override` must (whitespace-normalized)
+ * match for `checkAgeRecipientsNarrowing` to let a narrowing manifest
+ * through. Defined here (the schema module), not in `age-recipients-narrowing.ts`,
+ * so that module can import it FROM this one without creating the reverse
+ * (schema-depends-on-check-logic) edge — `age-recipients-narrowing.ts`
+ * already needs `FleetLock`/`FleetManifest` types from here, and this
+ * constant is schema-adjacent (it IS the expected shape of a schema field),
+ * not check-logic.
+ */
+export const AGE_RECIPIENTS_NARROWING_OVERRIDE_TEXT =
+  'I understand that narrowing age_recipients only stops FUTURE re-encryption from including the removed ' +
+  'recipient — it does not revoke that recipient\'s decrypt access to any vault copy already held (a backup, a ' +
+  'checkout, a laptop). Real revocation requires rotating the CA and re-issuing everything the old vault protected.';
 
 export const FleetDefaultsSchema = z
   .object({
@@ -738,6 +779,24 @@ export const FleetLockSchema = z
      * same precedent `scope_credentials` immediately above already sets.
      */
     age_recipients: z.array(z.string().min(1)).optional(),
+    /**
+     * groundnuty/macf#1230 — append-only ledger of every recipient EVER
+     * removed via an acknowledged `transport.age_recipients_narrowing_override`
+     * (never pruned — same "carry forward, union, never delete" convention
+     * every other merge in `fleet-lock.ts` establishes). This is the
+     * durable proof a removal from {@link age_recipients} was deliberate
+     * and acknowledged, not silent or accidental: comparing two
+     * `fleet.lock`s with the SAME (narrow) `age_recipients` array, a reader
+     * cannot otherwise tell "this fleet always had this set" from "this
+     * fleet had a recipient removed with an acknowledged override."
+     * `undefined` (never `[]`) when no override has ever been used,
+     * matching this schema's own "omit rather than write a vacuous empty
+     * collection" convention. Deduplicated + sorted (unlike
+     * {@link age_recipients}, position here carries no meaning — this is a
+     * historical SET of removed identities, not a currently-declared
+     * ordered list).
+     */
+    age_recipients_removed_by_override: z.array(z.string().min(1)).optional(),
   })
   .strict();
 

@@ -75,6 +75,8 @@ import {
 import { parseVaultPlaintext, vaultRouterAppId, vaultRouterAppKeyPem } from '../../src/cli/bootstrap/vault-read.js';
 import { ROUTER_APP_ROLE } from '../../src/cli/bootstrap/apply-router-app.js';
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../src/cli/bootstrap/registry-scope-preflight.js';
+import { AGE_RECIPIENTS_NARROWED_CODE } from '../../src/cli/bootstrap/age-recipients-narrowing.js';
+import { AGE_RECIPIENTS_NARROWING_OVERRIDE_TEXT } from '../../src/cli/bootstrap/fleet-manifest.js';
 import { upgradeFleets } from '@groundnuty/macf-core';
 import type { ApplyVersionPhaseDeps, ApplyVersionPhaseResult } from '../../src/cli/bootstrap/apply-version.js';
 
@@ -2547,6 +2549,157 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
       expect(code).toBe(0);
       expect(errs.join('\n')).not.toContain(REGISTRY_SCOPE_UNSATISFIABLE_CODE);
+    });
+  });
+
+  describe('groundnuty/macf#1230 — age_recipients-narrowing pre-flight refusal before consent gate 1', () => {
+    // `FLEET_YAML`'s single declared recipient — reused across this block so
+    // the "narrowing" tests below don't need to touch the manifest at all,
+    // only the recorded `fleet.lock` next to it.
+    const AGE_RECIPIENT_A = 'age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';
+    const AGE_RECIPIENT_B = 'age1qtestrecipientbxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';
+    const AGE_RECIPIENT_C = 'age1qtestrecipientcxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';
+
+    /** A `fleet.lock` recording exactly `recipients`, written next to `file` — the SAME path `readFleetLock(manifestPath)` (the preflight) AND `apply-fleet.ts`'s own self-heal (`controlDir` == `dirname(manifestPath)` in this file's `fakeMutateDeps`, via `controlRepoOptions.makeScratchDir`) both read from. */
+    function writePriorLock(file: string, recipients: readonly string[]): void {
+      const body = `schema_version: 1\nfleet: demo-fleet\nagents: []\nage_recipients:\n${recipients.map((r) => `  - ${r}`).join('\n')}\n`;
+      writeFileSync(join(dirname(file), 'fleet.lock'), body, 'utf-8');
+    }
+
+    /** `FLEET_YAML`, but declaring BOTH recipients A and B — used only by the widening/swap tests below, which need a desired set with more than one member. Every other test in this block keeps the single-recipient `FLEET_YAML` default. */
+    const FLEET_YAML_WITH_TWO_AGE_RECIPIENTS = FLEET_YAML.replace(
+      'age_recipients: [age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]',
+      `age_recipients: [${AGE_RECIPIENT_A}, ${AGE_RECIPIENT_B}]`,
+    );
+
+    /** `FLEET_YAML`'s single-recipient default, plus the exact override acknowledgment text. */
+    const FLEET_YAML_WITH_OVERRIDE = FLEET_YAML.replace(
+      'age_recipients: [age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]',
+      `age_recipients: [${AGE_RECIPIENT_A}]\n  age_recipients_narrowing_override: "${AGE_RECIPIENTS_NARROWING_OVERRIDE_TEXT}"`,
+    );
+
+    it('DECISIVE (1): a strict subset of the recorded set is refused at PREFLIGHT — before observe/confirmPlan/buildAgentDeps are ever reached, naming the removed recipient', async () => {
+      const file = writeManifest(); // FLEET_YAML default — declares only recipient A
+      writePriorLock(file, [AGE_RECIPIENT_A, AGE_RECIPIENT_B]); // recorded set has A AND B — B is about to be dropped
+      let observeCalls = 0;
+      let confirmPlanCalls = 0;
+      let buildAgentDepsCalls = 0;
+
+      const code = await runBootstrapApply(
+        { file, yes: true },
+        {
+          observe: () => {
+            observeCalls += 1;
+            return Promise.resolve(EMPTY_OBSERVED);
+          },
+        },
+        fakeMutateDeps(file, {
+          confirmPlan: async () => {
+            confirmPlanCalls += 1;
+            return true;
+          },
+          buildAgentDeps: () => {
+            buildAgentDepsCalls += 1;
+            return fakeAgentDeps();
+          },
+        }),
+      );
+
+      expect(code).toBe(1);
+      // Same "never even read GitHub state" discipline as the macf#999 test
+      // above — a refusal that fired after `observe` would mean AC 1 ("before
+      // any GitHub call") was violated even though the function still
+      // returns non-zero.
+      expect(observeCalls).toBe(0);
+      expect(confirmPlanCalls).toBe(0);
+      expect(buildAgentDepsCalls).toBe(0);
+      expect(errs.join('\n')).toContain(AGE_RECIPIENT_B);
+      expect(errs.join('\n')).toContain('does not revoke');
+      const dir = join(file, '..');
+      expect(existsSync(join(dir, 'fleet.lock'))).toBe(true); // the PRE-EXISTING one this test wrote — untouched, not a fresh write
+      expect(existsSync(join(dir, 'secrets', 'vault.age'))).toBe(false);
+    });
+
+    it('the refusal is visible under --json too, and carries the age_recipients_narrowed code', async () => {
+      const file = writeManifest();
+      writePriorLock(file, [AGE_RECIPIENT_A, AGE_RECIPIENT_B]);
+      const code = await runBootstrapApply({ file, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+      expect(code).toBe(1);
+      expect(logs.length).toBeGreaterThan(0);
+      const parsed = JSON.parse(logs.join('\n')) as { error: { code: string; message: string } };
+      expect(parsed.error.code).toBe(AGE_RECIPIENTS_NARROWED_CODE);
+      expect(parsed.error.message).toContain(AGE_RECIPIENT_B);
+    });
+
+    it('--dry-run is ALSO refused — unconditional, same placement rationale as checkAppNameLengths/checkRegistryScopePreflight: a dry-run render for a narrowing manifest would itself be misleading', async () => {
+      const file = writeManifest();
+      writePriorLock(file, [AGE_RECIPIENT_A, AGE_RECIPIENT_B]);
+      let observeCalls = 0;
+      const code = await runBootstrapApply(
+        { file, dryRun: true },
+        {
+          observe: () => {
+            observeCalls += 1;
+            return Promise.resolve(EMPTY_OBSERVED);
+          },
+        },
+      );
+      expect(code).toBe(1);
+      expect(observeCalls).toBe(0);
+      expect(errs.join('\n')).toContain(AGE_RECIPIENT_B);
+    });
+
+    it('DECISIVE (2): widening (desired is a SUPERSET of recorded) is NOT refused — adding a recipient stays completely frictionless', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TWO_AGE_RECIPIENTS); // declares A and B
+      writePriorLock(file, [AGE_RECIPIENT_A]); // recorded set has ONLY A — B is being ADDED, not removed
+      const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(AGE_RECIPIENTS_NARROWED_CODE);
+    });
+
+    it('no recorded age_recipients at all (every fleet provisioned before groundnuty/macf#1252) is UNKNOWN, not narrowed — never refused', async () => {
+      const file = writeManifest(); // no fleet.lock written at all — nothing to compare against
+      const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(AGE_RECIPIENTS_NARROWED_CODE);
+    });
+
+    it('a recorded lock that predates the age_recipients field (schema_version 1, no age_recipients key) is ALSO unknown, not narrowed', async () => {
+      const file = writeManifest();
+      writeFileSync(join(dirname(file), 'fleet.lock'), 'schema_version: 1\nfleet: demo-fleet\nagents: []\n', 'utf-8');
+      const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(AGE_RECIPIENTS_NARROWED_CODE);
+    });
+
+    it('a same-size SWAP (drop B, add C) is STILL refused — proves the preflight wiring carries the set-difference predicate through, not a length check', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TWO_AGE_RECIPIENTS.replace(AGE_RECIPIENT_B, AGE_RECIPIENT_C)); // declares A and C
+      writePriorLock(file, [AGE_RECIPIENT_A, AGE_RECIPIENT_B]); // recorded has A and B
+      const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+      expect(code).toBe(1);
+      expect(errs.join('\n')).toContain(AGE_RECIPIENT_B);
+    });
+
+    it('an override present AND verbatim-correct proceeds — AND the resulting fleet.lock records the removal in age_recipients_removed_by_override (AC 4)', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_OVERRIDE); // declares ONLY A, with the override text
+      writePriorLock(file, [AGE_RECIPIENT_A, AGE_RECIPIENT_B]); // recorded has A and B — B is being dropped, acknowledged
+      const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+      expect(code).toBe(0);
+      expect(errs.join('\n')).not.toContain(AGE_RECIPIENTS_NARROWED_CODE);
+
+      const dir = join(file, '..');
+      const lock = parseFleetLock(readFileSync(join(dir, 'fleet.lock'), 'utf-8'));
+      expect(lock.age_recipients).toEqual([AGE_RECIPIENT_A]);
+      expect(lock.age_recipients_removed_by_override).toEqual([AGE_RECIPIENT_B]);
+    });
+
+    it('an override present but WRONG (paraphrase/stale copy) does NOT suppress the refusal — presence alone is not enough', async () => {
+      const file = writeManifest(FLEET_YAML.replace('age_recipients: [age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]', 'age_recipients: [age1qtestrecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]\n  age_recipients_narrowing_override: "yes, I am sure"'));
+      writePriorLock(file, [AGE_RECIPIENT_A, AGE_RECIPIENT_B]);
+      const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+      expect(code).toBe(1);
+      expect(errs.join('\n')).toContain(AGE_RECIPIENT_B);
+      expect(errs.join('\n')).toContain('does not revoke');
     });
   });
 

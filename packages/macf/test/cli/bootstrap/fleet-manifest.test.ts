@@ -228,6 +228,35 @@ describe('parseFleetManifest — transport.runner_platform_endpoint (groundnuty/
   });
 });
 
+describe('parseFleetManifest — transport.age_recipients_narrowing_override (groundnuty/macf#1230)', () => {
+  it('is undefined when omitted — the ordinary case for a fleet that has never narrowed its recipient set', () => {
+    const manifest = parseFleetManifest(VALID_FLEET_YAML);
+    expect(manifest.transport.age_recipients_narrowing_override).toBeUndefined();
+  });
+
+  it('accepts ANY non-empty string at PARSE time — the schema does not enforce the exact acknowledgment text', () => {
+    // Schema-level shape only; whether the text is the REQUIRED acknowledgment
+    // is `age-recipients-narrowing.ts::checkAgeRecipientsNarrowing`'s job (see
+    // that module's test), not `.strict()` schema validation — a wrong/stale
+    // override string parses fine and is refused downstream with a diagnostic
+    // naming the exact text, rather than a generic "invalid literal" here.
+    const withField = VALID_FLEET_YAML.replace(
+      'transport:\n  age_recipients: []',
+      "transport:\n  age_recipients: []\n  age_recipients_narrowing_override: 'not the real text'",
+    );
+    const manifest = parseFleetManifest(withField);
+    expect(manifest.transport.age_recipients_narrowing_override).toBe('not the real text');
+  });
+
+  it('rejects an empty-string value (`.min(1)`, same discipline as every other operator-supplied string field)', () => {
+    const bad = VALID_FLEET_YAML.replace(
+      'transport:\n  age_recipients: []',
+      "transport:\n  age_recipients: []\n  age_recipients_narrowing_override: ''",
+    );
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+});
+
 describe('parseFleetManifest — transport.vault_repo REMOVED (macf#857, DR-043 Amendment F)', () => {
   // Amendment F: "transport.vault_repo is REMOVED; the vault always lives in
   // the control repo ... Make the bad state unrepresentable — the vault
