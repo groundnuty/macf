@@ -721,9 +721,9 @@ export const APPLY_UNIMPLEMENTED_REASONS = {
   // delete yet"), not kind-level.
   rowFourDelete:
     'plan has computed this as a negative diff (fleet.lock records this tool as the one that provisioned it, and ' +
-    "it is no longer declared) but apply's deletion path is deliberately UNWIRED (DR-043 Amendment P3 scopes row 4 " +
-    'to plan-side computation only, groundnuty/macf#1229) — remove it by hand, or wait for a future increment that ' +
-    'wires confirmed per-item deletes; nothing above was changed for this item.',
+    "it is no longer declared) but apply's deletion path is deliberately left unwired in this change — plan " +
+    'computes the diff, nothing removes it automatically yet. Remove it by hand, or wait for a future increment ' +
+    'that wires confirmed per-item deletes; nothing above was changed for this item.',
 } as const;
 
 /**
