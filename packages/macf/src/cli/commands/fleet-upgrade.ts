@@ -36,7 +36,7 @@ import { readFileSync } from 'node:fs';
 import { readAgentConfig } from '../config.js';
 import { discoverWorkspaces } from '../discovery.js';
 import { createVmDriverFromConfig } from '../fleet/vm-driver.js';
-import { fetchLatestCliVersion } from '../version-resolver.js';
+import { fetchLatestCliVersion, statusMessage, type FetchResult } from '../version-resolver.js';
 import { buildRecordDeployedVersion } from '../bootstrap/fleet-lock-recorder.js';
 import { parseFleetManifest } from '../bootstrap/fleet-manifest.js';
 import { resolveTargetVersion, NO_MANIFEST_VERSION, type ManifestVersionInput } from '../bootstrap/version-target.js';
@@ -532,6 +532,43 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
  * `{ given: false }` — byte-identical to pre-macf#907 / pre-Amendment-L
  * standalone behavior (npm-latest remains the default target).
  */
+/**
+ * Builds the standalone `fetchLatest` seam (DR-043 Amendment L2.5's ONLY
+ * reachable npm-latest lookup — `version-target.ts`'s `resolveTargetVersion`
+ * calls this ONLY when no fleet.yaml was given at all).
+ *
+ * macf#777 — this used to be `async () => { const r = await
+ * fetchLatestCliVersion(); return r.status === 'ok' ? r.value : null; }`:
+ * `fetchLatestCliVersion()` already discriminates WHY a fetch didn't resolve
+ * (`network_error` / `rate_limited` / `not_published` / `invalid_response`,
+ * each carrying `FetchResult.detail` — host + `err.cause` reason for a
+ * genuine network failure), but that discrimination was thrown away at this
+ * exact call site — collapsed to a bare `null`, so every non-ok cause
+ * produced the SAME downstream message
+ * (`resolveTargetVersion`'s `'could not resolve npm-latest target — pass
+ * --target <version>'`), indistinguishable from a local config problem.
+ * This closure now logs the discriminated `statusMessage` BEFORE returning
+ * null — `resolveTargetVersion`'s generic error still fires (return value
+ * unchanged: `string | null`, control flow untouched), it is now preceded by
+ * a line naming which endpoint rejected the call and why.
+ *
+ * Exported (not inlined in `resolveDepsFromConfig`) so this diagnostic
+ * behavior is unit-testable without exercising the surrounding
+ * config-discovery I/O.
+ */
+export function buildCliFetchLatest(
+  fetchFn: () => Promise<FetchResult> = fetchLatestCliVersion,
+  log: (line: string) => void = (line) => console.error(line),
+): () => Promise<string | null> {
+  return async () => {
+    const r = await fetchFn();
+    if (r.status !== 'ok') {
+      log(`macf fleet upgrade: ${statusMessage('cli', r.status, r.detail)}`);
+    }
+    return r.status === 'ok' ? r.value : null;
+  };
+}
+
 async function resolveDepsFromConfig(projectDir: string, manifestFile?: string): Promise<FleetUpgradeDeps | null> {
   const config = readAgentConfig(projectDir);
   if (!config) {
@@ -560,10 +597,7 @@ async function resolveDepsFromConfig(projectDir: string, manifestFile?: string):
   return {
     discover,
     defaultFleet,
-    fetchLatest: async () => {
-      const r = await fetchLatestCliVersion();
-      return r.status === 'ok' ? r.value : null;
-    },
+    fetchLatest: buildCliFetchLatest(),
     resolveDriver: async (fleet: string): Promise<FleetDriver | null> => {
       const rep = discover().find((r) => r.project === fleet);
       if (!rep) {
