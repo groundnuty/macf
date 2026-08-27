@@ -22,6 +22,8 @@ import { githubRegistryObserver, readAgentRegistryInfo, vaultAwareObserver } fro
 import { bootstrapStatusToJson, computeBootstrapStatus, formatBootstrapStatusText } from '../bootstrap/status.js';
 import type { Presence } from '../bootstrap/plan.js';
 import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
+import { computeControlRepoManifestDrift, controlRepoManifestDriftToJson, formatControlRepoManifestDriftLines } from '../bootstrap/control-repo-manifest-drift.js';
+import { controlRepoFullName, realReadControlManifestFile } from '../bootstrap/control-repo.js';
 
 export interface RunBootstrapStatusOptions {
   readonly file: string;
@@ -36,6 +38,14 @@ export interface BootstrapStatusDeps {
   readonly observe: FleetObserverFn;
   /** Same signature as `observer.ts::readAgentRegistryInfo` — production wiring passes that function directly. */
   readonly readAgentRegistry: (registry: RegistryConfig, fleetName: string, role: string) => Promise<AgentRegistryObservation>;
+  /**
+   * groundnuty/macf#1249 — same signature as `control-repo.ts::realReadControlManifestFile`,
+   * production wiring passes that function directly. Read via plain `gh api`
+   * under the operator's ambient auth — no vault/App-JWT credential, unlike
+   * {@link readAgentRegistry}'s registry read or `install-scope-coverage.ts`'s
+   * probe (see `control-repo-manifest-drift.ts`'s module doc for why).
+   */
+  readonly readControlManifest: (repo: string) => Promise<string | undefined>;
 }
 
 function resolveDeps(manifestPath: string, vaultPath?: string, identityKeyPath?: string): BootstrapStatusDeps {
@@ -43,7 +53,7 @@ function resolveDeps(manifestPath: string, vaultPath?: string, identityKeyPath?:
     vaultPath !== undefined && identityKeyPath !== undefined
       ? (manifest: FleetManifest) => vaultAwareObserver(manifest, manifestPath, { vaultPath, identityPath: identityKeyPath })
       : (manifest: FleetManifest) => githubRegistryObserver(manifest, manifestPath);
-  return { observe, readAgentRegistry: readAgentRegistryInfo };
+  return { observe, readAgentRegistry: readAgentRegistryInfo, readControlManifest: realReadControlManifestFile };
 }
 
 function renderFailure(failure: FleetPlanFailure, opts: RunBootstrapStatusOptions): number {
@@ -139,6 +149,21 @@ export async function runBootstrapStatus(
         : {};
     const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
 
+    // groundnuty/macf#1249 — the committed-vs-local `fleet.yaml` drift
+    // check. Unlike `installScopeCoverage` above, this needs NO vault gate
+    // (see `control-repo-manifest-drift.ts`'s module doc), so it runs on
+    // every `status` invocation. Same standalone-append shape as
+    // `installScopeCoverage`: this is its OWN live `gh api` read, so
+    // folding it into `computeBootstrapStatus` would make that function
+    // impure.
+    const controlRepoManifestDrift = await computeControlRepoManifestDrift(
+      manifest,
+      controlRepoFullName(manifest),
+      observed.controlRepoPresence,
+      resolved.readControlManifest,
+    );
+    const controlRepoManifestDriftLines = formatControlRepoManifestDriftLines(controlRepoManifestDrift);
+
     if (opts.json) {
       console.log(
         JSON.stringify(
@@ -147,6 +172,7 @@ export async function runBootstrapStatus(
             ...(Object.keys(installScopeCoverage).length > 0
               ? { install_scope_coverage: Object.values(installScopeCoverage).map(installScopeCoverageEntryToJson) }
               : {}),
+            control_repo_manifest_drift: controlRepoManifestDriftToJson(controlRepoManifestDrift),
           },
           null,
           2,
@@ -157,6 +183,10 @@ export async function runBootstrapStatus(
       if (installScopeCoverageLines.length > 0) {
         console.log('');
         console.log(installScopeCoverageLines.join('\n'));
+      }
+      if (controlRepoManifestDriftLines.length > 0) {
+        console.log('');
+        console.log(controlRepoManifestDriftLines.join('\n'));
       }
     }
     return 0;

@@ -102,6 +102,7 @@ describe('runBootstrapStatus', () => {
         throw new Error('boom');
       },
       readAgentRegistry: async () => ({ status: 'confirmed', presence: 'absent' }),
+      readControlManifest: async () => undefined,
     };
     const code = await runBootstrapStatus({ file, json: true }, deps);
     expect(code).toBe(1);
@@ -120,6 +121,7 @@ describe('runBootstrapStatus', () => {
     const deps: BootstrapStatusDeps = {
       observe: async () => observed,
       readAgentRegistry: async () => PRESENT_REGISTRY,
+      readControlManifest: async () => undefined,
     };
     const code = await runBootstrapStatus({ file, json: true }, deps);
     expect(code).toBe(0);
@@ -144,6 +146,7 @@ describe('runBootstrapStatus', () => {
     const deps: BootstrapStatusDeps = {
       observe: async () => EMPTY_OBSERVED,
       readAgentRegistry: async () => PRESENT_REGISTRY,
+      readControlManifest: async () => undefined,
     };
     const code = await runBootstrapStatus({ file }, deps);
     expect(code).toBe(0);
@@ -161,7 +164,7 @@ describe('runBootstrapStatus', () => {
     dirs.push(dir);
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const readAgentRegistry = vi.fn(async () => PRESENT_REGISTRY);
-    const deps: BootstrapStatusDeps = { observe: async () => EMPTY_OBSERVED, readAgentRegistry };
+    const deps: BootstrapStatusDeps = { observe: async () => EMPTY_OBSERVED, readAgentRegistry, readControlManifest: async () => undefined };
     await runBootstrapStatus({ file }, deps);
     expect(readAgentRegistry).toHaveBeenCalledTimes(1);
     expect(readAgentRegistry).toHaveBeenCalledWith(expect.objectContaining({ type: 'profile' }), 'icsoc-2026', 'code-agent');
@@ -205,7 +208,11 @@ describe('runBootstrapStatus', () => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const vaultPath = join(dir, 'does-not-exist', 'vault.age');
     const identityKeyPath = join(dir, 'does-not-exist', 'identity.txt');
-    const deps: BootstrapStatusDeps = { observe: async () => EMPTY_OBSERVED, readAgentRegistry: async () => ({ status: 'unknown', reason: 'not queried in this test' }) };
+    const deps: BootstrapStatusDeps = {
+      observe: async () => EMPTY_OBSERVED,
+      readAgentRegistry: async () => ({ status: 'unknown', reason: 'not queried in this test' }),
+      readControlManifest: async () => undefined,
+    };
     const code = await runBootstrapStatus({ file, json: true, vaultPath, identityKeyPath }, deps);
     expect(code).toBe(0);
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
@@ -219,11 +226,78 @@ describe('runBootstrapStatus', () => {
     const { dir, file } = writeManifest(VALID_FLEET_YAML);
     dirs.push(dir);
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const deps: BootstrapStatusDeps = { observe: async () => EMPTY_OBSERVED, readAgentRegistry: async () => ({ status: 'unknown', reason: 'not queried in this test' }) };
+    const deps: BootstrapStatusDeps = {
+      observe: async () => EMPTY_OBSERVED,
+      readAgentRegistry: async () => ({ status: 'unknown', reason: 'not queried in this test' }),
+      readControlManifest: async () => undefined,
+    };
     const code = await runBootstrapStatus({ file, json: true }, deps);
     expect(code).toBe(0);
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as Record<string, unknown>;
     expect('install_scope_coverage' in json).toBe(false);
+  });
+
+  // groundnuty/macf#1249 — `control_repo_manifest_drift` is ALWAYS present
+  // (unlike `install_scope_coverage`, which is omitted when there is
+  // nothing to check): this check needs no `--vault`/`--identity-key` gate
+  // (see `control-repo-manifest-drift.ts`'s module doc), so it runs on
+  // every `status` invocation regardless of flags.
+  it('a committed manifest that differs from the local one: `control_repo_manifest_drift` reports drift, naming the field', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const staleCommitted = VALID_FLEET_YAML.replace('advertise_host: example.ts.net', 'advertise_host: stale.ts.net');
+    const deps: BootstrapStatusDeps = {
+      observe: async () => ({ ...EMPTY_OBSERVED, controlRepoPresence: 'present' }),
+      readAgentRegistry: async () => ({ status: 'unknown', reason: 'not queried in this test' }),
+      readControlManifest: async () => staleCommitted,
+    };
+    const code = await runBootstrapStatus({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
+      control_repo_manifest_drift?: { status: string; fields: ReadonlyArray<{ path: string }> };
+    };
+    expect(json.control_repo_manifest_drift?.status).toBe('drift');
+    expect(json.control_repo_manifest_drift?.fields.map((f) => f.path)).toEqual(['network.advertise_host']);
+  });
+
+  it('an identical committed manifest: `control_repo_manifest_drift` reports clean, in both --json and plain-text mode', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const deps: BootstrapStatusDeps = {
+      observe: async () => ({ ...EMPTY_OBSERVED, controlRepoPresence: 'present' }),
+      readAgentRegistry: async () => ({ status: 'unknown', reason: 'not queried in this test' }),
+      readControlManifest: async () => VALID_FLEET_YAML,
+    };
+    const code = await runBootstrapStatus({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { control_repo_manifest_drift?: { status: string; fields: unknown[] } };
+    expect(json.control_repo_manifest_drift?.status).toBe('clean');
+    expect(json.control_repo_manifest_drift?.fields).toEqual([]);
+
+    logSpy.mockClear();
+    const textCode = await runBootstrapStatus({ file }, deps);
+    expect(textCode).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).not.toContain('control-repo-manifest-drift');
+  });
+
+  it('control repo not confirmed present (the default `EMPTY_OBSERVED` fixture): `control_repo_manifest_drift` is unknown, never clean/drift', async () => {
+    const { dir, file } = writeManifest(VALID_FLEET_YAML);
+    dirs.push(dir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const deps: BootstrapStatusDeps = {
+      observe: async () => EMPTY_OBSERVED, // controlRepoPresence: 'absent'
+      readAgentRegistry: async () => ({ status: 'unknown', reason: 'not queried in this test' }),
+      readControlManifest: async () => {
+        throw new Error('must not be called — presence check short-circuits before any read');
+      },
+    };
+    const code = await runBootstrapStatus({ file, json: true }, deps);
+    expect(code).toBe(0);
+    const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { control_repo_manifest_drift?: { status: string } };
+    expect(json.control_repo_manifest_drift?.status).toBe('unknown');
   });
 });
 
@@ -387,6 +461,8 @@ describe('runBootstrapStatus — no-mutation guarantee (static import-shape asse
     './advertise-host-drift.js', // pure comparison only (groundnuty/macf#1203) — no gh/network, see that module's doc
     '../commands/ps.js',
     '../bootstrap/install-scope-coverage.js', // groundnuty/macf#1220 — read-only: GET /repos/.../installation under an App JWT + a vault DECRYPT (read), no GitHub write; writeScratchPem/cleanupScratchPem are a LOCAL fs scratch file, never a mutation
+    '../bootstrap/control-repo-manifest-drift.js', // groundnuty/macf#1249 — pure diff + a `readManifestFile` callback this file supplies; no I/O of its own
+    '../bootstrap/control-repo.js', // groundnuty/macf#1249 — only `controlRepoFullName` (pure string derivation) + `realReadControlManifestFile` (GET /repos/.../contents/fleet.yaml, read-only) are used here; this module ALSO exports write-capable functions (`provisionControlRepo`, `realControlRepoCommitAndPush`) that this file never imports
   ]);
 
   function importSpecifiers(source: string): readonly string[] {
