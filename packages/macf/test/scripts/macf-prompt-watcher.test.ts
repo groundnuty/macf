@@ -1234,3 +1234,172 @@ describe('macf-prompt-watcher.sh — retry path shares the pre-Enter guard with 
     15_000,
   );
 });
+
+/**
+ * groundnuty/macf#778: the #712 own-output strip (`_strip_own_output`,
+ * `grep -vF "$OWN_MARKER"`) discriminates by MARKER PRESENCE, but an ALERT
+ * line is long (it embeds a frame excerpt) and routinely exceeds the pane's
+ * column width. Captured via plain `tmux capture-pane -p` (no `-J`), tmux
+ * renders that ONE logical line as MULTIPLE physical rows — the marker
+ * lands only on the FIRST row. `grep -vF` strips that row and leaves the
+ * WRAPPED CONTINUATION rows behind, unmarked — a capture that includes its
+ * own echo, incompletely discriminated. When a continuation row carries the
+ * embedded `❯ N.` excerpt (routine — that excerpt is exactly what wrapped),
+ * it still "looks prompt-like" on the next poll: the watcher re-triggers on
+ * its own prior output.
+ *
+ * This stub renders ONE logical line either WRAPPED at `cols` columns
+ * (plain `-p`) or JOINED (`-p -J`) from a single source string, so the two
+ * renderings cannot drift apart from each other. Behavior verified against
+ * a REAL tmux 3.4 pane at 40 columns before writing this stub: an ALERT
+ * line's `❯ 1. Continue` tail survives `grep -vF` under plain `-p` and does
+ * not survive under `-p -J`.
+ */
+function makeWrappingStubTmuxDir(logicalLine: string, cols: number): string {
+  const dir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-tmux-wrap-'));
+  const rows: string[] = [];
+  for (let i = 0; i < logicalLine.length; i += cols) {
+    rows.push(logicalLine.slice(i, i + cols));
+  }
+  if (rows.length === 0) rows.push('');
+  const wrappedFile = join(dir, 'pane-wrapped.txt');
+  const joinedFile = join(dir, 'pane-joined.txt');
+  const sendsFile = join(dir, 'sends.log');
+  writeFileSync(wrappedFile, `${rows.join('\n')}\n`);
+  writeFileSync(joinedFile, `${logicalLine}\n`);
+  // Branches on the LITERAL `-J` argv token, mirroring exactly how
+  // `_capture` invokes tmux (`-p -J`, two separate flags) — this is what
+  // makes the stub flag-SENSITIVE rather than a vacuous pass-through: if
+  // `_capture` regresses back to plain `-p` (the pre-#778-fix shape), the
+  // stub genuinely serves the WRAPPED file, not a hardcoded "always joined"
+  // answer, so the mutation check below actually exercises the code change.
+  const shim = `#!/usr/bin/env bash
+set -euo pipefail
+cmd="\${1:-}"
+case "$cmd" in
+  capture-pane)
+    shift || true
+    has_j=0
+    for a in "$@"; do
+      [ "$a" = "-J" ] && has_j=1
+    done
+    if [ "$has_j" -eq 1 ]; then
+      cat "${joinedFile}" 2>/dev/null || true
+    else
+      cat "${wrappedFile}" 2>/dev/null || true
+    fi
+    ;;
+  send-keys)
+    echo "SEND: $*" >> "${sendsFile}"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`;
+  writeFileSync(join(dir, 'tmux'), shim);
+  chmodSync(join(dir, 'tmux'), 0o755);
+  return dir;
+}
+
+describe('macf-prompt-watcher.sh — own-output strip survives line-wrapping (macf#778)', () => {
+  const COLS = 50;
+
+  it('DECISIVE 1: a genuine unknown prompt that wraps across physical rows still ALERTs (detection unaffected by -J)', () => {
+    // A real, never-before-emitted unknown menu line, long enough to wrap
+    // at 50 columns — models the live incident's actual Claude Code
+    // startup dialog (`❯ 1. Continue / 2. Fix with Claude / 3. Exit`),
+    // not the watcher's own output.
+    const genuineLine =
+      '❯ 1. Continue with existing project settings that could not be fully validated';
+    expect(genuineLine.length).toBeGreaterThan(COLS); // sanity: must actually wrap
+    const tmuxDir = makeWrappingStubTmuxDir(genuineLine, COLS);
+    const stateDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-state-'));
+    const workDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-work-'));
+    const configDir = join(workDir, '.macf');
+    const configPath = join(configDir, 'prompt-responses.json');
+    try {
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(configPath, MINIMAL_CONFIG);
+      const res = spawnSync('bash', [WATCHER_SCRIPT, '%99'], {
+        encoding: 'utf-8',
+        env: {
+          PATH: `${tmuxDir}:${process.env['PATH'] ?? ''}`,
+          MACF_PROMPT_RESPONSES_PATH: configPath,
+          MACF_LOG_PATH: join(stateDir, 'channel.log'),
+          MACF_PROMPT_WATCH_WINDOW_SECS: '2',
+          MACF_PROMPT_WATCH_INTERVAL_SECS: '1',
+          MACF_PROMPT_WATCH_TOTAL_CAP_SECS: '2',
+        },
+      });
+      expect(res.status).toBe(0);
+      expect(res.stderr).toContain('ALERT: UNKNOWN prompt-like frame');
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+      rmSync(workDir, { recursive: true, force: true });
+      rmSync(tmuxDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("DECISIVE 2: the watcher's OWN wrapped ALERT output, textually similar to a real prompt, does NOT trigger a new alert or any send", () => {
+    // The exact shape `_maybe_alert_unknown` emits: marker + prefix +
+    // embedded "First line: ❯ 1. Continue" excerpt — pre-seeded into the
+    // pane as if written by an earlier poll of THIS SAME watcher, long
+    // enough to wrap at 50 columns so the marker and the `❯ 1.` excerpt
+    // land on DIFFERENT physical rows under plain `-p`.
+    const ownAlertLine =
+      '[macf-prompt-watcher] ALERT: UNKNOWN prompt-like frame on pane %42 not on the allowlist — NOT answering (Inv 1). First line: ❯ 1. Continue';
+    expect(ownAlertLine.length).toBeGreaterThan(COLS * 2); // sanity: wraps across 3+ rows
+    const tmuxDir = makeWrappingStubTmuxDir(ownAlertLine, COLS);
+    const stateDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-state-'));
+    const workDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-work-'));
+    const configDir = join(workDir, '.macf');
+    const configPath = join(configDir, 'prompt-responses.json');
+    try {
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(configPath, MINIMAL_CONFIG);
+      const res = spawnSync('bash', [WATCHER_SCRIPT, '%99'], {
+        encoding: 'utf-8',
+        env: {
+          PATH: `${tmuxDir}:${process.env['PATH'] ?? ''}`,
+          MACF_PROMPT_RESPONSES_PATH: configPath,
+          MACF_LOG_PATH: join(stateDir, 'channel.log'),
+          MACF_PROMPT_WATCH_WINDOW_SECS: '2',
+          MACF_PROMPT_WATCH_INTERVAL_SECS: '1',
+          MACF_PROMPT_WATCH_TOTAL_CAP_SECS: '2',
+        },
+      });
+      expect(res.status).toBe(0);
+      // Honest-unknown, sharpest form: acts on NEITHER surface. No new
+      // alert from THIS run's own stderr (distinct from the pre-seeded pane
+      // content, which is what an unfixed `_capture` would re-detect)...
+      expect(res.stderr).not.toContain('ALERT: UNKNOWN prompt-like frame');
+      // ...and no send-keys fires either (Inv 1 — never guess).
+      const sendsFile = join(tmuxDir, 'sends.log');
+      expect(existsSync(sendsFile)).toBe(false);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+      rmSync(workDir, { recursive: true, force: true });
+      rmSync(tmuxDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("the alert excerpt is sanitized so the watcher's OWN emitted text can never itself look prompt-like (defense-in-depth)", () => {
+    // Independent of capture/-J: assert the TEXT `_maybe_alert_unknown`
+    // writes never contains a raw `❯` glyph or a `(y/n)`-shaped substring,
+    // so even a capture path this fix does not reach (e.g. character-level
+    // interleaving from the TUI redrawing at absolute cursor positions)
+    // cannot re-trigger `_looks_prompt_like` on the watcher's own text.
+    const unknownFrame = '❯ 1. Some unrecognized option (y/n)\n  2. Another option\n';
+    const result = runWatcher({ initialFrame: unknownFrame, windowSecs: 2, intervalSecs: 1 });
+    const alertLines = result.paneContents
+      .split('\n')
+      .filter((l) => l.includes('ALERT: UNKNOWN prompt-like frame'));
+    expect(alertLines.length).toBeGreaterThanOrEqual(1);
+    for (const line of alertLines) {
+      expect(line).not.toContain('❯');
+      expect(line).not.toMatch(/\((y\/n|y\/N|Y\/n)\)/);
+      expect(line).not.toMatch(/\[(y\/N|Y\/n|y\/n)\]/);
+    }
+  }, 15_000);
+});

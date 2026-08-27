@@ -303,8 +303,26 @@ _strip_own_output() {
   printf '%s' "$1" | grep -vF -- "$OWN_MARKER" || true
 }
 
+# groundnuty/macf#778: the #712 strip above is a CAPTURE THAT INCLUDES ITS
+# OWN ECHO, incompletely discriminated. An ALERT line is long (it embeds a
+# frame excerpt) and routinely exceeds the pane's column width, so
+# `tmux capture-pane -p` (no `-J`) renders it as MULTIPLE physical rows — the
+# marker sits only on the FIRST row. `grep -vF "$OWN_MARKER"` strips that one
+# row and leaves the wrapped CONTINUATION rows behind, unmarked. When a
+# continuation row happens to carry the embedded `❯ N.` excerpt (routine,
+# since that excerpt is exactly what wrapped), it still "looks prompt-like"
+# on the next poll — a fresh, non-deduped alert (its content shifts every
+# time), i.e. the watcher re-triggers on its own prior output. `-J` tells
+# tmux to join wrapped physical rows back into the ONE logical line it always
+# was, using tmux's own internal wrap tracking (not something we can safely
+# reconstruct from unwrapped text after the fact) — so the marker match now
+# covers the entire ALERT line, continuation included, and the strip is
+# complete regardless of ALERT-line length vs pane width. Verified against
+# real tmux (3.4): the same ALERT text at a 40-col pane width leaves
+# `line: ❯ 1. Continue` unmarked and re-matchable under plain `-p`; under
+# `-p -J` nothing prompt-like survives the strip.
 _capture() {
-  local raw; raw="$(tmux capture-pane -t "$PANE" -p 2>/dev/null || true)"
+  local raw; raw="$(tmux capture-pane -t "$PANE" -p -J 2>/dev/null || true)"
   _strip_own_output "$raw"
 }
 
@@ -399,15 +417,40 @@ _prompt_signature() {
   printf '%s' "$1" | grep -E "$PROMPT_LIKE_YN_RE" || true
 }
 
+# _sanitize_excerpt <text> → <text> with the exact substrings
+# PROMPT_LIKE_MENU_RE / PROMPT_LIKE_YN_RE match neutralized (❯ glyph;
+# (y/n)-shaped groups). Defense-in-depth for groundnuty/macf#778: the -J
+# capture fix above closes the WRAPPED-continuation self-match, but a
+# residual shape remains that -J cannot reach — character-level interleaving
+# from the TUI redrawing at absolute cursor positions while the watcher
+# writes at its own (an ALERT byte landing next to unrelated on-screen text,
+# e.g. the live-observed "❯macfContinuewatcher] ALERT: ..."). There the
+# `[macf-prompt-watcher]` marker itself is broken up, so neither
+# `grep -vF`'s marker-match nor `-J`'s row-join can recover it. Sanitizing
+# what we EMIT — so the alert text can never itself be prompt-shaped, no
+# matter how it re-enters a captured frame — is the only defense that
+# reaches that case. This ONLY touches the text handed to `_alert` for
+# display; it must never touch `_looks_prompt_like`'s detection input ($1
+# here, used unsanitized above for `sig`/`h`) — sanitizing what the watcher
+# reads instead of what it writes would blind real-prompt detection, not
+# just its own echo.
+_sanitize_excerpt() {
+  printf '%s' "$1" | sed \
+    -e 's/❯/[cursor]/g' \
+    -e 's/(y\/n)/(y-n)/g' -e 's/(y\/N)/(y-N)/g' -e 's/(Y\/n)/(Y-n)/g' \
+    -e 's/\[y\/N\]/[y-N]/g' -e 's/\[Y\/n\]/[Y-n]/g' -e 's/\[y\/n\]/[y-n]/g'
+}
+
 # --- unknown-prompt alert (dedup per distinct frame) -------------------------
 LAST_UNKNOWN=""
 _maybe_alert_unknown() { # <frame>
-  local sig h
+  local sig h excerpt
   sig="$(_prompt_signature "$1")"
   h="$(printf '%s' "$sig" | cksum 2>/dev/null | awk '{print $1}' || echo x)"
   [ "$h" = "$LAST_UNKNOWN" ] && return 0
   LAST_UNKNOWN="$h"
-  _alert "UNKNOWN prompt-like frame on pane $PANE not on the allowlist — NOT answering (Inv 1). First line: $(printf '%s' "$sig" | head -n1 | sed 's/^[[:space:]]*//' | cut -c1-120)"
+  excerpt="$(printf '%s' "$sig" | head -n1 | sed 's/^[[:space:]]*//' | cut -c1-120)"
+  _alert "UNKNOWN prompt-like frame on pane $PANE not on the allowlist — NOT answering (Inv 1). First line: $(_sanitize_excerpt "$excerpt")"
 }
 
 # --- deadline extension (macf#1041) -------------------------------------
