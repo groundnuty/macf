@@ -134,6 +134,16 @@ import { describeRunnerPlatformEndpointResolution, type RunnerPlatformEndpointRe
 // one-directional-runtime-dependency shape this file documents repeatedly
 // for `apply-routing.js`/`apply-router-app.js`/`runner-platform.js` above.
 import type { InstallScopeCoverageEntry } from './install-scope-coverage.js';
+// groundnuty/macf#1281 — reuses `app-identity-removal.ts`'s OWN
+// org/user-branching App-Advanced-tab URL (the exact convention this issue's
+// AC says to read first, not reinvent) for a row-4 App-orphan item's
+// "delete it yourself here" link. `app-identity-removal.ts` only ever
+// `import type`s from THIS module (`Presence`, transitively via `observer.js`
+// too — see that file's own imports), so this is the SAME
+// one-directional-runtime-dependency shape this file documents repeatedly
+// above (`apply-routing.js`/`apply-router-app.js`/`runner-platform.js`):
+// acyclic at runtime.
+import { appSettingsAdvancedUrl } from './app-identity-removal.js';
 
 // --- Observed state (the reconcile input; populated by an observer, consumed as data) ---
 
@@ -1058,6 +1068,42 @@ function presenceVerb(
         reasonSuffix: `${unknownReason} — treated as a create-candidate, LOW CONFIDENCE`,
       };
   }
+}
+
+/**
+ * groundnuty/macf#1281 — the exact URL a row-4 `orphan` item points the
+ * operator at to delete/archive the resource BY HAND (this tool never
+ * touches it — see the module-doc `orphan` entry). One dispatch point so
+ * `computePlan`'s two orphan branches (`kind: 'app'` / `kind: 'repo'`) never
+ * hand-roll the URL logic twice.
+ *
+ * **`'app'` is ALWAYS resolvable.** `owner.type` is a required manifest
+ * field (never ambiguous) and {@link deriveAppHandle} is a deterministic
+ * derivation from `fleetName` + `role` (both always in scope at the
+ * `computePlan` call site) — so there is no `'unknown'` branch to reach
+ * here. Delegates to `app-identity-removal.ts`'s {@link appSettingsAdvancedUrl}
+ * — the SAME org/user-branching Advanced-tab URL that module's teardown
+ * report already points an operator at for the identical "delete this App
+ * by hand" reason, per this issue's own AC ("read [the convention] first;
+ * do not invent a second convention").
+ *
+ * **`'repo'` is NEVER resolvable — always `'unknown'`, and this is by
+ * design, not a gap to fill later.** `FleetLockAgentSchema` carries no
+ * `repo` field (only a manifest-DECLARED `FleetAgent.repo` does, and a row-4
+ * role has no manifest entry — that is the entire premise of "extra role").
+ * `apply-delete.ts`'s own module doc hit this identical wall for the
+ * `'secret_fingerprint'` delete-verb case and refused to guess rather than
+ * risk a wrong target; the same refusal applies here, more sharply, because
+ * a WRONG link actively sends the operator to delete the wrong repository
+ * (worse than no link at all — this issue's own framing). Guessing a name
+ * by convention is also unsound on the merits: `templates/bootstrap-spec.example.json`'s
+ * own worked example shows a repo name is operator-supplied free text, not
+ * derived from `role` (`code-agent`'s repo is `icsoc-2026-experiment`, not
+ * `icsoc-2026-code-agent`).
+ */
+export function orphanResourceUrl(kind: 'app' | 'repo', fleetName: string, role: string, owner: FleetManifest['owner']): string {
+  if (kind === 'repo') return 'unknown';
+  return appSettingsAdvancedUrl(owner, deriveAppHandle(fleetName, role));
 }
 
 function appItem(fleetName: string, agent: FleetAgent, obs: ObservedAgentState | undefined): PlanItem {
@@ -2413,27 +2459,33 @@ export function computePlan(
     // can confirm present, never prove absent; an unconfirmed presence
     // earns no claim in either direction here).
     if (obs?.app === 'present') {
+      const url = orphanResourceUrl('app', fleetName, role, manifest.owner);
       items.push({
         kind: 'app',
         target: `agent:${role}:app`,
         verb: 'orphan',
         reason:
           `GitHub App for "${role}" was provisioned by this tool (recorded in fleet.lock) but "${role}" is no ` +
-          'longer declared — never auto-removed (2 clicks to recreate, but the private key is emitted once and ' +
-          'unrecoverable); un-install/delete it by hand if it should go away.',
+          'longer declared. NOTHING WAS DELETED — apply never auto-removes it, under any flag (2 clicks to ' +
+          'recreate, but the private key is emitted once and unrecoverable). If it should go away, delete it ' +
+          `yourself here (Settings → Advanced → "Delete GitHub App"): ${url}`,
         confirm_required: false,
       });
     }
     // Repos: orphan (un-archive is 0 clicks; recreate loses history).
     if (obs?.repo === 'present') {
+      const url = orphanResourceUrl('repo', fleetName, role, manifest.owner);
       items.push({
         kind: 'repo',
         target: `agent:${role}:repo`,
         verb: 'orphan',
         reason:
           `The repo for "${role}" was provisioned by this tool (recorded in fleet.lock) but "${role}" is no ` +
-          'longer declared — never auto-removed (recreating a repo loses its history; un-archiving is 0 clicks); ' +
-          'archive or delete it by hand if it should go away.',
+          'longer declared. NOTHING WAS DELETED — apply never auto-removes it, under any flag (recreating a ' +
+          `repo loses its history; un-archiving is 0 clicks). If it should go away, archive or delete it ` +
+          `yourself on its GitHub settings page: ${url} (this tool cannot name that page — fleet.lock does not ` +
+          `record which repo a no-longer-declared role used; search your GitHub ${manifest.owner.type === 'org' ? `organization "${manifest.owner.account}"` : 'account'}'s ` +
+          `repo list for one it created for role "${role}").`,
         confirm_required: false,
       });
     }
@@ -2624,6 +2676,26 @@ export function formatSkippedLines(sections: readonly SkippedSection[]): readonl
  */
 export function formatUnimplementedLines(items: readonly UnimplementedApplyItem[]): readonly string[] {
   return items.map((i) => `${i.kind}: ${i.target} (${i.verb}) — NOT IMPLEMENTED BY APPLY (${i.reason})`);
+}
+
+/**
+ * groundnuty/macf#1281 — one loud line per `orphan`-verb item —
+ * `<kind>: <target> — <reason>`. `reason` already carries the "NOTHING WAS
+ * DELETED, delete it yourself here: <url-or-unknown>" text baked in at
+ * construction time ({@link orphanResourceUrl} + `computePlan`'s row-4
+ * `app`/`repo` branches), so this formatter never re-derives wording a
+ * second time — same "one wording, reused" discipline
+ * {@link formatUnimplementedLines} above already establishes for its own
+ * per-item text.
+ *
+ * Shared verbatim between the `plan` surface ({@link formatPlanText} below)
+ * and the `apply` surface (`bootstrap-apply.ts`'s `formatApprovalBanner`) —
+ * this issue's own AC requires the SAME text on both, and importing one
+ * function is what makes "same" a structural guarantee rather than two
+ * independently-drifting copies.
+ */
+export function formatOrphanLines(items: readonly PlanItem[]): readonly string[] {
+  return items.filter((i) => i.verb === 'orphan').map((i) => `${i.kind}: ${i.target} — ${i.reason}`);
 }
 
 /**
@@ -2872,6 +2944,22 @@ export function formatPlanText(plan: FleetPlan): string {
       `⚠ apply cannot action ${String(plan.unimplementedByApply.length)} item(s) below yet — approving this plan ` +
         'will NOT create, update, or delete them; they are NOT implemented, this is not "nothing to do":',
       ...unimplementedLines,
+    );
+  }
+  // groundnuty/macf#1281 — the ORPHAN verb, spelled out. The table above
+  // already carries this same text in each row's REASON column, but
+  // `orphan` next to a resource name reads as jargon on a skim — this block
+  // restates it in a loud, impossible-to-miss form, the same "table row PLUS
+  // a dedicated loud block" shape `unimplementedLines` immediately above
+  // already establishes for its own verb.
+  const orphanLines = formatOrphanLines(plan.items);
+  if (orphanLines.length > 0) {
+    parts.push(
+      '',
+      `⚠ ${String(orphanLines.length)} resource(s) below are ORPHAN — created by this tool, no longer declared, ` +
+        'and NEVER deleted by apply, under any flag. NOTHING IS DELETED for these; each line names how to ' +
+        'remove it yourself, by hand, if it should go away:',
+      ...orphanLines,
     );
   }
   const registryScopeLines = formatRegistryScopeLines(plan.registryScopeIssues);

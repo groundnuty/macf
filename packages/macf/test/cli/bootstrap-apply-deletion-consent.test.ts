@@ -243,20 +243,35 @@ describe('formatApprovalBanner — decisive pair (groundnuty/macf#1272)', () => 
     expect(text).not.toMatch(/WILL DELETE/);
   });
 
-  it('a plan with ONLY orphan items ALSO retains "Nothing is deleted" — orphan removes nothing, so the sentence stays true', () => {
+  it('a plan with ONLY orphan items ALSO retains "Nothing is deleted" — orphan removes nothing, so the sentence stays true — AND names each orphan with its own "not deleted" text (groundnuty/macf#1281)', () => {
     const plan = basePlan([APP_ORPHAN_ITEM, REPO_ORPHAN_ITEM]);
     const text = formatApprovalBanner(plan, [], []);
     expect(text).toContain('Nothing is deleted (§D3 no-prune).');
     expect(text).not.toMatch(/WILL DELETE/);
+    // groundnuty/macf#1281 — before this issue, an orphan item was
+    // completely invisible on this surface; now each one is named, with the
+    // explicit "nothing is deleted" framing restated in a loud block.
+    expect(text).toContain(APP_ORPHAN_ITEM.target);
+    expect(text).toContain(REPO_ORPHAN_ITEM.target);
+    expect(text).toMatch(/NOTHING IS DELETED/);
   });
 
-  it('a mix of orphan + delete items: the enumeration appears, orphan items are NEVER named in it', () => {
+  it('a mix of orphan + delete items: the DELETION ENUMERATION never names an orphan item, but the SEPARATE orphan block does (groundnuty/macf#1281)', () => {
     const plan = basePlan([APP_ORPHAN_ITEM, REPO_ORPHAN_ITEM, ROUTING_DELETE_ITEM]);
     const text = formatApprovalBanner(plan, [], [EXECUTABLE_ROUTING_ACTION]);
     expect(text).not.toContain('Nothing is deleted');
     expect(text).toContain('This apply WILL DELETE 1 resource(s) this run:');
-    expect(text).not.toContain(APP_ORPHAN_ITEM.target);
-    expect(text).not.toContain(REPO_ORPHAN_ITEM.target);
+    // `formatDeletionEnumerationLines` itself is untouched by #1281 — still
+    // derived ONLY from delete-verb `DeletionAction[]`, never from orphan
+    // items (this is the property the ORIGINAL version of this test named
+    // "the enumeration").
+    const enumerationLines = formatDeletionEnumerationLines([EXECUTABLE_ROUTING_ACTION]).join('\n');
+    expect(enumerationLines).not.toContain(APP_ORPHAN_ITEM.target);
+    expect(enumerationLines).not.toContain(REPO_ORPHAN_ITEM.target);
+    // But the banner AS A WHOLE now names both orphan items too, in a
+    // dedicated block distinct from the deletion enumeration above.
+    expect(text).toContain(APP_ORPHAN_ITEM.target);
+    expect(text).toContain(REPO_ORPHAN_ITEM.target);
   });
 
   it('a non-executable delete item (secret_fingerprint) is named as SKIPPED, not claimed as deleted', () => {
