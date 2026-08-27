@@ -457,6 +457,7 @@ export function serializeFleetLock(lock: FleetLock): string {
     fingerprints?: Record<string, string>;
     scope_credentials?: ScopeCredentialMarker[];
     age_recipients?: string[];
+    age_recipients_removed_by_override?: string[];
   } = {
     schema_version: validated.schema_version,
     fleet: validated.fleet,
@@ -471,6 +472,13 @@ export function serializeFleetLock(lock: FleetLock): string {
   // above): position is real information here (mergeAgeRecipients's own
   // doc), so this is a verbatim copy, order preserved.
   if (validated.age_recipients !== undefined) ordered.age_recipients = [...validated.age_recipients];
+  // groundnuty/macf#1230 — the append-only override ledger. Already sorted +
+  // deduplicated by `mergeAgeRecipientsRemovedByOverride` (unlike
+  // `age_recipients` immediately above, position carries no meaning here),
+  // so this copy needs no further ordering — same "verbatim copy" shape.
+  if (validated.age_recipients_removed_by_override !== undefined) {
+    ordered.age_recipients_removed_by_override = [...validated.age_recipients_removed_by_override];
+  }
   return `${JSON.stringify(ordered, null, 2)}\n`;
 }
 
