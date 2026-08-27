@@ -125,7 +125,8 @@ import {
   tokenSourceFromConfig,
   agentCertPath,
   agentKeyPath,
-  caCertPath as caCertPathFor,
+  ownerAccountFromRegistry,
+  resolveExistingCaPaths,
 } from '../config.js';
 import { createClientFromConfig } from '../registry-helper.js';
 import {
@@ -539,8 +540,8 @@ export function parseRoutingClientCertIssuer(
 /**
  * Compare the recorded routing-client cert issuer fingerprint against the
  * project's CURRENT CA fingerprint. Pure w.r.t. its inputs — the CURRENT CA
- * fingerprint is read from LOCAL disk (`caCertPathFor`, the same source of
- * truth `certs rotate` / `issue-routing-client` sign against), not the
+ * fingerprint is read from LOCAL disk (`resolveExistingCaPaths`, the same
+ * source of truth `certs rotate` / `issue-routing-client` sign against), not the
  * registry-stored `CA_CERT` variable, so this check reflects what THIS
  * machine would sign a fresh routing-client cert with.
  */
@@ -2124,8 +2125,11 @@ async function resolveDepsFromRegistry(
       readRoutingClientCertIssuer: () => client.readVariable(routingClientCertIssuerVarName),
       // Local disk, NOT the registry-stored CA_CERT var — the same source of truth
       // `certs rotate` / `issue-routing-client` sign against (#800).
+      // macf#1277: owner-scoped conventional path, falling back to the
+      // pre-#1277 project-scoped legacy path — same `certs.ts` discipline,
+      // so this doctor check reads the SAME file those commands operate on.
       currentCaFingerprint: () => {
-        const p = caCertPathFor(config.project);
+        const p = resolveExistingCaPaths(ownerAccountFromRegistry(config.registry), config.project).certPath;
         if (!existsSync(p)) return null;
         try {
           return caCertFingerprint(readFileSync(p, 'utf-8'));

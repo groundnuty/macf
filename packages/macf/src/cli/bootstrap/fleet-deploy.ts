@@ -83,7 +83,7 @@ import { queryVaultAgentPresence, queryVaultCaPresence } from './vault-read.js';
 import { secretFingerprint } from './fleet-lock.js';
 import type { InitOptions } from '../commands/init.js';
 import { defaultAgentKeyPath, legacyAgentKeyPath, legacyProjectAgentKeyPath } from '../commands/init.js';
-import { caCertPath, caKeyPath, agentCertPath, agentKeyPath } from '../config.js';
+import { caCertPath, caKeyPath, legacyProjectCaCertPath, legacyProjectCaKeyPath, agentCertPath, agentKeyPath } from '../config.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -570,8 +570,15 @@ export type CaMaterializeOutcome =
   | { readonly status: 'vault-absent' };
 
 export interface CaPathDeps {
-  readonly caCertPathFor: (fleetName: string) => string;
-  readonly caKeyPathFor: (fleetName: string) => string;
+  /**
+   * Resolves the OWNER-scoped conventional CA path for a fleet (macf#1277).
+   * Takes `owner` explicitly — not captured in a closure — so a caller
+   * (test override included) cannot accidentally vary only by `fleetName`
+   * and silently reintroduce the cross-owner collision this issue reports:
+   * the TYPE forces every call site to supply an owner.
+   */
+  readonly caCertPathFor: (owner: string, fleetName: string) => string;
+  readonly caKeyPathFor: (owner: string, fleetName: string) => string;
 }
 
 /** The vault's decoded CA material, carried on {@link CaDetection}'s `'absent'`/`'mismatch'` variants — the only two that may need to WRITE it. Never carried on `'vault-absent'`/`'match'`, which never write. */
@@ -606,8 +613,42 @@ type CaDetection =
  * disk) is treated the same as `'absent'`: a lone cert or lone key is not a
  * usable CA to protect, so the complete, vault-confirmed pair materializes
  * fresh over it.
+ *
+ * **macf#1277 owner-scoping read-old-write-new, ONE legacy tier
+ * (fingerprint-gated).** When the owner-scoped conventional cert
+ * (`deps.caCertPathFor(owner, fleetName)`) is absent, this ALSO checks the
+ * pre-#1277 project-scoped, owner-less legacy path
+ * ({@link legacyProjectCaCertPath}/{@link legacyProjectCaKeyPath}) — but
+ * ONLY trusts it when its fingerprint matches THIS fleet's vault CA (the
+ * SAME discipline `resolveDefaultKeyPath` applies to the App key one layer
+ * up). A legacy CA that does NOT match is a DIFFERENT fleet's/owner's —
+ * silently irrelevant, never adopted, never compared for a refusal; the
+ * conventional owner-scoped path materializes fresh over it exactly as if
+ * no legacy file existed. This is the ONLY legacy tier for the CA (unlike
+ * the key's two): the CA path was already project-scoped before #1277 —
+ * see `config.ts::legacyProjectCaDir`'s own doc for why there is no flatter
+ * pre-project-scoped generation to fall through to.
+ *
+ * **`allowLegacyFallback` gates the legacy check — mirrors the App key's
+ * ternary-level split.** `deployAgent` passes `true` ONLY when NEITHER
+ * `deps.caCertPathFor` NOR `deps.caKeyPathFor` was overridden by the
+ * caller (the genuine unoverridden default). An override "fully owns path
+ * resolution and never sees the legacy fallback either" — same contract
+ * `keyPathFor`'s own doc states for the App key, and for the identical
+ * reason: `legacyProjectCaCertPath`/`legacyProjectCaKeyPath` are NOT
+ * injectable (always the REAL homedir), so a scratch-directory test
+ * override must never have this reached behind its back. Defaults to
+ * `false` — every existing direct caller of {@link materializeProjectCa}
+ * (this module's own unit tests) passes a scratch-dir override and
+ * therefore gets NO legacy lookup unless it opts in explicitly.
  */
-function detectCaStatus(raw: Readonly<Record<string, string>>, fleetName: string, deps: CaPathDeps): CaDetection {
+function detectCaStatus(
+  raw: Readonly<Record<string, string>>,
+  owner: string,
+  fleetName: string,
+  deps: CaPathDeps,
+  allowLegacyFallback: boolean,
+): CaDetection {
   const presence = queryVaultCaPresence(raw, fleetName);
   if (!(presence.caKey.present && presence.caCert.present)) {
     return { kind: 'vault-absent' };
@@ -632,8 +673,27 @@ function detectCaStatus(raw: Readonly<Record<string, string>>, fleetName: string
   const keyPem = Buffer.from(vaultKeyB64, 'base64').toString('utf-8');
   const material: CaVaultMaterial = { certPem, keyPem, fingerprint: caCertFingerprint(certPem) };
 
-  const caCertFilePath = deps.caCertPathFor(fleetName);
-  const caKeyFilePath = deps.caKeyPathFor(fleetName);
+  const conventionalCertPath = deps.caCertPathFor(owner, fleetName);
+  const conventionalKeyPath = deps.caKeyPathFor(owner, fleetName);
+  let caCertFilePath = conventionalCertPath;
+  let caKeyFilePath = conventionalKeyPath;
+  if (allowLegacyFallback && !existsSync(conventionalCertPath)) {
+    const legacyCertPath = legacyProjectCaCertPath(fleetName);
+    const legacyKeyPath = legacyProjectCaKeyPath(fleetName);
+    if (existsSync(legacyCertPath) && existsSync(legacyKeyPath)) {
+      try {
+        if (caCertFingerprint(readFileSync(legacyCertPath, 'utf-8')) === material.fingerprint) {
+          caCertFilePath = legacyCertPath;
+          caKeyFilePath = legacyKeyPath;
+        }
+      } catch {
+        // Unparseable legacy CA — not this fleet's concern; fall through
+        // to fresh materialization at the conventional path below, exactly
+        // as if the legacy file didn't exist.
+      }
+    }
+  }
+
   const localComplete = existsSync(caCertFilePath) && existsSync(caKeyFilePath);
   if (!localComplete) {
     return { kind: 'absent', material };
@@ -673,19 +733,28 @@ export function caFingerprintMismatchMessage(
   );
 }
 
-function writeCaMaterial(fleetName: string, deps: CaPathDeps, material: CaVaultMaterial): CaMaterializeOutcome {
-  writeAgentKeyAtomic0600(deps.caKeyPathFor(fleetName), material.keyPem);
-  writeCaCertAtomic0644(deps.caCertPathFor(fleetName), material.certPem);
+/**
+ * Always writes to the OWNER-SCOPED conventional path — never the legacy
+ * tier, even when `detectCaStatus`'s 'absent'/'mismatch' detection was
+ * reached via a legacy candidate that failed to match. "No migration of
+ * on-disk material" (macf#1157/#1214's own ruling, applied here): a fresh
+ * materialize always lands at the CURRENT conventional generation.
+ */
+function writeCaMaterial(owner: string, fleetName: string, deps: CaPathDeps, material: CaVaultMaterial): CaMaterializeOutcome {
+  writeAgentKeyAtomic0600(deps.caKeyPathFor(owner, fleetName), material.keyPem);
+  writeCaCertAtomic0644(deps.caCertPathFor(owner, fleetName), material.certPem);
   return { status: 'materialized', certFingerprint: material.fingerprint };
 }
 
 /**
- * Make the per-project CA usable locally at the SAME conventional path
- * `certs.ts`/`commands/init.ts` already read from ({@link caCertPath}/
- * {@link caKeyPath} by default) — mint-or-reuse, NEVER re-mint, mirroring
- * `apply-ca.ts::resolveCaCert`'s own "never mint twice" discipline one layer
- * down (this function never mints anything; it only ever writes what the
- * vault already holds).
+ * Make the per-project CA usable locally at the SAME owner-scoped
+ * conventional path `certs.ts`/`commands/init.ts` already read from
+ * ({@link caCertPath}/{@link caKeyPath} by default; macf#1277) — mint-or-
+ * reuse, NEVER re-mint, mirroring `apply-ca.ts::resolveCaCert`'s own "never
+ * mint twice" discipline one layer down (this function never mints
+ * anything; it only ever writes what the vault already holds). `owner` is
+ * REQUIRED (not optional) — see {@link CaPathDeps}'s own doc for why the
+ * signature forces it rather than leaving it closure-captured.
  *
  * A LOCAL CA that exists but DIFFERS from the vault's refuses loudly by
  * default (never silently overwrites — same "orphan a real credential"
@@ -695,31 +764,40 @@ function writeCaMaterial(fleetName: string, deps: CaPathDeps, material: CaVaultM
  * {@link materializeAgentKey}'s `forceKey`. Defaults to `false`, the SAFER
  * default: a mismatch refuses rather than silently overwriting a CA that
  * may be in independent use.
+ *
+ * `allowLegacyFallback` (macf#1277) — see {@link detectCaStatus}'s own doc.
+ * Defaults to `false`: a direct caller of this exported function (every
+ * existing unit test) gets NO pre-#1277 legacy-tier lookup against the
+ * REAL homedir unless it opts in explicitly. `deployAgent` passes `true`
+ * only for its own genuinely-unoverridden default `deps.caCertPathFor`/
+ * `caKeyPathFor`.
  */
 export async function materializeProjectCa(
   raw: Readonly<Record<string, string>>,
+  owner: string,
   fleetName: string,
   deps: CaPathDeps,
   forceCa = false,
+  allowLegacyFallback = false,
 ): Promise<CaMaterializeOutcome> {
-  const detection = detectCaStatus(raw, fleetName, deps);
+  const detection = detectCaStatus(raw, owner, fleetName, deps, allowLegacyFallback);
   switch (detection.kind) {
     case 'vault-absent':
       return { status: 'vault-absent' };
     case 'match':
       return { status: 'already-current', certFingerprint: detection.certFingerprint };
     case 'absent':
-      return writeCaMaterial(fleetName, deps, detection.material);
+      return writeCaMaterial(owner, fleetName, deps, detection.material);
     case 'mismatch':
       if (forceCa) {
-        return writeCaMaterial(fleetName, deps, detection.material);
+        return writeCaMaterial(owner, fleetName, deps, detection.material);
       }
       throw new FleetDeployError(
         'ca_mismatch_local_vs_vault',
         caFingerprintMismatchMessage(
           fleetName,
-          deps.caCertPathFor(fleetName),
-          deps.caKeyPathFor(fleetName),
+          deps.caCertPathFor(owner, fleetName),
+          deps.caKeyPathFor(owner, fleetName),
           detection.localFingerprint,
           detection.vaultFingerprint,
         ),
@@ -799,17 +877,19 @@ export interface FleetDeployDeps {
    */
   readonly keyPathFor?: (role: string) => string;
   /**
-   * Resolves the per-project CA cert/key paths (macf#976). Defaults to
-   * {@link caCertPath}/{@link caKeyPath} (`~/.macf/certs/<project>/ca-{cert,key}.pem`
+   * Resolves the owner+project-scoped CA cert/key paths (macf#976;
+   * owner-scoped as of macf#1277). Defaults to {@link caCertPath}/
+   * {@link caKeyPath} (`~/.macf/certs/<owner>/<project>/ca-{cert,key}.pem`
    * — the SAME conventional path `certs.ts` and `commands/init.ts`'s
-   * GitHub-mode cert-flow already read from). **Tests MUST override both to
+   * GitHub-mode cert-flow resolve to by default via
+   * `config.ts::resolveExistingCaPaths`). **Tests MUST override both to
    * a scratch directory** — the default resolves under the REAL operator's
    * home directory, which may hold a real, live fleet's CA.
    *
    * **Overriding this while `deps.initAgent` is the REAL `initAgent`
    * (macf#1000) breaks agent-cert issuance silently.** `commands/init.ts`'s
    * GitHub-mode cert-flow has NO path-override seam of its own — it always
-   * reads `caCertPath(project)`/`caKeyPath(project)` from `../config.js`
+   * resolves via `config.ts::resolveExistingCaPaths(owner, project)`
    * directly. If this override points `deployAgent`'s OWN CA materialize
    * step somewhere else, `initAgent` looks for the CA at the conventional
    * (un-overridden) path, finds nothing, and silently takes its "No CA
@@ -820,8 +900,8 @@ export interface FleetDeployDeps {
    * `fleet-deploy.test.ts`'s "REAL `initAgent` — the decisive seam-call-count
    * proof" block for the pattern that stays correct.
    */
-  readonly caCertPathFor?: (fleetName: string) => string;
-  readonly caKeyPathFor?: (fleetName: string) => string;
+  readonly caCertPathFor?: (owner: string, fleetName: string) => string;
+  readonly caKeyPathFor?: (owner: string, fleetName: string) => string;
   readonly log?: (line: string) => void;
   /**
    * Opt-in (macf#975; CLI flag `--force-key`) to re-materialize the on-disk
@@ -1249,10 +1329,22 @@ export async function deployAgent(
 
     const registryOpts = initRegistryOptionsFor(manifest.owner.registry);
 
+    // macf#1277: `caPathDeps` itself resolves ONLY to the owner-scoped
+    // conventional path (no fallback baked in here) — `owner` needs to
+    // reach every call site through the deps' TYPE, not a closure (see
+    // `CaPathDeps`'s own doc). The read-old legacy-tier fallback lives
+    // inside `detectCaStatus`/`materializeProjectCa`, fingerprint-gated
+    // AND additionally gated on `allowCaLegacyFallback` below — the SAME
+    // "override fully owns resolution" ternary-level split the App key
+    // applies, just expressed as an explicit boolean instead of a ternary
+    // branch (the CA's vault-decode happens INSIDE `detectCaStatus`, so
+    // the fallback can't be resolved before calling it the way the key's
+    // `resolveDefaultKeyPath` is).
     const caPathDeps: CaPathDeps = {
       caCertPathFor: deps.caCertPathFor ?? caCertPath,
       caKeyPathFor: deps.caKeyPathFor ?? caKeyPath,
     };
+    const allowCaLegacyFallback = deps.caCertPathFor === undefined && deps.caKeyPathFor === undefined;
     // macf#1157 / macf#1214: the owner+fleet-scoped default (with two-tier
     // legacy-path back-compat) ONLY applies when the caller hasn't
     // overridden resolution — an override (always used in tests, per
@@ -1266,7 +1358,7 @@ export async function deployAgent(
     // "Both the CA and the App key are PEEKED AT" section. Read-only: ONLY
     // decides whether to raise the combined refusal below; the actual
     // materialize calls (which redo this comparison) are what write.
-    const caDetection = detectCaStatus(raw, manifest.metadata.name, caPathDeps);
+    const caDetection = detectCaStatus(raw, manifest.owner.account, manifest.metadata.name, caPathDeps, allowCaLegacyFallback);
     const keyDetection = detectKeyStatus(role, keyPath, creds.privateKeyPem);
     if (caDetection.kind === 'mismatch' && deps.forceCa !== true && keyDetection.kind === 'mismatch' && deps.forceKey !== true) {
       throw new FleetDeployError(
@@ -1274,8 +1366,8 @@ export async function deployAgent(
         staleCaAndKeyMismatchMessage(
           role,
           manifest.metadata.name,
-          caPathDeps.caCertPathFor(manifest.metadata.name),
-          caPathDeps.caKeyPathFor(manifest.metadata.name),
+          caPathDeps.caCertPathFor(manifest.owner.account, manifest.metadata.name),
+          caPathDeps.caKeyPathFor(manifest.owner.account, manifest.metadata.name),
           caDetection.localFingerprint,
           caDetection.vaultFingerprint,
           keyPath,
@@ -1291,7 +1383,14 @@ export async function deployAgent(
     // than leaving a half-deployed workspace behind a loud error. The
     // combined pre-check above has already ruled out "both stale,
     // neither forced" reaching this point.
-    const ca = await materializeProjectCa(raw, manifest.metadata.name, caPathDeps, deps.forceCa === true);
+    const ca = await materializeProjectCa(
+      raw,
+      manifest.owner.account,
+      manifest.metadata.name,
+      caPathDeps,
+      deps.forceCa === true,
+      allowCaLegacyFallback,
+    );
     log(caMaterializeLogLine(role, ca));
 
     const { keyWrite, keyFingerprint } = materializeAgentKey(role, keyPath, creds.privateKeyPem, deps, log);

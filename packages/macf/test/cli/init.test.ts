@@ -800,11 +800,12 @@ describe('macf init', () => {
 
 // --- GitHub-mode agent leaf-cert flow: `skipCertIfPresent` (macf#1000) ---
 //
-// These tests touch the REAL `~/.macf/certs/<project>/` — the GitHub-mode
-// cert-flow (`issueGithubModeAgentCert` in `commands/init.ts`) has NO
-// path-override seam for the per-project CA; it always reads
-// `caCertPath(project)`/`caKeyPath(project)` from `../../src/cli/config.js`
-// directly. Proving the "no behaviour change for `macf init` used directly"
+// These tests touch the REAL `~/.macf/certs/<owner>/<project>/` — the
+// GitHub-mode cert-flow (`issueGithubModeAgentCert` in `commands/init.ts`)
+// has NO path-override seam for the per-owner, per-project CA; it always
+// resolves via `resolveExistingCaPaths(owner, project)` from
+// `../../src/cli/config.js` directly (owner-scoped as of macf#1277).
+// Proving the "no behaviour change for `macf init` used directly"
 // AC (macf#1000) therefore requires the CA to actually live at that
 // conventional location. Same convention `certs.test.ts` already
 // established: a RANDOMIZED per-test project name (never collides with a
@@ -816,8 +817,10 @@ describe('macf init — GitHub-mode agent leaf-cert flow, skipCertIfPresent (mac
     return `T${Date.now()}${Math.floor(Math.random() * 1e6)}`;
   }
 
+  // Matches every initOpts fixture below (`registryType: 'repo'`,
+  // `registryRepo: 'owner/repo'`) — owner resolves to the literal 'owner'.
   async function mintRealCaFor(project: string): Promise<void> {
-    await createCA({ project, certPath: caCertPath(project), keyPath: caKeyPath(project) });
+    await createCA({ project, certPath: caCertPath('owner', project), keyPath: caKeyPath('owner', project) });
   }
 
   function removeFromAgentsIndex(absDir: string): void {
@@ -860,7 +863,7 @@ describe('macf init — GitHub-mode agent leaf-cert flow, skipCertIfPresent (mac
       expect(secondCertPem).not.toBe(firstCertPem);
     } finally {
       rmSync(dir, { recursive: true, force: true });
-      rmSync(caDir(project), { recursive: true, force: true });
+      rmSync(caDir('owner', project), { recursive: true, force: true });
       removeFromAgentsIndex(dir);
     }
     // Two full `initAgent()` runs (each hitting the network for the plugin
@@ -901,7 +904,7 @@ describe('macf init — GitHub-mode agent leaf-cert flow, skipCertIfPresent (mac
       expect(secondCertPem).toBe(firstCertPem);
     } finally {
       rmSync(dir, { recursive: true, force: true });
-      rmSync(caDir(project), { recursive: true, force: true });
+      rmSync(caDir('owner', project), { recursive: true, force: true });
       removeFromAgentsIndex(dir);
     }
     // See the sibling test's own comment on the explicit timeout below.

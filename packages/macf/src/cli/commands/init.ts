@@ -5,8 +5,8 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import {
   projectMacfDir, writeAgentConfig, addToAgentsIndex,
   agentCertPath, agentKeyPath,
-  caCertPath as caCertPathFor, caKeyPath as caKeyPathFor,
   isValidProjectName, tokenSourceFromConfig,
+  ownerAccountFromRegistry, resolveExistingCaPaths,
 } from '../config.js';
 import { createCA, loadCA } from '@groundnuty/macf-core';
 import { generateAgentCert } from '@groundnuty/macf-core';
@@ -357,7 +357,8 @@ export function defaultLocalRegistryPath(project: string): string {
  * separator `owner/fleet` needs (see macf#1214's ruling comment). It is the
  * SAME account string `bootstrap/fleet-deploy.ts` reads as
  * `manifest.owner.account`; `macf init`'s own equivalent is derived by
- * `ownerAccountFromRegistry` below from whichever registry variant was
+ * `config.ts::ownerAccountFromRegistry` (moved there in macf#1277 so the
+ * CA-path resolution can share it too) from whichever registry variant was
  * resolved for this run.
  *
  * **Scoped by `project` since macf#1157** — the pre-#1157 shape was bare
@@ -422,35 +423,6 @@ export function legacyProjectAgentKeyPath(project: string, agentName: string): s
  */
 export function legacyAgentKeyPath(agentName: string): string {
   return join(homedir(), '.macf', 'keys', `${agentName}.pem`);
-}
-
-/**
- * The GitHub-account namespace this project's registry lives in — the
- * `<owner>` segment {@link defaultAgentKeyPath} needs (macf#1214). Derived
- * from whichever registry variant `initAgent` already resolved for this
- * run, never a separate `--owner` flag — the registry config already
- * carries the account. Mirrors `bootstrap/fleet-deploy.ts`'s
- * `manifest.owner.account` for the `macf fleet deploy`/`macf bootstrap
- * apply` path; this is `macf init`'s own equivalent for a direct,
- * standalone run.
- *
- * `local` registry mode never reaches this function — `initAgent` skips
- * `ingestAndResolveKeyPath` entirely when `regType === 'local'` (no App key
- * to resolve in local-registry mode at all). The throw below exists only
- * to keep the switch exhaustive and to fail loud, never silently return a
- * placeholder, if that invariant is ever broken by a future change.
- */
-function ownerAccountFromRegistry(registry: MacfAgentConfig['registry']): string {
-  switch (registry.type) {
-    case 'org':
-      return registry.org;
-    case 'profile':
-      return registry.user;
-    case 'repo':
-      return registry.owner;
-    case 'local':
-      throw new Error('ownerAccountFromRegistry: local registry mode has no owner-account namespace to key on');
-  }
 }
 
 /**
@@ -665,13 +637,19 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // Resolve version pins (explicit flags > network-fetched latest > fallback)
   const versions = await resolveVersions(opts);
 
+  // The GitHub-account namespace this run's registry lives in — needed for
+  // BOTH the owner-scoped App-key path (below) and the owner-scoped CA path
+  // ({@link issueGithubModeAgentCert}, macf#1277). Local-registry mode has
+  // no owner-account namespace at all (ownerAccountFromRegistry would
+  // throw) — computed once here, undefined in local mode, threaded to both
+  // call sites rather than re-derived per site.
+  const ownerAccount = regType === 'local' ? undefined : ownerAccountFromRegistry(registry);
+
   // Resolve the App-key destination and (when --app-key is given) ingest the
   // downloaded key there at 0600, failing loud on a missing key (macf#530).
-  // Local-registry mode mints no token, so it has no key — and has no
-  // owner-account namespace either (ownerAccountFromRegistry would throw),
-  // which is exactly why it's excluded from this call.
+  // Local-registry mode mints no token, so it has no key to resolve either.
   const githubKeyPath =
-    regType === 'local' ? undefined : ingestAndResolveKeyPath(opts, agentName, absDir, ownerAccountFromRegistry(registry));
+    regType === 'local' || ownerAccount === undefined ? undefined : ingestAndResolveKeyPath(opts, agentName, absDir, ownerAccount);
 
   // Write agent config. `github_app` is omitted in local-registry mode
   // (DR-024) — the launcher does not mint a token, and the schema marks
@@ -975,8 +953,14 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
 
   // GitHub-mode cert flow — the ONLY place in this codebase that issues an
   // agent's own mTLS leaf cert for a GitHub-backed registry (macf#1000; see
-  // {@link issueGithubModeAgentCert}'s own doc).
-  await issueGithubModeAgentCert(absDir, macfDir, agentName, claudeShPath, opts);
+  // {@link issueGithubModeAgentCert}'s own doc). `ownerAccount` is always
+  // defined here — the local-registry branch (the only one that leaves it
+  // `undefined`) already returned above. The throw is an internal-
+  // consistency guard, not a genuine runtime path.
+  if (ownerAccount === undefined) {
+    throw new Error('internal: ownerAccount unexpectedly undefined for a non-local registry');
+  }
+  await issueGithubModeAgentCert(absDir, macfDir, agentName, claudeShPath, opts, ownerAccount);
 
   // GitHub-mode migration: read agent records from a local-registry
   // JSON file and write each into the new GitHub-backed registry.
@@ -999,11 +983,17 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
  * `initAgent`'s GitHub-mode agent leaf-cert flow — the ONLY place in this
  * codebase that calls `generateAgentCert` for an agent's own mTLS leaf cert
  * against a GitHub-backed registry (macf#1000). Reads the per-project CA
- * from the conventional, non-injectable path (`caCertPathFor(opts.project)`/
- * `caKeyPathFor(opts.project)` — GitHub mode has no path-override seam; a
- * `fleet deploy` caller materializes the CA at that SAME conventional path
- * BEFORE calling `initAgent` — see `bootstrap/fleet-deploy.ts`'s module doc
- * for why the two must agree on one un-overridden location).
+ * via {@link resolveExistingCaPaths} (macf#1277) — the owner-scoped
+ * conventional path, falling back to the pre-#1277 project-scoped legacy
+ * path when only that one has a CA on disk (existence-only; no vault at
+ * this layer to fingerprint-check against, same as
+ * `ingestAndResolveKeyPath`'s own no-vault gating for the App key).
+ * GitHub mode has no path-override seam — a `fleet deploy` caller
+ * materializes the CA via the SAME `resolveExistingCaPaths`-equivalent
+ * read-old-write-new logic (fingerprint-gated there, since it HAS vault
+ * material — see `bootstrap/fleet-deploy.ts`'s module doc) BEFORE calling
+ * `initAgent`, so the two always agree on which tier actually holds the
+ * CA this run.
  *
  * **`opts.skipCertIfPresent` (macf#1000) is existence-only.** When `true`
  * AND a cert+key pair is ALREADY at the destination, this function returns
@@ -1027,9 +1017,9 @@ async function issueGithubModeAgentCert(
   agentName: string,
   claudeShPath: string,
   opts: Pick<InitOptions, 'project' | 'routingLabel' | 'advertiseHost' | 'skipCertIfPresent'>,
+  ownerAccount: string,
 ): Promise<void> {
-  const caCertFile = caCertPathFor(opts.project);
-  const caKeyFile = caKeyPathFor(opts.project);
+  const { certPath: caCertFile, keyPath: caKeyFile } = resolveExistingCaPaths(ownerAccount, opts.project);
   if (!(existsSync(caCertFile) && existsSync(caKeyFile))) {
     console.log(`Agent "${agentName}" initialized in ${absDir}`);
     console.log(`  Config: ${join(macfDir, 'macf-agent.json')}`);
